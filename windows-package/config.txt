@@ -1,4 +1,5 @@
 ;!@Install@!UTF-8!
 InstallPath="%TEMP%\\aiexpedite-terminal-helper"
+OverwriteMode="2"
 RunProgram="powershell -ExecutionPolicy Bypass -File entrypoint.ps1"
 ;!@InstallEnd@!
