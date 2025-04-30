@@ -1,15 +1,17 @@
 # ---------- build stage -------------------------------------------------------
     FROM alpine:3.19 AS build
 
-    # Install build dependencies, including zlib and json-c for ttyd
+    # Install build dependencies including TLS support for libwebsockets
     RUN apk add --no-cache \
         build-base \
         cmake \
         git \
         libwebsockets-dev \
+        libwebsockets-evlib_uv \
         libuv-dev \
         zlib-dev \
-        json-c-dev
+        json-c-dev \
+        openssl-dev
     
     # Clone and build ttyd
     RUN git clone --depth=1 https://github.com/tsl0922/ttyd /src/ttyd \
