@@ -1,0 +1,14 @@
+//go:build linux
+// +build linux
+
+package main
+
+// Embed the icon (PNG format) for Linux tray icon (if supported).
+//go:embed assets/icon.png
+var iconData []byte
+
+// ensureAutoStart on Linux: Not implemented (could use XDG autostart or systemd service).
+func ensureAutoStart() error {
+	// TODO: implement Linux autostart (e.g., create ~/.config/autostart/TrayAgent.desktop)
+	return nil
+}
