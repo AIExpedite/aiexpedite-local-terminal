@@ -3,14 +3,14 @@ name: build-and-release
 on:
   push:
     tags:
-      - "v*" # trigger only for version tags like v0.2.0
+      - "v*" # run only for version tags
 
 permissions:
-  contents: write # upload release assets
+  contents: write # upload assets to the release
   packages: write # push helper image to GHCR
 
 ###############################################################################
-# 1️⃣  Build native binaries on three OS‑matrix runners
+# 1️⃣  Build native binaries on three matrix runners
 ###############################################################################
 jobs:
   build-binaries:
@@ -20,17 +20,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-latest # linux/amd64
             goos: linux
             goarch: amd64
             ldflags: ""
             ext: ""
-          - os: windows-latest
+          - os: windows-latest # windows/amd64 (GUI subsystem)
             goos: windows
             goarch: amd64
             ldflags: "-H=windowsgui"
             ext: ".exe"
-          - os: macos-latest
+          - os: macos-latest # darwin/amd64
             goos: darwin
             goarch: amd64
             ldflags: ""
@@ -44,7 +44,7 @@ jobs:
           go-version: "1.24"
 
       - name: Download Go modules
-        run: go mod tidy
+        run: go mod tidy # populates go.sum
 
       - name: Build binary
         env:
@@ -52,28 +52,31 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
-          OUT=dist/aiexpedite-local-terminal-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
-          go build -ldflags "${{ matrix.ldflags }}" -o "${OUT}" .
-          echo "OUT_PATH=${OUT}" >> "$GITHUB_ENV"
+          BIN="dist/aiexpedite-local-terminal-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          go build -ldflags "${{ matrix.ldflags }}" -o "$BIN" .
+          echo "BIN=$BIN" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: binaries
-          path: ${{ env.OUT_PATH }}
+          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ env.BIN }}
 
   ###############################################################################
-  # 2️⃣  Create / update the GitHub Release and attach assets
+  # 2️⃣  Create / update the GitHub Release and attach assets
   ###############################################################################
   release:
+    name: Publish GitHub release
     needs: build-binaries
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
         with:
-          name: binaries
+          pattern: bin-* # grab every OS/arch artifact
           path: dist
+          merge-multiple: true
 
       - name: Generate SHA‑256 checksums
         run: |
@@ -86,9 +89,10 @@ jobs:
           files: dist/**
 
   ###############################################################################
-  # 3️⃣  (Optional) build & push your ttyd‑helper container
+  # 3️⃣  (optional) build & push your ttyd‑helper container
   ###############################################################################
   docker:
+    name: Push helper image to GHCR
     needs: release
     runs-on: ubuntu-latest
     permissions:
@@ -105,7 +109,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & push helper image
+      - name: Build & push image
         run: |
           docker buildx build --push \
             -t ghcr.io/${{ github.repository }}/ttyd-helper:latest .
