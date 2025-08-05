@@ -1,0 +1,35 @@
+# ───── Go tooling ──────────────────────────────────────────────────────────
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+*.test              # go test -c generated files
+*.out               # go test -c -o *.out
+
+# Output of `go build`, our workflow places them in /dist
+dist/
+
+# Go coverage profiles
+*.cover
+*.cov
+coverage/
+
+# IDE / editor settings
+.idea/
+.vscode/
+*.swp
+.*.swp
+*~
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# Logs & temp files
+*.log
+*.tmp
+*.bak
+
+# If you ever vendor dependencies (go mod vendor), keep or drop as needed
+# vendor/
