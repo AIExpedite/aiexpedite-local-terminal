@@ -3,35 +3,34 @@ name: build-and-release
 on:
   push:
     tags:
-      - "v*" # fires only for version tags
+      - "v*" # trigger only for version tags like v0.2.0
 
 permissions:
-  contents: write # needed for uploading release assets
-  packages: write # for GHCR push (docker job)
+  contents: write # upload release assets
+  packages: write # push helper image to GHCR
 
-###########################################################################
-# 1️⃣  MULTI‑PLATFORM GO BUILD & PUBLISH
-###########################################################################
+###############################################################################
+# 1️⃣  Build native binaries on three OS‑matrix runners
+###############################################################################
 jobs:
   build-binaries:
-    name: Build ${{ matrix.goos }} / ${{ matrix.goarch }}
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # One runner per OS → we can compile natively without cgo cross issues
         include:
-          - os: ubuntu-latest # produces linux/amd64
+          - os: ubuntu-latest
             goos: linux
             goarch: amd64
             ldflags: ""
             ext: ""
-          - os: windows-latest # produces windows/amd64 with GUI subsystem
+          - os: windows-latest
             goos: windows
             goarch: amd64
             ldflags: "-H=windowsgui"
             ext: ".exe"
-          - os: macos-latest # produces darwin/amd64
+          - os: macos-latest
             goos: darwin
             goarch: amd64
             ldflags: ""
@@ -44,56 +43,53 @@ jobs:
         with:
           go-version: "1.24"
 
-      - name: Tidy (fetch deps)
+      - name: Download Go modules
         run: go mod tidy
 
-      - name: Build
+      - name: Build binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
           mkdir -p dist
-          out="dist/aiexpedite-local-terminal-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          go build -ldflags "${{ matrix.ldflags }}" -o "$out" .
-          echo "BUILT=$out" >> $GITHUB_ENV
+          OUT=dist/aiexpedite-local-terminal-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          go build -ldflags "${{ matrix.ldflags }}" -o "${OUT}" .
+          echo "OUT_PATH=${OUT}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: binaries
-          path: ${{ env.BUILT }}
+          path: ${{ env.OUT_PATH }}
 
-  ###########################################################################
-  # 2️⃣  CREATE / UPDATE THE GITHUB RELEASE WITH BINARIES
-  ###########################################################################
+  ###############################################################################
+  # 2️⃣  Create / update the GitHub Release and attach assets
+  ###############################################################################
   release:
     needs: build-binaries
-    runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: binaries
           path: dist
 
-      - name: Generate checksums
+      - name: Generate SHA‑256 checksums
         run: |
           cd dist
           sha256sum * > SHA256SUMS
 
-      - name: Publish GitHub Release
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v1
         with:
           files: dist/**
 
-  ###########################################################################
-  # 3️⃣  (OPTIONAL) BUILD + PUSH YOUR ttyp-helper CONTAINER
-  ###########################################################################
+  ###############################################################################
+  # 3️⃣  (Optional) build & push your ttyd‑helper container
+  ###############################################################################
   docker:
-    needs: release # run after binaries succeed
+    needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: read
