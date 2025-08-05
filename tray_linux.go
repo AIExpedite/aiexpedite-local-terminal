@@ -3,6 +3,8 @@
 
 package main
 
+import _ "embed"
+
 // Embed the icon (PNG format) for Linux tray icon (if supported).
 //go:embed assets/icon.png
 var iconData []byte

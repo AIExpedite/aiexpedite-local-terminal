@@ -10,11 +10,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 	"runtime"
 	"github.com/gorilla/websocket"
+	"github.com/getlantern/systray"
 )
 
 const version = "v0.1.0"

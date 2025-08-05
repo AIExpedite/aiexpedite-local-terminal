@@ -5,8 +5,7 @@ package main
 
 import (
 	"os"
-	"strings"
-    "embed"
+    _ "embed"
 	"golang.org/x/sys/windows/registry"
 )
 
