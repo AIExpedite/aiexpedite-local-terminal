@@ -5,6 +5,7 @@ go 1.24
 require (
 	github.com/getlantern/systray v1.2.2
 	github.com/gorilla/websocket v1.5.3
+    cloud.google.com/go/pubsub    v1.37.2  
 	golang.org/x/sys v0.34.0
 )
 
