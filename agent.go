@@ -1,8 +1,9 @@
 // File: agent.go
 // -----------------------------------------------------------------------------
-// Starts the local ttyd server, optional tmux session, and the Pub/Sub loop
-// that exchanges terminal commands/results with the back‑end service.
-// Tray‑icon helpers live in main.go – this file focuses on background tasks.
+// Starts the local ttyd server, optional tmux session, *auto‑update* checker
+// and the Pub/Sub worker that exchanges terminal commands/results with the
+// back‑end service.  Tray helpers live in main.go – this file focuses on the
+// background tasks.
 // -----------------------------------------------------------------------------
 
 package main
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"time"
 )
 
 const version = "v0.2.0" // bumped after Pub/Sub support
@@ -25,15 +27,15 @@ var (
 
 /*──────────────────────────────  StartAgent  ──────────────────────────────*/
 
-// StartAgent prepares the local environment (tmux, ttyd) and launches the
-// background Pub/Sub worker that listens for remote commands.
+// StartAgent prepares the local environment (tmux + ttyd) and launches the
+// Pub/Sub worker.  If cfg.AutoUpdate is true we also run a delayed update check.
 func StartAgent(cfg *Config) {
-	/* 1. Ensure prerequisites (tmux + ttyd) exist ------------------------ */
+	/* 1. Ensure prerequisites (tmux + ttyd) exist ------------------------- */
 
 	useTmux := true
 	if err := ensureTmux(); err != nil {
 		if runtime.GOOS == "windows" {
-			// Windows users may not have tmux – gracefully fall back to a bare shell
+			// Windows users may not have tmux – gracefully fall back
 			useTmux = false
 			fmt.Println("Warning:", err, "- running without tmux.")
 		} else {
@@ -54,7 +56,7 @@ func StartAgent(cfg *Config) {
 		}
 	}
 
-	/* 2. Spawn ttyd ------------------------------------------------------ */
+	/* 2. Spawn ttyd ------------------------------------------------------- */
 
 	var shellCmd []string
 	if useTmux {
@@ -84,7 +86,18 @@ func StartAgent(cfg *Config) {
 	}
 	fmt.Println("ttyd listening on 127.0.0.1:", port)
 
-	/* 3. Start Pub/Sub loop (non‑blocking) ------------------------------- */
+	/* 3. Start Pub/Sub loop (non‑blocking) -------------------------------- */
 
 	go StartPubSubLoop(cfg)
+
+	/* 4. Optional auto‑update -------------------------------------------- */
+
+	if cfg.AutoUpdate {
+		go func() {
+			time.Sleep(5 * time.Second) // give the UI a chance to appear first
+			if err := checkForUpdate(); err != nil {
+				fmt.Println("Update check error:", err)
+			}
+		}()
+	}
 }

@@ -1,3 +1,4 @@
+// File: pubsub.go
 package main
 
 import (
@@ -10,7 +11,7 @@ import (
 	"cloud.google.com/go/pubsub"
 )
 
-/* Incoming command payload (matches backend’s publishCommand struct) */
+/* Incoming command payload (matches backend publishCommand struct) */
 type commandMsg struct {
 	ID      string   `json:"id"`
 	Command string   `json:"command"`
@@ -19,7 +20,7 @@ type commandMsg struct {
 	Ts      int64    `json:"ts"`
 }
 
-/* Outgoing result payload (matches backend’s publishResult) */
+/* Outgoing result payload (matches backend publishResult struct) */
 type resultMsg struct {
 	ID     string `json:"id"`
 	UID    string `json:"uid"`
@@ -29,10 +30,7 @@ type resultMsg struct {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  StartPubSubLoop – spawns a goroutine that                                */
-/*  • pulls messages from cfg.CommandsSubscription                           */
-/*  • executes cmd locally                                                   */
-/*  • publishes results to cfg.ResultsTopic                                  */
+/*  StartPubSubLoop – listens for commands and publishes results              */
 /* -------------------------------------------------------------------------- */
 func StartPubSubLoop(cfg *Config) {
 	if cfg.ProjectID == "" {
@@ -40,7 +38,9 @@ func StartPubSubLoop(cfg *Config) {
 		return
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-shutdownChan; cancel() }() // graceful exit on tray quit
+
 	client, err := pubsub.NewClient(ctx, cfg.ProjectID)
 	if err != nil {
 		fmt.Println("[pubsub] client error:", err)
@@ -81,7 +81,7 @@ func StartPubSubLoop(cfg *Config) {
 			}
 			m.Ack()
 		})
-		if err != nil {
+		if err != nil && ctx.Err() == nil { // ignore shutdown‑induced error
 			fmt.Println("[pubsub] subscription ended:", err)
 		}
 	}()

@@ -1,3 +1,4 @@
+// File: config.go
 package main
 
 import (
@@ -10,13 +11,13 @@ import (
 // Config holds configuration for the agent, loaded from a JSON file.
 type Config struct {
 	/* ─── Pub/Sub integration ───────────────────────── */
-	ProjectID            string `json:"project_id,omitempty"`             // GCP project
-	CommandsSubscription string `json:"commands_subscription,omitempty"`   // e.g. terminal‑commands‑sub
-	ResultsTopic         string `json:"results_topic,omitempty"`          // e.g. terminal‑results
+	ProjectID            string `json:"project_id,omitempty"`
+	CommandsSubscription string `json:"commands_subscription,omitempty"`
+	ResultsTopic         string `json:"results_topic,omitempty"`
 
 	/* ─── (optional) legacy relay mode ──────────────── */
-	RelayURL   string `json:"relay_url,omitempty"` // WSS endpoint (legacy)
-	JWT        string `json:"jwt,omitempty"`       // Auth token for relay
+	RelayURL string `json:"relay_url,omitempty"`
+	JWT      string `json:"jwt,omitempty"`
 
 	/* ─── mTLS (relay mode) ─────────────────────────── */
 	CertFile string `json:"cert_file,omitempty"`
@@ -55,8 +56,7 @@ func (cfg *Config) Save(path string) error {
 
 func DefaultConfig() *Config {
 	return &Config{
-		/* Pub/Sub defaults – change if you renamed the topics */
-		ProjectID:            "",                       // MUST be filled by the user
+		ProjectID:            "", // MUST be filled by the user for Pub/Sub mode
 		CommandsSubscription: "terminal-commands-sub",
 		ResultsTopic:         "terminal-results",
 
@@ -65,12 +65,25 @@ func DefaultConfig() *Config {
 	}
 }
 
+// Validate makes sure *one* transport (Pub/Sub or relay) is configured.
 func (cfg *Config) Validate() error {
-	if cfg.ProjectID == "" {
-		return errors.New("project_id is not set in config")
+	pubsubConfigured := cfg.ProjectID != "" &&
+		cfg.CommandsSubscription != "" &&
+		cfg.ResultsTopic != ""
+
+	relayConfigured := cfg.RelayURL != ""
+
+	switch {
+	case pubsubConfigured && relayConfigured:
+		return errors.New("both Pub/Sub and Relay are configured – choose one")
+	case !pubsubConfigured && !relayConfigured:
+		return errors.New("neither Pub/Sub nor Relay is configured")
+	case pubsubConfigured:
+		return nil // good
+	default: // relayConfigured only
+		if cfg.JWT == "" {
+			return errors.New("relay_url set but jwt missing")
+		}
+		return nil
 	}
-	if cfg.CommandsSubscription == "" || cfg.ResultsTopic == "" {
-		return errors.New("Pub/Sub subscription or topic not configured")
-	}
-	return nil
 }
