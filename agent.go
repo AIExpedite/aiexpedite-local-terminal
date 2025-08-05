@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -18,8 +17,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const version     = "v0.1.0"
-const githubRepo  = "AIExpedite/aiexpedite-local-terminal" // repo used for auto‑update
+const version    = "v0.1.0"
+const githubRepo = "AIExpedite/aiexpedite-local-terminal" // repo used for auto‑update
 
 var (
 	ttydCmd       *exec.Cmd          // ttyd process (killed on exit)
@@ -28,12 +27,13 @@ var (
 	updatePath    string
 )
 
-// StartAgent launches tmux (optional), ttyd and the relay loop.
+// ────────────────────────────── Launcher ────────────────────────────────────
+
 func StartAgent(cfg *Config) {
 	useTmux := true
 	if err := ensureTmux(); err != nil {
 		if runtime.GOOS == "windows" {
-			useTmux = false // Windows fallback: single shell
+			useTmux = false
 			fmt.Println("Warning:", err, "- running without tmux.")
 		} else {
 			fmt.Println("Fatal:", err)
@@ -54,7 +54,7 @@ func StartAgent(cfg *Config) {
 	}
 
 	// build ttyd command
-	shellCmd := []string{}
+	var shellCmd []string
 	if useTmux {
 		shellCmd = []string{"tmux", "attach", "-t", tmuxSessionName}
 	} else {
@@ -81,10 +81,8 @@ func StartAgent(cfg *Config) {
 	}
 	fmt.Println("ttyd listening on 127.0.0.1:", port)
 
-	// start relay loop
 	go relayConnectionLoop(cfg)
 
-	// background update check
 	if cfg.AutoUpdate {
 		go func() {
 			time.Sleep(5 * time.Second)
@@ -138,7 +136,7 @@ func relayConnectionLoop(cfg *Config) {
 	}
 }
 
-// ───────────────────────────── TLS / mTLS helper ────────────────────────────
+// ───────────────────────── TLS / mTLS helper ────────────────────────────────
 
 func buildTLSConfig(cfg *Config) (*tls.Config, error) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
@@ -232,8 +230,6 @@ func checkForUpdate() error {
 	if _, err := io.Copy(tmp, r2.Body); err != nil {
 		return err
 	}
-
-	// (checksum verification omitted for brevity)
 
 	updatePath = tmp.Name()
 	updatePending = true
