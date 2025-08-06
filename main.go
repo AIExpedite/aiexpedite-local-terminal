@@ -84,7 +84,7 @@ func onTrayExit() {
 	// stop ttyd cleanly
 	if ttydCmd != nil && ttydCmd.Process != nil {
 		_ = ttydCmd.Process.Kill()
-		_, _ = ttydCmd.Process.Wait() // ← ensures no zombie
+		_, _ = ttydCmd.Process.Wait() // avoid zombie
 	}
 
 	// kill tmux session (ignore error if it never existed)
@@ -98,4 +98,23 @@ func onTrayExit() {
 	}
 }
 
-/* openBrowser unchanged – omitted for brevity */
+/* ---------- util ---------- */
+
+// openBrowser opens the supplied URL in the platform’s default browser.
+func openBrowser(url string) {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "rundll32"
+		args = []string{"url.dll,FileProtocolHandler", url}
+	case "darwin":
+		cmd = "open"
+		args = []string{url}
+	default: // Linux and others
+		cmd = "xdg-open"
+		args = []string{url}
+	}
+	_ = exec.Command(cmd, args...).Start()
+}
