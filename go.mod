@@ -3,9 +3,10 @@ module github.com/AIExpedite/aiexpedite-local-terminal
 go 1.24
 
 require (
-	cloud.google.com/go/pubsub v1.37.0
-	github.com/getlantern/systray v1.2.2
-	golang.org/x/sys v0.34.0
+	cloud.google.com/go/pubsub v1.37.0 // direct
+	github.com/getlantern/systray v1.2.2 // direct
+	golang.org/x/mod v0.14.0 // semver‑compare helper
+	golang.org/x/sys v0.34.0 // direct
 )
 
 require (

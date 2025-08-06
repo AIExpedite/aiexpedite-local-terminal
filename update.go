@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/getlantern/systray"
+	"golang.org/x/mod/semver"
 )
 
 const githubRepo = "AIExpedite/aiexpedite-local-terminal"
@@ -25,7 +26,7 @@ func checkForUpdate() error {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("GitHub API returned %d", resp.StatusCode)
 	}
 
@@ -40,33 +41,25 @@ func checkForUpdate() error {
 		return err
 	}
 
-	newVer := strings.TrimPrefix(rel.TagName, "v")
-	curVer := strings.TrimPrefix(version, "v")
-	if !isNewerVersion(curVer, newVer) {
+	cur := "v" + strings.TrimPrefix(version, "v")
+	new := rel.TagName
+	if semver.Compare(new, cur) <= 0 {
 		fmt.Println("No update available; current", version)
 		return nil
 	}
 
+	// Choose the correct binary asset (GOOS & GOARCH)
+	targetSuffix := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
 	var assetURL, assetName string
 	for _, a := range rel.Assets {
 		name := strings.ToLower(a.Name)
-		switch runtime.GOOS {
-		case "windows":
-			if strings.HasSuffix(name, ".exe") {
-				assetURL, assetName = a.URL, a.Name
-			}
-		case "darwin":
-			if strings.Contains(name, "darwin") {
-				assetURL, assetName = a.URL, a.Name
-			}
-		default: // linux
-			if strings.Contains(name, "linux") {
-				assetURL, assetName = a.URL, a.Name
-			}
+		if strings.Contains(name, targetSuffix) {
+			assetURL, assetName = a.URL, a.Name
+			break
 		}
 	}
 	if assetURL == "" {
-		return fmt.Errorf("no binary asset for %s", runtime.GOOS)
+		return fmt.Errorf("no binary asset for %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 
 	fmt.Println("Downloading", assetName)
@@ -81,31 +74,16 @@ func checkForUpdate() error {
 		return err
 	}
 	defer r2.Body.Close()
+
 	h := sha256.New()
-	w := io.MultiWriter(tmp, h)
-	if _, err := io.Copy(w, r2.Body); err != nil {
+	if _, err := io.Copy(io.MultiWriter(tmp, h), r2.Body); err != nil {
 		return err
 	}
+	_ = os.Chmod(tmp.Name(), 0o755) // make executable
 	fmt.Printf("SHA‑256: %s\n", hex.EncodeToString(h.Sum(nil)))
 
 	updatePath = tmp.Name()
 	updatePending = true
 	systray.Quit() // trigger graceful restart
 	return nil
-}
-
-func isNewerVersion(cur, new string) bool {
-	cc := strings.Split(cur, ".")
-	nc := strings.Split(new, ".")
-	for i := 0; i < len(cc) && i < len(nc); i++ {
-		var ci, ni int
-		fmt.Sscanf(cc[i], "%d", &ci)
-		fmt.Sscanf(nc[i], "%d", &ni)
-		if ni > ci {
-			return true
-		} else if ni < ci {
-			return false
-		}
-	}
-	return len(nc) > len(cc)
 }

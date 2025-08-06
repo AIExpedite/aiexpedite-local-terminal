@@ -29,9 +29,9 @@ type resultMsg struct {
 	Ts     int64  `json:"ts"`
 }
 
-/* -------------------------------------------------------------------------- */
-/*  StartPubSubLoop – listens for commands and publishes results              */
-/* -------------------------------------------------------------------------- */
+/* --------------------------------------------------------------------------
+   StartPubSubLoop – listens for commands and publishes results
+   -------------------------------------------------------------------------- */
 func StartPubSubLoop(cfg *Config) {
 	if cfg.ProjectID == "" {
 		fmt.Println("[pubsub] disabled – project_id empty")
@@ -46,6 +46,11 @@ func StartPubSubLoop(cfg *Config) {
 		fmt.Println("[pubsub] client error:", err)
 		return
 	}
+	// Ensure underlying connections close when ctx is done
+	go func() {
+		<-ctx.Done()
+		_ = client.Close()
+	}()
 
 	sub := client.Subscription(cfg.CommandsSubscription)
 	sub.ReceiveSettings.Synchronous = true
