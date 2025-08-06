@@ -18,6 +18,8 @@ import (
 
 const githubRepo = "AIExpedite/aiexpedite-local-terminal"
 
+// checkForUpdate queries the latest GitHub release, downloads the correct
+// binary if a newer version exists, and triggers a self‑restart.
 func checkForUpdate() error {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
 
@@ -42,13 +44,13 @@ func checkForUpdate() error {
 	}
 
 	cur := "v" + strings.TrimPrefix(version, "v")
-	new := rel.TagName
-	if semver.Compare(new, cur) <= 0 {
+	latest := rel.TagName 
+	if semver.Compare(latest, cur) <= 0 {
 		fmt.Println("No update available; current", version)
 		return nil
 	}
 
-	// Choose the correct binary asset (GOOS & GOARCH)
+	// Pick the asset matching GOOS / GOARCH.
 	targetSuffix := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
 	var assetURL, assetName string
 	for _, a := range rel.Assets {
@@ -84,6 +86,6 @@ func checkForUpdate() error {
 
 	updatePath = tmp.Name()
 	updatePending = true
-	systray.Quit() // trigger graceful restart
+	systray.Quit() // graceful restart
 	return nil
 }
