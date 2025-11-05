@@ -14,3 +14,8 @@ func ensureAutoStart() error {
 	// TODO: implement Linux autostart (e.g., create ~/.config/autostart/TrayAgent.desktop)
 	return nil
 }
+
+// showConsoleWindow is a no-op on Linux (console visibility is handled differently)
+func showConsoleWindow(show bool) {
+	// No-op on Linux
+}

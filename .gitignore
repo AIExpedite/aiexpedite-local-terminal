@@ -1,20 +1,43 @@
-# ───── Go tooling ──────────────────────────────────────────────────────────
-# Binaries for programs and plugins
+# ═══════════════════════════════════════════════════════════════════════════
+# Public Repository - Minimal Code Display
+# Goal: Show only the core Go source code for transparency and trust
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ───── Build Artifacts & Binaries ──────────────────────────────────────────
+# Compiled binaries - users should build from source
 *.exe
 *.dll
 *.so
 *.dylib
-*.test              # go test -c generated files
-*.out               # go test -c -o *.out
-
-# Output of `go build`, our workflow places them in /dist
+*.test
+*.out
 dist/
 
-# Go coverage profiles
-*.cover
-*.cov
-coverage/
+# Windows resource files (generated)
+*.syso
 
+# ───── Build & Helper Scripts ──────────────────────────────────────────────
+# Batch files for building and setup
+*.bat
+
+# Node.js helper scripts (icon conversion, etc.)
+*.js
+node_modules/
+package.json
+package-lock.json
+
+# Installer configuration
+*.iss
+installer-output/
+innosetup-installer.exe
+INSTALLER-README.md
+
+# ───── Assets & Resources ──────────────────────────────────────────────────
+# Icons, images, and Windows resources
+assets/
+winres/
+
+# ───── Development Files ───────────────────────────────────────────────────
 # IDE / editor settings
 .idea/
 .vscode/
@@ -30,6 +53,17 @@ Thumbs.db
 *.log
 *.tmp
 *.bak
+nul
 
-# If you ever vendor dependencies (go mod vendor), keep or drop as needed
-# vendor/
+# Go coverage profiles
+*.cover
+*.cov
+coverage/
+
+# ───── Documentation to Keep ───────────────────────────────────────────────
+# Core files that WILL be checked in:
+# - *.go (all Go source code)
+# - go.mod, go.sum (dependency management)
+# - README.md, *.md (documentation)
+# - .github/ (CI/CD workflows)
+# - LICENSE (if present)

@@ -49,9 +49,12 @@ func onTrayReady(cfg *Config) func() {
 		mOpen := systray.AddMenuItem("Open Terminal", "Open terminal in browser")
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
 		systray.AddSeparator()
+		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", false)
+		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("Quit", "Exit the agent")
 
 		go func() {
+			consoleVisible := false
 			for {
 				select {
 				case <-mOpen.ClickedCh:
@@ -67,6 +70,20 @@ func onTrayReady(cfg *Config) func() {
 							fmt.Println("Update check failed:", err)
 						}
 					}()
+
+				case <-mConsole.ClickedCh:
+					consoleVisible = !consoleVisible
+					if consoleVisible {
+						mConsole.Check()
+						if runtime.GOOS == "windows" {
+							showConsoleWindow(true)
+						}
+					} else {
+						mConsole.Uncheck()
+						if runtime.GOOS == "windows" {
+							showConsoleWindow(false)
+						}
+					}
 
 				case <-mQuit.ClickedCh:
 					systray.Quit()

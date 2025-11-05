@@ -13,3 +13,8 @@ func ensureAutoStart() error {
 	// TODO: implement macOS autostart
 	return nil
 }
+
+// showConsoleWindow is a no-op on macOS (console visibility is handled differently)
+func showConsoleWindow(show bool) {
+	// No-op on macOS
+}

@@ -61,7 +61,7 @@ func DefaultConfig() *Config {
 		ResultsTopic:         "terminal-results",
 
 		LocalTtydPort: 7681,
-		AutoUpdate:    true,
+		AutoUpdate:    false, // Disabled by default (can be enabled in config file)
 	}
 }
 
