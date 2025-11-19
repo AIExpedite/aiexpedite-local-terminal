@@ -43,8 +43,8 @@ func main() {
 func onTrayReady(cfg *Config) func() {
 	return func() {
 		systray.SetIcon(iconData)
-		systray.SetTitle("TrayAgent")
-		systray.SetTooltip("TrayAgent – Remote Terminal")
+		systray.SetTitle("AI Expedite Terminal")
+		systray.SetTooltip("AI Expedite Terminal – Remote Command Execution")
 
 		mOpen := systray.AddMenuItem("Open Terminal", "Open terminal in browser")
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
