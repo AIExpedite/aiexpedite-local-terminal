@@ -27,6 +27,10 @@ type Config struct {
 	/* ─── Local ttyd ────────────────────────────────── */
 	LocalTtydPort int  `json:"local_ttyd_port,omitempty"` // 0 = 7681
 	AutoUpdate    bool `json:"auto_update,omitempty"`
+
+	/* ─── File Upload (GCS) ─────────────────────────── */
+	StorageBucket    string `json:"storage_bucket,omitempty"`     // Firebase bucket name
+	EnableFileUpload bool   `json:"enable_file_upload,omitempty"` // Feature flag
 }
 
 /* -------------------------------------------------------------------------- */
@@ -62,6 +66,10 @@ func DefaultConfig() *Config {
 
 		LocalTtydPort: 7681,
 		AutoUpdate:    false, // Disabled by default (can be enabled in config file)
+
+		// File upload defaults
+		StorageBucket:    "aix-core-dev-app-s1e4.firebasestorage.app",
+		EnableFileUpload: true,
 	}
 }
 

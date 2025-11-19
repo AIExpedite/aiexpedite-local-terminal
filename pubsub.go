@@ -5,7 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/pubsub"
@@ -22,11 +26,13 @@ type commandMsg struct {
 
 /* Outgoing result payload (matches backend publishResult struct) */
 type resultMsg struct {
-	ID     string `json:"id"`
-	UID    string `json:"uid"`
-	Output string `json:"output"`
-	Status string `json:"status"` // "success" | "error"
-	Ts     int64  `json:"ts"`
+	ID           string        `json:"id"`
+	UID          string        `json:"uid"`
+	Output       string        `json:"output"`
+	Status       string        `json:"status"` // "success" | "partial" | "error"
+	Ts           int64         `json:"ts"`
+	Files        []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
+	UploadErrors []UploadError `json:"uploadErrors,omitempty"` // File upload failures
 }
 
 /* --------------------------------------------------------------------------
@@ -95,6 +101,50 @@ func StartPubSubLoop(cfg *Config) {
 				res.Output = execErr.Error() + "\n" + out
 			}
 
+			// File upload integration
+			if cfg.EnableFileUpload && res.Status != "error" {
+				files := detectOutputFiles(cmd.Command, out)
+				if len(files) > 0 {
+					fmt.Printf("[file-upload] Detected %d output files, uploading to GCS...\n", len(files))
+
+					// Initialize GCS client
+					storageClient, storageErr := InitStorageClient(ctx)
+					if storageErr != nil {
+						fmt.Printf("[file-upload] Failed to initialize storage client: %v\n", storageErr)
+					} else {
+						defer storageClient.Close()
+
+						// Create logger
+						logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+						// Upload files
+						workspaceID := extractWorkspaceID(cmd)
+						uploadResult := UploadFiles(
+							ctx,
+							storageClient,
+							cfg.StorageBucket,
+							files,
+							workspaceID,
+							cmd.ID,
+							logger,
+						)
+
+						res.Files = uploadResult.Successful
+						res.UploadErrors = uploadResult.Failed
+
+						if len(uploadResult.Failed) > 0 && len(uploadResult.Successful) > 0 {
+							res.Status = "partial"
+						} else if len(uploadResult.Failed) > 0 && len(uploadResult.Successful) == 0 {
+							res.Status = "error"
+							res.Output += fmt.Sprintf("\n[file-upload] All file uploads failed: %d errors", len(uploadResult.Failed))
+						}
+
+						fmt.Printf("[file-upload] Upload complete: %d successful, %d failed\n",
+							len(uploadResult.Successful), len(uploadResult.Failed))
+					}
+				}
+			}
+
 			bytes, _ := json.Marshal(res)
 			fmt.Printf("[pubsub] publishing result to topic: %s (payload size: %d bytes)\n", cfg.ResultsTopic, len(bytes))
 			fmt.Printf("[pubsub] result preview - ID: %s, UID: %s, Status: %s, OutputLength: %d\n", res.ID, res.UID, res.Status, len(res.Output))
@@ -147,4 +197,64 @@ func containsSpace(s string) bool {
 		}
 	}
 	return false
+}
+
+/* --------------------------------------------------------------------------
+   File Upload Helper Functions
+   -------------------------------------------------------------------------- */
+
+// detectOutputFiles finds files to upload based on command and output
+func detectOutputFiles(command string, output string) []string {
+	files := []string{}
+
+	// Pattern 1: Playwright test artifacts
+	if containsSubstring(command, "playwright") || containsSubstring(command, "pwtest") {
+		fmt.Println("[file-upload] Detected Playwright command, scanning for test artifacts...")
+		// Look for test-results directory
+		files = appendFilesFromDir(files, "test-results", []string{".png", ".webm", ".mp4", ".json", ".html"})
+		fmt.Printf("[file-upload] Found %d Playwright artifacts\n", len(files))
+	}
+
+	// Pattern 2: Generic screenshots in current directory
+	if containsSubstring(command, "screenshot") || containsSubstring(output, "screenshot") {
+		files = appendFilesFromDir(files, ".", []string{".png", ".jpg", ".jpeg"})
+	}
+
+	// Pattern 3: Video recordings
+	if containsSubstring(command, "record") || containsSubstring(output, "recording") {
+		files = appendFilesFromDir(files, ".", []string{".webm", ".mp4", ".mov"})
+	}
+
+	return files
+}
+
+// containsSubstring checks if haystack contains needle (case-insensitive)
+func containsSubstring(haystack, needle string) bool {
+	return len(haystack) > 0 && len(needle) > 0 &&
+		   (haystack == needle || strings.Contains(strings.ToLower(haystack), strings.ToLower(needle)))
+}
+
+// appendFilesFromDir recursively finds files with given extensions in directory
+func appendFilesFromDir(files []string, dir string, extensions []string) []string {
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			ext := strings.ToLower(filepath.Ext(path))
+			for _, targetExt := range extensions {
+				if ext == targetExt {
+					files = append(files, path)
+					break
+				}
+			}
+		}
+		return nil
+	})
+	return files
+}
+
+// extractWorkspaceID extracts workspaceID from command context
+// TODO: Pass workspaceID in command metadata in future
+func extractWorkspaceID(cmd commandMsg) string {
+	// Placeholder: return default workspace
+	// In future, parse from command args or metadata
+	return "default-workspace"
 }
