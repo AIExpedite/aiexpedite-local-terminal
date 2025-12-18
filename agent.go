@@ -84,13 +84,17 @@ func StartAgent(cfg *Config) {
 		fmt.Println("Fatal: cannot start ttyd –", err)
 		return
 	}
-	fmt.Println("ttyd listening on 127.0.0.1:", port)
+	fmt.Printf("→ ttyd listening on http://127.0.0.1:%d\n", port)
 
 	/* 3. Start Pub/Sub loop (non‑blocking) -------------------------------- */
 
 	go StartPubSubLoop(cfg)
 
-	/* 4. Optional auto‑update -------------------------------------------- */
+	/* 4. Display connection instructions ---------------------------------- */
+
+	showConnectionInstructions(cfg, port)
+
+	/* 5. Optional auto‑update -------------------------------------------- */
 
 	if cfg.AutoUpdate {
 		go func() {
@@ -100,4 +104,42 @@ func StartAgent(cfg *Config) {
 			}
 		}()
 	}
+}
+
+/*──────────────────────────  showConnectionInstructions  ──────────────────────────*/
+
+// showConnectionInstructions displays how to connect to the terminal
+func showConnectionInstructions(cfg *Config, port int) {
+	fmt.Println("")
+	fmt.Println("╔════════════════════════════════════════════════════════════╗")
+	fmt.Println("║                    Ready to Connect!                       ║")
+	fmt.Println("╠════════════════════════════════════════════════════════════╣")
+	fmt.Printf("║  Local Terminal:  http://127.0.0.1:%-24d║\n", port)
+	fmt.Println("║                                                            ║")
+
+	if cfg.ProjectID == "" {
+		fmt.Println("║  Remote Access:   Not configured                          ║")
+		fmt.Println("║                                                            ║")
+		fmt.Println("║  To enable remote access from AI Expedite:                ║")
+		fmt.Println("║  1. Edit config: %APPDATA%\\AIExpedite\\config.json         ║")
+		fmt.Println("║  2. Set \"project_id\" to your GCP project                  ║")
+		fmt.Println("║  3. Set GOOGLE_APPLICATION_CREDENTIALS env var            ║")
+		fmt.Println("║  4. Restart this application                              ║")
+	} else {
+		fmt.Println("║  Remote Access:   Enabled (Pub/Sub)                       ║")
+		fmt.Printf("║  Project:         %-40s║\n", truncateString(cfg.ProjectID, 40))
+	}
+
+	fmt.Println("║                                                            ║")
+	fmt.Println("║  Tip: Right-click tray icon → Open Terminal                ║")
+	fmt.Println("╚════════════════════════════════════════════════════════════╝")
+	fmt.Println("")
+}
+
+// truncateString truncates a string to maxLen characters with ellipsis
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }
