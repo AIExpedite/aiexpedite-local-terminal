@@ -12,7 +12,7 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-//go:embed assets/aiexpedite-icon.ico
+//go:embed assets/aiexpedite-tray-icon.ico
 var iconData []byte
 
 var (
