@@ -9,11 +9,143 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/pubsub"
+	"golang.org/x/time/rate"
 )
+
+/* --------------------------------------------------------------------------
+   Sensitive Data Redaction
+   -------------------------------------------------------------------------- */
+
+var (
+	// Compiled regex patterns for sensitive data detection
+	sensitivePatterns     []*regexp.Regexp
+	sensitivePatternsOnce sync.Once
+)
+
+// initSensitivePatterns compiles regex patterns once
+func initSensitivePatterns() {
+	sensitivePatternsOnce.Do(func() {
+		patterns := []string{
+			// Passwords in various formats
+			`(?i)(password|passwd|pwd)\s*[=:]\s*\S+`,
+			`(?i)(-p|--password)\s+\S+`,
+			// API keys, tokens, secrets
+			`(?i)(token|api_key|apikey|api-key|secret|secret_key|secretkey|auth_key|authkey)\s*[=:]\s*\S+`,
+			// Bearer tokens
+			`(?i)Bearer\s+[A-Za-z0-9\-_.~+/]+=*`,
+			// AWS credentials
+			`(?i)(aws_access_key_id|aws_secret_access_key|aws_session_token)\s*[=:]\s*\S+`,
+			`AKIA[0-9A-Z]{16}`, // AWS Access Key ID pattern
+			// Connection strings with credentials
+			`(?i)(mongodb|postgres|mysql|redis|amqp)://[^:]+:[^@]+@`,
+			// Private keys
+			`(?i)-----BEGIN\s+(RSA\s+)?PRIVATE\s+KEY-----`,
+			// GitHub tokens
+			`gh[pousr]_[A-Za-z0-9_]{36,}`,
+			// Generic secrets in JSON
+			`(?i)"(password|secret|token|api_key|apikey)":\s*"[^"]+`,
+		}
+
+		sensitivePatterns = make([]*regexp.Regexp, 0, len(patterns))
+		for _, p := range patterns {
+			if re, err := regexp.Compile(p); err == nil {
+				sensitivePatterns = append(sensitivePatterns, re)
+			}
+		}
+	})
+}
+
+// redactSensitiveData replaces sensitive patterns in a string with [REDACTED]
+func redactSensitiveData(s string) string {
+	initSensitivePatterns()
+
+	result := s
+	for _, re := range sensitivePatterns {
+		result = re.ReplaceAllStringFunc(result, func(match string) string {
+			// For patterns like "password=xxx", keep the key visible
+			if idx := strings.IndexAny(match, "=:"); idx != -1 {
+				return match[:idx+1] + "[REDACTED]"
+			}
+			// For patterns like "Bearer xxx", keep the prefix
+			if strings.HasPrefix(strings.ToLower(match), "bearer ") {
+				return "Bearer [REDACTED]"
+			}
+			// For connection strings, redact credentials but keep protocol
+			if strings.Contains(match, "://") {
+				parts := strings.SplitN(match, "://", 2)
+				if len(parts) == 2 {
+					return parts[0] + "://[REDACTED]@"
+				}
+			}
+			return "[REDACTED]"
+		})
+	}
+	return result
+}
+
+// redactArgs redacts sensitive data from command arguments
+func redactArgs(args []string) []string {
+	result := make([]string, len(args))
+	for i, arg := range args {
+		result[i] = redactSensitiveData(arg)
+	}
+	return result
+}
+
+// redactCommandForLog creates a safe string for logging a command
+func redactCommandForLog(cmd string, args []string) string {
+	return redactSensitiveData(cmd) + " " + strings.Join(redactArgs(args), " ")
+}
+
+/* --------------------------------------------------------------------------
+   Per-UID Rate Limiting
+   -------------------------------------------------------------------------- */
+
+var (
+	// Per-UID rate limiters: 10 commands/second with burst of 20
+	uidRateLimiters = make(map[string]*rate.Limiter)
+	uidRateMutex    sync.RWMutex
+)
+
+// getUIDRateLimiter returns or creates a rate limiter for the given UID
+func getUIDRateLimiter(uid string) *rate.Limiter {
+	uidRateMutex.RLock()
+	limiter, exists := uidRateLimiters[uid]
+	uidRateMutex.RUnlock()
+
+	if exists {
+		return limiter
+	}
+
+	uidRateMutex.Lock()
+	defer uidRateMutex.Unlock()
+
+	// Double-check after acquiring write lock
+	if limiter, exists = uidRateLimiters[uid]; exists {
+		return limiter
+	}
+
+	// Create new limiter: 10 commands per second with burst of 20
+	limiter = rate.NewLimiter(rate.Limit(10), 20)
+	uidRateLimiters[uid] = limiter
+	return limiter
+}
+
+// checkRateLimit checks if a command should be rate-limited
+// Returns true if the command is allowed, false if rate-limited
+func checkRateLimit(uid string) bool {
+	if uid == "" {
+		return true // Allow commands without UID (backwards compatibility)
+	}
+	limiter := getUIDRateLimiter(uid)
+	return limiter.Allow()
+}
 
 /* Incoming command payload (matches backend publishCommand struct) */
 type commandMsg struct {
@@ -31,7 +163,7 @@ type resultMsg struct {
 	WorkspaceID  string        `json:"workspaceID,omitempty"`  // Workspace scope for audit trail
 	UID          string        `json:"uid"`
 	Output       string        `json:"output"`
-	Status       string        `json:"status"` // "success" | "partial" | "error" | "denied"
+	Status       string        `json:"status"` // "success" | "partial" | "error" | "denied" | "rate_limited" | "unauthorized"
 	Ts           int64         `json:"ts"`
 	Files        []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
 	UploadErrors []UploadError `json:"uploadErrors,omitempty"` // File upload failures
@@ -76,7 +208,8 @@ func StartPubSubLoop(cfg *Config) {
 	go func() {
 		fmt.Printf("[pubsub] listening for commands on: %s\n", cfg.CommandsSubscription)
 		err := sub.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {
-			fmt.Printf("[pubsub] received command: %s\n", string(m.Data))
+			// Redact sensitive data before logging received command
+			fmt.Printf("[pubsub] received command: %s\n", redactSensitiveData(string(m.Data)))
 			var cmd commandMsg
 			if err := json.Unmarshal(m.Data, &cmd); err != nil {
 				fmt.Println("[pubsub] bad payload:", err)
@@ -84,9 +217,32 @@ func StartPubSubLoop(cfg *Config) {
 				return
 			}
 
+			// ─── Per-UID Rate Limiting ─────────────────────────────────────────
+			if !checkRateLimit(cmd.UID) {
+				fmt.Printf("[security] Rate limit exceeded for UID: %s\n", cmd.UID)
+
+				// Send rate_limited response back to user for immediate feedback
+				res := resultMsg{
+					ID:          cmd.ID,
+					WorkspaceID: cmd.WorkspaceID,
+					UID:         cmd.UID,
+					Output:      "Command rate limit exceeded. Please wait before retrying.",
+					Status:      "rate_limited",
+					Ts:          time.Now().UnixMilli(),
+				}
+				bytes, _ := json.Marshal(res)
+				if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
+					fmt.Println("[pubsub] publish error:", err)
+				}
+				m.Ack()
+				return
+			}
+			// ─────────────────────────────────────────────────────────────────
+
 			// ─── Command Allow List Validation ───────────────────────────────
 			if cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
-				fmt.Printf("[security] Command not in allow list: %s %v\n", cmd.Command, cmd.Args)
+				// Redact args when logging security events
+				fmt.Printf("[security] Command not in allow list: %s\n", redactCommandForLog(cmd.Command, cmd.Args))
 
 				// Get timeout settings from config
 				timeoutSec := cfg.ApprovalTimeoutSec
@@ -107,7 +263,8 @@ func StartPubSubLoop(cfg *Config) {
 				case ApprovalDeny:
 					fmt.Println("[security] User denied command execution")
 					if cfg.LogDeniedCommands {
-						fmt.Printf("[security-audit] DENIED: %s %v (user: %s)\n", cmd.Command, cmd.Args, cmd.UID)
+						// Redact args in audit log
+						fmt.Printf("[security-audit] DENIED: %s (user: %s)\n", redactCommandForLog(cmd.Command, cmd.Args), cmd.UID)
 					}
 
 					// Send denial result back to backend
@@ -142,9 +299,11 @@ func StartPubSubLoop(cfg *Config) {
 			}
 			// ─────────────────────────────────────────────────────────────────
 
-			fmt.Printf("[pubsub] executing command: %s %v\n", cmd.Command, cmd.Args)
+			// Redact command args before logging
+			fmt.Printf("[pubsub] executing command: %s\n", redactCommandForLog(cmd.Command, cmd.Args))
 			out, execErr := runLocalCommand(cmd.Command, cmd.Args)
-			fmt.Printf("[pubsub] command output (length=%d): %s\n", len(out), out)
+			// Redact output before logging (may contain secrets)
+			fmt.Printf("[pubsub] command output (length=%d): %s\n", len(out), redactSensitiveData(out))
 			if execErr != nil {
 				fmt.Printf("[pubsub] command error: %v\n", execErr)
 			}
@@ -185,27 +344,27 @@ func StartPubSubLoop(cfg *Config) {
 
 							// Upload files
 							uploadResult := UploadFiles(
-							ctx,
-							storageClient,
-							cfg.StorageBucket,
-							files,
-							workspaceID,
-							cmd.ID,
-							logger,
-						)
+								ctx,
+								storageClient,
+								cfg.StorageBucket,
+								files,
+								workspaceID,
+								cmd.ID,
+								logger,
+							)
 
-						res.Files = uploadResult.Successful
-						res.UploadErrors = uploadResult.Failed
+							res.Files = uploadResult.Successful
+							res.UploadErrors = uploadResult.Failed
 
-						if len(uploadResult.Failed) > 0 && len(uploadResult.Successful) > 0 {
-							res.Status = "partial"
-						} else if len(uploadResult.Failed) > 0 && len(uploadResult.Successful) == 0 {
-							res.Status = "error"
-							res.Output += fmt.Sprintf("\n[file-upload] All file uploads failed: %d errors", len(uploadResult.Failed))
-						}
+							if len(uploadResult.Failed) > 0 && len(uploadResult.Successful) > 0 {
+								res.Status = "partial"
+							} else if len(uploadResult.Failed) > 0 && len(uploadResult.Successful) == 0 {
+								res.Status = "error"
+								res.Output += fmt.Sprintf("\n[file-upload] All file uploads failed: %d errors", len(uploadResult.Failed))
+							}
 
-						fmt.Printf("[file-upload] Upload complete: %d successful, %d failed\n",
-							len(uploadResult.Successful), len(uploadResult.Failed))
+							fmt.Printf("[file-upload] Upload complete: %d successful, %d failed\n",
+								len(uploadResult.Successful), len(uploadResult.Failed))
 						}
 					}
 				}
@@ -214,11 +373,11 @@ func StartPubSubLoop(cfg *Config) {
 			bytes, _ := json.Marshal(res)
 			fmt.Printf("[pubsub] publishing result to topic: %s (payload size: %d bytes)\n", cfg.ResultsTopic, len(bytes))
 			fmt.Printf("[pubsub] result preview - ID: %s, UID: %s, Status: %s, OutputLength: %d\n", res.ID, res.UID, res.Status, len(res.Output))
-			// Only print first 500 chars to avoid buffer issues
+			// Redact result JSON before logging (contains output which may have secrets)
 			if len(string(bytes)) > 500 {
-				fmt.Printf("[pubsub] result JSON (truncated): %s...\n", string(bytes)[:500])
+				fmt.Printf("[pubsub] result JSON (truncated): %s...\n", redactSensitiveData(string(bytes)[:500]))
 			} else {
-				fmt.Printf("[pubsub] result JSON: %s\n", string(bytes))
+				fmt.Printf("[pubsub] result JSON: %s\n", redactSensitiveData(string(bytes)))
 			}
 			if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
 				fmt.Println("[pubsub] publish error:", err)
@@ -266,6 +425,25 @@ func containsSpace(s string) bool {
 }
 
 /* --------------------------------------------------------------------------
+   Path Safety Validation
+   -------------------------------------------------------------------------- */
+
+// isPathSafe validates that a path is within the current working directory
+// to prevent path traversal attacks
+func isPathSafe(path string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	// Ensure the path is within current working directory
+	return strings.HasPrefix(abs, cwd)
+}
+
+/* --------------------------------------------------------------------------
    File Upload Helper Functions
    -------------------------------------------------------------------------- */
 
@@ -297,13 +475,24 @@ func detectOutputFiles(command string, output string) []string {
 // containsSubstring checks if haystack contains needle (case-insensitive)
 func containsSubstring(haystack, needle string) bool {
 	return len(haystack) > 0 && len(needle) > 0 &&
-		   (haystack == needle || strings.Contains(strings.ToLower(haystack), strings.ToLower(needle)))
+		(haystack == needle || strings.Contains(strings.ToLower(haystack), strings.ToLower(needle)))
 }
 
 // appendFilesFromDir recursively finds files with given extensions in directory
 func appendFilesFromDir(files []string, dir string, extensions []string) []string {
+	// Security: Validate directory is within safe boundaries
+	if !isPathSafe(dir) {
+		fmt.Printf("[security] Blocked path traversal attempt: %s\n", dir)
+		return files
+	}
+
 	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err == nil && !info.IsDir() {
+			// Security: Validate each file path as well
+			if !isPathSafe(path) {
+				fmt.Printf("[security] Blocked file path traversal: %s\n", path)
+				return nil
+			}
 			ext := strings.ToLower(filepath.Ext(path))
 			for _, targetExt := range extensions {
 				if ext == targetExt {
