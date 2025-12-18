@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 )
+
+const ttydDownloadURL = "https://github.com/tsl0922/ttyd/releases"
 
 // ensureTtyd verifies ttyd is on PATH or tries to install it automatically.
 func ensureTtyd() error {
@@ -56,52 +59,135 @@ func checkTtydInstalled() bool {
 }
 
 // installTtydWindows attempts to install ttyd on Windows via winget or scoop
+// Shows user-friendly dialogs and progress
 func installTtydWindows() error {
+	// Show install prompt dialog
+	choice := ShowInstallPrompt(
+		"ttyd (Terminal Server)",
+		"ttyd provides the web-based terminal interface.\n"+
+			"It will be installed via Windows Package Manager (winget).",
+	)
+
+	switch choice {
+	case InstallNo:
+		ShowInfoDialog(
+			"Installation Cancelled",
+			"You chose to exit. To use AI Expedite Terminal, please install ttyd manually:\n\n"+
+				"Open PowerShell and run:\n"+
+				"  winget install tsl0922.ttyd\n\n"+
+				"Then restart this application.",
+		)
+		os.Exit(0)
+		return nil
+
+	case InstallManual:
+		// Open download page in browser
+		openBrowser(ttydDownloadURL)
+		ShowInfoDialog(
+			"Manual Installation",
+			"Opening ttyd releases page in your browser.\n\n"+
+				"Download the Windows executable and add it to your PATH.\n"+
+				"Then restart this application.",
+		)
+		os.Exit(0)
+		return nil
+
+	case InstallYes:
+		// Continue with automatic installation
+	}
+
+	// Show console during installation
+	showConsoleWindow(true)
+
+	fmt.Println("")
+	fmt.Println("╔════════════════════════════════════════════════════════════╗")
+	fmt.Println("║           Installing ttyd - Please wait...                 ║")
+	fmt.Println("╚════════════════════════════════════════════════════════════╝")
+	fmt.Println("")
+
 	// Try winget first
 	if _, err := exec.LookPath("winget"); err == nil {
-		fmt.Println("Attempting to install ttyd via winget (this may take a moment)...")
+		fmt.Println("→ Using Windows Package Manager (winget)...")
+		fmt.Println("→ Running: winget install tsl0922.ttyd")
+		fmt.Println("")
+
 		cmd := exec.Command("winget", "install",
 			"-e", "--id", "tsl0922.ttyd",
-			"-h",
 			"--accept-package-agreements",
 			"--accept-source-agreements",
 			"--disable-interactivity")
 
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			fmt.Printf("winget install failed: %v\nOutput: %s\n", err, string(output))
-		} else {
-			fmt.Printf("winget output: %s\n", string(output))
+		// Show output in real-time
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 
-			// Check if ttyd is now available (try PATH first, then common install locations)
-			if checkTtydInstalled() {
-				fmt.Println("ttyd installed successfully via winget!")
-				return nil
-			}
+		err := cmd.Run()
+		if err != nil {
+			fmt.Printf("\n⚠ winget install returned: %v\n", err)
+		}
+
+		// Check if ttyd is now available
+		if checkTtydInstalled() {
+			fmt.Println("")
+			fmt.Println("╔════════════════════════════════════════════════════════════╗")
+			fmt.Println("║              ✓ ttyd installed successfully!                ║")
+			fmt.Println("╚════════════════════════════════════════════════════════════╝")
+			fmt.Println("")
+			return nil
 		}
 	}
 
 	// Try scoop as fallback
 	if _, err := exec.LookPath("scoop"); err == nil {
-		fmt.Println("Attempting to install ttyd via scoop...")
-		cmd := exec.Command("scoop", "install", "ttyd")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			fmt.Printf("scoop install failed: %v\nOutput: %s\n", err, string(output))
-		} else {
-			fmt.Printf("scoop output: %s\n", string(output))
+		fmt.Println("")
+		fmt.Println("→ Trying Scoop as fallback...")
+		fmt.Println("→ Running: scoop install ttyd")
+		fmt.Println("")
 
-			if checkTtydInstalled() {
-				fmt.Println("ttyd installed successfully via scoop!")
-				return nil
-			}
+		cmd := exec.Command("scoop", "install", "ttyd")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		err := cmd.Run()
+		if err != nil {
+			fmt.Printf("\n⚠ scoop install returned: %v\n", err)
+		}
+
+		if checkTtydInstalled() {
+			fmt.Println("")
+			fmt.Println("╔════════════════════════════════════════════════════════════╗")
+			fmt.Println("║              ✓ ttyd installed successfully!                ║")
+			fmt.Println("╚════════════════════════════════════════════════════════════╝")
+			fmt.Println("")
+			return nil
 		}
 	}
 
-	return errors.New("ttyd not found. Please install it manually:\n" +
-		"  Option 1: winget install tsl0922.ttyd\n" +
-		"  Option 2: scoop install ttyd\n" +
-		"Then restart this application.")
+	// Installation failed
+	fmt.Println("")
+	fmt.Println("╔════════════════════════════════════════════════════════════╗")
+	fmt.Println("║              ✗ Installation failed                         ║")
+	fmt.Println("╚════════════════════════════════════════════════════════════╝")
+	fmt.Println("")
+	fmt.Println("Please install ttyd manually:")
+	fmt.Println("  Option 1: winget install tsl0922.ttyd")
+	fmt.Println("  Option 2: scoop install ttyd")
+	fmt.Println("  Option 3: Download from", ttydDownloadURL)
+	fmt.Println("")
+	fmt.Println("Press Enter to exit...")
+
+	// Wait for user to acknowledge
+	bufio.NewReader(os.Stdin).ReadBytes('\n')
+
+	ShowErrorDialog(
+		"Installation Failed",
+		"ttyd could not be installed automatically.\n\n"+
+			"Please install it manually:\n"+
+			"  winget install tsl0922.ttyd\n\n"+
+			"Then restart this application.",
+	)
+
+	return errors.New("ttyd installation failed")
 }
 
 // installTtydDarwin attempts to install ttyd on macOS via Homebrew
@@ -109,6 +195,8 @@ func installTtydDarwin() error {
 	if _, err := exec.LookPath("brew"); err == nil {
 		fmt.Println("Attempting to install ttyd via Homebrew...")
 		cmd := exec.Command("brew", "install", "ttyd")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err == nil {
 			if _, err := exec.LookPath("ttyd"); err == nil {
 				fmt.Println("ttyd installed successfully via Homebrew!")
@@ -126,6 +214,8 @@ func installTtydLinux() error {
 	if _, err := exec.LookPath("apt-get"); err == nil {
 		fmt.Println("Attempting to install ttyd via apt-get...")
 		cmd := exec.Command("sudo", "apt-get", "-y", "install", "ttyd")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err == nil {
 			if _, err := exec.LookPath("ttyd"); err == nil {
 				fmt.Println("ttyd installed successfully via apt!")
@@ -136,6 +226,8 @@ func installTtydLinux() error {
 	if _, err := exec.LookPath("snap"); err == nil {
 		fmt.Println("Attempting to install ttyd via snap...")
 		cmd := exec.Command("sudo", "snap", "install", "ttyd", "--classic")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err == nil {
 			if _, err := exec.LookPath("ttyd"); err == nil {
 				fmt.Println("ttyd installed successfully via snap!")

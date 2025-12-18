@@ -19,16 +19,25 @@ var (
 )
 
 const (
+	MB_OK            = 0x00000000
+	MB_OKCANCEL      = 0x00000001
+	MB_YESNO         = 0x00000004
 	MB_YESNOCANCEL   = 0x00000003
+	MB_ICONERROR     = 0x00000010
+	MB_ICONQUESTION  = 0x00000020
 	MB_ICONWARNING   = 0x00000030
+	MB_ICONINFO      = 0x00000040
+	MB_DEFBUTTON1    = 0x00000000 // Default to first button
+	MB_DEFBUTTON2    = 0x00000100 // Default to second button
 	MB_DEFBUTTON3    = 0x00000200 // Default to Cancel (No/Deny)
 	MB_SETFOREGROUND = 0x00010000
 	MB_SYSTEMMODAL   = 0x00001000
 	MB_TOPMOST       = 0x00040000
 
+	IDOK     = 1
+	IDCANCEL = 2
 	IDYES    = 6
 	IDNO     = 7
-	IDCANCEL = 2
 )
 
 // ApprovalResult represents the user's decision
@@ -106,4 +115,102 @@ func ShowCommandApprovalDialog(cmd string, args []string, timeoutSec int) Approv
 		fmt.Println("[security] Approval dialog timed out")
 		return ApprovalDeny
 	}
+}
+
+/* --------------------------------------------------------------------------
+   Installation Dialogs
+   -------------------------------------------------------------------------- */
+
+// InstallChoice represents the user's choice for installation
+type InstallChoice int
+
+const (
+	InstallYes InstallChoice = iota
+	InstallNo
+	InstallManual
+)
+
+// ShowInstallPrompt displays a dialog asking user permission to install a dependency
+// Returns: InstallYes (auto-install), InstallNo (exit), InstallManual (open download page)
+func ShowInstallPrompt(component, description string) InstallChoice {
+	message := fmt.Sprintf(
+		"%s is required but not installed.\n\n"+
+			"%s\n\n"+
+			"Would you like to install it automatically?\n\n"+
+			"Click:\n"+
+			"  YES = Install automatically (via winget)\n"+
+			"  NO = Exit and install manually\n"+
+			"  CANCEL = Open download page",
+		component,
+		description,
+	)
+
+	title := "AI Expedite Terminal - Setup Required"
+
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	msgPtr, _ := syscall.UTF16PtrFromString(message)
+
+	flags := uint32(MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON1 | MB_SETFOREGROUND | MB_TOPMOST)
+
+	ret, _, _ := procMsgBox.Call(
+		0,
+		uintptr(unsafe.Pointer(msgPtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		uintptr(flags),
+	)
+
+	switch int(ret) {
+	case IDYES:
+		return InstallYes
+	case IDNO:
+		return InstallNo
+	default: // IDCANCEL
+		return InstallManual
+	}
+}
+
+// ShowInstallProgress displays an info dialog during installation
+// This is non-blocking - just shows a notification
+func ShowInfoDialog(title, message string) {
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	msgPtr, _ := syscall.UTF16PtrFromString(message)
+
+	flags := uint32(MB_OK | MB_ICONINFO | MB_SETFOREGROUND | MB_TOPMOST)
+
+	procMsgBox.Call(
+		0,
+		uintptr(unsafe.Pointer(msgPtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		uintptr(flags),
+	)
+}
+
+// ShowErrorDialog displays an error dialog
+func ShowErrorDialog(title, message string) {
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	msgPtr, _ := syscall.UTF16PtrFromString(message)
+
+	flags := uint32(MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST)
+
+	procMsgBox.Call(
+		0,
+		uintptr(unsafe.Pointer(msgPtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		uintptr(flags),
+	)
+}
+
+// ShowSuccessDialog displays a success dialog
+func ShowSuccessDialog(title, message string) {
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	msgPtr, _ := syscall.UTF16PtrFromString(message)
+
+	flags := uint32(MB_OK | MB_ICONINFO | MB_SETFOREGROUND | MB_TOPMOST)
+
+	procMsgBox.Call(
+		0,
+		uintptr(unsafe.Pointer(msgPtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		uintptr(flags),
+	)
 }

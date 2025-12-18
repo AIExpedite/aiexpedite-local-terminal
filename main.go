@@ -11,13 +11,18 @@ import (
 )
 
 func main() {
+	// Show startup message (console visible initially for first-time setup)
+	fmt.Println("")
+	fmt.Println("╔════════════════════════════════════════════════════════════╗")
+	fmt.Println("║          AI Expedite Terminal - Starting...                ║")
+	fmt.Println("╚════════════════════════════════════════════════════════════╝")
+	fmt.Println("")
+
 	// Ensure auto‑start at login (Windows)
 	if runtime.GOOS == "windows" {
 		if err := ensureAutoStart(); err != nil {
 			fmt.Println("AutoStart setup failed:", err)
 		}
-		// Hide console window on startup (user can show via tray menu)
-		showConsoleWindow(false)
 	}
 
 	// Load or create configuration
@@ -26,11 +31,13 @@ func main() {
 		if os.IsNotExist(err) {
 			cfg = DefaultConfig()
 			_ = cfg.Save(ConfigPath())
-			fmt.Println("Created default config at", ConfigPath())
+			fmt.Println("→ Created default config at", ConfigPath())
 		} else {
 			fmt.Println("Error loading config:", err)
 			cfg = DefaultConfig()
 		}
+	} else {
+		fmt.Println("→ Loaded config from", ConfigPath())
 	}
 
 	// Initialize command allow list for security
@@ -39,14 +46,22 @@ func main() {
 		if err != nil {
 			fmt.Println("Warning: Failed to initialize allow list:", err)
 		} else {
-			fmt.Println("Command allow list loaded from", al.GetConfigPath())
+			fmt.Println("→ Command allow list loaded from", al.GetConfigPath())
 		}
 	} else {
 		fmt.Println("Warning: Command allow list is DISABLED - all commands will execute without validation")
 	}
 
-	// Background workers
+	// Background workers (includes ttyd installation check)
 	go StartAgent(cfg)
+
+	// Hide console after successful startup (Windows)
+	// User can show it via tray menu
+	if runtime.GOOS == "windows" {
+		// Small delay to let user see startup messages
+		time.Sleep(500 * time.Millisecond)
+		showConsoleWindow(false)
+	}
 
 	// Tray UI
 	systray.Run(onTrayReady(cfg), onTrayExit)
