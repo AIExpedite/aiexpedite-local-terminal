@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"time"
 
@@ -11,6 +12,20 @@ import (
 )
 
 func main() {
+	// Handle --uninstall command line argument (Windows)
+	if runtime.GOOS == "windows" && len(os.Args) > 1 {
+		if os.Args[1] == "--uninstall" {
+			handleUninstall()
+			return
+		}
+	}
+
+	// Set up console close handler early (Windows)
+	// This prevents clicking X on console from closing the app
+	if runtime.GOOS == "windows" {
+		initConsoleHandler()
+	}
+
 	// Show startup message (console visible initially for first-time setup)
 	fmt.Println("")
 	fmt.Println("╔════════════════════════════════════════════════════════════╗")
@@ -22,6 +37,10 @@ func main() {
 	if runtime.GOOS == "windows" {
 		if err := ensureAutoStart(); err != nil {
 			fmt.Println("AutoStart setup failed:", err)
+		}
+		// Register app in Windows "Installed Apps" for easy uninstall
+		if err := ensureAppRegistration(); err != nil {
+			fmt.Println("App registration failed:", err)
 		}
 	}
 
@@ -115,6 +134,10 @@ func onTrayReady(cfg *Config) func() {
 					}
 
 				case <-mQuit.ClickedCh:
+					// Allow the app to actually exit now
+					if runtime.GOOS == "windows" {
+						SetAllowExit()
+					}
 					systray.Quit()
 					return
 				}
@@ -146,7 +169,64 @@ func onTrayExit() {
 
 /* ---------- util ---------- */
 
-// openBrowser opens the supplied URL in the platform’s default browser.
+// handleUninstall performs the uninstall process when --uninstall flag is passed
+func handleUninstall() {
+	quiet := len(os.Args) > 2 && os.Args[2] == "--quiet"
+
+	if !quiet {
+		fmt.Println("")
+		fmt.Println("╔════════════════════════════════════════════════════════════╗")
+		fmt.Println("║          AI Expedite Terminal - Uninstalling...            ║")
+		fmt.Println("╚════════════════════════════════════════════════════════════╝")
+		fmt.Println("")
+	}
+
+	// Remove registry entries (auto-start and Installed Apps)
+	if err := unregisterApp(); err != nil {
+		if !quiet {
+			fmt.Println("Warning: Failed to remove registry entries:", err)
+		}
+	} else {
+		if !quiet {
+			fmt.Println("→ Removed from Windows Installed Apps")
+			fmt.Println("→ Removed from Windows auto-start")
+		}
+	}
+
+	// Remove config directory
+	configDir := GetConfigDir()
+	if err := os.RemoveAll(configDir); err != nil {
+		if !quiet {
+			fmt.Println("Warning: Failed to remove config directory:", err)
+		}
+	} else {
+		if !quiet {
+			fmt.Println("→ Removed config directory:", configDir)
+		}
+	}
+
+	if !quiet {
+		fmt.Println("")
+		fmt.Println("╔════════════════════════════════════════════════════════════╗")
+		fmt.Println("║          Uninstall complete!                               ║")
+		fmt.Println("║                                                            ║")
+		fmt.Println("║  You can now delete the executable file manually.          ║")
+		fmt.Println("╚════════════════════════════════════════════════════════════╝")
+		fmt.Println("")
+
+		// Show dialog to user
+		exePath, _ := os.Executable()
+		exeDir := filepath.Dir(exePath)
+		ShowInfoDialog(
+			"Uninstall Complete",
+			"AI Expedite Terminal has been uninstalled.\n\n"+
+				"Registry entries and configuration have been removed.\n\n"+
+				"You can now delete the executable from:\n"+exeDir,
+		)
+	}
+}
+
+// openBrowser opens the supplied URL in the platform's default browser.
 func openBrowser(url string) {
 	var cmd string
 	var args []string
