@@ -16,10 +16,9 @@ import (
 var iconData []byte
 
 var (
-	kernel32         = syscall.NewLazyDLL("kernel32.dll")
-	user32           = syscall.NewLazyDLL("user32.dll")
+	kernel32             = syscall.NewLazyDLL("kernel32.dll")
 	procGetConsoleWindow = kernel32.NewProc("GetConsoleWindow")
-	procShowWindow   = user32.NewProc("ShowWindow")
+	procShowWindow       = user32.NewProc("ShowWindow") // user32 declared in approval_windows.go
 )
 
 const (
