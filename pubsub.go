@@ -3,6 +3,9 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -147,6 +150,42 @@ func checkRateLimit(uid string) bool {
 	return limiter.Allow()
 }
 
+/* --------------------------------------------------------------------------
+   Command Signature Verification (HMAC-SHA256)
+   -------------------------------------------------------------------------- */
+
+// verifySignature verifies the HMAC-SHA256 signature of a command
+// Returns true if signature is valid, false otherwise
+func verifySignature(cmd commandMsg, secret string) bool {
+	// Create canonical representation matching backend signCommand()
+	signatureData := fmt.Sprintf(`{"id":"%s","command":"%s","args":%s,"ts":%d}`,
+		cmd.ID,
+		cmd.Command,
+		argsToJSON(cmd.Args),
+		cmd.Ts,
+	)
+
+	// Compute expected signature
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signatureData))
+	expectedSig := hex.EncodeToString(mac.Sum(nil))
+
+	// Constant-time comparison to prevent timing attacks
+	return hmac.Equal([]byte(expectedSig), []byte(cmd.Signature))
+}
+
+// argsToJSON converts args slice to JSON array string
+func argsToJSON(args []string) string {
+	if args == nil || len(args) == 0 {
+		return "[]"
+	}
+	bytes, err := json.Marshal(args)
+	if err != nil {
+		return "[]"
+	}
+	return string(bytes)
+}
+
 /* Incoming command payload (matches backend publishCommand struct) */
 type commandMsg struct {
 	ID          string   `json:"id"`
@@ -155,12 +194,14 @@ type commandMsg struct {
 	WorkspaceID string   `json:"workspaceID"` // Workspace scope for file uploads
 	UID         string   `json:"uid"`
 	Ts          int64    `json:"ts"`
+	AgentID     string   `json:"agentId,omitempty"`   // Target agent for signature verification
+	Signature   string   `json:"signature,omitempty"` // HMAC-SHA256 signature of command
 }
 
 /* Outgoing result payload (matches backend publishResult struct) */
 type resultMsg struct {
 	ID           string        `json:"id"`
-	WorkspaceID  string        `json:"workspaceID,omitempty"`  // Workspace scope for audit trail
+	WorkspaceID  string        `json:"workspaceID,omitempty"` // Workspace scope for audit trail
 	UID          string        `json:"uid"`
 	Output       string        `json:"output"`
 	Status       string        `json:"status"` // "success" | "partial" | "error" | "denied" | "rate_limited" | "unauthorized"
@@ -236,6 +277,68 @@ func StartPubSubLoop(cfg *Config) {
 				}
 				m.Ack()
 				return
+			}
+			// ─────────────────────────────────────────────────────────────────
+
+			// ─── Command Signature Verification ──────────────────────────────
+			// If agent has a secret configured, ALL commands MUST be signed (strict mode)
+			if cfg.CommandSecret != "" {
+				// Check if command is targeted at this agent
+				if cmd.AgentID != "" && cmd.AgentID != cfg.AgentID {
+					fmt.Printf("[security] Command targeted at different agent: %s (this agent: %s)\n", cmd.AgentID, cfg.AgentID)
+					res := resultMsg{
+						ID:          cmd.ID,
+						WorkspaceID: cmd.WorkspaceID,
+						UID:         cmd.UID,
+						Output:      "Command rejected: targeted at different agent",
+						Status:      "unauthorized",
+						Ts:          time.Now().UnixMilli(),
+					}
+					bytes, _ := json.Marshal(res)
+					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
+						fmt.Println("[pubsub] publish error:", err)
+					}
+					m.Ack()
+					return
+				}
+
+				// Verify signature (strict mode - no signature = reject)
+				if cmd.Signature == "" {
+					fmt.Printf("[security] Command missing signature (strict mode enabled)\n")
+					res := resultMsg{
+						ID:          cmd.ID,
+						WorkspaceID: cmd.WorkspaceID,
+						UID:         cmd.UID,
+						Output:      "Command rejected: signature required but not provided",
+						Status:      "unauthorized",
+						Ts:          time.Now().UnixMilli(),
+					}
+					bytes, _ := json.Marshal(res)
+					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
+						fmt.Println("[pubsub] publish error:", err)
+					}
+					m.Ack()
+					return
+				}
+
+				if !verifySignature(cmd, cfg.CommandSecret) {
+					fmt.Printf("[security] Invalid command signature for ID: %s\n", cmd.ID)
+					res := resultMsg{
+						ID:          cmd.ID,
+						WorkspaceID: cmd.WorkspaceID,
+						UID:         cmd.UID,
+						Output:      "Command rejected: invalid signature",
+						Status:      "unauthorized",
+						Ts:          time.Now().UnixMilli(),
+					}
+					bytes, _ := json.Marshal(res)
+					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
+						fmt.Println("[pubsub] publish error:", err)
+					}
+					m.Ack()
+					return
+				}
+				fmt.Printf("[security] Command signature verified for ID: %s\n", cmd.ID)
 			}
 			// ─────────────────────────────────────────────────────────────────
 
