@@ -17,19 +17,21 @@ import (
 
 /* Incoming command payload (matches backend publishCommand struct) */
 type commandMsg struct {
-	ID      string   `json:"id"`
-	Command string   `json:"command"`
-	Args    []string `json:"args"`
-	UID     string   `json:"uid"`
-	Ts      int64    `json:"ts"`
+	ID          string   `json:"id"`
+	Command     string   `json:"command"`
+	Args        []string `json:"args"`
+	WorkspaceID string   `json:"workspaceID"` // Workspace scope for file uploads
+	UID         string   `json:"uid"`
+	Ts          int64    `json:"ts"`
 }
 
 /* Outgoing result payload (matches backend publishResult struct) */
 type resultMsg struct {
 	ID           string        `json:"id"`
+	WorkspaceID  string        `json:"workspaceID,omitempty"`  // Workspace scope for audit trail
 	UID          string        `json:"uid"`
 	Output       string        `json:"output"`
-	Status       string        `json:"status"` // "success" | "partial" | "error"
+	Status       string        `json:"status"` // "success" | "partial" | "error" | "denied"
 	Ts           int64         `json:"ts"`
 	Files        []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
 	UploadErrors []UploadError `json:"uploadErrors,omitempty"` // File upload failures
@@ -82,6 +84,64 @@ func StartPubSubLoop(cfg *Config) {
 				return
 			}
 
+			// ─── Command Allow List Validation ───────────────────────────────
+			if cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
+				fmt.Printf("[security] Command not in allow list: %s %v\n", cmd.Command, cmd.Args)
+
+				// Get timeout settings from config
+				timeoutSec := cfg.ApprovalTimeoutSec
+				if timeoutSec <= 0 {
+					timeoutSec = 60
+				}
+
+				// Show approval dialog
+				result := ShowCommandApprovalDialog(cmd.Command, cmd.Args, timeoutSec)
+
+				// Handle timeout based on config
+				if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
+					fmt.Println("[security] Timeout - auto-allowing per config")
+					result = ApprovalOnce
+				}
+
+				switch result {
+				case ApprovalDeny:
+					fmt.Println("[security] User denied command execution")
+					if cfg.LogDeniedCommands {
+						fmt.Printf("[security-audit] DENIED: %s %v (user: %s)\n", cmd.Command, cmd.Args, cmd.UID)
+					}
+
+					// Send denial result back to backend
+					res := resultMsg{
+						ID:          cmd.ID,
+						WorkspaceID: cmd.WorkspaceID,
+						UID:         cmd.UID,
+						Output:      "Command denied by user: not in allow list",
+						Status:      "denied",
+						Ts:          time.Now().UnixMilli(),
+					}
+					bytes, _ := json.Marshal(res)
+					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
+						fmt.Println("[pubsub] publish error:", err)
+					}
+					m.Ack()
+					return
+
+				case ApprovalAlways:
+					pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
+					if err := defaultAllowList.AddPattern(pattern); err != nil {
+						fmt.Printf("[security] Failed to add pattern to allow list: %v\n", err)
+					} else {
+						fmt.Printf("[security] Added pattern to allow list: %s\n", pattern)
+					}
+					// Fall through to execute
+
+				case ApprovalOnce:
+					fmt.Println("[security] User approved command (once)")
+					// Fall through to execute
+				}
+			}
+			// ─────────────────────────────────────────────────────────────────
+
 			fmt.Printf("[pubsub] executing command: %s %v\n", cmd.Command, cmd.Args)
 			out, execErr := runLocalCommand(cmd.Command, cmd.Args)
 			fmt.Printf("[pubsub] command output (length=%d): %s\n", len(out), out)
@@ -90,11 +150,12 @@ func StartPubSubLoop(cfg *Config) {
 			}
 
 			res := resultMsg{
-				ID:     cmd.ID,
-				UID:    cmd.UID,
-				Output: out,
-				Status: "success",
-				Ts:     time.Now().UnixMilli(),
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				Output:      out,
+				Status:      "success",
+				Ts:          time.Now().UnixMilli(),
 			}
 			if execErr != nil {
 				res.Status = "error"
@@ -105,21 +166,25 @@ func StartPubSubLoop(cfg *Config) {
 			if cfg.EnableFileUpload && res.Status != "error" {
 				files := detectOutputFiles(cmd.Command, out)
 				if len(files) > 0 {
-					fmt.Printf("[file-upload] Detected %d output files, uploading to GCS...\n", len(files))
-
-					// Initialize GCS client
-					storageClient, storageErr := InitStorageClient(ctx)
-					if storageErr != nil {
-						fmt.Printf("[file-upload] Failed to initialize storage client: %v\n", storageErr)
+					// Security: Block file upload if workspaceID is missing
+					workspaceID := extractWorkspaceID(cmd)
+					if workspaceID == "" {
+						fmt.Println("[file-upload] BLOCKED - no workspaceID provided (security: refusing to upload to default bucket)")
 					} else {
-						defer storageClient.Close()
+						fmt.Printf("[file-upload] Detected %d output files, uploading to GCS (workspace: %s)...\n", len(files), workspaceID)
 
-						// Create logger
-						logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+						// Initialize GCS client
+						storageClient, storageErr := InitStorageClient(ctx)
+						if storageErr != nil {
+							fmt.Printf("[file-upload] Failed to initialize storage client: %v\n", storageErr)
+						} else {
+							defer storageClient.Close()
 
-						// Upload files
-						workspaceID := extractWorkspaceID(cmd)
-						uploadResult := UploadFiles(
+							// Create logger
+							logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+							// Upload files
+							uploadResult := UploadFiles(
 							ctx,
 							storageClient,
 							cfg.StorageBucket,
@@ -141,6 +206,7 @@ func StartPubSubLoop(cfg *Config) {
 
 						fmt.Printf("[file-upload] Upload complete: %d successful, %d failed\n",
 							len(uploadResult.Successful), len(uploadResult.Failed))
+						}
 					}
 				}
 			}
@@ -251,10 +317,8 @@ func appendFilesFromDir(files []string, dir string, extensions []string) []strin
 	return files
 }
 
-// extractWorkspaceID extracts workspaceID from command context
-// TODO: Pass workspaceID in command metadata in future
+// extractWorkspaceID extracts workspaceID from command message
+// Returns empty string if not provided - caller must handle this case
 func extractWorkspaceID(cmd commandMsg) string {
-	// Placeholder: return default workspace
-	// In future, parse from command args or metadata
-	return "default-workspace"
+	return cmd.WorkspaceID
 }

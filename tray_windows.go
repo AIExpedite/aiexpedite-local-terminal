@@ -67,5 +67,5 @@ func ensureAutoStart() error {
 	}
 	defer key.Close()
 
-	return key.SetStringValue("TrayAgent", exePath)
+	return key.SetStringValue("AIExpedite", exePath)
 }

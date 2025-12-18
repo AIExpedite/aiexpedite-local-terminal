@@ -16,6 +16,8 @@ func main() {
 		if err := ensureAutoStart(); err != nil {
 			fmt.Println("AutoStart setup failed:", err)
 		}
+		// Hide console window on startup (user can show via tray menu)
+		showConsoleWindow(false)
 	}
 
 	// Load or create configuration
@@ -29,6 +31,18 @@ func main() {
 			fmt.Println("Error loading config:", err)
 			cfg = DefaultConfig()
 		}
+	}
+
+	// Initialize command allow list for security
+	if cfg.EnableAllowList {
+		al, err := InitAllowList()
+		if err != nil {
+			fmt.Println("Warning: Failed to initialize allow list:", err)
+		} else {
+			fmt.Println("Command allow list loaded from", al.GetConfigPath())
+		}
+	} else {
+		fmt.Println("Warning: Command allow list is DISABLED - all commands will execute without validation")
 	}
 
 	// Background workers

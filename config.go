@@ -31,6 +31,13 @@ type Config struct {
 	/* ─── File Upload (GCS) ─────────────────────────── */
 	StorageBucket    string `json:"storage_bucket,omitempty"`     // Firebase bucket name
 	EnableFileUpload bool   `json:"enable_file_upload,omitempty"` // Feature flag
+
+	/* ─── Command Security (Allow List) ────────────── */
+	EnableAllowList       bool   `json:"enable_allow_list"`        // Enable command validation (default: true)
+	AllowListPath         string `json:"allow_list_path,omitempty"` // Custom path to allow list file (optional)
+	ApprovalTimeoutSec    int    `json:"approval_timeout_sec"`     // Seconds before dialog auto-closes (default: 60)
+	ApprovalTimeoutAction string `json:"approval_timeout_action"`  // "deny" or "allow" on timeout (default: "deny")
+	LogDeniedCommands     bool   `json:"log_denied_commands"`      // Log denied commands for audit (default: true)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -70,6 +77,12 @@ func DefaultConfig() *Config {
 		// File upload defaults
 		StorageBucket:    "aix-core-dev-app-s1e4.firebasestorage.app",
 		EnableFileUpload: true,
+
+		// Command security defaults
+		EnableAllowList:       true,  // Security enabled by default
+		ApprovalTimeoutSec:    60,    // 60 second timeout for approval dialog
+		ApprovalTimeoutAction: "deny", // Deny on timeout (safer default)
+		LogDeniedCommands:     true,  // Log all denied commands for audit
 	}
 }
 

@@ -19,13 +19,13 @@ func init() {
 			// Fallback to HOME if APPDATA not set (unlikely).
 			appdata = filepath.Join(home, "AppData", "Roaming")
 		}
-		baseDir = filepath.Join(appdata, "TrayAgent")
+		baseDir = filepath.Join(appdata, "AIExpedite")
 	case "darwin":
 		// On macOS, use ~/Library/Application Support/.
 		if home == "" {
 			baseDir = "./" // fallback to current directory
 		} else {
-			baseDir = filepath.Join(home, "Library", "Application Support", "TrayAgent")
+			baseDir = filepath.Join(home, "Library", "Application Support", "AIExpedite")
 		}
 	default:
 		// On Linux/Unix, use XDG_CONFIG_HOME or ~/.config.
@@ -36,7 +36,7 @@ func init() {
 		if configHome == "" {
 			baseDir = "./"
 		} else {
-			baseDir = filepath.Join(configHome, "TrayAgent")
+			baseDir = filepath.Join(configHome, "AIExpedite")
 		}
 	}
 }
