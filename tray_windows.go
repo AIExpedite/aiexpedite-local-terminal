@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 
 	_ "embed"
@@ -139,6 +140,17 @@ func ensureAutoStart() error {
 	return key.SetStringValue("AIExpedite", quotedPath)
 }
 
+// copyIconToConfig writes the embedded icon to the config directory
+// so Windows can reliably display it in Installed Apps
+func copyIconToConfig(destPath string) error {
+	// Ensure config directory exists
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		return err
+	}
+	// Write the embedded icon data to file
+	return os.WriteFile(destPath, iconData, 0o644)
+}
+
 // ensureAppRegistration registers the app in Windows "Installed Apps" (Add/Remove Programs)
 // so users can easily uninstall it from Windows Settings
 func ensureAppRegistration() error {
@@ -160,9 +172,13 @@ func ensureAppRegistration() error {
 	defer key.Close()
 
 	// Get the install directory (parent of executable)
-	installDir := exePath[:len(exePath)-len("aiexpedite-terminal.exe")]
-	if installDir == "" {
-		installDir = "."
+	exeDir := filepath.Dir(exePath)
+
+	// Copy icon to config directory for reliable display
+	iconPath := filepath.Join(GetConfigDir(), "icon.ico")
+	if err := copyIconToConfig(iconPath); err != nil {
+		// Fall back to executable icon if copy fails
+		iconPath = exePath + ",0"
 	}
 
 	// Set required registry values for Add/Remove Programs
@@ -170,8 +186,8 @@ func ensureAppRegistration() error {
 		"DisplayName":     "AI Expedite Terminal",
 		"DisplayVersion":  "0.4.0",
 		"Publisher":       "AI Expedite",
-		"InstallLocation": installDir,
-		"DisplayIcon":     exePath + ",0",
+		"InstallLocation": exeDir,
+		"DisplayIcon":     iconPath,
 		"UninstallString": `"` + exePath + `" --uninstall`,
 		"QuietUninstallString": `"` + exePath + `" --uninstall --quiet`,
 		"NoModify":        "",
