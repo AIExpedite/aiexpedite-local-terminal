@@ -71,6 +71,18 @@ func main() {
 		fmt.Println("Warning: Command allow list is DISABLED - all commands will execute without validation")
 	}
 
+	// Check registration status
+	if cfg.IsRegistered() {
+		fmt.Printf("→ Device registered as: %s\n", cfg.AgentID)
+		fmt.Printf("→ Connected to user: %s\n", cfg.UserID)
+	} else {
+		fmt.Println("")
+		fmt.Println("⚠ This device is not registered.")
+		fmt.Println("  Use the 'Register Device' option in the system tray menu")
+		fmt.Println("  to connect to your AI Expedite account.")
+		fmt.Println("")
+	}
+
 	// Background workers (includes ttyd installation check)
 	go StartAgent(cfg)
 
@@ -97,12 +109,22 @@ func onTrayReady(cfg *Config) func() {
 		mOpen := systray.AddMenuItem("Open Terminal", "Open terminal in browser")
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
 		systray.AddSeparator()
+
+		// Add Register Device option (only shown when not registered)
+		var mRegister *systray.MenuItem
+		if !cfg.IsRegistered() {
+			mRegister = systray.AddMenuItem("Register Device", "Connect to your AI Expedite account")
+			systray.AddSeparator()
+		}
+
 		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", false)
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("Quit", "Exit the agent")
 
 		go func() {
 			consoleVisible := false
+			registering := false
+
 			for {
 				select {
 				case <-mOpen.ClickedCh:
@@ -117,6 +139,42 @@ func onTrayReady(cfg *Config) func() {
 						if err := checkForUpdate(); err != nil {
 							fmt.Println("Update check failed:", err)
 						}
+					}()
+
+				case <-func() chan struct{} {
+					if mRegister != nil {
+						return mRegister.ClickedCh
+					}
+					// Return a channel that never receives if mRegister is nil
+					return make(chan struct{})
+				}():
+					if registering {
+						continue // Already registering
+					}
+					registering = true
+
+					// Show console during registration
+					if runtime.GOOS == "windows" {
+						showConsoleWindow(true)
+						mConsole.Check()
+						consoleVisible = true
+					}
+
+					go func() {
+						if err := StartRegistration(cfg); err != nil {
+							fmt.Println("Registration failed:", err)
+							if runtime.GOOS == "windows" {
+								ShowErrorDialog("Registration Failed", err.Error())
+							}
+						} else {
+							// Registration successful - hide the menu item
+							if mRegister != nil {
+								mRegister.Hide()
+							}
+							// Update tooltip to show registered status
+							systray.SetTooltip(fmt.Sprintf("AI Expedite Terminal – Connected as %s", cfg.AgentID))
+						}
+						registering = false
 					}()
 
 				case <-mConsole.ClickedCh:

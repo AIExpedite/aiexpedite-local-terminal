@@ -42,6 +42,11 @@ type Config struct {
 	/* ─── Command Signature Verification ────────────── */
 	AgentID       string `json:"agent_id,omitempty"`       // Unique agent identifier for signature verification
 	CommandSecret string `json:"command_secret,omitempty"` // HMAC secret for command signature verification
+
+	/* ─── Device Registration ───────────────────────── */
+	UserID       string `json:"user_id,omitempty"`        // User ID from registration
+	DeviceName   string `json:"device_name,omitempty"`    // Human-readable device name
+	RegisteredAt string `json:"registered_at,omitempty"`  // ISO timestamp of registration
 }
 
 /* -------------------------------------------------------------------------- */
@@ -67,6 +72,11 @@ func (cfg *Config) Save(path string) error {
 		return err
 	}
 	return ioutil.WriteFile(path, b, 0o600)
+}
+
+// IsRegistered returns true if the device has been registered with the backend.
+func (cfg *Config) IsRegistered() bool {
+	return cfg.AgentID != "" && cfg.CommandSecret != ""
 }
 
 func DefaultConfig() *Config {
