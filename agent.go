@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "v0.2.1" // bumped after Pub/Sub support
+const version = "v0.2.2" // bumped after Pub/Sub support
 
 var (
 	ttydCmd       *exec.Cmd      // ttyd process (killed on exit)
