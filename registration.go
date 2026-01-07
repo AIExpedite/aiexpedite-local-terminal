@@ -14,7 +14,8 @@ import (
 
 const (
 	// API endpoint for device registration
-	// TODO: Make this configurable via environment or config
+	// Routes through api.aiexpedite.com Global Load Balancer with Cloud Armor WAF
+	// Can be overridden via TERMINAL_SERVICE_URL env var for local development
 	registrationBaseURL = "https://api.aiexpedite.com/terminal"
 
 	// Polling configuration
