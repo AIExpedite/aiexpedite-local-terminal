@@ -184,7 +184,7 @@ func ensureAppRegistration() error {
 	// Set required registry values for Add/Remove Programs
 	values := map[string]string{
 		"DisplayName":     "AI Expedite Terminal",
-		"DisplayVersion":  "0.2.2",
+		"DisplayVersion":  "0.2.3",
 		"Publisher":       "AI Expedite",
 		"InstallLocation": exeDir,
 		"DisplayIcon":     iconPath,
