@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/getlantern/systray"
@@ -263,25 +264,81 @@ func handleUninstall() {
 		}
 	}
 
+	// Self-delete: Create a batch file that deletes the executable after this process exits
+	exePath, err := os.Executable()
+	if err == nil {
+		if err := createSelfDeleteBatch(exePath, quiet); err != nil {
+			if !quiet {
+				fmt.Println("Warning: Could not create self-delete script:", err)
+			}
+		} else {
+			if !quiet {
+				fmt.Println("→ Scheduled executable for deletion")
+			}
+		}
+	}
+
 	if !quiet {
 		fmt.Println("")
 		fmt.Println("╔════════════════════════════════════════════════════════════╗")
 		fmt.Println("║          Uninstall complete!                               ║")
-		fmt.Println("║                                                            ║")
-		fmt.Println("║  You can now delete the executable file manually.          ║")
 		fmt.Println("╚════════════════════════════════════════════════════════════╝")
 		fmt.Println("")
 
 		// Show dialog to user
-		exePath, _ := os.Executable()
-		exeDir := filepath.Dir(exePath)
 		ShowInfoDialog(
 			"Uninstall Complete",
 			"AI Expedite Terminal has been uninstalled.\n\n"+
-				"Registry entries and configuration have been removed.\n\n"+
-				"You can now delete the executable from:\n"+exeDir,
+				"All files and settings have been removed.",
 		)
 	}
+}
+
+// createSelfDeleteBatch creates a batch file that waits for this process to exit,
+// then deletes the executable and itself. This is the industry-standard approach
+// for self-deleting executables on Windows.
+func createSelfDeleteBatch(exePath string, quiet bool) error {
+	// Create batch file in temp directory
+	tempDir := os.TempDir()
+	batchPath := filepath.Join(tempDir, "aiexpedite_uninstall_cleanup.bat")
+
+	// Get the directory containing the executable (to delete the whole folder if it's in Program Files)
+	exeDir := filepath.Dir(exePath)
+
+	// Batch script that:
+	// 1. Waits for the main process to exit (using ping for delay)
+	// 2. Deletes the executable
+	// 3. Attempts to remove the installation directory (if empty)
+	// 4. Deletes itself
+	batchContent := fmt.Sprintf(`@echo off
+REM AI Expedite Terminal - Cleanup Script
+REM This script deletes the executable after the uninstaller exits
+
+REM Wait for the main process to exit (3 second delay)
+ping -n 4 127.0.0.1 > nul
+
+REM Delete the executable
+del /f /q "%s" > nul 2>&1
+
+REM Try to remove the installation directory (will only succeed if empty)
+rmdir "%s" > nul 2>&1
+
+REM Delete this batch file
+del /f /q "%%~f0" > nul 2>&1
+`, exePath, exeDir)
+
+	// Write the batch file
+	if err := os.WriteFile(batchPath, []byte(batchContent), 0644); err != nil {
+		return err
+	}
+
+	// Execute the batch file in the background (hidden window)
+	cmd := exec.Command("cmd", "/c", "start", "/b", "", batchPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow: true,
+	}
+
+	return cmd.Start()
 }
 
 // openBrowser opens the supplied URL in the platform's default browser.
