@@ -11,28 +11,12 @@ permissions:
 
 ###############################################################################
 # 1. Build production binaries (public release)
+# Note: Currently only Windows is supported as main.go has Windows-specific code
 ###############################################################################
 jobs:
   build-prod:
-    name: Build prod/${{ matrix.goos }}/${{ matrix.goarch }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            ext: ""
-          - os: windows-latest
-            goos: windows
-            goarch: amd64
-            ext: ".exe"
-            ldflags_extra: "-H=windowsgui"
-          - os: macos-latest
-            goos: darwin
-            goarch: amd64
-            ext: ""
+    name: Build prod/windows/amd64
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -46,10 +30,6 @@ jobs:
         run: go mod tidy
 
       - name: Build binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "1"
         shell: bash
         run: |
           mkdir -p dist
@@ -59,121 +39,37 @@ jobs:
           LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite Terminal'"
           LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=https://api.aiexpedite.com/terminal"
           LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix="
+          LDFLAGS="$LDFLAGS -H=windowsgui"
 
-          # Add platform-specific ldflags
-          if [ -n "${{ matrix.ldflags_extra }}" ]; then
-            LDFLAGS="$LDFLAGS ${{ matrix.ldflags_extra }}"
-          fi
-
-          BIN="dist/aiexpedite-terminal-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          go build -ldflags "$LDFLAGS" -o "$BIN" .
-          echo "BIN=$BIN" >> $GITHUB_ENV
+          go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-windows-amd64.exe" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: prod-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ${{ env.BIN }}
+          name: prod-windows-amd64
+          path: dist/aiexpedite-terminal-windows-amd64.exe
 
   ###############################################################################
-  # 2. Build non-prod binaries (dev, stg, beta) - hidden pre-release
+  # 2. Build non-prod binaries (dev, stg, beta) - Windows only, hidden pre-release
   ###############################################################################
   build-nonprod:
-    name: Build ${{ matrix.env }}/${{ matrix.goos }}/${{ matrix.goarch }}
-    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.env }}/windows/amd64
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Dev - Linux
           - env: dev
-            os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            ext: ""
             display_name: "AI Expedite Terminal (Dev)"
             api_endpoint: "https://api.dev.aiexpedite.com/terminal"
             config_suffix: "-Dev"
             exe_suffix: "-dev"
-          # Dev - Windows
-          - env: dev
-            os: windows-latest
-            goos: windows
-            goarch: amd64
-            ext: ".exe"
-            display_name: "AI Expedite Terminal (Dev)"
-            api_endpoint: "https://api.dev.aiexpedite.com/terminal"
-            config_suffix: "-Dev"
-            exe_suffix: "-dev"
-            ldflags_extra: "-H=windowsgui"
-          # Dev - macOS
-          - env: dev
-            os: macos-latest
-            goos: darwin
-            goarch: amd64
-            ext: ""
-            display_name: "AI Expedite Terminal (Dev)"
-            api_endpoint: "https://api.dev.aiexpedite.com/terminal"
-            config_suffix: "-Dev"
-            exe_suffix: "-dev"
-          # Stg - Linux
           - env: stg
-            os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            ext: ""
             display_name: "AI Expedite Terminal (Stg)"
             api_endpoint: "https://api.stg.aiexpedite.com/terminal"
             config_suffix: "-Stg"
             exe_suffix: "-stg"
-          # Stg - Windows
-          - env: stg
-            os: windows-latest
-            goos: windows
-            goarch: amd64
-            ext: ".exe"
-            display_name: "AI Expedite Terminal (Stg)"
-            api_endpoint: "https://api.stg.aiexpedite.com/terminal"
-            config_suffix: "-Stg"
-            exe_suffix: "-stg"
-            ldflags_extra: "-H=windowsgui"
-          # Stg - macOS
-          - env: stg
-            os: macos-latest
-            goos: darwin
-            goarch: amd64
-            ext: ""
-            display_name: "AI Expedite Terminal (Stg)"
-            api_endpoint: "https://api.stg.aiexpedite.com/terminal"
-            config_suffix: "-Stg"
-            exe_suffix: "-stg"
-          # Beta - Linux
           - env: beta
-            os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            ext: ""
-            display_name: "AI Expedite Terminal (Beta)"
-            api_endpoint: "https://api.beta.aiexpedite.com/terminal"
-            config_suffix: "-Beta"
-            exe_suffix: "-beta"
-          # Beta - Windows
-          - env: beta
-            os: windows-latest
-            goos: windows
-            goarch: amd64
-            ext: ".exe"
-            display_name: "AI Expedite Terminal (Beta)"
-            api_endpoint: "https://api.beta.aiexpedite.com/terminal"
-            config_suffix: "-Beta"
-            exe_suffix: "-beta"
-            ldflags_extra: "-H=windowsgui"
-          # Beta - macOS
-          - env: beta
-            os: macos-latest
-            goos: darwin
-            goarch: amd64
-            ext: ""
             display_name: "AI Expedite Terminal (Beta)"
             api_endpoint: "https://api.beta.aiexpedite.com/terminal"
             config_suffix: "-Beta"
@@ -191,10 +87,6 @@ jobs:
         run: go mod tidy
 
       - name: Build binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "1"
         shell: bash
         run: |
           mkdir -p dist
@@ -204,21 +96,15 @@ jobs:
           LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=${{ matrix.display_name }}'"
           LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=${{ matrix.api_endpoint }}"
           LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix=${{ matrix.config_suffix }}"
+          LDFLAGS="$LDFLAGS -H=windowsgui"
 
-          # Add platform-specific ldflags
-          if [ -n "${{ matrix.ldflags_extra }}" ]; then
-            LDFLAGS="$LDFLAGS ${{ matrix.ldflags_extra }}"
-          fi
-
-          BIN="dist/aiexpedite-terminal${{ matrix.exe_suffix }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          go build -ldflags "$LDFLAGS" -o "$BIN" .
-          echo "BIN=$BIN" >> $GITHUB_ENV
+          go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe" .
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nonprod-${{ matrix.env }}-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: ${{ env.BIN }}
+          name: nonprod-${{ matrix.env }}-windows-amd64
+          path: dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe
 
   ###############################################################################
   # 3. Create production release (public, shown to users)
@@ -248,14 +134,11 @@ jobs:
           body: |
             ## AI Expedite Terminal
 
-            Download the version for your operating system:
-            - **Windows**: `aiexpedite-terminal-windows-amd64.exe`
-            - **macOS**: `aiexpedite-terminal-darwin-amd64`
-            - **Linux**: `aiexpedite-terminal-linux-amd64`
+            Download for Windows: `aiexpedite-terminal-windows-amd64.exe`
 
             ### Installation
-            1. Download the file for your OS
-            2. Run the application
+            1. Download and run the executable
+            2. If Windows SmartScreen appears, click "More info" then "Run anyway"
             3. Click "Register Device" in the system tray to connect to your AI Expedite account
 
   ###############################################################################
@@ -300,22 +183,13 @@ jobs:
           body: |
             ## Internal Builds (Dev, Staging, Beta)
 
-            **Note:** These builds are for internal testing only.
+            **Note:** These builds are for internal testing only (Windows).
 
-            ### Development (dev.aiexpedite.com)
-            - Windows: `aiexpedite-terminal-dev-windows-amd64.exe`
-            - macOS: `aiexpedite-terminal-dev-darwin-amd64`
-            - Linux: `aiexpedite-terminal-dev-linux-amd64`
-
-            ### Staging (stg.aiexpedite.com)
-            - Windows: `aiexpedite-terminal-stg-windows-amd64.exe`
-            - macOS: `aiexpedite-terminal-stg-darwin-amd64`
-            - Linux: `aiexpedite-terminal-stg-linux-amd64`
-
-            ### Beta (beta.aiexpedite.com)
-            - Windows: `aiexpedite-terminal-beta-windows-amd64.exe`
-            - macOS: `aiexpedite-terminal-beta-darwin-amd64`
-            - Linux: `aiexpedite-terminal-beta-linux-amd64`
+            | Environment | Download |
+            |-------------|----------|
+            | Development | `aiexpedite-terminal-dev-windows-amd64.exe` |
+            | Staging | `aiexpedite-terminal-stg-windows-amd64.exe` |
+            | Beta | `aiexpedite-terminal-beta-windows-amd64.exe` |
 
             All environments can run side-by-side on the same machine.
 
