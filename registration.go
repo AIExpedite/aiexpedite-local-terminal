@@ -13,11 +13,6 @@ import (
 )
 
 const (
-	// API endpoint for device registration
-	// Routes through api.aiexpedite.com Global Load Balancer with Cloud Armor WAF
-	// Can be overridden via TERMINAL_SERVICE_URL env var for local development
-	registrationBaseURL = "https://api.aiexpedite.com/terminal"
-
 	// Polling configuration
 	pollInterval = 2 * time.Second
 	pollTimeout  = 15 * time.Minute
@@ -58,13 +53,14 @@ func getDeviceName() string {
 }
 
 // getRegistrationURL returns the base URL for registration API
-// Can be overridden for local development
+// EnvAPIEndpoint is set via ldflags at build time for each environment
+// Can be overridden via TERMINAL_SERVICE_URL env var for local development
 func getRegistrationURL() string {
 	// Check for environment variable override (for local dev)
 	if url := os.Getenv("TERMINAL_SERVICE_URL"); url != "" {
 		return url
 	}
-	return registrationBaseURL
+	return EnvAPIEndpoint
 }
 
 // initRegistration calls POST /device/init to start the registration flow

@@ -137,7 +137,9 @@ func ensureAutoStart() error {
 	}
 	defer key.Close()
 
-	return key.SetStringValue("AIExpedite", quotedPath)
+	// Use environment-specific registry key name (e.g., "AIExpedite-Dev" for dev)
+	keyName := "AIExpedite" + EnvConfigSuffix
+	return key.SetStringValue(keyName, quotedPath)
 }
 
 // copyIconToConfig writes the embedded icon to the config directory
@@ -160,7 +162,8 @@ func ensureAppRegistration() error {
 	}
 
 	// Create/open the Uninstall registry key for this app
-	keyPath := `Software\Microsoft\Windows\CurrentVersion\Uninstall\AIExpediteTerminal`
+	// Use environment-specific key path (e.g., "AIExpediteTerminal-Dev" for dev)
+	keyPath := `Software\Microsoft\Windows\CurrentVersion\Uninstall\AIExpediteTerminal` + EnvConfigSuffix
 	key, _, err := registry.CreateKey(
 		registry.CURRENT_USER,
 		keyPath,
@@ -182,9 +185,10 @@ func ensureAppRegistration() error {
 	}
 
 	// Set required registry values for Add/Remove Programs
+	// Use environment-specific display name (e.g., "AI Expedite Terminal (Dev)" for dev)
 	values := map[string]string{
-		"DisplayName":     "AI Expedite Terminal",
-		"DisplayVersion":  "0.2.4",
+		"DisplayName":     EnvDisplayName,
+		"DisplayVersion":  version[1:], // Strip the "v" prefix from version
 		"Publisher":       "AI Expedite",
 		"InstallLocation": exeDir,
 		"DisplayIcon":     iconPath,
@@ -219,6 +223,10 @@ func ensureAppRegistration() error {
 
 // unregisterApp removes the app from Windows "Installed Apps" and auto-start
 func unregisterApp() error {
+	// Use environment-specific key names
+	runKeyName := "AIExpedite" + EnvConfigSuffix
+	uninstallKeyPath := `Software\Microsoft\Windows\CurrentVersion\Uninstall\AIExpediteTerminal` + EnvConfigSuffix
+
 	// Remove from auto-start
 	runKey, err := registry.OpenKey(
 		registry.CURRENT_USER,
@@ -226,14 +234,14 @@ func unregisterApp() error {
 		registry.SET_VALUE,
 	)
 	if err == nil {
-		_ = runKey.DeleteValue("AIExpedite")
+		_ = runKey.DeleteValue(runKeyName)
 		runKey.Close()
 	}
 
 	// Remove from Installed Apps
 	err = registry.DeleteKey(
 		registry.CURRENT_USER,
-		`Software\Microsoft\Windows\CurrentVersion\Uninstall\AIExpediteTerminal`,
+		uninstallKeyPath,
 	)
 	if err != nil && err != registry.ErrNotExist {
 		return fmt.Errorf("failed to remove uninstall key: %w", err)

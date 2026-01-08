@@ -10,7 +10,10 @@ var baseDir string
 
 func init() {
 	// Determine a default base directory for config and data, depending on OS.
+	// EnvConfigSuffix is set via ldflags at build time (e.g., "-Dev", "-Stg", "-Beta", "" for prod)
 	home := os.Getenv("HOME")
+	dirName := "AIExpedite" + EnvConfigSuffix
+
 	switch runtime.GOOS {
 	case "windows":
 		// On Windows, use %APPDATA% for config (roaming).
@@ -19,13 +22,13 @@ func init() {
 			// Fallback to HOME if APPDATA not set (unlikely).
 			appdata = filepath.Join(home, "AppData", "Roaming")
 		}
-		baseDir = filepath.Join(appdata, "AIExpedite")
+		baseDir = filepath.Join(appdata, dirName)
 	case "darwin":
 		// On macOS, use ~/Library/Application Support/.
 		if home == "" {
 			baseDir = "./" // fallback to current directory
 		} else {
-			baseDir = filepath.Join(home, "Library", "Application Support", "AIExpedite")
+			baseDir = filepath.Join(home, "Library", "Application Support", dirName)
 		}
 	default:
 		// On Linux/Unix, use XDG_CONFIG_HOME or ~/.config.
@@ -36,7 +39,7 @@ func init() {
 		if configHome == "" {
 			baseDir = "./"
 		} else {
-			baseDir = filepath.Join(configHome, "AIExpedite")
+			baseDir = filepath.Join(configHome, dirName)
 		}
 	}
 }

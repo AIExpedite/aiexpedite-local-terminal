@@ -30,7 +30,7 @@ func main() {
 	// Show startup message (console visible initially for first-time setup)
 	fmt.Println("")
 	fmt.Println("╔════════════════════════════════════════════════════════════╗")
-	fmt.Println("║          AI Expedite Terminal - Starting...                ║")
+	fmt.Printf("║          %s - Starting...\n", EnvDisplayName)
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 	fmt.Println("")
 
@@ -104,8 +104,8 @@ func main() {
 func onTrayReady(cfg *Config) func() {
 	return func() {
 		systray.SetIcon(iconData)
-		systray.SetTitle("AI Expedite Terminal")
-		systray.SetTooltip("AI Expedite Terminal – Remote Command Execution")
+		systray.SetTitle(EnvDisplayName)
+		systray.SetTooltip(EnvDisplayName + " – Remote Command Execution")
 
 		mOpen := systray.AddMenuItem("Open Terminal", "Open terminal in browser")
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
@@ -173,7 +173,7 @@ func onTrayReady(cfg *Config) func() {
 								mRegister.Hide()
 							}
 							// Update tooltip to show registered status
-							systray.SetTooltip(fmt.Sprintf("AI Expedite Terminal – Connected as %s", cfg.AgentID))
+							systray.SetTooltip(fmt.Sprintf("%s – Connected as %s", EnvDisplayName, cfg.AgentID))
 						}
 						registering = false
 					}()
@@ -235,7 +235,7 @@ func handleUninstall() {
 	if !quiet {
 		fmt.Println("")
 		fmt.Println("╔════════════════════════════════════════════════════════════╗")
-		fmt.Println("║          AI Expedite Terminal - Uninstalling...            ║")
+		fmt.Printf("║          %s - Uninstalling...\n", EnvDisplayName)
 		fmt.Println("╚════════════════════════════════════════════════════════════╝")
 		fmt.Println("")
 	}

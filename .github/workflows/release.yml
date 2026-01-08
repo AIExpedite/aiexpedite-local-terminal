@@ -10,31 +10,149 @@ permissions:
   packages: write # push helper image to GHCR
 
 ###############################################################################
-# 1️⃣  Build native binaries on three matrix runners
+# 1. Build native binaries for all environments on three matrix runners
 ###############################################################################
 jobs:
   build-binaries:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    name: Build ${{ matrix.env }}/${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest # linux/amd64
+        # Environment configuration
+        env: [dev, stg, beta, prod]
+        # Platform configuration
+        include_platform:
+          - os: ubuntu-latest
             goos: linux
             goarch: amd64
-            ldflags: ""
             ext: ""
-          - os: windows-latest # windows/amd64 (GUI subsystem)
+          - os: windows-latest
             goos: windows
             goarch: amd64
-            ldflags: "-H=windowsgui"
             ext: ".exe"
-          - os: macos-latest # darwin/amd64
+          - os: macos-latest
             goos: darwin
             goarch: amd64
-            ldflags: ""
             ext: ""
+        include:
+          # Dev environment - all platforms
+          - env: dev
+            os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ""
+            display_name: "AI Expedite Terminal (Dev)"
+            api_endpoint: "https://api.dev.aiexpedite.com/terminal"
+            config_suffix: "-Dev"
+            exe_suffix: "-dev"
+          - env: dev
+            os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+            display_name: "AI Expedite Terminal (Dev)"
+            api_endpoint: "https://api.dev.aiexpedite.com/terminal"
+            config_suffix: "-Dev"
+            exe_suffix: "-dev"
+            ldflags_extra: "-H=windowsgui"
+          - env: dev
+            os: macos-latest
+            goos: darwin
+            goarch: amd64
+            ext: ""
+            display_name: "AI Expedite Terminal (Dev)"
+            api_endpoint: "https://api.dev.aiexpedite.com/terminal"
+            config_suffix: "-Dev"
+            exe_suffix: "-dev"
+          # Stg environment - all platforms
+          - env: stg
+            os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ""
+            display_name: "AI Expedite Terminal (Stg)"
+            api_endpoint: "https://api.stg.aiexpedite.com/terminal"
+            config_suffix: "-Stg"
+            exe_suffix: "-stg"
+          - env: stg
+            os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+            display_name: "AI Expedite Terminal (Stg)"
+            api_endpoint: "https://api.stg.aiexpedite.com/terminal"
+            config_suffix: "-Stg"
+            exe_suffix: "-stg"
+            ldflags_extra: "-H=windowsgui"
+          - env: stg
+            os: macos-latest
+            goos: darwin
+            goarch: amd64
+            ext: ""
+            display_name: "AI Expedite Terminal (Stg)"
+            api_endpoint: "https://api.stg.aiexpedite.com/terminal"
+            config_suffix: "-Stg"
+            exe_suffix: "-stg"
+          # Beta environment - all platforms
+          - env: beta
+            os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ""
+            display_name: "AI Expedite Terminal (Beta)"
+            api_endpoint: "https://api.beta.aiexpedite.com/terminal"
+            config_suffix: "-Beta"
+            exe_suffix: "-beta"
+          - env: beta
+            os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+            display_name: "AI Expedite Terminal (Beta)"
+            api_endpoint: "https://api.beta.aiexpedite.com/terminal"
+            config_suffix: "-Beta"
+            exe_suffix: "-beta"
+            ldflags_extra: "-H=windowsgui"
+          - env: beta
+            os: macos-latest
+            goos: darwin
+            goarch: amd64
+            ext: ""
+            display_name: "AI Expedite Terminal (Beta)"
+            api_endpoint: "https://api.beta.aiexpedite.com/terminal"
+            config_suffix: "-Beta"
+            exe_suffix: "-beta"
+          # Prod environment - all platforms
+          - env: prod
+            os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            ext: ""
+            display_name: "AI Expedite Terminal"
+            api_endpoint: "https://api.aiexpedite.com/terminal"
+            config_suffix: ""
+            exe_suffix: ""
+          - env: prod
+            os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+            display_name: "AI Expedite Terminal"
+            api_endpoint: "https://api.aiexpedite.com/terminal"
+            config_suffix: ""
+            exe_suffix: ""
+            ldflags_extra: "-H=windowsgui"
+          - env: prod
+            os: macos-latest
+            goos: darwin
+            goarch: amd64
+            ext: ""
+            display_name: "AI Expedite Terminal"
+            api_endpoint: "https://api.aiexpedite.com/terminal"
+            config_suffix: ""
+            exe_suffix: ""
+
     steps:
       - uses: actions/checkout@v4
 
@@ -44,29 +162,43 @@ jobs:
           go-version: "1.24"
 
       - name: Download Go modules
-        run: go mod tidy # populates go.sum
+        run: go mod tidy
 
       - name: Build binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+        shell: bash
         run: |
           mkdir -p dist
-          BIN="dist/aiexpedite-local-terminal-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
-          go build -ldflags "${{ matrix.ldflags }}" -o "$BIN" .
+
+          # Construct ldflags with environment-specific values
+          LDFLAGS="-X main.EnvName=${{ matrix.env }}"
+          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=${{ matrix.display_name }}'"
+          LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=${{ matrix.api_endpoint }}"
+          LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix=${{ matrix.config_suffix }}"
+
+          # Add platform-specific ldflags (e.g., -H=windowsgui for Windows)
+          if [ -n "${{ matrix.ldflags_extra }}" ]; then
+            LDFLAGS="$LDFLAGS ${{ matrix.ldflags_extra }}"
+          fi
+
+          # Build with environment suffix in filename
+          BIN="dist/aiexpedite-terminal${{ matrix.exe_suffix }}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}"
+          go build -ldflags "$LDFLAGS" -o "$BIN" .
           echo "BIN=$BIN" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bin-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: bin-${{ matrix.env }}-${{ matrix.goos }}-${{ matrix.goarch }}
           path: ${{ env.BIN }}
 
   ###############################################################################
-  # 2️⃣  Create / update the GitHub Release and attach assets
+  # 2. Create / update the GitHub Release and attach assets
   ###############################################################################
   release:
-    name: Publish GitHub release
+    name: Publish GitHub release
     needs: build-binaries
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
@@ -74,11 +206,11 @@ jobs:
       - name: Download all binaries
         uses: actions/download-artifact@v4
         with:
-          pattern: bin-* # grab every OS/arch artifact
+          pattern: bin-* # grab every environment/OS/arch artifact
           path: dist
           merge-multiple: true
 
-      - name: Generate SHA‑256 checksums
+      - name: Generate SHA-256 checksums
         run: |
           cd dist
           sha256sum * > SHA256SUMS
@@ -87,9 +219,33 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: dist/**
+          body: |
+            ## Download Links by Environment
+
+            ### Production (aiexpedite.com)
+            - Windows: `aiexpedite-terminal-windows-amd64.exe`
+            - macOS: `aiexpedite-terminal-darwin-amd64`
+            - Linux: `aiexpedite-terminal-linux-amd64`
+
+            ### Beta (beta.aiexpedite.com)
+            - Windows: `aiexpedite-terminal-beta-windows-amd64.exe`
+            - macOS: `aiexpedite-terminal-beta-darwin-amd64`
+            - Linux: `aiexpedite-terminal-beta-linux-amd64`
+
+            ### Staging (stg.aiexpedite.com)
+            - Windows: `aiexpedite-terminal-stg-windows-amd64.exe`
+            - macOS: `aiexpedite-terminal-stg-darwin-amd64`
+            - Linux: `aiexpedite-terminal-stg-linux-amd64`
+
+            ### Development (dev.aiexpedite.com)
+            - Windows: `aiexpedite-terminal-dev-windows-amd64.exe`
+            - macOS: `aiexpedite-terminal-dev-darwin-amd64`
+            - Linux: `aiexpedite-terminal-dev-linux-amd64`
+
+            All environments can run side-by-side on the same machine.
 
   ###############################################################################
-  # 3️⃣  (optional) build & push your ttyd‑helper container
+  # 3. (optional) build & push your ttyd-helper container
   ###############################################################################
   docker:
     name: Push helper image to GHCR
