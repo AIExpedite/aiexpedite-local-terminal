@@ -174,6 +174,11 @@ func onTrayReady(cfg *Config) func() {
 							}
 							// Update tooltip to show registered status
 							systray.SetTooltip(fmt.Sprintf("%s – Connected as %s", EnvDisplayName, cfg.AgentID))
+
+							// Start Pub/Sub loop with new credentials
+							// (The initial StartAgent call started it before registration, so it exited early)
+							fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
+							go StartPubSubLoop(cfg)
 						}
 						registering = false
 					}()

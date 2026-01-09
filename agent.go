@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "v0.2.5" // bumped after Pub/Sub support
+const version = "v0.2.6" // panic recovery and debug logging for terminal commands
 
 var (
 	ttydCmd       *exec.Cmd      // ttyd process (killed on exit)

@@ -249,6 +249,14 @@ func StartPubSubLoop(cfg *Config) {
 	go func() {
 		fmt.Printf("[pubsub] listening for commands on: %s\n", cfg.CommandsSubscription)
 		err := sub.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {
+			// Panic recovery to prevent app crash on unhandled errors
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("[pubsub] PANIC in message handler: %v\n", r)
+					m.Nack() // Let Pub/Sub redeliver
+				}
+			}()
+
 			// Redact sensitive data before logging received command
 			fmt.Printf("[pubsub] received command: %s\n", redactSensitiveData(string(m.Data)))
 			var cmd commandMsg
@@ -513,8 +521,13 @@ func runLocalCommand(cmd string, args []string) (string, error) {
 	}
 
 	// Execute via PowerShell
+	fmt.Printf("[exec] Running PowerShell command: %s\n", cmdLine)
 	c := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
 	out, err := c.CombinedOutput()
+	if err != nil {
+		fmt.Printf("[exec] PowerShell error: %v\n", err)
+	}
+	fmt.Printf("[exec] PowerShell output length: %d bytes\n", len(out))
 	return string(out), err
 }
 
