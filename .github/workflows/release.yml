@@ -194,31 +194,3 @@ jobs:
             | Beta | `aiexpedite-terminal-beta-windows-amd64.exe` |
 
             All environments can run side-by-side on the same machine.
-
-  ###############################################################################
-  # 5. (optional) build & push your ttyd-helper container
-  ###############################################################################
-  docker:
-    name: Push helper image to GHCR
-    needs: release-prod
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build & push image
-        run: |
-          # Repository name must be lowercase for Docker tags
-          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
-          docker buildx build --push \
-            -t ghcr.io/${REPO_LOWER}/ttyd-helper:latest .
