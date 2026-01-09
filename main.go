@@ -30,7 +30,7 @@ func main() {
 	// Show startup message (console visible initially for first-time setup)
 	fmt.Println("")
 	fmt.Println("╔════════════════════════════════════════════════════════════╗")
-	fmt.Printf("║          %s - Starting...\n", EnvDisplayName)
+	fmt.Printf("║          %s %s - Starting...\n", EnvDisplayName, version)
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 	fmt.Println("")
 
