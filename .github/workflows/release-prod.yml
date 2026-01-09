@@ -1,0 +1,115 @@
+name: release-prod
+
+# Manual workflow to build and release production binaries
+# Triggered manually via GitHub Actions UI with a version tag input
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.3.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+###############################################################################
+# Build and release production binaries - Windows only
+# Triggered manually via workflow_dispatch
+###############################################################################
+jobs:
+  validate-version:
+    name: Validate version tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate version format
+        run: |
+          if [[ ! "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Version must be in format vX.Y.Z (e.g., v0.3.0)"
+            exit 1
+          fi
+          echo "Version ${{ inputs.version }} is valid"
+
+  build-prod:
+    name: Build prod/windows/amd64
+    needs: validate-version
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Download Go modules
+        run: go mod tidy
+
+      - name: Build binary
+        shell: bash
+        run: |
+          mkdir -p dist
+
+          # Production environment ldflags
+          # Note: NOT using -H=windowsgui so the console window is visible
+          # This allows users to see startup messages and debug info
+          LDFLAGS="-X main.EnvName=prod"
+          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite Terminal'"
+          LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=https://api.aiexpedite.com/terminal"
+          LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix="
+
+          go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-windows-amd64.exe" .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-windows-amd64
+          path: dist/aiexpedite-terminal-windows-amd64.exe
+
+  ###############################################################################
+  # Create production release (public, shown to users)
+  ###############################################################################
+  release-prod:
+    name: Publish production release
+    needs: build-prod
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download prod binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: prod-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ inputs.version }}" -m "Release ${{ inputs.version }}"
+          git push origin "${{ inputs.version }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish production release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.version }}
+          name: "${{ inputs.version }}"
+          files: dist/**
+          body: |
+            ## AI Expedite Terminal ${{ inputs.version }}
+
+            Download for Windows: `aiexpedite-terminal-windows-amd64.exe`
+
+            ### Installation
+            1. Download and run the executable
+            2. If Windows SmartScreen appears, click "More info" then "Run anyway"
+            3. Click "Register Device" in the system tray to connect to your AI Expedite account

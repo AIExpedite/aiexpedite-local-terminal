@@ -1,58 +1,19 @@
-name: build-and-release
+name: release-nonprod
 
+# Automatically build and release non-prod binaries on every push to main
 on:
   push:
-    tags:
-      - "v*" # run only for version tags
+    branches:
+      - main
 
 permissions:
-  contents: write # upload assets to the release
-  packages: write # push helper image to GHCR
+  contents: write
 
 ###############################################################################
-# 1. Build production binaries (public release)
-# Note: Currently only Windows is supported as main.go has Windows-specific code
+# Build and release non-prod binaries (dev, stg, beta) - Windows only
+# Triggered automatically on every push to main branch
 ###############################################################################
 jobs:
-  build-prod:
-    name: Build prod/windows/amd64
-    runs-on: windows-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-
-      - name: Download Go modules
-        run: go mod tidy
-
-      - name: Build binary
-        shell: bash
-        run: |
-          mkdir -p dist
-
-          # Production environment ldflags
-          # Note: NOT using -H=windowsgui so the console window is visible
-          # This allows users to see startup messages and debug info
-          LDFLAGS="-X main.EnvName=prod"
-          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite Terminal'"
-          LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=https://api.aiexpedite.com/terminal"
-          LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix="
-
-          go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-windows-amd64.exe" .
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: prod-windows-amd64
-          path: dist/aiexpedite-terminal-windows-amd64.exe
-
-  ###############################################################################
-  # 2. Build non-prod binaries (dev, stg, beta) - Windows only, hidden pre-release
-  ###############################################################################
   build-nonprod:
     name: Build ${{ matrix.env }}/windows/amd64
     runs-on: windows-latest
@@ -109,49 +70,15 @@ jobs:
           path: dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe
 
   ###############################################################################
-  # 3. Create production release (public, shown to users)
-  ###############################################################################
-  release-prod:
-    name: Publish production release
-    needs: build-prod
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download prod binaries
-        uses: actions/download-artifact@v4
-        with:
-          pattern: prod-*
-          path: dist
-          merge-multiple: true
-
-      - name: Generate SHA-256 checksums
-        run: |
-          cd dist
-          sha256sum * > SHA256SUMS
-
-      - name: Publish production release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: dist/**
-          body: |
-            ## AI Expedite Terminal
-
-            Download for Windows: `aiexpedite-terminal-windows-amd64.exe`
-
-            ### Installation
-            1. Download and run the executable
-            2. If Windows SmartScreen appears, click "More info" then "Run anyway"
-            3. Click "Register Device" in the system tray to connect to your AI Expedite account
-
-  ###############################################################################
-  # 4. Create non-prod release (pre-release, hidden from main downloads)
+  # Create non-prod release (pre-release, hidden from main downloads)
   ###############################################################################
   release-nonprod:
     name: Publish non-prod release
     needs: build-nonprod
-    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download non-prod binaries
         uses: actions/download-artifact@v4
         with:
@@ -164,9 +91,9 @@ jobs:
           cd dist
           sha256sum * > SHA256SUMS
 
-      - name: Get version from tag
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Get short SHA
+        id: sha
+        run: echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
       - name: Delete existing internal release
         run: |
@@ -179,13 +106,15 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: latest-internal
-          name: "Internal Builds (${{ steps.version.outputs.version }})"
+          name: "Internal Builds (${{ steps.sha.outputs.short_sha }})"
           prerelease: true
           files: dist/**
           body: |
             ## Internal Builds (Dev, Staging, Beta)
 
             **Note:** These builds are for internal testing only (Windows).
+
+            **Commit:** ${{ github.sha }}
 
             | Environment | Download |
             |-------------|----------|
