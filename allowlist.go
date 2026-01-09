@@ -174,7 +174,9 @@ const defaultAllowListContent = `# ============================================
 # ============================================
 
 # --- File System (Read-only / Safe) ---
+ls
 ls *
+dir
 dir *
 pwd
 cd *
@@ -204,20 +206,29 @@ echo *
 printf *
 
 # --- Git (All operations) ---
+git
 git *
 
 # --- Node.js / JavaScript ---
+node
 node *
+npm
 npm *
 npx *
+yarn
 yarn *
+pnpm
 pnpm *
+bun
 bun *
+deno
 deno *
 nvm *
 
 # --- Python ---
+python
 python *
+python3
 python3 *
 pip *
 pip3 *
@@ -231,16 +242,26 @@ ruff *
 uv *
 
 # --- Build Tools ---
+make
 make *
 cmake *
 gradle *
 mvn *
+cargo
 cargo *
+go
 go *
 rustc *
 gcc *
 g++ *
 clang *
+java
+java *
+javac *
+dotnet
+dotnet *
+ruby
+ruby *
 
 # --- Package Managers ---
 apt list *
@@ -251,19 +272,27 @@ winget *
 scoop *
 
 # --- Docker ---
+docker
+docker ps
 docker ps *
+docker images
 docker images *
 docker logs *
 docker inspect *
+docker stats
 docker stats *
 docker top *
 docker exec *
 docker run *
 docker build *
+docker info
+docker version
 docker compose *
 docker-compose *
 
 # --- Kubernetes ---
+kubectl
+kubectl version
 kubectl get *
 kubectl describe *
 kubectl logs *
@@ -271,6 +300,7 @@ kubectl exec *
 kubectl port-forward *
 kubectl apply *
 kubectl delete *
+helm *
 
 # --- Cloud CLIs ---
 gcloud *
@@ -281,6 +311,9 @@ vercel *
 netlify *
 fly *
 railway *
+terraform
+terraform *
+ansible *
 
 # --- Testing Frameworks ---
 jest *
@@ -309,10 +342,15 @@ nslookup *
 dig *
 host *
 traceroute *
+netstat
 netstat *
 ss *
+ifconfig
+ifconfig *
+ip *
 
 # --- Process Management ---
+ps
 ps *
 top
 htop
