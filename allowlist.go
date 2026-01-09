@@ -328,6 +328,9 @@ nvim *
 nano *
 emacs *
 
+# --- Internal Commands ---
+__ping__
+
 # --- Misc Dev Tools ---
 jq *
 yq *
