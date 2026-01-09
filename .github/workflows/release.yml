@@ -218,5 +218,7 @@ jobs:
 
       - name: Build & push image
         run: |
+          # Repository name must be lowercase for Docker tags
+          REPO_LOWER=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
           docker buildx build --push \
-            -t ghcr.io/${{ github.repository }}/ttyd-helper:latest .
+            -t ghcr.io/${REPO_LOWER}/ttyd-helper:latest .
