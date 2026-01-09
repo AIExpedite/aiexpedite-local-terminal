@@ -350,6 +350,27 @@ func StartPubSubLoop(cfg *Config) {
 			}
 			// ─────────────────────────────────────────────────────────────────
 
+			// ─── Special Ping Command Handler ────────────────────────────────
+			// Responds immediately without shell execution for online status checks
+			if cmd.Command == "__ping__" {
+				fmt.Println("[pubsub] received ping command, responding immediately")
+				res := resultMsg{
+					ID:          cmd.ID,
+					WorkspaceID: cmd.WorkspaceID,
+					UID:         cmd.UID,
+					Output:      "pong",
+					Status:      "success",
+					Ts:          time.Now().UnixMilli(),
+				}
+				bytes, _ := json.Marshal(res)
+				if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
+					fmt.Println("[pubsub] ping publish error:", err)
+				}
+				m.Ack()
+				return
+			}
+			// ─────────────────────────────────────────────────────────────────
+
 			// ─── Command Allow List Validation ───────────────────────────────
 			if cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
 				// Redact args when logging security events
