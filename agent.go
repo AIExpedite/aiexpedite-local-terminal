@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-const version = "v0.2.7" // auto-reconnect after sleep/wake, disconnect from cloud option
+const version = "v0.2.8" // auto-registration on first launch, register device checkbox with checkmark
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

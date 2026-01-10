@@ -78,9 +78,7 @@ func main() {
 		fmt.Printf("→ Connected to user: %s\n", cfg.UserID)
 	} else {
 		fmt.Println("")
-		fmt.Println("⚠ This device is not registered.")
-		fmt.Println("  Use the 'Register Device' option in the system tray menu")
-		fmt.Println("  to connect to your AI Expedite account.")
+		fmt.Println("→ First launch detected - registration will start automatically...")
 		fmt.Println("")
 	}
 
@@ -111,21 +109,52 @@ func onTrayReady(cfg *Config) func() {
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
 		systray.AddSeparator()
 
-		// Add Register Device option (only shown when not registered)
-		var mRegister *systray.MenuItem
-		if !cfg.IsRegistered() {
-			mRegister = systray.AddMenuItem("Register Device", "Connect to your AI Expedite account")
-			systray.AddSeparator()
+		// Register Device - always visible as checkbox showing registration status
+		mRegister := systray.AddMenuItemCheckbox("Register Device", "Connect to your AI Expedite account", cfg.IsRegistered())
+		if cfg.IsRegistered() {
+			mRegister.Disable() // Can't re-register once registered
 		}
+		systray.AddSeparator()
 
 		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", false)
 		mDisconnect := systray.AddMenuItemCheckbox("Disconnect from cloud", "Stop cloud connection (stay running)", false)
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("Quit", "Exit the agent")
 
+		// Auto-trigger registration on first launch (if not registered)
+		autoRegistering := false
+		if !cfg.IsRegistered() {
+			autoRegistering = true
+			// Keep console visible during auto-registration
+			if runtime.GOOS == "windows" {
+				showConsoleWindow(true)
+				mConsole.Check()
+			}
+
+			go func() {
+				if err := StartRegistration(cfg); err != nil {
+					fmt.Println("Registration failed:", err)
+					if runtime.GOOS == "windows" {
+						ShowErrorDialog("Registration Failed", err.Error())
+					}
+				} else {
+					// Registration successful - update checkbox and disable
+					mRegister.Check()
+					mRegister.Disable()
+					// Update tooltip to show registered status
+					systray.SetTooltip(fmt.Sprintf("%s – Connected as %s", EnvDisplayName, cfg.AgentID))
+
+					// Start Pub/Sub loop with new credentials
+					fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
+					go StartPubSubLoop(cfg)
+				}
+				autoRegistering = false
+			}()
+		}
+
 		go func() {
-			consoleVisible := false
-			registering := false
+			consoleVisible := !cfg.IsRegistered() // Start visible if auto-registering
+			registering := autoRegistering
 
 			for {
 				select {
@@ -143,13 +172,17 @@ func onTrayReady(cfg *Config) func() {
 						}
 					}()
 
-				case <-func() chan struct{} {
-					if mRegister != nil {
-						return mRegister.ClickedCh
+				case <-mRegister.ClickedCh:
+					// If already registered, show info dialog
+					if cfg.IsRegistered() {
+						if runtime.GOOS == "windows" {
+							ShowInfoDialog("Device Registered",
+								fmt.Sprintf("This device is already registered.\n\nAgent ID: %s\nUser: %s",
+									cfg.AgentID, cfg.UserID))
+						}
+						continue
 					}
-					// Return a channel that never receives if mRegister is nil
-					return make(chan struct{})
-				}():
+
 					if registering {
 						continue // Already registering
 					}
@@ -169,15 +202,13 @@ func onTrayReady(cfg *Config) func() {
 								ShowErrorDialog("Registration Failed", err.Error())
 							}
 						} else {
-							// Registration successful - hide the menu item
-							if mRegister != nil {
-								mRegister.Hide()
-							}
+							// Registration successful - update checkbox and disable
+							mRegister.Check()
+							mRegister.Disable()
 							// Update tooltip to show registered status
 							systray.SetTooltip(fmt.Sprintf("%s – Connected as %s", EnvDisplayName, cfg.AgentID))
 
 							// Start Pub/Sub loop with new credentials
-							// (The initial StartAgent call started it before registration, so it exited early)
 							fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
 							go StartPubSubLoop(cfg)
 						}
