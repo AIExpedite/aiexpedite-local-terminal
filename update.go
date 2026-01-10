@@ -95,7 +95,12 @@ func downloadAndApplyUpdate(info *UpdateInfo) error {
 
 	fmt.Printf("→ Downloading %s...\n", info.AssetName)
 
-	tmp, err := os.CreateTemp("", "agent_update_*")
+	// On Windows, temp files need .exe extension to be executable
+	pattern := "agent_update_*"
+	if runtime.GOOS == "windows" {
+		pattern = "agent_update_*.exe"
+	}
+	tmp, err := os.CreateTemp("", pattern)
 	if err != nil {
 		return err
 	}

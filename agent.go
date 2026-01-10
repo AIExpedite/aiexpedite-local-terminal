@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.1" // working directory fix - send workingDirectory during registration
+const Version = "v0.4.2" // fix: Windows update restart requires .exe extension on temp file
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
