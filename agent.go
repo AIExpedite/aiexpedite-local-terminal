@@ -17,7 +17,8 @@ import (
 	"time"
 )
 
-const version = "v0.2.9" // working directory support for commands
+// Version is the current terminal app version (exported for use in registration and results)
+const Version = "v0.3.0" // add version reporting to AI and backend
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

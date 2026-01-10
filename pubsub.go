@@ -208,6 +208,7 @@ type resultMsg struct {
 	Output       string        `json:"output"`
 	Status       string        `json:"status"` // "success" | "partial" | "error" | "denied" | "rate_limited" | "unauthorized"
 	Ts           int64         `json:"ts"`
+	Version      string        `json:"version,omitempty"`      // Terminal app version
 	Files        []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
 	UploadErrors []UploadError `json:"uploadErrors,omitempty"` // File upload failures
 }
@@ -366,6 +367,7 @@ func runPubSubConnection(cfg *Config) error {
 					Output:      "Command rate limit exceeded. Please wait before retrying.",
 					Status:      "rate_limited",
 					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
 				}
 				bytes, _ := json.Marshal(res)
 				if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
@@ -389,6 +391,7 @@ func runPubSubConnection(cfg *Config) error {
 						Output:      "Command rejected: targeted at different agent",
 						Status:      "unauthorized",
 						Ts:          time.Now().UnixMilli(),
+						Version:     Version,
 					}
 					bytes, _ := json.Marshal(res)
 					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
@@ -408,6 +411,7 @@ func runPubSubConnection(cfg *Config) error {
 						Output:      "Command rejected: signature required but not provided",
 						Status:      "unauthorized",
 						Ts:          time.Now().UnixMilli(),
+						Version:     Version,
 					}
 					bytes, _ := json.Marshal(res)
 					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
@@ -426,6 +430,7 @@ func runPubSubConnection(cfg *Config) error {
 						Output:      "Command rejected: invalid signature",
 						Status:      "unauthorized",
 						Ts:          time.Now().UnixMilli(),
+						Version:     Version,
 					}
 					bytes, _ := json.Marshal(res)
 					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
@@ -449,6 +454,7 @@ func runPubSubConnection(cfg *Config) error {
 					Output:      "pong",
 					Status:      "success",
 					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
 				}
 				bytes, _ := json.Marshal(res)
 				if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
@@ -495,6 +501,7 @@ func runPubSubConnection(cfg *Config) error {
 						Output:      "Command denied by user: not in allow list",
 						Status:      "denied",
 						Ts:          time.Now().UnixMilli(),
+						Version:     Version,
 					}
 					bytes, _ := json.Marshal(res)
 					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
@@ -535,6 +542,7 @@ func runPubSubConnection(cfg *Config) error {
 				Output:      out,
 				Status:      "success",
 				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
 			}
 			if execErr != nil {
 				res.Status = "error"

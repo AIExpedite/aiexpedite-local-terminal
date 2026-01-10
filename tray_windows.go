@@ -215,7 +215,7 @@ func ensureAppRegistration() error {
 	// Use environment-specific display name (e.g., "AI Expedite Terminal (Dev)" for dev)
 	values := map[string]string{
 		"DisplayName":     EnvDisplayName,
-		"DisplayVersion":  version[1:], // Strip the "v" prefix from version
+		"DisplayVersion":  Version[1:], // Strip the "v" prefix from version
 		"Publisher":       "AI Expedite",
 		"InstallLocation": exeDir,
 		"DisplayIcon":     iconPath,

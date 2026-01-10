@@ -71,6 +71,7 @@ func initRegistration(deviceName, platform string) (*InitResponse, error) {
 	payload := map[string]string{
 		"deviceName": deviceName,
 		"platform":   platform,
+		"version":    Version,
 	}
 
 	body, err := json.Marshal(payload)

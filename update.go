@@ -43,10 +43,10 @@ func checkForUpdate() error {
 		return err
 	}
 
-	cur := "v" + strings.TrimPrefix(version, "v")
-	latest := rel.TagName 
+	cur := "v" + strings.TrimPrefix(Version, "v")
+	latest := rel.TagName
 	if semver.Compare(latest, cur) <= 0 {
-		fmt.Println("No update available; current", version)
+		fmt.Println("No update available; current", Version)
 		return nil
 	}
 
