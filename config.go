@@ -44,9 +44,10 @@ type Config struct {
 	CommandSecret string `json:"command_secret,omitempty"` // HMAC secret for command signature verification
 
 	/* ─── Device Registration ───────────────────────── */
-	UserID       string `json:"user_id,omitempty"`        // User ID from registration
-	DeviceName   string `json:"device_name,omitempty"`    // Human-readable device name
-	RegisteredAt string `json:"registered_at,omitempty"`  // ISO timestamp of registration
+	UserID           string `json:"user_id,omitempty"`           // User ID from registration
+	DeviceName       string `json:"device_name,omitempty"`       // Human-readable device name
+	RegisteredAt     string `json:"registered_at,omitempty"`     // ISO timestamp of registration
+	WorkingDirectory string `json:"working_directory,omitempty"` // Default working directory for commands
 }
 
 /* -------------------------------------------------------------------------- */
@@ -80,6 +81,9 @@ func (cfg *Config) IsRegistered() bool {
 }
 
 func DefaultConfig() *Config {
+	// Get user home directory for default working directory
+	homeDir, _ := os.UserHomeDir()
+
 	return &Config{
 		ProjectID:            "", // MUST be filled by the user for Pub/Sub mode
 		CommandsSubscription: "terminal-commands-sub",
@@ -101,6 +105,9 @@ func DefaultConfig() *Config {
 		// Signature verification defaults (empty = disabled until agent is registered)
 		AgentID:       "",
 		CommandSecret: "",
+
+		// Working directory defaults to user home
+		WorkingDirectory: homeDir,
 	}
 }
 

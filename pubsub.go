@@ -192,7 +192,8 @@ type commandMsg struct {
 	ID          string   `json:"id"`
 	Command     string   `json:"command"`
 	Args        []string `json:"args"`
-	WorkspaceID string   `json:"workspaceID"` // Workspace scope for file uploads
+	Cwd         string   `json:"cwd,omitempty"`       // Working directory for command execution
+	WorkspaceID string   `json:"workspaceID"`         // Workspace scope for file uploads
 	UID         string   `json:"uid"`
 	Ts          int64    `json:"ts"`
 	AgentID     string   `json:"agentId,omitempty"`   // Target agent for signature verification
@@ -520,7 +521,7 @@ func runPubSubConnection(cfg *Config) error {
 
 			// Redact command args before logging
 			fmt.Printf("[pubsub] executing command: %s\n", redactCommandForLog(cmd.Command, cmd.Args))
-			out, execErr := runLocalCommand(cmd.Command, cmd.Args)
+			out, execErr := runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd)
 			// Redact output before logging (may contain secrets)
 			fmt.Printf("[pubsub] command output (length=%d): %s\n", len(out), redactSensitiveData(out))
 			if execErr != nil {
@@ -615,7 +616,7 @@ func runPubSubConnection(cfg *Config) error {
 }
 
 /* runLocalCommand executes the command and returns combined stdout/stderr. */
-func runLocalCommand(cmd string, args []string) (string, error) {
+func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string, error) {
 	// On Windows, run commands through PowerShell to support built-ins like dir, ls, etc.
 	// Construct the full command line
 	cmdLine := cmd
@@ -633,6 +634,17 @@ func runLocalCommand(cmd string, args []string) (string, error) {
 	// Execute via PowerShell
 	fmt.Printf("[exec] Running PowerShell command: %s\n", cmdLine)
 	c := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
+
+	// Set working directory: priority is command cwd > config default > process cwd
+	workDir := cwd
+	if workDir == "" && cfg != nil {
+		workDir = cfg.WorkingDirectory
+	}
+	if workDir != "" {
+		c.Dir = workDir
+		fmt.Printf("[exec] Working directory: %s\n", workDir)
+	}
+
 	out, err := c.CombinedOutput()
 	if err != nil {
 		fmt.Printf("[exec] PowerShell error: %v\n", err)

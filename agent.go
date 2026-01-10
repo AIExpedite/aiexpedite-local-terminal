@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-const version = "v0.2.8" // auto-registration on first launch, register device checkbox with checkmark
+const version = "v0.2.9" // working directory support for commands
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
