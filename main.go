@@ -144,6 +144,13 @@ func onTrayReady(cfg *Config) func() {
 					// Update tooltip to show registered status
 					systray.SetTooltip(fmt.Sprintf("%s – Connected as %s", EnvDisplayName, cfg.AgentID))
 
+					// Hide console after successful registration
+					if runtime.GOOS == "windows" {
+						time.Sleep(2 * time.Second) // Brief delay to let user see success message
+						showConsoleWindow(false)
+						mConsole.Uncheck()
+					}
+
 					// Start Pub/Sub loop with new credentials
 					fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
 					go StartPubSubLoop(cfg)
