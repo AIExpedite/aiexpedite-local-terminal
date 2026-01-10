@@ -107,6 +107,7 @@ jobs:
         with:
           tag_name: latest-internal
           name: "Internal Builds (${{ steps.sha.outputs.short_sha }})"
+          draft: false
           prerelease: true
           files: dist/**
           body: |
