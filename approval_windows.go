@@ -214,3 +214,59 @@ func ShowSuccessDialog(title, message string) {
 		uintptr(flags),
 	)
 }
+
+/* --------------------------------------------------------------------------
+   Update Dialog
+   -------------------------------------------------------------------------- */
+
+// UpdateChoice represents the user's response to update dialog
+type UpdateChoice int
+
+const (
+	UpdateNow UpdateChoice = iota
+	UpdateLater
+	SkipVersion
+)
+
+// ShowUpdateDialog shows a dialog asking to update with 3 options.
+// Uses Yes/No/Cancel buttons mapped as:
+//   - Yes = Update Now
+//   - No = Later (remind via tray menu)
+//   - Cancel = Skip this version
+//
+// Returns UpdateNow, UpdateLater, or SkipVersion
+func ShowUpdateDialog(currentVersion, newVersion string) UpdateChoice {
+	message := fmt.Sprintf(
+		"A new version of AI Expedite Terminal is available!\n\n"+
+			"Current version: %s\n"+
+			"New version: %s\n\n"+
+			"Would you like to update now?\n\n"+
+			"Click:\n"+
+			"  YES = Update now (app will restart)\n"+
+			"  NO = Remind me later (via tray menu)\n"+
+			"  CANCEL = Skip this version",
+		currentVersion, newVersion)
+
+	title := "AI Expedite Terminal - Update Available"
+
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	msgPtr, _ := syscall.UTF16PtrFromString(message)
+
+	flags := uint32(MB_YESNOCANCEL | MB_ICONINFO | MB_DEFBUTTON1 | MB_SETFOREGROUND | MB_TOPMOST)
+
+	ret, _, _ := procMsgBox.Call(
+		0,
+		uintptr(unsafe.Pointer(msgPtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		uintptr(flags),
+	)
+
+	switch int(ret) {
+	case IDYES:
+		return UpdateNow
+	case IDNO:
+		return UpdateLater
+	default: // IDCANCEL or dialog closed
+		return SkipVersion
+	}
+}

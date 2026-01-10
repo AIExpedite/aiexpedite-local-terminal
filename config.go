@@ -48,6 +48,9 @@ type Config struct {
 	DeviceName       string `json:"device_name,omitempty"`       // Human-readable device name
 	RegisteredAt     string `json:"registered_at,omitempty"`     // ISO timestamp of registration
 	WorkingDirectory string `json:"working_directory,omitempty"` // Default working directory for commands
+
+	/* ─── Update Preferences ───────────────────────── */
+	SkippedVersion string `json:"skipped_version,omitempty"` // Version user chose to skip (won't prompt again)
 }
 
 /* -------------------------------------------------------------------------- */

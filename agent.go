@@ -14,11 +14,10 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
-	"time"
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.3.0" // add version reporting to AI and backend
+const Version = "v0.4.0" // proactive update notification with user choice dialog
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -28,6 +27,10 @@ var (
 	offlineMutex  sync.RWMutex
 	updatePath    string
 	updatePending bool
+
+	// Pending update state (when user clicks "Later")
+	pendingUpdateInfo  *UpdateInfo
+	pendingUpdateMutex sync.RWMutex
 )
 
 // SetOffline enables or disables offline mode, signaling the Pub/Sub loop
@@ -54,6 +57,32 @@ func IsOffline() bool {
 	offlineMutex.RLock()
 	defer offlineMutex.RUnlock()
 	return isOffline
+}
+
+// SetPendingUpdate stores update info for later installation (user clicked "Later")
+func SetPendingUpdate(info *UpdateInfo) {
+	pendingUpdateMutex.Lock()
+	pendingUpdateInfo = info
+	pendingUpdateMutex.Unlock()
+}
+
+// GetPendingUpdate returns pending update info or nil if none
+func GetPendingUpdate() *UpdateInfo {
+	pendingUpdateMutex.RLock()
+	defer pendingUpdateMutex.RUnlock()
+	return pendingUpdateInfo
+}
+
+// HasPendingUpdate returns true if an update is waiting to be installed
+func HasPendingUpdate() bool {
+	return GetPendingUpdate() != nil
+}
+
+// ClearPendingUpdate removes the pending update info
+func ClearPendingUpdate() {
+	pendingUpdateMutex.Lock()
+	pendingUpdateInfo = nil
+	pendingUpdateMutex.Unlock()
 }
 
 /*──────────────────────────────  StartAgent  ──────────────────────────────*/
@@ -125,16 +154,7 @@ func StartAgent(cfg *Config) {
 
 	showConnectionInstructions(cfg, port)
 
-	/* 5. Optional auto‑update -------------------------------------------- */
-
-	if cfg.AutoUpdate {
-		go func() {
-			time.Sleep(5 * time.Second) // give the UI a chance to appear first
-			if err := checkForUpdate(); err != nil {
-				fmt.Println("Update check error:", err)
-			}
-		}()
-	}
+	// Note: Auto-update is now handled in main.go with proactive dialog
 }
 
 /*──────────────────────────  showConnectionInstructions  ──────────────────────────*/

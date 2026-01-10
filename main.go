@@ -108,6 +108,11 @@ func onTrayReady(cfg *Config) func() {
 
 		mOpen := systray.AddMenuItem("Open Terminal", "Open terminal in browser")
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
+
+		// Install Update menu item - initially hidden, shown when update is pending
+		mInstallUpdate := systray.AddMenuItem("", "")
+		mInstallUpdate.Hide()
+
 		systray.AddSeparator()
 
 		// Register Device - always visible as checkbox showing registration status
@@ -160,6 +165,64 @@ func onTrayReady(cfg *Config) func() {
 			}()
 		}
 
+		// Proactive update check (if AutoUpdate enabled)
+		if cfg.AutoUpdate {
+			go func() {
+				time.Sleep(3 * time.Second) // Let UI stabilize first
+
+				info, err := checkForNewVersion()
+				if err != nil {
+					fmt.Println("[update] Check failed:", err)
+					return
+				}
+
+				if !info.Available {
+					fmt.Println("[update] No update available")
+					return
+				}
+
+				// Skip if user previously chose to skip this version
+				if info.LatestVersion == cfg.SkippedVersion {
+					fmt.Printf("[update] Skipping version %s (user preference)\n", info.LatestVersion)
+					return
+				}
+
+				fmt.Printf("[update] New version available: %s → %s\n", info.CurrentVersion, info.LatestVersion)
+
+				// Show dialog to user (Windows only for now)
+				if runtime.GOOS == "windows" {
+					choice := ShowUpdateDialog(info.CurrentVersion, info.LatestVersion)
+
+					switch choice {
+					case UpdateNow:
+						fmt.Println("[update] User chose: Update Now")
+						if err := downloadAndApplyUpdate(info); err != nil {
+							fmt.Println("[update] Download failed:", err)
+							ShowErrorDialog("Update Failed", err.Error())
+						}
+
+					case UpdateLater:
+						fmt.Println("[update] User chose: Later")
+						SetPendingUpdate(info)
+						// Show the Install Update menu item
+						mInstallUpdate.SetTitle(fmt.Sprintf("Install Update (%s)", info.LatestVersion))
+						mInstallUpdate.SetTooltip("Click to install the pending update")
+						mInstallUpdate.Show()
+
+					case SkipVersion:
+						fmt.Printf("[update] User chose: Skip version %s\n", info.LatestVersion)
+						cfg.SkippedVersion = info.LatestVersion
+						_ = cfg.Save(ConfigPath())
+					}
+				} else {
+					// Non-Windows: just download automatically like before
+					if err := downloadAndApplyUpdate(info); err != nil {
+						fmt.Println("[update] Download failed:", err)
+					}
+				}
+			}()
+		}
+
 		go func() {
 			consoleVisible := !cfg.IsRegistered() // Start visible if auto-registering
 			registering := autoRegistering
@@ -175,10 +238,61 @@ func onTrayReady(cfg *Config) func() {
 
 				case <-mCheck.ClickedCh:
 					go func() {
-						if err := checkForUpdate(); err != nil {
+						// Manual check - always check even if we have a pending update
+						info, err := checkForNewVersion()
+						if err != nil {
 							fmt.Println("Update check failed:", err)
+							if runtime.GOOS == "windows" {
+								ShowErrorDialog("Update Check Failed", err.Error())
+							}
+							return
+						}
+
+						if !info.Available {
+							fmt.Println("No update available; current", Version)
+							if runtime.GOOS == "windows" {
+								ShowInfoDialog("No Update Available",
+									fmt.Sprintf("You're running the latest version (%s).", Version))
+							}
+							return
+						}
+
+						// Show dialog for manual check too
+						if runtime.GOOS == "windows" {
+							choice := ShowUpdateDialog(info.CurrentVersion, info.LatestVersion)
+							switch choice {
+							case UpdateNow:
+								if err := downloadAndApplyUpdate(info); err != nil {
+									ShowErrorDialog("Update Failed", err.Error())
+								}
+							case UpdateLater:
+								SetPendingUpdate(info)
+								mInstallUpdate.SetTitle(fmt.Sprintf("Install Update (%s)", info.LatestVersion))
+								mInstallUpdate.SetTooltip("Click to install the pending update")
+								mInstallUpdate.Show()
+							case SkipVersion:
+								cfg.SkippedVersion = info.LatestVersion
+								_ = cfg.Save(ConfigPath())
+							}
+						} else {
+							// Non-Windows: download automatically
+							if err := downloadAndApplyUpdate(info); err != nil {
+								fmt.Println("Update failed:", err)
+							}
 						}
 					}()
+
+				case <-mInstallUpdate.ClickedCh:
+					// Install pending update
+					if info := GetPendingUpdate(); info != nil {
+						fmt.Printf("[update] Installing pending update: %s\n", info.LatestVersion)
+						if err := downloadAndApplyUpdate(info); err != nil {
+							fmt.Println("[update] Failed:", err)
+							if runtime.GOOS == "windows" {
+								ShowErrorDialog("Update Failed", err.Error())
+							}
+						}
+					}
 
 				case <-mRegister.ClickedCh:
 					// If already registered, show info dialog
