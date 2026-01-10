@@ -13,17 +13,47 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"time"
 )
 
-const version = "v0.2.6" // panic recovery and debug logging for terminal commands
+const version = "v0.2.7" // auto-reconnect after sleep/wake, disconnect from cloud option
 
 var (
-	ttydCmd       *exec.Cmd      // ttyd process (killed on exit)
+	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
 	shutdownChan  = make(chan struct{})
+	offlineChan   = make(chan bool, 1) // Send true to go offline, false to come online
+	isOffline     bool                 // Current offline state
+	offlineMutex  sync.RWMutex
 	updatePath    string
 	updatePending bool
 )
+
+// SetOffline enables or disables offline mode, signaling the Pub/Sub loop
+func SetOffline(offline bool) {
+	offlineMutex.Lock()
+	isOffline = offline
+	offlineMutex.Unlock()
+
+	// Non-blocking send to signal the change
+	select {
+	case offlineChan <- offline:
+	default:
+		// Channel already has a pending value, drain and send new
+		select {
+		case <-offlineChan:
+		default:
+		}
+		offlineChan <- offline
+	}
+}
+
+// IsOffline returns the current offline state
+func IsOffline() bool {
+	offlineMutex.RLock()
+	defer offlineMutex.RUnlock()
+	return isOffline
+}
 
 /*──────────────────────────────  StartAgent  ──────────────────────────────*/
 

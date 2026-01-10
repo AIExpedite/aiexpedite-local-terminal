@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/pubsub"
+	"github.com/getlantern/systray"
 	"golang.org/x/time/rate"
 )
 
@@ -211,7 +212,7 @@ type resultMsg struct {
 }
 
 /* --------------------------------------------------------------------------
-   StartPubSubLoop – listens for commands and publishes results
+   StartPubSubLoop – reconnection wrapper with exponential backoff
    -------------------------------------------------------------------------- */
 func StartPubSubLoop(cfg *Config) {
 	fmt.Println("[pubsub] StartPubSubLoop called")
@@ -222,21 +223,107 @@ func StartPubSubLoop(cfg *Config) {
 		return
 	}
 
-	fmt.Println("[pubsub] creating Pub/Sub client...")
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() { <-shutdownChan; cancel() }() // graceful exit on tray quit
+	// Reconnection loop with exponential backoff
+	backoff := time.Second        // Initial: 1 second
+	maxBackoff := 5 * time.Minute // Max: 5 minutes
 
+	for {
+		// Check for shutdown
+		select {
+		case <-shutdownChan:
+			fmt.Println("[pubsub] shutdown signal received")
+			return
+		default:
+		}
+
+		// Check if offline mode is enabled
+		if IsOffline() {
+			fmt.Println("[pubsub] offline mode - waiting to come online...")
+			select {
+			case <-shutdownChan:
+				return
+			case online := <-offlineChan:
+				if !online {
+					continue // Still offline
+				}
+				fmt.Println("[pubsub] coming online...")
+				backoff = time.Second // Reset backoff
+			}
+		}
+
+		// Attempt connection
+		err := runPubSubConnection(cfg)
+
+		// Check if we went offline intentionally
+		if IsOffline() {
+			fmt.Println("[pubsub] disconnected (offline mode)")
+			continue
+		}
+
+		if err == nil {
+			// Clean shutdown
+			return
+		}
+
+		fmt.Printf("[pubsub] connection lost: %v\n", err)
+		fmt.Printf("[pubsub] reconnecting in %v...\n", backoff)
+		systray.SetTooltip(EnvDisplayName + " – Reconnecting...")
+
+		// Wait for backoff or shutdown/offline signal
+		select {
+		case <-shutdownChan:
+			return
+		case offline := <-offlineChan:
+			if offline {
+				fmt.Println("[pubsub] going offline...")
+				continue
+			}
+		case <-time.After(backoff):
+		}
+
+		// Exponential backoff (1s → 1.5s → 2.25s → ... → 5min max)
+		backoff = time.Duration(float64(backoff) * 1.5)
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+/* --------------------------------------------------------------------------
+   runPubSubConnection – handles a single connection attempt
+   Returns nil on clean shutdown, error on connection failure
+   -------------------------------------------------------------------------- */
+func runPubSubConnection(cfg *Config) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Listen for shutdown or offline signal
+	go func() {
+		select {
+		case <-shutdownChan:
+			cancel()
+		case offline := <-offlineChan:
+			if offline {
+				SetOffline(true)
+				cancel()
+			} else {
+				// Re-queue the online signal for the main loop
+				select {
+				case offlineChan <- false:
+				default:
+				}
+			}
+		}
+	}()
+
+	fmt.Println("[pubsub] creating Pub/Sub client...")
 	client, err := pubsub.NewClient(ctx, cfg.ProjectID)
 	if err != nil {
-		fmt.Println("[pubsub] client error:", err)
-		return
+		return fmt.Errorf("client creation failed: %w", err)
 	}
+	defer client.Close()
+
 	fmt.Println("[pubsub] client created successfully")
-	// Ensure underlying connections close when ctx is done
-	go func() {
-		<-ctx.Done()
-		_ = client.Close()
-	}()
 
 	sub := client.Subscription(cfg.CommandsSubscription)
 	sub.ReceiveSettings.Synchronous = true
@@ -244,11 +331,11 @@ func StartPubSubLoop(cfg *Config) {
 
 	topic := client.Topic(cfg.ResultsTopic)
 
-	fmt.Printf("[pubsub] connecting to subscription: %s\n", cfg.CommandsSubscription)
+	fmt.Printf("[pubsub] connected to subscription: %s\n", cfg.CommandsSubscription)
+	systray.SetTooltip(EnvDisplayName + " – Connected")
 
-	go func() {
-		fmt.Printf("[pubsub] listening for commands on: %s\n", cfg.CommandsSubscription)
-		err := sub.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {
+	fmt.Printf("[pubsub] listening for commands on: %s\n", cfg.CommandsSubscription)
+	err = sub.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {
 			// Panic recovery to prevent app crash on unhandled errors
 			defer func() {
 				if r := recover(); r != nil {
@@ -517,12 +604,14 @@ func StartPubSubLoop(cfg *Config) {
 				fmt.Println("[pubsub] result published successfully")
 			}
 			m.Ack()
-			fmt.Println("[pubsub] message acknowledged")
-		})
-		if err != nil && ctx.Err() == nil { // ignore shutdown‑induced error
-			fmt.Println("[pubsub] subscription ended:", err)
-		}
-	}()
+		fmt.Println("[pubsub] message acknowledged")
+	})
+
+	// Return nil on clean shutdown, error otherwise
+	if ctx.Err() != nil && !IsOffline() {
+		return nil // Clean shutdown
+	}
+	return err
 }
 
 /* runLocalCommand executes the command and returns combined stdout/stderr. */

@@ -119,6 +119,7 @@ func onTrayReady(cfg *Config) func() {
 		}
 
 		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", false)
+		mDisconnect := systray.AddMenuItemCheckbox("Disconnect from cloud", "Stop cloud connection (stay running)", false)
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("Quit", "Exit the agent")
 
@@ -195,6 +196,19 @@ func onTrayReady(cfg *Config) func() {
 						if runtime.GOOS == "windows" {
 							showConsoleWindow(false)
 						}
+					}
+
+				case <-mDisconnect.ClickedCh:
+					if mDisconnect.Checked() {
+						mDisconnect.Uncheck()
+						fmt.Println("[tray] Reconnecting to cloud...")
+						SetOffline(false)
+						systray.SetTooltip(EnvDisplayName + " – Online")
+					} else {
+						mDisconnect.Check()
+						fmt.Println("[tray] Disconnecting from cloud...")
+						SetOffline(true)
+						systray.SetTooltip(EnvDisplayName + " – Disconnected")
 					}
 
 				case <-mQuit.ClickedCh:
