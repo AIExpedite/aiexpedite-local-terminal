@@ -25,6 +25,7 @@ func main() {
 	// This prevents clicking X on console from closing the app
 	if runtime.GOOS == "windows" {
 		initConsoleHandler()
+		disableConsoleCloseButton() // Disable X button since Windows ignores our handler
 	}
 
 	// Show startup message (console visible initially for first-time setup)

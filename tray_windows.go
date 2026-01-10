@@ -32,6 +32,10 @@ const (
 	SW_SHOWNOACTIVATE  = 8
 	SW_RESTORE         = 9
 	SW_SHOWDEFAULT     = 10
+
+	// System menu constants for disabling close button
+	SC_CLOSE     = 0xF060
+	MF_BYCOMMAND = 0x00000000
 )
 
 // Console control event types
@@ -45,6 +49,8 @@ const (
 
 var (
 	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
+	procGetSystemMenu       = user32.NewProc("GetSystemMenu")
+	procDeleteMenu          = user32.NewProc("DeleteMenu")
 )
 
 // allowAppExit is set to true when user clicks "Quit" from tray menu
@@ -91,6 +97,27 @@ func initConsoleHandler() {
 	if ret == 0 {
 		fmt.Printf("[console] Warning: Failed to set console handler: %v\n", err)
 	}
+}
+
+// disableConsoleCloseButton removes the close button from the console window.
+// This prevents users from accidentally closing the app via the console X button,
+// since Windows forcibly terminates console apps on CTRL_CLOSE_EVENT regardless
+// of whether the handler returns TRUE.
+func disableConsoleCloseButton() {
+	hwnd := getConsoleWindow()
+	if hwnd == 0 {
+		return
+	}
+
+	// Get the system menu (window menu with Close, Minimize, etc.)
+	// The second parameter (0) means get a copy we can modify
+	hMenu, _, _ := procGetSystemMenu.Call(hwnd, 0)
+	if hMenu == 0 {
+		return
+	}
+
+	// Delete the Close menu item - this also grays out the X button
+	procDeleteMenu.Call(hMenu, SC_CLOSE, MF_BYCOMMAND)
 }
 
 // getConsoleWindow returns the handle to the console window
