@@ -64,14 +64,16 @@ func getRegistrationURL() string {
 }
 
 // initRegistration calls POST /device/init to start the registration flow
-func initRegistration(deviceName, platform string) (*InitResponse, error) {
+func initRegistration(deviceName, platform string, cfg *Config) (*InitResponse, error) {
 	baseURL := getRegistrationURL()
 	url := baseURL + "/device/init"
 
-	payload := map[string]string{
-		"deviceName": deviceName,
-		"platform":   platform,
-		"version":    Version,
+	// Use interface{} to allow mixed types (string and string)
+	payload := map[string]interface{}{
+		"deviceName":       deviceName,
+		"platform":         platform,
+		"version":          Version,
+		"workingDirectory": cfg.WorkingDirectory, // Send working directory for remote command execution
 	}
 
 	body, err := json.Marshal(payload)
@@ -175,7 +177,7 @@ func StartRegistration(cfg *Config) error {
 	fmt.Printf("→ Device: %s (%s)\n", deviceName, platform)
 	fmt.Println("→ Initiating registration...")
 
-	initResp, err := initRegistration(deviceName, platform)
+	initResp, err := initRegistration(deviceName, platform, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to initiate registration: %w", err)
 	}
