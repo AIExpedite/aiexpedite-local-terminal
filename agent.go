@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.0" // proactive update notification with user choice dialog
+const Version = "v0.4.1" // working directory fix - send workingDirectory during registration
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
