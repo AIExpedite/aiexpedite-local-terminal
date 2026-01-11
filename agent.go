@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.3" // fix: systray nil pointer crash when pubsub connects before tray ready
+const Version = "v0.4.4" // uninstall: keep allowed-commands.txt, only delete config.json
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

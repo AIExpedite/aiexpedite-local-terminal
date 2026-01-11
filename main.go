@@ -427,15 +427,15 @@ func handleUninstall() {
 		}
 	}
 
-	// Remove config directory
-	configDir := GetConfigDir()
-	if err := os.RemoveAll(configDir); err != nil {
+	// Remove config.json only (keep allowed-commands.txt for re-registration)
+	configFile := ConfigPath()
+	if err := os.Remove(configFile); err != nil && !os.IsNotExist(err) {
 		if !quiet {
-			fmt.Println("Warning: Failed to remove config directory:", err)
+			fmt.Println("Warning: Failed to remove config file:", err)
 		}
 	} else {
 		if !quiet {
-			fmt.Println("→ Removed config directory:", configDir)
+			fmt.Println("→ Removed config file:", configFile)
 		}
 	}
 
@@ -464,7 +464,7 @@ func handleUninstall() {
 		ShowInfoDialog(
 			"Uninstall Complete",
 			"AI Expedite Terminal has been uninstalled.\n\n"+
-				"All files and settings have been removed.",
+				"Your allowed-commands.txt file has been preserved.",
 		)
 	}
 }
