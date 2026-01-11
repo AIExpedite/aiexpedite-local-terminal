@@ -95,10 +95,18 @@ jobs:
         id: sha
         run: echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
-      - name: Delete existing internal release
+      - name: Delete existing internal release and recreate tag
         run: |
+          # Delete existing release (if any)
           gh release delete latest-internal --yes || true
+          # Delete existing tag from remote (if any)
           git push origin :refs/tags/latest-internal || true
+          # Delete local tag (if any)
+          git tag -d latest-internal || true
+          # Create new tag pointing to current commit
+          git tag latest-internal
+          # Push the new tag
+          git push origin latest-internal
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
