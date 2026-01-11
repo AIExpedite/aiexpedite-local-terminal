@@ -106,6 +106,9 @@ func onTrayReady(cfg *Config) func() {
 		systray.SetTitle(EnvDisplayName)
 		systray.SetTooltip(EnvDisplayName + " – Remote Command Execution")
 
+		// Mark systray as ready so background goroutines can safely use it
+		SetSystrayReady()
+
 		mOpen := systray.AddMenuItem("Open Terminal", "Open terminal in browser")
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
 

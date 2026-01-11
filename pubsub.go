@@ -269,7 +269,9 @@ func StartPubSubLoop(cfg *Config) {
 
 		fmt.Printf("[pubsub] connection lost: %v\n", err)
 		fmt.Printf("[pubsub] reconnecting in %v...\n", backoff)
-		systray.SetTooltip(EnvDisplayName + " – Reconnecting...")
+		if IsSystrayReady() {
+			systray.SetTooltip(EnvDisplayName + " – Reconnecting...")
+		}
 
 		// Wait for backoff or shutdown/offline signal
 		select {
@@ -334,7 +336,9 @@ func runPubSubConnection(cfg *Config) error {
 	topic := client.Topic(cfg.ResultsTopic)
 
 	fmt.Printf("[pubsub] connected to subscription: %s\n", cfg.CommandsSubscription)
-	systray.SetTooltip(EnvDisplayName + " – Connected")
+	if IsSystrayReady() {
+		systray.SetTooltip(EnvDisplayName + " – Connected")
+	}
 
 	fmt.Printf("[pubsub] listening for commands on: %s\n", cfg.CommandsSubscription)
 	err = sub.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {

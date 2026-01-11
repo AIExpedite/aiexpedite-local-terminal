@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.2" // fix: Windows update restart requires .exe extension on temp file
+const Version = "v0.4.3" // fix: systray nil pointer crash when pubsub connects before tray ready
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -31,7 +31,25 @@ var (
 	// Pending update state (when user clicks "Later")
 	pendingUpdateInfo  *UpdateInfo
 	pendingUpdateMutex sync.RWMutex
+
+	// Systray ready state - prevents calling systray functions before initialization
+	systrayReady      bool
+	systrayReadyMutex sync.RWMutex
 )
+
+// SetSystrayReady marks the systray as initialized and safe to use
+func SetSystrayReady() {
+	systrayReadyMutex.Lock()
+	systrayReady = true
+	systrayReadyMutex.Unlock()
+}
+
+// IsSystrayReady returns true if systray is initialized
+func IsSystrayReady() bool {
+	systrayReadyMutex.RLock()
+	defer systrayReadyMutex.RUnlock()
+	return systrayReady
+}
 
 // SetOffline enables or disables offline mode, signaling the Pub/Sub loop
 func SetOffline(offline bool) {
