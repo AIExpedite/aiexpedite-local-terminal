@@ -113,3 +113,61 @@ jobs:
             1. Download and run the executable
             2. If Windows SmartScreen appears, click "More info" then "Run anyway"
             3. Click "Register Device" in the system tray to connect to your AI Expedite account
+
+  ###############################################################################
+  # Update 'latest' tag and release (always points to newest production release)
+  ###############################################################################
+  update-latest:
+    name: Update latest release
+    needs: release-prod
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download prod binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: prod-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Delete existing latest release
+        run: gh release delete latest --yes || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update latest tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa latest -m "Latest release (${{ inputs.version }})"
+          git push origin latest --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create latest release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: latest
+          name: "Latest Release (${{ inputs.version }})"
+          files: dist/**
+          body: |
+            ## AI Expedite Terminal - Latest Release
+
+            **Current version: ${{ inputs.version }}**
+
+            Download for Windows: `aiexpedite-terminal-windows-amd64.exe`
+
+            ### Installation
+            1. Download and run the executable
+            2. If Windows SmartScreen appears, click "More info" then "Run anyway"
+            3. Click "Register Device" in the system tray to connect to your AI Expedite account
+
+            ---
+            *This release always points to the latest production version. For specific versions, see [all releases](https://github.com/AIExpedite/aiexpedite-local-terminal/releases).*
+          prerelease: false
