@@ -67,6 +67,7 @@ func checkForNewVersion() (*UpdateInfo, error) {
 
 	var rel struct {
 		TagName string `json:"tag_name"`
+		Body    string `json:"body"`
 		Assets  []struct {
 			Name string `json:"name"`
 			URL  string `json:"browser_download_url"`
@@ -78,6 +79,20 @@ func checkForNewVersion() (*UpdateInfo, error) {
 
 	cur := "v" + strings.TrimPrefix(Version, "v")
 	latest := rel.TagName
+
+	// For non-prod channels, extract version from release body (format: "**Version:** vX.Y.Z")
+	// since tag_name is "latest-dev" not a semver
+	if ReleaseChannel == "dev" || ReleaseChannel == "stg" || ReleaseChannel == "beta" {
+		if idx := strings.Index(rel.Body, "**Version:** "); idx != -1 {
+			start := idx + len("**Version:** ")
+			end := strings.Index(rel.Body[start:], "\n")
+			if end == -1 {
+				end = len(rel.Body) - start
+			}
+			latest = strings.TrimSpace(rel.Body[start : start+end])
+		}
+	}
+
 	if semver.Compare(latest, cur) <= 0 {
 		// No update needed
 		return info, nil

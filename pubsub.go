@@ -387,18 +387,17 @@ func runPubSubConnection(cfg *Config) error {
 				}
 			}()
 
-			// Redact sensitive data before logging received command
-			fmt.Printf("%s received command: %s\n", colorPrefix("[pubsub]", colorCyan), redactSensitiveData(string(m.Data)))
+			// Parse command silently (verbose logging removed in v0.4.12)
 			var cmd commandMsg
 			if err := json.Unmarshal(m.Data, &cmd); err != nil {
-				fmt.Println("[pubsub] bad payload:", err)
+				fmt.Printf("%s[aiexpedite] Bad command payload: %v%s\n", colorRed, err, colorReset)
 				m.Nack()
 				return
 			}
 
 			// ─── Per-UID Rate Limiting ─────────────────────────────────────────
 			if !checkRateLimit(cmd.UID, cfg) {
-				fmt.Printf("[security] Rate limit exceeded for UID: %s\n", cmd.UID)
+				fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
 
 				// Send rate_limited response back to user for immediate feedback
 				res := resultMsg{
@@ -424,7 +423,7 @@ func runPubSubConnection(cfg *Config) error {
 			if cfg.CommandSecret != "" {
 				// Check if command is targeted at this agent
 				if cmd.AgentID != "" && cmd.AgentID != cfg.AgentID {
-					fmt.Printf("[security] Command targeted at different agent: %s (this agent: %s)\n", cmd.AgentID, cfg.AgentID)
+					fmt.Printf("%s[aiexpedite] Command targeted at different agent%s\n", colorYellow, colorReset)
 					res := resultMsg{
 						ID:          cmd.ID,
 						WorkspaceID: cmd.WorkspaceID,
@@ -444,7 +443,7 @@ func runPubSubConnection(cfg *Config) error {
 
 				// Verify signature (strict mode - no signature = reject)
 				if cmd.Signature == "" {
-					fmt.Printf("[security] Command missing signature (strict mode enabled)\n")
+					fmt.Printf("%s[aiexpedite] Command missing signature%s\n", colorRed, colorReset)
 					res := resultMsg{
 						ID:          cmd.ID,
 						WorkspaceID: cmd.WorkspaceID,
@@ -463,7 +462,7 @@ func runPubSubConnection(cfg *Config) error {
 				}
 
 				if !verifySignature(cmd, cfg.CommandSecret) {
-					fmt.Printf("[security] Invalid command signature for ID: %s\n", cmd.ID)
+					fmt.Printf("%s[aiexpedite] Invalid command signature%s\n", colorRed, colorReset)
 					res := resultMsg{
 						ID:          cmd.ID,
 						WorkspaceID: cmd.WorkspaceID,
@@ -480,14 +479,14 @@ func runPubSubConnection(cfg *Config) error {
 					m.Ack()
 					return
 				}
-				fmt.Printf("[security] Command signature verified for ID: %s\n", cmd.ID)
+				// Signature verified - proceed silently
 			}
 			// ─────────────────────────────────────────────────────────────────
 
 			// ─── Special Ping Command Handler ────────────────────────────────
 			// Responds immediately without shell execution for online status checks
 			if cmd.Command == "__ping__" {
-				fmt.Println("[pubsub] received ping command, responding immediately")
+				// Ping is silent - no console output
 				res := resultMsg{
 					ID:          cmd.ID,
 					WorkspaceID: cmd.WorkspaceID,
@@ -499,7 +498,7 @@ func runPubSubConnection(cfg *Config) error {
 				}
 				bytes, _ := json.Marshal(res)
 				if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
-					fmt.Println("[pubsub] ping publish error:", err)
+					fmt.Printf("%s[aiexpedite] Ping publish error: %v%s\n", colorRed, err, colorReset)
 				}
 				m.Ack()
 				return
@@ -508,8 +507,7 @@ func runPubSubConnection(cfg *Config) error {
 
 			// ─── Command Allow List Validation ───────────────────────────────
 			if cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
-				// Redact args when logging security events
-				fmt.Printf("[security] Command not in allow list: %s\n", redactCommandForLog(cmd.Command, cmd.Args))
+				// Command not in allow list - show approval dialog
 
 				// Get timeout settings from config
 				timeoutSec := cfg.ApprovalTimeoutSec
@@ -522,17 +520,12 @@ func runPubSubConnection(cfg *Config) error {
 
 				// Handle timeout based on config
 				if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
-					fmt.Println("[security] Timeout - auto-allowing per config")
 					result = ApprovalOnce
 				}
 
 				switch result {
 				case ApprovalDeny:
-					fmt.Println("[security] User denied command execution")
-					if cfg.LogDeniedCommands {
-						// Redact args in audit log
-						fmt.Printf("[security-audit] DENIED: %s (user: %s)\n", redactCommandForLog(cmd.Command, cmd.Args), cmd.UID)
-					}
+					fmt.Printf("%s[aiexpedite] Command denied by user%s\n", colorYellow, colorReset)
 
 					// Send denial result back to backend
 					res := resultMsg{
@@ -554,28 +547,41 @@ func runPubSubConnection(cfg *Config) error {
 				case ApprovalAlways:
 					pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
 					if err := defaultAllowList.AddPattern(pattern); err != nil {
-						fmt.Printf("[security] Failed to add pattern to allow list: %v\n", err)
-					} else {
-						fmt.Printf("[security] Added pattern to allow list: %s\n", pattern)
+						fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
 					}
 					// Fall through to execute
 
 				case ApprovalOnce:
-					fmt.Println("[security] User approved command (once)")
-					// Fall through to execute
+					// User approved - proceed silently
 				}
 			}
 			// ─────────────────────────────────────────────────────────────────
 
-			// Redact command args before logging
-			fmt.Printf("%s executing: %s\n", colorPrefix("[pubsub]", colorBlue), redactCommandForLog(cmd.Command, cmd.Args))
+			// Display decoded command in green with ">" prefix
+			cmdDisplay := cmd.Command
+			if len(cmd.Args) > 0 {
+				cmdDisplay += " " + strings.Join(cmd.Args, " ")
+			}
+			// Decode Base64-encoded PowerShell commands for readability
+			if strings.ToLower(cmd.Command) == "powershell" && len(cmd.Args) >= 2 {
+				if strings.ToLower(cmd.Args[0]) == "-encodedcommand" {
+					cmdDisplay = decodeBase64PowerShell(cmd.Args[1])
+				}
+			}
+			fmt.Printf("%s> %s%s\n", colorGreen, redactSensitiveData(cmdDisplay), colorReset)
+
+			// Execute command (silently - no internal logs)
 			out, execErr := runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd)
-			// Redact output before logging (may contain secrets)
+
+			// Show output or terminal error
 			if execErr != nil {
-				fmt.Printf("%s error: %v\n", colorPrefix("[pubsub]", colorRed), execErr)
-				fmt.Printf("%s output (length=%d): %s\n", colorPrefix("[pubsub]", colorYellow), len(out), redactSensitiveData(out))
-			} else {
-				fmt.Printf("%s output (length=%d): %s\n", colorPrefix("[pubsub]", colorGreen), len(out), redactSensitiveData(out))
+				// Terminal error - shown in red without [aiexpedite] prefix
+				fmt.Printf("%s%v%s\n", colorRed, execErr, colorReset)
+				if out != "" {
+					fmt.Println(out)
+				}
+			} else if out != "" {
+				fmt.Println(out)
 			}
 
 			res := resultMsg{
@@ -642,19 +648,9 @@ func runPubSubConnection(cfg *Config) error {
 			}
 
 			bytes, _ := json.Marshal(res)
-			// Color the status based on success/error
-			statusColor := colorGreen
-			if res.Status == "error" {
-				statusColor = colorRed
-			} else if res.Status == "partial" || res.Status == "denied" || res.Status == "rate_limited" {
-				statusColor = colorYellow
-			}
-			fmt.Printf("%s publishing result (status=%s%s%s, size=%d bytes)\n",
-				colorPrefix("[pubsub]", colorBlue), statusColor, res.Status, colorReset, len(bytes))
+			// Publish result silently - only log errors
 			if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
-				fmt.Printf("%s publish error: %v\n", colorPrefix("[pubsub]", colorRed), err)
-			} else {
-				fmt.Printf("%s result published successfully\n", colorPrefix("[pubsub]", colorGreen))
+				fmt.Printf("%s[aiexpedite] Publish error: %v%s\n", colorRed, err, colorReset)
 			}
 			m.Ack()
 	})
@@ -722,18 +718,30 @@ func encodeForPowerShell(script string) string {
 	return base64.StdEncoding.EncodeToString(bytes)
 }
 
+// decodeBase64PowerShell decodes a Base64 UTF-16LE encoded PowerShell script.
+// Returns the decoded script or an error indicator if decoding fails.
+func decodeBase64PowerShell(encoded string) string {
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "[decode error]"
+	}
+	// Convert UTF-16LE to string
+	if len(decoded)%2 != 0 {
+		return "[invalid encoding]"
+	}
+	u16s := make([]uint16, len(decoded)/2)
+	for i := 0; i < len(u16s); i++ {
+		u16s[i] = uint16(decoded[i*2]) | uint16(decoded[i*2+1])<<8
+	}
+	return string(utf16.Decode(u16s))
+}
+
 // runEncodedPowerShellCommand executes a Base64-encoded PowerShell script.
 // This is the most reliable way to execute PowerShell commands as it completely
 // bypasses all shell escaping issues.
 // It captures stdout and stderr separately and filters CLIXML progress messages
 // to avoid false "exit status 1" errors when commands produce valid output.
 func runEncodedPowerShellCommand(encodedScript string, workDir string) (string, error) {
-	fmt.Printf("%s Running encoded PowerShell (length=%d)\n",
-		colorPrefix("[exec]", colorBlue), len(encodedScript))
-	if workDir != "" {
-		fmt.Printf("%s Working directory: %s\n", colorPrefix("[exec]", colorBlue), workDir)
-	}
-
 	// Build PowerShell arguments
 	psArgs := []string{
 		"-NoProfile",
@@ -774,23 +782,15 @@ func runEncodedPowerShellCommand(encodedScript string, workDir string) (string, 
 
 		if hasOnlyCLIXML && hasMeaningfulOutput {
 			// CLIXML on stderr but valid stdout - not a real error
-			fmt.Printf("%s CLIXML on stderr but valid output - treating as success\n",
-				colorPrefix("[exec]", colorYellow))
 			finalErr = nil
 		} else if hasMeaningfulOutput {
-			// Has output despite error - return output but log warning
-			fmt.Printf("%s Exited with error but produced output\n",
-				colorPrefix("[exec]", colorYellow))
+			// Has output despite error - return output
 			finalErr = nil
 		} else {
 			// Real error - no useful output
-			fmt.Printf("%s PowerShell error: %v\n", colorPrefix("[exec]", colorRed), err)
 			finalErr = err
 		}
 	}
-
-	fmt.Printf("%s Output length: %d bytes\n",
-		colorPrefix("[exec]", colorBlue), len(output))
 
 	return output, finalErr
 }
@@ -809,7 +809,6 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 		strings.ToLower(args[0]) == "-encodedcommand"
 
 	if isEncodedPowerShell {
-		fmt.Printf("%s Detected -EncodedCommand, using direct encoded execution\n", colorPrefix("[exec]", colorBlue))
 		return runEncodedPowerShellCommand(args[1], workDir)
 	}
 
@@ -822,7 +821,6 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 	if isPowerShellCommand {
 		// Encode the script locally to prevent escaping issues
 		script := strings.Join(args[1:], " ")
-		fmt.Printf("%s Encoding PowerShell -Command locally (length=%d)\n", colorPrefix("[exec]", colorBlue), len(script))
 		encoded := encodeForPowerShell(script)
 		return runEncodedPowerShellCommand(encoded, workDir)
 	}
@@ -840,15 +838,10 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 		}
 	}
 
-	fmt.Printf("%s Running command: %s\n", colorPrefix("[exec]", colorBlue), redactSensitiveData(cmdLine))
-	if workDir != "" {
-		fmt.Printf("%s Working directory: %s\n", colorPrefix("[exec]", colorBlue), workDir)
-	}
-
 	// Try persistent PowerShell first (much faster - avoids 300-800ms startup)
 	ps, err := GetPowerShell()
 	if err != nil {
-		fmt.Printf("%s Persistent PowerShell unavailable, falling back: %v\n", colorPrefix("[exec]", colorYellow), err)
+		fmt.Printf("%s[aiexpedite] Persistent PowerShell unavailable, using fallback%s\n", colorYellow, colorReset)
 		return runLocalCommandFallback(cmdLine, workDir)
 	}
 
@@ -858,9 +851,8 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 	output, err := ps.Execute(ctx, cmdLine, workDir)
 	if err != nil {
 		// If persistent PS failed, try restarting it once
-		fmt.Printf("%s Persistent PowerShell failed: %v, attempting restart...\n", colorPrefix("[exec]", colorYellow), err)
 		if restartErr := RestartPowerShell(); restartErr != nil {
-			fmt.Printf("%s Restart failed, falling back: %v\n", colorPrefix("[exec]", colorYellow), restartErr)
+			fmt.Printf("%s[aiexpedite] PowerShell restart failed, using fallback%s\n", colorYellow, colorReset)
 			return runLocalCommandFallback(cmdLine, workDir)
 		}
 
@@ -876,24 +868,17 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 		}
 	}
 
-	fmt.Printf("%s Output length: %d bytes\n", colorPrefix("[exec]", colorBlue), len(output))
 	return output, nil
 }
 
 // runLocalCommandFallback uses traditional process spawning (slow but reliable)
 func runLocalCommandFallback(cmdLine string, workDir string) (string, error) {
-	fmt.Printf("%s Using fallback (spawning new PowerShell process)\n", colorPrefix("[exec]", colorYellow))
-
 	c := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
 	if workDir != "" {
 		c.Dir = workDir
 	}
 
 	out, err := c.CombinedOutput()
-	if err != nil {
-		fmt.Printf("%s PowerShell error: %v\n", colorPrefix("[exec]", colorRed), err)
-	}
-	fmt.Printf("%s Output length: %d bytes\n", colorPrefix("[exec]", colorBlue), len(out))
 	return string(out), err
 }
 

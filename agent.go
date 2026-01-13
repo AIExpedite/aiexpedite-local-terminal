@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.12" // Prevent Windows Terminal wrapper window on AllocConsole
+const Version = "v0.4.12" // Simplified user-friendly console output
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -169,9 +169,9 @@ func StartAgent(cfg *Config) {
 	if runtime.GOOS == "windows" {
 		go func() {
 			if _, err := GetPowerShell(); err != nil {
-				fmt.Printf("[agent] Failed to pre-warm PowerShell: %v\n", err)
+				fmt.Printf("[aiexpedite] Failed to pre-warm PowerShell: %v\n", err)
 			} else {
-				fmt.Println("[agent] PowerShell process pre-warmed for fast command execution")
+				fmt.Println("[aiexpedite] PowerShell ready")
 			}
 		}()
 	}

@@ -159,6 +159,12 @@ jobs:
         id: sha
         run: echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
+      - name: Extract version from agent.go
+        id: version
+        run: |
+          VERSION=$(grep -oP 'const Version = "v\K[0-9]+\.[0-9]+\.[0-9]+' agent.go)
+          echo "version=v${VERSION}" >> $GITHUB_OUTPUT
+
       - name: Delete existing dev release and recreate tag
         run: |
           gh release delete latest-dev --yes || true
@@ -173,7 +179,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: latest-dev
-          name: "Dev Build (${{ steps.sha.outputs.short_sha }})"
+          name: "Dev Build ${{ steps.version.outputs.version }} (${{ steps.sha.outputs.short_sha }})"
           draft: false
           prerelease: false
           files: dist/**
@@ -182,6 +188,7 @@ jobs:
 
             Auto-update target for dev environment.
 
+            **Version:** ${{ steps.version.outputs.version }}
             **Commit:** ${{ github.sha }}
 
             | Platform | Download |
