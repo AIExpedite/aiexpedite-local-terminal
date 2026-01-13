@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.5" // uninstall: keep allowed-commands.txt, only delete config.json
+const Version = "v0.4.6" // GUI app mode: no console by default, allocate on-demand
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
