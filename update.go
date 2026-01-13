@@ -19,6 +19,11 @@ import (
 
 const githubRepo = "AIExpedite/aiexpedite-local-terminal"
 
+// ReleaseChannel determines which GitHub release to check for updates.
+// Set via ldflags: -X main.ReleaseChannel=dev
+// Values: "prod" (default), "dev", "stg", "beta"
+var ReleaseChannel string = "prod"
+
 // UpdateInfo contains information about an available update
 type UpdateInfo struct {
 	Available      bool
@@ -36,7 +41,15 @@ func checkForNewVersion() (*UpdateInfo, error) {
 		Available:      false,
 	}
 
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
+	// Choose API endpoint based on release channel
+	var url string
+	if ReleaseChannel == "dev" || ReleaseChannel == "stg" || ReleaseChannel == "beta" {
+		// Non-prod channels check their specific release tag
+		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/latest-%s", githubRepo, ReleaseChannel)
+	} else {
+		// Prod checks the latest release
+		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
+	}
 
 	resp, err := http.Get(url)
 	if err != nil {

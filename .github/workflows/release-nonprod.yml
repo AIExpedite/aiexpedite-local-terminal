@@ -60,6 +60,7 @@ jobs:
           LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=${{ matrix.display_name }}'"
           LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=${{ matrix.api_endpoint }}"
           LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix=${{ matrix.config_suffix }}"
+          LDFLAGS="$LDFLAGS -X main.ReleaseChannel=${{ matrix.env }}"
 
           go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe" .
 
@@ -132,3 +133,57 @@ jobs:
             | Beta | `aiexpedite-terminal-beta-windows-amd64.exe` |
 
             All environments can run side-by-side on the same machine.
+
+  ###############################################################################
+  # Create dev-specific release (non-prerelease for auto-update checking)
+  ###############################################################################
+  release-dev:
+    name: Publish dev release for auto-update
+    needs: build-nonprod
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download dev binary only
+        uses: actions/download-artifact@v4
+        with:
+          name: nonprod-dev-windows-amd64
+          path: dist
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short_sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+      - name: Delete existing dev release and recreate tag
+        run: |
+          gh release delete latest-dev --yes || true
+          git push origin :refs/tags/latest-dev || true
+          git tag -d latest-dev || true
+          git tag latest-dev
+          git push origin latest-dev
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish dev release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: latest-dev
+          name: "Dev Build (${{ steps.sha.outputs.short_sha }})"
+          draft: false
+          prerelease: false
+          files: dist/**
+          body: |
+            ## Development Build
+
+            Auto-update target for dev environment.
+
+            **Commit:** ${{ github.sha }}
+
+            | Platform | Download |
+            |----------|----------|
+            | Windows | `aiexpedite-terminal-dev-windows-amd64.exe` |
