@@ -54,9 +54,9 @@ jobs:
           mkdir -p dist
 
           # Construct ldflags with environment-specific values
-          # Note: NOT using -H=windowsgui so the console window is visible
-          # This allows users to see startup messages and debug info
-          LDFLAGS="-X main.EnvName=${{ matrix.env }}"
+          # Using -H=windowsgui to build as GUI app (no console window by default)
+          # Console is allocated on-demand when user clicks "Show Console" in tray menu
+          LDFLAGS="-H=windowsgui -X main.EnvName=${{ matrix.env }}"
           LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=${{ matrix.display_name }}'"
           LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=${{ matrix.api_endpoint }}"
           LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix=${{ matrix.config_suffix }}"

@@ -21,29 +21,14 @@ func main() {
 		}
 	}
 
-	// Set up console close handler early (Windows)
-	// This prevents clicking X on console from closing the app
-	if runtime.GOOS == "windows" {
-		initConsoleHandler()
-		disableConsoleCloseButton() // Disable X button since Windows ignores our handler
-	}
+	// NOTE: When built as a GUI app (-H=windowsgui), there's no console window
+	// by default. Console will be allocated on-demand when user clicks "Show Console".
 
-	// Show startup message (console visible initially for first-time setup)
-	fmt.Println("")
-	fmt.Println("╔════════════════════════════════════════════════════════════╗")
-	fmt.Printf("║          %s %s - Starting...\n", EnvDisplayName, Version)
-	fmt.Println("╚════════════════════════════════════════════════════════════╝")
-	fmt.Println("")
-
-	// Ensure auto‑start at login (Windows)
+	// Ensure auto-start at login (Windows)
 	if runtime.GOOS == "windows" {
-		if err := ensureAutoStart(); err != nil {
-			fmt.Println("AutoStart setup failed:", err)
-		}
+		_ = ensureAutoStart()
 		// Register app in Windows "Installed Apps" for easy uninstall
-		if err := ensureAppRegistration(); err != nil {
-			fmt.Println("App registration failed:", err)
-		}
+		_ = ensureAppRegistration()
 	}
 
 	// Load or create configuration
@@ -52,47 +37,21 @@ func main() {
 		if os.IsNotExist(err) {
 			cfg = DefaultConfig()
 			_ = cfg.Save(ConfigPath())
-			fmt.Println("→ Created default config at", ConfigPath())
 		} else {
-			fmt.Println("Error loading config:", err)
 			cfg = DefaultConfig()
 		}
-	} else {
-		fmt.Println("→ Loaded config from", ConfigPath())
 	}
 
 	// Initialize command allow list for security
 	if cfg.EnableAllowList {
-		al, err := InitAllowList()
-		if err != nil {
-			fmt.Println("Warning: Failed to initialize allow list:", err)
-		} else {
-			fmt.Println("→ Command allow list loaded from", al.GetConfigPath())
-		}
-	} else {
-		fmt.Println("Warning: Command allow list is DISABLED - all commands will execute without validation")
-	}
-
-	// Check registration status
-	if cfg.IsRegistered() {
-		fmt.Printf("→ Device registered as: %s\n", cfg.AgentID)
-		fmt.Printf("→ Connected to user: %s\n", cfg.UserID)
-	} else {
-		fmt.Println("")
-		fmt.Println("→ First launch detected - registration will start automatically...")
-		fmt.Println("")
+		_, _ = InitAllowList()
 	}
 
 	// Background workers (includes ttyd installation check)
 	go StartAgent(cfg)
 
-	// Hide console after successful startup (Windows)
-	// User can show it via tray menu
-	if runtime.GOOS == "windows" {
-		// Small delay to let user see startup messages
-		time.Sleep(500 * time.Millisecond)
-		showConsoleWindow(false)
-	}
+	// NOTE: No console hiding needed - GUI app has no console by default.
+	// Console is allocated on-demand when user clicks "Show Console" in tray menu.
 
 	// Tray UI
 	systray.Run(onTrayReady(cfg), onTrayExit)

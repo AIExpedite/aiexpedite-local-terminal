@@ -18,11 +18,23 @@ import (
 var iconData []byte
 
 var (
-	kernel32               = syscall.NewLazyDLL("kernel32.dll")
-	procGetConsoleWindow   = kernel32.NewProc("GetConsoleWindow")
+	kernel32                  = syscall.NewLazyDLL("kernel32.dll")
+	procGetConsoleWindow      = kernel32.NewProc("GetConsoleWindow")
 	procSetConsoleCtrlHandler = kernel32.NewProc("SetConsoleCtrlHandler")
-	procShowWindow         = user32.NewProc("ShowWindow") // user32 declared in approval_windows.go
+	procAllocConsole          = kernel32.NewProc("AllocConsole")
+	procFreeConsole           = kernel32.NewProc("FreeConsole")
+	procGetStdHandle          = kernel32.NewProc("GetStdHandle")
+	procShowWindow            = user32.NewProc("ShowWindow") // user32 declared in approval_windows.go
 )
+
+// Standard handle constants for GetStdHandle
+const (
+	STD_OUTPUT_HANDLE = ^uintptr(10) // -11
+	STD_ERROR_HANDLE  = ^uintptr(11) // -12
+)
+
+// Track if we've allocated a console
+var consoleAllocated = false
 
 const (
 	SW_HIDE            = 0
@@ -126,21 +138,76 @@ func getConsoleWindow() uintptr {
 	return ret
 }
 
-// showConsoleWindow shows or hides the console window
-func showConsoleWindow(show bool) {
-	hwnd := getConsoleWindow()
-	if hwnd == 0 {
-		return // No console window
+// allocateConsole creates a new console window for this GUI process
+func allocateConsole() error {
+	if consoleAllocated {
+		return nil
 	}
 
+	ret, _, err := procAllocConsole.Call()
+	if ret == 0 {
+		return fmt.Errorf("AllocConsole failed: %v", err)
+	}
+
+	// Get the new console's stdout/stderr handles
+	stdout, _, _ := procGetStdHandle.Call(STD_OUTPUT_HANDLE)
+	stderr, _, _ := procGetStdHandle.Call(STD_ERROR_HANDLE)
+
+	// Update Go's os.Stdout and os.Stderr to use the new console
+	os.Stdout = os.NewFile(stdout, "stdout")
+	os.Stderr = os.NewFile(stderr, "stderr")
+
+	consoleAllocated = true
+
+	// Disable the close button on the new console
+	disableConsoleCloseButton()
+
+	// Set up console control handler
+	initConsoleHandler()
+
+	// Print startup banner now that we have a console
+	fmt.Println("")
+	fmt.Println("╔════════════════════════════════════════════════════════════╗")
+	fmt.Printf("║          %s %s\n", EnvDisplayName, Version)
+	fmt.Println("╚════════════════════════════════════════════════════════════╝")
+	fmt.Println("")
+
+	return nil
+}
+
+// freeConsole detaches from the console
+func freeConsole() {
+	if !consoleAllocated {
+		return
+	}
+	procFreeConsole.Call()
+	consoleAllocated = false
+}
+
+// showConsoleWindow shows or hides the console window.
+// When built as a GUI app (-H=windowsgui), this allocates a console on-demand.
+func showConsoleWindow(show bool) {
 	if show {
-		// Restore window if minimized, then show and bring to foreground
-		procShowWindow.Call(hwnd, SW_RESTORE)
-		procShowWindow.Call(hwnd, SW_SHOW)
-		procSetForegroundWindow.Call(hwnd)
+		// Allocate console if we don't have one (GUI app mode)
+		if !consoleAllocated {
+			if err := allocateConsole(); err != nil {
+				// Can't print error - no console yet
+				return
+			}
+		}
+
+		hwnd := getConsoleWindow()
+		if hwnd != 0 {
+			procShowWindow.Call(hwnd, SW_RESTORE)
+			procShowWindow.Call(hwnd, SW_SHOW)
+			procSetForegroundWindow.Call(hwnd)
+		}
 	} else {
-		// Completely hide the console window (not just minimize)
-		procShowWindow.Call(hwnd, SW_HIDE)
+		hwnd := getConsoleWindow()
+		if hwnd != 0 {
+			// Completely hide the console window (not just minimize)
+			procShowWindow.Call(hwnd, SW_HIDE)
+		}
 	}
 }
 

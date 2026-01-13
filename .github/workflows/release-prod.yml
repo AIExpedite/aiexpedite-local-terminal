@@ -52,9 +52,9 @@ jobs:
           mkdir -p dist
 
           # Production environment ldflags
-          # Note: NOT using -H=windowsgui so the console window is visible
-          # This allows users to see startup messages and debug info
-          LDFLAGS="-X main.EnvName=prod"
+          # Using -H=windowsgui to build as GUI app (no console window by default)
+          # Console is allocated on-demand when user clicks "Show Console" in tray menu
+          LDFLAGS="-H=windowsgui -X main.EnvName=prod"
           LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite Terminal'"
           LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=https://api.aiexpedite.com/terminal"
           LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix="
