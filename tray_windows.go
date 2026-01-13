@@ -203,10 +203,17 @@ func showConsoleWindow(show bool) {
 			procSetForegroundWindow.Call(hwnd)
 		}
 	} else {
-		hwnd := getConsoleWindow()
-		if hwnd != 0 {
-			// Completely hide the console window (not just minimize)
-			procShowWindow.Call(hwnd, SW_HIDE)
+		// When Windows Terminal is the default terminal, GetConsoleWindow() returns
+		// the conhost window handle which may not control the visible Windows Terminal
+		// window. FreeConsole() properly detaches and closes the terminal.
+		if consoleAllocated {
+			freeConsole()
+		} else {
+			// Fallback: try to hide via window handle (for legacy conhost)
+			hwnd := getConsoleWindow()
+			if hwnd != 0 {
+				procShowWindow.Call(hwnd, SW_HIDE)
+			}
 		}
 	}
 }
