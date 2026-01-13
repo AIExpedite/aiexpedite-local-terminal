@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.11" // Console color output and CLIXML stderr filtering for false positive errors
+const Version = "v0.4.12" // Prevent Windows Terminal wrapper window on AllocConsole
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

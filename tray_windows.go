@@ -144,6 +144,14 @@ func allocateConsole() error {
 		return nil
 	}
 
+	// Clear Windows Terminal environment variables to prevent WT from
+	// intercepting AllocConsole() and creating a wrapper window.
+	// When these are set, Windows routes console allocation through Windows Terminal,
+	// which creates a separate terminal window that the app cannot control.
+	// By clearing them, we force Windows to use the legacy conhost.exe instead.
+	os.Unsetenv("WT_SESSION")
+	os.Unsetenv("WT_PROFILE_ID")
+
 	ret, _, err := procAllocConsole.Call()
 	if ret == 0 {
 		return fmt.Errorf("AllocConsole failed: %v", err)
