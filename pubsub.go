@@ -118,7 +118,7 @@ var (
 )
 
 // getUIDRateLimiter returns or creates a rate limiter for the given UID
-func getUIDRateLimiter(uid string) *rate.Limiter {
+func getUIDRateLimiter(uid string, cfg *Config) *rate.Limiter {
 	uidRateMutex.RLock()
 	limiter, exists := uidRateLimiters[uid]
 	uidRateMutex.RUnlock()
@@ -135,19 +135,28 @@ func getUIDRateLimiter(uid string) *rate.Limiter {
 		return limiter
 	}
 
-	// Create new limiter: 10 commands per second with burst of 20
-	limiter = rate.NewLimiter(rate.Limit(10), 20)
+	// Use config values with defaults
+	rateLimit := cfg.RateLimitPerSecond
+	if rateLimit <= 0 {
+		rateLimit = 10
+	}
+	burst := cfg.RateLimitBurst
+	if burst <= 0 {
+		burst = 20
+	}
+
+	limiter = rate.NewLimiter(rate.Limit(rateLimit), burst)
 	uidRateLimiters[uid] = limiter
 	return limiter
 }
 
 // checkRateLimit checks if a command should be rate-limited
 // Returns true if the command is allowed, false if rate-limited
-func checkRateLimit(uid string) bool {
+func checkRateLimit(uid string, cfg *Config) bool {
 	if uid == "" {
 		return true // Allow commands without UID (backwards compatibility)
 	}
-	limiter := getUIDRateLimiter(uid)
+	limiter := getUIDRateLimiter(uid, cfg)
 	return limiter.Allow()
 }
 
@@ -331,7 +340,12 @@ func runPubSubConnection(cfg *Config) error {
 
 	sub := client.Subscription(cfg.CommandsSubscription)
 	sub.ReceiveSettings.Synchronous = true
-	sub.ReceiveSettings.MaxOutstandingMessages = 1
+	// Use configurable MaxOutstandingMessages for parallel processing
+	sub.ReceiveSettings.MaxOutstandingMessages = cfg.MaxOutstandingMessages
+	if sub.ReceiveSettings.MaxOutstandingMessages <= 0 {
+		sub.ReceiveSettings.MaxOutstandingMessages = 5 // Default to 5 for better throughput
+	}
+	fmt.Printf("[pubsub] MaxOutstandingMessages set to %d\n", sub.ReceiveSettings.MaxOutstandingMessages)
 
 	topic := client.Topic(cfg.ResultsTopic)
 
@@ -360,7 +374,7 @@ func runPubSubConnection(cfg *Config) error {
 			}
 
 			// ─── Per-UID Rate Limiting ─────────────────────────────────────────
-			if !checkRateLimit(cmd.UID) {
+			if !checkRateLimit(cmd.UID, cfg) {
 				fmt.Printf("[security] Rate limit exceeded for UID: %s\n", cmd.UID)
 
 				// Send rate_limited response back to user for immediate feedback
@@ -564,12 +578,12 @@ func runPubSubConnection(cfg *Config) error {
 					} else {
 						fmt.Printf("[file-upload] Detected %d output files, uploading to GCS (workspace: %s)...\n", len(files), workspaceID)
 
-						// Initialize GCS client
-						storageClient, storageErr := InitStorageClient(ctx)
+						// Get reusable GCS client (much faster than creating per command)
+						storageClient, storageErr := GetStorageClient(ctx)
 						if storageErr != nil {
-							fmt.Printf("[file-upload] Failed to initialize storage client: %v\n", storageErr)
+							fmt.Printf("[file-upload] Failed to get storage client: %v\n", storageErr)
 						} else {
-							defer storageClient.Close()
+							// Don't close - client is reused globally
 
 							// Create logger
 							logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -627,13 +641,11 @@ func runPubSubConnection(cfg *Config) error {
 	return err
 }
 
-/* runLocalCommand executes the command and returns combined stdout/stderr. */
+/* runLocalCommand executes the command using persistent PowerShell for low latency. */
 func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string, error) {
-	// On Windows, run commands through PowerShell to support built-ins like dir, ls, etc.
 	// Construct the full command line
 	cmdLine := cmd
 	if len(args) > 0 {
-		// Quote arguments that contain spaces
 		for _, arg := range args {
 			if containsSpace(arg) {
 				cmdLine += " \"" + arg + "\""
@@ -643,18 +655,59 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 		}
 	}
 
-	// Execute via PowerShell
-	fmt.Printf("[exec] Running PowerShell command: %s\n", cmdLine)
-	c := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
-
 	// Set working directory: priority is command cwd > config default > process cwd
 	workDir := cwd
 	if workDir == "" && cfg != nil {
 		workDir = cfg.WorkingDirectory
 	}
+
+	fmt.Printf("[exec] Running command: %s\n", redactSensitiveData(cmdLine))
+	if workDir != "" {
+		fmt.Printf("[exec] Working directory: %s\n", workDir)
+	}
+
+	// Try persistent PowerShell first (much faster - avoids 300-800ms startup)
+	ps, err := GetPowerShell()
+	if err != nil {
+		fmt.Printf("[exec] Persistent PowerShell unavailable, falling back: %v\n", err)
+		return runLocalCommandFallback(cmdLine, workDir)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	output, err := ps.Execute(ctx, cmdLine, workDir)
+	if err != nil {
+		// If persistent PS failed, try restarting it once
+		fmt.Printf("[exec] Persistent PowerShell failed: %v, attempting restart...\n", err)
+		if restartErr := RestartPowerShell(); restartErr != nil {
+			fmt.Printf("[exec] Restart failed, falling back: %v\n", restartErr)
+			return runLocalCommandFallback(cmdLine, workDir)
+		}
+
+		// Try again with fresh process
+		ps, err = GetPowerShell()
+		if err != nil {
+			return runLocalCommandFallback(cmdLine, workDir)
+		}
+
+		output, err = ps.Execute(ctx, cmdLine, workDir)
+		if err != nil {
+			return runLocalCommandFallback(cmdLine, workDir)
+		}
+	}
+
+	fmt.Printf("[exec] Output length: %d bytes\n", len(output))
+	return output, nil
+}
+
+// runLocalCommandFallback uses traditional process spawning (slow but reliable)
+func runLocalCommandFallback(cmdLine string, workDir string) (string, error) {
+	fmt.Println("[exec] Using fallback (spawning new PowerShell process)")
+
+	c := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
 	if workDir != "" {
 		c.Dir = workDir
-		fmt.Printf("[exec] Working directory: %s\n", workDir)
 	}
 
 	out, err := c.CombinedOutput()

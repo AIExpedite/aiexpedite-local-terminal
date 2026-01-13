@@ -14,6 +14,43 @@ import (
 	"cloud.google.com/go/storage"
 )
 
+// Global reusable GCS client to avoid per-command initialization overhead
+var (
+	globalStorageClient     *storage.Client
+	globalStorageClientLock sync.Mutex
+)
+
+// GetStorageClient returns a reusable GCS client (creates one if needed)
+func GetStorageClient(ctx context.Context) (*storage.Client, error) {
+	globalStorageClientLock.Lock()
+	defer globalStorageClientLock.Unlock()
+
+	if globalStorageClient != nil {
+		return globalStorageClient, nil
+	}
+
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	globalStorageClient = client
+	fmt.Println("[storage] GCS client initialized and cached")
+	return client, nil
+}
+
+// CloseStorageClient closes the global storage client (call on app exit)
+func CloseStorageClient() {
+	globalStorageClientLock.Lock()
+	defer globalStorageClientLock.Unlock()
+
+	if globalStorageClient != nil {
+		globalStorageClient.Close()
+		globalStorageClient = nil
+		fmt.Println("[storage] GCS client closed")
+	}
+}
+
 // FileInfo represents uploaded file metadata
 type FileInfo struct {
 	Path string `json:"path"` // GCS path (gs://bucket/path)

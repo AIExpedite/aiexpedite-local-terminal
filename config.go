@@ -51,6 +51,11 @@ type Config struct {
 
 	/* ─── Update Preferences ───────────────────────── */
 	SkippedVersion string `json:"skipped_version,omitempty"` // Version user chose to skip (won't prompt again)
+
+	/* ─── Performance Tuning ─────────────────────────── */
+	MaxOutstandingMessages int `json:"max_outstanding_messages,omitempty"` // Parallel message processing (default: 5)
+	RateLimitPerSecond     int `json:"rate_limit_per_second,omitempty"`    // Commands per second per user (default: 10)
+	RateLimitBurst         int `json:"rate_limit_burst,omitempty"`         // Burst allowance (default: 20)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -111,6 +116,11 @@ func DefaultConfig() *Config {
 
 		// Working directory defaults to user home
 		WorkingDirectory: homeDir,
+
+		// Performance tuning defaults
+		MaxOutstandingMessages: 5,  // Process 5 messages in parallel
+		RateLimitPerSecond:     10, // 10 commands/second per user
+		RateLimitBurst:         20, // Burst of 20
 	}
 }
 

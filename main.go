@@ -343,6 +343,14 @@ func onTrayExit() {
 	// signal background goroutines
 	close(shutdownChan)
 
+	// Cleanup persistent PowerShell process (Windows only)
+	if runtime.GOOS == "windows" {
+		ShutdownPowerShell()
+	}
+
+	// Cleanup GCS storage client
+	CloseStorageClient()
+
 	// stop ttyd cleanly
 	if ttydCmd != nil && ttydCmd.Process != nil {
 		_ = ttydCmd.Process.Kill()

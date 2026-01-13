@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.6" // GUI app mode: no console by default, allocate on-demand
+const Version = "v0.4.7" // Persistent PowerShell, parallel processing, GCS client reuse
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -164,11 +164,23 @@ func StartAgent(cfg *Config) {
 	}
 	fmt.Printf("→ ttyd listening on http://127.0.0.1:%d\n", port)
 
-	/* 3. Start Pub/Sub loop (non‑blocking) -------------------------------- */
+	/* 3. Pre-warm persistent PowerShell (Windows only) -------------------- */
+
+	if runtime.GOOS == "windows" {
+		go func() {
+			if _, err := GetPowerShell(); err != nil {
+				fmt.Printf("[agent] Failed to pre-warm PowerShell: %v\n", err)
+			} else {
+				fmt.Println("[agent] PowerShell process pre-warmed for fast command execution")
+			}
+		}()
+	}
+
+	/* 4. Start Pub/Sub loop (non‑blocking) -------------------------------- */
 
 	go StartPubSubLoop(cfg)
 
-	/* 4. Display connection instructions ---------------------------------- */
+	/* 5. Display connection instructions ---------------------------------- */
 
 	showConnectionInstructions(cfg, port)
 
