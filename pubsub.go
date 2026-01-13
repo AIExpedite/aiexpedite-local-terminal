@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"cloud.google.com/go/pubsub"
 	"github.com/getlantern/systray"
@@ -641,8 +643,87 @@ func runPubSubConnection(cfg *Config) error {
 	return err
 }
 
+/* --------------------------------------------------------------------------
+   PowerShell Command Encoding
+   -------------------------------------------------------------------------- */
+
+// encodeForPowerShell converts a script to Base64 UTF-16LE format for use with
+// PowerShell's -EncodedCommand parameter. This prevents all shell escaping issues
+// with special characters like $, `, ", ', etc.
+func encodeForPowerShell(script string) string {
+	// Convert to UTF-16LE (PowerShell's expected encoding)
+	utf16leRunes := utf16.Encode([]rune(script))
+	bytes := make([]byte, len(utf16leRunes)*2)
+	for i, r := range utf16leRunes {
+		bytes[i*2] = byte(r)
+		bytes[i*2+1] = byte(r >> 8)
+	}
+	return base64.StdEncoding.EncodeToString(bytes)
+}
+
+// runEncodedPowerShellCommand executes a Base64-encoded PowerShell script.
+// This is the most reliable way to execute PowerShell commands as it completely
+// bypasses all shell escaping issues.
+func runEncodedPowerShellCommand(encodedScript string, workDir string) (string, error) {
+	fmt.Printf("[exec] Running encoded PowerShell command (encoded length=%d)\n", len(encodedScript))
+	if workDir != "" {
+		fmt.Printf("[exec] Working directory: %s\n", workDir)
+	}
+
+	// Build PowerShell arguments
+	psArgs := []string{
+		"-NoProfile",
+		"-NonInteractive",
+		"-EncodedCommand",
+		encodedScript,
+	}
+
+	c := exec.Command("powershell.exe", psArgs...)
+	if workDir != "" {
+		c.Dir = workDir
+	}
+
+	out, err := c.CombinedOutput()
+	if err != nil {
+		fmt.Printf("[exec] Encoded PowerShell error: %v\n", err)
+	}
+	fmt.Printf("[exec] Encoded PowerShell output length: %d bytes\n", len(out))
+	return string(out), err
+}
+
 /* runLocalCommand executes the command using persistent PowerShell for low latency. */
 func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string, error) {
+	// Set working directory: priority is command cwd > config default > process cwd
+	workDir := cwd
+	if workDir == "" && cfg != nil {
+		workDir = cfg.WorkingDirectory
+	}
+
+	// Check if this is an encoded PowerShell command (already Base64 encoded by terminal-service)
+	isEncodedPowerShell := strings.ToLower(cmd) == "powershell" &&
+		len(args) >= 2 &&
+		strings.ToLower(args[0]) == "-encodedcommand"
+
+	if isEncodedPowerShell {
+		fmt.Println("[exec] Detected -EncodedCommand, using direct encoded execution")
+		return runEncodedPowerShellCommand(args[1], workDir)
+	}
+
+	// Check if this is a regular PowerShell command with -Command that needs encoding
+	// This handles legacy commands that weren't encoded by terminal-service
+	isPowerShellCommand := strings.ToLower(cmd) == "powershell" &&
+		len(args) >= 2 &&
+		strings.ToLower(args[0]) == "-command"
+
+	if isPowerShellCommand {
+		// Encode the script locally to prevent escaping issues
+		script := strings.Join(args[1:], " ")
+		fmt.Printf("[exec] Encoding PowerShell -Command locally (script length=%d)\n", len(script))
+		encoded := encodeForPowerShell(script)
+		return runEncodedPowerShellCommand(encoded, workDir)
+	}
+
+	// Original behavior for non-PowerShell commands
 	// Construct the full command line
 	cmdLine := cmd
 	if len(args) > 0 {
@@ -653,12 +734,6 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 				cmdLine += " " + arg
 			}
 		}
-	}
-
-	// Set working directory: priority is command cwd > config default > process cwd
-	workDir := cwd
-	if workDir == "" && cfg != nil {
-		workDir = cfg.WorkingDirectory
 	}
 
 	fmt.Printf("[exec] Running command: %s\n", redactSensitiveData(cmdLine))

@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.7" // Persistent PowerShell, parallel processing, GCS client reuse
+const Version = "v0.4.8" // Base64-encoded PowerShell commands to fix special character escaping
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
