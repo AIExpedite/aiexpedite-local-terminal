@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.9" // Fix Windows Terminal not closing after registration
+const Version = "v0.4.10" // Fix Windows Terminal console loop (use SW_HIDE, not freeConsole)
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

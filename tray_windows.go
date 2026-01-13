@@ -203,17 +203,16 @@ func showConsoleWindow(show bool) {
 			procSetForegroundWindow.Call(hwnd)
 		}
 	} else {
-		// When Windows Terminal is the default terminal, GetConsoleWindow() returns
-		// the conhost window handle which may not control the visible Windows Terminal
-		// window. FreeConsole() properly detaches and closes the terminal.
-		if consoleAllocated {
-			freeConsole()
-		} else {
-			// Fallback: try to hide via window handle (for legacy conhost)
-			hwnd := getConsoleWindow()
-			if hwnd != 0 {
-				procShowWindow.Call(hwnd, SW_HIDE)
-			}
+		// Just hide the window - don't free the console.
+		// Using freeConsole() causes an infinite loop because:
+		// 1. freeConsole() invalidates stdout/stderr handles
+		// 2. Any fmt.Println() after that causes Windows to auto-reallocate a console
+		// 3. The new console triggers close handlers, which call showConsoleWindow(false)
+		// 4. Loop continues indefinitely
+		// SW_HIDE keeps the console allocated but hidden, avoiding this issue.
+		hwnd := getConsoleWindow()
+		if hwnd != 0 {
+			procShowWindow.Call(hwnd, SW_HIDE)
 		}
 	}
 }
