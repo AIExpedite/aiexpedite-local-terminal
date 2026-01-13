@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -74,6 +75,7 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 		"-NonInteractive",
 		"-Command", "-", // Read commands from stdin
 	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

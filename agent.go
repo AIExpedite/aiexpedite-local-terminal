@@ -158,6 +158,7 @@ func StartAgent(cfg *Config) {
 	args := append([]string{"-p", fmt.Sprintf("%d", port), "-i", "127.0.0.1"}, shellCmd...)
 
 	ttydCmd = exec.Command("ttyd", args...)
+	hideWindow(ttydCmd)
 	if err := ttydCmd.Start(); err != nil {
 		fmt.Println("Fatal: cannot start ttyd –", err)
 		return
