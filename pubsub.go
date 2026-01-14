@@ -187,20 +187,40 @@ func checkRateLimit(uid string, cfg *Config) bool {
    Command Signature Verification (HMAC-SHA256)
    -------------------------------------------------------------------------- */
 
+// signaturePayload matches the exact JSON structure used by Node.js signCommand()
+// Field order must match: id, command, args, ts
+type signaturePayload struct {
+	ID      string   `json:"id"`
+	Command string   `json:"command"`
+	Args    []string `json:"args"`
+	Ts      int64    `json:"ts"`
+}
+
 // verifySignature verifies the HMAC-SHA256 signature of a command
 // Returns true if signature is valid, false otherwise
 func verifySignature(cmd commandMsg, secret string) bool {
 	// Create canonical representation matching backend signCommand()
-	signatureData := fmt.Sprintf(`{"id":"%s","command":"%s","args":%s,"ts":%d}`,
-		cmd.ID,
-		cmd.Command,
-		argsToJSON(cmd.Args),
-		cmd.Ts,
-	)
+	// Use struct to ensure consistent JSON key ordering (id, command, args, ts)
+	args := cmd.Args
+	if args == nil {
+		args = []string{}
+	}
+
+	payload := signaturePayload{
+		ID:      cmd.ID,
+		Command: cmd.Command,
+		Args:    args,
+		Ts:      cmd.Ts,
+	}
+
+	signatureData, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
 
 	// Compute expected signature
 	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(signatureData))
+	mac.Write(signatureData)
 	expectedSig := hex.EncodeToString(mac.Sum(nil))
 
 	// Constant-time comparison to prevent timing attacks
