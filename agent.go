@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.14" // Fixed signature verification to use proper JSON marshaling
+const Version = "v0.4.15" // Include AgentID in ping response for version updates in device list
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

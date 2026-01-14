@@ -257,6 +257,7 @@ type resultMsg struct {
 	ID           string        `json:"id"`
 	WorkspaceID  string        `json:"workspaceID,omitempty"` // Workspace scope for audit trail
 	UID          string        `json:"uid"`
+	AgentID      string        `json:"agentId,omitempty"`     // Agent ID for version updates on ping
 	Output       string        `json:"output"`
 	Status       string        `json:"status"` // "success" | "partial" | "error" | "denied" | "rate_limited" | "unauthorized"
 	Ts           int64         `json:"ts"`
@@ -511,6 +512,7 @@ func runPubSubConnection(cfg *Config) error {
 					ID:          cmd.ID,
 					WorkspaceID: cmd.WorkspaceID,
 					UID:         cmd.UID,
+					AgentID:     cmd.AgentID, // Include for version update in terminalAgents
 					Output:      "pong",
 					Status:      "success",
 					Ts:          time.Now().UnixMilli(),
