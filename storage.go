@@ -12,13 +12,23 @@ import (
 	"sync"
 
 	"cloud.google.com/go/storage"
+	"golang.org/x/oauth2"
+	"google.golang.org/api/option"
 )
 
 // Global reusable GCS client to avoid per-command initialization overhead
 var (
 	globalStorageClient     *storage.Client
 	globalStorageClientLock sync.Mutex
+	globalStorageConfig     *Config // Config for WIF authentication
 )
+
+// SetStorageConfig sets the config for WIF authentication (call during startup)
+func SetStorageConfig(cfg *Config) {
+	globalStorageClientLock.Lock()
+	defer globalStorageClientLock.Unlock()
+	globalStorageConfig = cfg
+}
 
 // GetStorageClient returns a reusable GCS client (creates one if needed)
 func GetStorageClient(ctx context.Context) (*storage.Client, error) {
@@ -29,7 +39,20 @@ func GetStorageClient(ctx context.Context) (*storage.Client, error) {
 		return globalStorageClient, nil
 	}
 
-	client, err := storage.NewClient(ctx)
+	// Build client options - use WIF if configured, otherwise fall back to ADC
+	var clientOpts []option.ClientOption
+	if globalStorageConfig != nil && IsWIFConfigured(globalStorageConfig) {
+		fmt.Println("[storage] using Workload Identity Federation for authentication")
+		tokenSource := NewWIFTokenSource(globalStorageConfig)
+		// Wrap with ReuseTokenSource to cache and auto-refresh tokens
+		clientOpts = append(clientOpts, option.WithTokenSource(
+			oauth2.ReuseTokenSource(nil, tokenSource),
+		))
+	} else {
+		fmt.Println("[storage] using Application Default Credentials (ADC)")
+	}
+
+	client, err := storage.NewClient(ctx, clientOpts...)
 	if err != nil {
 		return nil, err
 	}

@@ -35,6 +35,10 @@ type PollResponse struct {
 	UserID               string `json:"userId,omitempty"`
 	CommandsSubscription string `json:"commandsSubscription,omitempty"`
 	ResultsTopic         string `json:"resultsTopic,omitempty"`
+	// Workload Identity Federation config
+	TokenEndpoint     string `json:"tokenEndpoint,omitempty"`
+	WIFAudience       string `json:"wifAudience,omitempty"`
+	WIFServiceAccount string `json:"wifServiceAccount,omitempty"`
 }
 
 // ErrorResponse is the error response from the API
@@ -218,6 +222,10 @@ func StartRegistration(cfg *Config) error {
 	cfg.ResultsTopic = credentials.ResultsTopic
 	cfg.DeviceName = deviceName
 	cfg.RegisteredAt = time.Now().Format(time.RFC3339)
+	// Workload Identity Federation config for GCP authentication
+	cfg.TokenEndpoint = credentials.TokenEndpoint
+	cfg.WIFAudience = credentials.WIFAudience
+	cfg.WIFServiceAccount = credentials.WIFServiceAccount
 
 	if err := cfg.Save(ConfigPath()); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)

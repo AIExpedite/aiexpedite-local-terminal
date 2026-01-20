@@ -108,6 +108,9 @@ func ClearPendingUpdate() {
 // StartAgent prepares the local environment (tmux + ttyd) and launches the
 // Pub/Sub worker.  If cfg.AutoUpdate is true we also run a delayed update check.
 func StartAgent(cfg *Config) {
+	/* 0. Initialize storage config for WIF authentication ----------------- */
+	SetStorageConfig(cfg)
+
 	/* 1. Ensure prerequisites (tmux + ttyd) exist ------------------------- */
 
 	useTmux := true

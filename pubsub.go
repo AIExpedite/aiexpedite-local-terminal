@@ -22,7 +22,9 @@ import (
 
 	"cloud.google.com/go/pubsub"
 	"github.com/getlantern/systray"
+	"golang.org/x/oauth2"
 	"golang.org/x/time/rate"
+	"google.golang.org/api/option"
 )
 
 /* --------------------------------------------------------------------------
@@ -374,7 +376,21 @@ func runPubSubConnection(cfg *Config) error {
 	}()
 
 	fmt.Println("[pubsub] creating Pub/Sub client...")
-	client, err := pubsub.NewClient(ctx, cfg.ProjectID)
+
+	// Build client options - use WIF if configured, otherwise fall back to ADC
+	var clientOpts []option.ClientOption
+	if IsWIFConfigured(cfg) {
+		fmt.Println("[pubsub] using Workload Identity Federation for authentication")
+		tokenSource := NewWIFTokenSource(cfg)
+		// Wrap with ReuseTokenSource to cache and auto-refresh tokens
+		clientOpts = append(clientOpts, option.WithTokenSource(
+			oauth2.ReuseTokenSource(nil, tokenSource),
+		))
+	} else {
+		fmt.Println("[pubsub] using Application Default Credentials (ADC)")
+	}
+
+	client, err := pubsub.NewClient(ctx, cfg.ProjectID, clientOpts...)
 	if err != nil {
 		return fmt.Errorf("client creation failed: %w", err)
 	}

@@ -56,6 +56,11 @@ type Config struct {
 	MaxOutstandingMessages int `json:"max_outstanding_messages,omitempty"` // Parallel message processing (default: 5)
 	RateLimitPerSecond     int `json:"rate_limit_per_second,omitempty"`    // Commands per second per user (default: 10)
 	RateLimitBurst         int `json:"rate_limit_burst,omitempty"`         // Burst allowance (default: 20)
+
+	/* ─── Workload Identity Federation (GCP Auth) ───── */
+	TokenEndpoint     string `json:"token_endpoint,omitempty"`      // Backend URL for OIDC token exchange
+	WIFAudience       string `json:"wif_audience,omitempty"`        // GCP Workload Identity Pool audience
+	WIFServiceAccount string `json:"wif_service_account,omitempty"` // GCP service account to impersonate
 }
 
 /* -------------------------------------------------------------------------- */
