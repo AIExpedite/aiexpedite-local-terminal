@@ -164,12 +164,34 @@ type stsTokenResponse struct {
 }
 
 // exchangeForGCPToken exchanges an OIDC token for a GCP access token.
-// This calls the GCP Security Token Service (STS) endpoint.
+// This is a two-step process:
+// 1. Exchange OIDC token for a federated STS token
+// 2. Use the federated token to impersonate the service account
 func (ts *WIFTokenSource) exchangeForGCPToken(idToken string) (string, time.Time, error) {
 	if ts.cfg.WIFAudience == "" {
 		return "", time.Time{}, fmt.Errorf("WIF audience not configured")
 	}
+	if ts.cfg.WIFServiceAccount == "" {
+		return "", time.Time{}, fmt.Errorf("WIF service account not configured")
+	}
 
+	// Step 1: Exchange OIDC token for federated STS token
+	federatedToken, err := ts.getFederatedToken(idToken)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("failed to get federated token: %w", err)
+	}
+
+	// Step 2: Impersonate service account using federated token
+	accessToken, expiry, err := ts.impersonateServiceAccount(federatedToken)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("failed to impersonate service account: %w", err)
+	}
+
+	return accessToken, expiry, nil
+}
+
+// getFederatedToken exchanges an OIDC token for a federated STS token.
+func (ts *WIFTokenSource) getFederatedToken(idToken string) (string, error) {
 	// GCP STS endpoint
 	stsURL := "https://sts.googleapis.com/v1/token"
 
@@ -186,37 +208,100 @@ func (ts *WIFTokenSource) exchangeForGCPToken(idToken string) (string, time.Time
 	// Make request to STS
 	resp, err := http.PostForm(stsURL, formData)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("STS request failed: %w", err)
+		return "", fmt.Errorf("STS request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	// Read response
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("failed to read STS response: %w", err)
+		return "", fmt.Errorf("failed to read STS response: %w", err)
 	}
 
 	var stsResp stsTokenResponse
 	if err := json.Unmarshal(respBody, &stsResp); err != nil {
-		return "", time.Time{}, fmt.Errorf("failed to decode STS response: %w", err)
+		return "", fmt.Errorf("failed to decode STS response: %w", err)
 	}
 
 	// Check for errors
 	if resp.StatusCode != http.StatusOK {
 		if stsResp.Error != "" {
-			return "", time.Time{}, fmt.Errorf("STS error: %s - %s", stsResp.Error, stsResp.ErrorDesc)
+			return "", fmt.Errorf("STS error: %s - %s", stsResp.Error, stsResp.ErrorDesc)
 		}
-		return "", time.Time{}, fmt.Errorf("STS request failed with status %d: %s", resp.StatusCode, string(respBody))
+		return "", fmt.Errorf("STS request failed with status %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	if stsResp.AccessToken == "" {
-		return "", time.Time{}, fmt.Errorf("empty access_token in STS response")
+		return "", fmt.Errorf("empty access_token in STS response")
 	}
 
-	// Calculate expiry time
-	expiry := time.Now().Add(time.Duration(stsResp.ExpiresIn) * time.Second)
+	return stsResp.AccessToken, nil
+}
 
-	return stsResp.AccessToken, expiry, nil
+// impersonateServiceAccount uses a federated token to get an access token for a service account.
+func (ts *WIFTokenSource) impersonateServiceAccount(federatedToken string) (string, time.Time, error) {
+	// IAM Credentials API endpoint for generating access tokens
+	impersonateURL := fmt.Sprintf(
+		"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken",
+		ts.cfg.WIFServiceAccount,
+	)
+
+	// Request body
+	reqBody := map[string]interface{}{
+		"scope": []string{"https://www.googleapis.com/auth/cloud-platform"},
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Create request with federated token as bearer
+	req, err := http.NewRequest("POST", impersonateURL, bytes.NewReader(body))
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+federatedToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	// Make request
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("impersonation request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Check for errors
+	if resp.StatusCode != http.StatusOK {
+		return "", time.Time{}, fmt.Errorf("impersonation failed with status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Parse response
+	var impersonateResp struct {
+		AccessToken string `json:"accessToken"`
+		ExpireTime  string `json:"expireTime"` // RFC3339 format
+	}
+	if err := json.Unmarshal(respBody, &impersonateResp); err != nil {
+		return "", time.Time{}, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if impersonateResp.AccessToken == "" {
+		return "", time.Time{}, fmt.Errorf("empty access token in response")
+	}
+
+	// Parse expiry time
+	expiry, err := time.Parse(time.RFC3339, impersonateResp.ExpireTime)
+	if err != nil {
+		// Default to 1 hour if parsing fails
+		expiry = time.Now().Add(1 * time.Hour)
+	}
+
+	return impersonateResp.AccessToken, expiry, nil
 }
 
 /* --------------------------------------------------------------------------
@@ -234,6 +319,7 @@ func generateHMAC(data, secret string) string {
 func IsWIFConfigured(cfg *Config) bool {
 	return cfg.TokenEndpoint != "" &&
 		cfg.WIFAudience != "" &&
+		cfg.WIFServiceAccount != "" &&
 		cfg.AgentID != "" &&
 		cfg.CommandSecret != ""
 }
