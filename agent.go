@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.4.15" // Include AgentID in ping response for version updates in device list
+const Version = "v0.5.0" // Workload Identity Federation for keyless GCP authentication
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
