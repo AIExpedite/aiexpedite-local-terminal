@@ -80,12 +80,26 @@ func checkForNewVersion() (*UpdateInfo, error) {
 	cur := "v" + strings.TrimPrefix(Version, "v")
 	latest := rel.TagName
 
-	// For non-prod channels, extract version from release body (format: "**Version:** vX.Y.Z")
-	// since tag_name is "latest-dev" not a semver
+	// Extract version from release body since tag_name may not be semver
+	// Non-prod format: "**Version:** vX.Y.Z"
+	// Prod format: "**Current version: vX.Y.Z**"
 	if ReleaseChannel == "dev" || ReleaseChannel == "stg" || ReleaseChannel == "beta" {
 		if idx := strings.Index(rel.Body, "**Version:** "); idx != -1 {
 			start := idx + len("**Version:** ")
 			end := strings.Index(rel.Body[start:], "\n")
+			if end == -1 {
+				end = len(rel.Body) - start
+			}
+			latest = strings.TrimSpace(rel.Body[start : start+end])
+		}
+	} else {
+		// Prod: extract from "**Current version: vX.Y.Z**"
+		if idx := strings.Index(rel.Body, "**Current version: "); idx != -1 {
+			start := idx + len("**Current version: ")
+			end := strings.Index(rel.Body[start:], "**")
+			if end == -1 {
+				end = strings.Index(rel.Body[start:], "\n")
+			}
 			if end == -1 {
 				end = len(rel.Body) - start
 			}
