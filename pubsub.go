@@ -437,6 +437,10 @@ func runPubSubConnection(cfg *Config) error {
 				return
 			}
 
+			// Debug: print raw message for signature investigation
+			fmt.Printf("[signature-debug] raw message: %s\n", string(m.Data))
+			fmt.Printf("[signature-debug] parsed args: %v (len=%d, nil=%v)\n", cmd.Args, len(cmd.Args), cmd.Args == nil)
+
 			// ─── Per-UID Rate Limiting ─────────────────────────────────────────
 			if !checkRateLimit(cmd.UID, cfg) {
 				fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)

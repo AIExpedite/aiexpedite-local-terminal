@@ -58,6 +58,8 @@ jobs:
           LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite Terminal'"
           LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=https://api.aiexpedite.com/terminal"
           LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix="
+          LDFLAGS="$LDFLAGS -X main.ReleaseChannel=prod"
+          LDFLAGS="$LDFLAGS -X main.Version=${{ inputs.version }}"
 
           go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-windows-amd64.exe" .
 
