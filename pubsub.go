@@ -225,6 +225,11 @@ func verifySignature(cmd commandMsg, secret string) bool {
 	mac.Write(signatureData)
 	expectedSig := hex.EncodeToString(mac.Sum(nil))
 
+	// Debug: print signature comparison data
+	fmt.Printf("[signature-debug] payload: %s\n", string(signatureData))
+	fmt.Printf("[signature-debug] expected: %s\n", expectedSig)
+	fmt.Printf("[signature-debug] received: %s\n", cmd.Signature)
+
 	// Constant-time comparison to prevent timing attacks
 	return hmac.Equal([]byte(expectedSig), []byte(cmd.Signature))
 }

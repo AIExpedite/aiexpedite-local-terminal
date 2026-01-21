@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.1" // Fix WIF service account impersonation for Pub/Sub access
+const Version = "v0.5.2" // Add signature debug logging
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
