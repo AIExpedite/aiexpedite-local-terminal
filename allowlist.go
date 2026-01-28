@@ -413,6 +413,22 @@ ver
 set
 where *
 
+# --- PowerShell Cmdlets (for Terminal Discovery Agent) ---
+Get-ChildItem *
+Get-Command *
+Get-CimInstance *
+ForEach-Object *
+Write-Output *
+Select-Object *
+
+# --- CLI Coding Agents ---
+claude
+claude *
+codex
+codex *
+gemini
+gemini *
+
 # --- Remote/SSH ---
 ssh *
 scp *
