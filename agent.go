@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.8" // Add PowerShell cmdlets/CLI agents to allow list; fix multiline command matching
+const Version = "v0.5.10" // Set custom icon on console window; clean up tray menu
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

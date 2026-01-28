@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"unsafe"
 
 	_ "embed"
 
@@ -25,6 +26,11 @@ var (
 	procFreeConsole           = kernel32.NewProc("FreeConsole")
 	procGetStdHandle          = kernel32.NewProc("GetStdHandle")
 	procShowWindow            = user32.NewProc("ShowWindow") // user32 declared in approval_windows.go
+
+	// For setting console window icon
+	procSendMessageW                = user32.NewProc("SendMessageW")
+	procLookupIconIdFromDirectoryEx = user32.NewProc("LookupIconIdFromDirectoryEx")
+	procCreateIconFromResourceEx    = user32.NewProc("CreateIconFromResourceEx")
 )
 
 // Standard handle constants for GetStdHandle
@@ -48,6 +54,12 @@ const (
 	// System menu constants for disabling close button
 	SC_CLOSE     = 0xF060
 	MF_BYCOMMAND = 0x00000000
+
+	// Icon constants for WM_SETICON
+	WM_SETICON      = 0x0080
+	ICON_SMALL      = 0
+	ICON_BIG        = 1
+	LR_DEFAULTCOLOR = 0x00000000
 )
 
 // Console control event types
@@ -138,6 +150,83 @@ func getConsoleWindow() uintptr {
 	return ret
 }
 
+// createIconFromData creates an icon handle from .ico file data
+// Uses LookupIconIdFromDirectoryEx to find the best matching icon size,
+// then CreateIconFromResourceEx to create the actual icon handle.
+func createIconFromData(data []byte, width, height int) uintptr {
+	if len(data) < 6 {
+		return 0
+	}
+
+	// LookupIconIdFromDirectoryEx finds the best matching icon in the .ico file
+	id, _, _ := procLookupIconIdFromDirectoryEx.Call(
+		uintptr(unsafe.Pointer(&data[0])),
+		1, // TRUE = icon (not cursor)
+		uintptr(width),
+		uintptr(height),
+		LR_DEFAULTCOLOR,
+	)
+	if id == 0 {
+		return 0
+	}
+
+	// Find the offset to the icon data in the .ico file
+	// ICO format: 6-byte header + (16-byte entries * count)
+	// Each entry has: width, height, colors, reserved, planes, bitcount, size, offset
+	numIcons := int(data[4]) | int(data[5])<<8
+	var offset, size uint32
+	for i := 0; i < numIcons; i++ {
+		entryOffset := 6 + i*16
+		if entryOffset+16 > len(data) {
+			break
+		}
+		// The ID returned by LookupIconIdFromDirectoryEx is 1-based index
+		if i+1 == int(id) {
+			size = uint32(data[entryOffset+8]) | uint32(data[entryOffset+9])<<8 |
+				uint32(data[entryOffset+10])<<16 | uint32(data[entryOffset+11])<<24
+			offset = uint32(data[entryOffset+12]) | uint32(data[entryOffset+13])<<8 |
+				uint32(data[entryOffset+14])<<16 | uint32(data[entryOffset+15])<<24
+			break
+		}
+	}
+
+	if offset == 0 || size == 0 || int(offset+size) > len(data) {
+		return 0
+	}
+
+	// CreateIconFromResourceEx creates the actual icon
+	hIcon, _, _ := procCreateIconFromResourceEx.Call(
+		uintptr(unsafe.Pointer(&data[offset])),
+		uintptr(size),
+		1,          // TRUE = icon
+		0x00030000, // Icon version (required)
+		uintptr(width),
+		uintptr(height),
+		LR_DEFAULTCOLOR,
+	)
+	return hIcon
+}
+
+// setConsoleIcon sets both small and large icons on the console window
+func setConsoleIcon() {
+	hwnd := getConsoleWindow()
+	if hwnd == 0 {
+		return
+	}
+
+	// Create small icon (16x16) for title bar and taskbar
+	hIconSmall := createIconFromData(iconData, 16, 16)
+	if hIconSmall != 0 {
+		procSendMessageW.Call(hwnd, WM_SETICON, ICON_SMALL, hIconSmall)
+	}
+
+	// Create large icon (32x32) for Alt+Tab
+	hIconBig := createIconFromData(iconData, 32, 32)
+	if hIconBig != 0 {
+		procSendMessageW.Call(hwnd, WM_SETICON, ICON_BIG, hIconBig)
+	}
+}
+
 // allocateConsole creates a new console window for this GUI process
 func allocateConsole() error {
 	if consoleAllocated {
@@ -172,6 +261,9 @@ func allocateConsole() error {
 
 	// Set up console control handler
 	initConsoleHandler()
+
+	// Set the console window icon
+	setConsoleIcon()
 
 	// Print startup banner now that we have a console
 	fmt.Println("")

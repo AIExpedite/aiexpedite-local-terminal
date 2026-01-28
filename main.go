@@ -68,13 +68,8 @@ func onTrayReady(cfg *Config) func() {
 		// Mark systray as ready so background goroutines can safely use it
 		SetSystrayReady()
 
-		mOpen := systray.AddMenuItem("Open Terminal", "Open terminal in browser")
-		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
-
-		// Install Update menu item - initially hidden, shown when update is pending
-		mInstallUpdate := systray.AddMenuItem("", "")
-		mInstallUpdate.Hide()
-
+		// Show Console at the top
+		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", false)
 		systray.AddSeparator()
 
 		// Register Device - always visible as checkbox showing registration status
@@ -84,8 +79,13 @@ func onTrayReady(cfg *Config) func() {
 		}
 		systray.AddSeparator()
 
-		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", false)
 		mDisconnect := systray.AddMenuItemCheckbox("Disconnect from cloud", "Stop cloud connection (stay running)", false)
+		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
+
+		// Install Update menu item - initially hidden, shown when update is pending
+		mInstallUpdate := systray.AddMenuItem("", "")
+		mInstallUpdate.Hide()
+
 		systray.AddSeparator()
 		mQuit := systray.AddMenuItem("Quit", "Exit the agent")
 
@@ -191,13 +191,6 @@ func onTrayReady(cfg *Config) func() {
 
 			for {
 				select {
-				case <-mOpen.ClickedCh:
-					url := fmt.Sprintf("http://127.0.0.1:%d", cfg.LocalTtydPort)
-					if cfg.LocalTtydPort == 0 {
-						url = "http://127.0.0.1:7681"
-					}
-					openBrowser(url)
-
 				case <-mCheck.ClickedCh:
 					go func() {
 						// Manual check - always check even if we have a pending update
