@@ -214,6 +214,14 @@ func setConsoleIcon() {
 	}
 }
 
+// setConsoleTitle sets the console window title
+var procSetConsoleTitleW = kernel32.NewProc("SetConsoleTitleW")
+
+func setConsoleTitle(title string) {
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	procSetConsoleTitleW.Call(uintptr(unsafe.Pointer(titlePtr)))
+}
+
 // allocateConsole creates a new console window for this GUI process
 func allocateConsole() error {
 	if consoleAllocated {
@@ -249,8 +257,9 @@ func allocateConsole() error {
 	// Set up console control handler
 	initConsoleHandler()
 
-	// Set the console window icon
+	// Set the console window icon and title
 	setConsoleIcon()
+	setConsoleTitle(EnvDisplayName + " " + Version)
 
 	// Print startup banner now that we have a console
 	fmt.Println("")

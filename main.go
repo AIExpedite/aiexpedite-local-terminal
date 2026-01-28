@@ -71,6 +71,7 @@ func onTrayReady(cfg *Config) func() {
 		// Show Console at the top
 		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", false)
 		mAllowList := systray.AddMenuItem("Edit Allow List", "Open allow list configuration folder")
+		mResetAllowList := systray.AddMenuItem("Reset Allow List", "Reset to default allowed commands")
 		systray.AddSeparator()
 
 		// Register Device - always visible as checkbox showing registration status
@@ -206,6 +207,23 @@ func onTrayReady(cfg *Config) func() {
 						exec.Command("open", configDir).Start()
 					} else {
 						exec.Command("xdg-open", configDir).Start()
+					}
+
+				case <-mResetAllowList.ClickedCh:
+					if runtime.GOOS == "windows" {
+						// Confirm with user before resetting
+						if ShowYesNoDialog("Reset Allow List",
+							"This will replace your allowed-commands.txt with the latest defaults.\n\n"+
+								"Any custom patterns you added will be lost.\n\n"+
+								"Continue?") {
+							if err := ResetAllowList(); err != nil {
+								ShowErrorDialog("Reset Failed", err.Error())
+							} else {
+								ShowInfoDialog("Allow List Reset",
+									"The allow list has been reset to defaults.\n\n"+
+										"New patterns are now active.")
+							}
+						}
 					}
 
 				case <-mCheck.ClickedCh:

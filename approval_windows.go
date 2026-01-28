@@ -215,6 +215,24 @@ func ShowSuccessDialog(title, message string) {
 	)
 }
 
+// ShowYesNoDialog shows a Yes/No confirmation dialog
+// Returns true if user clicks Yes, false otherwise
+func ShowYesNoDialog(title, message string) bool {
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	msgPtr, _ := syscall.UTF16PtrFromString(message)
+
+	flags := uint32(MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST)
+
+	ret, _, _ := procMsgBox.Call(
+		0,
+		uintptr(unsafe.Pointer(msgPtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		uintptr(flags),
+	)
+
+	return int(ret) == IDYES
+}
+
 /* --------------------------------------------------------------------------
    Update Dialog
    -------------------------------------------------------------------------- */

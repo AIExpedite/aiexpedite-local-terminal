@@ -165,6 +165,31 @@ func (al *AllowList) CreateDefault() error {
 	return os.WriteFile(al.configPath, []byte(defaultAllowListContent), 0600)
 }
 
+// ResetAllowList deletes the existing allow list and recreates it with defaults
+func ResetAllowList() error {
+	if defaultAllowList == nil {
+		return fmt.Errorf("allow list not initialized")
+	}
+
+	// Delete existing file
+	if err := os.Remove(defaultAllowList.configPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove old allow list: %w", err)
+	}
+
+	// Create new default file
+	if err := defaultAllowList.CreateDefault(); err != nil {
+		return fmt.Errorf("failed to create default allow list: %w", err)
+	}
+
+	// Reload patterns
+	if err := defaultAllowList.Load(); err != nil {
+		return fmt.Errorf("failed to reload allow list: %w", err)
+	}
+
+	fmt.Println("[allowlist] Allow list has been reset to defaults")
+	return nil
+}
+
 const defaultAllowListContent = `# ============================================
 # AI Expedite Local Terminal - Allowed Commands
 # ============================================
