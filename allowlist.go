@@ -131,8 +131,8 @@ func (al *AllowList) GetConfigPath() string {
 func patternToRegex(pattern string) *regexp.Regexp {
 	// Escape regex special chars except *
 	escaped := regexp.QuoteMeta(pattern)
-	// Convert * to .*
-	escaped = strings.ReplaceAll(escaped, `\*`, `.*`)
+	// Convert * to .* (use [\s\S]* to match across newlines)
+	escaped = strings.ReplaceAll(escaped, `\*`, `[\s\S]*`)
 	// Anchor the pattern
 	escaped = "^" + escaped + "$"
 

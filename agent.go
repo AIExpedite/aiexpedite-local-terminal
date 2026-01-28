@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.5" // Add PowerShell cmdlets and CLI agents to default allow list
+const Version = "v0.5.6" // Add PowerShell cmdlets/CLI agents to allow list; fix multiline command matching
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
