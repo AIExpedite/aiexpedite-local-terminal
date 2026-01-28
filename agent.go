@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.10" // Set custom icon on console window; clean up tray menu
+const Version = "v0.5.11" // Fix console icon; add version display and allow list access to tray menu
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

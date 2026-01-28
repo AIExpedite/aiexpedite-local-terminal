@@ -70,6 +70,7 @@ func onTrayReady(cfg *Config) func() {
 
 		// Show Console at the top
 		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", false)
+		mAllowList := systray.AddMenuItem("Edit Allow List", "Open allow list configuration folder")
 		systray.AddSeparator()
 
 		// Register Device - always visible as checkbox showing registration status
@@ -87,6 +88,11 @@ func onTrayReady(cfg *Config) func() {
 		mInstallUpdate.Hide()
 
 		systray.AddSeparator()
+
+		// Version display (disabled, just for info)
+		mVersion := systray.AddMenuItem("Version "+Version, "Current version")
+		mVersion.Disable()
+
 		mQuit := systray.AddMenuItem("Quit", "Exit the agent")
 
 		// Auto-trigger registration on first launch (if not registered)
@@ -191,6 +197,17 @@ func onTrayReady(cfg *Config) func() {
 
 			for {
 				select {
+				case <-mAllowList.ClickedCh:
+					// Open the config directory in file explorer
+					configDir := GetConfigDir()
+					if runtime.GOOS == "windows" {
+						exec.Command("explorer", configDir).Start()
+					} else if runtime.GOOS == "darwin" {
+						exec.Command("open", configDir).Start()
+					} else {
+						exec.Command("xdg-open", configDir).Start()
+					}
+
 				case <-mCheck.ClickedCh:
 					go func() {
 						// Manual check - always check even if we have a pending update

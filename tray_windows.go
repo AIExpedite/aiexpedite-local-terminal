@@ -28,9 +28,7 @@ var (
 	procShowWindow            = user32.NewProc("ShowWindow") // user32 declared in approval_windows.go
 
 	// For setting console window icon
-	procSendMessageW                = user32.NewProc("SendMessageW")
-	procLookupIconIdFromDirectoryEx = user32.NewProc("LookupIconIdFromDirectoryEx")
-	procCreateIconFromResourceEx    = user32.NewProc("CreateIconFromResourceEx")
+	procSendMessageW = user32.NewProc("SendMessageW")
 )
 
 // Standard handle constants for GetStdHandle
@@ -150,61 +148,44 @@ func getConsoleWindow() uintptr {
 	return ret
 }
 
-// createIconFromData creates an icon handle from .ico file data
-// Uses LookupIconIdFromDirectoryEx to find the best matching icon size,
-// then CreateIconFromResourceEx to create the actual icon handle.
-func createIconFromData(data []byte, width, height int) uintptr {
-	if len(data) < 6 {
-		return 0
-	}
+// loadIconFromFile loads an icon from a .ico file using LoadImage API
+// This is more reliable than parsing the ICO format manually
+var procLoadImageW = user32.NewProc("LoadImageW")
 
-	// LookupIconIdFromDirectoryEx finds the best matching icon in the .ico file
-	id, _, _ := procLookupIconIdFromDirectoryEx.Call(
-		uintptr(unsafe.Pointer(&data[0])),
-		1, // TRUE = icon (not cursor)
+const (
+	IMAGE_ICON    = 1
+	LR_LOADFROMFILE = 0x00000010
+)
+
+func loadIconFromFile(path string, width, height int) uintptr {
+	pathPtr, _ := syscall.UTF16PtrFromString(path)
+	hIcon, _, _ := procLoadImageW.Call(
+		0, // hInstance - NULL for loading from file
+		uintptr(unsafe.Pointer(pathPtr)),
+		IMAGE_ICON,
 		uintptr(width),
 		uintptr(height),
-		LR_DEFAULTCOLOR,
-	)
-	if id == 0 {
-		return 0
-	}
-
-	// Find the offset to the icon data in the .ico file
-	// ICO format: 6-byte header + (16-byte entries * count)
-	// Each entry has: width, height, colors, reserved, planes, bitcount, size, offset
-	numIcons := int(data[4]) | int(data[5])<<8
-	var offset, size uint32
-	for i := 0; i < numIcons; i++ {
-		entryOffset := 6 + i*16
-		if entryOffset+16 > len(data) {
-			break
-		}
-		// The ID returned by LookupIconIdFromDirectoryEx is 1-based index
-		if i+1 == int(id) {
-			size = uint32(data[entryOffset+8]) | uint32(data[entryOffset+9])<<8 |
-				uint32(data[entryOffset+10])<<16 | uint32(data[entryOffset+11])<<24
-			offset = uint32(data[entryOffset+12]) | uint32(data[entryOffset+13])<<8 |
-				uint32(data[entryOffset+14])<<16 | uint32(data[entryOffset+15])<<24
-			break
-		}
-	}
-
-	if offset == 0 || size == 0 || int(offset+size) > len(data) {
-		return 0
-	}
-
-	// CreateIconFromResourceEx creates the actual icon
-	hIcon, _, _ := procCreateIconFromResourceEx.Call(
-		uintptr(unsafe.Pointer(&data[offset])),
-		uintptr(size),
-		1,          // TRUE = icon
-		0x00030000, // Icon version (required)
-		uintptr(width),
-		uintptr(height),
-		LR_DEFAULTCOLOR,
+		LR_LOADFROMFILE|LR_DEFAULTCOLOR,
 	)
 	return hIcon
+}
+
+// consoleIconPath stores the path to the temp icon file
+var consoleIconPath string
+
+// ensureIconFile writes the embedded icon to a temp file if not already done
+func ensureIconFile() string {
+	if consoleIconPath != "" {
+		return consoleIconPath
+	}
+
+	// Write to config directory for persistence
+	iconPath := filepath.Join(GetConfigDir(), "console-icon.ico")
+	if err := os.WriteFile(iconPath, iconData, 0644); err != nil {
+		return ""
+	}
+	consoleIconPath = iconPath
+	return iconPath
 }
 
 // setConsoleIcon sets both small and large icons on the console window
@@ -214,14 +195,20 @@ func setConsoleIcon() {
 		return
 	}
 
+	// Ensure icon file exists
+	iconPath := ensureIconFile()
+	if iconPath == "" {
+		return
+	}
+
 	// Create small icon (16x16) for title bar and taskbar
-	hIconSmall := createIconFromData(iconData, 16, 16)
+	hIconSmall := loadIconFromFile(iconPath, 16, 16)
 	if hIconSmall != 0 {
 		procSendMessageW.Call(hwnd, WM_SETICON, ICON_SMALL, hIconSmall)
 	}
 
 	// Create large icon (32x32) for Alt+Tab
-	hIconBig := createIconFromData(iconData, 32, 32)
+	hIconBig := loadIconFromFile(iconPath, 32, 32)
 	if hIconBig != 0 {
 		procSendMessageW.Call(hwnd, WM_SETICON, ICON_BIG, hIconBig)
 	}
