@@ -273,6 +273,7 @@ scoop *
 
 # --- Docker ---
 docker
+docker *
 docker ps
 docker ps *
 docker images
@@ -420,6 +421,10 @@ Get-CimInstance *
 ForEach-Object *
 Write-Output *
 Select-Object *
+Format-List *
+Format-Table *
+@(*
+$*
 
 # --- CLI Coding Agents ---
 claude
