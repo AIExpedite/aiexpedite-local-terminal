@@ -892,7 +892,7 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 		return runLocalCommandFallback(cmdLine, workDir)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
 	output, err := ps.Execute(ctx, cmdLine, workDir)
