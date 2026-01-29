@@ -25,7 +25,7 @@ const (
 	// Timeout for health check commands
 	psHealthTimeout = 5 * time.Second
 	// Maximum time for a single command execution
-	psCommandTimeout = 15 * time.Minute
+	psCommandTimeout = 60 * time.Minute
 )
 
 // PersistentPowerShell manages a long-running PowerShell process
