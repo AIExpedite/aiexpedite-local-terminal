@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.29" // Aggressive cleanup for updates (kill stuck processes)
+const Version = "v0.5.30" // Auto-resolve Claude Code path for fallback PowerShell
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

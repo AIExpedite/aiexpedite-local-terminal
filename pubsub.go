@@ -994,6 +994,12 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 	isClaude := strings.HasPrefix(strings.ToLower(cmd), "claude")
 	if isClaude {
 		fmt.Printf("%s[aiexpedite] Using fallback for claude command%s\n", colorYellow, colorReset)
+		// Resolve full path to claude.exe since fallback PowerShell may not have it in PATH
+		claudePath := resolveClaudePath()
+		if claudePath != "" && claudePath != "claude" {
+			// Replace "claude" with the full path in the command line
+			cmdLine = claudePath + cmdLine[6:] // 6 = len("claude")
+		}
 		return runLocalCommandFallback(cmdLine, workDir)
 	}
 
@@ -1039,6 +1045,48 @@ func runLocalCommandFallback(cmdLine string, workDir string) (string, error) {
 
 	out, err := c.CombinedOutput()
 	return string(out), err
+}
+
+// resolveClaudePath finds the full path to claude.exe
+// Claude Code CLI is typically installed in %APPDATA%\Claude\claude-code\<version>\claude.exe
+func resolveClaudePath() string {
+	// First check if claude is in PATH
+	if path, err := exec.LookPath("claude"); err == nil {
+		return path
+	}
+	if path, err := exec.LookPath("claude.exe"); err == nil {
+		return path
+	}
+
+	// Check common Claude Code installation locations
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "claude"
+	}
+
+	// Claude Code CLI location: %APPDATA%\Claude\claude-code\<version>\claude.exe
+	claudeCodeDir := filepath.Join(homeDir, "AppData", "Roaming", "Claude", "claude-code")
+	if entries, err := os.ReadDir(claudeCodeDir); err == nil {
+		// Find the latest version directory
+		var latestVersion string
+		for _, entry := range entries {
+			if entry.IsDir() {
+				if latestVersion == "" || entry.Name() > latestVersion {
+					latestVersion = entry.Name()
+				}
+			}
+		}
+		if latestVersion != "" {
+			claudePath := filepath.Join(claudeCodeDir, latestVersion, "claude.exe")
+			if _, err := os.Stat(claudePath); err == nil {
+				fmt.Printf("%s[aiexpedite] Found Claude Code at: %s%s\n", colorCyan, claudePath, colorReset)
+				return claudePath
+			}
+		}
+	}
+
+	// Fallback to just "claude" and hope it's in PATH
+	return "claude"
 }
 
 func containsSpace(s string) bool {
