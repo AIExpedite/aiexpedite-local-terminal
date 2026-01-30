@@ -989,6 +989,14 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 		}
 	}
 
+	// Check if this is a "claude" command - these don't work with persistent PowerShell
+	// because claude uses interactive/streaming output that doesn't work with stdin pipes
+	isClaude := strings.HasPrefix(strings.ToLower(cmd), "claude")
+	if isClaude {
+		fmt.Printf("%s[aiexpedite] Using fallback for claude command%s\n", colorYellow, colorReset)
+		return runLocalCommandFallback(cmdLine, workDir)
+	}
+
 	// Try persistent PowerShell first (much faster - avoids 300-800ms startup)
 	ps, err := GetPowerShell()
 	if err != nil {

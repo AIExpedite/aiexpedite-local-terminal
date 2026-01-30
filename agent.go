@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.27" // Fix delimiter detection for commands without trailing newline
+const Version = "v0.5.28" // Use fallback for claude commands (stdin pipe incompatible)
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
