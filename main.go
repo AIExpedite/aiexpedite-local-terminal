@@ -29,6 +29,13 @@ func main() {
 		_ = ensureAutoStart()
 		// Register app in Windows "Installed Apps" for easy uninstall
 		_ = ensureAppRegistration()
+
+		// Allocate console early for non-prod environments (dev, stg, beta)
+		// This ensures all startup output (StartAgent, Pub/Sub) is visible
+		// Production builds stay as GUI-only apps with console on-demand
+		if EnvName != "prod" {
+			allocateConsole()
+		}
 	}
 
 	// Load or create configuration
@@ -68,8 +75,9 @@ func onTrayReady(cfg *Config) func() {
 		// Mark systray as ready so background goroutines can safely use it
 		SetSystrayReady()
 
-		// Show Console at the top
-		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", false)
+		// Show Console at the top - checked if we pre-allocated console for non-prod
+		consolePreAllocated := runtime.GOOS == "windows" && EnvName != "prod"
+		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", consolePreAllocated)
 		mAllowList := systray.AddMenuItem("Edit Allow List", "Open allow list configuration folder")
 		mResetAllowList := systray.AddMenuItem("Reset Allow List", "Reset to default allowed commands")
 		systray.AddSeparator()
@@ -193,7 +201,8 @@ func onTrayReady(cfg *Config) func() {
 		}
 
 		go func() {
-			consoleVisible := !cfg.IsRegistered() // Start visible if auto-registering
+			// Console is visible if: auto-registering OR pre-allocated for non-prod
+			consoleVisible := !cfg.IsRegistered() || consolePreAllocated
 			registering := autoRegistering
 
 			for {

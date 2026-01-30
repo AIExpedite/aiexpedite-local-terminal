@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.14" // Increased command timeout to 1 hour
+const Version = "v0.5.15" // Show console on startup for non-prod environments
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
