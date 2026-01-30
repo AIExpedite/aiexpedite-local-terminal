@@ -25,6 +25,8 @@ var (
 	procAllocConsole          = kernel32.NewProc("AllocConsole")
 	procFreeConsole           = kernel32.NewProc("FreeConsole")
 	procGetStdHandle          = kernel32.NewProc("GetStdHandle")
+	procSetConsoleMode        = kernel32.NewProc("SetConsoleMode")
+	procGetConsoleMode        = kernel32.NewProc("GetConsoleMode")
 	procShowWindow            = user32.NewProc("ShowWindow") // user32 declared in approval_windows.go
 
 	// For setting console window icon
@@ -35,6 +37,11 @@ var (
 const (
 	STD_OUTPUT_HANDLE = ^uintptr(10) // -11
 	STD_ERROR_HANDLE  = ^uintptr(11) // -12
+)
+
+// Console mode flags for ANSI escape code support
+const (
+	ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 )
 
 // Track if we've allocated a console
@@ -245,6 +252,9 @@ func allocateConsole() error {
 	stdout, _, _ := procGetStdHandle.Call(STD_OUTPUT_HANDLE)
 	stderr, _, _ := procGetStdHandle.Call(STD_ERROR_HANDLE)
 
+	// Enable ANSI escape code support for colored output
+	enableANSISupport(stdout)
+
 	// Update Go's os.Stdout and os.Stderr to use the new console
 	os.Stdout = os.NewFile(stdout, "stdout")
 	os.Stderr = os.NewFile(stderr, "stderr")
@@ -269,6 +279,14 @@ func allocateConsole() error {
 	fmt.Println("")
 
 	return nil
+}
+
+// enableANSISupport enables ANSI escape code processing for colored output
+func enableANSISupport(handle uintptr) {
+	var mode uint32
+	procGetConsoleMode.Call(handle, uintptr(unsafe.Pointer(&mode)))
+	mode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING
+	procSetConsoleMode.Call(handle, uintptr(mode))
 }
 
 // freeConsole detaches from the console
