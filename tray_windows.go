@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 	"unsafe"
 
 	_ "embed"
@@ -31,6 +32,9 @@ var (
 
 	// For setting console window icon
 	procSendMessageW = user32.NewProc("SendMessageW")
+
+	// For detecting minimized window state
+	procIsIconic = user32.NewProc("IsIconic")
 )
 
 // Standard handle constants for GetStdHandle
@@ -46,6 +50,12 @@ const (
 
 // Track if we've allocated a console
 var consoleAllocated = false
+
+// Channel to notify main.go when console visibility changes (e.g., minimized to tray)
+var ConsoleHiddenChan = make(chan bool, 1)
+
+// Channel to notify main.go when registration is invalidated (agent deleted from backend)
+var RegistrationInvalidChan = make(chan bool, 1)
 
 const (
 	SW_HIDE            = 0
@@ -278,6 +288,9 @@ func allocateConsole() error {
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 	fmt.Println("")
 
+	// Start monitoring for minimize events (hides to tray instead)
+	go monitorConsoleMinimize()
+
 	return nil
 }
 
@@ -327,6 +340,37 @@ func showConsoleWindow(show bool) {
 		hwnd := getConsoleWindow()
 		if hwnd != 0 {
 			procShowWindow.Call(hwnd, SW_HIDE)
+		}
+	}
+}
+
+// monitorConsoleMinimize watches for minimize events and hides console to tray.
+// This runs as a goroutine and polls the window state periodically.
+func monitorConsoleMinimize() {
+	for {
+		time.Sleep(100 * time.Millisecond) // Check 10 times per second
+
+		if !consoleAllocated {
+			continue
+		}
+
+		hwnd := getConsoleWindow()
+		if hwnd == 0 {
+			continue
+		}
+
+		// IsIconic returns non-zero if window is minimized
+		ret, _, _ := procIsIconic.Call(hwnd)
+		if ret != 0 {
+			// Window was minimized - hide it to tray instead
+			procShowWindow.Call(hwnd, SW_HIDE)
+
+			// Notify main.go to update the checkbox state
+			select {
+			case ConsoleHiddenChan <- true:
+			default:
+				// Channel full, skip (non-blocking)
+			}
 		}
 	}
 }

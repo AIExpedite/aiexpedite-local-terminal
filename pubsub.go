@@ -328,7 +328,7 @@ func StartPubSubLoop(cfg *Config) {
 		// Check if this is an "Unknown agent" error - means registration is invalid
 		errStr := err.Error()
 		if strings.Contains(errStr, "Unknown agent") || strings.Contains(errStr, "invalid_client") {
-			fmt.Printf("%s[pubsub] Registration is invalid - agent was deleted from backend%s\n", colorRed, colorReset)
+			fmt.Printf("%s[pubsub] Terminal connection was removed via the website%s\n", colorRed, colorReset)
 			fmt.Printf("%s[pubsub] Clearing local registration. Please re-register the device.%s\n", colorYellow, colorReset)
 
 			// Clear registration credentials from config
@@ -343,12 +343,20 @@ func StartPubSubLoop(cfg *Config) {
 				fmt.Printf("[pubsub] Failed to save config: %v\n", err)
 			}
 
+			// Notify main.go to update the Register Device menu item
+			if runtime.GOOS == "windows" {
+				select {
+				case RegistrationInvalidChan <- true:
+				default:
+					// Channel full, skip (non-blocking)
+				}
+			}
+
 			// Show error dialog to user
 			if runtime.GOOS == "windows" && IsSystrayReady() {
-				ShowErrorDialog("Registration Invalid",
-					"This device's registration is no longer valid.\n\n"+
-						"The agent may have been deleted from the backend.\n\n"+
-						"Please click 'Register Device' in the tray menu to re-register.")
+				ShowErrorDialog("Terminal Disconnected",
+					"This terminal's connection was removed via the website.\n\n"+
+						"Please click 'Register Device' in the tray menu to reconnect.")
 				systray.SetTooltip(EnvDisplayName + " – Not Registered")
 			}
 

@@ -350,6 +350,17 @@ func onTrayReady(cfg *Config) func() {
 						}
 					}
 
+				case <-ConsoleHiddenChan:
+					// Console was minimized and hidden to tray - update checkbox state
+					consoleVisible = false
+					mConsole.Uncheck()
+
+				case <-RegistrationInvalidChan:
+					// Registration was invalidated (terminal removed via website)
+					// Enable the Register Device menu item so user can re-register
+					mRegister.Uncheck()
+					mRegister.Enable()
+
 				case <-mDisconnect.ClickedCh:
 					if mDisconnect.Checked() {
 						mDisconnect.Uncheck()
