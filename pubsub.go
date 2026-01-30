@@ -459,7 +459,10 @@ func runPubSubConnection(cfg *Config) error {
 	fmt.Println("[pubsub] client created successfully")
 
 	sub := client.Subscription(cfg.CommandsSubscription)
-	sub.ReceiveSettings.Synchronous = true
+	// Use asynchronous processing to allow ping commands to be handled while
+	// long-running commands (like claude) are executing. This prevents the
+	// terminal from appearing "offline" during lengthy operations.
+	sub.ReceiveSettings.Synchronous = false
 	// Use configurable MaxOutstandingMessages for parallel processing
 	sub.ReceiveSettings.MaxOutstandingMessages = cfg.MaxOutstandingMessages
 	if sub.ReceiveSettings.MaxOutstandingMessages <= 0 {

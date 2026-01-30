@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.24" // Fix blank console window after update (use CONOUT$)
+const Version = "v0.5.25" // Fix terminal appearing offline during long commands
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
