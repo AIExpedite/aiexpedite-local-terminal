@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.25" // Fix terminal appearing offline during long commands
+const Version = "v0.5.26" // Fix publish context for async message handling
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

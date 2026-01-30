@@ -441,7 +441,9 @@ func onTrayExit() {
 		fmt.Println("Launching updated version…")
 		cmd := exec.Command(updatePath)
 		setNewConsole(cmd) // Ensure child process gets a fresh console with valid handles
-		_ = cmd.Start()
+		if err := cmd.Start(); err != nil {
+			fmt.Printf("Failed to start update: %v\n", err)
+		}
 		time.Sleep(1 * time.Second)
 	}
 }

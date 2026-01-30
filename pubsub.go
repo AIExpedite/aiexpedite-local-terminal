@@ -791,10 +791,13 @@ func runPubSubConnection(cfg *Config) error {
 			}
 
 			bytes, _ := json.Marshal(res)
-			// Publish result silently - only log errors
-			if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
+			// Publish result using a background context to ensure delivery even during shutdown.
+			// The message handler's ctx may be cancelled, but we still want to send the response.
+			publishCtx, publishCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if _, err := topic.Publish(publishCtx, &pubsub.Message{Data: bytes}).Get(publishCtx); err != nil {
 				fmt.Printf("%s[aiexpedite] Publish error: %v%s\n", colorRed, err, colorReset)
 			}
+			publishCancel()
 			m.Ack()
 	})
 
