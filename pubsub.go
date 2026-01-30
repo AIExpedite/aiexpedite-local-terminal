@@ -696,7 +696,12 @@ func runPubSubConnection(cfg *Config) error {
 					cmdDisplay = decodeBase64PowerShell(cmd.Args[1])
 				}
 			}
-			fmt.Printf("%s> %s%s\n", colorGreen, redactSensitiveData(cmdDisplay), colorReset)
+			// In debug mode, show full command; otherwise redact sensitive data
+			if cfg.DebugMode {
+				fmt.Printf("%s> %s%s\n", colorGreen, cmdDisplay, colorReset)
+			} else {
+				fmt.Printf("%s> %s%s\n", colorGreen, redactSensitiveData(cmdDisplay), colorReset)
+			}
 
 			// Debug mode: show raw command details
 			if cfg.DebugMode {

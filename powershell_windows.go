@@ -142,8 +142,8 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	// Execute the command and capture any errors
 	fullCmd.WriteString(command)
 
-	// Always print delimiter at end
-	fullCmd.WriteString(fmt.Sprintf("; Write-Host '%s'", psDelimiter))
+	// Always print delimiter at end (with newline before to ensure it's on its own line)
+	fullCmd.WriteString(fmt.Sprintf("; Write-Host ''; Write-Host '%s'", psDelimiter))
 
 	// Send command to PowerShell
 	_, err := fmt.Fprintln(ps.stdin, fullCmd.String())
