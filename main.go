@@ -78,10 +78,12 @@ func onTrayReady(cfg *Config) func() {
 		// Show Console at the top - checked if we pre-allocated console for non-prod
 		consolePreAllocated := runtime.GOOS == "windows" && EnvName != "prod"
 		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", consolePreAllocated)
-		mDebug := systray.AddMenuItemCheckbox("Debug Mode", "Show detailed command/response info", cfg.DebugMode)
-		systray.AddSeparator()
-		mAllowList := systray.AddMenuItem("Edit Allow List", "Open allow list configuration folder")
-		mResetAllowList := systray.AddMenuItem("Reset Allow List", "Reset to default allowed commands")
+
+		// Debug Mode - only visible in non-prod environments
+		var mDebug *systray.MenuItem
+		if EnvName != "prod" {
+			mDebug = systray.AddMenuItemCheckbox("Debug Mode", "Show detailed command/response info", cfg.DebugMode)
+		}
 		systray.AddSeparator()
 
 		// Register Device - always visible as checkbox showing registration status
@@ -89,20 +91,23 @@ func onTrayReady(cfg *Config) func() {
 		if cfg.IsRegistered() {
 			mRegister.Disable() // Can't re-register once registered
 		}
+		mDisconnect := systray.AddMenuItemCheckbox("Disconnect from cloud", "Stop cloud connection (stay running)", false)
 		systray.AddSeparator()
 
-		mDisconnect := systray.AddMenuItemCheckbox("Disconnect from cloud", "Stop cloud connection (stay running)", false)
+		mAllowList := systray.AddMenuItem("Edit Allow List", "Open allow list configuration folder")
+		mResetAllowList := systray.AddMenuItem("Reset Allow List", "Reset to default allowed commands")
+		systray.AddSeparator()
+
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
 
 		// Install Update menu item - initially hidden, shown when update is pending
 		mInstallUpdate := systray.AddMenuItem("", "")
 		mInstallUpdate.Hide()
 
-		systray.AddSeparator()
-
 		// Version display (disabled, just for info)
 		mVersion := systray.AddMenuItem("Version "+Version, "Current version")
 		mVersion.Disable()
+		systray.AddSeparator()
 
 		mQuit := systray.AddMenuItem("Quit", "Exit the agent")
 
@@ -200,6 +205,12 @@ func onTrayReady(cfg *Config) func() {
 					}
 				}
 			}()
+		}
+
+		// Create debug click channel - nil channel blocks forever in select, which is what we want for prod
+		var debugClickCh <-chan struct{}
+		if mDebug != nil {
+			debugClickCh = mDebug.ClickedCh
 		}
 
 		go func() {
@@ -363,8 +374,8 @@ func onTrayReady(cfg *Config) func() {
 					mRegister.Uncheck()
 					mRegister.Enable()
 
-				case <-mDebug.ClickedCh:
-					// Toggle debug mode
+				case <-debugClickCh:
+					// Toggle debug mode (only in non-prod)
 					cfg.DebugMode = !cfg.DebugMode
 					if cfg.DebugMode {
 						mDebug.Check()
