@@ -26,6 +26,7 @@ var (
 	procAllocConsole          = kernel32.NewProc("AllocConsole")
 	procFreeConsole           = kernel32.NewProc("FreeConsole")
 	procGetStdHandle          = kernel32.NewProc("GetStdHandle")
+	procSetStdHandle          = kernel32.NewProc("SetStdHandle")
 	procSetConsoleMode        = kernel32.NewProc("SetConsoleMode")
 	procGetConsoleMode        = kernel32.NewProc("GetConsoleMode")
 	procShowWindow            = user32.NewProc("ShowWindow") // user32 declared in approval_windows.go
@@ -37,8 +38,9 @@ var (
 	procIsIconic = user32.NewProc("IsIconic")
 )
 
-// Standard handle constants for GetStdHandle
+// Standard handle constants for GetStdHandle/SetStdHandle
 const (
+	STD_INPUT_HANDLE  = ^uintptr(9)  // -10
 	STD_OUTPUT_HANDLE = ^uintptr(10) // -11
 	STD_ERROR_HANDLE  = ^uintptr(11) // -12
 )
@@ -246,67 +248,47 @@ func allocateConsole() error {
 	}
 
 	// Check if we already have a console (e.g., created via CREATE_NEW_CONSOLE when
-	// launching an updated executable). If so, just set up Go's stdout/stderr handles.
-	if hwnd := getConsoleWindow(); hwnd != 0 {
-		// Console exists, just need to set up Go's stdout/stderr
-		stdout, _, _ := procGetStdHandle.Call(STD_OUTPUT_HANDLE)
-		stderr, _, _ := procGetStdHandle.Call(STD_ERROR_HANDLE)
+	// launching an updated executable). If so, we need to properly connect stdout/stderr.
+	existingConsole := getConsoleWindow() != 0
 
-		// Enable ANSI escape code support for colored output
-		enableANSISupport(stdout)
+	if !existingConsole {
+		// Clear Windows Terminal environment variables to prevent WT from
+		// intercepting AllocConsole() and creating a wrapper window.
+		// When these are set, Windows routes console allocation through Windows Terminal,
+		// which creates a separate terminal window that the app cannot control.
+		// By clearing them, we force Windows to use the legacy conhost.exe instead.
+		os.Unsetenv("WT_SESSION")
+		os.Unsetenv("WT_PROFILE_ID")
 
-		// Update Go's os.Stdout and os.Stderr to use the existing console
-		os.Stdout = os.NewFile(stdout, "stdout")
-		os.Stderr = os.NewFile(stderr, "stderr")
-
-		consoleAllocated = true
-
-		// Set up the existing console (icon, title, handlers, etc.)
-		disableConsoleCloseButton()
-		initConsoleHandler()
-		setConsoleIcon()
-		setConsoleTitle(EnvDisplayName + " " + Version)
-
-		// Print startup banner
-		fmt.Println("")
-		fmt.Println("╔════════════════════════════════════════════════════════════╗")
-		fmt.Printf("║          %s %s\n", EnvDisplayName, Version)
-		fmt.Println("╚════════════════════════════════════════════════════════════╝")
-		fmt.Println("")
-
-		// Start monitoring for minimize events (hides to tray instead)
-		go monitorConsoleMinimize()
-
-		return nil
+		ret, _, err := procAllocConsole.Call()
+		if ret == 0 {
+			return fmt.Errorf("AllocConsole failed: %v", err)
+		}
 	}
 
-	// Clear Windows Terminal environment variables to prevent WT from
-	// intercepting AllocConsole() and creating a wrapper window.
-	// When these are set, Windows routes console allocation through Windows Terminal,
-	// which creates a separate terminal window that the app cannot control.
-	// By clearing them, we force Windows to use the legacy conhost.exe instead.
-	os.Unsetenv("WT_SESSION")
-	os.Unsetenv("WT_PROFILE_ID")
-
-	ret, _, err := procAllocConsole.Call()
-	if ret == 0 {
-		return fmt.Errorf("AllocConsole failed: %v", err)
+	// Open CONOUT$ to get a valid handle to the console output buffer.
+	// This is necessary because:
+	// 1. When CREATE_NEW_CONSOLE creates a console, GetStdHandle may return invalid handles
+	// 2. Opening CONOUT$ directly always gives us a valid console output handle
+	conout, err := syscall.Open("CONOUT$", syscall.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("failed to open CONOUT$: %v", err)
 	}
 
-	// Get the new console's stdout/stderr handles
-	stdout, _, _ := procGetStdHandle.Call(STD_OUTPUT_HANDLE)
-	stderr, _, _ := procGetStdHandle.Call(STD_ERROR_HANDLE)
+	// Set the process's standard handles to point to the console
+	procSetStdHandle.Call(STD_OUTPUT_HANDLE, uintptr(conout))
+	procSetStdHandle.Call(STD_ERROR_HANDLE, uintptr(conout))
 
 	// Enable ANSI escape code support for colored output
-	enableANSISupport(stdout)
+	enableANSISupport(uintptr(conout))
 
-	// Update Go's os.Stdout and os.Stderr to use the new console
-	os.Stdout = os.NewFile(stdout, "stdout")
-	os.Stderr = os.NewFile(stderr, "stderr")
+	// Update Go's os.Stdout and os.Stderr to use the console
+	os.Stdout = os.NewFile(uintptr(conout), "stdout")
+	os.Stderr = os.NewFile(uintptr(conout), "stderr")
 
 	consoleAllocated = true
 
-	// Disable the close button on the new console
+	// Disable the close button on the console
 	disableConsoleCloseButton()
 
 	// Set up console control handler
