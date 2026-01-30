@@ -419,14 +419,26 @@ func onTrayExit() {
 	// signal background goroutines
 	close(shutdownChan)
 
-	// For updates, perform aggressive cleanup first to kill any stuck processes
-	if updatePending && runtime.GOOS == "windows" {
-		fmt.Println("[cleanup] Performing aggressive process cleanup for update...")
-		aggressiveCleanup()
+	// IMPORTANT: Launch update FIRST, before any cleanup that might kill processes
+	// The update process needs to be started before we kill our process tree
+	if updatePending && updatePath != "" {
+		fmt.Println("Launching updated version…")
+		cmd := exec.Command(updatePath)
+		setNewConsole(cmd) // Ensure child process gets a fresh console with valid handles
+		if err := cmd.Start(); err != nil {
+			fmt.Printf("Failed to start update: %v\n", err)
+		}
+		// Give the new process time to fully launch before we exit
+		time.Sleep(2 * time.Second)
+		// Don't do aggressive cleanup after launching update - just exit
+		// The new process is already running independently
+		return
 	}
 
-	// Cleanup persistent PowerShell process (Windows only)
+	// Only do aggressive cleanup when NOT updating (e.g., stuck processes during normal quit)
+	// When updating, we skip this to avoid killing the newly launched update process
 	if runtime.GOOS == "windows" {
+		// Cleanup persistent PowerShell process
 		ShutdownPowerShell()
 	}
 
@@ -441,17 +453,6 @@ func onTrayExit() {
 
 	// kill tmux session (ignore error if it never existed)
 	_ = exec.Command("tmux", "kill-session", "-t", tmuxSessionName).Run()
-
-	// launch downloaded update
-	if updatePending && updatePath != "" {
-		fmt.Println("Launching updated version…")
-		cmd := exec.Command(updatePath)
-		setNewConsole(cmd) // Ensure child process gets a fresh console with valid handles
-		if err := cmd.Start(); err != nil {
-			fmt.Printf("Failed to start update: %v\n", err)
-		}
-		time.Sleep(1 * time.Second)
-	}
 }
 
 // aggressiveCleanup forcefully kills child processes that might be stuck.
