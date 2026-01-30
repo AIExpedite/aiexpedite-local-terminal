@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.28" // Use fallback for claude commands (stdin pipe incompatible)
+const Version = "v0.5.29" // Aggressive cleanup for updates (kill stuck processes)
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
