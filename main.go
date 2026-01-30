@@ -78,6 +78,8 @@ func onTrayReady(cfg *Config) func() {
 		// Show Console at the top - checked if we pre-allocated console for non-prod
 		consolePreAllocated := runtime.GOOS == "windows" && EnvName != "prod"
 		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", consolePreAllocated)
+		mDebug := systray.AddMenuItemCheckbox("Debug Mode", "Show detailed command/response info", cfg.DebugMode)
+		systray.AddSeparator()
 		mAllowList := systray.AddMenuItem("Edit Allow List", "Open allow list configuration folder")
 		mResetAllowList := systray.AddMenuItem("Reset Allow List", "Reset to default allowed commands")
 		systray.AddSeparator()
@@ -360,6 +362,21 @@ func onTrayReady(cfg *Config) func() {
 					// Enable the Register Device menu item so user can re-register
 					mRegister.Uncheck()
 					mRegister.Enable()
+
+				case <-mDebug.ClickedCh:
+					// Toggle debug mode
+					cfg.DebugMode = !cfg.DebugMode
+					if cfg.DebugMode {
+						mDebug.Check()
+						fmt.Printf("%s[debug] Debug mode ENABLED - showing detailed command/response info%s\n", colorMagenta, colorReset)
+					} else {
+						mDebug.Uncheck()
+						fmt.Printf("%s[debug] Debug mode DISABLED%s\n", colorMagenta, colorReset)
+					}
+					// Save to config so it persists
+					if err := cfg.Save(ConfigPath()); err != nil {
+						fmt.Printf("[debug] Failed to save config: %v\n", err)
+					}
 
 				case <-mDisconnect.ClickedCh:
 					if mDisconnect.Checked() {

@@ -61,6 +61,9 @@ type Config struct {
 	TokenEndpoint     string `json:"token_endpoint,omitempty"`      // Backend URL for OIDC token exchange
 	WIFAudience       string `json:"wif_audience,omitempty"`        // GCP Workload Identity Pool audience
 	WIFServiceAccount string `json:"wif_service_account,omitempty"` // GCP service account to impersonate
+
+	/* ─── Debug Mode ─────────────────────────────────── */
+	DebugMode bool `json:"debug_mode,omitempty"` // Show detailed command/response info
 }
 
 /* -------------------------------------------------------------------------- */

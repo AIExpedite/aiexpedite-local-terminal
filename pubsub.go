@@ -134,6 +134,25 @@ func redactCommandForLog(cmd string, args []string) string {
 }
 
 /* --------------------------------------------------------------------------
+   Command Staleness Check
+   -------------------------------------------------------------------------- */
+
+// maxCommandAgeSec is the maximum age (in seconds) a command can have before
+// being rejected as stale. This prevents processing old queued commands when
+// the terminal reconnects after being offline.
+const maxCommandAgeSec = 60 // 1 minute
+
+// isCommandStale checks if a command's timestamp is older than maxCommandAgeSec
+func isCommandStale(cmdTs int64) bool {
+	if cmdTs == 0 {
+		return false // No timestamp - allow for backwards compatibility
+	}
+	now := time.Now().UnixMilli()
+	ageMs := now - cmdTs
+	return ageMs > int64(maxCommandAgeSec*1000)
+}
+
+/* --------------------------------------------------------------------------
    Per-UID Rate Limiting
    -------------------------------------------------------------------------- */
 
@@ -473,6 +492,33 @@ func runPubSubConnection(cfg *Config) error {
 				return
 			}
 
+			// ─── Command Staleness Check ──────────────────────────────────────
+			// Reject commands older than maxCommandAgeSec to prevent processing
+			// stale queued commands when terminal reconnects after being offline
+			if isCommandStale(cmd.Ts) {
+				ageSec := (time.Now().UnixMilli() - cmd.Ts) / 1000
+				fmt.Printf("%s[aiexpedite] Stale command rejected (age: %ds, max: %ds)%s\n",
+					colorYellow, ageSec, maxCommandAgeSec, colorReset)
+
+				// Send stale response back to user
+				res := resultMsg{
+					ID:          cmd.ID,
+					WorkspaceID: cmd.WorkspaceID,
+					UID:         cmd.UID,
+					Output:      fmt.Sprintf("Command rejected: too old (%d seconds, max %d seconds). Terminal may have been offline.", ageSec, maxCommandAgeSec),
+					Status:      "stale",
+					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
+				}
+				bytes, _ := json.Marshal(res)
+				if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
+					fmt.Println("[pubsub] publish error:", err)
+				}
+				m.Ack()
+				return
+			}
+			// ─────────────────────────────────────────────────────────────────
+
 			// ─── Per-UID Rate Limiting ─────────────────────────────────────────
 			if !checkRateLimit(cmd.UID, cfg) {
 				fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
@@ -649,8 +695,23 @@ func runPubSubConnection(cfg *Config) error {
 			}
 			fmt.Printf("%s> %s%s\n", colorGreen, redactSensitiveData(cmdDisplay), colorReset)
 
+			// Debug mode: show raw command details
+			if cfg.DebugMode {
+				fmt.Printf("%s[DEBUG] Raw command: %s%s\n", colorMagenta, cmd.Command, colorReset)
+				fmt.Printf("%s[DEBUG] Args: %v%s\n", colorMagenta, cmd.Args, colorReset)
+				fmt.Printf("%s[DEBUG] Cwd: %s%s\n", colorMagenta, cmd.Cwd, colorReset)
+			}
+
 			// Execute command (silently - no internal logs)
 			out, execErr := runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd)
+
+			// Debug mode: show raw output details
+			if cfg.DebugMode {
+				fmt.Printf("%s[DEBUG] Output length: %d bytes%s\n", colorMagenta, len(out), colorReset)
+				fmt.Printf("%s[DEBUG] Error: %v%s\n", colorMagenta, execErr, colorReset)
+				// Show raw output with visible control characters
+				fmt.Printf("%s[DEBUG] Raw output (quoted): %q%s\n", colorMagenta, out, colorReset)
+			}
 
 			// Show output or terminal error
 			if execErr != nil {

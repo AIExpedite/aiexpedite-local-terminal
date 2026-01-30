@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.19" // Update Register Device menu when terminal removed via website
+const Version = "v0.5.21" // Add 1-minute staleness check to reject old queued commands
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
