@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.15" // Show console on startup for non-prod environments
+const Version = "v0.5.16" // Enable ANSI colors, remove signature debug logs
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
