@@ -439,7 +439,9 @@ func onTrayExit() {
 	// launch downloaded update
 	if updatePending && updatePath != "" {
 		fmt.Println("Launching updated version…")
-		_ = exec.Command(updatePath).Start()
+		cmd := exec.Command(updatePath)
+		setNewConsole(cmd) // Ensure child process gets a fresh console with valid handles
+		_ = cmd.Start()
 		time.Sleep(1 * time.Second)
 	}
 }

@@ -10,3 +10,6 @@ import "os/exec"
 
 // hideWindow is a no-op on non-Windows platforms
 func hideWindow(cmd *exec.Cmd) {}
+
+// setNewConsole is a no-op on non-Windows platforms
+func setNewConsole(cmd *exec.Cmd) {}

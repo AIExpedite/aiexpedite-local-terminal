@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.22" // Reorganize menu, hide Debug Mode in prod
+const Version = "v0.5.23" // Fix blank console window after update
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

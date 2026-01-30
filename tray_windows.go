@@ -245,6 +245,41 @@ func allocateConsole() error {
 		return nil
 	}
 
+	// Check if we already have a console (e.g., created via CREATE_NEW_CONSOLE when
+	// launching an updated executable). If so, just set up Go's stdout/stderr handles.
+	if hwnd := getConsoleWindow(); hwnd != 0 {
+		// Console exists, just need to set up Go's stdout/stderr
+		stdout, _, _ := procGetStdHandle.Call(STD_OUTPUT_HANDLE)
+		stderr, _, _ := procGetStdHandle.Call(STD_ERROR_HANDLE)
+
+		// Enable ANSI escape code support for colored output
+		enableANSISupport(stdout)
+
+		// Update Go's os.Stdout and os.Stderr to use the existing console
+		os.Stdout = os.NewFile(stdout, "stdout")
+		os.Stderr = os.NewFile(stderr, "stderr")
+
+		consoleAllocated = true
+
+		// Set up the existing console (icon, title, handlers, etc.)
+		disableConsoleCloseButton()
+		initConsoleHandler()
+		setConsoleIcon()
+		setConsoleTitle(EnvDisplayName + " " + Version)
+
+		// Print startup banner
+		fmt.Println("")
+		fmt.Println("╔════════════════════════════════════════════════════════════╗")
+		fmt.Printf("║          %s %s\n", EnvDisplayName, Version)
+		fmt.Println("╚════════════════════════════════════════════════════════════╝")
+		fmt.Println("")
+
+		// Start monitoring for minimize events (hides to tray instead)
+		go monitorConsoleMinimize()
+
+		return nil
+	}
+
 	// Clear Windows Terminal environment variables to prevent WT from
 	// intercepting AllocConsole() and creating a wrapper window.
 	// When these are set, Windows routes console allocation through Windows Terminal,
