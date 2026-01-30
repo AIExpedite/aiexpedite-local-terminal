@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -323,6 +324,38 @@ func StartPubSubLoop(cfg *Config) {
 		}
 
 		fmt.Printf("[pubsub] connection lost: %v\n", err)
+
+		// Check if this is an "Unknown agent" error - means registration is invalid
+		errStr := err.Error()
+		if strings.Contains(errStr, "Unknown agent") || strings.Contains(errStr, "invalid_client") {
+			fmt.Printf("%s[pubsub] Registration is invalid - agent was deleted from backend%s\n", colorRed, colorReset)
+			fmt.Printf("%s[pubsub] Clearing local registration. Please re-register the device.%s\n", colorYellow, colorReset)
+
+			// Clear registration credentials from config
+			cfg.AgentID = ""
+			cfg.CommandSecret = ""
+			cfg.UserID = ""
+			cfg.RegisteredAt = ""
+			cfg.TokenEndpoint = ""
+			cfg.WIFAudience = ""
+			cfg.WIFServiceAccount = ""
+			if err := cfg.Save(ConfigPath()); err != nil {
+				fmt.Printf("[pubsub] Failed to save config: %v\n", err)
+			}
+
+			// Show error dialog to user
+			if runtime.GOOS == "windows" && IsSystrayReady() {
+				ShowErrorDialog("Registration Invalid",
+					"This device's registration is no longer valid.\n\n"+
+						"The agent may have been deleted from the backend.\n\n"+
+						"Please click 'Register Device' in the tray menu to re-register.")
+				systray.SetTooltip(EnvDisplayName + " – Not Registered")
+			}
+
+			// Stop the Pub/Sub loop - user needs to re-register
+			return
+		}
+
 		fmt.Printf("[pubsub] reconnecting in %v...\n", backoff)
 		if IsSystrayReady() {
 			systray.SetTooltip(EnvDisplayName + " – Reconnecting...")
