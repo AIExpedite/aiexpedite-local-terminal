@@ -225,11 +225,6 @@ func verifySignature(cmd commandMsg, secret string) bool {
 	mac.Write(signatureData)
 	expectedSig := hex.EncodeToString(mac.Sum(nil))
 
-	// Debug: print signature comparison data
-	fmt.Printf("[signature-debug] payload: %s\n", string(signatureData))
-	fmt.Printf("[signature-debug] expected: %s\n", expectedSig)
-	fmt.Printf("[signature-debug] received: %s\n", cmd.Signature)
-
 	// Constant-time comparison to prevent timing attacks
 	return hmac.Equal([]byte(expectedSig), []byte(cmd.Signature))
 }
@@ -436,10 +431,6 @@ func runPubSubConnection(cfg *Config) error {
 				m.Nack()
 				return
 			}
-
-			// Debug: print raw message for signature investigation
-			fmt.Printf("[signature-debug] raw message: %s\n", string(m.Data))
-			fmt.Printf("[signature-debug] parsed args: %v (len=%d, nil=%v)\n", cmd.Args, len(cmd.Args), cmd.Args == nil)
 
 			// ─── Per-UID Rate Limiting ─────────────────────────────────────────
 			if !checkRateLimit(cmd.UID, cfg) {
