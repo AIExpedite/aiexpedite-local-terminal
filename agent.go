@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.32" // Fix HMAC signature mismatch: Go json.Marshal escapes &,<,> but Node.js does not
+const Version = "v0.5.33" // Route all CLI agents (claude, codex, gemini) through dedicated process; sync allowlist
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

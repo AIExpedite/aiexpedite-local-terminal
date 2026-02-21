@@ -996,25 +996,23 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 		}
 	}
 
-	// Check if this is a "claude" command
-	isClaude := strings.HasPrefix(strings.ToLower(cmd), "claude")
-	if isClaude {
-		// Resolve full path to claude.exe since persistent PowerShell may not have it in PATH
-		claudePath := resolveClaudePath()
-		if claudePath != "" && claudePath != "claude" {
-			cmdLine = claudePath + cmdLine[6:] // 6 = len("claude")
+	// CLI coding agents (claude, codex, gemini) use interactive/streaming output
+	// that doesn't work with persistent PowerShell stdin pipes.
+	// Always spawn a new powershell.exe process for these commands.
+	cmdLower := strings.ToLower(cmd)
+	isCLIAgent := cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude ") ||
+		cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex ") ||
+		cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini ")
+	if isCLIAgent {
+		fmt.Printf("%s[aiexpedite] Using dedicated process for CLI agent: %s%s\n", colorCyan, cmd, colorReset)
+		// Resolve full path for claude since it may not be in fallback PowerShell's PATH
+		if strings.HasPrefix(cmdLower, "claude") {
+			claudePath := resolveClaudePath()
+			if claudePath != "" && claudePath != "claude" {
+				cmdLine = claudePath + cmdLine[6:] // 6 = len("claude")
+			}
 		}
-
-		// claude --print runs non-interactively (stdout only) - safe for persistent PowerShell
-		// Interactive claude (no --print) uses streaming output incompatible with stdin pipes
-		cmdLineLower := strings.ToLower(cmdLine)
-		if strings.Contains(cmdLineLower, " --print ") || strings.HasSuffix(cmdLineLower, " --print") {
-			fmt.Printf("%s[aiexpedite] Running claude --print via persistent PowerShell%s\n", colorCyan, colorReset)
-			// Fall through to persistent PowerShell path below
-		} else {
-			fmt.Printf("%s[aiexpedite] Using fallback for interactive claude command%s\n", colorYellow, colorReset)
-			return runLocalCommandFallback(cmdLine, workDir)
-		}
+		return runLocalCommandFallback(cmdLine, workDir)
 	}
 
 	// Try persistent PowerShell first (much faster - avoids 300-800ms startup)
