@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.31" // Fix update launch order (start new version before cleanup)
+const Version = "v0.5.32" // Fix HMAC signature mismatch: Go json.Marshal escapes &,<,> but Node.js does not
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

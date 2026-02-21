@@ -235,10 +235,17 @@ func verifySignature(cmd commandMsg, secret string) bool {
 		Ts:      cmd.Ts,
 	}
 
-	signatureData, err := json.Marshal(payload)
-	if err != nil {
+	// Use json.NewEncoder with SetEscapeHTML(false) to match Node.js JSON.stringify behavior.
+	// Go's json.Marshal escapes &, <, > as \u0026, \u003c, \u003e by default,
+	// but Node.js does not. This caused signature mismatches for commands containing &.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil {
 		return false
 	}
+	// Encode appends a trailing newline — strip it to match JSON.stringify output
+	signatureData := bytes.TrimRight(buf.Bytes(), "\n")
 
 	// Compute expected signature
 	mac := hmac.New(sha256.New, []byte(secret))
@@ -989,18 +996,25 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 		}
 	}
 
-	// Check if this is a "claude" command - these don't work with persistent PowerShell
-	// because claude uses interactive/streaming output that doesn't work with stdin pipes
+	// Check if this is a "claude" command
 	isClaude := strings.HasPrefix(strings.ToLower(cmd), "claude")
 	if isClaude {
-		fmt.Printf("%s[aiexpedite] Using fallback for claude command%s\n", colorYellow, colorReset)
-		// Resolve full path to claude.exe since fallback PowerShell may not have it in PATH
+		// Resolve full path to claude.exe since persistent PowerShell may not have it in PATH
 		claudePath := resolveClaudePath()
 		if claudePath != "" && claudePath != "claude" {
-			// Replace "claude" with the full path in the command line
 			cmdLine = claudePath + cmdLine[6:] // 6 = len("claude")
 		}
-		return runLocalCommandFallback(cmdLine, workDir)
+
+		// claude --print runs non-interactively (stdout only) - safe for persistent PowerShell
+		// Interactive claude (no --print) uses streaming output incompatible with stdin pipes
+		cmdLineLower := strings.ToLower(cmdLine)
+		if strings.Contains(cmdLineLower, " --print ") || strings.HasSuffix(cmdLineLower, " --print") {
+			fmt.Printf("%s[aiexpedite] Running claude --print via persistent PowerShell%s\n", colorCyan, colorReset)
+			// Fall through to persistent PowerShell path below
+		} else {
+			fmt.Printf("%s[aiexpedite] Using fallback for interactive claude command%s\n", colorYellow, colorReset)
+			return runLocalCommandFallback(cmdLine, workDir)
+		}
 	}
 
 	// Try persistent PowerShell first (much faster - avoids 300-800ms startup)
