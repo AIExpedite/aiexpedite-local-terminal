@@ -449,7 +449,10 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				fmt.Printf("%s[session] Prompt detected in %s: %s%s\n",
 					colorMagenta, session.ID, truncateString(promptInfo.Text, 80), colorReset)
 			} else {
-				batch = append(batch, line.text)
+				displayText := extractDisplayText(session.Command, line.text)
+				if displayText != "" {
+					batch = append(batch, displayText)
+				}
 			}
 
 		case <-batchTimer.C:

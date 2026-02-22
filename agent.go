@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.34" // Interactive sessions: add --approval-mode flags for Codex (full-auto) and Gemini (auto_edit)
+const Version = "v0.5.35" // Parse stream-json output into readable text for all CLI agents
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
