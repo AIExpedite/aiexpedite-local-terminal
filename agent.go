@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.33" // Route all CLI agents (claude, codex, gemini) through dedicated process; sync allowlist
+const Version = "v0.5.34" // Interactive sessions: add --approval-mode flags for Codex (full-auto) and Gemini (auto_edit)
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -179,6 +179,12 @@ func StartAgent(cfg *Config) {
 			}
 		}()
 	}
+
+	/* 3b. Initialize Session Manager for interactive CLI agents ----------- */
+
+	globalSessionManager = NewSessionManager()
+	go globalSessionManager.CleanupStale(sessionMaxLifetime)
+	fmt.Println("[aiexpedite] Session manager ready")
 
 	/* 4. Start Pub/Sub loop (non‑blocking) -------------------------------- */
 

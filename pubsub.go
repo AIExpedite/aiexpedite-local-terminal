@@ -279,6 +279,12 @@ type commandMsg struct {
 	Ts          int64    `json:"ts"`
 	AgentID     string   `json:"agentId,omitempty"`   // Target agent for signature verification
 	Signature   string   `json:"signature,omitempty"` // HMAC-SHA256 signature of command
+
+	// Session fields (for interactive CLI agent sessions)
+	Type      string `json:"type,omitempty"`      // "execute"|"session_start"|"session_input"|"session_signal"|"session_end"
+	SessionID string `json:"sessionID,omitempty"` // Unique session identifier
+	Input     string `json:"input,omitempty"`     // stdin text for session_input
+	Signal    string `json:"signal,omitempty"`    // "interrupt"|"kill" for session_signal
 }
 
 /* Outgoing result payload (matches backend publishResult struct) */
@@ -293,6 +299,14 @@ type resultMsg struct {
 	Version      string        `json:"version,omitempty"`      // Terminal app version
 	Files        []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
 	UploadErrors []UploadError `json:"uploadErrors,omitempty"` // File upload failures
+
+	// Session fields (for interactive CLI agent sessions)
+	Type       string `json:"type,omitempty"`       // "result"|"stream"|"prompt"|"session_ended"
+	SessionID  string `json:"sessionID,omitempty"`  // Session identifier
+	ExitCode   int    `json:"exitCode,omitempty"`   // Process exit code (for session_ended)
+	PromptText string `json:"promptText,omitempty"` // The question/approval text from CLI
+	PromptType string `json:"promptType,omitempty"` // "permission"|"question"|"unknown"
+	Seq        int    `json:"seq,omitempty"`         // Ordering sequence number for streaming
 }
 
 /* --------------------------------------------------------------------------
@@ -635,6 +649,15 @@ func runPubSubConnection(cfg *Config) error {
 				if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
 					fmt.Printf("%s[aiexpedite] Ping publish error: %v%s\n", colorRed, err, colorReset)
 				}
+				m.Ack()
+				return
+			}
+			// ─────────────────────────────────────────────────────────────────
+
+			// ─── Interactive Session Routing ─────────────────────────────────
+			// Route session_* commands to the SessionManager instead of shell execution
+			if cmd.Type != "" && cmd.Type != "execute" {
+				handleSessionCommand(ctx, topic, cmd)
 				m.Ack()
 				return
 			}
@@ -1196,4 +1219,142 @@ func appendFilesFromDir(files []string, dir string, extensions []string) []strin
 // Returns empty string if not provided - caller must handle this case
 func extractWorkspaceID(cmd commandMsg) string {
 	return cmd.WorkspaceID
+}
+
+/* --------------------------------------------------------------------------
+   Global Session Manager
+   -------------------------------------------------------------------------- */
+
+// globalSessionManager is the package-level SessionManager instance,
+// initialized in StartAgent (agent.go).
+var globalSessionManager *SessionManager
+
+/* --------------------------------------------------------------------------
+   handleSessionCommand — routes session_* commands to the SessionManager
+   -------------------------------------------------------------------------- */
+
+// handleSessionCommand handles interactive session commands (session_start,
+// session_input, session_signal, session_end). It publishes results back
+// via the provided Pub/Sub topic.
+func handleSessionCommand(ctx context.Context, topic *pubsub.Topic, cmd commandMsg) {
+	if globalSessionManager == nil {
+		publishSessionError(ctx, topic, cmd, "session manager not initialized")
+		return
+	}
+
+	// Create a publish function that sends results via Pub/Sub
+	publishFn := func(res resultMsg) {
+		data, err := json.Marshal(res)
+		if err != nil {
+			fmt.Printf("%s[session] Failed to marshal result: %v%s\n", colorRed, err, colorReset)
+			return
+		}
+		if _, err := topic.Publish(ctx, &pubsub.Message{Data: data}).Get(ctx); err != nil {
+			fmt.Printf("%s[session] Failed to publish result: %v%s\n", colorRed, err, colorReset)
+		}
+	}
+
+	switch cmd.Type {
+	case "session_start":
+		if cmd.SessionID == "" {
+			publishSessionError(ctx, topic, cmd, "sessionID is required for session_start")
+			return
+		}
+
+		fmt.Printf("%s[session] Starting session %s for command: %s%s\n",
+			colorCyan, cmd.SessionID, cmd.Command, colorReset)
+
+		err := globalSessionManager.StartSession(
+			cmd.SessionID,
+			cmd.Command,
+			cmd.Args,
+			cmd.Cwd,
+			cmd.WorkspaceID,
+			cmd.UID,
+			publishFn,
+		)
+		if err != nil {
+			publishSessionError(ctx, topic, cmd, fmt.Sprintf("failed to start session: %v", err))
+			return
+		}
+
+		// Publish session_started acknowledgment
+		publishFn(resultMsg{
+			ID:          cmd.ID,
+			WorkspaceID: cmd.WorkspaceID,
+			UID:         cmd.UID,
+			Output:      "Session started",
+			Status:      "success",
+			Ts:          time.Now().UnixMilli(),
+			Version:     Version,
+			Type:        "session_started",
+			SessionID:   cmd.SessionID,
+		})
+
+	case "session_input":
+		if cmd.SessionID == "" {
+			publishSessionError(ctx, topic, cmd, "sessionID is required for session_input")
+			return
+		}
+
+		fmt.Printf("%s[session] Sending input to session %s%s\n",
+			colorBlue, cmd.SessionID, colorReset)
+
+		if err := globalSessionManager.SendInput(cmd.SessionID, cmd.Input); err != nil {
+			publishSessionError(ctx, topic, cmd, fmt.Sprintf("failed to send input: %v", err))
+			return
+		}
+
+	case "session_signal":
+		if cmd.SessionID == "" {
+			publishSessionError(ctx, topic, cmd, "sessionID is required for session_signal")
+			return
+		}
+
+		fmt.Printf("%s[session] Sending signal '%s' to session %s%s\n",
+			colorYellow, cmd.Signal, cmd.SessionID, colorReset)
+
+		if err := globalSessionManager.SignalSession(cmd.SessionID, cmd.Signal); err != nil {
+			publishSessionError(ctx, topic, cmd, fmt.Sprintf("failed to send signal: %v", err))
+			return
+		}
+
+	case "session_end":
+		if cmd.SessionID == "" {
+			publishSessionError(ctx, topic, cmd, "sessionID is required for session_end")
+			return
+		}
+
+		fmt.Printf("%s[session] Ending session %s%s\n",
+			colorYellow, cmd.SessionID, colorReset)
+
+		if err := globalSessionManager.EndSession(cmd.SessionID); err != nil {
+			publishSessionError(ctx, topic, cmd, fmt.Sprintf("failed to end session: %v", err))
+			return
+		}
+
+	default:
+		publishSessionError(ctx, topic, cmd, fmt.Sprintf("unknown session command type: %s", cmd.Type))
+	}
+}
+
+// publishSessionError publishes an error result for a session command.
+func publishSessionError(ctx context.Context, topic *pubsub.Topic, cmd commandMsg, errMsg string) {
+	fmt.Printf("%s[session] Error: %s%s\n", colorRed, errMsg, colorReset)
+
+	res := resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		Output:      errMsg,
+		Status:      "error",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "session_error",
+		SessionID:   cmd.SessionID,
+	}
+	data, _ := json.Marshal(res)
+	if _, err := topic.Publish(ctx, &pubsub.Message{Data: data}).Get(ctx); err != nil {
+		fmt.Printf("%s[session] Failed to publish error: %v%s\n", colorRed, err, colorReset)
+	}
 }
