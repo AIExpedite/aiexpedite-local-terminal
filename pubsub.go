@@ -156,28 +156,62 @@ func isCommandStale(cmdTs int64) bool {
    Per-UID Rate Limiting
    -------------------------------------------------------------------------- */
 
+type rateLimiterEntry struct {
+	limiter    *rate.Limiter
+	lastAccess time.Time
+}
+
 var (
 	// Per-UID rate limiters: 10 commands/second with burst of 20
-	uidRateLimiters = make(map[string]*rate.Limiter)
-	uidRateMutex    sync.RWMutex
+	uidRateLimiters      = make(map[string]*rateLimiterEntry)
+	uidRateMutex         sync.RWMutex
+	rateLimiterCleanupOn sync.Once
 )
+
+// startRateLimiterCleanup launches a background goroutine that removes stale entries every 10 minutes.
+func startRateLimiterCleanup() {
+	rateLimiterCleanupOn.Do(func() {
+		go func() {
+			ticker := time.NewTicker(10 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				cutoff := time.Now().Add(-1 * time.Hour)
+				uidRateMutex.Lock()
+				for uid, entry := range uidRateLimiters {
+					if entry.lastAccess.Before(cutoff) {
+						delete(uidRateLimiters, uid)
+					}
+				}
+				uidRateMutex.Unlock()
+			}
+		}()
+	})
+}
 
 // getUIDRateLimiter returns or creates a rate limiter for the given UID
 func getUIDRateLimiter(uid string, cfg *Config) *rate.Limiter {
+	startRateLimiterCleanup()
+
+	now := time.Now()
+
 	uidRateMutex.RLock()
-	limiter, exists := uidRateLimiters[uid]
+	entry, exists := uidRateLimiters[uid]
 	uidRateMutex.RUnlock()
 
 	if exists {
-		return limiter
+		uidRateMutex.Lock()
+		entry.lastAccess = now
+		uidRateMutex.Unlock()
+		return entry.limiter
 	}
 
 	uidRateMutex.Lock()
 	defer uidRateMutex.Unlock()
 
 	// Double-check after acquiring write lock
-	if limiter, exists = uidRateLimiters[uid]; exists {
-		return limiter
+	if entry, exists = uidRateLimiters[uid]; exists {
+		entry.lastAccess = now
+		return entry.limiter
 	}
 
 	// Use config values with defaults
@@ -190,8 +224,8 @@ func getUIDRateLimiter(uid string, cfg *Config) *rate.Limiter {
 		burst = 20
 	}
 
-	limiter = rate.NewLimiter(rate.Limit(rateLimit), burst)
-	uidRateLimiters[uid] = limiter
+	limiter := rate.NewLimiter(rate.Limit(rateLimit), burst)
+	uidRateLimiters[uid] = &rateLimiterEntry{limiter: limiter, lastAccess: now}
 	return limiter
 }
 
@@ -279,6 +313,7 @@ type commandMsg struct {
 	Ts          int64    `json:"ts"`
 	AgentID     string   `json:"agentId,omitempty"`   // Target agent for signature verification
 	Signature   string   `json:"signature,omitempty"` // HMAC-SHA256 signature of command
+	TimeoutMs   int64    `json:"timeoutMs,omitempty"` // Execution timeout in milliseconds (default: 120000)
 
 	// Session fields (for interactive CLI agent sessions)
 	Type      string `json:"type,omitempty"`      // "execute"|"session_start"|"session_input"|"session_signal"|"session_end"
@@ -741,7 +776,7 @@ func runPubSubConnection(cfg *Config) error {
 			}
 
 			// Execute command (silently - no internal logs)
-			out, execErr := runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd)
+			out, execErr := runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
 
 			// Debug mode: show raw output details
 			if cfg.DebugMode {
@@ -762,18 +797,21 @@ func runPubSubConnection(cfg *Config) error {
 				fmt.Println(out)
 			}
 
+			// Redact sensitive data from output before publishing to Pub/Sub
+			redactedOut := redactSensitiveData(out)
+
 			res := resultMsg{
 				ID:          cmd.ID,
 				WorkspaceID: cmd.WorkspaceID,
 				UID:         cmd.UID,
-				Output:      out,
+				Output:      redactedOut,
 				Status:      "success",
 				Ts:          time.Now().UnixMilli(),
 				Version:     Version,
 			}
 			if execErr != nil {
 				res.Status = "error"
-				res.Output = execErr.Error() + "\n" + out
+				res.Output = redactSensitiveData(execErr.Error()) + "\n" + redactedOut
 			}
 
 			// File upload integration
@@ -922,7 +960,7 @@ func decodeBase64PowerShell(encoded string) string {
 // bypasses all shell escaping issues.
 // It captures stdout and stderr separately and filters CLIXML progress messages
 // to avoid false "exit status 1" errors when commands produce valid output.
-func runEncodedPowerShellCommand(encodedScript string, workDir string) (string, error) {
+func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout time.Duration) (string, error) {
 	// Build PowerShell arguments
 	psArgs := []string{
 		"-NoProfile",
@@ -931,7 +969,10 @@ func runEncodedPowerShellCommand(encodedScript string, workDir string) (string, 
 		encodedScript,
 	}
 
-	c := exec.Command("powershell.exe", psArgs...)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	c := exec.CommandContext(ctx, "powershell.exe", psArgs...)
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -976,8 +1017,15 @@ func runEncodedPowerShellCommand(encodedScript string, workDir string) (string, 
 	return output, finalErr
 }
 
-/* runLocalCommand executes the command using persistent PowerShell for low latency. */
-func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string, error) {
+/* runLocalCommand executes the command using persistent PowerShell for low latency.
+   timeoutMs controls the maximum execution time. If 0, defaults to 120 seconds. */
+func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {
+	// Default timeout: 120 seconds (matches server-side default)
+	if timeoutMs <= 0 {
+		timeoutMs = 120000
+	}
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+
 	// Set working directory: priority is command cwd > config default > process cwd
 	workDir := cwd
 	if workDir == "" && cfg != nil {
@@ -990,7 +1038,7 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 		strings.ToLower(args[0]) == "-encodedcommand"
 
 	if isEncodedPowerShell {
-		return runEncodedPowerShellCommand(args[1], workDir)
+		return runEncodedPowerShellCommand(args[1], workDir, timeout)
 	}
 
 	// Check if this is a regular PowerShell command with -Command that needs encoding
@@ -1003,7 +1051,7 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 		// Encode the script locally to prevent escaping issues
 		script := strings.Join(args[1:], " ")
 		encoded := encodeForPowerShell(script)
-		return runEncodedPowerShellCommand(encoded, workDir)
+		return runEncodedPowerShellCommand(encoded, workDir, timeout)
 	}
 
 	// Original behavior for non-PowerShell commands
@@ -1035,17 +1083,17 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 				cmdLine = claudePath + cmdLine[6:] // 6 = len("claude")
 			}
 		}
-		return runLocalCommandFallback(cmdLine, workDir)
+		return runLocalCommandFallback(cmdLine, workDir, timeout)
 	}
 
 	// Try persistent PowerShell first (much faster - avoids 300-800ms startup)
 	ps, err := GetPowerShell()
 	if err != nil {
 		fmt.Printf("%s[aiexpedite] Persistent PowerShell unavailable, using fallback%s\n", colorYellow, colorReset)
-		return runLocalCommandFallback(cmdLine, workDir)
+		return runLocalCommandFallback(cmdLine, workDir, timeout)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	output, err := ps.Execute(ctx, cmdLine, workDir)
@@ -1053,18 +1101,21 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 		// If persistent PS failed, try restarting it once
 		if restartErr := RestartPowerShell(); restartErr != nil {
 			fmt.Printf("%s[aiexpedite] PowerShell restart failed, using fallback%s\n", colorYellow, colorReset)
-			return runLocalCommandFallback(cmdLine, workDir)
+			return runLocalCommandFallback(cmdLine, workDir, timeout)
 		}
 
 		// Try again with fresh process
 		ps, err = GetPowerShell()
 		if err != nil {
-			return runLocalCommandFallback(cmdLine, workDir)
+			return runLocalCommandFallback(cmdLine, workDir, timeout)
 		}
 
-		output, err = ps.Execute(ctx, cmdLine, workDir)
+		ctx2, cancel2 := context.WithTimeout(context.Background(), timeout)
+		defer cancel2()
+
+		output, err = ps.Execute(ctx2, cmdLine, workDir)
 		if err != nil {
-			return runLocalCommandFallback(cmdLine, workDir)
+			return runLocalCommandFallback(cmdLine, workDir, timeout)
 		}
 	}
 
@@ -1072,8 +1123,11 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string) (string
 }
 
 // runLocalCommandFallback uses traditional process spawning (slow but reliable)
-func runLocalCommandFallback(cmdLine string, workDir string) (string, error) {
-	c := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
+func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	c := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
 	if workDir != "" {
 		c.Dir = workDir
 	}

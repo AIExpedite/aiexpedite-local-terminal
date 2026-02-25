@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.35" // Parse stream-json output into readable text for all CLI agents
+const Version = "v0.5.36" // Add execution timeout, rate limiter cleanup, output redaction
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
