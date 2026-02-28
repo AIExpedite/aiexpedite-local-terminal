@@ -67,9 +67,16 @@ func GetPowerShell() (*PersistentPowerShell, error) {
 	return ps, nil
 }
 
-// NewPersistentPowerShell creates a new persistent PowerShell process
+// NewPersistentPowerShell creates a new persistent PowerShell process.
+// Prefers pwsh.exe (PowerShell 7+) which supports && natively, falling back to powershell.exe.
 func NewPersistentPowerShell() (*PersistentPowerShell, error) {
-	cmd := exec.Command("powershell.exe",
+	psExe := "powershell.exe"
+	if _, err := exec.LookPath("pwsh.exe"); err == nil {
+		psExe = "pwsh.exe"
+		fmt.Println("[powershell] Using PowerShell 7+ (pwsh.exe)")
+	}
+
+	cmd := exec.Command(psExe,
 		"-NoProfile",
 		"-NoLogo",
 		"-NonInteractive",

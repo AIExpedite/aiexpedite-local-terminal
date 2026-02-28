@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.36" // Add execution timeout, rate limiter cleanup, output redaction
+const Version = "v0.5.37" // Route bash-style commands (&&, ||) through cmd.exe on Windows
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

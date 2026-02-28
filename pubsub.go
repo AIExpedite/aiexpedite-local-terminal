@@ -1017,6 +1017,73 @@ func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout t
 	return output, finalErr
 }
 
+/* --------------------------------------------------------------------------
+   cmd.exe Routing for Bash-Style Commands
+   On Windows, commands containing && or || are routed through cmd.exe which
+   natively supports these operators, avoiding PowerShell < 7 compatibility issues.
+   -------------------------------------------------------------------------- */
+
+// isBashStyleCommand detects commands that use bash/cmd syntax incompatible
+// with PowerShell < 7, such as && chaining or || chaining.
+func isBashStyleCommand(cmdLine string) bool {
+	return strings.Contains(cmdLine, " && ") || strings.Contains(cmdLine, " || ")
+}
+
+// isPowerShellSpecificCommand checks if a command requires PowerShell.
+// These are PowerShell cmdlets and syntax that do not work in cmd.exe.
+func isPowerShellSpecificCommand(cmd string) bool {
+	cmdLower := strings.ToLower(strings.TrimSpace(cmd))
+
+	// Already explicitly prefixed with powershell
+	if strings.HasPrefix(cmdLower, "powershell ") || strings.HasPrefix(cmdLower, "pwsh ") {
+		return true
+	}
+
+	// PowerShell cmdlets follow Verb-Noun pattern
+	psVerbs := []string{
+		"get-", "set-", "new-", "remove-", "invoke-",
+		"select-", "where-", "foreach-", "format-",
+		"write-", "read-", "test-", "start-", "stop-",
+		"import-", "export-", "add-", "clear-", "out-",
+		"measure-", "sort-", "group-", "compare-",
+		"convertto-", "convertfrom-",
+	}
+
+	// Check the first token of the command
+	firstToken := cmdLower
+	if idx := strings.IndexAny(cmdLower, " ;|"); idx != -1 {
+		firstToken = cmdLower[:idx]
+	}
+
+	for _, verb := range psVerbs {
+		if strings.HasPrefix(firstToken, verb) {
+			return true
+		}
+	}
+
+	// PowerShell-specific syntax
+	if strings.Contains(cmdLower, "$env:") || strings.Contains(cmdLower, "$_") {
+		return true
+	}
+
+	return false
+}
+
+// runViaCmdExe executes a command via cmd.exe, which natively supports
+// bash-like syntax (&& and ||) that PowerShell < 7 does not.
+func runViaCmdExe(cmdLine string, workDir string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	c := exec.CommandContext(ctx, "cmd.exe", "/C", cmdLine)
+	if workDir != "" {
+		c.Dir = workDir
+	}
+
+	out, err := c.CombinedOutput()
+	return string(out), err
+}
+
 /* runLocalCommand executes the command using persistent PowerShell for low latency.
    timeoutMs controls the maximum execution time. If 0, defaults to 120 seconds. */
 func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {
@@ -1086,6 +1153,13 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 		return runLocalCommandFallback(cmdLine, workDir, timeout)
 	}
 
+	// Route bash-style commands (containing && or ||) through cmd.exe on Windows.
+	// cmd.exe natively supports these operators while PowerShell < 7 does not.
+	if runtime.GOOS == "windows" && isBashStyleCommand(cmdLine) && !isPowerShellSpecificCommand(cmd) {
+		fmt.Printf("%s[aiexpedite] Routing bash-style command via cmd.exe%s\n", colorCyan, colorReset)
+		return runViaCmdExe(cmdLine, workDir, timeout)
+	}
+
 	// Try persistent PowerShell first (much faster - avoids 300-800ms startup)
 	ps, err := GetPowerShell()
 	if err != nil {
@@ -1122,12 +1196,18 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	return output, nil
 }
 
-// runLocalCommandFallback uses traditional process spawning (slow but reliable)
+// runLocalCommandFallback uses traditional process spawning (slow but reliable).
+// Prefers pwsh.exe (PowerShell 7+) when available for better compatibility.
 func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	c := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
+	psExe := "powershell.exe"
+	if _, err := exec.LookPath("pwsh.exe"); err == nil {
+		psExe = "pwsh.exe"
+	}
+
+	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-Command", cmdLine)
 	if workDir != "" {
 		c.Dir = workDir
 	}
