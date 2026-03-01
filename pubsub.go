@@ -168,6 +168,32 @@ var (
 	rateLimiterCleanupOn sync.Once
 )
 
+/* --------------------------------------------------------------------------
+   Tracked Working Directory
+   Persists the last known cwd across commands so that cd changes
+   are remembered even when the server sends the same default cwd.
+   -------------------------------------------------------------------------- */
+
+var (
+	trackedCwd     string
+	trackedCwdLock sync.RWMutex
+)
+
+func getTrackedCwd() string {
+	trackedCwdLock.RLock()
+	defer trackedCwdLock.RUnlock()
+	return trackedCwd
+}
+
+func setTrackedCwd(cwd string) {
+	if cwd == "" {
+		return
+	}
+	trackedCwdLock.Lock()
+	trackedCwd = cwd
+	trackedCwdLock.Unlock()
+}
+
 // startRateLimiterCleanup launches a background goroutine that removes stale entries every 10 minutes.
 func startRateLimiterCleanup() {
 	rateLimiterCleanupOn.Do(func() {
@@ -332,6 +358,7 @@ type resultMsg struct {
 	Status       string        `json:"status"` // "success" | "partial" | "error" | "denied" | "rate_limited" | "unauthorized"
 	Ts           int64         `json:"ts"`
 	Version      string        `json:"version,omitempty"`      // Terminal app version
+	Cwd          string        `json:"cwd,omitempty"`          // Current working directory after execution
 	Files        []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
 	UploadErrors []UploadError `json:"uploadErrors,omitempty"` // File upload failures
 
@@ -808,6 +835,7 @@ func runPubSubConnection(cfg *Config) error {
 				Status:      "success",
 				Ts:          time.Now().UnixMilli(),
 				Version:     Version,
+				Cwd:         getTrackedCwd(),
 			}
 			if execErr != nil {
 				res.Status = "error"
@@ -1093,10 +1121,22 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 
-	// Set working directory: priority is command cwd > config default > process cwd
+	// Set working directory with tracked cwd support:
+	// 1. If server sent an explicit cwd that differs from the config default, use it (user changed settings)
+	// 2. If server sent the same default cwd as config, prefer tracked cwd (user may have cd'd)
+	// 3. If no cwd at all, use tracked cwd or config default
 	workDir := cwd
-	if workDir == "" && cfg != nil {
-		workDir = cfg.WorkingDirectory
+	if workDir != "" && cfg != nil && strings.EqualFold(workDir, cfg.WorkingDirectory) {
+		if tc := getTrackedCwd(); tc != "" {
+			workDir = tc
+		}
+	}
+	if workDir == "" {
+		if tc := getTrackedCwd(); tc != "" {
+			workDir = tc
+		} else if cfg != nil {
+			workDir = cfg.WorkingDirectory
+		}
 	}
 
 	// Check if this is an encoded PowerShell command (already Base64 encoded by terminal-service)
@@ -1153,10 +1193,11 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 		return runLocalCommandFallback(cmdLine, workDir, timeout)
 	}
 
-	// Route bash-style commands (containing && or ||) through cmd.exe on Windows.
-	// cmd.exe natively supports these operators while PowerShell < 7 does not.
-	if runtime.GOOS == "windows" && isBashStyleCommand(cmdLine) && !isPowerShellSpecificCommand(cmd) {
-		fmt.Printf("%s[aiexpedite] Routing bash-style command via cmd.exe%s\n", colorCyan, colorReset)
+	// Route bash-style commands (containing && or ||) through cmd.exe on Windows,
+	// but only when PowerShell 7+ (pwsh.exe) is NOT available. pwsh.exe supports
+	// && natively and has ls/cat/etc. aliases that cmd.exe lacks.
+	if runtime.GOOS == "windows" && isBashStyleCommand(cmdLine) && !isPowerShellSpecificCommand(cmd) && !IsPersistentPSPwsh() {
+		fmt.Printf("%s[aiexpedite] Routing bash-style command via cmd.exe (no pwsh available)%s\n", colorCyan, colorReset)
 		return runViaCmdExe(cmdLine, workDir, timeout)
 	}
 
@@ -1191,6 +1232,11 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 		if err != nil {
 			return runLocalCommandFallback(cmdLine, workDir, timeout)
 		}
+	}
+
+	// Sync tracked cwd from persistent PowerShell's last known location
+	if newCwd := GetTrackedCwd(); newCwd != "" {
+		setTrackedCwd(newCwd)
 	}
 
 	return output, nil

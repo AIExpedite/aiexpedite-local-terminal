@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.37" // Route bash-style commands (&&, ||) through cmd.exe on Windows
+const Version = "v0.5.38" // Fix: skip cmd.exe routing when pwsh available; track cwd across commands
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

@@ -22,6 +22,8 @@ import (
 const (
 	// Unique delimiter to mark end of command output
 	psDelimiter = "<<<AIEXPEDITE_CMD_DONE_7f3d2a1b>>>"
+	// Unique marker to separate cwd from command output
+	psCwdMarker = "<<<AIEXPEDITE_CWD_7f3d2a1b>>>"
 	// Timeout for health check commands
 	psHealthTimeout = 5 * time.Second
 	// Maximum time for a single command execution
@@ -37,6 +39,8 @@ type PersistentPowerShell struct {
 	mutex    sync.Mutex
 	healthy  bool
 	lastUsed time.Time
+	isPwsh   bool   // true if using pwsh.exe (PowerShell 7+, supports && natively)
+	lastCwd  string // last known working directory of this PS process
 }
 
 var (
@@ -113,6 +117,7 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 		stderr:   stderr,
 		healthy:  true,
 		lastUsed: time.Now(),
+		isPwsh:   psExe == "pwsh.exe",
 	}
 
 	// Verify process is responsive with a health check
@@ -125,7 +130,9 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 	return ps, nil
 }
 
-// Execute runs a command and returns the output
+// Execute runs a command and returns the output.
+// Tracks the working directory across calls — only issues Set-Location when
+// the requested cwd differs from where the process already is.
 func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd string) (string, error) {
 	ps.mutex.Lock()
 	defer ps.mutex.Unlock()
@@ -140,8 +147,8 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	// We wrap everything to ensure delimiter is always printed, even on errors
 	var fullCmd strings.Builder
 
-	if cwd != "" {
-		// Change to working directory first (escape single quotes)
+	// Only Set-Location when the requested cwd is new and different from where we already are
+	if cwd != "" && !strings.EqualFold(cwd, ps.lastCwd) {
 		escapedCwd := strings.ReplaceAll(cwd, "'", "''")
 		fullCmd.WriteString(fmt.Sprintf("Set-Location -LiteralPath '%s'; ", escapedCwd))
 	}
@@ -149,8 +156,9 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	// Execute the command and capture any errors
 	fullCmd.WriteString(command)
 
-	// Always print delimiter at end (with newline before to ensure it's on its own line)
-	fullCmd.WriteString(fmt.Sprintf("; Write-Host ''; Write-Host '%s'", psDelimiter))
+	// After the command, emit cwd marker + current location for tracking, then delimiter
+	fullCmd.WriteString(fmt.Sprintf("; Write-Host ''; Write-Host '%s'; (Get-Location).Path | Write-Host; Write-Host '%s'",
+		psCwdMarker, psDelimiter))
 
 	// Send command to PowerShell
 	_, err := fmt.Fprintln(ps.stdin, fullCmd.String())
@@ -159,12 +167,19 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		return "", fmt.Errorf("failed to send command: %w", err)
 	}
 
-	// Read output until delimiter with timeout
-	outputChan := make(chan string, 1)
+	// Read output until delimiter with timeout, stripping cwd marker lines
+	type execResult struct {
+		output string
+		newCwd string
+	}
+	resultChan := make(chan execResult, 1)
 	errChan := make(chan error, 1)
 
 	go func() {
 		var output strings.Builder
+		var newCwd string
+		cwdMarkerSeen := false
+
 		for {
 			line, err := ps.stdout.ReadString('\n')
 			if err != nil {
@@ -173,10 +188,23 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 			}
 
 			line = strings.TrimRight(line, "\r\n")
+
 			if line == psDelimiter {
-				outputChan <- output.String()
+				resultChan <- execResult{output: output.String(), newCwd: newCwd}
 				return
 			}
+
+			// Detect and capture cwd marker sequence
+			if line == psCwdMarker {
+				cwdMarkerSeen = true
+				continue
+			}
+			if cwdMarkerSeen {
+				newCwd = line
+				cwdMarkerSeen = false
+				continue
+			}
+
 			if output.Len() > 0 {
 				output.WriteString("\r\n")
 			}
@@ -186,8 +214,11 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 
 	// Wait with timeout
 	select {
-	case output := <-outputChan:
-		return output, nil
+	case result := <-resultChan:
+		if result.newCwd != "" {
+			ps.lastCwd = result.newCwd
+		}
+		return result.output, nil
 	case err := <-errChan:
 		ps.healthy = false
 		return "", fmt.Errorf("failed to read output: %w", err)
@@ -289,4 +320,22 @@ func ShutdownPowerShell() {
 		globalPS.Close()
 		globalPS = nil
 	}
+}
+
+// IsPersistentPSPwsh returns true if the global persistent PowerShell uses pwsh.exe (PS 7+).
+// Used to decide whether bash-style commands (&&, ||) can be routed through PS instead of cmd.exe.
+func IsPersistentPSPwsh() bool {
+	globalPSLock.Lock()
+	defer globalPSLock.Unlock()
+	return globalPS != nil && globalPS.healthy && globalPS.isPwsh
+}
+
+// GetTrackedCwd returns the last known working directory from the global persistent PowerShell.
+func GetTrackedCwd() string {
+	globalPSLock.Lock()
+	defer globalPSLock.Unlock()
+	if globalPS != nil && globalPS.healthy {
+		return globalPS.lastCwd
+	}
+	return ""
 }
