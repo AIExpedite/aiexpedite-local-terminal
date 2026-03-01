@@ -153,11 +153,14 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		fullCmd.WriteString(fmt.Sprintf("Set-Location -LiteralPath '%s'; ", escapedCwd))
 	}
 
-	// Execute the command and capture any errors
-	fullCmd.WriteString(command)
+	// Wrap user command in a script block so && / || operators inside the command
+	// don't consume the delimiter. Without this, PowerShell's operator precedence
+	// causes `cmd1 && cmd2; Write-Host DELIMITER` to skip the delimiter when cmd1 fails.
+	fullCmd.WriteString(fmt.Sprintf("& { %s }", command))
 
-	// After the command, emit cwd marker + current location for tracking, then delimiter
-	fullCmd.WriteString(fmt.Sprintf("; Write-Host ''; Write-Host '%s'; (Get-Location).Path | Write-Host; Write-Host '%s'",
+	// Use newlines (not ;) to separate delimiter lines — newlines are unconditional
+	// statement separators that cannot be captured by && or || operators.
+	fullCmd.WriteString(fmt.Sprintf("\nWrite-Host ''\nWrite-Host '%s'\n(Get-Location).Path | Write-Host\nWrite-Host '%s'",
 		psCwdMarker, psDelimiter))
 
 	// Send command to PowerShell

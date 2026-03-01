@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.38" // Fix: skip cmd.exe routing when pwsh available; track cwd across commands
+const Version = "v0.5.39" // Fix: wrap commands in script block to prevent && from swallowing delimiter
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
