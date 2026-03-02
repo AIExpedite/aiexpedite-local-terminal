@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.57" // Fix: cap persistent-PS output builder at 10 MB to prevent RAM exhaustion
+const Version = "v0.5.58" // Fix: reset $LASTEXITCODE=0 before each PS command to prevent stale exit code false failures
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

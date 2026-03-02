@@ -169,6 +169,15 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		fullCmd.WriteString(fmt.Sprintf("Set-Location -LiteralPath '%s'; ", escapedCwd))
 	}
 
+	// Reset $LASTEXITCODE to 0 before running the user command.
+	// PowerShell only updates $LASTEXITCODE when a native executable is invoked;
+	// pure-cmdlet commands (Write-Host, Get-ChildItem, etc.) leave it unchanged.
+	// On a fresh pwsh.exe session the value can be 1 (from internal startup steps),
+	// which would cause every cmdlet-only command to be reported as a failure.
+	// Resetting here means $LASTEXITCODE correctly reflects the external-process
+	// result of this command, not of some earlier unrelated invocation.
+	fullCmd.WriteString("$LASTEXITCODE = 0\n")
+
 	// Wrap user command in a script block so && / || operators inside the command
 	// don't consume the delimiter. Without this, PowerShell's operator precedence
 	// causes `cmd1 && cmd2; Write-Host DELIMITER` to skip the delimiter when cmd1 fails.
