@@ -363,9 +363,17 @@ func showConsoleWindow(show bool) {
 
 // monitorConsoleMinimize watches for minimize events and hides console to tray.
 // This runs as a goroutine and polls the window state periodically.
+// Exits when shutdownChan is closed to prevent a leaked goroutine on app exit.
 func monitorConsoleMinimize() {
+	ticker := time.NewTicker(100 * time.Millisecond) // 10 checks per second
+	defer ticker.Stop()
+
 	for {
-		time.Sleep(100 * time.Millisecond) // Check 10 times per second
+		select {
+		case <-shutdownChan:
+			return
+		case <-ticker.C:
+		}
 
 		if !consoleAllocated {
 			continue

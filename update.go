@@ -12,10 +12,18 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/getlantern/systray"
 	"golang.org/x/mod/semver"
 )
+
+// updateHTTPClient is used for quick GitHub API metadata calls (60s timeout).
+var updateHTTPClient = &http.Client{Timeout: 60 * time.Second}
+
+// updateDownloadClient is used for binary asset downloads, which may be large
+// and require more time. 10-minute timeout prevents indefinite hangs.
+var updateDownloadClient = &http.Client{Timeout: 10 * time.Minute}
 
 const githubRepo = "AIExpedite/aiexpedite-local-terminal"
 
@@ -51,7 +59,7 @@ func checkForNewVersion() (*UpdateInfo, error) {
 		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
 	}
 
-	resp, err := http.Get(url)
+	resp, err := updateHTTPClient.Get(url)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +81,9 @@ func checkForNewVersion() (*UpdateInfo, error) {
 			URL  string `json:"browser_download_url"`
 		} `json:"assets"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	// Limit response body to 1 MB to guard against unexpectedly large or
+	// malformed responses from the GitHub API endpoint.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&rel); err != nil {
 		return nil, err
 	}
 
@@ -146,9 +156,16 @@ func downloadAndApplyUpdate(info *UpdateInfo) error {
 	if err != nil {
 		return err
 	}
-	defer tmp.Close()
+	// Clean up the temp file on any error path; on success updatePath takes ownership.
+	success := false
+	defer func() {
+		tmp.Close()
+		if !success {
+			os.Remove(tmp.Name())
+		}
+	}()
 
-	resp, err := http.Get(info.AssetURL)
+	resp, err := updateDownloadClient.Get(info.AssetURL) //nolint:gosec // URL comes from authenticated GitHub API response
 	if err != nil {
 		return err
 	}
@@ -163,8 +180,8 @@ func downloadAndApplyUpdate(info *UpdateInfo) error {
 	fmt.Printf("→ Downloaded (SHA-256: %s)\n", hex.EncodeToString(h.Sum(nil)))
 
 	// Set global state for restart
-	updatePath = tmp.Name()
-	updatePending = true
+	success = true // temp file is now owned by the update path; don't delete on defer
+	SetUpdateReady(tmp.Name())
 
 	fmt.Println("→ Restarting with new version...")
 	systray.Quit() // graceful restart

@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.39" // Fix: wrap commands in script block to prevent && from swallowing delimiter
+const Version = "v0.5.50" // Fix: session stream flushBatch blocking select loop on slow Pub/Sub publish
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -27,6 +27,7 @@ var (
 	offlineMutex  sync.RWMutex
 	updatePath    string
 	updatePending bool
+	updateMutex   sync.RWMutex
 
 	// Pending update state (when user clicks "Later")
 	pendingUpdateInfo  *UpdateInfo
@@ -57,16 +58,16 @@ func SetOffline(offline bool) {
 	isOffline = offline
 	offlineMutex.Unlock()
 
-	// Non-blocking send to signal the change
+	// Non-blocking send to signal the change.
+	// Drain any stale value first, then attempt to send — all non-blocking so
+	// concurrent callers cannot deadlock on the capacity-1 channel.
+	select {
+	case <-offlineChan:
+	default:
+	}
 	select {
 	case offlineChan <- offline:
 	default:
-		// Channel already has a pending value, drain and send new
-		select {
-		case <-offlineChan:
-		default:
-		}
-		offlineChan <- offline
 	}
 }
 
@@ -101,6 +102,23 @@ func ClearPendingUpdate() {
 	pendingUpdateMutex.Lock()
 	pendingUpdateInfo = nil
 	pendingUpdateMutex.Unlock()
+}
+
+// SetUpdateReady stores the path of the downloaded update binary and marks the
+// update as pending.  Called from the auto-update goroutine before systray.Quit().
+func SetUpdateReady(path string) {
+	updateMutex.Lock()
+	updatePath = path
+	updatePending = true
+	updateMutex.Unlock()
+}
+
+// GetUpdateReady returns the pending update path and whether an update is ready.
+// Safe to call from any goroutine.
+func GetUpdateReady() (path string, pending bool) {
+	updateMutex.RLock()
+	defer updateMutex.RUnlock()
+	return updatePath, updatePending
 }
 
 /*──────────────────────────────  StartAgent  ──────────────────────────────*/

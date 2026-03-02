@@ -152,7 +152,9 @@ func UploadFile(
 
 	// Copy file data
 	if _, err := io.Copy(writer, file); err != nil {
-		writer.Close()
+		// Close the writer to release the GCS connection; ignore the close error
+		// here since the copy error is the root cause we want to surface.
+		_ = writer.Close()
 		return FileInfo{}, fmt.Errorf("failed to upload: %w", err)
 	}
 

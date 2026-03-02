@@ -138,8 +138,12 @@ func patternToRegex(pattern string) *regexp.Regexp {
 
 	re, err := regexp.Compile("(?i)" + escaped) // Case insensitive
 	if err != nil {
-		// Fallback to literal match if regex fails
-		return regexp.MustCompile("(?i)^" + regexp.QuoteMeta(pattern) + "$")
+		// Fallback 1: literal exact match — regexp.QuoteMeta output is always valid
+		if literal, err2 := regexp.Compile("(?i)^" + regexp.QuoteMeta(pattern) + "$"); err2 == nil {
+			return literal
+		}
+		// Fallback 2: never-match regex — safer than a panic that disables the whole allow list
+		return regexp.MustCompile(`\A\Z`) // matches only the empty string at start/end (never matches a command)
 	}
 	return re
 }

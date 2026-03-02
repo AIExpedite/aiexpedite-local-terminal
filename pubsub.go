@@ -23,6 +23,7 @@ import (
 
 	"cloud.google.com/go/pubsub"
 	"github.com/getlantern/systray"
+	"golang.org/x/mod/semver"
 	"golang.org/x/oauth2"
 	"golang.org/x/time/rate"
 	"google.golang.org/api/option"
@@ -142,14 +143,17 @@ func redactCommandForLog(cmd string, args []string) string {
 // the terminal reconnects after being offline.
 const maxCommandAgeSec = 60 // 1 minute
 
-// isCommandStale checks if a command's timestamp is older than maxCommandAgeSec
+// isCommandStale checks if a command's timestamp is older than maxCommandAgeSec.
+// Also rejects commands with future-dated timestamps (clock skew > 60 s) to
+// prevent an attacker from bypassing the staleness check with a far-future ts.
 func isCommandStale(cmdTs int64) bool {
 	if cmdTs == 0 {
 		return false // No timestamp - allow for backwards compatibility
 	}
 	now := time.Now().UnixMilli()
 	ageMs := now - cmdTs
-	return ageMs > int64(maxCommandAgeSec*1000)
+	// Reject if too old OR if more than 60 s in the future (abnormal clock skew)
+	return ageMs > int64(maxCommandAgeSec*1000) || ageMs < -int64(maxCommandAgeSec*1000)
 }
 
 /* --------------------------------------------------------------------------
@@ -195,20 +199,26 @@ func setTrackedCwd(cwd string) {
 }
 
 // startRateLimiterCleanup launches a background goroutine that removes stale entries every 10 minutes.
+// The goroutine exits when shutdownChan is closed.
 func startRateLimiterCleanup() {
 	rateLimiterCleanupOn.Do(func() {
 		go func() {
 			ticker := time.NewTicker(10 * time.Minute)
 			defer ticker.Stop()
-			for range ticker.C {
-				cutoff := time.Now().Add(-1 * time.Hour)
-				uidRateMutex.Lock()
-				for uid, entry := range uidRateLimiters {
-					if entry.lastAccess.Before(cutoff) {
-						delete(uidRateLimiters, uid)
+			for {
+				select {
+				case <-ticker.C:
+					cutoff := time.Now().Add(-1 * time.Hour)
+					uidRateMutex.Lock()
+					for uid, entry := range uidRateLimiters {
+						if entry.lastAccess.Before(cutoff) {
+							delete(uidRateLimiters, uid)
+						}
 					}
+					uidRateMutex.Unlock()
+				case <-shutdownChan:
+					return
 				}
-				uidRateMutex.Unlock()
 			}
 		}()
 	})
@@ -220,24 +230,33 @@ func getUIDRateLimiter(uid string, cfg *Config) *rate.Limiter {
 
 	now := time.Now()
 
+	// Fast path: check under read lock first.
 	uidRateMutex.RLock()
 	entry, exists := uidRateLimiters[uid]
 	uidRateMutex.RUnlock()
 
 	if exists {
+		// lastAccess is updated under the write lock below to avoid a separate
+		// lock acquisition that could race with eviction or concurrent creates.
 		uidRateMutex.Lock()
-		entry.lastAccess = now
-		uidRateMutex.Unlock()
-		return entry.limiter
-	}
+		// Re-check: entry may have been evicted between the RUnlock and Lock.
+		if e, ok := uidRateLimiters[uid]; ok {
+			e.lastAccess = now
+			uidRateMutex.Unlock()
+			return e.limiter
+		}
+		// Entry was evicted — fall through to create a new one below
+		// (mutex is still held; do not unlock before the creation block)
+		defer uidRateMutex.Unlock()
+	} else {
+		uidRateMutex.Lock()
+		defer uidRateMutex.Unlock()
 
-	uidRateMutex.Lock()
-	defer uidRateMutex.Unlock()
-
-	// Double-check after acquiring write lock
-	if entry, exists = uidRateLimiters[uid]; exists {
-		entry.lastAccess = now
-		return entry.limiter
+		// Double-check after acquiring write lock
+		if entry, exists = uidRateLimiters[uid]; exists {
+			entry.lastAccess = now
+			return entry.limiter
+		}
 	}
 
 	// Use config values with defaults
@@ -248,6 +267,22 @@ func getUIDRateLimiter(uid string, cfg *Config) *rate.Limiter {
 	burst := cfg.RateLimitBurst
 	if burst <= 0 {
 		burst = 20
+	}
+
+	// Safety cap: evict one entry if the map exceeds the limit.
+	// Prevents unbounded memory growth when many distinct UIDs are seen.
+	// Use a random eviction (first key in Go's randomised map iteration) rather
+	// than a full O(N) scan for the oldest entry: at 10,000 entries a linear scan
+	// under the write lock would block all concurrent message handlers for an
+	// observable period.  Random eviction is good enough — the background cleanup
+	// goroutine (startRateLimiterCleanup) removes genuinely stale entries every
+	// 10 minutes, so in practice the cap is only hit by unusual traffic patterns.
+	const maxRateLimiterEntries = 10000
+	if len(uidRateLimiters) >= maxRateLimiterEntries {
+		for evictUID := range uidRateLimiters {
+			delete(uidRateLimiters, evictUID)
+			break
+		}
 	}
 
 	limiter := rate.NewLimiter(rate.Limit(rateLimit), burst)
@@ -491,6 +526,21 @@ func StartPubSubLoop(cfg *Config) {
 	}
 }
 
+// publishMsg marshals res and publishes it on topic using ctx.
+// Logs and returns any error so callers can decide whether to ack or nack.
+func publishMsg(ctx context.Context, topic *pubsub.Topic, res resultMsg) error {
+	bytes, err := json.Marshal(res)
+	if err != nil {
+		fmt.Printf("%s[aiexpedite] Failed to marshal result: %v%s\n", colorRed, err, colorReset)
+		return err
+	}
+	if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
+		fmt.Printf("%s[aiexpedite] Publish error: %v%s\n", colorRed, err, colorReset)
+		return err
+	}
+	return nil
+}
+
 /* --------------------------------------------------------------------------
    runPubSubConnection – handles a single connection attempt
    Returns nil on clean shutdown, error on connection failure
@@ -499,7 +549,9 @@ func runPubSubConnection(cfg *Config) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Listen for shutdown or offline signal
+	// Listen for shutdown or offline signal.
+	// ctx.Done() arm ensures this goroutine exits when the connection ends
+	// normally (e.g. sub.Receive returns), preventing a goroutine leak.
 	go func() {
 		select {
 		case <-shutdownChan:
@@ -515,6 +567,8 @@ func runPubSubConnection(cfg *Config) error {
 				default:
 				}
 			}
+		case <-ctx.Done():
+			// Connection ended cleanly; nothing to do, just exit.
 		}
 	}()
 
@@ -570,6 +624,17 @@ func runPubSubConnection(cfg *Config) error {
 				}
 			}()
 
+			// Reject oversized messages before parsing — a normal command payload is
+			// well under 1 KB; 64 KB is a generous cap that rules out memory exhaustion
+			// from malformed or unexpectedly large Pub/Sub messages.
+			const maxMessageSize = 64 * 1024 // 64 KB
+			if len(m.Data) > maxMessageSize {
+				fmt.Printf("%s[aiexpedite] Oversized message rejected (%d bytes)%s\n",
+					colorRed, len(m.Data), colorReset)
+				m.Ack() // Ack so it isn't redelivered forever
+				return
+			}
+
 			// Parse command silently (verbose logging removed in v0.4.12)
 			var cmd commandMsg
 			if err := json.Unmarshal(m.Data, &cmd); err != nil {
@@ -596,11 +661,11 @@ func runPubSubConnection(cfg *Config) error {
 					Ts:          time.Now().UnixMilli(),
 					Version:     Version,
 				}
-				bytes, _ := json.Marshal(res)
-				if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
-					fmt.Println("[pubsub] publish error:", err)
+				if err := publishMsg(ctx, topic, res); err != nil {
+					m.Nack()
+				} else {
+					m.Ack()
 				}
-				m.Ack()
 				return
 			}
 			// ─────────────────────────────────────────────────────────────────
@@ -619,11 +684,11 @@ func runPubSubConnection(cfg *Config) error {
 					Ts:          time.Now().UnixMilli(),
 					Version:     Version,
 				}
-				bytes, _ := json.Marshal(res)
-				if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
-					fmt.Println("[pubsub] publish error:", err)
+				if err := publishMsg(ctx, topic, res); err != nil {
+					m.Nack()
+				} else {
+					m.Ack()
 				}
-				m.Ack()
 				return
 			}
 			// ─────────────────────────────────────────────────────────────────
@@ -643,11 +708,11 @@ func runPubSubConnection(cfg *Config) error {
 						Ts:          time.Now().UnixMilli(),
 						Version:     Version,
 					}
-					bytes, _ := json.Marshal(res)
-					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
-						fmt.Println("[pubsub] publish error:", err)
+					if err := publishMsg(ctx, topic, res); err != nil {
+						m.Nack()
+					} else {
+						m.Ack()
 					}
-					m.Ack()
 					return
 				}
 
@@ -663,11 +728,11 @@ func runPubSubConnection(cfg *Config) error {
 						Ts:          time.Now().UnixMilli(),
 						Version:     Version,
 					}
-					bytes, _ := json.Marshal(res)
-					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
-						fmt.Println("[pubsub] publish error:", err)
+					if err := publishMsg(ctx, topic, res); err != nil {
+						m.Nack()
+					} else {
+						m.Ack()
 					}
-					m.Ack()
 					return
 				}
 
@@ -682,11 +747,11 @@ func runPubSubConnection(cfg *Config) error {
 						Ts:          time.Now().UnixMilli(),
 						Version:     Version,
 					}
-					bytes, _ := json.Marshal(res)
-					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
-						fmt.Println("[pubsub] publish error:", err)
+					if err := publishMsg(ctx, topic, res); err != nil {
+						m.Nack()
+					} else {
+						m.Ack()
 					}
-					m.Ack()
 					return
 				}
 				// Signature verified - proceed silently
@@ -707,8 +772,7 @@ func runPubSubConnection(cfg *Config) error {
 					Ts:          time.Now().UnixMilli(),
 					Version:     Version,
 				}
-				bytes, _ := json.Marshal(res)
-				if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
+				if err := publishMsg(ctx, topic, res); err != nil {
 					fmt.Printf("%s[aiexpedite] Ping publish error: %v%s\n", colorRed, err, colorReset)
 				}
 				m.Ack()
@@ -757,11 +821,11 @@ func runPubSubConnection(cfg *Config) error {
 						Ts:          time.Now().UnixMilli(),
 						Version:     Version,
 					}
-					bytes, _ := json.Marshal(res)
-					if _, err := topic.Publish(ctx, &pubsub.Message{Data: bytes}).Get(ctx); err != nil {
-						fmt.Println("[pubsub] publish error:", err)
+					if err := publishMsg(ctx, topic, res); err != nil {
+						m.Nack()
+					} else {
+						m.Ack()
 					}
-					m.Ack()
 					return
 
 				case ApprovalAlways:
@@ -788,40 +852,42 @@ func runPubSubConnection(cfg *Config) error {
 					cmdDisplay = decodeBase64PowerShell(cmd.Args[1])
 				}
 			}
-			// In debug mode, show full command; otherwise redact sensitive data
-			if cfg.DebugMode {
-				fmt.Printf("%s> %s%s\n", colorGreen, cmdDisplay, colorReset)
-			} else {
-				fmt.Printf("%s> %s%s\n", colorGreen, redactSensitiveData(cmdDisplay), colorReset)
-			}
+			// Always redact sensitive data before printing — debug mode shows more
+			// detail but still must not leak credentials to the console.
+			fmt.Printf("%s> %s%s\n", colorGreen, redactSensitiveData(cmdDisplay), colorReset)
 
-			// Debug mode: show raw command details
+			// Debug mode: show raw command details (redacted)
 			if cfg.DebugMode {
-				fmt.Printf("%s[DEBUG] Raw command: %s%s\n", colorMagenta, cmd.Command, colorReset)
-				fmt.Printf("%s[DEBUG] Args: %v%s\n", colorMagenta, cmd.Args, colorReset)
+				redactedArgs := make([]string, len(cmd.Args))
+				for i, a := range cmd.Args {
+					redactedArgs[i] = redactSensitiveData(a)
+				}
+				fmt.Printf("%s[DEBUG] Raw command: %s%s\n", colorMagenta, redactSensitiveData(cmd.Command), colorReset)
+				fmt.Printf("%s[DEBUG] Args: %v%s\n", colorMagenta, redactedArgs, colorReset)
 				fmt.Printf("%s[DEBUG] Cwd: %s%s\n", colorMagenta, cmd.Cwd, colorReset)
 			}
 
 			// Execute command (silently - no internal logs)
 			out, execErr := runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
 
-			// Debug mode: show raw output details
+			// Debug mode: show raw output details (redacted)
 			if cfg.DebugMode {
 				fmt.Printf("%s[DEBUG] Output length: %d bytes%s\n", colorMagenta, len(out), colorReset)
 				fmt.Printf("%s[DEBUG] Error: %v%s\n", colorMagenta, execErr, colorReset)
-				// Show raw output with visible control characters
-				fmt.Printf("%s[DEBUG] Raw output (quoted): %q%s\n", colorMagenta, out, colorReset)
+				// Show raw output with visible control characters (redacted)
+				fmt.Printf("%s[DEBUG] Raw output (quoted): %q%s\n", colorMagenta, redactSensitiveData(out), colorReset)
 			}
 
-			// Show output or terminal error
+			// Show output or terminal error — always redact before printing to
+			// the local console so that credentials in error messages (e.g. a
+			// failed psql connection string) are never written to the screen.
 			if execErr != nil {
-				// Terminal error - shown in red without [aiexpedite] prefix
-				fmt.Printf("%s%v%s\n", colorRed, execErr, colorReset)
+				fmt.Printf("%s%s%s\n", colorRed, redactSensitiveData(execErr.Error()), colorReset)
 				if out != "" {
-					fmt.Println(out)
+					fmt.Println(redactSensitiveData(out))
 				}
 			} else if out != "" {
-				fmt.Println(out)
+				fmt.Println(redactSensitiveData(out))
 			}
 
 			// Redact sensitive data from output before publishing to Pub/Sub
@@ -844,7 +910,14 @@ func runPubSubConnection(cfg *Config) error {
 
 			// File upload integration
 			if cfg.EnableFileUpload && res.Status != "error" {
-				files := detectOutputFiles(cmd.Command, out)
+				effectiveDir := getTrackedCwd()
+				if effectiveDir == "" {
+					effectiveDir = cmd.Cwd
+				}
+				if effectiveDir == "" && cfg != nil {
+					effectiveDir = cfg.WorkingDirectory
+				}
+				files := detectOutputFiles(cmd.Command, out, effectiveDir)
 				if len(files) > 0 {
 					// Security: Block file upload if workspaceID is missing
 					workspaceID := extractWorkspaceID(cmd)
@@ -854,8 +927,16 @@ func runPubSubConnection(cfg *Config) error {
 						fmt.Printf("[file-upload] Detected %d output files, uploading to GCS (workspace: %s)...\n", len(files), workspaceID)
 
 						// Get reusable GCS client (much faster than creating per command)
-						storageClient, storageErr := GetStorageClient(ctx)
+						// Use a background context for uploads: the message handler ctx may be
+						// cancelled mid-upload by the Pub/Sub library if acknowledgement takes
+						// too long, which would silently abort the transfer.
+						uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+						// Explicit call rather than defer: defer inside the sub.Receive
+						// callback goroutine would not fire until the receive loop exits,
+						// leaking the context for the entire Pub/Sub connection lifetime.
+						storageClient, storageErr := GetStorageClient(uploadCtx)
 						if storageErr != nil {
+							uploadCancel()
 							fmt.Printf("[file-upload] Failed to get storage client: %v\n", storageErr)
 						} else {
 							// Don't close - client is reused globally
@@ -865,7 +946,7 @@ func runPubSubConnection(cfg *Config) error {
 
 							// Upload files
 							uploadResult := UploadFiles(
-								ctx,
+								uploadCtx,
 								storageClient,
 								cfg.StorageBucket,
 								files,
@@ -873,6 +954,7 @@ func runPubSubConnection(cfg *Config) error {
 								cmd.ID,
 								logger,
 							)
+							uploadCancel()
 
 							res.Files = uploadResult.Successful
 							res.UploadErrors = uploadResult.Failed
@@ -891,14 +973,18 @@ func runPubSubConnection(cfg *Config) error {
 				}
 			}
 
-			bytes, _ := json.Marshal(res)
-			// Publish result using a background context to ensure delivery even during shutdown.
-			// The message handler's ctx may be cancelled, but we still want to send the response.
+			// Publish result using a background context to ensure delivery even during
+			// shutdown — the message handler's ctx may be cancelled before we finish.
+			// Explicit cancel (not defer): defer inside sub.Receive callback goroutines
+			// does not fire until the receive loop exits, leaking the context.
 			publishCtx, publishCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if _, err := topic.Publish(publishCtx, &pubsub.Message{Data: bytes}).Get(publishCtx); err != nil {
-				fmt.Printf("%s[aiexpedite] Publish error: %v%s\n", colorRed, err, colorReset)
-			}
+			pubErr := publishMsg(publishCtx, topic, res)
 			publishCancel()
+			if pubErr != nil {
+				// Publish failed — Nack so Pub/Sub redelivers and the agent retries.
+				m.Nack()
+				return
+			}
 			m.Ack()
 	})
 
@@ -1024,20 +1110,18 @@ func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout t
 		output += "\n" + filteredStderr
 	}
 
-	// Determine if this is a real error
+	// Determine if this is a real error.
+	// Only suppress the error when stderr contains nothing but CLIXML (PS
+	// progress/verbose noise) — that is cosmetic, not a real failure.
+	// Previously this also suppressed errors when stdout had content, which
+	// masked real failures (e.g. a failed `cd` that still printed something).
 	var finalErr error
 	if err != nil {
 		hasOnlyCLIXML := stderrStr != "" && strings.TrimSpace(filteredStderr) == ""
-		hasMeaningfulOutput := strings.TrimSpace(stdoutStr) != ""
-
-		if hasOnlyCLIXML && hasMeaningfulOutput {
-			// CLIXML on stderr but valid stdout - not a real error
-			finalErr = nil
-		} else if hasMeaningfulOutput {
-			// Has output despite error - return output
+		if hasOnlyCLIXML {
+			// CLIXML-only stderr is cosmetic noise — not a real error
 			finalErr = nil
 		} else {
-			// Real error - no useful output
 			finalErr = err
 		}
 	}
@@ -1097,13 +1181,15 @@ func isPowerShellSpecificCommand(cmd string) bool {
 	return false
 }
 
-// runViaCmdExe executes a command via cmd.exe, which natively supports
-// bash-like syntax (&& and ||) that PowerShell < 7 does not.
-func runViaCmdExe(cmdLine string, workDir string, timeout time.Duration) (string, error) {
+// runViaShell executes a bash-style (&&/||) command on Windows when pwsh is
+// unavailable. Uses powershell.exe rather than cmd.exe so that a failed `cd`
+// (e.g. to a non-existent path) sets a non-zero exit code and the error
+// propagates — cmd.exe's `cd` exits 0 even on failure, masking the problem.
+func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	c := exec.CommandContext(ctx, "cmd.exe", "/C", cmdLine)
+	c := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -1162,12 +1248,14 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	}
 
 	// Original behavior for non-PowerShell commands
-	// Construct the full command line
+	// Construct the full command line, quoting args that contain spaces or
+	// special shell characters that PowerShell would misinterpret.
 	cmdLine := cmd
 	if len(args) > 0 {
 		for _, arg := range args {
-			if containsSpace(arg) {
-				cmdLine += " \"" + arg + "\""
+			if needsQuoting(arg) {
+				// Escape embedded double-quotes by doubling them, then wrap in quotes.
+				cmdLine += " \"" + strings.ReplaceAll(arg, "\"", "\"\"") + "\""
 			} else {
 				cmdLine += " " + arg
 			}
@@ -1178,14 +1266,14 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	// that doesn't work with persistent PowerShell stdin pipes.
 	// Always spawn a new powershell.exe process for these commands.
 	cmdLower := strings.ToLower(cmd)
-	isCLIAgent := cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude ") ||
-		cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex ") ||
-		cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini ")
+	isCLIAgent := cmdLower == "claude" || cmdLower == "codex" || cmdLower == "gemini"
 	if isCLIAgent {
 		fmt.Printf("%s[aiexpedite] Using dedicated process for CLI agent: %s%s\n", colorCyan, cmd, colorReset)
-		// Resolve full path for claude since it may not be in fallback PowerShell's PATH
+		// Resolve full path for claude since it may not be in fallback PowerShell's PATH.
+		// Result is cached after the first resolution to avoid repeated PATH lookups and
+		// filesystem scans on every Claude command.
 		if strings.HasPrefix(cmdLower, "claude") {
-			claudePath := resolveClaudePath()
+			claudePath := cachedResolveClaudePath()
 			if claudePath != "" && claudePath != "claude" {
 				cmdLine = claudePath + cmdLine[6:] // 6 = len("claude")
 			}
@@ -1198,7 +1286,7 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	// && natively and has ls/cat/etc. aliases that cmd.exe lacks.
 	if runtime.GOOS == "windows" && isBashStyleCommand(cmdLine) && !isPowerShellSpecificCommand(cmd) && !IsPersistentPSPwsh() {
 		fmt.Printf("%s[aiexpedite] Routing bash-style command via cmd.exe (no pwsh available)%s\n", colorCyan, colorReset)
-		return runViaCmdExe(cmdLine, workDir, timeout)
+		return runViaShell(cmdLine, workDir, timeout)
 	}
 
 	// Try persistent PowerShell first (much faster - avoids 300-800ms startup)
@@ -1213,22 +1301,27 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 
 	output, err := ps.Execute(ctx, cmdLine, workDir)
 	if err != nil {
-		// If persistent PS failed, try restarting it once
+		// ExitCodeError means the command ran but exited non-zero — the PS
+		// process itself is fine, so don't restart or retry.
+		if _, isExitErr := err.(*ExitCodeError); isExitErr {
+			return output, err
+		}
+
+		// Process-level failure: try restarting PS once then retry.
 		if restartErr := RestartPowerShell(); restartErr != nil {
 			fmt.Printf("%s[aiexpedite] PowerShell restart failed, using fallback%s\n", colorYellow, colorReset)
 			return runLocalCommandFallback(cmdLine, workDir, timeout)
 		}
 
-		// Try again with fresh process
 		ps, err = GetPowerShell()
 		if err != nil {
 			return runLocalCommandFallback(cmdLine, workDir, timeout)
 		}
 
-		ctx2, cancel2 := context.WithTimeout(context.Background(), timeout)
-		defer cancel2()
-
-		output, err = ps.Execute(ctx2, cmdLine, workDir)
+		// Reuse the original context so the retry does not exceed the
+		// caller-requested timeout.  Creating a fresh full-timeout context here
+		// could allow the command to run for up to 2× the requested duration.
+		output, err = ps.Execute(ctx, cmdLine, workDir)
 		if err != nil {
 			return runLocalCommandFallback(cmdLine, workDir, timeout)
 		}
@@ -1242,24 +1335,78 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	return output, nil
 }
 
+// fallbackPSExe caches the resolved PowerShell executable path so that
+// runLocalCommandFallback does not re-run exec.LookPath on every invocation.
+var (
+	fallbackPSExe     string
+	fallbackPSExeOnce sync.Once
+)
+
+func getFallbackPSExe() string {
+	fallbackPSExeOnce.Do(func() {
+		fallbackPSExe = "powershell.exe"
+		if _, err := exec.LookPath("pwsh.exe"); err == nil {
+			fallbackPSExe = "pwsh.exe"
+		}
+	})
+	return fallbackPSExe
+}
+
+// claudePathCache caches the resolved Claude executable path so that the
+// PATH lookup and filesystem scan in resolveClaudePath are only done once
+// rather than on every Claude command invocation.
+var (
+	claudePathCached string
+	claudePathOnce   sync.Once
+)
+
+// cachedResolveClaudePath returns the Claude executable path, resolving it
+// once on first call and reusing the result for all subsequent calls.
+func cachedResolveClaudePath() string {
+	claudePathOnce.Do(func() {
+		claudePathCached = resolveClaudePath()
+	})
+	return claudePathCached
+}
+
 // runLocalCommandFallback uses traditional process spawning (slow but reliable).
 // Prefers pwsh.exe (PowerShell 7+) when available for better compatibility.
+// After the command runs, it queries the final working directory so that cd
+// commands are tracked even through the fallback path.
 func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	psExe := "powershell.exe"
-	if _, err := exec.LookPath("pwsh.exe"); err == nil {
-		psExe = "pwsh.exe"
-	}
+	psExe := getFallbackPSExe()
 
-	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-Command", cmdLine)
+	// Append a pwd probe so we can track directory changes from this process.
+	// The sentinel line lets us split user output from the directory result.
+	const cwdSentinel = "<<<AIX_CWD_PROBE>>>"
+	probeCmd := cmdLine + "\nWrite-Host '" + cwdSentinel + "'\n(Get-Location).Path"
+
+	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-Command", probeCmd)
 	if workDir != "" {
 		c.Dir = workDir
 	}
 
-	out, err := c.CombinedOutput()
-	return string(out), err
+	rawOut, err := c.CombinedOutput()
+	out := string(rawOut)
+
+	// Extract and strip the cwd probe from the output.
+	if idx := strings.Index(out, cwdSentinel); idx != -1 {
+		remainder := strings.TrimLeft(out[idx+len(cwdSentinel):], "\r\n")
+		// remainder is: <newline><cwd path><newline>
+		lines := strings.SplitN(remainder, "\n", 2)
+		if len(lines) >= 1 {
+			cwd := strings.TrimRight(lines[0], "\r\n ")
+			if cwd != "" {
+				setTrackedCwd(cwd)
+			}
+		}
+		out = out[:idx]
+	}
+
+	return strings.TrimRight(out, "\r\n"), err
 }
 
 // resolveClaudePath finds the full path to claude.exe
@@ -1282,13 +1429,29 @@ func resolveClaudePath() string {
 	// Claude Code CLI location: %APPDATA%\Claude\claude-code\<version>\claude.exe
 	claudeCodeDir := filepath.Join(homeDir, "AppData", "Roaming", "Claude", "claude-code")
 	if entries, err := os.ReadDir(claudeCodeDir); err == nil {
-		// Find the latest version directory
+		// Find the latest version directory using semver comparison so that
+		// v1.10.0 correctly ranks higher than v1.9.0 (lexicographic > fails here).
 		var latestVersion string
 		for _, entry := range entries {
-			if entry.IsDir() {
-				if latestVersion == "" || entry.Name() > latestVersion {
-					latestVersion = entry.Name()
-				}
+			if !entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			// Normalise: semver.Compare requires a leading "v"
+			candidate := name
+			if !strings.HasPrefix(candidate, "v") {
+				candidate = "v" + candidate
+			}
+			if latestVersion == "" {
+				latestVersion = name
+				continue
+			}
+			existing := latestVersion
+			if !strings.HasPrefix(existing, "v") {
+				existing = "v" + existing
+			}
+			if semver.Compare(candidate, existing) > 0 {
+				latestVersion = name
 			}
 		}
 		if latestVersion != "" {
@@ -1304,9 +1467,14 @@ func resolveClaudePath() string {
 	return "claude"
 }
 
-func containsSpace(s string) bool {
+// needsQuoting reports whether a command-line argument must be wrapped in
+// double-quotes before being embedded in a PowerShell command string.
+// Quotes are required when the arg contains spaces, literal double-quotes,
+// or PowerShell metacharacters that would be misinterpreted without quoting.
+func needsQuoting(s string) bool {
 	for _, r := range s {
-		if r == ' ' {
+		switch r {
+		case ' ', '\t', '"', '\'', '`', '$', '&', '|', '<', '>', '(', ')', '{', '}', ';', ',', '@', '#':
 			return true
 		}
 	}
@@ -1317,45 +1485,48 @@ func containsSpace(s string) bool {
    Path Safety Validation
    -------------------------------------------------------------------------- */
 
-// isPathSafe validates that a path is within the current working directory
-// to prevent path traversal attacks
-func isPathSafe(path string) bool {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return false
+// isPathSafeUnder validates that path is within baseDir to prevent traversal.
+// A separator is appended to the base before prefix-matching so that
+// "/tmp2/file" is not incorrectly accepted when the base is "/tmp".
+// Relative paths in path are resolved relative to baseDir.
+func isPathSafeUnder(path, baseDir string) bool {
+	// Resolve path relative to baseDir (handles both relative and absolute)
+	var abs string
+	if filepath.IsAbs(path) {
+		abs = filepath.Clean(path)
+	} else {
+		abs = filepath.Clean(filepath.Join(baseDir, path))
 	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return false
-	}
-	// Ensure the path is within current working directory
-	return strings.HasPrefix(abs, cwd)
+	base := filepath.Clean(baseDir) + string(filepath.Separator)
+	return strings.HasPrefix(abs+string(filepath.Separator), base)
 }
 
 /* --------------------------------------------------------------------------
    File Upload Helper Functions
    -------------------------------------------------------------------------- */
 
-// detectOutputFiles finds files to upload based on command and output
-func detectOutputFiles(command string, output string) []string {
+// detectOutputFiles finds files to upload based on command and output.
+// workDir is the directory the command ran in; relative paths are resolved
+// against it and safety checks are scoped to it.
+func detectOutputFiles(command string, output string, workDir string) []string {
 	files := []string{}
 
 	// Pattern 1: Playwright test artifacts
 	if containsSubstring(command, "playwright") || containsSubstring(command, "pwtest") {
 		fmt.Println("[file-upload] Detected Playwright command, scanning for test artifacts...")
 		// Look for test-results directory
-		files = appendFilesFromDir(files, "test-results", []string{".png", ".webm", ".mp4", ".json", ".html"})
+		files = appendFilesFromDir(files, "test-results", workDir, []string{".png", ".webm", ".mp4", ".json", ".html"})
 		fmt.Printf("[file-upload] Found %d Playwright artifacts\n", len(files))
 	}
 
 	// Pattern 2: Generic screenshots in current directory
 	if containsSubstring(command, "screenshot") || containsSubstring(output, "screenshot") {
-		files = appendFilesFromDir(files, ".", []string{".png", ".jpg", ".jpeg"})
+		files = appendFilesFromDir(files, ".", workDir, []string{".png", ".jpg", ".jpeg"})
 	}
 
 	// Pattern 3: Video recordings
 	if containsSubstring(command, "record") || containsSubstring(output, "recording") {
-		files = appendFilesFromDir(files, ".", []string{".webm", ".mp4", ".mov"})
+		files = appendFilesFromDir(files, ".", workDir, []string{".webm", ".mp4", ".mov"})
 	}
 
 	return files
@@ -1367,18 +1538,26 @@ func containsSubstring(haystack, needle string) bool {
 		(haystack == needle || strings.Contains(strings.ToLower(haystack), strings.ToLower(needle)))
 }
 
-// appendFilesFromDir recursively finds files with given extensions in directory
-func appendFilesFromDir(files []string, dir string, extensions []string) []string {
+// appendFilesFromDir recursively finds files with given extensions in dir.
+// baseDir is the command's working directory; relative paths in dir are
+// resolved against it and all found paths must remain within it.
+func appendFilesFromDir(files []string, dir string, baseDir string, extensions []string) []string {
 	// Security: Validate directory is within safe boundaries
-	if !isPathSafe(dir) {
+	if !isPathSafeUnder(dir, baseDir) {
 		fmt.Printf("[security] Blocked path traversal attempt: %s\n", dir)
 		return files
 	}
 
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	// Resolve dir to an absolute path for Walk
+	absDir := dir
+	if !filepath.IsAbs(dir) {
+		absDir = filepath.Join(baseDir, dir)
+	}
+
+	if err := filepath.Walk(absDir, func(path string, info os.FileInfo, err error) error {
 		if err == nil && !info.IsDir() {
 			// Security: Validate each file path as well
-			if !isPathSafe(path) {
+			if !isPathSafeUnder(path, baseDir) {
 				fmt.Printf("[security] Blocked file path traversal: %s\n", path)
 				return nil
 			}
@@ -1391,7 +1570,9 @@ func appendFilesFromDir(files []string, dir string, extensions []string) []strin
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		fmt.Printf("[file-upload] Walk error in %s: %v\n", dir, err)
+	}
 	return files
 }
 
@@ -1422,15 +1603,23 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Topic, cmd commandM
 		return
 	}
 
-	// Create a publish function that sends results via Pub/Sub
+	// Create a publish function that sends results via Pub/Sub.
+	// Use context.Background() rather than the sub.Receive callback ctx: the
+	// Pub/Sub library cancels that ctx once the message is acked, which happens
+	// immediately after session_start returns — but stream/prompt/session_ended
+	// messages are published for minutes afterward.  A cancelled context would
+	// silently drop every subsequent message.
 	publishFn := func(res resultMsg) {
 		data, err := json.Marshal(res)
 		if err != nil {
 			fmt.Printf("%s[session] Failed to marshal result: %v%s\n", colorRed, err, colorReset)
 			return
 		}
-		if _, err := topic.Publish(ctx, &pubsub.Message{Data: data}).Get(ctx); err != nil {
-			fmt.Printf("%s[session] Failed to publish result: %v%s\n", colorRed, err, colorReset)
+		pubCtx, pubCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, pubErr := topic.Publish(pubCtx, &pubsub.Message{Data: data}).Get(pubCtx)
+		pubCancel()
+		if pubErr != nil {
+			fmt.Printf("%s[session] Failed to publish result: %v%s\n", colorRed, pubErr, colorReset)
 		}
 	}
 
@@ -1533,8 +1722,7 @@ func publishSessionError(ctx context.Context, topic *pubsub.Topic, cmd commandMs
 		Type:        "session_error",
 		SessionID:   cmd.SessionID,
 	}
-	data, _ := json.Marshal(res)
-	if _, err := topic.Publish(ctx, &pubsub.Message{Data: data}).Get(ctx); err != nil {
+	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[session] Failed to publish error: %v%s\n", colorRed, err, colorReset)
 	}
 }

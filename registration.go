@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,7 +17,14 @@ const (
 	// Polling configuration
 	pollInterval = 2 * time.Second
 	pollTimeout  = 15 * time.Minute
+
+	// HTTP client timeout for registration API calls
+	registrationHTTPTimeout = 15 * time.Second
 )
+
+// registrationClient is a shared HTTP client with a reasonable timeout.
+// The default http.DefaultClient has no timeout and can hang indefinitely.
+var registrationClient = &http.Client{Timeout: registrationHTTPTimeout}
 
 // InitResponse is the response from POST /device/init
 type InitResponse struct {
@@ -85,7 +93,7 @@ func initRegistration(deviceName, platform string, cfg *Config) (*InitResponse, 
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := registrationClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to call init endpoint: %w", err)
 	}
@@ -93,12 +101,12 @@ func initRegistration(deviceName, platform string, cfg *Config) (*InitResponse, 
 
 	if resp.StatusCode != http.StatusOK {
 		var errResp ErrorResponse
-		json.NewDecoder(resp.Body).Decode(&errResp)
+		json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&errResp)
 		return nil, fmt.Errorf("init failed: %s - %s", errResp.Code, errResp.Message)
 	}
 
 	var initResp InitResponse
-	if err := json.NewDecoder(resp.Body).Decode(&initResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&initResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
@@ -124,14 +132,14 @@ func pollForAuthorization(deviceCode string, timeout time.Duration) (*PollRespon
 				return nil, fmt.Errorf("authorization timed out after %v", timeout)
 			}
 
-			resp, err := http.Get(pollURL)
+			resp, err := registrationClient.Get(pollURL)
 			if err != nil {
 				fmt.Print("!")
 				continue
 			}
 
 			var pollResp PollResponse
-			err = json.NewDecoder(resp.Body).Decode(&pollResp)
+			err = json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&pollResp)
 			resp.Body.Close()
 
 			if err != nil {

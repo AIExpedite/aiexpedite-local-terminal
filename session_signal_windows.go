@@ -10,6 +10,11 @@ import (
 	"syscall"
 )
 
+// procGenerateConsoleCtrlEvent is resolved once at startup using the package-level
+// kernel32 handle (declared in tray_windows.go) to avoid a redundant DLL load and
+// repeated proc-lookup allocations on every sendInterrupt call.
+var procGenerateConsoleCtrlEvent = kernel32.NewProc("GenerateConsoleCtrlEvent")
+
 // sendInterrupt sends a Ctrl+C event to the process on Windows.
 // Uses taskkill as a reliable cross-process interrupt mechanism.
 func sendInterrupt(process *os.Process) error {
@@ -23,9 +28,7 @@ func sendInterrupt(process *os.Process) error {
 	// GenerateConsoleCtrlEvent, then fall back to taskkill.
 
 	// Try GenerateConsoleCtrlEvent first (Ctrl+Break which is more reliable)
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	generateCtrl := kernel32.NewProc("GenerateConsoleCtrlEvent")
-	ret, _, err := generateCtrl.Call(
+	ret, _, err := procGenerateConsoleCtrlEvent.Call(
 		uintptr(syscall.CTRL_BREAK_EVENT),
 		uintptr(process.Pid),
 	)

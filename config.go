@@ -4,7 +4,6 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"io/ioutil"
 	"os"
 )
 
@@ -69,7 +68,7 @@ type Config struct {
 /* -------------------------------------------------------------------------- */
 
 func LoadConfig(path string) (*Config, error) {
-	b, err := ioutil.ReadFile(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +87,7 @@ func (cfg *Config) Save(path string) error {
 	if err := os.MkdirAll(GetConfigDir(), 0o755); err != nil {
 		return err
 	}
-	return ioutil.WriteFile(path, b, 0o600)
+	return os.WriteFile(path, b, 0o600)
 }
 
 // IsRegistered returns true if the device has been registered with the backend.

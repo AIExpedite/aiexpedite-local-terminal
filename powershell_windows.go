@@ -19,15 +19,31 @@ import (
 	"time"
 )
 
+// ExitCodeError represents a command that ran successfully in the shell but
+// exited with a non-zero exit code. This is distinct from a process-level
+// failure (pipe broken, PS crashed, timeout) so callers can avoid restarting
+// PowerShell unnecessarily.
+type ExitCodeError struct {
+	Code   int
+	Output string
+}
+
+func (e *ExitCodeError) Error() string {
+	if e.Output != "" {
+		return fmt.Sprintf("exit code %d\n%s", e.Code, e.Output)
+	}
+	return fmt.Sprintf("exit code %d", e.Code)
+}
+
 const (
 	// Unique delimiter to mark end of command output
 	psDelimiter = "<<<AIEXPEDITE_CMD_DONE_7f3d2a1b>>>"
 	// Unique marker to separate cwd from command output
 	psCwdMarker = "<<<AIEXPEDITE_CWD_7f3d2a1b>>>"
+	// Unique marker to separate exit code from command output
+	psExitCodeMarker = "<<<AIEXPEDITE_EXIT_7f3d2a1b>>>"
 	// Timeout for health check commands
 	psHealthTimeout = 5 * time.Second
-	// Maximum time for a single command execution
-	psCommandTimeout = 60 * time.Minute
 )
 
 // PersistentPowerShell manages a long-running PowerShell process
@@ -160,8 +176,11 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 
 	// Use newlines (not ;) to separate delimiter lines — newlines are unconditional
 	// statement separators that cannot be captured by && or || operators.
-	fullCmd.WriteString(fmt.Sprintf("\nWrite-Host ''\nWrite-Host '%s'\n(Get-Location).Path | Write-Host\nWrite-Host '%s'",
-		psCwdMarker, psDelimiter))
+	// Capture $LASTEXITCODE immediately after the script block (before any other
+	// statements that could reset it), then emit the protocol markers.
+	fullCmd.WriteString(fmt.Sprintf(
+		"\n$__aix_exit = $LASTEXITCODE\nWrite-Host ''\nWrite-Host '%s'\nWrite-Host $__aix_exit\n(Get-Location).Path | Write-Host\nWrite-Host '%s'",
+		psExitCodeMarker, psDelimiter))
 
 	// Send command to PowerShell
 	_, err := fmt.Fprintln(ps.stdin, fullCmd.String())
@@ -170,10 +189,11 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		return "", fmt.Errorf("failed to send command: %w", err)
 	}
 
-	// Read output until delimiter with timeout, stripping cwd marker lines
+	// Read output until delimiter with timeout, capturing exit code and cwd markers
 	type execResult struct {
-		output string
-		newCwd string
+		output   string
+		newCwd   string
+		exitCode int
 	}
 	resultChan := make(chan execResult, 1)
 	errChan := make(chan error, 1)
@@ -181,7 +201,9 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	go func() {
 		var output strings.Builder
 		var newCwd string
-		cwdMarkerSeen := false
+		exitCode := 0
+		exitCodeMarkerSeen := false
+		exitCodeCaptured := false
 
 		for {
 			line, err := ps.stdout.ReadString('\n')
@@ -193,18 +215,26 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 			line = strings.TrimRight(line, "\r\n")
 
 			if line == psDelimiter {
-				resultChan <- execResult{output: output.String(), newCwd: newCwd}
+				resultChan <- execResult{output: output.String(), newCwd: newCwd, exitCode: exitCode}
 				return
 			}
 
-			// Detect and capture cwd marker sequence
-			if line == psCwdMarker {
-				cwdMarkerSeen = true
+			// Detect exit code marker: next line is the exit code, line after is cwd
+			if line == psExitCodeMarker {
+				exitCodeMarkerSeen = true
 				continue
 			}
-			if cwdMarkerSeen {
+			if exitCodeMarkerSeen && !exitCodeCaptured {
+				if n, err := fmt.Sscanf(line, "%d", &exitCode); err != nil || n != 1 {
+					// Malformed exit code line — assume failure so errors aren't hidden
+					exitCode = 1
+				}
+				exitCodeCaptured = true
+				continue
+			}
+			// After exit code, next non-empty line is the cwd (captured until delimiter)
+			if exitCodeCaptured && newCwd == "" && line != "" {
 				newCwd = line
-				cwdMarkerSeen = false
 				continue
 			}
 
@@ -215,11 +245,16 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		}
 	}()
 
-	// Wait with timeout
+	// Wait for result, pipe error, or context cancellation/timeout.
+	// The caller is responsible for setting an appropriate deadline on ctx —
+	// we do not impose a secondary timeout here that would override it.
 	select {
 	case result := <-resultChan:
 		if result.newCwd != "" {
 			ps.lastCwd = result.newCwd
+		}
+		if result.exitCode != 0 {
+			return result.output, &ExitCodeError{Code: result.exitCode, Output: result.output}
 		}
 		return result.output, nil
 	case err := <-errChan:
@@ -227,10 +262,14 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		return "", fmt.Errorf("failed to read output: %w", err)
 	case <-ctx.Done():
 		ps.healthy = false
+		// Kill the process so the reader goroutine unblocks on pipe EOF
+		if ps.cmd.Process != nil {
+			ps.cmd.Process.Kill()
+		}
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("command timed out")
+		}
 		return "", fmt.Errorf("command cancelled")
-	case <-time.After(psCommandTimeout):
-		ps.healthy = false
-		return "", fmt.Errorf("command timed out after %v", psCommandTimeout)
 	}
 }
 

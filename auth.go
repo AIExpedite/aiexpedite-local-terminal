@@ -19,6 +19,10 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// authHTTPClient is used for all WIF token-exchange HTTP calls.
+// http.DefaultClient has no timeout and can hang indefinitely on slow endpoints.
+var authHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
 /* --------------------------------------------------------------------------
    WIF Token Source - Implements oauth2.TokenSource for GCP authentication
    -------------------------------------------------------------------------- */
@@ -44,17 +48,25 @@ func NewWIFTokenSource(cfg *Config) *WIFTokenSource {
 
 // Token returns a valid OAuth2 token, refreshing if necessary.
 // This implements the oauth2.TokenSource interface.
+//
+// The mutex is held only for the cache check and the final store, not across
+// the HTTP calls.  Holding the lock during two sequential remote round-trips
+// (each with a 30 s timeout) would block every concurrent caller — including
+// the Pub/Sub client's internal token refresh — for up to 60 seconds.
 func (ts *WIFTokenSource) Token() (*oauth2.Token, error) {
+	// Fast path: return cached token under read-equivalent check.
 	ts.mu.Lock()
-	defer ts.mu.Unlock()
-
-	// Return cached token if still valid (with 5 minute buffer)
 	if ts.cachedToken != nil && ts.cachedToken.Valid() {
 		if time.Until(ts.cachedToken.Expiry) > 5*time.Minute {
-			return ts.cachedToken, nil
+			tok := ts.cachedToken
+			ts.mu.Unlock()
+			return tok, nil
 		}
 	}
+	ts.mu.Unlock()
 
+	// Slow path: fetch new tokens without holding the mutex so concurrent
+	// callers are not serialised behind the HTTP round-trips.
 	// Step 1: Get OIDC token from our backend
 	idToken, err := ts.getOIDCToken()
 	if err != nil {
@@ -67,14 +79,23 @@ func (ts *WIFTokenSource) Token() (*oauth2.Token, error) {
 		return nil, fmt.Errorf("failed to exchange token: %w", err)
 	}
 
-	// Cache the token
-	ts.cachedToken = &oauth2.Token{
+	newToken := &oauth2.Token{
 		AccessToken: accessToken,
 		TokenType:   "Bearer",
 		Expiry:      expiry,
 	}
 
-	return ts.cachedToken, nil
+	// Store under lock; a concurrent refresh may have beaten us here — keep
+	// whichever token expires later so we don't regress to a shorter-lived one.
+	ts.mu.Lock()
+	if ts.cachedToken == nil || newToken.Expiry.After(ts.cachedToken.Expiry) {
+		ts.cachedToken = newToken
+	} else {
+		newToken = ts.cachedToken
+	}
+	ts.mu.Unlock()
+
+	return newToken, nil
 }
 
 /* --------------------------------------------------------------------------
@@ -117,14 +138,14 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 	}
 
 	// Make request to backend
-	resp, err := http.Post(ts.cfg.TokenEndpoint, "application/json", bytes.NewReader(body))
+	resp, err := authHTTPClient.Post(ts.cfg.TokenEndpoint, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return "", fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read response
-	respBody, err := io.ReadAll(resp.Body)
+	// Read response (64 KB cap — OIDC token responses are always small)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
@@ -206,14 +227,14 @@ func (ts *WIFTokenSource) getFederatedToken(idToken string) (string, error) {
 	}
 
 	// Make request to STS
-	resp, err := http.PostForm(stsURL, formData)
+	resp, err := authHTTPClient.PostForm(stsURL, formData)
 	if err != nil {
 		return "", fmt.Errorf("STS request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read response
-	respBody, err := io.ReadAll(resp.Body)
+	// Read response (64 KB cap — STS responses are always small)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
 		return "", fmt.Errorf("failed to read STS response: %w", err)
 	}
@@ -264,14 +285,14 @@ func (ts *WIFTokenSource) impersonateServiceAccount(federatedToken string) (stri
 	req.Header.Set("Content-Type", "application/json")
 
 	// Make request
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := authHTTPClient.Do(req)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("impersonation request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read response
-	respBody, err := io.ReadAll(resp.Body)
+	// Read response (64 KB cap — impersonation responses are always small)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("failed to read response: %w", err)
 	}

@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -111,10 +113,14 @@ func onTrayReady(cfg *Config) func() {
 
 		mQuit := systray.AddMenuItem("Quit", "Exit the agent")
 
+		// registering is true while a registration flow is in progress.
+		// Declared here (before the auto-register block) so the goroutine below
+		// can safely call registering.Store(false) without a data race.
+		var registering atomic.Bool
+
 		// Auto-trigger registration on first launch (if not registered)
-		autoRegistering := false
 		if !cfg.IsRegistered() {
-			autoRegistering = true
+			registering.Store(true)
 			// Keep console visible during auto-registration
 			if runtime.GOOS == "windows" {
 				showConsoleWindow(true)
@@ -145,7 +151,7 @@ func onTrayReady(cfg *Config) func() {
 					fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
 					go StartPubSubLoop(cfg)
 				}
-				autoRegistering = false
+				registering.Store(false)
 			}()
 		}
 
@@ -216,7 +222,6 @@ func onTrayReady(cfg *Config) func() {
 		go func() {
 			// Console is visible if: auto-registering OR pre-allocated for non-prod
 			consoleVisible := !cfg.IsRegistered() || consolePreAllocated
-			registering := autoRegistering
 
 			for {
 				select {
@@ -317,10 +322,10 @@ func onTrayReady(cfg *Config) func() {
 						continue
 					}
 
-					if registering {
+					if registering.Load() {
 						continue // Already registering
 					}
-					registering = true
+					registering.Store(true)
 
 					// Show console during registration
 					if runtime.GOOS == "windows" {
@@ -346,7 +351,7 @@ func onTrayReady(cfg *Config) func() {
 							fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
 							go StartPubSubLoop(cfg)
 						}
-						registering = false
+						registering.Store(false)
 					}()
 
 				case <-mConsole.ClickedCh:
@@ -421,9 +426,9 @@ func onTrayExit() {
 
 	// IMPORTANT: Launch update FIRST, before any cleanup that might kill processes
 	// The update process needs to be started before we kill our process tree
-	if updatePending && updatePath != "" {
+	if path, pending := GetUpdateReady(); pending && path != "" {
 		fmt.Println("Launching updated version…")
-		cmd := exec.Command(updatePath)
+		cmd := exec.Command(path)
 		setNewConsole(cmd) // Ensure child process gets a fresh console with valid handles
 		if err := cmd.Start(); err != nil {
 			fmt.Printf("Failed to start update: %v\n", err)
@@ -552,6 +557,24 @@ func handleUninstall() {
 	}
 }
 
+// escapeBatchPath escapes a filesystem path for safe embedding inside a
+// Windows batch file command (e.g. inside a "del /f /q "<path>" line).
+// It escapes % → %% (batch variable expansion) and removes ^ and ! which
+// could be interpreted as escape / delayed-expansion metacharacters.
+// The path is still wrapped in double-quotes by the caller; this function
+// only handles characters that are dangerous inside already-quoted strings.
+func escapeBatchPath(p string) string {
+	// % must be doubled so cmd.exe does not try to expand %SOMETHING% tokens.
+	p = strings.ReplaceAll(p, "%", "%%")
+	// ^ is the batch escape character — strip it; it should never appear in a
+	// normal Windows file path produced by os.Executable / filepath.Dir.
+	p = strings.ReplaceAll(p, "^", "")
+	// ! is only active with SETLOCAL ENABLEDELAYEDEXPANSION (not used here),
+	// but strip it defensively.
+	p = strings.ReplaceAll(p, "!", "")
+	return p
+}
+
 // createSelfDeleteBatch creates a batch file that waits for this process to exit,
 // then deletes the executable and itself. This is the industry-standard approach
 // for self-deleting executables on Windows.
@@ -562,6 +585,12 @@ func createSelfDeleteBatch(exePath string, quiet bool) error {
 
 	// Get the directory containing the executable (to delete the whole folder if it's in Program Files)
 	exeDir := filepath.Dir(exePath)
+
+	// Escape paths before embedding them in the batch script.
+	// Without this, a % in the path would be interpreted as a batch variable
+	// expansion token and silently break the del/rmdir commands.
+	safeExePath := escapeBatchPath(exePath)
+	safeExeDir := escapeBatchPath(exeDir)
 
 	// Batch script that:
 	// 1. Waits for the main process to exit (using ping for delay)
@@ -583,7 +612,7 @@ rmdir "%s" > nul 2>&1
 
 REM Delete this batch file
 del /f /q "%%~f0" > nul 2>&1
-`, exePath, exeDir)
+`, safeExePath, safeExeDir)
 
 	// Write the batch file
 	if err := os.WriteFile(batchPath, []byte(batchContent), 0644); err != nil {

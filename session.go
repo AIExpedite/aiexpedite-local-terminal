@@ -310,20 +310,25 @@ func (sm *SessionManager) CleanupStale(maxAge time.Duration) {
 	ticker := time.NewTicker(sessionCleanupInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		sm.mu.RLock()
-		var staleIDs []string
-		for id, session := range sm.sessions {
-			if time.Since(session.StartedAt) > maxAge {
-				staleIDs = append(staleIDs, id)
+	for {
+		select {
+		case <-ticker.C:
+			sm.mu.RLock()
+			var staleIDs []string
+			for id, session := range sm.sessions {
+				if time.Since(session.StartedAt) > maxAge {
+					staleIDs = append(staleIDs, id)
+				}
 			}
-		}
-		sm.mu.RUnlock()
+			sm.mu.RUnlock()
 
-		for _, id := range staleIDs {
-			fmt.Printf("%s[session] Cleaning up stale session %s (exceeded %v)%s\n",
-				colorYellow, id, maxAge, colorReset)
-			_ = sm.EndSession(id)
+			for _, id := range staleIDs {
+				fmt.Printf("%s[session] Cleaning up stale session %s (exceeded %v)%s\n",
+					colorYellow, id, maxAge, colorReset)
+				_ = sm.EndSession(id)
+			}
+		case <-shutdownChan:
+			return
 		}
 	}
 }
@@ -382,7 +387,17 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		close(lines)
 	}()
 
-	// Batch output and publish periodically
+	// Batch output and publish periodically.
+	// publishFn blocks for up to 30 s on Pub/Sub network I/O.  Calling it
+	// directly inside the select loop would stall the consumer goroutine,
+	// filling the lines channel (capacity 100) and eventually blocking the
+	// scanner goroutines that feed it — starving the CLI process's pipe buffer.
+	// Instead we publish in a fire-and-forget goroutine so the select loop
+	// always stays free to drain incoming lines.
+	asyncPublish := func(msg resultMsg) {
+		go publishFn(msg)
+	}
+
 	var batch []string
 	batchTimer := time.NewTicker(streamBatchInterval)
 	defer batchTimer.Stop()
@@ -394,7 +409,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		output := strings.Join(batch, "\n")
 		seq := atomic.AddInt64(&session.Seq, 1)
 
-		publishFn(resultMsg{
+		asyncPublish(resultMsg{
 			ID:          session.ID,
 			WorkspaceID: session.WorkspaceID,
 			UID:         session.UID,
@@ -431,7 +446,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 
 				seq := atomic.AddInt64(&session.Seq, 1)
 
-				publishFn(resultMsg{
+				asyncPublish(resultMsg{
 					ID:          session.ID,
 					WorkspaceID: session.WorkspaceID,
 					UID:         session.UID,
@@ -465,6 +480,13 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 // session_ended result.
 func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc) {
 	err := session.Process.Wait()
+
+	// Explicitly close pipes so the scanner goroutines in readOutputStream
+	// receive EOF and can exit.  On Windows, process exit does not always
+	// immediately release the pipe handles, so the scanners could block on
+	// Read() indefinitely without this.
+	session.Stdout.Close()
+	session.Stderr.Close()
 
 	session.mu.Lock()
 	session.Status = "ended"
@@ -573,7 +595,7 @@ func resolveExecutable(command string) string {
 	cmdLower := strings.ToLower(command)
 
 	if cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude") {
-		return resolveClaudePath()
+		return cachedResolveClaudePath()
 	}
 
 	// For codex and gemini, try PATH lookup
