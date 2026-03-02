@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.56" // Fix: cap caller-supplied TimeoutMs at 10 min to prevent goroutine slot exhaustion
+const Version = "v0.5.57" // Fix: cap persistent-PS output builder at 10 MB to prevent RAM exhaustion
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

@@ -204,6 +204,14 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		exitCode := 0
 		exitCodeMarkerSeen := false
 		exitCodeCaptured := false
+		outputTruncated := false
+
+		// Cap output at 10 MB.  Beyond this limit the result cannot be published
+		// to Pub/Sub anyway (64 KB message cap), and an unbounded builder would
+		// exhaust RAM on commands that produce very large output (e.g. `type
+		// largefile.bin`).  We stop appending but continue draining stdout so the
+		// protocol markers (exit code, cwd, delimiter) are still processed.
+		const maxOutputBytes = 10 * 1024 * 1024 // 10 MB
 
 		for {
 			line, err := ps.stdout.ReadString('\n')
@@ -238,10 +246,18 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 				continue
 			}
 
-			if output.Len() > 0 {
-				output.WriteString("\r\n")
+			if !outputTruncated {
+				if output.Len()+len(line)+2 > maxOutputBytes {
+					output.WriteString("\r\n[output truncated: exceeded 10 MB limit]")
+					outputTruncated = true
+					// Keep draining stdout so markers/delimiter are still received
+				} else {
+					if output.Len() > 0 {
+						output.WriteString("\r\n")
+					}
+					output.WriteString(line)
+				}
 			}
-			output.WriteString(line)
 		}
 	}()
 
