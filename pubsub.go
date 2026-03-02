@@ -1205,6 +1205,15 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	if timeoutMs <= 0 {
 		timeoutMs = 120000
 	}
+	// Cap timeout at 4 hours regardless of what the server sends.
+	// An unbounded caller-supplied timeout would hold a Pub/Sub receive goroutine
+	// indefinitely, silently exhausting MaxOutstandingMessages slots and
+	// preventing any new commands from being processed.
+	// 4 hours accommodates long-running operations such as codex agent runs.
+	const maxTimeoutMs = 4 * 60 * 60 * 1000 // 4 hours
+	if timeoutMs > maxTimeoutMs {
+		timeoutMs = maxTimeoutMs
+	}
 	timeout := time.Duration(timeoutMs) * time.Millisecond
 
 	// Set working directory with tracked cwd support:
@@ -1541,6 +1550,12 @@ func containsSubstring(haystack, needle string) bool {
 // appendFilesFromDir recursively finds files with given extensions in dir.
 // baseDir is the command's working directory; relative paths in dir are
 // resolved against it and all found paths must remain within it.
+// maxUploadFiles is the maximum number of files collected across all Walk calls
+// for a single command execution.  Without a cap, a large test-results tree or
+// a node_modules directory full of .png files would enqueue thousands of GCS
+// uploads, exhausting memory and Cloud Storage quota.
+const maxUploadFiles = 50
+
 func appendFilesFromDir(files []string, dir string, baseDir string, extensions []string) []string {
 	// Security: Validate directory is within safe boundaries
 	if !isPathSafeUnder(dir, baseDir) {
@@ -1555,6 +1570,10 @@ func appendFilesFromDir(files []string, dir string, baseDir string, extensions [
 	}
 
 	if err := filepath.Walk(absDir, func(path string, info os.FileInfo, err error) error {
+		// Stop collecting once we hit the cap; returning an error aborts the walk.
+		if len(files) >= maxUploadFiles {
+			return fmt.Errorf("file limit reached")
+		}
 		if err == nil && !info.IsDir() {
 			// Security: Validate each file path as well
 			if !isPathSafeUnder(path, baseDir) {
@@ -1570,7 +1589,8 @@ func appendFilesFromDir(files []string, dir string, baseDir string, extensions [
 			}
 		}
 		return nil
-	}); err != nil {
+	}); err != nil && len(files) < maxUploadFiles {
+		// Only log genuine walk errors, not our own sentinel stop error.
 		fmt.Printf("[file-upload] Walk error in %s: %v\n", dir, err)
 	}
 	return files

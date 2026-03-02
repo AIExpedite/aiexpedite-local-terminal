@@ -504,7 +504,13 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 
 	seq := atomic.AddInt64(&session.Seq, 1)
 
-	publishFn(resultMsg{
+	// Publish session_ended in a goroutine: publishFn blocks up to 30 s on
+	// Pub/Sub network I/O.  Calling it directly here would delay removeSession
+	// (and therefore free the session slot for reuse) by up to 30 s, and would
+	// race the async stream publishes already in-flight from readOutputStream —
+	// the session_ended message could arrive at the client before the last
+	// streamed lines despite having a higher sequence number.
+	go publishFn(resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,

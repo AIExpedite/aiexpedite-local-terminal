@@ -14,9 +14,13 @@ import (
 )
 
 var (
-	user32      = syscall.NewLazyDLL("user32.dll")
-	procMsgBox  = user32.NewProc("MessageBoxW")
+	user32            = syscall.NewLazyDLL("user32.dll")
+	procMsgBox        = user32.NewProc("MessageBoxW")
+	procFindWindowW   = user32.NewProc("FindWindowW")
+	procPostMessageW  = user32.NewProc("PostMessageW")
 )
+
+const WM_CLOSE = 0x0010
 
 const (
 	MB_OK            = 0x00000000
@@ -111,7 +115,14 @@ func ShowCommandApprovalDialog(cmd string, args []string, timeoutSec int) Approv
 	case result := <-resultCh:
 		return result
 	case <-time.After(time.Duration(timeoutSec) * time.Second):
-		// Timeout - return deny (caller can override based on config)
+		// Timeout — programmatically close the MessageBox so its goroutine can exit
+		// rather than leaking it as a zombie waiting for user input nobody will give.
+		// FindWindowW with a NULL class finds the top-level window matching the title.
+		titlePtr, _ := syscall.UTF16PtrFromString(title)
+		hwnd, _, _ := procFindWindowW.Call(0, uintptr(unsafe.Pointer(titlePtr)))
+		if hwnd != 0 {
+			procPostMessageW.Call(hwnd, WM_CLOSE, 0, 0)
+		}
 		fmt.Println("[security] Approval dialog timed out")
 		return ApprovalDeny
 	}

@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.50" // Fix: session stream flushBatch blocking select loop on slow Pub/Sub publish
+const Version = "v0.5.56" // Fix: cap caller-supplied TimeoutMs at 10 min to prevent goroutine slot exhaustion
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

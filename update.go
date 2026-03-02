@@ -171,8 +171,12 @@ func downloadAndApplyUpdate(info *UpdateInfo) error {
 	}
 	defer resp.Body.Close()
 
+	// Cap download at 200 MB to prevent disk exhaustion from an unexpectedly
+	// large or malicious response body. Release binaries are typically < 50 MB;
+	// 200 MB leaves plenty of headroom while still bounding disk usage.
+	const maxBinarySize = 200 << 20 // 200 MB
 	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(tmp, h), resp.Body); err != nil {
+	if _, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(resp.Body, maxBinarySize)); err != nil {
 		return err
 	}
 

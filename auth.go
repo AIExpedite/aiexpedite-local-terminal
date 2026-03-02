@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 )
 
 // authHTTPClient is used for all WIF token-exchange HTTP calls.
@@ -39,6 +40,12 @@ type WIFTokenSource struct {
 
 	// Cached token to avoid unnecessary refreshes
 	cachedToken *oauth2.Token
+
+	// sfg ensures only one token refresh is in-flight at a time.
+	// When multiple goroutines all find the token expired simultaneously,
+	// singleflight collapses them into a single HTTP round-trip and shares
+	// the result, preventing a thundering herd of WIF refresh calls.
+	sfg singleflight.Group
 }
 
 // NewWIFTokenSource creates a new token source for Workload Identity Federation.
@@ -65,37 +72,46 @@ func (ts *WIFTokenSource) Token() (*oauth2.Token, error) {
 	}
 	ts.mu.Unlock()
 
-	// Slow path: fetch new tokens without holding the mutex so concurrent
-	// callers are not serialised behind the HTTP round-trips.
-	// Step 1: Get OIDC token from our backend
-	idToken, err := ts.getOIDCToken()
+	// Slow path: use singleflight so that only one goroutine performs the two
+	// sequential HTTP round-trips (OIDC + STS) when multiple callers find the
+	// token expired at the same time.  Without this, MaxOutstandingMessages=5
+	// goroutines could each fire 3 HTTP calls simultaneously — a thundering herd
+	// that spikes backend load and wastes WIF quota.
+	v, err, _ := ts.sfg.Do("refresh", func() (interface{}, error) {
+		// Step 1: Get OIDC token from our backend
+		idToken, err := ts.getOIDCToken()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get OIDC token: %w", err)
+		}
+
+		// Step 2: Exchange OIDC token for GCP access token via STS
+		accessToken, expiry, err := ts.exchangeForGCPToken(idToken)
+		if err != nil {
+			return nil, fmt.Errorf("failed to exchange token: %w", err)
+		}
+
+		newToken := &oauth2.Token{
+			AccessToken: accessToken,
+			TokenType:   "Bearer",
+			Expiry:      expiry,
+		}
+
+		// Store under lock; keep whichever token expires later so we don't
+		// regress to a shorter-lived one if two refreshes somehow raced.
+		ts.mu.Lock()
+		if ts.cachedToken == nil || newToken.Expiry.After(ts.cachedToken.Expiry) {
+			ts.cachedToken = newToken
+		} else {
+			newToken = ts.cachedToken
+		}
+		ts.mu.Unlock()
+
+		return newToken, nil
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to get OIDC token: %w", err)
+		return nil, err
 	}
-
-	// Step 2: Exchange OIDC token for GCP access token via STS
-	accessToken, expiry, err := ts.exchangeForGCPToken(idToken)
-	if err != nil {
-		return nil, fmt.Errorf("failed to exchange token: %w", err)
-	}
-
-	newToken := &oauth2.Token{
-		AccessToken: accessToken,
-		TokenType:   "Bearer",
-		Expiry:      expiry,
-	}
-
-	// Store under lock; a concurrent refresh may have beaten us here — keep
-	// whichever token expires later so we don't regress to a shorter-lived one.
-	ts.mu.Lock()
-	if ts.cachedToken == nil || newToken.Expiry.After(ts.cachedToken.Expiry) {
-		ts.cachedToken = newToken
-	} else {
-		newToken = ts.cachedToken
-	}
-	ts.mu.Unlock()
-
-	return newToken, nil
+	return v.(*oauth2.Token), nil
 }
 
 /* --------------------------------------------------------------------------
