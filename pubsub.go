@@ -1181,15 +1181,18 @@ func isPowerShellSpecificCommand(cmd string) bool {
 	return false
 }
 
-// runViaShell executes a bash-style (&&/||) command on Windows when pwsh is
-// unavailable. Uses powershell.exe rather than cmd.exe so that a failed `cd`
-// (e.g. to a non-existent path) sets a non-zero exit code and the error
-// propagates — cmd.exe's `cd` exits 0 even on failure, masking the problem.
+// runViaShell executes a bash-style (&&/||) command on Windows by spawning a
+// one-shot PowerShell process. Prefers pwsh.exe (PS 7+, supports && natively)
+// and falls back to powershell.exe only when pwsh.exe is not on PATH.
+// powershell.exe is used in preference to cmd.exe so that a failed `cd` (e.g.
+// to a non-existent path) sets a non-zero exit code and the error propagates —
+// cmd.exe's `cd` exits 0 even on failure, masking the problem.
 func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	c := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", cmdLine)
+	psExe := getFallbackPSExe() // prefers pwsh.exe when available
+	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-Command", cmdLine)
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -1290,11 +1293,12 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 		return runLocalCommandFallback(cmdLine, workDir, timeout)
 	}
 
-	// Route bash-style commands (containing && or ||) through cmd.exe on Windows,
-	// but only when PowerShell 7+ (pwsh.exe) is NOT available. pwsh.exe supports
-	// && natively and has ls/cat/etc. aliases that cmd.exe lacks.
+	// Route bash-style commands (containing && or ||) through a one-shot
+	// PowerShell process on Windows when the persistent PS instance is not
+	// available. pwsh.exe is preferred (supports && natively); powershell.exe
+	// is the fallback when pwsh.exe is not on PATH.
 	if runtime.GOOS == "windows" && isBashStyleCommand(cmdLine) && !isPowerShellSpecificCommand(cmd) && !IsPersistentPSPwsh() {
-		fmt.Printf("%s[aiexpedite] Routing bash-style command via cmd.exe (no pwsh available)%s\n", colorCyan, colorReset)
+		fmt.Printf("%s[aiexpedite] Routing bash-style command via one-shot powershell.exe (persistent PS unavailable)%s\n", colorCyan, colorReset)
 		return runViaShell(cmdLine, workDir, timeout)
 	}
 

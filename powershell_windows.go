@@ -389,12 +389,23 @@ func ShutdownPowerShell() {
 	}
 }
 
-// IsPersistentPSPwsh returns true if the global persistent PowerShell uses pwsh.exe (PS 7+).
-// Used to decide whether bash-style commands (&&, ||) can be routed through PS instead of cmd.exe.
+// IsPersistentPSPwsh returns true if pwsh.exe (PowerShell 7+) is available,
+// either via the healthy persistent instance or directly on PATH.
+// Used to decide whether bash-style commands (&&, ||) can be routed through
+// pwsh.exe instead of the legacy powershell.exe, which does not support &&.
 func IsPersistentPSPwsh() bool {
 	globalPSLock.Lock()
-	defer globalPSLock.Unlock()
-	return globalPS != nil && globalPS.healthy && globalPS.isPwsh
+	isPwsh := globalPS != nil && globalPS.healthy && globalPS.isPwsh
+	globalPSLock.Unlock()
+
+	if isPwsh {
+		return true
+	}
+	// Persistent instance is unavailable, but pwsh.exe may still be on PATH.
+	// runViaShell will use pwsh.exe in that case, so report true so the caller
+	// does not incorrectly fall back to legacy powershell.exe for && commands.
+	_, err := exec.LookPath("pwsh.exe")
+	return err == nil
 }
 
 // GetTrackedCwd returns the last known working directory from the global persistent PowerShell.

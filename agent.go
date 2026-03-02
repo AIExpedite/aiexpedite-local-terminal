@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.58" // Fix: reset $LASTEXITCODE=0 before each PS command to prevent stale exit code false failures
+const Version = "v0.5.59" // Fix: IsPersistentPSPwsh falls back to PATH check; runViaShell uses pwsh.exe when available
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
