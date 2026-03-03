@@ -43,6 +43,10 @@ func GetStorageClient(ctx context.Context) (*storage.Client, error) {
 	var clientOpts []option.ClientOption
 	if globalStorageConfig != nil && IsWIFConfigured(globalStorageConfig) {
 		fmt.Println("[storage] using Workload Identity Federation for authentication")
+		fmt.Printf("[storage]   Token endpoint:  %s\n", globalStorageConfig.TokenEndpoint)
+		fmt.Printf("[storage]   WIF audience:    %s\n", globalStorageConfig.WIFAudience)
+		fmt.Printf("[storage]   Service account: %s\n", globalStorageConfig.WIFServiceAccount)
+		fmt.Printf("[storage]   Bucket:          %s\n", globalStorageConfig.StorageBucket)
 		tokenSource := NewWIFTokenSource(globalStorageConfig)
 		// Wrap with ReuseTokenSource to cache and auto-refresh tokens
 		clientOpts = append(clientOpts, option.WithTokenSource(
@@ -54,7 +58,17 @@ func GetStorageClient(ctx context.Context) (*storage.Client, error) {
 
 	client, err := storage.NewClient(ctx, clientOpts...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create GCS client: %w", err)
+	}
+
+	// Validate auth by checking bucket exists (catches WIF token exchange errors early)
+	if globalStorageConfig != nil && globalStorageConfig.StorageBucket != "" {
+		_, err = client.Bucket(globalStorageConfig.StorageBucket).Attrs(ctx)
+		if err != nil {
+			client.Close()
+			return nil, fmt.Errorf("GCS auth validation failed (bucket: %s): %w", globalStorageConfig.StorageBucket, err)
+		}
+		fmt.Printf("[storage] Auth validated - bucket %s accessible\n", globalStorageConfig.StorageBucket)
 	}
 
 	globalStorageClient = client
@@ -211,6 +225,7 @@ func UploadFiles(
 
 			fileInfo, err := UploadFile(ctx, client, bucketName, path, workspaceID, executionID, log)
 			if err != nil {
+				log.Error("Upload failed", "file", path, "error", err.Error())
 				resultChan <- UploadError{File: path, Error: err.Error()}
 			} else {
 				resultChan <- fileInfo

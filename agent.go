@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.60" // Fix: Prioritize ping before staleness check; increase MaxOutstandingMessages to 10
+const Version = "v0.5.61" // Add GCS upload error visibility: per-file error logging, eager auth validation, WIF diagnostic output
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

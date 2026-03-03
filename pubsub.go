@@ -969,6 +969,9 @@ func runPubSubConnection(cfg *Config) error {
 
 							fmt.Printf("[file-upload] Upload complete: %d successful, %d failed\n",
 								len(uploadResult.Successful), len(uploadResult.Failed))
+							for _, ue := range uploadResult.Failed {
+								fmt.Printf("[file-upload] FAILED: %s - %s\n", ue.File, ue.Error)
+							}
 						}
 					}
 				}
