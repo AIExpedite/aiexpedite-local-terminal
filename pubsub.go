@@ -1091,6 +1091,7 @@ func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout t
 	defer cancel()
 
 	c := exec.CommandContext(ctx, "powershell.exe", psArgs...)
+	hideWindow(c)
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -1197,6 +1198,7 @@ func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string,
 
 	psExe := getFallbackPSExe() // prefers pwsh.exe when available
 	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-Command", cmdLine)
+	hideWindow(c)
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -1402,6 +1404,7 @@ func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Durati
 	probeCmd := cmdLine + "\nWrite-Host '" + cwdSentinel + "'\n(Get-Location).Path"
 
 	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-Command", probeCmd)
+	hideWindow(c)
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -1491,7 +1494,7 @@ func resolveClaudePath() string {
 func needsQuoting(s string) bool {
 	for _, r := range s {
 		switch r {
-		case ' ', '\t', '"', '\'', '`', '$', '&', '|', '<', '>', '(', ')', '{', '}', ';', ',', '@', '#':
+		case ' ', '\t', '\n', '\r', '"', '\'', '`', '$', '&', '|', '<', '>', '(', ')', '{', '}', ';', ',', '@', '#':
 			return true
 		}
 	}

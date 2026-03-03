@@ -108,6 +108,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		colorCyan, command, id, executable, strings.Join(cliArgs, " "), colorReset)
 
 	proc := exec.Command(executable, cliArgs...)
+	hideWindow(proc)
 	if cwd != "" {
 		proc.Dir = cwd
 	}

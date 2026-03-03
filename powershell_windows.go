@@ -53,15 +53,16 @@ const (
 
 // PersistentPowerShell manages a long-running PowerShell process
 type PersistentPowerShell struct {
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   *bufio.Reader
-	stderr   io.ReadCloser
-	mutex    sync.Mutex
-	healthy  atomic.Bool // lock-free health flag — checked without acquiring mutex
-	lastUsed time.Time
-	isPwsh   bool   // true if using pwsh.exe (PowerShell 7+, supports && natively)
-	lastCwd  string // last known working directory of this PS process
+	cmd        *exec.Cmd
+	stdin      io.WriteCloser
+	stdoutPipe io.ReadCloser  // raw pipe — stored for explicit Close in forceKill
+	stdout     *bufio.Reader
+	stderr     io.ReadCloser
+	mutex      sync.Mutex
+	healthy    atomic.Bool // lock-free health flag — checked without acquiring mutex
+	lastUsed   time.Time
+	isPwsh     bool   // true if using pwsh.exe (PowerShell 7+, supports && natively)
+	lastCwd    string // last known working directory of this PS process
 }
 
 var (
@@ -132,12 +133,13 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 	}
 
 	ps := &PersistentPowerShell{
-		cmd:      cmd,
-		stdin:    stdin,
-		stdout:   bufio.NewReader(stdout),
-		stderr:   stderr,
-		lastUsed: time.Now(),
-		isPwsh:   psExe == "pwsh.exe",
+		cmd:        cmd,
+		stdin:      stdin,
+		stdoutPipe: stdout,
+		stdout:     bufio.NewReader(stdout),
+		stderr:     stderr,
+		lastUsed:   time.Now(),
+		isPwsh:     psExe == "pwsh.exe",
 	}
 	ps.healthy.Store(true)
 
@@ -365,6 +367,9 @@ func (ps *PersistentPowerShell) forceKill() {
 
 	if ps.stdin != nil {
 		ps.stdin.Close()
+	}
+	if ps.stdoutPipe != nil {
+		ps.stdoutPipe.Close()
 	}
 	if ps.stderr != nil {
 		ps.stderr.Close()

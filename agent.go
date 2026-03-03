@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.62" // Fix persistent PowerShell deadlock: atomic health flag, mutex timeout, force-kill without lock
+const Version = "v0.5.63" // Hide console windows for all subprocess paths, fix newline injection in needsQuoting, fix stdout pipe leak
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

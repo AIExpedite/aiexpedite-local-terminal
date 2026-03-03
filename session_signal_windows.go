@@ -38,6 +38,7 @@ func sendInterrupt(process *os.Process) error {
 
 	// Fallback: use taskkill for a graceful termination
 	killCmd := exec.Command("taskkill", "/PID", fmt.Sprintf("%d", process.Pid))
+	hideWindow(killCmd)
 	if killErr := killCmd.Run(); killErr != nil {
 		return fmt.Errorf("GenerateConsoleCtrlEvent failed (%v), taskkill also failed: %w", err, killErr)
 	}
