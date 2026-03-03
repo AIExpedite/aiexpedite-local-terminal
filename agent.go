@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.59" // Fix: IsPersistentPSPwsh falls back to PATH check; runViaShell uses pwsh.exe when available
+const Version = "v0.5.60" // Fix: Prioritize ping before staleness check; increase MaxOutstandingMessages to 10
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

@@ -603,7 +603,7 @@ func runPubSubConnection(cfg *Config) error {
 	// Use configurable MaxOutstandingMessages for parallel processing
 	sub.ReceiveSettings.MaxOutstandingMessages = cfg.MaxOutstandingMessages
 	if sub.ReceiveSettings.MaxOutstandingMessages <= 0 {
-		sub.ReceiveSettings.MaxOutstandingMessages = 5 // Default to 5 for better throughput
+		sub.ReceiveSettings.MaxOutstandingMessages = 10 // Default to 10 for faster stale-command drain
 	}
 	fmt.Printf("[pubsub] MaxOutstandingMessages set to %d\n", sub.ReceiveSettings.MaxOutstandingMessages)
 
@@ -642,6 +642,29 @@ func runPubSubConnection(cfg *Config) error {
 				m.Nack()
 				return
 			}
+
+			// ─── Priority Ping Handler ───────────────────────────────────────
+			// Process pings BEFORE staleness/rate-limit/signature checks so that
+			// online-status pings are never delayed by a backlog of stale commands
+			// in the Pub/Sub queue.
+			if cmd.Command == "__ping__" {
+				res := resultMsg{
+					ID:          cmd.ID,
+					WorkspaceID: cmd.WorkspaceID,
+					UID:         cmd.UID,
+					AgentID:     cmd.AgentID,
+					Output:      "pong",
+					Status:      "success",
+					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
+				}
+				if err := publishMsg(ctx, topic, res); err != nil {
+					fmt.Printf("%s[aiexpedite] Ping publish error: %v%s\n", colorRed, err, colorReset)
+				}
+				m.Ack()
+				return
+			}
+			// ─────────────────────────────────────────────────────────────────
 
 			// ─── Command Staleness Check ──────────────────────────────────────
 			// Reject commands older than maxCommandAgeSec to prevent processing
@@ -755,28 +778,6 @@ func runPubSubConnection(cfg *Config) error {
 					return
 				}
 				// Signature verified - proceed silently
-			}
-			// ─────────────────────────────────────────────────────────────────
-
-			// ─── Special Ping Command Handler ────────────────────────────────
-			// Responds immediately without shell execution for online status checks
-			if cmd.Command == "__ping__" {
-				// Ping is silent - no console output
-				res := resultMsg{
-					ID:          cmd.ID,
-					WorkspaceID: cmd.WorkspaceID,
-					UID:         cmd.UID,
-					AgentID:     cmd.AgentID, // Include for version update in terminalAgents
-					Output:      "pong",
-					Status:      "success",
-					Ts:          time.Now().UnixMilli(),
-					Version:     Version,
-				}
-				if err := publishMsg(ctx, topic, res); err != nil {
-					fmt.Printf("%s[aiexpedite] Ping publish error: %v%s\n", colorRed, err, colorReset)
-				}
-				m.Ack()
-				return
 			}
 			// ─────────────────────────────────────────────────────────────────
 
