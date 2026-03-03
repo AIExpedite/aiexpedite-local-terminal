@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.61" // Add GCS upload error visibility: per-file error logging, eager auth validation, WIF diagnostic output
+const Version = "v0.5.62" // Fix persistent PowerShell deadlock: atomic health flag, mutex timeout, force-kill without lock
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

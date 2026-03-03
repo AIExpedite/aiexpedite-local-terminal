@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -44,6 +45,10 @@ const (
 	psExitCodeMarker = "<<<AIEXPEDITE_EXIT_7f3d2a1b>>>"
 	// Timeout for health check commands
 	psHealthTimeout = 5 * time.Second
+	// Maximum time to wait for the mutex before giving up and falling back.
+	// If a command is stuck holding the mutex, new commands should not block
+	// forever — they should fall back to one-shot PowerShell processes.
+	psMutexAcquireTimeout = 10 * time.Second
 )
 
 // PersistentPowerShell manages a long-running PowerShell process
@@ -53,7 +58,7 @@ type PersistentPowerShell struct {
 	stdout   *bufio.Reader
 	stderr   io.ReadCloser
 	mutex    sync.Mutex
-	healthy  bool
+	healthy  atomic.Bool // lock-free health flag — checked without acquiring mutex
 	lastUsed time.Time
 	isPwsh   bool   // true if using pwsh.exe (PowerShell 7+, supports && natively)
 	lastCwd  string // last known working directory of this PS process
@@ -75,7 +80,7 @@ func GetPowerShell() (*PersistentPowerShell, error) {
 
 	// Kill old instance if exists
 	if globalPS != nil {
-		globalPS.closeInternal()
+		globalPS.forceKill()
 		globalPS = nil
 	}
 
@@ -131,14 +136,14 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 		stdin:    stdin,
 		stdout:   bufio.NewReader(stdout),
 		stderr:   stderr,
-		healthy:  true,
 		lastUsed: time.Now(),
 		isPwsh:   psExe == "pwsh.exe",
 	}
+	ps.healthy.Store(true)
 
 	// Verify process is responsive with a health check
 	if err := ps.healthCheck(); err != nil {
-		ps.closeInternal()
+		ps.forceKill()
 		return nil, fmt.Errorf("PowerShell health check failed: %w", err)
 	}
 
@@ -146,14 +151,44 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 	return ps, nil
 }
 
+// tryLockWithTimeout attempts to acquire the mutex within the given duration.
+// Returns true if the lock was acquired, false if it timed out.
+func (ps *PersistentPowerShell) tryLockWithTimeout(timeout time.Duration) bool {
+	// Fast path: try immediate acquisition
+	if ps.mutex.TryLock() {
+		return true
+	}
+
+	// Slow path: poll with increasing intervals up to the timeout
+	deadline := time.Now().Add(timeout)
+	interval := 5 * time.Millisecond
+	for time.Now().Before(deadline) {
+		time.Sleep(interval)
+		if ps.mutex.TryLock() {
+			return true
+		}
+		// Increase interval (cap at 100ms) to reduce CPU spin
+		if interval < 100*time.Millisecond {
+			interval = interval * 2
+		}
+	}
+	return false
+}
+
 // Execute runs a command and returns the output.
 // Tracks the working directory across calls — only issues Set-Location when
 // the requested cwd differs from where the process already is.
 func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd string) (string, error) {
-	ps.mutex.Lock()
+	// Try to acquire the mutex with a timeout. If another command is stuck
+	// holding the mutex, we return an error so the caller can fall back to
+	// a one-shot PowerShell process instead of blocking indefinitely.
+	if !ps.tryLockWithTimeout(psMutexAcquireTimeout) {
+		ps.healthy.Store(false)
+		return "", fmt.Errorf("PowerShell mutex acquisition timed out (another command may be stuck)")
+	}
 	defer ps.mutex.Unlock()
 
-	if !ps.healthy {
+	if !ps.healthy.Load() {
 		return "", fmt.Errorf("PowerShell process is not healthy")
 	}
 
@@ -194,7 +229,7 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 	// Send command to PowerShell
 	_, err := fmt.Fprintln(ps.stdin, fullCmd.String())
 	if err != nil {
-		ps.healthy = false
+		ps.healthy.Store(false)
 		return "", fmt.Errorf("failed to send command: %w", err)
 	}
 
@@ -283,10 +318,10 @@ func (ps *PersistentPowerShell) Execute(ctx context.Context, command string, cwd
 		}
 		return result.output, nil
 	case err := <-errChan:
-		ps.healthy = false
+		ps.healthy.Store(false)
 		return "", fmt.Errorf("failed to read output: %w", err)
 	case <-ctx.Done():
-		ps.healthy = false
+		ps.healthy.Store(false)
 		// Kill the process so the reader goroutine unblocks on pipe EOF
 		if ps.cmd.Process != nil {
 			ps.cmd.Process.Kill()
@@ -313,28 +348,20 @@ func (ps *PersistentPowerShell) healthCheck() error {
 	return nil
 }
 
-// IsHealthy returns whether the PowerShell process is healthy
-// This method acquires the mutex to check process state
+// IsHealthy returns whether the PowerShell process is healthy.
+// Uses atomic load — does NOT acquire the mutex, so it never blocks even
+// when Execute is stuck holding the lock.
 func (ps *PersistentPowerShell) IsHealthy() bool {
-	ps.mutex.Lock()
-	defer ps.mutex.Unlock()
-
-	if !ps.healthy {
-		return false
-	}
-
-	// Check if process has exited
-	if ps.cmd.ProcessState != nil {
-		ps.healthy = false
-		return false
-	}
-
-	return true
+	return ps.healthy.Load()
 }
 
-// closeInternal terminates the PowerShell process (must be called with mutex held or from global lock)
-func (ps *PersistentPowerShell) closeInternal() {
-	ps.healthy = false
+// forceKill terminates the PowerShell process WITHOUT acquiring the mutex.
+// This is safe to call even when Execute holds the mutex (e.g., during a
+// stuck command). Killing the process will cause the reader goroutine in
+// Execute to receive a pipe EOF, which unblocks the select and releases
+// the mutex naturally.
+func (ps *PersistentPowerShell) forceKill() {
+	ps.healthy.Store(false)
 
 	if ps.stdin != nil {
 		ps.stdin.Close()
@@ -347,24 +374,30 @@ func (ps *PersistentPowerShell) closeInternal() {
 		ps.cmd.Wait()
 	}
 
-	fmt.Println("[powershell] Persistent PowerShell process closed")
+	fmt.Println("[powershell] Persistent PowerShell process force-killed")
 }
 
-// Close terminates the PowerShell process
+// Close terminates the PowerShell process.
+// Tries an orderly shutdown by acquiring the mutex first, but falls back to
+// forceKill if the mutex is stuck (e.g. Execute is blocked on a hung command).
 func (ps *PersistentPowerShell) Close() {
-	ps.mutex.Lock()
-	defer ps.mutex.Unlock()
-	ps.closeInternal()
+	if ps.tryLockWithTimeout(3 * time.Second) {
+		ps.mutex.Unlock()
+	}
+	// Whether or not we got the mutex, kill the process. forceKill is
+	// idempotent and safe to call concurrently — it just sets healthy=false,
+	// closes pipes, kills the process, and waits for exit.
+	ps.forceKill()
 }
 
-// RestartPowerShell forcefully restarts the PowerShell process
-// Use this when the process becomes unresponsive
+// RestartPowerShell forcefully restarts the PowerShell process.
+// Uses forceKill instead of Close to avoid deadlock when Execute holds the mutex.
 func RestartPowerShell() error {
 	globalPSLock.Lock()
 	defer globalPSLock.Unlock()
 
 	if globalPS != nil {
-		globalPS.Close()
+		globalPS.forceKill()
 		globalPS = nil
 	}
 
@@ -395,7 +428,7 @@ func ShutdownPowerShell() {
 // pwsh.exe instead of the legacy powershell.exe, which does not support &&.
 func IsPersistentPSPwsh() bool {
 	globalPSLock.Lock()
-	isPwsh := globalPS != nil && globalPS.healthy && globalPS.isPwsh
+	isPwsh := globalPS != nil && globalPS.healthy.Load() && globalPS.isPwsh
 	globalPSLock.Unlock()
 
 	if isPwsh {
@@ -412,7 +445,7 @@ func IsPersistentPSPwsh() bool {
 func GetTrackedCwd() string {
 	globalPSLock.Lock()
 	defer globalPSLock.Unlock()
-	if globalPS != nil && globalPS.healthy {
+	if globalPS != nil && globalPS.healthy.Load() {
 		return globalPS.lastCwd
 	}
 	return ""
