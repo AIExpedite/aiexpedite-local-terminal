@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -112,6 +113,18 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	if cwd != "" {
 		proc.Dir = cwd
 	}
+
+	// Strip CLAUDECODE env var so Claude Code doesn't detect a nested session
+	// and refuse to start. The Go agent may inherit this variable if it was
+	// launched from within a Claude Code context.
+	cleanEnv := os.Environ()
+	filtered := cleanEnv[:0]
+	for _, e := range cleanEnv {
+		if !strings.HasPrefix(e, "CLAUDECODE=") {
+			filtered = append(filtered, e)
+		}
+	}
+	proc.Env = filtered
 
 	// Set up pipes
 	stdin, err := proc.StdinPipe()

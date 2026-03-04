@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.6.2" // Remove --input-format stream-json that blocked Claude waiting for NDJSON stdin
+const Version = "v0.6.3" // Strip CLAUDECODE env var from child processes to prevent nested session detection
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
