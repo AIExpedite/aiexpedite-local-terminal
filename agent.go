@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.6.5" // Add --include-partial-messages for Claude streaming, add scanner debug logging
+const Version = "v0.6.6" // Use bidirectional stream-json for Claude (send prompt via stdin NDJSON)
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

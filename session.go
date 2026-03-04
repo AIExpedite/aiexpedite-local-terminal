@@ -99,8 +99,9 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		return fmt.Errorf("session %s already exists", id)
 	}
 
-	// Build the CLI command with appropriate flags for structured streaming
-	cliArgs := buildInteractiveCLIArgs(command, args)
+	// Build the CLI command with appropriate flags for structured streaming.
+	// stdinPrompt is non-empty for Claude — the prompt is sent as NDJSON on stdin.
+	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args)
 
 	// Resolve executable path
 	executable := resolveExecutable(command)
@@ -182,6 +183,20 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	fmt.Printf("%s[session] Session %s started (PID: %d)%s\n",
 		colorGreen, id, proc.Process.Pid, colorReset)
+
+	// For Claude with --input-format stream-json, send the initial prompt as
+	// an NDJSON message on stdin.  Claude waits for this before producing output.
+	if stdinPrompt != "" {
+		initMsg := fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%s},"session_id":"%s","parent_tool_use_id":null}`,
+			jsonEscapeString(stdinPrompt), id)
+		if _, err := fmt.Fprintln(session.Stdin, initMsg); err != nil {
+			fmt.Printf("%s[session] Failed to send initial prompt to %s: %v%s\n",
+				colorRed, id, err, colorReset)
+		} else {
+			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars)%s\n",
+				colorGreen, id, len(stdinPrompt), colorReset)
+		}
+	}
 
 	return nil
 }
@@ -582,71 +597,54 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 
 // buildInteractiveCLIArgs builds CLI arguments for interactive streaming mode.
 // Each CLI agent has different flags for structured JSON output.
-func buildInteractiveCLIArgs(command string, args []string) []string {
+// Returns (cliArgs, stdinPrompt) — stdinPrompt is non-empty only for Claude,
+// where the prompt must be sent as NDJSON on stdin rather than as a CLI arg.
+func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
 	cmdLower := strings.ToLower(command)
 
 	switch {
 	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
 		return buildClaudeInteractiveArgs(args)
 	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
-		return buildCodexInteractiveArgs(args)
+		return buildCodexInteractiveArgs(args), ""
 	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
-		return buildGeminiInteractiveArgs(args)
+		return buildGeminiInteractiveArgs(args), ""
 	default:
-		return args
+		return args, ""
 	}
 }
 
-// buildClaudeInteractiveArgs builds Claude Code CLI args for interactive streaming.
-// Uses --output-format stream-json for structured event output and -p for print mode
-// (required for stream-json to work in non-TTY). The prompt words must be joined into
-// a single -p value; passing them as separate positional args causes Claude Code to
-// fall into interactive TUI mode which hangs without a real TTY.
-func buildClaudeInteractiveArgs(args []string) []string {
-	result := make([]string, 0, len(args)+4)
+// buildClaudeInteractiveArgs builds Claude Code CLI args for bidirectional
+// stream-json mode.  The prompt is NOT passed as a CLI arg — it is returned
+// separately so the caller can send it as an NDJSON message on stdin.
+// Returns (cliArgs, promptText).
+func buildClaudeInteractiveArgs(args []string) ([]string, string) {
+	result := []string{
+		"--output-format", "stream-json",
+		"--input-format", "stream-json",
+		"--verbose",
+		"--include-partial-messages",
+	}
 
-	// Add structured streaming output format with --verbose (required for stream-json).
-	// Note: --input-format stream-json is NOT used because it causes Claude to block
-	// waiting for NDJSON on stdin before producing any output.
-	result = append(result, "--output-format", "stream-json")
-	result = append(result, "--verbose")
-	result = append(result, "--include-partial-messages")
-
-	// Check if user already passed -p / --print
-	hasPrint := false
+	// Separate user-provided flags from prompt words.
+	// -p / --print are absorbed (we add our own -p).
+	var flags []string
+	var promptParts []string
 	for _, a := range args {
 		if a == "-p" || a == "--print" {
-			hasPrint = true
-			break
+			continue
 		}
-	}
-
-	if hasPrint {
-		// User already provided -p/--print — pass args as-is
-		result = append(result, args...)
-	} else {
-		// Separate flags from prompt words so we can join prompt into a single -p value
-		var flags []string
-		var promptParts []string
-		for _, a := range args {
-			if strings.HasPrefix(a, "-") {
-				flags = append(flags, a)
-			} else {
-				promptParts = append(promptParts, a)
-			}
-		}
-		// Add any user flags first
-		result = append(result, flags...)
-		// Add -p with the joined prompt as a single argument
-		if len(promptParts) > 0 {
-			result = append(result, "-p", strings.Join(promptParts, " "))
+		if strings.HasPrefix(a, "-") {
+			flags = append(flags, a)
 		} else {
-			// No prompt text — still need --print for non-TTY/streaming mode
-			result = append(result, "--print")
+			promptParts = append(promptParts, a)
 		}
 	}
 
-	return result
+	result = append(result, flags...)
+	result = append(result, "-p")
+
+	return result, strings.Join(promptParts, " ")
 }
 
 // buildCodexInteractiveArgs builds Codex CLI args for interactive streaming.
@@ -809,6 +807,13 @@ func detectGeminiPrompt(event map[string]interface{}) *promptInfo {
 /* --------------------------------------------------------------------------
    Process signal helpers (platform-specific interrupt is in session_signal_*.go)
    -------------------------------------------------------------------------- */
+
+// jsonEscapeString returns s as a JSON-encoded string literal (with surrounding quotes).
+// Used to safely embed user text inside hand-built JSON messages.
+func jsonEscapeString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
 
 // interruptProcess sends an interrupt signal to the process.
 // On Windows this uses GenerateConsoleCtrlEvent, on Unix it sends SIGINT.
