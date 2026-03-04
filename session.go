@@ -389,17 +389,41 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		defer wg.Done()
 		scanner := bufio.NewScanner(session.Stdout)
 		scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024) // 1MB max line
+		fmt.Printf("%s[session] stdout scanner started for %s%s\n", colorCyan, session.ID, colorReset)
+		lineCount := 0
 		for scanner.Scan() {
-			lines <- streamLine{text: scanner.Text(), source: "stdout"}
+			lineCount++
+			text := scanner.Text()
+			if lineCount <= 3 {
+				fmt.Printf("%s[session] stdout[%d] %s: %s%s\n",
+					colorCyan, lineCount, session.ID, truncateString(text, 120), colorReset)
+			}
+			lines <- streamLine{text: text, source: "stdout"}
 		}
+		if err := scanner.Err(); err != nil {
+			fmt.Printf("%s[session] stdout scanner error for %s: %v%s\n", colorRed, session.ID, err, colorReset)
+		}
+		fmt.Printf("%s[session] stdout scanner done for %s (%d lines)%s\n", colorYellow, session.ID, lineCount, colorReset)
 	}()
 	go func() {
 		defer wg.Done()
 		scanner := bufio.NewScanner(session.Stderr)
 		scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024) // 1MB max line
+		fmt.Printf("%s[session] stderr scanner started for %s%s\n", colorCyan, session.ID, colorReset)
+		lineCount := 0
 		for scanner.Scan() {
-			lines <- streamLine{text: scanner.Text(), source: "stderr"}
+			lineCount++
+			text := scanner.Text()
+			if lineCount <= 3 {
+				fmt.Printf("%s[session] stderr[%d] %s: %s%s\n",
+					colorYellow, lineCount, session.ID, truncateString(text, 120), colorReset)
+			}
+			lines <- streamLine{text: text, source: "stderr"}
 		}
+		if err := scanner.Err(); err != nil {
+			fmt.Printf("%s[session] stderr scanner error for %s: %v%s\n", colorRed, session.ID, err, colorReset)
+		}
+		fmt.Printf("%s[session] stderr scanner done for %s (%d lines)%s\n", colorYellow, session.ID, lineCount, colorReset)
 	}()
 
 	// Close lines channel when both readers are done
@@ -586,6 +610,7 @@ func buildClaudeInteractiveArgs(args []string) []string {
 	// waiting for NDJSON on stdin before producing any output.
 	result = append(result, "--output-format", "stream-json")
 	result = append(result, "--verbose")
+	result = append(result, "--include-partial-messages")
 
 	// Check if user already passed -p / --print
 	hasPrint := false
