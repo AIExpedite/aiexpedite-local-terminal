@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.6.7" // Close stdin after sending Claude prompt to trigger EOF and clean exit
+const Version = "v0.6.7" // Close stdin on Claude result event for clean exit while keeping stdin open for conversation
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

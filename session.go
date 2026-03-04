@@ -188,8 +188,9 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	// For Claude with --input-format stream-json, send the initial prompt as
 	// an NDJSON message on stdin.  Claude waits for this before producing output.
-	// After sending, close stdin so Claude sees EOF and exits after responding
-	// (in -p mode, Claude processes one prompt then exits on stdin EOF).
+	// Stdin stays open so the user can send follow-up messages (approvals,
+	// clarifications) via SendInput.  Stdin is closed when Claude emits a
+	// "result" event (detected in readOutputStream) signalling the turn is done.
 	if stdinPrompt != "" {
 		initMsg := fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%s},"session_id":"%s","parent_tool_use_id":null}`,
 			jsonEscapeString(stdinPrompt), id)
@@ -200,8 +201,6 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars)%s\n",
 				colorGreen, id, len(stdinPrompt), colorReset)
 		}
-		// Close stdin to signal EOF — Claude will finish processing and exit.
-		session.Stdin.Close()
 	}
 
 	return nil
@@ -510,6 +509,16 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				return
 			}
 
+			// For Claude stream-json: detect the "result" event that signals
+			// the turn is complete.  Close stdin so Claude sees EOF and exits.
+			if detectResultEvent(session.Command, line.text) {
+				session.mu.Lock()
+				session.Stdin.Close()
+				session.mu.Unlock()
+				fmt.Printf("%s[session] Result event received — closed stdin for %s%s\n",
+					colorGreen, session.ID, colorReset)
+			}
+
 			// Try to parse as JSON event for structured detection
 			if promptInfo := detectPromptFromJSON(session.Command, line.text); promptInfo != nil {
 				// Flush any buffered output first
@@ -774,6 +783,26 @@ func detectPromptFromJSON(command, line string) *promptInfo {
 	}
 
 	return nil
+}
+
+// detectResultEvent returns true if the line is a Claude "result" event,
+// signalling that the current turn is complete and stdin can be closed.
+// Only applies to Claude sessions using --output-format stream-json.
+func detectResultEvent(command, line string) bool {
+	cmdLower := strings.ToLower(command)
+	if cmdLower != "claude" && !strings.HasPrefix(cmdLower, "claude") {
+		return false
+	}
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var event map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &event); err != nil {
+		return false
+	}
+	eventType, _ := event["type"].(string)
+	return eventType == "result"
 }
 
 // detectClaudePrompt detects permission requests in Claude's stream-json output.
