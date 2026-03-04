@@ -188,6 +188,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	// For Claude with --input-format stream-json, send the initial prompt as
 	// an NDJSON message on stdin.  Claude waits for this before producing output.
+	// After sending, close stdin so Claude sees EOF and exits after responding
+	// (in -p mode, Claude processes one prompt then exits on stdin EOF).
 	if stdinPrompt != "" {
 		initMsg := fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%s},"session_id":"%s","parent_tool_use_id":null}`,
 			jsonEscapeString(stdinPrompt), id)
@@ -198,6 +200,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars)%s\n",
 				colorGreen, id, len(stdinPrompt), colorReset)
 		}
+		// Close stdin to signal EOF — Claude will finish processing and exit.
+		session.Stdin.Close()
 	}
 
 	return nil

@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.6.6" // Use bidirectional stream-json for Claude (send prompt via stdin NDJSON)
+const Version = "v0.6.7" // Close stdin after sending Claude prompt to trigger EOF and clean exit
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
