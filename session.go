@@ -561,12 +561,11 @@ func buildInteractiveCLIArgs(command string, args []string) []string {
 func buildClaudeInteractiveArgs(args []string) []string {
 	result := make([]string, 0, len(args)+4)
 
-	// Add structured streaming I/O format.
-	// --input-format stream-json keeps Claude alive after the initial prompt so
-	// follow-up messages can be sent via stdin JSON, enabling conversations.
+	// Add structured streaming output format with --verbose (required for stream-json).
+	// Note: --input-format stream-json is NOT used because it causes Claude to block
+	// waiting for NDJSON on stdin before producing any output.
 	result = append(result, "--output-format", "stream-json")
-	result = append(result, "--input-format", "stream-json")
-	result = append(result, "--verbose") // Required when using --print with --output-format=stream-json
+	result = append(result, "--verbose")
 
 	// Check if user already passed -p / --print
 	hasPrint := false
@@ -606,13 +605,13 @@ func buildClaudeInteractiveArgs(args []string) []string {
 }
 
 // buildCodexInteractiveArgs builds Codex CLI args for interactive streaming.
-// Uses exec mode with --json for JSONL event output and --approval-mode full-auto
-// to auto-approve all tool calls (stdin relay is not possible with exec).
+// Uses exec mode with --json for JSONL event output and --full-auto for
+// low-friction sandboxed automatic execution.
 func buildCodexInteractiveArgs(args []string) []string {
 	result := make([]string, 0, len(args)+4)
 	result = append(result, "exec")
 	result = append(result, "--json")
-	result = append(result, "--approval-mode", "full-auto")
+	result = append(result, "--full-auto")
 	result = append(result, args...)
 	return result
 }

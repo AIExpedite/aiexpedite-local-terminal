@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.6.1" // Add --verbose flag required by Claude Code for --print + --output-format=stream-json
+const Version = "v0.6.2" // Remove --input-format stream-json that blocked Claude waiting for NDJSON stdin
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
