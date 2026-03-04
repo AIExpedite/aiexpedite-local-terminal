@@ -118,13 +118,20 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// and refuse to start. The Go agent may inherit this variable if it was
 	// launched from within a Claude Code context.
 	cleanEnv := os.Environ()
-	filtered := cleanEnv[:0]
+	filtered := make([]string, 0, len(cleanEnv))
+	hadClaudeCode := false
 	for _, e := range cleanEnv {
-		if !strings.HasPrefix(e, "CLAUDECODE=") {
-			filtered = append(filtered, e)
+		if strings.HasPrefix(e, "CLAUDECODE=") {
+			hadClaudeCode = true
+			continue
 		}
+		filtered = append(filtered, e)
 	}
 	proc.Env = filtered
+	if hadClaudeCode {
+		fmt.Printf("%s[session] Stripped CLAUDECODE env var from session %s%s\n",
+			colorYellow, id, colorReset)
+	}
 
 	// Set up pipes
 	stdin, err := proc.StdinPipe()

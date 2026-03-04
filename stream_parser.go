@@ -126,6 +126,14 @@ func extractClaudeInnerEvent(event map[string]interface{}) string {
 // extractClaudeFlatEvent handles Claude Code's native flat event format.
 func extractClaudeFlatEvent(raw map[string]interface{}, eventType string) string {
 	switch eventType {
+	case "assistant":
+		// Claude Code wraps assistant messages in {"type":"assistant","message":{...}}
+		msg, ok := raw["message"].(map[string]interface{})
+		if !ok {
+			return ""
+		}
+		return extractContentFromMessage(msg)
+
 	case "message":
 		role, _ := raw["role"].(string)
 		if role != "assistant" {
@@ -140,11 +148,43 @@ func extractClaudeFlatEvent(raw map[string]interface{}, eventType string) string
 		}
 		return ""
 
-	case "tool_result", "result", "init", "system":
+	case "tool_result", "result", "init", "system", "user", "rate_limit_event":
 		return "" // skip metadata
 	}
 
 	return ""
+}
+
+// extractContentFromMessage extracts display text from a Claude assistant message
+// envelope: {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+func extractContentFromMessage(msg map[string]interface{}) string {
+	content, ok := msg["content"].([]interface{})
+	if !ok {
+		return ""
+	}
+	var parts []string
+	for _, item := range content {
+		block, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		blockType, _ := block["type"].(string)
+		switch blockType {
+		case "text":
+			text, _ := block["text"].(string)
+			if text != "" {
+				parts = append(parts, text)
+			}
+		case "tool_use":
+			name, _ := block["name"].(string)
+			if name != "" {
+				parts = append(parts, fmt.Sprintf("\n[Using tool: %s]\n", name))
+			}
+		case "thinking":
+			// Skip thinking blocks in display output
+		}
+	}
+	return strings.Join(parts, "")
 }
 
 /* --------------------------------------------------------------------------
