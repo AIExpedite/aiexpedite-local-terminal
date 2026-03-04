@@ -115,23 +115,25 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		proc.Dir = cwd
 	}
 
-	// Strip CLAUDECODE env var so Claude Code doesn't detect a nested session
-	// and refuse to start. The Go agent may inherit this variable if it was
-	// launched from within a Claude Code context.
+	// Strip CLAUDECODE and CLAUDE_* env vars so Claude Code doesn't detect a
+	// nested session or inherit IDE-specific settings (CLAUDE_CODE_ENTRYPOINT,
+	// CLAUDE_AGENT_SDK_VERSION, etc.).  The Go agent may inherit these if
+	// launched from within a Claude Code or VSCode context.
 	cleanEnv := os.Environ()
 	filtered := make([]string, 0, len(cleanEnv))
-	hadClaudeCode := false
+	var strippedVars []string
 	for _, e := range cleanEnv {
-		if strings.HasPrefix(e, "CLAUDECODE=") {
-			hadClaudeCode = true
+		upper := strings.ToUpper(e)
+		if strings.HasPrefix(upper, "CLAUDECODE=") || strings.HasPrefix(upper, "CLAUDE_") {
+			strippedVars = append(strippedVars, e[:strings.Index(e, "=")])
 			continue
 		}
 		filtered = append(filtered, e)
 	}
 	proc.Env = filtered
-	if hadClaudeCode {
-		fmt.Printf("%s[session] Stripped CLAUDECODE env var from session %s%s\n",
-			colorYellow, id, colorReset)
+	if len(strippedVars) > 0 {
+		fmt.Printf("%s[session] Stripped env vars from session %s: %s%s\n",
+			colorYellow, id, strings.Join(strippedVars, ", "), colorReset)
 	}
 
 	// Set up pipes
@@ -206,6 +208,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
    -------------------------------------------------------------------------- */
 
 // SendInput writes text to the stdin of the specified session.
+// For Claude sessions using --input-format stream-json, the text is wrapped
+// in an NDJSON user message envelope.  For other CLIs it is sent as raw text.
 func (sm *SessionManager) SendInput(id, text string) error {
 	sm.mu.RLock()
 	session, exists := sm.sessions[id]
@@ -222,8 +226,16 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		return fmt.Errorf("session %s has ended", id)
 	}
 
+	// For Claude sessions, wrap input in NDJSON user message envelope
+	payload := text
+	cmdLower := strings.ToLower(session.Command)
+	if cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude") {
+		payload = fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%s},"session_id":"%s","parent_tool_use_id":null}`,
+			jsonEscapeString(text), id)
+	}
+
 	// Write input followed by newline
-	_, err := fmt.Fprintln(session.Stdin, text)
+	_, err := fmt.Fprintln(session.Stdin, payload)
 	if err != nil {
 		return fmt.Errorf("failed to write to session %s stdin: %w", id, err)
 	}
@@ -626,19 +638,39 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 		"--include-partial-messages",
 	}
 
+	// Claude flags that consume the next argument as their value.
+	// Without this, "--model sonnet" would treat "sonnet" as a prompt word.
+	valuedFlags := map[string]bool{
+		"--model": true, "--system-prompt": true, "--append-system-prompt": true,
+		"--permission-mode": true, "--max-budget-usd": true, "--effort": true,
+		"--agent": true, "--agents": true, "--session-id": true,
+		"--mcp-config": true, "--settings": true, "--json-schema": true,
+		"--fallback-model": true, "--debug-file": true, "--setting-sources": true,
+	}
+
 	// Separate user-provided flags from prompt words.
 	// -p / --print are absorbed (we add our own -p).
 	var flags []string
 	var promptParts []string
-	for _, a := range args {
+	skipNext := false
+	for i, a := range args {
+		if skipNext {
+			skipNext = false
+			flags = append(flags, a)
+			continue
+		}
 		if a == "-p" || a == "--print" {
 			continue
 		}
 		if strings.HasPrefix(a, "-") {
 			flags = append(flags, a)
-		} else {
-			promptParts = append(promptParts, a)
+			// If this flag expects a value and there's a next arg, consume it too
+			if valuedFlags[a] && i+1 < len(args) {
+				skipNext = true
+			}
+			continue
 		}
+		promptParts = append(promptParts, a)
 	}
 
 	result = append(result, flags...)

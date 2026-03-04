@@ -38,7 +38,7 @@ jobs:
             exe_suffix: "-beta"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -65,7 +65,7 @@ jobs:
           go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe" .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.0
         with:
           name: nonprod-${{ matrix.env }}-windows-amd64
           path: dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe
@@ -78,7 +78,7 @@ jobs:
     needs: build-nonprod
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
 
       - name: Download non-prod binaries
         uses: actions/download-artifact@v4
@@ -112,7 +112,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish non-prod pre-release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: latest-internal
           name: "Internal Builds (${{ steps.sha.outputs.short_sha }})"
@@ -142,7 +142,7 @@ jobs:
     needs: build-nonprod
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
 
       - name: Download dev binary only
         uses: actions/download-artifact@v4
@@ -176,7 +176,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish dev release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: latest-dev
           name: "Dev Build ${{ steps.version.outputs.version }} (${{ steps.sha.outputs.short_sha }})"
