@@ -566,6 +566,7 @@ func buildClaudeInteractiveArgs(args []string) []string {
 	// follow-up messages can be sent via stdin JSON, enabling conversations.
 	result = append(result, "--output-format", "stream-json")
 	result = append(result, "--input-format", "stream-json")
+	result = append(result, "--verbose") // Required when using --print with --output-format=stream-json
 
 	// Check if user already passed -p / --print
 	hasPrint := false
