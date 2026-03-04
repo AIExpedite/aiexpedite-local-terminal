@@ -554,17 +554,52 @@ func buildInteractiveCLIArgs(command string, args []string) []string {
 }
 
 // buildClaudeInteractiveArgs builds Claude Code CLI args for interactive streaming.
-// Uses --output-format stream-json for structured event output and --input-format
-// stream-json for structured input via stdin.
+// Uses --output-format stream-json for structured event output and -p for print mode
+// (required for stream-json to work in non-TTY). The prompt words must be joined into
+// a single -p value; passing them as separate positional args causes Claude Code to
+// fall into interactive TUI mode which hangs without a real TTY.
 func buildClaudeInteractiveArgs(args []string) []string {
 	result := make([]string, 0, len(args)+4)
 
-	// Add structured streaming flags
+	// Add structured streaming I/O format.
+	// --input-format stream-json keeps Claude alive after the initial prompt so
+	// follow-up messages can be sent via stdin JSON, enabling conversations.
 	result = append(result, "--output-format", "stream-json")
-	result = append(result, "--print") // Required for stream-json to work in non-TTY
+	result = append(result, "--input-format", "stream-json")
 
-	// Add the user's args (prompt and any other flags)
-	result = append(result, args...)
+	// Check if user already passed -p / --print
+	hasPrint := false
+	for _, a := range args {
+		if a == "-p" || a == "--print" {
+			hasPrint = true
+			break
+		}
+	}
+
+	if hasPrint {
+		// User already provided -p/--print — pass args as-is
+		result = append(result, args...)
+	} else {
+		// Separate flags from prompt words so we can join prompt into a single -p value
+		var flags []string
+		var promptParts []string
+		for _, a := range args {
+			if strings.HasPrefix(a, "-") {
+				flags = append(flags, a)
+			} else {
+				promptParts = append(promptParts, a)
+			}
+		}
+		// Add any user flags first
+		result = append(result, flags...)
+		// Add -p with the joined prompt as a single argument
+		if len(promptParts) > 0 {
+			result = append(result, "-p", strings.Join(promptParts, " "))
+		} else {
+			// No prompt text — still need --print for non-TTY/streaming mode
+			result = append(result, "--print")
+		}
+	}
 
 	return result
 }

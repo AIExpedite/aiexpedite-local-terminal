@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.5.63" // Hide console windows for all subprocess paths, fix newline injection in needsQuoting, fix stdout pipe leak
+const Version = "v0.6.0" // Fix Claude Code session hang: join prompt into single -p value, add --input-format stream-json for conversations
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
