@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.6.9" // Add --dangerously-skip-permissions for Claude Code CLI sessions
+const Version = "v0.6.10" // Add --dangerously-skip-permissions for Claude Code CLI sessions
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -200,7 +200,7 @@ func StartAgent(cfg *Config) {
 
 	/* 3b. Initialize Session Manager for interactive CLI agents ----------- */
 
-	globalSessionManager = NewSessionManager()
+	globalSessionManager = NewSessionManager(cfg)
 	go globalSessionManager.CleanupStale(sessionMaxLifetime)
 	fmt.Println("[aiexpedite] Session manager ready")
 

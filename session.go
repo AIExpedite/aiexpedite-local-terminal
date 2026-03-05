@@ -10,9 +10,11 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -73,12 +75,14 @@ type CLISession struct {
 type SessionManager struct {
 	sessions map[string]*CLISession
 	mu       sync.RWMutex
+	Config   *Config // Config for file upload settings
 }
 
 // NewSessionManager creates a new SessionManager.
-func NewSessionManager() *SessionManager {
+func NewSessionManager(cfg *Config) *SessionManager {
 	return &SessionManager{
 		sessions: make(map[string]*CLISession),
+		Config:   cfg,
 	}
 }
 
@@ -589,6 +593,49 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 
 	seq := atomic.AddInt64(&session.Seq, 1)
 
+	// Detect and upload output files (screenshots, test artifacts) before
+	// publishing session_ended so that file metadata is included in the message.
+	var uploadedFiles []FileInfo
+	var uploadErrors []UploadError
+	cfg := sm.Config
+	if cfg != nil && cfg.EnableFileUpload && session.WorkspaceID != "" && session.ExitCode == 0 {
+		effectiveDir := session.Process.Dir
+		if effectiveDir == "" {
+			effectiveDir = getTrackedCwd()
+		}
+		if effectiveDir != "" {
+			files := detectOutputFiles(session.Command, "", effectiveDir)
+			if len(files) > 0 {
+				fmt.Printf("[session-file-upload] Detected %d output files, uploading to GCS (workspace: %s)...\n", len(files), session.WorkspaceID)
+
+				uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				storageClient, storageErr := GetStorageClient(uploadCtx)
+				if storageErr != nil {
+					uploadCancel()
+					fmt.Printf("[session-file-upload] Failed to get storage client: %v\n", storageErr)
+				} else {
+					logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+					uploadResult := UploadFiles(
+						uploadCtx,
+						storageClient,
+						cfg.StorageBucket,
+						files,
+						session.WorkspaceID,
+						session.ID,
+						logger,
+					)
+					uploadCancel()
+
+					uploadedFiles = uploadResult.Successful
+					uploadErrors = uploadResult.Failed
+
+					fmt.Printf("[session-file-upload] Upload complete: %d successful, %d failed\n",
+						len(uploadResult.Successful), len(uploadResult.Failed))
+				}
+			}
+		}
+	}
+
 	// Publish session_ended in a goroutine: publishFn blocks up to 30 s on
 	// Pub/Sub network I/O.  Calling it directly here would delay removeSession
 	// (and therefore free the session slot for reuse) by up to 30 s, and would
@@ -596,17 +643,19 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// the session_ended message could arrive at the client before the last
 	// streamed lines despite having a higher sequence number.
 	go publishFn(resultMsg{
-		ID:          session.ID,
-		WorkspaceID: session.WorkspaceID,
-		UID:         session.UID,
-		Output:      fmt.Sprintf("Session ended (exit code: %d)", session.ExitCode),
-		Status:      "success",
-		Ts:          time.Now().UnixMilli(),
-		Version:     Version,
-		Type:        "session_ended",
-		SessionID:   session.ID,
-		ExitCode:    session.ExitCode,
-		Seq:         int(seq),
+		ID:           session.ID,
+		WorkspaceID:  session.WorkspaceID,
+		UID:          session.UID,
+		Output:       fmt.Sprintf("Session ended (exit code: %d)", session.ExitCode),
+		Status:       "success",
+		Ts:           time.Now().UnixMilli(),
+		Version:      Version,
+		Type:         "session_ended",
+		SessionID:    session.ID,
+		ExitCode:     session.ExitCode,
+		Seq:          int(seq),
+		Files:        uploadedFiles,
+		UploadErrors: uploadErrors,
 	})
 
 	fmt.Printf("%s[session] Session %s ended (exit code: %d)%s\n",
