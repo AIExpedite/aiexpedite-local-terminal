@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.6.8" // Detect result event to close stdin instead of closing immediately; keeps conversation open for follow-ups
+const Version = "v0.6.9" // Add --dangerously-skip-permissions for Claude Code CLI sessions
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)

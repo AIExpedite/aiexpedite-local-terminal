@@ -649,6 +649,7 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 		"--input-format", "stream-json",
 		"--verbose",
 		"--include-partial-messages",
+		"--dangerously-skip-permissions",
 	}
 
 	// Claude flags that consume the next argument as their value.
