@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,21 @@ func main() {
 		}
 	}
 
+	// Handle --update-from=<original_path> argument (self-replacement after update)
+	// When the app is launched from a temp path after an auto-update, this flag
+	// tells it to copy itself over the original exe and re-launch from there.
+	for _, arg := range os.Args[1:] {
+		if strings.HasPrefix(arg, "--update-from=") {
+			originalPath := strings.TrimPrefix(arg, "--update-from=")
+			if err := performSelfReplace(originalPath); err != nil {
+				fmt.Printf("[update] Self-replace failed: %v\n", err)
+				// Fall through to run normally from temp path as fallback
+			} else {
+				return // Successfully re-launched from install path; exit this temp process
+			}
+		}
+	}
+
 	// NOTE: When built as a GUI app (-H=windowsgui), there's no console window
 	// by default. Console will be allocated on-demand when user clicks "Show Console".
 
@@ -39,6 +55,9 @@ func main() {
 			allocateConsole()
 		}
 	}
+
+	// Clean up leftover update temp files from previous updates
+	go cleanupUpdateTempFiles()
 
 	// Load or create configuration
 	cfg, err := LoadConfig(ConfigPath())
@@ -428,7 +447,20 @@ func onTrayExit() {
 	// The update process needs to be started before we kill our process tree
 	if path, pending := GetUpdateReady(); pending && path != "" {
 		fmt.Println("Launching updated version…")
-		cmd := exec.Command(path)
+
+		// Pass our own exe path so the new process can replace us at the install location
+		originalExe, err := os.Executable()
+		if err != nil {
+			fmt.Printf("Warning: could not determine own exe path: %v\n", err)
+			originalExe = "" // Fall back to running from temp without replacement
+		}
+
+		args := []string{}
+		if originalExe != "" {
+			args = append(args, fmt.Sprintf("--update-from=%s", originalExe))
+		}
+
+		cmd := exec.Command(path, args...)
 		setNewConsole(cmd) // Ensure child process gets a fresh console with valid handles
 		if err := cmd.Start(); err != nil {
 			fmt.Printf("Failed to start update: %v\n", err)
@@ -487,6 +519,146 @@ func aggressiveCleanup() {
 
 	// Brief pause to let processes terminate
 	time.Sleep(500 * time.Millisecond)
+}
+
+/* ---------- self-replace (auto-update) ---------- */
+
+// performSelfReplace copies the currently running binary (from a temp path) over
+// the original install-path exe, then re-launches from the install path.
+// This is called when the app starts with --update-from=<original_path>.
+//
+// Flow:
+//  1. Old version downloads new binary to temp, quits, launches temp binary with --update-from
+//  2. This function (in the temp binary) waits for the old process to release the exe file
+//  3. Copies itself over the original path
+//  4. Launches the original path (now the new version) without --update-from
+//  5. Returns nil so the caller can exit the temp process
+func performSelfReplace(originalPath string) error {
+	myPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot determine own path: %w", err)
+	}
+
+	// Resolve symlinks so we compare real paths
+	myPath, _ = filepath.EvalSymlinks(myPath)
+	resolvedOriginal, _ := filepath.EvalSymlinks(originalPath)
+
+	// Safety: if we're already running from the install path, skip replacement
+	if strings.EqualFold(myPath, resolvedOriginal) {
+		fmt.Println("[update] Already running from install path, skipping self-replace")
+		return fmt.Errorf("already at install path")
+	}
+
+	fmt.Printf("[update] Self-replacing: %s → %s\n", myPath, originalPath)
+
+	// Wait for the old process to fully exit and release the file
+	// Retry copying for up to 10 seconds
+	var copyErr error
+	for attempt := 0; attempt < 20; attempt++ {
+		copyErr = copyFile(myPath, originalPath)
+		if copyErr == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if copyErr != nil {
+		return fmt.Errorf("failed to overwrite %s after retries: %w", originalPath, copyErr)
+	}
+
+	fmt.Printf("[update] Successfully replaced %s\n", originalPath)
+
+	// Re-launch from the install path (no --update-from flag this time)
+	cmd := exec.Command(originalPath)
+	setNewConsole(cmd)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to re-launch from install path: %w", err)
+	}
+
+	fmt.Println("[update] Re-launched from install path, exiting temp process")
+	return nil
+}
+
+// copyFile copies src to dst, overwriting dst if it exists.
+// Uses a temporary file + rename for atomic replacement where possible.
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	// Write to a temp file in the same directory as dst, then rename
+	// This avoids partial writes if the process is interrupted
+	dstDir := filepath.Dir(dst)
+	tmp, err := os.CreateTemp(dstDir, "update_*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+
+	if _, err := io.Copy(tmp, srcFile); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+
+	// Make executable
+	_ = os.Chmod(tmpName, 0o755)
+
+	// Rename over the target (atomic on most filesystems)
+	if err := os.Rename(tmpName, dst); err != nil {
+		// On Windows, Rename can fail if dst is still locked. Try direct overwrite.
+		os.Remove(tmpName)
+		return directCopy(src, dst)
+	}
+
+	return nil
+}
+
+// directCopy is a fallback that overwrites dst directly (non-atomic).
+func directCopy(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
+}
+
+// cleanupUpdateTempFiles removes leftover agent_update_*.exe files from the temp directory.
+// These are created by downloadAndApplyUpdate and may linger after a successful update.
+func cleanupUpdateTempFiles() {
+	pattern := filepath.Join(os.TempDir(), "agent_update_*")
+	matches, err := filepath.Glob(pattern)
+	if err != nil || len(matches) == 0 {
+		return
+	}
+
+	myPath, _ := os.Executable()
+	myPath, _ = filepath.EvalSymlinks(myPath)
+
+	for _, m := range matches {
+		resolved, _ := filepath.EvalSymlinks(m)
+		// Don't delete ourselves if we're still running from temp (fallback case)
+		if strings.EqualFold(resolved, myPath) {
+			continue
+		}
+		if err := os.Remove(m); err == nil {
+			fmt.Printf("[update] Cleaned up temp file: %s\n", filepath.Base(m))
+		}
+	}
 }
 
 /* ---------- util ---------- */

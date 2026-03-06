@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.6.11" // Detect Playwright artifacts from CLI agent sessions (claude/codex/gemini)
+const Version = "v0.6.12" // Auto-update self-replaces original exe instead of running from temp
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
