@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.6.10" // Add --dangerously-skip-permissions for Claude Code CLI sessions
+const Version = "v0.6.11" // Detect Playwright artifacts from CLI agent sessions (claude/codex/gemini)
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
