@@ -171,6 +171,10 @@ func downloadAndApplyUpdate(info *UpdateInfo) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+	}
+
 	// Cap download at 200 MB to prevent disk exhaustion from an unexpectedly
 	// large or malicious response body. Release binaries are typically < 50 MB;
 	// 200 MB leaves plenty of headroom while still bounding disk usage.
@@ -180,8 +184,18 @@ func downloadAndApplyUpdate(info *UpdateInfo) error {
 		return err
 	}
 
+	// Verify the download produced a valid binary (not an empty/truncated response)
+	stat, err := tmp.Stat()
+	if err != nil {
+		return fmt.Errorf("cannot stat downloaded file: %w", err)
+	}
+	const minBinarySize = 1 << 20 // 1 MB — Go binaries are typically 10-50 MB
+	if stat.Size() < minBinarySize {
+		return fmt.Errorf("downloaded file too small (%d bytes), likely corrupted", stat.Size())
+	}
+
 	_ = os.Chmod(tmp.Name(), 0o755) // make executable
-	fmt.Printf("→ Downloaded (SHA-256: %s)\n", hex.EncodeToString(h.Sum(nil)))
+	fmt.Printf("→ Downloaded %d MB (SHA-256: %s)\n", stat.Size()>>20, hex.EncodeToString(h.Sum(nil)))
 
 	// Set global state for restart
 	success = true // temp file is now owned by the update path; don't delete on defer

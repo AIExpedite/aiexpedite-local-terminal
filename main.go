@@ -30,12 +30,25 @@ func main() {
 	for _, arg := range os.Args[1:] {
 		if strings.HasPrefix(arg, "--update-from=") {
 			originalPath := strings.TrimPrefix(arg, "--update-from=")
+			if originalPath == "" {
+				fmt.Println("[update] Empty --update-from path, skipping self-replace")
+				break
+			}
+			// Resolve to absolute to avoid ambiguity
+			if abs, err := filepath.Abs(originalPath); err == nil {
+				originalPath = abs
+			}
+			if err := validateUpdateTarget(originalPath); err != nil {
+				fmt.Printf("[update] Rejecting --update-from path: %v\n", err)
+				break // Fall through to run normally from temp path
+			}
 			if err := performSelfReplace(originalPath); err != nil {
 				fmt.Printf("[update] Self-replace failed: %v\n", err)
 				// Fall through to run normally from temp path as fallback
 			} else {
 				return // Successfully re-launched from install path; exit this temp process
 			}
+			break // Only process the first --update-from flag
 		}
 	}
 
@@ -448,16 +461,24 @@ func onTrayExit() {
 	if path, pending := GetUpdateReady(); pending && path != "" {
 		fmt.Println("Launching updated version…")
 
-		// Pass our own exe path so the new process can replace us at the install location
+		// Pass our own exe path so the new process can replace us at the install location.
+		// Resolve symlinks so the new process gets the real filesystem path.
 		originalExe, err := os.Executable()
 		if err != nil {
 			fmt.Printf("Warning: could not determine own exe path: %v\n", err)
-			originalExe = "" // Fall back to running from temp without replacement
+			originalExe = ""
+		} else if resolved, err := filepath.EvalSymlinks(originalExe); err == nil {
+			originalExe = resolved
 		}
 
+		// If we're already running from a temp path (chained update / previous broken update),
+		// don't pass --update-from pointing at the temp file — that would replace a temp file
+		// instead of the real install location. Let the new binary start without self-replace.
 		args := []string{}
-		if originalExe != "" {
+		if originalExe != "" && !isInTempDir(originalExe) {
 			args = append(args, fmt.Sprintf("--update-from=%s", originalExe))
+		} else if originalExe != "" {
+			fmt.Printf("[update] Current exe is in temp dir (%s), skipping --update-from\n", originalExe)
 		}
 
 		cmd := exec.Command(path, args...)
@@ -523,6 +544,67 @@ func aggressiveCleanup() {
 
 /* ---------- self-replace (auto-update) ---------- */
 
+// validateUpdateTarget checks that the target path for self-replacement is safe.
+// Rejects paths outside the user's profile or in protected system directories.
+func validateUpdateTarget(target string) error {
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return fmt.Errorf("cannot resolve path: %w", err)
+	}
+	lower := strings.ToLower(filepath.Clean(abs))
+
+	// Must end in .exe on Windows
+	if runtime.GOOS == "windows" && !strings.HasSuffix(lower, ".exe") {
+		return fmt.Errorf("target is not an executable: %s", target)
+	}
+
+	// Block known protected directories (use trailing separator to avoid
+	// false positives like "c:\windowsapps")
+	blockedPrefixes := []string{
+		`c:\windows\`,
+		`c:\program files\`,
+		`c:\program files (x86)\`,
+		`c:\programdata\`,
+	}
+	for _, prefix := range blockedPrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return fmt.Errorf("target is in protected directory: %s", target)
+		}
+	}
+	// Also block root-level executables (e.g., c:\cmd.exe)
+	if filepath.Dir(lower) == `c:\` {
+		return fmt.Errorf("target is in root directory: %s", target)
+	}
+
+	// Verify the target already exists and is a regular file (we're replacing, not creating)
+	info, err := os.Stat(target)
+	if err != nil {
+		return fmt.Errorf("target does not exist: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("target is a directory: %s", target)
+	}
+
+	return nil
+}
+
+// isInTempDir returns true if the given path is inside the OS temp directory.
+func isInTempDir(path string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	tmpDir, err := filepath.Abs(os.TempDir())
+	if err != nil {
+		return false
+	}
+	// Ensure trailing separator so "C:\Temp" doesn't match "C:\Temporary\..."
+	if !strings.HasSuffix(tmpDir, string(filepath.Separator)) {
+		tmpDir += string(filepath.Separator)
+	}
+	return strings.HasPrefix(strings.ToLower(absPath), strings.ToLower(tmpDir))
+}
+
 // performSelfReplace copies the currently running binary (from a temp path) over
 // the original install-path exe, then re-launches from the install path.
 // This is called when the app starts with --update-from=<original_path>.
@@ -540,8 +622,13 @@ func performSelfReplace(originalPath string) error {
 	}
 
 	// Resolve symlinks so we compare real paths
-	myPath, _ = filepath.EvalSymlinks(myPath)
-	resolvedOriginal, _ := filepath.EvalSymlinks(originalPath)
+	if resolved, err := filepath.EvalSymlinks(myPath); err == nil {
+		myPath = resolved
+	}
+	resolvedOriginal := originalPath
+	if resolved, err := filepath.EvalSymlinks(originalPath); err == nil {
+		resolvedOriginal = resolved
+	}
 
 	// Safety: if we're already running from the install path, skip replacement
 	if strings.EqualFold(myPath, resolvedOriginal) {
@@ -579,7 +666,9 @@ func performSelfReplace(originalPath string) error {
 }
 
 // copyFile copies src to dst, overwriting dst if it exists.
-// Uses a temporary file + rename for atomic replacement where possible.
+// Uses a temporary file + rename for near-atomic replacement where possible.
+// On Windows, os.Rename fails if dst exists or if src and dst are on different
+// drives, so we remove dst first and fall back to direct copy if needed.
 func copyFile(src, dst string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -587,16 +676,23 @@ func copyFile(src, dst string) error {
 	}
 	defer srcFile.Close()
 
-	// Write to a temp file in the same directory as dst, then rename
-	// This avoids partial writes if the process is interrupted
+	// Write to a temp file in the same directory as dst, then rename.
+	// This avoids partial writes if the process is interrupted.
 	dstDir := filepath.Dir(dst)
 	tmp, err := os.CreateTemp(dstDir, "update_*.tmp")
 	if err != nil {
-		return err
+		// Can't write to the install dir — fall back to direct overwrite
+		return directCopy(src, dst)
 	}
 	tmpName := tmp.Name()
 
 	if _, err := io.Copy(tmp, srcFile); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	// Flush to disk before close so the binary is fully written before rename
+	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
 		return err
@@ -606,12 +702,18 @@ func copyFile(src, dst string) error {
 		return err
 	}
 
-	// Make executable
 	_ = os.Chmod(tmpName, 0o755)
 
-	// Rename over the target (atomic on most filesystems)
+	// On Windows, os.Rename cannot overwrite an existing file.
+	// Remove dst first, then rename. If remove fails (file locked), fall back.
+	if runtime.GOOS == "windows" {
+		if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+			os.Remove(tmpName)
+			return directCopy(src, dst)
+		}
+	}
+
 	if err := os.Rename(tmpName, dst); err != nil {
-		// On Windows, Rename can fail if dst is still locked. Try direct overwrite.
 		os.Remove(tmpName)
 		return directCopy(src, dst)
 	}
@@ -633,30 +735,43 @@ func directCopy(src, dst string) error {
 	}
 	defer dstFile.Close()
 
-	_, err = io.Copy(dstFile, srcFile)
-	return err
+	if _, err = io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+	// Flush to disk so the binary isn't truncated if the process exits immediately
+	return dstFile.Sync()
 }
 
-// cleanupUpdateTempFiles removes leftover agent_update_*.exe files from the temp directory.
-// These are created by downloadAndApplyUpdate and may linger after a successful update.
+// cleanupUpdateTempFiles removes leftover update artifacts:
+//   - agent_update_*.exe in the OS temp directory (downloaded update binaries)
+//   - update_*.tmp in the install directory (partial copy artifacts from copyFile)
 func cleanupUpdateTempFiles() {
-	pattern := filepath.Join(os.TempDir(), "agent_update_*")
+	myPath, _ := os.Executable()
+	myPath, _ = filepath.EvalSymlinks(myPath)
+
+	// Pattern 1: Downloaded update binaries in OS temp dir
+	cleanupGlob(filepath.Join(os.TempDir(), "agent_update_*"), myPath)
+
+	// Pattern 2: Partial copy temp files in our install directory
+	if myPath != "" {
+		installDir := filepath.Dir(myPath)
+		cleanupGlob(filepath.Join(installDir, "update_*.tmp"), myPath)
+	}
+}
+
+// cleanupGlob removes files matching the glob pattern, skipping our own executable.
+func cleanupGlob(pattern, selfPath string) {
 	matches, err := filepath.Glob(pattern)
 	if err != nil || len(matches) == 0 {
 		return
 	}
-
-	myPath, _ := os.Executable()
-	myPath, _ = filepath.EvalSymlinks(myPath)
-
 	for _, m := range matches {
 		resolved, _ := filepath.EvalSymlinks(m)
-		// Don't delete ourselves if we're still running from temp (fallback case)
-		if strings.EqualFold(resolved, myPath) {
-			continue
+		if selfPath != "" && strings.EqualFold(resolved, selfPath) {
+			continue // Don't delete ourselves
 		}
 		if err := os.Remove(m); err == nil {
-			fmt.Printf("[update] Cleaned up temp file: %s\n", filepath.Base(m))
+			fmt.Printf("[update] Cleaned up: %s\n", filepath.Base(m))
 		}
 	}
 }
