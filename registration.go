@@ -47,6 +47,8 @@ type PollResponse struct {
 	TokenEndpoint     string `json:"tokenEndpoint,omitempty"`
 	WIFAudience       string `json:"wifAudience,omitempty"`
 	WIFServiceAccount string `json:"wifServiceAccount,omitempty"`
+	// Storage config
+	StorageBucket string `json:"storageBucket,omitempty"`
 }
 
 // ErrorResponse is the error response from the API
@@ -234,6 +236,10 @@ func StartRegistration(cfg *Config) error {
 	cfg.TokenEndpoint = credentials.TokenEndpoint
 	cfg.WIFAudience = credentials.WIFAudience
 	cfg.WIFServiceAccount = credentials.WIFServiceAccount
+	// Override default storage bucket with environment-specific value from backend
+	if credentials.StorageBucket != "" {
+		cfg.StorageBucket = credentials.StorageBucket
+	}
 
 	if err := cfg.Save(ConfigPath()); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
