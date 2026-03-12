@@ -719,23 +719,14 @@ func runPubSubConnection(cfg *Config) error {
 			// ─── Command Signature Verification ──────────────────────────────
 			// If agent has a secret configured, ALL commands MUST be signed (strict mode)
 			if cfg.CommandSecret != "" {
-				// Check if command is targeted at this agent
+				// Check if command is targeted at this agent.
+				// With per-agent subscriptions this should rarely happen — silently ack
+				// instead of publishing a competing "unauthorized" result that races
+				// with the correct agent's response.
 				if cmd.AgentID != "" && cmd.AgentID != cfg.AgentID {
-					fmt.Printf("%s[aiexpedite] Command targeted at different agent%s\n", colorYellow, colorReset)
-					res := resultMsg{
-						ID:          cmd.ID,
-						WorkspaceID: cmd.WorkspaceID,
-						UID:         cmd.UID,
-						Output:      "Command rejected: targeted at different agent",
-						Status:      "unauthorized",
-						Ts:          time.Now().UnixMilli(),
-						Version:     Version,
-					}
-					if err := publishMsg(ctx, topic, res); err != nil {
-						m.Nack()
-					} else {
-						m.Ack()
-					}
+					fmt.Printf("%s[aiexpedite] Ignoring command for different agent (got %s, I am %s)%s\n",
+						colorYellow, cmd.AgentID, cfg.AgentID, colorReset)
+					m.Ack()
 					return
 				}
 
