@@ -2,12 +2,12 @@
   "RT_GROUP_ICON": {
     "APP": {
       "0000": [
-        "../assets/aiexpedite-logo-16.png",
-        "../assets/aiexpedite-logo-32.png",
-        "../assets/aiexpedite-logo-48.png",
-        "../assets/aiexpedite-logo-64.png",
+        "../assets/aiexpedite-logo-256.png",
         "../assets/aiexpedite-logo-128.png",
-        "../assets/aiexpedite-logo-256.png"
+        "../assets/aiexpedite-logo-64.png",
+        "../assets/aiexpedite-logo-48.png",
+        "../assets/aiexpedite-logo-32.png",
+        "../assets/aiexpedite-logo-16.png"
       ]
     }
   },
@@ -15,24 +15,14 @@
     "#1": {
       "0409": {
         "identity": {
-          "name": "AI Expedite Terminal",
-          "version": "0.2.5.0"
+          "name": "com.aiexpedite.terminal",
+          "version": "0.6.19.0"
         },
         "description": "AI Expedite Terminal",
         "minimum-os": "win7",
         "execution-level": "as invoker",
-        "ui-access": false,
-        "auto-elevate": false,
         "dpi-awareness": "system",
-        "disable-theming": false,
-        "disable-window-filtering": false,
-        "high-resolution-scrolling-aware": false,
-        "ultra-high-resolution-scrolling-aware": false,
-        "long-path-aware": false,
-        "printer-driver-isolation": false,
-        "gdi-scaling": false,
-        "segment-heap": false,
-        "use-common-controls-v6": false
+        "use-common-controls-v6": true
       }
     }
   },
@@ -40,23 +30,16 @@
     "#1": {
       "0000": {
         "fixed": {
-          "file_version": "0.2.5.0",
-          "product_version": "0.2.5.0"
+          "file_version": "0.6.19.0",
+          "product_version": "0.6.19.0"
         },
         "info": {
           "0409": {
-            "Comments": "AI Expedite Terminal for remote terminal access",
             "CompanyName": "AI Expedite",
             "FileDescription": "AI Expedite Terminal",
-            "FileVersion": "0.2.5",
-            "InternalName": "aiexpedite-terminal",
-            "LegalCopyright": "Copyright (c) AI Expedite",
-            "LegalTrademarks": "",
-            "OriginalFilename": "aiexpedite-terminal.exe",
-            "PrivateBuild": "",
             "ProductName": "AI Expedite Terminal",
-            "ProductVersion": "0.2.5",
-            "SpecialBuild": ""
+            "LegalCopyright": "Copyright AI Expedite",
+            "OriginalFilename": "aiexpedite-terminal.exe"
           }
         }
       }

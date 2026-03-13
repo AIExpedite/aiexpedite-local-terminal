@@ -46,6 +46,14 @@ jobs:
       - name: Download Go modules
         run: go mod tidy
 
+      - name: Install go-winres
+        shell: bash
+        run: go install github.com/tc-hib/go-winres@latest
+
+      - name: Generate Windows resources (icon, manifest, version)
+        shell: bash
+        run: go-winres make --arch amd64
+
       - name: Build binary
         shell: bash
         run: |
