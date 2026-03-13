@@ -74,7 +74,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION=$(grep -oP 'const Version = "v\K[0-9]+\.[0-9]+\.[0-9]+' agent.go)
+          VERSION=$(sed -n 's/.*const Version = "v\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' agent.go)
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: Set installer version
