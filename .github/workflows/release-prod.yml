@@ -79,17 +79,17 @@ jobs:
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer-prod.iss
 
-      - name: Upload artifact
+      - name: Copy installer to dist with predictable name
+        shell: bash
+        run: cp installer-output/AIExpediteTerminal-Setup-*.exe dist/AIExpediteTerminal-Setup.exe
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v7.0.0
         with:
           name: prod-windows-amd64
-          path: dist/aiexpedite-terminal-windows-amd64.exe
-
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v7.0.0
-        with:
-          name: prod-installer-windows-amd64
-          path: installer-output/AIExpediteTerminal-Setup-*.exe
+          path: |
+            dist/aiexpedite-terminal-windows-amd64.exe
+            dist/AIExpediteTerminal-Setup.exe
 
   ###############################################################################
   # Create production release (public, shown to users)
@@ -135,7 +135,7 @@ jobs:
 
             | File | Description |
             |------|-------------|
-            | `AIExpediteTerminal-Setup-*.exe` | **Installer (Recommended)** — installs to Program Files, adds auto-start, creates uninstaller |
+            | `AIExpediteTerminal-Setup.exe` | **Installer (Recommended)** — installs to Program Files, adds auto-start, creates uninstaller |
             | `aiexpedite-terminal-windows-amd64.exe` | Standalone executable |
 
             ### Installation
@@ -194,7 +194,7 @@ jobs:
 
             | File | Description |
             |------|-------------|
-            | `AIExpediteTerminal-Setup-*.exe` | **Installer (Recommended)** — installs to Program Files, adds auto-start, creates uninstaller |
+            | `AIExpediteTerminal-Setup.exe` | **Installer (Recommended)** — installs to Program Files, adds auto-start, creates uninstaller |
             | `aiexpedite-terminal-windows-amd64.exe` | Standalone executable |
 
             ### Installation
