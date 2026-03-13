@@ -26,16 +26,22 @@ jobs:
             api_endpoint: "https://api.dev.aiexpedite.com/terminal"
             config_suffix: "-Dev"
             exe_suffix: "-dev"
+            installer_iss: installer-dev.iss
+            installer_name: AIExpediteTerminal-Dev-Setup.exe
           - env: stg
             display_name: "AI Expedite Terminal (Stg)"
             api_endpoint: "https://api.stg.aiexpedite.com/terminal"
             config_suffix: "-Stg"
             exe_suffix: "-stg"
+            installer_iss: installer-stg.iss
+            installer_name: AIExpediteTerminal-Stg-Setup.exe
           - env: beta
             display_name: "AI Expedite Terminal (Beta)"
             api_endpoint: "https://api.beta.aiexpedite.com/terminal"
             config_suffix: "-Beta"
             exe_suffix: "-beta"
+            installer_iss: installer-beta.iss
+            installer_name: AIExpediteTerminal-Beta-Setup.exe
 
     steps:
       - uses: actions/checkout@v6.0.2
@@ -64,11 +70,38 @@ jobs:
 
           go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe" .
 
+      - name: Extract version from agent.go
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(grep -oP 'const Version = "v\K[0-9]+\.[0-9]+\.[0-9]+' agent.go)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Set installer version
+        shell: bash
+        run: |
+          sed -i "s/#define MyAppVersion \".*\"/#define MyAppVersion \"$VERSION\"/" ${{ matrix.installer_iss }}
+          sed -i "s/#define MyAppVersionString \".*\"/#define MyAppVersionString \"$VERSION\"/" ${{ matrix.installer_iss }}
+
+      - name: Copy binary for installer
+        shell: bash
+        run: cp dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe aiexpedite-terminal${{ matrix.exe_suffix }}.exe
+
+      - name: Build installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ${{ matrix.installer_iss }}
+
+      - name: Copy installer to dist
+        shell: bash
+        run: cp installer-output/AIExpediteTerminal-*-Setup-*.exe dist/${{ matrix.installer_name }}
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.0
         with:
           name: nonprod-${{ matrix.env }}-windows-amd64
-          path: dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe
+          path: |
+            dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe
+            dist/${{ matrix.installer_name }}
 
   ###############################################################################
   # Create non-prod release (pre-release, hidden from main downloads)
@@ -126,11 +159,11 @@ jobs:
 
             **Commit:** ${{ github.sha }}
 
-            | Environment | Download |
-            |-------------|----------|
-            | Development | `aiexpedite-terminal-dev-windows-amd64.exe` |
-            | Staging | `aiexpedite-terminal-stg-windows-amd64.exe` |
-            | Beta | `aiexpedite-terminal-beta-windows-amd64.exe` |
+            | Environment | Installer (Recommended) | Standalone |
+            |-------------|------------------------|------------|
+            | Development | `AIExpediteTerminal-Dev-Setup.exe` | `aiexpedite-terminal-dev-windows-amd64.exe` |
+            | Staging | `AIExpediteTerminal-Stg-Setup.exe` | `aiexpedite-terminal-stg-windows-amd64.exe` |
+            | Beta | `AIExpediteTerminal-Beta-Setup.exe` | `aiexpedite-terminal-beta-windows-amd64.exe` |
 
             All environments can run side-by-side on the same machine.
 
