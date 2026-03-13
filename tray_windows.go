@@ -407,6 +407,11 @@ func ensureAutoStart() error {
 	if err != nil {
 		return err
 	}
+	// Don't register temp directory paths in auto-start — this happens when
+	// auto-update falls through and runs from %TEMP% as a fallback.
+	if isInTempDir(exePath) {
+		return nil
+	}
 	// Quote the path in case it contains spaces.
 	quotedPath := `"` + exePath + `"`
 
@@ -442,6 +447,11 @@ func ensureAppRegistration() error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return err
+	}
+	// Don't register in Installed Apps when running from a temp directory —
+	// this happens when auto-update falls through and runs from %TEMP%.
+	if isInTempDir(exePath) {
+		return nil
 	}
 
 	// Create/open the Uninstall registry key for this app

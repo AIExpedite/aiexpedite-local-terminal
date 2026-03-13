@@ -559,11 +559,12 @@ func validateUpdateTarget(target string) error {
 	}
 
 	// Block known protected directories (use trailing separator to avoid
-	// false positives like "c:\windowsapps")
+	// false positives like "c:\windowsapps").
+	// NOTE: c:\program files\ is intentionally NOT blocked — Inno Setup
+	// installs the app there by default ({autopf}), so auto-update must
+	// be able to self-replace the exe at its install location.
 	blockedPrefixes := []string{
 		`c:\windows\`,
-		`c:\program files\`,
-		`c:\program files (x86)\`,
 		`c:\programdata\`,
 	}
 	for _, prefix := range blockedPrefixes {
