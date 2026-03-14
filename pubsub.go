@@ -1762,6 +1762,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Topic, cmd commandM
 			cmd.Cwd,
 			cmd.WorkspaceID,
 			cmd.UID,
+			cmd.TimeoutMs,
 			publishFn,
 		)
 		if err != nil {

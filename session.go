@@ -28,8 +28,9 @@ import (
    -------------------------------------------------------------------------- */
 
 const (
-	// sessionMaxLifetime is the maximum time a session can run before cleanup
-	sessionMaxLifetime = 30 * time.Minute
+	// sessionMaxLifetime is the maximum time a session can run before cleanup.
+	// Set to 6 hours to support long-running CLI agent sessions (Claude, Codex, etc.).
+	sessionMaxLifetime = 6 * time.Hour
 
 	// sessionCleanupInterval is how often the cleanup goroutine runs
 	sessionCleanupInterval = 60 * time.Second
@@ -62,6 +63,7 @@ type CLISession struct {
 	// Metadata for result messages
 	WorkspaceID string
 	UID         string
+	TimeoutMs   int64 // Per-session timeout in ms (0 = no timeout, use stale cleanup)
 
 	mu   sync.Mutex
 	done chan struct{} // closed when process exits
@@ -95,7 +97,7 @@ type PublishFunc func(res resultMsg)
 
 // StartSession creates and starts a new interactive CLI session. The process
 // is spawned with stdin/stdout/stderr pipes and output is streamed via publishFn.
-func (sm *SessionManager) StartSession(id, command string, args []string, cwd, workspaceID, uid string, publishFn PublishFunc) error {
+func (sm *SessionManager) StartSession(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, publishFn PublishFunc) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -176,6 +178,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		Status:      "running",
 		WorkspaceID: workspaceID,
 		UID:         uid,
+		TimeoutMs:   timeoutMs,
 		done:        make(chan struct{}),
 	}
 
@@ -204,6 +207,21 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		} else {
 			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars)%s\n",
 				colorGreen, id, len(stdinPrompt), colorReset)
+		}
+	}
+
+	// For non-interactive commands (cmd, powershell one-shots, etc.), close
+	// stdin immediately.  These commands don't read from stdin, and leaving it
+	// open causes commands like `date` (which prompt for input) to hang forever.
+	if stdinPrompt == "" {
+		cmdLower := strings.ToLower(command)
+		isInteractiveCLI := cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude") ||
+			cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex") ||
+			cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini")
+		if !isInteractiveCLI {
+			session.Stdin.Close()
+			fmt.Printf("%s[session] Closed stdin for non-interactive session %s (%s)%s\n",
+				colorYellow, id, command, colorReset)
 		}
 	}
 
@@ -579,7 +597,23 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 // waitForExit waits for the session's process to exit and publishes a
 // session_ended result.
 func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc) {
+	// Set up per-session timeout — kill the process if it exceeds timeoutMs
+	var timeoutTimer *time.Timer
+	if session.TimeoutMs > 0 {
+		timeoutTimer = time.AfterFunc(time.Duration(session.TimeoutMs)*time.Millisecond, func() {
+			fmt.Printf("%s[session] Session %s timed out after %dms — killing%s\n",
+				colorYellow, session.ID, session.TimeoutMs, colorReset)
+			if session.Process.Process != nil {
+				session.Process.Process.Kill()
+			}
+		})
+	}
+
 	err := session.Process.Wait()
+
+	if timeoutTimer != nil {
+		timeoutTimer.Stop()
+	}
 
 	// Explicitly close pipes so the scanner goroutines in readOutputStream
 	// receive EOF and can exit.  On Windows, process exit does not always
