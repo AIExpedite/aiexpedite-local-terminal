@@ -473,8 +473,19 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	// scanner goroutines that feed it — starving the CLI process's pipe buffer.
 	// Instead we publish in a fire-and-forget goroutine so the select loop
 	// always stays free to drain incoming lines.
+	publishSem := make(chan struct{}, 5) // max 5 concurrent publishes per session
 	asyncPublish := func(msg resultMsg) {
-		go publishFn(msg)
+		select {
+		case publishSem <- struct{}{}:
+			go func() {
+				defer func() { <-publishSem }()
+				publishFn(msg)
+			}()
+		default:
+			// All publish slots busy — drop to prevent goroutine buildup
+			fmt.Printf("%s[session] Publish backpressure, dropping batch for %s%s\n",
+				colorYellow, session.ID, colorReset)
+		}
 	}
 
 	var batch []string

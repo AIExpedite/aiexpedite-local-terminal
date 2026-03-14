@@ -11,8 +11,8 @@ import (
 )
 
 func TestSignatureMatch(t *testing.T) {
-	// Values from the actual terminal-service log
-	expectedSignatureData := `{"id":"05989d90-0b3d-4592-bf14-928d11a82e14","command":"echo \"Testing terminal tool\" && date && pwd","args":[],"ts":1771714908831}`
+	// Values matching the expanded signaturePayload (id, command, args, ts, type, sessionID, input, signal)
+	expectedSignatureData := `{"id":"05989d90-0b3d-4592-bf14-928d11a82e14","command":"echo \"Testing terminal tool\" && date && pwd","args":[],"ts":1771714908831,"type":"","sessionID":"","input":"","signal":""}`
 
 	// Build the same payload Go would build from the Pub/Sub message
 	cmd := commandMsg{
@@ -23,10 +23,14 @@ func TestSignatureMatch(t *testing.T) {
 	}
 
 	payload := signaturePayload{
-		ID:      cmd.ID,
-		Command: cmd.Command,
-		Args:    cmd.Args,
-		Ts:      cmd.Ts,
+		ID:        cmd.ID,
+		Command:   cmd.Command,
+		Args:      cmd.Args,
+		Ts:        cmd.Ts,
+		Type:      cmd.Type,
+		SessionID: cmd.SessionID,
+		Input:     cmd.Input,
+		Signal:    cmd.Signal,
 	}
 
 	// Use the same encoding as verifySignature (SetEscapeHTML false)
@@ -71,6 +75,10 @@ func TestVerifySignatureWithAmpersand(t *testing.T) {
 		Command: "echo hello && echo world",
 		Args:    []string{},
 		Ts:      1234567890,
+		Type:    "",
+		SessionID: "",
+		Input:   "",
+		Signal:  "",
 	}
 	nodeJSON, err := nodeJSONStringify(nodePayload)
 	if err != nil {
@@ -120,10 +128,14 @@ func TestVerifySignatureWithSpecialChars(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// Generate signature the way Node.js would (no HTML escaping)
 			payload := signaturePayload{
-				ID:      "test-123",
-				Command: tc.command,
-				Args:    []string{},
-				Ts:      1234567890,
+				ID:        "test-123",
+				Command:   tc.command,
+				Args:      []string{},
+				Ts:        1234567890,
+				Type:      "",
+				SessionID: "",
+				Input:     "",
+				Signal:    "",
 			}
 			nodeJSON, err := nodeJSONStringify(payload)
 			if err != nil {
@@ -172,10 +184,14 @@ func TestVerifySignatureWithArgs(t *testing.T) {
 			}
 
 			payload := signaturePayload{
-				ID:      "test-123",
-				Command: "test",
-				Args:    args,
-				Ts:      1234567890,
+				ID:        "test-123",
+				Command:   "test",
+				Args:      args,
+				Ts:        1234567890,
+				Type:      "",
+				SessionID: "",
+				Input:     "",
+				Signal:    "",
 			}
 			nodeJSON, err := nodeJSONStringify(payload)
 			if err != nil {

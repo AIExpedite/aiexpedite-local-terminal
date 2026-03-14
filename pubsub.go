@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -292,12 +293,41 @@ func getUIDRateLimiter(uid string, cfg *Config) *rate.Limiter {
 
 // checkRateLimit checks if a command should be rate-limited
 // Returns true if the command is allowed, false if rate-limited
-func checkRateLimit(uid string, cfg *Config) bool {
-	if uid == "" {
-		return true // Allow commands without UID (backwards compatibility)
+func checkRateLimit(uid string, agentID string, cfg *Config) bool {
+	key := uid
+	if key == "" {
+		key = agentID
 	}
-	limiter := getUIDRateLimiter(uid, cfg)
+	if key == "" {
+		return true // No identity at all — allow (edge case)
+	}
+	limiter := getUIDRateLimiter(key, cfg)
 	return limiter.Allow()
+}
+
+/* --------------------------------------------------------------------------
+   Signature failure rate limiting
+   -------------------------------------------------------------------------- */
+var (
+	sigFailCount   int64
+	sigFailResetAt time.Time
+	sigFailMu      sync.Mutex
+)
+
+const maxSigFailsPerMinute = 10
+
+// isSigFailRateLimited returns true if too many signature failures have occurred recently.
+// When true, the caller should silently ACK without publishing a response.
+func isSigFailRateLimited() bool {
+	sigFailMu.Lock()
+	defer sigFailMu.Unlock()
+	now := time.Now()
+	if now.After(sigFailResetAt) {
+		sigFailCount = 0
+		sigFailResetAt = now.Add(time.Minute)
+	}
+	sigFailCount++
+	return sigFailCount > maxSigFailsPerMinute
 }
 
 /* --------------------------------------------------------------------------
@@ -305,12 +335,16 @@ func checkRateLimit(uid string, cfg *Config) bool {
    -------------------------------------------------------------------------- */
 
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
-// Field order must match: id, command, args, ts
+// Field order must match: id, command, args, ts, type, sessionID, input, signal
 type signaturePayload struct {
-	ID      string   `json:"id"`
-	Command string   `json:"command"`
-	Args    []string `json:"args"`
-	Ts      int64    `json:"ts"`
+	ID        string   `json:"id"`
+	Command   string   `json:"command"`
+	Args      []string `json:"args"`
+	Ts        int64    `json:"ts"`
+	Type      string   `json:"type"`
+	SessionID string   `json:"sessionID"`
+	Input     string   `json:"input"`
+	Signal    string   `json:"signal"`
 }
 
 // verifySignature verifies the HMAC-SHA256 signature of a command
@@ -324,10 +358,14 @@ func verifySignature(cmd commandMsg, secret string) bool {
 	}
 
 	payload := signaturePayload{
-		ID:      cmd.ID,
-		Command: cmd.Command,
-		Args:    args,
-		Ts:      cmd.Ts,
+		ID:        cmd.ID,
+		Command:   cmd.Command,
+		Args:      args,
+		Ts:        cmd.Ts,
+		Type:      cmd.Type,
+		SessionID: cmd.SessionID,
+		Input:     cmd.Input,
+		Signal:    cmd.Signal,
 	}
 
 	// Use json.NewEncoder with SetEscapeHTML(false) to match Node.js JSON.stringify behavior.
@@ -694,7 +732,7 @@ func runPubSubConnection(cfg *Config) error {
 			// ─────────────────────────────────────────────────────────────────
 
 			// ─── Per-UID Rate Limiting ─────────────────────────────────────────
-			if !checkRateLimit(cmd.UID, cfg) {
+			if !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
 				fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
 
 				// Send rate_limited response back to user for immediate feedback
@@ -733,6 +771,11 @@ func runPubSubConnection(cfg *Config) error {
 				// Verify signature (strict mode - no signature = reject)
 				if cmd.Signature == "" {
 					fmt.Printf("%s[aiexpedite] Command missing signature%s\n", colorRed, colorReset)
+					if isSigFailRateLimited() {
+						fmt.Printf("%s[aiexpedite] Rate-limiting unauthorized responses%s\n", colorYellow, colorReset)
+						m.Ack()
+						return
+					}
 					res := resultMsg{
 						ID:          cmd.ID,
 						WorkspaceID: cmd.WorkspaceID,
@@ -752,6 +795,11 @@ func runPubSubConnection(cfg *Config) error {
 
 				if !verifySignature(cmd, cfg.CommandSecret) {
 					fmt.Printf("%s[aiexpedite] Invalid command signature%s\n", colorRed, colorReset)
+					if isSigFailRateLimited() {
+						fmt.Printf("%s[aiexpedite] Rate-limiting unauthorized responses%s\n", colorYellow, colorReset)
+						m.Ack()
+						return
+					}
 					res := resultMsg{
 						ID:          cmd.ID,
 						WorkspaceID: cmd.WorkspaceID,
@@ -775,6 +823,43 @@ func runPubSubConnection(cfg *Config) error {
 			// ─── Interactive Session Routing ─────────────────────────────────
 			// Route session_* commands to the SessionManager instead of shell execution
 			if cmd.Type != "" && cmd.Type != "execute" {
+				// Apply allowlist to session_start (same rules as execute commands)
+				if cmd.Type == "session_start" && cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
+					timeoutSec := cfg.ApprovalTimeoutSec
+					if timeoutSec <= 0 {
+						timeoutSec = 60
+					}
+					result := ShowCommandApprovalDialog(cmd.Command, cmd.Args, timeoutSec)
+					if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
+						result = ApprovalOnce
+					}
+					switch result {
+					case ApprovalDeny:
+						fmt.Printf("%s[aiexpedite] Session command denied by user%s\n", colorYellow, colorReset)
+						res := resultMsg{
+							ID:          cmd.ID,
+							WorkspaceID: cmd.WorkspaceID,
+							UID:         cmd.UID,
+							Output:      "Command denied by user: not in allow list",
+							Status:      "denied",
+							Ts:          time.Now().UnixMilli(),
+							Version:     Version,
+							Type:        "session_error",
+							SessionID:   cmd.SessionID,
+						}
+						if err := publishMsg(ctx, topic, res); err != nil {
+							m.Nack()
+						} else {
+							m.Ack()
+						}
+						return
+					case ApprovalAlways:
+						pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
+						if err := defaultAllowList.AddPattern(pattern); err != nil {
+							fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
+						}
+					}
+				}
 				handleSessionCommand(ctx, topic, cmd)
 				m.Ack()
 				return
@@ -1582,12 +1667,16 @@ func appendFilesFromDir(files []string, dir string, baseDir string, extensions [
 		absDir = filepath.Join(baseDir, dir)
 	}
 
-	if err := filepath.Walk(absDir, func(path string, info os.FileInfo, err error) error {
+	if err := filepath.WalkDir(absDir, func(path string, d fs.DirEntry, err error) error {
 		// Stop collecting once we hit the cap; returning an error aborts the walk.
 		if len(files) >= maxUploadFiles {
 			return fmt.Errorf("file limit reached")
 		}
-		if err == nil && !info.IsDir() {
+		if err == nil && !d.IsDir() {
+			// Skip symlinks — prevents traversal outside baseDir
+			if d.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
 			// Security: Validate each file path as well
 			if !isPathSafeUnder(path, baseDir) {
 				fmt.Printf("[security] Blocked file path traversal: %s\n", path)

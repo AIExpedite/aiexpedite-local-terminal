@@ -136,6 +136,12 @@ func UploadFile(
 		return FileInfo{}, fmt.Errorf("failed to stat file: %w", err)
 	}
 
+	// Reject files exceeding size cap (100 MB)
+	const maxUploadFileSize = 100 * 1024 * 1024
+	if stat.Size() > maxUploadFileSize {
+		return FileInfo{}, fmt.Errorf("file too large: %d bytes (max %d)", stat.Size(), maxUploadFileSize)
+	}
+
 	// Build GCS path with workspace isolation
 	filename := filepath.Base(localPath)
 	gcsPath := fmt.Sprintf(
