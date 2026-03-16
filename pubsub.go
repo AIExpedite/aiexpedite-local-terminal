@@ -722,6 +722,11 @@ func runPubSubConnection(cfg *Config) error {
 					Ts:          time.Now().UnixMilli(),
 					Version:     Version,
 				}
+					// Include session metadata so the backend can update the session document
+					if cmd.Type != "" && cmd.SessionID != "" {
+						res.Type = "session_error"
+						res.SessionID = cmd.SessionID
+					}
 				if err := publishMsg(ctx, topic, res); err != nil {
 					m.Nack()
 				} else {
@@ -745,6 +750,11 @@ func runPubSubConnection(cfg *Config) error {
 					Ts:          time.Now().UnixMilli(),
 					Version:     Version,
 				}
+					// Include session metadata so the backend can update the session document
+					if cmd.Type != "" && cmd.SessionID != "" {
+						res.Type = "session_error"
+						res.SessionID = cmd.SessionID
+					}
 				if err := publishMsg(ctx, topic, res); err != nil {
 					m.Nack()
 				} else {
@@ -785,6 +795,11 @@ func runPubSubConnection(cfg *Config) error {
 						Ts:          time.Now().UnixMilli(),
 						Version:     Version,
 					}
+						// Include session metadata so the backend can update the session document
+						if cmd.Type != "" && cmd.SessionID != "" {
+							res.Type = "session_error"
+							res.SessionID = cmd.SessionID
+						}
 					if err := publishMsg(ctx, topic, res); err != nil {
 						m.Nack()
 					} else {
@@ -809,6 +824,11 @@ func runPubSubConnection(cfg *Config) error {
 						Ts:          time.Now().UnixMilli(),
 						Version:     Version,
 					}
+						// Include session metadata so the backend can update the session document
+						if cmd.Type != "" && cmd.SessionID != "" {
+							res.Type = "session_error"
+							res.SessionID = cmd.SessionID
+						}
 					if err := publishMsg(ctx, topic, res); err != nil {
 						m.Nack()
 					} else {
@@ -1594,7 +1614,13 @@ func isPathSafeUnder(path, baseDir string) bool {
 		abs = filepath.Clean(filepath.Join(baseDir, path))
 	}
 	base := filepath.Clean(baseDir) + string(filepath.Separator)
-	return strings.HasPrefix(abs+string(filepath.Separator), base)
+	absWithSep := abs + string(filepath.Separator)
+	// Windows paths are case-insensitive - normalize to lowercase to prevent bypass
+	if runtime.GOOS == "windows" {
+		absWithSep = strings.ToLower(absWithSep)
+		base = strings.ToLower(base)
+	}
+	return strings.HasPrefix(absWithSep, base)
 }
 
 /* --------------------------------------------------------------------------
