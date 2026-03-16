@@ -22,6 +22,10 @@ func main() {
 			handleUninstall()
 			return
 		}
+		if os.Args[1] == "--elevated-copy" {
+			handleElevatedCopy()
+			return
+		}
 	}
 
 	// Handle --update-from=<original_path> argument (self-replacement after update)
@@ -542,6 +546,38 @@ func aggressiveCleanup() {
 	time.Sleep(500 * time.Millisecond)
 }
 
+/* ---------- elevated copy (auto-update UAC) ---------- */
+
+// handleElevatedCopy performs a file copy with elevated privileges and exits.
+// Invoked via: --elevated-copy --copy-from="<src>" --copy-to="<dst>"
+// This runs as a minimal elevated process (no UI, no systray) spawned by
+// requestElevatedCopy when the app cannot write to its install directory.
+func handleElevatedCopy() {
+	var copyFrom, copyTo string
+	for _, arg := range os.Args[2:] {
+		if strings.HasPrefix(arg, "--copy-from=") {
+			copyFrom = strings.TrimPrefix(arg, "--copy-from=")
+		}
+		if strings.HasPrefix(arg, "--copy-to=") {
+			copyTo = strings.TrimPrefix(arg, "--copy-to=")
+		}
+	}
+	if copyFrom == "" || copyTo == "" {
+		fmt.Println("[elevated-copy] Missing --copy-from or --copy-to")
+		os.Exit(1)
+	}
+	if err := validateUpdateTarget(copyTo); err != nil {
+		fmt.Printf("[elevated-copy] Validation failed: %v\n", err)
+		os.Exit(2)
+	}
+	if err := copyFile(copyFrom, copyTo); err != nil {
+		fmt.Printf("[elevated-copy] Copy failed: %v\n", err)
+		os.Exit(3)
+	}
+	fmt.Printf("[elevated-copy] Successfully copied %s -> %s\n", copyFrom, copyTo)
+	os.Exit(0)
+}
+
 /* ---------- self-replace (auto-update) ---------- */
 
 // validateUpdateTarget checks that the target path for self-replacement is safe.
@@ -650,7 +686,10 @@ func performSelfReplace(originalPath string) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if copyErr != nil {
-		return fmt.Errorf("failed to overwrite %s after retries: %w", originalPath, copyErr)
+		fmt.Printf("[update] Direct copy failed (%v), attempting elevated copy...\n", copyErr)
+		if elevErr := requestElevatedCopy(myPath, originalPath); elevErr != nil {
+			return fmt.Errorf("failed to overwrite %s (direct: %v, elevated: %v)", originalPath, copyErr, elevErr)
+		}
 	}
 
 	fmt.Printf("[update] Successfully replaced %s\n", originalPath)
