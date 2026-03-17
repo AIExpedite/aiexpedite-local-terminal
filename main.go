@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,10 @@ import (
 
 	"github.com/getlantern/systray"
 )
+
+// shutdownConfig holds the config reference for use in onTrayExit.
+// Set once in main() after config is loaded.
+var shutdownConfig *Config
 
 func main() {
 	// Handle --uninstall command line argument (Windows)
@@ -86,6 +91,9 @@ func main() {
 			cfg = DefaultConfig()
 		}
 	}
+
+	// Store config for use in onTrayExit shutdown handler
+	shutdownConfig = cfg
 
 	// Initialize command allow list for security
 	if cfg.EnableAllowList {
@@ -459,6 +467,13 @@ func onTrayReady(cfg *Config) func() {
 func onTrayExit() {
 	// signal background goroutines
 	close(shutdownChan)
+
+	// Notify server that this agent is going offline (best-effort, 3s timeout)
+	if shutdownConfig != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		notifyOffline(ctx, shutdownConfig)
+		cancel()
+	}
 
 	// IMPORTANT: Launch update FIRST, before any cleanup that might kill processes
 	// The update process needs to be started before we kill our process tree
