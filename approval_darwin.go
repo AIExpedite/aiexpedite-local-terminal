@@ -38,6 +38,8 @@ func ShowCommandApprovalDialog(cmd string, args []string, timeoutSec int) Approv
 	// Escape special characters for AppleScript
 	displayCmd = strings.ReplaceAll(displayCmd, `\`, `\\`)
 	displayCmd = strings.ReplaceAll(displayCmd, `"`, `\"`)
+	displayCmd = strings.ReplaceAll(displayCmd, "\n", `\n`)
+	displayCmd = strings.ReplaceAll(displayCmd, "\r", `\r`)
 
 	script := fmt.Sprintf(`
 		display dialog "An agent wants to execute a command not in your allow list:\n\n%s\n\nYes = Allow once\nAlways = Always allow\nNo = Deny" buttons {"No", "Always", "Yes"} default button "No" with icon caution with title "AI Expedite - Command Approval" giving up after %d

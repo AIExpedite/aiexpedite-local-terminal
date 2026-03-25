@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/getlantern/systray"
@@ -174,9 +173,7 @@ func onTrayReady(cfg *Config) func() {
 			go func() {
 				if err := StartRegistration(cfg); err != nil {
 					fmt.Println("Registration failed:", err)
-					if runtime.GOOS == "windows" {
-						ShowErrorDialog("Registration Failed", err.Error())
-					}
+					ShowErrorDialog("Registration Failed", err.Error())
 				} else {
 					// Registration successful - update checkbox and disable
 					mRegister.Check()
@@ -223,36 +220,29 @@ func onTrayReady(cfg *Config) func() {
 
 				fmt.Printf("[update] New version available: %s → %s\n", info.CurrentVersion, info.LatestVersion)
 
-				// Show dialog to user (Windows only for now)
-				if runtime.GOOS == "windows" {
-					choice := ShowUpdateDialog(info.CurrentVersion, info.LatestVersion)
+				// Show update dialog to user
+				choice := ShowUpdateDialog(info.CurrentVersion, info.LatestVersion)
 
-					switch choice {
-					case UpdateNow:
-						fmt.Println("[update] User chose: Update Now")
-						if err := downloadAndApplyUpdate(info); err != nil {
-							fmt.Println("[update] Download failed:", err)
-							ShowErrorDialog("Update Failed", err.Error())
-						}
-
-					case UpdateLater:
-						fmt.Println("[update] User chose: Later")
-						SetPendingUpdate(info)
-						// Show the Install Update menu item
-						mInstallUpdate.SetTitle(fmt.Sprintf("Install Update (%s)", info.LatestVersion))
-						mInstallUpdate.SetTooltip("Click to install the pending update")
-						mInstallUpdate.Show()
-
-					case SkipVersion:
-						fmt.Printf("[update] User chose: Skip version %s\n", info.LatestVersion)
-						cfg.SkippedVersion = info.LatestVersion
-						_ = cfg.Save(ConfigPath())
-					}
-				} else {
-					// Non-Windows: just download automatically like before
+				switch choice {
+				case UpdateNow:
+					fmt.Println("[update] User chose: Update Now")
 					if err := downloadAndApplyUpdate(info); err != nil {
 						fmt.Println("[update] Download failed:", err)
+						ShowErrorDialog("Update Failed", err.Error())
 					}
+
+				case UpdateLater:
+					fmt.Println("[update] User chose: Later")
+					SetPendingUpdate(info)
+					// Show the Install Update menu item
+					mInstallUpdate.SetTitle(fmt.Sprintf("Install Update (%s)", info.LatestVersion))
+					mInstallUpdate.SetTooltip("Click to install the pending update")
+					mInstallUpdate.Show()
+
+				case SkipVersion:
+					fmt.Printf("[update] User chose: Skip version %s\n", info.LatestVersion)
+					cfg.SkippedVersion = info.LatestVersion
+					_ = cfg.Save(ConfigPath())
 				}
 			}()
 		}
@@ -281,19 +271,17 @@ func onTrayReady(cfg *Config) func() {
 					}
 
 				case <-mResetAllowList.ClickedCh:
-					if runtime.GOOS == "windows" {
-						// Confirm with user before resetting
-						if ShowYesNoDialog("Reset Allow List",
-							"This will replace your allowed-commands.txt with the latest defaults.\n\n"+
-								"Any custom patterns you added will be lost.\n\n"+
-								"Continue?") {
-							if err := ResetAllowList(); err != nil {
-								ShowErrorDialog("Reset Failed", err.Error())
-							} else {
-								ShowInfoDialog("Allow List Reset",
-									"The allow list has been reset to defaults.\n\n"+
-										"New patterns are now active.")
-							}
+					// Confirm with user before resetting
+					if ShowYesNoDialog("Reset Allow List",
+						"This will replace your allowed-commands.txt with the latest defaults.\n\n"+
+							"Any custom patterns you added will be lost.\n\n"+
+							"Continue?") {
+						if err := ResetAllowList(); err != nil {
+							ShowErrorDialog("Reset Failed", err.Error())
+						} else {
+							ShowInfoDialog("Allow List Reset",
+								"The allow list has been reset to defaults.\n\n"+
+									"New patterns are now active.")
 						}
 					}
 
@@ -303,43 +291,32 @@ func onTrayReady(cfg *Config) func() {
 						info, err := checkForNewVersion()
 						if err != nil {
 							fmt.Println("Update check failed:", err)
-							if runtime.GOOS == "windows" {
-								ShowErrorDialog("Update Check Failed", err.Error())
-							}
+							ShowErrorDialog("Update Check Failed", err.Error())
 							return
 						}
 
 						if !info.Available {
 							fmt.Println("No update available; current", Version)
-							if runtime.GOOS == "windows" {
-								ShowInfoDialog("No Update Available",
-									fmt.Sprintf("You're running the latest version (%s).", Version))
-							}
+							ShowInfoDialog("No Update Available",
+								fmt.Sprintf("You're running the latest version (%s).", Version))
 							return
 						}
 
 						// Show dialog for manual check too
-						if runtime.GOOS == "windows" {
-							choice := ShowUpdateDialog(info.CurrentVersion, info.LatestVersion)
-							switch choice {
-							case UpdateNow:
-								if err := downloadAndApplyUpdate(info); err != nil {
-									ShowErrorDialog("Update Failed", err.Error())
-								}
-							case UpdateLater:
-								SetPendingUpdate(info)
-								mInstallUpdate.SetTitle(fmt.Sprintf("Install Update (%s)", info.LatestVersion))
-								mInstallUpdate.SetTooltip("Click to install the pending update")
-								mInstallUpdate.Show()
-							case SkipVersion:
-								cfg.SkippedVersion = info.LatestVersion
-								_ = cfg.Save(ConfigPath())
-							}
-						} else {
-							// Non-Windows: download automatically
+						choice := ShowUpdateDialog(info.CurrentVersion, info.LatestVersion)
+						switch choice {
+						case UpdateNow:
 							if err := downloadAndApplyUpdate(info); err != nil {
-								fmt.Println("Update failed:", err)
+								ShowErrorDialog("Update Failed", err.Error())
 							}
+						case UpdateLater:
+							SetPendingUpdate(info)
+							mInstallUpdate.SetTitle(fmt.Sprintf("Install Update (%s)", info.LatestVersion))
+							mInstallUpdate.SetTooltip("Click to install the pending update")
+							mInstallUpdate.Show()
+						case SkipVersion:
+							cfg.SkippedVersion = info.LatestVersion
+							_ = cfg.Save(ConfigPath())
 						}
 					}()
 
@@ -349,20 +326,16 @@ func onTrayReady(cfg *Config) func() {
 						fmt.Printf("[update] Installing pending update: %s\n", info.LatestVersion)
 						if err := downloadAndApplyUpdate(info); err != nil {
 							fmt.Println("[update] Failed:", err)
-							if runtime.GOOS == "windows" {
-								ShowErrorDialog("Update Failed", err.Error())
-							}
+							ShowErrorDialog("Update Failed", err.Error())
 						}
 					}
 
 				case <-mRegister.ClickedCh:
 					// If already registered, show info dialog
 					if cfg.IsRegistered() {
-						if runtime.GOOS == "windows" {
-							ShowInfoDialog("Device Registered",
-								fmt.Sprintf("This device is already registered.\n\nAgent ID: %s\nUser: %s",
-									cfg.AgentID, cfg.UserID))
-						}
+						ShowInfoDialog("Device Registered",
+							fmt.Sprintf("This device is already registered.\n\nAgent ID: %s\nUser: %s",
+								cfg.AgentID, cfg.UserID))
 						continue
 					}
 
@@ -381,9 +354,7 @@ func onTrayReady(cfg *Config) func() {
 					go func() {
 						if err := StartRegistration(cfg); err != nil {
 							fmt.Println("Registration failed:", err)
-							if runtime.GOOS == "windows" {
-								ShowErrorDialog("Registration Failed", err.Error())
-							}
+							ShowErrorDialog("Registration Failed", err.Error())
 						} else {
 							// Registration successful - update checkbox and disable
 							mRegister.Check()
@@ -532,34 +503,7 @@ func onTrayExit() {
 	_ = exec.Command("tmux", "kill-session", "-t", tmuxSessionName).Run()
 }
 
-// aggressiveCleanup forcefully kills child processes that might be stuck.
-// This is necessary for updates when long-running commands (like claude -p) are hanging.
-// IMPORTANT: Only kills processes spawned by this application, not other user processes.
-func aggressiveCleanup() {
-	// Get our own PID - we'll kill our process tree
-	myPID := os.Getpid()
-	fmt.Printf("[cleanup] Killing child processes of PID %d...\n", myPID)
-
-	// Use taskkill /T to kill our entire process tree (all children)
-	// This includes any PowerShell, claude, ttyd processes we spawned
-	cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", myPID))
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	// Note: This will fail to kill ourselves (which is fine - we're exiting anyway)
-	// but it WILL kill all our child processes
-	_ = cmd.Run()
-
-	// Also kill ttyd specifically if we have its PID (belt and suspenders)
-	if ttydCmd != nil && ttydCmd.Process != nil {
-		pid := ttydCmd.Process.Pid
-		fmt.Printf("[cleanup] Killing ttyd process tree (PID %d)...\n", pid)
-		cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		_ = cmd.Run()
-	}
-
-	// Brief pause to let processes terminate
-	time.Sleep(500 * time.Millisecond)
-}
+// aggressiveCleanup is defined in cleanup_windows.go / cleanup_other.go
 
 /* ---------- elevated copy (auto-update UAC) ---------- */
 
@@ -963,9 +907,7 @@ del /f /q "%%~f0" > nul 2>&1
 
 	// Execute the batch file in the background (hidden window)
 	cmd := exec.Command("cmd", "/c", "start", "/b", "", batchPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow: true,
-	}
+	hideWindow(cmd)
 
 	return cmd.Start()
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"os"
@@ -174,10 +173,6 @@ func installTtydWindows() error {
 	fmt.Println("  Option 2: scoop install ttyd")
 	fmt.Println("  Option 3: Download from", ttydDownloadURL)
 	fmt.Println("")
-	fmt.Println("Press Enter to exit...")
-
-	// Wait for user to acknowledge
-	bufio.NewReader(os.Stdin).ReadBytes('\n')
 
 	ShowErrorDialog(
 		"Installation Failed",

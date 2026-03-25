@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -199,12 +200,12 @@ func setTrackedCwd(cwd string) {
 	trackedCwdLock.Unlock()
 }
 
-// startRateLimiterCleanup launches a background goroutine that removes stale entries every 10 minutes.
+// startRateLimiterCleanup launches a background goroutine that removes stale entries every minute.
 // The goroutine exits when shutdownChan is closed.
 func startRateLimiterCleanup() {
 	rateLimiterCleanupOn.Do(func() {
 		go func() {
-			ticker := time.NewTicker(10 * time.Minute)
+			ticker := time.NewTicker(1 * time.Minute)
 			defer ticker.Stop()
 			for {
 				select {
@@ -485,6 +486,7 @@ func StartPubSubLoop(cfg *Config) {
 		}
 
 		// Attempt connection
+		connStart := time.Now()
 		err := runPubSubConnection(cfg)
 
 		// Check if we went offline intentionally
@@ -496,6 +498,11 @@ func StartPubSubLoop(cfg *Config) {
 		if err == nil {
 			// Clean shutdown
 			return
+		}
+
+		// Reset backoff if the connection was healthy for a while (transient blip)
+		if time.Since(connStart) > 30*time.Second {
+			backoff = time.Second
 		}
 
 		fmt.Printf("[pubsub] connection lost: %v\n", err)
@@ -519,16 +526,14 @@ func StartPubSubLoop(cfg *Config) {
 			}
 
 			// Notify main.go to update the Register Device menu item
-			if runtime.GOOS == "windows" {
-				select {
-				case RegistrationInvalidChan <- true:
-				default:
-					// Channel full, skip (non-blocking)
-				}
+			select {
+			case RegistrationInvalidChan <- true:
+			default:
+				// Channel full, skip (non-blocking)
 			}
 
 			// Show error dialog to user
-			if runtime.GOOS == "windows" && IsSystrayReady() {
+			if IsSystrayReady() {
 				ShowErrorDialog("Terminal Disconnected",
 					"This terminal's connection was removed via the website.\n\n"+
 						"Please click 'Register Device' in the tray menu to reconnect.")
@@ -556,11 +561,14 @@ func StartPubSubLoop(cfg *Config) {
 		case <-time.After(backoff):
 		}
 
-		// Exponential backoff (1s → 1.5s → 2.25s → ... → 5min max)
+		// Exponential backoff with jitter (1s → 1.5s → 2.25s → ... → 5min max)
 		backoff = time.Duration(float64(backoff) * 1.5)
 		if backoff > maxBackoff {
 			backoff = maxBackoff
 		}
+		// Add ±25% jitter to prevent thundering herd when multiple terminals reconnect
+		jitter := time.Duration(rand.Int63n(int64(backoff)/2)) - backoff/4
+		backoff += jitter
 	}
 }
 

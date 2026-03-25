@@ -259,10 +259,20 @@ func (sm *SessionManager) SendInput(id, text string) error {
 			jsonEscapeString(text), id)
 	}
 
-	// Write input followed by newline
-	_, err := fmt.Fprintln(session.Stdin, payload)
-	if err != nil {
-		return fmt.Errorf("failed to write to session %s stdin: %w", id, err)
+	// Write input with timeout to prevent deadlock if the CLI process's
+	// stdin pipe buffer is full (e.g., process is stalled or blocked).
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := fmt.Fprintln(session.Stdin, payload)
+		writeDone <- err
+	}()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			return fmt.Errorf("failed to write to session %s stdin: %w", id, err)
+		}
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("timeout writing to session %s stdin (pipe buffer full)", id)
 	}
 
 	// Reset status from waiting_input back to running
@@ -499,9 +509,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				defer func() { <-publishSem }()
 				publishFn(msg)
 			}()
-		default:
-			// All publish slots busy — drop to prevent goroutine buildup
-			fmt.Printf("%s[session] Publish backpressure, dropping batch for %s%s\n",
+		case <-time.After(5 * time.Second):
+			// All publish slots busy for 5s — drop to prevent goroutine buildup
+			fmt.Printf("%s[session] Publish timeout, dropping batch for %s%s\n",
 				colorYellow, session.ID, colorReset)
 		}
 	}
