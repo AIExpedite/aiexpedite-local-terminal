@@ -48,14 +48,6 @@ func ShowCommandApprovalDialog(cmd string, args []string, timeoutSec int) Approv
 	return ApprovalDeny
 }
 
-// escapeZenityMarkup escapes characters that zenity interprets as Pango markup.
-func escapeZenityMarkup(s string) string {
-	s = strings.ReplaceAll(s, "&", "&amp;")
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	return s
-}
-
 func showZenityDialog(displayCmd string, timeoutSec int) ApprovalResult {
 	message := fmt.Sprintf(
 		"An agent wants to execute a command not in your allow list:\n\n%s\n\n"+
