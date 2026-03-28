@@ -99,12 +99,136 @@ jobs:
             dist/aiexpedite-terminal-windows-amd64.exe
             dist/AIExpediteTerminal-Setup.exe
 
+  build-prod-darwin:
+    name: Build prod/darwin/${{ matrix.goarch }}
+    needs: validate-version
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+
+      - name: Download Go modules
+        run: go mod tidy
+
+      - name: Build binary
+        run: |
+          mkdir -p dist
+
+          LDFLAGS="-X main.EnvName=prod"
+          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite Terminal'"
+          LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=https://api.aiexpedite.com/terminal"
+          LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix="
+          LDFLAGS="$LDFLAGS -X main.ReleaseChannel=prod"
+          LDFLAGS="$LDFLAGS -X main.Version=${{ inputs.version }}"
+
+          GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-darwin-${{ matrix.goarch }}" .
+
+      - name: Package as DMG
+        run: |
+          DMG_NAME="aiexpedite-terminal-darwin-${{ matrix.goarch }}.dmg"
+          mkdir -p dmg-staging
+          cp "dist/aiexpedite-terminal-darwin-${{ matrix.goarch }}" dmg-staging/AIExpediteTerminal
+          chmod +x dmg-staging/AIExpediteTerminal
+          hdiutil create -volname "AI Expedite Terminal" -srcfolder dmg-staging -ov -format UDZO "dist/${DMG_NAME}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: prod-darwin-${{ matrix.goarch }}
+          path: dist/aiexpedite-terminal-darwin-${{ matrix.goarch }}.dmg
+
+  build-prod-linux:
+    name: Build prod/linux/amd64
+    needs: validate-version
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+
+      - name: Download Go modules
+        run: go mod tidy
+
+      - name: Build binary
+        run: |
+          mkdir -p dist
+
+          LDFLAGS="-X main.EnvName=prod"
+          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite Terminal'"
+          LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=https://api.aiexpedite.com/terminal"
+          LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix="
+          LDFLAGS="$LDFLAGS -X main.ReleaseChannel=prod"
+          LDFLAGS="$LDFLAGS -X main.Version=${{ inputs.version }}"
+
+          GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-linux-amd64" .
+
+      - name: Package as AppImage
+        run: |
+          # Download appimagetool
+          wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" -O appimagetool
+          chmod +x appimagetool
+
+          # Create AppDir structure
+          mkdir -p AppDir/usr/bin AppDir/usr/share/icons/hicolor/256x256/apps
+          cp dist/aiexpedite-terminal-linux-amd64 AppDir/usr/bin/AIExpediteTerminal
+          chmod +x AppDir/usr/bin/AIExpediteTerminal
+
+          # Create desktop file
+          cat > AppDir/AIExpediteTerminal.desktop << 'DESKTOP'
+          [Desktop Entry]
+          Name=AI Expedite Terminal
+          Exec=AIExpediteTerminal
+          Icon=aiexpedite-terminal
+          Type=Application
+          Categories=Development;
+          DESKTOP
+
+          # Create AppRun
+          cat > AppDir/AppRun << 'APPRUN'
+          #!/bin/bash
+          SELF=$(readlink -f "$0")
+          HERE=${SELF%/*}
+          exec "${HERE}/usr/bin/AIExpediteTerminal" "$@"
+          APPRUN
+          chmod +x AppDir/AppRun
+
+          # Create a placeholder icon if none exists
+          if [ ! -f icon.png ]; then
+            convert -size 256x256 xc:transparent AppDir/usr/share/icons/hicolor/256x256/apps/aiexpedite-terminal.png 2>/dev/null || \
+            touch AppDir/usr/share/icons/hicolor/256x256/apps/aiexpedite-terminal.png
+          else
+            cp icon.png AppDir/usr/share/icons/hicolor/256x256/apps/aiexpedite-terminal.png
+          fi
+          ln -sf usr/share/icons/hicolor/256x256/apps/aiexpedite-terminal.png AppDir/aiexpedite-terminal.png
+
+          # Build AppImage
+          ARCH=x86_64 ./appimagetool --no-appstream AppDir "dist/aiexpedite-terminal-linux-amd64.AppImage"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: prod-linux-amd64
+          path: dist/aiexpedite-terminal-linux-amd64.AppImage
+
   ###############################################################################
   # Create production release (public, shown to users)
   ###############################################################################
   release-prod:
     name: Publish production release
-    needs: build-prod
+    needs: [build-prod, build-prod-darwin, build-prod-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
@@ -143,13 +267,17 @@ jobs:
 
             | File | Description |
             |------|-------------|
-            | `AIExpediteTerminal-Setup.exe` | **Installer (Recommended)** — installs to Program Files, adds auto-start, creates uninstaller |
-            | `aiexpedite-terminal-windows-amd64.exe` | Standalone executable |
+            | `AIExpediteTerminal-Setup.exe` | **Windows Installer (Recommended)** — installs to Program Files, adds auto-start, creates uninstaller |
+            | `aiexpedite-terminal-windows-amd64.exe` | Windows standalone executable |
+            | `aiexpedite-terminal-darwin-arm64.dmg` | **macOS (Apple Silicon)** |
+            | `aiexpedite-terminal-darwin-amd64.dmg` | macOS (Intel) |
+            | `aiexpedite-terminal-linux-amd64.AppImage` | Linux (x86_64) |
 
             ### Installation
-            1. Download and run the installer (or standalone exe)
-            2. If Windows SmartScreen appears, click "More info" then "Run anyway"
-            3. Click "Register Device" in the system tray to connect to your AI Expedite account
+            **Windows:** Download and run the installer (or standalone exe). If SmartScreen appears, click "More info" then "Run anyway".
+            **macOS:** Open the .dmg file and drag to Applications. If blocked, go to System Preferences → Security & Privacy → "Open Anyway".
+            **Linux:** Download the .AppImage, run `chmod +x` on it, then execute.
+            Click "Register Device" in the system tray to connect to your AI Expedite account.
 
   ###############################################################################
   # Update 'latest' tag and release (always points to newest production release)
@@ -202,13 +330,17 @@ jobs:
 
             | File | Description |
             |------|-------------|
-            | `AIExpediteTerminal-Setup.exe` | **Installer (Recommended)** — installs to Program Files, adds auto-start, creates uninstaller |
-            | `aiexpedite-terminal-windows-amd64.exe` | Standalone executable |
+            | `AIExpediteTerminal-Setup.exe` | **Windows Installer (Recommended)** — installs to Program Files, adds auto-start, creates uninstaller |
+            | `aiexpedite-terminal-windows-amd64.exe` | Windows standalone executable |
+            | `aiexpedite-terminal-darwin-arm64.dmg` | **macOS (Apple Silicon)** |
+            | `aiexpedite-terminal-darwin-amd64.dmg` | macOS (Intel) |
+            | `aiexpedite-terminal-linux-amd64.AppImage` | Linux (x86_64) |
 
             ### Installation
-            1. Download and run the installer (or standalone exe)
-            2. If Windows SmartScreen appears, click "More info" then "Run anyway"
-            3. Click "Register Device" in the system tray to connect to your AI Expedite account
+            **Windows:** Download and run the installer (or standalone exe). If SmartScreen appears, click "More info" then "Run anyway".
+            **macOS:** Open the .dmg file and drag to Applications. If blocked, go to System Preferences → Security & Privacy → "Open Anyway".
+            **Linux:** Download the .AppImage, run `chmod +x` on it, then execute.
+            Click "Register Device" in the system tray to connect to your AI Expedite account.
 
             ---
             *This release always points to the latest production version. For specific versions, see [all releases](https://github.com/AIExpedite/aiexpedite-local-terminal/releases).*

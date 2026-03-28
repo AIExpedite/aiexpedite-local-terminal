@@ -111,12 +111,161 @@ jobs:
             dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe
             dist/${{ matrix.installer_name }}
 
+  build-nonprod-darwin:
+    name: Build ${{ matrix.env }}/darwin/${{ matrix.goarch }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, stg, beta]
+        goarch: [amd64, arm64]
+        include:
+          - env: dev
+            display_name: "AI Expedite Terminal (Dev)"
+            api_endpoint: "https://api.dev.aiexpedite.com/terminal"
+            config_suffix: "-Dev"
+            exe_suffix: "-dev"
+          - env: stg
+            display_name: "AI Expedite Terminal (Stg)"
+            api_endpoint: "https://api.stg.aiexpedite.com/terminal"
+            config_suffix: "-Stg"
+            exe_suffix: "-stg"
+          - env: beta
+            display_name: "AI Expedite Terminal (Beta)"
+            api_endpoint: "https://api.beta.aiexpedite.com/terminal"
+            config_suffix: "-Beta"
+            exe_suffix: "-beta"
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+
+      - name: Download Go modules
+        run: go mod tidy
+
+      - name: Build binary
+        run: |
+          mkdir -p dist
+
+          LDFLAGS="-X main.EnvName=${{ matrix.env }}"
+          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=${{ matrix.display_name }}'"
+          LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=${{ matrix.api_endpoint }}"
+          LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix=${{ matrix.config_suffix }}"
+          LDFLAGS="$LDFLAGS -X main.ReleaseChannel=${{ matrix.env }}"
+
+          GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}" .
+
+      - name: Package as DMG
+        run: |
+          DMG_NAME="aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}.dmg"
+          mkdir -p dmg-staging
+          cp "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}" dmg-staging/AIExpediteTerminal
+          chmod +x dmg-staging/AIExpediteTerminal
+          hdiutil create -volname "AI Expedite Terminal (${{ matrix.env }})" -srcfolder dmg-staging -ov -format UDZO "dist/${DMG_NAME}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: nonprod-${{ matrix.env }}-darwin-${{ matrix.goarch }}
+          path: dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}.dmg
+
+  build-nonprod-linux:
+    name: Build ${{ matrix.env }}/linux/amd64
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: dev
+            display_name: "AI Expedite Terminal (Dev)"
+            api_endpoint: "https://api.dev.aiexpedite.com/terminal"
+            config_suffix: "-Dev"
+            exe_suffix: "-dev"
+          - env: stg
+            display_name: "AI Expedite Terminal (Stg)"
+            api_endpoint: "https://api.stg.aiexpedite.com/terminal"
+            config_suffix: "-Stg"
+            exe_suffix: "-stg"
+          - env: beta
+            display_name: "AI Expedite Terminal (Beta)"
+            api_endpoint: "https://api.beta.aiexpedite.com/terminal"
+            config_suffix: "-Beta"
+            exe_suffix: "-beta"
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24"
+
+      - name: Download Go modules
+        run: go mod tidy
+
+      - name: Build binary
+        run: |
+          mkdir -p dist
+
+          LDFLAGS="-X main.EnvName=${{ matrix.env }}"
+          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=${{ matrix.display_name }}'"
+          LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=${{ matrix.api_endpoint }}"
+          LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix=${{ matrix.config_suffix }}"
+          LDFLAGS="$LDFLAGS -X main.ReleaseChannel=${{ matrix.env }}"
+
+          GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-linux-amd64" .
+
+      - name: Package as AppImage
+        run: |
+          wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" -O appimagetool
+          chmod +x appimagetool
+
+          mkdir -p AppDir/usr/bin AppDir/usr/share/icons/hicolor/256x256/apps
+          cp "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-linux-amd64" AppDir/usr/bin/AIExpediteTerminal
+          chmod +x AppDir/usr/bin/AIExpediteTerminal
+
+          cat > AppDir/AIExpediteTerminal.desktop << 'DESKTOP'
+          [Desktop Entry]
+          Name=AI Expedite Terminal (${{ matrix.env }})
+          Exec=AIExpediteTerminal
+          Icon=aiexpedite-terminal
+          Type=Application
+          Categories=Development;
+          DESKTOP
+
+          cat > AppDir/AppRun << 'APPRUN'
+          #!/bin/bash
+          SELF=$(readlink -f "$0")
+          HERE=${SELF%/*}
+          exec "${HERE}/usr/bin/AIExpediteTerminal" "$@"
+          APPRUN
+          chmod +x AppDir/AppRun
+
+          if [ ! -f icon.png ]; then
+            touch AppDir/usr/share/icons/hicolor/256x256/apps/aiexpedite-terminal.png
+          else
+            cp icon.png AppDir/usr/share/icons/hicolor/256x256/apps/aiexpedite-terminal.png
+          fi
+          ln -sf usr/share/icons/hicolor/256x256/apps/aiexpedite-terminal.png AppDir/aiexpedite-terminal.png
+
+          ARCH=x86_64 ./appimagetool --no-appstream AppDir "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-linux-amd64.AppImage"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7.0.0
+        with:
+          name: nonprod-${{ matrix.env }}-linux-amd64
+          path: dist/aiexpedite-terminal${{ matrix.exe_suffix }}-linux-amd64.AppImage
+
   ###############################################################################
   # Create non-prod release (pre-release, hidden from main downloads)
   ###############################################################################
   release-nonprod:
     name: Publish non-prod release
-    needs: build-nonprod
+    needs: [build-nonprod, build-nonprod-darwin, build-nonprod-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
@@ -163,15 +312,15 @@ jobs:
           body: |
             ## Internal Builds (Dev, Staging, Beta)
 
-            **Note:** These builds are for internal testing only (Windows).
+            **Note:** These builds are for internal testing only.
 
             **Commit:** ${{ github.sha }}
 
-            | Environment | Installer (Recommended) | Standalone |
-            |-------------|------------------------|------------|
-            | Development | `AIExpediteTerminal-Dev-Setup.exe` | `aiexpedite-terminal-dev-windows-amd64.exe` |
-            | Staging | `AIExpediteTerminal-Stg-Setup.exe` | `aiexpedite-terminal-stg-windows-amd64.exe` |
-            | Beta | `AIExpediteTerminal-Beta-Setup.exe` | `aiexpedite-terminal-beta-windows-amd64.exe` |
+            | Environment | Windows Installer | Windows Standalone | macOS (Apple Silicon) | macOS (Intel) | Linux |
+            |-------------|------------------|-------------------|----------------------|---------------|-------|
+            | Development | `AIExpediteTerminal-Dev-Setup.exe` | `aiexpedite-terminal-dev-windows-amd64.exe` | `aiexpedite-terminal-dev-darwin-arm64.dmg` | `aiexpedite-terminal-dev-darwin-amd64.dmg` | `aiexpedite-terminal-dev-linux-amd64.AppImage` |
+            | Staging | `AIExpediteTerminal-Stg-Setup.exe` | `aiexpedite-terminal-stg-windows-amd64.exe` | `aiexpedite-terminal-stg-darwin-arm64.dmg` | `aiexpedite-terminal-stg-darwin-amd64.dmg` | `aiexpedite-terminal-stg-linux-amd64.AppImage` |
+            | Beta | `AIExpediteTerminal-Beta-Setup.exe` | `aiexpedite-terminal-beta-windows-amd64.exe` | `aiexpedite-terminal-beta-darwin-arm64.dmg` | `aiexpedite-terminal-beta-darwin-amd64.dmg` | `aiexpedite-terminal-beta-linux-amd64.AppImage` |
 
             All environments can run side-by-side on the same machine.
 
@@ -180,16 +329,17 @@ jobs:
   ###############################################################################
   release-dev:
     name: Publish dev release for auto-update
-    needs: build-nonprod
+    needs: [build-nonprod, build-nonprod-darwin, build-nonprod-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6.0.2
 
-      - name: Download dev binary only
+      - name: Download dev binaries
         uses: actions/download-artifact@v7
         with:
-          name: nonprod-dev-windows-amd64
+          pattern: nonprod-dev-*
           path: dist
+          merge-multiple: true
 
       - name: Generate SHA-256 checksums
         run: |
@@ -235,3 +385,6 @@ jobs:
             | Platform | Download |
             |----------|----------|
             | Windows | `aiexpedite-terminal-dev-windows-amd64.exe` |
+            | macOS (Apple Silicon) | `aiexpedite-terminal-dev-darwin-arm64.dmg` |
+            | macOS (Intel) | `aiexpedite-terminal-dev-darwin-amd64.dmg` |
+            | Linux | `aiexpedite-terminal-dev-linux-amd64.AppImage` |
