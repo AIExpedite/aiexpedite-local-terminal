@@ -159,13 +159,80 @@ jobs:
 
           CGO_ENABLED=1 GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}" .
 
+      - name: Generate macOS icon
+        run: |
+          mkdir -p AppIcon.iconset
+          sips -z 16 16     assets/aiexpedite-logo.png --out AppIcon.iconset/icon_16x16.png
+          sips -z 32 32     assets/aiexpedite-logo.png --out AppIcon.iconset/icon_16x16@2x.png
+          sips -z 32 32     assets/aiexpedite-logo.png --out AppIcon.iconset/icon_32x32.png
+          sips -z 64 64     assets/aiexpedite-logo.png --out AppIcon.iconset/icon_32x32@2x.png
+          sips -z 128 128   assets/aiexpedite-logo.png --out AppIcon.iconset/icon_128x128.png
+          sips -z 256 256   assets/aiexpedite-logo.png --out AppIcon.iconset/icon_128x128@2x.png
+          sips -z 256 256   assets/aiexpedite-logo.png --out AppIcon.iconset/icon_256x256.png
+          sips -z 512 512   assets/aiexpedite-logo.png --out AppIcon.iconset/icon_256x256@2x.png
+          sips -z 512 512   assets/aiexpedite-logo.png --out AppIcon.iconset/icon_512x512.png
+          sips -z 681 681   assets/aiexpedite-logo.png --out AppIcon.iconset/icon_512x512@2x.png
+          iconutil -c icns AppIcon.iconset -o AppIcon.icns
+
+      - name: Create .app bundle
+        run: |
+          VERSION=$(sed -n 's/.*const Version = "v\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' agent.go)
+
+          APP="dmg-staging/AIExpediteTerminal.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          cp "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}" "$APP/Contents/MacOS/AIExpediteTerminal"
+          chmod +x "$APP/Contents/MacOS/AIExpediteTerminal"
+          cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+
+          cat > "$APP/Contents/Info.plist" << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>AI Expedite Terminal</string>
+            <key>CFBundleDisplayName</key>
+            <string>${{ matrix.display_name }}</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.aiexpedite.terminal${{ matrix.config_suffix }}</string>
+            <key>CFBundleVersion</key>
+            <string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>CFBundleExecutable</key>
+            <string>AIExpediteTerminal</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+            <key>LSUIElement</key>
+            <true/>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
       - name: Package as DMG
         run: |
+          brew install create-dmg
           DMG_NAME="aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}.dmg"
-          mkdir -p dmg-staging
-          cp "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}" dmg-staging/AIExpediteTerminal
-          chmod +x dmg-staging/AIExpediteTerminal
-          hdiutil create -volname "AI Expedite Terminal (${{ matrix.env }})" -srcfolder dmg-staging -ov -format UDZO "dist/${DMG_NAME}"
+
+          create-dmg \
+            --volname "AI Expedite Terminal (${{ matrix.env }})" \
+            --volicon "AppIcon.icns" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "AIExpediteTerminal.app" 150 190 \
+            --app-drop-link 450 190 \
+            --no-internet-enable \
+            "dist/${DMG_NAME}" \
+            dmg-staging/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7.0.0
