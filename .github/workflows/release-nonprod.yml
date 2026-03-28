@@ -227,21 +227,30 @@ jobs:
 
       - name: Package as DMG
         run: |
-          brew install create-dmg
+          pip3 install dmgbuild
           DMG_NAME="aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}.dmg"
 
-          create-dmg \
-            --volname "AI Expedite Terminal (${{ matrix.env }})" \
-            --volicon "AppIcon.icns" \
-            --background "assets/dmg-background.png" \
-            --window-pos 200 120 \
-            --window-size 600 400 \
-            --icon-size 100 \
-            --icon "AIExpediteTerminal.app" 150 190 \
-            --app-drop-link 450 190 \
-            --no-internet-enable \
-            "dist/${DMG_NAME}" \
-            dmg-staging/
+          cat > /tmp/dmg-settings.py << 'PYEOF'
+          import os
+          application = defines.get("app_path")
+          appname = os.path.basename(application)
+          format = "UDZO"
+          files = [application]
+          symlinks = {"Applications": "/Applications"}
+          icon = defines.get("volume_icon", None)
+          icon_size = 100
+          background = defines.get("background")
+          icon_locations = {appname: (150, 190), "Applications": (450, 190)}
+          window_rect = ((200, 120), (600, 400))
+          default_view = "icon-view"
+          PYEOF
+
+          python3 -m dmgbuild -s /tmp/dmg-settings.py \
+            -D app_path="$PWD/dmg-staging/AIExpediteTerminal.app" \
+            -D background="$PWD/assets/dmg-background.png" \
+            -D volume_icon="$PWD/AppIcon.icns" \
+            "AI Expedite Terminal (${{ matrix.env }})" \
+            "dist/${DMG_NAME}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7.0.0
