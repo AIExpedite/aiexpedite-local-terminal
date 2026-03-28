@@ -185,7 +185,7 @@ jobs:
           chmod +x "$APP/Contents/MacOS/AIExpediteTerminal"
           cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
-          cat > "$APP/Contents/Info.plist" << PLIST
+          cat > "$APP/Contents/Info.plist" << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
             "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -194,13 +194,13 @@ jobs:
             <key>CFBundleName</key>
             <string>AI Expedite Terminal</string>
             <key>CFBundleDisplayName</key>
-            <string>${{ matrix.display_name }}</string>
+            <string>DISPLAY_NAME_PLACEHOLDER</string>
             <key>CFBundleIdentifier</key>
-            <string>com.aiexpedite.terminal${{ matrix.config_suffix }}</string>
+            <string>BUNDLE_ID_PLACEHOLDER</string>
             <key>CFBundleVersion</key>
-            <string>${VERSION}</string>
+            <string>VERSION_PLACEHOLDER</string>
             <key>CFBundleShortVersionString</key>
-            <string>${VERSION}</string>
+            <string>VERSION_PLACEHOLDER</string>
             <key>CFBundleExecutable</key>
             <string>AIExpediteTerminal</string>
             <key>CFBundleIconFile</key>
@@ -216,6 +216,14 @@ jobs:
           </dict>
           </plist>
           PLIST
+
+          # Replace placeholders with actual values
+          sed -i '' "s|DISPLAY_NAME_PLACEHOLDER|${{ matrix.display_name }}|g" "$APP/Contents/Info.plist"
+          sed -i '' "s|BUNDLE_ID_PLACEHOLDER|com.aiexpedite.terminal${{ matrix.config_suffix }}|g" "$APP/Contents/Info.plist"
+          sed -i '' "s|VERSION_PLACEHOLDER|${VERSION}|g" "$APP/Contents/Info.plist"
+
+      - name: Ad-hoc code sign
+        run: codesign --force --deep --sign - dmg-staging/AIExpediteTerminal.app
 
       - name: Package as DMG
         run: |
