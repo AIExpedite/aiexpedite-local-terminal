@@ -157,7 +157,7 @@ jobs:
           LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix=${{ matrix.config_suffix }}"
           LDFLAGS="$LDFLAGS -X main.ReleaseChannel=${{ matrix.env }}"
 
-          GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}" .
+          CGO_ENABLED=1 GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}" .
 
       - name: Package as DMG
         run: |
@@ -206,6 +206,9 @@ jobs:
 
       - name: Download Go modules
         run: go mod tidy
+
+      - name: Install systray dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc pkg-config libayatana-appindicator3-dev
 
       - name: Build binary
         run: |

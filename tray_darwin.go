@@ -93,3 +93,18 @@ func ensureAutoStart() error {
 func showConsoleWindow(show bool) {
 	// No-op on macOS
 }
+
+// allocateConsole is a no-op on macOS (Windows-only console allocation)
+func allocateConsole() error {
+	return nil
+}
+
+// ensureAppRegistration is a no-op on macOS (Windows registry only)
+func ensureAppRegistration() error {
+	return nil
+}
+
+// unregisterApp is a no-op on macOS (Windows registry only)
+func unregisterApp() error {
+	return nil
+}

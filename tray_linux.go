@@ -78,3 +78,18 @@ X-GNOME-Autostart-enabled=true
 func showConsoleWindow(show bool) {
 	// No-op on Linux
 }
+
+// allocateConsole is a no-op on Linux (Windows-only console allocation)
+func allocateConsole() error {
+	return nil
+}
+
+// ensureAppRegistration is a no-op on Linux (Windows registry only)
+func ensureAppRegistration() error {
+	return nil
+}
+
+// unregisterApp is a no-op on Linux (Windows registry only)
+func unregisterApp() error {
+	return nil
+}

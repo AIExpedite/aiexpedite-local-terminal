@@ -130,7 +130,7 @@ jobs:
           LDFLAGS="$LDFLAGS -X main.ReleaseChannel=prod"
           LDFLAGS="$LDFLAGS -X main.Version=${{ inputs.version }}"
 
-          GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-darwin-${{ matrix.goarch }}" .
+          CGO_ENABLED=1 GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-darwin-${{ matrix.goarch }}" .
 
       - name: Package as DMG
         run: |
@@ -161,6 +161,9 @@ jobs:
 
       - name: Download Go modules
         run: go mod tidy
+
+      - name: Install systray dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc pkg-config libayatana-appindicator3-dev
 
       - name: Build binary
         run: |
