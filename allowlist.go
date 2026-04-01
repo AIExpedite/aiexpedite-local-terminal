@@ -424,8 +424,11 @@ chown *
 
 # --- Windows Specific ---
 powershell *
+powershell.exe *
 pwsh *
+pwsh.exe *
 cmd *
+cmd.exe *
 type *
 copy *
 xcopy *
