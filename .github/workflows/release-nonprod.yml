@@ -227,7 +227,7 @@ jobs:
 
       - name: Package as DMG
         run: |
-          pip3 install dmgbuild
+          pip3 install --break-system-packages dmgbuild
           DMG_NAME="aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}.dmg"
 
           cat > /tmp/dmg-settings.py << 'PYEOF'
