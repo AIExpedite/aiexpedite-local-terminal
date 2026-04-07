@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.7.5"
+const Version = "v0.7.6"
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
