@@ -450,7 +450,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	go func() {
 		defer wg.Done()
 		scanner := bufio.NewScanner(session.Stdout)
-		scanner.Buffer(make([]byte, 0, 256*1024), 30*1024*1024) // 30MB max line (video base64 can be up to ~27MB)
+		scanner.Buffer(make([]byte, 0, 256*1024), 30*1024*1024) // 30MB max line (large CLI agent output, encoded content)
 		fmt.Printf("%s[session] stdout scanner started for %s%s\n", colorCyan, session.ID, colorReset)
 		lineCount := 0
 		for scanner.Scan() {
@@ -470,7 +470,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	go func() {
 		defer wg.Done()
 		scanner := bufio.NewScanner(session.Stderr)
-		scanner.Buffer(make([]byte, 0, 256*1024), 30*1024*1024) // 30MB max line (video base64 can be up to ~27MB)
+		scanner.Buffer(make([]byte, 0, 256*1024), 30*1024*1024) // 30MB max line (large CLI agent output, encoded content)
 		fmt.Printf("%s[session] stderr scanner started for %s%s\n", colorCyan, session.ID, colorReset)
 		lineCount := 0
 		for scanner.Scan() {
