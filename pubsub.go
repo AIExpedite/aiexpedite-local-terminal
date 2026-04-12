@@ -1644,8 +1644,9 @@ func detectOutputFiles(command string, output string, workDir string) []string {
 	// Pattern 1: Playwright test artifacts
 	if containsSubstring(command, "playwright") || containsSubstring(command, "pwtest") {
 		fmt.Println("[file-upload] Detected Playwright command, scanning for test artifacts...")
-		// Look for test-results directory
+		// Look for test-results and test-results-ui directories
 		files = appendFilesFromDir(files, "test-results", workDir, []string{".png", ".webm", ".mp4", ".json", ".html"})
+		files = appendFilesFromDir(files, "test-results-ui", workDir, []string{".png", ".webm", ".mp4", ".json", ".html"})
 		fmt.Printf("[file-upload] Found %d Playwright artifacts\n", len(files))
 	}
 
@@ -1662,11 +1663,12 @@ func detectOutputFiles(command string, output string, workDir string) []string {
 	// Pattern 4: CLI agents that ran Playwright tests (UI testing delegation)
 	// When claude/codex/gemini CLI runs Playwright internally, the command won't
 	// contain "playwright" and accumulated output may not be available (session.go
-	// passes "" for output). Always scan test-results for CLI agent commands since
-	// these agents are invoked specifically for UI testing tasks.
+	// passes "" for output). Always scan test-results and test-results-ui for CLI
+	// agent commands since these agents are invoked specifically for UI testing tasks.
 	if containsSubstring(command, "claude") || containsSubstring(command, "codex") || containsSubstring(command, "gemini") {
 		fmt.Println("[file-upload] Detected CLI agent command, scanning for test artifacts...")
 		files = appendFilesFromDir(files, "test-results", workDir, []string{".png", ".webm", ".mp4", ".json", ".html"})
+		files = appendFilesFromDir(files, "test-results-ui", workDir, []string{".png", ".webm", ".mp4", ".json", ".html"})
 		fmt.Printf("[file-upload] Found %d CLI agent test artifacts\n", len(files))
 	}
 
