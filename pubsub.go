@@ -23,7 +23,7 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"cloud.google.com/go/pubsub"
+	"cloud.google.com/go/pubsub/v2"
 	"github.com/getlantern/systray"
 	"golang.org/x/mod/semver"
 	"golang.org/x/oauth2"
@@ -574,7 +574,7 @@ func StartPubSubLoop(cfg *Config) {
 
 // publishMsg marshals res and publishes it on topic using ctx.
 // Logs and returns any error so callers can decide whether to ack or nack.
-func publishMsg(ctx context.Context, topic *pubsub.Topic, res resultMsg) error {
+func publishMsg(ctx context.Context, topic *pubsub.Publisher, res resultMsg) error {
 	bytes, err := json.Marshal(res)
 	if err != nil {
 		fmt.Printf("%s[aiexpedite] Failed to marshal result: %v%s\n", colorRed, err, colorReset)
@@ -641,19 +641,20 @@ func runPubSubConnection(cfg *Config) error {
 
 	fmt.Println("[pubsub] client created successfully")
 
-	sub := client.Subscription(cfg.CommandsSubscription)
-	// Use asynchronous processing to allow ping commands to be handled while
-	// long-running commands (like claude) are executing. This prevents the
-	// terminal from appearing "offline" during lengthy operations.
-	sub.ReceiveSettings.Synchronous = false
-	// Use configurable MaxOutstandingMessages for parallel processing
+	// v2 requires fully-qualified resource names.
+	subName := fmt.Sprintf("projects/%s/subscriptions/%s", cfg.ProjectID, cfg.CommandsSubscription)
+	topicName := fmt.Sprintf("projects/%s/topics/%s", cfg.ProjectID, cfg.ResultsTopic)
+
+	sub := client.Subscriber(subName)
+	// Use configurable MaxOutstandingMessages for parallel processing.
+	// (v2 is always asynchronous — the v1 Synchronous flag no longer exists.)
 	sub.ReceiveSettings.MaxOutstandingMessages = cfg.MaxOutstandingMessages
 	if sub.ReceiveSettings.MaxOutstandingMessages <= 0 {
 		sub.ReceiveSettings.MaxOutstandingMessages = 10 // Default to 10 for faster stale-command drain
 	}
 	fmt.Printf("[pubsub] MaxOutstandingMessages set to %d\n", sub.ReceiveSettings.MaxOutstandingMessages)
 
-	topic := client.Topic(cfg.ResultsTopic)
+	topic := client.Publisher(topicName)
 
 	fmt.Printf("[pubsub] connected to subscription: %s\n", cfg.CommandsSubscription)
 	if IsSystrayReady() {
@@ -1790,7 +1791,7 @@ var globalSessionManager *SessionManager
 // handleSessionCommand handles interactive session commands (session_start,
 // session_input, session_signal, session_end). It publishes results back
 // via the provided Pub/Sub topic.
-func handleSessionCommand(ctx context.Context, topic *pubsub.Topic, cmd commandMsg) {
+func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg) {
 	if globalSessionManager == nil {
 		publishSessionError(ctx, topic, cmd, "session manager not initialized")
 		return
@@ -1902,7 +1903,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Topic, cmd commandM
 }
 
 // publishSessionError publishes an error result for a session command.
-func publishSessionError(ctx context.Context, topic *pubsub.Topic, cmd commandMsg, errMsg string) {
+func publishSessionError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
 	fmt.Printf("%s[session] Error: %s%s\n", colorRed, errMsg, colorReset)
 
 	res := resultMsg{
