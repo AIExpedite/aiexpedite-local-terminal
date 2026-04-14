@@ -41,7 +41,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.24"
+          # Pinned to 1.25 because go.mod requires 1.25+ — forced by
+          # go.opentelemetry.io/otel/sdk v1.43.0, which carries the fix for
+          # GHSA-hfvc-g4fc-pqhx / GHSA-9h8m-3fm2-qjrq (PATH hijacking).
+          # Downgrading to 1.24 would reintroduce those high-severity CVEs.
+          go-version: "1.25"
 
       - name: Download Go modules
         run: go mod tidy
@@ -114,7 +118,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.24"
+          # Pinned to 1.25 because go.mod requires 1.25+ — forced by
+          # go.opentelemetry.io/otel/sdk v1.43.0, which carries the fix for
+          # GHSA-hfvc-g4fc-pqhx / GHSA-9h8m-3fm2-qjrq (PATH hijacking).
+          # Downgrading to 1.24 would reintroduce those high-severity CVEs.
+          go-version: "1.25"
 
       - name: Download Go modules
         run: go mod tidy
@@ -241,7 +249,11 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.24"
+          # Pinned to 1.25 because go.mod requires 1.25+ — forced by
+          # go.opentelemetry.io/otel/sdk v1.43.0, which carries the fix for
+          # GHSA-hfvc-g4fc-pqhx / GHSA-9h8m-3fm2-qjrq (PATH hijacking).
+          # Downgrading to 1.24 would reintroduce those high-severity CVEs.
+          go-version: "1.25"
 
       - name: Download Go modules
         run: go mod tidy
