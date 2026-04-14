@@ -1205,7 +1205,16 @@ func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout t
 	c.Stdout = &stdout
 	c.Stderr = &stderr
 
-	err := c.Run()
+	// Register/deregister the PID so the orphan scanner doesn't flag this
+	// short-lived spawn as an orphan if it overlaps with a scan cycle.
+	if startErr := c.Start(); startErr != nil {
+		return "", startErr
+	}
+	if c.Process != nil {
+		globalProcessRegistry.Register(c.Process.Pid, "pubsub:powershell-encoded")
+		defer globalProcessRegistry.Deregister(c.Process.Pid)
+	}
+	err := c.Wait()
 
 	stdoutStr := stdout.String()
 	stderrStr := stderr.String()
@@ -1307,8 +1316,21 @@ func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string,
 		c.Dir = workDir
 	}
 
-	out, err := c.CombinedOutput()
-	return string(out), err
+	// Use Start/Wait instead of CombinedOutput so we can register the PID
+	// with the orphan scanner. CombinedOutput would block before we can
+	// access c.Process.
+	var combined bytes.Buffer
+	c.Stdout = &combined
+	c.Stderr = &combined
+	if err := c.Start(); err != nil {
+		return "", err
+	}
+	if c.Process != nil {
+		globalProcessRegistry.Register(c.Process.Pid, "pubsub:shell")
+		defer globalProcessRegistry.Deregister(c.Process.Pid)
+	}
+	err := c.Wait()
+	return combined.String(), err
 }
 
 /* runLocalCommand executes the command using persistent PowerShell for low latency.
@@ -1513,7 +1535,20 @@ func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Durati
 		c.Dir = workDir
 	}
 
-	rawOut, err := c.CombinedOutput()
+	// Use Start/Wait instead of CombinedOutput so the PID is registered
+	// with the orphan scanner while the command runs.
+	var combined bytes.Buffer
+	c.Stdout = &combined
+	c.Stderr = &combined
+	if startErr := c.Start(); startErr != nil {
+		return "", startErr
+	}
+	if c.Process != nil {
+		globalProcessRegistry.Register(c.Process.Pid, "pubsub:fallback")
+		defer globalProcessRegistry.Deregister(c.Process.Pid)
+	}
+	err := c.Wait()
+	rawOut := combined.Bytes()
 	out := string(rawOut)
 
 	// Extract and strip the cwd probe from the output.

@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.7.8"
+const Version = "v0.7.9"
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -207,6 +207,10 @@ func StartAgent(cfg *Config) {
 	/* 4. Start Pub/Sub loop (non‑blocking) -------------------------------- */
 
 	go StartPubSubLoop(cfg)
+
+	/* 4b. Start orphan-process scanner (kills detached CLI agents) -------- */
+
+	StartOrphanScanner(cfg)
 
 	/* 5. Display connection instructions ---------------------------------- */
 

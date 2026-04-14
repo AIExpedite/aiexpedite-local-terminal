@@ -184,6 +184,12 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	sm.sessions[id] = session
 
+	// Register the PID so the orphan scanner knows this process is backed by
+	// an active session. removeSession() deregisters it on exit.
+	if proc.Process != nil {
+		globalProcessRegistry.Register(proc.Process.Pid, "session:"+id)
+	}
+
 	// Start output reader goroutines
 	go sm.readOutputStream(session, publishFn)
 
@@ -431,9 +437,13 @@ func (sm *SessionManager) ActiveSessionCount() int {
    Internal helpers
    -------------------------------------------------------------------------- */
 
-// removeSession removes a session from the map.
+// removeSession removes a session from the map and deregisters its PID from
+// the orphan-scanner registry.
 func (sm *SessionManager) removeSession(id string) {
 	sm.mu.Lock()
+	if s, ok := sm.sessions[id]; ok && s.Process != nil && s.Process.Process != nil {
+		globalProcessRegistry.Deregister(s.Process.Process.Pid)
+	}
 	delete(sm.sessions, id)
 	sm.mu.Unlock()
 }
