@@ -434,7 +434,8 @@ type resultMsg struct {
 	Version      string        `json:"version,omitempty"`      // Terminal app version
 	Cwd          string        `json:"cwd,omitempty"`          // Current working directory after execution
 	Files        []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
-	UploadErrors []UploadError `json:"uploadErrors,omitempty"` // File upload failures
+	UploadErrors    []UploadError `json:"uploadErrors,omitempty"` // File upload failures
+	RejectionReason string        `json:"rejectionReason,omitempty"`
 
 	// Session fields (for interactive CLI agent sessions)
 	Type       string `json:"type,omitempty"`       // "result"|"stream"|"prompt"|"session_ended"
@@ -723,13 +724,15 @@ func runPubSubConnection(cfg *Config) error {
 
 				// Send stale response back to user
 				res := resultMsg{
-					ID:          cmd.ID,
-					WorkspaceID: cmd.WorkspaceID,
-					UID:         cmd.UID,
-					Output:      fmt.Sprintf("Command rejected: too old (%d seconds, max %d seconds). Terminal may have been offline.", ageSec, maxCommandAgeSec),
-					Status:      "stale",
-					Ts:          time.Now().UnixMilli(),
-					Version:     Version,
+					ID:              cmd.ID,
+					WorkspaceID:     cmd.WorkspaceID,
+					UID:             cmd.UID,
+					AgentID:         cfg.AgentID,
+					Output:          fmt.Sprintf("Command rejected: too old (%d seconds, max %d seconds). Terminal may have been offline.", ageSec, maxCommandAgeSec),
+					Status:          "stale",
+					Ts:              time.Now().UnixMilli(),
+					Version:         Version,
+					RejectionReason: "STALE",
 				}
 					// Include session metadata so the backend can update the session document
 					if cmd.Type != "" && cmd.SessionID != "" {
@@ -751,13 +754,15 @@ func runPubSubConnection(cfg *Config) error {
 
 				// Send rate_limited response back to user for immediate feedback
 				res := resultMsg{
-					ID:          cmd.ID,
-					WorkspaceID: cmd.WorkspaceID,
-					UID:         cmd.UID,
-					Output:      "Command rate limit exceeded. Please wait before retrying.",
-					Status:      "rate_limited",
-					Ts:          time.Now().UnixMilli(),
-					Version:     Version,
+					ID:              cmd.ID,
+					WorkspaceID:     cmd.WorkspaceID,
+					UID:             cmd.UID,
+					AgentID:         cfg.AgentID,
+					Output:          "Command rate limit exceeded. Please wait before retrying.",
+					Status:          "rate_limited",
+					Ts:              time.Now().UnixMilli(),
+					Version:         Version,
+					RejectionReason: "RATE_LIMITED",
 				}
 					// Include session metadata so the backend can update the session document
 					if cmd.Type != "" && cmd.SessionID != "" {
@@ -796,13 +801,15 @@ func runPubSubConnection(cfg *Config) error {
 						return
 					}
 					res := resultMsg{
-						ID:          cmd.ID,
-						WorkspaceID: cmd.WorkspaceID,
-						UID:         cmd.UID,
-						Output:      "Command rejected: signature required but not provided",
-						Status:      "unauthorized",
-						Ts:          time.Now().UnixMilli(),
-						Version:     Version,
+						ID:              cmd.ID,
+						WorkspaceID:     cmd.WorkspaceID,
+						UID:             cmd.UID,
+						AgentID:         cfg.AgentID,
+						Output:          "Command rejected: signature required but not provided",
+						Status:          "unauthorized",
+						Ts:              time.Now().UnixMilli(),
+						Version:         Version,
+						RejectionReason: "UNAUTHORIZED",
 					}
 						// Include session metadata so the backend can update the session document
 						if cmd.Type != "" && cmd.SessionID != "" {
@@ -825,13 +832,15 @@ func runPubSubConnection(cfg *Config) error {
 						return
 					}
 					res := resultMsg{
-						ID:          cmd.ID,
-						WorkspaceID: cmd.WorkspaceID,
-						UID:         cmd.UID,
-						Output:      "Command rejected: invalid signature",
-						Status:      "unauthorized",
-						Ts:          time.Now().UnixMilli(),
-						Version:     Version,
+						ID:              cmd.ID,
+						WorkspaceID:     cmd.WorkspaceID,
+						UID:             cmd.UID,
+						AgentID:         cfg.AgentID,
+						Output:          "Command rejected: invalid signature",
+						Status:          "unauthorized",
+						Ts:              time.Now().UnixMilli(),
+						Version:         Version,
+						RejectionReason: "UNAUTHORIZED",
 					}
 						// Include session metadata so the backend can update the session document
 						if cmd.Type != "" && cmd.SessionID != "" {
@@ -866,15 +875,18 @@ func runPubSubConnection(cfg *Config) error {
 					case ApprovalDeny:
 						fmt.Printf("%s[aiexpedite] Session command denied by user%s\n", colorYellow, colorReset)
 						res := resultMsg{
-							ID:          cmd.ID,
-							WorkspaceID: cmd.WorkspaceID,
-							UID:         cmd.UID,
-							Output:      "Command denied by user: not in allow list",
-							Status:      "denied",
-							Ts:          time.Now().UnixMilli(),
-							Version:     Version,
-							Type:        "session_error",
-							SessionID:   cmd.SessionID,
+							ID:              cmd.ID,
+							WorkspaceID:     cmd.WorkspaceID,
+							UID:             cmd.UID,
+							AgentID:         cfg.AgentID,
+							Output:          "Command denied by user: not in allow list",
+							Status:          "denied",
+							Ts:              time.Now().UnixMilli(),
+							Version:         Version,
+							Cwd:             getTrackedCwd(),
+							RejectionReason: "ALLOWLIST_DENIED",
+							Type:            "session_error",
+							SessionID:       cmd.SessionID,
 						}
 						if err := publishMsg(ctx, topic, res); err != nil {
 							m.Nack()
@@ -919,13 +931,16 @@ func runPubSubConnection(cfg *Config) error {
 
 					// Send denial result back to backend
 					res := resultMsg{
-						ID:          cmd.ID,
-						WorkspaceID: cmd.WorkspaceID,
-						UID:         cmd.UID,
-						Output:      "Command denied by user: not in allow list",
-						Status:      "denied",
-						Ts:          time.Now().UnixMilli(),
-						Version:     Version,
+						ID:              cmd.ID,
+						WorkspaceID:     cmd.WorkspaceID,
+						UID:             cmd.UID,
+						AgentID:         cfg.AgentID,
+						Output:          "Command denied by user: not in allow list",
+						Status:          "denied",
+						Ts:              time.Now().UnixMilli(),
+						Version:         Version,
+						Cwd:             getTrackedCwd(),
+						RejectionReason: "ALLOWLIST_DENIED",
 					}
 					if err := publishMsg(ctx, topic, res); err != nil {
 						m.Nack()
