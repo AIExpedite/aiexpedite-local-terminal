@@ -71,7 +71,7 @@ func installTtydWindows() error {
 	case InstallNo:
 		ShowInfoDialog(
 			"Installation Cancelled",
-			"You chose to exit. To use AI Expedite Terminal, please install ttyd manually:\n\n"+
+			"You chose to exit. To use AI Expedite, please install ttyd manually:\n\n"+
 				"Open PowerShell and run:\n"+
 				"  winget install tsl0922.ttyd\n\n"+
 				"Then restart this application.",

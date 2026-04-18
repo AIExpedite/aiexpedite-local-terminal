@@ -20,12 +20,15 @@ import (
 var shutdownConfig *Config
 
 func main() {
-	// Handle --uninstall command line argument (Windows)
-	if runtime.GOOS == "windows" && len(os.Args) > 1 {
+	// Handle --uninstall command line argument (Windows + macOS)
+	if (runtime.GOOS == "windows" || runtime.GOOS == "darwin") && len(os.Args) > 1 {
 		if os.Args[1] == "--uninstall" {
 			handleUninstall()
 			return
 		}
+	}
+	// Windows-only: elevated UAC copy helper used during auto-update.
+	if runtime.GOOS == "windows" && len(os.Args) > 1 {
 		if os.Args[1] == "--elevated-copy" {
 			handleElevatedCopy()
 			return
@@ -113,16 +116,28 @@ func main() {
 
 func onTrayReady(cfg *Config) func() {
 	return func() {
-		systray.SetIcon(iconData)
-		systray.SetTitle(EnvDisplayName)
+		// Use template icon on macOS so the icon auto-inverts for light/dark
+		// menu bars (black icon on light bar, white on dark bar). The second
+		// arg is the regular fallback used on platforms that don't support
+		// template icons (e.g. Windows). icon.png is a black-with-alpha
+		// silhouette, which is the correct shape for a macOS template icon.
+		systray.SetTemplateIcon(iconData, iconData)
+		// Icon only in the menu bar — no title text next to it.
 		systray.SetTooltip(EnvDisplayName + " – Remote Command Execution")
 
 		// Mark systray as ready so background goroutines can safely use it
 		SetSystrayReady()
 
-		// Show Console at the top - checked if we pre-allocated console for non-prod
+		// Show Console at the top - checked if we pre-allocated console for non-prod.
+		// On non-Windows platforms the item is added but immediately hidden —
+		// it's a Windows-only concept (Win32 AllocConsole) and on macOS/Linux
+		// toggling it does nothing. The item is still created so the shared
+		// event loop below can reference `mConsole` without platform guards.
 		consolePreAllocated := runtime.GOOS == "windows" && EnvName != "prod"
 		mConsole := systray.AddMenuItemCheckbox("Show Console", "Toggle console window visibility", consolePreAllocated)
+		if runtime.GOOS != "windows" {
+			mConsole.Hide()
+		}
 
 		// Debug Mode - only visible in non-prod environments
 		var mDebug *systray.MenuItem
@@ -789,15 +804,19 @@ func handleUninstall() {
 		fmt.Println("")
 	}
 
-	// Remove registry entries (auto-start and Installed Apps)
+	// Remove auto-start registration (Windows: registry + Installed Apps;
+	// macOS: ~/Library/LaunchAgents plist — unloaded then deleted).
 	if err := unregisterApp(); err != nil {
 		if !quiet {
-			fmt.Println("Warning: Failed to remove registry entries:", err)
+			fmt.Println("Warning: Failed to remove auto-start entry:", err)
 		}
-	} else {
-		if !quiet {
+	} else if !quiet {
+		switch runtime.GOOS {
+		case "windows":
 			fmt.Println("→ Removed from Windows Installed Apps")
 			fmt.Println("→ Removed from Windows auto-start")
+		case "darwin":
+			fmt.Println("→ Removed LaunchAgent (macOS auto-start)")
 		}
 	}
 
@@ -813,18 +832,23 @@ func handleUninstall() {
 		}
 	}
 
-	// Self-delete: Create a batch file that deletes the executable after this process exits
-	exePath, err := os.Executable()
-	if err == nil {
-		if err := createSelfDeleteBatch(exePath, quiet); err != nil {
-			if !quiet {
-				fmt.Println("Warning: Could not create self-delete script:", err)
-			}
-		} else {
-			if !quiet {
+	// Self-delete of the binary is Windows-specific — it creates a .bat that
+	// waits for the process to exit then removes the exe, and is tied to the
+	// Inno Setup installer flow. On macOS the app ships as an .app bundle;
+	// the user removes it by dragging to Trash, so we just print that hint.
+	if runtime.GOOS == "windows" {
+		exePath, err := os.Executable()
+		if err == nil {
+			if err := createSelfDeleteBatch(exePath, quiet); err != nil {
+				if !quiet {
+					fmt.Println("Warning: Could not create self-delete script:", err)
+				}
+			} else if !quiet {
 				fmt.Println("→ Scheduled executable for deletion")
 			}
 		}
+	} else if runtime.GOOS == "darwin" && !quiet {
+		fmt.Println("→ To finish removal, drag AI Expedite.app from /Applications to the Trash.")
 	}
 
 	if !quiet {
@@ -837,7 +861,7 @@ func handleUninstall() {
 		// Show dialog to user
 		ShowInfoDialog(
 			"Uninstall Complete",
-			"AI Expedite Terminal has been uninstalled.\n\n"+
+			"AI Expedite has been uninstalled.\n\n"+
 				"Your allowed-commands.txt file has been preserved.",
 		)
 	}
@@ -884,7 +908,7 @@ func createSelfDeleteBatch(exePath string, quiet bool) error {
 	// 3. Attempts to remove the installation directory (if empty)
 	// 4. Deletes itself
 	batchContent := fmt.Sprintf(`@echo off
-REM AI Expedite Terminal - Cleanup Script
+REM AI Expedite - Cleanup Script
 REM This script deletes the executable after the uninstaller exits
 
 REM Wait for the main process to exit (3 second delay)

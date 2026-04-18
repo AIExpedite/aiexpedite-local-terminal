@@ -1349,6 +1349,41 @@ func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string,
 	return combined.String(), err
 }
 
+// runLocalCommandUnix executes a command directly on macOS/Linux, with no
+// PowerShell/cmd.exe wrapping. Stdout and stderr are combined. The process PID
+// is registered with the orphan scanner for the lifetime of the command.
+//
+// Commands arrive already-shaped by the terminal-service normalizer:
+//   - direct executables (`git status`, `npm run build`) run as-is
+//   - shell built-ins and operator-wrapped commands arrive as `bash -c "..."`
+//
+// Working-directory tracking across calls (Windows persistent-PS behavior) is
+// intentionally not implemented here; each Unix invocation starts fresh from
+// `workDir`, which matches typical Unix shell semantics.
+func runLocalCommandUnix(cmd string, args []string, workDir string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	c := exec.CommandContext(ctx, cmd, args...)
+	if workDir != "" {
+		c.Dir = workDir
+	}
+
+	var combined bytes.Buffer
+	c.Stdout = &combined
+	c.Stderr = &combined
+
+	if startErr := c.Start(); startErr != nil {
+		return "", startErr
+	}
+	if c.Process != nil {
+		globalProcessRegistry.Register(c.Process.Pid, "pubsub:unix")
+		defer globalProcessRegistry.Deregister(c.Process.Pid)
+	}
+	err := c.Wait()
+	return combined.String(), err
+}
+
 /* runLocalCommand executes the command using persistent PowerShell for low latency.
    timeoutMs controls the maximum execution time. If 0, defaults to 120 seconds. */
 func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {
@@ -1383,6 +1418,16 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 		} else if cfg != nil {
 			workDir = cfg.WorkingDirectory
 		}
+	}
+
+	// Unix (macOS/Linux): exec the command directly. The terminal-service
+	// already wraps shell-bound commands (built-ins, &&/||, pipes) in
+	// `bash -c "..."` before dispatch, so here we just run cmd + args with
+	// no PowerShell/cmd.exe involvement. Without this branch, Unix agents
+	// fall through to the Windows fallback path and try to exec
+	// powershell.exe, which doesn't exist on macOS/Linux.
+	if runtime.GOOS != "windows" {
+		return runLocalCommandUnix(cmd, args, workDir, timeout)
 	}
 
 	// Check if this is an encoded PowerShell command (already Base64 encoded by terminal-service)

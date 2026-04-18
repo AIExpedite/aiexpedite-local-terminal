@@ -1,13 +1,13 @@
-; AI Expedite Terminal (Stg) - Inno Setup Installer Script
-; This script creates a Windows installer for AI Expedite Terminal (Staging environment)
+; AI Expedite (Stg) - Inno Setup Installer Script
+; This script creates a Windows installer for AI Expedite (Staging environment)
 
-#define MyAppName "AI Expedite Terminal (Stg)"
+#define MyAppName "AI Expedite (Stg)"
 #define MyAppVersion "0.2.5"
 #define MyAppVersionString "0.2.5"
 #define MyAppPublisher "AI Expedite"
 #define MyAppURL "https://stg.aiexpedite.com"
 #define MyAppExeName "aiexpedite-terminal-stg.exe"
-#define MyAppDescription "AI Expedite Terminal for remote terminal access (Staging environment)"
+#define MyAppDescription "AI Expedite for remote terminal access (Staging environment)"
 #define MyEnvSuffix "-Stg"
 
 [Setup]

@@ -10,13 +10,45 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/getlantern/systray"
 	"golang.org/x/mod/semver"
 )
+
+// semverRegex validates a version string is well-formed semver with a leading
+// "v" (e.g. v1.2.3). Pre-release / build metadata (v1.2.3-rc1+meta) is
+// accepted. Used to reject release-body spoofing and stale config values.
+var semverRegex = regexp.MustCompile(`^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$`)
+
+// isValidSemver reports whether s looks like a semver tag this app can compare.
+func isValidSemver(s string) bool {
+	return semverRegex.MatchString(s)
+}
+
+// assetSuffixForGOOS returns the exact filename suffix the release publishes
+// for the current platform. Using a strict suffix match (rather than a loose
+// substring match on just "darwin-arm64") prevents accidentally selecting a
+// non-binary asset like a checksum file that happens to contain the platform
+// token in its name.
+func assetSuffixForGOOS() string {
+	switch runtime.GOOS {
+	case "windows":
+		return fmt.Sprintf("-%s-%s.exe", runtime.GOOS, runtime.GOARCH)
+	case "darwin":
+		return fmt.Sprintf("-%s-%s.dmg", runtime.GOOS, runtime.GOARCH)
+	case "linux":
+		return fmt.Sprintf("-%s-%s.AppImage", runtime.GOOS, runtime.GOARCH)
+	default:
+		// Fall back to a loose suffix for any future platform so the picker
+		// still has something to match; strict extensions can be added later.
+		return fmt.Sprintf("-%s-%s", runtime.GOOS, runtime.GOARCH)
+	}
+}
 
 // updateHTTPClient is used for quick GitHub API metadata calls (60s timeout).
 var updateHTTPClient = &http.Client{Timeout: 60 * time.Second}
@@ -41,6 +73,57 @@ type UpdateInfo struct {
 	AssetName      string
 }
 
+// getWithRetry performs an HTTP GET with bounded retries for transient
+// failures. Retries on: network errors, HTTP 5xx, HTTP 429 (respecting the
+// Retry-After header up to a cap). Does NOT retry on: HTTP 4xx (other than
+// 429), 2xx, 3xx — those are terminal states the caller should inspect.
+//
+// Bounded to 3 attempts with exponential backoff (1s, 2s, 4s) plus any
+// server-directed Retry-After wait, capped so a single check never takes
+// much longer than the caller's HTTP client timeout.
+func getWithRetry(client *http.Client, url string) (*http.Response, error) {
+	const maxAttempts = 3
+	const retryAfterCap = 30 * time.Second
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff before each retry; floor of 1s, doubling.
+			backoff := time.Duration(1<<attempt-1) * time.Second
+			time.Sleep(backoff)
+		}
+
+		resp, err := client.Get(url) //nolint:noctx,gosec // URL is a constant repo endpoint
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Terminal success/redirect/4xx (except 429): return as-is.
+		if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+			return resp, nil
+		}
+
+		// Retryable: drain the body so the connection can be reused, close,
+		// and honor Retry-After on 429.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+					wait := time.Duration(secs) * time.Second
+					if wait > retryAfterCap {
+						wait = retryAfterCap
+					}
+					time.Sleep(wait)
+				}
+			}
+		}
+		lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+	}
+	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
+}
+
 // checkForNewVersion checks GitHub for a newer version without downloading.
 // Returns UpdateInfo with Available=true if an update exists.
 func checkForNewVersion() (*UpdateInfo, error) {
@@ -59,7 +142,7 @@ func checkForNewVersion() (*UpdateInfo, error) {
 		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
 	}
 
-	resp, err := updateHTTPClient.Get(url)
+	resp, err := getWithRetry(updateHTTPClient, url)
 	if err != nil {
 		return nil, err
 	}
@@ -117,16 +200,33 @@ func checkForNewVersion() (*UpdateInfo, error) {
 		}
 	}
 
+	// Reject versions that do not parse as semver. A malformed or spoofed
+	// release body could otherwise put an arbitrary string into `latest`
+	// (e.g. "v999.0.0-ATTACK") and bypass the semver comparison below.
+	if !isValidSemver(latest) {
+		fmt.Printf("[update] Ignoring release: latest=%q is not valid semver\n", latest)
+		return info, nil
+	}
+	if !isValidSemver(cur) {
+		// Defensive: current Version should always parse, but if the build
+		// was tagged weirdly we'd rather skip than compare garbage.
+		fmt.Printf("[update] Skipping check: current version %q is not valid semver\n", cur)
+		return info, nil
+	}
+
 	if semver.Compare(latest, cur) <= 0 {
 		// No update needed
 		return info, nil
 	}
 
-	// Pick the asset matching GOOS / GOARCH
-	targetSuffix := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
+	// Pick the asset whose filename exactly ends with the platform-specific
+	// suffix (e.g. "-darwin-arm64.dmg"). Using HasSuffix rather than Contains
+	// prevents matching side-car files like SHA256SUMS or an unrelated asset
+	// that happens to include the platform token in its name.
+	wantSuffix := strings.ToLower(assetSuffixForGOOS())
 	for _, a := range rel.Assets {
 		name := strings.ToLower(a.Name)
-		if strings.Contains(name, targetSuffix) {
+		if strings.HasSuffix(name, wantSuffix) {
 			info.Available = true
 			info.LatestVersion = latest
 			info.AssetURL = a.URL
@@ -143,6 +243,20 @@ func checkForNewVersion() (*UpdateInfo, error) {
 func downloadAndApplyUpdate(info *UpdateInfo) error {
 	if !info.Available || info.AssetURL == "" {
 		return errors.New("no update available to download")
+	}
+
+	// macOS: release assets are .dmg disk images, not raw Mach-O binaries,
+	// so performSelfReplace would copy a DMG over the running executable
+	// and brick the install. The proactive/manual check already asked the
+	// user (Update Now / Later / Skip) — if we reach here they chose
+	// "Update Now", so open the release page directly without a second
+	// confirmation dialog. Logged so the console trail still shows what
+	// happened for anyone debugging.
+	if runtime.GOOS == "darwin" {
+		releaseURL := fmt.Sprintf("https://github.com/%s/releases", githubRepo)
+		fmt.Printf("[update] macOS manual upgrade: opening %s\n", releaseURL)
+		openBrowser(releaseURL)
+		return nil
 	}
 
 	fmt.Printf("→ Downloading %s...\n", info.AssetName)

@@ -76,6 +76,15 @@ func LoadConfig(path string) (*Config, error) {
 	if err := json.Unmarshal(b, cfg); err != nil {
 		return nil, err
 	}
+	// SkippedVersion is compared against live semver from GitHub. If the
+	// on-disk value is not a well-formed semver (stale from a malformed
+	// release body, hand-edited, or corrupted) it would silently suppress
+	// all future update prompts because the `==` check would only match an
+	// equally malformed remote value. Clear it so the user is re-prompted
+	// the next time a real update is available.
+	if cfg.SkippedVersion != "" && !isValidSemver(cfg.SkippedVersion) {
+		cfg.SkippedVersion = ""
+	}
 	return cfg, nil
 }
 

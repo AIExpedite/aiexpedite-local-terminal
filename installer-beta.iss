@@ -1,13 +1,13 @@
-; AI Expedite Terminal (Beta) - Inno Setup Installer Script
-; This script creates a Windows installer for AI Expedite Terminal (Beta environment)
+; AI Expedite (Beta) - Inno Setup Installer Script
+; This script creates a Windows installer for AI Expedite (Beta environment)
 
-#define MyAppName "AI Expedite Terminal (Beta)"
+#define MyAppName "AI Expedite (Beta)"
 #define MyAppVersion "0.2.5"
 #define MyAppVersionString "0.2.5"
 #define MyAppPublisher "AI Expedite"
 #define MyAppURL "https://beta.aiexpedite.com"
 #define MyAppExeName "aiexpedite-terminal-beta.exe"
-#define MyAppDescription "AI Expedite Terminal for remote terminal access (Beta environment)"
+#define MyAppDescription "AI Expedite for remote terminal access (Beta environment)"
 #define MyEnvSuffix "-Beta"
 
 [Setup]

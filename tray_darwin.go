@@ -7,12 +7,66 @@ import (
 	_ "embed"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"text/template"
 )
 
 //go:embed assets/icon.png
 var iconData []byte
+
+// When launched by launchd or Finder, a GUI app inherits a minimal PATH
+// (typically /usr/bin:/bin:/usr/sbin:/sbin) that excludes the common tool
+// directories a developer uses from a login shell. That means
+// `exec.LookPath("ttyd")`, `claude`, `codex`, `gemini`, `brew`, etc. can
+// all fail to resolve even when they are installed. Prepend the
+// standard locations so PATH-based resolution matches a typical terminal.
+func init() {
+	extraDirs := []string{
+		"/opt/homebrew/bin", // Homebrew on Apple Silicon
+		"/opt/homebrew/sbin",
+		"/usr/local/bin", // Homebrew on Intel + many manual installs
+		"/usr/local/sbin",
+	}
+	if home := os.Getenv("HOME"); home != "" {
+		// Common per-user tool locations (Volta, nvm shims, asdf, pipx, etc.)
+		extraDirs = append(extraDirs,
+			filepath.Join(home, ".local", "bin"),
+			filepath.Join(home, "bin"),
+		)
+	}
+
+	current := os.Getenv("PATH")
+	have := make(map[string]bool)
+	for _, p := range filepath.SplitList(current) {
+		have[p] = true
+	}
+
+	var prepend []string
+	for _, d := range extraDirs {
+		if !have[d] {
+			prepend = append(prepend, d)
+		}
+	}
+	if len(prepend) == 0 {
+		return
+	}
+
+	newPath := prepend
+	if current != "" {
+		newPath = append(newPath, current)
+	}
+
+	sep := string(os.PathListSeparator)
+	joined := ""
+	for i, p := range newPath {
+		if i > 0 {
+			joined += sep
+		}
+		joined += p
+	}
+	_ = os.Setenv("PATH", joined)
+}
 
 // Channel to notify main.go when console visibility changes (no-op on macOS, but needed for compilation)
 var ConsoleHiddenChan = make(chan bool, 1)
@@ -104,7 +158,23 @@ func ensureAppRegistration() error {
 	return nil
 }
 
-// unregisterApp is a no-op on macOS (Windows registry only)
+// unregisterApp removes the macOS LaunchAgent plist installed by
+// ensureAutoStart, unloading it first so launchd stops the running process
+// cleanly. A missing plist is not an error — uninstall may run twice.
 func unregisterApp() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	label := "com.aiexpedite.terminal" + EnvConfigSuffix
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", label+".plist")
+
+	// Best-effort unload before deletion; ignore errors from already-unloaded
+	// or never-loaded agents.
+	_ = exec.Command("launchctl", "unload", plistPath).Run()
+
+	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove LaunchAgent plist: %w", err)
+	}
 	return nil
 }

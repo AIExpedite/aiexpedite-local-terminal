@@ -156,7 +156,7 @@ func ShowInstallPrompt(component, description string) InstallChoice {
 		description,
 	)
 
-	title := "AI Expedite Terminal - Setup Required"
+	title := "AI Expedite - Setup Required"
 
 	titlePtr, _ := syscall.UTF16PtrFromString(title)
 	msgPtr, _ := syscall.UTF16PtrFromString(message)
@@ -266,7 +266,7 @@ const (
 // Returns UpdateNow, UpdateLater, or SkipVersion
 func ShowUpdateDialog(currentVersion, newVersion string) UpdateChoice {
 	message := fmt.Sprintf(
-		"A new version of AI Expedite Terminal is available!\n\n"+
+		"A new version of AI Expedite is available!\n\n"+
 			"Current version: %s\n"+
 			"New version: %s\n\n"+
 			"Would you like to update now?\n\n"+
@@ -276,7 +276,7 @@ func ShowUpdateDialog(currentVersion, newVersion string) UpdateChoice {
 			"  CANCEL = Skip this version",
 		currentVersion, newVersion)
 
-	title := "AI Expedite Terminal - Update Available"
+	title := "AI Expedite - Update Available"
 
 	titlePtr, _ := syscall.UTF16PtrFromString(title)
 	msgPtr, _ := syscall.UTF16PtrFromString(message)

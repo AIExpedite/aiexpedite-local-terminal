@@ -22,21 +22,21 @@ jobs:
       matrix:
         include:
           - env: dev
-            display_name: "AI Expedite Terminal (Dev)"
+            display_name: "AI Expedite (Dev)"
             api_endpoint: "https://api.dev.aiexpedite.com/terminal"
             config_suffix: "-Dev"
             exe_suffix: "-dev"
             installer_iss: installer-dev.iss
             installer_name: AIExpediteTerminal-Dev-Setup.exe
           - env: stg
-            display_name: "AI Expedite Terminal (Stg)"
+            display_name: "AI Expedite (Stg)"
             api_endpoint: "https://api.stg.aiexpedite.com/terminal"
             config_suffix: "-Stg"
             exe_suffix: "-stg"
             installer_iss: installer-stg.iss
             installer_name: AIExpediteTerminal-Stg-Setup.exe
           - env: beta
-            display_name: "AI Expedite Terminal (Beta)"
+            display_name: "AI Expedite (Beta)"
             api_endpoint: "https://api.beta.aiexpedite.com/terminal"
             config_suffix: "-Beta"
             exe_suffix: "-beta"
@@ -125,17 +125,17 @@ jobs:
         goarch: [amd64, arm64]
         include:
           - env: dev
-            display_name: "AI Expedite Terminal (Dev)"
+            display_name: "AI Expedite (Dev)"
             api_endpoint: "https://api.dev.aiexpedite.com/terminal"
             config_suffix: "-Dev"
             exe_suffix: "-dev"
           - env: stg
-            display_name: "AI Expedite Terminal (Stg)"
+            display_name: "AI Expedite (Stg)"
             api_endpoint: "https://api.stg.aiexpedite.com/terminal"
             config_suffix: "-Stg"
             exe_suffix: "-stg"
           - env: beta
-            display_name: "AI Expedite Terminal (Beta)"
+            display_name: "AI Expedite (Beta)"
             api_endpoint: "https://api.beta.aiexpedite.com/terminal"
             config_suffix: "-Beta"
             exe_suffix: "-beta"
@@ -224,7 +224,7 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>CFBundleName</key>
-            <string>AI Expedite Terminal</string>
+            <string>AI Expedite</string>
             <key>CFBundleDisplayName</key>
             <string>DISPLAY_NAME_PLACEHOLDER</string>
             <key>CFBundleIdentifier</key>
@@ -299,7 +299,7 @@ jobs:
             -D app_path="$PWD/dmg-staging/AIExpediteTerminal.app" \
             -D background="$PWD/assets/dmg-background.png" \
             -D volume_icon="$PWD/AppIcon.icns" \
-            "AI Expedite Terminal (${{ matrix.env }})" \
+            "AI Expedite (${{ matrix.env }})" \
             "dist/${DMG_NAME}"
 
       - name: Sign DMG with Developer ID
@@ -365,17 +365,17 @@ jobs:
       matrix:
         include:
           - env: dev
-            display_name: "AI Expedite Terminal (Dev)"
+            display_name: "AI Expedite (Dev)"
             api_endpoint: "https://api.dev.aiexpedite.com/terminal"
             config_suffix: "-Dev"
             exe_suffix: "-dev"
           - env: stg
-            display_name: "AI Expedite Terminal (Stg)"
+            display_name: "AI Expedite (Stg)"
             api_endpoint: "https://api.stg.aiexpedite.com/terminal"
             config_suffix: "-Stg"
             exe_suffix: "-stg"
           - env: beta
-            display_name: "AI Expedite Terminal (Beta)"
+            display_name: "AI Expedite (Beta)"
             api_endpoint: "https://api.beta.aiexpedite.com/terminal"
             config_suffix: "-Beta"
             exe_suffix: "-beta"
@@ -421,7 +421,7 @@ jobs:
 
           cat > AppDir/AIExpediteTerminal.desktop << 'DESKTOP'
           [Desktop Entry]
-          Name=AI Expedite Terminal (${{ matrix.env }})
+          Name=AI Expedite (${{ matrix.env }})
           Exec=AIExpediteTerminal
           Icon=aiexpedite-terminal
           Type=Application

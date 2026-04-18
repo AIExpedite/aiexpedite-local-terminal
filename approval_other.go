@@ -104,11 +104,11 @@ func ShowYesNoDialog(title, message string) bool {
 // Returns UpdateNow, UpdateLater, or SkipVersion.
 func ShowUpdateDialog(currentVersion, newVersion string) UpdateChoice {
 	message := fmt.Sprintf(
-		"A new version of AI Expedite Terminal is available!\n\n"+
+		"A new version of AI Expedite is available!\n\n"+
 			"Current version: %s\nNew version: %s\n\n"+
 			"Would you like to update now?",
 		currentVersion, newVersion)
-	title := "AI Expedite Terminal - Update Available"
+	title := "AI Expedite - Update Available"
 
 	switch runtime.GOOS {
 	case "darwin":
@@ -130,7 +130,7 @@ func ShowInstallPrompt(component, description string) InstallChoice {
 		"%s is required but not installed.\n\n%s\n\n"+
 			"Would you like to install it automatically?",
 		component, description)
-	title := "AI Expedite Terminal - Setup Required"
+	title := "AI Expedite - Setup Required"
 
 	switch runtime.GOOS {
 	case "darwin":

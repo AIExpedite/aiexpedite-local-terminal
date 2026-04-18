@@ -61,7 +61,7 @@ Exec=%s
 Icon=aiexpedite-terminal
 Terminal=false
 StartupNotify=false
-Comment=AI Expedite Terminal - Remote command execution agent
+Comment=AI Expedite - Remote command execution agent
 Categories=Development;Utility;
 X-GNOME-Autostart-enabled=true
 `, EnvDisplayName, exePath)

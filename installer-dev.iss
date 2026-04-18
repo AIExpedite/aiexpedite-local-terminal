@@ -1,13 +1,13 @@
-; AI Expedite Terminal (Dev) - Inno Setup Installer Script
-; This script creates a Windows installer for AI Expedite Terminal (Dev environment)
+; AI Expedite (Dev) - Inno Setup Installer Script
+; This script creates a Windows installer for AI Expedite (Dev environment)
 
-#define MyAppName "AI Expedite Terminal (Dev)"
+#define MyAppName "AI Expedite (Dev)"
 #define MyAppVersion "0.2.5"
 #define MyAppVersionString "0.2.5"
 #define MyAppPublisher "AI Expedite"
 #define MyAppURL "https://dev.aiexpedite.com"
 #define MyAppExeName "aiexpedite-terminal-dev.exe"
-#define MyAppDescription "AI Expedite Terminal for remote terminal access (Dev environment)"
+#define MyAppDescription "AI Expedite for remote terminal access (Dev environment)"
 #define MyEnvSuffix "-Dev"
 
 [Setup]

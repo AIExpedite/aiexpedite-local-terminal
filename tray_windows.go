@@ -484,7 +484,7 @@ func ensureAppRegistration() error {
 	}
 
 	// Set required registry values for Add/Remove Programs
-	// Use environment-specific display name (e.g., "AI Expedite Terminal (Dev)" for dev)
+	// Use environment-specific display name (e.g., "AI Expedite (Dev)" for dev)
 	values := map[string]string{
 		"DisplayName":     EnvDisplayName,
 		"DisplayVersion":  Version[1:], // Strip the "v" prefix from version

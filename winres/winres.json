@@ -18,7 +18,7 @@
           "name": "com.aiexpedite.terminal",
           "version": "0.6.19.0"
         },
-        "description": "AI Expedite Terminal",
+        "description": "AI Expedite",
         "minimum-os": "win7",
         "execution-level": "as invoker",
         "dpi-awareness": "system",
@@ -36,8 +36,8 @@
         "info": {
           "0409": {
             "CompanyName": "AI Expedite",
-            "FileDescription": "AI Expedite Terminal",
-            "ProductName": "AI Expedite Terminal",
+            "FileDescription": "AI Expedite",
+            "ProductName": "AI Expedite",
             "LegalCopyright": "Copyright AI Expedite",
             "OriginalFilename": "aiexpedite-terminal.exe"
           }

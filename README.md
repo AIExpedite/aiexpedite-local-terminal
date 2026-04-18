@@ -1,4 +1,4 @@
-# AI Expedite Terminal
+# AI Expedite
 
 A professional Windows system tray application that provides remote terminal access via ttyd and Google Cloud Pub/Sub. Features automatic installation, a modern installer, and comprehensive debugging tools.
 
@@ -131,7 +131,7 @@ To disable file upload:
 1. Download `AIExpediteTerminal-Setup-0.2.0.exe` from the releases
 2. Run the installer
 3. Choose your installation options:
-   - Installation directory (default: `C:\Program Files\AI Expedite Terminal`)
+   - Installation directory (default: `C:\Program Files\AI Expedite`)
    - Create desktop shortcut (optional)
    - Run at Windows startup (checked by default)
 4. Click Install and follow the wizard
@@ -146,9 +146,9 @@ The application will:
 ### Uninstallation
 
 Uninstall via:
-- **Windows Settings** → Apps → AI Expedite Terminal
+- **Windows Settings** → Apps → AI Expedite
 - **Control Panel** → Programs and Features
-- **Start Menu** → AI Expedite Terminal → Uninstall
+- **Start Menu** → AI Expedite → Uninstall
 
 ## Usage
 
@@ -322,7 +322,7 @@ The warning "Warning: tmux not found on Windows - running without tmux" is **nor
 If the application doesn't start automatically:
 
 1. Check Windows Startup apps: **Settings → Apps → Startup**
-2. Look for "AI Expedite Terminal" in the list
+2. Look for "AI Expedite" in the list
 3. Ensure it's enabled
 4. Alternatively, check registry: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 

@@ -67,7 +67,7 @@ jobs:
           # Using -H=windowsgui to build as GUI app (no console window by default)
           # Console is allocated on-demand when user clicks "Show Console" in tray menu
           LDFLAGS="-H=windowsgui -X main.EnvName=prod"
-          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite Terminal'"
+          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite'"
           LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=https://api.aiexpedite.com/terminal"
           LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix="
           LDFLAGS="$LDFLAGS -X main.ReleaseChannel=prod"
@@ -132,7 +132,7 @@ jobs:
           mkdir -p dist
 
           LDFLAGS="-X main.EnvName=prod"
-          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite Terminal'"
+          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite'"
           LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=https://api.aiexpedite.com/terminal"
           LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix="
           LDFLAGS="$LDFLAGS -X main.ReleaseChannel=prod"
@@ -198,9 +198,9 @@ jobs:
           <plist version="1.0">
           <dict>
             <key>CFBundleName</key>
-            <string>AI Expedite Terminal</string>
+            <string>AI Expedite</string>
             <key>CFBundleDisplayName</key>
-            <string>AI Expedite Terminal</string>
+            <string>AI Expedite</string>
             <key>CFBundleIdentifier</key>
             <string>com.aiexpedite.terminal</string>
             <key>CFBundleVersion</key>
@@ -271,7 +271,7 @@ jobs:
             -D app_path="$PWD/dmg-staging/AIExpediteTerminal.app" \
             -D background="$PWD/assets/dmg-background.png" \
             -D volume_icon="$PWD/AppIcon.icns" \
-            "AI Expedite Terminal" \
+            "AI Expedite" \
             "dist/${DMG_NAME}"
 
       - name: Sign DMG with Developer ID
@@ -357,7 +357,7 @@ jobs:
           mkdir -p dist
 
           LDFLAGS="-X main.EnvName=prod"
-          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite Terminal'"
+          LDFLAGS="$LDFLAGS -X 'main.EnvDisplayName=AI Expedite'"
           LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=https://api.aiexpedite.com/terminal"
           LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix="
           LDFLAGS="$LDFLAGS -X main.ReleaseChannel=prod"
@@ -379,7 +379,7 @@ jobs:
           # Create desktop file
           cat > AppDir/AIExpediteTerminal.desktop << 'DESKTOP'
           [Desktop Entry]
-          Name=AI Expedite Terminal
+          Name=AI Expedite
           Exec=AIExpediteTerminal
           Icon=aiexpedite-terminal
           Type=Application
@@ -451,7 +451,7 @@ jobs:
           name: "${{ inputs.version }}"
           files: dist/**
           body: |
-            ## AI Expedite Terminal ${{ inputs.version }}
+            ## AI Expedite ${{ inputs.version }}
 
             ### Downloads
 
@@ -512,7 +512,7 @@ jobs:
           name: "Latest Release (${{ inputs.version }})"
           files: dist/**
           body: |
-            ## AI Expedite Terminal - Latest Release
+            ## AI Expedite - Latest Release
 
             **Current version: ${{ inputs.version }}**
 

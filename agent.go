@@ -17,7 +17,7 @@ import (
 )
 
 // Version is the current terminal app version (exported for use in registration and results)
-const Version = "v0.8.0"
+const Version = "v0.8.2"
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -234,7 +234,7 @@ func showConnectionInstructions(cfg *Config, port int) {
 		fmt.Println("║  Remote Access:   Not configured                          ║")
 		fmt.Println("║                                                            ║")
 		fmt.Println("║  To enable remote access from AI Expedite:                ║")
-		fmt.Println("║  1. Edit config: %APPDATA%\\AIExpedite\\config.json         ║")
+		fmt.Printf("║  1. Edit config: %-42s║\n", truncateString(ConfigPath(), 42))
 		fmt.Println("║  2. Set \"project_id\" to your GCP project                  ║")
 		fmt.Println("║  3. Set GOOGLE_APPLICATION_CREDENTIALS env var            ║")
 		fmt.Println("║  4. Restart this application                              ║")
