@@ -33,7 +33,12 @@ jobs:
   build-prod:
     name: Build prod/windows/amd64
     needs: validate-version
-    runs-on: windows-latest
+    # Self-hosted Windows runner with the YubiKey plugged in.
+    # Required because the EV Code Signing cert lives on a physical YubiKey -
+    # signtool needs the smart card to be present, and Windows pops a PIN
+    # dialog that only an interactive runner session can satisfy.
+    # Setup: aiexpedite-local-terminal/WINDOWS_CODE_SIGNING.md
+    runs-on: [self-hosted, Windows, X64, yubikey]
 
     steps:
       - uses: actions/checkout@v6.0.2
@@ -87,6 +92,19 @@ jobs:
         shell: bash
         run: cp dist/aiexpedite-terminal-windows-amd64.exe aiexpedite-terminal.exe
 
+      # Sign the .exe BEFORE building the installer so the signed binary is
+      # what gets embedded. Then we sign the installer too (below).
+      # PIN policy 'once' means this single signtool call prompts for the
+      # YubiKey PIN exactly one time and signs both files.
+      - name: Sign Windows binary with YubiKey EV cert
+        shell: pwsh
+        env:
+          WINDOWS_CERT_THUMBPRINT: ${{ vars.WINDOWS_CERT_THUMBPRINT }}
+        run: |
+          ./scripts/sign/Sign-Binary.ps1 -Path `
+            "dist/aiexpedite-terminal-windows-amd64.exe", `
+            "aiexpedite-terminal.exe"
+
       - name: Build installer
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer-prod.iss
@@ -94,6 +112,13 @@ jobs:
       - name: Copy installer to dist with predictable name
         shell: bash
         run: cp installer-output/AIExpediteTerminal-Setup-*.exe dist/AIExpediteTerminal-Setup.exe
+
+      - name: Sign Windows installer with YubiKey EV cert
+        shell: pwsh
+        env:
+          WINDOWS_CERT_THUMBPRINT: ${{ vars.WINDOWS_CERT_THUMBPRINT }}
+        run: |
+          ./scripts/sign/Sign-Binary.ps1 -Path "dist/AIExpediteTerminal-Setup.exe"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7.0.0

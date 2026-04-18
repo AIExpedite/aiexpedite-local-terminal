@@ -60,6 +60,11 @@ nul
 *.cov
 coverage/
 
+# Code-signing artifacts — attestation certs, public keys, issued certs.
+# These are regenerable (attestation chain) or specific to a given YubiKey
+# (issued cert). Never commit.
+scripts/sign/out/
+
 # ───── Documentation to Keep ───────────────────────────────────────────────
 # Core files that WILL be checked in:
 # - *.go (all Go source code)
