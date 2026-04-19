@@ -10,8 +10,16 @@ on:
         required: true
         type: string
 
+# One prod release per version at a time. cancel-in-progress: false because
+# halfway through a prod build is a bad place to be cut off — finish what
+# you started, then queue the next one.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+# Default: no write access. Only the publish jobs request `contents: write`.
 permissions:
-  contents: write
+  contents: read
 
 ###############################################################################
 # Build and release production binaries - Windows only
@@ -30,6 +38,20 @@ jobs:
           fi
           echo "Version ${{ inputs.version }} is valid"
 
+      - name: Fail fast if tag already exists on origin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # gh api returns 200 if the tag exists, 404 if not. We want 404.
+          # Catching this here costs seconds; catching it after build costs ~1hr.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/refs/tags/${{ inputs.version }}" --silent 2>/dev/null; then
+            echo "Error: Tag ${{ inputs.version }} already exists on origin."
+            echo "Re-using a version tag would overwrite the published release artifacts."
+            echo "Bump the version in agent.go and try again."
+            exit 1
+          fi
+          echo "Tag ${{ inputs.version }} is available."
+
   build-prod:
     name: Build prod/windows/amd64
     needs: validate-version
@@ -38,13 +60,18 @@ jobs:
     # signtool needs the smart card to be present, and Windows pops a PIN
     # dialog that only an interactive runner session can satisfy.
     # Setup: aiexpedite-local-terminal/WINDOWS_CODE_SIGNING.md
+    #
+    # SECURITY: this runner is registered at the *repository* level (not the
+    # org level), so labels-only is sufficient — only workflows in THIS repo
+    # can ever dispatch to it. If sharing across org repos becomes necessary,
+    # promote to org-level + runner group with selected-repo restriction.
     runs-on: [self-hosted, Windows, X64, yubikey]
 
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           # Pinned to 1.25 because go.mod requires 1.25+ — forced by
           # go.opentelemetry.io/otel/sdk v1.43.0, which carries the fix for
@@ -53,7 +80,7 @@ jobs:
           go-version: "1.25"
 
       - name: Download Go modules
-        run: go mod tidy
+        run: go mod download
 
       - name: Install go-winres
         shell: bash
@@ -80,6 +107,15 @@ jobs:
 
           go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-windows-amd64.exe" .
 
+      - name: Smoke test built binary (pre-signing)
+        shell: bash
+        run: |
+          OUTPUT=$(./dist/aiexpedite-terminal-windows-amd64.exe --version)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "channel=prod" || { echo "channel mismatch"; exit 1; }
+          echo "$OUTPUT" | grep -q "env=prod" || { echo "env mismatch"; exit 1; }
+          echo "$OUTPUT" | grep -q "windows/amd64" || { echo "arch mismatch"; exit 1; }
+
       - name: Set installer version
         shell: bash
         run: |
@@ -105,6 +141,21 @@ jobs:
             "dist/aiexpedite-terminal-windows-amd64.exe", `
             "aiexpedite-terminal.exe"
 
+      - name: Verify Inno Setup is installed
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw @"
+          Inno Setup compiler not found at: $iscc
+          The self-hosted runner is missing a required tool. Install via:
+            winget install JRSoftware.InnoSetup
+          (or download from https://jrsoftware.org/isinfo.php)
+          See WINDOWS_CODE_SIGNING.md for the full runner setup checklist.
+          "@
+          }
+          Write-Host "Found Inno Setup: $iscc"
+
       - name: Build installer
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer-prod.iss
@@ -121,12 +172,13 @@ jobs:
           ./scripts/sign/Sign-Binary.ps1 -Path "dist/AIExpediteTerminal-Setup.exe"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: prod-windows-amd64
           path: |
             dist/aiexpedite-terminal-windows-amd64.exe
             dist/AIExpediteTerminal-Setup.exe
+          if-no-files-found: error
 
   build-prod-darwin:
     name: Build prod/darwin/${{ matrix.goarch }}
@@ -138,10 +190,10 @@ jobs:
         goarch: [amd64, arm64]
 
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           # Pinned to 1.25 because go.mod requires 1.25+ — forced by
           # go.opentelemetry.io/otel/sdk v1.43.0, which carries the fix for
@@ -150,7 +202,7 @@ jobs:
           go-version: "1.25"
 
       - name: Download Go modules
-        run: go mod tidy
+        run: go mod download
 
       - name: Build binary
         run: |
@@ -164,6 +216,15 @@ jobs:
           LDFLAGS="$LDFLAGS -X main.Version=${{ inputs.version }}"
 
           CGO_ENABLED=1 GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-darwin-${{ matrix.goarch }}" .
+
+      - name: Smoke test built binary (arm64 native only)
+        if: matrix.goarch == 'arm64'
+        run: |
+          OUTPUT=$(./dist/aiexpedite-terminal-darwin-${{ matrix.goarch }} --version)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "channel=prod" || { echo "channel mismatch"; exit 1; }
+          echo "$OUTPUT" | grep -q "env=prod" || { echo "env mismatch"; exit 1; }
+          echo "$OUTPUT" | grep -q "darwin/arm64" || { echo "arch mismatch"; exit 1; }
 
       - name: Import Apple Developer ID certificate
         env:
@@ -270,10 +331,16 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --display --verbose=4 "$APP"
 
+      - name: Cache pip wheels (dmgbuild)
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-dmgbuild-1.6.7-${{ runner.os }}-${{ runner.arch }}
+
       - name: Package as DMG
         id: package_dmg
         run: |
-          pip3 install --break-system-packages dmgbuild
+          pip3 install --break-system-packages 'dmgbuild==1.6.7'
           DMG_NAME="aiexpedite-terminal-darwin-${{ matrix.goarch }}.dmg"
           echo "dmg_path=dist/${DMG_NAME}" >> $GITHUB_OUTPUT
 
@@ -307,52 +374,188 @@ jobs:
             --sign "$SIGNING_IDENTITY" \
             "${{ steps.package_dmg.outputs.dmg_path }}"
 
-      - name: Notarize DMG with Apple
-        id: notarize
+      - name: Submit DMG for notarization (no wait)
+        id: notarize_submit
         env:
           APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
           TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
           APP_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PWD }}
         run: |
-          # Submit and capture the submission ID so we can fetch logs on failure.
-          SUBMIT_OUTPUT=$(xcrun notarytool submit "${{ steps.package_dmg.outputs.dmg_path }}" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$TEAM_ID" \
-            --password "$APP_PASSWORD" \
-            --wait \
-            --timeout 60m \
-            --output-format json)
+          # Submit with --no-wait so this runner can release immediately.
+          # The finalize-prod-darwin job waits for Apple, staples, uploads.
+          # Retry on transient submit failures — the build cost up to this
+          # point is ~10 min and we don't want to lose it over a network blip.
+          notarize_submit_with_retry() {
+            local dmg="$1"
+            local attempt=1
+            local max_attempts=3
+            while [ $attempt -le $max_attempts ]; do
+              if xcrun notarytool submit "${dmg}" \
+                  --apple-id "$APPLE_ID" \
+                  --team-id "$TEAM_ID" \
+                  --password "$APP_PASSWORD" \
+                  --no-wait \
+                  --output-format json; then
+                return 0
+              fi
+              echo "notarytool submit attempt ${attempt} failed" >&2
+              if [ $attempt -lt $max_attempts ]; then
+                sleep 60
+              fi
+              attempt=$((attempt + 1))
+            done
+            return 1
+          }
+
+          if ! SUBMIT_OUTPUT=$(notarize_submit_with_retry "${{ steps.package_dmg.outputs.dmg_path }}"); then
+            echo "notarytool submit failed after retries — aborting build"
+            exit 1
+          fi
           echo "$SUBMIT_OUTPUT"
           SUBMISSION_ID=$(echo "$SUBMIT_OUTPUT" | python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
-          echo "submission_id=$SUBMISSION_ID" >> $GITHUB_OUTPUT
-
-      - name: Fetch notarization log on failure
-        if: failure() && steps.notarize.outputs.submission_id != ''
-        env:
-          APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
-          TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
-          APP_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PWD }}
-        run: |
-          xcrun notarytool log "${{ steps.notarize.outputs.submission_id }}" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$TEAM_ID" \
-            --password "$APP_PASSWORD" || true
-
-      - name: Staple notarization ticket to DMG
-        run: |
-          xcrun stapler staple "${{ steps.package_dmg.outputs.dmg_path }}"
-          xcrun stapler validate "${{ steps.package_dmg.outputs.dmg_path }}"
+          mkdir -p notarize-pending
+          cp "${{ steps.package_dmg.outputs.dmg_path }}" notarize-pending/
+          echo "$SUBMISSION_ID" > notarize-pending/submission-id.txt
 
       - name: Clean up keychain
         if: always()
         run: |
           security delete-keychain $RUNNER_TEMP/build.keychain || true
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7.0.0
+      # Artifact name intentionally NOT prefixed with "prod-" so the release
+      # job's `pattern: prod-*` glob doesn't pick up the unstapled DMG.
+      - name: Upload pending DMG for notarization wait
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: prod-darwin-${{ matrix.goarch }}
-          path: dist/aiexpedite-terminal-darwin-${{ matrix.goarch }}.dmg
+          name: pending-prod-darwin-${{ matrix.goarch }}
+          path: notarize-pending/
+          if-no-files-found: error
+          retention-days: 1
+
+  ###############################################################################
+  # Wait for Apple notarization, staple the ticket, and upload the final DMGs.
+  # Single job (not matrix) so both arches share one macOS runner during the
+  # Apple queue wait — Apple processes both submissions in parallel.
+  ###############################################################################
+  finalize-prod-darwin:
+    name: Finalize prod darwin (notarize wait + staple)
+    needs: build-prod-darwin
+    runs-on: macos-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Download pending DMGs and submission IDs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: pending-prod-darwin-*
+          path: pending/
+
+      - name: Wait for notarization and staple (both arches in parallel)
+        env:
+          APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+          APP_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PWD }}
+        run: |
+          mkdir -p dist
+
+          # Kill any lingering background notarytool/stapler processes if the
+          # job is cancelled or the script aborts.
+          trap 'kill 0 2>/dev/null || true' EXIT
+
+          # notarytool wait retries internal HTTP errors, but a hard crash
+          # (transient 5xx, network blip) returns non-zero. Cheap retry —
+          # successful re-check returns near-instantly.
+          # Heartbeat: while wait blocks for 30-90 min on Apple, log every 5 min
+          # so the job appears alive and operators can tell "still waiting" from "hung".
+          notarize_wait_with_heartbeat() {
+            local sub_id="$1"
+            local arch="$2"
+            local attempt=1
+            local max_attempts=2
+            while [ $attempt -le $max_attempts ]; do
+              xcrun notarytool wait "${sub_id}" \
+                --apple-id "$APPLE_ID" \
+                --team-id "$TEAM_ID" \
+                --password "$APP_PASSWORD" \
+                --timeout 120m &
+              local wait_pid=$!
+              local elapsed=0
+              while kill -0 "$wait_pid" 2>/dev/null; do
+                sleep 30
+                elapsed=$((elapsed + 30))
+                if [ $((elapsed % 300)) -eq 0 ]; then
+                  echo "[${arch}] heartbeat: still waiting on Apple (~$((elapsed / 60))m elapsed)"
+                fi
+              done
+              wait "$wait_pid"
+              local exit_code=$?
+              if [ "$exit_code" -eq 0 ]; then
+                return 0
+              fi
+              if [ $attempt -lt $max_attempts ]; then
+                echo "[${arch}] notarytool wait attempt ${attempt} failed (exit ${exit_code}), retrying in 30s..."
+                sleep 30
+              fi
+              attempt=$((attempt + 1))
+            done
+            return 1
+          }
+
+          process_arch() {
+            local arch="$1"
+            local subdir="pending/pending-prod-darwin-${arch}"
+            local sub_id
+            local dmg
+
+            sub_id=$(cat "${subdir}/submission-id.txt")
+            dmg=$(ls "${subdir}"/*.dmg | head -1)
+
+            echo "[${arch}] Waiting for notarization (submission ${sub_id})..."
+            if ! notarize_wait_with_heartbeat "${sub_id}" "${arch}"; then
+              echo "[${arch}] notarytool wait failed — fetching log"
+              xcrun notarytool log "${sub_id}" \
+                --apple-id "$APPLE_ID" \
+                --team-id "$TEAM_ID" \
+                --password "$APP_PASSWORD" || true
+              return 1
+            fi
+
+            echo "[${arch}] Stapling ${dmg}..."
+            xcrun stapler staple "${dmg}"
+            xcrun stapler validate "${dmg}"
+            cp "${dmg}" "dist/$(basename "${dmg}")"
+          }
+
+          # Stream both arches' output live (interleaved) — `[arch]` prefix on
+          # every line keeps it readable. Heartbeats only matter if visible.
+          process_arch amd64 &
+          PID_AMD64=$!
+          process_arch arm64 &
+          PID_ARM64=$!
+
+          set +e
+          wait "$PID_AMD64"; STATUS_AMD64=$?
+          wait "$PID_ARM64"; STATUS_ARM64=$?
+          set -e
+
+          if [ "$STATUS_AMD64" -ne 0 ] || [ "$STATUS_ARM64" -ne 0 ]; then
+            echo "Notarization/stapling failed (amd64=$STATUS_AMD64 arm64=$STATUS_ARM64)"
+            exit 1
+          fi
+
+      - name: Upload final prod darwin amd64 DMG
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: prod-darwin-amd64
+          path: dist/aiexpedite-terminal-darwin-amd64.dmg
+          if-no-files-found: error
+
+      - name: Upload final prod darwin arm64 DMG
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: prod-darwin-arm64
+          path: dist/aiexpedite-terminal-darwin-arm64.dmg
+          if-no-files-found: error
 
   build-prod-linux:
     name: Build prod/linux/amd64
@@ -360,10 +563,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           # Pinned to 1.25 because go.mod requires 1.25+ — forced by
           # go.opentelemetry.io/otel/sdk v1.43.0, which carries the fix for
@@ -372,10 +575,13 @@ jobs:
           go-version: "1.25"
 
       - name: Download Go modules
-        run: go mod tidy
+        run: go mod download
 
-      - name: Install systray and AppImage dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc pkg-config libayatana-appindicator3-dev libfuse2
+      - name: Install systray and AppImage dependencies (cached)
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: gcc pkg-config libayatana-appindicator3-dev libfuse2
+          version: 1.0
 
       - name: Build binary
         run: |
@@ -390,10 +596,22 @@ jobs:
 
           GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-linux-amd64" .
 
+      - name: Smoke test built binary
+        run: |
+          OUTPUT=$(./dist/aiexpedite-terminal-linux-amd64 --version)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "channel=prod" || { echo "channel mismatch"; exit 1; }
+          echo "$OUTPUT" | grep -q "env=prod" || { echo "env mismatch"; exit 1; }
+          echo "$OUTPUT" | grep -q "linux/amd64" || { echo "arch mismatch"; exit 1; }
+
       - name: Package as AppImage
         run: |
-          # Download appimagetool
-          wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" -O appimagetool
+          # Pinned to appimagetool 1.9.1 (from new official AppImage/appimagetool repo)
+          # with SHA-256 verification — defends against rolling-`continuous` tag tampering.
+          APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          APPIMAGETOOL_SHA="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          wget -q "$APPIMAGETOOL_URL" -O appimagetool
+          echo "${APPIMAGETOOL_SHA}  appimagetool" | sha256sum -c -
           chmod +x appimagetool
 
           # Create AppDir structure
@@ -433,23 +651,28 @@ jobs:
           ARCH=x86_64 ./appimagetool --no-appstream AppDir "dist/aiexpedite-terminal-linux-amd64.AppImage"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: prod-linux-amd64
           path: dist/aiexpedite-terminal-linux-amd64.AppImage
+          if-no-files-found: error
 
   ###############################################################################
   # Create production release (public, shown to users)
   ###############################################################################
   release-prod:
     name: Publish production release
-    needs: [build-prod, build-prod-darwin, build-prod-linux]
+    needs: [build-prod, build-prod-darwin, finalize-prod-darwin, build-prod-linux]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write       # required for sigstore signing in attest
+      attestations: write   # required to upload the attestation
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download prod binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: prod-*
           path: dist
@@ -459,6 +682,18 @@ jobs:
         run: |
           cd dist
           sha256sum * > SHA256SUMS
+
+      # SLSA build provenance — anyone can verify these are the binaries
+      # produced by this exact workflow run via `gh attestation verify`.
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            dist/aiexpedite-terminal-windows-amd64.exe
+            dist/AIExpediteTerminal-Setup.exe
+            dist/aiexpedite-terminal-darwin-amd64.dmg
+            dist/aiexpedite-terminal-darwin-arm64.dmg
+            dist/aiexpedite-terminal-linux-amd64.AppImage
 
       - name: Create and push tag
         run: |
@@ -470,7 +705,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish production release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ inputs.version }}
           name: "${{ inputs.version }}"
@@ -501,11 +736,13 @@ jobs:
     name: Update latest release
     needs: release-prod
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download prod binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: prod-*
           path: dist
@@ -531,7 +768,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create latest release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: latest
           name: "Latest Release (${{ inputs.version }})"

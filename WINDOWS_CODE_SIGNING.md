@@ -13,38 +13,118 @@ unknown" warning to anyone installing the app.
 
 ## Architecture
 
+Both `release-prod` (manual) and `release-nonprod` (every push to main) now
+target the same self-hosted Windows runner. **prod** signs everything;
+**nonprod** signs **beta only** (see "Why beta is signed but dev/stg aren't"
+below).
+
 ```
 ┌────────────────────────────────────┐
-│  GitHub-hosted runners (windows-   │   non-prod / dev / stg / beta
-│  latest, macos-latest, ubuntu...)  │   builds run here UNSIGNED
+│  GitHub-hosted runners             │   macOS, Linux builds run on
+│  (macos-latest, ubuntu-latest)     │   GitHub-hosted (no Windows key needed)
 └────────────────────────────────────┘
               │
-              │  release-prod workflow_dispatch
+              │  every push to main (nonprod) /
+              │  workflow_dispatch (prod)
               ▼
 ┌────────────────────────────────────┐
-│  Self-hosted Windows runner        │   labels: self-hosted, Windows,
-│  (your Windows box, YubiKey in     │           X64, yubikey
-│   USB, you at the keyboard)        │
+│  Self-hosted Windows runner        │   runner-group: yubikey-signing
+│  (your Windows box, YubiKey in     │   labels: self-hosted, Windows,
+│   USB, runner running interactively│           X64, yubikey
+│   so signtool can prompt for PIN)  │
 │                                    │
 │  1. go build -> unsigned .exe      │
-│  2. signtool sign .exe ──┐         │
-│                          ├── YubiKey PIN dialog (you type once)
-│  3. ISCC.exe -> installer│         │
-│  4. signtool sign installer ──┘    │
+│  2. (BETA + PROD)                  │
+│     signtool sign .exe ─────────┐  │
+│                                 ├──── YubiKey PIN prompt
+│  3. ISCC.exe -> installer       │  │
+│  4. (BETA + PROD)               │  │
+│     signtool sign installer ────┘  │
 │                                    │
-│  Uploads SIGNED artifacts          │
+│  dev/stg builds skip 2 + 4         │
+│  Uploads (signed if beta/prod)     │
 └────────────────────────────────────┘
               │
               ▼
 ┌────────────────────────────────────┐
-│  release-prod / update-latest      │   publishes signed binaries to
-│  (back on ubuntu-latest)           │   GitHub Releases - no key needed
+│  release-* / update-latest         │   publishes binaries to
+│  (back on ubuntu-latest)           │   GitHub Releases + SLSA attestation
 └────────────────────────────────────┘
 ```
 
-Non-prod (`release-nonprod.yml`) intentionally stays on `windows-latest` and
-ships unsigned binaries — internal testers can click through SmartScreen, and
-this lets every push to `main` keep building without your machine being on.
+### Why labels alone are sufficient (no runner group needed)
+
+The runner is registered at the **repository** level (via the repo's
+**Settings → Actions → Runners → New self-hosted runner** flow), not at the
+org level. Repo-scoped runners can ONLY be dispatched to from workflows in
+that single repo — no other org repo can match the labels and dispatch a job
+here, regardless of label collisions.
+
+If we ever need to share this runner across multiple org repos, promote it
+to an org-level runner inside a runner group restricted to selected repos
+(`runs-on: { group: yubikey-signing, labels: [...] }`). Until then, the
+plain label list is the simpler and equally-restrictive choice.
+
+### Why beta is signed but dev/stg aren't
+
+Same logic as macOS notarization: **beta** is publicly distributed (external
+testers download it), so it must not trip SmartScreen. **dev** and **stg** are
+internal — testers can click through the warning, and skipping the sign step
+on every push to main keeps the PIN-prompt cadence manageable.
+
+## PIN handling on the self-hosted runner
+
+This is the failure mode you'll hit first if you don't plan for it.
+
+The PIV PIN policy on slot `9a` is `once` (set by `Setup-YubiKey.ps1`), which
+means the YubiKey caches the PIN **for the lifetime of one signtool process**.
+Each separate `signtool` invocation prompts again.
+
+For each signing workflow run, the number of PIN prompts is:
+
+| Workflow                    | Sign steps          | PIN prompts |
+|-----------------------------|---------------------|-------------|
+| `release-prod`              | 2 (exe + installer) | 2           |
+| `release-nonprod` (beta)    | 2 (exe + installer) | 2           |
+| `release-nonprod` (dev/stg) | 0                   | 0           |
+
+`release-nonprod` runs on **every push to main**. With beta signing, that's
+2 PIN dialogs per push.
+
+### Current setup: option 1 (interactive prompts, accepted)
+
+The current operational choice is **interactive PIN prompts**. The YubiKey
+machine is staffed during release windows; missed prompts are tolerated as
+a minor annoyance because the failure mode is safe (see below). Cost is low
+(no extra config, no money) and the tradeoffs of the alternatives weren't
+worth it at current release cadence.
+
+**If this changes** (e.g. release cadence climbs, or unattended automation
+becomes important), the alternatives in priority order are:
+
+1. **PIN cache via YubiKey minidriver.** Configure
+   `HKLM\SOFTWARE\Yubico\YubiKey\PIVPINCacheTimeoutMinutes` (DWORD) to extend
+   the cached-PIN window. Cache the PIN once at runner-session start and
+   signtool stops prompting until the timeout. Trades some security for
+   unattended operation. Reasonable middle ground.
+
+2. **Cloud HSM** (DigiCert KeyLocker, SignPath.io, Azure Key Vault Premium
+   with code-signing cert). Expensive ($50–300/mo) but eliminates the
+   physical-token SPOF, the PIN prompts, and the "must run interactively"
+   constraint. Multi-runner concurrent signing becomes possible. Recommended
+   if signing becomes daily-ops pain or if the YubiKey machine ever needs
+   to live somewhere other than a single physical desk.
+
+3. **Switch the slot to PIN policy `never`.** Don't do this. Means anyone
+   with physical access to the machine can sign anything.
+
+### What happens if no one's there to enter the PIN?
+
+The signtool step waits up to 60 seconds for the dialog response, then
+fails. The job fails with a clear `signtool sign failed with exit code 1`.
+The whole release run fails — no artifacts are published, nothing
+half-signed ships. `release-nonprod`'s concurrency group cancels in-progress,
+so a subsequent push will re-trigger and try again. Safe but annoying.
 
 ## One-time setup
 

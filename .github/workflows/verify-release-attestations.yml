@@ -1,0 +1,126 @@
+name: verify-release-attestations
+
+# Re-verifies the attestation chain on published releases. Manual-only —
+# kick off via the Actions tab or `gh workflow run` when you want to confirm
+# attestations are still valid (e.g. after a sigstore trust-root change, or
+# spot-check before a high-trust install).
+#
+# `gh attestation verify` is the trust check end-users run before installing
+# a binary; this workflow runs the same check from CI so a failure surfaces
+# tampering, revoked attestations, or sigstore-side breakage.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to verify (default: latest)"
+        required: false
+        default: "latest"
+
+permissions:
+  contents: read
+  attestations: read
+
+jobs:
+  verify:
+    name: Verify ${{ matrix.release.label }} attestations
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        release:
+          # Public production release — what end users download.
+          - { tag: "latest", label: "latest-prod" }
+          # Internal pre-release — covers dev/stg/beta artifacts in one tag.
+          - { tag: "latest-internal", label: "latest-internal" }
+          # Dev auto-update target — what dev installs poll for updates.
+          - { tag: "latest-dev", label: "latest-dev" }
+
+    steps:
+      - name: Resolve release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Manual dispatch overrides the matrix; otherwise use the matrix tag.
+          if [ -n "${{ github.event.inputs.release_tag }}" ] && \
+             [ "${{ github.event.inputs.release_tag }}" != "latest" ]; then
+            TAG="${{ github.event.inputs.release_tag }}"
+          else
+            TAG="${{ matrix.release.tag }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Verifying release tag: ${TAG}"
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          # `gh release download` skips the SHA256SUMS / provenance files we
+          # don't want to verify against themselves; explicit pattern is safer.
+          gh release download "${{ steps.tag.outputs.tag }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir assets \
+            --pattern '*.exe' \
+            --pattern '*.dmg' \
+            --pattern '*.AppImage' \
+            --skip-existing
+          ls -la assets/
+
+      - name: Verify each artifact's build provenance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # gh attestation verify requires --repo so it knows which trust
+          # root to use. An attestation signed by a different repo would fail.
+          REPO="${GITHUB_REPOSITORY}"
+
+          fail=0
+          missing=0
+          verified=0
+
+          for f in assets/*; do
+            name=$(basename "$f")
+            echo "::group::verify ${name}"
+            # Capture both stdout+stderr so we can pattern-match on the
+            # 404-no-attestations case (releases that predate the attest
+            # rollout, or assets that aren't covered by attestation yet).
+            output=$(gh attestation verify "$f" \
+              --repo "$REPO" \
+              --predicate-type "https://slsa.dev/provenance/v1" 2>&1)
+            exit_code=$?
+
+            if [ "$exit_code" -eq 0 ]; then
+              echo "✓ ${name}: attestation valid"
+              verified=$((verified + 1))
+            elif echo "$output" | grep -qE 'HTTP 404|no attestations found'; then
+              # Not yet covered by an attestation — likely a release published
+              # before attest-build-provenance was added to the workflow.
+              # Flag it but don't fail the run; it'll start passing once the
+              # release is republished by the new flow.
+              echo "⚠ ${name}: no attestation found (release predates attest rollout?)"
+              echo "$output"
+              missing=$((missing + 1))
+            else
+              echo "✗ ${name}: attestation INVALID"
+              echo "$output"
+              fail=$((fail + 1))
+            fi
+            echo "::endgroup::"
+          done
+
+          echo ""
+          echo "Summary: ${verified} verified, ${missing} missing, ${fail} invalid"
+
+          if [ "$fail" -gt 0 ]; then
+            echo ""
+            echo "One or more attestations FAILED verification — investigate immediately."
+            echo "Possible causes: tampered binary, revoked attestation, sigstore trust-root change."
+            exit 1
+          fi
+
+          # All-missing means this release predates the attestation rollout.
+          # Warn (writes to job summary) but don't fail.
+          if [ "$verified" -eq 0 ] && [ "$missing" -gt 0 ]; then
+            echo "::warning::No attestations exist for this release yet. This is expected for releases published before the attest-build-provenance step was added; will resolve once the release is republished."
+          fi

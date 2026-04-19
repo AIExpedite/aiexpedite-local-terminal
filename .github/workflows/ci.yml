@@ -1,0 +1,97 @@
+name: ci
+
+# Runs on every push and pull request. Catches:
+#   - Test regressions in the trust-boundary code (allowlist, update,
+#     attestation verification, registration URL validation)
+#   - Cross-platform build breakage from the _windows.go / _darwin.go /
+#     _linux.go split files
+#   - go vet warnings + gofmt drift
+#
+# Kept as a separate workflow from release-* because:
+#   - Different trigger (PR/push vs main-only push / workflow_dispatch)
+#   - Different runner needs (no signing, no self-hosted)
+#   - Failure here should NOT block a release once it's already in flight
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Per-PR concurrency: a new push to a branch cancels the previous run.
+# Saves runner minutes during rapid iteration.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test/${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each platform exercises its own _<goos>.go variants — running on
+        # all three catches platform-specific compile errors that a single
+        # ubuntu-only test job would miss.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: "1.25"
+          cache: true
+          cache-dependency-path: go.sum
+
+      # Linux needs the systray dev headers for `go build` / `go test` to
+      # link the CGO-backed `getlantern/systray` dep. macOS + Windows ship
+      # equivalents in the SDK so no extra install needed.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: gcc pkg-config libayatana-appindicator3-dev
+          version: 1.0
+
+      - name: go mod download
+        run: go mod download
+
+      # gofmt drift is the cheapest signal — fail fast before spending
+      # cycles on test execution. Skip on Windows because path separators
+      # in `gofmt -l` output get awkward to compare cross-platform; Linux/macOS
+      # cover the same files.
+      - name: gofmt check
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          # `gofmt -l` lists files that need formatting; empty output = clean.
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files need 'gofmt -w':"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # `-race` catches data races at runtime — required for a daemon with
+      # many goroutines (session.go, pubsub.go). Only run on Linux because:
+      #   - Race detector is slow (~2x runtime); running on every platform
+      #     wastes CI minutes.
+      #   - Race issues are platform-independent in this codebase.
+      - name: go test
+        if: runner.os == 'Linux'
+        run: go test -race -timeout 5m ./...
+
+      - name: go test (no race)
+        if: runner.os != 'Linux'
+        run: go test -timeout 5m ./...

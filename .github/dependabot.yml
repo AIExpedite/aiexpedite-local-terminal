@@ -1,0 +1,55 @@
+# Dependabot config — keeps action SHAs current.
+#
+# Why this matters: every action in our workflows is pinned to a 40-char
+# commit SHA (defense against tag re-pointing). Pinned SHAs go stale —
+# without an automated bump path they become tech debt that nobody
+# refreshes until something breaks. Dependabot opens a PR per update with
+# release notes, so reviewers see exactly what changed before merging.
+version: 2
+updates:
+  # Updates for `uses:` references in `.github/workflows/*.yml`.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    # Group all action updates into one PR per week — reduces review burden
+    # while still giving granular visibility into what changed via the diff.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "github-actions"
+
+  # Updates for direct Go dependencies in go.mod.
+  # `gomod` ecosystem also tracks indirect deps if needed via allow.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    groups:
+      go-deps:
+        patterns:
+          - "*"
+        # Patch and minor bumps grouped together; major bumps as separate PRs.
+        update-types:
+          - "patch"
+          - "minor"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "go"

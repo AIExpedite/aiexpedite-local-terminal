@@ -6,8 +6,15 @@ on:
     branches:
       - main
 
+# Cancel any in-flight nonprod release for the same ref when a newer push lands.
+# Prevents racing tag-delete-and-recreate on `latest-internal` / `latest-dev`.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default: no write access. Only the publish jobs request `contents: write`.
 permissions:
-  contents: write
+  contents: read
 
 ###############################################################################
 # Build and release non-prod binaries (dev, stg, beta) - Windows only
@@ -16,7 +23,22 @@ permissions:
 jobs:
   build-nonprod:
     name: Build ${{ matrix.env }}/windows/amd64
-    runs-on: windows-latest
+    # Self-hosted Windows runner with the YubiKey plugged in. Same runner the
+    # prod release uses — see WINDOWS_CODE_SIGNING.md. Moved off windows-latest
+    # to (a) save GitHub-hosted runner minutes and (b) enable EV-cert signing
+    # for beta builds (matches the macOS approach: beta is publicly distributed
+    # so it should be signed; dev/stg are internal, kept unsigned to skip the
+    # PIN prompt and reduce friction on every push).
+    #
+    # SECURITY: this runner is registered at the *repository* level (not the
+    # org level), so labels-only is sufficient — only workflows in THIS repo
+    # can ever dispatch to it, regardless of label matches in other repos.
+    # If we ever need to share the runner across multiple org repos, switch to
+    # an org-level runner inside a runner group restricted to selected repos:
+    #   runs-on:
+    #     group: yubikey-signing
+    #     labels: [self-hosted, Windows, X64, yubikey]
+    runs-on: [self-hosted, Windows, X64, yubikey]
     strategy:
       fail-fast: false
       matrix:
@@ -44,10 +66,10 @@ jobs:
             installer_name: AIExpediteTerminal-Beta-Setup.exe
 
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           # Pinned to 1.25 because go.mod requires 1.25+ — forced by
           # go.opentelemetry.io/otel/sdk v1.43.0, which carries the fix for
@@ -56,11 +78,20 @@ jobs:
           go-version: "1.25"
 
       - name: Download Go modules
-        run: go mod tidy
+        run: go mod download
 
-      - name: Install go-winres
+      - name: Cache go-winres binary
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/go/bin/go-winres.exe
+          key: go-winres-v0.3.3-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install go-winres (pinned)
         shell: bash
-        run: go install github.com/tc-hib/go-winres@latest
+        run: |
+          if ! command -v go-winres >/dev/null 2>&1 && [ ! -f "$HOME/go/bin/go-winres.exe" ]; then
+            go install github.com/tc-hib/go-winres@v0.3.3
+          fi
 
       - name: Generate Windows resources (icon, manifest, version)
         shell: bash
@@ -82,6 +113,15 @@ jobs:
 
           go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe" .
 
+      - name: Smoke test built binary
+        shell: bash
+        run: |
+          OUTPUT=$(./dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe --version)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "channel=${{ matrix.env }}" || { echo "channel mismatch"; exit 1; }
+          echo "$OUTPUT" | grep -q "env=${{ matrix.env }}" || { echo "env mismatch"; exit 1; }
+          echo "$OUTPUT" | grep -q "windows/amd64" || { echo "arch mismatch"; exit 1; }
+
       - name: Extract version from agent.go
         id: version
         shell: bash
@@ -99,6 +139,35 @@ jobs:
         shell: bash
         run: cp dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe aiexpedite-terminal${{ matrix.exe_suffix }}.exe
 
+      # Sign the .exe BEFORE building the installer so the signed binary is
+      # what gets embedded. PIN policy 'once' means this single signtool call
+      # prompts for the YubiKey PIN one time and signs both files.
+      # dev/stg are internal — skip signing to avoid PIN prompts on every push.
+      - name: Sign Windows binary with YubiKey EV cert (beta only)
+        if: matrix.env == 'beta'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_THUMBPRINT: ${{ vars.WINDOWS_CERT_THUMBPRINT }}
+        run: |
+          ./scripts/sign/Sign-Binary.ps1 -Path `
+            "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe", `
+            "aiexpedite-terminal${{ matrix.exe_suffix }}.exe"
+
+      - name: Verify Inno Setup is installed
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw @"
+          Inno Setup compiler not found at: $iscc
+          The self-hosted runner is missing a required tool. Install via:
+            winget install JRSoftware.InnoSetup
+          (or download from https://jrsoftware.org/isinfo.php)
+          See WINDOWS_CODE_SIGNING.md for the full runner setup checklist.
+          "@
+          }
+          Write-Host "Found Inno Setup: $iscc"
+
       - name: Build installer
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ${{ matrix.installer_iss }}
@@ -107,13 +176,22 @@ jobs:
         shell: bash
         run: cp installer-output/AIExpediteTerminal-*-Setup-*.exe dist/${{ matrix.installer_name }}
 
+      - name: Sign Windows installer with YubiKey EV cert (beta only)
+        if: matrix.env == 'beta'
+        shell: pwsh
+        env:
+          WINDOWS_CERT_THUMBPRINT: ${{ vars.WINDOWS_CERT_THUMBPRINT }}
+        run: |
+          ./scripts/sign/Sign-Binary.ps1 -Path "dist/${{ matrix.installer_name }}"
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nonprod-${{ matrix.env }}-windows-amd64
           path: |
             dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe
             dist/${{ matrix.installer_name }}
+          if-no-files-found: error
 
   build-nonprod-darwin:
     name: Build ${{ matrix.env }}/darwin/${{ matrix.goarch }}
@@ -141,10 +219,10 @@ jobs:
             exe_suffix: "-beta"
 
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           # Pinned to 1.25 because go.mod requires 1.25+ — forced by
           # go.opentelemetry.io/otel/sdk v1.43.0, which carries the fix for
@@ -153,7 +231,7 @@ jobs:
           go-version: "1.25"
 
       - name: Download Go modules
-        run: go mod tidy
+        run: go mod download
 
       - name: Build binary
         run: |
@@ -166,6 +244,19 @@ jobs:
           LDFLAGS="$LDFLAGS -X main.ReleaseChannel=${{ matrix.env }}"
 
           CGO_ENABLED=1 GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}" .
+
+      # macos-latest = arm64 host. arm64 binary runs natively; amd64 binary
+      # would need Rosetta. We smoke-test arm64 only — if the build pipeline
+      # produces a working arm64 binary, the amd64 build (same source) is
+      # almost certainly fine. (Cross-arch execution is its own can of worms.)
+      - name: Smoke test built binary (arm64 native only)
+        if: matrix.goarch == 'arm64'
+        run: |
+          OUTPUT=$(./dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }} --version)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "channel=${{ matrix.env }}" || { echo "channel mismatch"; exit 1; }
+          echo "$OUTPUT" | grep -q "env=${{ matrix.env }}" || { echo "env mismatch"; exit 1; }
+          echo "$OUTPUT" | grep -q "darwin/arm64" || { echo "arch mismatch"; exit 1; }
 
       - name: Import Apple Developer ID certificate
         env:
@@ -273,10 +364,16 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --display --verbose=4 "$APP"
 
+      - name: Cache pip wheels (dmgbuild)
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-dmgbuild-1.6.7-${{ runner.os }}-${{ runner.arch }}
+
       - name: Package as DMG
         id: package_dmg
         run: |
-          pip3 install --break-system-packages dmgbuild
+          pip3 install --break-system-packages 'dmgbuild==1.6.7'
           DMG_NAME="aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}.dmg"
           echo "dmg_path=dist/${DMG_NAME}" >> $GITHUB_OUTPUT
 
@@ -310,52 +407,204 @@ jobs:
             --sign "$SIGNING_IDENTITY" \
             "${{ steps.package_dmg.outputs.dmg_path }}"
 
-      - name: Notarize DMG with Apple
-        id: notarize
+      # dev/stg are internal-only — Developer ID signed but not notarized.
+      # Internal testers can right-click → Open to bypass Gatekeeper.
+      # Only beta is notarized (so external Beta testers don't see warnings).
+      - name: Submit DMG for notarization (beta only, no wait)
+        if: matrix.env == 'beta'
+        id: notarize_submit
         env:
           APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
           TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
           APP_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PWD }}
         run: |
-          # Submit and capture the submission ID so we can fetch logs on failure.
-          SUBMIT_OUTPUT=$(xcrun notarytool submit "${{ steps.package_dmg.outputs.dmg_path }}" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$TEAM_ID" \
-            --password "$APP_PASSWORD" \
-            --wait \
-            --timeout 60m \
-            --output-format json)
+          # Submit with --no-wait so this runner can release immediately.
+          # The finalize-nonprod-beta-darwin job waits for Apple, staples, uploads.
+          # Retry on transient submit failures — the build cost up to this point
+          # is ~10 min and we don't want to throw it away over a network blip.
+          notarize_submit_with_retry() {
+            local dmg="$1"
+            local attempt=1
+            local max_attempts=3
+            while [ $attempt -le $max_attempts ]; do
+              if xcrun notarytool submit "${dmg}" \
+                  --apple-id "$APPLE_ID" \
+                  --team-id "$TEAM_ID" \
+                  --password "$APP_PASSWORD" \
+                  --no-wait \
+                  --output-format json; then
+                return 0
+              fi
+              echo "notarytool submit attempt ${attempt} failed" >&2
+              if [ $attempt -lt $max_attempts ]; then
+                sleep 60
+              fi
+              attempt=$((attempt + 1))
+            done
+            return 1
+          }
+
+          if ! SUBMIT_OUTPUT=$(notarize_submit_with_retry "${{ steps.package_dmg.outputs.dmg_path }}"); then
+            echo "notarytool submit failed after retries — aborting build"
+            exit 1
+          fi
           echo "$SUBMIT_OUTPUT"
           SUBMISSION_ID=$(echo "$SUBMIT_OUTPUT" | python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
-          echo "submission_id=$SUBMISSION_ID" >> $GITHUB_OUTPUT
-
-      - name: Fetch notarization log on failure
-        if: failure() && steps.notarize.outputs.submission_id != ''
-        env:
-          APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
-          TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
-          APP_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PWD }}
-        run: |
-          xcrun notarytool log "${{ steps.notarize.outputs.submission_id }}" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$TEAM_ID" \
-            --password "$APP_PASSWORD" || true
-
-      - name: Staple notarization ticket to DMG
-        run: |
-          xcrun stapler staple "${{ steps.package_dmg.outputs.dmg_path }}"
-          xcrun stapler validate "${{ steps.package_dmg.outputs.dmg_path }}"
+          mkdir -p notarize-pending
+          cp "${{ steps.package_dmg.outputs.dmg_path }}" notarize-pending/
+          echo "$SUBMISSION_ID" > notarize-pending/submission-id.txt
 
       - name: Clean up keychain
         if: always()
         run: |
           security delete-keychain $RUNNER_TEMP/build.keychain || true
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7.0.0
+      # dev/stg: signed DMG is the final artifact (no notarization).
+      - name: Upload artifacts (dev/stg final)
+        if: matrix.env != 'beta'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nonprod-${{ matrix.env }}-darwin-${{ matrix.goarch }}
           path: dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}.dmg
+          if-no-files-found: error
+
+      # beta: hand off DMG + submission_id to the finalize job.
+      # Artifact name is intentionally NOT prefixed with "nonprod-" so the
+      # release job's `pattern: nonprod-*` glob doesn't pick up the unstapled DMG.
+      - name: Upload pending DMG for notarization wait (beta)
+        if: matrix.env == 'beta'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pending-beta-darwin-${{ matrix.goarch }}
+          path: notarize-pending/
+          if-no-files-found: error
+          retention-days: 1
+
+  ###############################################################################
+  # Wait for Apple notarization, staple the ticket, and upload the final DMGs.
+  # Single job (not matrix) so both arches share one macOS runner during the
+  # Apple queue wait — Apple processes both submissions in parallel.
+  ###############################################################################
+  finalize-nonprod-beta-darwin:
+    name: Finalize beta darwin (notarize wait + staple)
+    needs: build-nonprod-darwin
+    runs-on: macos-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Download pending beta DMGs and submission IDs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: pending-beta-darwin-*
+          path: pending/
+
+      - name: Wait for notarization and staple (both arches in parallel)
+        env:
+          APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+          APP_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PWD }}
+        run: |
+          mkdir -p dist
+
+          # Kill any lingering background notarytool/stapler processes if the
+          # job is cancelled or the script aborts.
+          trap 'kill 0 2>/dev/null || true' EXIT
+
+          # notarytool wait retries internal HTTP errors, but a hard crash
+          # (transient 5xx burst, network blip) returns non-zero. Cheap retry —
+          # successful re-check returns near-instantly.
+          # Heartbeat: while wait blocks for 30-90 min on Apple, log every 5 min
+          # so the job appears alive in the GitHub UI and operators can tell
+          # "still waiting" from "hung".
+          notarize_wait_with_heartbeat() {
+            local sub_id="$1"
+            local arch="$2"
+            local attempt=1
+            local max_attempts=2
+            while [ $attempt -le $max_attempts ]; do
+              xcrun notarytool wait "${sub_id}" \
+                --apple-id "$APPLE_ID" \
+                --team-id "$TEAM_ID" \
+                --password "$APP_PASSWORD" \
+                --timeout 120m &
+              local wait_pid=$!
+              local elapsed=0
+              while kill -0 "$wait_pid" 2>/dev/null; do
+                sleep 30
+                elapsed=$((elapsed + 30))
+                if [ $((elapsed % 300)) -eq 0 ]; then
+                  echo "[${arch}] heartbeat: still waiting on Apple (~$((elapsed / 60))m elapsed)"
+                fi
+              done
+              wait "$wait_pid"
+              local exit_code=$?
+              if [ "$exit_code" -eq 0 ]; then
+                return 0
+              fi
+              if [ $attempt -lt $max_attempts ]; then
+                echo "[${arch}] notarytool wait attempt ${attempt} failed (exit ${exit_code}), retrying in 30s..."
+                sleep 30
+              fi
+              attempt=$((attempt + 1))
+            done
+            return 1
+          }
+
+          process_arch() {
+            local arch="$1"
+            local subdir="pending/pending-beta-darwin-${arch}"
+            local sub_id
+            local dmg
+
+            sub_id=$(cat "${subdir}/submission-id.txt")
+            dmg=$(ls "${subdir}"/*.dmg | head -1)
+
+            echo "[${arch}] Waiting for notarization (submission ${sub_id})..."
+            if ! notarize_wait_with_heartbeat "${sub_id}" "${arch}"; then
+              echo "[${arch}] notarytool wait failed — fetching log"
+              xcrun notarytool log "${sub_id}" \
+                --apple-id "$APPLE_ID" \
+                --team-id "$TEAM_ID" \
+                --password "$APP_PASSWORD" || true
+              return 1
+            fi
+
+            echo "[${arch}] Stapling ${dmg}..."
+            xcrun stapler staple "${dmg}"
+            xcrun stapler validate "${dmg}"
+            cp "${dmg}" "dist/$(basename "${dmg}")"
+          }
+
+          # Stream both arches' output live (interleaved) — `[arch]` prefix on
+          # every line keeps it readable. Heartbeats only matter if visible.
+          process_arch amd64 &
+          PID_AMD64=$!
+          process_arch arm64 &
+          PID_ARM64=$!
+
+          set +e
+          wait "$PID_AMD64"; STATUS_AMD64=$?
+          wait "$PID_ARM64"; STATUS_ARM64=$?
+          set -e
+
+          if [ "$STATUS_AMD64" -ne 0 ] || [ "$STATUS_ARM64" -ne 0 ]; then
+            echo "Notarization/stapling failed (amd64=$STATUS_AMD64 arm64=$STATUS_ARM64)"
+            exit 1
+          fi
+
+      - name: Upload final beta darwin amd64 DMG
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nonprod-beta-darwin-amd64
+          path: dist/aiexpedite-terminal-beta-darwin-amd64.dmg
+          if-no-files-found: error
+
+      - name: Upload final beta darwin arm64 DMG
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nonprod-beta-darwin-arm64
+          path: dist/aiexpedite-terminal-beta-darwin-arm64.dmg
+          if-no-files-found: error
 
   build-nonprod-linux:
     name: Build ${{ matrix.env }}/linux/amd64
@@ -381,10 +630,10 @@ jobs:
             exe_suffix: "-beta"
 
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           # Pinned to 1.25 because go.mod requires 1.25+ — forced by
           # go.opentelemetry.io/otel/sdk v1.43.0, which carries the fix for
@@ -393,10 +642,13 @@ jobs:
           go-version: "1.25"
 
       - name: Download Go modules
-        run: go mod tidy
+        run: go mod download
 
-      - name: Install systray and AppImage dependencies
-        run: sudo apt-get update && sudo apt-get install -y gcc pkg-config libayatana-appindicator3-dev libfuse2
+      - name: Install systray and AppImage dependencies (cached)
+        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        with:
+          packages: gcc pkg-config libayatana-appindicator3-dev libfuse2
+          version: 1.0
 
       - name: Build binary
         run: |
@@ -410,9 +662,24 @@ jobs:
 
           GOOS=linux GOARCH=amd64 go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-linux-amd64" .
 
+      - name: Smoke test built binary
+        run: |
+          # Confirms the binary loads, ldflags-injected vars are wired,
+          # and the env channel matches what we asked for. Catches regressions
+          # before they ship.
+          OUTPUT=$(./dist/aiexpedite-terminal${{ matrix.exe_suffix }}-linux-amd64 --version)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "channel=${{ matrix.env }}" || { echo "channel mismatch"; exit 1; }
+          echo "$OUTPUT" | grep -q "env=${{ matrix.env }}" || { echo "env mismatch"; exit 1; }
+
       - name: Package as AppImage
         run: |
-          wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" -O appimagetool
+          # Pinned to appimagetool 1.9.1 (from new official AppImage/appimagetool repo)
+          # with SHA-256 verification — defends against rolling-`continuous` tag tampering.
+          APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          APPIMAGETOOL_SHA="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          wget -q "$APPIMAGETOOL_URL" -O appimagetool
+          echo "${APPIMAGETOOL_SHA}  appimagetool" | sha256sum -c -
           chmod +x appimagetool
 
           mkdir -p AppDir/usr/bin AppDir/usr/share/icons/hicolor/256x256/apps
@@ -446,23 +713,28 @@ jobs:
           ARCH=x86_64 ./appimagetool --no-appstream AppDir "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-linux-amd64.AppImage"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nonprod-${{ matrix.env }}-linux-amd64
           path: dist/aiexpedite-terminal${{ matrix.exe_suffix }}-linux-amd64.AppImage
+          if-no-files-found: error
 
   ###############################################################################
   # Create non-prod release (pre-release, hidden from main downloads)
   ###############################################################################
   release-nonprod:
     name: Publish non-prod release
-    needs: [build-nonprod, build-nonprod-darwin, build-nonprod-linux]
+    needs: [build-nonprod, build-nonprod-darwin, finalize-nonprod-beta-darwin, build-nonprod-linux]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write       # required for sigstore signing in attest
+      attestations: write   # required to upload the attestation
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download non-prod binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: nonprod-*
           path: dist
@@ -472,6 +744,20 @@ jobs:
         run: |
           cd dist
           sha256sum * > SHA256SUMS
+
+      # SLSA build provenance — proves these binaries were produced by THIS
+      # workflow run, on a GitHub-hosted (or known self-hosted) runner, from
+      # the commit referenced in github.sha. Stored as a sigstore-signed
+      # attestation alongside the release. Verifiable by anyone with `gh attestation verify`.
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            dist/aiexpedite-terminal-*-windows-amd64.exe
+            dist/AIExpediteTerminal-*-Setup.exe
+            dist/aiexpedite-terminal-*-darwin-amd64.dmg
+            dist/aiexpedite-terminal-*-darwin-arm64.dmg
+            dist/aiexpedite-terminal-*-linux-amd64.AppImage
 
       - name: Get short SHA
         id: sha
@@ -493,7 +779,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish non-prod pre-release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: latest-internal
           name: "Internal Builds (${{ steps.sha.outputs.short_sha }})"
@@ -522,11 +808,15 @@ jobs:
     name: Publish dev release for auto-update
     needs: [build-nonprod, build-nonprod-darwin, build-nonprod-linux]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download dev binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: nonprod-dev-*
           path: dist
@@ -536,6 +826,15 @@ jobs:
         run: |
           cd dist
           sha256sum * > SHA256SUMS
+
+      - name: Generate build provenance attestation (dev artifacts)
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            dist/aiexpedite-terminal-dev-windows-amd64.exe
+            dist/aiexpedite-terminal-dev-darwin-amd64.dmg
+            dist/aiexpedite-terminal-dev-darwin-arm64.dmg
+            dist/aiexpedite-terminal-dev-linux-amd64.AppImage
 
       - name: Get short SHA
         id: sha
@@ -558,7 +857,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish dev release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: latest-dev
           name: "Dev Build ${{ steps.version.outputs.version }} (${{ steps.sha.outputs.short_sha }})"
