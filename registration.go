@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -66,15 +67,60 @@ func getDeviceName() string {
 	return hostname
 }
 
-// getRegistrationURL returns the base URL for registration API
-// EnvAPIEndpoint is set via ldflags at build time for each environment
-// Can be overridden via TERMINAL_SERVICE_URL env var for local development
+// getRegistrationURL returns the base URL for registration API.
+// EnvAPIEndpoint is set via ldflags at build time for each environment.
+// Can be overridden via TERMINAL_SERVICE_URL env var for local development.
+//
+// Security: the override MUST start with `https://` (or be `http://localhost...`
+// for local-loopback-only development). Anything else (`http://` to a remote
+// host, `file://`, etc.) would send registration credentials in cleartext to
+// an arbitrary destination — accepting it via env var would make a single
+// shell history line a credential-exfiltration vector. We refuse rather than
+// silently accept; the registration flow surfaces the error to the user.
 func getRegistrationURL() string {
-	// Check for environment variable override (for local dev)
-	if url := os.Getenv("TERMINAL_SERVICE_URL"); url != "" {
+	url := os.Getenv("TERMINAL_SERVICE_URL")
+	if url == "" {
+		return EnvAPIEndpoint
+	}
+	if isAllowedRegistrationURL(url) {
 		return url
 	}
+	// Reject — log and fall back to the build-time endpoint so the app
+	// stays functional. The user sees the warning and can fix their env.
+	fmt.Printf("[registration] WARNING: ignoring TERMINAL_SERVICE_URL=%q — not https:// (or http://localhost). Falling back to %s.\n",
+		url, EnvAPIEndpoint)
 	return EnvAPIEndpoint
+}
+
+// isAllowedRegistrationURL returns true for URLs we'll accept as a service
+// endpoint override. Splits "https-only" from a narrow exception for
+// loopback HTTP (so `npm start` style local-dev flows still work).
+func isAllowedRegistrationURL(url string) bool {
+	// Production: HTTPS to anywhere is fine.
+	if strings.HasPrefix(url, "https://") {
+		return true
+	}
+	// Local dev: HTTP only to loopback, never to a remote host. Match
+	// localhost / 127.0.0.1 / [::1] explicitly to reject things like
+	// `http://localhost.evil.com`.
+	loopbackHTTPPrefixes := []string{
+		"http://localhost:",
+		"http://localhost/",
+		"http://127.0.0.1:",
+		"http://127.0.0.1/",
+		"http://[::1]:",
+		"http://[::1]/",
+	}
+	for _, p := range loopbackHTTPPrefixes {
+		if strings.HasPrefix(url, p) {
+			return true
+		}
+	}
+	// Bare "http://localhost" with no path/port is also fine.
+	if url == "http://localhost" || url == "http://127.0.0.1" || url == "http://[::1]" {
+		return true
+	}
+	return false
 }
 
 // initRegistration calls POST /device/init to start the registration flow

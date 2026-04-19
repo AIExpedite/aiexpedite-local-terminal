@@ -308,8 +308,25 @@ func downloadAndApplyUpdate(info *UpdateInfo) error {
 		return fmt.Errorf("downloaded file too small (%d bytes), likely corrupted", stat.Size())
 	}
 
+	digestHex := hex.EncodeToString(h.Sum(nil))
+	fmt.Printf("→ Downloaded %d MB (SHA-256: %s)\n", stat.Size()>>20, digestHex)
+
+	// Verify SLSA build provenance attestation BEFORE applying the update.
+	// Without this, the SHA-256 we just computed proves nothing — it only
+	// tells us "we got back what was at the URL", not "what was at the URL
+	// was actually built by our CI". See attestation.go for the threat model.
+	//
+	// errAttestationDisabled means the user explicitly opted out via env var
+	// (firewall escape hatch); proceed but with a clear log line. Any other
+	// error means we couldn't establish provenance — refuse to apply.
+	fmt.Println("→ Verifying build provenance...")
+	if err := verifyBuildProvenance(tmp.Name(), digestHex); err != nil {
+		if !errors.Is(err, errAttestationDisabled) {
+			return fmt.Errorf("attestation verification failed, refusing to apply update: %w", err)
+		}
+	}
+
 	_ = os.Chmod(tmp.Name(), 0o755) // make executable
-	fmt.Printf("→ Downloaded %d MB (SHA-256: %s)\n", stat.Size()>>20, hex.EncodeToString(h.Sum(nil)))
 
 	// Set global state for restart
 	success = true // temp file is now owned by the update path; don't delete on defer

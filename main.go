@@ -20,6 +20,14 @@ import (
 var shutdownConfig *Config
 
 func main() {
+	// Print version and exit. Used by CI smoke tests (and humans) to verify
+	// the binary loads and the build embedded the expected version string.
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Printf("aiexpedite-terminal %s %s/%s (channel=%s, env=%s)\n",
+			Version, runtime.GOOS, runtime.GOARCH, ReleaseChannel, EnvName)
+		return
+	}
+
 	// Handle --uninstall command line argument (Windows + macOS)
 	if (runtime.GOOS == "windows" || runtime.GOOS == "darwin") && len(os.Args) > 1 {
 		if os.Args[1] == "--uninstall" {

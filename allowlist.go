@@ -126,13 +126,20 @@ func (al *AllowList) GetConfigPath() string {
 }
 
 // patternToRegex converts glob-like pattern to regex
-// "git *" becomes "^git .*$"
-// "npm run *" becomes "^npm run .*$"
+// "git *" becomes "^git [^\n]*$"
+// "npm run *" becomes "^npm run [^\n]*$"
+//
+// Wildcard explicitly excludes newlines: a remote message could in principle
+// contain `\n` in a command string (JSON parsers accept `\n` escapes), and
+// `[\s\S]*` would let that through, allowing an attacker to chain "git status\n; rm -rf ~"
+// against a `git *` allowlist entry. The shell-quoting layer in pubsub.go
+// also rejects newlines, so this is defense-in-depth — but we want both
+// independent layers to be correct.
 func patternToRegex(pattern string) *regexp.Regexp {
 	// Escape regex special chars except *
 	escaped := regexp.QuoteMeta(pattern)
-	// Convert * to .* (use [\s\S]* to match across newlines)
-	escaped = strings.ReplaceAll(escaped, `\*`, `[\s\S]*`)
+	// Convert * to [^\n]* — match anything EXCEPT newlines.
+	escaped = strings.ReplaceAll(escaped, `\*`, `[^\n]*`)
 	// Anchor the pattern
 	escaped = "^" + escaped + "$"
 
