@@ -55,7 +55,7 @@ const (
 type PersistentPowerShell struct {
 	cmd        *exec.Cmd
 	stdin      io.WriteCloser
-	stdoutPipe io.ReadCloser  // raw pipe — stored for explicit Close in forceKill
+	stdoutPipe io.ReadCloser // raw pipe — stored for explicit Close in forceKill
 	stdout     *bufio.Reader
 	stderr     io.ReadCloser
 	mutex      sync.Mutex

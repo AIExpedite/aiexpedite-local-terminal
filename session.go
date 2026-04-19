@@ -825,7 +825,7 @@ func buildCodexInteractiveArgs(args []string) []string {
 // (stdin relay is not possible when Gemini streams).
 func buildGeminiInteractiveArgs(args []string) []string {
 	result := make([]string, 0, len(args)+4)
-	result = append(result, args...)                        // prompt as positional arg first
+	result = append(result, args...) // prompt as positional arg first
 	result = append(result, "-o", "stream-json")
 	result = append(result, "--approval-mode", "auto_edit")
 	return result
@@ -1027,4 +1027,3 @@ func (sm *SessionManager) ShutdownAllSessions() {
 		_ = sm.EndSession(id)
 	}
 }
-

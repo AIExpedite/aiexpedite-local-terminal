@@ -66,13 +66,13 @@ var ConsoleHiddenChan = make(chan bool, 1)
 var RegistrationInvalidChan = make(chan bool, 1)
 
 const (
-	SW_HIDE            = 0
-	SW_SHOWNORMAL      = 1
-	SW_SHOW            = 5
-	SW_MINIMIZE        = 6
-	SW_SHOWNOACTIVATE  = 8
-	SW_RESTORE         = 9
-	SW_SHOWDEFAULT     = 10
+	SW_HIDE           = 0
+	SW_SHOWNORMAL     = 1
+	SW_SHOW           = 5
+	SW_MINIMIZE       = 6
+	SW_SHOWNOACTIVATE = 8
+	SW_RESTORE        = 9
+	SW_SHOWDEFAULT    = 10
 
 	// System menu constants for disabling close button
 	SC_CLOSE     = 0xF060
@@ -178,7 +178,7 @@ func getConsoleWindow() uintptr {
 var procLoadImageW = user32.NewProc("LoadImageW")
 
 const (
-	IMAGE_ICON    = 1
+	IMAGE_ICON      = 1
 	LR_LOADFROMFILE = 0x00000010
 )
 
@@ -486,17 +486,17 @@ func ensureAppRegistration() error {
 	// Set required registry values for Add/Remove Programs
 	// Use environment-specific display name (e.g., "AI Expedite (Dev)" for dev)
 	values := map[string]string{
-		"DisplayName":     EnvDisplayName,
-		"DisplayVersion":  Version[1:], // Strip the "v" prefix from version
-		"Publisher":       "AI Expedite",
-		"InstallLocation": exeDir,
-		"DisplayIcon":     iconPath,
-		"UninstallString": `"` + exePath + `" --uninstall`,
+		"DisplayName":          EnvDisplayName,
+		"DisplayVersion":       Version[1:], // Strip the "v" prefix from version
+		"Publisher":            "AI Expedite",
+		"InstallLocation":      exeDir,
+		"DisplayIcon":          iconPath,
+		"UninstallString":      `"` + exePath + `" --uninstall`,
 		"QuietUninstallString": `"` + exePath + `" --uninstall --quiet`,
-		"NoModify":        "",
-		"NoRepair":        "",
-		"Comments":        "Remote terminal access with security features",
-		"URLInfoAbout":    "https://aiexpedite.com",
+		"NoModify":             "",
+		"NoRepair":             "",
+		"Comments":             "Remote terminal access with security features",
+		"URLInfoAbout":         "https://aiexpedite.com",
 	}
 
 	for name, value := range values {

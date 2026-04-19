@@ -14,10 +14,10 @@ import (
 )
 
 var (
-	user32            = syscall.NewLazyDLL("user32.dll")
-	procMsgBox        = user32.NewProc("MessageBoxW")
-	procFindWindowW   = user32.NewProc("FindWindowW")
-	procPostMessageW  = user32.NewProc("PostMessageW")
+	user32           = syscall.NewLazyDLL("user32.dll")
+	procMsgBox       = user32.NewProc("MessageBoxW")
+	procFindWindowW  = user32.NewProc("FindWindowW")
+	procPostMessageW = user32.NewProc("PostMessageW")
 )
 
 const WM_CLOSE = 0x0010
@@ -58,6 +58,7 @@ const (
 //   - Yes = Allow this once
 //   - No = Always allow this command pattern
 //   - Cancel = Deny execution
+//
 // Returns: ApprovalDeny, ApprovalOnce, or ApprovalAlways
 func ShowCommandApprovalDialog(cmd string, args []string, timeoutSec int) ApprovalResult {
 	fullCmd := cmd

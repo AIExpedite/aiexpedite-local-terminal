@@ -71,14 +71,14 @@ func TestVerifySignatureWithAmpersand(t *testing.T) {
 
 	// Simulate Node.js signCommand output (Node doesn't escape & in JSON)
 	nodePayload := signaturePayload{
-		ID:      "test-123",
-		Command: "echo hello && echo world",
-		Args:    []string{},
-		Ts:      1234567890,
-		Type:    "",
+		ID:        "test-123",
+		Command:   "echo hello && echo world",
+		Args:      []string{},
+		Ts:        1234567890,
+		Type:      "",
 		SessionID: "",
-		Input:   "",
-		Signal:  "",
+		Input:     "",
+		Signal:    "",
 	}
 	nodeJSON, err := nodeJSONStringify(nodePayload)
 	if err != nil {
