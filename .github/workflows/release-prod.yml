@@ -21,6 +21,13 @@ concurrency:
 permissions:
   contents: read
 
+# Single source of truth for tool versions referenced from multiple steps.
+# When bumping, update HERE only — both the `actions/cache` key and the
+# `go install ...@VERSION` invocation pick up the new value automatically,
+# preventing stale-cache bugs from forgetting one of the two places.
+env:
+  GO_WINRES_VERSION: v0.3.3
+
 ###############################################################################
 # Build and release production binaries - Windows only
 # Triggered manually via workflow_dispatch
@@ -97,13 +104,13 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/go/bin/go-winres.exe
-          key: go-winres-v0.3.3-${{ runner.os }}-${{ runner.arch }}
+          key: go-winres-${{ env.GO_WINRES_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install go-winres (pinned)
         shell: bash
         run: |
           if ! command -v go-winres >/dev/null 2>&1 && [ ! -f "$HOME/go/bin/go-winres.exe" ]; then
-            go install github.com/tc-hib/go-winres@v0.3.3
+            go install "github.com/tc-hib/go-winres@${GO_WINRES_VERSION}"
           fi
 
       - name: Generate Windows resources (icon, manifest, version)
@@ -237,7 +244,9 @@ jobs:
 
           CGO_ENABLED=1 GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal-darwin-${{ matrix.goarch }}" .
 
-      - name: Smoke test built binary (arm64 native only)
+      # arm64 is native (full --version smoke test); amd64 is cross-compiled
+      # so we validate the Mach-O architecture instead of executing it.
+      - name: Smoke test built binary (arm64 native)
         if: matrix.goarch == 'arm64'
         run: |
           OUTPUT=$(./dist/aiexpedite-terminal-darwin-${{ matrix.goarch }} --version)
@@ -245,6 +254,17 @@ jobs:
           echo "$OUTPUT" | grep -q "channel=prod" || { echo "channel mismatch"; exit 1; }
           echo "$OUTPUT" | grep -q "env=prod" || { echo "env mismatch"; exit 1; }
           echo "$OUTPUT" | grep -q "darwin/arm64" || { echo "arch mismatch"; exit 1; }
+
+      - name: Validate cross-compiled binary architecture (amd64)
+        if: matrix.goarch == 'amd64'
+        run: |
+          BIN="./dist/aiexpedite-terminal-darwin-${{ matrix.goarch }}"
+          INFO=$(file "$BIN")
+          echo "$INFO"
+          echo "$INFO" | grep -q "Mach-O 64-bit executable x86_64" || {
+            echo "Cross-compile produced wrong arch — expected x86_64"
+            exit 1
+          }
 
       - name: Import Apple Developer ID certificate
         env:
@@ -501,7 +521,9 @@ jobs:
 
           MAX_MINUTES=120
           POLL_SECONDS=60
+          HEARTBEAT_SECONDS=300       # log a heartbeat at least this often
           ELAPSED=0
+          LAST_HEARTBEAT=0
 
           while [ $ELAPSED -lt $((MAX_MINUTES * 60)) ]; do
             INFO_OUT=$(xcrun notarytool info "${SUB_ID}" \
@@ -525,8 +547,11 @@ jobs:
                 exit 1
                 ;;
               "In Progress"|"")
-                if [ $ELAPSED -gt 0 ] && [ $((ELAPSED % 300)) -eq 0 ]; then
+                # Heartbeat tracked by elapsed-time delta — works for any
+                # POLL_SECONDS, not just divisors of HEARTBEAT_SECONDS.
+                if [ $((ELAPSED - LAST_HEARTBEAT)) -ge $HEARTBEAT_SECONDS ] && [ $ELAPSED -gt 0 ]; then
                   echo "[${ARCH}] heartbeat: still in progress (~$((ELAPSED / 60))m elapsed)"
+                  LAST_HEARTBEAT=$ELAPSED
                 fi
                 sleep "$POLL_SECONDS"
                 ELAPSED=$((ELAPSED + POLL_SECONDS))

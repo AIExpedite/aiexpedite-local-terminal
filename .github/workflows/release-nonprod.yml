@@ -16,6 +16,13 @@ concurrency:
 permissions:
   contents: read
 
+# Single source of truth for tool versions referenced from multiple steps.
+# When bumping, update HERE only — both the `actions/cache` key and the
+# `go install ...@VERSION` invocation pick up the new value automatically,
+# preventing stale-cache bugs from forgetting one of the two places.
+env:
+  GO_WINRES_VERSION: v0.3.3
+
 ###############################################################################
 # Build and release non-prod binaries (dev, stg, beta) - Windows only
 # Triggered automatically on every push to main branch
@@ -103,13 +110,13 @@ jobs:
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ~/go/bin/go-winres.exe
-          key: go-winres-v0.3.3-${{ runner.os }}-${{ runner.arch }}
+          key: go-winres-${{ env.GO_WINRES_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install go-winres (pinned)
         shell: bash
         run: |
           if ! command -v go-winres >/dev/null 2>&1 && [ ! -f "$HOME/go/bin/go-winres.exe" ]; then
-            go install github.com/tc-hib/go-winres@v0.3.3
+            go install "github.com/tc-hib/go-winres@${GO_WINRES_VERSION}"
           fi
 
       - name: Generate Windows resources (icon, manifest, version)
@@ -264,11 +271,12 @@ jobs:
 
           CGO_ENABLED=1 GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}" .
 
-      # macos-latest = arm64 host. arm64 binary runs natively; amd64 binary
-      # would need Rosetta. We smoke-test arm64 only — if the build pipeline
-      # produces a working arm64 binary, the amd64 build (same source) is
-      # almost certainly fine. (Cross-arch execution is its own can of worms.)
-      - name: Smoke test built binary (arm64 native only)
+      # macos-latest is arm64. arm64 binary runs natively (full --version
+      # smoke test); amd64 binary is cross-compiled, so we validate its
+      # Mach-O architecture instead of executing it. `file` confirms the
+      # binary is the right arch + valid Mach-O — catches CGO link errors
+      # or accidental wrong-arch builds without needing Rosetta.
+      - name: Smoke test built binary (arm64 native)
         if: matrix.goarch == 'arm64'
         run: |
           OUTPUT=$(./dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }} --version)
@@ -276,6 +284,18 @@ jobs:
           echo "$OUTPUT" | grep -q "channel=${{ matrix.env }}" || { echo "channel mismatch"; exit 1; }
           echo "$OUTPUT" | grep -q "env=${{ matrix.env }}" || { echo "env mismatch"; exit 1; }
           echo "$OUTPUT" | grep -q "darwin/arm64" || { echo "arch mismatch"; exit 1; }
+
+      - name: Validate cross-compiled binary architecture (amd64)
+        if: matrix.goarch == 'amd64'
+        run: |
+          BIN="./dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}"
+          INFO=$(file "$BIN")
+          echo "$INFO"
+          # macOS `file` reports e.g.: "Mach-O 64-bit executable x86_64"
+          echo "$INFO" | grep -q "Mach-O 64-bit executable x86_64" || {
+            echo "Cross-compile produced wrong arch — expected x86_64"
+            exit 1
+          }
 
       - name: Import Apple Developer ID certificate
         env:
@@ -562,7 +582,9 @@ jobs:
 
           MAX_MINUTES=120
           POLL_SECONDS=60
+          HEARTBEAT_SECONDS=300       # log a heartbeat at least this often
           ELAPSED=0
+          LAST_HEARTBEAT=0
 
           while [ $ELAPSED -lt $((MAX_MINUTES * 60)) ]; do
             INFO_OUT=$(xcrun notarytool info "${SUB_ID}" \
@@ -588,9 +610,12 @@ jobs:
                 exit 1
                 ;;
               "In Progress"|"")
-                # Heartbeat every 5 min so operators can see progress.
-                if [ $ELAPSED -gt 0 ] && [ $((ELAPSED % 300)) -eq 0 ]; then
+                # Heartbeat tracked by elapsed-time delta, not by modulo —
+                # so any POLL_SECONDS value (not just divisors of HEARTBEAT)
+                # still produces regular heartbeats.
+                if [ $((ELAPSED - LAST_HEARTBEAT)) -ge $HEARTBEAT_SECONDS ] && [ $ELAPSED -gt 0 ]; then
                   echo "[${ARCH}] heartbeat: still in progress (~$((ELAPSED / 60))m elapsed)"
+                  LAST_HEARTBEAT=$ELAPSED
                 fi
                 sleep "$POLL_SECONDS"
                 ELAPSED=$((ELAPSED + POLL_SECONDS))
@@ -823,6 +848,15 @@ jobs:
 
   ###############################################################################
   # Create dev-specific release (non-prerelease for auto-update checking)
+  #
+  # NOTE on `needs:`. This depends on the WHOLE build-nonprod matrix (all
+  # envs) succeeding, even though release-dev only consumes dev artifacts.
+  # If a stg or beta windows build fails, dev's release is also blocked.
+  # GHA doesn't natively support per-matrix-entry `needs:` — the workaround
+  # would be to split the windows matrix into three separate jobs
+  # (build-nonprod-dev, -stg, -beta), which doubles the YAML. The current
+  # over-conservative behavior is acceptable: failed runs are uncommon and
+  # the operator can re-run only the failed matrix entry from the GH UI.
   ###############################################################################
   release-dev:
     name: Publish dev release for auto-update
@@ -852,6 +886,7 @@ jobs:
         with:
           subject-path: |
             dist/aiexpedite-terminal-dev-windows-amd64.exe
+            dist/AIExpediteTerminal-Dev-Setup.exe
             dist/aiexpedite-terminal-dev-darwin-amd64.dmg
             dist/aiexpedite-terminal-dev-darwin-arm64.dmg
             dist/aiexpedite-terminal-dev-linux-amd64.AppImage
