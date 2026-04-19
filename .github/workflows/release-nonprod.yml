@@ -23,22 +23,23 @@ permissions:
 jobs:
   build-nonprod:
     name: Build ${{ matrix.env }}/windows/amd64
-    # Self-hosted Windows runner with the YubiKey plugged in. Same runner the
-    # prod release uses — see WINDOWS_CODE_SIGNING.md. Moved off windows-latest
-    # to (a) save GitHub-hosted runner minutes and (b) enable EV-cert signing
-    # for beta builds (matches the macOS approach: beta is publicly distributed
-    # so it should be signed; dev/stg are internal, kept unsigned to skip the
-    # PIN prompt and reduce friction on every push).
+    # Per-env runner selection:
+    #   dev/stg → windows-latest (GitHub-hosted, parallel on the GHA pool, ~$0.16/release)
+    #   beta    → self-hosted (YubiKey signing requires the physical token)
     #
-    # SECURITY: this runner is registered at the *repository* level (not the
-    # org level), so labels-only is sufficient — only workflows in THIS repo
-    # can ever dispatch to it, regardless of label matches in other repos.
-    # If we ever need to share the runner across multiple org repos, switch to
-    # an org-level runner inside a runner group restricted to selected repos:
-    #   runs-on:
-    #     group: yubikey-signing
-    #     labels: [self-hosted, Windows, X64, yubikey]
-    runs-on: [self-hosted, Windows, X64, yubikey]
+    # Why the split: dev/stg + beta all share one self-hosted runner = serialized
+    # = 30+ min wall-clock for 3 builds, with the slow first cache-save dominating.
+    # Moving the unsigned envs back to GHA-hosted lets all three run truly in
+    # parallel; beta still needs the PIN, but doesn't block dev/stg anymore.
+    #
+    # SECURITY (self-hosted side): runner is registered at the *repository*
+    # level (not the org level), so labels-only is sufficient — only workflows
+    # in THIS repo can ever dispatch to it, regardless of label collisions in
+    # other repos. If we ever need to share the runner across multiple org
+    # repos, switch to an org-level runner inside a runner group restricted
+    # to selected repos:
+    #   runs_on: { group: yubikey-signing, labels: [self-hosted, Windows, X64, yubikey] }
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
@@ -50,6 +51,7 @@ jobs:
             exe_suffix: "-dev"
             installer_iss: installer-dev.iss
             installer_name: AIExpediteTerminal-Dev-Setup.exe
+            runs_on: windows-latest
           - env: stg
             display_name: "AI Expedite (Stg)"
             api_endpoint: "https://api.stg.aiexpedite.com/terminal"
@@ -57,6 +59,7 @@ jobs:
             exe_suffix: "-stg"
             installer_iss: installer-stg.iss
             installer_name: AIExpediteTerminal-Stg-Setup.exe
+            runs_on: windows-latest
           - env: beta
             display_name: "AI Expedite (Beta)"
             api_endpoint: "https://api.beta.aiexpedite.com/terminal"
@@ -64,6 +67,7 @@ jobs:
             exe_suffix: "-beta"
             installer_iss: installer-beta.iss
             installer_name: AIExpediteTerminal-Beta-Setup.exe
+            runs_on: [self-hosted, Windows, X64, yubikey]
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
