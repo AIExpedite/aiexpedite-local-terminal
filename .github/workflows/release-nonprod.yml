@@ -537,7 +537,14 @@ jobs:
         run: |
           set -e
           mkdir -p dist
-          trap 'kill 0 2>/dev/null || true' EXIT
+
+          # NO `trap '... EXIT'` here. A previous version had
+          #   trap 'kill 0 2>/dev/null || true' EXIT
+          # which sends SIGTERM to the entire process group — including the
+          # script's own bash process. Bash queues the SIGTERM during the
+          # trap, then exits 143 (128 + signal 15) instead of 0. Made
+          # every run look like a runner reclaim. The polling design has
+          # no backgrounded subprocesses to clean up, so no trap is needed.
 
           SUB_ID=$(cat "pending/submission-id.txt")
           DMG=$(ls pending/*.dmg | head -1)

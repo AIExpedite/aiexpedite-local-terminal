@@ -485,7 +485,10 @@ jobs:
         run: |
           set -e
           mkdir -p dist
-          trap 'kill 0 2>/dev/null || true' EXIT
+
+          # No EXIT trap — see release-nonprod.yml for the post-mortem.
+          # tl;dr: `trap 'kill 0' EXIT` sends SIGTERM to the script's own
+          # process group, making the script exit 143 instead of 0.
 
           SUB_ID=$(cat "pending/submission-id.txt")
           DMG=$(ls pending/*.dmg | head -1)
