@@ -38,12 +38,12 @@ import (
 // ANSI color codes for console output
 const (
 	colorReset   = "\033[0m"
-	colorCyan    = "\033[36m"    // Received commands
-	colorGreen   = "\033[32m"    // Success output
-	colorYellow  = "\033[33m"    // Warnings
-	colorRed     = "\033[31m"    // Errors
-	colorMagenta = "\033[35m"    // System messages
-	colorBlue    = "\033[34m"    // Info/metadata
+	colorCyan    = "\033[36m" // Received commands
+	colorGreen   = "\033[32m" // Success output
+	colorYellow  = "\033[33m" // Warnings
+	colorRed     = "\033[31m" // Errors
+	colorMagenta = "\033[35m" // System messages
+	colorBlue    = "\033[34m" // Info/metadata
 )
 
 // colorPrefix wraps a prefix with color codes for console output
@@ -306,9 +306,12 @@ func checkRateLimit(uid string, agentID string, cfg *Config) bool {
 	return limiter.Allow()
 }
 
-/* --------------------------------------------------------------------------
-   Signature failure rate limiting
-   -------------------------------------------------------------------------- */
+/*
+--------------------------------------------------------------------------
+
+	Signature failure rate limiting
+	--------------------------------------------------------------------------
+*/
 var (
 	sigFailCount   int64
 	sigFailResetAt time.Time
@@ -407,8 +410,8 @@ type commandMsg struct {
 	ID          string   `json:"id"`
 	Command     string   `json:"command"`
 	Args        []string `json:"args"`
-	Cwd         string   `json:"cwd,omitempty"`       // Working directory for command execution
-	WorkspaceID string   `json:"workspaceID"`         // Workspace scope for file uploads
+	Cwd         string   `json:"cwd,omitempty"` // Working directory for command execution
+	WorkspaceID string   `json:"workspaceID"`   // Workspace scope for file uploads
 	UID         string   `json:"uid"`
 	Ts          int64    `json:"ts"`
 	AgentID     string   `json:"agentId,omitempty"`   // Target agent for signature verification
@@ -424,16 +427,16 @@ type commandMsg struct {
 
 /* Outgoing result payload (matches backend publishResult struct) */
 type resultMsg struct {
-	ID           string        `json:"id"`
-	WorkspaceID  string        `json:"workspaceID,omitempty"` // Workspace scope for audit trail
-	UID          string        `json:"uid"`
-	AgentID      string        `json:"agentId,omitempty"`     // Agent ID for version updates on ping
-	Output       string        `json:"output"`
-	Status       string        `json:"status"` // "success" | "partial" | "error" | "denied" | "rate_limited" | "unauthorized"
-	Ts           int64         `json:"ts"`
-	Version      string        `json:"version,omitempty"`      // Terminal app version
-	Cwd          string        `json:"cwd,omitempty"`          // Current working directory after execution
-	Files        []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
+	ID              string        `json:"id"`
+	WorkspaceID     string        `json:"workspaceID,omitempty"` // Workspace scope for audit trail
+	UID             string        `json:"uid"`
+	AgentID         string        `json:"agentId,omitempty"` // Agent ID for version updates on ping
+	Output          string        `json:"output"`
+	Status          string        `json:"status"` // "success" | "partial" | "error" | "denied" | "rate_limited" | "unauthorized"
+	Ts              int64         `json:"ts"`
+	Version         string        `json:"version,omitempty"`      // Terminal app version
+	Cwd             string        `json:"cwd,omitempty"`          // Current working directory after execution
+	Files           []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
 	UploadErrors    []UploadError `json:"uploadErrors,omitempty"` // File upload failures
 	RejectionReason string        `json:"rejectionReason,omitempty"`
 
@@ -443,12 +446,15 @@ type resultMsg struct {
 	ExitCode   int    `json:"exitCode,omitempty"`   // Process exit code (for session_ended)
 	PromptText string `json:"promptText,omitempty"` // The question/approval text from CLI
 	PromptType string `json:"promptType,omitempty"` // "permission"|"question"|"unknown"
-	Seq        int    `json:"seq,omitempty"`         // Ordering sequence number for streaming
+	Seq        int    `json:"seq,omitempty"`        // Ordering sequence number for streaming
 }
 
-/* --------------------------------------------------------------------------
-   StartPubSubLoop – reconnection wrapper with exponential backoff
-   -------------------------------------------------------------------------- */
+/*
+--------------------------------------------------------------------------
+
+	StartPubSubLoop – reconnection wrapper with exponential backoff
+	--------------------------------------------------------------------------
+*/
 func StartPubSubLoop(cfg *Config) {
 	fmt.Println("[pubsub] StartPubSubLoop called")
 	fmt.Printf("[pubsub] Config: ProjectID=%s, Subscription=%s, Topic=%s\n", cfg.ProjectID, cfg.CommandsSubscription, cfg.ResultsTopic)
@@ -588,10 +594,13 @@ func publishMsg(ctx context.Context, topic *pubsub.Publisher, res resultMsg) err
 	return nil
 }
 
-/* --------------------------------------------------------------------------
-   runPubSubConnection – handles a single connection attempt
-   Returns nil on clean shutdown, error on connection failure
-   -------------------------------------------------------------------------- */
+/*
+--------------------------------------------------------------------------
+
+	runPubSubConnection – handles a single connection attempt
+	Returns nil on clean shutdown, error on connection failure
+	--------------------------------------------------------------------------
+*/
 func runPubSubConnection(cfg *Config) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -664,81 +673,158 @@ func runPubSubConnection(cfg *Config) error {
 
 	fmt.Printf("[pubsub] listening for commands on: %s\n", cfg.CommandsSubscription)
 	err = sub.Receive(ctx, func(ctx context.Context, m *pubsub.Message) {
-			// Panic recovery to prevent app crash on unhandled errors
-			defer func() {
-				if r := recover(); r != nil {
-					fmt.Printf("[pubsub] PANIC in message handler: %v\n", r)
-					m.Nack() // Let Pub/Sub redeliver
-				}
-			}()
-
-			// Reject oversized messages before parsing — a normal command payload is
-			// well under 1 KB; 64 KB is a generous cap that rules out memory exhaustion
-			// from malformed or unexpectedly large Pub/Sub messages.
-			const maxMessageSize = 64 * 1024 // 64 KB
-			if len(m.Data) > maxMessageSize {
-				fmt.Printf("%s[aiexpedite] Oversized message rejected (%d bytes)%s\n",
-					colorRed, len(m.Data), colorReset)
-				m.Ack() // Ack so it isn't redelivered forever
-				return
+		// Panic recovery to prevent app crash on unhandled errors
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf("[pubsub] PANIC in message handler: %v\n", r)
+				m.Nack() // Let Pub/Sub redeliver
 			}
+		}()
 
-			// Parse command silently (verbose logging removed in v0.4.12)
-			var cmd commandMsg
-			if err := json.Unmarshal(m.Data, &cmd); err != nil {
-				fmt.Printf("%s[aiexpedite] Bad command payload: %v%s\n", colorRed, err, colorReset)
+		// Reject oversized messages before parsing — a normal command payload is
+		// well under 1 KB; 64 KB is a generous cap that rules out memory exhaustion
+		// from malformed or unexpectedly large Pub/Sub messages.
+		const maxMessageSize = 64 * 1024 // 64 KB
+		if len(m.Data) > maxMessageSize {
+			fmt.Printf("%s[aiexpedite] Oversized message rejected (%d bytes)%s\n",
+				colorRed, len(m.Data), colorReset)
+			m.Ack() // Ack so it isn't redelivered forever
+			return
+		}
+
+		// Parse command silently (verbose logging removed in v0.4.12)
+		var cmd commandMsg
+		if err := json.Unmarshal(m.Data, &cmd); err != nil {
+			fmt.Printf("%s[aiexpedite] Bad command payload: %v%s\n", colorRed, err, colorReset)
+			m.Nack()
+			return
+		}
+
+		// ─── Priority Ping Handler ───────────────────────────────────────
+		// Process pings BEFORE staleness/rate-limit/signature checks so that
+		// online-status pings are never delayed by a backlog of stale commands
+		// in the Pub/Sub queue.
+		if cmd.Command == "__ping__" {
+			res := resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				AgentID:     cmd.AgentID,
+				Output:      "pong",
+				Status:      "success",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+			}
+			if err := publishMsg(ctx, topic, res); err != nil {
+				fmt.Printf("%s[aiexpedite] Ping publish error: %v%s\n", colorRed, err, colorReset)
+			}
+			m.Ack()
+			return
+		}
+		// ─────────────────────────────────────────────────────────────────
+
+		// ─── Command Staleness Check ──────────────────────────────────────
+		// Reject commands older than maxCommandAgeSec to prevent processing
+		// stale queued commands when terminal reconnects after being offline
+		if isCommandStale(cmd.Ts) {
+			ageSec := (time.Now().UnixMilli() - cmd.Ts) / 1000
+			fmt.Printf("%s[aiexpedite] Stale command rejected (age: %ds, max: %ds)%s\n",
+				colorYellow, ageSec, maxCommandAgeSec, colorReset)
+
+			// Send stale response back to user
+			res := resultMsg{
+				ID:              cmd.ID,
+				WorkspaceID:     cmd.WorkspaceID,
+				UID:             cmd.UID,
+				AgentID:         cfg.AgentID,
+				Output:          fmt.Sprintf("Command rejected: too old (%d seconds, max %d seconds). Terminal may have been offline.", ageSec, maxCommandAgeSec),
+				Status:          "stale",
+				Ts:              time.Now().UnixMilli(),
+				Version:         Version,
+				RejectionReason: "STALE",
+			}
+			// Include session metadata so the backend can update the session document
+			if cmd.Type != "" && cmd.SessionID != "" {
+				res.Type = "session_error"
+				res.SessionID = cmd.SessionID
+			}
+			if err := publishMsg(ctx, topic, res); err != nil {
 				m.Nack()
-				return
+			} else {
+				m.Ack()
 			}
+			return
+		}
+		// ─────────────────────────────────────────────────────────────────
 
-			// ─── Priority Ping Handler ───────────────────────────────────────
-			// Process pings BEFORE staleness/rate-limit/signature checks so that
-			// online-status pings are never delayed by a backlog of stale commands
-			// in the Pub/Sub queue.
-			if cmd.Command == "__ping__" {
-				res := resultMsg{
-					ID:          cmd.ID,
-					WorkspaceID: cmd.WorkspaceID,
-					UID:         cmd.UID,
-					AgentID:     cmd.AgentID,
-					Output:      "pong",
-					Status:      "success",
-					Ts:          time.Now().UnixMilli(),
-					Version:     Version,
-				}
-				if err := publishMsg(ctx, topic, res); err != nil {
-					fmt.Printf("%s[aiexpedite] Ping publish error: %v%s\n", colorRed, err, colorReset)
-				}
+		// ─── Per-UID Rate Limiting ─────────────────────────────────────────
+		if !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
+			fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
+
+			// Send rate_limited response back to user for immediate feedback
+			res := resultMsg{
+				ID:              cmd.ID,
+				WorkspaceID:     cmd.WorkspaceID,
+				UID:             cmd.UID,
+				AgentID:         cfg.AgentID,
+				Output:          "Command rate limit exceeded. Please wait before retrying.",
+				Status:          "rate_limited",
+				Ts:              time.Now().UnixMilli(),
+				Version:         Version,
+				RejectionReason: "RATE_LIMITED",
+			}
+			// Include session metadata so the backend can update the session document
+			if cmd.Type != "" && cmd.SessionID != "" {
+				res.Type = "session_error"
+				res.SessionID = cmd.SessionID
+			}
+			if err := publishMsg(ctx, topic, res); err != nil {
+				m.Nack()
+			} else {
+				m.Ack()
+			}
+			return
+		}
+		// ─────────────────────────────────────────────────────────────────
+
+		// ─── Command Signature Verification ──────────────────────────────
+		// If agent has a secret configured, ALL commands MUST be signed (strict mode)
+		if cfg.CommandSecret != "" {
+			// Check if command is targeted at this agent.
+			// With per-agent subscriptions this should rarely happen — silently ack
+			// instead of publishing a competing "unauthorized" result that races
+			// with the correct agent's response.
+			if cmd.AgentID != "" && cmd.AgentID != cfg.AgentID {
+				fmt.Printf("%s[aiexpedite] Ignoring command for different agent (got %s, I am %s)%s\n",
+					colorYellow, cmd.AgentID, cfg.AgentID, colorReset)
 				m.Ack()
 				return
 			}
-			// ─────────────────────────────────────────────────────────────────
 
-			// ─── Command Staleness Check ──────────────────────────────────────
-			// Reject commands older than maxCommandAgeSec to prevent processing
-			// stale queued commands when terminal reconnects after being offline
-			if isCommandStale(cmd.Ts) {
-				ageSec := (time.Now().UnixMilli() - cmd.Ts) / 1000
-				fmt.Printf("%s[aiexpedite] Stale command rejected (age: %ds, max: %ds)%s\n",
-					colorYellow, ageSec, maxCommandAgeSec, colorReset)
-
-				// Send stale response back to user
+			// Verify signature (strict mode - no signature = reject)
+			if cmd.Signature == "" {
+				fmt.Printf("%s[aiexpedite] Command missing signature%s\n", colorRed, colorReset)
+				if isSigFailRateLimited() {
+					fmt.Printf("%s[aiexpedite] Rate-limiting unauthorized responses%s\n", colorYellow, colorReset)
+					m.Ack()
+					return
+				}
 				res := resultMsg{
 					ID:              cmd.ID,
 					WorkspaceID:     cmd.WorkspaceID,
 					UID:             cmd.UID,
 					AgentID:         cfg.AgentID,
-					Output:          fmt.Sprintf("Command rejected: too old (%d seconds, max %d seconds). Terminal may have been offline.", ageSec, maxCommandAgeSec),
-					Status:          "stale",
+					Output:          "Command rejected: signature required but not provided",
+					Status:          "unauthorized",
 					Ts:              time.Now().UnixMilli(),
 					Version:         Version,
-					RejectionReason: "STALE",
+					RejectionReason: "UNAUTHORIZED",
 				}
-					// Include session metadata so the backend can update the session document
-					if cmd.Type != "" && cmd.SessionID != "" {
-						res.Type = "session_error"
-						res.SessionID = cmd.SessionID
-					}
+				// Include session metadata so the backend can update the session document
+				if cmd.Type != "" && cmd.SessionID != "" {
+					res.Type = "session_error"
+					res.SessionID = cmd.SessionID
+				}
 				if err := publishMsg(ctx, topic, res); err != nil {
 					m.Nack()
 				} else {
@@ -746,29 +832,30 @@ func runPubSubConnection(cfg *Config) error {
 				}
 				return
 			}
-			// ─────────────────────────────────────────────────────────────────
 
-			// ─── Per-UID Rate Limiting ─────────────────────────────────────────
-			if !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
-				fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
-
-				// Send rate_limited response back to user for immediate feedback
+			if !verifySignature(cmd, cfg.CommandSecret) {
+				fmt.Printf("%s[aiexpedite] Invalid command signature%s\n", colorRed, colorReset)
+				if isSigFailRateLimited() {
+					fmt.Printf("%s[aiexpedite] Rate-limiting unauthorized responses%s\n", colorYellow, colorReset)
+					m.Ack()
+					return
+				}
 				res := resultMsg{
 					ID:              cmd.ID,
 					WorkspaceID:     cmd.WorkspaceID,
 					UID:             cmd.UID,
 					AgentID:         cfg.AgentID,
-					Output:          "Command rate limit exceeded. Please wait before retrying.",
-					Status:          "rate_limited",
+					Output:          "Command rejected: invalid signature",
+					Status:          "unauthorized",
 					Ts:              time.Now().UnixMilli(),
 					Version:         Version,
-					RejectionReason: "RATE_LIMITED",
+					RejectionReason: "UNAUTHORIZED",
 				}
-					// Include session metadata so the backend can update the session document
-					if cmd.Type != "" && cmd.SessionID != "" {
-						res.Type = "session_error"
-						res.SessionID = cmd.SessionID
-					}
+				// Include session metadata so the backend can update the session document
+				if cmd.Type != "" && cmd.SessionID != "" {
+					res.Type = "session_error"
+					res.SessionID = cmd.SessionID
+				}
 				if err := publishMsg(ctx, topic, res); err != nil {
 					m.Nack()
 				} else {
@@ -776,160 +863,26 @@ func runPubSubConnection(cfg *Config) error {
 				}
 				return
 			}
-			// ─────────────────────────────────────────────────────────────────
+			// Signature verified - proceed silently
+		}
+		// ─────────────────────────────────────────────────────────────────
 
-			// ─── Command Signature Verification ──────────────────────────────
-			// If agent has a secret configured, ALL commands MUST be signed (strict mode)
-			if cfg.CommandSecret != "" {
-				// Check if command is targeted at this agent.
-				// With per-agent subscriptions this should rarely happen — silently ack
-				// instead of publishing a competing "unauthorized" result that races
-				// with the correct agent's response.
-				if cmd.AgentID != "" && cmd.AgentID != cfg.AgentID {
-					fmt.Printf("%s[aiexpedite] Ignoring command for different agent (got %s, I am %s)%s\n",
-						colorYellow, cmd.AgentID, cfg.AgentID, colorReset)
-					m.Ack()
-					return
-				}
-
-				// Verify signature (strict mode - no signature = reject)
-				if cmd.Signature == "" {
-					fmt.Printf("%s[aiexpedite] Command missing signature%s\n", colorRed, colorReset)
-					if isSigFailRateLimited() {
-						fmt.Printf("%s[aiexpedite] Rate-limiting unauthorized responses%s\n", colorYellow, colorReset)
-						m.Ack()
-						return
-					}
-					res := resultMsg{
-						ID:              cmd.ID,
-						WorkspaceID:     cmd.WorkspaceID,
-						UID:             cmd.UID,
-						AgentID:         cfg.AgentID,
-						Output:          "Command rejected: signature required but not provided",
-						Status:          "unauthorized",
-						Ts:              time.Now().UnixMilli(),
-						Version:         Version,
-						RejectionReason: "UNAUTHORIZED",
-					}
-						// Include session metadata so the backend can update the session document
-						if cmd.Type != "" && cmd.SessionID != "" {
-							res.Type = "session_error"
-							res.SessionID = cmd.SessionID
-						}
-					if err := publishMsg(ctx, topic, res); err != nil {
-						m.Nack()
-					} else {
-						m.Ack()
-					}
-					return
-				}
-
-				if !verifySignature(cmd, cfg.CommandSecret) {
-					fmt.Printf("%s[aiexpedite] Invalid command signature%s\n", colorRed, colorReset)
-					if isSigFailRateLimited() {
-						fmt.Printf("%s[aiexpedite] Rate-limiting unauthorized responses%s\n", colorYellow, colorReset)
-						m.Ack()
-						return
-					}
-					res := resultMsg{
-						ID:              cmd.ID,
-						WorkspaceID:     cmd.WorkspaceID,
-						UID:             cmd.UID,
-						AgentID:         cfg.AgentID,
-						Output:          "Command rejected: invalid signature",
-						Status:          "unauthorized",
-						Ts:              time.Now().UnixMilli(),
-						Version:         Version,
-						RejectionReason: "UNAUTHORIZED",
-					}
-						// Include session metadata so the backend can update the session document
-						if cmd.Type != "" && cmd.SessionID != "" {
-							res.Type = "session_error"
-							res.SessionID = cmd.SessionID
-						}
-					if err := publishMsg(ctx, topic, res); err != nil {
-						m.Nack()
-					} else {
-						m.Ack()
-					}
-					return
-				}
-				// Signature verified - proceed silently
-			}
-			// ─────────────────────────────────────────────────────────────────
-
-			// ─── Interactive Session Routing ─────────────────────────────────
-			// Route session_* commands to the SessionManager instead of shell execution
-			if cmd.Type != "" && cmd.Type != "execute" {
-				// Apply allowlist to session_start (same rules as execute commands)
-				if cmd.Type == "session_start" && cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
-					timeoutSec := cfg.ApprovalTimeoutSec
-					if timeoutSec <= 0 {
-						timeoutSec = 60
-					}
-					result := ShowCommandApprovalDialog(cmd.Command, cmd.Args, timeoutSec)
-					if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
-						result = ApprovalOnce
-					}
-					switch result {
-					case ApprovalDeny:
-						fmt.Printf("%s[aiexpedite] Session command denied by user%s\n", colorYellow, colorReset)
-						res := resultMsg{
-							ID:              cmd.ID,
-							WorkspaceID:     cmd.WorkspaceID,
-							UID:             cmd.UID,
-							AgentID:         cfg.AgentID,
-							Output:          "Command denied by user: not in allow list",
-							Status:          "denied",
-							Ts:              time.Now().UnixMilli(),
-							Version:         Version,
-							Cwd:             getTrackedCwd(),
-							RejectionReason: "ALLOWLIST_DENIED",
-							Type:            "session_error",
-							SessionID:       cmd.SessionID,
-						}
-						if err := publishMsg(ctx, topic, res); err != nil {
-							m.Nack()
-						} else {
-							m.Ack()
-						}
-						return
-					case ApprovalAlways:
-						pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
-						if err := defaultAllowList.AddPattern(pattern); err != nil {
-							fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
-						}
-					}
-				}
-				handleSessionCommand(ctx, topic, cmd)
-				m.Ack()
-				return
-			}
-			// ─────────────────────────────────────────────────────────────────
-
-			// ─── Command Allow List Validation ───────────────────────────────
-			if cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
-				// Command not in allow list - show approval dialog
-
-				// Get timeout settings from config
+		// ─── Interactive Session Routing ─────────────────────────────────
+		// Route session_* commands to the SessionManager instead of shell execution
+		if cmd.Type != "" && cmd.Type != "execute" {
+			// Apply allowlist to session_start (same rules as execute commands)
+			if cmd.Type == "session_start" && cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
 				timeoutSec := cfg.ApprovalTimeoutSec
 				if timeoutSec <= 0 {
 					timeoutSec = 60
 				}
-
-				// Show approval dialog
 				result := ShowCommandApprovalDialog(cmd.Command, cmd.Args, timeoutSec)
-
-				// Handle timeout based on config
 				if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
 					result = ApprovalOnce
 				}
-
 				switch result {
 				case ApprovalDeny:
-					fmt.Printf("%s[aiexpedite] Command denied by user%s\n", colorYellow, colorReset)
-
-					// Send denial result back to backend
+					fmt.Printf("%s[aiexpedite] Session command denied by user%s\n", colorYellow, colorReset)
 					res := resultMsg{
 						ID:              cmd.ID,
 						WorkspaceID:     cmd.WorkspaceID,
@@ -941,6 +894,8 @@ func runPubSubConnection(cfg *Config) error {
 						Version:         Version,
 						Cwd:             getTrackedCwd(),
 						RejectionReason: "ALLOWLIST_DENIED",
+						Type:            "session_error",
+						SessionID:       cmd.SessionID,
 					}
 					if err := publishMsg(ctx, topic, res); err != nil {
 						m.Nack()
@@ -948,168 +903,222 @@ func runPubSubConnection(cfg *Config) error {
 						m.Ack()
 					}
 					return
-
 				case ApprovalAlways:
 					pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
 					if err := defaultAllowList.AddPattern(pattern); err != nil {
 						fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
 					}
-					// Fall through to execute
-
-				case ApprovalOnce:
-					// User approved - proceed silently
 				}
 			}
-			// ─────────────────────────────────────────────────────────────────
+			handleSessionCommand(ctx, topic, cmd)
+			m.Ack()
+			return
+		}
+		// ─────────────────────────────────────────────────────────────────
 
-			// Display decoded command in green with ">" prefix
-			cmdDisplay := cmd.Command
-			if len(cmd.Args) > 0 {
-				cmdDisplay += " " + strings.Join(cmd.Args, " ")
+		// ─── Command Allow List Validation ───────────────────────────────
+		if cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
+			// Command not in allow list - show approval dialog
+
+			// Get timeout settings from config
+			timeoutSec := cfg.ApprovalTimeoutSec
+			if timeoutSec <= 0 {
+				timeoutSec = 60
 			}
-			// Decode Base64-encoded PowerShell commands for readability
-			if strings.ToLower(cmd.Command) == "powershell" && len(cmd.Args) >= 2 {
-				if strings.ToLower(cmd.Args[0]) == "-encodedcommand" {
-					cmdDisplay = decodeBase64PowerShell(cmd.Args[1])
+
+			// Show approval dialog
+			result := ShowCommandApprovalDialog(cmd.Command, cmd.Args, timeoutSec)
+
+			// Handle timeout based on config
+			if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
+				result = ApprovalOnce
+			}
+
+			switch result {
+			case ApprovalDeny:
+				fmt.Printf("%s[aiexpedite] Command denied by user%s\n", colorYellow, colorReset)
+
+				// Send denial result back to backend
+				res := resultMsg{
+					ID:              cmd.ID,
+					WorkspaceID:     cmd.WorkspaceID,
+					UID:             cmd.UID,
+					AgentID:         cfg.AgentID,
+					Output:          "Command denied by user: not in allow list",
+					Status:          "denied",
+					Ts:              time.Now().UnixMilli(),
+					Version:         Version,
+					Cwd:             getTrackedCwd(),
+					RejectionReason: "ALLOWLIST_DENIED",
 				}
-			}
-			// Always redact sensitive data before printing — debug mode shows more
-			// detail but still must not leak credentials to the console.
-			fmt.Printf("%s> %s%s\n", colorGreen, redactSensitiveData(cmdDisplay), colorReset)
-
-			// Debug mode: show raw command details (redacted)
-			if cfg.DebugMode {
-				redactedArgs := make([]string, len(cmd.Args))
-				for i, a := range cmd.Args {
-					redactedArgs[i] = redactSensitiveData(a)
+				if err := publishMsg(ctx, topic, res); err != nil {
+					m.Nack()
+				} else {
+					m.Ack()
 				}
-				fmt.Printf("%s[DEBUG] Raw command: %s%s\n", colorMagenta, redactSensitiveData(cmd.Command), colorReset)
-				fmt.Printf("%s[DEBUG] Args: %v%s\n", colorMagenta, redactedArgs, colorReset)
-				fmt.Printf("%s[DEBUG] Cwd: %s%s\n", colorMagenta, cmd.Cwd, colorReset)
-			}
+				return
 
-			// Execute command (silently - no internal logs)
-			out, execErr := runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
-
-			// Debug mode: show raw output details (redacted)
-			if cfg.DebugMode {
-				fmt.Printf("%s[DEBUG] Output length: %d bytes%s\n", colorMagenta, len(out), colorReset)
-				fmt.Printf("%s[DEBUG] Error: %v%s\n", colorMagenta, execErr, colorReset)
-				// Show raw output with visible control characters (redacted)
-				fmt.Printf("%s[DEBUG] Raw output (quoted): %q%s\n", colorMagenta, redactSensitiveData(out), colorReset)
-			}
-
-			// Show output or terminal error — always redact before printing to
-			// the local console so that credentials in error messages (e.g. a
-			// failed psql connection string) are never written to the screen.
-			if execErr != nil {
-				fmt.Printf("%s%s%s\n", colorRed, redactSensitiveData(execErr.Error()), colorReset)
-				if out != "" {
-					fmt.Println(redactSensitiveData(out))
+			case ApprovalAlways:
+				pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
+				if err := defaultAllowList.AddPattern(pattern); err != nil {
+					fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
 				}
-			} else if out != "" {
+				// Fall through to execute
+
+			case ApprovalOnce:
+				// User approved - proceed silently
+			}
+		}
+		// ─────────────────────────────────────────────────────────────────
+
+		// Display decoded command in green with ">" prefix
+		cmdDisplay := cmd.Command
+		if len(cmd.Args) > 0 {
+			cmdDisplay += " " + strings.Join(cmd.Args, " ")
+		}
+		// Decode Base64-encoded PowerShell commands for readability
+		if strings.ToLower(cmd.Command) == "powershell" && len(cmd.Args) >= 2 {
+			if strings.ToLower(cmd.Args[0]) == "-encodedcommand" {
+				cmdDisplay = decodeBase64PowerShell(cmd.Args[1])
+			}
+		}
+		// Always redact sensitive data before printing — debug mode shows more
+		// detail but still must not leak credentials to the console.
+		fmt.Printf("%s> %s%s\n", colorGreen, redactSensitiveData(cmdDisplay), colorReset)
+
+		// Debug mode: show raw command details (redacted)
+		if cfg.DebugMode {
+			redactedArgs := make([]string, len(cmd.Args))
+			for i, a := range cmd.Args {
+				redactedArgs[i] = redactSensitiveData(a)
+			}
+			fmt.Printf("%s[DEBUG] Raw command: %s%s\n", colorMagenta, redactSensitiveData(cmd.Command), colorReset)
+			fmt.Printf("%s[DEBUG] Args: %v%s\n", colorMagenta, redactedArgs, colorReset)
+			fmt.Printf("%s[DEBUG] Cwd: %s%s\n", colorMagenta, cmd.Cwd, colorReset)
+		}
+
+		// Execute command (silently - no internal logs)
+		out, execErr := runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
+
+		// Debug mode: show raw output details (redacted)
+		if cfg.DebugMode {
+			fmt.Printf("%s[DEBUG] Output length: %d bytes%s\n", colorMagenta, len(out), colorReset)
+			fmt.Printf("%s[DEBUG] Error: %v%s\n", colorMagenta, execErr, colorReset)
+			// Show raw output with visible control characters (redacted)
+			fmt.Printf("%s[DEBUG] Raw output (quoted): %q%s\n", colorMagenta, redactSensitiveData(out), colorReset)
+		}
+
+		// Show output or terminal error — always redact before printing to
+		// the local console so that credentials in error messages (e.g. a
+		// failed psql connection string) are never written to the screen.
+		if execErr != nil {
+			fmt.Printf("%s%s%s\n", colorRed, redactSensitiveData(execErr.Error()), colorReset)
+			if out != "" {
 				fmt.Println(redactSensitiveData(out))
 			}
+		} else if out != "" {
+			fmt.Println(redactSensitiveData(out))
+		}
 
-			// Redact sensitive data from output before publishing to Pub/Sub
-			redactedOut := redactSensitiveData(out)
+		// Redact sensitive data from output before publishing to Pub/Sub
+		redactedOut := redactSensitiveData(out)
 
-			res := resultMsg{
-				ID:          cmd.ID,
-				WorkspaceID: cmd.WorkspaceID,
-				UID:         cmd.UID,
-				Output:      redactedOut,
-				Status:      "success",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Cwd:         getTrackedCwd(),
+		res := resultMsg{
+			ID:          cmd.ID,
+			WorkspaceID: cmd.WorkspaceID,
+			UID:         cmd.UID,
+			Output:      redactedOut,
+			Status:      "success",
+			Ts:          time.Now().UnixMilli(),
+			Version:     Version,
+			Cwd:         getTrackedCwd(),
+		}
+		if execErr != nil {
+			res.Status = "error"
+			res.Output = redactSensitiveData(execErr.Error()) + "\n" + redactedOut
+		}
+
+		// File upload integration
+		if cfg.EnableFileUpload && res.Status != "error" {
+			effectiveDir := getTrackedCwd()
+			if effectiveDir == "" {
+				effectiveDir = cmd.Cwd
 			}
-			if execErr != nil {
-				res.Status = "error"
-				res.Output = redactSensitiveData(execErr.Error()) + "\n" + redactedOut
+			if effectiveDir == "" && cfg != nil {
+				effectiveDir = cfg.WorkingDirectory
 			}
+			files := detectOutputFiles(cmd.Command, out, effectiveDir)
+			if len(files) > 0 {
+				// Security: Block file upload if workspaceID is missing
+				workspaceID := extractWorkspaceID(cmd)
+				if workspaceID == "" {
+					fmt.Println("[file-upload] BLOCKED - no workspaceID provided (security: refusing to upload to default bucket)")
+				} else {
+					fmt.Printf("[file-upload] Detected %d output files, uploading to GCS (workspace: %s)...\n", len(files), workspaceID)
 
-			// File upload integration
-			if cfg.EnableFileUpload && res.Status != "error" {
-				effectiveDir := getTrackedCwd()
-				if effectiveDir == "" {
-					effectiveDir = cmd.Cwd
-				}
-				if effectiveDir == "" && cfg != nil {
-					effectiveDir = cfg.WorkingDirectory
-				}
-				files := detectOutputFiles(cmd.Command, out, effectiveDir)
-				if len(files) > 0 {
-					// Security: Block file upload if workspaceID is missing
-					workspaceID := extractWorkspaceID(cmd)
-					if workspaceID == "" {
-						fmt.Println("[file-upload] BLOCKED - no workspaceID provided (security: refusing to upload to default bucket)")
+					// Get reusable GCS client (much faster than creating per command)
+					// Use a background context for uploads: the message handler ctx may be
+					// cancelled mid-upload by the Pub/Sub library if acknowledgement takes
+					// too long, which would silently abort the transfer.
+					uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+					// Explicit call rather than defer: defer inside the sub.Receive
+					// callback goroutine would not fire until the receive loop exits,
+					// leaking the context for the entire Pub/Sub connection lifetime.
+					storageClient, storageErr := GetStorageClient(uploadCtx)
+					if storageErr != nil {
+						uploadCancel()
+						fmt.Printf("[file-upload] Failed to get storage client: %v\n", storageErr)
 					} else {
-						fmt.Printf("[file-upload] Detected %d output files, uploading to GCS (workspace: %s)...\n", len(files), workspaceID)
+						// Don't close - client is reused globally
 
-						// Get reusable GCS client (much faster than creating per command)
-						// Use a background context for uploads: the message handler ctx may be
-						// cancelled mid-upload by the Pub/Sub library if acknowledgement takes
-						// too long, which would silently abort the transfer.
-						uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-						// Explicit call rather than defer: defer inside the sub.Receive
-						// callback goroutine would not fire until the receive loop exits,
-						// leaking the context for the entire Pub/Sub connection lifetime.
-						storageClient, storageErr := GetStorageClient(uploadCtx)
-						if storageErr != nil {
-							uploadCancel()
-							fmt.Printf("[file-upload] Failed to get storage client: %v\n", storageErr)
-						} else {
-							// Don't close - client is reused globally
+						// Create logger
+						logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-							// Create logger
-							logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+						// Upload files
+						uploadResult := UploadFiles(
+							uploadCtx,
+							storageClient,
+							cfg.StorageBucket,
+							files,
+							workspaceID,
+							cmd.ID,
+							logger,
+						)
+						uploadCancel()
 
-							// Upload files
-							uploadResult := UploadFiles(
-								uploadCtx,
-								storageClient,
-								cfg.StorageBucket,
-								files,
-								workspaceID,
-								cmd.ID,
-								logger,
-							)
-							uploadCancel()
+						res.Files = uploadResult.Successful
+						res.UploadErrors = uploadResult.Failed
 
-							res.Files = uploadResult.Successful
-							res.UploadErrors = uploadResult.Failed
+						if len(uploadResult.Failed) > 0 && len(uploadResult.Successful) > 0 {
+							res.Status = "partial"
+						} else if len(uploadResult.Failed) > 0 && len(uploadResult.Successful) == 0 {
+							res.Status = "error"
+							res.Output += fmt.Sprintf("\n[file-upload] All file uploads failed: %d errors", len(uploadResult.Failed))
+						}
 
-							if len(uploadResult.Failed) > 0 && len(uploadResult.Successful) > 0 {
-								res.Status = "partial"
-							} else if len(uploadResult.Failed) > 0 && len(uploadResult.Successful) == 0 {
-								res.Status = "error"
-								res.Output += fmt.Sprintf("\n[file-upload] All file uploads failed: %d errors", len(uploadResult.Failed))
-							}
-
-							fmt.Printf("[file-upload] Upload complete: %d successful, %d failed\n",
-								len(uploadResult.Successful), len(uploadResult.Failed))
-							for _, ue := range uploadResult.Failed {
-								fmt.Printf("[file-upload] FAILED: %s - %s\n", ue.File, ue.Error)
-							}
+						fmt.Printf("[file-upload] Upload complete: %d successful, %d failed\n",
+							len(uploadResult.Successful), len(uploadResult.Failed))
+						for _, ue := range uploadResult.Failed {
+							fmt.Printf("[file-upload] FAILED: %s - %s\n", ue.File, ue.Error)
 						}
 					}
 				}
 			}
+		}
 
-			// Publish result using a background context to ensure delivery even during
-			// shutdown — the message handler's ctx may be cancelled before we finish.
-			// Explicit cancel (not defer): defer inside sub.Receive callback goroutines
-			// does not fire until the receive loop exits, leaking the context.
-			publishCtx, publishCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			pubErr := publishMsg(publishCtx, topic, res)
-			publishCancel()
-			if pubErr != nil {
-				// Publish failed — Nack so Pub/Sub redelivers and the agent retries.
-				m.Nack()
-				return
-			}
-			m.Ack()
+		// Publish result using a background context to ensure delivery even during
+		// shutdown — the message handler's ctx may be cancelled before we finish.
+		// Explicit cancel (not defer): defer inside sub.Receive callback goroutines
+		// does not fire until the receive loop exits, leaking the context.
+		publishCtx, publishCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		pubErr := publishMsg(publishCtx, topic, res)
+		publishCancel()
+		if pubErr != nil {
+			// Publish failed — Nack so Pub/Sub redelivers and the agent retries.
+			m.Nack()
+			return
+		}
+		m.Ack()
 	})
 
 	// Return nil on clean shutdown, error otherwise
@@ -1384,8 +1393,11 @@ func runLocalCommandUnix(cmd string, args []string, workDir string, timeout time
 	return combined.String(), err
 }
 
-/* runLocalCommand executes the command using persistent PowerShell for low latency.
-   timeoutMs controls the maximum execution time. If 0, defaults to 120 seconds. */
+/*
+runLocalCommand executes the command using persistent PowerShell for low latency.
+
+	timeoutMs controls the maximum execution time. If 0, defaults to 120 seconds.
+*/
 func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {
 	// Default timeout: 120 seconds (matches server-side default)
 	if timeoutMs <= 0 {
@@ -1789,7 +1801,8 @@ const maxUploadFiles = 50
 func appendFilesFromDir(files []string, dir string, baseDir string, extensions []string) []string {
 	// Security: Validate directory is within safe boundaries
 	if !isPathSafeUnder(dir, baseDir) {
-		fmt.Printf("[security] Blocked path traversal attempt: %s\n", dir)
+		LogSecurityEvent(SecEvtPathTraversal, "blocked directory outside base",
+			"dir", dir, "base_dir", baseDir, "site", "appendFilesFromDir.entry")
 		return files
 	}
 
@@ -1811,7 +1824,8 @@ func appendFilesFromDir(files []string, dir string, baseDir string, extensions [
 			}
 			// Security: Validate each file path as well
 			if !isPathSafeUnder(path, baseDir) {
-				fmt.Printf("[security] Blocked file path traversal: %s\n", path)
+				LogSecurityEvent(SecEvtPathTraversal, "blocked file outside base during walk",
+					"path", path, "base_dir", baseDir, "site", "appendFilesFromDir.walk")
 				return nil
 			}
 			ext := strings.ToLower(filepath.Ext(path))
