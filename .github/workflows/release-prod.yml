@@ -476,7 +476,7 @@ jobs:
           name: pending-prod-darwin-${{ matrix.goarch }}
           path: pending/
 
-      - name: Wait for notarization and staple
+      - name: Poll Apple for notarization completion + staple
         env:
           APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
           TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
@@ -485,55 +485,62 @@ jobs:
         run: |
           set -e
           mkdir -p dist
-
-          # Cleanup any lingering child processes if the job is cancelled.
           trap 'kill 0 2>/dev/null || true' EXIT
 
           SUB_ID=$(cat "pending/submission-id.txt")
           DMG=$(ls pending/*.dmg | head -1)
-          echo "[${ARCH}] Waiting for notarization (submission ${SUB_ID})"
 
-          # notarytool wait retries internal HTTP errors, but a hard crash
-          # (transient 5xx, network blip) returns non-zero. Cheap retry —
-          # a successful re-check returns near-instantly because Apple has
-          # already completed the submission.
-          # Heartbeat: while wait blocks for 30-90 min on Apple, log every 5 min
-          # so the job appears alive in the GitHub UI.
-          attempt=1
-          max_attempts=2
-          while [ $attempt -le $max_attempts ]; do
-            xcrun notarytool wait "${SUB_ID}" \
+          # See release-nonprod.yml for the full backstory on why we poll
+          # `notarytool info` instead of using `notarytool wait`. tl;dr:
+          # macOS GHA runners reliably die ~17m into a long blocking
+          # notarytool wait, losing all in-flight work.
+          echo "[${ARCH}] Polling Apple for notarization (submission ${SUB_ID})"
+
+          MAX_MINUTES=120
+          POLL_SECONDS=60
+          ELAPSED=0
+
+          while [ $ELAPSED -lt $((MAX_MINUTES * 60)) ]; do
+            INFO_OUT=$(xcrun notarytool info "${SUB_ID}" \
               --apple-id "$APPLE_ID" \
               --team-id "$TEAM_ID" \
-              --password "$APP_PASSWORD" \
-              --timeout 120m &
-            wait_pid=$!
-            elapsed=0
-            while kill -0 "$wait_pid" 2>/dev/null; do
-              sleep 30
-              elapsed=$((elapsed + 30))
-              if [ $((elapsed % 300)) -eq 0 ]; then
-                echo "[${ARCH}] heartbeat: still waiting on Apple (~$((elapsed / 60))m elapsed)"
-              fi
-            done
-            wait "$wait_pid"
-            exit_code=$?
-            if [ "$exit_code" -eq 0 ]; then
-              break
-            fi
-            if [ $attempt -lt $max_attempts ]; then
-              echo "[${ARCH}] notarytool wait attempt ${attempt} failed (exit ${exit_code}), retrying in 30s..."
-              sleep 30
-              attempt=$((attempt + 1))
-            else
-              echo "[${ARCH}] notarytool wait failed after ${max_attempts} attempts — fetching log"
-              xcrun notarytool log "${SUB_ID}" \
-                --apple-id "$APPLE_ID" \
-                --team-id "$TEAM_ID" \
-                --password "$APP_PASSWORD" || true
-              exit 1
-            fi
+              --password "$APP_PASSWORD" 2>&1) || true
+
+            STATUS=$(echo "$INFO_OUT" | awk -F': *' '/^[[:space:]]*status:/ {print $2; exit}')
+
+            case "$STATUS" in
+              Accepted)
+                echo "[${ARCH}] notarization Accepted after ~$((ELAPSED / 60))m"
+                break
+                ;;
+              Invalid|Rejected)
+                echo "[${ARCH}] notarization $STATUS — fetching developer log"
+                xcrun notarytool log "${SUB_ID}" \
+                  --apple-id "$APPLE_ID" \
+                  --team-id "$TEAM_ID" \
+                  --password "$APP_PASSWORD" || true
+                exit 1
+                ;;
+              "In Progress"|"")
+                if [ $ELAPSED -gt 0 ] && [ $((ELAPSED % 300)) -eq 0 ]; then
+                  echo "[${ARCH}] heartbeat: still in progress (~$((ELAPSED / 60))m elapsed)"
+                fi
+                sleep "$POLL_SECONDS"
+                ELAPSED=$((ELAPSED + POLL_SECONDS))
+                ;;
+              *)
+                echo "[${ARCH}] unexpected notarytool status: ${STATUS}"
+                echo "$INFO_OUT"
+                sleep "$POLL_SECONDS"
+                ELAPSED=$((ELAPSED + POLL_SECONDS))
+                ;;
+            esac
           done
+
+          if [ $ELAPSED -ge $((MAX_MINUTES * 60)) ]; then
+            echo "[${ARCH}] timeout after ${MAX_MINUTES} minutes — Apple may be backed up"
+            exit 1
+          fi
 
           echo "[${ARCH}] Stapling ${DMG}"
           xcrun stapler staple "${DMG}"
@@ -541,6 +548,7 @@ jobs:
           cp "${DMG}" "dist/$(basename "${DMG}")"
 
       - name: Upload final prod darwin DMG
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: prod-darwin-${{ matrix.goarch }}
