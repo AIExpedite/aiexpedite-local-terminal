@@ -106,6 +106,9 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 		"-NoProfile",
 		"-NoLogo",
 		"-NonInteractive",
+		// `-OutputFormat Text` prevents CLIXML error serialization on stderr
+		// for this persistent shell — see runEncodedPowerShellCommand in pubsub.go.
+		"-OutputFormat", "Text",
 		"-Command", "-", // Read commands from stdin
 	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}

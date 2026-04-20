@@ -1208,10 +1208,14 @@ func decodeBase64PowerShell(encoded string) string {
 // It captures stdout and stderr separately and filters CLIXML progress messages
 // to avoid false "exit status 1" errors when commands produce valid output.
 func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout time.Duration) (string, error) {
-	// Build PowerShell arguments
+	// `-OutputFormat Text` prevents PowerShell from serializing stderr as CLIXML
+	// (XML error records) when stderr is piped to a non-console parent process.
+	// Without it, any PowerShell error surfaces as `#< CLIXML <Objs ...>` noise
+	// that leaks past filterCLIXML and back to the user.
 	psArgs := []string{
 		"-NoProfile",
 		"-NonInteractive",
+		"-OutputFormat", "Text",
 		"-EncodedCommand",
 		encodedScript,
 	}
@@ -1335,7 +1339,9 @@ func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string,
 	defer cancel()
 
 	psExe := getFallbackPSExe() // prefers pwsh.exe when available
-	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-Command", cmdLine)
+	// `-OutputFormat Text` prevents CLIXML error serialization — see
+	// runEncodedPowerShellCommand for the full explanation.
+	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", cmdLine)
 	hideWindow(c)
 	if workDir != "" {
 		c.Dir = workDir
@@ -1602,7 +1608,9 @@ func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Durati
 	const cwdSentinel = "<<<AIX_CWD_PROBE>>>"
 	probeCmd := cmdLine + "\nWrite-Host '" + cwdSentinel + "'\n(Get-Location).Path"
 
-	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-Command", probeCmd)
+	// `-OutputFormat Text` prevents CLIXML error serialization — see
+	// runEncodedPowerShellCommand for the full explanation.
+	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", probeCmd)
 	hideWindow(c)
 	if workDir != "" {
 		c.Dir = workDir

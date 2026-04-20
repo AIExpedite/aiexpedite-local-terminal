@@ -456,6 +456,30 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	lines := make(chan streamLine, 100)
 	var wg sync.WaitGroup
 
+	// PowerShell sessions can emit CLIXML blocks on stderr when -OutputFormat Text
+	// is missing OR when the child process (e.g. a nested powershell.exe) ignores
+	// the parent's format flag. A CLIXML block spans multiple lines:
+	//   #< CLIXML
+	//   <Objs ...>...</Objs>
+	// The block must be dropped as a unit or the UI shows raw XML error records.
+	// Each stream (stdout, stderr) gets its own filter state so an unclosed block
+	// on one stream doesn't swallow lines on the other.
+	var clixmlActive [2]bool // [0]=stdout, [1]=stderr
+	skipCLIXML := func(slot int, text string) bool {
+		trimmed := strings.TrimSpace(text)
+		if clixmlActive[slot] {
+			if strings.HasPrefix(trimmed, "</Objs>") || strings.HasSuffix(trimmed, "</Objs>") {
+				clixmlActive[slot] = false
+			}
+			return true
+		}
+		if strings.HasPrefix(trimmed, "#< CLIXML") {
+			clixmlActive[slot] = true
+			return true
+		}
+		return false
+	}
+
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -466,6 +490,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		for scanner.Scan() {
 			lineCount++
 			text := scanner.Text()
+			if skipCLIXML(0, text) {
+				continue
+			}
 			if lineCount <= 3 {
 				fmt.Printf("%s[session] stdout[%d] %s: %s%s\n",
 					colorCyan, lineCount, session.ID, truncateString(text, 120), colorReset)
@@ -486,6 +513,9 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		for scanner.Scan() {
 			lineCount++
 			text := scanner.Text()
+			if skipCLIXML(1, text) {
+				continue
+			}
 			if lineCount <= 3 {
 				fmt.Printf("%s[session] stderr[%d] %s: %s%s\n",
 					colorYellow, lineCount, session.ID, truncateString(text, 120), colorReset)
