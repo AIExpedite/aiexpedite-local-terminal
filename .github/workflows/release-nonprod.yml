@@ -152,7 +152,8 @@ jobs:
         id: version
         shell: bash
         run: |
-          VERSION=$(sed -n 's/.*const Version = "v\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' agent.go)
+          VERSION=$(sed -nE 's/.*(const|var) Version = "v([0-9]+\.[0-9]+\.[0-9]+)".*/\2/p' agent.go)
+          [ -n "$VERSION" ] || { echo "version extraction from agent.go failed"; exit 1; }
           echo "VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: Set installer version
@@ -338,7 +339,8 @@ jobs:
 
       - name: Create .app bundle
         run: |
-          VERSION=$(sed -n 's/.*const Version = "v\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' agent.go)
+          VERSION=$(sed -nE 's/.*(const|var) Version = "v([0-9]+\.[0-9]+\.[0-9]+)".*/\2/p' agent.go)
+          [ -n "$VERSION" ] || { echo "version extraction from agent.go failed"; exit 1; }
 
           APP="dmg-staging/AIExpediteTerminal.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -898,7 +900,8 @@ jobs:
       - name: Extract version from agent.go
         id: version
         run: |
-          VERSION=$(grep -oP 'const Version = "v\K[0-9]+\.[0-9]+\.[0-9]+' agent.go)
+          VERSION=$(grep -oP '(const|var) Version = "v\K[0-9]+\.[0-9]+\.[0-9]+' agent.go)
+          [ -n "$VERSION" ] || { echo "version extraction from agent.go failed"; exit 1; }
           echo "version=v${VERSION}" >> $GITHUB_OUTPUT
 
       - name: Delete existing dev release and recreate tag
