@@ -22,13 +22,13 @@ import (
 // Declared as `var` (not `const`) so the prod release workflow can override
 // it via:
 //
-//	go build -ldflags "-X main.Version=v0.8.4" .
+//	go build -ldflags "-X main.Version=v0.8.5" .
 //
 // The Go linker can only patch package-level vars, never consts (consts are
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v0.8.4"
+var Version = "v0.8.5"
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
