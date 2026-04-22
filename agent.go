@@ -63,11 +63,23 @@ func IsSystrayReady() bool {
 	return systrayReady
 }
 
-// SetOffline enables or disables offline mode, signaling the Pub/Sub loop
-func SetOffline(offline bool) {
+// SetOffline enables or disables offline mode, signaling the Pub/Sub loop.
+// When a *Config is provided, the new OfflineMode is persisted so the toggle
+// survives app restarts. Passing nil is supported for callers that cannot
+// reach the live config (tests).
+func SetOffline(offline bool, cfg ...*Config) {
 	offlineMutex.Lock()
 	isOffline = offline
 	offlineMutex.Unlock()
+
+	// Persist across restarts so the user's explicit disconnect choice
+	// survives a reboot / auto-update / crash recovery.
+	if len(cfg) > 0 && cfg[0] != nil {
+		cfg[0].OfflineMode = offline
+		if err := cfg[0].Save(ConfigPath()); err != nil {
+			fmt.Printf("%s[offline] Failed to save offline state: %v%s\n", colorYellow, err, colorReset)
+		}
+	}
 
 	// Non-blocking send to signal the change.
 	// Drain any stale value first, then attempt to send — all non-blocking so
@@ -139,6 +151,12 @@ func GetUpdateReady() (path string, pending bool) {
 func StartAgent(cfg *Config) {
 	/* 0. Initialize storage config for WIF authentication ----------------- */
 	SetStorageConfig(cfg)
+
+	// Restore persisted offline state so the cloud connection respects the
+	// user's last "Disconnect from cloud" toggle across restarts.
+	offlineMutex.Lock()
+	isOffline = cfg.OfflineMode
+	offlineMutex.Unlock()
 
 	/* 1. Ensure prerequisites (tmux + ttyd) exist ------------------------- */
 

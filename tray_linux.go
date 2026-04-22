@@ -8,12 +8,34 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/getlantern/systray"
 )
 
 // Embed the icon (PNG format) for Linux tray icon (if supported).
 //
 //go:embed assets/icon.png
 var iconData []byte
+
+//go:embed assets/icon-disconnected.png
+var iconDataDisconnected []byte
+
+// applyStandardTrayIcon restores the normal tray icon on reconnect.
+func applyStandardTrayIcon() {
+	if !IsSystrayReady() {
+		return
+	}
+	systray.SetIcon(iconData)
+}
+
+// applyDisconnectedTrayIcon swaps the tray icon to the "disconnected" variant
+// so users can see the agent is offline at a glance.
+func applyDisconnectedTrayIcon() {
+	if !IsSystrayReady() {
+		return
+	}
+	systray.SetIcon(iconDataDisconnected)
+}
 
 // Channel to notify main.go when console visibility changes (no-op on Linux, but needed for compilation)
 var ConsoleHiddenChan = make(chan bool, 1)

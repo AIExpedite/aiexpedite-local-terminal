@@ -10,10 +10,35 @@ import (
 	"os/exec"
 	"path/filepath"
 	"text/template"
+
+	"github.com/getlantern/systray"
 )
 
 //go:embed assets/icon.png
 var iconData []byte
+
+//go:embed assets/icon-disconnected.png
+var iconDataDisconnected []byte
+
+// applyStandardTrayIcon swaps the tray icon back to the normal template icon
+// after the user toggles "Reconnect to cloud" from the tray menu.
+func applyStandardTrayIcon() {
+	if !IsSystrayReady() {
+		return
+	}
+	systray.SetTemplateIcon(iconData, iconData)
+}
+
+// applyDisconnectedTrayIcon swaps the tray icon to the "disconnected" variant
+// (with a red/grey dot overlay) so the offline state is visible at a glance.
+// The disconnected PNG is NOT a template icon — we want the red overlay to
+// stay red instead of being auto-inverted by macOS.
+func applyDisconnectedTrayIcon() {
+	if !IsSystrayReady() {
+		return
+	}
+	systray.SetIcon(iconDataDisconnected)
+}
 
 // When launched by launchd or Finder, a GUI app inherits a minimal PATH
 // (typically /usr/bin:/bin:/usr/sbin:/sbin) that excludes the common tool

@@ -63,6 +63,12 @@ type Config struct {
 
 	/* ─── Debug Mode ─────────────────────────────────── */
 	DebugMode bool `json:"debug_mode,omitempty"` // Show detailed command/response info
+
+	/* ─── Offline Mode ───────────────────────────────── */
+	// OfflineMode persists the user's "Disconnect from cloud" toggle across
+	// restarts. When true, StartAgent bypasses the Pub/Sub loop so the agent
+	// stays local-only until the user reconnects from the tray menu.
+	OfflineMode bool `json:"offline_mode,omitempty"`
 }
 
 /* -------------------------------------------------------------------------- */
@@ -137,6 +143,9 @@ func DefaultConfig() *Config {
 		MaxOutstandingMessages: 5,  // Process 5 messages in parallel
 		RateLimitPerSecond:     10, // 10 commands/second per user
 		RateLimitBurst:         20, // Burst of 20
+
+		// Offline mode defaults to false (connected to cloud)
+		OfflineMode: false,
 	}
 }
 
