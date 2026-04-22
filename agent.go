@@ -28,7 +28,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v0.8.7"
+var Version = "v0.8.6"
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -235,7 +235,14 @@ func StartAgent(cfg *Config) {
 
 	/* 4. Start Pub/Sub loop (non‑blocking) -------------------------------- */
 
-	go StartPubSubLoop(cfg)
+	// If the user disconnected from cloud in a previous session, skip the
+	// Pub/Sub loop entirely on boot. The tray "Reconnect to cloud" handler
+	// will start it explicitly when the user comes back online.
+	if cfg.OfflineMode {
+		fmt.Println("[agent] Offline mode persisted — skipping StartPubSubLoop until user reconnects")
+	} else {
+		go StartPubSubLoop(cfg)
+	}
 
 	/* 4b. Start orphan-process scanner (kills detached CLI agents) -------- */
 
