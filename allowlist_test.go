@@ -4,7 +4,10 @@
 // errs on the side of being thorough.
 package main
 
-import "testing"
+import (
+	"regexp"
+	"testing"
+)
 
 func TestPatternToRegex_BasicGlobs(t *testing.T) {
 	cases := []struct {
@@ -58,6 +61,12 @@ func TestPatternToRegex_NewlineInjectionBlocked(t *testing.T) {
 	// This is the M1 finding: the previous regex used `[\s\S]*` which would
 	// match across newlines. A remote message could ship "git status\n; rm -rf ~"
 	// and slip past a `git *` allowlist entry. The fix uses `[^\n]*`.
+	//
+	// Note: IsAllowed() now normalizes newlines to spaces *before* running
+	// this regex, so the allowlist itself no longer blocks newline injection.
+	// That defense now lives in pubsub.go's shell-quoting layer. The regex
+	// still rejects literal newlines as a belt-and-suspenders property of the
+	// pattern-matching primitive.
 	re := patternToRegex("git *")
 	cases := []string{
 		"git status\nrm -rf /",
@@ -69,6 +78,66 @@ func TestPatternToRegex_NewlineInjectionBlocked(t *testing.T) {
 			t.Errorf("BUG: newline injection through allowlist: input=%q matched %s",
 				input, re.String())
 		}
+	}
+}
+
+func TestIsAllowed_MultiLinePromptArgsAccepted(t *testing.T) {
+	// Regression: CLI coding agents (claude/codex/gemini) are invoked with
+	// large multi-line prompts as positional args. Before the newline
+	// normalization in IsAllowed, these were rejected because the joined
+	// match string "claude <prompt with \n>" failed `^claude [^\n]*$`, which
+	// silently bounced every agent run to the approval dialog and timed out
+	// after 60s with "Command denied by user: not in allow list".
+	al := &AllowList{
+		patterns: []string{"claude *", "codex *", "gemini *"},
+		compiled: []*regexp.Regexp{
+			patternToRegex("claude *"),
+			patternToRegex("codex *"),
+			patternToRegex("gemini *"),
+		},
+	}
+
+	multiLinePrompt := "You have full file write and git permissions.\n\nSteps:\n1. Create or checkout the feature branch\n2. Read existing files"
+
+	cases := []struct {
+		cmd  string
+		args []string
+		want bool
+	}{
+		// The actual step-7 runAndWait shape from prod — this was failing.
+		{"claude", []string{multiLinePrompt, "Feature Title", "\n\nFEATURE DESCRIPTION:\n"}, true},
+		{"codex", []string{multiLinePrompt}, true},
+		{"gemini", []string{multiLinePrompt}, true},
+		// Single-line still works.
+		{"claude", []string{"hello world"}, true},
+		// Carriage-return variants (Windows line endings in user-entered markdown).
+		{"claude", []string{"line1\r\nline2"}, true},
+		// Command not in this restricted allowlist must still be rejected,
+		// even though the default production list would accept it.
+		{"rm", []string{"-rf", "/"}, false},
+	}
+
+	for _, tc := range cases {
+		got := al.IsAllowed(tc.cmd, tc.args)
+		if got != tc.want {
+			t.Errorf("IsAllowed(%q, %q) = %v; want %v", tc.cmd, tc.args, got, tc.want)
+		}
+	}
+}
+
+func TestIsAllowed_UnallowedCommandStillRejected(t *testing.T) {
+	// Sanity check: normalizing newlines must not accidentally make
+	// arbitrary commands pass. A command that doesn't match any pattern
+	// still fails, newlines or no newlines.
+	al := &AllowList{
+		patterns: []string{"claude *"},
+		compiled: []*regexp.Regexp{patternToRegex("claude *")},
+	}
+	if al.IsAllowed("curl", []string{"http://evil.example.com"}) {
+		t.Error("curl should not match an allowlist containing only claude *")
+	}
+	if al.IsAllowed("curl", []string{"http://evil\n.example.com"}) {
+		t.Error("curl with newline in arg should not match an allowlist containing only claude *")
 	}
 }
 

@@ -74,7 +74,18 @@ func (al *AllowList) Load() error {
 	return scanner.Err()
 }
 
-// IsAllowed checks if a command matches any pattern
+// IsAllowed checks if a command matches any pattern.
+//
+// Newlines inside individual args (e.g. a multi-line prompt passed to
+// `claude`/`codex`/`gemini`) are collapsed to spaces before matching. The
+// allowlist's job is to decide whether the *command pattern* is permitted —
+// the newline-injection defense lives downstream in pubsub.go's shell-quoting
+// layer, which rejects newlines for shell-bound invocations. Direct-exec
+// paths (`exec.Command(cmd, args...)`) pass args as distinct argv slots, so
+// a newline inside an arg can't break out into a second shell command.
+//
+// Without this normalization, any agent prompt containing `\n` (almost all
+// of them) fails `^claude [^\n]*$` and gets routed to the approval dialog.
 func (al *AllowList) IsAllowed(cmd string, args []string) bool {
 	al.mu.RLock()
 	defer al.mu.RUnlock()
@@ -84,6 +95,7 @@ func (al *AllowList) IsAllowed(cmd string, args []string) bool {
 	if len(args) > 0 {
 		fullCmd = cmd + " " + strings.Join(args, " ")
 	}
+	fullCmd = newlineToSpace.Replace(fullCmd)
 
 	for _, re := range al.compiled {
 		if re.MatchString(fullCmd) {
@@ -92,6 +104,8 @@ func (al *AllowList) IsAllowed(cmd string, args []string) bool {
 	}
 	return false
 }
+
+var newlineToSpace = strings.NewReplacer("\n", " ", "\r", " ")
 
 // AddPattern adds a new pattern and persists to file
 func (al *AllowList) AddPattern(pattern string) error {
