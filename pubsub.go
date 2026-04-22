@@ -455,6 +455,13 @@ type resultMsg struct {
 	StartPubSubLoop – reconnection wrapper with exponential backoff
 	--------------------------------------------------------------------------
 */
+// pubsubLoopRunning prevents duplicate StartPubSubLoop goroutines from stacking
+// up when the tray "Reconnect to cloud" toggle fires while a previous loop is
+// still alive (e.g., waiting on offlineChan). Without this guard, repeated
+// toggles would spin up N goroutines all racing to Subscribe on the same
+// subscription and fighting for the same offlineChan token.
+var pubsubLoopRunning sync.Mutex
+
 func StartPubSubLoop(cfg *Config) {
 	fmt.Println("[pubsub] StartPubSubLoop called")
 	fmt.Printf("[pubsub] Config: ProjectID=%s, Subscription=%s, Topic=%s\n", cfg.ProjectID, cfg.CommandsSubscription, cfg.ResultsTopic)
@@ -463,6 +470,15 @@ func StartPubSubLoop(cfg *Config) {
 		fmt.Println("[pubsub] disabled – project_id empty")
 		return
 	}
+
+	// Only one reconnection loop at a time. TryLock so a second call becomes
+	// a no-op instead of blocking — the live loop is already responsible for
+	// picking up the online signal we just sent on offlineChan.
+	if !pubsubLoopRunning.TryLock() {
+		fmt.Println("[pubsub] loop already running, skipping duplicate start")
+		return
+	}
+	defer pubsubLoopRunning.Unlock()
 
 	// Reconnection loop with exponential backoff
 	backoff := time.Second        // Initial: 1 second

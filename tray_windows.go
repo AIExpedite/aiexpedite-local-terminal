@@ -13,11 +13,34 @@ import (
 
 	_ "embed"
 
+	"github.com/getlantern/systray"
 	"golang.org/x/sys/windows/registry"
 )
 
 //go:embed assets/aiexpedite-tray-icon.ico
 var iconData []byte
+
+//go:embed assets/aiexpedite-tray-icon-disconnected.ico
+var iconDataDisconnected []byte
+
+// applyStandardTrayIcon sets the tray icon to the normal "connected" icon.
+// Called on reconnect from the tray "Disconnect from cloud" toggle.
+func applyStandardTrayIcon() {
+	if !IsSystrayReady() {
+		return
+	}
+	systray.SetIcon(iconData)
+}
+
+// applyDisconnectedTrayIcon sets the tray icon to the "disconnected" variant
+// (red overlay). Called on disconnect from the tray toggle so the user can
+// tell at a glance that the agent is no longer talking to the cloud.
+func applyDisconnectedTrayIcon() {
+	if !IsSystrayReady() {
+		return
+	}
+	systray.SetIcon(iconDataDisconnected)
+}
 
 var (
 	kernel32                  = syscall.NewLazyDLL("kernel32.dll")

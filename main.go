@@ -159,7 +159,14 @@ func onTrayReady(cfg *Config) func() {
 		if cfg.IsRegistered() {
 			mRegister.Disable() // Can't re-register once registered
 		}
-		mDisconnect := systray.AddMenuItemCheckbox("Disconnect from cloud", "Stop cloud connection (stay running)", false)
+		mDisconnect := systray.AddMenuItemCheckbox("Disconnect from cloud", "Stop cloud connection (stay running)", cfg.OfflineMode)
+		// If we booted in the offline state (user toggled disconnect last session),
+		// reflect that in the tray tooltip and icon immediately. The actual
+		// Pub/Sub loop has already been gated off by cfg.OfflineMode in agent.go.
+		if cfg.OfflineMode {
+			systray.SetTooltip(EnvDisplayName + " – Disconnected")
+			applyDisconnectedTrayIcon()
+		}
 		systray.AddSeparator()
 
 		mAllowList := systray.AddMenuItem("Edit Allow List", "Open allow list configuration folder")
@@ -434,15 +441,31 @@ func onTrayReady(cfg *Config) func() {
 
 				case <-mDisconnect.ClickedCh:
 					if mDisconnect.Checked() {
+						// ── Reconnect flow ─────────────────────────────
 						mDisconnect.Uncheck()
 						fmt.Println("[tray] Reconnecting to cloud...")
-						SetOffline(false)
+						SetOffline(false, cfg) // persists cfg.OfflineMode = false
 						systray.SetTooltip(EnvDisplayName + " – Online")
+						applyStandardTrayIcon()
+						// Restart the Pub/Sub loop. SetOffline already signals
+						// the existing loop's offlineChan, but if the loop has
+						// exited (e.g., registration was invalidated), kicking
+						// a fresh goroutine guarantees a reconnect attempt.
+						go StartPubSubLoop(cfg)
 					} else {
+						// ── Disconnect flow ────────────────────────────
 						mDisconnect.Check()
 						fmt.Println("[tray] Disconnecting from cloud...")
-						SetOffline(true)
+						SetOffline(true, cfg) // persists cfg.OfflineMode = true
 						systray.SetTooltip(EnvDisplayName + " – Disconnected")
+						applyDisconnectedTrayIcon()
+						// Best-effort notify backend so the dot flips to red
+						// without waiting for the 30s ping polling loop.
+						go func() {
+							ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+							defer cancel()
+							notifyOffline(ctx, cfg)
+						}()
 					}
 
 				case <-mQuit.ClickedCh:
