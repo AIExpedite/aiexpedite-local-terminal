@@ -624,12 +624,21 @@ func runPubSubConnection(cfg *Config) error {
 	// Listen for shutdown or offline signal.
 	// ctx.Done() arm ensures this goroutine exits when the connection ends
 	// normally (e.g. sub.Receive returns), preventing a goroutine leak.
+	//
+	// When offline is signaled we cancel the receive context immediately so
+	// sub.Receive returns and the loop stops processing inbound messages —
+	// this is what guarantees no late pong escapes after disconnect.
 	go func() {
 		select {
 		case <-shutdownChan:
+			fmt.Println("[pubsub] shutdown received — cancelling subscription context")
 			cancel()
 		case offline := <-offlineChan:
 			if offline {
+				fmt.Println("[pubsub] offline signal received — cancelling subscription context")
+				// State may already be set by the caller; calling SetOffline
+				// here is idempotent and ensures any concurrent ping handler
+				// sees IsOffline() == true on its next check.
 				SetOffline(true)
 				cancel()
 			} else {
@@ -716,11 +725,37 @@ func runPubSubConnection(cfg *Config) error {
 			return
 		}
 
+		// ─── Offline Guard ───────────────────────────────────────────────
+		// Once the agent is in offline mode (user clicked "Disconnect from
+		// cloud" or graceful shutdown is in progress), suppress ALL command
+		// processing — including pings. A late pong arriving after the
+		// backend has set offlineSince would otherwise resurrect this device
+		// in the eyes of /device/has-online and reservation.service. We Ack
+		// to drain the message from the subscription instead of Nacking,
+		// since Nacking would just trigger redelivery and a hot loop.
+		if IsOffline() {
+			fmt.Printf("%s[pubsub] Offline mode — suppressing %s (id=%s) and Acking%s\n",
+				colorYellow, cmd.Command, cmd.ID, colorReset)
+			m.Ack()
+			return
+		}
+		// ─────────────────────────────────────────────────────────────────
+
 		// ─── Priority Ping Handler ───────────────────────────────────────
 		// Process pings BEFORE staleness/rate-limit/signature checks so that
 		// online-status pings are never delayed by a backlog of stale commands
 		// in the Pub/Sub queue.
 		if cmd.Command == "__ping__" {
+			// Defense-in-depth: re-check IsOffline immediately before
+			// publishing the pong. SetOffline can flip while we're in this
+			// handler, and a stale pong is the exact failure mode that
+			// resurrects a disconnected device.
+			if IsOffline() {
+				fmt.Printf("%s[pubsub] Offline mode — dropping ping pong (id=%s)%s\n",
+					colorYellow, cmd.ID, colorReset)
+				m.Ack()
+				return
+			}
 			res := resultMsg{
 				ID:          cmd.ID,
 				WorkspaceID: cmd.WorkspaceID,
