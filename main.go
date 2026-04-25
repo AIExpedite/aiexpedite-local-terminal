@@ -6,10 +6,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/getlantern/systray"
@@ -113,11 +115,46 @@ func main() {
 	// Background workers (includes ttyd installation check)
 	go StartAgent(cfg)
 
+	// Catch ungraceful exits (Ctrl+C in console, `kill <pid>`, systemd stop).
+	// Without this, Unix-based exits would skip the offline-notify path
+	// entirely and the backend would only learn about the disconnect when
+	// the 5-minute lastSeen heartbeat staleness check runs.
+	installSignalHandler(cfg)
+
 	// NOTE: No console hiding needed - GUI app has no console by default.
 	// Console is allocated on-demand when user clicks "Show Console" in tray menu.
 
 	// Tray UI
 	systray.Run(onTrayReady(cfg), onTrayExit)
+}
+
+// installSignalHandler registers a SIGINT/SIGTERM handler that runs the
+// canonical disconnect sequence before terminating the systray loop. This
+// guarantees the backend learns about Unix-style shutdowns (Ctrl+C in the
+// console, kill, systemd stop) the same way it does about tray-quit and
+// Windows console-close events.
+func installSignalHandler(cfg *Config) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-ch
+		fmt.Printf("[signal] Received %s — initiating graceful shutdown\n", sig)
+		closeShutdownChanOnce()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		gracefulShutdown(ctx, cfg)
+		// Allow systray.Quit to actually exit on Windows where the close
+		// button would normally be intercepted by consoleCtrlHandler.
+		if runtime.GOOS == "windows" {
+			SetAllowExit()
+		}
+		if IsSystrayReady() {
+			systray.Quit()
+		} else {
+			// systray hasn't initialized yet — exit directly.
+			os.Exit(0)
+		}
+	}()
 }
 
 /* ---------- tray helpers ---------- */
@@ -454,17 +491,30 @@ func onTrayReady(cfg *Config) func() {
 						go StartPubSubLoop(cfg)
 					} else {
 						// ── Disconnect flow ────────────────────────────
+						// Flip UI immediately so the user gets feedback even
+						// if the network call below stalls. SetOffline runs
+						// synchronously and is what stops the Pub/Sub loop
+						// from emitting a stale pong.
 						mDisconnect.Check()
 						fmt.Println("[tray] Disconnecting from cloud...")
 						SetOffline(true, cfg) // persists cfg.OfflineMode = true
 						systray.SetTooltip(EnvDisplayName + " – Disconnected")
 						applyDisconnectedTrayIcon()
-						// Best-effort notify backend so the dot flips to red
-						// without waiting for the 30s ping polling loop.
+
+						// Notify the backend synchronously (with retries
+						// inside notifyOffline). We wrap in a goroutine so
+						// the tray event loop isn't blocked, but the call
+						// itself is awaited rather than fire-and-forget so
+						// retries actually run instead of being abandoned
+						// when the goroutine gets descheduled. The 5s
+						// budget covers the retry wrapper's own deadline.
 						go func() {
-							ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+							ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 							defer cancel()
-							notifyOffline(ctx, cfg)
+							if err := notifyOffline(ctx, cfg); err != nil {
+								fmt.Printf("%s[tray] notifyOffline returned error: %v%s\n",
+									colorYellow, err, colorReset)
+							}
 						}()
 					}
 
@@ -482,18 +532,17 @@ func onTrayReady(cfg *Config) func() {
 }
 
 func onTrayExit() {
-	// signal background goroutines
-	close(shutdownChan)
+	// signal background goroutines (idempotent: closing an already-closed
+	// channel panics, so guard via the shutdown helper if it has already
+	// run from a signal handler).
+	closeShutdownChanOnce()
 
-	// Notify server that this agent is going offline (best-effort, 3s timeout)
-	if shutdownConfig != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		notifyOffline(ctx, shutdownConfig)
-		cancel()
-	}
-
-	// IMPORTANT: Launch update FIRST, before any cleanup that might kill processes
-	// The update process needs to be started before we kill our process tree
+	// IMPORTANT: Launch update FIRST, before any cleanup that might kill processes.
+	// The update process needs to be started before we kill our process tree.
+	// During an update we deliberately skip the offline notify — the new
+	// version will re-register and resume heartbeating immediately, so
+	// flipping the device offline mid-handoff would just churn the dot in
+	// the UI. Same for the rest of teardown.
 	if path, pending := GetUpdateReady(); pending && path != "" {
 		fmt.Println("Launching updated version…")
 
@@ -529,24 +578,22 @@ func onTrayExit() {
 		return
 	}
 
-	// Only do aggressive cleanup when NOT updating (e.g., stuck processes during normal quit)
-	// When updating, we skip this to avoid killing the newly launched update process
-	if runtime.GOOS == "windows" {
-		// Cleanup persistent PowerShell process
-		ShutdownPowerShell()
+	// Run the canonical disconnect sequence: flip offline state, await
+	// notifyOffline, then tear down sub-processes. This replaces the
+	// previous fire-and-forget notify + ad-hoc cleanup.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	gracefulShutdown(ctx, shutdownConfig)
+}
+
+// shutdownChanClosed prevents close(shutdownChan) from being called twice
+// when both a signal handler and onTrayExit fire on the same process.
+var shutdownChanClosed atomic.Bool
+
+func closeShutdownChanOnce() {
+	if shutdownChanClosed.CompareAndSwap(false, true) {
+		close(shutdownChan)
 	}
-
-	// Cleanup GCS storage client
-	CloseStorageClient()
-
-	// stop ttyd cleanly
-	if ttydCmd != nil && ttydCmd.Process != nil {
-		_ = ttydCmd.Process.Kill()
-		_, _ = ttydCmd.Process.Wait() // avoid zombie
-	}
-
-	// kill tmux session (ignore error if it never existed)
-	_ = exec.Command("tmux", "kill-session", "-t", tmuxSessionName).Run()
 }
 
 // aggressiveCleanup is defined in cleanup_windows.go / cleanup_other.go

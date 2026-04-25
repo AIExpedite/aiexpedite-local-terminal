@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -142,7 +143,16 @@ func consoleCtrlHandler(ctrlType uint) uintptr {
 			showConsoleWindow(false)
 			return 1 // TRUE - event handled, don't exit
 		}
-		// If allowAppExit is true, let the app exit normally
+		// allowAppExit is true (set by tray Quit). Run the graceful disconnect
+		// sequence so the backend learns we're going offline before Windows
+		// terminates the process — Windows kills console apps very quickly
+		// once the handler returns on CTRL_CLOSE_EVENT, so onTrayExit may not
+		// finish in time. This duplicates the work but gracefulShutdown is
+		// idempotent (shutdownInProgress guard), so the second pass is a noop.
+		fmt.Println("[console] Close event with allowAppExit=true — running gracefulShutdown")
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		gracefulShutdown(ctx, shutdownConfig)
 		return 0
 	case CTRL_C_EVENT, CTRL_BREAK_EVENT:
 		// Ctrl+C or Ctrl+Break - hide console instead of exiting
@@ -153,7 +163,15 @@ func consoleCtrlHandler(ctrlType uint) uintptr {
 		}
 		return 0
 	case CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT:
-		// System is logging off or shutting down - allow exit
+		// System is logging off or shutting down. We have a very narrow
+		// window before Windows force-kills us, but it's worth attempting
+		// the offline notify so the dot flips quickly when the user logs
+		// out / shuts down rather than waiting for the lastSeen staleness
+		// check on the next poll.
+		fmt.Println("[console] System logoff/shutdown — attempting graceful shutdown")
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		gracefulShutdown(ctx, shutdownConfig)
 		return 0
 	}
 	return 0

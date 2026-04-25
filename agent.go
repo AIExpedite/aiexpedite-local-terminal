@@ -67,13 +67,32 @@ func IsSystrayReady() bool {
 // When a *Config is provided, the new OfflineMode is persisted so the toggle
 // survives app restarts. Passing nil is supported for callers that cannot
 // reach the live config (tests).
+//
+// IMPORTANT: This function only toggles local state and signals the Pub/Sub
+// loop to suspend listening. It does NOT notify the backend service that this
+// agent has gone offline — the caller is responsible for invoking
+// notifyOffline(ctx, cfg) to make the disconnect visible server-side.
+//
+// The split is intentional: tray toggles, OS signal handlers, and the
+// gracefulShutdown orchestration each call SetOffline first to immediately
+// halt outbound Pub/Sub traffic, then await notifyOffline so the backend can
+// persist offlineSince before sub-processes are torn down.
 func SetOffline(offline bool, cfg ...*Config) {
 	offlineMutex.Lock()
 	isOffline = offline
 	offlineMutex.Unlock()
 
+	// Log transitions so operators can correlate disconnect events in the
+	// console with backend offlineSince writes.
+	if offline {
+		fmt.Printf("%s[offline] Local offline state ENABLED — Pub/Sub will be suspended%s\n", colorYellow, colorReset)
+	} else {
+		fmt.Printf("%s[offline] Local offline state DISABLED — Pub/Sub will resume%s\n", colorGreen, colorReset)
+	}
+
 	// Persist across restarts so the user's explicit disconnect choice
-	// survives a reboot / auto-update / crash recovery.
+	// survives a reboot / auto-update / crash recovery. Nil-safe: callers
+	// from tests or signal handlers may not have a live config reference.
 	if len(cfg) > 0 && cfg[0] != nil {
 		cfg[0].OfflineMode = offline
 		if err := cfg[0].Save(ConfigPath()); err != nil {
