@@ -9,11 +9,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
 	"sync"
+	"time"
 )
 
 // Version is the current terminal app version (exported for use in
@@ -28,7 +30,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v0.8.9"
+var Version = "v0.9.0"
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -261,6 +263,24 @@ func StartAgent(cfg *Config) {
 		fmt.Println("[agent] Offline mode persisted — skipping StartPubSubLoop until user reconnects")
 	} else {
 		go StartPubSubLoop(cfg)
+
+		// Tell the backend we're online so any `offlineSince` left over
+		// from a prior graceful shutdown (SIGTERM / console close / tray
+		// Quit / OS signal) is cleared. Without this the agent pings
+		// forever into a `Stale pong ignored` log on the server while the
+		// frontend shows the device grey, until the user manually clicks
+		// the tray Reconnect or someone clears Firestore by hand. The
+		// helper guards on cfg.IsRegistered() so we don't fire before the
+		// registration flow has populated AgentID/CommandSecret.
+		//
+		// Best-effort, non-blocking: a transient backend failure must not
+		// delay agent startup. The HTTP retry wrapper inside notifyOnline
+		// gives us 2 attempts × 2s within a 5s budget.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			notifyOnlineIfApplicable(ctx, cfg)
+		}()
 	}
 
 	/* 4b. Start orphan-process scanner (kills detached CLI agents) -------- */
