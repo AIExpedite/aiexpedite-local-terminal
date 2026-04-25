@@ -5,23 +5,23 @@
 // Why these tests are the regression guard for the prod "stuck-grey-device"
 // bug:
 //
-//   1. The prod bug existed because the Go agent never made the HTTP call
-//      to /device/:id/online — there was a notifyOffline path but no
-//      symmetric online path. If a future refactor accidentally drops the
-//      call site (or breaks the URL path / HMAC payload shape), the unit
-//      tests below fail at build/CI rather than waiting for someone to
-//      notice grey dots in prod.
+//  1. The prod bug existed because the Go agent never made the HTTP call
+//     to /device/:id/online — there was a notifyOffline path but no
+//     symmetric online path. If a future refactor accidentally drops the
+//     call site (or breaks the URL path / HMAC payload shape), the unit
+//     tests below fail at build/CI rather than waiting for someone to
+//     notice grey dots in prod.
 //
-//   2. The shared mutex (notifyConnectivityMutex) is what prevents a
-//      late-arriving notifyOffline from clobbering a fresh notifyOnline
-//      during rapid tray toggling. The serialization test here is the
-//      contract: if the mutex is removed or accidentally split per-route,
-//      the test catches it.
+//  2. The shared mutex (notifyConnectivityMutex) is what prevents a
+//     late-arriving notifyOffline from clobbering a fresh notifyOnline
+//     during rapid tray toggling. The serialization test here is the
+//     contract: if the mutex is removed or accidentally split per-route,
+//     the test catches it.
 //
-//   3. The boot-path helper notifyOnlineIfApplicable encodes "only call
-//      /online when registered AND not in user-toggled offline mode" — the
-//      gate that keeps us from silently overriding a user's explicit
-//      Disconnect across restarts. The gate tests below pin those edges.
+//  3. The boot-path helper notifyOnlineIfApplicable encodes "only call
+//     /online when registered AND not in user-toggled offline mode" — the
+//     gate that keeps us from silently overriding a user's explicit
+//     Disconnect across restarts. The gate tests below pin those edges.
 package main
 
 import (
