@@ -29,10 +29,17 @@ var notifyConnectivityMutex sync.Mutex
 // signals are critical — a single transient HTTP failure (TCP reset, brief
 // DNS hiccup, server restart) must not silently leave the backend with stale
 // state.
+//
+// notifyConnectivityHTTPBudget is the deadline the HTTP work gets AFTER the
+// mutex is acquired — see notifyConnectivity for the rationale. It must be
+// at least (notifyConnectivityMaxAttempts × notifyConnectivityPerAttemptHTTP)
+// + (notifyConnectivityMaxAttempts-1) × notifyConnectivityRetryBackoff for
+// the retry wrapper to actually finish all attempts.
 const (
 	notifyConnectivityMaxAttempts    = 2
 	notifyConnectivityRetryBackoff   = 250 * time.Millisecond
 	notifyConnectivityPerAttemptHTTP = 2 * time.Second
+	notifyConnectivityHTTPBudget     = 5 * time.Second
 )
 
 // notifyOffline sends a POST /device/{agentId}/offline request to the
@@ -88,9 +95,10 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string) error {
 	if cfg == nil || cfg.AgentID == "" || cfg.CommandSecret == "" {
 		return fmt.Errorf("notify%s: missing agent credentials", capitalize(path))
 	}
-	// Respect caller-provided cancellation early (e.g., the app is quitting
-	// while the user also clicked "Disconnect"; no reason to make two calls
-	// fight for the HTTP client timeout).
+	// Respect caller-provided cancellation early so a doomed call does not
+	// even queue up on the mutex behind a slow predecessor — but don't
+	// honor the caller's deadline past this point. See post-lock budget
+	// reset below for why.
 	if ctx != nil {
 		select {
 		case <-ctx.Done():
@@ -109,20 +117,36 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string) error {
 		return fmt.Errorf("notify%s: registration URL not configured", capitalize(path))
 	}
 
-	// If the caller didn't provide a context, fall back to a 5s budget so
-	// tray-click callers don't have to remember to wrap.
-	if ctx == nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-	}
+	// Fresh deadline budget for the HTTP work after lock acquisition.
+	//
+	// The mutex's purpose is wire-order serialization, not a shared
+	// queue deadline. If we kept the caller's ctx for the HTTP work
+	// after the mutex, a rapid Disconnect→Reconnect where the first
+	// call burns most of its 5s budget on retries-while-holding-mutex
+	// would leave the second caller almost no budget for its own
+	// attempts, and the user's later intent would be silently lost
+	// (backend ends up stuck on the earlier transition). The pre-lock
+	// cancellation check above already gated entry; once we hold the
+	// mutex, the HTTP work gets a clean budget.
+	//
+	// We deliberately do NOT propagate the caller ctx's cancellation
+	// past this line. All current callers pass plain timeout contexts
+	// with no explicit cancel source (tray click handlers, boot path,
+	// signal handler — each constructs `context.WithTimeout(
+	// context.Background(), 5s)`), so the parent ctx's only signal is
+	// its deadline, which is exactly what we want to ignore here. If
+	// a future caller needs to propagate explicit cancellation through
+	// the mutex (e.g. a "stop everything" abort), this is the place to
+	// thread it via context.AfterFunc.
+	ctx, cancel := context.WithTimeout(context.Background(), notifyConnectivityHTTPBudget)
+	defer cancel()
 
 	url := fmt.Sprintf("%s/device/%s/%s", baseURL, cfg.AgentID, path)
 
 	var lastErr error
 	for attempt := 1; attempt <= notifyConnectivityMaxAttempts; attempt++ {
-		// Honor caller-cancellation between attempts so shutdown's 5s budget
-		// isn't squandered on retries the caller has already given up on.
+		// Honor the post-lock budget between attempts so we don't loop
+		// past the 5s window on a fully-broken network.
 		select {
 		case <-ctx.Done():
 			if lastErr != nil {

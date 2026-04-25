@@ -486,6 +486,145 @@ func TestNotifyConnectivityMutexSerializesOfflineAndOnline(t *testing.T) {
 	}
 }
 
+// TestNotifyConnectivityResetsBudgetAfterLock pins the regression flagged
+// by the Codex bot review on PR #9: rapid Disconnect→Reconnect (or any
+// pair of state-flip RPCs back-to-back) must not let the first call's
+// retries-while-holding-the-mutex eat into the second call's HTTP budget.
+//
+// Without the post-lock budget reset, the second call would block on the
+// mutex while its caller-provided context expired, then abort on the
+// first per-attempt cancellation check — silently dropping the user's
+// most recent intent. With the reset, the second call gets a fresh
+// budget for HTTP work once it owns the mutex, and the user's later
+// click reaches the backend.
+//
+// Test mechanic: the server delays only the FIRST request long enough
+// that a second caller's tight 200ms context expires while waiting on
+// the mutex. After the first call releases, the second call must
+// still succeed (proving its budget was reset).
+func TestNotifyConnectivityResetsBudgetAfterLock(t *testing.T) {
+	resetConnectivityState(t)
+
+	var firstHit atomic.Bool
+	cap := &captureRequest{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Slow first request, instant on every subsequent call.
+		if firstHit.CompareAndSwap(false, true) {
+			time.Sleep(800 * time.Millisecond)
+		}
+		// Reuse the captureRequest helper's recording machinery so we
+		// still assert on the path/timestamp/signature shape.
+		body, _ := io.ReadAll(r.Body)
+		var parsed struct {
+			Timestamp int64  `json:"timestamp"`
+			Signature string `json:"signature"`
+		}
+		_ = json.Unmarshal(body, &parsed)
+		cap.mu.Lock()
+		cap.hits = append(cap.hits, capturedHit{
+			path:      r.URL.Path,
+			timestamp: parsed.Timestamp,
+			signature: parsed.Signature,
+			startedAt: time.Now(),
+			endedAt:   time.Now(),
+		})
+		cap.mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+
+	cfg := &Config{AgentID: "agent-budget-reset-1", CommandSecret: "secret"}
+
+	// Fire a slow notifyOffline that will hold the mutex for ~800ms.
+	// Use a generous 5s parent ctx so this call itself doesn't get cut
+	// short — we're testing what happens to the SECOND call.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := notifyOffline(ctx, cfg); err != nil {
+			t.Errorf("first notifyOffline failed: %v", err)
+		}
+	}()
+
+	// Brief delay so the first goroutine grabs the mutex before the
+	// second one tries to enter — without this we'd be measuring
+	// goroutine scheduling, not the deadline-reset behavior.
+	time.Sleep(50 * time.Millisecond)
+
+	// Second call: 200ms parent ctx. It will expire while we're still
+	// blocked on the mutex (~750ms left of the first call's hold).
+	// Without the post-lock reset, the per-attempt ctx check would fire
+	// immediately after lock acquisition and return ctx.Err(). With the
+	// reset, the call proceeds with a fresh 5s budget for HTTP work.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	if err := notifyOnline(ctx, cfg); err != nil {
+		t.Fatalf("expected notifyOnline to succeed despite parent ctx expiring during mutex wait; got %v after %v",
+			err, time.Since(start))
+	}
+	wg.Wait()
+
+	// Sanity: the call should have waited for the first call's mutex
+	// hold (~750ms remaining at start of second call's wait), proving
+	// it actually went through the queue rather than racing past it.
+	if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
+		t.Fatalf("expected notifyOnline to wait for mutex (~750ms), but completed in %v — mutex serialization broken?", elapsed)
+	}
+
+	// Both calls must have reached the server.
+	hits := cap.snapshot()
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 hits (1 offline + 1 online), got %d", len(hits))
+	}
+	var sawOffline, sawOnline bool
+	for _, h := range hits {
+		if strings.HasSuffix(h.path, "/offline") {
+			sawOffline = true
+		}
+		if strings.HasSuffix(h.path, "/online") {
+			sawOnline = true
+		}
+	}
+	if !sawOffline || !sawOnline {
+		t.Fatalf("expected one /offline and one /online hit; got paths %+v", hits)
+	}
+}
+
+// TestNotifyConnectivityRejectsPreCancelledContext pins the OTHER half
+// of the budget-reset contract: a caller passing an already-cancelled
+// context must still abort early — we don't want a stale, doomed call
+// to queue up on the mutex behind a slow predecessor. The early-cancel
+// check at the top of notifyConnectivity preserves this even though we
+// reset the deadline post-lock.
+func TestNotifyConnectivityRejectsPreCancelledContext(t *testing.T) {
+	resetConnectivityState(t)
+
+	cap := &captureRequest{}
+	srv := httptest.NewServer(cap.handler(t, http.StatusOK))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+
+	cfg := &Config{AgentID: "agent-precancel-1", CommandSecret: "secret"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before the call
+
+	if err := notifyOnline(ctx, cfg); err == nil {
+		t.Fatalf("expected error for pre-cancelled ctx")
+	}
+
+	// And critically, the request must NOT have reached the server —
+	// the early-cancel check fast-paths out before mutex.Lock().
+	if got := len(cap.snapshot()); got != 0 {
+		t.Fatalf("expected zero requests for pre-cancelled ctx, got %d", got)
+	}
+}
+
 // fmtSigInput recomputes the canonical "<agentId>:<timestamp>" string used
 // as HMAC input — kept here as a tiny helper so the signature-shape test
 // reads the same as the production code without forcing an export.
