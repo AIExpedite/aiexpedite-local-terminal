@@ -489,6 +489,24 @@ func onTrayReady(cfg *Config) func() {
 						// exited (e.g., registration was invalidated), kicking
 						// a fresh goroutine guarantees a reconnect attempt.
 						go StartPubSubLoop(cfg)
+
+						// Mirror of the disconnect-side notifyOffline call:
+						// tell the backend to clear `offlineSince` so the
+						// device immediately becomes eligible for routing
+						// again. Without this the agent pings forever into
+						// a `Stale pong ignored` log and shows grey in the
+						// frontend until manual intervention. Wrapped in a
+						// goroutine so the tray loop isn't blocked, but the
+						// call itself awaits the retry wrapper inside
+						// notifyOnline so transient blips don't leak past.
+						go func() {
+							ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+							defer cancel()
+							if err := notifyOnline(ctx, cfg); err != nil {
+								fmt.Printf("%s[tray] notifyOnline returned error: %v%s\n",
+									colorYellow, err, colorReset)
+							}
+						}()
 					} else {
 						// ── Disconnect flow ────────────────────────────
 						// Flip UI immediately so the user gets feedback even

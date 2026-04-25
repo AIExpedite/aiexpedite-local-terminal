@@ -7,18 +7,18 @@
 //   - Windows console close handler (consoleCtrlHandler in tray_windows.go)
 //
 // The teardown order is intentional and must be preserved:
-//   1. SetOffline(true)        — flips the local IsOffline flag and signals
-//                                the Pub/Sub loop to suspend, so any in-flight
-//                                __ping__ messages are dropped instead of
-//                                producing a stale pong.
-//   2. notifyOffline(ctx, cfg) — synchronously notifies the backend so
-//                                offlineSince is persisted and lastSeen reset.
-//                                Retries within the supplied context budget.
-//   3. Sub-process teardown    — only after the backend is informed do we
-//                                kill ttyd, tmux, and the persistent
-//                                PowerShell helper. This avoids a race where
-//                                killing children stops the goroutine before
-//                                the HTTP round-trip completes.
+//  1. SetOffline(true)        — flips the local IsOffline flag and signals
+//     the Pub/Sub loop to suspend, so any in-flight
+//     __ping__ messages are dropped instead of
+//     producing a stale pong.
+//  2. notifyOffline(ctx, cfg) — synchronously notifies the backend so
+//     offlineSince is persisted and lastSeen reset.
+//     Retries within the supplied context budget.
+//  3. Sub-process teardown    — only after the backend is informed do we
+//     kill ttyd, tmux, and the persistent
+//     PowerShell helper. This avoids a race where
+//     killing children stops the goroutine before
+//     the HTTP round-trip completes.
 package main
 
 import (
