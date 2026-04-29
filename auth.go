@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"runtime"
 	"sync"
 	"time"
 
@@ -141,11 +142,20 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 	timestamp := time.Now().UnixMilli()
 	signature := generateHMAC(fmt.Sprintf("%s:%d", ts.cfg.AgentID, timestamp), ts.cfg.CommandSecret)
 
-	// Build request payload
+	// Build request payload. Include the agent's current OS, hostname, and
+	// version so the backend can detect when credentials have been moved to a
+	// different machine (e.g. config copied from a Windows box to a Mac). The
+	// /auth/token route refreshes these on the global agent doc and flags the
+	// per-workspace discovery cache as stale when platform actually flips —
+	// otherwise the LLM keeps reading the original OS from Firestore and
+	// generates the wrong shell syntax.
 	payload := map[string]interface{}{
-		"agentId":   ts.cfg.AgentID,
-		"timestamp": timestamp,
-		"signature": signature,
+		"agentId":    ts.cfg.AgentID,
+		"timestamp":  timestamp,
+		"signature":  signature,
+		"platform":   runtime.GOOS,
+		"deviceName": getDeviceName(),
+		"version":    Version,
 	}
 
 	body, err := json.Marshal(payload)
