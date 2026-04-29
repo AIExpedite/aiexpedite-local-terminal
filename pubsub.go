@@ -136,6 +136,36 @@ func redactCommandForLog(cmd string, args []string) string {
 	return redactSensitiveData(cmd) + " " + strings.Join(redactArgs(args), " ")
 }
 
+// attachCmdContext fills in redacted command/args/cwd fields on a resultMsg
+// from the inbound command. Used by both the rejection paths
+// (makeRejectionResult) and the failure paths (publishSessionError, execute
+// error branch) so the backend's persistRejection / persistFailure
+// collections always carry the command the agent was trying to run.
+//
+// Command and args go through redactSensitiveData / redactArgs first so
+// secrets the LLM put on the command line (Bearer tokens, passwords in
+// connection strings, GitHub PATs) are scrubbed before reaching Firestore.
+// Cwd is taken from the inbound command's requested cwd — for rejections
+// the command never ran (getTrackedCwd() empty or stale), and for failures
+// the requested cwd is more diagnostic than wherever the shell landed
+// mid-error.
+//
+// Only writes fields that are currently empty so callers that have already
+// populated something authoritative (e.g. attachCmdContext over a
+// session-ended message that already filled Cwd from the running session)
+// don't get clobbered.
+func attachCmdContext(res *resultMsg, cmd commandMsg) {
+	if res.Command == "" {
+		res.Command = redactSensitiveData(cmd.Command)
+	}
+	if len(res.Args) == 0 && len(cmd.Args) > 0 {
+		res.Args = redactArgs(cmd.Args)
+	}
+	if res.Cwd == "" {
+		res.Cwd = cmd.Cwd
+	}
+}
+
 // makeRejectionResult builds the resultMsg sent back to the backend when a
 // command is refused (allowlist deny, stale, rate-limit, unauthorized). The
 // backend's persistRejection() reads command/args/cwd off this message and
@@ -143,15 +173,6 @@ func redactCommandForLog(cmd string, args []string) string {
 // command/args here every captured rejection is "we denied something for
 // some reason" — diagnostically useless, exactly what 108 prod records
 // looked like before this fix.
-//
-// Command and args are passed through redactSensitiveData/redactArgs so
-// secrets the LLM put on the command line (Bearer tokens, passwords in
-// connection strings, *_TOKEN env vars) are scrubbed before they hit
-// Firestore.
-//
-// Cwd carries the requested cwd from the inbound command — for rejections
-// the command never ran, so the post-execution `getTrackedCwd()` value
-// would either be empty or describe an unrelated previous session.
 func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string) resultMsg {
 	res := resultMsg{
 		ID:              cmd.ID,
@@ -162,11 +183,9 @@ func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string)
 		Status:          status,
 		Ts:              time.Now().UnixMilli(),
 		Version:         Version,
-		Cwd:             cmd.Cwd,
-		Command:         redactSensitiveData(cmd.Command),
-		Args:            redactArgs(cmd.Args),
 		RejectionReason: reason,
 	}
+	attachCmdContext(&res, cmd)
 	// Session-routed commands need Type/SessionID set so the backend can
 	// correlate the rejection with the session document.
 	if cmd.Type != "" && cmd.SessionID != "" {
@@ -1087,6 +1106,13 @@ func runPubSubConnection(cfg *Config) error {
 		if execErr != nil {
 			res.Status = "error"
 			res.Output = redactSensitiveData(execErr.Error()) + "\n" + redactedOut
+			// Attach cmd context so the backend's persistFailure() can write
+			// the actual command/args/requested-cwd into the failed_terminal
+			// _commands collection. Without this, a "executable file not
+			// found in $PATH" failure produces a row with command:null —
+			// diagnostically useless, the same gap the rejection capture
+			// hit before v0.9.3.
+			attachCmdContext(&res, cmd)
 		}
 
 		// File upload integration
@@ -2036,6 +2062,13 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 }
 
 // publishSessionError publishes an error result for a session command.
+//
+// Echoes the command/args/cwd from cmd so the backend's persistFailure()
+// can populate the failed_terminal_commands collection with what the agent
+// was actually trying to run. The "executable file not found in $PATH"
+// errors that surfaced in Cbw8pMlDbjbB4iwPNvTs-0 originate here — without
+// the cmd-context attach, those failure rows landed with command:null and
+// the SHELL_NOT_FOUND signal had no agent identity.
 func publishSessionError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
 	fmt.Printf("%s[session] Error: %s%s\n", colorRed, errMsg, colorReset)
 
@@ -2050,6 +2083,7 @@ func publishSessionError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 		Type:        "session_error",
 		SessionID:   cmd.SessionID,
 	}
+	attachCmdContext(&res, cmd)
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[session] Failed to publish error: %v%s\n", colorRed, err, colorReset)
 	}
