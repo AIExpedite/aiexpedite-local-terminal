@@ -136,6 +136,46 @@ func redactCommandForLog(cmd string, args []string) string {
 	return redactSensitiveData(cmd) + " " + strings.Join(redactArgs(args), " ")
 }
 
+// makeRejectionResult builds the resultMsg sent back to the backend when a
+// command is refused (allowlist deny, stale, rate-limit, unauthorized). The
+// backend's persistRejection() reads command/args/cwd off this message and
+// writes to workspace/{id}/rejected_terminal_commands. Without echoing
+// command/args here every captured rejection is "we denied something for
+// some reason" — diagnostically useless, exactly what 108 prod records
+// looked like before this fix.
+//
+// Command and args are passed through redactSensitiveData/redactArgs so
+// secrets the LLM put on the command line (Bearer tokens, passwords in
+// connection strings, *_TOKEN env vars) are scrubbed before they hit
+// Firestore.
+//
+// Cwd carries the requested cwd from the inbound command — for rejections
+// the command never ran, so the post-execution `getTrackedCwd()` value
+// would either be empty or describe an unrelated previous session.
+func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string) resultMsg {
+	res := resultMsg{
+		ID:              cmd.ID,
+		WorkspaceID:     cmd.WorkspaceID,
+		UID:             cmd.UID,
+		AgentID:         agentID,
+		Output:          output,
+		Status:          status,
+		Ts:              time.Now().UnixMilli(),
+		Version:         Version,
+		Cwd:             cmd.Cwd,
+		Command:         redactSensitiveData(cmd.Command),
+		Args:            redactArgs(cmd.Args),
+		RejectionReason: reason,
+	}
+	// Session-routed commands need Type/SessionID set so the backend can
+	// correlate the rejection with the session document.
+	if cmd.Type != "" && cmd.SessionID != "" {
+		res.Type = "session_error"
+		res.SessionID = cmd.SessionID
+	}
+	return res
+}
+
 /* --------------------------------------------------------------------------
    Command Staleness Check
    -------------------------------------------------------------------------- */
@@ -435,10 +475,18 @@ type resultMsg struct {
 	Status          string        `json:"status"` // "success" | "partial" | "error" | "denied" | "rate_limited" | "unauthorized"
 	Ts              int64         `json:"ts"`
 	Version         string        `json:"version,omitempty"`      // Terminal app version
-	Cwd             string        `json:"cwd,omitempty"`          // Current working directory after execution
+	Cwd             string        `json:"cwd,omitempty"`          // Working directory: post-execution for success results, requested cwd for rejections
 	Files           []FileInfo    `json:"files,omitempty"`        // Uploaded file metadata
 	UploadErrors    []UploadError `json:"uploadErrors,omitempty"` // File upload failures
 	RejectionReason string        `json:"rejectionReason,omitempty"`
+	// Echoed back on rejections so terminal-service's persistRejection() can
+	// store what the AI agent actually tried. Empty otherwise — successful
+	// results don't need to repeat the command. Both are passed through
+	// redactSensitiveData() before send so credentials/tokens that the LLM
+	// embedded in args (e.g. `git push https://x:TOKEN@host/...`) don't end
+	// up in the rejected_terminal_commands collection.
+	Command string   `json:"command,omitempty"`
+	Args    []string `json:"args,omitempty"`
 
 	// Session fields (for interactive CLI agent sessions)
 	Type       string `json:"type,omitempty"`       // "result"|"stream"|"prompt"|"session_ended"
@@ -783,22 +831,13 @@ func runPubSubConnection(cfg *Config) error {
 				colorYellow, ageSec, maxCommandAgeSec, colorReset)
 
 			// Send stale response back to user
-			res := resultMsg{
-				ID:              cmd.ID,
-				WorkspaceID:     cmd.WorkspaceID,
-				UID:             cmd.UID,
-				AgentID:         cfg.AgentID,
-				Output:          fmt.Sprintf("Command rejected: too old (%d seconds, max %d seconds). Terminal may have been offline.", ageSec, maxCommandAgeSec),
-				Status:          "stale",
-				Ts:              time.Now().UnixMilli(),
-				Version:         Version,
-				RejectionReason: "STALE",
-			}
-			// Include session metadata so the backend can update the session document
-			if cmd.Type != "" && cmd.SessionID != "" {
-				res.Type = "session_error"
-				res.SessionID = cmd.SessionID
-			}
+			res := makeRejectionResult(
+				cmd,
+				cfg.AgentID,
+				"stale",
+				"STALE",
+				fmt.Sprintf("Command rejected: too old (%d seconds, max %d seconds). Terminal may have been offline.", ageSec, maxCommandAgeSec),
+			)
 			if err := publishMsg(ctx, topic, res); err != nil {
 				m.Nack()
 			} else {
@@ -813,22 +852,13 @@ func runPubSubConnection(cfg *Config) error {
 			fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
 
 			// Send rate_limited response back to user for immediate feedback
-			res := resultMsg{
-				ID:              cmd.ID,
-				WorkspaceID:     cmd.WorkspaceID,
-				UID:             cmd.UID,
-				AgentID:         cfg.AgentID,
-				Output:          "Command rate limit exceeded. Please wait before retrying.",
-				Status:          "rate_limited",
-				Ts:              time.Now().UnixMilli(),
-				Version:         Version,
-				RejectionReason: "RATE_LIMITED",
-			}
-			// Include session metadata so the backend can update the session document
-			if cmd.Type != "" && cmd.SessionID != "" {
-				res.Type = "session_error"
-				res.SessionID = cmd.SessionID
-			}
+			res := makeRejectionResult(
+				cmd,
+				cfg.AgentID,
+				"rate_limited",
+				"RATE_LIMITED",
+				"Command rate limit exceeded. Please wait before retrying.",
+			)
 			if err := publishMsg(ctx, topic, res); err != nil {
 				m.Nack()
 			} else {
@@ -860,22 +890,13 @@ func runPubSubConnection(cfg *Config) error {
 					m.Ack()
 					return
 				}
-				res := resultMsg{
-					ID:              cmd.ID,
-					WorkspaceID:     cmd.WorkspaceID,
-					UID:             cmd.UID,
-					AgentID:         cfg.AgentID,
-					Output:          "Command rejected: signature required but not provided",
-					Status:          "unauthorized",
-					Ts:              time.Now().UnixMilli(),
-					Version:         Version,
-					RejectionReason: "UNAUTHORIZED",
-				}
-				// Include session metadata so the backend can update the session document
-				if cmd.Type != "" && cmd.SessionID != "" {
-					res.Type = "session_error"
-					res.SessionID = cmd.SessionID
-				}
+				res := makeRejectionResult(
+					cmd,
+					cfg.AgentID,
+					"unauthorized",
+					"UNAUTHORIZED",
+					"Command rejected: signature required but not provided",
+				)
 				if err := publishMsg(ctx, topic, res); err != nil {
 					m.Nack()
 				} else {
@@ -891,22 +912,13 @@ func runPubSubConnection(cfg *Config) error {
 					m.Ack()
 					return
 				}
-				res := resultMsg{
-					ID:              cmd.ID,
-					WorkspaceID:     cmd.WorkspaceID,
-					UID:             cmd.UID,
-					AgentID:         cfg.AgentID,
-					Output:          "Command rejected: invalid signature",
-					Status:          "unauthorized",
-					Ts:              time.Now().UnixMilli(),
-					Version:         Version,
-					RejectionReason: "UNAUTHORIZED",
-				}
-				// Include session metadata so the backend can update the session document
-				if cmd.Type != "" && cmd.SessionID != "" {
-					res.Type = "session_error"
-					res.SessionID = cmd.SessionID
-				}
+				res := makeRejectionResult(
+					cmd,
+					cfg.AgentID,
+					"unauthorized",
+					"UNAUTHORIZED",
+					"Command rejected: invalid signature",
+				)
 				if err := publishMsg(ctx, topic, res); err != nil {
 					m.Nack()
 				} else {
@@ -934,20 +946,13 @@ func runPubSubConnection(cfg *Config) error {
 				switch result {
 				case ApprovalDeny:
 					fmt.Printf("%s[aiexpedite] Session command denied by user%s\n", colorYellow, colorReset)
-					res := resultMsg{
-						ID:              cmd.ID,
-						WorkspaceID:     cmd.WorkspaceID,
-						UID:             cmd.UID,
-						AgentID:         cfg.AgentID,
-						Output:          "Command denied by user: not in allow list",
-						Status:          "denied",
-						Ts:              time.Now().UnixMilli(),
-						Version:         Version,
-						Cwd:             getTrackedCwd(),
-						RejectionReason: "ALLOWLIST_DENIED",
-						Type:            "session_error",
-						SessionID:       cmd.SessionID,
-					}
+					res := makeRejectionResult(
+						cmd,
+						cfg.AgentID,
+						"denied",
+						"ALLOWLIST_DENIED",
+						"Command denied by user: not in allow list",
+					)
 					if err := publishMsg(ctx, topic, res); err != nil {
 						m.Nack()
 					} else {
@@ -990,18 +995,13 @@ func runPubSubConnection(cfg *Config) error {
 				fmt.Printf("%s[aiexpedite] Command denied by user%s\n", colorYellow, colorReset)
 
 				// Send denial result back to backend
-				res := resultMsg{
-					ID:              cmd.ID,
-					WorkspaceID:     cmd.WorkspaceID,
-					UID:             cmd.UID,
-					AgentID:         cfg.AgentID,
-					Output:          "Command denied by user: not in allow list",
-					Status:          "denied",
-					Ts:              time.Now().UnixMilli(),
-					Version:         Version,
-					Cwd:             getTrackedCwd(),
-					RejectionReason: "ALLOWLIST_DENIED",
-				}
+				res := makeRejectionResult(
+					cmd,
+					cfg.AgentID,
+					"denied",
+					"ALLOWLIST_DENIED",
+					"Command denied by user: not in allow list",
+				)
 				if err := publishMsg(ctx, topic, res); err != nil {
 					m.Nack()
 				} else {
