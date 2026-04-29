@@ -169,3 +169,109 @@ func TestMakeRejectionResult_EmptyCmdCwdProducesEmptyResultCwd(t *testing.T) {
 		t.Errorf("Cwd = %q, want empty (cmd.Cwd was empty)", res.Cwd)
 	}
 }
+
+// ─── attachCmdContext (used by both rejection and failure paths) ────────────
+
+func TestAttachCmdContext_PopulatesEmptyFields(t *testing.T) {
+	cmd := commandMsg{
+		Command: "claude",
+		Args:    []string{"implement the login page"},
+		Cwd:     "/Users/daniel/aiexpedite/ai-service",
+	}
+	res := resultMsg{} // nothing populated
+
+	attachCmdContext(&res, cmd)
+
+	if res.Command != "claude" {
+		t.Errorf("Command = %q, want %q", res.Command, "claude")
+	}
+	if len(res.Args) != 1 || res.Args[0] != "implement the login page" {
+		t.Errorf("Args = %v, want [implement the login page]", res.Args)
+	}
+	if res.Cwd != "/Users/daniel/aiexpedite/ai-service" {
+		t.Errorf("Cwd = %q, want the requested cwd", res.Cwd)
+	}
+}
+
+func TestAttachCmdContext_DoesNotClobberPrePopulatedFields(t *testing.T) {
+	// Authoritative field already set on the result (e.g. session_ended
+	// passes the running session's Cwd, not the requested one) — must
+	// not be overwritten.
+	cmd := commandMsg{
+		Command: "claude",
+		Args:    []string{"alpha"},
+		Cwd:     "/requested/path",
+	}
+	res := resultMsg{
+		Command: "preset-cmd",
+		Args:    []string{"preset-arg"},
+		Cwd:     "/already/set",
+	}
+
+	attachCmdContext(&res, cmd)
+
+	if res.Command != "preset-cmd" {
+		t.Errorf("Command was clobbered: %q", res.Command)
+	}
+	if len(res.Args) != 1 || res.Args[0] != "preset-arg" {
+		t.Errorf("Args were clobbered: %v", res.Args)
+	}
+	if res.Cwd != "/already/set" {
+		t.Errorf("Cwd was clobbered: %q", res.Cwd)
+	}
+}
+
+func TestAttachCmdContext_RedactsSecretsBeforeAttaching(t *testing.T) {
+	// Secrets in args must be scrubbed BEFORE the message hits Pub/Sub
+	// — same redaction guarantee makeRejectionResult provides for the
+	// rejection path, now extended to the failure path.
+	cmd := commandMsg{
+		Command: "curl",
+		Args: []string{
+			"-H",
+			"Authorization: Bearer sk-live-fakekey-1234567890abcdef",
+		},
+	}
+	res := resultMsg{}
+
+	attachCmdContext(&res, cmd)
+
+	joined := strings.Join(res.Args, " ")
+	if strings.Contains(joined, "sk-live-fakekey-1234567890abcdef") {
+		t.Errorf("redaction failed — token leaked into Args: %q", joined)
+	}
+	if !strings.Contains(joined, "[REDACTED]") {
+		t.Errorf("expected [REDACTED] marker, got %q", joined)
+	}
+}
+
+func TestAttachCmdContext_HandlesEmptyCmdGracefully(t *testing.T) {
+	// e.g. cmd was malformed at the boundary — attachCmdContext should
+	// not panic or invent values.
+	cmd := commandMsg{}
+	res := resultMsg{}
+
+	attachCmdContext(&res, cmd)
+
+	if res.Command != "" || len(res.Args) != 0 || res.Cwd != "" {
+		t.Errorf("attached non-empty values from empty cmd: %+v", res)
+	}
+}
+
+func TestAttachCmdContext_LeavesArgsAloneWhenCmdHasNone(t *testing.T) {
+	// Don't overwrite an existing non-empty Args slice with a nil/empty
+	// one from cmd. Symmetric with the pre-populated test above.
+	cmd := commandMsg{
+		Command: "ls",
+		// Args nil
+	}
+	res := resultMsg{
+		Args: []string{"-la"}, // pretend an upstream caller already set this
+	}
+
+	attachCmdContext(&res, cmd)
+
+	if len(res.Args) != 1 || res.Args[0] != "-la" {
+		t.Errorf("Args clobbered when cmd had none: %v", res.Args)
+	}
+}
