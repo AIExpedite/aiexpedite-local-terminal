@@ -107,20 +107,34 @@ type gpuInfo struct {
 // when the host has no battery (most desktops). The agent's task-routing
 // can use this to avoid scheduling long-running work onto a laptop on
 // battery — discharge-killing the agent mid-task is the worst failure mode.
+//
+// No `omitempty` on Charging/Plugged/Level: when batteryInfo is emitted at
+// all, the probe ran successfully and `Present=true` was already set, so
+// the false/0 values for these fields are meaningful states (e.g. critical
+// unplugged laptop = `{present:true, charging:false, plugged:false, level:3.0}`).
+// Dropping them would make "explicitly on battery / nearly empty"
+// indistinguishable from "unknown" and break the avoid-laptop-on-battery
+// heuristic on the routing side.
 type batteryInfo struct {
 	Present  bool    `json:"present"`
-	Charging bool    `json:"charging,omitempty"`          // true when plugged in AND not full
-	Plugged  bool    `json:"plugged,omitempty"`           // AC connected (independent of charging state)
-	Level    float64 `json:"level,omitempty"`             // 0.0 - 100.0 percent remaining
+	Charging bool    `json:"charging"`                    // true when plugged in AND not full
+	Plugged  bool    `json:"plugged"`                     // AC connected (independent of charging state)
+	Level    float64 `json:"level"`                       // 0.0 - 100.0 percent remaining
 }
 
 // liveInfo carries near-real-time load metrics. Refreshed on every gather
 // (every 6h by default; can be re-gathered on demand later if we add an
 // idle-aware task router). cpu.Percent runs over a 1-second window so
 // the value is meaningful, not the cumulative-since-boot average.
+//
+// No `omitempty`: composeLiveInfo only returns a non-nil *liveInfo when at
+// least one probe succeeded, so an emitted liveInfo with cpuPct=0/memPct=0
+// represents a genuinely-idle host, not a missing measurement. omitempty
+// would erase that distinction on the wire and downstream routing logic
+// could no longer treat the machine as a known-idle candidate.
 type liveInfo struct {
-	CPUPct float64 `json:"cpuPct,omitempty"`              // 0.0 - 100.0
-	MemPct float64 `json:"memPct,omitempty"`              // 0.0 - 100.0
+	CPUPct float64 `json:"cpuPct"`                        // 0.0 - 100.0
+	MemPct float64 `json:"memPct"`                        // 0.0 - 100.0
 }
 
 // MachineInfo is the full payload sent to terminal-service. The backend's

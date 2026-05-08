@@ -359,3 +359,36 @@ func TestMachineInfo_JSONShape_DockerRunningFalseSerializes(t *testing.T) {
 		t.Errorf("expected dockerRunning:false in JSON; got: %s", string(b))
 	}
 }
+
+// Codex P1/P2 (PR #16): batteryInfo.{Charging,Plugged,Level} and
+// liveInfo.{CPUPct,MemPct} must NOT have `omitempty`. When the parent
+// struct is emitted at all, the probe ran successfully and false/0 are
+// meaningful states (idle host, critical unplugged laptop). Dropping them
+// would erase the distinction between "explicitly false/zero" and
+// "unknown/missing", breaking task-routing heuristics that key off these
+// values (avoid-laptop-on-battery, prefer-idle-host).
+func TestMachineInfo_JSONShape_BatteryAndLiveZeroValuesPreserved(t *testing.T) {
+	// Critical unplugged laptop at 0% — every battery field is either
+	// false or zero, but each is a meaningful explicit measurement.
+	mi := &MachineInfo{
+		Battery: &batteryInfo{Present: true, Charging: false, Plugged: false, Level: 0},
+		Live:    &liveInfo{CPUPct: 0, MemPct: 0},
+	}
+	b, err := json.Marshal(mi)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	out := string(b)
+	for _, want := range []string{
+		`"present":true`,
+		`"charging":false`,
+		`"plugged":false`,
+		`"level":0`,
+		`"cpuPct":0`,
+		`"memPct":0`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in JSON (zero/false must NOT be omitted); got: %s", want, out)
+		}
+	}
+}
