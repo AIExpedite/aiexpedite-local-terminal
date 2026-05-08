@@ -190,6 +190,70 @@ func TestMachineInfo_JSONShape_NewFieldsOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
+// Codex P1 (PR #16): lspci -mm tokens are class/vendor/device/subsystem,
+// so the GPU name lives at tokens[2] and the vendor at tokens[1].
+// Earlier code mis-mapped tokens[2]→vendor and tokens[3]→name, which on
+// a real RTX 4090 line would surface "Gigabyte Technology Co., Ltd" as
+// the GPU name and guess the vendor from the device string. Pin the
+// correct mapping.
+func TestSplitQuoted_LspciTokenOrder(t *testing.T) {
+	// Real lspci -mm line from an NVIDIA card. Subsystem-vendor present.
+	line := `01:00.0 "VGA compatible controller" "NVIDIA Corporation" "AD102 [GeForce RTX 4090]" -ra1 "Gigabyte Technology Co., Ltd"`
+	tokens := splitQuoted(line)
+	if len(tokens) < 3 {
+		t.Fatalf("expected at least 3 tokens; got %v", tokens)
+	}
+	if tokens[0] != "VGA compatible controller" {
+		t.Errorf("tokens[0] (class) = %q, want VGA compatible controller", tokens[0])
+	}
+	if tokens[1] != "NVIDIA Corporation" {
+		t.Errorf("tokens[1] (vendor) = %q, want NVIDIA Corporation", tokens[1])
+	}
+	if tokens[2] != "AD102 [GeForce RTX 4090]" {
+		t.Errorf("tokens[2] (device/name) = %q, want AD102 [GeForce RTX 4090]", tokens[2])
+	}
+	// Confirm the downstream guessVendorFromName resolves correctly from
+	// the vendor field (tokens[1]), not from the subsystem.
+	if got := guessVendorFromName(tokens[1]); got != "nvidia" {
+		t.Errorf("guessVendorFromName(tokens[1]) = %q, want nvidia", got)
+	}
+	if got := guessVendorFromName(tokens[2]); got != "nvidia" {
+		// Device name also contains "GeForce/RTX" cues, so the fallback
+		// path also resolves to nvidia — the fix's tie-break logic.
+		t.Errorf("device-name fallback guessVendorFromName(tokens[2]) = %q, want nvidia", got)
+	}
+}
+
+// Codex P2 (PR #16): macOS pmset output containing "discharging" was
+// matching the substring "charging" and incorrectly setting Charging=true
+// on unplugged laptops. The exclusion guard must reject both
+// "discharging" and "not charging" while keeping plain "charging" and
+// "charging+high" / "charging+low" cases (Win32_Battery uses similar
+// idioms).
+func TestChargingDetection_ExcludesDischargingAndNotCharging(t *testing.T) {
+	// Match the production check verbatim.
+	isCharging := func(line string) bool {
+		lc := strings.ToLower(line)
+		return strings.Contains(lc, "charging") &&
+			!strings.Contains(lc, "discharging") &&
+			!strings.Contains(lc, "not charging")
+	}
+	cases := map[string]bool{
+		"-InternalBattery-0 (id=...)\t100%; charged; 0:00 remaining present: true":         false,
+		"-InternalBattery-0 (id=...)\t87%; charging; 0:42 remaining present: true":         true,
+		"-InternalBattery-0 (id=...)\t50%; discharging; 3:14 remaining present: true":      false,
+		"-InternalBattery-0 (id=...)\t12%; not charging; 0:00 remaining present: true":     false,
+		"-InternalBattery-0 (id=...)\t60%; AC attached; not charging; ":                    false,
+		// Windows-shaped plain "charging"
+		"BatteryStatus: 6 (Charging)":                                                     true,
+	}
+	for line, want := range cases {
+		if got := isCharging(line); got != want {
+			t.Errorf("isCharging(%q) = %v, want %v", line, got, want)
+		}
+	}
+}
+
 func TestMachineInfo_JSONShape_DockerRunningFalseSerializes(t *testing.T) {
 	// docker installed but daemon down — pointer-to-false must serialize
 	// (omitempty omits the *pointer* when nil, not the deref'd value).

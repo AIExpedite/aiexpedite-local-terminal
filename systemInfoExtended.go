@@ -284,15 +284,32 @@ func gatherGPULinux() []gpuInfo {
 				!strings.Contains(lower, `"display controller"`) {
 				continue
 			}
-			// `01:00.0 "VGA compatible controller" "NVIDIA Corporation" "AD102 [GeForce RTX 4090]"` ...
-			// Extract the 3rd and 4th quoted tokens.
+			// lspci -mm format (with bus ID stripped — splitQuoted only
+			// returns the quoted tokens):
+			//   tokens[0] = class       ("VGA compatible controller")
+			//   tokens[1] = vendor      ("NVIDIA Corporation")
+			//   tokens[2] = device      ("AD102 [GeForce RTX 4090]")  ← what we want as Name
+			//   tokens[3] = subsystem-vendor (optional, "Gigabyte Technology Co., Ltd")
+			//
+			// Earlier this code read tokens[2] as vendor and tokens[3] as
+			// name, which mapped the GPU name to the BOARD MAKER and
+			// guessed vendor from the device string — Codex review on PR #16
+			// flagged that anywhere nvidia-smi was unavailable, the routing
+			// signal this field provides was systematically wrong.
 			tokens := splitQuoted(line)
-			if len(tokens) < 4 {
+			if len(tokens) < 3 {
 				continue
 			}
-			vendor := guessVendorFromName(tokens[2])
+			vendorRaw := tokens[1]
+			nameRaw := strings.TrimSpace(tokens[2])
+			// Prefer the explicit vendor field; if it normalises to "other"
+			// (e.g. obscure rebrand), try the device name as a tie-breaker.
+			vendor := guessVendorFromName(vendorRaw)
+			if vendor == "other" {
+				vendor = guessVendorFromName(nameRaw)
+			}
 			gpus = append(gpus, gpuInfo{
-				Name:   strings.TrimSpace(tokens[3]),
+				Name:   nameRaw,
 				Vendor: vendor,
 			})
 		}
@@ -396,8 +413,15 @@ func gatherBatteryDarwin() *batteryInfo {
 		}
 		// Charging vs charged vs discharging — the line carries one of:
 		// "charging", "charged", "discharging", "AC attached".
+		// Substring-match `"charging"` matches BOTH "charging" and
+		// "discharging" (and "not charging"). Codex review on PR #16
+		// flagged that earlier code marked unplugged laptops as charging.
+		// Exclude both "discharging" and "not charging" to leave only the
+		// genuine "charging" / "charging+full" cases.
 		lc := strings.ToLower(line)
-		if strings.Contains(lc, "charging") && !strings.Contains(lc, "not charging") {
+		if strings.Contains(lc, "charging") &&
+			!strings.Contains(lc, "discharging") &&
+			!strings.Contains(lc, "not charging") {
 			bi.Charging = true
 		}
 	}
