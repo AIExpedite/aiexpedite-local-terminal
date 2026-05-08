@@ -203,6 +203,19 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 		if mi.CollectedAt != "" {
 			payload["collectedAt"] = mi.CollectedAt
 		}
+		// Tier 1+2 additions (machine task-routability hints).
+		if len(mi.GPU) > 0 {
+			payload["gpu"] = mi.GPU
+		}
+		if mi.Battery != nil {
+			payload["battery"] = mi.Battery
+		}
+		if mi.Live != nil {
+			payload["live"] = mi.Live
+		}
+		if mi.DockerRunning != nil {
+			payload["dockerRunning"] = *mi.DockerRunning
+		}
 	}
 
 	body, err := json.Marshal(payload)
