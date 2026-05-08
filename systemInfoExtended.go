@@ -66,20 +66,38 @@ func gatherDockerRunning() *bool {
 // `cpu.Percent(0, false)` returns the cumulative-since-boot average,
 // which masks any current load. Memory percent is instantaneous.
 //
-// Returns nil only when both probes fail (extremely rare; gopsutil
-// handles every supported platform).
+// Returns nil only when BOTH probes fail. Successful probes that return
+// a literal 0 (genuine idle host on a large-RAM box) are kept — Codex
+// review on PR #16 flagged that the earlier `if both==0 return nil`
+// guard dropped legitimate idle samples and hid the distinction
+// "probe failed" vs "host idle" from downstream consumers.
 func gatherLiveLoad() *liveInfo {
-	li := &liveInfo{}
+	var cpuPct, memPct float64
+	var cpuOK, memOK bool
 	if pcts, err := cpu.Percent(time.Second, false); err == nil && len(pcts) > 0 {
-		li.CPUPct = roundPct(pcts[0])
+		cpuPct = pcts[0]
+		cpuOK = true
 	}
 	if vmem, err := mem.VirtualMemory(); err == nil {
-		li.MemPct = roundPct(vmem.UsedPercent)
+		memPct = vmem.UsedPercent
+		memOK = true
 	}
-	if li.CPUPct == 0 && li.MemPct == 0 {
+	return composeLiveInfo(cpuPct, cpuOK, memPct, memOK)
+}
+
+// composeLiveInfo returns a populated liveInfo when AT LEAST one probe
+// succeeded, even if the successful probe returned 0. Returns nil only
+// when both probes failed. Split out from gatherLiveLoad so the
+// success-vs-zero distinction is unit-testable without mocking
+// gopsutil's package-level functions.
+func composeLiveInfo(cpuPct float64, cpuOK bool, memPct float64, memOK bool) *liveInfo {
+	if !cpuOK && !memOK {
 		return nil
 	}
-	return li
+	return &liveInfo{
+		CPUPct: roundPct(cpuPct),
+		MemPct: roundPct(memPct),
+	}
 }
 
 func roundPct(v float64) float64 {

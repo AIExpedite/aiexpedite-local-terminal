@@ -21,6 +21,58 @@ import (
 	"testing"
 )
 
+// Codex P2 (PR #16): the earlier gatherLiveLoad returned nil when both
+// rounded values were 0, dropping legitimate idle-host samples. The fix
+// tracks per-probe success and returns nil only when BOTH probes failed.
+// composeLiveInfo is the testable kernel of that logic.
+func TestComposeLiveInfo(t *testing.T) {
+	cases := []struct {
+		name     string
+		cpuPct   float64
+		cpuOK    bool
+		memPct   float64
+		memOK    bool
+		wantNil  bool
+		wantCPU  float64
+		wantMem  float64
+	}{
+		// Both probes succeed with non-zero — typical hot host
+		{"hot host", 73.5, true, 81.2, true, false, 73.5, 81.2},
+		// Both probes succeed with zero — genuinely idle host. Must NOT
+		// be treated as failure: downstream task-routing wants to know
+		// "this big-RAM workstation is fully free" vs "we couldn't probe".
+		{"idle host (legit zeros)", 0, true, 0, true, false, 0, 0},
+		// Mixed: one probe succeeded with zero, the other returned a real value
+		{"cpu zero, mem real", 0, true, 42.1, true, false, 0, 42.1},
+		{"mem zero, cpu real", 12.7, true, 0, true, false, 12.7, 0},
+		// One probe failed: keep the successful one, zero out the failed one
+		{"cpu probe failed", 0, false, 50.0, true, false, 0, 50.0},
+		{"mem probe failed", 30.0, true, 0, false, false, 30.0, 0},
+		// Both probes failed: nil (the only nil case)
+		{"both probes failed", 0, false, 0, false, true, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := composeLiveInfo(tc.cpuPct, tc.cpuOK, tc.memPct, tc.memOK)
+			if tc.wantNil {
+				if got != nil {
+					t.Errorf("expected nil, got %+v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected non-nil liveInfo, got nil")
+			}
+			if got.CPUPct != tc.wantCPU {
+				t.Errorf("CPUPct = %v, want %v", got.CPUPct, tc.wantCPU)
+			}
+			if got.MemPct != tc.wantMem {
+				t.Errorf("MemPct = %v, want %v", got.MemPct, tc.wantMem)
+			}
+		})
+	}
+}
+
 func TestRoundPct(t *testing.T) {
 	cases := []struct {
 		in   float64
