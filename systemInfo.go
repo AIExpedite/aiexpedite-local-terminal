@@ -209,7 +209,6 @@ func gatherMachineInfo() *MachineInfo {
 	for _, rt := range []struct{ Key, Cmd, Flag string }{
 		{"node", "node", "--version"},
 		{"python", pythonCmd, "--version"},
-		{"java", "java", "--version"},
 		{"go", "go", "version"},
 		{"dotnet", "dotnet", "--version"},
 		{"ruby", "ruby", "--version"},
@@ -217,6 +216,19 @@ func gatherMachineInfo() *MachineInfo {
 		if v := probeVersion(rt.Cmd, rt.Flag); v != "" {
 			info.Runtimes[rt.Key] = v
 		}
+	}
+
+	// Java is special-cased: `java --version` (two dashes) only works on
+	// Java 9+; Java 8 treats it as a class name lookup, fails to load,
+	// and exits non-zero. Without the fallback, every JRE/JDK 8 host
+	// (still common on enterprise / older dev boxes) would be reported
+	// as missing Java even when it's installed.  Try the modern flag
+	// first since most hosts are on 11/17/21 now, fall back to the
+	// legacy single-dash form on failure.
+	if v := probeVersion("java", "--version"); v != "" {
+		info.Runtimes["java"] = v
+	} else if v := probeVersion("java", "-version"); v != "" {
+		info.Runtimes["java"] = v
 	}
 
 	// Tools + package managers
