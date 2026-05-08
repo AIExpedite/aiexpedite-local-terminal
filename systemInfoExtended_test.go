@@ -21,6 +21,46 @@ import (
 	"testing"
 )
 
+// Codex P2 (PR #16): gatherBatteryLinux only recognised power-supply
+// type "Mains" as external power, missing USB / USB_PD / USB_C / etc.
+// that modern USB-C laptops expose. Pin the broader matcher so a future
+// rename or additional kernel-introduced subtype doesn't silently
+// regress the avoid-laptop-on-battery heuristic.
+func TestLinuxLinePowerTypeMatcher(t *testing.T) {
+	// Mirror the production switch case literally — keep this in sync if
+	// gatherBatteryLinux's predicate changes.
+	isLinePower := func(typ string) bool {
+		typLower := strings.ToLower(typ)
+		return typLower == "mains" ||
+			typLower == "wireless" ||
+			strings.HasPrefix(typLower, "usb")
+	}
+	cases := map[string]bool{
+		// classic AC adapter
+		"Mains": true,
+		"mains": true,
+		// USB-C laptops (the regression case)
+		"USB":         true,
+		"USB_PD":      true,
+		"USB_PD_DRP":  true,
+		"USB_C":       true,
+		"USB_CDP":     true,
+		"USB_DCP":     true,
+		"usb_pd":      true,
+		// wireless charging pads
+		"Wireless": true,
+		// not line power
+		"Battery": false,
+		"":        false,
+		"Unknown": false,
+	}
+	for typ, want := range cases {
+		if got := isLinePower(typ); got != want {
+			t.Errorf("isLinePower(%q) = %v, want %v", typ, got, want)
+		}
+	}
+}
+
 // Codex P2 (PR #16): the earlier gatherLiveLoad returned nil when both
 // rounded values were 0, dropping legitimate idle-host samples. The fix
 // tracks per-probe success and returns nil only when BOTH probes failed.

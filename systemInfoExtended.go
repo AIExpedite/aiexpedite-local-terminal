@@ -482,6 +482,21 @@ func gatherBatteryWindows() *batteryInfo {
 }
 
 // Linux: read /sys/class/power_supply directly. No shell-out needed.
+//
+// Power-supply types we treat as "external power":
+//   - "Mains"    — wall AC adapter (the legacy / classic case)
+//   - "USB"      — generic USB power input
+//   - "USB_PD"   — USB Power Delivery (modern USB-C laptops)
+//   - "USB_PD_DRP" — USB-C dual-role port (host or device)
+//   - "USB_C", "USB_CDP", "USB_DCP" — variants surfaced by some kernels
+//   - "Wireless" — Qi / wireless charging pad
+//
+// Earlier code recognised only "Mains", so modern USB-C laptops connected
+// to a USB-PD charger were reported as `plugged=false` while clearly on
+// external power — Codex review on PR #16 flagged that this skews the
+// task router's avoid-laptop-on-battery heuristic. Match the prefix
+// "usb" plus the explicit mains/wireless tokens so any current or
+// near-future USB power-delivery variant is recognised.
 func gatherBatteryLinux() *batteryInfo {
 	supplyDir := "/sys/class/power_supply"
 	entries, err := readDir(supplyDir)
@@ -491,8 +506,9 @@ func gatherBatteryLinux() *batteryInfo {
 	bi := &batteryInfo{}
 	for _, name := range entries {
 		typ := readTrim(filepath.Join(supplyDir, name, "type"))
-		switch strings.ToLower(typ) {
-		case "battery":
+		typLower := strings.ToLower(typ)
+		switch {
+		case typLower == "battery":
 			bi.Present = true
 			if cap := readTrim(filepath.Join(supplyDir, name, "capacity")); cap != "" {
 				if v, err := strconv.ParseFloat(cap, 64); err == nil {
@@ -503,7 +519,7 @@ func gatherBatteryLinux() *batteryInfo {
 			if st == "charging" {
 				bi.Charging = true
 			}
-		case "mains":
+		case typLower == "mains" || typLower == "wireless" || strings.HasPrefix(typLower, "usb"):
 			if readTrim(filepath.Join(supplyDir, name, "online")) == "1" {
 				bi.Plugged = true
 			}
