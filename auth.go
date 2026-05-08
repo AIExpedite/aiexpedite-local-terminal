@@ -158,6 +158,53 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 		"version":    Version,
 	}
 
+	// Embed machine-level metadata (CPU/RAM/disk/runtimes/shell/cliAgents/
+	// architecture) gathered by systemInfo.go's background goroutine. The
+	// backend lifts these fields onto the top-level `terminalAgents/{id}`
+	// doc — Phase 2 of the platform/systemInfo consolidation. Before this,
+	// machine info was gathered by an LLM-driven discovery probe that was
+	// non-deterministic across devices (the missing-RAM-on-some-devices
+	// bug). The Go-side gather is deterministic.
+	//
+	// The cache may be nil if the first gather hasn't completed yet (rare —
+	// only on the very first /auth/token after startup, before the gather
+	// goroutine returns). In that case we send the request without these
+	// fields and terminal-service falls back to the legacy workspace
+	// systemInfo path.
+	if mi := GetMachineInfo(); mi != nil {
+		payload["architecture"] = mi.Architecture
+		if mi.CPU != nil {
+			payload["cpu"] = mi.CPU
+		}
+		if mi.Memory != nil {
+			payload["memory"] = mi.Memory
+		}
+		if len(mi.Disk) > 0 {
+			payload["disk"] = mi.Disk
+		}
+		if len(mi.Runtimes) > 0 {
+			payload["runtimes"] = mi.Runtimes
+		}
+		if len(mi.PackageManagers) > 0 {
+			payload["packageManagers"] = mi.PackageManagers
+		}
+		if len(mi.Tools) > 0 {
+			payload["tools"] = mi.Tools
+		}
+		if mi.Shell != nil {
+			payload["shell"] = mi.Shell
+		}
+		if len(mi.DetectedCliAgents) > 0 {
+			payload["detectedCliAgents"] = mi.DetectedCliAgents
+		}
+		if mi.Capabilities != nil {
+			payload["capabilities"] = mi.Capabilities
+		}
+		if mi.CollectedAt != "" {
+			payload["collectedAt"] = mi.CollectedAt
+		}
+	}
+
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal request: %w", err)

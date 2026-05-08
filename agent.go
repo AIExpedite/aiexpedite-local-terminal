@@ -254,6 +254,14 @@ func StartAgent(cfg *Config) {
 	go globalSessionManager.CleanupStale(sessionMaxLifetime)
 	fmt.Println("[aiexpedite] Session manager ready")
 
+	/* 3c. Begin gathering machine info for /auth/token uploads ------------ */
+	// Runs in a background goroutine so we don't block startup. The first
+	// gather typically completes within a few seconds, comfortably before
+	// the first token request needs it. If it hasn't finished yet,
+	// auth.go's getOIDCToken sees a nil cache and sends the request without
+	// the new fields — terminal-service handles the absence gracefully.
+	StartMachineInfoGathering()
+
 	/* 4. Start Pub/Sub loop (non‑blocking) -------------------------------- */
 
 	// If the user disconnected from cloud in a previous session, skip the
