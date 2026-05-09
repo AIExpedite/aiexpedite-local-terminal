@@ -98,9 +98,9 @@ type capabilitiesInfo struct {
 // jobs need NVIDIA; Metal jobs need Apple).
 type gpuInfo struct {
 	Name     string  `json:"name,omitempty"`
-	Vendor   string  `json:"vendor,omitempty"`            // "apple" | "nvidia" | "amd" | "intel" | "other"
-	MemoryGB float64 `json:"memoryGB,omitempty"`          // VRAM (or unified memory share on Apple Silicon)
-	Driver   string  `json:"driver,omitempty"`            // optional driver/runtime version (e.g. "535.171.04" on NVIDIA)
+	Vendor   string  `json:"vendor,omitempty"`   // "apple" | "nvidia" | "amd" | "intel" | "other"
+	MemoryGB float64 `json:"memoryGB,omitempty"` // VRAM (or unified memory share on Apple Silicon)
+	Driver   string  `json:"driver,omitempty"`   // optional driver/runtime version (e.g. "535.171.04" on NVIDIA)
 }
 
 // batteryInfo describes the host's battery state. Absent (returned nil)
@@ -117,9 +117,9 @@ type gpuInfo struct {
 // heuristic on the routing side.
 type batteryInfo struct {
 	Present  bool    `json:"present"`
-	Charging bool    `json:"charging"`                    // true when plugged in AND not full
-	Plugged  bool    `json:"plugged"`                     // AC connected (independent of charging state)
-	Level    float64 `json:"level"`                       // 0.0 - 100.0 percent remaining
+	Charging bool    `json:"charging"` // true when plugged in AND not full
+	Plugged  bool    `json:"plugged"`  // AC connected (independent of charging state)
+	Level    float64 `json:"level"`    // 0.0 - 100.0 percent remaining
 }
 
 // liveInfo carries near-real-time load metrics. Refreshed on every gather
@@ -133,8 +133,8 @@ type batteryInfo struct {
 // would erase that distinction on the wire and downstream routing logic
 // could no longer treat the machine as a known-idle candidate.
 type liveInfo struct {
-	CPUPct float64 `json:"cpuPct"`                        // 0.0 - 100.0
-	MemPct float64 `json:"memPct"`                        // 0.0 - 100.0
+	CPUPct float64 `json:"cpuPct"` // 0.0 - 100.0
+	MemPct float64 `json:"memPct"` // 0.0 - 100.0
 }
 
 // MachineInfo is the full payload sent to terminal-service. The backend's
@@ -152,7 +152,7 @@ type MachineInfo struct {
 	Runtimes          map[string]string           `json:"runtimes,omitempty"`
 	PackageManagers   map[string]string           `json:"packageManagers,omitempty"`
 	Tools             map[string]string           `json:"tools,omitempty"`
-	DockerRunning     *bool                       `json:"dockerRunning,omitempty"`     // pointer so JSON omits when probe didn't run; false = installed but daemon down
+	DockerRunning     *bool                       `json:"dockerRunning,omitempty"` // pointer so JSON omits when probe didn't run; false = installed but daemon down
 	Shell             *shellInfo                  `json:"shell,omitempty"`
 	DetectedCliAgents map[string]detectedCLIAgent `json:"detectedCliAgents,omitempty"`
 	Capabilities      *capabilitiesInfo           `json:"capabilities,omitempty"`

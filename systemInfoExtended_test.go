@@ -40,13 +40,13 @@ func TestLinuxLinePowerTypeMatcher(t *testing.T) {
 		"Mains": true,
 		"mains": true,
 		// USB-C laptops (the regression case)
-		"USB":         true,
-		"USB_PD":      true,
-		"USB_PD_DRP":  true,
-		"USB_C":       true,
-		"USB_CDP":     true,
-		"USB_DCP":     true,
-		"usb_pd":      true,
+		"USB":        true,
+		"USB_PD":     true,
+		"USB_PD_DRP": true,
+		"USB_C":      true,
+		"USB_CDP":    true,
+		"USB_DCP":    true,
+		"usb_pd":     true,
 		// wireless charging pads
 		"Wireless": true,
 		// not line power
@@ -67,14 +67,14 @@ func TestLinuxLinePowerTypeMatcher(t *testing.T) {
 // composeLiveInfo is the testable kernel of that logic.
 func TestComposeLiveInfo(t *testing.T) {
 	cases := []struct {
-		name     string
-		cpuPct   float64
-		cpuOK    bool
-		memPct   float64
-		memOK    bool
-		wantNil  bool
-		wantCPU  float64
-		wantMem  float64
+		name    string
+		cpuPct  float64
+		cpuOK   bool
+		memPct  float64
+		memOK   bool
+		wantNil bool
+		wantCPU float64
+		wantMem float64
 	}{
 		// Both probes succeed with non-zero — typical hot host
 		{"hot host", 73.5, true, 81.2, true, false, 73.5, 81.2},
@@ -178,15 +178,15 @@ func TestNormalizeAppleVendor(t *testing.T) {
 
 func TestGuessVendorFromName(t *testing.T) {
 	cases := map[string]string{
-		"NVIDIA GeForce RTX 4090":          "nvidia",
-		"GeForce GTX 1660":                 "nvidia",
-		"AMD Radeon Pro 5500M":             "amd",
-		"ATI Radeon HD 5450":               "amd",
-		"Intel(R) UHD Graphics 630":        "intel",
-		"Intel Iris Plus":                  "intel",
-		"Apple M2 Pro":                     "apple",
-		"Bochs Display":                    "other",
-		"":                                 "other",
+		"NVIDIA GeForce RTX 4090":   "nvidia",
+		"GeForce GTX 1660":          "nvidia",
+		"AMD Radeon Pro 5500M":      "amd",
+		"ATI Radeon HD 5450":        "amd",
+		"Intel(R) UHD Graphics 630": "intel",
+		"Intel Iris Plus":           "intel",
+		"Apple M2 Pro":              "apple",
+		"Bochs Display":             "other",
+		"":                          "other",
 	}
 	for in, want := range cases {
 		got := guessVendorFromName(in)
@@ -387,13 +387,13 @@ func TestChargingDetection_ExcludesDischargingAndNotCharging(t *testing.T) {
 			!strings.Contains(lc, "not charging")
 	}
 	cases := map[string]bool{
-		"-InternalBattery-0 (id=...)\t100%; charged; 0:00 remaining present: true":         false,
-		"-InternalBattery-0 (id=...)\t87%; charging; 0:42 remaining present: true":         true,
-		"-InternalBattery-0 (id=...)\t50%; discharging; 3:14 remaining present: true":      false,
-		"-InternalBattery-0 (id=...)\t12%; not charging; 0:00 remaining present: true":     false,
-		"-InternalBattery-0 (id=...)\t60%; AC attached; not charging; ":                    false,
+		"-InternalBattery-0 (id=...)\t100%; charged; 0:00 remaining present: true":     false,
+		"-InternalBattery-0 (id=...)\t87%; charging; 0:42 remaining present: true":     true,
+		"-InternalBattery-0 (id=...)\t50%; discharging; 3:14 remaining present: true":  false,
+		"-InternalBattery-0 (id=...)\t12%; not charging; 0:00 remaining present: true": false,
+		"-InternalBattery-0 (id=...)\t60%; AC attached; not charging; ":                false,
 		// Windows-shaped plain "charging"
-		"BatteryStatus: 6 (Charging)":                                                     true,
+		"BatteryStatus: 6 (Charging)": true,
 	}
 	for line, want := range cases {
 		if got := isCharging(line); got != want {
