@@ -407,12 +407,31 @@ func guessVendorFromName(name string) string {
 
 // splitQuoted parses lspci -mm-style output: tokens are double-quoted,
 // separated by spaces. Returns the unquoted token strings.
+//
+// Escape handling (Codex P2, PR #16, fourth review): per lspci(8), values
+// are "quoted and escaped if necessary" — `\"` represents a literal `"`
+// inside a token and `\\` represents a literal `\`. Without escape-aware
+// parsing, a vendor/device name containing a quote (rare but legal: some
+// OEM strings include trademark marks like `Foo "Bar" Inc.`) would
+// terminate the token early, shift every subsequent token's index, and
+// corrupt name/vendor extraction. Inside a quoted token, when we see a
+// backslash we copy the NEXT rune verbatim.
 func splitQuoted(line string) []string {
 	var out []string
 	inQuotes := false
 	cur := strings.Builder{}
-	for _, r := range line {
+	runes := []rune(line)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
 		switch {
+		case inQuotes && r == '\\' && i+1 < len(runes):
+			// Backslash-escape: consume the next rune literally regardless
+			// of whether it's a quote, another backslash, or anything else
+			// — lspci only emits `\"` and `\\` today, but treating any
+			// `\X` as literal `X` is the conservative reading and matches
+			// how `od -c` quoting is normally interpreted.
+			cur.WriteRune(runes[i+1])
+			i++
 		case r == '"':
 			if inQuotes {
 				out = append(out, cur.String())

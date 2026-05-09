@@ -230,6 +230,62 @@ func TestSplitQuoted_HandlesEmptyAndUnbalanced(t *testing.T) {
 	}
 }
 
+// Codex P2 (PR #16, fourth review): lspci(8) documents that machine-
+// readable values are quoted AND escaped: `\"` for a literal `"` inside
+// a token, `\\` for a literal `\`. Earlier `splitQuoted` treated every
+// `"` as a toggle, so an OEM string like `Foo "Bar" Inc.` would break
+// token boundaries, shift every subsequent token's index, and corrupt
+// downstream name/vendor extraction. Pin the escape contract.
+func TestSplitQuoted_HandlesEscapedQuotesAndBackslashes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{
+			name: "escaped quote inside vendor",
+			// Vendor with embedded quote: `Foo "Bar" Inc.`
+			in:   `01:00.0 "VGA compatible controller" "Foo \"Bar\" Inc." "Some Card"`,
+			want: []string{"VGA compatible controller", `Foo "Bar" Inc.`, "Some Card"},
+		},
+		{
+			name: "escaped backslash in device name",
+			// Device with literal backslash: `weird\name`
+			in:   `01:00.0 "VGA compatible controller" "VendorCo" "weird\\name"`,
+			want: []string{"VGA compatible controller", "VendorCo", `weird\name`},
+		},
+		{
+			name: "escape at very end of token (right before closing quote)",
+			in:   `"a\"" "b"`,
+			want: []string{`a"`, "b"},
+		},
+		{
+			name: "trailing backslash with no following rune is benign (no panic, no extra rune)",
+			in:   `"foo\`,
+			// Unterminated quote → no token closed; should not panic.
+			want: nil,
+		},
+		{
+			name: "escape only applies inside quotes — backslash outside is ignored as non-token noise",
+			in:   `\ "alpha" \beta "gamma"`,
+			want: []string{"alpha", "gamma"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := splitQuoted(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d tokens %v, want %d %v", len(got), got, len(tc.want), tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("token[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestMachineInfo_JSONShape_NewFields(t *testing.T) {
 	// All new fields populated — verify they appear in the wire format
 	// with the documented JSON keys.
