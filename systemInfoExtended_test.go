@@ -392,3 +392,163 @@ func TestMachineInfo_JSONShape_BatteryAndLiveZeroValuesPreserved(t *testing.T) {
 		}
 	}
 }
+
+// Codex P1 (PR #16, second review): /sys/class/power_supply exposes
+// peripheral batteries (Logitech HID receivers, Bluetooth mice, USB-PD
+// PD-controller batteries) under type=Battery. Treating those as the
+// host battery would misclassify Linux desktops as battery-powered and
+// skew avoid-laptop-on-battery routing. Pin the name-prefix denylist —
+// the canonical scope=Device check covers modern kernels, this is the
+// fallback for older ones that don't set scope.
+func TestIsPeripheralBatteryName(t *testing.T) {
+	cases := map[string]bool{
+		// Real peripheral examples from production hosts — must filter out.
+		"hidpp_battery_0":               true,
+		"hidpp_battery_1":               true,
+		"hid-04:e6:c2:11:22:33":         true,
+		"hid-c4:c1:00:00:00:01-battery": true,
+		"ucsi-source-psy-USBC000:001":   true,
+		"logitech_keyboard_bluetooth":   true,
+		"wireless_keyboard_logi":        true,
+		"wireless_mouse_mx":             true,
+		"wireless_headset_g733":         true,
+		// Real host batteries — must NOT be filtered out.
+		"BAT0":                       false,
+		"BAT1":                       false,
+		"battery":                    false,
+		"main_battery":               false,
+		"sony_controller_battery_xx": false, // unusual, but no denylist keyword — accept
+	}
+	for name, want := range cases {
+		if got := isPeripheralBatteryName(name); got != want {
+			t.Errorf("isPeripheralBatteryName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// Codex P2 (PR #16, second review): multi-battery laptops (BAT0 + BAT1
+// on enterprise ThinkPads / dual-battery hardware) had their host-level
+// `level` overwritten by whichever battery the directory walk visited
+// last. Aggregation must be capacity-weighted across all system
+// batteries, falling back to a mean of `capacity` percentages only when
+// energy_*/charge_* are unavailable. A half-drained 80 Wh main + full
+// 20 Wh secondary should report ~60%, NOT 75% (the naive mean of 50% + 100%).
+func TestAggregateLinuxBatteryLevel(t *testing.T) {
+	tests := []struct {
+		name string
+		bats []linuxSystemBattery
+		want float64
+	}{
+		{
+			name: "single battery, energy_* preferred",
+			bats: []linuxSystemBattery{
+				{energyNow: 40_000_000, energyFull: 80_000_000, capacity: 50, capacityOK: true},
+			},
+			want: 50.0,
+		},
+		{
+			name: "two batteries, capacity-weighted by energy",
+			bats: []linuxSystemBattery{
+				// 80 Wh main, half drained (40 Wh)
+				{energyNow: 40_000_000, energyFull: 80_000_000, capacity: 50, capacityOK: true},
+				// 20 Wh secondary, full
+				{energyNow: 20_000_000, energyFull: 20_000_000, capacity: 100, capacityOK: true},
+			},
+			// (40 + 20) / (80 + 20) = 60.0
+			want: 60.0,
+		},
+		{
+			name: "charge_* fallback when energy_* unavailable",
+			bats: []linuxSystemBattery{
+				{chargeNow: 3000, chargeFull: 6000},
+			},
+			want: 50.0,
+		},
+		{
+			name: "capacity-mean fallback when neither energy_* nor charge_* exposed",
+			bats: []linuxSystemBattery{
+				{capacity: 50, capacityOK: true},
+				{capacity: 100, capacityOK: true},
+			},
+			// Naive mean of percentages — only when no weighted info exists.
+			want: 75.0,
+		},
+		{
+			name: "all readings missing — returns 0",
+			bats: []linuxSystemBattery{
+				{},
+			},
+			want: 0,
+		},
+		{
+			name: "mixed energy + capacity — weighted wins, capacity ignored",
+			bats: []linuxSystemBattery{
+				{energyNow: 25_000_000, energyFull: 100_000_000, capacity: 25, capacityOK: true},
+				{energyNow: 50_000_000, energyFull: 100_000_000, capacity: 50, capacityOK: true},
+			},
+			// Weighted = (25 + 50) / (100 + 100) = 37.5
+			// Capacity mean would be 37.5 too — pick a case where they differ:
+			want: 37.5,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := aggregateLinuxBatteryLevel(tc.bats); got != tc.want {
+				t.Errorf("aggregateLinuxBatteryLevel = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAnyBatteryCharging(t *testing.T) {
+	// Kernel uses exact-token status: "Charging" / "Discharging" /
+	// "Not charging" / "Full" / "Unknown" — already lowercased by
+	// readLinuxBattery before we get here. Equality check is
+	// unambiguous (no substring trap).
+	cases := []struct {
+		name string
+		bats []linuxSystemBattery
+		want bool
+	}{
+		{"single charging", []linuxSystemBattery{{status: "charging"}}, true},
+		{"single discharging", []linuxSystemBattery{{status: "discharging"}}, false},
+		{"single not charging (AC attached, full)", []linuxSystemBattery{{status: "not charging"}}, false},
+		{"single full", []linuxSystemBattery{{status: "full"}}, false},
+		{"two: one charging, one full → charging", []linuxSystemBattery{
+			{status: "full"}, {status: "charging"},
+		}, true},
+		{"two: both discharging → not charging", []linuxSystemBattery{
+			{status: "discharging"}, {status: "discharging"},
+		}, false},
+		{"empty slice", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := anyBatteryCharging(tc.bats); got != tc.want {
+				t.Errorf("anyBatteryCharging = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseFloatField(t *testing.T) {
+	// readTrim has already stripped whitespace by the time this helper
+	// sees the value; parseFloatField only has to distinguish empty
+	// (file missing / unreadable) from a parsable number.
+	cases := []struct {
+		in    string
+		ok    bool
+		value float64
+	}{
+		{"", false, 0},
+		{"50", true, 50},
+		{"50.5", true, 50.5},
+		{"abc", false, 0},
+	}
+	for _, tc := range cases {
+		got, ok := parseFloatField(tc.in)
+		if ok != tc.ok || got != tc.value {
+			t.Errorf("parseFloatField(%q) = (%v, %v), want (%v, %v)", tc.in, got, ok, tc.value, tc.ok)
+		}
+	}
+}

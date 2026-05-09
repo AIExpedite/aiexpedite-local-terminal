@@ -497,38 +497,174 @@ func gatherBatteryWindows() *batteryInfo {
 // task router's avoid-laptop-on-battery heuristic. Match the prefix
 // "usb" plus the explicit mains/wireless tokens so any current or
 // near-future USB power-delivery variant is recognised.
+//
+// Battery filtering and aggregation (Codex P1+P2, PR #16, second review):
+//
+//   - `type=Battery` matches both the laptop's main battery AND every
+//     peripheral that the kernel exposes as a battery — Logitech HID
+//     receivers (`hidpp_battery_*`), Bluetooth mice/keyboards, etc.
+//     Treating those as the host battery would misclassify desktops
+//     with a Logitech receiver as "battery-powered" and route long jobs
+//     away from them. Filter peripherals via two layers: kernel `scope`
+//     (System vs Device) plus a name-prefix denylist for older kernels
+//     that don't set `scope` on HID power supplies.
+//
+//   - Multi-battery laptops (BAT0 + BAT1 — common on ThinkPads / dual-
+//     battery enterprise hardware) were reporting whichever battery the
+//     directory walk visited last. Aggregate properly: prefer the
+//     capacity-weighted (energy_now / energy_full) sum, fall back to
+//     charge_now / charge_full, fall back to a mean of `capacity`
+//     percentages. This correctly reports a half-drained 80 Wh main +
+//     full 20 Wh secondary as ~60%, not 75%.
 func gatherBatteryLinux() *batteryInfo {
 	supplyDir := "/sys/class/power_supply"
 	entries, err := readDir(supplyDir)
 	if err != nil {
 		return nil
 	}
-	bi := &batteryInfo{}
+	var bats []linuxSystemBattery
+	plugged := false
 	for _, name := range entries {
 		typ := readTrim(filepath.Join(supplyDir, name, "type"))
 		typLower := strings.ToLower(typ)
 		switch {
 		case typLower == "battery":
-			bi.Present = true
-			if cap := readTrim(filepath.Join(supplyDir, name, "capacity")); cap != "" {
-				if v, err := strconv.ParseFloat(cap, 64); err == nil {
-					bi.Level = v
-				}
+			scope := strings.ToLower(readTrim(filepath.Join(supplyDir, name, "scope")))
+			if scope == "device" || isPeripheralBatteryName(name) {
+				// Logitech receiver / Bluetooth peripheral / HID battery.
+				// Not the host's main battery — must not influence routing.
+				continue
 			}
-			st := strings.ToLower(readTrim(filepath.Join(supplyDir, name, "status")))
-			if st == "charging" {
-				bi.Charging = true
-			}
+			bats = append(bats, readLinuxBattery(supplyDir, name))
 		case typLower == "mains" || typLower == "wireless" || strings.HasPrefix(typLower, "usb"):
 			if readTrim(filepath.Join(supplyDir, name, "online")) == "1" {
-				bi.Plugged = true
+				plugged = true
 			}
 		}
 	}
-	if !bi.Present {
+	if len(bats) == 0 {
 		return nil
 	}
-	return bi
+	return &batteryInfo{
+		Present:  true,
+		Charging: anyBatteryCharging(bats),
+		Plugged:  plugged,
+		Level:    aggregateLinuxBatteryLevel(bats),
+	}
+}
+
+// linuxSystemBattery is a per-battery snapshot captured during the
+// power-supply scan. Kept as a struct (not folded into batteryInfo
+// directly) so multi-battery aggregation runs AFTER the scan, instead of
+// last-write-wins clobbering across BAT0 / BAT1.
+type linuxSystemBattery struct {
+	energyNow  float64 // µWh; 0 when kernel only exposes charge_*
+	energyFull float64
+	chargeNow  float64 // µAh; alternative to energy_*
+	chargeFull float64
+	capacity   float64 // already a 0-100 percentage; fallback only
+	capacityOK bool
+	status     string // lowercased; "charging" / "discharging" / "not charging" / "full" / "unknown"
+}
+
+func readLinuxBattery(supplyDir, name string) linuxSystemBattery {
+	sb := linuxSystemBattery{
+		status: strings.ToLower(readTrim(filepath.Join(supplyDir, name, "status"))),
+	}
+	if v, ok := parseFloatField(readTrim(filepath.Join(supplyDir, name, "energy_now"))); ok {
+		sb.energyNow = v
+	}
+	if v, ok := parseFloatField(readTrim(filepath.Join(supplyDir, name, "energy_full"))); ok {
+		sb.energyFull = v
+	}
+	if v, ok := parseFloatField(readTrim(filepath.Join(supplyDir, name, "charge_now"))); ok {
+		sb.chargeNow = v
+	}
+	if v, ok := parseFloatField(readTrim(filepath.Join(supplyDir, name, "charge_full"))); ok {
+		sb.chargeFull = v
+	}
+	if v, ok := parseFloatField(readTrim(filepath.Join(supplyDir, name, "capacity"))); ok {
+		sb.capacity = v
+		sb.capacityOK = true
+	}
+	return sb
+}
+
+// isPeripheralBatteryName is a defense-in-depth name filter for kernels
+// that don't set `scope=Device` on HID / Bluetooth peripheral batteries.
+// The scope file is the canonical signal but it's only set by relatively
+// recent power-supply core code, so name-prefix matching covers the gap.
+func isPeripheralBatteryName(name string) bool {
+	n := strings.ToLower(name)
+	return strings.HasPrefix(n, "hidpp_battery") ||
+		strings.HasPrefix(n, "hid-") ||
+		strings.HasPrefix(n, "ucsi-") ||
+		strings.Contains(n, "bluetooth") ||
+		strings.Contains(n, "wireless_keyboard") ||
+		strings.Contains(n, "wireless_mouse") ||
+		strings.Contains(n, "wireless_headset")
+}
+
+func anyBatteryCharging(bats []linuxSystemBattery) bool {
+	for _, b := range bats {
+		// Kernel exposes the status as the exact tokens "Charging" /
+		// "Discharging" / "Not charging" / "Full" / "Unknown", so a
+		// literal equality check is unambiguous (no substring trap as
+		// macOS pmset has).
+		if b.status == "charging" {
+			return true
+		}
+	}
+	return false
+}
+
+// aggregateLinuxBatteryLevel computes a host-level percentage from per-
+// battery readings. Energy/charge sums are preferred over averaging
+// per-battery capacity percentages because they correctly weight by
+// physical capacity — a half-drained 80 Wh main + full 20 Wh secondary
+// is 60%, not 75%.
+//
+// Falls back to a mean of `capacity` only when neither energy_* nor
+// charge_* is exposed (some embedded / virtualised kernels expose only
+// the abstract percentage).
+func aggregateLinuxBatteryLevel(bats []linuxSystemBattery) float64 {
+	var nowSum, fullSum float64
+	for _, b := range bats {
+		switch {
+		case b.energyFull > 0:
+			nowSum += b.energyNow
+			fullSum += b.energyFull
+		case b.chargeFull > 0:
+			nowSum += b.chargeNow
+			fullSum += b.chargeFull
+		}
+	}
+	if fullSum > 0 {
+		return roundPct(100.0 * nowSum / fullSum)
+	}
+	var sum float64
+	var n int
+	for _, b := range bats {
+		if b.capacityOK {
+			sum += b.capacity
+			n++
+		}
+	}
+	if n == 0 {
+		return 0
+	}
+	return roundPct(sum / float64(n))
+}
+
+func parseFloatField(s string) (float64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
 }
 
 /* --------------------------------------------------------------------------
