@@ -91,6 +91,52 @@ type capabilitiesInfo struct {
 	RecommendedConcurrentBuilds int `json:"recommendedConcurrentBuilds,omitempty"`
 }
 
+// gpuInfo describes a single GPU adapter. Multi-GPU machines emit one
+// entry per adapter (laptop with integrated + discrete; workstation with
+// multiple discrete cards). Vendor distinguishes Apple-Silicon integrated
+// from NVIDIA / AMD / Intel for task-routing decisions (CUDA-only ML
+// jobs need NVIDIA; Metal jobs need Apple).
+type gpuInfo struct {
+	Name     string  `json:"name,omitempty"`
+	Vendor   string  `json:"vendor,omitempty"`   // "apple" | "nvidia" | "amd" | "intel" | "other"
+	MemoryGB float64 `json:"memoryGB,omitempty"` // VRAM (or unified memory share on Apple Silicon)
+	Driver   string  `json:"driver,omitempty"`   // optional driver/runtime version (e.g. "535.171.04" on NVIDIA)
+}
+
+// batteryInfo describes the host's battery state. Absent (returned nil)
+// when the host has no battery (most desktops). The agent's task-routing
+// can use this to avoid scheduling long-running work onto a laptop on
+// battery — discharge-killing the agent mid-task is the worst failure mode.
+//
+// No `omitempty` on Charging/Plugged/Level: when batteryInfo is emitted at
+// all, the probe ran successfully and `Present=true` was already set, so
+// the false/0 values for these fields are meaningful states (e.g. critical
+// unplugged laptop = `{present:true, charging:false, plugged:false, level:3.0}`).
+// Dropping them would make "explicitly on battery / nearly empty"
+// indistinguishable from "unknown" and break the avoid-laptop-on-battery
+// heuristic on the routing side.
+type batteryInfo struct {
+	Present  bool    `json:"present"`
+	Charging bool    `json:"charging"` // true when plugged in AND not full
+	Plugged  bool    `json:"plugged"`  // AC connected (independent of charging state)
+	Level    float64 `json:"level"`    // 0.0 - 100.0 percent remaining
+}
+
+// liveInfo carries near-real-time load metrics. Refreshed on every gather
+// (every 6h by default; can be re-gathered on demand later if we add an
+// idle-aware task router). cpu.Percent runs over a 1-second window so
+// the value is meaningful, not the cumulative-since-boot average.
+//
+// No `omitempty`: composeLiveInfo only returns a non-nil *liveInfo when at
+// least one probe succeeded, so an emitted liveInfo with cpuPct=0/memPct=0
+// represents a genuinely-idle host, not a missing measurement. omitempty
+// would erase that distinction on the wire and downstream routing logic
+// could no longer treat the machine as a known-idle candidate.
+type liveInfo struct {
+	CPUPct float64 `json:"cpuPct"` // 0.0 - 100.0
+	MemPct float64 `json:"memPct"` // 0.0 - 100.0
+}
+
 // MachineInfo is the full payload sent to terminal-service. The backend's
 // /auth/token route lifts these fields onto the top-level
 // `terminalAgents/{id}` doc; terminal-service mergeMachineInfo reads them
@@ -100,9 +146,13 @@ type MachineInfo struct {
 	CPU               *cpuInfo                    `json:"cpu,omitempty"`
 	Memory            *memoryInfo                 `json:"memory,omitempty"`
 	Disk              []diskEntry                 `json:"disk,omitempty"`
+	GPU               []gpuInfo                   `json:"gpu,omitempty"`
+	Battery           *batteryInfo                `json:"battery,omitempty"`
+	Live              *liveInfo                   `json:"live,omitempty"`
 	Runtimes          map[string]string           `json:"runtimes,omitempty"`
 	PackageManagers   map[string]string           `json:"packageManagers,omitempty"`
 	Tools             map[string]string           `json:"tools,omitempty"`
+	DockerRunning     *bool                       `json:"dockerRunning,omitempty"` // pointer so JSON omits when probe didn't run; false = installed but daemon down
 	Shell             *shellInfo                  `json:"shell,omitempty"`
 	DetectedCliAgents map[string]detectedCLIAgent `json:"detectedCliAgents,omitempty"`
 	Capabilities      *capabilitiesInfo           `json:"capabilities,omitempty"`
@@ -257,11 +307,40 @@ func gatherMachineInfo() *MachineInfo {
 	// Shell info is platform-shaped — see helper.
 	info.Shell = gatherShellInfo()
 
+	// Docker daemon — distinct from `tools.docker` which only proves the
+	// CLI binary exists. Containerized tasks (build images, run a
+	// containerized test suite) need the daemon up. `docker info` exits
+	// non-zero when the daemon isn't running, even if the CLI is on PATH.
+	if dr := gatherDockerRunning(); dr != nil {
+		info.DockerRunning = dr
+	}
+
 	// CLI agents — claude/codex/gemini detection. Same trio as the legacy
 	// LLM probe. exec.LookPath honors the PATH that tray_darwin.go's
 	// init() augmented with /opt/homebrew/bin etc., so brew-installed
 	// agents are visible.
 	info.DetectedCliAgents = gatherCLIAgents()
+
+	// GPU — multi-adapter support; per-platform shell-out (system_profiler
+	// on macOS, WMI on Windows, nvidia-smi/lspci on Linux). Best-effort:
+	// returns nil on probe failure or no detectable GPU. Without this,
+	// task routers can't distinguish "Apple Silicon agent for Metal jobs"
+	// from "NVIDIA agent for CUDA jobs" from "no GPU at all".
+	if gpus := gatherGPU(); len(gpus) > 0 {
+		info.GPU = gpus
+	}
+
+	// Battery — laptops only; desktops return nil. Lets the task router
+	// avoid scheduling a 6h training job onto a laptop running on battery
+	// (it'll discharge mid-run and the agent dies with the OS).
+	info.Battery = gatherBattery()
+
+	// Live load — 1-second cpu sample + instantaneous mem percent. The
+	// 1s sample adds a small fixed cost to the gather but produces a
+	// meaningful number (without it, gopsutil's first call returns 0
+	// and subsequent calls average over 6 hours, which smooths out any
+	// signal we'd actually act on).
+	info.Live = gatherLiveLoad()
 
 	// Capability hints — cheap derivation from the gathered numbers; the
 	// LLM uses these to decide whether to run tests/builds in parallel.
