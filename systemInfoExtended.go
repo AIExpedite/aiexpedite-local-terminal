@@ -259,81 +259,130 @@ func gatherGPUWindows() []gpuInfo {
 	return gpus
 }
 
-// Linux: prefer `nvidia-smi` for accurate VRAM (the only common path
-// where VRAM is available without root). Fall back to lspci for
-// non-NVIDIA cards (no VRAM info, just name).
+// Linux: gather both `nvidia-smi` (high-fidelity NVIDIA entries with
+// VRAM + driver) AND `lspci -mm` (broader inventory: Intel iGPU, AMD
+// dGPU, Apple T2, etc.), then merge. nvidia-smi reports NVIDIA adapters
+// only — earlier code returned its results immediately and skipped
+// lspci, which dropped the iGPU on every hybrid laptop (Intel iGPU +
+// NVIDIA dGPU on most ThinkPad / Dell XPS / System76 hardware) so the
+// router couldn't see the integrated adapter. Codex P2 (PR #16, third
+// review) flagged this. Merging both sources keeps the NVIDIA entries'
+// extra detail (VRAM, driver) AND surfaces the non-NVIDIA cards.
+//
+// Deduplication: when nvidia-smi has already reported NVIDIA cards, drop
+// any nvidia-vendor entries from lspci — they're the same physical
+// adapter at lower fidelity and would confuse the multi-adapter count.
+// Non-nvidia lspci entries always pass through.
 func gatherGPULinux() []gpuInfo {
-	if out := probeOutputArgs("nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"); out != "" {
-		var gpus []gpuInfo
-		for _, line := range strings.Split(out, "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" {
-				continue
-			}
-			parts := strings.Split(line, ",")
-			if len(parts) < 2 {
-				continue
-			}
-			name := strings.TrimSpace(parts[0])
-			memMiBStr := strings.TrimSpace(parts[1])
-			memMiB, _ := strconv.ParseFloat(memMiBStr, 64)
-			driver := ""
-			if len(parts) >= 3 {
-				driver = strings.TrimSpace(parts[2])
-			}
-			gpus = append(gpus, gpuInfo{
-				Name:     name,
-				Vendor:   "nvidia",
-				MemoryGB: roundPct(memMiB / 1024), // MiB → GiB; reuse the one-decimal rounder
-				Driver:   driver,
-			})
-		}
-		if len(gpus) > 0 {
-			return gpus
-		}
+	fromNvidia := parseNvidiaSmiGPUs(probeOutputArgs("nvidia-smi",
+		"--query-gpu=name,memory.total,driver_version",
+		"--format=csv,noheader,nounits"))
+	fromLspci := parseLspciGPUs(probeOutputArgs("lspci", "-mm"))
+	merged := mergeLinuxGPUs(fromNvidia, fromLspci)
+	if len(merged) == 0 {
+		return nil
 	}
-	// lspci fallback — name only, no VRAM. Match VGA/3D/Display class.
-	if out := probeOutputArgs("lspci", "-mm"); out != "" {
-		var gpus []gpuInfo
-		for _, line := range strings.Split(out, "\n") {
-			lower := strings.ToLower(line)
-			if !strings.Contains(lower, `"vga compatible controller"`) &&
-				!strings.Contains(lower, `"3d controller"`) &&
-				!strings.Contains(lower, `"display controller"`) {
-				continue
-			}
-			// lspci -mm format (with bus ID stripped — splitQuoted only
-			// returns the quoted tokens):
-			//   tokens[0] = class       ("VGA compatible controller")
-			//   tokens[1] = vendor      ("NVIDIA Corporation")
-			//   tokens[2] = device      ("AD102 [GeForce RTX 4090]")  ← what we want as Name
-			//   tokens[3] = subsystem-vendor (optional, "Gigabyte Technology Co., Ltd")
-			//
-			// Earlier this code read tokens[2] as vendor and tokens[3] as
-			// name, which mapped the GPU name to the BOARD MAKER and
-			// guessed vendor from the device string — Codex review on PR #16
-			// flagged that anywhere nvidia-smi was unavailable, the routing
-			// signal this field provides was systematically wrong.
-			tokens := splitQuoted(line)
-			if len(tokens) < 3 {
-				continue
-			}
-			vendorRaw := tokens[1]
-			nameRaw := strings.TrimSpace(tokens[2])
-			// Prefer the explicit vendor field; if it normalises to "other"
-			// (e.g. obscure rebrand), try the device name as a tie-breaker.
-			vendor := guessVendorFromName(vendorRaw)
-			if vendor == "other" {
-				vendor = guessVendorFromName(nameRaw)
-			}
-			gpus = append(gpus, gpuInfo{
-				Name:   nameRaw,
-				Vendor: vendor,
-			})
-		}
-		return gpus
+	return merged
+}
+
+// parseNvidiaSmiGPUs parses the CSV output of
+// `nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader,nounits`.
+// Split out from gatherGPULinux so the merge logic can be unit-tested
+// without invoking the real CLI.
+func parseNvidiaSmiGPUs(out string) []gpuInfo {
+	if out == "" {
+		return nil
 	}
-	return nil
+	var gpus []gpuInfo
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, ",")
+		if len(parts) < 2 {
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		memMiB, _ := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+		driver := ""
+		if len(parts) >= 3 {
+			driver = strings.TrimSpace(parts[2])
+		}
+		gpus = append(gpus, gpuInfo{
+			Name:     name,
+			Vendor:   "nvidia",
+			MemoryGB: roundPct(memMiB / 1024), // MiB → GiB; reuse the one-decimal rounder
+			Driver:   driver,
+		})
+	}
+	return gpus
+}
+
+// parseLspciGPUs parses `lspci -mm` output, picking only the display-
+// class lines (VGA / 3D / Display controller). Returns one gpuInfo per
+// adapter; no VRAM info available from lspci.
+func parseLspciGPUs(out string) []gpuInfo {
+	if out == "" {
+		return nil
+	}
+	var gpus []gpuInfo
+	for _, line := range strings.Split(out, "\n") {
+		lower := strings.ToLower(line)
+		if !strings.Contains(lower, `"vga compatible controller"`) &&
+			!strings.Contains(lower, `"3d controller"`) &&
+			!strings.Contains(lower, `"display controller"`) {
+			continue
+		}
+		// lspci -mm format (with bus ID stripped — splitQuoted only
+		// returns the quoted tokens):
+		//   tokens[0] = class       ("VGA compatible controller")
+		//   tokens[1] = vendor      ("NVIDIA Corporation")
+		//   tokens[2] = device      ("AD102 [GeForce RTX 4090]")  ← what we want as Name
+		//   tokens[3] = subsystem-vendor (optional, "Gigabyte Technology Co., Ltd")
+		//
+		// Earlier this code read tokens[2] as vendor and tokens[3] as
+		// name, which mapped the GPU name to the BOARD MAKER and
+		// guessed vendor from the device string — Codex review on PR #16
+		// flagged that anywhere nvidia-smi was unavailable, the routing
+		// signal this field provides was systematically wrong.
+		tokens := splitQuoted(line)
+		if len(tokens) < 3 {
+			continue
+		}
+		vendorRaw := tokens[1]
+		nameRaw := strings.TrimSpace(tokens[2])
+		// Prefer the explicit vendor field; if it normalises to "other"
+		// (e.g. obscure rebrand), try the device name as a tie-breaker.
+		vendor := guessVendorFromName(vendorRaw)
+		if vendor == "other" {
+			vendor = guessVendorFromName(nameRaw)
+		}
+		gpus = append(gpus, gpuInfo{
+			Name:   nameRaw,
+			Vendor: vendor,
+		})
+	}
+	return gpus
+}
+
+// mergeLinuxGPUs combines nvidia-smi + lspci results so hybrid hosts
+// surface both adapters. When nvidia-smi reports any NVIDIA cards, drop
+// the corresponding nvidia-vendor lspci entries (same physical adapter
+// at lower fidelity — keeping both would inflate the per-host adapter
+// count and confuse downstream multi-GPU heuristics).
+func mergeLinuxGPUs(fromNvidia, fromLspci []gpuInfo) []gpuInfo {
+	result := make([]gpuInfo, 0, len(fromNvidia)+len(fromLspci))
+	result = append(result, fromNvidia...)
+	nvidiaSeen := len(fromNvidia) > 0
+	for _, g := range fromLspci {
+		if nvidiaSeen && g.Vendor == "nvidia" {
+			// Already covered by nvidia-smi at higher fidelity.
+			continue
+		}
+		result = append(result, g)
+	}
+	return result
 }
 
 // guessVendorFromName extracts the canonical vendor token from a name
@@ -624,24 +673,54 @@ func anyBatteryCharging(bats []linuxSystemBattery) bool {
 // physical capacity — a half-drained 80 Wh main + full 20 Wh secondary
 // is 60%, not 75%.
 //
-// Falls back to a mean of `capacity` only when neither energy_* nor
-// charge_* is exposed (some embedded / virtualised kernels expose only
-// the abstract percentage).
+// Unit safety (Codex P2, PR #16, third review): pick a SINGLE unit
+// family across the whole battery set before summing — energy_* (µWh)
+// and charge_* (µAh) are dimensionally different and depend on cell
+// voltage to convert. Mixing them in the same nowSum/fullSum yields
+// physically meaningless values on multi-battery systems where drivers
+// expose different counters. Precedence:
+//
+//  1. Every battery exposes energy_full → sum energy.
+//  2. Every battery exposes charge_full → sum charge.
+//  3. Otherwise → mean of `capacity` percentages (the single unit-free
+//     basis we can mix safely).
+//
+// Falls all the way through to capacity-mean for an empty slice / all-
+// readings-missing case (returns 0 there).
 func aggregateLinuxBatteryLevel(bats []linuxSystemBattery) float64 {
-	var nowSum, fullSum float64
+	if len(bats) == 0 {
+		return 0
+	}
+	allEnergy := true
+	allCharge := true
 	for _, b := range bats {
-		switch {
-		case b.energyFull > 0:
+		if b.energyFull <= 0 {
+			allEnergy = false
+		}
+		if b.chargeFull <= 0 {
+			allCharge = false
+		}
+	}
+	switch {
+	case allEnergy:
+		var nowSum, fullSum float64
+		for _, b := range bats {
 			nowSum += b.energyNow
 			fullSum += b.energyFull
-		case b.chargeFull > 0:
+		}
+		return roundPct(100.0 * nowSum / fullSum)
+	case allCharge:
+		var nowSum, fullSum float64
+		for _, b := range bats {
 			nowSum += b.chargeNow
 			fullSum += b.chargeFull
 		}
-	}
-	if fullSum > 0 {
 		return roundPct(100.0 * nowSum / fullSum)
 	}
+	// Capacity-mean fallback: covers (a) embedded/virtualised kernels
+	// that expose only `capacity`, and (b) the dimensionally-unsafe
+	// "one battery has energy_*, another has charge_*" case where
+	// neither family covers the full set.
 	var sum float64
 	var n int
 	for _, b := range bats {

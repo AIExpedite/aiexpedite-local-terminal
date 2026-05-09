@@ -490,6 +490,24 @@ func TestAggregateLinuxBatteryLevel(t *testing.T) {
 			// Capacity mean would be 37.5 too — pick a case where they differ:
 			want: 37.5,
 		},
+		{
+			// Codex P2 (PR #16, third review): mixing µWh and µAh in the
+			// same sum is dimensionally invalid (you'd need cell voltage
+			// to convert, which we don't have). When one battery exposes
+			// only energy_* and the other only charge_*, fall through to
+			// the unit-free capacity-mean instead of silently producing
+			// a meaningless number.
+			name: "mixed unit families — falls back to capacity-mean (unit safety)",
+			bats: []linuxSystemBattery{
+				// Battery A: energy_* only (no charge_*)
+				{energyNow: 40_000_000, energyFull: 80_000_000, capacity: 50, capacityOK: true},
+				// Battery B: charge_* only (no energy_*)
+				{chargeNow: 4_000_000, chargeFull: 4_000_000, capacity: 100, capacityOK: true},
+			},
+			// allEnergy=false (B has no energy), allCharge=false (A has
+			// no charge) → capacity-mean = (50 + 100) / 2 = 75.
+			want: 75,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -528,6 +546,99 @@ func TestAnyBatteryCharging(t *testing.T) {
 				t.Errorf("anyBatteryCharging = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// Codex P2 (PR #16, third review): hybrid Linux laptops (Intel iGPU +
+// NVIDIA dGPU on most ThinkPad / Dell XPS / System76 hardware) had the
+// integrated adapter dropped, because gatherGPULinux returned from
+// nvidia-smi early without falling through to lspci. Pin the merge
+// behaviour so:
+//   - nvidia-smi entries (have VRAM + driver) survive verbatim
+//   - non-nvidia lspci entries are appended (the Intel/AMD iGPU case)
+//   - duplicate nvidia-vendor lspci entries are dropped (same physical
+//     adapter as nvidia-smi, just lower fidelity — keeping both would
+//     inflate the per-host adapter count and confuse multi-GPU heuristics)
+func TestMergeLinuxGPUs(t *testing.T) {
+	nvidia := gpuInfo{Name: "NVIDIA GeForce RTX 4090", Vendor: "nvidia", MemoryGB: 24, Driver: "535.171.04"}
+	intelIGPU := gpuInfo{Name: "Raptor Lake-P [Iris Xe Graphics]", Vendor: "intel"}
+	amdDGPU := gpuInfo{Name: "Navi 21 [Radeon RX 6800]", Vendor: "amd"}
+	nvidiaFromLspci := gpuInfo{Name: "AD102 [GeForce RTX 4090]", Vendor: "nvidia"}
+
+	tests := []struct {
+		name       string
+		fromNvidia []gpuInfo
+		fromLspci  []gpuInfo
+		want       []gpuInfo
+	}{
+		{
+			name:       "hybrid laptop: nvidia-smi dGPU + lspci iGPU → both surface",
+			fromNvidia: []gpuInfo{nvidia},
+			fromLspci:  []gpuInfo{intelIGPU, nvidiaFromLspci},
+			// nvidia-smi entry first, then non-duplicate intel entry.
+			// nvidia-vendor lspci entry dropped (already covered).
+			want: []gpuInfo{nvidia, intelIGPU},
+		},
+		{
+			name:       "no nvidia-smi: lspci entries pass through unchanged",
+			fromNvidia: nil,
+			fromLspci:  []gpuInfo{intelIGPU, amdDGPU},
+			want:       []gpuInfo{intelIGPU, amdDGPU},
+		},
+		{
+			name:       "no lspci: nvidia-smi entries returned as-is",
+			fromNvidia: []gpuInfo{nvidia},
+			fromLspci:  nil,
+			want:       []gpuInfo{nvidia},
+		},
+		{
+			name:       "neither source returned anything",
+			fromNvidia: nil,
+			fromLspci:  nil,
+			want:       []gpuInfo{},
+		},
+		{
+			name:       "AMD-only host: nvidia-smi empty, lspci AMD card surfaces",
+			fromNvidia: nil,
+			fromLspci:  []gpuInfo{amdDGPU},
+			want:       []gpuInfo{amdDGPU},
+		},
+		{
+			name:       "nvidia-only host: nvidia-smi card returned, lspci nvidia entry deduped",
+			fromNvidia: []gpuInfo{nvidia},
+			fromLspci:  []gpuInfo{nvidiaFromLspci},
+			want:       []gpuInfo{nvidia},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mergeLinuxGPUs(tc.fromNvidia, tc.fromLspci)
+			if len(got) != len(tc.want) {
+				t.Fatalf("mergeLinuxGPUs len = %d (%+v), want %d (%+v)", len(got), got, len(tc.want), tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("entry %d = %+v, want %+v", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseNvidiaSmiGPUs(t *testing.T) {
+	// Real nvidia-smi --query-gpu=name,memory.total,driver_version
+	// --format=csv,noheader,nounits output. Two-card host.
+	out := "NVIDIA GeForce RTX 4090, 24564, 535.171.04\nNVIDIA H100 PCIe, 81920, 535.171.04"
+	got := parseNvidiaSmiGPUs(out)
+	if len(got) != 2 {
+		t.Fatalf("parseNvidiaSmiGPUs len = %d, want 2; got: %+v", len(got), got)
+	}
+	if got[0].Name != "NVIDIA GeForce RTX 4090" || got[0].Vendor != "nvidia" || got[0].Driver != "535.171.04" {
+		t.Errorf("entry 0 = %+v", got[0])
+	}
+	// 24564 MiB / 1024 → 23.99... → roundPct → 24.0
+	if got[0].MemoryGB < 23.9 || got[0].MemoryGB > 24.1 {
+		t.Errorf("entry 0 MemoryGB = %v, want ~24", got[0].MemoryGB)
 	}
 }
 
