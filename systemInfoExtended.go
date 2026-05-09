@@ -523,29 +523,69 @@ func gatherBatteryDarwin() *batteryInfo {
 //	1 = Discharging   2 = AC          3 = Fully charged   4 = Low
 //	5 = Critical      6 = Charging    7 = Charging+High   8 = Charging+Low
 //	9 = Charging+Crit 10 = Undefined  11 = Partially Charged
+//
+// Multi-battery aggregation (Codex P2, PR #16, fifth review): some
+// enterprise / dual-battery laptops expose multiple Win32_Battery
+// instances. The earlier `Select-Object -First 1` dropped every
+// battery but one, so the host-level percentage and charging signal
+// reflected only one of two packs. Read all instances and aggregate
+// (mean of EstimatedChargeRemaining; any-charging across the set;
+// plugged when any battery reports AC / charging status).
+//
+// Why mean-of-percentages rather than capacity-weighted: WMI's
+// `FullChargeCapacity` is unreliable across vendors (often `null` on
+// OEM laptops, especially newer Snapdragon-based devices), so the
+// only consistently available value is the abstract percentage.
 func gatherBatteryWindows() *batteryInfo {
-	ps := `$b = Get-CimInstance Win32_Battery | Select-Object -First 1 BatteryStatus,EstimatedChargeRemaining; ConvertTo-Json -InputObject $b -Compress`
+	ps := `$b = @(Get-CimInstance Win32_Battery | Select-Object BatteryStatus,EstimatedChargeRemaining); ConvertTo-Json -InputObject $b -Compress`
 	out := probeOutputArgs("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
 	if out == "" || out == "null" {
 		return nil
 	}
-	var b struct {
+	type winBat struct {
 		BatteryStatus            int     `json:"BatteryStatus"`
 		EstimatedChargeRemaining float64 `json:"EstimatedChargeRemaining"`
 	}
-	if err := json.Unmarshal([]byte(out), &b); err != nil {
+	// `@()` forces a JSON array even with a single element, but be
+	// defensive: handle a bare object too in case a future PowerShell
+	// change drops the wrapper.
+	var arr []winBat
+	if err := json.Unmarshal([]byte(out), &arr); err != nil {
+		var single winBat
+		if err2 := json.Unmarshal([]byte(out), &single); err2 != nil {
+			return nil
+		}
+		arr = []winBat{single}
+	}
+	// Filter out empty / undefined batteries (Status 0 or 10).
+	bats := make([]winBat, 0, len(arr))
+	for _, b := range arr {
+		if b.BatteryStatus == 0 || b.BatteryStatus == 10 {
+			continue
+		}
+		bats = append(bats, b)
+	}
+	if len(bats) == 0 {
 		return nil
 	}
-	if b.BatteryStatus == 0 {
-		return nil
+	var charging, plugged bool
+	var sum float64
+	for _, b := range bats {
+		isCharging := b.BatteryStatus == 6 || b.BatteryStatus == 7 || b.BatteryStatus == 8 || b.BatteryStatus == 9
+		if isCharging {
+			charging = true
+		}
+		// `2 = AC`, `3 = Fully charged` both indicate AC connected.
+		if isCharging || b.BatteryStatus == 2 || b.BatteryStatus == 3 {
+			plugged = true
+		}
+		sum += b.EstimatedChargeRemaining
 	}
-	charging := b.BatteryStatus == 6 || b.BatteryStatus == 7 || b.BatteryStatus == 8 || b.BatteryStatus == 9
-	plugged := b.BatteryStatus == 2 || b.BatteryStatus == 3 || charging
 	return &batteryInfo{
 		Present:  true,
 		Charging: charging,
 		Plugged:  plugged,
-		Level:    b.EstimatedChargeRemaining,
+		Level:    roundPct(sum / float64(len(bats))),
 	}
 }
 
@@ -625,14 +665,39 @@ func gatherBatteryLinux() *batteryInfo {
 // power-supply scan. Kept as a struct (not folded into batteryInfo
 // directly) so multi-battery aggregation runs AFTER the scan, instead of
 // last-write-wins clobbering across BAT0 / BAT1.
+//
+// Each numeric field carries a separate `*OK` flag because a literal 0
+// reading is meaningful (genuinely empty battery) and must be
+// distinguishable from "couldn't read this attribute". Without that
+// distinction, aggregation can't tell a partially-unreadable battery
+// from a literally-empty one — Codex P2 (PR #16, fifth review) flagged
+// that with only `*Full > 0` gates, a battery with a missing
+// `energy_now` would default to 0 and silently drag down the host
+// percentage on a plugged-in laptop.
 type linuxSystemBattery struct {
-	energyNow  float64 // µWh; 0 when kernel only exposes charge_*
-	energyFull float64
-	chargeNow  float64 // µAh; alternative to energy_*
-	chargeFull float64
-	capacity   float64 // already a 0-100 percentage; fallback only
-	capacityOK bool
-	status     string // lowercased; "charging" / "discharging" / "not charging" / "full" / "unknown"
+	energyNow    float64 // µWh; only meaningful when energyNowOK
+	energyNowOK  bool
+	energyFull   float64
+	energyFullOK bool
+	chargeNow    float64 // µAh; alternative to energy_*
+	chargeNowOK  bool
+	chargeFull   float64
+	chargeFullOK bool
+	capacity     float64 // already a 0-100 percentage; fallback only
+	capacityOK   bool
+	status       string // lowercased; "charging" / "discharging" / "not charging" / "full" / "unknown"
+}
+
+// hasEnergy returns true when this battery contributes a usable
+// numerator and denominator to the energy-basis weighted sum:
+// both reads succeeded AND energyFull is positive (the divisor must
+// be > 0 for the weighted math to be defined).
+func (b linuxSystemBattery) hasEnergy() bool {
+	return b.energyNowOK && b.energyFullOK && b.energyFull > 0
+}
+
+func (b linuxSystemBattery) hasCharge() bool {
+	return b.chargeNowOK && b.chargeFullOK && b.chargeFull > 0
 }
 
 func readLinuxBattery(supplyDir, name string) linuxSystemBattery {
@@ -641,15 +706,19 @@ func readLinuxBattery(supplyDir, name string) linuxSystemBattery {
 	}
 	if v, ok := parseFloatField(readTrim(filepath.Join(supplyDir, name, "energy_now"))); ok {
 		sb.energyNow = v
+		sb.energyNowOK = true
 	}
 	if v, ok := parseFloatField(readTrim(filepath.Join(supplyDir, name, "energy_full"))); ok {
 		sb.energyFull = v
+		sb.energyFullOK = true
 	}
 	if v, ok := parseFloatField(readTrim(filepath.Join(supplyDir, name, "charge_now"))); ok {
 		sb.chargeNow = v
+		sb.chargeNowOK = true
 	}
 	if v, ok := parseFloatField(readTrim(filepath.Join(supplyDir, name, "charge_full"))); ok {
 		sb.chargeFull = v
+		sb.chargeFullOK = true
 	}
 	if v, ok := parseFloatField(readTrim(filepath.Join(supplyDir, name, "capacity"))); ok {
 		sb.capacity = v
@@ -710,13 +779,20 @@ func aggregateLinuxBatteryLevel(bats []linuxSystemBattery) float64 {
 	if len(bats) == 0 {
 		return 0
 	}
+	// Eligibility for the weighted basis requires BOTH the numerator
+	// (`*_now`) and the denominator (`*_full`) to have been read
+	// successfully on every battery (Codex P2, PR #16, fifth review).
+	// Without the `*_now` gate, a partially-unreadable battery with
+	// only `_full` would silently treat the missing-now as literal 0,
+	// dragging down the host percentage and misclassifying a plugged
+	// laptop as near-dead.
 	allEnergy := true
 	allCharge := true
 	for _, b := range bats {
-		if b.energyFull <= 0 {
+		if !b.hasEnergy() {
 			allEnergy = false
 		}
-		if b.chargeFull <= 0 {
+		if !b.hasCharge() {
 			allCharge = false
 		}
 	}

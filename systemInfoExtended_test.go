@@ -498,7 +498,7 @@ func TestAggregateLinuxBatteryLevel(t *testing.T) {
 		{
 			name: "single battery, energy_* preferred",
 			bats: []linuxSystemBattery{
-				{energyNow: 40_000_000, energyFull: 80_000_000, capacity: 50, capacityOK: true},
+				{energyNow: 40_000_000, energyNowOK: true, energyFull: 80_000_000, energyFullOK: true, capacity: 50, capacityOK: true},
 			},
 			want: 50.0,
 		},
@@ -506,9 +506,9 @@ func TestAggregateLinuxBatteryLevel(t *testing.T) {
 			name: "two batteries, capacity-weighted by energy",
 			bats: []linuxSystemBattery{
 				// 80 Wh main, half drained (40 Wh)
-				{energyNow: 40_000_000, energyFull: 80_000_000, capacity: 50, capacityOK: true},
+				{energyNow: 40_000_000, energyNowOK: true, energyFull: 80_000_000, energyFullOK: true, capacity: 50, capacityOK: true},
 				// 20 Wh secondary, full
-				{energyNow: 20_000_000, energyFull: 20_000_000, capacity: 100, capacityOK: true},
+				{energyNow: 20_000_000, energyNowOK: true, energyFull: 20_000_000, energyFullOK: true, capacity: 100, capacityOK: true},
 			},
 			// (40 + 20) / (80 + 20) = 60.0
 			want: 60.0,
@@ -516,7 +516,7 @@ func TestAggregateLinuxBatteryLevel(t *testing.T) {
 		{
 			name: "charge_* fallback when energy_* unavailable",
 			bats: []linuxSystemBattery{
-				{chargeNow: 3000, chargeFull: 6000},
+				{chargeNow: 3000, chargeNowOK: true, chargeFull: 6000, chargeFullOK: true},
 			},
 			want: 50.0,
 		},
@@ -539,8 +539,8 @@ func TestAggregateLinuxBatteryLevel(t *testing.T) {
 		{
 			name: "mixed energy + capacity — weighted wins, capacity ignored",
 			bats: []linuxSystemBattery{
-				{energyNow: 25_000_000, energyFull: 100_000_000, capacity: 25, capacityOK: true},
-				{energyNow: 50_000_000, energyFull: 100_000_000, capacity: 50, capacityOK: true},
+				{energyNow: 25_000_000, energyNowOK: true, energyFull: 100_000_000, energyFullOK: true, capacity: 25, capacityOK: true},
+				{energyNow: 50_000_000, energyNowOK: true, energyFull: 100_000_000, energyFullOK: true, capacity: 50, capacityOK: true},
 			},
 			// Weighted = (25 + 50) / (100 + 100) = 37.5
 			// Capacity mean would be 37.5 too — pick a case where they differ:
@@ -556,12 +556,36 @@ func TestAggregateLinuxBatteryLevel(t *testing.T) {
 			name: "mixed unit families — falls back to capacity-mean (unit safety)",
 			bats: []linuxSystemBattery{
 				// Battery A: energy_* only (no charge_*)
-				{energyNow: 40_000_000, energyFull: 80_000_000, capacity: 50, capacityOK: true},
+				{energyNow: 40_000_000, energyNowOK: true, energyFull: 80_000_000, energyFullOK: true, capacity: 50, capacityOK: true},
 				// Battery B: charge_* only (no energy_*)
-				{chargeNow: 4_000_000, chargeFull: 4_000_000, capacity: 100, capacityOK: true},
+				{chargeNow: 4_000_000, chargeNowOK: true, chargeFull: 4_000_000, chargeFullOK: true, capacity: 100, capacityOK: true},
 			},
 			// allEnergy=false (B has no energy), allCharge=false (A has
 			// no charge) → capacity-mean = (50 + 100) / 2 = 75.
+			want: 75,
+		},
+		{
+			// Codex P2 (PR #16, fifth review): a battery with `energy_full`
+			// readable but `energy_now` missing must NOT be treated as
+			// "energy=0" by the weighted sum. The earlier `*Full > 0` gate
+			// alone would silently include it in the energy basis,
+			// dragging the host total down by ~50% on a dual-battery host
+			// where one pack lost its instantaneous reading. Now both
+			// `*NowOK` AND `*FullOK` are required for energy/charge basis;
+			// otherwise we fall through to capacity-mean.
+			name: "missing energy_now on one battery — falls back to capacity-mean",
+			bats: []linuxSystemBattery{
+				// Battery A: full readings present, 50% via capacity
+				{energyNow: 40_000_000, energyNowOK: true, energyFull: 80_000_000, energyFullOK: true, capacity: 50, capacityOK: true},
+				// Battery B: energy_full readable, but energy_now read FAILED
+				// (NowOK=false, value defaults to 0). Without the *NowOK
+				// gate this used to count B as 0/20 = 0% and pull the host
+				// total to (40 + 0) / (80 + 20) = 40% instead of the true
+				// (50 + 100) / 2 = 75% the capacity readings indicate.
+				{energyFull: 20_000_000, energyFullOK: true, capacity: 100, capacityOK: true},
+			},
+			// allEnergy=false (B's energyNowOK is false), allCharge=false
+			// → capacity-mean fallback = (50 + 100) / 2 = 75.
 			want: 75,
 		},
 	}
