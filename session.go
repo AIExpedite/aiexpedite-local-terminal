@@ -65,8 +65,9 @@ type CLISession struct {
 	UID         string
 	TimeoutMs   int64 // Per-session timeout in ms (0 = no timeout, use stale cleanup)
 
-	mu   sync.Mutex
-	done chan struct{} // closed when process exits
+	mu         sync.Mutex
+	done       chan struct{} // closed when process exits
+	streamDone chan struct{} // closed when stdout/stderr and stream publishes finish
 }
 
 /* --------------------------------------------------------------------------
@@ -180,6 +181,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		UID:         uid,
 		TimeoutMs:   timeoutMs,
 		done:        make(chan struct{}),
+		streamDone:  make(chan struct{}),
 	}
 
 	sm.sessions[id] = session
@@ -216,19 +218,12 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		}
 	}
 
-	// For non-interactive commands (cmd, powershell one-shots, etc.), close
-	// stdin immediately.  These commands don't read from stdin, and leaving it
-	// open causes commands like `date` (which prompt for input) to hang forever.
-	if stdinPrompt == "" {
-		cmdLower := strings.ToLower(command)
-		isInteractiveCLI := cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude") ||
-			cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex") ||
-			cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini")
-		if !isInteractiveCLI {
-			session.Stdin.Close()
-			fmt.Printf("%s[session] Closed stdin for non-interactive session %s (%s)%s\n",
-				colorYellow, id, command, colorReset)
-		}
+	// Close stdin for one-shot sessions. Codex exec appends piped stdin to the
+	// prompt, so leaving the pipe open makes it wait indefinitely for EOF.
+	if shouldCloseStdinAfterStart(command, stdinPrompt) {
+		session.Stdin.Close()
+		fmt.Printf("%s[session] Closed stdin for one-shot session %s (%s)%s\n",
+			colorYellow, id, command, colorReset)
 	}
 
 	return nil
@@ -448,10 +443,29 @@ func (sm *SessionManager) removeSession(id string) {
 	sm.mu.Unlock()
 }
 
+func shouldCloseStdinAfterStart(_ string, stdinPrompt string) bool {
+	return stdinPrompt == ""
+}
+
+func waitForStreamCompletion(session *CLISession, timeout time.Duration) {
+	if session.streamDone == nil {
+		return
+	}
+
+	select {
+	case <-session.streamDone:
+	case <-time.After(timeout):
+		fmt.Printf("%s[session] Timed out waiting for stream publish completion for %s%s\n",
+			colorYellow, session.ID, colorReset)
+	}
+}
+
 // readOutputStream reads stdout and stderr from the session and publishes
 // output chunks via the publishFn. It parses JSON events from structured
 // output modes to detect permission/approval prompts.
 func (sm *SessionManager) readOutputStream(session *CLISession, publishFn PublishFunc) {
+	defer close(session.streamDone)
+
 	// Merge stdout and stderr into a single channel
 	lines := make(chan streamLine, 100)
 	var wg sync.WaitGroup
@@ -540,16 +554,23 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	// filling the lines channel (capacity 100) and eventually blocking the
 	// scanner goroutines that feed it — starving the CLI process's pipe buffer.
 	// Instead we publish in a fire-and-forget goroutine so the select loop
-	// always stays free to drain incoming lines.
+	// always stays free to drain incoming lines.  The publish wait group lets
+	// waitForExit avoid marking the session ended before final chunks are sent.
 	publishSem := make(chan struct{}, 5) // max 5 concurrent publishes per session
+	var publishWg sync.WaitGroup
+	defer publishWg.Wait()
+
 	asyncPublish := func(msg resultMsg) {
+		publishWg.Add(1)
 		select {
 		case publishSem <- struct{}{}:
 			go func() {
+				defer publishWg.Done()
 				defer func() { <-publishSem }()
 				publishFn(msg)
 			}()
 		case <-time.After(5 * time.Second):
+			publishWg.Done()
 			// All publish slots busy for 5s — drop to prevent goroutine buildup
 			fmt.Printf("%s[session] Publish timeout, dropping batch for %s%s\n",
 				colorYellow, session.ID, colorReset)
@@ -671,6 +692,8 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// Read() indefinitely without this.
 	session.Stdout.Close()
 	session.Stderr.Close()
+
+	waitForStreamCompletion(session, 45*time.Second)
 
 	session.mu.Lock()
 	session.Status = "ended"
@@ -837,16 +860,54 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 	return result, strings.Join(promptParts, " ")
 }
 
-// buildCodexInteractiveArgs builds Codex CLI args for interactive streaming.
-// Uses exec mode with --json for JSONL event output and --full-auto for
-// low-friction sandboxed automatic execution.
+// buildCodexInteractiveArgs builds Codex CLI args for JSONL streaming. Codex
+// exec is a one-shot command: the prompt is positional, and stdin must be
+// closed so Codex does not wait for additional piped input.
 func buildCodexInteractiveArgs(args []string) []string {
-	result := make([]string, 0, len(args)+4)
+	cleanedArgs := sanitizeCodexExecArgs(args)
+	result := make([]string, 0, len(cleanedArgs)+3)
 	result = append(result, "exec")
 	result = append(result, "--json")
-	result = append(result, "--full-auto")
-	result = append(result, args...)
+	result = append(result, "--dangerously-bypass-approvals-and-sandbox")
+	result = append(result, cleanedArgs...)
 	return result
+}
+
+func sanitizeCodexExecArgs(args []string) []string {
+	cleaned := make([]string, 0, len(args))
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		lowerArg := strings.ToLower(arg)
+
+		if i == 0 && lowerArg == "exec" {
+			continue
+		}
+
+		switch {
+		case lowerArg == "--json" ||
+			lowerArg == "--full-auto" ||
+			lowerArg == "--dangerously-bypass-approvals-and-sandbox":
+			continue
+		case lowerArg == "--sandbox" ||
+			lowerArg == "-s" ||
+			lowerArg == "--approval-policy" ||
+			lowerArg == "--ask-for-approval" ||
+			lowerArg == "-a":
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		case strings.HasPrefix(lowerArg, "--sandbox=") ||
+			strings.HasPrefix(lowerArg, "--approval-policy=") ||
+			strings.HasPrefix(lowerArg, "--ask-for-approval="):
+			continue
+		default:
+			cleaned = append(cleaned, arg)
+		}
+	}
+
+	return cleaned
 }
 
 // buildGeminiInteractiveArgs builds Gemini CLI args for interactive streaming.
