@@ -460,6 +460,45 @@ func waitForStreamCompletion(session *CLISession, timeout time.Duration) {
 	}
 }
 
+// detectCLITerminalEvent returns true if the JSON line marks the natural end of
+// a CLI agent turn — Claude "result", Codex "thread.completed"/"turn.completed",
+// or Gemini "result". Used to flush any pending stream batch before the CLI
+// process exits, so the final text chunk does not race with session_ended.
+//
+// Returning true means: "this CLI has just announced it is done; flush now and
+// expect process exit very soon." Unlike detectResultEvent, this does NOT cause
+// stdin to be closed (only Claude needs that — codex/gemini exit on their own
+// once stdin is closed at start). Detection here is best-effort: if a CLI emits
+// a terminal event we don't recognise, the existing process-exit path still
+// triggers the flush in the !ok branch of readOutputStream.
+func detectCLITerminalEvent(command, line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var event map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &event); err != nil {
+		return false
+	}
+	eventType, _ := event["type"].(string)
+	if eventType == "" {
+		return false
+	}
+
+	cmdLower := strings.ToLower(command)
+	switch {
+	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
+		return eventType == "result"
+	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
+		// Codex emits turn.completed when the turn is done. thread.completed is
+		// the very last event before the process exits.
+		return eventType == "thread.completed" || eventType == "turn.completed"
+	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
+		return eventType == "result"
+	}
+	return false
+}
+
 // readOutputStream reads stdout and stderr from the session and publishes
 // output chunks via the publishFn. It parses JSON events from structured
 // output modes to detect permission/approval prompts.
@@ -613,8 +652,22 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				return
 			}
 
+			// Detect CLI-terminal events (Claude "result", Codex
+			// "thread.completed"/"turn.completed", Gemini "result"). When we see
+			// one we flush any buffered text BEFORE the CLI process exits — the
+			// process-exit path also flushes via the !ok branch, but on a fast
+			// exit (Claude after stdin close, codex/gemini after final event)
+			// the timing race can leave the final batch in flight while
+			// session_ended is already being published. Flushing here guarantees
+			// the last chunk is enqueued for publish before the exit cascade.
+			if detectCLITerminalEvent(session.Command, line.text) {
+				flushBatch()
+			}
+
 			// For Claude stream-json: detect the "result" event that signals
 			// the turn is complete.  Close stdin so Claude sees EOF and exits.
+			// Done AFTER flushBatch above so any preceding text_delta lines in
+			// the batch are queued for publish before Claude tears down.
 			if detectResultEvent(session.Command, line.text) {
 				session.mu.Lock()
 				session.Stdin.Close()
@@ -693,7 +746,13 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	session.Stdout.Close()
 	session.Stderr.Close()
 
-	waitForStreamCompletion(session, 45*time.Second)
+	// 120s rather than 45s — publishFn can block up to 30s per pubsub.Publish
+	// and the asyncPublish semaphore has 5 slots, so a fully-loaded queue at
+	// exit can legitimately need ~30s to drain. 45s was tight enough that a
+	// single slow Publish would time us out and let session_ended race the
+	// final stream chunk, which is what produced the "agent didn't wait for
+	// terminal response — calls cross between steps" report on documentDesign.
+	waitForStreamCompletion(session, 120*time.Second)
 
 	session.mu.Lock()
 	session.Status = "ended"
