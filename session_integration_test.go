@@ -425,10 +425,10 @@ func TestSessionLifecycle_StderrOnlyIsStreamed(t *testing.T) {
 
 // assertLifecycleOrdering pins the two invariants that terminal-service +
 // ai-service rely on for correct chunk reassembly:
-//   1. session_ended is the LAST publishFn message (nothing after it).
-//   2. session_ended.Seq is strictly greater than any stream/prompt Seq, so
-//      terminal-service can write chunks ordered by Seq and the final
-//      session_ended chunk lands last.
+//  1. session_ended is the LAST publishFn message (nothing after it).
+//  2. session_ended.Seq is strictly greater than any stream/prompt Seq, so
+//     terminal-service can write chunks ordered by Seq and the final
+//     session_ended chunk lands last.
 //
 // session_started is published by pubsub.go (not SessionManager), so it's
 // out of scope here.
