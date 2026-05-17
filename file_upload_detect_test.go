@@ -128,10 +128,8 @@ func TestDetectOutputFilesSince_IgnoredDirs(t *testing.T) {
 	ignoredCases := []string{
 		"node_modules/some-pkg/icon.png",
 		".git/objects/pack-abc.png",
-		"dist/bundle.png",
 		".next/static/screenshot.png",
 		".cache/foo.png",
-		"build/output.png",
 	}
 	for _, p := range ignoredCases {
 		writeFileAt(t, filepath.Join(dir, p), "x", freshTime)

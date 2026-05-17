@@ -1851,10 +1851,6 @@ var ignoredDirs = map[string]struct{}{
 	".venv":         {},
 	"venv":          {},
 	"__pycache__":   {},
-	"dist":          {},
-	"build":         {},
-	"out":           {},
-	"target":        {},
 	"vendor":        {},
 	"bin":           {},
 	"obj":           {},
@@ -1973,7 +1969,7 @@ func detectOutputFilesSince(workDir string, sessionStart time.Time) []string {
 			}
 
 			// Prune ignored directories. Match by base name only — a project
-			// named "build" at the repo root is rare enough that the false
+			// named "vendor" at the repo root is rare enough that the false
 			// positive is acceptable, and the user can rename if needed.
 			if path != absBase {
 				if _, skip := ignoredDirs[d.Name()]; skip {
