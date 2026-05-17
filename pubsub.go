@@ -1832,8 +1832,10 @@ var mediaExtensions = map[string]struct{}{
 // ignoredDirs are directory names pruned from the walk regardless of depth.
 // The mtime filter would already exclude pre-existing files inside these
 // trees, but pruning the walk saves 10-100x on repos with large dependency
-// caches. None of these are conventional output locations for any UI testing
-// framework we support, so pruning is safe.
+// caches. Restricted to dependency/cache trees only — generic build-output
+// directories (dist, build, out, target, bin, obj) are NOT pruned because
+// test frameworks routinely write screenshots/videos under those paths and
+// the upload feature is meant to discover them.
 var ignoredDirs = map[string]struct{}{
 	"node_modules":  {},
 	".git":          {},
@@ -1852,8 +1854,6 @@ var ignoredDirs = map[string]struct{}{
 	"venv":          {},
 	"__pycache__":   {},
 	"vendor":        {},
-	"bin":           {},
-	"obj":           {},
 }
 
 // sensitiveBasenamePrefixes is a deny-list of basename prefixes that look
@@ -1909,7 +1909,7 @@ var errFileLimitReached = errors.New("file upload limit reached")
 //  2. Basename does not match any sensitiveBasenamePrefixes pattern
 //  3. ModTime >= sessionStart - mtimeSkew
 //  4. Path stays within workDir (no symlink escape)
-//  5. Not inside an ignored directory (node_modules, .git, build caches, etc.)
+//  5. Not inside an ignored dependency/cache directory (node_modules, .git, etc.)
 //
 // This replaces an older heuristic that scanned a hardcoded list of
 // framework-specific directories (test-results/, test-results-ui/). The
@@ -1933,6 +1933,21 @@ func detectOutputFilesSince(workDir string, sessionStart time.Time) []string {
 	if err != nil {
 		fmt.Printf("[file-upload] Cannot resolve workDir %q: %v\n", workDir, err)
 		return files
+	}
+
+	// Resolve symlinks before walking. filepath.WalkDir does NOT descend into
+	// symlinked directories, so if workDir itself (or any ancestor in the
+	// path) is a symlink — common when the user's repo lives under a
+	// symlinked path like /var → /private/var on macOS, or when CI mounts a
+	// workspace via symlink — the walk would return nothing. EvalSymlinks
+	// resolves the entire chain to a canonical real path. If resolution
+	// fails (e.g., the workdir was deleted between command dispatch and
+	// session end), fall through to the original absBase so the walk's own
+	// error handling reports the not-exist condition.
+	if resolved, resolveErr := filepath.EvalSymlinks(absBase); resolveErr == nil {
+		absBase = resolved
+	} else if !errors.Is(resolveErr, fs.ErrNotExist) {
+		fmt.Printf("[file-upload] Cannot resolve symlinks for %q: %v\n", absBase, resolveErr)
 	}
 
 	cutoff := time.Time{}
