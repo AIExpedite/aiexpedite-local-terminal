@@ -771,17 +771,26 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	seq := atomic.AddInt64(&session.Seq, 1)
 
 	// Detect and upload output files (screenshots, test artifacts) before
-	// publishing session_ended so that file metadata is included in the message.
+	// publishing session_ended so that file metadata is included in the
+	// message. Note: we intentionally do NOT gate on session.ExitCode == 0 —
+	// a UI test that screenshots right before crashing is the case where we
+	// MOST want the image to reach the orchestrator.
 	var uploadedFiles []FileInfo
 	var uploadErrors []UploadError
 	cfg := sm.Config
-	if cfg != nil && cfg.EnableFileUpload && session.WorkspaceID != "" && session.ExitCode == 0 {
+	if cfg != nil && cfg.EnableFileUpload && session.WorkspaceID != "" {
 		effectiveDir := session.Process.Dir
 		if effectiveDir == "" {
 			effectiveDir = getTrackedCwd()
 		}
-		if effectiveDir != "" {
-			files := detectOutputFiles(session.Command, "", effectiveDir)
+		if effectiveDir == "" {
+			// Without a workdir we cannot scope the upload scan, so we skip
+			// it entirely. Surface the reason — silently dropping every
+			// screenshot from a session is the kind of thing operators need
+			// to see, not have to git-blame for.
+			fmt.Printf("[session-file-upload] Skipping upload for session %s — no effective workdir (Process.Dir and trackedCwd both empty)\n", session.ID)
+		} else {
+			files := detectOutputFilesSince(effectiveDir, session.StartedAt)
 			if len(files) > 0 {
 				fmt.Printf("[session-file-upload] Detected %d output files, uploading to GCS (workspace: %s)...\n", len(files), session.WorkspaceID)
 

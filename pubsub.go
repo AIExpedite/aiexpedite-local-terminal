@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -1048,6 +1049,12 @@ func runPubSubConnection(cfg *Config) error {
 			fmt.Printf("%s[DEBUG] Cwd: %s%s\n", colorMagenta, cmd.Cwd, colorReset)
 		}
 
+		// Capture command start time for the file-upload mtime filter — any
+		// media file written under workDir during this command's lifetime
+		// gets picked up, regardless of which subdirectory the framework or
+		// the user's custom config chose.
+		cmdStartedAt := time.Now()
+
 		// Execute command (silently - no internal logs)
 		out, execErr := runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
 
@@ -1089,8 +1096,13 @@ func runPubSubConnection(cfg *Config) error {
 			res.Output = redactSensitiveData(execErr.Error()) + "\n" + redactedOut
 		}
 
-		// File upload integration
-		if cfg.EnableFileUpload && res.Status != "error" {
+		// File upload integration. Note: this block intentionally runs even
+		// when res.Status == "error". A failing UI test that captured a
+		// screenshot right before crashing is exactly the case where we
+		// MOST want the image to reach the orchestrator — gating on a
+		// successful exit code was the previous behavior, and it dropped
+		// screenshots from the crashes we most needed to debug.
+		if cfg.EnableFileUpload {
 			effectiveDir := getTrackedCwd()
 			if effectiveDir == "" {
 				effectiveDir = cmd.Cwd
@@ -1098,7 +1110,7 @@ func runPubSubConnection(cfg *Config) error {
 			if effectiveDir == "" && cfg != nil {
 				effectiveDir = cfg.WorkingDirectory
 			}
-			files := detectOutputFiles(cmd.Command, out, effectiveDir)
+			files := detectOutputFilesSince(effectiveDir, cmdStartedAt)
 			if len(files) > 0 {
 				// Security: Block file upload if workspaceID is missing
 				workspaceID := extractWorkspaceID(cmd)
@@ -1802,104 +1814,241 @@ func isPathSafeUnder(path, baseDir string) bool {
    File Upload Helper Functions
    -------------------------------------------------------------------------- */
 
-// detectOutputFiles finds files to upload based on command and output.
-// workDir is the directory the command ran in; relative paths are resolved
-// against it and safety checks are scoped to it.
-func detectOutputFiles(command string, output string, workDir string) []string {
-	files := []string{}
-
-	// Pattern 1: Playwright test artifacts
-	if containsSubstring(command, "playwright") || containsSubstring(command, "pwtest") {
-		fmt.Println("[file-upload] Detected Playwright command, scanning for test artifacts...")
-		// Look for test-results and test-results-ui directories
-		files = appendFilesFromDir(files, "test-results", workDir, []string{".png", ".webm", ".mp4", ".json", ".html"})
-		files = appendFilesFromDir(files, "test-results-ui", workDir, []string{".png", ".webm", ".mp4", ".json", ".html"})
-		fmt.Printf("[file-upload] Found %d Playwright artifacts\n", len(files))
-	}
-
-	// Pattern 2: Generic screenshots in current directory
-	if containsSubstring(command, "screenshot") || containsSubstring(output, "screenshot") {
-		files = appendFilesFromDir(files, ".", workDir, []string{".png", ".jpg", ".jpeg"})
-	}
-
-	// Pattern 3: Video recordings
-	if containsSubstring(command, "record") || containsSubstring(output, "recording") {
-		files = appendFilesFromDir(files, ".", workDir, []string{".webm", ".mp4", ".mov"})
-	}
-
-	// Pattern 4: CLI agents that ran Playwright tests (UI testing delegation)
-	// When claude/codex/gemini CLI runs Playwright internally, the command won't
-	// contain "playwright" and accumulated output may not be available (session.go
-	// passes "" for output). Always scan test-results and test-results-ui for CLI
-	// agent commands since these agents are invoked specifically for UI testing tasks.
-	if containsSubstring(command, "claude") || containsSubstring(command, "codex") || containsSubstring(command, "gemini") {
-		fmt.Println("[file-upload] Detected CLI agent command, scanning for test artifacts...")
-		files = appendFilesFromDir(files, "test-results", workDir, []string{".png", ".webm", ".mp4", ".json", ".html"})
-		files = appendFilesFromDir(files, "test-results-ui", workDir, []string{".png", ".webm", ".mp4", ".json", ".html"})
-		fmt.Printf("[file-upload] Found %d CLI agent test artifacts\n", len(files))
-	}
-
-	return files
+// mediaExtensions is the whitelist of file extensions eligible for upload.
+// Kept narrow on purpose — we want screenshots, video captures, and test
+// recordings, NOT test reports, source maps, or random JSON blobs that happen
+// to land in the workdir while a command runs.
+var mediaExtensions = map[string]struct{}{
+	".png":  {},
+	".jpg":  {},
+	".jpeg": {},
+	".gif":  {},
+	".webp": {},
+	".webm": {},
+	".mp4":  {},
+	".mov":  {},
 }
 
-// containsSubstring checks if haystack contains needle (case-insensitive)
-func containsSubstring(haystack, needle string) bool {
-	return len(haystack) > 0 && len(needle) > 0 &&
-		(haystack == needle || strings.Contains(strings.ToLower(haystack), strings.ToLower(needle)))
+// ignoredDirs are directory names pruned from the walk regardless of depth.
+// The mtime filter would already exclude pre-existing files inside these
+// trees, but pruning the walk saves 10-100x on repos with large dependency
+// caches. None of these are conventional output locations for any UI testing
+// framework we support, so pruning is safe.
+var ignoredDirs = map[string]struct{}{
+	"node_modules":  {},
+	".git":          {},
+	".hg":           {},
+	".svn":          {},
+	".next":         {},
+	".nuxt":         {},
+	".turbo":        {},
+	".cache":        {},
+	".parcel-cache": {},
+	".pytest_cache": {},
+	".mypy_cache":   {},
+	".ruff_cache":   {},
+	".tox":          {},
+	".venv":         {},
+	"venv":          {},
+	"__pycache__":   {},
+	"dist":          {},
+	"build":         {},
+	"out":           {},
+	"target":        {},
+	"vendor":        {},
+	"bin":           {},
+	"obj":           {},
 }
 
-// appendFilesFromDir recursively finds files with given extensions in dir.
-// baseDir is the command's working directory; relative paths in dir are
-// resolved against it and all found paths must remain within it.
-// maxUploadFiles is the maximum number of files collected across all Walk calls
-// for a single command execution.  Without a cap, a large test-results tree or
-// a node_modules directory full of .png files would enqueue thousands of GCS
-// uploads, exhausting memory and Cloud Storage quota.
+// sensitiveBasenamePrefixes is a deny-list of basename prefixes that look
+// like deliberately disguised credential files (e.g. "id_rsa.jpg",
+// ".env.png", "credentials.mov"). Extension whitelisting alone doesn't
+// catch a base64-encoded secret renamed to <something>.png; this is
+// defense-in-depth against the user accidentally — or maliciously —
+// dropping such a file into a workdir we're about to ship to GCS.
+//
+// Matched case-insensitively against the file basename (without
+// directory) via simple HasPrefix comparison. Unicode-lookalike attacks
+// (e.g. Cyrillic "е" in place of Latin "e") are NOT defended against —
+// the primary control is the user not dropping credential files into
+// their repo; this list catches the common-typo case.
+var sensitiveBasenamePrefixes = []string{
+	".env",
+	"id_rsa",
+	"id_dsa",
+	"id_ecdsa",
+	"id_ed25519",
+	".npmrc",
+	".pypirc",
+	".netrc",
+	".aws",
+	".gcp",
+	".kube",
+	"credentials",
+	"service-account",
+	"service_account",
+	"secret",
+}
+
+// mtimeSkew is the slack we subtract from the session start time to avoid
+// dropping files written within a millisecond of session start due to clock
+// rounding or filesystem timestamp resolution (HFS+ is 1s, FAT32 is 2s).
+const mtimeSkew = 5 * time.Second
+
+// maxUploadFiles caps total uploads per command/session.  Without a cap, a
+// repo dropping hundreds of screenshots per run could exhaust memory and GCS
+// quota. The mtime filter already excludes pre-existing files, so 50 is
+// generous for a single test run.
 const maxUploadFiles = 50
 
-func appendFilesFromDir(files []string, dir string, baseDir string, extensions []string) []string {
-	// Security: Validate directory is within safe boundaries
-	if !isPathSafeUnder(dir, baseDir) {
-		LogSecurityEvent(SecEvtPathTraversal, "blocked directory outside base",
-			"dir", dir, "base_dir", baseDir, "site", "appendFilesFromDir.entry")
+// errFileLimitReached is the sentinel returned from the WalkDir callback to
+// abort the walk once we've collected maxUploadFiles. A typed sentinel lets
+// the caller distinguish "we hit our cap" from "the filesystem returned a
+// real error" without comparing length counts.
+var errFileLimitReached = errors.New("file upload limit reached")
+
+// detectOutputFilesSince finds media files newly written under workDir during
+// the current command/session. Files are kept if:
+//  1. Extension is in mediaExtensions (PNG, JPG, GIF, WEBP, WEBM, MP4, MOV)
+//  2. Basename does not match any sensitiveBasenamePrefixes pattern
+//  3. ModTime >= sessionStart - mtimeSkew
+//  4. Path stays within workDir (no symlink escape)
+//  5. Not inside an ignored directory (node_modules, .git, build caches, etc.)
+//
+// This replaces an older heuristic that scanned a hardcoded list of
+// framework-specific directories (test-results/, test-results-ui/). The
+// mtime-based approach catches screenshots wherever a framework or custom
+// config writes them — cypress/screenshots/, wdio-output/, artifacts/,
+// .maestro/output/, or anywhere else the user has configured — without
+// requiring the Go binary to know about every framework.
+//
+// sessionStart should be the time the command (or interactive session)
+// started. Pass time.Time{} (zero) to disable the mtime filter and accept
+// any matching media file under workDir — only used by tests; production
+// callers always pass a real start time.
+func detectOutputFilesSince(workDir string, sessionStart time.Time) []string {
+	files := []string{}
+
+	if workDir == "" {
 		return files
 	}
 
-	// Resolve dir to an absolute path for Walk
-	absDir := dir
-	if !filepath.IsAbs(dir) {
-		absDir = filepath.Join(baseDir, dir)
+	absBase, err := filepath.Abs(workDir)
+	if err != nil {
+		fmt.Printf("[file-upload] Cannot resolve workDir %q: %v\n", workDir, err)
+		return files
 	}
 
-	if err := filepath.WalkDir(absDir, func(path string, d fs.DirEntry, err error) error {
-		// Stop collecting once we hit the cap; returning an error aborts the walk.
-		if len(files) >= maxUploadFiles {
-			return fmt.Errorf("file limit reached")
+	cutoff := time.Time{}
+	if !sessionStart.IsZero() {
+		cutoff = sessionStart.Add(-mtimeSkew)
+	}
+
+	walkErr := filepath.WalkDir(absBase, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// Permission and not-exist errors on individual subtrees (or on
+			// the root itself, when the workdir was removed between command
+			// dispatch and session end) should not abort the walk or spam
+			// stderr — they're expected operational states.
+			if !errors.Is(err, fs.ErrPermission) && !errors.Is(err, fs.ErrNotExist) {
+				fmt.Printf("[file-upload] Walk error at %s: %v\n", path, err)
+			}
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
-		if err == nil && !d.IsDir() {
-			// Skip symlinks — prevents traversal outside baseDir
-			if d.Type()&os.ModeSymlink != 0 {
-				return nil
+
+		if d.IsDir() {
+			// Defense in depth: refuse any "directory" entry that is not a
+			// pure directory. This catches symlinked dirs on POSIX, NTFS
+			// junctions (created by `mklink /J`) and mount points on
+			// Windows — both of which have ModeIrregular set on Go 1.20+
+			// even though IsDir() returns true — plus anything else exotic
+			// the OS surfaces (Windows reparse-point tags we don't know
+			// about). filepath.WalkDir doesn't follow symlinks, but it DOES
+			// descend into junctions, which is the gap we're closing here.
+			if d.Type()&^os.ModeDir != 0 {
+				return fs.SkipDir
 			}
-			// Security: Validate each file path as well
-			if !isPathSafeUnder(path, baseDir) {
-				LogSecurityEvent(SecEvtPathTraversal, "blocked file outside base during walk",
-					"path", path, "base_dir", baseDir, "site", "appendFilesFromDir.walk")
-				return nil
-			}
-			ext := strings.ToLower(filepath.Ext(path))
-			for _, targetExt := range extensions {
-				if ext == targetExt {
-					files = append(files, path)
-					break
+
+			// Prune ignored directories. Match by base name only — a project
+			// named "build" at the repo root is rare enough that the false
+			// positive is acceptable, and the user can rename if needed.
+			if path != absBase {
+				if _, skip := ignoredDirs[d.Name()]; skip {
+					return fs.SkipDir
+				}
+				// Hidden directories are pruned too, EXCEPT the .maestro
+				// convention used by Maestro for mobile UI testing output.
+				name := d.Name()
+				if strings.HasPrefix(name, ".") && name != ".maestro" {
+					return fs.SkipDir
 				}
 			}
+			return nil
 		}
+
+		if len(files) >= maxUploadFiles {
+			return errFileLimitReached
+		}
+
+		// Only upload regular files. d.Type() returns just the type bits
+		// (ModeDir, ModeSymlink, ModeNamedPipe, ModeSocket, ModeDevice,
+		// ModeCharDevice, ModeIrregular) — a value of zero means a regular
+		// file. This blocks symlinks, pipes, sockets, devices, and the
+		// ModeIrregular tag Windows uses for reparse points other than
+		// symlinks (e.g. NTFS junctions).
+		if d.Type() != 0 {
+			return nil
+		}
+
+		ext := strings.ToLower(filepath.Ext(path))
+		if _, ok := mediaExtensions[ext]; !ok {
+			return nil
+		}
+
+		// Sensitive-name guard: even though the extension is on the media
+		// allowlist, refuse to upload basenames that look like disguised
+		// credential / secret files. Catches the case where someone (or
+		// some misconfigured tool) drops `.env.png` or `id_rsa.jpg` into
+		// the workdir.
+		baseLower := strings.ToLower(filepath.Base(path))
+		for _, prefix := range sensitiveBasenamePrefixes {
+			if strings.HasPrefix(baseLower, prefix) {
+				LogSecurityEvent(SecEvtPathTraversal, "blocked sensitive-looking filename from upload",
+					"path", path, "site", "detectOutputFilesSince.sensitiveBasename")
+				return nil
+			}
+		}
+
+		// Defense in depth: the walk shouldn't leave absBase since we
+		// rejected symlinks, but verify before uploading.
+		if !isPathSafeUnder(path, absBase) {
+			LogSecurityEvent(SecEvtPathTraversal, "blocked file outside base during walk",
+				"path", path, "base_dir", absBase, "site", "detectOutputFilesSince")
+			return nil
+		}
+
+		if !cutoff.IsZero() {
+			info, infoErr := d.Info()
+			if infoErr != nil {
+				return nil
+			}
+			if info.ModTime().Before(cutoff) {
+				return nil
+			}
+		}
+
+		files = append(files, path)
 		return nil
-	}); err != nil && len(files) < maxUploadFiles {
+	})
+
+	if walkErr != nil && !errors.Is(walkErr, errFileLimitReached) {
 		// Only log genuine walk errors, not our own sentinel stop error.
-		fmt.Printf("[file-upload] Walk error in %s: %v\n", dir, err)
+		fmt.Printf("[file-upload] Walk error in %s: %v\n", absBase, walkErr)
 	}
+
 	return files
 }
 
