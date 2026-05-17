@@ -1934,6 +1934,10 @@ func detectOutputFilesSince(workDir string, sessionStart time.Time) []string {
 		fmt.Printf("[file-upload] Cannot resolve workDir %q: %v\n", workDir, err)
 		return files
 	}
+	// Resolve symlinks in the base directory itself so WalkDir doesn't skip it
+	if resolvedBase, err := filepath.EvalSymlinks(absBase); err == nil {
+		absBase = resolvedBase
+	}
 
 	// Resolve symlinks before walking. filepath.WalkDir does NOT descend into
 	// symlinked directories, so if workDir itself (or any ancestor in the
