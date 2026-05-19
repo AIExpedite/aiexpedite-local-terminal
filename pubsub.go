@@ -1284,18 +1284,19 @@ func decodeBase64PowerShellStrict(encoded string) (string, error) {
 	return string(utf16.Decode(u16s)), nil
 }
 
-// encodedCommandStdinThreshold is the maximum -EncodedCommand argument length
-// we'll pass to powershell.exe before falling back to the stdin-pipe path.
-// Windows CreateProcess caps lpCommandLine at 32767 chars; 30000 leaves ~2KB
-// headroom for the executable path, the leading flags, and a safety margin.
-const encodedCommandStdinThreshold = 30000
+// encodedCommandFallbackThreshold is the maximum -EncodedCommand argument
+// length we'll pass to powershell.exe before falling back to the temp-file
+// path. Windows CreateProcess caps lpCommandLine at 32767 chars; 30000 leaves
+// ~2KB headroom for the executable path, the leading flags, and a safety
+// margin.
+const encodedCommandFallbackThreshold = 30000
 
 // Indirection points for tests: the dispatcher in runEncodedPowerShellCommand
 // calls these vars rather than the implementations directly so unit tests can
 // swap in spies to assert which transport was selected.
 var (
-	runEncodedPowerShellViaArgFn   = runEncodedPowerShellViaArg
-	runPowerShellCommandViaStdinFn = runPowerShellCommandViaStdin
+	runEncodedPowerShellViaArgFn      = runEncodedPowerShellViaArg
+	runPowerShellCommandViaTempFileFn = runPowerShellCommandViaTempFile
 )
 
 // runEncodedPowerShellCommand executes a Base64-encoded PowerShell script.
@@ -1303,21 +1304,21 @@ var (
 // bypasses all shell escaping issues.
 //
 // When the encoded script is small enough to fit in a Windows command line
-// (<=encodedCommandStdinThreshold chars) it goes through the standard
+// (<=encodedCommandFallbackThreshold chars) it goes through the standard
 // -EncodedCommand argument path. Above that, Windows' CreateProcess cmdline
 // cap (~32767 chars) starts rejecting the spawn with "The filename or
-// extension is too long", so we decode the script and pipe it to
-// `powershell.exe -Command -` via stdin instead. The transport differs but
-// the semantics (one-shot fresh process, CLIXML filtering, error shape) are
-// identical.
+// extension is too long", so we decode the script to a temp .ps1 file and
+// invoke `powershell.exe -File <path>` instead. The transport differs but
+// the semantics (one-shot fresh process, default/empty stdin for any child
+// tools spawned by the script, CLIXML filtering, error shape) are identical.
 func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout time.Duration) (string, error) {
-	if len(encodedScript) > encodedCommandStdinThreshold {
+	if len(encodedScript) > encodedCommandFallbackThreshold {
 		script, decodeErr := decodeBase64PowerShellStrict(encodedScript)
 		if decodeErr != nil {
-			return "", fmt.Errorf("powershell stdin fallback: decode failed: %w", decodeErr)
+			return "", fmt.Errorf("powershell temp-file fallback: decode failed: %w", decodeErr)
 		}
-		fmt.Printf("%s[aiexpedite] PowerShell script %d chars encoded — routing via stdin pipe (over -EncodedCommand cmdline limit)%s\n", colorCyan, len(encodedScript), colorReset)
-		return runPowerShellCommandViaStdinFn(script, workDir, timeout)
+		fmt.Printf("%s[aiexpedite] PowerShell script %d chars encoded — routing via temp .ps1 file (over -EncodedCommand cmdline limit)%s\n", colorCyan, len(encodedScript), colorReset)
+		return runPowerShellCommandViaTempFileFn(script, workDir, timeout)
 	}
 	return runEncodedPowerShellViaArgFn(encodedScript, workDir, timeout)
 }
@@ -1369,16 +1370,47 @@ func runEncodedPowerShellViaArg(encodedScript string, workDir string, timeout ti
 	return assemblePowerShellOutput(stdout.String(), stderr.String(), err)
 }
 
-// runPowerShellCommandViaStdin invokes powershell.exe and pipes the (already
-// decoded) script via stdin to `-Command -`. Used as a fallback when the
-// Base64-encoded script is too large to fit on the Windows command line.
-// Error/output semantics match runEncodedPowerShellViaArg exactly.
-func runPowerShellCommandViaStdin(script string, workDir string, timeout time.Duration) (string, error) {
+// runPowerShellCommandViaTempFile writes the (already decoded) script to a
+// temp .ps1 file and invokes `powershell.exe -File <path>`. Used as a
+// fallback when the Base64-encoded script is too large to fit on the Windows
+// command line.
+//
+// We deliberately do NOT pipe the script through stdin to `-Command -`:
+// PowerShell reading source from stdin shares that pipe with any child
+// process started by the script (python, node, ssh, credential prompts,
+// etc.), and a child reading stdin can consume the remaining PowerShell
+// source instead of seeing the default/empty stdin it would have had on the
+// -EncodedCommand path. The temp-file transport preserves the original
+// stdin semantics. Error/output semantics match runEncodedPowerShellViaArg
+// exactly.
+func runPowerShellCommandViaTempFile(script string, workDir string, timeout time.Duration) (string, error) {
+	tmp, err := os.CreateTemp("", "aiexpedite-ps-*.ps1")
+	if err != nil {
+		return "", fmt.Errorf("powershell temp-file fallback: create temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	// UTF-8 BOM tells Windows PowerShell 5.x to read the file as UTF-8
+	// rather than the legacy ANSI codepage, so non-ASCII characters in the
+	// script survive intact.
+	if _, err := tmp.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("powershell temp-file fallback: write BOM: %w", err)
+	}
+	if _, err := tmp.WriteString(script); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("powershell temp-file fallback: write script: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("powershell temp-file fallback: close temp: %w", err)
+	}
+
 	psArgs := []string{
 		"-NoProfile",
 		"-NonInteractive",
 		"-OutputFormat", "Text",
-		"-Command", "-",
+		"-File", tmpPath,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -1394,25 +1426,13 @@ func runPowerShellCommandViaStdin(script string, workDir string, timeout time.Du
 	c.Stdout = &stdout
 	c.Stderr = &stderr
 
-	stdin, err := c.StdinPipe()
-	if err != nil {
-		return "", err
-	}
-
 	if startErr := c.Start(); startErr != nil {
-		_ = stdin.Close()
 		return "", startErr
 	}
 	if c.Process != nil {
-		globalProcessRegistry.Register(c.Process.Pid, "pubsub:powershell-stdin")
+		globalProcessRegistry.Register(c.Process.Pid, "pubsub:powershell-tempfile")
 		defer globalProcessRegistry.Deregister(c.Process.Pid)
 	}
-
-	// Feed the script and close stdin so PowerShell sees EOF and exits.
-	// A write error here usually means the process already died; in that case
-	// c.Wait() below surfaces the real reason, so we don't bail early.
-	_, _ = fmt.Fprint(stdin, script)
-	_ = stdin.Close()
 
 	waitErr := c.Wait()
 	return assemblePowerShellOutput(stdout.String(), stderr.String(), waitErr)

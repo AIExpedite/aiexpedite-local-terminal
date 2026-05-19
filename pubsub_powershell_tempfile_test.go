@@ -11,28 +11,28 @@ import (
 // withSpiedTransports swaps the two PowerShell transport vars used by
 // runEncodedPowerShellCommand for stubs, records which one was called, and
 // restores the originals when the returned cleanup runs.
-func withSpiedTransports(t *testing.T) (called *struct{ arg, stdin bool }, lastScript *string, cleanup func()) {
+func withSpiedTransports(t *testing.T) (called *struct{ arg, tempFile bool }, lastScript *string, cleanup func()) {
 	t.Helper()
-	flags := &struct{ arg, stdin bool }{}
+	flags := &struct{ arg, tempFile bool }{}
 	captured := new(string)
 
 	origArg := runEncodedPowerShellViaArgFn
-	origStdin := runPowerShellCommandViaStdinFn
+	origTempFile := runPowerShellCommandViaTempFileFn
 
 	runEncodedPowerShellViaArgFn = func(encoded string, workDir string, timeout time.Duration) (string, error) {
 		flags.arg = true
 		*captured = encoded
 		return "arg-stub", nil
 	}
-	runPowerShellCommandViaStdinFn = func(script string, workDir string, timeout time.Duration) (string, error) {
-		flags.stdin = true
+	runPowerShellCommandViaTempFileFn = func(script string, workDir string, timeout time.Duration) (string, error) {
+		flags.tempFile = true
 		*captured = script
-		return "stdin-stub", nil
+		return "tempfile-stub", nil
 	}
 
 	return flags, captured, func() {
 		runEncodedPowerShellViaArgFn = origArg
-		runPowerShellCommandViaStdinFn = origStdin
+		runPowerShellCommandViaTempFileFn = origTempFile
 	}
 }
 
@@ -43,7 +43,7 @@ func TestSmallEncodedScriptUsesArgPath(t *testing.T) {
 	defer restore()
 
 	encoded := encodeForPowerShell("Write-Host hello")
-	if len(encoded) > encodedCommandStdinThreshold {
+	if len(encoded) > encodedCommandFallbackThreshold {
 		t.Fatalf("test setup invariant violated: short script encoded to %d chars", len(encoded))
 	}
 
@@ -57,15 +57,15 @@ func TestSmallEncodedScriptUsesArgPath(t *testing.T) {
 	if !flags.arg {
 		t.Error("expected arg path to be invoked")
 	}
-	if flags.stdin {
-		t.Error("stdin path should not have been invoked for small script")
+	if flags.tempFile {
+		t.Error("temp-file path should not have been invoked for small script")
 	}
 }
 
-// TestLargeEncodedScriptUsesStdinPath verifies that when the encoded form
+// TestLargeEncodedScriptUsesTempFilePath verifies that when the encoded form
 // exceeds the threshold, runEncodedPowerShellCommand decodes the script and
-// routes it through the stdin-pipe helper.
-func TestLargeEncodedScriptUsesStdinPath(t *testing.T) {
+// routes it through the temp-file helper.
+func TestLargeEncodedScriptUsesTempFilePath(t *testing.T) {
 	flags, captured, restore := withSpiedTransports(t)
 	defer restore()
 
@@ -73,7 +73,7 @@ func TestLargeEncodedScriptUsesStdinPath(t *testing.T) {
 	// well above the 30000-char encoded threshold.
 	raw := "Write-Output 'sentinel-large'\n" + strings.Repeat("# pad\n", 2500)
 	encoded := encodeForPowerShell(raw)
-	if len(encoded) <= encodedCommandStdinThreshold {
+	if len(encoded) <= encodedCommandFallbackThreshold {
 		t.Fatalf("test setup invariant violated: large script encoded to only %d chars", len(encoded))
 	}
 
@@ -81,42 +81,42 @@ func TestLargeEncodedScriptUsesStdinPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if out != "stdin-stub" {
-		t.Fatalf("expected stdin-stub output, got %q", out)
+	if out != "tempfile-stub" {
+		t.Fatalf("expected tempfile-stub output, got %q", out)
 	}
-	if !flags.stdin {
-		t.Error("expected stdin path to be invoked")
+	if !flags.tempFile {
+		t.Error("expected temp-file path to be invoked")
 	}
 	if flags.arg {
 		t.Error("arg path should not have been invoked for large script")
 	}
-	// The stdin helper receives the *decoded* script, not the encoded blob.
+	// The temp-file helper receives the *decoded* script, not the encoded blob.
 	if !strings.Contains(*captured, "sentinel-large") {
-		t.Errorf("stdin helper received script that doesn't contain the original sentinel; first 80 chars: %q", truncate(*captured, 80))
+		t.Errorf("temp-file helper received script that doesn't contain the original sentinel; first 80 chars: %q", truncate(*captured, 80))
 	}
 }
 
-// TestStdinPipeExecutesLargeScript exercises the real stdin-pipe helper
+// TestTempFileExecutesLargeScript exercises the real temp-file helper
 // end-to-end against the local powershell.exe to confirm that scripts past
 // the -EncodedCommand cmdline limit actually run and return their output.
-func TestStdinPipeExecutesLargeScript(t *testing.T) {
+func TestTempFileExecutesLargeScript(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping powershell.exe integration test in -short mode")
 	}
 
-	sentinel := "STDIN-PIPE-OK-9F2A"
+	sentinel := "TEMPFILE-OK-9F2A"
 	// ~18KB raw → ~48KB base64-encoded UTF-16LE, well over the threshold and
 	// over the historical CreateProcess failure point.
 	padding := strings.Repeat("# noise line\n", 3000)
 	script := "Write-Output '" + sentinel + "'\n" + padding
 	encoded := encodeForPowerShell(script)
-	if len(encoded) <= encodedCommandStdinThreshold {
+	if len(encoded) <= encodedCommandFallbackThreshold {
 		t.Fatalf("test setup invariant violated: encoded length %d does not exceed threshold", len(encoded))
 	}
 
 	out, err := runEncodedPowerShellCommand(encoded, "", 30*time.Second)
 	if err != nil {
-		t.Fatalf("expected stdin-piped large script to succeed, got error: %v\noutput: %s", err, out)
+		t.Fatalf("expected temp-file large script to succeed, got error: %v\noutput: %s", err, out)
 	}
 	if !strings.Contains(out, sentinel) {
 		t.Errorf("expected sentinel %q in output, got: %s", sentinel, out)
@@ -124,12 +124,12 @@ func TestStdinPipeExecutesLargeScript(t *testing.T) {
 }
 
 // TestInvalidBase64AboveThresholdReturnsError verifies that a malformed
-// encoded payload large enough to trip the stdin fallback surfaces a real
+// encoded payload large enough to trip the temp-file fallback surfaces a real
 // error instead of being silently forwarded to PowerShell.
 func TestInvalidBase64AboveThresholdReturnsError(t *testing.T) {
 	// '!' is not a valid base64 character, so any size of this string fails
-	// the decoder. Sized above the threshold so the stdin path is taken.
-	bad := strings.Repeat("!", encodedCommandStdinThreshold+10)
+	// the decoder. Sized above the threshold so the fallback path is taken.
+	bad := strings.Repeat("!", encodedCommandFallbackThreshold+10)
 
 	out, err := runEncodedPowerShellCommand(bad, "", 5*time.Second)
 	if err == nil {
