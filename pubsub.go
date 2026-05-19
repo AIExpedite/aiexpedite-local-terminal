@@ -1406,9 +1406,16 @@ func runPowerShellCommandViaTempFile(script string, workDir string, timeout time
 		return "", fmt.Errorf("powershell temp-file fallback: close temp: %w", err)
 	}
 
+	// `-ExecutionPolicy Bypass` is required because `-File` (unlike
+	// `-EncodedCommand`) is subject to the machine's ExecutionPolicy. On
+	// clients with the default `Restricted` policy, .ps1 scripts simply
+	// won't run, so a large encoded command would silently fail where the
+	// small-script `-EncodedCommand` path succeeded. Bypass is scoped to
+	// this single process invocation and does not touch user/machine policy.
 	psArgs := []string{
 		"-NoProfile",
 		"-NonInteractive",
+		"-ExecutionPolicy", "Bypass",
 		"-OutputFormat", "Text",
 		"-File", tmpPath,
 	}
