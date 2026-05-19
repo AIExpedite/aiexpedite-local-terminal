@@ -1265,12 +1265,71 @@ func decodeBase64PowerShell(encoded string) string {
 	return string(utf16.Decode(u16s))
 }
 
+// decodeBase64PowerShellStrict is the same as decodeBase64PowerShell but returns
+// a real error instead of a magic sentinel string. Used by the stdin-pipe
+// fallback path where a decode failure must abort the call rather than be
+// silently forwarded to PowerShell as a literal "[decode error]" script.
+func decodeBase64PowerShellStrict(encoded string) (string, error) {
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("base64 decode: %w", err)
+	}
+	if len(decoded)%2 != 0 {
+		return "", errors.New("invalid UTF-16LE encoding: odd byte length")
+	}
+	u16s := make([]uint16, len(decoded)/2)
+	for i := 0; i < len(u16s); i++ {
+		u16s[i] = uint16(decoded[i*2]) | uint16(decoded[i*2+1])<<8
+	}
+	return string(utf16.Decode(u16s)), nil
+}
+
+// encodedCommandFallbackThreshold is the maximum -EncodedCommand argument
+// length we'll pass to powershell.exe before falling back to the temp-file
+// path. Windows CreateProcess caps lpCommandLine at 32767 chars; 30000 leaves
+// ~2KB headroom for the executable path, the leading flags, and a safety
+// margin.
+const encodedCommandFallbackThreshold = 30000
+
+// Indirection points for tests: the dispatcher in runEncodedPowerShellCommand
+// calls these vars rather than the implementations directly so unit tests can
+// swap in spies to assert which transport was selected.
+var (
+	runEncodedPowerShellViaArgFn      = runEncodedPowerShellViaArg
+	runPowerShellCommandViaTempFileFn = runPowerShellCommandViaTempFile
+)
+
 // runEncodedPowerShellCommand executes a Base64-encoded PowerShell script.
 // This is the most reliable way to execute PowerShell commands as it completely
 // bypasses all shell escaping issues.
-// It captures stdout and stderr separately and filters CLIXML progress messages
-// to avoid false "exit status 1" errors when commands produce valid output.
+//
+// When the encoded script is small enough to fit in a Windows command line
+// (<=encodedCommandFallbackThreshold chars) it goes through the standard
+// -EncodedCommand argument path. Above that, Windows' CreateProcess cmdline
+// cap (~32767 chars) starts rejecting the spawn with "The filename or
+// extension is too long", so we decode the script to a temp .ps1 file and
+// invoke `powershell.exe -File <path>` instead. The transport differs but
+// the semantics (one-shot fresh process, default/empty stdin for any child
+// tools spawned by the script, CLIXML filtering, error shape) are identical.
 func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout time.Duration) (string, error) {
+	if len(encodedScript) > encodedCommandFallbackThreshold {
+		script, decodeErr := decodeBase64PowerShellStrict(encodedScript)
+		if decodeErr != nil {
+			return "", fmt.Errorf("powershell temp-file fallback: decode failed: %w", decodeErr)
+		}
+		fmt.Printf("%s[aiexpedite] PowerShell script %d chars encoded — routing via temp .ps1 file (over -EncodedCommand cmdline limit)%s\n", colorCyan, len(encodedScript), colorReset)
+		return runPowerShellCommandViaTempFileFn(script, workDir, timeout)
+	}
+	return runEncodedPowerShellViaArgFn(encodedScript, workDir, timeout)
+}
+
+// runEncodedPowerShellViaArg invokes powershell.exe with the script passed as
+// the -EncodedCommand argument. This is the fast path used for any script
+// whose encoded form fits comfortably under the Windows cmdline limit.
+// It captures stdout and stderr separately and filters CLIXML progress
+// messages to avoid false "exit status 1" errors when commands produce valid
+// output.
+func runEncodedPowerShellViaArg(encodedScript string, workDir string, timeout time.Duration) (string, error) {
 	// `-OutputFormat Text` prevents PowerShell from serializing stderr as CLIXML
 	// (XML error records) when stderr is piped to a non-console parent process.
 	// Without it, any PowerShell error surfaces as `#< CLIXML <Objs ...>` noise
@@ -1308,34 +1367,105 @@ func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout t
 	}
 	err := c.Wait()
 
-	stdoutStr := stdout.String()
-	stderrStr := stderr.String()
+	return assemblePowerShellOutput(stdout.String(), stderr.String(), err)
+}
 
-	// Filter CLIXML from stderr (progress/verbose messages)
+// runPowerShellCommandViaTempFile writes the (already decoded) script to a
+// temp .ps1 file and invokes `powershell.exe -File <path>`. Used as a
+// fallback when the Base64-encoded script is too large to fit on the Windows
+// command line.
+//
+// We deliberately do NOT pipe the script through stdin to `-Command -`:
+// PowerShell reading source from stdin shares that pipe with any child
+// process started by the script (python, node, ssh, credential prompts,
+// etc.), and a child reading stdin can consume the remaining PowerShell
+// source instead of seeing the default/empty stdin it would have had on the
+// -EncodedCommand path. The temp-file transport preserves the original
+// stdin semantics. Error/output semantics match runEncodedPowerShellViaArg
+// exactly.
+func runPowerShellCommandViaTempFile(script string, workDir string, timeout time.Duration) (string, error) {
+	tmp, err := os.CreateTemp("", "aiexpedite-ps-*.ps1")
+	if err != nil {
+		return "", fmt.Errorf("powershell temp-file fallback: create temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	// UTF-8 BOM tells Windows PowerShell 5.x to read the file as UTF-8
+	// rather than the legacy ANSI codepage, so non-ASCII characters in the
+	// script survive intact.
+	if _, err := tmp.Write([]byte{0xEF, 0xBB, 0xBF}); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("powershell temp-file fallback: write BOM: %w", err)
+	}
+	if _, err := tmp.WriteString(script); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("powershell temp-file fallback: write script: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("powershell temp-file fallback: close temp: %w", err)
+	}
+
+	// `-ExecutionPolicy Bypass` is required because `-File` (unlike
+	// `-EncodedCommand`) is subject to the machine's ExecutionPolicy. On
+	// clients with the default `Restricted` policy, .ps1 scripts simply
+	// won't run, so a large encoded command would silently fail where the
+	// small-script `-EncodedCommand` path succeeded. Bypass is scoped to
+	// this single process invocation and does not touch user/machine policy.
+	psArgs := []string{
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy", "Bypass",
+		"-OutputFormat", "Text",
+		"-File", tmpPath,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	c := exec.CommandContext(ctx, "powershell.exe", psArgs...)
+	hideWindow(c)
+	if workDir != "" {
+		c.Dir = workDir
+	}
+
+	var stdout, stderr bytes.Buffer
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+
+	if startErr := c.Start(); startErr != nil {
+		return "", startErr
+	}
+	if c.Process != nil {
+		globalProcessRegistry.Register(c.Process.Pid, "pubsub:powershell-tempfile")
+		defer globalProcessRegistry.Deregister(c.Process.Pid)
+	}
+
+	waitErr := c.Wait()
+	return assemblePowerShellOutput(stdout.String(), stderr.String(), waitErr)
+}
+
+// assemblePowerShellOutput combines stdout/stderr from a one-shot PowerShell
+// spawn, filters CLIXML noise out of stderr, and applies the shared
+// error-suppression rule: a non-zero exit whose stderr was entirely CLIXML
+// progress chatter is cosmetic, not a real failure.
+func assemblePowerShellOutput(stdoutStr, stderrStr string, runErr error) (string, error) {
 	filteredStderr := filterCLIXML(stderrStr)
 
-	// Combine output (stdout first, then filtered stderr if any)
 	output := stdoutStr
 	if strings.TrimSpace(filteredStderr) != "" {
 		output += "\n" + filteredStderr
 	}
 
-	// Determine if this is a real error.
-	// Only suppress the error when stderr contains nothing but CLIXML (PS
-	// progress/verbose noise) — that is cosmetic, not a real failure.
-	// Previously this also suppressed errors when stdout had content, which
-	// masked real failures (e.g. a failed `cd` that still printed something).
 	var finalErr error
-	if err != nil {
+	if runErr != nil {
 		hasOnlyCLIXML := stderrStr != "" && strings.TrimSpace(filteredStderr) == ""
 		if hasOnlyCLIXML {
-			// CLIXML-only stderr is cosmetic noise — not a real error
 			finalErr = nil
 		} else {
-			finalErr = err
+			finalErr = runErr
 		}
 	}
-
 	return output, finalErr
 }
 
