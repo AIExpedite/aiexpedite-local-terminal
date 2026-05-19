@@ -271,12 +271,12 @@ func TestNoStdinPipeInTempFileTransport(t *testing.T) {
 	// either via Go's pipe API or via `-Command -` on the cmdline. Any of
 	// them means the fallback has regressed to the unsafe transport.
 	forbidden := []string{
-		"StdinPipe",        // c.StdinPipe()
-		"c.Stdin =",        // any direct Stdin assignment to a non-nil source
-		"cmd.Stdin =",      // same, alternate naming
-		`"-Command"`,       // -Command argument (would be paired with `-` or pipe)
-		`"-Command", "-"`,  // exact `-Command -` form
-		`"-Command","-"`,   // formatter quirk
+		"StdinPipe",       // c.StdinPipe()
+		"c.Stdin =",       // any direct Stdin assignment to a non-nil source
+		"cmd.Stdin =",     // same, alternate naming
+		`"-Command"`,      // -Command argument (would be paired with `-` or pipe)
+		`"-Command", "-"`, // exact `-Command -` form
+		`"-Command","-"`,  // formatter quirk
 	}
 	for _, pat := range forbidden {
 		if strings.Contains(body, pat) {
