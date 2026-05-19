@@ -1265,12 +1265,70 @@ func decodeBase64PowerShell(encoded string) string {
 	return string(utf16.Decode(u16s))
 }
 
+// decodeBase64PowerShellStrict is the same as decodeBase64PowerShell but returns
+// a real error instead of a magic sentinel string. Used by the stdin-pipe
+// fallback path where a decode failure must abort the call rather than be
+// silently forwarded to PowerShell as a literal "[decode error]" script.
+func decodeBase64PowerShellStrict(encoded string) (string, error) {
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", fmt.Errorf("base64 decode: %w", err)
+	}
+	if len(decoded)%2 != 0 {
+		return "", errors.New("invalid UTF-16LE encoding: odd byte length")
+	}
+	u16s := make([]uint16, len(decoded)/2)
+	for i := 0; i < len(u16s); i++ {
+		u16s[i] = uint16(decoded[i*2]) | uint16(decoded[i*2+1])<<8
+	}
+	return string(utf16.Decode(u16s)), nil
+}
+
+// encodedCommandStdinThreshold is the maximum -EncodedCommand argument length
+// we'll pass to powershell.exe before falling back to the stdin-pipe path.
+// Windows CreateProcess caps lpCommandLine at 32767 chars; 30000 leaves ~2KB
+// headroom for the executable path, the leading flags, and a safety margin.
+const encodedCommandStdinThreshold = 30000
+
+// Indirection points for tests: the dispatcher in runEncodedPowerShellCommand
+// calls these vars rather than the implementations directly so unit tests can
+// swap in spies to assert which transport was selected.
+var (
+	runEncodedPowerShellViaArgFn   = runEncodedPowerShellViaArg
+	runPowerShellCommandViaStdinFn = runPowerShellCommandViaStdin
+)
+
 // runEncodedPowerShellCommand executes a Base64-encoded PowerShell script.
 // This is the most reliable way to execute PowerShell commands as it completely
 // bypasses all shell escaping issues.
-// It captures stdout and stderr separately and filters CLIXML progress messages
-// to avoid false "exit status 1" errors when commands produce valid output.
+//
+// When the encoded script is small enough to fit in a Windows command line
+// (<=encodedCommandStdinThreshold chars) it goes through the standard
+// -EncodedCommand argument path. Above that, Windows' CreateProcess cmdline
+// cap (~32767 chars) starts rejecting the spawn with "The filename or
+// extension is too long", so we decode the script and pipe it to
+// `powershell.exe -Command -` via stdin instead. The transport differs but
+// the semantics (one-shot fresh process, CLIXML filtering, error shape) are
+// identical.
 func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout time.Duration) (string, error) {
+	if len(encodedScript) > encodedCommandStdinThreshold {
+		script, decodeErr := decodeBase64PowerShellStrict(encodedScript)
+		if decodeErr != nil {
+			return "", fmt.Errorf("powershell stdin fallback: decode failed: %w", decodeErr)
+		}
+		fmt.Printf("%s[aiexpedite] PowerShell script %d chars encoded — routing via stdin pipe (over -EncodedCommand cmdline limit)%s\n", colorCyan, len(encodedScript), colorReset)
+		return runPowerShellCommandViaStdinFn(script, workDir, timeout)
+	}
+	return runEncodedPowerShellViaArgFn(encodedScript, workDir, timeout)
+}
+
+// runEncodedPowerShellViaArg invokes powershell.exe with the script passed as
+// the -EncodedCommand argument. This is the fast path used for any script
+// whose encoded form fits comfortably under the Windows cmdline limit.
+// It captures stdout and stderr separately and filters CLIXML progress
+// messages to avoid false "exit status 1" errors when commands produce valid
+// output.
+func runEncodedPowerShellViaArg(encodedScript string, workDir string, timeout time.Duration) (string, error) {
 	// `-OutputFormat Text` prevents PowerShell from serializing stderr as CLIXML
 	// (XML error records) when stderr is piped to a non-console parent process.
 	// Without it, any PowerShell error surfaces as `#< CLIXML <Objs ...>` noise
@@ -1308,34 +1366,79 @@ func runEncodedPowerShellCommand(encodedScript string, workDir string, timeout t
 	}
 	err := c.Wait()
 
-	stdoutStr := stdout.String()
-	stderrStr := stderr.String()
+	return assemblePowerShellOutput(stdout.String(), stderr.String(), err)
+}
 
-	// Filter CLIXML from stderr (progress/verbose messages)
+// runPowerShellCommandViaStdin invokes powershell.exe and pipes the (already
+// decoded) script via stdin to `-Command -`. Used as a fallback when the
+// Base64-encoded script is too large to fit on the Windows command line.
+// Error/output semantics match runEncodedPowerShellViaArg exactly.
+func runPowerShellCommandViaStdin(script string, workDir string, timeout time.Duration) (string, error) {
+	psArgs := []string{
+		"-NoProfile",
+		"-NonInteractive",
+		"-OutputFormat", "Text",
+		"-Command", "-",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	c := exec.CommandContext(ctx, "powershell.exe", psArgs...)
+	hideWindow(c)
+	if workDir != "" {
+		c.Dir = workDir
+	}
+
+	var stdout, stderr bytes.Buffer
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+
+	stdin, err := c.StdinPipe()
+	if err != nil {
+		return "", err
+	}
+
+	if startErr := c.Start(); startErr != nil {
+		_ = stdin.Close()
+		return "", startErr
+	}
+	if c.Process != nil {
+		globalProcessRegistry.Register(c.Process.Pid, "pubsub:powershell-stdin")
+		defer globalProcessRegistry.Deregister(c.Process.Pid)
+	}
+
+	// Feed the script and close stdin so PowerShell sees EOF and exits.
+	// A write error here usually means the process already died; in that case
+	// c.Wait() below surfaces the real reason, so we don't bail early.
+	_, _ = fmt.Fprint(stdin, script)
+	_ = stdin.Close()
+
+	waitErr := c.Wait()
+	return assemblePowerShellOutput(stdout.String(), stderr.String(), waitErr)
+}
+
+// assemblePowerShellOutput combines stdout/stderr from a one-shot PowerShell
+// spawn, filters CLIXML noise out of stderr, and applies the shared
+// error-suppression rule: a non-zero exit whose stderr was entirely CLIXML
+// progress chatter is cosmetic, not a real failure.
+func assemblePowerShellOutput(stdoutStr, stderrStr string, runErr error) (string, error) {
 	filteredStderr := filterCLIXML(stderrStr)
 
-	// Combine output (stdout first, then filtered stderr if any)
 	output := stdoutStr
 	if strings.TrimSpace(filteredStderr) != "" {
 		output += "\n" + filteredStderr
 	}
 
-	// Determine if this is a real error.
-	// Only suppress the error when stderr contains nothing but CLIXML (PS
-	// progress/verbose noise) — that is cosmetic, not a real failure.
-	// Previously this also suppressed errors when stdout had content, which
-	// masked real failures (e.g. a failed `cd` that still printed something).
 	var finalErr error
-	if err != nil {
+	if runErr != nil {
 		hasOnlyCLIXML := stderrStr != "" && strings.TrimSpace(filteredStderr) == ""
 		if hasOnlyCLIXML {
-			// CLIXML-only stderr is cosmetic noise — not a real error
 			finalErr = nil
 		} else {
-			finalErr = err
+			finalErr = runErr
 		}
 	}
-
 	return output, finalErr
 }
 
