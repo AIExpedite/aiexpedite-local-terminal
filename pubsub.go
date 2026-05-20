@@ -755,10 +755,23 @@ func runPubSubConnection(cfg *Config) error {
 			}
 		}()
 
-		// Reject oversized messages before parsing — a normal command payload is
-		// well under 1 KB; 64 KB is a generous cap that rules out memory exhaustion
-		// from malformed or unexpectedly large Pub/Sub messages.
-		const maxMessageSize = 64 * 1024 // 64 KB
+		// Reject oversized messages before parsing as a defense against memory
+		// exhaustion from malformed or unexpectedly large Pub/Sub messages.
+		//
+		// Sized to accommodate large positional args — specifically the
+		// kickoff-brief pattern in ai-service's TerminalWithFeatureDetailsTool,
+		// which passes a verbatim feature spec (tens to hundreds of KB) as
+		// args[0] so claude can be seeded with the signed-off doc without
+		// AI paraphrasing. Briefs over ~78 KB were previously silently dropped
+		// here and stranded the session at status=starting forever.
+		//
+		// 1 MB matches the next natural ceiling — Firestore's per-document cap,
+		// which terminal-service hits when it writes args onto the
+		// terminalSession doc. If something ever exceeds 1 MB the Firestore
+		// write will throw a clear error instead of the silent pubsub drop.
+		// Pub/Sub itself allows up to 10 MB, so this is well within transport
+		// limits.
+		const maxMessageSize = 1024 * 1024 // 1 MB
 		if len(m.Data) > maxMessageSize {
 			fmt.Printf("%s[aiexpedite] Oversized message rejected (%d bytes)%s\n",
 				colorRed, len(m.Data), colorReset)
