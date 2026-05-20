@@ -755,13 +755,45 @@ func runPubSubConnection(cfg *Config) error {
 			}
 		}()
 
-		// Reject oversized messages before parsing — a normal command payload is
-		// well under 1 KB; 64 KB is a generous cap that rules out memory exhaustion
-		// from malformed or unexpectedly large Pub/Sub messages.
-		const maxMessageSize = 64 * 1024 // 64 KB
+		// Reject oversized messages before parsing as a defense against memory
+		// exhaustion from malformed or unexpectedly large Pub/Sub messages.
+		//
+		// Sized to accommodate large positional args — specifically the
+		// kickoff-brief pattern in ai-service's TerminalWithFeatureDetailsTool,
+		// which passes a verbatim feature spec (tens to hundreds of KB) as
+		// args[0] so claude can be seeded with the signed-off doc without
+		// AI paraphrasing. Briefs over ~78 KB were previously silently dropped
+		// here and stranded the session at status=starting forever.
+		//
+		// 1 MB matches the next natural ceiling — Firestore's per-document cap,
+		// which terminal-service hits when it writes args onto the
+		// terminalSession doc. If something ever exceeds 1 MB the Firestore
+		// write will throw a clear error instead of the silent pubsub drop.
+		// Pub/Sub itself allows up to 10 MB, so this is well within transport
+		// limits.
+		const maxMessageSize = 1024 * 1024 // 1 MB
 		if len(m.Data) > maxMessageSize {
 			fmt.Printf("%s[aiexpedite] Oversized message rejected (%d bytes)%s\n",
 				colorRed, len(m.Data), colorReset)
+
+			// Surface the rejection to terminal-service so the session
+			// fails fast with a clear error instead of stranding at
+			// status=starting forever — that silent-drop mode is exactly
+			// what raising the 64 KB cap was meant to fix, so we don't
+			// want to re-introduce it for payloads above 1 MB.
+			//
+			// Best-effort parse: pubsub already caps payloads at 10 MB,
+			// so the memory cost of unmarshaling a rejected message is
+			// bounded. If the JSON is malformed OR there's no sessionID
+			// to attribute the failure to, fall through to the bare ack
+			// (we have nothing to fail).
+			var cmd commandMsg
+			if err := json.Unmarshal(m.Data, &cmd); err == nil && cmd.SessionID != "" {
+				publishSessionError(ctx, topic, cmd,
+					fmt.Sprintf("Command rejected: payload size %d bytes exceeds %d byte limit",
+						len(m.Data), maxMessageSize))
+			}
+
 			m.Ack() // Ack so it isn't redelivered forever
 			return
 		}
