@@ -43,11 +43,14 @@ import (
    removed from argv and sent as NDJSON on stdin. The args function must:
      1. Always include --output-format stream-json + --input-format stream-json
         + --verbose + --include-partial-messages + --dangerously-skip-permissions
-     2. Absorb any user-supplied -p / --print (we add our own).
+     2. Strip any user-supplied -p / --print — interactive sessions must NEVER
+        run in print mode, or claude exits after the first turn and the kickoff
+        → session.sendInput handoff breaks.
      3. Recognise valued flags (--model X, --system-prompt X, etc.) and keep
         the value tied to the flag — otherwise the value gets misparsed as a
         prompt word.
-     4. Always end with -p so claude runs in print mode.
+     4. NEVER append -p (interactive multi-turn requires keeping claude alive
+        between sendInput cycles).
    ------------------------------------------------------------------------ */
 
 func TestBuildClaudeInteractiveArgs_PromptOnly(t *testing.T) {
@@ -64,8 +67,13 @@ func TestBuildClaudeInteractiveArgs_PromptOnly(t *testing.T) {
 		"--verbose",
 		"--include-partial-messages",
 		"--dangerously-skip-permissions",
-		"-p",
 	)
+	for _, a := range args {
+		if a == "-p" || a == "--print" {
+			t.Errorf("-p/--print must never appear in interactive args: %v", args)
+			break
+		}
+	}
 	for _, a := range args {
 		if a == "explain" || a == "the" || a == "auth" || a == "flow" {
 			t.Errorf("prompt word leaked into argv: %v", args)
@@ -81,22 +89,17 @@ func TestBuildClaudeInteractiveArgs_MultiWordPromptJoinedWithSpaces(t *testing.T
 	}
 }
 
-func TestBuildClaudeInteractiveArgs_AbsorbsUserSuppliedPrintFlag(t *testing.T) {
-	// We add our own -p; any user-provided -p/--print must be dropped so we
-	// don't end up with `-p -p` (claude is tolerant but it's confusing).
+func TestBuildClaudeInteractiveArgs_StripsUserSuppliedPrintFlag(t *testing.T) {
+	// -p / --print are stripped on the interactive path — claude in print mode
+	// exits after the first turn, killing the kickoff → sendInput handoff.
 	args, prompt := buildClaudeInteractiveArgs([]string{"-p", "hello"})
 	if prompt != "hello" {
 		t.Errorf("prompt = %q, want %q", prompt, "hello")
 	}
-	// Exactly one -p (the one we appended at the end).
-	count := 0
 	for _, a := range args {
 		if a == "-p" || a == "--print" {
-			count++
+			t.Errorf("-p/--print must be stripped from interactive args, got: %v", args)
 		}
-	}
-	if count != 1 {
-		t.Errorf("-p occurrence count = %d, want 1, args=%v", count, args)
 	}
 }
 
@@ -180,7 +183,12 @@ func TestBuildClaudeInteractiveArgs_EmptyArgsProducesEmptyPrompt(t *testing.T) {
 	if prompt != "" {
 		t.Errorf("prompt = %q, want empty", prompt)
 	}
-	mustContain(t, args, "-p", "--output-format", "stream-json")
+	mustContain(t, args, "--output-format", "stream-json")
+	for _, a := range args {
+		if a == "-p" || a == "--print" {
+			t.Errorf("-p/--print must never appear in interactive args: %v", args)
+		}
+	}
 }
 
 func TestBuildClaudeInteractiveArgs_PromptEndsWithDashedToken(t *testing.T) {

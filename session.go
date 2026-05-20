@@ -665,14 +665,38 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			}
 
 			// For Claude stream-json: detect the "result" event that signals
-			// the turn is complete.  Close stdin so Claude sees EOF and exits.
-			// Done AFTER flushBatch above so any preceding text_delta lines in
-			// the batch are queued for publish before Claude tears down.
+			// the turn is complete. Keep the session alive — claude was launched
+			// WITHOUT `-p`, so after emitting result it will sit on stdin waiting
+			// for the next NDJSON user message. We flag the in-memory status as
+			// "waiting_input" and publish a `prompt`-typed message so the
+			// terminal-service pubsub consumer flips the Firestore session doc
+			// to `status: "waiting_input"` — which is what the AOS
+			// terminal.session.sendInput "settle" wait listens for.
+			//
+			// NOTE: stdin stays open intentionally. The previous behaviour
+			// (close stdin on result → claude exits → next sendInput hits
+			// "session already ended") broke the kickoff-then-sendInput pattern
+			// that codeImplementation relies on across steps 11→14→15.
 			if detectResultEvent(session.Command, line.text) {
 				session.mu.Lock()
-				session.Stdin.Close()
+				session.Status = "waiting_input"
 				session.mu.Unlock()
-				fmt.Printf("%s[session] Result event received — closed stdin for %s%s\n",
+				seq := atomic.AddInt64(&session.Seq, 1)
+				asyncPublish(resultMsg{
+					ID:          session.ID,
+					WorkspaceID: session.WorkspaceID,
+					UID:         session.UID,
+					Output:      "",
+					Status:      "success",
+					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
+					Type:        "prompt",
+					SessionID:   session.ID,
+					PromptText:  "",
+					PromptType:  "turn_complete",
+					Seq:         int(seq),
+				})
+				fmt.Printf("%s[session] Result event — turn complete, %s waiting_input%s\n",
 					colorGreen, session.ID, colorReset)
 			}
 
@@ -878,6 +902,13 @@ func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
 // stream-json mode.  The prompt is NOT passed as a CLI arg — it is returned
 // separately so the caller can send it as an NDJSON message on stdin.
 // Returns (cliArgs, promptText).
+//
+// IMPORTANT: this path is for INTERACTIVE multi-turn sessions. We never add
+// `-p` / `--print` — that flag puts claude in one-shot mode and exits after
+// the first response, killing the session before a follow-up `session.sendInput`
+// can land. Any user-supplied `-p`/`--print` is stripped for the same reason.
+// Callers that want one-shot claude must use the non-session execute.runAndWait
+// path (which builds its own argv outside this function).
 func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 	result := []string{
 		"--output-format", "stream-json",
@@ -898,7 +929,9 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 	}
 
 	// Separate user-provided flags from prompt words.
-	// -p / --print are absorbed (we add our own -p).
+	// -p / --print are stripped — we never want claude in print/one-shot mode
+	// on this path; it would exit after the first turn and break cross-step
+	// session.sendInput.
 	var flags []string
 	var promptParts []string
 	skipNext := false
@@ -923,7 +956,6 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 	}
 
 	result = append(result, flags...)
-	result = append(result, "-p")
 
 	return result, strings.Join(promptParts, " ")
 }
