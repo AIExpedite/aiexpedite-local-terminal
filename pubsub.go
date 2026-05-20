@@ -775,6 +775,25 @@ func runPubSubConnection(cfg *Config) error {
 		if len(m.Data) > maxMessageSize {
 			fmt.Printf("%s[aiexpedite] Oversized message rejected (%d bytes)%s\n",
 				colorRed, len(m.Data), colorReset)
+
+			// Surface the rejection to terminal-service so the session
+			// fails fast with a clear error instead of stranding at
+			// status=starting forever — that silent-drop mode is exactly
+			// what raising the 64 KB cap was meant to fix, so we don't
+			// want to re-introduce it for payloads above 1 MB.
+			//
+			// Best-effort parse: pubsub already caps payloads at 10 MB,
+			// so the memory cost of unmarshaling a rejected message is
+			// bounded. If the JSON is malformed OR there's no sessionID
+			// to attribute the failure to, fall through to the bare ack
+			// (we have nothing to fail).
+			var cmd commandMsg
+			if err := json.Unmarshal(m.Data, &cmd); err == nil && cmd.SessionID != "" {
+				publishSessionError(ctx, topic, cmd,
+					fmt.Sprintf("Command rejected: payload size %d bytes exceeds %d byte limit",
+						len(m.Data), maxMessageSize))
+			}
+
 			m.Ack() // Ack so it isn't redelivered forever
 			return
 		}
