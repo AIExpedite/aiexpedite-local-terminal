@@ -126,20 +126,27 @@ func extractClaudeInnerEvent(event map[string]interface{}) string {
 // extractClaudeFlatEvent handles Claude Code's native flat event format.
 func extractClaudeFlatEvent(raw map[string]interface{}, eventType string) string {
 	switch eventType {
-	case "assistant":
-		// Claude Code wraps assistant messages in {"type":"assistant","message":{...}}
-		msg, ok := raw["message"].(map[string]interface{})
-		if !ok {
-			return ""
-		}
-		return extractContentFromMessage(msg)
-
-	case "message":
-		role, _ := raw["role"].(string)
-		if role != "assistant" {
-			return ""
-		}
-		return extractContentArray(raw)
+	case "assistant", "message":
+		// Skip the wholesale assistant-turn recap. Claude is always launched
+		// with `--include-partial-messages` (see buildClaudeInteractiveArgs in
+		// session.go), which causes claude to emit BOTH:
+		//   1. Streaming `stream_event` envelopes with content_block_delta
+		//      (text_delta + content_block_start tool_use) — incremental.
+		//   2. A final flat `{type:"assistant", message:{content:[...]}}`
+		//      event (and/or `{type:"message", role:"assistant"}`) — the
+		//      full assembled turn as a recap.
+		// We capture (1) via extractClaudeInnerEvent → those produce the
+		// visible streaming chunks. Capturing (2) too would emit every word
+		// twice — once from the deltas, once from the recap — which is what
+		// produced the visible "Octopuses have three hearts… Octopuses have
+		// three hearts…" doubling in chat cards. Skip the recap; the deltas
+		// are sufficient.
+		//
+		// If we ever stop passing `--include-partial-messages`, we'd lose
+		// streaming text and would need to fall back to extracting from this
+		// branch. For now `--include-partial-messages` is always set, so the
+		// recap is pure duplication.
+		return ""
 
 	case "tool_use":
 		name, _ := raw["name"].(string)

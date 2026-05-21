@@ -487,13 +487,26 @@ func TestExtractDisplayText_Claude_ToolUseBlockStart(t *testing.T) {
 	}
 }
 
-func TestExtractDisplayText_Claude_AssistantMessageWithMultipleContentBlocks(t *testing.T) {
-	line := `{"type":"assistant","message":{"content":[{"type":"text","text":"Part A"},{"type":"tool_use","name":"Read"},{"type":"text","text":"Part B"}]}}`
-	got := extractDisplayText("claude", line)
-	// Joined together, so we should see all three signals.
-	for _, want := range []string{"Part A", "Read", "Part B"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("got %q, missing %q", got, want)
+func TestExtractDisplayText_Claude_AssistantWholesaleRecapSkipped(t *testing.T) {
+	// Claude launched with `--include-partial-messages` (which buildClaudeInteractiveArgs
+	// always sets) emits BOTH the streaming content_block_delta events AND a
+	// final wholesale `{type:"assistant",...}` recap of the same turn. The
+	// streaming chunks cover everything that's in the recap — emitting both
+	// produces the visible doubled output we saw in chat ("Octopuses have
+	// three hearts… Octopuses have three hearts…"). Skip the recap entirely.
+	cases := []string{
+		// Original assistant-recap shape with text + tool_use blocks.
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"Part A"},{"type":"tool_use","name":"Read"},{"type":"text","text":"Part B"}]}}`,
+		// Flat `{type:"message", role:"assistant"}` shape — same recap, different envelope.
+		`{"type":"message","role":"assistant","content":[{"type":"text","text":"Recap"}]}`,
+		// Empty / malformed recap shapes — still skipped.
+		`{"type":"assistant","message":{"content":[]}}`,
+		`{"type":"assistant"}`,
+	}
+	for _, line := range cases {
+		got := extractDisplayText("claude", line)
+		if got != "" {
+			t.Errorf("expected empty (recap should be skipped) for %q, got %q", line, got)
 		}
 	}
 }
