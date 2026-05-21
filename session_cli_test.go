@@ -725,30 +725,45 @@ func TestDetectPromptFromJSON_NonPromptEventsReturnNil(t *testing.T) {
 /* --------------------------------------------------------------------------
    shouldCloseStdinAfterStart — expanded coverage
    --------------------------------------------------------------------------
-   The original test in session_test.go covered the basics. This one pins the
-   contract that the stdin-close decision is driven ONLY by stdinPrompt
-   (regardless of command), which is the v0.9.6 fix that lets codex exit.
+   Contract (post-claude-stays-open fix):
+   - Claude: ALWAYS keep stdin open. Sessions are interactive and the
+     orchestrator wants to SendInput follow-ups regardless of whether an
+     initial prompt was queued. Closing stdin makes claude EOF and exit in
+     ~3s — the prod failure mode for `terminal({command: "claude"})` with
+     empty args observed in chatDefault test runs.
+   - Everything else (codex, gemini, powershell, git, ...): close stdin
+     when stdinPrompt is empty (codex exec specifically blocks on EOF
+     before producing output).
    ------------------------------------------------------------------------ */
 
-func TestShouldCloseStdinAfterStart_StdinPromptIsTheOnlySignal(t *testing.T) {
-	// Anything with a non-empty stdinPrompt keeps stdin open (claude). Anything
-	// with an empty stdinPrompt closes it (codex/gemini/cmd/powershell).
+func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *testing.T) {
 	cases := []struct {
+		cmd         string
 		stdinPrompt string
 		want        bool // want close?
 	}{
-		{stdinPrompt: "", want: true},
-		{stdinPrompt: "hello", want: false},
-		{stdinPrompt: " ", want: false}, // a single space counts as non-empty
-		{stdinPrompt: "\n", want: false},
+		// Claude — always open regardless of prompt.
+		{cmd: "claude", stdinPrompt: "", want: false},
+		{cmd: "claude", stdinPrompt: "hello", want: false},
+		{cmd: "claude", stdinPrompt: " ", want: false},
+		{cmd: "claude", stdinPrompt: "\n", want: false},
+		// Normalize: claude.exe, claude.cmd should match too.
+		{cmd: "claude.exe", stdinPrompt: "", want: false},
+		{cmd: "Claude", stdinPrompt: "", want: false},
+		// Codex / gemini / shells: close iff empty prompt.
+		{cmd: "codex", stdinPrompt: "", want: true},
+		{cmd: "codex", stdinPrompt: "hello", want: false},
+		{cmd: "gemini", stdinPrompt: "", want: true},
+		{cmd: "gemini", stdinPrompt: "hello", want: false},
+		{cmd: "powershell", stdinPrompt: "", want: true},
+		{cmd: "git", stdinPrompt: "", want: true},
+		{cmd: "", stdinPrompt: "", want: true},
 	}
 	for _, tc := range cases {
-		for _, cmd := range []string{"claude", "codex", "gemini", "powershell", "git", ""} {
-			got := shouldCloseStdinAfterStart(cmd, tc.stdinPrompt)
-			if got != tc.want {
-				t.Errorf("shouldCloseStdinAfterStart(%q, %q) = %v, want %v",
-					cmd, tc.stdinPrompt, got, tc.want)
-			}
+		got := shouldCloseStdinAfterStart(tc.cmd, tc.stdinPrompt)
+		if got != tc.want {
+			t.Errorf("shouldCloseStdinAfterStart(%q, %q) = %v, want %v",
+				tc.cmd, tc.stdinPrompt, got, tc.want)
 		}
 	}
 }

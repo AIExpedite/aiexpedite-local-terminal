@@ -73,8 +73,16 @@ func TestShouldCloseStdinAfterStart(t *testing.T) {
 		stdinPrompt string
 		want        bool
 	}{
+		// Claude in --input-format stream-json mode reads NDJSON from stdin
+		// in a loop. Sessions are interactive — keep stdin open so the
+		// orchestrator can SendInput follow-ups (whether or not an initial
+		// prompt was queued via args). Closing stdin = claude EOFs and exits
+		// in ~3s, which is the prod failure mode we're patching here.
 		{name: "claude_with_stdin_prompt_stays_open", command: "claude", stdinPrompt: "do work", want: false},
-		{name: "claude_without_prompt_closes", command: "claude", want: true},
+		{name: "claude_without_prompt_stays_open", command: "claude", want: false},
+		// Codex / gemini and shells are one-shot by design — they need stdin
+		// closed when no prompt was queued (codex exec specifically blocks
+		// on EOF before producing output).
 		{name: "codex_exec_closes", command: "codex", want: true},
 		{name: "gemini_exec_closes", command: "gemini", want: true},
 		{name: "powershell_closes", command: "powershell", want: true},
