@@ -27,6 +27,12 @@ permissions:
 # preventing stale-cache bugs from forgetting one of the two places.
 env:
   GO_WINRES_VERSION: v0.3.3
+  # Force every JS action onto Node 24. Required because actions/setup-go@v6.4.0
+  # (latest) still calls actions/cache@v4 internally for its module cache, and
+  # v4 runs on Node 20 — which GitHub force-cuts to Node 24 on 2026-06-02 and
+  # removes from runners on 2026-09-16. Flipping it now silences the deprecation
+  # warning ahead of the cutover; remove once setup-go bumps its transitive cache.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 ###############################################################################
 # Build and release production binaries - Windows only
