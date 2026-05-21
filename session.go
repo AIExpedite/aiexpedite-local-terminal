@@ -443,7 +443,44 @@ func (sm *SessionManager) removeSession(id string) {
 	sm.mu.Unlock()
 }
 
-func shouldCloseStdinAfterStart(_ string, stdinPrompt string) bool {
+// shouldCloseStdinAfterStart decides whether to close the child process's
+// stdin right after launch.
+//
+//   - Claude in `--input-format stream-json` mode reads NDJSON messages from
+//     stdin in a loop. Closing stdin makes claude EOF and exit immediately —
+//     which is the right call for one-shot launches (we sent the prompt as
+//     args, claude responds, done), but the WRONG call for SESSION launches
+//     where the orchestrator wants to keep talking to claude via SendInput.
+//
+//     Before: anyone calling `terminal({command: "claude"})` with no args had
+//     stdin closed immediately → session ended in ~3s with empty output (the
+//     same failure mode PR #133 patched for the bundled-kickoff path, but
+//     that fix only forced a non-empty args[0]; plain TerminalTool with empty
+//     args still hit the trap). Observed in chatDefault test runs where the
+//     AI launched claude without an initial prompt and saw status=ended
+//     with an empty output a few seconds later.
+//
+//     Now: keep stdin open for claude regardless of whether an initial prompt
+//     was sent. If an initial prompt was provided, claude processes it on
+//     start; either way subsequent NDJSON via SendInput keeps the conversation
+//     going. The session is closed when claude itself exits (the "result"
+//     event detection in readOutputStream) or when the orchestrator ends the
+//     session explicitly.
+//
+//   - codex / gemini and all non-CLI commands (powershell, bash, git, ...)
+//     are one-shot by design — they finish, exit, and need stdin closed when
+//     no prompt was queued (codex exec specifically waits for EOF before
+//     producing output, so leaving stdin open hangs codex indefinitely).
+//     Same rule as before for them: close stdin iff stdinPrompt is empty.
+func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
+	// Normalize: claude / claude.exe / claude.cmd should all match.
+	cmd := strings.ToLower(command)
+	cmd = strings.TrimSuffix(cmd, ".exe")
+	cmd = strings.TrimSuffix(cmd, ".cmd")
+	cmd = strings.TrimSuffix(cmd, ".bat")
+	if cmd == "claude" {
+		return false
+	}
 	return stdinPrompt == ""
 }
 
