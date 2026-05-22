@@ -5,42 +5,50 @@ import (
 	"testing"
 )
 
+// Codex's prompt now flows through stdin via the `-` positional placeholder
+// instead of as a multi-KB argv element. These tests assert the new argv
+// shape: prompt is pulled OUT of args (returned as stdinPrompt for the caller
+// to write through the pipe) and `-` is appended as the last argv element.
 func TestBuildCodexInteractiveArgs_PromptOnly(t *testing.T) {
-	got := buildCodexInteractiveArgs([]string{"implement this"})
-	want := []string{
+	gotArgs, gotPrompt := buildCodexInteractiveArgs([]string{"implement this"})
+	wantArgs := []string{
 		"exec",
 		"--json",
 		"--dangerously-bypass-approvals-and-sandbox",
-		"implement this",
+		"-",
 	}
-
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("buildCodexInteractiveArgs() = %#v, want %#v", got, want)
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("buildCodexInteractiveArgs() args = %#v, want %#v", gotArgs, wantArgs)
+	}
+	if gotPrompt != "implement this" {
+		t.Fatalf("buildCodexInteractiveArgs() prompt = %q, want %q", gotPrompt, "implement this")
 	}
 }
 
 func TestBuildCodexInteractiveArgs_StripsDuplicateExecAndAutomationFlags(t *testing.T) {
-	got := buildCodexInteractiveArgs([]string{
+	gotArgs, gotPrompt := buildCodexInteractiveArgs([]string{
 		"exec",
 		"--json",
 		"--full-auto",
 		"--dangerously-bypass-approvals-and-sandbox",
 		"implement this",
 	})
-	want := []string{
+	wantArgs := []string{
 		"exec",
 		"--json",
 		"--dangerously-bypass-approvals-and-sandbox",
-		"implement this",
+		"-",
 	}
-
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("buildCodexInteractiveArgs() = %#v, want %#v", got, want)
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("buildCodexInteractiveArgs() args = %#v, want %#v", gotArgs, wantArgs)
+	}
+	if gotPrompt != "implement this" {
+		t.Fatalf("buildCodexInteractiveArgs() prompt = %q, want %q", gotPrompt, "implement this")
 	}
 }
 
 func TestBuildCodexInteractiveArgs_StripsConflictingSandboxAndApprovalFlags(t *testing.T) {
-	got := buildCodexInteractiveArgs([]string{
+	gotArgs, gotPrompt := buildCodexInteractiveArgs([]string{
 		"exec",
 		"--sandbox", "workspace-write",
 		"--sandbox=read-only",
@@ -53,16 +61,18 @@ func TestBuildCodexInteractiveArgs_StripsConflictingSandboxAndApprovalFlags(t *t
 		"--model", "gpt-5.4",
 		"implement this",
 	})
-	want := []string{
+	wantArgs := []string{
 		"exec",
 		"--json",
 		"--dangerously-bypass-approvals-and-sandbox",
 		"--model", "gpt-5.4",
-		"implement this",
+		"-",
 	}
-
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("buildCodexInteractiveArgs() = %#v, want %#v", got, want)
+	if !reflect.DeepEqual(gotArgs, wantArgs) {
+		t.Fatalf("buildCodexInteractiveArgs() args = %#v, want %#v", gotArgs, wantArgs)
+	}
+	if gotPrompt != "implement this" {
+		t.Fatalf("buildCodexInteractiveArgs() prompt = %q, want %q", gotPrompt, "implement this")
 	}
 }
 

@@ -434,6 +434,7 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 		{"claudeCode", "claude"},
 		{"codex", "codex"},
 		{"geminiCli", "gemini"},
+		{"antigravity", "agy"},
 	} {
 		path, err := exec.LookPath(a.Bin)
 		if err != nil {

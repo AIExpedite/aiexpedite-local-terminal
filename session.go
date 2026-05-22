@@ -201,20 +201,40 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	fmt.Printf("%s[session] Session %s started (PID: %d)%s\n",
 		colorGreen, id, proc.Process.Pid, colorReset)
 
-	// For Claude with --input-format stream-json, send the initial prompt as
-	// an NDJSON message on stdin.  Claude waits for this before producing output.
-	// Stdin stays open so the user can send follow-up messages (approvals,
-	// clarifications) via SendInput.  Stdin is closed when Claude emits a
-	// "result" event (detected in readOutputStream) signalling the turn is done.
+	// Deliver the initial prompt on stdin, framed per the target CLI's protocol.
+	//
+	//   "ndjson" — claude's --input-format stream-json mode. Wrap the prompt
+	//              in the `{type:"user", message:{...}}` envelope and keep
+	//              stdin open so the orchestrator can send follow-up turns
+	//              via SendInput. Stdin closes when claude emits a "result"
+	//              event (detected in readOutputStream).
+	//   "plain"  — codex exec's stdin protocol (also used via the `-`
+	//              positional placeholder). Write the prompt verbatim plus
+	//              a trailing newline. codex reads stdin to completion
+	//              before starting inference, then exits — stdin is closed
+	//              right after the write via shouldCloseStdinAfterStart.
+	//   ""       — no stdin prompt (positional argv path, or no prompt
+	//              expected at all).
 	if stdinPrompt != "" {
-		initMsg := fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%s},"session_id":"%s","parent_tool_use_id":null}`,
-			jsonEscapeString(stdinPrompt), id)
-		if _, err := fmt.Fprintln(session.Stdin, initMsg); err != nil {
+		var line string
+		switch stdinPromptFormat(command) {
+		case "ndjson":
+			line = fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%s},"session_id":"%s","parent_tool_use_id":null}`,
+				jsonEscapeString(stdinPrompt), id)
+		case "plain":
+			line = stdinPrompt
+		default:
+			// Defensive: a CLI router returned a stdinPrompt for a command
+			// with no documented stdin format. Treat as plain text rather
+			// than dropping the prompt silently.
+			line = stdinPrompt
+		}
+		if _, err := fmt.Fprintln(session.Stdin, line); err != nil {
 			fmt.Printf("%s[session] Failed to send initial prompt to %s: %v%s\n",
 				colorRed, id, err, colorReset)
 		} else {
-			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars)%s\n",
-				colorGreen, id, len(stdinPrompt), colorReset)
+			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars, format=%s)%s\n",
+				colorGreen, id, len(stdinPrompt), stdinPromptFormat(command), colorReset)
 		}
 	}
 
@@ -467,19 +487,29 @@ func (sm *SessionManager) removeSession(id string) {
 //     event detection in readOutputStream) or when the orchestrator ends the
 //     session explicitly.
 //
-//   - codex / gemini and all non-CLI commands (powershell, bash, git, ...)
-//     are one-shot by design — they finish, exit, and need stdin closed when
-//     no prompt was queued (codex exec specifically waits for EOF before
-//     producing output, so leaving stdin open hangs codex indefinitely).
-//     Same rule as before for them: close stdin iff stdinPrompt is empty.
+//   - codex is one-shot by design AND now receives its prompt via stdin
+//     (the `-` positional placeholder writes the brief through the pipe so
+//     multi-KB briefs don't overflow Windows' CreateProcess command-line
+//     cap). codex reads stdin to completion before starting inference, so
+//     we ALWAYS close stdin after the prompt write — leaving it open hangs
+//     codex indefinitely waiting for EOF.
+//   - gemini and all non-CLI commands (powershell, bash, git, ...) keep the
+//     pre-existing rule: close stdin iff no stdinPrompt was queued. Gemini
+//     stays on argv-passed prompts for now (its stdin contract for
+//     --output-format stream-json is undocumented enough to defer the
+//     switch to a follow-up).
 func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
 	// Normalize: claude / claude.exe / claude.cmd should all match.
 	cmd := strings.ToLower(command)
 	cmd = strings.TrimSuffix(cmd, ".exe")
 	cmd = strings.TrimSuffix(cmd, ".cmd")
 	cmd = strings.TrimSuffix(cmd, ".bat")
+	cmd = strings.TrimSuffix(cmd, ".ps1")
 	if cmd == "claude" {
 		return false
+	}
+	if cmd == "codex" {
+		return true
 	}
 	return stdinPrompt == ""
 }
@@ -918,8 +948,23 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 
 // buildInteractiveCLIArgs builds CLI arguments for interactive streaming mode.
 // Each CLI agent has different flags for structured JSON output.
-// Returns (cliArgs, stdinPrompt) — stdinPrompt is non-empty only for Claude,
-// where the prompt must be sent as NDJSON on stdin rather than as a CLI arg.
+// Returns (cliArgs, stdinPrompt) — stdinPrompt is non-empty when the prompt
+// is routed via stdin rather than argv. Per-CLI conventions:
+//   - claude:      stdinPrompt is the prompt, sent as NDJSON via stream-json
+//                  input mode; multi-turn (stdin stays open)
+//   - codex:       stdinPrompt is the prompt, written as raw text; codex exec
+//                  reads stdin to completion (`-` positional placeholder)
+//                  then exits; one-shot per process
+//   - gemini:      prompt stays positional (current behavior — gemini's stdin
+//                  contract for `--output-format stream-json` is undocumented
+//                  enough that switching pre-emptively risks regressions)
+//   - antigravity: prompt as positional argv via `--print`; v1.0.1 has no
+//                  --output-format flag and no documented stdin protocol —
+//                  switch to stdin once agy ships those
+//   - other:       prompt stays in args
+//
+// The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
+// the stdinPrompt before writing it to the process stdin.
 func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
 	cmdLower := strings.ToLower(command)
 
@@ -927,12 +972,40 @@ func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
 	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
 		return buildClaudeInteractiveArgs(args)
 	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
-		return buildCodexInteractiveArgs(args), ""
+		return buildCodexInteractiveArgs(args)
 	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
 		return buildGeminiInteractiveArgs(args), ""
+	case cmdLower == "agy" || strings.HasPrefix(cmdLower, "agy"):
+		return buildAntigravityInteractiveArgs(args), ""
 	default:
 		return args, ""
 	}
+}
+
+// stdinPromptFormat returns how the initial stdinPrompt should be written
+// to the process stdin in StartSession. Empty string means no prompt is
+// expected on stdin (positional argv path).
+//
+//	"ndjson" — wrap as `{"type":"user","message":{...}}` for claude's
+//	           --input-format stream-json mode
+//	"plain"  — write the prompt text verbatim followed by a newline
+//	"" (default) — no stdin prompt; nothing to write
+//
+// Centralises the per-CLI knowledge so the StartSession write path doesn't
+// hard-code claude's protocol against any non-empty stdinPrompt.
+func stdinPromptFormat(command string) string {
+	cmd := strings.ToLower(command)
+	cmd = strings.TrimSuffix(cmd, ".exe")
+	cmd = strings.TrimSuffix(cmd, ".cmd")
+	cmd = strings.TrimSuffix(cmd, ".bat")
+	cmd = strings.TrimSuffix(cmd, ".ps1")
+	switch cmd {
+	case "claude":
+		return "ndjson"
+	case "codex":
+		return "plain"
+	}
+	return ""
 }
 
 // buildClaudeInteractiveArgs builds Claude Code CLI args for bidirectional
@@ -997,17 +1070,67 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 	return result, strings.Join(promptParts, " ")
 }
 
-// buildCodexInteractiveArgs builds Codex CLI args for JSONL streaming. Codex
-// exec is a one-shot command: the prompt is positional, and stdin must be
-// closed so Codex does not wait for additional piped input.
-func buildCodexInteractiveArgs(args []string) []string {
+// buildCodexInteractiveArgs builds Codex CLI args for JSONL streaming.
+//
+// Codex exec is one-shot (reads stdin to completion, runs the turn, exits),
+// and its prompt can come in via either a positional argv or the `-`
+// placeholder which redirects to stdin. We use the `-` form so multi-KB
+// briefs don't hit the Windows CreateProcess ~32KB command-line cap
+// (the failure that surfaced as `fork/exec ... codex.cmd: The filename or
+// extension is too long.` when a 56KB review brief was passed as argv).
+//
+// Returns (cliArgs, stdinPrompt):
+//   - cliArgs ends with "-" to signal codex to read the prompt from stdin.
+//   - stdinPrompt is the joined positional prompt text. StartSession writes
+//     it verbatim (plain text — codex does NOT parse NDJSON like claude),
+//     then closes stdin so codex stops waiting for more.
+//
+// Empty stdinPrompt is allowed (codex will error if no prompt is provided,
+// but that surfaces as a normal start error rather than a cmdline overflow).
+func buildCodexInteractiveArgs(args []string) ([]string, string) {
 	cleanedArgs := sanitizeCodexExecArgs(args)
-	result := make([]string, 0, len(cleanedArgs)+3)
+
+	// Split into flag args (with their values) and positional prompt parts.
+	// Codex options that consume the next argument as their value — without
+	// this, e.g. `--model o3` would treat "o3" as a prompt word.
+	valuedFlags := map[string]bool{
+		"-c": true, "--config": true,
+		"-m": true, "--model": true,
+		"-i": true, "--image": true,
+		"--enable": true, "--disable": true,
+		"--cd": true, "-C": true,
+	}
+
+	var flagArgs []string
+	var promptParts []string
+	skipNext := false
+	for i, a := range cleanedArgs {
+		if skipNext {
+			skipNext = false
+			flagArgs = append(flagArgs, a)
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			flagArgs = append(flagArgs, a)
+			if valuedFlags[a] && i+1 < len(cleanedArgs) {
+				skipNext = true
+			}
+			continue
+		}
+		promptParts = append(promptParts, a)
+	}
+
+	result := make([]string, 0, len(flagArgs)+4)
 	result = append(result, "exec")
 	result = append(result, "--json")
 	result = append(result, "--dangerously-bypass-approvals-and-sandbox")
-	result = append(result, cleanedArgs...)
-	return result
+	result = append(result, flagArgs...)
+	// "-" tells codex to read the prompt from stdin. Always append, even if
+	// promptParts is empty — keeps the args shape predictable and codex will
+	// surface a useful error if it hits EOF on stdin with no content.
+	result = append(result, "-")
+
+	return result, strings.Join(promptParts, " ")
 }
 
 func sanitizeCodexExecArgs(args []string) []string {
@@ -1045,6 +1168,27 @@ func sanitizeCodexExecArgs(args []string) []string {
 	}
 
 	return cleaned
+}
+
+// buildAntigravityInteractiveArgs builds Antigravity CLI (`agy`) args for
+// one-shot prompt execution.
+//
+// agy v1.0.1 ships claude-code-shaped flags (--print / --prompt-interactive /
+// --dangerously-skip-permissions) but does NOT expose --output-format or
+// stream-json input — so we cannot yet drive it as a multi-turn streaming
+// session like claude. For now we run a one-shot --print with the prompt as
+// a positional arg.
+//
+// KNOWN LIMITATION (tracked for follow-up): until agy ships a stdin protocol
+// for the prompt, multi-KB briefs on Windows risk the same CreateProcess
+// ~32KB command-line cap that bit codex. Switch to stdin delivery as soon
+// as agy ships --output-format stream-json or a `-` positional placeholder.
+func buildAntigravityInteractiveArgs(args []string) []string {
+	result := make([]string, 0, len(args)+2)
+	result = append(result, "--print")
+	result = append(result, "--dangerously-skip-permissions")
+	result = append(result, args...)
+	return result
 }
 
 // buildGeminiInteractiveArgs builds Gemini CLI args for interactive streaming.

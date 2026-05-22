@@ -243,10 +243,129 @@ func TestBuildGeminiInteractiveArgs_EmptyArgs(t *testing.T) {
 }
 
 /* --------------------------------------------------------------------------
+   buildCodexInteractiveArgs
+   --------------------------------------------------------------------------
+   Codex receives the prompt via stdin (`-` placeholder) rather than as a
+   positional argv. The switch from argv to stdin fixes the Windows
+   CreateProcess ~32KB cmdline cap that bit multi-KB review briefs.
+   ------------------------------------------------------------------------ */
+
+func TestBuildCodexInteractiveArgs_PromptGoesToStdin(t *testing.T) {
+	args, prompt := buildCodexInteractiveArgs([]string{"review the diff"})
+	if prompt != "review the diff" {
+		t.Errorf("codex stdinPrompt = %q, want %q", prompt, "review the diff")
+	}
+	// args must end with `-` so codex reads the prompt from stdin.
+	if len(args) == 0 || args[len(args)-1] != "-" {
+		t.Errorf("codex args must end with `-` placeholder, got %v", args)
+	}
+	mustContain(t, args, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox")
+}
+
+func TestBuildCodexInteractiveArgs_EmptyArgsStillEndsWithDash(t *testing.T) {
+	// Defensive: even with no prompt parts we still want the canonical args
+	// shape (`exec --json … -`) so codex surfaces a clean error rather than
+	// being launched in some other mode.
+	args, prompt := buildCodexInteractiveArgs([]string{})
+	if prompt != "" {
+		t.Errorf("empty args should yield empty stdinPrompt, got %q", prompt)
+	}
+	if len(args) == 0 || args[len(args)-1] != "-" {
+		t.Errorf("codex args must end with `-` placeholder even on empty input, got %v", args)
+	}
+}
+
+func TestBuildCodexInteractiveArgs_PreservesValuedFlags(t *testing.T) {
+	// --model takes the next arg as its value; that value must NOT leak into
+	// the stdin prompt as a prompt word.
+	args, prompt := buildCodexInteractiveArgs([]string{"--model", "o3", "review the diff"})
+	if prompt != "review the diff" {
+		t.Errorf("prompt = %q, want %q (args=%v)", prompt, "review the diff", args)
+	}
+	mustContain(t, args, "--model", "o3")
+}
+
+func TestBuildCodexInteractiveArgs_PreservesShortValuedFlag(t *testing.T) {
+	// -m is the short alias for --model.
+	args, prompt := buildCodexInteractiveArgs([]string{"-m", "o3", "review"})
+	if prompt != "review" {
+		t.Errorf("prompt = %q, want %q (args=%v)", prompt, "review", args)
+	}
+	mustContain(t, args, "-m", "o3")
+}
+
+func TestBuildCodexInteractiveArgs_StripsDuplicateJsonFlag(t *testing.T) {
+	// sanitizeCodexExecArgs drops user-supplied --json (we always add it).
+	args, _ := buildCodexInteractiveArgs([]string{"--json", "hello"})
+	jsonCount := 0
+	for _, a := range args {
+		if a == "--json" {
+			jsonCount++
+		}
+	}
+	if jsonCount != 1 {
+		t.Errorf("expected exactly one --json in args, got %d (%v)", jsonCount, args)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   buildAntigravityInteractiveArgs
+   --------------------------------------------------------------------------
+   agy v1.0.1 is claude-code-shaped on its flag surface but ships without
+   --output-format / stream-json input — so we run a one-shot --print with
+   the prompt as a positional argv for now. Switch to stdin delivery once
+   agy ships a stdin protocol.
+   ------------------------------------------------------------------------ */
+
+func TestBuildAntigravityInteractiveArgs_PrintAndPrompt(t *testing.T) {
+	args := buildAntigravityInteractiveArgs([]string{"hello"})
+	mustContain(t, args, "--print", "--dangerously-skip-permissions", "hello")
+}
+
+func TestBuildAntigravityInteractiveArgs_EmptyArgs(t *testing.T) {
+	args := buildAntigravityInteractiveArgs([]string{})
+	mustContain(t, args, "--print", "--dangerously-skip-permissions")
+}
+
+/* --------------------------------------------------------------------------
+   stdinPromptFormat
+   --------------------------------------------------------------------------
+   Centralises per-CLI stdin protocol so StartSession's write path doesn't
+   hard-code claude's NDJSON envelope against every stdinPrompt.
+   ------------------------------------------------------------------------ */
+
+func TestStdinPromptFormat(t *testing.T) {
+	cases := []struct {
+		cmd  string
+		want string
+	}{
+		{"claude", "ndjson"},
+		{"claude.exe", "ndjson"},
+		{"Claude", "ndjson"},
+		{"codex", "plain"},
+		{"codex.cmd", "plain"},
+		{"CODEX", "plain"},
+		{"gemini", ""}, // gemini still uses argv; no stdin prompt in this PR
+		{"agy", ""},    // antigravity still uses argv; switch when agy ships stdin
+		{"powershell", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		got := stdinPromptFormat(tc.cmd)
+		if got != tc.want {
+			t.Errorf("stdinPromptFormat(%q) = %q, want %q", tc.cmd, got, tc.want)
+		}
+	}
+}
+
+/* --------------------------------------------------------------------------
    buildInteractiveCLIArgs (router)
    --------------------------------------------------------------------------
-   The dispatcher is what makes the empty-stdinPrompt contract per CLI work —
-   claude returns (args, prompt), codex/gemini return (args, "").
+   Each CLI has its own stdinPrompt contract:
+     - claude:      prompt goes via NDJSON on stdin
+     - codex:       prompt goes via raw stdin (`-` placeholder)
+     - gemini, agy: prompt stays positional (no stdin protocol yet)
+     - other:       passes through verbatim
    ------------------------------------------------------------------------ */
 
 func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
@@ -257,9 +376,12 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 		}
 	})
 	t.Run("codex", func(t *testing.T) {
-		_, prompt := buildInteractiveCLIArgs("codex", []string{"hello"})
-		if prompt != "" {
-			t.Errorf("codex stdinPrompt MUST be empty (prompt goes on argv): %q", prompt)
+		args, prompt := buildInteractiveCLIArgs("codex", []string{"hello"})
+		if prompt != "hello" {
+			t.Errorf("codex stdinPrompt = %q, want %q", prompt, "hello")
+		}
+		if len(args) == 0 || args[len(args)-1] != "-" {
+			t.Errorf("codex args must end with `-` placeholder, got %v", args)
 		}
 	})
 	t.Run("gemini", func(t *testing.T) {
@@ -267,6 +389,13 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 		if prompt != "" {
 			t.Errorf("gemini stdinPrompt MUST be empty (prompt goes on argv): %q", prompt)
 		}
+	})
+	t.Run("antigravity", func(t *testing.T) {
+		args, prompt := buildInteractiveCLIArgs("agy", []string{"hello"})
+		if prompt != "" {
+			t.Errorf("agy stdinPrompt MUST be empty (prompt goes on argv at v1.0.1): %q", prompt)
+		}
+		mustContain(t, args, "--print", "--dangerously-skip-permissions", "hello")
 	})
 	t.Run("case-insensitive", func(t *testing.T) {
 		// The router checks command.ToLower() exactly + startswith — make sure
@@ -755,17 +884,25 @@ func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *test
 		stdinPrompt string
 		want        bool // want close?
 	}{
-		// Claude — always open regardless of prompt.
+		// Claude — always open regardless of prompt (multi-turn stream-json
+		// keeps stdin open between SendInput calls).
 		{cmd: "claude", stdinPrompt: "", want: false},
 		{cmd: "claude", stdinPrompt: "hello", want: false},
 		{cmd: "claude", stdinPrompt: " ", want: false},
 		{cmd: "claude", stdinPrompt: "\n", want: false},
-		// Normalize: claude.exe, claude.cmd should match too.
+		// Normalize: claude.exe, claude.cmd, claude.ps1 should match too.
 		{cmd: "claude.exe", stdinPrompt: "", want: false},
 		{cmd: "Claude", stdinPrompt: "", want: false},
-		// Codex / gemini / shells: close iff empty prompt.
+		// Codex — always close. codex exec reads stdin to completion before
+		// inference, so we close right after writing the prompt; otherwise
+		// codex hangs waiting for EOF. Behaviour is identical whether the
+		// prompt is empty (will error out cleanly) or non-empty (the new
+		// stdin-piped path).
 		{cmd: "codex", stdinPrompt: "", want: true},
-		{cmd: "codex", stdinPrompt: "hello", want: false},
+		{cmd: "codex", stdinPrompt: "review the diff", want: true},
+		{cmd: "codex.cmd", stdinPrompt: "review", want: true},
+		{cmd: "CODEX", stdinPrompt: "review", want: true},
+		// Gemini / shells / non-CLI: legacy rule — close iff empty prompt.
 		{cmd: "gemini", stdinPrompt: "", want: true},
 		{cmd: "gemini", stdinPrompt: "hello", want: false},
 		{cmd: "powershell", stdinPrompt: "", want: true},
