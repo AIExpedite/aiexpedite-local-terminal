@@ -360,8 +360,8 @@ func TestBuildCodexInteractiveArgs_PreservesResumeSubcommand(t *testing.T) {
 	mustContain(t, args, "exec", "resume", "--last", "follow-up")
 	// Order check: `resume` must precede `--last` so codex routes the flag
 	// under the subcommand parser, not the top-level exec parser.
-	resumeIdx := indexOf(args, "resume")
-	lastIdx := indexOf(args, "--last")
+	resumeIdx := argIndex(args, "resume")
+	lastIdx := argIndex(args, "--last")
 	if resumeIdx < 0 || lastIdx < 0 || resumeIdx > lastIdx {
 		t.Errorf("expected `resume` before `--last`, got %v", args)
 	}
@@ -374,9 +374,9 @@ func TestBuildCodexInteractiveArgs_PreservesResumeSessionAndPrompt(t *testing.T)
 	}
 	// Both session id and prompt must remain in argv, in order.
 	mustContain(t, args, "resume", "abc-123", "follow-up text")
-	resumeIdx := indexOf(args, "resume")
-	idIdx := indexOf(args, "abc-123")
-	promptIdx := indexOf(args, "follow-up text")
+	resumeIdx := argIndex(args, "resume")
+	idIdx := argIndex(args, "abc-123")
+	promptIdx := argIndex(args, "follow-up text")
 	if !(resumeIdx < idIdx && idIdx < promptIdx) {
 		t.Errorf("expected order resume < session_id < prompt, got %v", args)
 	}
@@ -1015,6 +1015,18 @@ func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *test
 /* --------------------------------------------------------------------------
    helpers
    ------------------------------------------------------------------------ */
+
+// argIndex returns the position of needle in args, or -1 if not found. Local
+// to the test file so it's available on every platform (the production
+// indexOf in processes_windows.go is Windows-only).
+func argIndex(args []string, needle string) int {
+	for i, v := range args {
+		if v == needle {
+			return i
+		}
+	}
+	return -1
+}
 
 // mustContain fails the test if args is missing any of the expected substrings,
 // in any order. Convenient for argument-builder tests where we don't care about
