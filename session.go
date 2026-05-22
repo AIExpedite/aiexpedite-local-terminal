@@ -493,6 +493,7 @@ func (sm *SessionManager) removeSession(id string) {
 //     cap). codex reads stdin to completion before starting inference, so
 //     we ALWAYS close stdin after the prompt write — leaving it open hangs
 //     codex indefinitely waiting for EOF.
+//
 //   - gemini and all non-CLI commands (powershell, bash, git, ...) keep the
 //     pre-existing rule: close stdin iff no stdinPrompt was queued. Gemini
 //     stays on argv-passed prompts for now (its stdin contract for
@@ -951,16 +952,16 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 // Returns (cliArgs, stdinPrompt) — stdinPrompt is non-empty when the prompt
 // is routed via stdin rather than argv. Per-CLI conventions:
 //   - claude:      stdinPrompt is the prompt, sent as NDJSON via stream-json
-//                  input mode; multi-turn (stdin stays open)
+//     input mode; multi-turn (stdin stays open)
 //   - codex:       stdinPrompt is the prompt, written as raw text; codex exec
-//                  reads stdin to completion (`-` positional placeholder)
-//                  then exits; one-shot per process
+//     reads stdin to completion (`-` positional placeholder)
+//     then exits; one-shot per process
 //   - gemini:      prompt stays positional (current behavior — gemini's stdin
-//                  contract for `--output-format stream-json` is undocumented
-//                  enough that switching pre-emptively risks regressions)
+//     contract for `--output-format stream-json` is undocumented
+//     enough that switching pre-emptively risks regressions)
 //   - antigravity: prompt as positional argv via `--print`; v1.0.1 has no
-//                  --output-format flag and no documented stdin protocol —
-//                  switch to stdin once agy ships those
+//     --output-format flag and no documented stdin protocol —
+//     switch to stdin once agy ships those
 //   - other:       prompt stays in args
 //
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap

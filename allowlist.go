@@ -486,6 +486,8 @@ codex
 codex *
 gemini
 gemini *
+agy
+agy *
 
 # --- Remote/SSH ---
 ssh *
