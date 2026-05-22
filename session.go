@@ -1088,20 +1088,86 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 //
 // Empty stdinPrompt is allowed (codex will error if no prompt is provided,
 // but that surfaces as a normal start error rather than a cmdline overflow).
+//
+// Subcommand carve-out: `codex exec` also supports `resume` / `review` / `help`
+// subcommands (e.g. `codex exec resume --last "follow-up"`). For those we keep
+// the entire user-supplied argv intact and skip stdin routing, because the
+// positional grammar after a subcommand differs (resume has SESSION_ID before
+// PROMPT) and rewriting it would corrupt the call. Top-level invocations — the
+// originating Windows-cmdline-overflow case — still use the stdin path.
 func buildCodexInteractiveArgs(args []string) ([]string, string) {
 	cleanedArgs := sanitizeCodexExecArgs(args)
 
-	// Split into flag args (with their values) and positional prompt parts.
 	// Codex options that consume the next argument as their value — without
-	// this, e.g. `--model o3` would treat "o3" as a prompt word.
+	// this, e.g. `--model o3` would treat "o3" as a prompt word. Keep this
+	// in sync with `codex exec --help` (and the resume/review subcommands).
+	// The `--flag=value` form is one token and doesn't need entries here.
 	valuedFlags := map[string]bool{
+		// Top-level `codex exec` options
 		"-c": true, "--config": true,
 		"-m": true, "--model": true,
 		"-i": true, "--image": true,
+		"-p": true, "--profile": true,
+		"-C": true, "--cd": true,
+		"-o": true, "--output-last-message": true,
 		"--enable": true, "--disable": true,
-		"--cd": true, "-C": true,
+		"--local-provider": true,
+		"--add-dir":        true,
+		"--output-schema":  true,
+		"--color":          true,
+		// `codex exec review` adds these (harmless when passed through in the
+		// subcommand path; listed for completeness so the value isn't
+		// misclassified if a future change brings reviews into the parser).
+		"--base":   true,
+		"--commit": true,
+		"--title":  true,
 	}
 
+	// Detect whether the user invoked an `exec` subcommand (resume/review/help)
+	// by scanning until the first non-flag positional token. Anything past that
+	// token belongs to the subcommand and must be forwarded verbatim.
+	knownSubcommands := map[string]bool{
+		"resume": true,
+		"review": true,
+		"help":   true,
+	}
+	hasSubcommand := false
+	{
+		skipNext := false
+		for i, a := range cleanedArgs {
+			if skipNext {
+				skipNext = false
+				continue
+			}
+			if strings.HasPrefix(a, "-") {
+				if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(cleanedArgs) {
+					skipNext = true
+				}
+				continue
+			}
+			if knownSubcommands[strings.ToLower(a)] {
+				hasSubcommand = true
+			}
+			break // first non-flag positional decides
+		}
+	}
+
+	if hasSubcommand {
+		// Subcommand path: keep argv shape intact, no stdin routing.
+		// `resume` / `review` accept `-` as a stdin placeholder for PROMPT,
+		// but we can't safely rewrite without also knowing whether a leading
+		// positional is SESSION_ID vs prompt, so we pass through verbatim.
+		// Multi-KB prompts in this path may still hit the Windows cmdline cap.
+		result := make([]string, 0, len(cleanedArgs)+3)
+		result = append(result, "exec")
+		result = append(result, "--json")
+		result = append(result, "--dangerously-bypass-approvals-and-sandbox")
+		result = append(result, cleanedArgs...)
+		return result, ""
+	}
+
+	// Top-level path: split flag args (with their values) from positional
+	// prompt parts, then route the prompt through stdin via `-`.
 	var flagArgs []string
 	var promptParts []string
 	skipNext := false
@@ -1113,7 +1179,7 @@ func buildCodexInteractiveArgs(args []string) ([]string, string) {
 		}
 		if strings.HasPrefix(a, "-") {
 			flagArgs = append(flagArgs, a)
-			if valuedFlags[a] && i+1 < len(cleanedArgs) {
+			if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(cleanedArgs) {
 				skipNext = true
 			}
 			continue

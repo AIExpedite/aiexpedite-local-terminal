@@ -286,10 +286,12 @@ func TestBuildCodexInteractiveArgs_PreservesValuedFlags(t *testing.T) {
 }
 
 func TestBuildCodexInteractiveArgs_PreservesShortValuedFlag(t *testing.T) {
-	// -m is the short alias for --model.
-	args, prompt := buildCodexInteractiveArgs([]string{"-m", "o3", "review"})
-	if prompt != "review" {
-		t.Errorf("prompt = %q, want %q (args=%v)", prompt, "review", args)
+	// -m is the short alias for --model. NOTE: prompt is intentionally NOT
+	// "review" — that would collide with the `codex exec review` subcommand
+	// (which codex itself would interpret as a subcommand call, not a prompt).
+	args, prompt := buildCodexInteractiveArgs([]string{"-m", "o3", "summarize"})
+	if prompt != "summarize" {
+		t.Errorf("prompt = %q, want %q (args=%v)", prompt, "summarize", args)
 	}
 	mustContain(t, args, "-m", "o3")
 }
@@ -305,6 +307,98 @@ func TestBuildCodexInteractiveArgs_StripsDuplicateJsonFlag(t *testing.T) {
 	}
 	if jsonCount != 1 {
 		t.Errorf("expected exactly one --json in args, got %d (%v)", jsonCount, args)
+	}
+}
+
+// Regression for P1 review on PR #28: `codex exec` documents additional
+// value-taking options beyond `--model` / `--config`. If those values get
+// reclassified as prompt words, codex will either reject the flag (missing
+// value) or silently drop a critical setting.
+func TestBuildCodexInteractiveArgs_PreservesAllValuedFlags(t *testing.T) {
+	cases := []struct {
+		name string
+		flag string
+		val  string
+	}{
+		{"output-last-message-long", "--output-last-message", "/tmp/last.txt"},
+		{"output-last-message-short", "-o", "/tmp/last.txt"},
+		{"output-schema", "--output-schema", "/tmp/schema.json"},
+		{"add-dir", "--add-dir", "/workspace/extra"},
+		{"profile-long", "--profile", "dev"},
+		{"profile-short", "-p", "dev"},
+		{"local-provider", "--local-provider", "lmstudio"},
+		{"color", "--color", "never"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args, prompt := buildCodexInteractiveArgs([]string{tc.flag, tc.val, "review the diff"})
+			if prompt != "review the diff" {
+				t.Errorf("prompt = %q, want %q (args=%v)", prompt, "review the diff", args)
+			}
+			mustContain(t, args, tc.flag, tc.val)
+			// The value must NOT show up in the stdin prompt.
+			if strings.Contains(prompt, tc.val) {
+				t.Errorf("value %q leaked into stdinPrompt %q", tc.val, prompt)
+			}
+		})
+	}
+}
+
+// Regression for P1 review on PR #28: `codex exec` accepts `resume` / `review`
+// / `help` subcommands. Treating those positional tokens as prompt words
+// destroys the call — codex sees the subcommand's own flags at the top level
+// and either errors or runs a fresh session instead of resuming.
+func TestBuildCodexInteractiveArgs_PreservesResumeSubcommand(t *testing.T) {
+	args, prompt := buildCodexInteractiveArgs([]string{"resume", "--last", "follow-up"})
+	// Subcommand path keeps everything in argv; no stdin routing.
+	if prompt != "" {
+		t.Errorf("subcommand path must not produce stdinPrompt, got %q (args=%v)", prompt, args)
+	}
+	if len(args) > 0 && args[len(args)-1] == "-" {
+		t.Errorf("subcommand path must NOT append `-` placeholder, got %v", args)
+	}
+	mustContain(t, args, "exec", "resume", "--last", "follow-up")
+	// Order check: `resume` must precede `--last` so codex routes the flag
+	// under the subcommand parser, not the top-level exec parser.
+	resumeIdx := indexOf(args, "resume")
+	lastIdx := indexOf(args, "--last")
+	if resumeIdx < 0 || lastIdx < 0 || resumeIdx > lastIdx {
+		t.Errorf("expected `resume` before `--last`, got %v", args)
+	}
+}
+
+func TestBuildCodexInteractiveArgs_PreservesResumeSessionAndPrompt(t *testing.T) {
+	args, prompt := buildCodexInteractiveArgs([]string{"resume", "abc-123", "follow-up text"})
+	if prompt != "" {
+		t.Errorf("subcommand path must not produce stdinPrompt, got %q", prompt)
+	}
+	// Both session id and prompt must remain in argv, in order.
+	mustContain(t, args, "resume", "abc-123", "follow-up text")
+	resumeIdx := indexOf(args, "resume")
+	idIdx := indexOf(args, "abc-123")
+	promptIdx := indexOf(args, "follow-up text")
+	if !(resumeIdx < idIdx && idIdx < promptIdx) {
+		t.Errorf("expected order resume < session_id < prompt, got %v", args)
+	}
+}
+
+func TestBuildCodexInteractiveArgs_PreservesReviewSubcommand(t *testing.T) {
+	args, prompt := buildCodexInteractiveArgs([]string{"review", "--uncommitted"})
+	if prompt != "" {
+		t.Errorf("subcommand path must not produce stdinPrompt, got %q", prompt)
+	}
+	mustContain(t, args, "exec", "review", "--uncommitted")
+}
+
+func TestBuildCodexInteractiveArgs_PromptWordResumeNotMistakenForSubcommand(t *testing.T) {
+	// If the FIRST positional isn't a known subcommand, "resume" appearing
+	// later in the prompt must be treated as prompt text, not a subcommand.
+	args, prompt := buildCodexInteractiveArgs([]string{"please", "resume", "the", "discussion"})
+	if prompt != "please resume the discussion" {
+		t.Errorf("prompt = %q, want %q (args=%v)", prompt, "please resume the discussion", args)
+	}
+	if len(args) == 0 || args[len(args)-1] != "-" {
+		t.Errorf("non-subcommand path must end with `-`, got %v", args)
 	}
 }
 
