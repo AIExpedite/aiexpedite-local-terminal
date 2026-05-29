@@ -20,6 +20,8 @@ package main
 import (
 	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -197,6 +199,73 @@ func TestMachineInfo_JSONShape_OmitsEmpty(t *testing.T) {
 		if !strings.Contains(out, "\""+key+"\"") {
 			t.Errorf("expected %q in JSON; got: %s", key, out)
 		}
+	}
+}
+
+// TestGatherCLIAgents_PopulatesDisplayName verifies that the Name field on
+// each emitted detectedCLIAgent carries the canonical product label
+// ("Antigravity", "Claude Code", "Codex", "Gemini CLI") rather than the
+// binary name. The frontend's About-tab "CLI Tools" chips read
+// info.name || agentKey, so this is what shows in the UI.
+func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// LookPath behavior on Windows requires .exe / PATHEXT and a real
+		// loadable image. The display-name mapping is platform-agnostic,
+		// and the macOS/Linux PATH-shim approach below is enough coverage
+		// for the regression we care about.
+		t.Skip("PATH-shim style probe not portable to windows test runners")
+	}
+
+	dir := t.TempDir()
+	// Drop empty executable stubs for every binary gatherCLIAgents probes.
+	// LookPath only checks the executable bit; the version probe will time
+	// out / exit non-zero, but Detected + Name are populated before the
+	// version probe runs.
+	for _, bin := range []string{"claude", "codex", "gemini", "agy"} {
+		stub := filepath.Join(dir, bin)
+		if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+			t.Fatalf("write stub %s: %v", stub, err)
+		}
+	}
+
+	prevPath := os.Getenv("PATH")
+	t.Setenv("PATH", dir)
+	t.Cleanup(func() { _ = os.Setenv("PATH", prevPath) })
+
+	agents := gatherCLIAgents()
+
+	wantNames := map[string]string{
+		"claudeCode":  "Claude Code",
+		"codex":       "Codex",
+		"geminiCli":   "Gemini CLI",
+		"antigravity": "Antigravity",
+	}
+	for key, wantName := range wantNames {
+		entry, ok := agents[key]
+		if !ok {
+			t.Errorf("gatherCLIAgents missing key %q (PATH=%s)", key, dir)
+			continue
+		}
+		if !entry.Detected {
+			t.Errorf("agent %q: Detected=false, want true", key)
+		}
+		if entry.Name != wantName {
+			t.Errorf("agent %q: Name=%q, want %q", key, entry.Name, wantName)
+		}
+		if entry.Path == "" {
+			t.Errorf("agent %q: Path is empty", key)
+		}
+	}
+
+	// JSON round-trip — the persisted shape on terminalAgents/{id} must
+	// carry the human-readable name field so the frontend chip renders
+	// "Antigravity v…" not "agy v…".
+	b, err := json.Marshal(agents["antigravity"])
+	if err != nil {
+		t.Fatalf("marshal antigravity entry: %v", err)
+	}
+	if !strings.Contains(string(b), `"name":"Antigravity"`) {
+		t.Errorf("JSON does not carry display name: %s", string(b))
 	}
 }
 

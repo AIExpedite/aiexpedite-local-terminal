@@ -430,11 +430,16 @@ func gatherShellInfo() *shellInfo {
 
 func gatherCLIAgents() map[string]detectedCLIAgent {
 	agents := map[string]detectedCLIAgent{}
-	for _, a := range []struct{ Key, Bin string }{
-		{"claudeCode", "claude"},
-		{"codex", "codex"},
-		{"geminiCli", "gemini"},
-		{"antigravity", "agy"},
+	// DisplayName carries the canonical product label the frontend "CLI
+	// Tools" chips render. Mirrors `name` in db-content/dev/cliAgents/*.json
+	// (Antigravity, Claude Code, Codex, Gemini CLI), not the binary name —
+	// otherwise the About tab would show "agy v1.0.1" instead of
+	// "Antigravity v1.0.1".
+	for _, a := range []struct{ Key, Bin, DisplayName string }{
+		{"claudeCode", "claude", "Claude Code"},
+		{"codex", "codex", "Codex"},
+		{"geminiCli", "gemini", "Gemini CLI"},
+		{"antigravity", "agy", "Antigravity"},
 	} {
 		path, err := exec.LookPath(a.Bin)
 		if err != nil {
@@ -443,7 +448,7 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 		entry := detectedCLIAgent{
 			Detected: true,
 			Path:     path,
-			Name:     a.Bin,
+			Name:     a.DisplayName,
 		}
 		if v := probeVersionArgs(a.Bin, "--version"); v != "" {
 			entry.Version = v
