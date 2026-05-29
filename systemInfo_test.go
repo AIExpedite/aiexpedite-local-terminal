@@ -228,9 +228,8 @@ func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
 		}
 	}
 
-	prevPath := os.Getenv("PATH")
+	// t.Setenv restores PATH on test cleanup automatically.
 	t.Setenv("PATH", dir)
-	t.Cleanup(func() { _ = os.Setenv("PATH", prevPath) })
 
 	agents := gatherCLIAgents()
 
