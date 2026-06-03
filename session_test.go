@@ -90,9 +90,9 @@ func TestShouldCloseStdinAfterStart(t *testing.T) {
 		// in ~3s, which is the prod failure mode we're patching here.
 		{name: "claude_with_stdin_prompt_stays_open", command: "claude", stdinPrompt: "do work", want: false},
 		{name: "claude_without_prompt_stays_open", command: "claude", want: false},
-		// Codex / gemini and shells are one-shot by design — they need stdin
-		// closed when no prompt was queued (codex exec specifically blocks
-		// on EOF before producing output).
+		// Codex / gemini are one-shot by design and read the stdin-piped prompt
+		// to EOF, so stdin is ALWAYS closed after the write (leaving it open
+		// hangs them). Shells close only when no prompt was queued.
 		{name: "codex_exec_closes", command: "codex", want: true},
 		{name: "gemini_exec_closes", command: "gemini", want: true},
 		{name: "powershell_closes", command: "powershell", want: true},
