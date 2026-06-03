@@ -533,8 +533,8 @@ func TestStdinPromptFormat(t *testing.T) {
 		{"CODEX", "plain"},
 		{"gemini", "plain"},     // gemini routes the prompt via stdin (interactive, no -p)
 		{"gemini.cmd", "plain"}, // normalize the Windows npm shim suffix too
-		{"agy", ""},     // antigravity keeps argv (it ignores piped stdin); no stdin prompt
-		{"agy.exe", ""}, // native agy.exe — still positional, no stdin prompt
+		{"agy", ""},             // antigravity keeps argv (it ignores piped stdin); no stdin prompt
+		{"agy.exe", ""},         // native agy.exe — still positional, no stdin prompt
 		{"powershell", ""},
 		{"", ""},
 	}
