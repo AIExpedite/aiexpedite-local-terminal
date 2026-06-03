@@ -487,18 +487,17 @@ func (sm *SessionManager) removeSession(id string) {
 //     event detection in readOutputStream) or when the orchestrator ends the
 //     session explicitly.
 //
-//   - codex is one-shot by design AND now receives its prompt via stdin
-//     (the `-` positional placeholder writes the brief through the pipe so
-//     multi-KB briefs don't overflow Windows' CreateProcess command-line
-//     cap). codex reads stdin to completion before starting inference, so
-//     we ALWAYS close stdin after the prompt write — leaving it open hangs
-//     codex indefinitely waiting for EOF.
+//   - codex, gemini and agy are one-shot by design AND receive their prompt via
+//     stdin (codex via the `-` positional placeholder; gemini via headless
+//     `-p ""`; agy via claude-shaped `--print`) so multi-KB briefs don't
+//     overflow Windows' command-line cap. All read stdin to completion
+//     before/at the start of inference, so we ALWAYS close stdin after the
+//     prompt write — leaving it open hangs the process indefinitely waiting
+//     for EOF. (Gemini's and agy's stdin were already closed right after launch
+//     on the old argv path, so this is no multi-turn regression.)
 //
-//   - gemini and all non-CLI commands (powershell, bash, git, ...) keep the
-//     pre-existing rule: close stdin iff no stdinPrompt was queued. Gemini
-//     stays on argv-passed prompts for now (its stdin contract for
-//     --output-format stream-json is undocumented enough to defer the
-//     switch to a follow-up).
+//   - all non-CLI commands (powershell, bash, git, ...) keep the pre-existing
+//     rule: close stdin iff no stdinPrompt was queued.
 func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
 	// Normalize: claude / claude.exe / claude.cmd should all match.
 	cmd := strings.ToLower(command)
@@ -509,7 +508,7 @@ func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
 	if cmd == "claude" {
 		return false
 	}
-	if cmd == "codex" {
+	if cmd == "codex" || cmd == "gemini" || cmd == "agy" {
 		return true
 	}
 	return stdinPrompt == ""
@@ -956,12 +955,16 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 //   - codex:       stdinPrompt is the prompt, written as raw text; codex exec
 //     reads stdin to completion (`-` positional placeholder)
 //     then exits; one-shot per process
-//   - gemini:      prompt stays positional (current behavior — gemini's stdin
-//     contract for `--output-format stream-json` is undocumented
-//     enough that switching pre-emptively risks regressions)
-//   - antigravity: prompt as positional argv via `--print`; v1.0.1 has no
-//     --output-format flag and no documented stdin protocol —
-//     switch to stdin once agy ships those
+//   - gemini:      stdinPrompt is the prompt, written as raw text; gemini's
+//     `-p ""` selects non-interactive (headless) mode and reads
+//     the prompt from the stdin pipe (`-p` is "appended to input
+//     on stdin"), so multi-KB briefs don't overflow Windows'
+//     cmd.exe command-line cap. One-shot (stdin closed after write).
+//   - antigravity: stdinPrompt is the prompt, written as raw text; agy is
+//     claude-code-shaped, so its one-shot `--print` mode reads the
+//     prompt from stdin when no positional is given (like
+//     `echo "..." | claude --print`). Keeps multi-KB briefs off
+//     the Windows command line. One-shot (stdin closed after write).
 //   - other:       prompt stays in args
 //
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
@@ -975,9 +978,9 @@ func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
 	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
 		return buildCodexInteractiveArgs(args)
 	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
-		return buildGeminiInteractiveArgs(args), ""
+		return buildGeminiInteractiveArgs(args)
 	case cmdLower == "agy" || strings.HasPrefix(cmdLower, "agy"):
-		return buildAntigravityInteractiveArgs(args), ""
+		return buildAntigravityInteractiveArgs(args)
 	default:
 		return args, ""
 	}
@@ -1003,7 +1006,7 @@ func stdinPromptFormat(command string) string {
 	switch cmd {
 	case "claude":
 		return "ndjson"
-	case "codex":
+	case "codex", "gemini", "agy":
 		return "plain"
 	}
 	return ""
@@ -1238,36 +1241,137 @@ func sanitizeCodexExecArgs(args []string) []string {
 }
 
 // buildAntigravityInteractiveArgs builds Antigravity CLI (`agy`) args for
-// one-shot prompt execution.
+// one-shot prompt execution, routing the prompt via STDIN instead of argv.
 //
 // agy v1.0.1 ships claude-code-shaped flags (--print / --prompt-interactive /
 // --dangerously-skip-permissions) but does NOT expose --output-format or
-// stream-json input — so we cannot yet drive it as a multi-turn streaming
-// session like claude. For now we run a one-shot --print with the prompt as
-// a positional arg.
+// stream-json input — so we cannot drive it as a multi-turn streaming session
+// like claude. We run a one-shot `--print`.
 //
-// KNOWN LIMITATION (tracked for follow-up): until agy ships a stdin protocol
-// for the prompt, multi-KB briefs on Windows risk the same CreateProcess
-// ~32KB command-line cap that bit codex. Switch to stdin delivery as soon
-// as agy ships --output-format stream-json or a `-` positional placeholder.
-func buildAntigravityInteractiveArgs(args []string) []string {
-	result := make([]string, 0, len(args)+2)
+// WHY STDIN: like gemini/codex, on Windows `agy` resolves to a .cmd/.ps1 npm
+// shim that cmd.exe executes, and a multi-KB brief passed positionally
+// overflows cmd.exe's 8191-char command-line cap ("The command line is too
+// long."). Because agy mirrors Claude Code's CLI, its `--print` mode reads the
+// prompt from stdin when no positional prompt is supplied — exactly like
+// `echo "..." | claude --print` — so we pipe the brief through stdin and leave
+// the positional empty. StartSession writes the prompt then closes stdin; agy
+// reads to EOF, runs the turn, and exits.
+//
+// VERIFIED BY ANALOGY to Claude Code (whose flag surface agy copies), NOT live —
+// agy was not installed on the dev machine when this was written. Smoke-test on
+// a device with agy before relying on it; if agy ignores stdin in --print mode,
+// revert this builder to the positional-argv form.
+//
+// Returns (cliArgs, stdinPrompt):
+//   - cliArgs carries only flags (no prompt on argv).
+//   - stdinPrompt is the joined positional prompt text.
+func buildAntigravityInteractiveArgs(args []string) ([]string, string) {
+	// agy flags (claude-shaped) that consume the next argument as their value —
+	// without this, e.g. `--model fast` would be misread as a prompt word.
+	valuedFlags := map[string]bool{
+		"-m": true, "--model": true,
+		"-i": true, "--prompt-interactive": true,
+		"--permission-mode":      true,
+		"--system-prompt":        true,
+		"--append-system-prompt": true,
+	}
+
+	// Split user-provided flags (with their values) from positional prompt
+	// parts. Positional parts become the stdin prompt; flags stay on argv.
+	var flagArgs []string
+	var promptParts []string
+	skipNext := false
+	for i, a := range args {
+		if skipNext {
+			skipNext = false
+			flagArgs = append(flagArgs, a)
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			flagArgs = append(flagArgs, a)
+			if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(args) {
+				skipNext = true
+			}
+			continue
+		}
+		promptParts = append(promptParts, a)
+	}
+
+	result := make([]string, 0, len(flagArgs)+2)
 	result = append(result, "--print")
 	result = append(result, "--dangerously-skip-permissions")
-	result = append(result, args...)
-	return result
+	result = append(result, flagArgs...)
+
+	return result, strings.Join(promptParts, " ")
 }
 
-// buildGeminiInteractiveArgs builds Gemini CLI args for interactive streaming.
-// Prompt is a positional arg (must come first), then -o stream-json for structured
-// streaming output, and --approval-mode auto_edit to auto-approve file edits
-// (stdin relay is not possible when Gemini streams).
-func buildGeminiInteractiveArgs(args []string) []string {
-	result := make([]string, 0, len(args)+4)
-	result = append(result, args...) // prompt as positional arg first
+// buildGeminiInteractiveArgs builds Gemini CLI args for headless streaming,
+// routing the prompt via STDIN instead of argv.
+//
+// WHY STDIN: on Windows, `gemini` resolves to the npm `gemini.cmd` / `gemini.ps1`
+// shim, which cmd.exe executes. cmd.exe rejects command lines longer than 8191
+// characters with "The command line is too long." A multi-KB kickoff brief
+// passed as a positional arg blew past that limit — the CLI exited 1 with no
+// work done (observed as a failing "kickoff tertiary: gemini with 9 KB brief").
+// Mirrors the identical fix already applied to codex (see buildCodexInteractiveArgs).
+//
+// HOW: gemini's `-p/--prompt` is documented as "appended to input on stdin (if
+// any)", so an empty `-p ""` selects non-interactive (headless) mode and uses
+// the piped stdin content as the prompt. `-o stream-json` keeps the structured
+// output the stream parser understands; `--approval-mode auto_edit` preserves
+// the prior autonomy posture. StartSession writes the prompt to stdin then
+// closes it (one-shot — shouldCloseStdinAfterStart returns true for gemini),
+// which matches gemini's pre-existing one-shot lifecycle (on the old argv path
+// its stdin was already closed immediately after launch).
+//
+// Returns (cliArgs, stdinPrompt):
+//   - cliArgs carries only flags (no prompt on argv).
+//   - stdinPrompt is the joined positional prompt text.
+func buildGeminiInteractiveArgs(args []string) ([]string, string) {
+	// Gemini flags that consume the next argument as their value — without this
+	// e.g. `--model gemini-3-pro` would treat "gemini-3-pro" as a prompt word.
+	// The `--flag=value` form is a single token and doesn't need an entry here.
+	valuedFlags := map[string]bool{
+		"-m": true, "--model": true,
+		"-o": true, "--output-format": true,
+		"-e": true, "--extensions": true,
+		"-r": true, "--resume": true,
+		"-i": true, "--prompt-interactive": true,
+		"-p": true, "--prompt": true,
+		"--approval-mode": true, "--policy": true,
+		"--allowed-tools": true, "--allowed-mcp-server-names": true,
+		"--include-directories": true, "--delete-session": true,
+	}
+
+	// Split user-provided flags (with their values) from positional prompt
+	// parts. Positional parts become the stdin prompt; flags stay on argv.
+	var flagArgs []string
+	var promptParts []string
+	skipNext := false
+	for i, a := range args {
+		if skipNext {
+			skipNext = false
+			flagArgs = append(flagArgs, a)
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			flagArgs = append(flagArgs, a)
+			if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(args) {
+				skipNext = true
+			}
+			continue
+		}
+		promptParts = append(promptParts, a)
+	}
+
+	result := make([]string, 0, len(flagArgs)+6)
+	result = append(result, flagArgs...)
 	result = append(result, "-o", "stream-json")
 	result = append(result, "--approval-mode", "auto_edit")
-	return result
+	// Empty -p forces headless mode; the prompt is read from the stdin pipe.
+	result = append(result, "-p", "")
+
+	return result, strings.Join(promptParts, " ")
 }
 
 /* --------------------------------------------------------------------------
