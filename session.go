@@ -1267,13 +1267,27 @@ func sanitizeCodexExecArgs(args []string) []string {
 //   - stdinPrompt is the joined positional prompt text.
 func buildAntigravityInteractiveArgs(args []string) ([]string, string) {
 	// agy flags (claude-shaped) that consume the next argument as their value —
-	// without this, e.g. `--model fast` would be misread as a prompt word.
+	// without this, e.g. `--model fast` would be misread as a prompt word and
+	// the real flag would be left on argv without a value (agy errors or runs
+	// without the requested setting).
 	valuedFlags := map[string]bool{
 		"-m": true, "--model": true,
 		"-i": true, "--prompt-interactive": true,
-		"--permission-mode":      true,
-		"--system-prompt":        true,
-		"--append-system-prompt": true,
+		"--permission-mode":        true,
+		"--permission-prompt-tool": true,
+		"--system-prompt":          true,
+		"--append-system-prompt":   true,
+		"--add-dir":                true,
+		"--allowed-tools":          true,
+		"--disallowed-tools":       true,
+		"--mcp-config":             true,
+		"--output-format":          true,
+		"--input-format":           true,
+		"--print-timeout":          true,
+		"--log-file":               true,
+		"--conversation":           true,
+		"--session-id":             true,
+		"--fallback-model":         true,
 	}
 
 	// Split user-provided flags (with their values) from positional prompt
@@ -1341,6 +1355,7 @@ func buildGeminiInteractiveArgs(args []string) ([]string, string) {
 		"-e": true, "--extensions": true,
 		"-r": true, "--resume": true,
 		"-i": true, "--prompt-interactive": true,
+		"-w": true, "--worktree": true,
 		"--approval-mode": true, "--policy": true,
 		"--allowed-tools": true, "--allowed-mcp-server-names": true,
 		"--include-directories": true, "--delete-session": true,

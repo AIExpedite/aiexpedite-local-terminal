@@ -308,6 +308,26 @@ func TestBuildGeminiInteractiveArgs_UserPromptFlagAndPositionalCombine(t *testin
 	}
 }
 
+// Regression for P2 review on PR #33: Gemini's `--worktree`/`-w` is a string
+// option (https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/cli-reference.md).
+// Without marking it as value-taking, `gemini --worktree fix-branch "do the task"`
+// would keep only `--worktree` on argv and fold `fix-branch` into the stdin
+// prompt — gemini receives an empty worktree value and a polluted prompt.
+func TestBuildGeminiInteractiveArgs_PreservesWorktreeFlag(t *testing.T) {
+	for _, flag := range []string{"--worktree", "-w"} {
+		t.Run(flag, func(t *testing.T) {
+			args, prompt := buildGeminiInteractiveArgs([]string{flag, "fix-branch", "do the task"})
+			if prompt != "do the task" {
+				t.Errorf("prompt = %q, want %q (args=%v)", prompt, "do the task", args)
+			}
+			mustContain(t, args, flag, "fix-branch")
+			if strings.Contains(prompt, "fix-branch") {
+				t.Errorf("worktree value leaked into stdinPrompt %q", prompt)
+			}
+		})
+	}
+}
+
 /* --------------------------------------------------------------------------
    buildCodexInteractiveArgs
    --------------------------------------------------------------------------
@@ -508,6 +528,46 @@ func TestBuildAntigravityInteractiveArgs_EmptyArgs(t *testing.T) {
 		t.Errorf("empty input should yield empty stdinPrompt, got %q", prompt)
 	}
 	mustContain(t, args, "--print", "--dangerously-skip-permissions")
+}
+
+// Regression for P2 review on PR #33: agy mirrors Claude Code's CLI surface,
+// which exposes a number of value-taking flags beyond `--model`. If those
+// values get reclassified as prompt words, the flag is left on argv without a
+// value and agy either errors or silently runs without the requested setting
+// (e.g. `agy --add-dir ../shared-library --print "task"` would become
+// `agy --print --dangerously-skip-permissions --add-dir` plus a prompt
+// containing the directory).
+func TestBuildAntigravityInteractiveArgs_PreservesAllValuedFlags(t *testing.T) {
+	cases := []struct {
+		name string
+		flag string
+		val  string
+	}{
+		{"add-dir", "--add-dir", "../shared-library"},
+		{"conversation", "--conversation", "sess-abc-123"},
+		{"log-file", "--log-file", "/tmp/agy.log"},
+		{"print-timeout", "--print-timeout", "10m"},
+		{"allowed-tools", "--allowed-tools", "Edit,Read"},
+		{"disallowed-tools", "--disallowed-tools", "Bash"},
+		{"mcp-config", "--mcp-config", "/tmp/mcp.json"},
+		{"output-format", "--output-format", "json"},
+		{"input-format", "--input-format", "text"},
+		{"session-id", "--session-id", "sid-1"},
+		{"permission-prompt-tool", "--permission-prompt-tool", "ask-tool"},
+		{"fallback-model", "--fallback-model", "sonnet"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args, prompt := buildAntigravityInteractiveArgs([]string{tc.flag, tc.val, "do", "the", "task"})
+			if prompt != "do the task" {
+				t.Errorf("prompt = %q, want %q (args=%v)", prompt, "do the task", args)
+			}
+			mustContain(t, args, tc.flag, tc.val)
+			if strings.Contains(prompt, tc.val) {
+				t.Errorf("value %q leaked into stdinPrompt %q", tc.val, prompt)
+			}
+		})
+	}
 }
 
 /* --------------------------------------------------------------------------
