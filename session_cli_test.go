@@ -253,6 +253,61 @@ func TestBuildGeminiInteractiveArgs_EmptyArgs(t *testing.T) {
 	mustContain(t, args, "-o", "stream-json", "--approval-mode", "auto_edit", "-p")
 }
 
+// Regression: a user-supplied `-p "..."` must be converted into stdinPrompt
+// and stripped from argv. Otherwise we'd land as `gemini -p foo … -p ""`,
+// the trailing empty `-p` would override the real prompt, and stdin would
+// receive nothing — the previously-valid headless invocation would fail.
+func TestBuildGeminiInteractiveArgs_UserPromptFlagRoutedToStdin(t *testing.T) {
+	args, prompt := buildGeminiInteractiveArgs([]string{"-p", "explain the auth flow"})
+	if prompt != "explain the auth flow" {
+		t.Errorf("gemini stdinPrompt = %q, want %q", prompt, "explain the auth flow")
+	}
+	// The only `-p` on argv must be the trailing headless `-p ""` we append.
+	dashP := 0
+	for i, a := range args {
+		if a == "-p" {
+			dashP++
+			if i+1 >= len(args) || args[i+1] != "" {
+				t.Errorf("each `-p` must be followed by an empty string, got args=%v", args)
+			}
+		}
+		if a == "explain the auth flow" {
+			t.Errorf("prompt leaked onto argv: %v", args)
+		}
+	}
+	if dashP != 1 {
+		t.Errorf("expected exactly one `-p` flag on argv, got %d in %v", dashP, args)
+	}
+}
+
+func TestBuildGeminiInteractiveArgs_UserPromptEqualsFormRoutedToStdin(t *testing.T) {
+	// `--prompt=foo` is a single token; the value still has to end up on stdin
+	// rather than argv. Same for `-p=foo`.
+	for _, in := range [][]string{
+		{"--prompt=explain"},
+		{"-p=explain"},
+	} {
+		args, prompt := buildGeminiInteractiveArgs(in)
+		if prompt != "explain" {
+			t.Errorf("input=%v: stdinPrompt = %q, want %q", in, prompt, "explain")
+		}
+		for _, a := range args {
+			if a == "--prompt=explain" || a == "-p=explain" {
+				t.Errorf("input=%v: prompt-equals token leaked onto argv: %v", in, args)
+			}
+		}
+	}
+}
+
+// User-supplied `-p` plus positional prompt parts should both end up on stdin
+// (joined), not silently dropped.
+func TestBuildGeminiInteractiveArgs_UserPromptFlagAndPositionalCombine(t *testing.T) {
+	args, prompt := buildGeminiInteractiveArgs([]string{"-p", "first", "second"})
+	if prompt != "first second" {
+		t.Errorf("stdinPrompt = %q, want %q (args=%v)", prompt, "first second", args)
+	}
+}
+
 /* --------------------------------------------------------------------------
    buildCodexInteractiveArgs
    --------------------------------------------------------------------------

@@ -1331,13 +1331,16 @@ func buildGeminiInteractiveArgs(args []string) ([]string, string) {
 	// Gemini flags that consume the next argument as their value — without this
 	// e.g. `--model gemini-3-pro` would treat "gemini-3-pro" as a prompt word.
 	// The `--flag=value` form is a single token and doesn't need an entry here.
+	// -p/--prompt is intentionally NOT in this map: when the caller already
+	// supplied a prompt flag, we route its value into stdinPrompt below instead
+	// of leaving a stray `-p VALUE` on argv that would collide with the
+	// headless `-p ""` we append at the end.
 	valuedFlags := map[string]bool{
 		"-m": true, "--model": true,
 		"-o": true, "--output-format": true,
 		"-e": true, "--extensions": true,
 		"-r": true, "--resume": true,
 		"-i": true, "--prompt-interactive": true,
-		"-p": true, "--prompt": true,
 		"--approval-mode": true, "--policy": true,
 		"--allowed-tools": true, "--allowed-mcp-server-names": true,
 		"--include-directories": true, "--delete-session": true,
@@ -1345,16 +1348,47 @@ func buildGeminiInteractiveArgs(args []string) ([]string, string) {
 
 	// Split user-provided flags (with their values) from positional prompt
 	// parts. Positional parts become the stdin prompt; flags stay on argv.
+	// User-supplied `-p`/`--prompt` is converted into stdin prompt input —
+	// without this, e.g. `gemini -p "foo"` would land as
+	// `gemini -p foo … -p ""`, and the trailing empty `-p` would override the
+	// real prompt while stdin received nothing (the previously-valid session
+	// would fail with no input).
 	var flagArgs []string
 	var promptParts []string
 	skipNext := false
+	captureNextAsPrompt := false
 	for i, a := range args {
 		if skipNext {
 			skipNext = false
 			flagArgs = append(flagArgs, a)
 			continue
 		}
+		if captureNextAsPrompt {
+			captureNextAsPrompt = false
+			if a != "" {
+				promptParts = append(promptParts, a)
+			}
+			continue
+		}
 		if strings.HasPrefix(a, "-") {
+			if a == "-p" || a == "--prompt" {
+				if i+1 < len(args) {
+					captureNextAsPrompt = true
+				}
+				continue
+			}
+			if strings.HasPrefix(a, "-p=") {
+				if v := strings.TrimPrefix(a, "-p="); v != "" {
+					promptParts = append(promptParts, v)
+				}
+				continue
+			}
+			if strings.HasPrefix(a, "--prompt=") {
+				if v := strings.TrimPrefix(a, "--prompt="); v != "" {
+					promptParts = append(promptParts, v)
+				}
+				continue
+			}
 			flagArgs = append(flagArgs, a)
 			if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(args) {
 				skipNext = true
