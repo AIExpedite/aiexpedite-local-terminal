@@ -209,11 +209,13 @@ func TestBuildClaudeInteractiveArgs_PromptEndsWithDashedToken(t *testing.T) {
 /* --------------------------------------------------------------------------
    buildGeminiInteractiveArgs
    --------------------------------------------------------------------------
-   Gemini receives the prompt via STDIN (headless `-p ""`) rather than as a
-   positional argv — the switch fixes the Windows cmd.exe 8191-char command-line
-   cap that bit multi-KB kickoff briefs ("The command line is too long.", exit 1).
-   The prompt is returned as stdinPrompt; argv carries only flags plus our fixed
-   -o stream-json / --approval-mode auto_edit / -p "".
+   Gemini receives the prompt via STDIN in its default INTERACTIVE mode (no -p)
+   rather than as a positional argv — the switch fixes the Windows cmd.exe
+   8191-char command-line cap that bit multi-KB kickoff briefs ("The command
+   line is too long.", exit 1). The prompt is returned as stdinPrompt; argv
+   carries only flags plus our fixed -o stream-json / --approval-mode auto_edit.
+   No -p/--print: gemini's interactive mode reads the piped stdin as the prompt
+   (verified against gemini 0.32.1).
    ------------------------------------------------------------------------ */
 
 func TestBuildGeminiInteractiveArgs_PromptGoesToStdin(t *testing.T) {
@@ -227,10 +229,12 @@ func TestBuildGeminiInteractiveArgs_PromptGoesToStdin(t *testing.T) {
 			t.Errorf("prompt leaked onto argv: %v", args)
 		}
 	}
-	// Headless flags must be present so gemini reads the prompt from stdin.
-	mustContain(t, args, "-o", "stream-json", "--approval-mode", "auto_edit", "-p")
-	if args[len(args)-2] != "-p" || args[len(args)-1] != "" {
-		t.Errorf("args must end with `-p \"\"` to select headless+stdin mode, got %v", args)
+	// stream-json flags present; NO -p (interactive mode, per the chosen style).
+	mustContain(t, args, "-o", "stream-json", "--approval-mode", "auto_edit")
+	for _, a := range args {
+		if a == "-p" || a == "--prompt" {
+			t.Errorf("gemini must run interactive (no -p/--print), got %v", args)
+		}
 	}
 }
 
@@ -244,39 +248,32 @@ func TestBuildGeminiInteractiveArgs_PreservesUserFlags(t *testing.T) {
 }
 
 func TestBuildGeminiInteractiveArgs_EmptyArgs(t *testing.T) {
-	// No prompt → empty stdinPrompt, but the headless flags must still be present
-	// so gemini boots in stream-json mode rather than blocking on a TTY.
+	// No prompt → empty stdinPrompt, but the stream-json flags must still be
+	// present so gemini boots in stream-json mode.
 	args, prompt := buildGeminiInteractiveArgs([]string{})
 	if prompt != "" {
 		t.Errorf("empty input should yield empty stdinPrompt, got %q", prompt)
 	}
-	mustContain(t, args, "-o", "stream-json", "--approval-mode", "auto_edit", "-p")
+	mustContain(t, args, "-o", "stream-json", "--approval-mode", "auto_edit")
 }
 
 // Regression: a user-supplied `-p "..."` must be converted into stdinPrompt
-// and stripped from argv. Otherwise we'd land as `gemini -p foo … -p ""`,
-// the trailing empty `-p` would override the real prompt, and stdin would
-// receive nothing — the previously-valid headless invocation would fail.
+// and stripped from argv. In interactive mode we never want ANY `-p` on argv —
+// a stray `-p` would switch gemini to headless mode and collide with the
+// interactive piped-stdin contract.
 func TestBuildGeminiInteractiveArgs_UserPromptFlagRoutedToStdin(t *testing.T) {
 	args, prompt := buildGeminiInteractiveArgs([]string{"-p", "explain the auth flow"})
 	if prompt != "explain the auth flow" {
 		t.Errorf("gemini stdinPrompt = %q, want %q", prompt, "explain the auth flow")
 	}
-	// The only `-p` on argv must be the trailing headless `-p ""` we append.
-	dashP := 0
-	for i, a := range args {
-		if a == "-p" {
-			dashP++
-			if i+1 >= len(args) || args[i+1] != "" {
-				t.Errorf("each `-p` must be followed by an empty string, got args=%v", args)
-			}
+	// NO `-p`/`--prompt` may appear on argv (interactive mode).
+	for _, a := range args {
+		if a == "-p" || a == "--prompt" {
+			t.Errorf("`-p`/`--prompt` must be stripped from argv (interactive mode), got %v", args)
 		}
 		if a == "explain the auth flow" {
 			t.Errorf("prompt leaked onto argv: %v", args)
 		}
-	}
-	if dashP != 1 {
-		t.Errorf("expected exactly one `-p` flag on argv, got %d in %v", dashP, args)
 	}
 }
 
@@ -491,83 +488,29 @@ func TestBuildCodexInteractiveArgs_PromptWordResumeNotMistakenForSubcommand(t *t
 /* --------------------------------------------------------------------------
    buildAntigravityInteractiveArgs
    --------------------------------------------------------------------------
-   agy v1.0.1 is claude-code-shaped on its flag surface but ships without
-   --output-format / stream-json input — so we run a one-shot `--print`. The
-   prompt is routed via STDIN (not argv) to dodge the Windows cmd.exe 8191-char
-   command-line cap; agy's claude-shaped `--print` reads the prompt from stdin
-   when no positional is supplied. Returns the prompt as stdinPrompt; argv
-   carries only --print / --dangerously-skip-permissions (+ any user flags).
+   agy is claude-code-shaped on its flag surface but ships without
+   --output-format / stream-json input, and (verified against agy 1.0.4) it
+   does NOT read a piped stdin — so the prompt stays a POSITIONAL argv and we
+   run a one-shot `--print`. agy resolves to a native agy.exe (not a cmd.exe
+   shim), so it is launched via CreateProcess (~32KB cap) and is not subject to
+   gemini's 8191-char cmd.exe cap. Single return value (no stdinPrompt).
    ------------------------------------------------------------------------ */
 
-func TestBuildAntigravityInteractiveArgs_PromptGoesToStdin(t *testing.T) {
-	args, prompt := buildAntigravityInteractiveArgs([]string{"hello"})
-	if prompt != "hello" {
-		t.Errorf("agy stdinPrompt = %q, want %q", prompt, "hello")
-	}
-	// Prompt MUST NOT appear on argv (that's the whole point of the fix).
-	for _, a := range args {
-		if a == "hello" {
-			t.Errorf("prompt leaked onto argv: %v", args)
-		}
-	}
-	mustContain(t, args, "--print", "--dangerously-skip-permissions")
-}
-
-func TestBuildAntigravityInteractiveArgs_PreservesUserFlags(t *testing.T) {
-	args, prompt := buildAntigravityInteractiveArgs([]string{"hello", "--model", "fast"})
-	if prompt != "hello" {
-		t.Errorf("agy stdinPrompt = %q, want %q", prompt, "hello")
-	}
-	// User flag + its value stay on argv (and the value is NOT misread as prompt).
-	mustContain(t, args, "--print", "--dangerously-skip-permissions", "--model", "fast")
+func TestBuildAntigravityInteractiveArgs_PrintAndPrompt(t *testing.T) {
+	args := buildAntigravityInteractiveArgs([]string{"hello"})
+	mustContain(t, args, "--print", "--dangerously-skip-permissions", "hello")
 }
 
 func TestBuildAntigravityInteractiveArgs_EmptyArgs(t *testing.T) {
-	args, prompt := buildAntigravityInteractiveArgs([]string{})
-	if prompt != "" {
-		t.Errorf("empty input should yield empty stdinPrompt, got %q", prompt)
-	}
+	args := buildAntigravityInteractiveArgs([]string{})
 	mustContain(t, args, "--print", "--dangerously-skip-permissions")
 }
 
-// Regression for P2 review on PR #33: agy mirrors Claude Code's CLI surface,
-// which exposes a number of value-taking flags beyond `--model`. If those
-// values get reclassified as prompt words, the flag is left on argv without a
-// value and agy either errors or silently runs without the requested setting
-// (e.g. `agy --add-dir ../shared-library --print "task"` would become
-// `agy --print --dangerously-skip-permissions --add-dir` plus a prompt
-// containing the directory).
-func TestBuildAntigravityInteractiveArgs_PreservesAllValuedFlags(t *testing.T) {
-	cases := []struct {
-		name string
-		flag string
-		val  string
-	}{
-		{"add-dir", "--add-dir", "../shared-library"},
-		{"conversation", "--conversation", "sess-abc-123"},
-		{"log-file", "--log-file", "/tmp/agy.log"},
-		{"print-timeout", "--print-timeout", "10m"},
-		{"allowed-tools", "--allowed-tools", "Edit,Read"},
-		{"disallowed-tools", "--disallowed-tools", "Bash"},
-		{"mcp-config", "--mcp-config", "/tmp/mcp.json"},
-		{"output-format", "--output-format", "json"},
-		{"input-format", "--input-format", "text"},
-		{"session-id", "--session-id", "sid-1"},
-		{"permission-prompt-tool", "--permission-prompt-tool", "ask-tool"},
-		{"fallback-model", "--fallback-model", "sonnet"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			args, prompt := buildAntigravityInteractiveArgs([]string{tc.flag, tc.val, "do", "the", "task"})
-			if prompt != "do the task" {
-				t.Errorf("prompt = %q, want %q (args=%v)", prompt, "do the task", args)
-			}
-			mustContain(t, args, tc.flag, tc.val)
-			if strings.Contains(prompt, tc.val) {
-				t.Errorf("value %q leaked into stdinPrompt %q", tc.val, prompt)
-			}
-		})
-	}
+// agy gets every arg on argv (prompt + any flags), in order, after the two
+// leading flags. Nothing is reclassified or routed to stdin (agy ignores it).
+func TestBuildAntigravityInteractiveArgs_PassesArgsThroughPositional(t *testing.T) {
+	args := buildAntigravityInteractiveArgs([]string{"--add-dir", "../shared-library", "do the task"})
+	mustContain(t, args, "--print", "--dangerously-skip-permissions", "--add-dir", "../shared-library", "do the task")
 }
 
 /* --------------------------------------------------------------------------
@@ -588,10 +531,10 @@ func TestStdinPromptFormat(t *testing.T) {
 		{"codex", "plain"},
 		{"codex.cmd", "plain"},
 		{"CODEX", "plain"},
-		{"gemini", "plain"},     // gemini now routes the prompt via stdin (headless -p "")
+		{"gemini", "plain"},     // gemini routes the prompt via stdin (interactive, no -p)
 		{"gemini.cmd", "plain"}, // normalize the Windows npm shim suffix too
-		{"agy", "plain"},        // antigravity now routes the prompt via stdin (claude-shaped --print)
-		{"agy.cmd", "plain"},    // normalize the Windows npm shim suffix too
+		{"agy", ""},     // antigravity keeps argv (it ignores piped stdin); no stdin prompt
+		{"agy.exe", ""}, // native agy.exe — still positional, no stdin prompt
 		{"powershell", ""},
 		{"", ""},
 	}
@@ -609,8 +552,8 @@ func TestStdinPromptFormat(t *testing.T) {
    Each CLI has its own stdinPrompt contract:
      - claude: prompt goes via NDJSON on stdin
      - codex:  prompt goes via raw stdin (`-` placeholder)
-     - gemini: prompt goes via raw stdin (headless `-p ""`)
-     - agy:    prompt goes via raw stdin (claude-shaped `--print`)
+     - gemini: prompt goes via raw stdin (interactive mode, no -p)
+     - agy:    prompt stays positional (agy ignores piped stdin)
      - other:  passes through verbatim
    ------------------------------------------------------------------------ */
 
@@ -635,26 +578,23 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 		if prompt != "hello" {
 			t.Errorf("gemini stdinPrompt = %q, want %q (prompt now goes via stdin)", prompt, "hello")
 		}
-		// Prompt must be off argv; headless -p "" must be present.
+		// Prompt must be off argv; interactive stream-json flags present, no -p.
 		for _, a := range args {
 			if a == "hello" {
 				t.Errorf("gemini prompt must NOT be on argv, got %v", args)
 			}
+			if a == "-p" || a == "--prompt" {
+				t.Errorf("gemini must run interactive (no -p), got %v", args)
+			}
 		}
-		mustContain(t, args, "-p", "-o", "stream-json")
+		mustContain(t, args, "-o", "stream-json")
 	})
 	t.Run("antigravity", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("agy", []string{"hello"})
-		if prompt != "hello" {
-			t.Errorf("agy stdinPrompt = %q, want %q (prompt now goes via stdin)", prompt, "hello")
+		if prompt != "" {
+			t.Errorf("agy stdinPrompt MUST be empty (agy ignores piped stdin; prompt goes on argv): %q", prompt)
 		}
-		// Prompt must be off argv; --print must be present.
-		for _, a := range args {
-			if a == "hello" {
-				t.Errorf("agy prompt must NOT be on argv, got %v", args)
-			}
-		}
-		mustContain(t, args, "--print", "--dangerously-skip-permissions")
+		mustContain(t, args, "--print", "--dangerously-skip-permissions", "hello")
 	})
 	t.Run("case-insensitive", func(t *testing.T) {
 		// The router checks command.ToLower() exactly + startswith — make sure
