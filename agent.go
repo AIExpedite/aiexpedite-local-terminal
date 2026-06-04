@@ -254,6 +254,15 @@ func StartAgent(cfg *Config) {
 	go globalSessionManager.CleanupStale(sessionMaxLifetime)
 	fmt.Println("[aiexpedite] Session manager ready")
 
+	/* 3b'. Initialize Codex app-server manager (JSON-RPC over stdio) ----- */
+	// Drives `codex app-server --listen stdio://` for AI Expedite's Codex IDE
+	// integration. Independent of the CLI session manager above because the
+	// protocol is fundamentally different (JSON-RPC 2.0 framing vs. one-shot
+	// stream-json output).
+
+	globalCodexAppServerManager = NewCodexAppServerManager(cfg)
+	fmt.Println("[aiexpedite] Codex app-server manager ready")
+
 	/* 3c. Begin gathering machine info for /auth/token uploads ------------ */
 	// Runs in a background goroutine so we don't block startup. The first
 	// gather typically completes within a few seconds, comfortably before

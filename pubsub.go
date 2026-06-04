@@ -460,9 +460,9 @@ type commandMsg struct {
 	TimeoutMs   int64    `json:"timeoutMs,omitempty"` // Execution timeout in milliseconds (default: 120000)
 
 	// Session fields (for interactive CLI agent sessions)
-	Type      string `json:"type,omitempty"`      // "execute"|"session_start"|"session_input"|"session_signal"|"session_end"
+	Type      string `json:"type,omitempty"`      // "execute"|"session_start"|"session_input"|"session_signal"|"session_end"|"codex_appserver_start"|"codex_appserver_send"|"codex_appserver_end"
 	SessionID string `json:"sessionID,omitempty"` // Unique session identifier
-	Input     string `json:"input,omitempty"`     // stdin text for session_input
+	Input     string `json:"input,omitempty"`     // stdin text for session_input; raw JSON-RPC frame for codex_appserver_send
 	Signal    string `json:"signal,omitempty"`    // "interrupt"|"kill" for session_signal
 }
 
@@ -490,9 +490,9 @@ type resultMsg struct {
 	Args    []string `json:"args,omitempty"`
 
 	// Session fields (for interactive CLI agent sessions)
-	Type       string `json:"type,omitempty"`       // "result"|"stream"|"prompt"|"session_ended"
+	Type       string `json:"type,omitempty"`       // "result"|"stream"|"prompt"|"session_ended"|"codex_appserver_started"|"codex_appserver_message"|"codex_appserver_stderr"|"codex_appserver_error"|"codex_appserver_ended"
 	SessionID  string `json:"sessionID,omitempty"`  // Session identifier
-	ExitCode   int    `json:"exitCode,omitempty"`   // Process exit code (for session_ended)
+	ExitCode   int    `json:"exitCode,omitempty"`   // Process exit code (for session_ended / codex_appserver_ended)
 	PromptText string `json:"promptText,omitempty"` // The question/approval text from CLI
 	PromptType string `json:"promptType,omitempty"` // "permission"|"question"|"unknown"
 	Seq        int    `json:"seq,omitempty"`        // Ordering sequence number for streaming
@@ -964,8 +964,49 @@ func runPubSubConnection(cfg *Config) error {
 		// ─────────────────────────────────────────────────────────────────
 
 		// ─── Interactive Session Routing ─────────────────────────────────
-		// Route session_* commands to the SessionManager instead of shell execution
+		// Route session_* and codex_appserver_* commands to their respective
+		// managers instead of shell execution.
 		if cmd.Type != "" && cmd.Type != "execute" {
+			// codex_appserver_start is the JSON-RPC entry point — gate it
+			// through the allowlist using the same `codex app-server …` argv
+			// the manager will actually exec, so an admin who has whitelisted
+			// `codex *` (the default) gets app-server access for free without
+			// having to maintain a parallel allowlist for the new entry kind.
+			if cmd.Type == "codex_appserver_start" && cfg.EnableAllowList && defaultAllowList != nil {
+				appServerArgs := buildCodexAppServerArgs(cmd.Args)
+				if !defaultAllowList.IsAllowed("codex", appServerArgs) {
+					timeoutSec := cfg.ApprovalTimeoutSec
+					if timeoutSec <= 0 {
+						timeoutSec = 60
+					}
+					result := ShowCommandApprovalDialog("codex", appServerArgs, timeoutSec)
+					if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
+						result = ApprovalOnce
+					}
+					switch result {
+					case ApprovalDeny:
+						fmt.Printf("%s[aiexpedite] codex app-server start denied by user%s\n", colorYellow, colorReset)
+						res := makeRejectionResult(
+							cmd,
+							cfg.AgentID,
+							"denied",
+							"ALLOWLIST_DENIED",
+							"codex app-server denied by user: not in allow list",
+						)
+						if err := publishMsg(ctx, topic, res); err != nil {
+							m.Nack()
+						} else {
+							m.Ack()
+						}
+						return
+					case ApprovalAlways:
+						pattern := GeneratePatternFromCommand("codex", appServerArgs)
+						if err := defaultAllowList.AddPattern(pattern); err != nil {
+							fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
+						}
+					}
+				}
+			}
 			// Apply allowlist to session_start (same rules as execute commands)
 			if cmd.Type == "session_start" && cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
 				timeoutSec := cfg.ApprovalTimeoutSec
@@ -2239,14 +2280,25 @@ func extractWorkspaceID(cmd commandMsg) string {
 // initialized in StartAgent (agent.go).
 var globalSessionManager *SessionManager
 
+// globalCodexAppServerManager is the package-level CodexAppServerManager
+// instance, initialized in StartAgent (agent.go). Sessions launched here
+// drive Codex via its JSON-RPC stdio app-server protocol (separate code path
+// from the existing `codex exec` CLI integration in session.go).
+var globalCodexAppServerManager *CodexAppServerManager
+
 /* --------------------------------------------------------------------------
    handleSessionCommand — routes session_* commands to the SessionManager
    -------------------------------------------------------------------------- */
 
-// handleSessionCommand handles interactive session commands (session_start,
-// session_input, session_signal, session_end). It publishes results back
-// via the provided Pub/Sub topic.
+// handleSessionCommand handles interactive session commands (session_*,
+// codex_appserver_*). It publishes results back via the provided Pub/Sub
+// topic.
 func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg) {
+	if isCodexAppServerCommand(cmd.Type) {
+		handleCodexAppServerCommand(ctx, topic, cmd)
+		return
+	}
+
 	if globalSessionManager == nil {
 		publishSessionError(ctx, topic, cmd, "session manager not initialized")
 		return
@@ -2374,5 +2426,145 @@ func publishSessionError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[session] Failed to publish error: %v%s\n", colorRed, err, colorReset)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Codex app-server (JSON-RPC over stdio) command routing
+   -------------------------------------------------------------------------- */
+
+// isCodexAppServerCommand returns true if cmdType is one of the Codex IDE
+// app-server command kinds. Centralised so the dispatch in handleSessionCommand
+// and any future tray/UI consumers stay in sync.
+func isCodexAppServerCommand(cmdType string) bool {
+	switch cmdType {
+	case "codex_appserver_start", "codex_appserver_send", "codex_appserver_end":
+		return true
+	}
+	return false
+}
+
+// handleCodexAppServerCommand dispatches codex_appserver_* commands to the
+// CodexAppServerManager. Mirrors handleSessionCommand's shape — a single
+// publishFn is shared with the manager so it can stream JSON-RPC frames
+// (responses, notifications, server-initiated approval requests) back via
+// Pub/Sub for the duration of the session.
+func handleCodexAppServerCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg) {
+	if globalCodexAppServerManager == nil {
+		publishCodexAppServerError(ctx, topic, cmd, "codex app-server manager not initialized")
+		return
+	}
+
+	// Same context-isolation rule as handleSessionCommand: the sub.Receive
+	// callback context is cancelled after Ack, but codex_appserver_message
+	// frames keep flowing for minutes — so each publish gets a fresh
+	// background context with a per-call timeout.
+	publishFn := func(res resultMsg) {
+		data, err := json.Marshal(res)
+		if err != nil {
+			fmt.Printf("%s[codex-appserver] Failed to marshal result: %v%s\n", colorRed, err, colorReset)
+			return
+		}
+		pubCtx, pubCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, pubErr := topic.Publish(pubCtx, &pubsub.Message{Data: data}).Get(pubCtx)
+		pubCancel()
+		if pubErr != nil {
+			fmt.Printf("%s[codex-appserver] Failed to publish result: %v%s\n", colorRed, pubErr, colorReset)
+		}
+	}
+
+	switch cmd.Type {
+	case "codex_appserver_start":
+		if cmd.SessionID == "" {
+			publishCodexAppServerError(ctx, topic, cmd, "sessionID is required for codex_appserver_start")
+			return
+		}
+
+		fmt.Printf("%s[codex-appserver] Starting session %s (workspace=%s)%s\n",
+			colorCyan, cmd.SessionID, cmd.WorkspaceID, colorReset)
+
+		err := globalCodexAppServerManager.Start(
+			cmd.SessionID,
+			cmd.Cwd,
+			cmd.Args,
+			cmd.WorkspaceID,
+			cmd.UID,
+			publishFn,
+		)
+		if err != nil {
+			publishCodexAppServerError(ctx, topic, cmd, fmt.Sprintf("failed to start codex app-server: %v", err))
+			return
+		}
+
+		// Mirror session_started: a synchronous ack so the orchestrator can
+		// proceed to send the JSON-RPC `initialize` request as soon as the
+		// pipe is up. The first codex_appserver_message will follow once
+		// codex emits its initialize response on stdout.
+		publishFn(resultMsg{
+			ID:          cmd.ID,
+			WorkspaceID: cmd.WorkspaceID,
+			UID:         cmd.UID,
+			Output:      "Codex app-server started",
+			Status:      "success",
+			Ts:          time.Now().UnixMilli(),
+			Version:     Version,
+			Type:        "codex_appserver_started",
+			SessionID:   cmd.SessionID,
+		})
+
+	case "codex_appserver_send":
+		if cmd.SessionID == "" {
+			publishCodexAppServerError(ctx, topic, cmd, "sessionID is required for codex_appserver_send")
+			return
+		}
+		if cmd.Input == "" {
+			publishCodexAppServerError(ctx, topic, cmd, "input (JSON-RPC frame) is required for codex_appserver_send")
+			return
+		}
+
+		if err := globalCodexAppServerManager.Send(cmd.SessionID, cmd.Input); err != nil {
+			publishCodexAppServerError(ctx, topic, cmd, fmt.Sprintf("failed to send to codex app-server: %v", err))
+			return
+		}
+
+	case "codex_appserver_end":
+		if cmd.SessionID == "" {
+			publishCodexAppServerError(ctx, topic, cmd, "sessionID is required for codex_appserver_end")
+			return
+		}
+
+		fmt.Printf("%s[codex-appserver] Ending session %s%s\n",
+			colorYellow, cmd.SessionID, colorReset)
+
+		if err := globalCodexAppServerManager.End(cmd.SessionID); err != nil {
+			publishCodexAppServerError(ctx, topic, cmd, fmt.Sprintf("failed to end codex app-server session: %v", err))
+			return
+		}
+
+	default:
+		publishCodexAppServerError(ctx, topic, cmd, fmt.Sprintf("unknown codex app-server command type: %s", cmd.Type))
+	}
+}
+
+// publishCodexAppServerError surfaces a synchronous failure (bad request,
+// manager not ready, send failure) back to the orchestrator as a
+// `codex_appserver_error` frame so it can fail the in-flight call without
+// waiting for a timeout.
+func publishCodexAppServerError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
+	fmt.Printf("%s[codex-appserver] Error: %s%s\n", colorRed, errMsg, colorReset)
+
+	res := resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		Output:      errMsg,
+		Status:      "error",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "codex_appserver_error",
+		SessionID:   cmd.SessionID,
+	}
+	if err := publishMsg(ctx, topic, res); err != nil {
+		fmt.Printf("%s[codex-appserver] Failed to publish error: %v%s\n", colorRed, err, colorReset)
 	}
 }

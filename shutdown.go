@@ -115,6 +115,14 @@ func tearDownSubprocesses() {
 		ShutdownPowerShell()
 	}
 
+	// Gracefully end any in-flight Codex app-server sessions before we tear
+	// down outbound network so codex children don't outlive the agent and
+	// silently consume tokens. Best-effort: each End() call has its own
+	// timeout cascade (stdin close → SIGINT → SIGKILL).
+	if globalCodexAppServerManager != nil {
+		globalCodexAppServerManager.ShutdownAll()
+	}
+
 	// Cleanup GCS storage client (closes idle HTTP/2 streams cleanly).
 	CloseStorageClient()
 

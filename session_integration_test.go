@@ -125,6 +125,9 @@ func runMockCLI(mode string) {
 		fmt.Fprintln(os.Stderr, "permission denied: refresh your gemini token")
 		os.Exit(2)
 
+	case "codex-appserver-echo":
+		runMockCodexAppServer()
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown TEST_MOCK_CLI_MODE: %s\n", mode)
 		os.Exit(1)
