@@ -578,6 +578,12 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	session.Stdout.Close()
 	session.Stderr.Close()
 
+	// Wait for readStream to finish draining + flushing every queued publish.
+	// readStream's deferred publishWg.Wait() runs before its deferred
+	// close(streamDone), so by the time we unblock here the in-flight
+	// message frames have already been delivered to publishFn. That preserves
+	// the invariant the orchestrator relies on: codex_appserver_ended is
+	// strictly the last frame for this session and carries the highest Seq.
 	select {
 	case <-session.streamDone:
 	case <-time.After(codexAppServerStreamDrainTimeout):
@@ -597,10 +603,14 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	exit := session.exitCode
 	session.mu.Unlock()
 
-	close(session.done)
-
 	seq := atomic.AddInt64(&session.seq, 1)
-	publishFn(resultMsg{
+
+	// Publish codex_appserver_ended in a goroutine: publishFn can block up to
+	// 30 s on Pub/Sub network I/O. Calling it directly here would hold the
+	// session slot (delaying removeSession below) and slow EndSession-style
+	// callers waiting on session.done. Mirrors session.go's session_ended
+	// publish pattern.
+	go publishFn(resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,
@@ -613,6 +623,11 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 		ExitCode:    exit,
 		Seq:         int(seq),
 	})
+
+	// Closing `done` after the publish goroutine has been launched (but
+	// without waiting on it) means End() can unblock and the manager can
+	// reclaim the session slot in parallel with the Pub/Sub round-trip.
+	close(session.done)
 
 	fmt.Printf("%s[codex-appserver] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, exit, colorReset)

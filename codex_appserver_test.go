@@ -482,9 +482,26 @@ func TestCodexAppServerLifecycle_StartSendEnd(t *testing.T) {
 	}
 
 	// End the session. Mock exits when stdin closes, so we should see a
-	// `codex_appserver_ended` message shortly afterwards.
+	// `codex_appserver_ended` message shortly afterwards. The _ended publish
+	// is fire-and-forget (matches session.go's session_ended pattern), so we
+	// poll instead of asserting immediately — otherwise this test races the
+	// publish goroutine.
 	if err := m.End(id); err != nil {
 		t.Fatalf("End: %v", err)
+	}
+
+	endedDeadline := time.Now().Add(5 * time.Second)
+	var last resultMsg
+	for time.Now().Before(endedDeadline) {
+		mu.Lock()
+		if len(captured) > 0 {
+			last = captured[len(captured)-1]
+		}
+		mu.Unlock()
+		if last.Type == "codex_appserver_ended" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	mu.Lock()
@@ -494,7 +511,7 @@ func TestCodexAppServerLifecycle_StartSendEnd(t *testing.T) {
 	}
 	// Last message must be `codex_appserver_ended` (mirrors session_ended
 	// invariant in session.go — orchestrator relies on this being terminal).
-	last := captured[len(captured)-1]
+	last = captured[len(captured)-1]
 	if last.Type != "codex_appserver_ended" {
 		t.Errorf("expected final message to be codex_appserver_ended; got %q", last.Type)
 	}
