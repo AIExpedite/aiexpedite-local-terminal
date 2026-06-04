@@ -81,6 +81,39 @@ func TestBuildCodexAppServerArgs_StripsCallerListenOverride(t *testing.T) {
 	}
 }
 
+func TestBuildCodexAppServerArgs_PreservesListenAsValuedFlagValue(t *testing.T) {
+	// Regression: a `--listen` token in VALUE position (the value of a valued
+	// flag like -c / --config / --enable) is user data, NOT a transport
+	// override — it must survive sanitization, and the token after it must not
+	// be eaten. The old sanitizer treated the `--listen` value of `-c` as the
+	// transport flag, stripping it AND skipping the following token, corrupting
+	// the override.
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"config_value_is_listen",
+			[]string{"-c", "--listen", "-c", `model="x"`},
+			[]string{"app-server", "--listen", "stdio://", "-c", "--listen", "-c", `model="x"`},
+		},
+		{
+			"enable_value_is_listen",
+			[]string{"--enable", "--listen", "-c", `model="x"`},
+			[]string{"app-server", "--listen", "stdio://", "--enable", "--listen", "-c", `model="x"`},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildCodexAppServerArgs(c.args)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("buildCodexAppServerArgs mangled a valued-flag `--listen` value: got %#v, want %#v", got, c.want)
+			}
+		})
+	}
+}
+
 /* --------------------------------------------------------------------------
    env sanitizer
    -------------------------------------------------------------------------- */

@@ -513,7 +513,15 @@ func (m *CodexAppServerManager) removeSession(id string) {
 // message (a response correlated by id, a turn-completion notification, an
 // approval request); silently dropping one would corrupt the orchestrator's
 // session state. So:
-//   - Frames are NEVER reordered or dropped under normal operation.
+//   - Frames are NEVER dropped under normal operation.
+//   - Every frame carries a monotonic `Seq`, and the orchestrator MUST order
+//     and dedup by `Seq`, NOT by Pub/Sub arrival order. Publish order can
+//     legitimately differ from `Seq` order: the stdout and stderr scanners each
+//     assign `Seq` (atomic) *before* enqueuing, so the two producers can win the
+//     channel race out of `Seq` order, and the fatal-error path below publishes
+//     synchronously, bypassing the queue. The only invariants the orchestrator
+//     relies on are on `Seq` itself (e.g. `_ended` always carries the highest
+//     `Seq`, assigned after streamDone), never on arrival order.
 //   - If Pub/Sub stalls for codexAppServerEnqueueTimeout while the queue is
 //     full, the manager publishes a fatal codex_appserver_error and force-
 //     kills the child. Failing-fast is the only safe response: continuing
@@ -521,9 +529,11 @@ func (m *CodexAppServerManager) removeSession(id string) {
 func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publishFn PublishFunc) {
 	defer close(session.streamDone)
 
-	// Single ordered publisher goroutine. Buffered channel preserves arrival
-	// order across goroutines; the publisher drains serially so Pub/Sub
-	// retries cannot reorder frames either.
+	// Single ordered publisher goroutine. The buffered channel preserves the
+	// order frames are *enqueued* and the publisher drains serially, so Pub/Sub
+	// retries can't reorder what's already queued. Note this is enqueue order,
+	// which can differ from `Seq` order (the two producers race seq-assign vs
+	// enqueue); the orchestrator sorts by `Seq`, not by arrival.
 	queue := make(chan resultMsg, codexAppServerPublishQueueSize)
 	publisherDone := make(chan struct{})
 	go func() {
@@ -554,16 +564,22 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 
 	// failSessionFatally surfaces a queue-stall diagnostic via a synchronous
 	// publish (bypassing the wedged queue) and kills the child so waitForExit
-	// publishes codex_appserver_ended. The publish MUST be synchronous: if
-	// we detached it to a goroutine, it would race with waitForExit's own
-	// async `codex_appserver_ended` publish, and the orchestrator could see
-	// `_ended` before `_error`, violating the "_ended is strictly last"
-	// invariant and closing the session without surfacing why it was
-	// force-killed. Blocking here for the publishFn timeout (~30 s) is
-	// acceptable — the session is already dying and the diagnostic is what
-	// makes the failure actionable. This is the documented failure mode
-	// when Pub/Sub stays unresponsive long enough that we'd otherwise have to
-	// drop a JSON-RPC frame.
+	// publishes codex_appserver_ended. The publish is synchronous so the
+	// diagnostic is actually emitted before the session is torn down; ordering
+	// against the async `_ended` is guaranteed by `Seq`, not by this being
+	// synchronous (`_error` here gets a lower `Seq` than `_ended`, which is
+	// assigned after streamDone), so the orchestrator can always reconstruct
+	// "_error then _ended" regardless of arrival order.
+	//
+	// CAVEAT: this path's trigger is a wedged/slow Pub/Sub, and this synchronous
+	// publish uses the SAME publishFn. If Pub/Sub is genuinely DOWN (not merely
+	// slow), this call also blocks for the full publishFn timeout (~30 s) and
+	// then fails — so the `_error` diagnostic may itself be dropped and the
+	// child-kill is delayed until that timeout elapses (worst case roughly
+	// enqueueTimeout + publish timeout before the session dies). The diagnostic
+	// only reliably lands when Pub/Sub is responsive-but-slow; a true outage
+	// degrades to "child killed late, no diagnostic" — still safe (no dropped
+	// JSON-RPC frame is mistaken for a live session), just not observable.
 	failSessionFatally := func(reason string, droppedType string) {
 		fmt.Printf("%s[codex-appserver] Publish queue stalled for %s — failing session (dropped %s)%s\n",
 			colorRed, session.ID, droppedType, colorReset)
@@ -750,6 +766,12 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			}
 		}
 		if err := scanner.Err(); err != nil {
+			// Unlike the stdout scanner (which fails the session on a scanner
+			// error), a stderr error — including ErrTooLong on a line past the
+			// 1 MB cap set above — is deliberately NOT session-fatal. stderr is
+			// diagnostic, not protocol-critical: a lost or truncated stderr line
+			// cannot deadlock the orchestrator's JSON-RPC state machine the way a
+			// dropped stdout frame would. Log and let the session continue.
 			fmt.Printf("%s[codex-appserver] stderr scanner error for %s: %v%s\n",
 				colorRed, session.ID, err, colorReset)
 		}
@@ -844,11 +866,27 @@ func buildCodexAppServerArgs(extraArgs []string) []string {
 }
 
 func sanitizeCodexAppServerExtraArgs(extraArgs []string) []string {
+	// codex flags whose NEXT token is their value, not a positional. We must not
+	// interpret such a value as a transport override: a caller passing
+	// `-c --listen` means the config KEY "--listen", not a real `--listen` flag.
+	// Without this guard the old code stripped that value AND skipped the token
+	// after it, corrupting the `-c` override and silently dropping an arg.
+	valuedFlags := map[string]bool{
+		"-c": true, "--config": true,
+		"--enable": true, "--disable": true,
+		"--ws-auth": true,
+	}
 	cleaned := make([]string, 0, len(extraArgs))
-	skipNext := false
-	for i, a := range extraArgs {
+	skipNext := false // skip the value of a stripped --listen
+	keepNext := false // pass through the value of a valued flag verbatim
+	for _, a := range extraArgs {
 		if skipNext {
 			skipNext = false
+			continue
+		}
+		if keepNext {
+			keepNext = false
+			cleaned = append(cleaned, a)
 			continue
 		}
 		lower := strings.ToLower(a)
@@ -858,13 +896,14 @@ func sanitizeCodexAppServerExtraArgs(extraArgs []string) []string {
 		case lower == "--listen":
 			// `--listen ws://...` would swap us onto WebSocket transport,
 			// breaking the JSONL-over-stdio contract this manager assumes.
-			// Drop the flag and its value.
-			if i+1 < len(extraArgs) {
-				skipNext = true
-			}
+			// Drop the flag and its value (skipNext is harmless if it's last).
+			skipNext = true
 			continue
 		case strings.HasPrefix(lower, "--listen="):
 			continue
+		}
+		if valuedFlags[lower] {
+			keepNext = true
 		}
 		cleaned = append(cleaned, a)
 	}
