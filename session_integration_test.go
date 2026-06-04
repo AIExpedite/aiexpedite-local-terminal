@@ -128,6 +128,13 @@ func runMockCLI(mode string) {
 	case "codex-appserver-echo":
 		runMockCodexAppServer()
 
+	case "codex-appserver-bad-frame":
+		// Emit a single non-JSON stdout line to exercise the
+		// `codex_appserver_error` surfacing path, then exit cleanly. Used by
+		// TestCodexAppServerLifecycle_ForwardsBadFrameAsError.
+		fmt.Println("this is not json")
+		os.Exit(0)
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown TEST_MOCK_CLI_MODE: %s\n", mode)
 		os.Exit(1)

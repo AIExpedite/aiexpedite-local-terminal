@@ -171,12 +171,20 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 		return fmt.Errorf("publishFn is required")
 	}
 
+	// Hold the manager mutex across the entire spawn so two concurrent Start
+	// calls for the same id can't both pass the existence check and double-
+	// spawn (the previous check-release-insert pattern had that TOCTOU race —
+	// the first session's process would be silently orphaned because the
+	// manager's map only kept the second). proc.Start() returns in tens of
+	// milliseconds, so serialising starts has no real cost. Mirrors
+	// SessionManager.StartSession in session.go which also holds its mutex
+	// across exec.Start.
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if _, exists := m.sessions[id]; exists {
-		m.mu.Unlock()
 		return fmt.Errorf("codex app-server session %s already exists", id)
 	}
-	m.mu.Unlock()
 
 	executable := resolveExecutable("codex")
 	args := buildCodexAppServerArgs(extraArgs)
@@ -229,9 +237,7 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 		streamDone:  make(chan struct{}),
 	}
 
-	m.mu.Lock()
 	m.sessions[id] = session
-	m.mu.Unlock()
 
 	if proc.Process != nil {
 		globalProcessRegistry.Register(proc.Process.Pid, "codex-appserver:"+id)

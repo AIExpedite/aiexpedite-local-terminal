@@ -507,6 +507,87 @@ func TestCodexAppServerLifecycle_StartSendEnd(t *testing.T) {
 	}
 }
 
+// TestCodexAppServerLifecycle_ForwardsBadFrameAsError pins the documented
+// `codex_appserver_error` behaviour: when codex (or a buggy proxy) emits a
+// non-JSON line on stdout, the manager forwards it as a clearly-typed error
+// frame so the orchestrator can fail the in-flight call instead of treating
+// the protocol-violating line as a legitimate JSON-RPC message.
+func TestCodexAppServerLifecycle_ForwardsBadFrameAsError(t *testing.T) {
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	tmpDir := t.TempDir()
+	mockName := "codex"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	mockPath := filepath.Join(tmpDir, mockName)
+	if err := copyTestBinary(testExe, mockPath); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "codex-appserver-bad-frame")
+
+	m := NewCodexAppServerManager(nil)
+	id := fmt.Sprintf("badframe-test-%d", time.Now().UnixNano())
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	if err := m.Start(id, tmpDir, nil, "ws", "uid", publishFn); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Mock emits one non-JSON line then exits. Wait for codex_appserver_ended.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		ended := false
+		for _, msg := range captured {
+			if msg.Type == "codex_appserver_ended" {
+				ended = true
+				break
+			}
+		}
+		mu.Unlock()
+		if ended {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	sawError := false
+	for _, msg := range captured {
+		if msg.Type == "codex_appserver_error" && strings.Contains(msg.Output, "non-JSON frame") {
+			sawError = true
+			if msg.Status != "error" {
+				t.Errorf("expected Status=error on bad-frame surface; got %q", msg.Status)
+			}
+		}
+	}
+	if !sawError {
+		t.Errorf("expected `codex_appserver_error` surfacing the non-JSON frame; got types %v",
+			extractTypes(captured))
+	}
+}
+
+func extractTypes(msgs []resultMsg) []string {
+	out := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m.Type)
+	}
+	return out
+}
+
 func TestCodexAppServerLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	// Point PATH at an empty dir so resolveExecutable("codex") returns the
 	// literal "codex" which exec.Start cannot find.
