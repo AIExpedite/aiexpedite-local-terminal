@@ -540,14 +540,21 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 
 	// failSessionFatally surfaces a queue-stall diagnostic via a synchronous
 	// publish (bypassing the wedged queue) and kills the child so waitForExit
-	// publishes codex_appserver_ended. This is the documented failure mode
+	// publishes codex_appserver_ended. The publish MUST be synchronous: if
+	// we detached it to a goroutine, it would race with waitForExit's own
+	// async `codex_appserver_ended` publish, and the orchestrator could see
+	// `_ended` before `_error`, violating the "_ended is strictly last"
+	// invariant and closing the session without surfacing why it was
+	// force-killed. Blocking here for the publishFn timeout (~30 s) is
+	// acceptable — the session is already dying and the diagnostic is what
+	// makes the failure actionable. This is the documented failure mode
 	// when Pub/Sub stays unresponsive long enough that we'd otherwise have to
 	// drop a JSON-RPC frame.
 	failSessionFatally := func(reason string, droppedType string) {
 		fmt.Printf("%s[codex-appserver] Publish queue stalled for %s — failing session (dropped %s)%s\n",
 			colorRed, session.ID, droppedType, colorReset)
 		seq := atomic.AddInt64(&session.seq, 1)
-		go publishFn(resultMsg{
+		publishFn(resultMsg{
 			ID:          session.ID,
 			WorkspaceID: session.WorkspaceID,
 			UID:         session.UID,

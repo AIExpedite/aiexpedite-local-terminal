@@ -326,9 +326,10 @@ func TestCodexAppServerLifecycle_StallingPublisherTerminatesSession(t *testing.T
 
 	// publishFn: accept the first few frames, then block forever. This
 	// simulates a wedged Pub/Sub network and is enough to fill the bounded
-	// publish queue. The fatal-publish path uses `go publishFn(...)` (the
-	// fail-fast goroutine bypasses the wedged queue), so we capture those
-	// frames via a separate, non-blocking sink.
+	// publish queue. The fatal-publish path bypasses the wedged queue with a
+	// synchronous publishFn call (so `_error` is delivered before the
+	// downstream `_ended` can race ahead), so we capture those frames via a
+	// separate, non-blocking sink that always accepts them.
 	var captureMu sync.Mutex
 	var captured []resultMsg
 	const liveSlots = 2
@@ -340,10 +341,11 @@ func TestCodexAppServerLifecycle_StallingPublisherTerminatesSession(t *testing.T
 	defer close(stall)
 
 	publishFn := func(res resultMsg) {
-		// Fatal errors published via `go publishFn` arrive when the queue is
-		// already wedged. Allow ONE such error through unconditionally so the
-		// test can observe it even if normal live slots are exhausted. Other
-		// frames consume a "live" slot or block on stall.
+		// Fatal errors and the terminal `_ended` frame are published via the
+		// fail-fast path that bypasses the wedged queue. Accept them
+		// unconditionally so the test can observe them even when normal live
+		// slots are exhausted. Other frames consume a "live" slot or block on
+		// stall.
 		if res.Type == "codex_appserver_error" || res.Type == "codex_appserver_ended" {
 			captureMu.Lock()
 			captured = append(captured, res)
