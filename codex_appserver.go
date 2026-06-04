@@ -64,6 +64,27 @@ const (
 	// publishing `codex_appserver_ended`. Generous to avoid racing the last
 	// JSON-RPC response with the exit notification.
 	codexAppServerStreamDrainTimeout = 30 * time.Second
+
+	// codexAppServerMaxLifetime caps how long a session may stay open before
+	// CleanupStale ends it. Matches SessionManager's 6 h ceiling so an
+	// orchestrator crash can't leak codex children indefinitely (each child
+	// holds an OpenAI auth session that keeps billing).
+	codexAppServerMaxLifetime = 6 * time.Hour
+
+	// codexAppServerCleanupInterval is how often the stale cleanup goroutine
+	// scans for expired sessions.
+	codexAppServerCleanupInterval = 60 * time.Second
+
+	// codexAppServerPublishConcurrency caps the per-session pub/sub publish
+	// fan-out. Each publish can take up to 30 s on a slow network; running
+	// them serially would back-pressure the stdout pipe and stall codex.
+	// Mirrors the 5-slot semaphore used by session.go's stream batcher.
+	codexAppServerPublishConcurrency = 5
+
+	// codexAppServerPublishQueueTimeout drops a publish if no semaphore slot
+	// frees within this window — prevents goroutine buildup when Pub/Sub is
+	// fully wedged. Mirrors session.go's 5 s drop threshold.
+	codexAppServerPublishQueueTimeout = 5 * time.Second
 )
 
 /* --------------------------------------------------------------------------
@@ -329,6 +350,46 @@ func (m *CodexAppServerManager) ActiveCount() int {
 	return len(m.sessions)
 }
 
+// CleanupStale runs periodically to end sessions that exceed maxAge. Call as
+// a goroutine: `go m.CleanupStale(codexAppServerMaxLifetime)`. Without this,
+// an orchestrator crash that drops the `codex_appserver_end` signal would
+// leak codex children indefinitely — each child holds an OpenAI auth session
+// and keeps billing until the OS reaps the process. Mirrors
+// SessionManager.CleanupStale.
+func (m *CodexAppServerManager) CleanupStale(maxAge time.Duration) {
+	ticker := time.NewTicker(codexAppServerCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			m.endStaleSessions(maxAge)
+		case <-shutdownChan:
+			return
+		}
+	}
+}
+
+// endStaleSessions ends any session whose StartedAt is older than maxAge.
+// Split out from CleanupStale so it can be unit-tested without driving the
+// ticker.
+func (m *CodexAppServerManager) endStaleSessions(maxAge time.Duration) {
+	m.mu.RLock()
+	var staleIDs []string
+	for id, session := range m.sessions {
+		if time.Since(session.StartedAt) > maxAge {
+			staleIDs = append(staleIDs, id)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, id := range staleIDs {
+		fmt.Printf("%s[codex-appserver] Cleaning up stale session %s (exceeded %v)%s\n",
+			colorYellow, id, maxAge, colorReset)
+		_ = m.End(id)
+	}
+}
+
 // ShutdownAll ends every active session. Called during agent shutdown so
 // codex children don't outlive the agent and silently consume tokens.
 func (m *CodexAppServerManager) ShutdownAll() {
@@ -366,8 +427,40 @@ func (m *CodexAppServerManager) removeSession(id string) {
 // `codex_appserver_error` instead of being silently passed through), but the
 // original line text is forwarded verbatim — we never edit codex's wire
 // format.
+//
+// Publishing is fan-out async (mirroring session.go's stream batcher): each
+// publishFn call goes through a 5-slot semaphore so a slow Pub/Sub network
+// cannot back-pressure the stdout pipe and stall codex. The returned
+// asyncPublish + its waitgroup are exposed to waitForExit so the
+// `codex_appserver_ended` frame is published AFTER every queued message
+// frame — without that ordering, terminal-service would see exit before the
+// final JSON-RPC response and the orchestrator would receive a truncated
+// stream.
 func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publishFn PublishFunc) {
 	defer close(session.streamDone)
+
+	publishSem := make(chan struct{}, codexAppServerPublishConcurrency)
+	var publishWg sync.WaitGroup
+	// Wait for all in-flight publishes to settle before signalling streamDone.
+	// waitForExit blocks on streamDone before publishing `_ended`, so this
+	// chain preserves message ordering across the slow-network edge case.
+	defer publishWg.Wait()
+
+	asyncPublish := func(msg resultMsg) {
+		publishWg.Add(1)
+		select {
+		case publishSem <- struct{}{}:
+			go func() {
+				defer publishWg.Done()
+				defer func() { <-publishSem }()
+				publishFn(msg)
+			}()
+		case <-time.After(codexAppServerPublishQueueTimeout):
+			publishWg.Done()
+			fmt.Printf("%s[codex-appserver] Publish queue full, dropping frame for %s (type=%s)%s\n",
+				colorYellow, session.ID, msg.Type, colorReset)
+		}
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -395,7 +488,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 				// confused with a legitimate JSON-RPC frame.
 				fmt.Printf("%s[codex-appserver] Non-JSON stdout frame on %s: %v (line=%s)%s\n",
 					colorRed, session.ID, err, truncateString(trimmed, 200), colorReset)
-				publishFn(resultMsg{
+				asyncPublish(resultMsg{
 					ID:          session.ID,
 					WorkspaceID: session.WorkspaceID,
 					UID:         session.UID,
@@ -413,7 +506,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 				fmt.Printf("%s[codex-appserver] stdout[%d] %s: %s%s\n",
 					colorCyan, lineCount, session.ID, truncateString(trimmed, 200), colorReset)
 			}
-			publishFn(resultMsg{
+			asyncPublish(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,
 				UID:         session.UID,
@@ -448,7 +541,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			seq := atomic.AddInt64(&session.seq, 1)
 			fmt.Printf("%s[codex-appserver] stderr %s: %s%s\n",
 				colorYellow, session.ID, truncateString(line, 200), colorReset)
-			publishFn(resultMsg{
+			asyncPublish(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,
 				UID:         session.UID,

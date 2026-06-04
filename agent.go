@@ -261,6 +261,7 @@ func StartAgent(cfg *Config) {
 	// stream-json output).
 
 	globalCodexAppServerManager = NewCodexAppServerManager(cfg)
+	go globalCodexAppServerManager.CleanupStale(codexAppServerMaxLifetime)
 	fmt.Println("[aiexpedite] Codex app-server manager ready")
 
 	/* 3c. Begin gathering machine info for /auth/token uploads ------------ */

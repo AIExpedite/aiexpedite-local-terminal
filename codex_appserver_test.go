@@ -235,6 +235,50 @@ func TestCodexAppServerManager_StartRequiresIDAndPublish(t *testing.T) {
 }
 
 /* --------------------------------------------------------------------------
+   Stale-session cleanup
+   -------------------------------------------------------------------------- */
+
+// TestCodexAppServerManager_EndStaleSessions_OldOnly verifies the GC logic
+// that protects against orchestrator crashes leaking codex children — only
+// sessions older than maxAge get ended, and a session younger than maxAge
+// must survive.
+func TestCodexAppServerManager_EndStaleSessions_OldOnly(t *testing.T) {
+	m := NewCodexAppServerManager(nil)
+
+	now := time.Now()
+	old := &CodexAppServerSession{
+		ID:         "old",
+		StartedAt:  now.Add(-2 * time.Hour),
+		status:     "ended", // pre-mark as ended so End() short-circuits without touching pipes
+		done:       make(chan struct{}),
+		streamDone: make(chan struct{}),
+	}
+	close(old.done)
+	close(old.streamDone)
+	young := &CodexAppServerSession{
+		ID:         "young",
+		StartedAt:  now,
+		status:     "ended",
+		done:       make(chan struct{}),
+		streamDone: make(chan struct{}),
+	}
+	close(young.done)
+	close(young.streamDone)
+
+	m.sessions["old"] = old
+	m.sessions["young"] = young
+
+	m.endStaleSessions(30 * time.Minute)
+
+	if _, ok := m.sessions["old"]; ok {
+		t.Errorf("stale session `old` should have been removed; still present")
+	}
+	if _, ok := m.sessions["young"]; !ok {
+		t.Errorf("fresh session `young` should still be present; was removed")
+	}
+}
+
+/* --------------------------------------------------------------------------
    End-to-end lifecycle against a mock codex app-server
    -------------------------------------------------------------------------- */
 

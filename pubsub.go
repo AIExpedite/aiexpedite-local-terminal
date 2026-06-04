@@ -2290,6 +2290,31 @@ var globalCodexAppServerManager *CodexAppServerManager
    handleSessionCommand — routes session_* commands to the SessionManager
    -------------------------------------------------------------------------- */
 
+// newSessionPublishFn returns a PublishFunc that marshals each resultMsg and
+// publishes it via the supplied Pub/Sub topic. logPrefix is used in error
+// logs so the source ([session] vs. [codex-appserver]) stays distinguishable.
+//
+// Each publish uses a fresh context.Background() (not the sub.Receive
+// callback ctx) because the callback ctx is cancelled once the inbound
+// message is acked — which happens immediately after session_start returns,
+// while stream / session_ended frames are published for minutes afterward.
+// A cancelled context would silently drop every subsequent message.
+func newSessionPublishFn(topic *pubsub.Publisher, logPrefix string) PublishFunc {
+	return func(res resultMsg) {
+		data, err := json.Marshal(res)
+		if err != nil {
+			fmt.Printf("%s%s Failed to marshal result: %v%s\n", colorRed, logPrefix, err, colorReset)
+			return
+		}
+		pubCtx, pubCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, pubErr := topic.Publish(pubCtx, &pubsub.Message{Data: data}).Get(pubCtx)
+		pubCancel()
+		if pubErr != nil {
+			fmt.Printf("%s%s Failed to publish result: %v%s\n", colorRed, logPrefix, pubErr, colorReset)
+		}
+	}
+}
+
 // handleSessionCommand handles interactive session commands (session_*,
 // codex_appserver_*). It publishes results back via the provided Pub/Sub
 // topic.
@@ -2304,25 +2329,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		return
 	}
 
-	// Create a publish function that sends results via Pub/Sub.
-	// Use context.Background() rather than the sub.Receive callback ctx: the
-	// Pub/Sub library cancels that ctx once the message is acked, which happens
-	// immediately after session_start returns — but stream/prompt/session_ended
-	// messages are published for minutes afterward.  A cancelled context would
-	// silently drop every subsequent message.
-	publishFn := func(res resultMsg) {
-		data, err := json.Marshal(res)
-		if err != nil {
-			fmt.Printf("%s[session] Failed to marshal result: %v%s\n", colorRed, err, colorReset)
-			return
-		}
-		pubCtx, pubCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_, pubErr := topic.Publish(pubCtx, &pubsub.Message{Data: data}).Get(pubCtx)
-		pubCancel()
-		if pubErr != nil {
-			fmt.Printf("%s[session] Failed to publish result: %v%s\n", colorRed, pubErr, colorReset)
-		}
-	}
+	publishFn := newSessionPublishFn(topic, "[session]")
 
 	switch cmd.Type {
 	case "session_start":
@@ -2455,23 +2462,7 @@ func handleCodexAppServerCommand(ctx context.Context, topic *pubsub.Publisher, c
 		return
 	}
 
-	// Same context-isolation rule as handleSessionCommand: the sub.Receive
-	// callback context is cancelled after Ack, but codex_appserver_message
-	// frames keep flowing for minutes — so each publish gets a fresh
-	// background context with a per-call timeout.
-	publishFn := func(res resultMsg) {
-		data, err := json.Marshal(res)
-		if err != nil {
-			fmt.Printf("%s[codex-appserver] Failed to marshal result: %v%s\n", colorRed, err, colorReset)
-			return
-		}
-		pubCtx, pubCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_, pubErr := topic.Publish(pubCtx, &pubsub.Message{Data: data}).Get(pubCtx)
-		pubCancel()
-		if pubErr != nil {
-			fmt.Printf("%s[codex-appserver] Failed to publish result: %v%s\n", colorRed, pubErr, colorReset)
-		}
-	}
+	publishFn := newSessionPublishFn(topic, "[codex-appserver]")
 
 	switch cmd.Type {
 	case "codex_appserver_start":
