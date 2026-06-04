@@ -155,6 +155,11 @@ type MachineInfo struct {
 	DockerRunning     *bool                       `json:"dockerRunning,omitempty"` // pointer so JSON omits when probe didn't run; false = installed but daemon down
 	Shell             *shellInfo                  `json:"shell,omitempty"`
 	DetectedCliAgents map[string]detectedCLIAgent `json:"detectedCliAgents,omitempty"`
+	// CliAgents is the richer per-agent shape introduced with the CLI Agents
+	// tab — one entry per provider with account/plan/capacity metrics. The
+	// older DetectedCliAgents map stays for backward compatibility with the
+	// About-tab chip strip (legacy clients render it directly).
+	CliAgents []cliAgentUsage `json:"cliAgents,omitempty"`
 	Capabilities      *capabilitiesInfo           `json:"capabilities,omitempty"`
 	CollectedAt       string                      `json:"collectedAt,omitempty"`
 }
@@ -176,6 +181,17 @@ func GetMachineInfo() *MachineInfo {
 	machineInfoMu.RLock()
 	defer machineInfoMu.RUnlock()
 	return machineInfoCache
+}
+
+// RefreshMachineInfoNow runs a synchronous, off-cycle gather and updates the
+// cache. Triggered by the CLI Agents tab's manual refresh signal so operators
+// don't have to wait for the next 6h tick. Safe to call from any goroutine;
+// concurrent callers serialize through the cache lock.
+func RefreshMachineInfoNow() {
+	info := gatherMachineInfo()
+	machineInfoMu.Lock()
+	machineInfoCache = info
+	machineInfoMu.Unlock()
 }
 
 // StartMachineInfoGathering launches the background goroutine that
@@ -320,6 +336,10 @@ func gatherMachineInfo() *MachineInfo {
 	// init() augmented with /opt/homebrew/bin etc., so brew-installed
 	// agents are visible.
 	info.DetectedCliAgents = gatherCLIAgents()
+	// Richer per-provider utilization snapshot — feeds the CLI Agents tab.
+	// Stable order so byte-equal Firestore payloads produce a delta-skip on
+	// the terminal-service side rather than a write per gather cycle.
+	info.CliAgents = gatherCLIAgentUsage(info.DetectedCliAgents, time.Now())
 
 	// GPU — multi-adapter support; per-platform shell-out (system_profiler
 	// on macOS, WMI on Windows, nvidia-smi/lspci on Linux). Best-effort:

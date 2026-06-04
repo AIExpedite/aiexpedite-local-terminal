@@ -837,6 +837,22 @@ func runPubSubConnection(cfg *Config) error {
 		}
 		// ─────────────────────────────────────────────────────────────────
 
+		if cmd.Command == "__cli_usage_refresh__" {
+			// CLI Agents tab issues this to force an immediate re-gather of
+			// per-provider utilization. Off-cycle from the normal 6h machine-
+			// info loop so an operator clicking Refresh sees fresh data within
+			// the next /auth/token tick rather than waiting hours. Ack
+			// regardless — there is no caller waiting on a pubsub-side reply
+			// (the result flows back via the terminalAgent Firestore doc).
+			if IsOffline() {
+				m.Ack()
+				return
+			}
+			RefreshMachineInfoNow()
+			m.Ack()
+			return
+		}
+
 		// ─── Priority Ping Handler ───────────────────────────────────────
 		// Process pings BEFORE staleness/rate-limit/signature checks so that
 		// online-status pings are never delayed by a backlog of stale commands
