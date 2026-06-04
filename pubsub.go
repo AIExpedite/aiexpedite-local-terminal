@@ -169,12 +169,27 @@ func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string)
 		RejectionReason: reason,
 	}
 	// Session-routed commands need Type/SessionID set so the backend can
-	// correlate the rejection with the session document.
+	// correlate the rejection with the session document. The rejection Type
+	// is derived from cmd.Type so codex_appserver_* rejections (allowlist
+	// deny / stale / rate-limited / signature failure) come back labeled
+	// codex_appserver_error rather than the generic session_error — the
+	// orchestrator's codex IDE protocol handler can then route them without
+	// having to special-case SessionID prefixes.
 	if cmd.Type != "" && cmd.SessionID != "" {
-		res.Type = "session_error"
+		res.Type = rejectionResultType(cmd.Type)
 		res.SessionID = cmd.SessionID
 	}
 	return res
+}
+
+// rejectionResultType maps an inbound command Type to the result Type used
+// when the command is rejected. Centralised so adding a new family of
+// interactive commands only requires updating one switch.
+func rejectionResultType(cmdType string) string {
+	if isCodexAppServerCommand(cmdType) {
+		return "codex_appserver_error"
+	}
+	return "session_error"
 }
 
 /* --------------------------------------------------------------------------
@@ -965,80 +980,15 @@ func runPubSubConnection(cfg *Config) error {
 
 		// ─── Interactive Session Routing ─────────────────────────────────
 		// Route session_* and codex_appserver_* commands to their respective
-		// managers instead of shell execution.
+		// managers instead of shell execution. Long-running entry-point
+		// commands (session_start and codex_appserver_start) are gated
+		// through the allowlist + user approval dialog before dispatch; all
+		// other interactive commands (session_input / session_signal /
+		// session_end / codex_appserver_send / codex_appserver_end) flow
+		// through directly because they target an already-allowed session.
 		if cmd.Type != "" && cmd.Type != "execute" {
-			// codex_appserver_start is the JSON-RPC entry point — gate it
-			// through the allowlist using the same `codex app-server …` argv
-			// the manager will actually exec, so an admin who has whitelisted
-			// `codex *` (the default) gets app-server access for free without
-			// having to maintain a parallel allowlist for the new entry kind.
-			if cmd.Type == "codex_appserver_start" && cfg.EnableAllowList && defaultAllowList != nil {
-				appServerArgs := buildCodexAppServerArgs(cmd.Args)
-				if !defaultAllowList.IsAllowed("codex", appServerArgs) {
-					timeoutSec := cfg.ApprovalTimeoutSec
-					if timeoutSec <= 0 {
-						timeoutSec = 60
-					}
-					result := ShowCommandApprovalDialog("codex", appServerArgs, timeoutSec)
-					if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
-						result = ApprovalOnce
-					}
-					switch result {
-					case ApprovalDeny:
-						fmt.Printf("%s[aiexpedite] codex app-server start denied by user%s\n", colorYellow, colorReset)
-						res := makeRejectionResult(
-							cmd,
-							cfg.AgentID,
-							"denied",
-							"ALLOWLIST_DENIED",
-							"codex app-server denied by user: not in allow list",
-						)
-						if err := publishMsg(ctx, topic, res); err != nil {
-							m.Nack()
-						} else {
-							m.Ack()
-						}
-						return
-					case ApprovalAlways:
-						pattern := GeneratePatternFromCommand("codex", appServerArgs)
-						if err := defaultAllowList.AddPattern(pattern); err != nil {
-							fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
-						}
-					}
-				}
-			}
-			// Apply allowlist to session_start (same rules as execute commands)
-			if cmd.Type == "session_start" && cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
-				timeoutSec := cfg.ApprovalTimeoutSec
-				if timeoutSec <= 0 {
-					timeoutSec = 60
-				}
-				result := ShowCommandApprovalDialog(cmd.Command, cmd.Args, timeoutSec)
-				if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
-					result = ApprovalOnce
-				}
-				switch result {
-				case ApprovalDeny:
-					fmt.Printf("%s[aiexpedite] Session command denied by user%s\n", colorYellow, colorReset)
-					res := makeRejectionResult(
-						cmd,
-						cfg.AgentID,
-						"denied",
-						"ALLOWLIST_DENIED",
-						"Command denied by user: not in allow list",
-					)
-					if err := publishMsg(ctx, topic, res); err != nil {
-						m.Nack()
-					} else {
-						m.Ack()
-					}
-					return
-				case ApprovalAlways:
-					pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
-					if err := defaultAllowList.AddPattern(pattern); err != nil {
-						fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
-					}
-				}
+			if proceed := gateSessionEntryCommand(ctx, topic, m, cmd, cfg); !proceed {
+				return
 			}
 			handleSessionCommand(ctx, topic, cmd)
 			m.Ack()
@@ -2289,6 +2239,80 @@ var globalCodexAppServerManager *CodexAppServerManager
 /* --------------------------------------------------------------------------
    handleSessionCommand — routes session_* commands to the SessionManager
    -------------------------------------------------------------------------- */
+
+// gateSessionEntryCommand applies the allowlist + user-approval dialog flow
+// to the long-running entry-point commands (session_start and
+// codex_appserver_start). For all other interactive commands it is a no-op
+// pass-through — those target an already-allowed session and don't need to
+// re-prompt.
+//
+// Returns true if processing should continue (handleSessionCommand should
+// dispatch), false if a rejection has already been published and the inbound
+// pub/sub message has been acked. Centralising this here removes the
+// 40-line duplicate block that used to live inline for each entry kind.
+func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pubsub.Message, cmd commandMsg, cfg *Config) bool {
+	if !cfg.EnableAllowList || defaultAllowList == nil {
+		return true
+	}
+
+	var allowCommand string
+	var allowArgs []string
+	var denyOutput string
+
+	switch cmd.Type {
+	case "session_start":
+		allowCommand = cmd.Command
+		allowArgs = cmd.Args
+		denyOutput = "Command denied by user: not in allow list"
+	case "codex_appserver_start":
+		// Gate against the synthesised `codex app-server …` argv the manager
+		// will actually exec so the default `codex *` allowlist entry covers
+		// app-server access without operators having to maintain a parallel
+		// allowlist for the new entry kind.
+		allowCommand = "codex"
+		allowArgs = buildCodexAppServerArgs(cmd.Args)
+		denyOutput = "codex app-server denied by user: not in allow list"
+	default:
+		// Mid-session interactive commands don't re-prompt.
+		return true
+	}
+
+	if defaultAllowList.IsAllowed(allowCommand, allowArgs) {
+		return true
+	}
+
+	timeoutSec := cfg.ApprovalTimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = 60
+	}
+	result := ShowCommandApprovalDialog(allowCommand, allowArgs, timeoutSec)
+	if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
+		result = ApprovalOnce
+	}
+	switch result {
+	case ApprovalDeny:
+		fmt.Printf("%s[aiexpedite] %s denied by user%s\n", colorYellow, cmd.Type, colorReset)
+		res := makeRejectionResult(
+			cmd,
+			cfg.AgentID,
+			"denied",
+			"ALLOWLIST_DENIED",
+			denyOutput,
+		)
+		if err := publishMsg(ctx, topic, res); err != nil {
+			m.Nack()
+		} else {
+			m.Ack()
+		}
+		return false
+	case ApprovalAlways:
+		pattern := GeneratePatternFromCommand(allowCommand, allowArgs)
+		if err := defaultAllowList.AddPattern(pattern); err != nil {
+			fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
+		}
+	}
+	return true
+}
 
 // newSessionPublishFn returns a PublishFunc that marshals each resultMsg and
 // publishes it via the supplied Pub/Sub topic. logPrefix is used in error
