@@ -218,7 +218,7 @@ func TestCodexAppServerManager_StartRejectsDuplicateID(t *testing.T) {
 	m.sessions[id] = &CodexAppServerSession{ID: id, status: "running", done: make(chan struct{}), streamDone: make(chan struct{})}
 
 	publishFn := func(resultMsg) {}
-	err := m.Start(id, "", nil, "ws", "uid", publishFn)
+	err := m.Start(id, t.TempDir(), nil, "ws", "uid", publishFn)
 	if err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("expected `already exists` error; got %v", err)
 	}
@@ -226,17 +226,177 @@ func TestCodexAppServerManager_StartRejectsDuplicateID(t *testing.T) {
 
 func TestCodexAppServerManager_StartRequiresIDAndPublish(t *testing.T) {
 	m := NewCodexAppServerManager()
-	if err := m.Start("", "", nil, "ws", "uid", func(resultMsg) {}); err == nil {
+	cwd := t.TempDir()
+	if err := m.Start("", cwd, nil, "ws", "uid", func(resultMsg) {}); err == nil {
 		t.Fatalf("expected error for empty sessionID")
 	}
-	if err := m.Start("x", "", nil, "ws", "uid", nil); err == nil {
+	if err := m.Start("x", cwd, nil, "ws", "uid", nil); err == nil {
 		t.Fatalf("expected error for nil publishFn")
+	}
+}
+
+// TestCodexAppServerManager_StartRequiresValidCwd pins the cwd validation —
+// missing/relative/non-existent cwd must all reject before any process is
+// spawned, so a malformed orchestrator command can't accidentally launch
+// codex against the agent's process working directory and edit unintended
+// files (e.g. C:\Program Files\AI Expedite on Windows).
+func TestCodexAppServerManager_StartRequiresValidCwd(t *testing.T) {
+	m := NewCodexAppServerManager()
+	publishFn := func(resultMsg) {}
+
+	t.Run("empty_cwd_rejected", func(t *testing.T) {
+		err := m.Start("a", "", nil, "ws", "uid", publishFn)
+		if err == nil || !strings.Contains(err.Error(), "cwd is required") {
+			t.Fatalf("expected `cwd is required` error; got %v", err)
+		}
+	})
+
+	t.Run("relative_cwd_rejected", func(t *testing.T) {
+		err := m.Start("b", "./relative/path", nil, "ws", "uid", publishFn)
+		if err == nil || !strings.Contains(err.Error(), "absolute path") {
+			t.Fatalf("expected `absolute path` error; got %v", err)
+		}
+	})
+
+	t.Run("missing_dir_rejected", func(t *testing.T) {
+		// Use an absolute path that almost certainly does not exist.
+		missing := filepath.Join(t.TempDir(), "definitely-missing-dir-xyz123")
+		err := m.Start("c", missing, nil, "ws", "uid", publishFn)
+		if err == nil || !strings.Contains(err.Error(), "not accessible") {
+			t.Fatalf("expected `not accessible` error; got %v", err)
+		}
+	})
+
+	t.Run("file_instead_of_dir_rejected", func(t *testing.T) {
+		// Create a regular file and try to use its path as cwd.
+		dir := t.TempDir()
+		filePath := filepath.Join(dir, "afile.txt")
+		if err := os.WriteFile(filePath, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+		err := m.Start("d", filePath, nil, "ws", "uid", publishFn)
+		if err == nil || !strings.Contains(err.Error(), "not a directory") {
+			t.Fatalf("expected `not a directory` error; got %v", err)
+		}
+	})
+
+	if m.ActiveCount() != 0 {
+		t.Errorf("no session should have been registered after rejected Start calls; got %d", m.ActiveCount())
 	}
 }
 
 /* --------------------------------------------------------------------------
    Stale-session cleanup
    -------------------------------------------------------------------------- */
+
+// TestCodexAppServerLifecycle_StallingPublisherTerminatesSession exercises
+// the never-drop policy: a Pub/Sub publisher that blocks indefinitely must
+// not cause stdout frames to be dropped silently — the manager has to
+// publish a codex_appserver_error surface and force-kill the child so the
+// orchestrator sees a clear failure instead of a silently-truncated stream.
+//
+// Pretty heavy test (drives a real mock CLI and relies on the
+// codexAppServerEnqueueTimeout cap), so we shrink the cap via a build-tag-
+// free swap pattern: we override the constants through the public package
+// vars used in production. Because the constants ARE constants here, we
+// instead point the mock at a tight "echo many frames" mode and assert the
+// fatal error surface is published.
+func TestCodexAppServerLifecycle_StallingPublisherTerminatesSession(t *testing.T) {
+	// Build a publishFn that blocks forever after a handful of messages so
+	// the queue fills, then assert we see codex_appserver_error indicating
+	// the queue stalled.
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	tmpDir := t.TempDir()
+	mockName := "codex"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	mockPath := filepath.Join(tmpDir, mockName)
+	if err := copyTestBinary(testExe, mockPath); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "codex-appserver-burst")
+
+	m := NewCodexAppServerManager()
+	id := fmt.Sprintf("stall-test-%d", time.Now().UnixNano())
+
+	// publishFn: accept the first few frames, then block forever. This
+	// simulates a wedged Pub/Sub network and is enough to fill the bounded
+	// publish queue. The fatal-publish path uses `go publishFn(...)` (the
+	// fail-fast goroutine bypasses the wedged queue), so we capture those
+	// frames via a separate, non-blocking sink.
+	var captureMu sync.Mutex
+	var captured []resultMsg
+	const liveSlots = 2
+	live := make(chan struct{}, liveSlots)
+	for i := 0; i < liveSlots; i++ {
+		live <- struct{}{}
+	}
+	stall := make(chan struct{})
+	defer close(stall)
+
+	publishFn := func(res resultMsg) {
+		// Fatal errors published via `go publishFn` arrive when the queue is
+		// already wedged. Allow ONE such error through unconditionally so the
+		// test can observe it even if normal live slots are exhausted. Other
+		// frames consume a "live" slot or block on stall.
+		if res.Type == "codex_appserver_error" || res.Type == "codex_appserver_ended" {
+			captureMu.Lock()
+			captured = append(captured, res)
+			captureMu.Unlock()
+			return
+		}
+		select {
+		case <-live:
+			captureMu.Lock()
+			captured = append(captured, res)
+			captureMu.Unlock()
+		case <-stall:
+		}
+	}
+
+	if err := m.Start(id, tmpDir, nil, "ws", "uid", publishFn); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Wait up to enqueue timeout + a margin for the fatal escalation to fire.
+	deadline := time.Now().Add(codexAppServerEnqueueTimeout + 15*time.Second)
+	for time.Now().Before(deadline) {
+		captureMu.Lock()
+		sawFatal := false
+		for _, msg := range captured {
+			if msg.Type == "codex_appserver_error" && strings.Contains(msg.Output, "queue stalled") {
+				sawFatal = true
+				break
+			}
+		}
+		captureMu.Unlock()
+		if sawFatal {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	captureMu.Lock()
+	defer captureMu.Unlock()
+	sawFatal := false
+	for _, msg := range captured {
+		if msg.Type == "codex_appserver_error" && strings.Contains(msg.Output, "queue stalled") {
+			sawFatal = true
+		}
+	}
+	if !sawFatal {
+		types := make([]string, 0, len(captured))
+		for _, msg := range captured {
+			types = append(types, msg.Type)
+		}
+		t.Errorf("expected fatal `codex_appserver_error` with `queue stalled`; got types=%v", types)
+	}
+}
 
 // TestCodexAppServerManager_EndStaleSessions_OldOnly verifies the GC logic
 // that protects against orchestrator crashes leaking codex children — only

@@ -36,6 +36,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,16 +76,25 @@ const (
 	// scans for expired sessions.
 	codexAppServerCleanupInterval = 60 * time.Second
 
-	// codexAppServerPublishConcurrency caps the per-session pub/sub publish
-	// fan-out. Each publish can take up to 30 s on a slow network; running
-	// them serially would back-pressure the stdout pipe and stall codex.
-	// Mirrors the 5-slot semaphore used by session.go's stream batcher.
-	codexAppServerPublishConcurrency = 5
+	// codexAppServerPublishQueueSize bounds the per-session publish backlog.
+	// Frames are enqueued in order and drained by a single publisher
+	// goroutine, so codex stays decoupled from Pub/Sub latency without
+	// risking reordering — unlike session.go's stream batcher, which is free
+	// to drop unstructured stream chunks under overload, every codex
+	// app-server frame is a stateful JSON-RPC message (request id, turn
+	// completion, approval request). Losing one corrupts the session. If the
+	// backlog fills the publisher is too slow to keep up; we surface a
+	// fatal error and kill the child rather than silently dropping (see
+	// codexAppServerEnqueueTimeout below).
+	codexAppServerPublishQueueSize = 256
 
-	// codexAppServerPublishQueueTimeout drops a publish if no semaphore slot
-	// frees within this window — prevents goroutine buildup when Pub/Sub is
-	// fully wedged. Mirrors session.go's 5 s drop threshold.
-	codexAppServerPublishQueueTimeout = 5 * time.Second
+	// codexAppServerEnqueueTimeout is the upper bound for the stream readers
+	// to wait when the publish queue is full. Hitting this means Pub/Sub has
+	// stalled for a sustained period; the session cannot continue safely
+	// (silently dropped frames would break the JSON-RPC state machine on the
+	// orchestrator), so the manager publishes a `codex_appserver_error`
+	// surface and force-kills the child to fail-fast.
+	codexAppServerEnqueueTimeout = 30 * time.Second
 )
 
 /* --------------------------------------------------------------------------
@@ -165,6 +175,24 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 	}
 	if publishFn == nil {
 		return fmt.Errorf("publishFn is required")
+	}
+
+	// cwd is required and must point at an existing directory. Falling back
+	// to the agent's working directory would silently run codex against a
+	// surprise path (e.g. C:\Program Files\AI Expedite on Windows), exposing
+	// or editing files unrelated to the requested workspace. session.go's
+	// session_start handler accepts an empty cwd because legacy CLI agents
+	// did, but the IDE/app-server path is new and can require it.
+	if cwd == "" {
+		return fmt.Errorf("cwd is required for codex app-server (must point at a workspace directory)")
+	}
+	if !filepath.IsAbs(cwd) {
+		return fmt.Errorf("cwd must be an absolute path; got %q", cwd)
+	}
+	if info, err := os.Stat(cwd); err != nil {
+		return fmt.Errorf("cwd %q is not accessible: %w", cwd, err)
+	} else if !info.IsDir() {
+		return fmt.Errorf("cwd %q is not a directory", cwd)
 	}
 
 	// Hold the manager mutex across the entire spawn so two concurrent Start
@@ -252,6 +280,13 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 // that the payload is parseable JSON and contains no embedded newlines (which
 // would corrupt the JSONL framing on the wire) but never edits its content,
 // so callers retain exact control over JSON-RPC ids and method names.
+//
+// Timeout policy is fail-fast: on stdin write timeout the manager kills the
+// child and closes stdin BEFORE returning. This guarantees no later Send can
+// race with the abandoned write goroutine — the next Send sees Status=ended
+// and rejects, and the orphaned write (if it ever wakes up) lands on a closed
+// pipe. Without that guarantee, two timed-out Sends could interleave their
+// JSON-RPC frames on the wire and break request/response correlation.
 func (m *CodexAppServerManager) Send(id string, payload string) error {
 	session := m.Get(id)
 	if session == nil {
@@ -270,12 +305,15 @@ func (m *CodexAppServerManager) Send(id string, payload string) error {
 		return fmt.Errorf("payload is not valid JSON: %w", err)
 	}
 
+	session.stdinMu.Lock()
+	defer session.stdinMu.Unlock()
+
+	// Re-check Status under stdinMu so we cannot pass the gate after another
+	// goroutine has already started tearing the session down via End() or
+	// the timeout-fail path below.
 	if session.Status() == "ended" {
 		return fmt.Errorf("codex app-server session %s has ended", id)
 	}
-
-	session.stdinMu.Lock()
-	defer session.stdinMu.Unlock()
 
 	writeDone := make(chan error, 1)
 	go func() {
@@ -288,7 +326,20 @@ func (m *CodexAppServerManager) Send(id string, payload string) error {
 			return fmt.Errorf("failed to write to codex app-server session %s stdin: %w", id, err)
 		}
 	case <-time.After(codexAppServerStdinWriteTimeout):
-		return fmt.Errorf("timeout writing to codex app-server session %s stdin (pipe buffer full)", id)
+		// Fatal: a stalled write is a signal that codex isn't draining stdin.
+		// Continuing would let the next Send acquire stdinMu and interleave
+		// its frame with the abandoned write's eventual completion. Close
+		// stdin to unblock the abandoned goroutine immediately, transition
+		// to "ended" so concurrent/subsequent Sends short-circuit, and kill
+		// the child so waitForExit publishes codex_appserver_ended.
+		session.closeStdin()
+		session.mu.Lock()
+		session.status = "ended"
+		session.mu.Unlock()
+		if session.Process != nil && session.Process.Process != nil {
+			_ = session.Process.Process.Kill()
+		}
+		return fmt.Errorf("timeout writing to codex app-server session %s stdin — session terminated to prevent frame interleave", id)
 	}
 
 	fmt.Printf("%s[codex-appserver] → %s (%d bytes)%s\n",
@@ -429,37 +480,73 @@ func (m *CodexAppServerManager) removeSession(id string) {
 // original line text is forwarded verbatim — we never edit codex's wire
 // format.
 //
-// Publishing is fan-out async (mirroring session.go's stream batcher): each
-// publishFn call goes through a 5-slot semaphore so a slow Pub/Sub network
-// cannot back-pressure the stdout pipe and stall codex. The returned
-// asyncPublish + its waitgroup are exposed to waitForExit so the
-// `codex_appserver_ended` frame is published AFTER every queued message
-// frame — without that ordering, terminal-service would see exit before the
-// final JSON-RPC response and the orchestrator would receive a truncated
-// stream.
+// Publishing uses a single ordered consumer goroutine that drains a bounded
+// queue. Every frame in the Codex IDE stdio protocol is a stateful JSON-RPC
+// message (a response correlated by id, a turn-completion notification, an
+// approval request); silently dropping one would corrupt the orchestrator's
+// session state. So:
+//   - Frames are NEVER reordered or dropped under normal operation.
+//   - If Pub/Sub stalls for codexAppServerEnqueueTimeout while the queue is
+//     full, the manager publishes a fatal codex_appserver_error and force-
+//     kills the child. Failing-fast is the only safe response: continuing
+//     with dropped frames produces silently-broken sessions.
 func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publishFn PublishFunc) {
 	defer close(session.streamDone)
 
-	publishSem := make(chan struct{}, codexAppServerPublishConcurrency)
-	var publishWg sync.WaitGroup
-	// Wait for all in-flight publishes to settle before signalling streamDone.
-	// waitForExit blocks on streamDone before publishing `_ended`, so this
-	// chain preserves message ordering across the slow-network edge case.
-	defer publishWg.Wait()
+	// Single ordered publisher goroutine. Buffered channel preserves arrival
+	// order across goroutines; the publisher drains serially so Pub/Sub
+	// retries cannot reorder frames either.
+	queue := make(chan resultMsg, codexAppServerPublishQueueSize)
+	publisherDone := make(chan struct{})
+	go func() {
+		defer close(publisherDone)
+		for msg := range queue {
+			publishFn(msg)
+		}
+	}()
+	// Close queue after both scanners finish so the publisher goroutine drains
+	// every remaining frame before signalling streamDone.
+	defer func() {
+		close(queue)
+		<-publisherDone
+	}()
 
-	asyncPublish := func(msg resultMsg) {
-		publishWg.Add(1)
+	// enqueue blocks up to codexAppServerEnqueueTimeout for queue space.
+	// Returns false if the queue is wedged — caller MUST treat that as
+	// session-fatal and stop reading (further reads can't be published in
+	// order anyway, and dropping silently breaks the JSON-RPC contract).
+	enqueue := func(msg resultMsg) bool {
 		select {
-		case publishSem <- struct{}{}:
-			go func() {
-				defer publishWg.Done()
-				defer func() { <-publishSem }()
-				publishFn(msg)
-			}()
-		case <-time.After(codexAppServerPublishQueueTimeout):
-			publishWg.Done()
-			fmt.Printf("%s[codex-appserver] Publish queue full, dropping frame for %s (type=%s)%s\n",
-				colorYellow, session.ID, msg.Type, colorReset)
+		case queue <- msg:
+			return true
+		case <-time.After(codexAppServerEnqueueTimeout):
+			return false
+		}
+	}
+
+	// failSessionFatally surfaces a queue-stall diagnostic via a synchronous
+	// publish (bypassing the wedged queue) and kills the child so waitForExit
+	// publishes codex_appserver_ended. This is the documented failure mode
+	// when Pub/Sub stays unresponsive long enough that we'd otherwise have to
+	// drop a JSON-RPC frame.
+	failSessionFatally := func(reason string, droppedType string) {
+		fmt.Printf("%s[codex-appserver] Publish queue stalled for %s — failing session (dropped %s)%s\n",
+			colorRed, session.ID, droppedType, colorReset)
+		seq := atomic.AddInt64(&session.seq, 1)
+		go publishFn(resultMsg{
+			ID:          session.ID,
+			WorkspaceID: session.WorkspaceID,
+			UID:         session.UID,
+			Output:      reason,
+			Status:      "error",
+			Ts:          time.Now().UnixMilli(),
+			Version:     Version,
+			Type:        "codex_appserver_error",
+			SessionID:   session.ID,
+			Seq:         int(seq),
+		})
+		if session.Process != nil && session.Process.Process != nil {
+			_ = session.Process.Process.Kill()
 		}
 	}
 
@@ -489,7 +576,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 				// confused with a legitimate JSON-RPC frame.
 				fmt.Printf("%s[codex-appserver] Non-JSON stdout frame on %s: %v (line=%s)%s\n",
 					colorRed, session.ID, err, truncateString(trimmed, 200), colorReset)
-				asyncPublish(resultMsg{
+				if !enqueue(resultMsg{
 					ID:          session.ID,
 					WorkspaceID: session.WorkspaceID,
 					UID:         session.UID,
@@ -500,14 +587,17 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 					Type:        "codex_appserver_error",
 					SessionID:   session.ID,
 					Seq:         int(seq),
-				})
+				}) {
+					failSessionFatally("codex app-server publish queue stalled — terminating session to avoid dropping JSON-RPC frames", "codex_appserver_error")
+					return
+				}
 				continue
 			}
 			if lineCount <= 3 {
 				fmt.Printf("%s[codex-appserver] stdout[%d] %s: %s%s\n",
 					colorCyan, lineCount, session.ID, truncateString(trimmed, 200), colorReset)
 			}
-			asyncPublish(resultMsg{
+			if !enqueue(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,
 				UID:         session.UID,
@@ -518,7 +608,10 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 				Type:        "codex_appserver_message",
 				SessionID:   session.ID,
 				Seq:         int(seq),
-			})
+			}) {
+				failSessionFatally("codex app-server publish queue stalled — terminating session to avoid dropping JSON-RPC frames", "codex_appserver_message")
+				return
+			}
 		}
 		if err := scanner.Err(); err != nil {
 			fmt.Printf("%s[codex-appserver] stdout scanner error for %s: %v%s\n",
@@ -542,7 +635,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			seq := atomic.AddInt64(&session.seq, 1)
 			fmt.Printf("%s[codex-appserver] stderr %s: %s%s\n",
 				colorYellow, session.ID, truncateString(line, 200), colorReset)
-			asyncPublish(resultMsg{
+			if !enqueue(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,
 				UID:         session.UID,
@@ -553,7 +646,10 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 				Type:        "codex_appserver_stderr",
 				SessionID:   session.ID,
 				Seq:         int(seq),
-			})
+			}) {
+				failSessionFatally("codex app-server publish queue stalled — terminating session to avoid dropping stderr frames", "codex_appserver_stderr")
+				return
+			}
 		}
 		if err := scanner.Err(); err != nil {
 			fmt.Printf("%s[codex-appserver] stderr scanner error for %s: %v%s\n",

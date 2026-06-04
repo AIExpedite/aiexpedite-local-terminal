@@ -135,6 +135,19 @@ func runMockCLI(mode string) {
 		fmt.Println("this is not json")
 		os.Exit(0)
 
+	case "codex-appserver-burst":
+		// Emit a burst of JSON-RPC frames much larger than
+		// codexAppServerPublishQueueSize, then keep going to keep the
+		// publish queue saturated. Used by
+		// TestCodexAppServerLifecycle_StallingPublisherTerminatesSession
+		// — when the publisher stalls, the manager must surface a fatal
+		// codex_appserver_error and kill us rather than dropping frames.
+		for i := 0; i < 4000; i++ {
+			fmt.Printf(`{"jsonrpc":"2.0","method":"item/started","params":{"item":{"i":%d}}}`+"\n", i)
+		}
+		// Block until killed.
+		select {}
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown TEST_MOCK_CLI_MODE: %s\n", mode)
 		os.Exit(1)
