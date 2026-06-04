@@ -51,17 +51,31 @@ const (
 	// are session-fatal (see codexAppServerMaxFrameSize below).
 	codexAppServerMaxLineSize = 30 * 1024 * 1024
 
-	// codexAppServerMaxFrameSize is the largest stdout frame that can be
-	// published through Pub/Sub. Pub/Sub's hard ceiling is 10 MB; we cap at
-	// 8 MB so the resultMsg envelope overhead (workspaceID, sessionID,
-	// timestamps, JSON keys, …) plus the Output field stays under that
-	// ceiling. Frames exceeding this cap are session-fatal: silently
-	// dropping one would break the orchestrator's JSON-RPC state machine
-	// (it would wait forever for a response that never arrives), so the
-	// scanner publishes a fatal `codex_appserver_error` and kills the
-	// child via failSessionFatally. Addresses Finding #4 from the
-	// secondary review.
+	// codexAppServerMaxFrameSize is a cheap pre-check on the raw stdout line.
+	// Frames bigger than this cannot possibly fit Pub/Sub's 10 MB envelope
+	// even before JSON escaping, so we reject them without paying the cost of
+	// building/marshaling a resultMsg. The authoritative gate is
+	// codexAppServerMaxPublishSize below: the Output field is JSON-string-
+	// escaped on marshal, and a frame heavy in '"' / '\' can roughly double
+	// in size, so a line that passes this pre-check can still fail the
+	// marshaled-envelope check. Frames that fail either check are session-
+	// fatal — silently dropping one would deadlock the orchestrator's
+	// JSON-RPC state machine waiting for a response that never arrives.
+	// Addresses Finding #4 (raw cap) and the follow-up escape-amplification
+	// finding from the secondary review.
 	codexAppServerMaxFrameSize = 8 * 1024 * 1024
+
+	// codexAppServerMaxPublishSize is GCP Pub/Sub's documented per-message
+	// publish limit (10_000_000 bytes). After building each resultMsg, the
+	// stream reader marshals it and rejects envelopes that exceed this
+	// ceiling — that catches the case where Codex emits a frame whose raw
+	// bytes are under codexAppServerMaxFrameSize but whose JSON-string-
+	// escaped Output field marshals beyond what Pub/Sub will accept. A
+	// silently-rejected publish would leave the orchestrator waiting for a
+	// JSON-RPC response that never arrives, so oversize envelopes trigger
+	// the same fail-fast (`codex_appserver_error` + kill child) as oversize
+	// raw frames.
+	codexAppServerMaxPublishSize = 10_000_000
 
 	// codexAppServerStdinWriteTimeout is the upper bound on a single stdin
 	// write before we declare the pipe stalled. Matches session.go's
@@ -571,6 +585,43 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 		}
 	}
 
+	// publishOrFail is the single gate for non-fatal stream frames. It
+	// marshals msg first so we can verify the resulting envelope fits
+	// Pub/Sub's 10 MB ceiling (the raw-line pre-check above can pass while
+	// JSON-string escaping doubles a frame heavy in '"' / '\' beyond what
+	// Pub/Sub will accept). On either an oversize envelope or a stalled
+	// publish queue it triggers failSessionFatally and returns false so the
+	// scanner stops — silently continuing would risk dropping subsequent
+	// JSON-RPC frames the orchestrator is correlating against. The double-
+	// marshal (here and again in newSessionPublishFn) is the price of
+	// keeping PublishFunc's signature unchanged; marshaling a sub-10 MB
+	// envelope is cheap relative to the session-fatal cost of a silent drop.
+	publishOrFail := func(msg resultMsg, droppedType string) bool {
+		encoded, err := json.Marshal(msg)
+		if err != nil {
+			failSessionFatally(
+				fmt.Sprintf("codex app-server envelope failed to marshal: %v — session terminated", err),
+				droppedType,
+			)
+			return false
+		}
+		if len(encoded) > codexAppServerMaxPublishSize {
+			failSessionFatally(
+				fmt.Sprintf(
+					"codex app-server envelope marshaled to %d bytes after JSON escaping, exceeding the %d-byte publishable limit — session terminated to avoid silent Pub/Sub rejection",
+					len(encoded), codexAppServerMaxPublishSize,
+				),
+				droppedType,
+			)
+			return false
+		}
+		if !enqueue(msg) {
+			failSessionFatally("codex app-server publish queue stalled — terminating session to avoid dropping JSON-RPC frames", droppedType)
+			return false
+		}
+		return true
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -617,7 +668,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 				// confused with a legitimate JSON-RPC frame.
 				fmt.Printf("%s[codex-appserver] Non-JSON stdout frame on %s: %v (line=%s)%s\n",
 					colorRed, session.ID, err, truncateString(trimmed, 200), colorReset)
-				if !enqueue(resultMsg{
+				if !publishOrFail(resultMsg{
 					ID:          session.ID,
 					WorkspaceID: session.WorkspaceID,
 					UID:         session.UID,
@@ -628,8 +679,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 					Type:        "codex_appserver_error",
 					SessionID:   session.ID,
 					Seq:         int(seq),
-				}) {
-					failSessionFatally("codex app-server publish queue stalled — terminating session to avoid dropping JSON-RPC frames", "codex_appserver_error")
+				}, "codex_appserver_error") {
 					return
 				}
 				continue
@@ -638,7 +688,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 				fmt.Printf("%s[codex-appserver] stdout[%d] %s: %s%s\n",
 					colorCyan, lineCount, session.ID, truncateString(trimmed, 200), colorReset)
 			}
-			if !enqueue(resultMsg{
+			if !publishOrFail(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,
 				UID:         session.UID,
@@ -649,8 +699,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 				Type:        "codex_appserver_message",
 				SessionID:   session.ID,
 				Seq:         int(seq),
-			}) {
-				failSessionFatally("codex app-server publish queue stalled — terminating session to avoid dropping JSON-RPC frames", "codex_appserver_message")
+			}, "codex_appserver_message") {
 				return
 			}
 		}
@@ -685,7 +734,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			seq := atomic.AddInt64(&session.seq, 1)
 			fmt.Printf("%s[codex-appserver] stderr %s: %s%s\n",
 				colorYellow, session.ID, truncateString(line, 200), colorReset)
-			if !enqueue(resultMsg{
+			if !publishOrFail(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,
 				UID:         session.UID,
@@ -696,8 +745,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 				Type:        "codex_appserver_stderr",
 				SessionID:   session.ID,
 				Seq:         int(seq),
-			}) {
-				failSessionFatally("codex app-server publish queue stalled — terminating session to avoid dropping stderr frames", "codex_appserver_stderr")
+			}, "codex_appserver_stderr") {
 				return
 			}
 		}

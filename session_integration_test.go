@@ -161,6 +161,37 @@ func runMockCLI(mode string) {
 		// Block until killed.
 		select {}
 
+	case "codex-appserver-oversize-escaped":
+		// Emit a single valid-JSON frame whose raw size is UNDER
+		// codexAppServerMaxFrameSize (8 MB) but whose marshaled resultMsg
+		// envelope blows past codexAppServerMaxPublishSize (10 MB) due to
+		// JSON-string escape amplification — each '\' / '"' byte in the raw
+		// line becomes 2 bytes when embedded into the Output field on
+		// marshal. The manager MUST surface a fatal codex_appserver_error
+		// rather than enqueue a frame Pub/Sub would silently reject. Used
+		// by TestCodexAppServerLifecycle_EscapeAmplifiedFrameTerminatesSession.
+		_, _ = os.Stdout.WriteString(`{"jsonrpc":"2.0","method":"item/started","params":{"item":{"big":"`)
+		// 6 MB of '\\"' escape sequences in the raw line. Each 2-byte raw
+		// '\"' marshals to 4 bytes ('\\\\\"'), so the Output field alone
+		// grows to ~12 MB, well over Pub/Sub's 10 MB ceiling.
+		const rawEscapeBytes = 6 * 1024 * 1024
+		escapePair := []byte{'\\', '"'}
+		chunk := bytes.Repeat(escapePair, 32*1024) // 64 KB of '\"'
+		emitted := 0
+		for emitted < rawEscapeBytes {
+			n := len(chunk)
+			if rawEscapeBytes-emitted < n {
+				n = rawEscapeBytes - emitted
+				if n%2 == 1 { // keep escape pairs intact
+					n--
+				}
+			}
+			_, _ = os.Stdout.Write(chunk[:n])
+			emitted += n
+		}
+		_, _ = os.Stdout.WriteString(`"}}}` + "\n")
+		select {}
+
 	case "codex-appserver-burst":
 		// Emit a burst of JSON-RPC frames much larger than
 		// codexAppServerPublishQueueSize, then keep going to keep the

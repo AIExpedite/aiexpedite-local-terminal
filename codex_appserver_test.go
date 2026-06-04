@@ -775,6 +775,94 @@ func TestCodexAppServerLifecycle_OversizeFrameTerminatesSession(t *testing.T) {
 	}
 }
 
+// TestCodexAppServerLifecycle_EscapeAmplifiedFrameTerminatesSession pins the
+// marshaled-envelope size check: a frame whose raw line is UNDER
+// codexAppServerMaxFrameSize but whose Output field doubles on JSON marshal
+// (heavy in '"' / '\') can still produce an envelope larger than Pub/Sub's
+// 10 MB ceiling. The manager MUST fail-fast in that case too — silently
+// publishing a frame Pub/Sub rejects would leave the orchestrator waiting
+// for a JSON-RPC response that never arrives.
+func TestCodexAppServerLifecycle_EscapeAmplifiedFrameTerminatesSession(t *testing.T) {
+	if runtime.GOOS != "windows" && runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("integration test only runs on win/linux/darwin")
+	}
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	tmpDir := t.TempDir()
+	mockName := "codex"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	mockPath := filepath.Join(tmpDir, mockName)
+	if err := copyTestBinary(testExe, mockPath); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "codex-appserver-oversize-escaped")
+
+	m := NewCodexAppServerManager()
+	id := fmt.Sprintf("escaped-oversize-test-%d", time.Now().UnixNano())
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	if err := m.Start(id, tmpDir, nil, "ws", "uid", publishFn); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Generous deadline — the mock emits ~6 MB of escape sequences before
+	// the newline, and the manager has to read, build, and marshal it before
+	// the size check fires.
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		sawFatal := false
+		for _, msg := range captured {
+			if msg.Type == "codex_appserver_error" && strings.Contains(msg.Output, "after JSON escaping") {
+				sawFatal = true
+				break
+			}
+		}
+		mu.Unlock()
+		if sawFatal {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	sawFatal := false
+	for _, msg := range captured {
+		if msg.Type == "codex_appserver_error" && strings.Contains(msg.Output, "after JSON escaping") {
+			sawFatal = true
+			if msg.Status != "error" {
+				t.Errorf("expected Status=error on escape-amplified surface; got %q", msg.Status)
+			}
+		}
+		// The oversize frame must NOT have leaked through as a normal
+		// codex_appserver_message — Pub/Sub would reject the envelope and
+		// the orchestrator would silently lose the response.
+		if msg.Type == "codex_appserver_message" && len(msg.Output) > codexAppServerMaxFrameSize/2 {
+			t.Errorf("escape-amplified frame leaked through as codex_appserver_message (len=%d)", len(msg.Output))
+		}
+	}
+	if !sawFatal {
+		types := make([]string, 0, len(captured))
+		for _, msg := range captured {
+			types = append(types, msg.Type)
+		}
+		t.Errorf("expected fatal `codex_appserver_error` for escape-amplified frame; got types=%v", types)
+	}
+}
+
 // TestCodexAppServerLifecycle_ForwardsBadFrameAsError pins the documented
 // `codex_appserver_error` behaviour: when codex (or a buggy proxy) emits a
 // non-JSON line on stdout, the manager forwards it as a clearly-typed error
