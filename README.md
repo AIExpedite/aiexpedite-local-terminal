@@ -124,6 +124,116 @@ To disable file upload:
 3. Set `"enable_file_upload": false`
 4. Restart the application
 
+## Codex IDE App-Server (JSON-RPC over stdio)
+
+The local terminal can drive Codex through OpenAI's IDE/app-server protocol —
+the same JSON-RPC 2.0 interface that powers the official VS Code and JetBrains
+extensions. AI Expedite spawns `codex app-server --listen stdio://` as a child
+process and forwards JSON-RPC frames in both directions, leaving the
+orchestrator (ai-service / agent-orchestrator-service) in full control of the
+codex conversation, threads, turns, and approvals.
+
+### Prerequisites
+
+- The Codex CLI must be installed and available on `PATH` (try `codex --version`).
+  Install instructions live at https://developers.openai.com/codex/ide.
+- Authentication is whatever Codex already uses on this machine: `codex login`
+  for ChatGPT-managed sessions, `OPENAI_API_KEY` for API-key mode, or the
+  externally-managed token flow. AI Expedite does **not** intercept or override
+  Codex auth — it inherits the user's environment.
+- `CODEX_HOME` (if set) is preserved so a non-default profile location keeps
+  working. Per-session config knobs can be passed via the `args` field on the
+  Pub/Sub command (forwarded as additional argv after the built-in transport
+  flags), e.g. `["-c", "model=\"gpt-5.4\""]`.
+
+### Wire protocol
+
+The local terminal exposes three new Pub/Sub command types and emits five new
+result types. The terminal stays protocol-agnostic — it validates JSON framing
+and forwards every frame verbatim, so any future Codex protocol changes do not
+require an agent update.
+
+Commands (orchestrator → local terminal):
+
+| `cmd.type`               | Required fields            | Action                                                                                                                    |
+| ------------------------ | -------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `codex_appserver_start`  | `sessionID`, `cwd`         | Launch `codex app-server --listen stdio://` with optional `args` appended after the built-in transport flags.             |
+| `codex_appserver_send`   | `sessionID`, `input`       | Write a single JSON-RPC 2.0 frame to the child's stdin (request, response, or notification — all valid JSON-RPC objects). |
+| `codex_appserver_end`    | `sessionID`                | Graceful shutdown: close stdin → SIGINT → SIGKILL with timeouts in between.                                               |
+
+Results (local terminal → orchestrator):
+
+| `res.type`                    | Meaning                                                                                                       |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `codex_appserver_started`     | Synchronous ack that the child process started successfully and the pipe is open.                             |
+| `codex_appserver_message`     | A JSON-RPC frame emitted by codex on stdout. `Output` carries the raw JSON line; `Seq` is monotonically increasing. |
+| `codex_appserver_stderr`      | A line of stderr output from codex (diagnostics).                                                             |
+| `codex_appserver_error`       | Synchronous failure (validation, send error, manager not initialized, or non-JSON stdout frame).              |
+| `codex_appserver_ended`       | Final frame for the session, carrying `ExitCode`.                                                             |
+
+### Typical flow
+
+1. Orchestrator sends `codex_appserver_start` with a unique `sessionID` and the
+   workspace `cwd` (the directory codex will operate in).
+2. Terminal acks with `codex_appserver_started`.
+3. Orchestrator sends `codex_appserver_send` carrying the JSON-RPC `initialize`
+   request, then `initialized` notification per the
+   [app-server docs](https://developers.openai.com/codex/app-server).
+4. Codex's responses and notifications flow back as `codex_appserver_message`
+   frames in order.
+5. Orchestrator drives the normal codex methods (`thread/start`, `turn/start`,
+   responses to `item/commandExecution/requestApproval`, etc.) by sending more
+   `codex_appserver_send` frames.
+6. On shutdown, orchestrator sends `codex_appserver_end` and waits for
+   `codex_appserver_ended`.
+
+### Lifecycle and cleanup
+
+- The codex app-server child is tracked in the global process registry so the
+  orphan scanner (`ORPHAN_CLEANUP_MODE=enforce`) recognises it as a legitimate
+  child and never kills it.
+- On agent shutdown (tray Quit, OS signal, console close), every active
+  app-server session is gracefully ended before sub-process teardown so codex
+  children don't outlive the agent.
+- Sessions are isolated per `sessionID`; many concurrent app-server children
+  are supported and share no state.
+
+### Configuration
+
+No new config keys are required. Existing knobs that affect this path:
+
+- `enable_allow_list` — codex_appserver_start is gated through the same
+  allow-list as `session_start`. The default allow-list includes `codex *` so
+  the new path works out of the box. Adding a tighter pattern (e.g. blocking
+  `app-server` specifically) requires a custom allow-list file.
+- `approval_timeout_sec` / `approval_timeout_action` — control the UI approval
+  dialog timeout when the allow-list rejects the launch.
+
+### Troubleshooting
+
+Use **Show Console** to view diagnostic output. Each session prefixes its logs
+with `[codex-appserver]`:
+
+```
+[codex-appserver] Starting session abc-123: codex app-server --listen stdio://
+[codex-appserver] Session abc-123 started (PID: 12345)
+[codex-appserver] stdout scanner started for abc-123
+[codex-appserver] → abc-123 (86 bytes)
+[codex-appserver] stderr abc-123: <codex diagnostics>
+```
+
+Common failures:
+
+- **`failed to start codex app-server (is codex on PATH?)`** — install the
+  Codex CLI per https://developers.openai.com/codex/ide.
+- **`codex_appserver_error: non-JSON frame on codex app-server stdout`** —
+  codex emitted output that isn't valid JSON-RPC. The raw stderr is forwarded
+  as `codex_appserver_stderr`; check it for the underlying error (usually an
+  auth or config problem).
+- **No `codex_appserver_message` after `_started`** — confirm the orchestrator
+  sent the `initialize` request. The protocol requires this handshake before
+  any other method.
+
 ## Installation
 
 ### For End Users
@@ -365,6 +475,7 @@ aiexpedite-local-terminal/
 ├── ttyd.go                 # ttyd installation and management
 ├── tmux.go                 # tmux session management (Linux/macOS)
 ├── pubsub.go               # Google Cloud Pub/Sub integration
+├── codex_appserver.go      # Codex IDE app-server (JSON-RPC over stdio)
 ├── storage.go              # GCS file upload (NEW)
 ├── update.go               # Auto-update functionality
 ├── paths.go                # Path utilities
@@ -392,6 +503,12 @@ aiexpedite-local-terminal/
 5. **Test installer**: Run the installer and verify all features work
 
 ## Version History
+
+### Unreleased
+- Added Codex IDE app-server integration (`codex app-server --listen stdio://`).
+  Forwards JSON-RPC 2.0 frames in both directions via three new Pub/Sub command
+  types (`codex_appserver_start` / `_send` / `_end`) and five result types.
+  See the "Codex IDE App-Server" section above for details.
 
 ### v0.3.0 (Current)
 - 📁 **NEW**: Automatic file upload to Google Cloud Storage

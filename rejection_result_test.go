@@ -133,6 +133,50 @@ func TestMakeRejectionResult_SessionRoutedSetsTypeAndSessionID(t *testing.T) {
 	}
 }
 
+func TestMakeRejectionResult_CodexAppServerStartUsesCodexErrorType(t *testing.T) {
+	// codex_appserver_start rejections must come back labeled
+	// codex_appserver_error so the orchestrator's IDE protocol handler can
+	// route them — labelling them session_error (the catch-all used until
+	// this fix) forced the orchestrator to special-case SessionID prefixes
+	// to distinguish a session_start denial from a codex_appserver_start
+	// denial.
+	cmd := commandMsg{
+		ID:        "cmd-codex-1",
+		Command:   "codex",
+		Args:      []string{"-c", `model="gpt-5.4"`},
+		Type:      "codex_appserver_start",
+		SessionID: "sess-codex-abc",
+	}
+	res := makeRejectionResult(cmd, "agent-1", "denied", "ALLOWLIST_DENIED", "Denied")
+
+	if res.Type != "codex_appserver_error" {
+		t.Errorf("Type = %q, want %q", res.Type, "codex_appserver_error")
+	}
+	if res.SessionID != "sess-codex-abc" {
+		t.Errorf("SessionID = %q, want %q", res.SessionID, "sess-codex-abc")
+	}
+}
+
+func TestMakeRejectionResult_CodexAppServerSendUsesCodexErrorType(t *testing.T) {
+	// Stale/rate-limited/signature-failed codex_appserver_send rejections
+	// route through the same makeRejectionResult path. They must also come
+	// back labeled codex_appserver_error so the orchestrator's IDE handler
+	// fails the in-flight JSON-RPC call instead of treating it as a generic
+	// session error.
+	cmd := commandMsg{
+		ID:        "cmd-codex-2",
+		Command:   "codex",
+		Type:      "codex_appserver_send",
+		SessionID: "sess-codex-xyz",
+		Input:     `{"jsonrpc":"2.0","id":1,"method":"initialize"}`,
+	}
+	res := makeRejectionResult(cmd, "agent-1", "rate_limited", "RATE_LIMITED", "Rate limit exceeded")
+
+	if res.Type != "codex_appserver_error" {
+		t.Errorf("Type = %q, want %q", res.Type, "codex_appserver_error")
+	}
+}
+
 func TestMakeRejectionResult_NoSessionMetadataForExecuteWithoutSessionID(t *testing.T) {
 	// Type set but SessionID missing — historically a defensive case in
 	// the inline literals. The helper requires BOTH to be present, since
