@@ -44,10 +44,24 @@ import (
 )
 
 const (
-	// codexAppServerMaxLineSize caps a single JSONL frame on stdout. Approval
-	// requests can carry large patch payloads, so we mirror the 30 MB cap
-	// used by session.go's CLI stream scanner.
+	// codexAppServerMaxLineSize caps the bufio.Scanner buffer for a single
+	// JSONL frame. A generous 30 MB ceiling matches session.go's CLI stream
+	// scanner — but the downstream Pub/Sub message limit is 10 MB, so frames
+	// bigger than codexAppServerMaxFrameSize cannot survive a publish and
+	// are session-fatal (see codexAppServerMaxFrameSize below).
 	codexAppServerMaxLineSize = 30 * 1024 * 1024
+
+	// codexAppServerMaxFrameSize is the largest stdout frame that can be
+	// published through Pub/Sub. Pub/Sub's hard ceiling is 10 MB; we cap at
+	// 8 MB so the resultMsg envelope overhead (workspaceID, sessionID,
+	// timestamps, JSON keys, …) plus the Output field stays under that
+	// ceiling. Frames exceeding this cap are session-fatal: silently
+	// dropping one would break the orchestrator's JSON-RPC state machine
+	// (it would wait forever for a response that never arrives), so the
+	// scanner publishes a fatal `codex_appserver_error` and kills the
+	// child via failSessionFatally. Addresses Finding #4 from the
+	// secondary review.
+	codexAppServerMaxFrameSize = 8 * 1024 * 1024
 
 	// codexAppServerStdinWriteTimeout is the upper bound on a single stdin
 	// write before we declare the pipe stalled. Matches session.go's
@@ -567,6 +581,26 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			if trimmed == "" {
 				continue
 			}
+
+			// Pre-publish size check (Finding #4 in the secondary review):
+			// Pub/Sub messages have a 10 MB ceiling. A frame larger than
+			// codexAppServerMaxFrameSize cannot survive a publish — Pub/Sub
+			// rejects oversize messages and the orchestrator would never see
+			// that JSON-RPC response (turn-completion, approval request, …),
+			// leaving its state machine deadlocked waiting for a frame that
+			// never arrives. Fail-fast so the orchestrator gets a diagnostic
+			// + session_ended instead of silent hangs.
+			if len(trimmed) > codexAppServerMaxFrameSize {
+				failSessionFatally(
+					fmt.Sprintf(
+						"codex emitted a %d-byte frame exceeding the %d-byte publishable limit — session terminated to avoid silent drop",
+						len(trimmed), codexAppServerMaxFrameSize,
+					),
+					"codex_appserver_oversize_frame",
+				)
+				return
+			}
+
 			seq := atomic.AddInt64(&session.seq, 1)
 
 			var probe json.RawMessage
@@ -614,8 +648,17 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 			}
 		}
 		if err := scanner.Err(); err != nil {
+			// ErrTooLong (a single line exceeding codexAppServerMaxLineSize)
+			// is session-fatal — the scanner is dead after this and any
+			// subsequent JSON-RPC frame would be lost. Same fail-fast
+			// applies to any other unexpected scanner error so we don't
+			// leave the orchestrator waiting for frames that never come.
 			fmt.Printf("%s[codex-appserver] stdout scanner error for %s: %v%s\n",
 				colorRed, session.ID, err, colorReset)
+			failSessionFatally(
+				fmt.Sprintf("codex stdout scanner error: %v — session terminated", err),
+				"codex_appserver_scanner_error",
+			)
 		}
 		fmt.Printf("%s[codex-appserver] stdout scanner done for %s (%d lines)%s\n",
 			colorYellow, session.ID, lineCount, colorReset)

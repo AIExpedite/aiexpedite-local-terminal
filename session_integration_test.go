@@ -135,6 +135,32 @@ func runMockCLI(mode string) {
 		fmt.Println("this is not json")
 		os.Exit(0)
 
+	case "codex-appserver-oversize":
+		// Emit a single JSON frame larger than codexAppServerMaxFrameSize
+		// (8 MB) to exercise the Finding #4 fail-fast path. The manager
+		// must surface a fatal codex_appserver_error rather than enqueueing
+		// the frame (which would fail at the Pub/Sub layer and silently
+		// break the orchestrator's JSON-RPC state machine). Used by
+		// TestCodexAppServerLifecycle_OversizeFrameTerminatesSession.
+		const oversize = 9 * 1024 * 1024 // ~9 MB > 8 MB cap
+		_, _ = os.Stdout.WriteString(`{"jsonrpc":"2.0","method":"item/started","params":{"item":{"big":"`)
+		buf := make([]byte, 64*1024)
+		for i := range buf {
+			buf[i] = 'A'
+		}
+		emitted := 0
+		for emitted < oversize {
+			n := len(buf)
+			if oversize-emitted < n {
+				n = oversize - emitted
+			}
+			_, _ = os.Stdout.Write(buf[:n])
+			emitted += n
+		}
+		_, _ = os.Stdout.WriteString(`"}}}` + "\n")
+		// Block until killed.
+		select {}
+
 	case "codex-appserver-burst":
 		// Emit a burst of JSON-RPC frames much larger than
 		// codexAppServerPublishQueueSize, then keep going to keep the
