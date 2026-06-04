@@ -260,7 +260,7 @@ func StartAgent(cfg *Config) {
 	// protocol is fundamentally different (JSON-RPC 2.0 framing vs. one-shot
 	// stream-json output).
 
-	globalCodexAppServerManager = NewCodexAppServerManager(cfg)
+	globalCodexAppServerManager = NewCodexAppServerManager()
 	go globalCodexAppServerManager.CleanupStale(codexAppServerMaxLifetime)
 	fmt.Println("[aiexpedite] Codex app-server manager ready")
 

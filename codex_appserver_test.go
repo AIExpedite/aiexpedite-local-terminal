@@ -146,7 +146,7 @@ func TestIsCodexAppServerCommand(t *testing.T) {
    -------------------------------------------------------------------------- */
 
 func TestCodexAppServerManager_Send_RejectsInvalidPayloads(t *testing.T) {
-	m := NewCodexAppServerManager(nil)
+	m := NewCodexAppServerManager()
 	// We don't even start a session — Send should reject before looking at
 	// the pipe for an unknown session id, but the empty/newline checks fire
 	// on a known session. Use a placeholder fixture session that's already
@@ -187,7 +187,7 @@ func TestCodexAppServerManager_Send_RejectsInvalidPayloads(t *testing.T) {
 }
 
 func TestCodexAppServerManager_Send_NotFound(t *testing.T) {
-	m := NewCodexAppServerManager(nil)
+	m := NewCodexAppServerManager()
 	err := m.Send("missing", `{"jsonrpc":"2.0","id":1,"method":"initialize"}`)
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("expected `not found` error; got %v", err)
@@ -195,7 +195,7 @@ func TestCodexAppServerManager_Send_NotFound(t *testing.T) {
 }
 
 func TestCodexAppServerManager_Send_EndedSession(t *testing.T) {
-	m := NewCodexAppServerManager(nil)
+	m := NewCodexAppServerManager()
 	id := "ended-fixture"
 	fixture := &CodexAppServerSession{ID: id, status: "ended", done: make(chan struct{}), streamDone: make(chan struct{})}
 	close(fixture.done)
@@ -213,7 +213,7 @@ func TestCodexAppServerManager_Send_EndedSession(t *testing.T) {
    -------------------------------------------------------------------------- */
 
 func TestCodexAppServerManager_StartRejectsDuplicateID(t *testing.T) {
-	m := NewCodexAppServerManager(nil)
+	m := NewCodexAppServerManager()
 	id := "dupe-fixture"
 	m.sessions[id] = &CodexAppServerSession{ID: id, status: "running", done: make(chan struct{}), streamDone: make(chan struct{})}
 
@@ -225,7 +225,7 @@ func TestCodexAppServerManager_StartRejectsDuplicateID(t *testing.T) {
 }
 
 func TestCodexAppServerManager_StartRequiresIDAndPublish(t *testing.T) {
-	m := NewCodexAppServerManager(nil)
+	m := NewCodexAppServerManager()
 	if err := m.Start("", "", nil, "ws", "uid", func(resultMsg) {}); err == nil {
 		t.Fatalf("expected error for empty sessionID")
 	}
@@ -243,7 +243,7 @@ func TestCodexAppServerManager_StartRequiresIDAndPublish(t *testing.T) {
 // sessions older than maxAge get ended, and a session younger than maxAge
 // must survive.
 func TestCodexAppServerManager_EndStaleSessions_OldOnly(t *testing.T) {
-	m := NewCodexAppServerManager(nil)
+	m := NewCodexAppServerManager()
 
 	now := time.Now()
 	old := &CodexAppServerSession{
@@ -379,7 +379,7 @@ func TestCodexAppServerLifecycle_StartSendEnd(t *testing.T) {
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(mockCLIEnvVar, "codex-appserver-echo")
 
-	m := NewCodexAppServerManager(nil)
+	m := NewCodexAppServerManager()
 	id := fmt.Sprintf("appsrv-test-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -547,7 +547,7 @@ func TestCodexAppServerLifecycle_ForwardsBadFrameAsError(t *testing.T) {
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(mockCLIEnvVar, "codex-appserver-bad-frame")
 
-	m := NewCodexAppServerManager(nil)
+	m := NewCodexAppServerManager()
 	id := fmt.Sprintf("badframe-test-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -611,7 +611,7 @@ func TestCodexAppServerLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("PATH", tmpDir)
 
-	m := NewCodexAppServerManager(nil)
+	m := NewCodexAppServerManager()
 	publishFn := func(resultMsg) {}
 	err := m.Start("missing-bin", tmpDir, nil, "ws", "uid", publishFn)
 	if err == nil {

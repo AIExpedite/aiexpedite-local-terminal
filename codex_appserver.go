@@ -103,7 +103,6 @@ type CodexAppServerSession struct {
 	StartedAt   time.Time
 	WorkspaceID string
 	UID         string
-	Cwd         string
 
 	mu         sync.Mutex
 	status     string // "running" | "ended"
@@ -141,15 +140,12 @@ func (s *CodexAppServerSession) closeStdin() {
 type CodexAppServerManager struct {
 	sessions map[string]*CodexAppServerSession
 	mu       sync.RWMutex
-	Config   *Config
 }
 
-// NewCodexAppServerManager creates a fresh manager. cfg is retained so future
-// per-workspace settings can be threaded through without breaking callers.
-func NewCodexAppServerManager(cfg *Config) *CodexAppServerManager {
+// NewCodexAppServerManager creates a fresh manager.
+func NewCodexAppServerManager() *CodexAppServerManager {
 	return &CodexAppServerManager{
 		sessions: make(map[string]*CodexAppServerSession),
-		Config:   cfg,
 	}
 }
 
@@ -231,7 +227,6 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 		StartedAt:   time.Now(),
 		WorkspaceID: workspaceID,
 		UID:         uid,
-		Cwd:         cwd,
 		status:      "running",
 		done:        make(chan struct{}),
 		streamDone:  make(chan struct{}),
