@@ -91,7 +91,7 @@ type cliAgentUsageParser interface {
 // which the terminal-service delta-skip relies on.
 func gatherCLIAgentUsage(detected map[string]detectedCLIAgent, now time.Time) []cliAgentUsage {
 	if len(detected) == 0 {
-		return nil
+		return []cliAgentUsage{}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {

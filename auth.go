@@ -197,8 +197,10 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 		if len(mi.DetectedCliAgents) > 0 {
 			payload["detectedCliAgents"] = mi.DetectedCliAgents
 		}
-		if len(mi.CliAgents) > 0 {
+		if mi.CliAgents != nil {
 			// Richer per-provider usage shape consumed by the CLI Agents tab.
+			// Send explicit [] snapshots too so the backend can clear stale
+			// utilization when a device no longer detects any CLI agents.
 			// Sent alongside detectedCliAgents (not in place of it) so legacy
 			// clients keep rendering the About-tab chip strip.
 			payload["cliAgents"] = mi.CliAgents

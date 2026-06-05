@@ -152,6 +152,16 @@ func TestGatherCLIAgentUsage_StableOrderAndOptIn(t *testing.T) {
 	}
 }
 
+func TestGatherCLIAgentUsage_EmptyDetectedReturnsExplicitEmptySlice(t *testing.T) {
+	out := gatherCLIAgentUsage(map[string]detectedCLIAgent{}, time.Now())
+	if out == nil {
+		t.Fatalf("expected non-nil empty slice so auth can send cliAgents: []")
+	}
+	if len(out) != 0 {
+		t.Fatalf("expected no entries, got %d", len(out))
+	}
+}
+
 func TestFingerprintAccount_StableAndProviderScoped(t *testing.T) {
 	a := fingerprintAccount("claudeCode", "ada@example.com")
 	b := fingerprintAccount("claudeCode", "ada@example.com")
