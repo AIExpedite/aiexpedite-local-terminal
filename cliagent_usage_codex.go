@@ -8,7 +8,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -24,6 +26,20 @@ type codexAuth struct {
 	PlanType   string `json:"plan_type"`
 	OrgID      string `json:"org_id"`
 	TokenLimit *int   `json:"token_limit"`
+	Tokens     struct {
+		IDToken   string `json:"id_token"`
+		AccountID string `json:"account_id"`
+	} `json:"tokens"`
+}
+
+type codexIDTokenClaims struct {
+	Account  string `json:"account"`
+	Email    string `json:"email"`
+	UserID   string `json:"user_id"`
+	Subject  string `json:"sub"`
+	Plan     string `json:"plan"`
+	PlanType string `json:"plan_type"`
+	OrgID    string `json:"org_id"`
 }
 
 func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
@@ -43,8 +59,19 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 
 	auth := codexAuth{}
 	if readJSONFile(expandHome(base, "auth.json"), &auth) {
-		usage.Account = firstNonEmpty(auth.Email, auth.Account, auth.UserID)
-		usage.Plan = firstNonEmpty(auth.Plan, auth.PlanType)
+		claims := codexIDTokenClaims{}
+		parseCodexIDTokenClaims(auth.Tokens.IDToken, &claims)
+		usage.Account = firstNonEmpty(
+			auth.Email,
+			auth.Account,
+			auth.UserID,
+			claims.Email,
+			claims.Account,
+			claims.UserID,
+			auth.Tokens.AccountID,
+			claims.Subject,
+		)
+		usage.Plan = firstNonEmpty(auth.Plan, auth.PlanType, claims.Plan, claims.PlanType)
 	}
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
@@ -67,4 +94,22 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 		},
 	}
 	return usage, true
+}
+
+func parseCodexIDTokenClaims(idToken string, into *codexIDTokenClaims) bool {
+	if idToken == "" || into == nil {
+		return false
+	}
+	parts := strings.Split(idToken, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+	}
+	if err != nil {
+		return false
+	}
+	return unmarshalJSON(payload, into)
 }

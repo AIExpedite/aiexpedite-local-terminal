@@ -1,12 +1,15 @@
 // cliagent_usage_gemini.go — Gemini CLI usage parser.
 //
-// Reads ~/.gemini/settings.json. On the free tier we know the public 1,000
-// requests/day cap, so we surface it as the metric's total even though the
-// remaining count isn't on disk — operators see the gauge framed at the cap
-// with Unknown=true (dashed bar) instead of nothing.
+// Reads ~/.gemini/settings.json. On the explicit free tier we know the public
+// 1,000 requests/day cap, so we surface it as the metric's total even though
+// the remaining count isn't on disk. Unknown tiers stay unframed rather than
+// assuming a free quota.
 package main
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type geminiUsageParser struct{}
 
@@ -47,7 +50,7 @@ func (p geminiUsageParser) Parse(home string, detected detectedCLIAgent, now tim
 		Unit:    "requests",
 		Unknown: true,
 	}
-	if cfg.Tier == "" || cfg.Tier == "free" {
+	if strings.EqualFold(strings.TrimSpace(cfg.Tier), "free") {
 		dailyRequests.Total = floatPtr(1000)
 	}
 	usage.Metrics = []cliAgentUsageMetric{dailyRequests}

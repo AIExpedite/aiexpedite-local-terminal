@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -20,6 +21,16 @@ func helperWriteJSON(t *testing.T, path string, payload any) {
 	if err := os.WriteFile(path, b, 0o600); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+}
+
+func helperJWT(t *testing.T, claims any) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatalf("marshal jwt claims: %v", err)
+	}
+	return header + "." + base64.RawURLEncoding.EncodeToString(payload) + "."
 }
 
 func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
@@ -140,6 +151,35 @@ func TestCodexUsageParser_HonorsCodexHome(t *testing.T) {
 	}
 }
 
+func TestCodexUsageParser_NestedAuthDotJsonClaims(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token": helperJWT(t, map[string]any{
+				"email": "oauth@example.com",
+				"plan":  "plus",
+				"sub":   "user-subject",
+			}),
+			"account_id": "acct_fallback",
+		},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || usage == nil {
+		t.Fatalf("expected usage")
+	}
+	if usage.Account != "oauth@example.com" {
+		t.Errorf("Account=%q, want oauth@example.com", usage.Account)
+	}
+	if usage.Plan != "plus" {
+		t.Errorf("Plan=%q, want plus", usage.Plan)
+	}
+	if usage.AccountFingerprint == "" {
+		t.Errorf("expected fingerprint for nested auth account")
+	}
+}
+
 func TestGeminiUsageParser_FreeTierFramesTotal(t *testing.T) {
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".gemini", "settings.json"), map[string]any{
@@ -155,6 +195,23 @@ func TestGeminiUsageParser_FreeTierFramesTotal(t *testing.T) {
 	}
 	if len(usage.Metrics) != 1 || usage.Metrics[0].Total == nil || *usage.Metrics[0].Total != 1000 {
 		t.Errorf("expected daily free cap of 1000 requests, got %+v", usage.Metrics)
+	}
+}
+
+func TestGeminiUsageParser_MissingTierKeepsTotalUnknown(t *testing.T) {
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".gemini", "settings.json"), map[string]any{
+		"email": "paid-or-unknown@example.com",
+	})
+	usage, _ := geminiUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if usage == nil {
+		t.Fatalf("expected usage")
+	}
+	if len(usage.Metrics) != 1 {
+		t.Fatalf("expected one metric, got %d", len(usage.Metrics))
+	}
+	if usage.Metrics[0].Total != nil {
+		t.Errorf("missing tier should leave Total unknown, got %v", *usage.Metrics[0].Total)
 	}
 }
 
