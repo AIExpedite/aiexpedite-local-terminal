@@ -159,9 +159,9 @@ type MachineInfo struct {
 	// tab — one entry per provider with account/plan/capacity metrics. The
 	// older DetectedCliAgents map stays for backward compatibility with the
 	// About-tab chip strip (legacy clients render it directly).
-	CliAgents []cliAgentUsage `json:"cliAgents,omitempty"`
-	Capabilities      *capabilitiesInfo           `json:"capabilities,omitempty"`
-	CollectedAt       string                      `json:"collectedAt,omitempty"`
+	CliAgents    []cliAgentUsage   `json:"cliAgents,omitempty"`
+	Capabilities *capabilitiesInfo `json:"capabilities,omitempty"`
+	CollectedAt  string            `json:"collectedAt,omitempty"`
 }
 
 /* --------------------------------------------------------------------------
