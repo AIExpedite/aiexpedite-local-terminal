@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 )
 
 // unmarshalJSON wraps json.Unmarshal so parsers can call it without an
@@ -34,6 +35,22 @@ func fingerprintAccount(provider, account string) string {
 	// 12 bytes (24 hex) is plenty of collision resistance for a per-workspace
 	// set; the full 32 bytes would just bloat the Firestore doc.
 	return hex.EncodeToString(sum[:12])
+}
+
+// fallbackUnknownAccountFingerprint gives missing-credential snapshots a stable
+// per-device bucket without pretending we know the underlying account.
+func fallbackUnknownAccountFingerprint(provider, host string, detected detectedCLIAgent) string {
+	parts := make([]string, 0, 4)
+	for _, value := range []string{host, detected.Path, detected.Version, detected.Name} {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			parts = append(parts, value)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return fingerprintAccount(provider+":unknown", strings.Join(parts, "\x00"))
 }
 
 // cliAgentUsageRegistry returns the active parsers in deterministic order.

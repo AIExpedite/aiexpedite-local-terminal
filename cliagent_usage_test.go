@@ -256,6 +256,32 @@ func TestGatherCLIAgentUsage_StableOrderAndOptIn(t *testing.T) {
 	}
 }
 
+func TestGatherCLIAgentUsage_UnknownAccountGetsDeviceScopedFingerprint(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CODEX_HOME", "")
+
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	out := gatherCLIAgentUsage(map[string]detectedCLIAgent{
+		"codex": {
+			Detected: true,
+			Name:     "Codex",
+			Version:  "0.14.0",
+			Path:     filepath.Join(home, "bin", "codex"),
+		},
+	}, now)
+
+	if len(out) != 1 {
+		t.Fatalf("expected one entry, got %d", len(out))
+	}
+	if out[0].Account != "" {
+		t.Fatalf("unknown account should not expose account text, got %q", out[0].Account)
+	}
+	if out[0].AccountFingerprint == "" {
+		t.Fatalf("expected fallback fingerprint for unknown account")
+	}
+}
+
 func TestGatherCLIAgentUsage_EmptyDetectedReturnsExplicitEmptySlice(t *testing.T) {
 	out := gatherCLIAgentUsage(map[string]detectedCLIAgent{}, time.Now())
 	if out == nil {

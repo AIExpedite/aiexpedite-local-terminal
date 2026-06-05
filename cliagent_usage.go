@@ -97,6 +97,10 @@ func gatherCLIAgentUsage(detected map[string]detectedCLIAgent, now time.Time) []
 	if err != nil {
 		home = ""
 	}
+	host, err := os.Hostname()
+	if err != nil {
+		host = ""
+	}
 
 	out := make([]cliAgentUsage, 0, len(detected))
 	for _, parser := range cliAgentUsageRegistry() {
@@ -116,6 +120,9 @@ func gatherCLIAgentUsage(detected map[string]detectedCLIAgent, now time.Time) []
 				Path:        entry.Path,
 				CollectedAt: now.UTC().Format(time.RFC3339),
 			}
+		}
+		if usage.AccountFingerprint == "" {
+			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(parser.Provider(), host, entry)
 		}
 		out = append(out, *usage)
 	}
