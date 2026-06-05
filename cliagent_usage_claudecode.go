@@ -1,14 +1,17 @@
 // cliagent_usage_claudecode.go — Claude Code usage parser.
 //
 // Claude Code does not currently expose a public utilization API. What we
-// CAN observe locally is ~/.claude/.credentials.json (account + plan) for
-// fingerprinting and plan display. The real 5h-window counters are not in
-// any local file, so the session/daily metrics are flagged Unknown — the UI
-// renders a dashed gauge so operators know the metric exists but is
-// unobservable.
+// CAN observe locally is CLAUDE_CONFIG_DIR/.credentials.json (or
+// ~/.claude/.credentials.json) for fingerprinting and plan display. The real
+// 5h-window counters are not in any local file, so the session/daily metrics
+// are flagged Unknown — the UI renders a dashed gauge so operators know the
+// metric exists but is unobservable.
 package main
 
-import "time"
+import (
+	"os"
+	"time"
+)
 
 type claudeCodeUsageParser struct{}
 
@@ -23,7 +26,7 @@ type claudeCredentials struct {
 }
 
 func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
-	base := expandHome(home, ".claude")
+	base := firstNonEmpty(os.Getenv("CLAUDE_CONFIG_DIR"), expandHome(home, ".claude"))
 	if base == "" {
 		return nil, false
 	}

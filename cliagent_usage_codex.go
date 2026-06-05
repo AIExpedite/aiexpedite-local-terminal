@@ -1,12 +1,16 @@
 // cliagent_usage_codex.go — Codex (OpenAI) usage parser.
 //
-// Reads ~/.codex/auth.json for the active account and any local plan/quota
+// Reads CODEX_HOME/auth.json (or ~/.codex/auth.json) for the active account
+// and any local plan/quota
 // hints. Emits Unknown=true for daily-tokens because the remaining counter
 // is enforced at the API gateway and is not on disk; the total cap is
 // surfaced when the auth file records it.
 package main
 
-import "time"
+import (
+	"os"
+	"time"
+)
 
 type codexUsageParser struct{}
 
@@ -23,7 +27,7 @@ type codexAuth struct {
 }
 
 func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
-	base := expandHome(home, ".codex")
+	base := firstNonEmpty(os.Getenv("CODEX_HOME"), expandHome(home, ".codex"))
 	if base == "" {
 		return nil, false
 	}

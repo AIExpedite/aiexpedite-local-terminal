@@ -23,6 +23,7 @@ func helperWriteJSON(t *testing.T, path string, payload any) {
 }
 
 func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
 		"email": "ada@example.com",
@@ -58,7 +59,29 @@ func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeUsageParser_HonorsClaudeConfigDir(t *testing.T) {
+	home := t.TempDir()
+	configDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	helperWriteJSON(t, filepath.Join(configDir, ".credentials.json"), map[string]any{
+		"email": "profile@example.com",
+		"plan":  "team",
+	})
+
+	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || usage == nil {
+		t.Fatalf("expected usage from CLAUDE_CONFIG_DIR")
+	}
+	if usage.Account != "profile@example.com" {
+		t.Errorf("Account=%q, want profile@example.com", usage.Account)
+	}
+	if usage.Plan != "team" {
+		t.Errorf("Plan=%q, want team", usage.Plan)
+	}
+}
+
 func TestClaudeCodeUsageParser_MissingCredentials(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	home := t.TempDir()
 	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
 	if !ok || usage == nil {
@@ -70,6 +93,7 @@ func TestClaudeCodeUsageParser_MissingCredentials(t *testing.T) {
 }
 
 func TestCodexUsageParser_KnownTokenLimit(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
 		"email":       "carol@example.com",
@@ -92,6 +116,27 @@ func TestCodexUsageParser_KnownTokenLimit(t *testing.T) {
 	}
 	if !tokens.Unknown {
 		t.Errorf("Unknown should remain true — we know cap, not consumed")
+	}
+}
+
+func TestCodexUsageParser_HonorsCodexHome(t *testing.T) {
+	home := t.TempDir()
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{
+		"email": "codex-profile@example.com",
+		"plan":  "pro",
+	})
+
+	usage, ok := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || usage == nil {
+		t.Fatalf("expected usage from CODEX_HOME")
+	}
+	if usage.Account != "codex-profile@example.com" {
+		t.Errorf("Account=%q, want codex-profile@example.com", usage.Account)
+	}
+	if usage.Plan != "pro" {
+		t.Errorf("Plan=%q, want pro", usage.Plan)
 	}
 }
 
@@ -131,6 +176,8 @@ func TestAntigravityUsageParser_PlanFromConfig(t *testing.T) {
 func TestGatherCLIAgentUsage_StableOrderAndOptIn(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("CODEX_HOME", "")
 	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
 		"email": "ada@example.com",
 	})
