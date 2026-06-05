@@ -1,12 +1,16 @@
 // cliagent_usage_antigravity.go — Antigravity (`agy`) usage parser.
 //
-// Antigravity stores per-user config under ~/.agy/config.json. The provider
-// does not currently expose request- or token-level quotas, only the active
-// account/plan. Capacity rows are flagged Unknown because there is no
-// observable counter to plot.
+// Antigravity CLI stores per-user settings under
+// ~/.gemini/antigravity-cli/settings.json. The provider does not currently
+// expose request- or token-level quotas, only the active account/plan.
+// Capacity rows are flagged Unknown because there is no observable counter to
+// plot.
 package main
 
-import "time"
+import (
+	"path/filepath"
+	"time"
+)
 
 type antigravityUsageParser struct{}
 
@@ -20,7 +24,7 @@ type antigravityConfig struct {
 }
 
 func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
-	base := expandHome(home, ".agy")
+	base := expandHome(home, filepath.Join(".gemini", "antigravity-cli"))
 	if base == "" {
 		return nil, false
 	}
@@ -30,12 +34,16 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 		Name:        firstNonEmpty(detected.Name, "Antigravity"),
 		Version:     detected.Version,
 		Path:        detected.Path,
-		DataSource:  "~/.agy",
+		DataSource:  "~/.gemini/antigravity-cli",
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
 
 	cfg := antigravityConfig{}
-	if readJSONFile(expandHome(base, "config.json"), &cfg) {
+	if readJSONFile(expandHome(base, "settings.json"), &cfg) {
+		usage.Account = firstNonEmpty(cfg.Email, cfg.Account)
+		usage.Plan = firstNonEmpty(cfg.Plan, cfg.Tier)
+	} else if legacyBase := expandHome(home, ".agy"); readJSONFile(expandHome(legacyBase, "config.json"), &cfg) {
+		usage.DataSource = "~/.agy"
 		usage.Account = firstNonEmpty(cfg.Email, cfg.Account)
 		usage.Plan = firstNonEmpty(cfg.Plan, cfg.Tier)
 	}

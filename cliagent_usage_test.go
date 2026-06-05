@@ -215,9 +215,9 @@ func TestGeminiUsageParser_MissingTierKeepsTotalUnknown(t *testing.T) {
 	}
 }
 
-func TestAntigravityUsageParser_PlanFromConfig(t *testing.T) {
+func TestAntigravityUsageParser_PlanFromSettings(t *testing.T) {
 	home := t.TempDir()
-	helperWriteJSON(t, filepath.Join(home, ".agy", "config.json"), map[string]any{
+	helperWriteJSON(t, filepath.Join(home, ".gemini", "antigravity-cli", "settings.json"), map[string]any{
 		"email": "eve@example.com",
 		"tier":  "team",
 	})
@@ -227,6 +227,9 @@ func TestAntigravityUsageParser_PlanFromConfig(t *testing.T) {
 	}
 	if usage.Plan != "team" {
 		t.Errorf("Plan=%q, want team", usage.Plan)
+	}
+	if usage.DataSource != "~/.gemini/antigravity-cli" {
+		t.Errorf("DataSource=%q, want documented Antigravity settings path", usage.DataSource)
 	}
 }
 
