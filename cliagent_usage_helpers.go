@@ -5,6 +5,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
@@ -18,6 +19,24 @@ func unmarshalJSON(data []byte, into any) bool {
 		return false
 	}
 	return true
+}
+
+func parseJWTClaims(idToken string, into any) bool {
+	if idToken == "" || into == nil {
+		return false
+	}
+	parts := strings.Split(idToken, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+	}
+	if err != nil {
+		return false
+	}
+	return unmarshalJSON(payload, into)
 }
 
 // fingerprintAccount produces a stable per-account opaque identifier from a

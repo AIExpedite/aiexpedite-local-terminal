@@ -198,6 +198,36 @@ func TestGeminiUsageParser_FreeTierFramesTotal(t *testing.T) {
 	}
 }
 
+func TestGeminiUsageParser_OAuthCredentialsAccount(t *testing.T) {
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".gemini", "oauth_creds.json"), map[string]any{
+		"id_token": helperJWT(t, map[string]any{
+			"email": "gemini-oauth@example.com",
+			"sub":   "gemini-subject",
+		}),
+	})
+	helperWriteJSON(t, filepath.Join(home, ".gemini", "settings.json"), map[string]any{
+		"tier": "free",
+	})
+
+	usage, _ := geminiUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if usage == nil {
+		t.Fatalf("expected usage")
+	}
+	if usage.Account != "gemini-oauth@example.com" {
+		t.Errorf("Account=%q, want gemini-oauth@example.com", usage.Account)
+	}
+	if usage.AccountFingerprint == "" {
+		t.Errorf("expected fingerprint for OAuth account")
+	}
+	if usage.Plan != "free" {
+		t.Errorf("Plan=%q, want free", usage.Plan)
+	}
+	if len(usage.Metrics) != 1 || usage.Metrics[0].Total == nil || *usage.Metrics[0].Total != 1000 {
+		t.Errorf("expected daily free cap of 1000 requests, got %+v", usage.Metrics)
+	}
+}
+
 func TestGeminiUsageParser_MissingTierKeepsTotalUnknown(t *testing.T) {
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".gemini", "settings.json"), map[string]any{

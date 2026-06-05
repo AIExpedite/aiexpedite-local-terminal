@@ -8,9 +8,7 @@
 package main
 
 import (
-	"encoding/base64"
 	"os"
-	"strings"
 	"time"
 )
 
@@ -60,7 +58,7 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 	auth := codexAuth{}
 	if readJSONFile(expandHome(base, "auth.json"), &auth) {
 		claims := codexIDTokenClaims{}
-		parseCodexIDTokenClaims(auth.Tokens.IDToken, &claims)
+		parseJWTClaims(auth.Tokens.IDToken, &claims)
 		usage.Account = firstNonEmpty(
 			auth.Email,
 			auth.Account,
@@ -94,22 +92,4 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 		},
 	}
 	return usage, true
-}
-
-func parseCodexIDTokenClaims(idToken string, into *codexIDTokenClaims) bool {
-	if idToken == "" || into == nil {
-		return false
-	}
-	parts := strings.Split(idToken, ".")
-	if len(parts) < 2 {
-		return false
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		payload, err = base64.URLEncoding.DecodeString(parts[1])
-	}
-	if err != nil {
-		return false
-	}
-	return unmarshalJSON(payload, into)
 }
