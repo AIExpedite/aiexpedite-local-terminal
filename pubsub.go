@@ -978,6 +978,34 @@ func runPubSubConnection(cfg *Config) error {
 		}
 		// ─────────────────────────────────────────────────────────────────
 
+		if cmd.Command == "__cli_usage_refresh__" {
+			// CLI Agents tab issues this to force an immediate re-gather of
+			// per-provider utilization. Off-cycle from the normal 6h machine-
+			// info loop so an operator clicking Refresh sees fresh data within
+			// the next /auth/token tick rather than waiting hours. Ack
+			// regardless — there is no caller waiting on a pubsub-side reply
+			// (the result flows back via the terminalAgent Firestore doc).
+			if IsOffline() {
+				m.Ack()
+				return
+			}
+			RefreshMachineInfoNow()
+
+			// Trigger a backend update immediately by calling the token endpoint
+			if cfg.TokenEndpoint != "" && cfg.AgentID != "" && cfg.CommandSecret != "" {
+				ts := NewWIFTokenSource(cfg)
+				_, err := ts.getOIDCToken()
+				if err != nil {
+					fmt.Printf("[pubsub] Failed to push refreshed usage to backend: %v\n", err)
+				} else {
+					fmt.Println("[pubsub] Refreshed usage successfully pushed to backend")
+				}
+			}
+
+			m.Ack()
+			return
+		}
+
 		// ─── Interactive Session Routing ─────────────────────────────────
 		// Route session_* and codex_appserver_* commands to their respective
 		// managers instead of shell execution. Long-running entry-point
