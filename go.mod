@@ -4,16 +4,16 @@ go 1.25.8
 
 require (
 	cloud.google.com/go/pubsub/v2 v2.6.0 // direct
-	cloud.google.com/go/storage v1.62.2 // direct
+	cloud.google.com/go/storage v1.62.3 // direct
 	github.com/getlantern/systray v1.2.2 // direct
-	golang.org/x/mod v0.36.0 // semver‑compare helper
-	golang.org/x/sys v0.45.0 // direct
+	golang.org/x/mod v0.37.0 // semver‑compare helper
+	golang.org/x/sys v0.46.0 // direct
 )
 
 require (
 	github.com/shirou/gopsutil/v4 v4.26.5
 	golang.org/x/oauth2 v0.36.0
-	golang.org/x/sync v0.20.0
+	golang.org/x/sync v0.21.0
 	golang.org/x/time v0.15.0
 	google.golang.org/api v0.283.0
 )
