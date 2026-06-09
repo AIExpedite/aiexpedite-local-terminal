@@ -261,8 +261,7 @@ func (sm *SessionManager) SendInput(id, text string) error {
 
 	// For Claude sessions, wrap input in NDJSON user message envelope
 	payload := text
-	cmdLower := strings.ToLower(session.Command)
-	if cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude") {
+	if isClaudeCommand(session.Command) {
 		payload = fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%s},"session_id":"%s","parent_tool_use_id":null}`,
 			jsonEscapeString(text), id)
 	}
@@ -539,15 +538,15 @@ func detectCLITerminalEvent(command, line string) bool {
 		return false
 	}
 
-	cmdLower := strings.ToLower(command)
+	base := commandBaseName(command)
 	switch {
-	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
+	case strings.HasPrefix(base, "claude"):
 		return eventType == "result"
-	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
+	case strings.HasPrefix(base, "codex"):
 		// Codex emits turn.completed when the turn is done. thread.completed is
 		// the very last event before the process exits.
 		return eventType == "thread.completed" || eventType == "turn.completed"
-	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
+	case strings.HasPrefix(base, "gemini"):
 		return eventType == "result"
 	}
 	return false
@@ -1010,28 +1009,39 @@ func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 	return filtered, stripped
 }
 
-// isClaudeCommand reports whether command would be routed to the `claude`
-// CLI by buildInteractiveCLIArgs. Accepts bare names, Windows shims
-// (.exe/.cmd/.bat/.ps1), and absolute / relative paths. Mirrors the
-// router's `strings.HasPrefix(cmdLower, "claude")` semantics so the
-// billing-var strip can't drift out of sync — if a command gets claude
-// argv shaping, it MUST also get the claude env policy, or a `claude-edge`
-// (or any future `claude*` variant) would silently regain API-key billing.
-// Used to gate the ANTHROPIC_* billing-var strip in sanitizeClaudeChildEnv.
-func isClaudeCommand(command string) bool {
+// commandBaseName returns the lowercased basename of command with any
+// Windows shim extension (.exe / .cmd / .bat / .ps1) stripped. Backslashes
+// are normalized to forward slashes first so Windows-style paths
+// (e.g. `C:\Users\u\AppData\Roaming\npm\claude.cmd`) resolve correctly on
+// non-Windows builds where `filepath.Base` only treats `/` as a separator.
+//
+// All command-routing sites (argv builder, executable resolver, prompt
+// detector, stdin envelope writer, billing-var strip) MUST classify
+// commands through this helper so the routing predicate stays single-
+// sourced — otherwise an absolute path like `/usr/local/bin/claude` could
+// fall through one site but not another and silently regain API-key
+// billing (or skip the stream-json shaping that the driver depends on).
+func commandBaseName(command string) string {
 	if command == "" {
-		return false
+		return ""
 	}
-	// Normalize backslashes to forward slashes before taking the base name so
-	// Windows-style paths (e.g. `C:\Users\u\AppData\Roaming\npm\claude.cmd`)
-	// resolve correctly on non-Windows builds — `filepath.Base` only treats `/`
-	// as a separator off Windows, so without this step the full path would
-	// fall through, miss the prefix check, and silently regain API-key billing.
 	base := strings.ToLower(filepath.Base(strings.ReplaceAll(command, `\`, "/")))
 	for _, ext := range []string{".exe", ".cmd", ".bat", ".ps1"} {
 		base = strings.TrimSuffix(base, ext)
 	}
-	return strings.HasPrefix(base, "claude")
+	return base
+}
+
+// isClaudeCommand reports whether command would be routed to the `claude`
+// CLI by buildInteractiveCLIArgs. Accepts bare names, Windows shims
+// (.exe/.cmd/.bat/.ps1), and absolute / relative paths. Uses the same
+// basename-prefix predicate as the router so the billing-var strip can't
+// drift out of sync — if a command gets claude argv shaping, it MUST also
+// get the claude env policy, or a `claude-edge` (or any future `claude*`
+// variant) would silently regain API-key billing.
+// Used to gate the ANTHROPIC_* billing-var strip in sanitizeClaudeChildEnv.
+func isClaudeCommand(command string) bool {
+	return strings.HasPrefix(commandBaseName(command), "claude")
 }
 
 /* --------------------------------------------------------------------------
@@ -1063,16 +1073,16 @@ func isClaudeCommand(command string) bool {
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
 // the stdinPrompt before writing it to the process stdin.
 func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
-	cmdLower := strings.ToLower(command)
+	base := commandBaseName(command)
 
 	switch {
-	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
+	case strings.HasPrefix(base, "claude"):
 		return buildClaudeInteractiveArgs(args)
-	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
+	case strings.HasPrefix(base, "codex"):
 		return buildCodexInteractiveArgs(args)
-	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
+	case strings.HasPrefix(base, "gemini"):
 		return buildGeminiInteractiveArgs(args)
-	case cmdLower == "agy" || strings.HasPrefix(cmdLower, "agy"):
+	case strings.HasPrefix(base, "agy"):
 		return buildAntigravityInteractiveArgs(args), ""
 	default:
 		return args, ""
@@ -1091,15 +1101,11 @@ func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
 // Centralises the per-CLI knowledge so the StartSession write path doesn't
 // hard-code claude's protocol against any non-empty stdinPrompt.
 func stdinPromptFormat(command string) string {
-	cmd := strings.ToLower(command)
-	cmd = strings.TrimSuffix(cmd, ".exe")
-	cmd = strings.TrimSuffix(cmd, ".cmd")
-	cmd = strings.TrimSuffix(cmd, ".bat")
-	cmd = strings.TrimSuffix(cmd, ".ps1")
-	switch cmd {
-	case "claude":
+	base := commandBaseName(command)
+	switch {
+	case strings.HasPrefix(base, "claude"):
 		return "ndjson"
-	case "codex", "gemini":
+	case strings.HasPrefix(base, "codex"), strings.HasPrefix(base, "gemini"):
 		return "plain"
 	}
 	return ""
@@ -1495,9 +1501,7 @@ func buildGeminiInteractiveArgs(args []string) ([]string, string) {
 
 // resolveExecutable resolves the full path to a CLI executable.
 func resolveExecutable(command string) string {
-	cmdLower := strings.ToLower(command)
-
-	if cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude") {
+	if isClaudeCommand(command) {
 		return cachedResolveClaudePath()
 	}
 
@@ -1544,14 +1548,14 @@ func detectPromptFromJSON(command, line string) *promptInfo {
 		return nil
 	}
 
-	cmdLower := strings.ToLower(command)
+	base := commandBaseName(command)
 
 	switch {
-	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
+	case strings.HasPrefix(base, "claude"):
 		return detectClaudePrompt(event)
-	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
+	case strings.HasPrefix(base, "codex"):
 		return detectCodexPrompt(event)
-	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
+	case strings.HasPrefix(base, "gemini"):
 		return detectGeminiPrompt(event)
 	}
 
@@ -1562,8 +1566,7 @@ func detectPromptFromJSON(command, line string) *promptInfo {
 // signalling that the current turn is complete and stdin can be closed.
 // Only applies to Claude sessions using --output-format stream-json.
 func detectResultEvent(command, line string) bool {
-	cmdLower := strings.ToLower(command)
-	if cmdLower != "claude" && !strings.HasPrefix(cmdLower, "claude") {
+	if !isClaudeCommand(command) {
 		return false
 	}
 	trimmed := strings.TrimSpace(line)

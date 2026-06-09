@@ -664,6 +664,27 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 			t.Errorf("CODEX (upper case) should still route to codex builder, args=%v", args)
 		}
 	})
+	t.Run("path-and-shim-route-like-isClaudeCommand", func(t *testing.T) {
+		// Regression guard: the router and isClaudeCommand MUST classify
+		// commands identically — otherwise an absolute path like
+		// `/usr/local/bin/claude` or a Windows shim could get one half of the
+		// claude treatment (stream-json shaping) without the other (billing
+		// strip), or vice-versa.
+		for _, cmd := range []string{
+			"/usr/local/bin/claude",
+			`C:\Users\u\AppData\Roaming\npm\claude.cmd`,
+			"./claude",
+			"claude-edge",
+		} {
+			_, prompt := buildInteractiveCLIArgs(cmd, []string{"hi"})
+			if prompt == "" {
+				t.Errorf("buildInteractiveCLIArgs(%q) did not route to claude (empty stdinPrompt)", cmd)
+			}
+			if !isClaudeCommand(cmd) {
+				t.Errorf("isClaudeCommand(%q) = false, but router treated it as claude — predicates drifted", cmd)
+			}
+		}
+	})
 	t.Run("unknown-command-passes-through", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("git", []string{"status"})
 		if prompt != "" {
