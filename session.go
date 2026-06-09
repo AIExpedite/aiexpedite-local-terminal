@@ -1022,7 +1022,12 @@ func isClaudeCommand(command string) bool {
 	if command == "" {
 		return false
 	}
-	base := strings.ToLower(filepath.Base(command))
+	// Normalize backslashes to forward slashes before taking the base name so
+	// Windows-style paths (e.g. `C:\Users\u\AppData\Roaming\npm\claude.cmd`)
+	// resolve correctly on non-Windows builds — `filepath.Base` only treats `/`
+	// as a separator off Windows, so without this step the full path would
+	// fall through, miss the prefix check, and silently regain API-key billing.
+	base := strings.ToLower(filepath.Base(strings.ReplaceAll(command, `\`, "/")))
 	for _, ext := range []string{".exe", ".cmd", ".bat", ".ps1"} {
 		base = strings.TrimSuffix(base, ext)
 	}
