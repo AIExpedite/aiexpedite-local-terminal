@@ -1550,14 +1550,19 @@ func isExplicitPath(command string) bool {
 // must be resolved against the child's working directory rather than the
 // agent's. Used so resolveExecutable can skip exec.LookPath (which would
 // resolve against the agent's cwd) and let exec.Command + proc.Dir do the
-// resolution at child-exec time. Recognises Windows drive-letter paths
-// cross-platform so a `C:\tools\claude.cmd` arriving on a non-Windows
-// runtime is still treated as absolute, not cwd-relative.
+// resolution at child-exec time. Recognises both Unix `/`-prefixed paths and
+// Windows drive-letter paths cross-platform so a `/opt/claude/claude` or
+// `C:\tools\claude.cmd` arriving on the "wrong" runtime is still treated as
+// absolute, not cwd-relative — filepath.IsAbs alone is GOOS-specific and
+// would misclassify the foreign-style absolute path as relative.
 func isRelativeExplicitPath(command string) bool {
 	if !isExplicitPath(command) {
 		return false
 	}
 	if filepath.IsAbs(command) {
+		return false
+	}
+	if strings.HasPrefix(command, "/") {
 		return false
 	}
 	if len(command) >= 2 && command[1] == ':' {
