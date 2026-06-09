@@ -114,12 +114,14 @@ func TestBuildClaudeInteractiveArgs_StripsPrintFlagVariants(t *testing.T) {
 	}{
 		{"short flag leading", []string{"-p", "hello"}, "hello"},
 		{"long flag leading", []string{"--print", "hello"}, "hello"},
-		{"short equals form", []string{"-p=hello", "world"}, "world"},
-		{"long equals form", []string{"--print=hello", "world"}, "world"},
+		{"short equals form", []string{"-p=hello", "world"}, "hello world"},
+		{"long equals form", []string{"--print=hello", "world"}, "hello world"},
 		{"trailing short", []string{"hello", "-p"}, "hello"},
 		{"trailing long", []string{"hello", "--print"}, "hello"},
 		{"mixed with valued flag", []string{"--model", "sonnet", "-p", "design auth"}, "design auth"},
 		{"long equals only", []string{"--print="}, ""},
+		{"short equals only preserves prompt", []string{"-p=hello"}, "hello"},
+		{"long equals only preserves prompt", []string{"--print=hello world"}, "hello world"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

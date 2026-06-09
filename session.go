@@ -1153,8 +1153,23 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 			flags = append(flags, a)
 			continue
 		}
-		if a == "-p" || a == "--print" ||
-			strings.HasPrefix(a, "-p=") || strings.HasPrefix(a, "--print=") {
+		if a == "-p" || a == "--print" {
+			continue
+		}
+		// Equals-form: strip the print/one-shot mode flag but keep the inline
+		// prompt text (e.g. `claude --print=hello` → prompt "hello") so the
+		// interactive launch still answers the caller's query instead of
+		// hanging on empty stdin.
+		if strings.HasPrefix(a, "-p=") {
+			if v := strings.TrimPrefix(a, "-p="); v != "" {
+				promptParts = append(promptParts, v)
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "--print=") {
+			if v := strings.TrimPrefix(a, "--print="); v != "" {
+				promptParts = append(promptParts, v)
+			}
 			continue
 		}
 		if strings.HasPrefix(a, "-") {
