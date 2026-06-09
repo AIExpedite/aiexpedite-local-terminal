@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -122,21 +123,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		proc.Dir = cwd
 	}
 
-	// Strip CLAUDECODE and CLAUDE_* env vars so Claude Code doesn't detect a
-	// nested session or inherit IDE-specific settings (CLAUDE_CODE_ENTRYPOINT,
-	// CLAUDE_AGENT_SDK_VERSION, etc.).  The Go agent may inherit these if
-	// launched from within a Claude Code or VSCode context.
-	cleanEnv := os.Environ()
-	filtered := make([]string, 0, len(cleanEnv))
-	var strippedVars []string
-	for _, e := range cleanEnv {
-		upper := strings.ToUpper(e)
-		if strings.HasPrefix(upper, "CLAUDECODE=") || strings.HasPrefix(upper, "CLAUDE_") {
-			strippedVars = append(strippedVars, e[:strings.Index(e, "=")])
-			continue
-		}
-		filtered = append(filtered, e)
-	}
+	filtered, strippedVars := sanitizeClaudeChildEnv(command, os.Environ())
 	proc.Env = filtered
 	if len(strippedVars) > 0 {
 		fmt.Printf("%s[session] Stripped env vars from session %s: %s%s\n",
@@ -274,8 +261,7 @@ func (sm *SessionManager) SendInput(id, text string) error {
 
 	// For Claude sessions, wrap input in NDJSON user message envelope
 	payload := text
-	cmdLower := strings.ToLower(session.Command)
-	if cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude") {
+	if isClaudeCommand(session.Command) {
 		payload = fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%s},"session_id":"%s","parent_tool_use_id":null}`,
 			jsonEscapeString(text), id)
 	}
@@ -499,16 +485,16 @@ func (sm *SessionManager) removeSession(id string) {
 //     pre-existing rule: close stdin iff no stdinPrompt was queued. agy gets
 //     its prompt on argv (it ignores piped stdin), so stdinPrompt is empty.
 func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
-	// Normalize: claude / claude.exe / claude.cmd should all match.
-	cmd := strings.ToLower(command)
-	cmd = strings.TrimSuffix(cmd, ".exe")
-	cmd = strings.TrimSuffix(cmd, ".cmd")
-	cmd = strings.TrimSuffix(cmd, ".bat")
-	cmd = strings.TrimSuffix(cmd, ".ps1")
-	if cmd == "claude" {
+	// Route through commandBaseName so absolute/relative paths like
+	// `/opt/bin/codex` or `C:\tools\gemini.cmd` follow the same stdin policy
+	// as bare names — otherwise the argv builder would shape them as stdin-
+	// fed codex/gemini sessions while this function left the pipe open,
+	// hanging the child waiting for EOF.
+	base := commandBaseName(command)
+	switch {
+	case strings.HasPrefix(base, "claude"):
 		return false
-	}
-	if cmd == "codex" || cmd == "gemini" {
+	case strings.HasPrefix(base, "codex"), strings.HasPrefix(base, "gemini"):
 		return true
 	}
 	return stdinPrompt == ""
@@ -552,15 +538,15 @@ func detectCLITerminalEvent(command, line string) bool {
 		return false
 	}
 
-	cmdLower := strings.ToLower(command)
+	base := commandBaseName(command)
 	switch {
-	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
+	case strings.HasPrefix(base, "claude"):
 		return eventType == "result"
-	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
+	case strings.HasPrefix(base, "codex"):
 		// Codex emits turn.completed when the turn is done. thread.completed is
 		// the very last event before the process exits.
 		return eventType == "thread.completed" || eventType == "turn.completed"
-	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
+	case strings.HasPrefix(base, "gemini"):
 		return eventType == "result"
 	}
 	return false
@@ -943,6 +929,122 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 }
 
 /* --------------------------------------------------------------------------
+   Child-process env sanitisation
+   -------------------------------------------------------------------------- */
+
+// claudeAlwaysStripped is the set of env-var prefixes we drop from every
+// spawned session, regardless of command. They identify or configure a
+// surrounding Claude Code / Claude IDE context (CLAUDECODE,
+// CLAUDE_CODE_ENTRYPOINT, CLAUDE_AGENT_SDK_VERSION, …) that, if leaked into
+// the child, makes claude believe it is nested inside another Claude session
+// or an IDE that isn't actually present.
+//
+// CLAUDE_CODE_OAUTH_TOKEN intentionally falls under this prefix sweep. The
+// integration relies on the user's interactive `/login` credentials stored
+// in ~/.claude/.credentials.json — there is no current code path that needs
+// a headless OAuth token injected via env. If a future maintainer wants
+// subscription-safe headless token support they should add an explicit
+// whitelist here rather than discovering the strip by accident.
+var claudeAlwaysStripped = []string{
+	"CLAUDECODE=",
+	"CLAUDE_",
+}
+
+// claudeBillingStripped is the set of env-var prefixes that would silently
+// redirect a spawned Claude Code session away from the user's `/login`
+// subscription credentials and onto API-key / OAuth-token billing. Anthropic
+// SDK precedence puts these ahead of the stored subscription token, so a
+// developer who keeps ANTHROPIC_API_KEY in their shell for unrelated SDK
+// work would otherwise unknowingly bill their company API wallet for every
+// interactive session this driver launches.
+//
+// Policy (per CLI_AGENT_INTEGRATION.md): force subscription billing — no
+// opt-in API-key escape hatch. A user who genuinely wants API-key billing
+// can run `claude` directly outside the driver.
+var claudeBillingStripped = []string{
+	"ANTHROPIC_API_KEY=",
+	"ANTHROPIC_AUTH_TOKEN=",
+}
+
+// sanitizeClaudeChildEnv returns env with any variable that would confuse a
+// spawned CLI agent (or, for claude specifically, would override the user's
+// subscription credentials) removed. The second return value lists the names
+// of the stripped variables in the order they appeared, suitable for an
+// auditable [session] log line.
+//
+// The billing-var strip is gated on isClaudeCommand(command): codex / gemini
+// / arbitrary shells are unaffected so they keep working with whatever auth
+// the user has configured for those tools.
+func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
+	stripClaudeBilling := isClaudeCommand(command)
+
+	filtered := make([]string, 0, len(env))
+	var stripped []string
+	for _, e := range env {
+		upper := strings.ToUpper(e)
+
+		drop := false
+		for _, p := range claudeAlwaysStripped {
+			if strings.HasPrefix(upper, p) {
+				drop = true
+				break
+			}
+		}
+		if !drop && stripClaudeBilling {
+			for _, p := range claudeBillingStripped {
+				if strings.HasPrefix(upper, p) {
+					drop = true
+					break
+				}
+			}
+		}
+		if drop {
+			if eq := strings.Index(e, "="); eq > 0 {
+				stripped = append(stripped, e[:eq])
+			}
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	return filtered, stripped
+}
+
+// commandBaseName returns the lowercased basename of command with any
+// Windows shim extension (.exe / .cmd / .bat / .ps1) stripped. Backslashes
+// are normalized to forward slashes first so Windows-style paths
+// (e.g. `C:\Users\u\AppData\Roaming\npm\claude.cmd`) resolve correctly on
+// non-Windows builds where `filepath.Base` only treats `/` as a separator.
+//
+// All command-routing sites (argv builder, executable resolver, prompt
+// detector, stdin envelope writer, billing-var strip) MUST classify
+// commands through this helper so the routing predicate stays single-
+// sourced — otherwise an absolute path like `/usr/local/bin/claude` could
+// fall through one site but not another and silently regain API-key
+// billing (or skip the stream-json shaping that the driver depends on).
+func commandBaseName(command string) string {
+	if command == "" {
+		return ""
+	}
+	base := strings.ToLower(filepath.Base(strings.ReplaceAll(command, `\`, "/")))
+	for _, ext := range []string{".exe", ".cmd", ".bat", ".ps1"} {
+		base = strings.TrimSuffix(base, ext)
+	}
+	return base
+}
+
+// isClaudeCommand reports whether command would be routed to the `claude`
+// CLI by buildInteractiveCLIArgs. Accepts bare names, Windows shims
+// (.exe/.cmd/.bat/.ps1), and absolute / relative paths. Uses the same
+// basename-prefix predicate as the router so the billing-var strip can't
+// drift out of sync — if a command gets claude argv shaping, it MUST also
+// get the claude env policy, or a `claude-edge` (or any future `claude*`
+// variant) would silently regain API-key billing.
+// Used to gate the ANTHROPIC_* billing-var strip in sanitizeClaudeChildEnv.
+func isClaudeCommand(command string) bool {
+	return strings.HasPrefix(commandBaseName(command), "claude")
+}
+
+/* --------------------------------------------------------------------------
    CLI argument builders
    -------------------------------------------------------------------------- */
 
@@ -971,16 +1073,16 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
 // the stdinPrompt before writing it to the process stdin.
 func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
-	cmdLower := strings.ToLower(command)
+	base := commandBaseName(command)
 
 	switch {
-	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
+	case strings.HasPrefix(base, "claude"):
 		return buildClaudeInteractiveArgs(args)
-	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
+	case strings.HasPrefix(base, "codex"):
 		return buildCodexInteractiveArgs(args)
-	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
+	case strings.HasPrefix(base, "gemini"):
 		return buildGeminiInteractiveArgs(args)
-	case cmdLower == "agy" || strings.HasPrefix(cmdLower, "agy"):
+	case strings.HasPrefix(base, "agy"):
 		return buildAntigravityInteractiveArgs(args), ""
 	default:
 		return args, ""
@@ -999,15 +1101,11 @@ func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
 // Centralises the per-CLI knowledge so the StartSession write path doesn't
 // hard-code claude's protocol against any non-empty stdinPrompt.
 func stdinPromptFormat(command string) string {
-	cmd := strings.ToLower(command)
-	cmd = strings.TrimSuffix(cmd, ".exe")
-	cmd = strings.TrimSuffix(cmd, ".cmd")
-	cmd = strings.TrimSuffix(cmd, ".bat")
-	cmd = strings.TrimSuffix(cmd, ".ps1")
-	switch cmd {
-	case "claude":
+	base := commandBaseName(command)
+	switch {
+	case strings.HasPrefix(base, "claude"):
 		return "ndjson"
-	case "codex", "gemini":
+	case strings.HasPrefix(base, "codex"), strings.HasPrefix(base, "gemini"):
 		return "plain"
 	}
 	return ""
@@ -1044,9 +1142,14 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 	}
 
 	// Separate user-provided flags from prompt words.
-	// -p / --print are stripped — we never want claude in print/one-shot mode
-	// on this path; it would exit after the first turn and break cross-step
-	// session.sendInput.
+	// -p / --print (and the equals-form variants -p=... / --print=...) are
+	// stripped — we never want claude in print/one-shot mode on this path; it
+	// would exit after the first turn and break cross-step session.sendInput.
+	// Keeping the interactive launch shape is also load-bearing for billing:
+	// starting 2026-06-15 Anthropic routes `claude -p` / Agent SDK usage on
+	// Pro/Max/Team subscriptions through a separate Agent SDK credit pool,
+	// while plain interactive Claude Code keeps drawing from the normal
+	// subscription allowance. See CLI_AGENT_INTEGRATION.md.
 	var flags []string
 	var promptParts []string
 	skipNext := false
@@ -1057,6 +1160,22 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 			continue
 		}
 		if a == "-p" || a == "--print" {
+			continue
+		}
+		// Equals-form: strip the print/one-shot mode flag but keep the inline
+		// prompt text (e.g. `claude --print=hello` → prompt "hello") so the
+		// interactive launch still answers the caller's query instead of
+		// hanging on empty stdin.
+		if strings.HasPrefix(a, "-p=") {
+			if v := strings.TrimPrefix(a, "-p="); v != "" {
+				promptParts = append(promptParts, v)
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "--print=") {
+			if v := strings.TrimPrefix(a, "--print="); v != "" {
+				promptParts = append(promptParts, v)
+			}
 			continue
 		}
 		if strings.HasPrefix(a, "-") {
@@ -1382,9 +1501,30 @@ func buildGeminiInteractiveArgs(args []string) ([]string, string) {
 
 // resolveExecutable resolves the full path to a CLI executable.
 func resolveExecutable(command string) string {
-	cmdLower := strings.ToLower(command)
+	// If the caller supplied an explicit path (absolute or relative), honor
+	// it instead of falling back to the cached PATH-resolved `claude`. This
+	// matters for test shims and side-by-side installs like
+	// `/opt/claude-nightly/claude` — the basename still routes through
+	// isClaudeCommand for argv shaping and the billing-var strip, but the
+	// binary that gets exec'd is the one the caller actually pointed at.
+	if isExplicitPath(command) {
+		// Relative explicit paths (e.g. `./claude`, `bin/claude`) must be
+		// resolved against the session's cwd, not the agent's. exec.LookPath
+		// resolves against the agent's current directory, so calling it here
+		// would silently launch the agent-cwd binary and ignore the caller's
+		// requested workspace. Pass the relative path through unchanged —
+		// exec.Command + proc.Dir then resolves it inside the child's cwd
+		// at exec time, matching the pre-PR behaviour for relative paths.
+		if isRelativeExplicitPath(command) {
+			return command
+		}
+		if path, err := exec.LookPath(command); err == nil {
+			return path
+		}
+		return command
+	}
 
-	if cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude") {
+	if isClaudeCommand(command) {
 		return cachedResolveClaudePath()
 	}
 
@@ -1397,6 +1537,36 @@ func resolveExecutable(command string) string {
 	}
 
 	return command
+}
+
+// isExplicitPath reports whether command was supplied as an explicit
+// filesystem path (contains a separator) rather than a bare name to be
+// resolved against PATH.
+func isExplicitPath(command string) bool {
+	return strings.ContainsAny(command, `/\`)
+}
+
+// isRelativeExplicitPath reports whether command is an explicit path that
+// must be resolved against the child's working directory rather than the
+// agent's. Used so resolveExecutable can skip exec.LookPath (which would
+// resolve against the agent's cwd) and let exec.Command + proc.Dir do the
+// resolution at child-exec time. Recognises Windows drive-letter paths
+// cross-platform so a `C:\tools\claude.cmd` arriving on a non-Windows
+// runtime is still treated as absolute, not cwd-relative.
+func isRelativeExplicitPath(command string) bool {
+	if !isExplicitPath(command) {
+		return false
+	}
+	if filepath.IsAbs(command) {
+		return false
+	}
+	if len(command) >= 2 && command[1] == ':' {
+		c := command[0]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			return false
+		}
+	}
+	return true
 }
 
 /* --------------------------------------------------------------------------
@@ -1431,14 +1601,14 @@ func detectPromptFromJSON(command, line string) *promptInfo {
 		return nil
 	}
 
-	cmdLower := strings.ToLower(command)
+	base := commandBaseName(command)
 
 	switch {
-	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
+	case strings.HasPrefix(base, "claude"):
 		return detectClaudePrompt(event)
-	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
+	case strings.HasPrefix(base, "codex"):
 		return detectCodexPrompt(event)
-	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
+	case strings.HasPrefix(base, "gemini"):
 		return detectGeminiPrompt(event)
 	}
 
@@ -1449,8 +1619,7 @@ func detectPromptFromJSON(command, line string) *promptInfo {
 // signalling that the current turn is complete and stdin can be closed.
 // Only applies to Claude sessions using --output-format stream-json.
 func detectResultEvent(command, line string) bool {
-	cmdLower := strings.ToLower(command)
-	if cmdLower != "claude" && !strings.HasPrefix(cmdLower, "claude") {
+	if !isClaudeCommand(command) {
 		return false
 	}
 	trimmed := strings.TrimSpace(line)

@@ -103,6 +103,62 @@ func TestBuildClaudeInteractiveArgs_StripsUserSuppliedPrintFlag(t *testing.T) {
 	}
 }
 
+func TestBuildClaudeInteractiveArgs_StripsPrintFlagVariants(t *testing.T) {
+	// All of these forms must be removed from argv — leaving any of them
+	// would put claude into print/one-shot mode (kills multi-turn) and, after
+	// 2026-06-15, divert billing to the Agent SDK credit pool.
+	cases := []struct {
+		name       string
+		input      []string
+		wantPrompt string
+	}{
+		{"short flag leading", []string{"-p", "hello"}, "hello"},
+		{"long flag leading", []string{"--print", "hello"}, "hello"},
+		{"short equals form", []string{"-p=hello", "world"}, "hello world"},
+		{"long equals form", []string{"--print=hello", "world"}, "hello world"},
+		{"trailing short", []string{"hello", "-p"}, "hello"},
+		{"trailing long", []string{"hello", "--print"}, "hello"},
+		{"mixed with valued flag", []string{"--model", "sonnet", "-p", "design auth"}, "design auth"},
+		{"long equals only", []string{"--print="}, ""},
+		{"short equals only preserves prompt", []string{"-p=hello"}, "hello"},
+		{"long equals only preserves prompt", []string{"--print=hello world"}, "hello world"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args, prompt := buildClaudeInteractiveArgs(tc.input)
+			if prompt != tc.wantPrompt {
+				t.Errorf("prompt = %q, want %q (args=%v)", prompt, tc.wantPrompt, args)
+			}
+			for _, a := range args {
+				if a == "-p" || a == "--print" ||
+					strings.HasPrefix(a, "-p=") || strings.HasPrefix(a, "--print=") {
+					t.Errorf("print-flag variant %q leaked into argv: %v", a, args)
+				}
+			}
+		})
+	}
+
+	// Case sensitivity: claude's own CLI is case-sensitive on flag names,
+	// so "-P" / "--PRINT" are NOT the print flag and must pass through
+	// unchanged (they'll surface as an unknown-flag error from claude
+	// itself, which is the correct user-visible failure mode).
+	t.Run("uppercase variants pass through", func(t *testing.T) {
+		args, _ := buildClaudeInteractiveArgs([]string{"-P", "--PRINT", "hello"})
+		foundP, foundPrint := false, false
+		for _, a := range args {
+			if a == "-P" {
+				foundP = true
+			}
+			if a == "--PRINT" {
+				foundPrint = true
+			}
+		}
+		if !foundP || !foundPrint {
+			t.Errorf("uppercase -P / --PRINT must pass through, got %v", args)
+		}
+	})
+}
+
 func TestBuildClaudeInteractiveArgs_KeepsValuedFlagWithItsValue(t *testing.T) {
 	// --model sonnet must travel together: if "sonnet" were treated as a
 	// prompt word, claude would silently fall back to the default model and
@@ -608,6 +664,27 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 			t.Errorf("CODEX (upper case) should still route to codex builder, args=%v", args)
 		}
 	})
+	t.Run("path-and-shim-route-like-isClaudeCommand", func(t *testing.T) {
+		// Regression guard: the router and isClaudeCommand MUST classify
+		// commands identically — otherwise an absolute path like
+		// `/usr/local/bin/claude` or a Windows shim could get one half of the
+		// claude treatment (stream-json shaping) without the other (billing
+		// strip), or vice-versa.
+		for _, cmd := range []string{
+			"/usr/local/bin/claude",
+			`C:\Users\u\AppData\Roaming\npm\claude.cmd`,
+			"./claude",
+			"claude-edge",
+		} {
+			_, prompt := buildInteractiveCLIArgs(cmd, []string{"hi"})
+			if prompt == "" {
+				t.Errorf("buildInteractiveCLIArgs(%q) did not route to claude (empty stdinPrompt)", cmd)
+			}
+			if !isClaudeCommand(cmd) {
+				t.Errorf("isClaudeCommand(%q) = false, but router treated it as claude — predicates drifted", cmd)
+			}
+		}
+	})
 	t.Run("unknown-command-passes-through", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("git", []string{"status"})
 		if prompt != "" {
@@ -1108,6 +1185,15 @@ func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *test
 		{cmd: "gemini", stdinPrompt: "", want: true},
 		{cmd: "gemini", stdinPrompt: "hello", want: true},
 		{cmd: "gemini.cmd", stdinPrompt: "review", want: true},
+		// Path-routed claude/codex/gemini — same policy must apply when the
+		// caller supplied an absolute or relative path. Otherwise the argv
+		// builder shapes a stdin-fed codex/gemini session but stdin is left
+		// open and the child hangs waiting for EOF.
+		{cmd: "/opt/claude-nightly/claude", stdinPrompt: "", want: false},
+		{cmd: `C:\tools\claude.cmd`, stdinPrompt: "hi", want: false},
+		{cmd: "/opt/bin/codex", stdinPrompt: "review", want: true},
+		{cmd: `C:\tools\gemini.cmd`, stdinPrompt: "review", want: true},
+		{cmd: "./codex", stdinPrompt: "", want: true},
 		// Shells / non-CLI: legacy rule — close iff empty prompt.
 		{cmd: "powershell", stdinPrompt: "", want: true},
 		{cmd: "git", stdinPrompt: "", want: true},
