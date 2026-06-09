@@ -123,7 +123,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		proc.Dir = cwd
 	}
 
-	filtered, strippedVars := sanitizeClaudeChildEnv(command, os.Environ())
+	filtered, strippedVars := prepareClaudeChildEnv(command, os.Environ())
 	proc.Env = filtered
 	if len(strippedVars) > 0 {
 		fmt.Printf("%s[session] Stripped env vars from session %s: %s%s\n",
@@ -1009,6 +1009,32 @@ func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 	return filtered, stripped
 }
 
+// prepareClaudeChildEnv sanitises the parent environment for a spawned CLI
+// session and, for claude specifically, pins CLAUDE_CODE_ENTRYPOINT=cli.
+//
+// sanitizeClaudeChildEnv has already stripped any inherited
+// CLAUDE_CODE_ENTRYPOINT — it could be "claude-vscode" / "sdk-ts" if this
+// agent was itself launched from a host IDE or the Agent SDK. We then set the
+// honest "cli" value so the spawned session self-identifies as an interactive
+// CLI session, which is the launch shape this driver actually uses.
+//
+// This is load-bearing for billing. Starting 2026-06-15 Anthropic routes
+// `claude -p` / Agent SDK usage on Pro/Max/Team subscriptions through a
+// separate Agent SDK credit pool, classified in part by entrypoint. Pinning
+// "cli" makes the favourable interactive classification deterministic instead
+// of relying on claude's default-when-unset. It is the truthful tag for an
+// interactive session — NOT spoofing (we never set "claude-vscode"/"sdk-ts").
+//
+// Non-claude commands (codex / gemini / shells) get only the sanitise step;
+// no entrypoint is injected.
+func prepareClaudeChildEnv(command string, env []string) ([]string, []string) {
+	filtered, stripped := sanitizeClaudeChildEnv(command, env)
+	if isClaudeCommand(command) {
+		filtered = append(filtered, "CLAUDE_CODE_ENTRYPOINT=cli")
+	}
+	return filtered, stripped
+}
+
 // commandBaseName returns the lowercased basename of command with any
 // Windows shim extension (.exe / .cmd / .bat / .ps1) stripped. Backslashes
 // are normalized to forward slashes first so Windows-style paths
@@ -1558,6 +1584,14 @@ func isRelativeExplicitPath(command string) bool {
 		return false
 	}
 	if filepath.IsAbs(command) {
+		return false
+	}
+	// Unix-style absolute path (leading "/") — treat as absolute even on
+	// Windows, where filepath.IsAbs returns false for "/usr/local/bin/claude"
+	// (Windows absolute paths need a drive letter or UNC prefix). Symmetric
+	// with the drive-letter check below, which recognises "C:\..." as absolute
+	// on non-Windows runtimes.
+	if strings.HasPrefix(command, "/") {
 		return false
 	}
 	if len(command) >= 2 && command[1] == ':' {

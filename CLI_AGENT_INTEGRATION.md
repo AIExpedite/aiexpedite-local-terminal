@@ -110,6 +110,22 @@ Stripped variable names are logged per session as a yellow
 auditable, not hidden. Non-claude commands (codex, gemini, arbitrary
 shells) are unaffected by the billing strip and keep their existing auth.
 
+### Pinned entrypoint (claude only)
+
+After the strip, `prepareClaudeChildEnv` ([session.go](session.go)) sets
+`CLAUDE_CODE_ENTRYPOINT=cli` on the child env for claude commands. The
+`CLAUDE_` sweep above first removes any **inherited** entrypoint (which would
+be `claude-vscode` / `sdk-ts` if this agent was itself launched from a host
+IDE or the Agent SDK); we then pin the honest `cli` value so the spawned
+session self-identifies as the interactive CLI session it actually is.
+
+This is load-bearing for the **2026-06-15** split: Anthropic classifies the
+separate Agent SDK credit pool in part by entrypoint, so pinning `cli` makes
+the favourable *interactive* classification deterministic instead of relying
+on claude's default-when-unset. It is the truthful tag for this launch shape
+— it is **not** spoofing; we never set `claude-vscode` or `sdk-ts`. The pin is
+claude-specific: codex / gemini / shells never receive it.
+
 ## Enforcement points
 
 - [`session.go` — `buildClaudeInteractiveArgs`](session.go) — strips
@@ -117,6 +133,8 @@ shells) are unaffected by the billing strip and keep their existing auth.
   flag set.
 - [`session.go` — `sanitizeClaudeChildEnv`](session.go) — strips the env
   prefixes above.
+- [`session.go` — `prepareClaudeChildEnv`](session.go) — wraps the sanitiser
+  and pins `CLAUDE_CODE_ENTRYPOINT=cli` for claude commands.
 - [`session.go` — `shouldCloseStdinAfterStart`](session.go) — returns
   `false` for `claude` so multi-turn `SendInput` works.
 - [`session_cli_test.go`](session_cli_test.go) — pins the print-flag strip
