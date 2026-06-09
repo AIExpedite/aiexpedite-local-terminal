@@ -39,13 +39,19 @@ func extractDisplayText(command, line string) string {
 		return line // passthrough malformed JSON
 	}
 
-	cmdLower := strings.ToLower(command)
+	// Route through commandBaseName (see session.go) so absolute/relative
+	// paths like `/usr/local/bin/claude`, `./codex`, or `C:\tools\gemini.cmd`
+	// classify the same as their bare-name equivalents. Without this the
+	// switch falls through to the default branch for path-routed commands
+	// and the frontend sees raw stream-json/JSONL events instead of clean
+	// text.
+	base := commandBaseName(command)
 	switch {
-	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
+	case strings.HasPrefix(base, "claude"):
 		return extractClaudeDisplayText(raw)
-	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
+	case strings.HasPrefix(base, "codex"):
 		return extractCodexDisplayText(raw)
-	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
+	case strings.HasPrefix(base, "gemini"):
 		return extractGeminiDisplayText(raw)
 	default:
 		return line // passthrough unknown CLI agents

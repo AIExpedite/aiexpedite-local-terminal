@@ -960,6 +960,54 @@ func TestExtractDisplayText_Claude_SkipsInputJsonDelta(t *testing.T) {
 	}
 }
 
+func TestExtractDisplayText_RoutesPathFormsThroughBasename(t *testing.T) {
+	// Path-routed commands like `/usr/local/bin/claude`, `./codex`, or
+	// `C:\tools\gemini.cmd` must be normalized through commandBaseName before
+	// the parser switch — otherwise the switch falls through to the default
+	// branch and the frontend sees raw stream-json/JSONL events instead of
+	// clean text. This guards extractDisplayText against drifting out of sync
+	// with the buildInteractiveCLIArgs router.
+	cases := []struct {
+		name    string
+		command string
+		line    string
+		want    string
+	}{
+		{
+			name:    "claude absolute path",
+			command: "/usr/local/bin/claude",
+			line:    `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}}`,
+			want:    "Hello",
+		},
+		{
+			name:    "codex relative path",
+			command: "./codex",
+			line:    `{"type":"item.completed","item":{"type":"agent_message","text":"Done."}}`,
+			want:    "Done.",
+		},
+		{
+			name:    "gemini Windows shim path",
+			command: `C:\tools\gemini.cmd`,
+			line:    `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}`,
+			want:    "Hi",
+		},
+		{
+			name:    "claude .exe shim path",
+			command: `C:\Users\u\AppData\Roaming\npm\claude.exe`,
+			line:    `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hey"}}}`,
+			want:    "hey",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractDisplayText(tc.command, tc.line)
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 /* --------------------------------------------------------------------------
    extractDisplayText — Codex
    ------------------------------------------------------------------------ */
