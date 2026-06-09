@@ -1508,6 +1508,16 @@ func resolveExecutable(command string) string {
 	// isClaudeCommand for argv shaping and the billing-var strip, but the
 	// binary that gets exec'd is the one the caller actually pointed at.
 	if isExplicitPath(command) {
+		// Relative explicit paths (e.g. `./claude`, `bin/claude`) must be
+		// resolved against the session's cwd, not the agent's. exec.LookPath
+		// resolves against the agent's current directory, so calling it here
+		// would silently launch the agent-cwd binary and ignore the caller's
+		// requested workspace. Pass the relative path through unchanged —
+		// exec.Command + proc.Dir then resolves it inside the child's cwd
+		// at exec time, matching the pre-PR behaviour for relative paths.
+		if isRelativeExplicitPath(command) {
+			return command
+		}
 		if path, err := exec.LookPath(command); err == nil {
 			return path
 		}
@@ -1534,6 +1544,29 @@ func resolveExecutable(command string) string {
 // resolved against PATH.
 func isExplicitPath(command string) bool {
 	return strings.ContainsAny(command, `/\`)
+}
+
+// isRelativeExplicitPath reports whether command is an explicit path that
+// must be resolved against the child's working directory rather than the
+// agent's. Used so resolveExecutable can skip exec.LookPath (which would
+// resolve against the agent's cwd) and let exec.Command + proc.Dir do the
+// resolution at child-exec time. Recognises Windows drive-letter paths
+// cross-platform so a `C:\tools\claude.cmd` arriving on a non-Windows
+// runtime is still treated as absolute, not cwd-relative.
+func isRelativeExplicitPath(command string) bool {
+	if !isExplicitPath(command) {
+		return false
+	}
+	if filepath.IsAbs(command) {
+		return false
+	}
+	if len(command) >= 2 && command[1] == ':' {
+		c := command[0]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') {
+			return false
+		}
+	}
+	return true
 }
 
 /* --------------------------------------------------------------------------

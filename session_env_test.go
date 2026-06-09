@@ -223,3 +223,52 @@ func TestIsClaudeCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestIsRelativeExplicitPath(t *testing.T) {
+	// resolveExecutable must skip exec.LookPath for cwd-relative paths so
+	// the binary is resolved against the session's cwd at exec time, not
+	// the agent's. Bare names (PATH lookup), absolute Unix paths, and
+	// Windows drive-letter paths are NOT cwd-relative.
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"./claude", true},
+		{"../tools/claude", true},
+		{"bin/claude", true},
+		{`.\claude.cmd`, true},
+		{`tools\claude.exe`, true},
+		{"/opt/claude-nightly/claude", false},
+		{"/usr/local/bin/claude", false},
+		{`C:\tools\claude.cmd`, false},
+		{`c:\tools\claude.cmd`, false},
+		{"claude", false}, // bare name → PATH lookup, not explicit path
+		{"claude.exe", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isRelativeExplicitPath(tc.in); got != tc.want {
+			t.Errorf("isRelativeExplicitPath(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestResolveExecutable_PreservesCwdRelativePath(t *testing.T) {
+	// A relative explicit path like `./claude` must be returned unchanged
+	// so exec.Command + proc.Dir resolves it against the session's cwd.
+	// Running exec.LookPath here would resolve against the AGENT's cwd
+	// and silently launch the wrong binary (or none) when the agent and
+	// session live in different directories — the pre-fix bug Codex flagged.
+	cases := []string{
+		"./claude",
+		"../bin/claude",
+		"bin/claude",
+		`.\claude.cmd`,
+	}
+	for _, in := range cases {
+		if got := resolveExecutable(in); got != in {
+			t.Errorf("resolveExecutable(%q) = %q, want %q (cwd-relative paths must pass through unchanged)",
+				in, got, in)
+		}
+	}
+}
