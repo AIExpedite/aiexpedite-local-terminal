@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -122,21 +123,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		proc.Dir = cwd
 	}
 
-	// Strip CLAUDECODE and CLAUDE_* env vars so Claude Code doesn't detect a
-	// nested session or inherit IDE-specific settings (CLAUDE_CODE_ENTRYPOINT,
-	// CLAUDE_AGENT_SDK_VERSION, etc.).  The Go agent may inherit these if
-	// launched from within a Claude Code or VSCode context.
-	cleanEnv := os.Environ()
-	filtered := make([]string, 0, len(cleanEnv))
-	var strippedVars []string
-	for _, e := range cleanEnv {
-		upper := strings.ToUpper(e)
-		if strings.HasPrefix(upper, "CLAUDECODE=") || strings.HasPrefix(upper, "CLAUDE_") {
-			strippedVars = append(strippedVars, e[:strings.Index(e, "=")])
-			continue
-		}
-		filtered = append(filtered, e)
-	}
+	filtered, strippedVars := sanitizeClaudeChildEnv(command, os.Environ())
 	proc.Env = filtered
 	if len(strippedVars) > 0 {
 		fmt.Printf("%s[session] Stripped env vars from session %s: %s%s\n",
@@ -943,6 +930,103 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 }
 
 /* --------------------------------------------------------------------------
+   Child-process env sanitisation
+   -------------------------------------------------------------------------- */
+
+// claudeAlwaysStripped is the set of env-var prefixes we drop from every
+// spawned session, regardless of command. They identify or configure a
+// surrounding Claude Code / Claude IDE context (CLAUDECODE,
+// CLAUDE_CODE_ENTRYPOINT, CLAUDE_AGENT_SDK_VERSION, …) that, if leaked into
+// the child, makes claude believe it is nested inside another Claude session
+// or an IDE that isn't actually present.
+//
+// CLAUDE_CODE_OAUTH_TOKEN intentionally falls under this prefix sweep. The
+// integration relies on the user's interactive `/login` credentials stored
+// in ~/.claude/.credentials.json — there is no current code path that needs
+// a headless OAuth token injected via env. If a future maintainer wants
+// subscription-safe headless token support they should add an explicit
+// whitelist here rather than discovering the strip by accident.
+var claudeAlwaysStripped = []string{
+	"CLAUDECODE=",
+	"CLAUDE_",
+}
+
+// claudeBillingStripped is the set of env-var prefixes that would silently
+// redirect a spawned Claude Code session away from the user's `/login`
+// subscription credentials and onto API-key / OAuth-token billing. Anthropic
+// SDK precedence puts these ahead of the stored subscription token, so a
+// developer who keeps ANTHROPIC_API_KEY in their shell for unrelated SDK
+// work would otherwise unknowingly bill their company API wallet for every
+// interactive session this driver launches.
+//
+// Policy (per CLI_AGENT_INTEGRATION.md): force subscription billing — no
+// opt-in API-key escape hatch. A user who genuinely wants API-key billing
+// can run `claude` directly outside the driver.
+var claudeBillingStripped = []string{
+	"ANTHROPIC_API_KEY=",
+	"ANTHROPIC_AUTH_TOKEN=",
+}
+
+// sanitizeClaudeChildEnv returns env with any variable that would confuse a
+// spawned CLI agent (or, for claude specifically, would override the user's
+// subscription credentials) removed. The second return value lists the names
+// of the stripped variables in the order they appeared, suitable for an
+// auditable [session] log line.
+//
+// The billing-var strip is gated on isClaudeCommand(command): codex / gemini
+// / arbitrary shells are unaffected so they keep working with whatever auth
+// the user has configured for those tools.
+func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
+	stripClaudeBilling := isClaudeCommand(command)
+
+	filtered := make([]string, 0, len(env))
+	var stripped []string
+	for _, e := range env {
+		upper := strings.ToUpper(e)
+
+		drop := false
+		for _, p := range claudeAlwaysStripped {
+			if strings.HasPrefix(upper, p) {
+				drop = true
+				break
+			}
+		}
+		if !drop && stripClaudeBilling {
+			for _, p := range claudeBillingStripped {
+				if strings.HasPrefix(upper, p) {
+					drop = true
+					break
+				}
+			}
+		}
+		if drop {
+			if eq := strings.Index(e, "="); eq > 0 {
+				stripped = append(stripped, e[:eq])
+			}
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	return filtered, stripped
+}
+
+// isClaudeCommand reports whether command resolves to the `claude` CLI.
+// Accepts bare names, Windows shims (.exe/.cmd/.bat/.ps1), and absolute /
+// relative paths — anything whose basename, with a known executable suffix
+// trimmed, lowercases to "claude". Used to gate the ANTHROPIC_* billing-var
+// strip in sanitizeClaudeChildEnv so non-claude sessions keep their auth.
+func isClaudeCommand(command string) bool {
+	if command == "" {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(command))
+	for _, ext := range []string{".exe", ".cmd", ".bat", ".ps1"} {
+		base = strings.TrimSuffix(base, ext)
+	}
+	return base == "claude"
+}
+
+/* --------------------------------------------------------------------------
    CLI argument builders
    -------------------------------------------------------------------------- */
 
@@ -1044,9 +1128,14 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 	}
 
 	// Separate user-provided flags from prompt words.
-	// -p / --print are stripped — we never want claude in print/one-shot mode
-	// on this path; it would exit after the first turn and break cross-step
-	// session.sendInput.
+	// -p / --print (and the equals-form variants -p=... / --print=...) are
+	// stripped — we never want claude in print/one-shot mode on this path; it
+	// would exit after the first turn and break cross-step session.sendInput.
+	// Keeping the interactive launch shape is also load-bearing for billing:
+	// starting 2026-06-15 Anthropic routes `claude -p` / Agent SDK usage on
+	// Pro/Max/Team subscriptions through a separate Agent SDK credit pool,
+	// while plain interactive Claude Code keeps drawing from the normal
+	// subscription allowance. See CLI_AGENT_INTEGRATION.md.
 	var flags []string
 	var promptParts []string
 	skipNext := false
@@ -1056,7 +1145,8 @@ func buildClaudeInteractiveArgs(args []string) ([]string, string) {
 			flags = append(flags, a)
 			continue
 		}
-		if a == "-p" || a == "--print" {
+		if a == "-p" || a == "--print" ||
+			strings.HasPrefix(a, "-p=") || strings.HasPrefix(a, "--print=") {
 			continue
 		}
 		if strings.HasPrefix(a, "-") {

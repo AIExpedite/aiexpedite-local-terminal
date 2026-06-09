@@ -103,6 +103,60 @@ func TestBuildClaudeInteractiveArgs_StripsUserSuppliedPrintFlag(t *testing.T) {
 	}
 }
 
+func TestBuildClaudeInteractiveArgs_StripsPrintFlagVariants(t *testing.T) {
+	// All of these forms must be removed from argv — leaving any of them
+	// would put claude into print/one-shot mode (kills multi-turn) and, after
+	// 2026-06-15, divert billing to the Agent SDK credit pool.
+	cases := []struct {
+		name       string
+		input      []string
+		wantPrompt string
+	}{
+		{"short flag leading", []string{"-p", "hello"}, "hello"},
+		{"long flag leading", []string{"--print", "hello"}, "hello"},
+		{"short equals form", []string{"-p=hello", "world"}, "world"},
+		{"long equals form", []string{"--print=hello", "world"}, "world"},
+		{"trailing short", []string{"hello", "-p"}, "hello"},
+		{"trailing long", []string{"hello", "--print"}, "hello"},
+		{"mixed with valued flag", []string{"--model", "sonnet", "-p", "design auth"}, "design auth"},
+		{"long equals only", []string{"--print="}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args, prompt := buildClaudeInteractiveArgs(tc.input)
+			if prompt != tc.wantPrompt {
+				t.Errorf("prompt = %q, want %q (args=%v)", prompt, tc.wantPrompt, args)
+			}
+			for _, a := range args {
+				if a == "-p" || a == "--print" ||
+					strings.HasPrefix(a, "-p=") || strings.HasPrefix(a, "--print=") {
+					t.Errorf("print-flag variant %q leaked into argv: %v", a, args)
+				}
+			}
+		})
+	}
+
+	// Case sensitivity: claude's own CLI is case-sensitive on flag names,
+	// so "-P" / "--PRINT" are NOT the print flag and must pass through
+	// unchanged (they'll surface as an unknown-flag error from claude
+	// itself, which is the correct user-visible failure mode).
+	t.Run("uppercase variants pass through", func(t *testing.T) {
+		args, _ := buildClaudeInteractiveArgs([]string{"-P", "--PRINT", "hello"})
+		foundP, foundPrint := false, false
+		for _, a := range args {
+			if a == "-P" {
+				foundP = true
+			}
+			if a == "--PRINT" {
+				foundPrint = true
+			}
+		}
+		if !foundP || !foundPrint {
+			t.Errorf("uppercase -P / --PRINT must pass through, got %v", args)
+		}
+	})
+}
+
 func TestBuildClaudeInteractiveArgs_KeepsValuedFlagWithItsValue(t *testing.T) {
 	// --model sonnet must travel together: if "sonnet" were treated as a
 	// prompt word, claude would silently fall back to the default model and
