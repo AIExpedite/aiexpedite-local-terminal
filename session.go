@@ -485,16 +485,16 @@ func (sm *SessionManager) removeSession(id string) {
 //     pre-existing rule: close stdin iff no stdinPrompt was queued. agy gets
 //     its prompt on argv (it ignores piped stdin), so stdinPrompt is empty.
 func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
-	// Normalize: claude / claude.exe / claude.cmd should all match.
-	cmd := strings.ToLower(command)
-	cmd = strings.TrimSuffix(cmd, ".exe")
-	cmd = strings.TrimSuffix(cmd, ".cmd")
-	cmd = strings.TrimSuffix(cmd, ".bat")
-	cmd = strings.TrimSuffix(cmd, ".ps1")
-	if cmd == "claude" {
+	// Route through commandBaseName so absolute/relative paths like
+	// `/opt/bin/codex` or `C:\tools\gemini.cmd` follow the same stdin policy
+	// as bare names — otherwise the argv builder would shape them as stdin-
+	// fed codex/gemini sessions while this function left the pipe open,
+	// hanging the child waiting for EOF.
+	base := commandBaseName(command)
+	switch {
+	case strings.HasPrefix(base, "claude"):
 		return false
-	}
-	if cmd == "codex" || cmd == "gemini" {
+	case strings.HasPrefix(base, "codex"), strings.HasPrefix(base, "gemini"):
 		return true
 	}
 	return stdinPrompt == ""
@@ -1501,6 +1501,19 @@ func buildGeminiInteractiveArgs(args []string) ([]string, string) {
 
 // resolveExecutable resolves the full path to a CLI executable.
 func resolveExecutable(command string) string {
+	// If the caller supplied an explicit path (absolute or relative), honor
+	// it instead of falling back to the cached PATH-resolved `claude`. This
+	// matters for test shims and side-by-side installs like
+	// `/opt/claude-nightly/claude` — the basename still routes through
+	// isClaudeCommand for argv shaping and the billing-var strip, but the
+	// binary that gets exec'd is the one the caller actually pointed at.
+	if isExplicitPath(command) {
+		if path, err := exec.LookPath(command); err == nil {
+			return path
+		}
+		return command
+	}
+
 	if isClaudeCommand(command) {
 		return cachedResolveClaudePath()
 	}
@@ -1514,6 +1527,13 @@ func resolveExecutable(command string) string {
 	}
 
 	return command
+}
+
+// isExplicitPath reports whether command was supplied as an explicit
+// filesystem path (contains a separator) rather than a bare name to be
+// resolved against PATH.
+func isExplicitPath(command string) bool {
+	return strings.ContainsAny(command, `/\`)
 }
 
 /* --------------------------------------------------------------------------

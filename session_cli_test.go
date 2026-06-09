@@ -1185,6 +1185,15 @@ func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *test
 		{cmd: "gemini", stdinPrompt: "", want: true},
 		{cmd: "gemini", stdinPrompt: "hello", want: true},
 		{cmd: "gemini.cmd", stdinPrompt: "review", want: true},
+		// Path-routed claude/codex/gemini — same policy must apply when the
+		// caller supplied an absolute or relative path. Otherwise the argv
+		// builder shapes a stdin-fed codex/gemini session but stdin is left
+		// open and the child hangs waiting for EOF.
+		{cmd: "/opt/claude-nightly/claude", stdinPrompt: "", want: false},
+		{cmd: `C:\tools\claude.cmd`, stdinPrompt: "hi", want: false},
+		{cmd: "/opt/bin/codex", stdinPrompt: "review", want: true},
+		{cmd: `C:\tools\gemini.cmd`, stdinPrompt: "review", want: true},
+		{cmd: "./codex", stdinPrompt: "", want: true},
 		// Shells / non-CLI: legacy rule — close iff empty prompt.
 		{cmd: "powershell", stdinPrompt: "", want: true},
 		{cmd: "git", stdinPrompt: "", want: true},
