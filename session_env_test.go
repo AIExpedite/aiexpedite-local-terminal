@@ -189,6 +189,66 @@ func TestSanitizeClaudeChildEnv_MalformedEntryWithoutEquals(t *testing.T) {
 	}
 }
 
+func TestPrepareClaudeChildEnv_PinsCliEntrypointForClaude(t *testing.T) {
+	// A spawned claude session must self-identify as an interactive CLI
+	// session (CLAUDE_CODE_ENTRYPOINT=cli) — the launch shape this driver
+	// uses — even when this agent inherited a different entrypoint (e.g.
+	// "claude-vscode" from a host IDE). The inherited value is stripped by
+	// sanitize, then the canonical "cli" is pinned. Load-bearing for the
+	// 2026-06-15 Agent-SDK-credit-pool split (see CLI_AGENT_INTEGRATION.md).
+	in := []string{
+		"PATH=/usr/bin",
+		"CLAUDE_CODE_ENTRYPOINT=claude-vscode",
+	}
+	out, stripped := prepareClaudeChildEnv("claude", in)
+
+	var vals []string
+	for _, e := range out {
+		if strings.HasPrefix(e, "CLAUDE_CODE_ENTRYPOINT=") {
+			vals = append(vals, strings.TrimPrefix(e, "CLAUDE_CODE_ENTRYPOINT="))
+		}
+	}
+	if len(vals) != 1 || vals[0] != "cli" {
+		t.Errorf("claude child env must pin exactly CLAUDE_CODE_ENTRYPOINT=cli, got %v (full=%v)", vals, out)
+	}
+
+	// The inherited entrypoint must still be recorded as stripped so the
+	// audit log line reflects what was removed.
+	found := false
+	for _, s := range stripped {
+		if s == "CLAUDE_CODE_ENTRYPOINT" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("inherited CLAUDE_CODE_ENTRYPOINT should be recorded as stripped, got %v", stripped)
+	}
+}
+
+func TestPrepareClaudeChildEnv_NoEntrypointForNonClaude(t *testing.T) {
+	// codex / gemini / shells must not be tagged with claude's entrypoint —
+	// the pin is claude-specific.
+	in := []string{"PATH=/usr/bin"}
+	for _, cmd := range []string{"codex", "gemini", "agy", "git", ""} {
+		t.Run(cmd, func(t *testing.T) {
+			out, _ := prepareClaudeChildEnv(cmd, in)
+			if envHas(out, "CLAUDE_CODE_ENTRYPOINT") {
+				t.Errorf("non-claude %q must not get CLAUDE_CODE_ENTRYPOINT, got %v", cmd, out)
+			}
+		})
+	}
+}
+
+func TestPrepareClaudeChildEnv_PinsCliWhenAbsent(t *testing.T) {
+	// Even with no inherited entrypoint at all, claude must end up pinned to
+	// cli rather than relying on claude's default-when-unset.
+	out, _ := prepareClaudeChildEnv("claude", []string{"PATH=/usr/bin"})
+	if !envHas(out, "CLAUDE_CODE_ENTRYPOINT") {
+		t.Errorf("claude child env must pin CLAUDE_CODE_ENTRYPOINT=cli, got %v", out)
+	}
+}
+
 func TestIsClaudeCommand(t *testing.T) {
 	cases := []struct {
 		in   string
