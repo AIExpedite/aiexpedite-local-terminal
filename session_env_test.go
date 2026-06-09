@@ -207,8 +207,13 @@ func TestIsClaudeCommand(t *testing.T) {
 		{"codex", false},
 		{"gemini", false},
 		{"agy", false},
-		{"claude-code", false}, // not the same binary
-		{"myclaude", false},
+		// Matches the router's HasPrefix("claude") behaviour — any future
+		// `claude-edge` / `claude-next` variant gets the same env policy as
+		// the canonical claude binary, so it can't silently regain API-key
+		// billing.
+		{"claude-edge", true},
+		{"claude-next.exe", true},
+		{"myclaude", false}, // prefix doesn't match — not routed to claude
 		{"", false},
 	}
 	for _, tc := range cases {

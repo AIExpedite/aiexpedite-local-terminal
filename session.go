@@ -1010,11 +1010,14 @@ func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 	return filtered, stripped
 }
 
-// isClaudeCommand reports whether command resolves to the `claude` CLI.
-// Accepts bare names, Windows shims (.exe/.cmd/.bat/.ps1), and absolute /
-// relative paths — anything whose basename, with a known executable suffix
-// trimmed, lowercases to "claude". Used to gate the ANTHROPIC_* billing-var
-// strip in sanitizeClaudeChildEnv so non-claude sessions keep their auth.
+// isClaudeCommand reports whether command would be routed to the `claude`
+// CLI by buildInteractiveCLIArgs. Accepts bare names, Windows shims
+// (.exe/.cmd/.bat/.ps1), and absolute / relative paths. Mirrors the
+// router's `strings.HasPrefix(cmdLower, "claude")` semantics so the
+// billing-var strip can't drift out of sync — if a command gets claude
+// argv shaping, it MUST also get the claude env policy, or a `claude-edge`
+// (or any future `claude*` variant) would silently regain API-key billing.
+// Used to gate the ANTHROPIC_* billing-var strip in sanitizeClaudeChildEnv.
 func isClaudeCommand(command string) bool {
 	if command == "" {
 		return false
@@ -1023,7 +1026,7 @@ func isClaudeCommand(command string) bool {
 	for _, ext := range []string{".exe", ".cmd", ".bat", ".ps1"} {
 		base = strings.TrimSuffix(base, ext)
 	}
-	return base == "claude"
+	return strings.HasPrefix(base, "claude")
 }
 
 /* --------------------------------------------------------------------------
