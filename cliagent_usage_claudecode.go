@@ -34,7 +34,7 @@ type claudeCredentials struct {
 }
 
 func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
-	base := firstNonEmpty(os.Getenv("CLAUDE_CONFIG_DIR"), expandHome(home, ".claude"))
+	base := claudeConfigDir(home)
 	if base == "" {
 		return nil, false
 	}
@@ -55,30 +55,106 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 	}
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
-	usage.Metrics = claudeCodeMetricsFromCache(now)
+	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)
 	return usage, true
+}
+
+// claudeConfigDir resolves the Claude config dir using the same precedence Parse
+// uses (CLAUDE_CONFIG_DIR override, then ~/.claude). Empty when neither resolves.
+func claudeConfigDir(home string) string {
+	return firstNonEmpty(os.Getenv("CLAUDE_CONFIG_DIR"), expandHome(home, ".claude"))
+}
+
+// currentClaudeAccountFingerprint reads the Claude credentials on disk and
+// returns the same fingerprint Parse would attach to a usage snapshot. Used by
+// the capture path to scope the rate-limit cache to the active account.
+// Returns "" when no creds are readable, in which case the cache is unscoped
+// (best-effort, matches pre-scoping behavior).
+func currentClaudeAccountFingerprint() string {
+	home, _ := os.UserHomeDir()
+	base := claudeConfigDir(home)
+	if base == "" {
+		return ""
+	}
+	creds := claudeCredentials{}
+	if !readJSONFile(expandHome(base, ".credentials.json"), &creds) {
+		return ""
+	}
+	account := firstNonEmpty(creds.Email, creds.Account, creds.Organization)
+	return fingerprintAccount("claudeCode", account)
 }
 
 // claudeCodeMetricsFromCache builds the metric rows from the rate-limit cache,
 // falling back to the Unknown placeholders when a window hasn't been observed.
 // Two rows are always shown so the card layout is stable: the 5-hour session
-// window and the weekly window.
-func claudeCodeMetricsFromCache(now time.Time) []cliAgentUsageMetric {
+// window and the weekly window. The cache is ignored when its account
+// fingerprint doesn't match the current account — otherwise a previous user's
+// reset times would be reported under the new account.
+func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentUsageMetric {
 	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
 	buckets := map[string]claudeRateLimitBucket{}
-	if ok {
+	if ok && (currentFingerprint == "" || snap.AccountFingerprint == "" || snap.AccountFingerprint == currentFingerprint) {
 		buckets = snap.Buckets
 	}
 
 	session := observedMetricOrUnknown(
 		buckets, []string{claudeWindowFiveHour}, limitKindSession, "5-hour session window", now)
-	// Weekly is reported under seven_day; some plans split it per-model.
-	weekly := observedMetricOrUnknown(
-		buckets,
-		[]string{claudeWindowSevenDay, claudeWindowSevenDaySonnet, claudeWindowSevenDayOpus},
-		limitKindWeekly, "Weekly quota", now)
+	// Weekly is reported under seven_day; some plans split it per-model. When
+	// both per-model buckets are present we aggregate CONSERVATIVELY so an
+	// exhausted Opus quota isn't hidden behind a healthier Sonnet number.
+	weekly := aggregateWeeklyMetric(buckets, now)
 
 	return []cliAgentUsageMetric{session, weekly}
+}
+
+// aggregateWeeklyMetric reports the worst observed seven-day window: the
+// highest used percentage and the soonest reset across the unified `seven_day`
+// bucket and any per-model split (`seven_day_sonnet`, `seven_day_opus`). This
+// prevents a healthy Sonnet bucket from masking a depleted Opus bucket on
+// plans that emit them separately.
+func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Time) cliAgentUsageMetric {
+	windowIDs := []string{claudeWindowSevenDay, claudeWindowSevenDaySonnet, claudeWindowSevenDayOpus}
+	var (
+		observed     bool
+		worstUsed    float64
+		soonestReset int64
+	)
+	for _, id := range windowIDs {
+		b, ok := buckets[id]
+		if !ok {
+			continue
+		}
+		used := b.UsedPercentage
+		if b.ResetsAtMs > 0 && now.UnixMilli() >= b.ResetsAtMs {
+			used = 0 // this sub-window has already rolled over
+		}
+		used = clampPercent(used)
+		if !observed || used > worstUsed {
+			worstUsed = used
+		}
+		if b.ResetsAtMs > 0 && now.UnixMilli() < b.ResetsAtMs {
+			if soonestReset == 0 || b.ResetsAtMs < soonestReset {
+				soonestReset = b.ResetsAtMs
+			}
+		}
+		observed = true
+	}
+	if !observed {
+		return cliAgentUsageMetric{Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%", Unknown: true}
+	}
+	var resetAt string
+	if soonestReset > 0 {
+		resetAt = time.UnixMilli(soonestReset).UTC().Format(time.RFC3339)
+	}
+	return cliAgentUsageMetric{
+		Kind:      limitKindWeekly,
+		Label:     "Weekly quota",
+		Unit:      "%",
+		Total:     floatPtr(100),
+		Consumed:  floatPtr(worstUsed),
+		Remaining: floatPtr(100 - worstUsed),
+		ResetAt:   resetAt,
+	}
 }
 
 // observedMetricOrUnknown returns a real percentage metric for the first window

@@ -60,9 +60,14 @@ type claudeRateLimitBucket struct {
 }
 
 // claudeRateLimitSnapshot is the on-disk cache, keyed by window id.
+// AccountFingerprint pins the snapshot to the Claude account that produced it
+// — when the local creds change, a stale weekly/future-reset bucket must NOT
+// be attributed to the new account (the CLI Agents tab would otherwise show
+// another user's capacity until the new account emits its own telemetry).
 type claudeRateLimitSnapshot struct {
-	UpdatedAt string                           `json:"updatedAt"`
-	Buckets   map[string]claudeRateLimitBucket `json:"buckets"`
+	UpdatedAt          string                           `json:"updatedAt"`
+	AccountFingerprint string                           `json:"accountFingerprint,omitempty"`
+	Buckets            map[string]claudeRateLimitBucket `json:"buckets"`
 }
 
 // claudeRateLimitMu serialises the read-modify-write of the cache file. A
@@ -233,7 +238,7 @@ func captureClaudeRateLimitLine(line string, now time.Time) *claudeRateLimitBuck
 	if len(updates) == 0 {
 		return nil
 	}
-	mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now)
+	mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint())
 
 	// Surface the most urgent rejected window (soonest reset) for the caller.
 	var rejected *claudeRateLimitBucket
@@ -249,8 +254,11 @@ func captureClaudeRateLimitLine(line string, now time.Time) *claudeRateLimitBuck
 }
 
 // mergeClaudeRateLimitCache read-modify-writes the cache, overwriting only the
-// windows present in `updates` and leaving the rest intact.
-func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBucket, now time.Time) {
+// windows present in `updates` and leaving the rest intact. When the existing
+// snapshot was captured under a different account fingerprint, its buckets are
+// discarded — a previous account's reset times must not bleed into the new
+// account's display.
+func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint string) {
 	if path == "" || len(updates) == 0 {
 		return
 	}
@@ -264,10 +272,18 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 			snap.Buckets = map[string]claudeRateLimitBucket{}
 		}
 	}
+	// Scope to the current account: if the existing snapshot belongs to a
+	// different identity, drop its buckets before merging.
+	if fingerprint != "" && snap.AccountFingerprint != "" && snap.AccountFingerprint != fingerprint {
+		snap.Buckets = map[string]claudeRateLimitBucket{}
+	}
 	for window, bucket := range updates {
 		snap.Buckets[window] = bucket
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
+	if fingerprint != "" {
+		snap.AccountFingerprint = fingerprint
+	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return
