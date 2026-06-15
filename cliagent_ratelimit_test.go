@@ -469,7 +469,7 @@ func TestClaudeCodeMetricsFromCache_WeeklyResetTracksWorstBucket(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
-	sonnetReset := now.Add(24 * time.Hour).UnixMilli()    // sooner, but healthy
+	sonnetReset := now.Add(24 * time.Hour).UnixMilli()   // sooner, but healthy
 	opusReset := now.Add(7 * 24 * time.Hour).UnixMilli() // later, constraining
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowSevenDaySonnet: {UsedPercentage: 10, ResetsAtMs: sonnetReset, Status: "allowed", usageKnown: true},

@@ -120,9 +120,9 @@ func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliA
 func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Time) cliAgentUsageMetric {
 	windowIDs := []string{claudeWindowSevenDay, claudeWindowSevenDaySonnet, claudeWindowSevenDayOpus}
 	var (
-		observed    bool
-		worstUsed   float64
-		worstReset  int64
+		observed   bool
+		worstUsed  float64
+		worstReset int64
 	)
 	for _, id := range windowIDs {
 		b, ok := buckets[id]
