@@ -12,7 +12,10 @@
 //	and the status line surface emits the equivalent
 //	    rate_limits.<window>.{ used_percentage, resets_at }.
 //	We accept BOTH shapes so a future Claude Code version that moves the data
-//	between surfaces keeps working.
+//	between surfaces keeps working. Field names are also matched in both
+//	snake_case and camelCase: the rejected `rate_limit_event` upstream uses
+//	camelCase (`rateLimitType`, `resetsAt`) while the SDK / status-line shape
+//	uses snake_case — both must be parsed or rejected sessions go uncaptured.
 //
 // Two consumers read the cache this writes:
 //  1. cliagent_usage_claudecode.go — turns the snapshot into the real
@@ -77,6 +80,21 @@ func claudeRateLimitCachePath() string {
 	return filepath.Join(GetConfigDir(), "claude_rate_limits.json")
 }
 
+// pickField returns the first value present under any of the given keys, plus
+// whether one was found. Claude Code's stream-json emits the same fields in
+// either snake_case or camelCase depending on surface and version (e.g. the
+// rejected `rate_limit_event` upstream uses `rateLimitType` / `resetsAt`,
+// while the status-line / SDK shape uses `rate_limit_type` / `resets_at`).
+// Accepting both keeps parsing resilient across versions.
+func pickField(m map[string]interface{}, keys ...string) (interface{}, bool) {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
 // numAsFloat coerces a decoded JSON value (float64, json.Number, or numeric
 // string) into a float64. Returns (0, false) for anything non-numeric.
 func numAsFloat(v interface{}) (float64, bool) {
@@ -116,13 +134,13 @@ func bucketFromInfo(info map[string]interface{}, nowMs int64) (claudeRateLimitBu
 	if s, ok := info["status"].(string); ok {
 		b.Status = s
 	}
-	if v, ok := info["resets_at"]; ok {
+	if v, ok := pickField(info, "resets_at", "resetsAt"); ok {
 		if f, ok := numAsFloat(v); ok {
 			b.ResetsAtMs = normalizeResetMs(f)
 		}
 	}
 	// Prefer an explicit 0..100 percentage; fall back to 0..1 utilization.
-	if v, ok := info["used_percentage"]; ok {
+	if v, ok := pickField(info, "used_percentage", "usedPercentage"); ok {
 		if f, ok := numAsFloat(v); ok {
 			b.UsedPercentage = clampPercent(f)
 		}
@@ -159,11 +177,13 @@ func extractClaudeRateLimitBuckets(raw map[string]interface{}, nowMs int64) map[
 	out := map[string]claudeRateLimitBucket{}
 
 	// Shape 3: a map of windows.
-	if rl, ok := raw["rate_limits"].(map[string]interface{}); ok {
-		for window, v := range rl {
-			if info, ok := v.(map[string]interface{}); ok {
-				if b, ok := bucketFromInfo(info, nowMs); ok {
-					out[window] = b
+	if v, ok := pickField(raw, "rate_limits", "rateLimits"); ok {
+		if rl, ok := v.(map[string]interface{}); ok {
+			for window, v := range rl {
+				if info, ok := v.(map[string]interface{}); ok {
+					if b, ok := bucketFromInfo(info, nowMs); ok {
+						out[window] = b
+					}
 				}
 			}
 		}
@@ -171,10 +191,15 @@ func extractClaudeRateLimitBuckets(raw map[string]interface{}, nowMs int64) map[
 
 	// Shapes 1 & 2: a single window carried by rate_limit_info / top level.
 	info := raw
-	if nested, ok := raw["rate_limit_info"].(map[string]interface{}); ok {
-		info = nested
+	if v, ok := pickField(raw, "rate_limit_info", "rateLimitInfo"); ok {
+		if nested, ok := v.(map[string]interface{}); ok {
+			info = nested
+		}
 	}
-	window, _ := info["rate_limit_type"].(string)
+	window := ""
+	if v, ok := pickField(info, "rate_limit_type", "rateLimitType"); ok {
+		window, _ = v.(string)
+	}
 	if window != "" {
 		if b, ok := bucketFromInfo(info, nowMs); ok {
 			out[window] = b
@@ -191,7 +216,12 @@ func extractClaudeRateLimitBuckets(raw map[string]interface{}, nowMs int64) map[
 // (this runs in the hot streaming path and must never break a session).
 func captureClaudeRateLimitLine(line string, now time.Time) *claudeRateLimitBucket {
 	trimmed := strings.TrimSpace(line)
-	if !strings.HasPrefix(trimmed, "{") || !strings.Contains(trimmed, "rate_limit") {
+	if !strings.HasPrefix(trimmed, "{") {
+		return nil
+	}
+	// Cheap prefilter: only attempt the JSON decode when the line could plausibly
+	// carry rate-limit telemetry, in either snake_case or camelCase shape.
+	if !strings.Contains(trimmed, "rate_limit") && !strings.Contains(trimmed, "rateLimit") {
 		return nil
 	}
 	var raw map[string]interface{}

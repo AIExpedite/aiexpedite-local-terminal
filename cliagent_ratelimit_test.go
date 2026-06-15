@@ -136,6 +136,67 @@ func TestClaudeCodeMetricsFromCache_NoCacheFallsBackToUnknown(t *testing.T) {
 	}
 }
 
+// Claude Code's rejected rate_limit_event emits camelCase keys upstream
+// (`rateLimitType`, `resetsAt`, `usedPercentage`). The capture path must
+// recognise that shape too — otherwise a real limit hit yields an empty
+// window, no rejected bucket, and the orchestrator never gets the synthetic
+// "resets at" line that drives auto-defer.
+func TestCaptureClaudeRateLimit_CamelCase_RejectedSurfacesResetLine(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(45 * time.Minute)
+	line := `{"type":"rate_limit_event","rateLimitInfo":{"status":"rejected","rateLimitType":"five_hour","utilization":1.0,"resetsAt":` +
+		itoa(reset.Unix()) + `}}`
+
+	rejected := captureClaudeRateLimitLine(line, now)
+	if rejected == nil {
+		t.Fatalf("rejected camelCase window must be surfaced")
+	}
+	notice := formatClaudeLimitLine(*rejected)
+	if !strings.Contains(notice, "usage limit") || !strings.Contains(notice, "resets at ") {
+		t.Errorf("limit line %q missing cue/reset phrasing", notice)
+	}
+	if !strings.Contains(notice, reset.UTC().Format(time.RFC3339)) {
+		t.Errorf("limit line %q missing exact reset timestamp", notice)
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache to be written from camelCase event")
+	}
+	b, ok := snap.Buckets[claudeWindowFiveHour]
+	if !ok {
+		t.Fatalf("expected five_hour bucket, got %+v", snap.Buckets)
+	}
+	if b.Status != claudeRateLimitStatusRejected {
+		t.Errorf("Status=%q, want rejected", b.Status)
+	}
+	if b.ResetsAtMs != reset.Unix()*1000 {
+		t.Errorf("ResetsAtMs=%d, want %d", b.ResetsAtMs, reset.Unix()*1000)
+	}
+}
+
+func TestCaptureClaudeRateLimit_CamelCase_RateLimitsMapShape(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	fiveReset := now.Add(time.Hour).UnixMilli()
+	line := `{"type":"result","rateLimits":{"five_hour":{"usedPercentage":62.5,"resetsAt":` +
+		itoa(fiveReset) + `}}}`
+
+	captureClaudeRateLimitLine(line, now)
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache write")
+	}
+	got := snap.Buckets[claudeWindowFiveHour]
+	if got.UsedPercentage != 62.5 || got.ResetsAtMs != fiveReset {
+		t.Errorf("five_hour=%+v, want used 62.5 reset %d", got, fiveReset)
+	}
+}
+
 func TestNormalizeResetMs(t *testing.T) {
 	if got := normalizeResetMs(1781544600); got != 1781544600000 {
 		t.Errorf("seconds: got %d, want 1781544600000", got)
