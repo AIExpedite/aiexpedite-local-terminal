@@ -273,6 +273,49 @@ func TestMergeClaudeRateLimitCache_DropsOtherAccountBuckets(t *testing.T) {
 	}
 }
 
+// When the current account cannot be identified (creds removed or
+// unreadable), a scoped snapshot from a previous account must NOT be trusted
+// — otherwise gatherCLIAgentUsage attributes the prior user's reset windows
+// to the device-scoped fallback entry on the CLI Agents tab.
+func TestClaudeCodeMetricsFromCache_IgnoresScopedSnapshotWhenAccountUnknown(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 80, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed"},
+		claudeWindowSevenDay: {UsedPercentage: 91, ResetsAtMs: now.Add(48 * time.Hour).UnixMilli(), Status: "allowed"},
+	}, now, "fp-prior-signed-in-account")
+
+	metrics := claudeCodeMetricsFromCache(now, "")
+	for _, m := range metrics {
+		if !m.Unknown {
+			t.Errorf("metric %q must be Unknown when current account is unidentifiable (scoped cache must not leak)", m.Kind)
+		}
+	}
+}
+
+// An unscoped snapshot (legacy or test-written without a fingerprint) is
+// accepted by an unscoped reader — preserves the "no creds anywhere" path
+// used by capture-path tests and pre-scoping caches.
+func TestClaudeCodeMetricsFromCache_UnscopedSnapshotWithUnknownAccount(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 25, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed"},
+	}, now, "")
+
+	metrics := claudeCodeMetricsFromCache(now, "")
+	if metrics[0].Unknown {
+		t.Errorf("unscoped reader must accept unscoped snapshot, got Unknown")
+	}
+	if metrics[0].Consumed == nil || *metrics[0].Consumed != 25 {
+		t.Errorf("session Consumed=%v, want 25", metrics[0].Consumed)
+	}
+}
+
 func TestNormalizeResetMs(t *testing.T) {
 	if got := normalizeResetMs(1781544600); got != 1781544600000 {
 		t.Errorf("seconds: got %d, want 1781544600000", got)

@@ -87,13 +87,18 @@ func currentClaudeAccountFingerprint() string {
 // claudeCodeMetricsFromCache builds the metric rows from the rate-limit cache,
 // falling back to the Unknown placeholders when a window hasn't been observed.
 // Two rows are always shown so the card layout is stable: the 5-hour session
-// window and the weekly window. The cache is ignored when its account
-// fingerprint doesn't match the current account — otherwise a previous user's
-// reset times would be reported under the new account.
+// window and the weekly window.
+//
+// The cache is trusted only when its `accountFingerprint` exactly matches the
+// caller-supplied one. Two empty fingerprints match (no creds + unscoped
+// snapshot — the test/legacy default), but a scoped snapshot is ignored when
+// the current account cannot be identified: otherwise `gatherCLIAgentUsage`
+// would attribute a previous user's reset windows to the device-scoped
+// fallback entry after the local credentials were removed.
 func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentUsageMetric {
 	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
 	buckets := map[string]claudeRateLimitBucket{}
-	if ok && (currentFingerprint == "" || snap.AccountFingerprint == "" || snap.AccountFingerprint == currentFingerprint) {
+	if ok && snap.AccountFingerprint == currentFingerprint {
 		buckets = snap.Buckets
 	}
 
