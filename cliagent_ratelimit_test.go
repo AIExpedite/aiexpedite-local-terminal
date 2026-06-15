@@ -376,6 +376,39 @@ func TestMergeClaudeRateLimitCache_DropsUnscopedBucketsOnAccountSignIn(t *testin
 	}
 }
 
+// An allowed heartbeat (status + reset time, no usage field) must NOT clobber
+// a previously observed UsedPercentage with a zero default — Claude Code emits
+// such heartbeats every session and the CLI Agents tab would otherwise decay
+// to 0% consumed after each run.
+func TestCaptureClaudeRateLimit_AllowedHeartbeatPreservesPriorUsage(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	firstReset := now.Add(2 * time.Hour).Unix()
+	first := `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","utilization":0.42,"resets_at":` +
+		itoa(firstReset) + `}}`
+	captureClaudeRateLimitLine(first, now)
+
+	later := now.Add(15 * time.Minute)
+	heartbeatReset := later.Add(105 * time.Minute).Unix()
+	heartbeat := `{"type":"rate_limit_event","rateLimitInfo":{"status":"allowed","rateLimitType":"five_hour","resetsAt":` +
+		itoa(heartbeatReset) + `}}`
+	captureClaudeRateLimitLine(heartbeat, later)
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache write")
+	}
+	b := snap.Buckets[claudeWindowFiveHour]
+	if b.UsedPercentage < 41.9 || b.UsedPercentage > 42.1 {
+		t.Errorf("UsedPercentage=%v, want preserved ~42 (heartbeat must not zero it out)", b.UsedPercentage)
+	}
+	if b.ResetsAtMs != heartbeatReset*1000 {
+		t.Errorf("ResetsAtMs=%d, want updated %d from the heartbeat", b.ResetsAtMs, heartbeatReset*1000)
+	}
+}
+
 func TestNormalizeResetMs(t *testing.T) {
 	if got := normalizeResetMs(1781544600); got != 1781544600000 {
 		t.Errorf("seconds: got %d, want 1781544600000", got)

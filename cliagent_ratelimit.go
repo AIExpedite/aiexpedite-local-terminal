@@ -57,6 +57,13 @@ type claudeRateLimitBucket struct {
 	ResetsAtMs     int64   `json:"resetsAtMs"`
 	Status         string  `json:"status,omitempty"`
 	ObservedAtMs   int64   `json:"observedAtMs"`
+	// usageKnown is true when this bucket carries a fresh usage reading
+	// (utilization / used_percentage) or a synthesized 100% from a rejected
+	// status. False marks an "allowed heartbeat" that updated only the reset
+	// time / status — merge must NOT let its 0 default overwrite a previously
+	// observed UsedPercentage. Not persisted: every loaded bucket is treated
+	// as a known usage reading.
+	usageKnown bool `json:"-"`
 }
 
 // claudeRateLimitSnapshot is the on-disk cache, keyed by window id.
@@ -164,10 +171,12 @@ func bucketFromInfo(info map[string]interface{}, nowMs int64) (claudeRateLimitBu
 	// the bucket as exhausted in that case so the UI matches reality.
 	if !usageObserved && b.Status == claudeRateLimitStatusRejected {
 		b.UsedPercentage = 100
+		usageObserved = true
 	}
+	b.usageKnown = usageObserved
 	// A bucket with neither a reset time nor a status nor a usage signal is
 	// noise — refuse it so we never overwrite a good cache entry with nothing.
-	if b.ResetsAtMs == 0 && b.Status == "" && b.UsedPercentage == 0 {
+	if b.ResetsAtMs == 0 && b.Status == "" && !usageObserved {
 		return b, false
 	}
 	return b, true
@@ -292,6 +301,15 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 		snap.Buckets = map[string]claudeRateLimitBucket{}
 	}
 	for window, bucket := range updates {
+		// An "allowed" heartbeat refreshes status / reset time but carries no
+		// usage reading. Don't let its zero default clobber a previously
+		// observed UsedPercentage — Claude Code emits these heartbeats after
+		// every session, so a real percentage would otherwise decay to 0%.
+		if !bucket.usageKnown {
+			if prev, ok := snap.Buckets[window]; ok {
+				bucket.UsedPercentage = prev.UsedPercentage
+			}
+		}
 		snap.Buckets[window] = bucket
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
