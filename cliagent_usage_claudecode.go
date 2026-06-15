@@ -137,13 +137,27 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 		used = clampPercent(used)
 		// Pair the reset with the bucket that produced worstUsed so the UI
 		// reports when the *constraining* quota clears, not when an unrelated
-		// healthier bucket happens to reset first.
-		if !observed || used > worstUsed {
+		// healthier bucket happens to reset first. On a tie (e.g. both Sonnet
+		// and Opus rejected at 100%), both buckets are equally constraining
+		// and the limit doesn't clear until BOTH have reset — track the later
+		// reset so we don't tell operators they can retry while another tied
+		// bucket is still exhausted.
+		switch {
+		case !observed || used > worstUsed:
 			worstUsed = used
 			if liveReset {
 				worstReset = b.ResetsAtMs
 			} else {
 				worstReset = 0
+			}
+		case used == worstUsed:
+			switch {
+			case !liveReset:
+				// New tied bucket has no known live reset, so we can't say
+				// when the combined constraint clears — surface Unknown.
+				worstReset = 0
+			case worstReset > 0 && b.ResetsAtMs > worstReset:
+				worstReset = b.ResetsAtMs
 			}
 		}
 		observed = true

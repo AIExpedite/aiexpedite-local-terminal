@@ -548,6 +548,34 @@ func TestClaudeCodeMetricsFromCache_WeeklyResetTracksWorstBucket(t *testing.T) {
 	}
 }
 
+// When two weekly sub-windows tie at the highest usage (e.g. both Sonnet
+// and Opus rejected at 100%), the aggregate reset must follow the LATER of
+// the two buckets — the rate limit doesn't clear until BOTH have rolled
+// over. Picking the sooner one would tell operators they can retry while
+// another tied bucket is still exhausted.
+func TestClaudeCodeMetricsFromCache_WeeklyTieBreaksOnLaterReset(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	sonnetReset := now.Add(24 * time.Hour).UnixMilli() // sooner
+	opusReset := now.Add(96 * time.Hour).UnixMilli()   // later — still exhausted then
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDaySonnet: {UsedPercentage: 100, ResetsAtMs: sonnetReset, Status: "rejected", usageKnown: true},
+		claudeWindowSevenDayOpus:   {UsedPercentage: 100, ResetsAtMs: opusReset, Status: "rejected", usageKnown: true},
+	}, now, "")
+
+	metrics := claudeCodeMetricsFromCache(now, "")
+	weekly := metrics[1]
+	if weekly.Consumed == nil || *weekly.Consumed != 100 {
+		t.Fatalf("weekly Consumed=%v, want 100", weekly.Consumed)
+	}
+	wantReset := time.UnixMilli(opusReset).UTC().Format(time.RFC3339)
+	if weekly.ResetAt != wantReset {
+		t.Errorf("weekly ResetAt=%q, want %q (later of two tied buckets)", weekly.ResetAt, wantReset)
+	}
+}
+
 func TestNormalizeResetMs(t *testing.T) {
 	if got := normalizeResetMs(1781544600); got != 1781544600000 {
 		t.Errorf("seconds: got %d, want 1781544600000", got)
