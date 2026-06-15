@@ -94,8 +94,8 @@ func TestClaudeCodeMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	// five_hour observed and live; seven_day's reset already passed.
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowFiveHour: {UsedPercentage: 23.5, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed"},
-		claudeWindowSevenDay: {UsedPercentage: 90, ResetsAtMs: now.Add(-time.Hour).UnixMilli(), Status: "allowed"},
+		claudeWindowFiveHour: {UsedPercentage: 23.5, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
+		claudeWindowSevenDay: {UsedPercentage: 90, ResetsAtMs: now.Add(-time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
 	}, now, "")
 
 	metrics := claudeCodeMetricsFromCache(now, "")
@@ -207,8 +207,8 @@ func TestClaudeCodeMetricsFromCache_SplitWeeklyAggregatesConservatively(t *testi
 	sonnetReset := now.Add(96 * time.Hour).UnixMilli()
 	opusReset := now.Add(36 * time.Hour).UnixMilli() // sooner — Opus exhausted first
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowSevenDaySonnet: {UsedPercentage: 32, ResetsAtMs: sonnetReset, Status: "allowed"},
-		claudeWindowSevenDayOpus:   {UsedPercentage: 99, ResetsAtMs: opusReset, Status: "allowed"},
+		claudeWindowSevenDaySonnet: {UsedPercentage: 32, ResetsAtMs: sonnetReset, Status: "allowed", usageKnown: true},
+		claudeWindowSevenDayOpus:   {UsedPercentage: 99, ResetsAtMs: opusReset, Status: "allowed", usageKnown: true},
 	}, now, "")
 
 	metrics := claudeCodeMetricsFromCache(now, "")
@@ -233,7 +233,7 @@ func TestClaudeCodeMetricsFromCache_IgnoresOtherAccountSnapshot(t *testing.T) {
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowFiveHour: {UsedPercentage: 80, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed"},
+		claudeWindowFiveHour: {UsedPercentage: 80, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
 	}, now, "fp-previous-account")
 
 	metrics := claudeCodeMetricsFromCache(now, "fp-current-account")
@@ -251,11 +251,11 @@ func TestMergeClaudeRateLimitCache_DropsOtherAccountBuckets(t *testing.T) {
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowSevenDay: {UsedPercentage: 70, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), Status: "allowed"},
+		claudeWindowSevenDay: {UsedPercentage: 70, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
 	}, now, "fp-A")
 
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowFiveHour: {UsedPercentage: 10, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed"},
+		claudeWindowFiveHour: {UsedPercentage: 10, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
 	}, now, "fp-B")
 
 	snap, ok := loadClaudeRateLimitSnapshot(cache)
@@ -283,8 +283,8 @@ func TestClaudeCodeMetricsFromCache_IgnoresScopedSnapshotWhenAccountUnknown(t *t
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowFiveHour: {UsedPercentage: 80, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed"},
-		claudeWindowSevenDay: {UsedPercentage: 91, ResetsAtMs: now.Add(48 * time.Hour).UnixMilli(), Status: "allowed"},
+		claudeWindowFiveHour: {UsedPercentage: 80, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
+		claudeWindowSevenDay: {UsedPercentage: 91, ResetsAtMs: now.Add(48 * time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
 	}, now, "fp-prior-signed-in-account")
 
 	metrics := claudeCodeMetricsFromCache(now, "")
@@ -304,7 +304,7 @@ func TestClaudeCodeMetricsFromCache_UnscopedSnapshotWithUnknownAccount(t *testin
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowFiveHour: {UsedPercentage: 25, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed"},
+		claudeWindowFiveHour: {UsedPercentage: 25, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
 	}, now, "")
 
 	metrics := claudeCodeMetricsFromCache(now, "")
@@ -354,11 +354,11 @@ func TestMergeClaudeRateLimitCache_DropsUnscopedBucketsOnAccountSignIn(t *testin
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowSevenDay: {UsedPercentage: 88, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), Status: "allowed"},
+		claudeWindowSevenDay: {UsedPercentage: 88, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
 	}, now, "")
 
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowFiveHour: {UsedPercentage: 5, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed"},
+		claudeWindowFiveHour: {UsedPercentage: 5, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
 	}, now, "fp-new-account")
 
 	snap, ok := loadClaudeRateLimitSnapshot(cache)
@@ -406,6 +406,58 @@ func TestCaptureClaudeRateLimit_AllowedHeartbeatPreservesPriorUsage(t *testing.T
 	}
 	if b.ResetsAtMs != heartbeatReset*1000 {
 		t.Errorf("ResetsAtMs=%d, want updated %d from the heartbeat", b.ResetsAtMs, heartbeatReset*1000)
+	}
+}
+
+// A first-ever "allowed" heartbeat with no utilization must not seed the cache
+// with a fake 0%/100%-remaining bucket — there's no prior usage to preserve,
+// so the snapshot should stay empty and the metrics fall back to Unknown.
+func TestCaptureClaudeRateLimit_AllowedHeartbeatWithoutPriorUsageDoesNotPersist(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	resetSec := now.Add(2 * time.Hour).Unix()
+	line := `{"type":"rate_limit_event","rateLimitInfo":{"status":"allowed","rateLimitType":"five_hour","resetsAt":` +
+		itoa(resetSec) + `}}`
+	captureClaudeRateLimitLine(line, now)
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if ok {
+		if _, present := snap.Buckets[claudeWindowFiveHour]; present {
+			t.Fatalf("first heartbeat without usage must not persist a zero-usage bucket")
+		}
+	}
+	metrics := claudeCodeMetricsFromCache(now, "")
+	for _, m := range metrics {
+		if !m.Unknown {
+			t.Errorf("metric %q want Unknown until a usage reading arrives, got Consumed=%v", m.Kind, m.Consumed)
+		}
+	}
+}
+
+// The weekly aggregate's reset must come from the bucket that produced
+// worstUsed, not from an unrelated healthier bucket that resets sooner.
+func TestClaudeCodeMetricsFromCache_WeeklyResetTracksWorstBucket(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	sonnetReset := now.Add(24 * time.Hour).UnixMilli()    // sooner, but healthy
+	opusReset := now.Add(7 * 24 * time.Hour).UnixMilli() // later, constraining
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDaySonnet: {UsedPercentage: 10, ResetsAtMs: sonnetReset, Status: "allowed", usageKnown: true},
+		claudeWindowSevenDayOpus:   {UsedPercentage: 99, ResetsAtMs: opusReset, Status: "allowed", usageKnown: true},
+	}, now, "")
+
+	metrics := claudeCodeMetricsFromCache(now, "")
+	weekly := metrics[1]
+	if weekly.Consumed == nil || *weekly.Consumed != 99 {
+		t.Fatalf("weekly Consumed=%v, want 99", weekly.Consumed)
+	}
+	wantReset := time.UnixMilli(opusReset).UTC().Format(time.RFC3339)
+	if weekly.ResetAt != wantReset {
+		t.Errorf("weekly ResetAt=%q, want %q (must follow the constraining Opus bucket, not the sooner Sonnet reset)", weekly.ResetAt, wantReset)
 	}
 }
 

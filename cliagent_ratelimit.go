@@ -305,10 +305,15 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 		// usage reading. Don't let its zero default clobber a previously
 		// observed UsedPercentage — Claude Code emits these heartbeats after
 		// every session, so a real percentage would otherwise decay to 0%.
+		// When no prior bucket exists, skip persisting entirely: writing a
+		// zero-usage bucket would otherwise surface as a real "0% consumed /
+		// 100% remaining" row until a usage-bearing event finally arrives.
 		if !bucket.usageKnown {
-			if prev, ok := snap.Buckets[window]; ok {
-				bucket.UsedPercentage = prev.UsedPercentage
+			prev, ok := snap.Buckets[window]
+			if !ok {
+				continue
 			}
+			bucket.UsedPercentage = prev.UsedPercentage
 		}
 		snap.Buckets[window] = bucket
 	}

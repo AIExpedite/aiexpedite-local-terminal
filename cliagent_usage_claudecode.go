@@ -120,9 +120,9 @@ func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliA
 func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Time) cliAgentUsageMetric {
 	windowIDs := []string{claudeWindowSevenDay, claudeWindowSevenDaySonnet, claudeWindowSevenDayOpus}
 	var (
-		observed     bool
-		worstUsed    float64
-		soonestReset int64
+		observed    bool
+		worstUsed   float64
+		worstReset  int64
 	)
 	for _, id := range windowIDs {
 		b, ok := buckets[id]
@@ -130,16 +130,20 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 			continue
 		}
 		used := b.UsedPercentage
+		liveReset := b.ResetsAtMs > 0 && now.UnixMilli() < b.ResetsAtMs
 		if b.ResetsAtMs > 0 && now.UnixMilli() >= b.ResetsAtMs {
 			used = 0 // this sub-window has already rolled over
 		}
 		used = clampPercent(used)
+		// Pair the reset with the bucket that produced worstUsed so the UI
+		// reports when the *constraining* quota clears, not when an unrelated
+		// healthier bucket happens to reset first.
 		if !observed || used > worstUsed {
 			worstUsed = used
-		}
-		if b.ResetsAtMs > 0 && now.UnixMilli() < b.ResetsAtMs {
-			if soonestReset == 0 || b.ResetsAtMs < soonestReset {
-				soonestReset = b.ResetsAtMs
+			if liveReset {
+				worstReset = b.ResetsAtMs
+			} else {
+				worstReset = 0
 			}
 		}
 		observed = true
@@ -148,8 +152,8 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 		return cliAgentUsageMetric{Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%", Unknown: true}
 	}
 	var resetAt string
-	if soonestReset > 0 {
-		resetAt = time.UnixMilli(soonestReset).UTC().Format(time.RFC3339)
+	if worstReset > 0 {
+		resetAt = time.UnixMilli(worstReset).UTC().Format(time.RFC3339)
 	}
 	return cliAgentUsageMetric{
 		Kind:      limitKindWeekly,
