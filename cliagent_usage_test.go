@@ -35,6 +35,9 @@ func helperJWT(t *testing.T, claims any) string {
 
 func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	// Isolate from any real rate-limit cache on the dev machine so this asserts
+	// the no-telemetry (Unknown) fallback deterministically.
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
 		"email": "ada@example.com",
