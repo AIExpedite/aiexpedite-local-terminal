@@ -462,6 +462,67 @@ func TestCaptureClaudeRateLimit_AllowedHeartbeatWithoutPriorUsageDoesNotPersist(
 	}
 }
 
+// A rejected rate_limit_event may omit the window id entirely — Claude Code's
+// SDKRateLimitEvent carries status/resetsAt/utilization with no rate_limit_type.
+// It can't be cached per-window, but it MUST still drive auto-defer, so
+// captureClaudeRateLimitLine has to surface it.
+func TestCaptureClaudeRateLimit_WindowlessRejectedSurfacesResetLine(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(28 * time.Minute)
+	// No rate_limit_type / rateLimitType anywhere in the event.
+	line := `{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","utilization":1.0,"resets_at":` +
+		itoa(reset.Unix()) + `}}`
+
+	rejected := captureClaudeRateLimitLine(line, now)
+	if rejected == nil {
+		t.Fatalf("windowless rejected event must still be surfaced for auto-defer")
+	}
+	notice := formatClaudeLimitLine(*rejected)
+	if !strings.Contains(notice, "usage limit") || !strings.Contains(notice, reset.UTC().Format(time.RFC3339)) {
+		t.Errorf("limit line %q missing cue / exact reset", notice)
+	}
+	// It must NOT be written to the cache under a guessed window.
+	if snap, ok := loadClaudeRateLimitSnapshot(cache); ok && len(snap.Buckets) != 0 {
+		t.Errorf("windowless event must not be cached, got buckets %+v", snap.Buckets)
+	}
+}
+
+// A no-usage "allowed" heartbeat that arrives AFTER the prior window has rolled
+// over (its reset has passed) must not replay the old percentage under the
+// heartbeat's new, future reset. The metric should reflect the rolled-over
+// window, not a stale high-water mark.
+func TestCaptureClaudeRateLimit_RolledOverHeartbeatDropsStaleUsage(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // no creds -> unscoped fingerprint ""
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	firstReset := now.Add(30 * time.Minute)
+	first := `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","utilization":0.95,"resets_at":` +
+		itoa(firstReset.Unix()) + `}}`
+	captureClaudeRateLimitLine(first, now)
+
+	// 31 min later: the first window has reset. Heartbeat advertises a NEW reset
+	// five hours out, with no usage reading.
+	later := now.Add(31 * time.Minute)
+	heartbeat := `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","resets_at":` +
+		itoa(later.Add(5*time.Hour).Unix()) + `}}`
+	captureClaudeRateLimitLine(heartbeat, later)
+
+	metrics := claudeCodeMetricsFromCache(later, "")
+	session := metrics[0]
+	if session.Consumed != nil && *session.Consumed > 0 {
+		t.Errorf("rolled-over window Consumed=%v, want 0 — stale 95%% must not carry under the new reset", *session.Consumed)
+	}
+	if session.ResetAt != "" {
+		t.Errorf("rolled-over window must not advertise a fresh reset, got %q", session.ResetAt)
+	}
+}
+
 // The weekly aggregate's reset must come from the bucket that produced
 // worstUsed, not from an unrelated healthier bucket that resets sooner.
 func TestClaudeCodeMetricsFromCache_WeeklyResetTracksWorstBucket(t *testing.T) {

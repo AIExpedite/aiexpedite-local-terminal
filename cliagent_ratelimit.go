@@ -255,10 +255,9 @@ func captureClaudeRateLimitLine(line string, now time.Time) *claudeRateLimitBuck
 	}
 	nowMs := now.UnixMilli()
 	updates := extractClaudeRateLimitBuckets(raw, nowMs)
-	if len(updates) == 0 {
-		return nil
+	if len(updates) > 0 {
+		mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint())
 	}
-	mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint())
 
 	// Surface the rejected window with the LATEST reset time. When multiple
 	// buckets are rejected in the same event (e.g. five_hour and seven_day_opus),
@@ -266,15 +265,49 @@ func captureClaudeRateLimitLine(line string, now time.Time) *claudeRateLimitBuck
 	// resuming — picking the soonest reset would wake it while another window is
 	// still blocked, causing an immediate re-rejection from Claude.
 	var rejected *claudeRateLimitBucket
-	for _, b := range updates {
-		if b.Status == claudeRateLimitStatusRejected && b.ResetsAtMs > 0 {
-			if rejected == nil || b.ResetsAtMs > rejected.ResetsAtMs {
-				bb := b
-				rejected = &bb
-			}
+	consider := func(b claudeRateLimitBucket) {
+		if b.Status != claudeRateLimitStatusRejected || b.ResetsAtMs <= 0 {
+			return
+		}
+		if rejected == nil || b.ResetsAtMs > rejected.ResetsAtMs {
+			bb := b
+			rejected = &bb
 		}
 	}
+	for _, b := range updates {
+		consider(b)
+	}
+	// A rejected event may omit the window id — Claude Code's SDKRateLimitEvent
+	// carries status/resetsAt/utilization with no rate_limit_type. It can't be
+	// keyed into the per-window cache, but a hard limit MUST still drive the
+	// auto-defer, so consider it here even though it never reached `updates`.
+	if wl, ok := windowlessRejectedBucket(raw, nowMs); ok {
+		consider(wl)
+	}
 	return rejected
+}
+
+// windowlessRejectedBucket extracts a rejected rate-limit bucket from an event
+// that omits the window id (rate_limit_type / rateLimitType). Returns
+// (zero, false) for anything else — a windowed event (already captured via the
+// per-window path), a non-rejected status, or a missing reset time. Used only
+// to drive auto-defer; such an event is intentionally NOT cached because there
+// is no window to attribute it to on the CLI Agents tab.
+func windowlessRejectedBucket(raw map[string]interface{}, nowMs int64) (claudeRateLimitBucket, bool) {
+	info := raw
+	if v, ok := pickField(raw, "rate_limit_info", "rateLimitInfo"); ok {
+		if nested, ok := v.(map[string]interface{}); ok {
+			info = nested
+		}
+	}
+	if _, ok := pickField(info, "rate_limit_type", "rateLimitType"); ok {
+		return claudeRateLimitBucket{}, false // windowed path already handled it
+	}
+	b, ok := bucketFromInfo(info, nowMs)
+	if !ok || b.Status != claudeRateLimitStatusRejected || b.ResetsAtMs <= 0 {
+		return claudeRateLimitBucket{}, false
+	}
+	return b, true
 }
 
 // mergeClaudeRateLimitCache read-modify-writes the cache, overwriting only the
@@ -304,18 +337,30 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]claudeRateLimitBucket{}
 	}
+	nowMs := now.UnixMilli()
 	for window, bucket := range updates {
 		// An "allowed" heartbeat refreshes status / reset time but carries no
 		// usage reading. Don't let its zero default clobber a previously
 		// observed UsedPercentage — Claude Code emits these heartbeats after
 		// every session, so a real percentage would otherwise decay to 0%.
-		// When no prior bucket exists, skip persisting entirely: writing a
-		// zero-usage bucket would otherwise surface as a real "0% consumed /
-		// 100% remaining" row until a usage-bearing event finally arrives.
 		if !bucket.usageKnown {
 			prev, ok := snap.Buckets[window]
-			if !ok {
+			// Carry a prior reading forward ONLY when it still describes the
+			// same LIVE window: the prior reset is in the future, and this
+			// heartbeat either repeats that reset or omits it. If the prior
+			// window already rolled over (its reset has passed) or this
+			// heartbeat advertises a different/later reset, the percentage is
+			// stale — skip persisting so the metric reflects the rolled-over
+			// window (0% / Unknown) instead of replaying a high-water mark
+			// under the new reset. Skipping also covers the no-prior case: a
+			// first-ever heartbeat without usage must not seed a fake 0% row.
+			sameLiveWindow := ok && prev.ResetsAtMs > nowMs &&
+				(bucket.ResetsAtMs == 0 || bucket.ResetsAtMs == prev.ResetsAtMs)
+			if !sameLiveWindow {
 				continue
+			}
+			if bucket.ResetsAtMs == 0 {
+				bucket.ResetsAtMs = prev.ResetsAtMs
 			}
 			bucket.UsedPercentage = prev.UsedPercentage
 		}
