@@ -145,14 +145,25 @@ func bucketFromInfo(info map[string]interface{}, nowMs int64) (claudeRateLimitBu
 		}
 	}
 	// Prefer an explicit 0..100 percentage; fall back to 0..1 utilization.
+	usageObserved := false
 	if v, ok := pickField(info, "used_percentage", "usedPercentage"); ok {
 		if f, ok := numAsFloat(v); ok {
 			b.UsedPercentage = clampPercent(f)
+			usageObserved = true
 		}
 	} else if v, ok := info["utilization"]; ok {
 		if f, ok := numAsFloat(v); ok {
 			b.UsedPercentage = clampPercent(f * 100)
+			usageObserved = true
 		}
+	}
+	// A rejected (hard-limit) bucket may omit usedPercentage / utilization —
+	// upstream sometimes emits only status + resetsAt + rateLimitType. Without
+	// this, the cache would render 0% consumed / 100% remaining alongside a
+	// future reset, contradicting the auto-defer session.go just emitted. Treat
+	// the bucket as exhausted in that case so the UI matches reality.
+	if !usageObserved && b.Status == claudeRateLimitStatusRejected {
+		b.UsedPercentage = 100
 	}
 	// A bucket with neither a reset time nor a status nor a usage signal is
 	// noise — refuse it so we never overwrite a good cache entry with nothing.
@@ -272,18 +283,19 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 			snap.Buckets = map[string]claudeRateLimitBucket{}
 		}
 	}
-	// Scope to the current account: if the existing snapshot belongs to a
-	// different identity, drop its buckets before merging.
-	if fingerprint != "" && snap.AccountFingerprint != "" && snap.AccountFingerprint != fingerprint {
+	// Scope to the current account: any fingerprint transition is an account
+	// boundary, including unscoped<->scoped flips. Without dropping on those
+	// transitions, buckets cached while creds were unreadable get stamped under
+	// the next signed-in account's fingerprint and surface as that account's
+	// reset windows on the CLI Agents tab.
+	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]claudeRateLimitBucket{}
 	}
 	for window, bucket := range updates {
 		snap.Buckets[window] = bucket
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
-	if fingerprint != "" {
-		snap.AccountFingerprint = fingerprint
-	}
+	snap.AccountFingerprint = fingerprint
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return

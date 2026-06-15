@@ -316,6 +316,66 @@ func TestClaudeCodeMetricsFromCache_UnscopedSnapshotWithUnknownAccount(t *testin
 	}
 }
 
+// A rejected rate_limit_event without an explicit usage field must be treated
+// as fully exhausted — otherwise the cache renders 0% consumed alongside the
+// future reset, contradicting the hard-limit auto-defer session.go just fired.
+func TestCaptureClaudeRateLimit_RejectedWithoutUsageMarksExhausted(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(30 * time.Minute)
+	line := `{"type":"rate_limit_event","rateLimitInfo":{"status":"rejected","rateLimitType":"five_hour","resetsAt":` +
+		itoa(reset.Unix()) + `}}`
+
+	rejected := captureClaudeRateLimitLine(line, now)
+	if rejected == nil {
+		t.Fatalf("rejected window must be surfaced even without usage field")
+	}
+	if rejected.UsedPercentage != 100 {
+		t.Errorf("rejected bucket UsedPercentage=%v, want 100 (exhausted by default)", rejected.UsedPercentage)
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache to be written")
+	}
+	b := snap.Buckets[claudeWindowFiveHour]
+	if b.UsedPercentage != 100 {
+		t.Errorf("cached five_hour UsedPercentage=%v, want 100", b.UsedPercentage)
+	}
+}
+
+// A transition between unscoped and scoped fingerprints is an account
+// boundary too: buckets cached while creds were unreadable must not survive
+// into the new account's snapshot, or the next account would inherit a stray
+// reset window.
+func TestMergeClaudeRateLimitCache_DropsUnscopedBucketsOnAccountSignIn(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDay: {UsedPercentage: 88, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), Status: "allowed"},
+	}, now, "")
+
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 5, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed"},
+	}, now, "fp-new-account")
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected snapshot")
+	}
+	if snap.AccountFingerprint != "fp-new-account" {
+		t.Errorf("AccountFingerprint=%q, want fp-new-account", snap.AccountFingerprint)
+	}
+	if _, present := snap.Buckets[claudeWindowSevenDay]; present {
+		t.Errorf("unscoped seven_day bucket must not be carried into the signed-in account snapshot")
+	}
+	if _, present := snap.Buckets[claudeWindowFiveHour]; !present {
+		t.Errorf("five_hour bucket from the signed-in account should be present")
+	}
+}
+
 func TestNormalizeResetMs(t *testing.T) {
 	if got := normalizeResetMs(1781544600); got != 1781544600000 {
 		t.Errorf("seconds: got %d, want 1781544600000", got)
