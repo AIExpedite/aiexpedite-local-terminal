@@ -260,11 +260,15 @@ func captureClaudeRateLimitLine(line string, now time.Time) *claudeRateLimitBuck
 	}
 	mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint())
 
-	// Surface the most urgent rejected window (soonest reset) for the caller.
+	// Surface the rejected window with the LATEST reset time. When multiple
+	// buckets are rejected in the same event (e.g. five_hour and seven_day_opus),
+	// the orchestrator must wait until every rejected window has reset before
+	// resuming — picking the soonest reset would wake it while another window is
+	// still blocked, causing an immediate re-rejection from Claude.
 	var rejected *claudeRateLimitBucket
 	for _, b := range updates {
 		if b.Status == claudeRateLimitStatusRejected && b.ResetsAtMs > 0 {
-			if rejected == nil || b.ResetsAtMs < rejected.ResetsAtMs {
+			if rejected == nil || b.ResetsAtMs > rejected.ResetsAtMs {
 				bb := b
 				rejected = &bb
 			}

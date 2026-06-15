@@ -87,6 +87,32 @@ func TestCaptureClaudeRateLimit_RejectedSurfacesResetLine(t *testing.T) {
 	}
 }
 
+// When a single telemetry event carries multiple rejected windows (e.g. the
+// 5-hour and the weekly Opus bucket are both exhausted), the surfaced reset
+// time must be the LATEST of the rejected windows. Picking the soonest would
+// wake the orchestrator while the longer window is still blocked, causing an
+// immediate re-rejection from Claude.
+func TestCaptureClaudeRateLimit_MultiRejectedPicksLatestReset(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	soonReset := now.Add(28 * time.Minute)
+	lateReset := now.Add(72 * time.Hour)
+	line := `{"rate_limits":{` +
+		`"five_hour":{"status":"rejected","utilization":1.0,"resets_at":` + itoa(soonReset.Unix()) + `},` +
+		`"seven_day_opus":{"status":"rejected","utilization":1.0,"resets_at":` + itoa(lateReset.Unix()) + `}` +
+		`}}`
+
+	rejected := captureClaudeRateLimitLine(line, now)
+	if rejected == nil {
+		t.Fatalf("rejected window must be surfaced")
+	}
+	if rejected.ResetsAtMs != lateReset.UnixMilli() {
+		t.Errorf("ResetsAtMs=%d, want %d (latest of the rejected buckets)", rejected.ResetsAtMs, lateReset.UnixMilli())
+	}
+}
+
 func TestClaudeCodeMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
