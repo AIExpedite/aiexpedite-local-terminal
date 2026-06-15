@@ -705,6 +705,37 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				return
 			}
 
+			// Claude rate-limit telemetry: passively cache the structured
+			// per-window snapshot (used by the CLI Agents tab) from the
+			// rate_limit_event stream we already read. When a window is
+			// hard-rejected (limit hit), also emit a synthetic, orchestrator-
+			// parseable limit line carrying the exact reset time — Claude's own
+			// rejection text is zone-less prose ("resets 3:45pm"), but the
+			// rate_limit_event gives us an unambiguous epoch. This is what lets
+			// agent-orchestrator-service auto-defer + resume instead of
+			// completing the step empty.
+			if isClaudeCommand(session.Command) {
+				if rejected := captureClaudeRateLimitLine(line.text, time.Now()); rejected != nil {
+					flushBatch()
+					seq := atomic.AddInt64(&session.Seq, 1)
+					asyncPublish(resultMsg{
+						ID:          session.ID,
+						WorkspaceID: session.WorkspaceID,
+						UID:         session.UID,
+						Output:      formatClaudeLimitLine(*rejected) + "\n",
+						Status:      "success",
+						Ts:          time.Now().UnixMilli(),
+						Version:     Version,
+						Type:        "stream",
+						SessionID:   session.ID,
+						Seq:         int(seq),
+					})
+					fmt.Printf("%s[session] Claude rate limit rejected — %s resets %s%s\n",
+						colorYellow, session.ID,
+						time.UnixMilli(rejected.ResetsAtMs).UTC().Format(time.RFC3339), colorReset)
+				}
+			}
+
 			// Detect CLI-terminal events (Claude "result", Codex
 			// "thread.completed"/"turn.completed", Gemini "result"). When we see
 			// one we flush any buffered text BEFORE the CLI process exits — the
