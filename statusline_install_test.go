@@ -136,6 +136,79 @@ func TestEnsureClaudeStatusLineHook_ClearsStaleStashOnEmptyInstall(t *testing.T)
 	}
 }
 
+// extractInstalledPinnedPath must round-trip the pinned stash path embedded in
+// an installed command — including paths whose shell-specific escapes were
+// applied at install time — so a refresh that targets a NEW pinned path can
+// migrate the existing stash file instead of orphaning it.
+func TestExtractInstalledPinnedPath_RoundTripsPosixAndPowerShell(t *testing.T) {
+	const apostrophePath = "/Users/bob's mac/.aiexpedite/claude_statusline_prev.json"
+	posix := statusLinePosixCommand("/Users/bob's mac/aiexpedite", "/cache.json", apostrophePath)
+	if got := extractInstalledPinnedPath(posix, "STATUSLINE_PREV"); got != apostrophePath {
+		t.Errorf("POSIX extract: got %q want %q", got, apostrophePath)
+	}
+	const dollarPath = `C:/Users/A$B/prev.json`
+	ps := statusLinePowerShellCommand(`C:/Users/A$B/aiexpedite.exe`, "C:/cache.json", dollarPath)
+	if got := extractInstalledPinnedPath(ps, "STATUSLINE_PREV"); got != dollarPath {
+		t.Errorf("PowerShell extract: got %q want %q", got, dollarPath)
+	}
+}
+
+// When the existing installed command is one of ours but its pinned
+// STATUSLINE_PREV differs from the freshly resolved path (e.g. GetConfigDir()
+// moved between the previous install and this boot), the stash file must be
+// migrated to the new pinned path BEFORE the command is overwritten. Otherwise
+// the refreshed hook and opt-out look at the new path while the user's chained
+// third-party command remains stashed only at the old one, silently dropping
+// the chain target.
+func TestEnsureClaudeStatusLineHook_MigratesStashOnPinnedPathChange(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	// Old install pinned the stash here…
+	oldPrev := filepath.Join(t.TempDir(), "old-prev.json")
+	stashBody := []byte(`{"statusLine":{"type":"command","command":"old-line.sh"}}`)
+	if err := os.WriteFile(oldPrev, stashBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", oldPrev)
+
+	// …this boot resolves a different pinned stash path.
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settings := `{"theme":"dark","statusLine":{"type":"command","command":` +
+		mustJSONString(t, oldCmd) + `,"padding":2}}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := ensureClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("install: changed=%v err=%v", changed, err)
+	}
+
+	if _, err := os.Stat(oldPrev); !os.IsNotExist(err) {
+		t.Errorf("old pinned stash should be migrated away; err=%v", err)
+	}
+	got, err := os.ReadFile(newPrev)
+	if err != nil {
+		t.Fatalf("new pinned stash should exist: %v", err)
+	}
+	if string(got) != string(stashBody) {
+		t.Errorf("migrated stash body mismatch: got %s want %s", got, stashBody)
+	}
+}
+
+func mustJSONString(t *testing.T, s string) string {
+	t.Helper()
+	// Minimal JSON string escaper for test fixtures — only need `"` and `\`.
+	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+	return `"` + r.Replace(s) + `"`
+}
+
 // mergeClaudeRateLimitCache uses an advisory file lock to serialize the
 // read-modify-write across the multiple `aiexpedite statusline-hook` processes
 // Claude can spawn in parallel. Verify the lock file is materialised next to

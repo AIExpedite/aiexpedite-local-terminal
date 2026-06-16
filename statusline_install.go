@@ -218,6 +218,48 @@ var statusLineEnvPreambleRe = regexp.MustCompile(
 	`^(?:\s*(?:AIEXPEDITE_CLAUDE_\w+='(?:[^']|'\\'')*'|\$env:AIEXPEDITE_CLAUDE_\w+="[^"]*";))+\s*`,
 )
 
+// statusLinePinnedPosixRe / statusLinePinnedPowerShellRe extract a single pinned
+// env var's value from the installed command's preamble. The POSIX body mirrors
+// posixSingleQuote's close/escape/reopen apostrophe shape; the PowerShell body
+// mirrors powerShellDoubleQuote's escape rules.
+var (
+	statusLinePinnedPosixRe = regexp.MustCompile(
+		`(?:^|\s)AIEXPEDITE_CLAUDE_(\w+)='((?:[^']|'\\'')*)'`,
+	)
+	statusLinePinnedPowerShellRe = regexp.MustCompile(
+		`\$env:AIEXPEDITE_CLAUDE_(\w+)="((?:[^"` + "`" + `]|""|` + "`" + `.)*)"`,
+	)
+)
+
+// extractInstalledPinnedPath returns the value of the named pinned env var
+// (e.g. `STATUSLINE_PREV`) from an installed command's preamble, with the
+// shell-specific escapes unwound. Returns "" when the command doesn't pin it.
+//
+// Used on a refresh where the existing command is already one of ours but the
+// new `ourStatusLineCommand` resolves to a different `prevStatusLinePath()`
+// (e.g. `GetConfigDir()` moved because XDG_CONFIG_HOME changed between the
+// previous install and this boot). Without it, the stash file would remain at
+// the OLD pinned path while both the hook and opt-out look at the NEW one,
+// so the user's chained third-party status line would silently disappear and
+// opt-out would have nothing to restore.
+func extractInstalledPinnedPath(command, suffix string) string {
+	for _, m := range statusLinePinnedPosixRe.FindAllStringSubmatch(command, -1) {
+		if m[1] == suffix {
+			return strings.ReplaceAll(m[2], `'\''`, `'`)
+		}
+	}
+	for _, m := range statusLinePinnedPowerShellRe.FindAllStringSubmatch(command, -1) {
+		if m[1] == suffix {
+			v := m[2]
+			v = strings.ReplaceAll(v, `""`, `"`)
+			v = strings.ReplaceAll(v, "`$", "$")
+			v = strings.ReplaceAll(v, "``", "`")
+			return v
+		}
+	}
+	return ""
+}
+
 // isOurStatusLineCommand reports whether a configured command is our hook (any
 // binary path, with or without our pinned env preamble) — used to stay
 // idempotent across binary-path / config-dir refreshes, and to avoid stashing
@@ -353,6 +395,25 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 			// hook would silently lose the user's third-party status line and
 			// leave opt-out unable to restore it.
 			return false, err
+		}
+	} else if existing.Command != "" {
+		// Existing command is one of ours but differs from the freshly generated
+		// one — usually just a refreshed binary path. If the pinned stash path
+		// also moved (e.g. GetConfigDir() resolved differently on this boot),
+		// migrate the stash file to the new path BEFORE we overwrite the
+		// command. Otherwise the new installed hook + opt-out look at the new
+		// path while the user's chained third-party command remains stashed
+		// only at the old one, silently dropping the chain target.
+		oldPrev := extractInstalledPinnedPath(existing.Command, "STATUSLINE_PREV")
+		newPrev := prevStatusLinePath()
+		if oldPrev != "" && oldPrev != newPrev {
+			if _, err := os.Stat(newPrev); os.IsNotExist(err) {
+				if _, err := os.Stat(oldPrev); err == nil {
+					if mkErr := os.MkdirAll(filepath.Dir(newPrev), 0o755); mkErr == nil {
+						_ = os.Rename(oldPrev, newPrev)
+					}
+				}
+			}
 		}
 	} else if existing.Command == "" {
 		// Installing over an empty/absent statusLine: there's no third-party
