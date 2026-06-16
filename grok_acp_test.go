@@ -1154,3 +1154,181 @@ func TestGrokACPLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 		t.Errorf("manager should have 0 sessions after failed start; got %d", m.ActiveCount())
 	}
 }
+
+// TestSanitizeGrokACPExtraArgs_StripsAuthConfigOverrides pins the gate that
+// prevents `-c|--config` from selecting api-key auth or supplying an api key
+// while EnableGrokAPIKeyFallback is false. Without this the explicit
+// `--api-key`/`--auth` strip is trivially bypassed by routing the same value
+// through Grok's config knob.
+func TestSanitizeGrokACPExtraArgs_StripsAuthConfigOverrides(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"strips_config_auth_method_xai_api_key_separate",
+			[]string{"--config", "auth.method=xai.api_key", "--model", "grok-2"},
+			[]string{"--model", "grok-2"},
+		},
+		{
+			"strips_short_config_auth_method_xai_api_key",
+			[]string{"-c", "auth.method=xai.api_key"},
+			[]string{},
+		},
+		{
+			"strips_config_model_api_key",
+			[]string{"--config", "model.api_key=xai-secret"},
+			[]string{},
+		},
+		{
+			"strips_config_xai_api_key",
+			[]string{"-c", "xai.api_key=xai-secret"},
+			[]string{},
+		},
+		{
+			"strips_config_model_env_key",
+			[]string{"--config", "model.env_key=XAI_API_KEY"},
+			[]string{},
+		},
+		{
+			"strips_inline_equals_form",
+			[]string{"--config=auth.method=xai.api_key", "--model", "grok-2"},
+			[]string{"--model", "grok-2"},
+		},
+		{
+			"keeps_config_auth_method_cached_token",
+			[]string{"--config", "auth.method=cached_token", "--model", "grok-2"},
+			[]string{"--config", "auth.method=cached_token", "--model", "grok-2"},
+		},
+		{
+			"keeps_unrelated_config",
+			[]string{"-c", "model=grok-2", "--config", "log.level=debug"},
+			[]string{"-c", "model=grok-2", "--config", "log.level=debug"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := sanitizeGrokACPExtraArgs(c.args, false)
+			if len(got) == 0 && len(c.want) == 0 {
+				return
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("sanitizeGrokACPExtraArgs(allowAPIKey=false) = %#v, want %#v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestSanitizeGrokACPExtraArgs_PreservesAuthConfigOverridesWhenFallbackEnabled
+// is the inverse: once the workspace opts into API-key fallback the gate
+// disappears so callers can route credentials through `-c|--config` too.
+func TestSanitizeGrokACPExtraArgs_PreservesAuthConfigOverridesWhenFallbackEnabled(t *testing.T) {
+	in := []string{"--config", "auth.method=xai.api_key", "-c", "model.api_key=xai-secret"}
+	got := sanitizeGrokACPExtraArgs(in, true)
+	if !reflect.DeepEqual(got, in) {
+		t.Fatalf("sanitizeGrokACPExtraArgs(allowAPIKey=true) must preserve auth config args; got %#v", got)
+	}
+}
+
+// TestValidateGrokACPSendCwd_RejectsEscapingSessionNew pins the in-protocol
+// containment check Send applies to `session/new` frames. Without this a
+// later signed grok_acp_send could point Grok at a path outside the
+// configured workspace root and bypass the Start-time containment gate.
+func TestValidateGrokACPSendCwd_RejectsEscapingSessionNew(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink + containment semantics covered on unix")
+	}
+	root := t.TempDir()
+	inside := filepath.Join(root, "ok")
+	if err := os.Mkdir(inside, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	outside := t.TempDir()
+
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("eval root: %v", err)
+	}
+
+	cases := []struct {
+		name      string
+		frame     string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:    "session_new_inside_root_accepted",
+			frame:   fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}`, inside),
+			wantErr: false,
+		},
+		{
+			name:      "session_new_outside_root_rejected",
+			frame:     fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}`, outside),
+			wantErr:   true,
+			errSubstr: "outside the configured workspace root",
+		},
+		{
+			name:      "session_new_relative_cwd_rejected",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"../etc"}}`,
+			wantErr:   true,
+			errSubstr: "must be an absolute path",
+		},
+		{
+			name:    "non_session_new_method_accepted_unchanged",
+			frame:   fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"cwd":%q,"sessionId":"x"}}`, outside),
+			wantErr: false,
+		},
+		{
+			name:    "session_new_without_cwd_accepted",
+			frame:   `{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`,
+			wantErr: false,
+		},
+		{
+			name:    "non_jsonrpc_frame_accepted",
+			frame:   `"not-an-object"`,
+			wantErr: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateGrokACPSendCwd(c.frame, resolvedRoot)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				if c.errSubstr != "" && !strings.Contains(err.Error(), c.errSubstr) {
+					t.Fatalf("expected error to contain %q; got %v", c.errSubstr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateGrokACPSendCwd_SymlinkEscapeRejected pins the canonical
+// "appears inside, actually escapes" attack — a session/new whose cwd is a
+// symlink under root that resolves to an outside path.
+func TestValidateGrokACPSendCwd_SymlinkEscapeRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink + containment semantics covered on unix")
+	}
+	root := t.TempDir()
+	outside := t.TempDir()
+	escape := filepath.Join(root, "escape")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("eval root: %v", err)
+	}
+	frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}`, escape)
+	err = validateGrokACPSendCwd(frame, resolvedRoot)
+	if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
+		t.Fatalf("symlink-resolved escape must be rejected; got %v", err)
+	}
+}

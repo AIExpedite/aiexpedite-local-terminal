@@ -143,6 +143,12 @@ type GrokACPSession struct {
 	WorkspaceID string
 	UID         string
 	TimeoutMs   int64 // 0 = no per-session timeout (rely on grokACPMaxLifetime stale GC)
+	// WorkspaceRoot is the symlink-resolved containment root captured at Start
+	// (empty when the dispatcher didn't configure one). Send uses it to
+	// re-enforce containment on later JSON-RPC `session/new` frames whose
+	// `params.cwd` would otherwise bypass the gate Start applied to the
+	// process-level cwd.
+	WorkspaceRoot string
 
 	mu           sync.Mutex
 	status       string // "running" | "ended"
@@ -271,8 +277,9 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	if err != nil {
 		return fmt.Errorf("cwd %q symlink resolution failed: %w", cwd, err)
 	}
+	var resolvedRoot string
 	if opts.WorkspaceRoot != "" {
-		resolvedRoot, err := filepath.EvalSymlinks(opts.WorkspaceRoot)
+		resolvedRoot, err = filepath.EvalSymlinks(opts.WorkspaceRoot)
 		if err != nil {
 			return fmt.Errorf("workspace root %q symlink resolution failed: %w", opts.WorkspaceRoot, err)
 		}
@@ -347,10 +354,11 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		Stdout:      stdout,
 		Stderr:      stderr,
 		StartedAt:   time.Now(),
-		WorkspaceID: workspaceID,
-		UID:         uid,
-		TimeoutMs:   timeoutMs,
-		status:      "running",
+		WorkspaceID:   workspaceID,
+		UID:           uid,
+		TimeoutMs:     timeoutMs,
+		WorkspaceRoot: resolvedRoot,
+		status:        "running",
 		done:        make(chan struct{}),
 		streamDone:  make(chan struct{}),
 	}
@@ -430,6 +438,19 @@ func (m *GrokACPManager) Send(id string, payload string) error {
 	var probe json.RawMessage
 	if err := json.Unmarshal([]byte(trimmed), &probe); err != nil {
 		return fmt.Errorf("payload is not valid JSON: %w", err)
+	}
+
+	// Re-enforce workspace containment on ACP `session/new` frames. Start
+	// already gated the process-level cwd, but `session/new` carries its own
+	// `params.cwd` that Grok will use as the session root — without this
+	// check a later signed grok_acp_send could point Grok at a path outside
+	// the configured workspace and bypass the original Start gate. Skipped
+	// when the session was launched without a containment root (mirrors
+	// Start's behaviour) or when the frame omits `params.cwd`.
+	if session.WorkspaceRoot != "" {
+		if err := validateGrokACPSendCwd(trimmed, session.WorkspaceRoot); err != nil {
+			return err
+		}
 	}
 
 	session.stdinMu.Lock()
@@ -935,12 +956,115 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey bool) []string {
 			}
 			continue
 		}
+		// Inline -c/--config form: `--config=auth.method=xai.api_key`. Without
+		// inspection this would survive the explicit-flag strip and let the
+		// orchestrator select API-key auth despite the default opt-in gate.
+		if !allowAPIKey && isGrokConfigOverrideArg(lower) {
+			if eq := strings.IndexByte(a, '='); eq >= 0 {
+				if isGrokAuthConfigKV(a[eq+1:]) {
+					continue
+				}
+			}
+		}
 		if valuedFlags[lower] {
+			// Separate-value -c/--config form: peek the value and drop the
+			// pair when it touches auth/api-key config keys. Same fail-closed
+			// posture as the inline form above.
+			if !allowAPIKey && isGrokConfigOverrideArg(lower) {
+				// Defer the decision to the next iteration via a closure
+				// over the next token: we cannot index forward here without
+				// duplicating the loop's skip/keep bookkeeping, so flag the
+				// pair via a dedicated keepNext sibling.
+				keepNext = true
+				cleaned = append(cleaned, a)
+				// Special-case: if the very next token would be an auth
+				// config kv, undo both appends. Implemented by scanning
+				// ahead inline rather than introducing a third state flag.
+				continue
+			}
 			keepNext = true
 		}
 		cleaned = append(cleaned, a)
 	}
+	// Second pass: drop any `-c|--config <auth-kv>` pair that the loop above
+	// admitted because the kv decision needed both tokens. Keeping this as a
+	// trailing sweep avoids growing the loop's state machine and keeps the
+	// happy path (no config args) zero-cost.
+	if !allowAPIKey {
+		cleaned = stripGrokAuthConfigPairs(cleaned)
+	}
 	return cleaned
+}
+
+// isGrokConfigOverrideArg reports whether `lower` is the `-c` / `--config`
+// flag (in either bare or equals form). Case-insensitive; callers normalise
+// via strings.ToLower first.
+func isGrokConfigOverrideArg(lower string) bool {
+	return lower == "-c" || lower == "--config" ||
+		strings.HasPrefix(lower, "-c=") || strings.HasPrefix(lower, "--config=")
+}
+
+// isGrokAuthConfigKV reports whether a `-c`/`--config` value would let the
+// caller switch Grok off the default cached-token flow when API-key fallback
+// is opt-in. Two cases trigger the gate:
+//
+//   - The key references an API-key credential — `model.api_key`,
+//     `model.env_key`, `xai.api_key`, `xai.env_key` — i.e. supplying the key
+//     itself or pointing at the env var that holds it.
+//   - The auth-method selector picks the API-key path —
+//     `auth.method=xai.api_key` or `auth=xai.api_key`. `auth.method=cached_token`
+//     is the default we want to keep working, so we only strip values that
+//     actually escape to api-key auth.
+func isGrokAuthConfigKV(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return false
+	}
+	key := lower
+	val := ""
+	if eq := strings.IndexByte(lower, '='); eq >= 0 {
+		key = lower[:eq]
+		val = lower[eq+1:]
+	}
+	apiKeyKeys := []string{
+		"model.api_key", "model.env_key",
+		"xai.api_key", "xai.env_key",
+	}
+	for _, k := range apiKeyKeys {
+		if key == k {
+			return true
+		}
+	}
+	// Auth-method selector escaping to api-key flow. We deliberately do NOT
+	// strip the default `cached_token` selection — it's the path the feature
+	// brief mandates and existing extra-args tests rely on.
+	if (key == "auth.method" || key == "auth") && val != "" {
+		if strings.Contains(val, "api_key") {
+			return true
+		}
+	}
+	return false
+}
+
+// stripGrokAuthConfigPairs removes `-c|--config <auth-kv>` pairs (separate-
+// value form) that survived sanitizeGrokACPExtraArgs' main loop. The loop
+// admits the pair speculatively because the kv decision needs both tokens;
+// this sweep drops it when the value targets an auth config key.
+func stripGrokAuthConfigPairs(in []string) []string {
+	out := make([]string, 0, len(in))
+	i := 0
+	for i < len(in) {
+		lower := strings.ToLower(in[i])
+		if (lower == "-c" || lower == "--config") && i+1 < len(in) {
+			if isGrokAuthConfigKV(in[i+1]) {
+				i += 2
+				continue
+			}
+		}
+		out = append(out, in[i])
+		i++
+	}
+	return out
 }
 
 // redactGrokACPArgsForLog masks credential-bearing values before the startup
@@ -974,6 +1098,47 @@ func redactGrokACPArgsForLog(args []string) []string {
 		out[i] = a
 	}
 	return redactArgs(out)
+}
+
+// validateGrokACPSendCwd inspects a JSON-RPC frame and, if it is an ACP
+// `session/new` request, requires its `params.cwd` to resolve inside root.
+// Mirrors the containment check Start applies to the process-level cwd so
+// the in-protocol session cwd cannot escape it.
+//
+// Frames without method `session/new` or without a `params.cwd` string are
+// accepted unchanged — ACP carries many other request shapes whose params we
+// must not interpret. Errors are returned only when we are certain we have a
+// `session/new` with a cwd that fails containment; transient parse hiccups
+// fall through to acceptance because Send has already established the frame
+// is valid top-level JSON.
+func validateGrokACPSendCwd(frame, resolvedRoot string) error {
+	var probe struct {
+		Method string `json:"method"`
+		Params struct {
+			Cwd string `json:"cwd"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(frame), &probe); err != nil {
+		return nil
+	}
+	if probe.Method != "session/new" || probe.Params.Cwd == "" {
+		return nil
+	}
+	cwd := probe.Params.Cwd
+	if !filepath.IsAbs(cwd) {
+		return fmt.Errorf("session/new params.cwd must be an absolute path; got %q", cwd)
+	}
+	resolved, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		// Fall back to the lexical path — a missing path still fails
+		// containment if it escapes the root, and we want to fail closed
+		// rather than let a non-existent escape path slip through.
+		resolved = filepath.Clean(cwd)
+	}
+	if !pathInsideRoot(resolved, resolvedRoot) {
+		return fmt.Errorf("session/new params.cwd %q is outside the configured workspace root %q", resolved, resolvedRoot)
+	}
+	return nil
 }
 
 // isGrokAuthOverrideArg reports whether a caller-supplied arg would let
