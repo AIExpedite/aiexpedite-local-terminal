@@ -209,11 +209,43 @@ path, so orchestrator typos can't accidentally fall back to TUI scraping.
 
 [`sanitizeGrokACPEnv`](grok_acp.go) strips the same nested-IDE markers as
 the Codex sanitiser (`CLAUDECODE=`, `CLAUDE_*`, `CODEX_IDE_*`) so downstream
-tooling doesn't think it's running embedded inside another IDE. **It
-deliberately preserves `XAI_API_KEY` and any `GROK_*` config dir vars** so
-the user's local Grok auth state remains reachable. Auth precedence
-(`cached_token` first, `xai.api_key` fallback) is enforced by the
-orchestrator's `authenticate` flow, not by env stripping.
+tooling doesn't think it's running embedded inside another IDE. **`XAI_API_KEY`
+is stripped by default** — the user must explicitly enable API-key fallback
+for this agent via `enable_grok_api_key_fallback` in
+[`config.go`](config.go) before the env var (and any caller-supplied
+`--api-key*` / `--auth*` args) flow through to the child. Without that
+opt-in:
+
+- A developer with `export XAI_API_KEY=...` in their shell rc can NOT
+  accidentally bill their xAI API wallet for Grok sessions launched by this
+  agent.
+- A misbehaving orchestrator can NOT override the cached-token preference
+  by passing `--api-key`/`--auth` via `cmd.Args` — both
+  [`buildGrokACPArgs`](grok_acp.go) and [`sanitizeGrokACPEnv`](grok_acp.go)
+  enforce the gate.
+
+`GROK_*` config dir vars (notably `GROK_HOME`) are always preserved so the
+local `grok login` cached token remains discoverable.
+
+## Workspace containment
+
+[`GrokACPManager.Start`](grok_acp.go) accepts a `GrokStartOptions.WorkspaceRoot`
+the dispatcher sources from `Config.WorkingDirectory`. When non-empty,
+Start resolves symlinks on BOTH the requested cwd and the root, then
+rejects any cwd that escapes the root — defends against signed
+`grok_acp_start` payloads targeting arbitrary directories the OS user
+happens to read/write, including symlink-escape paths under a workspace
+that point to a sibling.
+
+## Per-session timeout
+
+`cmd.TimeoutMs` from the inbound `grok_acp_start` is threaded into
+`GrokStartOptions.TimeoutMs`. When non-zero, Start arms a `time.AfterFunc`
+that — on fire — publishes a typed `grok_acp_error` (`"timed out after Xms"`)
+and kills the child; [`waitForExit`](grok_acp.go) then publishes the
+terminal `grok_acp_ended`. Requested values above `grokACPMaxLifetime`
+(6 h, same as the stale GC) are clamped so a misbehaving orchestrator
+can't request a longer session than our GC tolerates.
 
 ## Lifecycle
 
@@ -233,13 +265,21 @@ seeing every frame in `Seq` order; a silent drop would deadlock.
 ## Enforcement points
 
 - [`grok_acp.go` — `buildGrokACPArgs`](grok_acp.go) — forces the `agent
-  stdio` entry-point argv and strips TUI / chat / run tokens.
+  stdio` entry-point argv, strips TUI / chat / run tokens, and (when
+  `allowAPIKey=false`) strips caller-supplied `--api-key*` / `--auth*`
+  args.
 - [`grok_acp.go` — `sanitizeGrokACPEnv`](grok_acp.go) — strips nested-IDE
-  env markers, preserves `XAI_API_KEY` and `GROK_*` so local Grok auth
-  survives.
+  env markers; strips `XAI_API_KEY` unless `Config.EnableGrokAPIKeyFallback`
+  is set; preserves `GROK_*` so the local cached-token path stays
+  discoverable.
+- [`grok_acp.go` — `pathInsideRoot`](grok_acp.go) — workspace containment
+  helper (symlink-resolved, `filepath.Rel`-based, no `HasPrefix` shortcut).
+- [`grok_acp.go` — `Start` deadline timer](grok_acp.go) — per-session
+  TimeoutMs handling, clamped at `grokACPMaxLifetime`.
 - [`pubsub.go` — `isGrokACPCommand` / `handleGrokACPCommand`](pubsub.go) —
-  dispatches `grok_acp_*` commands; allowlist-gates `grok_acp_start`
-  against the synthesised `grok agent stdio …` argv.
+  dispatches `grok_acp_*` commands; sources `GrokStartOptions` from
+  `Config` + `cmd.TimeoutMs`; allowlist-gates `grok_acp_start` against the
+  synthesised `grok agent stdio …` argv.
 - [`grok_acp_test.go`](grok_acp_test.go) — pins the argv builder, env
   sanitizer, Send validation, full ACP handshake (initialize →
   authenticate → session/new → session/prompt → session/update →

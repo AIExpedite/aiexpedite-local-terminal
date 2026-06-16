@@ -69,6 +69,15 @@ type Config struct {
 	// restarts. When true, StartAgent bypasses the Pub/Sub loop so the agent
 	// stays local-only until the user reconnects from the tray menu.
 	OfflineMode bool `json:"offline_mode,omitempty"`
+
+	/* ─── Grok ACP — API-key fallback ────────────────── */
+	// EnableGrokAPIKeyFallback gates xAI Grok's API-key auth path. When
+	// false (default), the Grok ACP manager strips XAI_API_KEY from the
+	// child env AND any `--api-key*` / `--auth*` args from the spawn argv —
+	// so the orchestrator's ACP authenticate flow can only resolve via the
+	// local `grok login` cached token. Set to true on hosts where the user
+	// has explicitly opted into API-key billing for this agent.
+	EnableGrokAPIKeyFallback bool `json:"enable_grok_api_key_fallback,omitempty"`
 }
 
 /* -------------------------------------------------------------------------- */

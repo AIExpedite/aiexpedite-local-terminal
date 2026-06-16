@@ -202,6 +202,14 @@ func runMockCLI(mode string) {
 		fmt.Println("this is not json")
 		os.Exit(0)
 
+	case "grok-acp-hang":
+		// Stay alive forever, ignoring stdin (don't even read it). Used by
+		// TestGrokACPLifecycle_TimeoutKillsRunawaySession to assert that the
+		// per-session deadline kills a hung Grok child and publishes a typed
+		// grok_acp_error rather than waiting for the 6h stale GC.
+		fmt.Fprintln(os.Stderr, "[mock-grok-hang] running forever")
+		select {}
+
 	case "codex-appserver-burst":
 		// Emit a burst of JSON-RPC frames much larger than
 		// codexAppServerPublishQueueSize, then keep going to keep the

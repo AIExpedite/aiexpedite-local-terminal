@@ -1021,7 +1021,7 @@ func runPubSubConnection(cfg *Config) error {
 			if proceed := gateSessionEntryCommand(ctx, topic, m, cmd, cfg); !proceed {
 				return
 			}
-			handleSessionCommand(ctx, topic, cmd)
+			handleSessionCommand(ctx, topic, cmd, cfg)
 			m.Ack()
 			return
 		}
@@ -2315,8 +2315,11 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// Same shape as codex_appserver_start: synthesise the actual
 		// `grok agent stdio …` argv we will exec so the default `grok *`
 		// allowlist entry covers ACP access without a parallel allowlist.
+		// The allowAPIKey gate must match what handleGrokACPCommand will
+		// pass to Start, otherwise the allowlist would match a different
+		// argv shape than the one we actually exec.
 		allowCommand = "grok"
-		allowArgs = buildGrokACPArgs(cmd.Args)
+		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAPIKeyFallback)
 		denyOutput = "grok agent stdio denied by user: not in allow list"
 	default:
 		// Mid-session interactive commands don't re-prompt.
@@ -2387,14 +2390,16 @@ func newSessionPublishFn(topic *pubsub.Publisher, logPrefix string) PublishFunc 
 
 // handleSessionCommand handles interactive session commands (session_*,
 // codex_appserver_*, grok_acp_*). It publishes results back via the
-// provided Pub/Sub topic.
-func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg) {
+// provided Pub/Sub topic. cfg is threaded through so per-family handlers
+// can apply config-driven policy (e.g. grok's API-key gate, workspace
+// containment root) without reaching for a package-level config getter.
+func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
 	if isCodexAppServerCommand(cmd.Type) {
 		handleCodexAppServerCommand(ctx, topic, cmd)
 		return
 	}
 	if isGrokACPCommand(cmd.Type) {
-		handleGrokACPCommand(ctx, topic, cmd)
+		handleGrokACPCommand(ctx, topic, cmd, cfg)
 		return
 	}
 
@@ -2653,8 +2658,10 @@ func isGrokACPCommand(cmdType string) bool {
 // Mirrors handleCodexAppServerCommand's shape — a single publishFn is shared
 // with the manager so it can stream JSON-RPC frames (responses, session/update
 // notifications, server-initiated approval requests) back via Pub/Sub for the
-// duration of the session.
-func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg) {
+// duration of the session. cfg drives per-session policy: API-key fallback
+// gate (Config.EnableGrokAPIKeyFallback) and workspace-root containment
+// (Config.WorkingDirectory).
+func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
 	if globalGrokACPManager == nil {
 		publishGrokACPError(ctx, topic, cmd, "grok acp manager not initialized")
 		return
@@ -2672,12 +2679,21 @@ func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		fmt.Printf("%s[grok-acp] Starting session %s (workspace=%s)%s\n",
 			colorCyan, cmd.SessionID, cmd.WorkspaceID, colorReset)
 
+		opts := GrokStartOptions{
+			TimeoutMs:           cmd.TimeoutMs,
+			AllowAPIKeyFallback: cfg != nil && cfg.EnableGrokAPIKeyFallback,
+		}
+		if cfg != nil {
+			opts.WorkspaceRoot = cfg.WorkingDirectory
+		}
+
 		err := globalGrokACPManager.Start(
 			cmd.SessionID,
 			cmd.Cwd,
 			cmd.Args,
 			cmd.WorkspaceID,
 			cmd.UID,
+			opts,
 			publishFn,
 		)
 		if err != nil {
