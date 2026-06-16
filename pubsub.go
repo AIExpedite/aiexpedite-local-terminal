@@ -2296,12 +2296,19 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 
 	var allowCommand string
 	var allowArgs []string
+	// dialogArgs is what we show the user in the approval dialog. It
+	// usually equals allowArgs, but for grok_acp_start with API-key
+	// fallback enabled we pass the redacted form so an `--api-key xai-…`
+	// value the orchestrator passed through doesn't leak into the
+	// dialog text (the platform dialogs concatenate argv for display).
+	var dialogArgs []string
 	var denyOutput string
 
 	switch cmd.Type {
 	case "session_start":
 		allowCommand = cmd.Command
 		allowArgs = cmd.Args
+		dialogArgs = allowArgs
 		denyOutput = "Command denied by user: not in allow list"
 	case "codex_appserver_start":
 		// Gate against the synthesised `codex app-server …` argv the manager
@@ -2310,6 +2317,7 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// allowlist for the new entry kind.
 		allowCommand = "codex"
 		allowArgs = buildCodexAppServerArgs(cmd.Args)
+		dialogArgs = allowArgs
 		denyOutput = "codex app-server denied by user: not in allow list"
 	case "grok_acp_start":
 		// Same shape as codex_appserver_start: synthesise the actual
@@ -2320,6 +2328,13 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// would match a different argv shape than the one we actually exec.
 		allowCommand = "grok"
 		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAPIKeyFallback, cfg.EnableGrokAlwaysApprove)
+		// Match the startup-banner redaction so an xAI API key the caller
+		// passed via `--api-key …` (only possible when the fallback is
+		// enabled) never reaches the platform approval dialog. IsAllowed
+		// and GeneratePatternFromCommand still see the unredacted argv —
+		// the pattern is `grok *` and the match runs against the same
+		// argv we will exec.
+		dialogArgs = redactGrokACPArgsForLog(allowArgs)
 		denyOutput = "grok agent stdio denied by user: not in allow list"
 	default:
 		// Mid-session interactive commands don't re-prompt.
@@ -2334,7 +2349,7 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 	if timeoutSec <= 0 {
 		timeoutSec = 60
 	}
-	result := ShowCommandApprovalDialog(allowCommand, allowArgs, timeoutSec)
+	result := ShowCommandApprovalDialog(allowCommand, dialogArgs, timeoutSec)
 	if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
 		result = ApprovalOnce
 	}
