@@ -32,7 +32,7 @@ import (
    -------------------------------------------------------------------------- */
 
 func TestBuildGrokACPArgs_DefaultsToAgentStdio(t *testing.T) {
-	got := buildGrokACPArgs(nil, false)
+	got := buildGrokACPArgs(nil, false, false)
 	// `--no-auto-update` is injected unconditionally so a background update
 	// worker can't race ACP startup and pollute stdout with non-JSON.
 	want := []string{"agent", "stdio", "--no-auto-update"}
@@ -42,7 +42,7 @@ func TestBuildGrokACPArgs_DefaultsToAgentStdio(t *testing.T) {
 }
 
 func TestBuildGrokACPArgs_ForwardsExtraArgs(t *testing.T) {
-	got := buildGrokACPArgs([]string{"--model", "grok-2-fast", "--config", "auth.method=cached_token"}, false)
+	got := buildGrokACPArgs([]string{"--model", "grok-2-fast", "--config", "auth.method=cached_token"}, false, false)
 	want := []string{"agent", "stdio", "--no-auto-update", "--model", "grok-2-fast", "--config", "auth.method=cached_token"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs = %#v, want %#v", got, want)
@@ -62,7 +62,7 @@ func TestBuildGrokACPArgs_StripsDuplicateEntryTokens(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false)
+			got := buildGrokACPArgs(c.args, false, false)
 			if len(got) < 3 || got[0] != "agent" || got[1] != "stdio" || got[2] != "--no-auto-update" {
 				t.Fatalf("expected built-in `agent stdio --no-auto-update` prefix; got %#v", got)
 			}
@@ -105,7 +105,7 @@ func TestBuildGrokACPArgs_NoAutoUpdateDedupedAndAutoUpdateStripped(t *testing.T)
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false)
+			got := buildGrokACPArgs(c.args, false, false)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("buildGrokACPArgs = %#v, want %#v", got, c.want)
 			}
@@ -135,7 +135,7 @@ func TestBuildGrokACPArgs_PreservesValueOfValuedFlag(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false)
+			got := buildGrokACPArgs(c.args, false, false)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("buildGrokACPArgs mangled a valued-flag value: got %#v, want %#v", got, c.want)
 			}
@@ -183,7 +183,7 @@ func TestBuildGrokACPArgs_StripsAuthOverridesByDefault(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false)
+			got := buildGrokACPArgs(c.args, false, false)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("buildGrokACPArgs(allowAPIKey=false) failed to strip auth override: got %#v, want %#v", got, c.want)
 			}
@@ -196,7 +196,7 @@ func TestBuildGrokACPArgs_StripsAuthOverridesByDefault(t *testing.T) {
 // Config.EnableGrokAPIKeyFallback=true, the caller-supplied auth override
 // must flow through verbatim.
 func TestBuildGrokACPArgs_PreservesAuthOverridesWhenFallbackEnabled(t *testing.T) {
-	got := buildGrokACPArgs([]string{"--api-key", "xai-abc", "--model", "grok-2"}, true)
+	got := buildGrokACPArgs([]string{"--api-key", "xai-abc", "--model", "grok-2"}, true, false)
 	want := []string{"agent", "stdio", "--no-auto-update", "--api-key", "xai-abc", "--model", "grok-2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(allowAPIKey=true) must preserve --api-key; got %#v, want %#v", got, want)
@@ -1248,7 +1248,7 @@ func TestSanitizeGrokACPExtraArgs_StripsAuthConfigOverrides(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := sanitizeGrokACPExtraArgs(c.args, false)
+			got := sanitizeGrokACPExtraArgs(c.args, false, false)
 			if len(got) == 0 && len(c.want) == 0 {
 				return
 			}
@@ -1264,9 +1264,147 @@ func TestSanitizeGrokACPExtraArgs_StripsAuthConfigOverrides(t *testing.T) {
 // disappears so callers can route credentials through `-c|--config` too.
 func TestSanitizeGrokACPExtraArgs_PreservesAuthConfigOverridesWhenFallbackEnabled(t *testing.T) {
 	in := []string{"--config", "auth.method=xai.api_key", "-c", "model.api_key=xai-secret"}
-	got := sanitizeGrokACPExtraArgs(in, true)
+	got := sanitizeGrokACPExtraArgs(in, true, false)
 	if !reflect.DeepEqual(got, in) {
 		t.Fatalf("sanitizeGrokACPExtraArgs(allowAPIKey=true) must preserve auth config args; got %#v", got)
+	}
+}
+
+// TestBuildGrokACPArgs_StripsAlwaysApproveByDefault pins the gate that
+// prevents a signed grok_acp_start from enabling autonomous tool execution
+// without an explicit per-workspace opt-in. xAI documents `--always-approve`
+// as skipping permission prompts, and the design doc treats it as
+// equivalent to `--auto-approve` — both flag forms (boolean and
+// `=true`/`=false`) MUST be dropped when Config.EnableGrokAlwaysApprove is
+// false, regardless of position in the argv.
+func TestBuildGrokACPArgs_StripsAlwaysApproveByDefault(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"strips_always_approve_bare",
+			[]string{"--always-approve", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"strips_always_approve_equals_true",
+			[]string{"--always-approve=true", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"strips_always_approve_equals_false_still_drops",
+			[]string{"--always-approve=false", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"strips_auto_approve_bare",
+			[]string{"--auto-approve", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"strips_auto_approve_equals_form",
+			[]string{"--auto-approve=true", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"strips_when_interleaved_with_kept_args",
+			[]string{"--model", "grok-2", "--always-approve", "--config", "log.level=debug"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "log.level=debug"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildGrokACPArgs(c.args, false, false)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("buildGrokACPArgs(allowAlwaysApprove=false) failed to strip always-approve flag: got %#v, want %#v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestBuildGrokACPArgs_PreservesAlwaysApproveWhenEnabled is the inverse:
+// once the workspace has explicitly opted into autonomous execution via
+// Config.EnableGrokAlwaysApprove=true, the caller-supplied flag must flow
+// through verbatim so the orchestrator can enable the documented behaviour.
+func TestBuildGrokACPArgs_PreservesAlwaysApproveWhenEnabled(t *testing.T) {
+	got := buildGrokACPArgs([]string{"--always-approve", "--model", "grok-2"}, false, true)
+	want := []string{"agent", "stdio", "--no-auto-update", "--always-approve", "--model", "grok-2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildGrokACPArgs(allowAlwaysApprove=true) must preserve --always-approve; got %#v, want %#v", got, want)
+	}
+}
+
+// TestSanitizeGrokACPExtraArgs_StripsApprovalConfigOverrides pins the gate
+// against `-c|--config` overrides that would flip Grok to autonomous
+// execution without setting the documented `--always-approve` flag. Without
+// this the explicit-flag strip is trivially bypassed by routing the same
+// toggle through Grok's config knob (the same shape the auth-config gate
+// defends against in the API-key path).
+func TestSanitizeGrokACPExtraArgs_StripsApprovalConfigOverrides(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"strips_config_approval_mode_always_separate",
+			[]string{"--config", "approval.mode=always", "--model", "grok-2"},
+			[]string{"--model", "grok-2"},
+		},
+		{
+			"strips_short_config_approval_mode_auto",
+			[]string{"-c", "approval.mode=auto"},
+			[]string{},
+		},
+		{
+			"strips_config_tools_always_approve_true",
+			[]string{"--config", "tools.always_approve=true"},
+			[]string{},
+		},
+		{
+			"strips_config_tools_auto_approve_yes",
+			[]string{"-c", "tools.auto_approve=yes"},
+			[]string{},
+		},
+		{
+			"strips_inline_equals_form",
+			[]string{"--config=approval.mode=always", "--model", "grok-2"},
+			[]string{"--model", "grok-2"},
+		},
+		{
+			"keeps_config_approval_mode_ask",
+			[]string{"--config", "approval.mode=ask", "--model", "grok-2"},
+			[]string{"--config", "approval.mode=ask", "--model", "grok-2"},
+		},
+		{
+			"keeps_config_tools_always_approve_false",
+			[]string{"-c", "tools.always_approve=false"},
+			[]string{"-c", "tools.always_approve=false"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := sanitizeGrokACPExtraArgs(c.args, false, false)
+			if len(got) == 0 && len(c.want) == 0 {
+				return
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("sanitizeGrokACPExtraArgs(allowAlwaysApprove=false) = %#v, want %#v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestSanitizeGrokACPExtraArgs_PreservesApprovalConfigWhenEnabled is the
+// inverse: once the workspace opts into always-approve the config-knob
+// gate disappears so callers can flip the toggle through `-c|--config` too.
+func TestSanitizeGrokACPExtraArgs_PreservesApprovalConfigWhenEnabled(t *testing.T) {
+	in := []string{"--config", "approval.mode=always", "-c", "tools.always_approve=true"}
+	got := sanitizeGrokACPExtraArgs(in, false, true)
+	if !reflect.DeepEqual(got, in) {
+		t.Fatalf("sanitizeGrokACPExtraArgs(allowAlwaysApprove=true) must preserve approval config args; got %#v", got)
 	}
 }
 

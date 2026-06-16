@@ -78,6 +78,18 @@ type Config struct {
 	// local `grok login` cached token. Set to true on hosts where the user
 	// has explicitly opted into API-key billing for this agent.
 	EnableGrokAPIKeyFallback bool `json:"enable_grok_api_key_fallback,omitempty"`
+
+	/* ─── Grok ACP — always-approve gate ─────────────── */
+	// EnableGrokAlwaysApprove gates Grok's autonomous-tool-execution flags.
+	// When false (default), the Grok ACP manager strips `--always-approve`
+	// / `--auto-approve` (and equivalent `-c approval.mode=always|auto` /
+	// `-c tools.always_approve=true` / `-c tools.auto_approve=true` config
+	// overrides) from the spawn argv — so a signed `grok_acp_start` cannot
+	// enable autonomous tool execution without an explicit per-workspace
+	// opt-in. The feature brief makes approval behaviour conservative by
+	// default; flip this only on workspaces where the user has actively
+	// chosen to skip per-tool permission prompts.
+	EnableGrokAlwaysApprove bool `json:"enable_grok_always_approve,omitempty"`
 }
 
 /* -------------------------------------------------------------------------- */

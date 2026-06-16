@@ -2315,11 +2315,11 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// Same shape as codex_appserver_start: synthesise the actual
 		// `grok agent stdio …` argv we will exec so the default `grok *`
 		// allowlist entry covers ACP access without a parallel allowlist.
-		// The allowAPIKey gate must match what handleGrokACPCommand will
-		// pass to Start, otherwise the allowlist would match a different
-		// argv shape than the one we actually exec.
+		// Both the allowAPIKey and allowAlwaysApprove gates must match what
+		// handleGrokACPCommand will pass to Start, otherwise the allowlist
+		// would match a different argv shape than the one we actually exec.
 		allowCommand = "grok"
-		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAPIKeyFallback)
+		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAPIKeyFallback, cfg.EnableGrokAlwaysApprove)
 		denyOutput = "grok agent stdio denied by user: not in allow list"
 	default:
 		// Mid-session interactive commands don't re-prompt.
@@ -2659,7 +2659,8 @@ func isGrokACPCommand(cmdType string) bool {
 // with the manager so it can stream JSON-RPC frames (responses, session/update
 // notifications, server-initiated approval requests) back via Pub/Sub for the
 // duration of the session. cfg drives per-session policy: API-key fallback
-// gate (Config.EnableGrokAPIKeyFallback) and workspace-root containment
+// gate (Config.EnableGrokAPIKeyFallback), always-approve gate
+// (Config.EnableGrokAlwaysApprove), and workspace-root containment
 // (Config.WorkingDirectory).
 func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
 	if globalGrokACPManager == nil {
@@ -2682,6 +2683,7 @@ func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		opts := GrokStartOptions{
 			TimeoutMs:           cmd.TimeoutMs,
 			AllowAPIKeyFallback: cfg != nil && cfg.EnableGrokAPIKeyFallback,
+			AllowAlwaysApprove:  cfg != nil && cfg.EnableGrokAlwaysApprove,
 		}
 		if cfg != nil {
 			opts.WorkspaceRoot = cfg.WorkingDirectory

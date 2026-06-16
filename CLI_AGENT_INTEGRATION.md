@@ -244,6 +244,22 @@ opt-in:
 `GROK_*` config dir vars (notably `GROK_HOME`) are always preserved so the
 local `grok login` cached token remains discoverable.
 
+## Approval policy
+
+Per-tool permission prompts are **on by default**. xAI documents
+`--always-approve` as the flag that skips them, and the design doc treats
+`--auto-approve` as an equivalent name. Both flags — and the equivalent
+config knobs `approval.mode=always|auto` and
+`tools.always_approve=true` / `tools.auto_approve=true` — are stripped from
+`cmd.Args` unless the workspace has explicitly opted into autonomous
+execution via `enable_grok_always_approve` in [`config.go`](config.go).
+Without that opt-in, a signed `grok_acp_start` cannot flip Grok onto
+autonomous tool execution even if the orchestrator tries to forward the
+flag (directly or through `-c|--config`). When approval needs to happen,
+the orchestrator should route a JSON-RPC `permission/request` back through
+the existing per-workspace approval gate and answer with
+`permission/response`; the desktop never auto-allows.
+
 ## Workspace containment
 
 [`GrokACPManager.Start`](grok_acp.go) accepts a `GrokStartOptions.WorkspaceRoot`
@@ -284,7 +300,10 @@ seeing every frame in `Seq` order; a silent drop would deadlock.
 - [`grok_acp.go` — `buildGrokACPArgs`](grok_acp.go) — forces the `agent
   stdio` entry-point argv, strips TUI / chat / run tokens, and (when
   `allowAPIKey=false`) strips caller-supplied `--api-key*` / `--auth*`
-  args.
+  args; (when `allowAlwaysApprove=false`) strips caller-supplied
+  `--always-approve` / `--auto-approve` and the equivalent
+  `-c approval.mode=always|auto` / `-c tools.always_approve=true` /
+  `-c tools.auto_approve=true` config overrides.
 - [`grok_acp.go` — `sanitizeGrokACPEnv`](grok_acp.go) — strips nested-IDE
   env markers; strips `XAI_API_KEY` unless `Config.EnableGrokAPIKeyFallback`
   is set; preserves `GROK_*` so the local cached-token path stays

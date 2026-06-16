@@ -182,6 +182,16 @@ type GrokStartOptions struct {
 	// integration launches. Sourced from Config.EnableGrokAPIKeyFallback.
 	AllowAPIKeyFallback bool
 
+	// AllowAlwaysApprove, when false, strips `--always-approve` /
+	// `--auto-approve` (and equivalent `-c approval.mode=always|auto` /
+	// `-c tools.always_approve=true` / `-c tools.auto_approve=true` config
+	// overrides) from the spawn argv. Default false enforces the feature
+	// brief's conservative approval posture — autonomous tool execution
+	// must be an explicit per-workspace opt-in, not something a signed
+	// `grok_acp_start` can flip via extra args. Sourced from
+	// Config.EnableGrokAlwaysApprove.
+	AllowAlwaysApprove bool
+
 	// WorkspaceRoot, when non-empty, is treated as a containment root: the
 	// requested cwd must resolve (after EvalSymlinks) to a path strictly
 	// inside this root. When empty, no containment check runs — but Start
@@ -310,7 +320,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 			executable = p
 		}
 	}
-	args := buildGrokACPArgs(extraArgs, opts.AllowAPIKeyFallback)
+	args := buildGrokACPArgs(extraArgs, opts.AllowAPIKeyFallback, opts.AllowAlwaysApprove)
 
 	fmt.Printf("%s[grok-acp] Starting session %s: %s %s%s\n",
 		colorCyan, id, executable, strings.Join(redactGrokACPArgsForLog(args), " "), colorReset)
@@ -935,13 +945,21 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 // via argv. The orchestrator's ACP `authenticate` flow still resolves
 // `cached_token` via the JSON-RPC handshake — no functionality loss for the
 // default path.
-func buildGrokACPArgs(extraArgs []string, allowAPIKey bool) []string {
+//
+// When allowAlwaysApprove is false the sanitiser additionally drops any
+// caller-supplied `--always-approve` / `--auto-approve` flags AND the
+// equivalent `-c approval.mode=always|auto` / `-c tools.always_approve=true`
+// / `-c tools.auto_approve=true` config overrides. The feature brief makes
+// approval behaviour conservative by default — autonomous tool execution
+// has to be a per-workspace opt-in (Config.EnableGrokAlwaysApprove), not
+// something a signed `grok_acp_start` can flip via extra args.
+func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) []string {
 	args := []string{"agent", "stdio", "--no-auto-update"}
-	args = append(args, sanitizeGrokACPExtraArgs(extraArgs, allowAPIKey)...)
+	args = append(args, sanitizeGrokACPExtraArgs(extraArgs, allowAPIKey, allowAlwaysApprove)...)
 	return args
 }
 
-func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey bool) []string {
+func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) []string {
 	// Conservative valued-flag list — we don't currently know every flag
 	// `grok` accepts, but covering the common config family lets callers
 	// pass values whose token happens to look like a stripped subcommand
@@ -987,28 +1005,42 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey bool) []string {
 			}
 			continue
 		}
-		// Inline -c/--config form: `--config=auth.method=xai.api_key`. Without
-		// inspection this would survive the explicit-flag strip and let the
-		// orchestrator select API-key auth despite the default opt-in gate.
-		if !allowAPIKey && isGrokConfigOverrideArg(lower) {
+		if !allowAlwaysApprove && isGrokAlwaysApproveArg(lower) {
+			// `--always-approve` / `--auto-approve` are boolean flags in
+			// every form xAI has documented — there's no separate-value to
+			// skip. Equals-form (`--always-approve=true`) is dropped wholesale
+			// because re-admitting `--always-approve=false` here would let a
+			// caller toggle the value back on via subsequent flag ordering.
+			continue
+		}
+		// Inline -c/--config form: `--config=auth.method=xai.api_key` or
+		// `--config=approval.mode=always`. Without inspection these would
+		// survive the explicit-flag strip and let the orchestrator escape the
+		// default opt-in gates.
+		if isGrokConfigOverrideArg(lower) {
 			if eq := strings.IndexByte(a, '='); eq >= 0 {
-				if isGrokAuthConfigKV(a[eq+1:]) {
+				kv := a[eq+1:]
+				if !allowAPIKey && isGrokAuthConfigKV(kv) {
+					continue
+				}
+				if !allowAlwaysApprove && isGrokApprovalConfigKV(kv) {
 					continue
 				}
 			}
 		}
 		if valuedFlags[lower] {
 			// Separate-value -c/--config form: peek the value and drop the
-			// pair when it touches auth/api-key config keys. Same fail-closed
-			// posture as the inline form above.
-			if !allowAPIKey && isGrokConfigOverrideArg(lower) {
+			// pair when it touches a gated config key. Same fail-closed
+			// posture as the inline form above; the trailing sweep below
+			// finishes the job once both tokens are visible.
+			if (!allowAPIKey || !allowAlwaysApprove) && isGrokConfigOverrideArg(lower) {
 				// Defer the decision to the next iteration via a closure
 				// over the next token: we cannot index forward here without
 				// duplicating the loop's skip/keep bookkeeping, so flag the
 				// pair via a dedicated keepNext sibling.
 				keepNext = true
 				cleaned = append(cleaned, a)
-				// Special-case: if the very next token would be an auth
+				// Special-case: if the very next token would be a gated
 				// config kv, undo both appends. Implemented by scanning
 				// ahead inline rather than introducing a third state flag.
 				continue
@@ -1017,12 +1049,15 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey bool) []string {
 		}
 		cleaned = append(cleaned, a)
 	}
-	// Second pass: drop any `-c|--config <auth-kv>` pair that the loop above
+	// Second pass: drop any `-c|--config <gated-kv>` pair that the loop above
 	// admitted because the kv decision needed both tokens. Keeping this as a
 	// trailing sweep avoids growing the loop's state machine and keeps the
 	// happy path (no config args) zero-cost.
 	if !allowAPIKey {
 		cleaned = stripGrokAuthConfigPairs(cleaned)
+	}
+	if !allowAlwaysApprove {
+		cleaned = stripGrokApprovalConfigPairs(cleaned)
 	}
 	return cleaned
 }
@@ -1088,6 +1123,82 @@ func stripGrokAuthConfigPairs(in []string) []string {
 		lower := strings.ToLower(in[i])
 		if (lower == "-c" || lower == "--config") && i+1 < len(in) {
 			if isGrokAuthConfigKV(in[i+1]) {
+				i += 2
+				continue
+			}
+		}
+		out = append(out, in[i])
+		i++
+	}
+	return out
+}
+
+// isGrokAlwaysApproveArg reports whether a caller-supplied arg would let
+// Grok skip per-tool permission prompts. xAI documents `--always-approve`
+// as the canonical autonomous-execution flag; `--auto-approve` is the
+// equivalent name used by the design doc and other CLI agents. Each known
+// flag is enumerated explicitly — a broader prefix match would silently
+// strip flags we don't know about (e.g. a hypothetical `--always-approve-
+// for-readonly`) and risk breaking unrelated args future Grok releases
+// might ship. Match is case-insensitive; callers normalise via
+// strings.ToLower first.
+func isGrokAlwaysApproveArg(lower string) bool {
+	approveFlags := []string{
+		"--always-approve",
+		"--auto-approve",
+	}
+	for _, f := range approveFlags {
+		if lower == f || strings.HasPrefix(lower, f+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// isGrokApprovalConfigKV reports whether a `-c`/`--config` value would let
+// the caller switch Grok off the per-tool prompt flow when always-approve is
+// opt-in. Three cases trigger the gate:
+//
+//   - `approval.mode=always|auto` (or `approval=always|auto`) — flips the
+//     top-level approval selector to autonomous execution.
+//   - `tools.always_approve=true` / `tools.auto_approve=true` — the boolean
+//     toggle that the documented flag desugars to.
+//
+// `approval.mode=ask` (or any non-always selector) is left intact so callers
+// can still re-pin the conservative default explicitly.
+func isGrokApprovalConfigKV(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return false
+	}
+	key := lower
+	val := ""
+	if eq := strings.IndexByte(lower, '='); eq >= 0 {
+		key = lower[:eq]
+		val = lower[eq+1:]
+	}
+	if (key == "tools.always_approve" || key == "tools.auto_approve") && (val == "true" || val == "1" || val == "yes" || val == "on") {
+		return true
+	}
+	if (key == "approval.mode" || key == "approval") && val != "" {
+		if val == "always" || val == "auto" || val == "auto-approve" || val == "always-approve" {
+			return true
+		}
+	}
+	return false
+}
+
+// stripGrokApprovalConfigPairs removes `-c|--config <approval-kv>` pairs
+// (separate-value form) that survived sanitizeGrokACPExtraArgs' main loop.
+// Mirrors stripGrokAuthConfigPairs — same speculative-admit / trailing-sweep
+// pattern, just gated on the approval kv set instead of the auth kv set.
+func stripGrokApprovalConfigPairs(in []string) []string {
+	out := make([]string, 0, len(in))
+	i := 0
+	for i < len(in) {
+		lower := strings.ToLower(in[i])
+		if (lower == "-c" || lower == "--config") && i+1 < len(in) {
+			if isGrokApprovalConfigKV(in[i+1]) {
 				i += 2
 				continue
 			}
