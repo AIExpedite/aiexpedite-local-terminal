@@ -389,10 +389,16 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		globalProcessRegistry.Register(proc.Process.Pid, "grok-acp:"+id)
 	}
 
-	// Per-session deadline (finding #2 from secondary review). On fire we
-	// publish a typed grok_acp_error first so the orchestrator can fail the
-	// in-flight ACP call with a clear reason BEFORE waitForExit's eventual
-	// grok_acp_ended arrives — both frames carry monotonic Seq so the
+	// Per-session deadline. Kill the child FIRST, then publish the typed
+	// grok_acp_error best-effort. The publish is synchronous in the
+	// AfterFunc goroutine and the production newSessionPublishFn can block
+	// for the full Pub/Sub publish timeout (~30s) when Pub/Sub is slow or
+	// unavailable; running it before Kill would leave the timed-out session
+	// executing tools and consuming Grok usage past its deadline. Kill is
+	// non-blocking so the orchestrator is guaranteed to see the child
+	// terminate on schedule, and the resulting natural exit will publish
+	// `grok_acp_ended` via waitForExit even if this diagnostic publish
+	// itself ultimately fails. Both frames carry monotonic Seq so the
 	// orchestrator can reconstruct ordering even though the kill→wait→ended
 	// cascade is asynchronous. Timer is Stop()'d in waitForExit on natural
 	// exit so a freshly-exited session can't double-fire the timeout publish.
@@ -403,6 +409,9 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 			}
 			fmt.Printf("%s[grok-acp] Session %s timed out after %dms — killing%s\n",
 				colorYellow, session.ID, session.TimeoutMs, colorReset)
+			if session.Process != nil && session.Process.Process != nil {
+				_ = session.Process.Process.Kill()
+			}
 			seq := atomic.AddInt64(&session.seq, 1)
 			publishFn(resultMsg{
 				ID:          session.ID,
@@ -416,9 +425,6 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 				SessionID:   session.ID,
 				Seq:         int(seq),
 			})
-			if session.Process != nil && session.Process.Process != nil {
-				_ = session.Process.Process.Kill()
-			}
 		})
 	}
 

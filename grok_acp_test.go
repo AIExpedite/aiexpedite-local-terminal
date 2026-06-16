@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1459,6 +1460,103 @@ func TestGrokACPLifecycle_TimeoutKillsRunawaySession(t *testing.T) {
 	}
 	if m.ActiveCount() != 0 {
 		t.Errorf("session should have been unregistered after timeout; %d still active", m.ActiveCount())
+	}
+}
+
+// signalAlive returns nil when pid is still alive (Signal(0) succeeds) and
+// an error once the process has exited or is no longer signalable. Used by
+// the timeout-ordering test to probe child liveness without taking a
+// dependency on platform-specific /proc / WMI lookups.
+func signalAlive(pid int) error {
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return p.Signal(syscall.Signal(0))
+}
+
+// TestGrokACPLifecycle_TimeoutKillsBeforeBlockingPublish pins the ordering
+// invariant inside the per-session deadline AfterFunc: Process.Kill MUST run
+// BEFORE the diagnostic publishFn call, because the production publishFn can
+// block for the full Pub/Sub publish timeout (~30s) when Pub/Sub is slow.
+// If publish ran first the timed-out child would keep executing tools and
+// consuming Grok usage past its deadline. Test verifies the child PID is gone
+// while publishFn is still blocked.
+func TestGrokACPLifecycle_TimeoutKillsBeforeBlockingPublish(t *testing.T) {
+	// Skip Windows: syscall.Signal(0) liveness probe is a Unix-only idiom;
+	// the ordering invariant we're pinning is OS-agnostic so linux+darwin
+	// coverage is sufficient.
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("liveness probe via Signal(0) only runs on unix")
+	}
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	tmpDir := t.TempDir()
+	mockName := "grok"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	mockPath := filepath.Join(tmpDir, mockName)
+	if err := copyTestBinary(testExe, mockPath); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "grok-acp-hang")
+
+	m := NewGrokACPManager()
+	id := fmt.Sprintf("grok-timeout-killfirst-%d", time.Now().UnixNano())
+
+	// publishGate blocks the timeout publish so we can probe whether Kill
+	// has run while publishFn is still in flight. waitForExit's terminal
+	// `grok_acp_ended` publish would also hit this gate, so we release it
+	// from the test goroutine after we've made the assertion.
+	publishGate := make(chan struct{})
+	publishEntered := make(chan resultMsg, 4)
+	publishFn := func(res resultMsg) {
+		select {
+		case publishEntered <- res:
+		default:
+		}
+		<-publishGate
+	}
+
+	if err := m.Start(id, tmpDir, nil, "ws", "uid", GrokStartOptions{TimeoutMs: 300}, publishFn); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer close(publishGate)
+
+	session := m.Get(id)
+	if session == nil || session.Process == nil || session.Process.Process == nil {
+		t.Fatalf("expected live session after Start")
+	}
+	pid := session.Process.Process.Pid
+
+	// Wait for the timeout publish to start (i.e. publishFn was called).
+	select {
+	case res := <-publishEntered:
+		if res.Type != "grok_acp_error" || !strings.Contains(res.Output, "timed out") {
+			t.Fatalf("expected first publish to be timeout grok_acp_error; got Type=%q Output=%q", res.Type, res.Output)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout publish never started")
+	}
+
+	// publishFn is now blocked inside the AfterFunc. The fix asserts Kill
+	// already ran before this synchronous publish — confirm the child is
+	// no longer signalable. Poll briefly to absorb the small window between
+	// Kill() returning and the kernel reaping the process.
+	killed := false
+	for i := 0; i < 40; i++ {
+		if err := signalAlive(pid); err != nil {
+			killed = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !killed {
+		t.Errorf("child PID %d still alive while publishFn is blocked — Kill ran AFTER publish, violating the timeout-path ordering", pid)
 	}
 }
 
