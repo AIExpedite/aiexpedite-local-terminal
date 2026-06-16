@@ -24,8 +24,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -66,16 +68,41 @@ func captureClaudeRateLimitsFromStatusline(raw []byte, now time.Time) {
 // renderStatusLine forwards to the user's previous status-line command when we
 // chained one at install time (feeding it the same stdin), otherwise prints our
 // own compact line built from the payload.
+//
+// Cancellation: Claude's status-line docs state that a new render cancels the
+// in-flight one. Without help the shell child we spawn here would survive that
+// kill — Claude only terminates the wrapper it invoked — leaking expensive or
+// stuck third-party status-line processes across renders. We put the child in
+// its own process group / job and forward catchable termination signals to it
+// so a hanging chained command is torn down with us, restoring the cancellation
+// guarantee users had before we wrapped their command.
 func renderStatusLine(raw []byte) {
 	if prev := loadPrevStatusLineCommand(); prev != "" {
 		cmd := shellCommand(prev)
 		cmd.Stdin = bytes.NewReader(raw)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err == nil {
-			return
+		setStatusLineChildProcessGroup(cmd)
+		if err := cmd.Start(); err == nil {
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+			defer signal.Stop(sigCh)
+			select {
+			case err := <-done:
+				if err == nil {
+					return
+				}
+			case sig := <-sigCh:
+				killStatusLineChild(cmd.Process, sig)
+				<-done
+				// We're being torn down by Claude; do not fall back to our
+				// own line — the next render will print one.
+				return
+			}
+			// Fall through to our own line if the chained command failed.
 		}
-		// Fall through to our own line if the chained command failed.
 	}
 	fmt.Print(defaultStatusLine(raw))
 }
