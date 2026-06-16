@@ -958,7 +958,7 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 // can flip via extra args.
 //
 // When allowAlwaysApprove is false AND the sanitized extras don't already
-// pin a `--permission-mode`, we additionally inject `--permission-mode ask`
+// pin a `--permission-mode`, we additionally inject `--permission-mode default`
 // onto the argv. The argv flag has higher precedence than `~/.grok/
 // config.toml` (or `$GROK_HOME/config.toml`), so a host where the user has
 // `[ui] permission_mode = "always-approve"` persisted cannot silently flip
@@ -967,14 +967,18 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 // config bypass open. We deliberately only inject when no caller-supplied
 // `--permission-mode` survived sanitisation: by that point any bypass-valued
 // caller arg has already been dropped, so a survivor is a conservative
-// selector (`ask`, `plan`, etc.) the orchestrator explicitly chose — we
-// don't second-guess it.
+// selector (`default`, `plan`, etc.) the orchestrator explicitly chose — we
+// don't second-guess it. `default` is the xAI-documented CLI value for the
+// prompt-on-every-tool mode (the `[ui] permission_mode = "ask"` config key
+// has no matching CLI selector — xAI's enterprise docs enumerate `default`,
+// `dontAsk`, `acceptEdits`, `bypassPermissions`, `plan`), so `default` is
+// what we pin to keep the launch from failing argv validation.
 func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) []string {
 	args := []string{"agent", "stdio", "--no-auto-update"}
 	sanitized := sanitizeGrokACPExtraArgs(extraArgs, allowAPIKey, allowAlwaysApprove)
 	args = append(args, sanitized...)
 	if !allowAlwaysApprove && !grokExtraArgsPinPermissionMode(sanitized) {
-		args = append(args, "--permission-mode", "ask")
+		args = append(args, "--permission-mode", "default")
 	}
 	return args
 }
@@ -983,7 +987,7 @@ func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) 
 // supplied arg already pins the Grok permission mode (via `--permission-mode`
 // or the `-c|--config approval.permission_mode=...` / `permission_mode=...`
 // config-knob form). Used by buildGrokACPArgs to decide whether to inject
-// the `--permission-mode ask` argv override that defeats `~/.grok/config.toml`
+// the `--permission-mode default` argv override that defeats `~/.grok/config.toml`
 // based bypasses — when the caller already pinned a mode, we don't stack a
 // second one on top. Both the explicit-flag and `-c|--config` knob surfaces
 // must be considered because the bypass-mode strip in sanitizeGrokACPExtraArgs
@@ -1300,7 +1304,8 @@ func isGrokApprovalConfigKV(value string) bool {
 // permission gate selector that, when set to `bypassPermissions`, disables
 // per-tool prompts — i.e. the same intent as `--always-approve` but routed
 // through a different surface. Recognised here so the always-approve gate
-// can fail closed on it; benign selectors like `ask` are left intact.
+// can fail closed on it; benign selectors like `default` or `plan` are left
+// intact.
 func isGrokPermissionModeArg(lower string) bool {
 	return lower == "--permission-mode" || lower == "--permission_mode" ||
 		strings.HasPrefix(lower, "--permission-mode=") || strings.HasPrefix(lower, "--permission_mode=")
@@ -1332,8 +1337,8 @@ func isGrokPermissionModeBypassValue(value string) bool {
 // loop. The loop admits the pair speculatively via the valuedFlags branch
 // because the bypass decision needs both tokens; this sweep drops it only
 // when the value resolves to a bypass selector. Non-bypass values such as
-// `ask` flow through unchanged so callers can still pin the conservative
-// default explicitly.
+// `default` or `plan` flow through unchanged so callers can still pin a
+// conservative selector explicitly.
 func stripGrokPermissionModePairs(in []string) []string {
 	out := make([]string, 0, len(in))
 	i := 0
