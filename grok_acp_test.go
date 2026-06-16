@@ -1447,6 +1447,16 @@ func TestBuildGrokACPArgs_StripsPermissionModeBypassByDefault(t *testing.T) {
 			[]string{"agent", "stdio", "--no-auto-update"},
 		},
 		{
+			"strips_accept_edits_separate",
+			[]string{"--permission-mode", "acceptEdits", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"strips_accept_edits_equals_separator_variant",
+			[]string{"--permission-mode=accept-edits"},
+			[]string{"agent", "stdio", "--no-auto-update"},
+		},
+		{
 			"keeps_permission_mode_ask_separate",
 			[]string{"--permission-mode", "ask", "--model", "grok-2"},
 			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask", "--model", "grok-2"},
@@ -1504,6 +1514,16 @@ func TestSanitizeGrokACPExtraArgs_StripsPermissionModeConfigOverrides(t *testing
 		{
 			"strips_inline_equals_form",
 			[]string{"--config=approval.permission_mode=bypass"},
+			[]string{},
+		},
+		{
+			"strips_config_permission_mode_accept_edits",
+			[]string{"--config", "approval.permission_mode=acceptEdits", "--model", "grok-2"},
+			[]string{"--model", "grok-2"},
+		},
+		{
+			"strips_short_config_permission_mode_accept_edits_separator_variant",
+			[]string{"-c", "permission_mode=accept-edits"},
 			[]string{},
 		},
 		{

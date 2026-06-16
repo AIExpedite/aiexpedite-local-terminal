@@ -1232,13 +1232,18 @@ func isGrokPermissionModeArg(lower string) bool {
 // would let the caller bypass per-tool permission prompts. `bypassPermissions`
 // is the canonical name from xAI's enterprise docs; the bare `bypass`,
 // `auto*`, and `always*` synonyms share the same intent and are gated to
-// fail closed too. Case- and separator-insensitive.
+// fail closed too. `acceptEdits` is also gated because xAI's enterprise docs
+// describe it as auto-approving file edits without per-tool prompts —
+// strictly narrower than full `bypassPermissions` but still an auto-approval
+// surface that must stay behind Config.EnableGrokAlwaysApprove. Case- and
+// separator-insensitive.
 func isGrokPermissionModeBypassValue(value string) bool {
 	v := strings.ToLower(strings.TrimSpace(value))
 	switch v {
 	case "bypasspermissions", "bypass-permissions", "bypass_permissions", "bypass",
 		"auto", "auto-approve", "auto_approve",
-		"always", "always-approve", "always_approve":
+		"always", "always-approve", "always_approve",
+		"acceptedits", "accept-edits", "accept_edits":
 		return true
 	}
 	return false
