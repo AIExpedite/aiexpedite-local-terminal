@@ -2689,3 +2689,120 @@ func TestBuildGrokACPArgs_DelimiterCannotDemotePolicyFlags(t *testing.T) {
 		t.Fatalf("expected trailing `--permission-mode default`; got %#v", got)
 	}
 }
+
+// TestParsePersistedGrokModelScopesWithAPIKey_DiscoversDefaultAndScopedKeys
+// pins the case codex flagged in PR #42: a `~/.grok/config.toml` that sets
+// `[models] default = "custom"` and `[model.custom] api_key = "..."` would
+// resolve to the custom scope's API key on every ACP launch even though the
+// orchestrator never passes `--model custom`. The persisted-config scanner
+// must surface BOTH the `[models] default` scope and any `[model.<scope>]`
+// section that carries an api_key/env_key so buildGrokACPArgs can emit the
+// matching `--config model.<scope>.{api_key,env_key}=` clears.
+func TestParsePersistedGrokModelScopesWithAPIKey_DiscoversDefaultAndScopedKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `# user-edited grok config
+[models]
+default = "custom"
+
+[model.custom]
+api_key = "xai-secret"
+
+[model.alt]
+env_key = "XAI_ALT_KEY"
+
+[model.no-creds]
+temperature = 0.2
+
+[model.grok-build]
+api_key = "should-be-skipped-already-in-static-slice"
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	got := parsePersistedGrokModelScopesWithAPIKey(path)
+	seen := map[string]bool{}
+	for _, s := range got {
+		seen[s] = true
+	}
+	if !seen["custom"] {
+		t.Errorf("expected `custom` (the [models] default + scoped api_key) in scopes, got %#v", got)
+	}
+	if !seen["alt"] {
+		t.Errorf("expected `alt` ([model.alt] env_key) in scopes, got %#v", got)
+	}
+	if seen["no-creds"] {
+		t.Errorf("`no-creds` has no api_key/env_key — should not appear: %#v", got)
+	}
+	if seen["grok-build"] {
+		t.Errorf("`grok-build` is already neutralized by the static slice — should be skipped: %#v", got)
+	}
+}
+
+// TestParsePersistedGrokModelScopesWithAPIKey_MissingFileReturnsNil keeps the
+// best-effort contract: a host without a persisted config gets no scopes and
+// no error path that would block the launch.
+func TestParsePersistedGrokModelScopesWithAPIKey_MissingFileReturnsNil(t *testing.T) {
+	dir := t.TempDir()
+	got := parsePersistedGrokModelScopesWithAPIKey(filepath.Join(dir, "does-not-exist.toml"))
+	if got != nil {
+		t.Fatalf("expected nil for missing config, got %#v", got)
+	}
+}
+
+// TestParsePersistedGrokModelScopesWithAPIKey_RejectsUnsafeScopeNames keeps
+// the safety filter and the persisted-config scanner in lockstep: a scope
+// name containing a TOML-key-significant character (period, `=`, whitespace)
+// would corrupt the emitted `--config model.<scope>.api_key=` arg and is
+// dropped here rather than allowed to flow through to argv.
+func TestParsePersistedGrokModelScopesWithAPIKey_RejectsUnsafeScopeNames(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `[model.with.dot]
+api_key = "x"
+
+[model.has space]
+api_key = "x"
+
+[model.safe_name]
+api_key = "x"
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	got := parsePersistedGrokModelScopesWithAPIKey(path)
+	if len(got) != 1 || got[0] != "safe_name" {
+		t.Fatalf("expected only `safe_name` to survive isSafeGrokModelScope, got %#v", got)
+	}
+}
+
+// TestBuildGrokACPArgs_NeutralizesPersistedDefaultModelAPIKey is the
+// end-to-end gate for the codex finding: with GROK_HOME pointed at a config
+// that sets `[models] default = "custom"` + `[model.custom] api_key = ...`,
+// buildGrokACPArgs MUST emit `--config model.custom.api_key=` clears even
+// when no `--model` was supplied on argv. Without this, a host that ran
+// `grok config set models.default custom` and stored a per-scope API key
+// would silently bill the API-key account despite EnableGrokAPIKeyFallback
+// being false.
+func TestBuildGrokACPArgs_NeutralizesPersistedDefaultModelAPIKey(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(`
+[models]
+default = "custom"
+
+[model.custom]
+api_key = "xai-leak"
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("GROK_HOME", dir)
+
+	got := buildGrokACPArgs(nil, false, false)
+	joined := strings.Join(got, " ")
+	if !strings.Contains(joined, "model.custom.api_key=") {
+		t.Errorf("expected persisted-default scope `custom` to be neutralized; got %#v", got)
+	}
+	if !strings.Contains(joined, "model.custom.env_key=") {
+		t.Errorf("expected persisted-default scope `custom` env_key neutralizer; got %#v", got)
+	}
+}

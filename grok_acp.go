@@ -1062,7 +1062,22 @@ func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) 
 		// selection. Mirrors the argv-side gate in `isGrokAuthConfigKV`,
 		// which already matches any `model.<scope>.{api_key,env_key}` shape
 		// supplied via `-c|--config`.
-		args = append(args, grokModelScopeAuthNeutralizingConfigArgs(extractGrokModelScopes(sanitized))...)
+		// Per-model-scope neutralizers also need to cover scopes the orchestrator
+		// did NOT name on argv: xAI's enterprise docs document `[models] default
+		// = "<scope>"` as the persisted active-model selector, so a host with
+		// `[models] default = "custom"` + `[model.custom] api_key = "..."` would
+		// resolve to `[model.custom]`'s API key on every ACP launch even though
+		// no `--model` was passed. Read the persisted config to discover any
+		// `[model.<scope>]` section with an api_key/env_key and the `[models]
+		// default` scope, then emit clears for each. Filtered through
+		// isSafeGrokModelScope and capped so a hostile/corrupted config can't
+		// balloon argv.
+		args = append(args, grokModelScopeAuthNeutralizingConfigArgs(
+			mergeGrokModelScopes(
+				extractGrokModelScopes(sanitized),
+				persistedGrokModelScopesWithAPIKey(),
+			),
+		)...)
 	}
 	if !allowAlwaysApprove && !grokExtraArgsPinPermissionMode(sanitized) {
 		args = append(args, "--permission-mode", "default")
@@ -1171,6 +1186,151 @@ func extractGrokModelScopes(args []string) []string {
 		}
 	}
 	return scopes
+}
+
+// persistedGrokModelScopesWithAPIKey returns scope names from the user's
+// `~/.grok/config.toml` (or `$GROK_HOME/config.toml`) that either appear as
+// `[model.<scope>]` sections containing an `api_key` / `env_key` line, or
+// are named as `[models] default = "<scope>"` (the persisted active-model
+// selector documented in xAI's enterprise docs). Used by buildGrokACPArgs
+// to ensure the cached-token posture is not silently bypassed by a host
+// whose persisted default model resolves to a `[model.<scope>] api_key =
+// "..."` section without any `--model` arg from the orchestrator. Missing
+// / unreadable config files yield nil — best-effort by design.
+func persistedGrokModelScopesWithAPIKey() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	base := firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
+	if base == "" {
+		return nil
+	}
+	return parsePersistedGrokModelScopesWithAPIKey(filepath.Join(base, "config.toml"))
+}
+
+// parsePersistedGrokModelScopesWithAPIKey is the file-path-injectable
+// implementation of persistedGrokModelScopesWithAPIKey. Kept separate so
+// tests can point at a fixture without monkey-patching $GROK_HOME. The
+// parser is intentionally line-oriented and regex-free: Grok's config.toml
+// is human-edited TOML and a fully spec-compliant parser is overkill for
+// the narrow goal of discovering scope-credential sections. We cap the
+// read at 1 MiB and the scope count at 32 so a hostile/corrupted file
+// can't balloon argv or stall the launch.
+func parsePersistedGrokModelScopesWithAPIKey(path string) []string {
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	scopes := make([]string, 0, 4)
+	seen := map[string]bool{}
+	addScope := func(name string) {
+		if name == "" || name == "grok-build" {
+			return
+		}
+		if !isSafeGrokModelScope(name) {
+			return
+		}
+		if seen[name] {
+			return
+		}
+		seen[name] = true
+		scopes = append(scopes, name)
+	}
+
+	const maxBytes = 1 << 20
+	reader := io.LimitReader(f, maxBytes)
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+
+	currentSection := ""
+	currentScope := ""
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			currentSection = strings.TrimSpace(line[1 : len(line)-1])
+			currentScope = ""
+			if strings.HasPrefix(currentSection, "model.") {
+				currentScope = currentSection[len("model."):]
+			}
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		switch currentSection {
+		case "models":
+			if key == "default" {
+				addScope(trimTOMLString(val))
+			}
+		default:
+			if currentScope != "" && (key == "api_key" || key == "env_key") {
+				addScope(currentScope)
+			}
+		}
+		if len(scopes) >= 32 {
+			break
+		}
+	}
+	return scopes
+}
+
+// trimTOMLString unwraps a TOML scalar of the form `"..."` or `'...'`.
+// Returns the input unchanged when no matching quotes are present so
+// non-string scalars don't get truncated; isSafeGrokModelScope will reject
+// anything that isn't a valid scope identifier downstream regardless.
+func trimTOMLString(v string) string {
+	if len(v) >= 2 {
+		first, last := v[0], v[len(v)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			return v[1 : len(v)-1]
+		}
+	}
+	return v
+}
+
+// mergeGrokModelScopes returns the union of two scope slices, preserving
+// the first slice's order and appending only new entries from the second.
+// Used by buildGrokACPArgs to combine argv-derived scopes (the caller's
+// `--model` selectors) with config-file-derived scopes (the persisted
+// default model + any scope-with-credential discovered in config.toml)
+// without emitting duplicate `--config model.<scope>.{api_key,env_key}=`
+// clears.
+func mergeGrokModelScopes(a, b []string) []string {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	out := make([]string, 0, len(a)+len(b))
+	seen := map[string]bool{}
+	for _, s := range a {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, s := range b {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 // isSafeGrokModelScope reports whether `name` is a conservative model
