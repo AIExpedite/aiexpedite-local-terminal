@@ -170,8 +170,13 @@ naming specific to Grok.
 ## How to install / login
 
 ```bash
-# Install Grok Build CLI (xAI)
-npm install -g @xai/grok
+# Install Grok Build CLI (xAI) — official installer
+# Drops the `grok` binary at ~/.grok/bin/grok and prints the PATH export
+# you'll need so the local terminal's `exec.LookPath("grok")` finds it.
+curl -fsSL https://x.ai/cli/install.sh | bash
+
+# Alternative (kept for environments without curl access):
+#   npm install -g @xai/grok
 
 # Subscription-bound auth — preferred by AI Expedite
 grok login
@@ -179,6 +184,10 @@ grok login
 # Optional API-key fallback (only if no cached_token is available)
 export XAI_API_KEY="xai-..."
 ```
+
+> The official `install.sh` drops the binary under `~/.grok/bin`. If
+> `grok_acp_start` reports "grok not on PATH", confirm `~/.grok/bin` is in
+> the user's `PATH` (the installer prints the line to add to your shell rc).
 
 The agent detects `grok` via `gatherCLIAgents` in [systemInfo.go](systemInfo.go)
 and reports installed-status + version on the auth/token uplink. The CLI

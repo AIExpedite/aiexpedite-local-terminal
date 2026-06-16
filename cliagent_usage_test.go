@@ -329,6 +329,37 @@ func TestGrokUsageParser_LegacyCachedTokenLayout(t *testing.T) {
 	}
 }
 
+func TestGrokUsageParser_ScopedInstallerAuthFile(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	// Layout written by https://x.ai/cli/install.sh — top-level keys are auth
+	// scopes, values wrap the JWT under `key`. Without scoped-format support
+	// the parser would silently report a logged-in user as no-account.
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		"grok-cli": map[string]any{
+			"key": helperJWT(t, map[string]any{
+				"email":     "scoped-grok@example.com",
+				"sub":       "scoped-sub",
+				"plan_type": "premium",
+			}),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || usage == nil {
+		t.Fatalf("expected usage from scoped installer auth.json")
+	}
+	if usage.Account != "scoped-grok@example.com" {
+		t.Errorf("Account=%q, want scoped-grok@example.com (from scoped JWT)", usage.Account)
+	}
+	if usage.Plan != "premium" {
+		t.Errorf("Plan=%q, want premium", usage.Plan)
+	}
+	if usage.AccountFingerprint == "" {
+		t.Errorf("expected fingerprint for scoped account")
+	}
+}
+
 func TestGrokUsageParser_HonorsGrokHomeEnv(t *testing.T) {
 	home := t.TempDir()
 	grokHome := t.TempDir()

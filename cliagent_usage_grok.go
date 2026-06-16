@@ -14,8 +14,10 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -76,11 +78,14 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
 
-	// Grok writes its cached-token JSON in one of a couple of layouts depending
-	// on CLI version: a flat `auth.json` (newer) and a sibling
-	// `cached_token.json` (legacy). Try both before giving up.
+	// Grok writes its cached-token JSON in one of a few layouts depending on
+	// CLI version: the official installer's scoped `auth.json`
+	// (`{scope: {key: <jwt>}}` — what `read_grok_token` in
+	// https://x.ai/cli/install.sh consumes), a flat `auth.json`, and a sibling
+	// `cached_token.json` (legacy). Try all three before giving up.
+	authPath := filepath.Join(base, "auth.json")
 	auth := grokAuthFile{}
-	loaded := readJSONFile(filepath.Join(base, "auth.json"), &auth)
+	loaded := readJSONFile(authPath, &auth)
 	if !loaded {
 		loaded = readJSONFile(filepath.Join(base, "cached_token.json"), &auth)
 	}
@@ -110,6 +115,29 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 			claims.PlanType,
 		)
 	}
+	// Scoped fallback: the installer-produced `auth.json` does not match the
+	// flat shape above — every top-level key is an auth scope whose value is a
+	// `{key: <jwt>}` envelope. When the flat parse left identity fields empty,
+	// reparse the file as the scoped map and pull claims from the first JWT.
+	if usage.Account == "" {
+		if scopedClaims, ok := readGrokScopedAuthClaims(authPath); ok {
+			usage.Account = firstNonEmpty(
+				usage.Account,
+				scopedClaims.Email,
+				scopedClaims.Account,
+				scopedClaims.UserName,
+				scopedClaims.UserID,
+				scopedClaims.Subject,
+			)
+			usage.Plan = firstNonEmpty(
+				usage.Plan,
+				scopedClaims.Plan,
+				scopedClaims.PlanType,
+			)
+			loaded = true
+		}
+	}
+	_ = loaded
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
 	usage.Metrics = []cliAgentUsageMetric{
@@ -127,4 +155,38 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 		},
 	}
 	return usage, true
+}
+
+// readGrokScopedAuthClaims decodes the installer-produced `auth.json`, whose
+// top level is keyed by auth scope (e.g. `grok-cli`) and whose values wrap a
+// JWT under `key`. Returns the JWT claims from the first non-empty token.
+func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
+	var claims grokIDTokenClaims
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return claims, false
+	}
+	var scoped map[string]struct {
+		Key   string `json:"key"`
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &scoped); err != nil {
+		return claims, false
+	}
+	keys := make([]string, 0, len(scoped))
+	for k := range scoped {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := scoped[k]
+		token := firstNonEmpty(v.Key, v.Token)
+		if token == "" {
+			continue
+		}
+		if parseJWTClaims(token, &claims) {
+			return claims, true
+		}
+	}
+	return claims, false
 }
