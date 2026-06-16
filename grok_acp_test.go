@@ -2191,6 +2191,35 @@ func TestSanitizeGrokACPExtraArgs_StripsPermissionModeConfigOverrides(t *testing
 			[]string{"--config", "ui.permission_mode=ask", "--model", "grok-2"},
 			[]string{"--config", "ui.permission_mode=ask", "--model", "grok-2"},
 		},
+		// Grok's `-c|--config` form preserves TOML string quotes verbatim
+		// (`permission_mode="bypassPermissions"`). Without quote-stripping
+		// the value comparison falls through and the always-approve gate
+		// fails open.
+		{
+			"strips_quoted_double_bypass_permission_mode",
+			[]string{"--config", `permission_mode="bypassPermissions"`, "--model", "grok-2"},
+			[]string{"--model", "grok-2"},
+		},
+		{
+			"strips_quoted_single_bypass_approval_permission_mode",
+			[]string{"-c", `approval.permission_mode='bypass'`},
+			[]string{},
+		},
+		{
+			"strips_quoted_double_always_approve_ui_permission_mode",
+			[]string{"--config=ui.permission_mode=\"always-approve\""},
+			[]string{},
+		},
+		{
+			"strips_quoted_double_permission_mode_equals_form",
+			[]string{`--permission-mode="bypassPermissions"`},
+			[]string{},
+		},
+		{
+			"keeps_quoted_ask",
+			[]string{"--config", `approval.permission_mode="ask"`, "--model", "grok-2"},
+			[]string{"--config", `approval.permission_mode="ask"`, "--model", "grok-2"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

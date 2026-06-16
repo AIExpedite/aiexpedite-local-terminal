@@ -2206,6 +2206,13 @@ func isGrokApprovalConfigKV(value string) bool {
 		key = lower[:eq]
 		val = lower[eq+1:]
 	}
+	// TOML accepts string values wrapped in `"…"` or `'…'`, and Grok's `-c`
+	// form preserves the quotes verbatim when xAI's docs spell the value as a
+	// quoted string (e.g. `--config permission_mode="bypassPermissions"`).
+	// Strip a single matched pair of surrounding quotes before the value
+	// comparisons below so a quoted bypass selector cannot survive
+	// sanitization just because the key=val text retained its TOML quoting.
+	val = trimGrokTOMLStringQuotes(val)
 	if (key == "tools.always_approve" || key == "tools.auto_approve") && (val == "true" || val == "1" || val == "yes" || val == "on") {
 		return true
 	}
@@ -2390,6 +2397,23 @@ func isGrokPermissionModeArg(lower string) bool {
 		strings.HasPrefix(lower, "--permission-mode=") || strings.HasPrefix(lower, "--permission_mode=")
 }
 
+// trimGrokTOMLStringQuotes strips a single matched pair of surrounding
+// TOML string quotes (`"…"` or `'…'`) from `s`. Used so a quoted bypass
+// selector like `permission_mode="bypassPermissions"` — which Grok's
+// `-c|--config` form preserves verbatim — is normalised to the bare
+// `bypassPermissions` token the sanitization gates compare against.
+// Mismatched / unbalanced quotes are returned unchanged so a value with a
+// stray quote does not silently lose a character.
+func trimGrokTOMLStringQuotes(s string) string {
+	if len(s) >= 2 {
+		first, last := s[0], s[len(s)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
 // isGrokPermissionModeBypassValue reports whether a `--permission-mode` value
 // would let the caller bypass per-tool permission prompts. `bypassPermissions`
 // is the canonical name from xAI's enterprise docs; the bare `bypass`,
@@ -2400,7 +2424,7 @@ func isGrokPermissionModeArg(lower string) bool {
 // surface that must stay behind Config.EnableGrokAlwaysApprove. Case- and
 // separator-insensitive.
 func isGrokPermissionModeBypassValue(value string) bool {
-	v := strings.ToLower(strings.TrimSpace(value))
+	v := strings.ToLower(trimGrokTOMLStringQuotes(strings.TrimSpace(value)))
 	switch v {
 	case "bypasspermissions", "bypass-permissions", "bypass_permissions", "bypass",
 		"auto", "auto-approve", "auto_approve",
