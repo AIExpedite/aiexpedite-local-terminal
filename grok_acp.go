@@ -1453,6 +1453,24 @@ func parsePersistedGrokModelScopesWithAPIKey(path string) []string {
 			if key == "default" {
 				addScope(trimTOMLString(val))
 			}
+		case "":
+			// Top-level dotted keys: a user who ran `grok config set
+			// models.default custom` (or hand-edited the file without
+			// section headers) lands with `currentSection == ""` and a
+			// dotted `key`. Honor the same two shapes the [models] /
+			// [model.<scope>] branches do so the scope discovery does not
+			// silently miss a persisted per-model API key.
+			if key == "models.default" {
+				addScope(trimTOMLString(val))
+				break
+			}
+			if strings.HasPrefix(key, "model.") {
+				rest := key[len("model."):]
+				dot := strings.LastIndexByte(rest, '.')
+				if dot > 0 && (rest[dot+1:] == "api_key" || rest[dot+1:] == "env_key") {
+					addScope(rest[:dot])
+				}
+			}
 		default:
 			if currentScope != "" && (key == "api_key" || key == "env_key") {
 				addScope(currentScope)

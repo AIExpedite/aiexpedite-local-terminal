@@ -2984,6 +2984,45 @@ api_key = "should-be-skipped-already-in-static-slice"
 	}
 }
 
+// TestParsePersistedGrokModelScopesWithAPIKey_DiscoversDottedTopLevelKeys
+// pins the codex follow-up on PR #42: a user who ran
+// `grok config set models.default team` (or hand-edited config.toml without
+// section headers) ends up with top-level dotted keys — `models.default` and
+// `model.team.api_key` — and no `[models]` / `[model.team]` headers. The
+// section-only branch missed both, so the per-scope clears were never
+// emitted and Grok would still resolve the persisted API key.
+func TestParsePersistedGrokModelScopesWithAPIKey_DiscoversDottedTopLevelKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `# headerless dotted form
+models.default = "team"
+model.team.api_key = "xai-secret"
+model.alt.env_key = "XAI_ALT_KEY"
+model.no_creds.temperature = 0.2
+model.grok-build.api_key = "should-be-skipped-already-in-static-slice"
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	got := parsePersistedGrokModelScopesWithAPIKey(path)
+	seen := map[string]bool{}
+	for _, s := range got {
+		seen[s] = true
+	}
+	if !seen["team"] {
+		t.Errorf("expected `team` (models.default dotted form) in scopes, got %#v", got)
+	}
+	if !seen["alt"] {
+		t.Errorf("expected `alt` (model.alt.env_key dotted form) in scopes, got %#v", got)
+	}
+	if seen["no_creds"] {
+		t.Errorf("`no_creds` has no api_key/env_key — should not appear: %#v", got)
+	}
+	if seen["grok-build"] {
+		t.Errorf("`grok-build` is already neutralized by the static slice — should be skipped: %#v", got)
+	}
+}
+
 // TestParsePersistedGrokModelScopesWithAPIKey_MissingFileReturnsNil keeps the
 // best-effort contract: a host without a persisted config gets no scopes and
 // no error path that would block the launch.
