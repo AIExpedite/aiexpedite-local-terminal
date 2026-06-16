@@ -956,10 +956,75 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 // by default — autonomous tool execution has to be a per-workspace opt-in
 // (Config.EnableGrokAlwaysApprove), not something a signed `grok_acp_start`
 // can flip via extra args.
+//
+// When allowAlwaysApprove is false AND the sanitized extras don't already
+// pin a `--permission-mode`, we additionally inject `--permission-mode ask`
+// onto the argv. The argv flag has higher precedence than `~/.grok/
+// config.toml` (or `$GROK_HOME/config.toml`), so a host where the user has
+// `[ui] permission_mode = "always-approve"` persisted cannot silently flip
+// the spawned ACP child into auto-approval mode. Without this, the strip
+// posture above would only cover the argv surface and leave the persistent
+// config bypass open. We deliberately only inject when no caller-supplied
+// `--permission-mode` survived sanitisation: by that point any bypass-valued
+// caller arg has already been dropped, so a survivor is a conservative
+// selector (`ask`, `plan`, etc.) the orchestrator explicitly chose — we
+// don't second-guess it.
 func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) []string {
 	args := []string{"agent", "stdio", "--no-auto-update"}
-	args = append(args, sanitizeGrokACPExtraArgs(extraArgs, allowAPIKey, allowAlwaysApprove)...)
+	sanitized := sanitizeGrokACPExtraArgs(extraArgs, allowAPIKey, allowAlwaysApprove)
+	args = append(args, sanitized...)
+	if !allowAlwaysApprove && !grokExtraArgsPinPermissionMode(sanitized) {
+		args = append(args, "--permission-mode", "ask")
+	}
 	return args
+}
+
+// grokExtraArgsPinPermissionMode reports whether any sanitized caller-
+// supplied arg already pins the Grok permission mode (via `--permission-mode`
+// or the `-c|--config approval.permission_mode=...` / `permission_mode=...`
+// config-knob form). Used by buildGrokACPArgs to decide whether to inject
+// the `--permission-mode ask` argv override that defeats `~/.grok/config.toml`
+// based bypasses — when the caller already pinned a mode, we don't stack a
+// second one on top. Both the explicit-flag and `-c|--config` knob surfaces
+// must be considered because the bypass-mode strip in sanitizeGrokACPExtraArgs
+// only removes bypass VALUES; any non-bypass selector survives, and we treat
+// a surviving selector as an explicit caller choice.
+func grokExtraArgsPinPermissionMode(args []string) bool {
+	for i, a := range args {
+		lower := strings.ToLower(a)
+		if isGrokPermissionModeArg(lower) {
+			return true
+		}
+		if isGrokConfigOverrideArg(lower) {
+			if eq := strings.IndexByte(lower, '='); eq >= 0 {
+				if grokConfigKVTargetsPermissionMode(lower[eq+1:]) {
+					return true
+				}
+				continue
+			}
+			if i+1 < len(args) && grokConfigKVTargetsPermissionMode(strings.ToLower(args[i+1])) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// grokConfigKVTargetsPermissionMode reports whether a `-c|--config` value
+// targets the `permission_mode` key (top-level or namespaced under
+// `approval.`). Companion to grokExtraArgsPinPermissionMode — we only care
+// that the key is being set, not what value it is set to (bypass values were
+// already stripped upstream). Caller normalises to lower-case.
+func grokConfigKVTargetsPermissionMode(kv string) bool {
+	if kv == "" {
+		return false
+	}
+	key := kv
+	if eq := strings.IndexByte(kv, '='); eq >= 0 {
+		key = kv[:eq]
+	}
+	key = strings.TrimSpace(key)
+	return key == "approval.permission_mode" || key == "permission_mode"
 }
 
 func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) []string {

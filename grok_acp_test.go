@@ -35,7 +35,10 @@ func TestBuildGrokACPArgs_DefaultsToAgentStdio(t *testing.T) {
 	got := buildGrokACPArgs(nil, false, false)
 	// `--no-auto-update` is injected unconditionally so a background update
 	// worker can't race ACP startup and pollute stdout with non-JSON.
-	want := []string{"agent", "stdio", "--no-auto-update"}
+	// `--permission-mode ask` is appended whenever allowAlwaysApprove=false to
+	// override any persistent `~/.grok/config.toml` always-approve setting via
+	// the higher-precedence argv surface.
+	want := []string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(nil) = %#v, want %#v", got, want)
 	}
@@ -43,7 +46,7 @@ func TestBuildGrokACPArgs_DefaultsToAgentStdio(t *testing.T) {
 
 func TestBuildGrokACPArgs_ForwardsExtraArgs(t *testing.T) {
 	got := buildGrokACPArgs([]string{"--model", "grok-2-fast", "--config", "auth.method=cached_token"}, false, false)
-	want := []string{"agent", "stdio", "--no-auto-update", "--model", "grok-2-fast", "--config", "auth.method=cached_token"}
+	want := []string{"agent", "stdio", "--no-auto-update", "--model", "grok-2-fast", "--config", "auth.method=cached_token", "--permission-mode", "ask"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs = %#v, want %#v", got, want)
 	}
@@ -72,8 +75,31 @@ func TestBuildGrokACPArgs_StripsDuplicateEntryTokens(t *testing.T) {
 					t.Fatalf("duplicate entry token leaked into final argv: %#v", got)
 				}
 			}
+			// allowAlwaysApprove=false must also pin the conservative
+			// `--permission-mode ask` so a host-level
+			// `~/.grok/config.toml` cannot bypass the workspace gate.
+			if !containsPermissionModeAsk(got) {
+				t.Fatalf("expected `--permission-mode ask` suffix for allowAlwaysApprove=false; got %#v", got)
+			}
 		})
 	}
+}
+
+// containsPermissionModeAsk reports whether args contains a
+// `--permission-mode ask` pin (either separate-value or equals form). Used
+// by tests that don't pin exact argv positions but still need to assert the
+// config-bypass gate is in effect.
+func containsPermissionModeAsk(args []string) bool {
+	for i, a := range args {
+		lower := strings.ToLower(a)
+		if (lower == "--permission-mode" || lower == "--permission_mode") && i+1 < len(args) && strings.EqualFold(args[i+1], "ask") {
+			return true
+		}
+		if lower == "--permission-mode=ask" || lower == "--permission_mode=ask" {
+			return true
+		}
+	}
+	return false
 }
 
 // TestBuildGrokACPArgs_NoAutoUpdateDedupedAndAutoUpdateStripped pins the
@@ -90,17 +116,17 @@ func TestBuildGrokACPArgs_NoAutoUpdateDedupedAndAutoUpdateStripped(t *testing.T)
 		{
 			"caller_supplied_no_auto_update_is_deduped",
 			[]string{"--no-auto-update", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"caller_supplied_auto_update_is_stripped",
 			[]string{"--auto-update", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"both_forms_collapsed_to_single_no_auto_update",
 			[]string{"--auto-update", "--no-auto-update", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 	}
 	for _, c := range cases {
@@ -127,17 +153,17 @@ func TestBuildGrokACPArgs_StripsCwdOverride(t *testing.T) {
 		{
 			"separate_value_cwd_dropped_with_value",
 			[]string{"--cwd", "/tmp/other", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"equals_form_cwd_dropped",
 			[]string{"--cwd=/tmp/other", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"case_insensitive_cwd_dropped",
 			[]string{"--CWD", "/tmp/other"},
-			[]string{"agent", "stdio", "--no-auto-update"},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask"},
 		},
 	}
 	for _, c := range cases {
@@ -162,12 +188,12 @@ func TestBuildGrokACPArgs_PreservesValueOfValuedFlag(t *testing.T) {
 		{
 			"config_value_is_agent",
 			[]string{"-c", "agent", "-c", "model=grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "-c", "agent", "-c", "model=grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "-c", "agent", "-c", "model=grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"config_value_is_stdio",
 			[]string{"--config", "stdio", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "stdio", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "stdio", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 	}
 	for _, c := range cases {
@@ -195,27 +221,27 @@ func TestBuildGrokACPArgs_StripsAuthOverridesByDefault(t *testing.T) {
 		{
 			"strips_api_key_separate_value",
 			[]string{"--api-key", "xai-abc", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_api_key_equals_form",
 			[]string{"--api-key=xai-abc", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_auth_method",
 			[]string{"--auth", "xai.api_key", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_auth_equals_form",
 			[]string{"--auth=xai.api_key", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_api_key_env",
 			[]string{"--api-key-env", "OTHER_KEY", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 	}
 	for _, c := range cases {
@@ -234,7 +260,7 @@ func TestBuildGrokACPArgs_StripsAuthOverridesByDefault(t *testing.T) {
 // must flow through verbatim.
 func TestBuildGrokACPArgs_PreservesAuthOverridesWhenFallbackEnabled(t *testing.T) {
 	got := buildGrokACPArgs([]string{"--api-key", "xai-abc", "--model", "grok-2"}, true, false)
-	want := []string{"agent", "stdio", "--no-auto-update", "--api-key", "xai-abc", "--model", "grok-2"}
+	want := []string{"agent", "stdio", "--no-auto-update", "--api-key", "xai-abc", "--model", "grok-2", "--permission-mode", "ask"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(allowAPIKey=true) must preserve --api-key; got %#v, want %#v", got, want)
 	}
@@ -1323,32 +1349,32 @@ func TestBuildGrokACPArgs_StripsAlwaysApproveByDefault(t *testing.T) {
 		{
 			"strips_always_approve_bare",
 			[]string{"--always-approve", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_always_approve_equals_true",
 			[]string{"--always-approve=true", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_always_approve_equals_false_still_drops",
 			[]string{"--always-approve=false", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_auto_approve_bare",
 			[]string{"--auto-approve", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_auto_approve_equals_form",
 			[]string{"--auto-approve=true", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_when_interleaved_with_kept_args",
 			[]string{"--model", "grok-2", "--always-approve", "--config", "log.level=debug"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "log.level=debug"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "log.level=debug", "--permission-mode", "ask"},
 		},
 	}
 	for _, c := range cases {
@@ -1461,37 +1487,37 @@ func TestBuildGrokACPArgs_StripsPermissionModeBypassByDefault(t *testing.T) {
 		{
 			"strips_permission_mode_bypass_separate",
 			[]string{"--permission-mode", "bypassPermissions", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_permission_mode_bypass_equals",
 			[]string{"--permission-mode=bypassPermissions", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_underscore_alias",
 			[]string{"--permission_mode", "bypassPermissions"},
-			[]string{"agent", "stdio", "--no-auto-update"},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask"},
 		},
 		{
 			"strips_bare_bypass_synonym",
 			[]string{"--permission-mode", "bypass"},
-			[]string{"agent", "stdio", "--no-auto-update"},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask"},
 		},
 		{
 			"strips_auto_synonym_equals",
 			[]string{"--permission-mode=auto"},
-			[]string{"agent", "stdio", "--no-auto-update"},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask"},
 		},
 		{
 			"strips_accept_edits_separate",
 			[]string{"--permission-mode", "acceptEdits", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
 		},
 		{
 			"strips_accept_edits_equals_separator_variant",
 			[]string{"--permission-mode=accept-edits"},
-			[]string{"agent", "stdio", "--no-auto-update"},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask"},
 		},
 		{
 			"keeps_permission_mode_ask_separate",
@@ -1518,12 +1544,125 @@ func TestBuildGrokACPArgs_StripsPermissionModeBypassByDefault(t *testing.T) {
 // inverse: once the workspace has explicitly opted into autonomous
 // execution via Config.EnableGrokAlwaysApprove=true, `--permission-mode
 // bypassPermissions` flows through verbatim alongside `--always-approve`.
+// The conservative `--permission-mode ask` injection is also skipped because
+// the workspace has explicitly opted in.
 func TestBuildGrokACPArgs_PreservesPermissionModeBypassWhenEnabled(t *testing.T) {
 	in := []string{"--permission-mode", "bypassPermissions", "--model", "grok-2"}
 	got := buildGrokACPArgs(in, false, true)
 	want := []string{"agent", "stdio", "--no-auto-update", "--permission-mode", "bypassPermissions", "--model", "grok-2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(allowAlwaysApprove=true) must preserve --permission-mode bypassPermissions; got %#v, want %#v", got, want)
+	}
+	if containsPermissionModeAsk(got) {
+		t.Fatalf("buildGrokACPArgs(allowAlwaysApprove=true) must NOT inject `--permission-mode ask`; got %#v", got)
+	}
+}
+
+// TestBuildGrokACPArgs_PinsPermissionModeAskAgainstHostConfig is the gate that
+// closes the `~/.grok/config.toml` bypass: even when the host has persisted
+// `[ui] permission_mode = "always-approve"` (or equivalent legacy keys), an
+// argv-level `--permission-mode ask` pin overrides it via standard CLI-beats-
+// config precedence. Without this, the strip posture in sanitizeGrokACPExtraArgs
+// only covers the argv surface and a logged-in user with the always-approve
+// config persisted would silently bypass the per-workspace
+// EnableGrokAlwaysApprove gate.
+//
+// The pin must:
+//   - fire on the default path (allowAlwaysApprove=false, no caller
+//     permission-mode override),
+//   - be skipped when the workspace opts in (allowAlwaysApprove=true) — that
+//     case is covered by TestBuildGrokACPArgs_PreservesPermissionModeBypassWhenEnabled
+//     and TestBuildGrokACPArgs_PreservesAlwaysApproveWhenEnabled below,
+//   - be skipped when the caller already pinned a non-bypass permission-mode
+//     via `--permission-mode`, `--permission_mode`, or
+//     `-c|--config approval.permission_mode=…` / `permission_mode=…`, so we
+//     don't stack a second pin that could fight with the caller's explicit
+//     choice via Grok's last-flag-wins precedence.
+func TestBuildGrokACPArgs_PinsPermissionModeAskAgainstHostConfig(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      []string
+		wantAsk   bool // expect `--permission-mode ask` appended
+		wantFinal []string
+	}{
+		{
+			"injects_when_no_caller_pin",
+			nil,
+			true,
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask"},
+		},
+		{
+			"injects_when_only_unrelated_extras",
+			[]string{"--model", "grok-2"},
+			true,
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
+		},
+		{
+			"skips_when_caller_pins_ask_separate",
+			[]string{"--permission-mode", "ask", "--model", "grok-2"},
+			false,
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask", "--model", "grok-2"},
+		},
+		{
+			"skips_when_caller_pins_ask_equals",
+			[]string{"--permission-mode=ask"},
+			false,
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode=ask"},
+		},
+		{
+			"skips_when_caller_pins_underscore_alias",
+			[]string{"--permission_mode", "ask"},
+			false,
+			[]string{"agent", "stdio", "--no-auto-update", "--permission_mode", "ask"},
+		},
+		{
+			"skips_when_caller_pins_via_config_separate",
+			[]string{"--config", "approval.permission_mode=ask", "--model", "grok-2"},
+			false,
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "approval.permission_mode=ask", "--model", "grok-2"},
+		},
+		{
+			"skips_when_caller_pins_via_short_config",
+			[]string{"-c", "permission_mode=ask"},
+			false,
+			[]string{"agent", "stdio", "--no-auto-update", "-c", "permission_mode=ask"},
+		},
+		{
+			"skips_when_caller_pins_via_inline_config_equals",
+			[]string{"--config=approval.permission_mode=ask"},
+			false,
+			[]string{"agent", "stdio", "--no-auto-update", "--config=approval.permission_mode=ask"},
+		},
+		{
+			"injects_when_caller_bypass_value_is_stripped",
+			// The bypass-value strip wins, so sanitizer drops the pair —
+			// callers cannot use a bypass value to suppress our injection.
+			[]string{"--permission-mode", "bypassPermissions", "--model", "grok-2"},
+			true,
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--permission-mode", "ask"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildGrokACPArgs(c.args, false, false)
+			if !reflect.DeepEqual(got, c.wantFinal) {
+				t.Fatalf("buildGrokACPArgs argv mismatch: got %#v, want %#v", got, c.wantFinal)
+			}
+			hasInjection := len(got) >= 2 &&
+				got[len(got)-2] == "--permission-mode" && got[len(got)-1] == "ask"
+			if hasInjection != c.wantAsk {
+				t.Fatalf("injection presence mismatch: got hasInjection=%v want %v (argv=%#v)", hasInjection, c.wantAsk, got)
+			}
+			// No matter the path, the final argv must NOT carry a bypass-valued
+			// `--permission-mode` — that's what closes the host-config bypass.
+			for i, a := range got {
+				if (strings.EqualFold(a, "--permission-mode") || strings.EqualFold(a, "--permission_mode")) && i+1 < len(got) {
+					if isGrokPermissionModeBypassValue(got[i+1]) {
+						t.Fatalf("final argv contains bypass permission-mode value: %#v", got)
+					}
+				}
+			}
+		})
 	}
 }
 
