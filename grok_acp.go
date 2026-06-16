@@ -949,11 +949,16 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 // When allowAlwaysApprove is false the sanitiser additionally drops any
 // caller-supplied `--always-approve` / `--auto-approve` flags, the
 // `--permission-mode bypassPermissions` selector (xAI's enterprise-docs
-// equivalent for skipping per-tool prompts), AND the equivalent
-// `-c approval.mode=always|auto` / `-c tools.always_approve=true` /
-// `-c tools.auto_approve=true` / `-c approval.permission_mode=bypassPermissions`
-// config overrides. The feature brief makes approval behaviour conservative
-// by default — autonomous tool execution has to be a per-workspace opt-in
+// equivalent for skipping per-tool prompts), the `--allow <pattern>`
+// permission-policy rules (xAI enterprise docs describe policy rules as
+// evaluated BEFORE the per-tool prompt, so even with `--permission-mode
+// default` pinned a single `--allow "Bash(*)"` would auto-approve matching
+// tool calls), AND the equivalent `-c approval.mode=always|auto` /
+// `-c tools.always_approve=true` / `-c tools.auto_approve=true` /
+// `-c approval.permission_mode=bypassPermissions` /
+// `-c permission_rules=…` / `-c policy.allow=…` config overrides. The
+// feature brief makes approval behaviour conservative by default —
+// autonomous tool execution has to be a per-workspace opt-in
 // (Config.EnableGrokAlwaysApprove), not something a signed `grok_acp_start`
 // can flip via extra args.
 //
@@ -985,8 +990,14 @@ func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) 
 		// stripping `XAI_API_KEY` from env and `--api-key` from argv is not
 		// enough — a host where the user once ran `grok config set model.api_key`
 		// would still silently bill the API-key account on every ACP launch.
-		// The `-c key=` form (empty value) is the documented xAI override that
-		// clears a config-file value for the duration of one process. We also
+		// The `--config key=` form (empty value) is the xAI override that
+		// clears a config-file value for the duration of one process. We use
+		// the long-form spelling deliberately: xAI's headless/scripting docs
+		// list `-c` as the short alias for `--continue` (resume-session), and
+		// only the enterprise-deployment docs spell out `-c|--config` as the
+		// config-override surface. Pinning `--config` avoids any chance of
+		// the neutralizer being mis-parsed as `--continue <session-id>` on a
+		// host where the alias mapping went the other way. We also
 		// neutralize the `xai.*` aliases the design doc enumerates so the
 		// orchestrator's `cached_token` selection is the only auth surface left.
 		args = append(args, grokAuthNeutralizingConfigArgs()...)
@@ -997,19 +1008,26 @@ func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) 
 	return args
 }
 
-// grokAuthNeutralizingConfigArgs returns the `-c <key>=` overrides that empty
-// out any API-key credential persisted in `~/.grok/config.toml` /
+// grokAuthNeutralizingConfigArgs returns the `--config <key>=` overrides that
+// empty out any API-key credential persisted in `~/.grok/config.toml` /
 // `$GROK_HOME/config.toml`. Used by buildGrokACPArgs when
 // Config.EnableGrokAPIKeyFallback is false to ensure the orchestrator's
 // `cached_token` auth selection cannot be silently shadowed by a config-file
 // API-key. Keys mirror isGrokAuthConfigKV's gated set so the strip-from-argv
 // and override-config-file surfaces stay in lockstep.
+//
+// We deliberately spell the flag as `--config` rather than the `-c` short
+// alias: xAI's headless/scripting docs use `-c` for `--continue`
+// (resume-session) while only the enterprise-deployment docs document the
+// `-c|--config` config-override surface. Using the long form removes the
+// ambiguity so the neutralizer cannot be mis-parsed as a `--continue
+// <session-id>` flag if a future Grok release narrows the short alias.
 func grokAuthNeutralizingConfigArgs() []string {
 	return []string{
-		"-c", "model.api_key=",
-		"-c", "model.env_key=",
-		"-c", "xai.api_key=",
-		"-c", "xai.env_key=",
+		"--config", "model.api_key=",
+		"--config", "model.env_key=",
+		"--config", "xai.api_key=",
+		"--config", "xai.env_key=",
 	}
 }
 
@@ -1071,6 +1089,11 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprov
 		"-c": true, "--config": true,
 		"--model":           true,
 		"--permission-mode": true, "--permission_mode": true,
+		// `--allow` is a permission-policy rule selector (e.g.
+		// `--allow "Bash(*)"`). It always takes a value; admit the pair
+		// speculatively here so the trailing stripGrokAllowRulePairs sweep
+		// can drop both tokens when always-approve is opt-in.
+		"--allow": true,
 	}
 	cleaned := make([]string, 0, len(extraArgs))
 	keepNext := false
@@ -1146,6 +1169,20 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprov
 				}
 			}
 		}
+		if !allowAlwaysApprove && isGrokAllowRuleArg(lower) {
+			// `--allow <pattern>` adds a permission-policy rule (xAI
+			// enterprise docs). Rules are evaluated BEFORE the per-tool
+			// prompt, so a single `--allow "Bash(*)"` would auto-approve
+			// matching tool calls even with `--permission-mode default`
+			// pinned. Unlike `--permission-mode`, EVERY value to `--allow`
+			// is autonomous-execution-shaped, so we don't second-guess the
+			// value here — drop inline equals-form wholesale and let the
+			// trailing stripGrokAllowRulePairs sweep finish off the
+			// separate-value pair admitted via the valuedFlags branch.
+			if strings.HasPrefix(lower, "--allow=") {
+				continue
+			}
+		}
 		// Inline -c/--config form: `--config=auth.method=xai.api_key` or
 		// `--config=approval.mode=always`. Without inspection these would
 		// survive the explicit-flag strip and let the orchestrator escape the
@@ -1192,6 +1229,7 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprov
 	if !allowAlwaysApprove {
 		cleaned = stripGrokApprovalConfigPairs(cleaned)
 		cleaned = stripGrokPermissionModePairs(cleaned)
+		cleaned = stripGrokAllowRulePairs(cleaned)
 	}
 	return cleaned
 }
@@ -1267,6 +1305,40 @@ func stripGrokAuthConfigPairs(in []string) []string {
 	return out
 }
 
+// isGrokAllowRuleArg reports whether `lower` is the `--allow` policy-rule
+// flag (bare or equals form). xAI's enterprise docs describe `--allow` as a
+// permission-policy rule (e.g. `--allow "Bash(*)"`) whose rules are evaluated
+// BEFORE the per-tool prompt — so a single `--allow` survival is enough to
+// auto-approve matching tool calls even when `--permission-mode default` is
+// still pinned. Match is case-insensitive; callers normalise via
+// strings.ToLower first. `--deny` is intentionally NOT recognised here —
+// deny rules tighten the policy and are safe to admit on the conservative
+// default path.
+func isGrokAllowRuleArg(lower string) bool {
+	return lower == "--allow" || strings.HasPrefix(lower, "--allow=")
+}
+
+// stripGrokAllowRulePairs removes `--allow <pattern>` pairs (separate-value
+// form) that survived sanitizeGrokACPExtraArgs' main loop. The loop admits
+// the pair speculatively via the valuedFlags branch because the strip
+// decision needs both tokens; this sweep drops the pair when
+// Config.EnableGrokAlwaysApprove is false. Mirrors stripGrokPermissionModePairs
+// — same speculative-admit / trailing-sweep pattern.
+func stripGrokAllowRulePairs(in []string) []string {
+	out := make([]string, 0, len(in))
+	i := 0
+	for i < len(in) {
+		lower := strings.ToLower(in[i])
+		if lower == "--allow" && i+1 < len(in) {
+			i += 2
+			continue
+		}
+		out = append(out, in[i])
+		i++
+	}
+	return out
+}
+
 // isGrokAlwaysApproveArg reports whether a caller-supplied arg would let
 // Grok skip per-tool permission prompts. xAI documents `--always-approve`
 // as the canonical autonomous-execution flag; `--auto-approve` is the
@@ -1325,6 +1397,21 @@ func isGrokApprovalConfigKV(value string) bool {
 	// deliberately left intact.
 	if (key == "approval.permission_mode" || key == "permission_mode") && isGrokPermissionModeBypassValue(val) {
 		return true
+	}
+	// Config-form of `--allow <rule>` — xAI's enterprise docs describe the
+	// permission_rules TOML array (and its dotted `permission.rules` /
+	// `policy.allow` / `permissions.allow` / `tools.allow` cousins) as
+	// holding the same rule list `--allow` appends to. Any non-empty value
+	// here would survive into the policy table and pre-empt the per-tool
+	// prompt the same way the argv flag does, so the gate has to mirror.
+	// We intentionally do NOT enumerate deny-list keys — those tighten the
+	// policy and are safe on the conservative default path.
+	switch key {
+	case "permission_rules", "permission.rules",
+		"policy.allow", "permissions.allow", "tools.allow":
+		if val != "" {
+			return true
+		}
 	}
 	return false
 }
