@@ -139,15 +139,19 @@ func loadPrevStatusLineCommand() string {
 	return sl.Command
 }
 
-func savePrevStatusLine(raw json.RawMessage) {
+// savePrevStatusLine persists the user's original statusLine object. Returns an
+// error on failure so the install can abort before overwriting Claude's
+// settings — otherwise an unwritable AIExpedite config dir would leave the user
+// with our hook installed but no stash to chain to or restore from on opt-out.
+func savePrevStatusLine(raw json.RawMessage) error {
 	b, err := json.MarshalIndent(prevStatusLine{StatusLine: raw}, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(prevStatusLinePath()), 0o755); err != nil {
-		return
+		return err
 	}
-	_ = os.WriteFile(prevStatusLinePath(), b, 0o600)
+	return os.WriteFile(prevStatusLinePath(), b, 0o600)
 }
 
 // ensureClaudeStatusLineHook installs (or refreshes) the status-line hook in
@@ -201,7 +205,12 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 	// AND opt-out can restore its other options. (A command that IS ours but
 	// with a stale binary path just gets its path refreshed; don't re-stash.)
 	if existing.Command != "" && !isOurStatusLineCommand(existing.Command) {
-		savePrevStatusLine(existingRaw)
+		if err := savePrevStatusLine(existingRaw); err != nil {
+			// Abort: if we can't persist the original command, installing the
+			// hook would silently lose the user's third-party status line and
+			// leave opt-out unable to restore it.
+			return false, err
+		}
 	}
 
 	// Preserve the existing statusLine's other documented options (padding,

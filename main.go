@@ -925,6 +925,19 @@ func handleUninstall() {
 		}
 	}
 
+	// Restore Claude Code's status line BEFORE the binary self-deletes:
+	// otherwise Claude keeps invoking a missing exe on every render, and any
+	// stashed third-party command stays hidden.
+	if home, err := os.UserHomeDir(); err == nil {
+		if changed, err := removeClaudeStatusLineHook(home); err != nil {
+			if !quiet {
+				fmt.Println("Warning: Failed to remove Claude status-line hook:", err)
+			}
+		} else if changed && !quiet {
+			fmt.Println("→ Restored Claude Code status line")
+		}
+	}
+
 	// Remove config.json only (keep allowed-commands.txt for re-registration)
 	configFile := ConfigPath()
 	if err := os.Remove(configFile); err != nil && !os.IsNotExist(err) {
