@@ -2292,9 +2292,16 @@ func grokPermissionRulesValueHasAllowAction(value string) bool {
 		return false
 	}
 	lower := strings.ToLower(v)
-	if !strings.Contains(lower, "action") {
-		// No `action` field — legacy `permission_rules = ["pattern"]` form,
-		// which xAI documents as allow shortcuts. Treat as allow.
+	// Detect an `action = ...` KEY outside any quoted-string pattern. The
+	// prior heuristic looked for the substring `action` anywhere, which
+	// misclassifies a legacy bare-pattern array like `["Bash(*action*)"]`
+	// as table form and then — finding no `action="allow"` — returns false
+	// (i.e. treats it as safe). A bare-pattern array MUST be treated as an
+	// allow shortcut. So: walk the raw (case-folded) value, track whether
+	// we are inside `"..."` or `'...'`, and look for the literal `action`
+	// token followed (after optional whitespace) by `=`. If no such key
+	// exists at TOML level, the value is bare-pattern shorthand → allow.
+	if !lowerHasActionKey(lower) {
 		return true
 	}
 	// Table form with explicit action= entries. Flag only when at least one
@@ -2313,6 +2320,62 @@ func grokPermissionRulesValueHasAllowAction(value string) bool {
 		strings.Contains(compact, "action=allow,") ||
 		strings.Contains(compact, "action=allow}") ||
 		strings.HasSuffix(compact, "action=allow")
+}
+
+// lowerHasActionKey reports whether `lower` (already case-folded) contains
+// an `action` TOML key — i.e. the literal token `action` appearing outside
+// any single- or double-quoted string and followed (after optional
+// whitespace/tabs) by `=`. This distinguishes a real table form like
+// `{action = "allow", ...}` from a bare pattern such as
+// `["Bash(*action*)"]` where the word `action` is only part of a quoted
+// pattern. TOML's basic and literal string forms do not support embedded
+// escaped quotes for our purposes (the value comes from `-c key=value` or
+// a single TOML line), so a simple paired-quote toggle is sufficient.
+func lowerHasActionKey(lower string) bool {
+	inDouble := false
+	inSingle := false
+	for i := 0; i < len(lower); i++ {
+		c := lower[i]
+		if inDouble {
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+			continue
+		case '\'':
+			inSingle = true
+			continue
+		}
+		if c != 'a' || i+6 > len(lower) || lower[i:i+6] != "action" {
+			continue
+		}
+		// Token boundary on the left: the byte before `action` must not be a
+		// continuation of an identifier — otherwise we'd match `reaction`.
+		if i > 0 {
+			p := lower[i-1]
+			if (p >= 'a' && p <= 'z') || (p >= '0' && p <= '9') || p == '_' || p == '-' || p == '.' {
+				continue
+			}
+		}
+		j := i + 6
+		for j < len(lower) && (lower[j] == ' ' || lower[j] == '\t') {
+			j++
+		}
+		if j < len(lower) && lower[j] == '=' {
+			return true
+		}
+	}
+	return false
 }
 
 // isGrokPermissionModeArg reports whether `lower` is the `--permission-mode`

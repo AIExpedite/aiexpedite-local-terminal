@@ -3310,6 +3310,15 @@ func TestGrokPermissionRulesValueHasAllowAction(t *testing.T) {
 		{"tabbed_allow", "[{action\t=\t\"allow\",\tpattern\t=\t\"Bash(*)\"}]", true},
 		{"deny_only_with_tabs", "[{action\t=\t\"deny\",\tpattern\t=\t\"Bash(*)\"}]", false},
 		{"case_insensitive_allow", `[{Action = "ALLOW", pattern = "Bash(*)"}]`, true},
+		// Bare-pattern allow shortcut whose pattern text contains the
+		// substring `action`. Must be treated as allow — the old heuristic
+		// saw the word and assumed table form, then returned false because
+		// no `action="allow"` was present.
+		{"legacy_bare_pattern_contains_action_word", `["Bash(*action*)"]`, true},
+		{"legacy_bare_pattern_reaction_substring", `["Bash(reaction)"]`, true},
+		// Deny-only table whose pattern contains the word `action` — must
+		// stay safe (the action= key is `deny`, not `allow`).
+		{"deny_table_pattern_mentions_action", `[{action = "deny", pattern = "Bash(*action*)"}]`, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
