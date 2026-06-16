@@ -69,6 +69,13 @@ type Config struct {
 	// restarts. When true, StartAgent bypasses the Pub/Sub loop so the agent
 	// stays local-only until the user reconnects from the tray menu.
 	OfflineMode bool `json:"offline_mode,omitempty"`
+
+	/* ─── Claude Code status-line hook ───────────────── */
+	// DisableClaudeStatusLineHook opts out of wiring Claude Code's `statusLine`
+	// setting to our hook (the side channel that keeps the CLI Agents tab's
+	// rate-limit metrics fresh from interactive usage). Off by default — the
+	// hook installs on startup, preserving any existing status line by chaining.
+	DisableClaudeStatusLineHook bool `json:"disable_claude_status_line_hook,omitempty"`
 }
 
 /* -------------------------------------------------------------------------- */

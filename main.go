@@ -22,6 +22,15 @@ import (
 var shutdownConfig *Config
 
 func main() {
+	// Claude Code status-line hook: invoked as `<binary> statusline-hook` with the
+	// session JSON (incl. rate_limits) on stdin. Must be the FIRST thing main()
+	// does — it runs on every Claude render, so it has to be fast and must never
+	// touch the tray / console / Pub/Sub.
+	if len(os.Args) > 1 && os.Args[1] == statusLineHookArg {
+		runStatusLineHook()
+		return
+	}
+
 	// Print version and exit. Used by CI smoke tests (and humans) to verify
 	// the binary loads and the build embedded the expected version string.
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
