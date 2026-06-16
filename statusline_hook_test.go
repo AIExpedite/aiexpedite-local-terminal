@@ -404,9 +404,9 @@ func TestIsOurStatusLineCommand_OnlyMatchesInstalledShape(t *testing.T) {
 		`~/.claude/statusline-hook.sh`,
 		`bash ~/.claude/statusline-hook.sh`,
 		`my-custom-line.sh`,
-		`statusline-hook`,                            // bare arg, no quoted path
-		`"/x/aiexpedite" statusline-hook --extra`,    // trailing extras aren't ours
-		`"/x/statusline-hook.sh"`,                    // hook arg only as substring
+		`statusline-hook`,                         // bare arg, no quoted path
+		`"/x/aiexpedite" statusline-hook --extra`, // trailing extras aren't ours
+		`"/x/statusline-hook.sh"`,                 // hook arg only as substring
 		``,
 	}
 	for _, c := range notOurs {

@@ -7,8 +7,12 @@ import (
 	"time"
 )
 
-// posixSingleQuote emits the close/escape/reopen form `'\''` to embed a literal
-// apostrophe inside a single-quoted POSIX value. The env-preamble regex used
+// posixSingleQuote emits the close/escape/reopen form to embed a literal
+// apostrophe inside a single-quoted POSIX value:
+//
+//	'\''
+//
+// The env-preamble regex used
 // by isOurStatusLineCommand has to accept that sequence — otherwise a config
 // dir containing an apostrophe (e.g. `/Users/bob's/...`) breaks recognition of
 // our OWN installed command, and:

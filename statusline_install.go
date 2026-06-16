@@ -165,7 +165,10 @@ func statusLinePowerShellCommand(exe, cachePath, prevPath string) string {
 }
 
 // posixSingleQuote wraps s in single quotes for sh/bash. A single quote inside
-// the value is escaped via the standard close/escape/reopen trick (`'\''`),
+// the value is escaped via the standard close/escape/reopen trick:
+//
+//	'\''
+//
 // so paths under e.g. `/Users/dan's mac/...` survive.
 func posixSingleQuote(s string) string {
 	return `'` + strings.ReplaceAll(s, `'`, `'\''`) + `'`
@@ -188,7 +191,11 @@ func powerShellDoubleQuote(s string) string {
 // matching the inner exe+hook shape.
 //
 // The POSIX body must also accept `posixSingleQuote`'s embedded-apostrophe
-// escape (`'\''` — close, escape, reopen). Without it, a config dir like
+// escape — the close/escape/reopen sequence:
+//
+//	'\''
+//
+// Without it, a config dir like
 // `/Users/bob's/.aiexpedite/...` stops the regex at the first apostrophe and
 // our own installed command is no longer recognized — opt-out/uninstall then
 // leaves Claude pointing at the binary, and a later refresh stashes our own
