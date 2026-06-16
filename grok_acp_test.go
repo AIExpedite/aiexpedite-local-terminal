@@ -497,7 +497,11 @@ func TestGrokACPLifecycle_StartSendEnd(t *testing.T) {
 	if err := m.Send(id, authFrame); err != nil {
 		t.Fatalf("Send authenticate: %v", err)
 	}
-	sessFrame := `{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":"` + jsonEscapePath(tmpDir) + `","mcpServers":[]}}`
+	cwdJSON, err := json.Marshal(tmpDir)
+	if err != nil {
+		t.Fatalf("marshal cwd: %v", err)
+	}
+	sessFrame := fmt.Sprintf(`{"jsonrpc":"2.0","id":3,"method":"session/new","params":{"cwd":%s,"mcpServers":[]}}`, cwdJSON)
 	if err := m.Send(id, sessFrame); err != nil {
 		t.Fatalf("Send session/new: %v", err)
 	}
@@ -795,12 +799,4 @@ func TestGrokACPLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	if m.ActiveCount() != 0 {
 		t.Errorf("manager should have 0 sessions after failed start; got %d", m.ActiveCount())
 	}
-}
-
-// jsonEscapePath is a tiny helper for embedding an absolute path inside a
-// JSON string literal without dragging in the full encoder. Only escapes the
-// backslash + double-quote chars that appear on the platforms we test on.
-func jsonEscapePath(p string) string {
-	r := strings.ReplaceAll(p, `\`, `\\`)
-	return strings.ReplaceAll(r, `"`, `\"`)
 }

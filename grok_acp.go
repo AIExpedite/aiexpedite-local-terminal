@@ -813,19 +813,22 @@ func sanitizeGrokACPExtraArgs(extraArgs []string) []string {
 	return cleaned
 }
 
-// sanitizeGrokACPEnv strips environment variables that would confuse grok
-// inside a nested session and preserves the user's local Grok auth state:
+// sanitizeGrokACPEnv applies a *strip list only* — anything that doesn't
+// match a stripped prefix is forwarded unchanged. That means:
 //
-//   - XAI_API_KEY and GROK_* env vars are preserved so an opt-in API-key
-//     fallback works when configured, and so the user's existing `grok
-//     login` cached token (stored under e.g. ~/.grok or $GROK_HOME) is
-//     discoverable. Per the feature brief, the orchestrator's ACP
-//     `authenticate` request still picks `cached_token` first; the env
-//     preservation here only ensures the fallback is reachable when the
-//     workspace chooses it.
-//   - CLAUDECODE / CLAUDE_* / CODEX_IDE_* are stripped because they tell
-//     downstream tooling it is running embedded inside another IDE / agent,
-//     which is not true here.
+//   - XAI_API_KEY and GROK_* / GROK_HOME are forwarded by omission (we
+//     never list them in the strip set). The opt-in API-key fallback works
+//     when set, and `grok login`'s cached token under $GROK_HOME / ~/.grok
+//     remains discoverable. Per the feature brief, the orchestrator's ACP
+//     `authenticate` request still selects `cached_token` first; the env
+//     forwarding here only ensures the configured fallback is reachable.
+//   - CLAUDECODE / CLAUDE_* / CODEX_IDE_* are explicitly stripped because
+//     they would tell downstream tooling it is running embedded inside
+//     another IDE / agent, which is not true here.
+//
+// We do NOT pin a `GROK_*` allowlist — a strip-only list keeps the child's
+// shell environment intact (PATH, HOME, locale, proxy settings, …) without
+// us having to enumerate every harmless variable Grok might care about.
 func sanitizeGrokACPEnv(env []string) []string {
 	filtered := make([]string, 0, len(env))
 	for _, e := range env {
