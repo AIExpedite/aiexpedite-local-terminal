@@ -84,13 +84,15 @@ func renderStatusLine(raw []byte) {
 // runs it, so a chained command behaves identically to when Claude invoked it
 // directly. On Windows that means Git Bash when installed (so `~` expands and
 // `.sh` scripts run) and PowerShell otherwise — NOT cmd, which would silently
-// break a Bash-style stashed command like `~/.claude/statusline.sh`.
+// break a Bash-style stashed command like `~/.claude/statusline.sh`. The
+// PowerShell branch mirrors Claude's own `-ExecutionPolicy Bypass` so a stashed
+// `.ps1` command keeps working under the default Restricted policy.
 func shellCommand(command string) *exec.Cmd {
 	if runtime.GOOS == "windows" {
 		if bash := findGitBash(); bash != "" {
 			return exec.Command(bash, "-c", command)
 		}
-		return exec.Command("powershell", "-NoProfile", "-Command", command)
+		return exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command)
 	}
 	return exec.Command("sh", "-c", command)
 }

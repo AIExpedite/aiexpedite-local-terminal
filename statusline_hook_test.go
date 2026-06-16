@@ -165,6 +165,15 @@ func TestShellCommand_UsesClaudeShellNotCmd(t *testing.T) {
 		if !strings.Contains(base, "bash") && !strings.Contains(base, "powershell") {
 			t.Errorf("expected git bash or powershell, got %s", cmd.Path)
 		}
+		// When falling back to PowerShell, mirror Claude's own
+		// `-ExecutionPolicy Bypass` so a stashed `.ps1` survives the default
+		// Restricted policy instead of silently failing to the default line.
+		if strings.Contains(base, "powershell") {
+			joined := strings.Join(cmd.Args, " ")
+			if !strings.Contains(joined, "-ExecutionPolicy") || !strings.Contains(joined, "Bypass") {
+				t.Errorf("powershell branch must pass -ExecutionPolicy Bypass: %v", cmd.Args)
+			}
+		}
 	} else if !strings.Contains(base, "sh") {
 		t.Errorf("expected sh, got %s", cmd.Path)
 	}
