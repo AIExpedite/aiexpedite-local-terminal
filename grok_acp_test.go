@@ -33,7 +33,9 @@ import (
 
 func TestBuildGrokACPArgs_DefaultsToAgentStdio(t *testing.T) {
 	got := buildGrokACPArgs(nil, false)
-	want := []string{"agent", "stdio"}
+	// `--no-auto-update` is injected unconditionally so a background update
+	// worker can't race ACP startup and pollute stdout with non-JSON.
+	want := []string{"agent", "stdio", "--no-auto-update"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(nil) = %#v, want %#v", got, want)
 	}
@@ -41,7 +43,7 @@ func TestBuildGrokACPArgs_DefaultsToAgentStdio(t *testing.T) {
 
 func TestBuildGrokACPArgs_ForwardsExtraArgs(t *testing.T) {
 	got := buildGrokACPArgs([]string{"--model", "grok-2-fast", "--config", "auth.method=cached_token"}, false)
-	want := []string{"agent", "stdio", "--model", "grok-2-fast", "--config", "auth.method=cached_token"}
+	want := []string{"agent", "stdio", "--no-auto-update", "--model", "grok-2-fast", "--config", "auth.method=cached_token"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs = %#v, want %#v", got, want)
 	}
@@ -61,14 +63,51 @@ func TestBuildGrokACPArgs_StripsDuplicateEntryTokens(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := buildGrokACPArgs(c.args, false)
-			if len(got) < 2 || got[0] != "agent" || got[1] != "stdio" {
-				t.Fatalf("expected built-in `agent stdio` prefix; got %#v", got)
+			if len(got) < 3 || got[0] != "agent" || got[1] != "stdio" || got[2] != "--no-auto-update" {
+				t.Fatalf("expected built-in `agent stdio --no-auto-update` prefix; got %#v", got)
 			}
-			for _, a := range got[2:] {
+			for _, a := range got[3:] {
 				lower := strings.ToLower(a)
 				if lower == "agent" || lower == "stdio" || lower == "tui" || lower == "chat" || lower == "run" {
 					t.Fatalf("duplicate entry token leaked into final argv: %#v", got)
 				}
+			}
+		})
+	}
+}
+
+// TestBuildGrokACPArgs_NoAutoUpdateDedupedAndAutoUpdateStripped pins the
+// auto-update gate: we always inject `--no-auto-update`, so a caller-
+// supplied copy must dedupe AND a caller-supplied `--auto-update` must be
+// stripped — otherwise the orchestrator could re-enable the background
+// update worker whose non-protocol stdout would surface as `grok_acp_error`.
+func TestBuildGrokACPArgs_NoAutoUpdateDedupedAndAutoUpdateStripped(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"caller_supplied_no_auto_update_is_deduped",
+			[]string{"--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"caller_supplied_auto_update_is_stripped",
+			[]string{"--auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"both_forms_collapsed_to_single_no_auto_update",
+			[]string{"--auto-update", "--no-auto-update", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildGrokACPArgs(c.args, false)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("buildGrokACPArgs = %#v, want %#v", got, c.want)
 			}
 		})
 	}
@@ -86,12 +125,12 @@ func TestBuildGrokACPArgs_PreservesValueOfValuedFlag(t *testing.T) {
 		{
 			"config_value_is_agent",
 			[]string{"-c", "agent", "-c", "model=grok-2"},
-			[]string{"agent", "stdio", "-c", "agent", "-c", "model=grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "-c", "agent", "-c", "model=grok-2"},
 		},
 		{
 			"config_value_is_stdio",
 			[]string{"--config", "stdio", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--config", "stdio", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "stdio", "--model", "grok-2"},
 		},
 	}
 	for _, c := range cases {
@@ -119,27 +158,27 @@ func TestBuildGrokACPArgs_StripsAuthOverridesByDefault(t *testing.T) {
 		{
 			"strips_api_key_separate_value",
 			[]string{"--api-key", "xai-abc", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
 		},
 		{
 			"strips_api_key_equals_form",
 			[]string{"--api-key=xai-abc", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
 		},
 		{
 			"strips_auth_method",
 			[]string{"--auth", "xai.api_key", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
 		},
 		{
 			"strips_auth_equals_form",
 			[]string{"--auth=xai.api_key", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
 		},
 		{
 			"strips_api_key_env",
 			[]string{"--api-key-env", "OTHER_KEY", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
 		},
 	}
 	for _, c := range cases {
@@ -158,7 +197,7 @@ func TestBuildGrokACPArgs_StripsAuthOverridesByDefault(t *testing.T) {
 // must flow through verbatim.
 func TestBuildGrokACPArgs_PreservesAuthOverridesWhenFallbackEnabled(t *testing.T) {
 	got := buildGrokACPArgs([]string{"--api-key", "xai-abc", "--model", "grok-2"}, true)
-	want := []string{"agent", "stdio", "--api-key", "xai-abc", "--model", "grok-2"}
+	want := []string{"agent", "stdio", "--no-auto-update", "--api-key", "xai-abc", "--model", "grok-2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(allowAPIKey=true) must preserve --api-key; got %#v, want %#v", got, want)
 	}

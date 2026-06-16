@@ -185,9 +185,12 @@ grok login
 export XAI_API_KEY="xai-..."
 ```
 
-> The official `install.sh` drops the binary under `~/.grok/bin`. If
-> `grok_acp_start` reports "grok not on PATH", confirm `~/.grok/bin` is in
-> the user's `PATH` (the installer prints the line to add to your shell rc).
+> The official `install.sh` drops the binary under `~/.grok/bin`. macOS
+> GUI/launchd-spawned agents inherit a sparse PATH that often excludes that
+> dir, so both `gatherCLIAgents` and `GrokACPManager.Start` automatically
+> fall back to `$GROK_BIN_DIR` (the override `install.sh` itself reads) or
+> `$HOME/.grok/bin` when `exec.LookPath("grok")` misses — no shell rc edit
+> required for detection or session startup.
 
 The agent detects `grok` via `gatherCLIAgents` in [systemInfo.go](systemInfo.go)
 and reports installed-status + version on the auth/token uplink. The CLI
@@ -212,7 +215,12 @@ machine-to-machine entry point and offers:
 
 `buildGrokACPArgs` in [grok_acp.go](grok_acp.go) strips any caller-supplied
 `agent` / `stdio` / `chat` / `tui` / `run` tokens that would re-enter the TUI
-path, so orchestrator typos can't accidentally fall back to TUI scraping.
+path, so orchestrator typos can't accidentally fall back to TUI scraping. It
+also always injects `--no-auto-update` (and strips any caller-supplied
+`--auto-update`) — the xAI headless/scripting docs recommend this for
+automated ACP children so a background update worker can't race the
+JSON-RPC handshake and pollute stdout with non-protocol bytes (which would
+surface as `grok_acp_error` and fail the in-flight `initialize` call).
 
 ## Environment policy
 

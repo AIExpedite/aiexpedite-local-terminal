@@ -464,19 +464,76 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 	} {
 		path, err := exec.LookPath(a.Bin)
 		if err != nil {
-			continue
+			// Grok's official installer (https://x.ai/cli/install.sh) drops
+			// the binary in $HOME/.grok/bin (or $GROK_BIN_DIR) and only
+			// updates shell rc files when it cannot symlink into an
+			// already-on-PATH directory. macOS GUI/launchd agents inherit a
+			// sparse PATH that frequently excludes that dir, so a perfectly
+			// functional install would otherwise report missing — and the
+			// later grok_acp_start would fail via the same lookup. Probe the
+			// installer's default bin dir before giving up.
+			if a.Key == "grok" {
+				if p := resolveGrokInstallerBinary(); p != "" {
+					path = p
+				} else {
+					continue
+				}
+			} else {
+				continue
+			}
 		}
 		entry := detectedCLIAgent{
 			Detected: true,
 			Path:     path,
 			Name:     a.DisplayName,
 		}
-		if v := probeVersionArgs(a.Bin, "--version"); v != "" {
+		// Probe via the resolved absolute path so fallback-located binaries
+		// (e.g. grok in ~/.grok/bin) still report a version; probeVersionArgs
+		// runs `exec.LookPath` internally and that accepts absolute paths.
+		if v := probeVersionArgs(path, "--version"); v != "" {
 			entry.Version = v
 		}
 		agents[a.Key] = entry
 	}
 	return agents
+}
+
+// grokInstallerBinDir returns the directory the official Grok installer
+// drops the `grok` binary in. Honors $GROK_BIN_DIR (the override the
+// installer itself reads) and falls back to $HOME/.grok/bin
+// (%USERPROFILE%\.grok\bin on Windows).
+func grokInstallerBinDir() string {
+	if d := strings.TrimSpace(os.Getenv("GROK_BIN_DIR")); d != "" {
+		return d
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".grok", "bin")
+}
+
+// resolveGrokInstallerBinary returns the absolute path to a `grok` binary
+// installed by the official installer, or "" when none exists. Used as a
+// PATH-independent fallback by both CLI detection and the ACP manager so a
+// launchd/GUI-spawned agent process with a sparse PATH still finds the
+// user's grok install.
+func resolveGrokInstallerBinary() string {
+	dir := grokInstallerBinDir()
+	if dir == "" {
+		return ""
+	}
+	candidates := []string{"grok"}
+	if runtime.GOOS == "windows" {
+		candidates = []string{"grok.exe", "grok"}
+	}
+	for _, name := range candidates {
+		p := filepath.Join(dir, name)
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	return ""
 }
 
 func roundGB(bytes uint64) float64 {

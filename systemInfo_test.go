@@ -269,6 +269,78 @@ func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
 	}
 }
 
+// TestGatherCLIAgents_DetectsGrokInInstallerBin pins the macOS-GUI/launchd
+// fallback: the official Grok installer drops the binary in $HOME/.grok/bin
+// and only edits shell rc files. A launchd-spawned agent process inherits a
+// sparse PATH that excludes that dir, so PATH lookup alone would report
+// Grok missing. The detection must fall back to the installer's bin dir
+// when PATH lookup misses.
+func TestGatherCLIAgents_DetectsGrokInInstallerBin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// LookPath + .exe semantics differ enough on Windows that the cross-
+		// platform invariant is better covered on unix CI.
+		t.Skip("installer-bin fallback covered on unix")
+	}
+
+	home := t.TempDir()
+	grokBinDir := filepath.Join(home, ".grok", "bin")
+	if err := os.MkdirAll(grokBinDir, 0o755); err != nil {
+		t.Fatalf("mkdir grok bin dir: %v", err)
+	}
+	stub := filepath.Join(grokBinDir, "grok")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+
+	// Empty PATH so the loop falls through to the installer-bin fallback;
+	// HOME pointed at our tempdir so resolveGrokInstallerBinary picks up the
+	// stub.
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("HOME", home)
+
+	agents := gatherCLIAgents()
+	entry, ok := agents["grok"]
+	if !ok {
+		t.Fatalf("gatherCLIAgents missed grok despite stub at %s", stub)
+	}
+	if !entry.Detected {
+		t.Errorf("grok entry: Detected=false, want true")
+	}
+	if entry.Path != stub {
+		t.Errorf("grok entry: Path=%q, want %q", entry.Path, stub)
+	}
+	if entry.Name != "Grok" {
+		t.Errorf("grok entry: Name=%q, want %q", entry.Name, "Grok")
+	}
+}
+
+// TestGatherCLIAgents_GrokBinDirEnvOverridesHome pins that $GROK_BIN_DIR
+// (the same override the installer itself reads) takes precedence over the
+// $HOME/.grok/bin default — for users who installed Grok to a custom prefix.
+func TestGatherCLIAgents_GrokBinDirEnvOverridesHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("installer-bin fallback covered on unix")
+	}
+	custom := t.TempDir()
+	stub := filepath.Join(custom, "grok")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("HOME", t.TempDir()) // no .grok/bin under here
+	t.Setenv("GROK_BIN_DIR", custom)
+
+	agents := gatherCLIAgents()
+	entry, ok := agents["grok"]
+	if !ok {
+		t.Fatalf("gatherCLIAgents missed grok despite GROK_BIN_DIR=%s", custom)
+	}
+	if entry.Path != stub {
+		t.Errorf("grok entry: Path=%q, want %q", entry.Path, stub)
+	}
+}
+
 func TestCapabilitiesDerivation_RespectsRAMConstraint(t *testing.T) {
 	// Recommendations cap at min(threads/cores, RAM/2 or RAM/4).
 	// If RAM is the tight constraint, that wins.

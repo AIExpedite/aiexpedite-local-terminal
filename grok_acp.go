@@ -300,6 +300,16 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	}
 
 	executable := resolveExecutable("grok")
+	// PATH lookup miss is the common failure mode for macOS GUI/launchd
+	// agents — Grok's installer drops the binary in ~/.grok/bin and only
+	// touches shell rc, which the agent process never sources. Fall back to
+	// the installer's default location before failing so a logged-in user
+	// doesn't have to manually re-export PATH.
+	if executable == "grok" {
+		if p := resolveGrokInstallerBinary(); p != "" {
+			executable = p
+		}
+	}
 	args := buildGrokACPArgs(extraArgs, opts.AllowAPIKeyFallback)
 
 	fmt.Printf("%s[grok-acp] Starting session %s: %s %s%s\n",
@@ -332,7 +342,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		stdin.Close()
 		stdout.Close()
 		stderr.Close()
-		return fmt.Errorf("failed to start grok agent stdio (is `grok` on PATH? run `grok login` to authenticate): %w", err)
+		return fmt.Errorf("failed to start grok agent stdio (is `grok` on PATH or in ~/.grok/bin? run `grok login` to authenticate): %w", err)
 	}
 
 	// Clamp the requested timeout at our stale-GC ceiling. A misbehaving
@@ -899,6 +909,14 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 // interactive TUI which we deliberately avoid (the feature brief mandates
 // JSON-RPC ACP as the primary integration path, not TUI scraping).
 //
+// `--no-auto-update` is always passed so a background update check can't
+// race the ACP handshake. The xAI headless/scripting docs explicitly
+// recommend this for automated ACP children; without it, any non-protocol
+// stdout from the update worker would surface as a `grok_acp_error` and
+// fail the in-flight initialize call. A caller-supplied `--no-auto-update`
+// is deduped, and a caller-supplied `--auto-update` is stripped — we own
+// this knob, the orchestrator doesn't.
+//
 // extraArgs are forwarded after the entry-point tokens so callers can supply
 // Grok config overrides (e.g. `--model grok-2-fast`). Tokens that would
 // re-enter the TUI path (`agent`, `stdio`, or alternative subcommands like
@@ -911,7 +929,7 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 // `cached_token` via the JSON-RPC handshake — no functionality loss for the
 // default path.
 func buildGrokACPArgs(extraArgs []string, allowAPIKey bool) []string {
-	args := []string{"agent", "stdio"}
+	args := []string{"agent", "stdio", "--no-auto-update"}
 	args = append(args, sanitizeGrokACPExtraArgs(extraArgs, allowAPIKey)...)
 	return args
 }
@@ -944,6 +962,12 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey bool) []string {
 		case "agent", "stdio", "chat", "tui", "run":
 			// Drop tokens that would re-enter the TUI / interactive REPL
 			// path or duplicate the `agent stdio` prefix we already set.
+			continue
+		case "--no-auto-update", "--auto-update":
+			// buildGrokACPArgs always injects --no-auto-update; dedupe any
+			// caller-supplied copy AND drop --auto-update so a caller can't
+			// re-enable the background update worker that would race the
+			// ACP handshake on stdout.
 			continue
 		}
 		if !allowAPIKey && isGrokAuthOverrideArg(lower) {
