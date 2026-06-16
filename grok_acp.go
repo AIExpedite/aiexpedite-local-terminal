@@ -1057,7 +1057,10 @@ func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) 
 		// `--config key=` empty override is the documented per-process clear; we
 		// MUST issue it by default and MUST omit it once the workspace has
 		// opted in (otherwise the opt-in path's persisted policy would be
-		// silently cleared).
+		// silently cleared). `permission_rules` / `permission.rules` are
+		// conditionally cleared by the second slice below so deny-only host
+		// policies survive untouched.
+		args = append(args, grokPersistedAllowRuleNeutralizingConfigArgs()...)
 		args = append(args, grokPolicyNeutralizingConfigArgs()...)
 	}
 	if !allowAPIKey {
@@ -1547,10 +1550,21 @@ func isSafeGrokModelScope(name string) bool {
 // value (an empty value is ambiguous for booleans). Long-form `--config`
 // is used for the same `-c` vs `--continue` ambiguity reason
 // `grokAuthNeutralizingConfigArgs` cites.
+//
+// `permission_rules` / `permission.rules` are intentionally NOT blanket-
+// cleared here: xAI's enterprise docs treat the array as a heterogeneous
+// rule list where `action = "deny"` entries tighten the policy (deny
+// takes precedence) and `action = "allow"` entries loosen it. An
+// unconditional `-c permission_rules=` clear would also wipe an MDM-set
+// deny rule — degrading the host's security posture in pursuit of an
+// allow-rule neutralizer. Persisted allow rules in these keys are instead
+// caught conditionally by grokPersistedAllowRuleNeutralizingConfigArgs,
+// which reads the documented config layers and emits the clear only when
+// an allow rule is actually present; argv `-c permission_rules=…`
+// injections of allow rules are still gated by isGrokApprovalConfigKV via
+// the sanitiser.
 func grokPolicyNeutralizingConfigArgs() []string {
 	return []string{
-		"--config", "permission_rules=",
-		"--config", "permission.rules=",
 		"--config", "policy.allow=",
 		"--config", "permissions.allow=",
 		"--config", "tools.allow=",
@@ -1566,6 +1580,84 @@ func grokPolicyNeutralizingConfigArgs() []string {
 		"--config", "tools.always_approve=false",
 		"--config", "tools.auto_approve=false",
 	}
+}
+
+// grokPersistedAllowRuleNeutralizingConfigArgs returns the `--config
+// permission_rules=` / `--config permission.rules=` empty-value overrides
+// when (and only when) at least one documented Grok config layer contains
+// a `permission_rules` / `permission.rules` entry with an explicit
+// `action = "allow"` selector OR a legacy bare-pattern allow shortcut.
+// Returns an empty slice when no allow rule is present so a deny-only
+// policy survives untouched.
+//
+// Used by buildGrokACPArgs when Config.EnableGrokAlwaysApprove is false so
+// the cached-token + per-tool-prompt posture can't be silently shadowed by
+// a persisted `permission_rules = ["Bash(*)"]`, while an MDM-style
+// `permission_rules = [{action = "deny", pattern = "Bash(rm -rf*)"}]` is
+// left in place. Missing/unreadable files yield no clears — best-effort by
+// design, mirroring persistedGrokModelScopesWithAPIKey's tolerance.
+func grokPersistedAllowRuleNeutralizingConfigArgs() []string {
+	for _, p := range persistedGrokConfigPaths() {
+		if parsePersistedGrokPermissionRulesHasAllowAction(p) {
+			return []string{
+				"--config", "permission_rules=",
+				"--config", "permission.rules=",
+			}
+		}
+	}
+	return nil
+}
+
+// parsePersistedGrokPermissionRulesHasAllowAction is the file-path-
+// injectable implementation of grokPersistedAllowRuleNeutralizingConfigArgs'
+// per-layer scan. Reuses the same line-oriented TOML scanner shape as
+// parsePersistedGrokModelScopesWithAPIKey (1 MiB read cap, regex-free
+// section + key=value parse). Recognises the inline forms
+// `permission_rules = ["pattern"]` (legacy bare-pattern allow shortcut)
+// and `permission_rules = [{action = "allow", ...}]` (table form with
+// explicit allow action), plus the dotted `[permission] rules = …`
+// section/key spelling.
+func parsePersistedGrokPermissionRulesHasAllowAction(path string) bool {
+	if path == "" {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	const maxBytes = 1 << 20
+	reader := io.LimitReader(f, maxBytes)
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+
+	currentSection := ""
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			currentSection = strings.TrimSpace(line[1 : len(line)-1])
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		dotted := key
+		if currentSection != "" {
+			dotted = currentSection + "." + key
+		}
+		if (dotted == "permission_rules" || dotted == "permission.rules") &&
+			grokPermissionRulesValueHasAllowAction(val) {
+			return true
+		}
+	}
+	return false
 }
 
 // grokExtraArgsPinPermissionMode reports whether any sanitized caller-
@@ -1981,21 +2073,76 @@ func isGrokApprovalConfigKV(value string) bool {
 		return true
 	}
 	// Config-form of `--allow <rule>` — xAI's enterprise docs describe the
-	// permission_rules TOML array (and its dotted `permission.rules` /
-	// `policy.allow` / `permissions.allow` / `tools.allow` cousins) as
-	// holding the same rule list `--allow` appends to. Any non-empty value
-	// here would survive into the policy table and pre-empt the per-tool
-	// prompt the same way the argv flag does, so the gate has to mirror.
-	// We intentionally do NOT enumerate deny-list keys — those tighten the
-	// policy and are safe on the conservative default path.
+	// permission_rules TOML array (and its dotted `permission.rules` cousin)
+	// as a rule list `--allow` appends to. The list is heterogeneous though:
+	// xAI documents `action = "deny"` rules as policy-tightening (deny takes
+	// precedence) and `action = "allow"` rules as policy-loosening — only the
+	// latter routes around the per-tool prompt. Differentiate via
+	// grokPermissionRulesValueHasAllowAction so a deny-only rule (e.g. an MDM
+	// policy denying dangerous Bash patterns) is left intact on the
+	// conservative default path. The `policy.allow` / `permissions.allow` /
+	// `tools.allow` cousins are explicit allow lists by name — any non-empty
+	// value is by definition an allow rule and gates unconditionally.
 	switch key {
-	case "permission_rules", "permission.rules",
-		"policy.allow", "permissions.allow", "tools.allow":
+	case "permission_rules", "permission.rules":
+		if grokPermissionRulesValueHasAllowAction(val) {
+			return true
+		}
+	case "policy.allow", "permissions.allow", "tools.allow":
 		if val != "" {
 			return true
 		}
 	}
 	return false
+}
+
+// grokPermissionRulesValueHasAllowAction reports whether a serialised
+// `permission_rules` / `permission.rules` TOML value contains at least one
+// allow rule that would route around the per-tool prompt gate. Returns
+// false for empty values, empty arrays, and deny-only table forms — xAI's
+// enterprise docs treat `action = "deny"` rules as policy tightening
+// (deny takes precedence), so they are safe to preserve even when the
+// workspace has not opted into always-approve.
+//
+// The check is intentionally a substring scan over the lower-cased,
+// whitespace-stripped value rather than a full TOML parse: callers feed
+// us either an argv `-c key=value` string or a single TOML line from the
+// line-oriented requirements.toml scanner, and both can be answered
+// without reconstructing the full TOML AST. The legacy
+// `permission_rules = ["Bash(*)"]` form (string-only patterns, no
+// `action` field) is treated as allow because xAI documents bare string
+// patterns as allow shortcuts.
+func grokPermissionRulesValueHasAllowAction(value string) bool {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return false
+	}
+	// Empty TOML arrays in either bracket form are not allow rules.
+	if v == "[]" || v == "[ ]" {
+		return false
+	}
+	lower := strings.ToLower(v)
+	if !strings.Contains(lower, "action") {
+		// No `action` field — legacy `permission_rules = ["pattern"]` form,
+		// which xAI documents as allow shortcuts. Treat as allow.
+		return true
+	}
+	// Table form with explicit action= entries. Flag only when at least one
+	// action is the documented allow selector. Strip whitespace so
+	// `action = "allow"`, `action="allow"`, and `action  =  "allow"` all
+	// match the same compact form. Tabs are also stripped so the scanner can
+	// answer for TOML hand-formatted with tab indentation.
+	compact := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, lower)
+	return strings.Contains(compact, `action="allow"`) ||
+		strings.Contains(compact, "action='allow'") ||
+		strings.Contains(compact, "action=allow,") ||
+		strings.Contains(compact, "action=allow}") ||
+		strings.HasSuffix(compact, "action=allow")
 }
 
 // isGrokPermissionModeArg reports whether `lower` is the `--permission-mode`
