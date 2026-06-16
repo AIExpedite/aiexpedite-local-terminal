@@ -1509,12 +1509,20 @@ func TestGrokACPLifecycle_TimeoutKillsBeforeBlockingPublish(t *testing.T) {
 	id := fmt.Sprintf("grok-timeout-killfirst-%d", time.Now().UnixNano())
 
 	// publishGate blocks the timeout publish so we can probe whether Kill
-	// has run while publishFn is still in flight. waitForExit's terminal
-	// `grok_acp_ended` publish would also hit this gate, so we release it
-	// from the test goroutine after we've made the assertion.
+	// has run while publishFn is still in flight. We gate ONLY the typed
+	// timeout `grok_acp_error` publish: the hang mock writes a stderr line
+	// immediately, which the stderr scanner surfaces as `grok_acp_stderr`
+	// before the deadline fires. On linux/darwin that diagnostic publish
+	// wins the race into publishEntered and is unrelated to the ordering
+	// invariant under test, so we let it (and waitForExit's terminal
+	// `grok_acp_ended`) pass through ungated rather than treating it as the
+	// "first publish".
 	publishGate := make(chan struct{})
 	publishEntered := make(chan resultMsg, 4)
 	publishFn := func(res resultMsg) {
+		if res.Type != "grok_acp_error" {
+			return
+		}
 		select {
 		case publishEntered <- res:
 		default:
