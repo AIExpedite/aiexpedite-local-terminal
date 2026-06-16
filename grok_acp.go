@@ -2116,6 +2116,13 @@ func isGrokAuthConfigKV(value string) bool {
 		key = lower[:eq]
 		val = lower[eq+1:]
 	}
+	// TOML accepts whitespace around the `=`, e.g. `model.api_key = "xai-..."`.
+	// Strip it after the split so `key` and `val` match the bare dotted-path
+	// and value compared below — otherwise a `--config 'model.api_key = ...'`
+	// override would survive the gate despite EnableGrokAPIKeyFallback being
+	// false.
+	key = strings.TrimSpace(key)
+	val = strings.TrimSpace(val)
 	apiKeyKeys := []string{
 		"model.api_key", "model.env_key",
 		"xai.api_key", "xai.env_key",
@@ -2253,6 +2260,11 @@ func isGrokApprovalConfigKV(value string) bool {
 		key = lower[:eq]
 		val = lower[eq+1:]
 	}
+	// Mirror isGrokAuthConfigKV: trim whitespace around the `=` so a
+	// `--config 'approval_mode = always-approve'` (TOML-style spacing) is
+	// classified the same as the bare `approval_mode=always-approve` form.
+	key = strings.TrimSpace(key)
+	val = strings.TrimSpace(val)
 	// TOML accepts string values wrapped in `"…"` or `'…'`, and Grok's `-c`
 	// form preserves the quotes verbatim when xAI's docs spell the value as a
 	// quoted string (e.g. `--config permission_mode="bypassPermissions"`).

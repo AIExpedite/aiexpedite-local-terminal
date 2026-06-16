@@ -3762,3 +3762,63 @@ func TestIsGrokApprovalConfigKV_PermissionRulesDenyOnly(t *testing.T) {
 		})
 	}
 }
+
+// TestIsGrokAuthConfigKV_TrimsSpacedEquals pins the gate against TOML-style
+// `key = value` overrides with whitespace around the `=`. Without trimming
+// after the split, `key` retains a trailing space (e.g. `"model.api_key "`)
+// and neither the exact-key check nor the model-scoped `api_key` check
+// matches — so a `--config 'model.api_key = "xai-..."'` override would
+// survive sanitisation despite EnableGrokAPIKeyFallback being false, and
+// xAI's docs note `model.api_key` takes precedence over the active
+// cached-token.
+func TestIsGrokAuthConfigKV_TrimsSpacedEquals(t *testing.T) {
+	cases := []struct {
+		name string
+		kv   string
+		want bool
+	}{
+		{"model_api_key_spaced", `model.api_key = "xai-..."`, true},
+		{"model_env_key_spaced", `model.env_key = XAI_API_KEY`, true},
+		{"xai_api_key_spaced", `xai.api_key = "xai-..."`, true},
+		{"model_scope_spaced", `model.grok-build.api_key = "xai-..."`, true},
+		{"model_scope_env_spaced", `model.custom.env_key = XAI_API_KEY`, true},
+		{"auth_method_spaced", `auth.method = xai.api_key`, true},
+		{"auth_method_cached_token_spaced", `auth.method = cached_token`, false},
+		{"trailing_space_key_only", `model.api_key =`, true},
+		{"leading_space_key", ` model.api_key=xai-...`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isGrokAuthConfigKV(c.kv); got != c.want {
+				t.Fatalf("isGrokAuthConfigKV(%q) = %v, want %v", c.kv, got, c.want)
+			}
+		})
+	}
+}
+
+// TestIsGrokApprovalConfigKV_TrimsSpacedEquals is the approval-side
+// equivalent of TestIsGrokAuthConfigKV_TrimsSpacedEquals: TOML-style
+// `approval_mode = always-approve` MUST classify the same as the bare
+// `approval_mode=always-approve` form so the argv sanitiser still drops it
+// when EnableGrokAlwaysApprove is false.
+func TestIsGrokApprovalConfigKV_TrimsSpacedEquals(t *testing.T) {
+	cases := []struct {
+		name string
+		kv   string
+		want bool
+	}{
+		{"approval_mode_always_spaced", `approval_mode = always-approve`, true},
+		{"approval_mode_ask_spaced", `approval_mode = ask`, false},
+		{"yolo_true_spaced", `yolo = true`, true},
+		{"yolo_false_spaced", `yolo = false`, false},
+		{"tools_always_approve_spaced", `tools.always_approve = true`, true},
+		{"ui_permission_mode_bypass_spaced", `ui.permission_mode = bypassPermissions`, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isGrokApprovalConfigKV(c.kv); got != c.want {
+				t.Fatalf("isGrokApprovalConfigKV(%q) = %v, want %v", c.kv, got, c.want)
+			}
+		})
+	}
+}
