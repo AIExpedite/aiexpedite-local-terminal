@@ -345,6 +345,97 @@ func TestRemoveClaudeStatusLineHook_LeavesForeignCommandAlone(t *testing.T) {
 	}
 }
 
+func TestIsOurStatusLineCommand_OnlyMatchesInstalledShape(t *testing.T) {
+	ours := []string{
+		`"/usr/local/bin/aiexpedite" statusline-hook`,
+		`"C:/Users/x/aiexpedite.exe" statusline-hook`,
+		`& "C:/Users/x/aiexpedite.exe" statusline-hook`,
+		`  "/x/aiexpedite" statusline-hook  `, // surrounding whitespace tolerated
+	}
+	for _, c := range ours {
+		if !isOurStatusLineCommand(c) {
+			t.Errorf("expected to be recognized as ours: %q", c)
+		}
+	}
+	// Substring `statusline-hook` in a user-authored command must NOT be claimed
+	// as ours — otherwise install would overwrite without stashing, and opt-out
+	// would later delete the statusLine instead of restoring the user's command.
+	notOurs := []string{
+		`~/.claude/statusline-hook.sh`,
+		`bash ~/.claude/statusline-hook.sh`,
+		`my-custom-line.sh`,
+		`statusline-hook`,                            // bare arg, no quoted path
+		`"/x/aiexpedite" statusline-hook --extra`,    // trailing extras aren't ours
+		`"/x/statusline-hook.sh"`,                    // hook arg only as substring
+		``,
+	}
+	for _, c := range notOurs {
+		if isOurStatusLineCommand(c) {
+			t.Errorf("must NOT be recognized as ours: %q", c)
+		}
+	}
+}
+
+func TestEnsureClaudeStatusLineHook_StashesUserHookSubstringCommand(t *testing.T) {
+	// A user-authored command that merely CONTAINS the substring `statusline-hook`
+	// (e.g. their own `~/.claude/statusline-hook.sh`) must be stashed and chained
+	// to, not silently overwritten. Regression test for the old substring match.
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", filepath.Join(t.TempDir(), "prev.json"))
+
+	seed := `{"statusLine":{"type":"command","command":"~/.claude/statusline-hook.sh"}}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := ensureClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("install: changed=%v err=%v", changed, err)
+	}
+	if prev := loadPrevStatusLineCommand(); prev != "~/.claude/statusline-hook.sh" {
+		t.Errorf("user's hook-substring command not stashed: %q", prev)
+	}
+	// Opt-out restores it verbatim.
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	sl := readStatusLine(t, filepath.Join(claudeDir, "settings.json"))
+	if sl.Command != "~/.claude/statusline-hook.sh" {
+		t.Errorf("user's command not restored on opt-out: %+v", sl)
+	}
+}
+
+func TestEnsureClaudeStatusLineHook_AbortsOnUnreadableSettings(t *testing.T) {
+	// A non-`IsNotExist` read error must abort the install — otherwise the
+	// atomic write would replace settings.json with only `statusLine`, dropping
+	// every other Claude setting.
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", filepath.Join(t.TempDir(), "prev.json"))
+
+	// settings.json is a DIRECTORY — os.ReadFile returns a non-IsNotExist error
+	// (EISDIR), simulating an unreadable settings file in a portable way.
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	if err := os.MkdirAll(settingsPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := ensureClaudeStatusLineHook(home)
+	if err == nil {
+		t.Fatalf("expected error on unreadable settings.json, got nil (changed=%v)", changed)
+	}
+	if changed {
+		t.Errorf("install must not report changed=true on read failure")
+	}
+}
+
 func readStatusLine(t *testing.T, path string) claudeStatusLine {
 	t.Helper()
 	raw, err := os.ReadFile(path)

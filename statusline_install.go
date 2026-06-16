@@ -129,8 +129,22 @@ func ourStatusLineCommand() (string, bool) {
 // isOurStatusLineCommand reports whether a configured command is our hook (any
 // binary path) — used to stay idempotent and to avoid stashing our own command
 // as the "previous" one after the binary path changes across updates.
+//
+// Matches the EXACT shape `ourStatusLineCommand` emits — a quoted executable
+// path followed by ` statusline-hook`, with an optional leading `&` call op for
+// the PowerShell form. A loose substring match would falsely claim a user's own
+// command (e.g. `~/.claude/statusline-hook.sh`) as ours and silently overwrite
+// it without stashing, leaving opt-out unable to restore it.
 func isOurStatusLineCommand(command string) bool {
-	return strings.Contains(command, statusLineHookArg)
+	s := strings.TrimSpace(command)
+	suffix := " " + statusLineHookArg
+	if !strings.HasSuffix(s, suffix) {
+		return false
+	}
+	prefix := strings.TrimSpace(strings.TrimSuffix(s, suffix))
+	// PowerShell form starts with the `&` call operator before the quoted path.
+	prefix = strings.TrimSpace(strings.TrimPrefix(prefix, "&"))
+	return len(prefix) >= 2 && strings.HasPrefix(prefix, `"`) && strings.HasSuffix(prefix, `"`)
 }
 
 // loadPrevStatusLine returns the full original statusLine object we stashed.
@@ -200,7 +214,15 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 
 	settingsPath := filepath.Join(base, "settings.json")
 	settings := map[string]json.RawMessage{}
-	if b, err := os.ReadFile(settingsPath); err == nil {
+	b, err := os.ReadFile(settingsPath)
+	if err != nil && !os.IsNotExist(err) {
+		// A non-`IsNotExist` read error (permission, transient share/lock, …)
+		// is NOT the same as "file is absent": treating it as empty would let
+		// the later atomic write replace settings.json with only our statusLine
+		// key, silently dropping every other Claude setting the user has.
+		return false, err
+	}
+	if err == nil {
 		if err := json.Unmarshal(b, &settings); err != nil {
 			// Refuse to clobber an unparseable settings.json — the user may have
 			// a comment-laden or hand-edited file; surface the error instead.
