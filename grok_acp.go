@@ -977,10 +977,40 @@ func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) 
 	args := []string{"agent", "stdio", "--no-auto-update"}
 	sanitized := sanitizeGrokACPExtraArgs(extraArgs, allowAPIKey, allowAlwaysApprove)
 	args = append(args, sanitized...)
+	if !allowAPIKey {
+		// Neutralize any API-key credential persisted in the user's
+		// `~/.grok/config.toml` (or `$GROK_HOME/config.toml`). xAI's CLI treats
+		// `model.api_key` / `model.env_key` as model-credential overrides that
+		// take precedence over the active `grok login` session token, so just
+		// stripping `XAI_API_KEY` from env and `--api-key` from argv is not
+		// enough — a host where the user once ran `grok config set model.api_key`
+		// would still silently bill the API-key account on every ACP launch.
+		// The `-c key=` form (empty value) is the documented xAI override that
+		// clears a config-file value for the duration of one process. We also
+		// neutralize the `xai.*` aliases the design doc enumerates so the
+		// orchestrator's `cached_token` selection is the only auth surface left.
+		args = append(args, grokAuthNeutralizingConfigArgs()...)
+	}
 	if !allowAlwaysApprove && !grokExtraArgsPinPermissionMode(sanitized) {
 		args = append(args, "--permission-mode", "default")
 	}
 	return args
+}
+
+// grokAuthNeutralizingConfigArgs returns the `-c <key>=` overrides that empty
+// out any API-key credential persisted in `~/.grok/config.toml` /
+// `$GROK_HOME/config.toml`. Used by buildGrokACPArgs when
+// Config.EnableGrokAPIKeyFallback is false to ensure the orchestrator's
+// `cached_token` auth selection cannot be silently shadowed by a config-file
+// API-key. Keys mirror isGrokAuthConfigKV's gated set so the strip-from-argv
+// and override-config-file surfaces stay in lockstep.
+func grokAuthNeutralizingConfigArgs() []string {
+	return []string{
+		"-c", "model.api_key=",
+		"-c", "model.env_key=",
+		"-c", "xai.api_key=",
+		"-c", "xai.env_key=",
+	}
 }
 
 // grokExtraArgsPinPermissionMode reports whether any sanitized caller-
