@@ -1008,6 +1008,28 @@ func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) 
 	args := []string{"agent", "stdio", "--no-auto-update"}
 	sanitized := sanitizeGrokACPExtraArgs(extraArgs, allowAPIKey, allowAlwaysApprove)
 	args = append(args, sanitized...)
+	// Persistent-config neutralizers come AFTER the sanitized extras so that
+	// later command-line flags win against earlier same-key values per Grok's
+	// last-wins precedence — i.e. a caller-supplied `--config model.api_key=
+	// xai-...` (which only survives sanitisation when allowAPIKey=true) does
+	// not get clobbered by a default neutralizer. The sanitiser already
+	// drops the POSIX `--` end-of-options delimiter from extras, so the
+	// trailing flags here are guaranteed to be parsed as options rather than
+	// silently demoted to positionals.
+	if !allowAlwaysApprove {
+		// Neutralize any auto-approval policy persisted in `~/.grok/config.toml`
+		// (or `$GROK_HOME/config.toml`). The argv-level `--permission-mode default`
+		// pin only covers the documented prompt-mode selector — xAI's enterprise
+		// docs separately describe `[permission] rules` as a rule list evaluated
+		// BEFORE the prompt gate, so a persisted `permission_rules = ["Bash(*)"]`
+		// would still auto-approve matching tool calls on every ACP launch
+		// despite the workspace not opting into `EnableGrokAlwaysApprove`. The
+		// `--config key=` empty override is the documented per-process clear; we
+		// MUST issue it by default and MUST omit it once the workspace has
+		// opted in (otherwise the opt-in path's persisted policy would be
+		// silently cleared).
+		args = append(args, grokPolicyNeutralizingConfigArgs()...)
+	}
 	if !allowAPIKey {
 		// Neutralize any API-key credential persisted in the user's
 		// `~/.grok/config.toml` (or `$GROK_HOME/config.toml`). xAI's CLI treats
@@ -1052,8 +1074,53 @@ func grokAuthNeutralizingConfigArgs() []string {
 	return []string{
 		"--config", "model.api_key=",
 		"--config", "model.env_key=",
+		// Documented model-scoped form from xAI's enterprise docs (`[model.grok-build]
+		// api_key = "..."`). Clearing the documented scope closes the practical
+		// bypass; the argv-side gate (`isGrokAuthConfigKV` matches any
+		// `model.<scope>.{api_key,env_key}`) blocks an orchestrator from
+		// re-routing through a different scope name via `-c|--config`.
+		"--config", "model.grok-build.api_key=",
+		"--config", "model.grok-build.env_key=",
 		"--config", "xai.api_key=",
 		"--config", "xai.env_key=",
+	}
+}
+
+// grokPolicyNeutralizingConfigArgs returns the `--config <key>=` overrides
+// that empty out any auto-approval policy persisted in `~/.grok/config.toml`
+// (or `$GROK_HOME/config.toml`). Used by buildGrokACPArgs when
+// Config.EnableGrokAlwaysApprove is false to ensure the conservative
+// per-tool prompt default cannot be silently shadowed by a config-file
+// policy rule or approval-mode toggle.
+//
+// xAI's enterprise docs describe the `[permission] rules` TOML table as a
+// permission-policy rule list that is evaluated BEFORE the per-tool prompt
+// gate — so a single persisted `permission_rules = ["Bash(*)"]` would
+// auto-approve matching tool calls even with `--permission-mode default`
+// pinned on argv. The dotted-path neutralizers below clear the documented
+// keys via the same `--config <key>=` empty-value override the auth
+// neutralizer uses; keys mirror `isGrokApprovalConfigKV`'s gated set so the
+// strip-from-argv and override-config-file surfaces stay in lockstep.
+//
+// `approval.mode=` / `approval.permission_mode=` cleared to empty falls back
+// to Grok's documented default (per-tool prompt), so an explicit empty
+// override is the right neutralizer for a persisted `always-approve` /
+// `bypassPermissions` selector. `tools.always_approve=false` /
+// `tools.auto_approve=false` pin the boolean toggles to the conservative
+// value (an empty value is ambiguous for booleans). Long-form `--config`
+// is used for the same `-c` vs `--continue` ambiguity reason
+// `grokAuthNeutralizingConfigArgs` cites.
+func grokPolicyNeutralizingConfigArgs() []string {
+	return []string{
+		"--config", "permission_rules=",
+		"--config", "permission.rules=",
+		"--config", "policy.allow=",
+		"--config", "permissions.allow=",
+		"--config", "tools.allow=",
+		"--config", "approval.mode=",
+		"--config", "approval.permission_mode=",
+		"--config", "tools.always_approve=false",
+		"--config", "tools.auto_approve=false",
 	}
 }
 
@@ -1145,6 +1212,19 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprov
 			// caller-supplied copy AND drop --auto-update so a caller can't
 			// re-enable the background update worker that would race the
 			// ACP handshake on stdout.
+			continue
+		case "--":
+			// POSIX Utility Syntax Guideline 10 defines a standalone `--` as
+			// the end-of-options delimiter — any subsequent tokens are treated
+			// as operands rather than flags. buildGrokACPArgs appends the
+			// auth/policy `--config <key>=` neutralizers and the
+			// `--permission-mode default` pin AFTER the sanitised extras, so a
+			// surviving `--` from caller args would silently demote those
+			// policy-enforcing flags to positionals and re-open every gate
+			// they're meant to close. ACP startup args have no documented use
+			// for the delimiter (`agent stdio` already supplies the positional
+			// subcommand and ACP frames travel via stdin, not argv), so the
+			// fail-closed posture is to drop the token unconditionally.
 			continue
 		}
 		// xAI's headless docs document `--cwd <PATH>` as setting Grok's
@@ -1270,11 +1350,18 @@ func isGrokConfigOverrideArg(lower string) bool {
 
 // isGrokAuthConfigKV reports whether a `-c`/`--config` value would let the
 // caller switch Grok off the default cached-token flow when API-key fallback
-// is opt-in. Two cases trigger the gate:
+// is opt-in. Three cases trigger the gate:
 //
-//   - The key references an API-key credential — `model.api_key`,
+//   - The key references an API-key credential at the top-level — `model.api_key`,
 //     `model.env_key`, `xai.api_key`, `xai.env_key` — i.e. supplying the key
 //     itself or pointing at the env var that holds it.
+//   - The key references an API-key credential under a model-scoped section —
+//     xAI documents persistent API-key config as `[model.grok-build] api_key =
+//     "..."` (enterprise docs), which in dotted-path form is
+//     `model.<scope>.api_key` / `model.<scope>.env_key` for any scope name.
+//     The model-scoped form takes precedence over the active cached-token, so
+//     a `--config model.grok-build.api_key=xai-...` (or any other scope) must
+//     be gated the same way as the top-level form.
 //   - The auth-method selector picks the API-key path —
 //     `auth.method=xai.api_key` or `auth=xai.api_key`. `auth.method=cached_token`
 //     is the default we want to keep working, so we only strip values that
@@ -1297,6 +1384,24 @@ func isGrokAuthConfigKV(value string) bool {
 	for _, k := range apiKeyKeys {
 		if key == k {
 			return true
+		}
+	}
+	// Model-scoped form (`model.<scope>.api_key` / `model.<scope>.env_key`).
+	// xAI's enterprise docs document persistent API-key config as a model-
+	// scoped TOML section like `[model.grok-build] api_key = "..."`, which is
+	// rendered as a `model.<scope>.api_key` dotted-path in `-c`/`--config`
+	// args. We can't enumerate every model scope a host might have configured
+	// (or that xAI might ship in future releases), so any `model.<anything>
+	// .{api_key,env_key}` shape is treated as the same credential class as the
+	// top-level form. The first segment must be `model` and the last segment
+	// must be one of the credential keys — that lets `model.<scope>.foo` flow
+	// through if it ever maps to a non-credential field.
+	if strings.HasPrefix(key, "model.") {
+		if last := strings.LastIndexByte(key, '.'); last > len("model.")-1 && last < len(key)-1 {
+			tail := key[last+1:]
+			if tail == "api_key" || tail == "env_key" {
+				return true
+			}
 		}
 	}
 	// Auth-method selector escaping to api-key flow. We deliberately do NOT

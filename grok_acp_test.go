@@ -38,7 +38,7 @@ func TestBuildGrokACPArgs_DefaultsToAgentStdio(t *testing.T) {
 	// `--permission-mode default` is appended whenever allowAlwaysApprove=false to
 	// override any persistent `~/.grok/config.toml` always-approve setting via
 	// the higher-precedence argv surface.
-	want := []string{"agent", "stdio", "--no-auto-update", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"}
+	want := []string{"agent", "stdio", "--no-auto-update", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(nil) = %#v, want %#v", got, want)
 	}
@@ -46,7 +46,7 @@ func TestBuildGrokACPArgs_DefaultsToAgentStdio(t *testing.T) {
 
 func TestBuildGrokACPArgs_ForwardsExtraArgs(t *testing.T) {
 	got := buildGrokACPArgs([]string{"--model", "grok-2-fast", "--config", "auth.method=cached_token"}, false, false)
-	want := []string{"agent", "stdio", "--no-auto-update", "--model", "grok-2-fast", "--config", "auth.method=cached_token", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"}
+	want := []string{"agent", "stdio", "--no-auto-update", "--model", "grok-2-fast", "--config", "auth.method=cached_token", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs = %#v, want %#v", got, want)
 	}
@@ -116,17 +116,17 @@ func TestBuildGrokACPArgs_NoAutoUpdateDedupedAndAutoUpdateStripped(t *testing.T)
 		{
 			"caller_supplied_no_auto_update_is_deduped",
 			[]string{"--no-auto-update", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"caller_supplied_auto_update_is_stripped",
 			[]string{"--auto-update", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"both_forms_collapsed_to_single_no_auto_update",
 			[]string{"--auto-update", "--no-auto-update", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 	}
 	for _, c := range cases {
@@ -153,17 +153,17 @@ func TestBuildGrokACPArgs_StripsCwdOverride(t *testing.T) {
 		{
 			"separate_value_cwd_dropped_with_value",
 			[]string{"--cwd", "/tmp/other", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"equals_form_cwd_dropped",
 			[]string{"--cwd=/tmp/other", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"case_insensitive_cwd_dropped",
 			[]string{"--CWD", "/tmp/other"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 	}
 	for _, c := range cases {
@@ -188,12 +188,12 @@ func TestBuildGrokACPArgs_PreservesValueOfValuedFlag(t *testing.T) {
 		{
 			"config_value_is_agent",
 			[]string{"-c", "agent", "-c", "model=grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "-c", "agent", "-c", "model=grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "-c", "agent", "-c", "model=grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"config_value_is_stdio",
 			[]string{"--config", "stdio", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "stdio", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "stdio", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 	}
 	for _, c := range cases {
@@ -221,27 +221,27 @@ func TestBuildGrokACPArgs_StripsAuthOverridesByDefault(t *testing.T) {
 		{
 			"strips_api_key_separate_value",
 			[]string{"--api-key", "xai-abc", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_api_key_equals_form",
 			[]string{"--api-key=xai-abc", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_auth_method",
 			[]string{"--auth", "xai.api_key", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_auth_equals_form",
 			[]string{"--auth=xai.api_key", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_api_key_env",
 			[]string{"--api-key-env", "OTHER_KEY", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 	}
 	for _, c := range cases {
@@ -260,7 +260,7 @@ func TestBuildGrokACPArgs_StripsAuthOverridesByDefault(t *testing.T) {
 // must flow through verbatim.
 func TestBuildGrokACPArgs_PreservesAuthOverridesWhenFallbackEnabled(t *testing.T) {
 	got := buildGrokACPArgs([]string{"--api-key", "xai-abc", "--model", "grok-2"}, true, false)
-	want := []string{"agent", "stdio", "--no-auto-update", "--api-key", "xai-abc", "--model", "grok-2", "--permission-mode", "default"}
+	want := []string{"agent", "stdio", "--no-auto-update", "--api-key", "xai-abc", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--permission-mode", "default"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(allowAPIKey=true) must preserve --api-key; got %#v, want %#v", got, want)
 	}
@@ -286,6 +286,14 @@ func TestBuildGrokACPArgs_NeutralizesConfigFileAPIKeyByDefault(t *testing.T) {
 	wantPairs := [][2]string{
 		{"model.api_key=", ""},
 		{"model.env_key=", ""},
+		// xAI documents persistent API-key config as `[model.grok-build] api_key
+		// = "..."` (enterprise docs), so the documented scope name MUST be in
+		// the neutralizer slice. The argv-side gate (isGrokAuthConfigKV) covers
+		// any other `model.<scope>.{api_key,env_key}` shape, but a host with the
+		// documented scope persisted is the practical bypass path the
+		// neutralizer exists to close.
+		{"model.grok-build.api_key=", ""},
+		{"model.grok-build.env_key=", ""},
 		{"xai.api_key=", ""},
 		{"xai.env_key=", ""},
 	}
@@ -308,7 +316,9 @@ func TestBuildGrokACPArgs_NeutralizesConfigFileAPIKeyByDefault(t *testing.T) {
 	for i := 0; i+1 < len(got); i++ {
 		if got[i] == "-c" {
 			switch got[i+1] {
-			case "model.api_key=", "model.env_key=", "xai.api_key=", "xai.env_key=":
+			case "model.api_key=", "model.env_key=",
+				"model.grok-build.api_key=", "model.grok-build.env_key=",
+				"xai.api_key=", "xai.env_key=":
 				t.Fatalf("auth neutralizer regressed to `-c` short alias: %#v", got)
 			}
 		}
@@ -325,7 +335,9 @@ func TestBuildGrokACPArgs_OmitsConfigFileAPIKeyNeutralizerWhenFallbackEnabled(t 
 	for i := 0; i+1 < len(got); i++ {
 		if got[i] == "--config" || got[i] == "-c" {
 			switch got[i+1] {
-			case "model.api_key=", "model.env_key=", "xai.api_key=", "xai.env_key=":
+			case "model.api_key=", "model.env_key=",
+				"model.grok-build.api_key=", "model.grok-build.env_key=",
+				"xai.api_key=", "xai.env_key=":
 				t.Fatalf("auth neutralizer leaked into allowAPIKey=true argv: %#v", got)
 			}
 		}
@@ -1415,32 +1427,32 @@ func TestBuildGrokACPArgs_StripsAlwaysApproveByDefault(t *testing.T) {
 		{
 			"strips_always_approve_bare",
 			[]string{"--always-approve", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_always_approve_equals_true",
 			[]string{"--always-approve=true", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_always_approve_equals_false_still_drops",
 			[]string{"--always-approve=false", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_auto_approve_bare",
 			[]string{"--auto-approve", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_auto_approve_equals_form",
 			[]string{"--auto-approve=true", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_when_interleaved_with_kept_args",
 			[]string{"--model", "grok-2", "--always-approve", "--config", "log.level=debug"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "log.level=debug", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "log.level=debug", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 	}
 	for _, c := range cases {
@@ -1459,7 +1471,7 @@ func TestBuildGrokACPArgs_StripsAlwaysApproveByDefault(t *testing.T) {
 // through verbatim so the orchestrator can enable the documented behaviour.
 func TestBuildGrokACPArgs_PreservesAlwaysApproveWhenEnabled(t *testing.T) {
 	got := buildGrokACPArgs([]string{"--always-approve", "--model", "grok-2"}, false, true)
-	want := []string{"agent", "stdio", "--no-auto-update", "--always-approve", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="}
+	want := []string{"agent", "stdio", "--no-auto-update", "--always-approve", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(allowAlwaysApprove=true) must preserve --always-approve; got %#v, want %#v", got, want)
 	}
@@ -1628,7 +1640,13 @@ func TestBuildGrokACPArgs_StripsAllowRulesByDefault(t *testing.T) {
 	got := buildGrokACPArgs([]string{"--allow", "Bash(*)", "--allow=Edit(*)"}, false, false)
 	want := []string{
 		"agent", "stdio", "--no-auto-update",
+		"--config", "permission_rules=", "--config", "permission.rules=",
+		"--config", "policy.allow=", "--config", "permissions.allow=",
+		"--config", "tools.allow=",
+		"--config", "approval.mode=", "--config", "approval.permission_mode=",
+		"--config", "tools.always_approve=false", "--config", "tools.auto_approve=false",
 		"--config", "model.api_key=", "--config", "model.env_key=",
+		"--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=",
 		"--config", "xai.api_key=", "--config", "xai.env_key=",
 		"--permission-mode", "default",
 	}
@@ -1653,47 +1671,47 @@ func TestBuildGrokACPArgs_StripsPermissionModeBypassByDefault(t *testing.T) {
 		{
 			"strips_permission_mode_bypass_separate",
 			[]string{"--permission-mode", "bypassPermissions", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_permission_mode_bypass_equals",
 			[]string{"--permission-mode=bypassPermissions", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_underscore_alias",
 			[]string{"--permission_mode", "bypassPermissions"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_bare_bypass_synonym",
 			[]string{"--permission-mode", "bypass"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_auto_synonym_equals",
 			[]string{"--permission-mode=auto"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_accept_edits_separate",
 			[]string{"--permission-mode", "acceptEdits", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_accept_edits_equals_separator_variant",
 			[]string{"--permission-mode=accept-edits"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"keeps_permission_mode_ask_separate",
 			[]string{"--permission-mode", "ask", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 		{
 			"keeps_permission_mode_ask_equals",
 			[]string{"--permission-mode=ask"},
-			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode=ask", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode=ask", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 	}
 	for _, c := range cases {
@@ -1715,7 +1733,7 @@ func TestBuildGrokACPArgs_StripsPermissionModeBypassByDefault(t *testing.T) {
 func TestBuildGrokACPArgs_PreservesPermissionModeBypassWhenEnabled(t *testing.T) {
 	in := []string{"--permission-mode", "bypassPermissions", "--model", "grok-2"}
 	got := buildGrokACPArgs(in, false, true)
-	want := []string{"agent", "stdio", "--no-auto-update", "--permission-mode", "bypassPermissions", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="}
+	want := []string{"agent", "stdio", "--no-auto-update", "--permission-mode", "bypassPermissions", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(allowAlwaysApprove=true) must preserve --permission-mode bypassPermissions; got %#v, want %#v", got, want)
 	}
@@ -1755,49 +1773,49 @@ func TestBuildGrokACPArgs_PinsPermissionModeAskAgainstHostConfig(t *testing.T) {
 			"injects_when_no_caller_pin",
 			nil,
 			true,
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"injects_when_only_unrelated_extras",
 			[]string{"--model", "grok-2"},
 			true,
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"skips_when_caller_pins_ask_separate",
 			[]string{"--permission-mode", "ask", "--model", "grok-2"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 		{
 			"skips_when_caller_pins_ask_equals",
 			[]string{"--permission-mode=ask"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode=ask", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode=ask", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 		{
 			"skips_when_caller_pins_underscore_alias",
 			[]string{"--permission_mode", "ask"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "--permission_mode", "ask", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission_mode", "ask", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 		{
 			"skips_when_caller_pins_via_config_separate",
 			[]string{"--config", "approval.permission_mode=ask", "--model", "grok-2"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "approval.permission_mode=ask", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "approval.permission_mode=ask", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 		{
 			"skips_when_caller_pins_via_short_config",
 			[]string{"-c", "permission_mode=ask"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "-c", "permission_mode=ask", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "-c", "permission_mode=ask", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 		{
 			"skips_when_caller_pins_via_inline_config_equals",
 			[]string{"--config=approval.permission_mode=ask"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "--config=approval.permission_mode=ask", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--config=approval.permission_mode=ask", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 		{
 			"injects_when_caller_bypass_value_is_stripped",
@@ -1805,7 +1823,7 @@ func TestBuildGrokACPArgs_PinsPermissionModeAskAgainstHostConfig(t *testing.T) {
 			// callers cannot use a bypass value to suppress our injection.
 			[]string{"--permission-mode", "bypassPermissions", "--model", "grok-2"},
 			true,
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "permission_rules=", "--config", "permission.rules=", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 	}
 	for _, c := range cases {
@@ -2318,5 +2336,206 @@ func TestWaitForExit_FinalFrameSurvivesQuickExit(t *testing.T) {
 			t.Fatalf("iter %d: terminal grok_acp_message must precede grok_acp_ended; got types=%v",
 				i, extractTypes(captured))
 		}
+	}
+}
+
+// TestSanitizeGrokACPExtraArgs_StripsModelScopedAuthConfigOverrides pins the
+// gate against xAI's documented persistent API-key form,
+// `[model.<scope>] api_key = "..."` — rendered as
+// `model.<scope>.{api_key,env_key}` in -c|--config args. The top-level
+// `model.api_key` strip is not enough because xAI's enterprise docs document
+// `[model.grok-build]` as the canonical model-scoped section and treat
+// model-scoped API-key credentials as taking precedence over the active
+// cached-token, so a signed grok_acp_start that routed through a scoped key
+// would silently bill the API-key account despite EnableGrokAPIKeyFallback
+// being false. We can't enumerate every model name a host might configure,
+// so the gate recognises ANY `model.<scope>.{api_key,env_key}` shape — the
+// first segment must be `model` and the trailing segment must be one of the
+// credential keys.
+func TestSanitizeGrokACPExtraArgs_StripsModelScopedAuthConfigOverrides(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"strips_documented_grok_build_scope_separate",
+			[]string{"--config", "model.grok-build.api_key=xai-secret", "--model", "grok-2"},
+			[]string{"--model", "grok-2"},
+		},
+		{
+			"strips_documented_grok_build_scope_short",
+			[]string{"-c", "model.grok-build.env_key=XAI_BUILD_KEY"},
+			[]string{},
+		},
+		{
+			"strips_documented_grok_build_scope_inline",
+			[]string{"--config=model.grok-build.api_key=xai-secret"},
+			[]string{},
+		},
+		{
+			"strips_arbitrary_scope_api_key",
+			[]string{"--config", "model.custom-scope.api_key=xai-secret", "--model", "grok-2"},
+			[]string{"--model", "grok-2"},
+		},
+		{
+			"strips_arbitrary_scope_env_key",
+			[]string{"-c", "model.tenant-a.env_key=SECRET_VAR"},
+			[]string{},
+		},
+		{
+			"keeps_model_non_credential_field",
+			// `model.<scope>.context_window` is not an API-key credential — it
+			// must flow through so callers can still tune non-auth model config.
+			[]string{"--config", "model.grok-build.context_window=200000"},
+			[]string{"--config", "model.grok-build.context_window=200000"},
+		},
+		{
+			"keeps_unrelated_config",
+			[]string{"--config", "log.level=debug"},
+			[]string{"--config", "log.level=debug"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := sanitizeGrokACPExtraArgs(c.args, false, false)
+			if len(got) == 0 && len(c.want) == 0 {
+				return
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("sanitizeGrokACPExtraArgs(allowAPIKey=false) model-scoped gate = %#v, want %#v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestBuildGrokACPArgs_NeutralizesPersistentAllowRulesByDefault pins the
+// other half of the always-approve gate: when the workspace has not opted
+// in, the argv `--permission-mode default` pin alone does NOT clear policy
+// rules persisted in `~/.grok/config.toml` (xAI's enterprise docs describe
+// `[permission] rules` as evaluated BEFORE the prompt gate). A `--config
+// permission_rules=` empty override on argv clears the persisted rules for
+// this one process; we MUST issue it by default and MUST skip it when the
+// workspace has opted into EnableGrokAlwaysApprove (otherwise the opt-in
+// path's documented rule list would be silently cleared).
+func TestBuildGrokACPArgs_NeutralizesPersistentAllowRulesByDefault(t *testing.T) {
+	got := buildGrokACPArgs(nil, false, false)
+	wantKeys := []string{
+		"permission_rules=",
+		"permission.rules=",
+		"policy.allow=",
+		"permissions.allow=",
+		"tools.allow=",
+		"approval.mode=",
+		"approval.permission_mode=",
+		"tools.always_approve=false",
+		"tools.auto_approve=false",
+	}
+	for _, k := range wantKeys {
+		found := false
+		for i := 0; i+1 < len(got); i++ {
+			if got[i] == "--config" && got[i+1] == k {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected `--config %s` policy neutralizer in argv; got %#v", k, got)
+		}
+	}
+	// `-c` short alias must NOT pair with any policy neutralizer kv — same
+	// long-form-only posture as the auth neutralizer (avoid the `--continue`
+	// alias collision).
+	for i := 0; i+1 < len(got); i++ {
+		if got[i] == "-c" {
+			for _, k := range wantKeys {
+				if got[i+1] == k {
+					t.Fatalf("policy neutralizer regressed to `-c` short alias on key %q: %#v", k, got)
+				}
+			}
+		}
+	}
+}
+
+// TestBuildGrokACPArgs_OmitsPersistentAllowRulesNeutralizerWhenOptIn is the
+// inverse: once Config.EnableGrokAlwaysApprove=true the persistent-policy
+// neutralizer MUST NOT fire, otherwise it would clobber the very policy
+// rules the opt-in path lets the orchestrator rely on.
+func TestBuildGrokACPArgs_OmitsPersistentAllowRulesNeutralizerWhenOptIn(t *testing.T) {
+	got := buildGrokACPArgs(nil, false, true)
+	neutralizerKeys := map[string]bool{
+		"permission_rules=":         true,
+		"permission.rules=":         true,
+		"policy.allow=":             true,
+		"permissions.allow=":        true,
+		"tools.allow=":              true,
+		"approval.mode=":            true,
+		"approval.permission_mode=": true,
+		"tools.always_approve=false": true,
+		"tools.auto_approve=false":   true,
+	}
+	for i := 0; i+1 < len(got); i++ {
+		if (got[i] == "--config" || got[i] == "-c") && neutralizerKeys[got[i+1]] {
+			t.Fatalf("policy neutralizer %q leaked into allowAlwaysApprove=true argv: %#v", got[i+1], got)
+		}
+	}
+}
+
+// TestSanitizeGrokACPExtraArgs_StripsEndOfOptionsDelimiter pins the gate
+// against POSIX Utility Syntax Guideline 10's `--` end-of-options token.
+// buildGrokACPArgs appends the auth/policy `--config <key>=` neutralizers
+// and the conservative `--permission-mode default` pin AFTER the sanitised
+// extras, so a surviving `--` would demote every subsequent token to a
+// positional and silently disable each gate. Grok ACP startup has no
+// documented use for the delimiter (`agent stdio` already supplies the
+// positional subcommand and ACP frames travel via stdin), so dropping the
+// token unconditionally is the fail-closed posture.
+func TestSanitizeGrokACPExtraArgs_StripsEndOfOptionsDelimiter(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"strips_standalone_delimiter",
+			[]string{"--model", "grok-2", "--"},
+			[]string{"--model", "grok-2"},
+		},
+		{
+			"strips_delimiter_at_start",
+			[]string{"--", "--model", "grok-2"},
+			[]string{"--model", "grok-2"},
+		},
+		{
+			"strips_multiple_delimiters",
+			[]string{"--", "--model", "grok-2", "--"},
+			[]string{"--model", "grok-2"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := sanitizeGrokACPExtraArgs(c.args, false, false)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("sanitizeGrokACPExtraArgs failed to strip `--`: got %#v, want %#v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestBuildGrokACPArgs_DelimiterCannotDemotePolicyFlags is the end-to-end
+// version of the strip: a caller-supplied `--` MUST NOT survive into the
+// final argv, otherwise the trailing `--permission-mode default` /
+// neutralizer `--config` flags would parse as positionals to grok and the
+// host-config bypass gates would silently re-open.
+func TestBuildGrokACPArgs_DelimiterCannotDemotePolicyFlags(t *testing.T) {
+	got := buildGrokACPArgs([]string{"--model", "grok-2", "--"}, false, false)
+	for _, a := range got {
+		if a == "--" {
+			t.Fatalf("end-of-options `--` survived into final argv — policy flags would demote to positionals: %#v", got)
+		}
+	}
+	// The conservative permission-mode pin MUST still be the final pair.
+	if len(got) < 2 || got[len(got)-2] != "--permission-mode" || got[len(got)-1] != "default" {
+		t.Fatalf("expected trailing `--permission-mode default`; got %#v", got)
 	}
 }
