@@ -488,8 +488,6 @@ gemini
 gemini *
 agy
 agy *
-grok
-grok *
 
 # --- Remote/SSH ---
 ssh *
