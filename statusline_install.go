@@ -185,11 +185,17 @@ func powerShellDoubleQuote(s string) string {
 // statusLineEnvPreambleRe captures the per-invocation env preamble we install
 // before the hook in either the POSIX (`KEY='val' …`) or PowerShell
 // (`$env:KEY="val"; …`) form so isOurStatusLineCommand can strip it before
-// matching the inner exe+hook shape. We always single/double-quote our own
-// values, so the permissive `[^']*` / `[^"]*` body is sufficient for the
-// shapes we actually emit.
+// matching the inner exe+hook shape.
+//
+// The POSIX body must also accept `posixSingleQuote`'s embedded-apostrophe
+// escape (`'\''` — close, escape, reopen). Without it, a config dir like
+// `/Users/bob's/.aiexpedite/...` stops the regex at the first apostrophe and
+// our own installed command is no longer recognized — opt-out/uninstall then
+// leaves Claude pointing at the binary, and a later refresh stashes our own
+// command as the chained third-party one. Windows file paths can't contain
+// `"`, so the PowerShell `[^"]*` body needs no escape clause.
 var statusLineEnvPreambleRe = regexp.MustCompile(
-	`^(?:\s*(?:AIEXPEDITE_CLAUDE_\w+='[^']*'|\$env:AIEXPEDITE_CLAUDE_\w+="[^"]*";))+\s*`,
+	`^(?:\s*(?:AIEXPEDITE_CLAUDE_\w+='(?:[^']|'\\'')*'|\$env:AIEXPEDITE_CLAUDE_\w+="[^"]*";))+\s*`,
 )
 
 // isOurStatusLineCommand reports whether a configured command is our hook (any
