@@ -337,6 +337,20 @@ func savePrevStatusLine(raw json.RawMessage) error {
 	return os.WriteFile(prevStatusLinePath(), b, 0o600)
 }
 
+// copyPrevStatusLine copies the stash file across filesystems with the same
+// owner-only mode `savePrevStatusLine` uses. The binary `copyFile` helper is
+// intentionally NOT reused here: it chmods to 0o755, which would leave the
+// JSON stash world-readable on Unix and expose the previously chained
+// status-line command (which can include inline env vars / tokens) to other
+// local users after an EXDEV migration.
+func copyPrevStatusLine(src, dst string) error {
+	b, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, b, 0o600)
+}
+
 // ensureClaudeStatusLineHook installs (or refreshes) the status-line hook in
 // Claude's settings.json. It is best-effort and idempotent:
 //   - Skips entirely when Claude isn't present (no config dir).
@@ -421,10 +435,15 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 						// the home disk to a mounted drive). Ignoring it would
 						// leave the stash at oldPrev while the hook + opt-out
 						// look at newPrev, silently dropping the chained
-						// third-party command. Fall back to copy-and-remove so
-						// the migration still happens across volumes.
+						// third-party command. Fall back to a private-mode
+						// copy-and-remove so the migration still happens
+						// across volumes — do NOT use the binary `copyFile`
+						// helper here: it chmods to 0o755, which would leave
+						// the stash world-readable on Unix and expose the
+						// previously chained command (potentially including
+						// inline env vars / tokens) to other local users.
 						if err := os.Rename(oldPrev, newPrev); err != nil {
-							if copyErr := copyFile(oldPrev, newPrev); copyErr == nil {
+							if copyErr := copyPrevStatusLine(oldPrev, newPrev); copyErr == nil {
 								_ = os.Remove(oldPrev)
 							}
 						}

@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -199,6 +200,33 @@ func TestEnsureClaudeStatusLineHook_MigratesStashOnPinnedPathChange(t *testing.T
 	}
 	if string(got) != string(stashBody) {
 		t.Errorf("migrated stash body mismatch: got %s want %s", got, stashBody)
+	}
+}
+
+// When the pinned stash path moves across filesystems, the EXDEV fallback
+// must keep the stash private. The binary `copyFile` helper chmods to 0o755,
+// which on Unix would leave `claude_statusline_prev.json` world-readable and
+// expose the previously chained status-line command (potentially including
+// inline env vars / tokens) to other local users. The migration must instead
+// produce the same owner-only 0o600 mode `savePrevStatusLine` uses.
+func TestCopyPrevStatusLine_PreservesPrivateMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes are not meaningful on Windows")
+	}
+	src := filepath.Join(t.TempDir(), "old-prev.json")
+	if err := os.WriteFile(src, []byte(`{"statusLine":{"type":"command","command":"third-party --token=secret"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(t.TempDir(), "new-prev.json")
+	if err := copyPrevStatusLine(src, dst); err != nil {
+		t.Fatalf("copyPrevStatusLine: %v", err)
+	}
+	st, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat dst: %v", err)
+	}
+	if mode := st.Mode().Perm(); mode != 0o600 {
+		t.Errorf("migrated stash must be owner-only (0o600), got %o", mode)
 	}
 }
 
