@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
 )
 
@@ -22,10 +22,12 @@ type claudeStatusLine struct {
 	Padding *int   `json:"padding,omitempty"`
 }
 
-// prevStatusLine is the small record we persist so the hook can chain to the
-// user's original command (the one we replaced).
+// prevStatusLine is the record we persist so the hook can chain to the user's
+// original command AND opt-out can restore their full original statusLine
+// object (padding / refreshInterval / hideVimModeIndicator and any other
+// options) verbatim — not just type + command.
 type prevStatusLine struct {
-	Command string `json:"command"`
+	StatusLine json.RawMessage `json:"statusLine,omitempty"`
 }
 
 // prevStatusLinePath is where the replaced command is stashed, inside the
@@ -39,8 +41,13 @@ func prevStatusLinePath() string {
 }
 
 // ourStatusLineCommand is the command string we install into Claude's settings:
-// the agent binary re-invoked with the hook subcommand. Quoted so a path with
-// spaces (e.g. Program Files) runs correctly through Claude's shell.
+// the agent binary re-invoked with the hook subcommand, double-quoted so a path
+// with spaces (e.g. Program Files) survives the shell.
+//
+// On Windows, Claude runs the statusLine command through Git Bash when present
+// (else PowerShell). Git Bash treats Windows backslashes as escapes and the
+// docs recommend forward-slash paths, so we normalise separators — a quoted
+// forward-slash path runs correctly under Git Bash (the documented primary).
 func ourStatusLineCommand() (string, bool) {
 	exe, err := os.Executable()
 	if err != nil || exe == "" {
@@ -49,7 +56,10 @@ func ourStatusLineCommand() (string, bool) {
 	if abs, err := filepath.Abs(exe); err == nil {
 		exe = abs
 	}
-	return strconv.Quote(exe) + " " + statusLineHookArg, true
+	if runtime.GOOS == "windows" {
+		exe = strings.ReplaceAll(exe, `\`, "/")
+	}
+	return `"` + exe + `" ` + statusLineHookArg, true
 }
 
 // isOurStatusLineCommand reports whether a configured command is our hook (any
@@ -59,26 +69,37 @@ func isOurStatusLineCommand(command string) bool {
 	return strings.Contains(command, statusLineHookArg)
 }
 
-// loadPrevStatusLineCommand returns the user's original status-line command we
-// stashed, or "" when none was chained.
-func loadPrevStatusLineCommand() string {
+// loadPrevStatusLine returns the full original statusLine object we stashed.
+func loadPrevStatusLine() (json.RawMessage, bool) {
 	b, err := os.ReadFile(prevStatusLinePath())
 	if err != nil {
-		return ""
+		return nil, false
 	}
 	var p prevStatusLine
-	if json.Unmarshal(b, &p) != nil {
-		return ""
+	if json.Unmarshal(b, &p) != nil || len(p.StatusLine) == 0 {
+		return nil, false
 	}
-	return p.Command
+	return p.StatusLine, true
 }
 
-func savePrevStatusLineCommand(command string) {
-	b, err := json.MarshalIndent(prevStatusLine{Command: command}, "", "  ")
+// loadPrevStatusLineCommand extracts just the command from the stashed object
+// (the hook chains to it), or "" when none was stashed.
+func loadPrevStatusLineCommand() string {
+	raw, ok := loadPrevStatusLine()
+	if !ok {
+		return ""
+	}
+	var sl claudeStatusLine
+	_ = json.Unmarshal(raw, &sl)
+	return sl.Command
+}
+
+func savePrevStatusLine(raw json.RawMessage) {
+	b, err := json.MarshalIndent(prevStatusLine{StatusLine: raw}, "", "  ")
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(GetConfigDir(), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(prevStatusLinePath()), 0o755); err != nil {
 		return
 	}
 	_ = os.WriteFile(prevStatusLinePath(), b, 0o600)
@@ -120,7 +141,9 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 	}
 
 	var existing claudeStatusLine
+	var existingRaw json.RawMessage
 	if rawSL, present := settings["statusLine"]; present {
+		existingRaw = rawSL
 		_ = json.Unmarshal(rawSL, &existing)
 	}
 
@@ -129,18 +152,31 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 	}
 
 	// A different command that isn't one of ours is a real user/third-party
-	// status line — stash it so the hook can chain to it. (A command that IS
-	// ours but with a stale binary path just gets its path refreshed; don't
-	// stash it as "previous".)
+	// status line — stash the FULL object so the hook can chain to its command
+	// AND opt-out can restore its other options. (A command that IS ours but
+	// with a stale binary path just gets its path refreshed; don't re-stash.)
 	if existing.Command != "" && !isOurStatusLineCommand(existing.Command) {
-		savePrevStatusLineCommand(existing.Command)
+		savePrevStatusLine(existingRaw)
 	}
 
-	updated, err := json.Marshal(claudeStatusLine{Type: "command", Command: ours})
+	// Preserve the existing statusLine's other documented options (padding,
+	// refreshInterval, hideVimModeIndicator, …) by merging into it; override
+	// only type + command so the user's spacing / refresh / vim behavior is kept.
+	slMap := map[string]json.RawMessage{}
+	if len(existingRaw) > 0 {
+		_ = json.Unmarshal(existingRaw, &slMap)
+	}
+	cmdJSON, err := json.Marshal(ours)
 	if err != nil {
 		return false, err
 	}
-	settings["statusLine"] = updated
+	slMap["type"] = json.RawMessage(`"command"`)
+	slMap["command"] = cmdJSON
+	merged, err := json.Marshal(slMap)
+	if err != nil {
+		return false, err
+	}
+	settings["statusLine"] = merged
 
 	out, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
@@ -191,12 +227,10 @@ func removeClaudeStatusLineHook(home string) (bool, error) {
 		return false, nil
 	}
 
-	if prev := loadPrevStatusLineCommand(); prev != "" {
-		restored, err := json.Marshal(claudeStatusLine{Type: "command", Command: prev})
-		if err != nil {
-			return false, err
-		}
-		settings["statusLine"] = restored
+	if prev, ok := loadPrevStatusLine(); ok {
+		// Restore the user's full original statusLine object verbatim —
+		// command and every preserved option (padding / refreshInterval / …).
+		settings["statusLine"] = prev
 	} else {
 		delete(settings, "statusLine")
 	}

@@ -130,6 +130,86 @@ func TestEnsureClaudeStatusLineHook_SkipsWhenNoClaude(t *testing.T) {
 	}
 }
 
+func TestOurStatusLineCommand_NoBackslashesAndQuoted(t *testing.T) {
+	cmd, ok := ourStatusLineCommand()
+	if !ok {
+		t.Fatal("expected a command")
+	}
+	// On Windows the exe path must be forward-slashed so Claude's Git Bash
+	// invocation doesn't treat backslashes as escapes; elsewhere paths are
+	// already forward-slash. Either way: no backslashes, quoted, hook arg.
+	if strings.Contains(cmd, `\`) {
+		t.Errorf("command must not contain backslashes: %q", cmd)
+	}
+	if !strings.HasPrefix(cmd, `"`) || !strings.Contains(cmd, statusLineHookArg) {
+		t.Errorf("command should be a quoted path + hook arg: %q", cmd)
+	}
+}
+
+func TestEnsureClaudeStatusLineHook_PreservesStatusLineOptions(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", filepath.Join(t.TempDir(), "prev.json"))
+
+	// A custom status line with documented options that must survive.
+	seed := `{"statusLine":{"type":"command","command":"my-line.sh","padding":2,` +
+		`"refreshInterval":1000,"hideVimModeIndicator":true}}`
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := ensureClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("install: changed=%v err=%v", changed, err)
+	}
+
+	// Merged object keeps padding / refreshInterval / hideVimModeIndicator and
+	// only swaps in our command.
+	sl := rawStatusLineMap(t, settingsPath)
+	if string(sl["padding"]) != "2" || string(sl["refreshInterval"]) != "1000" ||
+		string(sl["hideVimModeIndicator"]) != "true" {
+		t.Errorf("options not preserved on install: %v", sl)
+	}
+	var cmd string
+	_ = json.Unmarshal(sl["command"], &cmd)
+	if !strings.Contains(cmd, statusLineHookArg) {
+		t.Errorf("command not swapped to hook: %q", cmd)
+	}
+
+	// Opt-out restores the user's FULL original object — options included.
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	restored := rawStatusLineMap(t, settingsPath)
+	var rcmd string
+	_ = json.Unmarshal(restored["command"], &rcmd)
+	if rcmd != "my-line.sh" || string(restored["padding"]) != "2" ||
+		string(restored["refreshInterval"]) != "1000" || string(restored["hideVimModeIndicator"]) != "true" {
+		t.Errorf("original options not fully restored on opt-out: %v", restored)
+	}
+}
+
+func rawStatusLineMap(t *testing.T, settingsPath string) map[string]json.RawMessage {
+	t.Helper()
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read settings: %v", err)
+	}
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatalf("parse settings: %v", err)
+	}
+	var sl map[string]json.RawMessage
+	if err := json.Unmarshal(settings["statusLine"], &sl); err != nil {
+		t.Fatalf("parse statusLine: %v", err)
+	}
+	return sl
+}
+
 func TestRemoveClaudeStatusLineHook_RestoresStashedCommand(t *testing.T) {
 	home := t.TempDir()
 	claudeDir := filepath.Join(home, ".claude")
