@@ -142,7 +142,11 @@ func TestOurStatusLineCommand_NoBackslashesAndQuoted(t *testing.T) {
 	if strings.Contains(cmd, `\`) {
 		t.Errorf("command must not contain backslashes: %q", cmd)
 	}
-	if !strings.Contains(cmd, `"`) || !strings.Contains(cmd, statusLineHookArg) {
+	// Quoted with either single quotes (POSIX/Git Bash form, safe against `$`/
+	// backtick expansion) or double quotes (PowerShell form, escaped via
+	// powerShellDoubleQuote). A bare/unquoted exe path is never emitted.
+	if !(strings.Contains(cmd, `"`) || strings.Contains(cmd, `'`)) ||
+		!strings.Contains(cmd, statusLineHookArg) {
 		t.Errorf("command should carry a quoted path + hook arg: %q", cmd)
 	}
 	// Windows: either the Git Bash form (`KEYS… "path" hook`) or the PowerShell
@@ -386,7 +390,14 @@ func TestIsOurStatusLineCommand_OnlyMatchesInstalledShape(t *testing.T) {
 		`"C:/Users/x/aiexpedite.exe" statusline-hook`,
 		`& "C:/Users/x/aiexpedite.exe" statusline-hook`,
 		`  "/x/aiexpedite" statusline-hook  `, // surrounding whitespace tolerated
-		// New: env-pinned shapes must also be recognized as ours so a refreshed
+		// Legacy double-quoted-exe shapes (previously installed entries) must
+		// continue to be claimed as ours after we switched to POSIX single
+		// quotes — otherwise the next install would treat the user's existing
+		// (older-shape) hook entry as third-party and stash it.
+		// Current single-quoted POSIX shape, both with and without env preamble.
+		`'/usr/local/bin/aiexpedite' statusline-hook`,
+		`AIEXPEDITE_CLAUDE_RL_CACHE='/x/cache.json' AIEXPEDITE_CLAUDE_STATUSLINE_PREV='/x/prev.json' '/x/aiexpedite' statusline-hook`,
+		// Env-pinned shapes must also be recognized as ours so a refreshed
 		// data-dir path (or an upgrade across the old shape) doesn't make the
 		// installer stash our own command as the "previous" one.
 		`AIEXPEDITE_CLAUDE_RL_CACHE='/x/cache.json' AIEXPEDITE_CLAUDE_STATUSLINE_PREV='/x/prev.json' "/x/aiexpedite" statusline-hook`,

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -47,6 +48,91 @@ func TestIsOurStatusLineCommand_PlainPosixStillRoundTrips(t *testing.T) {
 	)
 	if !isOurStatusLineCommand(cmd) {
 		t.Errorf("plain posix command should still be recognized: %q", cmd)
+	}
+}
+
+// statusLinePosixCommand must wrap the exe path in POSIX single quotes too
+// (not raw double quotes), otherwise an install path containing shell
+// metacharacters like `$`, backticks, or `"` — all legal in macOS/Linux/Git
+// Bash directory names — gets expanded by sh before exec. In that case the
+// hook either resolves to the wrong binary or runs a command substitution on
+// every render and the side-channel never updates the rate-limit cache.
+func TestStatusLinePosixCommand_QuotesExeForShellSafety(t *testing.T) {
+	cmd := statusLinePosixCommand(
+		`/Users/dan/$WORK/aiexpedite`,
+		"/cache.json",
+		"/prev.json",
+	)
+	// The literal `$WORK` must survive verbatim — sh expands `$WORK` inside
+	// double quotes but treats it as literal inside single quotes.
+	if !strings.Contains(cmd, `'/Users/dan/$WORK/aiexpedite'`) {
+		t.Errorf("exe path should be single-quoted to suppress `$` expansion: %q", cmd)
+	}
+	if !isOurStatusLineCommand(cmd) {
+		t.Errorf("single-quoted-exe command must still be recognized as ours: %q", cmd)
+	}
+}
+
+// statusLinePowerShellCommand must escape the exe path through
+// powerShellDoubleQuote — Windows permits `$`/`$(...)` in directory names, and
+// a raw `"..."` PowerShell literal would expand a variable or evaluate a
+// subexpression before invoking the binary, leaving the hook silently broken.
+func TestStatusLinePowerShellCommand_EscapesExe(t *testing.T) {
+	cmd := statusLinePowerShellCommand(
+		`C:/Users/A$B/aiexpedite.exe`,
+		"C:/cache.json",
+		"C:/prev.json",
+	)
+	// The `$` must be backtick-escaped so PowerShell doesn't substitute `$B`.
+	if !strings.Contains(cmd, "& \"C:/Users/A`$B/aiexpedite.exe\" "+statusLineHookArg) {
+		t.Errorf("exe path should be backtick-escaped for PowerShell: %q", cmd)
+	}
+	if !isOurStatusLineCommand(cmd) {
+		t.Errorf("PowerShell-escaped exe command must still be recognized as ours: %q", cmd)
+	}
+}
+
+// Installing the hook when settings.json has no statusLine (or one we manually
+// wiped) must clear any leftover prev-stash so a later opt-out doesn't
+// resurrect a command the user has already removed.
+func TestEnsureClaudeStatusLineHook_ClearsStaleStashOnEmptyInstall(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	prevFile := filepath.Join(t.TempDir(), "prev.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", prevFile)
+
+	// Drop a stale stash from a hypothetical earlier install — the user has
+	// since removed `statusLine` from settings.json on their own.
+	if err := os.WriteFile(prevFile,
+		[]byte(`{"statusLine":{"type":"command","command":"old-line.sh"}}`),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"),
+		[]byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := ensureClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("install: changed=%v err=%v", changed, err)
+	}
+
+	// Stale stash must be gone so opt-out doesn't resurrect `old-line.sh`.
+	if _, err := os.Stat(prevFile); !os.IsNotExist(err) {
+		t.Errorf("stale prev stash should be removed on empty-statusLine install; err=%v", err)
+	}
+
+	// Opt-out drops statusLine entirely — not the resurrected old command.
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	if strings.Contains(string(raw), "old-line.sh") {
+		t.Errorf("opt-out resurrected a removed third-party command: %s", raw)
 	}
 }
 
