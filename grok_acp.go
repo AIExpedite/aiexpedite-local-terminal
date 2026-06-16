@@ -1432,6 +1432,13 @@ func grokPolicyNeutralizingConfigArgs() []string {
 		"--config", "tools.allow=",
 		"--config", "approval.mode=",
 		"--config", "approval.permission_mode=",
+		// `ui.permission_mode` is xAI's documented persisted-config key for
+		// the same selector (the `[ui] permission_mode` TOML section). Without
+		// the explicit clear, a host with `[ui] permission_mode =
+		// "always-approve"` persisted would silently shadow the conservative
+		// default — the argv `--permission-mode default` pin only covers the
+		// flag surface, not this config-file key.
+		"--config", "ui.permission_mode=",
 		"--config", "tools.always_approve=false",
 		"--config", "tools.auto_approve=false",
 	}
@@ -1469,10 +1476,11 @@ func grokExtraArgsPinPermissionMode(args []string) bool {
 }
 
 // grokConfigKVTargetsPermissionMode reports whether a `-c|--config` value
-// targets the `permission_mode` key (top-level or namespaced under
-// `approval.`). Companion to grokExtraArgsPinPermissionMode — we only care
-// that the key is being set, not what value it is set to (bypass values were
-// already stripped upstream). Caller normalises to lower-case.
+// targets the `permission_mode` key (top-level, namespaced under `approval.`,
+// or namespaced under `ui.` — the xAI persisted-config form). Companion to
+// grokExtraArgsPinPermissionMode — we only care that the key is being set,
+// not what value it is set to (bypass values were already stripped upstream).
+// Caller normalises to lower-case.
 func grokConfigKVTargetsPermissionMode(kv string) bool {
 	if kv == "" {
 		return false
@@ -1482,7 +1490,7 @@ func grokConfigKVTargetsPermissionMode(kv string) bool {
 		key = kv[:eq]
 	}
 	key = strings.TrimSpace(key)
-	return key == "approval.permission_mode" || key == "permission_mode"
+	return key == "approval.permission_mode" || key == "permission_mode" || key == "ui.permission_mode"
 }
 
 func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) []string {
@@ -1838,8 +1846,14 @@ func isGrokApprovalConfigKV(value string) bool {
 	// Config-form of `--permission-mode bypassPermissions` (the xAI enterprise
 	// docs name `bypassPermissions` explicitly; common variants share intent).
 	// `approval.permission_mode=ask` is the conservative default and is
-	// deliberately left intact.
-	if (key == "approval.permission_mode" || key == "permission_mode") && isGrokPermissionModeBypassValue(val) {
+	// deliberately left intact. `ui.permission_mode` is xAI's documented
+	// persisted-config key for the same selector (the `[ui] permission_mode`
+	// TOML section), so we gate it on the same bypass-value set — otherwise a
+	// `-c ui.permission_mode=always-approve` would route around the
+	// `approval.permission_mode` / `permission_mode` gate and silently flip
+	// the spawned ACP child into auto-approval despite the workspace not
+	// opting into `EnableGrokAlwaysApprove`.
+	if (key == "approval.permission_mode" || key == "permission_mode" || key == "ui.permission_mode") && isGrokPermissionModeBypassValue(val) {
 		return true
 	}
 	// Config-form of `--allow <rule>` — xAI's enterprise docs describe the
