@@ -2614,13 +2614,13 @@ func TestBuildGrokACPArgs_NeutralizesPersistentAllowRulesByDefault(t *testing.T)
 func TestBuildGrokACPArgs_OmitsPersistentAllowRulesNeutralizerWhenOptIn(t *testing.T) {
 	got := buildGrokACPArgs(nil, false, true)
 	neutralizerKeys := map[string]bool{
-		"permission_rules=":         true,
-		"permission.rules=":         true,
-		"policy.allow=":             true,
-		"permissions.allow=":        true,
-		"tools.allow=":              true,
-		"approval.mode=":            true,
-		"approval.permission_mode=": true,
+		"permission_rules=":          true,
+		"permission.rules=":          true,
+		"policy.allow=":              true,
+		"permissions.allow=":         true,
+		"tools.allow=":               true,
+		"approval.mode=":             true,
+		"approval.permission_mode=":  true,
 		"tools.always_approve=false": true,
 		"tools.auto_approve=false":   true,
 	}
