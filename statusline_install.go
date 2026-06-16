@@ -40,9 +40,15 @@ func findGitBash() string {
 		candidates = append(candidates, filepath.Join(la, "Programs", "Git", "bin", "bash.exe"))
 	}
 	if gitPath, err := exec.LookPath("git"); err == nil {
-		// ...\Git\cmd\git.exe -> ...\Git\bin\bash.exe
+		// ...\Git\cmd\git.exe -> ...\Git\bin\bash.exe. An MSYS2/Cygwin `git` on
+		// PATH would derive `<msys>/bin/bash.exe` — not Git Bash, and Claude's
+		// actual fallback shell here (PowerShell) would mis-execute the POSIX
+		// form we emit. Filter the derived candidate the same way as PATH bash.
 		gitDir := filepath.Dir(filepath.Dir(gitPath))
-		candidates = append(candidates, filepath.Join(gitDir, "bin", "bash.exe"))
+		derived := filepath.Join(gitDir, "bin", "bash.exe")
+		if isGitForWindowsBashPath(derived) {
+			candidates = append(candidates, derived)
+		}
 	}
 	for _, c := range candidates {
 		if st, err := os.Stat(c); err == nil && !st.IsDir() {
@@ -410,7 +416,18 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 			if _, err := os.Stat(newPrev); os.IsNotExist(err) {
 				if _, err := os.Stat(oldPrev); err == nil {
 					if mkErr := os.MkdirAll(filepath.Dir(newPrev), 0o755); mkErr == nil {
-						_ = os.Rename(oldPrev, newPrev)
+						// os.Rename returns EXDEV when oldPrev and newPrev sit on
+						// different filesystems (e.g. XDG_CONFIG_HOME moved from
+						// the home disk to a mounted drive). Ignoring it would
+						// leave the stash at oldPrev while the hook + opt-out
+						// look at newPrev, silently dropping the chained
+						// third-party command. Fall back to copy-and-remove so
+						// the migration still happens across volumes.
+						if err := os.Rename(oldPrev, newPrev); err != nil {
+							if copyErr := copyFile(oldPrev, newPrev); copyErr == nil {
+								_ = os.Remove(oldPrev)
+							}
+						}
 					}
 				}
 			}
