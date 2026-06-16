@@ -402,30 +402,34 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		globalProcessRegistry.Register(proc.Process.Pid, "grok-acp:"+id)
 	}
 
-	// Per-session deadline. Kill the child FIRST, then publish the typed
-	// grok_acp_error best-effort. The publish is synchronous in the
-	// AfterFunc goroutine and the production newSessionPublishFn can block
-	// for the full Pub/Sub publish timeout (~30s) when Pub/Sub is slow or
-	// unavailable; running it before Kill would leave the timed-out session
-	// executing tools and consuming Grok usage past its deadline. Kill is
-	// non-blocking so the orchestrator is guaranteed to see the child
-	// terminate on schedule, and the resulting natural exit will publish
-	// `grok_acp_ended` via waitForExit even if this diagnostic publish
-	// itself ultimately fails. Both frames carry monotonic Seq so the
-	// orchestrator can reconstruct ordering even though the kill→wait→ended
-	// cascade is asynchronous. Timer is Stop()'d in waitForExit on natural
-	// exit so a freshly-exited session can't double-fire the timeout publish.
+	// Per-session deadline. Reserve the typed-error Seq BEFORE Kill() and
+	// publish AFTER. The reservation ordering matters because Kill() races
+	// with waitForExit: a fast exit can publish `grok_acp_ended` (which
+	// increments session.seq) before this callback would otherwise allocate
+	// its own Seq, letting the orchestrator order the terminal _ended frame
+	// before the timeout error or drop the error as post-terminal. Taking
+	// the AddInt64 first nails down a Seq strictly less than whatever
+	// _ended ends up with, so even though both publishes are asynchronous
+	// the orchestrator sees timeout → ended causal order. The publish is
+	// still deferred until after Kill() because the production
+	// newSessionPublishFn can block for the full Pub/Sub publish timeout
+	// (~30s) when Pub/Sub is slow or unavailable; killing first guarantees
+	// the orchestrator sees the child terminate on schedule and the
+	// natural exit publishes `grok_acp_ended` via waitForExit even if this
+	// diagnostic publish itself ultimately fails. Timer is Stop()'d in
+	// waitForExit on natural exit so a freshly-exited session can't
+	// double-fire the timeout publish.
 	if session.TimeoutMs > 0 {
 		session.timeoutTimer = time.AfterFunc(time.Duration(session.TimeoutMs)*time.Millisecond, func() {
 			if session.Status() == "ended" {
 				return
 			}
+			seq := atomic.AddInt64(&session.seq, 1)
 			fmt.Printf("%s[grok-acp] Session %s timed out after %dms — killing%s\n",
 				colorYellow, session.ID, session.TimeoutMs, colorReset)
 			if session.Process != nil && session.Process.Process != nil {
 				_ = session.Process.Process.Kill()
 			}
-			seq := atomic.AddInt64(&session.seq, 1)
 			publishFn(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,

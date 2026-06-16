@@ -252,3 +252,43 @@ func TestMakeRejectionResult_EmptyCmdCwdProducesEmptyResultCwd(t *testing.T) {
 		t.Errorf("Cwd = %q, want empty (cmd.Cwd was empty)", res.Cwd)
 	}
 }
+
+// Regression: separate-form `--api-key xai-...` survived the generic per-arg
+// regex in redactArgs because the secret lives in the NEXT argv token as a
+// bare value matching no sensitive pattern. For grok_acp_start the rejection
+// path now routes through redactGrokACPArgsForLog, the same masker the
+// approval-dialog path already uses, so the API key is scrubbed before the
+// rejected-command record is persisted.
+func TestMakeRejectionResult_RedactsGrokSeparateFormAPIKey(t *testing.T) {
+	cmd := commandMsg{
+		ID:        "cmd-grok-3",
+		Command:   "grok",
+		Args:      []string{"agent", "stdio", "--api-key", "xai-supersecret-deadbeef"},
+		Type:      "grok_acp_start",
+		SessionID: "sess-grok-redact",
+	}
+	res := makeRejectionResult(cmd, "agent-1", "denied", "ALLOWLIST_DENIED", "denied")
+
+	joined := strings.Join(res.Args, " ")
+	if strings.Contains(joined, "xai-supersecret-deadbeef") {
+		t.Fatalf("Args leaked separate-form api key: %v", res.Args)
+	}
+	if len(res.Args) != 4 || res.Args[2] != "--api-key" || res.Args[3] != "[REDACTED]" {
+		t.Errorf("Args = %v, want […, --api-key, [REDACTED]]", res.Args)
+	}
+}
+
+// Non-grok commands keep using the generic redactArgs path so we don't
+// inadvertently change masking behavior for execute / session_start.
+func TestMakeRejectionResult_NonGrokArgsUseGenericRedaction(t *testing.T) {
+	cmd := commandMsg{
+		ID:      "cmd-shell-7",
+		Command: "curl",
+		Args:    []string{"-H", "Authorization: Bearer abc.def.ghi", "https://api.example.com"},
+		Type:    "execute",
+	}
+	res := makeRejectionResult(cmd, "agent-1", "denied", "ALLOWLIST_DENIED", "denied")
+	if strings.Contains(strings.Join(res.Args, " "), "abc.def.ghi") {
+		t.Errorf("Args leaked bearer token: %v", res.Args)
+	}
+}

@@ -165,7 +165,7 @@ func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string)
 		Version:         Version,
 		Cwd:             cmd.Cwd,
 		Command:         redactSensitiveData(cmd.Command),
-		Args:            redactArgs(cmd.Args),
+		Args:            redactRejectionArgs(cmd),
 		RejectionReason: reason,
 	}
 	// Session-routed commands need Type/SessionID set so the backend can
@@ -180,6 +180,22 @@ func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string)
 		res.SessionID = cmd.SessionID
 	}
 	return res
+}
+
+// redactRejectionArgs scrubs cmd.Args before they land in the rejected-command
+// record. The generic per-arg redactSensitiveData regex catches inline
+// secrets (`--api-key=xai-…`, bearer tokens, etc.) but cannot see across two
+// adjacent argv tokens — for `--api-key xai-…` the secret sits in the next
+// arg as a bare value that matches no pattern, so the key would otherwise be
+// persisted to the rejected-command record even though the approval-dialog
+// path already redacts it via redactGrokACPArgsForLog. Route grok_acp_start
+// rejections through the same family-specific masker so the dialog and
+// rejection paths agree; everything else falls back to redactArgs.
+func redactRejectionArgs(cmd commandMsg) []string {
+	if cmd.Type == "grok_acp_start" {
+		return redactGrokACPArgsForLog(cmd.Args)
+	}
+	return redactArgs(cmd.Args)
 }
 
 // rejectionResultType maps an inbound command Type to the result Type used
