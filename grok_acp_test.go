@@ -1564,6 +1564,43 @@ func TestValidateGrokACPSendCwd_NonExistentInsideRootAccepted(t *testing.T) {
 	}
 }
 
+// TestValidateGrokACPSendCwd_SymlinkParentDotDotEscapeRejected pins the
+// tertiary-review finding: when params.cwd is `$root/link/../new` where
+// `link` is a symlink inside the workspace pointing OUTSIDE it, the old
+// `filepath.Clean(cwd)` fallback would collapse `link/..` lexically to
+// `$root/new` and accept the path. The kernel resolves the same input by
+// following `link` to its target FIRST, then popping the target's parent
+// with `..` — landing outside the workspace. The forward-walk algorithm
+// resolves the symlink before applying the `..` pop, so the escape is
+// caught.
+func TestValidateGrokACPSendCwd_SymlinkParentDotDotEscapeRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink + containment semantics covered on unix")
+	}
+	root := t.TempDir()
+	outside := t.TempDir()
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("eval root: %v", err)
+	}
+	// `$root/link/../new`: kernel follows link → outside, then `..` →
+	// outside's parent, then appends `new`. Must NOT be accepted as a
+	// workspace-local path even though lexical Clean would say so. Build
+	// the path with raw string concatenation because filepath.Join calls
+	// Clean and would collapse the `link/..` before validateGrokACPSendCwd
+	// ever saw it — defeating the test.
+	target := link + string(filepath.Separator) + ".." + string(filepath.Separator) + "new"
+	frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}`, target)
+	err = validateGrokACPSendCwd(frame, resolvedRoot)
+	if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
+		t.Fatalf("link/.. escape must be rejected; got %v", err)
+	}
+}
+
 // TestResolveCwdForContainment_NoResolvableAncestorRejected exercises the
 // fail-closed branch directly: a path under a non-existent volume / absolute
 // root must return an error so the caller treats it as a containment failure

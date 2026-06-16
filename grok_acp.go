@@ -368,19 +368,19 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	}
 
 	session := &GrokACPSession{
-		ID:          id,
-		Process:     proc,
-		Stdin:       stdin,
-		Stdout:      stdout,
-		Stderr:      stderr,
-		StartedAt:   time.Now(),
+		ID:            id,
+		Process:       proc,
+		Stdin:         stdin,
+		Stdout:        stdout,
+		Stderr:        stderr,
+		StartedAt:     time.Now(),
 		WorkspaceID:   workspaceID,
 		UID:           uid,
 		TimeoutMs:     timeoutMs,
 		WorkspaceRoot: resolvedRoot,
 		status:        "running",
-		done:        make(chan struct{}),
-		streamDone:  make(chan struct{}),
+		done:          make(chan struct{}),
+		streamDone:    make(chan struct{}),
 	}
 
 	m.sessions[id] = session
@@ -1286,41 +1286,63 @@ func validateGrokACPSendCwd(frame, resolvedRoot string) error {
 // The honest case: cwd exists, EvalSymlinks succeeds, we return the
 // resolved path.
 //
-// The attack case: cwd is something like `$root/link/new` where `link` is a
-// symlink under the workspace pointing at `/outside` and `new` does not
-// exist yet. EvalSymlinks fails on the whole path because of the missing
-// tail, but `link` itself is a fully resolvable symlink that escapes — a
-// lexical-only fallback (`filepath.Clean(cwd)`) would accept `$root/link/new`
-// even though the OS will resolve session creation through `link` to
-// `/outside/new`. So when EvalSymlinks on the full path fails we walk up to
-// the deepest existing ancestor, resolve THAT, and reattach the unresolved
-// suffix. The containment check then runs against the OS-true prefix; any
-// escaping symlink on the existing portion of the path is caught.
+// The attack case: cwd is something like `$root/link/../new` where `link`
+// is a symlink under the workspace pointing at `/outside` and `new` does
+// not exist yet. EvalSymlinks fails on the whole path because of the
+// missing tail. We must NOT lexically Clean the input first — Clean would
+// collapse `link/..` to nothing, hiding a symlink whose OS-resolved
+// target (`/outside`) is the parent that `..` actually pops from. The
+// previous walk-up-from-cleaned-input approach had this exact bug: it
+// accepted `$root/link/../new` as `$root/new`.
 //
-// If no ancestor can be resolved we refuse the path outright — fail-closed
-// matches the rest of the desktop's workspace-safety stance.
+// Instead, walk the path FORWARD from the volume root, applying one
+// component at a time:
+//
+//   - `..` pops one component off the OS-resolved prefix (matching how
+//     the kernel evaluates the path after symlink resolution).
+//   - any other name is appended and re-resolved via EvalSymlinks so a
+//     symlink on the existing portion takes effect before a subsequent
+//     `..` is applied.
+//
+// Once we hit the first component that can't be resolved (because it
+// doesn't exist yet), everything after it is necessarily fictional —
+// there are no more symlinks to follow on the unreachable suffix — so we
+// can lexically Join the remainder over the OS-resolved prefix.
+//
+// If even the volume root can't be resolved we refuse the path outright —
+// fail-closed matches the rest of the desktop's workspace-safety stance.
 func resolveCwdForContainment(cwd string) (string, error) {
 	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
 		return resolved, nil
 	}
-	cleaned := filepath.Clean(cwd)
-	cur := cleaned
-	var suffix []string
-	for {
-		parent := filepath.Dir(cur)
-		// filepath.Dir returns the same path once we hit the volume root
-		// (`/`, `C:\`, etc.). At that point we have walked the whole path
-		// and nothing resolved — reject rather than silently accept.
-		if parent == cur {
-			return "", fmt.Errorf("no resolvable ancestor for %q", cleaned)
-		}
-		base := filepath.Base(cur)
-		suffix = append([]string{base}, suffix...)
-		cur = parent
-		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
-			return filepath.Join(append([]string{resolved}, suffix...)...), nil
-		}
+	vol := filepath.VolumeName(cwd)
+	sep := string(filepath.Separator)
+	root := vol + sep
+	cur, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("no resolvable ancestor for %q: %w", cwd, err)
 	}
+	parts := strings.Split(strings.TrimPrefix(cwd[len(vol):], sep), sep)
+	for i, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		if part == ".." {
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, part)
+		if resolved, err := filepath.EvalSymlinks(next); err == nil {
+			cur = resolved
+			continue
+		}
+		// First non-resolvable component → suffix is fictional. Lexical
+		// Join over the OS-resolved prefix is safe because there are no
+		// more symlinks to follow on the unreachable subtree.
+		remaining := append([]string{cur}, parts[i:]...)
+		return filepath.Join(remaining...), nil
+	}
+	return cur, nil
 }
 
 // isGrokAuthOverrideArg reports whether a caller-supplied arg would let
