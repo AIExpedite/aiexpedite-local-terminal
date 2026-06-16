@@ -81,10 +81,16 @@ func renderStatusLine(raw []byte) {
 }
 
 // shellCommand wraps a status-line command string the way Claude Code itself
-// runs it: through the platform shell so pipelines / args work unchanged.
+// runs it, so a chained command behaves identically to when Claude invoked it
+// directly. On Windows that means Git Bash when installed (so `~` expands and
+// `.sh` scripts run) and PowerShell otherwise — NOT cmd, which would silently
+// break a Bash-style stashed command like `~/.claude/statusline.sh`.
 func shellCommand(command string) *exec.Cmd {
 	if runtime.GOOS == "windows" {
-		return exec.Command("cmd", "/c", command)
+		if bash := findGitBash(); bash != "" {
+			return exec.Command(bash, "-c", command)
+		}
+		return exec.Command("powershell", "-NoProfile", "-Command", command)
 	}
 	return exec.Command("sh", "-c", command)
 }

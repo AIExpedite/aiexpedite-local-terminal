@@ -10,10 +10,47 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 )
+
+// findGitBash mirrors how Claude Code decides the Windows status-line shell:
+// Git Bash when installed, PowerShell otherwise (per the Claude status-line
+// "Windows configuration" docs). Returns the path to Git Bash's bash.exe, or ""
+// when not found. Checks the standard Git-for-Windows install locations, then
+// derives it from `git` on PATH, then any non-WSL `bash` on PATH (WSL's
+// System32 bash has different path semantics and is intentionally excluded).
+func findGitBash() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	var candidates []string
+	for _, env := range []string{"ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"} {
+		if root := os.Getenv(env); root != "" {
+			candidates = append(candidates, filepath.Join(root, "Git", "bin", "bash.exe"))
+		}
+	}
+	if la := os.Getenv("LocalAppData"); la != "" {
+		candidates = append(candidates, filepath.Join(la, "Programs", "Git", "bin", "bash.exe"))
+	}
+	if gitPath, err := exec.LookPath("git"); err == nil {
+		// ...\Git\cmd\git.exe -> ...\Git\bin\bash.exe
+		gitDir := filepath.Dir(filepath.Dir(gitPath))
+		candidates = append(candidates, filepath.Join(gitDir, "bin", "bash.exe"))
+	}
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	if p, err := exec.LookPath("bash"); err == nil &&
+		!strings.Contains(strings.ToLower(p), `\windows\system32`) {
+		return p
+	}
+	return ""
+}
 
 // claudeStatusLine mirrors Claude Code's settings.json `statusLine` object.
 type claudeStatusLine struct {
@@ -41,13 +78,17 @@ func prevStatusLinePath() string {
 }
 
 // ourStatusLineCommand is the command string we install into Claude's settings:
-// the agent binary re-invoked with the hook subcommand, double-quoted so a path
-// with spaces (e.g. Program Files) survives the shell.
+// the agent binary re-invoked with the hook subcommand.
 //
-// On Windows, Claude runs the statusLine command through Git Bash when present
-// (else PowerShell). Git Bash treats Windows backslashes as escapes and the
-// docs recommend forward-slash paths, so we normalise separators — a quoted
-// forward-slash path runs correctly under Git Bash (the documented primary).
+// On Windows, Claude runs the command through Git Bash when installed, else
+// PowerShell — and no single literal works in both for a quoted/spaced path
+// (Git Bash chokes on a leading `&`; PowerShell treats a quoted path as a mere
+// string unless invoked with the `&` call operator). So we mirror Claude's own
+// Git-Bash detection and emit the matching form:
+//   - Git Bash:   "C:/path/exe" statusline-hook        (forward-slashed, quoted)
+//   - PowerShell: & "C:/path/exe" statusline-hook       (call operator)
+//
+// Re-evaluated on every startup, so adding/removing Git Bash self-corrects.
 func ourStatusLineCommand() (string, bool) {
 	exe, err := os.Executable()
 	if err != nil || exe == "" {
@@ -56,10 +97,14 @@ func ourStatusLineCommand() (string, bool) {
 	if abs, err := filepath.Abs(exe); err == nil {
 		exe = abs
 	}
-	if runtime.GOOS == "windows" {
-		exe = strings.ReplaceAll(exe, `\`, "/")
+	if runtime.GOOS != "windows" {
+		return `"` + exe + `" ` + statusLineHookArg, true
 	}
-	return `"` + exe + `" ` + statusLineHookArg, true
+	exe = strings.ReplaceAll(exe, `\`, "/")
+	if findGitBash() != "" {
+		return `"` + exe + `" ` + statusLineHookArg, true
+	}
+	return `& "` + exe + `" ` + statusLineHookArg, true
 }
 
 // isOurStatusLineCommand reports whether a configured command is our hook (any

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -137,12 +138,35 @@ func TestOurStatusLineCommand_NoBackslashesAndQuoted(t *testing.T) {
 	}
 	// On Windows the exe path must be forward-slashed so Claude's Git Bash
 	// invocation doesn't treat backslashes as escapes; elsewhere paths are
-	// already forward-slash. Either way: no backslashes, quoted, hook arg.
+	// already forward-slash. Either way: no backslashes, a quoted path, hook arg.
 	if strings.Contains(cmd, `\`) {
 		t.Errorf("command must not contain backslashes: %q", cmd)
 	}
-	if !strings.HasPrefix(cmd, `"`) || !strings.Contains(cmd, statusLineHookArg) {
-		t.Errorf("command should be a quoted path + hook arg: %q", cmd)
+	if !strings.Contains(cmd, `"`) || !strings.Contains(cmd, statusLineHookArg) {
+		t.Errorf("command should carry a quoted path + hook arg: %q", cmd)
+	}
+	// Windows: either the Git Bash form (`"path" hook`) or the PowerShell call-
+	// operator form (`& "path" hook`) — never an unprefixed quoted path that
+	// PowerShell would treat as a bare string.
+	if runtime.GOOS == "windows" && findGitBash() == "" && !strings.HasPrefix(cmd, `& "`) {
+		t.Errorf("PowerShell command must start with the & call operator: %q", cmd)
+	}
+}
+
+func TestShellCommand_UsesClaudeShellNotCmd(t *testing.T) {
+	cmd := shellCommand("echo hi")
+	base := strings.ToLower(filepath.Base(cmd.Path))
+	if runtime.GOOS == "windows" {
+		// cmd silently breaks Bash-style stashed commands (~ / .sh); we must use
+		// Git Bash or PowerShell, matching how Claude ran the original.
+		if strings.HasPrefix(base, "cmd") {
+			t.Errorf("must not chain via cmd: %s", cmd.Path)
+		}
+		if !strings.Contains(base, "bash") && !strings.Contains(base, "powershell") {
+			t.Errorf("expected git bash or powershell, got %s", cmd.Path)
+		}
+	} else if !strings.Contains(base, "sh") {
+		t.Errorf("expected sh, got %s", cmd.Path)
 	}
 }
 
