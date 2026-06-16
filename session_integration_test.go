@@ -210,6 +210,13 @@ func runMockCLI(mode string) {
 		fmt.Fprintln(os.Stderr, "[mock-grok-hang] running forever")
 		select {}
 
+	case "grok-acp-quick-exit":
+		// Exit immediately with status 0 — no stdout/stderr. Used by
+		// TestWaitForExit_StatusFlipsBeforeStreamDrain to drive the
+		// natural-exit path through waitForExit so the test can assert no
+		// spurious grok_acp_error is published for a clean exit.
+		os.Exit(0)
+
 	case "codex-appserver-burst":
 		// Emit a burst of JSON-RPC frames much larger than
 		// codexAppServerPublishQueueSize, then keep going to keep the

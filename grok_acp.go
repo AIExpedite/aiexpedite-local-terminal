@@ -846,10 +846,29 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishFunc) {
 	err := session.Process.Wait()
 
-	// Stop the deadline timer so a freshly-exited session can't double-fire
-	// the timeout grok_acp_error after waitForExit has already published
-	// grok_acp_ended. Stop is idempotent and safe whether the timer already
-	// fired, is queued, or was never armed.
+	// Flip status to "ended" and record exitCode BEFORE the stream-drain wait.
+	// The deadline timer's AfterFunc gates its publish+Kill on
+	// Status() == "ended"; if we postponed this flip until after drain
+	// (which can be slow under back-pressure), a timer that fires while we
+	// are draining would see status=="running", publish a spurious
+	// grok_acp_error AND Kill an already-exited PID. Both are observable
+	// upstream — the orchestrator would surface a phantom timeout error for
+	// a session that exited normally. Order is fixed: status flip → timer
+	// Stop → pipe close → stream drain. Stop() additionally elides a
+	// not-yet-fired timer, but it cannot interrupt an in-flight callback,
+	// which is why the status flip has to come first.
+	session.mu.Lock()
+	session.status = "ended"
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			session.exitCode = exitErr.ExitCode()
+		} else {
+			session.exitCode = -1
+		}
+	}
+	exit := session.exitCode
+	session.mu.Unlock()
+
 	if session.timeoutTimer != nil {
 		session.timeoutTimer.Stop()
 	}
@@ -863,18 +882,6 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 		fmt.Printf("%s[grok-acp] Stream drain timed out for %s%s\n",
 			colorYellow, session.ID, colorReset)
 	}
-
-	session.mu.Lock()
-	session.status = "ended"
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			session.exitCode = exitErr.ExitCode()
-		} else {
-			session.exitCode = -1
-		}
-	}
-	exit := session.exitCode
-	session.mu.Unlock()
 
 	seq := atomic.AddInt64(&session.seq, 1)
 
@@ -1152,17 +1159,57 @@ func validateGrokACPSendCwd(frame, resolvedRoot string) error {
 	if !filepath.IsAbs(cwd) {
 		return fmt.Errorf("session/new params.cwd must be an absolute path; got %q", cwd)
 	}
-	resolved, err := filepath.EvalSymlinks(cwd)
+	resolved, err := resolveCwdForContainment(cwd)
 	if err != nil {
-		// Fall back to the lexical path — a missing path still fails
-		// containment if it escapes the root, and we want to fail closed
-		// rather than let a non-existent escape path slip through.
-		resolved = filepath.Clean(cwd)
+		return fmt.Errorf("session/new params.cwd %q could not be safely resolved: %w", cwd, err)
 	}
 	if !pathInsideRoot(resolved, resolvedRoot) {
 		return fmt.Errorf("session/new params.cwd %q is outside the configured workspace root %q", resolved, resolvedRoot)
 	}
 	return nil
+}
+
+// resolveCwdForContainment resolves cwd through any symlinks so a later
+// containment check sees the OS's view, not the caller's lexical view.
+//
+// The honest case: cwd exists, EvalSymlinks succeeds, we return the
+// resolved path.
+//
+// The attack case: cwd is something like `$root/link/new` where `link` is a
+// symlink under the workspace pointing at `/outside` and `new` does not
+// exist yet. EvalSymlinks fails on the whole path because of the missing
+// tail, but `link` itself is a fully resolvable symlink that escapes — a
+// lexical-only fallback (`filepath.Clean(cwd)`) would accept `$root/link/new`
+// even though the OS will resolve session creation through `link` to
+// `/outside/new`. So when EvalSymlinks on the full path fails we walk up to
+// the deepest existing ancestor, resolve THAT, and reattach the unresolved
+// suffix. The containment check then runs against the OS-true prefix; any
+// escaping symlink on the existing portion of the path is caught.
+//
+// If no ancestor can be resolved we refuse the path outright — fail-closed
+// matches the rest of the desktop's workspace-safety stance.
+func resolveCwdForContainment(cwd string) (string, error) {
+	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
+		return resolved, nil
+	}
+	cleaned := filepath.Clean(cwd)
+	cur := cleaned
+	var suffix []string
+	for {
+		parent := filepath.Dir(cur)
+		// filepath.Dir returns the same path once we hit the volume root
+		// (`/`, `C:\`, etc.). At that point we have walked the whole path
+		// and nothing resolved — reject rather than silently accept.
+		if parent == cur {
+			return "", fmt.Errorf("no resolvable ancestor for %q", cleaned)
+		}
+		base := filepath.Base(cur)
+		suffix = append([]string{base}, suffix...)
+		cur = parent
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(append([]string{resolved}, suffix...)...), nil
+		}
+	}
 }
 
 // isGrokAuthOverrideArg reports whether a caller-supplied arg would let
