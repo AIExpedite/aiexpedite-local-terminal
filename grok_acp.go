@@ -854,7 +854,18 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 }
 
 func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishFunc) {
-	err := session.Process.Wait()
+	// Reap the child via os.Process.Wait, NOT exec.Cmd.Wait. Per the
+	// StdoutPipe docs, "it is incorrect to call Wait before all reads from
+	// the pipe have completed" — exec.Cmd.Wait closes the parent ends of
+	// StdoutPipe/StderrPipe the moment the child exits, which can truncate
+	// the final JSON-RPC frame still buffered in the bufio.Scanner. When
+	// grok writes a response and exits in quick succession, that final
+	// frame is the one the orchestrator needs to complete the in-flight
+	// ACP request; losing it leaves the request stuck. Splitting exit
+	// detection (Process.Wait) from pipe cleanup (manual Close below,
+	// gated on streamDone) preserves the final frame while keeping the
+	// status-flip race fix intact.
+	state, _ := session.Process.Process.Wait()
 
 	// Flip status to "ended" and record exitCode BEFORE the stream-drain wait.
 	// The deadline timer's AfterFunc gates its publish+Kill on
@@ -864,17 +875,15 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	// grok_acp_error AND Kill an already-exited PID. Both are observable
 	// upstream — the orchestrator would surface a phantom timeout error for
 	// a session that exited normally. Order is fixed: status flip → timer
-	// Stop → pipe close → stream drain. Stop() additionally elides a
+	// Stop → stream drain → pipe close. Stop() additionally elides a
 	// not-yet-fired timer, but it cannot interrupt an in-flight callback,
 	// which is why the status flip has to come first.
 	session.mu.Lock()
 	session.status = "ended"
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			session.exitCode = exitErr.ExitCode()
-		} else {
-			session.exitCode = -1
-		}
+	if state != nil {
+		session.exitCode = state.ExitCode()
+	} else {
+		session.exitCode = -1
 	}
 	exit := session.exitCode
 	session.mu.Unlock()
@@ -883,15 +892,30 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 		session.timeoutTimer.Stop()
 	}
 
-	session.Stdout.Close()
-	session.Stderr.Close()
-
+	// Drain the stdout/stderr scanner goroutines BEFORE closing pipes. The
+	// child's write ends are already closed (Process.Wait above only returns
+	// post-exit), so the scanners hit EOF naturally once they catch up on
+	// the OS pipe buffer — including the final JSON-RPC frame. If a scanner
+	// is wedged, the drain timeout falls through to a force-close that
+	// unblocks it; that path accepts the (rare) truncation because hanging
+	// this goroutine forever is strictly worse.
 	select {
 	case <-session.streamDone:
 	case <-time.After(grokACPStreamDrainTimeout):
-		fmt.Printf("%s[grok-acp] Stream drain timed out for %s%s\n",
+		fmt.Printf("%s[grok-acp] Stream drain timed out for %s — forcing pipe close%s\n",
 			colorYellow, session.ID, colorReset)
+		session.Stdout.Close()
+		session.Stderr.Close()
 	}
+
+	// Close the parent ends of every pipe. exec.Cmd.Wait would do this for
+	// us; since we bypassed it above we have to mop up ourselves to avoid
+	// leaking fds. closeStdin is idempotent (sync.Once), and Stdout/Stderr
+	// Close after a prior Close is documented as returning ErrClosed
+	// without side effects.
+	session.closeStdin()
+	session.Stdout.Close()
+	session.Stderr.Close()
 
 	seq := atomic.AddInt64(&session.seq, 1)
 

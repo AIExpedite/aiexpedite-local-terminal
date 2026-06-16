@@ -2179,3 +2179,111 @@ func TestWaitForExit_StatusFlipsBeforeStreamDrain(t *testing.T) {
 		t.Errorf("clean exit must unregister session; %d still active", m.ActiveCount())
 	}
 }
+
+// TestWaitForExit_FinalFrameSurvivesQuickExit pins the third-pass review
+// finding: when grok writes a final JSON-RPC frame and exits immediately,
+// the manager must NOT drop that frame. Before the fix, waitForExit called
+// exec.Cmd.Wait first, which auto-closed StdoutPipe the instant the child
+// exited and raced the bufio.Scanner drain — the terminal grok_acp_message
+// could be truncated, leaving the orchestrator's in-flight ACP request
+// stuck waiting on a response that never arrived. The fix splits exit
+// detection (os.Process.Wait) from pipe cleanup (manual Close after
+// streamDone) so the scanner is guaranteed to have seen the final frame
+// before any fd is closed in our process.
+func TestWaitForExit_FinalFrameSurvivesQuickExit(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("mock-binary path uses unix exec semantics")
+	}
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	tmpDir := t.TempDir()
+	mockPath := filepath.Join(tmpDir, "grok")
+	if err := copyTestBinary(testExe, mockPath); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "grok-acp-final-frame-and-exit")
+
+	// Run the scenario multiple times — the race that this test guards
+	// against is timing-dependent (microseconds between child exit and
+	// pipe close), so one pass is not enough to reproduce reliably on a
+	// noisy CI host. 25 passes is the same dial codex_appserver_test.go
+	// uses for similar lifecycle races.
+	const iterations = 25
+	for i := 0; i < iterations; i++ {
+		m := NewGrokACPManager()
+		id := fmt.Sprintf("grok-final-frame-test-%d-%d", time.Now().UnixNano(), i)
+
+		var mu sync.Mutex
+		var captured []resultMsg
+		publishFn := func(res resultMsg) {
+			mu.Lock()
+			defer mu.Unlock()
+			captured = append(captured, res)
+		}
+		if err := m.Start(id, tmpDir, nil, "ws", "uid", GrokStartOptions{}, publishFn); err != nil {
+			t.Fatalf("iter %d: Start: %v", i, err)
+		}
+
+		// Wait up to 10 s for the terminal frame; if we never see it the
+		// session is stuck and the test fails the timing assertion below.
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			mu.Lock()
+			var sawEnded bool
+			for _, msg := range captured {
+				if msg.Type == "grok_acp_ended" {
+					sawEnded = true
+				}
+			}
+			mu.Unlock()
+			if sawEnded {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		mu.Lock()
+		var sawFinalFrame bool
+		var sawEnded bool
+		var sawError bool
+		var orderOK bool
+		for idx, msg := range captured {
+			if msg.Type == "grok_acp_message" && strings.Contains(msg.Output, `"stopReason":"end_turn"`) {
+				sawFinalFrame = true
+				// final JSON-RPC frame must precede grok_acp_ended
+				for _, after := range captured[idx+1:] {
+					if after.Type == "grok_acp_ended" {
+						orderOK = true
+						break
+					}
+				}
+			}
+			if msg.Type == "grok_acp_ended" {
+				sawEnded = true
+			}
+			if msg.Type == "grok_acp_error" {
+				sawError = true
+			}
+		}
+		mu.Unlock()
+
+		if !sawEnded {
+			t.Fatalf("iter %d: expected grok_acp_ended; got types=%v", i, extractTypes(captured))
+		}
+		if sawError {
+			t.Fatalf("iter %d: clean quick-exit must not publish grok_acp_error; got types=%v",
+				i, extractTypes(captured))
+		}
+		if !sawFinalFrame {
+			t.Fatalf("iter %d: terminal grok_acp_message lost — Wait truncated the pipe before drain; got types=%v",
+				i, extractTypes(captured))
+		}
+		if !orderOK {
+			t.Fatalf("iter %d: terminal grok_acp_message must precede grok_acp_ended; got types=%v",
+				i, extractTypes(captured))
+		}
+	}
+}

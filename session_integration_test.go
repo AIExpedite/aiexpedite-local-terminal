@@ -217,6 +217,15 @@ func runMockCLI(mode string) {
 		// spurious grok_acp_error is published for a clean exit.
 		os.Exit(0)
 
+	case "grok-acp-final-frame-and-exit":
+		// Emit a single JSON-RPC response frame and exit immediately. Used by
+		// TestWaitForExit_FinalFrameSurvivesQuickExit to assert that the
+		// manager does NOT truncate the last frame at the moment of child
+		// exit — exec.Cmd.Wait's auto-close of StdoutPipe used to race with
+		// the scanner goroutine's drain, dropping grok's terminal response.
+		fmt.Println(`{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`)
+		os.Exit(0)
+
 	case "codex-appserver-burst":
 		// Emit a burst of JSON-RPC frames much larger than
 		// codexAppServerPublishQueueSize, then keep going to keep the
