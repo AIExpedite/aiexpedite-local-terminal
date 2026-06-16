@@ -1049,6 +1049,20 @@ func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) 
 		// neutralize the `xai.*` aliases the design doc enumerates so the
 		// orchestrator's `cached_token` selection is the only auth surface left.
 		args = append(args, grokAuthNeutralizingConfigArgs()...)
+		// Per-model-scope neutralizers: xAI's enterprise docs document
+		// persistent API-key credentials as model-scoped TOML sections
+		// (`[model.<scope>] api_key = "..."`) that take precedence over the
+		// active `cached_token` for that model. The static neutralizer slice
+		// above clears the top-level and the documented `model.grok-build`
+		// scope, but a caller-supplied `--model <other-scope>` would still
+		// resolve to whatever credential `[model.<other-scope>]` holds in
+		// `~/.grok/config.toml`. Scan the sanitised extras for `--model`
+		// selectors and emit matching `--config model.<scope>.{api_key,env_key}=`
+		// clears so the cached-token posture survives a non-default model
+		// selection. Mirrors the argv-side gate in `isGrokAuthConfigKV`,
+		// which already matches any `model.<scope>.{api_key,env_key}` shape
+		// supplied via `-c|--config`.
+		args = append(args, grokModelScopeAuthNeutralizingConfigArgs(extractGrokModelScopes(sanitized))...)
 	}
 	if !allowAlwaysApprove && !grokExtraArgsPinPermissionMode(sanitized) {
 		args = append(args, "--permission-mode", "default")
@@ -1084,6 +1098,104 @@ func grokAuthNeutralizingConfigArgs() []string {
 		"--config", "xai.api_key=",
 		"--config", "xai.env_key=",
 	}
+}
+
+// grokModelScopeAuthNeutralizingConfigArgs returns `--config
+// model.<scope>.{api_key,env_key}=` clears for each caller-selected model
+// scope. Used by buildGrokACPArgs when EnableGrokAPIKeyFallback is false so
+// a `--model <scope>` that resolves to a `[model.<scope>] api_key = "..."`
+// section in `~/.grok/config.toml` cannot silently reroute the launch off
+// the cached-token posture — xAI documents per-model API-key credentials as
+// taking precedence over the active session token, and the static slice in
+// grokAuthNeutralizingConfigArgs only covers the top-level and documented
+// `model.grok-build` scope. Scopes are filtered through isSafeGrokModelScope
+// to keep the emitted `--config` arg shape sound; an unsafe-looking name
+// is dropped here and the launch falls back to the static neutralizers.
+func grokModelScopeAuthNeutralizingConfigArgs(scopes []string) []string {
+	if len(scopes) == 0 {
+		return nil
+	}
+	args := make([]string, 0, 4*len(scopes))
+	for _, scope := range scopes {
+		// `grok-build` is already in the static slice; skipping it here keeps
+		// the emitted argv free of duplicate clears for the documented scope.
+		if scope == "" || scope == "grok-build" {
+			continue
+		}
+		if !isSafeGrokModelScope(scope) {
+			continue
+		}
+		args = append(args,
+			"--config", "model."+scope+".api_key=",
+			"--config", "model."+scope+".env_key=",
+		)
+	}
+	return args
+}
+
+// extractGrokModelScopes returns the unique model-scope names selected via
+// `--model <name>` / `--model=<name>` flags in the sanitised argv. Both
+// forms are recognised so the orchestrator can pass either style; values
+// that fail isSafeGrokModelScope are skipped here rather than upstream so
+// the safety filter and neutralizer emission stay in lockstep. Caller
+// supplies args after sanitizeGrokACPExtraArgs has already stripped
+// subcommands, `--`, and other tokens that would otherwise be mis-read as
+// a model selector.
+func extractGrokModelScopes(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	var scopes []string
+	seen := map[string]bool{}
+	keepNext := false
+	for _, a := range args {
+		if keepNext {
+			keepNext = false
+			if !seen[a] && isSafeGrokModelScope(a) {
+				seen[a] = true
+				scopes = append(scopes, a)
+			}
+			continue
+		}
+		lower := strings.ToLower(a)
+		if lower == "--model" {
+			keepNext = true
+			continue
+		}
+		if strings.HasPrefix(lower, "--model=") {
+			v := a[len("--model="):]
+			if !seen[v] && isSafeGrokModelScope(v) {
+				seen[v] = true
+				scopes = append(scopes, v)
+			}
+		}
+	}
+	return scopes
+}
+
+// isSafeGrokModelScope reports whether `name` is a conservative model
+// identifier safe to splice into a `--config model.<name>.api_key=`
+// neutralizer. Allowed characters are [A-Za-z0-9_-]; periods would change
+// the dotted-path the neutralizer targets, `=` would split the config arg
+// into multiple kvs, and whitespace would corrupt the TOML key form.
+// Unknown shapes fall back to the static top-level/`model.grok-build`/
+// `xai.*` clears in grokAuthNeutralizingConfigArgs — fail-closed when in
+// doubt.
+func isSafeGrokModelScope(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // grokPolicyNeutralizingConfigArgs returns the `--config <key>=` overrides
