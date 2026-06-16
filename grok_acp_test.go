@@ -1408,6 +1408,123 @@ func TestSanitizeGrokACPExtraArgs_PreservesApprovalConfigWhenEnabled(t *testing.
 	}
 }
 
+// TestBuildGrokACPArgs_StripsPermissionModeBypassByDefault pins the gate
+// against the xAI enterprise-docs alternative to `--always-approve`:
+// `--permission-mode bypassPermissions`. Both inline equals-form and
+// separate-value form (and the underscore alias) MUST be dropped when
+// Config.EnableGrokAlwaysApprove is false. Non-bypass selectors such as
+// `ask` are deliberately preserved so callers can still pin the
+// conservative default explicitly.
+func TestBuildGrokACPArgs_StripsPermissionModeBypassByDefault(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"strips_permission_mode_bypass_separate",
+			[]string{"--permission-mode", "bypassPermissions", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"strips_permission_mode_bypass_equals",
+			[]string{"--permission-mode=bypassPermissions", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"strips_underscore_alias",
+			[]string{"--permission_mode", "bypassPermissions"},
+			[]string{"agent", "stdio", "--no-auto-update"},
+		},
+		{
+			"strips_bare_bypass_synonym",
+			[]string{"--permission-mode", "bypass"},
+			[]string{"agent", "stdio", "--no-auto-update"},
+		},
+		{
+			"strips_auto_synonym_equals",
+			[]string{"--permission-mode=auto"},
+			[]string{"agent", "stdio", "--no-auto-update"},
+		},
+		{
+			"keeps_permission_mode_ask_separate",
+			[]string{"--permission-mode", "ask", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask", "--model", "grok-2"},
+		},
+		{
+			"keeps_permission_mode_ask_equals",
+			[]string{"--permission-mode=ask"},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode=ask"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildGrokACPArgs(c.args, false, false)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("buildGrokACPArgs(allowAlwaysApprove=false) permission-mode gate = %#v, want %#v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestBuildGrokACPArgs_PreservesPermissionModeBypassWhenEnabled is the
+// inverse: once the workspace has explicitly opted into autonomous
+// execution via Config.EnableGrokAlwaysApprove=true, `--permission-mode
+// bypassPermissions` flows through verbatim alongside `--always-approve`.
+func TestBuildGrokACPArgs_PreservesPermissionModeBypassWhenEnabled(t *testing.T) {
+	in := []string{"--permission-mode", "bypassPermissions", "--model", "grok-2"}
+	got := buildGrokACPArgs(in, false, true)
+	want := []string{"agent", "stdio", "--no-auto-update", "--permission-mode", "bypassPermissions", "--model", "grok-2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildGrokACPArgs(allowAlwaysApprove=true) must preserve --permission-mode bypassPermissions; got %#v, want %#v", got, want)
+	}
+}
+
+// TestSanitizeGrokACPExtraArgs_StripsPermissionModeConfigOverrides pins the
+// gate against the `-c|--config` form of the same bypass: a signed
+// grok_acp_start could otherwise route `approval.permission_mode=
+// bypassPermissions` through Grok's config knob and reach the same state
+// the explicit-flag strip blocks.
+func TestSanitizeGrokACPExtraArgs_StripsPermissionModeConfigOverrides(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"strips_config_permission_mode_bypass_separate",
+			[]string{"--config", "approval.permission_mode=bypassPermissions", "--model", "grok-2"},
+			[]string{"--model", "grok-2"},
+		},
+		{
+			"strips_short_config_permission_mode_bypass",
+			[]string{"-c", "permission_mode=bypassPermissions"},
+			[]string{},
+		},
+		{
+			"strips_inline_equals_form",
+			[]string{"--config=approval.permission_mode=bypass"},
+			[]string{},
+		},
+		{
+			"keeps_config_permission_mode_ask",
+			[]string{"--config", "approval.permission_mode=ask", "--model", "grok-2"},
+			[]string{"--config", "approval.permission_mode=ask", "--model", "grok-2"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := sanitizeGrokACPExtraArgs(c.args, false, false)
+			if len(got) == 0 && len(c.want) == 0 {
+				return
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("sanitizeGrokACPExtraArgs(allowAlwaysApprove=false) permission-mode config gate = %#v, want %#v", got, c.want)
+			}
+		})
+	}
+}
+
 // TestValidateGrokACPSendCwd_RejectsEscapingSessionNew pins the in-protocol
 // containment check Send applies to `session/new` frames. Without this a
 // later signed grok_acp_send could point Grok at a path outside the

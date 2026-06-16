@@ -947,12 +947,15 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 // default path.
 //
 // When allowAlwaysApprove is false the sanitiser additionally drops any
-// caller-supplied `--always-approve` / `--auto-approve` flags AND the
-// equivalent `-c approval.mode=always|auto` / `-c tools.always_approve=true`
-// / `-c tools.auto_approve=true` config overrides. The feature brief makes
-// approval behaviour conservative by default — autonomous tool execution
-// has to be a per-workspace opt-in (Config.EnableGrokAlwaysApprove), not
-// something a signed `grok_acp_start` can flip via extra args.
+// caller-supplied `--always-approve` / `--auto-approve` flags, the
+// `--permission-mode bypassPermissions` selector (xAI's enterprise-docs
+// equivalent for skipping per-tool prompts), AND the equivalent
+// `-c approval.mode=always|auto` / `-c tools.always_approve=true` /
+// `-c tools.auto_approve=true` / `-c approval.permission_mode=bypassPermissions`
+// config overrides. The feature brief makes approval behaviour conservative
+// by default — autonomous tool execution has to be a per-workspace opt-in
+// (Config.EnableGrokAlwaysApprove), not something a signed `grok_acp_start`
+// can flip via extra args.
 func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) []string {
 	args := []string{"agent", "stdio", "--no-auto-update"}
 	args = append(args, sanitizeGrokACPExtraArgs(extraArgs, allowAPIKey, allowAlwaysApprove)...)
@@ -967,7 +970,8 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprov
 	// the codex manager's valuedFlags map.
 	valuedFlags := map[string]bool{
 		"-c": true, "--config": true,
-		"--model": true,
+		"--model":           true,
+		"--permission-mode": true, "--permission_mode": true,
 	}
 	cleaned := make([]string, 0, len(extraArgs))
 	keepNext := false
@@ -1012,6 +1016,23 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprov
 			// because re-admitting `--always-approve=false` here would let a
 			// caller toggle the value back on via subsequent flag ordering.
 			continue
+		}
+		if !allowAlwaysApprove && isGrokPermissionModeArg(lower) {
+			// `--permission-mode bypassPermissions` is xAI's documented escape
+			// hatch for the per-tool prompt gate (enterprise docs, ACP
+			// scripting mode). Inline equals-form (`--permission-mode=
+			// bypassPermissions`) is dropped here once both halves are
+			// visible in a single token; non-bypass values like `ask` fall
+			// through unchanged. Separate-value form (`--permission-mode
+			// bypassPermissions`) is admitted speculatively via the
+			// valuedFlags branch below and the trailing
+			// stripGrokPermissionModePairs sweep drops the pair only when
+			// the value resolves to a bypass selector.
+			if eq := strings.IndexByte(a, '='); eq >= 0 {
+				if isGrokPermissionModeBypassValue(a[eq+1:]) {
+					continue
+				}
+			}
 		}
 		// Inline -c/--config form: `--config=auth.method=xai.api_key` or
 		// `--config=approval.mode=always`. Without inspection these would
@@ -1058,6 +1079,7 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprov
 	}
 	if !allowAlwaysApprove {
 		cleaned = stripGrokApprovalConfigPairs(cleaned)
+		cleaned = stripGrokPermissionModePairs(cleaned)
 	}
 	return cleaned
 }
@@ -1185,7 +1207,65 @@ func isGrokApprovalConfigKV(value string) bool {
 			return true
 		}
 	}
+	// Config-form of `--permission-mode bypassPermissions` (the xAI enterprise
+	// docs name `bypassPermissions` explicitly; common variants share intent).
+	// `approval.permission_mode=ask` is the conservative default and is
+	// deliberately left intact.
+	if (key == "approval.permission_mode" || key == "permission_mode") && isGrokPermissionModeBypassValue(val) {
+		return true
+	}
 	return false
+}
+
+// isGrokPermissionModeArg reports whether `lower` is the `--permission-mode`
+// flag (bare or equals form). xAI's enterprise docs surface this flag as a
+// permission gate selector that, when set to `bypassPermissions`, disables
+// per-tool prompts — i.e. the same intent as `--always-approve` but routed
+// through a different surface. Recognised here so the always-approve gate
+// can fail closed on it; benign selectors like `ask` are left intact.
+func isGrokPermissionModeArg(lower string) bool {
+	return lower == "--permission-mode" || lower == "--permission_mode" ||
+		strings.HasPrefix(lower, "--permission-mode=") || strings.HasPrefix(lower, "--permission_mode=")
+}
+
+// isGrokPermissionModeBypassValue reports whether a `--permission-mode` value
+// would let the caller bypass per-tool permission prompts. `bypassPermissions`
+// is the canonical name from xAI's enterprise docs; the bare `bypass`,
+// `auto*`, and `always*` synonyms share the same intent and are gated to
+// fail closed too. Case- and separator-insensitive.
+func isGrokPermissionModeBypassValue(value string) bool {
+	v := strings.ToLower(strings.TrimSpace(value))
+	switch v {
+	case "bypasspermissions", "bypass-permissions", "bypass_permissions", "bypass",
+		"auto", "auto-approve", "auto_approve",
+		"always", "always-approve", "always_approve":
+		return true
+	}
+	return false
+}
+
+// stripGrokPermissionModePairs removes `--permission-mode <bypass-value>`
+// pairs (separate-value form) that survived sanitizeGrokACPExtraArgs' main
+// loop. The loop admits the pair speculatively via the valuedFlags branch
+// because the bypass decision needs both tokens; this sweep drops it only
+// when the value resolves to a bypass selector. Non-bypass values such as
+// `ask` flow through unchanged so callers can still pin the conservative
+// default explicitly.
+func stripGrokPermissionModePairs(in []string) []string {
+	out := make([]string, 0, len(in))
+	i := 0
+	for i < len(in) {
+		lower := strings.ToLower(in[i])
+		if (lower == "--permission-mode" || lower == "--permission_mode") && i+1 < len(in) {
+			if isGrokPermissionModeBypassValue(in[i+1]) {
+				i += 2
+				continue
+			}
+		}
+		out = append(out, in[i])
+		i++
+	}
+	return out
 }
 
 // stripGrokApprovalConfigPairs removes `-c|--config <approval-kv>` pairs
