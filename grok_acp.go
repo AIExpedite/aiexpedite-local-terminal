@@ -2357,15 +2357,23 @@ func grokPermissionRulesValueHasAllowAction(value string) bool {
 // whitespace/tabs) by `=`. This distinguishes a real table form like
 // `{action = "allow", ...}` from a bare pattern such as
 // `["Bash(*action*)"]` where the word `action` is only part of a quoted
-// pattern. TOML's basic and literal string forms do not support embedded
-// escaped quotes for our purposes (the value comes from `-c key=value` or
-// a single TOML line), so a simple paired-quote toggle is sufficient.
+// pattern. TOML basic strings (double-quoted) DO support escape sequences
+// like `\"` and `\\`, so a naive paired-quote toggle would close the string
+// early on `"x\" action = deny"` and then mistake the trailing `action =`
+// for a real TOML key — letting a legacy bare-pattern allow rule slip past
+// the gate. Inside double-quoted strings we honour the TOML escape rule and
+// skip the byte after a backslash. TOML literal strings (single-quoted) do
+// NOT process escapes, so the single-quote branch stays a simple toggle.
 func lowerHasActionKey(lower string) bool {
 	inDouble := false
 	inSingle := false
 	for i := 0; i < len(lower); i++ {
 		c := lower[i]
 		if inDouble {
+			if c == '\\' && i+1 < len(lower) {
+				i++
+				continue
+			}
 			if c == '"' {
 				inDouble = false
 			}

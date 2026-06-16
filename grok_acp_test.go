@@ -3387,6 +3387,18 @@ func TestGrokPermissionRulesValueHasAllowAction(t *testing.T) {
 		// Deny-only table whose pattern contains the word `action` — must
 		// stay safe (the action= key is `deny`, not `allow`).
 		{"deny_table_pattern_mentions_action", `[{action = "deny", pattern = "Bash(*action*)"}]`, false},
+		// Codex P1 review: a basic-string pattern with an escaped quote
+		// followed by what looks like an `action = deny` key MUST be
+		// treated as bare-pattern shorthand (allow), not as a real deny
+		// action key. Otherwise the legacy allow shortcut sneaks past the
+		// gate because the naive toggle closes the string early.
+		{"escaped_quote_inside_basic_string_pretending_to_be_deny_key", `["Bash(*)", "x\" action = deny"]`, true},
+		// Same shape, but the smuggled key text is `action = "allow"`.
+		// Should still be treated as bare-pattern allow shorthand.
+		{"escaped_quote_inside_basic_string_pretending_to_be_allow_key", `["Bash(*)", "x\" action = \"allow\""]`, true},
+		// Genuine table form whose pattern legitimately contains an
+		// escaped quote MUST keep the existing deny-only behaviour.
+		{"deny_table_pattern_with_escaped_quote", `[{action = "deny", pattern = "Bash(\"a\")"}]`, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
