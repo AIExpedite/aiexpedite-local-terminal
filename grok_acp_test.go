@@ -113,6 +113,43 @@ func TestBuildGrokACPArgs_NoAutoUpdateDedupedAndAutoUpdateStripped(t *testing.T)
 	}
 }
 
+// TestBuildGrokACPArgs_StripsCwdOverride pins the cwd-override gate. Grok's
+// headless docs document `--cwd <PATH>` as setting the working directory,
+// which would override the `proc.Dir` value Start just validated against
+// WorkspaceRoot. The sanitizer must strip the flag in both separate-value
+// and equals forms so a signed `grok_acp_start` can't escape containment.
+func TestBuildGrokACPArgs_StripsCwdOverride(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"separate_value_cwd_dropped_with_value",
+			[]string{"--cwd", "/tmp/other", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"equals_form_cwd_dropped",
+			[]string{"--cwd=/tmp/other", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2"},
+		},
+		{
+			"case_insensitive_cwd_dropped",
+			[]string{"--CWD", "/tmp/other"},
+			[]string{"agent", "stdio", "--no-auto-update"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildGrokACPArgs(c.args, false, false)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("buildGrokACPArgs failed to strip --cwd: got %#v, want %#v", got, c.want)
+			}
+		})
+	}
+}
+
 // TestBuildGrokACPArgs_PreservesValueOfValuedFlag pins the regression where a
 // value that happens to spell a stripped subcommand (-c agent=true) was
 // silently swallowed by the entry-token strip.

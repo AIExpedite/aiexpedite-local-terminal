@@ -999,6 +999,19 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprov
 			// ACP handshake on stdout.
 			continue
 		}
+		// xAI's headless docs document `--cwd <PATH>` as setting Grok's
+		// working directory, which would override the `proc.Dir` value Start
+		// just validated against WorkspaceRoot. Drop the flag in both forms
+		// (separate-value and `--cwd=...`) so a signed `grok_acp_start` can't
+		// escape the symlink/containment checks via an extra-args side door —
+		// the manager already pins the child to the validated cwd via proc.Dir.
+		if lower == "--cwd" {
+			skipNext = true
+			continue
+		}
+		if strings.HasPrefix(lower, "--cwd=") {
+			continue
+		}
 		if !allowAPIKey && isGrokAuthOverrideArg(lower) {
 			// Strip BOTH separate-value (--api-key foo) AND equals-form
 			// (--api-key=foo) flags. For separate-value form we also skip
