@@ -164,6 +164,65 @@ func TestBuildGrokACPArgs_PreservesAuthOverridesWhenFallbackEnabled(t *testing.T
 	}
 }
 
+// TestRedactGrokACPArgsForLog pins the startup-banner redaction: when the
+// API-key fallback is enabled and buildGrokACPArgs preserves --api-key{,-env}
+// / --auth{,-method} verbatim, the value MUST be replaced with [REDACTED]
+// before the args are logged — covering both equals-form (`--api-key=xai-...`)
+// and separate-value form (`--api-key xai-...`). Non-auth args and the flag
+// names themselves stay intact so the log is still diagnostic.
+func TestRedactGrokACPArgsForLog(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"masks_api_key_separate_value",
+			[]string{"agent", "stdio", "--api-key", "xai-abcdef", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--api-key", "[REDACTED]", "--model", "grok-2"},
+		},
+		{
+			"masks_api_key_equals_form",
+			[]string{"agent", "stdio", "--api-key=xai-abcdef", "--model", "grok-2"},
+			[]string{"agent", "stdio", "--api-key=[REDACTED]", "--model", "grok-2"},
+		},
+		{
+			"masks_api_key_env_separate_value",
+			[]string{"agent", "stdio", "--api-key-env", "OTHER_KEY_VAR"},
+			[]string{"agent", "stdio", "--api-key-env", "[REDACTED]"},
+		},
+		{
+			"masks_auth_method_value",
+			[]string{"agent", "stdio", "--auth", "xai.api_key"},
+			[]string{"agent", "stdio", "--auth", "[REDACTED]"},
+		},
+		{
+			"no_op_when_no_auth_flags",
+			[]string{"agent", "stdio", "--model", "grok-2-fast"},
+			[]string{"agent", "stdio", "--model", "grok-2-fast"},
+		},
+		{
+			"flag_at_end_without_value_is_left_alone",
+			[]string{"agent", "stdio", "--api-key"},
+			[]string{"agent", "stdio", "--api-key"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := redactGrokACPArgsForLog(c.args)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("redactGrokACPArgsForLog: got %#v, want %#v", got, c.want)
+			}
+			// Defence in depth: whatever the structure, the raw secret value
+			// must never appear in the joined log line.
+			joined := strings.Join(got, " ")
+			if strings.Contains(joined, "xai-abcdef") {
+				t.Fatalf("redacted output still contains raw key: %q", joined)
+			}
+		})
+	}
+}
+
 /* --------------------------------------------------------------------------
    env sanitizer
    -------------------------------------------------------------------------- */

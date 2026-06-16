@@ -104,7 +104,7 @@ func selectScanBackend() scanBackend {
 // and doesn't need to assume time.Local matches the system timezone.
 func scanViaPowerShell() []ProcessInfo {
 	script := `$ErrorActionPreference = 'SilentlyContinue';` +
-		` Get-CimInstance Win32_Process -Filter "Name='claude.exe' OR Name='codex.exe' OR Name='gemini.exe' OR Name='agy.exe'"` +
+		` Get-CimInstance Win32_Process -Filter "Name='claude.exe' OR Name='codex.exe' OR Name='gemini.exe' OR Name='agy.exe' OR Name='grok.exe'"` +
 		` | Select-Object @{Name='Name';Expression={$_.Name}},` +
 		` @{Name='ProcessId';Expression={$_.ProcessId}},` +
 		` @{Name='ParentProcessId';Expression={$_.ParentProcessId}},` +
@@ -126,7 +126,7 @@ func scanViaPowerShell() []ProcessInfo {
 // scanViaWMIC queries via the legacy `wmic` tool. Kept as a fallback for Windows
 // versions where PowerShell is unavailable.
 func scanViaWMIC() []ProcessInfo {
-	whereClause := `name="claude.exe" or name="codex.exe" or name="gemini.exe" or name="agy.exe"`
+	whereClause := `name="claude.exe" or name="codex.exe" or name="gemini.exe" or name="agy.exe" or name="grok.exe"`
 	args := []string{
 		"process",
 		"where", whereClause,

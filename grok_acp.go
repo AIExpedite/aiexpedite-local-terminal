@@ -296,7 +296,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	args := buildGrokACPArgs(extraArgs, opts.AllowAPIKeyFallback)
 
 	fmt.Printf("%s[grok-acp] Starting session %s: %s %s%s\n",
-		colorCyan, id, executable, strings.Join(args, " "), colorReset)
+		colorCyan, id, executable, strings.Join(redactGrokACPArgsForLog(args), " "), colorReset)
 
 	proc := exec.Command(executable, args...)
 	hideWindow(proc)
@@ -941,6 +941,39 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey bool) []string {
 		cleaned = append(cleaned, a)
 	}
 	return cleaned
+}
+
+// redactGrokACPArgsForLog masks credential-bearing values before the startup
+// banner is printed. Necessary because when EnableGrokAPIKeyFallback is true,
+// buildGrokACPArgs deliberately preserves `--api-key{,-env}` / `--auth{,-method}`
+// verbatim — without this the next-arg value (e.g. `xai-...`) would leak into
+// stdout/log files unlike the normal shell-command path which routes through
+// redactCommandForLog. Equals-form values are masked inline; separate-value
+// form masks the following token. Output is passed through redactArgs so any
+// other secret pattern (bearer tokens, AWS keys, etc.) the per-arg regex
+// recognises in caller-supplied extra args is also caught.
+func redactGrokACPArgsForLog(args []string) []string {
+	out := make([]string, len(args))
+	maskNext := false
+	for i, a := range args {
+		if maskNext {
+			out[i] = "[REDACTED]"
+			maskNext = false
+			continue
+		}
+		lower := strings.ToLower(a)
+		if isGrokAuthOverrideArg(lower) {
+			if eq := strings.IndexByte(a, '='); eq >= 0 {
+				out[i] = a[:eq+1] + "[REDACTED]"
+			} else {
+				out[i] = a
+				maskNext = true
+			}
+			continue
+		}
+		out[i] = a
+	}
+	return redactArgs(out)
 }
 
 // isGrokAuthOverrideArg reports whether a caller-supplied arg would let
