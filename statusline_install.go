@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 )
@@ -99,15 +100,26 @@ func prevStatusLinePath() string {
 // ourStatusLineCommand is the command string we install into Claude's settings:
 // the agent binary re-invoked with the hook subcommand.
 //
+// We PIN the cache + stash paths via `AIEXPEDITE_CLAUDE_RL_CACHE` /
+// `AIEXPEDITE_CLAUDE_STATUSLINE_PREV` in the command itself so the hook resolves
+// them from the same `GetConfigDir()` the installer used — otherwise a Linux
+// box where the agent starts at login without the user's shell
+// `XDG_CONFIG_HOME` but Claude is launched from a shell that sets it would
+// write `claude_rate_limits.json` and look for the stashed previous status line
+// under a different config dir than the Agents tab and installer, so
+// interactive usage would stay stale and a chained custom status line would
+// silently disappear.
+//
 // On Windows, Claude runs the command through Git Bash when installed, else
 // PowerShell — and no single literal works in both for a quoted/spaced path
 // (Git Bash chokes on a leading `&`; PowerShell treats a quoted path as a mere
 // string unless invoked with the `&` call operator). So we mirror Claude's own
 // Git-Bash detection and emit the matching form:
-//   - Git Bash:   "C:/path/exe" statusline-hook        (forward-slashed, quoted)
-//   - PowerShell: & "C:/path/exe" statusline-hook       (call operator)
+//   - Git Bash:   KEY='val' KEY2='val2' "C:/path/exe" statusline-hook
+//   - PowerShell: $env:KEY="val"; $env:KEY2="val2"; & "C:/path/exe" statusline-hook
 //
-// Re-evaluated on every startup, so adding/removing Git Bash self-corrects.
+// Re-evaluated on every startup, so adding/removing Git Bash — or relocating
+// the data dir — self-corrects on the next agent boot.
 func ourStatusLineCommand() (string, bool) {
 	exe, err := os.Executable()
 	if err != nil || exe == "" {
@@ -116,27 +128,84 @@ func ourStatusLineCommand() (string, bool) {
 	if abs, err := filepath.Abs(exe); err == nil {
 		exe = abs
 	}
-	if runtime.GOOS != "windows" {
-		return `"` + exe + `" ` + statusLineHookArg, true
+	cachePath := claudeRateLimitCachePath()
+	prevPath := prevStatusLinePath()
+	if runtime.GOOS == "windows" {
+		// Forward-slash everything we embed: the exe path lives inside double
+		// quotes where Git Bash treats `\` as an escape, and the env values —
+		// even though we single-quote them — are simpler to reason about when
+		// the whole command is slash-uniform.
+		exe = strings.ReplaceAll(exe, `\`, "/")
+		cachePath = strings.ReplaceAll(cachePath, `\`, "/")
+		prevPath = strings.ReplaceAll(prevPath, `\`, "/")
+		if findGitBash() != "" {
+			return statusLinePosixCommand(exe, cachePath, prevPath), true
+		}
+		return statusLinePowerShellCommand(exe, cachePath, prevPath), true
 	}
-	exe = strings.ReplaceAll(exe, `\`, "/")
-	if findGitBash() != "" {
-		return `"` + exe + `" ` + statusLineHookArg, true
-	}
-	return `& "` + exe + `" ` + statusLineHookArg, true
+	return statusLinePosixCommand(exe, cachePath, prevPath), true
 }
 
+// statusLinePosixCommand emits the sh/bash form Claude uses on POSIX and on
+// Windows when Git Bash is installed: per-invocation env assignments followed
+// by the quoted exe + hook arg.
+func statusLinePosixCommand(exe, cachePath, prevPath string) string {
+	return "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(cachePath) +
+		" AIEXPEDITE_CLAUDE_STATUSLINE_PREV=" + posixSingleQuote(prevPath) +
+		` "` + exe + `" ` + statusLineHookArg
+}
+
+// statusLinePowerShellCommand emits the PowerShell form Claude uses on Windows
+// when Git Bash is absent: `$env:` assignments separated by `;`, then the `&`
+// call operator on the quoted exe + hook arg.
+func statusLinePowerShellCommand(exe, cachePath, prevPath string) string {
+	return "$env:AIEXPEDITE_CLAUDE_RL_CACHE=" + powerShellDoubleQuote(cachePath) +
+		"; $env:AIEXPEDITE_CLAUDE_STATUSLINE_PREV=" + powerShellDoubleQuote(prevPath) +
+		`; & "` + exe + `" ` + statusLineHookArg
+}
+
+// posixSingleQuote wraps s in single quotes for sh/bash. A single quote inside
+// the value is escaped via the standard close/escape/reopen trick (`'\''`),
+// so paths under e.g. `/Users/dan's mac/...` survive.
+func posixSingleQuote(s string) string {
+	return `'` + strings.ReplaceAll(s, `'`, `'\''`) + `'`
+}
+
+// powerShellDoubleQuote wraps s in double quotes for PowerShell. The two
+// expansion-time metachars are `"` (escape by doubling) and `$` (escape with a
+// backtick), and the backtick itself is the escape character so it must be
+// doubled first.
+func powerShellDoubleQuote(s string) string {
+	s = strings.ReplaceAll(s, "`", "``")
+	s = strings.ReplaceAll(s, `"`, `""`)
+	s = strings.ReplaceAll(s, `$`, "`$")
+	return `"` + s + `"`
+}
+
+// statusLineEnvPreambleRe captures the per-invocation env preamble we install
+// before the hook in either the POSIX (`KEY='val' …`) or PowerShell
+// (`$env:KEY="val"; …`) form so isOurStatusLineCommand can strip it before
+// matching the inner exe+hook shape. We always single/double-quote our own
+// values, so the permissive `[^']*` / `[^"]*` body is sufficient for the
+// shapes we actually emit.
+var statusLineEnvPreambleRe = regexp.MustCompile(
+	`^(?:\s*(?:AIEXPEDITE_CLAUDE_\w+='[^']*'|\$env:AIEXPEDITE_CLAUDE_\w+="[^"]*";))+\s*`,
+)
+
 // isOurStatusLineCommand reports whether a configured command is our hook (any
-// binary path) — used to stay idempotent and to avoid stashing our own command
-// as the "previous" one after the binary path changes across updates.
+// binary path, with or without our pinned env preamble) — used to stay
+// idempotent across binary-path / config-dir refreshes, and to avoid stashing
+// our own command as the "previous" one.
 //
-// Matches the EXACT shape `ourStatusLineCommand` emits — a quoted executable
-// path followed by ` statusline-hook`, with an optional leading `&` call op for
-// the PowerShell form. A loose substring match would falsely claim a user's own
-// command (e.g. `~/.claude/statusline-hook.sh`) as ours and silently overwrite
-// it without stashing, leaving opt-out unable to restore it.
+// Matches the shape `ourStatusLineCommand` emits — an optional env-var
+// preamble, then a quoted executable path followed by ` statusline-hook`, with
+// an optional leading `&` call op for the PowerShell form. A loose substring
+// match would falsely claim a user's own command (e.g.
+// `~/.claude/statusline-hook.sh`) as ours and silently overwrite it without
+// stashing, leaving opt-out unable to restore it.
 func isOurStatusLineCommand(command string) bool {
 	s := strings.TrimSpace(command)
+	s = statusLineEnvPreambleRe.ReplaceAllString(s, "")
 	suffix := " " + statusLineHookArg
 	if !strings.HasSuffix(s, suffix) {
 		return false

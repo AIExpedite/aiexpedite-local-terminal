@@ -145,11 +145,46 @@ func TestOurStatusLineCommand_NoBackslashesAndQuoted(t *testing.T) {
 	if !strings.Contains(cmd, `"`) || !strings.Contains(cmd, statusLineHookArg) {
 		t.Errorf("command should carry a quoted path + hook arg: %q", cmd)
 	}
-	// Windows: either the Git Bash form (`"path" hook`) or the PowerShell call-
-	// operator form (`& "path" hook`) — never an unprefixed quoted path that
-	// PowerShell would treat as a bare string.
-	if runtime.GOOS == "windows" && findGitBash() == "" && !strings.HasPrefix(cmd, `& "`) {
-		t.Errorf("PowerShell command must start with the & call operator: %q", cmd)
+	// Windows: either the Git Bash form (`KEYS… "path" hook`) or the PowerShell
+	// call-operator form (`$env:…; & "path" hook`) — never an unprefixed quoted
+	// path that PowerShell would treat as a bare string. The PowerShell preamble
+	// terminates each `$env:` assignment with `;`, so the `& "` call op is what
+	// the inner exe invocation starts with.
+	if runtime.GOOS == "windows" && findGitBash() == "" && !strings.Contains(cmd, `; & "`) {
+		t.Errorf("PowerShell command must invoke exe via the & call operator: %q", cmd)
+	}
+}
+
+func TestOurStatusLineCommand_PinsCacheAndStashPaths(t *testing.T) {
+	// Pin the cache + stash paths so the installed command is independent of
+	// the caller environment (e.g. Claude launching with a different
+	// XDG_CONFIG_HOME than the agent had at install time).
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	prev := filepath.Join(t.TempDir(), "prev.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", prev)
+
+	cmd, ok := ourStatusLineCommand()
+	if !ok {
+		t.Fatal("expected a command")
+	}
+	// Both keys must appear, and the resolved paths must be embedded so the
+	// hook resolves them identically regardless of how Claude is launched.
+	if !strings.Contains(cmd, "AIEXPEDITE_CLAUDE_RL_CACHE") ||
+		!strings.Contains(cmd, "AIEXPEDITE_CLAUDE_STATUSLINE_PREV") {
+		t.Fatalf("command should embed both env keys: %q", cmd)
+	}
+	// On Windows we forward-slash the embedded paths so they survive Git Bash
+	// quoting and stay backslash-free in the test assertion above.
+	wantCache := strings.ReplaceAll(cache, `\`, "/")
+	wantPrev := strings.ReplaceAll(prev, `\`, "/")
+	if !strings.Contains(cmd, wantCache) || !strings.Contains(cmd, wantPrev) {
+		t.Errorf("command should embed resolved paths %q + %q: %q", wantCache, wantPrev, cmd)
+	}
+	// Round-trip: the command must still be recognized as ours so the next
+	// install doesn't stash it as a third-party command.
+	if !isOurStatusLineCommand(cmd) {
+		t.Errorf("env-pinned command not recognized as ours: %q", cmd)
 	}
 }
 
@@ -351,6 +386,11 @@ func TestIsOurStatusLineCommand_OnlyMatchesInstalledShape(t *testing.T) {
 		`"C:/Users/x/aiexpedite.exe" statusline-hook`,
 		`& "C:/Users/x/aiexpedite.exe" statusline-hook`,
 		`  "/x/aiexpedite" statusline-hook  `, // surrounding whitespace tolerated
+		// New: env-pinned shapes must also be recognized as ours so a refreshed
+		// data-dir path (or an upgrade across the old shape) doesn't make the
+		// installer stash our own command as the "previous" one.
+		`AIEXPEDITE_CLAUDE_RL_CACHE='/x/cache.json' AIEXPEDITE_CLAUDE_STATUSLINE_PREV='/x/prev.json' "/x/aiexpedite" statusline-hook`,
+		`$env:AIEXPEDITE_CLAUDE_RL_CACHE="C:/x/cache.json"; $env:AIEXPEDITE_CLAUDE_STATUSLINE_PREV="C:/x/prev.json"; & "C:/x/aiexpedite.exe" statusline-hook`,
 	}
 	for _, c := range ours {
 		if !isOurStatusLineCommand(c) {
