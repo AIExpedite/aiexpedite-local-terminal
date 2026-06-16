@@ -492,7 +492,25 @@ func removeClaudeStatusLineHook(home string) (bool, error) {
 		return false, nil
 	}
 
-	if prev, ok := loadPrevStatusLine(); ok {
+	prev, ok := loadPrevStatusLine()
+	pinnedPrev := ""
+	if !ok {
+		// Fall back to the path the installed command itself pinned. The data
+		// dir may have moved since install (e.g. XDG_CONFIG_HOME changed), so
+		// the current prevStatusLinePath() resolves to a different file than
+		// the one we wrote at install time — but the stash is still sitting at
+		// the old pinned path. Without this fallback we'd delete statusLine
+		// and lose the user's original chained command.
+		if pinned := extractInstalledPinnedPath(existing.Command, "STATUSLINE_PREV"); pinned != "" && pinned != prevStatusLinePath() {
+			if b, err := os.ReadFile(pinned); err == nil {
+				var p prevStatusLine
+				if json.Unmarshal(b, &p) == nil && len(p.StatusLine) > 0 {
+					prev, ok, pinnedPrev = p.StatusLine, true, pinned
+				}
+			}
+		}
+	}
+	if ok {
 		// Restore the user's full original statusLine object verbatim —
 		// command and every preserved option (padding / refreshInterval / …).
 		settings["statusLine"] = prev
@@ -508,8 +526,12 @@ func removeClaudeStatusLineHook(home string) (bool, error) {
 		return false, err
 	}
 	// Stash is consumed (or never existed) — drop it so a later re-enable
-	// doesn't resurrect a stale chain target.
+	// doesn't resurrect a stale chain target. Also drop the pinned-path stash
+	// if we restored from it.
 	_ = os.Remove(prevStatusLinePath())
+	if pinnedPrev != "" {
+		_ = os.Remove(pinnedPrev)
+	}
 	return true, nil
 }
 

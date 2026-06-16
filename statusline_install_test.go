@@ -202,6 +202,52 @@ func TestEnsureClaudeStatusLineHook_MigratesStashOnPinnedPathChange(t *testing.T
 	}
 }
 
+// When opt-out runs after the data dir moved (e.g. XDG_CONFIG_HOME changed),
+// the current prevStatusLinePath() resolves to a fresh empty location, but the
+// stash is still sitting at the path the installed command itself pinned.
+// removeClaudeStatusLineHook must fall back to that pinned path so the user's
+// original third-party command is restored instead of dropped.
+func TestRemoveClaudeStatusLineHook_RestoresFromPinnedPathWhenCurrentMissing(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	// Install-time pinned stash path (data dir before the move).
+	pinnedPrev := filepath.Join(t.TempDir(), "pinned-prev.json")
+	stashBody := []byte(`{"statusLine":{"type":"command","command":"third-party.sh","padding":2}}`)
+	if err := os.WriteFile(pinnedPrev, stashBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+
+	// Current boot resolves to a different, NON-EXISTENT stash path — the move.
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settings := `{"theme":"dark","statusLine":{"type":"command","command":` +
+		mustJSONString(t, installedCmd) + `}}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	if !strings.Contains(string(raw), `"third-party.sh"`) {
+		t.Errorf("opt-out should restore the pinned-path stash, got: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"padding": 2`) {
+		t.Errorf("opt-out should restore the full stashed object (padding), got: %s", raw)
+	}
+	if _, err := os.Stat(pinnedPrev); !os.IsNotExist(err) {
+		t.Errorf("pinned-path stash should be consumed after restore; err=%v", err)
+	}
+}
+
 func mustJSONString(t *testing.T, s string) string {
 	t.Helper()
 	// Minimal JSON string escaper for test fixtures — only need `"` and `\`.
