@@ -2974,3 +2974,174 @@ env_key = "XAI_REQUIRED_KEY"
 		t.Errorf("expected requirements-layer scope to be neutralized; got %#v", got)
 	}
 }
+
+// TestGrokACPManager_Send_RejectsNonObjectFrame pins the top-level-shape gate
+// in Send. ACP stdio carries individual JSON-RPC 2.0 messages, one object per
+// line — top-level arrays (the JSON-RPC batch form) and scalar frames are
+// out of spec and must be rejected before reaching the child, because
+// validateGrokACPSendCwd only inspects object-shaped frames and a batched
+// `session/new` could otherwise skip the cwd containment gate.
+func TestGrokACPManager_Send_RejectsNonObjectFrame(t *testing.T) {
+	m := NewGrokACPManager()
+	id := "non-object-fixture"
+	fixture := &GrokACPSession{
+		ID:         id,
+		status:     "ended",
+		done:       make(chan struct{}),
+		streamDone: make(chan struct{}),
+	}
+	close(fixture.done)
+	close(fixture.streamDone)
+	m.sessions[id] = fixture
+
+	cases := []struct {
+		name    string
+		payload string
+	}{
+		{"batch_array", `[{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/outside"}}]`},
+		{"empty_array", `[]`},
+		{"top_level_string", `"oops"`},
+		{"top_level_number", `42`},
+		{"top_level_bool", `true`},
+		{"top_level_null", `null`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := m.Send(id, c.payload)
+			if err == nil {
+				t.Fatalf("expected non-object frame to be rejected; got nil")
+			}
+			if !strings.Contains(err.Error(), "single JSON-RPC object") {
+				t.Fatalf("expected single-JSON-RPC-object error; got %q", err.Error())
+			}
+		})
+	}
+}
+
+// TestGrokACPManager_Send_BatchArrayDoesNotBypassCwdGate is the regression
+// test for the bypass the rereview surfaced: with WorkspaceRoot set, a
+// JSON-RPC batch array carrying a `session/new` with an outside cwd used to
+// pass validateGrokACPSendCwd silently (array unmarshal into the
+// method/params probe yielded an error the function swallowed). The
+// non-object guard in Send must close it now.
+func TestGrokACPManager_Send_BatchArrayDoesNotBypassCwdGate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink/path semantics covered on unix")
+	}
+	m := NewGrokACPManager()
+	id := "batch-cwd-fixture"
+	root := t.TempDir()
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("eval root: %v", err)
+	}
+	fixture := &GrokACPSession{
+		ID:            id,
+		status:        "ended",
+		WorkspaceRoot: resolvedRoot,
+		done:          make(chan struct{}),
+		streamDone:    make(chan struct{}),
+	}
+	close(fixture.done)
+	close(fixture.streamDone)
+	m.sessions[id] = fixture
+
+	outside := t.TempDir()
+	batch := fmt.Sprintf(`[{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}]`, outside)
+	err = m.Send(id, batch)
+	if err == nil {
+		t.Fatalf("expected batched session/new with outside cwd to be rejected; got nil")
+	}
+	if !strings.Contains(err.Error(), "single JSON-RPC object") {
+		t.Fatalf("expected single-JSON-RPC-object error; got %q", err.Error())
+	}
+}
+
+// TestDetectPinnedGrokRequirements_RejectsPinnedAPIKey pins the
+// requirements.toml gate: when a host pins `[model.<scope>] api_key = "..."`
+// in requirements.toml, the per-process `--config <key>=` neutralizer
+// buildGrokACPArgs emits is futile (xAI's enterprise loader treats
+// requirements.toml as pinned and overrides later `--config` args), so
+// Start must fail-closed rather than spawning a session whose auth
+// posture would silently bill the API-key account.
+func TestDetectPinnedGrokRequirements_RejectsPinnedAPIKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "[model.grok-build]\napi_key = \"xai-pinned\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// allowAPIKey=false: pinned credential must be rejected.
+	if err := detectPinnedGrokRequirementsFile(path, false, true); err == nil {
+		t.Fatalf("expected pinned api_key to be rejected")
+	} else if !strings.Contains(err.Error(), "API-key") || !strings.Contains(err.Error(), "requirements.toml") {
+		t.Fatalf("expected API-key/requirements.toml error; got %q", err.Error())
+	}
+	// allowAPIKey=true: caller opted in, no error.
+	if err := detectPinnedGrokRequirementsFile(path, true, true); err != nil {
+		t.Fatalf("allow-fallback path should tolerate pinned api_key; got %v", err)
+	}
+}
+
+// TestDetectPinnedGrokRequirements_RejectsPinnedApprovalPolicy is the
+// approval-side counterpart: a host that pins a permissive
+// `approval.permission_mode = "bypassPermissions"` (or `[tools]
+// always_approve = true`) in requirements.toml would silently route the
+// spawned ACP child past the per-tool prompt despite the workspace not
+// opting into EnableGrokAlwaysApprove.
+func TestDetectPinnedGrokRequirements_RejectsPinnedApprovalPolicy(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"permission_mode_bypass", "[approval]\npermission_mode = \"bypassPermissions\"\n"},
+		{"ui_permission_mode_bypass", "[ui]\npermission_mode = \"always-approve\"\n"},
+		{"tools_always_approve", "[tools]\nalways_approve = true\n"},
+		{"permission_rules", "[permission]\nrules = \"Bash(*)\"\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "requirements.toml")
+			if err := os.WriteFile(path, []byte(c.body), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if err := detectPinnedGrokRequirementsFile(path, true, false); err == nil {
+				t.Fatalf("expected pinned permissive policy to be rejected")
+			} else if !strings.Contains(err.Error(), "approval policy") || !strings.Contains(err.Error(), "requirements.toml") {
+				t.Fatalf("expected approval-policy/requirements.toml error; got %q", err.Error())
+			}
+			if err := detectPinnedGrokRequirementsFile(path, true, true); err != nil {
+				t.Fatalf("allow-always-approve path should tolerate pinned policy; got %v", err)
+			}
+		})
+	}
+}
+
+// TestDetectPinnedGrokRequirements_IgnoresBenignSections pins the
+// negative case: requirements.toml that pins UNRELATED keys (model
+// selection, logging, anything outside the auth/approval surface) must
+// not fail Start. We only refuse on keys isGrokAuthConfigKV /
+// isGrokApprovalConfigKV already enumerate so the detection surface and
+// the argv strip surface stay in lockstep.
+func TestDetectPinnedGrokRequirements_IgnoresBenignSections(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "[models]\ndefault = \"grok-build\"\n\n[logging]\nlevel = \"info\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := detectPinnedGrokRequirementsFile(path, false, false); err != nil {
+		t.Fatalf("benign requirements.toml should not trip the gate; got %v", err)
+	}
+}
+
+// TestDetectPinnedGrokRequirements_MissingFileTolerated pins the
+// best-effort posture: a missing requirements.toml is the common case
+// on most hosts and must not break Start.
+func TestDetectPinnedGrokRequirements_MissingFileTolerated(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist.toml")
+	if err := detectPinnedGrokRequirementsFile(missing, false, false); err != nil {
+		t.Fatalf("missing file should be tolerated; got %v", err)
+	}
+}

@@ -309,6 +309,19 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return fmt.Errorf("grok acp session %s already exists", id)
 	}
 
+	// Fail-closed when a Grok requirements.toml layer pins auth or approval
+	// policy in a direction the workspace's opt-in flags do not allow. xAI's
+	// enterprise docs document requirements.toml as PINNED — its values
+	// override later `-c|--config <key>=` flags rather than the other way
+	// round — so the neutralizers buildGrokACPArgs emits would silently fail
+	// open if the pinned layer already selected `model.api_key` or a
+	// permissive `[permission] rules` table. Refusing the launch here, with
+	// a message naming the pinned key and file, is safer than spawning a
+	// session whose auth/approval posture we cannot honour.
+	if err := detectPinnedGrokRequirements(opts.AllowAPIKeyFallback, opts.AllowAlwaysApprove); err != nil {
+		return err
+	}
+
 	executable := resolveExecutable("grok")
 	// PATH lookup miss is the common failure mode for macOS GUI/launchd
 	// agents — Grok's installer drops the binary in ~/.grok/bin and only
@@ -464,6 +477,17 @@ func (m *GrokACPManager) Send(id string, payload string) error {
 	var probe json.RawMessage
 	if err := json.Unmarshal([]byte(trimmed), &probe); err != nil {
 		return fmt.Errorf("payload is not valid JSON: %w", err)
+	}
+	// ACP stdio frames are individual JSON-RPC 2.0 messages — a
+	// request, notification or response, each a single JSON object per
+	// line. Top-level arrays (JSON-RPC batch form) and scalars are out
+	// of spec for ACP and must be rejected here rather than passed to
+	// the child: validateGrokACPSendCwd's session-setup containment
+	// gate only inspects object-shaped frames, so a batched
+	// `[{"method":"session/new", "params":{"cwd":"/outside"}}, ...]`
+	// would otherwise skip the cwd check and reach Grok unfiltered.
+	if trimmed[0] != '{' {
+		return fmt.Errorf("payload must be a single JSON-RPC object; batch arrays and scalar frames are not supported on ACP stdio")
 	}
 
 	// Re-enforce workspace containment on ACP session-setup frames
@@ -1248,6 +1272,106 @@ func persistedGrokConfigPaths() []string {
 		filepath.Join(systemBase, "requirements.toml"),
 	)
 	return paths
+}
+
+// grokRequirementsConfigPaths enumerates the Grok requirements.toml layers
+// xAI's enterprise loader treats as PINNED — values in these files override
+// later `-c|--config <key>=` flags rather than the other way round. The
+// detectPinnedGrokRequirements gate uses this list (and not the broader
+// persistedGrokConfigPaths set) because per-user/system config.toml and
+// managed_config.toml CAN be neutralised by the existing `--config <key>=`
+// emitter; only the requirements layer needs to fail-closed.
+func grokRequirementsConfigPaths() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	userBase := firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
+	systemBase := "/etc/grok"
+
+	paths := make([]string, 0, 2)
+	if userBase != "" {
+		paths = append(paths, filepath.Join(userBase, "requirements.toml"))
+	}
+	paths = append(paths, filepath.Join(systemBase, "requirements.toml"))
+	return paths
+}
+
+// detectPinnedGrokRequirements scans every requirements.toml layer and
+// returns an error when the host pins an auth credential the agent has not
+// opted into (`allowAPIKey` false) or a permissive approval policy the
+// agent has not opted into (`allowAlwaysApprove` false). Used by Start to
+// fail-closed rather than spawning a session whose persisted posture
+// silently bypasses the workspace's opt-in flags.
+//
+// Missing/unreadable files yield nil — best-effort by design. The first
+// pinned key found determines the error so the operator gets actionable
+// pointer (file + dotted key) rather than a generic refusal.
+func detectPinnedGrokRequirements(allowAPIKey, allowAlwaysApprove bool) error {
+	if allowAPIKey && allowAlwaysApprove {
+		return nil
+	}
+	for _, p := range grokRequirementsConfigPaths() {
+		if err := detectPinnedGrokRequirementsFile(p, allowAPIKey, allowAlwaysApprove); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// detectPinnedGrokRequirementsFile is the file-path-injectable
+// implementation of detectPinnedGrokRequirements. Reuses the same
+// line-oriented TOML scanner shape as parsePersistedGrokModelScopesWithAPIKey
+// (1 MiB read cap, regex-free section + key=value parse, scoped to the
+// keys isGrokAuthConfigKV / isGrokApprovalConfigKV already enumerate so the
+// pinned-detection surface stays in lockstep with the argv strip surface).
+func detectPinnedGrokRequirementsFile(path string, allowAPIKey, allowAlwaysApprove bool) error {
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	const maxBytes = 1 << 20
+	reader := io.LimitReader(f, maxBytes)
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+
+	currentSection := ""
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			currentSection = strings.TrimSpace(line[1 : len(line)-1])
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq < 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		// Render as the dotted-path form the isGrok*ConfigKV gates
+		// already understand so detection stays in lockstep with the
+		// argv strip surface.
+		dotted := key
+		if currentSection != "" {
+			dotted = currentSection + "." + key
+		}
+		kv := dotted + "=" + trimTOMLString(val)
+		if !allowAPIKey && isGrokAuthConfigKV(kv) {
+			return fmt.Errorf("grok requirements.toml pins API-key auth via %q in %s; the per-process --config neutralizer cannot override a requirements.toml pin — set Config.EnableGrokAPIKeyFallback=true to opt in, or remove the pinned credential", dotted, path)
+		}
+		if !allowAlwaysApprove && isGrokApprovalConfigKV(kv) {
+			return fmt.Errorf("grok requirements.toml pins permissive approval policy via %q in %s; the per-process --config neutralizer cannot override a requirements.toml pin — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the pinned policy", dotted, path)
+		}
+	}
+	return nil
 }
 
 // parsePersistedGrokModelScopesWithAPIKey is the file-path-injectable
