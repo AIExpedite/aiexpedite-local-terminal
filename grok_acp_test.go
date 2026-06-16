@@ -2806,3 +2806,37 @@ api_key = "xai-leak"
 		t.Errorf("expected persisted-default scope `custom` env_key neutralizer; got %#v", got)
 	}
 }
+
+// TestBuildGrokACPArgs_NeutralizesManagedAndRequirementsLayerScopes covers the
+// codex finding that xAI's loader also consumes `managed_config.toml` and
+// `requirements.toml` alongside `config.toml` under `$GROK_HOME` (or
+// `~/.grok`), and that an `[model.<scope>]` API-key in any of those layers
+// takes precedence over the cached session token. The user-base `config.toml`
+// here is empty/missing — the scope must be discovered from the managed and
+// requirements layers and emitted as a `--config model.<scope>.{api_key,env_key}=`
+// clear regardless.
+func TestBuildGrokACPArgs_NeutralizesManagedAndRequirementsLayerScopes(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "managed_config.toml"), []byte(`
+[model.managed-scope]
+api_key = "xai-managed-leak"
+`), 0o600); err != nil {
+		t.Fatalf("write managed_config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "requirements.toml"), []byte(`
+[model.required-scope]
+env_key = "XAI_REQUIRED_KEY"
+`), 0o600); err != nil {
+		t.Fatalf("write requirements: %v", err)
+	}
+	t.Setenv("GROK_HOME", dir)
+
+	got := buildGrokACPArgs(nil, false, false)
+	joined := strings.Join(got, " ")
+	if !strings.Contains(joined, "model.managed-scope.api_key=") {
+		t.Errorf("expected managed-layer scope to be neutralized; got %#v", got)
+	}
+	if !strings.Contains(joined, "model.required-scope.env_key=") {
+		t.Errorf("expected requirements-layer scope to be neutralized; got %#v", got)
+	}
+}

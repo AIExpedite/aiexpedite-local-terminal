@@ -1188,25 +1188,60 @@ func extractGrokModelScopes(args []string) []string {
 	return scopes
 }
 
-// persistedGrokModelScopesWithAPIKey returns scope names from the user's
-// `~/.grok/config.toml` (or `$GROK_HOME/config.toml`) that either appear as
-// `[model.<scope>]` sections containing an `api_key` / `env_key` line, or
-// are named as `[models] default = "<scope>"` (the persisted active-model
-// selector documented in xAI's enterprise docs). Used by buildGrokACPArgs
-// to ensure the cached-token posture is not silently bypassed by a host
-// whose persisted default model resolves to a `[model.<scope>] api_key =
-// "..."` section without any `--model` arg from the orchestrator. Missing
-// / unreadable config files yield nil — best-effort by design.
+// persistedGrokModelScopesWithAPIKey returns scope names from every Grok
+// config layer that either appear as `[model.<scope>]` sections containing
+// an `api_key` / `env_key` line, or are named as `[models] default =
+// "<scope>"` (the persisted active-model selector documented in xAI's
+// enterprise docs). Used by buildGrokACPArgs to ensure the cached-token
+// posture is not silently bypassed by a host whose persisted default model
+// resolves to a `[model.<scope>] api_key = "..."` section without any
+// `--model` arg from the orchestrator. Missing / unreadable config files
+// yield nil — best-effort by design.
+//
+// xAI's enterprise docs document a layered loader: the per-user
+// `~/.grok/config.toml` (or `$GROK_HOME/config.toml`) is one source, but
+// `[managed_]config.toml` and `requirements.toml` under `~/.grok` and
+// `/etc/grok` are also consumed, and `model.api_key` / `model.env_key`
+// values in any of those layers take precedence over the active session
+// token. We scan every layer and merge the discovered scopes so a host
+// whose managed layer selects a custom `[model.<scope>]` with credentials
+// is neutralised the same as one whose user config does.
 func persistedGrokModelScopesWithAPIKey() []string {
+	var merged []string
+	for _, p := range persistedGrokConfigPaths() {
+		merged = mergeGrokModelScopes(merged, parsePersistedGrokModelScopesWithAPIKey(p))
+	}
+	return merged
+}
+
+// persistedGrokConfigPaths enumerates every config layer xAI's Grok loader
+// is documented to consume, in precedence-agnostic order. The caller (the
+// neutraliser path) only cares about the union of scopes-with-credentials
+// across layers, not which layer wins, so order does not affect output —
+// it only keeps the emitted `--config` args deterministic. Missing files
+// are silently skipped downstream by parsePersistedGrokModelScopesWithAPIKey.
+func persistedGrokConfigPaths() []string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = ""
 	}
-	base := firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
-	if base == "" {
-		return nil
+	userBase := firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
+	systemBase := "/etc/grok"
+
+	paths := make([]string, 0, 6)
+	if userBase != "" {
+		paths = append(paths,
+			filepath.Join(userBase, "config.toml"),
+			filepath.Join(userBase, "managed_config.toml"),
+			filepath.Join(userBase, "requirements.toml"),
+		)
 	}
-	return parsePersistedGrokModelScopesWithAPIKey(filepath.Join(base, "config.toml"))
+	paths = append(paths,
+		filepath.Join(systemBase, "managed_config.toml"),
+		filepath.Join(systemBase, "config.toml"),
+		filepath.Join(systemBase, "requirements.toml"),
+	)
+	return paths
 }
 
 // parsePersistedGrokModelScopesWithAPIKey is the file-path-injectable
