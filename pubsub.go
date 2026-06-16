@@ -170,11 +170,11 @@ func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string)
 	}
 	// Session-routed commands need Type/SessionID set so the backend can
 	// correlate the rejection with the session document. The rejection Type
-	// is derived from cmd.Type so codex_appserver_* rejections (allowlist
-	// deny / stale / rate-limited / signature failure) come back labeled
-	// codex_appserver_error rather than the generic session_error — the
-	// orchestrator's codex IDE protocol handler can then route them without
-	// having to special-case SessionID prefixes.
+	// is derived from cmd.Type so codex_appserver_* / grok_acp_* rejections
+	// (allowlist deny / stale / rate-limited / signature failure) come back
+	// labeled with their family-specific error type rather than the generic
+	// session_error — each orchestrator-side protocol handler can then route
+	// them without having to special-case SessionID prefixes.
 	if cmd.Type != "" && cmd.SessionID != "" {
 		res.Type = rejectionResultType(cmd.Type)
 		res.SessionID = cmd.SessionID
@@ -188,6 +188,9 @@ func makeRejectionResult(cmd commandMsg, agentID, status, reason, output string)
 func rejectionResultType(cmdType string) string {
 	if isCodexAppServerCommand(cmdType) {
 		return "codex_appserver_error"
+	}
+	if isGrokACPCommand(cmdType) {
+		return "grok_acp_error"
 	}
 	return "session_error"
 }
@@ -475,9 +478,9 @@ type commandMsg struct {
 	TimeoutMs   int64    `json:"timeoutMs,omitempty"` // Execution timeout in milliseconds (default: 120000)
 
 	// Session fields (for interactive CLI agent sessions)
-	Type      string `json:"type,omitempty"`      // "execute"|"session_start"|"session_input"|"session_signal"|"session_end"|"codex_appserver_start"|"codex_appserver_send"|"codex_appserver_end"
+	Type      string `json:"type,omitempty"`      // "execute"|"session_start"|"session_input"|"session_signal"|"session_end"|"codex_appserver_start"|"codex_appserver_send"|"codex_appserver_end"|"grok_acp_start"|"grok_acp_send"|"grok_acp_end"
 	SessionID string `json:"sessionID,omitempty"` // Unique session identifier
-	Input     string `json:"input,omitempty"`     // stdin text for session_input; raw JSON-RPC frame for codex_appserver_send
+	Input     string `json:"input,omitempty"`     // stdin text for session_input; raw JSON-RPC frame for codex_appserver_send / grok_acp_send
 	Signal    string `json:"signal,omitempty"`    // "interrupt"|"kill" for session_signal
 }
 
@@ -505,9 +508,9 @@ type resultMsg struct {
 	Args    []string `json:"args,omitempty"`
 
 	// Session fields (for interactive CLI agent sessions)
-	Type       string `json:"type,omitempty"`       // "result"|"stream"|"prompt"|"session_ended"|"codex_appserver_started"|"codex_appserver_message"|"codex_appserver_stderr"|"codex_appserver_error"|"codex_appserver_ended"
+	Type       string `json:"type,omitempty"`       // "result"|"stream"|"prompt"|"session_ended"|"codex_appserver_started"|"codex_appserver_message"|"codex_appserver_stderr"|"codex_appserver_error"|"codex_appserver_ended"|"grok_acp_started"|"grok_acp_message"|"grok_acp_stderr"|"grok_acp_error"|"grok_acp_ended"
 	SessionID  string `json:"sessionID,omitempty"`  // Session identifier
-	ExitCode   int    `json:"exitCode,omitempty"`   // Process exit code (for session_ended / codex_appserver_ended)
+	ExitCode   int    `json:"exitCode,omitempty"`   // Process exit code (for session_ended / codex_appserver_ended / grok_acp_ended)
 	PromptText string `json:"promptText,omitempty"` // The question/approval text from CLI
 	PromptType string `json:"promptType,omitempty"` // "permission"|"question"|"unknown"
 	Seq        int    `json:"seq,omitempty"`        // Ordering sequence number for streaming
@@ -2264,6 +2267,14 @@ var globalSessionManager *SessionManager
 // from the existing `codex exec` CLI integration in session.go).
 var globalCodexAppServerManager *CodexAppServerManager
 
+// globalGrokACPManager is the package-level GrokACPManager instance,
+// initialized in StartAgent (agent.go). Sessions launched here drive xAI
+// Grok Build CLI via its ACP (Agent Client Protocol) JSON-RPC stdio
+// interface (`grok agent stdio`), preferring the user's local `grok login`
+// cached token over an API-key fallback so usage ties to the terminal
+// computer user's Grok / X account.
+var globalGrokACPManager *GrokACPManager
+
 /* --------------------------------------------------------------------------
    handleSessionCommand — routes session_* commands to the SessionManager
    -------------------------------------------------------------------------- */
@@ -2300,6 +2311,13 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		allowCommand = "codex"
 		allowArgs = buildCodexAppServerArgs(cmd.Args)
 		denyOutput = "codex app-server denied by user: not in allow list"
+	case "grok_acp_start":
+		// Same shape as codex_appserver_start: synthesise the actual
+		// `grok agent stdio …` argv we will exec so the default `grok *`
+		// allowlist entry covers ACP access without a parallel allowlist.
+		allowCommand = "grok"
+		allowArgs = buildGrokACPArgs(cmd.Args)
+		denyOutput = "grok agent stdio denied by user: not in allow list"
 	default:
 		// Mid-session interactive commands don't re-prompt.
 		return true
@@ -2368,11 +2386,15 @@ func newSessionPublishFn(topic *pubsub.Publisher, logPrefix string) PublishFunc 
 }
 
 // handleSessionCommand handles interactive session commands (session_*,
-// codex_appserver_*). It publishes results back via the provided Pub/Sub
-// topic.
+// codex_appserver_*, grok_acp_*). It publishes results back via the
+// provided Pub/Sub topic.
 func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg) {
 	if isCodexAppServerCommand(cmd.Type) {
 		handleCodexAppServerCommand(ctx, topic, cmd)
+		return
+	}
+	if isGrokACPCommand(cmd.Type) {
+		handleGrokACPCommand(ctx, topic, cmd)
 		return
 	}
 
@@ -2609,5 +2631,128 @@ func publishCodexAppServerError(ctx context.Context, topic *pubsub.Publisher, cm
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[codex-appserver] Failed to publish error: %v%s\n", colorRed, err, colorReset)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Grok ACP (JSON-RPC over stdio) command routing
+   -------------------------------------------------------------------------- */
+
+// isGrokACPCommand returns true if cmdType is one of the Grok ACP command
+// kinds. Same shape as isCodexAppServerCommand; both families share the
+// JSON-RPC stdio dispatcher pattern.
+func isGrokACPCommand(cmdType string) bool {
+	switch cmdType {
+	case "grok_acp_start", "grok_acp_send", "grok_acp_end":
+		return true
+	}
+	return false
+}
+
+// handleGrokACPCommand dispatches grok_acp_* commands to the GrokACPManager.
+// Mirrors handleCodexAppServerCommand's shape — a single publishFn is shared
+// with the manager so it can stream JSON-RPC frames (responses, session/update
+// notifications, server-initiated approval requests) back via Pub/Sub for the
+// duration of the session.
+func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg) {
+	if globalGrokACPManager == nil {
+		publishGrokACPError(ctx, topic, cmd, "grok acp manager not initialized")
+		return
+	}
+
+	publishFn := newSessionPublishFn(topic, "[grok-acp]")
+
+	switch cmd.Type {
+	case "grok_acp_start":
+		if cmd.SessionID == "" {
+			publishGrokACPError(ctx, topic, cmd, "sessionID is required for grok_acp_start")
+			return
+		}
+
+		fmt.Printf("%s[grok-acp] Starting session %s (workspace=%s)%s\n",
+			colorCyan, cmd.SessionID, cmd.WorkspaceID, colorReset)
+
+		err := globalGrokACPManager.Start(
+			cmd.SessionID,
+			cmd.Cwd,
+			cmd.Args,
+			cmd.WorkspaceID,
+			cmd.UID,
+			publishFn,
+		)
+		if err != nil {
+			publishGrokACPError(ctx, topic, cmd, fmt.Sprintf("failed to start grok acp: %v", err))
+			return
+		}
+
+		// Synchronous ack so the orchestrator can proceed to send the ACP
+		// `initialize` request as soon as the pipe is up. The first
+		// grok_acp_message will follow once grok emits its initialize
+		// response on stdout.
+		publishFn(resultMsg{
+			ID:          cmd.ID,
+			WorkspaceID: cmd.WorkspaceID,
+			UID:         cmd.UID,
+			Output:      "Grok ACP started",
+			Status:      "success",
+			Ts:          time.Now().UnixMilli(),
+			Version:     Version,
+			Type:        "grok_acp_started",
+			SessionID:   cmd.SessionID,
+		})
+
+	case "grok_acp_send":
+		if cmd.SessionID == "" {
+			publishGrokACPError(ctx, topic, cmd, "sessionID is required for grok_acp_send")
+			return
+		}
+		if cmd.Input == "" {
+			publishGrokACPError(ctx, topic, cmd, "input (JSON-RPC frame) is required for grok_acp_send")
+			return
+		}
+
+		if err := globalGrokACPManager.Send(cmd.SessionID, cmd.Input); err != nil {
+			publishGrokACPError(ctx, topic, cmd, fmt.Sprintf("failed to send to grok acp: %v", err))
+			return
+		}
+
+	case "grok_acp_end":
+		if cmd.SessionID == "" {
+			publishGrokACPError(ctx, topic, cmd, "sessionID is required for grok_acp_end")
+			return
+		}
+
+		fmt.Printf("%s[grok-acp] Ending session %s%s\n",
+			colorYellow, cmd.SessionID, colorReset)
+
+		if err := globalGrokACPManager.End(cmd.SessionID); err != nil {
+			publishGrokACPError(ctx, topic, cmd, fmt.Sprintf("failed to end grok acp session: %v", err))
+			return
+		}
+
+	default:
+		publishGrokACPError(ctx, topic, cmd, fmt.Sprintf("unknown grok acp command type: %s", cmd.Type))
+	}
+}
+
+// publishGrokACPError surfaces a synchronous failure (bad request, manager
+// not ready, send failure) back to the orchestrator as a `grok_acp_error`
+// frame so it can fail the in-flight call without waiting for a timeout.
+func publishGrokACPError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
+	fmt.Printf("%s[grok-acp] Error: %s%s\n", colorRed, errMsg, colorReset)
+
+	res := resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		Output:      errMsg,
+		Status:      "error",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "grok_acp_error",
+		SessionID:   cmd.SessionID,
+	}
+	if err := publishMsg(ctx, topic, res); err != nil {
+		fmt.Printf("%s[grok-acp] Failed to publish error: %v%s\n", colorRed, err, colorReset)
 	}
 }

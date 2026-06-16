@@ -266,6 +266,110 @@ func TestAntigravityUsageParser_PlanFromSettings(t *testing.T) {
 	}
 }
 
+func TestGrokUsageParser_CachedTokenAuthFile(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		"email":        "rick@example.com",
+		"plan":         "premium",
+		"subscription": "x-premium",
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true, Version: "0.4.1"}, time.Now())
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry from ~/.grok/auth.json")
+	}
+	if usage.Account != "rick@example.com" {
+		t.Errorf("Account=%q, want rick@example.com", usage.Account)
+	}
+	if usage.Plan != "premium" {
+		t.Errorf("Plan=%q, want premium", usage.Plan)
+	}
+	if usage.AccountFingerprint == "" {
+		t.Errorf("expected fingerprint for known account")
+	}
+	if usage.DataSource != "~/.grok" {
+		t.Errorf("DataSource=%q, want ~/.grok", usage.DataSource)
+	}
+	if len(usage.Metrics) != 2 {
+		t.Fatalf("expected 2 metrics (requests + tokens), got %d", len(usage.Metrics))
+	}
+	for _, m := range usage.Metrics {
+		if !m.Unknown {
+			t.Errorf("metric %q should be Unknown (no observable counter)", m.Kind)
+		}
+	}
+}
+
+func TestGrokUsageParser_LegacyCachedTokenLayout(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "cached_token.json"), map[string]any{
+		"cached_token": map[string]any{
+			"id_token": helperJWT(t, map[string]any{
+				"email":     "oauth-grok@example.com",
+				"sub":       "grok-subject",
+				"plan_type": "team",
+			}),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || usage == nil {
+		t.Fatalf("expected usage from legacy cached_token.json layout")
+	}
+	if usage.Account != "oauth-grok@example.com" {
+		t.Errorf("Account=%q, want oauth-grok@example.com (from JWT claims)", usage.Account)
+	}
+	if usage.Plan != "team" {
+		t.Errorf("Plan=%q, want team", usage.Plan)
+	}
+	if usage.AccountFingerprint == "" {
+		t.Errorf("expected fingerprint for OAuth account")
+	}
+}
+
+func TestGrokUsageParser_HonorsGrokHomeEnv(t *testing.T) {
+	home := t.TempDir()
+	grokHome := t.TempDir()
+	t.Setenv("GROK_HOME", grokHome)
+	helperWriteJSON(t, filepath.Join(grokHome, "auth.json"), map[string]any{
+		"email": "profile-grok@example.com",
+		"plan":  "pro",
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || usage == nil {
+		t.Fatalf("expected usage from $GROK_HOME")
+	}
+	if usage.Account != "profile-grok@example.com" {
+		t.Errorf("Account=%q, want profile-grok@example.com", usage.Account)
+	}
+	if usage.DataSource != "$GROK_HOME" {
+		t.Errorf("DataSource=%q, want $GROK_HOME marker so the UI distinguishes overrides", usage.DataSource)
+	}
+}
+
+// TestGrokUsageParser_MissingCredentialsKeepsBaselineEntry pins the behaviour
+// that lets the CLI Agents tab surface "Grok installed but not logged in" —
+// the parser returns a baseline entry with unknown metrics so the user can
+// see they need to run `grok login` rather than the agent silently dropping
+// the row.
+func TestGrokUsageParser_MissingCredentialsKeepsBaselineEntry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || usage == nil {
+		t.Fatalf("parser must return a baseline entry even without credentials so the UI can prompt the user to `grok login`")
+	}
+	if usage.Account != "" {
+		t.Errorf("expected empty account without cached token; got %q", usage.Account)
+	}
+	if usage.AccountFingerprint != "" {
+		t.Errorf("fingerprint should be empty when account is unknown")
+	}
+}
+
 func TestGatherCLIAgentUsage_StableOrderAndOptIn(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

@@ -192,6 +192,16 @@ func runMockCLI(mode string) {
 		_, _ = os.Stdout.WriteString(`"}}}` + "\n")
 		select {}
 
+	case "grok-acp-echo":
+		runMockGrokACPServer()
+
+	case "grok-acp-bad-frame":
+		// Emit a single non-JSON stdout line to exercise the `grok_acp_error`
+		// surfacing path, then exit cleanly. Used by
+		// TestGrokACPLifecycle_ForwardsBadFrameAsError.
+		fmt.Println("this is not json")
+		os.Exit(0)
+
 	case "codex-appserver-burst":
 		// Emit a burst of JSON-RPC frames much larger than
 		// codexAppServerPublishQueueSize, then keep going to keep the

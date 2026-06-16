@@ -177,6 +177,45 @@ func TestMakeRejectionResult_CodexAppServerSendUsesCodexErrorType(t *testing.T) 
 	}
 }
 
+func TestMakeRejectionResult_GrokACPStartUsesGrokErrorType(t *testing.T) {
+	// grok_acp_start rejections must come back labeled grok_acp_error so the
+	// orchestrator's ACP protocol handler can route them on Type alone,
+	// independent of the codex IDE handler.
+	cmd := commandMsg{
+		ID:        "cmd-grok-1",
+		Command:   "grok",
+		Args:      []string{"--model", "grok-2-fast"},
+		Type:      "grok_acp_start",
+		SessionID: "sess-grok-abc",
+	}
+	res := makeRejectionResult(cmd, "agent-1", "denied", "ALLOWLIST_DENIED", "Denied")
+
+	if res.Type != "grok_acp_error" {
+		t.Errorf("Type = %q, want %q", res.Type, "grok_acp_error")
+	}
+	if res.SessionID != "sess-grok-abc" {
+		t.Errorf("SessionID = %q, want %q", res.SessionID, "sess-grok-abc")
+	}
+}
+
+func TestMakeRejectionResult_GrokACPSendUsesGrokErrorType(t *testing.T) {
+	// Stale/rate-limited grok_acp_send rejections route through the same path
+	// and must come back labeled grok_acp_error so the orchestrator fails the
+	// in-flight ACP call rather than treating it as a generic session error.
+	cmd := commandMsg{
+		ID:        "cmd-grok-2",
+		Command:   "grok",
+		Type:      "grok_acp_send",
+		SessionID: "sess-grok-xyz",
+		Input:     `{"jsonrpc":"2.0","id":1,"method":"initialize"}`,
+	}
+	res := makeRejectionResult(cmd, "agent-1", "rate_limited", "RATE_LIMITED", "Rate limit exceeded")
+
+	if res.Type != "grok_acp_error" {
+		t.Errorf("Type = %q, want %q", res.Type, "grok_acp_error")
+	}
+}
+
 func TestMakeRejectionResult_NoSessionMetadataForExecuteWithoutSessionID(t *testing.T) {
 	// Type set but SessionID missing — historically a defensive case in
 	// the inline literals. The helper requires BOTH to be present, since

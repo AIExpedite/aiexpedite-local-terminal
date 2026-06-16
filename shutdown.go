@@ -123,6 +123,12 @@ func tearDownSubprocesses() {
 		globalCodexAppServerManager.ShutdownAll()
 	}
 
+	// Same rationale for the Grok ACP manager — children hold a Grok auth
+	// session and may keep billing if the agent dies without ending them.
+	if globalGrokACPManager != nil {
+		globalGrokACPManager.ShutdownAll()
+	}
+
 	// Cleanup GCS storage client (closes idle HTTP/2 streams cleanly).
 	CloseStorageClient()
 

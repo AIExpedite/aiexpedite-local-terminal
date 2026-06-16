@@ -221,7 +221,7 @@ func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
 	// LookPath only checks the executable bit; the version probe will time
 	// out / exit non-zero, but Detected + Name are populated before the
 	// version probe runs.
-	for _, bin := range []string{"claude", "codex", "gemini", "agy"} {
+	for _, bin := range []string{"claude", "codex", "gemini", "agy", "grok"} {
 		stub := filepath.Join(dir, bin)
 		if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 			t.Fatalf("write stub %s: %v", stub, err)
@@ -238,6 +238,7 @@ func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
 		"codex":       "Codex",
 		"geminiCli":   "Gemini CLI",
 		"antigravity": "Antigravity",
+		"grok":        "Grok",
 	}
 	for key, wantName := range wantNames {
 		entry, ok := agents[key]

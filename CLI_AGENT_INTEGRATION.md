@@ -141,3 +141,110 @@ claude-specific: codex / gemini / shells never receive it.
   behaviour (incl. equals-form variants).
 - [`session_env_test.go`](session_env_test.go) — pins the env strip
   behaviour (billing vars, always-vars, non-claude carve-out, log payload).
+
+---
+
+# CLI Agent Integration — xAI Grok Build CLI (ACP)
+
+xAI Grok Build CLI is integrated via its **ACP (Agent Client Protocol)
+JSON-RPC** interface (`grok agent stdio`), not via the interactive TUI. The
+implementation mirrors the Codex app-server manager — same JSON-RPC stdio
+contract, same fail-fast policy, same lifecycle — but with auth posture and
+naming specific to Grok.
+
+## TL;DR
+
+- Manager: [`GrokACPManager`](grok_acp.go) — spawns `grok agent stdio` and
+  forwards every JSONL frame back to the orchestrator as `grok_acp_message`
+  (stdout) / `grok_acp_stderr` (stderr) / `grok_acp_error` (protocol
+  violation) / `grok_acp_ended` (process exit).
+- Pub/Sub command types: `grok_acp_start`, `grok_acp_send`, `grok_acp_end`.
+- **Auth preference**: orchestrator selects `cached_token` from the
+  `initialize` response's `authMethods` so usage ties to the terminal
+  computer user's local `grok login`. `xai.api_key` / `XAI_API_KEY` is an
+  opt-in fallback only.
+- Approval posture: **conservative by default**. The driver does NOT auto-
+  enable always-approve / autonomous tool execution; the orchestrator must
+  explicitly request it per workspace.
+
+## How to install / login
+
+```bash
+# Install Grok Build CLI (xAI)
+npm install -g @xai/grok
+
+# Subscription-bound auth — preferred by AI Expedite
+grok login
+
+# Optional API-key fallback (only if no cached_token is available)
+export XAI_API_KEY="xai-..."
+```
+
+The agent detects `grok` via `gatherCLIAgents` in [systemInfo.go](systemInfo.go)
+and reports installed-status + version on the auth/token uplink. The CLI
+Agents tab reads from `cliAgents[]` (see
+[cliagent_usage_grok.go](cliagent_usage_grok.go)); when the user hasn't run
+`grok login`, the entry still appears with empty account + dashed capacity
+gauges so the user sees they need to authenticate.
+
+## Why ACP, not TUI scraping
+
+`grok` (no subcommand) launches an interactive TUI built around terminal
+escape sequences. Scraping that output is fragile — Grok ships TUI redesigns
+frequently and there are no stable parse anchors. ACP is the supported
+machine-to-machine entry point and offers:
+
+- Stable JSON-RPC 2.0 framing (newline-delimited stdio).
+- First-class `authenticate` method that surfaces `cached_token` so we don't
+  need to grovel through dotfiles ourselves.
+- Streaming `session/update` notifications for assistant deltas, tool calls,
+  and approval requests.
+- Clean cancellation via `session/cancel` + stdin-close.
+
+`buildGrokACPArgs` in [grok_acp.go](grok_acp.go) strips any caller-supplied
+`agent` / `stdio` / `chat` / `tui` / `run` tokens that would re-enter the TUI
+path, so orchestrator typos can't accidentally fall back to TUI scraping.
+
+## Environment policy
+
+[`sanitizeGrokACPEnv`](grok_acp.go) strips the same nested-IDE markers as
+the Codex sanitiser (`CLAUDECODE=`, `CLAUDE_*`, `CODEX_IDE_*`) so downstream
+tooling doesn't think it's running embedded inside another IDE. **It
+deliberately preserves `XAI_API_KEY` and any `GROK_*` config dir vars** so
+the user's local Grok auth state remains reachable. Auth precedence
+(`cached_token` first, `xai.api_key` fallback) is enforced by the
+orchestrator's `authenticate` flow, not by env stripping.
+
+## Lifecycle
+
+`Start` spawns the child, registers it with the global process registry,
+launches stdout + stderr reader goroutines, and synchronously acks
+`grok_acp_started`. `End` closes stdin (ACP's documented graceful-exit
+path), then escalates to SIGINT → SIGKILL on the 5s timeout cascade.
+`CleanupStale` ends sessions older than 6 h so an orchestrator crash that
+drops `grok_acp_end` can't leak grok children indefinitely.
+
+Frames are **never silently dropped**: oversize frames, escape-amplified
+envelopes, stalled publish queues, or scanner errors all surface a fatal
+`grok_acp_error` and force-kill the child, then publish the terminal
+`grok_acp_ended`. The orchestrator's JSON-RPC state machine relies on
+seeing every frame in `Seq` order; a silent drop would deadlock.
+
+## Enforcement points
+
+- [`grok_acp.go` — `buildGrokACPArgs`](grok_acp.go) — forces the `agent
+  stdio` entry-point argv and strips TUI / chat / run tokens.
+- [`grok_acp.go` — `sanitizeGrokACPEnv`](grok_acp.go) — strips nested-IDE
+  env markers, preserves `XAI_API_KEY` and `GROK_*` so local Grok auth
+  survives.
+- [`pubsub.go` — `isGrokACPCommand` / `handleGrokACPCommand`](pubsub.go) —
+  dispatches `grok_acp_*` commands; allowlist-gates `grok_acp_start`
+  against the synthesised `grok agent stdio …` argv.
+- [`grok_acp_test.go`](grok_acp_test.go) — pins the argv builder, env
+  sanitizer, Send validation, full ACP handshake (initialize →
+  authenticate → session/new → session/prompt → session/update →
+  session/cancel → end), bad-frame surfacing, and missing-binary error.
+- [`cliagent_usage_grok.go`](cliagent_usage_grok.go) +
+  [`cliagent_usage_test.go`](cliagent_usage_test.go) — pins the
+  cached-token discovery (auth.json + cached_token.json layouts,
+  `$GROK_HOME` override) and the missing-login baseline entry.
