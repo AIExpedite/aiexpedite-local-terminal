@@ -1940,6 +1940,32 @@ func TestValidateGrokACPSendCwd_RejectsEscapingSessionNew(t *testing.T) {
 			frame:   `{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}`,
 			wantErr: false,
 		},
+		// session/load is ACP's resume-a-session counterpart to session/new and
+		// carries the same `params.cwd` that anchors the session root. It must
+		// go through the same containment gate or a signed grok_acp_send that
+		// resumes a session could escape the workspace root.
+		{
+			name:    "session_load_inside_root_accepted",
+			frame:   fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"cwd":%q,"sessionId":"sess-1"}}`, inside),
+			wantErr: false,
+		},
+		{
+			name:      "session_load_outside_root_rejected",
+			frame:     fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"cwd":%q,"sessionId":"sess-1"}}`, outside),
+			wantErr:   true,
+			errSubstr: "outside the configured workspace root",
+		},
+		{
+			name:      "session_load_relative_cwd_rejected",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"cwd":"../etc","sessionId":"sess-1"}}`,
+			wantErr:   true,
+			errSubstr: "must be an absolute path",
+		},
+		{
+			name:    "session_load_without_cwd_accepted",
+			frame:   `{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"sess-1"}}`,
+			wantErr: false,
+		},
 		{
 			name:    "non_jsonrpc_frame_accepted",
 			frame:   `"not-an-object"`,
@@ -1966,26 +1992,33 @@ func TestValidateGrokACPSendCwd_RejectsEscapingSessionNew(t *testing.T) {
 }
 
 // TestValidateGrokACPSendCwd_SymlinkEscapeRejected pins the canonical
-// "appears inside, actually escapes" attack — a session/new whose cwd is a
-// symlink under root that resolves to an outside path.
+// "appears inside, actually escapes" attack — a session-setup frame whose
+// cwd is a symlink under root that resolves to an outside path. Covers both
+// `session/new` and `session/load` so the resume code path can't sneak past
+// the gate the create path enforces.
 func TestValidateGrokACPSendCwd_SymlinkEscapeRejected(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink + containment semantics covered on unix")
 	}
-	root := t.TempDir()
-	outside := t.TempDir()
-	escape := filepath.Join(root, "escape")
-	if err := os.Symlink(outside, escape); err != nil {
-		t.Skipf("symlink not supported: %v", err)
-	}
-	resolvedRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		t.Fatalf("eval root: %v", err)
-	}
-	frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}`, escape)
-	err = validateGrokACPSendCwd(frame, resolvedRoot)
-	if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
-		t.Fatalf("symlink-resolved escape must be rejected; got %v", err)
+	for _, method := range []string{"session/new", "session/load"} {
+		method := method
+		t.Run(strings.ReplaceAll(method, "/", "_"), func(t *testing.T) {
+			root := t.TempDir()
+			outside := t.TempDir()
+			escape := filepath.Join(root, "escape")
+			if err := os.Symlink(outside, escape); err != nil {
+				t.Skipf("symlink not supported: %v", err)
+			}
+			resolvedRoot, err := filepath.EvalSymlinks(root)
+			if err != nil {
+				t.Fatalf("eval root: %v", err)
+			}
+			frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":{"cwd":%q,"sessionId":"sess-1"}}`, method, escape)
+			err = validateGrokACPSendCwd(frame, resolvedRoot)
+			if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
+				t.Fatalf("symlink-resolved escape must be rejected for %s; got %v", method, err)
+			}
+		})
 	}
 }
 

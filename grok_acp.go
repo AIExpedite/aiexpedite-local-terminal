@@ -145,9 +145,9 @@ type GrokACPSession struct {
 	TimeoutMs   int64 // 0 = no per-session timeout (rely on grokACPMaxLifetime stale GC)
 	// WorkspaceRoot is the symlink-resolved containment root captured at Start
 	// (empty when the dispatcher didn't configure one). Send uses it to
-	// re-enforce containment on later JSON-RPC `session/new` frames whose
-	// `params.cwd` would otherwise bypass the gate Start applied to the
-	// process-level cwd.
+	// re-enforce containment on later JSON-RPC session-setup frames
+	// (`session/new` and `session/load`) whose `params.cwd` would otherwise
+	// bypass the gate Start applied to the process-level cwd.
 	WorkspaceRoot string
 
 	mu           sync.Mutex
@@ -460,13 +460,15 @@ func (m *GrokACPManager) Send(id string, payload string) error {
 		return fmt.Errorf("payload is not valid JSON: %w", err)
 	}
 
-	// Re-enforce workspace containment on ACP `session/new` frames. Start
-	// already gated the process-level cwd, but `session/new` carries its own
+	// Re-enforce workspace containment on ACP session-setup frames
+	// (`session/new` and `session/load`). Start already gated the
+	// process-level cwd, but both setup verbs can carry their own
 	// `params.cwd` that Grok will use as the session root — without this
-	// check a later signed grok_acp_send could point Grok at a path outside
-	// the configured workspace and bypass the original Start gate. Skipped
-	// when the session was launched without a containment root (mirrors
-	// Start's behaviour) or when the frame omits `params.cwd`.
+	// check a later signed grok_acp_send (including one that resumes a
+	// prior session) could point Grok at a path outside the configured
+	// workspace and bypass the original Start gate. Skipped when the
+	// session was launched without a containment root (mirrors Start's
+	// behaviour) or when the frame omits `params.cwd`.
 	if session.WorkspaceRoot != "" {
 		if err := validateGrokACPSendCwd(trimmed, session.WorkspaceRoot); err != nil {
 			return err
@@ -1552,14 +1554,21 @@ func redactGrokACPArgsForLog(args []string) []string {
 }
 
 // validateGrokACPSendCwd inspects a JSON-RPC frame and, if it is an ACP
-// `session/new` request, requires its `params.cwd` to resolve inside root.
-// Mirrors the containment check Start applies to the process-level cwd so
-// the in-protocol session cwd cannot escape it.
+// session-setup request (`session/new` or `session/load`), requires its
+// `params.cwd` to resolve inside root. Mirrors the containment check Start
+// applies to the process-level cwd so the in-protocol session cwd cannot
+// escape it.
 //
-// Frames without method `session/new` or without a `params.cwd` string are
+// Both methods are covered because ACP exposes `session/load` as the
+// session-setup alternative to `session/new` for resumed sessions, and Grok
+// ACP clients pass `cwd` on loads too — gating only `session/new` would let
+// a later signed grok_acp_send that resumes a session point Grok at a
+// directory outside the workspace root.
+//
+// Frames whose method is neither setup verb, or that omit `params.cwd`, are
 // accepted unchanged — ACP carries many other request shapes whose params we
 // must not interpret. Errors are returned only when we are certain we have a
-// `session/new` with a cwd that fails containment; transient parse hiccups
+// setup frame with a cwd that fails containment; transient parse hiccups
 // fall through to acceptance because Send has already established the frame
 // is valid top-level JSON.
 func validateGrokACPSendCwd(frame, resolvedRoot string) error {
@@ -1572,21 +1581,28 @@ func validateGrokACPSendCwd(frame, resolvedRoot string) error {
 	if err := json.Unmarshal([]byte(frame), &probe); err != nil {
 		return nil
 	}
-	if probe.Method != "session/new" || probe.Params.Cwd == "" {
+	if !isGrokACPSessionSetupMethod(probe.Method) || probe.Params.Cwd == "" {
 		return nil
 	}
 	cwd := probe.Params.Cwd
 	if !filepath.IsAbs(cwd) {
-		return fmt.Errorf("session/new params.cwd must be an absolute path; got %q", cwd)
+		return fmt.Errorf("%s params.cwd must be an absolute path; got %q", probe.Method, cwd)
 	}
 	resolved, err := resolveCwdForContainment(cwd)
 	if err != nil {
-		return fmt.Errorf("session/new params.cwd %q could not be safely resolved: %w", cwd, err)
+		return fmt.Errorf("%s params.cwd %q could not be safely resolved: %w", probe.Method, cwd, err)
 	}
 	if !pathInsideRoot(resolved, resolvedRoot) {
-		return fmt.Errorf("session/new params.cwd %q is outside the configured workspace root %q", resolved, resolvedRoot)
+		return fmt.Errorf("%s params.cwd %q is outside the configured workspace root %q", probe.Method, resolved, resolvedRoot)
 	}
 	return nil
+}
+
+// isGrokACPSessionSetupMethod reports whether method is one of the ACP
+// session-setup verbs whose `params.cwd` (when present) anchors the session
+// to a workspace path and therefore must be containment-checked.
+func isGrokACPSessionSetupMethod(method string) bool {
+	return method == "session/new" || method == "session/load"
 }
 
 // resolveCwdForContainment resolves cwd through any symlinks so a later
