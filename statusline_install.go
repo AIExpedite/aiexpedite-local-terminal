@@ -20,8 +20,11 @@ import (
 // Git Bash when installed, PowerShell otherwise (per the Claude status-line
 // "Windows configuration" docs). Returns the path to Git Bash's bash.exe, or ""
 // when not found. Checks the standard Git-for-Windows install locations, then
-// derives it from `git` on PATH, then any non-WSL `bash` on PATH (WSL's
-// System32 bash has different path semantics and is intentionally excluded).
+// derives it from `git` on PATH. A PATH-resolved `bash.exe` is only accepted
+// when its path looks like Git for Windows (contains a `git` segment) — a bare
+// MSYS2/Cygwin/WSL `bash` is NOT Git Bash, and accepting it would emit the
+// no-`&` form that PowerShell (Claude's actual fallback shell here) treats as
+// a string literal, so the hook would silently never run.
 func findGitBash() string {
 	if runtime.GOOS != "windows" {
 		return ""
@@ -45,11 +48,27 @@ func findGitBash() string {
 			return c
 		}
 	}
-	if p, err := exec.LookPath("bash"); err == nil &&
-		!strings.Contains(strings.ToLower(p), `\windows\system32`) {
+	if p, err := exec.LookPath("bash"); err == nil && isGitForWindowsBashPath(p) {
 		return p
 	}
 	return ""
+}
+
+// isGitForWindowsBashPath returns true for a bash.exe that lives under a Git
+// for Windows install layout (a `git` path segment, not under System32).
+// Filters out WSL (System32), MSYS2, Cygwin, and other non-Git-Bash shells
+// that Claude does NOT route the status-line command through.
+func isGitForWindowsBashPath(p string) bool {
+	lp := strings.ToLower(filepath.ToSlash(p))
+	if strings.Contains(lp, "/windows/system32/") {
+		return false
+	}
+	for _, seg := range strings.Split(lp, "/") {
+		if seg == "git" {
+			return true
+		}
+	}
+	return false
 }
 
 // claudeStatusLine mirrors Claude Code's settings.json `statusLine` object.
