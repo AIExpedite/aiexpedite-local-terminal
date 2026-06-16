@@ -1358,7 +1358,18 @@ func detectPinnedGrokRequirementsFile(path string, allowAPIKey, allowAlwaysAppro
 			continue
 		}
 		key := strings.TrimSpace(line[:eq])
-		val := strings.TrimSpace(line[eq+1:])
+		// Strip inline `# comment` from the value before quote-trimming so
+		// pinned `always_approve = true # managed` reduces to `true` (the
+		// gate's exact boolean match) instead of `true # managed` (which
+		// silently misses and lets requirements.toml route past the
+		// approval policy). For multi-line TOML arrays (the documented
+		// `permission_rules = [ ... ]` form) we accumulate continuation
+		// lines so a deny-only list isn't misread as the legacy bare-
+		// pattern allow shortcut.
+		val := strings.TrimSpace(stripTOMLInlineComment(line[eq+1:]))
+		if bracketDepthOutsideStrings(val) > 0 {
+			val = strings.TrimSpace(accumulateTOMLMultilineArray(scanner, val))
+		}
 		// Render as the dotted-path form the isGrok*ConfigKV gates
 		// already understand so detection stays in lockstep with the
 		// argv strip surface.
@@ -1466,6 +1477,131 @@ func trimTOMLString(v string) string {
 		}
 	}
 	return v
+}
+
+// stripTOMLInlineComment removes a trailing `# ...` comment from a TOML
+// scalar value. TOML permits inline comments after a value on the same
+// line, so a pinned `always_approve = true # managed` (or
+// `[tools] always_approve = true  # managed`) would otherwise leave our
+// line-oriented requirements/config scanners with the raw value
+// `true # managed`, which neither the boolean nor string gate matches —
+// silently routing past the approval policy.
+//
+// Quotes are tracked so a `#` inside a TOML basic ("...") or literal
+// ('...') string is preserved. Backslash escapes inside basic strings are
+// skipped so `\"` does not look like a closing quote. The caller is
+// expected to re-trim trailing whitespace, but we also do it here for
+// safety.
+func stripTOMLInlineComment(v string) string {
+	inDouble := false
+	inSingle := false
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if inDouble {
+			if c == '\\' && i+1 < len(v) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+		case '\'':
+			inSingle = true
+		case '#':
+			return strings.TrimRight(v[:i], " \t")
+		}
+	}
+	return v
+}
+
+// bracketDepthOutsideStrings counts the net `[` minus `]` characters that
+// sit OUTSIDE TOML basic and literal strings. Used by
+// accumulateTOMLMultilineArray to decide whether a `permission_rules = [`
+// opening still needs more continuation lines before the value is
+// classifiable. Quote tracking mirrors stripTOMLInlineComment so a
+// `pattern = "Bash[*]"` literal doesn't confuse the depth count.
+func bracketDepthOutsideStrings(s string) int {
+	depth := 0
+	inDouble := false
+	inSingle := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inDouble {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+		case '\'':
+			inSingle = true
+		case '[':
+			depth++
+		case ']':
+			depth--
+		}
+	}
+	return depth
+}
+
+// accumulateTOMLMultilineArray reads continuation lines from the scanner
+// while the running bracket depth (starting at the depth of `initial`) is
+// still positive, joining them into a single logical value. xAI's
+// enterprise docs document `permission_rules` as a TOML array, which is
+// commonly hand-written across multiple lines:
+//
+//	permission_rules = [
+//	  { action = "deny", pattern = "Bash(rm -rf*)" }
+//	]
+//
+// Without accumulation the line scanner sees the value `[` on the first
+// line, hits grokPermissionRulesValueHasAllowAction, finds no `action`
+// substring, and misclassifies the deny-only list as a legacy bare-pattern
+// allow shortcut. That wipes an MDM-style deny rule via the neutralizer
+// AND rejects an otherwise stricter deny-only policy in the requirements
+// gate. We bound the read at 256 lines so a corrupted file with no
+// closing `]` can't stall the launch.
+func accumulateTOMLMultilineArray(scanner *bufio.Scanner, initial string) string {
+	depth := bracketDepthOutsideStrings(initial)
+	if depth <= 0 {
+		return initial
+	}
+	parts := make([]string, 0, 4)
+	parts = append(parts, initial)
+	const maxContinuationLines = 256
+	for i := 0; i < maxContinuationLines && depth > 0 && scanner.Scan(); i++ {
+		ln := stripTOMLInlineComment(scanner.Text())
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		depth += bracketDepthOutsideStrings(ln)
+		parts = append(parts, ln)
+	}
+	return strings.Join(parts, " ")
 }
 
 // mergeGrokModelScopes returns the union of two scope slices, preserving
@@ -1579,6 +1715,16 @@ func grokPolicyNeutralizingConfigArgs() []string {
 		"--config", "ui.permission_mode=",
 		"--config", "tools.always_approve=false",
 		"--config", "tools.auto_approve=false",
+		// Legacy spellings xAI's Modes and Commands page still accepts.
+		// `approval_mode` is the undotted variant of `approval.mode`, and
+		// `yolo = true` desugars to the same always-approve posture as
+		// `tools.always_approve = true`. Mirrors isGrokApprovalConfigKV's
+		// gated set so the argv-strip and persisted-config-clear surfaces
+		// stay symmetric — a persisted `~/.grok/config.toml` with either
+		// key would otherwise route past the per-tool prompt despite the
+		// workspace not opting into EnableGrokAlwaysApprove.
+		"--config", "approval_mode=",
+		"--config", "yolo=false",
 	}
 }
 
@@ -1647,7 +1793,16 @@ func parsePersistedGrokPermissionRulesHasAllowAction(path string) bool {
 			continue
 		}
 		key := strings.TrimSpace(line[:eq])
-		val := strings.TrimSpace(line[eq+1:])
+		// Strip inline comments and accumulate multi-line array continuations
+		// before classification so a deny-only `permission_rules = [\n  {action="deny",…}\n]`
+		// is not misread as the legacy bare-pattern allow shortcut on the
+		// first-line value `[`. Matching detectPinnedGrokRequirementsFile's
+		// approach keeps the user-config neutralizer and the requirements
+		// gate symmetric on multi-line TOML.
+		val := strings.TrimSpace(stripTOMLInlineComment(line[eq+1:]))
+		if bracketDepthOutsideStrings(val) > 0 {
+			val = strings.TrimSpace(accumulateTOMLMultilineArray(scanner, val))
+		}
 		dotted := key
 		if currentSection != "" {
 			dotted = currentSection + "." + key
@@ -2054,7 +2209,22 @@ func isGrokApprovalConfigKV(value string) bool {
 	if (key == "tools.always_approve" || key == "tools.auto_approve") && (val == "true" || val == "1" || val == "yes" || val == "on") {
 		return true
 	}
-	if (key == "approval.mode" || key == "approval") && val != "" {
+	// xAI's Modes and Commands page documents a `yolo = true` legacy
+	// shortcut that desugars to the same `always-approve` posture as
+	// `tools.always_approve = true`. Without this branch, a host with
+	// `/etc/grok/requirements.toml` pinning `yolo = true` would route past
+	// the approval gate (detectPinnedGrokRequirementsFile would not flag
+	// the line, and the per-process `--config yolo=false` neutralizer in
+	// grokPolicyNeutralizingConfigArgs would not be emitted) despite
+	// EnableGrokAlwaysApprove being false.
+	if key == "yolo" && (val == "true" || val == "1" || val == "yes" || val == "on") {
+		return true
+	}
+	// `approval_mode` is the legacy spelling of `approval.mode` xAI keeps
+	// accepting for backward compat. Same gated value set so a persisted
+	// `approval_mode = "always-approve"` cannot silently shadow the
+	// per-tool prompt selector.
+	if (key == "approval.mode" || key == "approval" || key == "approval_mode") && val != "" {
 		if val == "always" || val == "auto" || val == "auto-approve" || val == "always-approve" {
 			return true
 		}

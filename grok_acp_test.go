@@ -42,7 +42,7 @@ func TestBuildGrokACPArgs_DefaultsToAgentStdio(t *testing.T) {
 	// `--permission-mode default` is appended whenever allowAlwaysApprove=false to
 	// override any persistent `~/.grok/config.toml` always-approve setting via
 	// the higher-precedence argv surface.
-	want := []string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"}
+	want := []string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(nil) = %#v, want %#v", got, want)
 	}
@@ -51,7 +51,7 @@ func TestBuildGrokACPArgs_DefaultsToAgentStdio(t *testing.T) {
 func TestBuildGrokACPArgs_ForwardsExtraArgs(t *testing.T) {
 	t.Setenv("GROK_HOME", t.TempDir())
 	got := buildGrokACPArgs([]string{"--model", "grok-2-fast", "--config", "auth.method=cached_token"}, false, false)
-	want := []string{"agent", "stdio", "--no-auto-update", "--model", "grok-2-fast", "--config", "auth.method=cached_token", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2-fast.api_key=", "--config", "model.grok-2-fast.env_key=", "--permission-mode", "default"}
+	want := []string{"agent", "stdio", "--no-auto-update", "--model", "grok-2-fast", "--config", "auth.method=cached_token", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2-fast.api_key=", "--config", "model.grok-2-fast.env_key=", "--permission-mode", "default"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs = %#v, want %#v", got, want)
 	}
@@ -121,17 +121,17 @@ func TestBuildGrokACPArgs_NoAutoUpdateDedupedAndAutoUpdateStripped(t *testing.T)
 		{
 			"caller_supplied_no_auto_update_is_deduped",
 			[]string{"--no-auto-update", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"caller_supplied_auto_update_is_stripped",
 			[]string{"--auto-update", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"both_forms_collapsed_to_single_no_auto_update",
 			[]string{"--auto-update", "--no-auto-update", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 	}
 	for _, c := range cases {
@@ -158,17 +158,17 @@ func TestBuildGrokACPArgs_StripsCwdOverride(t *testing.T) {
 		{
 			"separate_value_cwd_dropped_with_value",
 			[]string{"--cwd", "/tmp/other", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"equals_form_cwd_dropped",
 			[]string{"--cwd=/tmp/other", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"case_insensitive_cwd_dropped",
 			[]string{"--CWD", "/tmp/other"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 	}
 	for _, c := range cases {
@@ -193,12 +193,12 @@ func TestBuildGrokACPArgs_PreservesValueOfValuedFlag(t *testing.T) {
 		{
 			"config_value_is_agent",
 			[]string{"-c", "agent", "-c", "model=grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "-c", "agent", "-c", "model=grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "-c", "agent", "-c", "model=grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"config_value_is_stdio",
 			[]string{"--config", "stdio", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "stdio", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "stdio", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 	}
 	for _, c := range cases {
@@ -226,27 +226,27 @@ func TestBuildGrokACPArgs_StripsAuthOverridesByDefault(t *testing.T) {
 		{
 			"strips_api_key_separate_value",
 			[]string{"--api-key", "xai-abc", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_api_key_equals_form",
 			[]string{"--api-key=xai-abc", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_auth_method",
 			[]string{"--auth", "xai.api_key", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_auth_equals_form",
 			[]string{"--auth=xai.api_key", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_api_key_env",
 			[]string{"--api-key-env", "OTHER_KEY", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 	}
 	for _, c := range cases {
@@ -265,7 +265,7 @@ func TestBuildGrokACPArgs_StripsAuthOverridesByDefault(t *testing.T) {
 // must flow through verbatim.
 func TestBuildGrokACPArgs_PreservesAuthOverridesWhenFallbackEnabled(t *testing.T) {
 	got := buildGrokACPArgs([]string{"--api-key", "xai-abc", "--model", "grok-2"}, true, false)
-	want := []string{"agent", "stdio", "--no-auto-update", "--api-key", "xai-abc", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--permission-mode", "default"}
+	want := []string{"agent", "stdio", "--no-auto-update", "--api-key", "xai-abc", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--permission-mode", "default"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(allowAPIKey=true) must preserve --api-key; got %#v, want %#v", got, want)
 	}
@@ -1687,32 +1687,32 @@ func TestBuildGrokACPArgs_StripsAlwaysApproveByDefault(t *testing.T) {
 		{
 			"strips_always_approve_bare",
 			[]string{"--always-approve", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_always_approve_equals_true",
 			[]string{"--always-approve=true", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_always_approve_equals_false_still_drops",
 			[]string{"--always-approve=false", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_auto_approve_bare",
 			[]string{"--auto-approve", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_auto_approve_equals_form",
 			[]string{"--auto-approve=true", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_when_interleaved_with_kept_args",
 			[]string{"--model", "grok-2", "--always-approve", "--config", "log.level=debug"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "log.level=debug", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "log.level=debug", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 	}
 	for _, c := range cases {
@@ -1909,6 +1909,7 @@ func TestBuildGrokACPArgs_StripsAllowRulesByDefault(t *testing.T) {
 		"--config", "approval.mode=", "--config", "approval.permission_mode=",
 		"--config", "ui.permission_mode=",
 		"--config", "tools.always_approve=false", "--config", "tools.auto_approve=false",
+		"--config", "approval_mode=", "--config", "yolo=false",
 		"--config", "model.api_key=", "--config", "model.env_key=",
 		"--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=",
 		"--config", "xai.api_key=", "--config", "xai.env_key=",
@@ -1935,47 +1936,47 @@ func TestBuildGrokACPArgs_StripsPermissionModeBypassByDefault(t *testing.T) {
 		{
 			"strips_permission_mode_bypass_separate",
 			[]string{"--permission-mode", "bypassPermissions", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_permission_mode_bypass_equals",
 			[]string{"--permission-mode=bypassPermissions", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_underscore_alias",
 			[]string{"--permission_mode", "bypassPermissions"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_bare_bypass_synonym",
 			[]string{"--permission-mode", "bypass"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_auto_synonym_equals",
 			[]string{"--permission-mode=auto"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_accept_edits_separate",
 			[]string{"--permission-mode", "acceptEdits", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"strips_accept_edits_equals_separator_variant",
 			[]string{"--permission-mode=accept-edits"},
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"keeps_permission_mode_ask_separate",
 			[]string{"--permission-mode", "ask", "--model", "grok-2"},
-			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key="},
 		},
 		{
 			"keeps_permission_mode_ask_equals",
 			[]string{"--permission-mode=ask"},
-			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode=ask", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode=ask", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 	}
 	for _, c := range cases {
@@ -2037,49 +2038,49 @@ func TestBuildGrokACPArgs_PinsPermissionModeAskAgainstHostConfig(t *testing.T) {
 			"injects_when_no_caller_pin",
 			nil,
 			true,
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"injects_when_only_unrelated_extras",
 			[]string{"--model", "grok-2"},
 			true,
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		{
 			"skips_when_caller_pins_ask_separate",
 			[]string{"--permission-mode", "ask", "--model", "grok-2"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode", "ask", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key="},
 		},
 		{
 			"skips_when_caller_pins_ask_equals",
 			[]string{"--permission-mode=ask"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode=ask", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission-mode=ask", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 		{
 			"skips_when_caller_pins_underscore_alias",
 			[]string{"--permission_mode", "ask"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "--permission_mode", "ask", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--permission_mode", "ask", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 		{
 			"skips_when_caller_pins_via_config_separate",
 			[]string{"--config", "approval.permission_mode=ask", "--model", "grok-2"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "approval.permission_mode=ask", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "approval.permission_mode=ask", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key="},
 		},
 		{
 			"skips_when_caller_pins_via_short_config",
 			[]string{"-c", "permission_mode=ask"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "-c", "permission_mode=ask", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "-c", "permission_mode=ask", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 		{
 			"skips_when_caller_pins_via_inline_config_equals",
 			[]string{"--config=approval.permission_mode=ask"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "--config=approval.permission_mode=ask", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--config=approval.permission_mode=ask", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key="},
 		},
 		{
 			"injects_when_caller_bypass_value_is_stripped",
@@ -2087,7 +2088,7 @@ func TestBuildGrokACPArgs_PinsPermissionModeAskAgainstHostConfig(t *testing.T) {
 			// callers cannot use a bypass value to suppress our injection.
 			[]string{"--permission-mode", "bypassPermissions", "--model", "grok-2"},
 			true,
-			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
+			[]string{"agent", "stdio", "--no-auto-update", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key=", "--permission-mode", "default"},
 		},
 		// `ui.permission_mode=ask` is xAI's persisted-config form of the same
 		// conservative selector; the explicit caller pin must suppress the
@@ -2097,7 +2098,7 @@ func TestBuildGrokACPArgs_PinsPermissionModeAskAgainstHostConfig(t *testing.T) {
 			"skips_when_caller_pins_via_config_ui_namespace",
 			[]string{"--config", "ui.permission_mode=ask", "--model", "grok-2"},
 			false,
-			[]string{"agent", "stdio", "--no-auto-update", "--config", "ui.permission_mode=ask", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key="},
+			[]string{"agent", "stdio", "--no-auto-update", "--config", "ui.permission_mode=ask", "--model", "grok-2", "--config", "policy.allow=", "--config", "permissions.allow=", "--config", "tools.allow=", "--config", "approval.mode=", "--config", "approval.permission_mode=", "--config", "ui.permission_mode=", "--config", "tools.always_approve=false", "--config", "tools.auto_approve=false", "--config", "approval_mode=", "--config", "yolo=false", "--config", "model.api_key=", "--config", "model.env_key=", "--config", "model.grok-build.api_key=", "--config", "model.grok-build.env_key=", "--config", "xai.api_key=", "--config", "xai.env_key=", "--config", "model.grok-2.api_key=", "--config", "model.grok-2.env_key="},
 		},
 	}
 	for _, c := range cases {
@@ -2731,6 +2732,8 @@ func TestBuildGrokACPArgs_NeutralizesPersistentAllowRulesByDefault(t *testing.T)
 		"approval.permission_mode=",
 		"tools.always_approve=false",
 		"tools.auto_approve=false",
+		"approval_mode=",
+		"yolo=false",
 	}
 	for _, k := range wantKeys {
 		found := false
@@ -2834,6 +2837,8 @@ func TestBuildGrokACPArgs_OmitsPersistentAllowRulesNeutralizerWhenOptIn(t *testi
 		"approval.permission_mode=":  true,
 		"tools.always_approve=false": true,
 		"tools.auto_approve=false":   true,
+		"approval_mode=":             true,
+		"yolo=false":                 true,
 	}
 	for i := 0; i+1 < len(got); i++ {
 		if (got[i] == "--config" || got[i] == "-c") && neutralizerKeys[got[i+1]] {
@@ -3310,6 +3315,258 @@ func TestGrokPermissionRulesValueHasAllowAction(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := grokPermissionRulesValueHasAllowAction(c.value); got != c.want {
 				t.Fatalf("grokPermissionRulesValueHasAllowAction(%q) = %v, want %v", c.value, got, c.want)
+			}
+		})
+	}
+}
+
+// TestStripTOMLInlineComment pins the inline-comment stripper that the
+// requirements/config TOML scanners feed every scalar value through. Two
+// failure modes the codex P1 review called out: (1) `true # managed` must
+// reduce to `true` so the boolean gate matches, (2) a `#` inside a quoted
+// string must survive so legitimate values aren't truncated.
+func TestStripTOMLInlineComment(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"true", "true"},
+		{"true # managed", "true"},
+		{"true   # managed", "true"},
+		{"true\t# managed", "true"},
+		{"\"value#1\"", "\"value#1\""},
+		{"'value#1'", "'value#1'"},
+		{"\"a\" # comment", "\"a\""},
+		{"# comment only", ""},
+		{"", ""},
+		{"\"escaped \\\" quote # not a comment\" # actual", "\"escaped \\\" quote # not a comment\""},
+		{"  prefix-ws", "  prefix-ws"},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			if got := stripTOMLInlineComment(c.in); got != c.want {
+				t.Fatalf("stripTOMLInlineComment(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
+// TestDetectPinnedGrokRequirements_RejectsPinnedApprovalPolicyWithComment
+// pins the codex P1 follow-up: an inline comment on a pinned approval
+// scalar must not let the requirements gate miss. Without the inline
+// comment strip, `always_approve = true # managed` arrives at
+// isGrokApprovalConfigKV as `tools.always_approve=true # managed` and the
+// boolean match falls through — silently allowing the pinned host to skip
+// per-tool prompts.
+func TestDetectPinnedGrokRequirements_RejectsPinnedApprovalPolicyWithComment(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"tools_always_approve_inline_comment", "[tools]\nalways_approve = true # managed\n"},
+		{"tools_auto_approve_inline_comment", "[tools]\nauto_approve = true   # mdm\n"},
+		{"approval_mode_inline_comment", "[approval]\nmode = \"always-approve\" # policy\n"},
+		{"ui_permission_mode_inline_comment", "[ui]\npermission_mode = \"bypassPermissions\" # mdm\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "requirements.toml")
+			if err := os.WriteFile(path, []byte(c.body), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if err := detectPinnedGrokRequirementsFile(path, true, false); err == nil {
+				t.Fatalf("expected pinned permissive policy with inline comment to be rejected")
+			} else if !strings.Contains(err.Error(), "approval policy") {
+				t.Fatalf("expected approval-policy error; got %q", err.Error())
+			}
+		})
+	}
+}
+
+// TestDetectPinnedGrokRequirements_RejectsPinnedLegacyApprovalKeys pins
+// the codex P1 legacy-key follow-up. xAI's Modes and Commands page still
+// accepts the undotted `approval_mode = "always-approve"` spelling and
+// the `yolo = true` shortcut; both must be rejected by the requirements
+// gate when EnableGrokAlwaysApprove is false.
+func TestDetectPinnedGrokRequirements_RejectsPinnedLegacyApprovalKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"top_level_approval_mode_always_approve", "approval_mode = \"always-approve\"\n"},
+		{"top_level_approval_mode_auto", "approval_mode = \"auto\"\n"},
+		{"top_level_yolo_true", "yolo = true\n"},
+		{"top_level_yolo_yes", "yolo = yes\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "requirements.toml")
+			if err := os.WriteFile(path, []byte(c.body), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if err := detectPinnedGrokRequirementsFile(path, true, false); err == nil {
+				t.Fatalf("expected pinned legacy approval key to be rejected")
+			} else if !strings.Contains(err.Error(), "approval policy") {
+				t.Fatalf("expected approval-policy error; got %q", err.Error())
+			}
+			if err := detectPinnedGrokRequirementsFile(path, true, true); err != nil {
+				t.Fatalf("allow-always-approve path should tolerate pinned legacy key; got %v", err)
+			}
+		})
+	}
+}
+
+// TestIsGrokApprovalConfigKV_LegacyApprovalKeys mirrors the requirements
+// test at the gate surface: `-c approval_mode=always-approve` and
+// `-c yolo=true` MUST be classified as approval bypass so the argv
+// sanitiser drops them. `yolo=false` MUST flow through unchanged so the
+// conservative default neutralizer (`--config yolo=false`) is preserved.
+func TestIsGrokApprovalConfigKV_LegacyApprovalKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		kv   string
+		want bool
+	}{
+		{"approval_mode_always_approve", "approval_mode=always-approve", true},
+		{"approval_mode_auto", "approval_mode=auto", true},
+		{"approval_mode_ask", "approval_mode=ask", false},
+		{"yolo_true", "yolo=true", true},
+		{"yolo_yes", "yolo=yes", true},
+		{"yolo_false", "yolo=false", false},
+		{"yolo_empty", "yolo=", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isGrokApprovalConfigKV(c.kv); got != c.want {
+				t.Fatalf("isGrokApprovalConfigKV(%q) = %v, want %v", c.kv, got, c.want)
+			}
+		})
+	}
+}
+
+// TestGrokPolicyNeutralizingConfigArgsCoversLegacyKeys pins the
+// neutralizer surface: the per-process `--config <key>=` clears MUST
+// include the legacy `approval_mode` and `yolo` keys so a persisted
+// `~/.grok/config.toml` with either cannot route past the per-tool prompt
+// when EnableGrokAlwaysApprove is false.
+func TestGrokPolicyNeutralizingConfigArgsCoversLegacyKeys(t *testing.T) {
+	args := grokPolicyNeutralizingConfigArgs()
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"approval_mode=", "yolo=false"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("grokPolicyNeutralizingConfigArgs missing %q; got %v", want, args)
+		}
+	}
+}
+
+// TestParsePersistedGrokPermissionRulesMultilineDenyOnly pins the codex
+// P2 follow-up at the persisted-config scan surface: a multiline TOML
+// rule list whose entries are all `action = "deny"` MUST NOT be
+// classified as an allow shortcut, so the per-process
+// `--config permission_rules=` neutralizer is NOT emitted and the MDM
+// deny rule survives the launch unmolested.
+func TestParsePersistedGrokPermissionRulesMultilineDenyOnly(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "multiline_deny_only",
+			body: "permission_rules = [\n  { action = \"deny\", pattern = \"Bash(rm -rf*)\" }\n]\n",
+			want: false,
+		},
+		{
+			name: "multiline_deny_only_in_section",
+			body: "[permission]\nrules = [\n  { action = \"deny\", pattern = \"Bash(*)\" },\n  { action = \"deny\", pattern = \"Edit(*)\" }\n]\n",
+			want: false,
+		},
+		{
+			name: "multiline_mixed_allow_deny",
+			body: "permission_rules = [\n  { action = \"deny\", pattern = \"Bash(rm*)\" },\n  { action = \"allow\", pattern = \"Bash(*)\" }\n]\n",
+			want: true,
+		},
+		{
+			name: "multiline_legacy_bare_patterns",
+			body: "permission_rules = [\n  \"Bash(*)\",\n  \"Edit(*)\"\n]\n",
+			want: true,
+		},
+		{
+			name: "multiline_empty_array",
+			body: "permission_rules = [\n]\n",
+			want: false,
+		},
+		{
+			name: "multiline_inline_comments_in_continuation",
+			body: "permission_rules = [\n  { action = \"deny\", pattern = \"Bash(*)\" } # mdm\n]\n",
+			want: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			if err := os.WriteFile(path, []byte(c.body), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if got := parsePersistedGrokPermissionRulesHasAllowAction(path); got != c.want {
+				t.Fatalf("parsePersistedGrokPermissionRulesHasAllowAction(%q) = %v, want %v", c.name, got, c.want)
+			}
+		})
+	}
+}
+
+// TestDetectPinnedGrokRequirements_MultilinePermissionRulesDenyOnly is
+// the same multi-line accumulation property at the requirements-gate
+// surface. A `requirements.toml` whose `permission_rules` block contains
+// only deny entries MUST NOT be flagged as a pinned permissive policy —
+// otherwise the gate inverts intent and refuses hosts asking for MORE
+// security.
+func TestDetectPinnedGrokRequirements_MultilinePermissionRulesDenyOnly(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		wantErr  bool
+		wantText string
+	}{
+		{
+			name:    "multiline_deny_only",
+			body:    "permission_rules = [\n  { action = \"deny\", pattern = \"Bash(rm -rf*)\" }\n]\n",
+			wantErr: false,
+		},
+		{
+			name:     "multiline_with_allow",
+			body:     "permission_rules = [\n  { action = \"deny\", pattern = \"Bash(rm*)\" },\n  { action = \"allow\", pattern = \"Bash(*)\" }\n]\n",
+			wantErr:  true,
+			wantText: "approval policy",
+		},
+		{
+			name:    "multiline_empty",
+			body:    "permission_rules = [\n]\n",
+			wantErr: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "requirements.toml")
+			if err := os.WriteFile(path, []byte(c.body), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			err := detectPinnedGrokRequirementsFile(path, true, false)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("expected pinned allow rule to be rejected")
+				}
+				if !strings.Contains(err.Error(), c.wantText) {
+					t.Fatalf("expected error containing %q; got %q", c.wantText, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("deny-only/empty multiline rules MUST NOT trip the gate; got %v", err)
+				}
 			}
 		})
 	}
