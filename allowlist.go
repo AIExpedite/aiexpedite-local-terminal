@@ -488,6 +488,14 @@ gemini
 gemini *
 agy
 agy *
+# Bare "grok" / "grok *" deliberately omitted so a signed execute of raw
+# grok cannot bypass the ACP manager auth/approval gates
+# (EnableGrokAPIKeyFallback / EnableGrokAlwaysApprove). Only the ACP entry
+# shape — "grok agent stdio ...", synthesised by buildGrokACPArgs in
+# gateSessionEntryCommand — is default-allowed so grok_acp_start does not
+# block on the approval dialog on a stock install.
+grok agent stdio
+grok agent stdio *
 
 # --- Remote/SSH ---
 ssh *

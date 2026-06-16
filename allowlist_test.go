@@ -5,6 +5,7 @@
 package main
 
 import (
+	"path/filepath"
 	"regexp"
 	"testing"
 )
@@ -153,5 +154,39 @@ func TestPatternToRegex_MalformedPatternFallsBackSafely(t *testing.T) {
 	// Empty pattern → "^$" → matches only the empty string. Not dangerous.
 	if re.MatchString("anything") {
 		t.Errorf("empty pattern matched non-empty string")
+	}
+}
+
+func TestDefaultAllowList_GrokACPNarrowEntry(t *testing.T) {
+	// The default allowlist must default-allow the synthesised
+	// `grok agent stdio ...` argv that gateSessionEntryCommand passes for
+	// grok_acp_start, while still denying raw `grok` execution so a signed
+	// `execute` cannot bypass the ACP manager's auth/approval gates.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	al := &AllowList{configPath: path}
+	if err := al.CreateDefault(); err != nil {
+		t.Fatalf("CreateDefault: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	cases := []struct {
+		cmd  string
+		args []string
+		want bool
+		why  string
+	}{
+		{"grok", []string{"agent", "stdio", "--no-auto-update"}, true, "ACP entry must be allowed by default"},
+		{"grok", []string{"agent", "stdio"}, true, "bare ACP entry must be allowed"},
+		{"grok", []string{"--always-approve", "-p", "do thing"}, false, "raw grok must still require approval"},
+		{"grok", nil, false, "raw bare grok must still require approval"},
+		{"grok", []string{"agent", "tui"}, false, "non-stdio grok subcommand must not match"},
+	}
+	for _, tc := range cases {
+		if got := al.IsAllowed(tc.cmd, tc.args); got != tc.want {
+			t.Errorf("IsAllowed(%q, %v) = %v; want %v (%s)", tc.cmd, tc.args, got, tc.want, tc.why)
+		}
 	}
 }
