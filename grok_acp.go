@@ -1353,8 +1353,8 @@ func detectPinnedGrokRequirementsFile(path string, allowAPIKey, allowAlwaysAppro
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			currentSection = strings.TrimSpace(line[1 : len(line)-1])
+		if name, ok := parseTOMLSectionHeader(line); ok {
+			currentSection = name
 			continue
 		}
 		eq := strings.IndexByte(line, '=')
@@ -1438,8 +1438,8 @@ func parsePersistedGrokModelScopesWithAPIKey(path string) []string {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			currentSection = strings.TrimSpace(line[1 : len(line)-1])
+		if name, ok := parseTOMLSectionHeader(line); ok {
+			currentSection = name
 			currentScope = ""
 			if strings.HasPrefix(currentSection, "model.") {
 				currentScope = currentSection[len("model."):]
@@ -1545,6 +1545,31 @@ func stripTOMLInlineComment(v string) string {
 		}
 	}
 	return v
+}
+
+// parseTOMLSectionHeader recognises a line as a TOML section header,
+// tolerating a trailing inline comment such as `[tools] # managed` that the
+// TOML spec permits but a naive `HasSuffix(line, "]")` check rejects. Without
+// this, a pinned `requirements.toml` whose table headers carry a managed-by
+// comment would silently skip section tracking, and the following
+// `api_key = ...` / `always_approve = true` would be evaluated as bare top-
+// level keys that the dotted-form `isGrok*ConfigKV` gates never match —
+// letting a pinned host bypass the API-key and approval opt-ins. Returns the
+// trimmed section name and ok=true only when the closing `]` is followed by
+// nothing but whitespace and an optional `# comment`.
+func parseTOMLSectionHeader(line string) (string, bool) {
+	if !strings.HasPrefix(line, "[") {
+		return "", false
+	}
+	end := strings.IndexByte(line, ']')
+	if end < 0 {
+		return "", false
+	}
+	tail := strings.TrimSpace(stripTOMLInlineComment(line[end+1:]))
+	if tail != "" {
+		return "", false
+	}
+	return strings.TrimSpace(line[1:end]), true
 }
 
 // bracketDepthOutsideStrings counts the net `[` minus `]` characters that
@@ -1806,8 +1831,8 @@ func parsePersistedGrokPermissionRulesHasAllowAction(path string) bool {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			currentSection = strings.TrimSpace(line[1 : len(line)-1])
+		if name, ok := parseTOMLSectionHeader(line); ok {
+			currentSection = name
 			continue
 		}
 		eq := strings.IndexByte(line, '=')

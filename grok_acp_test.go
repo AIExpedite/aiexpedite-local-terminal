@@ -3296,6 +3296,81 @@ func TestDetectPinnedGrokRequirements_MissingFileTolerated(t *testing.T) {
 	}
 }
 
+// TestDetectPinnedGrokRequirements_RejectsCommentedTableHeaders pins the
+// codex P1 case: a valid TOML inline comment on a section header such as
+// `[tools] # managed` must not slip the following `always_approve = true`
+// (or `[model.custom] # managed` followed by `api_key = "xai-..."`) past
+// the pinned-requirements gate. Without quote-aware header parsing the
+// trimmed line no longer ends in `]`, currentSection stays "", and the
+// gated key is evaluated as a bare top-level identifier the dotted-form
+// isGrok*ConfigKV gates never match.
+func TestDetectPinnedGrokRequirements_RejectsCommentedTableHeaders(t *testing.T) {
+	cases := []struct {
+		name           string
+		body           string
+		allowAPIKey    bool
+		allowApprove   bool
+		expectContains string
+	}{
+		{
+			name:           "tools_header_inline_comment_pins_always_approve",
+			body:           "[tools] # managed\nalways_approve = true\n",
+			allowAPIKey:    true,
+			allowApprove:   false,
+			expectContains: "approval policy",
+		},
+		{
+			name:           "model_scope_header_inline_comment_pins_api_key",
+			body:           "[model.custom] # managed\napi_key = \"xai-pinned\"\n",
+			allowAPIKey:    false,
+			allowApprove:   true,
+			expectContains: "API-key",
+		},
+		{
+			name:           "approval_header_inline_comment_pins_permission_mode",
+			body:           "[approval]  #managed\npermission_mode = \"bypassPermissions\"\n",
+			allowAPIKey:    true,
+			allowApprove:   false,
+			expectContains: "approval policy",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "requirements.toml")
+			if err := os.WriteFile(path, []byte(c.body), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			err := detectPinnedGrokRequirementsFile(path, c.allowAPIKey, c.allowApprove)
+			if err == nil {
+				t.Fatalf("expected pinned key under commented header to be rejected")
+			}
+			if !strings.Contains(err.Error(), c.expectContains) {
+				t.Fatalf("expected error containing %q; got %q", c.expectContains, err.Error())
+			}
+		})
+	}
+}
+
+// TestParsePersistedGrokModelScopes_HonorsCommentedHeaders pins the same
+// commented-header property for the persisted-config scope scanner — a
+// `[model.custom] # managed` table whose `api_key` lives on the next line
+// must still be discovered so buildGrokACPArgs can emit a per-scope
+// neutralizer.
+func TestParsePersistedGrokModelScopes_HonorsCommentedHeaders(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := "[model.custom] # managed\napi_key = \"xai-pinned\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := parsePersistedGrokModelScopesWithAPIKey(path)
+	want := []string{"custom"}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("parsePersistedGrokModelScopesWithAPIKey = %v, want %v", got, want)
+	}
+}
+
 // TestDetectPinnedGrokRequirements_PassesDenyOnlyPermissionRules pins the
 // deny-rule preservation property the codex P2 review called out: a
 // requirements.toml that pins only `action = "deny"` rules under
