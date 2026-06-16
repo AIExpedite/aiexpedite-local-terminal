@@ -130,6 +130,108 @@ func TestEnsureClaudeStatusLineHook_SkipsWhenNoClaude(t *testing.T) {
 	}
 }
 
+func TestRemoveClaudeStatusLineHook_RestoresStashedCommand(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	prevFile := filepath.Join(t.TempDir(), "prev.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", prevFile)
+
+	// Install once over an existing third-party command — this stashes the user's
+	// command and writes our hook into settings.json.
+	seed := `{"theme":"dark","statusLine":{"type":"command","command":"my-custom-line.sh"}}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureClaudeStatusLineHook(home); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	// Now opt out: the stashed command must be restored verbatim and other keys
+	// preserved.
+	changed, err := removeClaudeStatusLineHook(home)
+	if err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	sl := readStatusLine(t, filepath.Join(claudeDir, "settings.json"))
+	if sl.Type != "command" || sl.Command != "my-custom-line.sh" {
+		t.Errorf("statusLine not restored to stashed command: %+v", sl)
+	}
+	raw, _ := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := settings["theme"]; !ok {
+		t.Errorf("unrelated 'theme' key dropped during opt-out: %s", raw)
+	}
+	if _, err := os.Stat(prevFile); !os.IsNotExist(err) {
+		t.Errorf("prev stash should be cleared after restore; err=%v", err)
+	}
+
+	// Second call is a no-op now that our hook is gone.
+	changed2, err := removeClaudeStatusLineHook(home)
+	if err != nil || changed2 {
+		t.Errorf("idempotent remove should not change: changed=%v err=%v", changed2, err)
+	}
+}
+
+func TestRemoveClaudeStatusLineHook_DropsStatusLineWhenNoStash(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", filepath.Join(t.TempDir(), "prev.json"))
+
+	// Fresh install (no prior command stashed).
+	if _, err := ensureClaudeStatusLineHook(home); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	changed, err := removeClaudeStatusLineHook(home)
+	if err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	var settings map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := settings["statusLine"]; ok {
+		t.Errorf("statusLine should be removed when nothing was stashed: %s", raw)
+	}
+}
+
+func TestRemoveClaudeStatusLineHook_LeavesForeignCommandAlone(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", filepath.Join(t.TempDir(), "prev.json"))
+
+	// settings.json carries a non-ours statusLine (user re-wired manually).
+	seed := `{"statusLine":{"type":"command","command":"my-custom-line.sh"}}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := removeClaudeStatusLineHook(home)
+	if err != nil || changed {
+		t.Errorf("remove should be a no-op when statusLine isn't ours: changed=%v err=%v", changed, err)
+	}
+	sl := readStatusLine(t, filepath.Join(claudeDir, "settings.json"))
+	if sl.Command != "my-custom-line.sh" {
+		t.Errorf("foreign command got clobbered: %+v", sl)
+	}
+}
+
 func readStatusLine(t *testing.T, path string) claudeStatusLine {
 	t.Helper()
 	raw, err := os.ReadFile(path)
