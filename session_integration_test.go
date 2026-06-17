@@ -192,6 +192,40 @@ func runMockCLI(mode string) {
 		_, _ = os.Stdout.WriteString(`"}}}` + "\n")
 		select {}
 
+	case "grok-acp-echo":
+		runMockGrokACPServer()
+
+	case "grok-acp-bad-frame":
+		// Emit a single non-JSON stdout line to exercise the `grok_acp_error`
+		// surfacing path, then exit cleanly. Used by
+		// TestGrokACPLifecycle_ForwardsBadFrameAsError.
+		fmt.Println("this is not json")
+		os.Exit(0)
+
+	case "grok-acp-hang":
+		// Stay alive forever, ignoring stdin (don't even read it). Used by
+		// TestGrokACPLifecycle_TimeoutKillsRunawaySession to assert that the
+		// per-session deadline kills a hung Grok child and publishes a typed
+		// grok_acp_error rather than waiting for the 6h stale GC.
+		fmt.Fprintln(os.Stderr, "[mock-grok-hang] running forever")
+		select {}
+
+	case "grok-acp-quick-exit":
+		// Exit immediately with status 0 — no stdout/stderr. Used by
+		// TestWaitForExit_StatusFlipsBeforeStreamDrain to drive the
+		// natural-exit path through waitForExit so the test can assert no
+		// spurious grok_acp_error is published for a clean exit.
+		os.Exit(0)
+
+	case "grok-acp-final-frame-and-exit":
+		// Emit a single JSON-RPC response frame and exit immediately. Used by
+		// TestWaitForExit_FinalFrameSurvivesQuickExit to assert that the
+		// manager does NOT truncate the last frame at the moment of child
+		// exit — exec.Cmd.Wait's auto-close of StdoutPipe used to race with
+		// the scanner goroutine's drain, dropping grok's terminal response.
+		fmt.Println(`{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}`)
+		os.Exit(0)
+
 	case "codex-appserver-burst":
 		// Emit a burst of JSON-RPC frames much larger than
 		// codexAppServerPublishQueueSize, then keep going to keep the

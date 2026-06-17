@@ -177,6 +177,45 @@ func TestMakeRejectionResult_CodexAppServerSendUsesCodexErrorType(t *testing.T) 
 	}
 }
 
+func TestMakeRejectionResult_GrokACPStartUsesGrokErrorType(t *testing.T) {
+	// grok_acp_start rejections must come back labeled grok_acp_error so the
+	// orchestrator's ACP protocol handler can route them on Type alone,
+	// independent of the codex IDE handler.
+	cmd := commandMsg{
+		ID:        "cmd-grok-1",
+		Command:   "grok",
+		Args:      []string{"--model", "grok-2-fast"},
+		Type:      "grok_acp_start",
+		SessionID: "sess-grok-abc",
+	}
+	res := makeRejectionResult(cmd, "agent-1", "denied", "ALLOWLIST_DENIED", "Denied")
+
+	if res.Type != "grok_acp_error" {
+		t.Errorf("Type = %q, want %q", res.Type, "grok_acp_error")
+	}
+	if res.SessionID != "sess-grok-abc" {
+		t.Errorf("SessionID = %q, want %q", res.SessionID, "sess-grok-abc")
+	}
+}
+
+func TestMakeRejectionResult_GrokACPSendUsesGrokErrorType(t *testing.T) {
+	// Stale/rate-limited grok_acp_send rejections route through the same path
+	// and must come back labeled grok_acp_error so the orchestrator fails the
+	// in-flight ACP call rather than treating it as a generic session error.
+	cmd := commandMsg{
+		ID:        "cmd-grok-2",
+		Command:   "grok",
+		Type:      "grok_acp_send",
+		SessionID: "sess-grok-xyz",
+		Input:     `{"jsonrpc":"2.0","id":1,"method":"initialize"}`,
+	}
+	res := makeRejectionResult(cmd, "agent-1", "rate_limited", "RATE_LIMITED", "Rate limit exceeded")
+
+	if res.Type != "grok_acp_error" {
+		t.Errorf("Type = %q, want %q", res.Type, "grok_acp_error")
+	}
+}
+
 func TestMakeRejectionResult_NoSessionMetadataForExecuteWithoutSessionID(t *testing.T) {
 	// Type set but SessionID missing — historically a defensive case in
 	// the inline literals. The helper requires BOTH to be present, since
@@ -211,5 +250,45 @@ func TestMakeRejectionResult_EmptyCmdCwdProducesEmptyResultCwd(t *testing.T) {
 
 	if res.Cwd != "" {
 		t.Errorf("Cwd = %q, want empty (cmd.Cwd was empty)", res.Cwd)
+	}
+}
+
+// Regression: separate-form `--api-key xai-...` survived the generic per-arg
+// regex in redactArgs because the secret lives in the NEXT argv token as a
+// bare value matching no sensitive pattern. For grok_acp_start the rejection
+// path now routes through redactGrokACPArgsForLog, the same masker the
+// approval-dialog path already uses, so the API key is scrubbed before the
+// rejected-command record is persisted.
+func TestMakeRejectionResult_RedactsGrokSeparateFormAPIKey(t *testing.T) {
+	cmd := commandMsg{
+		ID:        "cmd-grok-3",
+		Command:   "grok",
+		Args:      []string{"agent", "stdio", "--api-key", "xai-supersecret-deadbeef"},
+		Type:      "grok_acp_start",
+		SessionID: "sess-grok-redact",
+	}
+	res := makeRejectionResult(cmd, "agent-1", "denied", "ALLOWLIST_DENIED", "denied")
+
+	joined := strings.Join(res.Args, " ")
+	if strings.Contains(joined, "xai-supersecret-deadbeef") {
+		t.Fatalf("Args leaked separate-form api key: %v", res.Args)
+	}
+	if len(res.Args) != 4 || res.Args[2] != "--api-key" || res.Args[3] != "[REDACTED]" {
+		t.Errorf("Args = %v, want […, --api-key, [REDACTED]]", res.Args)
+	}
+}
+
+// Non-grok commands keep using the generic redactArgs path so we don't
+// inadvertently change masking behavior for execute / session_start.
+func TestMakeRejectionResult_NonGrokArgsUseGenericRedaction(t *testing.T) {
+	cmd := commandMsg{
+		ID:      "cmd-shell-7",
+		Command: "curl",
+		Args:    []string{"-H", "Authorization: Bearer abc.def.ghi", "https://api.example.com"},
+		Type:    "execute",
+	}
+	res := makeRejectionResult(cmd, "agent-1", "denied", "ALLOWLIST_DENIED", "denied")
+	if strings.Contains(strings.Join(res.Args, " "), "abc.def.ghi") {
+		t.Errorf("Args leaked bearer token: %v", res.Args)
 	}
 }

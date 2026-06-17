@@ -289,6 +289,17 @@ func StartAgent(cfg *Config) {
 	go globalCodexAppServerManager.CleanupStale(codexAppServerMaxLifetime)
 	fmt.Println("[aiexpedite] Codex app-server manager ready")
 
+	/* 3b''. Initialize Grok ACP manager (JSON-RPC over stdio) ------------ */
+	// Drives `grok agent stdio` for AI Expedite's xAI Grok Build CLI ACP
+	// integration. Same shape as the Codex app-server manager (JSON-RPC 2.0
+	// stdio with `cached_token`-first auth) but distinct because the
+	// orchestrator dispatches the two families on different command Types
+	// and keeps independent JSON-RPC state machines per provider.
+
+	globalGrokACPManager = NewGrokACPManager()
+	go globalGrokACPManager.CleanupStale(grokACPMaxLifetime)
+	fmt.Println("[aiexpedite] Grok ACP manager ready")
+
 	/* 3c. Begin gathering machine info for /auth/token uploads ------------ */
 	// Runs in a background goroutine so we don't block startup. The first
 	// gather typically completes within a few seconds, comfortably before

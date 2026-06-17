@@ -488,6 +488,13 @@ gemini
 gemini *
 agy
 agy *
+# No "grok" / "grok *" / "grok agent stdio *" entries: the ACP manager owns
+# the only legitimate Grok entry point. gateSessionEntryCommand short-circuits
+# grok_acp_start so the synthesised "grok agent stdio ..." argv does not need
+# a default allowlist match, and a raw execute of "grok ..." (bare or
+# "grok agent stdio ...") stays gated by the dialog so it cannot bypass the
+# manager's EnableGrokAPIKeyFallback / EnableGrokAlwaysApprove / env
+# sanitisation.
 
 # --- Remote/SSH ---
 ssh *
