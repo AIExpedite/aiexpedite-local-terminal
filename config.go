@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"sync/atomic"
 )
 
 // Config holds configuration for the agent, loaded from a JSON file.
@@ -42,7 +43,16 @@ type Config struct {
 	// without prompting. This is a hard security-posture override; the
 	// tray toggle requires a confirmation on enable and emits a
 	// security-log event so accidental activation is loud.
-	AllowAllCommands bool `json:"allow_all_commands,omitempty"`
+	//
+	// The persisted bool is the canonical on-disk value, but runtime
+	// reads on the Pub/Sub goroutine MUST go through IsAllowAllCommands()
+	// because the tray-menu goroutine in main.go writes the toggle while
+	// Receive callbacks read it for every inbound command — a direct
+	// bool access there is a data race (go test -race). The unexported
+	// allowAllRuntime atomic.Bool below is the synchronised mirror;
+	// LoadConfig and SetAllowAllCommands keep the two in lockstep.
+	AllowAllCommands bool         `json:"allow_all_commands,omitempty"`
+	allowAllRuntime  atomic.Bool  // synchronised mirror of AllowAllCommands
 
 	/* ─── Command Signature Verification ────────────── */
 	AgentID       string `json:"agent_id,omitempty"`       // Unique agent identifier for signature verification
@@ -125,7 +135,30 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.SkippedVersion != "" && !isValidSemver(cfg.SkippedVersion) {
 		cfg.SkippedVersion = ""
 	}
+	// Mirror the persisted AllowAllCommands bool into the atomic so the
+	// first Pub/Sub Receive callback (which reads via IsAllowAllCommands)
+	// sees the same value the user toggled in a previous session.
+	cfg.allowAllRuntime.Store(cfg.AllowAllCommands)
 	return cfg, nil
+}
+
+// IsAllowAllCommands returns the live AllowAllCommands flag using an
+// atomic load. Pub/Sub Receive callbacks MUST call this rather than
+// reading cfg.AllowAllCommands directly — the tray-menu goroutine in
+// main.go writes the toggle, so unsynchronised reads from a different
+// goroutine are a data race.
+func (cfg *Config) IsAllowAllCommands() bool {
+	return cfg.allowAllRuntime.Load()
+}
+
+// SetAllowAllCommands publishes a new AllowAllCommands value to
+// concurrent readers AND keeps the persisted bool in sync so the next
+// Save() writes the right thing. Call this from the tray goroutine
+// AFTER a successful cfg.Save() so disk and in-memory state remain
+// consistent on a failing write.
+func (cfg *Config) SetAllowAllCommands(v bool) {
+	cfg.AllowAllCommands = v
+	cfg.allowAllRuntime.Store(v)
 }
 
 func (cfg *Config) Save(path string) error {

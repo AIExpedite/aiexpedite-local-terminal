@@ -219,7 +219,7 @@ func onTrayReady(cfg *Config) func() {
 		mResetAllowList := systray.AddMenuItem("Reset Allow List", "Reset to default allowed commands")
 		mAllowAll := systray.AddMenuItemCheckbox("Allow All Commands",
 			"Bypass the allow list and never prompt for command approval",
-			cfg.AllowAllCommands)
+			cfg.IsAllowAllCommands())
 		systray.AddSeparator()
 
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
@@ -350,11 +350,18 @@ func onTrayReady(cfg *Config) func() {
 					}
 
 				case <-mAllowAll.ClickedCh:
+					// The tray goroutine is the SOLE writer of both
+					// cfg.AllowAllCommands (used by Save() for the on-disk
+					// JSON) and the atomic mirror published via
+					// SetAllowAllCommands. Pub/Sub Receive callbacks only
+					// ever read the atomic via cfg.IsAllowAllCommands(), so
+					// mutating the bool field here while Save() is running
+					// does NOT race with the readers. We deliberately delay
+					// publishing the new value to the atomic until AFTER
+					// Save succeeds — a failed write must leave gating
+					// behaviour unchanged from the readers' perspective.
 					if mAllowAll.Checked() {
 						// ── Disable bypass — restore normal allow-list posture ──
-						// Persist FIRST; only flip the live flag/menu after Save succeeds so
-						// a failed write (read-only config dir, full disk, permission drift)
-						// does not leave the UI saying "off" while disk still says "on".
 						prev := cfg.AllowAllCommands
 						cfg.AllowAllCommands = false
 						if err := cfg.Save(ConfigPath()); err != nil {
@@ -364,6 +371,7 @@ func onTrayReady(cfg *Config) func() {
 								fmt.Sprintf("Could not disable Allow All Commands — config save failed:\n\n%v\n\nThe bypass remains enabled.", err))
 							continue
 						}
+						cfg.SetAllowAllCommands(false)
 						mAllowAll.Uncheck()
 						LogSecurityEvent(SecEvtAllowAllDisabled,
 							"Allow All Commands disabled by user — allow list re-enforced")
@@ -375,22 +383,16 @@ func onTrayReady(cfg *Config) func() {
 								"Only enable this on a machine you fully trust. Continue?") {
 							continue
 						}
-						// Save a COPY with the new value first; only flip the live
-						// flag after the disk write succeeds. The live cfg pointer is
-						// shared with Pub/Sub receive callbacks (shouldGateExecuteCommand
-						// reads cfg.AllowAllCommands directly), so flipping it before
-						// Save returns would let commands bypass gating during a slow
-						// or failing write even though the user-visible state still
-						// reports "disabled".
-						pending := *cfg
-						pending.AllowAllCommands = true
-						if err := pending.Save(ConfigPath()); err != nil {
+						prev := cfg.AllowAllCommands
+						cfg.AllowAllCommands = true
+						if err := cfg.Save(ConfigPath()); err != nil {
+							cfg.AllowAllCommands = prev
 							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
 							ShowErrorDialog("Allow All Commands",
 								fmt.Sprintf("Could not enable Allow All Commands — config save failed:\n\n%v\n\nThe bypass remains disabled.", err))
 							continue
 						}
-						cfg.AllowAllCommands = true
+						cfg.SetAllowAllCommands(true)
 						mAllowAll.Check()
 						LogSecurityEvent(SecEvtAllowAllEnabled,
 							"Allow All Commands enabled by user — allow list bypassed")

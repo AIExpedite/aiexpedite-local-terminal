@@ -95,10 +95,12 @@ func TestShouldGateExecuteCommand_AllowAllBypasses(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := &Config{
-				EnableAllowList:  tc.enableAllowList,
-				AllowAllCommands: tc.allowAll,
-			}
+			cfg := &Config{EnableAllowList: tc.enableAllowList}
+			// shouldGateExecuteCommand reads AllowAllCommands via the
+			// synchronised accessor (cfg.IsAllowAllCommands), not the
+			// raw field — so tests must publish through SetAllowAllCommands
+			// to populate the atomic mirror.
+			cfg.SetAllowAllCommands(tc.allowAll)
 			got := shouldGateExecuteCommand(cfg, tc.al, tc.cmd, tc.args)
 			if got != tc.wantShouldGate {
 				t.Errorf("shouldGateExecuteCommand = %v; want %v (%s)", got, tc.wantShouldGate, tc.why)
@@ -119,12 +121,16 @@ func TestGateSessionEntryCommand_AllowAllBypassesAllKinds(t *testing.T) {
 	t.Cleanup(func() { defaultAllowList = prev })
 
 	cfg := &Config{
-		EnableAllowList:  true,
-		AllowAllCommands: true,
+		EnableAllowList: true,
 		// CommandSecret left empty so grok_acp_start does NOT take its
 		// "signed mode → return true" short-circuit; we want to prove
 		// AllowAllCommands is what's letting it through.
 	}
+	// gateSessionEntryCommand reads AllowAllCommands via the synchronised
+	// accessor, so publish through SetAllowAllCommands to populate the
+	// atomic mirror — a raw `AllowAllCommands: true` literal would leave
+	// the atomic at false and the bypass would never fire.
+	cfg.SetAllowAllCommands(true)
 
 	kinds := []string{
 		"session_start",
@@ -161,10 +167,8 @@ func TestGateSessionEntryCommand_AllowAllOffStillGatesUnknownKinds(t *testing.T)
 	defaultAllowList = restrictiveAllowList()
 	t.Cleanup(func() { defaultAllowList = prev })
 
-	cfg := &Config{
-		EnableAllowList:  true,
-		AllowAllCommands: false,
-	}
+	cfg := &Config{EnableAllowList: true}
+	cfg.SetAllowAllCommands(false)
 	for _, kind := range []string{"session_input", "session_signal", "session_end", ""} {
 		cmd := commandMsg{Type: kind, Command: "curl", Args: []string{"x"}}
 		if !gateSessionEntryCommand(context.Background(), nil, nil, cmd, cfg) {

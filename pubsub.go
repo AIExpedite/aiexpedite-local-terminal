@@ -2303,7 +2303,11 @@ var globalGrokACPManager *GrokACPManager
 // Centralising the boolean keeps handleMessage readable and gives the
 // AllowAllCommands bypass a single unit-testable seam.
 func shouldGateExecuteCommand(cfg *Config, al *AllowList, cmd string, args []string) bool {
-	if !cfg.EnableAllowList || cfg.AllowAllCommands || al == nil {
+	// AllowAllCommands is read via the synchronised accessor — the
+	// tray-menu goroutine in main.go writes the toggle while Receive
+	// callbacks land here on Pub/Sub goroutines, so a direct field
+	// access would be a data race (go test -race).
+	if !cfg.EnableAllowList || cfg.IsAllowAllCommands() || al == nil {
 		return false
 	}
 	return !al.IsAllowed(cmd, args)
@@ -2322,8 +2326,9 @@ func shouldGateExecuteCommand(cfg *Config, al *AllowList, cmd string, args []str
 func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pubsub.Message, cmd commandMsg, cfg *Config) bool {
 	// AllowAllCommands short-circuits before any allow-list / dialog work
 	// so session entry points behave the same as the execute path when
-	// the operator has flipped the tray bypass.
-	if cfg.AllowAllCommands {
+	// the operator has flipped the tray bypass. Read via the synchronised
+	// accessor — see shouldGateExecuteCommand for the rationale.
+	if cfg.IsAllowAllCommands() {
 		return true
 	}
 	if !cfg.EnableAllowList || defaultAllowList == nil {
