@@ -236,6 +236,40 @@ func TestEnsureGhDefaults_AppendsForLegacyAllowList(t *testing.T) {
 	}
 }
 
+func TestEnsureGhDefaults_AppendErrorKeepsLoadedPatterns(t *testing.T) {
+	// If the on-disk allow list can't be appended to (read-only file, FS
+	// quota, etc.), the migration must be best-effort: the patterns loaded
+	// from disk stay intact so shouldGateExecuteCommand still gates commands.
+	// Regression guard: returning the error from InitAllowList would leave
+	// defaultAllowList nil and silently turn every command into a pass-through.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	legacy := "git\ngit *\nmy-custom-tool *\n"
+	if err := os.WriteFile(path, []byte(legacy), 0400); err != nil {
+		t.Fatalf("seed legacy allow list: %v", err)
+	}
+
+	al := &AllowList{configPath: path}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	patternsBefore := append([]string(nil), al.patterns...)
+
+	if err := al.ensureGhDefaults(); err == nil {
+		t.Skip("filesystem still allows writes to a 0400 file; cannot exercise failure path")
+	}
+
+	if !al.IsAllowed("git", []string{"status"}) {
+		t.Errorf("loaded patterns were dropped after migration failure")
+	}
+	if !al.IsAllowed("my-custom-tool", []string{"--flag"}) {
+		t.Errorf("user-added pattern was dropped after migration failure")
+	}
+	if len(al.patterns) != len(patternsBefore) {
+		t.Errorf("pattern count changed after migration failure: got %d, want %d", len(al.patterns), len(patternsBefore))
+	}
+}
+
 func TestDefaultAllowList_GrokIsNeverDefaultAllowed(t *testing.T) {
 	// The default allowlist must NOT match any `grok ...` argv — neither
 	// bare `grok` nor the synthesised `grok agent stdio ...` shape. A raw

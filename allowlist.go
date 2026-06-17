@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -44,9 +45,13 @@ func InitAllowList() (*AllowList, error) {
 
 	// Migrate existing allow lists that pre-date the GitHub CLI defaults so
 	// upgraded installs don't keep prompting for `gh *` commands without
-	// requiring the user to reset and lose their custom patterns.
+	// requiring the user to reset and lose their custom patterns. Best-effort:
+	// if the migration fails (e.g. read-only allowed-commands.txt) keep the
+	// already-loaded list active rather than discarding it — otherwise main.go
+	// would leave defaultAllowList nil and shouldGateExecuteCommand would skip
+	// gating entirely, silently turning every command into a pass-through.
 	if err := al.ensureGhDefaults(); err != nil {
-		return nil, err
+		log.Printf("allowlist: gh defaults migration failed, continuing with existing list: %v", err)
 	}
 
 	defaultAllowList = al
