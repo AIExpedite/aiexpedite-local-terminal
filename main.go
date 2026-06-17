@@ -362,17 +362,19 @@ func onTrayReady(cfg *Config) func() {
 					// behaviour unchanged from the readers' perspective.
 					if mAllowAll.Checked() {
 						// ── Disable bypass — restore normal allow-list posture ──
-						prev := cfg.AllowAllCommands
+						// Fail CLOSED: the user's intent is to re-enforce gating,
+						// so apply the disable in memory and to the atomic mirror
+						// regardless of whether Save() succeeds. A persistence
+						// failure only means the change may not survive restart;
+						// it must not leave the Pub/Sub readers bypassing checks.
 						cfg.AllowAllCommands = false
-						if err := cfg.Save(ConfigPath()); err != nil {
-							cfg.AllowAllCommands = prev
-							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
-							ShowErrorDialog("Allow All Commands",
-								fmt.Sprintf("Could not disable Allow All Commands — config save failed:\n\n%v\n\nThe bypass remains enabled.", err))
-							continue
-						}
 						cfg.SetAllowAllCommands(false)
 						mAllowAll.Uncheck()
+						if err := cfg.Save(ConfigPath()); err != nil {
+							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
+							ShowErrorDialog("Allow All Commands",
+								fmt.Sprintf("Allow All Commands has been disabled, but the change could not be saved:\n\n%v\n\nThe bypass is OFF now, but may be restored on next restart.", err))
+						}
 						LogSecurityEvent(SecEvtAllowAllDisabled,
 							"Allow All Commands disabled by user — allow list re-enforced")
 					} else {
