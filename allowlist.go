@@ -58,13 +58,26 @@ func InitAllowList() (*AllowList, error) {
 	return al, nil
 }
 
-// ensureGhDefaults appends the GitHub CLI pass-through patterns to the
-// on-disk allow list if they are not already present. Safe to call on every
-// boot — it is a no-op once the patterns are in place.
-func (al *AllowList) ensureGhDefaults() error {
-	const ghBlock = "\n# --- GitHub CLI (migrated default) ---\ngh\ngh *\n"
+// ghMigrationMarker is written into allowed-commands.txt once the GitHub CLI
+// migration has run. Keying off a marker (rather than the presence of the
+// patterns themselves) makes the migration one-shot: an operator who later
+// removes `gh *` via Edit Allow List stays removed across restarts, instead
+// of having the entry resurrected on the next boot.
+const ghMigrationMarker = "# allowlist-migration: gh-defaults-v1"
 
-	missing := []string{"gh", "gh *"}
+// ensureGhDefaults appends the GitHub CLI pass-through patterns to the
+// on-disk allow list once, on the first boot after the upgrade. Subsequent
+// boots see the marker and skip — so manual removals via Edit Allow List
+// stick like every other default entry.
+func (al *AllowList) ensureGhDefaults() error {
+	raw, err := os.ReadFile(al.configPath)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(string(raw), ghMigrationMarker) {
+		return nil
+	}
+
 	al.mu.RLock()
 	existing := make(map[string]bool, len(al.patterns))
 	for _, p := range al.patterns {
@@ -72,22 +85,22 @@ func (al *AllowList) ensureGhDefaults() error {
 	}
 	al.mu.RUnlock()
 
-	needsMigration := false
-	for _, p := range missing {
+	var block strings.Builder
+	block.WriteString("\n")
+	block.WriteString(ghMigrationMarker)
+	block.WriteString("\n# --- GitHub CLI (migrated default) ---\n")
+	for _, p := range []string{"gh", "gh *"} {
 		if !existing[p] {
-			needsMigration = true
-			break
+			block.WriteString(p)
+			block.WriteString("\n")
 		}
-	}
-	if !needsMigration {
-		return nil
 	}
 
 	f, err := os.OpenFile(al.configPath, os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
-	if _, err := f.WriteString(ghBlock); err != nil {
+	if _, err := f.WriteString(block.String()); err != nil {
 		f.Close()
 		return err
 	}

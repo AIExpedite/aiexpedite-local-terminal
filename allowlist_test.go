@@ -270,6 +270,51 @@ func TestEnsureGhDefaults_AppendErrorKeepsLoadedPatterns(t *testing.T) {
 	}
 }
 
+func TestEnsureGhDefaults_DoesNotResurrectManualRemoval(t *testing.T) {
+	// After the gh migration runs once, an operator who deletes `gh *` via
+	// `Edit Allow List` must stay removed — re-adding it on every boot would
+	// make `gh` the only default entry that can't be removed and would break
+	// the edit/reset contract surfaced in the menu. The marker comment in the
+	// file is what makes the migration one-shot.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	legacy := "git\ngit *\n"
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatalf("seed legacy allow list: %v", err)
+	}
+
+	al := &AllowList{configPath: path}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := al.ensureGhDefaults(); err != nil {
+		t.Fatalf("first ensureGhDefaults: %v", err)
+	}
+	if !al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Fatalf("precondition: gh should be allowed after first migration")
+	}
+
+	// Simulate the operator editing the allow list and stripping the gh lines.
+	edited := "git\ngit *\n" + ghMigrationMarker + "\n# --- GitHub CLI (migrated default) ---\n"
+	if err := os.WriteFile(path, []byte(edited), 0600); err != nil {
+		t.Fatalf("rewrite edited allow list: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("reload after edit: %v", err)
+	}
+	if al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Fatalf("precondition: edited list should no longer allow gh")
+	}
+
+	// Next boot — migration must NOT re-add gh because the marker is present.
+	if err := al.ensureGhDefaults(); err != nil {
+		t.Fatalf("second ensureGhDefaults: %v", err)
+	}
+	if al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Errorf("ensureGhDefaults resurrected a manually-removed gh entry")
+	}
+}
+
 func TestDefaultAllowList_GrokIsNeverDefaultAllowed(t *testing.T) {
 	// The default allowlist must NOT match any `grok ...` argv — neither
 	// bare `grok` nor the synthesised `grok agent stdio ...` shape. A raw
