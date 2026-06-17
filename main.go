@@ -217,6 +217,9 @@ func onTrayReady(cfg *Config) func() {
 
 		mAllowList := systray.AddMenuItem("Edit Allow List", "Open allow list configuration folder")
 		mResetAllowList := systray.AddMenuItem("Reset Allow List", "Reset to default allowed commands")
+		mAllowAll := systray.AddMenuItemCheckbox("Allow All Commands",
+			"Bypass the allow list and never prompt for command approval",
+			cfg.AllowAllCommands)
 		systray.AddSeparator()
 
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
@@ -344,6 +347,33 @@ func onTrayReady(cfg *Config) func() {
 						exec.Command("open", configDir).Start()
 					} else {
 						exec.Command("xdg-open", configDir).Start()
+					}
+
+				case <-mAllowAll.ClickedCh:
+					if mAllowAll.Checked() {
+						// ── Disable bypass — restore normal allow-list posture ──
+						mAllowAll.Uncheck()
+						cfg.AllowAllCommands = false
+						if err := cfg.Save(ConfigPath()); err != nil {
+							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
+						}
+						LogSecurityEvent(SecEvtAllowAllDisabled,
+							"Allow All Commands disabled by user — allow list re-enforced")
+					} else {
+						// ── Enable bypass — require explicit confirmation ──
+						if !ShowYesNoDialog("Allow All Commands?",
+							"This disables the command allow list and approval prompts.\n\n"+
+								"Every command received from the cloud will execute WITHOUT prompting.\n\n"+
+								"Only enable this on a machine you fully trust. Continue?") {
+							continue
+						}
+						mAllowAll.Check()
+						cfg.AllowAllCommands = true
+						if err := cfg.Save(ConfigPath()); err != nil {
+							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
+						}
+						LogSecurityEvent(SecEvtAllowAllEnabled,
+							"Allow All Commands enabled by user — allow list bypassed")
 					}
 
 				case <-mResetAllowList.ClickedCh:

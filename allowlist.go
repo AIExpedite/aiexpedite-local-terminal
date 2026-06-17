@@ -259,6 +259,10 @@ printf *
 git
 git *
 
+# --- GitHub CLI ---
+gh
+gh *
+
 # --- Node.js / JavaScript ---
 node
 node *

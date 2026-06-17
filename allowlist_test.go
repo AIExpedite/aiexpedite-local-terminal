@@ -157,6 +157,37 @@ func TestPatternToRegex_MalformedPatternFallsBackSafely(t *testing.T) {
 	}
 }
 
+func TestDefaultAllowList_GhCliIsDefaultAllowed(t *testing.T) {
+	// gh (GitHub CLI) commands should pass through the default allow list
+	// without prompting. Mirrors how the Git block already works — agents
+	// drive PR / issue automation through `gh` and shouldn't trip the
+	// approval dialog on every invocation.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	al := &AllowList{configPath: path}
+	if err := al.CreateDefault(); err != nil {
+		t.Fatalf("CreateDefault: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	cases := []struct {
+		cmd  string
+		args []string
+	}{
+		{"gh", nil},
+		{"gh", []string{"pr", "list"}},
+		{"gh", []string{"issue", "create", "--title", "bug"}},
+		{"gh", []string{"auth", "status"}},
+	}
+	for _, tc := range cases {
+		if !al.IsAllowed(tc.cmd, tc.args) {
+			t.Errorf("IsAllowed(%q, %v) = false; want true (gh CLI should be default-allowed)", tc.cmd, tc.args)
+		}
+	}
+}
+
 func TestDefaultAllowList_GrokIsNeverDefaultAllowed(t *testing.T) {
 	// The default allowlist must NOT match any `grok ...` argv — neither
 	// bare `grok` nor the synthesised `grok agent stdio ...` shape. A raw

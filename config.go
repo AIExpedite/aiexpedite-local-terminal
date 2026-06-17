@@ -37,6 +37,12 @@ type Config struct {
 	ApprovalTimeoutSec    int    `json:"approval_timeout_sec"`      // Seconds before dialog auto-closes (default: 60)
 	ApprovalTimeoutAction string `json:"approval_timeout_action"`   // "deny" or "allow" on timeout (default: "deny")
 	LogDeniedCommands     bool   `json:"log_denied_commands"`       // Log denied commands for audit (default: true)
+	// AllowAllCommands, when true, bypasses every allow-list check and
+	// approval dialog — the agent will execute ANY incoming command
+	// without prompting. This is a hard security-posture override; the
+	// tray toggle requires a confirmation on enable and emits a
+	// security-log event so accidental activation is loud.
+	AllowAllCommands bool `json:"allow_all_commands,omitempty"`
 
 	/* ─── Command Signature Verification ────────────── */
 	AgentID       string `json:"agent_id,omitempty"`       // Unique agent identifier for signature verification

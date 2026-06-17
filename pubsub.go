@@ -1044,7 +1044,7 @@ func runPubSubConnection(cfg *Config) error {
 		// ─────────────────────────────────────────────────────────────────
 
 		// ─── Command Allow List Validation ───────────────────────────────
-		if cfg.EnableAllowList && defaultAllowList != nil && !defaultAllowList.IsAllowed(cmd.Command, cmd.Args) {
+		if shouldGateExecuteCommand(cfg, defaultAllowList, cmd.Command, cmd.Args) {
 			// Command not in allow list - show approval dialog
 
 			// Get timeout settings from config
@@ -2295,6 +2295,20 @@ var globalGrokACPManager *GrokACPManager
    handleSessionCommand — routes session_* commands to the SessionManager
    -------------------------------------------------------------------------- */
 
+// shouldGateExecuteCommand reports whether the inbound `execute` command
+// must be routed through the allow-list / approval-dialog flow. Returns
+// false (skip gating) when the operator disabled allow-list enforcement,
+// flipped the AllowAllCommands tray override, the allow-list is not yet
+// initialised, OR the command already matches a permitted pattern.
+// Centralising the boolean keeps handleMessage readable and gives the
+// AllowAllCommands bypass a single unit-testable seam.
+func shouldGateExecuteCommand(cfg *Config, al *AllowList, cmd string, args []string) bool {
+	if !cfg.EnableAllowList || cfg.AllowAllCommands || al == nil {
+		return false
+	}
+	return !al.IsAllowed(cmd, args)
+}
+
 // gateSessionEntryCommand applies the allowlist + user-approval dialog flow
 // to the long-running entry-point commands (session_start and
 // codex_appserver_start). For all other interactive commands it is a no-op
@@ -2306,6 +2320,12 @@ var globalGrokACPManager *GrokACPManager
 // pub/sub message has been acked. Centralising this here removes the
 // 40-line duplicate block that used to live inline for each entry kind.
 func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pubsub.Message, cmd commandMsg, cfg *Config) bool {
+	// AllowAllCommands short-circuits before any allow-list / dialog work
+	// so session entry points behave the same as the execute path when
+	// the operator has flipped the tray bypass.
+	if cfg.AllowAllCommands {
+		return true
+	}
 	if !cfg.EnableAllowList || defaultAllowList == nil {
 		return true
 	}
