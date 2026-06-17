@@ -23,14 +23,14 @@ func TestShouldGateExecuteCommand_AllowAllBypasses(t *testing.T) {
 	al := restrictiveAllowList()
 
 	cases := []struct {
-		name             string
-		enableAllowList  bool
-		allowAll         bool
-		al               *AllowList
-		cmd              string
-		args             []string
-		wantShouldGate   bool
-		why              string
+		name            string
+		enableAllowList bool
+		allowAll        bool
+		al              *AllowList
+		cmd             string
+		args            []string
+		wantShouldGate  bool
+		why             string
 	}{
 		{
 			name:            "bypass on — unmatched cmd skips gating",
