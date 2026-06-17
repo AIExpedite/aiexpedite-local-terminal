@@ -90,6 +90,13 @@ type Config struct {
 	// default; flip this only on workspaces where the user has actively
 	// chosen to skip per-tool permission prompts.
 	EnableGrokAlwaysApprove bool `json:"enable_grok_always_approve,omitempty"`
+
+	/* ─── Claude Code status-line hook ───────────────── */
+	// DisableClaudeStatusLineHook opts out of wiring Claude Code's `statusLine`
+	// setting to our hook (the side channel that keeps the CLI Agents tab's
+	// rate-limit metrics fresh from interactive usage). Off by default — the
+	// hook installs on startup, preserving any existing status line by chaining.
+	DisableClaudeStatusLineHook bool `json:"disable_claude_status_line_hook,omitempty"`
 }
 
 /* -------------------------------------------------------------------------- */

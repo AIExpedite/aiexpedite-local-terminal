@@ -30,7 +30,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v0.10.3"
+var Version = "v0.10.4"
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -178,6 +178,31 @@ func StartAgent(cfg *Config) {
 	offlineMutex.Lock()
 	isOffline = cfg.OfflineMode
 	offlineMutex.Unlock()
+
+	// Wire Claude Code's status line to our hook so the CLI Agents tab's
+	// rate-limit metrics stay fresh from interactive usage (not just the
+	// agent's automation sessions). Best-effort and idempotent — refreshed on
+	// every startup so the binary path stays current across auto-updates. When
+	// the user opts out, undo any prior install (restore the stashed third-
+	// party command, or drop the key) so the toggle actually takes effect.
+	hookHome, _ := os.UserHomeDir()
+	if cfg.DisableClaudeStatusLineHook {
+		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
+			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",
+				colorYellow, err, colorReset)
+		} else if changed {
+			fmt.Printf("%s[statusline] Removed Claude status-line hook (opt-out)%s\n",
+				colorGreen, colorReset)
+		}
+	} else {
+		if changed, err := ensureClaudeStatusLineHook(hookHome); err != nil {
+			fmt.Printf("%s[statusline] Could not install Claude status-line hook: %v%s\n",
+				colorYellow, err, colorReset)
+		} else if changed {
+			fmt.Printf("%s[statusline] Installed Claude status-line hook for live rate-limit metrics%s\n",
+				colorGreen, colorReset)
+		}
+	}
 
 	/* 1. Ensure prerequisites (tmux + ttyd) exist ------------------------- */
 
