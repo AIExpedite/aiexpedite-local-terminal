@@ -5,6 +5,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"regexp"
 	"testing"
@@ -185,6 +186,53 @@ func TestDefaultAllowList_GhCliIsDefaultAllowed(t *testing.T) {
 		if !al.IsAllowed(tc.cmd, tc.args) {
 			t.Errorf("IsAllowed(%q, %v) = false; want true (gh CLI should be default-allowed)", tc.cmd, tc.args)
 		}
+	}
+}
+
+func TestEnsureGhDefaults_AppendsForLegacyAllowList(t *testing.T) {
+	// Existing installs that pre-date the gh defaults still have an
+	// allowed-commands.txt without `gh`/`gh *`. ensureGhDefaults must append
+	// the GitHub CLI patterns in place without clobbering user-added rules.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	legacy := "# legacy\ngit\ngit *\nmy-custom-tool *\n"
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatalf("seed legacy allow list: %v", err)
+	}
+
+	al := &AllowList{configPath: path}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Fatalf("precondition: legacy list should not yet allow gh")
+	}
+
+	if err := al.ensureGhDefaults(); err != nil {
+		t.Fatalf("ensureGhDefaults: %v", err)
+	}
+
+	if !al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Errorf("after migration, gh pr list should be allowed")
+	}
+	if !al.IsAllowed("my-custom-tool", []string{"--flag"}) {
+		t.Errorf("user-added pattern was lost after migration")
+	}
+
+	// Idempotency: a second call must not re-append the block.
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if err := al.ensureGhDefaults(); err != nil {
+		t.Fatalf("ensureGhDefaults (second call): %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("ensureGhDefaults is not idempotent; file changed on second call")
 	}
 }
 

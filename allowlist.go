@@ -42,8 +42,55 @@ func InitAllowList() (*AllowList, error) {
 		}
 	}
 
+	// Migrate existing allow lists that pre-date the GitHub CLI defaults so
+	// upgraded installs don't keep prompting for `gh *` commands without
+	// requiring the user to reset and lose their custom patterns.
+	if err := al.ensureGhDefaults(); err != nil {
+		return nil, err
+	}
+
 	defaultAllowList = al
 	return al, nil
+}
+
+// ensureGhDefaults appends the GitHub CLI pass-through patterns to the
+// on-disk allow list if they are not already present. Safe to call on every
+// boot — it is a no-op once the patterns are in place.
+func (al *AllowList) ensureGhDefaults() error {
+	const ghBlock = "\n# --- GitHub CLI (migrated default) ---\ngh\ngh *\n"
+
+	missing := []string{"gh", "gh *"}
+	al.mu.RLock()
+	existing := make(map[string]bool, len(al.patterns))
+	for _, p := range al.patterns {
+		existing[p] = true
+	}
+	al.mu.RUnlock()
+
+	needsMigration := false
+	for _, p := range missing {
+		if !existing[p] {
+			needsMigration = true
+			break
+		}
+	}
+	if !needsMigration {
+		return nil
+	}
+
+	f, err := os.OpenFile(al.configPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(ghBlock); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	return al.Load()
 }
 
 // Load reads patterns from the config file
