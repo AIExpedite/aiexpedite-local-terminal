@@ -325,6 +325,7 @@ git
 git *
 
 # --- GitHub CLI ---
+# allowlist-migration: gh-defaults-v1
 gh
 gh *
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -312,6 +313,50 @@ func TestEnsureGhDefaults_DoesNotResurrectManualRemoval(t *testing.T) {
 	}
 	if al.IsAllowed("gh", []string{"pr", "list"}) {
 		t.Errorf("ensureGhDefaults resurrected a manually-removed gh entry")
+	}
+}
+
+func TestDefaultAllowList_CarriesGhMigrationMarker(t *testing.T) {
+	// Reset Allow List rewrites the file from defaultAllowListContent and
+	// then reloads it. Without the migration marker in the default content,
+	// a subsequent boot would treat the freshly-reset file as an unmigrated
+	// legacy list — so any manual removal of `gh`/`gh *` made after the
+	// reset would be silently resurrected by ensureGhDefaults. The defaults
+	// must ship the marker so reset writes a "migration already ran" state.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	al := &AllowList{configPath: path}
+	if err := al.CreateDefault(); err != nil {
+		t.Fatalf("CreateDefault: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read default file: %v", err)
+	}
+	if !strings.Contains(string(raw), ghMigrationMarker) {
+		t.Fatalf("default allow list content missing %q marker; reset would re-trigger gh migration", ghMigrationMarker)
+	}
+
+	// Simulate post-reset operator removing the gh lines via Edit Allow List.
+	edited := strings.ReplaceAll(string(raw), "\ngh\n", "\n")
+	edited = strings.ReplaceAll(edited, "\ngh *\n", "\n")
+	if err := os.WriteFile(path, []byte(edited), 0600); err != nil {
+		t.Fatalf("rewrite edited allow list: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Fatalf("precondition: edited list should no longer allow gh")
+	}
+
+	// Next boot must NOT re-add gh — marker is present from the reset defaults.
+	if err := al.ensureGhDefaults(); err != nil {
+		t.Fatalf("ensureGhDefaults: %v", err)
+	}
+	if al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Errorf("ensureGhDefaults resurrected gh after a Reset Allow List + manual removal")
 	}
 }
 
