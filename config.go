@@ -51,8 +51,8 @@ type Config struct {
 	// bool access there is a data race (go test -race). The unexported
 	// allowAllRuntime atomic.Bool below is the synchronised mirror;
 	// LoadConfig and SetAllowAllCommands keep the two in lockstep.
-	AllowAllCommands bool         `json:"allow_all_commands,omitempty"`
-	allowAllRuntime  atomic.Bool  // synchronised mirror of AllowAllCommands
+	AllowAllCommands bool        `json:"allow_all_commands,omitempty"`
+	allowAllRuntime  atomic.Bool // synchronised mirror of AllowAllCommands
 
 	/* ─── Command Signature Verification ────────────── */
 	AgentID       string `json:"agent_id,omitempty"`       // Unique agent identifier for signature verification
