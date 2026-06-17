@@ -375,15 +375,22 @@ func onTrayReady(cfg *Config) func() {
 								"Only enable this on a machine you fully trust. Continue?") {
 							continue
 						}
-						prev := cfg.AllowAllCommands
-						cfg.AllowAllCommands = true
-						if err := cfg.Save(ConfigPath()); err != nil {
-							cfg.AllowAllCommands = prev
+						// Save a COPY with the new value first; only flip the live
+						// flag after the disk write succeeds. The live cfg pointer is
+						// shared with Pub/Sub receive callbacks (shouldGateExecuteCommand
+						// reads cfg.AllowAllCommands directly), so flipping it before
+						// Save returns would let commands bypass gating during a slow
+						// or failing write even though the user-visible state still
+						// reports "disabled".
+						pending := *cfg
+						pending.AllowAllCommands = true
+						if err := pending.Save(ConfigPath()); err != nil {
 							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
 							ShowErrorDialog("Allow All Commands",
 								fmt.Sprintf("Could not enable Allow All Commands — config save failed:\n\n%v\n\nThe bypass remains disabled.", err))
 							continue
 						}
+						cfg.AllowAllCommands = true
 						mAllowAll.Check()
 						LogSecurityEvent(SecEvtAllowAllEnabled,
 							"Allow All Commands enabled by user — allow list bypassed")
