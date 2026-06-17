@@ -29,6 +29,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,9 +78,11 @@ type claudeRateLimitSnapshot struct {
 	Buckets            map[string]claudeRateLimitBucket `json:"buckets"`
 }
 
-// claudeRateLimitMu serialises the read-modify-write of the cache file. A
-// single device can run several Claude sessions concurrently, each streaming
-// its own rate_limit_event lines.
+// claudeRateLimitMu serialises the read-modify-write of the cache file
+// in-process. Cross-process serialization is handled separately by an advisory
+// file lock — Claude Code can render the status line from multiple windows in
+// parallel, each spawning its own `aiexpedite statusline-hook` process, and a
+// process-local mutex doesn't help across those boundaries.
 var claudeRateLimitMu sync.Mutex
 
 // claudeRateLimitCachePath is the cache location inside the agent's data dir.
@@ -315,12 +318,36 @@ func windowlessRejectedBucket(raw map[string]interface{}, nowMs int64) (claudeRa
 // snapshot was captured under a different account fingerprint, its buckets are
 // discarded — a previous account's reset times must not bleed into the new
 // account's display.
+//
+// Concurrent Claude Code windows each spawn their own `aiexpedite
+// statusline-hook` process, so an in-process mutex doesn't serialize this RMW.
+// We take an advisory file lock on a sibling `.lock` file across the read,
+// merge, and rename — without it, two writers can both read the same old
+// snapshot, then race their tmp writes and renames, dropping one window's
+// fresh five-hour/seven-day update. The tmp file is also given a per-process
+// unique suffix so even if the lock is unavailable (some odd filesystem) two
+// writers can't clobber each other's intermediate state.
 func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint string) {
 	if path == "" || len(updates) == 0 {
 		return
 	}
 	claudeRateLimitMu.Lock()
 	defer claudeRateLimitMu.Unlock()
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	// Cross-process exclusive lock. Best-effort: if the lock file can't be
+	// created (read-only data dir) we still proceed — the in-process mutex
+	// keeps THIS process consistent, and a single-Claude-window install never
+	// hits the cross-process race anyway.
+	lockFile, locked := acquireCrossProcessCacheLock(path)
+	if locked {
+		defer func() {
+			_ = unlockFile(lockFile)
+			_ = lockFile.Close()
+		}()
+	}
 
 	snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
 	if b, err := os.ReadFile(path); err == nil {
@@ -369,22 +396,38 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
 	snap.AccountFingerprint = fingerprint
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return
-	}
 	out, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return
 	}
 	// Write-then-rename so a concurrent loadClaudeRateLimitSnapshot reader never
-	// observes a half-written file (rename is atomic within a directory).
-	tmp := path + ".tmp"
+	// observes a half-written file. The PID + nanosecond suffix keeps two
+	// concurrent writers (or a stale tmp from a crashed prior run) from
+	// colliding on the intermediate file even outside the lock.
+	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 	}
+}
+
+// acquireCrossProcessCacheLock opens (and exclusively locks) a sibling file of
+// the cache path so concurrent `aiexpedite statusline-hook` processes serialize
+// the read-modify-write. Returns the lock file and whether the lock was
+// acquired — callers MUST unlock + close when true, and skip when false.
+func acquireCrossProcessCacheLock(cachePath string) (*os.File, bool) {
+	lockPath := cachePath + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, false
+	}
+	if err := lockFileExclusive(f); err != nil {
+		_ = f.Close()
+		return nil, false
+	}
+	return f, true
 }
 
 // loadClaudeRateLimitSnapshot reads the cache. Returns (zero, false) when the
