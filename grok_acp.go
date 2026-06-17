@@ -50,6 +50,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1323,7 +1324,83 @@ func detectPinnedGrokRequirements(allowAPIKey, allowAlwaysApprove bool) error {
 			return err
 		}
 	}
+	if !allowAlwaysApprove {
+		// Grok enterprise loader documents importing Claude Code's
+		// `managed-settings.json` and evaluating its `permissions.allow`
+		// rules BEFORE the per-tool prompt
+		// (https://docs.x.ai/build/enterprise#permissions). The Grok
+		// `-c permission_rules=` neutralizer above can only clear Grok's
+		// own permission_rules — a Claude-imported allow rule survives
+		// the per-process override, so fail closed when MDM has set one
+		// and the workspace has not opted into EnableGrokAlwaysApprove.
+		// Mirrors the requirements.toml pinned-policy path: the operator
+		// either removes the imported allow rule or opts in explicitly.
+		for _, p := range claudeManagedSettingsPaths() {
+			if path, ok := detectClaudeManagedSettingsAllowRule(p); ok {
+				return fmt.Errorf("grok imports Claude Code's managed-settings.json permission rules and %s contains a `permissions.allow` entry; the per-process --config neutralizer cannot override an imported Claude allow rule — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the imported allow rule", path)
+			}
+		}
+	}
 	return nil
+}
+
+// claudeManagedSettingsPaths enumerates the Claude Code managed-settings.json
+// locations xAI's Grok enterprise loader is documented to import permission
+// rules from. Per-OS system paths only — user-scope ~/.claude/settings.json is
+// intentionally NOT scanned because Grok's enterprise import is documented as
+// the MDM-managed layer; treating ad-hoc user settings as pinned would
+// over-fail-closed for the common single-user dev box.
+func claudeManagedSettingsPaths() []string {
+	paths := make([]string, 0, 2)
+	switch runtime.GOOS {
+	case "darwin":
+		paths = append(paths, "/Library/Application Support/ClaudeCode/managed-settings.json")
+	case "windows":
+		programData := os.Getenv("ProgramData")
+		if programData == "" {
+			programData = `C:\ProgramData`
+		}
+		paths = append(paths, filepath.Join(programData, "ClaudeCode", "managed-settings.json"))
+	default:
+		paths = append(paths, "/etc/claude-code/managed-settings.json")
+	}
+	return paths
+}
+
+// detectClaudeManagedSettingsAllowRule reports whether the Claude
+// managed-settings.json at `path` contains a non-empty `permissions.allow`
+// array. Returns the path on hit so the error message can point the operator
+// at the exact file. Missing/unreadable/malformed files yield false —
+// best-effort by design, matching detectPinnedGrokRequirementsFile's
+// tolerance for missing config layers.
+func detectClaudeManagedSettingsAllowRule(path string) (string, bool) {
+	if path == "" {
+		return "", false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	const maxBytes = 1 << 20
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes))
+	if err != nil {
+		return "", false
+	}
+	var parsed struct {
+		Permissions struct {
+			Allow []string `json:"allow"`
+		} `json:"permissions"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return "", false
+	}
+	for _, rule := range parsed.Permissions.Allow {
+		if strings.TrimSpace(rule) != "" {
+			return path, true
+		}
+	}
+	return "", false
 }
 
 // detectPinnedGrokRequirementsFile is the file-path-injectable

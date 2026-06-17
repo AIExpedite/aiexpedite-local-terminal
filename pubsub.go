@@ -2337,7 +2337,8 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		denyOutput = "codex app-server denied by user: not in allow list"
 	case "grok_acp_start":
 		// Unlike codex_appserver_start, grok_acp_start is NOT gated through
-		// the shared execute allowlist or approval dialog. Two reasons:
+		// the shared execute allowlist or approval dialog WHEN signing is
+		// enforced. Two reasons:
 		//
 		//   1. The default allowlist intentionally omits bare `grok` so a
 		//      signed raw `execute` of `grok …` cannot bypass the ACP
@@ -2354,7 +2355,24 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// On "Always" the persisted pattern would also be `grok *` — i.e.
 		// it would permanently neuter (1). Short-circuiting here avoids
 		// both the global match and the Always-persist path.
-		return true
+		//
+		// BUT when signature verification is disabled (cfg.CommandSecret
+		// empty — the pre/unregistered mode the upstream check at line ~940
+		// permits), nothing has authenticated the inbound command, so a
+		// stray pubsub message could otherwise launch a Grok session
+		// without ANY local gate. Fall back to the same allowlist +
+		// approval-dialog path session_start uses in that mode so the
+		// human operator still gets a prompt before spawn. The synthesised
+		// `grok …` argv mirrors what the manager will actually exec,
+		// keeping the dialog's display text and the persisted Always
+		// pattern truthful.
+		if cfg.CommandSecret != "" {
+			return true
+		}
+		allowCommand = "grok"
+		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAPIKeyFallback, cfg.EnableGrokAlwaysApprove)
+		dialogArgs = redactGrokACPArgsForLog(allowArgs)
+		denyOutput = "grok ACP session denied by user: not in allow list"
 	default:
 		// Mid-session interactive commands don't re-prompt.
 		return true

@@ -3286,6 +3286,67 @@ func TestDetectPinnedGrokRequirements_IgnoresBenignSections(t *testing.T) {
 	}
 }
 
+// TestDetectClaudeManagedSettingsAllowRule covers the
+// Claude-managed-settings.json import path: xAI's Grok enterprise loader
+// imports Claude `permissions.allow` rules and evaluates them before the
+// per-tool prompt, so a populated allow list in MDM-pinned Claude
+// settings must be flagged when EnableGrokAlwaysApprove is off (the
+// per-process `--config permission_rules=` neutralizer can't clear an
+// imported Claude rule).
+func TestDetectClaudeManagedSettingsAllowRule(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("missing file tolerated", func(t *testing.T) {
+		if _, ok := detectClaudeManagedSettingsAllowRule(filepath.Join(dir, "nope.json")); ok {
+			t.Fatalf("missing file should not flag")
+		}
+	})
+
+	t.Run("malformed json tolerated", func(t *testing.T) {
+		path := filepath.Join(dir, "bad.json")
+		if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if _, ok := detectClaudeManagedSettingsAllowRule(path); ok {
+			t.Fatalf("malformed json should not flag")
+		}
+	})
+
+	t.Run("empty allow list does not flag", func(t *testing.T) {
+		path := filepath.Join(dir, "empty.json")
+		if err := os.WriteFile(path, []byte(`{"permissions":{"allow":[]}}`), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if _, ok := detectClaudeManagedSettingsAllowRule(path); ok {
+			t.Fatalf("empty allow should not flag")
+		}
+	})
+
+	t.Run("whitespace-only rule does not flag", func(t *testing.T) {
+		path := filepath.Join(dir, "ws.json")
+		if err := os.WriteFile(path, []byte(`{"permissions":{"allow":["  "]}}`), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if _, ok := detectClaudeManagedSettingsAllowRule(path); ok {
+			t.Fatalf("whitespace-only rule should not flag")
+		}
+	})
+
+	t.Run("populated allow flags with path", func(t *testing.T) {
+		path := filepath.Join(dir, "hit.json")
+		if err := os.WriteFile(path, []byte(`{"permissions":{"allow":["Bash(*)"]}}`), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		got, ok := detectClaudeManagedSettingsAllowRule(path)
+		if !ok {
+			t.Fatalf("populated allow list must flag")
+		}
+		if got != path {
+			t.Fatalf("expected hit path %q, got %q", path, got)
+		}
+	})
+}
+
 // TestDetectPinnedGrokRequirements_MissingFileTolerated pins the
 // best-effort posture: a missing requirements.toml is the common case
 // on most hosts and must not break Start.
