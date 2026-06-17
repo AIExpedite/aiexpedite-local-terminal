@@ -352,11 +352,19 @@ func onTrayReady(cfg *Config) func() {
 				case <-mAllowAll.ClickedCh:
 					if mAllowAll.Checked() {
 						// ── Disable bypass — restore normal allow-list posture ──
-						mAllowAll.Uncheck()
+						// Persist FIRST; only flip the live flag/menu after Save succeeds so
+						// a failed write (read-only config dir, full disk, permission drift)
+						// does not leave the UI saying "off" while disk still says "on".
+						prev := cfg.AllowAllCommands
 						cfg.AllowAllCommands = false
 						if err := cfg.Save(ConfigPath()); err != nil {
+							cfg.AllowAllCommands = prev
 							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
+							ShowErrorDialog("Allow All Commands",
+								fmt.Sprintf("Could not disable Allow All Commands — config save failed:\n\n%v\n\nThe bypass remains enabled.", err))
+							continue
 						}
+						mAllowAll.Uncheck()
 						LogSecurityEvent(SecEvtAllowAllDisabled,
 							"Allow All Commands disabled by user — allow list re-enforced")
 					} else {
@@ -367,11 +375,16 @@ func onTrayReady(cfg *Config) func() {
 								"Only enable this on a machine you fully trust. Continue?") {
 							continue
 						}
-						mAllowAll.Check()
+						prev := cfg.AllowAllCommands
 						cfg.AllowAllCommands = true
 						if err := cfg.Save(ConfigPath()); err != nil {
+							cfg.AllowAllCommands = prev
 							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
+							ShowErrorDialog("Allow All Commands",
+								fmt.Sprintf("Could not enable Allow All Commands — config save failed:\n\n%v\n\nThe bypass remains disabled.", err))
+							continue
 						}
+						mAllowAll.Check()
 						LogSecurityEvent(SecEvtAllowAllEnabled,
 							"Allow All Commands enabled by user — allow list bypassed")
 					}
