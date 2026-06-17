@@ -2336,22 +2336,25 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		dialogArgs = allowArgs
 		denyOutput = "codex app-server denied by user: not in allow list"
 	case "grok_acp_start":
-		// Same shape as codex_appserver_start: synthesise the actual
-		// `grok agent stdio …` argv we will exec so the default `grok *`
-		// allowlist entry covers ACP access without a parallel allowlist.
-		// Both the allowAPIKey and allowAlwaysApprove gates must match what
-		// handleGrokACPCommand will pass to Start, otherwise the allowlist
-		// would match a different argv shape than the one we actually exec.
-		allowCommand = "grok"
-		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAPIKeyFallback, cfg.EnableGrokAlwaysApprove)
-		// Match the startup-banner redaction so an xAI API key the caller
-		// passed via `--api-key …` (only possible when the fallback is
-		// enabled) never reaches the platform approval dialog. IsAllowed
-		// and GeneratePatternFromCommand still see the unredacted argv —
-		// the pattern is `grok *` and the match runs against the same
-		// argv we will exec.
-		dialogArgs = redactGrokACPArgsForLog(allowArgs)
-		denyOutput = "grok agent stdio denied by user: not in allow list"
+		// Unlike codex_appserver_start, grok_acp_start is NOT gated through
+		// the shared execute allowlist or approval dialog. Two reasons:
+		//
+		//   1. The default allowlist intentionally omits bare `grok` so a
+		//      signed raw `execute` of `grok …` cannot bypass the ACP
+		//      manager's EnableGrokAPIKeyFallback / EnableGrokAlwaysApprove
+		//      / env-sanitisation gates. Adding a `grok agent stdio *`
+		//      entry to satisfy grok_acp_start would re-open exactly that
+		//      bypass for any execute carrying those same args.
+		//
+		//   2. ACP approvals are routed inside the manager + orchestrator
+		//      (permission/request → orchestrator → per-workspace prompt),
+		//      so the session-entry dialog is redundant. The manager still
+		//      enforces argv/env sanitisation regardless of the gate.
+		//
+		// On "Always" the persisted pattern would also be `grok *` — i.e.
+		// it would permanently neuter (1). Short-circuiting here avoids
+		// both the global match and the Always-persist path.
+		return true
 	default:
 		// Mid-session interactive commands don't re-prompt.
 		return true
