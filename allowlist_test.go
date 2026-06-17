@@ -5,8 +5,10 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -154,6 +156,207 @@ func TestPatternToRegex_MalformedPatternFallsBackSafely(t *testing.T) {
 	// Empty pattern → "^$" → matches only the empty string. Not dangerous.
 	if re.MatchString("anything") {
 		t.Errorf("empty pattern matched non-empty string")
+	}
+}
+
+func TestDefaultAllowList_GhCliIsDefaultAllowed(t *testing.T) {
+	// gh (GitHub CLI) commands should pass through the default allow list
+	// without prompting. Mirrors how the Git block already works — agents
+	// drive PR / issue automation through `gh` and shouldn't trip the
+	// approval dialog on every invocation.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	al := &AllowList{configPath: path}
+	if err := al.CreateDefault(); err != nil {
+		t.Fatalf("CreateDefault: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	cases := []struct {
+		cmd  string
+		args []string
+	}{
+		{"gh", nil},
+		{"gh", []string{"pr", "list"}},
+		{"gh", []string{"issue", "create", "--title", "bug"}},
+		{"gh", []string{"auth", "status"}},
+	}
+	for _, tc := range cases {
+		if !al.IsAllowed(tc.cmd, tc.args) {
+			t.Errorf("IsAllowed(%q, %v) = false; want true (gh CLI should be default-allowed)", tc.cmd, tc.args)
+		}
+	}
+}
+
+func TestEnsureGhDefaults_AppendsForLegacyAllowList(t *testing.T) {
+	// Existing installs that pre-date the gh defaults still have an
+	// allowed-commands.txt without `gh`/`gh *`. ensureGhDefaults must append
+	// the GitHub CLI patterns in place without clobbering user-added rules.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	legacy := "# legacy\ngit\ngit *\nmy-custom-tool *\n"
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatalf("seed legacy allow list: %v", err)
+	}
+
+	al := &AllowList{configPath: path}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Fatalf("precondition: legacy list should not yet allow gh")
+	}
+
+	if err := al.ensureGhDefaults(); err != nil {
+		t.Fatalf("ensureGhDefaults: %v", err)
+	}
+
+	if !al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Errorf("after migration, gh pr list should be allowed")
+	}
+	if !al.IsAllowed("my-custom-tool", []string{"--flag"}) {
+		t.Errorf("user-added pattern was lost after migration")
+	}
+
+	// Idempotency: a second call must not re-append the block.
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if err := al.ensureGhDefaults(); err != nil {
+		t.Fatalf("ensureGhDefaults (second call): %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("ensureGhDefaults is not idempotent; file changed on second call")
+	}
+}
+
+func TestEnsureGhDefaults_AppendErrorKeepsLoadedPatterns(t *testing.T) {
+	// If the on-disk allow list can't be appended to (read-only file, FS
+	// quota, etc.), the migration must be best-effort: the patterns loaded
+	// from disk stay intact so shouldGateExecuteCommand still gates commands.
+	// Regression guard: returning the error from InitAllowList would leave
+	// defaultAllowList nil and silently turn every command into a pass-through.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	legacy := "git\ngit *\nmy-custom-tool *\n"
+	if err := os.WriteFile(path, []byte(legacy), 0400); err != nil {
+		t.Fatalf("seed legacy allow list: %v", err)
+	}
+
+	al := &AllowList{configPath: path}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	patternsBefore := append([]string(nil), al.patterns...)
+
+	if err := al.ensureGhDefaults(); err == nil {
+		t.Skip("filesystem still allows writes to a 0400 file; cannot exercise failure path")
+	}
+
+	if !al.IsAllowed("git", []string{"status"}) {
+		t.Errorf("loaded patterns were dropped after migration failure")
+	}
+	if !al.IsAllowed("my-custom-tool", []string{"--flag"}) {
+		t.Errorf("user-added pattern was dropped after migration failure")
+	}
+	if len(al.patterns) != len(patternsBefore) {
+		t.Errorf("pattern count changed after migration failure: got %d, want %d", len(al.patterns), len(patternsBefore))
+	}
+}
+
+func TestEnsureGhDefaults_DoesNotResurrectManualRemoval(t *testing.T) {
+	// After the gh migration runs once, an operator who deletes `gh *` via
+	// `Edit Allow List` must stay removed — re-adding it on every boot would
+	// make `gh` the only default entry that can't be removed and would break
+	// the edit/reset contract surfaced in the menu. The marker comment in the
+	// file is what makes the migration one-shot.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	legacy := "git\ngit *\n"
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatalf("seed legacy allow list: %v", err)
+	}
+
+	al := &AllowList{configPath: path}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := al.ensureGhDefaults(); err != nil {
+		t.Fatalf("first ensureGhDefaults: %v", err)
+	}
+	if !al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Fatalf("precondition: gh should be allowed after first migration")
+	}
+
+	// Simulate the operator editing the allow list and stripping the gh lines.
+	edited := "git\ngit *\n" + ghMigrationMarker + "\n# --- GitHub CLI (migrated default) ---\n"
+	if err := os.WriteFile(path, []byte(edited), 0600); err != nil {
+		t.Fatalf("rewrite edited allow list: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("reload after edit: %v", err)
+	}
+	if al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Fatalf("precondition: edited list should no longer allow gh")
+	}
+
+	// Next boot — migration must NOT re-add gh because the marker is present.
+	if err := al.ensureGhDefaults(); err != nil {
+		t.Fatalf("second ensureGhDefaults: %v", err)
+	}
+	if al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Errorf("ensureGhDefaults resurrected a manually-removed gh entry")
+	}
+}
+
+func TestDefaultAllowList_CarriesGhMigrationMarker(t *testing.T) {
+	// Reset Allow List rewrites the file from defaultAllowListContent and
+	// then reloads it. Without the migration marker in the default content,
+	// a subsequent boot would treat the freshly-reset file as an unmigrated
+	// legacy list — so any manual removal of `gh`/`gh *` made after the
+	// reset would be silently resurrected by ensureGhDefaults. The defaults
+	// must ship the marker so reset writes a "migration already ran" state.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	al := &AllowList{configPath: path}
+	if err := al.CreateDefault(); err != nil {
+		t.Fatalf("CreateDefault: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read default file: %v", err)
+	}
+	if !strings.Contains(string(raw), ghMigrationMarker) {
+		t.Fatalf("default allow list content missing %q marker; reset would re-trigger gh migration", ghMigrationMarker)
+	}
+
+	// Simulate post-reset operator removing the gh lines via Edit Allow List.
+	edited := strings.ReplaceAll(string(raw), "\ngh\n", "\n")
+	edited = strings.ReplaceAll(edited, "\ngh *\n", "\n")
+	if err := os.WriteFile(path, []byte(edited), 0600); err != nil {
+		t.Fatalf("rewrite edited allow list: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Fatalf("precondition: edited list should no longer allow gh")
+	}
+
+	// Next boot must NOT re-add gh — marker is present from the reset defaults.
+	if err := al.ensureGhDefaults(); err != nil {
+		t.Fatalf("ensureGhDefaults: %v", err)
+	}
+	if al.IsAllowed("gh", []string{"pr", "list"}) {
+		t.Errorf("ensureGhDefaults resurrected gh after a Reset Allow List + manual removal")
 	}
 }
 

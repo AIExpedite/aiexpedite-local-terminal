@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -42,8 +43,72 @@ func InitAllowList() (*AllowList, error) {
 		}
 	}
 
+	// Migrate existing allow lists that pre-date the GitHub CLI defaults so
+	// upgraded installs don't keep prompting for `gh *` commands without
+	// requiring the user to reset and lose their custom patterns. Best-effort:
+	// if the migration fails (e.g. read-only allowed-commands.txt) keep the
+	// already-loaded list active rather than discarding it — otherwise main.go
+	// would leave defaultAllowList nil and shouldGateExecuteCommand would skip
+	// gating entirely, silently turning every command into a pass-through.
+	if err := al.ensureGhDefaults(); err != nil {
+		log.Printf("allowlist: gh defaults migration failed, continuing with existing list: %v", err)
+	}
+
 	defaultAllowList = al
 	return al, nil
+}
+
+// ghMigrationMarker is written into allowed-commands.txt once the GitHub CLI
+// migration has run. Keying off a marker (rather than the presence of the
+// patterns themselves) makes the migration one-shot: an operator who later
+// removes `gh *` via Edit Allow List stays removed across restarts, instead
+// of having the entry resurrected on the next boot.
+const ghMigrationMarker = "# allowlist-migration: gh-defaults-v1"
+
+// ensureGhDefaults appends the GitHub CLI pass-through patterns to the
+// on-disk allow list once, on the first boot after the upgrade. Subsequent
+// boots see the marker and skip — so manual removals via Edit Allow List
+// stick like every other default entry.
+func (al *AllowList) ensureGhDefaults() error {
+	raw, err := os.ReadFile(al.configPath)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(string(raw), ghMigrationMarker) {
+		return nil
+	}
+
+	al.mu.RLock()
+	existing := make(map[string]bool, len(al.patterns))
+	for _, p := range al.patterns {
+		existing[p] = true
+	}
+	al.mu.RUnlock()
+
+	var block strings.Builder
+	block.WriteString("\n")
+	block.WriteString(ghMigrationMarker)
+	block.WriteString("\n# --- GitHub CLI (migrated default) ---\n")
+	for _, p := range []string{"gh", "gh *"} {
+		if !existing[p] {
+			block.WriteString(p)
+			block.WriteString("\n")
+		}
+	}
+
+	f, err := os.OpenFile(al.configPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(block.String()); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	return al.Load()
 }
 
 // Load reads patterns from the config file
@@ -258,6 +323,11 @@ printf *
 # --- Git (All operations) ---
 git
 git *
+
+# --- GitHub CLI ---
+# allowlist-migration: gh-defaults-v1
+gh
+gh *
 
 # --- Node.js / JavaScript ---
 node

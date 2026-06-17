@@ -50,6 +50,14 @@ const (
 	// any allow pattern). Volume can be high in normal use; keep fields
 	// minimal to avoid log bloat.
 	SecEvtAllowlistDenied SecurityEvent = "allowlist_denied"
+
+	// SecEvtAllowAllEnabled / SecEvtAllowAllDisabled: the operator
+	// toggled the "Allow All Commands" tray override. Enabling is the
+	// loud event — it disables every allow-list and approval check
+	// until toggled back. Disabling is logged too so the audit trail
+	// shows when normal posture was restored.
+	SecEvtAllowAllEnabled  SecurityEvent = "allow_all_commands_enabled"
+	SecEvtAllowAllDisabled SecurityEvent = "allow_all_commands_disabled"
 )
 
 var (

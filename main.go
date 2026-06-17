@@ -217,6 +217,9 @@ func onTrayReady(cfg *Config) func() {
 
 		mAllowList := systray.AddMenuItem("Edit Allow List", "Open allow list configuration folder")
 		mResetAllowList := systray.AddMenuItem("Reset Allow List", "Reset to default allowed commands")
+		mAllowAll := systray.AddMenuItemCheckbox("Allow All Commands",
+			"Bypass the allow list and never prompt for command approval",
+			cfg.IsAllowAllCommands())
 		systray.AddSeparator()
 
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
@@ -344,6 +347,57 @@ func onTrayReady(cfg *Config) func() {
 						exec.Command("open", configDir).Start()
 					} else {
 						exec.Command("xdg-open", configDir).Start()
+					}
+
+				case <-mAllowAll.ClickedCh:
+					// The tray goroutine is the SOLE writer of both
+					// cfg.AllowAllCommands (used by Save() for the on-disk
+					// JSON) and the atomic mirror published via
+					// SetAllowAllCommands. Pub/Sub Receive callbacks only
+					// ever read the atomic via cfg.IsAllowAllCommands(), so
+					// mutating the bool field here while Save() is running
+					// does NOT race with the readers. We deliberately delay
+					// publishing the new value to the atomic until AFTER
+					// Save succeeds — a failed write must leave gating
+					// behaviour unchanged from the readers' perspective.
+					if mAllowAll.Checked() {
+						// ── Disable bypass — restore normal allow-list posture ──
+						// Fail CLOSED: the user's intent is to re-enforce gating,
+						// so apply the disable in memory and to the atomic mirror
+						// regardless of whether Save() succeeds. A persistence
+						// failure only means the change may not survive restart;
+						// it must not leave the Pub/Sub readers bypassing checks.
+						cfg.AllowAllCommands = false
+						cfg.SetAllowAllCommands(false)
+						mAllowAll.Uncheck()
+						if err := cfg.Save(ConfigPath()); err != nil {
+							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
+							ShowErrorDialog("Allow All Commands",
+								fmt.Sprintf("Allow All Commands has been disabled, but the change could not be saved:\n\n%v\n\nThe bypass is OFF now, but may be restored on next restart.", err))
+						}
+						LogSecurityEvent(SecEvtAllowAllDisabled,
+							"Allow All Commands disabled by user — allow list re-enforced")
+					} else {
+						// ── Enable bypass — require explicit confirmation ──
+						if !ShowYesNoDialog("Allow All Commands?",
+							"This disables the command allow list and approval prompts.\n\n"+
+								"Every command received from the cloud will execute WITHOUT prompting.\n\n"+
+								"Only enable this on a machine you fully trust. Continue?") {
+							continue
+						}
+						prev := cfg.AllowAllCommands
+						cfg.AllowAllCommands = true
+						if err := cfg.Save(ConfigPath()); err != nil {
+							cfg.AllowAllCommands = prev
+							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
+							ShowErrorDialog("Allow All Commands",
+								fmt.Sprintf("Could not enable Allow All Commands — config save failed:\n\n%v\n\nThe bypass remains disabled.", err))
+							continue
+						}
+						cfg.SetAllowAllCommands(true)
+						mAllowAll.Check()
+						LogSecurityEvent(SecEvtAllowAllEnabled,
+							"Allow All Commands enabled by user — allow list bypassed")
 					}
 
 				case <-mResetAllowList.ClickedCh:
