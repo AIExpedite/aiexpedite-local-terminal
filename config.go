@@ -151,7 +151,7 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func (cfg *Config) UpdateCLIAgentCatalog(entries []cliAgentCatalogEntry) {
-	if len(entries) == 0 {
+	if entries == nil {
 		return
 	}
 	cfg.CliAgentCatalog = normalizeCLIAgentCatalog(entries)
