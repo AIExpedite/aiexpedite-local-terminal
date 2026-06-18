@@ -119,10 +119,44 @@ type Config struct {
 	// cliAgent collection. When present it replaces the built-in fallback list
 	// for detection and utilization, allowing new CLI agents to appear without
 	// a local terminal code change.
-	CliAgentCatalog []cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
+	CliAgentCatalog []cliAgentCatalogEntry `json:"-"`
 }
 
 /* -------------------------------------------------------------------------- */
+
+type configJSON Config
+
+func (cfg *Config) MarshalJSON() ([]byte, error) {
+	type configWithCatalog struct {
+		*configJSON
+		CliAgentCatalog *[]cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
+	}
+
+	out := configWithCatalog{configJSON: (*configJSON)(cfg)}
+	if cfg.CliAgentCatalog != nil {
+		catalog := cfg.CliAgentCatalog
+		out.CliAgentCatalog = &catalog
+	}
+	return json.Marshal(out)
+}
+
+func (cfg *Config) UnmarshalJSON(data []byte) error {
+	type configWithCatalog struct {
+		*configJSON
+		CliAgentCatalog *[]cliAgentCatalogEntry `json:"cliAgentCatalog"`
+	}
+
+	in := configWithCatalog{configJSON: (*configJSON)(cfg)}
+	if err := json.Unmarshal(data, &in); err != nil {
+		return err
+	}
+	if in.CliAgentCatalog != nil {
+		cfg.CliAgentCatalog = *in.CliAgentCatalog
+	} else {
+		cfg.CliAgentCatalog = nil
+	}
+	return nil
+}
 
 func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)

@@ -430,16 +430,16 @@ func isSigFailRateLimited() bool {
 // still matches. Only the new __cli_usage_refresh__ command carries the
 // field, and both ends include it.
 type signaturePayload struct {
-	ID              string                 `json:"id"`
-	Command         string                 `json:"command"`
-	Args            []string               `json:"args"`
-	Ts              int64                  `json:"ts"`
-	Type            string                 `json:"type"`
-	SessionID       string                 `json:"sessionID"`
-	Input           string                 `json:"input"`
-	Signal          string                 `json:"signal"`
-	RefreshID       string                 `json:"refreshId,omitempty"`
-	CliAgentCatalog []cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
+	ID              string          `json:"id"`
+	Command         string          `json:"command"`
+	Args            []string        `json:"args"`
+	Ts              int64           `json:"ts"`
+	Type            string          `json:"type"`
+	SessionID       string          `json:"sessionID"`
+	Input           string          `json:"input"`
+	Signal          string          `json:"signal"`
+	RefreshID       string          `json:"refreshId,omitempty"`
+	CliAgentCatalog json.RawMessage `json:"cliAgentCatalog,omitempty"`
 }
 
 // verifySignature verifies the HMAC-SHA256 signature of a command
@@ -462,7 +462,7 @@ func verifySignature(cmd commandMsg, secret string) bool {
 		Input:           cmd.Input,
 		Signal:          cmd.Signal,
 		RefreshID:       cmd.RefreshID,
-		CliAgentCatalog: cmd.CliAgentCatalog,
+		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
 	}
 
 	// Use json.NewEncoder with SetEscapeHTML(false) to match Node.js JSON.stringify behavior.
@@ -484,6 +484,23 @@ func verifySignature(cmd commandMsg, secret string) bool {
 
 	// Constant-time comparison to prevent timing attacks
 	return hmac.Equal([]byte(expectedSig), []byte(cmd.Signature))
+}
+
+func cliAgentCatalogSignatureJSON(cmd commandMsg) json.RawMessage {
+	if len(cmd.rawCliAgentCatalog) > 0 {
+		return append(json.RawMessage(nil), cmd.rawCliAgentCatalog...)
+	}
+	if cmd.CliAgentCatalog == nil {
+		return nil
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(cmd.CliAgentCatalog); err != nil {
+		return nil
+	}
+	return append(json.RawMessage(nil), bytes.TrimRight(buf.Bytes(), "\n")...)
 }
 
 // argsToJSON converts args slice to JSON array string
@@ -523,6 +540,28 @@ type commandMsg struct {
 	SessionID string `json:"sessionID,omitempty"` // Unique session identifier
 	Input     string `json:"input,omitempty"`     // stdin text for session_input; raw JSON-RPC frame for codex_appserver_send / grok_acp_send
 	Signal    string `json:"signal,omitempty"`    // "interrupt"|"kill" for session_signal
+
+	rawCliAgentCatalog json.RawMessage
+}
+
+func (cmd *commandMsg) UnmarshalJSON(data []byte) error {
+	type commandMsgJSON commandMsg
+	var decoded commandMsgJSON
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*cmd = commandMsg(decoded)
+
+	var raw struct {
+		CliAgentCatalog json.RawMessage `json:"cliAgentCatalog"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if len(raw.CliAgentCatalog) > 0 {
+		cmd.rawCliAgentCatalog = append(json.RawMessage(nil), raw.CliAgentCatalog...)
+	}
+	return nil
 }
 
 /* Outgoing result payload (matches backend publishResult struct) */
