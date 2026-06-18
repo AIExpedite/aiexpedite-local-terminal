@@ -23,6 +23,8 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -83,6 +85,16 @@ type cliAgentUsage struct {
 type cliAgentUsageParser interface {
 	Provider() string
 	Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool)
+}
+
+// cliAgentUsageError carries a per-provider failure record for the
+// terminal-results subscriber. The Go agent emits one entry per provider
+// that panicked, timed out, or couldn't gather. The backend's
+// handleCliUsageRefreshResult uses these to advance cliUsageLastFailedAt
+// when zero providers returned data.
+type cliAgentUsageError struct {
+	Provider string `json:"provider"`
+	Message  string `json:"message"`
 }
 
 // gatherCLIAgentUsage walks the registered parsers and returns the slice the
@@ -168,3 +180,105 @@ func firstNonEmpty(values ...string) string {
 // metrics shape uses pointers to distinguish "we observed 0" from "we have no
 // observation" — see cliAgentUsageMetric.
 func floatPtr(v float64) *float64 { return &v }
+
+// GatherCLIAgentUsageOnly runs the CLI-usage probe in isolation — no CPU,
+// memory, GPU, runtime, or shell probing. Used by the demand-driven
+// __cli_usage_refresh__ handler in pubsub.go so an Active wake-up
+// triggers a cheap re-poll of provider quotas without dragging the full
+// 6-hour machine-info gather along with it.
+//
+// Per-provider gather runs under a 10s parent context. Any panic inside
+// a parser is recovered into errs and the provider is omitted from the
+// returned slice (rather than crashing the whole gather). Returns
+// `(usage, errs)` — caller decides success vs. handled_failure based on
+// `len(usage)` plus the presence of errors.
+func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUsageError) {
+	gatherCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	detected := gatherCLIAgents()
+	if len(detected) == 0 {
+		return []cliAgentUsage{}, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		host = ""
+	}
+	now := time.Now()
+
+	out := make([]cliAgentUsage, 0, len(detected))
+	var errs []cliAgentUsageError
+
+	for _, parser := range cliAgentUsageRegistry() {
+		entry, ok := detected[parser.Provider()]
+		if !ok || !entry.Detected {
+			continue
+		}
+		// Each provider parser runs under defer-recover so a panic in one
+		// parser cannot orphan the in-flight marker on the server side.
+		// The recovered failure becomes an explicit error entry and the
+		// provider is omitted from the success slice.
+		usage, errEntry := runProviderParseSafely(gatherCtx, parser, home, entry, now)
+		if errEntry != nil {
+			errs = append(errs, *errEntry)
+			continue
+		}
+		if usage == nil {
+			usage = &cliAgentUsage{
+				Provider:    parser.Provider(),
+				Name:        entry.Name,
+				Version:     entry.Version,
+				Path:        entry.Path,
+				CollectedAt: now.UTC().Format(time.RFC3339),
+			}
+		}
+		if usage.AccountFingerprint == "" {
+			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(parser.Provider(), host, entry)
+		}
+		out = append(out, *usage)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })
+	return out, errs
+}
+
+// runProviderParseSafely invokes a parser under defer-recover and the
+// parent context cancellation. If the parent context is canceled
+// (e.g., the 10s timeout fired), it returns an error entry so the
+// caller can attribute the failure rather than silently dropping the
+// provider.
+func runProviderParseSafely(
+	ctx context.Context,
+	parser cliAgentUsageParser,
+	home string,
+	entry detectedCLIAgent,
+	now time.Time,
+) (usage *cliAgentUsage, errEntry *cliAgentUsageError) {
+	defer func() {
+		if r := recover(); r != nil {
+			usage = nil
+			errEntry = &cliAgentUsageError{
+				Provider: parser.Provider(),
+				Message:  fmt.Sprintf("panic: %v", r),
+			}
+		}
+	}()
+	select {
+	case <-ctx.Done():
+		return nil, &cliAgentUsageError{
+			Provider: parser.Provider(),
+			Message:  "gather context canceled",
+		}
+	default:
+	}
+	parsed, ok := parser.Parse(home, entry, now)
+	if !ok || parsed == nil {
+		// Non-fatal "we couldn't enrich this provider" — caller will
+		// still emit the baseline entry. Don't surface as an error.
+		return nil, nil
+	}
+	return parsed, nil
+}

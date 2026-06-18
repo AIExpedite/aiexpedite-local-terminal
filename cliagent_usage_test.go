@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -460,6 +461,38 @@ func TestGatherCLIAgentUsage_EmptyDetectedReturnsExplicitEmptySlice(t *testing.T
 	}
 	if len(out) != 0 {
 		t.Fatalf("expected no entries, got %d", len(out))
+	}
+}
+
+// GatherCLIAgentUsageOnly is the lightweight per-tick entry point the
+// pubsub.go __cli_usage_refresh__ handler calls. We exercise the
+// happy-path empty-detect case and the context-cancel case here; the
+// per-provider parsing logic is already covered by the per-provider
+// tests above.
+func TestGatherCLIAgentUsageOnly_EmptyWhenNoAgentsDetected(t *testing.T) {
+	// Confine HOME so no real providers are picked up off the host.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("PATH", "/nonexistent")
+	usage, errs := GatherCLIAgentUsageOnly(context.Background())
+	if usage == nil {
+		t.Fatalf("expected non-nil empty slice")
+	}
+	if len(usage) != 0 {
+		t.Fatalf("expected empty usage when no agents are on PATH, got %d entries", len(usage))
+	}
+	if len(errs) != 0 {
+		t.Fatalf("expected no errors when no providers were detected, got %d", len(errs))
+	}
+}
+
+func TestGatherCLIAgentUsageOnly_RespectsCanceledContext(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// The function should return promptly without panic.
+	usage, _ := GatherCLIAgentUsageOnly(ctx)
+	if usage == nil {
+		t.Fatalf("expected empty slice on canceled context, got nil")
 	}
 }
 
