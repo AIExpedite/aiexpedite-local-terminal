@@ -1022,8 +1022,14 @@ func runPubSubConnection(cfg *Config) error {
 
 		// ─── Command Staleness Check ──────────────────────────────────────
 		// Reject commands older than maxCommandAgeSec to prevent processing
-		// stale queued commands when terminal reconnects after being offline
-		if isCommandStale(cmd.Ts) {
+		// stale queued commands when terminal reconnects after being offline.
+		//
+		// Exempt __cli_usage_refresh__: it's a server-internal command that
+		// MUST always publish a __cli_usage_refresh_result__ carrying the
+		// refreshId so the backend can clear cliUsageInFlightRefreshId.
+		// Emitting a generic "stale" rejection here would orphan the in-flight
+		// marker and block the active loop until its 60s timeout.
+		if cmd.Command != "__cli_usage_refresh__" && isCommandStale(cmd.Ts) {
 			ageSec := (time.Now().UnixMilli() - cmd.Ts) / 1000
 			fmt.Printf("%s[aiexpedite] Stale command rejected (age: %ds, max: %ds)%s\n",
 				colorYellow, ageSec, maxCommandAgeSec, colorReset)
@@ -1046,7 +1052,10 @@ func runPubSubConnection(cfg *Config) error {
 		// ─────────────────────────────────────────────────────────────────
 
 		// ─── Per-UID Rate Limiting ─────────────────────────────────────────
-		if !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
+		// Exempt __cli_usage_refresh__ for the same reason as the staleness
+		// check above — a "rate_limited" rejection would not carry refreshId
+		// and would orphan the backend's cliUsageInFlightRefreshId.
+		if cmd.Command != "__cli_usage_refresh__" && !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
 			fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
 
 			// Send rate_limited response back to user for immediate feedback
