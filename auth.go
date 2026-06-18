@@ -25,6 +25,10 @@ import (
 // http.DefaultClient has no timeout and can hang indefinitely on slow endpoints.
 var authHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
+var refreshMachineInfoAfterCatalogUpdate = func() {
+	go RefreshMachineInfoNow()
+}
+
 /* --------------------------------------------------------------------------
    WIF Token Source - Implements oauth2.TokenSource for GCP authentication
    -------------------------------------------------------------------------- */
@@ -258,7 +262,12 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 		return "", fmt.Errorf("token request failed with status %d", resp.StatusCode)
 	}
 
-	ts.cfg.UpdateCLIAgentCatalog(tokenResp.CliAgentCatalog)
+	if ts.cfg.UpdateCLIAgentCatalog(tokenResp.CliAgentCatalog) {
+		if err := ts.cfg.Save(ConfigPath()); err != nil {
+			fmt.Printf("%s[auth] Failed to persist CLI-agent catalog from token response: %v%s\n", colorYellow, err, colorReset)
+		}
+		refreshMachineInfoAfterCatalogUpdate()
+	}
 
 	if tokenResp.IDToken == "" {
 		return "", fmt.Errorf("empty id_token in response")

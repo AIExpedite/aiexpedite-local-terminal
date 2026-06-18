@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
+	"sync"
 	"sync/atomic"
 )
 
@@ -119,7 +121,8 @@ type Config struct {
 	// cliAgent collection. When present it replaces the built-in fallback list
 	// for detection and utilization, allowing new CLI agents to appear without
 	// a local terminal code change.
-	CliAgentCatalog []cliAgentCatalogEntry `json:"-"`
+	CliAgentCatalog   []cliAgentCatalogEntry `json:"-"`
+	cliAgentCatalogMu sync.RWMutex
 }
 
 /* -------------------------------------------------------------------------- */
@@ -133,8 +136,7 @@ func (cfg *Config) MarshalJSON() ([]byte, error) {
 	}
 
 	out := configWithCatalog{configJSON: (*configJSON)(cfg)}
-	if cfg.CliAgentCatalog != nil {
-		catalog := cfg.CliAgentCatalog
+	if catalog := cfg.cliAgentCatalogSnapshot(); catalog != nil {
 		out.CliAgentCatalog = &catalog
 	}
 	return json.Marshal(out)
@@ -150,11 +152,13 @@ func (cfg *Config) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &in); err != nil {
 		return err
 	}
+	cfg.cliAgentCatalogMu.Lock()
 	if in.CliAgentCatalog != nil {
-		cfg.CliAgentCatalog = *in.CliAgentCatalog
+		cfg.CliAgentCatalog = cloneCLIAgentCatalog(*in.CliAgentCatalog)
 	} else {
 		cfg.CliAgentCatalog = nil
 	}
+	cfg.cliAgentCatalogMu.Unlock()
 	return nil
 }
 
@@ -176,7 +180,7 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.SkippedVersion != "" && !isValidSemver(cfg.SkippedVersion) {
 		cfg.SkippedVersion = ""
 	}
-	SetCLIAgentCatalog(cfg.CliAgentCatalog)
+	SetCLIAgentCatalog(cfg.cliAgentCatalogSnapshot())
 	// Mirror the persisted AllowAllCommands bool into the atomic so the
 	// first Pub/Sub Receive callback (which reads via IsAllowAllCommands)
 	// sees the same value the user toggled in a previous session.
@@ -184,12 +188,25 @@ func LoadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func (cfg *Config) UpdateCLIAgentCatalog(entries []cliAgentCatalogEntry) {
+func (cfg *Config) UpdateCLIAgentCatalog(entries []cliAgentCatalogEntry) bool {
 	if entries == nil {
-		return
+		return false
 	}
-	cfg.CliAgentCatalog = normalizeCLIAgentCatalog(entries)
-	SetCLIAgentCatalog(cfg.CliAgentCatalog)
+	normalized := normalizeCLIAgentCatalog(entries)
+
+	cfg.cliAgentCatalogMu.Lock()
+	changed := !reflect.DeepEqual(cfg.CliAgentCatalog, normalized)
+	cfg.CliAgentCatalog = cloneCLIAgentCatalog(normalized)
+	cfg.cliAgentCatalogMu.Unlock()
+
+	SetCLIAgentCatalog(normalized)
+	return changed
+}
+
+func (cfg *Config) cliAgentCatalogSnapshot() []cliAgentCatalogEntry {
+	cfg.cliAgentCatalogMu.RLock()
+	defer cfg.cliAgentCatalogMu.RUnlock()
+	return cloneCLIAgentCatalog(cfg.CliAgentCatalog)
 }
 
 // IsAllowAllCommands returns the live AllowAllCommands flag using an

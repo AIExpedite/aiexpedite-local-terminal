@@ -95,6 +95,9 @@ func normalizeCLIAgentCatalog(entries []cliAgentCatalogEntry) []cliAgentCatalogE
 }
 
 func cloneCLIAgentCatalog(entries []cliAgentCatalogEntry) []cliAgentCatalogEntry {
+	if entries == nil {
+		return nil
+	}
 	out := make([]cliAgentCatalogEntry, len(entries))
 	for i, entry := range entries {
 		out[i] = entry
