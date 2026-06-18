@@ -357,10 +357,10 @@ func gatherMachineInfo() *MachineInfo {
 		info.DockerRunning = dr
 	}
 
-	// CLI agents — claude/codex/gemini detection. Same trio as the legacy
-	// LLM probe. exec.LookPath honors the PATH that tray_darwin.go's
-	// init() augmented with /opt/homebrew/bin etc., so brew-installed
-	// agents are visible.
+	// CLI agents — database-backed catalog entries when the backend provides
+	// them, with a built-in default catalog for older services. exec.LookPath
+	// honors the PATH that tray_darwin.go's init() augmented with
+	// /opt/homebrew/bin etc., so brew-installed agents are visible.
 	info.DetectedCliAgents = gatherCLIAgents()
 	// Richer per-provider utilization snapshot — feeds the CLI Agents tab.
 	// Stable order so byte-equal Firestore payloads produce a delta-skip on
@@ -476,19 +476,8 @@ func gatherShellInfo() *shellInfo {
 
 func gatherCLIAgents() map[string]detectedCLIAgent {
 	agents := map[string]detectedCLIAgent{}
-	// DisplayName carries the canonical product label the frontend "CLI
-	// Tools" chips render. Mirrors `name` in db-content/dev/cliAgents/*.json
-	// (Antigravity, Claude Code, Codex, Gemini CLI), not the binary name —
-	// otherwise the About tab would show "agy v1.0.1" instead of
-	// "Antigravity v1.0.1".
-	for _, a := range []struct{ Key, Bin, DisplayName string }{
-		{"claudeCode", "claude", "Claude Code"},
-		{"codex", "codex", "Codex"},
-		{"geminiCli", "gemini", "Gemini CLI"},
-		{"antigravity", "agy", "Antigravity"},
-		{"grok", "grok", "Grok Build"},
-	} {
-		path, err := exec.LookPath(a.Bin)
+	for _, a := range activeCLIAgentCatalog() {
+		path, err := exec.LookPath(a.Command)
 		if err != nil {
 			// Grok's official installer (https://x.ai/cli/install.sh) drops
 			// the binary in $HOME/.grok/bin (or $GROK_BIN_DIR) and only
@@ -498,7 +487,7 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 			// functional install would otherwise report missing — and the
 			// later grok_acp_start would fail via the same lookup. Probe the
 			// installer's default bin dir before giving up.
-			if a.Key == "grok" {
+			if a.Command == "grok" {
 				if p := resolveGrokInstallerBinary(); p != "" {
 					path = p
 				} else {
@@ -519,7 +508,7 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 		if v := probeVersionArgs(path, "--version"); v != "" {
 			entry.Version = v
 		}
-		agents[a.Key] = entry
+		agents[a.ID] = entry
 	}
 	return agents
 }

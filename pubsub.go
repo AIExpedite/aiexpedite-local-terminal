@@ -414,7 +414,7 @@ func isSigFailRateLimited() bool {
    -------------------------------------------------------------------------- */
 
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
-// Field order must match: id, command, args, ts, type, sessionID, input, signal, refreshId
+// Field order must match: id, command, args, ts, type, sessionID, input, signal, refreshId, cliAgentCatalog
 //
 // refreshId is signed so an adversary that can alter a signed
 // __cli_usage_refresh__ command cannot swap the correlation id without
@@ -430,15 +430,16 @@ func isSigFailRateLimited() bool {
 // still matches. Only the new __cli_usage_refresh__ command carries the
 // field, and both ends include it.
 type signaturePayload struct {
-	ID        string   `json:"id"`
-	Command   string   `json:"command"`
-	Args      []string `json:"args"`
-	Ts        int64    `json:"ts"`
-	Type      string   `json:"type"`
-	SessionID string   `json:"sessionID"`
-	Input     string   `json:"input"`
-	Signal    string   `json:"signal"`
-	RefreshID string   `json:"refreshId,omitempty"`
+	ID              string                 `json:"id"`
+	Command         string                 `json:"command"`
+	Args            []string               `json:"args"`
+	Ts              int64                  `json:"ts"`
+	Type            string                 `json:"type"`
+	SessionID       string                 `json:"sessionID"`
+	Input           string                 `json:"input"`
+	Signal          string                 `json:"signal"`
+	RefreshID       string                 `json:"refreshId,omitempty"`
+	CliAgentCatalog []cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
 }
 
 // verifySignature verifies the HMAC-SHA256 signature of a command
@@ -452,15 +453,16 @@ func verifySignature(cmd commandMsg, secret string) bool {
 	}
 
 	payload := signaturePayload{
-		ID:        cmd.ID,
-		Command:   cmd.Command,
-		Args:      args,
-		Ts:        cmd.Ts,
-		Type:      cmd.Type,
-		SessionID: cmd.SessionID,
-		Input:     cmd.Input,
-		Signal:    cmd.Signal,
-		RefreshID: cmd.RefreshID,
+		ID:              cmd.ID,
+		Command:         cmd.Command,
+		Args:            args,
+		Ts:              cmd.Ts,
+		Type:            cmd.Type,
+		SessionID:       cmd.SessionID,
+		Input:           cmd.Input,
+		Signal:          cmd.Signal,
+		RefreshID:       cmd.RefreshID,
+		CliAgentCatalog: cmd.CliAgentCatalog,
 	}
 
 	// Use json.NewEncoder with SetEscapeHTML(false) to match Node.js JSON.stringify behavior.
@@ -512,6 +514,9 @@ type commandMsg struct {
 	// can echo it back. Stored as `cliUsageInFlightRefreshId` on the agent doc;
 	// stale results (mismatched refreshId) are dropped by the results subscriber.
 	RefreshID string `json:"refreshId,omitempty"`
+	// Optional database-backed CLI-agent catalog. When included, it is signed
+	// with the command payload and applied before usage probing.
+	CliAgentCatalog []cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
 
 	// Session fields (for interactive CLI agent sessions)
 	Type      string `json:"type,omitempty"`      // "execute"|"session_start"|"session_input"|"session_signal"|"session_end"|"codex_appserver_start"|"codex_appserver_send"|"codex_appserver_end"|"grok_acp_start"|"grok_acp_send"|"grok_acp_end"
@@ -738,6 +743,7 @@ func StartPubSubLoop(cfg *Config) {
 // stuck waiting for a result that will never arrive.
 func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) (publishErr error) {
 	refreshID := cmd.RefreshID
+	cfg.UpdateCLIAgentCatalog(cmd.CliAgentCatalog)
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("%s[pubsub] panic in CLI usage refresh handler: %v%s\n", colorRed, r, colorReset)

@@ -121,11 +121,12 @@ func (ts *WIFTokenSource) Token() (*oauth2.Token, error) {
 
 // oidcTokenResponse is the response from POST /auth/token
 type oidcTokenResponse struct {
-	IDToken   string `json:"id_token"`
-	ExpiresIn int    `json:"expires_in"`
-	TokenType string `json:"token_type"`
-	Error     string `json:"error,omitempty"`
-	ErrorDesc string `json:"error_description,omitempty"`
+	IDToken         string                 `json:"id_token"`
+	ExpiresIn       int                    `json:"expires_in"`
+	TokenType       string                 `json:"token_type"`
+	Error           string                 `json:"error,omitempty"`
+	ErrorDesc       string                 `json:"error_description,omitempty"`
+	CliAgentCatalog []cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
 }
 
 // getOIDCToken requests an OIDC ID token from our backend.
@@ -256,6 +257,8 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 		}
 		return "", fmt.Errorf("token request failed with status %d", resp.StatusCode)
 	}
+
+	ts.cfg.UpdateCLIAgentCatalog(tokenResp.CliAgentCatalog)
 
 	if tokenResp.IDToken == "" {
 		return "", fmt.Errorf("empty id_token in response")

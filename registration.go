@@ -50,6 +50,8 @@ type PollResponse struct {
 	WIFServiceAccount string `json:"wifServiceAccount,omitempty"`
 	// Storage config
 	StorageBucket string `json:"storageBucket,omitempty"`
+	// CLI-agent catalog projected from the backend cliAgent collection.
+	CliAgentCatalog []cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
 }
 
 // ErrorResponse is the error response from the API
@@ -286,6 +288,7 @@ func StartRegistration(cfg *Config) error {
 	if credentials.StorageBucket != "" {
 		cfg.StorageBucket = credentials.StorageBucket
 	}
+	cfg.UpdateCLIAgentCatalog(credentials.CliAgentCatalog)
 
 	if err := cfg.Save(ConfigPath()); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)

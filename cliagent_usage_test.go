@@ -403,6 +403,7 @@ func TestGrokUsageParser_MissingCredentialsKeepsBaselineEntry(t *testing.T) {
 }
 
 func TestGatherCLIAgentUsage_StableOrderAndOptIn(t *testing.T) {
+	SetCLIAgentCatalog(nil)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
@@ -428,7 +429,70 @@ func TestGatherCLIAgentUsage_StableOrderAndOptIn(t *testing.T) {
 	}
 }
 
+func TestGatherCLIAgentUsage_IncludesConfiguredAgentWithoutParser(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	SetCLIAgentCatalog([]cliAgentCatalogEntry{
+		{
+			ID:           "futureAgent",
+			DisplayName:  "Future Agent",
+			DisplayOrder: 10,
+			Command:      "future-agent",
+		},
+	})
+	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
+
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	out := gatherCLIAgentUsage(map[string]detectedCLIAgent{
+		"futureAgent": {
+			Detected: true,
+			Name:     "Future Agent",
+			Version:  "1.2.3",
+			Path:     filepath.Join(home, "bin", "future-agent"),
+		},
+	}, now)
+
+	if len(out) != 1 {
+		t.Fatalf("expected one generic usage entry, got %d: %#v", len(out), out)
+	}
+	if out[0].Provider != "futureAgent" {
+		t.Errorf("Provider=%q, want futureAgent", out[0].Provider)
+	}
+	if out[0].CliAgentID != "futureAgent" {
+		t.Errorf("CliAgentID=%q, want futureAgent", out[0].CliAgentID)
+	}
+	if out[0].Name != "Future Agent" {
+		t.Errorf("Name=%q, want Future Agent", out[0].Name)
+	}
+	if out[0].Version != "1.2.3" {
+		t.Errorf("Version=%q, want 1.2.3", out[0].Version)
+	}
+	if out[0].AccountFingerprint == "" {
+		t.Errorf("expected fallback device-scoped fingerprint for generic catalog agent")
+	}
+}
+
+func TestGatherCLIAgentUsage_RespectsUtilizationDisabledCatalogEntry(t *testing.T) {
+	SetCLIAgentCatalog([]cliAgentCatalogEntry{
+		{
+			ID:           "futureAgent",
+			DisplayName:  "Future Agent",
+			Command:      "future-agent",
+			Capabilities: json.RawMessage(`{"utilization":false}`),
+		},
+	})
+	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
+
+	out := gatherCLIAgentUsage(map[string]detectedCLIAgent{
+		"futureAgent": {Detected: true, Name: "Future Agent"},
+	}, time.Now())
+	if len(out) != 0 {
+		t.Fatalf("expected utilization-disabled agent to be omitted, got %#v", out)
+	}
+}
+
 func TestGatherCLIAgentUsage_UnknownAccountGetsDeviceScopedFingerprint(t *testing.T) {
+	SetCLIAgentCatalog(nil)
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CODEX_HOME", "")
@@ -455,6 +519,7 @@ func TestGatherCLIAgentUsage_UnknownAccountGetsDeviceScopedFingerprint(t *testin
 }
 
 func TestGatherCLIAgentUsage_EmptyDetectedReturnsExplicitEmptySlice(t *testing.T) {
+	SetCLIAgentCatalog(nil)
 	out := gatherCLIAgentUsage(map[string]detectedCLIAgent{}, time.Now())
 	if out == nil {
 		t.Fatalf("expected non-nil empty slice so auth can send cliAgents: []")
@@ -470,6 +535,7 @@ func TestGatherCLIAgentUsage_EmptyDetectedReturnsExplicitEmptySlice(t *testing.T
 // per-provider parsing logic is already covered by the per-provider
 // tests above.
 func TestGatherCLIAgentUsageOnly_EmptyWhenNoAgentsDetected(t *testing.T) {
+	SetCLIAgentCatalog(nil)
 	// Confine HOME so no real providers are picked up off the host.
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("PATH", "/nonexistent")
@@ -486,6 +552,7 @@ func TestGatherCLIAgentUsageOnly_EmptyWhenNoAgentsDetected(t *testing.T) {
 }
 
 func TestGatherCLIAgentUsageOnly_RespectsCanceledContext(t *testing.T) {
+	SetCLIAgentCatalog(nil)
 	t.Setenv("HOME", t.TempDir())
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

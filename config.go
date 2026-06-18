@@ -113,6 +113,13 @@ type Config struct {
 	// rate-limit metrics fresh from interactive usage). Off by default — the
 	// hook installs on startup, preserving any existing status line by chaining.
 	DisableClaudeStatusLineHook bool `json:"disable_claude_status_line_hook,omitempty"`
+
+	/* ─── CLI-agent catalog ───────────────────────────── */
+	// CliAgentCatalog is the backend-provided projection of the Firestore
+	// cliAgent collection. When present it replaces the built-in fallback list
+	// for detection and utilization, allowing new CLI agents to appear without
+	// a local terminal code change.
+	CliAgentCatalog []cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
 }
 
 /* -------------------------------------------------------------------------- */
@@ -135,11 +142,20 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.SkippedVersion != "" && !isValidSemver(cfg.SkippedVersion) {
 		cfg.SkippedVersion = ""
 	}
+	SetCLIAgentCatalog(cfg.CliAgentCatalog)
 	// Mirror the persisted AllowAllCommands bool into the atomic so the
 	// first Pub/Sub Receive callback (which reads via IsAllowAllCommands)
 	// sees the same value the user toggled in a previous session.
 	cfg.allowAllRuntime.Store(cfg.AllowAllCommands)
 	return cfg, nil
+}
+
+func (cfg *Config) UpdateCLIAgentCatalog(entries []cliAgentCatalogEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	cfg.CliAgentCatalog = normalizeCLIAgentCatalog(entries)
+	SetCLIAgentCatalog(cfg.CliAgentCatalog)
 }
 
 // IsAllowAllCommands returns the live AllowAllCommands flag using an
