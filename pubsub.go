@@ -540,7 +540,13 @@ type resultMsg struct {
 	// subscriber routes on Type and reads these directly.
 	RefreshID string               `json:"refreshId,omitempty"`
 	Success   bool                 `json:"success,omitempty"`
-	CliAgents []cliAgentUsage      `json:"cliAgents,omitempty"`
+	// No omitempty — an empty cliAgents slice ("agent has zero CLI
+	// providers installed") is a legitimate successful poll, not the
+	// same as "field absent". The backend's result handler treats the
+	// presence of the array as the signal to advance
+	// cliUsageLastCheckedAt; omitempty would force every empty-success
+	// poll down the handled-failure path.
+	CliAgents []cliAgentUsage      `json:"cliAgents"`
 	Errors    []cliAgentUsageError `json:"errors,omitempty"`
 }
 
@@ -735,7 +741,13 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	}
 
 	usage, errs := GatherCLIAgentUsageOnly(ctx)
-	success := len(usage) > 0
+	// success is "we polled successfully", NOT "we found something". An
+	// agent with zero providers installed (or zero providers that
+	// matched our parsers) is a legitimate empty poll — the backend
+	// should still advance cliUsageLastCheckedAt and clear any prior
+	// failure marker. Only treat as failure when at least one provider
+	// threw (panic / context cancel / parse error).
+	success := len(errs) == 0
 
 	res := resultMsg{
 		ID:          cmd.ID,
