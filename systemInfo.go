@@ -184,9 +184,16 @@ func GetMachineInfo() *MachineInfo {
 }
 
 // RefreshMachineInfoNow runs a synchronous, off-cycle gather and updates the
-// cache. Triggered by the CLI Agents tab's manual refresh signal so operators
-// don't have to wait for the next 6h tick. Safe to call from any goroutine;
-// concurrent callers serialize through the cache lock.
+// cache. Now ONLY triggered by internal callers that need an immediate
+// machine-info refresh; the backend's demand-driven CLI-usage path goes
+// through GatherCLIAgentUsageOnly (cliagent_usage.go) which probes ONLY
+// the provider quotas — no CPU, memory, GPU, runtime, or shell gather.
+// Without this separation, every Active-loop tick (~5min) would drag
+// the full machine-info probe along with it and cost ~10x what the
+// frontend actually needs to refresh.
+//
+// The 6h periodic gather started by StartMachineInfoGathering remains
+// the source of truth for the full MachineInfo cache.
 func RefreshMachineInfoNow() {
 	info := gatherMachineInfo()
 	machineInfoMu.Lock()

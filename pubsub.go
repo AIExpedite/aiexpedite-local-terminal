@@ -492,6 +492,10 @@ type commandMsg struct {
 	AgentID     string   `json:"agentId,omitempty"`   // Target agent for signature verification
 	Signature   string   `json:"signature,omitempty"` // HMAC-SHA256 signature of command
 	TimeoutMs   int64    `json:"timeoutMs,omitempty"` // Execution timeout in milliseconds (default: 120000)
+	// CLI usage refresh: carries the backend's refreshId so __cli_usage_refresh_result__
+	// can echo it back. Stored as `cliUsageInFlightRefreshId` on the agent doc;
+	// stale results (mismatched refreshId) are dropped by the results subscriber.
+	RefreshID string `json:"refreshId,omitempty"`
 
 	// Session fields (for interactive CLI agent sessions)
 	Type      string `json:"type,omitempty"`      // "execute"|"session_start"|"session_input"|"session_signal"|"session_end"|"codex_appserver_start"|"codex_appserver_send"|"codex_appserver_end"|"grok_acp_start"|"grok_acp_send"|"grok_acp_end"
@@ -524,12 +528,20 @@ type resultMsg struct {
 	Args    []string `json:"args,omitempty"`
 
 	// Session fields (for interactive CLI agent sessions)
-	Type       string `json:"type,omitempty"`       // "result"|"stream"|"prompt"|"session_ended"|"codex_appserver_started"|"codex_appserver_message"|"codex_appserver_stderr"|"codex_appserver_error"|"codex_appserver_ended"|"grok_acp_started"|"grok_acp_message"|"grok_acp_stderr"|"grok_acp_error"|"grok_acp_ended"
+	Type       string `json:"type,omitempty"`       // "result"|"stream"|"prompt"|"session_ended"|"codex_appserver_started"|"codex_appserver_message"|"codex_appserver_stderr"|"codex_appserver_error"|"codex_appserver_ended"|"grok_acp_started"|"grok_acp_message"|"grok_acp_stderr"|"grok_acp_error"|"grok_acp_ended"|"__cli_usage_refresh_result__"
 	SessionID  string `json:"sessionID,omitempty"`  // Session identifier
 	ExitCode   int    `json:"exitCode,omitempty"`   // Process exit code (for session_ended / codex_appserver_ended / grok_acp_ended)
 	PromptText string `json:"promptText,omitempty"` // The question/approval text from CLI
 	PromptType string `json:"promptType,omitempty"` // "permission"|"question"|"unknown"
 	Seq        int    `json:"seq,omitempty"`        // Ordering sequence number for streaming
+
+	// __cli_usage_refresh_result__ payload — populated only when
+	// Type == "__cli_usage_refresh_result__". The backend's results
+	// subscriber routes on Type and reads these directly.
+	RefreshID string               `json:"refreshId,omitempty"`
+	Success   bool                 `json:"success,omitempty"`
+	CliAgents []cliAgentUsage      `json:"cliAgents,omitempty"`
+	Errors    []cliAgentUsageError `json:"errors,omitempty"`
 }
 
 /*
@@ -675,6 +687,71 @@ func StartPubSubLoop(cfg *Config) {
 		// Add ±25% jitter to prevent thundering herd when multiple terminals reconnect
 		jitter := time.Duration(rand.Int63n(int64(backoff)/2)) - backoff/4
 		backoff += jitter
+	}
+}
+
+// handleCLIUsageRefreshCommand handles the demand-driven
+// __cli_usage_refresh__ command from the backend's Active/Idle state
+// machine. It always publishes a __cli_usage_refresh_result__ message
+// (success or handled-failure) so the backend's in-flight marker is
+// never orphaned.
+//
+// Wrapped in defer-recover so a panic in the dispatch path itself (not
+// just per-provider) still surfaces a failure result and clears the
+// server-side in-flight state. Without this, a panicking handler would
+// leave the device's cliUsageInFlightSince stuck until the 60s timeout.
+func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
+	refreshID := cmd.RefreshID
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("%s[pubsub] panic in CLI usage refresh handler: %v%s\n", colorRed, r, colorReset)
+			res := resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				AgentID:     cfg.AgentID,
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        "__cli_usage_refresh_result__",
+				RefreshID:   refreshID,
+				Success:     false,
+				Errors: []cliAgentUsageError{
+					{Provider: "_dispatch", Message: fmt.Sprintf("panic: %v", r)},
+				},
+			}
+			if err := publishMsg(ctx, topic, res); err != nil {
+				fmt.Printf("%s[pubsub] Failed to publish panic refresh result: %v%s\n", colorRed, err, colorReset)
+			}
+		}
+	}()
+
+	if IsOffline() {
+		// Don't publish a result in offline mode — the backend's
+		// guards already short-circuit dispatch in this case, and any
+		// in-flight marker on the server is the result of a race that
+		// the next scheduler tick will resolve. Logging only.
+		fmt.Println("[pubsub] CLI usage refresh ignored — offline mode")
+		return
+	}
+
+	usage, errs := GatherCLIAgentUsageOnly(ctx)
+	success := len(usage) > 0
+
+	res := resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		AgentID:     cfg.AgentID,
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "__cli_usage_refresh_result__",
+		RefreshID:   refreshID,
+		Success:     success,
+		CliAgents:   usage,
+		Errors:      errs,
+	}
+	if err := publishMsg(ctx, topic, res); err != nil {
+		fmt.Printf("%s[pubsub] Failed to publish refresh result: %v%s\n", colorRed, err, colorReset)
 	}
 }
 
@@ -998,29 +1075,18 @@ func runPubSubConnection(cfg *Config) error {
 		// ─────────────────────────────────────────────────────────────────
 
 		if cmd.Command == "__cli_usage_refresh__" {
-			// CLI Agents tab issues this to force an immediate re-gather of
-			// per-provider utilization. Off-cycle from the normal 6h machine-
-			// info loop so an operator clicking Refresh sees fresh data within
-			// the next /auth/token tick rather than waiting hours. Ack
-			// regardless — there is no caller waiting on a pubsub-side reply
-			// (the result flows back via the terminalAgent Firestore doc).
-			if IsOffline() {
-				m.Ack()
-				return
-			}
-			RefreshMachineInfoNow()
-
-			// Trigger a backend update immediately by calling the token endpoint
-			if cfg.TokenEndpoint != "" && cfg.AgentID != "" && cfg.CommandSecret != "" {
-				ts := NewWIFTokenSource(cfg)
-				_, err := ts.getOIDCToken()
-				if err != nil {
-					fmt.Printf("[pubsub] Failed to push refreshed usage to backend: %v\n", err)
-				} else {
-					fmt.Println("[pubsub] Refreshed usage successfully pushed to backend")
-				}
-			}
-
+			// Demand-driven CLI usage refresh from the backend's
+			// Active/Idle state machine (see terminal-service's
+			// cliUsageActiveLoop.service.js). We gather CLI-usage ONLY
+			// — no CPU/memory/runtime probing — and publish a
+			// __cli_usage_refresh_result__ message carrying the
+			// refreshId so the backend can drop stale results and
+			// clear the in-flight marker.
+			//
+			// IMPORTANT: always publish a result, even on failure. The
+			// backend's in-flight marker would otherwise stick until
+			// the 60s timeout and the next scheduled tick.
+			handleCLIUsageRefreshCommand(ctx, topic, cmd, cfg)
 			m.Ack()
 			return
 		}
