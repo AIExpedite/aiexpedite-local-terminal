@@ -538,8 +538,8 @@ type resultMsg struct {
 	// __cli_usage_refresh_result__ payload — populated only when
 	// Type == "__cli_usage_refresh_result__". The backend's results
 	// subscriber routes on Type and reads these directly.
-	RefreshID string               `json:"refreshId,omitempty"`
-	Success   bool                 `json:"success,omitempty"`
+	RefreshID string `json:"refreshId,omitempty"`
+	Success   bool   `json:"success,omitempty"`
 	// No omitempty — an empty cliAgents slice ("agent has zero CLI
 	// providers installed") is a legitimate successful poll, not the
 	// same as "field absent". The backend's result handler treats the
