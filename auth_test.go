@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -77,5 +78,53 @@ func TestGetOIDCToken_PersistsAndRefreshesChangedCLIAgentCatalog(t *testing.T) {
 	catalog := loaded.cliAgentCatalogSnapshot()
 	if len(catalog) != 1 || catalog[0].ID != "futureAgent" {
 		t.Fatalf("persisted catalog=%#v, want futureAgent", catalog)
+	}
+}
+
+func TestGetOIDCToken_AllowsLargeCLIAgentCatalogResponse(t *testing.T) {
+	oldBaseDir := baseDir
+	baseDir = t.TempDir()
+	t.Cleanup(func() { baseDir = oldBaseDir })
+
+	SetCLIAgentCatalog(nil)
+	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
+
+	originalRefresh := refreshMachineInfoAfterCatalogUpdate
+	refreshMachineInfoAfterCatalogUpdate = func() {}
+	t.Cleanup(func() { refreshMachineInfoAfterCatalogUpdate = originalRefresh })
+
+	largeMetadata := strings.Repeat("backend-only catalog metadata ", 3000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"id_token":   "oidc-token",
+			"expires_in": 3600,
+			"token_type": "Bearer",
+			"cliAgentCatalog": []map[string]any{
+				{
+					"id":          "largeCatalogAgent",
+					"displayName": "Large Catalog Agent",
+					"command":     "large-agent",
+					"description": largeMetadata,
+				},
+			},
+		}); err != nil {
+			t.Fatalf("encode response: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := &Config{
+		AgentID:       "agent-1",
+		CommandSecret: "secret",
+		TokenEndpoint: srv.URL,
+	}
+
+	token, err := NewWIFTokenSource(cfg).getOIDCToken()
+	if err != nil {
+		t.Fatalf("getOIDCToken failed for large catalog response: %v", err)
+	}
+	if token != "oidc-token" {
+		t.Fatalf("token=%q, want oidc-token", token)
 	}
 }

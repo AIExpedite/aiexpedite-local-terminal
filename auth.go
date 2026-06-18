@@ -25,6 +25,8 @@ import (
 // http.DefaultClient has no timeout and can hang indefinitely on slow endpoints.
 var authHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
+const maxOIDCTokenResponseBytes = 2 * 1024 * 1024
+
 var refreshMachineInfoAfterCatalogUpdate = func() {
 	go RefreshMachineInfoNow()
 }
@@ -254,10 +256,14 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 	}
 	defer resp.Body.Close()
 
-	// Read response (64 KB cap — OIDC token responses are always small)
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	// Token responses can include the CLI-agent catalog, so keep a bounded but
+	// larger read window than the small STS/impersonation responses below.
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxOIDCTokenResponseBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+	if len(respBody) > maxOIDCTokenResponseBytes {
+		return "", fmt.Errorf("token response exceeds %d bytes", maxOIDCTokenResponseBytes)
 	}
 
 	var tokenResp oidcTokenResponse
