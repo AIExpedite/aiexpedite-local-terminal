@@ -420,6 +420,15 @@ func isSigFailRateLimited() bool {
 // __cli_usage_refresh__ command cannot swap the correlation id without
 // invalidating the HMAC — protecting the backend's stale-result guard
 // (cliUsageInFlightRefreshId mismatch drop) from a replay/tamper bypass.
+//
+// refreshId uses `omitempty` so non-refresh commands (which don't carry one)
+// produce the same canonical JSON as the pre-refreshId signing format. That
+// preserves signature verification across the agent/service upgrade window:
+// a new agent receiving a normal command from an older Node producer (no
+// refreshId in the signed shape) still matches, and a new Node producer
+// sending a non-refresh command to an older agent (also without refreshId)
+// still matches. Only the new __cli_usage_refresh__ command carries the
+// field, and both ends include it.
 type signaturePayload struct {
 	ID        string   `json:"id"`
 	Command   string   `json:"command"`
@@ -429,7 +438,7 @@ type signaturePayload struct {
 	SessionID string   `json:"sessionID"`
 	Input     string   `json:"input"`
 	Signal    string   `json:"signal"`
-	RefreshID string   `json:"refreshId"`
+	RefreshID string   `json:"refreshId,omitempty"`
 }
 
 // verifySignature verifies the HMAC-SHA256 signature of a command

@@ -11,8 +11,10 @@ import (
 )
 
 func TestSignatureMatch(t *testing.T) {
-	// Values matching the expanded signaturePayload (id, command, args, ts, type, sessionID, input, signal, refreshId)
-	expectedSignatureData := `{"id":"05989d90-0b3d-4592-bf14-928d11a82e14","command":"echo \"Testing terminal tool\" && date && pwd","args":[],"ts":1771714908831,"type":"","sessionID":"","input":"","signal":"","refreshId":""}`
+	// Non-refresh commands omit refreshId from the canonical JSON (omitempty),
+	// so this matches the pre-refreshId signed shape — backward-compatible with
+	// older agents/services that don't know about refreshId.
+	expectedSignatureData := `{"id":"05989d90-0b3d-4592-bf14-928d11a82e14","command":"echo \"Testing terminal tool\" && date && pwd","args":[],"ts":1771714908831,"type":"","sessionID":"","input":"","signal":""}`
 
 	// Build the same payload Go would build from the Pub/Sub message
 	cmd := commandMsg{
@@ -161,6 +163,72 @@ func TestVerifySignatureWithSpecialChars(t *testing.T) {
 				t.Fatalf("verifySignature failed for command: %s\nNode JSON: %s", tc.command, string(nodeJSON))
 			}
 		})
+	}
+}
+
+func TestSignatureMatchWithRefreshId(t *testing.T) {
+	// __cli_usage_refresh__ commands DO carry refreshId, so it must appear
+	// last in the canonical JSON (matches Node signCommand output).
+	expectedSignatureData := `{"id":"cmd-abc","command":"__cli_usage_refresh__","args":[],"ts":1771714908831,"type":"","sessionID":"","input":"","signal":"","refreshId":"rid-xyz"}`
+
+	cmd := commandMsg{
+		ID:        "cmd-abc",
+		Command:   "__cli_usage_refresh__",
+		Args:      []string{},
+		Ts:        1771714908831,
+		RefreshID: "rid-xyz",
+	}
+
+	payload := signaturePayload{
+		ID:        cmd.ID,
+		Command:   cmd.Command,
+		Args:      cmd.Args,
+		Ts:        cmd.Ts,
+		Type:      cmd.Type,
+		SessionID: cmd.SessionID,
+		Input:     cmd.Input,
+		Signal:    cmd.Signal,
+		RefreshID: cmd.RefreshID,
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(payload); err != nil {
+		t.Fatalf("json.Encode failed: %v", err)
+	}
+	signatureData := bytes.TrimRight(buf.Bytes(), "\n")
+
+	if string(signatureData) != expectedSignatureData {
+		t.Fatalf("refreshId canonical mismatch\nwant: %s\n got: %s", expectedSignatureData, string(signatureData))
+	}
+}
+
+// TestVerifySignatureBackwardCompatLegacyProducer simulates the agent/service
+// upgrade window: a producer that signed without refreshId at all (the
+// pre-refreshId canonical shape) must still verify on the new agent for
+// non-refresh commands. Regression guard for the P1 raised on commit 59bc0cc.
+func TestVerifySignatureBackwardCompatLegacyProducer(t *testing.T) {
+	secret := "test-secret-for-unit-test"
+
+	// Legacy canonical JSON — no refreshId field at all.
+	legacyCanonical := `{"id":"legacy-1","command":"ls","args":[],"ts":1234567890,"type":"","sessionID":"","input":"","signal":""}`
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(legacyCanonical))
+	legacySig := hex.EncodeToString(mac.Sum(nil))
+
+	cmd := commandMsg{
+		ID:        "legacy-1",
+		Command:   "ls",
+		Args:      []string{},
+		Ts:        1234567890,
+		Signature: legacySig,
+		// RefreshID intentionally left empty — old producer didn't set it.
+	}
+
+	if !verifySignature(cmd, secret) {
+		t.Fatalf("verifySignature should accept legacy signatures (no refreshId) for non-refresh commands")
 	}
 }
 
