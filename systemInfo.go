@@ -183,6 +183,25 @@ func GetMachineInfo() *MachineInfo {
 	return machineInfoCache
 }
 
+// SetCachedCLIAgents updates only the CliAgents slice on the cached
+// MachineInfo so the next /auth/token request sends the freshly polled
+// usage instead of the stale 6h-gather snapshot. Called by the
+// demand-driven __cli_usage_refresh__ handler after a successful
+// lightweight gather; without it a WIF/token refresh that races with
+// an Active-loop poll would POST the old cliAgents array and revert
+// the backend to stale quota/account data.
+//
+// No-op when the cache hasn't been populated yet (first gather still
+// in flight) — the next full gather will overwrite this slice anyway.
+func SetCachedCLIAgents(usage []cliAgentUsage) {
+	machineInfoMu.Lock()
+	defer machineInfoMu.Unlock()
+	if machineInfoCache == nil {
+		return
+	}
+	machineInfoCache.CliAgents = usage
+}
+
 // RefreshMachineInfoNow runs a synchronous, off-cycle gather and updates the
 // cache. Now ONLY triggered by internal callers that need an immediate
 // machine-info refresh; the backend's demand-driven CLI-usage path goes

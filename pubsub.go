@@ -773,6 +773,14 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	}
 
 	usage, errs := GatherCLIAgentUsageOnly(ctx)
+	// Refresh the cached CliAgents on the shared MachineInfo so the next
+	// /auth/token doesn't POST the stale 6h-gather snapshot and revert
+	// the backend's quota state. Only update on a successful poll —
+	// preserving the prior cache on handled failure is intentional and
+	// matches the backend's "don't overwrite snapshot on failure" rule.
+	if len(errs) == 0 {
+		SetCachedCLIAgents(usage)
+	}
 	// success is "we polled successfully", NOT "we found something". An
 	// agent with zero providers installed (or zero providers that
 	// matched our parsers) is a legitimate empty poll — the backend
