@@ -11,8 +11,8 @@ import (
 )
 
 func TestSignatureMatch(t *testing.T) {
-	// Values matching the expanded signaturePayload (id, command, args, ts, type, sessionID, input, signal)
-	expectedSignatureData := `{"id":"05989d90-0b3d-4592-bf14-928d11a82e14","command":"echo \"Testing terminal tool\" && date && pwd","args":[],"ts":1771714908831,"type":"","sessionID":"","input":"","signal":""}`
+	// Values matching the expanded signaturePayload (id, command, args, ts, type, sessionID, input, signal, refreshId)
+	expectedSignatureData := `{"id":"05989d90-0b3d-4592-bf14-928d11a82e14","command":"echo \"Testing terminal tool\" && date && pwd","args":[],"ts":1771714908831,"type":"","sessionID":"","input":"","signal":"","refreshId":""}`
 
 	// Build the same payload Go would build from the Pub/Sub message
 	cmd := commandMsg{
@@ -31,6 +31,7 @@ func TestSignatureMatch(t *testing.T) {
 		SessionID: cmd.SessionID,
 		Input:     cmd.Input,
 		Signal:    cmd.Signal,
+		RefreshID: cmd.RefreshID,
 	}
 
 	// Use the same encoding as verifySignature (SetEscapeHTML false)
@@ -79,6 +80,7 @@ func TestVerifySignatureWithAmpersand(t *testing.T) {
 		SessionID: "",
 		Input:     "",
 		Signal:    "",
+		RefreshID: "",
 	}
 	nodeJSON, err := nodeJSONStringify(nodePayload)
 	if err != nil {
@@ -136,6 +138,7 @@ func TestVerifySignatureWithSpecialChars(t *testing.T) {
 				SessionID: "",
 				Input:     "",
 				Signal:    "",
+				RefreshID: "",
 			}
 			nodeJSON, err := nodeJSONStringify(payload)
 			if err != nil {
@@ -192,6 +195,7 @@ func TestVerifySignatureWithArgs(t *testing.T) {
 				SessionID: "",
 				Input:     "",
 				Signal:    "",
+				RefreshID: "",
 			}
 			nodeJSON, err := nodeJSONStringify(payload)
 			if err != nil {

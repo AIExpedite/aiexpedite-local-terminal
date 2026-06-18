@@ -414,7 +414,12 @@ func isSigFailRateLimited() bool {
    -------------------------------------------------------------------------- */
 
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
-// Field order must match: id, command, args, ts, type, sessionID, input, signal
+// Field order must match: id, command, args, ts, type, sessionID, input, signal, refreshId
+//
+// refreshId is signed so an adversary that can alter a signed
+// __cli_usage_refresh__ command cannot swap the correlation id without
+// invalidating the HMAC — protecting the backend's stale-result guard
+// (cliUsageInFlightRefreshId mismatch drop) from a replay/tamper bypass.
 type signaturePayload struct {
 	ID        string   `json:"id"`
 	Command   string   `json:"command"`
@@ -424,6 +429,7 @@ type signaturePayload struct {
 	SessionID string   `json:"sessionID"`
 	Input     string   `json:"input"`
 	Signal    string   `json:"signal"`
+	RefreshID string   `json:"refreshId"`
 }
 
 // verifySignature verifies the HMAC-SHA256 signature of a command
@@ -445,6 +451,7 @@ func verifySignature(cmd commandMsg, secret string) bool {
 		SessionID: cmd.SessionID,
 		Input:     cmd.Input,
 		Signal:    cmd.Signal,
+		RefreshID: cmd.RefreshID,
 	}
 
 	// Use json.NewEncoder with SetEscapeHTML(false) to match Node.js JSON.stringify behavior.
@@ -539,7 +546,15 @@ type resultMsg struct {
 	// Type == "__cli_usage_refresh_result__". The backend's results
 	// subscriber routes on Type and reads these directly.
 	RefreshID string `json:"refreshId,omitempty"`
-	Success   bool   `json:"success,omitempty"`
+	// Pointer (not bool) because the zero value `false` is meaningful —
+	// it's how the handled-failure path (provider timeout/panic) tells
+	// the backend to set cliUsageLastFailedAt. A non-pointer bool with
+	// `omitempty` would drop `success: false` from the marshaled JSON,
+	// so the backend would see an absent field and fall through to its
+	// legacy "no explicit signal" handling instead of the failure
+	// branch. nil = field absent (non-refresh result), &true / &false =
+	// explicit success/failure on a refresh result.
+	Success *bool `json:"success,omitempty"`
 	// No omitempty — an empty cliAgents slice ("agent has zero CLI
 	// providers installed") is a legitimate successful poll, not the
 	// same as "field absent". The backend's result handler treats the
@@ -706,11 +721,18 @@ func StartPubSubLoop(cfg *Config) {
 // just per-provider) still surfaces a failure result and clears the
 // server-side in-flight state. Without this, a panicking handler would
 // leave the device's cliUsageInFlightSince stuck until the 60s timeout.
-func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
+//
+// Returns nil on a clean completion (result published OR offline-skip),
+// non-nil when the result publish itself failed. The caller uses this
+// to decide ack vs nack: a failed publish must nack so Pub/Sub
+// redelivers the command and the backend's in-flight marker isn't left
+// stuck waiting for a result that will never arrive.
+func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) (publishErr error) {
 	refreshID := cmd.RefreshID
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("%s[pubsub] panic in CLI usage refresh handler: %v%s\n", colorRed, r, colorReset)
+			failure := false
 			res := resultMsg{
 				ID:          cmd.ID,
 				WorkspaceID: cmd.WorkspaceID,
@@ -720,13 +742,14 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 				Version:     Version,
 				Type:        "__cli_usage_refresh_result__",
 				RefreshID:   refreshID,
-				Success:     false,
+				Success:     &failure,
 				Errors: []cliAgentUsageError{
 					{Provider: "_dispatch", Message: fmt.Sprintf("panic: %v", r)},
 				},
 			}
 			if err := publishMsg(ctx, topic, res); err != nil {
 				fmt.Printf("%s[pubsub] Failed to publish panic refresh result: %v%s\n", colorRed, err, colorReset)
+				publishErr = err
 			}
 		}
 	}()
@@ -737,7 +760,7 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 		// in-flight marker on the server is the result of a race that
 		// the next scheduler tick will resolve. Logging only.
 		fmt.Println("[pubsub] CLI usage refresh ignored — offline mode")
-		return
+		return nil
 	}
 
 	usage, errs := GatherCLIAgentUsageOnly(ctx)
@@ -758,13 +781,15 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 		Version:     Version,
 		Type:        "__cli_usage_refresh_result__",
 		RefreshID:   refreshID,
-		Success:     success,
+		Success:     &success,
 		CliAgents:   usage,
 		Errors:      errs,
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[pubsub] Failed to publish refresh result: %v%s\n", colorRed, err, colorReset)
+		return err
 	}
+	return nil
 }
 
 // publishMsg marshals res and publishes it on topic using ctx.
@@ -1098,8 +1123,16 @@ func runPubSubConnection(cfg *Config) error {
 			// IMPORTANT: always publish a result, even on failure. The
 			// backend's in-flight marker would otherwise stick until
 			// the 60s timeout and the next scheduled tick.
-			handleCLIUsageRefreshCommand(ctx, topic, cmd, cfg)
-			m.Ack()
+			//
+			// Nack on publish failure so Pub/Sub redelivers the
+			// command — otherwise a transient publish error would
+			// leave the backend's cliUsageInFlightSince stuck and the
+			// next scheduler tick blocked behind the in-flight guard.
+			if err := handleCLIUsageRefreshCommand(ctx, topic, cmd, cfg); err != nil {
+				m.Nack()
+			} else {
+				m.Ack()
+			}
 			return
 		}
 
