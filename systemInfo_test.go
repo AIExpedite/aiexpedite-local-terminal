@@ -238,7 +238,7 @@ func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
 		"codex":       "Codex",
 		"geminiCli":   "Gemini CLI",
 		"antigravity": "Antigravity",
-		"grok":        "Grok",
+		"grok":        "Grok Build",
 	}
 	for key, wantName := range wantNames {
 		entry, ok := agents[key]
@@ -309,8 +309,8 @@ func TestGatherCLIAgents_DetectsGrokInInstallerBin(t *testing.T) {
 	if entry.Path != stub {
 		t.Errorf("grok entry: Path=%q, want %q", entry.Path, stub)
 	}
-	if entry.Name != "Grok" {
-		t.Errorf("grok entry: Name=%q, want %q", entry.Name, "Grok")
+	if entry.Name != "Grok Build" {
+		t.Errorf("grok entry: Name=%q, want %q", entry.Name, "Grok Build")
 	}
 }
 
