@@ -782,7 +782,7 @@ func StartPubSubLoop(cfg *Config) {
 // stuck waiting for a result that will never arrive.
 func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) (publishErr error) {
 	refreshID := cmd.RefreshID
-	cfg.UpdateCLIAgentCatalog(cmd.CliAgentCatalog)
+	persistCLIAgentCatalogUpdate(cfg, cmd.CliAgentCatalog, "pubsub", "refresh command")
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("%s[pubsub] panic in CLI usage refresh handler: %v%s\n", colorRed, r, colorReset)

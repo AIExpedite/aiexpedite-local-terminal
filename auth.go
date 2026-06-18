@@ -29,6 +29,17 @@ var refreshMachineInfoAfterCatalogUpdate = func() {
 	go RefreshMachineInfoNow()
 }
 
+func persistCLIAgentCatalogUpdate(cfg *Config, entries []cliAgentCatalogEntry, logScope, source string) bool {
+	if cfg == nil || !cfg.UpdateCLIAgentCatalog(entries) {
+		return false
+	}
+	if err := cfg.Save(ConfigPath()); err != nil {
+		fmt.Printf("%s[%s] Failed to persist CLI-agent catalog from %s: %v%s\n", colorYellow, logScope, source, err, colorReset)
+	}
+	refreshMachineInfoAfterCatalogUpdate()
+	return true
+}
+
 /* --------------------------------------------------------------------------
    WIF Token Source - Implements oauth2.TokenSource for GCP authentication
    -------------------------------------------------------------------------- */
@@ -262,12 +273,7 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 		return "", fmt.Errorf("token request failed with status %d", resp.StatusCode)
 	}
 
-	if ts.cfg.UpdateCLIAgentCatalog(tokenResp.CliAgentCatalog) {
-		if err := ts.cfg.Save(ConfigPath()); err != nil {
-			fmt.Printf("%s[auth] Failed to persist CLI-agent catalog from token response: %v%s\n", colorYellow, err, colorReset)
-		}
-		refreshMachineInfoAfterCatalogUpdate()
-	}
+	persistCLIAgentCatalogUpdate(ts.cfg, tokenResp.CliAgentCatalog, "auth", "token response")
 
 	if tokenResp.IDToken == "" {
 		return "", fmt.Errorf("empty id_token in response")
