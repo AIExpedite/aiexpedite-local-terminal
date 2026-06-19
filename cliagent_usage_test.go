@@ -442,6 +442,79 @@ func TestCodexUsageParser_RolloutAnchorsRelativeResetToEventTime(t *testing.T) {
 	}
 }
 
+// A later sparse token_count frame that restates only `primary` must not drop
+// a `secondary` reading an earlier frame in the same file already captured.
+func TestCodexUsageParser_RolloutMergesSparseFrames(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{"email": "carol@example.com"})
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-sparse", []map[string]any{
+		// Full frame: both windows.
+		codexRateLimitFrame(20, 40, now),
+		// Sparse follow-up: only primary restated (no secondary key).
+		{"primary": map[string]any{"used_percent": 25.0, "window_minutes": 300.0, "resets_at": float64(now.Add(time.Hour).Unix())}},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Consumed == nil || *session.Consumed != 25 {
+		t.Errorf("session Consumed=%v, want 25 (latest primary)", session.Consumed)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 40 {
+		t.Errorf("weekly metric=%+v, want 40 preserved from earlier frame", weekly)
+	}
+}
+
+// camelCase telemetry (`rateLimits`, `usedPercent`, …) — which the extractor
+// and live capture already accept — must survive the fallback prefilter too.
+func TestCodexUsageParser_RolloutAcceptsCamelCaseFrames(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{"email": "carol@example.com"})
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	dir := filepath.Join(codexHome, "sessions", "2026", "06", "19")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	line, err := json.Marshal(map[string]any{
+		"timestamp": "2026-06-19T11:00:00.000Z",
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type": "token_count",
+			"rateLimits": map[string]any{
+				"primary":   map[string]any{"usedPercent": 15.0, "windowMinutes": 300.0, "resetsAt": float64(now.Add(time.Hour).Unix())},
+				"secondary": map[string]any{"usedPercent": 8.0, "windowMinutes": 10080.0, "resetsAt": float64(now.Add(72 * time.Hour).Unix())},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "rollout-2026-06-19T11-00-00-camel.jsonl"), append(line, '\n'), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Unknown || session.Consumed == nil || *session.Consumed != 15 {
+		t.Errorf("session metric=%+v, want 15 from camelCase rollout frame", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 8 {
+		t.Errorf("weekly metric=%+v, want 8 from camelCase rollout frame", weekly)
+	}
+}
+
 func TestGeminiUsageParser_FreeTierFramesTotal(t *testing.T) {
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".gemini", "settings.json"), map[string]any{

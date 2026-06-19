@@ -932,12 +932,16 @@ func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]codexRa
 	// app-server's ceiling so a single big line doesn't abort the scan mid-file.
 	scanner.Buffer(make([]byte, 0, 64*1024), codexAppServerMaxLineSize)
 
-	var latest map[string]map[string]codexRateLimitBucket
+	acc := map[string]map[string]codexRateLimitBucket{}
 	for scanner.Scan() {
 		line := scanner.Text()
-		// Cheap prefilter: only decode lines that could carry a window update,
-		// mirroring captureCodexRateLimitLine's pre-JSON gate.
-		if !strings.Contains(line, "rate_limit") {
+		// Cheap prefilter: only decode lines that could carry a window update.
+		// Mirror captureCodexRateLimitLine's gate exactly so camelCase frames
+		// (`rateLimits` / `rateLimitsByLimitId`) the extractor supports aren't
+		// dropped — `rate_limit` alone wouldn't match the camelCase spelling.
+		if !strings.Contains(line, "token_count") &&
+			!strings.Contains(line, "rateLimits") &&
+			!strings.Contains(line, "rate_limit") {
 			continue
 		}
 		var raw map[string]interface{}
@@ -963,16 +967,54 @@ func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]codexRa
 		// false for that envelope, so null windows are ignored rather than
 		// treated as clears — exactly what we want when mining for live usage.
 		if updates, _ := extractCodexRateLimitBuckets(raw, eventTime); len(updates) > 0 {
-			latest = updates
+			// Merge, don't replace: token_count notifications are sparse, so a
+			// later frame restating only `primary` must not drop a `secondary`
+			// reading an earlier frame in this same file already captured.
+			mergeCodexRolloutFrame(acc, updates)
 		}
 	}
-	if latest == nil {
+	if len(acc) == 0 {
 		return nil, false
 	}
 	// Roll over against the real current time: aggregateCodexBuckets zeroes any
 	// window whose reset is already in the past as of now, so a stale relative
 	// reset anchored above correctly clears instead of showing old usage.
-	return aggregateCodexBuckets(latest, now), true
+	return aggregateCodexBuckets(acc, now), true
+}
+
+// mergeCodexRolloutFrame folds one frame's per-(window, limit) contributors into
+// the accumulated snapshot for a single rollout file, latest-wins. Within a
+// restated (window, limit), a sparse frame that carries only a fresh usage OR
+// only a fresh reset preserves the field it omitted from the prior frame —
+// mirroring the live cache's sparse-merge so a reset-only heartbeat can't zero
+// the usage and a usage-only update can't drop the reset. Windows/limits the
+// frame doesn't mention are left untouched (rollout frames never clear).
+func mergeCodexRolloutFrame(acc, updates map[string]map[string]codexRateLimitBucket) {
+	for window, contributors := range updates {
+		if acc[window] == nil {
+			acc[window] = map[string]codexRateLimitBucket{}
+		}
+		for limit, b := range contributors {
+			prev, ok := acc[window][limit]
+			if !ok {
+				acc[window][limit] = b
+				continue
+			}
+			merged := b
+			if !b.usageKnown && prev.usageKnown {
+				merged.UsedPercentage = prev.UsedPercentage
+				merged.usageKnown = true
+			}
+			if !b.resetKnown && prev.resetKnown {
+				merged.ResetsAtMs = prev.ResetsAtMs
+				merged.resetKnown = true
+			}
+			if merged.WindowMinutes == 0 && prev.WindowMinutes > 0 {
+				merged.WindowMinutes = prev.WindowMinutes
+			}
+			acc[window][limit] = merged
+		}
+	}
 }
 
 // codexWindowLabel renders a human label for a window of the given length.
