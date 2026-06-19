@@ -360,6 +360,108 @@ func TestCaptureCodexRateLimit_ResetOnlyAdvanceDropsPriorUsage(t *testing.T) {
 	}
 }
 
+// Codex's app-server also emits token_count events as JSONL/event envelopes
+// outside of a JSON-RPC params/result frame: `{"id":"…","msg":{"type":
+// "token_count", … "rate_limits": …}}` and a session-event variant
+// `{"payload":{…}}`. The extractor must descend into TOP-LEVEL msg/payload —
+// not just params/result and their nested .msg — otherwise the prefilter
+// passes, no buckets are emitted, and the card stays Unknown despite live
+// telemetry being present.
+func TestCaptureCodexRateLimit_TopLevelMsgEnvelope(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	line := `{"id":"0","msg":{"type":"token_count","rate_limits":{` +
+		`"primary":{"used_percent":61,"resets_in_seconds":1800},` +
+		`"secondary":{"utilization":0.42,"resets_in_seconds":259200}` +
+		`}}}`
+
+	captureCodexRateLimitLine(line, now)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache to be written from top-level msg envelope")
+	}
+	p, ok := snap.Buckets[codexWindowPrimary]
+	if !ok {
+		t.Fatalf("expected primary bucket from top-level msg envelope, got %+v", snap.Buckets)
+	}
+	if p.UsedPercentage != 61 {
+		t.Errorf("primary UsedPercentage=%v, want 61", p.UsedPercentage)
+	}
+	if want := now.Add(30 * time.Minute).UnixMilli(); p.ResetsAtMs != want {
+		t.Errorf("primary ResetsAtMs=%d, want %d", p.ResetsAtMs, want)
+	}
+	s, ok := snap.Buckets[codexWindowSecondary]
+	if !ok {
+		t.Fatalf("expected secondary bucket from top-level msg envelope")
+	}
+	if s.UsedPercentage < 41.9 || s.UsedPercentage > 42.1 {
+		t.Errorf("secondary UsedPercentage=%v, want ~42 (utilization 0.42)", s.UsedPercentage)
+	}
+}
+
+func TestCaptureCodexRateLimit_TopLevelPayloadEnvelope(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	line := `{"payload":{"type":"token_count","rate_limits":{` +
+		`"primary":{"used_percent":25,"resets_in_seconds":900}` +
+		`}}}`
+
+	captureCodexRateLimitLine(line, now)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache to be written from top-level payload envelope")
+	}
+	p, ok := snap.Buckets[codexWindowPrimary]
+	if !ok {
+		t.Fatalf("expected primary bucket from top-level payload envelope, got %+v", snap.Buckets)
+	}
+	if p.UsedPercentage != 25 {
+		t.Errorf("primary UsedPercentage=%v, want 25", p.UsedPercentage)
+	}
+}
+
+// Top-level msg/payload envelopes are notifications, NOT full
+// account/rateLimits/read snapshots — a null window there means "no update,"
+// not "clear it." Otherwise a stray top-level event could silently wipe a
+// freshly cached weekly bucket.
+func TestCaptureCodexRateLimit_TopLevelMsgNullDoesNotClear(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed both windows via a normal params-side notification.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","method":"token_count","params":{"msg":{"rate_limits":{`+
+			`"primary":{"used_percent":40,"resets_in_seconds":3600},`+
+			`"secondary":{"used_percent":10,"resets_in_seconds":604800}}}}}`,
+		now)
+
+	// A subsequent top-level-msg event reports primary only and SETS secondary
+	// null. Since this is not a full snapshot, secondary must be preserved.
+	captureCodexRateLimitLine(
+		`{"id":"1","msg":{"type":"token_count","rate_limits":{`+
+			`"primary":{"used_percent":55,"resets_in_seconds":3600},`+
+			`"secondary":null}}}`,
+		now.Add(time.Minute))
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if p := snap.Buckets[codexWindowPrimary]; p.UsedPercentage != 55 {
+		t.Errorf("primary UsedPercentage=%v, want 55 (refreshed)", p.UsedPercentage)
+	}
+	if _, present := snap.Buckets[codexWindowSecondary]; !present {
+		t.Errorf("secondary window must NOT be cleared by a null in a top-level msg envelope (notification, not full snapshot)")
+	}
+}
+
 func TestCaptureCodexRateLimit_IgnoresUnrelatedFrames(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)

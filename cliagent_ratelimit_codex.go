@@ -164,7 +164,11 @@ func codexBucketFromInfo(info map[string]interface{}, now time.Time) (codexRateL
 // extractCodexRateLimitBuckets pulls every window it can find from a decoded
 // Codex app-server frame. The payload may sit under `params` (notifications:
 // `token_count`, `account/rateLimits/updated`), `result` (response to
-// `account/rateLimits/read`), or `params.msg` (typed event envelope). Both
+// `account/rateLimits/read`), `params.msg` / `result.msg` (typed event
+// envelope under a JSON-RPC frame), or — for the JSONL event-envelope shape
+// the app-server emits outside of a JSON-RPC request/response pair
+// (`{"id":"…","msg":{"type":"token_count", …}}` and the session-event
+// `{"payload":{…}}` variant) — under a top-level `msg` / `payload`. Both
 // snake_case (`rate_limits`) and camelCase (`rateLimits`) are accepted so a
 // schema rename doesn't silently zero the card.
 //
@@ -186,6 +190,20 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (ma
 		fullSnapshot bool
 	}
 	candidates := []candidate{{src: raw, fullSnapshot: false}}
+	// Top-level `msg` / `payload` envelopes: the app-server emits typed events
+	// outside of a JSON-RPC request/response pair as
+	// `{"id":"…","msg":{"type":"token_count", … "rate_limits": …}}` and a
+	// session-event variant `{"payload":{…}}`. These never carry a full
+	// account/rateLimits/read snapshot (those arrive under `result`), so
+	// fullSnapshot stays false — a `null` window here means "no update," not
+	// "clear it," matching the params-side notification semantics.
+	for _, key := range []string{"msg", "payload"} {
+		if v, ok := raw[key]; ok {
+			if m, ok := v.(map[string]interface{}); ok {
+				candidates = append(candidates, candidate{src: m, fullSnapshot: false})
+			}
+		}
+	}
 	for _, key := range []string{"params", "result"} {
 		v, ok := raw[key]
 		if !ok {
@@ -197,8 +215,8 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (ma
 		}
 		fullSnap := key == "result"
 		candidates = append(candidates, candidate{src: m, fullSnapshot: fullSnap})
-		// `params.msg` is the shape codex's app-server uses for typed event
-		// payloads.
+		// `params.msg` / `result.msg` is the shape codex's app-server uses for
+		// typed event payloads carried inside a JSON-RPC frame.
 		if v, ok := m["msg"]; ok {
 			if mm, ok := v.(map[string]interface{}); ok {
 				candidates = append(candidates, candidate{src: mm, fullSnapshot: fullSnap})
