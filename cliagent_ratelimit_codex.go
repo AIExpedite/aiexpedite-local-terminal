@@ -764,6 +764,34 @@ func currentCodexAccountFingerprint() string {
 	return fingerprintAccount("codex", account)
 }
 
+// codexCachedBucketsForAccount loads the rate-limit cache and returns the
+// display-window buckets for `currentFingerprint`, or an empty map when the
+// cache is missing or pinned to a different account. Shared between
+// codexMetricsFromCache (which renders the metrics) and the rollout backfill
+// (which needs to know whether a metric's source bucket has rolled over).
+func codexCachedBucketsForAccount(now time.Time, currentFingerprint string) map[string]codexRateLimitBucket {
+	snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath())
+	if !ok || snap.AccountFingerprint != currentFingerprint {
+		return map[string]codexRateLimitBucket{}
+	}
+	// Prefer Contributors when present so a sparse update for one limit
+	// can't shadow a stricter prior contributor that the sparse frame
+	// never restated. Fall back to the flat aggregate for any legacy
+	// cache file written before the contributors map existed.
+	if len(snap.Contributors) > 0 {
+		reflagged := make(map[string]map[string]codexRateLimitBucket, len(snap.Contributors))
+		for w, contribs := range snap.Contributors {
+			windowMap := make(map[string]codexRateLimitBucket, len(contribs))
+			for limit, b := range contribs {
+				windowMap[limit] = reflagPersistedCodexBucket(b)
+			}
+			reflagged[w] = windowMap
+		}
+		return aggregateCodexBuckets(reflagged, now)
+	}
+	return snap.Buckets
+}
+
 // codexMetricsFromCache builds the metric rows from the rate-limit cache,
 // falling back to the Unknown placeholders when a window hasn't been observed.
 // Two rows are always shown so the card layout is stable: the 5-hour session
@@ -773,27 +801,7 @@ func currentCodexAccountFingerprint() string {
 // caller-supplied one — otherwise a previous account's windows could surface
 // under the current account after a credentials swap.
 func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentUsageMetric {
-	snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath())
-	buckets := map[string]codexRateLimitBucket{}
-	if ok && snap.AccountFingerprint == currentFingerprint {
-		// Prefer Contributors when present so a sparse update for one limit
-		// can't shadow a stricter prior contributor that the sparse frame
-		// never restated. Fall back to the flat aggregate for any legacy
-		// cache file written before the contributors map existed.
-		if len(snap.Contributors) > 0 {
-			reflagged := make(map[string]map[string]codexRateLimitBucket, len(snap.Contributors))
-			for w, contribs := range snap.Contributors {
-				windowMap := make(map[string]codexRateLimitBucket, len(contribs))
-				for limit, b := range contribs {
-					windowMap[limit] = reflagPersistedCodexBucket(b)
-				}
-				reflagged[w] = windowMap
-			}
-			buckets = aggregateCodexBuckets(reflagged, now)
-		} else {
-			buckets = snap.Buckets
-		}
-	}
+	buckets := codexCachedBucketsForAccount(now, currentFingerprint)
 
 	session := codexObservedMetricOrUnknown(
 		buckets, codexWindowPrimary, limitKindSession, "5-hour session window", now)
@@ -810,8 +818,8 @@ func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentU
 // file or two.
 const codexRolloutScanFileCap = 16
 
-// codexBackfillUnknownFromRollout fills any Unknown window in `metrics` from
-// Codex's own on-disk session rollout logs.
+// codexBackfillUnknownFromRollout fills any Unknown or rolled-over window in
+// `metrics` from Codex's own on-disk session rollout logs.
 //
 // Why this exists: our live cache (codex_rate_limits.json) is fed ONLY by the
 // passive app-server capture in codex_appserver.go, so it stays empty whenever
@@ -820,18 +828,47 @@ const codexRolloutScanFileCap = 16
 // telemetry to its rollout logs, so a window we never observed live can still
 // be reported from disk — the same source Codex's own `/status` reads.
 //
-// A live captured bucket is authoritative: only windows that came back Unknown
-// are backfilled, and the rollout scan runs at most once per call. Returns the
-// input slice unchanged when nothing is Unknown or no rollout telemetry exists.
-func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base string, now time.Time) []cliAgentUsageMetric {
-	anyUnknown := false
-	for _, m := range metrics {
+// A live captured bucket with a still-future reset is authoritative: it wins
+// over any rollout reading. But when the cache row's reset has already passed,
+// codexObservedMetricOrUnknown rolls it over to a concrete 0% (Unknown=false)
+// — and without this fallback the card would show that bogus 0% indefinitely
+// for a user who once streamed through the app-server, let the window reset,
+// and then drove Codex only through the TUI (where the new window's usage is
+// only ever written to the rollout log, never back to our cache). So a stale
+// rolled-over cache row is treated as fillable too, identically to Unknown.
+// The rollout scan still runs at most once per call.
+func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, currentFingerprint string, now time.Time) []cliAgentUsageMetric {
+	cacheBuckets := codexCachedBucketsForAccount(now, currentFingerprint)
+	nowMs := now.UnixMilli()
+	cacheRolledOver := func(windowID string) bool {
+		b, ok := cacheBuckets[windowID]
+		return ok && b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs
+	}
+	windowIDFor := func(kind string) (string, bool) {
+		switch kind {
+		case limitKindSession:
+			return codexWindowPrimary, true
+		case limitKindWeekly:
+			return codexWindowSecondary, true
+		}
+		return "", false
+	}
+	fillable := func(m cliAgentUsageMetric) bool {
 		if m.Unknown {
-			anyUnknown = true
+			return true
+		}
+		w, ok := windowIDFor(m.Kind)
+		return ok && cacheRolledOver(w)
+	}
+
+	anyFillable := false
+	for _, m := range metrics {
+		if fillable(m) {
+			anyFillable = true
 			break
 		}
 	}
-	if !anyUnknown {
+	if !anyFillable {
 		return metrics
 	}
 
@@ -841,16 +878,11 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base string,
 	}
 
 	for i, m := range metrics {
-		if !m.Unknown {
+		if !fillable(m) {
 			continue
 		}
-		var windowID string
-		switch m.Kind {
-		case limitKindSession:
-			windowID = codexWindowPrimary
-		case limitKindWeekly:
-			windowID = codexWindowSecondary
-		default:
+		windowID, ok := windowIDFor(m.Kind)
+		if !ok {
 			continue
 		}
 		if _, present := buckets[windowID]; !present {

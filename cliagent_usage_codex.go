@@ -86,6 +86,6 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 	// fall back to Codex's own on-disk rollout logs so the card is observable
 	// even when Codex is only ever driven through its TUI.
 	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
-	usage.Metrics = codexBackfillUnknownFromRollout(usage.Metrics, base, now)
+	usage.Metrics = codexBackfillUnknownFromRollout(usage.Metrics, base, usage.AccountFingerprint, now)
 	return usage, true
 }

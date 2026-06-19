@@ -355,6 +355,44 @@ func TestCodexUsageParser_RolloutOnlyFillsUnknownWindows(t *testing.T) {
 	}
 }
 
+// A cached live bucket whose reset has already passed rolls over to a concrete
+// 0% (Unknown=false) at display time, but the user could have continued
+// driving Codex through its TUI in the new window — that usage only lands in
+// the rollout log, never back in our cache. Without past-reset → fillable, the
+// card would show 0% forever; with it, the newer rollout reading wins.
+func TestCodexUsageParser_RolloutBackfillsRolledOverCacheBucket(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	// Live cache once observed the primary window — but its reset has passed,
+	// so codexObservedMetricOrUnknown rolls it over to 0% (Unknown=false). The
+	// weekly window stays Unknown.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {UsedPercentage: 42, ResetsAtMs: now.Add(-time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
+	}, nil, now.Add(-2*time.Hour), fp)
+	// Rollout carries current usage from a TUI-only session in the new window.
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-rollover", []map[string]any{
+		codexRateLimitFrame(63, 21, now),
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Unknown || session.Consumed == nil || *session.Consumed != 63 {
+		t.Errorf("session metric=%+v, want 63 from rollout (cache rolled over to stale 0%%)", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 21 {
+		t.Errorf("weekly metric=%+v, want 21 from rollout backfill", weekly)
+	}
+}
+
 // Codex emits rate_limits: null between real readings; the parser must take the
 // LAST populated frame, ignoring nulls and earlier values.
 func TestCodexUsageParser_RolloutPrefersLastPopulatedFrame(t *testing.T) {
