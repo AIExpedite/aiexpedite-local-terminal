@@ -225,38 +225,100 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (ma
 	}
 
 	for _, c := range candidates {
-		v, ok := pickField(c.src, "rate_limits", "rateLimits")
-		if !ok {
-			continue
-		}
-		rl, ok := v.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		for window, val := range rl {
-			id, ok := codexWindowAliases[window]
-			if !ok {
-				continue
-			}
-			if val == nil {
-				if c.fullSnapshot {
-					clears[id] = true
+		if v, ok := pickField(c.src, "rate_limits", "rateLimits"); ok {
+			if rl, ok := v.(map[string]interface{}); ok {
+				for window, val := range rl {
+					id, ok := codexWindowAliases[window]
+					if !ok {
+						continue
+					}
+					if val == nil {
+						if c.fullSnapshot {
+							clears[id] = true
+						}
+						continue
+					}
+					info, ok := val.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					b, ok := codexBucketFromInfo(info, now)
+					if !ok {
+						continue
+					}
+					mergeCodexBucketMostConstrained(out, id, b)
 				}
-				continue
 			}
-			info, ok := val.(map[string]interface{})
-			if !ok {
-				continue
+		}
+		// Multi-bucket shape: `rateLimitsByLimitId` is the documented per-
+		// metered-limit view (`codex_primary`, `codex_secondary`, `codex_other`,
+		// …). When present, each entry may carry a tighter quota than the
+		// legacy aggregate `rate_limits` view — e.g. an `codex_other` bucket
+		// constraining the same 5-hour or weekly window — so we must fold
+		// these into our two display windows and keep the HIGHEST observed
+		// utilisation per window. Skipping this would silently understate
+		// usage when the legacy view is the looser of the two.
+		if v, ok := pickField(c.src, "rate_limits_by_limit_id", "rateLimitsByLimitId"); ok {
+			if rl, ok := v.(map[string]interface{}); ok {
+				for limitKey, val := range rl {
+					info, ok := val.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					b, ok := codexBucketFromInfo(info, now)
+					if !ok {
+						continue
+					}
+					id := classifyCodexByLimitBucket(limitKey, b.WindowMinutes)
+					if id == "" {
+						continue
+					}
+					mergeCodexBucketMostConstrained(out, id, b)
+				}
 			}
-			b, ok := codexBucketFromInfo(info, now)
-			if !ok {
-				continue
-			}
-			out[id] = b
 		}
 	}
 
 	return out, clears
+}
+
+// mergeCodexBucketMostConstrained writes `b` into `out[id]` unless an existing
+// bucket already reports a higher observed utilisation — picking the most
+// constrained view keeps multi-bucket payloads from understating usage.
+func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id string, b codexRateLimitBucket) {
+	prev, exists := out[id]
+	if !exists {
+		out[id] = b
+		return
+	}
+	if !b.usageKnown {
+		return
+	}
+	if !prev.usageKnown || b.UsedPercentage > prev.UsedPercentage {
+		out[id] = b
+	}
+}
+
+// classifyCodexByLimitBucket maps a `rateLimitsByLimitId` entry onto one of our
+// two display windows (primary = 5-hour, secondary = weekly) using its key and
+// window length. Unknown buckets (e.g. `codex_other` with no window hint) are
+// classified by length: <= 6h → primary, > 6h → secondary; entries without any
+// window hint are dropped rather than misattributed.
+func classifyCodexByLimitBucket(limitKey string, windowMinutes float64) string {
+	k := strings.ToLower(limitKey)
+	switch {
+	case strings.Contains(k, "primary"), strings.Contains(k, "5h"), strings.Contains(k, "five_hour"), strings.Contains(k, "session"):
+		return codexWindowPrimary
+	case strings.Contains(k, "secondary"), strings.Contains(k, "weekly"), strings.Contains(k, "7d"), strings.Contains(k, "seven_day"):
+		return codexWindowSecondary
+	}
+	if windowMinutes > 0 {
+		if windowMinutes <= 360 {
+			return codexWindowPrimary
+		}
+		return codexWindowSecondary
+	}
+	return ""
 }
 
 // captureCodexRateLimitLine parses one stdout line from a Codex app-server

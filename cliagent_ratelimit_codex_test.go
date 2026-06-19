@@ -462,6 +462,72 @@ func TestCaptureCodexRateLimit_TopLevelMsgNullDoesNotClear(t *testing.T) {
 	}
 }
 
+// account/rateLimits/read can return the documented multi-bucket shape under
+// `rateLimitsByLimitId` (keyed by metered limit id, e.g. `codex_primary`,
+// `codex_secondary`, `codex_other`). When a `codex_other` bucket reports a
+// HIGHER utilisation than the aggregate `rateLimits` view, the cache must keep
+// the more-constrained number — otherwise the UI silently understates usage.
+func TestCaptureCodexRateLimit_MultiBucketKeepsMostConstrained(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	// Legacy aggregate says 5h=20%; the multi-bucket view shows codex_other on
+	// the same 5h window at 80%. The merged primary must be 80%.
+	line := `{"jsonrpc":"2.0","result":{"rateLimits":{` +
+		`"primary":{"used_percent":20,"resets_in_seconds":1800,"window_minutes":300},` +
+		`"secondary":{"used_percent":15,"resets_in_seconds":86400,"window_minutes":10080}` +
+		`},"rateLimitsByLimitId":{` +
+		`"codex_primary":{"used_percent":20,"window_minutes":300,"resets_in_seconds":1800},` +
+		`"codex_other":{"used_percent":80,"window_minutes":300,"resets_in_seconds":1800},` +
+		`"codex_secondary":{"used_percent":15,"window_minutes":10080,"resets_in_seconds":86400}` +
+		`}},"id":1}`
+
+	captureCodexRateLimitLine(line, now)
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache write")
+	}
+	p, ok := snap.Buckets[codexWindowPrimary]
+	if !ok {
+		t.Fatalf("expected primary bucket, got %+v", snap.Buckets)
+	}
+	if p.UsedPercentage != 80 {
+		t.Errorf("primary UsedPercentage=%v, want 80 (most constrained multi-bucket entry)", p.UsedPercentage)
+	}
+	s, ok := snap.Buckets[codexWindowSecondary]
+	if !ok || s.UsedPercentage != 15 {
+		t.Errorf("secondary=%+v, want UsedPercentage=15", s)
+	}
+}
+
+// When `rateLimits` is absent and only `rateLimitsByLimitId` is present, the
+// extractor must still populate both display windows — classifying entries
+// without an explicit key hint by window length (<=6h → primary, otherwise
+// secondary).
+func TestCaptureCodexRateLimit_MultiBucketOnlyClassifiesByLength(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	line := `{"jsonrpc":"2.0","result":{"rateLimitsByLimitId":{` +
+		`"some_5h_bucket":{"used_percent":33,"window_minutes":300,"resets_in_seconds":1800},` +
+		`"some_weekly_bucket":{"used_percent":44,"window_minutes":10080,"resets_in_seconds":86400}` +
+		`}},"id":1}`
+
+	captureCodexRateLimitLine(line, now)
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache write from rateLimitsByLimitId alone")
+	}
+	if snap.Buckets[codexWindowPrimary].UsedPercentage != 33 {
+		t.Errorf("primary=%+v, want UsedPercentage=33", snap.Buckets[codexWindowPrimary])
+	}
+	if snap.Buckets[codexWindowSecondary].UsedPercentage != 44 {
+		t.Errorf("secondary=%+v, want UsedPercentage=44", snap.Buckets[codexWindowSecondary])
+	}
+}
+
 func TestCaptureCodexRateLimit_IgnoresUnrelatedFrames(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
