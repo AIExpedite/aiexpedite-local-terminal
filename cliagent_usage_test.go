@@ -611,6 +611,49 @@ func TestCodexUsageParser_RolloutIgnoresStandaloneResetOnlyFrame(t *testing.T) {
 	}
 }
 
+// When sessions overlap — an older-started but still-active session next to a
+// newer-started but idle one — filename order alone would let the stale session
+// "win" and stop the scan before the live reading is consulted. Ranking by file
+// mtime lets the still-active session (the live source of truth) be considered
+// first.
+func TestCodexUsageParser_RolloutRanksByMtimeNotFilename(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// "Stale" session: newer by filename / session start (11:30) but no longer
+	// being written. Its frame reads 80%.
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T11-30-00-stale", "2026-06-19T11:30:00.000Z",
+		[]map[string]any{codexRateLimitFrame(80, 70, now)})
+	stalePath := filepath.Join(codexHome, "sessions", "2026", "06", "19", "rollout-2026-06-19T11-30-00-stale.jsonl")
+	staleMtime := now.Add(-30 * time.Minute)
+	if err := os.Chtimes(stalePath, staleMtime, staleMtime); err != nil {
+		t.Fatalf("chtimes stale: %v", err)
+	}
+	// "Active" session: older by filename / session start (10:00) but its file
+	// is the one being appended to right now. Its latest frame reads 30%.
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T10-00-00-active", "2026-06-19T10:00:00.000Z",
+		[]map[string]any{codexRateLimitFrame(30, 12, now)})
+	activePath := filepath.Join(codexHome, "sessions", "2026", "06", "19", "rollout-2026-06-19T10-00-00-active.jsonl")
+	if err := os.Chtimes(activePath, now, now); err != nil {
+		t.Fatalf("chtimes active: %v", err)
+	}
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Consumed == nil || *session.Consumed != 30 {
+		t.Errorf("session Consumed=%v, want 30 from the still-active session (newer mtime), not 80 from the stale newer-filename session", session.Consumed)
+	}
+	if weekly.Consumed == nil || *weekly.Consumed != 12 {
+		t.Errorf("weekly Consumed=%v, want 12 from the still-active session (newer mtime), not 70 from the stale newer-filename session", weekly.Consumed)
+	}
+}
+
 func TestGeminiUsageParser_FreeTierFramesTotal(t *testing.T) {
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".gemini", "settings.json"), map[string]any{

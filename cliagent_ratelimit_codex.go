@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -899,21 +900,50 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRa
 		authMod = info.ModTime()
 	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
-	// filepath.Glob returns lexically-sorted paths; every segment is zero-padded
-	// and the filename is ISO-timestamp-prefixed, so lexical order is
-	// chronological order and the tail of the slice is the newest session.
 	matches, err := filepath.Glob(filepath.Join(base, "sessions", "*", "*", "*", "rollout-*.jsonl"))
 	if err != nil || len(matches) == 0 {
 		return nil, false
 	}
+	// Rank candidates by file mtime descending, NOT by filename (= session
+	// start time). When sessions overlap — e.g. an older still-active session
+	// runs alongside a newer-started but idle one, or a long-lived session is
+	// resumed after newer files exist — filename order treats the stale session
+	// as the "newest" reading. mtime tracks the last append, so the file being
+	// written most recently (the live source of truth) is considered first.
+	// Ties fall back to filename order so a deterministic chronological tiebreak
+	// applies when two files share an mtime.
+	type rolloutCandidate struct {
+		path  string
+		mtime time.Time
+	}
+	candidates := make([]rolloutCandidate, 0, len(matches))
+	for _, m := range matches {
+		info, err := os.Stat(m)
+		if err != nil {
+			continue
+		}
+		candidates = append(candidates, rolloutCandidate{path: m, mtime: info.ModTime()})
+	}
+	if len(candidates) == 0 {
+		return nil, false
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if !candidates[i].mtime.Equal(candidates[j].mtime) {
+			return candidates[i].mtime.After(candidates[j].mtime)
+		}
+		return candidates[i].path > candidates[j].path
+	})
 	// Accumulate across files newest-first: a window the newest log never
 	// restated (e.g. it only carried `primary`) can still be filled from a
 	// slightly older log that did carry `secondary`. The newest reading for a
 	// given window wins, so once a window is in `acc` an older file never
 	// overwrites it.
 	acc := map[string]codexRateLimitBucket{}
-	for i, scanned := len(matches)-1, 0; i >= 0 && scanned < codexRolloutScanFileCap; i, scanned = i-1, scanned+1 {
-		buckets, sessionStart, ok := codexBucketsFromRolloutFile(matches[i], now)
+	for scanned, c := range candidates {
+		if scanned >= codexRolloutScanFileCap {
+			break
+		}
+		buckets, sessionStart, ok := codexBucketsFromRolloutFile(c.path, now)
 		if !ok {
 			continue
 		}
