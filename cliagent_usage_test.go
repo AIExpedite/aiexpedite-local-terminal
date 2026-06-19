@@ -107,34 +107,75 @@ func TestClaudeCodeUsageParser_MissingCredentials(t *testing.T) {
 	}
 }
 
-func TestCodexUsageParser_KnownTokenLimit(t *testing.T) {
+func TestCodexUsageParser_IdentityFromAuth(t *testing.T) {
 	t.Setenv("CODEX_HOME", "")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
-		"email":       "carol@example.com",
-		"plan":        "pro",
-		"token_limit": 250000,
+		"email": "carol@example.com",
+		"plan":  "pro",
 	})
 	usage, ok := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
 	if !ok {
 		t.Fatalf("expected usage")
 	}
+	if usage.Account != "carol@example.com" {
+		t.Errorf("Account=%q, want carol@example.com", usage.Account)
+	}
 	if usage.Plan != "pro" {
 		t.Errorf("Plan=%q, want pro", usage.Plan)
 	}
-	tokens := usage.Metrics[0]
-	if tokens.Kind != limitKindTokens {
-		t.Errorf("first metric kind=%q, want %q", tokens.Kind, limitKindTokens)
+	if len(usage.Metrics) != 2 {
+		t.Fatalf("expected 2 metrics (session + weekly), got %d", len(usage.Metrics))
 	}
-	if tokens.Total == nil || *tokens.Total != 250000 {
-		t.Errorf("expected Total=250000, got %v", tokens.Total)
+	for _, m := range usage.Metrics {
+		if !m.Unknown {
+			t.Errorf("metric %q should be Unknown without an observed app-server frame", m.Kind)
+		}
 	}
-	if !tokens.Unknown {
-		t.Errorf("Unknown should remain true — we know cap, not consumed")
+}
+
+func TestCodexUsageParser_PopulatesObservedMetricsFromCache(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"email": "carol@example.com",
+		"plan":  "pro",
+	})
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary:   {UsedPercentage: 42, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
+		codexWindowSecondary: {UsedPercentage: 13, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
+	}, nil, now, fp)
+
+	usage, ok := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	if len(usage.Metrics) != 2 {
+		t.Fatalf("expected 2 metrics, got %d", len(usage.Metrics))
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Kind != limitKindSession || session.Unknown {
+		t.Errorf("session metric=%+v, want observed limitKindSession", session)
+	}
+	if session.Consumed == nil || *session.Consumed != 42 {
+		t.Errorf("session Consumed=%v, want 42", session.Consumed)
+	}
+	if weekly.Kind != limitKindWeekly || weekly.Unknown {
+		t.Errorf("weekly metric=%+v, want observed limitKindWeekly", weekly)
+	}
+	if weekly.Consumed == nil || *weekly.Consumed != 13 {
+		t.Errorf("weekly Consumed=%v, want 13", weekly.Consumed)
 	}
 }
 
 func TestCodexUsageParser_HonorsCodexHome(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	home := t.TempDir()
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
@@ -157,6 +198,7 @@ func TestCodexUsageParser_HonorsCodexHome(t *testing.T) {
 
 func TestCodexUsageParser_NestedAuthDotJsonClaims(t *testing.T) {
 	t.Setenv("CODEX_HOME", "")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
 		"tokens": map[string]any{
@@ -408,6 +450,8 @@ func TestGatherCLIAgentUsage_StableOrderAndOptIn(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("CODEX_HOME", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "claude_rl.json"))
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "codex_rl.json"))
 	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
 		"email": "ada@example.com",
 	})
@@ -496,6 +540,7 @@ func TestGatherCLIAgentUsage_UnknownAccountGetsDeviceScopedFingerprint(t *testin
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CODEX_HOME", "")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 
 	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 	out := gatherCLIAgentUsage(map[string]detectedCLIAgent{
