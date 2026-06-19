@@ -1,0 +1,160 @@
+package main
+
+import (
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestCaptureCodexRateLimit_TokenCountNotification(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	primaryResetSec := 3600.0   // 1h
+	secondaryResetSec := 604800 // 7d
+	line := `{"jsonrpc":"2.0","method":"token_count","params":{"msg":{"rate_limits":{` +
+		`"primary":{"used_percent":42.5,"resets_in_seconds":3600},` +
+		`"secondary":{"utilization":0.18,"resets_in_seconds":604800}` +
+		`}}}}`
+
+	captureCodexRateLimitLine(line, now)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache to be written")
+	}
+	p, ok := snap.Buckets[codexWindowPrimary]
+	if !ok {
+		t.Fatalf("expected primary bucket, got %+v", snap.Buckets)
+	}
+	if p.UsedPercentage != 42.5 {
+		t.Errorf("primary UsedPercentage=%v, want 42.5", p.UsedPercentage)
+	}
+	wantPrimaryReset := now.Add(time.Duration(primaryResetSec * float64(time.Second))).UnixMilli()
+	if p.ResetsAtMs != wantPrimaryReset {
+		t.Errorf("primary ResetsAtMs=%d, want %d", p.ResetsAtMs, wantPrimaryReset)
+	}
+
+	s := snap.Buckets[codexWindowSecondary]
+	if s.UsedPercentage < 17.9 || s.UsedPercentage > 18.1 {
+		t.Errorf("secondary UsedPercentage=%v, want ~18 (utilization 0.18 -> %%)", s.UsedPercentage)
+	}
+	wantSecondaryReset := now.Add(time.Duration(secondaryResetSec) * time.Second).UnixMilli()
+	if s.ResetsAtMs != wantSecondaryReset {
+		t.Errorf("secondary ResetsAtMs=%d, want %d", s.ResetsAtMs, wantSecondaryReset)
+	}
+}
+
+func TestCaptureCodexRateLimit_IgnoresUnrelatedFrames(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	// No token_count / rate_limit substring → cheap prefilter skips.
+	captureCodexRateLimitLine(`{"jsonrpc":"2.0","method":"agent_message","params":{"text":"hi"}}`, now)
+	// Malformed JSON → silent.
+	captureCodexRateLimitLine(`{not json`, now)
+	// Has the trigger word but no rate_limits map → no cache write.
+	captureCodexRateLimitLine(`{"method":"token_count","params":{"msg":{"input_tokens":5}}}`, now)
+
+	if _, ok := loadCodexRateLimitSnapshot(cache); ok {
+		t.Fatalf("cache must not be written for unrelated frames")
+	}
+}
+
+func TestCaptureCodexRateLimit_DropsStaleSnapshotOnAccountSwitch(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {UsedPercentage: 75, ResetsAtMs: now.Add(time.Hour).UnixMilli()},
+	}, now, "fingerprint-A")
+
+	// Different account writes only secondary — primary from A must be dropped.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowSecondary: {UsedPercentage: 10, ResetsAtMs: now.Add(48 * time.Hour).UnixMilli()},
+	}, now, "fingerprint-B")
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if snap.AccountFingerprint != "fingerprint-B" {
+		t.Errorf("fingerprint=%q, want fingerprint-B", snap.AccountFingerprint)
+	}
+	if _, present := snap.Buckets[codexWindowPrimary]; present {
+		t.Errorf("primary bucket from account A must be dropped on account switch")
+	}
+	if _, present := snap.Buckets[codexWindowSecondary]; !present {
+		t.Errorf("secondary bucket from account B missing")
+	}
+}
+
+func TestCodexMetricsFromCache_ObservedAndPastReset(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary:   {UsedPercentage: 31.2, ResetsAtMs: now.Add(2 * time.Hour).UnixMilli()},
+		codexWindowSecondary: {UsedPercentage: 95, ResetsAtMs: now.Add(-time.Minute).UnixMilli()},
+	}, now, "")
+
+	metrics := codexMetricsFromCache(now, "")
+	if len(metrics) != 2 {
+		t.Fatalf("want 2 metrics, got %d", len(metrics))
+	}
+	session, weekly := metrics[0], metrics[1]
+	if session.Kind != limitKindSession || session.Unknown {
+		t.Errorf("session metric=%+v, want observed limitKindSession", session)
+	}
+	if session.Consumed == nil || *session.Consumed != 31.2 {
+		t.Errorf("session Consumed=%v, want 31.2", session.Consumed)
+	}
+	if session.ResetAt == "" {
+		t.Errorf("live session window should advertise a ResetAt")
+	}
+	if weekly.Kind != limitKindWeekly {
+		t.Errorf("weekly metric kind=%q, want %q", weekly.Kind, limitKindWeekly)
+	}
+	if weekly.Consumed == nil || *weekly.Consumed != 0 {
+		t.Errorf("past-reset weekly Consumed=%v, want 0 (rolled over)", weekly.Consumed)
+	}
+	if weekly.ResetAt != "" {
+		t.Errorf("past-reset window must not advertise a stale ResetAt")
+	}
+}
+
+func TestCodexMetricsFromCache_NoCacheFallsBackToUnknown(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "absent.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+
+	metrics := codexMetricsFromCache(time.Now(), "")
+	if len(metrics) != 2 {
+		t.Fatalf("want 2 metrics, got %d", len(metrics))
+	}
+	for _, m := range metrics {
+		if !m.Unknown {
+			t.Errorf("metric %q should be Unknown without a cache", m.Kind)
+		}
+	}
+}
+
+func TestCodexMetricsFromCache_FingerprintMismatchHidesSnapshot(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {UsedPercentage: 75, ResetsAtMs: now.Add(time.Hour).UnixMilli()},
+	}, now, "fingerprint-A")
+
+	metrics := codexMetricsFromCache(now, "fingerprint-B")
+	for _, m := range metrics {
+		if !m.Unknown {
+			t.Errorf("metric %q should be Unknown when cache fingerprint mismatches", m.Kind)
+		}
+	}
+}

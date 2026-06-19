@@ -704,6 +704,10 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 				fmt.Printf("%s[codex-appserver] stdout[%d] %s: %s%s\n",
 					colorCyan, lineCount, session.ID, truncateString(trimmed, 200), colorReset)
 			}
+			// Passive utilization capture: extract token_count rate_limits
+			// into the per-account cache cliagent_usage_codex.go reads from.
+			// Side-effect only — does not alter framing or block publish.
+			captureCodexRateLimitLine(trimmed, time.Now())
 			if !publishOrFail(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,

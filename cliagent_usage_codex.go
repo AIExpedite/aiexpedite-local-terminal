@@ -1,10 +1,14 @@
 // cliagent_usage_codex.go — Codex (OpenAI) usage parser.
 //
 // Reads CODEX_HOME/auth.json (or ~/.codex/auth.json) for the active account
-// and any local plan/quota
-// hints. Emits Unknown=true for daily-tokens because the remaining counter
-// is enforced at the API gateway and is not on disk; the total cap is
-// surfaced when the auth file records it.
+// and any local plan/quota hints. Live utilization comes from the
+// `token_count` JSON-RPC notification the Codex app-server emits on stdout
+// while a session is active — codex_appserver.go forwards every line to
+// captureCodexRateLimitLine, which writes the latest primary (5-hour) /
+// secondary (weekly) windows to an on-disk cache keyed by account
+// fingerprint. This parser turns the latest snapshot into real percentage
+// metrics for the CLI Agents tab, falling back to Unknown placeholders when
+// no Codex session has been observed yet under the current account.
 package main
 
 import (
@@ -17,14 +21,13 @@ type codexUsageParser struct{}
 func (codexUsageParser) Provider() string { return "codex" }
 
 type codexAuth struct {
-	Account    string `json:"account"`
-	Email      string `json:"email"`
-	UserID     string `json:"user_id"`
-	Plan       string `json:"plan"`
-	PlanType   string `json:"plan_type"`
-	OrgID      string `json:"org_id"`
-	TokenLimit *int   `json:"token_limit"`
-	Tokens     struct {
+	Account  string `json:"account"`
+	Email    string `json:"email"`
+	UserID   string `json:"user_id"`
+	Plan     string `json:"plan"`
+	PlanType string `json:"plan_type"`
+	OrgID    string `json:"org_id"`
+	Tokens   struct {
 		IDToken   string `json:"id_token"`
 		AccountID string `json:"account_id"`
 	} `json:"tokens"`
@@ -51,7 +54,7 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 		Name:        firstNonEmpty(detected.Name, "Codex"),
 		Version:     detected.Version,
 		Path:        detected.Path,
-		DataSource:  "~/.codex",
+		DataSource:  "token_count",
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
 
@@ -73,23 +76,6 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 	}
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
-	dailyTokens := cliAgentUsageMetric{
-		Kind:    limitKindTokens,
-		Label:   "Daily tokens",
-		Unit:    "tokens",
-		Unknown: true,
-	}
-	if auth.TokenLimit != nil && *auth.TokenLimit > 0 {
-		dailyTokens.Total = floatPtr(float64(*auth.TokenLimit))
-	}
-	usage.Metrics = []cliAgentUsageMetric{
-		dailyTokens,
-		{
-			Kind:    limitKindRequests,
-			Label:   "Daily requests",
-			Unit:    "requests",
-			Unknown: true,
-		},
-	}
+	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
 	return usage, true
 }
