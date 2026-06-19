@@ -47,6 +47,11 @@ const (
 	colorBlue    = "\033[34m" // Info/metadata
 )
 
+const (
+	maxPubSubCommandMessageBytes = 1024 * 1024
+	maxPubSubCatalogMessageBytes = maxOIDCTokenResponseBytes
+)
+
 // colorPrefix wraps a prefix with color codes for console output
 func colorPrefix(prefix, color string) string {
 	return color + prefix + colorReset
@@ -515,6 +520,17 @@ func argsToJSON(args []string) string {
 	return string(bytes)
 }
 
+func pubSubMessageSizeLimit(cmd commandMsg) int {
+	if cmd.Command == "__cli_usage_refresh__" {
+		return maxPubSubCatalogMessageBytes
+	}
+	return maxPubSubCommandMessageBytes
+}
+
+func commandPayloadTooLargeMessage(sizeBytes, limitBytes int) string {
+	return fmt.Sprintf("Command rejected: payload size %d bytes exceeds %d byte limit", sizeBytes, limitBytes)
+}
+
 /* Incoming command payload (matches backend publishCommand struct) */
 type commandMsg struct {
 	ID          string   `json:"id"`
@@ -781,26 +797,11 @@ func StartPubSubLoop(cfg *Config) {
 // redelivers the command and the backend's in-flight marker isn't left
 // stuck waiting for a result that will never arrive.
 func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) (publishErr error) {
-	refreshID := cmd.RefreshID
 	persistCLIAgentCatalogUpdate(cfg, cmd.CliAgentCatalog, "pubsub", "refresh command")
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("%s[pubsub] panic in CLI usage refresh handler: %v%s\n", colorRed, r, colorReset)
-			failure := false
-			res := resultMsg{
-				ID:          cmd.ID,
-				WorkspaceID: cmd.WorkspaceID,
-				UID:         cmd.UID,
-				AgentID:     cfg.AgentID,
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "__cli_usage_refresh_result__",
-				RefreshID:   refreshID,
-				Success:     &failure,
-				Errors: []cliAgentUsageError{
-					{Provider: "_dispatch", Message: fmt.Sprintf("panic: %v", r)},
-				},
-			}
+			res := makeCLIUsageRefreshFailureResult(cmd, cfg, fmt.Sprintf("panic: %v", r))
 			if err := publishMsg(ctx, topic, res); err != nil {
 				fmt.Printf("%s[pubsub] Failed to publish panic refresh result: %v%s\n", colorRed, err, colorReset)
 				publishErr = err
@@ -842,7 +843,7 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
 		Type:        "__cli_usage_refresh_result__",
-		RefreshID:   refreshID,
+		RefreshID:   cmd.RefreshID,
 		Success:     &success,
 		CliAgents:   usage,
 		Errors:      errs,
@@ -852,6 +853,33 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 		return err
 	}
 	return nil
+}
+
+func makeCLIUsageRefreshFailureResult(cmd commandMsg, cfg *Config, message string) resultMsg {
+	failure := false
+	agentID := cmd.AgentID
+	if cfg != nil && cfg.AgentID != "" {
+		agentID = cfg.AgentID
+	}
+	return resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		AgentID:     agentID,
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "__cli_usage_refresh_result__",
+		RefreshID:   cmd.RefreshID,
+		Success:     &failure,
+		Errors: []cliAgentUsageError{
+			{Provider: "_dispatch", Message: message},
+		},
+	}
+}
+
+func publishCLIUsageRefreshFailure(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config, message string) error {
+	fmt.Printf("%s[pubsub] CLI usage refresh rejected: %s%s\n", colorRed, message, colorReset)
+	return publishMsg(ctx, topic, makeCLIUsageRefreshFailureResult(cmd, cfg, message))
 }
 
 // publishMsg marshals res and publishes it on topic using ctx.
@@ -965,8 +993,8 @@ func runPubSubConnection(cfg *Config) error {
 			}
 		}()
 
-		// Reject oversized messages before parsing as a defense against memory
-		// exhaustion from malformed or unexpectedly large Pub/Sub messages.
+		// Reject oversized messages as a defense against memory exhaustion from
+		// malformed or unexpectedly large Pub/Sub messages.
 		//
 		// Sized to accommodate large positional args — specifically the
 		// kickoff-brief pattern in ai-service's TerminalWithFeatureDetailsTool,
@@ -975,14 +1003,18 @@ func runPubSubConnection(cfg *Config) error {
 		// AI paraphrasing. Briefs over ~78 KB were previously silently dropped
 		// here and stranded the session at status=starting forever.
 		//
-		// 1 MB matches the next natural ceiling — Firestore's per-document cap,
-		// which terminal-service hits when it writes args onto the
-		// terminalSession doc. If something ever exceeds 1 MB the Firestore
-		// write will throw a clear error instead of the silent pubsub drop.
-		// Pub/Sub itself allows up to 10 MB, so this is well within transport
-		// limits.
-		const maxMessageSize = 1024 * 1024 // 1 MB
-		if len(m.Data) > maxMessageSize {
+		// 1 MB matches the next natural ceiling for normal commands:
+		// Firestore's per-document cap, which terminal-service hits when it
+		// writes args onto the terminalSession doc. If something ever exceeds
+		// 1 MB the Firestore write will throw a clear error instead of the
+		// silent pubsub drop.
+		//
+		// CLI usage refresh commands can carry the database-backed catalog and
+		// do not write args to terminalSession, so they share the larger bounded
+		// catalog cap used by /auth/token. Anything beyond that cap is rejected
+		// before normal processing, with a refresh failure result when possible
+		// so the backend's in-flight marker is not orphaned.
+		if len(m.Data) > maxPubSubCatalogMessageBytes {
 			fmt.Printf("%s[aiexpedite] Oversized message rejected (%d bytes)%s\n",
 				colorRed, len(m.Data), colorReset)
 
@@ -994,14 +1026,23 @@ func runPubSubConnection(cfg *Config) error {
 			//
 			// Best-effort parse: pubsub already caps payloads at 10 MB,
 			// so the memory cost of unmarshaling a rejected message is
-			// bounded. If the JSON is malformed OR there's no sessionID
-			// to attribute the failure to, fall through to the bare ack
-			// (we have nothing to fail).
+			// bounded. If the JSON is malformed, or if the command is neither
+			// a refresh nor session-routed command, fall through to the bare
+			// ack because we have nothing to fail.
 			var cmd commandMsg
-			if err := json.Unmarshal(m.Data, &cmd); err == nil && cmd.SessionID != "" {
-				publishSessionError(ctx, topic, cmd,
-					fmt.Sprintf("Command rejected: payload size %d bytes exceeds %d byte limit",
-						len(m.Data), maxMessageSize))
+			if err := json.Unmarshal(m.Data, &cmd); err == nil {
+				message := commandPayloadTooLargeMessage(len(m.Data), maxPubSubCatalogMessageBytes)
+				if cmd.Command == "__cli_usage_refresh__" {
+					if err := publishCLIUsageRefreshFailure(ctx, topic, cmd, cfg, message); err != nil {
+						m.Nack()
+					} else {
+						m.Ack()
+					}
+					return
+				}
+				if cmd.SessionID != "" {
+					publishSessionError(ctx, topic, cmd, message)
+				}
 			}
 
 			m.Ack() // Ack so it isn't redelivered forever
@@ -1012,7 +1053,30 @@ func runPubSubConnection(cfg *Config) error {
 		var cmd commandMsg
 		if err := json.Unmarshal(m.Data, &cmd); err != nil {
 			fmt.Printf("%s[aiexpedite] Bad command payload: %v%s\n", colorRed, err, colorReset)
+			if len(m.Data) > maxPubSubCommandMessageBytes {
+				m.Ack()
+				return
+			}
 			m.Nack()
+			return
+		}
+		if messageSizeLimit := pubSubMessageSizeLimit(cmd); len(m.Data) > messageSizeLimit {
+			fmt.Printf("%s[aiexpedite] Oversized message rejected (%d bytes)%s\n",
+				colorRed, len(m.Data), colorReset)
+
+			message := commandPayloadTooLargeMessage(len(m.Data), messageSizeLimit)
+			if cmd.Command == "__cli_usage_refresh__" {
+				if err := publishCLIUsageRefreshFailure(ctx, topic, cmd, cfg, message); err != nil {
+					m.Nack()
+				} else {
+					m.Ack()
+				}
+				return
+			}
+			if cmd.SessionID != "" {
+				publishSessionError(ctx, topic, cmd, message)
+			}
+			m.Ack()
 			return
 		}
 
