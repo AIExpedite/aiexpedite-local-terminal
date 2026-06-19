@@ -50,6 +50,14 @@ type codexRateLimitBucket struct {
 	UsedPercentage float64 `json:"usedPercentage"`
 	ResetsAtMs     int64   `json:"resetsAtMs"`
 	ObservedAtMs   int64   `json:"observedAtMs"`
+	// usageKnown/resetKnown mark which fields were freshly observed in this
+	// update. Codex's account/rateLimits/updated is sparse — a notification
+	// may carry only the new reset time, or only a new used_percent, and the
+	// other field must be preserved from the prior snapshot rather than
+	// silently overwritten with zero. Not persisted: every loaded bucket is
+	// treated as fully observed.
+	usageKnown bool `json:"-"`
+	resetKnown bool `json:"-"`
 }
 
 // codexRateLimitSnapshot is the on-disk cache, keyed by window id (primary /
@@ -132,31 +140,40 @@ func codexBucketFromInfo(info map[string]interface{}, now time.Time) (codexRateL
 			}
 		}
 	}
+	b.usageKnown = usageObserved
+	b.resetKnown = b.ResetsAtMs > 0
 
-	if !usageObserved && b.ResetsAtMs == 0 {
+	if !b.usageKnown && !b.resetKnown {
 		return b, false
 	}
 	return b, true
 }
 
 // extractCodexRateLimitBuckets pulls every window it can find from a decoded
-// Codex app-server frame. The shape we care about is the `token_count`
-// notification's `params.rate_limits` map. JSON-RPC notifications nest the
-// payload under `params`, so we also accept a top-level `rate_limits` for
-// future flat shapes.
+// Codex app-server frame. The payload may sit under `params` (notifications:
+// `token_count`, `account/rateLimits/updated`), `result` (response to
+// `account/rateLimits/read`), or `params.msg` (typed event envelope). Both
+// snake_case (`rate_limits`) and camelCase (`rateLimits`) are accepted so a
+// schema rename doesn't silently zero the card.
 func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) map[string]codexRateLimitBucket {
 	out := map[string]codexRateLimitBucket{}
 
 	candidates := []map[string]interface{}{raw}
-	if v, ok := raw["params"]; ok {
-		if m, ok := v.(map[string]interface{}); ok {
-			candidates = append(candidates, m)
-			// `params.msg` is the shape codex's app-server uses for typed
-			// event payloads.
-			if v, ok := m["msg"]; ok {
-				if mm, ok := v.(map[string]interface{}); ok {
-					candidates = append(candidates, mm)
-				}
+	for _, key := range []string{"params", "result"} {
+		v, ok := raw[key]
+		if !ok {
+			continue
+		}
+		m, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		candidates = append(candidates, m)
+		// `params.msg` is the shape codex's app-server uses for typed event
+		// payloads.
+		if v, ok := m["msg"]; ok {
+			if mm, ok := v.(map[string]interface{}); ok {
+				candidates = append(candidates, mm)
 			}
 		}
 	}
@@ -200,9 +217,13 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 		return
 	}
 	// Cheap prefilter: only attempt the JSON decode when the line could
-	// plausibly carry rate-limit telemetry. `token_count` is the notification
-	// method that wraps it; `rate_limits` is the payload key we extract.
-	if !strings.Contains(trimmed, "token_count") && !strings.Contains(trimmed, "rate_limit") {
+	// plausibly carry rate-limit telemetry. `token_count` wraps the legacy
+	// notification; `account/rateLimits/{read,updated}` is the newer
+	// JSON-RPC surface; `rate_limits`/`rateLimits` cover both payload key
+	// spellings. Anything else can't carry a window update for us.
+	if !strings.Contains(trimmed, "token_count") &&
+		!strings.Contains(trimmed, "rateLimits") &&
+		!strings.Contains(trimmed, "rate_limit") {
 		return
 	}
 	var raw map[string]interface{}
@@ -249,7 +270,23 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]codexRateLimitBucket{}
 	}
+	nowMs := now.UnixMilli()
 	for window, bucket := range updates {
+		// Codex's account/rateLimits/updated is sparse: a notification may
+		// carry only a fresh used_percent OR only a fresh reset time. Merge
+		// per field so a usage-only update doesn't clobber the live reset,
+		// and a reset-only update doesn't reset Consumed to 0%. A prior
+		// reading is only carried forward when it still describes a LIVE
+		// window (prior reset in the future); otherwise it's stale and we
+		// let the partial new bucket stand.
+		prev, hadPrev := snap.Buckets[window]
+		priorStillLive := hadPrev && prev.ResetsAtMs > nowMs
+		if !bucket.usageKnown && priorStillLive {
+			bucket.UsedPercentage = prev.UsedPercentage
+		}
+		if !bucket.resetKnown && priorStillLive {
+			bucket.ResetsAtMs = prev.ResetsAtMs
+		}
 		snap.Buckets[window] = bucket
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)

@@ -78,6 +78,78 @@ func TestCaptureCodexRateLimit_AcceptsAliasesAndWindowMinutes(t *testing.T) {
 	}
 }
 
+// Codex's newer surface is `account/rateLimits/read` (response under
+// `result`) and `account/rateLimits/updated` (notification under `params`),
+// both with camelCase `rateLimits`. The prefilter must accept that token and
+// extraction must drain both `result` and `params`.
+func TestCaptureCodexRateLimit_AccountRateLimitsReadResult(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	line := `{"jsonrpc":"2.0","id":7,"result":{"rateLimits":{` +
+		`"primary":{"usedPercent":22,"resetsInSeconds":1800}` +
+		`}}}`
+	captureCodexRateLimitLine(line, now)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache write for account/rateLimits/read result")
+	}
+	p, ok := snap.Buckets[codexWindowPrimary]
+	if !ok || p.UsedPercentage != 22 {
+		t.Fatalf("primary not extracted from result.rateLimits: %+v", snap.Buckets)
+	}
+	if p.ResetsAtMs != now.Add(1800*time.Second).UnixMilli() {
+		t.Errorf("ResetsAtMs=%d, want resetsInSeconds offset", p.ResetsAtMs)
+	}
+}
+
+// account/rateLimits/updated notifications are documented as sparse. A
+// reset-only follow-up must NOT zero out the prior used_percent, and a
+// usage-only follow-up must NOT drop the prior reset time — otherwise the
+// card oscillates between real numbers and 0%/Unknown between turns.
+func TestCaptureCodexRateLimit_SparseUpdatesPreservePriorFields(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Initial full snapshot: 60% used, resets in 1h.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"primary":{"used_percent":60,"resets_in_seconds":3600}}}}`,
+		now,
+	)
+
+	// Sparse update #1: reset-only (used_percent omitted). Must preserve 60%.
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"resetsInSeconds":1500}}}}`,
+		now,
+	)
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if got := snap.Buckets[codexWindowPrimary].UsedPercentage; got != 60 {
+		t.Errorf("after reset-only update UsedPercentage=%v, want 60 (preserved)", got)
+	}
+	if got := snap.Buckets[codexWindowPrimary].ResetsAtMs; got != now.Add(1500*time.Second).UnixMilli() {
+		t.Errorf("after reset-only update ResetsAtMs=%d not refreshed", got)
+	}
+
+	// Sparse update #2: usage-only (no reset). Must preserve the live reset.
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":72}}}}`,
+		now,
+	)
+	snap, _ = loadCodexRateLimitSnapshot(cache)
+	if got := snap.Buckets[codexWindowPrimary].UsedPercentage; got != 72 {
+		t.Errorf("after usage-only update UsedPercentage=%v, want 72", got)
+	}
+	if got := snap.Buckets[codexWindowPrimary].ResetsAtMs; got != now.Add(1500*time.Second).UnixMilli() {
+		t.Errorf("after usage-only update ResetsAtMs=%d, want previous live reset preserved", got)
+	}
+}
+
 func TestCaptureCodexRateLimit_IgnoresUnrelatedFrames(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
