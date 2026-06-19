@@ -150,6 +150,32 @@ func TestCaptureCodexRateLimit_SparseUpdatesPreservePriorFields(t *testing.T) {
 	}
 }
 
+// A reset-only update with no prior live bucket must NOT persist a zero-value
+// UsedPercentage, otherwise the card would render an observed 0% used / 100%
+// remaining even though no usage was ever reported. The metric should stay
+// Unknown until a real used_percent/utilization is observed.
+func TestCaptureCodexRateLimit_ResetOnlyWithoutPriorStaysUnknown(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"resetsInSeconds":1500}}}}`,
+		now,
+	)
+
+	if snap, ok := loadCodexRateLimitSnapshot(cache); ok {
+		if _, present := snap.Buckets[codexWindowPrimary]; present {
+			t.Fatalf("reset-only update with no prior bucket should not seed a 0%% bucket: %+v", snap.Buckets)
+		}
+	}
+
+	metrics := codexMetricsFromCache(now, "")
+	if !metrics[0].Unknown {
+		t.Errorf("session metric should remain Unknown after reset-only update with no prior usage, got %+v", metrics[0])
+	}
+}
+
 func TestCaptureCodexRateLimit_IgnoresUnrelatedFrames(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
@@ -173,12 +199,12 @@ func TestCaptureCodexRateLimit_DropsStaleSnapshotOnAccountSwitch(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
-		codexWindowPrimary: {UsedPercentage: 75, ResetsAtMs: now.Add(time.Hour).UnixMilli()},
+		codexWindowPrimary: {UsedPercentage: 75, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
 	}, now, "fingerprint-A")
 
 	// Different account writes only secondary — primary from A must be dropped.
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
-		codexWindowSecondary: {UsedPercentage: 10, ResetsAtMs: now.Add(48 * time.Hour).UnixMilli()},
+		codexWindowSecondary: {UsedPercentage: 10, ResetsAtMs: now.Add(48 * time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
 	}, now, "fingerprint-B")
 
 	snap, ok := loadCodexRateLimitSnapshot(cache)
@@ -202,8 +228,8 @@ func TestCodexMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
-		codexWindowPrimary:   {UsedPercentage: 31.2, ResetsAtMs: now.Add(2 * time.Hour).UnixMilli()},
-		codexWindowSecondary: {UsedPercentage: 95, ResetsAtMs: now.Add(-time.Minute).UnixMilli()},
+		codexWindowPrimary:   {UsedPercentage: 31.2, ResetsAtMs: now.Add(2 * time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
+		codexWindowSecondary: {UsedPercentage: 95, ResetsAtMs: now.Add(-time.Minute).UnixMilli(), usageKnown: true, resetKnown: true},
 	}, now, "")
 
 	metrics := codexMetricsFromCache(now, "")
@@ -252,7 +278,7 @@ func TestCodexMetricsFromCache_FingerprintMismatchHidesSnapshot(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
-		codexWindowPrimary: {UsedPercentage: 75, ResetsAtMs: now.Add(time.Hour).UnixMilli()},
+		codexWindowPrimary: {UsedPercentage: 75, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
 	}, now, "fingerprint-A")
 
 	metrics := codexMetricsFromCache(now, "fingerprint-B")

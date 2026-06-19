@@ -287,6 +287,14 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 		if !bucket.resetKnown && priorStillLive {
 			bucket.ResetsAtMs = prev.ResetsAtMs
 		}
+		// Reset-only update with no live prior usage: persisting now would
+		// seed a fake observed 0% used (the zero-value UsedPercentage), so
+		// the next refresh would render the quota as 0% / 100% remaining
+		// even though no usage value was ever observed. Leave it Unknown
+		// until a real used_percent/utilization arrives.
+		if !bucket.usageKnown && !priorStillLive {
+			continue
+		}
 		snap.Buckets[window] = bucket
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
