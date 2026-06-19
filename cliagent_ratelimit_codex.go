@@ -359,7 +359,10 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (ma
 //     so expiring at the earlier reset would zero the window while the
 //     runner-up bucket is still live and contributing usage. On a usage tie
 //     with only one reset known, the reset is dropped (we can't promise a
-//     time the unknown side can't confirm).
+//     time the unknown side can't confirm). When the bucket driving the
+//     displayed usage has no reset of its own, we drop the reset entirely
+//     rather than borrowing the lower-usage bucket's reset — otherwise the
+//     UI would clear the stricter bucket at a time it hasn't confirmed.
 //
 // Window-length hints are preserved from either side.
 func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id string, b codexRateLimitBucket) {
@@ -373,7 +376,8 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 	}
 
 	merged := prev
-	if !prev.usageKnown || b.UsedPercentage > prev.UsedPercentage {
+	usageDrivenByB := !prev.usageKnown || b.UsedPercentage > prev.UsedPercentage
+	if usageDrivenByB {
 		merged.UsedPercentage = b.UsedPercentage
 		merged.usageKnown = true
 		merged.ObservedAtMs = b.ObservedAtMs
@@ -388,17 +392,22 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 			merged.ResetsAtMs = prev.ResetsAtMs
 		}
 		merged.resetKnown = true
-	case usageTie && b.resetKnown != prev.resetKnown:
-		// Same exhaustion, one side has no reset hint — don't promise a time
-		// the unknown side can't confirm; render "—" instead.
+	case usageTie:
+		// Same exhaustion, only one side has a reset hint — don't promise a
+		// time the unknown side can't confirm; render "—" instead.
 		merged.ResetsAtMs = 0
 		merged.resetKnown = false
-	case b.resetKnown:
+	case usageDrivenByB && b.resetKnown:
 		merged.ResetsAtMs = b.ResetsAtMs
 		merged.resetKnown = true
-	case prev.resetKnown:
+	case !usageDrivenByB && prev.resetKnown:
 		merged.ResetsAtMs = prev.ResetsAtMs
 		merged.resetKnown = true
+	default:
+		// Stricter bucket has no reset of its own; do not borrow the
+		// lower-usage bucket's reset.
+		merged.ResetsAtMs = 0
+		merged.resetKnown = false
 	}
 
 	if merged.WindowMinutes == 0 {

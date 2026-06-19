@@ -932,6 +932,47 @@ func TestExtractCodexRateLimitBuckets_HigherUsagePreservesLaterReset(t *testing.
 	}
 }
 
+// When the stricter (higher-usage) bucket has no reset of its own, we must
+// not borrow the reset from a lower-usage bucket: the UI would otherwise
+// clear the displayed window at a time the stricter bucket has not confirmed.
+func TestExtractCodexRateLimitBuckets_StricterBucketWithoutResetDropsBorrowedReset(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	lowerBucketResetMs := now.Add(30 * time.Minute).UnixMilli()
+
+	// codex_other.primary at 80% with no reset; codex_primary at 20% with a
+	// reset. The display should report the 80% but leave reset unknown.
+	raw := map[string]interface{}{
+		"result": map[string]interface{}{
+			"rateLimitsByLimitId": map[string]interface{}{
+				"codex_other": map[string]interface{}{
+					"primary": map[string]interface{}{
+						"usedPercent":        80.0,
+						"windowDurationMins": 300.0,
+					},
+				},
+				"codex_primary": map[string]interface{}{
+					"primary": map[string]interface{}{
+						"usedPercent":        20.0,
+						"windowDurationMins": 300.0,
+						"resetsAt":           float64(lowerBucketResetMs),
+					},
+				},
+			},
+		},
+	}
+	buckets, _ := extractCodexRateLimitBuckets(raw, now)
+	p, ok := buckets[codexWindowPrimary]
+	if !ok {
+		t.Fatalf("expected primary bucket, got %+v", buckets)
+	}
+	if p.UsedPercentage != 80 {
+		t.Errorf("primary UsedPercentage=%v, want 80 (most-constrained view)", p.UsedPercentage)
+	}
+	if p.resetKnown || p.ResetsAtMs != 0 {
+		t.Errorf("primary reset must stay unknown when stricter bucket has no reset (got ResetsAtMs=%v resetKnown=%v)", p.ResetsAtMs, p.resetKnown)
+	}
+}
+
 // A heartbeat reset-only frame recomputes ResetsAtMs from the local receive
 // time plus `resets_in_seconds`. Between two consecutive frames the same live
 // window's recomputed reset can drift by a second; exact equality would treat
