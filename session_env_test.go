@@ -284,6 +284,33 @@ func TestIsClaudeCommand(t *testing.T) {
 	}
 }
 
+func TestIsCodexCommand(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"codex", true},
+		{"Codex", true},
+		{"codex.exe", true},
+		{"codex.cmd", true},
+		{"/usr/local/bin/codex", true},
+		{`C:\Users\u\AppData\Roaming\npm\codex.cmd`, true},
+		{"./codex", true},
+		{"codex-next", true},
+		{"claude", false},
+		{"gemini", false},
+		{"agy", false},
+		{"mycodex", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		got := isCodexCommand(tc.in)
+		if got != tc.want {
+			t.Errorf("isCodexCommand(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestIsRelativeExplicitPath(t *testing.T) {
 	// resolveExecutable must skip exec.LookPath for cwd-relative paths so
 	// the binary is resolved against the session's cwd at exec time, not

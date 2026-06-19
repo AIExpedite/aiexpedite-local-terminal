@@ -714,6 +714,15 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// rate_limit_event gives us an unambiguous epoch. This is what lets
 			// agent-orchestrator-service auto-defer + resume instead of
 			// completing the step empty.
+			// Codex rate-limit telemetry: token_count frames from `codex exec
+			// --json` carry the same primary/secondary rate_limits payload as
+			// the app-server stream. Without this hook, normal terminal Codex
+			// sessions never populate codex_rate_limits.json and the CLI Agents
+			// card stays Unknown for users who don't go through app-server.
+			if isCodexCommand(session.Command) {
+				captureCodexRateLimitLine(line.text, time.Now())
+			}
+
 			if isClaudeCommand(session.Command) {
 				if rejected := captureClaudeRateLimitLine(line.text, time.Now()); rejected != nil {
 					flushBatch()
@@ -1099,6 +1108,14 @@ func commandBaseName(command string) string {
 // Used to gate the ANTHROPIC_* billing-var strip in sanitizeClaudeChildEnv.
 func isClaudeCommand(command string) bool {
 	return strings.HasPrefix(commandBaseName(command), "claude")
+}
+
+// isCodexCommand reports whether command would be routed to the `codex` CLI
+// by buildInteractiveCLIArgs. Used to gate the Codex rate-limit cache writer
+// in the session output loop so `token_count` frames from `codex exec --json`
+// populate codex_rate_limits.json just like the app-server reader does.
+func isCodexCommand(command string) bool {
+	return strings.HasPrefix(commandBaseName(command), "codex")
 }
 
 /* --------------------------------------------------------------------------
