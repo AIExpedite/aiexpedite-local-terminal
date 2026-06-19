@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -223,6 +224,142 @@ func TestCodexUsageParser_NestedAuthDotJsonClaims(t *testing.T) {
 	}
 	if usage.AccountFingerprint == "" {
 		t.Errorf("expected fingerprint for nested auth account")
+	}
+}
+
+// helperWriteRolloutLog writes a Codex session rollout log
+// (CODEX_HOME/sessions/2026/06/<day>/rollout-<name>.jsonl) made of token_count
+// event frames. Each entry in frames is the `rate_limits` object for one line;
+// a nil entry emits the `rate_limits: null` heartbeat Codex sends between real
+// readings.
+func helperWriteRolloutLog(t *testing.T, base, day, name string, frames []map[string]any) {
+	t.Helper()
+	dir := filepath.Join(base, "sessions", "2026", "06", day)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	var b strings.Builder
+	for _, rl := range frames {
+		line, err := json.Marshal(map[string]any{
+			"timestamp": "2026-06-19T11:00:00.000Z",
+			"type":      "event_msg",
+			"payload": map[string]any{
+				"type":        "token_count",
+				"info":        map[string]any{"total_token_usage": map[string]any{"total_tokens": 1}},
+				"rate_limits": rl,
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal rollout line: %v", err)
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(filepath.Join(dir, "rollout-"+name+".jsonl"), []byte(b.String()), 0o600); err != nil {
+		t.Fatalf("write rollout log: %v", err)
+	}
+}
+
+func codexRateLimitFrame(primaryPct, secondaryPct float64, now time.Time) map[string]any {
+	return map[string]any{
+		"primary":   map[string]any{"used_percent": primaryPct, "window_minutes": 300.0, "resets_at": float64(now.Add(time.Hour).Unix())},
+		"secondary": map[string]any{"used_percent": secondaryPct, "window_minutes": 10080.0, "resets_at": float64(now.Add(72 * time.Hour).Unix())},
+	}
+}
+
+// When no live app-server frame has been captured, the parser should backfill
+// both windows from Codex's own rollout logs (the TUI-only path).
+func TestCodexUsageParser_BackfillsFromRolloutLogs(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{
+		"email": "carol@example.com",
+		"plan":  "pro",
+	})
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-aaaa", []map[string]any{
+		codexRateLimitFrame(27, 10, now),
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Unknown || session.Consumed == nil || *session.Consumed != 27 {
+		t.Errorf("session metric=%+v, want observed 27%% from rollout", session)
+	}
+	if session.Label != "5-hour session window" {
+		t.Errorf("session Label=%q, want 5-hour session window", session.Label)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 10 {
+		t.Errorf("weekly metric=%+v, want observed 10%% from rollout", weekly)
+	}
+}
+
+// A live captured bucket is authoritative: the rollout fallback must only fill
+// windows that came back Unknown, never override an observed live reading.
+func TestCodexUsageParser_RolloutOnlyFillsUnknownWindows(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{
+		"email": "carol@example.com",
+		"plan":  "pro",
+	})
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	// Live cache observed only the primary (5-hour) window.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {UsedPercentage: 42, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
+	}, nil, now, fp)
+	// Rollout carries both — a conflicting primary (must be ignored) and the
+	// only source for the weekly window.
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-bbbb", []map[string]any{
+		codexRateLimitFrame(99, 33, now),
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Consumed == nil || *session.Consumed != 42 {
+		t.Errorf("session Consumed=%v, want 42 (live cache wins over rollout)", session.Consumed)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 33 {
+		t.Errorf("weekly metric=%+v, want 33 from rollout backfill", weekly)
+	}
+}
+
+// Codex emits rate_limits: null between real readings; the parser must take the
+// LAST populated frame, ignoring nulls and earlier values.
+func TestCodexUsageParser_RolloutPrefersLastPopulatedFrame(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{
+		"email": "carol@example.com",
+	})
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-cccc", []map[string]any{
+		codexRateLimitFrame(20, 5, now),
+		nil, // heartbeat: rate_limits: null
+		codexRateLimitFrame(55, 18, now),
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session := usage.Metrics[0]
+	if session.Consumed == nil || *session.Consumed != 55 {
+		t.Errorf("session Consumed=%v, want 55 (last populated frame)", session.Consumed)
 	}
 }
 

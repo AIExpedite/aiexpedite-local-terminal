@@ -25,6 +25,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -799,6 +800,141 @@ func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentU
 		buckets, codexWindowSecondary, limitKindWeekly, "Weekly quota", now)
 
 	return []cliAgentUsageMetric{session, weekly}
+}
+
+// codexRolloutScanFileCap bounds how many of the most-recent rollout logs the
+// fallback opens before giving up, so a sessions directory holding thousands of
+// files can't turn a usage refresh into a long scan. The newest log carrying a
+// populated rate_limits frame wins, so in practice this resolves on the first
+// file or two.
+const codexRolloutScanFileCap = 16
+
+// codexBackfillUnknownFromRollout fills any Unknown window in `metrics` from
+// Codex's own on-disk session rollout logs.
+//
+// Why this exists: our live cache (codex_rate_limits.json) is fed ONLY by the
+// passive app-server capture in codex_appserver.go, so it stays empty whenever
+// Codex is driven through its own TUI (which never streams through our
+// app-server). Codex persists the exact same `token_count.rate_limits`
+// telemetry to its rollout logs, so a window we never observed live can still
+// be reported from disk — the same source Codex's own `/status` reads.
+//
+// A live captured bucket is authoritative: only windows that came back Unknown
+// are backfilled, and the rollout scan runs at most once per call. Returns the
+// input slice unchanged when nothing is Unknown or no rollout telemetry exists.
+func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base string, now time.Time) []cliAgentUsageMetric {
+	anyUnknown := false
+	for _, m := range metrics {
+		if m.Unknown {
+			anyUnknown = true
+			break
+		}
+	}
+	if !anyUnknown {
+		return metrics
+	}
+
+	buckets, ok := codexRolloutFallbackBuckets(base, now)
+	if !ok {
+		return metrics
+	}
+
+	for i, m := range metrics {
+		if !m.Unknown {
+			continue
+		}
+		var windowID string
+		switch m.Kind {
+		case limitKindSession:
+			windowID = codexWindowPrimary
+		case limitKindWeekly:
+			windowID = codexWindowSecondary
+		default:
+			continue
+		}
+		if _, present := buckets[windowID]; !present {
+			continue
+		}
+		// Reuse the cache-path renderer so rollout-sourced metrics get the same
+		// window-label derivation and reset-passed → 0% rollover handling. The
+		// metric's existing label is the default Codex window label, which is
+		// the right fallback when the frame carried no window_minutes hint.
+		metrics[i] = codexObservedMetricOrUnknown(buckets, windowID, m.Kind, m.Label, now)
+	}
+	return metrics
+}
+
+// codexRolloutFallbackBuckets reads Codex's session rollout logs
+// (CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl) for the most recent populated
+// `rate_limits` frame and returns aggregated display-window buckets.
+//
+// Account scoping is implicit: the rollout logs live under the active
+// CODEX_HOME — the same directory whose auth.json produced the fingerprint the
+// caller renders — so there is no cross-account bleed. Best-effort: returns
+// (nil, false) on any problem.
+func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRateLimitBucket, bool) {
+	if base == "" {
+		return nil, false
+	}
+	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
+	// filepath.Glob returns lexically-sorted paths; every segment is zero-padded
+	// and the filename is ISO-timestamp-prefixed, so lexical order is
+	// chronological order and the tail of the slice is the newest session.
+	matches, err := filepath.Glob(filepath.Join(base, "sessions", "*", "*", "*", "rollout-*.jsonl"))
+	if err != nil || len(matches) == 0 {
+		return nil, false
+	}
+	for i, scanned := len(matches)-1, 0; i >= 0 && scanned < codexRolloutScanFileCap; i, scanned = i-1, scanned+1 {
+		if buckets, ok := codexBucketsFromRolloutFile(matches[i], now); ok {
+			return buckets, true
+		}
+	}
+	return nil, false
+}
+
+// codexBucketsFromRolloutFile returns the aggregated buckets from the LAST
+// populated `rate_limits` frame in a single rollout log. Codex emits
+// `rate_limits: null` on most token_count events and the real object only
+// periodically, so the last non-empty extraction — not the first — is the live
+// reading. Best-effort: returns (nil, false) when the file holds no usable
+// frame or can't be read.
+func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]codexRateLimitBucket, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	// Rollout lines embed full model turns and can be large; match the
+	// app-server's ceiling so a single big line doesn't abort the scan mid-file.
+	scanner.Buffer(make([]byte, 0, 64*1024), codexAppServerMaxLineSize)
+
+	var latest map[string]map[string]codexRateLimitBucket
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Cheap prefilter: only decode lines that could carry a window update,
+		// mirroring captureCodexRateLimitLine's pre-JSON gate.
+		if !strings.Contains(line, "rate_limit") {
+			continue
+		}
+		var raw map[string]interface{}
+		if json.Unmarshal([]byte(line), &raw) != nil {
+			continue
+		}
+		// The rollout shape nests telemetry under `payload`
+		// ({"type":"event_msg","payload":{"type":"token_count","rate_limits":…}}),
+		// which extractCodexRateLimitBuckets already unwraps. fullSnapshot is
+		// false for that envelope, so null windows are ignored rather than
+		// treated as clears — exactly what we want when mining for live usage.
+		if updates, _ := extractCodexRateLimitBuckets(raw, now); len(updates) > 0 {
+			latest = updates
+		}
+	}
+	if latest == nil {
+		return nil, false
+	}
+	return aggregateCodexBuckets(latest, now), true
 }
 
 // codexWindowLabel renders a human label for a window of the given length.
