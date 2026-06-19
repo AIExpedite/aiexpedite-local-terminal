@@ -891,6 +891,86 @@ func TestCodexMetricsFromCache_DistinctWindowsBypassCanonicalBands(t *testing.T)
 	}
 }
 
+// When two metered buckets land on the same display window and the higher-
+// utilisation one resets FIRST, the merge must carry the runner-up's later
+// reset forward so codexObservedMetricOrUnknown doesn't zero the entire
+// window at the earlier reset — the runner-up bucket is still live and
+// contributing usage past that point.
+func TestExtractCodexRateLimitBuckets_HigherUsagePreservesLaterReset(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	earlierResetMs := now.Add(30 * time.Minute).UnixMilli()
+	laterResetMs := now.Add(2 * time.Hour).UnixMilli()
+
+	raw := map[string]interface{}{
+		"result": map[string]interface{}{
+			"rateLimitsByLimitId": map[string]interface{}{
+				// Higher utilisation but resets first.
+				"codex_primary_a": map[string]interface{}{
+					"usedPercent":        90.0,
+					"windowDurationMins": 300.0,
+					"resetsAt":           float64(earlierResetMs),
+				},
+				// Lower utilisation but resets later — still live past A's reset.
+				"codex_primary_b": map[string]interface{}{
+					"usedPercent":        40.0,
+					"windowDurationMins": 300.0,
+					"resetsAt":           float64(laterResetMs),
+				},
+			},
+		},
+	}
+	buckets, _ := extractCodexRateLimitBuckets(raw, now)
+	p, ok := buckets[codexWindowPrimary]
+	if !ok {
+		t.Fatalf("expected primary bucket, got %+v", buckets)
+	}
+	if p.UsedPercentage != 90 {
+		t.Errorf("primary UsedPercentage=%v, want 90 (most-constrained view)", p.UsedPercentage)
+	}
+	if p.ResetsAtMs != laterResetMs {
+		t.Errorf("primary ResetsAtMs=%v, want later reset %v (earlier reset would zero the window while runner-up is still live)", p.ResetsAtMs, laterResetMs)
+	}
+}
+
+// A heartbeat reset-only frame recomputes ResetsAtMs from the local receive
+// time plus `resets_in_seconds`. Between two consecutive frames the same live
+// window's recomputed reset can drift by a second; exact equality would treat
+// that as a rollover and discard the prior used %, flipping the card to
+// Unknown until the next usage frame. The merge must tolerate sub-minute
+// jitter so a heartbeat preserves the prior usage.
+func TestCaptureCodexRateLimit_ResetOnlyJitterPreservesPriorUsage(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	first := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed: 65% used, resets in exactly 1h.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"primary":{"used_percent":65,"resets_in_seconds":3600}}}}`,
+		first,
+	)
+
+	// Heartbeat 2s later, reset still 1h away — Codex emits seconds-precision
+	// `resetsInSeconds`, so the recomputed absolute reset drifts by ~2s. This
+	// is the SAME live window, not a rollover.
+	heartbeat := first.Add(2 * time.Second)
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"resetsInSeconds":3598}}}}`,
+		heartbeat,
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	b, present := snap.Buckets[codexWindowPrimary]
+	if !present {
+		t.Fatalf("primary bucket must survive a jitter-only heartbeat, got %+v", snap.Buckets)
+	}
+	if b.UsedPercentage != 65 {
+		t.Errorf("UsedPercentage=%v, want 65 (heartbeat within jitter must preserve prior usage)", b.UsedPercentage)
+	}
+}
+
 func TestCodexMetricsFromCache_FingerprintMismatchHidesSnapshot(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)

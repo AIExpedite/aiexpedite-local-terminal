@@ -43,6 +43,30 @@ const (
 	codexWindowSecondary = "secondary"
 )
 
+// codexResetJitterMs is how much two reset timestamps may differ and still be
+// treated as the same quota window. A sparse reset-only frame recomputes
+// ResetsAtMs from the local receive time plus `resets_in_seconds`, so the
+// same live window can drift by milliseconds (clock skew) or a rounded second
+// (Codex emits the relative reset at second precision) between consecutive
+// frames. A real rollover, in contrast, jumps by at least the window length
+// (5 hours for primary, 1 week for secondary), so any sub-minute tolerance
+// safely separates jitter from a fresh window. Picked larger than expected
+// jitter (~1s) and far smaller than the next real Codex window length (the
+// 4-hour primary alternative at 14400s).
+const codexResetJitterMs int64 = 60_000
+
+// resetsWithinJitter reports whether two ResetsAtMs values likely describe the
+// same quota window despite small local-time drift. Used to keep a heartbeat
+// `resets_in_seconds` frame from flipping the card to Unknown just because the
+// recomputed absolute reset slipped by a second.
+func resetsWithinJitter(a, b int64) bool {
+	delta := a - b
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= codexResetJitterMs
+}
+
 // codexRateLimitBucket is one window's observed state. UsedPercentage is
 // normalised to 0..100 regardless of source shape (utilization 0..1 vs
 // used_percent 0..100). ResetsAtMs is unix epoch milliseconds (0 = unknown).
@@ -325,9 +349,19 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (ma
 	return out, clears
 }
 
-// mergeCodexBucketMostConstrained writes `b` into `out[id]` unless an existing
-// bucket already reports a higher observed utilisation — picking the most
-// constrained view keeps multi-bucket payloads from understating usage.
+// mergeCodexBucketMostConstrained folds `b` into `out[id]`, keeping the most
+// constrained view of the display window across multiple metered buckets:
+//
+//   - UsedPercentage is the MAX of the two (the user feels the strictest
+//     bucket's throttle right now);
+//   - ResetsAtMs is the LATER of the two when both are known — the display
+//     window is only fully cleared once EVERY contributing bucket has reset,
+//     so expiring at the earlier reset would zero the window while the
+//     runner-up bucket is still live and contributing usage. On a usage tie
+//     with only one reset known, the reset is dropped (we can't promise a
+//     time the unknown side can't confirm).
+//
+// Window-length hints are preserved from either side.
 func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id string, b codexRateLimitBucket) {
 	prev, exists := out[id]
 	if !exists {
@@ -337,32 +371,46 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 	if !b.usageKnown {
 		return
 	}
+
+	merged := prev
 	if !prev.usageKnown || b.UsedPercentage > prev.UsedPercentage {
-		out[id] = b
-		return
+		merged.UsedPercentage = b.UsedPercentage
+		merged.usageKnown = true
+		merged.ObservedAtMs = b.ObservedAtMs
 	}
-	// Usage ties: two metered buckets report the same utilisation for this
-	// window (commonly both 100% exhausted). Map iteration order would
-	// otherwise pick whichever the runtime visited first and could advertise
-	// an earlier reset even though the other equally-exhausted bucket still
-	// blocks usage. Merge conservatively: keep the LATER reset so we never
-	// promise availability sooner than reality, and drop the reset entirely
-	// when one side is unknown so the UI shows "—" instead of a misleading
-	// time.
-	if b.UsedPercentage == prev.UsedPercentage {
-		merged := prev
-		if !b.resetKnown || !prev.resetKnown {
-			merged.ResetsAtMs = 0
-			merged.resetKnown = false
-		} else if b.ResetsAtMs > prev.ResetsAtMs {
+
+	usageTie := prev.usageKnown && b.UsedPercentage == prev.UsedPercentage
+	switch {
+	case b.resetKnown && prev.resetKnown:
+		if b.ResetsAtMs > prev.ResetsAtMs {
 			merged.ResetsAtMs = b.ResetsAtMs
+		} else {
+			merged.ResetsAtMs = prev.ResetsAtMs
 		}
-		// Carry forward any window-length hint either side observed.
-		if merged.WindowMinutes == 0 && b.WindowMinutes > 0 {
+		merged.resetKnown = true
+	case usageTie && b.resetKnown != prev.resetKnown:
+		// Same exhaustion, one side has no reset hint — don't promise a time
+		// the unknown side can't confirm; render "—" instead.
+		merged.ResetsAtMs = 0
+		merged.resetKnown = false
+	case b.resetKnown:
+		merged.ResetsAtMs = b.ResetsAtMs
+		merged.resetKnown = true
+	case prev.resetKnown:
+		merged.ResetsAtMs = prev.ResetsAtMs
+		merged.resetKnown = true
+	}
+
+	if merged.WindowMinutes == 0 {
+		switch {
+		case prev.WindowMinutes > 0:
+			merged.WindowMinutes = prev.WindowMinutes
+		case b.WindowMinutes > 0:
 			merged.WindowMinutes = b.WindowMinutes
 		}
-		out[id] = merged
 	}
+
+	out[id] = merged
 }
 
 // classifyCodexByLimitBucket maps a `rateLimitsByLimitId` entry onto one of our
@@ -474,13 +522,15 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 		prev, hadPrev := snap.Buckets[window]
 		priorStillLive := hadPrev && prev.ResetsAtMs > nowMs
 		// A reset-only update only describes the SAME live window when its
-		// new reset matches the prior reset (or omits a reset entirely). If
-		// it advances resetsAt past the prior reset, the quota window has
-		// rolled over: the prior used % belongs to the old window and must
-		// NOT be copied onto the fresh one — doing so makes the card keep
-		// showing the previous high usage for what is actually an empty
-		// new 5-hour / weekly window.
-		sameLiveWindow := priorStillLive && (!bucket.resetKnown || bucket.ResetsAtMs == prev.ResetsAtMs)
+		// new reset is within jitter of the prior reset (or omits a reset
+		// entirely). A heartbeat `resets_in_seconds` frame recomputes the
+		// absolute reset from the local receive time, so two consecutive
+		// notifications for the same live window can differ by a second
+		// or two — exact equality would treat that as a rollover and flip
+		// the card to Unknown until the next usage frame. A real rollover
+		// jumps by the full window length (5h / 1w), well past the jitter
+		// band, so we still drop the prior used % when the gap is large.
+		sameLiveWindow := priorStillLive && (!bucket.resetKnown || resetsWithinJitter(bucket.ResetsAtMs, prev.ResetsAtMs))
 		if !bucket.usageKnown && sameLiveWindow {
 			bucket.UsedPercentage = prev.UsedPercentage
 		}
@@ -505,7 +555,7 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 		// rather than letting it linger on the card until the old reset
 		// passes.
 		if !bucket.usageKnown && !sameLiveWindow {
-			if hadPrev && bucket.resetKnown && bucket.ResetsAtMs != prev.ResetsAtMs {
+			if hadPrev && bucket.resetKnown && !resetsWithinJitter(bucket.ResetsAtMs, prev.ResetsAtMs) {
 				delete(snap.Buckets, window)
 			}
 			continue
