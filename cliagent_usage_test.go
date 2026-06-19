@@ -649,6 +649,75 @@ func TestCodexUsageParser_RolloutIgnoresStandaloneResetOnlyFrame(t *testing.T) {
 	}
 }
 
+// A usage-only sparse frame that arrives after the prior reset has already
+// expired must NOT inherit the prior expired reset — copying it forward stamps
+// the fresh usage with a past resets_at, which codexObservedMetricOrUnknown then
+// rolls down to 0% (the window appears "already rolled over"), hiding the new
+// reading. The live cache merge only carries a prior reset when it is still
+// live; mirror that here.
+func TestCodexUsageParser_RolloutUsageOnlyAfterExpiredResetDoesNotInheritStaleReset(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	dir := filepath.Join(codexHome, "sessions", "2026", "06", "19")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Two frames in one file with different per-line timestamps:
+	//   t=10:00 — primary=50%, resets at 11:00 (already past by now=12:00 AND
+	//             past the second frame's 11:30 event time).
+	//   t=11:30 — primary=10%, no reset (sparse usage-only update).
+	frames := []map[string]any{
+		{
+			"timestamp": "2026-06-19T10:00:00.000Z",
+			"rl": map[string]any{
+				"primary": map[string]any{"used_percent": 50.0, "window_minutes": 300.0, "resets_at": float64(now.Add(-time.Hour).Unix())},
+			},
+		},
+		{
+			"timestamp": "2026-06-19T11:30:00.000Z",
+			"rl": map[string]any{
+				"primary": map[string]any{"used_percent": 10.0, "window_minutes": 300.0},
+			},
+		},
+	}
+	var buf strings.Builder
+	for _, f := range frames {
+		line, err := json.Marshal(map[string]any{
+			"timestamp": f["timestamp"],
+			"type":      "event_msg",
+			"payload": map[string]any{
+				"type":        "token_count",
+				"info":        map[string]any{"total_token_usage": map[string]any{"total_tokens": 1}},
+				"rate_limits": f["rl"],
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	if err := os.WriteFile(filepath.Join(dir, "rollout-2026-06-19T10-00-00-expired.jsonl"), []byte(buf.String()), 0o600); err != nil {
+		t.Fatalf("write rollout log: %v", err)
+	}
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session := usage.Metrics[0]
+	if session.Unknown || session.Consumed == nil || *session.Consumed != 10 {
+		t.Errorf("session=%+v, want 10%% from the fresh usage-only frame (not rolled to 0%% by inherited expired reset)", session)
+	}
+	if session.ResetAt != "" {
+		t.Errorf("session ResetAt=%q, want empty (the only candidate reset has already expired)", session.ResetAt)
+	}
+}
+
 // When sessions overlap — an older-started but still-active session next to a
 // newer-started but idle one — filename order alone would let the stale session
 // "win" and stop the scan before the live reading is consulted. Ranking by file

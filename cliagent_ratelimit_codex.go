@@ -1069,7 +1069,9 @@ func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]codexRa
 			// Merge, don't replace: token_count notifications are sparse, so a
 			// later frame restating only `primary` must not drop a `secondary`
 			// reading an earlier frame in this same file already captured.
-			mergeCodexRolloutFrame(acc, updates)
+			// Liveness for sparse-merge is judged at the frame's own event
+			// time so an expired prior reset isn't carried onto fresh usage.
+			mergeCodexRolloutFrame(acc, updates, eventTime)
 		}
 	}
 	if len(acc) == 0 {
@@ -1102,9 +1104,10 @@ func codexRolloutLineTimestamp(line string) (time.Time, bool) {
 // the accumulated snapshot for a single rollout file, latest-wins, mirroring the
 // live cache's sparse-merge semantics:
 //
-//   - A reset-only update within the SAME window (new reset within jitter of the
-//     prior) carries the prior usage forward; a usage-only update keeps the
-//     prior reset. Window-length hints survive from either side.
+//   - A reset-only update within the SAME LIVE window (prior reset still in the
+//     future as of this frame's event time, and within jitter of the new reset)
+//     carries the prior usage forward; a usage-only update keeps the prior reset
+//     only while it's still live. Window-length hints survive from either side.
 //   - A bucket with no known usage is NEVER stored as a standalone observed
 //     contributor — the live path ignores reset-only updates that have no prior
 //     same-window usage to merge into, and so do we. Storing one would make
@@ -1113,10 +1116,15 @@ func codexRolloutLineTimestamp(line string) (time.Time, bool) {
 //   - When a reset-only update jumps to a NEW window (reset beyond jitter), the
 //     prior reading is stale: drop it so it can't keep rendering an expired
 //     percentage, and leave the window unobserved until a real usage frame lands.
+//   - A usage-only update arriving after the prior window has already expired
+//     stands on its own — copying the expired prev reset would make
+//     codexObservedMetricOrUnknown zero out the fresh usage as rolled over.
 //
 // Windows/limits the frame doesn't mention are left untouched (rollout frames
-// never clear).
-func mergeCodexRolloutFrame(acc, updates map[string]map[string]codexRateLimitBucket) {
+// never clear). `frameTime` is the line's own timestamp so liveness is judged
+// at the moment the frame was emitted, not at refresh time.
+func mergeCodexRolloutFrame(acc, updates map[string]map[string]codexRateLimitBucket, frameTime time.Time) {
+	frameMs := frameTime.UnixMilli()
 	for window, contributors := range updates {
 		for limit, b := range contributors {
 			var prev codexRateLimitBucket
@@ -1124,14 +1132,16 @@ func mergeCodexRolloutFrame(acc, updates map[string]map[string]codexRateLimitBuc
 			if acc[window] != nil {
 				prev, hadPrev = acc[window][limit]
 			}
+			priorStillLive := hadPrev && prev.resetKnown && prev.ResetsAtMs > frameMs
 			sameWindow := hadPrev && (!b.resetKnown || !prev.resetKnown ||
 				resetsWithinJitter(b.ResetsAtMs, prev.ResetsAtMs))
+			sameLiveWindow := priorStillLive && (!b.resetKnown || resetsWithinJitter(b.ResetsAtMs, prev.ResetsAtMs))
 
-			if !b.usageKnown && hadPrev && sameWindow && prev.usageKnown {
+			if !b.usageKnown && sameLiveWindow && prev.usageKnown {
 				b.UsedPercentage = prev.UsedPercentage
 				b.usageKnown = true
 			}
-			if !b.resetKnown && hadPrev && prev.resetKnown {
+			if !b.resetKnown && priorStillLive {
 				b.ResetsAtMs = prev.ResetsAtMs
 				b.resetKnown = true
 			}
