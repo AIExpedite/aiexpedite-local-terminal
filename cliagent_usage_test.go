@@ -234,6 +234,13 @@ func TestCodexUsageParser_NestedAuthDotJsonClaims(t *testing.T) {
 // readings.
 func helperWriteRolloutLog(t *testing.T, base, day, name string, frames []map[string]any) {
 	t.Helper()
+	helperWriteRolloutLogAt(t, base, day, name, "2026-06-19T11:00:00.000Z", frames)
+}
+
+// helperWriteRolloutLogAt is helperWriteRolloutLog with an explicit per-line
+// event timestamp, used to exercise relative-reset anchoring.
+func helperWriteRolloutLogAt(t *testing.T, base, day, name, ts string, frames []map[string]any) {
+	t.Helper()
 	dir := filepath.Join(base, "sessions", "2026", "06", day)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir %s: %v", dir, err)
@@ -241,7 +248,7 @@ func helperWriteRolloutLog(t *testing.T, base, day, name string, frames []map[st
 	var b strings.Builder
 	for _, rl := range frames {
 		line, err := json.Marshal(map[string]any{
-			"timestamp": "2026-06-19T11:00:00.000Z",
+			"timestamp": ts,
 			"type":      "event_msg",
 			"payload": map[string]any{
 				"type":        "token_count",
@@ -397,6 +404,41 @@ func TestCodexUsageParser_RolloutRejectsPreLoginLogs(t *testing.T) {
 		if !m.Unknown {
 			t.Errorf("metric %q=%+v should stay Unknown; pre-login rollout must not backfill", m.Kind, m)
 		}
+	}
+}
+
+// A relative reset (`resets_in_seconds`) in a historical rollout line must be
+// anchored to the line's own emit time, so a window whose reset has already
+// passed rolls over to 0% instead of showing stale usage with a bogus future
+// reset.
+func TestCodexUsageParser_RolloutAnchorsRelativeResetToEventTime(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{"email": "carol@example.com"})
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Emitted 4 days before `now` with a relative reset only 1h out → expired
+	// long ago relative to now.
+	frame := map[string]any{
+		"primary": map[string]any{"used_percent": 50.0, "window_minutes": 300.0, "resets_in_seconds": 3600.0},
+	}
+	helperWriteRolloutLogAt(t, codexHome, "15", "2026-06-15T10-00-00-old", "2026-06-15T10:00:00.000Z",
+		[]map[string]any{frame})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session := usage.Metrics[0]
+	if session.Unknown {
+		t.Fatalf("session should be observed (rolled over), got Unknown")
+	}
+	if session.Consumed == nil || *session.Consumed != 0 {
+		t.Errorf("session Consumed=%v, want 0 (window rolled over via event-time anchor)", session.Consumed)
+	}
+	if session.ResetAt != "" {
+		t.Errorf("session ResetAt=%q, want empty for a rolled-over window", session.ResetAt)
 	}
 }
 

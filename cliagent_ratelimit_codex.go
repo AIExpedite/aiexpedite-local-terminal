@@ -882,10 +882,14 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRa
 	if base == "" {
 		return nil, false
 	}
-	// auth.json mtime is the account-swap watermark (0 = missing → guard off).
-	var authModUnix int64
+	// auth.json mtime is the account-swap watermark (zero = missing → guard
+	// off). Kept as time.Time and compared with Before() so a sub-second swap
+	// (a prior-account log modified earlier in the same wall-clock second as the
+	// new login) is still rejected — truncating to whole seconds would let it
+	// through.
+	var authMod time.Time
 	if info, err := os.Stat(expandHome(base, "auth.json")); err == nil {
-		authModUnix = info.ModTime().Unix()
+		authMod = info.ModTime()
 	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
 	// filepath.Glob returns lexically-sorted paths; every segment is zero-padded
@@ -897,9 +901,9 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRa
 	}
 	for i, scanned := len(matches)-1, 0; i >= 0 && scanned < codexRolloutScanFileCap; i, scanned = i-1, scanned+1 {
 		// Reject logs predating the current credentials (possible prior account).
-		if authModUnix > 0 {
+		if !authMod.IsZero() {
 			info, err := os.Stat(matches[i])
-			if err != nil || info.ModTime().Unix() < authModUnix {
+			if err != nil || info.ModTime().Before(authMod) {
 				continue
 			}
 		}
@@ -940,18 +944,34 @@ func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]codexRa
 		if json.Unmarshal([]byte(line), &raw) != nil {
 			continue
 		}
+		// Anchor relative reset fields (`resets_in_seconds`) to the moment the
+		// line was EMITTED, not the usage-refresh time. A historical rollout
+		// line saying "resets in 3600s" reset an hour after it was written; with
+		// the refresh time as the anchor it would falsely look like it resets an
+		// hour from now, masking a window that has long since rolled over.
+		// Absolute `resets_at` fields ignore this anchor, so the fallback is
+		// when the line carries no parseable timestamp.
+		eventTime := now
+		if ts, ok := raw["timestamp"].(string); ok {
+			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+				eventTime = parsed
+			}
+		}
 		// The rollout shape nests telemetry under `payload`
 		// ({"type":"event_msg","payload":{"type":"token_count","rate_limits":…}}),
 		// which extractCodexRateLimitBuckets already unwraps. fullSnapshot is
 		// false for that envelope, so null windows are ignored rather than
 		// treated as clears — exactly what we want when mining for live usage.
-		if updates, _ := extractCodexRateLimitBuckets(raw, now); len(updates) > 0 {
+		if updates, _ := extractCodexRateLimitBuckets(raw, eventTime); len(updates) > 0 {
 			latest = updates
 		}
 	}
 	if latest == nil {
 		return nil, false
 	}
+	// Roll over against the real current time: aggregateCodexBuckets zeroes any
+	// window whose reset is already in the past as of now, so a stale relative
+	// reset anchored above correctly clears instead of showing old usage.
 	return aggregateCodexBuckets(latest, now), true
 }
 
