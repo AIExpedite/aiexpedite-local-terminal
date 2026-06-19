@@ -46,6 +46,38 @@ func TestCaptureCodexRateLimit_TokenCountNotification(t *testing.T) {
 	}
 }
 
+// Codex's exact wire keys are tolerated, not assumed: the design accepts
+// `5h`/`7d` window aliases and a `window_minutes` reset hint so a schema
+// rename doesn't silently zero the card. Cover both at once.
+func TestCaptureCodexRateLimit_AcceptsAliasesAndWindowMinutes(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	line := `{"method":"token_count","params":{"rate_limits":{` +
+		`"5h":{"used_percent":12,"window_minutes":300},` +
+		`"7d":{"used_percent":50,"window_minutes":10080}` +
+		`}}}`
+
+	captureCodexRateLimitLine(line, now)
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache write under alias keys")
+	}
+	p, ok := snap.Buckets[codexWindowPrimary]
+	if !ok || p.UsedPercentage != 12 {
+		t.Fatalf("5h alias did not normalise to primary bucket: %+v", snap.Buckets)
+	}
+	wantPrimaryReset := now.Add(300 * time.Minute).UnixMilli()
+	if p.ResetsAtMs != wantPrimaryReset {
+		t.Errorf("primary ResetsAtMs from window_minutes=%d, want %d", p.ResetsAtMs, wantPrimaryReset)
+	}
+	s, ok := snap.Buckets[codexWindowSecondary]
+	if !ok || s.UsedPercentage != 50 {
+		t.Fatalf("7d alias did not normalise to secondary bucket: %+v", snap.Buckets)
+	}
+}
+
 func TestCaptureCodexRateLimit_IgnoresUnrelatedFrames(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
