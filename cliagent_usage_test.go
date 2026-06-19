@@ -515,6 +515,63 @@ func TestCodexUsageParser_RolloutAcceptsCamelCaseFrames(t *testing.T) {
 	}
 }
 
+// When the newest rollout log only restated `primary`, a window still missing
+// must be filled from a slightly older log that did carry it.
+func TestCodexUsageParser_RolloutAccumulatesAcrossFiles(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{"email": "carol@example.com"})
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Older log carries both windows.
+	helperWriteRolloutLog(t, codexHome, "18", "2026-06-18T10-00-00-older", []map[string]any{
+		codexRateLimitFrame(10, 50, now),
+	})
+	// Newest log restates only primary.
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-newer", []map[string]any{
+		{"primary": map[string]any{"used_percent": 30.0, "window_minutes": 300.0, "resets_at": float64(now.Add(time.Hour).Unix())}},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Consumed == nil || *session.Consumed != 30 {
+		t.Errorf("session Consumed=%v, want 30 (newest log wins)", session.Consumed)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 50 {
+		t.Errorf("weekly metric=%+v, want 50 from older log", weekly)
+	}
+}
+
+// A reset-only sparse frame that jumps to a NEW window must not carry the prior
+// window's usage onto the fresh reset — report rolled-over (0%) instead.
+func TestCodexUsageParser_RolloutResetOnlyNewWindowDropsStaleUsage(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{"email": "carol@example.com"})
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-rollover", []map[string]any{
+		// Window A: 60% used, resets in 1h.
+		{"primary": map[string]any{"used_percent": 60.0, "window_minutes": 300.0, "resets_at": float64(now.Add(time.Hour).Unix())}},
+		// Reset-only frame jumping to a new window 5h out (beyond jitter), no usage.
+		{"primary": map[string]any{"window_minutes": 300.0, "resets_at": float64(now.Add(5 * time.Hour).Unix())}},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session := usage.Metrics[0]
+	if session.Consumed == nil || *session.Consumed != 0 {
+		t.Errorf("session Consumed=%v, want 0 (stale usage not carried into new window)", session.Consumed)
+	}
+}
+
 func TestGeminiUsageParser_FreeTierFramesTotal(t *testing.T) {
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".gemini", "settings.json"), map[string]any{

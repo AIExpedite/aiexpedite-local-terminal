@@ -899,6 +899,12 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRa
 	if err != nil || len(matches) == 0 {
 		return nil, false
 	}
+	// Accumulate across files newest-first: a window the newest log never
+	// restated (e.g. it only carried `primary`) can still be filled from a
+	// slightly older log that did carry `secondary`. The newest reading for a
+	// given window wins, so once a window is in `acc` an older file never
+	// overwrites it.
+	acc := map[string]codexRateLimitBucket{}
 	for i, scanned := len(matches)-1, 0; i >= 0 && scanned < codexRolloutScanFileCap; i, scanned = i-1, scanned+1 {
 		// Reject logs predating the current credentials (possible prior account).
 		if !authMod.IsZero() {
@@ -907,11 +913,25 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRa
 				continue
 			}
 		}
-		if buckets, ok := codexBucketsFromRolloutFile(matches[i], now); ok {
-			return buckets, true
+		buckets, ok := codexBucketsFromRolloutFile(matches[i], now)
+		if !ok {
+			continue
+		}
+		for w, b := range buckets {
+			if _, exists := acc[w]; !exists {
+				acc[w] = b
+			}
+		}
+		_, hasPrimary := acc[codexWindowPrimary]
+		_, hasSecondary := acc[codexWindowSecondary]
+		if hasPrimary && hasSecondary {
+			break
 		}
 	}
-	return nil, false
+	if len(acc) == 0 {
+		return nil, false
+	}
+	return acc, true
 }
 
 // codexBucketsFromRolloutFile returns the aggregated buckets from the LAST
@@ -1001,9 +1021,19 @@ func mergeCodexRolloutFrame(acc, updates map[string]map[string]codexRateLimitBuc
 				continue
 			}
 			merged := b
+			// Carry the prior usage onto a reset-only update ONLY when the new
+			// reset still describes the SAME window (within jitter of the prior
+			// reset). A reset that jumped to a new window means the prior
+			// usage is stale — leave usage unobserved so the new window reports
+			// rolled-over/0% rather than the previous window's percentage. This
+			// mirrors the live cache's sparse-merge (resetsWithinJitter gate).
 			if !b.usageKnown && prev.usageKnown {
-				merged.UsedPercentage = prev.UsedPercentage
-				merged.usageKnown = true
+				sameWindow := !b.resetKnown || !prev.resetKnown ||
+					resetsWithinJitter(b.ResetsAtMs, prev.ResetsAtMs)
+				if sameWindow {
+					merged.UsedPercentage = prev.UsedPercentage
+					merged.usageKnown = true
+				}
 			}
 			if !b.resetKnown && prev.resetKnown {
 				merged.ResetsAtMs = prev.ResetsAtMs
