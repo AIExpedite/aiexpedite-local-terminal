@@ -43,6 +43,14 @@ const (
 	codexWindowSecondary = "secondary"
 )
 
+// codexLegacyLimitID is the synthetic contributor id for buckets coming from
+// the legacy aggregate `rate_limits` view (no `rateLimitsByLimitId` key). We
+// track every contributor separately so a sparse `account/rateLimits/updated`
+// that only mentions one metered limit (e.g. `codex_primary`) does not silently
+// clobber a stricter prior contributor (e.g. `codex_other`) that the sparse
+// frame did not restate.
+const codexLegacyLimitID = "__legacy__"
+
 // codexResetJitterMs is how much two reset timestamps may differ and still be
 // treated as the same quota window. A sparse reset-only frame recomputes
 // ResetsAtMs from the local receive time plus `resets_in_seconds`, so the
@@ -95,10 +103,18 @@ type codexRateLimitBucket struct {
 // produced it — when the local creds change, a stale window must NOT be
 // attributed to the new account (the CLI Agents tab would otherwise show
 // another user's capacity until the new account emits its own telemetry).
+//
+// Buckets is the aggregated most-constrained view of each display window
+// (primary / secondary) and is what cliagent_usage_codex.go renders. Contributors
+// remembers the per-(window, limit-id) buckets that feed that aggregate — a
+// later sparse `account/rateLimits/updated` for only one metered limit can
+// therefore replace just that limit's slot without losing a stricter prior
+// limit's bucket. The aggregate is recomputed from Contributors on every write.
 type codexRateLimitSnapshot struct {
-	UpdatedAt          string                          `json:"updatedAt"`
-	AccountFingerprint string                          `json:"accountFingerprint,omitempty"`
-	Buckets            map[string]codexRateLimitBucket `json:"buckets"`
+	UpdatedAt          string                                     `json:"updatedAt"`
+	AccountFingerprint string                                     `json:"accountFingerprint,omitempty"`
+	Buckets            map[string]codexRateLimitBucket            `json:"buckets"`
+	Contributors       map[string]map[string]codexRateLimitBucket `json:"contributors,omitempty"`
 }
 
 // codexRateLimitMu serialises the read-modify-write of the cache file
@@ -205,9 +221,26 @@ func codexBucketFromInfo(info map[string]interface{}, now time.Time) (codexRateL
 // notifications under `params` are NOT full snapshots — a missing or null
 // window there means "no update for this window," not "clear it," so we
 // only honour clears that arrive via the `result` path.
-func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (map[string]codexRateLimitBucket, map[string]bool) {
-	out := map[string]codexRateLimitBucket{}
+func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (map[string]map[string]codexRateLimitBucket, map[string]bool) {
+	out := map[string]map[string]codexRateLimitBucket{}
 	clears := map[string]bool{}
+	addContributor := func(window, limit string, b codexRateLimitBucket) {
+		if out[window] == nil {
+			out[window] = map[string]codexRateLimitBucket{}
+		}
+		// Same (window, limit) appearing twice in a single frame (e.g. once via
+		// `rate_limits` aggregate and once via nested `rateLimitsByLimitId`)
+		// is folded into the most constrained view, matching how the previous
+		// flat extractor handled intra-frame conflicts.
+		prev, exists := out[window][limit]
+		if !exists {
+			out[window][limit] = b
+			return
+		}
+		merged := map[string]codexRateLimitBucket{limit: prev}
+		mergeCodexBucketMostConstrained(merged, limit, b)
+		out[window][limit] = merged[limit]
+	}
 
 	type candidate struct {
 		src          map[string]interface{}
@@ -270,7 +303,7 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (ma
 					if !ok {
 						continue
 					}
-					mergeCodexBucketMostConstrained(out, id, b)
+					addContributor(id, codexLegacyLimitID, b)
 				}
 			}
 		}
@@ -327,7 +360,7 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (ma
 							continue
 						}
 						nestedMatched = true
-						mergeCodexBucketMostConstrained(out, id, nb)
+						addContributor(id, limitKey, nb)
 					}
 					if nestedMatched {
 						continue
@@ -340,13 +373,38 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (ma
 					if id == "" {
 						continue
 					}
-					mergeCodexBucketMostConstrained(out, id, b)
+					addContributor(id, limitKey, b)
 				}
 			}
 		}
 	}
 
 	return out, clears
+}
+
+// aggregateCodexBuckets folds per-(window, limit) contributors into a single
+// most-constrained bucket per window. Used both by tests of the extractor and
+// at write/read time to derive the flat `Buckets` field rendered on the card.
+//
+// A contributor whose reset is strictly in the past is treated as having
+// rolled over to 0% used: its prior utilisation is stale (Codex would emit a
+// fresh telemetry frame at the start of the new window), and leaving the
+// stale percentage in the merge would let it shadow a live contributor that
+// has a smaller usage but a real future reset. The reset itself is preserved
+// so codexObservedMetricOrUnknown still recognises the rollover at display
+// time when no other contributor is live.
+func aggregateCodexBuckets(perLimit map[string]map[string]codexRateLimitBucket, now time.Time) map[string]codexRateLimitBucket {
+	out := map[string]codexRateLimitBucket{}
+	nowMs := now.UnixMilli()
+	for window, contributors := range perLimit {
+		for _, b := range contributors {
+			if b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs {
+				b.UsedPercentage = 0
+			}
+			mergeCodexBucketMostConstrained(out, window, b)
+		}
+	}
+	return out
 }
 
 // mergeCodexBucketMostConstrained folds `b` into `out[id]`, keeping the most
@@ -471,20 +529,46 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 	if len(updates) == 0 && len(clears) == 0 {
 		return
 	}
-	mergeCodexRateLimitCache(codexRateLimitCachePath(), updates, clears, now, currentCodexAccountFingerprint())
+	mergeCodexRateLimitCachePerLimit(codexRateLimitCachePath(), updates, clears, now, currentCodexAccountFingerprint())
 }
 
-// mergeCodexRateLimitCache read-modify-writes the cache, overwriting only the
-// windows present in `updates` and leaving the rest intact. Windows named in
-// `clears` are deleted from the cache — Codex uses `secondary: null` in a
-// full account/rateLimits/read response to mean "this window does not apply
-// to the account," so we must drop any stale bucket instead of leaving it to
-// render until its old reset passes. When the existing snapshot was captured
-// under a different account fingerprint, its buckets are discarded — a
-// previous account's reset times must not bleed into the new account's
-// display.
+// mergeCodexRateLimitCache is the flat-shape entry point preserved for callers
+// (and tests) that already aggregated their updates by display window. Each
+// flat entry is recorded as a single contributor under codexLegacyLimitID so
+// the on-disk schema stays per-limit and the per-(window, limit) sparse-merge
+// logic still applies.
 func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBucket, clears map[string]bool, now time.Time, fingerprint string) {
-	if path == "" || (len(updates) == 0 && len(clears) == 0) {
+	if len(updates) == 0 && len(clears) == 0 {
+		return
+	}
+	perLimit := make(map[string]map[string]codexRateLimitBucket, len(updates))
+	for window, bucket := range updates {
+		perLimit[window] = map[string]codexRateLimitBucket{codexLegacyLimitID: bucket}
+	}
+	mergeCodexRateLimitCachePerLimit(path, perLimit, clears, now, fingerprint)
+}
+
+// mergeCodexRateLimitCachePerLimit read-modify-writes the cache, preserving
+// the per-(window, limit-id) contributors map so a sparse
+// `account/rateLimits/updated` for one metered limit (e.g. `codex_primary`)
+// does not silently clobber a stricter prior contributor (e.g. `codex_other`)
+// the sparse frame never restated. The flat `Buckets` field is re-aggregated
+// from the contributors on every write so the read path stays unchanged.
+//
+// Windows named in `clears` are dropped entirely (every contributor) —
+// Codex uses `secondary: null` in a full account/rateLimits/read response to
+// mean "this window does not apply to the account." When the existing
+// snapshot was captured under a different account fingerprint, all buckets
+// and contributors are discarded so a previous account's reset times can't
+// bleed into the new account's display.
+func mergeCodexRateLimitCachePerLimit(
+	path string,
+	perLimit map[string]map[string]codexRateLimitBucket,
+	clears map[string]bool,
+	now time.Time,
+	fingerprint string,
+) {
+	if path == "" || (len(perLimit) == 0 && len(clears) == 0) {
 		return
 	}
 	codexRateLimitMu.Lock()
@@ -501,15 +585,45 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 		}()
 	}
 
-	snap := codexRateLimitSnapshot{Buckets: map[string]codexRateLimitBucket{}}
+	snap := codexRateLimitSnapshot{
+		Buckets:      map[string]codexRateLimitBucket{},
+		Contributors: map[string]map[string]codexRateLimitBucket{},
+	}
 	if b, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(b, &snap)
 		if snap.Buckets == nil {
 			snap.Buckets = map[string]codexRateLimitBucket{}
 		}
+		if snap.Contributors == nil {
+			snap.Contributors = map[string]map[string]codexRateLimitBucket{}
+		}
 	}
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]codexRateLimitBucket{}
+		snap.Contributors = map[string]map[string]codexRateLimitBucket{}
+	}
+	// Migrate legacy cache files written before Contributors existed: each
+	// pre-existing aggregated bucket becomes a single __legacy__ contributor
+	// so subsequent sparse updates can merge against it instead of starting
+	// fresh.
+	for window, b := range snap.Buckets {
+		if _, ok := snap.Contributors[window]; ok {
+			continue
+		}
+		snap.Contributors[window] = map[string]codexRateLimitBucket{
+			codexLegacyLimitID: reflagPersistedCodexBucket(b),
+		}
+	}
+	// Restore the provenance flags on every loaded contributor — they're
+	// json:"-" and so come back as false. Without this, the final
+	// aggregateCodexBuckets pass would treat a still-live prior contributor
+	// as "no usage known" and let a freshly updated sparse contributor with
+	// lower usage replace it — exactly the bug this Contributors map is
+	// supposed to prevent.
+	for window, contribs := range snap.Contributors {
+		for limit, b := range contribs {
+			snap.Contributors[window][limit] = reflagPersistedCodexBucket(b)
+		}
 	}
 	// Drop windows the frame explicitly cleared (null in a full read response)
 	// before applying updates: a clear in this snapshot wins over any cached
@@ -518,59 +632,58 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 	// that both clears one window and refreshes another behaves correctly.
 	for window := range clears {
 		delete(snap.Buckets, window)
+		delete(snap.Contributors, window)
 	}
 	nowMs := now.UnixMilli()
-	for window, bucket := range updates {
-		// Codex's account/rateLimits/updated is sparse: a notification may
-		// carry only a fresh used_percent OR only a fresh reset time. Merge
-		// per field so a usage-only update doesn't clobber the live reset,
-		// and a reset-only update doesn't reset Consumed to 0%. A prior
-		// reading is only carried forward when it still describes a LIVE
-		// window (prior reset in the future); otherwise it's stale and we
-		// let the partial new bucket stand.
-		prev, hadPrev := snap.Buckets[window]
-		priorStillLive := hadPrev && prev.ResetsAtMs > nowMs
-		// A reset-only update only describes the SAME live window when its
-		// new reset is within jitter of the prior reset (or omits a reset
-		// entirely). A heartbeat `resets_in_seconds` frame recomputes the
-		// absolute reset from the local receive time, so two consecutive
-		// notifications for the same live window can differ by a second
-		// or two — exact equality would treat that as a rollover and flip
-		// the card to Unknown until the next usage frame. A real rollover
-		// jumps by the full window length (5h / 1w), well past the jitter
-		// band, so we still drop the prior used % when the gap is large.
-		sameLiveWindow := priorStillLive && (!bucket.resetKnown || resetsWithinJitter(bucket.ResetsAtMs, prev.ResetsAtMs))
-		if !bucket.usageKnown && sameLiveWindow {
-			bucket.UsedPercentage = prev.UsedPercentage
-		}
-		if !bucket.resetKnown && priorStillLive {
-			bucket.ResetsAtMs = prev.ResetsAtMs
-		}
-		// WindowMinutes describes the rolling-window length and rarely
-		// changes within an account, so carry it forward whenever the new
-		// update doesn't restate it — same intent as the usage/reset
-		// preservation above.
-		if bucket.WindowMinutes == 0 && hadPrev && prev.WindowMinutes > 0 {
-			bucket.WindowMinutes = prev.WindowMinutes
-		}
-		// Reset-only update with no usage carried from the same live window:
-		// persisting now would seed a fake observed 0% used (the zero-value
-		// UsedPercentage), so the next refresh would render the quota as
-		// 0% / 100% remaining even though no usage value was ever observed
-		// for this window. Leave it Unknown until a real used_percent /
-		// utilization arrives. This covers both "no prior bucket" and
-		// "prior bucket belonged to a now-rolled-over window" — in the
-		// rolled-over case we additionally evict the stale prior bucket
-		// rather than letting it linger on the card until the old reset
-		// passes.
-		if !bucket.usageKnown && !sameLiveWindow {
-			if hadPrev && bucket.resetKnown && !resetsWithinJitter(bucket.ResetsAtMs, prev.ResetsAtMs) {
-				delete(snap.Buckets, window)
+	for window, contributors := range perLimit {
+		for limit, bucket := range contributors {
+			// Codex's account/rateLimits/updated is sparse PER LIMIT: a
+			// notification may carry only a fresh used_percent OR only a
+			// fresh reset time for one (window, limit) pair, and any other
+			// contributor for the same display window must be left alone.
+			// Merge per field so a usage-only update doesn't clobber the
+			// live reset and a reset-only update doesn't reset Consumed to
+			// 0%. A prior reading is only carried forward when it still
+			// describes a LIVE window for THIS limit (prior reset in the
+			// future); otherwise it's stale and we let the partial new
+			// bucket stand.
+			windowContribs := snap.Contributors[window]
+			prev, hadPrev := codexRateLimitBucket{}, false
+			if windowContribs != nil {
+				prev, hadPrev = windowContribs[limit]
+				if hadPrev {
+					prev = reflagPersistedCodexBucket(prev)
+				}
 			}
-			continue
+			priorStillLive := hadPrev && prev.ResetsAtMs > nowMs
+			sameLiveWindow := priorStillLive && (!bucket.resetKnown || resetsWithinJitter(bucket.ResetsAtMs, prev.ResetsAtMs))
+			if !bucket.usageKnown && sameLiveWindow {
+				bucket.UsedPercentage = prev.UsedPercentage
+			}
+			if !bucket.resetKnown && priorStillLive {
+				bucket.ResetsAtMs = prev.ResetsAtMs
+			}
+			if bucket.WindowMinutes == 0 && hadPrev && prev.WindowMinutes > 0 {
+				bucket.WindowMinutes = prev.WindowMinutes
+			}
+			if !bucket.usageKnown && !sameLiveWindow {
+				if hadPrev && bucket.resetKnown && !resetsWithinJitter(bucket.ResetsAtMs, prev.ResetsAtMs) {
+					delete(snap.Contributors[window], limit)
+					if len(snap.Contributors[window]) == 0 {
+						delete(snap.Contributors, window)
+					}
+				}
+				continue
+			}
+			if snap.Contributors[window] == nil {
+				snap.Contributors[window] = map[string]codexRateLimitBucket{}
+			}
+			snap.Contributors[window][limit] = bucket
 		}
-		snap.Buckets[window] = bucket
 	}
+	// Recompute the flat aggregate from contributors so callers reading the
+	// cache (codexMetricsFromCache, tests) see the most-constrained view.
+	snap.Buckets = aggregateCodexBuckets(snap.Contributors, now)
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
 	snap.AccountFingerprint = fingerprint
 
@@ -585,6 +698,24 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 	}
+}
+
+// reflagPersistedCodexBucket restores the usageKnown / resetKnown provenance
+// flags that aren't persisted (they're json:"-"). On load both are false; we
+// upgrade based on whether values are present, because mergeCodexBucketMost-
+// Constrained refuses to treat a prior bucket as a real contributor unless
+// its usageKnown flag is set.
+func reflagPersistedCodexBucket(b codexRateLimitBucket) codexRateLimitBucket {
+	if !b.usageKnown {
+		// A bucket only reaches the on-disk snapshot once usage was observed
+		// — the write path skips buckets without a known used_percent — so
+		// it is safe to mark loaded entries as having known usage.
+		b.usageKnown = true
+	}
+	if !b.resetKnown {
+		b.resetKnown = b.ResetsAtMs > 0
+	}
+	return b
 }
 
 // loadCodexRateLimitSnapshot reads the cache. Returns (zero, false) when the
@@ -643,7 +774,23 @@ func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentU
 	snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath())
 	buckets := map[string]codexRateLimitBucket{}
 	if ok && snap.AccountFingerprint == currentFingerprint {
-		buckets = snap.Buckets
+		// Prefer Contributors when present so a sparse update for one limit
+		// can't shadow a stricter prior contributor that the sparse frame
+		// never restated. Fall back to the flat aggregate for any legacy
+		// cache file written before the contributors map existed.
+		if len(snap.Contributors) > 0 {
+			reflagged := make(map[string]map[string]codexRateLimitBucket, len(snap.Contributors))
+			for w, contribs := range snap.Contributors {
+				windowMap := make(map[string]codexRateLimitBucket, len(contribs))
+				for limit, b := range contribs {
+					windowMap[limit] = reflagPersistedCodexBucket(b)
+				}
+				reflagged[w] = windowMap
+			}
+			buckets = aggregateCodexBuckets(reflagged, now)
+		} else {
+			buckets = snap.Buckets
+		}
 	}
 
 	session := codexObservedMetricOrUnknown(

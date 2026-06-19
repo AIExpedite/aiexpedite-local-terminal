@@ -633,7 +633,8 @@ func TestExtractCodexRateLimitBuckets_TieKeepsLaterReset(t *testing.T) {
 			},
 		},
 	}
-	buckets, _ := extractCodexRateLimitBuckets(raw, now)
+	perLimit, _ := extractCodexRateLimitBuckets(raw, now)
+	buckets := aggregateCodexBuckets(perLimit, now)
 	p, ok := buckets[codexWindowPrimary]
 	if !ok {
 		t.Fatalf("expected primary bucket, got %+v", buckets)
@@ -670,7 +671,8 @@ func TestExtractCodexRateLimitBuckets_TieDropsResetWhenOneUnknown(t *testing.T) 
 			},
 		},
 	}
-	buckets, _ := extractCodexRateLimitBuckets(raw, now)
+	perLimit, _ := extractCodexRateLimitBuckets(raw, now)
+	buckets := aggregateCodexBuckets(perLimit, now)
 	p, ok := buckets[codexWindowPrimary]
 	if !ok {
 		t.Fatalf("expected primary bucket, got %+v", buckets)
@@ -919,7 +921,8 @@ func TestExtractCodexRateLimitBuckets_HigherUsagePreservesLaterReset(t *testing.
 			},
 		},
 	}
-	buckets, _ := extractCodexRateLimitBuckets(raw, now)
+	perLimit, _ := extractCodexRateLimitBuckets(raw, now)
+	buckets := aggregateCodexBuckets(perLimit, now)
 	p, ok := buckets[codexWindowPrimary]
 	if !ok {
 		t.Fatalf("expected primary bucket, got %+v", buckets)
@@ -960,7 +963,8 @@ func TestExtractCodexRateLimitBuckets_StricterBucketWithoutResetDropsBorrowedRes
 			},
 		},
 	}
-	buckets, _ := extractCodexRateLimitBuckets(raw, now)
+	perLimit, _ := extractCodexRateLimitBuckets(raw, now)
+	buckets := aggregateCodexBuckets(perLimit, now)
 	p, ok := buckets[codexWindowPrimary]
 	if !ok {
 		t.Fatalf("expected primary bucket, got %+v", buckets)
@@ -1009,6 +1013,62 @@ func TestCaptureCodexRateLimit_ResetOnlyJitterPreservesPriorUsage(t *testing.T) 
 	}
 	if b.UsedPercentage != 65 {
 		t.Errorf("UsedPercentage=%v, want 65 (heartbeat within jitter must preserve prior usage)", b.UsedPercentage)
+	}
+}
+
+// A full account/rateLimits/read can cache one window from a strict
+// `codex_other` contributor (e.g. 80% on primary). A later sparse
+// `account/rateLimits/updated` that only restates `codex_primary` at 20% must
+// NOT lower the cached aggregate to 20% — the prior `codex_other` contributor
+// is still live for the same window and the sparse frame never said it
+// dropped. The on-disk per-(window, limit) Contributors map is what makes
+// that preservation possible.
+func TestCaptureCodexRateLimit_SparseByLimitPreservesPriorStricterContributor(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Full read seeds primary with two contributors: codex_primary at 20% and a
+	// stricter codex_other at 80% on the same 5-hour window.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","id":1,"result":{"rateLimitsByLimitId":{`+
+			`"codex_primary":{"primary":{"usedPercent":20,"resetsInSeconds":1800,"windowDurationMins":300}},`+
+			`"codex_other":{"primary":{"usedPercent":80,"resetsInSeconds":1800,"windowDurationMins":300}}`+
+			`}}}`,
+		now,
+	)
+	if snap, ok := loadCodexRateLimitSnapshot(cache); !ok || snap.Buckets[codexWindowPrimary].UsedPercentage != 80 {
+		t.Fatalf("seed should aggregate to 80%% from codex_other, got %+v", snap.Buckets)
+	}
+
+	// Later sparse update only restates codex_primary at 20% on the same live
+	// window. codex_other was not mentioned but is still live, so the aggregate
+	// must STAY at 80%.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{"rateLimitsByLimitId":{`+
+			`"codex_primary":{"primary":{"usedPercent":20,"resetsInSeconds":1800,"windowDurationMins":300}}`+
+			`}}}`,
+		now.Add(30*time.Second),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	p, present := snap.Buckets[codexWindowPrimary]
+	if !present {
+		t.Fatalf("primary bucket missing after sparse by-limit update: %+v", snap.Buckets)
+	}
+	if p.UsedPercentage != 80 {
+		t.Errorf("aggregate UsedPercentage=%v, want 80 (codex_other still live, sparse update for codex_primary must not lower it)", p.UsedPercentage)
+	}
+	// Sanity: both contributors should be present in the per-limit map.
+	contribs := snap.Contributors[codexWindowPrimary]
+	if got := contribs["codex_other"].UsedPercentage; got != 80 {
+		t.Errorf("codex_other contributor UsedPercentage=%v, want 80", got)
+	}
+	if got := contribs["codex_primary"].UsedPercentage; got != 20 {
+		t.Errorf("codex_primary contributor UsedPercentage=%v, want 20 (refreshed by sparse update)", got)
 	}
 }
 
