@@ -46,10 +46,16 @@ const (
 // codexRateLimitBucket is one window's observed state. UsedPercentage is
 // normalised to 0..100 regardless of source shape (utilization 0..1 vs
 // used_percent 0..100). ResetsAtMs is unix epoch milliseconds (0 = unknown).
+// WindowMinutes records the documented length of the rolling window when
+// Codex advertises it (`window_minutes` / `windowDurationMins`), so the metric
+// label can be derived from the actual duration rather than assuming
+// primary == 5h: a future plan whose primary window is e.g. 15 minutes
+// would otherwise still be reported as a "5-hour session window".
 type codexRateLimitBucket struct {
 	UsedPercentage float64 `json:"usedPercentage"`
 	ResetsAtMs     int64   `json:"resetsAtMs"`
 	ObservedAtMs   int64   `json:"observedAtMs"`
+	WindowMinutes  float64 `json:"windowMinutes,omitempty"`
 	// usageKnown/resetKnown mark which fields were freshly observed in this
 	// update. Codex's account/rateLimits/updated is sparse — a notification
 	// may carry only the new reset time, or only a new used_percent, and the
@@ -133,9 +139,13 @@ func codexBucketFromInfo(info map[string]interface{}, now time.Time) (codexRateL
 			}
 		}
 	}
-	if b.ResetsAtMs == 0 {
-		if v, ok := pickField(info, "window_minutes", "windowMinutes"); ok {
-			if f, ok := numAsFloat(v); ok && f > 0 {
+	// Always record the documented window length when present, even when an
+	// explicit reset was given — the label ("5-hour session window") is
+	// derived from this, not from the position in the rate_limits map.
+	if v, ok := pickField(info, "window_minutes", "windowMinutes", "windowDurationMins"); ok {
+		if f, ok := numAsFloat(v); ok && f > 0 {
+			b.WindowMinutes = f
+			if b.ResetsAtMs == 0 {
 				b.ResetsAtMs = now.Add(time.Duration(f * float64(time.Minute))).UnixMilli()
 			}
 		}
@@ -287,6 +297,13 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 		if !bucket.resetKnown && priorStillLive {
 			bucket.ResetsAtMs = prev.ResetsAtMs
 		}
+		// WindowMinutes describes the rolling-window length and rarely
+		// changes within an account, so carry it forward whenever the new
+		// update doesn't restate it — same intent as the usage/reset
+		// preservation above.
+		if bucket.WindowMinutes == 0 && hadPrev && prev.WindowMinutes > 0 {
+			bucket.WindowMinutes = prev.WindowMinutes
+		}
 		// Reset-only update with no live prior usage: persisting now would
 		// seed a fake observed 0% used (the zero-value UsedPercentage), so
 		// the next refresh would render the quota as 0% / 100% remaining
@@ -380,18 +397,45 @@ func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentU
 	return []cliAgentUsageMetric{session, weekly}
 }
 
+// codexWindowLabel renders a human label for a window of the given length.
+// We special-case the canonical Codex windows (300 min = 5 hours, 10080 min =
+// weekly) so the long-standing labels stay identical, and derive a neutral
+// "Nm/Nh/Nd window" string otherwise so an off-spec plan still shows the right
+// quota window context instead of the wrong hard-coded one.
+func codexWindowLabel(minutes float64, fallback string) string {
+	if minutes <= 0 {
+		return fallback
+	}
+	m := int(minutes + 0.5)
+	switch m {
+	case 300:
+		return "5-hour session window"
+	case 10080:
+		return "Weekly quota"
+	}
+	switch {
+	case m < 60:
+		return fmt.Sprintf("%d-minute window", m)
+	case m%60 == 0 && m < 60*24:
+		return fmt.Sprintf("%d-hour window", m/60)
+	case m%(60*24) == 0:
+		return fmt.Sprintf("%d-day window", m/(60*24))
+	}
+	return fmt.Sprintf("%.1f-hour window", float64(m)/60)
+}
+
 // codexObservedMetricOrUnknown returns a real percentage metric for the given
 // window id, or an Unknown placeholder when it is unobserved. A window whose
 // reset time has already passed is reported as 0% used (the window rolled
 // over), matching Claude's observedMetricOrUnknown behavior.
 func codexObservedMetricOrUnknown(
 	buckets map[string]codexRateLimitBucket,
-	windowID, kind, label string,
+	windowID, kind, defaultLabel string,
 	now time.Time,
 ) cliAgentUsageMetric {
 	b, ok := buckets[windowID]
 	if !ok {
-		return cliAgentUsageMetric{Kind: kind, Label: label, Unit: "%", Unknown: true}
+		return cliAgentUsageMetric{Kind: kind, Label: defaultLabel, Unit: "%", Unknown: true}
 	}
 	used := b.UsedPercentage
 	var resetAt string
@@ -405,7 +449,7 @@ func codexObservedMetricOrUnknown(
 	used = clampPercent(used)
 	return cliAgentUsageMetric{
 		Kind:      kind,
-		Label:     label,
+		Label:     codexWindowLabel(b.WindowMinutes, defaultLabel),
 		Unit:      "%",
 		Total:     floatPtr(100),
 		Consumed:  floatPtr(used),

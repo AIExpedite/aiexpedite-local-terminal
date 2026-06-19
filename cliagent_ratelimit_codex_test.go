@@ -272,6 +272,63 @@ func TestCodexMetricsFromCache_NoCacheFallsBackToUnknown(t *testing.T) {
 	}
 }
 
+// When Codex reports a non-canonical window length (e.g. 15-minute primary in
+// the documented account/rateLimits/read example, or a future plan), the metric
+// label must reflect the actual duration rather than the hard-coded
+// "5-hour session window" / "Weekly quota" strings.
+func TestCodexMetricsFromCache_LabelDerivedFromWindowMinutes(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 40, ResetsAtMs: now.Add(15 * time.Minute).UnixMilli(),
+			WindowMinutes: 15, usageKnown: true, resetKnown: true,
+		},
+		codexWindowSecondary: {
+			UsedPercentage: 10, ResetsAtMs: now.Add(24 * time.Hour).UnixMilli(),
+			WindowMinutes: 1440, usageKnown: true, resetKnown: true,
+		},
+	}, now, "")
+
+	metrics := codexMetricsFromCache(now, "")
+	if got := metrics[0].Label; got != "15-minute window" {
+		t.Errorf("primary label=%q, want %q", got, "15-minute window")
+	}
+	if got := metrics[1].Label; got != "1-day window" {
+		t.Errorf("secondary label=%q, want %q", got, "1-day window")
+	}
+}
+
+// Canonical Codex windows (primary = 300 min, secondary = 10080 min) must keep
+// their long-standing labels so the card text doesn't churn for existing users
+// once duration-derived labels land.
+func TestCodexMetricsFromCache_CanonicalWindowsKeepLabels(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 20, ResetsAtMs: now.Add(5 * time.Hour).UnixMilli(),
+			WindowMinutes: 300, usageKnown: true, resetKnown: true,
+		},
+		codexWindowSecondary: {
+			UsedPercentage: 5, ResetsAtMs: now.Add(7 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, usageKnown: true, resetKnown: true,
+		},
+	}, now, "")
+
+	metrics := codexMetricsFromCache(now, "")
+	if got := metrics[0].Label; got != "5-hour session window" {
+		t.Errorf("primary label=%q, want canonical 5-hour session window", got)
+	}
+	if got := metrics[1].Label; got != "Weekly quota" {
+		t.Errorf("secondary label=%q, want canonical Weekly quota", got)
+	}
+}
+
 func TestCodexMetricsFromCache_FingerprintMismatchHidesSnapshot(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)

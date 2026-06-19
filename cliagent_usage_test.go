@@ -148,8 +148,8 @@ func TestCodexUsageParser_PopulatesObservedMetricsFromCache(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	fp := fingerprintAccount("codex", "carol@example.com")
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
-		codexWindowPrimary:   {UsedPercentage: 42, ResetsAtMs: now.Add(time.Hour).UnixMilli()},
-		codexWindowSecondary: {UsedPercentage: 13, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli()},
+		codexWindowPrimary:   {UsedPercentage: 42, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
+		codexWindowSecondary: {UsedPercentage: 13, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
 	}, now, fp)
 
 	usage, ok := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
