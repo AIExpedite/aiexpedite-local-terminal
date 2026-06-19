@@ -66,6 +66,7 @@ type cliAgentUsageMetric struct {
 // entry per detected agent on this device — multi-device aggregation is the
 // frontend hook's job, not ours.
 type cliAgentUsage struct {
+	CliAgentID         string                `json:"cliAgentId,omitempty"`
 	Provider           string                `json:"provider"`
 	Name               string                `json:"name,omitempty"`
 	Version            string                `json:"version,omitempty"`
@@ -97,10 +98,12 @@ type cliAgentUsageError struct {
 	Message  string `json:"message"`
 }
 
-// gatherCLIAgentUsage walks the registered parsers and returns the slice the
-// auth/token request embeds as `cliAgents[]`. Order is stable (alphabetical
-// by provider) so byte-equal payloads produce byte-equal Firestore writes,
-// which the terminal-service delta-skip relies on.
+// gatherCLIAgentUsage walks the active catalog and returns the slice the
+// auth/token request embeds as `cliAgents[]`. Catalog entries with no
+// specialized parser still emit a baseline snapshot so newly configured CLI
+// agents appear in utilization surfaces without a local terminal code change.
+// Order is stable (alphabetical by provider) so byte-equal payloads produce
+// byte-equal Firestore writes, which the terminal-service delta-skip relies on.
 func gatherCLIAgentUsage(detected map[string]detectedCLIAgent, now time.Time) []cliAgentUsage {
 	if len(detected) == 0 {
 		return []cliAgentUsage{}
@@ -114,27 +117,42 @@ func gatherCLIAgentUsage(detected map[string]detectedCLIAgent, now time.Time) []
 		host = ""
 	}
 
+	parsers := cliAgentUsageParserIndex()
 	out := make([]cliAgentUsage, 0, len(detected))
-	for _, parser := range cliAgentUsageRegistry() {
-		entry, ok := detected[parser.Provider()]
+	for _, agent := range activeCLIAgentCatalog() {
+		if !cliAgentCatalogSupportsUtilization(agent) {
+			continue
+		}
+		entry, ok := detected[agent.ID]
 		if !ok || !entry.Detected {
 			continue
 		}
-		usage, ok := parser.Parse(home, entry, now)
-		if !ok || usage == nil {
+		parser := parsers[cliAgentCatalogParserKey(agent)]
+		provider := agent.ID
+		var usage *cliAgentUsage
+		var parsed bool
+		if parser != nil {
+			provider = parser.Provider()
+			usage, parsed = parser.Parse(home, entry, now)
+		}
+		if !parsed || usage == nil {
 			// Even when we can't enrich, still emit a baseline entry so the UI
 			// shows the agent on the CLI Agents tab with "metrics unknown"
 			// rather than dropping it entirely.
 			usage = &cliAgentUsage{
-				Provider:    parser.Provider(),
+				CliAgentID:  agent.ID,
+				Provider:    provider,
 				Name:        entry.Name,
 				Version:     entry.Version,
 				Path:        entry.Path,
 				CollectedAt: now.UTC().Format(time.RFC3339),
 			}
 		}
+		if usage.CliAgentID == "" {
+			usage.CliAgentID = agent.ID
+		}
 		if usage.AccountFingerprint == "" {
-			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(parser.Provider(), host, entry)
+			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}
 		out = append(out, *usage)
 	}
@@ -210,34 +228,49 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 	}
 	now := time.Now()
 
+	parsers := cliAgentUsageParserIndex()
 	out := make([]cliAgentUsage, 0, len(detected))
 	var errs []cliAgentUsageError
 
-	for _, parser := range cliAgentUsageRegistry() {
-		entry, ok := detected[parser.Provider()]
+	for _, agent := range activeCLIAgentCatalog() {
+		if !cliAgentCatalogSupportsUtilization(agent) {
+			continue
+		}
+		entry, ok := detected[agent.ID]
 		if !ok || !entry.Detected {
 			continue
 		}
+		parser := parsers[cliAgentCatalogParserKey(agent)]
+		provider := agent.ID
 		// Each provider parser runs under defer-recover so a panic in one
 		// parser cannot orphan the in-flight marker on the server side.
 		// The recovered failure becomes an explicit error entry and the
 		// provider is omitted from the success slice.
-		usage, errEntry := runProviderParseSafely(gatherCtx, parser, home, entry, now)
-		if errEntry != nil {
-			errs = append(errs, *errEntry)
-			continue
+		var usage *cliAgentUsage
+		if parser != nil {
+			provider = parser.Provider()
+			var errEntry *cliAgentUsageError
+			usage, errEntry = runProviderParseSafely(gatherCtx, parser, home, entry, now)
+			if errEntry != nil {
+				errs = append(errs, *errEntry)
+				continue
+			}
 		}
 		if usage == nil {
 			usage = &cliAgentUsage{
-				Provider:    parser.Provider(),
+				CliAgentID:  agent.ID,
+				Provider:    provider,
 				Name:        entry.Name,
 				Version:     entry.Version,
 				Path:        entry.Path,
 				CollectedAt: now.UTC().Format(time.RFC3339),
 			}
 		}
+		if usage.CliAgentID == "" {
+			usage.CliAgentID = agent.ID
+		}
 		if usage.AccountFingerprint == "" {
-			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(parser.Provider(), host, entry)
+			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}
 		out = append(out, *usage)
 	}

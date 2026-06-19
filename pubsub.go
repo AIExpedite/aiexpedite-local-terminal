@@ -47,6 +47,11 @@ const (
 	colorBlue    = "\033[34m" // Info/metadata
 )
 
+const (
+	maxPubSubCommandMessageBytes = 1024 * 1024
+	maxPubSubCatalogMessageBytes = maxOIDCTokenResponseBytes
+)
+
 // colorPrefix wraps a prefix with color codes for console output
 func colorPrefix(prefix, color string) string {
 	return color + prefix + colorReset
@@ -414,7 +419,7 @@ func isSigFailRateLimited() bool {
    -------------------------------------------------------------------------- */
 
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
-// Field order must match: id, command, args, ts, type, sessionID, input, signal, refreshId
+// Field order must match: id, command, args, ts, type, sessionID, input, signal, refreshId, cliAgentCatalog
 //
 // refreshId is signed so an adversary that can alter a signed
 // __cli_usage_refresh__ command cannot swap the correlation id without
@@ -430,15 +435,16 @@ func isSigFailRateLimited() bool {
 // still matches. Only the new __cli_usage_refresh__ command carries the
 // field, and both ends include it.
 type signaturePayload struct {
-	ID        string   `json:"id"`
-	Command   string   `json:"command"`
-	Args      []string `json:"args"`
-	Ts        int64    `json:"ts"`
-	Type      string   `json:"type"`
-	SessionID string   `json:"sessionID"`
-	Input     string   `json:"input"`
-	Signal    string   `json:"signal"`
-	RefreshID string   `json:"refreshId,omitempty"`
+	ID              string          `json:"id"`
+	Command         string          `json:"command"`
+	Args            []string        `json:"args"`
+	Ts              int64           `json:"ts"`
+	Type            string          `json:"type"`
+	SessionID       string          `json:"sessionID"`
+	Input           string          `json:"input"`
+	Signal          string          `json:"signal"`
+	RefreshID       string          `json:"refreshId,omitempty"`
+	CliAgentCatalog json.RawMessage `json:"cliAgentCatalog,omitempty"`
 }
 
 // verifySignature verifies the HMAC-SHA256 signature of a command
@@ -452,15 +458,16 @@ func verifySignature(cmd commandMsg, secret string) bool {
 	}
 
 	payload := signaturePayload{
-		ID:        cmd.ID,
-		Command:   cmd.Command,
-		Args:      args,
-		Ts:        cmd.Ts,
-		Type:      cmd.Type,
-		SessionID: cmd.SessionID,
-		Input:     cmd.Input,
-		Signal:    cmd.Signal,
-		RefreshID: cmd.RefreshID,
+		ID:              cmd.ID,
+		Command:         cmd.Command,
+		Args:            args,
+		Ts:              cmd.Ts,
+		Type:            cmd.Type,
+		SessionID:       cmd.SessionID,
+		Input:           cmd.Input,
+		Signal:          cmd.Signal,
+		RefreshID:       cmd.RefreshID,
+		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
 	}
 
 	// Use json.NewEncoder with SetEscapeHTML(false) to match Node.js JSON.stringify behavior.
@@ -484,6 +491,23 @@ func verifySignature(cmd commandMsg, secret string) bool {
 	return hmac.Equal([]byte(expectedSig), []byte(cmd.Signature))
 }
 
+func cliAgentCatalogSignatureJSON(cmd commandMsg) json.RawMessage {
+	if len(cmd.rawCliAgentCatalog) > 0 {
+		return append(json.RawMessage(nil), cmd.rawCliAgentCatalog...)
+	}
+	if cmd.CliAgentCatalog == nil {
+		return nil
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(cmd.CliAgentCatalog); err != nil {
+		return nil
+	}
+	return append(json.RawMessage(nil), bytes.TrimRight(buf.Bytes(), "\n")...)
+}
+
 // argsToJSON converts args slice to JSON array string
 func argsToJSON(args []string) string {
 	if args == nil || len(args) == 0 {
@@ -494,6 +518,17 @@ func argsToJSON(args []string) string {
 		return "[]"
 	}
 	return string(bytes)
+}
+
+func pubSubMessageSizeLimit(cmd commandMsg) int {
+	if cmd.Command == "__cli_usage_refresh__" {
+		return maxPubSubCatalogMessageBytes
+	}
+	return maxPubSubCommandMessageBytes
+}
+
+func commandPayloadTooLargeMessage(sizeBytes, limitBytes int) string {
+	return fmt.Sprintf("Command rejected: payload size %d bytes exceeds %d byte limit", sizeBytes, limitBytes)
 }
 
 /* Incoming command payload (matches backend publishCommand struct) */
@@ -512,12 +547,37 @@ type commandMsg struct {
 	// can echo it back. Stored as `cliUsageInFlightRefreshId` on the agent doc;
 	// stale results (mismatched refreshId) are dropped by the results subscriber.
 	RefreshID string `json:"refreshId,omitempty"`
+	// Optional database-backed CLI-agent catalog. When included, it is signed
+	// with the command payload and applied before usage probing.
+	CliAgentCatalog []cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
 
 	// Session fields (for interactive CLI agent sessions)
 	Type      string `json:"type,omitempty"`      // "execute"|"session_start"|"session_input"|"session_signal"|"session_end"|"codex_appserver_start"|"codex_appserver_send"|"codex_appserver_end"|"grok_acp_start"|"grok_acp_send"|"grok_acp_end"
 	SessionID string `json:"sessionID,omitempty"` // Unique session identifier
 	Input     string `json:"input,omitempty"`     // stdin text for session_input; raw JSON-RPC frame for codex_appserver_send / grok_acp_send
 	Signal    string `json:"signal,omitempty"`    // "interrupt"|"kill" for session_signal
+
+	rawCliAgentCatalog json.RawMessage
+}
+
+func (cmd *commandMsg) UnmarshalJSON(data []byte) error {
+	type commandMsgJSON commandMsg
+	var decoded commandMsgJSON
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*cmd = commandMsg(decoded)
+
+	var raw struct {
+		CliAgentCatalog json.RawMessage `json:"cliAgentCatalog"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if len(raw.CliAgentCatalog) > 0 {
+		cmd.rawCliAgentCatalog = append(json.RawMessage(nil), raw.CliAgentCatalog...)
+	}
+	return nil
 }
 
 /* Outgoing result payload (matches backend publishResult struct) */
@@ -737,25 +797,11 @@ func StartPubSubLoop(cfg *Config) {
 // redelivers the command and the backend's in-flight marker isn't left
 // stuck waiting for a result that will never arrive.
 func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) (publishErr error) {
-	refreshID := cmd.RefreshID
+	persistCLIAgentCatalogUpdate(cfg, cmd.CliAgentCatalog, "pubsub", "refresh command")
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("%s[pubsub] panic in CLI usage refresh handler: %v%s\n", colorRed, r, colorReset)
-			failure := false
-			res := resultMsg{
-				ID:          cmd.ID,
-				WorkspaceID: cmd.WorkspaceID,
-				UID:         cmd.UID,
-				AgentID:     cfg.AgentID,
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "__cli_usage_refresh_result__",
-				RefreshID:   refreshID,
-				Success:     &failure,
-				Errors: []cliAgentUsageError{
-					{Provider: "_dispatch", Message: fmt.Sprintf("panic: %v", r)},
-				},
-			}
+			res := makeCLIUsageRefreshFailureResult(cmd, cfg, fmt.Sprintf("panic: %v", r))
 			if err := publishMsg(ctx, topic, res); err != nil {
 				fmt.Printf("%s[pubsub] Failed to publish panic refresh result: %v%s\n", colorRed, err, colorReset)
 				publishErr = err
@@ -797,7 +843,7 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
 		Type:        "__cli_usage_refresh_result__",
-		RefreshID:   refreshID,
+		RefreshID:   cmd.RefreshID,
 		Success:     &success,
 		CliAgents:   usage,
 		Errors:      errs,
@@ -807,6 +853,33 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 		return err
 	}
 	return nil
+}
+
+func makeCLIUsageRefreshFailureResult(cmd commandMsg, cfg *Config, message string) resultMsg {
+	failure := false
+	agentID := cmd.AgentID
+	if cfg != nil && cfg.AgentID != "" {
+		agentID = cfg.AgentID
+	}
+	return resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		AgentID:     agentID,
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "__cli_usage_refresh_result__",
+		RefreshID:   cmd.RefreshID,
+		Success:     &failure,
+		Errors: []cliAgentUsageError{
+			{Provider: "_dispatch", Message: message},
+		},
+	}
+}
+
+func publishCLIUsageRefreshFailure(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config, message string) error {
+	fmt.Printf("%s[pubsub] CLI usage refresh rejected: %s%s\n", colorRed, message, colorReset)
+	return publishMsg(ctx, topic, makeCLIUsageRefreshFailureResult(cmd, cfg, message))
 }
 
 // publishMsg marshals res and publishes it on topic using ctx.
@@ -920,8 +993,8 @@ func runPubSubConnection(cfg *Config) error {
 			}
 		}()
 
-		// Reject oversized messages before parsing as a defense against memory
-		// exhaustion from malformed or unexpectedly large Pub/Sub messages.
+		// Reject oversized messages as a defense against memory exhaustion from
+		// malformed or unexpectedly large Pub/Sub messages.
 		//
 		// Sized to accommodate large positional args — specifically the
 		// kickoff-brief pattern in ai-service's TerminalWithFeatureDetailsTool,
@@ -930,14 +1003,18 @@ func runPubSubConnection(cfg *Config) error {
 		// AI paraphrasing. Briefs over ~78 KB were previously silently dropped
 		// here and stranded the session at status=starting forever.
 		//
-		// 1 MB matches the next natural ceiling — Firestore's per-document cap,
-		// which terminal-service hits when it writes args onto the
-		// terminalSession doc. If something ever exceeds 1 MB the Firestore
-		// write will throw a clear error instead of the silent pubsub drop.
-		// Pub/Sub itself allows up to 10 MB, so this is well within transport
-		// limits.
-		const maxMessageSize = 1024 * 1024 // 1 MB
-		if len(m.Data) > maxMessageSize {
+		// 1 MB matches the next natural ceiling for normal commands:
+		// Firestore's per-document cap, which terminal-service hits when it
+		// writes args onto the terminalSession doc. If something ever exceeds
+		// 1 MB the Firestore write will throw a clear error instead of the
+		// silent pubsub drop.
+		//
+		// CLI usage refresh commands can carry the database-backed catalog and
+		// do not write args to terminalSession, so they share the larger bounded
+		// catalog cap used by /auth/token. Anything beyond that cap is rejected
+		// before normal processing, with a refresh failure result when possible
+		// so the backend's in-flight marker is not orphaned.
+		if len(m.Data) > maxPubSubCatalogMessageBytes {
 			fmt.Printf("%s[aiexpedite] Oversized message rejected (%d bytes)%s\n",
 				colorRed, len(m.Data), colorReset)
 
@@ -949,14 +1026,23 @@ func runPubSubConnection(cfg *Config) error {
 			//
 			// Best-effort parse: pubsub already caps payloads at 10 MB,
 			// so the memory cost of unmarshaling a rejected message is
-			// bounded. If the JSON is malformed OR there's no sessionID
-			// to attribute the failure to, fall through to the bare ack
-			// (we have nothing to fail).
+			// bounded. If the JSON is malformed, or if the command is neither
+			// a refresh nor session-routed command, fall through to the bare
+			// ack because we have nothing to fail.
 			var cmd commandMsg
-			if err := json.Unmarshal(m.Data, &cmd); err == nil && cmd.SessionID != "" {
-				publishSessionError(ctx, topic, cmd,
-					fmt.Sprintf("Command rejected: payload size %d bytes exceeds %d byte limit",
-						len(m.Data), maxMessageSize))
+			if err := json.Unmarshal(m.Data, &cmd); err == nil {
+				message := commandPayloadTooLargeMessage(len(m.Data), maxPubSubCatalogMessageBytes)
+				if cmd.Command == "__cli_usage_refresh__" {
+					if err := publishCLIUsageRefreshFailure(ctx, topic, cmd, cfg, message); err != nil {
+						m.Nack()
+					} else {
+						m.Ack()
+					}
+					return
+				}
+				if cmd.SessionID != "" {
+					publishSessionError(ctx, topic, cmd, message)
+				}
 			}
 
 			m.Ack() // Ack so it isn't redelivered forever
@@ -967,7 +1053,30 @@ func runPubSubConnection(cfg *Config) error {
 		var cmd commandMsg
 		if err := json.Unmarshal(m.Data, &cmd); err != nil {
 			fmt.Printf("%s[aiexpedite] Bad command payload: %v%s\n", colorRed, err, colorReset)
+			if len(m.Data) > maxPubSubCommandMessageBytes {
+				m.Ack()
+				return
+			}
 			m.Nack()
+			return
+		}
+		if messageSizeLimit := pubSubMessageSizeLimit(cmd); len(m.Data) > messageSizeLimit {
+			fmt.Printf("%s[aiexpedite] Oversized message rejected (%d bytes)%s\n",
+				colorRed, len(m.Data), colorReset)
+
+			message := commandPayloadTooLargeMessage(len(m.Data), messageSizeLimit)
+			if cmd.Command == "__cli_usage_refresh__" {
+				if err := publishCLIUsageRefreshFailure(ctx, topic, cmd, cfg, message); err != nil {
+					m.Nack()
+				} else {
+					m.Ack()
+				}
+				return
+			}
+			if cmd.SessionID != "" {
+				publishSessionError(ctx, topic, cmd, message)
+			}
+			m.Ack()
 			return
 		}
 

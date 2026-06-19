@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"reflect"
+	"sync"
 	"sync/atomic"
 )
 
@@ -113,9 +115,52 @@ type Config struct {
 	// rate-limit metrics fresh from interactive usage). Off by default — the
 	// hook installs on startup, preserving any existing status line by chaining.
 	DisableClaudeStatusLineHook bool `json:"disable_claude_status_line_hook,omitempty"`
+
+	/* ─── CLI-agent catalog ───────────────────────────── */
+	// CliAgentCatalog is the backend-provided projection of the Firestore
+	// cliAgent collection. When present it replaces the built-in fallback list
+	// for detection and utilization, allowing new CLI agents to appear without
+	// a local terminal code change.
+	CliAgentCatalog   []cliAgentCatalogEntry `json:"-"`
+	cliAgentCatalogMu sync.RWMutex
 }
 
 /* -------------------------------------------------------------------------- */
+
+type configJSON Config
+
+func (cfg *Config) MarshalJSON() ([]byte, error) {
+	type configWithCatalog struct {
+		*configJSON
+		CliAgentCatalog *[]cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
+	}
+
+	out := configWithCatalog{configJSON: (*configJSON)(cfg)}
+	if catalog := cfg.cliAgentCatalogSnapshot(); catalog != nil {
+		out.CliAgentCatalog = &catalog
+	}
+	return json.Marshal(out)
+}
+
+func (cfg *Config) UnmarshalJSON(data []byte) error {
+	type configWithCatalog struct {
+		*configJSON
+		CliAgentCatalog *[]cliAgentCatalogEntry `json:"cliAgentCatalog"`
+	}
+
+	in := configWithCatalog{configJSON: (*configJSON)(cfg)}
+	if err := json.Unmarshal(data, &in); err != nil {
+		return err
+	}
+	cfg.cliAgentCatalogMu.Lock()
+	if in.CliAgentCatalog != nil {
+		cfg.CliAgentCatalog = cloneCLIAgentCatalog(*in.CliAgentCatalog)
+	} else {
+		cfg.CliAgentCatalog = nil
+	}
+	cfg.cliAgentCatalogMu.Unlock()
+	return nil
+}
 
 func LoadConfig(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
@@ -135,11 +180,33 @@ func LoadConfig(path string) (*Config, error) {
 	if cfg.SkippedVersion != "" && !isValidSemver(cfg.SkippedVersion) {
 		cfg.SkippedVersion = ""
 	}
+	SetCLIAgentCatalog(cfg.cliAgentCatalogSnapshot())
 	// Mirror the persisted AllowAllCommands bool into the atomic so the
 	// first Pub/Sub Receive callback (which reads via IsAllowAllCommands)
 	// sees the same value the user toggled in a previous session.
 	cfg.allowAllRuntime.Store(cfg.AllowAllCommands)
 	return cfg, nil
+}
+
+func (cfg *Config) UpdateCLIAgentCatalog(entries []cliAgentCatalogEntry) bool {
+	if entries == nil {
+		return false
+	}
+	normalized := normalizeCLIAgentCatalog(entries)
+
+	cfg.cliAgentCatalogMu.Lock()
+	changed := !reflect.DeepEqual(cfg.CliAgentCatalog, normalized)
+	cfg.CliAgentCatalog = cloneCLIAgentCatalog(normalized)
+	cfg.cliAgentCatalogMu.Unlock()
+
+	SetCLIAgentCatalog(normalized)
+	return changed
+}
+
+func (cfg *Config) cliAgentCatalogSnapshot() []cliAgentCatalogEntry {
+	cfg.cliAgentCatalogMu.RLock()
+	defer cfg.cliAgentCatalogMu.RUnlock()
+	return cloneCLIAgentCatalog(cfg.CliAgentCatalog)
 }
 
 // IsAllowAllCommands returns the live AllowAllCommands flag using an

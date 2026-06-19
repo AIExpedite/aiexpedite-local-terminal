@@ -71,7 +71,7 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 
 	usage := &cliAgentUsage{
 		Provider:    p.Provider(),
-		Name:        firstNonEmpty(detected.Name, "Grok"),
+		Name:        firstNonEmpty(detected.Name, "Grok Build"),
 		Version:     detected.Version,
 		Path:        detected.Path,
 		DataSource:  dataSource,

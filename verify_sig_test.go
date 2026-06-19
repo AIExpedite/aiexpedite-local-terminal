@@ -204,6 +204,28 @@ func TestSignatureMatchWithRefreshId(t *testing.T) {
 	}
 }
 
+func TestVerifySignaturePreservesRawCLIAgentCatalogBytes(t *testing.T) {
+	secret := "test-secret-for-unit-test"
+	catalogJSON := `[{"id":"grok","displayName":"Grok Build","command":"grok","backendOnly":{"beta":true,"weight":7},"detectionKeys":["grokBuild","grok"]}]`
+	canonical := `{"id":"refresh-raw","command":"__cli_usage_refresh__","args":[],"ts":1234567890,"type":"","sessionID":"","input":"","signal":"","refreshId":"rid-raw","cliAgentCatalog":` + catalogJSON + `}`
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(canonical))
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	messageJSON := `{"id":"refresh-raw","command":"__cli_usage_refresh__","args":[],"ts":1234567890,"refreshId":"rid-raw","cliAgentCatalog":` + catalogJSON + `,"signature":"` + sig + `"}`
+	var cmd commandMsg
+	if err := json.Unmarshal([]byte(messageJSON), &cmd); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if string(cmd.rawCliAgentCatalog) != catalogJSON {
+		t.Fatalf("raw catalog mismatch\nwant: %s\n got: %s", catalogJSON, string(cmd.rawCliAgentCatalog))
+	}
+	if !verifySignature(cmd, secret) {
+		t.Fatalf("verifySignature should use raw cliAgentCatalog JSON bytes")
+	}
+}
+
 // TestVerifySignatureBackwardCompatLegacyProducer simulates the agent/service
 // upgrade window: a producer that signed without refreshId at all (the
 // pre-refreshId canonical shape) must still verify on the new agent for

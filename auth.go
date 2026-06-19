@@ -25,6 +25,23 @@ import (
 // http.DefaultClient has no timeout and can hang indefinitely on slow endpoints.
 var authHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
+const maxOIDCTokenResponseBytes = 2 * 1024 * 1024
+
+var refreshMachineInfoAfterCatalogUpdate = func() {
+	go RefreshMachineInfoNow()
+}
+
+func persistCLIAgentCatalogUpdate(cfg *Config, entries []cliAgentCatalogEntry, logScope, source string) bool {
+	if cfg == nil || !cfg.UpdateCLIAgentCatalog(entries) {
+		return false
+	}
+	if err := cfg.Save(ConfigPath()); err != nil {
+		fmt.Printf("%s[%s] Failed to persist CLI-agent catalog from %s: %v%s\n", colorYellow, logScope, source, err, colorReset)
+	}
+	refreshMachineInfoAfterCatalogUpdate()
+	return true
+}
+
 /* --------------------------------------------------------------------------
    WIF Token Source - Implements oauth2.TokenSource for GCP authentication
    -------------------------------------------------------------------------- */
@@ -121,11 +138,12 @@ func (ts *WIFTokenSource) Token() (*oauth2.Token, error) {
 
 // oidcTokenResponse is the response from POST /auth/token
 type oidcTokenResponse struct {
-	IDToken   string `json:"id_token"`
-	ExpiresIn int    `json:"expires_in"`
-	TokenType string `json:"token_type"`
-	Error     string `json:"error,omitempty"`
-	ErrorDesc string `json:"error_description,omitempty"`
+	IDToken         string                 `json:"id_token"`
+	ExpiresIn       int                    `json:"expires_in"`
+	TokenType       string                 `json:"token_type"`
+	Error           string                 `json:"error,omitempty"`
+	ErrorDesc       string                 `json:"error_description,omitempty"`
+	CliAgentCatalog []cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
 }
 
 // getOIDCToken requests an OIDC ID token from our backend.
@@ -238,10 +256,14 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 	}
 	defer resp.Body.Close()
 
-	// Read response (64 KB cap — OIDC token responses are always small)
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	// Token responses can include the CLI-agent catalog, so keep a bounded but
+	// larger read window than the small STS/impersonation responses below.
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxOIDCTokenResponseBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+	if len(respBody) > maxOIDCTokenResponseBytes {
+		return "", fmt.Errorf("token response exceeds %d bytes", maxOIDCTokenResponseBytes)
 	}
 
 	var tokenResp oidcTokenResponse
@@ -256,6 +278,8 @@ func (ts *WIFTokenSource) getOIDCToken() (string, error) {
 		}
 		return "", fmt.Errorf("token request failed with status %d", resp.StatusCode)
 	}
+
+	persistCLIAgentCatalogUpdate(ts.cfg, tokenResp.CliAgentCatalog, "auth", "token response")
 
 	if tokenResp.IDToken == "" {
 		return "", fmt.Errorf("empty id_token in response")

@@ -208,6 +208,7 @@ func TestMachineInfo_JSONShape_OmitsEmpty(t *testing.T) {
 // binary name. The frontend's About-tab "CLI Tools" chips read
 // info.name || agentKey, so this is what shows in the UI.
 func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
+	SetCLIAgentCatalog(nil)
 	if runtime.GOOS == "windows" {
 		// LookPath behavior on Windows requires .exe / PATHEXT and a real
 		// loadable image. The display-name mapping is platform-agnostic,
@@ -238,7 +239,7 @@ func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
 		"codex":       "Codex",
 		"geminiCli":   "Gemini CLI",
 		"antigravity": "Antigravity",
-		"grok":        "Grok",
+		"grok":        "Grok Build",
 	}
 	for key, wantName := range wantNames {
 		entry, ok := agents[key]
@@ -269,6 +270,58 @@ func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
 	}
 }
 
+func TestGatherCLIAgents_UsesConfiguredCatalog(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PATH-shim style probe not portable to windows test runners")
+	}
+
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "future-agent")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	t.Setenv("PATH", dir)
+	SetCLIAgentCatalog([]cliAgentCatalogEntry{
+		{
+			ID:           "futureAgent",
+			DisplayName:  "Future Agent",
+			DisplayOrder: 10,
+			Command:      "future-agent",
+			DetectionKeys: []string{
+				"future",
+			},
+		},
+	})
+	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
+
+	agents := gatherCLIAgents()
+	if len(agents) != 1 {
+		t.Fatalf("expected exactly the configured catalog agent, got %d: %#v", len(agents), agents)
+	}
+	entry, ok := agents["futureAgent"]
+	if !ok {
+		t.Fatalf("missing configured catalog id; got %#v", agents)
+	}
+	if entry.Name != "Future Agent" {
+		t.Errorf("Name=%q, want Future Agent", entry.Name)
+	}
+	if entry.Path != stub {
+		t.Errorf("Path=%q, want %q", entry.Path, stub)
+	}
+}
+
+func TestGatherCLIAgents_DoesNotFallbackWhenConfiguredCatalogNormalizesEmpty(t *testing.T) {
+	disabled := false
+	SetCLIAgentCatalog([]cliAgentCatalogEntry{
+		{ID: "hiddenAgent", DisplayName: "Hidden Agent", Command: "hidden-agent", Enabled: &disabled},
+	})
+	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
+
+	if agents := gatherCLIAgents(); len(agents) != 0 {
+		t.Fatalf("expected configured disabled catalog to suppress fallback agents, got %#v", agents)
+	}
+}
+
 // TestGatherCLIAgents_DetectsGrokInInstallerBin pins the macOS-GUI/launchd
 // fallback: the official Grok installer drops the binary in $HOME/.grok/bin
 // and only edits shell rc files. A launchd-spawned agent process inherits a
@@ -276,6 +329,7 @@ func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
 // Grok missing. The detection must fall back to the installer's bin dir
 // when PATH lookup misses.
 func TestGatherCLIAgents_DetectsGrokInInstallerBin(t *testing.T) {
+	SetCLIAgentCatalog(nil)
 	if runtime.GOOS == "windows" {
 		// LookPath + .exe semantics differ enough on Windows that the cross-
 		// platform invariant is better covered on unix CI.
@@ -309,8 +363,8 @@ func TestGatherCLIAgents_DetectsGrokInInstallerBin(t *testing.T) {
 	if entry.Path != stub {
 		t.Errorf("grok entry: Path=%q, want %q", entry.Path, stub)
 	}
-	if entry.Name != "Grok" {
-		t.Errorf("grok entry: Name=%q, want %q", entry.Name, "Grok")
+	if entry.Name != "Grok Build" {
+		t.Errorf("grok entry: Name=%q, want %q", entry.Name, "Grok Build")
 	}
 }
 
@@ -318,6 +372,7 @@ func TestGatherCLIAgents_DetectsGrokInInstallerBin(t *testing.T) {
 // (the same override the installer itself reads) takes precedence over the
 // $HOME/.grok/bin default — for users who installed Grok to a custom prefix.
 func TestGatherCLIAgents_GrokBinDirEnvOverridesHome(t *testing.T) {
+	SetCLIAgentCatalog(nil)
 	if runtime.GOOS == "windows" {
 		t.Skip("installer-bin fallback covered on unix")
 	}

@@ -83,3 +83,12 @@ func cliAgentUsageRegistry() []cliAgentUsageParser {
 		&grokUsageParser{},
 	}
 }
+
+func cliAgentUsageParserIndex() map[string]cliAgentUsageParser {
+	parsers := cliAgentUsageRegistry()
+	out := make(map[string]cliAgentUsageParser, len(parsers))
+	for _, parser := range parsers {
+		out[parser.Provider()] = parser
+	}
+	return out
+}
