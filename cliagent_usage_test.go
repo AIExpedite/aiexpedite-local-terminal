@@ -274,16 +274,31 @@ func codexRateLimitFrame(primaryPct, secondaryPct float64, now time.Time) map[st
 	}
 }
 
+// helperCodexAuthAt writes auth.json for email and stamps its mtime to loginAt —
+// the account-login watermark the rollout scope guard compares each session's
+// start time against. Default rollout session timestamps are 2026-06-19T11:00Z,
+// so a login earlier that day keeps them in scope.
+func helperCodexAuthAt(t *testing.T, codexHome, email string, loginAt time.Time) {
+	t.Helper()
+	authPath := filepath.Join(codexHome, "auth.json")
+	helperWriteJSON(t, authPath, map[string]any{"email": email})
+	if err := os.Chtimes(authPath, loginAt, loginAt); err != nil {
+		t.Fatalf("chtimes auth: %v", err)
+	}
+}
+
+// codexTestLogin is a fixed account-login watermark before the default rollout
+// session timestamps, so the scope guard is deterministic regardless of when the
+// suite runs (auth.json would otherwise carry the real wall-clock mtime).
+var codexTestLogin = time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC)
+
 // When no live app-server frame has been captured, the parser should backfill
 // both windows from Codex's own rollout logs (the TUI-only path).
 func TestCodexUsageParser_BackfillsFromRolloutLogs(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
-	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{
-		"email": "carol@example.com",
-		"plan":  "pro",
-	})
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
 
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-aaaa", []map[string]any{
@@ -313,10 +328,7 @@ func TestCodexUsageParser_RolloutOnlyFillsUnknownWindows(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
-	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{
-		"email": "carol@example.com",
-		"plan":  "pro",
-	})
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
 
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	fp := fingerprintAccount("codex", "carol@example.com")
@@ -349,9 +361,7 @@ func TestCodexUsageParser_RolloutPrefersLastPopulatedFrame(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
-	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{
-		"email": "carol@example.com",
-	})
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
 
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-cccc", []map[string]any{
@@ -370,31 +380,26 @@ func TestCodexUsageParser_RolloutPrefersLastPopulatedFrame(t *testing.T) {
 	}
 }
 
-// A rollout log written before the current auth.json (i.e. by a previously
-// signed-in account that shared this CODEX_HOME) must NOT backfill the new
-// account's windows — that would leak the prior account's quota.
-func TestCodexUsageParser_RolloutRejectsPreLoginLogs(t *testing.T) {
+// A previous account's session that STARTED before the new account's login —
+// but kept being appended afterward, so its file mtime is recent — must NOT
+// backfill the new account's windows. Scoping by session start (not file mtime)
+// is what closes this shared-CODEX_HOME bleed.
+func TestCodexUsageParser_RolloutScopesBySessionStartNotMtime(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
 
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
-	// Rollout produced by the previous account.
-	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-old", []map[string]any{
-		codexRateLimitFrame(80, 70, now),
-	})
-	oldLog := filepath.Join(codexHome, "sessions", "2026", "06", "19", "rollout-2026-06-19T11-00-00-old.jsonl")
-	past := time.Date(2026, 6, 18, 9, 0, 0, 0, time.UTC)
-	if err := os.Chtimes(oldLog, past, past); err != nil {
+	// Prior account's session started at 08:00 — before the 10:00 login below.
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T08-00-00-prior", "2026-06-19T08:00:00.000Z",
+		[]map[string]any{codexRateLimitFrame(80, 70, now)})
+	// …but it's still running, so its file mtime is recent (after the login).
+	priorLog := filepath.Join(codexHome, "sessions", "2026", "06", "19", "rollout-2026-06-19T08-00-00-prior.jsonl")
+	if err := os.Chtimes(priorLog, now, now); err != nil {
 		t.Fatalf("chtimes rollout: %v", err)
 	}
-	// New account signs in AFTER that log was written.
-	authPath := filepath.Join(codexHome, "auth.json")
-	helperWriteJSON(t, authPath, map[string]any{"email": "newuser@example.com"})
-	login := time.Date(2026, 6, 19, 10, 0, 0, 0, time.UTC)
-	if err := os.Chtimes(authPath, login, login); err != nil {
-		t.Fatalf("chtimes auth: %v", err)
-	}
+	// New account logs in at 10:00, after the prior session started.
+	helperCodexAuthAt(t, codexHome, "newuser@example.com", time.Date(2026, 6, 19, 10, 0, 0, 0, time.UTC))
 
 	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
 	if !ok {
@@ -402,7 +407,7 @@ func TestCodexUsageParser_RolloutRejectsPreLoginLogs(t *testing.T) {
 	}
 	for _, m := range usage.Metrics {
 		if !m.Unknown {
-			t.Errorf("metric %q=%+v should stay Unknown; pre-login rollout must not backfill", m.Kind, m)
+			t.Errorf("metric %q=%+v should stay Unknown; a pre-login session (recent mtime) must not backfill", m.Kind, m)
 		}
 	}
 }
@@ -415,7 +420,8 @@ func TestCodexUsageParser_RolloutAnchorsRelativeResetToEventTime(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
-	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{"email": "carol@example.com"})
+	// Login before the historical session's 2026-06-15 start so it stays in scope.
+	helperCodexAuthAt(t, codexHome, "carol@example.com", time.Date(2026, 6, 15, 9, 0, 0, 0, time.UTC))
 
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	// Emitted 4 days before `now` with a relative reset only 1h out → expired
@@ -448,7 +454,7 @@ func TestCodexUsageParser_RolloutMergesSparseFrames(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
-	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{"email": "carol@example.com"})
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
 
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-sparse", []map[string]any{
@@ -477,7 +483,7 @@ func TestCodexUsageParser_RolloutAcceptsCamelCaseFrames(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
-	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{"email": "carol@example.com"})
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
 
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	dir := filepath.Join(codexHome, "sessions", "2026", "06", "19")
@@ -521,7 +527,7 @@ func TestCodexUsageParser_RolloutAccumulatesAcrossFiles(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
-	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{"email": "carol@example.com"})
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
 
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	// Older log carries both windows.
@@ -547,12 +553,13 @@ func TestCodexUsageParser_RolloutAccumulatesAcrossFiles(t *testing.T) {
 }
 
 // A reset-only sparse frame that jumps to a NEW window must not carry the prior
-// window's usage onto the fresh reset — report rolled-over (0%) instead.
+// window's usage onto the fresh reset — drop the stale reading so the window is
+// reported Unknown rather than the old percentage.
 func TestCodexUsageParser_RolloutResetOnlyNewWindowDropsStaleUsage(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
-	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{"email": "carol@example.com"})
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
 
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-rollover", []map[string]any{
@@ -567,8 +574,40 @@ func TestCodexUsageParser_RolloutResetOnlyNewWindowDropsStaleUsage(t *testing.T)
 		t.Fatalf("expected usage")
 	}
 	session := usage.Metrics[0]
-	if session.Consumed == nil || *session.Consumed != 0 {
-		t.Errorf("session Consumed=%v, want 0 (stale usage not carried into new window)", session.Consumed)
+	if !session.Unknown {
+		t.Errorf("session=%+v, want Unknown (stale usage dropped on new-window reset)", session)
+	}
+}
+
+// A standalone reset-only frame (no usage to anchor it) must not be reported as
+// observed 0% — it must leave the window open so an older log can fill the real
+// usage.
+func TestCodexUsageParser_RolloutIgnoresStandaloneResetOnlyFrame(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Newest log: only a reset-only primary frame (no usage).
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T11-30-00-resetonly", "2026-06-19T11:30:00.000Z",
+		[]map[string]any{
+			{"primary": map[string]any{"window_minutes": 300.0, "resets_at": float64(now.Add(time.Hour).Unix())}},
+		})
+	// Older log: real usage for both windows.
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T10-00-00-real", "2026-06-19T10:00:00.000Z",
+		[]map[string]any{codexRateLimitFrame(22, 44, now)})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Unknown || session.Consumed == nil || *session.Consumed != 22 {
+		t.Errorf("session=%+v, want 22 from the older real-usage log", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 44 {
+		t.Errorf("weekly=%+v, want 44 from the older real-usage log", weekly)
 	}
 }
 
