@@ -54,9 +54,13 @@ func TestCaptureCodexRateLimit_AcceptsAliasesAndWindowMinutes(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	// Pair window_minutes with a real resets_in_seconds — window_minutes is the
+	// window LENGTH, not a time-until-reset, so the bucket must rely on the
+	// explicit reset field for ResetsAtMs and keep window_minutes only for
+	// labelling.
 	line := `{"method":"token_count","params":{"rate_limits":{` +
-		`"5h":{"used_percent":12,"window_minutes":300},` +
-		`"7d":{"used_percent":50,"window_minutes":10080}` +
+		`"5h":{"used_percent":12,"window_minutes":300,"resets_in_seconds":1800},` +
+		`"7d":{"used_percent":50,"window_minutes":10080,"resets_in_seconds":86400}` +
 		`}}}`
 
 	captureCodexRateLimitLine(line, now)
@@ -68,13 +72,152 @@ func TestCaptureCodexRateLimit_AcceptsAliasesAndWindowMinutes(t *testing.T) {
 	if !ok || p.UsedPercentage != 12 {
 		t.Fatalf("5h alias did not normalise to primary bucket: %+v", snap.Buckets)
 	}
-	wantPrimaryReset := now.Add(300 * time.Minute).UnixMilli()
+	wantPrimaryReset := now.Add(1800 * time.Second).UnixMilli()
 	if p.ResetsAtMs != wantPrimaryReset {
-		t.Errorf("primary ResetsAtMs from window_minutes=%d, want %d", p.ResetsAtMs, wantPrimaryReset)
+		t.Errorf("primary ResetsAtMs from resets_in_seconds=%d, want %d", p.ResetsAtMs, wantPrimaryReset)
+	}
+	if p.WindowMinutes != 300 {
+		t.Errorf("primary WindowMinutes=%v, want 300 (kept for labelling)", p.WindowMinutes)
 	}
 	s, ok := snap.Buckets[codexWindowSecondary]
 	if !ok || s.UsedPercentage != 50 {
 		t.Fatalf("7d alias did not normalise to secondary bucket: %+v", snap.Buckets)
+	}
+}
+
+// window_minutes is the documented rolling-window LENGTH, not a time-until-reset
+// hint. When a Codex frame includes used_percent + window_minutes but omits a
+// real resetsAt/resets_in_seconds, the bucket must keep window_minutes for
+// labelling and leave ResetsAtMs unknown — otherwise a sparse update with no
+// real reset field would overwrite a previously correct reset with one
+// hours/days too late, and a brand-new window would render with a fabricated
+// reset that has nothing to do with when the quota actually rolls over.
+func TestCaptureCodexRateLimit_WindowMinutesAloneLeavesResetUnknown(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// 1. Seed a live primary window with a real reset 1h out, then send a
+	//    follow-up with used_percent + window_minutes but no real reset. The
+	//    cached reset must be preserved; window_minutes must NOT overwrite it
+	//    with `now + 300m` (4 hours too late).
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"primary":{"used_percent":40,"resets_in_seconds":3600}}}}`,
+		now,
+	)
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":55,"windowDurationMins":300}}}}`,
+		now,
+	)
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	p := snap.Buckets[codexWindowPrimary]
+	if got, want := p.ResetsAtMs, now.Add(time.Hour).UnixMilli(); got != want {
+		t.Errorf("after windowDurationMins-only update ResetsAtMs=%d, want preserved %d", got, want)
+	}
+	if p.UsedPercentage != 55 {
+		t.Errorf("after windowDurationMins-only update UsedPercentage=%v, want 55", p.UsedPercentage)
+	}
+	if p.WindowMinutes != 300 {
+		t.Errorf("WindowMinutes=%v, want 300 retained for labelling", p.WindowMinutes)
+	}
+
+	// 2. A first-ever observation with used_percent + window_minutes but no
+	//    real reset must persist usage and label hint, with ResetsAtMs = 0
+	//    (unknown). Otherwise the card would advertise a stale ResetAt that
+	//    has no anchor in reality.
+	cache2 := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache2)
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"primary":{"used_percent":33,"window_minutes":15}}}}`,
+		now,
+	)
+	snap2, ok := loadCodexRateLimitSnapshot(cache2)
+	if !ok {
+		t.Fatalf("expected cache (first observation)")
+	}
+	p2, ok := snap2.Buckets[codexWindowPrimary]
+	if !ok {
+		t.Fatalf("primary not persisted on first observation: %+v", snap2.Buckets)
+	}
+	if p2.UsedPercentage != 33 {
+		t.Errorf("first-obs UsedPercentage=%v, want 33", p2.UsedPercentage)
+	}
+	if p2.WindowMinutes != 15 {
+		t.Errorf("first-obs WindowMinutes=%v, want 15", p2.WindowMinutes)
+	}
+	if p2.ResetsAtMs != 0 {
+		t.Errorf("first-obs ResetsAtMs=%d, want 0 (no real reset field present)", p2.ResetsAtMs)
+	}
+}
+
+// `account/rateLimits/read` is a full snapshot: when Codex returns
+// `secondary: null`, the account has no weekly window and any previously
+// cached bucket must be cleared rather than left to render stale numbers
+// until its old reset passes. Sparse `account/rateLimits/updated` /
+// `token_count` notifications are NOT full snapshots, so a missing or null
+// window there must NOT clear the cache.
+func TestCaptureCodexRateLimit_FullReadNullClearsWindow(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed a live secondary (weekly) bucket.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"secondary":{"used_percent":40,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+	if snap, ok := loadCodexRateLimitSnapshot(cache); !ok || snap.Buckets[codexWindowSecondary].UsedPercentage != 40 {
+		t.Fatalf("seed failed: %+v", snap.Buckets)
+	}
+
+	// Full account/rateLimits/read response with secondary: null — clear it.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","id":3,"result":{"rateLimits":{"primary":{"usedPercent":10,"resetsInSeconds":1800},"secondary":null}}}`,
+		now,
+	)
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache after full read")
+	}
+	if _, present := snap.Buckets[codexWindowSecondary]; present {
+		t.Errorf("secondary bucket must be cleared by explicit null in full read response: %+v", snap.Buckets)
+	}
+	if p, ok := snap.Buckets[codexWindowPrimary]; !ok || p.UsedPercentage != 10 {
+		t.Errorf("primary update inside the same full read should still apply: %+v", snap.Buckets)
+	}
+}
+
+// A null window inside a sparse account/rateLimits/updated notification is
+// "no update for this window," not "clear the window" — clearing is only the
+// semantics of a full account/rateLimits/read response. A previously cached
+// live bucket must therefore survive.
+func TestCaptureCodexRateLimit_SparseUpdateNullDoesNotClear(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"secondary":{"used_percent":40,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"secondary":null,"primary":{"usedPercent":12,"resetsInSeconds":1800}}}}`,
+		now,
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	s, present := snap.Buckets[codexWindowSecondary]
+	if !present || s.UsedPercentage != 40 {
+		t.Errorf("sparse-update null must preserve prior secondary bucket: %+v", snap.Buckets)
+	}
+	if p, ok := snap.Buckets[codexWindowPrimary]; !ok || p.UsedPercentage != 12 {
+		t.Errorf("primary update should still apply: %+v", snap.Buckets)
 	}
 }
 
@@ -200,12 +343,12 @@ func TestCaptureCodexRateLimit_DropsStaleSnapshotOnAccountSwitch(t *testing.T) {
 
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
 		codexWindowPrimary: {UsedPercentage: 75, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
-	}, now, "fingerprint-A")
+	}, nil, now, "fingerprint-A")
 
 	// Different account writes only secondary — primary from A must be dropped.
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
 		codexWindowSecondary: {UsedPercentage: 10, ResetsAtMs: now.Add(48 * time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
-	}, now, "fingerprint-B")
+	}, nil, now, "fingerprint-B")
 
 	snap, ok := loadCodexRateLimitSnapshot(cache)
 	if !ok {
@@ -230,7 +373,7 @@ func TestCodexMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
 		codexWindowPrimary:   {UsedPercentage: 31.2, ResetsAtMs: now.Add(2 * time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
 		codexWindowSecondary: {UsedPercentage: 95, ResetsAtMs: now.Add(-time.Minute).UnixMilli(), usageKnown: true, resetKnown: true},
-	}, now, "")
+	}, nil, now, "")
 
 	metrics := codexMetricsFromCache(now, "")
 	if len(metrics) != 2 {
@@ -290,7 +433,7 @@ func TestCodexMetricsFromCache_LabelDerivedFromWindowMinutes(t *testing.T) {
 			UsedPercentage: 10, ResetsAtMs: now.Add(24 * time.Hour).UnixMilli(),
 			WindowMinutes: 1440, usageKnown: true, resetKnown: true,
 		},
-	}, now, "")
+	}, nil, now, "")
 
 	metrics := codexMetricsFromCache(now, "")
 	if got := metrics[0].Label; got != "15-minute window" {
@@ -318,7 +461,7 @@ func TestCodexMetricsFromCache_CanonicalWindowsKeepLabels(t *testing.T) {
 			UsedPercentage: 5, ResetsAtMs: now.Add(7 * 24 * time.Hour).UnixMilli(),
 			WindowMinutes: 10080, usageKnown: true, resetKnown: true,
 		},
-	}, now, "")
+	}, nil, now, "")
 
 	metrics := codexMetricsFromCache(now, "")
 	if got := metrics[0].Label; got != "5-hour session window" {
@@ -336,7 +479,7 @@ func TestCodexMetricsFromCache_FingerprintMismatchHidesSnapshot(t *testing.T) {
 
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
 		codexWindowPrimary: {UsedPercentage: 75, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
-	}, now, "fingerprint-A")
+	}, nil, now, "fingerprint-A")
 
 	metrics := codexMetricsFromCache(now, "fingerprint-B")
 	for _, m := range metrics {

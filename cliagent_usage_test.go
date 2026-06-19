@@ -150,7 +150,7 @@ func TestCodexUsageParser_PopulatesObservedMetricsFromCache(t *testing.T) {
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
 		codexWindowPrimary:   {UsedPercentage: 42, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
 		codexWindowSecondary: {UsedPercentage: 13, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
-	}, now, fp)
+	}, nil, now, fp)
 
 	usage, ok := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
 	if !ok {

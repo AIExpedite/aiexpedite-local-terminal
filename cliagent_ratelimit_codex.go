@@ -142,12 +142,14 @@ func codexBucketFromInfo(info map[string]interface{}, now time.Time) (codexRateL
 	// Always record the documented window length when present, even when an
 	// explicit reset was given — the label ("5-hour session window") is
 	// derived from this, not from the position in the rate_limits map.
+	// Note: window_minutes is the rolling window LENGTH, not the time until
+	// reset, so it must never be used to fabricate ResetsAtMs — Codex emits
+	// a real resetsAt/resets_in_seconds for that, and a sparse update without
+	// either field should leave the reset Unknown rather than overwrite a
+	// previously correct reset with one hours or days too late.
 	if v, ok := pickField(info, "window_minutes", "windowMinutes", "windowDurationMins"); ok {
 		if f, ok := numAsFloat(v); ok && f > 0 {
 			b.WindowMinutes = f
-			if b.ResetsAtMs == 0 {
-				b.ResetsAtMs = now.Add(time.Duration(f * float64(time.Minute))).UnixMilli()
-			}
 		}
 	}
 	b.usageKnown = usageObserved
@@ -165,10 +167,25 @@ func codexBucketFromInfo(info map[string]interface{}, now time.Time) (codexRateL
 // `account/rateLimits/read`), or `params.msg` (typed event envelope). Both
 // snake_case (`rate_limits`) and camelCase (`rateLimits`) are accepted so a
 // schema rename doesn't silently zero the card.
-func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) map[string]codexRateLimitBucket {
+//
+// The second return value names windows the frame explicitly cleared. A full
+// `account/rateLimits/read` response (carried under `result`) can return
+// `secondary: null` for accounts without a weekly window; that null is a
+// statement that the window does not exist, so any previously-cached bucket
+// for it must be dropped rather than left to render stale numbers until its
+// old reset time passes. Sparse `account/rateLimits/updated` / `token_count`
+// notifications under `params` are NOT full snapshots — a missing or null
+// window there means "no update for this window," not "clear it," so we
+// only honour clears that arrive via the `result` path.
+func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (map[string]codexRateLimitBucket, map[string]bool) {
 	out := map[string]codexRateLimitBucket{}
+	clears := map[string]bool{}
 
-	candidates := []map[string]interface{}{raw}
+	type candidate struct {
+		src          map[string]interface{}
+		fullSnapshot bool
+	}
+	candidates := []candidate{{src: raw, fullSnapshot: false}}
 	for _, key := range []string{"params", "result"} {
 		v, ok := raw[key]
 		if !ok {
@@ -178,18 +195,19 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) map
 		if !ok {
 			continue
 		}
-		candidates = append(candidates, m)
+		fullSnap := key == "result"
+		candidates = append(candidates, candidate{src: m, fullSnapshot: fullSnap})
 		// `params.msg` is the shape codex's app-server uses for typed event
 		// payloads.
 		if v, ok := m["msg"]; ok {
 			if mm, ok := v.(map[string]interface{}); ok {
-				candidates = append(candidates, mm)
+				candidates = append(candidates, candidate{src: mm, fullSnapshot: fullSnap})
 			}
 		}
 	}
 
-	for _, src := range candidates {
-		v, ok := pickField(src, "rate_limits", "rateLimits")
+	for _, c := range candidates {
+		v, ok := pickField(c.src, "rate_limits", "rateLimits")
 		if !ok {
 			continue
 		}
@@ -197,12 +215,18 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) map
 		if !ok {
 			continue
 		}
-		for window, v := range rl {
-			info, ok := v.(map[string]interface{})
+		for window, val := range rl {
+			id, ok := codexWindowAliases[window]
 			if !ok {
 				continue
 			}
-			id, ok := codexWindowAliases[window]
+			if val == nil {
+				if c.fullSnapshot {
+					clears[id] = true
+				}
+				continue
+			}
+			info, ok := val.(map[string]interface{})
 			if !ok {
 				continue
 			}
@@ -214,7 +238,7 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) map
 		}
 	}
 
-	return out
+	return out, clears
 }
 
 // captureCodexRateLimitLine parses one stdout line from a Codex app-server
@@ -240,20 +264,24 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
 		return
 	}
-	updates := extractCodexRateLimitBuckets(raw, now)
-	if len(updates) == 0 {
+	updates, clears := extractCodexRateLimitBuckets(raw, now)
+	if len(updates) == 0 && len(clears) == 0 {
 		return
 	}
-	mergeCodexRateLimitCache(codexRateLimitCachePath(), updates, now, currentCodexAccountFingerprint())
+	mergeCodexRateLimitCache(codexRateLimitCachePath(), updates, clears, now, currentCodexAccountFingerprint())
 }
 
 // mergeCodexRateLimitCache read-modify-writes the cache, overwriting only the
-// windows present in `updates` and leaving the rest intact. When the existing
-// snapshot was captured under a different account fingerprint, its buckets are
-// discarded — a previous account's reset times must not bleed into the new
-// account's display.
-func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBucket, now time.Time, fingerprint string) {
-	if path == "" || len(updates) == 0 {
+// windows present in `updates` and leaving the rest intact. Windows named in
+// `clears` are deleted from the cache — Codex uses `secondary: null` in a
+// full account/rateLimits/read response to mean "this window does not apply
+// to the account," so we must drop any stale bucket instead of leaving it to
+// render until its old reset passes. When the existing snapshot was captured
+// under a different account fingerprint, its buckets are discarded — a
+// previous account's reset times must not bleed into the new account's
+// display.
+func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBucket, clears map[string]bool, now time.Time, fingerprint string) {
+	if path == "" || (len(updates) == 0 && len(clears) == 0) {
 		return
 	}
 	codexRateLimitMu.Lock()
@@ -279,6 +307,14 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 	}
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]codexRateLimitBucket{}
+	}
+	// Drop windows the frame explicitly cleared (null in a full read response)
+	// before applying updates: a clear in this snapshot wins over any cached
+	// state for that window — leaving it would render stale usage/reset until
+	// the old reset passes. Updates apply afterwards so a single full snapshot
+	// that both clears one window and refreshes another behaves correctly.
+	for window := range clears {
+		delete(snap.Buckets, window)
 	}
 	nowMs := now.UnixMilli()
 	for window, bucket := range updates {
