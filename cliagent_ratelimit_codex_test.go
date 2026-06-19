@@ -562,6 +562,124 @@ func TestCaptureCodexRateLimit_MultiBucketNestedPrimarySecondary(t *testing.T) {
 	}
 }
 
+// A full `account/rateLimits/read` response can carry
+// `rateLimitsByLimitId.<limit>.secondary: null` to declare that this metered
+// limit no longer constrains the weekly window. When the snapshot has no
+// other source of secondary data (no aggregate `rateLimits` entry, no other
+// metered bucket), a previously-cached secondary must be cleared rather than
+// left to render stale usage until its old reset passes.
+func TestCaptureCodexRateLimit_MultiBucketNestedNullClearsWindow(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed a prior secondary so we can prove the null actually clears it.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowSecondary: {
+			UsedPercentage: 60,
+			ResetsAtMs:     now.Add(48 * time.Hour).UnixMilli(),
+			usageKnown:     true,
+			resetKnown:     true,
+		},
+	}, nil, now, "")
+
+	// Full snapshot: nested `codex_primary.primary` carries the primary update,
+	// but the only secondary mention is `codex_primary.secondary: null`.
+	line := `{"jsonrpc":"2.0","result":{"rateLimitsByLimitId":{` +
+		`"codex_primary":{"primary":{"usedPercent":40,"resetsInSeconds":1800,"windowDurationMins":300},"secondary":null}` +
+		`}},"id":1}`
+	captureCodexRateLimitLine(line, now.Add(time.Minute))
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if p := snap.Buckets[codexWindowPrimary]; p.UsedPercentage != 40 {
+		t.Errorf("primary UsedPercentage=%v, want 40", p.UsedPercentage)
+	}
+	if _, present := snap.Buckets[codexWindowSecondary]; present {
+		t.Errorf("secondary bucket must be cleared by nested null in full snapshot")
+	}
+}
+
+// Two metered buckets can report identical utilisation (commonly both 100%
+// exhausted) for the same window, each with its own resetsAt. The merge must
+// not silently keep whichever bucket the Go map happened to visit first — that
+// could advertise an earlier reset while another equally-exhausted bucket
+// still blocks usage. Equal-usage buckets should be merged conservatively by
+// keeping the LATER reset (or dropping the reset entirely when one is
+// unknown).
+func TestExtractCodexRateLimitBuckets_TieKeepsLaterReset(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	earlierResetMs := now.Add(30 * time.Minute).UnixMilli()
+	laterResetMs := now.Add(2 * time.Hour).UnixMilli()
+
+	// Two codex_other-style buckets at 100% on the same primary window, with
+	// different reset times. Whichever order the map iterates, the merged
+	// primary must reflect the later reset.
+	raw := map[string]interface{}{
+		"result": map[string]interface{}{
+			"rateLimitsByLimitId": map[string]interface{}{
+				"codex_primary_a": map[string]interface{}{
+					"usedPercent":        100.0,
+					"windowDurationMins": 300.0,
+					"resetsAt":           float64(earlierResetMs),
+				},
+				"codex_primary_b": map[string]interface{}{
+					"usedPercent":        100.0,
+					"windowDurationMins": 300.0,
+					"resetsAt":           float64(laterResetMs),
+				},
+			},
+		},
+	}
+	buckets, _ := extractCodexRateLimitBuckets(raw, now)
+	p, ok := buckets[codexWindowPrimary]
+	if !ok {
+		t.Fatalf("expected primary bucket, got %+v", buckets)
+	}
+	if p.UsedPercentage != 100 {
+		t.Errorf("primary UsedPercentage=%v, want 100", p.UsedPercentage)
+	}
+	if p.ResetsAtMs != laterResetMs {
+		t.Errorf("primary ResetsAtMs=%v, want later reset %v (tie must not let earlier reset win)", p.ResetsAtMs, laterResetMs)
+	}
+}
+
+// When two equally-exhausted buckets disagree on whether a reset is known, the
+// safe answer is "unknown" — don't promise a reset time that the unknown side
+// can't confirm.
+func TestExtractCodexRateLimitBuckets_TieDropsResetWhenOneUnknown(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	knownResetMs := now.Add(30 * time.Minute).UnixMilli()
+
+	raw := map[string]interface{}{
+		"result": map[string]interface{}{
+			"rateLimitsByLimitId": map[string]interface{}{
+				"codex_primary_a": map[string]interface{}{
+					"usedPercent":        100.0,
+					"windowDurationMins": 300.0,
+					"resetsAt":           float64(knownResetMs),
+				},
+				// Same 100% usage but no reset hint — its real reset is
+				// unknown to us, so we must not promise the other bucket's.
+				"codex_primary_b": map[string]interface{}{
+					"usedPercent":        100.0,
+					"windowDurationMins": 300.0,
+				},
+			},
+		},
+	}
+	buckets, _ := extractCodexRateLimitBuckets(raw, now)
+	p, ok := buckets[codexWindowPrimary]
+	if !ok {
+		t.Fatalf("expected primary bucket, got %+v", buckets)
+	}
+	if p.ResetsAtMs != 0 {
+		t.Errorf("primary ResetsAtMs=%v, want 0 (tie with one unknown reset must drop the reset)", p.ResetsAtMs)
+	}
+}
+
 func TestCaptureCodexRateLimit_IgnoresUnrelatedFrames(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)

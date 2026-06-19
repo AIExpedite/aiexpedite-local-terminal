@@ -281,6 +281,19 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (ma
 						if !isWindow {
 							continue
 						}
+						// `rateLimitsByLimitId.<limit>.secondary: null` in a full
+						// snapshot means this metered limit no longer constrains
+						// that window. Treat it as a clear so a previously-cached
+						// bucket can't keep rendering stale usage. Skip nulls in
+						// non-snapshot frames (notifications are sparse — null
+						// there means "no update," not "clear it").
+						if nestedVal == nil {
+							if c.fullSnapshot {
+								nestedMatched = true
+								clears[id] = true
+							}
+							continue
+						}
 						nestedInfo, ok := nestedVal.(map[string]interface{})
 						if !ok {
 							continue
@@ -326,6 +339,29 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 	}
 	if !prev.usageKnown || b.UsedPercentage > prev.UsedPercentage {
 		out[id] = b
+		return
+	}
+	// Usage ties: two metered buckets report the same utilisation for this
+	// window (commonly both 100% exhausted). Map iteration order would
+	// otherwise pick whichever the runtime visited first and could advertise
+	// an earlier reset even though the other equally-exhausted bucket still
+	// blocks usage. Merge conservatively: keep the LATER reset so we never
+	// promise availability sooner than reality, and drop the reset entirely
+	// when one side is unknown so the UI shows "—" instead of a misleading
+	// time.
+	if b.UsedPercentage == prev.UsedPercentage {
+		merged := prev
+		if !b.resetKnown || !prev.resetKnown {
+			merged.ResetsAtMs = 0
+			merged.resetKnown = false
+		} else if b.ResetsAtMs > prev.ResetsAtMs {
+			merged.ResetsAtMs = b.ResetsAtMs
+		}
+		// Carry forward any window-length hint either side observed.
+		if merged.WindowMinutes == 0 && b.WindowMinutes > 0 {
+			merged.WindowMinutes = b.WindowMinutes
+		}
+		out[id] = merged
 	}
 }
 
