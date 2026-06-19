@@ -600,15 +600,23 @@ func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentU
 // weekly) so the long-standing labels stay identical, and derive a neutral
 // "Nm/Nh/Nd window" string otherwise so an off-spec plan still shows the right
 // quota window context instead of the wrong hard-coded one.
+//
+// Codex's `token_count` JSONL often reports the canonical windows with a
+// floored/rounded minute count (e.g. window_minutes: 299 for the 5-hour window
+// and 10079 for the weekly window — see openai/codex#14728), so we tolerate a
+// small band around 300 and 10080 before falling back to the generic label.
+// The bands are disjoint from any neighboring real Codex window (4h=240,
+// 6h=360, 6-day=8640, biweekly=20160), so a legitimately different quota
+// length still renders as the neutral "N-…" string.
 func codexWindowLabel(minutes float64, fallback string) string {
 	if minutes <= 0 {
 		return fallback
 	}
 	m := int(minutes + 0.5)
-	switch m {
-	case 300:
+	switch {
+	case m >= 295 && m <= 305:
 		return "5-hour session window"
-	case 10080:
+	case m >= 10020 && m <= 10140:
 		return "Weekly quota"
 	}
 	switch {

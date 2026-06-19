@@ -833,6 +833,64 @@ func TestCodexMetricsFromCache_CanonicalWindowsKeepLabels(t *testing.T) {
 	}
 }
 
+// Codex `token_count` JSONL commonly reports the canonical primary/secondary
+// quota windows with a floored minute count (e.g. window_minutes: 299 for the
+// 5-hour window, 10079 for the weekly window — see openai/codex#14728). The
+// label deriver must tolerate that floor instead of falling back to the
+// generic "299-minute window" / "168.0-hour window" strings.
+func TestCodexMetricsFromCache_RoundedCanonicalWindowsKeepLabels(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 20, ResetsAtMs: now.Add(5 * time.Hour).UnixMilli(),
+			WindowMinutes: 299, usageKnown: true, resetKnown: true,
+		},
+		codexWindowSecondary: {
+			UsedPercentage: 5, ResetsAtMs: now.Add(7 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10079, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, "")
+
+	metrics := codexMetricsFromCache(now, "")
+	if got := metrics[0].Label; got != "5-hour session window" {
+		t.Errorf("primary label=%q, want canonical 5-hour session window (floored 299)", got)
+	}
+	if got := metrics[1].Label; got != "Weekly quota" {
+		t.Errorf("secondary label=%q, want canonical Weekly quota (floored 10079)", got)
+	}
+}
+
+// A window length that is clearly NOT a rounded canonical (e.g. 4-hour primary
+// or 6-day weekly) must continue to render the neutral duration-derived label,
+// so the tolerance band cannot silently mask a genuinely different plan.
+func TestCodexMetricsFromCache_DistinctWindowsBypassCanonicalBands(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 20, ResetsAtMs: now.Add(4 * time.Hour).UnixMilli(),
+			WindowMinutes: 240, usageKnown: true, resetKnown: true,
+		},
+		codexWindowSecondary: {
+			UsedPercentage: 5, ResetsAtMs: now.Add(6 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 8640, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, "")
+
+	metrics := codexMetricsFromCache(now, "")
+	if got := metrics[0].Label; got != "4-hour window" {
+		t.Errorf("primary label=%q, want %q (240 min must not snap to 5-hour band)", got, "4-hour window")
+	}
+	if got := metrics[1].Label; got != "6-day window" {
+		t.Errorf("secondary label=%q, want %q (8640 min must not snap to weekly band)", got, "6-day window")
+	}
+}
+
 func TestCodexMetricsFromCache_FingerprintMismatchHidesSnapshot(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
