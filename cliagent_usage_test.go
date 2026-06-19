@@ -363,6 +363,43 @@ func TestCodexUsageParser_RolloutPrefersLastPopulatedFrame(t *testing.T) {
 	}
 }
 
+// A rollout log written before the current auth.json (i.e. by a previously
+// signed-in account that shared this CODEX_HOME) must NOT backfill the new
+// account's windows — that would leak the prior account's quota.
+func TestCodexUsageParser_RolloutRejectsPreLoginLogs(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Rollout produced by the previous account.
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-old", []map[string]any{
+		codexRateLimitFrame(80, 70, now),
+	})
+	oldLog := filepath.Join(codexHome, "sessions", "2026", "06", "19", "rollout-2026-06-19T11-00-00-old.jsonl")
+	past := time.Date(2026, 6, 18, 9, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(oldLog, past, past); err != nil {
+		t.Fatalf("chtimes rollout: %v", err)
+	}
+	// New account signs in AFTER that log was written.
+	authPath := filepath.Join(codexHome, "auth.json")
+	helperWriteJSON(t, authPath, map[string]any{"email": "newuser@example.com"})
+	login := time.Date(2026, 6, 19, 10, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(authPath, login, login); err != nil {
+		t.Fatalf("chtimes auth: %v", err)
+	}
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	for _, m := range usage.Metrics {
+		if !m.Unknown {
+			t.Errorf("metric %q=%+v should stay Unknown; pre-login rollout must not backfill", m.Kind, m)
+		}
+	}
+}
+
 func TestGeminiUsageParser_FreeTierFramesTotal(t *testing.T) {
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".gemini", "settings.json"), map[string]any{

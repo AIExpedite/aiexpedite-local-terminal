@@ -868,13 +868,24 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base string,
 // (CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl) for the most recent populated
 // `rate_limits` frame and returns aggregated display-window buckets.
 //
-// Account scoping is implicit: the rollout logs live under the active
-// CODEX_HOME — the same directory whose auth.json produced the fingerprint the
-// caller renders — so there is no cross-account bleed. Best-effort: returns
-// (nil, false) on any problem.
+// Account scoping: rollout logs carry no account identity of their own, so they
+// can't be fingerprint-matched the way the on-disk cache is. Instead we reject
+// any log written BEFORE auth.json's current mtime — a fresh `codex login`
+// rewrites auth.json, so its mtime advances past every rollout log the
+// previous account produced. This prevents the credentials-swap bleed the cache
+// path's fingerprint check already guards against (showing a prior account's
+// quota under the new account). When auth.json is missing/unreadable the guard
+// is disabled, matching the best-effort unscoped behaviour the parser already
+// uses when the account is unknown. Best-effort: returns (nil, false) on any
+// problem.
 func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRateLimitBucket, bool) {
 	if base == "" {
 		return nil, false
+	}
+	// auth.json mtime is the account-swap watermark (0 = missing → guard off).
+	var authModUnix int64
+	if info, err := os.Stat(expandHome(base, "auth.json")); err == nil {
+		authModUnix = info.ModTime().Unix()
 	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
 	// filepath.Glob returns lexically-sorted paths; every segment is zero-padded
@@ -885,6 +896,13 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRa
 		return nil, false
 	}
 	for i, scanned := len(matches)-1, 0; i >= 0 && scanned < codexRolloutScanFileCap; i, scanned = i-1, scanned+1 {
+		// Reject logs predating the current credentials (possible prior account).
+		if authModUnix > 0 {
+			info, err := os.Stat(matches[i])
+			if err != nil || info.ModTime().Unix() < authModUnix {
+				continue
+			}
+		}
 		if buckets, ok := codexBucketsFromRolloutFile(matches[i], now); ok {
 			return buckets, true
 		}
