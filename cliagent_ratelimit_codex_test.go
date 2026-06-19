@@ -528,6 +528,40 @@ func TestCaptureCodexRateLimit_MultiBucketOnlyClassifiesByLength(t *testing.T) {
 	}
 }
 
+// The documented `rateLimitsByLimitId` shape nests window buckets under
+// `primary`/`secondary` keys (e.g. `codex_other.primary.usedPercent`). The
+// extractor must descend into those nested keys — not treat the outer entry
+// as a flat bucket — so a stricter `codex_other.primary` actually constrains
+// the primary display window.
+func TestCaptureCodexRateLimit_MultiBucketNestedPrimarySecondary(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	// Aggregate view says primary=20%; the nested `codex_other.primary`
+	// reports 77% on the same 5h window. Merge must keep 77%.
+	line := `{"jsonrpc":"2.0","result":{"rateLimits":{` +
+		`"primary":{"usedPercent":20,"resetsInSeconds":1800,"windowDurationMins":300},` +
+		`"secondary":{"usedPercent":10,"resetsInSeconds":86400,"windowDurationMins":10080}` +
+		`},"rateLimitsByLimitId":{` +
+		`"codex_primary":{"primary":{"usedPercent":20,"resetsInSeconds":1800,"windowDurationMins":300}},` +
+		`"codex_other":{"primary":{"usedPercent":77,"resetsInSeconds":1800,"windowDurationMins":300},` +
+		`"secondary":{"usedPercent":55,"resetsInSeconds":86400,"windowDurationMins":10080}}` +
+		`}},"id":1}`
+
+	captureCodexRateLimitLine(line, now)
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache write for nested rateLimitsByLimitId")
+	}
+	if snap.Buckets[codexWindowPrimary].UsedPercentage != 77 {
+		t.Errorf("primary=%+v, want UsedPercentage=77 from nested codex_other.primary", snap.Buckets[codexWindowPrimary])
+	}
+	if snap.Buckets[codexWindowSecondary].UsedPercentage != 55 {
+		t.Errorf("secondary=%+v, want UsedPercentage=55 from nested codex_other.secondary", snap.Buckets[codexWindowSecondary])
+	}
+}
+
 func TestCaptureCodexRateLimit_IgnoresUnrelatedFrames(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)

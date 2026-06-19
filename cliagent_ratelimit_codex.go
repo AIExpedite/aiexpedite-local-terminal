@@ -265,6 +265,36 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (ma
 					if !ok {
 						continue
 					}
+					// Documented shape: each `rateLimitsByLimitId` entry is an
+					// object that nests window buckets under `primary` /
+					// `secondary` (e.g. `codex_other.primary.usedPercent`).
+					// When those nested keys are present, iterate them and
+					// classify via the window alias table so a strict
+					// `codex_other.primary` bucket actually constrains our
+					// primary display window. Fall back to treating the entry
+					// as a flat bucket (legacy/observed shape) only when no
+					// nested window key matched, so neither shape silently
+					// goes ignored.
+					nestedMatched := false
+					for nestedKey, nestedVal := range info {
+						id, isWindow := codexWindowAliases[strings.ToLower(nestedKey)]
+						if !isWindow {
+							continue
+						}
+						nestedInfo, ok := nestedVal.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						nb, ok := codexBucketFromInfo(nestedInfo, now)
+						if !ok {
+							continue
+						}
+						nestedMatched = true
+						mergeCodexBucketMostConstrained(out, id, nb)
+					}
+					if nestedMatched {
+						continue
+					}
 					b, ok := codexBucketFromInfo(info, now)
 					if !ok {
 						continue
