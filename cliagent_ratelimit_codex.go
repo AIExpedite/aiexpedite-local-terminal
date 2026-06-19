@@ -327,7 +327,15 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 		// let the partial new bucket stand.
 		prev, hadPrev := snap.Buckets[window]
 		priorStillLive := hadPrev && prev.ResetsAtMs > nowMs
-		if !bucket.usageKnown && priorStillLive {
+		// A reset-only update only describes the SAME live window when its
+		// new reset matches the prior reset (or omits a reset entirely). If
+		// it advances resetsAt past the prior reset, the quota window has
+		// rolled over: the prior used % belongs to the old window and must
+		// NOT be copied onto the fresh one — doing so makes the card keep
+		// showing the previous high usage for what is actually an empty
+		// new 5-hour / weekly window.
+		sameLiveWindow := priorStillLive && (!bucket.resetKnown || bucket.ResetsAtMs == prev.ResetsAtMs)
+		if !bucket.usageKnown && sameLiveWindow {
 			bucket.UsedPercentage = prev.UsedPercentage
 		}
 		if !bucket.resetKnown && priorStillLive {
@@ -340,12 +348,20 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 		if bucket.WindowMinutes == 0 && hadPrev && prev.WindowMinutes > 0 {
 			bucket.WindowMinutes = prev.WindowMinutes
 		}
-		// Reset-only update with no live prior usage: persisting now would
-		// seed a fake observed 0% used (the zero-value UsedPercentage), so
-		// the next refresh would render the quota as 0% / 100% remaining
-		// even though no usage value was ever observed. Leave it Unknown
-		// until a real used_percent/utilization arrives.
-		if !bucket.usageKnown && !priorStillLive {
+		// Reset-only update with no usage carried from the same live window:
+		// persisting now would seed a fake observed 0% used (the zero-value
+		// UsedPercentage), so the next refresh would render the quota as
+		// 0% / 100% remaining even though no usage value was ever observed
+		// for this window. Leave it Unknown until a real used_percent /
+		// utilization arrives. This covers both "no prior bucket" and
+		// "prior bucket belonged to a now-rolled-over window" — in the
+		// rolled-over case we additionally evict the stale prior bucket
+		// rather than letting it linger on the card until the old reset
+		// passes.
+		if !bucket.usageKnown && !sameLiveWindow {
+			if hadPrev && bucket.resetKnown && bucket.ResetsAtMs != prev.ResetsAtMs {
+				delete(snap.Buckets, window)
+			}
 			continue
 		}
 		snap.Buckets[window] = bucket

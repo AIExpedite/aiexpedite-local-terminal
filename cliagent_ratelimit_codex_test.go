@@ -249,9 +249,12 @@ func TestCaptureCodexRateLimit_AccountRateLimitsReadResult(t *testing.T) {
 }
 
 // account/rateLimits/updated notifications are documented as sparse. A
-// reset-only follow-up must NOT zero out the prior used_percent, and a
-// usage-only follow-up must NOT drop the prior reset time — otherwise the
-// card oscillates between real numbers and 0%/Unknown between turns.
+// reset-only follow-up that restates the SAME live reset must preserve the
+// prior used_percent, and a usage-only follow-up must NOT drop the prior
+// reset time — otherwise the card oscillates between real numbers and
+// 0%/Unknown between turns. (Reset-only updates that ADVANCE the reset to a
+// new window are covered separately by
+// TestCaptureCodexRateLimit_ResetOnlyAdvanceDropsPriorUsage.)
 func TestCaptureCodexRateLimit_SparseUpdatesPreservePriorFields(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
@@ -263,9 +266,10 @@ func TestCaptureCodexRateLimit_SparseUpdatesPreservePriorFields(t *testing.T) {
 		now,
 	)
 
-	// Sparse update #1: reset-only (used_percent omitted). Must preserve 60%.
+	// Sparse update #1: reset-only restating the same live reset. Must
+	// preserve 60% (same window, just a fresh notification).
 	captureCodexRateLimitLine(
-		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"resetsInSeconds":1500}}}}`,
+		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"resetsInSeconds":3600}}}}`,
 		now,
 	)
 	snap, ok := loadCodexRateLimitSnapshot(cache)
@@ -275,8 +279,8 @@ func TestCaptureCodexRateLimit_SparseUpdatesPreservePriorFields(t *testing.T) {
 	if got := snap.Buckets[codexWindowPrimary].UsedPercentage; got != 60 {
 		t.Errorf("after reset-only update UsedPercentage=%v, want 60 (preserved)", got)
 	}
-	if got := snap.Buckets[codexWindowPrimary].ResetsAtMs; got != now.Add(1500*time.Second).UnixMilli() {
-		t.Errorf("after reset-only update ResetsAtMs=%d not refreshed", got)
+	if got := snap.Buckets[codexWindowPrimary].ResetsAtMs; got != now.Add(3600*time.Second).UnixMilli() {
+		t.Errorf("after reset-only update ResetsAtMs=%d, want live reset preserved", got)
 	}
 
 	// Sparse update #2: usage-only (no reset). Must preserve the live reset.
@@ -288,7 +292,7 @@ func TestCaptureCodexRateLimit_SparseUpdatesPreservePriorFields(t *testing.T) {
 	if got := snap.Buckets[codexWindowPrimary].UsedPercentage; got != 72 {
 		t.Errorf("after usage-only update UsedPercentage=%v, want 72", got)
 	}
-	if got := snap.Buckets[codexWindowPrimary].ResetsAtMs; got != now.Add(1500*time.Second).UnixMilli() {
+	if got := snap.Buckets[codexWindowPrimary].ResetsAtMs; got != now.Add(3600*time.Second).UnixMilli() {
 		t.Errorf("after usage-only update ResetsAtMs=%d, want previous live reset preserved", got)
 	}
 }
@@ -316,6 +320,43 @@ func TestCaptureCodexRateLimit_ResetOnlyWithoutPriorStaysUnknown(t *testing.T) {
 	metrics := codexMetricsFromCache(now, "")
 	if !metrics[0].Unknown {
 		t.Errorf("session metric should remain Unknown after reset-only update with no prior usage, got %+v", metrics[0])
+	}
+}
+
+// A sparse reset-only update that ADVANCES resetsAt past the cached reset
+// describes a fresh quota window (the prior 5h/weekly bucket has rolled over).
+// The previous bucket's UsedPercentage must NOT be copied onto the new window —
+// otherwise the card keeps showing the old high usage on what is actually an
+// empty new window until a real used_percent arrives.
+func TestCaptureCodexRateLimit_ResetOnlyAdvanceDropsPriorUsage(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed a live bucket at 80% with a reset 30 minutes out.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"primary":{"used_percent":80,"resets_in_seconds":1800}}}}`,
+		now,
+	)
+
+	// Sparse reset-only update advancing resetsAt by another 5 hours — this is
+	// a new window, not a refreshed reset for the same one.
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"resetsInSeconds":19800}}}}`,
+		now,
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if got, present := snap.Buckets[codexWindowPrimary]; present && got.UsedPercentage == 80 {
+		t.Fatalf("reset-only advance must NOT carry 80%% used onto the new window: %+v", got)
+	}
+
+	metrics := codexMetricsFromCache(now, "")
+	if !metrics[0].Unknown {
+		t.Errorf("session metric should be Unknown after reset-only advance to a new window, got %+v", metrics[0])
 	}
 }
 
