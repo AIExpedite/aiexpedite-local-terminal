@@ -7,8 +7,14 @@
 // captureCodexRateLimitLine, which writes the latest primary (5-hour) /
 // secondary (weekly) windows to an on-disk cache keyed by account
 // fingerprint. This parser turns the latest snapshot into real percentage
-// metrics for the CLI Agents tab, falling back to Unknown placeholders when
-// no Codex session has been observed yet under the current account.
+// metrics for the CLI Agents tab.
+//
+// When the live cache has no entry for a window — the common case when Codex
+// is only ever driven through its own TUI rather than our app-server — the
+// parser backfills from Codex's own session rollout logs
+// (CODEX_HOME/sessions/.../rollout-*.jsonl), which persist the identical
+// `token_count.rate_limits` telemetry. Only windows still Unknown after the
+// live cache are filled in this way.
 package main
 
 import (
@@ -76,6 +82,10 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 	}
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
+	// Live app-server telemetry first; for any window never captured live,
+	// fall back to Codex's own on-disk rollout logs so the card is observable
+	// even when Codex is only ever driven through its TUI.
 	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
+	usage.Metrics = codexBackfillUnknownFromRollout(usage.Metrics, base, usage.AccountFingerprint, now)
 	return usage, true
 }

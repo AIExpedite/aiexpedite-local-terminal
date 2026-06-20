@@ -1450,7 +1450,12 @@ func TestGrokACPLifecycle_TimeoutKillsRunawaySession(t *testing.T) {
 			}
 		}
 		mu.Unlock()
-		if sawTimeoutError && sawEnded {
+		// Also wait for the session to be unregistered: the registry is cleaned
+		// up separately from (and slightly after) the terminal `grok_acp_ended`
+		// publish, so breaking on the message alone races the ActiveCount check
+		// below on slower runners. Polling it here keeps the assertion stable
+		// without weakening it — the 10s deadline still bounds a real hang.
+		if sawTimeoutError && sawEnded && m.ActiveCount() == 0 {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)

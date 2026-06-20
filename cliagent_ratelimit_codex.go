@@ -25,10 +25,12 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -762,6 +764,34 @@ func currentCodexAccountFingerprint() string {
 	return fingerprintAccount("codex", account)
 }
 
+// codexCachedBucketsForAccount loads the rate-limit cache and returns the
+// display-window buckets for `currentFingerprint`, or an empty map when the
+// cache is missing or pinned to a different account. Shared between
+// codexMetricsFromCache (which renders the metrics) and the rollout backfill
+// (which needs to know whether a metric's source bucket has rolled over).
+func codexCachedBucketsForAccount(now time.Time, currentFingerprint string) map[string]codexRateLimitBucket {
+	snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath())
+	if !ok || snap.AccountFingerprint != currentFingerprint {
+		return map[string]codexRateLimitBucket{}
+	}
+	// Prefer Contributors when present so a sparse update for one limit
+	// can't shadow a stricter prior contributor that the sparse frame
+	// never restated. Fall back to the flat aggregate for any legacy
+	// cache file written before the contributors map existed.
+	if len(snap.Contributors) > 0 {
+		reflagged := make(map[string]map[string]codexRateLimitBucket, len(snap.Contributors))
+		for w, contribs := range snap.Contributors {
+			windowMap := make(map[string]codexRateLimitBucket, len(contribs))
+			for limit, b := range contribs {
+				windowMap[limit] = reflagPersistedCodexBucket(b)
+			}
+			reflagged[w] = windowMap
+		}
+		return aggregateCodexBuckets(reflagged, now)
+	}
+	return snap.Buckets
+}
+
 // codexMetricsFromCache builds the metric rows from the rate-limit cache,
 // falling back to the Unknown placeholders when a window hasn't been observed.
 // Two rows are always shown so the card layout is stable: the 5-hour session
@@ -771,27 +801,7 @@ func currentCodexAccountFingerprint() string {
 // caller-supplied one — otherwise a previous account's windows could surface
 // under the current account after a credentials swap.
 func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentUsageMetric {
-	snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath())
-	buckets := map[string]codexRateLimitBucket{}
-	if ok && snap.AccountFingerprint == currentFingerprint {
-		// Prefer Contributors when present so a sparse update for one limit
-		// can't shadow a stricter prior contributor that the sparse frame
-		// never restated. Fall back to the flat aggregate for any legacy
-		// cache file written before the contributors map existed.
-		if len(snap.Contributors) > 0 {
-			reflagged := make(map[string]map[string]codexRateLimitBucket, len(snap.Contributors))
-			for w, contribs := range snap.Contributors {
-				windowMap := make(map[string]codexRateLimitBucket, len(contribs))
-				for limit, b := range contribs {
-					windowMap[limit] = reflagPersistedCodexBucket(b)
-				}
-				reflagged[w] = windowMap
-			}
-			buckets = aggregateCodexBuckets(reflagged, now)
-		} else {
-			buckets = snap.Buckets
-		}
-	}
+	buckets := codexCachedBucketsForAccount(now, currentFingerprint)
 
 	session := codexObservedMetricOrUnknown(
 		buckets, codexWindowPrimary, limitKindSession, "5-hour session window", now)
@@ -799,6 +809,363 @@ func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentU
 		buckets, codexWindowSecondary, limitKindWeekly, "Weekly quota", now)
 
 	return []cliAgentUsageMetric{session, weekly}
+}
+
+// codexRolloutScanFileCap bounds how many of the most-recent rollout logs the
+// fallback opens before giving up, so a sessions directory holding thousands of
+// files can't turn a usage refresh into a long scan. The newest log carrying a
+// populated rate_limits frame wins, so in practice this resolves on the first
+// file or two.
+const codexRolloutScanFileCap = 16
+
+// codexBackfillUnknownFromRollout fills any Unknown or rolled-over window in
+// `metrics` from Codex's own on-disk session rollout logs.
+//
+// Why this exists: our live cache (codex_rate_limits.json) is fed ONLY by the
+// passive app-server capture in codex_appserver.go, so it stays empty whenever
+// Codex is driven through its own TUI (which never streams through our
+// app-server). Codex persists the exact same `token_count.rate_limits`
+// telemetry to its rollout logs, so a window we never observed live can still
+// be reported from disk — the same source Codex's own `/status` reads.
+//
+// A live captured bucket with a still-future reset is authoritative: it wins
+// over any rollout reading. But when the cache row's reset has already passed,
+// codexObservedMetricOrUnknown rolls it over to a concrete 0% (Unknown=false)
+// — and without this fallback the card would show that bogus 0% indefinitely
+// for a user who once streamed through the app-server, let the window reset,
+// and then drove Codex only through the TUI (where the new window's usage is
+// only ever written to the rollout log, never back to our cache). So a stale
+// rolled-over cache row is treated as fillable too, identically to Unknown.
+// The rollout scan still runs at most once per call.
+func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, currentFingerprint string, now time.Time) []cliAgentUsageMetric {
+	cacheBuckets := codexCachedBucketsForAccount(now, currentFingerprint)
+	nowMs := now.UnixMilli()
+	cacheRolledOver := func(windowID string) bool {
+		b, ok := cacheBuckets[windowID]
+		return ok && b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs
+	}
+	windowIDFor := func(kind string) (string, bool) {
+		switch kind {
+		case limitKindSession:
+			return codexWindowPrimary, true
+		case limitKindWeekly:
+			return codexWindowSecondary, true
+		}
+		return "", false
+	}
+	fillable := func(m cliAgentUsageMetric) bool {
+		if m.Unknown {
+			return true
+		}
+		w, ok := windowIDFor(m.Kind)
+		return ok && cacheRolledOver(w)
+	}
+
+	anyFillable := false
+	for _, m := range metrics {
+		if fillable(m) {
+			anyFillable = true
+			break
+		}
+	}
+	if !anyFillable {
+		return metrics
+	}
+
+	buckets, ok := codexRolloutFallbackBuckets(base, now)
+	if !ok {
+		return metrics
+	}
+
+	for i, m := range metrics {
+		if !fillable(m) {
+			continue
+		}
+		windowID, ok := windowIDFor(m.Kind)
+		if !ok {
+			continue
+		}
+		if _, present := buckets[windowID]; !present {
+			continue
+		}
+		// Reuse the cache-path renderer so rollout-sourced metrics get the same
+		// window-label derivation and reset-passed → 0% rollover handling. The
+		// metric's existing label is the default Codex window label, which is
+		// the right fallback when the frame carried no window_minutes hint.
+		metrics[i] = codexObservedMetricOrUnknown(buckets, windowID, m.Kind, m.Label, now)
+	}
+	return metrics
+}
+
+// codexRolloutFallbackBuckets reads Codex's session rollout logs
+// (CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl) for the most recent populated
+// `rate_limits` frame and returns aggregated display-window buckets.
+//
+// Account scoping: rollout logs carry no account identity of their own, so they
+// can't be fingerprint-matched the way the on-disk cache is. Instead we reject
+// any log written BEFORE auth.json's current mtime — a fresh `codex login`
+// rewrites auth.json, so its mtime advances past every rollout log the
+// previous account produced. This prevents the credentials-swap bleed the cache
+// path's fingerprint check already guards against (showing a prior account's
+// quota under the new account). When auth.json is missing/unreadable the guard
+// is disabled, matching the best-effort unscoped behaviour the parser already
+// uses when the account is unknown. Best-effort: returns (nil, false) on any
+// problem.
+func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRateLimitBucket, bool) {
+	if base == "" {
+		return nil, false
+	}
+	// auth.json mtime is the account-login watermark (zero = missing → guard
+	// off). A fresh `codex login` rewrites auth.json, so its mtime marks when
+	// the current account took over this CODEX_HOME.
+	//
+	// We scope rollout logs by their SESSION START time (the first line's
+	// timestamp), NOT the file mtime: a previous account's session that is still
+	// running when a new account logs in keeps appending to its log, pushing the
+	// file mtime past the login even though the session — and its quota — belong
+	// to the old account. The start time, fixed when the session began, stays on
+	// the correct side of the login. (Residual caveat: a token refresh that
+	// rewrites auth.json mid-session can over-reject same-account logs that
+	// started earlier; that degrades to Unknown, never to cross-account bleed.)
+	var authMod time.Time
+	if info, err := os.Stat(expandHome(base, "auth.json")); err == nil {
+		authMod = info.ModTime()
+	}
+	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
+	matches, err := filepath.Glob(filepath.Join(base, "sessions", "*", "*", "*", "rollout-*.jsonl"))
+	if err != nil || len(matches) == 0 {
+		return nil, false
+	}
+	// Rank candidates by file mtime descending, NOT by filename (= session
+	// start time). When sessions overlap — e.g. an older still-active session
+	// runs alongside a newer-started but idle one, or a long-lived session is
+	// resumed after newer files exist — filename order treats the stale session
+	// as the "newest" reading. mtime tracks the last append, so the file being
+	// written most recently (the live source of truth) is considered first.
+	// Ties fall back to filename order so a deterministic chronological tiebreak
+	// applies when two files share an mtime.
+	type rolloutCandidate struct {
+		path  string
+		mtime time.Time
+	}
+	candidates := make([]rolloutCandidate, 0, len(matches))
+	for _, m := range matches {
+		info, err := os.Stat(m)
+		if err != nil {
+			continue
+		}
+		candidates = append(candidates, rolloutCandidate{path: m, mtime: info.ModTime()})
+	}
+	if len(candidates) == 0 {
+		return nil, false
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if !candidates[i].mtime.Equal(candidates[j].mtime) {
+			return candidates[i].mtime.After(candidates[j].mtime)
+		}
+		return candidates[i].path > candidates[j].path
+	})
+	// Accumulate across files newest-first: a window the newest log never
+	// restated (e.g. it only carried `primary`) can still be filled from a
+	// slightly older log that did carry `secondary`. The newest reading for a
+	// given window wins, so once a window is in `acc` an older file never
+	// overwrites it.
+	acc := map[string]codexRateLimitBucket{}
+	for scanned, c := range candidates {
+		if scanned >= codexRolloutScanFileCap {
+			break
+		}
+		buckets, sessionStart, ok := codexBucketsFromRolloutFile(c.path, now)
+		if !ok {
+			continue
+		}
+		// Reject logs whose session began before the current login (a possible
+		// prior account). A log with no parseable start time can't be scoped, so
+		// keep it (best-effort, matches the unscoped unknown-account path).
+		if !authMod.IsZero() && !sessionStart.IsZero() && sessionStart.Before(authMod) {
+			continue
+		}
+		for w, b := range buckets {
+			if _, exists := acc[w]; !exists {
+				acc[w] = b
+			}
+		}
+		_, hasPrimary := acc[codexWindowPrimary]
+		_, hasSecondary := acc[codexWindowSecondary]
+		if hasPrimary && hasSecondary {
+			break
+		}
+	}
+	if len(acc) == 0 {
+		return nil, false
+	}
+	return acc, true
+}
+
+// codexBucketsFromRolloutFile returns the aggregated buckets from the LAST
+// populated `rate_limits` frame in a single rollout log, plus the session's
+// start time (the first line's `timestamp`). Codex emits `rate_limits: null` on
+// most token_count events and the real object only periodically, so the last
+// non-empty extraction — not the first — is the live reading. The start time is
+// used by the caller to scope logs to the current account. Best-effort: returns
+// ok=false when the file holds no usable frame or can't be read; the returned
+// start time is zero when no line carried a parseable timestamp.
+func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]codexRateLimitBucket, time.Time, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, time.Time{}, false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	// Rollout lines embed full model turns and can be large; match the
+	// app-server's ceiling so a single big line doesn't abort the scan mid-file.
+	scanner.Buffer(make([]byte, 0, 64*1024), codexAppServerMaxLineSize)
+
+	var sessionStart time.Time
+	acc := map[string]map[string]codexRateLimitBucket{}
+	for scanner.Scan() {
+		line := scanner.Text()
+		// The first line carrying a timestamp is the session_meta header, i.e.
+		// when this session STARTED — recorded before any rate-limit frame, so
+		// it's captured ahead of the prefilter below.
+		if sessionStart.IsZero() {
+			if ts, ok := codexRolloutLineTimestamp(line); ok {
+				sessionStart = ts
+			}
+		}
+		// Cheap prefilter: only decode lines that could carry a window update.
+		// Mirror captureCodexRateLimitLine's gate exactly so camelCase frames
+		// (`rateLimits` / `rateLimitsByLimitId`) the extractor supports aren't
+		// dropped — `rate_limit` alone wouldn't match the camelCase spelling.
+		if !strings.Contains(line, "token_count") &&
+			!strings.Contains(line, "rateLimits") &&
+			!strings.Contains(line, "rate_limit") {
+			continue
+		}
+		var raw map[string]interface{}
+		if json.Unmarshal([]byte(line), &raw) != nil {
+			continue
+		}
+		// Anchor relative reset fields (`resets_in_seconds`) to the moment the
+		// line was EMITTED, not the usage-refresh time. A historical rollout
+		// line saying "resets in 3600s" reset an hour after it was written; with
+		// the refresh time as the anchor it would falsely look like it resets an
+		// hour from now, masking a window that has long since rolled over.
+		// Absolute `resets_at` fields ignore this anchor, so the fallback is
+		// when the line carries no parseable timestamp.
+		eventTime := now
+		if ts, ok := raw["timestamp"].(string); ok {
+			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+				eventTime = parsed
+			}
+		}
+		// The rollout shape nests telemetry under `payload`
+		// ({"type":"event_msg","payload":{"type":"token_count","rate_limits":…}}),
+		// which extractCodexRateLimitBuckets already unwraps. fullSnapshot is
+		// false for that envelope, so null windows are ignored rather than
+		// treated as clears — exactly what we want when mining for live usage.
+		if updates, _ := extractCodexRateLimitBuckets(raw, eventTime); len(updates) > 0 {
+			// Merge, don't replace: token_count notifications are sparse, so a
+			// later frame restating only `primary` must not drop a `secondary`
+			// reading an earlier frame in this same file already captured.
+			// Liveness for sparse-merge is judged at the frame's own event
+			// time so an expired prior reset isn't carried onto fresh usage.
+			mergeCodexRolloutFrame(acc, updates, eventTime)
+		}
+	}
+	if len(acc) == 0 {
+		return nil, sessionStart, false
+	}
+	// Roll over against the real current time: aggregateCodexBuckets zeroes any
+	// window whose reset is already in the past as of now, so a stale relative
+	// reset anchored above correctly clears instead of showing old usage.
+	return aggregateCodexBuckets(acc, now), sessionStart, true
+}
+
+// codexRolloutLineTimestamp extracts the top-level `timestamp` (RFC3339) from
+// one rollout JSONL line. Used to read a session's start time without decoding
+// the whole line. ok=false when the line has no parseable timestamp.
+func codexRolloutLineTimestamp(line string) (time.Time, bool) {
+	var probe struct {
+		Timestamp string `json:"timestamp"`
+	}
+	if json.Unmarshal([]byte(line), &probe) != nil || probe.Timestamp == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, probe.Timestamp)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// mergeCodexRolloutFrame folds one frame's per-(window, limit) contributors into
+// the accumulated snapshot for a single rollout file, latest-wins, mirroring the
+// live cache's sparse-merge semantics:
+//
+//   - A reset-only update within the SAME LIVE window (prior reset still in the
+//     future as of this frame's event time, and within jitter of the new reset)
+//     carries the prior usage forward; a usage-only update keeps the prior reset
+//     only while it's still live. Window-length hints survive from either side.
+//   - A bucket with no known usage is NEVER stored as a standalone observed
+//     contributor — the live path ignores reset-only updates that have no prior
+//     same-window usage to merge into, and so do we. Storing one would make
+//     codexObservedMetricOrUnknown report a bogus 0% and block an older file
+//     from filling the real usage.
+//   - When a reset-only update jumps to a NEW window (reset beyond jitter), the
+//     prior reading is stale: drop it so it can't keep rendering an expired
+//     percentage, and leave the window unobserved until a real usage frame lands.
+//   - A usage-only update arriving after the prior window has already expired
+//     stands on its own — copying the expired prev reset would make
+//     codexObservedMetricOrUnknown zero out the fresh usage as rolled over.
+//
+// Windows/limits the frame doesn't mention are left untouched (rollout frames
+// never clear). `frameTime` is the line's own timestamp so liveness is judged
+// at the moment the frame was emitted, not at refresh time.
+func mergeCodexRolloutFrame(acc, updates map[string]map[string]codexRateLimitBucket, frameTime time.Time) {
+	frameMs := frameTime.UnixMilli()
+	for window, contributors := range updates {
+		for limit, b := range contributors {
+			var prev codexRateLimitBucket
+			hadPrev := false
+			if acc[window] != nil {
+				prev, hadPrev = acc[window][limit]
+			}
+			priorStillLive := hadPrev && prev.resetKnown && prev.ResetsAtMs > frameMs
+			sameWindow := hadPrev && (!b.resetKnown || !prev.resetKnown ||
+				resetsWithinJitter(b.ResetsAtMs, prev.ResetsAtMs))
+			sameLiveWindow := priorStillLive && (!b.resetKnown || resetsWithinJitter(b.ResetsAtMs, prev.ResetsAtMs))
+
+			if !b.usageKnown && sameLiveWindow && prev.usageKnown {
+				b.UsedPercentage = prev.UsedPercentage
+				b.usageKnown = true
+			}
+			if !b.resetKnown && priorStillLive {
+				b.ResetsAtMs = prev.ResetsAtMs
+				b.resetKnown = true
+			}
+			if b.WindowMinutes == 0 && hadPrev && prev.WindowMinutes > 0 {
+				b.WindowMinutes = prev.WindowMinutes
+			}
+
+			if !b.usageKnown {
+				// Reset-only update with no usage to anchor it. Drop a stale
+				// prior when the window rolled over; otherwise ignore.
+				if hadPrev && b.resetKnown && !sameWindow {
+					delete(acc[window], limit)
+					if len(acc[window]) == 0 {
+						delete(acc, window)
+					}
+				}
+				continue
+			}
+			if acc[window] == nil {
+				acc[window] = map[string]codexRateLimitBucket{}
+			}
+			acc[window][limit] = b
+		}
+	}
 }
 
 // codexWindowLabel renders a human label for a window of the given length.
