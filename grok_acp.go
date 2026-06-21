@@ -50,7 +50,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -150,6 +149,13 @@ type GrokACPSession struct {
 	// (`session/new` and `session/load`) whose `params.cwd` would otherwise
 	// bypass the gate Start applied to the process-level cwd.
 	WorkspaceRoot string
+	// IsolatedHome is the per-session temp dir Start points the child's
+	// GROK_HOME at (a copy of the real auth file + a minimal clean
+	// config.toml). It is removed best-effort exactly once, after the child
+	// has exited (waitForExit), so we never delete the copied auth.json out
+	// from under a running grok process. Empty when Start could not create
+	// the dir (the launch falls back to the inherited GROK_HOME in that case).
+	IsolatedHome string
 
 	mu           sync.Mutex
 	status       string // "running" | "ended"
@@ -310,19 +316,6 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return fmt.Errorf("grok acp session %s already exists", id)
 	}
 
-	// Fail-closed when a Grok requirements.toml layer pins auth or approval
-	// policy in a direction the workspace's opt-in flags do not allow. xAI's
-	// enterprise docs document requirements.toml as PINNED — its values
-	// override later `-c|--config <key>=` flags rather than the other way
-	// round — so the neutralizers buildGrokACPArgs emits would silently fail
-	// open if the pinned layer already selected `model.api_key` or a
-	// permissive `[permission] rules` table. Refusing the launch here, with
-	// a message naming the pinned key and file, is safer than spawning a
-	// session whose auth/approval posture we cannot honour.
-	if err := detectPinnedGrokRequirements(opts.AllowAPIKeyFallback, opts.AllowAlwaysApprove); err != nil {
-		return err
-	}
-
 	executable := resolveExecutable("grok")
 	// PATH lookup miss is the common failure mode for macOS GUI/launchd
 	// agents — Grok's installer drops the binary in ~/.grok/bin and only
@@ -334,7 +327,27 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 			executable = p
 		}
 	}
-	args := buildGrokACPArgs(extraArgs, opts.AllowAPIKeyFallback, opts.AllowAlwaysApprove)
+	args := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove)
+
+	// Isolated GROK_HOME (replaces the old `--config <key>=` security
+	// neutralizers, which are GONE as of grok 0.2.59 — `grok agent` rejects
+	// `--config` / `--permission-mode` / `--no-auto-update` with "unexpected
+	// argument", so the entire persisted-config-clear-via-argv approach is
+	// dead). Instead we point the child at a per-session temp dir that
+	// contains ONLY a copy of the real `grok login` auth file plus a minimal
+	// clean config.toml. By NOT copying the user's real config.toml /
+	// requirements.toml we neutralise every persisted-config vector by
+	// omission: no `api_key` billing override, no auto-approve / permission
+	// bypass, no pinned requirements layer. The cached-token handshake still
+	// works because the auth file is the one piece we deliberately copy in.
+	// Best-effort: if the dir can't be created we fall back to the inherited
+	// GROK_HOME rather than failing the launch.
+	isolatedHome, err := setupIsolatedGrokHome()
+	if err != nil {
+		fmt.Printf("%s[grok-acp] Session %s: isolated GROK_HOME setup failed (%v) — falling back to inherited GROK_HOME%s\n",
+			colorYellow, id, err, colorReset)
+		isolatedHome = ""
+	}
 
 	fmt.Printf("%s[grok-acp] Starting session %s: %s %s%s\n",
 		colorCyan, id, executable, strings.Join(redactGrokACPArgsForLog(args), " "), colorReset)
@@ -344,21 +357,38 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	if cwd != "" {
 		proc.Dir = cwd
 	}
-	proc.Env = sanitizeGrokACPEnv(os.Environ(), opts.AllowAPIKeyFallback)
+	env := sanitizeGrokACPEnv(os.Environ(), opts.AllowAPIKeyFallback)
+	if isolatedHome != "" {
+		env = setEnvVar(env, "GROK_HOME", isolatedHome)
+	}
+	proc.Env = env
+
+	// cleanupIsolatedHome removes the per-session temp dir on any pre-spawn
+	// failure path. Once the child is successfully started, ownership of the
+	// dir transfers to waitForExit (which removes it after the process exits),
+	// so we must NOT call this after a successful proc.Start().
+	cleanupIsolatedHome := func() {
+		if isolatedHome != "" {
+			_ = os.RemoveAll(isolatedHome)
+		}
+	}
 
 	stdin, err := proc.StdinPipe()
 	if err != nil {
+		cleanupIsolatedHome()
 		return fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
 	stdout, err := proc.StdoutPipe()
 	if err != nil {
 		stdin.Close()
+		cleanupIsolatedHome()
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 	stderr, err := proc.StderrPipe()
 	if err != nil {
 		stdin.Close()
 		stdout.Close()
+		cleanupIsolatedHome()
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
@@ -366,6 +396,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		stdin.Close()
 		stdout.Close()
 		stderr.Close()
+		cleanupIsolatedHome()
 		return fmt.Errorf("failed to start grok agent stdio (is `grok` on PATH or in ~/.grok/bin? run `grok login` to authenticate): %w", err)
 	}
 
@@ -392,6 +423,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		UID:           uid,
 		TimeoutMs:     timeoutMs,
 		WorkspaceRoot: resolvedRoot,
+		IsolatedHome:  isolatedHome,
 		status:        "running",
 		done:          make(chan struct{}),
 		streamDone:    make(chan struct{}),
@@ -982,6 +1014,16 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 
 	close(session.done)
 
+	// Remove the per-session isolated GROK_HOME now that the child has
+	// exited (Process.Wait above returned). Doing it here — and only here —
+	// guarantees we never delete the copied auth.json / config.toml out from
+	// under a still-running grok process, and the work runs exactly once per
+	// session because waitForExit fires exactly once. Best-effort: a leftover
+	// temp dir is harmless and the OS temp reaper will eventually collect it.
+	if session.IsolatedHome != "" {
+		_ = os.RemoveAll(session.IsolatedHome)
+	}
+
 	fmt.Printf("%s[grok-acp] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, exit, colorReset)
 
@@ -992,1646 +1034,263 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
    argv + env builders
    -------------------------------------------------------------------------- */
 
-// buildGrokACPArgs constructs argv for `grok agent stdio`. The literal
-// `agent stdio` prefix is the ACP entry point — `grok` itself launches the
-// interactive TUI which we deliberately avoid (the feature brief mandates
-// JSON-RPC ACP as the primary integration path, not TUI scraping).
+// grokACPDefaultModel is the model the ACP child runs under unless the caller
+// supplies its own `--model <x>` via extraArgs. Validated live against grok
+// 0.2.59's ACP handshake (initialize → authenticate{cached_token} →
+// session/new → session/prompt → end_turn).
+const grokACPDefaultModel = "grok-build"
+
+// buildGrokACPArgs constructs argv for `grok agent stdio`.
 //
-// `--no-auto-update` is always passed so a background update check can't
-// race the ACP handshake. The xAI headless/scripting docs explicitly
-// recommend this for automated ACP children; without it, any non-protocol
-// stdout from the update worker would surface as a `grok_acp_error` and
-// fail the in-flight initialize call. A caller-supplied `--no-auto-update`
-// is deduped, and a caller-supplied `--auto-update` is stripped — we own
-// this knob, the orchestrator doesn't.
+// VALIDATED CONTRACT (grok 0.2.59): the only supported shape is
 //
-// extraArgs are forwarded after the entry-point tokens so callers can supply
-// Grok config overrides (e.g. `--model grok-2-fast`). Tokens that would
-// re-enter the TUI path (`agent`, `stdio`, or alternative subcommands like
-// `chat`/`tui`/`run`) are stripped to keep the orchestrator forgiving.
+//	grok agent --model <model> [--always-approve] stdio
 //
-// When allowAPIKey is false the sanitiser also drops any caller-supplied
-// `--api-key*` / `--auth*` flags so a misbehaving orchestrator can't override
-// our env-strip by pointing Grok at an alternative key env var or auth method
-// via argv. The orchestrator's ACP `authenticate` flow still resolves
-// `cached_token` via the JSON-RPC handshake — no functionality loss for the
-// default path.
+// Two hard constraints discovered live against `grok agent --help`:
 //
-// When allowAlwaysApprove is false the sanitiser additionally drops any
-// caller-supplied `--always-approve` / `--auto-approve` flags, the
-// `--permission-mode bypassPermissions` selector (xAI's enterprise-docs
-// equivalent for skipping per-tool prompts), the `--allow <pattern>`
-// permission-policy rules (xAI enterprise docs describe policy rules as
-// evaluated BEFORE the per-tool prompt, so even with `--permission-mode
-// default` pinned a single `--allow "Bash(*)"` would auto-approve matching
-// tool calls), AND the equivalent `-c approval.mode=always|auto` /
-// `-c tools.always_approve=true` / `-c tools.auto_approve=true` /
-// `-c approval.permission_mode=bypassPermissions` /
-// `-c permission_rules=…` / `-c policy.allow=…` config overrides. The
-// feature brief makes approval behaviour conservative by default —
-// autonomous tool execution has to be a per-workspace opt-in
-// (Config.EnableGrokAlwaysApprove), not something a signed `grok_acp_start`
-// can flip via extra args.
+//  1. `grok agent` accepts ONLY a fixed flag set (--reauth, -m/--model,
+//     --reasoning-effort, --always-approve, --agent-profile, --leader/
+//     --no-leader, --grok-ws-*, --cli-chat-proxy-base-url,
+//     --xai-api-base-url, --debug/--debug-file, --leader-socket). It does
+//     NOT accept `--config`, `--permission-mode`, or `--no-auto-update` —
+//     each is rejected with "unexpected argument". The entire `--config`-
+//     based security-neutralizer approach the previous implementation used
+//     is therefore dead; persisted-config vectors are now neutralised by the
+//     isolated GROK_HOME set up in Start (see setupIsolatedGrokHome).
+//  2. Flags MUST come BEFORE the `stdio` subcommand — `stdio` itself takes no
+//     options, so anything after it is mis-parsed.
 //
-// When allowAlwaysApprove is false AND the sanitized extras don't already
-// pin a `--permission-mode`, we additionally inject `--permission-mode default`
-// onto the argv. The argv flag has higher precedence than `~/.grok/
-// config.toml` (or `$GROK_HOME/config.toml`), so a host where the user has
-// `[ui] permission_mode = "always-approve"` persisted cannot silently flip
-// the spawned ACP child into auto-approval mode. Without this, the strip
-// posture above would only cover the argv surface and leave the persistent
-// config bypass open. We deliberately only inject when no caller-supplied
-// `--permission-mode` survived sanitisation: by that point any bypass-valued
-// caller arg has already been dropped, so a survivor is a conservative
-// selector (`default`, `plan`, etc.) the orchestrator explicitly chose — we
-// don't second-guess it. `default` is the xAI-documented CLI value for the
-// prompt-on-every-tool mode (the `[ui] permission_mode = "ask"` config key
-// has no matching CLI selector — xAI's enterprise docs enumerate `default`,
-// `dontAsk`, `acceptEdits`, `bypassPermissions`, `plan`), so `default` is
-// what we pin to keep the launch from failing argv validation.
-func buildGrokACPArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) []string {
-	args := []string{"agent", "stdio", "--no-auto-update"}
-	sanitized := sanitizeGrokACPExtraArgs(extraArgs, allowAPIKey, allowAlwaysApprove)
+// Model selection: the default is grok-build. A caller-supplied `--model <x>`
+// (or `--model=<x>`) in extraArgs REPLACES the default. Any other extraArgs
+// that aren't valid `grok agent` flags — especially the now-rejected
+// `--config*` / `--permission-mode*` / `--no-auto-update`, plus `--api-key*`
+// and the POSIX `--` delimiter — are stripped by sanitizeGrokACPExtraArgs so
+// a signed grok_acp_start can't smuggle an incompatible flag onto the argv.
+//
+// `--always-approve` is appended (between `--model <x>` and `stdio`) ONLY when
+// allowAlwaysApprove is true. Default false keeps autonomous tool execution an
+// explicit per-workspace opt-in (Config.EnableGrokAlwaysApprove) rather than
+// something a signed grok_acp_start can flip via extra args.
+func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
+	model, sanitized := sanitizeGrokACPExtraArgs(extraArgs, grokACPDefaultModel)
+
+	args := []string{"agent", "--model", model}
+	if allowAlwaysApprove {
+		args = append(args, "--always-approve")
+	}
+	// Any remaining sanitized extras are valid `grok agent` flags the
+	// orchestrator chose to pass through; they must precede the `stdio`
+	// subcommand (constraint #2 above).
 	args = append(args, sanitized...)
-	// Persistent-config neutralizers come AFTER the sanitized extras so that
-	// later command-line flags win against earlier same-key values per Grok's
-	// last-wins precedence — i.e. a caller-supplied `--config model.api_key=
-	// xai-...` (which only survives sanitisation when allowAPIKey=true) does
-	// not get clobbered by a default neutralizer. The sanitiser already
-	// drops the POSIX `--` end-of-options delimiter from extras, so the
-	// trailing flags here are guaranteed to be parsed as options rather than
-	// silently demoted to positionals.
-	if !allowAlwaysApprove {
-		// Neutralize any auto-approval policy persisted in `~/.grok/config.toml`
-		// (or `$GROK_HOME/config.toml`). The argv-level `--permission-mode default`
-		// pin only covers the documented prompt-mode selector — xAI's enterprise
-		// docs separately describe `[permission] rules` as a rule list evaluated
-		// BEFORE the prompt gate, so a persisted `permission_rules = ["Bash(*)"]`
-		// would still auto-approve matching tool calls on every ACP launch
-		// despite the workspace not opting into `EnableGrokAlwaysApprove`. The
-		// `--config key=` empty override is the documented per-process clear; we
-		// MUST issue it by default and MUST omit it once the workspace has
-		// opted in (otherwise the opt-in path's persisted policy would be
-		// silently cleared). `permission_rules` / `permission.rules` are
-		// conditionally cleared by the second slice below so deny-only host
-		// policies survive untouched.
-		args = append(args, grokPersistedAllowRuleNeutralizingConfigArgs()...)
-		args = append(args, grokPolicyNeutralizingConfigArgs()...)
-	}
-	if !allowAPIKey {
-		// Neutralize any API-key credential persisted in the user's
-		// `~/.grok/config.toml` (or `$GROK_HOME/config.toml`). xAI's CLI treats
-		// `model.api_key` / `model.env_key` as model-credential overrides that
-		// take precedence over the active `grok login` session token, so just
-		// stripping `XAI_API_KEY` from env and `--api-key` from argv is not
-		// enough — a host where the user once ran `grok config set model.api_key`
-		// would still silently bill the API-key account on every ACP launch.
-		// The `--config key=` form (empty value) is the xAI override that
-		// clears a config-file value for the duration of one process. We use
-		// the long-form spelling deliberately: xAI's headless/scripting docs
-		// list `-c` as the short alias for `--continue` (resume-session), and
-		// only the enterprise-deployment docs spell out `-c|--config` as the
-		// config-override surface. Pinning `--config` avoids any chance of
-		// the neutralizer being mis-parsed as `--continue <session-id>` on a
-		// host where the alias mapping went the other way. We also
-		// neutralize the `xai.*` aliases the design doc enumerates so the
-		// orchestrator's `cached_token` selection is the only auth surface left.
-		args = append(args, grokAuthNeutralizingConfigArgs()...)
-		// Per-model-scope neutralizers: xAI's enterprise docs document
-		// persistent API-key credentials as model-scoped TOML sections
-		// (`[model.<scope>] api_key = "..."`) that take precedence over the
-		// active `cached_token` for that model. The static neutralizer slice
-		// above clears the top-level and the documented `model.grok-build`
-		// scope, but a caller-supplied `--model <other-scope>` would still
-		// resolve to whatever credential `[model.<other-scope>]` holds in
-		// `~/.grok/config.toml`. Scan the sanitised extras for `--model`
-		// selectors and emit matching `--config model.<scope>.{api_key,env_key}=`
-		// clears so the cached-token posture survives a non-default model
-		// selection. Mirrors the argv-side gate in `isGrokAuthConfigKV`,
-		// which already matches any `model.<scope>.{api_key,env_key}` shape
-		// supplied via `-c|--config`.
-		// Per-model-scope neutralizers also need to cover scopes the orchestrator
-		// did NOT name on argv: xAI's enterprise docs document `[models] default
-		// = "<scope>"` as the persisted active-model selector, so a host with
-		// `[models] default = "custom"` + `[model.custom] api_key = "..."` would
-		// resolve to `[model.custom]`'s API key on every ACP launch even though
-		// no `--model` was passed. Read the persisted config to discover any
-		// `[model.<scope>]` section with an api_key/env_key and the `[models]
-		// default` scope, then emit clears for each. Filtered through
-		// isSafeGrokModelScope and capped so a hostile/corrupted config can't
-		// balloon argv.
-		args = append(args, grokModelScopeAuthNeutralizingConfigArgs(
-			mergeGrokModelScopes(
-				extractGrokModelScopes(sanitized),
-				persistedGrokModelScopesWithAPIKey(),
-			),
-		)...)
-	}
-	if !allowAlwaysApprove && !grokExtraArgsPinPermissionMode(sanitized) {
-		args = append(args, "--permission-mode", "default")
-	}
+	args = append(args, "stdio")
 	return args
 }
 
-// grokAuthNeutralizingConfigArgs returns the `--config <key>=` overrides that
-// empty out any API-key credential persisted in `~/.grok/config.toml` /
-// `$GROK_HOME/config.toml`. Used by buildGrokACPArgs when
-// Config.EnableGrokAPIKeyFallback is false to ensure the orchestrator's
-// `cached_token` auth selection cannot be silently shadowed by a config-file
-// API-key. Keys mirror isGrokAuthConfigKV's gated set so the strip-from-argv
-// and override-config-file surfaces stay in lockstep.
+// setupIsolatedGrokHome creates a per-session temp dir to use as the child's
+// GROK_HOME and seeds it with exactly two things:
 //
-// We deliberately spell the flag as `--config` rather than the `-c` short
-// alias: xAI's headless/scripting docs use `-c` for `--continue`
-// (resume-session) while only the enterprise-deployment docs document the
-// `-c|--config` config-override surface. Using the long form removes the
-// ambiguity so the neutralizer cannot be mis-parsed as a `--continue
-// <session-id>` flag if a future Grok release narrows the short alias.
-func grokAuthNeutralizingConfigArgs() []string {
-	return []string{
-		"--config", "model.api_key=",
-		"--config", "model.env_key=",
-		// Documented model-scoped form from xAI's enterprise docs (`[model.grok-build]
-		// api_key = "..."`). Clearing the documented scope closes the practical
-		// bypass; the argv-side gate (`isGrokAuthConfigKV` matches any
-		// `model.<scope>.{api_key,env_key}`) blocks an orchestrator from
-		// re-routing through a different scope name via `-c|--config`.
-		"--config", "model.grok-build.api_key=",
-		"--config", "model.grok-build.env_key=",
-		"--config", "xai.api_key=",
-		"--config", "xai.env_key=",
-	}
-}
-
-// grokModelScopeAuthNeutralizingConfigArgs returns `--config
-// model.<scope>.{api_key,env_key}=` clears for each caller-selected model
-// scope. Used by buildGrokACPArgs when EnableGrokAPIKeyFallback is false so
-// a `--model <scope>` that resolves to a `[model.<scope>] api_key = "..."`
-// section in `~/.grok/config.toml` cannot silently reroute the launch off
-// the cached-token posture — xAI documents per-model API-key credentials as
-// taking precedence over the active session token, and the static slice in
-// grokAuthNeutralizingConfigArgs only covers the top-level and documented
-// `model.grok-build` scope. Scopes are filtered through isSafeGrokModelScope
-// to keep the emitted `--config` arg shape sound; an unsafe-looking name
-// is dropped here and the launch falls back to the static neutralizers.
-func grokModelScopeAuthNeutralizingConfigArgs(scopes []string) []string {
-	if len(scopes) == 0 {
-		return nil
-	}
-	args := make([]string, 0, 4*len(scopes))
-	for _, scope := range scopes {
-		// `grok-build` is already in the static slice; skipping it here keeps
-		// the emitted argv free of duplicate clears for the documented scope.
-		if scope == "" || scope == "grok-build" {
-			continue
-		}
-		if !isSafeGrokModelScope(scope) {
-			continue
-		}
-		args = append(args,
-			"--config", "model."+scope+".api_key=",
-			"--config", "model."+scope+".env_key=",
-		)
-	}
-	return args
-}
-
-// extractGrokModelScopes returns the unique model-scope names selected via
-// `--model <name>` / `--model=<name>` flags in the sanitised argv. Both
-// forms are recognised so the orchestrator can pass either style; values
-// that fail isSafeGrokModelScope are skipped here rather than upstream so
-// the safety filter and neutralizer emission stay in lockstep. Caller
-// supplies args after sanitizeGrokACPExtraArgs has already stripped
-// subcommands, `--`, and other tokens that would otherwise be mis-read as
-// a model selector.
-func extractGrokModelScopes(args []string) []string {
-	if len(args) == 0 {
-		return nil
-	}
-	var scopes []string
-	seen := map[string]bool{}
-	keepNext := false
-	for _, a := range args {
-		if keepNext {
-			keepNext = false
-			if !seen[a] && isSafeGrokModelScope(a) {
-				seen[a] = true
-				scopes = append(scopes, a)
-			}
-			continue
-		}
-		lower := strings.ToLower(a)
-		if lower == "--model" {
-			keepNext = true
-			continue
-		}
-		if strings.HasPrefix(lower, "--model=") {
-			v := a[len("--model="):]
-			if !seen[v] && isSafeGrokModelScope(v) {
-				seen[v] = true
-				scopes = append(scopes, v)
-			}
-		}
-	}
-	return scopes
-}
-
-// persistedGrokModelScopesWithAPIKey returns scope names from every Grok
-// config layer that either appear as `[model.<scope>]` sections containing
-// an `api_key` / `env_key` line, or are named as `[models] default =
-// "<scope>"` (the persisted active-model selector documented in xAI's
-// enterprise docs). Used by buildGrokACPArgs to ensure the cached-token
-// posture is not silently bypassed by a host whose persisted default model
-// resolves to a `[model.<scope>] api_key = "..."` section without any
-// `--model` arg from the orchestrator. Missing / unreadable config files
-// yield nil — best-effort by design.
+//   - a copy of the real `grok login` auth file, so cached-token auth keeps
+//     working without us inheriting anything else from the user's real
+//     ~/.grok (api_key, auto-approve, pinned requirements.toml, …)
+//   - a minimal clean config.toml (`[cli]\ninstaller = "internal"\n`)
 //
-// xAI's enterprise docs document a layered loader: the per-user
-// `~/.grok/config.toml` (or `$GROK_HOME/config.toml`) is one source, but
-// `[managed_]config.toml` and `requirements.toml` under `~/.grok` and
-// `/etc/grok` are also consumed, and `model.api_key` / `model.env_key`
-// values in any of those layers take precedence over the active session
-// token. We scan every layer and merge the discovered scopes so a host
-// whose managed layer selects a custom `[model.<scope>]` with credentials
-// is neutralised the same as one whose user config does.
-func persistedGrokModelScopesWithAPIKey() []string {
-	var merged []string
-	for _, p := range persistedGrokConfigPaths() {
-		merged = mergeGrokModelScopes(merged, parsePersistedGrokModelScopesWithAPIKey(p))
-	}
-	return merged
-}
-
-// persistedGrokConfigPaths enumerates every config layer xAI's Grok loader
-// is documented to consume, in precedence-agnostic order. The caller (the
-// neutraliser path) only cares about the union of scopes-with-credentials
-// across layers, not which layer wins, so order does not affect output —
-// it only keeps the emitted `--config` args deterministic. Missing files
-// are silently skipped downstream by parsePersistedGrokModelScopesWithAPIKey.
-func persistedGrokConfigPaths() []string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = ""
-	}
-	userBase := firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
-	systemBase := "/etc/grok"
-
-	paths := make([]string, 0, 6)
-	if userBase != "" {
-		paths = append(paths,
-			filepath.Join(userBase, "config.toml"),
-			filepath.Join(userBase, "managed_config.toml"),
-			filepath.Join(userBase, "requirements.toml"),
-		)
-	}
-	paths = append(paths,
-		filepath.Join(systemBase, "managed_config.toml"),
-		filepath.Join(systemBase, "config.toml"),
-		filepath.Join(systemBase, "requirements.toml"),
-	)
-	return paths
-}
-
-// grokRequirementsConfigPaths enumerates the Grok requirements.toml layers
-// xAI's enterprise loader treats as PINNED — values in these files override
-// later `-c|--config <key>=` flags rather than the other way round. The
-// detectPinnedGrokRequirements gate uses this list (and not the broader
-// persistedGrokConfigPaths set) because per-user/system config.toml and
-// managed_config.toml CAN be neutralised by the existing `--config <key>=`
-// emitter; only the requirements layer needs to fail-closed.
-func grokRequirementsConfigPaths() []string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		home = ""
-	}
-	userBase := firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
-	systemBase := "/etc/grok"
-
-	paths := make([]string, 0, 2)
-	if userBase != "" {
-		paths = append(paths, filepath.Join(userBase, "requirements.toml"))
-	}
-	paths = append(paths, filepath.Join(systemBase, "requirements.toml"))
-	return paths
-}
-
-// detectPinnedGrokRequirements scans every requirements.toml layer and
-// returns an error when the host pins an auth credential the agent has not
-// opted into (`allowAPIKey` false) or a permissive approval policy the
-// agent has not opted into (`allowAlwaysApprove` false). Used by Start to
-// fail-closed rather than spawning a session whose persisted posture
-// silently bypasses the workspace's opt-in flags.
+// This replaces the dead `--config <key>=` neutralizer machinery: grok 0.2.59
+// rejects `--config` outright, so we can no longer clear persisted config via
+// argv. Pointing GROK_HOME at an isolated dir that simply OMITS the dangerous
+// persisted files neutralises every persisted-config vector by construction.
 //
-// Missing/unreadable files yield nil — best-effort by design. The first
-// pinned key found determines the error so the operator gets actionable
-// pointer (file + dotted key) rather than a generic refusal.
-func detectPinnedGrokRequirements(allowAPIKey, allowAlwaysApprove bool) error {
-	if allowAPIKey && allowAlwaysApprove {
-		return nil
-	}
-	for _, p := range grokRequirementsConfigPaths() {
-		if err := detectPinnedGrokRequirementsFile(p, allowAPIKey, allowAlwaysApprove); err != nil {
-			return err
-		}
-	}
-	if !allowAlwaysApprove {
-		// Grok enterprise loader documents importing Claude Code's
-		// `managed-settings.json` and evaluating its `permissions.allow`
-		// rules BEFORE the per-tool prompt
-		// (https://docs.x.ai/build/enterprise#permissions). The Grok
-		// `-c permission_rules=` neutralizer above can only clear Grok's
-		// own permission_rules — a Claude-imported allow rule survives
-		// the per-process override, so fail closed when MDM has set one
-		// and the workspace has not opted into EnableGrokAlwaysApprove.
-		// Mirrors the requirements.toml pinned-policy path: the operator
-		// either removes the imported allow rule or opts in explicitly.
-		for _, p := range claudeManagedSettingsPaths() {
-			if path, ok := detectClaudeManagedSettingsAllowRule(p); ok {
-				return fmt.Errorf("grok imports Claude Code's managed-settings.json permission rules and %s contains a `permissions.allow` entry; the per-process --config neutralizer cannot override an imported Claude allow rule — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the imported allow rule", path)
-			}
-		}
-	}
-	return nil
-}
-
-// claudeManagedSettingsPaths enumerates the Claude Code managed-settings.json
-// locations xAI's Grok enterprise loader is documented to import permission
-// rules from. Per-OS system paths only — user-scope ~/.claude/settings.json is
-// intentionally NOT scanned because Grok's enterprise import is documented as
-// the MDM-managed layer; treating ad-hoc user settings as pinned would
-// over-fail-closed for the common single-user dev box.
-func claudeManagedSettingsPaths() []string {
-	paths := make([]string, 0, 2)
-	switch runtime.GOOS {
-	case "darwin":
-		paths = append(paths, "/Library/Application Support/ClaudeCode/managed-settings.json")
-	case "windows":
-		programData := os.Getenv("ProgramData")
-		if programData == "" {
-			programData = `C:\ProgramData`
-		}
-		paths = append(paths, filepath.Join(programData, "ClaudeCode", "managed-settings.json"))
-	default:
-		paths = append(paths, "/etc/claude-code/managed-settings.json")
-	}
-	return paths
-}
-
-// detectClaudeManagedSettingsAllowRule reports whether the Claude
-// managed-settings.json at `path` contains a non-empty `permissions.allow`
-// array. Returns the path on hit so the error message can point the operator
-// at the exact file. Missing/unreadable/malformed files yield false —
-// best-effort by design, matching detectPinnedGrokRequirementsFile's
-// tolerance for missing config layers.
-func detectClaudeManagedSettingsAllowRule(path string) (string, bool) {
-	if path == "" {
-		return "", false
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", false
-	}
-	defer f.Close()
-	const maxBytes = 1 << 20
-	data, err := io.ReadAll(io.LimitReader(f, maxBytes))
-	if err != nil {
-		return "", false
-	}
-	var parsed struct {
-		Permissions struct {
-			Allow []string `json:"allow"`
-		} `json:"permissions"`
-	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", false
-	}
-	for _, rule := range parsed.Permissions.Allow {
-		if strings.TrimSpace(rule) != "" {
-			return path, true
-		}
-	}
-	return "", false
-}
-
-// detectPinnedGrokRequirementsFile is the file-path-injectable
-// implementation of detectPinnedGrokRequirements. Reuses the same
-// line-oriented TOML scanner shape as parsePersistedGrokModelScopesWithAPIKey
-// (1 MiB read cap, regex-free section + key=value parse, scoped to the
-// keys isGrokAuthConfigKV / isGrokApprovalConfigKV already enumerate so the
-// pinned-detection surface stays in lockstep with the argv strip surface).
-func detectPinnedGrokRequirementsFile(path string, allowAPIKey, allowAlwaysApprove bool) error {
-	if path == "" {
-		return nil
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	const maxBytes = 1 << 20
-	reader := io.LimitReader(f, maxBytes)
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 256*1024)
-
-	currentSection := ""
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if name, ok := parseTOMLSectionHeader(line); ok {
-			currentSection = name
-			continue
-		}
-		eq := strings.IndexByte(line, '=')
-		if eq < 0 {
-			continue
-		}
-		key := strings.TrimSpace(line[:eq])
-		// Strip inline `# comment` from the value before quote-trimming so
-		// pinned `always_approve = true # managed` reduces to `true` (the
-		// gate's exact boolean match) instead of `true # managed` (which
-		// silently misses and lets requirements.toml route past the
-		// approval policy). For multi-line TOML arrays (the documented
-		// `permission_rules = [ ... ]` form) we accumulate continuation
-		// lines so a deny-only list isn't misread as the legacy bare-
-		// pattern allow shortcut.
-		val := strings.TrimSpace(stripTOMLInlineComment(line[eq+1:]))
-		if bracketDepthOutsideStrings(val) > 0 {
-			val = strings.TrimSpace(accumulateTOMLMultilineArray(scanner, val))
-		}
-		// Render as the dotted-path form the isGrok*ConfigKV gates
-		// already understand so detection stays in lockstep with the
-		// argv strip surface.
-		dotted := key
-		if currentSection != "" {
-			dotted = currentSection + "." + key
-		}
-		kv := dotted + "=" + trimTOMLString(val)
-		if !allowAPIKey && isGrokAuthConfigKV(kv) {
-			return fmt.Errorf("grok requirements.toml pins API-key auth via %q in %s; the per-process --config neutralizer cannot override a requirements.toml pin — set Config.EnableGrokAPIKeyFallback=true to opt in, or remove the pinned credential", dotted, path)
-		}
-		if !allowAlwaysApprove && isGrokApprovalConfigKV(kv) {
-			return fmt.Errorf("grok requirements.toml pins permissive approval policy via %q in %s; the per-process --config neutralizer cannot override a requirements.toml pin — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the pinned policy", dotted, path)
-		}
-	}
-	return nil
-}
-
-// parsePersistedGrokModelScopesWithAPIKey is the file-path-injectable
-// implementation of persistedGrokModelScopesWithAPIKey. Kept separate so
-// tests can point at a fixture without monkey-patching $GROK_HOME. The
-// parser is intentionally line-oriented and regex-free: Grok's config.toml
-// is human-edited TOML and a fully spec-compliant parser is overkill for
-// the narrow goal of discovering scope-credential sections. We cap the
-// read at 1 MiB and the scope count at 32 so a hostile/corrupted file
-// can't balloon argv or stall the launch.
-func parsePersistedGrokModelScopesWithAPIKey(path string) []string {
-	if path == "" {
-		return nil
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	scopes := make([]string, 0, 4)
-	seen := map[string]bool{}
-	addScope := func(name string) {
-		if name == "" || name == "grok-build" {
-			return
-		}
-		if !isSafeGrokModelScope(name) {
-			return
-		}
-		if seen[name] {
-			return
-		}
-		seen[name] = true
-		scopes = append(scopes, name)
-	}
-
-	const maxBytes = 1 << 20
-	reader := io.LimitReader(f, maxBytes)
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 256*1024)
-
-	currentSection := ""
-	currentScope := ""
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if name, ok := parseTOMLSectionHeader(line); ok {
-			currentSection = name
-			currentScope = ""
-			if strings.HasPrefix(currentSection, "model.") {
-				currentScope = currentSection[len("model."):]
-			}
-			continue
-		}
-		eq := strings.IndexByte(line, '=')
-		if eq < 0 {
-			continue
-		}
-		key := strings.TrimSpace(line[:eq])
-		val := strings.TrimSpace(line[eq+1:])
-		switch currentSection {
-		case "models":
-			if key == "default" {
-				addScope(trimTOMLString(val))
-			}
-		case "":
-			// Top-level dotted keys: a user who ran `grok config set
-			// models.default custom` (or hand-edited the file without
-			// section headers) lands with `currentSection == ""` and a
-			// dotted `key`. Honor the same two shapes the [models] /
-			// [model.<scope>] branches do so the scope discovery does not
-			// silently miss a persisted per-model API key.
-			if key == "models.default" {
-				addScope(trimTOMLString(val))
-				break
-			}
-			if strings.HasPrefix(key, "model.") {
-				rest := key[len("model."):]
-				dot := strings.LastIndexByte(rest, '.')
-				if dot > 0 && (rest[dot+1:] == "api_key" || rest[dot+1:] == "env_key") {
-					addScope(rest[:dot])
-				}
-			}
-		default:
-			if currentScope != "" && (key == "api_key" || key == "env_key") {
-				addScope(currentScope)
-			}
-		}
-		if len(scopes) >= 32 {
-			break
-		}
-	}
-	return scopes
-}
-
-// trimTOMLString unwraps a TOML scalar of the form `"..."` or `'...'`.
-// Returns the input unchanged when no matching quotes are present so
-// non-string scalars don't get truncated; isSafeGrokModelScope will reject
-// anything that isn't a valid scope identifier downstream regardless.
-func trimTOMLString(v string) string {
-	if len(v) >= 2 {
-		first, last := v[0], v[len(v)-1]
-		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-			return v[1 : len(v)-1]
-		}
-	}
-	return v
-}
-
-// stripTOMLInlineComment removes a trailing `# ...` comment from a TOML
-// scalar value. TOML permits inline comments after a value on the same
-// line, so a pinned `always_approve = true # managed` (or
-// `[tools] always_approve = true  # managed`) would otherwise leave our
-// line-oriented requirements/config scanners with the raw value
-// `true # managed`, which neither the boolean nor string gate matches —
-// silently routing past the approval policy.
+// Source auth file: `$GROK_HOME/auth.json` when GROK_HOME is set, else
+// `~/.grok/auth.json`; `cached_token.json` is tried as a fallback name. A
+// missing auth file is NOT fatal — we proceed with just the clean config.toml
+// and let grok surface any auth error through the normal ACP handshake.
 //
-// Quotes are tracked so a `#` inside a TOML basic ("...") or literal
-// ('...') string is preserved. Backslash escapes inside basic strings are
-// skipped so `\"` does not look like a closing quote. The caller is
-// expected to re-trim trailing whitespace, but we also do it here for
-// safety.
-func stripTOMLInlineComment(v string) string {
-	inDouble := false
-	inSingle := false
-	for i := 0; i < len(v); i++ {
-		c := v[i]
-		if inDouble {
-			if c == '\\' && i+1 < len(v) {
-				i++
+// Returns the temp dir path. The caller (Start) owns its lifecycle and removes
+// it after the child exits (waitForExit) or on any pre-spawn failure.
+func setupIsolatedGrokHome() (string, error) {
+	dir, err := os.MkdirTemp("", "grok-acp-home-")
+	if err != nil {
+		return "", fmt.Errorf("create isolated grok home: %w", err)
+	}
+
+	// Real ~/.grok base: prefer an inherited GROK_HOME (so a user who
+	// relocated their grok dir is still honoured), else the OS home's .grok.
+	srcBase := os.Getenv("GROK_HOME")
+	if srcBase == "" {
+		if home, herr := os.UserHomeDir(); herr == nil {
+			srcBase = filepath.Join(home, ".grok")
+		}
+	}
+
+	// Copy the auth file under the first name that exists. Best-effort: a
+	// missing/unreadable source is tolerated (grok surfaces the auth error
+	// through the normal ACP flow).
+	if srcBase != "" {
+		for _, name := range []string{"auth.json", "cached_token.json"} {
+			src := filepath.Join(srcBase, name)
+			data, rerr := os.ReadFile(src)
+			if rerr != nil {
 				continue
 			}
-			if c == '"' {
-				inDouble = false
+			if werr := os.WriteFile(filepath.Join(dir, name), data, 0o600); werr != nil {
+				_ = os.RemoveAll(dir)
+				return "", fmt.Errorf("copy grok auth file %s: %w", name, werr)
 			}
-			continue
-		}
-		if inSingle {
-			if c == '\'' {
-				inSingle = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inDouble = true
-		case '\'':
-			inSingle = true
-		case '#':
-			return strings.TrimRight(v[:i], " \t")
 		}
 	}
-	return v
+
+	// Minimal clean config.toml — deliberately carries no api_key and no
+	// approval/permission knobs, so none of the user's real persisted policy
+	// leaks into the isolated session.
+	const cleanConfig = "[cli]\ninstaller = \"internal\"\n"
+	if werr := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cleanConfig), 0o600); werr != nil {
+		_ = os.RemoveAll(dir)
+		return "", fmt.Errorf("write isolated config.toml: %w", werr)
+	}
+
+	return dir, nil
 }
 
-// parseTOMLSectionHeader recognises a line as a TOML section header,
-// tolerating a trailing inline comment such as `[tools] # managed` that the
-// TOML spec permits but a naive `HasSuffix(line, "]")` check rejects. Without
-// this, a pinned `requirements.toml` whose table headers carry a managed-by
-// comment would silently skip section tracking, and the following
-// `api_key = ...` / `always_approve = true` would be evaluated as bare top-
-// level keys that the dotted-form `isGrok*ConfigKV` gates never match —
-// letting a pinned host bypass the API-key and approval opt-ins. Returns the
-// trimmed section name and ok=true only when the closing `]` is followed by
-// nothing but whitespace and an optional `# comment`.
-func parseTOMLSectionHeader(line string) (string, bool) {
-	if !strings.HasPrefix(line, "[") {
-		return "", false
-	}
-	end := strings.IndexByte(line, ']')
-	if end < 0 {
-		return "", false
-	}
-	tail := strings.TrimSpace(stripTOMLInlineComment(line[end+1:]))
-	if tail != "" {
-		return "", false
-	}
-	return strings.TrimSpace(line[1:end]), true
-}
-
-// bracketDepthOutsideStrings counts the net `[` minus `]` characters that
-// sit OUTSIDE TOML basic and literal strings. Used by
-// accumulateTOMLMultilineArray to decide whether a `permission_rules = [`
-// opening still needs more continuation lines before the value is
-// classifiable. Quote tracking mirrors stripTOMLInlineComment so a
-// `pattern = "Bash[*]"` literal doesn't confuse the depth count.
-func bracketDepthOutsideStrings(s string) int {
-	depth := 0
-	inDouble := false
-	inSingle := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if inDouble {
-			if c == '\\' && i+1 < len(s) {
-				i++
-				continue
-			}
-			if c == '"' {
-				inDouble = false
+// setEnvVar returns env with the `KEY=value` entry for key replaced (case-
+// sensitive match on the key) or appended when absent. Used by Start to pin
+// GROK_HOME to the isolated dir, overriding any inherited GROK_HOME the env
+// sanitiser left in place.
+func setEnvVar(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			if !replaced {
+				out = append(out, prefix+value)
+				replaced = true
 			}
 			continue
 		}
-		if inSingle {
-			if c == '\'' {
-				inSingle = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inDouble = true
-		case '\'':
-			inSingle = true
-		case '[':
-			depth++
-		case ']':
-			depth--
-		}
+		out = append(out, e)
 	}
-	return depth
-}
-
-// accumulateTOMLMultilineArray reads continuation lines from the scanner
-// while the running bracket depth (starting at the depth of `initial`) is
-// still positive, joining them into a single logical value. xAI's
-// enterprise docs document `permission_rules` as a TOML array, which is
-// commonly hand-written across multiple lines:
-//
-//	permission_rules = [
-//	  { action = "deny", pattern = "Bash(rm -rf*)" }
-//	]
-//
-// Without accumulation the line scanner sees the value `[` on the first
-// line, hits grokPermissionRulesValueHasAllowAction, finds no `action`
-// substring, and misclassifies the deny-only list as a legacy bare-pattern
-// allow shortcut. That wipes an MDM-style deny rule via the neutralizer
-// AND rejects an otherwise stricter deny-only policy in the requirements
-// gate. We bound the read at 256 lines so a corrupted file with no
-// closing `]` can't stall the launch.
-func accumulateTOMLMultilineArray(scanner *bufio.Scanner, initial string) string {
-	depth := bracketDepthOutsideStrings(initial)
-	if depth <= 0 {
-		return initial
-	}
-	parts := make([]string, 0, 4)
-	parts = append(parts, initial)
-	const maxContinuationLines = 256
-	for i := 0; i < maxContinuationLines && depth > 0 && scanner.Scan(); i++ {
-		ln := stripTOMLInlineComment(scanner.Text())
-		ln = strings.TrimSpace(ln)
-		if ln == "" {
-			continue
-		}
-		depth += bracketDepthOutsideStrings(ln)
-		parts = append(parts, ln)
-	}
-	return strings.Join(parts, " ")
-}
-
-// mergeGrokModelScopes returns the union of two scope slices, preserving
-// the first slice's order and appending only new entries from the second.
-// Used by buildGrokACPArgs to combine argv-derived scopes (the caller's
-// `--model` selectors) with config-file-derived scopes (the persisted
-// default model + any scope-with-credential discovered in config.toml)
-// without emitting duplicate `--config model.<scope>.{api_key,env_key}=`
-// clears.
-func mergeGrokModelScopes(a, b []string) []string {
-	if len(a) == 0 {
-		return b
-	}
-	if len(b) == 0 {
-		return a
-	}
-	out := make([]string, 0, len(a)+len(b))
-	seen := map[string]bool{}
-	for _, s := range a {
-		if s == "" || seen[s] {
-			continue
-		}
-		seen[s] = true
-		out = append(out, s)
-	}
-	for _, s := range b {
-		if s == "" || seen[s] {
-			continue
-		}
-		seen[s] = true
-		out = append(out, s)
+	if !replaced {
+		out = append(out, prefix+value)
 	}
 	return out
 }
 
-// isSafeGrokModelScope reports whether `name` is a conservative model
-// identifier safe to splice into a `--config model.<name>.api_key=`
-// neutralizer. Allowed characters are [A-Za-z0-9_-]; periods would change
-// the dotted-path the neutralizer targets, `=` would split the config arg
-// into multiple kvs, and whitespace would corrupt the TOML key form.
-// Unknown shapes fall back to the static top-level/`model.grok-build`/
-// `xai.*` clears in grokAuthNeutralizingConfigArgs — fail-closed when in
-// doubt.
-func isSafeGrokModelScope(name string) bool {
-	if name == "" {
-		return false
-	}
-	for _, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= 'A' && r <= 'Z':
-		case r >= '0' && r <= '9':
-		case r == '-' || r == '_':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// grokPolicyNeutralizingConfigArgs returns the `--config <key>=` overrides
-// that empty out any auto-approval policy persisted in `~/.grok/config.toml`
-// (or `$GROK_HOME/config.toml`). Used by buildGrokACPArgs when
-// Config.EnableGrokAlwaysApprove is false to ensure the conservative
-// per-tool prompt default cannot be silently shadowed by a config-file
-// policy rule or approval-mode toggle.
+// sanitizeGrokACPExtraArgs filters caller-supplied extra args down to tokens
+// that are safe and valid to splice onto a `grok agent … stdio` argv, and
+// extracts a caller `--model <x>` selector.
 //
-// xAI's enterprise docs describe the `[permission] rules` TOML table as a
-// permission-policy rule list that is evaluated BEFORE the per-tool prompt
-// gate — so a single persisted `permission_rules = ["Bash(*)"]` would
-// auto-approve matching tool calls even with `--permission-mode default`
-// pinned on argv. The dotted-path neutralizers below clear the documented
-// keys via the same `--config <key>=` empty-value override the auth
-// neutralizer uses; keys mirror `isGrokApprovalConfigKV`'s gated set so the
-// strip-from-argv and override-config-file surfaces stay in lockstep.
-//
-// `approval.mode=` / `approval.permission_mode=` cleared to empty falls back
-// to Grok's documented default (per-tool prompt), so an explicit empty
-// override is the right neutralizer for a persisted `always-approve` /
-// `bypassPermissions` selector. `tools.always_approve=false` /
-// `tools.auto_approve=false` pin the boolean toggles to the conservative
-// value (an empty value is ambiguous for booleans). Long-form `--config`
-// is used for the same `-c` vs `--continue` ambiguity reason
-// `grokAuthNeutralizingConfigArgs` cites.
-//
-// `permission_rules` / `permission.rules` are intentionally NOT blanket-
-// cleared here: xAI's enterprise docs treat the array as a heterogeneous
-// rule list where `action = "deny"` entries tighten the policy (deny
-// takes precedence) and `action = "allow"` entries loosen it. An
-// unconditional `-c permission_rules=` clear would also wipe an MDM-set
-// deny rule — degrading the host's security posture in pursuit of an
-// allow-rule neutralizer. Persisted allow rules in these keys are instead
-// caught conditionally by grokPersistedAllowRuleNeutralizingConfigArgs,
-// which reads the documented config layers and emits the clear only when
-// an allow rule is actually present; argv `-c permission_rules=…`
-// injections of allow rules are still gated by isGrokApprovalConfigKV via
-// the sanitiser.
-func grokPolicyNeutralizingConfigArgs() []string {
-	return []string{
-		"--config", "policy.allow=",
-		"--config", "permissions.allow=",
-		"--config", "tools.allow=",
-		"--config", "approval.mode=",
-		"--config", "approval.permission_mode=",
-		// `ui.permission_mode` is xAI's documented persisted-config key for
-		// the same selector (the `[ui] permission_mode` TOML section). Without
-		// the explicit clear, a host with `[ui] permission_mode =
-		// "always-approve"` persisted would silently shadow the conservative
-		// default — the argv `--permission-mode default` pin only covers the
-		// flag surface, not this config-file key.
-		"--config", "ui.permission_mode=",
-		"--config", "tools.always_approve=false",
-		"--config", "tools.auto_approve=false",
-		// Legacy spellings xAI's Modes and Commands page still accepts.
-		// `approval_mode` is the undotted variant of `approval.mode`, and
-		// `yolo = true` desugars to the same always-approve posture as
-		// `tools.always_approve = true`. Mirrors isGrokApprovalConfigKV's
-		// gated set so the argv-strip and persisted-config-clear surfaces
-		// stay symmetric — a persisted `~/.grok/config.toml` with either
-		// key would otherwise route past the per-tool prompt despite the
-		// workspace not opting into EnableGrokAlwaysApprove.
-		"--config", "approval_mode=",
-		"--config", "yolo=false",
-	}
-}
-
-// grokPersistedAllowRuleNeutralizingConfigArgs returns the `--config
-// permission_rules=` / `--config permission.rules=` empty-value overrides
-// when (and only when) at least one documented Grok config layer contains
-// a `permission_rules` / `permission.rules` entry with an explicit
-// `action = "allow"` selector OR a legacy bare-pattern allow shortcut.
-// Returns an empty slice when no allow rule is present so a deny-only
-// policy survives untouched.
-//
-// Used by buildGrokACPArgs when Config.EnableGrokAlwaysApprove is false so
-// the cached-token + per-tool-prompt posture can't be silently shadowed by
-// a persisted `permission_rules = ["Bash(*)"]`, while an MDM-style
-// `permission_rules = [{action = "deny", pattern = "Bash(rm -rf*)"}]` is
-// left in place. Missing/unreadable files yield no clears — best-effort by
-// design, mirroring persistedGrokModelScopesWithAPIKey's tolerance.
-func grokPersistedAllowRuleNeutralizingConfigArgs() []string {
-	for _, p := range persistedGrokConfigPaths() {
-		if parsePersistedGrokPermissionRulesHasAllowAction(p) {
-			return []string{
-				"--config", "permission_rules=",
-				"--config", "permission.rules=",
-			}
-		}
-	}
-	return nil
-}
-
-// parsePersistedGrokPermissionRulesHasAllowAction is the file-path-
-// injectable implementation of grokPersistedAllowRuleNeutralizingConfigArgs'
-// per-layer scan. Reuses the same line-oriented TOML scanner shape as
-// parsePersistedGrokModelScopesWithAPIKey (1 MiB read cap, regex-free
-// section + key=value parse). Recognises the inline forms
-// `permission_rules = ["pattern"]` (legacy bare-pattern allow shortcut)
-// and `permission_rules = [{action = "allow", ...}]` (table form with
-// explicit allow action), plus the dotted `[permission] rules = …`
-// section/key spelling.
-func parsePersistedGrokPermissionRulesHasAllowAction(path string) bool {
-	if path == "" {
-		return false
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-
-	const maxBytes = 1 << 20
-	reader := io.LimitReader(f, maxBytes)
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 256*1024)
-
-	currentSection := ""
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if name, ok := parseTOMLSectionHeader(line); ok {
-			currentSection = name
-			continue
-		}
-		eq := strings.IndexByte(line, '=')
-		if eq < 0 {
-			continue
-		}
-		key := strings.TrimSpace(line[:eq])
-		// Strip inline comments and accumulate multi-line array continuations
-		// before classification so a deny-only `permission_rules = [\n  {action="deny",…}\n]`
-		// is not misread as the legacy bare-pattern allow shortcut on the
-		// first-line value `[`. Matching detectPinnedGrokRequirementsFile's
-		// approach keeps the user-config neutralizer and the requirements
-		// gate symmetric on multi-line TOML.
-		val := strings.TrimSpace(stripTOMLInlineComment(line[eq+1:]))
-		if bracketDepthOutsideStrings(val) > 0 {
-			val = strings.TrimSpace(accumulateTOMLMultilineArray(scanner, val))
-		}
-		dotted := key
-		if currentSection != "" {
-			dotted = currentSection + "." + key
-		}
-		if (dotted == "permission_rules" || dotted == "permission.rules") &&
-			grokPermissionRulesValueHasAllowAction(val) {
-			return true
-		}
-	}
-	return false
-}
-
-// grokExtraArgsPinPermissionMode reports whether any sanitized caller-
-// supplied arg already pins the Grok permission mode (via `--permission-mode`
-// or the `-c|--config approval.permission_mode=...` / `permission_mode=...`
-// config-knob form). Used by buildGrokACPArgs to decide whether to inject
-// the `--permission-mode default` argv override that defeats `~/.grok/config.toml`
-// based bypasses — when the caller already pinned a mode, we don't stack a
-// second one on top. Both the explicit-flag and `-c|--config` knob surfaces
-// must be considered because the bypass-mode strip in sanitizeGrokACPExtraArgs
-// only removes bypass VALUES; any non-bypass selector survives, and we treat
-// a surviving selector as an explicit caller choice.
-func grokExtraArgsPinPermissionMode(args []string) bool {
-	for i, a := range args {
-		lower := strings.ToLower(a)
-		if isGrokPermissionModeArg(lower) {
-			return true
-		}
-		if isGrokConfigOverrideArg(lower) {
-			if eq := strings.IndexByte(lower, '='); eq >= 0 {
-				if grokConfigKVTargetsPermissionMode(lower[eq+1:]) {
-					return true
-				}
-				continue
-			}
-			if i+1 < len(args) && grokConfigKVTargetsPermissionMode(strings.ToLower(args[i+1])) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// grokConfigKVTargetsPermissionMode reports whether a `-c|--config` value
-// targets the `permission_mode` key (top-level, namespaced under `approval.`,
-// or namespaced under `ui.` — the xAI persisted-config form). Companion to
-// grokExtraArgsPinPermissionMode — we only care that the key is being set,
-// not what value it is set to (bypass values were already stripped upstream).
-// Caller normalises to lower-case.
-func grokConfigKVTargetsPermissionMode(kv string) bool {
-	if kv == "" {
-		return false
-	}
-	key := kv
-	if eq := strings.IndexByte(kv, '='); eq >= 0 {
-		key = kv[:eq]
-	}
-	key = strings.TrimSpace(key)
-	return key == "approval.permission_mode" || key == "permission_mode" || key == "ui.permission_mode"
-}
-
-func sanitizeGrokACPExtraArgs(extraArgs []string, allowAPIKey, allowAlwaysApprove bool) []string {
-	// Conservative valued-flag list — we don't currently know every flag
-	// `grok` accepts, but covering the common config family lets callers
-	// pass values whose token happens to look like a stripped subcommand
-	// (`-c stdio=true` style) without us eating them. Keep in lockstep with
-	// the codex manager's valuedFlags map.
-	valuedFlags := map[string]bool{
-		"-c": true, "--config": true,
-		"--model":           true,
-		"--permission-mode": true, "--permission_mode": true,
-		// `--allow` is a permission-policy rule selector (e.g.
-		// `--allow "Bash(*)"`). It always takes a value; admit the pair
-		// speculatively here so the trailing stripGrokAllowRulePairs sweep
-		// can drop both tokens when always-approve is opt-in.
-		"--allow": true,
-	}
+// It returns (model, cleaned):
+//   - model is the caller's `--model` / `--model=` value when present and
+//     non-empty, else defaultModel. The `--model` flag+value are consumed
+//     here (not re-emitted) because buildGrokACPArgs positions `--model`
+//     itself.
+//   - cleaned is the remaining extras with dangerous/incompatible tokens
+//     dropped: the grok-0.2.59-rejected `--config*` / `--permission-mode*` /
+//     `--no-auto-update` / `--auto-update`, the credential flags `--api-key*`
+//     / `--auth*` (API-key auth stays neutralised via the isolated
+//     GROK_HOME), the `--cwd*` containment side-door, `--always-approve`
+//     (owned by buildGrokACPArgs), the duplicate entry tokens
+//     (`agent`/`stdio`/`chat`/`tui`/`run`), and the POSIX `--` end-of-options
+//     delimiter.
+func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string) (string, []string) {
+	model := defaultModel
 	cleaned := make([]string, 0, len(extraArgs))
-	keepNext := false
 	skipNext := false
-	for _, a := range extraArgs {
+	for i := 0; i < len(extraArgs); i++ {
+		a := extraArgs[i]
 		if skipNext {
 			skipNext = false
 			continue
 		}
-		if keepNext {
-			keepNext = false
-			cleaned = append(cleaned, a)
+		lower := strings.ToLower(a)
+
+		// Caller model selector — consume and record; buildGrokACPArgs emits
+		// the `--model` flag itself.
+		if lower == "--model" || lower == "-m" {
+			if i+1 < len(extraArgs) {
+				if v := strings.TrimSpace(extraArgs[i+1]); v != "" {
+					model = v
+				}
+				skipNext = true
+			}
 			continue
 		}
-		lower := strings.ToLower(a)
+		if strings.HasPrefix(lower, "--model=") {
+			if v := strings.TrimSpace(a[len("--model="):]); v != "" {
+				model = v
+			}
+			continue
+		}
+		if strings.HasPrefix(lower, "-m=") {
+			if v := strings.TrimSpace(a[len("-m="):]); v != "" {
+				model = v
+			}
+			continue
+		}
+
+		// Duplicate entry / subcommand tokens that would re-enter the TUI
+		// path or duplicate the argv we build.
 		switch lower {
 		case "agent", "stdio", "chat", "tui", "run":
-			// Drop tokens that would re-enter the TUI / interactive REPL
-			// path or duplicate the `agent stdio` prefix we already set.
-			continue
-		case "--no-auto-update", "--auto-update":
-			// buildGrokACPArgs always injects --no-auto-update; dedupe any
-			// caller-supplied copy AND drop --auto-update so a caller can't
-			// re-enable the background update worker that would race the
-			// ACP handshake on stdout.
-			continue
-		case "--":
-			// POSIX Utility Syntax Guideline 10 defines a standalone `--` as
-			// the end-of-options delimiter — any subsequent tokens are treated
-			// as operands rather than flags. buildGrokACPArgs appends the
-			// auth/policy `--config <key>=` neutralizers and the
-			// `--permission-mode default` pin AFTER the sanitised extras, so a
-			// surviving `--` from caller args would silently demote those
-			// policy-enforcing flags to positionals and re-open every gate
-			// they're meant to close. ACP startup args have no documented use
-			// for the delimiter (`agent stdio` already supplies the positional
-			// subcommand and ACP frames travel via stdin, not argv), so the
-			// fail-closed posture is to drop the token unconditionally.
 			continue
 		}
-		// xAI's headless docs document `--cwd <PATH>` as setting Grok's
-		// working directory, which would override the `proc.Dir` value Start
-		// just validated against WorkspaceRoot. Drop the flag in both forms
-		// (separate-value and `--cwd=...`) so a signed `grok_acp_start` can't
-		// escape the symlink/containment checks via an extra-args side door —
-		// the manager already pins the child to the validated cwd via proc.Dir.
+
+		// Flags grok 0.2.59's `grok agent` rejects outright ("unexpected
+		// argument"). The previous `--config`-based neutralizers are dead;
+		// these must never reach the argv. `--config` / `-c` and
+		// `--permission-mode` historically took a separate value, so skip the
+		// following token too when not in equals form.
+		if lower == "--config" || lower == "-c" ||
+			lower == "--permission-mode" || lower == "--permission_mode" {
+			if !strings.Contains(a, "=") && i+1 < len(extraArgs) {
+				skipNext = true
+			}
+			continue
+		}
+		if strings.HasPrefix(lower, "--config=") || strings.HasPrefix(lower, "-c=") ||
+			strings.HasPrefix(lower, "--permission-mode=") || strings.HasPrefix(lower, "--permission_mode=") {
+			continue
+		}
+		if lower == "--no-auto-update" || lower == "--auto-update" {
+			continue
+		}
+
+		// Credential side-doors: API-key auth stays neutralised by the
+		// isolated GROK_HOME, so strip any caller attempt to point grok at an
+		// API key / alternative auth method via argv.
+		if isGrokAuthOverrideArg(lower) {
+			if !strings.Contains(a, "=") && i+1 < len(extraArgs) {
+				skipNext = true
+			}
+			continue
+		}
+
+		// `--cwd` would override the proc.Dir Start validated against the
+		// workspace root — drop both forms.
 		if lower == "--cwd" {
-			skipNext = true
+			if i+1 < len(extraArgs) {
+				skipNext = true
+			}
 			continue
 		}
 		if strings.HasPrefix(lower, "--cwd=") {
 			continue
 		}
-		if !allowAPIKey && isGrokAuthOverrideArg(lower) {
-			// Strip BOTH separate-value (--api-key foo) AND equals-form
-			// (--api-key=foo) flags. For separate-value form we also skip
-			// the following token so the value doesn't leak through as a
-			// stray positional.
-			if !strings.Contains(lower, "=") {
-				skipNext = true
-			}
+
+		// `--always-approve` is owned by buildGrokACPArgs (gated on the
+		// per-workspace opt-in) — never let a caller inject it directly.
+		if lower == "--always-approve" || strings.HasPrefix(lower, "--always-approve=") {
 			continue
 		}
-		if !allowAlwaysApprove && isGrokAlwaysApproveArg(lower) {
-			// `--always-approve` / `--auto-approve` are boolean flags in
-			// every form xAI has documented — there's no separate-value to
-			// skip. Equals-form (`--always-approve=true`) is dropped wholesale
-			// because re-admitting `--always-approve=false` here would let a
-			// caller toggle the value back on via subsequent flag ordering.
+
+		// POSIX end-of-options delimiter: `stdio` is appended after these
+		// extras, so a surviving `--` would demote it to an operand. Drop it.
+		if a == "--" {
 			continue
 		}
-		if !allowAlwaysApprove && isGrokPermissionModeArg(lower) {
-			// `--permission-mode bypassPermissions` is xAI's documented escape
-			// hatch for the per-tool prompt gate (enterprise docs, ACP
-			// scripting mode). Inline equals-form (`--permission-mode=
-			// bypassPermissions`) is dropped here once both halves are
-			// visible in a single token; non-bypass values like `ask` fall
-			// through unchanged. Separate-value form (`--permission-mode
-			// bypassPermissions`) is admitted speculatively via the
-			// valuedFlags branch below and the trailing
-			// stripGrokPermissionModePairs sweep drops the pair only when
-			// the value resolves to a bypass selector.
-			if eq := strings.IndexByte(a, '='); eq >= 0 {
-				if isGrokPermissionModeBypassValue(a[eq+1:]) {
-					continue
-				}
-			}
-		}
-		if !allowAlwaysApprove && isGrokAllowRuleArg(lower) {
-			// `--allow <pattern>` adds a permission-policy rule (xAI
-			// enterprise docs). Rules are evaluated BEFORE the per-tool
-			// prompt, so a single `--allow "Bash(*)"` would auto-approve
-			// matching tool calls even with `--permission-mode default`
-			// pinned. Unlike `--permission-mode`, EVERY value to `--allow`
-			// is autonomous-execution-shaped, so we don't second-guess the
-			// value here — drop inline equals-form wholesale and let the
-			// trailing stripGrokAllowRulePairs sweep finish off the
-			// separate-value pair admitted via the valuedFlags branch.
-			if strings.HasPrefix(lower, "--allow=") {
-				continue
-			}
-		}
-		// Inline -c/--config form: `--config=auth.method=xai.api_key` or
-		// `--config=approval.mode=always`. Without inspection these would
-		// survive the explicit-flag strip and let the orchestrator escape the
-		// default opt-in gates.
-		if isGrokConfigOverrideArg(lower) {
-			if eq := strings.IndexByte(a, '='); eq >= 0 {
-				kv := a[eq+1:]
-				if !allowAPIKey && isGrokAuthConfigKV(kv) {
-					continue
-				}
-				if !allowAlwaysApprove && isGrokApprovalConfigKV(kv) {
-					continue
-				}
-			}
-		}
-		if valuedFlags[lower] {
-			// Separate-value -c/--config form: peek the value and drop the
-			// pair when it touches a gated config key. Same fail-closed
-			// posture as the inline form above; the trailing sweep below
-			// finishes the job once both tokens are visible.
-			if (!allowAPIKey || !allowAlwaysApprove) && isGrokConfigOverrideArg(lower) {
-				// Defer the decision to the next iteration via a closure
-				// over the next token: we cannot index forward here without
-				// duplicating the loop's skip/keep bookkeeping, so flag the
-				// pair via a dedicated keepNext sibling.
-				keepNext = true
-				cleaned = append(cleaned, a)
-				// Special-case: if the very next token would be a gated
-				// config kv, undo both appends. Implemented by scanning
-				// ahead inline rather than introducing a third state flag.
-				continue
-			}
-			keepNext = true
-		}
+
 		cleaned = append(cleaned, a)
 	}
-	// Second pass: drop any `-c|--config <gated-kv>` pair that the loop above
-	// admitted because the kv decision needed both tokens. Keeping this as a
-	// trailing sweep avoids growing the loop's state machine and keeps the
-	// happy path (no config args) zero-cost.
-	if !allowAPIKey {
-		cleaned = stripGrokAuthConfigPairs(cleaned)
-	}
-	if !allowAlwaysApprove {
-		cleaned = stripGrokApprovalConfigPairs(cleaned)
-		cleaned = stripGrokPermissionModePairs(cleaned)
-		cleaned = stripGrokAllowRulePairs(cleaned)
-	}
-	return cleaned
-}
-
-// isGrokConfigOverrideArg reports whether `lower` is the `-c` / `--config`
-// flag (in either bare or equals form). Case-insensitive; callers normalise
-// via strings.ToLower first.
-func isGrokConfigOverrideArg(lower string) bool {
-	return lower == "-c" || lower == "--config" ||
-		strings.HasPrefix(lower, "-c=") || strings.HasPrefix(lower, "--config=")
-}
-
-// isGrokAuthConfigKV reports whether a `-c`/`--config` value would let the
-// caller switch Grok off the default cached-token flow when API-key fallback
-// is opt-in. Three cases trigger the gate:
-//
-//   - The key references an API-key credential at the top-level — `model.api_key`,
-//     `model.env_key`, `xai.api_key`, `xai.env_key` — i.e. supplying the key
-//     itself or pointing at the env var that holds it.
-//   - The key references an API-key credential under a model-scoped section —
-//     xAI documents persistent API-key config as `[model.grok-build] api_key =
-//     "..."` (enterprise docs), which in dotted-path form is
-//     `model.<scope>.api_key` / `model.<scope>.env_key` for any scope name.
-//     The model-scoped form takes precedence over the active cached-token, so
-//     a `--config model.grok-build.api_key=xai-...` (or any other scope) must
-//     be gated the same way as the top-level form.
-//   - The auth-method selector picks the API-key path —
-//     `auth.method=xai.api_key` or `auth=xai.api_key`. `auth.method=cached_token`
-//     is the default we want to keep working, so we only strip values that
-//     actually escape to api-key auth.
-func isGrokAuthConfigKV(value string) bool {
-	lower := strings.ToLower(strings.TrimSpace(value))
-	if lower == "" {
-		return false
-	}
-	key := lower
-	val := ""
-	if eq := strings.IndexByte(lower, '='); eq >= 0 {
-		key = lower[:eq]
-		val = lower[eq+1:]
-	}
-	// TOML accepts whitespace around the `=`, e.g. `model.api_key = "xai-..."`.
-	// Strip it after the split so `key` and `val` match the bare dotted-path
-	// and value compared below — otherwise a `--config 'model.api_key = ...'`
-	// override would survive the gate despite EnableGrokAPIKeyFallback being
-	// false.
-	key = strings.TrimSpace(key)
-	val = strings.TrimSpace(val)
-	apiKeyKeys := []string{
-		"model.api_key", "model.env_key",
-		"xai.api_key", "xai.env_key",
-	}
-	for _, k := range apiKeyKeys {
-		if key == k {
-			return true
-		}
-	}
-	// Model-scoped form (`model.<scope>.api_key` / `model.<scope>.env_key`).
-	// xAI's enterprise docs document persistent API-key config as a model-
-	// scoped TOML section like `[model.grok-build] api_key = "..."`, which is
-	// rendered as a `model.<scope>.api_key` dotted-path in `-c`/`--config`
-	// args. We can't enumerate every model scope a host might have configured
-	// (or that xAI might ship in future releases), so any `model.<anything>
-	// .{api_key,env_key}` shape is treated as the same credential class as the
-	// top-level form. The first segment must be `model` and the last segment
-	// must be one of the credential keys — that lets `model.<scope>.foo` flow
-	// through if it ever maps to a non-credential field.
-	if strings.HasPrefix(key, "model.") {
-		if last := strings.LastIndexByte(key, '.'); last > len("model.")-1 && last < len(key)-1 {
-			tail := key[last+1:]
-			if tail == "api_key" || tail == "env_key" {
-				return true
-			}
-		}
-	}
-	// Auth-method selector escaping to api-key flow. We deliberately do NOT
-	// strip the default `cached_token` selection — it's the path the feature
-	// brief mandates and existing extra-args tests rely on.
-	if (key == "auth.method" || key == "auth") && val != "" {
-		if strings.Contains(val, "api_key") {
-			return true
-		}
-	}
-	return false
-}
-
-// stripGrokAuthConfigPairs removes `-c|--config <auth-kv>` pairs (separate-
-// value form) that survived sanitizeGrokACPExtraArgs' main loop. The loop
-// admits the pair speculatively because the kv decision needs both tokens;
-// this sweep drops it when the value targets an auth config key.
-func stripGrokAuthConfigPairs(in []string) []string {
-	out := make([]string, 0, len(in))
-	i := 0
-	for i < len(in) {
-		lower := strings.ToLower(in[i])
-		if (lower == "-c" || lower == "--config") && i+1 < len(in) {
-			if isGrokAuthConfigKV(in[i+1]) {
-				i += 2
-				continue
-			}
-		}
-		out = append(out, in[i])
-		i++
-	}
-	return out
-}
-
-// isGrokAllowRuleArg reports whether `lower` is the `--allow` policy-rule
-// flag (bare or equals form). xAI's enterprise docs describe `--allow` as a
-// permission-policy rule (e.g. `--allow "Bash(*)"`) whose rules are evaluated
-// BEFORE the per-tool prompt — so a single `--allow` survival is enough to
-// auto-approve matching tool calls even when `--permission-mode default` is
-// still pinned. Match is case-insensitive; callers normalise via
-// strings.ToLower first. `--deny` is intentionally NOT recognised here —
-// deny rules tighten the policy and are safe to admit on the conservative
-// default path.
-func isGrokAllowRuleArg(lower string) bool {
-	return lower == "--allow" || strings.HasPrefix(lower, "--allow=")
-}
-
-// stripGrokAllowRulePairs removes `--allow <pattern>` pairs (separate-value
-// form) that survived sanitizeGrokACPExtraArgs' main loop. The loop admits
-// the pair speculatively via the valuedFlags branch because the strip
-// decision needs both tokens; this sweep drops the pair when
-// Config.EnableGrokAlwaysApprove is false. Mirrors stripGrokPermissionModePairs
-// — same speculative-admit / trailing-sweep pattern.
-func stripGrokAllowRulePairs(in []string) []string {
-	out := make([]string, 0, len(in))
-	i := 0
-	for i < len(in) {
-		lower := strings.ToLower(in[i])
-		if lower == "--allow" && i+1 < len(in) {
-			i += 2
-			continue
-		}
-		out = append(out, in[i])
-		i++
-	}
-	return out
-}
-
-// isGrokAlwaysApproveArg reports whether a caller-supplied arg would let
-// Grok skip per-tool permission prompts. xAI documents `--always-approve`
-// as the canonical autonomous-execution flag; `--auto-approve` is the
-// equivalent name used by the design doc and other CLI agents. Each known
-// flag is enumerated explicitly — a broader prefix match would silently
-// strip flags we don't know about (e.g. a hypothetical `--always-approve-
-// for-readonly`) and risk breaking unrelated args future Grok releases
-// might ship. Match is case-insensitive; callers normalise via
-// strings.ToLower first.
-func isGrokAlwaysApproveArg(lower string) bool {
-	approveFlags := []string{
-		"--always-approve",
-		"--auto-approve",
-	}
-	for _, f := range approveFlags {
-		if lower == f || strings.HasPrefix(lower, f+"=") {
-			return true
-		}
-	}
-	return false
-}
-
-// isGrokApprovalConfigKV reports whether a `-c`/`--config` value would let
-// the caller switch Grok off the per-tool prompt flow when always-approve is
-// opt-in. Three cases trigger the gate:
-//
-//   - `approval.mode=always|auto` (or `approval=always|auto`) — flips the
-//     top-level approval selector to autonomous execution.
-//   - `tools.always_approve=true` / `tools.auto_approve=true` — the boolean
-//     toggle that the documented flag desugars to.
-//
-// `approval.mode=ask` (or any non-always selector) is left intact so callers
-// can still re-pin the conservative default explicitly.
-func isGrokApprovalConfigKV(value string) bool {
-	lower := strings.ToLower(strings.TrimSpace(value))
-	if lower == "" {
-		return false
-	}
-	key := lower
-	val := ""
-	if eq := strings.IndexByte(lower, '='); eq >= 0 {
-		key = lower[:eq]
-		val = lower[eq+1:]
-	}
-	// Mirror isGrokAuthConfigKV: trim whitespace around the `=` so a
-	// `--config 'approval_mode = always-approve'` (TOML-style spacing) is
-	// classified the same as the bare `approval_mode=always-approve` form.
-	key = strings.TrimSpace(key)
-	val = strings.TrimSpace(val)
-	// TOML accepts string values wrapped in `"…"` or `'…'`, and Grok's `-c`
-	// form preserves the quotes verbatim when xAI's docs spell the value as a
-	// quoted string (e.g. `--config permission_mode="bypassPermissions"`).
-	// Strip a single matched pair of surrounding quotes before the value
-	// comparisons below so a quoted bypass selector cannot survive
-	// sanitization just because the key=val text retained its TOML quoting.
-	val = trimGrokTOMLStringQuotes(val)
-	if (key == "tools.always_approve" || key == "tools.auto_approve") && (val == "true" || val == "1" || val == "yes" || val == "on") {
-		return true
-	}
-	// xAI's Modes and Commands page documents a `yolo = true` legacy
-	// shortcut that desugars to the same `always-approve` posture as
-	// `tools.always_approve = true`. Without this branch, a host with
-	// `/etc/grok/requirements.toml` pinning `yolo = true` would route past
-	// the approval gate (detectPinnedGrokRequirementsFile would not flag
-	// the line, and the per-process `--config yolo=false` neutralizer in
-	// grokPolicyNeutralizingConfigArgs would not be emitted) despite
-	// EnableGrokAlwaysApprove being false.
-	if key == "yolo" && (val == "true" || val == "1" || val == "yes" || val == "on") {
-		return true
-	}
-	// `approval_mode` is the legacy spelling of `approval.mode` xAI keeps
-	// accepting for backward compat. Same gated value set so a persisted
-	// `approval_mode = "always-approve"` cannot silently shadow the
-	// per-tool prompt selector.
-	if (key == "approval.mode" || key == "approval" || key == "approval_mode") && val != "" {
-		if val == "always" || val == "auto" || val == "auto-approve" || val == "always-approve" {
-			return true
-		}
-	}
-	// Config-form of `--permission-mode bypassPermissions` (the xAI enterprise
-	// docs name `bypassPermissions` explicitly; common variants share intent).
-	// `approval.permission_mode=ask` is the conservative default and is
-	// deliberately left intact. `ui.permission_mode` is xAI's documented
-	// persisted-config key for the same selector (the `[ui] permission_mode`
-	// TOML section), so we gate it on the same bypass-value set — otherwise a
-	// `-c ui.permission_mode=always-approve` would route around the
-	// `approval.permission_mode` / `permission_mode` gate and silently flip
-	// the spawned ACP child into auto-approval despite the workspace not
-	// opting into `EnableGrokAlwaysApprove`.
-	if (key == "approval.permission_mode" || key == "permission_mode" || key == "ui.permission_mode") && isGrokPermissionModeBypassValue(val) {
-		return true
-	}
-	// Config-form of `--allow <rule>` — xAI's enterprise docs describe the
-	// permission_rules TOML array (and its dotted `permission.rules` cousin)
-	// as a rule list `--allow` appends to. The list is heterogeneous though:
-	// xAI documents `action = "deny"` rules as policy-tightening (deny takes
-	// precedence) and `action = "allow"` rules as policy-loosening — only the
-	// latter routes around the per-tool prompt. Differentiate via
-	// grokPermissionRulesValueHasAllowAction so a deny-only rule (e.g. an MDM
-	// policy denying dangerous Bash patterns) is left intact on the
-	// conservative default path. The `policy.allow` / `permissions.allow` /
-	// `tools.allow` cousins are explicit allow lists by name — any non-empty
-	// value is by definition an allow rule and gates unconditionally.
-	switch key {
-	case "permission_rules", "permission.rules":
-		if grokPermissionRulesValueHasAllowAction(val) {
-			return true
-		}
-	case "policy.allow", "permissions.allow", "tools.allow":
-		if val != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// grokPermissionRulesValueHasAllowAction reports whether a serialised
-// `permission_rules` / `permission.rules` TOML value contains at least one
-// allow rule that would route around the per-tool prompt gate. Returns
-// false for empty values, empty arrays, and deny-only table forms — xAI's
-// enterprise docs treat `action = "deny"` rules as policy tightening
-// (deny takes precedence), so they are safe to preserve even when the
-// workspace has not opted into always-approve.
-//
-// The check is intentionally a substring scan over the lower-cased,
-// whitespace-stripped value rather than a full TOML parse: callers feed
-// us either an argv `-c key=value` string or a single TOML line from the
-// line-oriented requirements.toml scanner, and both can be answered
-// without reconstructing the full TOML AST. The legacy
-// `permission_rules = ["Bash(*)"]` form (string-only patterns, no
-// `action` field) is treated as allow because xAI documents bare string
-// patterns as allow shortcuts.
-func grokPermissionRulesValueHasAllowAction(value string) bool {
-	v := strings.TrimSpace(value)
-	if v == "" {
-		return false
-	}
-	// Empty TOML arrays in either bracket form are not allow rules.
-	if v == "[]" || v == "[ ]" {
-		return false
-	}
-	lower := strings.ToLower(v)
-	// Detect an `action = ...` KEY outside any quoted-string pattern. The
-	// prior heuristic looked for the substring `action` anywhere, which
-	// misclassifies a legacy bare-pattern array like `["Bash(*action*)"]`
-	// as table form and then — finding no `action="allow"` — returns false
-	// (i.e. treats it as safe). A bare-pattern array MUST be treated as an
-	// allow shortcut. So: walk the raw (case-folded) value, track whether
-	// we are inside `"..."` or `'...'`, and look for the literal `action`
-	// token followed (after optional whitespace) by `=`. If no such key
-	// exists at TOML level, the value is bare-pattern shorthand → allow.
-	if !lowerHasActionKey(lower) {
-		return true
-	}
-	// Table form with explicit action= entries. Flag only when at least one
-	// action is the documented allow selector. Strip whitespace so
-	// `action = "allow"`, `action="allow"`, and `action  =  "allow"` all
-	// match the same compact form. Tabs are also stripped so the scanner can
-	// answer for TOML hand-formatted with tab indentation.
-	compact := strings.Map(func(r rune) rune {
-		if r == ' ' || r == '\t' {
-			return -1
-		}
-		return r
-	}, lower)
-	return strings.Contains(compact, `action="allow"`) ||
-		strings.Contains(compact, "action='allow'") ||
-		strings.Contains(compact, "action=allow,") ||
-		strings.Contains(compact, "action=allow}") ||
-		strings.HasSuffix(compact, "action=allow")
-}
-
-// lowerHasActionKey reports whether `lower` (already case-folded) contains
-// an `action` TOML key — i.e. the literal token `action` appearing outside
-// any single- or double-quoted string and followed (after optional
-// whitespace/tabs) by `=`. This distinguishes a real table form like
-// `{action = "allow", ...}` from a bare pattern such as
-// `["Bash(*action*)"]` where the word `action` is only part of a quoted
-// pattern. TOML basic strings (double-quoted) DO support escape sequences
-// like `\"` and `\\`, so a naive paired-quote toggle would close the string
-// early on `"x\" action = deny"` and then mistake the trailing `action =`
-// for a real TOML key — letting a legacy bare-pattern allow rule slip past
-// the gate. Inside double-quoted strings we honour the TOML escape rule and
-// skip the byte after a backslash. TOML literal strings (single-quoted) do
-// NOT process escapes, so the single-quote branch stays a simple toggle.
-func lowerHasActionKey(lower string) bool {
-	inDouble := false
-	inSingle := false
-	for i := 0; i < len(lower); i++ {
-		c := lower[i]
-		if inDouble {
-			if c == '\\' && i+1 < len(lower) {
-				i++
-				continue
-			}
-			if c == '"' {
-				inDouble = false
-			}
-			continue
-		}
-		if inSingle {
-			if c == '\'' {
-				inSingle = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inDouble = true
-			continue
-		case '\'':
-			inSingle = true
-			continue
-		}
-		if c != 'a' || i+6 > len(lower) || lower[i:i+6] != "action" {
-			continue
-		}
-		// Token boundary on the left: the byte before `action` must not be a
-		// continuation of an identifier — otherwise we'd match `reaction`.
-		if i > 0 {
-			p := lower[i-1]
-			if (p >= 'a' && p <= 'z') || (p >= '0' && p <= '9') || p == '_' || p == '-' || p == '.' {
-				continue
-			}
-		}
-		j := i + 6
-		for j < len(lower) && (lower[j] == ' ' || lower[j] == '\t') {
-			j++
-		}
-		if j < len(lower) && lower[j] == '=' {
-			return true
-		}
-	}
-	return false
-}
-
-// isGrokPermissionModeArg reports whether `lower` is the `--permission-mode`
-// flag (bare or equals form). xAI's enterprise docs surface this flag as a
-// permission gate selector that, when set to `bypassPermissions`, disables
-// per-tool prompts — i.e. the same intent as `--always-approve` but routed
-// through a different surface. Recognised here so the always-approve gate
-// can fail closed on it; benign selectors like `default` or `plan` are left
-// intact.
-func isGrokPermissionModeArg(lower string) bool {
-	return lower == "--permission-mode" || lower == "--permission_mode" ||
-		strings.HasPrefix(lower, "--permission-mode=") || strings.HasPrefix(lower, "--permission_mode=")
-}
-
-// trimGrokTOMLStringQuotes strips a single matched pair of surrounding
-// TOML string quotes (`"…"` or `'…'`) from `s`. Used so a quoted bypass
-// selector like `permission_mode="bypassPermissions"` — which Grok's
-// `-c|--config` form preserves verbatim — is normalised to the bare
-// `bypassPermissions` token the sanitization gates compare against.
-// Mismatched / unbalanced quotes are returned unchanged so a value with a
-// stray quote does not silently lose a character.
-func trimGrokTOMLStringQuotes(s string) string {
-	if len(s) >= 2 {
-		first, last := s[0], s[len(s)-1]
-		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
-			return s[1 : len(s)-1]
-		}
-	}
-	return s
-}
-
-// isGrokPermissionModeBypassValue reports whether a `--permission-mode` value
-// would let the caller bypass per-tool permission prompts. `bypassPermissions`
-// is the canonical name from xAI's enterprise docs; the bare `bypass`,
-// `auto*`, and `always*` synonyms share the same intent and are gated to
-// fail closed too. `acceptEdits` is also gated because xAI's enterprise docs
-// describe it as auto-approving file edits without per-tool prompts —
-// strictly narrower than full `bypassPermissions` but still an auto-approval
-// surface that must stay behind Config.EnableGrokAlwaysApprove. Case- and
-// separator-insensitive.
-func isGrokPermissionModeBypassValue(value string) bool {
-	v := strings.ToLower(trimGrokTOMLStringQuotes(strings.TrimSpace(value)))
-	switch v {
-	case "bypasspermissions", "bypass-permissions", "bypass_permissions", "bypass",
-		"auto", "auto-approve", "auto_approve",
-		"always", "always-approve", "always_approve",
-		"acceptedits", "accept-edits", "accept_edits":
-		return true
-	}
-	return false
-}
-
-// stripGrokPermissionModePairs removes `--permission-mode <bypass-value>`
-// pairs (separate-value form) that survived sanitizeGrokACPExtraArgs' main
-// loop. The loop admits the pair speculatively via the valuedFlags branch
-// because the bypass decision needs both tokens; this sweep drops it only
-// when the value resolves to a bypass selector. Non-bypass values such as
-// `default` or `plan` flow through unchanged so callers can still pin a
-// conservative selector explicitly.
-func stripGrokPermissionModePairs(in []string) []string {
-	out := make([]string, 0, len(in))
-	i := 0
-	for i < len(in) {
-		lower := strings.ToLower(in[i])
-		if (lower == "--permission-mode" || lower == "--permission_mode") && i+1 < len(in) {
-			if isGrokPermissionModeBypassValue(in[i+1]) {
-				i += 2
-				continue
-			}
-		}
-		out = append(out, in[i])
-		i++
-	}
-	return out
-}
-
-// stripGrokApprovalConfigPairs removes `-c|--config <approval-kv>` pairs
-// (separate-value form) that survived sanitizeGrokACPExtraArgs' main loop.
-// Mirrors stripGrokAuthConfigPairs — same speculative-admit / trailing-sweep
-// pattern, just gated on the approval kv set instead of the auth kv set.
-func stripGrokApprovalConfigPairs(in []string) []string {
-	out := make([]string, 0, len(in))
-	i := 0
-	for i < len(in) {
-		lower := strings.ToLower(in[i])
-		if (lower == "-c" || lower == "--config") && i+1 < len(in) {
-			if isGrokApprovalConfigKV(in[i+1]) {
-				i += 2
-				continue
-			}
-		}
-		out = append(out, in[i])
-		i++
-	}
-	return out
+	return model, cleaned
 }
 
 // redactGrokACPArgsForLog masks credential-bearing values before the startup

@@ -2641,7 +2641,7 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 			return true
 		}
 		allowCommand = "grok"
-		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAPIKeyFallback, cfg.EnableGrokAlwaysApprove)
+		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAlwaysApprove)
 		dialogArgs = redactGrokACPArgsForLog(allowArgs)
 		denyOutput = "grok ACP session denied by user: not in allow list"
 	default:

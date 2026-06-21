@@ -2271,3 +2271,333 @@ func (sm *SessionManager) ShutdownAllSessions() {
 		_ = sm.EndSession(id)
 	}
 }
+
+/* --------------------------------------------------------------------------
+   Grok raw-CLI permission/approval flag helpers
+   --------------------------------------------------------------------------
+   These helpers gate Grok's autonomous-execution / permission-bypass flag
+   surfaces for the RAW `session_start` path (the managed headless `-p` turn
+   built above), independent of the ACP path in grok_acp.go. They were moved
+   here when grok 0.2.59 removed `grok agent`'s `--config` flag and the ACP
+   driver's `--config`-based neutralizer machinery was deleted — these were
+   the only members of that set still referenced (by buildGrokFlagArgs's
+   gate-off strips), so they live with their sole remaining consumer.
+   -------------------------------------------------------------------------- */
+
+// stripGrokAllowRulePairs removes `--allow <pattern>` pairs (separate-value
+// form) that survived sanitizeGrokACPExtraArgs' main loop. The loop admits
+// the pair speculatively via the valuedFlags branch because the strip
+// decision needs both tokens; this sweep drops the pair when
+// Config.EnableGrokAlwaysApprove is false. Mirrors stripGrokPermissionModePairs
+// — same speculative-admit / trailing-sweep pattern.
+func stripGrokAllowRulePairs(in []string) []string {
+	out := make([]string, 0, len(in))
+	i := 0
+	for i < len(in) {
+		lower := strings.ToLower(in[i])
+		if lower == "--allow" && i+1 < len(in) {
+			i += 2
+			continue
+		}
+		out = append(out, in[i])
+		i++
+	}
+	return out
+}
+
+// isGrokApprovalConfigKV reports whether a `-c`/`--config` value would let
+// the caller switch Grok off the per-tool prompt flow when always-approve is
+// opt-in. Three cases trigger the gate:
+//
+//   - `approval.mode=always|auto` (or `approval=always|auto`) — flips the
+//     top-level approval selector to autonomous execution.
+//   - `tools.always_approve=true` / `tools.auto_approve=true` — the boolean
+//     toggle that the documented flag desugars to.
+//
+// `approval.mode=ask` (or any non-always selector) is left intact so callers
+// can still re-pin the conservative default explicitly.
+func isGrokApprovalConfigKV(value string) bool {
+	lower := strings.ToLower(strings.TrimSpace(value))
+	if lower == "" {
+		return false
+	}
+	key := lower
+	val := ""
+	if eq := strings.IndexByte(lower, '='); eq >= 0 {
+		key = lower[:eq]
+		val = lower[eq+1:]
+	}
+	// Mirror isGrokAuthConfigKV: trim whitespace around the `=` so a
+	// `--config 'approval_mode = always-approve'` (TOML-style spacing) is
+	// classified the same as the bare `approval_mode=always-approve` form.
+	key = strings.TrimSpace(key)
+	val = strings.TrimSpace(val)
+	// TOML accepts string values wrapped in `"…"` or `'…'`, and Grok's `-c`
+	// form preserves the quotes verbatim when xAI's docs spell the value as a
+	// quoted string (e.g. `--config permission_mode="bypassPermissions"`).
+	// Strip a single matched pair of surrounding quotes before the value
+	// comparisons below so a quoted bypass selector cannot survive
+	// sanitization just because the key=val text retained its TOML quoting.
+	val = trimGrokTOMLStringQuotes(val)
+	if (key == "tools.always_approve" || key == "tools.auto_approve") && (val == "true" || val == "1" || val == "yes" || val == "on") {
+		return true
+	}
+	// xAI's Modes and Commands page documents a `yolo = true` legacy
+	// shortcut that desugars to the same `always-approve` posture as
+	// `tools.always_approve = true`. Without this branch, a host with
+	// `/etc/grok/requirements.toml` pinning `yolo = true` would route past
+	// the approval gate (detectPinnedGrokRequirementsFile would not flag
+	// the line, and the per-process `--config yolo=false` neutralizer in
+	// grokPolicyNeutralizingConfigArgs would not be emitted) despite
+	// EnableGrokAlwaysApprove being false.
+	if key == "yolo" && (val == "true" || val == "1" || val == "yes" || val == "on") {
+		return true
+	}
+	// `approval_mode` is the legacy spelling of `approval.mode` xAI keeps
+	// accepting for backward compat. Same gated value set so a persisted
+	// `approval_mode = "always-approve"` cannot silently shadow the
+	// per-tool prompt selector.
+	if (key == "approval.mode" || key == "approval" || key == "approval_mode") && val != "" {
+		if val == "always" || val == "auto" || val == "auto-approve" || val == "always-approve" {
+			return true
+		}
+	}
+	// Config-form of `--permission-mode bypassPermissions` (the xAI enterprise
+	// docs name `bypassPermissions` explicitly; common variants share intent).
+	// `approval.permission_mode=ask` is the conservative default and is
+	// deliberately left intact. `ui.permission_mode` is xAI's documented
+	// persisted-config key for the same selector (the `[ui] permission_mode`
+	// TOML section), so we gate it on the same bypass-value set — otherwise a
+	// `-c ui.permission_mode=always-approve` would route around the
+	// `approval.permission_mode` / `permission_mode` gate and silently flip
+	// the spawned ACP child into auto-approval despite the workspace not
+	// opting into `EnableGrokAlwaysApprove`.
+	if (key == "approval.permission_mode" || key == "permission_mode" || key == "ui.permission_mode") && isGrokPermissionModeBypassValue(val) {
+		return true
+	}
+	// Config-form of `--allow <rule>` — xAI's enterprise docs describe the
+	// permission_rules TOML array (and its dotted `permission.rules` cousin)
+	// as a rule list `--allow` appends to. The list is heterogeneous though:
+	// xAI documents `action = "deny"` rules as policy-tightening (deny takes
+	// precedence) and `action = "allow"` rules as policy-loosening — only the
+	// latter routes around the per-tool prompt. Differentiate via
+	// grokPermissionRulesValueHasAllowAction so a deny-only rule (e.g. an MDM
+	// policy denying dangerous Bash patterns) is left intact on the
+	// conservative default path. The `policy.allow` / `permissions.allow` /
+	// `tools.allow` cousins are explicit allow lists by name — any non-empty
+	// value is by definition an allow rule and gates unconditionally.
+	switch key {
+	case "permission_rules", "permission.rules":
+		if grokPermissionRulesValueHasAllowAction(val) {
+			return true
+		}
+	case "policy.allow", "permissions.allow", "tools.allow":
+		if val != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// grokPermissionRulesValueHasAllowAction reports whether a serialised
+// `permission_rules` / `permission.rules` TOML value contains at least one
+// allow rule that would route around the per-tool prompt gate. Returns
+// false for empty values, empty arrays, and deny-only table forms — xAI's
+// enterprise docs treat `action = "deny"` rules as policy tightening
+// (deny takes precedence), so they are safe to preserve even when the
+// workspace has not opted into always-approve.
+//
+// The check is intentionally a substring scan over the lower-cased,
+// whitespace-stripped value rather than a full TOML parse: callers feed
+// us either an argv `-c key=value` string or a single TOML line from the
+// line-oriented requirements.toml scanner, and both can be answered
+// without reconstructing the full TOML AST. The legacy
+// `permission_rules = ["Bash(*)"]` form (string-only patterns, no
+// `action` field) is treated as allow because xAI documents bare string
+// patterns as allow shortcuts.
+func grokPermissionRulesValueHasAllowAction(value string) bool {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return false
+	}
+	// Empty TOML arrays in either bracket form are not allow rules.
+	if v == "[]" || v == "[ ]" {
+		return false
+	}
+	lower := strings.ToLower(v)
+	// Detect an `action = ...` KEY outside any quoted-string pattern. The
+	// prior heuristic looked for the substring `action` anywhere, which
+	// misclassifies a legacy bare-pattern array like `["Bash(*action*)"]`
+	// as table form and then — finding no `action="allow"` — returns false
+	// (i.e. treats it as safe). A bare-pattern array MUST be treated as an
+	// allow shortcut. So: walk the raw (case-folded) value, track whether
+	// we are inside `"..."` or `'...'`, and look for the literal `action`
+	// token followed (after optional whitespace) by `=`. If no such key
+	// exists at TOML level, the value is bare-pattern shorthand → allow.
+	if !lowerHasActionKey(lower) {
+		return true
+	}
+	// Table form with explicit action= entries. Flag only when at least one
+	// action is the documented allow selector. Strip whitespace so
+	// `action = "allow"`, `action="allow"`, and `action  =  "allow"` all
+	// match the same compact form. Tabs are also stripped so the scanner can
+	// answer for TOML hand-formatted with tab indentation.
+	compact := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, lower)
+	return strings.Contains(compact, `action="allow"`) ||
+		strings.Contains(compact, "action='allow'") ||
+		strings.Contains(compact, "action=allow,") ||
+		strings.Contains(compact, "action=allow}") ||
+		strings.HasSuffix(compact, "action=allow")
+}
+
+// lowerHasActionKey reports whether `lower` (already case-folded) contains
+// an `action` TOML key — i.e. the literal token `action` appearing outside
+// any single- or double-quoted string and followed (after optional
+// whitespace/tabs) by `=`. This distinguishes a real table form like
+// `{action = "allow", ...}` from a bare pattern such as
+// `["Bash(*action*)"]` where the word `action` is only part of a quoted
+// pattern. TOML basic strings (double-quoted) DO support escape sequences
+// like `\"` and `\\`, so a naive paired-quote toggle would close the string
+// early on `"x\" action = deny"` and then mistake the trailing `action =`
+// for a real TOML key — letting a legacy bare-pattern allow rule slip past
+// the gate. Inside double-quoted strings we honour the TOML escape rule and
+// skip the byte after a backslash. TOML literal strings (single-quoted) do
+// NOT process escapes, so the single-quote branch stays a simple toggle.
+func lowerHasActionKey(lower string) bool {
+	inDouble := false
+	inSingle := false
+	for i := 0; i < len(lower); i++ {
+		c := lower[i]
+		if inDouble {
+			if c == '\\' && i+1 < len(lower) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+			continue
+		case '\'':
+			inSingle = true
+			continue
+		}
+		if c != 'a' || i+6 > len(lower) || lower[i:i+6] != "action" {
+			continue
+		}
+		// Token boundary on the left: the byte before `action` must not be a
+		// continuation of an identifier — otherwise we'd match `reaction`.
+		if i > 0 {
+			p := lower[i-1]
+			if (p >= 'a' && p <= 'z') || (p >= '0' && p <= '9') || p == '_' || p == '-' || p == '.' {
+				continue
+			}
+		}
+		j := i + 6
+		for j < len(lower) && (lower[j] == ' ' || lower[j] == '\t') {
+			j++
+		}
+		if j < len(lower) && lower[j] == '=' {
+			return true
+		}
+	}
+	return false
+}
+
+// trimGrokTOMLStringQuotes strips a single matched pair of surrounding
+// TOML string quotes (`"…"` or `'…'`) from `s`. Used so a quoted bypass
+// selector like `permission_mode="bypassPermissions"` — which Grok's
+// `-c|--config` form preserves verbatim — is normalised to the bare
+// `bypassPermissions` token the sanitization gates compare against.
+// Mismatched / unbalanced quotes are returned unchanged so a value with a
+// stray quote does not silently lose a character.
+func trimGrokTOMLStringQuotes(s string) string {
+	if len(s) >= 2 {
+		first, last := s[0], s[len(s)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
+// isGrokPermissionModeBypassValue reports whether a `--permission-mode` value
+// would let the caller bypass per-tool permission prompts. `bypassPermissions`
+// is the canonical name from xAI's enterprise docs; the bare `bypass`,
+// `auto*`, and `always*` synonyms share the same intent and are gated to
+// fail closed too. `acceptEdits` is also gated because xAI's enterprise docs
+// describe it as auto-approving file edits without per-tool prompts —
+// strictly narrower than full `bypassPermissions` but still an auto-approval
+// surface that must stay behind Config.EnableGrokAlwaysApprove. Case- and
+// separator-insensitive.
+func isGrokPermissionModeBypassValue(value string) bool {
+	v := strings.ToLower(trimGrokTOMLStringQuotes(strings.TrimSpace(value)))
+	switch v {
+	case "bypasspermissions", "bypass-permissions", "bypass_permissions", "bypass",
+		"auto", "auto-approve", "auto_approve",
+		"always", "always-approve", "always_approve",
+		"acceptedits", "accept-edits", "accept_edits":
+		return true
+	}
+	return false
+}
+
+// stripGrokPermissionModePairs removes `--permission-mode <bypass-value>`
+// pairs (separate-value form) that survived sanitizeGrokACPExtraArgs' main
+// loop. The loop admits the pair speculatively via the valuedFlags branch
+// because the bypass decision needs both tokens; this sweep drops it only
+// when the value resolves to a bypass selector. Non-bypass values such as
+// `default` or `plan` flow through unchanged so callers can still pin a
+// conservative selector explicitly.
+func stripGrokPermissionModePairs(in []string) []string {
+	out := make([]string, 0, len(in))
+	i := 0
+	for i < len(in) {
+		lower := strings.ToLower(in[i])
+		if (lower == "--permission-mode" || lower == "--permission_mode") && i+1 < len(in) {
+			if isGrokPermissionModeBypassValue(in[i+1]) {
+				i += 2
+				continue
+			}
+		}
+		out = append(out, in[i])
+		i++
+	}
+	return out
+}
+
+// stripGrokApprovalConfigPairs removes `-c|--config <approval-kv>` pairs
+// (separate-value form) that survived sanitizeGrokACPExtraArgs' main loop.
+// Mirrors stripGrokAuthConfigPairs — same speculative-admit / trailing-sweep
+// pattern, just gated on the approval kv set instead of the auth kv set.
+func stripGrokApprovalConfigPairs(in []string) []string {
+	out := make([]string, 0, len(in))
+	i := 0
+	for i < len(in) {
+		lower := strings.ToLower(in[i])
+		if (lower == "-c" || lower == "--config") && i+1 < len(in) {
+			if isGrokApprovalConfigKV(in[i+1]) {
+				i += 2
+				continue
+			}
+		}
+		out = append(out, in[i])
+		i++
+	}
+	return out
+}
