@@ -139,7 +139,15 @@ func grokLimitStateFromFrame(raw map[string]interface{}, now time.Time) (grokUsa
 				switch s := val.(type) {
 				case string:
 					ls := strings.ToLower(s)
-					if lk == "type" || lk == "event" || lk == "kind" || lk == "reason" || lk == "name" {
+					// `sessionupdate` / `session_update` cover Grok's ACP
+					// session-update frames — xAI's docs key the limit
+					// signal off `update.sessionUpdate` (e.g.
+					// `{"params":{"update":{"sessionUpdate":"usage_limit_reached"}}}`),
+					// so without these the walker classifies usage-limit
+					// session updates as no-signal even though the prefilter
+					// admitted them.
+					if lk == "type" || lk == "event" || lk == "kind" || lk == "reason" || lk == "name" ||
+						lk == "sessionupdate" || lk == "session_update" {
 						switch {
 						case strings.Contains(ls, "usage_limit_reached"),
 							strings.Contains(ls, "credit_limit_hit"),

@@ -417,3 +417,41 @@ func TestGrokLimitStateFromFrame_NoSignal(t *testing.T) {
 		t.Fatal("ordinary frame must not produce a limit state")
 	}
 }
+
+// Grok ACP session-update frames carry the limit signal under
+// `params.update.sessionUpdate` rather than the more generic
+// `type`/`event`/`kind` keys. Without the walker recognising the
+// `sessionUpdate` key, a real `usage_limit_reached` session-update frame
+// passes the prefilter but returns ok=false, leaving the usage-limit card
+// notice un-cached for that primary signal.
+func TestGrokLimitStateFromFrame_SessionUpdate(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	frame := map[string]interface{}{
+		"params": map[string]interface{}{
+			"update": map[string]interface{}{
+				"sessionUpdate": "usage_limit_reached",
+				"gate_message":  "You've hit your Grok limit.",
+				"gate_url":      "https://grok.com/supergrok",
+			},
+		},
+	}
+	st, ok := grokLimitStateFromFrame(frame, now)
+	if !ok || st.Severity != grokLimitReached {
+		t.Fatalf("want reached, got ok=%v sev=%q", ok, st.Severity)
+	}
+	if st.Message == "" || !strings.Contains(st.UpgradeURL, "supergrok") {
+		t.Fatalf("message/url not captured: %+v", st)
+	}
+
+	frameSnake := map[string]interface{}{
+		"params": map[string]interface{}{
+			"update": map[string]interface{}{
+				"session_update": "credit_limit_upsell_shown",
+			},
+		},
+	}
+	st, ok = grokLimitStateFromFrame(frameSnake, now)
+	if !ok || st.Severity != grokLimitApproaching {
+		t.Fatalf("want approaching from snake_case session_update, got ok=%v sev=%q", ok, st.Severity)
+	}
+}
