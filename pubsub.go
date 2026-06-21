@@ -1947,6 +1947,20 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 		}
 	}
 
+	// Grok on the EXECUTE path: a plain `grok <prompt>` here would launch
+	// Grok's interactive TUI (no -p) and hang until the timeout — the device
+	// routes by command type, and any grok command that arrives as `execute`
+	// rather than `session_start` bypasses StartSession's buildGrokInteractiveArgs.
+	// Rewrite the argv to the same managed headless form (plain output for this
+	// stdout-capturing path) so grok runs one turn and exits. Subcommands
+	// (`grok models`, …) pass through unchanged. This runs BEFORE the Unix
+	// branch below so macOS/Linux dispatches the rewritten argv too — otherwise
+	// runLocalCommandUnix would exec the original `grok <prompt>` verbatim and
+	// hang there.
+	if isGrokCommand(cmd) {
+		args = buildGrokExecuteArgs(args)
+	}
+
 	// Unix (macOS/Linux): exec the command directly. The terminal-service
 	// already wraps shell-bound commands (built-ins, &&/||, pipes) in
 	// `bash -c "..."` before dispatch, so here we just run cmd + args with
@@ -1977,17 +1991,6 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 		script := strings.Join(args[1:], " ")
 		encoded := encodeForPowerShell(script)
 		return runEncodedPowerShellCommand(encoded, workDir, timeout)
-	}
-
-	// Grok on the EXECUTE path: a plain `grok <prompt>` here would launch
-	// Grok's interactive TUI (no -p) and hang until the timeout — the device
-	// routes by command type, and any grok command that arrives as `execute`
-	// rather than `session_start` bypasses StartSession's buildGrokInteractiveArgs.
-	// Rewrite the argv to the same managed headless form (plain output for this
-	// stdout-capturing path) so grok runs one turn and exits. Subcommands
-	// (`grok models`, …) pass through unchanged.
-	if isGrokCommand(cmd) {
-		args = buildGrokExecuteArgs(args)
 	}
 
 	// Original behavior for non-PowerShell commands
