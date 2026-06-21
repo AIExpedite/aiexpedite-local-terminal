@@ -1534,6 +1534,14 @@ func buildGrokInteractiveArgs(args []string) []string {
 		"--compaction-mode": true, "--compaction-detail": true,
 		"--rules": true, "--system-prompt-override": true,
 		"--leader-socket": true, "--debug-file": true,
+		// Permission-policy rule flags: xAI's enterprise headless docs document
+		// `--allow <pattern>` / `--deny <pattern>` as per-tool policy rules
+		// (e.g. `--allow "Bash(git *)" --deny "Bash(rm -rf *)"`). Without these
+		// entries the loop would treat the rule value as a prompt word and the
+		// bare flag would slot in immediately before the appended `-p` — Grok
+		// would then consume `-p` as the rule value, dropping the managed
+		// prompt and/or the intended allow/deny rule.
+		"--allow": true, "--deny": true,
 		// Session continuation: xAI's docs list -s/--session-id and -r/--resume
 		// as value-taking common flags. Without them, e.g. `grok --resume abc
 		// continue work` would land "abc" in promptParts, then the appended
@@ -1559,8 +1567,23 @@ func buildGrokInteractiveArgs(args []string) []string {
 	// `--cwd` value (per xAI's headless flag docs) and still routes through the
 	// managed `-p` builder, instead of treating "sessions" as a subcommand and
 	// returning early.
+	//
+	// Require the carve-out to be UNAMBIGUOUS: the leading positional matches a
+	// known subcommand AND the total free-positional count is ≤ 2 (i.e. just
+	// `models` / `sessions` or two-token shapes like `sessions list`, `mcp
+	// install`). Three-or-more free positionals after flag-folding is the
+	// signature of an unquoted prose prompt that happens to start with a
+	// subcommand-name word — `grok help me fix tests`, `grok sessions should
+	// persist` — and must fall through to the `-p` builder so the prompt is
+	// folded into a single `-p` value instead of being parsed as a subcommand
+	// invocation with stray positional words. The narrower threshold trades
+	// support for rare 3-token subcommand calls (`grok sessions show <id>` —
+	// also expressible with flag/equals form) for the much more common prose
+	// prompt case the Codex review flagged.
 	{
 		skipNext := false
+		positionalCount := 0
+		var firstPositional string
 		for i, a := range args {
 			if skipNext {
 				skipNext = false
@@ -1572,10 +1595,13 @@ func buildGrokInteractiveArgs(args []string) []string {
 				}
 				continue
 			}
-			if grokKnownSubcommands[strings.ToLower(a)] {
-				return args
+			if positionalCount == 0 {
+				firstPositional = strings.ToLower(a)
 			}
-			break // first non-flag positional decides
+			positionalCount++
+		}
+		if firstPositional != "" && grokKnownSubcommands[firstPositional] && positionalCount <= 2 {
+			return args
 		}
 	}
 

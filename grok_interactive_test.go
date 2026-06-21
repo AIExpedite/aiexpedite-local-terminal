@@ -230,6 +230,110 @@ func TestBuildGrokInteractiveArgs_SubcommandPreScanSkipsPromptFlagValues(t *test
 	}
 }
 
+// TestBuildGrokInteractiveArgs_PreservesAllowDenyRuleValues guards the xAI
+// enterprise headless docs `--allow <pattern>` / `--deny <pattern>` policy
+// rule flags. Without these entries in valuedFlags, the rule value lands in
+// promptParts and the bare flag slots in immediately before the appended
+// managed `-p`, so Grok would then consume `-p` as the rule value — dropping
+// the managed prompt and/or the intended allow/deny rules.
+func TestBuildGrokInteractiveArgs_PreservesAllowDenyRuleValues(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "--allow keeps its pattern; prompt remains intact",
+			in:   []string{"--allow", "Bash(git *)", "fix", "the", "bug"},
+			want: []string{"--output-format", "streaming-json", "--always-approve", "--allow", "Bash(git *)", "-p", "fix the bug"},
+		},
+		{
+			name: "--deny keeps its pattern; prompt remains intact",
+			in:   []string{"--deny", "Bash(rm -rf *)", "ship", "it"},
+			want: []string{"--output-format", "streaming-json", "--always-approve", "--deny", "Bash(rm -rf *)", "-p", "ship it"},
+		},
+		{
+			name: "allow + deny together (xAI docs example)",
+			in:   []string{"--allow", "Bash(git *)", "--deny", "Bash(rm -rf *)", "land", "the", "fix"},
+			want: []string{"--output-format", "streaming-json", "--always-approve", "--allow", "Bash(git *)", "--deny", "Bash(rm -rf *)", "-p", "land the fix"},
+		},
+		{
+			name: "caller-supplied -p with allow/deny — managed -p still wins, prompt preserved",
+			in:   []string{"-p", "fix it", "--allow", "Bash(git *)", "--deny", "Bash(rm -rf *)"},
+			want: []string{"--output-format", "streaming-json", "--always-approve", "--allow", "Bash(git *)", "--deny", "Bash(rm -rf *)", "-p", "fix it"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv
+// guards the narrowed subcommand pre-scan: a leading subcommand-name word
+// no longer short-circuits to verbatim argv when the trailing positional
+// count is ≥ 3 — that shape is the unquoted prose prompt the headless
+// builder exists to fix (`grok help me fix tests`, `grok sessions should
+// persist`). Unambiguous shapes (`grok models`, `grok sessions list`) still
+// carve out and forward argv untouched.
+func TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv(t *testing.T) {
+	cases := []struct {
+		name      string
+		in        []string
+		want      []string
+		carvedOut bool
+	}{
+		{
+			name:      "bare subcommand carves out",
+			in:        []string{"models"},
+			want:      []string{"models"},
+			carvedOut: true,
+		},
+		{
+			name:      "two-token subcommand carves out (sessions list)",
+			in:        []string{"sessions", "list"},
+			want:      []string{"sessions", "list"},
+			carvedOut: true,
+		},
+		{
+			name:      "two-token subcommand carves out (mcp install)",
+			in:        []string{"mcp", "install"},
+			want:      []string{"mcp", "install"},
+			carvedOut: true,
+		},
+		{
+			name:      "subcommand with flag also carves out",
+			in:        []string{"sessions", "--json"},
+			want:      []string{"sessions", "--json"},
+			carvedOut: true,
+		},
+		{
+			name:      "prose prompt leading with subcommand word folds into -p (help me fix tests)",
+			in:        []string{"help", "me", "fix", "tests"},
+			want:      []string{"--output-format", "streaming-json", "--always-approve", "-p", "help me fix tests"},
+			carvedOut: false,
+		},
+		{
+			name:      "prose prompt with three positional words (sessions should persist)",
+			in:        []string{"sessions", "should", "persist"},
+			want:      []string{"--output-format", "streaming-json", "--always-approve", "-p", "sessions should persist"},
+			carvedOut: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDetectCLITerminalEvent_Grok(t *testing.T) {
 	if !detectCLITerminalEvent("grok", `{"type":"end"}`) {
 		t.Fatal(`grok "end" event should be terminal`)
