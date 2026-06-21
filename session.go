@@ -1505,8 +1505,9 @@ var grokKnownSubcommands = map[string]bool{
 // second token (`unrecognized subcommand 'me'`), and we'd reintroduce the
 // tokenisation failure the headless `-p` path exists to fix. Restricting the
 // 2-positional carve-out to recognised verbs (`list`, `install`, `add`, …)
-// keeps documented grammars (`sessions list`, `mcp install`, `models list`)
-// verbatim while letting prose fall through to the managed `-p` builder.
+// keeps documented grammars (`sessions list`, `mcp install`, `models list`,
+// `agent stdio`) verbatim while letting prose fall through to the managed
+// `-p` builder.
 var grokSubcommandActions = map[string]bool{
 	"list": true, "ls": true,
 	"add": true, "remove": true, "rm": true, "delete": true, "del": true,
@@ -1516,7 +1517,7 @@ var grokSubcommandActions = map[string]bool{
 	"set": true, "unset": true,
 	"enable": true, "disable": true,
 	"start": true, "stop": true, "restart": true, "status": true,
-	"run": true, "exec": true,
+	"run": true, "exec": true, "stdio": true,
 	"create": true, "new": true, "init": true,
 	"login": true, "logout": true,
 	"clear": true, "reset": true, "purge": true,

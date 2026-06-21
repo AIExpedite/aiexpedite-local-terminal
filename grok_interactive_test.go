@@ -423,6 +423,18 @@ func TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv(t *t
 			carvedOut: true,
 		},
 		{
+			// xAI documents `grok agent stdio` as the ACP entrypoint
+			// (https://docs.x.ai/build/cli/headless-scripting#ACP). Without
+			// `stdio` in grokSubcommandActions, the 2-positional carve-out
+			// would not fire and the builder would rewrite the call to
+			// `grok ... -p "agent stdio"`, turning the JSON-RPC agent launch
+			// into a prose prompt.
+			name:      "two-token subcommand carves out (agent stdio)",
+			in:        []string{"agent", "stdio"},
+			want:      []string{"agent", "stdio"},
+			carvedOut: true,
+		},
+		{
 			name:      "subcommand with flag also carves out",
 			in:        []string{"sessions", "--json"},
 			want:      []string{"sessions", "--json"},
