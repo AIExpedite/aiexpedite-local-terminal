@@ -341,7 +341,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return err
 	}
 
-	args := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove, opts.AllowAPIKeyFallback)
+	args := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove)
 
 	// Isolated GROK_HOME (replaces the old `--config <key>=` security
 	// neutralizers, which are GONE as of grok 0.2.59 — `grok agent` rejects
@@ -357,7 +357,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// Fail closed if isolation can't be established: with `--config` gone, the
 	// argv has no neutralizers, so launching with the inherited (potentially
 	// unsafe) GROK_HOME would silently bypass the workspace's opt-in gates.
-	isolatedHome, err := setupIsolatedGrokHome()
+	isolatedHome, err := setupIsolatedGrokHome(opts.AllowAPIKeyFallback)
 	if err != nil {
 		return fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)
 	}
@@ -1081,14 +1081,16 @@ const grokACPDefaultModel = "grok-build"
 // explicit per-workspace opt-in (Config.EnableGrokAlwaysApprove) rather than
 // something a signed grok_acp_start can flip via extra args.
 //
-// allowAPIKeyFallback mirrors the env-sanitiser's gate: when true, caller-
-// supplied `--api-key{,-env}` / `--auth{,-method}` flags are preserved on the
-// argv so a workspace that has opted into API-key auth via
-// Config.EnableGrokAPIKeyFallback can actually pass the credential to the
-// child. When false (the default), those flags are stripped so the
-// XAI_API_KEY / argv side-doors stay closed.
-func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove, allowAPIKeyFallback bool) []string {
-	model, sanitized := sanitizeGrokACPExtraArgs(extraArgs, grokACPDefaultModel, allowAlwaysApprove, allowAPIKeyFallback)
+// `--api-key{,-env}` / `--auth{,-method}` are NOT in `grok agent`'s accepted
+// flag set (constraint #1 above) — passing them makes the child exit with
+// "unexpected argument" instead of starting the JSON-RPC handshake. So they
+// are stripped unconditionally by sanitizeGrokACPExtraArgs regardless of
+// Config.EnableGrokAPIKeyFallback. The opt-in fallback flows through the
+// supported channels instead: XAI_API_KEY env (preserved by sanitizeGrokACPEnv
+// when AllowAPIKeyFallback=true) and the persisted `[model] api_key` line that
+// setupIsolatedGrokHome copies into the isolated config.toml on the same gate.
+func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
+	model, sanitized := sanitizeGrokACPExtraArgs(extraArgs, grokACPDefaultModel, allowAlwaysApprove)
 
 	args := []string{"agent", "--model", model}
 	if allowAlwaysApprove {
@@ -1123,9 +1125,17 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove, allowAPIKeyFallbac
 // missing auth file is NOT fatal — we proceed with just the clean config.toml
 // and let grok surface any auth error through the normal ACP handshake.
 //
+// allowAPIKeyFallback opts in to preserving the user's persistent
+// `[model] api_key = "..."` entry from the source `config.toml` into the
+// isolated config. Without this, users who opted into API-key fallback but
+// keep their key in `~/.grok/config.toml` (xAI's documented persistent form)
+// and do NOT export XAI_API_KEY would silently lose API-key auth in the
+// isolated session. All other persisted config (approval/permission knobs,
+// other model.* fields, other tables) stays excluded by design.
+//
 // Returns the temp dir path. The caller (Start) owns its lifecycle and removes
 // it after the child exits (waitForExit) or on any pre-spawn failure.
-func setupIsolatedGrokHome() (string, error) {
+func setupIsolatedGrokHome(allowAPIKeyFallback bool) (string, error) {
 	dir, err := os.MkdirTemp("", "grok-acp-home-")
 	if err != nil {
 		return "", fmt.Errorf("create isolated grok home: %w", err)
@@ -1157,19 +1167,80 @@ func setupIsolatedGrokHome() (string, error) {
 		}
 	}
 
-	// Minimal clean config.toml — deliberately carries no api_key and no
-	// approval/permission knobs, so none of the user's real persisted policy
-	// leaks into the isolated session.
+	// Minimal clean config.toml — deliberately carries no approval/permission
+	// knobs, so none of the user's real persisted policy leaks into the
+	// isolated session. When allowAPIKeyFallback is true and the source
+	// `config.toml` contains `[model] api_key = "..."`, that single line is
+	// carried over so the opt-in fallback also works for users whose key lives
+	// in xAI's documented persistent form (not just `XAI_API_KEY`).
 	// `auto_update = false` matches xAI's documented headless/scripting guidance:
 	// without it, an updater check can race `grok agent stdio` and dump non-JSON
 	// stdout that readStream treats as a fatal `grok_acp_error`.
-	const cleanConfig = "[cli]\ninstaller = \"internal\"\nauto_update = false\n"
-	if werr := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cleanConfig), 0o600); werr != nil {
+	cfg := "[cli]\ninstaller = \"internal\"\nauto_update = false\n"
+	if allowAPIKeyFallback && srcBase != "" {
+		if apiKey := readGrokPersistedAPIKey(filepath.Join(srcBase, "config.toml")); apiKey != "" {
+			cfg += "\n[model]\napi_key = " + apiKey + "\n"
+		}
+	}
+	if werr := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cfg), 0o600); werr != nil {
 		_ = os.RemoveAll(dir)
 		return "", fmt.Errorf("write isolated config.toml: %w", werr)
 	}
 
 	return dir, nil
+}
+
+// readGrokPersistedAPIKey returns the raw TOML value (quoted or literal, as
+// found) of `[model] api_key` from the given source `config.toml`, or "" when
+// the file is missing/unreadable or the key is absent. Returning the raw value
+// preserves whichever quoting style the user wrote (`"xai-..."`, `'xai-...'`,
+// or basic strings) without re-quoting heuristics that could corrupt embedded
+// characters. Scoped tightly: only the `[model]` section's `api_key` scalar is
+// considered — section-qualified `model.api_key = ...` at the document root is
+// also accepted. Tracks the active section using the same line-oriented sweep
+// as detectPinnedSystemGrokRequirementsFile, with inline `#` strip and the
+// same array-of-tables guard.
+func readGrokPersistedAPIKey(path string) string {
+	if path == "" {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	const maxBytes = 1 << 20
+	scanner := bufio.NewScanner(io.LimitReader(f, maxBytes))
+	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+	var currentSection string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = grokTOMLStripInlineComment(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") && !strings.HasPrefix(line, "[[") {
+			currentSection = strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		bareKey := strings.ToLower(strings.TrimSpace(line[:eq]))
+		key := bareKey
+		if currentSection != "" && !strings.Contains(bareKey, ".") {
+			key = currentSection + "." + bareKey
+		}
+		if key == "model.api_key" {
+			return strings.TrimSpace(line[eq+1:])
+		}
+	}
+	return ""
 }
 
 // grokSystemRequirementsPath is the documented system-level pinned-config
@@ -1609,8 +1680,10 @@ func setEnvVar(env []string, key, value string) []string {
 //   - cleaned is the remaining extras with dangerous/incompatible tokens
 //     dropped: the grok-0.2.59-rejected `--config*` / `--permission-mode*` /
 //     `--no-auto-update` / `--auto-update`, the credential flags `--api-key*`
-//     / `--auth*` (stripped UNLESS allowAPIKeyFallback is true — see the
-//     env-sanitiser's matching XAI_API_KEY gate), the `--cwd*` containment
+//     / `--auth*` (stripped UNCONDITIONALLY — `grok agent` does not accept
+//     them and would reject the argv with "unexpected argument"; the API-key
+//     fallback opt-in flows through XAI_API_KEY env and the persisted
+//     `[model] api_key` config.toml line instead), the `--cwd*` containment
 //     side-door, `--always-approve` / `--auto-approve` (owned by buildGrokACPArgs), the
 //     duplicate entry tokens (`agent`/`stdio`/`chat`/`tui`/`run`), and the
 //     POSIX `--` end-of-options delimiter. `--allow <pattern>` / `--allow=…`
@@ -1620,7 +1693,7 @@ func setEnvVar(env []string, key, value string) []string {
 //     sweep so a signed grok_acp_start cannot route around the per-tool prompt
 //     by handing `--allow Bash(*)` through extras. `--deny` is policy-tightening
 //     and is preserved on both sides of the gate.
-func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwaysApprove, allowAPIKeyFallback bool) (string, []string) {
+func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwaysApprove bool) (string, []string) {
 	model := defaultModel
 	cleaned := make([]string, 0, len(extraArgs))
 	skipNext := false
@@ -1683,22 +1756,14 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwa
 			continue
 		}
 
-		// Credential side-doors: API-key auth stays neutralised by the
-		// isolated GROK_HOME, so strip any caller attempt to point grok at an
-		// API key / alternative auth method via argv. UNLESS the workspace
-		// has explicitly opted in via Config.EnableGrokAPIKeyFallback, in
-		// which case we preserve `--api-key{,-env}` / `--auth{,-method}` and
-		// their values so the orchestrator can hand the credential to the
-		// child (mirrors the XAI_API_KEY preservation in sanitizeGrokACPEnv).
+		// Credential side-doors: `grok agent` does not accept `--api-key{,-env}`
+		// / `--auth{,-method}` (constraint #1 in buildGrokACPArgs) — passing
+		// them makes the child exit with "unexpected argument" instead of
+		// starting the JSON-RPC handshake. Strip unconditionally, even when
+		// EnableGrokAPIKeyFallback is true: the opt-in fallback flows through
+		// XAI_API_KEY env (sanitizeGrokACPEnv) and the persisted
+		// `[model] api_key` config.toml line (setupIsolatedGrokHome), not argv.
 		if isGrokAuthOverrideArg(lower) {
-			if allowAPIKeyFallback {
-				cleaned = append(cleaned, a)
-				if !strings.Contains(a, "=") && i+1 < len(extraArgs) {
-					cleaned = append(cleaned, extraArgs[i+1])
-					skipNext = true
-				}
-				continue
-			}
 			if !strings.Contains(a, "=") && i+1 < len(extraArgs) {
 				skipNext = true
 			}
@@ -1762,14 +1827,14 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwa
 }
 
 // redactGrokACPArgsForLog masks credential-bearing values before the startup
-// banner is printed. Necessary because when EnableGrokAPIKeyFallback is true,
-// buildGrokACPArgs deliberately preserves `--api-key{,-env}` / `--auth{,-method}`
-// verbatim — without this the next-arg value (e.g. `xai-...`) would leak into
-// stdout/log files unlike the normal shell-command path which routes through
-// redactCommandForLog. Equals-form values are masked inline; separate-value
-// form masks the following token. Output is passed through redactArgs so any
-// other secret pattern (bearer tokens, AWS keys, etc.) the per-arg regex
-// recognises in caller-supplied extra args is also caught.
+// banner is printed. sanitizeGrokACPExtraArgs strips `--api-key{,-env}` /
+// `--auth{,-method}` from the argv unconditionally (grok agent rejects them),
+// so in normal flow there is nothing to mask here. Kept as defence-in-depth in
+// case a future code path appends a credential-bearing token to args without
+// routing through the sanitiser; equals-form values are masked inline and
+// separate-value form masks the following token. Output is passed through
+// redactArgs so other secret patterns (bearer tokens, AWS keys, etc.) the
+// per-arg regex recognises in caller-supplied extra args are also caught.
 func redactGrokACPArgsForLog(args []string) []string {
 	out := make([]string, len(args))
 	maskNext := false

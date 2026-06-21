@@ -23,10 +23,10 @@ import (
 // --no-auto-update, flags BEFORE the `stdio` subcommand, and --always-approve
 // omitted by default.
 func TestBuildGrokACPArgs_DefaultContract(t *testing.T) {
-	got := buildGrokACPArgs(nil, false, false)
+	got := buildGrokACPArgs(nil, false)
 	want := []string{"agent", "--model", "grok-build", "stdio"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("buildGrokACPArgs(nil, false, false) = %#v, want %#v", got, want)
+		t.Fatalf("buildGrokACPArgs(nil, false) = %#v, want %#v", got, want)
 	}
 }
 
@@ -34,15 +34,15 @@ func TestBuildGrokACPArgs_DefaultContract(t *testing.T) {
 // appears (between --model grok-build and stdio) ONLY when allowAlwaysApprove
 // is true.
 func TestBuildGrokACPArgs_AlwaysApproveOnlyWhenEnabled(t *testing.T) {
-	off := buildGrokACPArgs(nil, false, false)
+	off := buildGrokACPArgs(nil, false)
 	if grokArgsContain(off, "--always-approve") {
 		t.Fatalf("--always-approve must be absent when disabled; got %#v", off)
 	}
 
-	on := buildGrokACPArgs(nil, true, false)
+	on := buildGrokACPArgs(nil, true)
 	want := []string{"agent", "--model", "grok-build", "--always-approve", "stdio"}
 	if !reflect.DeepEqual(on, want) {
-		t.Fatalf("buildGrokACPArgs(nil, true, false) = %#v, want %#v", on, want)
+		t.Fatalf("buildGrokACPArgs(nil, true) = %#v, want %#v", on, want)
 	}
 	// --always-approve must precede the stdio subcommand (stdio takes no opts).
 	idxApprove, idxStdio := -1, -1
@@ -96,7 +96,7 @@ func TestBuildGrokACPArgs_CallerModelOverridesDefault(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false, false)
+			got := buildGrokACPArgs(c.args, false)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("buildGrokACPArgs(%#v) = %#v, want %#v", c.args, got, c.want)
 			}
@@ -134,7 +134,7 @@ func TestBuildGrokACPArgs_StripsIncompatibleFlags(t *testing.T) {
 	want := []string{"agent", "--model", "grok-build", "stdio"}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false, false)
+			got := buildGrokACPArgs(c.args, false)
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("buildGrokACPArgs(%#v) = %#v, want %#v (incompatible flag leaked)", c.args, got, want)
 			}
@@ -146,7 +146,7 @@ func TestBuildGrokACPArgs_StripsIncompatibleFlags(t *testing.T) {
 // special-case (valid `grok agent` knobs the orchestrator may pass) flow
 // through verbatim and stay BEFORE the stdio subcommand.
 func TestBuildGrokACPArgs_PreservesUnknownGrokAgentFlags(t *testing.T) {
-	got := buildGrokACPArgs([]string{"--reasoning-effort", "high", "--model", "grok-4"}, false, false)
+	got := buildGrokACPArgs([]string{"--reasoning-effort", "high", "--model", "grok-4"}, false)
 	want := []string{"agent", "--model", "grok-4", "--reasoning-effort", "high", "stdio"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs preserved unknown flags wrong: got %#v, want %#v", got, want)
@@ -183,7 +183,7 @@ func TestSanitizeGrokACPExtraArgs_ExtractsModelAndStripsDangerousFlags(t *testin
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			model, cleaned := sanitizeGrokACPExtraArgs(c.args, "grok-build", false, false)
+			model, cleaned := sanitizeGrokACPExtraArgs(c.args, "grok-build", false)
 			if model != c.wantModel {
 				t.Fatalf("model = %q, want %q", model, c.wantModel)
 			}
@@ -208,7 +208,7 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 	}
 	t.Setenv("GROK_HOME", realHome)
 
-	dir, err := setupIsolatedGrokHome()
+	dir, err := setupIsolatedGrokHome(false)
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 func TestSetupIsolatedGrokHome_MissingAuthTolerated(t *testing.T) {
 	t.Setenv("GROK_HOME", t.TempDir()) // empty: no auth.json
 
-	dir, err := setupIsolatedGrokHome()
+	dir, err := setupIsolatedGrokHome(false)
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome must tolerate missing auth: %v", err)
 	}
@@ -295,54 +295,82 @@ func grokArgsContain(args []string, target string) bool {
 	return false
 }
 
-// TestBuildGrokACPArgs_PreservesAPIKeyArgsWhenFallbackEnabled pins the inverse
-// of the default-strip: when the workspace has opted into API-key auth via
-// Config.EnableGrokAPIKeyFallback, the caller-supplied `--api-key{,-env}` /
-// `--auth{,-method}` flags (and their separate-value tokens) MUST flow through
-// to the child argv so the orchestrator can hand the credential to grok. The
-// matching XAI_API_KEY env-var survival is covered in
-// TestSanitizeGrokACPEnv_PreservesXAIKeyWhenFallbackEnabled.
-func TestBuildGrokACPArgs_PreservesAPIKeyArgsWhenFallbackEnabled(t *testing.T) {
+// TestBuildGrokACPArgs_StripsAPIKeyArgsUnconditionally pins that caller-
+// supplied `--api-key{,-env}` / `--auth{,-method}` (and their separate-value
+// tokens) NEVER reach the argv — not even when the workspace opts into
+// EnableGrokAPIKeyFallback. `grok agent` rejects these flags ("unexpected
+// argument"); the opt-in fallback rides XAI_API_KEY (sanitizeGrokACPEnv) and
+// the persisted `[model] api_key` config.toml line (setupIsolatedGrokHome)
+// instead. Both surfaces are pinned by dedicated tests
+// (TestSanitizeGrokACPEnv_PreservesXAIKeyWhenFallbackEnabled and
+// TestSetupIsolatedGrokHome_PreservesPersistedAPIKeyWhenFallbackEnabled).
+func TestBuildGrokACPArgs_StripsAPIKeyArgsUnconditionally(t *testing.T) {
 	cases := []struct {
 		name string
 		args []string
-		want []string
 	}{
-		{
-			"api_key_separate_value",
-			[]string{"--api-key", "xai-abc"},
-			[]string{"agent", "--model", "grok-build", "--api-key", "xai-abc", "stdio"},
-		},
-		{
-			"api_key_equals_form",
-			[]string{"--api-key=xai-abc"},
-			[]string{"agent", "--model", "grok-build", "--api-key=xai-abc", "stdio"},
-		},
-		{
-			"api_key_env_separate_value",
-			[]string{"--api-key-env", "OTHER_KEY_VAR"},
-			[]string{"agent", "--model", "grok-build", "--api-key-env", "OTHER_KEY_VAR", "stdio"},
-		},
-		{
-			"auth_method_separate_value",
-			[]string{"--auth", "xai.api_key"},
-			[]string{"agent", "--model", "grok-build", "--auth", "xai.api_key", "stdio"},
-		},
+		{"api_key_separate_value", []string{"--api-key", "xai-abc"}},
+		{"api_key_equals_form", []string{"--api-key=xai-abc"}},
+		{"api_key_env_separate_value", []string{"--api-key-env", "OTHER_KEY_VAR"}},
+		{"auth_method_separate_value", []string{"--auth", "xai.api_key"}},
 	}
+	defaultContract := []string{"agent", "--model", "grok-build", "stdio"}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false, true)
-			if !reflect.DeepEqual(got, c.want) {
-				t.Fatalf("buildGrokACPArgs(%#v, false, true) = %#v, want %#v", c.args, got, c.want)
+			got := buildGrokACPArgs(c.args, false)
+			if !reflect.DeepEqual(got, defaultContract) {
+				t.Fatalf("buildGrokACPArgs(%#v, false) = %#v, want %#v — api-key arg leaked into argv", c.args, got, defaultContract)
 			}
-			// And the gate-off path still strips them (regression guard for
-			// the inverse default).
-			off := buildGrokACPArgs(c.args, false, false)
-			defaultContract := []string{"agent", "--model", "grok-build", "stdio"}
-			if !reflect.DeepEqual(off, defaultContract) {
-				t.Fatalf("buildGrokACPArgs(%#v, false, false) leaked: got %#v, want %#v", c.args, off, defaultContract)
+			gotApprove := buildGrokACPArgs(c.args, true)
+			wantApprove := []string{"agent", "--model", "grok-build", "--always-approve", "stdio"}
+			if !reflect.DeepEqual(gotApprove, wantApprove) {
+				t.Fatalf("buildGrokACPArgs(%#v, true) = %#v, want %#v — api-key arg leaked under always-approve gate", c.args, gotApprove, wantApprove)
 			}
 		})
+	}
+}
+
+// TestSetupIsolatedGrokHome_PreservesPersistedAPIKeyWhenFallbackEnabled pins
+// the second leg of the EnableGrokAPIKeyFallback opt-in: when the user keeps
+// their key in xAI's documented persistent form (`~/.grok/config.toml` with
+// `[model] api_key`) and does NOT export XAI_API_KEY, the isolated home must
+// carry that line over so the fallback actually works. With the gate off, the
+// isolated config must stay clean (zero credential exposure).
+func TestSetupIsolatedGrokHome_PreservesPersistedAPIKeyWhenFallbackEnabled(t *testing.T) {
+	realHome := t.TempDir()
+	body := "[model]\napi_key = \"xai-persisted\"\n[approval]\nalways_approve = true\n"
+	if err := os.WriteFile(filepath.Join(realHome, "config.toml"), []byte(body), 0o600); err != nil {
+		t.Fatalf("seed source config.toml: %v", err)
+	}
+	t.Setenv("GROK_HOME", realHome)
+
+	on, err := setupIsolatedGrokHome(true)
+	if err != nil {
+		t.Fatalf("setupIsolatedGrokHome(true): %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(on) })
+	cfgOn, err := os.ReadFile(filepath.Join(on, "config.toml"))
+	if err != nil {
+		t.Fatalf("isolated config.toml not written: %v", err)
+	}
+	if !strings.Contains(string(cfgOn), "xai-persisted") {
+		t.Fatalf("expected persisted api_key carried into isolated config; got %q", cfgOn)
+	}
+	if strings.Contains(string(cfgOn), "always_approve") {
+		t.Fatalf("approval knob must NOT leak even when api-key fallback is on; got %q", cfgOn)
+	}
+
+	off, err := setupIsolatedGrokHome(false)
+	if err != nil {
+		t.Fatalf("setupIsolatedGrokHome(false): %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(off) })
+	cfgOff, err := os.ReadFile(filepath.Join(off, "config.toml"))
+	if err != nil {
+		t.Fatalf("isolated config.toml not written: %v", err)
+	}
+	if strings.Contains(string(cfgOff), "api_key") || strings.Contains(string(cfgOff), "xai-persisted") {
+		t.Fatalf("api_key must stay stripped when fallback gate is closed; got %q", cfgOff)
 	}
 }
 
@@ -727,7 +755,7 @@ func TestBuildGrokACPArgs_StripsCallerAllowRuleUnderGateOff(t *testing.T) {
 	defaultContract := []string{"agent", "--model", "grok-build", "stdio"}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false, false)
+			got := buildGrokACPArgs(c.args, false)
 			if !reflect.DeepEqual(got, defaultContract) {
 				t.Fatalf("buildGrokACPArgs(%#v, false, false) = %#v, want %#v — caller --allow leaked past gate", c.args, got, defaultContract)
 			}
@@ -759,7 +787,7 @@ func TestBuildGrokACPArgs_PreservesCallerAllowRuleUnderGateOn(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, true, false)
+			got := buildGrokACPArgs(c.args, true)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("buildGrokACPArgs(%#v, true, false) = %#v, want %#v", c.args, got, c.want)
 			}
@@ -768,11 +796,11 @@ func TestBuildGrokACPArgs_PreservesCallerAllowRuleUnderGateOn(t *testing.T) {
 
 	denyArgs := []string{"--deny", "Bash(rm -rf *)"}
 	wantOn := []string{"agent", "--model", "grok-build", "--always-approve", "--deny", "Bash(rm -rf *)", "stdio"}
-	if got := buildGrokACPArgs(denyArgs, true, false); !reflect.DeepEqual(got, wantOn) {
+	if got := buildGrokACPArgs(denyArgs, true); !reflect.DeepEqual(got, wantOn) {
 		t.Fatalf("--deny stripped under gate-on: got %#v, want %#v", got, wantOn)
 	}
 	wantOff := []string{"agent", "--model", "grok-build", "--deny", "Bash(rm -rf *)", "stdio"}
-	if got := buildGrokACPArgs(denyArgs, false, false); !reflect.DeepEqual(got, wantOff) {
+	if got := buildGrokACPArgs(denyArgs, false); !reflect.DeepEqual(got, wantOff) {
 		t.Fatalf("--deny stripped under gate-off: got %#v, want %#v", got, wantOff)
 	}
 }
