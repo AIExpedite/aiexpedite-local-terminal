@@ -1206,21 +1206,163 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// Strip inline `# comment` so `always_approve = true # managed`
-		// reduces to `true` and the boolean match below still hits.
-		if hash := strings.IndexByte(line, '#'); hash >= 0 {
-			line = strings.TrimSpace(line[:hash])
+		// Quote-aware inline-`#` strip so `always_approve = true # managed`
+		// reduces to `true` while a `pattern = "Bash(#magic)"` literal stays
+		// intact — a naive strings.IndexByte('#') would corrupt the latter and
+		// silently let a pinned allow rule with a `#` in its pattern route
+		// past the gate.
+		line = grokTOMLStripInlineComment(line)
+		if line == "" {
+			continue
 		}
 		lower := strings.ToLower(line)
 
 		if !allowAPIKey && lineMentionsGrokAuthPin(lower) {
 			return fmt.Errorf("grok requirements pin API-key auth in %s; refusing to spawn — set Config.EnableGrokAPIKeyFallback=true to opt in, or remove the pinned credential", path)
 		}
-		if !allowAlwaysApprove && lineMentionsGrokApprovalPin(lower) {
+		if allowAlwaysApprove {
+			continue
+		}
+		if lineMentionsGrokApprovalPin(lower) {
 			return fmt.Errorf("grok requirements pin a permissive approval policy in %s; refusing to spawn — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the pinned policy", path)
+		}
+		// `permission_rules` / `permission.rules` and the `policy.allow` /
+		// `permissions.allow` / `tools.allow` cousins are documented xAI
+		// allow-list keys that the boolean/mode-style scan above does NOT
+		// catch. They have to be handled here because operators on managed
+		// hosts commonly pin a `permission_rules = ["Bash(*)"]` or
+		// `permission_rules = [{action = "allow", ...}]` allow rule in the
+		// system layer — and that layer is NOT redirected by GROK_HOME, so
+		// the isolation in setupIsolatedGrokHome cannot neutralise it.
+		// Multi-line array form needs continuation accumulation before
+		// classification or a `[\n {action = "allow", ...}\n]` would be read
+		// as the first-line value `[` and miss the allow entry entirely.
+		eq := strings.IndexByte(lower, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(lower[:eq])
+		rawVal := strings.TrimSpace(line[eq+1:])
+		switch key {
+		case "permission_rules", "permission.rules":
+			if grokTOMLBracketDepth(rawVal) > 0 {
+				rawVal = accumulateGrokTOMLArrayContinuation(scanner, rawVal)
+			}
+			if grokPermissionRulesValueHasAllowAction(rawVal) {
+				return fmt.Errorf("grok requirements pin a permissive permission_rules allow entry in %s; refusing to spawn — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the pinned rule", path)
+			}
+		case "policy.allow", "permissions.allow", "tools.allow":
+			cleaned := strings.TrimSpace(strings.Trim(rawVal, `"'`))
+			if cleaned != "" && cleaned != "[]" && cleaned != "[ ]" {
+				return fmt.Errorf("grok requirements pin a permissive %s entry in %s; refusing to spawn — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the pinned rule", key, path)
+			}
 		}
 	}
 	return nil
+}
+
+// grokTOMLStripInlineComment removes a trailing `# ...` comment from a TOML
+// line, honoring `"..."` / `'...'` string contents so a `#` inside a quoted
+// pattern (`pattern = "Bash(#magic)"`) is preserved. Without this the line-
+// oriented requirements scanner would corrupt valid pinned values that
+// embed `#` in a pattern literal — silently letting them route past the
+// approval gate.
+func grokTOMLStripInlineComment(line string) string {
+	inDouble := false
+	inSingle := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if inDouble {
+			if c == '\\' && i+1 < len(line) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+		case '\'':
+			inSingle = true
+		case '#':
+			return strings.TrimRight(line[:i], " \t")
+		}
+	}
+	return line
+}
+
+// grokTOMLBracketDepth counts net `[` minus `]` characters outside TOML basic
+// ("...") and literal ('...') strings, so a `pattern = "Bash[*]"` literal
+// inside `permission_rules` doesn't unbalance the count.
+func grokTOMLBracketDepth(s string) int {
+	depth := 0
+	inDouble := false
+	inSingle := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inDouble {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inDouble = true
+		case '\'':
+			inSingle = true
+		case '[':
+			depth++
+		case ']':
+			depth--
+		}
+	}
+	return depth
+}
+
+// accumulateGrokTOMLArrayContinuation reads continuation lines from scanner
+// while the running bracket depth (starting at the depth of `initial`) is
+// still positive, joining them into a single logical value. Used by
+// detectPinnedSystemGrokRequirements so a `permission_rules = [\n {action =
+// "allow", ...}\n]` hand-formatted across multiple lines is classified on
+// the full array value rather than the first-line `[`. Bounded at 256
+// continuation lines so a corrupted file with no closing `]` can't stall
+// the launch.
+func accumulateGrokTOMLArrayContinuation(scanner *bufio.Scanner, initial string) string {
+	depth := grokTOMLBracketDepth(initial)
+	if depth <= 0 {
+		return initial
+	}
+	parts := []string{initial}
+	const maxContinuationLines = 256
+	for i := 0; i < maxContinuationLines && depth > 0 && scanner.Scan(); i++ {
+		ln := strings.TrimSpace(grokTOMLStripInlineComment(scanner.Text()))
+		if ln == "" {
+			continue
+		}
+		parts = append(parts, ln)
+		depth += grokTOMLBracketDepth(ln)
+	}
+	return strings.Join(parts, " ")
 }
 
 // lineMentionsGrokAuthPin reports whether a normalised TOML line names an

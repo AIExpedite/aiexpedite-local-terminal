@@ -417,3 +417,128 @@ func TestDetectPinnedSystemGrokRequirements_BenignFilePasses(t *testing.T) {
 		t.Fatalf("benign requirements file must not trigger refusal: %v", err)
 	}
 }
+
+// TestDetectPinnedSystemGrokRequirements_RefusesOnLegacyBarePatternAllowRule
+// pins the allow-rule axis the boolean/mode-style scan does NOT catch: a
+// system-layer `permission_rules = ["Bash(*)"]` (the documented legacy bare-
+// pattern allow shortcut) MUST refuse to spawn when EnableGrokAlwaysApprove
+// is false, because the isolated GROK_HOME does not redirect /etc/grok and
+// Grok would otherwise auto-approve matching tools behind the workspace's
+// back.
+func TestDetectPinnedSystemGrokRequirements_RefusesOnLegacyBarePatternAllowRule(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "permission_rules = [\"Bash(*)\"]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed pinned requirements: %v", err)
+	}
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = path
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
+		t.Fatalf("expected refusal when bare-pattern allow rule pinned and approval gate closed")
+	}
+	if err := detectPinnedSystemGrokRequirements(false, true); err != nil {
+		t.Fatalf("expected pass when EnableGrokAlwaysApprove=true acknowledges pin: %v", err)
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_RefusesOnMultilineAllowActionRule
+// pins the multi-line accumulation path: `permission_rules` whose array body
+// spans multiple lines must be reassembled before classification — otherwise
+// the first-line value `[` would be misread as a benign empty-shape opener
+// and an explicit `{action = "allow", pattern = "..."}` on the next line
+// would slip past the gate.
+func TestDetectPinnedSystemGrokRequirements_RefusesOnMultilineAllowActionRule(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "permission_rules = [\n  { action = \"allow\", pattern = \"Bash(*)\" }\n]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed pinned requirements: %v", err)
+	}
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = path
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
+		t.Fatalf("expected refusal when multi-line allow-action rule pinned and approval gate closed")
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_PassesOnDenyOnlyMultilineRule guards
+// the inverse of the previous case: an MDM-style deny-only
+// `permission_rules` (deny takes precedence in xAI's policy model) MUST NOT
+// trigger refusal — wiping it would weaken host security in pursuit of a
+// non-existent allow.
+func TestDetectPinnedSystemGrokRequirements_PassesOnDenyOnlyMultilineRule(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "permission_rules = [\n  { action = \"deny\", pattern = \"Bash(rm -rf*)\" }\n]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed deny-only requirements: %v", err)
+	}
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = path
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err != nil {
+		t.Fatalf("deny-only permission_rules must NOT trigger refusal: %v", err)
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_RefusesOnPolicyAllowKey covers the
+// `policy.allow` / `permissions.allow` / `tools.allow` cousins. Any non-empty
+// value is by definition an allow list and must refuse to spawn when the
+// approval gate is closed.
+func TestDetectPinnedSystemGrokRequirements_RefusesOnPolicyAllowKey(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"policy_allow", "policy.allow = \"Bash(*)\"\n"},
+		{"permissions_allow", "permissions.allow = \"Bash(*)\"\n"},
+		{"tools_allow", "tools.allow = \"Bash(*)\"\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "requirements.toml")
+			if err := os.WriteFile(path, []byte(c.body), 0o600); err != nil {
+				t.Fatalf("seed pinned requirements: %v", err)
+			}
+			orig := grokSystemRequirementsPath
+			grokSystemRequirementsPath = path
+			t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+			if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
+				t.Fatalf("expected refusal for non-empty %s pin", c.name)
+			}
+			if err := detectPinnedSystemGrokRequirements(false, true); err != nil {
+				t.Fatalf("expected pass when EnableGrokAlwaysApprove=true acknowledges pin: %v", err)
+			}
+		})
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_QuoteAwareInlineCommentStrip pins the
+// quote-aware `#` strip: a pinned allow rule whose pattern legitimately
+// contains a `#` (e.g. `pattern = "Bash(#magic)"`) must survive comment
+// stripping intact and still be classified as an allow. A naive
+// IndexByte('#') strip would chop the value at the in-pattern `#` and the
+// downstream classifier would never see the `action = "allow"` token.
+func TestDetectPinnedSystemGrokRequirements_QuoteAwareInlineCommentStrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "permission_rules = [{ action = \"allow\", pattern = \"Bash(#magic)\" }] # mdm\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed pinned requirements: %v", err)
+	}
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = path
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
+		t.Fatalf("expected refusal — quote-aware strip must keep the in-pattern `#` and still flag the allow rule")
+	}
+}
