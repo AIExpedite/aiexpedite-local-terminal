@@ -231,6 +231,9 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 	if !strings.Contains(string(cfg), `installer = "internal"`) {
 		t.Fatalf("config.toml missing clean installer line: %q", cfg)
 	}
+	if !strings.Contains(string(cfg), `auto_update = false`) {
+		t.Fatalf("config.toml missing auto_update = false: %q", cfg)
+	}
 	if strings.Contains(string(cfg), "api_key") || strings.Contains(string(cfg), "approve") {
 		t.Fatalf("clean config.toml must not carry api_key/approval knobs: %q", cfg)
 	}

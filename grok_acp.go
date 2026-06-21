@@ -1108,7 +1108,10 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove, allowAPIKeyFallbac
 //   - a copy of the real `grok login` auth file, so cached-token auth keeps
 //     working without us inheriting anything else from the user's real
 //     ~/.grok (api_key, auto-approve, pinned requirements.toml, …)
-//   - a minimal clean config.toml (`[cli]\ninstaller = "internal"\n`)
+//   - a minimal clean config.toml (`[cli]\ninstaller = "internal"\nauto_update = false\n`)
+//     — `auto_update = false` suppresses the headless updater check, which can
+//     otherwise race `grok agent stdio` and emit non-JSON stdout that readStream
+//     would treat as a fatal `grok_acp_error`
 //
 // This replaces the dead `--config <key>=` neutralizer machinery: grok 0.2.59
 // rejects `--config` outright, so we can no longer clear persisted config via
@@ -1157,7 +1160,10 @@ func setupIsolatedGrokHome() (string, error) {
 	// Minimal clean config.toml — deliberately carries no api_key and no
 	// approval/permission knobs, so none of the user's real persisted policy
 	// leaks into the isolated session.
-	const cleanConfig = "[cli]\ninstaller = \"internal\"\n"
+	// `auto_update = false` matches xAI's documented headless/scripting guidance:
+	// without it, an updater check can race `grok agent stdio` and dump non-JSON
+	// stdout that readStream treats as a fatal `grok_acp_error`.
+	const cleanConfig = "[cli]\ninstaller = \"internal\"\nauto_update = false\n"
 	if werr := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cleanConfig), 0o600); werr != nil {
 		_ = os.RemoveAll(dir)
 		return "", fmt.Errorf("write isolated config.toml: %w", werr)
