@@ -1889,6 +1889,16 @@ func resolveExecutable(command string) string {
 		return path
 	}
 
+	// Grok's installer drops the binary in ~/.grok/bin and only touches shell
+	// rc, which macOS GUI/launchd agent processes never source. Mirror the ACP
+	// manager's fallback (grok_acp.go) so catalog-name `grok` sessions launched
+	// from StartSession can still find the official install on a PATH miss.
+	if isGrokCommand(command) {
+		if p := resolveGrokInstallerBinary(); p != "" {
+			return p
+		}
+	}
+
 	return command
 }
 

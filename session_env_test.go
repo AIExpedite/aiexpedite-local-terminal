@@ -13,7 +13,10 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -357,5 +360,32 @@ func TestResolveExecutable_PreservesCwdRelativePath(t *testing.T) {
 			t.Errorf("resolveExecutable(%q) = %q, want %q (cwd-relative paths must pass through unchanged)",
 				in, got, in)
 		}
+	}
+}
+
+// TestResolveExecutable_GrokInstallerBinFallback pins that catalog-name "grok"
+// sessions launched via StartSession fall back to the installer's ~/.grok/bin
+// location on a PATH miss — the same fallback GrokACPManager.Start applies.
+// Without this, macOS GUI / launchd agents (which never source shell rc and so
+// inherit a sparse PATH that excludes ~/.grok/bin) would hand the literal
+// "grok" to exec, and proc.Start would fail with "executable file not found".
+func TestResolveExecutable_GrokInstallerBinFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("installer-bin fallback covered on unix; mirrors systemInfo_test.go")
+	}
+	home := t.TempDir()
+	grokBinDir := filepath.Join(home, ".grok", "bin")
+	if err := os.MkdirAll(grokBinDir, 0o755); err != nil {
+		t.Fatalf("mkdir grok bin dir: %v", err)
+	}
+	stub := filepath.Join(grokBinDir, "grok")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatalf("write stub: %v", err)
+	}
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("HOME", home)
+
+	if got := resolveExecutable("grok"); got != stub {
+		t.Errorf("resolveExecutable(\"grok\") = %q, want %q (installer-bin fallback)", got, stub)
 	}
 }
