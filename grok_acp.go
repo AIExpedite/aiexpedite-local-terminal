@@ -1392,7 +1392,9 @@ func lineMentionsGrokAuthPin(lower string) bool {
 // lineMentionsGrokApprovalPin reports whether a normalised TOML line pins one
 // of the approval bypasses (`always_approve = true`, `auto_approve = true`,
 // `approval.mode = "always"|"auto"`, `yolo = true`, `permission_mode =
-// "bypass*"`). Same flat-keyword approach as the auth pin scanner.
+// "bypass*"`, or a non-empty allow-list such as `permission_rules =
+// ["Bash(*)"]` / `policy.allow = [...]`). Same flat-keyword approach as the
+// auth pin scanner.
 func lineMentionsGrokApprovalPin(lower string) bool {
 	eq := strings.IndexByte(lower, '=')
 	if eq < 0 {
@@ -1407,6 +1409,16 @@ func lineMentionsGrokApprovalPin(lower string) bool {
 		return val == "always" || val == "auto"
 	case strings.Contains(key, "permission_mode") || strings.Contains(key, "permission-mode"):
 		return strings.HasPrefix(val, "bypass")
+	case strings.Contains(key, "permission_rules") ||
+		strings.Contains(key, "permission-rules") ||
+		strings.HasSuffix(key, "permission.rules") ||
+		strings.HasSuffix(key, "policy.allow") ||
+		strings.HasSuffix(key, ".allow") ||
+		key == "allow" || key == "allow_rules" || key == "allowlist":
+		// Any non-empty allow rule auto-approves matching tools, which is
+		// the same bypass surface as `always_approve = true`. Empty list /
+		// empty string ⇒ deliberate clear, treat as benign.
+		return val != "" && val != "[]"
 	}
 	return false
 }

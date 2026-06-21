@@ -386,6 +386,59 @@ func TestDetectPinnedSystemGrokRequirements_RefusesOnPinnedAlwaysApprove(t *test
 	}
 }
 
+// TestDetectPinnedSystemGrokRequirements_RefusesOnPinnedPermissionRules
+// covers the allow-list bypass surface (e.g. `permission_rules = ["Bash(*)"]`
+// or `policy.allow = [...]`) that the boolean/mode-style approval pins miss.
+// A non-empty allow rule auto-approves matching tools just like
+// `always_approve = true`, so it must trip the same fail-closed refusal.
+func TestDetectPinnedSystemGrokRequirements_RefusesOnPinnedPermissionRules(t *testing.T) {
+	cases := map[string]string{
+		"flat permission_rules": "permission_rules = [\"Bash(*)\"]\n",
+		"section permission":    "[permission]\nrules = [\"Bash(*)\"]\nallow = [\"Read(*)\"]\n",
+		"policy allow":          "[policy]\nallow = [\"Bash(*)\"]\n",
+		"top-level allow":       "allow = [\"Bash(*)\"]\n",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "requirements.toml")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatalf("seed pinned requirements: %v", err)
+			}
+			orig := grokSystemRequirementsPath
+			grokSystemRequirementsPath = path
+			t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+			if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
+				t.Fatalf("expected refusal when permission allow-list pinned and approval gate closed")
+			}
+			if err := detectPinnedSystemGrokRequirements(false, true); err != nil {
+				t.Fatalf("expected pass when EnableGrokAlwaysApprove=true acknowledges pin: %v", err)
+			}
+		})
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_EmptyPermissionRulesPasses guards
+// the explicit-clear case: `permission_rules = []` is the operator deliberately
+// blanking the system layer, the same way `api_key = ""` is treated as a clear
+// for the auth path.
+func TestDetectPinnedSystemGrokRequirements_EmptyPermissionRulesPasses(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "permission_rules = []\n[policy]\nallow = []\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed empty allow-list requirements: %v", err)
+	}
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = path
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err != nil {
+		t.Fatalf("empty allow-list must not trigger refusal: %v", err)
+	}
+}
+
 // TestDetectPinnedSystemGrokRequirements_MissingFileTolerated pins the
 // best-effort contract: when there is no system requirements file at all the
 // scan returns nil (a missing file is the common case on non-managed hosts).
