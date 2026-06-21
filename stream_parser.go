@@ -40,15 +40,22 @@ func extractDisplayText(command, line string) string {
 		return line // passthrough malformed JSON
 	}
 
-	cmdLower := strings.ToLower(command)
+	// Route by the same basename normalization the session router and
+	// detectCLITerminalEvent use (commandBaseName in session.go) so an
+	// explicit path like `/home/user/.grok/bin/grok` or `C:\tools\grok.exe`
+	// — which buildInteractiveCLIArgs already shapes as the streaming-json
+	// `-p` headless turn — picks the matching parser here too. Without this
+	// normalisation a path-launched session would fall through to the
+	// default case and publish raw NDJSON frames as chat text.
+	base := commandBaseName(command)
 	switch {
-	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
+	case strings.HasPrefix(base, "claude"):
 		return extractClaudeDisplayText(raw)
-	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
+	case strings.HasPrefix(base, "codex"):
 		return extractCodexDisplayText(raw)
-	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
+	case strings.HasPrefix(base, "gemini"):
 		return extractGeminiDisplayText(raw)
-	case cmdLower == "grok" || strings.HasPrefix(cmdLower, "grok"):
+	case strings.HasPrefix(base, "grok"):
 		return extractGrokDisplayText(raw)
 	default:
 		return line // passthrough unknown CLI agents

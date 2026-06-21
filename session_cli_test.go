@@ -1139,6 +1139,68 @@ func TestExtractDisplayText_Grok_NonJsonPassthrough(t *testing.T) {
 	}
 }
 
+// TestExtractDisplayText_RoutesByBasename guards parser selection against
+// path-launched sessions: buildInteractiveCLIArgs and detectCLITerminalEvent
+// both classify via commandBaseName, so an explicit grok path like
+// `/home/user/.grok/bin/grok` or `C:\tools\grok.exe` is shaped as the
+// managed streaming-json `-p` headless turn. extractDisplayText must use the
+// same normalisation — otherwise the parser fell through to default and
+// raw NDJSON frames were emitted as chat text. Same risk for claude / codex
+// / gemini installed at a non-bare path.
+func TestExtractDisplayText_RoutesByBasename(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		line    string
+		want    string
+	}{
+		{
+			name:    "grok absolute unix path",
+			command: "/home/user/.grok/bin/grok",
+			line:    `{"type":"text","text":"hello"}`,
+			want:    "hello",
+		},
+		{
+			name:    "grok windows path with .exe",
+			command: `C:\tools\grok.exe`,
+			line:    `{"type":"text","text":"hello"}`,
+			want:    "hello",
+		},
+		{
+			name:    "grok windows path mixed case",
+			command: `C:\Tools\Grok.EXE`,
+			line:    `{"type":"text","text":"hi"}`,
+			want:    "hi",
+		},
+		{
+			name:    "claude absolute unix path skips assistant recap",
+			command: "/usr/local/bin/claude",
+			line:    `{"type":"assistant","message":{"content":[{"type":"text","text":"recap"}]}}`,
+			want:    "",
+		},
+		{
+			name:    "codex windows shim routes to codex parser",
+			command: `C:\Users\u\AppData\Roaming\npm\codex.cmd`,
+			line:    `{"type":"turn.started"}`,
+			want:    "",
+		},
+		{
+			name:    "gemini absolute path routes to gemini parser",
+			command: "/opt/bin/gemini",
+			line:    `{"type":"message","role":"assistant","content":"hi"}`,
+			want:    "hi",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractDisplayText(tc.command, tc.line)
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 /* --------------------------------------------------------------------------
    detectPromptFromJSON
    ------------------------------------------------------------------------ */

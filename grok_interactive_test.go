@@ -186,6 +186,50 @@ func TestBuildGrokInteractiveArgs_PreservesResumeAndSessionIDValues(t *testing.T
 	}
 }
 
+// TestBuildGrokInteractiveArgs_SubcommandPreScanSkipsPromptFlagValues guards
+// the same pre-scan against `-p`/`--single`: their value is the first word of
+// the prompt, which can collide with a subcommand name (`help`, `models`,
+// `sessions`, etc.). Without skipping that value the pre-scan returns the raw
+// argv early, the managed `-p` folding never runs, and Grok sees only "help"
+// as the prompt while the rest of the words are parsed as stray
+// positionals — exactly the tokenisation failure this builder exists to fix.
+func TestBuildGrokInteractiveArgs_SubcommandPreScanSkipsPromptFlagValues(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "-p value starts with a subcommand-name word",
+			in:   []string{"-p", "help", "me", "fix", "tests"},
+			want: []string{"--output-format", "streaming-json", "--always-approve", "-p", "help me fix tests"},
+		},
+		{
+			name: "--single value starts with a subcommand-name word",
+			in:   []string{"--single", "models", "in", "this", "repo"},
+			want: []string{"--output-format", "streaming-json", "--always-approve", "-p", "models in this repo"},
+		},
+		{
+			name: "-p value equals exactly a subcommand name",
+			in:   []string{"-p", "sessions"},
+			want: []string{"--output-format", "streaming-json", "--always-approve", "-p", "sessions"},
+		},
+		{
+			name: "-p=value inline form (single token) still routes correctly",
+			in:   []string{"-p=help", "me", "out"},
+			want: []string{"--output-format", "streaming-json", "--always-approve", "-p", "help me out"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDetectCLITerminalEvent_Grok(t *testing.T) {
 	if !detectCLITerminalEvent("grok", `{"type":"end"}`) {
 		t.Fatal(`grok "end" event should be terminal`)

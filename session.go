@@ -1542,6 +1542,15 @@ func buildGrokInteractiveArgs(args []string) []string {
 		// resumed/named headless sessions.
 		"-s": true, "--session-id": true,
 		"-r": true, "--resume": true,
+		// Prompt-delivery flags also take the next token as a value (the
+		// prompt). The main loop below handles `-p`/`--single` via its own
+		// captureNextAsPrompt branch BEFORE the generic valuedFlags check, so
+		// adding them here is a no-op for the main loop — but the subcommand
+		// pre-scan below shares this same map, and without these entries
+		// `grok -p help me fix tests` would treat the prompt's first word
+		// "help" as a subcommand and return the raw argv, reintroducing the
+		// tokenisation failure this builder exists to fix.
+		"-p": true, "--single": true,
 	}
 
 	// Subcommand carve-out: keep `grok models`, `grok sessions list`, etc.
