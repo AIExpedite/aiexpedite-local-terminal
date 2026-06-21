@@ -377,12 +377,18 @@ func TestBuildGrokInteractiveArgs_PreservesConfigValue(t *testing.T) {
 }
 
 // TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv
-// guards the narrowed subcommand pre-scan: a leading subcommand-name word
-// no longer short-circuits to verbatim argv when the trailing positional
-// count is ≥ 3 — that shape is the unquoted prose prompt the headless
-// builder exists to fix (`grok help me fix tests`, `grok sessions should
-// persist`). Unambiguous shapes (`grok models`, `grok sessions list`) still
-// carve out and forward argv untouched.
+// guards the narrowed subcommand pre-scan. A leading subcommand-name word
+// only short-circuits to verbatim argv in three unambiguous shapes:
+//   (1) a single bare positional matching a subcommand (`grok models`);
+//   (2) two positionals where the second is a recognised CLI action verb
+//       (`grok sessions list`, `grok mcp install`); or
+//   (3) any positional count with a POSIX `--` separator anchoring a real
+//       subcommand grammar (covered by TestBuildGrokInteractiveArgs_
+//       SubcommandCarveOutOnDoubleDash).
+// All other shapes — three-plus positionals without `--`, OR two positionals
+// whose second word is plainly not a CLI verb (`grok help me`,
+// `grok sessions stuck`) — are unquoted prose prompts the headless builder
+// exists to fix and must fall through to managed `-p` delivery.
 func TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -409,10 +415,34 @@ func TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv(t *t
 			carvedOut: true,
 		},
 		{
+			name:      "two-token subcommand carves out (models list)",
+			in:        []string{"models", "list"},
+			want:      []string{"models", "list"},
+			carvedOut: true,
+		},
+		{
 			name:      "subcommand with flag also carves out",
 			in:        []string{"sessions", "--json"},
 			want:      []string{"sessions", "--json"},
 			carvedOut: true,
+		},
+		{
+			name:      "two-positional prose with subcommand-word first folds into -p (help me)",
+			in:        []string{"help", "me"},
+			want:      []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "help me"},
+			carvedOut: false,
+		},
+		{
+			name:      "two-positional prose with subcommand-word first folds into -p (sessions stuck)",
+			in:        []string{"sessions", "stuck"},
+			want:      []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "sessions stuck"},
+			carvedOut: false,
+		},
+		{
+			name:      "two-positional prose with subcommand-word first folds into -p (models broken)",
+			in:        []string{"models", "broken"},
+			want:      []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "models broken"},
+			carvedOut: false,
 		},
 		{
 			name:      "prose prompt leading with subcommand word folds into -p (help me fix tests)",

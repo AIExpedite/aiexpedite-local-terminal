@@ -1495,6 +1495,35 @@ var grokKnownSubcommands = map[string]bool{
 	"trace": true, "update": true, "version": true, "worktree": true,
 }
 
+// grokSubcommandActions are second-positional words that, when paired with a
+// known leading subcommand, indicate a documented two-word subcommand grammar
+// rather than a prose prompt. Without this gate, the pre-scan would treat any
+// two-word input whose first word matches a Grok subcommand as a verbatim
+// argv call — including prose prompts like `grok help me`, `grok sessions
+// stuck`, or `grok models broken` whose second word is plainly not a CLI
+// verb. Those would short-circuit to raw argv, Grok would reject the unknown
+// second token (`unrecognized subcommand 'me'`), and we'd reintroduce the
+// tokenisation failure the headless `-p` path exists to fix. Restricting the
+// 2-positional carve-out to recognised verbs (`list`, `install`, `add`, …)
+// keeps documented grammars (`sessions list`, `mcp install`, `models list`)
+// verbatim while letting prose fall through to the managed `-p` builder.
+var grokSubcommandActions = map[string]bool{
+	"list": true, "ls": true,
+	"add": true, "remove": true, "rm": true, "delete": true, "del": true,
+	"install": true, "uninstall": true,
+	"update": true, "upgrade": true,
+	"show": true, "get": true, "info": true, "inspect": true,
+	"set": true, "unset": true,
+	"enable": true, "disable": true,
+	"start": true, "stop": true, "restart": true, "status": true,
+	"run": true, "exec": true,
+	"create": true, "new": true, "init": true,
+	"login": true, "logout": true,
+	"clear": true, "reset": true, "purge": true,
+	"import": true, "export": true,
+	"sync": true, "switch": true, "use": true,
+}
+
 // buildGrokInteractiveArgs builds Grok Build CLI (`grok`) args for a one-shot
 // headless turn streamed as JSON.
 //
@@ -1587,27 +1616,30 @@ func buildGrokInteractiveArgs(args []string) []string {
 	// managed `-p` builder, instead of treating "sessions" as a subcommand and
 	// returning early.
 	//
-	// Carve out when EITHER signal is unambiguous:
-	//   (a) leading positional is a known subcommand AND total free-positional
-	//       count is ≤ 2 (`models`, `sessions list`, `mcp install`); or
-	//   (b) args contain the POSIX `--` end-of-options separator AND the
-	//       leading positional is a known subcommand. `--` is a hard CLI signal
-	//       that the user is invoking a documented multi-arg subcommand
-	//       grammar (xAI changelog: `grok mcp add <name> -- <cmd> [args...]`),
-	//       not typing prose — prose prompts never contain `--`. Without (b),
-	//       any documented Grok subcommand with three or more positional
-	//       tokens (mcp add, mcp install with command, etc.) would be
-	//       silently rewritten into `-p "mcp add filesystem npx ..."` and
-	//       Grok would never receive the subcommand.
-	// Three-or-more free positionals WITHOUT `--`, even when the leading word
-	// matches a subcommand name, is the signature of an unquoted prose prompt
-	// (`grok help me fix tests`, `grok sessions should persist`) and must fall
-	// through to the `-p` builder.
+	// Carve out only when the shape is unambiguously a subcommand invocation,
+	// in one of three forms:
+	//   (a) the POSIX `--` end-of-options separator is present AND the leading
+	//       positional is a known subcommand (xAI changelog:
+	//       `grok mcp add <name> -- <cmd> [args...]`). `--` is a hard CLI
+	//       signal — prose prompts never contain it.
+	//   (b) exactly ONE free positional that matches a known subcommand
+	//       (`grok models`, `grok sessions`, `grok login`). A single
+	//       subcommand token can only be a subcommand call.
+	//   (c) exactly TWO free positionals, the first a known subcommand AND
+	//       the second a recognised action verb (`grok sessions list`,
+	//       `grok mcp install`, `grok models list`). The action-verb gate is
+	//       what makes the 2-positional case unambiguous — without it,
+	//       prose like `grok help me` or `grok sessions stuck` would land
+	//       on raw argv and Grok would reject the unknown second token,
+	//       reintroducing the tokenisation failure this builder fixes.
+	// Anything else — three-plus positionals without `--`, or two
+	// positionals whose second word is not an action verb — is treated as
+	// a prose prompt and folded into managed `-p` delivery.
 	{
 		skipNext := false
 		positionalCount := 0
 		hasDoubleDash := false
-		var firstPositional string
+		var firstPositional, secondPositional string
 		for i, a := range args {
 			if skipNext {
 				skipNext = false
@@ -1623,14 +1655,20 @@ func buildGrokInteractiveArgs(args []string) []string {
 				}
 				continue
 			}
-			if positionalCount == 0 {
+			switch positionalCount {
+			case 0:
 				firstPositional = strings.ToLower(a)
+			case 1:
+				secondPositional = strings.ToLower(a)
 			}
 			positionalCount++
 		}
-		if firstPositional != "" && grokKnownSubcommands[firstPositional] &&
-			(positionalCount <= 2 || hasDoubleDash) {
-			return args
+		if firstPositional != "" && grokKnownSubcommands[firstPositional] {
+			if hasDoubleDash ||
+				positionalCount == 1 ||
+				(positionalCount == 2 && grokSubcommandActions[secondPositional]) {
+				return args
+			}
 		}
 	}
 
