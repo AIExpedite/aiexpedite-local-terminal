@@ -1656,6 +1656,19 @@ func buildGrokInteractiveArgs(args []string) []string {
 			strings.HasPrefix(a, "--prompt-json=") {
 			continue
 		}
+		// Auto-update toggles: strip both forms so the unconditional injection
+		// below owns the policy. The xAI headless/scripting docs recommend
+		// `--no-auto-update` for automated children because the background
+		// update worker can race protocol output — in this streaming-json path,
+		// an update notice on stdout/stderr would be read by readOutputStream
+		// as session output and pollute the user's response stream. Mirrors
+		// the unconditional injection + caller-supplied dedupe in
+		// buildGrokACPArgs / sanitizeGrokACPExtraArgs (grok_acp.go).
+		if a == "--no-auto-update" || a == "--auto-update" ||
+			strings.HasPrefix(a, "--no-auto-update=") ||
+			strings.HasPrefix(a, "--auto-update=") {
+			continue
+		}
 
 		if strings.HasPrefix(a, "-") {
 			flagArgs = append(flagArgs, a)
@@ -1694,8 +1707,8 @@ func buildGrokInteractiveArgs(args []string) []string {
 		}
 	}
 
-	result := make([]string, 0, len(flagArgs)+5)
-	result = append(result, "--output-format", "streaming-json")
+	result := make([]string, 0, len(flagArgs)+6)
+	result = append(result, "--output-format", "streaming-json", "--no-auto-update")
 	if injectAlwaysApprove {
 		result = append(result, "--always-approve")
 	}

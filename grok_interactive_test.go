@@ -13,7 +13,7 @@ import (
 // a single `-p` value under managed streaming-json, exiting after one turn.
 func TestBuildGrokInteractiveArgs_UnquotedPromptScreenshotCase(t *testing.T) {
 	got := buildGrokInteractiveArgs([]string{"Have", "a", "short", "conversation"})
-	want := []string{"--output-format", "streaming-json", "--always-approve", "-p", "Have a short conversation"}
+	want := []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "Have a short conversation"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
 	}
@@ -25,7 +25,7 @@ func TestBuildGrokInteractiveArgs_StripsManagedFlagsAndPassesModel(t *testing.T)
 	got := buildGrokInteractiveArgs([]string{
 		"--model", "grok-4", "--output-format", "json", "-p", "fix the bug",
 	})
-	want := []string{"--output-format", "streaming-json", "--always-approve", "--model", "grok-4", "-p", "fix the bug"}
+	want := []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--model", "grok-4", "-p", "fix the bug"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
 	}
@@ -33,7 +33,7 @@ func TestBuildGrokInteractiveArgs_StripsManagedFlagsAndPassesModel(t *testing.T)
 
 func TestBuildGrokInteractiveArgs_InlinePromptFlagValue(t *testing.T) {
 	got := buildGrokInteractiveArgs([]string{"--single=hello there"})
-	want := []string{"--output-format", "streaming-json", "--always-approve", "-p", "hello there"}
+	want := []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "hello there"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
 	}
@@ -64,22 +64,22 @@ func TestBuildGrokInteractiveArgs_SubcommandPreScanSkipsValuedFlagValues(t *test
 		{
 			name: "--cwd value happens to be a subcommand name",
 			in:   []string{"--cwd", "sessions", "fix", "bug"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "--cwd", "sessions", "-p", "fix bug"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--cwd", "sessions", "-p", "fix bug"},
 		},
 		{
 			name: "--model value happens to be a subcommand name",
 			in:   []string{"--model", "agent", "do", "thing"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "--model", "agent", "-p", "do thing"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--model", "agent", "-p", "do thing"},
 		},
 		{
 			name: "-r value happens to be a subcommand name",
 			in:   []string{"-r", "memory", "continue"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "-r", "memory", "-p", "continue"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-r", "memory", "-p", "continue"},
 		},
 		{
 			name: "--cwd=value equals form (single token) still routes correctly",
 			in:   []string{"--cwd=sessions", "fix", "bug"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "--cwd=sessions", "-p", "fix bug"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--cwd=sessions", "-p", "fix bug"},
 		},
 	}
 	for _, tc := range cases {
@@ -158,22 +158,22 @@ func TestBuildGrokInteractiveArgs_PreservesResumeAndSessionIDValues(t *testing.T
 		{
 			name: "--resume keeps its ID and prompt is preserved",
 			in:   []string{"--resume", "abc", "continue", "work"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "--resume", "abc", "-p", "continue work"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--resume", "abc", "-p", "continue work"},
 		},
 		{
 			name: "-r short form",
 			in:   []string{"-r", "abc", "ship", "it"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "-r", "abc", "-p", "ship it"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-r", "abc", "-p", "ship it"},
 		},
 		{
 			name: "--session-id keeps its ID",
 			in:   []string{"--session-id", "sess-42", "next", "step"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "--session-id", "sess-42", "-p", "next step"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--session-id", "sess-42", "-p", "next step"},
 		},
 		{
 			name: "-s short form",
 			in:   []string{"-s", "sess-42", "go"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "-s", "sess-42", "-p", "go"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-s", "sess-42", "-p", "go"},
 		},
 	}
 	for _, tc := range cases {
@@ -202,22 +202,22 @@ func TestBuildGrokInteractiveArgs_SubcommandPreScanSkipsPromptFlagValues(t *test
 		{
 			name: "-p value starts with a subcommand-name word",
 			in:   []string{"-p", "help", "me", "fix", "tests"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "-p", "help me fix tests"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "help me fix tests"},
 		},
 		{
 			name: "--single value starts with a subcommand-name word",
 			in:   []string{"--single", "models", "in", "this", "repo"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "-p", "models in this repo"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "models in this repo"},
 		},
 		{
 			name: "-p value equals exactly a subcommand name",
 			in:   []string{"-p", "sessions"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "-p", "sessions"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "sessions"},
 		},
 		{
 			name: "-p=value inline form (single token) still routes correctly",
 			in:   []string{"-p=help", "me", "out"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "-p", "help me out"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "help me out"},
 		},
 	}
 	for _, tc := range cases {
@@ -245,22 +245,22 @@ func TestBuildGrokInteractiveArgs_PreservesAllowDenyRuleValues(t *testing.T) {
 		{
 			name: "--allow keeps its pattern; prompt remains intact",
 			in:   []string{"--allow", "Bash(git *)", "fix", "the", "bug"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "--allow", "Bash(git *)", "-p", "fix the bug"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--allow", "Bash(git *)", "-p", "fix the bug"},
 		},
 		{
 			name: "--deny keeps its pattern; prompt remains intact",
 			in:   []string{"--deny", "Bash(rm -rf *)", "ship", "it"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "--deny", "Bash(rm -rf *)", "-p", "ship it"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--deny", "Bash(rm -rf *)", "-p", "ship it"},
 		},
 		{
 			name: "allow + deny together (xAI docs example)",
 			in:   []string{"--allow", "Bash(git *)", "--deny", "Bash(rm -rf *)", "land", "the", "fix"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "--allow", "Bash(git *)", "--deny", "Bash(rm -rf *)", "-p", "land the fix"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--allow", "Bash(git *)", "--deny", "Bash(rm -rf *)", "-p", "land the fix"},
 		},
 		{
 			name: "caller-supplied -p with allow/deny — managed -p still wins, prompt preserved",
 			in:   []string{"-p", "fix it", "--allow", "Bash(git *)", "--deny", "Bash(rm -rf *)"},
-			want: []string{"--output-format", "streaming-json", "--always-approve", "--allow", "Bash(git *)", "--deny", "Bash(rm -rf *)", "-p", "fix it"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--allow", "Bash(git *)", "--deny", "Bash(rm -rf *)", "-p", "fix it"},
 		},
 	}
 	for _, tc := range cases {
@@ -314,13 +314,13 @@ func TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv(t *t
 		{
 			name:      "prose prompt leading with subcommand word folds into -p (help me fix tests)",
 			in:        []string{"help", "me", "fix", "tests"},
-			want:      []string{"--output-format", "streaming-json", "--always-approve", "-p", "help me fix tests"},
+			want:      []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "help me fix tests"},
 			carvedOut: false,
 		},
 		{
 			name:      "prose prompt with three positional words (sessions should persist)",
 			in:        []string{"sessions", "should", "persist"},
-			want:      []string{"--output-format", "streaming-json", "--always-approve", "-p", "sessions should persist"},
+			want:      []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "sessions should persist"},
 			carvedOut: false,
 		},
 	}
@@ -329,6 +329,47 @@ func TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv(t *t
 			got := buildGrokInteractiveArgs(tc.in)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildGrokInteractiveArgs_InjectsNoAutoUpdateAndDedupes guards the
+// unconditional injection of `--no-auto-update` on managed headless turns and
+// the strip of any caller-supplied `--no-auto-update` / `--auto-update`. Grok's
+// background update worker can emit non-protocol output on stdout/stderr,
+// which readOutputStream would surface as session output and pollute the
+// streaming-json frame stream — mirrors the same posture in the ACP path.
+func TestBuildGrokInteractiveArgs_InjectsNoAutoUpdateAndDedupes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+	}{
+		{name: "no caller flag", in: []string{"do", "thing"}},
+		{name: "caller --no-auto-update", in: []string{"--no-auto-update", "do", "thing"}},
+		{name: "caller --no-auto-update=true", in: []string{"--no-auto-update=true", "do", "thing"}},
+		{name: "caller --auto-update stripped", in: []string{"--auto-update", "do", "thing"}},
+		{name: "caller --auto-update=true stripped", in: []string{"--auto-update=true", "do", "thing"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in)
+			noUpdateCount := 0
+			autoUpdateCount := 0
+			for _, a := range got {
+				lower := strings.ToLower(a)
+				switch {
+				case lower == "--no-auto-update" || strings.HasPrefix(lower, "--no-auto-update="):
+					noUpdateCount++
+				case lower == "--auto-update" || strings.HasPrefix(lower, "--auto-update="):
+					autoUpdateCount++
+				}
+			}
+			if noUpdateCount != 1 {
+				t.Fatalf("expected exactly one --no-auto-update, got %d: %#v", noUpdateCount, got)
+			}
+			if autoUpdateCount != 0 {
+				t.Fatalf("expected --auto-update to be stripped, got %d: %#v", autoUpdateCount, got)
 			}
 		})
 	}
