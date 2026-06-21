@@ -1979,6 +1979,17 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 		return runEncodedPowerShellCommand(encoded, workDir, timeout)
 	}
 
+	// Grok on the EXECUTE path: a plain `grok <prompt>` here would launch
+	// Grok's interactive TUI (no -p) and hang until the timeout — the device
+	// routes by command type, and any grok command that arrives as `execute`
+	// rather than `session_start` bypasses StartSession's buildGrokInteractiveArgs.
+	// Rewrite the argv to the same managed headless form (plain output for this
+	// stdout-capturing path) so grok runs one turn and exits. Subcommands
+	// (`grok models`, …) pass through unchanged.
+	if isGrokCommand(cmd) {
+		args = buildGrokExecuteArgs(args)
+	}
+
 	// Original behavior for non-PowerShell commands
 	// Construct the full command line, quoting args that contain spaces or
 	// special shell characters that PowerShell would misinterpret.
@@ -1998,7 +2009,7 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	// that doesn't work with persistent PowerShell stdin pipes.
 	// Always spawn a new powershell.exe process for these commands.
 	cmdLower := strings.ToLower(cmd)
-	isCLIAgent := cmdLower == "claude" || cmdLower == "codex" || cmdLower == "gemini"
+	isCLIAgent := cmdLower == "claude" || cmdLower == "codex" || cmdLower == "gemini" || isGrokCommand(cmd)
 	if isCLIAgent {
 		fmt.Printf("%s[aiexpedite] Using dedicated process for CLI agent: %s%s\n", colorCyan, cmd, colorReset)
 		// Resolve full path for claude since it may not be in fallback PowerShell's PATH.

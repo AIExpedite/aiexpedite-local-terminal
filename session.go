@@ -1738,6 +1738,36 @@ func buildGrokInteractiveArgs(args []string) []string {
 	return result
 }
 
+// buildGrokExecuteArgs adapts the headless Grok invocation for the non-session
+// EXECUTE path (runLocalCommand), which runs the command in a one-shot shell
+// and captures plain stdout rather than parsing the streaming-json event frames
+// the interactive session path consumes.
+//
+// WHY THIS EXISTS: the device routes commands by type — `session_start` reaches
+// StartSession → buildGrokInteractiveArgs (managed headless), but a command that
+// arrives as a plain `execute` would otherwise run `grok <prompt>` verbatim,
+// launching Grok's interactive TUI with no `-p` and hanging until the timeout
+// (observed as a terminal card stuck "Running"/"Starting"). Rewriting the
+// execute-path argv to the same managed headless form makes grok run a single
+// turn and exit regardless of which path dispatched it.
+//
+// It reuses buildGrokInteractiveArgs so the prompt-folding, flag-stripping and
+// subcommand carve-out stay single-sourced, then swaps the streaming-json
+// output format for plain text — the execute path returns captured stdout
+// directly to the model, so a JSON event log would be noisier than the reply.
+// Subcommand invocations (where buildGrokInteractiveArgs returns argv unchanged,
+// e.g. `grok models`) carry no `--output-format` and pass straight through.
+func buildGrokExecuteArgs(args []string) []string {
+	out := buildGrokInteractiveArgs(args)
+	for i := 0; i+1 < len(out); i++ {
+		if out[i] == "--output-format" && out[i+1] == "streaming-json" {
+			out[i+1] = "plain"
+			break
+		}
+	}
+	return out
+}
+
 // buildGeminiInteractiveArgs builds Gemini CLI args, routing the prompt via
 // STDIN instead of argv and running gemini in its default INTERACTIVE mode
 // (no -p/--print).

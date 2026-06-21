@@ -519,3 +519,29 @@ func TestGrokLimitStateFromFrame_SessionUpdate(t *testing.T) {
 		t.Fatalf("want approaching from snake_case session_update, got ok=%v sev=%q", ok, st.Severity)
 	}
 }
+
+// TestBuildGrokExecuteArgs_HeadlessPlainAndCarveOut verifies the EXECUTE-path
+// adapter: a bare multi-word prompt becomes managed headless with PLAIN output
+// (not streaming-json, which the execute path doesn't parse), and a subcommand
+// passes through untouched (no injected -p).
+func TestBuildGrokExecuteArgs_HeadlessPlainAndCarveOut(t *testing.T) {
+	got := buildGrokExecuteArgs([]string{"Reply", "with", "exactly:", "OK"})
+	// streaming-json must be swapped to plain; -p must carry the whole prompt.
+	joined := strings.Join(got, " ")
+	if strings.Contains(joined, "streaming-json") {
+		t.Fatalf("execute path must not use streaming-json: %#v", got)
+	}
+	if !strings.Contains(joined, "--output-format plain") {
+		t.Fatalf("expected plain output format: %#v", got)
+	}
+	last2 := got[len(got)-2:]
+	if last2[0] != "-p" || last2[1] != "Reply with exactly: OK" {
+		t.Fatalf("prompt not folded into -p: %#v", got)
+	}
+
+	// Subcommand carve-out: unchanged, no -p injected.
+	sub := buildGrokExecuteArgs([]string{"models"})
+	if !reflect.DeepEqual(sub, []string{"models"}) {
+		t.Fatalf("subcommand should pass through: %#v", sub)
+	}
+}
