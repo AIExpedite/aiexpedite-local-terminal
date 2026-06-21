@@ -183,7 +183,7 @@ func TestSanitizeGrokACPExtraArgs_ExtractsModelAndStripsDangerousFlags(t *testin
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			model, cleaned := sanitizeGrokACPExtraArgs(c.args, "grok-build", false)
+			model, cleaned := sanitizeGrokACPExtraArgs(c.args, "grok-build", false, false)
 			if model != c.wantModel {
 				t.Fatalf("model = %q, want %q", model, c.wantModel)
 			}
@@ -702,6 +702,201 @@ func TestDetectPinnedSystemGrokRequirements_RefusesOnFullBypassValueSet(t *testi
 			}
 			if err := detectPinnedSystemGrokRequirements(false, true); err != nil {
 				t.Fatalf("expected pass when EnableGrokAlwaysApprove=true acknowledges pin: %v", err)
+			}
+		})
+	}
+}
+
+// TestBuildGrokACPArgs_StripsCallerAllowRuleUnderGateOff pins the gate-off
+// strip of caller-supplied `--allow <pattern>` / `--allow=<pattern>` so a
+// signed grok_acp_start cannot ferry an autonomous-approval allow rule
+// through extras when EnableGrokAlwaysApprove is false. Mirrors the raw
+// `session_start` path's stripGrokAllowRulePairs trailing sweep.
+func TestBuildGrokACPArgs_StripsCallerAllowRuleUnderGateOff(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"separate_value", []string{"--allow", "Bash(*)"}},
+		{"equals_form", []string{"--allow=Bash(*)"}},
+		{"multiple_separate", []string{"--allow", "Bash(git *)", "--allow", "WriteFile(*)"}},
+	}
+	defaultContract := []string{"agent", "--model", "grok-build", "stdio"}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildGrokACPArgs(c.args, false, false)
+			if !reflect.DeepEqual(got, defaultContract) {
+				t.Fatalf("buildGrokACPArgs(%#v, false, false) = %#v, want %#v — caller --allow leaked past gate", c.args, got, defaultContract)
+			}
+		})
+	}
+}
+
+// TestBuildGrokACPArgs_PreservesCallerAllowRuleUnderGateOn pins the inverse:
+// when EnableGrokAlwaysApprove is true the caller has opted into autonomous
+// approval, so `--allow` rules flow through verbatim. Also pins that
+// `--deny` survives on both sides of the gate (policy-tightening, never
+// stripped).
+func TestBuildGrokACPArgs_PreservesCallerAllowRuleUnderGateOn(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"allow_separate",
+			[]string{"--allow", "Bash(git *)"},
+			[]string{"agent", "--model", "grok-build", "--always-approve", "--allow", "Bash(git *)", "stdio"},
+		},
+		{
+			"allow_equals",
+			[]string{"--allow=Bash(*)"},
+			[]string{"agent", "--model", "grok-build", "--always-approve", "--allow=Bash(*)", "stdio"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildGrokACPArgs(c.args, true, false)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("buildGrokACPArgs(%#v, true, false) = %#v, want %#v", c.args, got, c.want)
+			}
+		})
+	}
+
+	denyArgs := []string{"--deny", "Bash(rm -rf *)"}
+	wantOn := []string{"agent", "--model", "grok-build", "--always-approve", "--deny", "Bash(rm -rf *)", "stdio"}
+	if got := buildGrokACPArgs(denyArgs, true, false); !reflect.DeepEqual(got, wantOn) {
+		t.Fatalf("--deny stripped under gate-on: got %#v, want %#v", got, wantOn)
+	}
+	wantOff := []string{"agent", "--model", "grok-build", "--deny", "Bash(rm -rf *)", "stdio"}
+	if got := buildGrokACPArgs(denyArgs, false, false); !reflect.DeepEqual(got, wantOff) {
+		t.Fatalf("--deny stripped under gate-off: got %#v, want %#v", got, wantOff)
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_ScansManagedConfigPath pins the
+// fail-closed behaviour for the second system-level layer
+// `/etc/grok/managed_config.toml`. It is NOT redirected by GROK_HOME, so a
+// pin there must trip the same refusal as `/etc/grok/requirements.toml`.
+func TestDetectPinnedSystemGrokRequirements_ScansManagedConfigPath(t *testing.T) {
+	emptyDir := t.TempDir()
+	emptyPath := filepath.Join(emptyDir, "requirements.toml")
+	if err := os.WriteFile(emptyPath, []byte(""), 0o600); err != nil {
+		t.Fatalf("seed empty requirements: %v", err)
+	}
+	origReq := grokSystemRequirementsPath
+	grokSystemRequirementsPath = emptyPath
+	t.Cleanup(func() { grokSystemRequirementsPath = origReq })
+
+	cases := map[string]string{
+		"managed_config pins api_key":                "[model]\napi_key = \"xai-mc\"\n",
+		"managed_config pins always_approve":         "[tools]\nalways_approve = true\n",
+		"managed_config pins permission_rules allow": "permission_rules = [\"Bash(*)\"]\n",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "managed_config.toml")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatalf("seed managed_config: %v", err)
+			}
+			origMC := grokSystemManagedConfigPath
+			grokSystemManagedConfigPath = path
+			t.Cleanup(func() { grokSystemManagedConfigPath = origMC })
+
+			if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
+				t.Fatalf("expected refusal when managed_config pins bypass posture and gate closed")
+			}
+			if err := detectPinnedSystemGrokRequirements(true, true); err != nil {
+				t.Fatalf("expected pass when both gates open: %v", err)
+			}
+		})
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_RefusesOnClaudeManagedAllowRule pins
+// that an imported Claude `managed-settings.json` with a non-empty
+// `permissions.allow` array trips the same fail-closed refusal under
+// gate-off — the per-session isolated GROK_HOME does not relocate these
+// MDM-managed files, so Grok's enterprise loader still imports the rules
+// before the per-tool prompt.
+func TestDetectPinnedSystemGrokRequirements_RefusesOnClaudeManagedAllowRule(t *testing.T) {
+	emptyDir := t.TempDir()
+	emptyReq := filepath.Join(emptyDir, "requirements.toml")
+	if err := os.WriteFile(emptyReq, []byte(""), 0o600); err != nil {
+		t.Fatalf("seed empty requirements: %v", err)
+	}
+	emptyMC := filepath.Join(emptyDir, "managed_config.toml")
+	if err := os.WriteFile(emptyMC, []byte(""), 0o600); err != nil {
+		t.Fatalf("seed empty managed_config: %v", err)
+	}
+	origReq := grokSystemRequirementsPath
+	origMC := grokSystemManagedConfigPath
+	grokSystemRequirementsPath = emptyReq
+	grokSystemManagedConfigPath = emptyMC
+	t.Cleanup(func() {
+		grokSystemRequirementsPath = origReq
+		grokSystemManagedConfigPath = origMC
+	})
+
+	dir := t.TempDir()
+	claudePath := filepath.Join(dir, "managed-settings.json")
+	if err := os.WriteFile(claudePath, []byte(`{"permissions":{"allow":["Bash(*)"]}}`), 0o600); err != nil {
+		t.Fatalf("seed claude managed-settings: %v", err)
+	}
+	origFn := claudeManagedSettingsPathsFn
+	claudeManagedSettingsPathsFn = func() []string { return []string{claudePath} }
+	t.Cleanup(func() { claudeManagedSettingsPathsFn = origFn })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
+		t.Fatalf("expected refusal when claude managed-settings pins permissions.allow and approval gate closed")
+	}
+	if err := detectPinnedSystemGrokRequirements(false, true); err != nil {
+		t.Fatalf("expected pass when EnableGrokAlwaysApprove=true acknowledges pin: %v", err)
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_PassesOnEmptyClaudeAllowList guards
+// the empty-list path: present-but-empty / absent `permissions.allow` must
+// NOT refuse — only non-empty rules count, otherwise we over-fail-closed for
+// hosts that ship the file for non-allow-related settings.
+func TestDetectPinnedSystemGrokRequirements_PassesOnEmptyClaudeAllowList(t *testing.T) {
+	emptyDir := t.TempDir()
+	emptyReq := filepath.Join(emptyDir, "requirements.toml")
+	if err := os.WriteFile(emptyReq, []byte(""), 0o600); err != nil {
+		t.Fatalf("seed empty requirements: %v", err)
+	}
+	emptyMC := filepath.Join(emptyDir, "managed_config.toml")
+	if err := os.WriteFile(emptyMC, []byte(""), 0o600); err != nil {
+		t.Fatalf("seed empty managed_config: %v", err)
+	}
+	origReq := grokSystemRequirementsPath
+	origMC := grokSystemManagedConfigPath
+	grokSystemRequirementsPath = emptyReq
+	grokSystemManagedConfigPath = emptyMC
+	t.Cleanup(func() {
+		grokSystemRequirementsPath = origReq
+		grokSystemManagedConfigPath = origMC
+	})
+
+	cases := map[string]string{
+		"empty allow array":    `{"permissions":{"allow":[]}}`,
+		"no permissions key":   `{"otherKey":true}`,
+		"whitespace-only rule": `{"permissions":{"allow":["  "]}}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			claudePath := filepath.Join(dir, "managed-settings.json")
+			if err := os.WriteFile(claudePath, []byte(body), 0o600); err != nil {
+				t.Fatalf("seed claude managed-settings: %v", err)
+			}
+			origFn := claudeManagedSettingsPathsFn
+			claudeManagedSettingsPathsFn = func() []string { return []string{claudePath} }
+			t.Cleanup(func() { claudeManagedSettingsPathsFn = origFn })
+
+			if err := detectPinnedSystemGrokRequirements(false, false); err != nil {
+				t.Fatalf("expected pass on benign claude managed-settings (%s): %v", name, err)
 			}
 		})
 	}

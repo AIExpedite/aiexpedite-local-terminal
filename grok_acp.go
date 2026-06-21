@@ -50,6 +50,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1087,7 +1088,7 @@ const grokACPDefaultModel = "grok-build"
 // child. When false (the default), those flags are stripped so the
 // XAI_API_KEY / argv side-doors stay closed.
 func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove, allowAPIKeyFallback bool) []string {
-	model, sanitized := sanitizeGrokACPExtraArgs(extraArgs, grokACPDefaultModel, allowAPIKeyFallback)
+	model, sanitized := sanitizeGrokACPExtraArgs(extraArgs, grokACPDefaultModel, allowAlwaysApprove, allowAPIKeyFallback)
 
 	args := []string{"agent", "--model", model}
 	if allowAlwaysApprove {
@@ -1173,22 +1174,72 @@ func setupIsolatedGrokHome() (string, error) {
 // tests; production reads it as-is.
 var grokSystemRequirementsPath = "/etc/grok/requirements.toml"
 
-// detectPinnedSystemGrokRequirements refuses to start a session when the
-// system-level `/etc/grok/requirements.toml` pins API-key auth or a permissive
-// approval policy AND the workspace has not opted into the matching gate. Both
-// gates open ⇒ caller has acknowledged the pinned posture, so we let it through.
+// grokSystemManagedConfigPath is the second system-level layer xAI's
+// enterprise loader reads. Unlike `~/.grok/managed_config.toml` (which IS
+// redirected by GROK_HOME and therefore neutralised by setupIsolatedGrokHome),
+// the system path is fixed and survives the isolation, so an operator pinning
+// `model.api_key = "..."` or `permission_rules = ["Bash(*)"]` here would
+// silently bypass `EnableGrokAPIKeyFallback` / `EnableGrokAlwaysApprove`.
+// Scanned with the same line-oriented TOML logic as the requirements layer.
+var grokSystemManagedConfigPath = "/etc/grok/managed_config.toml"
+
+// claudeManagedSettingsPathsFn enumerates the Claude Code `managed-settings.json`
+// locations xAI's Grok enterprise loader is documented to import
+// `permissions.allow` rules from. These imports run BEFORE the per-tool prompt
+// and are not redirected by GROK_HOME, so a non-empty allow list pinned here
+// would route around `EnableGrokAlwaysApprove`. Per-OS system paths only —
+// user-scope `~/.claude/settings.json` is intentionally NOT scanned because
+// Grok's enterprise import is documented as the MDM-managed layer; treating
+// ad-hoc user settings as pinned would over-fail-closed on the common
+// single-user dev box. Held as a var so tests can inject paths.
+var claudeManagedSettingsPathsFn = claudeManagedSettingsPaths
+
+// detectPinnedSystemGrokRequirements refuses to start a session when a
+// system-level Grok config layer pins API-key auth or a permissive approval
+// policy AND the workspace has not opted into the matching gate. Both gates
+// open ⇒ caller has acknowledged the pinned posture, so we let it through.
 //
-// The scan is intentionally minimal — a line-level keyword sweep, not a TOML
-// parser — because the only goal here is to catch the dangerous markers the
-// argv-strip surface in sanitizeGrokACPExtraArgs / sanitizeGrokACPEnv already
-// neutralises at the per-process layer. Missing/unreadable file ⇒ nil (best-
-// effort by design; matches setupIsolatedGrokHome's tolerance for missing
-// inputs).
+// Two TOML layers are scanned (`/etc/grok/requirements.toml` and
+// `/etc/grok/managed_config.toml`) plus Claude Code's
+// `managed-settings.json` system locations — none of these are redirected by
+// GROK_HOME, so the per-session isolation in setupIsolatedGrokHome cannot
+// neutralise pins set here. The TOML scan is intentionally minimal — a line-
+// level keyword sweep, not a TOML parser — because the only goal here is to
+// catch the dangerous markers the argv-strip surface in
+// sanitizeGrokACPExtraArgs / sanitizeGrokACPEnv already neutralises at the
+// per-process layer. Missing/unreadable files ⇒ skipped (best-effort by
+// design; matches setupIsolatedGrokHome's tolerance for missing inputs).
 func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) error {
 	if allowAPIKey && allowAlwaysApprove {
 		return nil
 	}
-	path := grokSystemRequirementsPath
+	for _, p := range []string{grokSystemRequirementsPath, grokSystemManagedConfigPath} {
+		if err := detectPinnedSystemGrokRequirementsFile(p, allowAPIKey, allowAlwaysApprove); err != nil {
+			return err
+		}
+	}
+	if !allowAlwaysApprove {
+		// xAI's Grok enterprise loader documents importing Claude Code's
+		// `managed-settings.json` and evaluating its `permissions.allow`
+		// rules BEFORE the per-tool prompt
+		// (https://docs.x.ai/build/enterprise#permissions). Those rules are
+		// not under GROK_HOME, so the isolation cannot neutralise them; fail
+		// closed when an MDM policy has set one and the workspace has not
+		// opted into EnableGrokAlwaysApprove.
+		for _, p := range claudeManagedSettingsPathsFn() {
+			if hit, ok := detectClaudeManagedSettingsAllowRule(p); ok {
+				return fmt.Errorf("grok imports Claude Code's managed-settings.json permission rules and %s contains a `permissions.allow` entry; the per-session isolated GROK_HOME cannot override an imported Claude allow rule — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the imported allow rule", hit)
+			}
+		}
+	}
+	return nil
+}
+
+// detectPinnedSystemGrokRequirementsFile is the per-path scanner that backs
+// detectPinnedSystemGrokRequirements. Split out so the system layers can be
+// iterated cleanly and so tests can target a single path. Missing/unreadable/
+// empty path ⇒ nil (best-effort).
+func detectPinnedSystemGrokRequirementsFile(path string, allowAPIKey, allowAlwaysApprove bool) error {
 	if path == "" {
 		return nil
 	}
@@ -1280,6 +1331,62 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 		}
 	}
 	return nil
+}
+
+// claudeManagedSettingsPaths returns the OS-specific Claude Code
+// `managed-settings.json` locations. See claudeManagedSettingsPathsFn for the
+// rationale on which paths are scanned and which are deliberately omitted.
+func claudeManagedSettingsPaths() []string {
+	paths := make([]string, 0, 2)
+	switch runtime.GOOS {
+	case "darwin":
+		paths = append(paths, "/Library/Application Support/ClaudeCode/managed-settings.json")
+	case "windows":
+		programData := os.Getenv("ProgramData")
+		if programData == "" {
+			programData = `C:\ProgramData`
+		}
+		paths = append(paths, filepath.Join(programData, "ClaudeCode", "managed-settings.json"))
+	default:
+		paths = append(paths, "/etc/claude-code/managed-settings.json")
+	}
+	return paths
+}
+
+// detectClaudeManagedSettingsAllowRule reports whether the Claude
+// `managed-settings.json` at `path` contains a non-empty `permissions.allow`
+// array. Returns the path on hit so the error message can point the operator
+// at the exact file. Missing/unreadable/malformed/empty files yield false —
+// best-effort by design, matching detectPinnedSystemGrokRequirementsFile's
+// tolerance for missing inputs.
+func detectClaudeManagedSettingsAllowRule(path string) (string, bool) {
+	if path == "" {
+		return "", false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	const maxBytes = 1 << 20
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes))
+	if err != nil {
+		return "", false
+	}
+	var parsed struct {
+		Permissions struct {
+			Allow []string `json:"allow"`
+		} `json:"permissions"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return "", false
+	}
+	for _, rule := range parsed.Permissions.Allow {
+		if strings.TrimSpace(rule) != "" {
+			return path, true
+		}
+	}
+	return "", false
 }
 
 // grokTOMLStripInlineComment removes a trailing `# ...` comment from a TOML
@@ -1500,8 +1607,14 @@ func setEnvVar(env []string, key, value string) []string {
 //     env-sanitiser's matching XAI_API_KEY gate), the `--cwd*` containment
 //     side-door, `--always-approve` / `--auto-approve` (owned by buildGrokACPArgs), the
 //     duplicate entry tokens (`agent`/`stdio`/`chat`/`tui`/`run`), and the
-//     POSIX `--` end-of-options delimiter.
-func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAPIKeyFallback bool) (string, []string) {
+//     POSIX `--` end-of-options delimiter. `--allow <pattern>` / `--allow=…`
+//     are xAI's documented pre-prompt allow rules (matching tools auto-approve
+//     BEFORE the per-tool prompt runs) — stripped when allowAlwaysApprove is
+//     false, mirroring the raw `session_start` path's stripGrokAllowRulePairs
+//     sweep so a signed grok_acp_start cannot route around the per-tool prompt
+//     by handing `--allow Bash(*)` through extras. `--deny` is policy-tightening
+//     and is preserved on both sides of the gate.
+func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwaysApprove, allowAPIKeyFallback bool) (string, []string) {
 	model := defaultModel
 	cleaned := make([]string, 0, len(extraArgs))
 	skipNext := false
@@ -1608,6 +1721,27 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAPIK
 		if lower == "--always-approve" || strings.HasPrefix(lower, "--always-approve=") ||
 			lower == "--auto-approve" || strings.HasPrefix(lower, "--auto-approve=") {
 			continue
+		}
+
+		// `--allow <pattern>` / `--allow=<pattern>` is xAI's documented pre-
+		// prompt allow rule — matching tool calls auto-approve before the
+		// per-tool prompt runs, the same bypass surface as `--always-approve`.
+		// The raw `session_start` path strips it on the same gate (via
+		// stripGrokAllowRulePairs); mirror that here so a signed
+		// grok_acp_start passing `--allow Bash(*)` through extras cannot
+		// route around the per-tool prompt when EnableGrokAlwaysApprove is
+		// false. `--deny` is policy-tightening (deny takes precedence in
+		// xAI's docs) and is preserved on both sides of the gate.
+		if !allowAlwaysApprove {
+			if lower == "--allow" {
+				if i+1 < len(extraArgs) {
+					skipNext = true
+				}
+				continue
+			}
+			if strings.HasPrefix(lower, "--allow=") {
+				continue
+			}
 		}
 
 		// POSIX end-of-options delimiter: `stdio` is appended after these
