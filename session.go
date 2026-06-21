@@ -548,6 +548,11 @@ func detectCLITerminalEvent(command, line string) bool {
 		return eventType == "thread.completed" || eventType == "turn.completed"
 	case strings.HasPrefix(base, "gemini"):
 		return eventType == "result"
+	case strings.HasPrefix(base, "grok"):
+		// Grok's `--output-format streaming-json` emits per-event frames
+		// (thought / text / end); `end` marks the natural end of the turn,
+		// right before the headless `-p` process exits.
+		return eventType == "end"
 	}
 	return false
 }
@@ -721,6 +726,15 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// card stays Unknown for users who don't go through app-server.
 			if isCodexCommand(session.Command) {
 				captureCodexRateLimitLine(line.text, time.Now())
+			}
+
+			// Grok usage-limit telemetry: xAI exposes no numeric quota, but the
+			// server volunteers a discrete `usage_limit_reached` / credit-limit /
+			// access-gate frame on the streaming-json output when you near or hit
+			// the cap. Capture it (best-effort) so the CLI Agents card can show a
+			// warning instead of a permanently-Unknown bar.
+			if isGrokCommand(session.Command) {
+				captureGrokUsageLimitLine(line.text, time.Now())
 			}
 
 			if isClaudeCommand(session.Command) {
@@ -1118,6 +1132,14 @@ func isCodexCommand(command string) bool {
 	return strings.HasPrefix(commandBaseName(command), "codex")
 }
 
+// isGrokCommand reports whether command would be routed to the `grok` CLI by
+// buildInteractiveCLIArgs. Used to gate the Grok usage-limit capture in the
+// session output loop so a `usage_limit_reached` / gate frame from
+// `grok --output-format streaming-json` populates grok_usage_limit.json.
+func isGrokCommand(command string) bool {
+	return strings.HasPrefix(commandBaseName(command), "grok")
+}
+
 /* --------------------------------------------------------------------------
    CLI argument builders
    -------------------------------------------------------------------------- */
@@ -1158,6 +1180,8 @@ func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
 		return buildGeminiInteractiveArgs(args)
 	case strings.HasPrefix(base, "agy"):
 		return buildAntigravityInteractiveArgs(args), ""
+	case strings.HasPrefix(base, "grok"):
+		return buildGrokInteractiveArgs(args), ""
 	default:
 		return args, ""
 	}
@@ -1456,6 +1480,142 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	result = append(result, "--print")
 	result = append(result, "--dangerously-skip-permissions")
 	result = append(result, args...)
+	return result
+}
+
+// grokKnownSubcommands are the `grok <cmd>` subcommands whose argv grammar must
+// be forwarded verbatim — running them through the headless prompt builder
+// (which injects `-p`) would corrupt the call. Mirrors the codex resume/review
+// carve-out. A bare `grok "<prompt>"` (no subcommand) is the prompt path.
+var grokKnownSubcommands = map[string]bool{
+	"agent": true, "completions": true, "dashboard": true, "export": true,
+	"help": true, "import": true, "inspect": true, "leader": true,
+	"login": true, "logout": true, "mcp": true, "memory": true,
+	"models": true, "plugin": true, "sessions": true, "setup": true,
+	"trace": true, "update": true, "version": true, "worktree": true,
+}
+
+// buildGrokInteractiveArgs builds Grok Build CLI (`grok`) args for a one-shot
+// headless turn streamed as JSON.
+//
+// WHY HEADLESS (-p) + streaming-json: a bare `grok <prompt>` launches Grok's
+// interactive TUI, which never exits in our non-TTY session — the process
+// hangs until the 6h cap (observed as a terminal card stuck on "Running"). And
+// an UNQUOTED multi-word prompt is tokenised so Grok parses the second word as
+// a subcommand (`error: unrecognized subcommand 'a'`, exit 1). Forcing
+// `-p/--single` runs the prompt once and exits; `--output-format
+// streaming-json` gives the stream parser the same per-event shape
+// (thought / text / end) it reads for the other agents, with `end` as the turn
+// terminal (see detectCLITerminalEvent).
+//
+// WHY ARGV (no stdin): grok resolves to a native `grok.exe` (~/.grok/bin),
+// launched directly via CreateProcess, so the prompt rides on argv as the value
+// of `-p` (the ~32KB CreateProcess cap applies, like agy — not a cmd.exe shim's
+// 8191-char cap). The headless `-p` process exits on its own after one turn, so
+// no stdin routing is needed.
+//
+// Caller-supplied prompt-delivery / output-format flags are stripped so they
+// can't collide with the managed contract: `-p`/`--single` (we always inject
+// one; an inline value is folded into the prompt), `--output-format`,
+// `--prompt-file`, `--prompt-json`. Other flags (`--model`, `--effort`,
+// `--max-turns`, …) pass through.
+//
+// Returns cliArgs only — there is no stdin prompt (stdinPromptFormat returns ""
+// for grok), the prompt is the value of `-p`.
+func buildGrokInteractiveArgs(args []string) []string {
+	// Subcommand carve-out: keep `grok models`, `grok sessions list`, etc.
+	// intact — those are not prompt invocations.
+	for _, a := range args {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		if grokKnownSubcommands[strings.ToLower(a)] {
+			return args
+		}
+		break // first non-flag positional decides
+	}
+
+	// Grok flags that consume the NEXT token as their value — without this,
+	// e.g. `--model grok-4` would treat "grok-4" as a prompt word. The
+	// `--flag=value` form is one token and needs no entry here.
+	valuedFlags := map[string]bool{
+		"-m": true, "--model": true,
+		"--effort": true, "--reasoning-effort": true,
+		"--max-turns": true, "--agent": true, "--agents": true,
+		"--cwd": true, "--permission-mode": true, "--sandbox": true,
+		"--compaction-mode": true, "--compaction-detail": true,
+		"--rules": true, "--system-prompt-override": true,
+		"--leader-socket": true, "--debug-file": true,
+	}
+
+	var flagArgs []string
+	var promptParts []string
+	skipNext := false            // next token is a passthrough flag's value
+	dropNext := false            // next token is a stripped flag's value — drop it
+	captureNextAsPrompt := false // next token is a stripped -p/--single value — keep as prompt
+	for i, a := range args {
+		switch {
+		case dropNext:
+			dropNext = false
+			continue
+		case skipNext:
+			skipNext = false
+			flagArgs = append(flagArgs, a)
+			continue
+		case captureNextAsPrompt:
+			captureNextAsPrompt = false
+			promptParts = append(promptParts, a)
+			continue
+		}
+
+		// Prompt-delivery flags: strip (we always inject our own -p). Fold an
+		// inline / following value into the prompt so the turn still runs.
+		if a == "-p" || a == "--single" {
+			captureNextAsPrompt = true
+			continue
+		}
+		if v, ok := strings.CutPrefix(a, "-p="); ok {
+			if v != "" {
+				promptParts = append(promptParts, v)
+			}
+			continue
+		}
+		if v, ok := strings.CutPrefix(a, "--single="); ok {
+			if v != "" {
+				promptParts = append(promptParts, v)
+			}
+			continue
+		}
+		// Output-format / alternate prompt sources: strip flag AND its value —
+		// they collide with the managed streaming-json + `-p` contract.
+		if a == "--output-format" || a == "--prompt-file" || a == "--prompt-json" {
+			if i+1 < len(args) {
+				dropNext = true
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "--output-format=") ||
+			strings.HasPrefix(a, "--prompt-file=") ||
+			strings.HasPrefix(a, "--prompt-json=") {
+			continue
+		}
+
+		if strings.HasPrefix(a, "-") {
+			flagArgs = append(flagArgs, a)
+			if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(args) {
+				skipNext = true
+			}
+			continue
+		}
+		promptParts = append(promptParts, a)
+	}
+
+	result := make([]string, 0, len(flagArgs)+4)
+	result = append(result, "--output-format", "streaming-json")
+	result = append(result, flagArgs...)
+	// Always append `-p <prompt>`, even when empty — grok surfaces a useful
+	// "no prompt" error rather than hanging on the interactive TUI.
+	result = append(result, "-p", strings.Join(promptParts, " "))
 	return result
 }
 

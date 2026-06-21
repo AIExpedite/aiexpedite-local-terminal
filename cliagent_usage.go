@@ -77,6 +77,14 @@ type cliAgentUsage struct {
 	Metrics            []cliAgentUsageMetric `json:"metrics,omitempty"`
 	CollectedAt        string                `json:"collectedAt"`
 	DataSource         string                `json:"dataSource,omitempty"`
+	// Notice is a card-level banner shown above the capacity bars — used when a
+	// provider exposes a discrete usage-limit WARNING rather than a numeric
+	// quota (e.g. Grok's server-pushed `usage_limit_reached` / access-gate).
+	// NoticeSeverity is "warning" (approaching) or "error" (reached); NoticeURL
+	// is an optional upgrade/billing link. Omitted when no limit is active.
+	Notice         string `json:"notice,omitempty"`
+	NoticeSeverity string `json:"noticeSeverity,omitempty"`
+	NoticeURL      string `json:"noticeUrl,omitempty"`
 }
 
 // cliAgentUsageParser is the small interface every provider parser
