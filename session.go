@@ -1541,6 +1541,18 @@ func buildGrokInteractiveArgs(args []string) []string {
 		// would then consume `-p` as the plugin directory value, dropping the
 		// managed prompt delivery.
 		"--plugin-dir": true,
+		// Per-process config override: xAI's enterprise-deployment docs spell
+		// out `-c|--config <key>=value` as the config-override surface (the
+		// repo's Grok ACP builder also emits separate-value `--config <key>=`
+		// pairs). Without this entry, `grok --config log.level=debug fix bug`
+		// would land "log.level=debug" in promptParts and the bare `--config`
+		// would slot in immediately before the appended managed `-p` — Grok
+		// would then consume `-p` as the config value, dropping the managed
+		// prompt delivery. We intentionally pin only the long form here: `-c`
+		// is documented as ambiguous in some Grok CLI contexts (continue vs.
+		// config), so we leave the short form alone rather than risk swapping
+		// a `--continue` short-form value into the prompt path.
+		"--config": true,
 		// Permission-policy rule flags: xAI's enterprise headless docs document
 		// `--allow <pattern>` / `--deny <pattern>` as per-tool policy rules
 		// (e.g. `--allow "Bash(git *)" --deny "Bash(rm -rf *)"`). Without these

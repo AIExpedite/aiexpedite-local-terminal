@@ -305,6 +305,38 @@ func TestBuildGrokInteractiveArgs_PreservesPluginDirValue(t *testing.T) {
 	}
 }
 
+// TestBuildGrokInteractiveArgs_PreservesConfigValue guards the xAI
+// enterprise-deployment `--config <key>=value` separate-value flag. Without
+// the entry in valuedFlags, the value lands in promptParts and the bare
+// `--config` slots in immediately before the appended managed `-p`, so Grok
+// consumes `-p` as the config override and the prompt is no longer delivered.
+func TestBuildGrokInteractiveArgs_PreservesConfigValue(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "--config keeps its key=value; prompt remains intact",
+			in:   []string{"--config", "log.level=debug", "fix", "bug"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--config", "log.level=debug", "-p", "fix bug"},
+		},
+		{
+			name: "multiple --config overrides preserved before managed -p",
+			in:   []string{"--config", "log.level=debug", "--config", "model.api_key=", "fix", "bug"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--config", "log.level=debug", "--config", "model.api_key=", "-p", "fix bug"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv
 // guards the narrowed subcommand pre-scan: a leading subcommand-name word
 // no longer short-circuits to verbatim argv when the trailing positional
