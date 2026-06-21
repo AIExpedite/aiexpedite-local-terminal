@@ -1698,6 +1698,23 @@ func buildGrokInteractiveArgs(args []string) []string {
 			strings.HasPrefix(a, "--auto-update=") {
 			continue
 		}
+		// Approval-bypass equals-forms: strip wholesale so a caller-supplied
+		// `--always-approve=false` / `--auto-approve=false` cannot disable the
+		// bypass while still slipping through to Grok in flagArgs (the dedupe
+		// check below would also see the equals-form and suppress the
+		// injection, so Grok would run with `=false` and the headless `-p`
+		// turn would stall on the first tool/file-edit prompt — StartSession
+		// closes Grok's stdin and detectPromptFromJSON has no Grok approval
+		// branch). Dropping every equals-form here lets the bare form remain
+		// the ONLY caller-supplied signal that genuinely opts into the bypass
+		// (and dedupes the injection); equivalent to grok_acp.go's
+		// sanitizeGrokInteractiveExtraArgs dropping `--always-approve=*`
+		// wholesale.
+		lowerEq := strings.ToLower(a)
+		if strings.HasPrefix(lowerEq, "--always-approve=") ||
+			strings.HasPrefix(lowerEq, "--auto-approve=") {
+			continue
+		}
 
 		if strings.HasPrefix(a, "-") {
 			flagArgs = append(flagArgs, a)
@@ -1725,12 +1742,16 @@ func buildGrokInteractiveArgs(args []string) []string {
 	// duplicate boolean flag is harmless but the cleaner argv aids debugging.
 	// xAI documents `--always-approve` as the canonical flag (`--auto-approve`
 	// is the legacy synonym — see isGrokAlwaysApproveArg in grok_acp.go).
+	// Equals-form spellings (`--always-approve=true`, `--always-approve=false`,
+	// and the `--auto-approve=…` synonyms) were stripped wholesale in the
+	// flag-folding loop above, so only the bare form can reach this dedupe
+	// check — this prevents a caller-supplied `=false` from suppressing the
+	// injection while leaving the disabled flag in flagArgs (which would
+	// stall the headless `-p` turn on the first tool/file-edit prompt).
 	injectAlwaysApprove := true
 	for _, a := range args {
 		lower := strings.ToLower(a)
-		if lower == "--always-approve" || lower == "--auto-approve" ||
-			strings.HasPrefix(lower, "--always-approve=") ||
-			strings.HasPrefix(lower, "--auto-approve=") {
+		if lower == "--always-approve" || lower == "--auto-approve" {
 			injectAlwaysApprove = false
 			break
 		}

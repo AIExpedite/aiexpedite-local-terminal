@@ -144,6 +144,45 @@ func TestBuildGrokInteractiveArgs_DoesNotDuplicateUserAlwaysApprove(t *testing.T
 	}
 }
 
+// TestBuildGrokInteractiveArgs_DisabledApproveDoesNotSuppressInjection guards
+// the equals-false fix: a caller-supplied `--always-approve=false` /
+// `--auto-approve=false` must NOT slip through to flagArgs (Grok would see
+// the disabled flag and stall on the first tool/file-edit prompt — the
+// headless `-p` turn has no approval handler) AND must NOT suppress the
+// injected bare `--always-approve`. Stripping every equals-form in the
+// flag-folding loop, plus dedupe-by-bare-form only, gets us both invariants:
+// the managed bare flag is always present exactly once, and the disabled
+// equals-form is dropped.
+func TestBuildGrokInteractiveArgs_DisabledApproveDoesNotSuppressInjection(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+	}{
+		{name: "--always-approve=false", in: []string{"--always-approve=false", "fix", "the", "bug"}},
+		{name: "--auto-approve=false", in: []string{"--auto-approve=false", "fix", "the", "bug"}},
+		{name: "--Always-Approve=False mixed case", in: []string{"--Always-Approve=False", "fix", "the", "bug"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in)
+			bareCount := 0
+			for _, a := range got {
+				lower := strings.ToLower(a)
+				if strings.HasPrefix(lower, "--always-approve=") ||
+					strings.HasPrefix(lower, "--auto-approve=") {
+					t.Fatalf("equals-form approval flag leaked through: %#v", got)
+				}
+				if lower == "--always-approve" || lower == "--auto-approve" {
+					bareCount++
+				}
+			}
+			if bareCount != 1 {
+				t.Fatalf("expected exactly one bare approval flag in argv, got %d: %#v", bareCount, got)
+			}
+		})
+	}
+}
+
 // TestBuildGrokInteractiveArgs_PreservesResumeAndSessionIDValues guards the
 // xAI Headless & Scripting common flags `-r/--resume <ID>` and
 // `-s/--session-id <ID>`: without an entry in valuedFlags the next token (the
