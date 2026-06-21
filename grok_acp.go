@@ -153,8 +153,8 @@ type GrokACPSession struct {
 	// GROK_HOME at (a copy of the real auth file + a minimal clean
 	// config.toml). It is removed best-effort exactly once, after the child
 	// has exited (waitForExit), so we never delete the copied auth.json out
-	// from under a running grok process. Empty when Start could not create
-	// the dir (the launch falls back to the inherited GROK_HOME in that case).
+	// from under a running grok process. Always set on a successfully started
+	// session because Start fails closed when isolation can't be established.
 	IsolatedHome string
 
 	mu           sync.Mutex
@@ -327,7 +327,20 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 			executable = p
 		}
 	}
-	args := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove)
+	// System-level requirements.toml (`/etc/grok/requirements.toml`) is NOT
+	// redirected by GROK_HOME — that's the whole point of a system layer. The
+	// per-session GROK_HOME isolation below neutralises the user-level layer
+	// by omission, but a managed host that pins API-key auth or an always-
+	// approve policy in the system file would still bypass the workspace's
+	// opt-in gates. Fail closed before we spawn rather than silently launching
+	// with the unsafe pinned posture. Opt out by setting both
+	// EnableGrokAPIKeyFallback and EnableGrokAlwaysApprove to acknowledge the
+	// pinned posture (or remove the system requirements file).
+	if err := detectPinnedSystemGrokRequirements(opts.AllowAPIKeyFallback, opts.AllowAlwaysApprove); err != nil {
+		return err
+	}
+
+	args := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove, opts.AllowAPIKeyFallback)
 
 	// Isolated GROK_HOME (replaces the old `--config <key>=` security
 	// neutralizers, which are GONE as of grok 0.2.59 — `grok agent` rejects
@@ -340,13 +353,12 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// omission: no `api_key` billing override, no auto-approve / permission
 	// bypass, no pinned requirements layer. The cached-token handshake still
 	// works because the auth file is the one piece we deliberately copy in.
-	// Best-effort: if the dir can't be created we fall back to the inherited
-	// GROK_HOME rather than failing the launch.
+	// Fail closed if isolation can't be established: with `--config` gone, the
+	// argv has no neutralizers, so launching with the inherited (potentially
+	// unsafe) GROK_HOME would silently bypass the workspace's opt-in gates.
 	isolatedHome, err := setupIsolatedGrokHome()
 	if err != nil {
-		fmt.Printf("%s[grok-acp] Session %s: isolated GROK_HOME setup failed (%v) — falling back to inherited GROK_HOME%s\n",
-			colorYellow, id, err, colorReset)
-		isolatedHome = ""
+		return fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)
 	}
 
 	fmt.Printf("%s[grok-acp] Starting session %s: %s %s%s\n",
@@ -358,9 +370,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		proc.Dir = cwd
 	}
 	env := sanitizeGrokACPEnv(os.Environ(), opts.AllowAPIKeyFallback)
-	if isolatedHome != "" {
-		env = setEnvVar(env, "GROK_HOME", isolatedHome)
-	}
+	env = setEnvVar(env, "GROK_HOME", isolatedHome)
 	proc.Env = env
 
 	// cleanupIsolatedHome removes the per-session temp dir on any pre-spawn
@@ -368,9 +378,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// dir transfers to waitForExit (which removes it after the process exits),
 	// so we must NOT call this after a successful proc.Start().
 	cleanupIsolatedHome := func() {
-		if isolatedHome != "" {
-			_ = os.RemoveAll(isolatedHome)
-		}
+		_ = os.RemoveAll(isolatedHome)
 	}
 
 	stdin, err := proc.StdinPipe()
@@ -1071,8 +1079,15 @@ const grokACPDefaultModel = "grok-build"
 // allowAlwaysApprove is true. Default false keeps autonomous tool execution an
 // explicit per-workspace opt-in (Config.EnableGrokAlwaysApprove) rather than
 // something a signed grok_acp_start can flip via extra args.
-func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
-	model, sanitized := sanitizeGrokACPExtraArgs(extraArgs, grokACPDefaultModel)
+//
+// allowAPIKeyFallback mirrors the env-sanitiser's gate: when true, caller-
+// supplied `--api-key{,-env}` / `--auth{,-method}` flags are preserved on the
+// argv so a workspace that has opted into API-key auth via
+// Config.EnableGrokAPIKeyFallback can actually pass the credential to the
+// child. When false (the default), those flags are stripped so the
+// XAI_API_KEY / argv side-doors stay closed.
+func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove, allowAPIKeyFallback bool) []string {
+	model, sanitized := sanitizeGrokACPExtraArgs(extraArgs, grokACPDefaultModel, allowAPIKeyFallback)
 
 	args := []string{"agent", "--model", model}
 	if allowAlwaysApprove {
@@ -1150,6 +1165,110 @@ func setupIsolatedGrokHome() (string, error) {
 	return dir, nil
 }
 
+// grokSystemRequirementsPath is the documented system-level pinned-config
+// layer (https://docs.x.ai/build/enterprise#configuration). Unlike user-level
+// `~/.grok/requirements.toml`, it is NOT redirected by GROK_HOME — that's the
+// point of a system file — so the per-session isolation in setupIsolatedGrokHome
+// cannot neutralise pins set here. Operators relocate by overriding the var in
+// tests; production reads it as-is.
+var grokSystemRequirementsPath = "/etc/grok/requirements.toml"
+
+// detectPinnedSystemGrokRequirements refuses to start a session when the
+// system-level `/etc/grok/requirements.toml` pins API-key auth or a permissive
+// approval policy AND the workspace has not opted into the matching gate. Both
+// gates open ⇒ caller has acknowledged the pinned posture, so we let it through.
+//
+// The scan is intentionally minimal — a line-level keyword sweep, not a TOML
+// parser — because the only goal here is to catch the dangerous markers the
+// argv-strip surface in sanitizeGrokACPExtraArgs / sanitizeGrokACPEnv already
+// neutralises at the per-process layer. Missing/unreadable file ⇒ nil (best-
+// effort by design; matches setupIsolatedGrokHome's tolerance for missing
+// inputs).
+func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) error {
+	if allowAPIKey && allowAlwaysApprove {
+		return nil
+	}
+	path := grokSystemRequirementsPath
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	const maxBytes = 1 << 20
+	scanner := bufio.NewScanner(io.LimitReader(f, maxBytes))
+	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Strip inline `# comment` so `always_approve = true # managed`
+		// reduces to `true` and the boolean match below still hits.
+		if hash := strings.IndexByte(line, '#'); hash >= 0 {
+			line = strings.TrimSpace(line[:hash])
+		}
+		lower := strings.ToLower(line)
+
+		if !allowAPIKey && lineMentionsGrokAuthPin(lower) {
+			return fmt.Errorf("grok requirements pin API-key auth in %s; refusing to spawn — set Config.EnableGrokAPIKeyFallback=true to opt in, or remove the pinned credential", path)
+		}
+		if !allowAlwaysApprove && lineMentionsGrokApprovalPin(lower) {
+			return fmt.Errorf("grok requirements pin a permissive approval policy in %s; refusing to spawn — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the pinned policy", path)
+		}
+	}
+	return nil
+}
+
+// lineMentionsGrokAuthPin reports whether a normalised TOML line names an
+// API-key credential — `api_key`/`env_key` as a key on any `model.*` / `xai.*`
+// scope, with a non-empty quoted or env-style value. Kept as a flat keyword
+// match (rather than a full TOML parser) because the system requirements file
+// is operator-controlled and the false-positive risk on a key named "api_key"
+// in another section is acceptable: failing closed is the safe direction.
+func lineMentionsGrokAuthPin(lower string) bool {
+	if !strings.Contains(lower, "api_key") && !strings.Contains(lower, "env_key") {
+		return false
+	}
+	eq := strings.IndexByte(lower, '=')
+	if eq < 0 {
+		return false
+	}
+	val := strings.TrimSpace(lower[eq+1:])
+	// Empty value (`api_key = ""`) is a deliberate clear — that's what the
+	// old per-process `--config api_key=` neutralizer emitted, and we should
+	// not refuse on it.
+	if val == "" || val == `""` || val == `''` {
+		return false
+	}
+	return true
+}
+
+// lineMentionsGrokApprovalPin reports whether a normalised TOML line pins one
+// of the approval bypasses (`always_approve = true`, `auto_approve = true`,
+// `approval.mode = "always"|"auto"`, `yolo = true`, `permission_mode =
+// "bypass*"`). Same flat-keyword approach as the auth pin scanner.
+func lineMentionsGrokApprovalPin(lower string) bool {
+	eq := strings.IndexByte(lower, '=')
+	if eq < 0 {
+		return false
+	}
+	key := strings.TrimSpace(lower[:eq])
+	val := strings.Trim(strings.TrimSpace(lower[eq+1:]), `"'`)
+	switch {
+	case (strings.Contains(key, "always_approve") || strings.Contains(key, "auto_approve") || key == "yolo") && val == "true":
+		return true
+	case strings.HasSuffix(key, "approval.mode") || key == "mode":
+		return val == "always" || val == "auto"
+	case strings.Contains(key, "permission_mode") || strings.Contains(key, "permission-mode"):
+		return strings.HasPrefix(val, "bypass")
+	}
+	return false
+}
+
 // setEnvVar returns env with the `KEY=value` entry for key replaced (case-
 // sensitive match on the key) or appended when absent. Used by Start to pin
 // GROK_HOME to the isolated dir, overriding any inherited GROK_HOME the env
@@ -1186,12 +1305,12 @@ func setEnvVar(env []string, key, value string) []string {
 //   - cleaned is the remaining extras with dangerous/incompatible tokens
 //     dropped: the grok-0.2.59-rejected `--config*` / `--permission-mode*` /
 //     `--no-auto-update` / `--auto-update`, the credential flags `--api-key*`
-//     / `--auth*` (API-key auth stays neutralised via the isolated
-//     GROK_HOME), the `--cwd*` containment side-door, `--always-approve`
-//     (owned by buildGrokACPArgs), the duplicate entry tokens
-//     (`agent`/`stdio`/`chat`/`tui`/`run`), and the POSIX `--` end-of-options
-//     delimiter.
-func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string) (string, []string) {
+//     / `--auth*` (stripped UNLESS allowAPIKeyFallback is true — see the
+//     env-sanitiser's matching XAI_API_KEY gate), the `--cwd*` containment
+//     side-door, `--always-approve` (owned by buildGrokACPArgs), the
+//     duplicate entry tokens (`agent`/`stdio`/`chat`/`tui`/`run`), and the
+//     POSIX `--` end-of-options delimiter.
+func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAPIKeyFallback bool) (string, []string) {
 	model := defaultModel
 	cleaned := make([]string, 0, len(extraArgs))
 	skipNext := false
@@ -1256,8 +1375,20 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string) (string, 
 
 		// Credential side-doors: API-key auth stays neutralised by the
 		// isolated GROK_HOME, so strip any caller attempt to point grok at an
-		// API key / alternative auth method via argv.
+		// API key / alternative auth method via argv. UNLESS the workspace
+		// has explicitly opted in via Config.EnableGrokAPIKeyFallback, in
+		// which case we preserve `--api-key{,-env}` / `--auth{,-method}` and
+		// their values so the orchestrator can hand the credential to the
+		// child (mirrors the XAI_API_KEY preservation in sanitizeGrokACPEnv).
 		if isGrokAuthOverrideArg(lower) {
+			if allowAPIKeyFallback {
+				cleaned = append(cleaned, a)
+				if !strings.Contains(a, "=") && i+1 < len(extraArgs) {
+					cleaned = append(cleaned, extraArgs[i+1])
+					skipNext = true
+				}
+				continue
+			}
 			if !strings.Contains(a, "=") && i+1 < len(extraArgs) {
 				skipNext = true
 			}

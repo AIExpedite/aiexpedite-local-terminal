@@ -23,10 +23,10 @@ import (
 // --no-auto-update, flags BEFORE the `stdio` subcommand, and --always-approve
 // omitted by default.
 func TestBuildGrokACPArgs_DefaultContract(t *testing.T) {
-	got := buildGrokACPArgs(nil, false)
+	got := buildGrokACPArgs(nil, false, false)
 	want := []string{"agent", "--model", "grok-build", "stdio"}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("buildGrokACPArgs(nil, false) = %#v, want %#v", got, want)
+		t.Fatalf("buildGrokACPArgs(nil, false, false) = %#v, want %#v", got, want)
 	}
 }
 
@@ -34,15 +34,15 @@ func TestBuildGrokACPArgs_DefaultContract(t *testing.T) {
 // appears (between --model grok-build and stdio) ONLY when allowAlwaysApprove
 // is true.
 func TestBuildGrokACPArgs_AlwaysApproveOnlyWhenEnabled(t *testing.T) {
-	off := buildGrokACPArgs(nil, false)
+	off := buildGrokACPArgs(nil, false, false)
 	if grokArgsContain(off, "--always-approve") {
 		t.Fatalf("--always-approve must be absent when disabled; got %#v", off)
 	}
 
-	on := buildGrokACPArgs(nil, true)
+	on := buildGrokACPArgs(nil, true, false)
 	want := []string{"agent", "--model", "grok-build", "--always-approve", "stdio"}
 	if !reflect.DeepEqual(on, want) {
-		t.Fatalf("buildGrokACPArgs(nil, true) = %#v, want %#v", on, want)
+		t.Fatalf("buildGrokACPArgs(nil, true, false) = %#v, want %#v", on, want)
 	}
 	// --always-approve must precede the stdio subcommand (stdio takes no opts).
 	idxApprove, idxStdio := -1, -1
@@ -96,7 +96,7 @@ func TestBuildGrokACPArgs_CallerModelOverridesDefault(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false)
+			got := buildGrokACPArgs(c.args, false, false)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("buildGrokACPArgs(%#v) = %#v, want %#v", c.args, got, c.want)
 			}
@@ -132,7 +132,7 @@ func TestBuildGrokACPArgs_StripsIncompatibleFlags(t *testing.T) {
 	want := []string{"agent", "--model", "grok-build", "stdio"}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false)
+			got := buildGrokACPArgs(c.args, false, false)
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("buildGrokACPArgs(%#v) = %#v, want %#v (incompatible flag leaked)", c.args, got, want)
 			}
@@ -144,7 +144,7 @@ func TestBuildGrokACPArgs_StripsIncompatibleFlags(t *testing.T) {
 // special-case (valid `grok agent` knobs the orchestrator may pass) flow
 // through verbatim and stay BEFORE the stdio subcommand.
 func TestBuildGrokACPArgs_PreservesUnknownGrokAgentFlags(t *testing.T) {
-	got := buildGrokACPArgs([]string{"--reasoning-effort", "high", "--model", "grok-4"}, false)
+	got := buildGrokACPArgs([]string{"--reasoning-effort", "high", "--model", "grok-4"}, false, false)
 	want := []string{"agent", "--model", "grok-4", "--reasoning-effort", "high", "stdio"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs preserved unknown flags wrong: got %#v, want %#v", got, want)
@@ -181,7 +181,7 @@ func TestSanitizeGrokACPExtraArgs_ExtractsModelAndStripsDangerousFlags(t *testin
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			model, cleaned := sanitizeGrokACPExtraArgs(c.args, "grok-build")
+			model, cleaned := sanitizeGrokACPExtraArgs(c.args, "grok-build", false)
 			if model != c.wantModel {
 				t.Fatalf("model = %q, want %q", model, c.wantModel)
 			}
@@ -288,4 +288,132 @@ func grokArgsContain(args []string, target string) bool {
 		}
 	}
 	return false
+}
+
+// TestBuildGrokACPArgs_PreservesAPIKeyArgsWhenFallbackEnabled pins the inverse
+// of the default-strip: when the workspace has opted into API-key auth via
+// Config.EnableGrokAPIKeyFallback, the caller-supplied `--api-key{,-env}` /
+// `--auth{,-method}` flags (and their separate-value tokens) MUST flow through
+// to the child argv so the orchestrator can hand the credential to grok. The
+// matching XAI_API_KEY env-var survival is covered in
+// TestSanitizeGrokACPEnv_PreservesXAIKeyWhenFallbackEnabled.
+func TestBuildGrokACPArgs_PreservesAPIKeyArgsWhenFallbackEnabled(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{
+			"api_key_separate_value",
+			[]string{"--api-key", "xai-abc"},
+			[]string{"agent", "--model", "grok-build", "--api-key", "xai-abc", "stdio"},
+		},
+		{
+			"api_key_equals_form",
+			[]string{"--api-key=xai-abc"},
+			[]string{"agent", "--model", "grok-build", "--api-key=xai-abc", "stdio"},
+		},
+		{
+			"api_key_env_separate_value",
+			[]string{"--api-key-env", "OTHER_KEY_VAR"},
+			[]string{"agent", "--model", "grok-build", "--api-key-env", "OTHER_KEY_VAR", "stdio"},
+		},
+		{
+			"auth_method_separate_value",
+			[]string{"--auth", "xai.api_key"},
+			[]string{"agent", "--model", "grok-build", "--auth", "xai.api_key", "stdio"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := buildGrokACPArgs(c.args, false, true)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("buildGrokACPArgs(%#v, false, true) = %#v, want %#v", c.args, got, c.want)
+			}
+			// And the gate-off path still strips them (regression guard for
+			// the inverse default).
+			off := buildGrokACPArgs(c.args, false, false)
+			defaultContract := []string{"agent", "--model", "grok-build", "stdio"}
+			if !reflect.DeepEqual(off, defaultContract) {
+				t.Fatalf("buildGrokACPArgs(%#v, false, false) leaked: got %#v, want %#v", c.args, off, defaultContract)
+			}
+		})
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_RefusesOnPinnedAPIKey pins the
+// fail-closed behaviour for the system-level `/etc/grok/requirements.toml`
+// layer (NOT redirected by GROK_HOME): when it pins `model.api_key = "..."`
+// and the workspace has NOT opted into EnableGrokAPIKeyFallback, Start must
+// refuse to spawn the session rather than launch with the pinned credential.
+func TestDetectPinnedSystemGrokRequirements_RefusesOnPinnedAPIKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	if err := os.WriteFile(path, []byte("[model]\napi_key = \"xai-pinned\"\n"), 0o600); err != nil {
+		t.Fatalf("seed pinned requirements: %v", err)
+	}
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = path
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
+		t.Fatalf("expected refusal when api-key pinned and fallback gate closed")
+	}
+	if err := detectPinnedSystemGrokRequirements(true, false); err != nil {
+		t.Fatalf("expected pass when EnableGrokAPIKeyFallback=true acknowledges pin: %v", err)
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_RefusesOnPinnedAlwaysApprove mirrors
+// the auth-pin path for the approval-policy axis. `always_approve = true` in
+// the system layer + EnableGrokAlwaysApprove=false ⇒ refuse.
+func TestDetectPinnedSystemGrokRequirements_RefusesOnPinnedAlwaysApprove(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "[tools]\nalways_approve = true  # managed\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed pinned requirements: %v", err)
+	}
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = path
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
+		t.Fatalf("expected refusal when always_approve pinned and approval gate closed")
+	}
+	if err := detectPinnedSystemGrokRequirements(false, true); err != nil {
+		t.Fatalf("expected pass when EnableGrokAlwaysApprove=true acknowledges pin: %v", err)
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_MissingFileTolerated pins the
+// best-effort contract: when there is no system requirements file at all the
+// scan returns nil (a missing file is the common case on non-managed hosts).
+func TestDetectPinnedSystemGrokRequirements_MissingFileTolerated(t *testing.T) {
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = filepath.Join(t.TempDir(), "does-not-exist.toml")
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err != nil {
+		t.Fatalf("missing system requirements file must be tolerated: %v", err)
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_BenignFilePasses guards against the
+// fail-closed scan over-refusing on a benign system file that names neither
+// api_key nor approval pins.
+func TestDetectPinnedSystemGrokRequirements_BenignFilePasses(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "[models]\ndefault = \"grok-build\"\n[xai]\napi_base_url = \"https://api.x.ai\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed benign requirements: %v", err)
+	}
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = path
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err != nil {
+		t.Fatalf("benign requirements file must not trigger refusal: %v", err)
+	}
 }
