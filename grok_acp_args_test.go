@@ -665,3 +665,44 @@ func TestDetectPinnedSystemGrokRequirements_PassesOnSectionFormDenyOnlyRule(t *t
 		t.Fatalf("section-form deny-only permission_rules must NOT trigger refusal: %v", err)
 	}
 }
+
+// TestDetectPinnedSystemGrokRequirements_RefusesOnFullBypassValueSet pins the
+// lockstep contract between the requirements scanner and isGrokApprovalConfigKV
+// / isGrokPermissionModeBypassValue. The argv classifier accepts dashed long
+// forms (`approval.mode = "always-approve"`) and the claude-style
+// `acceptEdits` / `bypassPermissions` selectors on `permission_mode`; the
+// requirements gate must too, or a managed host can pin one of those values in
+// `/etc/grok/requirements.toml` and route around the per-tool prompt while
+// EnableGrokAlwaysApprove is false. The cases mirror the value buckets
+// documented in isGrokPermissionModeBypassValue.
+func TestDetectPinnedSystemGrokRequirements_RefusesOnFullBypassValueSet(t *testing.T) {
+	cases := map[string]string{
+		"approval.mode always-approve":      "approval.mode = \"always-approve\"\n",
+		"approval.mode auto-approve":        "approval.mode = \"auto-approve\"\n",
+		"approval_mode legacy long-form":    "approval_mode = \"always-approve\"\n",
+		"permission_mode acceptEdits":       "permission_mode = \"acceptEdits\"\n",
+		"permission_mode accept-edits":      "permission_mode = \"accept-edits\"\n",
+		"permission_mode bypassPermissions": "permission_mode = \"bypassPermissions\"\n",
+		"permission_mode always-approve":    "permission_mode = \"always-approve\"\n",
+		"ui.permission_mode acceptEdits":    "[ui]\npermission_mode = \"acceptEdits\"\n",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "requirements.toml")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatalf("seed pinned requirements: %v", err)
+			}
+			orig := grokSystemRequirementsPath
+			grokSystemRequirementsPath = path
+			t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+			if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
+				t.Fatalf("expected refusal when bypass-value pinned and approval gate closed")
+			}
+			if err := detectPinnedSystemGrokRequirements(false, true); err != nil {
+				t.Fatalf("expected pass when EnableGrokAlwaysApprove=true acknowledges pin: %v", err)
+			}
+		})
+	}
+}

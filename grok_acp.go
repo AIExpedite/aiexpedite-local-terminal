@@ -1412,24 +1412,36 @@ func lineMentionsGrokAuthPin(lower string) bool {
 
 // lineMentionsGrokApprovalPin reports whether a normalised TOML line pins one
 // of the approval bypasses (`always_approve = true`, `auto_approve = true`,
-// `approval.mode = "always"|"auto"`, `yolo = true`, `permission_mode =
-// "bypass*"`, or a non-empty allow-list such as `permission_rules =
-// ["Bash(*)"]` / `policy.allow = [...]`). Same flat-keyword approach as the
-// auth pin scanner.
+// `approval.mode = "always"|"auto"|"always-approve"|"auto-approve"`,
+// `yolo = true`, `permission_mode` matching isGrokPermissionModeBypassValue —
+// the full `bypass*` / `accept-edits` / `always*` / `auto*` set — or a
+// non-empty allow-list such as `policy.allow = [...]`). Bypass-value gating
+// is delegated to isGrokPermissionModeBypassValue (and mirrors the
+// approval-mode value set isGrokApprovalConfigKV gates argv on) so a system-
+// layer pin like `permission_mode = "acceptEdits"` or `approval.mode =
+// "always-approve"` trips the requirements gate identically to the argv
+// `--config permission_mode=…` / `--config approval.mode=…` surface — the
+// two surfaces must stay in lockstep, otherwise a managed host can route
+// past the per-tool prompt despite EnableGrokAlwaysApprove=false.
 func lineMentionsGrokApprovalPin(lower string) bool {
 	eq := strings.IndexByte(lower, '=')
 	if eq < 0 {
 		return false
 	}
 	key := strings.TrimSpace(lower[:eq])
-	val := strings.Trim(strings.TrimSpace(lower[eq+1:]), `"'`)
+	val := trimGrokTOMLStringQuotes(strings.TrimSpace(lower[eq+1:]))
 	switch {
 	case (strings.Contains(key, "always_approve") || strings.Contains(key, "auto_approve") || key == "yolo") && val == "true":
 		return true
-	case strings.HasSuffix(key, "approval.mode") || key == "mode":
-		return val == "always" || val == "auto"
+	case strings.HasSuffix(key, "approval.mode") || key == "approval_mode" || key == "approval" || key == "mode":
+		// Mirror isGrokApprovalConfigKV's approval-mode bypass-value set
+		// (`always|auto` plus the documented dashed long-forms). Without the
+		// long-form variants a `/etc/grok/requirements.toml` pinning
+		// `approval.mode = "always-approve"` would slip past the gate while
+		// the same argv `--config approval.mode=always-approve` is stripped.
+		return val == "always" || val == "auto" || val == "always-approve" || val == "auto-approve"
 	case strings.Contains(key, "permission_mode") || strings.Contains(key, "permission-mode"):
-		return strings.HasPrefix(val, "bypass")
+		return isGrokPermissionModeBypassValue(val)
 	case strings.HasSuffix(key, "policy.allow") ||
 		strings.HasSuffix(key, ".allow") ||
 		key == "allow" || key == "allow_rules" || key == "allowlist":
