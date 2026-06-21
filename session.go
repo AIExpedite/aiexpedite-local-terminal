@@ -1523,18 +1523,6 @@ var grokKnownSubcommands = map[string]bool{
 // Returns cliArgs only — there is no stdin prompt (stdinPromptFormat returns ""
 // for grok), the prompt is the value of `-p`.
 func buildGrokInteractiveArgs(args []string) []string {
-	// Subcommand carve-out: keep `grok models`, `grok sessions list`, etc.
-	// intact — those are not prompt invocations.
-	for _, a := range args {
-		if strings.HasPrefix(a, "-") {
-			continue
-		}
-		if grokKnownSubcommands[strings.ToLower(a)] {
-			return args
-		}
-		break // first non-flag positional decides
-	}
-
 	// Grok flags that consume the NEXT token as their value — without this,
 	// e.g. `--model grok-4` would treat "grok-4" as a prompt word. The
 	// `--flag=value` form is one token and needs no entry here.
@@ -1554,6 +1542,32 @@ func buildGrokInteractiveArgs(args []string) []string {
 		// resumed/named headless sessions.
 		"-s": true, "--session-id": true,
 		"-r": true, "--resume": true,
+	}
+
+	// Subcommand carve-out: keep `grok models`, `grok sessions list`, etc.
+	// intact — those are not prompt invocations. Skip valuedFlag values during
+	// the scan so e.g. `grok --cwd sessions fix bug` keeps "sessions" as the
+	// `--cwd` value (per xAI's headless flag docs) and still routes through the
+	// managed `-p` builder, instead of treating "sessions" as a subcommand and
+	// returning early.
+	{
+		skipNext := false
+		for i, a := range args {
+			if skipNext {
+				skipNext = false
+				continue
+			}
+			if strings.HasPrefix(a, "-") {
+				if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(args) {
+					skipNext = true
+				}
+				continue
+			}
+			if grokKnownSubcommands[strings.ToLower(a)] {
+				return args
+			}
+			break // first non-flag positional decides
+		}
 	}
 
 	var flagArgs []string
@@ -1618,8 +1632,38 @@ func buildGrokInteractiveArgs(args []string) []string {
 		promptParts = append(promptParts, a)
 	}
 
-	result := make([]string, 0, len(flagArgs)+4)
+	// Autonomous-tool-execution flag for the managed headless turn. Grok's
+	// documented default permission mode is `ask`, which prompts on every tool
+	// invocation / file edit. StartSession closes Grok's stdin after launch
+	// (shouldCloseStdinAfterStart returns true via the default branch when
+	// stdinPrompt is empty — grok's prompt rides on argv, not stdin) and
+	// detectPromptFromJSON has no Grok approval branch, so an approval prompt
+	// from inside the headless `-p` turn cannot be answered — the session
+	// would stall or fail despite the TUI-hang fix. Mirrors the unconditional
+	// approval bypass the other managed coding-agent argv builders inject
+	// (claude `--dangerously-skip-permissions`, codex
+	// `--dangerously-bypass-approvals-and-sandbox`, gemini
+	// `--approval-mode auto_edit`, agy `--dangerously-skip-permissions`).
+	// Skipped only when the caller already supplied an equivalent flag — a
+	// duplicate boolean flag is harmless but the cleaner argv aids debugging.
+	// xAI documents `--always-approve` as the canonical flag (`--auto-approve`
+	// is the legacy synonym — see isGrokAlwaysApproveArg in grok_acp.go).
+	injectAlwaysApprove := true
+	for _, a := range args {
+		lower := strings.ToLower(a)
+		if lower == "--always-approve" || lower == "--auto-approve" ||
+			strings.HasPrefix(lower, "--always-approve=") ||
+			strings.HasPrefix(lower, "--auto-approve=") {
+			injectAlwaysApprove = false
+			break
+		}
+	}
+
+	result := make([]string, 0, len(flagArgs)+5)
 	result = append(result, "--output-format", "streaming-json")
+	if injectAlwaysApprove {
+		result = append(result, "--always-approve")
+	}
 	result = append(result, flagArgs...)
 	// Always append `-p <prompt>`, even when empty — grok surfaces a useful
 	// "no prompt" error rather than hanging on the interactive TUI.
