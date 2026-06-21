@@ -656,6 +656,233 @@ func TestBuildGrokInteractiveArgs_InjectsNoAutoUpdateAndDedupes(t *testing.T) {
 	}
 }
 
+// TestBuildGrokInteractiveArgs_GateOffStripsPermissionBypassSurfaces guards
+// the gate-off mirror of the ACP path's sanitizeGrokACPExtraArgs: when
+// EnableGrokAlwaysApprove is false, the headless `-p` builder must strip
+// EVERY documented permission-bypass surface, not just `--always-approve`.
+// xAI's enterprise docs list three other surfaces that all skip the per-tool
+// prompt gate:
+//
+//   - `--permission-mode bypassPermissions` (and the `bypass`/`auto`/`always`/
+//     `acceptedits` synonyms isGrokPermissionModeBypassValue recognises);
+//   - `--allow <pattern>` (rules are evaluated BEFORE the per-tool prompt,
+//     so a single `--allow "Bash(*)"` would auto-approve matching tool calls);
+//   - `--config approval.permission_mode=bypassPermissions` / `auth.method=…`
+//     family (per-process config override of the same gate).
+//
+// Equals-form is dropped in the flag-folding loop; separate-value pairs flow
+// into flagArgs and are stripped by the trailing sweeps that mirror
+// stripGrokPermissionModePairs / stripGrokAllowRulePairs /
+// stripGrokApprovalConfigPairs. Without these strips a signed `session_start`
+// could ferry the bypass in via argv even though the ACP path refuses it.
+func TestBuildGrokInteractiveArgs_GateOffStripsPermissionBypassSurfaces(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+	}{
+		{name: "--permission-mode bypassPermissions separate-value", in: []string{"--permission-mode", "bypassPermissions", "fix", "bug"}},
+		{name: "--permission-mode=bypassPermissions equals-form", in: []string{"--permission-mode=bypassPermissions", "fix", "bug"}},
+		{name: "--permission-mode bypass synonym", in: []string{"--permission-mode", "bypass", "fix", "bug"}},
+		{name: "--permission-mode=auto synonym", in: []string{"--permission-mode=auto", "fix", "bug"}},
+		{name: "--permission-mode acceptEdits", in: []string{"--permission-mode", "acceptEdits", "fix", "bug"}},
+		{name: "--permission_mode underscore form", in: []string{"--permission_mode", "bypassPermissions", "fix", "bug"}},
+		{name: "--allow separate-value", in: []string{"--allow", "Bash(*)", "fix", "bug"}},
+		{name: "--allow=Bash(*) equals-form", in: []string{"--allow=Bash(*)", "fix", "bug"}},
+		{name: "--allow with second rule survives gate too", in: []string{"--allow", "Bash(git *)", "--allow", "WriteFile(*)", "fix", "bug"}},
+		{name: "--config approval.permission_mode=bypass", in: []string{"--config", "approval.permission_mode=bypassPermissions", "fix", "bug"}},
+		{name: "--config=approval.permission_mode=bypass equals-form", in: []string{"--config=approval.permission_mode=bypassPermissions", "fix", "bug"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in, false)
+			for i, a := range got {
+				lower := strings.ToLower(a)
+				switch {
+				case lower == "--permission-mode" || lower == "--permission_mode":
+					if i+1 < len(got) && isGrokPermissionModeBypassValue(got[i+1]) {
+						t.Fatalf("permission-mode bypass pair leaked through with gate off: %#v", got)
+					}
+				case strings.HasPrefix(lower, "--permission-mode=") || strings.HasPrefix(lower, "--permission_mode="):
+					if eq := strings.IndexByte(a, '='); eq >= 0 && isGrokPermissionModeBypassValue(a[eq+1:]) {
+						t.Fatalf("permission-mode bypass equals-form leaked through with gate off: %#v", got)
+					}
+				case lower == "--allow" || strings.HasPrefix(lower, "--allow="):
+					t.Fatalf("--allow rule leaked through with gate off: %#v", got)
+				case lower == "--config" || lower == "-c":
+					if i+1 < len(got) && isGrokApprovalConfigKV(got[i+1]) {
+						t.Fatalf("--config approval-kv pair leaked through with gate off: %#v", got)
+					}
+				case strings.HasPrefix(lower, "--config=") || strings.HasPrefix(lower, "-c="):
+					if eq := strings.IndexByte(a, '='); eq >= 0 && isGrokApprovalConfigKV(a[eq+1:]) {
+						t.Fatalf("--config approval-kv equals-form leaked through with gate off: %#v", got)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestBuildGrokInteractiveArgs_GateOffPreservesBenignPermissionMode guards
+// the inverse of the strip above: only BYPASS values are dropped. Selectors
+// like `default`, `plan`, or `ask` tighten the policy (or are the default)
+// and must flow through even with the gate off — same posture as the ACP
+// path's stripGrokPermissionModePairs.
+func TestBuildGrokInteractiveArgs_GateOffPreservesBenignPermissionMode(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "--permission-mode default flows through",
+			in:   []string{"--permission-mode", "default", "fix", "bug"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--permission-mode", "default", "-p", "fix bug"},
+		},
+		{
+			name: "--permission-mode plan flows through",
+			in:   []string{"--permission-mode", "plan", "fix", "bug"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--permission-mode", "plan", "-p", "fix bug"},
+		},
+		{
+			name: "--permission-mode=ask equals-form flows through",
+			in:   []string{"--permission-mode=ask", "fix", "bug"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--permission-mode=ask", "-p", "fix bug"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in, false)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildGrokInteractiveArgs_GateOffPreservesNonApprovalConfig guards that
+// the trailing sweep only drops `--config <approval-kv>` pairs (and the
+// auth-key family) when the gate is off — benign config like `log.level=debug`
+// or `model.timeout=120s` must flow through unchanged.
+func TestBuildGrokInteractiveArgs_GateOffPreservesNonApprovalConfig(t *testing.T) {
+	got := buildGrokInteractiveArgs([]string{"--config", "log.level=debug", "fix", "bug"}, false)
+	want := []string{"--output-format", "streaming-json", "--no-auto-update", "--config", "log.level=debug", "-p", "fix bug"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v, want %#v", got, want)
+	}
+}
+
+// TestBuildGrokInteractiveArgs_GateOnPreservesPermissionBypassSurfaces guards
+// the other side: when EnableGrokAlwaysApprove IS set the workspace has
+// opted into autonomous tool execution, so the bypass surfaces flow through
+// verbatim. The dedupe of the managed `--always-approve` injection is
+// covered separately; here we only assert the strip does NOT fire.
+func TestBuildGrokInteractiveArgs_GateOnPreservesPermissionBypassSurfaces(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		need string
+	}{
+		{name: "--permission-mode bypassPermissions stays", in: []string{"--permission-mode", "bypassPermissions", "fix", "bug"}, need: "bypassPermissions"},
+		{name: "--allow Bash(*) stays", in: []string{"--allow", "Bash(*)", "fix", "bug"}, need: "Bash(*)"},
+		{name: "--config approval.permission_mode=bypass stays", in: []string{"--config", "approval.permission_mode=bypassPermissions", "fix", "bug"}, need: "approval.permission_mode=bypassPermissions"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in, true)
+			found := false
+			for _, a := range got {
+				if a == tc.need {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("expected %q to flow through with gate on, got %#v", tc.need, got)
+			}
+		})
+	}
+}
+
+// TestBuildGrokInteractiveArgs_DoubleDashInProseWithSubcommandFirstWordFoldsToPrompt
+// guards the narrowed `--` carve-out gate. Previously, ANY input whose first
+// positional matched a known subcommand AND contained `--` short-circuited
+// to verbatim argv — meaning prose prompts like
+// `grok help me -- explain git checkout -- file` (where "help" collides with
+// the subcommand name but "me" is plainly not a CLI action verb) would be
+// passed to Grok unchanged. Grok then parses `help` as a subcommand and the
+// rest as subcommand args, reintroducing the tokenization failure this
+// builder exists to fix. The fix gates the `--` carve-out on the same
+// subcommand-grammar shape as the no-`--` case: ONE positional before `--`,
+// or two-plus positionals before `--` whose second is an action verb.
+func TestBuildGrokInteractiveArgs_DoubleDashInProseWithSubcommandFirstWordFoldsToPrompt(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         []string
+		wantPrompt string
+	}{
+		{
+			name:       "help me -- explain ... (P2 reviewer case)",
+			in:         []string{"help", "me", "--", "explain", "git", "checkout", "--", "file"},
+			wantPrompt: "help me -- explain git checkout -- file",
+		},
+		{
+			name:       "sessions stuck -- maybe?",
+			in:         []string{"sessions", "stuck", "--", "maybe?"},
+			wantPrompt: "sessions stuck -- maybe?",
+		},
+		{
+			name:       "models broken -- I think",
+			in:         []string{"models", "broken", "--", "I", "think"},
+			wantPrompt: "models broken -- I think",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in, true)
+			// Must NOT short-circuit to raw argv: managed `-p` must wrap the prompt.
+			if len(got) < 2 || got[len(got)-2] != "-p" {
+				t.Fatalf("expected trailing `-p <prompt>`, got %#v", got)
+			}
+			if got[len(got)-1] != tc.wantPrompt {
+				t.Fatalf("prompt mismatch: got %q, want %q (full=%#v)", got[len(got)-1], tc.wantPrompt, got)
+			}
+			// `--` must never appear directly before the managed `-p` — Grok
+			// would consume the flag as a positional and the headless
+			// prompt-delivery flag would be lost.
+			for i, a := range got {
+				if a == "--" && i+1 < len(got) && got[i+1] == "-p" {
+					t.Fatalf("standalone `--` leaked before managed -p: %#v", got)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildGrokInteractiveArgs_DoubleDashCarveOutStillFiresForRealSubcommandGrammar
+// is the inverse: the narrowed gate must STILL admit documented
+// multi-argument subcommand grammars where the positionals BEFORE the `--`
+// are a real subcommand+action shape. Specifically `grok mcp add <name> --
+// <cmd> [args...]` (xAI changelog example) must pass through verbatim — the
+// fix narrows the gate, it does not close it.
+func TestBuildGrokInteractiveArgs_DoubleDashCarveOutStillFiresForRealSubcommandGrammar(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+	}{
+		{name: "mcp add with --", in: []string{"mcp", "add", "filesystem", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"}},
+		{name: "mcp -- alone (single positional before --)", in: []string{"mcp", "--", "foo"}},
+		{name: "agent stdio with -- and args", in: []string{"agent", "stdio", "--", "--debug"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in, true)
+			if !reflect.DeepEqual(got, tc.in) {
+				t.Fatalf("expected verbatim passthrough, got %#v, want %#v", got, tc.in)
+			}
+		})
+	}
+}
+
 func TestDetectCLITerminalEvent_Grok(t *testing.T) {
 	if !detectCLITerminalEvent("grok", `{"type":"end"}`) {
 		t.Fatal(`grok "end" event should be terminal`)

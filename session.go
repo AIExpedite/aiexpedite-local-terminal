@@ -1619,27 +1619,27 @@ func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []str
 	// returning early.
 	//
 	// Carve out only when the shape is unambiguously a subcommand invocation,
-	// in one of three forms:
-	//   (a) the POSIX `--` end-of-options separator is present AND the leading
-	//       positional is a known subcommand (xAI changelog:
-	//       `grok mcp add <name> -- <cmd> [args...]`). `--` is a hard CLI
-	//       signal — prose prompts never contain it.
-	//   (b) exactly ONE free positional that matches a known subcommand
-	//       (`grok models`, `grok sessions`, `grok login`). A single
-	//       subcommand token can only be a subcommand call.
-	//   (c) exactly TWO free positionals, the first a known subcommand AND
-	//       the second a recognised action verb (`grok sessions list`,
-	//       `grok mcp install`, `grok models list`). The action-verb gate is
-	//       what makes the 2-positional case unambiguous — without it,
-	//       prose like `grok help me` or `grok sessions stuck` would land
-	//       on raw argv and Grok would reject the unknown second token,
-	//       reintroducing the tokenisation failure this builder fixes.
-	// Anything else — three-plus positionals without `--`, or two
-	// positionals whose second word is not an action verb — is treated as
-	// a prose prompt and folded into managed `-p` delivery.
+	// gated on the positionals BEFORE any POSIX `--` end-of-options separator:
+	//   (a) exactly ONE positional before `--` (or before end-of-args) that
+	//       matches a known subcommand (`grok models`, `grok sessions`,
+	//       `grok login`, `grok mcp -- foo`). A single subcommand token can
+	//       only be a subcommand call.
+	//   (b) two-plus positionals before `--` (or before end-of-args, capped
+	//       at two for the no-`--` case) where the first is a known
+	//       subcommand AND the second is a recognised action verb
+	//       (`grok sessions list`, `grok mcp install`, `grok mcp add <name>
+	//       -- <cmd>`). The action-verb gate is what makes the multi-
+	//       positional case unambiguous — without it, prose like `grok help
+	//       me` or `grok help me -- explain this` (where "help" matches a
+	//       subcommand name but "me" is not a verb) would land on raw argv
+	//       and Grok would reject the unknown second token, reintroducing
+	//       the tokenisation failure this builder exists to fix.
+	// Anything else — including a `--` that follows prose positionals — is
+	// treated as a prose prompt and folded into managed `-p` delivery.
 	{
 		skipNext := false
 		positionalCount := 0
+		positionalsBeforeDoubleDash := 0
 		hasDoubleDash := false
 		var firstPositional, secondPositional string
 		for i, a := range args {
@@ -1648,7 +1648,10 @@ func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []str
 				continue
 			}
 			if a == "--" {
-				hasDoubleDash = true
+				if !hasDoubleDash {
+					positionalsBeforeDoubleDash = positionalCount
+					hasDoubleDash = true
+				}
 				continue
 			}
 			if strings.HasPrefix(a, "-") {
@@ -1665,10 +1668,15 @@ func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []str
 			}
 			positionalCount++
 		}
+		// Effective positional count for the carve-out gate: positionals
+		// BEFORE the `--`. When no `--` is present, use the total count.
+		effectivePositionals := positionalCount
+		if hasDoubleDash {
+			effectivePositionals = positionalsBeforeDoubleDash
+		}
 		if firstPositional != "" && grokKnownSubcommands[firstPositional] {
-			if hasDoubleDash ||
-				positionalCount == 1 ||
-				(positionalCount == 2 && grokSubcommandActions[secondPositional]) {
+			if effectivePositionals == 1 ||
+				(effectivePositionals >= 2 && grokSubcommandActions[secondPositional]) {
 				return args
 			}
 		}
@@ -1766,6 +1774,35 @@ func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []str
 			(lowerEq == "--always-approve" || lowerEq == "--auto-approve") {
 			continue
 		}
+		// Gate-off strip for the OTHER permission-bypass surfaces xAI
+		// documents — `--permission-mode bypassPermissions`, `--allow
+		// <pattern>`, and `--config approval.*=bypass`. Equals-form is
+		// dropped here; the separate-value pairs flow into flagArgs and are
+		// stripped by the trailing sweeps below (mirrors the ACP path's
+		// sanitizeGrokACPExtraArgs speculative-admit / trailing-sweep
+		// pattern). Without this, a signed `session_start` could ferry the
+		// bypass in via `--permission-mode=bypassPermissions` /
+		// `--allow="Bash(*)"` / `--config=approval.permission_mode=bypass`
+		// and silently skip Grok's per-tool prompts in the default opt-out
+		// configuration even though the ACP path refuses to allow it.
+		if !enableGrokAlwaysApprove {
+			if strings.HasPrefix(lowerEq, "--permission-mode=") ||
+				strings.HasPrefix(lowerEq, "--permission_mode=") {
+				if eq := strings.IndexByte(a, '='); eq >= 0 &&
+					isGrokPermissionModeBypassValue(a[eq+1:]) {
+					continue
+				}
+			}
+			if strings.HasPrefix(lowerEq, "--allow=") {
+				continue
+			}
+			if strings.HasPrefix(lowerEq, "--config=") {
+				if eq := strings.IndexByte(a, '='); eq >= 0 &&
+					isGrokApprovalConfigKV(a[eq+1:]) {
+					continue
+				}
+			}
+		}
 		// Standalone `--` in the prose-prompt path: fold into the prompt
 		// rather than passing it through to Grok. The subcommand pre-scan
 		// above already carved out the documented `grok <subcmd> ... --
@@ -1792,6 +1829,21 @@ func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []str
 			continue
 		}
 		promptParts = append(promptParts, a)
+	}
+
+	// Gate-off trailing sweeps: drop `--permission-mode <bypass>`, `--allow
+	// <pattern>`, and `--config <approval-kv>` separate-value pairs that the
+	// main loop admitted speculatively via valuedFlags. Mirrors
+	// sanitizeGrokACPExtraArgs — equals-forms were dropped above, these
+	// sweeps finish off the separate-value pairs. Without them, a signed
+	// session_start could bypass the workspace's per-tool approval gate via
+	// `--permission-mode bypassPermissions` / `--allow "Bash(*)"` /
+	// `--config approval.permission_mode=bypass` even though the ACP path
+	// refuses the same surfaces under the same gate.
+	if !enableGrokAlwaysApprove {
+		flagArgs = stripGrokPermissionModePairs(flagArgs)
+		flagArgs = stripGrokAllowRulePairs(flagArgs)
+		flagArgs = stripGrokApprovalConfigPairs(flagArgs)
 	}
 
 	// Autonomous-tool-execution flag for the managed headless turn. Grok's
