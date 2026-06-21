@@ -48,6 +48,48 @@ func TestBuildGrokInteractiveArgs_SubcommandCarveOut(t *testing.T) {
 	}
 }
 
+// TestBuildGrokInteractiveArgs_PreservesResumeAndSessionIDValues guards the
+// xAI Headless & Scripting common flags `-r/--resume <ID>` and
+// `-s/--session-id <ID>`: without an entry in valuedFlags the next token (the
+// ID) would land in promptParts and Grok would then see `--resume -p` (the
+// managed `-p` flag swallowed as the resume ID), breaking resumed sessions.
+func TestBuildGrokInteractiveArgs_PreservesResumeAndSessionIDValues(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "--resume keeps its ID and prompt is preserved",
+			in:   []string{"--resume", "abc", "continue", "work"},
+			want: []string{"--output-format", "streaming-json", "--resume", "abc", "-p", "continue work"},
+		},
+		{
+			name: "-r short form",
+			in:   []string{"-r", "abc", "ship", "it"},
+			want: []string{"--output-format", "streaming-json", "-r", "abc", "-p", "ship it"},
+		},
+		{
+			name: "--session-id keeps its ID",
+			in:   []string{"--session-id", "sess-42", "next", "step"},
+			want: []string{"--output-format", "streaming-json", "--session-id", "sess-42", "-p", "next step"},
+		},
+		{
+			name: "-s short form",
+			in:   []string{"-s", "sess-42", "go"},
+			want: []string{"--output-format", "streaming-json", "-s", "sess-42", "-p", "go"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDetectCLITerminalEvent_Grok(t *testing.T) {
 	if !detectCLITerminalEvent("grok", `{"type":"end"}`) {
 		t.Fatal(`grok "end" event should be terminal`)

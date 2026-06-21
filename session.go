@@ -1546,6 +1546,14 @@ func buildGrokInteractiveArgs(args []string) []string {
 		"--compaction-mode": true, "--compaction-detail": true,
 		"--rules": true, "--system-prompt-override": true,
 		"--leader-socket": true, "--debug-file": true,
+		// Session continuation: xAI's docs list -s/--session-id and -r/--resume
+		// as value-taking common flags. Without them, e.g. `grok --resume abc
+		// continue work` would land "abc" in promptParts, then the appended
+		// `-p` would have "--resume" as its preceding token — Grok would see
+		// `--resume -p` and consume the `-p` flag as the resume ID, breaking
+		// resumed/named headless sessions.
+		"-s": true, "--session-id": true,
+		"-r": true, "--resume": true,
 	}
 
 	var flagArgs []string

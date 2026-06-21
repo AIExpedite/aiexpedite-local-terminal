@@ -5,9 +5,10 @@
 // to show clean text instead of raw JSON events.
 //
 // Each CLI uses a different JSON streaming format:
-//   - Claude: --output-format stream-json  (Anthropic API streaming events)
-//   - Codex:  --json                       (JSONL events)
-//   - Gemini: -o stream-json               (NDJSON events)
+//   - Claude: --output-format stream-json     (Anthropic API streaming events)
+//   - Codex:  --json                          (JSONL events)
+//   - Gemini: -o stream-json                  (NDJSON events)
+//   - Grok:   --output-format streaming-json  (NDJSON: text / thought / end frames)
 // -----------------------------------------------------------------------------
 
 package main
@@ -47,6 +48,8 @@ func extractDisplayText(command, line string) string {
 		return extractCodexDisplayText(raw)
 	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
 		return extractGeminiDisplayText(raw)
+	case cmdLower == "grok" || strings.HasPrefix(cmdLower, "grok"):
+		return extractGrokDisplayText(raw)
 	default:
 		return line // passthrough unknown CLI agents
 	}
@@ -298,6 +301,46 @@ func extractGeminiDisplayText(raw map[string]interface{}) string {
 
 	case "tool_result", "result", "init":
 		return "" // skip metadata
+	}
+
+	return ""
+}
+
+/* --------------------------------------------------------------------------
+   Grok parser
+   -------------------------------------------------------------------------- */
+
+// extractGrokDisplayText extracts display text from a Grok streaming-json
+// event. buildGrokInteractiveArgs forces `--output-format streaming-json`, so
+// without this branch the parser would fall through to `default` and the user
+// would see raw `{"type":"text",...}` / `thought` / `end` frames in chat
+// instead of the assistant's words.
+func extractGrokDisplayText(raw map[string]interface{}) string {
+	eventType, _ := raw["type"].(string)
+
+	switch eventType {
+	case "text":
+		text, _ := raw["text"].(string)
+		return text
+
+	case "tool_use":
+		name, _ := raw["name"].(string)
+		if name == "" {
+			name, _ = raw["tool_name"].(string)
+		}
+		if name != "" {
+			return fmt.Sprintf("\n[Using tool: %s]\n", name)
+		}
+		return ""
+
+	case "error":
+		if errMsg, _ := raw["message"].(string); errMsg != "" {
+			return fmt.Sprintf("\n[Error: %s]\n", errMsg)
+		}
+		return ""
+
+	case "thought", "end", "tool_result", "result", "init", "start":
+		return "" // thinking + lifecycle / metadata frames, skip
 	}
 
 	return ""

@@ -1075,6 +1075,71 @@ func TestExtractDisplayText_Gemini_ErrorEventSurfacesMessage(t *testing.T) {
 }
 
 /* --------------------------------------------------------------------------
+   extractDisplayText — Grok
+   --------------------------------------------------------------------------
+   buildGrokInteractiveArgs forces `--output-format streaming-json`, which
+   emits per-event NDJSON frames (text / thought / end). Without a grok
+   branch in extractDisplayText, every line falls through to the default
+   passthrough and the user sees raw `{"type":"text",...}` JSON in chat.
+   ------------------------------------------------------------------------ */
+
+func TestExtractDisplayText_Grok_TextFrameReturnsText(t *testing.T) {
+	line := `{"type":"text","text":"hello from grok"}`
+	got := extractDisplayText("grok", line)
+	if got != "hello from grok" {
+		t.Errorf("got %q, want %q", got, "hello from grok")
+	}
+}
+
+func TestExtractDisplayText_Grok_SkipsThoughtAndEndAndMetadata(t *testing.T) {
+	// thought / end / lifecycle frames are noise to the human reader. `end`
+	// is also the detectCLITerminalEvent signal — surfacing it as display
+	// text would emit a stray `{}` looking blob right before turn close.
+	cases := []string{
+		`{"type":"thought","text":"reasoning..."}`,
+		`{"type":"end"}`,
+		`{"type":"start"}`,
+		`{"type":"init"}`,
+		`{"type":"result"}`,
+		`{"type":"tool_result"}`,
+	}
+	for _, line := range cases {
+		got := extractDisplayText("grok", line)
+		if got != "" {
+			t.Errorf("expected empty for %q, got %q", line, got)
+		}
+	}
+}
+
+func TestExtractDisplayText_Grok_ToolUseSurfacesName(t *testing.T) {
+	// Grok's tool-use frames carry the tool name under either `name` or
+	// `tool_name` across versions; both must work, mirroring gemini.
+	got := extractDisplayText("grok", `{"type":"tool_use","name":"Bash"}`)
+	if !strings.Contains(got, "Bash") {
+		t.Errorf("got %q, want output to mention 'Bash'", got)
+	}
+	got2 := extractDisplayText("grok", `{"type":"tool_use","tool_name":"ReadFile"}`)
+	if !strings.Contains(got2, "ReadFile") {
+		t.Errorf("got %q, want output to mention 'ReadFile'", got2)
+	}
+}
+
+func TestExtractDisplayText_Grok_ErrorEventSurfacesMessage(t *testing.T) {
+	line := `{"type":"error","message":"rate limited"}`
+	got := extractDisplayText("grok", line)
+	if !strings.Contains(got, "rate limited") {
+		t.Errorf("error event must surface message: got %q", got)
+	}
+}
+
+func TestExtractDisplayText_Grok_NonJsonPassthrough(t *testing.T) {
+	got := extractDisplayText("grok", "error: unrecognized subcommand 'a'")
+	if got != "error: unrecognized subcommand 'a'" {
+		t.Errorf("plain text should passthrough, got %q", got)
+	}
+}
+
+/* --------------------------------------------------------------------------
    detectPromptFromJSON
    ------------------------------------------------------------------------ */
 
