@@ -1201,6 +1201,15 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 	const maxBytes = 1 << 20
 	scanner := bufio.NewScanner(io.LimitReader(f, maxBytes))
 	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+	// Track the active TOML section so a `[permission]` header followed by a
+	// bare `rules = ["Bash(*)"]` line is classified as `permission.rules` —
+	// the documented section-form of the allow-list pin. Without this the
+	// switch below would see the unqualified key `rules` and skip the line,
+	// letting a system-layer allow rule bypass the gate. Array-of-tables
+	// (`[[name]]`) is intentionally ignored: the keys we care about are all
+	// scalar tables, and treating `[[arr]]` as a section would mis-prefix
+	// unrelated keys inside it.
+	var currentSection string
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -1215,15 +1224,32 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 		if line == "" {
 			continue
 		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") && !strings.HasPrefix(line, "[[") {
+			currentSection = strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
+			continue
+		}
 		lower := strings.ToLower(line)
+		eq := strings.IndexByte(lower, '=')
+		if eq <= 0 {
+			continue
+		}
+		bareKey := strings.TrimSpace(lower[:eq])
+		key := bareKey
+		if currentSection != "" && bareKey != "" && !strings.Contains(bareKey, ".") {
+			key = currentSection + "." + bareKey
+		}
+		// Synthesise a section-qualified `key = ...` line so the keyword
+		// scanners below see `permission.rules` instead of the unqualified
+		// `rules` when the file uses section-form.
+		qualifiedLower := key + lower[eq:]
 
-		if !allowAPIKey && lineMentionsGrokAuthPin(lower) {
+		if !allowAPIKey && lineMentionsGrokAuthPin(qualifiedLower) {
 			return fmt.Errorf("grok requirements pin API-key auth in %s; refusing to spawn — set Config.EnableGrokAPIKeyFallback=true to opt in, or remove the pinned credential", path)
 		}
 		if allowAlwaysApprove {
 			continue
 		}
-		if lineMentionsGrokApprovalPin(lower) {
+		if lineMentionsGrokApprovalPin(qualifiedLower) {
 			return fmt.Errorf("grok requirements pin a permissive approval policy in %s; refusing to spawn — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the pinned policy", path)
 		}
 		// `permission_rules` / `permission.rules` and the `policy.allow` /
@@ -1237,11 +1263,6 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 		// Multi-line array form needs continuation accumulation before
 		// classification or a `[\n {action = "allow", ...}\n]` would be read
 		// as the first-line value `[` and miss the allow entry entirely.
-		eq := strings.IndexByte(lower, '=')
-		if eq <= 0 {
-			continue
-		}
-		key := strings.TrimSpace(lower[:eq])
 		rawVal := strings.TrimSpace(line[eq+1:])
 		switch key {
 		case "permission_rules", "permission.rules":
@@ -1409,15 +1430,19 @@ func lineMentionsGrokApprovalPin(lower string) bool {
 		return val == "always" || val == "auto"
 	case strings.Contains(key, "permission_mode") || strings.Contains(key, "permission-mode"):
 		return strings.HasPrefix(val, "bypass")
-	case strings.Contains(key, "permission_rules") ||
-		strings.Contains(key, "permission-rules") ||
-		strings.HasSuffix(key, "permission.rules") ||
-		strings.HasSuffix(key, "policy.allow") ||
+	case strings.HasSuffix(key, "policy.allow") ||
 		strings.HasSuffix(key, ".allow") ||
 		key == "allow" || key == "allow_rules" || key == "allowlist":
 		// Any non-empty allow rule auto-approves matching tools, which is
 		// the same bypass surface as `always_approve = true`. Empty list /
 		// empty string ⇒ deliberate clear, treat as benign.
+		// `permission_rules` / `permission.rules` are NOT classified here:
+		// xAI documents `action = "deny"` rules as policy-tightening (deny
+		// takes precedence), so a deny-only pin from an MDM policy must not
+		// trip this broad refusal. The structured switch in
+		// detectPinnedSystemGrokRequirements routes `permission_rules`
+		// values through grokPermissionRulesValueHasAllowAction, which only
+		// fires on actual allow entries.
 		return val != "" && val != "[]"
 	}
 	return false
@@ -1461,7 +1486,7 @@ func setEnvVar(env []string, key, value string) []string {
 //     `--no-auto-update` / `--auto-update`, the credential flags `--api-key*`
 //     / `--auth*` (stripped UNLESS allowAPIKeyFallback is true — see the
 //     env-sanitiser's matching XAI_API_KEY gate), the `--cwd*` containment
-//     side-door, `--always-approve` (owned by buildGrokACPArgs), the
+//     side-door, `--always-approve` / `--auto-approve` (owned by buildGrokACPArgs), the
 //     duplicate entry tokens (`agent`/`stdio`/`chat`/`tui`/`run`), and the
 //     POSIX `--` end-of-options delimiter.
 func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAPIKeyFallback bool) (string, []string) {
@@ -1563,7 +1588,13 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAPIK
 
 		// `--always-approve` is owned by buildGrokACPArgs (gated on the
 		// per-workspace opt-in) — never let a caller inject it directly.
-		if lower == "--always-approve" || strings.HasPrefix(lower, "--always-approve=") {
+		// `--auto-approve` is the documented alias on some grok builds and
+		// behaves identically as an approval bypass, so it has to be
+		// stripped on the same gate — otherwise extras like
+		// `["--auto-approve"]` would slip past the always-approve sanitiser
+		// (or hard-fail startup on versions that reject the alias).
+		if lower == "--always-approve" || strings.HasPrefix(lower, "--always-approve=") ||
+			lower == "--auto-approve" || strings.HasPrefix(lower, "--auto-approve=") {
 			continue
 		}
 

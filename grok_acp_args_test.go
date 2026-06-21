@@ -126,6 +126,8 @@ func TestBuildGrokACPArgs_StripsIncompatibleFlags(t *testing.T) {
 		{"cwd_separate", []string{"--cwd", "/tmp/other"}},
 		{"cwd_equals", []string{"--cwd=/tmp/other"}},
 		{"always_approve_injected_by_caller", []string{"--always-approve"}},
+		{"auto_approve_alias_injected_by_caller", []string{"--auto-approve"}},
+		{"auto_approve_alias_equals_form", []string{"--auto-approve=true"}},
 		{"end_of_options_delimiter", []string{"--", "--config", "model.api_key=x"}},
 		{"duplicate_entry_tokens", []string{"agent", "stdio", "chat", "tui", "run"}},
 	}
@@ -593,5 +595,73 @@ func TestDetectPinnedSystemGrokRequirements_QuoteAwareInlineCommentStrip(t *test
 
 	if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
 		t.Fatalf("expected refusal — quote-aware strip must keep the in-pattern `#` and still flag the allow rule")
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_RefusesOnSectionFormPermissionRules
+// pins the section-header path: `[permission]\nrules = ["Bash(*)"]` is a
+// legal TOML rewrite of the flat `permission.rules = [...]` form, so the
+// scanner must qualify the unqualified `rules` key with the active section
+// header — otherwise a system-layer allow rule would skip the gate and let
+// auto-approve happen behind the workspace's back.
+func TestDetectPinnedSystemGrokRequirements_RefusesOnSectionFormPermissionRules(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "[permission]\nrules = [\"Bash(*)\"]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed pinned requirements: %v", err)
+	}
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = path
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err == nil {
+		t.Fatalf("expected refusal when section-form [permission]\\nrules = [...] pinned and approval gate closed")
+	}
+	if err := detectPinnedSystemGrokRequirements(false, true); err != nil {
+		t.Fatalf("expected pass when EnableGrokAlwaysApprove=true acknowledges pin: %v", err)
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_PassesOnDenyOnlyFlatRule guards the
+// flat (single-line) deny-only form. Before the lineMentionsGrokApprovalPin
+// scoping fix, ANY non-empty `permission_rules` value tripped the broad
+// refusal, including `permission_rules = [{action = "deny", ...}]` —
+// weakening host security to wipe a deny policy that doesn't even allow
+// anything. The structured switch's grokPermissionRulesValueHasAllowAction
+// classifier now owns this surface and must let deny-only through.
+func TestDetectPinnedSystemGrokRequirements_PassesOnDenyOnlyFlatRule(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "permission_rules = [{ action = \"deny\", pattern = \"Bash(rm -rf*)\" }]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed deny-only requirements: %v", err)
+	}
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = path
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err != nil {
+		t.Fatalf("flat deny-only permission_rules must NOT trigger refusal: %v", err)
+	}
+}
+
+// TestDetectPinnedSystemGrokRequirements_PassesOnSectionFormDenyOnlyRule
+// covers the section-header rewrite of the deny-only case: both the section
+// qualification AND the deny-vs-allow classification must compose so an MDM
+// policy `[permission]\nrules = [{action = "deny", ...}]` stays intact.
+func TestDetectPinnedSystemGrokRequirements_PassesOnSectionFormDenyOnlyRule(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requirements.toml")
+	body := "[permission]\nrules = [{ action = \"deny\", pattern = \"Bash(rm -rf*)\" }]\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed deny-only section requirements: %v", err)
+	}
+	orig := grokSystemRequirementsPath
+	grokSystemRequirementsPath = path
+	t.Cleanup(func() { grokSystemRequirementsPath = orig })
+
+	if err := detectPinnedSystemGrokRequirements(false, false); err != nil {
+		t.Fatalf("section-form deny-only permission_rules must NOT trigger refusal: %v", err)
 	}
 }
