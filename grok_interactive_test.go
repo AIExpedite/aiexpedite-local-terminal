@@ -398,6 +398,45 @@ func TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv(t *t
 	}
 }
 
+// TestBuildGrokInteractiveArgs_SubcommandCarveOutOnDoubleDash guards
+// documented multi-argument Grok subcommand grammars (xAI changelog:
+// `grok mcp add <name> -- <cmd> [args...]`). The POSIX `--` end-of-options
+// separator is a hard CLI signal that the invocation is a real subcommand
+// grammar, not prose — without this carve-out, the leading subcommand word
+// plus ≥ 3 positionals would fall through to the prompt builder and be
+// rewritten to `-p "mcp add filesystem npx ..."`, dropping the subcommand.
+func TestBuildGrokInteractiveArgs_SubcommandCarveOutOnDoubleDash(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "mcp add with -- separator carves out verbatim (xAI changelog example)",
+			in:   []string{"mcp", "add", "filesystem", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"},
+			want: []string{"mcp", "add", "filesystem", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"},
+		},
+		{
+			name: "mcp add with -- and a single trailing token",
+			in:   []string{"mcp", "add", "fs", "--", "fs-server"},
+			want: []string{"mcp", "add", "fs", "--", "fs-server"},
+		},
+		{
+			name: "flags before subcommand with -- still carve out",
+			in:   []string{"--cwd", "/tmp", "mcp", "add", "fs", "--", "npx", "server"},
+			want: []string{"--cwd", "/tmp", "mcp", "add", "fs", "--", "npx", "server"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestBuildGrokInteractiveArgs_InjectsNoAutoUpdateAndDedupes guards the
 // unconditional injection of `--no-auto-update` on managed headless turns and
 // the strip of any caller-supplied `--no-auto-update` / `--auto-update`. Grok's

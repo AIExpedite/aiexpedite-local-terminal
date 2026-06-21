@@ -1587,25 +1587,34 @@ func buildGrokInteractiveArgs(args []string) []string {
 	// managed `-p` builder, instead of treating "sessions" as a subcommand and
 	// returning early.
 	//
-	// Require the carve-out to be UNAMBIGUOUS: the leading positional matches a
-	// known subcommand AND the total free-positional count is ≤ 2 (i.e. just
-	// `models` / `sessions` or two-token shapes like `sessions list`, `mcp
-	// install`). Three-or-more free positionals after flag-folding is the
-	// signature of an unquoted prose prompt that happens to start with a
-	// subcommand-name word — `grok help me fix tests`, `grok sessions should
-	// persist` — and must fall through to the `-p` builder so the prompt is
-	// folded into a single `-p` value instead of being parsed as a subcommand
-	// invocation with stray positional words. The narrower threshold trades
-	// support for rare 3-token subcommand calls (`grok sessions show <id>` —
-	// also expressible with flag/equals form) for the much more common prose
-	// prompt case the Codex review flagged.
+	// Carve out when EITHER signal is unambiguous:
+	//   (a) leading positional is a known subcommand AND total free-positional
+	//       count is ≤ 2 (`models`, `sessions list`, `mcp install`); or
+	//   (b) args contain the POSIX `--` end-of-options separator AND the
+	//       leading positional is a known subcommand. `--` is a hard CLI signal
+	//       that the user is invoking a documented multi-arg subcommand
+	//       grammar (xAI changelog: `grok mcp add <name> -- <cmd> [args...]`),
+	//       not typing prose — prose prompts never contain `--`. Without (b),
+	//       any documented Grok subcommand with three or more positional
+	//       tokens (mcp add, mcp install with command, etc.) would be
+	//       silently rewritten into `-p "mcp add filesystem npx ..."` and
+	//       Grok would never receive the subcommand.
+	// Three-or-more free positionals WITHOUT `--`, even when the leading word
+	// matches a subcommand name, is the signature of an unquoted prose prompt
+	// (`grok help me fix tests`, `grok sessions should persist`) and must fall
+	// through to the `-p` builder.
 	{
 		skipNext := false
 		positionalCount := 0
+		hasDoubleDash := false
 		var firstPositional string
 		for i, a := range args {
 			if skipNext {
 				skipNext = false
+				continue
+			}
+			if a == "--" {
+				hasDoubleDash = true
 				continue
 			}
 			if strings.HasPrefix(a, "-") {
@@ -1619,7 +1628,8 @@ func buildGrokInteractiveArgs(args []string) []string {
 			}
 			positionalCount++
 		}
-		if firstPositional != "" && grokKnownSubcommands[firstPositional] && positionalCount <= 2 {
+		if firstPositional != "" && grokKnownSubcommands[firstPositional] &&
+			(positionalCount <= 2 || hasDoubleDash) {
 			return args
 		}
 	}
