@@ -56,7 +56,7 @@ func extractDisplayText(command, line string) string {
 	case strings.HasPrefix(base, "gemini"):
 		return extractGeminiDisplayText(raw)
 	case strings.HasPrefix(base, "grok"):
-		return extractGrokDisplayText(raw)
+		return extractGrokDisplayText(raw, line)
 	default:
 		return line // passthrough unknown CLI agents
 	}
@@ -322,7 +322,18 @@ func extractGeminiDisplayText(raw map[string]interface{}) string {
 // without this branch the parser would fall through to `default` and the user
 // would see raw `{"type":"text",...}` / `thought` / `end` frames in chat
 // instead of the assistant's words.
-func extractGrokDisplayText(raw map[string]interface{}) string {
+//
+// `line` is the raw JSON line and is used as a passthrough fallback when the
+// frame has no `type` field at all — which is the shape of structured JSON
+// output emitted by carved-out Grok subcommands (e.g. `grok sessions --json`)
+// that bypass the managed `--output-format streaming-json -p` headless path.
+// Every event in the streaming-json schema carries a `type` field, so
+// "no type" is a reliable signal that this is subcommand output the user
+// asked for rather than a streaming frame to filter.
+func extractGrokDisplayText(raw map[string]interface{}, line string) string {
+	if _, hasType := raw["type"]; !hasType {
+		return line
+	}
 	eventType, _ := raw["type"].(string)
 
 	switch eventType {

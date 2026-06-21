@@ -1139,6 +1139,29 @@ func TestExtractDisplayText_Grok_NonJsonPassthrough(t *testing.T) {
 	}
 }
 
+// TestExtractDisplayText_Grok_SubcommandJSONPassthrough guards that JSON
+// output from a carved-out Grok subcommand — which bypasses the managed
+// `--output-format streaming-json -p` headless path and runs verbatim
+// (e.g. `grok sessions --json`) — is not swallowed by the streaming-json
+// parser. Every event in the streaming-json schema carries a `type` field,
+// so a JSON object with no `type` is structured subcommand output the user
+// asked for and must passthrough rather than render as an empty line.
+// Pairs with TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv's
+// `sessions --json` carve-out case.
+func TestExtractDisplayText_Grok_SubcommandJSONPassthrough(t *testing.T) {
+	cases := []string{
+		`{"id":"sess_1","name":"work","createdAt":"2026-06-20T00:00:00Z"}`,
+		`{"models":["grok-4","grok-3"]}`,
+		`{"version":"1.2.3","build":"abc"}`,
+	}
+	for _, line := range cases {
+		got := extractDisplayText("grok", line)
+		if got != line {
+			t.Errorf("subcommand JSON without type field should passthrough; got %q, want %q", got, line)
+		}
+	}
+}
+
 // TestExtractDisplayText_RoutesByBasename guards parser selection against
 // path-launched sessions: buildInteractiveCLIArgs and detectCLITerminalEvent
 // both classify via commandBaseName, so an explicit grok path like
