@@ -12,7 +12,7 @@ import (
 // Grok parsed "a" as a subcommand. The builder must fold the whole prompt into
 // a single `-p` value under managed streaming-json, exiting after one turn.
 func TestBuildGrokInteractiveArgs_UnquotedPromptScreenshotCase(t *testing.T) {
-	got := buildGrokInteractiveArgs([]string{"Have", "a", "short", "conversation"})
+	got := buildGrokInteractiveArgs([]string{"Have", "a", "short", "conversation"}, true)
 	want := []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "Have a short conversation"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
@@ -24,7 +24,7 @@ func TestBuildGrokInteractiveArgs_StripsManagedFlagsAndPassesModel(t *testing.T)
 	// stripped; --model must pass through; positional words become the prompt.
 	got := buildGrokInteractiveArgs([]string{
 		"--model", "grok-4", "--output-format", "json", "-p", "fix the bug",
-	})
+	}, true)
 	want := []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--model", "grok-4", "-p", "fix the bug"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
@@ -32,7 +32,7 @@ func TestBuildGrokInteractiveArgs_StripsManagedFlagsAndPassesModel(t *testing.T)
 }
 
 func TestBuildGrokInteractiveArgs_InlinePromptFlagValue(t *testing.T) {
-	got := buildGrokInteractiveArgs([]string{"--single=hello there"})
+	got := buildGrokInteractiveArgs([]string{"--single=hello there"}, true)
 	want := []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "hello there"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v, want %#v", got, want)
@@ -42,7 +42,7 @@ func TestBuildGrokInteractiveArgs_InlinePromptFlagValue(t *testing.T) {
 func TestBuildGrokInteractiveArgs_SubcommandCarveOut(t *testing.T) {
 	// `grok models` is not a prompt — pass through verbatim, no injected -p.
 	in := []string{"models"}
-	got := buildGrokInteractiveArgs(in)
+	got := buildGrokInteractiveArgs(in, true)
 	if !reflect.DeepEqual(got, in) {
 		t.Fatalf("subcommand should be untouched: got %#v", got)
 	}
@@ -84,7 +84,7 @@ func TestBuildGrokInteractiveArgs_SubcommandPreScanSkipsValuedFlagValues(t *test
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %#v, want %#v", got, tc.want)
 			}
@@ -92,14 +92,15 @@ func TestBuildGrokInteractiveArgs_SubcommandPreScanSkipsValuedFlagValues(t *test
 	}
 }
 
-// TestBuildGrokInteractiveArgs_InjectsAlwaysApproveByDefault guards the
-// unconditional injection of `--always-approve` on managed headless turns.
-// Without it, Grok's default `ask` permission mode would prompt for tool
-// execution / file edits, but StartSession closes Grok's stdin after launch
-// and detectPromptFromJSON has no Grok approval branch — the prompt cannot
-// be answered and the headless session stalls or fails.
-func TestBuildGrokInteractiveArgs_InjectsAlwaysApproveByDefault(t *testing.T) {
-	got := buildGrokInteractiveArgs([]string{"do", "the", "thing"})
+// TestBuildGrokInteractiveArgs_InjectsAlwaysApproveWhenOptedIn guards the
+// injection of `--always-approve` on managed headless turns once the workspace
+// has opted into Config.EnableGrokAlwaysApprove. Without it, Grok's default
+// `ask` permission mode would prompt for tool execution / file edits, but
+// StartSession closes Grok's stdin after launch and detectPromptFromJSON has
+// no Grok approval branch — the prompt cannot be answered and the headless
+// session stalls or fails.
+func TestBuildGrokInteractiveArgs_InjectsAlwaysApproveWhenOptedIn(t *testing.T) {
+	got := buildGrokInteractiveArgs([]string{"do", "the", "thing"}, true)
 	hasFlag := false
 	for _, a := range got {
 		if a == "--always-approve" {
@@ -109,6 +110,54 @@ func TestBuildGrokInteractiveArgs_InjectsAlwaysApproveByDefault(t *testing.T) {
 	}
 	if !hasFlag {
 		t.Fatalf("expected --always-approve in managed argv, got %#v", got)
+	}
+}
+
+// TestBuildGrokInteractiveArgs_OmitsAlwaysApproveByDefault guards the gate:
+// without Config.EnableGrokAlwaysApprove, the managed argv must NOT silently
+// inject the approval bypass — the same conservative posture the Grok ACP
+// path enforces. The session may stall on the first tool/file-edit prompt;
+// that is the intentional opt-in tradeoff.
+func TestBuildGrokInteractiveArgs_OmitsAlwaysApproveByDefault(t *testing.T) {
+	got := buildGrokInteractiveArgs([]string{"do", "the", "thing"}, false)
+	for _, a := range got {
+		lower := strings.ToLower(a)
+		if lower == "--always-approve" || lower == "--auto-approve" ||
+			strings.HasPrefix(lower, "--always-approve=") ||
+			strings.HasPrefix(lower, "--auto-approve=") {
+			t.Fatalf("expected no approval-bypass flag when gate off, got %#v", got)
+		}
+	}
+}
+
+// TestBuildGrokInteractiveArgs_GateOffStripsCallerSuppliedAlwaysApprove guards
+// that even a caller-supplied `--always-approve` / `--auto-approve` (any
+// spelling) is dropped from flagArgs when the gate is off — otherwise a
+// signed `session_start` could ferry the bypass in via argv and bypass the
+// per-workspace opt-in. Mirrors the strip-by-default posture in the Grok ACP
+// path's stripGrokAlwaysApprove flow.
+func TestBuildGrokInteractiveArgs_GateOffStripsCallerSuppliedAlwaysApprove(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+	}{
+		{name: "bare --always-approve", in: []string{"--always-approve", "do", "thing"}},
+		{name: "--always-approve=true", in: []string{"--always-approve=true", "do", "thing"}},
+		{name: "--auto-approve synonym", in: []string{"--auto-approve", "do", "thing"}},
+		{name: "--auto-approve=true synonym", in: []string{"--auto-approve=true", "do", "thing"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in, false)
+			for _, a := range got {
+				lower := strings.ToLower(a)
+				if lower == "--always-approve" || lower == "--auto-approve" ||
+					strings.HasPrefix(lower, "--always-approve=") ||
+					strings.HasPrefix(lower, "--auto-approve=") {
+					t.Fatalf("approval-bypass flag leaked through with gate off: %#v", got)
+				}
+			}
+		})
 	}
 }
 
@@ -127,7 +176,7 @@ func TestBuildGrokInteractiveArgs_DoesNotDuplicateUserAlwaysApprove(t *testing.T
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			count := 0
 			for _, a := range got {
 				lower := strings.ToLower(a)
@@ -164,7 +213,7 @@ func TestBuildGrokInteractiveArgs_DisabledApproveDoesNotSuppressInjection(t *tes
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			bareCount := 0
 			for _, a := range got {
 				lower := strings.ToLower(a)
@@ -217,7 +266,7 @@ func TestBuildGrokInteractiveArgs_PreservesResumeAndSessionIDValues(t *testing.T
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %#v, want %#v", got, tc.want)
 			}
@@ -261,7 +310,7 @@ func TestBuildGrokInteractiveArgs_SubcommandPreScanSkipsPromptFlagValues(t *test
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %#v, want %#v", got, tc.want)
 			}
@@ -304,7 +353,7 @@ func TestBuildGrokInteractiveArgs_PreservesAllowDenyRuleValues(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %#v, want %#v", got, tc.want)
 			}
@@ -336,7 +385,7 @@ func TestBuildGrokInteractiveArgs_PreservesPluginDirValue(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %#v, want %#v", got, tc.want)
 			}
@@ -368,7 +417,7 @@ func TestBuildGrokInteractiveArgs_PreservesConfigValue(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %#v, want %#v", got, tc.want)
 			}
@@ -473,7 +522,7 @@ func TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv(t *t
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %#v, want %#v", got, tc.want)
 			}
@@ -512,7 +561,7 @@ func TestBuildGrokInteractiveArgs_SubcommandCarveOutOnDoubleDash(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %#v, want %#v", got, tc.want)
 			}
@@ -546,7 +595,7 @@ func TestBuildGrokInteractiveArgs_DoubleDashInProseFoldsIntoPrompt(t *testing.T)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			// `--` must never appear among the flag args: it would precede
 			// the appended managed `-p` and Grok would consume the flag as a
 			// positional, breaking the headless contract.
@@ -585,7 +634,7 @@ func TestBuildGrokInteractiveArgs_InjectsNoAutoUpdateAndDedupes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildGrokInteractiveArgs(tc.in)
+			got := buildGrokInteractiveArgs(tc.in, true)
 			noUpdateCount := 0
 			autoUpdateCount := 0
 			for _, a := range got {

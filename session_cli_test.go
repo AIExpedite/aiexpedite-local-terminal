@@ -615,13 +615,13 @@ func TestStdinPromptFormat(t *testing.T) {
 
 func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 	t.Run("claude", func(t *testing.T) {
-		_, prompt := buildInteractiveCLIArgs("claude", []string{"hello"})
+		_, prompt := buildInteractiveCLIArgs("claude", []string{"hello"}, false)
 		if prompt != "hello" {
 			t.Errorf("claude prompt = %q, want %q", prompt, "hello")
 		}
 	})
 	t.Run("codex", func(t *testing.T) {
-		args, prompt := buildInteractiveCLIArgs("codex", []string{"hello"})
+		args, prompt := buildInteractiveCLIArgs("codex", []string{"hello"}, false)
 		if prompt != "hello" {
 			t.Errorf("codex stdinPrompt = %q, want %q", prompt, "hello")
 		}
@@ -630,7 +630,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 		}
 	})
 	t.Run("gemini", func(t *testing.T) {
-		args, prompt := buildInteractiveCLIArgs("gemini", []string{"hello"})
+		args, prompt := buildInteractiveCLIArgs("gemini", []string{"hello"}, false)
 		if prompt != "hello" {
 			t.Errorf("gemini stdinPrompt = %q, want %q (prompt now goes via stdin)", prompt, "hello")
 		}
@@ -646,7 +646,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 		mustContain(t, args, "-o", "stream-json")
 	})
 	t.Run("antigravity", func(t *testing.T) {
-		args, prompt := buildInteractiveCLIArgs("agy", []string{"hello"})
+		args, prompt := buildInteractiveCLIArgs("agy", []string{"hello"}, false)
 		if prompt != "" {
 			t.Errorf("agy stdinPrompt MUST be empty (agy ignores piped stdin; prompt goes on argv): %q", prompt)
 		}
@@ -655,11 +655,11 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 	t.Run("case-insensitive", func(t *testing.T) {
 		// The router checks command.ToLower() exactly + startswith — make sure
 		// "Claude" / "CODEX" still route correctly.
-		_, p1 := buildInteractiveCLIArgs("Claude", []string{"hi"})
+		_, p1 := buildInteractiveCLIArgs("Claude", []string{"hi"}, false)
 		if p1 == "" {
 			t.Errorf("Claude (mixed case) should still route to claude builder, got empty prompt")
 		}
-		args, _ := buildInteractiveCLIArgs("CODEX", []string{"hi"})
+		args, _ := buildInteractiveCLIArgs("CODEX", []string{"hi"}, false)
 		if len(args) == 0 || args[0] != "exec" {
 			t.Errorf("CODEX (upper case) should still route to codex builder, args=%v", args)
 		}
@@ -676,7 +676,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 			"./claude",
 			"claude-edge",
 		} {
-			_, prompt := buildInteractiveCLIArgs(cmd, []string{"hi"})
+			_, prompt := buildInteractiveCLIArgs(cmd, []string{"hi"}, false)
 			if prompt == "" {
 				t.Errorf("buildInteractiveCLIArgs(%q) did not route to claude (empty stdinPrompt)", cmd)
 			}
@@ -686,7 +686,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 		}
 	})
 	t.Run("unknown-command-passes-through", func(t *testing.T) {
-		args, prompt := buildInteractiveCLIArgs("git", []string{"status"})
+		args, prompt := buildInteractiveCLIArgs("git", []string{"status"}, false)
 		if prompt != "" {
 			t.Errorf("unknown command should have empty stdinPrompt, got %q", prompt)
 		}

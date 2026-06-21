@@ -109,7 +109,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	// Build the CLI command with appropriate flags for structured streaming.
 	// stdinPrompt is non-empty for Claude — the prompt is sent as NDJSON on stdin.
-	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args)
+	enableGrokAlwaysApprove := sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
+	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
 
 	// Resolve executable path
 	executable := resolveExecutable(command)
@@ -1168,7 +1169,7 @@ func isGrokCommand(command string) bool {
 //
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
 // the stdinPrompt before writing it to the process stdin.
-func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
+func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysApprove bool) ([]string, string) {
 	base := commandBaseName(command)
 
 	switch {
@@ -1181,7 +1182,7 @@ func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
 	case strings.HasPrefix(base, "agy"):
 		return buildAntigravityInteractiveArgs(args), ""
 	case strings.HasPrefix(base, "grok"):
-		return buildGrokInteractiveArgs(args), ""
+		return buildGrokInteractiveArgs(args, enableGrokAlwaysApprove), ""
 	default:
 		return args, ""
 	}
@@ -1552,7 +1553,7 @@ var grokSubcommandActions = map[string]bool{
 //
 // Returns cliArgs only — there is no stdin prompt (stdinPromptFormat returns ""
 // for grok), the prompt is the value of `-p`.
-func buildGrokInteractiveArgs(args []string) []string {
+func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []string {
 	// Grok flags that consume the NEXT token as their value — without this,
 	// e.g. `--model grok-4` would treat "grok-4" as a prompt word. The
 	// `--flag=value` form is one token and needs no entry here.
@@ -1754,6 +1755,17 @@ func buildGrokInteractiveArgs(args []string) []string {
 			strings.HasPrefix(lowerEq, "--auto-approve=") {
 			continue
 		}
+		// Gate-off strip: when the workspace has NOT opted into
+		// Config.EnableGrokAlwaysApprove, drop any caller-supplied bare
+		// `--always-approve` / `--auto-approve` from flagArgs too. Otherwise a
+		// signed `session_start` could ferry the approval bypass in via argv
+		// and silently skip Grok's permission prompts in the default (opt-out)
+		// configuration — exactly what the ACP path's stripGrokAlwaysApprove
+		// flow refuses to allow.
+		if !enableGrokAlwaysApprove &&
+			(lowerEq == "--always-approve" || lowerEq == "--auto-approve") {
+			continue
+		}
 		// Standalone `--` in the prose-prompt path: fold into the prompt
 		// rather than passing it through to Grok. The subcommand pre-scan
 		// above already carved out the documented `grok <subcmd> ... --
@@ -1789,27 +1801,35 @@ func buildGrokInteractiveArgs(args []string) []string {
 	// stdinPrompt is empty — grok's prompt rides on argv, not stdin) and
 	// detectPromptFromJSON has no Grok approval branch, so an approval prompt
 	// from inside the headless `-p` turn cannot be answered — the session
-	// would stall or fail despite the TUI-hang fix. Mirrors the unconditional
-	// approval bypass the other managed coding-agent argv builders inject
-	// (claude `--dangerously-skip-permissions`, codex
-	// `--dangerously-bypass-approvals-and-sandbox`, gemini
-	// `--approval-mode auto_edit`, agy `--dangerously-skip-permissions`).
+	// would stall or fail despite the TUI-hang fix. xAI documents
+	// `--always-approve` as the canonical flag (`--auto-approve` is the legacy
+	// synonym — see isGrokAlwaysApproveArg in grok_acp.go).
+	//
+	// GATED behind Config.EnableGrokAlwaysApprove — the same per-workspace
+	// opt-in the Grok ACP path uses to strip equivalent caller-supplied bypass
+	// flags. Without this gate, an approved/signed `session_start` targeting
+	// `grok` would silently skip Grok's permission prompts in the default
+	// (opt-out) configuration even though the ACP path refuses to. When the
+	// gate is off the headless `-p` turn may stall on the first tool/file-edit
+	// prompt — that is the intentional conservative posture; flip the gate to
+	// accept the autonomous-execution tradeoff.
+	//
 	// Skipped only when the caller already supplied an equivalent flag — a
 	// duplicate boolean flag is harmless but the cleaner argv aids debugging.
-	// xAI documents `--always-approve` as the canonical flag (`--auto-approve`
-	// is the legacy synonym — see isGrokAlwaysApproveArg in grok_acp.go).
 	// Equals-form spellings (`--always-approve=true`, `--always-approve=false`,
 	// and the `--auto-approve=…` synonyms) were stripped wholesale in the
 	// flag-folding loop above, so only the bare form can reach this dedupe
 	// check — this prevents a caller-supplied `=false` from suppressing the
 	// injection while leaving the disabled flag in flagArgs (which would
 	// stall the headless `-p` turn on the first tool/file-edit prompt).
-	injectAlwaysApprove := true
-	for _, a := range args {
-		lower := strings.ToLower(a)
-		if lower == "--always-approve" || lower == "--auto-approve" {
-			injectAlwaysApprove = false
-			break
+	injectAlwaysApprove := enableGrokAlwaysApprove
+	if injectAlwaysApprove {
+		for _, a := range args {
+			lower := strings.ToLower(a)
+			if lower == "--always-approve" || lower == "--auto-approve" {
+				injectAlwaysApprove = false
+				break
+			}
 		}
 	}
 
