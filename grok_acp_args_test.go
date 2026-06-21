@@ -208,7 +208,7 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 	}
 	t.Setenv("GROK_HOME", realHome)
 
-	dir, err := setupIsolatedGrokHome(false)
+	dir, err := setupIsolatedGrokHome(false, grokACPDefaultModel)
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 func TestSetupIsolatedGrokHome_MissingAuthTolerated(t *testing.T) {
 	t.Setenv("GROK_HOME", t.TempDir()) // empty: no auth.json
 
-	dir, err := setupIsolatedGrokHome(false)
+	dir, err := setupIsolatedGrokHome(false, grokACPDefaultModel)
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome must tolerate missing auth: %v", err)
 	}
@@ -344,7 +344,7 @@ func TestSetupIsolatedGrokHome_PreservesPersistedAPIKeyWhenFallbackEnabled(t *te
 	}
 	t.Setenv("GROK_HOME", realHome)
 
-	on, err := setupIsolatedGrokHome(true)
+	on, err := setupIsolatedGrokHome(true, grokACPDefaultModel)
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome(true): %v", err)
 	}
@@ -360,7 +360,7 @@ func TestSetupIsolatedGrokHome_PreservesPersistedAPIKeyWhenFallbackEnabled(t *te
 		t.Fatalf("approval knob must NOT leak even when api-key fallback is on; got %q", cfgOn)
 	}
 
-	off, err := setupIsolatedGrokHome(false)
+	off, err := setupIsolatedGrokHome(false, grokACPDefaultModel)
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome(false): %v", err)
 	}
@@ -371,6 +371,75 @@ func TestSetupIsolatedGrokHome_PreservesPersistedAPIKeyWhenFallbackEnabled(t *te
 	}
 	if strings.Contains(string(cfgOff), "api_key") || strings.Contains(string(cfgOff), "xai-persisted") {
 		t.Fatalf("api_key must stay stripped when fallback gate is closed; got %q", cfgOff)
+	}
+}
+
+// TestSetupIsolatedGrokHome_PreservesPerModelAPIKey pins the per-model leg of
+// the EnableGrokAPIKeyFallback opt-in: when the user stores the fallback key in
+// xAI's documented per-model form (`[model.<runtimeModel>] api_key = "..."`,
+// the xAI Enterprise "API key example"), the isolated home must carry that
+// section over for the model the agent actually launches under. Otherwise the
+// per-session GROK_HOME isolation strips a key the user explicitly opted in to.
+// Per-model match also wins over a root `[model] api_key` default — mirroring
+// grok's own precedence in the un-isolated config.
+func TestSetupIsolatedGrokHome_PreservesPerModelAPIKey(t *testing.T) {
+	realHome := t.TempDir()
+	body := "[model]\napi_key = \"xai-root-default\"\n" +
+		"[model.grok-build]\napi_key = \"xai-per-model\"\n" +
+		"[model.grok-other]\napi_key = \"xai-other\"\n"
+	if err := os.WriteFile(filepath.Join(realHome, "config.toml"), []byte(body), 0o600); err != nil {
+		t.Fatalf("seed source config.toml: %v", err)
+	}
+	t.Setenv("GROK_HOME", realHome)
+
+	on, err := setupIsolatedGrokHome(true, "grok-build")
+	if err != nil {
+		t.Fatalf("setupIsolatedGrokHome(true, grok-build): %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(on) })
+	cfgOn, err := os.ReadFile(filepath.Join(on, "config.toml"))
+	if err != nil {
+		t.Fatalf("isolated config.toml not written: %v", err)
+	}
+	got := string(cfgOn)
+	if !strings.Contains(got, "[model.grok-build]") || !strings.Contains(got, "xai-per-model") {
+		t.Fatalf("per-model api_key must be carried over under [model.grok-build]; got %q", got)
+	}
+	if strings.Contains(got, "xai-root-default") {
+		t.Fatalf("per-model match must win over root [model] default; got %q", got)
+	}
+	if strings.Contains(got, "xai-other") || strings.Contains(got, "[model.grok-other]") {
+		t.Fatalf("non-matching per-model sections must NOT leak; got %q", got)
+	}
+}
+
+// TestSetupIsolatedGrokHome_PreservesRootAPIKeyWhenNoPerModelMatch pins that
+// the root `[model] api_key` default is still honoured when no per-model
+// section matches the runtime model — preserves prior behaviour for users
+// whose key lives under the documented default form.
+func TestSetupIsolatedGrokHome_PreservesRootAPIKeyWhenNoPerModelMatch(t *testing.T) {
+	realHome := t.TempDir()
+	body := "[model]\napi_key = \"xai-root-only\"\n[model.grok-other]\napi_key = \"xai-other\"\n"
+	if err := os.WriteFile(filepath.Join(realHome, "config.toml"), []byte(body), 0o600); err != nil {
+		t.Fatalf("seed source config.toml: %v", err)
+	}
+	t.Setenv("GROK_HOME", realHome)
+
+	on, err := setupIsolatedGrokHome(true, "grok-build")
+	if err != nil {
+		t.Fatalf("setupIsolatedGrokHome(true, grok-build): %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(on) })
+	cfgOn, err := os.ReadFile(filepath.Join(on, "config.toml"))
+	if err != nil {
+		t.Fatalf("isolated config.toml not written: %v", err)
+	}
+	got := string(cfgOn)
+	if !strings.Contains(got, "xai-root-only") {
+		t.Fatalf("root [model] api_key must be carried over when no per-model match; got %q", got)
+	}
+	if strings.Contains(got, "xai-other") {
+		t.Fatalf("non-matching per-model section must NOT leak; got %q", got)
 	}
 }
 

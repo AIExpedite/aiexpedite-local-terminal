@@ -342,6 +342,14 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	}
 
 	args := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove)
+	// args is `{"agent", "--model", <model>, ...}` by buildGrokACPArgs's
+	// validated contract (see grokACPDefaultModel block); pull args[2] so
+	// setupIsolatedGrokHome carries over the matching per-model api_key when
+	// the user keeps it in the `[model.<resolvedModel>]` form.
+	resolvedModel := grokACPDefaultModel
+	if len(args) >= 3 && args[1] == "--model" {
+		resolvedModel = args[2]
+	}
 
 	// Isolated GROK_HOME (replaces the old `--config <key>=` security
 	// neutralizers, which are GONE as of grok 0.2.59 — `grok agent` rejects
@@ -357,7 +365,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// Fail closed if isolation can't be established: with `--config` gone, the
 	// argv has no neutralizers, so launching with the inherited (potentially
 	// unsafe) GROK_HOME would silently bypass the workspace's opt-in gates.
-	isolatedHome, err := setupIsolatedGrokHome(opts.AllowAPIKeyFallback)
+	isolatedHome, err := setupIsolatedGrokHome(opts.AllowAPIKeyFallback, resolvedModel)
 	if err != nil {
 		return fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)
 	}
@@ -1126,16 +1134,20 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
 // and let grok surface any auth error through the normal ACP handshake.
 //
 // allowAPIKeyFallback opts in to preserving the user's persistent
-// `[model] api_key = "..."` entry from the source `config.toml` into the
-// isolated config. Without this, users who opted into API-key fallback but
-// keep their key in `~/.grok/config.toml` (xAI's documented persistent form)
-// and do NOT export XAI_API_KEY would silently lose API-key auth in the
-// isolated session. All other persisted config (approval/permission knobs,
-// other model.* fields, other tables) stays excluded by design.
+// `api_key = "..."` entry from the source `config.toml` into the isolated
+// config. Without this, users who opted into API-key fallback but keep their
+// key in `~/.grok/config.toml` (xAI's documented persistent form) and do NOT
+// export XAI_API_KEY would silently lose API-key auth in the isolated session.
+// Both the root `[model] api_key` form AND the documented per-model
+// `[model.<runtimeModel>] api_key` form are carried over (the per-model match
+// for the resolved runtime model wins when both exist — mirroring grok's own
+// precedence in the un-isolated config). All other persisted config
+// (approval/permission knobs, other model.* fields, other tables) stays
+// excluded by design.
 //
 // Returns the temp dir path. The caller (Start) owns its lifecycle and removes
 // it after the child exits (waitForExit) or on any pre-spawn failure.
-func setupIsolatedGrokHome(allowAPIKeyFallback bool) (string, error) {
+func setupIsolatedGrokHome(allowAPIKeyFallback bool, runtimeModel string) (string, error) {
 	dir, err := os.MkdirTemp("", "grok-acp-home-")
 	if err != nil {
 		return "", fmt.Errorf("create isolated grok home: %w", err)
@@ -1170,16 +1182,19 @@ func setupIsolatedGrokHome(allowAPIKeyFallback bool) (string, error) {
 	// Minimal clean config.toml — deliberately carries no approval/permission
 	// knobs, so none of the user's real persisted policy leaks into the
 	// isolated session. When allowAPIKeyFallback is true and the source
-	// `config.toml` contains `[model] api_key = "..."`, that single line is
-	// carried over so the opt-in fallback also works for users whose key lives
-	// in xAI's documented persistent form (not just `XAI_API_KEY`).
+	// `config.toml` contains either `[model] api_key = "..."` OR the
+	// per-model `[model.<runtimeModel>] api_key = "..."` form, that single
+	// line is carried over (under the same section header it came from) so
+	// the opt-in fallback also works for users whose key lives in xAI's
+	// documented persistent form (not just `XAI_API_KEY`).
 	// `auto_update = false` matches xAI's documented headless/scripting guidance:
 	// without it, an updater check can race `grok agent stdio` and dump non-JSON
 	// stdout that readStream treats as a fatal `grok_acp_error`.
 	cfg := "[cli]\ninstaller = \"internal\"\nauto_update = false\n"
 	if allowAPIKeyFallback && srcBase != "" {
-		if apiKey := readGrokPersistedAPIKey(filepath.Join(srcBase, "config.toml")); apiKey != "" {
-			cfg += "\n[model]\napi_key = " + apiKey + "\n"
+		section, apiKey := readGrokPersistedAPIKey(filepath.Join(srcBase, "config.toml"), runtimeModel)
+		if apiKey != "" {
+			cfg += "\n[" + section + "]\napi_key = " + apiKey + "\n"
 		}
 	}
 	if werr := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cfg), 0o600); werr != nil {
@@ -1191,22 +1206,33 @@ func setupIsolatedGrokHome(allowAPIKeyFallback bool) (string, error) {
 }
 
 // readGrokPersistedAPIKey returns the raw TOML value (quoted or literal, as
-// found) of `[model] api_key` from the given source `config.toml`, or "" when
-// the file is missing/unreadable or the key is absent. Returning the raw value
-// preserves whichever quoting style the user wrote (`"xai-..."`, `'xai-...'`,
-// or basic strings) without re-quoting heuristics that could corrupt embedded
-// characters. Scoped tightly: only the `[model]` section's `api_key` scalar is
-// considered — section-qualified `model.api_key = ...` at the document root is
-// also accepted. Tracks the active section using the same line-oriented sweep
-// as detectPinnedSystemGrokRequirementsFile, with inline `#` strip and the
-// same array-of-tables guard.
-func readGrokPersistedAPIKey(path string) string {
+// found) of an `api_key` line from the given source `config.toml`, plus the
+// section header it was found under (`"model"` or `"model.<runtimeModel>"`).
+// Returns ("", "") when the file is missing/unreadable or no matching key is
+// present. Returning the raw value preserves whichever quoting style the user
+// wrote (`"xai-..."`, `'xai-...'`, or basic strings) without re-quoting
+// heuristics that could corrupt embedded characters.
+//
+// Both the root `[model] api_key` form AND the documented per-model
+// `[model.<name>] api_key` form (xAI Enterprise "API key example") are
+// honoured, because users who explicitly opted into EnableGrokAPIKeyFallback
+// shouldn't silently lose the fallback just because their persistent key lives
+// in the per-model section that matches the model the agent runs under
+// (default `grok-build`). Per-model match for `runtimeModel` takes precedence
+// over the root `[model]` default — same precedence grok itself applies when
+// it loads the un-isolated config — and the returned section header is mirrored
+// into the isolated config so the carryover behaves identically.
+//
+// Tracks the active section using the same line-oriented sweep as
+// detectPinnedSystemGrokRequirementsFile, with inline `#` strip and the same
+// array-of-tables guard.
+func readGrokPersistedAPIKey(path, runtimeModel string) (string, string) {
 	if path == "" {
-		return ""
+		return "", ""
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	defer f.Close()
 
@@ -1214,6 +1240,12 @@ func readGrokPersistedAPIKey(path string) string {
 	scanner := bufio.NewScanner(io.LimitReader(f, maxBytes))
 	scanner.Buffer(make([]byte, 64*1024), 256*1024)
 	var currentSection string
+	var rootSection, rootValue string
+	var perModelSection, perModelValue string
+	perModelMatch := ""
+	if runtimeModel != "" {
+		perModelMatch = "model." + strings.ToLower(runtimeModel) + ".api_key"
+	}
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -1236,11 +1268,20 @@ func readGrokPersistedAPIKey(path string) string {
 		if currentSection != "" && !strings.Contains(bareKey, ".") {
 			key = currentSection + "." + bareKey
 		}
-		if key == "model.api_key" {
-			return strings.TrimSpace(line[eq+1:])
+		if key == "model.api_key" && rootValue == "" {
+			rootSection = "model"
+			rootValue = strings.TrimSpace(line[eq+1:])
+			continue
+		}
+		if perModelMatch != "" && key == perModelMatch && perModelValue == "" {
+			perModelSection = "model." + strings.ToLower(runtimeModel)
+			perModelValue = strings.TrimSpace(line[eq+1:])
 		}
 	}
-	return ""
+	if perModelValue != "" {
+		return perModelSection, perModelValue
+	}
+	return rootSection, rootValue
 }
 
 // grokSystemRequirementsPath is the documented system-level pinned-config
