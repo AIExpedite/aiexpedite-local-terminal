@@ -273,6 +273,38 @@ func TestBuildGrokInteractiveArgs_PreservesAllowDenyRuleValues(t *testing.T) {
 	}
 }
 
+// TestBuildGrokInteractiveArgs_PreservesPluginDirValue guards the xAI plugin
+// docs `--plugin-dir <PATH>` separate-value flag. Without this entry in
+// valuedFlags, the path lands in promptParts and the bare `--plugin-dir`
+// slots in immediately before the appended managed `-p`, so Grok consumes
+// `-p` as the plugin directory value and the prompt is no longer delivered.
+func TestBuildGrokInteractiveArgs_PreservesPluginDirValue(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "--plugin-dir keeps its path; prompt remains intact",
+			in:   []string{"--plugin-dir", "/tmp/plugins", "fix", "bug"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--plugin-dir", "/tmp/plugins", "-p", "fix bug"},
+		},
+		{
+			name: "caller-supplied -p with --plugin-dir — managed -p still wins, prompt preserved",
+			in:   []string{"--plugin-dir", "/tmp/plugins", "-p", "fix bug"},
+			want: []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "--plugin-dir", "/tmp/plugins", "-p", "fix bug"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("got %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv
 // guards the narrowed subcommand pre-scan: a leading subcommand-name word
 // no longer short-circuits to verbatim argv when the trailing positional

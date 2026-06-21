@@ -1534,6 +1534,13 @@ func buildGrokInteractiveArgs(args []string) []string {
 		"--compaction-mode": true, "--compaction-detail": true,
 		"--rules": true, "--system-prompt-override": true,
 		"--leader-socket": true, "--debug-file": true,
+		// Plugin discovery: xAI's plugin docs list `--plugin-dir <PATH>` as a
+		// separate-value flag. Without this entry, `grok --plugin-dir /tmp/p
+		// fix bug` would land "/tmp/p" in promptParts and the bare `--plugin-dir`
+		// would slot in immediately before the appended managed `-p` — Grok
+		// would then consume `-p` as the plugin directory value, dropping the
+		// managed prompt delivery.
+		"--plugin-dir": true,
 		// Permission-policy rule flags: xAI's enterprise headless docs document
 		// `--allow <pattern>` / `--deny <pattern>` as per-tool policy rules
 		// (e.g. `--allow "Bash(git *)" --deny "Bash(rm -rf *)"`). Without these
