@@ -5,9 +5,10 @@
 // to show clean text instead of raw JSON events.
 //
 // Each CLI uses a different JSON streaming format:
-//   - Claude: --output-format stream-json  (Anthropic API streaming events)
-//   - Codex:  --json                       (JSONL events)
-//   - Gemini: -o stream-json               (NDJSON events)
+//   - Claude: --output-format stream-json     (Anthropic API streaming events)
+//   - Codex:  --json                          (JSONL events)
+//   - Gemini: -o stream-json                  (NDJSON events)
+//   - Grok:   --output-format streaming-json  (NDJSON: text / thought / end frames)
 // -----------------------------------------------------------------------------
 
 package main
@@ -39,14 +40,23 @@ func extractDisplayText(command, line string) string {
 		return line // passthrough malformed JSON
 	}
 
-	cmdLower := strings.ToLower(command)
+	// Route by the same basename normalization the session router and
+	// detectCLITerminalEvent use (commandBaseName in session.go) so an
+	// explicit path like `/home/user/.grok/bin/grok` or `C:\tools\grok.exe`
+	// — which buildInteractiveCLIArgs already shapes as the streaming-json
+	// `-p` headless turn — picks the matching parser here too. Without this
+	// normalisation a path-launched session would fall through to the
+	// default case and publish raw NDJSON frames as chat text.
+	base := commandBaseName(command)
 	switch {
-	case cmdLower == "claude" || strings.HasPrefix(cmdLower, "claude"):
+	case strings.HasPrefix(base, "claude"):
 		return extractClaudeDisplayText(raw)
-	case cmdLower == "codex" || strings.HasPrefix(cmdLower, "codex"):
+	case strings.HasPrefix(base, "codex"):
 		return extractCodexDisplayText(raw)
-	case cmdLower == "gemini" || strings.HasPrefix(cmdLower, "gemini"):
+	case strings.HasPrefix(base, "gemini"):
 		return extractGeminiDisplayText(raw)
+	case strings.HasPrefix(base, "grok"):
+		return extractGrokDisplayText(raw, line)
 	default:
 		return line // passthrough unknown CLI agents
 	}
@@ -298,6 +308,57 @@ func extractGeminiDisplayText(raw map[string]interface{}) string {
 
 	case "tool_result", "result", "init":
 		return "" // skip metadata
+	}
+
+	return ""
+}
+
+/* --------------------------------------------------------------------------
+   Grok parser
+   -------------------------------------------------------------------------- */
+
+// extractGrokDisplayText extracts display text from a Grok streaming-json
+// event. buildGrokInteractiveArgs forces `--output-format streaming-json`, so
+// without this branch the parser would fall through to `default` and the user
+// would see raw `{"type":"text",...}` / `thought` / `end` frames in chat
+// instead of the assistant's words.
+//
+// `line` is the raw JSON line and is used as a passthrough fallback when the
+// frame has no `type` field at all — which is the shape of structured JSON
+// output emitted by carved-out Grok subcommands (e.g. `grok sessions --json`)
+// that bypass the managed `--output-format streaming-json -p` headless path.
+// Every event in the streaming-json schema carries a `type` field, so
+// "no type" is a reliable signal that this is subcommand output the user
+// asked for rather than a streaming frame to filter.
+func extractGrokDisplayText(raw map[string]interface{}, line string) string {
+	if _, hasType := raw["type"]; !hasType {
+		return line
+	}
+	eventType, _ := raw["type"].(string)
+
+	switch eventType {
+	case "text":
+		text, _ := raw["text"].(string)
+		return text
+
+	case "tool_use":
+		name, _ := raw["name"].(string)
+		if name == "" {
+			name, _ = raw["tool_name"].(string)
+		}
+		if name != "" {
+			return fmt.Sprintf("\n[Using tool: %s]\n", name)
+		}
+		return ""
+
+	case "error":
+		if errMsg, _ := raw["message"].(string); errMsg != "" {
+			return fmt.Sprintf("\n[Error: %s]\n", errMsg)
+		}
+		return ""
+
+	case "thought", "end", "tool_result", "result", "init", "start":
+		return "" // thinking + lifecycle / metadata frames, skip
 	}
 
 	return ""

@@ -1394,6 +1394,95 @@ func TestGrokACPLifecycle_ForwardsBadFrameAsError(t *testing.T) {
 	}
 }
 
+// TestGrokACPLifecycle_CapturesUsageLimitFromStream pins the ACP-path bridge
+// to captureGrokUsageLimitLine: the normal Grok integration runs through
+// `grok_acp_start` / readStream rather than the raw `session_start` path in
+// session.go that already wires the hook, so without mirroring the call in
+// readStream the `usage_limit_reached` session-update frame the orchestrator
+// produces never populates `grok_usage_limit.json` and the CLI Agents card
+// stays Unknown for the primary Grok flow.
+func TestGrokACPLifecycle_CapturesUsageLimitFromStream(t *testing.T) {
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	tmpDir := t.TempDir()
+	mockName := "grok"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	mockPath := filepath.Join(tmpDir, mockName)
+	if err := copyTestBinary(testExe, mockPath); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+
+	cachePath := filepath.Join(tmpDir, "grok_usage_limit.json")
+	t.Setenv("AIEXPEDITE_GROK_LIMIT_CACHE", cachePath)
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "grok-acp-usage-limit")
+
+	m := NewGrokACPManager()
+	id := fmt.Sprintf("grok-usagelimit-test-%d", time.Now().UnixNano())
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	if err := m.Start(id, tmpDir, nil, "ws", "uid", GrokStartOptions{}, publishFn); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		ended := false
+		for _, msg := range captured {
+			if msg.Type == "grok_acp_ended" {
+				ended = true
+				break
+			}
+		}
+		mu.Unlock()
+		if ended {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	mu.Lock()
+	sawUsageFrame := false
+	for _, msg := range captured {
+		if msg.Type == "grok_acp_message" && strings.Contains(msg.Output, "usage_limit_reached") {
+			sawUsageFrame = true
+			break
+		}
+	}
+	mu.Unlock()
+	if !sawUsageFrame {
+		t.Fatalf("expected the usage_limit_reached frame to be forwarded as grok_acp_message; got types %v",
+			extractTypes(captured))
+	}
+
+	raw, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("usage-limit cache was never written at %s: %v", cachePath, err)
+	}
+	var state grokUsageLimitState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatalf("usage-limit cache is not valid JSON: %v\n%s", err, raw)
+	}
+	if state.Severity != grokLimitReached {
+		t.Errorf("expected severity=%q in cache, got %q", grokLimitReached, state.Severity)
+	}
+	if !strings.Contains(state.UpgradeURL, "supergrok") {
+		t.Errorf("expected upgradeUrl to carry the gate URL, got %q", state.UpgradeURL)
+	}
+}
+
 // TestGrokACPLifecycle_TimeoutKillsRunawaySession pins finding #2 end-to-end:
 // when the orchestrator passes a per-session TimeoutMs and the Grok child
 // would otherwise run forever, the deadline timer must fire, publish a typed

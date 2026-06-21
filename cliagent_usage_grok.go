@@ -78,66 +78,9 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
 
-	// Grok writes its cached-token JSON in one of a few layouts depending on
-	// CLI version: the official installer's scoped `auth.json`
-	// (`{scope: {key: <jwt>}}` — what `read_grok_token` in
-	// https://x.ai/cli/install.sh consumes), a flat `auth.json`, and a sibling
-	// `cached_token.json` (legacy). Try all three before giving up.
-	authPath := filepath.Join(base, "auth.json")
-	auth := grokAuthFile{}
-	loaded := readJSONFile(authPath, &auth)
-	if !loaded {
-		loaded = readJSONFile(filepath.Join(base, "cached_token.json"), &auth)
-	}
-	if loaded {
-		claims := grokIDTokenClaims{}
-		parseJWTClaims(firstNonEmpty(auth.CachedToken.IDToken, auth.CachedToken.AccessToken), &claims)
-		usage.Account = firstNonEmpty(
-			auth.Email,
-			auth.Account,
-			auth.UserName,
-			auth.UserID,
-			auth.CachedToken.Email,
-			auth.CachedToken.Account,
-			claims.Email,
-			claims.Account,
-			claims.UserName,
-			claims.UserID,
-			auth.CachedToken.Subject,
-			claims.Subject,
-		)
-		usage.Plan = firstNonEmpty(
-			auth.Plan,
-			auth.PlanType,
-			auth.Tier,
-			auth.Subscription,
-			claims.Plan,
-			claims.PlanType,
-		)
-	}
-	// Scoped fallback: the installer-produced `auth.json` does not match the
-	// flat shape above — every top-level key is an auth scope whose value is a
-	// `{key: <jwt>}` envelope. When the flat parse left identity fields empty,
-	// reparse the file as the scoped map and pull claims from the first JWT.
-	if usage.Account == "" {
-		if scopedClaims, ok := readGrokScopedAuthClaims(authPath); ok {
-			usage.Account = firstNonEmpty(
-				usage.Account,
-				scopedClaims.Email,
-				scopedClaims.Account,
-				scopedClaims.UserName,
-				scopedClaims.UserID,
-				scopedClaims.Subject,
-			)
-			usage.Plan = firstNonEmpty(
-				usage.Plan,
-				scopedClaims.Plan,
-				scopedClaims.PlanType,
-			)
-			loaded = true
-		}
-	}
-	_ = loaded
+	account, plan := readGrokAccountAndPlan(base)
+	usage.Account = account
+	usage.Plan = plan
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
 	usage.Metrics = []cliAgentUsageMetric{
@@ -154,7 +97,113 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 			Unknown: true,
 		},
 	}
+
+	// xAI exposes no numeric quota, so the bars stay Unknown — but Grok DOES
+	// push a discrete usage-limit warning on the streaming-json output, which
+	// captureGrokUsageLimitLine caches. Surface the latest live state as a
+	// card-level notice (approaching → warning banner, reached → error banner).
+	if state, ok := loadGrokUsageLimitState(usage.AccountFingerprint, now); ok {
+		usage.Notice = grokNoticeText(state)
+		usage.NoticeURL = state.UpgradeURL
+		if state.Severity == grokLimitReached {
+			usage.NoticeSeverity = "error"
+		} else {
+			usage.NoticeSeverity = "warning"
+		}
+	}
+
 	return usage, true
+}
+
+// grokNoticeText renders the card banner copy for a captured limit state,
+// preferring Grok's own gate message when present.
+func grokNoticeText(state grokUsageLimitState) string {
+	if state.Message != "" {
+		return state.Message
+	}
+	if state.Severity == grokLimitReached {
+		return "Grok usage limit reached — new requests may be blocked until your quota resets."
+	}
+	return "Approaching your Grok usage limit."
+}
+
+// readGrokAccountAndPlan extracts the account identifier and plan from the Grok
+// cached-token JSON under base. Grok writes one of a few layouts depending on
+// CLI version: the official installer's scoped `auth.json`
+// (`{scope: {key: <jwt>}}` — what `read_grok_token` in
+// https://x.ai/cli/install.sh consumes), a flat `auth.json`, and a sibling
+// `cached_token.json` (legacy). Try all three before giving up. Shared by the
+// usage parser and the usage-limit capture so both compute the SAME account
+// fingerprint (a mismatch would orphan a captured limit from the card).
+func readGrokAccountAndPlan(base string) (string, string) {
+	authPath := filepath.Join(base, "auth.json")
+	auth := grokAuthFile{}
+	loaded := readJSONFile(authPath, &auth)
+	if !loaded {
+		loaded = readJSONFile(filepath.Join(base, "cached_token.json"), &auth)
+	}
+	account, plan := "", ""
+	if loaded {
+		claims := grokIDTokenClaims{}
+		parseJWTClaims(firstNonEmpty(auth.CachedToken.IDToken, auth.CachedToken.AccessToken), &claims)
+		account = firstNonEmpty(
+			auth.Email,
+			auth.Account,
+			auth.UserName,
+			auth.UserID,
+			auth.CachedToken.Email,
+			auth.CachedToken.Account,
+			claims.Email,
+			claims.Account,
+			claims.UserName,
+			claims.UserID,
+			auth.CachedToken.Subject,
+			claims.Subject,
+		)
+		plan = firstNonEmpty(
+			auth.Plan,
+			auth.PlanType,
+			auth.Tier,
+			auth.Subscription,
+			claims.Plan,
+			claims.PlanType,
+		)
+	}
+	// Scoped fallback: the installer-produced `auth.json` does not match the
+	// flat shape above — every top-level key is an auth scope whose value is a
+	// `{key: <jwt>}` envelope. When the flat parse left identity fields empty,
+	// reparse the file as the scoped map and pull claims from the first JWT.
+	if account == "" {
+		if scopedClaims, ok := readGrokScopedAuthClaims(authPath); ok {
+			account = firstNonEmpty(
+				scopedClaims.Email,
+				scopedClaims.Account,
+				scopedClaims.UserName,
+				scopedClaims.UserID,
+				scopedClaims.Subject,
+			)
+			plan = firstNonEmpty(
+				plan,
+				scopedClaims.Plan,
+				scopedClaims.PlanType,
+			)
+		}
+	}
+	return account, plan
+}
+
+// currentGrokAccountFingerprint reads the Grok auth on disk and returns the
+// same fingerprint grokUsageParser.Parse attaches to a usage snapshot. Used by
+// the usage-limit capture path to scope its cache to the active account.
+// Returns "" when no auth is readable (best-effort, matches the codex analog).
+func currentGrokAccountFingerprint() string {
+	home, _ := os.UserHomeDir()
+	base := firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
+	if base == "" {
+		return ""
+	}
+	account, _ := readGrokAccountAndPlan(base)
+	return fingerprintAccount("grok", account)
 }
 
 // readGrokScopedAuthClaims decodes the installer-produced `auth.json`, whose

@@ -109,7 +109,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	// Build the CLI command with appropriate flags for structured streaming.
 	// stdinPrompt is non-empty for Claude — the prompt is sent as NDJSON on stdin.
-	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args)
+	enableGrokAlwaysApprove := sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
+	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
 
 	// Resolve executable path
 	executable := resolveExecutable(command)
@@ -548,6 +549,11 @@ func detectCLITerminalEvent(command, line string) bool {
 		return eventType == "thread.completed" || eventType == "turn.completed"
 	case strings.HasPrefix(base, "gemini"):
 		return eventType == "result"
+	case strings.HasPrefix(base, "grok"):
+		// Grok's `--output-format streaming-json` emits per-event frames
+		// (thought / text / end); `end` marks the natural end of the turn,
+		// right before the headless `-p` process exits.
+		return eventType == "end"
 	}
 	return false
 }
@@ -721,6 +727,15 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// card stays Unknown for users who don't go through app-server.
 			if isCodexCommand(session.Command) {
 				captureCodexRateLimitLine(line.text, time.Now())
+			}
+
+			// Grok usage-limit telemetry: xAI exposes no numeric quota, but the
+			// server volunteers a discrete `usage_limit_reached` / credit-limit /
+			// access-gate frame on the streaming-json output when you near or hit
+			// the cap. Capture it (best-effort) so the CLI Agents card can show a
+			// warning instead of a permanently-Unknown bar.
+			if isGrokCommand(session.Command) {
+				captureGrokUsageLimitLine(line.text, time.Now())
 			}
 
 			if isClaudeCommand(session.Command) {
@@ -1118,6 +1133,14 @@ func isCodexCommand(command string) bool {
 	return strings.HasPrefix(commandBaseName(command), "codex")
 }
 
+// isGrokCommand reports whether command would be routed to the `grok` CLI by
+// buildInteractiveCLIArgs. Used to gate the Grok usage-limit capture in the
+// session output loop so a `usage_limit_reached` / gate frame from
+// `grok --output-format streaming-json` populates grok_usage_limit.json.
+func isGrokCommand(command string) bool {
+	return strings.HasPrefix(commandBaseName(command), "grok")
+}
+
 /* --------------------------------------------------------------------------
    CLI argument builders
    -------------------------------------------------------------------------- */
@@ -1146,7 +1169,7 @@ func isCodexCommand(command string) bool {
 //
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
 // the stdinPrompt before writing it to the process stdin.
-func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
+func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysApprove bool) ([]string, string) {
 	base := commandBaseName(command)
 
 	switch {
@@ -1158,6 +1181,8 @@ func buildInteractiveCLIArgs(command string, args []string) ([]string, string) {
 		return buildGeminiInteractiveArgs(args)
 	case strings.HasPrefix(base, "agy"):
 		return buildAntigravityInteractiveArgs(args), ""
+	case strings.HasPrefix(base, "grok"):
+		return buildGrokInteractiveArgs(args, enableGrokAlwaysApprove), ""
 	default:
 		return args, ""
 	}
@@ -1459,6 +1484,419 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	return result
 }
 
+// grokKnownSubcommands are the `grok <cmd>` subcommands whose argv grammar must
+// be forwarded verbatim — running them through the headless prompt builder
+// (which injects `-p`) would corrupt the call. Mirrors the codex resume/review
+// carve-out. A bare `grok "<prompt>"` (no subcommand) is the prompt path.
+var grokKnownSubcommands = map[string]bool{
+	"agent": true, "completions": true, "dashboard": true, "export": true,
+	"help": true, "import": true, "inspect": true, "leader": true,
+	"login": true, "logout": true, "mcp": true, "memory": true,
+	"models": true, "plugin": true, "sessions": true, "setup": true,
+	"trace": true, "update": true, "version": true, "worktree": true,
+}
+
+// grokSubcommandActions are second-positional words that, when paired with a
+// known leading subcommand, indicate a documented two-word subcommand grammar
+// rather than a prose prompt. Without this gate, the pre-scan would treat any
+// two-word input whose first word matches a Grok subcommand as a verbatim
+// argv call — including prose prompts like `grok help me`, `grok sessions
+// stuck`, or `grok models broken` whose second word is plainly not a CLI
+// verb. Those would short-circuit to raw argv, Grok would reject the unknown
+// second token (`unrecognized subcommand 'me'`), and we'd reintroduce the
+// tokenisation failure the headless `-p` path exists to fix. Restricting the
+// 2-positional carve-out to recognised verbs (`list`, `install`, `add`, …)
+// keeps documented grammars (`sessions list`, `mcp install`, `models list`,
+// `agent stdio`) verbatim while letting prose fall through to the managed
+// `-p` builder.
+var grokSubcommandActions = map[string]bool{
+	"list": true, "ls": true,
+	"add": true, "remove": true, "rm": true, "delete": true, "del": true,
+	"install": true, "uninstall": true,
+	"update": true, "upgrade": true,
+	"show": true, "get": true, "info": true, "inspect": true,
+	"set": true, "unset": true,
+	"enable": true, "disable": true,
+	"start": true, "stop": true, "restart": true, "status": true,
+	"run": true, "exec": true, "stdio": true,
+	"create": true, "new": true, "init": true,
+	"login": true, "logout": true,
+	"clear": true, "reset": true, "purge": true,
+	"import": true, "export": true,
+	"sync": true, "switch": true, "use": true,
+}
+
+// buildGrokInteractiveArgs builds Grok Build CLI (`grok`) args for a one-shot
+// headless turn streamed as JSON.
+//
+// WHY HEADLESS (-p) + streaming-json: a bare `grok <prompt>` launches Grok's
+// interactive TUI, which never exits in our non-TTY session — the process
+// hangs until the 6h cap (observed as a terminal card stuck on "Running"). And
+// an UNQUOTED multi-word prompt is tokenised so Grok parses the second word as
+// a subcommand (`error: unrecognized subcommand 'a'`, exit 1). Forcing
+// `-p/--single` runs the prompt once and exits; `--output-format
+// streaming-json` gives the stream parser the same per-event shape
+// (thought / text / end) it reads for the other agents, with `end` as the turn
+// terminal (see detectCLITerminalEvent).
+//
+// WHY ARGV (no stdin): grok resolves to a native `grok.exe` (~/.grok/bin),
+// launched directly via CreateProcess, so the prompt rides on argv as the value
+// of `-p` (the ~32KB CreateProcess cap applies, like agy — not a cmd.exe shim's
+// 8191-char cap). The headless `-p` process exits on its own after one turn, so
+// no stdin routing is needed.
+//
+// Caller-supplied prompt-delivery / output-format flags are stripped so they
+// can't collide with the managed contract: `-p`/`--single` (we always inject
+// one; an inline value is folded into the prompt), `--output-format`,
+// `--prompt-file`, `--prompt-json`. Other flags (`--model`, `--effort`,
+// `--max-turns`, …) pass through.
+//
+// Returns cliArgs only — there is no stdin prompt (stdinPromptFormat returns ""
+// for grok), the prompt is the value of `-p`.
+func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []string {
+	// Grok flags that consume the NEXT token as their value — without this,
+	// e.g. `--model grok-4` would treat "grok-4" as a prompt word. The
+	// `--flag=value` form is one token and needs no entry here.
+	valuedFlags := map[string]bool{
+		"-m": true, "--model": true,
+		"--effort": true, "--reasoning-effort": true,
+		"--max-turns": true, "--agent": true, "--agents": true,
+		"--cwd": true, "--permission-mode": true, "--sandbox": true,
+		"--compaction-mode": true, "--compaction-detail": true,
+		"--rules": true, "--system-prompt-override": true,
+		"--leader-socket": true, "--debug-file": true,
+		// Plugin discovery: xAI's plugin docs list `--plugin-dir <PATH>` as a
+		// separate-value flag. Without this entry, `grok --plugin-dir /tmp/p
+		// fix bug` would land "/tmp/p" in promptParts and the bare `--plugin-dir`
+		// would slot in immediately before the appended managed `-p` — Grok
+		// would then consume `-p` as the plugin directory value, dropping the
+		// managed prompt delivery.
+		"--plugin-dir": true,
+		// Per-process config override: xAI's enterprise-deployment docs spell
+		// out `-c|--config <key>=value` as the config-override surface (the
+		// repo's Grok ACP builder also emits separate-value `--config <key>=`
+		// pairs). Without this entry, `grok --config log.level=debug fix bug`
+		// would land "log.level=debug" in promptParts and the bare `--config`
+		// would slot in immediately before the appended managed `-p` — Grok
+		// would then consume `-p` as the config value, dropping the managed
+		// prompt delivery. We intentionally pin only the long form here: `-c`
+		// is documented as ambiguous in some Grok CLI contexts (continue vs.
+		// config), so we leave the short form alone rather than risk swapping
+		// a `--continue` short-form value into the prompt path.
+		"--config": true,
+		// Permission-policy rule flags: xAI's enterprise headless docs document
+		// `--allow <pattern>` / `--deny <pattern>` as per-tool policy rules
+		// (e.g. `--allow "Bash(git *)" --deny "Bash(rm -rf *)"`). Without these
+		// entries the loop would treat the rule value as a prompt word and the
+		// bare flag would slot in immediately before the appended `-p` — Grok
+		// would then consume `-p` as the rule value, dropping the managed
+		// prompt and/or the intended allow/deny rule.
+		"--allow": true, "--deny": true,
+		// Session continuation: xAI's docs list -s/--session-id and -r/--resume
+		// as value-taking common flags. Without them, e.g. `grok --resume abc
+		// continue work` would land "abc" in promptParts, then the appended
+		// `-p` would have "--resume" as its preceding token — Grok would see
+		// `--resume -p` and consume the `-p` flag as the resume ID, breaking
+		// resumed/named headless sessions.
+		"-s": true, "--session-id": true,
+		"-r": true, "--resume": true,
+		// Prompt-delivery flags also take the next token as a value (the
+		// prompt). The main loop below handles `-p`/`--single` via its own
+		// captureNextAsPrompt branch BEFORE the generic valuedFlags check, so
+		// adding them here is a no-op for the main loop — but the subcommand
+		// pre-scan below shares this same map, and without these entries
+		// `grok -p help me fix tests` would treat the prompt's first word
+		// "help" as a subcommand and return the raw argv, reintroducing the
+		// tokenisation failure this builder exists to fix.
+		"-p": true, "--single": true,
+	}
+
+	// Subcommand carve-out: keep `grok models`, `grok sessions list`, etc.
+	// intact — those are not prompt invocations. Skip valuedFlag values during
+	// the scan so e.g. `grok --cwd sessions fix bug` keeps "sessions" as the
+	// `--cwd` value (per xAI's headless flag docs) and still routes through the
+	// managed `-p` builder, instead of treating "sessions" as a subcommand and
+	// returning early.
+	//
+	// Carve out only when the shape is unambiguously a subcommand invocation,
+	// gated on the positionals BEFORE any POSIX `--` end-of-options separator:
+	//   (a) exactly ONE positional before `--` (or before end-of-args) that
+	//       matches a known subcommand (`grok models`, `grok sessions`,
+	//       `grok login`, `grok mcp -- foo`). A single subcommand token can
+	//       only be a subcommand call.
+	//   (b) two-plus positionals before `--` (or before end-of-args, capped
+	//       at two for the no-`--` case) where the first is a known
+	//       subcommand AND the second is a recognised action verb
+	//       (`grok sessions list`, `grok mcp install`, `grok mcp add <name>
+	//       -- <cmd>`). The action-verb gate is what makes the multi-
+	//       positional case unambiguous — without it, prose like `grok help
+	//       me` or `grok help me -- explain this` (where "help" matches a
+	//       subcommand name but "me" is not a verb) would land on raw argv
+	//       and Grok would reject the unknown second token, reintroducing
+	//       the tokenisation failure this builder exists to fix.
+	// Anything else — including a `--` that follows prose positionals — is
+	// treated as a prose prompt and folded into managed `-p` delivery.
+	{
+		skipNext := false
+		positionalCount := 0
+		positionalsBeforeDoubleDash := 0
+		hasDoubleDash := false
+		var firstPositional, secondPositional string
+		for i, a := range args {
+			if skipNext {
+				skipNext = false
+				continue
+			}
+			if a == "--" {
+				if !hasDoubleDash {
+					positionalsBeforeDoubleDash = positionalCount
+					hasDoubleDash = true
+				}
+				continue
+			}
+			if strings.HasPrefix(a, "-") {
+				if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(args) {
+					skipNext = true
+				}
+				continue
+			}
+			switch positionalCount {
+			case 0:
+				firstPositional = strings.ToLower(a)
+			case 1:
+				secondPositional = strings.ToLower(a)
+			}
+			positionalCount++
+		}
+		// Effective positional count for the carve-out gate: positionals
+		// BEFORE the `--`. When no `--` is present, use the total count.
+		effectivePositionals := positionalCount
+		if hasDoubleDash {
+			effectivePositionals = positionalsBeforeDoubleDash
+		}
+		if firstPositional != "" && grokKnownSubcommands[firstPositional] {
+			if effectivePositionals == 1 ||
+				(effectivePositionals >= 2 && grokSubcommandActions[secondPositional]) {
+				return args
+			}
+		}
+	}
+
+	var flagArgs []string
+	var promptParts []string
+	skipNext := false            // next token is a passthrough flag's value
+	dropNext := false            // next token is a stripped flag's value — drop it
+	captureNextAsPrompt := false // next token is a stripped -p/--single value — keep as prompt
+	for i, a := range args {
+		switch {
+		case dropNext:
+			dropNext = false
+			continue
+		case skipNext:
+			skipNext = false
+			flagArgs = append(flagArgs, a)
+			continue
+		case captureNextAsPrompt:
+			captureNextAsPrompt = false
+			promptParts = append(promptParts, a)
+			continue
+		}
+
+		// Prompt-delivery flags: strip (we always inject our own -p). Fold an
+		// inline / following value into the prompt so the turn still runs.
+		if a == "-p" || a == "--single" {
+			captureNextAsPrompt = true
+			continue
+		}
+		if v, ok := strings.CutPrefix(a, "-p="); ok {
+			if v != "" {
+				promptParts = append(promptParts, v)
+			}
+			continue
+		}
+		if v, ok := strings.CutPrefix(a, "--single="); ok {
+			if v != "" {
+				promptParts = append(promptParts, v)
+			}
+			continue
+		}
+		// Output-format / alternate prompt sources: strip flag AND its value —
+		// they collide with the managed streaming-json + `-p` contract.
+		if a == "--output-format" || a == "--prompt-file" || a == "--prompt-json" {
+			if i+1 < len(args) {
+				dropNext = true
+			}
+			continue
+		}
+		if strings.HasPrefix(a, "--output-format=") ||
+			strings.HasPrefix(a, "--prompt-file=") ||
+			strings.HasPrefix(a, "--prompt-json=") {
+			continue
+		}
+		// Auto-update toggles: strip both forms so the unconditional injection
+		// below owns the policy. The xAI headless/scripting docs recommend
+		// `--no-auto-update` for automated children because the background
+		// update worker can race protocol output — in this streaming-json path,
+		// an update notice on stdout/stderr would be read by readOutputStream
+		// as session output and pollute the user's response stream. Mirrors
+		// the unconditional injection + caller-supplied dedupe in
+		// buildGrokACPArgs / sanitizeGrokACPExtraArgs (grok_acp.go).
+		if a == "--no-auto-update" || a == "--auto-update" ||
+			strings.HasPrefix(a, "--no-auto-update=") ||
+			strings.HasPrefix(a, "--auto-update=") {
+			continue
+		}
+		// Approval-bypass equals-forms: strip wholesale so a caller-supplied
+		// `--always-approve=false` / `--auto-approve=false` cannot disable the
+		// bypass while still slipping through to Grok in flagArgs (the dedupe
+		// check below would also see the equals-form and suppress the
+		// injection, so Grok would run with `=false` and the headless `-p`
+		// turn would stall on the first tool/file-edit prompt — StartSession
+		// closes Grok's stdin and detectPromptFromJSON has no Grok approval
+		// branch). Dropping every equals-form here lets the bare form remain
+		// the ONLY caller-supplied signal that genuinely opts into the bypass
+		// (and dedupes the injection); equivalent to grok_acp.go's
+		// sanitizeGrokInteractiveExtraArgs dropping `--always-approve=*`
+		// wholesale.
+		lowerEq := strings.ToLower(a)
+		if strings.HasPrefix(lowerEq, "--always-approve=") ||
+			strings.HasPrefix(lowerEq, "--auto-approve=") {
+			continue
+		}
+		// Gate-off strip: when the workspace has NOT opted into
+		// Config.EnableGrokAlwaysApprove, drop any caller-supplied bare
+		// `--always-approve` / `--auto-approve` from flagArgs too. Otherwise a
+		// signed `session_start` could ferry the approval bypass in via argv
+		// and silently skip Grok's permission prompts in the default (opt-out)
+		// configuration — exactly what the ACP path's stripGrokAlwaysApprove
+		// flow refuses to allow.
+		if !enableGrokAlwaysApprove &&
+			(lowerEq == "--always-approve" || lowerEq == "--auto-approve") {
+			continue
+		}
+		// Gate-off strip for the OTHER permission-bypass surfaces xAI
+		// documents — `--permission-mode bypassPermissions`, `--allow
+		// <pattern>`, and `--config approval.*=bypass`. Equals-form is
+		// dropped here; the separate-value pairs flow into flagArgs and are
+		// stripped by the trailing sweeps below (mirrors the ACP path's
+		// sanitizeGrokACPExtraArgs speculative-admit / trailing-sweep
+		// pattern). Without this, a signed `session_start` could ferry the
+		// bypass in via `--permission-mode=bypassPermissions` /
+		// `--allow="Bash(*)"` / `--config=approval.permission_mode=bypass`
+		// and silently skip Grok's per-tool prompts in the default opt-out
+		// configuration even though the ACP path refuses to allow it.
+		if !enableGrokAlwaysApprove {
+			if strings.HasPrefix(lowerEq, "--permission-mode=") ||
+				strings.HasPrefix(lowerEq, "--permission_mode=") {
+				if eq := strings.IndexByte(a, '='); eq >= 0 &&
+					isGrokPermissionModeBypassValue(a[eq+1:]) {
+					continue
+				}
+			}
+			if strings.HasPrefix(lowerEq, "--allow=") {
+				continue
+			}
+			if strings.HasPrefix(lowerEq, "--config=") {
+				if eq := strings.IndexByte(a, '='); eq >= 0 &&
+					isGrokApprovalConfigKV(a[eq+1:]) {
+					continue
+				}
+			}
+		}
+		// Standalone `--` in the prose-prompt path: fold into the prompt
+		// rather than passing it through to Grok. The subcommand pre-scan
+		// above already carved out the documented `grok <subcmd> ... --
+		// <args...>` grammars (xAI changelog: `grok mcp add <name> -- <cmd>`)
+		// via a raw-argv return, so reaching this point means we're building
+		// a managed `-p` headless turn. Letting `--` survive into flagArgs
+		// would emit `... -- -p "<prompt>"` to Grok, and the POSIX
+		// end-of-options separator would make Grok treat `-p` as a
+		// positional rather than the prompt-delivery flag — the injected
+		// `-p` would be dropped and the turn would fall back to the
+		// interactive TUI this builder exists to avoid (the
+		// `grok explain git checkout -- file` case). Folding `--` into
+		// promptParts preserves the user's prose intent.
+		if a == "--" {
+			promptParts = append(promptParts, a)
+			continue
+		}
+
+		if strings.HasPrefix(a, "-") {
+			flagArgs = append(flagArgs, a)
+			if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(args) {
+				skipNext = true
+			}
+			continue
+		}
+		promptParts = append(promptParts, a)
+	}
+
+	// Gate-off trailing sweeps: drop `--permission-mode <bypass>`, `--allow
+	// <pattern>`, and `--config <approval-kv>` separate-value pairs that the
+	// main loop admitted speculatively via valuedFlags. Mirrors
+	// sanitizeGrokACPExtraArgs — equals-forms were dropped above, these
+	// sweeps finish off the separate-value pairs. Without them, a signed
+	// session_start could bypass the workspace's per-tool approval gate via
+	// `--permission-mode bypassPermissions` / `--allow "Bash(*)"` /
+	// `--config approval.permission_mode=bypass` even though the ACP path
+	// refuses the same surfaces under the same gate.
+	if !enableGrokAlwaysApprove {
+		flagArgs = stripGrokPermissionModePairs(flagArgs)
+		flagArgs = stripGrokAllowRulePairs(flagArgs)
+		flagArgs = stripGrokApprovalConfigPairs(flagArgs)
+	}
+
+	// Autonomous-tool-execution flag for the managed headless turn. Grok's
+	// documented default permission mode is `ask`, which prompts on every tool
+	// invocation / file edit. StartSession closes Grok's stdin after launch
+	// (shouldCloseStdinAfterStart returns true via the default branch when
+	// stdinPrompt is empty — grok's prompt rides on argv, not stdin) and
+	// detectPromptFromJSON has no Grok approval branch, so an approval prompt
+	// from inside the headless `-p` turn cannot be answered — the session
+	// would stall or fail despite the TUI-hang fix. xAI documents
+	// `--always-approve` as the canonical flag (`--auto-approve` is the legacy
+	// synonym — see isGrokAlwaysApproveArg in grok_acp.go).
+	//
+	// GATED behind Config.EnableGrokAlwaysApprove — the same per-workspace
+	// opt-in the Grok ACP path uses to strip equivalent caller-supplied bypass
+	// flags. Without this gate, an approved/signed `session_start` targeting
+	// `grok` would silently skip Grok's permission prompts in the default
+	// (opt-out) configuration even though the ACP path refuses to. When the
+	// gate is off the headless `-p` turn may stall on the first tool/file-edit
+	// prompt — that is the intentional conservative posture; flip the gate to
+	// accept the autonomous-execution tradeoff.
+	//
+	// Skipped only when the caller already supplied an equivalent flag — a
+	// duplicate boolean flag is harmless but the cleaner argv aids debugging.
+	// Equals-form spellings (`--always-approve=true`, `--always-approve=false`,
+	// and the `--auto-approve=…` synonyms) were stripped wholesale in the
+	// flag-folding loop above, so only the bare form can reach this dedupe
+	// check — this prevents a caller-supplied `=false` from suppressing the
+	// injection while leaving the disabled flag in flagArgs (which would
+	// stall the headless `-p` turn on the first tool/file-edit prompt).
+	injectAlwaysApprove := enableGrokAlwaysApprove
+	if injectAlwaysApprove {
+		for _, a := range args {
+			lower := strings.ToLower(a)
+			if lower == "--always-approve" || lower == "--auto-approve" {
+				injectAlwaysApprove = false
+				break
+			}
+		}
+	}
+
+	result := make([]string, 0, len(flagArgs)+6)
+	result = append(result, "--output-format", "streaming-json", "--no-auto-update")
+	if injectAlwaysApprove {
+		result = append(result, "--always-approve")
+	}
+	result = append(result, flagArgs...)
+	// Always append `-p <prompt>`, even when empty — grok surfaces a useful
+	// "no prompt" error rather than hanging on the interactive TUI.
+	result = append(result, "-p", strings.Join(promptParts, " "))
+	return result
+}
+
 // buildGeminiInteractiveArgs builds Gemini CLI args, routing the prompt via
 // STDIN instead of argv and running gemini in its default INTERACTIVE mode
 // (no -p/--print).
@@ -1608,6 +2046,16 @@ func resolveExecutable(command string) string {
 	}
 	if path, err := exec.LookPath(command + ".exe"); err == nil {
 		return path
+	}
+
+	// Grok's installer drops the binary in ~/.grok/bin and only touches shell
+	// rc, which macOS GUI/launchd agent processes never source. Mirror the ACP
+	// manager's fallback (grok_acp.go) so catalog-name `grok` sessions launched
+	// from StartSession can still find the official install on a PATH miss.
+	if isGrokCommand(command) {
+		if p := resolveGrokInstallerBinary(); p != "" {
+			return p
+		}
 	}
 
 	return command

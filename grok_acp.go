@@ -822,6 +822,16 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 				fmt.Printf("%s[grok-acp] stdout[%d] %s: %s%s\n",
 					colorCyan, lineCount, session.ID, truncateString(trimmed, 200), colorReset)
 			}
+
+			// Grok usage-limit telemetry: the ACP transport is the primary path
+			// for normal Grok sessions (`grok_acp_start`), and xAI surfaces the
+			// `usage_limit_reached` / `credit_limit_*` / `allow_access:false`
+			// signals as `session/update` notifications on this same stdout
+			// stream. The raw `session_start` path in session.go already calls
+			// captureGrokUsageLimitLine; without mirroring it here, the CLI
+			// Agents card stays Unknown for the primary Grok flow.
+			captureGrokUsageLimitLine(trimmed, time.Now())
+
 			if !publishOrFail(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,

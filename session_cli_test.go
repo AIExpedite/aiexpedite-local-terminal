@@ -615,13 +615,13 @@ func TestStdinPromptFormat(t *testing.T) {
 
 func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 	t.Run("claude", func(t *testing.T) {
-		_, prompt := buildInteractiveCLIArgs("claude", []string{"hello"})
+		_, prompt := buildInteractiveCLIArgs("claude", []string{"hello"}, false)
 		if prompt != "hello" {
 			t.Errorf("claude prompt = %q, want %q", prompt, "hello")
 		}
 	})
 	t.Run("codex", func(t *testing.T) {
-		args, prompt := buildInteractiveCLIArgs("codex", []string{"hello"})
+		args, prompt := buildInteractiveCLIArgs("codex", []string{"hello"}, false)
 		if prompt != "hello" {
 			t.Errorf("codex stdinPrompt = %q, want %q", prompt, "hello")
 		}
@@ -630,7 +630,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 		}
 	})
 	t.Run("gemini", func(t *testing.T) {
-		args, prompt := buildInteractiveCLIArgs("gemini", []string{"hello"})
+		args, prompt := buildInteractiveCLIArgs("gemini", []string{"hello"}, false)
 		if prompt != "hello" {
 			t.Errorf("gemini stdinPrompt = %q, want %q (prompt now goes via stdin)", prompt, "hello")
 		}
@@ -646,7 +646,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 		mustContain(t, args, "-o", "stream-json")
 	})
 	t.Run("antigravity", func(t *testing.T) {
-		args, prompt := buildInteractiveCLIArgs("agy", []string{"hello"})
+		args, prompt := buildInteractiveCLIArgs("agy", []string{"hello"}, false)
 		if prompt != "" {
 			t.Errorf("agy stdinPrompt MUST be empty (agy ignores piped stdin; prompt goes on argv): %q", prompt)
 		}
@@ -655,11 +655,11 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 	t.Run("case-insensitive", func(t *testing.T) {
 		// The router checks command.ToLower() exactly + startswith — make sure
 		// "Claude" / "CODEX" still route correctly.
-		_, p1 := buildInteractiveCLIArgs("Claude", []string{"hi"})
+		_, p1 := buildInteractiveCLIArgs("Claude", []string{"hi"}, false)
 		if p1 == "" {
 			t.Errorf("Claude (mixed case) should still route to claude builder, got empty prompt")
 		}
-		args, _ := buildInteractiveCLIArgs("CODEX", []string{"hi"})
+		args, _ := buildInteractiveCLIArgs("CODEX", []string{"hi"}, false)
 		if len(args) == 0 || args[0] != "exec" {
 			t.Errorf("CODEX (upper case) should still route to codex builder, args=%v", args)
 		}
@@ -676,7 +676,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 			"./claude",
 			"claude-edge",
 		} {
-			_, prompt := buildInteractiveCLIArgs(cmd, []string{"hi"})
+			_, prompt := buildInteractiveCLIArgs(cmd, []string{"hi"}, false)
 			if prompt == "" {
 				t.Errorf("buildInteractiveCLIArgs(%q) did not route to claude (empty stdinPrompt)", cmd)
 			}
@@ -686,7 +686,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 		}
 	})
 	t.Run("unknown-command-passes-through", func(t *testing.T) {
-		args, prompt := buildInteractiveCLIArgs("git", []string{"status"})
+		args, prompt := buildInteractiveCLIArgs("git", []string{"status"}, false)
 		if prompt != "" {
 			t.Errorf("unknown command should have empty stdinPrompt, got %q", prompt)
 		}
@@ -1071,6 +1071,156 @@ func TestExtractDisplayText_Gemini_ErrorEventSurfacesMessage(t *testing.T) {
 	got := extractDisplayText("gemini", line)
 	if !strings.Contains(got, "context window exceeded") {
 		t.Errorf("error event must surface message: got %q", got)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   extractDisplayText — Grok
+   --------------------------------------------------------------------------
+   buildGrokInteractiveArgs forces `--output-format streaming-json`, which
+   emits per-event NDJSON frames (text / thought / end). Without a grok
+   branch in extractDisplayText, every line falls through to the default
+   passthrough and the user sees raw `{"type":"text",...}` JSON in chat.
+   ------------------------------------------------------------------------ */
+
+func TestExtractDisplayText_Grok_TextFrameReturnsText(t *testing.T) {
+	line := `{"type":"text","text":"hello from grok"}`
+	got := extractDisplayText("grok", line)
+	if got != "hello from grok" {
+		t.Errorf("got %q, want %q", got, "hello from grok")
+	}
+}
+
+func TestExtractDisplayText_Grok_SkipsThoughtAndEndAndMetadata(t *testing.T) {
+	// thought / end / lifecycle frames are noise to the human reader. `end`
+	// is also the detectCLITerminalEvent signal — surfacing it as display
+	// text would emit a stray `{}` looking blob right before turn close.
+	cases := []string{
+		`{"type":"thought","text":"reasoning..."}`,
+		`{"type":"end"}`,
+		`{"type":"start"}`,
+		`{"type":"init"}`,
+		`{"type":"result"}`,
+		`{"type":"tool_result"}`,
+	}
+	for _, line := range cases {
+		got := extractDisplayText("grok", line)
+		if got != "" {
+			t.Errorf("expected empty for %q, got %q", line, got)
+		}
+	}
+}
+
+func TestExtractDisplayText_Grok_ToolUseSurfacesName(t *testing.T) {
+	// Grok's tool-use frames carry the tool name under either `name` or
+	// `tool_name` across versions; both must work, mirroring gemini.
+	got := extractDisplayText("grok", `{"type":"tool_use","name":"Bash"}`)
+	if !strings.Contains(got, "Bash") {
+		t.Errorf("got %q, want output to mention 'Bash'", got)
+	}
+	got2 := extractDisplayText("grok", `{"type":"tool_use","tool_name":"ReadFile"}`)
+	if !strings.Contains(got2, "ReadFile") {
+		t.Errorf("got %q, want output to mention 'ReadFile'", got2)
+	}
+}
+
+func TestExtractDisplayText_Grok_ErrorEventSurfacesMessage(t *testing.T) {
+	line := `{"type":"error","message":"rate limited"}`
+	got := extractDisplayText("grok", line)
+	if !strings.Contains(got, "rate limited") {
+		t.Errorf("error event must surface message: got %q", got)
+	}
+}
+
+func TestExtractDisplayText_Grok_NonJsonPassthrough(t *testing.T) {
+	got := extractDisplayText("grok", "error: unrecognized subcommand 'a'")
+	if got != "error: unrecognized subcommand 'a'" {
+		t.Errorf("plain text should passthrough, got %q", got)
+	}
+}
+
+// TestExtractDisplayText_Grok_SubcommandJSONPassthrough guards that JSON
+// output from a carved-out Grok subcommand — which bypasses the managed
+// `--output-format streaming-json -p` headless path and runs verbatim
+// (e.g. `grok sessions --json`) — is not swallowed by the streaming-json
+// parser. Every event in the streaming-json schema carries a `type` field,
+// so a JSON object with no `type` is structured subcommand output the user
+// asked for and must passthrough rather than render as an empty line.
+// Pairs with TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv's
+// `sessions --json` carve-out case.
+func TestExtractDisplayText_Grok_SubcommandJSONPassthrough(t *testing.T) {
+	cases := []string{
+		`{"id":"sess_1","name":"work","createdAt":"2026-06-20T00:00:00Z"}`,
+		`{"models":["grok-4","grok-3"]}`,
+		`{"version":"1.2.3","build":"abc"}`,
+	}
+	for _, line := range cases {
+		got := extractDisplayText("grok", line)
+		if got != line {
+			t.Errorf("subcommand JSON without type field should passthrough; got %q, want %q", got, line)
+		}
+	}
+}
+
+// TestExtractDisplayText_RoutesByBasename guards parser selection against
+// path-launched sessions: buildInteractiveCLIArgs and detectCLITerminalEvent
+// both classify via commandBaseName, so an explicit grok path like
+// `/home/user/.grok/bin/grok` or `C:\tools\grok.exe` is shaped as the
+// managed streaming-json `-p` headless turn. extractDisplayText must use the
+// same normalisation — otherwise the parser fell through to default and
+// raw NDJSON frames were emitted as chat text. Same risk for claude / codex
+// / gemini installed at a non-bare path.
+func TestExtractDisplayText_RoutesByBasename(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		line    string
+		want    string
+	}{
+		{
+			name:    "grok absolute unix path",
+			command: "/home/user/.grok/bin/grok",
+			line:    `{"type":"text","text":"hello"}`,
+			want:    "hello",
+		},
+		{
+			name:    "grok windows path with .exe",
+			command: `C:\tools\grok.exe`,
+			line:    `{"type":"text","text":"hello"}`,
+			want:    "hello",
+		},
+		{
+			name:    "grok windows path mixed case",
+			command: `C:\Tools\Grok.EXE`,
+			line:    `{"type":"text","text":"hi"}`,
+			want:    "hi",
+		},
+		{
+			name:    "claude absolute unix path skips assistant recap",
+			command: "/usr/local/bin/claude",
+			line:    `{"type":"assistant","message":{"content":[{"type":"text","text":"recap"}]}}`,
+			want:    "",
+		},
+		{
+			name:    "codex windows shim routes to codex parser",
+			command: `C:\Users\u\AppData\Roaming\npm\codex.cmd`,
+			line:    `{"type":"turn.started"}`,
+			want:    "",
+		},
+		{
+			name:    "gemini absolute path routes to gemini parser",
+			command: "/opt/bin/gemini",
+			line:    `{"type":"message","role":"assistant","content":"hi"}`,
+			want:    "hi",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractDisplayText(tc.command, tc.line)
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

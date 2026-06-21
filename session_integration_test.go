@@ -195,6 +195,16 @@ func runMockCLI(mode string) {
 	case "grok-acp-echo":
 		runMockGrokACPServer()
 
+	case "grok-acp-usage-limit":
+		// Emit a single ACP `session/update` notification that carries a
+		// usage_limit_reached signal under params.update.sessionUpdate, then
+		// exit. Used by TestGrokACPLifecycle_CapturesUsageLimitFromStream
+		// to assert the readStream hook routes ACP frames through
+		// captureGrokUsageLimitLine and writes the on-disk cache.
+		fmt.Fprintln(os.Stderr, "[mock-grok-usage-limit] emitting usage_limit_reached frame")
+		fmt.Println(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_mock","update":{"sessionUpdate":"usage_limit_reached","gate_message":"You've hit your Grok limit.","gate_url":"https://grok.com/supergrok"}}}`)
+		os.Exit(0)
+
 	case "grok-acp-bad-frame":
 		// Emit a single non-JSON stdout line to exercise the `grok_acp_error`
 		// surfacing path, then exit cleanly. Used by
