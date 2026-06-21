@@ -379,12 +379,14 @@ func TestBuildGrokInteractiveArgs_PreservesConfigValue(t *testing.T) {
 // TestBuildGrokInteractiveArgs_SubcommandCarveOutRequiresUnambiguousArgv
 // guards the narrowed subcommand pre-scan. A leading subcommand-name word
 // only short-circuits to verbatim argv in three unambiguous shapes:
-//   (1) a single bare positional matching a subcommand (`grok models`);
-//   (2) two positionals where the second is a recognised CLI action verb
-//       (`grok sessions list`, `grok mcp install`); or
-//   (3) any positional count with a POSIX `--` separator anchoring a real
-//       subcommand grammar (covered by TestBuildGrokInteractiveArgs_
-//       SubcommandCarveOutOnDoubleDash).
+//
+//	(1) a single bare positional matching a subcommand (`grok models`);
+//	(2) two positionals where the second is a recognised CLI action verb
+//	    (`grok sessions list`, `grok mcp install`); or
+//	(3) any positional count with a POSIX `--` separator anchoring a real
+//	    subcommand grammar (covered by TestBuildGrokInteractiveArgs_
+//	    SubcommandCarveOutOnDoubleDash).
+//
 // All other shapes — three-plus positionals without `--`, OR two positionals
 // whose second word is plainly not a CLI verb (`grok help me`,
 // `grok sessions stuck`) — are unquoted prose prompts the headless builder
@@ -501,6 +503,52 @@ func TestBuildGrokInteractiveArgs_SubcommandCarveOutOnDoubleDash(t *testing.T) {
 			got := buildGrokInteractiveArgs(tc.in)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("got %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildGrokInteractiveArgs_DoubleDashInProseFoldsIntoPrompt guards the
+// prose-prompt path against POSIX `--`. When the input is NOT a documented
+// subcommand grammar (carved out above), a standalone `--` must NOT survive
+// into flagArgs — Grok would interpret it as end-of-options and treat the
+// appended `-p` as a positional, dropping the headless prompt-delivery flag
+// and falling back to the interactive TUI this builder exists to avoid (e.g.
+// `grok explain git checkout -- file`).
+func TestBuildGrokInteractiveArgs_DoubleDashInProseFoldsIntoPrompt(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         []string
+		wantPrompt string
+	}{
+		{
+			name:       "prose prompt with -- about a shell command",
+			in:         []string{"explain", "git", "checkout", "--", "file"},
+			wantPrompt: "explain git checkout -- file",
+		},
+		{
+			name:       "prose prompt with -- between words",
+			in:         []string{"summarize", "the", "diff", "--", "please"},
+			wantPrompt: "summarize the diff -- please",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildGrokInteractiveArgs(tc.in)
+			// `--` must never appear among the flag args: it would precede
+			// the appended managed `-p` and Grok would consume the flag as a
+			// positional, breaking the headless contract.
+			for i, a := range got {
+				if a == "--" && i+1 < len(got) && got[i+1] == "-p" {
+					t.Fatalf("standalone `--` leaked before managed -p: %#v", got)
+				}
+			}
+			// The last two args must be the managed -p flag and the folded prompt.
+			if len(got) < 2 || got[len(got)-2] != "-p" {
+				t.Fatalf("expected trailing `-p <prompt>`, got %#v", got)
+			}
+			if got[len(got)-1] != tc.wantPrompt {
+				t.Fatalf("prompt mismatch: got %q, want %q (full=%#v)", got[len(got)-1], tc.wantPrompt, got)
 			}
 		})
 	}

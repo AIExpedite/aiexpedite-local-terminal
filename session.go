@@ -1753,6 +1753,23 @@ func buildGrokInteractiveArgs(args []string) []string {
 			strings.HasPrefix(lowerEq, "--auto-approve=") {
 			continue
 		}
+		// Standalone `--` in the prose-prompt path: fold into the prompt
+		// rather than passing it through to Grok. The subcommand pre-scan
+		// above already carved out the documented `grok <subcmd> ... --
+		// <args...>` grammars (xAI changelog: `grok mcp add <name> -- <cmd>`)
+		// via a raw-argv return, so reaching this point means we're building
+		// a managed `-p` headless turn. Letting `--` survive into flagArgs
+		// would emit `... -- -p "<prompt>"` to Grok, and the POSIX
+		// end-of-options separator would make Grok treat `-p` as a
+		// positional rather than the prompt-delivery flag — the injected
+		// `-p` would be dropped and the turn would fall back to the
+		// interactive TUI this builder exists to avoid (the
+		// `grok explain git checkout -- file` case). Folding `--` into
+		// promptParts preserves the user's prose intent.
+		if a == "--" {
+			promptParts = append(promptParts, a)
+			continue
+		}
 
 		if strings.HasPrefix(a, "-") {
 			flagArgs = append(flagArgs, a)
