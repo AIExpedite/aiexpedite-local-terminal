@@ -66,6 +66,13 @@ type CLISession struct {
 	UID         string
 	TimeoutMs   int64 // Per-session timeout in ms (0 = no timeout, use stale cleanup)
 
+	// promptFile is the path to a temp file holding grok's prompt, set when
+	// rewriteGrokPromptToFile relocated the argv `-p <prompt>` pair to
+	// `--prompt-file <path>` to dodge the Windows command-line-length cap.
+	// Empty for every other command (and for grok subcommand carve-outs).
+	// Removed exactly once after the process exits (see waitForExit).
+	promptFile string
+
 	mu         sync.Mutex
 	done       chan struct{} // closed when process exits
 	streamDone chan struct{} // closed when stdout/stderr and stream publishes finish
@@ -111,6 +118,29 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// stdinPrompt is non-empty for Claude — the prompt is sent as NDJSON on stdin.
 	enableGrokAlwaysApprove := sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
 	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
+
+	// grok's headless mode takes its prompt on argv (`-p <prompt>`) and does NOT
+	// read a piped stdin, so — unlike claude/codex/gemini, which route a long
+	// prompt through stdinPrompt — a long review brief would blow past the
+	// Windows command-line-length cap ("command line too long"). grok accepts
+	// `--prompt-file <path>` as a drop-in for `-p <prompt>`, so relocate the
+	// prompt into a temp file. promptFile is removed after the process exits.
+	var promptFile string
+	if isGrokCommand(command) {
+		cliArgs, promptFile = rewriteGrokPromptToFile(cliArgs)
+	}
+
+	// rewriteGrokPromptToFile may have created an on-disk temp file. waitForExit
+	// owns the eventual removal, but it only runs once proc.Start() has
+	// succeeded AND a CLISession has been registered — every pipe/Start error
+	// path below this point returns early and would otherwise leak the file.
+	// Disarm this defer once the session has taken ownership.
+	sessionOwnsPromptFile := false
+	defer func() {
+		if promptFile != "" && !sessionOwnsPromptFile {
+			_ = os.Remove(promptFile)
+		}
+	}()
 
 	// Resolve executable path
 	executable := resolveExecutable(command)
@@ -168,6 +198,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		WorkspaceID: workspaceID,
 		UID:         uid,
 		TimeoutMs:   timeoutMs,
+		promptFile:  promptFile,
 		done:        make(chan struct{}),
 		streamDone:  make(chan struct{}),
 	}
@@ -185,6 +216,10 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	// Start process waiter (detects exit)
 	go sm.waitForExit(session, publishFn)
+
+	// waitForExit is now responsible for removing promptFile after the process
+	// exits — disarm the early-return cleanup defer above.
+	sessionOwnsPromptFile = true
 
 	fmt.Printf("%s[session] Session %s started (PID: %d)%s\n",
 		colorGreen, id, proc.Process.Pid, colorReset)
@@ -878,6 +913,14 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	session.Stdout.Close()
 	session.Stderr.Close()
 
+	// Remove the grok prompt temp file now that the process has exited — doing
+	// it before Wait() returned would risk pulling the file out from under a
+	// still-running grok. Empty for every non-grok session and grok subcommand
+	// carve-outs, so this is a no-op there. Runs exactly once per session.
+	if session.promptFile != "" {
+		_ = os.Remove(session.promptFile)
+	}
+
 	// 120s rather than 45s — publishFn can block up to 30s per pubsub.Publish
 	// and the asyncPublish semaphore has 5 slots, so a fully-loaded queue at
 	// exit can legitimately need ~30s to drain. 45s was tight enough that a
@@ -1524,6 +1567,108 @@ var grokSubcommandActions = map[string]bool{
 	"clear": true, "reset": true, "purge": true,
 	"import": true, "export": true,
 	"sync": true, "switch": true, "use": true,
+}
+
+// rewriteGrokPromptToFile relocates grok's argv prompt from the inline
+// `-p <prompt>` pair to `--prompt-file <tempPath>`, returning the rewritten
+// args and the path of the temp file the caller must remove after the process
+// exits (empty when no rewrite happened).
+//
+// WHY: buildGrokInteractiveArgs always appends the prompt on argv as `-p
+// <prompt>` (the LAST two tokens). claude/codex/gemini sidestep the OS
+// command-line-length cap by piping long prompts through stdin, but grok's
+// headless mode does NOT read piped stdin — so a long review brief overflows
+// the Windows command line ("command line too long" / "powershell path too
+// long"). grok accepts `--prompt-file <path>` as a validated drop-in for `-p
+// <prompt>`, so a temp file is the file-based analog of the others' stdin route.
+//
+// grokPromptTempDir returns the directory the grok prompt temp file is written
+// into: `<home>/.ai-expedite/grok-prompts/`. This co-locates it under the same
+// AI Expedite scratch root the documentRequirements / documentDesign agents use
+// (`~/.ai-expedite/requirements/<featureID>/...`) — a stable, non-repo location
+// (so a repo `git stash` during sync can't wipe it) outside the OS temp dir.
+// Returns "" (→ CreateTemp uses the OS temp dir) when the home can't be resolved
+// or the directory can't be created, so the rewrite is always best-effort.
+func grokPromptTempDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	dir := filepath.Join(home, ".ai-expedite", "grok-prompts")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return ""
+	}
+	return dir
+}
+
+// Best-effort: on any temp-file write error, or when the argv was NOT produced
+// by buildGrokInteractiveArgs' managed `-p` path (subcommand carve-outs return
+// user args verbatim — see the carve-out `return args` at the top of
+// buildGrokInteractiveArgs), the original args are returned untouched and
+// cleanupPath is "" so the launch falls back to `-p` rather than failing.
+//
+// The managed-path gate matters: buildGrokInteractiveArgs hands back user argv
+// verbatim for the documented `grok mcp add <name> -- <cmd> [args...]` grammar
+// (and the other subcommand carve-outs), so a legitimate child command ending
+// in its OWN `-p <value>` — e.g. `grok mcp add svc -- python server.py -p 8000`
+// — would otherwise have its trailing `-p 8000` rewritten to `--prompt-file
+// <temp>` and the registered MCP server command would be corrupted. The
+// managed path always emits the streaming-json + no-auto-update sentinels at
+// the head of argv, so anchor the rewrite to that signature.
+func rewriteGrokPromptToFile(cliArgs []string) (newArgs []string, cleanupPath string) {
+	// Managed-path gate: only the buildGrokInteractiveArgs managed `-p` path
+	// emits `--output-format streaming-json --no-auto-update` as the first
+	// three tokens (see the unconditional prepend in that function). The
+	// subcommand carve-out returns user args verbatim and does NOT carry these
+	// sentinels, so a verbatim argv ending in `-p <value>` (e.g. a child
+	// command's own flag in `grok mcp add svc -- python server.py -p 8000`)
+	// falls through unchanged.
+	if len(cliArgs) < 3 ||
+		cliArgs[0] != "--output-format" ||
+		cliArgs[1] != "streaming-json" ||
+		cliArgs[2] != "--no-auto-update" {
+		return cliArgs, ""
+	}
+	// buildGrokInteractiveArgs always emits the separate-value form with the
+	// prompt as the final token, i.e. cliArgs[n-2] == "-p", cliArgs[n-1] == value.
+	n := len(cliArgs)
+	if n < 2 || cliArgs[n-2] != "-p" {
+		return cliArgs, ""
+	}
+	prompt := cliArgs[n-1]
+
+	// Write under the AI Expedite scratch root (`~/.ai-expedite/grok-prompts/`)
+	// — the same parent the documentRequirements / documentDesign agents use for
+	// their feature scratch files — rather than the OS temp dir. grokPromptTempDir
+	// returns "" on any failure, in which case CreateTemp falls back to the OS
+	// temp dir (still works; just not co-located with the other scratch files).
+	f, err := os.CreateTemp(grokPromptTempDir(), "grok-prompt-*.txt")
+	if err != nil {
+		return cliArgs, ""
+	}
+	tempPath := f.Name()
+	// The file holds only the prompt; lock it down to the owner (0600). On
+	// Windows the perm bits are advisory, but we keep them consistent with the
+	// Unix builds and other per-session temp resources.
+	if chmodErr := f.Chmod(0o600); chmodErr != nil {
+		// Non-fatal — proceed with the default perms.
+		_ = chmodErr
+	}
+	if _, writeErr := f.WriteString(prompt); writeErr != nil {
+		f.Close()
+		_ = os.Remove(tempPath)
+		return cliArgs, ""
+	}
+	if closeErr := f.Close(); closeErr != nil {
+		_ = os.Remove(tempPath)
+		return cliArgs, ""
+	}
+
+	// Replace the trailing `-p <value>` pair with `--prompt-file <tempPath>`.
+	rewritten := make([]string, 0, n)
+	rewritten = append(rewritten, cliArgs[:n-2]...)
+	rewritten = append(rewritten, "--prompt-file", tempPath)
+	return rewritten, tempPath
 }
 
 // buildGrokInteractiveArgs builds Grok Build CLI (`grok`) args for a one-shot
