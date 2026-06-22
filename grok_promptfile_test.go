@@ -1,0 +1,114 @@
+// File: grok_promptfile_test.go
+// -----------------------------------------------------------------------------
+// Tests for rewriteGrokPromptToFile, which relocates grok's headless prompt
+// from the inline `-p <prompt>` argv pair to `--prompt-file <tempPath>` so a
+// long review brief does not overflow the Windows command-line-length cap.
+// (grok's headless mode does not read piped stdin, so a temp file is the
+// file-based analog of the stdin route claude/codex/gemini use.)
+// -----------------------------------------------------------------------------
+
+package main
+
+import (
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestRewriteGrokPromptToFile_HappyPath(t *testing.T) {
+	prompt := "a very long review brief ... " + strings.Repeat("detail ", 5000)
+	in := []string{
+		"--output-format", "streaming-json", "--no-auto-update",
+		"--always-approve", "-p", prompt,
+	}
+
+	out, cleanup := rewriteGrokPromptToFile(in)
+	if cleanup == "" {
+		t.Fatalf("expected a non-empty cleanup path, got empty")
+	}
+	defer os.Remove(cleanup)
+
+	// The trailing `-p <prompt>` pair must become `--prompt-file <path>`.
+	n := len(out)
+	if n < 2 || out[n-2] != "--prompt-file" || out[n-1] != cleanup {
+		t.Fatalf("expected trailing [--prompt-file %q], got %v", cleanup, out)
+	}
+	// The leading flags must be preserved unchanged.
+	wantPrefix := []string{
+		"--output-format", "streaming-json", "--no-auto-update", "--always-approve",
+	}
+	for i, w := range wantPrefix {
+		if out[i] != w {
+			t.Fatalf("prefix arg %d: want %q, got %q", i, w, out[i])
+		}
+	}
+	// `-p` and the raw prompt must no longer appear on argv.
+	for _, a := range out {
+		if a == "-p" || a == prompt {
+			t.Fatalf("argv still carries the inline prompt: %v", out)
+		}
+	}
+
+	// The temp file must exist and hold the exact prompt.
+	data, err := os.ReadFile(cleanup)
+	if err != nil {
+		t.Fatalf("reading temp prompt file: %v", err)
+	}
+	if string(data) != prompt {
+		t.Fatalf("temp file content mismatch: got %d bytes, want %d", len(data), len(prompt))
+	}
+
+	// os.Remove must succeed (defer also covers it, but assert it here).
+	if err := os.Remove(cleanup); err != nil {
+		t.Fatalf("removing temp prompt file: %v", err)
+	}
+}
+
+func TestRewriteGrokPromptToFile_NoPromptFlag(t *testing.T) {
+	// Subcommand carve-out: buildGrokInteractiveArgs returns argv unchanged
+	// with no `-p`, so the rewrite must be a no-op.
+	in := []string{"models"}
+	out, cleanup := rewriteGrokPromptToFile(in)
+	if cleanup != "" {
+		t.Fatalf("expected empty cleanup path for no -p input, got %q", cleanup)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("expected argv unchanged, got %v", out)
+	}
+	for i := range in {
+		if out[i] != in[i] {
+			t.Fatalf("arg %d changed: want %q, got %q", i, in[i], out[i])
+		}
+	}
+}
+
+func TestRewriteGrokPromptToFile_MultilineValuePreservedByteForByte(t *testing.T) {
+	// A multi-line / large value must land in the file byte-for-byte —
+	// including newlines, trailing whitespace, and non-ASCII.
+	prompt := "line one\nline two\r\n\ttabbed\n" +
+		"unicode: café — 漢字 — 🚀\n" +
+		"trailing spaces:    \n" +
+		strings.Repeat("BIG ", 20000)
+	in := []string{
+		"--output-format", "streaming-json", "--no-auto-update", "-p", prompt,
+	}
+
+	out, cleanup := rewriteGrokPromptToFile(in)
+	if cleanup == "" {
+		t.Fatalf("expected a non-empty cleanup path, got empty")
+	}
+	defer os.Remove(cleanup)
+
+	data, err := os.ReadFile(cleanup)
+	if err != nil {
+		t.Fatalf("reading temp prompt file: %v", err)
+	}
+	if string(data) != prompt {
+		t.Fatalf("temp file content not byte-for-byte: got %d bytes, want %d", len(data), len(prompt))
+	}
+
+	n := len(out)
+	if out[n-2] != "--prompt-file" || out[n-1] != cleanup {
+		t.Fatalf("expected trailing [--prompt-file %q], got %v", cleanup, out)
+	}
+}
