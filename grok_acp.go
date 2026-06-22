@@ -1190,7 +1190,15 @@ func setupIsolatedGrokHome(allowAPIKeyFallback bool, runtimeModel string) (strin
 	// `auto_update = false` matches xAI's documented headless/scripting guidance:
 	// without it, an updater check can race `grok agent stdio` and dump non-JSON
 	// stdout that readStream treats as a fatal `grok_acp_error`.
-	cfg := "[cli]\ninstaller = \"internal\"\nauto_update = false\n"
+	//
+	// `[compat.cursor] mcps = false` + `[compat.claude] mcps = false` suppress
+	// grok's vendor-MCP scan of the HOST's `~/.cursor/mcp.json` and
+	// `~/.claude.json` — those files live outside $GROK_HOME so the isolated
+	// dir alone can't hide them, and a slow vendor MCP (e.g. a `visualization`
+	// proxy) otherwise blocks `session/new` ~10s before the ACP turn times out.
+	cfg := "[cli]\ninstaller = \"internal\"\nauto_update = false\n" +
+		"\n[compat.cursor]\nmcps = false\n" +
+		"\n[compat.claude]\nmcps = false\n"
 	if allowAPIKeyFallback && srcBase != "" {
 		section, apiKey := readGrokPersistedAPIKey(filepath.Join(srcBase, "config.toml"), runtimeModel)
 		if apiKey != "" {

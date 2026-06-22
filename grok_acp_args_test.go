@@ -234,6 +234,26 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 	if !strings.Contains(string(cfg), `auto_update = false`) {
 		t.Fatalf("config.toml missing auto_update = false: %q", cfg)
 	}
+	// Vendor-MCP scan must be disabled for both Cursor and Claude — without
+	// these, grok scans the host's `~/.cursor/mcp.json` / `~/.claude.json`
+	// at session/new and a slow vendor MCP blocks the ACP turn.
+	if !strings.Contains(string(cfg), "[compat.cursor]") || !strings.Contains(string(cfg), "[compat.claude]") {
+		t.Fatalf("config.toml missing [compat.cursor]/[compat.claude] sections: %q", cfg)
+	}
+	for _, section := range []string{"compat.cursor", "compat.claude"} {
+		header := "[" + section + "]"
+		idx := strings.Index(string(cfg), header)
+		if idx < 0 {
+			t.Fatalf("config.toml missing %s section: %q", header, cfg)
+		}
+		rest := string(cfg)[idx+len(header):]
+		if next := strings.Index(rest, "\n["); next >= 0 {
+			rest = rest[:next]
+		}
+		if !strings.Contains(rest, "mcps = false") {
+			t.Fatalf("%s section missing mcps = false: %q", header, cfg)
+		}
+	}
 	if strings.Contains(string(cfg), "api_key") || strings.Contains(string(cfg), "approve") {
 		t.Fatalf("clean config.toml must not carry api_key/approval knobs: %q", cfg)
 	}
