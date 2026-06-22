@@ -1582,6 +1582,25 @@ var grokSubcommandActions = map[string]bool{
 // long"). grok accepts `--prompt-file <path>` as a validated drop-in for `-p
 // <prompt>`, so a temp file is the file-based analog of the others' stdin route.
 //
+// grokPromptTempDir returns the directory the grok prompt temp file is written
+// into: `<home>/.ai-expedite/grok-prompts/`. This co-locates it under the same
+// AI Expedite scratch root the documentRequirements / documentDesign agents use
+// (`~/.ai-expedite/requirements/<featureID>/...`) — a stable, non-repo location
+// (so a repo `git stash` during sync can't wipe it) outside the OS temp dir.
+// Returns "" (→ CreateTemp uses the OS temp dir) when the home can't be resolved
+// or the directory can't be created, so the rewrite is always best-effort.
+func grokPromptTempDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	dir := filepath.Join(home, ".ai-expedite", "grok-prompts")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return ""
+	}
+	return dir
+}
+
 // Best-effort: on any temp-file write error, or when no inline `-p <value>`
 // pair is present (grok subcommand carve-outs return argv unchanged with no
 // `-p`), the original args are returned untouched and cleanupPath is "" so the
@@ -1595,7 +1614,12 @@ func rewriteGrokPromptToFile(cliArgs []string) (newArgs []string, cleanupPath st
 	}
 	prompt := cliArgs[n-1]
 
-	f, err := os.CreateTemp("", "grok-prompt-*.txt")
+	// Write under the AI Expedite scratch root (`~/.ai-expedite/grok-prompts/`)
+	// — the same parent the documentRequirements / documentDesign agents use for
+	// their feature scratch files — rather than the OS temp dir. grokPromptTempDir
+	// returns "" on any failure, in which case CreateTemp falls back to the OS
+	// temp dir (still works; just not co-located with the other scratch files).
+	f, err := os.CreateTemp(grokPromptTempDir(), "grok-prompt-*.txt")
 	if err != nil {
 		return cliArgs, ""
 	}

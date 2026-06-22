@@ -128,7 +128,9 @@ func TestStartSession_RemovesGrokPromptFileOnEarlyFailure(t *testing.T) {
 
 	// Snapshot pre-existing grok-prompt-*.txt files so we can spot a leak
 	// caused by THIS call regardless of what other tests have left behind.
-	pattern := filepath.Join(os.TempDir(), "grok-prompt-*.txt")
+	// Glob the SAME dir the rewrite writes into (the .ai-expedite scratch root,
+	// not the OS temp dir) so the leak check is actually effective.
+	pattern := filepath.Join(grokPromptTempDir(), "grok-prompt-*.txt")
 	beforeList, _ := filepath.Glob(pattern)
 	before := make(map[string]bool, len(beforeList))
 	for _, p := range beforeList {
