@@ -1601,11 +1601,34 @@ func grokPromptTempDir() string {
 	return dir
 }
 
-// Best-effort: on any temp-file write error, or when no inline `-p <value>`
-// pair is present (grok subcommand carve-outs return argv unchanged with no
-// `-p`), the original args are returned untouched and cleanupPath is "" so the
-// launch falls back to `-p` rather than failing.
+// Best-effort: on any temp-file write error, or when the argv was NOT produced
+// by buildGrokInteractiveArgs' managed `-p` path (subcommand carve-outs return
+// user args verbatim — see the carve-out `return args` at the top of
+// buildGrokInteractiveArgs), the original args are returned untouched and
+// cleanupPath is "" so the launch falls back to `-p` rather than failing.
+//
+// The managed-path gate matters: buildGrokInteractiveArgs hands back user argv
+// verbatim for the documented `grok mcp add <name> -- <cmd> [args...]` grammar
+// (and the other subcommand carve-outs), so a legitimate child command ending
+// in its OWN `-p <value>` — e.g. `grok mcp add svc -- python server.py -p 8000`
+// — would otherwise have its trailing `-p 8000` rewritten to `--prompt-file
+// <temp>` and the registered MCP server command would be corrupted. The
+// managed path always emits the streaming-json + no-auto-update sentinels at
+// the head of argv, so anchor the rewrite to that signature.
 func rewriteGrokPromptToFile(cliArgs []string) (newArgs []string, cleanupPath string) {
+	// Managed-path gate: only the buildGrokInteractiveArgs managed `-p` path
+	// emits `--output-format streaming-json --no-auto-update` as the first
+	// three tokens (see the unconditional prepend in that function). The
+	// subcommand carve-out returns user args verbatim and does NOT carry these
+	// sentinels, so a verbatim argv ending in `-p <value>` (e.g. a child
+	// command's own flag in `grok mcp add svc -- python server.py -p 8000`)
+	// falls through unchanged.
+	if len(cliArgs) < 3 ||
+		cliArgs[0] != "--output-format" ||
+		cliArgs[1] != "streaming-json" ||
+		cliArgs[2] != "--no-auto-update" {
+		return cliArgs, ""
+	}
 	// buildGrokInteractiveArgs always emits the separate-value form with the
 	// prompt as the final token, i.e. cliArgs[n-2] == "-p", cliArgs[n-1] == value.
 	n := len(cliArgs)

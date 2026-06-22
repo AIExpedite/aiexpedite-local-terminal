@@ -83,6 +83,28 @@ func TestRewriteGrokPromptToFile_NoPromptFlag(t *testing.T) {
 	}
 }
 
+func TestRewriteGrokPromptToFile_SubcommandCarveOutWithChildDashP(t *testing.T) {
+	// Reviewer-flagged regression: buildGrokInteractiveArgs returns user argv
+	// verbatim for the documented `grok mcp add <name> -- <cmd> [args...]`
+	// grammar (and the other subcommand carve-outs). If the trailing `-p
+	// <value>` belongs to the CHILD command behind `--` (e.g. a Python server
+	// taking `-p 8000` as its port), the rewrite must NOT relocate it — the
+	// registered MCP server command would otherwise be corrupted.
+	in := []string{"mcp", "add", "svc", "--", "python", "server.py", "-p", "8000"}
+	out, cleanup := rewriteGrokPromptToFile(in)
+	if cleanup != "" {
+		t.Fatalf("expected empty cleanup path for carve-out argv, got %q", cleanup)
+	}
+	if len(out) != len(in) {
+		t.Fatalf("expected argv unchanged for carve-out, got %v", out)
+	}
+	for i := range in {
+		if out[i] != in[i] {
+			t.Fatalf("arg %d changed: want %q, got %q", i, in[i], out[i])
+		}
+	}
+}
+
 func TestRewriteGrokPromptToFile_MultilineValuePreservedByteForByte(t *testing.T) {
 	// A multi-line / large value must land in the file byte-for-byte —
 	// including newlines, trailing whitespace, and non-ASCII.
