@@ -11,6 +11,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -110,5 +111,46 @@ func TestRewriteGrokPromptToFile_MultilineValuePreservedByteForByte(t *testing.T
 	n := len(out)
 	if out[n-2] != "--prompt-file" || out[n-1] != cleanup {
 		t.Fatalf("expected trailing [--prompt-file %q], got %v", cleanup, out)
+	}
+}
+
+// TestStartSession_RemovesGrokPromptFileOnEarlyFailure proves the cleanup
+// defer in StartSession removes the temp file written by rewriteGrokPromptToFile
+// when proc.Start() fails — without it, every failed launch (missing grok,
+// bad cwd, CreateProcess error) would leak the prompt brief on disk because
+// waitForExit, which owns the eventual removal, never runs.
+func TestStartSession_RemovesGrokPromptFileOnEarlyFailure(t *testing.T) {
+	// An explicit absolute path that does not exist forces proc.Start() to
+	// fail AFTER rewriteGrokPromptToFile has already written the temp file.
+	// The basename is still "grok", so isGrokCommand() returns true and the
+	// rewrite path runs.
+	missing := filepath.Join(t.TempDir(), "does-not-exist", "grok")
+
+	// Snapshot pre-existing grok-prompt-*.txt files so we can spot a leak
+	// caused by THIS call regardless of what other tests have left behind.
+	pattern := filepath.Join(os.TempDir(), "grok-prompt-*.txt")
+	beforeList, _ := filepath.Glob(pattern)
+	before := make(map[string]bool, len(beforeList))
+	for _, p := range beforeList {
+		before[p] = true
+	}
+
+	sm := NewSessionManager(nil)
+	err := sm.StartSession(
+		"leak-test",
+		missing,
+		[]string{"a long review brief that would have ridden on argv"},
+		"", "ws", "uid", 0,
+		func(resultMsg) {},
+	)
+	if err == nil {
+		t.Fatalf("expected StartSession to fail when executable does not exist")
+	}
+
+	afterList, _ := filepath.Glob(pattern)
+	for _, p := range afterList {
+		if !before[p] {
+			t.Fatalf("StartSession leaked grok prompt temp file on early failure: %s", p)
+		}
 	}
 }

@@ -130,6 +130,18 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		cliArgs, promptFile = rewriteGrokPromptToFile(cliArgs)
 	}
 
+	// rewriteGrokPromptToFile may have created an on-disk temp file. waitForExit
+	// owns the eventual removal, but it only runs once proc.Start() has
+	// succeeded AND a CLISession has been registered — every pipe/Start error
+	// path below this point returns early and would otherwise leak the file.
+	// Disarm this defer once the session has taken ownership.
+	sessionOwnsPromptFile := false
+	defer func() {
+		if promptFile != "" && !sessionOwnsPromptFile {
+			_ = os.Remove(promptFile)
+		}
+	}()
+
 	// Resolve executable path
 	executable := resolveExecutable(command)
 
@@ -204,6 +216,10 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	// Start process waiter (detects exit)
 	go sm.waitForExit(session, publishFn)
+
+	// waitForExit is now responsible for removing promptFile after the process
+	// exits — disarm the early-return cleanup defer above.
+	sessionOwnsPromptFile = true
 
 	fmt.Printf("%s[session] Session %s started (PID: %d)%s\n",
 		colorGreen, id, proc.Process.Pid, colorReset)
