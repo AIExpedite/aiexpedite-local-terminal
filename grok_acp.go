@@ -125,6 +125,23 @@ const (
 	// the manager publishes a `grok_acp_error` surface and force-kills the
 	// child to fail-fast.
 	grokACPEnqueueTimeout = 30 * time.Second
+
+	// grokACPFirstFrameTimeout bounds how long we wait, after spawning the
+	// child, for grok to emit its FIRST stdout frame. A healthy `grok agent
+	// stdio` answers the orchestrator's `initialize` request within ~1s, so
+	// the first `grok_acp_message` normally lands a second or two after the
+	// `grok_acp_started` ack (the gap is just one Pub/Sub round-trip for the
+	// orchestrator to send `initialize`). A child that stays completely
+	// silent past this window is almost always blocked needing INTERACTIVE
+	// re-authentication: when grok's cached login token expires it wants a
+	// browser sign-in flow it cannot present over headless stdio, so it
+	// launches, we publish "Grok ACP started", and then it sits forever with
+	// no output. Without this watchdog such a session hangs until the
+	// optional per-session deadline (which is frequently 0 = none) or the 6h
+	// stale GC — the exact silent "stuck at Grok ACP started" failure this
+	// guards against. The window is generous (vs the ~1s healthy case) so
+	// Pub/Sub latency before `initialize` can never trip a false positive.
+	grokACPFirstFrameTimeout = 45 * time.Second
 )
 
 /* --------------------------------------------------------------------------
@@ -167,6 +184,12 @@ type GrokACPSession struct {
 	streamDone   chan struct{}
 	seq          int64
 	timeoutTimer *time.Timer // armed only when TimeoutMs > 0
+	// firstFrame is closed (exactly once, via firstFrameOnce) the moment the
+	// stdout reader sees grok's first frame. The first-frame watchdog
+	// (watchFirstFrame) selects on it to disarm itself the instant grok
+	// proves it is alive and producing output.
+	firstFrame     chan struct{}
+	firstFrameOnce sync.Once
 }
 
 // GrokStartOptions bundles the per-session policy knobs the dispatcher reads
@@ -222,6 +245,17 @@ func (s *GrokACPSession) Status() string {
 func (s *GrokACPSession) closeStdin() {
 	s.stdinClose.Do(func() {
 		_ = s.Stdin.Close()
+	})
+}
+
+// signalFirstFrame records that grok has emitted its first stdout frame. It is
+// idempotent (sync.Once) so the per-line hot path in the stdout reader can call
+// it unconditionally without a guard. Closing the channel — rather than setting
+// a flag — lets the first-frame watchdog block on it directly and wake the
+// instant grok proves it is alive.
+func (s *GrokACPSession) signalFirstFrame() {
+	s.firstFrameOnce.Do(func() {
+		close(s.firstFrame)
 	})
 }
 
@@ -444,6 +478,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		status:        "running",
 		done:          make(chan struct{}),
 		streamDone:    make(chan struct{}),
+		firstFrame:    make(chan struct{}),
 	}
 
 	m.sessions[id] = session
@@ -497,6 +532,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 
 	go m.readStream(session, publishFn)
 	go m.waitForExit(session, publishFn)
+	go m.watchFirstFrame(session, publishFn, grokACPFirstFrameTimeout)
 
 	fmt.Printf("%s[grok-acp] Session %s started (PID: %d)%s\n",
 		colorGreen, id, proc.Process.Pid, colorReset)
@@ -834,6 +870,13 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 				continue
 			}
 
+			// grok produced output — disarm the first-frame watchdog. Done
+			// before size/JSON validation on purpose: even a malformed or
+			// oversize frame proves the child is alive and draining stdin, so
+			// it is NOT the silent auth/startup stall the watchdog guards
+			// against (those failures surface through their own fatal paths).
+			session.signalFirstFrame()
+
 			if len(trimmed) > grokACPMaxFrameSize {
 				failSessionFatally(
 					fmt.Sprintf(
@@ -1045,6 +1088,75 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 		colorYellow, session.ID, exit, colorReset)
 
 	m.removeSession(session.ID)
+}
+
+// watchFirstFrame fails a session fast when grok spawns but never produces any
+// stdout — the signature of a child blocked on interactive re-authentication
+// (expired cached token → grok wants a browser sign-in it can't show over
+// headless stdio) or otherwise wedged at startup. Without it such a session
+// sits at "Grok ACP started" until the optional per-session deadline (often
+// none) or the 6h stale GC.
+//
+// It blocks until one of three things happens:
+//   - session.firstFrame closes — grok emitted a frame; healthy, disarm.
+//   - session.done closes — the child already exited (e.g. immediate crash);
+//     waitForExit owns the terminal `grok_acp_ended` frame, so do nothing.
+//   - timeout elapses — declare the startup stalled, publish an actionable
+//     `grok_acp_error`, and kill the child so waitForExit emits the ended frame.
+//
+// timeout is a parameter (rather than the package constant) so unit tests can
+// drive the fail-fast path with a sub-second budget and no real process.
+//
+// Seq ordering mirrors the per-session deadline timer: reserve the error's Seq
+// (atomic increment) BEFORE Kill and publish AFTER, so the watchdog error is
+// strictly ordered before the `grok_acp_ended` frame waitForExit allocates once
+// the killed child is reaped — the orchestrator therefore sees error → ended.
+func (m *GrokACPManager) watchFirstFrame(session *GrokACPSession, publishFn PublishFunc, timeout time.Duration) {
+	select {
+	case <-session.firstFrame:
+		return
+	case <-session.done:
+		return
+	case <-time.After(timeout):
+	}
+
+	// Lost the race against a frame/exit that landed as the timer fired?
+	// Re-check both non-blockingly so we never kill a session that just
+	// proved itself alive (or already terminated on its own).
+	select {
+	case <-session.firstFrame:
+		return
+	case <-session.done:
+		return
+	default:
+	}
+	if session.Status() == "ended" {
+		return
+	}
+
+	seq := atomic.AddInt64(&session.seq, 1)
+	fmt.Printf("%s[grok-acp] Session %s produced no output within %v — assuming auth/startup stall, killing%s\n",
+		colorYellow, session.ID, timeout, colorReset)
+	if session.Process != nil && session.Process.Process != nil {
+		_ = session.Process.Process.Kill()
+	}
+	publishFn(resultMsg{
+		ID:          session.ID,
+		WorkspaceID: session.WorkspaceID,
+		UID:         session.UID,
+		Output: fmt.Sprintf(
+			"grok produced no output within %v of starting — it is most likely not signed in on this computer "+
+				"(its saved grok login/token expired; run `grok` in a terminal on the terminal computer to sign in again) "+
+				"or wedged at startup. Session terminated.",
+			timeout,
+		),
+		Status:    "error",
+		Ts:        time.Now().UnixMilli(),
+		Version:   Version,
+		Type:      "grok_acp_error",
+		SessionID: session.ID,
+		Seq:       int(seq),
+	})
 }
 
 /* --------------------------------------------------------------------------
