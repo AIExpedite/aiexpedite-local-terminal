@@ -896,13 +896,6 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 				continue
 			}
 
-			// grok produced output — disarm the first-frame watchdog. Done
-			// before size/JSON validation on purpose: even a malformed or
-			// oversize frame proves the child is alive and draining stdin, so
-			// it is NOT the silent auth/startup stall the watchdog guards
-			// against (those failures surface through their own fatal paths).
-			session.signalFirstFrame()
-
 			if len(trimmed) > grokACPMaxFrameSize {
 				failSessionFatally(
 					fmt.Sprintf(
@@ -936,6 +929,18 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 				}
 				continue
 			}
+
+			// Valid JSON-RPC frame from grok — disarm the first-frame
+			// watchdog. We deliberately wait for a parseable frame here
+			// instead of signaling on any stdout: grok's auth/updater paths
+			// can print non-JSON banners or prompts and then stall waiting
+			// for input. Treating those as proof-of-life would disarm the
+			// watchdog while the ACP handshake is still hung. The non-JSON
+			// branch above only reports a `grok_acp_error` and keeps
+			// scanning, so the watchdog must stay armed until we see a real
+			// frame.
+			session.signalFirstFrame()
+
 			if lineCount <= 3 {
 				fmt.Printf("%s[grok-acp] stdout[%d] %s: %s%s\n",
 					colorCyan, lineCount, session.ID, truncateString(trimmed, 200), colorReset)
