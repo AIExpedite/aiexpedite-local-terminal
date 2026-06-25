@@ -3042,6 +3042,13 @@ func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			SessionID:   cmd.SessionID,
 		})
 
+		// Arm the first-frame watchdog AFTER the ack publish. publishFn
+		// (newSessionPublishFn) can block for up to 30s when Pub/Sub is slow;
+		// arming the watchdog from Start would include that publish latency
+		// in the 45s budget and risk killing a healthy grok that is just
+		// waiting on the orchestrator's `initialize` frame.
+		globalGrokACPManager.ArmFirstFrameWatchdog(cmd.SessionID, publishFn)
+
 	case "grok_acp_send":
 		if cmd.SessionID == "" {
 			publishGrokACPError(ctx, topic, cmd, "sessionID is required for grok_acp_send")

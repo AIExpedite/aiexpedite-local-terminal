@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1711,5 +1712,294 @@ func TestGrokACPManager_Send_BatchArrayDoesNotBypassCwdGate(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "single JSON-RPC object") {
 		t.Fatalf("expected single-JSON-RPC-object error; got %q", err.Error())
+	}
+}
+
+/* --------------------------------------------------------------------------
+   first-frame watchdog
+   -------------------------------------------------------------------------- */
+
+// newWatchdogFixtureSession builds a minimal running session usable by the
+// watchFirstFrame tests without spawning a real grok: Process is nil (the
+// watchdog's Kill is nil-guarded) and only the channels/status the watchdog
+// touches are populated.
+func newWatchdogFixtureSession(id string) *GrokACPSession {
+	return &GrokACPSession{
+		ID:          id,
+		WorkspaceID: "ws",
+		UID:         "uid",
+		status:      "running",
+		done:        make(chan struct{}),
+		streamDone:  make(chan struct{}),
+		firstFrame:  make(chan struct{}),
+	}
+}
+
+// TestGrokACPManager_WatchFirstFrame_FiresAuthErrorOnSilence pins the core
+// fail-fast: a session that never emits a stdout frame within the budget must
+// produce exactly one `grok_acp_error` whose message points the user at
+// re-authenticating, instead of hanging at "Grok ACP started" forever.
+func TestGrokACPManager_WatchFirstFrame_FiresAuthErrorOnSilence(t *testing.T) {
+	m := NewGrokACPManager()
+	session := newWatchdogFixtureSession("silent-1")
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	m.watchFirstFrame(session, publishFn, 30*time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 1 {
+		t.Fatalf("expected exactly 1 published frame, got %d: %+v", len(captured), captured)
+	}
+	got := captured[0]
+	if got.Type != "grok_acp_error" {
+		t.Fatalf("expected grok_acp_error, got %q", got.Type)
+	}
+	if got.Status != "error" {
+		t.Fatalf("expected status error, got %q", got.Status)
+	}
+	if got.SessionID != "silent-1" {
+		t.Fatalf("expected SessionID silent-1, got %q", got.SessionID)
+	}
+	if !strings.Contains(got.Output, "no output") || !strings.Contains(got.Output, "grok") {
+		t.Fatalf("expected actionable auth message, got %q", got.Output)
+	}
+}
+
+// TestGrokACPManager_WatchFirstFrame_SilentWhenFrameArrives ensures a healthy
+// session (grok emits a frame before the budget) disarms the watchdog with no
+// spurious error frame.
+func TestGrokACPManager_WatchFirstFrame_SilentWhenFrameArrives(t *testing.T) {
+	m := NewGrokACPManager()
+	session := newWatchdogFixtureSession("healthy-1")
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	// Signal the first frame well before the (long) budget elapses.
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		session.signalFirstFrame()
+	}()
+	m.watchFirstFrame(session, publishFn, 5*time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 0 {
+		t.Fatalf("expected no published frames for a healthy session, got %d: %+v", len(captured), captured)
+	}
+}
+
+// TestGrokACPManager_WatchFirstFrame_SilentWhenSessionExits ensures a session
+// that exits on its own before any frame (e.g. immediate crash) does NOT get a
+// watchdog auth error — waitForExit owns the terminal `grok_acp_ended` frame in
+// that case, so the watchdog must stay quiet.
+func TestGrokACPManager_WatchFirstFrame_SilentWhenSessionExits(t *testing.T) {
+	m := NewGrokACPManager()
+	session := newWatchdogFixtureSession("exited-1")
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		close(session.done)
+	}()
+	m.watchFirstFrame(session, publishFn, 5*time.Second)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 0 {
+		t.Fatalf("expected no published frames when the session exits first, got %d: %+v", len(captured), captured)
+	}
+}
+
+// TestGrokACPManager_WatchFirstFrame_SignalFirstFrameIdempotent guards the
+// hot-path assumption that the stdout reader can call signalFirstFrame() on
+// every line without panicking on a double close.
+func TestGrokACPManager_WatchFirstFrame_SignalFirstFrameIdempotent(t *testing.T) {
+	session := newWatchdogFixtureSession("idem-1")
+	session.signalFirstFrame()
+	session.signalFirstFrame()
+	session.signalFirstFrame()
+	select {
+	case <-session.firstFrame:
+	default:
+		t.Fatalf("expected firstFrame channel to be closed after signalFirstFrame")
+	}
+}
+
+// TestGrokACPManager_ArmFirstFrameWatchdog_NoopForUnknownSession pins that the
+// dispatcher's post-ack arm call is safe if the session is already gone (e.g.
+// removed by a fast natural exit between Start and the ack publish completing).
+func TestGrokACPManager_ArmFirstFrameWatchdog_NoopForUnknownSession(t *testing.T) {
+	m := NewGrokACPManager()
+	var captured []resultMsg
+	publishFn := func(res resultMsg) { captured = append(captured, res) }
+
+	m.ArmFirstFrameWatchdog("does-not-exist", publishFn)
+
+	if len(captured) != 0 {
+		t.Fatalf("expected no publishes for unknown session, got %d: %+v", len(captured), captured)
+	}
+}
+
+// TestGrokACPManager_ArmFirstFrameWatchdog_NoopForEndedSession pins that
+// arming after the session has already transitioned to "ended" is a no-op —
+// waitForExit owns the terminal `grok_acp_ended` frame in that case, so the
+// watchdog must stay quiet.
+func TestGrokACPManager_ArmFirstFrameWatchdog_NoopForEndedSession(t *testing.T) {
+	m := NewGrokACPManager()
+	session := newWatchdogFixtureSession("ended-1")
+	session.status = "ended"
+	m.sessions[session.ID] = session
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	m.ArmFirstFrameWatchdog(session.ID, publishFn)
+
+	// Give any (incorrectly) spawned goroutine a chance to misbehave.
+	time.Sleep(20 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 0 {
+		t.Fatalf("expected no publishes for ended session, got %d: %+v", len(captured), captured)
+	}
+}
+
+// TestGrokACPManager_ArmFirstFrameWatchdog_QuietForHealthySession verifies the
+// post-ack arm path stays silent when grok produces a frame — the dispatcher
+// integration must not change the disarm semantics watchFirstFrame relies on.
+func TestGrokACPManager_ArmFirstFrameWatchdog_QuietForHealthySession(t *testing.T) {
+	m := NewGrokACPManager()
+	session := newWatchdogFixtureSession("arm-quiet-1")
+	m.sessions[session.ID] = session
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	m.ArmFirstFrameWatchdog(session.ID, publishFn)
+	// Disarm immediately by signalling a first frame, then give the goroutine
+	// a moment to observe it before we inspect captured publishes.
+	session.signalFirstFrame()
+	time.Sleep(20 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 0 {
+		t.Fatalf("expected no publishes when arm sees an immediate first frame, got %d: %+v", len(captured), captured)
+	}
+}
+
+// TestGrokACPManager_ReadStream_NonJSONDoesNotDisarmWatchdog pins the disarm
+// contract: a non-JSON stdout line (e.g. an auth banner grok prints before
+// blocking on interactive sign-in) must NOT close session.firstFrame, so the
+// watchdog can still fail the silent startup stall. The same test then writes
+// a valid ACP frame and verifies it DOES disarm — proving the gate is on
+// "spoke the protocol", not "wrote anything to stdout".
+func TestGrokACPManager_ReadStream_NonJSONDoesNotDisarmWatchdog(t *testing.T) {
+	m := NewGrokACPManager()
+
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	defer stderrW.Close()
+
+	session := &GrokACPSession{
+		ID:          "readstream-disarm-1",
+		WorkspaceID: "ws",
+		UID:         "uid",
+		status:      "running",
+		done:        make(chan struct{}),
+		streamDone:  make(chan struct{}),
+		firstFrame:  make(chan struct{}),
+		Stdout:      stdoutR,
+		Stderr:      stderrR,
+	}
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	go m.readStream(session, publishFn)
+
+	// Feed a non-JSON banner — the kind grok could print before blocking on
+	// interactive auth — and let the scanner observe it.
+	if _, err := io.WriteString(stdoutW, "Welcome to grok, please sign in at https://...\n"); err != nil {
+		t.Fatalf("write non-JSON banner: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		sawError := false
+		for _, msg := range captured {
+			if msg.Type == "grok_acp_error" && strings.Contains(msg.Output, "non-JSON frame") {
+				sawError = true
+				break
+			}
+		}
+		mu.Unlock()
+		if sawError {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-session.firstFrame:
+		t.Fatalf("non-JSON banner must NOT disarm the first-frame watchdog")
+	default:
+	}
+
+	// Now feed a valid ACP frame and verify the watchdog disarms.
+	if _, err := io.WriteString(stdoutW, `{"jsonrpc":"2.0","id":1,"result":{}}`+"\n"); err != nil {
+		t.Fatalf("write valid JSON frame: %v", err)
+	}
+	select {
+	case <-session.firstFrame:
+		// Expected.
+	case <-time.After(2 * time.Second):
+		t.Fatalf("valid ACP frame must disarm the first-frame watchdog")
+	}
+
+	// Cleanly unwind: close the writer side so the scanner exits, then wait
+	// for readStream's defer-close on streamDone so we don't leak the goroutine.
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	select {
+	case <-session.streamDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("readStream did not exit after stdout/stderr closed")
 	}
 }
