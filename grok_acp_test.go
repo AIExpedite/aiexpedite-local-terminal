@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1916,5 +1917,89 @@ func TestGrokACPManager_ArmFirstFrameWatchdog_QuietForHealthySession(t *testing.
 	defer mu.Unlock()
 	if len(captured) != 0 {
 		t.Fatalf("expected no publishes when arm sees an immediate first frame, got %d: %+v", len(captured), captured)
+	}
+}
+
+// TestGrokACPManager_ReadStream_NonJSONDoesNotDisarmWatchdog pins the disarm
+// contract: a non-JSON stdout line (e.g. an auth banner grok prints before
+// blocking on interactive sign-in) must NOT close session.firstFrame, so the
+// watchdog can still fail the silent startup stall. The same test then writes
+// a valid ACP frame and verifies it DOES disarm — proving the gate is on
+// "spoke the protocol", not "wrote anything to stdout".
+func TestGrokACPManager_ReadStream_NonJSONDoesNotDisarmWatchdog(t *testing.T) {
+	m := NewGrokACPManager()
+
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+	defer stderrW.Close()
+
+	session := &GrokACPSession{
+		ID:          "readstream-disarm-1",
+		WorkspaceID: "ws",
+		UID:         "uid",
+		status:      "running",
+		done:        make(chan struct{}),
+		streamDone:  make(chan struct{}),
+		firstFrame:  make(chan struct{}),
+		Stdout:      stdoutR,
+		Stderr:      stderrR,
+	}
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	go m.readStream(session, publishFn)
+
+	// Feed a non-JSON banner — the kind grok could print before blocking on
+	// interactive auth — and let the scanner observe it.
+	if _, err := io.WriteString(stdoutW, "Welcome to grok, please sign in at https://...\n"); err != nil {
+		t.Fatalf("write non-JSON banner: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		sawError := false
+		for _, msg := range captured {
+			if msg.Type == "grok_acp_error" && strings.Contains(msg.Output, "non-JSON frame") {
+				sawError = true
+				break
+			}
+		}
+		mu.Unlock()
+		if sawError {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	select {
+	case <-session.firstFrame:
+		t.Fatalf("non-JSON banner must NOT disarm the first-frame watchdog")
+	default:
+	}
+
+	// Now feed a valid ACP frame and verify the watchdog disarms.
+	if _, err := io.WriteString(stdoutW, `{"jsonrpc":"2.0","id":1,"result":{}}`+"\n"); err != nil {
+		t.Fatalf("write valid JSON frame: %v", err)
+	}
+	select {
+	case <-session.firstFrame:
+		// Expected.
+	case <-time.After(2 * time.Second):
+		t.Fatalf("valid ACP frame must disarm the first-frame watchdog")
+	}
+
+	// Cleanly unwind: close the writer side so the scanner exits, then wait
+	// for readStream's defer-close on streamDone so we don't leak the goroutine.
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	select {
+	case <-session.streamDone:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("readStream did not exit after stdout/stderr closed")
 	}
 }
