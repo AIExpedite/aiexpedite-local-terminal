@@ -126,21 +126,24 @@ const (
 	// child to fail-fast.
 	grokACPEnqueueTimeout = 30 * time.Second
 
-	// grokACPFirstFrameTimeout bounds how long we wait, after spawning the
-	// child, for grok to emit its FIRST stdout frame. A healthy `grok agent
-	// stdio` answers the orchestrator's `initialize` request within ~1s, so
-	// the first `grok_acp_message` normally lands a second or two after the
-	// `grok_acp_started` ack (the gap is just one Pub/Sub round-trip for the
-	// orchestrator to send `initialize`). A child that stays completely
-	// silent past this window is almost always blocked needing INTERACTIVE
-	// re-authentication: when grok's cached login token expires it wants a
-	// browser sign-in flow it cannot present over headless stdio, so it
-	// launches, we publish "Grok ACP started", and then it sits forever with
-	// no output. Without this watchdog such a session hangs until the
-	// optional per-session deadline (which is frequently 0 = none) or the 6h
-	// stale GC — the exact silent "stuck at Grok ACP started" failure this
-	// guards against. The window is generous (vs the ~1s healthy case) so
-	// Pub/Sub latency before `initialize` can never trip a false positive.
+	// grokACPFirstFrameTimeout bounds how long we wait, AFTER the
+	// `grok_acp_started` ack publish completes, for grok to emit its FIRST
+	// stdout frame. A healthy `grok agent stdio` answers the orchestrator's
+	// `initialize` request within ~1s, so the first `grok_acp_message`
+	// normally lands a second or two after the ack (the gap is just one
+	// Pub/Sub round-trip for the orchestrator to send `initialize`). A child
+	// that stays completely silent past this window is almost always blocked
+	// needing INTERACTIVE re-authentication: when grok's cached login token
+	// expires it wants a browser sign-in flow it cannot present over headless
+	// stdio, so it launches, we publish "Grok ACP started", and then it sits
+	// forever with no output. Without this watchdog such a session hangs
+	// until the optional per-session deadline (which is frequently 0 = none)
+	// or the 6h stale GC — the exact silent "stuck at Grok ACP started"
+	// failure this guards against. The dispatcher arms this timer via
+	// ArmFirstFrameWatchdog after the ack publish so the up-to-30s
+	// newSessionPublishFn timeout never eats into the budget — arming it
+	// directly in Start could otherwise reduce the effective window enough
+	// to kill a healthy grok waiting on `initialize` under slow Pub/Sub.
 	grokACPFirstFrameTimeout = 45 * time.Second
 )
 
@@ -532,11 +535,34 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 
 	go m.readStream(session, publishFn)
 	go m.waitForExit(session, publishFn)
-	go m.watchFirstFrame(session, publishFn, grokACPFirstFrameTimeout)
+	// NOTE: the first-frame watchdog is NOT armed here. The dispatcher arms it
+	// via ArmFirstFrameWatchdog AFTER the `grok_acp_started` ack publish
+	// completes, so the budget excludes ack-publish latency (newSessionPublishFn
+	// can block for up to 30s when Pub/Sub is slow). Arming here would let a
+	// slow ack publish shrink the window enough to kill a healthy grok that is
+	// just waiting on the orchestrator's `initialize` frame.
 
 	fmt.Printf("%s[grok-acp] Session %s started (PID: %d)%s\n",
 		colorGreen, id, proc.Process.Pid, colorReset)
 	return nil
+}
+
+// ArmFirstFrameWatchdog starts the first-frame watchdog for an already-started
+// session. Split out from Start so the dispatcher can call it AFTER the
+// synchronous `grok_acp_started` ack publish completes — that publish can take
+// up to 30s on a slow Pub/Sub, and including it in the watchdog budget would
+// risk killing a healthy grok that is just waiting on the orchestrator's
+// `initialize` frame. No-op if the session is unknown (already removed) or
+// already exited.
+func (m *GrokACPManager) ArmFirstFrameWatchdog(id string, publishFn PublishFunc) {
+	session := m.Get(id)
+	if session == nil {
+		return
+	}
+	if session.Status() == "ended" {
+		return
+	}
+	go m.watchFirstFrame(session, publishFn, grokACPFirstFrameTimeout)
 }
 
 // Send writes a single JSON-RPC 2.0 frame to the child's stdin. payload must

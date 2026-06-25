@@ -1844,3 +1844,77 @@ func TestGrokACPManager_WatchFirstFrame_SignalFirstFrameIdempotent(t *testing.T)
 		t.Fatalf("expected firstFrame channel to be closed after signalFirstFrame")
 	}
 }
+
+// TestGrokACPManager_ArmFirstFrameWatchdog_NoopForUnknownSession pins that the
+// dispatcher's post-ack arm call is safe if the session is already gone (e.g.
+// removed by a fast natural exit between Start and the ack publish completing).
+func TestGrokACPManager_ArmFirstFrameWatchdog_NoopForUnknownSession(t *testing.T) {
+	m := NewGrokACPManager()
+	var captured []resultMsg
+	publishFn := func(res resultMsg) { captured = append(captured, res) }
+
+	m.ArmFirstFrameWatchdog("does-not-exist", publishFn)
+
+	if len(captured) != 0 {
+		t.Fatalf("expected no publishes for unknown session, got %d: %+v", len(captured), captured)
+	}
+}
+
+// TestGrokACPManager_ArmFirstFrameWatchdog_NoopForEndedSession pins that
+// arming after the session has already transitioned to "ended" is a no-op —
+// waitForExit owns the terminal `grok_acp_ended` frame in that case, so the
+// watchdog must stay quiet.
+func TestGrokACPManager_ArmFirstFrameWatchdog_NoopForEndedSession(t *testing.T) {
+	m := NewGrokACPManager()
+	session := newWatchdogFixtureSession("ended-1")
+	session.status = "ended"
+	m.sessions[session.ID] = session
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	m.ArmFirstFrameWatchdog(session.ID, publishFn)
+
+	// Give any (incorrectly) spawned goroutine a chance to misbehave.
+	time.Sleep(20 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 0 {
+		t.Fatalf("expected no publishes for ended session, got %d: %+v", len(captured), captured)
+	}
+}
+
+// TestGrokACPManager_ArmFirstFrameWatchdog_QuietForHealthySession verifies the
+// post-ack arm path stays silent when grok produces a frame — the dispatcher
+// integration must not change the disarm semantics watchFirstFrame relies on.
+func TestGrokACPManager_ArmFirstFrameWatchdog_QuietForHealthySession(t *testing.T) {
+	m := NewGrokACPManager()
+	session := newWatchdogFixtureSession("arm-quiet-1")
+	m.sessions[session.ID] = session
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	m.ArmFirstFrameWatchdog(session.ID, publishFn)
+	// Disarm immediately by signalling a first frame, then give the goroutine
+	// a moment to observe it before we inspect captured publishes.
+	session.signalFirstFrame()
+	time.Sleep(20 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 0 {
+		t.Fatalf("expected no publishes when arm sees an immediate first frame, got %d: %+v", len(captured), captured)
+	}
+}
