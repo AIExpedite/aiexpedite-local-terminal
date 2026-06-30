@@ -25,6 +25,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,6 +94,26 @@ func runMockCLI(mode string) {
 		fmt.Println(`{"type":"item.completed","item":{"type":"agent_message","text":"hello from codex"}}`)
 		fmt.Println(`{"type":"turn.completed"}`)
 		fmt.Println(`{"type":"thread.completed"}`)
+		os.Exit(0)
+
+	case "codex-reads-stdin":
+		// Mimic `codex exec -` on codex CLI v0.140+: read the prompt from stdin
+		// to EOF, then run. With NO prompt (immediate EOF), exit 1 like the real
+		// CLI's "No prompt provided via stdin." This exercises the deferred-stdin
+		// fix: the chat-direct flow starts codex with no prompt and delivers the
+		// first message later via SendInput, so stdin MUST stay open until that
+		// write — closing it at start would EOF the child with no prompt and it
+		// would exit 1 before the user's message ever arrived.
+		data, _ := io.ReadAll(os.Stdin)
+		prompt := strings.TrimSpace(string(data))
+		if prompt == "" {
+			fmt.Fprintln(os.Stderr, "No prompt provided via stdin.")
+			os.Exit(1)
+		}
+		fmt.Println(`{"type":"thread.started","thread_id":"t-1"}`)
+		fmt.Println(`{"type":"turn.started","turn_id":"r-1"}`)
+		fmt.Printf(`{"type":"item.completed","item":{"type":"agent_message","text":"echo: %s"}}`+"\n", prompt)
+		fmt.Println(`{"type":"turn.completed"}`)
 		os.Exit(0)
 
 	case "gemini":
@@ -402,6 +423,31 @@ func TestSessionLifecycle_Codex(t *testing.T) {
 	streamText := concatStreamOutput(messages)
 	if !strings.Contains(streamText, "hello from codex") {
 		t.Errorf("expected stream output to contain agent_message text; got %q", streamText)
+	}
+}
+
+// TestSessionLifecycle_CodexDeferredStdinPrompt covers the chat-direct flow
+// where the session is opened eagerly with NO prompt and the user's first
+// message is delivered later via SendInput. codex exec reads stdin to EOF
+// before running, so stdin must stay open until that first SendInput; the
+// pre-fix behaviour closed stdin at start, and codex v0.140+ then exited 1 with
+// "No prompt provided via stdin." before the message arrived (the prod
+// "Codex session failed" symptom). The mock here reproduces that contract:
+// empty stdin → exit 1; a delivered prompt → normal stream + clean exit.
+func TestSessionLifecycle_CodexDeferredStdinPrompt(t *testing.T) {
+	_, messages, err := captureSession(t, "codex-reads-stdin", "codex", []string{}, "Hi there")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+
+	assertLifecycleOrdering(t, messages)
+
+	// The deferred prompt must have reached codex over the still-open stdin —
+	// the mock echoes it back. Absence means stdin was closed before SendInput
+	// delivered the prompt (the regression this fix guards against).
+	streamText := concatStreamOutput(messages)
+	if !strings.Contains(streamText, "echo: Hi there") {
+		t.Errorf("expected the deferred prompt to reach codex via SendInput; got %q", streamText)
 	}
 }
 

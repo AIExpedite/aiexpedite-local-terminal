@@ -91,10 +91,17 @@ func TestShouldCloseStdinAfterStart(t *testing.T) {
 		{name: "claude_with_stdin_prompt_stays_open", command: "claude", stdinPrompt: "do work", want: false},
 		{name: "claude_without_prompt_stays_open", command: "claude", want: false},
 		// Codex / gemini are one-shot by design and read the stdin-piped prompt
-		// to EOF, so stdin is ALWAYS closed after the write (leaving it open
-		// hangs them). Shells close only when no prompt was queued.
-		{name: "codex_exec_closes", command: "codex", want: true},
-		{name: "gemini_exec_closes", command: "gemini", want: true},
+		// to EOF. When a prompt was queued at start (delegate path), close stdin
+		// right after the write — leaving it open hangs them. When NO prompt was
+		// queued (chat-direct opens the session eagerly and delivers the first
+		// message later via SendInput), DEFER the close: closing here hands the
+		// child an immediate EOF with no prompt and codex v0.140+ exits 1 with
+		// "No prompt provided via stdin." SendInput closes the pipe after the
+		// first prompt instead (see deferredStdinClose).
+		{name: "codex_with_prompt_closes", command: "codex", stdinPrompt: "do work", want: true},
+		{name: "codex_without_prompt_defers", command: "codex", want: false},
+		{name: "gemini_with_prompt_closes", command: "gemini", stdinPrompt: "do work", want: true},
+		{name: "gemini_without_prompt_defers", command: "gemini", want: false},
 		{name: "powershell_closes", command: "powershell", want: true},
 	}
 
