@@ -73,6 +73,15 @@ type CLISession struct {
 	// Removed exactly once after the process exits (see waitForExit).
 	promptFile string
 
+	// deferredStdinClose marks a one-shot, stdin-fed CLI (codex/gemini) that
+	// was started with NO prompt — the chat-direct flow opens the session
+	// eagerly and delivers the first message later via SendInput. Stdin is left
+	// open at start (see shouldCloseStdinAfterStart) and closed by SendInput
+	// immediately after the first prompt is written, giving the child its
+	// prompt + EOF in the order codex exec requires. Reset to false once the
+	// pipe is closed so a second SendInput doesn't double-close.
+	deferredStdinClose bool
+
 	mu         sync.Mutex
 	done       chan struct{} // closed when process exits
 	streamDone chan struct{} // closed when stdout/stderr and stream publishes finish
@@ -199,8 +208,12 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		UID:         uid,
 		TimeoutMs:   timeoutMs,
 		promptFile:  promptFile,
-		done:        make(chan struct{}),
-		streamDone:  make(chan struct{}),
+		// A stdin-fed one-shot CLI (codex/gemini) started without a prompt keeps
+		// its stdin open so the first SendInput can deliver the prompt; that
+		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
+		deferredStdinClose: stdinPromptFormat(command) == "plain" && stdinPrompt == "",
+		done:               make(chan struct{}),
+		streamDone:         make(chan struct{}),
 	}
 
 	sm.sessions[id] = session
@@ -316,6 +329,18 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		}
 	case <-time.After(10 * time.Second):
 		return fmt.Errorf("timeout writing to session %s stdin (pipe buffer full)", id)
+	}
+
+	// One-shot, stdin-fed CLIs (codex/gemini) started without a prompt held
+	// their stdin open waiting for this first message. codex exec reads stdin
+	// to EOF before running, so close the pipe now that the prompt is written —
+	// otherwise the child waits forever for EOF. Done once: a subsequent
+	// SendInput hits an already-ended one-shot session.
+	if session.deferredStdinClose {
+		session.deferredStdinClose = false
+		session.Stdin.Close()
+		fmt.Printf("%s[session] Closed stdin after first prompt for one-shot session %s (%s)%s\n",
+			colorYellow, id, session.Command, colorReset)
 	}
 
 	// Reset status from waiting_input back to running
@@ -531,7 +556,16 @@ func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
 	case strings.HasPrefix(base, "claude"):
 		return false
 	case strings.HasPrefix(base, "codex"), strings.HasPrefix(base, "gemini"):
-		return true
+		// One-shot, stdin-fed CLIs: close stdin right after start ONLY when a
+		// prompt was delivered at start (the delegate/one-shot path). When the
+		// session is started with NO prompt — the chat-direct flow eagerly
+		// opens the session on model selection and delivers the first message
+		// later via SendInput — closing here would hand the child an immediate
+		// EOF with no prompt. codex v0.140+ then exits 1 with "No prompt
+		// provided via stdin." before the user's first message ever arrives.
+		// Keep stdin open in that case; SendInput closes it after writing the
+		// first (and only) prompt. See deferredStdinClose.
+		return stdinPrompt != ""
 	}
 	return stdinPrompt == ""
 }

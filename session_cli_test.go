@@ -1320,19 +1320,20 @@ func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *test
 		// Normalize: claude.exe, claude.cmd, claude.ps1 should match too.
 		{cmd: "claude.exe", stdinPrompt: "", want: false},
 		{cmd: "Claude", stdinPrompt: "", want: false},
-		// Codex — always close. codex exec reads stdin to completion before
-		// inference, so we close right after writing the prompt; otherwise
-		// codex hangs waiting for EOF. Behaviour is identical whether the
-		// prompt is empty (will error out cleanly) or non-empty (the new
-		// stdin-piped path).
-		{cmd: "codex", stdinPrompt: "", want: true},
+		// Codex — close after the write when a prompt was queued at start; codex
+		// exec reads stdin to completion before inference, so leaving it open
+		// hangs the child waiting for EOF. But with an EMPTY prompt (chat-direct
+		// opens the session eagerly and delivers the first message later via
+		// SendInput), DEFER: closing here hands codex an immediate EOF with no
+		// prompt and v0.140+ exits 1 with "No prompt provided via stdin."
+		// SendInput closes the pipe after writing the first prompt instead.
+		{cmd: "codex", stdinPrompt: "", want: false},
 		{cmd: "codex", stdinPrompt: "review the diff", want: true},
 		{cmd: "codex.cmd", stdinPrompt: "review", want: true},
 		{cmd: "CODEX", stdinPrompt: "review", want: true},
-		// Gemini — always close (one-shot; reads the stdin-piped prompt to EOF,
-		// same as codex). Behaviour is identical whether the prompt is empty or
-		// the new stdin-piped path.
-		{cmd: "gemini", stdinPrompt: "", want: true},
+		// Gemini — same one-shot policy as codex: close when a prompt was queued
+		// at start, defer (stdin stays open for the first SendInput) when not.
+		{cmd: "gemini", stdinPrompt: "", want: false},
 		{cmd: "gemini", stdinPrompt: "hello", want: true},
 		{cmd: "gemini.cmd", stdinPrompt: "review", want: true},
 		// Path-routed claude/codex/gemini — same policy must apply when the
@@ -1343,7 +1344,7 @@ func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *test
 		{cmd: `C:\tools\claude.cmd`, stdinPrompt: "hi", want: false},
 		{cmd: "/opt/bin/codex", stdinPrompt: "review", want: true},
 		{cmd: `C:\tools\gemini.cmd`, stdinPrompt: "review", want: true},
-		{cmd: "./codex", stdinPrompt: "", want: true},
+		{cmd: "./codex", stdinPrompt: "", want: false},
 		// Shells / non-CLI: legacy rule — close iff empty prompt.
 		{cmd: "powershell", stdinPrompt: "", want: true},
 		{cmd: "git", stdinPrompt: "", want: true},
