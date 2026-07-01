@@ -225,6 +225,10 @@ jobs:
             dist/aiexpedite-terminal${{ matrix.exe_suffix }}-windows-amd64.exe
             dist/${{ matrix.installer_name }}
           if-no-files-found: error
+          # Consumed by the release job in this same run; the durable copy is the
+          # GitHub Release asset. Short window instead of the ~7d default to keep
+          # Actions storage down.
+          retention-days: 2
 
   build-nonprod-darwin:
     name: Build ${{ matrix.env }}/darwin/${{ matrix.goarch }}
@@ -514,6 +518,8 @@ jobs:
           name: nonprod-${{ matrix.env }}-darwin-${{ matrix.goarch }}
           path: dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}.dmg
           if-no-files-found: error
+          # Durable copy is the GitHub Release asset; short window vs ~7d default.
+          retention-days: 2
 
       # beta: hand off DMG + submission_id to the finalize job.
       # Artifact name is intentionally NOT prefixed with "nonprod-" so the
@@ -658,6 +664,8 @@ jobs:
           name: nonprod-beta-darwin-${{ matrix.goarch }}
           path: dist/aiexpedite-terminal-beta-darwin-${{ matrix.goarch }}.dmg
           if-no-files-found: error
+          # Durable copy is the GitHub Release asset; short window vs ~7d default.
+          retention-days: 2
 
   build-nonprod-linux:
     name: Build ${{ matrix.env }}/linux/amd64
@@ -771,6 +779,8 @@ jobs:
           name: nonprod-${{ matrix.env }}-linux-amd64
           path: dist/aiexpedite-terminal${{ matrix.exe_suffix }}-linux-amd64.AppImage
           if-no-files-found: error
+          # Durable copy is the GitHub Release asset; short window vs ~7d default.
+          retention-days: 2
 
   ###############################################################################
   # Create non-prod release (pre-release, hidden from main downloads)
