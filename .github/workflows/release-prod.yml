@@ -212,6 +212,10 @@ jobs:
             dist/aiexpedite-terminal-windows-amd64.exe
             dist/AIExpediteTerminal-Setup.exe
           if-no-files-found: error
+          # Consumed by the release job in this same run; the durable copy is the
+          # GitHub Release asset. Short window instead of the ~7d default to keep
+          # Actions storage down.
+          retention-days: 2
 
   build-prod-darwin:
     name: Build prod/darwin/${{ matrix.goarch }}
@@ -588,6 +592,8 @@ jobs:
           name: prod-darwin-${{ matrix.goarch }}
           path: dist/aiexpedite-terminal-darwin-${{ matrix.goarch }}.dmg
           if-no-files-found: error
+          # Durable copy is the GitHub Release asset; short window vs ~7d default.
+          retention-days: 2
 
   build-prod-linux:
     name: Build prod/linux/amd64
@@ -688,6 +694,8 @@ jobs:
           name: prod-linux-amd64
           path: dist/aiexpedite-terminal-linux-amd64.AppImage
           if-no-files-found: error
+          # Durable copy is the GitHub Release asset; short window vs ~7d default.
+          retention-days: 2
 
   ###############################################################################
   # Create production release (public, shown to users)
