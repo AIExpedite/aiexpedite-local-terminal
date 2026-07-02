@@ -82,9 +82,37 @@ type CLISession struct {
 	// pipe is closed so a second SendInput doesn't double-close.
 	deferredStdinClose bool
 
+	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
+	// a claude session emits its first genuine assistant output — a stream-json
+	// text/thinking delta or a tool_use. The claude no-output watchdog
+	// (watchClaudeFirstFrame) blocks on it to tell a healthy (if slow) session
+	// apart from one that launched, emitted only its `system/init`, and then
+	// stalled — the signature of a Claude Code that is not signed in on the
+	// terminal computer. Created for every session; only claude arms the
+	// watchdog and only claude signals it.
+	firstRealFrame     chan struct{}
+	firstRealFrameOnce sync.Once
+
 	mu         sync.Mutex
 	done       chan struct{} // closed when process exits
 	streamDone chan struct{} // closed when stdout/stderr and stream publishes finish
+}
+
+// claudeFirstFrameTimeout bounds how long a freshly-started claude session may
+// go without producing any real assistant output before the watchdog assumes
+// it is not signed in (or wedged at startup) and kills it. Generous on purpose:
+// a healthy claude streams a thinking/text delta well inside this window even
+// on a large repo, so the only sessions this catches are ones that emit nothing
+// but their `system/init`. Mirrors the grok ACP first-frame watchdog.
+const claudeFirstFrameTimeout = 120 * time.Second
+
+// signalFirstRealFrame marks that this session has produced genuine assistant
+// output, disarming the no-output watchdog. Idempotent and nil-safe.
+func (s *CLISession) signalFirstRealFrame() {
+	if s.firstRealFrame == nil {
+		return
+	}
+	s.firstRealFrameOnce.Do(func() { close(s.firstRealFrame) })
 }
 
 /* --------------------------------------------------------------------------
@@ -212,6 +240,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
 		deferredStdinClose: stdinPromptFormat(command) == "plain" && stdinPrompt == "",
+		firstRealFrame:     make(chan struct{}),
 		done:               make(chan struct{}),
 		streamDone:         make(chan struct{}),
 	}
@@ -226,6 +255,16 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	// Start output reader goroutines
 	go sm.readOutputStream(session, publishFn)
+
+	// Claude no-output watchdog. A Claude Code that is not signed in on this
+	// computer launches, emits its system/init, then stalls — without this the
+	// session sits until the 6h stale GC and the design step completes empty.
+	// Fail fast with an actionable message. Only claude needs it: other CLIs
+	// fail loudly on stdin EOF (codex/gemini) or have their own watchdog (grok
+	// ACP). Armed here after start; disarms on the first real assistant frame.
+	if isClaudeCommand(command) {
+		go sm.watchClaudeFirstFrame(session, publishFn, claudeFirstFrameTimeout)
+	}
 
 	// Start process waiter (detects exit)
 	go sm.waitForExit(session, publishFn)
@@ -827,6 +866,42 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 						colorYellow, session.ID,
 						time.UnixMilli(rejected.ResetsAtMs).UTC().Format(time.RFC3339), colorReset)
 				}
+
+				// Fail fast when Claude Code reports it cannot authenticate. The
+				// driver strips env-based credentials for claude to force the
+				// user's `/login` subscription, so an expired/absent login here
+				// surfaces as an api_retry(authentication_failed) or a
+				// result(is_error) "…/login" message and the session would
+				// otherwise idle until the 6h stale GC and complete empty. Publish
+				// an actionable error and kill the child so waitForExit emits the
+				// ended frame. Seq is reserved before Kill so error orders before
+				// ended. Mirrors the grok "not signed in" fail-fast.
+				if authFail := detectClaudeAuthFailure(line.text); authFail != nil {
+					flushBatch()
+					seq := atomic.AddInt64(&session.Seq, 1)
+					asyncPublish(resultMsg{
+						ID:          session.ID,
+						WorkspaceID: session.WorkspaceID,
+						UID:         session.UID,
+						Output: fmt.Sprintf(
+							"claude is not signed in / not authorized on this computer (%s) — run `claude` then "+
+								"`/login` in a terminal on the terminal computer to sign in again. Session terminated.",
+							authFail.Category,
+						),
+						Status:    "error",
+						Ts:        time.Now().UnixMilli(),
+						Version:   Version,
+						Type:      "stream",
+						SessionID: session.ID,
+						Seq:       int(seq),
+					})
+					fmt.Printf("%s[session] Claude auth failure (%s) — %s terminated%s\n",
+						colorRed, authFail.Category, session.ID, colorReset)
+					if session.Process != nil && session.Process.Process != nil {
+						_ = session.Process.Process.Kill()
+					}
+					continue
+				}
 			}
 
 			// Detect CLI-terminal events (Claude "result", Codex
@@ -910,6 +985,17 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				displayText := extractDisplayText(session.Command, line.text)
 				if displayText != "" {
 					batch = append(batch, displayText)
+					// Genuine assistant output (text/thinking delta or tool_use)
+					// — the session is alive and producing, so disarm the claude
+					// no-output watchdog. No-op for non-claude sessions (they
+					// never arm it). Deliberately NOT signalled from init/system,
+					// prompt-detection, or result events: those can fire for a
+					// stalled/errored claude, and the parser swallows result
+					// events, so only real streamed content is a reliable
+					// "claude is working" signal.
+					if isClaudeCommand(session.Command) {
+						session.signalFirstRealFrame()
+					}
 				}
 			}
 
@@ -917,6 +1003,71 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			flushBatch()
 		}
 	}
+}
+
+// watchClaudeFirstFrame fails a claude session fast when it produces no genuine
+// assistant output within `timeout` of starting. This is the "launched but not
+// signed in / wedged at startup" case: the child emits its system/init and then
+// nothing, so without this watchdog the session hangs until the 6h stale GC and
+// the design step completes empty. Mirrors the grok ACP first-frame watchdog.
+//
+// It returns early when the session proves itself healthy (firstRealFrame) or
+// has already exited (done — waitForExit owns the ended frame). `timeout` is a
+// parameter so unit tests can drive the fail-fast path with a sub-second budget.
+//
+// Seq is reserved (atomic increment) BEFORE Kill and the error published AFTER,
+// so the error frame is strictly ordered before the session_ended frame that
+// waitForExit allocates once the killed child is reaped — the orchestrator
+// therefore sees error → ended.
+func (sm *SessionManager) watchClaudeFirstFrame(session *CLISession, publishFn PublishFunc, timeout time.Duration) {
+	select {
+	case <-session.firstRealFrame:
+		return
+	case <-session.done:
+		return
+	case <-time.After(timeout):
+	}
+
+	// Lost the race against a frame/exit that landed as the timer fired?
+	// Re-check both non-blockingly so we never kill a session that just proved
+	// itself alive (or already terminated on its own).
+	select {
+	case <-session.firstRealFrame:
+		return
+	case <-session.done:
+		return
+	default:
+	}
+	session.mu.Lock()
+	ended := session.Status == "ended"
+	session.mu.Unlock()
+	if ended {
+		return
+	}
+
+	seq := atomic.AddInt64(&session.Seq, 1)
+	fmt.Printf("%s[session] Claude produced no output within %v — assuming not signed in / startup stall, killing %s%s\n",
+		colorYellow, timeout, session.ID, colorReset)
+	if session.Process != nil && session.Process.Process != nil {
+		_ = session.Process.Process.Kill()
+	}
+	publishFn(resultMsg{
+		ID:          session.ID,
+		WorkspaceID: session.WorkspaceID,
+		UID:         session.UID,
+		Output: fmt.Sprintf(
+			"claude produced no output within %v of starting — it is most likely not signed in on this computer "+
+				"(run `claude` then `/login` in a terminal on the terminal computer to sign in again) or wedged at "+
+				"startup. Session terminated.",
+			timeout,
+		),
+		Status:    "error",
+		Ts:        time.Now().UnixMilli(),
+		Version:   Version,
+		Type:      "stream",
+		SessionID: session.ID,
+		Seq:       int(seq),
+	})
 }
 
 // waitForExit waits for the session's process to exit and publishes a
