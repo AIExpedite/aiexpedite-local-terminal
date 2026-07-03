@@ -352,6 +352,37 @@ func TestWatchClaudeFirstFrame_PublishesBeforeKill(t *testing.T) {
 	}
 }
 
+// TestIsClaudeStructuredStreamLine pins the guard that keeps the no-output
+// watchdog armed for passthrough text. extractDisplayText returns non-JSON /
+// malformed-JSON lines verbatim, so without this gate a not-signed-in claude
+// that prints a plain login/banner line would falsely disarm the fail-fast
+// and the session would hang until stale GC.
+func TestIsClaudeStructuredStreamLine(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"assistant text delta", `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}`, true},
+		{"flat assistant event", `{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}`, true},
+		{"system init event", `{"type":"system","subtype":"init","session_id":"abc"}`, true},
+		{"plain stderr banner", "Not logged in. Please run /login", false},
+		{"login banner with braces mid-line", "error: bad {config}", false},
+		{"malformed json", `{"type":"assistant","message":`, false},
+		{"json without type field", `{"foo":"bar"}`, false},
+		{"empty line", "", false},
+		{"whitespace only", "   \t  ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isClaudeStructuredStreamLine(tc.line)
+			if got != tc.want {
+				t.Fatalf("isClaudeStructuredStreamLine(%q) = %v, want %v", tc.line, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestArmClaudeFirstFrameWatchdog_NoopForNonClaude ensures the arm helper is
 // safely a no-op for codex/gemini/grok — only claude has the not-signed-in
 // stall signature this watchdog targets.

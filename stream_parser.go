@@ -19,6 +19,26 @@ import (
 	"strings"
 )
 
+// isClaudeStructuredStreamLine reports whether a line came from Claude's
+// --output-format stream-json output (a JSON object with a `type` field) as
+// opposed to a passthrough plain-text/stderr line. The claude no-output
+// watchdog uses this to distinguish real assistant content from a stalled
+// login banner: extractDisplayText echoes non-JSON and malformed-JSON lines
+// verbatim, so a not-signed-in claude that prints a plain banner and hangs
+// would otherwise disarm the fail-fast on passthrough text.
+func isClaudeStructuredStreamLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return false
+	}
+	_, ok := raw["type"].(string)
+	return ok
+}
+
 // extractDisplayText parses a single stdout line from a CLI agent and returns
 // the human-readable text to display. Returns empty string if the line should
 // be skipped (internal events, metadata, etc.).

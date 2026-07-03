@@ -1022,7 +1022,13 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					// claude and the parser swallows result events. Prompt
 					// detection (permission_request/input_request) also disarms
 					// the watchdog — see the sibling branch above.
-					if isClaudeCommand(session.Command) {
+					//
+					// Gate on isClaudeStructuredStreamLine so a not-signed-in
+					// claude that prints a plain stderr/login banner (which
+					// extractDisplayText passes through verbatim) does NOT
+					// disarm the fail-fast watchdog — otherwise a stalled
+					// session with a banner would hang until stale GC.
+					if isClaudeCommand(session.Command) && isClaudeStructuredStreamLine(line.text) {
 						session.signalFirstRealFrame()
 					}
 				}
