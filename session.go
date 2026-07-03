@@ -981,6 +981,15 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				})
 				fmt.Printf("%s[session] Result event — turn complete, %s waiting_input%s\n",
 					colorGreen, session.ID, colorReset)
+
+				// A Claude result event means the turn reached terminal state —
+				// Claude ran through to completion (even an empty/non-auth
+				// is_error result still proves the child was responsive). Auth
+				// failures are caught upstream by detectClaudeAuthFailure, so
+				// anything reaching here is a healthy turn. Disarm the
+				// no-output watchdog so it doesn't later publish a misleading
+				// /login error and kill a session that already completed.
+				session.signalFirstRealFrame()
 			}
 
 			// Try to parse as JSON event for structured detection
