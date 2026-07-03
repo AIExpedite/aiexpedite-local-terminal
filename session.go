@@ -886,15 +886,20 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					fmt.Printf("%s[session] Claude rate limit rejected — %s resets %s%s\n",
 						colorYellow, session.ID,
 						time.UnixMilli(rejected.ResetsAtMs).UTC().Format(time.RFC3339), colorReset)
+				}
 
-					// A handled rate-limit rejection means Claude reached us and the
-					// orchestrator will auto-defer + resume — the session is not
-					// stalled at startup. extractDisplayText treats rate_limit_event
-					// as metadata so the sibling disarm below never fires, leaving
-					// the no-output watchdog armed to publish a misleading /login
-					// error 120s later and kill a correctly rate-limited turn.
-					// Disarm here so the fail-fast path stays scoped to genuine
-					// startup stalls.
+				// Any Claude rate_limit_event — allowed heartbeat OR handled
+				// rejection — proves Claude's stream reached us: it is signed
+				// in and emitting per-window telemetry. extractDisplayText
+				// treats rate_limit_event as metadata so the sibling disarm
+				// below never fires, leaving the no-output watchdog armed to
+				// publish a misleading /login error 120s later and kill a
+				// healthy (or correctly rate-limited) turn where the only
+				// early output was heartbeats. captureClaudeRateLimitLine
+				// only returns rejected buckets, so the allowed-heartbeat
+				// case needs its own detector. Disarm here so the fail-fast
+				// path stays scoped to genuine startup stalls.
+				if isClaudeRateLimitEventLine(line.text) {
 					session.signalFirstRealFrame()
 				}
 

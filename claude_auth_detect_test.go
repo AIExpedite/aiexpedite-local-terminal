@@ -383,6 +383,40 @@ func TestIsClaudeStructuredStreamLine(t *testing.T) {
 	}
 }
 
+// TestIsClaudeRateLimitEventLine pins the detector the no-output watchdog uses
+// to disarm on any Claude rate_limit_event frame (allowed heartbeat OR handled
+// rejection). extractDisplayText treats rate_limit_event as metadata, so without
+// this signal a slow first turn whose only early output is heartbeats would be
+// killed after 120s with a misleading /login error. Passthrough text and other
+// structured frames must NOT match — the fail-fast has to stay scoped to
+// genuine startup stalls.
+func TestIsClaudeRateLimitEventLine(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"allowed heartbeat snake_case", `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","utilization":0.42,"resets_at":"2026-07-02T20:00:00Z"}}`, true},
+		{"allowed heartbeat camelCase", `{"type":"rate_limit_event","rateLimitInfo":{"status":"allowed","rateLimitType":"five_hour","resetsAt":"2026-07-02T20:00:00Z"}}`, true},
+		{"rejected event", `{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rate_limit_type":"five_hour","resets_at":"2026-07-02T20:00:00Z"}}`, true},
+		{"windowless rejected event", `{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resets_at":"2026-07-02T20:00:00Z"}}`, true},
+		{"assistant text delta is not a rate_limit_event", `{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}`, false},
+		{"system init is not a rate_limit_event", `{"type":"system","subtype":"init","session_id":"abc"}`, false},
+		{"prose mentioning rate_limit_event but wrong type", `{"type":"assistant","message":{"content":[{"type":"text","text":"rate_limit_event"}]}}`, false},
+		{"plain stderr banner", "Not logged in. Please run /login", false},
+		{"malformed json", `{"type":"rate_limit_event"`, false},
+		{"empty line", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isClaudeRateLimitEventLine(tc.line)
+			if got != tc.want {
+				t.Fatalf("isClaudeRateLimitEventLine(%q) = %v, want %v", tc.line, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestArmClaudeFirstFrameWatchdog_NoopForNonClaude ensures the arm helper is
 // safely a no-op for codex/gemini/grok — only claude has the not-signed-in
 // stall signature this watchdog targets.
