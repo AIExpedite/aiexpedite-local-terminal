@@ -886,6 +886,16 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					fmt.Printf("%s[session] Claude rate limit rejected — %s resets %s%s\n",
 						colorYellow, session.ID,
 						time.UnixMilli(rejected.ResetsAtMs).UTC().Format(time.RFC3339), colorReset)
+
+					// A handled rate-limit rejection means Claude reached us and the
+					// orchestrator will auto-defer + resume — the session is not
+					// stalled at startup. extractDisplayText treats rate_limit_event
+					// as metadata so the sibling disarm below never fires, leaving
+					// the no-output watchdog armed to publish a misleading /login
+					// error 120s later and kill a correctly rate-limited turn.
+					// Disarm here so the fail-fast path stays scoped to genuine
+					// startup stalls.
+					session.signalFirstRealFrame()
 				}
 
 				// Fail fast when Claude Code reports it cannot authenticate. The
