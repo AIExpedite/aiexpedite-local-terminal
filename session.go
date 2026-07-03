@@ -93,6 +93,18 @@ type CLISession struct {
 	firstRealFrame     chan struct{}
 	firstRealFrameOnce sync.Once
 
+	// claudeWatchdogOnce guards the no-output watchdog goroutine so it is armed
+	// at most once per claude session. The arm point is deferred to the moment
+	// a prompt is actually delivered to claude (StartSession's initial stdin
+	// write, or the first SendInput on a session opened without an initial
+	// prompt) — arming at process start would kill the supported no-initial-
+	// prompt flow (chat-direct/session.sendInput) where claude legitimately
+	// sits idle until the first SendInput lands.
+	claudeWatchdogOnce sync.Once
+	// publishFn is captured at StartSession so deferred arming from SendInput
+	// can publish the fail-fast error frame without threading it through.
+	publishFn PublishFunc
+
 	mu         sync.Mutex
 	done       chan struct{} // closed when process exits
 	streamDone chan struct{} // closed when stdout/stderr and stream publishes finish
@@ -243,6 +255,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		firstRealFrame:     make(chan struct{}),
 		done:               make(chan struct{}),
 		streamDone:         make(chan struct{}),
+		publishFn:          publishFn,
 	}
 
 	sm.sessions[id] = session
@@ -256,15 +269,12 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// Start output reader goroutines
 	go sm.readOutputStream(session, publishFn)
 
-	// Claude no-output watchdog. A Claude Code that is not signed in on this
-	// computer launches, emits its system/init, then stalls — without this the
-	// session sits until the 6h stale GC and the design step completes empty.
-	// Fail fast with an actionable message. Only claude needs it: other CLIs
-	// fail loudly on stdin EOF (codex/gemini) or have their own watchdog (grok
-	// ACP). Armed here after start; disarms on the first real assistant frame.
-	if isClaudeCommand(command) {
-		go sm.watchClaudeFirstFrame(session, publishFn, claudeFirstFrameTimeout)
-	}
+	// Claude no-output watchdog is armed lazily: only once a prompt has actually
+	// been delivered to claude. See armClaudeFirstFrameWatchdog — arming at
+	// process start would incorrectly kill the supported no-initial-prompt
+	// flow (chat-direct/session.sendInput) where claude sits idle until the
+	// first SendInput. StartSession arms it below when it writes the initial
+	// prompt; SendInput arms it on the first send otherwise.
 
 	// Start process waiter (detects exit)
 	go sm.waitForExit(session, publishFn)
@@ -310,6 +320,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		} else {
 			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars, format=%s)%s\n",
 				colorGreen, id, len(stdinPrompt), stdinPromptFormat(command), colorReset)
+			// Prompt delivered — arm the claude no-output watchdog now.
+			sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
 		}
 	}
 
@@ -386,6 +398,15 @@ func (sm *SessionManager) SendInput(id, text string) error {
 	if session.Status == "waiting_input" {
 		session.Status = "running"
 	}
+
+	// Arm the claude no-output watchdog on the first prompt delivered via
+	// SendInput. For sessions that started with an initial argv/stdin prompt
+	// this is a no-op (sync.Once already fired in StartSession); for the
+	// no-initial-prompt flow this is where the watchdog first arms — we now
+	// have a prompt outstanding, so a subsequent stall means the same
+	// "launched but not signed in" failure StartSession's arm would have
+	// caught.
+	sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
 
 	fmt.Printf("%s[session] Input sent to %s: %s%s\n",
 		colorBlue, id, truncateString(text, 80), colorReset)
@@ -1003,6 +1024,20 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			flushBatch()
 		}
 	}
+}
+
+// armClaudeFirstFrameWatchdog starts the no-output watchdog exactly once per
+// claude session, on the first call. Called from StartSession right after the
+// initial prompt is written, and from SendInput on the first user message when
+// the session was opened without an initial prompt (chat-direct flow). No-op
+// for non-claude sessions and when publishFn was not captured.
+func (sm *SessionManager) armClaudeFirstFrameWatchdog(session *CLISession, timeout time.Duration) {
+	if session == nil || !isClaudeCommand(session.Command) || session.publishFn == nil {
+		return
+	}
+	session.claudeWatchdogOnce.Do(func() {
+		go sm.watchClaudeFirstFrame(session, session.publishFn, timeout)
+	})
 }
 
 // watchClaudeFirstFrame fails a claude session fast when it produces no genuine

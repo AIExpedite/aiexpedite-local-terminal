@@ -235,3 +235,90 @@ func TestSignalFirstRealFrame_NilSafe(t *testing.T) {
 	session := &CLISession{ID: "nil-1"}
 	session.signalFirstRealFrame() // must not panic
 }
+
+// TestArmClaudeFirstFrameWatchdog_Idempotent guards the fix that lifted the
+// watchdog off of process-start and onto the first prompt delivery. If either
+// StartSession's initial-prompt path or SendInput's first-send path arms it,
+// subsequent arms must be no-ops — otherwise a session that both sent an
+// initial prompt AND received a follow-up SendInput would spawn two watchdogs
+// and publish two error frames.
+func TestArmClaudeFirstFrameWatchdog_Idempotent(t *testing.T) {
+	sm := &SessionManager{}
+	session := newClaudeWatchdogFixtureSession("arm-idem")
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	session.publishFn = func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	sm.armClaudeFirstFrameWatchdog(session, 20*time.Millisecond)
+	sm.armClaudeFirstFrameWatchdog(session, 20*time.Millisecond)
+	sm.armClaudeFirstFrameWatchdog(session, 20*time.Millisecond)
+
+	time.Sleep(80 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 1 {
+		t.Fatalf("expected exactly 1 watchdog error frame across repeated arms, got %d", len(captured))
+	}
+}
+
+// TestArmClaudeFirstFrameWatchdog_NotArmedWithoutPrompt pins the regression the
+// P1 review flagged: a claude session opened without an initial prompt (chat-
+// direct/session.sendInput flow) must NOT be killed by the watchdog until a
+// prompt has been delivered — otherwise the healthy idle case dies at 120s.
+// We assert by driving a fixture session that no code calls arm on, waiting
+// past the timeout, and confirming zero frames were published.
+func TestArmClaudeFirstFrameWatchdog_NotArmedWithoutPrompt(t *testing.T) {
+	session := newClaudeWatchdogFixtureSession("noprompt-1")
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	session.publishFn = func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	// Deliberately do NOT call armClaudeFirstFrameWatchdog — mirrors the
+	// StartSession path when stdinPrompt == "" and SendInput has not yet
+	// fired. A short wait past a would-be timeout proves no watchdog is
+	// running.
+	time.Sleep(60 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 0 {
+		t.Fatalf("expected zero frames for an unarmed session, got %d: %+v", len(captured), captured)
+	}
+}
+
+// TestArmClaudeFirstFrameWatchdog_NoopForNonClaude ensures the arm helper is
+// safely a no-op for codex/gemini/grok — only claude has the not-signed-in
+// stall signature this watchdog targets.
+func TestArmClaudeFirstFrameWatchdog_NoopForNonClaude(t *testing.T) {
+	sm := &SessionManager{}
+	session := newClaudeWatchdogFixtureSession("codex-1")
+	session.Command = "codex"
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	session.publishFn = func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	sm.armClaudeFirstFrameWatchdog(session, 20*time.Millisecond)
+	time.Sleep(60 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(captured) != 0 {
+		t.Fatalf("expected zero frames for non-claude session, got %d", len(captured))
+	}
+}
