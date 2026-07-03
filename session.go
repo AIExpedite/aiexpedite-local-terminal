@@ -1058,10 +1058,14 @@ func (sm *SessionManager) armClaudeFirstFrameWatchdog(session *CLISession, timeo
 // has already exited (done — waitForExit owns the ended frame). `timeout` is a
 // parameter so unit tests can drive the fail-fast path with a sub-second budget.
 //
-// Seq is reserved (atomic increment) BEFORE Kill and the error published AFTER,
-// so the error frame is strictly ordered before the session_ended frame that
-// waitForExit allocates once the killed child is reaped — the orchestrator
-// therefore sees error → ended.
+// The error is PUBLISHED before Kill so this frame lands on publishFn strictly
+// before waitForExit's session_ended: Kill unblocks Process.Wait(), and only
+// after Wait returns does waitForExit publish session_ended. Because publishFn
+// here is a synchronous call outside readOutputStream's publishWg, publishing
+// after Kill would race — a slow publish could arrive after session_ended,
+// violating the session_integration_test.go invariant that nothing is
+// published after session_ended. Seq is still reserved before publish so the
+// orchestrator can also order by Seq.
 func (sm *SessionManager) watchClaudeFirstFrame(session *CLISession, publishFn PublishFunc, timeout time.Duration) {
 	select {
 	case <-session.firstRealFrame:
@@ -1091,9 +1095,6 @@ func (sm *SessionManager) watchClaudeFirstFrame(session *CLISession, publishFn P
 	seq := atomic.AddInt64(&session.Seq, 1)
 	fmt.Printf("%s[session] Claude produced no output within %v — assuming not signed in / startup stall, killing %s%s\n",
 		colorYellow, timeout, session.ID, colorReset)
-	if session.Process != nil && session.Process.Process != nil {
-		_ = session.Process.Process.Kill()
-	}
 	publishFn(resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
@@ -1111,6 +1112,9 @@ func (sm *SessionManager) watchClaudeFirstFrame(session *CLISession, publishFn P
 		SessionID: session.ID,
 		Seq:       int(seq),
 	})
+	if session.Process != nil && session.Process.Process != nil {
+		_ = session.Process.Process.Kill()
+	}
 }
 
 // waitForExit waits for the session's process to exit and publishes a

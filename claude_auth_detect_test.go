@@ -1,8 +1,11 @@
 package main
 
 import (
+	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -294,6 +297,58 @@ func TestArmClaudeFirstFrameWatchdog_NotArmedWithoutPrompt(t *testing.T) {
 	defer mu.Unlock()
 	if len(captured) != 0 {
 		t.Fatalf("expected zero frames for an unarmed session, got %d: %+v", len(captured), captured)
+	}
+}
+
+// TestWatchClaudeFirstFrame_PublishesBeforeKill pins the ordering fix from
+// Codex review 4621910220: the watchdog error frame must reach publishFn
+// BEFORE the child is killed, so a slow publish cannot race with the
+// session_ended frame that waitForExit publishes once Kill unblocks
+// Process.Wait(). The invariant (nothing published after session_ended) is
+// enforced by session_integration_test.go's assertLifecycleOrdering.
+//
+// We prove ordering by spawning a real long-sleep child, then having
+// publishFn probe `session.Process.Process.Signal(syscall.Signal(0))` — on
+// unix that returns nil while the process is alive and errors once the
+// kernel has reaped a killed child. If publish precedes Kill, the probe sees
+// a live process. Skipped on Windows: syscall.Signal(0) has no equivalent
+// there, and this is a race the current callsite exhibits the same on both.
+func TestWatchClaudeFirstFrame_PublishesBeforeKill(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("signal(0) liveness probe is unix-only; ordering fix is identical on windows")
+	}
+
+	sm := &SessionManager{}
+	session := newClaudeWatchdogFixtureSession("order-1")
+
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start sleep child: %v", err)
+	}
+	session.Process = cmd
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+
+	var mu sync.Mutex
+	var aliveAtPublish bool
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		// Signal 0 asks the kernel whether the target still exists; nil means
+		// the process is alive (Kill has not yet run, or has not yet been
+		// scheduled). A non-nil error would mean the child was already killed
+		// and reaped before publish — the bug the fix guards against.
+		aliveAtPublish = cmd.Process.Signal(syscall.Signal(0)) == nil
+	}
+
+	sm.watchClaudeFirstFrame(session, publishFn, 30*time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !aliveAtPublish {
+		t.Fatalf("expected child to still be alive when publishFn is called (publish must precede Kill)")
 	}
 }
 
