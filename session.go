@@ -1002,6 +1002,14 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 
 				fmt.Printf("%s[session] Prompt detected in %s: %s%s\n",
 					colorMagenta, session.ID, truncateString(promptInfo.Text, 80), colorReset)
+
+				// A claude permission/input prompt means the session is healthy
+				// and blocked on the user — not stalled. Disarm the no-output
+				// watchdog so it doesn't kill a session that's legitimately
+				// waiting on a response with a misleading sign-in error.
+				if isClaudeCommand(session.Command) {
+					session.signalFirstRealFrame()
+				}
 			} else {
 				displayText := extractDisplayText(session.Command, line.text)
 				if displayText != "" {
@@ -1009,11 +1017,11 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					// Genuine assistant output (text/thinking delta or tool_use)
 					// — the session is alive and producing, so disarm the claude
 					// no-output watchdog. No-op for non-claude sessions (they
-					// never arm it). Deliberately NOT signalled from init/system,
-					// prompt-detection, or result events: those can fire for a
-					// stalled/errored claude, and the parser swallows result
-					// events, so only real streamed content is a reliable
-					// "claude is working" signal.
+					// never arm it). Deliberately NOT signalled from init/system
+					// or result events: those can fire for a stalled/errored
+					// claude and the parser swallows result events. Prompt
+					// detection (permission_request/input_request) also disarms
+					// the watchdog — see the sibling branch above.
 					if isClaudeCommand(session.Command) {
 						session.signalFirstRealFrame()
 					}
