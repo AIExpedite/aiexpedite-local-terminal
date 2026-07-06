@@ -638,28 +638,43 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 }
 
 func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishFn PublishFunc) {
-	err := session.Process.Wait()
+	// Reap via os.Process.Wait, NOT exec.Cmd.Wait. StdoutPipe docs: "it is
+	// incorrect to call Wait before all reads from the pipe have completed" —
+	// Cmd.Wait closes the parent ends of StdoutPipe/StderrPipe the moment the
+	// child exits, which can truncate the final stream-json frame still
+	// buffered in the scanner. When claude writes a terminal `result` frame
+	// and exits immediately after (auth failure, end-of-turn flush), losing
+	// that frame corrupts the transcript. Split exit detection (Process.Wait)
+	// from pipe cleanup (Close below, gated on streamDone) — same pattern as
+	// the Grok ACP manager.
+	state, _ := session.Process.Process.Wait()
 
-	session.Stdout.Close()
-	session.Stderr.Close()
-
-	// Wait for readStream to finish draining every queued publish so
-	// claude_native_ended is strictly the last frame with the highest Seq.
+	// Drain the scanner goroutines BEFORE closing pipes so they see EOF
+	// naturally on the OS pipe buffer, including the final frame. The child's
+	// write ends are already closed (Process.Wait only returns post-exit); a
+	// wedged scanner falls through to the drain timeout + force-close.
 	select {
 	case <-session.streamDone:
 	case <-time.After(claudeNativeStreamDrainTimeout):
-		fmt.Printf("%s[claude-native] Stream drain timed out for %s%s\n",
+		fmt.Printf("%s[claude-native] Stream drain timed out for %s — forcing pipe close%s\n",
 			colorYellow, session.ID, colorReset)
+		session.Stdout.Close()
+		session.Stderr.Close()
 	}
+
+	// Close parent pipe ends. Cmd.Wait would do this for us; since we
+	// bypassed it above we mop up ourselves. Close-after-Close is documented
+	// as returning ErrClosed without side effects; closeStdin is sync.Once.
+	session.closeStdin()
+	session.Stdout.Close()
+	session.Stderr.Close()
 
 	session.mu.Lock()
 	session.status = "ended"
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			session.exitCode = exitErr.ExitCode()
-		} else {
-			session.exitCode = -1
-		}
+	if state != nil {
+		session.exitCode = state.ExitCode()
+	} else {
+		session.exitCode = -1
 	}
 	exit := session.exitCode
 	session.mu.Unlock()
