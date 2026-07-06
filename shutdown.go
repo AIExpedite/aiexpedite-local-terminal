@@ -129,6 +129,12 @@ func tearDownSubprocesses() {
 		globalGrokACPManager.ShutdownAll()
 	}
 
+	// Same rationale for the Claude native manager — stream-json children keep
+	// drawing on the interactive Claude allowance until ended.
+	if globalClaudeNativeManager != nil {
+		globalClaudeNativeManager.ShutdownAll()
+	}
+
 	// Cleanup GCS storage client (closes idle HTTP/2 streams cleanly).
 	CloseStorageClient()
 
