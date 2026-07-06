@@ -350,6 +350,56 @@ func TestClaudeNativeLifecycle_OversizeFrameTerminatesSession(t *testing.T) {
 	_ = m.End(id)
 }
 
+// A hard-quota rejection surfaced by captureClaudeRateLimitLine must be
+// republished as a dedicated `claude_native_ratelimit` frame whose Output
+// carries formatClaudeLimitLine. The legacy Claude session path emits this so
+// agent-orchestrator-service's detectRateLimit can defer + auto-resume at the
+// reset instant; without it native sessions that hit Claude limits finish/fail
+// instead of being rescheduled.
+func TestClaudeNativeLifecycle_SurfacesRejectedRateLimit(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	// Isolate the rate-limit cache so the mock's rejected event doesn't pollute
+	// this user's real snapshot.
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	tmpDir := installMockClaude(t, "claude-native-ratelimit")
+
+	m := NewClaudeNativeManager()
+	id := fmt.Sprintf("claude-ratelimit-%d", time.Now().UnixNano())
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}
+
+	if err := m.Start(id, tmpDir, nil, "trigger", "ws", "uid", publishFn, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.End(id) })
+
+	deadline := time.Now().Add(15 * time.Second)
+	sawLimit := false
+	for time.Now().Before(deadline) && !sawLimit {
+		mu.Lock()
+		for _, msg := range captured {
+			if msg.Type == "claude_native_ratelimit" &&
+				strings.Contains(msg.Output, "usage limit") &&
+				strings.Contains(msg.Output, "resets at") {
+				sawLimit = true
+				break
+			}
+		}
+		mu.Unlock()
+		time.Sleep(30 * time.Millisecond)
+	}
+	if !sawLimit {
+		t.Fatalf("expected a claude_native_ratelimit frame carrying formatClaudeLimitLine text")
+	}
+}
+
 func TestClaudeNativeLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	skipIfUnsupportedOS(t)
 	// Point PATH at an empty dir so resolveExecutable("claude") can't find it.

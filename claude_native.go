@@ -596,7 +596,32 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 			}
 			// Passive utilization capture (side-effect only; does not alter
 			// framing) so cliagent_usage_claudecode.go can read rate limits.
-			captureClaudeRateLimitLine(trimmed, time.Now())
+			// When the parse yields a hard-quota rejection, mirror session.go
+			// and publish formatClaudeLimitLine as a dedicated frame — the
+			// legacy path emits this so agent-orchestrator-service's
+			// detectRateLimit can defer the execution and auto-resume at the
+			// reset instant. Without this frame native sessions that hit
+			// Claude limits finish/fail instead of being rescheduled.
+			if rejected := captureClaudeRateLimitLine(trimmed, time.Now()); rejected != nil {
+				limitSeq := atomic.AddInt64(&session.seq, 1)
+				if !publishOrFail(resultMsg{
+					ID:          session.ID,
+					WorkspaceID: session.WorkspaceID,
+					UID:         session.UID,
+					Output:      formatClaudeLimitLine(*rejected),
+					Status:      "success",
+					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
+					Type:        "claude_native_ratelimit",
+					SessionID:   session.ID,
+					Seq:         int(limitSeq),
+				}, "claude_native_ratelimit") {
+					return
+				}
+				fmt.Printf("%s[claude-native] rate limit rejected for %s — resets %s%s\n",
+					colorYellow, session.ID,
+					time.UnixMilli(rejected.ResetsAtMs).UTC().Format(time.RFC3339), colorReset)
+			}
 			if !publishOrFail(resultMsg{
 				ID:          session.ID,
 				WorkspaceID: session.WorkspaceID,
