@@ -271,11 +271,35 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 	}
 
 	// Deliver the first user turn (if any) after the readers are wired so we
-	// never miss Claude's response frames.
+	// never miss Claude's response frames. A failure here means the session
+	// never actually got the user's first message — publish a typed error
+	// frame (waitForExit still emits claude_native_ended once the child
+	// exits) so the consumer sees the failure instead of a silent empty chat.
 	if prompt != "" {
 		if err := m.writeUserTurn(session, prompt); err != nil {
 			fmt.Printf("%s[claude-native] Failed to send initial prompt to %s: %v%s\n",
 				colorRed, id, err, colorReset)
+			seq := atomic.AddInt64(&session.seq, 1)
+			publishFn(resultMsg{
+				ID:          session.ID,
+				WorkspaceID: session.WorkspaceID,
+				UID:         session.UID,
+				Output:      fmt.Sprintf("failed to deliver initial prompt: %v", err),
+				Status:      "error",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        "claude_native_error",
+				SessionID:   session.ID,
+				Seq:         int(seq),
+			})
+			if session.Status() != "ended" {
+				session.mu.Lock()
+				session.status = "ended"
+				session.mu.Unlock()
+				if session.Process != nil && session.Process.Process != nil {
+					_ = session.Process.Process.Kill()
+				}
+			}
 		} else {
 			fmt.Printf("%s[claude-native] Sent initial prompt to %s (%d chars)%s\n",
 				colorGreen, id, len(prompt), colorReset)
