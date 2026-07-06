@@ -260,15 +260,18 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 		globalProcessRegistry.Register(proc.Process.Pid, "claude-native:"+id)
 	}
 
-	go m.readStream(session, publishFn)
-	go m.waitForExit(session, publishFn)
-
-	// Fire the started ack BEFORE writing the initial prompt so consumers see
-	// `claude_native_started` ahead of any `claude_native_message` frames the
-	// readers may publish in response to that prompt.
+	// Fire the started ack BEFORE spawning the stdout/stderr reader goroutines
+	// so `claude_native_started` is published ahead of any
+	// `claude_native_message`/`claude_native_stderr` frames — even if Claude
+	// emits early startup output (auth error, diagnostic) before we get to
+	// writing the initial prompt. The OS pipe buffer holds any early bytes
+	// until the readers below drain them, so no frame is lost.
 	if onStarted != nil {
 		onStarted()
 	}
+
+	go m.readStream(session, publishFn)
+	go m.waitForExit(session, publishFn)
 
 	// Deliver the first user turn (if any) after the readers are wired so we
 	// never miss Claude's response frames. A failure here means the session
