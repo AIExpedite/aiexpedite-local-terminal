@@ -3023,6 +3023,24 @@ func handleClaudeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd
 		fmt.Printf("%s[claude-native] Starting session %s (workspace=%s)%s\n",
 			colorCyan, cmd.SessionID, cmd.WorkspaceID, colorReset)
 
+		// Fire the started ack from inside Start (after readers are wired but
+		// before the initial prompt is written) so the ack is guaranteed to
+		// precede any claude_native_message frames — consumers that initialize
+		// state on the started frame rely on that ordering.
+		onStarted := func() {
+			publishFn(resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				Output:      "Claude native started",
+				Status:      "success",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        "claude_native_started",
+				SessionID:   cmd.SessionID,
+			})
+		}
+
 		err := globalClaudeNativeManager.Start(
 			cmd.SessionID,
 			cmd.Cwd,
@@ -3031,26 +3049,12 @@ func handleClaudeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd
 			cmd.WorkspaceID,
 			cmd.UID,
 			publishFn,
+			onStarted,
 		)
 		if err != nil {
 			publishClaudeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to start claude native: %v", err))
 			return
 		}
-
-		// Synchronous ack so the orchestrator can surface "starting" and begin
-		// streaming; the first claude_native_message follows once Claude emits
-		// its first stream-json frame.
-		publishFn(resultMsg{
-			ID:          cmd.ID,
-			WorkspaceID: cmd.WorkspaceID,
-			UID:         cmd.UID,
-			Output:      "Claude native started",
-			Status:      "success",
-			Ts:          time.Now().UnixMilli(),
-			Version:     Version,
-			Type:        "claude_native_started",
-			SessionID:   cmd.SessionID,
-		})
 
 	case "claude_native_send":
 		if cmd.SessionID == "" {

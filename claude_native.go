@@ -160,7 +160,13 @@ func NewClaudeNativeManager() *ClaudeNativeManager {
 //   - claude_native_stderr  for every stderr line
 //   - claude_native_error   on a fatal stream condition (oversize / queue stall)
 //   - claude_native_ended   when the process exits, carrying ExitCode
-func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialPrompt, workspaceID, uid string, publishFn PublishFunc) error {
+//
+// onStarted, when non-nil, is invoked after the child process is spawned and
+// the stream readers are wired, but BEFORE the initial prompt is written. This
+// lets callers publish their `claude_native_started` ack ahead of any
+// `claude_native_message` frames the readers may forward, guaranteeing the
+// ordering consumers rely on when they initialize state on the started frame.
+func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialPrompt, workspaceID, uid string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -256,6 +262,13 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 
 	go m.readStream(session, publishFn)
 	go m.waitForExit(session, publishFn)
+
+	// Fire the started ack BEFORE writing the initial prompt so consumers see
+	// `claude_native_started` ahead of any `claude_native_message` frames the
+	// readers may publish in response to that prompt.
+	if onStarted != nil {
+		onStarted()
+	}
 
 	// Deliver the first user turn (if any) after the readers are wired so we
 	// never miss Claude's response frames.

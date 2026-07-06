@@ -124,7 +124,7 @@ func TestClaudeNativeManager_StartRejectsDuplicateID(t *testing.T) {
 	m := NewClaudeNativeManager()
 	id := "dupe-fixture"
 	m.sessions[id] = &ClaudeNativeSession{ID: id, status: "running", done: make(chan struct{}), streamDone: make(chan struct{})}
-	err := m.Start(id, t.TempDir(), nil, "", "ws", "uid", func(resultMsg) {})
+	err := m.Start(id, t.TempDir(), nil, "", "ws", "uid", func(resultMsg) {}, nil)
 	if err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("expected `already exists` error; got %v", err)
 	}
@@ -133,10 +133,10 @@ func TestClaudeNativeManager_StartRejectsDuplicateID(t *testing.T) {
 func TestClaudeNativeManager_StartRequiresIDAndPublish(t *testing.T) {
 	m := NewClaudeNativeManager()
 	cwd := t.TempDir()
-	if err := m.Start("", cwd, nil, "", "ws", "uid", func(resultMsg) {}); err == nil {
+	if err := m.Start("", cwd, nil, "", "ws", "uid", func(resultMsg) {}, nil); err == nil {
 		t.Fatalf("expected error for empty sessionID")
 	}
-	if err := m.Start("x", cwd, nil, "", "ws", "uid", nil); err == nil {
+	if err := m.Start("x", cwd, nil, "", "ws", "uid", nil, nil); err == nil {
 		t.Fatalf("expected error for nil publishFn")
 	}
 }
@@ -146,18 +146,18 @@ func TestClaudeNativeManager_StartRequiresValidCwd(t *testing.T) {
 	publishFn := func(resultMsg) {}
 
 	t.Run("empty_cwd_rejected", func(t *testing.T) {
-		if err := m.Start("a", "", nil, "", "ws", "uid", publishFn); err == nil || !strings.Contains(err.Error(), "cwd is required") {
+		if err := m.Start("a", "", nil, "", "ws", "uid", publishFn, nil); err == nil || !strings.Contains(err.Error(), "cwd is required") {
 			t.Fatalf("expected `cwd is required`; got %v", err)
 		}
 	})
 	t.Run("relative_cwd_rejected", func(t *testing.T) {
-		if err := m.Start("b", "./rel", nil, "", "ws", "uid", publishFn); err == nil || !strings.Contains(err.Error(), "absolute path") {
+		if err := m.Start("b", "./rel", nil, "", "ws", "uid", publishFn, nil); err == nil || !strings.Contains(err.Error(), "absolute path") {
 			t.Fatalf("expected `absolute path`; got %v", err)
 		}
 	})
 	t.Run("missing_dir_rejected", func(t *testing.T) {
 		missing := filepath.Join(t.TempDir(), "definitely-missing-xyz123")
-		if err := m.Start("c", missing, nil, "", "ws", "uid", publishFn); err == nil || !strings.Contains(err.Error(), "not accessible") {
+		if err := m.Start("c", missing, nil, "", "ws", "uid", publishFn, nil); err == nil || !strings.Contains(err.Error(), "not accessible") {
 			t.Fatalf("expected `not accessible`; got %v", err)
 		}
 	})
@@ -243,7 +243,7 @@ func TestClaudeNativeLifecycle_StartSendEnd(t *testing.T) {
 	}
 
 	// Start with an initial prompt delivered on stdin.
-	if err := m.Start(id, tmpDir, nil, "hello world", "ws", "uid", publishFn); err != nil {
+	if err := m.Start(id, tmpDir, nil, "hello world", "ws", "uid", publishFn, nil); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -327,7 +327,7 @@ func TestClaudeNativeLifecycle_OversizeFrameTerminatesSession(t *testing.T) {
 		captured = append(captured, res)
 	}
 
-	if err := m.Start(id, tmpDir, nil, "go", "ws", "uid", publishFn); err != nil {
+	if err := m.Start(id, tmpDir, nil, "go", "ws", "uid", publishFn, nil); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -363,7 +363,7 @@ func TestClaudeNativeLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	})
 
 	m := NewClaudeNativeManager()
-	err := m.Start("nobin", t.TempDir(), nil, "hi", "ws", "uid", func(resultMsg) {})
+	err := m.Start("nobin", t.TempDir(), nil, "hi", "ws", "uid", func(resultMsg) {}, nil)
 	if err == nil {
 		t.Fatalf("expected Start to fail when `claude` is not on PATH")
 	}
