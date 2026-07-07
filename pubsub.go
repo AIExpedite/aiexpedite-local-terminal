@@ -213,6 +213,9 @@ func rejectionResultType(cmdType string) string {
 	if isGrokACPCommand(cmdType) {
 		return "grok_acp_error"
 	}
+	if isClaudeNativeCommand(cmdType) {
+		return "claude_native_error"
+	}
 	return "session_error"
 }
 
@@ -2537,6 +2540,13 @@ var globalCodexAppServerManager *CodexAppServerManager
 // computer user's Grok / X account.
 var globalGrokACPManager *GrokACPManager
 
+// globalClaudeNativeManager is the package-level ClaudeNativeManager instance,
+// initialized in StartAgent (agent.go). Sessions launched here drive Claude
+// Code in structured `--output-format stream-json` mode and forward its frames
+// verbatim as `claude_native_*` chunks (separate code path from the generic
+// display-text `stream` integration in session.go).
+var globalClaudeNativeManager *ClaudeNativeManager
+
 /* --------------------------------------------------------------------------
    handleSessionCommand — routes session_* commands to the SessionManager
    -------------------------------------------------------------------------- */
@@ -2606,6 +2616,16 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		allowArgs = buildCodexAppServerArgs(cmd.Args)
 		dialogArgs = allowArgs
 		denyOutput = "codex app-server denied by user: not in allow list"
+	case "claude_native_start":
+		// Gate against the synthesised `claude …stream-json…` argv the manager
+		// will actually exec so the default `claude *` allowlist entry covers
+		// native-chat access without a parallel allowlist for the new entry
+		// kind. buildClaudeInteractiveArgs also strips -p/--print, matching the
+		// launch shape (its extracted prompt is delivered on stdin, not argv).
+		allowCommand = "claude"
+		allowArgs, _ = buildClaudeInteractiveArgs(cmd.Args)
+		dialogArgs = allowArgs
+		denyOutput = "claude native session denied by user: not in allow list"
 	case "grok_acp_start":
 		// Unlike codex_appserver_start, grok_acp_start is NOT gated through
 		// the shared execute allowlist or approval dialog WHEN signing is
@@ -2719,6 +2739,10 @@ func newSessionPublishFn(topic *pubsub.Publisher, logPrefix string) PublishFunc 
 func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
 	if isCodexAppServerCommand(cmd.Type) {
 		handleCodexAppServerCommand(ctx, topic, cmd)
+		return
+	}
+	if isClaudeNativeCommand(cmd.Type) {
+		handleClaudeNativeCommand(ctx, topic, cmd)
 		return
 	}
 	if isGrokACPCommand(cmd.Type) {
@@ -2959,6 +2983,131 @@ func publishCodexAppServerError(ctx context.Context, topic *pubsub.Publisher, cm
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[codex-appserver] Failed to publish error: %v%s\n", colorRed, err, colorReset)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Claude native (stream-json over stdio) command routing
+   -------------------------------------------------------------------------- */
+
+// isClaudeNativeCommand returns true if cmdType is one of the Claude native
+// command kinds. Same shape as isCodexAppServerCommand / isGrokACPCommand.
+func isClaudeNativeCommand(cmdType string) bool {
+	switch cmdType {
+	case "claude_native_start", "claude_native_send", "claude_native_end":
+		return true
+	}
+	return false
+}
+
+// handleClaudeNativeCommand dispatches claude_native_* commands to the
+// ClaudeNativeManager. Unlike codex/grok (which forward opaque JSON-RPC frames
+// the orchestrator constructs), Claude turns are plain user text: `start`
+// carries the optional initial prompt in cmd.Input, `send` carries the next
+// user turn's text, and the manager wraps both in the NDJSON user envelope.
+func handleClaudeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg) {
+	if globalClaudeNativeManager == nil {
+		publishClaudeNativeError(ctx, topic, cmd, "claude native manager not initialized")
+		return
+	}
+
+	publishFn := newSessionPublishFn(topic, "[claude-native]")
+
+	switch cmd.Type {
+	case "claude_native_start":
+		if cmd.SessionID == "" {
+			publishClaudeNativeError(ctx, topic, cmd, "sessionID is required for claude_native_start")
+			return
+		}
+
+		fmt.Printf("%s[claude-native] Starting session %s (workspace=%s)%s\n",
+			colorCyan, cmd.SessionID, cmd.WorkspaceID, colorReset)
+
+		// Fire the started ack from inside Start (after readers are wired but
+		// before the initial prompt is written) so the ack is guaranteed to
+		// precede any claude_native_message frames — consumers that initialize
+		// state on the started frame rely on that ordering.
+		onStarted := func() {
+			publishFn(resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				Output:      "Claude native started",
+				Status:      "success",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        "claude_native_started",
+				SessionID:   cmd.SessionID,
+			})
+		}
+
+		err := globalClaudeNativeManager.Start(
+			cmd.SessionID,
+			cmd.Cwd,
+			cmd.Args,
+			cmd.Input, // optional initial user prompt (plain text)
+			cmd.WorkspaceID,
+			cmd.UID,
+			publishFn,
+			onStarted,
+		)
+		if err != nil {
+			publishClaudeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to start claude native: %v", err))
+			return
+		}
+
+	case "claude_native_send":
+		if cmd.SessionID == "" {
+			publishClaudeNativeError(ctx, topic, cmd, "sessionID is required for claude_native_send")
+			return
+		}
+		if cmd.Input == "" {
+			publishClaudeNativeError(ctx, topic, cmd, "input (user turn text) is required for claude_native_send")
+			return
+		}
+
+		if err := globalClaudeNativeManager.Send(cmd.SessionID, cmd.Input); err != nil {
+			publishClaudeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to send to claude native: %v", err))
+			return
+		}
+
+	case "claude_native_end":
+		if cmd.SessionID == "" {
+			publishClaudeNativeError(ctx, topic, cmd, "sessionID is required for claude_native_end")
+			return
+		}
+
+		fmt.Printf("%s[claude-native] Ending session %s%s\n",
+			colorYellow, cmd.SessionID, colorReset)
+
+		if err := globalClaudeNativeManager.End(cmd.SessionID); err != nil {
+			publishClaudeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to end claude native session: %v", err))
+			return
+		}
+
+	default:
+		publishClaudeNativeError(ctx, topic, cmd, fmt.Sprintf("unknown claude native command type: %s", cmd.Type))
+	}
+}
+
+// publishClaudeNativeError surfaces a synchronous failure back to the
+// orchestrator as a `claude_native_error` frame.
+func publishClaudeNativeError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
+	fmt.Printf("%s[claude-native] Error: %s%s\n", colorRed, errMsg, colorReset)
+
+	res := resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		Output:      errMsg,
+		Status:      "error",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "claude_native_error",
+		SessionID:   cmd.SessionID,
+	}
+	if err := publishMsg(ctx, topic, res); err != nil {
+		fmt.Printf("%s[claude-native] Failed to publish error: %v%s\n", colorRed, err, colorReset)
 	}
 }
 

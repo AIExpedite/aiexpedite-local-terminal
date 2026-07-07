@@ -300,6 +300,15 @@ func StartAgent(cfg *Config) {
 	go globalGrokACPManager.CleanupStale(grokACPMaxLifetime)
 	fmt.Println("[aiexpedite] Grok ACP manager ready")
 
+	/* 3b'''. Initialize Claude native manager (stream-json over stdio) ---- */
+	// Drives `claude --output-format stream-json` for Claude Code native-chat
+	// rendering. Same manager shape as codex/grok, but forwards Claude's
+	// stream-json frames verbatim as claude_native_* chunks.
+
+	globalClaudeNativeManager = NewClaudeNativeManager()
+	go globalClaudeNativeManager.CleanupStale(claudeNativeMaxLifetime)
+	fmt.Println("[aiexpedite] Claude native manager ready")
+
 	/* 3c. Begin gathering machine info for /auth/token uploads ------------ */
 	// Runs in a background goroutine so we don't block startup. The first
 	// gather typically completes within a few seconds, comfortably before

@@ -213,6 +213,46 @@ func runMockCLI(mode string) {
 		_, _ = os.Stdout.WriteString(`"}}}` + "\n")
 		select {}
 
+	case "claude-native-echo":
+		runMockClaudeNative()
+
+	case "claude-native-ratelimit":
+		// Emit a single stream-json frame that captureClaudeRateLimitLine
+		// classifies as a hard-quota rejection, then keep stdin open so the
+		// manager doesn't tear down before the test observes the surfaced
+		// claude_native_ratelimit frame. Used by
+		// TestClaudeNativeLifecycle_SurfacesRejectedRateLimit.
+		reset := time.Now().Add(45 * time.Minute).Unix()
+		fmt.Fprintln(os.Stderr, "[mock-claude-ratelimit] emitting rejected rate_limit_event")
+		fmt.Printf(`{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","utilization":1.0,"resets_at":%d}}`+"\n", reset)
+		// Stay alive so End() drives the teardown, matching the real CLI's
+		// behavior of holding stdin open across turns.
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		os.Exit(0)
+
+	case "claude-native-oversize":
+		// Emit a single stdout frame larger than claudeNativeMaxFrameSize
+		// (8 MB) to exercise the fail-fast path — the manager must surface a
+		// fatal claude_native_error rather than enqueue an un-publishable
+		// frame. Used by TestClaudeNativeLifecycle_OversizeFrameTerminatesSession.
+		const oversize = 9 * 1024 * 1024 // ~9 MB > 8 MB cap
+		_, _ = os.Stdout.WriteString(`{"type":"assistant","message":{"content":[{"type":"text","text":"`)
+		buf := make([]byte, 64*1024)
+		for i := range buf {
+			buf[i] = 'A'
+		}
+		emitted := 0
+		for emitted < oversize {
+			n := len(buf)
+			if oversize-emitted < n {
+				n = oversize - emitted
+			}
+			_, _ = os.Stdout.Write(buf[:n])
+			emitted += n
+		}
+		_, _ = os.Stdout.WriteString(`"}]}}` + "\n")
+		select {}
+
 	case "grok-acp-echo":
 		runMockGrokACPServer()
 
