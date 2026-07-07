@@ -19,6 +19,52 @@ import (
 	"strings"
 )
 
+// isClaudeStructuredStreamLine reports whether a line came from Claude's
+// --output-format stream-json output (a JSON object with a `type` field) as
+// opposed to a passthrough plain-text/stderr line. The claude no-output
+// watchdog uses this to distinguish real assistant content from a stalled
+// login banner: extractDisplayText echoes non-JSON and malformed-JSON lines
+// verbatim, so a not-signed-in claude that prints a plain banner and hangs
+// would otherwise disarm the fail-fast on passthrough text.
+func isClaudeStructuredStreamLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return false
+	}
+	_, ok := raw["type"].(string)
+	return ok
+}
+
+// isClaudeRateLimitEventLine reports whether a line is a Claude
+// `rate_limit_event` structured stream frame — allowed heartbeat or
+// hard rejection. Used by the no-output watchdog: extractDisplayText
+// treats rate_limit_event as metadata, but the frame itself proves
+// Claude's stream reached us (Claude is signed in and emitting per-window
+// telemetry), so a slow first turn — say, a large repo scan — that only
+// produces rate_limit_event heartbeats within the 120s budget must NOT
+// be killed with a misleading /login error. captureClaudeRateLimitLine
+// only surfaces rejections, so it can't be used to detect the allowed-
+// heartbeat case on its own.
+func isClaudeRateLimitEventLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	if !strings.Contains(trimmed, "rate_limit_event") {
+		return false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return false
+	}
+	t, _ := raw["type"].(string)
+	return t == "rate_limit_event"
+}
+
 // extractDisplayText parses a single stdout line from a CLI agent and returns
 // the human-readable text to display. Returns empty string if the line should
 // be skipped (internal events, metadata, etc.).

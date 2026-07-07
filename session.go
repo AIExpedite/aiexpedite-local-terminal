@@ -82,9 +82,49 @@ type CLISession struct {
 	// pipe is closed so a second SendInput doesn't double-close.
 	deferredStdinClose bool
 
+	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
+	// a claude session emits its first genuine assistant output — a stream-json
+	// text/thinking delta or a tool_use. The claude no-output watchdog
+	// (watchClaudeFirstFrame) blocks on it to tell a healthy (if slow) session
+	// apart from one that launched, emitted only its `system/init`, and then
+	// stalled — the signature of a Claude Code that is not signed in on the
+	// terminal computer. Created for every session; only claude arms the
+	// watchdog and only claude signals it.
+	firstRealFrame     chan struct{}
+	firstRealFrameOnce sync.Once
+
+	// claudeWatchdogOnce guards the no-output watchdog goroutine so it is armed
+	// at most once per claude session. The arm point is deferred to the moment
+	// a prompt is actually delivered to claude (StartSession's initial stdin
+	// write, or the first SendInput on a session opened without an initial
+	// prompt) — arming at process start would kill the supported no-initial-
+	// prompt flow (chat-direct/session.sendInput) where claude legitimately
+	// sits idle until the first SendInput lands.
+	claudeWatchdogOnce sync.Once
+	// publishFn is captured at StartSession so deferred arming from SendInput
+	// can publish the fail-fast error frame without threading it through.
+	publishFn PublishFunc
+
 	mu         sync.Mutex
 	done       chan struct{} // closed when process exits
 	streamDone chan struct{} // closed when stdout/stderr and stream publishes finish
+}
+
+// claudeFirstFrameTimeout bounds how long a freshly-started claude session may
+// go without producing any real assistant output before the watchdog assumes
+// it is not signed in (or wedged at startup) and kills it. Generous on purpose:
+// a healthy claude streams a thinking/text delta well inside this window even
+// on a large repo, so the only sessions this catches are ones that emit nothing
+// but their `system/init`. Mirrors the grok ACP first-frame watchdog.
+const claudeFirstFrameTimeout = 120 * time.Second
+
+// signalFirstRealFrame marks that this session has produced genuine assistant
+// output, disarming the no-output watchdog. Idempotent and nil-safe.
+func (s *CLISession) signalFirstRealFrame() {
+	if s.firstRealFrame == nil {
+		return
+	}
+	s.firstRealFrameOnce.Do(func() { close(s.firstRealFrame) })
 }
 
 /* --------------------------------------------------------------------------
@@ -212,8 +252,10 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
 		deferredStdinClose: stdinPromptFormat(command) == "plain" && stdinPrompt == "",
+		firstRealFrame:     make(chan struct{}),
 		done:               make(chan struct{}),
 		streamDone:         make(chan struct{}),
+		publishFn:          publishFn,
 	}
 
 	sm.sessions[id] = session
@@ -226,6 +268,13 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	// Start output reader goroutines
 	go sm.readOutputStream(session, publishFn)
+
+	// Claude no-output watchdog is armed lazily: only once a prompt has actually
+	// been delivered to claude. See armClaudeFirstFrameWatchdog — arming at
+	// process start would incorrectly kill the supported no-initial-prompt
+	// flow (chat-direct/session.sendInput) where claude sits idle until the
+	// first SendInput. StartSession arms it below when it writes the initial
+	// prompt; SendInput arms it on the first send otherwise.
 
 	// Start process waiter (detects exit)
 	go sm.waitForExit(session, publishFn)
@@ -271,6 +320,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		} else {
 			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars, format=%s)%s\n",
 				colorGreen, id, len(stdinPrompt), stdinPromptFormat(command), colorReset)
+			// Prompt delivered — arm the claude no-output watchdog now.
+			sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
 		}
 	}
 
@@ -347,6 +398,15 @@ func (sm *SessionManager) SendInput(id, text string) error {
 	if session.Status == "waiting_input" {
 		session.Status = "running"
 	}
+
+	// Arm the claude no-output watchdog on the first prompt delivered via
+	// SendInput. For sessions that started with an initial argv/stdin prompt
+	// this is a no-op (sync.Once already fired in StartSession); for the
+	// no-initial-prompt flow this is where the watchdog first arms — we now
+	// have a prompt outstanding, so a subsequent stall means the same
+	// "launched but not signed in" failure StartSession's arm would have
+	// caught.
+	sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
 
 	fmt.Printf("%s[session] Input sent to %s: %s%s\n",
 		colorBlue, id, truncateString(text, 80), colorReset)
@@ -827,6 +887,57 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 						colorYellow, session.ID,
 						time.UnixMilli(rejected.ResetsAtMs).UTC().Format(time.RFC3339), colorReset)
 				}
+
+				// Any Claude rate_limit_event — allowed heartbeat OR handled
+				// rejection — proves Claude's stream reached us: it is signed
+				// in and emitting per-window telemetry. extractDisplayText
+				// treats rate_limit_event as metadata so the sibling disarm
+				// below never fires, leaving the no-output watchdog armed to
+				// publish a misleading /login error 120s later and kill a
+				// healthy (or correctly rate-limited) turn where the only
+				// early output was heartbeats. captureClaudeRateLimitLine
+				// only returns rejected buckets, so the allowed-heartbeat
+				// case needs its own detector. Disarm here so the fail-fast
+				// path stays scoped to genuine startup stalls.
+				if isClaudeRateLimitEventLine(line.text) {
+					session.signalFirstRealFrame()
+				}
+
+				// Fail fast when Claude Code reports it cannot authenticate. The
+				// driver strips env-based credentials for claude to force the
+				// user's `/login` subscription, so an expired/absent login here
+				// surfaces as an api_retry(authentication_failed) or a
+				// result(is_error) "…/login" message and the session would
+				// otherwise idle until the 6h stale GC and complete empty. Publish
+				// an actionable error and kill the child so waitForExit emits the
+				// ended frame. Seq is reserved before Kill so error orders before
+				// ended. Mirrors the grok "not signed in" fail-fast.
+				if authFail := detectClaudeAuthFailure(line.text); authFail != nil {
+					flushBatch()
+					seq := atomic.AddInt64(&session.Seq, 1)
+					asyncPublish(resultMsg{
+						ID:          session.ID,
+						WorkspaceID: session.WorkspaceID,
+						UID:         session.UID,
+						Output: fmt.Sprintf(
+							"claude is not signed in / not authorized on this computer (%s) — run `claude` then "+
+								"`/login` in a terminal on the terminal computer to sign in again. Session terminated.",
+							authFail.Category,
+						),
+						Status:    "error",
+						Ts:        time.Now().UnixMilli(),
+						Version:   Version,
+						Type:      "stream",
+						SessionID: session.ID,
+						Seq:       int(seq),
+					})
+					fmt.Printf("%s[session] Claude auth failure (%s) — %s terminated%s\n",
+						colorRed, authFail.Category, session.ID, colorReset)
+					if session.Process != nil && session.Process.Process != nil {
+						_ = session.Process.Process.Kill()
+					}
+					continue
+				}
 			}
 
 			// Detect CLI-terminal events (Claude "result", Codex
@@ -875,6 +986,15 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				})
 				fmt.Printf("%s[session] Result event — turn complete, %s waiting_input%s\n",
 					colorGreen, session.ID, colorReset)
+
+				// A Claude result event means the turn reached terminal state —
+				// Claude ran through to completion (even an empty/non-auth
+				// is_error result still proves the child was responsive). Auth
+				// failures are caught upstream by detectClaudeAuthFailure, so
+				// anything reaching here is a healthy turn. Disarm the
+				// no-output watchdog so it doesn't later publish a misleading
+				// /login error and kill a session that already completed.
+				session.signalFirstRealFrame()
 			}
 
 			// Try to parse as JSON event for structured detection
@@ -906,16 +1026,124 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 
 				fmt.Printf("%s[session] Prompt detected in %s: %s%s\n",
 					colorMagenta, session.ID, truncateString(promptInfo.Text, 80), colorReset)
+
+				// A claude permission/input prompt means the session is healthy
+				// and blocked on the user — not stalled. Disarm the no-output
+				// watchdog so it doesn't kill a session that's legitimately
+				// waiting on a response with a misleading sign-in error.
+				if isClaudeCommand(session.Command) {
+					session.signalFirstRealFrame()
+				}
 			} else {
 				displayText := extractDisplayText(session.Command, line.text)
 				if displayText != "" {
 					batch = append(batch, displayText)
+					// Genuine assistant output (text/thinking delta or tool_use)
+					// — the session is alive and producing, so disarm the claude
+					// no-output watchdog. No-op for non-claude sessions (they
+					// never arm it). Deliberately NOT signalled from init/system
+					// or result events: those can fire for a stalled/errored
+					// claude and the parser swallows result events. Prompt
+					// detection (permission_request/input_request) also disarms
+					// the watchdog — see the sibling branch above.
+					//
+					// Gate on isClaudeStructuredStreamLine so a not-signed-in
+					// claude that prints a plain stderr/login banner (which
+					// extractDisplayText passes through verbatim) does NOT
+					// disarm the fail-fast watchdog — otherwise a stalled
+					// session with a banner would hang until stale GC.
+					if isClaudeCommand(session.Command) && isClaudeStructuredStreamLine(line.text) {
+						session.signalFirstRealFrame()
+					}
 				}
 			}
 
 		case <-batchTimer.C:
 			flushBatch()
 		}
+	}
+}
+
+// armClaudeFirstFrameWatchdog starts the no-output watchdog exactly once per
+// claude session, on the first call. Called from StartSession right after the
+// initial prompt is written, and from SendInput on the first user message when
+// the session was opened without an initial prompt (chat-direct flow). No-op
+// for non-claude sessions and when publishFn was not captured.
+func (sm *SessionManager) armClaudeFirstFrameWatchdog(session *CLISession, timeout time.Duration) {
+	if session == nil || !isClaudeCommand(session.Command) || session.publishFn == nil {
+		return
+	}
+	session.claudeWatchdogOnce.Do(func() {
+		go sm.watchClaudeFirstFrame(session, session.publishFn, timeout)
+	})
+}
+
+// watchClaudeFirstFrame fails a claude session fast when it produces no genuine
+// assistant output within `timeout` of starting. This is the "launched but not
+// signed in / wedged at startup" case: the child emits its system/init and then
+// nothing, so without this watchdog the session hangs until the 6h stale GC and
+// the design step completes empty. Mirrors the grok ACP first-frame watchdog.
+//
+// It returns early when the session proves itself healthy (firstRealFrame) or
+// has already exited (done — waitForExit owns the ended frame). `timeout` is a
+// parameter so unit tests can drive the fail-fast path with a sub-second budget.
+//
+// The error is PUBLISHED before Kill so this frame lands on publishFn strictly
+// before waitForExit's session_ended: Kill unblocks Process.Wait(), and only
+// after Wait returns does waitForExit publish session_ended. Because publishFn
+// here is a synchronous call outside readOutputStream's publishWg, publishing
+// after Kill would race — a slow publish could arrive after session_ended,
+// violating the session_integration_test.go invariant that nothing is
+// published after session_ended. Seq is still reserved before publish so the
+// orchestrator can also order by Seq.
+func (sm *SessionManager) watchClaudeFirstFrame(session *CLISession, publishFn PublishFunc, timeout time.Duration) {
+	select {
+	case <-session.firstRealFrame:
+		return
+	case <-session.done:
+		return
+	case <-time.After(timeout):
+	}
+
+	// Lost the race against a frame/exit that landed as the timer fired?
+	// Re-check both non-blockingly so we never kill a session that just proved
+	// itself alive (or already terminated on its own).
+	select {
+	case <-session.firstRealFrame:
+		return
+	case <-session.done:
+		return
+	default:
+	}
+	session.mu.Lock()
+	ended := session.Status == "ended"
+	session.mu.Unlock()
+	if ended {
+		return
+	}
+
+	seq := atomic.AddInt64(&session.Seq, 1)
+	fmt.Printf("%s[session] Claude produced no output within %v — assuming not signed in / startup stall, killing %s%s\n",
+		colorYellow, timeout, session.ID, colorReset)
+	publishFn(resultMsg{
+		ID:          session.ID,
+		WorkspaceID: session.WorkspaceID,
+		UID:         session.UID,
+		Output: fmt.Sprintf(
+			"claude produced no output within %v of starting — it is most likely not signed in on this computer "+
+				"(run `claude` then `/login` in a terminal on the terminal computer to sign in again) or wedged at "+
+				"startup. Session terminated.",
+			timeout,
+		),
+		Status:    "error",
+		Ts:        time.Now().UnixMilli(),
+		Version:   Version,
+		Type:      "stream",
+		SessionID: session.ID,
+		Seq:       int(seq),
+	})
+	if session.Process != nil && session.Process.Process != nil {
+		_ = session.Process.Process.Kill()
 	}
 }
 
