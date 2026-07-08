@@ -140,15 +140,24 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
 		},
 		{
+			// `--skip-trust` trusts the current workspace for the session
+			// without prompting, re-enabling the project `.gemini/settings.json`
+			// (tool auto-acceptance / project policies) this sanitizer blocks.
+			// It is a boolean flag, so nothing follows it.
+			"skip_trust_stripped",
+			[]string{"--skip-trust", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
 			"privileged_equals_forms_stripped",
-			[]string{"--yolo=true", "--approval-mode=auto_edit", "--include-directories=/outside", "--allowed-tools=run_shell_command", "--policy=/tmp/allow.toml", "--admin-policy=/tmp/admin"},
+			[]string{"--yolo=true", "--skip-trust=true", "--approval-mode=auto_edit", "--include-directories=/outside", "--allowed-tools=run_shell_command", "--policy=/tmp/allow.toml", "--admin-policy=/tmp/admin"},
 			[]string{"--experimental-acp"},
 		},
 		{
 			// gemini's yargs parser accepts camelCase spellings of every
 			// kebab-case flag — the deny list has to catch those too.
 			"privileged_camelcase_spellings_stripped",
-			[]string{"--approvalMode", "yolo", "--includeDirectories", "/outside", "--allowedTools", "run_shell_command", "--adminPolicy", "/tmp/admin"},
+			[]string{"--approvalMode", "yolo", "--skipTrust", "--includeDirectories", "/outside", "--allowedTools", "run_shell_command", "--adminPolicy", "/tmp/admin"},
 			[]string{"--experimental-acp"},
 		},
 	}

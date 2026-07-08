@@ -160,7 +160,11 @@ func buildGeminiACPArgs(extraArgs []string) []string {
 //     same way; `--policy`/`--admin-policy` load extra policy-engine files
 //     whose `allow` rules auto-approve tools without confirmation — the
 //     policy engine is the documented successor to `--allowed-tools`, so
-//     both routes to it are closed; `--include-directories` adds extra
+//     both routes to it are closed; `--skip-trust` trusts the current
+//     workspace for the session without prompting, which re-enables the
+//     project `.gemini/settings.json` (tool auto-acceptance / project
+//     policies / include-directory behavior) this sanitizer is otherwise
+//     blocking; `--include-directories` adds extra
 //     workspace directories, routing around the WorkspaceRoot cwd
 //     containment Start enforces. Unlike
 //     Grok's `--allow` there is no per-workspace opt-in gate for these —
@@ -223,15 +227,17 @@ func sanitizeGeminiACPExtraArgs(extraArgs []string) []string {
 // deny list of privilege-escalating gemini flags: `-y`/`--yolo` and
 // `--approval-mode` bypass per-tool approvals, `--allowed-tools` pre-approves
 // named tools, `--policy`/`--admin-policy` load extra policy files whose
-// `allow` rules auto-approve tools the same way, and
-// `--include-directories` escapes the WorkspaceRoot containment.
+// `allow` rules auto-approve tools the same way, `--skip-trust` trusts the
+// workspace without prompting (re-enabling project settings/auto-acceptance),
+// and `--include-directories` escapes the WorkspaceRoot containment.
 // gemini's yargs parser also accepts camelCase spellings of every kebab-case
 // flag, so both spellings are matched (ToLower collapses camelCase to the
 // dash-less form). takesValue is true only for the separate-token value form;
 // equals-form tokens carry their value inline and consume nothing extra.
 func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 	switch lower {
-	case "-y", "--yolo":
+	case "-y", "--yolo",
+		"--skip-trust", "--skiptrust":
 		return true, false
 	case "--approval-mode", "--approvalmode",
 		"--allowed-tools", "--allowedtools",
@@ -242,6 +248,7 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 	}
 	for _, prefix := range []string{
 		"--yolo=",
+		"--skip-trust=", "--skiptrust=",
 		"--approval-mode=", "--approvalmode=",
 		"--allowed-tools=", "--allowedtools=",
 		"--policy=",
