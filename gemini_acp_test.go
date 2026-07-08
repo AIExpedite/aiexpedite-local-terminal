@@ -223,6 +223,7 @@ func TestScreenGeminiWorkspaceSettings_Allows(t *testing.T) {
 		"manual mode":         `{"general":{"defaultApprovalMode":"manual"}}`,
 		"autoAccept false":    `{"tools":{"autoAccept":false}}`,
 		"empty includeDirs":   `{"context":{"includeDirectories":[]}}`,
+		"empty allowed tools": `{"tools":{"allowed":[]}}`,
 		"empty policyPaths":   `{"security":{"policyPaths":[]}}`,
 		"untrusted mcp":       `{"mcpServers":{"local":{"command":"npx","trust":false}}}`,
 		"unrelated settings":  `{"ui":{"theme":"dark"},"context":{"fileName":"AGENTS.md"}}`,
@@ -244,15 +245,17 @@ func TestScreenGeminiWorkspaceSettings_Blocks(t *testing.T) {
 	// Each of these positively grants a privilege the argv sanitizer strips,
 	// via nested, camelCase, snake_case and legacy-flat spellings.
 	cases := map[string]string{
-		"nested yolo mode":   `{"general":{"defaultApprovalMode":"yolo"}}`,
-		"auto_edit mode":     `{"general":{"defaultApprovalMode":"auto_edit"}}`,
-		"camelCase approval": `{"approvalMode":"yolo"}`,
-		"autoAccept true":    `{"tools":{"autoAccept":true}}`,
-		"legacy flat yolo":   `{"yolo":true}`,
-		"includeDirectories": `{"context":{"includeDirectories":["/etc","/root"]}}`,
-		"nested policyPaths": `{"security":{"policyPaths":["/tmp/allow.toml"]}}`,
-		"adminPolicy string": `{"admin_policy_paths":"/tmp/admin"}`,
-		"trusted mcp server": `{"mcpServers":{"local":{"command":"npx","trust":true}}}`,
+		"nested yolo mode":    `{"general":{"defaultApprovalMode":"yolo"}}`,
+		"auto_edit mode":      `{"general":{"defaultApprovalMode":"auto_edit"}}`,
+		"camelCase approval":  `{"approvalMode":"yolo"}`,
+		"autoAccept true":     `{"tools":{"autoAccept":true}}`,
+		"legacy flat yolo":    `{"yolo":true}`,
+		"includeDirectories":  `{"context":{"includeDirectories":["/etc","/root"]}}`,
+		"nested policyPaths":  `{"security":{"policyPaths":["/tmp/allow.toml"]}}`,
+		"allowed tools":       `{"tools":{"allowed":["run_shell_command"]}}`,
+		"legacy allowedTools": `{"allowedTools":"run_shell_command"}`,
+		"adminPolicy string":  `{"admin_policy_paths":"/tmp/admin"}`,
+		"trusted mcp server":  `{"mcpServers":{"local":{"command":"npx","trust":true}}}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
