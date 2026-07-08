@@ -225,6 +225,12 @@ func TestScreenGeminiWorkspaceSettings_Allows(t *testing.T) {
 		"autoAccept false":    `{"tools":{"autoAccept":false}}`,
 		"empty includeDirs":   `{"context":{"includeDirectories":[]}}`,
 		"empty allowed tools": `{"tools":{"allowed":[]}}`,
+		// `allowed` is only a pre-approved-tools grant under `tools`. A
+		// non-empty `mcp.allowed` (permitted MCP server names) is a benign
+		// restriction, and other blocks spell similar allowlists — none of
+		// them auto-approve tools, so they must NOT block the start.
+		"mcp allowed servers": `{"mcp":{"allowed":["trusted-server","other"]}}`,
+		"nested allowlist":    `{"security":{"folderTrust":{"allowed":["/repo"]}}}`,
 		"empty policyPaths":   `{"security":{"policyPaths":[]}}`,
 		"empty mcpServers":    `{"mcpServers":{}}`,
 		"empty discoveryCmd":  `{"tools":{"discoveryCommand":""}}`,
@@ -245,7 +251,7 @@ func TestScreenGeminiWorkspaceSettings_Allows(t *testing.T) {
 			if body != "" {
 				writeGeminiSettings(t, cwd, body)
 			}
-			if err := screenGeminiWorkspaceSettings(cwd); err != nil {
+			if err := screenGeminiWorkspaceSettings(cwd, ""); err != nil {
 				t.Fatalf("expected no error, got %v", err)
 			}
 		})
@@ -290,7 +296,7 @@ func TestScreenGeminiWorkspaceSettings_Blocks(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cwd := t.TempDir()
 			writeGeminiSettings(t, cwd, body)
-			err := screenGeminiWorkspaceSettings(cwd)
+			err := screenGeminiWorkspaceSettings(cwd, "")
 			if err == nil {
 				t.Fatalf("expected privilege-escalation error for %s, got nil", body)
 			}
@@ -299,6 +305,57 @@ func TestScreenGeminiWorkspaceSettings_Blocks(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestScreenGeminiWorkspaceSettings_ProjectRootWalk covers the case where the
+// session runs from a subdirectory but the privileged `.gemini/settings.json`
+// lives at the workspace/project root above cwd — the file Gemini itself would
+// load and apply. The screen must walk up to WorkspaceRoot and catch it, while
+// still leaving anything above WorkspaceRoot (e.g. the user's global settings)
+// alone.
+func TestScreenGeminiWorkspaceSettings_ProjectRootWalk(t *testing.T) {
+	t.Run("privileged settings at workspace root block a subdir start", func(t *testing.T) {
+		root := t.TempDir()
+		writeGeminiSettings(t, root, `{"general":{"defaultApprovalMode":"yolo"}}`)
+		sub := filepath.Join(root, "packages", "app")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		err := screenGeminiWorkspaceSettings(sub, root)
+		if err == nil {
+			t.Fatal("expected the root-level yolo settings to block the subdir start")
+		}
+		if !strings.Contains(err.Error(), "settings.json") {
+			t.Errorf("error should name the offending file; got %v", err)
+		}
+	})
+
+	t.Run("benign subdir with clean chain up to root passes", func(t *testing.T) {
+		root := t.TempDir()
+		writeGeminiSettings(t, root, `{"ui":{"theme":"dark"}}`)
+		sub := filepath.Join(root, "packages", "app")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := screenGeminiWorkspaceSettings(sub, root); err != nil {
+			t.Fatalf("expected no error for benign chain, got %v", err)
+		}
+	})
+
+	t.Run("privileged file above WorkspaceRoot is not screened", func(t *testing.T) {
+		// A settings file OUTSIDE the containment root must be ignored: the walk
+		// stops at WorkspaceRoot so it never reaches the user's global config.
+		above := t.TempDir()
+		writeGeminiSettings(t, above, `{"yolo":true}`)
+		root := filepath.Join(above, "workspace")
+		sub := filepath.Join(root, "sub")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := screenGeminiWorkspaceSettings(sub, root); err != nil {
+			t.Fatalf("expected settings above WorkspaceRoot to be ignored, got %v", err)
+		}
+	})
 }
 
 /* --------------------------------------------------------------------------

@@ -125,7 +125,7 @@ func (m *GeminiACPManager) Start(id, cwd string, extraArgs []string, workspaceID
 		// sanitizer enforces. Screen it before spawning and fail the session
 		// start if it grants privilege — surfaced as a gemini_acp_error, the
 		// same way an unusable binary is.
-		if err := screenGeminiWorkspaceSettings(cwd); err != nil {
+		if err := screenGeminiWorkspaceSettings(cwd, opts.WorkspaceRoot); err != nil {
 			return acpSpawnPlan{}, err
 		}
 		executable := resolveExecutable("gemini")
@@ -304,9 +304,21 @@ func sanitizeGeminiACPEnv(env []string) []string {
    -------------------------------------------------------------------------- */
 
 // screenGeminiWorkspaceSettings inspects the workspace-scoped
-// `cwd/.gemini/settings.json` (if any) BEFORE spawning the ACP child and
-// rejects the session start when that file would grant a privilege the argv
-// sanitizer strips on the command line. Gemini loads workspace settings and
+// `.gemini/settings.json` files (if any) BEFORE spawning the ACP child and
+// rejects the session start when one of them would grant a privilege the argv
+// sanitizer strips on the command line. Gemini resolves its "workspace"
+// settings from the PROJECT ROOT — the nearest ancestor of cwd it recognises
+// as the project (git root etc.), not cwd itself — so when a chat session runs
+// from a subdirectory the privileged file lives above cwd. Screening only
+// `cwd/.gemini/settings.json` would miss a repo-root file that Gemini still
+// applies. So walk every directory from cwd up to and including WorkspaceRoot
+// (the containment root cwd is guaranteed to sit inside) and screen each
+// `.gemini/settings.json` on that path; the first privileged one blocks the
+// start. When WorkspaceRoot is empty (no containment configured) or cwd is not
+// lexically under it, fall back to screening cwd alone. The walk deliberately
+// stops at WorkspaceRoot so it never reaches the user's global
+// `~/.gemini/settings.json`, which is the user's own choice and out of scope
+// for this repo-supplied-settings screen. Gemini loads workspace settings and
 // lets them override user settings, so a repo-local settings file is an
 // equivalent route to the `--yolo` / `--approval-mode` / `--include-directories`
 // flags sanitizeGeminiACPExtraArgs already blocks: it can re-enable tool
@@ -336,8 +348,51 @@ func sanitizeGeminiACPEnv(env []string) []string {
 // a privilege-escalating value blocks the start. The scan walks the whole JSON
 // tree so both the nested (`general.defaultApprovalMode`, `context.includeDirectories`)
 // and any legacy flat spellings are caught regardless of nesting.
-func screenGeminiWorkspaceSettings(cwd string) error {
-	path := filepath.Join(cwd, ".gemini", "settings.json")
+func screenGeminiWorkspaceSettings(cwd, workspaceRoot string) error {
+	for _, dir := range geminiSettingsScreenDirs(cwd, workspaceRoot) {
+		if err := screenGeminiSettingsFile(filepath.Join(dir, ".gemini", "settings.json")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// geminiSettingsScreenDirs returns the directories whose `.gemini/settings.json`
+// must be screened for a session rooted at cwd: cwd first, then each ancestor
+// up to and including workspaceRoot. This mirrors how far up Gemini itself will
+// search for the project settings that override user/default settings. When
+// workspaceRoot is empty, or cwd does not sit lexically under it, only cwd is
+// screened — the walk never climbs past workspaceRoot into the user's home so
+// the global `~/.gemini/settings.json` is left alone.
+func geminiSettingsScreenDirs(cwd, workspaceRoot string) []string {
+	cwd = filepath.Clean(cwd)
+	if workspaceRoot == "" {
+		return []string{cwd}
+	}
+	root := filepath.Clean(workspaceRoot)
+	rel, err := filepath.Rel(root, cwd)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		// cwd is not under workspaceRoot (unexpected given containment) —
+		// screen cwd alone rather than walking an unrelated ancestor chain.
+		return []string{cwd}
+	}
+	dirs := []string{cwd}
+	for dir := cwd; dir != root; {
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break // reached the filesystem root without matching workspaceRoot
+		}
+		dir = parent
+		dirs = append(dirs, dir)
+	}
+	return dirs
+}
+
+// screenGeminiSettingsFile screens a single `.gemini/settings.json` path,
+// returning a non-nil error only when the file parses AND positively declares a
+// privilege-escalating setting. A missing/unreadable/malformed file is not
+// fatal (see the screenGeminiWorkspaceSettings doc for the rationale).
+func screenGeminiSettingsFile(path string) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		// No workspace settings (or unreadable) → nothing to screen.
@@ -366,10 +421,22 @@ func screenGeminiWorkspaceSettings(cwd string) error {
 // ignores `-`/`_` separators so kebab-case, camelCase and snake_case spellings
 // all match.
 func geminiSettingsPrivilegeReason(v any) string {
+	return geminiSettingsPrivilegeReasonUnder(v, "")
+}
+
+// geminiSettingsPrivilegeReasonUnder is the parent-aware recursion behind
+// geminiSettingsPrivilegeReason. `parent` is the normalised key of the object
+// currently being walked (empty at the root), which lets the ambiguous
+// `allowed` key be classified by context: `tools.allowed` pre-approves tool
+// calls (privileged) while `mcp.allowed` merely restricts which MCP servers are
+// enabled (a benign allowlist). The unambiguous legacy-flat `allowedTools`
+// spelling stays position-blind.
+func geminiSettingsPrivilegeReasonUnder(v any, parent string) string {
 	switch node := v.(type) {
 	case map[string]any:
 		for k, val := range node {
-			switch geminiSettingsKey(k) {
+			key := geminiSettingsKey(k)
+			switch key {
 			case "defaultapprovalmode", "approvalmode":
 				if s, ok := val.(string); ok {
 					mode := geminiSettingsKey(s)
@@ -390,21 +457,25 @@ func geminiSettingsPrivilegeReason(v any) string {
 				if arr, ok := val.([]any); ok && len(arr) > 0 {
 					return "extra context directories (includeDirectories)"
 				}
-			case "allowed", "allowedtools":
-				// tools.allowed (and the legacy flat allowedTools) pre-approve
-				// the named tools, skipping the confirmation dialog — the
-				// settings twin of the stripped `--allowed-tools` flag. The
-				// walk is positional-blind, but like `trust` no benign Gemini
-				// setting spells a non-empty `allowed` list.
-				switch tools := val.(type) {
-				case string:
-					if strings.TrimSpace(tools) != "" {
-						return fmt.Sprintf("pre-approved tools (%s)", k)
+			case "allowed":
+				// `tools.allowed` pre-approves the named tools, skipping the
+				// confirmation dialog — the settings twin of the stripped
+				// `--allowed-tools` flag. But `allowed` is NOT unique to tools:
+				// `mcp.allowed` is a benign allowlist of permitted MCP server
+				// NAMES (a restriction, not an auto-approval), and other blocks
+				// spell similar allowlists. So only treat a bare `allowed` as
+				// privileged when it sits directly under `tools`; elsewhere it
+				// is a restrictive allowlist and passes.
+				if parent == "tools" {
+					if reason := geminiAllowedToolsReason(k, val); reason != "" {
+						return reason
 					}
-				case []any:
-					if len(tools) > 0 {
-						return fmt.Sprintf("pre-approved tools (%s)", k)
-					}
+				}
+			case "allowedtools":
+				// The legacy flat `allowedTools` spelling is unambiguous —
+				// always pre-approved tools, regardless of nesting.
+				if reason := geminiAllowedToolsReason(k, val); reason != "" {
+					return reason
 				}
 			case "policypaths", "adminpolicypaths":
 				switch paths := val.(type) {
@@ -466,15 +537,35 @@ func geminiSettingsPrivilegeReason(v any) string {
 					}
 				}
 			}
-			if reason := geminiSettingsPrivilegeReason(val); reason != "" {
+			if reason := geminiSettingsPrivilegeReasonUnder(val, key); reason != "" {
 				return reason
 			}
 		}
 	case []any:
+		// Array elements inherit the current parent key (e.g. items under a
+		// `tools.allowed` array are still "under" tools).
 		for _, item := range node {
-			if reason := geminiSettingsPrivilegeReason(item); reason != "" {
+			if reason := geminiSettingsPrivilegeReasonUnder(item, parent); reason != "" {
 				return reason
 			}
+		}
+	}
+	return ""
+}
+
+// geminiAllowedToolsReason returns a privilege reason for a `tools.allowed` /
+// legacy `allowedTools` value when it names at least one pre-approved tool,
+// accepting both the string and array spellings; it returns "" for an empty or
+// blank value.
+func geminiAllowedToolsReason(rawKey string, val any) string {
+	switch tools := val.(type) {
+	case string:
+		if strings.TrimSpace(tools) != "" {
+			return fmt.Sprintf("pre-approved tools (%s)", rawKey)
+		}
+	case []any:
+		if len(tools) > 0 {
+			return fmt.Sprintf("pre-approved tools (%s)", rawKey)
 		}
 	}
 	return ""
