@@ -297,10 +297,21 @@ func StartAgent(cfg *Config) {
 	// and keeps independent JSON-RPC state machines per provider.
 
 	globalGrokACPManager = NewGrokACPManager()
-	go globalGrokACPManager.CleanupStale(grokACPMaxLifetime)
+	go globalGrokACPManager.CleanupStale(acpMaxLifetime)
 	fmt.Println("[aiexpedite] Grok ACP manager ready")
 
-	/* 3b'''. Initialize Claude native manager (stream-json over stdio) ---- */
+	/* 3b'''. Initialize Gemini ACP manager (JSON-RPC over stdio) --------- */
+	// Drives `gemini --experimental-acp` for AI Expedite's Gemini CLI ACP
+	// integration. Same shared ACP core as the Grok manager, but distinct
+	// because the orchestrator dispatches the two families on different
+	// command Types and keeps independent JSON-RPC state machines per
+	// provider.
+
+	globalGeminiACPManager = NewGeminiACPManager()
+	go globalGeminiACPManager.CleanupStale(acpMaxLifetime)
+	fmt.Println("[aiexpedite] Gemini ACP manager ready")
+
+	/* 3b''''. Initialize Claude native manager (stream-json over stdio) --- */
 	// Drives `claude --output-format stream-json` for Claude Code native-chat
 	// rendering. Same manager shape as codex/grok, but forwards Claude's
 	// stream-json frames verbatim as claude_native_* chunks.

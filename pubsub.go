@@ -213,6 +213,9 @@ func rejectionResultType(cmdType string) string {
 	if isGrokACPCommand(cmdType) {
 		return "grok_acp_error"
 	}
+	if isGeminiACPCommand(cmdType) {
+		return "gemini_acp_error"
+	}
 	if isClaudeNativeCommand(cmdType) {
 		return "claude_native_error"
 	}
@@ -555,7 +558,7 @@ type commandMsg struct {
 	CliAgentCatalog []cliAgentCatalogEntry `json:"cliAgentCatalog,omitempty"`
 
 	// Session fields (for interactive CLI agent sessions)
-	Type      string `json:"type,omitempty"`      // "execute"|"session_start"|"session_input"|"session_signal"|"session_end"|"codex_appserver_start"|"codex_appserver_send"|"codex_appserver_end"|"grok_acp_start"|"grok_acp_send"|"grok_acp_end"
+	Type      string `json:"type,omitempty"`      // "execute"|"session_start"|"session_input"|"session_signal"|"session_end"|"codex_appserver_start"|"codex_appserver_send"|"codex_appserver_end"|"grok_acp_start"|"grok_acp_send"|"grok_acp_end"|"gemini_acp_start"|"gemini_acp_send"|"gemini_acp_end"
 	SessionID string `json:"sessionID,omitempty"` // Unique session identifier
 	Input     string `json:"input,omitempty"`     // stdin text for session_input; raw JSON-RPC frame for codex_appserver_send / grok_acp_send
 	Signal    string `json:"signal,omitempty"`    // "interrupt"|"kill" for session_signal
@@ -607,9 +610,9 @@ type resultMsg struct {
 	Args    []string `json:"args,omitempty"`
 
 	// Session fields (for interactive CLI agent sessions)
-	Type       string `json:"type,omitempty"`       // "result"|"stream"|"prompt"|"session_ended"|"codex_appserver_started"|"codex_appserver_message"|"codex_appserver_stderr"|"codex_appserver_error"|"codex_appserver_ended"|"grok_acp_started"|"grok_acp_message"|"grok_acp_stderr"|"grok_acp_error"|"grok_acp_ended"|"__cli_usage_refresh_result__"
+	Type       string `json:"type,omitempty"`       // "result"|"stream"|"prompt"|"session_ended"|"codex_appserver_started"|"codex_appserver_message"|"codex_appserver_stderr"|"codex_appserver_error"|"codex_appserver_ended"|"grok_acp_started"|"grok_acp_message"|"grok_acp_stderr"|"grok_acp_error"|"grok_acp_ended"|"gemini_acp_started"|"gemini_acp_message"|"gemini_acp_stderr"|"gemini_acp_error"|"gemini_acp_ended"|"__cli_usage_refresh_result__"
 	SessionID  string `json:"sessionID,omitempty"`  // Session identifier
-	ExitCode   int    `json:"exitCode,omitempty"`   // Process exit code (for session_ended / codex_appserver_ended / grok_acp_ended)
+	ExitCode   int    `json:"exitCode,omitempty"`   // Process exit code (for session_ended / codex_appserver_ended / grok_acp_ended / gemini_acp_ended)
 	PromptText string `json:"promptText,omitempty"` // The question/approval text from CLI
 	PromptType string `json:"promptType,omitempty"` // "permission"|"question"|"unknown"
 	Seq        int    `json:"seq,omitempty"`        // Ordering sequence number for streaming
@@ -2540,6 +2543,14 @@ var globalCodexAppServerManager *CodexAppServerManager
 // computer user's Grok / X account.
 var globalGrokACPManager *GrokACPManager
 
+// globalGeminiACPManager is the package-level GeminiACPManager instance,
+// initialized in StartAgent (agent.go). Sessions launched here drive Google's
+// Gemini CLI via its experimental ACP (Agent Client Protocol) JSON-RPC stdio
+// interface (`gemini --experimental-acp`), authenticating with the user's
+// local `gemini` OAuth login so usage ties to the terminal computer user's
+// Google account.
+var globalGeminiACPManager *GeminiACPManager
+
 // globalClaudeNativeManager is the package-level ClaudeNativeManager instance,
 // initialized in StartAgent (agent.go). Sessions launched here drive Claude
 // Code in structured `--output-format stream-json` mode and forward its frames
@@ -2626,6 +2637,18 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		allowArgs, _ = buildClaudeInteractiveArgs(cmd.Args)
 		dialogArgs = allowArgs
 		denyOutput = "claude native session denied by user: not in allow list"
+	case "gemini_acp_start":
+		// Gate against the synthesised `gemini --experimental-acp …` argv the
+		// manager will actually exec so the default `gemini *` allowlist entry
+		// covers ACP access without operators having to maintain a parallel
+		// allowlist for the new entry kind. Unlike grok_acp_start there is no
+		// signed-mode short-circuit: `gemini` is deliberately IN the default
+		// allowlist (a raw execute of `gemini …` has no manager-only gates to
+		// bypass), so the codex/claude-native gating shape applies as-is.
+		allowCommand = "gemini"
+		allowArgs = buildGeminiACPArgs(cmd.Args)
+		dialogArgs = allowArgs
+		denyOutput = "gemini ACP session denied by user: not in allow list"
 	case "grok_acp_start":
 		// Unlike codex_appserver_start, grok_acp_start is NOT gated through
 		// the shared execute allowlist or approval dialog WHEN signing is
@@ -2747,6 +2770,10 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 	}
 	if isGrokACPCommand(cmd.Type) {
 		handleGrokACPCommand(ctx, topic, cmd, cfg)
+		return
+	}
+	if isGeminiACPCommand(cmd.Type) {
+		handleGeminiACPCommand(ctx, topic, cmd, cfg)
 		return
 	}
 
@@ -3251,5 +3278,146 @@ func publishGrokACPError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[grok-acp] Failed to publish error: %v%s\n", colorRed, err, colorReset)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Gemini ACP (JSON-RPC over stdio) command routing
+   -------------------------------------------------------------------------- */
+
+// isGeminiACPCommand returns true if cmdType is one of the Gemini ACP command
+// kinds. Same shape as isGrokACPCommand; both families share the shared ACP
+// core's JSON-RPC stdio dispatcher pattern.
+func isGeminiACPCommand(cmdType string) bool {
+	switch cmdType {
+	case "gemini_acp_start", "gemini_acp_send", "gemini_acp_end":
+		return true
+	}
+	return false
+}
+
+// handleGeminiACPCommand dispatches gemini_acp_* commands to the
+// GeminiACPManager. Mirrors handleGrokACPCommand's shape — a single publishFn
+// is shared with the manager so it can stream JSON-RPC frames (responses,
+// session/update notifications, server-initiated permission requests) back
+// via Pub/Sub for the duration of the session. cfg drives per-session policy:
+// workspace-root containment (Config.WorkingDirectory). Gemini has no
+// API-key / always-approve gates — tool approvals ride inside the ACP
+// protocol and are answered by the orchestrator.
+func handleGeminiACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
+	if globalGeminiACPManager == nil {
+		publishGeminiACPError(ctx, topic, cmd, "gemini acp manager not initialized")
+		return
+	}
+
+	publishFn := newSessionPublishFn(topic, "[gemini-acp]")
+
+	switch cmd.Type {
+	case "gemini_acp_start":
+		if cmd.SessionID == "" {
+			publishGeminiACPError(ctx, topic, cmd, "sessionID is required for gemini_acp_start")
+			return
+		}
+
+		fmt.Printf("%s[gemini-acp] Starting session %s (workspace=%s)%s\n",
+			colorCyan, cmd.SessionID, cmd.WorkspaceID, colorReset)
+
+		opts := GeminiStartOptions{
+			TimeoutMs: cmd.TimeoutMs,
+		}
+		if cfg != nil {
+			opts.WorkspaceRoot = cfg.WorkingDirectory
+		}
+
+		err := globalGeminiACPManager.Start(
+			cmd.SessionID,
+			cmd.Cwd,
+			cmd.Args,
+			cmd.WorkspaceID,
+			cmd.UID,
+			opts,
+			publishFn,
+		)
+		if err != nil {
+			publishGeminiACPError(ctx, topic, cmd, fmt.Sprintf("failed to start gemini acp: %v", err))
+			return
+		}
+
+		// Synchronous ack so the orchestrator can proceed to send the ACP
+		// `initialize` request as soon as the pipe is up. The first
+		// gemini_acp_message will follow once gemini emits its initialize
+		// response on stdout.
+		publishFn(resultMsg{
+			ID:          cmd.ID,
+			WorkspaceID: cmd.WorkspaceID,
+			UID:         cmd.UID,
+			Output:      "Gemini ACP started",
+			Status:      "success",
+			Ts:          time.Now().UnixMilli(),
+			Version:     Version,
+			Type:        "gemini_acp_started",
+			SessionID:   cmd.SessionID,
+		})
+
+		// Arm the first-frame watchdog AFTER the ack publish. publishFn
+		// (newSessionPublishFn) can block for up to 30s when Pub/Sub is slow;
+		// arming the watchdog from Start would include that publish latency
+		// in the 45s budget and risk killing a healthy gemini that is just
+		// waiting on the orchestrator's `initialize` frame.
+		globalGeminiACPManager.ArmFirstFrameWatchdog(cmd.SessionID, publishFn)
+
+	case "gemini_acp_send":
+		if cmd.SessionID == "" {
+			publishGeminiACPError(ctx, topic, cmd, "sessionID is required for gemini_acp_send")
+			return
+		}
+		if cmd.Input == "" {
+			publishGeminiACPError(ctx, topic, cmd, "input (JSON-RPC frame) is required for gemini_acp_send")
+			return
+		}
+
+		if err := globalGeminiACPManager.Send(cmd.SessionID, cmd.Input); err != nil {
+			publishGeminiACPError(ctx, topic, cmd, fmt.Sprintf("failed to send to gemini acp: %v", err))
+			return
+		}
+
+	case "gemini_acp_end":
+		if cmd.SessionID == "" {
+			publishGeminiACPError(ctx, topic, cmd, "sessionID is required for gemini_acp_end")
+			return
+		}
+
+		fmt.Printf("%s[gemini-acp] Ending session %s%s\n",
+			colorYellow, cmd.SessionID, colorReset)
+
+		if err := globalGeminiACPManager.End(cmd.SessionID); err != nil {
+			publishGeminiACPError(ctx, topic, cmd, fmt.Sprintf("failed to end gemini acp session: %v", err))
+			return
+		}
+
+	default:
+		publishGeminiACPError(ctx, topic, cmd, fmt.Sprintf("unknown gemini acp command type: %s", cmd.Type))
+	}
+}
+
+// publishGeminiACPError surfaces a synchronous failure (bad request, manager
+// not ready, send failure) back to the orchestrator as a `gemini_acp_error`
+// frame so it can fail the in-flight call without waiting for a timeout.
+func publishGeminiACPError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
+	fmt.Printf("%s[gemini-acp] Error: %s%s\n", colorRed, errMsg, colorReset)
+
+	res := resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		Output:      errMsg,
+		Status:      "error",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "gemini_acp_error",
+		SessionID:   cmd.SessionID,
+	}
+	if err := publishMsg(ctx, topic, res); err != nil {
+		fmt.Printf("%s[gemini-acp] Failed to publish error: %v%s\n", colorRed, err, colorReset)
 	}
 }

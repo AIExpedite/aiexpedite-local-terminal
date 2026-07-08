@@ -129,6 +129,12 @@ func tearDownSubprocesses() {
 		globalGrokACPManager.ShutdownAll()
 	}
 
+	// Same rationale for the Gemini ACP manager — children hold the user's
+	// Gemini OAuth session and keep drawing on its quota until ended.
+	if globalGeminiACPManager != nil {
+		globalGeminiACPManager.ShutdownAll()
+	}
+
 	// Same rationale for the Claude native manager — stream-json children keep
 	// drawing on the interactive Claude allowance until ended.
 	if globalClaudeNativeManager != nil {

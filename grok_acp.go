@@ -4,24 +4,10 @@
 // to drive xAI Grok via its ACP (Agent Client Protocol) JSON-RPC 2.0 interface
 // over the child process' stdio (newline-delimited JSON).
 //
-// Mirrors CodexAppServerManager (codex_appserver.go) — the transport, framing,
-// fail-fast policy, lifecycle and cleanup story are identical between the two
-// integrations because the same orchestrator-side state machine drives both:
-//
-//   - We only enforce wire framing (a single JSON object per line, no embedded
-//     newlines, never silently drop a frame). All JSON-RPC semantics — method
-//     names, request/response correlation, `initialize`, `authenticate`,
-//     `session/new`, `session/prompt`, `session/update` streaming, approval
-//     responses — live in the orchestrator. Keeping this driver protocol-
-//     agnostic means Grok's ACP can evolve without dragging the agent along.
-//
-//   - Frames are forwarded VERBATIM as `grok_acp_message` results. Non-JSON
-//     lines become `grok_acp_error` so the orchestrator's state machine sees
-//     a clear failure instead of misinterpreting a malformed line as a real
-//     JSON-RPC response.
-//
-//   - Stderr is surfaced as `grok_acp_stderr` for diagnostics but is not
-//     protocol-critical.
+// The transport, framing, fail-fast policy, lifecycle and cleanup story live
+// in the shared ACP core (acp_core.go) — this file contributes only the
+// Grok-specific configuration: the `grok_acp_*` result-type names, the argv
+// builder/sanitiser, the env policy, and the isolated-GROK_HOME spawn setup.
 //
 // Auth posture is enforced by the orchestrator, not here: per the feature
 // brief, the orchestrator's `authenticate` flow MUST prefer Grok's
@@ -31,13 +17,6 @@
 // preserving the local Grok auth state (XAI_API_KEY and the `GROK_*` config
 // dir vars survive the env sanitiser) and stripping vars that would confuse
 // Grok inside a nested agent (CLAUDECODE / CLAUDE_ / CODEX_IDE_*).
-//
-// Lifecycle (identical shape to codex_appserver.go for operational
-// consistency): Start spawns the child, registers it in the global process
-// registry, and launches stdout + stderr reader goroutines. End closes stdin
-// first (ACP's documented graceful-shutdown path) and falls through to
-// interrupt + kill on timeout. waitForExit publishes a `grok_acp_ended` frame
-// and removes the session from the manager.
 // -----------------------------------------------------------------------------
 
 package main
@@ -48,152 +27,41 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
-const (
-	// grokACPMaxLineSize caps the bufio.Scanner buffer for a single JSONL
-	// frame. Matches the Codex manager's ceiling — session.go's CLI stream
-	// scanner uses the same 30 MB cap. The downstream Pub/Sub message limit
-	// is 10 MB, so frames bigger than grokACPMaxFrameSize cannot survive a
-	// publish and are session-fatal.
-	grokACPMaxLineSize = 30 * 1024 * 1024
-
-	// grokACPMaxFrameSize is a cheap pre-check on the raw stdout line. Frames
-	// bigger than this cannot possibly fit Pub/Sub's 10 MB envelope before
-	// JSON escaping, so we reject them without building a resultMsg. The
-	// authoritative gate is grokACPMaxPublishSize below — the Output field is
-	// JSON-string-escaped on marshal, so a frame heavy in '"' / '\' can
-	// roughly double in size, meaning a line that passes this pre-check can
-	// still fail the marshaled-envelope check. Frames that fail either check
-	// are session-fatal — silently dropping one would deadlock the
-	// orchestrator's JSON-RPC state machine waiting for a response that never
-	// arrives.
-	grokACPMaxFrameSize = 8 * 1024 * 1024
-
-	// grokACPMaxPublishSize is GCP Pub/Sub's documented per-message publish
-	// limit. After building each resultMsg, the stream reader marshals it and
-	// rejects envelopes that exceed this ceiling — that catches the case
-	// where Grok emits a frame whose raw bytes are under grokACPMaxFrameSize
-	// but whose JSON-string-escaped Output field marshals beyond what Pub/Sub
-	// will accept.
-	grokACPMaxPublishSize = 10_000_000
-
-	// grokACPStdinWriteTimeout is the upper bound on a single stdin write
-	// before we declare the pipe stalled. Matches session.go's SendInput
-	// budget.
-	grokACPStdinWriteTimeout = 10 * time.Second
-
-	// grokACPGracefulShutdownTimeout is how long End waits after closing
-	// stdin (ACP's documented exit path) before escalating to SIGINT and
-	// ultimately SIGKILL.
-	grokACPGracefulShutdownTimeout = 5 * time.Second
-
-	// grokACPStreamDrainTimeout is how long waitForExit waits for the
-	// stdout/stderr readers to finish draining buffered frames before
-	// publishing `grok_acp_ended`. Generous to avoid racing the last JSON-RPC
-	// response with the exit notification.
-	grokACPStreamDrainTimeout = 30 * time.Second
-
-	// grokACPMaxLifetime caps how long a session may stay open before
-	// CleanupStale ends it. Matches SessionManager's 6 h ceiling so an
-	// orchestrator crash can't leak grok children indefinitely (each child
-	// holds a Grok auth session and may keep billing).
-	grokACPMaxLifetime = 6 * time.Hour
-
-	// grokACPCleanupInterval is how often the stale cleanup goroutine scans
-	// for expired sessions.
-	grokACPCleanupInterval = 60 * time.Second
-
-	// grokACPPublishQueueSize bounds the per-session publish backlog. Every
-	// ACP frame is a stateful JSON-RPC message (request id, session/update
-	// notification, approval request) — losing one corrupts the session, so
-	// frames are enqueued in order and drained by a single publisher
-	// goroutine. If the queue fills we surface a fatal error and kill the
-	// child rather than silently dropping.
-	grokACPPublishQueueSize = 256
-
-	// grokACPEnqueueTimeout is the upper bound for the stream readers to
-	// wait when the publish queue is full. Hitting this means Pub/Sub has
-	// stalled for a sustained period; the session cannot continue safely so
-	// the manager publishes a `grok_acp_error` surface and force-kills the
-	// child to fail-fast.
-	grokACPEnqueueTimeout = 30 * time.Second
-
-	// grokACPFirstFrameTimeout bounds how long we wait, AFTER the
-	// `grok_acp_started` ack publish completes, for grok to emit its FIRST
-	// stdout frame. A healthy `grok agent stdio` answers the orchestrator's
-	// `initialize` request within ~1s, so the first `grok_acp_message`
-	// normally lands a second or two after the ack (the gap is just one
-	// Pub/Sub round-trip for the orchestrator to send `initialize`). A child
-	// that stays completely silent past this window is almost always blocked
-	// needing INTERACTIVE re-authentication: when grok's cached login token
-	// expires it wants a browser sign-in flow it cannot present over headless
-	// stdio, so it launches, we publish "Grok ACP started", and then it sits
-	// forever with no output. Without this watchdog such a session hangs
-	// until the optional per-session deadline (which is frequently 0 = none)
-	// or the 6h stale GC — the exact silent "stuck at Grok ACP started"
-	// failure this guards against. The dispatcher arms this timer via
-	// ArmFirstFrameWatchdog after the ack publish so the up-to-30s
-	// newSessionPublishFn timeout never eats into the budget — arming it
-	// directly in Start could otherwise reduce the effective window enough
-	// to kill a healthy grok waiting on `initialize` under slow Pub/Sub.
-	grokACPFirstFrameTimeout = 45 * time.Second
-)
-
-/* --------------------------------------------------------------------------
-   GrokACPSession — one running `grok agent stdio` process
-   -------------------------------------------------------------------------- */
-
-// GrokACPSession holds a single child process and its stdio pipes. All public
-// state is guarded by mu; stdin writes are serialised separately by stdinMu
-// so concurrent Send callers cannot interleave JSONL frames.
-type GrokACPSession struct {
-	ID          string
-	Process     *exec.Cmd
-	Stdin       io.WriteCloser
-	Stdout      io.ReadCloser
-	Stderr      io.ReadCloser
-	StartedAt   time.Time
-	WorkspaceID string
-	UID         string
-	TimeoutMs   int64 // 0 = no per-session timeout (rely on grokACPMaxLifetime stale GC)
-	// WorkspaceRoot is the symlink-resolved containment root captured at Start
-	// (empty when the dispatcher didn't configure one). Send uses it to
-	// re-enforce containment on later JSON-RPC session-setup frames
-	// (`session/new` and `session/load`) whose `params.cwd` would otherwise
-	// bypass the gate Start applied to the process-level cwd.
-	WorkspaceRoot string
-	// IsolatedHome is the per-session temp dir Start points the child's
-	// GROK_HOME at (a copy of the real auth file + a minimal clean
-	// config.toml). It is removed best-effort exactly once, after the child
-	// has exited (waitForExit), so we never delete the copied auth.json out
-	// from under a running grok process. Always set on a successfully started
-	// session because Start fails closed when isolation can't be established.
-	IsolatedHome string
-
-	mu           sync.Mutex
-	status       string // "running" | "ended"
-	exitCode     int
-	stdinMu      sync.Mutex
-	stdinClose   sync.Once
-	done         chan struct{}
-	streamDone   chan struct{}
-	seq          int64
-	timeoutTimer *time.Timer // armed only when TimeoutMs > 0
-	// firstFrame is closed (exactly once, via firstFrameOnce) the moment the
-	// stdout reader sees grok's first frame. The first-frame watchdog
-	// (watchFirstFrame) selects on it to disarm itself the instant grok
-	// proves it is alive and producing output.
-	firstFrame     chan struct{}
-	firstFrameOnce sync.Once
+// grokACPSpec parameterises the shared ACP core for the Grok family. The
+// stall hint mirrors the historical watchdog wording: a silent `grok agent
+// stdio` is almost always blocked on an interactive re-authentication it
+// cannot present over headless stdio.
+var grokACPSpec = acpSpec{
+	family:      "grok_acp",
+	logTag:      "grok-acp",
+	noun:        "grok acp",
+	agentName:   "grok",
+	transport:   "grok agent stdio",
+	startHint:   "is `grok` on PATH or in ~/.grok/bin? run `grok login` to authenticate",
+	stallHint:   "it is most likely not signed in on this computer (its saved grok login/token expired; run `grok` in a terminal on the terminal computer to sign in again) or wedged at startup.",
+	messageType: "grok_acp_message",
+	stderrType:  "grok_acp_stderr",
+	errorType:   "grok_acp_error",
+	endedType:   "grok_acp_ended",
+	// Grok usage-limit telemetry: the ACP transport is the primary path for
+	// normal Grok sessions (`grok_acp_start`), and xAI surfaces the
+	// `usage_limit_reached` / `credit_limit_*` / `allow_access:false`
+	// signals as `session/update` notifications on that stdout stream. The
+	// raw `session_start` path in session.go already calls
+	// captureGrokUsageLimitLine; without this hook, the CLI Agents card
+	// stays Unknown for the primary Grok flow.
+	captureLine: captureGrokUsageLimitLine,
 }
+
+// GrokACPSession is the Grok-family view of a shared ACP session. Alias
+// rather than a wrapper: the session carries no Grok-specific state (the
+// isolated GROK_HOME rides in the generic CleanupDir field).
+type GrokACPSession = acpSession
 
 // GrokStartOptions bundles the per-session policy knobs the dispatcher reads
 // from Config + commandMsg before spawning a Grok ACP child. Bundled rather
@@ -203,7 +71,7 @@ type GrokStartOptions struct {
 	// TimeoutMs is the backend-requested per-session deadline. 0 means
 	// "no deadline" and the session lives until the 6h stale GC, End(),
 	// orchestrator-driven cancellation, or the child's natural exit. Values
-	// above grokACPMaxLifetime are clamped to grokACPMaxLifetime — a
+	// above acpMaxLifetime are clamped to acpMaxLifetime — a
 	// runaway-orchestrator can't request a longer session than our GC
 	// would tolerate anyway.
 	TimeoutMs int64
@@ -234,50 +102,21 @@ type GrokStartOptions struct {
 	WorkspaceRoot string
 }
 
-// Status returns the current lifecycle status under the session mutex so
-// callers don't race with waitForExit's transition to "ended".
-func (s *GrokACPSession) Status() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.status
-}
-
-// closeStdin is idempotent: the End fallback path calls it after stdin may
-// already have been closed by waitForExit, and the second close would
-// otherwise return an `io: already closed` error.
-func (s *GrokACPSession) closeStdin() {
-	s.stdinClose.Do(func() {
-		_ = s.Stdin.Close()
-	})
-}
-
-// signalFirstFrame records that grok has emitted its first stdout frame. It is
-// idempotent (sync.Once) so the per-line hot path in the stdout reader can call
-// it unconditionally without a guard. Closing the channel — rather than setting
-// a flag — lets the first-frame watchdog block on it directly and wake the
-// instant grok proves it is alive.
-func (s *GrokACPSession) signalFirstFrame() {
-	s.firstFrameOnce.Do(func() {
-		close(s.firstFrame)
-	})
-}
-
 /* --------------------------------------------------------------------------
-   GrokACPManager — tracks every active session
+   GrokACPManager — Grok configuration over the shared ACP core
    -------------------------------------------------------------------------- */
 
 // GrokACPManager owns the active `grok agent stdio` processes. One manager
-// handles many concurrent sessions, mirroring SessionManager's shape.
+// handles many concurrent sessions, mirroring SessionManager's shape. All
+// generic lifecycle methods (Send/End/Get/ActiveCount/CleanupStale/
+// ShutdownAll/ArmFirstFrameWatchdog) are promoted from the embedded core.
 type GrokACPManager struct {
-	sessions map[string]*GrokACPSession
-	mu       sync.RWMutex
+	acpManager
 }
 
 // NewGrokACPManager creates a fresh manager.
 func NewGrokACPManager() *GrokACPManager {
-	return &GrokACPManager{
-		sessions: make(map[string]*GrokACPSession),
-	}
+	return &GrokACPManager{acpManager: newACPManager(grokACPSpec)}
 }
 
 // Start launches `grok agent stdio` in cwd. extraArgs are passed through
@@ -285,908 +124,74 @@ func NewGrokACPManager() *GrokACPManager {
 // Grok-specific config knobs (e.g. `--model grok-2-fast`) without us
 // special-casing every Grok flag. opts carries the per-session policy knobs
 // (timeout, API-key gating, workspace containment) the dispatcher sourced
-// from Config + commandMsg.
-//
-// publishFn receives:
-//   - `grok_acp_message` for every JSONL frame Grok emits on stdout
-//   - `grok_acp_stderr`  for every line Grok emits on stderr
-//   - `grok_acp_error`   when Grok emits a non-JSON line (protocol bug) OR
-//     when opts.TimeoutMs fires before the child exits naturally
-//   - `grok_acp_ended`   when the process exits, carrying ExitCode
+// from Config + commandMsg. The shared core owns cwd validation, containment
+// and process lifecycle; the prepare callback below owns everything
+// Grok-specific about the spawn.
 func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, uid string, opts GrokStartOptions, publishFn PublishFunc) error {
-	if id == "" {
-		return fmt.Errorf("sessionID is required")
-	}
-	if publishFn == nil {
-		return fmt.Errorf("publishFn is required")
-	}
+	return m.start(id, cwd, opts.WorkspaceRoot, opts.TimeoutMs, workspaceID, uid, publishFn, func() (acpSpawnPlan, error) {
+		executable := resolveExecutable("grok")
+		// PATH lookup miss is the common failure mode for macOS GUI/launchd
+		// agents — Grok's installer drops the binary in ~/.grok/bin and only
+		// touches shell rc, which the agent process never sources. Fall back to
+		// the installer's default location before failing so a logged-in user
+		// doesn't have to manually re-export PATH.
+		if executable == "grok" {
+			if p := resolveGrokInstallerBinary(); p != "" {
+				executable = p
+			}
+		}
+		// System-level requirements.toml (`/etc/grok/requirements.toml`) is NOT
+		// redirected by GROK_HOME — that's the whole point of a system layer. The
+		// per-session GROK_HOME isolation below neutralises the user-level layer
+		// by omission, but a managed host that pins API-key auth or an always-
+		// approve policy in the system file would still bypass the workspace's
+		// opt-in gates. Fail closed before we spawn rather than silently launching
+		// with the unsafe pinned posture. Opt out by setting both
+		// EnableGrokAPIKeyFallback and EnableGrokAlwaysApprove to acknowledge the
+		// pinned posture (or remove the system requirements file).
+		if err := detectPinnedSystemGrokRequirements(opts.AllowAPIKeyFallback, opts.AllowAlwaysApprove); err != nil {
+			return acpSpawnPlan{}, err
+		}
 
-	// cwd is required and must point at an existing directory. Falling back
-	// to the agent's working directory would silently run grok against a
-	// surprise path (e.g. C:\Program Files\AI Expedite on Windows), exposing
-	// or editing files unrelated to the requested workspace. The local
-	// terminal's workspace/path safety rules treat this as session-fatal at
-	// startup rather than tolerating an empty cwd as the legacy CLI path
-	// does.
-	if cwd == "" {
-		return fmt.Errorf("cwd is required for grok agent stdio (must point at a workspace directory)")
-	}
-	if !filepath.IsAbs(cwd) {
-		return fmt.Errorf("cwd must be an absolute path; got %q", cwd)
-	}
-	if info, err := os.Stat(cwd); err != nil {
-		return fmt.Errorf("cwd %q is not accessible: %w", cwd, err)
-	} else if !info.IsDir() {
-		return fmt.Errorf("cwd %q is not a directory", cwd)
-	}
+		args := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove)
+		// args is `{"agent", "--model", <model>, ...}` by buildGrokACPArgs's
+		// validated contract (see grokACPDefaultModel block); pull args[2] so
+		// setupIsolatedGrokHome carries over the matching per-model api_key when
+		// the user keeps it in the `[model.<resolvedModel>]` form.
+		resolvedModel := grokACPDefaultModel
+		if len(args) >= 3 && args[1] == "--model" {
+			resolvedModel = args[2]
+		}
 
-	// Workspace-root containment (finding #1 from secondary review):
-	// resolve symlinks on both sides and reject anything that escapes the
-	// configured root. Without this, a signed grok_acp_start could launch
-	// Grok against any directory the OS user can read/write, sidestepping
-	// the workspace/path safety stance the rest of the agent enforces. When
-	// the dispatcher does not configure a root (opts.WorkspaceRoot == "")
-	// we skip the check — preserving the existing absolute/exists contract
-	// for callers that have their own out-of-band containment.
-	resolvedCwd, err := filepath.EvalSymlinks(cwd)
-	if err != nil {
-		return fmt.Errorf("cwd %q symlink resolution failed: %w", cwd, err)
-	}
-	var resolvedRoot string
-	if opts.WorkspaceRoot != "" {
-		resolvedRoot, err = filepath.EvalSymlinks(opts.WorkspaceRoot)
+		// Isolated GROK_HOME (replaces the old `--config <key>=` security
+		// neutralizers, which are GONE as of grok 0.2.59 — `grok agent` rejects
+		// `--config` / `--permission-mode` / `--no-auto-update` with "unexpected
+		// argument", so the entire persisted-config-clear-via-argv approach is
+		// dead). Instead we point the child at a per-session temp dir that
+		// contains ONLY a copy of the real `grok login` auth file plus a minimal
+		// clean config.toml. By NOT copying the user's real config.toml /
+		// requirements.toml we neutralise every persisted-config vector by
+		// omission: no `api_key` billing override, no auto-approve / permission
+		// bypass, no pinned requirements layer. The cached-token handshake still
+		// works because the auth file is the one piece we deliberately copy in.
+		// Fail closed if isolation can't be established: with `--config` gone, the
+		// argv has no neutralizers, so launching with the inherited (potentially
+		// unsafe) GROK_HOME would silently bypass the workspace's opt-in gates.
+		isolatedHome, err := setupIsolatedGrokHome(opts.AllowAPIKeyFallback, resolvedModel)
 		if err != nil {
-			return fmt.Errorf("workspace root %q symlink resolution failed: %w", opts.WorkspaceRoot, err)
+			return acpSpawnPlan{}, fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)
 		}
-		if !pathInsideRoot(resolvedCwd, resolvedRoot) {
-			return fmt.Errorf("cwd %q is outside the configured workspace root %q", resolvedCwd, resolvedRoot)
-		}
-	}
 
-	// Hold the manager mutex across the entire spawn so two concurrent Start
-	// calls for the same id can't both pass the existence check and double-
-	// spawn (the previous check-release-insert pattern had that TOCTOU race).
-	// Mirrors CodexAppServerManager.Start and SessionManager.StartSession.
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if _, exists := m.sessions[id]; exists {
-		return fmt.Errorf("grok acp session %s already exists", id)
-	}
-
-	executable := resolveExecutable("grok")
-	// PATH lookup miss is the common failure mode for macOS GUI/launchd
-	// agents — Grok's installer drops the binary in ~/.grok/bin and only
-	// touches shell rc, which the agent process never sources. Fall back to
-	// the installer's default location before failing so a logged-in user
-	// doesn't have to manually re-export PATH.
-	if executable == "grok" {
-		if p := resolveGrokInstallerBinary(); p != "" {
-			executable = p
-		}
-	}
-	// System-level requirements.toml (`/etc/grok/requirements.toml`) is NOT
-	// redirected by GROK_HOME — that's the whole point of a system layer. The
-	// per-session GROK_HOME isolation below neutralises the user-level layer
-	// by omission, but a managed host that pins API-key auth or an always-
-	// approve policy in the system file would still bypass the workspace's
-	// opt-in gates. Fail closed before we spawn rather than silently launching
-	// with the unsafe pinned posture. Opt out by setting both
-	// EnableGrokAPIKeyFallback and EnableGrokAlwaysApprove to acknowledge the
-	// pinned posture (or remove the system requirements file).
-	if err := detectPinnedSystemGrokRequirements(opts.AllowAPIKeyFallback, opts.AllowAlwaysApprove); err != nil {
-		return err
-	}
-
-	args := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove)
-	// args is `{"agent", "--model", <model>, ...}` by buildGrokACPArgs's
-	// validated contract (see grokACPDefaultModel block); pull args[2] so
-	// setupIsolatedGrokHome carries over the matching per-model api_key when
-	// the user keeps it in the `[model.<resolvedModel>]` form.
-	resolvedModel := grokACPDefaultModel
-	if len(args) >= 3 && args[1] == "--model" {
-		resolvedModel = args[2]
-	}
-
-	// Isolated GROK_HOME (replaces the old `--config <key>=` security
-	// neutralizers, which are GONE as of grok 0.2.59 — `grok agent` rejects
-	// `--config` / `--permission-mode` / `--no-auto-update` with "unexpected
-	// argument", so the entire persisted-config-clear-via-argv approach is
-	// dead). Instead we point the child at a per-session temp dir that
-	// contains ONLY a copy of the real `grok login` auth file plus a minimal
-	// clean config.toml. By NOT copying the user's real config.toml /
-	// requirements.toml we neutralise every persisted-config vector by
-	// omission: no `api_key` billing override, no auto-approve / permission
-	// bypass, no pinned requirements layer. The cached-token handshake still
-	// works because the auth file is the one piece we deliberately copy in.
-	// Fail closed if isolation can't be established: with `--config` gone, the
-	// argv has no neutralizers, so launching with the inherited (potentially
-	// unsafe) GROK_HOME would silently bypass the workspace's opt-in gates.
-	isolatedHome, err := setupIsolatedGrokHome(opts.AllowAPIKeyFallback, resolvedModel)
-	if err != nil {
-		return fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)
-	}
-
-	fmt.Printf("%s[grok-acp] Starting session %s: %s %s%s\n",
-		colorCyan, id, executable, strings.Join(redactGrokACPArgsForLog(args), " "), colorReset)
-
-	proc := exec.Command(executable, args...)
-	hideWindow(proc)
-	if cwd != "" {
-		proc.Dir = cwd
-	}
-	env := sanitizeGrokACPEnv(os.Environ(), opts.AllowAPIKeyFallback)
-	env = setEnvVar(env, "GROK_HOME", isolatedHome)
-	proc.Env = env
-
-	// cleanupIsolatedHome removes the per-session temp dir on any pre-spawn
-	// failure path. Once the child is successfully started, ownership of the
-	// dir transfers to waitForExit (which removes it after the process exits),
-	// so we must NOT call this after a successful proc.Start().
-	cleanupIsolatedHome := func() {
-		_ = os.RemoveAll(isolatedHome)
-	}
-
-	stdin, err := proc.StdinPipe()
-	if err != nil {
-		cleanupIsolatedHome()
-		return fmt.Errorf("failed to create stdin pipe: %w", err)
-	}
-	stdout, err := proc.StdoutPipe()
-	if err != nil {
-		stdin.Close()
-		cleanupIsolatedHome()
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-	stderr, err := proc.StderrPipe()
-	if err != nil {
-		stdin.Close()
-		stdout.Close()
-		cleanupIsolatedHome()
-		return fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
-
-	if err := proc.Start(); err != nil {
-		stdin.Close()
-		stdout.Close()
-		stderr.Close()
-		cleanupIsolatedHome()
-		return fmt.Errorf("failed to start grok agent stdio (is `grok` on PATH or in ~/.grok/bin? run `grok login` to authenticate): %w", err)
-	}
-
-	// Clamp the requested timeout at our stale-GC ceiling. A misbehaving
-	// orchestrator that requests TimeoutMs > grokACPMaxLifetime would
-	// otherwise outlive the GC anyway; clamping makes the effective deadline
-	// predictable and keeps the timer firing meaningful.
-	timeoutMs := opts.TimeoutMs
-	if timeoutMs < 0 {
-		timeoutMs = 0
-	}
-	if max := int64(grokACPMaxLifetime / time.Millisecond); timeoutMs > max {
-		timeoutMs = max
-	}
-
-	session := &GrokACPSession{
-		ID:            id,
-		Process:       proc,
-		Stdin:         stdin,
-		Stdout:        stdout,
-		Stderr:        stderr,
-		StartedAt:     time.Now(),
-		WorkspaceID:   workspaceID,
-		UID:           uid,
-		TimeoutMs:     timeoutMs,
-		WorkspaceRoot: resolvedRoot,
-		IsolatedHome:  isolatedHome,
-		status:        "running",
-		done:          make(chan struct{}),
-		streamDone:    make(chan struct{}),
-		firstFrame:    make(chan struct{}),
-	}
-
-	m.sessions[id] = session
-
-	if proc.Process != nil {
-		globalProcessRegistry.Register(proc.Process.Pid, "grok-acp:"+id)
-	}
-
-	// Per-session deadline. Reserve the typed-error Seq BEFORE Kill() and
-	// publish AFTER. The reservation ordering matters because Kill() races
-	// with waitForExit: a fast exit can publish `grok_acp_ended` (which
-	// increments session.seq) before this callback would otherwise allocate
-	// its own Seq, letting the orchestrator order the terminal _ended frame
-	// before the timeout error or drop the error as post-terminal. Taking
-	// the AddInt64 first nails down a Seq strictly less than whatever
-	// _ended ends up with, so even though both publishes are asynchronous
-	// the orchestrator sees timeout → ended causal order. The publish is
-	// still deferred until after Kill() because the production
-	// newSessionPublishFn can block for the full Pub/Sub publish timeout
-	// (~30s) when Pub/Sub is slow or unavailable; killing first guarantees
-	// the orchestrator sees the child terminate on schedule and the
-	// natural exit publishes `grok_acp_ended` via waitForExit even if this
-	// diagnostic publish itself ultimately fails. Timer is Stop()'d in
-	// waitForExit on natural exit so a freshly-exited session can't
-	// double-fire the timeout publish.
-	if session.TimeoutMs > 0 {
-		session.timeoutTimer = time.AfterFunc(time.Duration(session.TimeoutMs)*time.Millisecond, func() {
-			if session.Status() == "ended" {
-				return
-			}
-			seq := atomic.AddInt64(&session.seq, 1)
-			fmt.Printf("%s[grok-acp] Session %s timed out after %dms — killing%s\n",
-				colorYellow, session.ID, session.TimeoutMs, colorReset)
-			if session.Process != nil && session.Process.Process != nil {
-				_ = session.Process.Process.Kill()
-			}
-			publishFn(resultMsg{
-				ID:          session.ID,
-				WorkspaceID: session.WorkspaceID,
-				UID:         session.UID,
-				Output:      fmt.Sprintf("grok acp session timed out after %dms — terminated by per-session deadline", session.TimeoutMs),
-				Status:      "error",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "grok_acp_error",
-				SessionID:   session.ID,
-				Seq:         int(seq),
-			})
-		})
-	}
-
-	go m.readStream(session, publishFn)
-	go m.waitForExit(session, publishFn)
-	// NOTE: the first-frame watchdog is NOT armed here. The dispatcher arms it
-	// via ArmFirstFrameWatchdog AFTER the `grok_acp_started` ack publish
-	// completes, so the budget excludes ack-publish latency (newSessionPublishFn
-	// can block for up to 30s when Pub/Sub is slow). Arming here would let a
-	// slow ack publish shrink the window enough to kill a healthy grok that is
-	// just waiting on the orchestrator's `initialize` frame.
-
-	fmt.Printf("%s[grok-acp] Session %s started (PID: %d)%s\n",
-		colorGreen, id, proc.Process.Pid, colorReset)
-	return nil
-}
-
-// ArmFirstFrameWatchdog starts the first-frame watchdog for an already-started
-// session. Split out from Start so the dispatcher can call it AFTER the
-// synchronous `grok_acp_started` ack publish completes — that publish can take
-// up to 30s on a slow Pub/Sub, and including it in the watchdog budget would
-// risk killing a healthy grok that is just waiting on the orchestrator's
-// `initialize` frame. No-op if the session is unknown (already removed) or
-// already exited.
-func (m *GrokACPManager) ArmFirstFrameWatchdog(id string, publishFn PublishFunc) {
-	session := m.Get(id)
-	if session == nil {
-		return
-	}
-	if session.Status() == "ended" {
-		return
-	}
-	go m.watchFirstFrame(session, publishFn, grokACPFirstFrameTimeout)
-}
-
-// Send writes a single JSON-RPC 2.0 frame to the child's stdin. payload must
-// be a self-contained JSON object — typically an ACP request, response or
-// notification. Send validates that the payload is parseable JSON and
-// contains no embedded newlines (which would corrupt the JSONL framing on
-// the wire) but never edits its content, so callers retain exact control
-// over JSON-RPC ids and method names.
-//
-// Timeout policy is fail-fast: on stdin write timeout the manager kills the
-// child and closes stdin BEFORE returning. This guarantees no later Send can
-// race with the abandoned write goroutine — the next Send sees Status=ended
-// and rejects, and the orphaned write (if it ever wakes up) lands on a
-// closed pipe.
-func (m *GrokACPManager) Send(id string, payload string) error {
-	session := m.Get(id)
-	if session == nil {
-		return fmt.Errorf("grok acp session %s not found", id)
-	}
-
-	trimmed := strings.TrimSpace(payload)
-	if trimmed == "" {
-		return fmt.Errorf("payload is empty")
-	}
-	if strings.ContainsAny(trimmed, "\r\n") {
-		return fmt.Errorf("payload must be a single line of JSON (no embedded newlines); got %d bytes", len(trimmed))
-	}
-	var probe json.RawMessage
-	if err := json.Unmarshal([]byte(trimmed), &probe); err != nil {
-		return fmt.Errorf("payload is not valid JSON: %w", err)
-	}
-	// ACP stdio frames are individual JSON-RPC 2.0 messages — a
-	// request, notification or response, each a single JSON object per
-	// line. Top-level arrays (JSON-RPC batch form) and scalars are out
-	// of spec for ACP and must be rejected here rather than passed to
-	// the child: validateGrokACPSendCwd's session-setup containment
-	// gate only inspects object-shaped frames, so a batched
-	// `[{"method":"session/new", "params":{"cwd":"/outside"}}, ...]`
-	// would otherwise skip the cwd check and reach Grok unfiltered.
-	if trimmed[0] != '{' {
-		return fmt.Errorf("payload must be a single JSON-RPC object; batch arrays and scalar frames are not supported on ACP stdio")
-	}
-
-	// Re-enforce workspace containment on ACP session-setup frames
-	// (`session/new` and `session/load`). Start already gated the
-	// process-level cwd, but both setup verbs can carry their own
-	// `params.cwd` that Grok will use as the session root — without this
-	// check a later signed grok_acp_send (including one that resumes a
-	// prior session) could point Grok at a path outside the configured
-	// workspace and bypass the original Start gate. Skipped when the
-	// session was launched without a containment root (mirrors Start's
-	// behaviour) or when the frame omits `params.cwd`.
-	if session.WorkspaceRoot != "" {
-		if err := validateGrokACPSendCwd(trimmed, session.WorkspaceRoot); err != nil {
-			return err
-		}
-	}
-
-	session.stdinMu.Lock()
-	defer session.stdinMu.Unlock()
-
-	// Re-check Status under stdinMu so we cannot pass the gate after another
-	// goroutine has already started tearing the session down via End() or
-	// the timeout-fail path below.
-	if session.Status() == "ended" {
-		return fmt.Errorf("grok acp session %s has ended", id)
-	}
-
-	writeDone := make(chan error, 1)
-	go func() {
-		_, err := fmt.Fprintln(session.Stdin, trimmed)
-		writeDone <- err
-	}()
-	select {
-	case err := <-writeDone:
-		if err != nil {
-			return fmt.Errorf("failed to write to grok acp session %s stdin: %w", id, err)
-		}
-	case <-time.After(grokACPStdinWriteTimeout):
-		// Fatal: a stalled write is a signal that grok isn't draining stdin.
-		// Continuing would let the next Send acquire stdinMu and interleave
-		// its frame with the abandoned write's eventual completion. Close
-		// stdin to unblock the abandoned goroutine immediately, transition
-		// to "ended" so concurrent/subsequent Sends short-circuit, and kill
-		// the child so waitForExit publishes grok_acp_ended.
-		session.closeStdin()
-		session.mu.Lock()
-		session.status = "ended"
-		session.mu.Unlock()
-		if session.Process != nil && session.Process.Process != nil {
-			_ = session.Process.Process.Kill()
-		}
-		return fmt.Errorf("timeout writing to grok acp session %s stdin — session terminated to prevent frame interleave", id)
-	}
-
-	fmt.Printf("%s[grok-acp] → %s (%d bytes)%s\n",
-		colorBlue, id, len(trimmed), colorReset)
-	return nil
-}
-
-// End shuts down a session. First it closes stdin (ACP's documented exit
-// path). If the process is still alive after grokACPGracefulShutdownTimeout
-// we interrupt it, and if that also fails we SIGKILL.
-func (m *GrokACPManager) End(id string) error {
-	session := m.Get(id)
-	if session == nil {
-		return fmt.Errorf("grok acp session %s not found", id)
-	}
-
-	if session.Status() == "ended" {
-		m.removeSession(id)
-		return nil
-	}
-
-	fmt.Printf("%s[grok-acp] Ending session %s gracefully...%s\n",
-		colorYellow, id, colorReset)
-
-	session.closeStdin()
-
-	select {
-	case <-session.done:
-	case <-time.After(grokACPGracefulShutdownTimeout):
-		fmt.Printf("%s[grok-acp] Stdin close didn't exit %s — interrupting%s\n",
-			colorYellow, id, colorReset)
-		_ = interruptProcess(session.Process)
-		select {
-		case <-session.done:
-		case <-time.After(grokACPGracefulShutdownTimeout):
-			fmt.Printf("%s[grok-acp] Force killing session %s%s\n",
-				colorRed, id, colorReset)
-			if session.Process.Process != nil {
-				_ = session.Process.Process.Kill()
-			}
-			<-session.done
-		}
-	}
-
-	m.removeSession(id)
-	return nil
-}
-
-// Get returns the session for id, or nil if it does not exist.
-func (m *GrokACPManager) Get(id string) *GrokACPSession {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.sessions[id]
-}
-
-// ActiveCount returns the number of currently tracked sessions.
-func (m *GrokACPManager) ActiveCount() int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return len(m.sessions)
-}
-
-// CleanupStale runs periodically to end sessions that exceed maxAge. Call as
-// a goroutine: `go m.CleanupStale(grokACPMaxLifetime)`. Without this, an
-// orchestrator crash that drops the `grok_acp_end` signal would leak grok
-// children indefinitely.
-func (m *GrokACPManager) CleanupStale(maxAge time.Duration) {
-	ticker := time.NewTicker(grokACPCleanupInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			m.endStaleSessions(maxAge)
-		case <-shutdownChan:
-			return
-		}
-	}
-}
-
-// endStaleSessions ends any session whose StartedAt is older than maxAge.
-// Split out from CleanupStale so it can be unit-tested without driving the
-// ticker.
-func (m *GrokACPManager) endStaleSessions(maxAge time.Duration) {
-	m.mu.RLock()
-	var staleIDs []string
-	for id, session := range m.sessions {
-		if time.Since(session.StartedAt) > maxAge {
-			staleIDs = append(staleIDs, id)
-		}
-	}
-	m.mu.RUnlock()
-
-	for _, id := range staleIDs {
-		fmt.Printf("%s[grok-acp] Cleaning up stale session %s (exceeded %v)%s\n",
-			colorYellow, id, maxAge, colorReset)
-		_ = m.End(id)
-	}
-}
-
-// ShutdownAll ends every active session. Called during agent shutdown so
-// grok children don't outlive the agent and silently consume tokens.
-func (m *GrokACPManager) ShutdownAll() {
-	m.mu.RLock()
-	ids := make([]string, 0, len(m.sessions))
-	for id := range m.sessions {
-		ids = append(ids, id)
-	}
-	m.mu.RUnlock()
-	if len(ids) > 0 {
-		fmt.Printf("%s[grok-acp] Shutting down %d active session(s)...%s\n",
-			colorYellow, len(ids), colorReset)
-	}
-	for _, id := range ids {
-		_ = m.End(id)
-	}
-}
-
-func (m *GrokACPManager) removeSession(id string) {
-	m.mu.Lock()
-	if s, ok := m.sessions[id]; ok && s.Process != nil && s.Process.Process != nil {
-		globalProcessRegistry.Deregister(s.Process.Process.Pid)
-	}
-	delete(m.sessions, id)
-	m.mu.Unlock()
-}
-
-/* --------------------------------------------------------------------------
-   Stream + exit handling
-   -------------------------------------------------------------------------- */
-
-// readStream forwards every grok stdout frame as `grok_acp_message` and
-// every stderr line as `grok_acp_stderr`. stdout frames are validated as
-// JSON (so a malformed frame is surfaced as `grok_acp_error` instead of
-// being silently passed through), but the original line text is forwarded
-// verbatim — we never edit grok's wire format.
-//
-// Publishing uses a single ordered consumer goroutine that drains a bounded
-// queue. Every frame in the Grok ACP stdio protocol is a stateful JSON-RPC
-// message (a response correlated by id, a session/update notification, an
-// approval request); silently dropping one would corrupt the orchestrator's
-// session state.
-func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFunc) {
-	defer close(session.streamDone)
-
-	queue := make(chan resultMsg, grokACPPublishQueueSize)
-	publisherDone := make(chan struct{})
-	go func() {
-		defer close(publisherDone)
-		for msg := range queue {
-			publishFn(msg)
-		}
-	}()
-	defer func() {
-		close(queue)
-		<-publisherDone
-	}()
-
-	enqueue := func(msg resultMsg) bool {
-		select {
-		case queue <- msg:
-			return true
-		case <-time.After(grokACPEnqueueTimeout):
-			return false
-		}
-	}
-
-	// failSessionFatally surfaces a queue-stall diagnostic via a synchronous
-	// publish (bypassing the wedged queue) and kills the child so waitForExit
-	// publishes grok_acp_ended. Same caveat as the Codex manager: if Pub/Sub
-	// is genuinely down (not merely slow) this synchronous publish also blocks
-	// for the full publishFn timeout — the diagnostic only reliably lands when
-	// Pub/Sub is responsive-but-slow; a true outage degrades to "child killed
-	// late, no diagnostic" which is still safe (no dropped JSON-RPC frame is
-	// mistaken for a live session), just not observable.
-	failSessionFatally := func(reason string, droppedType string) {
-		fmt.Printf("%s[grok-acp] Publish queue stalled for %s — failing session (dropped %s)%s\n",
-			colorRed, session.ID, droppedType, colorReset)
-		seq := atomic.AddInt64(&session.seq, 1)
-		publishFn(resultMsg{
-			ID:          session.ID,
-			WorkspaceID: session.WorkspaceID,
-			UID:         session.UID,
-			Output:      reason,
-			Status:      "error",
-			Ts:          time.Now().UnixMilli(),
-			Version:     Version,
-			Type:        "grok_acp_error",
-			SessionID:   session.ID,
-			Seq:         int(seq),
-		})
-		if session.Process != nil && session.Process.Process != nil {
-			_ = session.Process.Process.Kill()
-		}
-	}
-
-	publishOrFail := func(msg resultMsg, droppedType string) bool {
-		encoded, err := json.Marshal(msg)
-		if err != nil {
-			failSessionFatally(
-				fmt.Sprintf("grok acp envelope failed to marshal: %v — session terminated", err),
-				droppedType,
-			)
-			return false
-		}
-		if len(encoded) > grokACPMaxPublishSize {
-			failSessionFatally(
-				fmt.Sprintf(
-					"grok acp envelope marshaled to %d bytes after JSON escaping, exceeding the %d-byte publishable limit — session terminated to avoid silent Pub/Sub rejection",
-					len(encoded), grokACPMaxPublishSize,
-				),
-				droppedType,
-			)
-			return false
-		}
-		if !enqueue(msg) {
-			failSessionFatally("grok acp publish queue stalled — terminating session to avoid dropping JSON-RPC frames", droppedType)
-			return false
-		}
-		return true
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		scanner := bufio.NewScanner(session.Stdout)
-		scanner.Buffer(make([]byte, 0, 256*1024), grokACPMaxLineSize)
-		fmt.Printf("%s[grok-acp] stdout scanner started for %s%s\n",
-			colorCyan, session.ID, colorReset)
-		lineCount := 0
-		for scanner.Scan() {
-			lineCount++
-			line := scanner.Text()
-			trimmed := strings.TrimSpace(line)
-			if trimmed == "" {
-				continue
-			}
-
-			if len(trimmed) > grokACPMaxFrameSize {
-				failSessionFatally(
-					fmt.Sprintf(
-						"grok emitted a %d-byte frame exceeding the %d-byte publishable limit — session terminated to avoid silent drop",
-						len(trimmed), grokACPMaxFrameSize,
-					),
-					"grok_acp_oversize_frame",
-				)
-				return
-			}
-
-			seq := atomic.AddInt64(&session.seq, 1)
-
-			var probe json.RawMessage
-			if err := json.Unmarshal([]byte(trimmed), &probe); err != nil {
-				fmt.Printf("%s[grok-acp] Non-JSON stdout frame on %s: %v (line=%s)%s\n",
-					colorRed, session.ID, err, truncateString(trimmed, 200), colorReset)
-				if !publishOrFail(resultMsg{
-					ID:          session.ID,
-					WorkspaceID: session.WorkspaceID,
-					UID:         session.UID,
-					Output:      fmt.Sprintf("non-JSON frame on grok acp stdout: %v", err),
-					Status:      "error",
-					Ts:          time.Now().UnixMilli(),
-					Version:     Version,
-					Type:        "grok_acp_error",
-					SessionID:   session.ID,
-					Seq:         int(seq),
-				}, "grok_acp_error") {
-					return
-				}
-				continue
-			}
-
-			// Valid JSON-RPC frame from grok — disarm the first-frame
-			// watchdog. We deliberately wait for a parseable frame here
-			// instead of signaling on any stdout: grok's auth/updater paths
-			// can print non-JSON banners or prompts and then stall waiting
-			// for input. Treating those as proof-of-life would disarm the
-			// watchdog while the ACP handshake is still hung. The non-JSON
-			// branch above only reports a `grok_acp_error` and keeps
-			// scanning, so the watchdog must stay armed until we see a real
-			// frame.
-			session.signalFirstFrame()
-
-			if lineCount <= 3 {
-				fmt.Printf("%s[grok-acp] stdout[%d] %s: %s%s\n",
-					colorCyan, lineCount, session.ID, truncateString(trimmed, 200), colorReset)
-			}
-
-			// Grok usage-limit telemetry: the ACP transport is the primary path
-			// for normal Grok sessions (`grok_acp_start`), and xAI surfaces the
-			// `usage_limit_reached` / `credit_limit_*` / `allow_access:false`
-			// signals as `session/update` notifications on this same stdout
-			// stream. The raw `session_start` path in session.go already calls
-			// captureGrokUsageLimitLine; without mirroring it here, the CLI
-			// Agents card stays Unknown for the primary Grok flow.
-			captureGrokUsageLimitLine(trimmed, time.Now())
-
-			if !publishOrFail(resultMsg{
-				ID:          session.ID,
-				WorkspaceID: session.WorkspaceID,
-				UID:         session.UID,
-				Output:      trimmed,
-				Status:      "success",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "grok_acp_message",
-				SessionID:   session.ID,
-				Seq:         int(seq),
-			}, "grok_acp_message") {
-				return
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			fmt.Printf("%s[grok-acp] stdout scanner error for %s: %v%s\n",
-				colorRed, session.ID, err, colorReset)
-			failSessionFatally(
-				fmt.Sprintf("grok stdout scanner error: %v — session terminated", err),
-				"grok_acp_scanner_error",
-			)
-		}
-		fmt.Printf("%s[grok-acp] stdout scanner done for %s (%d lines)%s\n",
-			colorYellow, session.ID, lineCount, colorReset)
-	}()
-
-	go func() {
-		defer wg.Done()
-		scanner := bufio.NewScanner(session.Stderr)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		fmt.Printf("%s[grok-acp] stderr scanner started for %s%s\n",
-			colorCyan, session.ID, colorReset)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if strings.TrimSpace(line) == "" {
-				continue
-			}
-			seq := atomic.AddInt64(&session.seq, 1)
-			fmt.Printf("%s[grok-acp] stderr %s: %s%s\n",
-				colorYellow, session.ID, truncateString(line, 200), colorReset)
-			if !publishOrFail(resultMsg{
-				ID:          session.ID,
-				WorkspaceID: session.WorkspaceID,
-				UID:         session.UID,
-				Output:      line,
-				Status:      "success",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "grok_acp_stderr",
-				SessionID:   session.ID,
-				Seq:         int(seq),
-			}, "grok_acp_stderr") {
-				return
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			// stderr is diagnostic, not protocol-critical: a lost/truncated
-			// stderr line cannot deadlock the orchestrator's JSON-RPC state
-			// machine the way a dropped stdout frame would. Log and continue.
-			fmt.Printf("%s[grok-acp] stderr scanner error for %s: %v%s\n",
-				colorRed, session.ID, err, colorReset)
-		}
-	}()
-
-	wg.Wait()
-}
-
-func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishFunc) {
-	// Reap the child via os.Process.Wait, NOT exec.Cmd.Wait. Per the
-	// StdoutPipe docs, "it is incorrect to call Wait before all reads from
-	// the pipe have completed" — exec.Cmd.Wait closes the parent ends of
-	// StdoutPipe/StderrPipe the moment the child exits, which can truncate
-	// the final JSON-RPC frame still buffered in the bufio.Scanner. When
-	// grok writes a response and exits in quick succession, that final
-	// frame is the one the orchestrator needs to complete the in-flight
-	// ACP request; losing it leaves the request stuck. Splitting exit
-	// detection (Process.Wait) from pipe cleanup (manual Close below,
-	// gated on streamDone) preserves the final frame while keeping the
-	// status-flip race fix intact.
-	state, _ := session.Process.Process.Wait()
-
-	// Flip status to "ended" and record exitCode BEFORE the stream-drain wait.
-	// The deadline timer's AfterFunc gates its publish+Kill on
-	// Status() == "ended"; if we postponed this flip until after drain
-	// (which can be slow under back-pressure), a timer that fires while we
-	// are draining would see status=="running", publish a spurious
-	// grok_acp_error AND Kill an already-exited PID. Both are observable
-	// upstream — the orchestrator would surface a phantom timeout error for
-	// a session that exited normally. Order is fixed: status flip → timer
-	// Stop → stream drain → pipe close. Stop() additionally elides a
-	// not-yet-fired timer, but it cannot interrupt an in-flight callback,
-	// which is why the status flip has to come first.
-	session.mu.Lock()
-	session.status = "ended"
-	if state != nil {
-		session.exitCode = state.ExitCode()
-	} else {
-		session.exitCode = -1
-	}
-	exit := session.exitCode
-	session.mu.Unlock()
-
-	if session.timeoutTimer != nil {
-		session.timeoutTimer.Stop()
-	}
-
-	// Drain the stdout/stderr scanner goroutines BEFORE closing pipes. The
-	// child's write ends are already closed (Process.Wait above only returns
-	// post-exit), so the scanners hit EOF naturally once they catch up on
-	// the OS pipe buffer — including the final JSON-RPC frame. If a scanner
-	// is wedged, the drain timeout falls through to a force-close that
-	// unblocks it; that path accepts the (rare) truncation because hanging
-	// this goroutine forever is strictly worse.
-	select {
-	case <-session.streamDone:
-	case <-time.After(grokACPStreamDrainTimeout):
-		fmt.Printf("%s[grok-acp] Stream drain timed out for %s — forcing pipe close%s\n",
-			colorYellow, session.ID, colorReset)
-		session.Stdout.Close()
-		session.Stderr.Close()
-	}
-
-	// Close the parent ends of every pipe. exec.Cmd.Wait would do this for
-	// us; since we bypassed it above we have to mop up ourselves to avoid
-	// leaking fds. closeStdin is idempotent (sync.Once), and Stdout/Stderr
-	// Close after a prior Close is documented as returning ErrClosed
-	// without side effects.
-	session.closeStdin()
-	session.Stdout.Close()
-	session.Stderr.Close()
-
-	seq := atomic.AddInt64(&session.seq, 1)
-
-	go publishFn(resultMsg{
-		ID:          session.ID,
-		WorkspaceID: session.WorkspaceID,
-		UID:         session.UID,
-		Output:      fmt.Sprintf("grok agent stdio ended (exit code: %d)", exit),
-		Status:      "success",
-		Ts:          time.Now().UnixMilli(),
-		Version:     Version,
-		Type:        "grok_acp_ended",
-		SessionID:   session.ID,
-		ExitCode:    exit,
-		Seq:         int(seq),
-	})
-
-	close(session.done)
-
-	// Remove the per-session isolated GROK_HOME now that the child has
-	// exited (Process.Wait above returned). Doing it here — and only here —
-	// guarantees we never delete the copied auth.json / config.toml out from
-	// under a still-running grok process, and the work runs exactly once per
-	// session because waitForExit fires exactly once. Best-effort: a leftover
-	// temp dir is harmless and the OS temp reaper will eventually collect it.
-	if session.IsolatedHome != "" {
-		_ = os.RemoveAll(session.IsolatedHome)
-	}
-
-	fmt.Printf("%s[grok-acp] Session %s ended (exit code: %d)%s\n",
-		colorYellow, session.ID, exit, colorReset)
-
-	m.removeSession(session.ID)
-}
-
-// watchFirstFrame fails a session fast when grok spawns but never produces any
-// stdout — the signature of a child blocked on interactive re-authentication
-// (expired cached token → grok wants a browser sign-in it can't show over
-// headless stdio) or otherwise wedged at startup. Without it such a session
-// sits at "Grok ACP started" until the optional per-session deadline (often
-// none) or the 6h stale GC.
-//
-// It blocks until one of three things happens:
-//   - session.firstFrame closes — grok emitted a frame; healthy, disarm.
-//   - session.done closes — the child already exited (e.g. immediate crash);
-//     waitForExit owns the terminal `grok_acp_ended` frame, so do nothing.
-//   - timeout elapses — declare the startup stalled, publish an actionable
-//     `grok_acp_error`, and kill the child so waitForExit emits the ended frame.
-//
-// timeout is a parameter (rather than the package constant) so unit tests can
-// drive the fail-fast path with a sub-second budget and no real process.
-//
-// Seq ordering mirrors the per-session deadline timer: reserve the error's Seq
-// (atomic increment) BEFORE Kill and publish AFTER, so the watchdog error is
-// strictly ordered before the `grok_acp_ended` frame waitForExit allocates once
-// the killed child is reaped — the orchestrator therefore sees error → ended.
-func (m *GrokACPManager) watchFirstFrame(session *GrokACPSession, publishFn PublishFunc, timeout time.Duration) {
-	select {
-	case <-session.firstFrame:
-		return
-	case <-session.done:
-		return
-	case <-time.After(timeout):
-	}
-
-	// Lost the race against a frame/exit that landed as the timer fired?
-	// Re-check both non-blockingly so we never kill a session that just
-	// proved itself alive (or already terminated on its own).
-	select {
-	case <-session.firstFrame:
-		return
-	case <-session.done:
-		return
-	default:
-	}
-	if session.Status() == "ended" {
-		return
-	}
-
-	seq := atomic.AddInt64(&session.seq, 1)
-	fmt.Printf("%s[grok-acp] Session %s produced no output within %v — assuming auth/startup stall, killing%s\n",
-		colorYellow, session.ID, timeout, colorReset)
-	if session.Process != nil && session.Process.Process != nil {
-		_ = session.Process.Process.Kill()
-	}
-	publishFn(resultMsg{
-		ID:          session.ID,
-		WorkspaceID: session.WorkspaceID,
-		UID:         session.UID,
-		Output: fmt.Sprintf(
-			"grok produced no output within %v of starting — it is most likely not signed in on this computer "+
-				"(its saved grok login/token expired; run `grok` in a terminal on the terminal computer to sign in again) "+
-				"or wedged at startup. Session terminated.",
-			timeout,
-		),
-		Status:    "error",
-		Ts:        time.Now().UnixMilli(),
-		Version:   Version,
-		Type:      "grok_acp_error",
-		SessionID: session.ID,
-		Seq:       int(seq),
+		env := sanitizeGrokACPEnv(os.Environ(), opts.AllowAPIKeyFallback)
+		env = setEnvVar(env, "GROK_HOME", isolatedHome)
+
+		return acpSpawnPlan{
+			executable: executable,
+			args:       args,
+			logArgs:    redactGrokACPArgsForLog(args),
+			env:        env,
+			cleanupDir: isolatedHome,
+		}, nil
 	})
 }
 
@@ -1836,30 +841,6 @@ func lineMentionsGrokApprovalPin(lower string) bool {
 	return false
 }
 
-// setEnvVar returns env with the `KEY=value` entry for key replaced (case-
-// sensitive match on the key) or appended when absent. Used by Start to pin
-// GROK_HOME to the isolated dir, overriding any inherited GROK_HOME the env
-// sanitiser left in place.
-func setEnvVar(env []string, key, value string) []string {
-	prefix := key + "="
-	out := make([]string, 0, len(env)+1)
-	replaced := false
-	for _, e := range env {
-		if strings.HasPrefix(e, prefix) {
-			if !replaced {
-				out = append(out, prefix+value)
-				replaced = true
-			}
-			continue
-		}
-		out = append(out, e)
-	}
-	if !replaced {
-		out = append(out, prefix+value)
-	}
-	return out
-}
-
 // sanitizeGrokACPExtraArgs filters caller-supplied extra args down to tokens
 // that are safe and valid to splice onto a `grok agent … stdio` argv, and
 // extracts a caller `--model <x>` selector.
@@ -1962,7 +943,7 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwa
 			continue
 		}
 
-		// `--cwd` would override the proc.Dir Start validated against the
+		// `--cwd` would override the proc.Dir start validated against the
 		// workspace root — drop both forms.
 		if lower == "--cwd" {
 			if i+1 < len(extraArgs) {
@@ -2051,123 +1032,6 @@ func redactGrokACPArgsForLog(args []string) []string {
 	return redactArgs(out)
 }
 
-// validateGrokACPSendCwd inspects a JSON-RPC frame and, if it is an ACP
-// session-setup request (`session/new` or `session/load`), requires its
-// `params.cwd` to resolve inside root. Mirrors the containment check Start
-// applies to the process-level cwd so the in-protocol session cwd cannot
-// escape it.
-//
-// Both methods are covered because ACP exposes `session/load` as the
-// session-setup alternative to `session/new` for resumed sessions, and Grok
-// ACP clients pass `cwd` on loads too — gating only `session/new` would let
-// a later signed grok_acp_send that resumes a session point Grok at a
-// directory outside the workspace root.
-//
-// Frames whose method is neither setup verb, or that omit `params.cwd`, are
-// accepted unchanged — ACP carries many other request shapes whose params we
-// must not interpret. Errors are returned only when we are certain we have a
-// setup frame with a cwd that fails containment; transient parse hiccups
-// fall through to acceptance because Send has already established the frame
-// is valid top-level JSON.
-func validateGrokACPSendCwd(frame, resolvedRoot string) error {
-	var probe struct {
-		Method string `json:"method"`
-		Params struct {
-			Cwd string `json:"cwd"`
-		} `json:"params"`
-	}
-	if err := json.Unmarshal([]byte(frame), &probe); err != nil {
-		return nil
-	}
-	if !isGrokACPSessionSetupMethod(probe.Method) || probe.Params.Cwd == "" {
-		return nil
-	}
-	cwd := probe.Params.Cwd
-	if !filepath.IsAbs(cwd) {
-		return fmt.Errorf("%s params.cwd must be an absolute path; got %q", probe.Method, cwd)
-	}
-	resolved, err := resolveCwdForContainment(cwd)
-	if err != nil {
-		return fmt.Errorf("%s params.cwd %q could not be safely resolved: %w", probe.Method, cwd, err)
-	}
-	if !pathInsideRoot(resolved, resolvedRoot) {
-		return fmt.Errorf("%s params.cwd %q is outside the configured workspace root %q", probe.Method, resolved, resolvedRoot)
-	}
-	return nil
-}
-
-// isGrokACPSessionSetupMethod reports whether method is one of the ACP
-// session-setup verbs whose `params.cwd` (when present) anchors the session
-// to a workspace path and therefore must be containment-checked.
-func isGrokACPSessionSetupMethod(method string) bool {
-	return method == "session/new" || method == "session/load"
-}
-
-// resolveCwdForContainment resolves cwd through any symlinks so a later
-// containment check sees the OS's view, not the caller's lexical view.
-//
-// The honest case: cwd exists, EvalSymlinks succeeds, we return the
-// resolved path.
-//
-// The attack case: cwd is something like `$root/link/../new` where `link`
-// is a symlink under the workspace pointing at `/outside` and `new` does
-// not exist yet. EvalSymlinks fails on the whole path because of the
-// missing tail. We must NOT lexically Clean the input first — Clean would
-// collapse `link/..` to nothing, hiding a symlink whose OS-resolved
-// target (`/outside`) is the parent that `..` actually pops from. The
-// previous walk-up-from-cleaned-input approach had this exact bug: it
-// accepted `$root/link/../new` as `$root/new`.
-//
-// Instead, walk the path FORWARD from the volume root, applying one
-// component at a time:
-//
-//   - `..` pops one component off the OS-resolved prefix (matching how
-//     the kernel evaluates the path after symlink resolution).
-//   - any other name is appended and re-resolved via EvalSymlinks so a
-//     symlink on the existing portion takes effect before a subsequent
-//     `..` is applied.
-//
-// Once we hit the first component that can't be resolved (because it
-// doesn't exist yet), everything after it is necessarily fictional —
-// there are no more symlinks to follow on the unreachable suffix — so we
-// can lexically Join the remainder over the OS-resolved prefix.
-//
-// If even the volume root can't be resolved we refuse the path outright —
-// fail-closed matches the rest of the desktop's workspace-safety stance.
-func resolveCwdForContainment(cwd string) (string, error) {
-	if resolved, err := filepath.EvalSymlinks(cwd); err == nil {
-		return resolved, nil
-	}
-	vol := filepath.VolumeName(cwd)
-	sep := string(filepath.Separator)
-	root := vol + sep
-	cur, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", fmt.Errorf("no resolvable ancestor for %q: %w", cwd, err)
-	}
-	parts := strings.Split(strings.TrimPrefix(cwd[len(vol):], sep), sep)
-	for i, part := range parts {
-		if part == "" || part == "." {
-			continue
-		}
-		if part == ".." {
-			cur = filepath.Dir(cur)
-			continue
-		}
-		next := filepath.Join(cur, part)
-		if resolved, err := filepath.EvalSymlinks(next); err == nil {
-			cur = resolved
-			continue
-		}
-		// First non-resolvable component → suffix is fictional. Lexical
-		// Join over the OS-resolved prefix is safe because there are no
-		// more symlinks to follow on the unreachable subtree.
-		remaining := append([]string{cur}, parts[i:]...)
-		return filepath.Join(remaining...), nil
-	}
-	return cur, nil
-}
-
 // isGrokAuthOverrideArg reports whether a caller-supplied arg would let
 // the orchestrator point Grok at an API key (or non-cached-token auth
 // method) and bypass the default subscription-bound flow. Each known flag
@@ -2188,35 +1052,6 @@ func isGrokAuthOverrideArg(lower string) bool {
 		}
 	}
 	return false
-}
-
-// pathInsideRoot reports whether candidate (already absolute, ideally
-// EvalSymlinks-resolved) is strictly inside root (same). Uses
-// filepath.Rel to handle Windows drive-letter cases correctly — a plain
-// strings.HasPrefix would mis-fire on `/root` vs `/rootkit`.
-func pathInsideRoot(candidate, root string) bool {
-	if candidate == "" || root == "" {
-		return false
-	}
-	rel, err := filepath.Rel(root, candidate)
-	if err != nil {
-		return false
-	}
-	// "." is the root itself — treat as inside.
-	if rel == "." {
-		return true
-	}
-	// A relative path that starts with ".." or "../" escapes the root. On
-	// Windows, a path on a different drive returns the absolute path back,
-	// which also starts with a drive letter and is therefore filtered by
-	// the same check.
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return false
-	}
-	if filepath.IsAbs(rel) {
-		return false
-	}
-	return true
 }
 
 // sanitizeGrokACPEnv applies a strip list to the inherited environment

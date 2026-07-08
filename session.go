@@ -867,6 +867,14 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				captureGrokUsageLimitLine(line.text, time.Now())
 			}
 
+			// Gemini usage-limit telemetry: quota / 429 errors surface as
+			// discrete frames on the streaming output. Capture them
+			// (best-effort) so the CLI Agents card can show a warning, same
+			// as the Grok hook above and the ACP stream reader.
+			if isGeminiCommand(session.Command) {
+				captureGeminiUsageLimitLine(line.text, time.Now())
+			}
+
 			if isClaudeCommand(session.Command) {
 				if rejected := captureClaudeRateLimitLine(line.text, time.Now()); rejected != nil {
 					flushBatch()
@@ -1444,6 +1452,15 @@ func isCodexCommand(command string) bool {
 // `grok --output-format streaming-json` populates grok_usage_limit.json.
 func isGrokCommand(command string) bool {
 	return strings.HasPrefix(commandBaseName(command), "grok")
+}
+
+// isGeminiCommand reports whether command would be routed to the `gemini` CLI
+// by buildInteractiveCLIArgs. Used to gate the Gemini usage-limit capture in
+// the session output loop so a quota / 429 error frame from a single-turn
+// gemini session populates gemini_usage_limit.json just like the ACP stream
+// reader does.
+func isGeminiCommand(command string) bool {
+	return strings.HasPrefix(commandBaseName(command), "gemini")
 }
 
 /* --------------------------------------------------------------------------

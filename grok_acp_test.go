@@ -408,8 +408,8 @@ func TestPathInsideRoot(t *testing.T) {
 func TestGrokACPManager_StartClampsTimeoutAtMaxLifetime(t *testing.T) {
 	// We exercise this via the session struct directly because Start needs a
 	// real binary. The clamping logic is plain integer arithmetic against
-	// grokACPMaxLifetime — pin it as a value test.
-	max := int64(grokACPMaxLifetime / time.Millisecond)
+	// acpMaxLifetime — pin it as a value test.
+	max := int64(acpMaxLifetime / time.Millisecond)
 	cases := []struct {
 		name string
 		in   int64
@@ -488,7 +488,14 @@ func TestGrokACPManager_EndStaleSessions_OldOnly(t *testing.T) {
 //   - exits cleanly when stdin closes (ACP's documented exit path)
 func runMockGrokACPServer() {
 	fmt.Fprintln(os.Stderr, "[mock-grok] ready, listening on stdio")
+	runMockACPEchoLoop()
+}
 
+// runMockACPEchoLoop is the JSON-RPC echo body shared by the grok and gemini
+// ACP mocks — the wire protocol (initialize / authenticate / session/new /
+// session/prompt / session/cancel) is identical across the ACP family, only
+// the stderr banner differs per agent.
+func runMockACPEchoLoop() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for scanner.Scan() {
@@ -998,7 +1005,7 @@ func TestGrokACPLifecycle_CapturesUsageLimitFromStream(t *testing.T) {
 // would otherwise run forever, the deadline timer must fire, publish a typed
 // grok_acp_error AND a terminal grok_acp_ended, then unregister the session.
 // Without this the child would keep holding the user's Grok auth/subscription
-// resources for up to grokACPMaxLifetime (6h).
+// resources for up to acpMaxLifetime (6h).
 func TestGrokACPLifecycle_TimeoutKillsRunawaySession(t *testing.T) {
 	if runtime.GOOS != "windows" && runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("integration test only runs on win/linux/darwin")
@@ -1286,7 +1293,7 @@ func TestValidateGrokACPSendCwd_RejectsEscapingSessionNew(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := validateGrokACPSendCwd(c.frame, resolvedRoot)
+			err := validateACPSendCwd(c.frame, resolvedRoot)
 			if c.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
@@ -1326,7 +1333,7 @@ func TestValidateGrokACPSendCwd_SymlinkEscapeRejected(t *testing.T) {
 				t.Fatalf("eval root: %v", err)
 			}
 			frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":{"cwd":%q,"sessionId":"sess-1"}}`, method, escape)
-			err = validateGrokACPSendCwd(frame, resolvedRoot)
+			err = validateACPSendCwd(frame, resolvedRoot)
 			if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
 				t.Fatalf("symlink-resolved escape must be rejected for %s; got %v", method, err)
 			}
@@ -1359,7 +1366,7 @@ func TestValidateGrokACPSendCwd_SymlinkEscapeWithMissingSuffixRejected(t *testin
 	// `new` does not exist under `escape` — full-path EvalSymlinks will fail.
 	target := filepath.Join(escape, "new")
 	frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}`, target)
-	err = validateGrokACPSendCwd(frame, resolvedRoot)
+	err = validateACPSendCwd(frame, resolvedRoot)
 	if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
 		t.Fatalf("symlink-escape with missing suffix must be rejected; got %v", err)
 	}
@@ -1383,7 +1390,7 @@ func TestValidateGrokACPSendCwd_NonExistentInsideRootAccepted(t *testing.T) {
 	// `root` itself — which is inside the workspace.
 	target := filepath.Join(root, "nested", "new")
 	frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}`, target)
-	if err := validateGrokACPSendCwd(frame, resolvedRoot); err != nil {
+	if err := validateACPSendCwd(frame, resolvedRoot); err != nil {
 		t.Fatalf("non-existent path inside root must be accepted; got %v", err)
 	}
 }
@@ -1415,11 +1422,11 @@ func TestValidateGrokACPSendCwd_SymlinkParentDotDotEscapeRejected(t *testing.T) 
 	// outside's parent, then appends `new`. Must NOT be accepted as a
 	// workspace-local path even though lexical Clean would say so. Build
 	// the path with raw string concatenation because filepath.Join calls
-	// Clean and would collapse the `link/..` before validateGrokACPSendCwd
+	// Clean and would collapse the `link/..` before validateACPSendCwd
 	// ever saw it — defeating the test.
 	target := link + string(filepath.Separator) + ".." + string(filepath.Separator) + "new"
 	frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}`, target)
-	err = validateGrokACPSendCwd(frame, resolvedRoot)
+	err = validateACPSendCwd(frame, resolvedRoot)
 	if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
 		t.Fatalf("link/.. escape must be rejected; got %v", err)
 	}
@@ -1637,7 +1644,7 @@ func TestWaitForExit_FinalFrameSurvivesQuickExit(t *testing.T) {
 // in Send. ACP stdio carries individual JSON-RPC 2.0 messages, one object per
 // line — top-level arrays (the JSON-RPC batch form) and scalar frames are
 // out of spec and must be rejected before reaching the child, because
-// validateGrokACPSendCwd only inspects object-shaped frames and a batched
+// validateACPSendCwd only inspects object-shaped frames and a batched
 // `session/new` could otherwise skip the cwd containment gate.
 func TestGrokACPManager_Send_RejectsNonObjectFrame(t *testing.T) {
 	m := NewGrokACPManager()
@@ -1679,7 +1686,7 @@ func TestGrokACPManager_Send_RejectsNonObjectFrame(t *testing.T) {
 // TestGrokACPManager_Send_BatchArrayDoesNotBypassCwdGate is the regression
 // test for the bypass the rereview surfaced: with WorkspaceRoot set, a
 // JSON-RPC batch array carrying a `session/new` with an outside cwd used to
-// pass validateGrokACPSendCwd silently (array unmarshal into the
+// pass validateACPSendCwd silently (array unmarshal into the
 // method/params probe yielded an error the function swallowed). The
 // non-object guard in Send must close it now.
 func TestGrokACPManager_Send_BatchArrayDoesNotBypassCwdGate(t *testing.T) {

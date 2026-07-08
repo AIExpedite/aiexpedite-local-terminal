@@ -281,6 +281,26 @@ func runMockCLI(mode string) {
 		fmt.Fprintln(os.Stderr, "[mock-grok-hang] running forever")
 		select {}
 
+	case "gemini-acp-echo":
+		runMockGeminiACPServer()
+
+	case "gemini-acp-bad-frame":
+		// Emit a single non-JSON stdout line to exercise the
+		// `gemini_acp_error` surfacing path, then exit cleanly. Used by
+		// TestGeminiACPLifecycle_ForwardsBadFrameAsError.
+		fmt.Println("this is not json")
+		os.Exit(0)
+
+	case "gemini-acp-quota":
+		// Emit a single JSON-RPC error frame carrying a 429/RESOURCE_EXHAUSTED
+		// quota signal, then exit. Used by
+		// TestGeminiACPLifecycle_CapturesQuotaFromStream to assert the ACP
+		// stream loop routes frames through captureGeminiUsageLimitLine and
+		// writes the on-disk cache.
+		fmt.Fprintln(os.Stderr, "[mock-gemini-quota] emitting RESOURCE_EXHAUSTED frame")
+		fmt.Println(`{"jsonrpc":"2.0","id":4,"error":{"code":429,"message":"Quota exceeded for quota metric 'Gemini Pro Requests' and limit 'requests per day'","status":"RESOURCE_EXHAUSTED"}}`)
+		os.Exit(0)
+
 	case "grok-acp-quick-exit":
 		// Exit immediately with status 0 — no stdout/stderr. Used by
 		// TestWaitForExit_StatusFlipsBeforeStreamDrain to drive the
