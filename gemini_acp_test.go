@@ -112,6 +112,35 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--model=gemini-3-pro", "--", "trailing prompt"},
 			[]string{"--experimental-acp", "--model=gemini-3-pro"},
 		},
+		{
+			// `-y`/`--yolo` and `--approval-mode` auto-approve tool calls,
+			// bypassing the orchestrator-driven session/request_permission
+			// flow — a signed gemini_acp_start must not be able to smuggle
+			// them in through extras.
+			"yolo_and_approval_mode_stripped",
+			[]string{"-y", "--yolo", "--approval-mode", "yolo", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
+			// `--include-directories` would widen the workspace beyond the
+			// WorkspaceRoot containment Start enforces; the separate-token
+			// value must be consumed with the flag.
+			"include_directories_and_value_stripped",
+			[]string{"--include-directories", "/outside", "--model=gemini-3-pro"},
+			[]string{"--experimental-acp", "--model=gemini-3-pro"},
+		},
+		{
+			"privileged_equals_forms_stripped",
+			[]string{"--yolo=true", "--approval-mode=auto_edit", "--include-directories=/outside", "--allowed-tools=run_shell_command"},
+			[]string{"--experimental-acp"},
+		},
+		{
+			// gemini's yargs parser accepts camelCase spellings of every
+			// kebab-case flag — the deny list has to catch those too.
+			"privileged_camelcase_spellings_stripped",
+			[]string{"--approvalMode", "yolo", "--includeDirectories", "/outside", "--allowedTools", "run_shell_command"},
+			[]string{"--experimental-acp"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

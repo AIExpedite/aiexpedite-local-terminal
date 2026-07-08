@@ -153,11 +153,19 @@ func buildGeminiACPArgs(extraArgs []string) []string {
 //     buildGeminiInteractiveArgs) is where prompts belong.
 //   - the POSIX `--` end-of-options delimiter — everything after it would be
 //     read as a positional prompt, which switches modes exactly like `-p`.
+//   - privilege-escalating flags (see geminiACPPrivilegedFlag): `-y`/`--yolo`
+//     and `--approval-mode` auto-approve tool calls, bypassing the
+//     orchestrator-driven `session/request_permission` flow this manager
+//     relies on for approvals; `--allowed-tools` pre-approves named tools the
+//     same way; `--include-directories` adds extra workspace directories,
+//     routing around the WorkspaceRoot cwd containment Start enforces. Unlike
+//     Grok's `--allow` there is no per-workspace opt-in gate for these —
+//     Gemini approvals must ride the ACP protocol, so they are stripped
+//     unconditionally.
 //
-// Everything else (e.g. `--model <x>`, `--include-directories …`) passes
-// through verbatim — gemini validates its own flags and an unrecognized one
-// fails the child fast, which the stream/exit path surfaces as
-// `gemini_acp_stderr` + `gemini_acp_ended`.
+// Everything else (e.g. `--model <x>`) passes through verbatim — gemini
+// validates its own flags and an unrecognized one fails the child fast, which
+// the stream/exit path surfaces as `gemini_acp_stderr` + `gemini_acp_ended`.
 func sanitizeGeminiACPExtraArgs(extraArgs []string) []string {
 	cleaned := make([]string, 0, len(extraArgs))
 	skipNext := false
@@ -185,6 +193,15 @@ func sanitizeGeminiACPExtraArgs(extraArgs []string) []string {
 			continue
 		}
 
+		// Privileged flags never reach the argv (rationale in the function
+		// doc). Separate-token value forms consume the following token too.
+		if priv, takesValue := geminiACPPrivilegedFlag(lower); priv {
+			if takesValue && i+1 < len(extraArgs) {
+				skipNext = true
+			}
+			continue
+		}
+
 		// POSIX end-of-options delimiter: everything after it is a
 		// positional prompt, which flips gemini out of ACP mode exactly like
 		// `-p`. Drop the delimiter AND everything after it — a legitimate
@@ -196,6 +213,36 @@ func sanitizeGeminiACPExtraArgs(extraArgs []string) []string {
 		cleaned = append(cleaned, a)
 	}
 	return cleaned
+}
+
+// geminiACPPrivilegedFlag classifies a lowercased extra-arg token against the
+// deny list of privilege-escalating gemini flags: `-y`/`--yolo` and
+// `--approval-mode` bypass per-tool approvals, `--allowed-tools` pre-approves
+// named tools, `--include-directories` escapes the WorkspaceRoot containment.
+// gemini's yargs parser also accepts camelCase spellings of every kebab-case
+// flag, so both spellings are matched (ToLower collapses camelCase to the
+// dash-less form). takesValue is true only for the separate-token value form;
+// equals-form tokens carry their value inline and consume nothing extra.
+func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
+	switch lower {
+	case "-y", "--yolo":
+		return true, false
+	case "--approval-mode", "--approvalmode",
+		"--allowed-tools", "--allowedtools",
+		"--include-directories", "--includedirectories":
+		return true, true
+	}
+	for _, prefix := range []string{
+		"--yolo=",
+		"--approval-mode=", "--approvalmode=",
+		"--allowed-tools=", "--allowedtools=",
+		"--include-directories=", "--includedirectories=",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true, false
+		}
+	}
+	return false, false
 }
 
 // sanitizeGeminiACPEnv applies a strip list to the inherited environment
