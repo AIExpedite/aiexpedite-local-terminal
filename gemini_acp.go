@@ -319,8 +319,12 @@ func sanitizeGeminiACPEnv(env []string) []string {
 // MCP servers that Gemini spawns/connects during discovery — stdio transport
 // runs repo-controlled local code before any approval, so ANY non-empty
 // `mcpServers` block is treated as privileged, not just `mcpServers.*.trust:
-// true` — or add context directories outside the WorkspaceRoot containment
-// `start` enforces.
+// true` — name workspace executables gemini runs for custom-tool discovery
+// and calls (`tools.discoveryCommand` / `tools.callCommand`, legacy flat
+// `toolDiscoveryCommand` / `toolCallCommand`) or attach command hooks to
+// lifecycle events (`hooks`), both the same pre-approval code-execution
+// vector as `mcpServers` — or add context directories outside the
+// WorkspaceRoot containment `start` enforces.
 //
 // A missing or unreadable file is NOT fatal (absence is the common case), and
 // neither is a file that stays unparseable even after we normalise the JSONC
@@ -433,6 +437,33 @@ func geminiSettingsPrivilegeReason(v any) string {
 				// but no benign Gemini setting spells a bare boolean `trust`.
 				if b, ok := val.(bool); ok && b {
 					return "a trusted MCP server (trust: true)"
+				}
+			case "discoverycommand", "tooldiscoverycommand",
+				"callcommand", "toolcallcommand":
+				// tools.discoveryCommand / tools.callCommand (and the legacy
+				// flat toolDiscoveryCommand / toolCallCommand spellings) name a
+				// workspace-controlled executable gemini runs at custom-tool
+				// discovery and on every custom-tool call — repo-controlled
+				// code execution before the ACP `session/request_permission`
+				// flow is involved, the same vector as `mcpServers`.
+				if s, ok := val.(string); ok && strings.TrimSpace(s) != "" {
+					return fmt.Sprintf("a workspace tool command (%s)", k)
+				}
+			case "hooks":
+				// Gemini hook settings attach workspace-defined shell commands
+				// to lifecycle events (PreToolUse etc.), which run outside the
+				// ACP approval flow. Any non-empty hooks block is treated as
+				// privileged, same policy as `mcpServers`. No benign Gemini
+				// setting spells a non-empty `hooks` container.
+				switch hooks := val.(type) {
+				case map[string]any:
+					if len(hooks) > 0 {
+						return "workspace-defined hooks (hooks)"
+					}
+				case []any:
+					if len(hooks) > 0 {
+						return "workspace-defined hooks (hooks)"
+					}
 				}
 			}
 			if reason := geminiSettingsPrivilegeReason(val); reason != "" {
