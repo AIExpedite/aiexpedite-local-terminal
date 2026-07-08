@@ -64,6 +64,12 @@ var geminiACPSpec = acpSpec{
 	// calls captureGeminiUsageLimitLine; without this hook, the CLI Agents
 	// card stays Unknown for the primary Gemini chat flow.
 	captureLine: captureGeminiUsageLimitLine,
+	// A signed gemini_acp_send can create or load a session rooted at a
+	// different directory inside the workspace than the launch cwd Start
+	// screened. Re-screen that send-time cwd's `.gemini/settings.json` before
+	// the frame reaches the child so a subdirectory's project config cannot
+	// re-enable mcpServers / hooks / auto-approval past the Start-time guard.
+	screenSetupCwd: screenGeminiWorkspaceSettings,
 }
 
 // GeminiACPSession is the Gemini-family view of a shared ACP session. Alias
@@ -258,12 +264,17 @@ func sanitizeGeminiACPExtraArgs(extraArgs []string) []string {
 		}
 
 		// Bare positionals are prompt words (rationale in the function doc):
-		// keep one only as the value of the flag token kept immediately
-		// before it; otherwise drop it so it cannot flip the child out of
-		// ACP mode. Comparing against the last KEPT token (not the previous
-		// raw token) fails closed when the preceding flag was itself dropped.
+		// keep one only as the value of a KNOWN value-taking flag kept
+		// immediately before it (e.g. `--model gemini-3-pro`); otherwise drop
+		// it so it cannot flip the child out of ACP mode. A boolean flag such
+		// as `--debug` does NOT consume its following token — gemini reads that
+		// token as the positional `query`, leaving ACP mode and breaking the
+		// JSON-RPC handshake — so a bare token after a boolean (or any flag not
+		// on the known-value list) must be dropped, not preserved. Comparing
+		// against the last KEPT token (not the previous raw token) also fails
+		// closed when the preceding flag was itself dropped.
 		if !geminiACPFlagShaped(a) {
-			if len(cleaned) == 0 || !geminiACPSeparateValueFlagShaped(cleaned[len(cleaned)-1]) {
+			if len(cleaned) == 0 || !geminiACPKnownSeparateValueFlag(cleaned[len(cleaned)-1]) {
 				continue
 			}
 		}
@@ -286,6 +297,58 @@ func geminiACPFlagShaped(tok string) bool {
 // after it is a positional).
 func geminiACPSeparateValueFlagShaped(tok string) bool {
 	return geminiACPFlagShaped(tok) && !strings.Contains(tok, "=")
+}
+
+// geminiACPKnownValueFlags is the set of gemini flags that consume the NEXT
+// argument as their value, keyed by the spelling-agnostic form
+// geminiNormalizeFlag produces (leading + interior dashes stripped, lowercased)
+// so a flag's short (`-m`), kebab-case (`--output-format`) and camelCase
+// (`--outputFormat`) spellings — all of which gemini's yargs parser accepts —
+// collapse to one key. Only a flag on this list legitimises keeping a bare
+// following token as its value; after a boolean or unknown flag that token is a
+// positional prompt (see sanitizeGeminiACPExtraArgs).
+//
+// Mirrors buildGeminiInteractiveArgs' valuedFlags, minus the entries that never
+// survive to the positional check here: the mode-breaking prompt flags
+// (`-i`/`-p`, dropped earlier) and the privileged value-taking flags
+// (`--approval-mode` / `--allowed-tools` / `--policy` / `--admin-policy` /
+// `--include-directories`, dropped as privileged). Their values must NOT be
+// preserved either, so they are deliberately absent.
+var geminiACPKnownValueFlags = map[string]bool{
+	"m": true, "model": true,
+	"o": true, "outputformat": true,
+	"e": true, "extensions": true,
+	"r": true, "resume": true,
+	"w": true, "worktree": true,
+	"allowedmcpservernames": true,
+	"deletesession":         true,
+}
+
+// geminiNormalizeFlag reduces a flag token to a spelling-agnostic key: strip
+// leading dashes, strip any interior dashes, lowercase. `--output-format`,
+// `--outputFormat` and (separately) `-o` map to comparable keys, matching how
+// gemini's yargs parser treats the kebab/camel/short spellings as equivalent.
+// Returns "" for a non-flag token.
+func geminiNormalizeFlag(tok string) string {
+	if !geminiACPFlagShaped(tok) {
+		return ""
+	}
+	t := strings.TrimLeft(tok, "-")
+	t = strings.ReplaceAll(t, "-", "")
+	return strings.ToLower(t)
+}
+
+// geminiACPKnownSeparateValueFlag reports whether tok is a separate-token
+// (no inline `=value`) gemini flag KNOWN to consume the next argument as its
+// value. Only such a flag lets sanitizeGeminiACPExtraArgs keep a following bare
+// token; after a boolean flag (e.g. `--debug`) or any flag not on the
+// known-value list the bare token is a positional prompt that would break ACP
+// mode and must be dropped.
+func geminiACPKnownSeparateValueFlag(tok string) bool {
+	if !geminiACPSeparateValueFlagShaped(tok) {
+		return false
+	}
+	return geminiACPKnownValueFlags[geminiNormalizeFlag(tok)]
 }
 
 // geminiACPPrivilegedFlag classifies a lowercased extra-arg token against the

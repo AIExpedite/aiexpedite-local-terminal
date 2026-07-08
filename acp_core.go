@@ -187,6 +187,18 @@ type acpSpec struct {
 	// sees the ACP stream too, not just the raw session.go path. Must be
 	// best-effort and non-blocking — it runs on the stream hot path.
 	captureLine func(line string, now time.Time)
+
+	// screenSetupCwd, when non-nil, is invoked by Send on the `params.cwd` of
+	// every ACP session-setup frame (`session/new` / `session/load`) that
+	// carries one, AFTER the containment check passes. It lets a per-agent
+	// workspace-config screen re-run against a send-time cwd that differs from
+	// the process start cwd — start only screened the launch cwd, but a signed
+	// *_acp_send can root a session at another directory inside the workspace
+	// whose project config would otherwise never be inspected. Returns a
+	// non-nil error to reject the frame. Gemini wires this to
+	// screenGeminiWorkspaceSettings; Grok leaves it nil (no per-cwd config to
+	// screen).
+	screenSetupCwd func(cwd, workspaceRoot string) error
 }
 
 /* --------------------------------------------------------------------------
@@ -591,6 +603,24 @@ func (m *acpManager) Send(id string, payload string) error {
 	if session.WorkspaceRoot != "" {
 		if err := validateACPSendCwd(trimmed, session.WorkspaceRoot); err != nil {
 			return err
+		}
+	}
+
+	// Re-run the per-agent workspace-config screen against the send-time cwd of
+	// an ACP session-setup frame. The containment check above only proves the
+	// send-time cwd stays inside WorkspaceRoot; it does NOT inspect the config
+	// that cwd's directory contributes. For Gemini, a `session/new` /
+	// `session/load` rooted at a subdirectory (or a re-created session) would
+	// apply that directory's `.gemini/settings.json` (mcpServers, hooks,
+	// approvalMode: yolo, …) which start's launch-cwd screen never saw. Screen
+	// it before the frame is written and reject the send if it grants a
+	// privilege the ACP approval flow must own. No-op for agents that leave
+	// screenSetupCwd nil (e.g. Grok).
+	if m.spec.screenSetupCwd != nil {
+		if setupCwd := acpSessionSetupCwd(trimmed); setupCwd != "" {
+			if err := m.spec.screenSetupCwd(setupCwd, session.WorkspaceRoot); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1218,6 +1248,28 @@ func validateACPSendCwd(frame, resolvedRoot string) error {
 // to a workspace path and therefore must be containment-checked.
 func isACPSessionSetupMethod(method string) bool {
 	return method == "session/new" || method == "session/load"
+}
+
+// acpSessionSetupCwd returns the `params.cwd` of an ACP session-setup frame
+// (`session/new` / `session/load`), or "" when the frame is not a setup verb,
+// carries no cwd, or does not parse. Send uses it to drive the per-agent
+// screenSetupCwd hook against the directory a setup frame anchors the session
+// to. A transient parse hiccup returns "" (no screen) rather than an error
+// because Send has already established the frame is valid top-level JSON.
+func acpSessionSetupCwd(frame string) string {
+	var probe struct {
+		Method string `json:"method"`
+		Params struct {
+			Cwd string `json:"cwd"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(frame), &probe); err != nil {
+		return ""
+	}
+	if !isACPSessionSetupMethod(probe.Method) {
+		return ""
+	}
+	return probe.Params.Cwd
 }
 
 // resolveCwdForContainment resolves cwd through any symlinks so a later

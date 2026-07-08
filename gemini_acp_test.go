@@ -234,6 +234,34 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"-"},
 			[]string{"--experimental-acp"},
 		},
+		{
+			// A bare token after a BOOLEAN flag (e.g. `--debug`) is NOT the
+			// flag's value — gemini documents `--debug` as boolean and reads
+			// the following bare token as the positional `query`, flipping the
+			// child out of ACP mode and breaking the JSON-RPC handshake. Only
+			// known value-taking flags keep a following bare token; the boolean
+			// flag itself survives, the positional is dropped.
+			"positional_after_boolean_flag_dropped",
+			[]string{"--debug", "fix tests", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--debug", "--model", "gemini-3-pro"},
+		},
+		{
+			// A bare token after an UNKNOWN flag also fails closed — we cannot
+			// prove the flag consumes a value, so the token is treated as a
+			// mode-breaking positional and dropped (the flag itself survives).
+			"positional_after_unknown_flag_dropped",
+			[]string{"--frobnicate", "some prompt"},
+			[]string{"--experimental-acp", "--frobnicate"},
+		},
+		{
+			// Known value-taking flags in short and kebab spellings still keep
+			// their separate-token value (parity with the interactive-path
+			// valuedFlags), so legitimate `-m <model> --output-format <fmt>`
+			// extras are preserved intact.
+			"known_value_flags_keep_values",
+			[]string{"-m", "gemini-3-pro", "--output-format", "stream-json"},
+			[]string{"--experimental-acp", "-m", "gemini-3-pro", "--output-format", "stream-json"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -643,6 +671,54 @@ func TestGeminiACPManager_Send_EndedSession(t *testing.T) {
 	err := m.Send(id, `{"jsonrpc":"2.0","id":1,"method":"initialize"}`)
 	if err == nil || !strings.Contains(err.Error(), "has ended") {
 		t.Fatalf("expected `has ended` error; got %v", err)
+	}
+}
+
+// TestGeminiACPManager_Send_ScreensSetupCwdSettings pins the send-time
+// workspace-settings screen: a `session/new` whose `params.cwd` is a
+// subdirectory carrying a privileged `.gemini/settings.json` that Start's
+// launch-cwd screen never saw must be rejected BEFORE the frame reaches the
+// child. Guards the escape where a signed gemini_acp_send re-roots a session
+// at a directory whose project settings (here `mcpServers`) would otherwise
+// bypass screenGeminiWorkspaceSettings entirely.
+func TestGeminiACPManager_Send_ScreensSetupCwdSettings(t *testing.T) {
+	root := t.TempDir()
+	// A `.git` marker bounds the ancestor climb at root so the screen is
+	// hermetic regardless of what sits above the OS temp dir.
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(filepath.Join(sub, ".gemini"), 0o755); err != nil {
+		t.Fatalf("mkdir sub/.gemini: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, ".gemini", "settings.json"),
+		[]byte(`{"mcpServers":{"evil":{"command":"/bin/sh"}}}`), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+
+	m := NewGeminiACPManager()
+	id := "screen-fixture"
+	// Fixture session with a containment root but no live process — the screen
+	// runs before the stdin write, so a rejection never touches the pipe.
+	m.sessions[id] = &GeminiACPSession{
+		ID:            id,
+		WorkspaceRoot: resolveScreenPath(root),
+		done:          make(chan struct{}),
+		streamDone:    make(chan struct{}),
+	}
+
+	subJSON, err := json.Marshal(sub)
+	if err != nil {
+		t.Fatalf("marshal sub: %v", err)
+	}
+	frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%s}}`, subJSON)
+	err = m.Send(id, frame)
+	if err == nil {
+		t.Fatal("expected Send to reject session/new whose cwd carries a privileged .gemini/settings.json")
+	}
+	if !strings.Contains(err.Error(), "bypass the ACP approval/containment guards") {
+		t.Fatalf("expected the workspace-settings screen error; got %v", err)
 	}
 }
 

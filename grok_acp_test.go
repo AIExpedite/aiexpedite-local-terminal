@@ -1310,6 +1310,32 @@ func TestValidateGrokACPSendCwd_RejectsEscapingSessionNew(t *testing.T) {
 	}
 }
 
+// TestACPSessionSetupCwd pins the frame → setup-cwd extraction Send uses to
+// drive the per-agent screenSetupCwd hook: only session-setup verbs with a
+// present cwd yield a path; every other shape (other methods, missing cwd,
+// unparseable frame) yields "" so the hook is skipped.
+func TestACPSessionSetupCwd(t *testing.T) {
+	cases := []struct {
+		name  string
+		frame string
+		want  string
+	}{
+		{"session_new_with_cwd", `{"method":"session/new","params":{"cwd":"/ws/sub"}}`, "/ws/sub"},
+		{"session_load_with_cwd", `{"method":"session/load","params":{"cwd":"/ws/sub","sessionId":"s"}}`, "/ws/sub"},
+		{"session_new_without_cwd", `{"method":"session/new","params":{}}`, ""},
+		{"non_setup_method", `{"method":"session/prompt","params":{"cwd":"/ws/sub"}}`, ""},
+		{"no_method", `{"params":{"cwd":"/ws/sub"}}`, ""},
+		{"unparseable_frame", `not-json`, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := acpSessionSetupCwd(c.frame); got != c.want {
+				t.Fatalf("acpSessionSetupCwd(%q) = %q, want %q", c.frame, got, c.want)
+			}
+		})
+	}
+}
+
 // TestValidateGrokACPSendCwd_SymlinkEscapeRejected pins the canonical
 // "appears inside, actually escapes" attack — a session-setup frame whose
 // cwd is a symlink under root that resolves to an outside path. Covers both
