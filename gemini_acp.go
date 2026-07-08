@@ -315,16 +315,21 @@ func sanitizeGeminiACPEnv(env []string) []string {
 // (`tools.allowed` / legacy `allowedTools` — the settings twin of the
 // stripped `--allowed-tools` flag), load extra policy files whose `allow`
 // rules auto-approve tools (policyPaths / adminPolicyPaths — the settings
-// twin of the stripped `--policy`/`--admin-policy` flags), mark an MCP server
-// trusted so its tool calls skip confirmation (`mcpServers.*.trust: true`),
-// or add context directories outside the WorkspaceRoot containment `start`
-// enforces.
+// twin of the stripped `--policy`/`--admin-policy` flags), declare workspace
+// MCP servers that Gemini spawns/connects during discovery — stdio transport
+// runs repo-controlled local code before any approval, so ANY non-empty
+// `mcpServers` block is treated as privileged, not just `mcpServers.*.trust:
+// true` — or add context directories outside the WorkspaceRoot containment
+// `start` enforces.
 //
-// A missing or unreadable/unparseable file is NOT fatal: absence is the common
-// case, and gemini itself tolerates a malformed settings file, so failing the
-// spawn on parse errors would diverge from the CLI and turn a cosmetic typo in
-// a repo into a chat outage. Only a parseable file that positively declares a
-// privilege-escalating value blocks the start. The scan walks the whole JSON
+// A missing or unreadable file is NOT fatal (absence is the common case), and
+// neither is a file that stays unparseable even after we normalise the JSONC
+// extensions Gemini's own loader tolerates (`//` + `/* */` comments and
+// trailing commas — see stripJSONCForParsing): gemini would ignore/repair a
+// genuinely malformed file rather than apply a privileged setting, so failing
+// the spawn on parse errors would diverge from the CLI and turn a cosmetic typo
+// in a repo into a chat outage. Only a parseable file that positively declares
+// a privilege-escalating value blocks the start. The scan walks the whole JSON
 // tree so both the nested (`general.defaultApprovalMode`, `context.includeDirectories`)
 // and any legacy flat spellings are caught regardless of nesting.
 func screenGeminiWorkspaceSettings(cwd string) error {
@@ -335,9 +340,12 @@ func screenGeminiWorkspaceSettings(cwd string) error {
 		return nil
 	}
 	var parsed any
-	if json.Unmarshal(raw, &parsed) != nil {
-		// Malformed JSON: gemini would ignore/repair it rather than apply a
-		// privileged setting, so don't fail the spawn on it here.
+	if json.Unmarshal(stripJSONCForParsing(raw), &parsed) != nil {
+		// Even after tolerating the JSONC extensions Gemini's settings loader
+		// accepts (`//` + `/* */` comments via strip-json-comments, and
+		// trailing commas), the file is not valid JSON. Gemini would
+		// ignore/repair it rather than apply a privileged setting, so don't
+		// fail the spawn on it here.
 		return nil
 	}
 	if reason := geminiSettingsPrivilegeReason(parsed); reason != "" {
@@ -405,6 +413,20 @@ func geminiSettingsPrivilegeReason(v any) string {
 						return fmt.Sprintf("extra policy files (%s)", k)
 					}
 				}
+			case "mcpservers":
+				// A workspace `mcpServers` block makes Gemini spawn/connect
+				// those servers during MCP discovery — stdio transport launches
+				// a local subprocess — which runs repo-controlled code BEFORE
+				// any ACP `session/request_permission` approval is involved, and
+				// regardless of whether the server is marked `trust: true`. So a
+				// repo can execute arbitrary local code just by shipping a
+				// settings file; treat ANY non-empty workspace mcpServers as
+				// privileged. The `trust: true` case below is the stricter
+				// subset (auto-approving that server's tool CALLS) and is kept
+				// for defense in depth / oddly-nested spellings.
+				if m, ok := val.(map[string]any); ok && len(m) > 0 {
+					return "workspace-defined MCP servers (mcpServers)"
+				}
 			case "trust":
 				// mcpServers.<name>.trust: true bypasses per-call tool
 				// confirmations for that server. The walk is positional-blind,
@@ -425,6 +447,102 @@ func geminiSettingsPrivilegeReason(v any) string {
 		}
 	}
 	return ""
+}
+
+// stripJSONCForParsing rewrites the JSONC extensions Gemini's settings loader
+// tolerates into plain JSON so a file that is valid to Gemini also parses here.
+// Gemini imports strip-json-comments and permits trailing commas, so a workspace
+// settings file may legitimately carry `//` line comments, `/* */` block
+// comments, or a trailing comma before `}`/`]`. Without normalising them first,
+// strict encoding/json would reject such a file, screenGeminiWorkspaceSettings
+// would treat it as "malformed → allow", and a privileged value like
+// `defaultApprovalMode: "yolo"` sitting next to a comment would slip past the
+// screen while Gemini still applied it. Comments/commas inside string literals
+// (respecting `\` escapes) are left untouched.
+func stripJSONCForParsing(raw []byte) []byte {
+	out := make([]byte, 0, len(raw))
+	inString := false
+	inLineComment := false
+	inBlockComment := false
+	escaped := false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		switch {
+		case inLineComment:
+			if c == '\n' {
+				inLineComment = false
+				out = append(out, c)
+			}
+		case inBlockComment:
+			if c == '*' && i+1 < len(raw) && raw[i+1] == '/' {
+				inBlockComment = false
+				i++
+			}
+		case inString:
+			out = append(out, c)
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+		case c == '"':
+			inString = true
+			out = append(out, c)
+		case c == '/' && i+1 < len(raw) && raw[i+1] == '/':
+			inLineComment = true
+			i++
+		case c == '/' && i+1 < len(raw) && raw[i+1] == '*':
+			inBlockComment = true
+			i++
+		default:
+			out = append(out, c)
+		}
+	}
+	return stripJSONTrailingCommas(out)
+}
+
+// stripJSONTrailingCommas drops a comma that is followed only by whitespace and
+// then a closing `}` or `]`, matching Gemini's trailing-comma tolerance. Commas
+// inside string literals are preserved. Input is expected to already be
+// comment-free (stripJSONCForParsing calls it last).
+func stripJSONTrailingCommas(b []byte) []byte {
+	out := make([]byte, 0, len(b))
+	inString := false
+	escaped := false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if inString {
+			out = append(out, c)
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		if c == '"' {
+			inString = true
+			out = append(out, c)
+			continue
+		}
+		if c == ',' {
+			j := i + 1
+			for j < len(b) && (b[j] == ' ' || b[j] == '\t' || b[j] == '\n' || b[j] == '\r') {
+				j++
+			}
+			if j < len(b) && (b[j] == '}' || b[j] == ']') {
+				continue // drop the trailing comma
+			}
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // geminiSettingsKey normalises a settings key or enum value for comparison:

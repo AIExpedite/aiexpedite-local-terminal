@@ -226,8 +226,15 @@ func TestScreenGeminiWorkspaceSettings_Allows(t *testing.T) {
 		"empty includeDirs":   `{"context":{"includeDirectories":[]}}`,
 		"empty allowed tools": `{"tools":{"allowed":[]}}`,
 		"empty policyPaths":   `{"security":{"policyPaths":[]}}`,
-		"untrusted mcp":       `{"mcpServers":{"local":{"command":"npx","trust":false}}}`,
+		"empty mcpServers":    `{"mcpServers":{}}`,
 		"unrelated settings":  `{"ui":{"theme":"dark"},"context":{"fileName":"AGENTS.md"}}`,
+		// JSONC that Gemini's loader tolerates and that carries no privileged
+		// value must still be treated as parseable-and-benign, not malformed.
+		"benign line comment":   "{\n  // theme choice\n  \"ui\": {\"theme\": \"dark\"}\n}",
+		"benign block comment":  "{\n  /* preferences */\n  \"ui\": {\"theme\": \"dark\"}\n}",
+		"benign trailing comma": `{"ui":{"theme":"dark"},}`,
+		// A `//` inside a string value is NOT a comment and must be preserved.
+		"url in string": `{"context":{"fileName":"https://example.com/AGENTS.md"}}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -257,6 +264,15 @@ func TestScreenGeminiWorkspaceSettings_Blocks(t *testing.T) {
 		"legacy allowedTools": `{"allowedTools":"run_shell_command"}`,
 		"adminPolicy string":  `{"admin_policy_paths":"/tmp/admin"}`,
 		"trusted mcp server":  `{"mcpServers":{"local":{"command":"npx","trust":true}}}`,
+		// Any workspace-declared MCP server spawns local code during discovery
+		// before any approval — blocked even when trust is false/absent.
+		"untrusted mcp server": `{"mcpServers":{"local":{"command":"npx","trust":false}}}`,
+		"bare mcp server":      `{"mcpServers":{"local":{"command":"npx"}}}`,
+		// A privileged value hiding next to JSONC comments / trailing commas
+		// must not slip past the screen just because strict JSON would reject it.
+		"yolo behind line comment":  "{\n  // harmless\n  \"yolo\": true\n}",
+		"yolo behind block comment": "{\n  /* harmless */ \"tools\": {\"autoAccept\": true}\n}",
+		"privileged trailing comma": `{"yolo":true,}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
