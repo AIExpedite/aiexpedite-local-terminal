@@ -190,6 +190,47 @@ func TestDefaultAllowList_GhCliIsDefaultAllowed(t *testing.T) {
 	}
 }
 
+func TestDefaultAllowList_GeminiACPArgvIsDefaultAllowed(t *testing.T) {
+	// gemini_acp_start is gated against the SYNTHESIZED `gemini
+	// --experimental-acp …` argv (unlike grok_acp_start, which short-circuits
+	// in signed mode because bare `grok` is deliberately absent from the
+	// default allowlist). That gate decision is only safe while the default
+	// list keeps its `gemini` / `gemini *` entries — pin both directions so a
+	// future allowlist edit can't silently break ACP session starts (gate
+	// closed) or a pattern regression can't silently open unrelated argv.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	al := &AllowList{configPath: path}
+	if err := al.CreateDefault(); err != nil {
+		t.Fatalf("CreateDefault: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	acpArgs := buildGeminiACPArgs(nil)
+	if !al.IsAllowed("gemini", acpArgs) {
+		t.Errorf("IsAllowed(gemini, %v) = false; want true — gemini_acp_start would prompt on every session start", acpArgs)
+	}
+	withModel := buildGeminiACPArgs([]string{"--model=gemini-3-pro"})
+	if !al.IsAllowed("gemini", withModel) {
+		t.Errorf("IsAllowed(gemini, %v) = false; want true", withModel)
+	}
+
+	// Without the gemini entries the same argv must be gated — proves the
+	// pass-through above is the allowlist entry, not a matcher hole.
+	bare := &AllowList{configPath: filepath.Join(dir, "empty.txt")}
+	if err := os.WriteFile(bare.configPath, []byte("git *\n"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := bare.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if bare.IsAllowed("gemini", acpArgs) {
+		t.Errorf("IsAllowed(gemini, %v) = true on a list without gemini entries; want false", acpArgs)
+	}
+}
+
 func TestEnsureGhDefaults_AppendsForLegacyAllowList(t *testing.T) {
 	// Existing installs that pre-date the gh defaults still have an
 	// allowed-commands.txt without `gh`/`gh *`. ensureGhDefaults must append

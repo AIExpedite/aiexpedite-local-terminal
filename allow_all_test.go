@@ -136,6 +136,8 @@ func TestGateSessionEntryCommand_AllowAllBypassesAllKinds(t *testing.T) {
 		"session_start",
 		"codex_appserver_start",
 		"grok_acp_start",
+		"gemini_acp_start",
+		"claude_native_start",
 		"session_input", // mid-session pass-through — included for completeness
 		"",              // execute-shape — also a pass-through here
 	}

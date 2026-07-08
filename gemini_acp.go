@@ -19,8 +19,11 @@
 // Auth posture mirrors Grok's: enforced by the orchestrator, not here. The
 // user's local `gemini` login (OAuth creds under ~/.gemini) is what the child
 // authenticates with, so usage ties to the terminal computer user's Google
-// account. Unlike Grok there is no API-key opt-in gate — the orchestrator
-// does not pass credentials through this path at all.
+// account. Unlike Grok there is no API-key opt-in gate on this path: no
+// credential flags are accepted on the argv, and inherited env keys
+// (GEMINI_API_KEY / GOOGLE_API_KEY) pass through exactly as they do on the
+// raw single-turn `session_start` path — sanitizeGeminiACPEnv only strips
+// the embedded-IDE markers.
 // -----------------------------------------------------------------------------
 
 package main
@@ -183,10 +186,11 @@ func sanitizeGeminiACPExtraArgs(extraArgs []string) []string {
 		}
 
 		// POSIX end-of-options delimiter: everything after it is a
-		// positional prompt, which flips gemini out of ACP mode. Drop the
-		// delimiter and let any remaining flags be validated by gemini.
+		// positional prompt, which flips gemini out of ACP mode exactly like
+		// `-p`. Drop the delimiter AND everything after it — a legitimate
+		// flag value never follows a bare `--`, so nothing usable is lost.
 		if a == "--" {
-			continue
+			break
 		}
 
 		cleaned = append(cleaned, a)

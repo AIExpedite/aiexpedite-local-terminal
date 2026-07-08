@@ -100,9 +100,17 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--experimental-acp"},
 		},
 		{
-			"double_dash_delimiter_dropped",
+			// Positional tokens after `--` are a prompt, which flips gemini
+			// out of ACP mode exactly like `-p` — the delimiter AND its tail
+			// must both be dropped or the handshake never starts.
+			"double_dash_delimiter_and_tail_dropped",
 			[]string{"--", "positional prompt words"},
-			[]string{"--experimental-acp", "positional prompt words"},
+			[]string{"--experimental-acp"},
+		},
+		{
+			"flags_before_double_dash_survive",
+			[]string{"--model=gemini-3-pro", "--", "trailing prompt"},
+			[]string{"--experimental-acp", "--model=gemini-3-pro"},
 		},
 	}
 	for _, c := range cases {
