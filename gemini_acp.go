@@ -24,8 +24,9 @@
 // (GEMINI_API_KEY / GOOGLE_API_KEY) pass through exactly as they do on the
 // raw single-turn `session_start` path — sanitizeGeminiACPEnv strips the
 // embedded-IDE markers (including GEMINI_CLI_IDE_*), pins
-// GEMINI_CLI_TRUST_WORKSPACE off so a committed workspace `.env` cannot trust
-// the workspace (the env twin of `--skip-trust`), and pins
+// GEMINI_CLI_TRUST_WORKSPACE so a committed workspace `.env` cannot trust the
+// workspace (the env twin of `--skip-trust`) while preserving the operator's
+// own headless trust opt-in from the agent's launch environment, and pins
 // GEMINI_CLI_IDE_WORKSPACE_PATH empty so the same `.env` cannot add outside
 // directories (the env twin of `--include-directories`).
 // -----------------------------------------------------------------------------
@@ -368,10 +369,22 @@ const geminiIDEWorkspacePathEnvVar = "GEMINI_CLI_IDE_WORKSPACE_PATH"
 // as trusting the workspace for the session — the same trust bypass that
 // re-enables the project `.gemini/settings.json` / tool auto-acceptance the ACP
 // guards otherwise block. A repo could therefore commit a `.env` carrying that
-// variable and get the bypass for free. So drop any inherited spelling and
-// force it to `false` in the child's process env; Gemini's dotenv loader does
-// not override a variable already present in the environment, so the workspace
-// `.env` cannot flip it back on.
+// variable and get the bypass for free. So the variable is always pinned in the
+// child's process env — Gemini's dotenv loader does not override a variable
+// already present in the environment, so the workspace `.env` can never set it.
+//
+// WHICH value gets pinned depends on the inherited environment. Gemini's trust
+// check honors only the exact value `true` (checkPathTrust: `=== 'true'`); any
+// other value behaves like unset, falling through to the user's Folder Trust
+// config (~/.gemini/trustedFolders.json). When the AGENT'S OWN environment —
+// set by the operator who launched the terminal agent, not reachable from any
+// repo — carries exactly GEMINI_CLI_TRUST_WORKSPACE=true, that value is
+// preserved: it is Gemini's documented non-interactive trust bypass for
+// headless runs, and without it a Folder-Trust-enabled user whose workspace is
+// not in trustedFolders.json would hit FatalUntrustedWorkspaceError before the
+// ACP handshake with no non-interactive way out (the workspace-settings screen
+// above keeps guarding the privileged settings regardless of trust). Any other
+// inherited value is normalized to the inert `false`.
 //
 // GEMINI_CLI_IDE_* gets the same treatment for the same reason: this manager
 // is not Gemini's IDE companion, and GEMINI_CLI_IDE_WORKSPACE_PATH in
@@ -383,6 +396,7 @@ const geminiIDEWorkspacePathEnvVar = "GEMINI_CLI_IDE_WORKSPACE_PATH"
 // pin, and Gemini ignores an empty value.
 func sanitizeGeminiACPEnv(env []string) []string {
 	filtered := make([]string, 0, len(env)+2)
+	inheritedTrust := false
 	for _, e := range env {
 		upper := strings.ToUpper(e)
 		if strings.HasPrefix(upper, "CLAUDECODE=") ||
@@ -390,12 +404,25 @@ func sanitizeGeminiACPEnv(env []string) []string {
 			strings.HasPrefix(upper, "CODEX_IDE_") ||
 			strings.HasPrefix(upper, "GEMINI_CLI_IDE_") ||
 			strings.HasPrefix(upper, geminiTrustWorkspaceEnvVar+"=") {
+			// Only the exact value `true` means anything to Gemini's trust
+			// check; remember it so the operator's own headless trust opt-in
+			// survives the pin below.
+			if strings.HasPrefix(upper, geminiTrustWorkspaceEnvVar+"=") &&
+				e[strings.IndexByte(e, '=')+1:] == "true" {
+				inheritedTrust = true
+			}
 			continue
 		}
 		filtered = append(filtered, e)
 	}
-	// Pin workspace trust off so a committed `.env` cannot re-grant it.
-	filtered = append(filtered, geminiTrustWorkspaceEnvVar+"=false")
+	// Pin workspace trust so a committed `.env` cannot set it: `true` only
+	// when the operator's own launch environment opted in, inert `false`
+	// otherwise.
+	trustValue := "false"
+	if inheritedTrust {
+		trustValue = "true"
+	}
+	filtered = append(filtered, geminiTrustWorkspaceEnvVar+"="+trustValue)
 	// Pin the IDE workspace path empty so a committed `.env` cannot add
 	// directories outside WorkspaceRoot through the IDE-companion route.
 	filtered = append(filtered, geminiIDEWorkspacePathEnvVar+"=")

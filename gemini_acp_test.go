@@ -220,10 +220,11 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 		"GEMINI_API_KEY=g-key",
 		"GOOGLE_CLOUD_PROJECT=proj",
 		"HOME=/home/user",
-		// An inherited "trust the workspace" value must be dropped and replaced
-		// with a pinned-off value so a committed workspace `.env` cannot re-grant
-		// it (the env twin of the stripped `--skip-trust` flag).
-		"GEMINI_CLI_TRUST_WORKSPACE=true",
+		// An inherited "trust the workspace" value that Gemini would not honor
+		// anyway (only the exact value `true` counts) must be normalized to the
+		// inert pinned-off value so a committed workspace `.env` cannot set it
+		// (the env twin of the stripped `--skip-trust` flag).
+		"GEMINI_CLI_TRUST_WORKSPACE=1",
 		// IDE-companion variables must be dropped: the workspace path feeds
 		// includeDirectories directly (the env twin of the stripped
 		// `--include-directories` flag).
@@ -236,13 +237,13 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 			t.Errorf("expected env to retain %q; got %v", w, got)
 		}
 	}
-	for _, w := range []string{"CLAUDECODE=1", "CLAUDE_CODE_ENTRYPOINT=cli", "CODEX_IDE_VERSION=0.1.0", "GEMINI_CLI_TRUST_WORKSPACE=true", "GEMINI_CLI_IDE_WORKSPACE_PATH=/outside/workspace", "GEMINI_CLI_IDE_SERVER_PORT=12345"} {
+	for _, w := range []string{"CLAUDECODE=1", "CLAUDE_CODE_ENTRYPOINT=cli", "CODEX_IDE_VERSION=0.1.0", "GEMINI_CLI_TRUST_WORKSPACE=1", "GEMINI_CLI_IDE_WORKSPACE_PATH=/outside/workspace", "GEMINI_CLI_IDE_SERVER_PORT=12345"} {
 		if envContains(got, w) {
 			t.Errorf("expected env to strip %q; got %v", w, got)
 		}
 	}
-	// Workspace trust must be pinned OFF exactly once, regardless of whether an
-	// inherited value was present.
+	// Workspace trust must be pinned OFF exactly once when the inherited value
+	// is anything other than the exact `true` Gemini honors.
 	if !envContains(got, "GEMINI_CLI_TRUST_WORKSPACE=false") {
 		t.Errorf("expected env to pin GEMINI_CLI_TRUST_WORKSPACE=false; got %v", got)
 	}
@@ -277,6 +278,37 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 	}
 	if !envContains(gotClean, "GEMINI_CLI_IDE_WORKSPACE_PATH=") {
 		t.Errorf("expected IDE workspace path pinned empty when absent from input; got %v", gotClean)
+	}
+
+	// The operator's own headless trust opt-in — the exact value `true`, the
+	// only spelling Gemini's checkPathTrust honors — set in the agent's launch
+	// environment (not reachable from any repo) must survive as a single pinned
+	// entry, so Folder-Trust-enabled users keep Gemini's documented
+	// non-interactive bypass instead of hitting FatalUntrustedWorkspaceError.
+	gotTrusted := sanitizeGeminiACPEnv([]string{"PATH=/usr/bin", "GEMINI_CLI_TRUST_WORKSPACE=true"})
+	trustedCount := 0
+	for _, e := range gotTrusted {
+		if strings.HasPrefix(strings.ToUpper(e), "GEMINI_CLI_TRUST_WORKSPACE=") {
+			trustedCount++
+			if e != "GEMINI_CLI_TRUST_WORKSPACE=true" {
+				t.Errorf("expected operator trust opt-in preserved as exact `true`; got %q", e)
+			}
+		}
+	}
+	if trustedCount != 1 {
+		t.Errorf("expected exactly one GEMINI_CLI_TRUST_WORKSPACE entry, got %d in %v", trustedCount, gotTrusted)
+	}
+
+	// Values Gemini would ignore (`TRUE`, `1`, empty) are normalized to the
+	// inert `false`, never passed through and never promoted to `true`.
+	for _, v := range []string{"GEMINI_CLI_TRUST_WORKSPACE=TRUE", "GEMINI_CLI_TRUST_WORKSPACE=1", "GEMINI_CLI_TRUST_WORKSPACE="} {
+		gotOther := sanitizeGeminiACPEnv([]string{"PATH=/usr/bin", v})
+		if !envContains(gotOther, "GEMINI_CLI_TRUST_WORKSPACE=false") {
+			t.Errorf("expected inherited %q normalized to pinned false; got %v", v, gotOther)
+		}
+		if envContains(gotOther, v) || envContains(gotOther, "GEMINI_CLI_TRUST_WORKSPACE=true") {
+			t.Errorf("expected inherited %q neither passed through nor promoted; got %v", v, gotOther)
+		}
 	}
 }
 
