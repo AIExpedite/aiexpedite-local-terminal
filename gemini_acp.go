@@ -311,8 +311,11 @@ func sanitizeGeminiACPEnv(env []string) []string {
 // equivalent route to the `--yolo` / `--approval-mode` / `--include-directories`
 // flags sanitizeGeminiACPExtraArgs already blocks: it can re-enable tool
 // auto-approval (bypassing the orchestrator's ACP `session/request_permission`
-// flow) or add context directories outside the WorkspaceRoot containment
-// `start` enforces.
+// flow), load extra policy files whose `allow` rules auto-approve tools
+// (policyPaths / adminPolicyPaths — the settings twin of the stripped
+// `--policy`/`--admin-policy` flags), mark an MCP server trusted so its tool
+// calls skip confirmation (`mcpServers.*.trust: true`), or add context
+// directories outside the WorkspaceRoot containment `start` enforces.
 //
 // A missing or unreadable/unparseable file is NOT fatal: absence is the common
 // case, and gemini itself tolerates a malformed settings file, so failing the
@@ -366,6 +369,24 @@ func geminiSettingsPrivilegeReason(v any) string {
 			case "includedirectories":
 				if arr, ok := val.([]any); ok && len(arr) > 0 {
 					return "extra context directories (includeDirectories)"
+				}
+			case "policypaths", "adminpolicypaths":
+				switch paths := val.(type) {
+				case string:
+					if strings.TrimSpace(paths) != "" {
+						return fmt.Sprintf("extra policy files (%s)", k)
+					}
+				case []any:
+					if len(paths) > 0 {
+						return fmt.Sprintf("extra policy files (%s)", k)
+					}
+				}
+			case "trust":
+				// mcpServers.<name>.trust: true bypasses per-call tool
+				// confirmations for that server. The walk is positional-blind,
+				// but no benign Gemini setting spells a bare boolean `trust`.
+				if b, ok := val.(bool); ok && b {
+					return "a trusted MCP server (trust: true)"
 				}
 			}
 			if reason := geminiSettingsPrivilegeReason(val); reason != "" {

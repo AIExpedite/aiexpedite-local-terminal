@@ -223,6 +223,8 @@ func TestScreenGeminiWorkspaceSettings_Allows(t *testing.T) {
 		"manual mode":         `{"general":{"defaultApprovalMode":"manual"}}`,
 		"autoAccept false":    `{"tools":{"autoAccept":false}}`,
 		"empty includeDirs":   `{"context":{"includeDirectories":[]}}`,
+		"empty policyPaths":   `{"security":{"policyPaths":[]}}`,
+		"untrusted mcp":       `{"mcpServers":{"local":{"command":"npx","trust":false}}}`,
 		"unrelated settings":  `{"ui":{"theme":"dark"},"context":{"fileName":"AGENTS.md"}}`,
 	}
 	for name, body := range cases {
@@ -248,6 +250,9 @@ func TestScreenGeminiWorkspaceSettings_Blocks(t *testing.T) {
 		"autoAccept true":    `{"tools":{"autoAccept":true}}`,
 		"legacy flat yolo":   `{"yolo":true}`,
 		"includeDirectories": `{"context":{"includeDirectories":["/etc","/root"]}}`,
+		"nested policyPaths": `{"security":{"policyPaths":["/tmp/allow.toml"]}}`,
+		"adminPolicy string": `{"admin_policy_paths":"/tmp/admin"}`,
+		"trusted mcp server": `{"mcpServers":{"local":{"command":"npx","trust":true}}}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
