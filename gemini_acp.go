@@ -22,8 +22,9 @@
 // account. Unlike Grok there is no API-key opt-in gate on this path: no
 // credential flags are accepted on the argv, and inherited env keys
 // (GEMINI_API_KEY / GOOGLE_API_KEY) pass through exactly as they do on the
-// raw single-turn `session_start` path — sanitizeGeminiACPEnv only strips
-// the embedded-IDE markers.
+// raw single-turn `session_start` path — sanitizeGeminiACPEnv strips the
+// embedded-IDE markers and pins GEMINI_CLI_TRUST_WORKSPACE off so a committed
+// workspace `.env` cannot trust the workspace (the env twin of `--skip-trust`).
 // -----------------------------------------------------------------------------
 
 package main
@@ -278,24 +279,45 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 	return false, false
 }
 
+// geminiTrustWorkspaceEnvVar is the environment variable Gemini documents as
+// trusting the current workspace for the session — the env-file twin of the
+// stripped `--skip-trust` flag. See
+// https://geminicli.com/docs/reference/configuration/.
+const geminiTrustWorkspaceEnvVar = "GEMINI_CLI_TRUST_WORKSPACE"
+
 // sanitizeGeminiACPEnv applies a strip list to the inherited environment
-// before forwarding it to the Gemini ACP child. Mirrors
-// sanitizeCodexAppServerEnv: CLAUDECODE / CLAUDE_* / CODEX_IDE_* would tell
-// downstream tooling it is running embedded inside another IDE / agent,
-// which is not true here. GEMINI_* / GOOGLE_* / PATH / HOME etc. are
-// forwarded by omission so the child's shell environment stays intact and
-// the user's `gemini` OAuth creds under ~/.gemini remain discoverable.
+// before forwarding it to the Gemini ACP child, then pins the workspace-trust
+// variable off. Mirrors sanitizeCodexAppServerEnv for the IDE markers:
+// CLAUDECODE / CLAUDE_* / CODEX_IDE_* would tell downstream tooling it is
+// running embedded inside another IDE / agent, which is not true here.
+// GEMINI_* / GOOGLE_* / PATH / HOME etc. are forwarded by omission so the
+// child's shell environment stays intact and the user's `gemini` OAuth creds
+// under ~/.gemini remain discoverable.
+//
+// GEMINI_CLI_TRUST_WORKSPACE is handled specially: stripping the `--skip-trust`
+// flag on the argv is not enough because Gemini auto-loads a `.env` from the
+// workspace (and its ancestors) and documents GEMINI_CLI_TRUST_WORKSPACE=true
+// as trusting the workspace for the session — the same trust bypass that
+// re-enables the project `.gemini/settings.json` / tool auto-acceptance the ACP
+// guards otherwise block. A repo could therefore commit a `.env` carrying that
+// variable and get the bypass for free. So drop any inherited spelling and
+// force it to `false` in the child's process env; Gemini's dotenv loader does
+// not override a variable already present in the environment, so the workspace
+// `.env` cannot flip it back on.
 func sanitizeGeminiACPEnv(env []string) []string {
-	filtered := make([]string, 0, len(env))
+	filtered := make([]string, 0, len(env)+1)
 	for _, e := range env {
 		upper := strings.ToUpper(e)
 		if strings.HasPrefix(upper, "CLAUDECODE=") ||
 			strings.HasPrefix(upper, "CLAUDE_") ||
-			strings.HasPrefix(upper, "CODEX_IDE_") {
+			strings.HasPrefix(upper, "CODEX_IDE_") ||
+			strings.HasPrefix(upper, geminiTrustWorkspaceEnvVar+"=") {
 			continue
 		}
 		filtered = append(filtered, e)
 	}
+	// Pin workspace trust off so a committed `.env` cannot re-grant it.
+	filtered = append(filtered, geminiTrustWorkspaceEnvVar+"=false")
 	return filtered
 }
 
@@ -312,11 +334,15 @@ func sanitizeGeminiACPEnv(env []string) []string {
 // from a subdirectory the privileged file lives above cwd. Screening only
 // `cwd/.gemini/settings.json` would miss a repo-root file that Gemini still
 // applies. So walk every directory from cwd up to and including WorkspaceRoot
-// (the containment root cwd is guaranteed to sit inside) and screen each
-// `.gemini/settings.json` on that path; the first privileged one blocks the
-// start. When WorkspaceRoot is empty (no containment configured) or cwd is not
-// lexically under it, fall back to screening cwd alone. The walk deliberately
-// stops at WorkspaceRoot so it never reaches the user's global
+// (the containment root cwd is guaranteed to sit inside) and — because Gemini
+// resolves project settings from the enclosing Git project root, which can sit
+// ABOVE WorkspaceRoot when the workspace is a subdirectory of a larger repo —
+// keep climbing to that Git root, screening each `.gemini/settings.json` on the
+// path; the first privileged one blocks the start (see geminiSettingsScreenDirs
+// for the exact bounds). When WorkspaceRoot is empty (no containment
+// configured) or cwd is not lexically under it, fall back to screening cwd
+// alone. The upward climb deliberately stops at the Git project root and never
+// enters the user's home directory, so it never reaches the user's global
 // `~/.gemini/settings.json`, which is the user's own choice and out of scope
 // for this repo-supplied-settings screen. Gemini loads workspace settings and
 // lets them override user settings, so a repo-local settings file is an
@@ -359,11 +385,20 @@ func screenGeminiWorkspaceSettings(cwd, workspaceRoot string) error {
 
 // geminiSettingsScreenDirs returns the directories whose `.gemini/settings.json`
 // must be screened for a session rooted at cwd: cwd first, then each ancestor
-// up to and including workspaceRoot. This mirrors how far up Gemini itself will
-// search for the project settings that override user/default settings. When
-// workspaceRoot is empty, or cwd does not sit lexically under it, only cwd is
-// screened — the walk never climbs past workspaceRoot into the user's home so
-// the global `~/.gemini/settings.json` is left alone.
+// up to and including workspaceRoot, then — when workspaceRoot is itself a
+// subdirectory of a larger Git project — each further ancestor up to and
+// including that project root. This mirrors how far up Gemini itself searches
+// for the project settings that override user/default settings: Gemini treats
+// the enclosing Git project root as the place for `.gemini/settings.json` and
+// applies it when running from that project OR any of its subdirectories, so a
+// repo-root settings file just above the configured workspace is still loaded
+// by Gemini and must be screened too.
+//
+// When workspaceRoot is empty, or cwd does not sit lexically under it, only cwd
+// is screened. The upward climb stops at the Git project root (mirroring how
+// far Gemini looks) and never enters the user's home directory, so the global
+// `~/.gemini/settings.json` — the user's own out-of-scope choice — is left
+// alone even when the workspace lives directly under home.
 func geminiSettingsScreenDirs(cwd, workspaceRoot string) []string {
 	cwd = filepath.Clean(cwd)
 	if workspaceRoot == "" {
@@ -385,7 +420,53 @@ func geminiSettingsScreenDirs(cwd, workspaceRoot string) []string {
 		dir = parent
 		dirs = append(dirs, dir)
 	}
-	return dirs
+	// Extend the screen above workspaceRoot to the enclosing Git project root,
+	// which Gemini still loads project settings from when the workspace is a
+	// subdirectory of a larger repo.
+	return append(dirs, geminiProjectRootAncestors(root)...)
+}
+
+// geminiProjectRootAncestors returns the directories strictly above start, up
+// to and including the nearest ancestor that looks like a Git project root (an
+// ancestor containing a `.git` entry — a directory for a normal clone or a file
+// for a worktree/submodule). It returns nil when start is itself a project root
+// (Gemini looks no higher), when no project root is found before the filesystem
+// root, or when the climb would reach the user's home directory. Bounding the
+// climb at the Git root matches how far Gemini searches for project
+// `.gemini/settings.json`; the home-dir guard keeps the user's global config
+// out of this repo-supplied screen.
+func geminiProjectRootAncestors(start string) []string {
+	if hasGitEntry(start) {
+		// start already IS the project root — Gemini resolves no higher.
+		return nil
+	}
+	home := ""
+	if h, err := os.UserHomeDir(); err == nil {
+		home = filepath.Clean(h)
+	}
+	var ancestors []string
+	for dir := start; ; {
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return nil // filesystem root reached without finding a project root
+		}
+		dir = parent
+		if home != "" && dir == home {
+			return nil // reached the user's home dir — leave the global config alone
+		}
+		ancestors = append(ancestors, dir)
+		if hasGitEntry(dir) {
+			return ancestors // Git project root reached (inclusive) — Gemini stops here
+		}
+	}
+}
+
+// hasGitEntry reports whether dir contains a `.git` entry, the marker Gemini
+// uses to identify a project root. A normal clone has a `.git` directory; a
+// worktree or submodule has a `.git` file — os.Stat matches either.
+func hasGitEntry(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, ".git"))
+	return err == nil
 }
 
 // screenGeminiSettingsFile screens a single `.gemini/settings.json` path,

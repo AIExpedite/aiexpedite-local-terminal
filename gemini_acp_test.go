@@ -183,6 +183,10 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 		"GEMINI_API_KEY=g-key",
 		"GOOGLE_CLOUD_PROJECT=proj",
 		"HOME=/home/user",
+		// An inherited "trust the workspace" value must be dropped and replaced
+		// with a pinned-off value so a committed workspace `.env` cannot re-grant
+		// it (the env twin of the stripped `--skip-trust` flag).
+		"GEMINI_CLI_TRUST_WORKSPACE=true",
 	}
 	got := sanitizeGeminiACPEnv(in)
 	for _, w := range []string{"PATH=/usr/bin", "GEMINI_API_KEY=g-key", "GOOGLE_CLOUD_PROJECT=proj", "HOME=/home/user"} {
@@ -190,10 +194,30 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 			t.Errorf("expected env to retain %q; got %v", w, got)
 		}
 	}
-	for _, w := range []string{"CLAUDECODE=1", "CLAUDE_CODE_ENTRYPOINT=cli", "CODEX_IDE_VERSION=0.1.0"} {
+	for _, w := range []string{"CLAUDECODE=1", "CLAUDE_CODE_ENTRYPOINT=cli", "CODEX_IDE_VERSION=0.1.0", "GEMINI_CLI_TRUST_WORKSPACE=true"} {
 		if envContains(got, w) {
 			t.Errorf("expected env to strip %q; got %v", w, got)
 		}
+	}
+	// Workspace trust must be pinned OFF exactly once, regardless of whether an
+	// inherited value was present.
+	if !envContains(got, "GEMINI_CLI_TRUST_WORKSPACE=false") {
+		t.Errorf("expected env to pin GEMINI_CLI_TRUST_WORKSPACE=false; got %v", got)
+	}
+	trustCount := 0
+	for _, e := range got {
+		if strings.HasPrefix(strings.ToUpper(e), "GEMINI_CLI_TRUST_WORKSPACE=") {
+			trustCount++
+		}
+	}
+	if trustCount != 1 {
+		t.Errorf("expected exactly one GEMINI_CLI_TRUST_WORKSPACE entry, got %d in %v", trustCount, got)
+	}
+
+	// Even with no inherited trust variable, the pinned-off value is appended.
+	gotClean := sanitizeGeminiACPEnv([]string{"PATH=/usr/bin"})
+	if !envContains(gotClean, "GEMINI_CLI_TRUST_WORKSPACE=false") {
+		t.Errorf("expected trust var pinned off when absent from input; got %v", gotClean)
 	}
 }
 
@@ -342,9 +366,11 @@ func TestScreenGeminiWorkspaceSettings_ProjectRootWalk(t *testing.T) {
 		}
 	})
 
-	t.Run("privileged file above WorkspaceRoot is not screened", func(t *testing.T) {
-		// A settings file OUTSIDE the containment root must be ignored: the walk
-		// stops at WorkspaceRoot so it never reaches the user's global config.
+	t.Run("privileged file above WorkspaceRoot with no Git root is not screened", func(t *testing.T) {
+		// A settings file above the containment root that is NOT under an
+		// enclosing Git project root must be ignored: without a `.git` marker
+		// Gemini would not resolve it as project settings, and the climb must not
+		// reach the user's global config.
 		above := t.TempDir()
 		writeGeminiSettings(t, above, `{"yolo":true}`)
 		root := filepath.Join(above, "workspace")
@@ -356,6 +382,67 @@ func TestScreenGeminiWorkspaceSettings_ProjectRootWalk(t *testing.T) {
 			t.Fatalf("expected settings above WorkspaceRoot to be ignored, got %v", err)
 		}
 	})
+
+	t.Run("privileged settings at the Git project root above WorkspaceRoot block the start", func(t *testing.T) {
+		// The workspace is a subdirectory of a larger Git repo whose root carries
+		// a privileged `.gemini/settings.json`. Gemini still loads that repo-root
+		// file, so the screen must climb above WorkspaceRoot to the Git root and
+		// catch it.
+		repoRoot := t.TempDir()
+		mkGitMarker(t, repoRoot)
+		writeGeminiSettings(t, repoRoot, `{"mcpServers":{"local":{"command":"npx"}}}`)
+		workspace := filepath.Join(repoRoot, "packages", "app")
+		sub := filepath.Join(workspace, "src")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		err := screenGeminiWorkspaceSettings(sub, workspace)
+		if err == nil {
+			t.Fatal("expected repo-root settings above WorkspaceRoot to block the start")
+		}
+		if !strings.Contains(err.Error(), "settings.json") {
+			t.Errorf("error should name the offending file; got %v", err)
+		}
+	})
+
+	t.Run("benign settings at the Git project root above WorkspaceRoot pass", func(t *testing.T) {
+		repoRoot := t.TempDir()
+		mkGitMarker(t, repoRoot)
+		writeGeminiSettings(t, repoRoot, `{"ui":{"theme":"dark"}}`)
+		workspace := filepath.Join(repoRoot, "packages", "app")
+		if err := os.MkdirAll(workspace, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := screenGeminiWorkspaceSettings(workspace, workspace); err != nil {
+			t.Fatalf("expected benign repo-root settings to pass, got %v", err)
+		}
+	})
+
+	t.Run("climb stops at the Git root and never screens above it", func(t *testing.T) {
+		// A privileged settings file ABOVE the Git project root must be ignored:
+		// Gemini resolves project settings no higher than the Git root, so the
+		// screen must not climb past it into unrelated ancestors.
+		above := t.TempDir()
+		writeGeminiSettings(t, above, `{"yolo":true}`)
+		repoRoot := filepath.Join(above, "repo")
+		mkGitMarker(t, repoRoot)
+		workspace := filepath.Join(repoRoot, "packages", "app")
+		if err := os.MkdirAll(workspace, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := screenGeminiWorkspaceSettings(workspace, workspace); err != nil {
+			t.Fatalf("expected settings above the Git root to be ignored, got %v", err)
+		}
+	})
+}
+
+// mkGitMarker creates a `.git` directory in dir so hasGitEntry treats it as a
+// Git project root.
+func mkGitMarker(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
 }
 
 /* --------------------------------------------------------------------------
