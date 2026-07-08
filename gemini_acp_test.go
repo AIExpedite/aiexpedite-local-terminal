@@ -130,15 +130,25 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--experimental-acp", "--model=gemini-3-pro"},
 		},
 		{
+			// `--policy`/`--admin-policy` load extra policy-engine files
+			// whose `allow` rules auto-approve tools without confirmation —
+			// the same bypass as `--allowed-tools`, which gemini's own docs
+			// deprecate in favor of the policy engine. Separate-token values
+			// must be consumed with the flag.
+			"policy_files_and_values_stripped",
+			[]string{"--policy", "/tmp/allow.toml", "--admin-policy", "/tmp/admin", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
 			"privileged_equals_forms_stripped",
-			[]string{"--yolo=true", "--approval-mode=auto_edit", "--include-directories=/outside", "--allowed-tools=run_shell_command"},
+			[]string{"--yolo=true", "--approval-mode=auto_edit", "--include-directories=/outside", "--allowed-tools=run_shell_command", "--policy=/tmp/allow.toml", "--admin-policy=/tmp/admin"},
 			[]string{"--experimental-acp"},
 		},
 		{
 			// gemini's yargs parser accepts camelCase spellings of every
 			// kebab-case flag — the deny list has to catch those too.
 			"privileged_camelcase_spellings_stripped",
-			[]string{"--approvalMode", "yolo", "--includeDirectories", "/outside", "--allowedTools", "run_shell_command"},
+			[]string{"--approvalMode", "yolo", "--includeDirectories", "/outside", "--allowedTools", "run_shell_command", "--adminPolicy", "/tmp/admin"},
 			[]string{"--experimental-acp"},
 		},
 	}

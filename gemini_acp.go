@@ -157,8 +157,12 @@ func buildGeminiACPArgs(extraArgs []string) []string {
 //     and `--approval-mode` auto-approve tool calls, bypassing the
 //     orchestrator-driven `session/request_permission` flow this manager
 //     relies on for approvals; `--allowed-tools` pre-approves named tools the
-//     same way; `--include-directories` adds extra workspace directories,
-//     routing around the WorkspaceRoot cwd containment Start enforces. Unlike
+//     same way; `--policy`/`--admin-policy` load extra policy-engine files
+//     whose `allow` rules auto-approve tools without confirmation — the
+//     policy engine is the documented successor to `--allowed-tools`, so
+//     both routes to it are closed; `--include-directories` adds extra
+//     workspace directories, routing around the WorkspaceRoot cwd
+//     containment Start enforces. Unlike
 //     Grok's `--allow` there is no per-workspace opt-in gate for these —
 //     Gemini approvals must ride the ACP protocol, so they are stripped
 //     unconditionally.
@@ -218,7 +222,9 @@ func sanitizeGeminiACPExtraArgs(extraArgs []string) []string {
 // geminiACPPrivilegedFlag classifies a lowercased extra-arg token against the
 // deny list of privilege-escalating gemini flags: `-y`/`--yolo` and
 // `--approval-mode` bypass per-tool approvals, `--allowed-tools` pre-approves
-// named tools, `--include-directories` escapes the WorkspaceRoot containment.
+// named tools, `--policy`/`--admin-policy` load extra policy files whose
+// `allow` rules auto-approve tools the same way, and
+// `--include-directories` escapes the WorkspaceRoot containment.
 // gemini's yargs parser also accepts camelCase spellings of every kebab-case
 // flag, so both spellings are matched (ToLower collapses camelCase to the
 // dash-less form). takesValue is true only for the separate-token value form;
@@ -229,6 +235,8 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 		return true, false
 	case "--approval-mode", "--approvalmode",
 		"--allowed-tools", "--allowedtools",
+		"--policy",
+		"--admin-policy", "--adminpolicy",
 		"--include-directories", "--includedirectories":
 		return true, true
 	}
@@ -236,6 +244,8 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 		"--yolo=",
 		"--approval-mode=", "--approvalmode=",
 		"--allowed-tools=", "--allowedtools=",
+		"--policy=",
+		"--admin-policy=", "--adminpolicy=",
 		"--include-directories=", "--includedirectories=",
 	} {
 		if strings.HasPrefix(lower, prefix) {
