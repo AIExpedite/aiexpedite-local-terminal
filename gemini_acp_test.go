@@ -197,6 +197,43 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"-v=1", "--model", "gemini-3-pro"},
 			[]string{"--experimental-acp", "-v=1", "--model", "gemini-3-pro"},
 		},
+		{
+			// A bare positional is a prompt word — the undelimited spelling
+			// of the `--` tail — and flips gemini out of ACP mode exactly
+			// like `-p`. A legacy caller reusing the session_start shape with
+			// the prompt in Args[0] must not break the handshake.
+			"bare_positional_prompt_dropped",
+			[]string{"tell me a joke", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
+			// A positional after a DROPPED flag fails closed: the preceding
+			// flag never reached the argv, so the trailing word cannot be its
+			// value and would be read as a prompt.
+			"positional_after_dropped_flag_dropped",
+			[]string{"--yolo", "do things"},
+			[]string{"--experimental-acp"},
+		},
+		{
+			// An equals-form flag already carries its value inline, so a bare
+			// token after it is a positional prompt, not a value.
+			"positional_after_equals_flag_dropped",
+			[]string{"--model=gemini-3-pro", "stray prompt"},
+			[]string{"--experimental-acp", "--model=gemini-3-pro"},
+		},
+		{
+			// Only the token directly after a separate-token flag can be its
+			// value; a second bare token is a positional again.
+			"second_positional_after_flag_value_dropped",
+			[]string{"--model", "gemini-3-pro", "extra prompt"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
+			// The lone `-` stdin marker is a positional, not a flag.
+			"lone_dash_dropped",
+			[]string{"-"},
+			[]string{"--experimental-acp"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

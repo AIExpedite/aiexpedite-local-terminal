@@ -174,6 +174,13 @@ func buildGeminiACPArgs(extraArgs []string) []string {
 //     buildGeminiInteractiveArgs) is where prompts belong.
 //   - the POSIX `--` end-of-options delimiter — everything after it would be
 //     read as a positional prompt, which switches modes exactly like `-p`.
+//   - bare positionals — gemini reads any non-flag positional as a prompt
+//     word too (the undelimited spelling of the `--` tail above), so a legacy
+//     caller reusing the `session_start` shape with the prompt in `Args[0]`
+//     would flip the child out of ACP mode. A bare token survives only as the
+//     value of the immediately preceding kept separate-token flag (e.g.
+//     `--model gemini-3-pro`); anywhere else it is dropped. Failing closed is
+//     safe because a flag's value always directly follows its flag.
 //   - privilege-escalating flags (see geminiACPPrivilegedFlag): `-y`/`--yolo`
 //     and `--approval-mode` auto-approve tool calls, bypassing the
 //     orchestrator-driven `session/request_permission` flow this manager
@@ -250,9 +257,35 @@ func sanitizeGeminiACPExtraArgs(extraArgs []string) []string {
 			break
 		}
 
+		// Bare positionals are prompt words (rationale in the function doc):
+		// keep one only as the value of the flag token kept immediately
+		// before it; otherwise drop it so it cannot flip the child out of
+		// ACP mode. Comparing against the last KEPT token (not the previous
+		// raw token) fails closed when the preceding flag was itself dropped.
+		if !geminiACPFlagShaped(a) {
+			if len(cleaned) == 0 || !geminiACPSeparateValueFlagShaped(cleaned[len(cleaned)-1]) {
+				continue
+			}
+		}
+
 		cleaned = append(cleaned, a)
 	}
 	return cleaned
+}
+
+// geminiACPFlagShaped reports whether a token is flag-shaped: a leading dash
+// followed by at least one more character. The lone `-` stdin marker is a
+// positional, not a flag.
+func geminiACPFlagShaped(tok string) bool {
+	return len(tok) >= 2 && tok[0] == '-'
+}
+
+// geminiACPSeparateValueFlagShaped reports whether a kept token could be
+// consuming a following separate-token value: flag-shaped with no inline
+// `=value` (an equals-form flag already carries its value, so a bare token
+// after it is a positional).
+func geminiACPSeparateValueFlagShaped(tok string) bool {
+	return geminiACPFlagShaped(tok) && !strings.Contains(tok, "=")
 }
 
 // geminiACPPrivilegedFlag classifies a lowercased extra-arg token against the
