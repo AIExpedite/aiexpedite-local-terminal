@@ -221,6 +221,7 @@ func TestScreenGeminiWorkspaceSettings_Allows(t *testing.T) {
 		"malformed json":      `{ not valid`,
 		"benign default mode": `{"general":{"defaultApprovalMode":"default"}}`,
 		"manual mode":         `{"general":{"defaultApprovalMode":"manual"}}`,
+		"read-only plan mode": `{"general":{"defaultApprovalMode":"plan"}}`,
 		"autoAccept false":    `{"tools":{"autoAccept":false}}`,
 		"empty includeDirs":   `{"context":{"includeDirectories":[]}}`,
 		"empty allowed tools": `{"tools":{"allowed":[]}}`,

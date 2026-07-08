@@ -361,7 +361,12 @@ func geminiSettingsPrivilegeReason(v any) string {
 			case "defaultapprovalmode", "approvalmode":
 				if s, ok := val.(string); ok {
 					mode := geminiSettingsKey(s)
-					if mode != "" && mode != "default" && mode != "manual" {
+					// `default`/`manual` prompt per action and `plan` is
+					// read-only (no edits/tool runs), so none of them bypass
+					// the ACP `session/request_permission` flow; only
+					// `auto_edit`/`yolo` auto-approve actions. See
+					// https://geminicli.com/docs/cli/settings/.
+					if mode != "" && mode != "default" && mode != "manual" && mode != "plan" {
 						return fmt.Sprintf("auto-approval mode %q", s)
 					}
 				}
