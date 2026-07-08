@@ -303,16 +303,29 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 var geminiACPDangerousShortFlags = map[rune]bool{'y': true, 'p': true, 'i': true}
 
 // geminiACPShortFlagClusterHasPrivilege reports whether a lowercased token is a
-// short-option cluster (a single leading dash followed by two or more ASCII
-// letters, no `=`) that carries one of geminiACPDangerousShortFlags. Long
-// flags (`--…`), the `--` delimiter, equals-form tokens, and anything that is
-// not a pure short-flag cluster (values, digits, paths) are not clusters and
-// return false, so `--model gemini-3-pro` style extras still pass through.
+// short-option cluster (a single leading dash followed by one or more ASCII
+// letters) that carries one of geminiACPDangerousShortFlags. gemini's
+// yargs-parser accepts a short-option equals value (e.g. `-y=true`, and by
+// extension a clustered `-yd=true`), so an `=value` suffix is stripped before
+// the letter check — this catches the short yolo equals form that the
+// exact-match deny list in geminiACPPrivilegedFlag (which only sees `-y=…` if
+// it were listed) would otherwise miss. Long flags (`--…`), the `--`
+// delimiter, and anything that is not a pure short-flag cluster (values,
+// digits, paths) return false, so `--model gemini-3-pro` style extras still
+// pass through.
 func geminiACPShortFlagClusterHasPrivilege(lower string) bool {
 	if len(lower) < 2 || lower[0] != '-' || lower[1] == '-' {
 		return false
 	}
 	body := lower[1:]
+	// yargs accepts a short-option equals value (`-y=true`); the letters
+	// before the `=` are still expanded as boolean short flags, so screen them.
+	if eq := strings.IndexByte(body, '='); eq >= 0 {
+		body = body[:eq]
+	}
+	if body == "" {
+		return false
+	}
 	for _, r := range body {
 		if r < 'a' || r > 'z' {
 			return false // not a pure short-flag cluster
@@ -480,14 +493,14 @@ func geminiSettingsScreenDirs(cwd, workspaceRoot string) []string {
 	// screens cwd alone.
 	cwd = resolveScreenPath(cwd)
 	if workspaceRoot == "" {
-		return []string{cwd}
+		return dropGeminiHomeDir([]string{cwd})
 	}
 	root := resolveScreenPath(workspaceRoot)
 	rel, err := filepath.Rel(root, cwd)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		// cwd is not under workspaceRoot (unexpected given containment) —
 		// screen cwd alone rather than walking an unrelated ancestor chain.
-		return []string{cwd}
+		return dropGeminiHomeDir([]string{cwd})
 	}
 	dirs := []string{cwd}
 	for dir := cwd; dir != root; {
@@ -501,7 +514,32 @@ func geminiSettingsScreenDirs(cwd, workspaceRoot string) []string {
 	// Extend the screen above workspaceRoot to the enclosing Git project root,
 	// which Gemini still loads project settings from when the workspace is a
 	// subdirectory of a larger repo.
-	return append(dirs, geminiProjectRootAncestors(root)...)
+	return dropGeminiHomeDir(append(dirs, geminiProjectRootAncestors(root)...))
+}
+
+// dropGeminiHomeDir removes the user's home directory from a screen list. When
+// the configured workspace is left at (or is itself) the home directory — the
+// default WorkingDirectory when none is set — the upward walk includes home and
+// would screen `~/.gemini/settings.json`, the user's own global config, causing
+// every ACP chat to be rejected for users who set global mcpServers /
+// allowedTools / a non-default approval mode. Gemini's project-settings search
+// and the geminiProjectRootAncestors climb both deliberately exclude the global
+// config; this keeps the direct walk consistent with that boundary. Home is
+// resolved through the same symlink resolution as the screen dirs so the guard
+// still fires when home is reached through a symlink.
+func dropGeminiHomeDir(dirs []string) []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return dirs
+	}
+	home = resolveScreenPath(home)
+	out := dirs[:0]
+	for _, dir := range dirs {
+		if dir != home {
+			out = append(out, dir)
+		}
+	}
+	return out
 }
 
 // resolveScreenPath returns the symlink-resolved absolute form of p, matching

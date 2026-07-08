@@ -176,11 +176,26 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
 		},
 		{
+			// gemini's yargs-parser accepts a short-option equals value
+			// (`-y=true`), which would re-enable yolo if it fell through the
+			// exact-match deny list. Both the bare `-y=…` and a clustered
+			// `-yd=…` carrying the yolo/prompt letters must be dropped.
+			"short_yolo_equals_form_stripped",
+			[]string{"-y=true", "-yd=1", "-ip=x", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
 			// A benign short cluster with no dangerous letters must survive so
 			// legitimate gemini short options are not silently dropped.
 			"benign_short_cluster_survives",
 			[]string{"-vd", "--model", "gemini-3-pro"},
 			[]string{"--experimental-acp", "-vd", "--model", "gemini-3-pro"},
+		},
+		{
+			// A benign short-option equals value must still pass through.
+			"benign_short_equals_survives",
+			[]string{"-v=1", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "-v=1", "--model", "gemini-3-pro"},
 		},
 	}
 	for _, c := range cases {
@@ -503,6 +518,26 @@ func TestScreenGeminiWorkspaceSettings_ProjectRootWalk(t *testing.T) {
 		}
 		if err := screenGeminiWorkspaceSettings(workspace, workspace); err != nil {
 			t.Fatalf("expected settings above the Git root to be ignored, got %v", err)
+		}
+	})
+
+	t.Run("home directory global settings are never screened", func(t *testing.T) {
+		// Regression: when WorkingDirectory is left at its default home directory
+		// and a session runs from a project under ~, the upward walk reaches home
+		// and would screen the user's own global ~/.gemini/settings.json, wrongly
+		// rejecting every ACP chat for users with global mcpServers/allowedTools/
+		// approval-mode set. The global config is out of scope and must be skipped.
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("USERPROFILE", home) // Windows os.UserHomeDir source
+		writeGeminiSettings(t, home, `{"mcpServers":{"local":{"command":"npx"}},"general":{"defaultApprovalMode":"yolo"}}`)
+		workspace := filepath.Join(home, "proj")
+		if err := os.MkdirAll(workspace, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// workspaceRoot == home: the walk from proj up to home must drop home.
+		if err := screenGeminiWorkspaceSettings(workspace, home); err != nil {
+			t.Fatalf("expected the user's global ~/.gemini/settings.json to be left unscreened, got %v", err)
 		}
 	})
 }
