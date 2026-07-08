@@ -400,11 +400,21 @@ func screenGeminiWorkspaceSettings(cwd, workspaceRoot string) error {
 // `~/.gemini/settings.json` — the user's own out-of-scope choice — is left
 // alone even when the workspace lives directly under home.
 func geminiSettingsScreenDirs(cwd, workspaceRoot string) []string {
-	cwd = filepath.Clean(cwd)
+	// Resolve symlinks on both sides before any containment math so this walk
+	// agrees with the symlink-resolved containment check acpManager.start
+	// already enforced. A raw lexical Rel mis-classifies a contained cwd as
+	// outside the root when the two are spelled through different symlinks
+	// (e.g. workspaceRoot=/link/repo, cwd=/real/repo/sub): start accepts the
+	// session, but the lexical check here would return only cwd and skip the
+	// workspace/Git-root `.gemini/settings.json` that Gemini still loads,
+	// letting a repo re-enable yolo/MCP/tool settings past the guard. Fall back
+	// to a lexical Clean when resolution fails so an unresolvable path still
+	// screens cwd alone.
+	cwd = resolveScreenPath(cwd)
 	if workspaceRoot == "" {
 		return []string{cwd}
 	}
-	root := filepath.Clean(workspaceRoot)
+	root := resolveScreenPath(workspaceRoot)
 	rel, err := filepath.Rel(root, cwd)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		// cwd is not under workspaceRoot (unexpected given containment) —
@@ -426,6 +436,19 @@ func geminiSettingsScreenDirs(cwd, workspaceRoot string) []string {
 	return append(dirs, geminiProjectRootAncestors(root)...)
 }
 
+// resolveScreenPath returns the symlink-resolved absolute form of p, matching
+// the resolution acpManager.start uses for containment (so the two views of a
+// contained path can't diverge). It reuses resolveCwdForContainment, which
+// resolves the existing prefix even when a trailing component doesn't exist,
+// and falls back to a lexical Clean when even that can't resolve so callers
+// always get a usable path.
+func resolveScreenPath(p string) string {
+	if resolved, err := resolveCwdForContainment(p); err == nil {
+		return resolved
+	}
+	return filepath.Clean(p)
+}
+
 // geminiProjectRootAncestors returns the directories strictly above start, up
 // to and including the nearest ancestor that looks like a Git project root (an
 // ancestor containing a `.git` entry — a directory for a normal clone or a file
@@ -440,9 +463,11 @@ func geminiProjectRootAncestors(start string) []string {
 		// start already IS the project root — Gemini resolves no higher.
 		return nil
 	}
+	// Resolve the home dir the same way the ancestor chain is resolved so the
+	// guard below still fires when home (or start) is reached through a symlink.
 	home := ""
 	if h, err := os.UserHomeDir(); err == nil {
-		home = filepath.Clean(h)
+		home = resolveScreenPath(h)
 	}
 	var ancestors []string
 	for dir := start; ; {

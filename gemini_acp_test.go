@@ -418,6 +418,33 @@ func TestScreenGeminiWorkspaceSettings_ProjectRootWalk(t *testing.T) {
 		}
 	})
 
+	t.Run("workspace root reached through a symlink still screens the root settings", func(t *testing.T) {
+		// Regression: when WorkspaceRoot and cwd spell the same contained tree
+		// through different symlinks, a purely lexical Rel would treat cwd as
+		// outside the root and screen cwd alone, skipping the privileged
+		// root-level settings.json that Gemini still loads. The screen must
+		// resolve symlinks (as acpManager.start's containment check does) so the
+		// root file is caught.
+		real := t.TempDir()
+		writeGeminiSettings(t, real, `{"general":{"defaultApprovalMode":"yolo"}}`)
+		sub := filepath.Join(real, "packages", "app")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(t.TempDir(), "link")
+		if err := os.Symlink(real, link); err != nil {
+			t.Skipf("symlinks unavailable on this platform: %v", err)
+		}
+		// WorkspaceRoot given via the symlink; cwd via the real path.
+		err := screenGeminiWorkspaceSettings(sub, link)
+		if err == nil {
+			t.Fatal("expected the symlinked root's yolo settings to block the start")
+		}
+		if !strings.Contains(err.Error(), "settings.json") {
+			t.Errorf("error should name the offending file; got %v", err)
+		}
+	})
+
 	t.Run("climb stops at the Git root and never screens above it", func(t *testing.T) {
 		// A privileged settings file ABOVE the Git project root must be ignored:
 		// Gemini resolves project settings no higher than the Git root, so the
