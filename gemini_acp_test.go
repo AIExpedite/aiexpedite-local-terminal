@@ -187,6 +187,11 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 		// with a pinned-off value so a committed workspace `.env` cannot re-grant
 		// it (the env twin of the stripped `--skip-trust` flag).
 		"GEMINI_CLI_TRUST_WORKSPACE=true",
+		// IDE-companion variables must be dropped: the workspace path feeds
+		// includeDirectories directly (the env twin of the stripped
+		// `--include-directories` flag).
+		"GEMINI_CLI_IDE_WORKSPACE_PATH=/outside/workspace",
+		"GEMINI_CLI_IDE_SERVER_PORT=12345",
 	}
 	got := sanitizeGeminiACPEnv(in)
 	for _, w := range []string{"PATH=/usr/bin", "GEMINI_API_KEY=g-key", "GOOGLE_CLOUD_PROJECT=proj", "HOME=/home/user"} {
@@ -194,7 +199,7 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 			t.Errorf("expected env to retain %q; got %v", w, got)
 		}
 	}
-	for _, w := range []string{"CLAUDECODE=1", "CLAUDE_CODE_ENTRYPOINT=cli", "CODEX_IDE_VERSION=0.1.0", "GEMINI_CLI_TRUST_WORKSPACE=true"} {
+	for _, w := range []string{"CLAUDECODE=1", "CLAUDE_CODE_ENTRYPOINT=cli", "CODEX_IDE_VERSION=0.1.0", "GEMINI_CLI_TRUST_WORKSPACE=true", "GEMINI_CLI_IDE_WORKSPACE_PATH=/outside/workspace", "GEMINI_CLI_IDE_SERVER_PORT=12345"} {
 		if envContains(got, w) {
 			t.Errorf("expected env to strip %q; got %v", w, got)
 		}
@@ -213,11 +218,28 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 	if trustCount != 1 {
 		t.Errorf("expected exactly one GEMINI_CLI_TRUST_WORKSPACE entry, got %d in %v", trustCount, got)
 	}
+	// The IDE workspace path must be pinned EMPTY exactly once so a committed
+	// workspace `.env` cannot set it (dotenv does not override a present var).
+	idePathCount := 0
+	for _, e := range got {
+		if strings.HasPrefix(strings.ToUpper(e), "GEMINI_CLI_IDE_WORKSPACE_PATH=") {
+			idePathCount++
+			if e != "GEMINI_CLI_IDE_WORKSPACE_PATH=" {
+				t.Errorf("expected IDE workspace path pinned empty; got %q", e)
+			}
+		}
+	}
+	if idePathCount != 1 {
+		t.Errorf("expected exactly one GEMINI_CLI_IDE_WORKSPACE_PATH entry, got %d in %v", idePathCount, got)
+	}
 
-	// Even with no inherited trust variable, the pinned-off value is appended.
+	// Even with no inherited trust/IDE variables, the pinned values are appended.
 	gotClean := sanitizeGeminiACPEnv([]string{"PATH=/usr/bin"})
 	if !envContains(gotClean, "GEMINI_CLI_TRUST_WORKSPACE=false") {
 		t.Errorf("expected trust var pinned off when absent from input; got %v", gotClean)
+	}
+	if !envContains(gotClean, "GEMINI_CLI_IDE_WORKSPACE_PATH=") {
+		t.Errorf("expected IDE workspace path pinned empty when absent from input; got %v", gotClean)
 	}
 }
 

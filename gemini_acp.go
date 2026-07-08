@@ -23,8 +23,11 @@
 // credential flags are accepted on the argv, and inherited env keys
 // (GEMINI_API_KEY / GOOGLE_API_KEY) pass through exactly as they do on the
 // raw single-turn `session_start` path — sanitizeGeminiACPEnv strips the
-// embedded-IDE markers and pins GEMINI_CLI_TRUST_WORKSPACE off so a committed
-// workspace `.env` cannot trust the workspace (the env twin of `--skip-trust`).
+// embedded-IDE markers (including GEMINI_CLI_IDE_*), pins
+// GEMINI_CLI_TRUST_WORKSPACE off so a committed workspace `.env` cannot trust
+// the workspace (the env twin of `--skip-trust`), and pins
+// GEMINI_CLI_IDE_WORKSPACE_PATH empty so the same `.env` cannot add outside
+// directories (the env twin of `--include-directories`).
 // -----------------------------------------------------------------------------
 
 package main
@@ -285,6 +288,14 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 // https://geminicli.com/docs/reference/configuration/.
 const geminiTrustWorkspaceEnvVar = "GEMINI_CLI_TRUST_WORKSPACE"
 
+// geminiIDEWorkspacePathEnvVar is the variable Gemini's IDE companion sets to
+// tell the CLI which IDE workspace folders it runs inside. Gemini's config
+// loader reads it unconditionally and pushes those folders into
+// includeDirectories — the env twin of the stripped `--include-directories`
+// flag and the screened `context.includeDirectories` setting, so it is another
+// route to grant the child access to directories outside WorkspaceRoot.
+const geminiIDEWorkspacePathEnvVar = "GEMINI_CLI_IDE_WORKSPACE_PATH"
+
 // sanitizeGeminiACPEnv applies a strip list to the inherited environment
 // before forwarding it to the Gemini ACP child, then pins the workspace-trust
 // variable off. Mirrors sanitizeCodexAppServerEnv for the IDE markers:
@@ -304,13 +315,23 @@ const geminiTrustWorkspaceEnvVar = "GEMINI_CLI_TRUST_WORKSPACE"
 // force it to `false` in the child's process env; Gemini's dotenv loader does
 // not override a variable already present in the environment, so the workspace
 // `.env` cannot flip it back on.
+//
+// GEMINI_CLI_IDE_* gets the same treatment for the same reason: this manager
+// is not Gemini's IDE companion, and GEMINI_CLI_IDE_WORKSPACE_PATH in
+// particular feeds includeDirectories directly (Gemini's config loader pushes
+// its folders into the context), sidestepping the `--include-directories`
+// strip and the `context.includeDirectories` settings screen. Drop any
+// inherited GEMINI_CLI_IDE_* value and pin the workspace-path variable to
+// empty — present-but-empty blocks the dotenv override just like the trust
+// pin, and Gemini ignores an empty value.
 func sanitizeGeminiACPEnv(env []string) []string {
-	filtered := make([]string, 0, len(env)+1)
+	filtered := make([]string, 0, len(env)+2)
 	for _, e := range env {
 		upper := strings.ToUpper(e)
 		if strings.HasPrefix(upper, "CLAUDECODE=") ||
 			strings.HasPrefix(upper, "CLAUDE_") ||
 			strings.HasPrefix(upper, "CODEX_IDE_") ||
+			strings.HasPrefix(upper, "GEMINI_CLI_IDE_") ||
 			strings.HasPrefix(upper, geminiTrustWorkspaceEnvVar+"=") {
 			continue
 		}
@@ -318,6 +339,9 @@ func sanitizeGeminiACPEnv(env []string) []string {
 	}
 	// Pin workspace trust off so a committed `.env` cannot re-grant it.
 	filtered = append(filtered, geminiTrustWorkspaceEnvVar+"=false")
+	// Pin the IDE workspace path empty so a committed `.env` cannot add
+	// directories outside WorkspaceRoot through the IDE-companion route.
+	filtered = append(filtered, geminiIDEWorkspacePathEnvVar+"=")
 	return filtered
 }
 
