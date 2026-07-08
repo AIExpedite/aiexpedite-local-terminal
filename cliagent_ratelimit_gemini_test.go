@@ -86,6 +86,57 @@ func TestGeminiLimitStateFromFrame_SessionUpdate(t *testing.T) {
 	}
 }
 
+// Ordinary chat text that merely TALKS ABOUT quota limits (an assistant
+// explaining an API error, a user pasting one) rides in the same
+// `content`/`text` keys as real notices. It must not classify — a false
+// "reached" would pin an error banner on the CLI Agents card for the 6h TTL.
+func TestGeminiLimitStateFromFrame_ChatProseIsNotALimitSignal(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	frames := []map[string]interface{}{
+		// ACP agent_message_chunk: assistant prose mentioning a quota error.
+		{
+			"method": "session/update",
+			"params": map[string]interface{}{
+				"update": map[string]interface{}{
+					"sessionUpdate": "agent_message_chunk",
+					"content": map[string]interface{}{
+						"type": "text",
+						"text": "Your API call failed because the quota limit was hit; quota exceeded errors mean you should retry tomorrow.",
+					},
+				},
+			},
+		},
+		// User prompt text quoting a rate-limit error.
+		{
+			"prompt": []interface{}{
+				map[string]interface{}{"type": "text", "text": "why did I get 'rate limit exceeded' from my script?"},
+			},
+		},
+	}
+	for i, frame := range frames {
+		if _, ok := geminiLimitStateFromFrame(frame, now); ok {
+			t.Errorf("frame %d: chat prose must not produce a limit state", i)
+		}
+	}
+}
+
+// Prose inside an error-declaring envelope still classifies: the CLI's error
+// frames can carry the quota text under `content` rather than `message`.
+func TestGeminiLimitStateFromFrame_ErrorEnvelopeContentStillClassifies(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	frame := map[string]interface{}{
+		"type":    "error",
+		"content": "Quota exceeded for quota metric 'Gemini Pro Requests'",
+	}
+	st, ok := geminiLimitStateFromFrame(frame, now)
+	if !ok || st.Severity != geminiLimitReached {
+		t.Fatalf("want reached from error-enveloped content, got ok=%v sev=%q", ok, st.Severity)
+	}
+	if !strings.Contains(st.Message, "Quota exceeded") {
+		t.Fatalf("message not captured: %+v", st)
+	}
+}
+
 // TestCaptureGeminiUsageLimitLine_WritesCache drives the full line-capture
 // path: prefilter → decode → classify → cache write, against an isolated
 // cache location.
@@ -122,6 +173,9 @@ func TestCaptureGeminiUsageLimitLine_IgnoresOrdinaryLines(t *testing.T) {
 
 	captureGeminiUsageLimitLine(`{"type":"message","role":"assistant","content":"hello"}`, time.Now())
 	captureGeminiUsageLimitLine(`not json at all`, time.Now())
+	// Passes the cheap prefilter (mentions "quota") but is an ordinary ACP
+	// chat chunk — the classifier must reject it end-to-end.
+	captureGeminiUsageLimitLine(`{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"That 429 means your quota limit was exceeded upstream."}}}}`, time.Now())
 
 	if _, err := os.ReadFile(cachePath); err == nil {
 		t.Fatal("cache must not be written for ordinary lines")

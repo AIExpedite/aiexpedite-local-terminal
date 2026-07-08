@@ -108,7 +108,11 @@ func captureGeminiUsageLimitLine(line string, now time.Time) {
 // shape nest the payload under varying keys, so we search recursively rather
 // than assume a fixed path. Only limit-bearing message strings are harvested
 // (not every generic `message`) to avoid false positives from unrelated
-// frames.
+// frames. `content`/`text` prose is classified ONLY inside an error-declaring
+// envelope (under an `error`/`errors` key, or a frame whose type/sessionUpdate
+// marks it as an error): ordinary chat updates carry assistant/user text in
+// those same keys, and a message that merely *talks about* quota limits must
+// not arm the card-level limit notice.
 //
 // Severity: a hard hit (`RESOURCE_EXHAUSTED` status, HTTP/gRPC code 429,
 // `rateLimitExceeded`, "quota … exceeded"/"quota limit") → reached; a soft
@@ -131,10 +135,11 @@ func geminiLimitStateFromFrame(raw map[string]interface{}, now time.Time) (gemin
 		}
 	}
 
-	var walk func(v interface{})
-	walk = func(v interface{}) {
+	var walk func(v interface{}, inError bool)
+	walk = func(v interface{}, inError bool) {
 		switch t := v.(type) {
 		case map[string]interface{}:
+			inError = inError || geminiFrameDeclaresError(t)
 			for k, val := range t {
 				lk := strings.ToLower(k)
 				switch s := val.(type) {
@@ -161,9 +166,12 @@ func geminiLimitStateFromFrame(raw map[string]interface{}, now time.Time) (gemin
 					}
 					// Prose forms: the CLI's error text and the pro→flash
 					// fallback notice both ride in `message` / `error` /
-					// `content` strings. Only classify strings that
-					// unambiguously talk about a quota/rate limit.
-					if lk == "message" || lk == "error" || lk == "content" || lk == "text" {
+					// `content` strings. `message`/`error` keys only ever
+					// carry error/notice prose; `content`/`text` also carry
+					// ordinary chat turns, so those classify only inside an
+					// error envelope.
+					if lk == "message" || lk == "error" ||
+						((lk == "content" || lk == "text") && inError) {
 						switch {
 						case strings.Contains(ls, "quota exceeded"),
 							strings.Contains(ls, "quota limit"),
@@ -188,21 +196,51 @@ func geminiLimitStateFromFrame(raw map[string]interface{}, now time.Time) (gemin
 						setSeverity(geminiLimitReached)
 					}
 				}
-				walk(val)
+				walk(val, inError || lk == "error" || lk == "errors")
 			}
 		case []interface{}:
 			for _, x := range t {
-				walk(x)
+				walk(x, inError)
 			}
 		}
 	}
-	walk(raw)
+	walk(raw, false)
 
 	if !found {
 		return st, false
 	}
 	st.Severity = severity
 	return st, true
+}
+
+// geminiFrameDeclaresError reports whether a map is itself an error envelope:
+// its type-discriminator key names an error, or it carries the REST/gRPC
+// error markers (`code: 429`, `status: RESOURCE_EXHAUSTED`). Used to scope
+// prose harvesting of `content`/`text` — those keys also carry ordinary chat
+// turns, which must never classify.
+func geminiFrameDeclaresError(m map[string]interface{}) bool {
+	for k, val := range m {
+		lk := strings.ToLower(k)
+		switch s := val.(type) {
+		case string:
+			if lk == "type" || lk == "event" || lk == "kind" || lk == "subtype" ||
+				lk == "sessionupdate" || lk == "session_update" || lk == "severity" {
+				ls := strings.ToLower(s)
+				if strings.Contains(ls, "error") || strings.Contains(ls, "quota") ||
+					strings.Contains(ls, "rate_limit") {
+					return true
+				}
+			}
+			if lk == "status" && strings.Contains(strings.ToLower(s), "resource_exhausted") {
+				return true
+			}
+		case float64:
+			if (lk == "code" || lk == "status") && s == 429 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // writeGeminiUsageLimitState read-modify-writes the cache. Latest observation
