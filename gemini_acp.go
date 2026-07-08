@@ -29,7 +29,10 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -112,6 +115,19 @@ func NewGeminiACPManager() *GeminiACPManager {
 // non-zero exit code — matching how Grok startup failures are reported.
 func (m *GeminiACPManager) Start(id, cwd string, extraArgs []string, workspaceID, uid string, opts GeminiStartOptions, publishFn PublishFunc) error {
 	return m.start(id, cwd, opts.WorkspaceRoot, opts.TimeoutMs, workspaceID, uid, publishFn, func() (acpSpawnPlan, error) {
+		// The argv/env sanitizers close the flag/env routes to auto-approval
+		// and containment escape, but `gemini --experimental-acp` still loads
+		// the workspace's own `cwd/.gemini/settings.json`, which Gemini
+		// documents as overriding user settings. A repo-local settings file
+		// could re-enable auto-approval (general.defaultApprovalMode /
+		// autoAccept / yolo) or add directories outside WorkspaceRoot
+		// (context.includeDirectories), bypassing the same guards the argv
+		// sanitizer enforces. Screen it before spawning and fail the session
+		// start if it grants privilege — surfaced as a gemini_acp_error, the
+		// same way an unusable binary is.
+		if err := screenGeminiWorkspaceSettings(cwd); err != nil {
+			return acpSpawnPlan{}, err
+		}
 		executable := resolveExecutable("gemini")
 		args := buildGeminiACPArgs(extraArgs)
 		return acpSpawnPlan{
@@ -281,4 +297,96 @@ func sanitizeGeminiACPEnv(env []string) []string {
 		filtered = append(filtered, e)
 	}
 	return filtered
+}
+
+/* --------------------------------------------------------------------------
+   workspace settings screen
+   -------------------------------------------------------------------------- */
+
+// screenGeminiWorkspaceSettings inspects the workspace-scoped
+// `cwd/.gemini/settings.json` (if any) BEFORE spawning the ACP child and
+// rejects the session start when that file would grant a privilege the argv
+// sanitizer strips on the command line. Gemini loads workspace settings and
+// lets them override user settings, so a repo-local settings file is an
+// equivalent route to the `--yolo` / `--approval-mode` / `--include-directories`
+// flags sanitizeGeminiACPExtraArgs already blocks: it can re-enable tool
+// auto-approval (bypassing the orchestrator's ACP `session/request_permission`
+// flow) or add context directories outside the WorkspaceRoot containment
+// `start` enforces.
+//
+// A missing or unreadable/unparseable file is NOT fatal: absence is the common
+// case, and gemini itself tolerates a malformed settings file, so failing the
+// spawn on parse errors would diverge from the CLI and turn a cosmetic typo in
+// a repo into a chat outage. Only a parseable file that positively declares a
+// privilege-escalating value blocks the start. The scan walks the whole JSON
+// tree so both the nested (`general.defaultApprovalMode`, `context.includeDirectories`)
+// and any legacy flat spellings are caught regardless of nesting.
+func screenGeminiWorkspaceSettings(cwd string) error {
+	path := filepath.Join(cwd, ".gemini", "settings.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		// No workspace settings (or unreadable) → nothing to screen.
+		return nil
+	}
+	var parsed any
+	if json.Unmarshal(raw, &parsed) != nil {
+		// Malformed JSON: gemini would ignore/repair it rather than apply a
+		// privileged setting, so don't fail the spawn on it here.
+		return nil
+	}
+	if reason := geminiSettingsPrivilegeReason(parsed); reason != "" {
+		return fmt.Errorf(
+			"workspace %s grants %s, which would bypass the ACP approval/containment guards; "+
+				"remove it or run Gemini chat from a workspace without it", path, reason)
+	}
+	return nil
+}
+
+// geminiSettingsPrivilegeReason walks a decoded settings JSON value and returns
+// a human-readable reason string for the first privilege-escalating setting it
+// finds, or "" when none is present. Key matching is case-insensitive and
+// ignores `-`/`_` separators so kebab-case, camelCase and snake_case spellings
+// all match.
+func geminiSettingsPrivilegeReason(v any) string {
+	switch node := v.(type) {
+	case map[string]any:
+		for k, val := range node {
+			switch geminiSettingsKey(k) {
+			case "defaultapprovalmode", "approvalmode":
+				if s, ok := val.(string); ok {
+					mode := geminiSettingsKey(s)
+					if mode != "" && mode != "default" && mode != "manual" {
+						return fmt.Sprintf("auto-approval mode %q", s)
+					}
+				}
+			case "autoaccept", "yolo":
+				if b, ok := val.(bool); ok && b {
+					return fmt.Sprintf("tool auto-acceptance (%s)", k)
+				}
+			case "includedirectories":
+				if arr, ok := val.([]any); ok && len(arr) > 0 {
+					return "extra context directories (includeDirectories)"
+				}
+			}
+			if reason := geminiSettingsPrivilegeReason(val); reason != "" {
+				return reason
+			}
+		}
+	case []any:
+		for _, item := range node {
+			if reason := geminiSettingsPrivilegeReason(item); reason != "" {
+				return reason
+			}
+		}
+	}
+	return ""
+}
+
+// geminiSettingsKey normalises a settings key or enum value for comparison:
+// lowercased with `-` and `_` separators removed.
+func geminiSettingsKey(s string) string {
+	lower := strings.ToLower(s)
+	lower = strings.ReplaceAll(lower, "-", "")
+	lower = strings.ReplaceAll(lower, "_", "")
+	return lower
 }

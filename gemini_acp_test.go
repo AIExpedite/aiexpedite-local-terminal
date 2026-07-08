@@ -198,6 +198,73 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 }
 
 /* --------------------------------------------------------------------------
+   workspace settings screen
+   -------------------------------------------------------------------------- */
+
+// writeGeminiSettings writes cwd/.gemini/settings.json with the given body.
+func writeGeminiSettings(t *testing.T, cwd, body string) {
+	t.Helper()
+	dir := filepath.Join(cwd, ".gemini")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir .gemini: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write settings.json: %v", err)
+	}
+}
+
+func TestScreenGeminiWorkspaceSettings_Allows(t *testing.T) {
+	// No file, and benign / non-privileged files, must all pass.
+	cases := map[string]string{
+		"no file":             "",
+		"empty object":        `{}`,
+		"malformed json":      `{ not valid`,
+		"benign default mode": `{"general":{"defaultApprovalMode":"default"}}`,
+		"manual mode":         `{"general":{"defaultApprovalMode":"manual"}}`,
+		"autoAccept false":    `{"tools":{"autoAccept":false}}`,
+		"empty includeDirs":   `{"context":{"includeDirectories":[]}}`,
+		"unrelated settings":  `{"ui":{"theme":"dark"},"context":{"fileName":"AGENTS.md"}}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			cwd := t.TempDir()
+			if body != "" {
+				writeGeminiSettings(t, cwd, body)
+			}
+			if err := screenGeminiWorkspaceSettings(cwd); err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestScreenGeminiWorkspaceSettings_Blocks(t *testing.T) {
+	// Each of these positively grants a privilege the argv sanitizer strips,
+	// via nested, camelCase, snake_case and legacy-flat spellings.
+	cases := map[string]string{
+		"nested yolo mode":   `{"general":{"defaultApprovalMode":"yolo"}}`,
+		"auto_edit mode":     `{"general":{"defaultApprovalMode":"auto_edit"}}`,
+		"camelCase approval": `{"approvalMode":"yolo"}`,
+		"autoAccept true":    `{"tools":{"autoAccept":true}}`,
+		"legacy flat yolo":   `{"yolo":true}`,
+		"includeDirectories": `{"context":{"includeDirectories":["/etc","/root"]}}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			cwd := t.TempDir()
+			writeGeminiSettings(t, cwd, body)
+			err := screenGeminiWorkspaceSettings(cwd)
+			if err == nil {
+				t.Fatalf("expected privilege-escalation error for %s, got nil", body)
+			}
+			if !strings.Contains(err.Error(), "settings.json") {
+				t.Errorf("error should name the offending file; got %v", err)
+			}
+		})
+	}
+}
+
+/* --------------------------------------------------------------------------
    Send / Start validation (gemini_acp result-type + noun mapping)
    -------------------------------------------------------------------------- */
 
