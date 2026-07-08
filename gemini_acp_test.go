@@ -160,6 +160,28 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--approvalMode", "yolo", "--skipTrust", "--includeDirectories", "/outside", "--allowedTools", "run_shell_command", "--adminPolicy", "/tmp/admin"},
 			[]string{"--experimental-acp"},
 		},
+		{
+			// gemini's yargs parser expands a grouped short cluster like `-yd`
+			// into `-y -d`, so an exact-match deny on `-y` alone would let the
+			// yolo bit through. The whole cluster must be dropped.
+			"grouped_yolo_cluster_stripped",
+			[]string{"-yd", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
+			// Clusters carrying the prompt short flags (`-p`/`-i`) flip gemini
+			// out of ACP mode just like their standalone forms.
+			"grouped_prompt_cluster_stripped",
+			[]string{"-dp", "-iv", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
+			// A benign short cluster with no dangerous letters must survive so
+			// legitimate gemini short options are not silently dropped.
+			"benign_short_cluster_survives",
+			[]string{"-vd", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "-vd", "--model", "gemini-3-pro"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

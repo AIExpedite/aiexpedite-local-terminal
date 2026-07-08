@@ -230,6 +230,17 @@ func sanitizeGeminiACPExtraArgs(extraArgs []string) []string {
 			continue
 		}
 
+		// Grouped short-option clusters: gemini's yargs parser expands a
+		// cluster like `-yd` into individual boolean flags (`-y -d`), so the
+		// exact-match checks above (which only see the whole `-yd` token)
+		// would let a smuggled `-y` (yolo) or `-p`/`-i` (prompt, mode-break)
+		// through. Drop the whole cluster when it carries one of those
+		// letters — failing closed is safe here because a legitimate caller
+		// can always pass the flags separately.
+		if geminiACPShortFlagClusterHasPrivilege(lower) {
+			continue
+		}
+
 		// POSIX end-of-options delimiter: everything after it is a
 		// positional prompt, which flips gemini out of ACP mode exactly like
 		// `-p`. Drop the delimiter AND everything after it — a legitimate
@@ -280,6 +291,39 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 		}
 	}
 	return false, false
+}
+
+// geminiACPDangerousShortFlags are the single-letter gemini short options that
+// must never survive onto the ACP argv, even hidden inside a grouped cluster:
+// `y` enables YOLO/auto-approve (bypassing the orchestrator-driven
+// session/request_permission flow) and `p`/`i` switch gemini out of ACP stdio
+// mode into a one-shot prompt run (breaking the JSON-RPC handshake). gemini's
+// yargs parser expands `-yd` into `-y -d`, so the exact-match deny lists above
+// do not catch clustered spellings.
+var geminiACPDangerousShortFlags = map[rune]bool{'y': true, 'p': true, 'i': true}
+
+// geminiACPShortFlagClusterHasPrivilege reports whether a lowercased token is a
+// short-option cluster (a single leading dash followed by two or more ASCII
+// letters, no `=`) that carries one of geminiACPDangerousShortFlags. Long
+// flags (`--…`), the `--` delimiter, equals-form tokens, and anything that is
+// not a pure short-flag cluster (values, digits, paths) are not clusters and
+// return false, so `--model gemini-3-pro` style extras still pass through.
+func geminiACPShortFlagClusterHasPrivilege(lower string) bool {
+	if len(lower) < 2 || lower[0] != '-' || lower[1] == '-' {
+		return false
+	}
+	body := lower[1:]
+	for _, r := range body {
+		if r < 'a' || r > 'z' {
+			return false // not a pure short-flag cluster
+		}
+	}
+	for _, r := range body {
+		if geminiACPDangerousShortFlags[r] {
+			return true
+		}
+	}
+	return false
 }
 
 // geminiTrustWorkspaceEnvVar is the environment variable Gemini documents as
