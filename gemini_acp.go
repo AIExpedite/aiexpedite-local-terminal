@@ -26,9 +26,10 @@
 // embedded-IDE markers (including GEMINI_CLI_IDE_*), pins
 // GEMINI_CLI_TRUST_WORKSPACE so a committed workspace `.env` cannot trust the
 // workspace (the env twin of `--skip-trust`) while preserving the operator's
-// own headless trust opt-in from the agent's launch environment, and pins
+// own headless trust opt-in from the agent's launch environment, pins
 // GEMINI_CLI_IDE_WORKSPACE_PATH empty so the same `.env` cannot add outside
-// directories (the env twin of `--include-directories`).
+// directories (the env twin of `--include-directories`), and pins Gemini
+// config-location env vars so workspace dotenv cannot redirect settings.
 // -----------------------------------------------------------------------------
 
 package main
@@ -508,6 +509,20 @@ const geminiTrustWorkspaceEnvVar = "GEMINI_CLI_TRUST_WORKSPACE"
 // route to grant the child access to directories outside WorkspaceRoot.
 const geminiIDEWorkspacePathEnvVar = "GEMINI_CLI_IDE_WORKSPACE_PATH"
 
+// geminiACPConfigPathEnvVars are Gemini environment variables that redirect
+// where the CLI reads persistent config from. A workspace `.env` must not be
+// able to set them before Gemini loads settings: that would move user/system
+// settings, defaults, or folder-trust data to repo-controlled files outside
+// the workspace settings screen below. Preserving an already-inherited value is
+// intentional: it was supplied by the operator's launch environment, not by
+// the repo-local dotenv Gemini has not loaded yet.
+var geminiACPConfigPathEnvVars = []string{
+	"GEMINI_CLI_HOME",
+	"GEMINI_CLI_SYSTEM_SETTINGS_PATH",
+	"GEMINI_CLI_SYSTEM_DEFAULTS_PATH",
+	"GEMINI_CLI_TRUSTED_FOLDERS_PATH",
+}
+
 // sanitizeGeminiACPEnv applies a strip list to the inherited environment
 // before forwarding it to the Gemini ACP child, then pins the workspace-trust
 // variable off. Mirrors sanitizeCodexAppServerEnv for the IDE markers:
@@ -548,11 +563,28 @@ const geminiIDEWorkspacePathEnvVar = "GEMINI_CLI_IDE_WORKSPACE_PATH"
 // inherited GEMINI_CLI_IDE_* value and pin the workspace-path variable to
 // empty — present-but-empty blocks the dotenv override just like the trust
 // pin, and Gemini ignores an empty value.
+//
+// Gemini also lets environment variables override config file locations:
+// GEMINI_CLI_HOME moves the user's `.gemini` directory, while
+// GEMINI_CLI_SYSTEM_SETTINGS_PATH / GEMINI_CLI_SYSTEM_DEFAULTS_PATH and
+// GEMINI_CLI_TRUSTED_FOLDERS_PATH point at specific config files. If a
+// workspace `.env` can set those, it can route Gemini to repo-controlled JSON
+// carrying mcpServers, hooks, policy files, or trust state that the workspace
+// settings screen never inspected. Pin each variable before dotenv runs:
+// inherited operator values survive, absent variables become empty so Gemini
+// falls back to its default paths and dotenv cannot fill them in later.
 func sanitizeGeminiACPEnv(env []string) []string {
-	filtered := make([]string, 0, len(env)+2)
+	filtered := make([]string, 0, len(env)+2+len(geminiACPConfigPathEnvVars))
 	inheritedTrust := false
+	configPathValues := make(map[string]string, len(geminiACPConfigPathEnvVars))
 	for _, e := range env {
 		upper := strings.ToUpper(e)
+		if key, value, ok := strings.Cut(e, "="); ok {
+			if canonical, found := geminiACPConfigPathEnvVar(strings.ToUpper(key)); found {
+				configPathValues[canonical] = value
+				continue
+			}
+		}
 		if strings.HasPrefix(upper, "CLAUDECODE=") ||
 			strings.HasPrefix(upper, "CLAUDE_") ||
 			strings.HasPrefix(upper, "CODEX_IDE_") ||
@@ -580,7 +612,21 @@ func sanitizeGeminiACPEnv(env []string) []string {
 	// Pin the IDE workspace path empty so a committed `.env` cannot add
 	// directories outside WorkspaceRoot through the IDE-companion route.
 	filtered = append(filtered, geminiIDEWorkspacePathEnvVar+"=")
+	// Pin config-location overrides so workspace dotenv cannot redirect
+	// Gemini to repo-controlled settings/defaults/trust files.
+	for _, name := range geminiACPConfigPathEnvVars {
+		filtered = append(filtered, name+"="+configPathValues[name])
+	}
 	return filtered
+}
+
+func geminiACPConfigPathEnvVar(upperKey string) (string, bool) {
+	for _, name := range geminiACPConfigPathEnvVars {
+		if upperKey == name {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 /* --------------------------------------------------------------------------

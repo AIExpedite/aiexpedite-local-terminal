@@ -384,6 +384,13 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 		// `--include-directories` flag).
 		"GEMINI_CLI_IDE_WORKSPACE_PATH=/outside/workspace",
 		"GEMINI_CLI_IDE_SERVER_PORT=12345",
+		// Operator-provided config-location overrides must be preserved, but
+		// canonicalized to one pinned entry so a workspace `.env` cannot later
+		// redirect Gemini to repo-controlled settings/defaults/trust files.
+		"GEMINI_CLI_HOME=/operator/.gemini",
+		"GEMINI_CLI_SYSTEM_SETTINGS_PATH=/operator/system-settings.json",
+		"GEMINI_CLI_SYSTEM_DEFAULTS_PATH=/operator/system-defaults.json",
+		"GEMINI_CLI_TRUSTED_FOLDERS_PATH=/operator/trustedFolders.json",
 	}
 	got := sanitizeGeminiACPEnv(in)
 	for _, w := range []string{"PATH=/usr/bin", "GEMINI_API_KEY=g-key", "GOOGLE_CLOUD_PROJECT=proj", "HOME=/home/user"} {
@@ -425,6 +432,27 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 		t.Errorf("expected exactly one GEMINI_CLI_IDE_WORKSPACE_PATH entry, got %d in %v", idePathCount, got)
 	}
 
+	for _, w := range []string{
+		"GEMINI_CLI_HOME=/operator/.gemini",
+		"GEMINI_CLI_SYSTEM_SETTINGS_PATH=/operator/system-settings.json",
+		"GEMINI_CLI_SYSTEM_DEFAULTS_PATH=/operator/system-defaults.json",
+		"GEMINI_CLI_TRUSTED_FOLDERS_PATH=/operator/trustedFolders.json",
+	} {
+		if !envContains(got, w) {
+			t.Errorf("expected env to preserve pinned operator config path %q; got %v", w, got)
+		}
+		key := strings.SplitN(w, "=", 2)[0]
+		count := 0
+		for _, e := range got {
+			if strings.HasPrefix(strings.ToUpper(e), key+"=") {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("expected exactly one %s entry, got %d in %v", key, count, got)
+		}
+	}
+
 	// Even with no inherited trust/IDE variables, the pinned values are appended.
 	gotClean := sanitizeGeminiACPEnv([]string{"PATH=/usr/bin"})
 	if !envContains(gotClean, "GEMINI_CLI_TRUST_WORKSPACE=false") {
@@ -432,6 +460,21 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 	}
 	if !envContains(gotClean, "GEMINI_CLI_IDE_WORKSPACE_PATH=") {
 		t.Errorf("expected IDE workspace path pinned empty when absent from input; got %v", gotClean)
+	}
+	for _, key := range geminiACPConfigPathEnvVars {
+		pinnedEmpty := key + "="
+		if !envContains(gotClean, pinnedEmpty) {
+			t.Errorf("expected %s pinned empty when absent from input; got %v", key, gotClean)
+		}
+		count := 0
+		for _, e := range gotClean {
+			if strings.HasPrefix(strings.ToUpper(e), key+"=") {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("expected exactly one %s entry, got %d in %v", key, count, gotClean)
+		}
 	}
 
 	// The operator's own headless trust opt-in — the exact value `true`, the
