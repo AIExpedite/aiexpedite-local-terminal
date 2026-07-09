@@ -173,9 +173,10 @@ func buildGeminiACPArgs(extraArgs []string) []string {
 // Dropped tokens:
 //
 //   - `--experimental-acp` / `--acp` — owned by buildGeminiACPArgs; duplicates
-//     and yargs alias/equals forms are dropped so a trailing false value cannot
+//     plus yargs alias/equals/negated forms are dropped so caller extras cannot
 //     override ACP mode.
-//   - `-p`/`--prompt` and `-i`/`--prompt-interactive` (both forms) — any of
+//   - `-p`/`--prompt` and `-i`/`--prompt-interactive` (kebab/camel/equals
+//     forms) — any of
 //     these switches gemini OUT of ACP stdio mode into a one-shot headless /
 //     interactive run, which would break the JSON-RPC handshake the
 //     orchestrator is about to drive. The single-turn path (session_start →
@@ -230,14 +231,17 @@ func sanitizeGeminiACPExtraArgs(extraArgs []string) []string {
 		}
 
 		// Prompt flags take a value in separate-token form; consume it too.
-		if lower == "-p" || lower == "--prompt" || lower == "-i" || lower == "--prompt-interactive" {
+		if lower == "-p" || lower == "--prompt" || lower == "-i" ||
+			lower == "--prompt-interactive" || lower == "--promptinteractive" {
 			if i+1 < len(extraArgs) {
 				skipNext = true
 			}
 			continue
 		}
 		if strings.HasPrefix(lower, "--prompt=") || strings.HasPrefix(lower, "-p=") ||
-			strings.HasPrefix(lower, "--prompt-interactive=") || strings.HasPrefix(lower, "-i=") {
+			strings.HasPrefix(lower, "--prompt-interactive=") ||
+			strings.HasPrefix(lower, "--promptinteractive=") ||
+			strings.HasPrefix(lower, "-i=") {
 			continue
 		}
 
@@ -307,18 +311,26 @@ func geminiACPSeparateValueFlagShaped(tok string) bool {
 
 // geminiACPOwnedTransportFlag reports whether lower is an ACP transport flag
 // spelling owned by buildGeminiACPArgs. Gemini's yargs parser maps
-// `--experimental-acp` to `experimentalAcp`, accepts camelCase, and may expose
-// `--acp` as an alias, so every long-form spelling and inline value is stripped
-// before caller extras are appended after the built-in `--experimental-acp`.
+// `--experimental-acp` to `experimentalAcp`, accepts camelCase, may expose
+// `--acp` as an alias, and honors yargs' `--no-*` boolean negation syntax, so
+// every long-form spelling and inline value is stripped before caller extras
+// are appended after the built-in `--experimental-acp`.
 func geminiACPOwnedTransportFlag(lower string) bool {
 	switch lower {
-	case "--experimental-acp", "--experimentalacp", "--acp":
+	case "--experimental-acp", "--experimentalacp", "--acp",
+		"--no-experimental-acp", "--no-experimentalacp", "--noexperimentalacp",
+		"--no-acp", "--noacp":
 		return true
 	}
 	for _, prefix := range []string{
 		"--experimental-acp=",
 		"--experimentalacp=",
 		"--acp=",
+		"--no-experimental-acp=",
+		"--no-experimentalacp=",
+		"--noexperimentalacp=",
+		"--no-acp=",
+		"--noacp=",
 	} {
 		if strings.HasPrefix(lower, prefix) {
 			return true

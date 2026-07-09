@@ -94,6 +94,14 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
 		},
 		{
+			// yargs boolean negation (`--no-*`) would override the built-in ACP
+			// transport flag if appended later, so negated transport aliases are
+			// owned and stripped too.
+			"transport_negated_alias_forms_dropped",
+			[]string{"--no-experimental-acp", "--no-experimentalAcp=false", "--noExperimentalAcp", "--no-acp", "--noAcp=false", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
 			// If a caller uses separate-token boolean syntax, the flag is
 			// stripped and the value falls through the normal bare-positional
 			// screen, so it cannot become a prompt that breaks ACP mode.
@@ -115,6 +123,13 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			"prompt_interactive_stripped",
 			[]string{"--prompt-interactive", "hi", "-i", "hi2", "-i=hi3"},
 			[]string{"--experimental-acp"},
+		},
+		{
+			// yargs accepts camelCase spellings for kebab-case options, so the
+			// prompt-interactive mode switch has to be stripped in camelCase too.
+			"prompt_interactive_camelcase_stripped",
+			[]string{"--promptInteractive", "hi", "--promptInteractive=hi2", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// Positional tokens after `--` are a prompt, which flips gemini
