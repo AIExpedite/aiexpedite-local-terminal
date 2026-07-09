@@ -209,6 +209,12 @@ type acpSpec struct {
 	// `.gemini/settings.json` mcpServers. Agents without that startup behavior
 	// leave this false.
 	rejectSetupMCPServers bool
+
+	// validateSendFrame, when non-nil, is invoked by Send after shared
+	// JSON-RPC framing and containment checks but before the frame is written
+	// to stdin. It gives an agent driver a narrow policy hook for ACP methods
+	// whose meaning is agent-specific. Returning an error rejects the frame.
+	validateSendFrame func(frame string) error
 }
 
 /* --------------------------------------------------------------------------
@@ -618,6 +624,11 @@ func (m *acpManager) Send(id string, payload string) error {
 	}
 	if m.spec.rejectSetupMCPServers {
 		if err := validateACPSetupNoClientMCPServers(trimmed); err != nil {
+			return err
+		}
+	}
+	if m.spec.validateSendFrame != nil {
+		if err := m.spec.validateSendFrame(trimmed); err != nil {
 			return err
 		}
 	}

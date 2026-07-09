@@ -73,6 +73,7 @@ var geminiACPSpec = acpSpec{
 	// re-enable mcpServers / hooks / auto-approval past the Start-time guard.
 	screenSetupCwd:        screenGeminiWorkspaceSettings,
 	rejectSetupMCPServers: true,
+	validateSendFrame:     validateGeminiACPSendFrame,
 }
 
 // GeminiACPSession is the Gemini-family view of a shared ACP session. Alias
@@ -151,6 +152,33 @@ func (m *GeminiACPManager) Start(id, cwd string, extraArgs []string, workspaceID
 			env:        sanitizeGeminiACPEnv(os.Environ()),
 		}, nil
 	})
+}
+
+// validateGeminiACPSendFrame rejects Gemini ACP methods that can change the
+// live session into a mode that bypasses the orchestrator's permission loop.
+// Startup argv/env/settings guards already strip the same approval escalation
+// routes before spawn; this closes the in-protocol setSessionMode route.
+func validateGeminiACPSendFrame(frame string) error {
+	var probe struct {
+		Method string `json:"method"`
+		Params struct {
+			ModeID string `json:"modeId"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(frame), &probe); err != nil {
+		return nil
+	}
+	if probe.Method != "setSessionMode" || strings.TrimSpace(probe.Params.ModeID) == "" {
+		return nil
+	}
+
+	mode := geminiSettingsKey(probe.Params.ModeID)
+	switch mode {
+	case "default", "manual", "plan":
+		return nil
+	default:
+		return fmt.Errorf("setSessionMode modeId %q would enable or request a non-manual Gemini approval mode; Gemini ACP approvals must remain orchestrator-controlled", probe.Params.ModeID)
+	}
 }
 
 /* --------------------------------------------------------------------------

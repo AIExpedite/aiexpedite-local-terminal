@@ -972,6 +972,87 @@ func TestGeminiACPManager_Send_RejectsClientMCPServers(t *testing.T) {
 	}
 }
 
+func TestGeminiACPSendFrameValidation_SetSessionMode(t *testing.T) {
+	cases := []struct {
+		name      string
+		frame     string
+		wantError bool
+	}{
+		{
+			name:  "ignores other methods",
+			frame: `{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"modeId":"yolo"}}`,
+		},
+		{
+			name:  "allows default mode",
+			frame: `{"jsonrpc":"2.0","id":1,"method":"setSessionMode","params":{"modeId":"default"}}`,
+		},
+		{
+			name:  "allows manual mode",
+			frame: `{"jsonrpc":"2.0","id":1,"method":"setSessionMode","params":{"modeId":"manual"}}`,
+		},
+		{
+			name:  "allows read only plan mode",
+			frame: `{"jsonrpc":"2.0","id":1,"method":"setSessionMode","params":{"modeId":"plan"}}`,
+		},
+		{
+			name:      "rejects yolo mode",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"setSessionMode","params":{"modeId":"yolo"}}`,
+			wantError: true,
+		},
+		{
+			name:      "rejects auto edit mode",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"setSessionMode","params":{"modeId":"auto_edit"}}`,
+			wantError: true,
+		},
+		{
+			name:      "rejects camelCase auto edit mode",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"setSessionMode","params":{"modeId":"autoEdit"}}`,
+			wantError: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateGeminiACPSendFrame(c.frame)
+			if c.wantError {
+				if err == nil {
+					t.Fatal("expected setSessionMode to be rejected")
+				}
+				if !strings.Contains(err.Error(), "setSessionMode modeId") {
+					t.Fatalf("expected setSessionMode error, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected frame to be allowed, got %v", err)
+			}
+		})
+	}
+}
+
+func TestGeminiACPManager_Send_RejectsAutoApprovalSessionMode(t *testing.T) {
+	m := NewGeminiACPManager()
+	id := "mode-fixture"
+	m.sessions[id] = &GeminiACPSession{
+		ID:         id,
+		done:       make(chan struct{}),
+		streamDone: make(chan struct{}),
+	}
+
+	for _, mode := range []string{"yolo", "auto_edit"} {
+		t.Run(mode, func(t *testing.T) {
+			frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"setSessionMode","params":{"modeId":%q}}`, mode)
+			err := m.Send(id, frame)
+			if err == nil {
+				t.Fatalf("expected Send to reject setSessionMode modeId %q", mode)
+			}
+			if !strings.Contains(err.Error(), "Gemini ACP approvals must remain orchestrator-controlled") {
+				t.Fatalf("expected Gemini session-mode approval guard; got %v", err)
+			}
+		})
+	}
+}
+
 // TestGeminiACPLifecycle_StartFailsWhenBinaryMissing pins the startup error
 // mapping: a gemini binary that isn't on PATH must surface as a synchronous
 // Start error (which the dispatcher publishes as `gemini_acp_error`) naming
