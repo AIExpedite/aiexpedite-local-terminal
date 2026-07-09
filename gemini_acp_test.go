@@ -130,6 +130,23 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--experimental-acp", "--model=gemini-3-pro"},
 		},
 		{
+			// `--worktree`/`-w` starts the child inside a fresh git worktree
+			// under `.gemini/worktrees/` — a path outside WorkspaceRoot —
+			// escaping the start/send cwd containment exactly like
+			// `--include-directories`. The separate-token value (worktree name)
+			// must be consumed with the flag in both the long and short spelling.
+			"worktree_and_value_stripped",
+			[]string{"--worktree", "feature-x", "-w", "hotfix", "--model=gemini-3-pro"},
+			[]string{"--experimental-acp", "--model=gemini-3-pro"},
+		},
+		{
+			// The equals and camelCase spellings of the worktree flag must be
+			// caught too, and a grouped cluster carrying `-w` fails closed.
+			"worktree_equals_camelcase_and_cluster_stripped",
+			[]string{"--worktree=feature-x", "-w=hotfix", "-wd", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
 			// `--policy`/`--admin-policy` load extra policy-engine files
 			// whose `allow` rules auto-approve tools without confirmation —
 			// the same bypass as `--allowed-tools`, which gemini's own docs

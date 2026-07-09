@@ -198,7 +198,10 @@ func buildGeminiACPArgs(extraArgs []string) []string {
 //     workspace for the session without prompting, which re-enables the
 //     project `.gemini/settings.json` (tool auto-acceptance / project
 //     policies / include-directory behavior) this sanitizer is otherwise
-//     blocking; `--include-directories` adds extra
+//     blocking; `--worktree`/`-w` starts the child inside a fresh git worktree
+//     under `.gemini/worktrees/` — a path outside WorkspaceRoot — escaping the
+//     start/send cwd containment and the workspace-settings screen the same way
+//     `--include-directories` does; `--include-directories` adds extra
 //     workspace directories, routing around the WorkspaceRoot cwd
 //     containment Start enforces. Unlike
 //     Grok's `--allow` there is no per-workspace opt-in gate for these —
@@ -312,14 +315,13 @@ func geminiACPSeparateValueFlagShaped(tok string) bool {
 // survive to the positional check here: the mode-breaking prompt flags
 // (`-i`/`-p`, dropped earlier) and the privileged value-taking flags
 // (`--approval-mode` / `--allowed-tools` / `--policy` / `--admin-policy` /
-// `--include-directories`, dropped as privileged). Their values must NOT be
-// preserved either, so they are deliberately absent.
+// `--worktree` / `--include-directories`, dropped as privileged). Their values
+// must NOT be preserved either, so they are deliberately absent.
 var geminiACPKnownValueFlags = map[string]bool{
 	"m": true, "model": true,
 	"o": true, "outputformat": true,
 	"e": true, "extensions": true,
 	"r": true, "resume": true,
-	"w": true, "worktree": true,
 	"allowedmcpservernames": true,
 	"deletesession":         true,
 }
@@ -357,7 +359,10 @@ func geminiACPKnownSeparateValueFlag(tok string) bool {
 // named tools, `--policy`/`--admin-policy` load extra policy files whose
 // `allow` rules auto-approve tools the same way, `--skip-trust` trusts the
 // workspace without prompting (re-enabling project settings/auto-acceptance),
-// and `--include-directories` escapes the WorkspaceRoot containment.
+// `--worktree`/`-w` starts the CLI inside a fresh git worktree under
+// `.gemini/worktrees/` (a path outside WorkspaceRoot, escaping the start/send
+// cwd containment and the workspace-settings screen), and
+// `--include-directories` escapes the WorkspaceRoot containment.
 // gemini's yargs parser also accepts camelCase spellings of every kebab-case
 // flag, so both spellings are matched (ToLower collapses camelCase to the
 // dash-less form). takesValue is true only for the separate-token value form;
@@ -371,6 +376,7 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 		"--allowed-tools", "--allowedtools",
 		"--policy",
 		"--admin-policy", "--adminpolicy",
+		"-w", "--worktree",
 		"--include-directories", "--includedirectories":
 		return true, true
 	}
@@ -381,6 +387,7 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 		"--allowed-tools=", "--allowedtools=",
 		"--policy=",
 		"--admin-policy=", "--adminpolicy=",
+		"-w=", "--worktree=",
 		"--include-directories=", "--includedirectories=",
 	} {
 		if strings.HasPrefix(lower, prefix) {
@@ -393,11 +400,12 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 // geminiACPDangerousShortFlags are the single-letter gemini short options that
 // must never survive onto the ACP argv, even hidden inside a grouped cluster:
 // `y` enables YOLO/auto-approve (bypassing the orchestrator-driven
-// session/request_permission flow) and `p`/`i` switch gemini out of ACP stdio
-// mode into a one-shot prompt run (breaking the JSON-RPC handshake). gemini's
-// yargs parser expands `-yd` into `-y -d`, so the exact-match deny lists above
-// do not catch clustered spellings.
-var geminiACPDangerousShortFlags = map[rune]bool{'y': true, 'p': true, 'i': true}
+// session/request_permission flow), `p`/`i` switch gemini out of ACP stdio
+// mode into a one-shot prompt run (breaking the JSON-RPC handshake), and `w`
+// (worktree) starts the child inside a `.gemini/worktrees/` path outside the
+// WorkspaceRoot containment. gemini's yargs parser expands `-yd` into `-y -d`,
+// so the exact-match deny lists above do not catch clustered spellings.
+var geminiACPDangerousShortFlags = map[rune]bool{'y': true, 'p': true, 'i': true, 'w': true}
 
 // geminiACPShortFlagClusterHasPrivilege reports whether a lowercased token is a
 // short-option cluster (a single leading dash followed by one or more ASCII
