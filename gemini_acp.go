@@ -729,10 +729,11 @@ func geminiACPSandboxDefaultEnvValue(name string) string {
 // MCP servers that Gemini spawns/connects during discovery — stdio transport
 // runs repo-controlled local code before any approval, so ANY non-empty
 // `mcpServers` block is treated as privileged, not just `mcpServers.*.trust:
-// true` — name workspace executables gemini runs for custom-tool discovery
-// and calls (`tools.discoveryCommand` / `tools.callCommand`, legacy flat
+// true` — name workspace executables gemini runs for MCP startup
+// (`mcp.serverCommand`), custom-tool discovery and calls
+// (`tools.discoveryCommand` / `tools.callCommand`, legacy flat
 // `toolDiscoveryCommand` / `toolCallCommand`) or attach command hooks to
-// lifecycle events (`hooks`), both the same pre-approval code-execution
+// lifecycle events (`hooks`), all the same pre-approval code-execution
 // vector as `mcpServers` — or add context directories outside the
 // WorkspaceRoot containment `start` enforces.
 //
@@ -1036,6 +1037,15 @@ func geminiSettingsPrivilegeReasonUnder(v any, parent string) string {
 				// but no benign Gemini setting spells a bare boolean `trust`.
 				if b, ok := val.(bool); ok && b {
 					return "a trusted MCP server (trust: true)"
+				}
+			case "servercommand":
+				if parent == "mcp" {
+					// mcp.serverCommand names a workspace-controlled MCP
+					// process Gemini starts during MCP discovery, before any
+					// ACP permission request can be surfaced.
+					if s, ok := val.(string); ok && strings.TrimSpace(s) != "" {
+						return fmt.Sprintf("a workspace MCP command (%s)", k)
+					}
 				}
 			case "discoverycommand", "tooldiscoverycommand",
 				"callcommand", "toolcallcommand":

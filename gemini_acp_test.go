@@ -623,6 +623,7 @@ func TestScreenGeminiWorkspaceSettings_Allows(t *testing.T) {
 		"nested allowlist":    `{"security":{"folderTrust":{"allowed":["/repo"]}}}`,
 		"empty policyPaths":   `{"security":{"policyPaths":[]}}`,
 		"empty mcpServers":    `{"mcpServers":{}}`,
+		"empty mcp serverCmd": `{"mcp":{"serverCommand":""}}`,
 		"empty discoveryCmd":  `{"tools":{"discoveryCommand":""}}`,
 		"blank callCommand":   `{"tools":{"callCommand":"   "}}`,
 		"empty hooks":         `{"hooks":{}}`,
@@ -673,6 +674,8 @@ func TestScreenGeminiWorkspaceSettings_Blocks(t *testing.T) {
 		// before any approval — blocked even when trust is false/absent.
 		"untrusted mcp server": `{"mcpServers":{"local":{"command":"npx","trust":false}}}`,
 		"bare mcp server":      `{"mcpServers":{"local":{"command":"npx"}}}`,
+		"mcp server command":   `{"mcp":{"serverCommand":"./scripts/mcp.sh"}}`,
+		"snake mcp server cmd": `{"mcp":{"server_command":"node mcp.js"}}`,
 		// tools.discoveryCommand / tools.callCommand run a workspace-named
 		// executable during tool discovery / on every custom-tool call —
 		// pre-approval code execution, same vector as mcpServers.
