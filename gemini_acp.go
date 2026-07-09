@@ -414,9 +414,18 @@ var geminiACPDangerousShortFlags = map[rune]bool{'y': true, 'p': true, 'i': true
 // extension a clustered `-yd=true`), so an `=value` suffix is stripped before
 // the letter check — this catches the short yolo equals form that the
 // exact-match deny list in geminiACPPrivilegedFlag (which only sees `-y=…` if
-// it were listed) would otherwise miss. Long flags (`--…`), the `--`
-// delimiter, and anything that is not a pure short-flag cluster (values,
-// digits, paths) return false, so `--model gemini-3-pro` style extras still
+// it were listed) would otherwise miss.
+//
+// yargs-parser also accepts an ATTACHED short-option value: a non-word
+// character immediately after a short option (`letters[j+1].match(/\W/)`)
+// makes the remainder that option's value — so `-w/tmp/foo` enables worktree
+// mode and `-p/tmp/foo` flips out of ACP mode, both with a `/`-led attached
+// value the old `[a-z]`-only screen let through. The scan therefore walks the
+// leading contiguous letters (each a real short flag in the cluster) and
+// returns true the moment it hits a dangerous one; the first non-letter marks
+// the start of the preceding option's attached value, and since no dangerous
+// letter was seen before it the token is benign. Long flags (`--…`) and the
+// `--` delimiter return false so `--model gemini-3-pro` style extras still
 // pass through.
 func geminiACPShortFlagClusterHasPrivilege(lower string) bool {
 	if len(lower) < 2 || lower[0] != '-' || lower[1] == '-' {
@@ -432,13 +441,14 @@ func geminiACPShortFlagClusterHasPrivilege(lower string) bool {
 		return false
 	}
 	for _, r := range body {
-		if r < 'a' || r > 'z' {
-			return false // not a pure short-flag cluster
-		}
-	}
-	for _, r := range body {
 		if geminiACPDangerousShortFlags[r] {
 			return true
+		}
+		if r < 'a' || r > 'z' {
+			// Non-letter: yargs reads it and everything after as the attached
+			// value of the preceding short option. None of the letters scanned
+			// so far were dangerous, so nothing privileged reaches the argv.
+			return false
 		}
 	}
 	return false

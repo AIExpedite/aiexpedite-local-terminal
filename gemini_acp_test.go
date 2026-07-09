@@ -215,6 +215,31 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--experimental-acp", "-v=1", "--model", "gemini-3-pro"},
 		},
 		{
+			// yargs-parser treats a non-word character right after a short
+			// option as that option's ATTACHED value (`-w/tmp/foo` ->
+			// worktree=/tmp/foo, `-p/tmp/foo` -> prompt=/tmp/foo). The `/`
+			// must not end the privilege scan before the dangerous letter is
+			// seen, or the token survives and re-enables worktree mode / flips
+			// out of ACP mode.
+			"attached_short_option_value_stripped",
+			[]string{"-w/tmp/foo", "-p/tmp/foo", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
+			// A dangerous letter clustered before the letter that takes the
+			// attached value must still be caught (`-dw/tmp/foo` carries `w`).
+			"dangerous_letter_before_attached_value_stripped",
+			[]string{"-dw/tmp/foo", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
+			// A benign short option with an attached `/`-led value must still
+			// pass through -- the attached-value handling must not over-strip.
+			"benign_attached_short_value_survives",
+			[]string{"-v/tmp/foo", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "-v/tmp/foo", "--model", "gemini-3-pro"},
+		},
+		{
 			// A bare positional is a prompt word — the undelimited spelling
 			// of the `--` tail — and flips gemini out of ACP mode exactly
 			// like `-p`. A legacy caller reusing the session_start shape with
