@@ -164,6 +164,21 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
 		},
 		{
+			// `--delete-session` is a session-management command, not a chat
+			// option. It can delete saved Gemini sessions instead of starting
+			// ACP, so both the flag and its separate-token value are stripped.
+			"delete_session_and_value_stripped",
+			[]string{"--delete-session", "2", "--deleteSession", "3", "--model=gemini-3-pro"},
+			[]string{"--experimental-acp", "--model=gemini-3-pro"},
+		},
+		{
+			// yargs accepts equals and camelCase spellings of the management
+			// flag too; inline values must not survive either.
+			"delete_session_equals_and_camelcase_stripped",
+			[]string{"--delete-session=2", "--deleteSession=3", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
 			// `--policy`/`--admin-policy` load extra policy-engine files
 			// whose `allow` rules auto-approve tools without confirmation —
 			// the same bypass as `--allowed-tools`, which gemini's own docs

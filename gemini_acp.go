@@ -199,12 +199,13 @@ func buildGeminiACPArgs(extraArgs []string) []string {
 //     workspace for the session without prompting, which re-enables the
 //     project `.gemini/settings.json` (tool auto-acceptance / project
 //     policies / include-directory behavior) this sanitizer is otherwise
-//     blocking; `--worktree`/`-w` starts the child inside a fresh git worktree
-//     under `.gemini/worktrees/` — a path outside WorkspaceRoot — escaping the
-//     start/send cwd containment and the workspace-settings screen the same way
-//     `--include-directories` does; `--include-directories` adds extra
-//     workspace directories, routing around the WorkspaceRoot cwd
-//     containment Start enforces. Unlike
+//     blocking; `--delete-session` runs Gemini's saved-session deletion flow
+//     instead of starting a chat; `--worktree`/`-w` starts the child inside a
+//     fresh git worktree under `.gemini/worktrees/` — a path outside
+//     WorkspaceRoot — escaping the start/send cwd containment and the
+//     workspace-settings screen the same way `--include-directories` does;
+//     `--include-directories` adds extra workspace directories, routing around
+//     the WorkspaceRoot cwd containment Start enforces. Unlike
 //     Grok's `--allow` there is no per-workspace opt-in gate for these —
 //     Gemini approvals must ride the ACP protocol, so they are stripped
 //     unconditionally.
@@ -338,15 +339,15 @@ func geminiACPOwnedTransportFlag(lower string) bool {
 // survive to the positional check here: the mode-breaking prompt flags
 // (`-i`/`-p`, dropped earlier) and the privileged value-taking flags
 // (`--approval-mode` / `--allowed-tools` / `--policy` / `--admin-policy` /
-// `--worktree` / `--include-directories`, dropped as privileged). Their values
-// must NOT be preserved either, so they are deliberately absent.
+// `--delete-session` / `--worktree` / `--include-directories`, dropped as
+// privileged). Their values must NOT be preserved either, so they are
+// deliberately absent.
 var geminiACPKnownValueFlags = map[string]bool{
 	"m": true, "model": true,
 	"o": true, "outputformat": true,
 	"e": true, "extensions": true,
 	"r": true, "resume": true,
 	"allowedmcpservernames": true,
-	"deletesession":         true,
 }
 
 // geminiNormalizeFlag reduces a flag token to a spelling-agnostic key: strip
@@ -382,10 +383,11 @@ func geminiACPKnownSeparateValueFlag(tok string) bool {
 // named tools, `--policy`/`--admin-policy` load extra policy files whose
 // `allow` rules auto-approve tools the same way, `--skip-trust` trusts the
 // workspace without prompting (re-enabling project settings/auto-acceptance),
-// `--worktree`/`-w` starts the CLI inside a fresh git worktree under
+// `--delete-session` runs Gemini's saved-session deletion flow instead of ACP
+// chat, `--worktree`/`-w` starts the CLI inside a fresh git worktree under
 // `.gemini/worktrees/` (a path outside WorkspaceRoot, escaping the start/send
-// cwd containment and the workspace-settings screen), and
-// `--include-directories` escapes the WorkspaceRoot containment.
+// cwd containment and the workspace-settings screen), and `--include-directories`
+// escapes the WorkspaceRoot containment.
 // gemini's yargs parser also accepts camelCase spellings of every kebab-case
 // flag, so both spellings are matched (ToLower collapses camelCase to the
 // dash-less form). takesValue is true only for the separate-token value form;
@@ -399,6 +401,7 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 		"--allowed-tools", "--allowedtools",
 		"--policy",
 		"--admin-policy", "--adminpolicy",
+		"--delete-session", "--deletesession",
 		"-w", "--worktree",
 		"--include-directories", "--includedirectories":
 		return true, true
@@ -410,6 +413,7 @@ func geminiACPPrivilegedFlag(lower string) (privileged, takesValue bool) {
 		"--allowed-tools=", "--allowedtools=",
 		"--policy=",
 		"--admin-policy=", "--adminpolicy=",
+		"--delete-session=", "--deletesession=",
 		"-w=", "--worktree=",
 		"--include-directories=", "--includedirectories=",
 	} {
