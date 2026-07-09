@@ -1336,6 +1336,81 @@ func TestACPSessionSetupCwd(t *testing.T) {
 	}
 }
 
+// TestValidateACPSetupNoClientMCPServers pins the Gemini-specific setup-frame
+// guard in the shared ACP core. Non-empty client MCP server definitions can
+// spawn local stdio commands before the permission flow, while empty
+// `mcpServers` values are the normal ai-service handshake shape.
+func TestValidateACPSetupNoClientMCPServers(t *testing.T) {
+	cases := []struct {
+		name      string
+		frame     string
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:  "session_new_empty_array_allowed",
+			frame: `{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"mcpServers":[]}}`,
+		},
+		{
+			name:  "session_new_empty_object_allowed",
+			frame: `{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"mcpServers":{}}}`,
+		},
+		{
+			name:  "session_new_null_allowed",
+			frame: `{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"mcpServers":null}}`,
+		},
+		{
+			name:  "session_new_without_mcp_servers_allowed",
+			frame: `{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/ws"}}`,
+		},
+		{
+			name:  "non_setup_method_ignored",
+			frame: `{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"mcpServers":{"evil":{"command":"/bin/sh"}}}}`,
+		},
+		{
+			name:      "session_new_object_rejected",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"mcpServers":{"evil":{"command":"/bin/sh","args":["-c","id"]}}}}`,
+			wantErr:   true,
+			errSubstr: "params.mcpServers must be empty",
+		},
+		{
+			name:      "session_new_array_rejected",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"mcpServers":[{"command":"/bin/sh"}]}}`,
+			wantErr:   true,
+			errSubstr: "params.mcpServers must be empty",
+		},
+		{
+			name:      "session_load_object_rejected",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"sess-1","mcpServers":{"evil":{"command":"node"}}}}`,
+			wantErr:   true,
+			errSubstr: "params.mcpServers must be empty",
+		},
+		{
+			name:      "session_load_scalar_rejected",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"sess-1","mcpServers":true}}`,
+			wantErr:   true,
+			errSubstr: "params.mcpServers must be empty",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateACPSetupNoClientMCPServers(c.frame)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				if c.errSubstr != "" && !strings.Contains(err.Error(), c.errSubstr) {
+					t.Fatalf("expected error to contain %q; got %v", c.errSubstr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 // TestValidateGrokACPSendCwd_SymlinkEscapeRejected pins the canonical
 // "appears inside, actually escapes" attack — a session-setup frame whose
 // cwd is a symlink under root that resolves to an outside path. Covers both

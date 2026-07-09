@@ -69,7 +69,8 @@ var geminiACPSpec = acpSpec{
 	// screened. Re-screen that send-time cwd's `.gemini/settings.json` before
 	// the frame reaches the child so a subdirectory's project config cannot
 	// re-enable mcpServers / hooks / auto-approval past the Start-time guard.
-	screenSetupCwd: screenGeminiWorkspaceSettings,
+	screenSetupCwd:        screenGeminiWorkspaceSettings,
+	rejectSetupMCPServers: true,
 }
 
 // GeminiACPSession is the Gemini-family view of a shared ACP session. Alias

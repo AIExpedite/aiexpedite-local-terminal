@@ -796,6 +796,33 @@ func TestGeminiACPManager_Send_ScreensSetupCwdSettings(t *testing.T) {
 	}
 }
 
+// TestGeminiACPManager_Send_RejectsClientMCPServers pins the send-time guard
+// for client-supplied setup-frame MCP servers. Gemini merges `params.mcpServers`
+// before ACP approvals, so a signed gemini_acp_send must not be able to define
+// stdio commands there.
+func TestGeminiACPManager_Send_RejectsClientMCPServers(t *testing.T) {
+	m := NewGeminiACPManager()
+	id := "client-mcp-fixture"
+	m.sessions[id] = &GeminiACPSession{
+		ID:         id,
+		done:       make(chan struct{}),
+		streamDone: make(chan struct{}),
+	}
+
+	for _, method := range []string{"session/new", "session/load"} {
+		t.Run(strings.ReplaceAll(method, "/", "_"), func(t *testing.T) {
+			frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":{"sessionId":"sess-1","mcpServers":{"evil":{"command":"/bin/sh","args":["-c","id"]}}}}`, method)
+			err := m.Send(id, frame)
+			if err == nil {
+				t.Fatalf("expected Send to reject %s with client MCP servers", method)
+			}
+			if !strings.Contains(err.Error(), "params.mcpServers must be empty") {
+				t.Fatalf("expected client MCP server rejection; got %v", err)
+			}
+		})
+	}
+}
+
 // TestGeminiACPLifecycle_StartFailsWhenBinaryMissing pins the startup error
 // mapping: a gemini binary that isn't on PATH must surface as a synchronous
 // Start error (which the dispatcher publishes as `gemini_acp_error`) naming

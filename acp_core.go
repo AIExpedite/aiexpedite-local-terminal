@@ -199,6 +199,14 @@ type acpSpec struct {
 	// screenGeminiWorkspaceSettings; Grok leaves it nil (no per-cwd config to
 	// screen).
 	screenSetupCwd func(cwd, workspaceRoot string) error
+
+	// rejectSetupMCPServers rejects non-empty `params.mcpServers` on ACP
+	// session-setup frames (`session/new` / `session/load`). Gemini merges
+	// client-supplied MCP server definitions before the ACP permission flow, so
+	// those definitions are privileged in the same way as workspace
+	// `.gemini/settings.json` mcpServers. Agents without that startup behavior
+	// leave this false.
+	rejectSetupMCPServers bool
 }
 
 /* --------------------------------------------------------------------------
@@ -602,6 +610,11 @@ func (m *acpManager) Send(id string, payload string) error {
 	// behaviour) or when the frame omits `params.cwd`.
 	if session.WorkspaceRoot != "" {
 		if err := validateACPSendCwd(trimmed, session.WorkspaceRoot); err != nil {
+			return err
+		}
+	}
+	if m.spec.rejectSetupMCPServers {
+		if err := validateACPSetupNoClientMCPServers(trimmed); err != nil {
 			return err
 		}
 	}
@@ -1241,6 +1254,55 @@ func validateACPSendCwd(frame, resolvedRoot string) error {
 		return fmt.Errorf("%s params.cwd %q is outside the configured workspace root %q", probe.Method, resolved, resolvedRoot)
 	}
 	return nil
+}
+
+// validateACPSetupNoClientMCPServers rejects session-setup frames that carry
+// client-defined MCP servers. Gemini's ACP client merges `params.mcpServers`
+// into its MCP server config and stdio servers can spawn local commands during
+// discovery, before the ACP permission loop is involved. Empty object/array
+// values are allowed because the ai-service handshake sends `mcpServers: []` as
+// an explicit "none configured" value.
+func validateACPSetupNoClientMCPServers(frame string) error {
+	var probe struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal([]byte(frame), &probe); err != nil {
+		return nil
+	}
+	if !isACPSessionSetupMethod(probe.Method) || len(probe.Params) == 0 {
+		return nil
+	}
+
+	var params map[string]json.RawMessage
+	if err := json.Unmarshal(probe.Params, &params); err != nil {
+		return nil
+	}
+	raw, ok := params["mcpServers"]
+	if !ok {
+		return nil
+	}
+	if acpRawJSONEmpty(raw) {
+		return nil
+	}
+	return fmt.Errorf("%s params.mcpServers must be empty; client-defined MCP servers are not allowed in ACP setup frames", probe.Method)
+}
+
+func acpRawJSONEmpty(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return true
+	}
+
+	var arr []json.RawMessage
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return len(arr) == 0
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return len(obj) == 0
+	}
+	return false
 }
 
 // isACPSessionSetupMethod reports whether method is one of the ACP
