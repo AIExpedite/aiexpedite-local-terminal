@@ -1285,6 +1285,48 @@ func TestValidateGrokACPSendCwd_RejectsEscapingSessionNew(t *testing.T) {
 			frame:   `{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"sess-1"}}`,
 			wantErr: false,
 		},
+		// Gemini's documented ACP method names use camel-case verbs rather
+		// than the Grok-style slash verbs. They carry the same setup cwd and
+		// must pass through the same containment gate.
+		{
+			name:    "gemini_newSession_inside_root_accepted",
+			frame:   fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"newSession","params":{"cwd":%q}}`, inside),
+			wantErr: false,
+		},
+		{
+			name:      "gemini_newSession_outside_root_rejected",
+			frame:     fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"newSession","params":{"cwd":%q}}`, outside),
+			wantErr:   true,
+			errSubstr: "outside the configured workspace root",
+		},
+		{
+			name:      "gemini_newSession_relative_cwd_rejected",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"newSession","params":{"cwd":"../etc"}}`,
+			wantErr:   true,
+			errSubstr: "must be an absolute path",
+		},
+		{
+			name:    "gemini_loadSession_inside_root_accepted",
+			frame:   fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"loadSession","params":{"cwd":%q,"sessionId":"sess-1"}}`, inside),
+			wantErr: false,
+		},
+		{
+			name:      "gemini_loadSession_outside_root_rejected",
+			frame:     fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"loadSession","params":{"cwd":%q,"sessionId":"sess-1"}}`, outside),
+			wantErr:   true,
+			errSubstr: "outside the configured workspace root",
+		},
+		{
+			name:      "gemini_loadSession_relative_cwd_rejected",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"loadSession","params":{"cwd":"../etc","sessionId":"sess-1"}}`,
+			wantErr:   true,
+			errSubstr: "must be an absolute path",
+		},
+		{
+			name:    "gemini_loadSession_without_cwd_accepted",
+			frame:   `{"jsonrpc":"2.0","id":1,"method":"loadSession","params":{"sessionId":"sess-1"}}`,
+			wantErr: false,
+		},
 		{
 			name:    "non_jsonrpc_frame_accepted",
 			frame:   `"not-an-object"`,
@@ -1322,6 +1364,8 @@ func TestACPSessionSetupCwd(t *testing.T) {
 	}{
 		{"session_new_with_cwd", `{"method":"session/new","params":{"cwd":"/ws/sub"}}`, "/ws/sub"},
 		{"session_load_with_cwd", `{"method":"session/load","params":{"cwd":"/ws/sub","sessionId":"s"}}`, "/ws/sub"},
+		{"gemini_newSession_with_cwd", `{"method":"newSession","params":{"cwd":"/ws/sub"}}`, "/ws/sub"},
+		{"gemini_loadSession_with_cwd", `{"method":"loadSession","params":{"cwd":"/ws/sub","sessionId":"s"}}`, "/ws/sub"},
 		{"session_new_without_cwd", `{"method":"session/new","params":{}}`, ""},
 		{"non_setup_method", `{"method":"session/prompt","params":{"cwd":"/ws/sub"}}`, ""},
 		{"no_method", `{"params":{"cwd":"/ws/sub"}}`, ""},
@@ -1388,6 +1432,18 @@ func TestValidateACPSetupNoClientMCPServers(t *testing.T) {
 		{
 			name:      "session_load_scalar_rejected",
 			frame:     `{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"sess-1","mcpServers":true}}`,
+			wantErr:   true,
+			errSubstr: "params.mcpServers must be empty",
+		},
+		{
+			name:      "gemini_newSession_object_rejected",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"newSession","params":{"mcpServers":{"evil":{"command":"/bin/sh"}}}}`,
+			wantErr:   true,
+			errSubstr: "params.mcpServers must be empty",
+		},
+		{
+			name:      "gemini_loadSession_scalar_rejected",
+			frame:     `{"jsonrpc":"2.0","id":1,"method":"loadSession","params":{"sessionId":"sess-1","mcpServers":true}}`,
 			wantErr:   true,
 			errSubstr: "params.mcpServers must be empty",
 		},

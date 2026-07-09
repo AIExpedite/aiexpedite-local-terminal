@@ -301,7 +301,7 @@ func StartAgent(cfg *Config) {
 	fmt.Println("[aiexpedite] Grok ACP manager ready")
 
 	/* 3b'''. Initialize Gemini ACP manager (JSON-RPC over stdio) --------- */
-	// Drives `gemini --experimental-acp` for AI Expedite's Gemini CLI ACP
+	// Drives `gemini --acp` for AI Expedite's Gemini CLI ACP
 	// integration. Same shared ACP core as the Grok manager, but distinct
 	// because the orchestrator dispatches the two families on different
 	// command Types and keeps independent JSON-RPC state machines per

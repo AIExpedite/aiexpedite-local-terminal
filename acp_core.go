@@ -3,7 +3,7 @@
 // acpManager — the protocol-generic core for long-lived ACP (Agent Client
 // Protocol) JSON-RPC 2.0 sessions driven over a child process' stdio
 // (newline-delimited JSON). Extracted from the original GrokACPManager
-// (grok_acp.go) so additional ACP-speaking CLIs (`gemini --experimental-acp`)
+// (grok_acp.go) so additional ACP-speaking CLIs (`gemini --acp`)
 // reuse the exact same transport, framing, fail-fast policy, lifecycle and
 // cleanup story instead of growing a third hand-rolled copy alongside
 // codex_appserver.go.
@@ -189,8 +189,9 @@ type acpSpec struct {
 	captureLine func(line string, now time.Time)
 
 	// screenSetupCwd, when non-nil, is invoked by Send on the `params.cwd` of
-	// every ACP session-setup frame (`session/new` / `session/load`) that
-	// carries one, AFTER the containment check passes. It lets a per-agent
+	// every ACP session-setup frame (`session/new` / `session/load` and
+	// Gemini's documented `newSession` / `loadSession`) that carries one,
+	// AFTER the containment check passes. It lets a per-agent
 	// workspace-config screen re-run against a send-time cwd that differs from
 	// the process start cwd — start only screened the launch cwd, but a signed
 	// *_acp_send can root a session at another directory inside the workspace
@@ -201,8 +202,9 @@ type acpSpec struct {
 	screenSetupCwd func(cwd, workspaceRoot string) error
 
 	// rejectSetupMCPServers rejects non-empty `params.mcpServers` on ACP
-	// session-setup frames (`session/new` / `session/load`). Gemini merges
-	// client-supplied MCP server definitions before the ACP permission flow, so
+	// session-setup frames (`session/new` / `session/load` and Gemini's
+	// documented `newSession` / `loadSession`). Gemini merges client-supplied
+	// MCP server definitions before the ACP permission flow, so
 	// those definitions are privileged in the same way as workspace
 	// `.gemini/settings.json` mcpServers. Agents without that startup behavior
 	// leave this false.
@@ -600,8 +602,9 @@ func (m *acpManager) Send(id string, payload string) error {
 	}
 
 	// Re-enforce workspace containment on ACP session-setup frames
-	// (`session/new` and `session/load`). start already gated the
-	// process-level cwd, but both setup verbs can carry their own
+	// (`session/new` / `session/load` and Gemini's documented
+	// `newSession` / `loadSession`). start already gated the
+	// process-level cwd, but these setup verbs can carry their own
 	// `params.cwd` that the agent will use as the session root — without
 	// this check a later signed *_acp_send (including one that resumes a
 	// prior session) could point the agent at a path outside the configured
@@ -623,7 +626,8 @@ func (m *acpManager) Send(id string, payload string) error {
 	// an ACP session-setup frame. The containment check above only proves the
 	// send-time cwd stays inside WorkspaceRoot; it does NOT inspect the config
 	// that cwd's directory contributes. For Gemini, a `session/new` /
-	// `session/load` rooted at a subdirectory (or a re-created session) would
+	// `session/load` or `newSession` / `loadSession` rooted at a subdirectory
+	// (or a re-created session) would
 	// apply that directory's `.gemini/settings.json` (mcpServers, hooks,
 	// approvalMode: yolo, …) which start's launch-cwd screen never saw. Screen
 	// it before the frame is written and reject the send if it grants a
@@ -1212,16 +1216,16 @@ func (m *acpManager) watchFirstFrame(session *acpSession, publishFn PublishFunc,
    -------------------------------------------------------------------------- */
 
 // validateACPSendCwd inspects a JSON-RPC frame and, if it is an ACP
-// session-setup request (`session/new` or `session/load`), requires its
+// session-setup request (`session/new` / `session/load` or Gemini's documented
+// `newSession` / `loadSession`), requires its
 // `params.cwd` to resolve inside root. Mirrors the containment check start
 // applies to the process-level cwd so the in-protocol session cwd cannot
 // escape it.
 //
-// Both methods are covered because ACP exposes `session/load` as the
-// session-setup alternative to `session/new` for resumed sessions, and ACP
-// clients pass `cwd` on loads too — gating only `session/new` would let
-// a later signed *_acp_send that resumes a session point the agent at a
-// directory outside the workspace root.
+// Both create/load pairs are covered: Grok-style clients use `session/new` and
+// `session/load`, while current Gemini ACP uses `newSession` and `loadSession`.
+// Gating only one spelling would let a later signed *_acp_send point the agent
+// at a directory outside the workspace root.
 //
 // Frames whose method is neither setup verb, or that omit `params.cwd`, are
 // accepted unchanged — ACP carries many other request shapes whose params we
@@ -1309,12 +1313,18 @@ func acpRawJSONEmpty(raw json.RawMessage) bool {
 // session-setup verbs whose `params.cwd` (when present) anchors the session
 // to a workspace path and therefore must be containment-checked.
 func isACPSessionSetupMethod(method string) bool {
-	return method == "session/new" || method == "session/load"
+	switch method {
+	case "session/new", "session/load", "newSession", "loadSession":
+		return true
+	default:
+		return false
+	}
 }
 
 // acpSessionSetupCwd returns the `params.cwd` of an ACP session-setup frame
-// (`session/new` / `session/load`), or "" when the frame is not a setup verb,
-// carries no cwd, or does not parse. Send uses it to drive the per-agent
+// (`session/new` / `session/load` or `newSession` / `loadSession`), or "" when
+// the frame is not a setup verb, carries no cwd, or does not parse. Send uses it
+// to drive the per-agent
 // screenSetupCwd hook against the directory a setup frame anchors the session
 // to. A transient parse hiccup returns "" (no screen) rather than an error
 // because Send has already established the frame is valid top-level JSON.

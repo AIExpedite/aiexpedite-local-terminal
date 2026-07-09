@@ -59,7 +59,7 @@ func TestIsGeminiACPCommand(t *testing.T) {
 	}
 }
 
-// TestBuildGeminiACPArgs pins the argv contract: `--experimental-acp` always
+// TestBuildGeminiACPArgs pins the argv contract: `--acp` always
 // leads, mode-switching prompt flags are stripped (any surviving -p/-i would
 // flip gemini OUT of ACP stdio mode and break the orchestrator's JSON-RPC
 // handshake), and benign flags pass through for gemini itself to validate.
@@ -72,26 +72,26 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 		{
 			"no_extras",
 			nil,
-			[]string{"--experimental-acp"},
+			[]string{"--acp"},
 		},
 		{
 			"model_passthrough",
 			[]string{"--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			"duplicate_transport_flag_dropped",
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// The ACP transport flag is owned by buildGeminiACPArgs. A trailing
 			// false value in yargs' equals/camelCase forms can override the
-			// built-in `--experimental-acp`, so every transport spelling is
+			// built-in `--acp`, so every transport spelling is
 			// stripped before extras are appended.
 			"transport_alias_equals_forms_dropped",
 			[]string{"--experimental-acp=false", "--experimentalAcp=false", "--acp=false", "--acp", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// yargs boolean negation (`--no-*`) would override the built-in ACP
@@ -99,37 +99,37 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// owned and stripped too.
 			"transport_negated_alias_forms_dropped",
 			[]string{"--no-experimental-acp", "--no-experimentalAcp=false", "--noExperimentalAcp", "--no-acp", "--noAcp=false", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// If a caller uses separate-token boolean syntax, the flag is
 			// stripped and the value falls through the normal bare-positional
 			// screen, so it cannot become a prompt that breaks ACP mode.
 			"transport_alias_separate_false_value_dropped",
-			[]string{"--experimental-acp", "false", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "false", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			"prompt_flag_and_value_stripped",
 			[]string{"-p", "hello there", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			"prompt_equals_form_stripped",
 			[]string{"--prompt=hello", "--model=gemini-3-pro"},
-			[]string{"--experimental-acp", "--model=gemini-3-pro"},
+			[]string{"--acp", "--model=gemini-3-pro"},
 		},
 		{
 			"prompt_interactive_stripped",
 			[]string{"--prompt-interactive", "hi", "-i", "hi2", "-i=hi3"},
-			[]string{"--experimental-acp"},
+			[]string{"--acp"},
 		},
 		{
 			// yargs accepts camelCase spellings for kebab-case options, so the
 			// prompt-interactive mode switch has to be stripped in camelCase too.
 			"prompt_interactive_camelcase_stripped",
 			[]string{"--promptInteractive", "hi", "--promptInteractive=hi2", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// Positional tokens after `--` are a prompt, which flips gemini
@@ -137,12 +137,12 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// must both be dropped or the handshake never starts.
 			"double_dash_delimiter_and_tail_dropped",
 			[]string{"--", "positional prompt words"},
-			[]string{"--experimental-acp"},
+			[]string{"--acp"},
 		},
 		{
 			"flags_before_double_dash_survive",
 			[]string{"--model=gemini-3-pro", "--", "trailing prompt"},
-			[]string{"--experimental-acp", "--model=gemini-3-pro"},
+			[]string{"--acp", "--model=gemini-3-pro"},
 		},
 		{
 			// `-y`/`--yolo` and `--approval-mode` auto-approve tool calls,
@@ -151,7 +151,7 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// them in through extras.
 			"yolo_and_approval_mode_stripped",
 			[]string{"-y", "--yolo", "--approval-mode", "yolo", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// `--include-directories` would widen the workspace beyond the
@@ -159,7 +159,7 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// value must be consumed with the flag.
 			"include_directories_and_value_stripped",
 			[]string{"--include-directories", "/outside", "--model=gemini-3-pro"},
-			[]string{"--experimental-acp", "--model=gemini-3-pro"},
+			[]string{"--acp", "--model=gemini-3-pro"},
 		},
 		{
 			// `--worktree`/`-w` starts the child inside a fresh git worktree
@@ -169,14 +169,14 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// must be consumed with the flag in both the long and short spelling.
 			"worktree_and_value_stripped",
 			[]string{"--worktree", "feature-x", "-w", "hotfix", "--model=gemini-3-pro"},
-			[]string{"--experimental-acp", "--model=gemini-3-pro"},
+			[]string{"--acp", "--model=gemini-3-pro"},
 		},
 		{
 			// The equals and camelCase spellings of the worktree flag must be
 			// caught too, and a grouped cluster carrying `-w` fails closed.
 			"worktree_equals_camelcase_and_cluster_stripped",
 			[]string{"--worktree=feature-x", "-w=hotfix", "-wd", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// `--delete-session` is a session-management command, not a chat
@@ -184,14 +184,14 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// ACP, so both the flag and its separate-token value are stripped.
 			"delete_session_and_value_stripped",
 			[]string{"--delete-session", "2", "--deleteSession", "3", "--model=gemini-3-pro"},
-			[]string{"--experimental-acp", "--model=gemini-3-pro"},
+			[]string{"--acp", "--model=gemini-3-pro"},
 		},
 		{
 			// yargs accepts equals and camelCase spellings of the management
 			// flag too; inline values must not survive either.
 			"delete_session_equals_and_camelcase_stripped",
 			[]string{"--delete-session=2", "--deleteSession=3", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// `--policy`/`--admin-policy` load extra policy-engine files
@@ -201,7 +201,7 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// must be consumed with the flag.
 			"policy_files_and_values_stripped",
 			[]string{"--policy", "/tmp/allow.toml", "--admin-policy", "/tmp/admin", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// `--skip-trust` trusts the current workspace for the session
@@ -210,7 +210,7 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// It is a boolean flag, so nothing follows it.
 			"skip_trust_stripped",
 			[]string{"--skip-trust", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// `--sandbox` / `-s` can enable or steer Gemini's full-process
@@ -219,19 +219,19 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// signed start cannot alter sandbox posture.
 			"sandbox_flags_stripped",
 			[]string{"--sandbox", "--sandbox=true", "--no-sandbox", "--noSandbox=false", "-s", "-s=true", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			"privileged_equals_forms_stripped",
 			[]string{"--yolo=true", "--skip-trust=true", "--approval-mode=auto_edit", "--include-directories=/outside", "--allowed-tools=run_shell_command", "--policy=/tmp/allow.toml", "--admin-policy=/tmp/admin"},
-			[]string{"--experimental-acp"},
+			[]string{"--acp"},
 		},
 		{
 			// gemini's yargs parser accepts camelCase spellings of every
 			// kebab-case flag — the deny list has to catch those too.
 			"privileged_camelcase_spellings_stripped",
 			[]string{"--approvalMode", "yolo", "--skipTrust", "--includeDirectories", "/outside", "--allowedTools", "run_shell_command", "--adminPolicy", "/tmp/admin"},
-			[]string{"--experimental-acp"},
+			[]string{"--acp"},
 		},
 		{
 			// gemini's yargs parser expands a grouped short cluster like `-yd`
@@ -239,21 +239,21 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// yolo bit through. The whole cluster must be dropped.
 			"grouped_yolo_cluster_stripped",
 			[]string{"-yd", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// Clusters carrying the prompt short flags (`-p`/`-i`) flip gemini
 			// out of ACP mode just like their standalone forms.
 			"grouped_prompt_cluster_stripped",
 			[]string{"-dp", "-iv", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// Clusters carrying the sandbox short flag (`-s`) must also fail
 			// closed because yargs expands grouped booleans before parsing.
 			"grouped_sandbox_cluster_stripped",
 			[]string{"-sd", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// gemini's yargs-parser accepts a short-option equals value
@@ -262,20 +262,20 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// `-yd=…` carrying the yolo/prompt letters must be dropped.
 			"short_yolo_equals_form_stripped",
 			[]string{"-y=true", "-yd=1", "-ip=x", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// A benign short cluster with no dangerous letters must survive so
 			// legitimate gemini short options are not silently dropped.
 			"benign_short_cluster_survives",
 			[]string{"-vd", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "-vd", "--model", "gemini-3-pro"},
+			[]string{"--acp", "-vd", "--model", "gemini-3-pro"},
 		},
 		{
 			// A benign short-option equals value must still pass through.
 			"benign_short_equals_survives",
 			[]string{"-v=1", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "-v=1", "--model", "gemini-3-pro"},
+			[]string{"--acp", "-v=1", "--model", "gemini-3-pro"},
 		},
 		{
 			// yargs-parser treats a non-word character right after a short
@@ -286,21 +286,21 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// or flips out of ACP mode.
 			"attached_short_option_value_stripped",
 			[]string{"-w/tmp/foo", "-p/tmp/foo", "-s/tmp/profile", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// A dangerous letter clustered before the letter that takes the
 			// attached value must still be caught (`-dw/tmp/foo` carries `w`).
 			"dangerous_letter_before_attached_value_stripped",
 			[]string{"-dw/tmp/foo", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// A benign short option with an attached `/`-led value must still
 			// pass through -- the attached-value handling must not over-strip.
 			"benign_attached_short_value_survives",
 			[]string{"-v/tmp/foo", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "-v/tmp/foo", "--model", "gemini-3-pro"},
+			[]string{"--acp", "-v/tmp/foo", "--model", "gemini-3-pro"},
 		},
 		{
 			// A bare positional is a prompt word — the undelimited spelling
@@ -309,7 +309,7 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// the prompt in Args[0] must not break the handshake.
 			"bare_positional_prompt_dropped",
 			[]string{"tell me a joke", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// A positional after a DROPPED flag fails closed: the preceding
@@ -317,27 +317,27 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// value and would be read as a prompt.
 			"positional_after_dropped_flag_dropped",
 			[]string{"--yolo", "do things"},
-			[]string{"--experimental-acp"},
+			[]string{"--acp"},
 		},
 		{
 			// An equals-form flag already carries its value inline, so a bare
 			// token after it is a positional prompt, not a value.
 			"positional_after_equals_flag_dropped",
 			[]string{"--model=gemini-3-pro", "stray prompt"},
-			[]string{"--experimental-acp", "--model=gemini-3-pro"},
+			[]string{"--acp", "--model=gemini-3-pro"},
 		},
 		{
 			// Only the token directly after a separate-token flag can be its
 			// value; a second bare token is a positional again.
 			"second_positional_after_flag_value_dropped",
 			[]string{"--model", "gemini-3-pro", "extra prompt"},
-			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--model", "gemini-3-pro"},
 		},
 		{
 			// The lone `-` stdin marker is a positional, not a flag.
 			"lone_dash_dropped",
 			[]string{"-"},
-			[]string{"--experimental-acp"},
+			[]string{"--acp"},
 		},
 		{
 			// A bare token after a BOOLEAN flag (e.g. `--debug`) is NOT the
@@ -348,7 +348,7 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// flag itself survives, the positional is dropped.
 			"positional_after_boolean_flag_dropped",
 			[]string{"--debug", "fix tests", "--model", "gemini-3-pro"},
-			[]string{"--experimental-acp", "--debug", "--model", "gemini-3-pro"},
+			[]string{"--acp", "--debug", "--model", "gemini-3-pro"},
 		},
 		{
 			// A bare token after an UNKNOWN flag also fails closed — we cannot
@@ -356,7 +356,7 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// mode-breaking positional and dropped (the flag itself survives).
 			"positional_after_unknown_flag_dropped",
 			[]string{"--frobnicate", "some prompt"},
-			[]string{"--experimental-acp", "--frobnicate"},
+			[]string{"--acp", "--frobnicate"},
 		},
 		{
 			// Known value-taking flags in short and kebab spellings still keep
@@ -365,7 +365,7 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// extras are preserved intact.
 			"known_value_flags_keep_values",
 			[]string{"-m", "gemini-3-pro", "--output-format", "stream-json"},
-			[]string{"--experimental-acp", "-m", "gemini-3-pro", "--output-format", "stream-json"},
+			[]string{"--acp", "-m", "gemini-3-pro", "--output-format", "stream-json"},
 		},
 	}
 	for _, c := range cases {
@@ -931,13 +931,17 @@ func TestGeminiACPManager_Send_ScreensSetupCwdSettings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal sub: %v", err)
 	}
-	frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%s}}`, subJSON)
-	err = m.Send(id, frame)
-	if err == nil {
-		t.Fatal("expected Send to reject session/new whose cwd carries a privileged .gemini/settings.json")
-	}
-	if !strings.Contains(err.Error(), "bypass the ACP approval/containment guards") {
-		t.Fatalf("expected the workspace-settings screen error; got %v", err)
+	for _, method := range []string{"session/new", "newSession"} {
+		t.Run(strings.ReplaceAll(method, "/", "_"), func(t *testing.T) {
+			frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":{"cwd":%s}}`, method, subJSON)
+			sendErr := m.Send(id, frame)
+			if sendErr == nil {
+				t.Fatalf("expected Send to reject %s whose cwd carries a privileged .gemini/settings.json", method)
+			}
+			if !strings.Contains(sendErr.Error(), "bypass the ACP approval/containment guards") {
+				t.Fatalf("expected the workspace-settings screen error; got %v", sendErr)
+			}
+		})
 	}
 }
 
@@ -954,7 +958,7 @@ func TestGeminiACPManager_Send_RejectsClientMCPServers(t *testing.T) {
 		streamDone: make(chan struct{}),
 	}
 
-	for _, method := range []string{"session/new", "session/load"} {
+	for _, method := range []string{"session/new", "session/load", "newSession", "loadSession"} {
 		t.Run(strings.ReplaceAll(method, "/", "_"), func(t *testing.T) {
 			frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":{"sessionId":"sess-1","mcpServers":{"evil":{"command":"/bin/sh","args":["-c","id"]}}}}`, method)
 			err := m.Send(id, frame)
@@ -982,7 +986,7 @@ func TestGeminiACPLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected start error when gemini binary is not on PATH")
 	}
-	if !strings.Contains(err.Error(), "failed to start gemini --experimental-acp") {
+	if !strings.Contains(err.Error(), "failed to start gemini --acp") {
 		t.Errorf("expected error to name the gemini transport; got %q", err.Error())
 	}
 	if m.ActiveCount() != 0 {
@@ -1162,8 +1166,8 @@ func TestGeminiACPLifecycle_StartSendEnd(t *testing.T) {
 }
 
 // TestGeminiACPLifecycle_ForwardsBadFrameAsError pins the error mapping for a
-// child that emits non-JSON on stdout — the classic failure shape of an old
-// gemini build rejecting `--experimental-acp` with a plain-text usage error.
+// child that emits non-JSON on stdout — the classic failure shape of a gemini
+// build rejecting `--acp` with a plain-text usage error.
 // The manager must surface a `gemini_acp_error` (not silently forward the
 // garbage) and still deliver the terminal `gemini_acp_ended`.
 func TestGeminiACPLifecycle_ForwardsBadFrameAsError(t *testing.T) {

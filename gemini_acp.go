@@ -1,6 +1,6 @@
 // File: gemini_acp.go
 // -----------------------------------------------------------------------------
-// GeminiACPManager — long-lived `gemini --experimental-acp` sessions used by
+// GeminiACPManager — long-lived `gemini --acp` sessions used by
 // AI Expedite to drive Google's Gemini CLI via its ACP (Agent Client Protocol)
 // JSON-RPC 2.0 interface over the child process' stdio (newline-delimited
 // JSON). Same wire protocol family as the Grok ACP integration, so the
@@ -14,7 +14,7 @@
 // path and stays untouched: over a pipe gemini treats stdin as one turn and
 // exits, which is exactly what `session_start` wants and exactly what a
 // multi-turn chat cannot use. Multi-turn sessions come through here instead,
-// on gemini's experimental ACP stdio mode.
+// on gemini's documented ACP stdio mode.
 //
 // Auth posture mirrors Grok's: enforced by the orchestrator, not here. The
 // user's local `gemini` login (OAuth creds under ~/.gemini) is what the child
@@ -44,7 +44,7 @@ import (
 )
 
 // geminiACPSpec parameterises the shared ACP core for the Gemini family. The
-// stall hint mirrors Grok's: a `gemini --experimental-acp` child that spawns
+// stall hint mirrors Grok's: a `gemini --acp` child that spawns
 // but never emits a frame is almost always blocked on an interactive OAuth
 // sign-in it cannot present over headless stdio.
 var geminiACPSpec = acpSpec{
@@ -52,7 +52,7 @@ var geminiACPSpec = acpSpec{
 	logTag:      "gemini-acp",
 	noun:        "gemini acp",
 	agentName:   "gemini",
-	transport:   "gemini --experimental-acp",
+	transport:   "gemini --acp",
 	startHint:   "is `gemini` on PATH? run `gemini` in a terminal to sign in",
 	stallHint:   "it is most likely not signed in on this computer (its saved Google OAuth token expired; run `gemini` in a terminal on the terminal computer to sign in again) or wedged at startup.",
 	messageType: "gemini_acp_message",
@@ -103,7 +103,7 @@ type GeminiStartOptions struct {
    GeminiACPManager — Gemini configuration over the shared ACP core
    -------------------------------------------------------------------------- */
 
-// GeminiACPManager owns the active `gemini --experimental-acp` processes. One
+// GeminiACPManager owns the active `gemini --acp` processes. One
 // manager handles many concurrent sessions, mirroring GrokACPManager's shape.
 // All generic lifecycle methods (Send/End/Get/ActiveCount/CleanupStale/
 // ShutdownAll/ArmFirstFrameWatchdog) are promoted from the embedded core.
@@ -116,7 +116,7 @@ func NewGeminiACPManager() *GeminiACPManager {
 	return &GeminiACPManager{acpManager: newACPManager(geminiACPSpec)}
 }
 
-// Start launches `gemini --experimental-acp` in cwd. extraArgs are passed
+// Start launches `gemini --acp` in cwd. extraArgs are passed
 // through after the built-in transport flag so the orchestrator can supply
 // Gemini-specific knobs (e.g. `--model gemini-3-pro`) without us
 // special-casing every Gemini flag. The shared core owns cwd validation,
@@ -124,13 +124,13 @@ func NewGeminiACPManager() *GeminiACPManager {
 // Gemini argv/env policy. An unusable binary (not on PATH) surfaces as a
 // start error the dispatcher publishes as `gemini_acp_error`; a child that
 // spawns but exits immediately (e.g. an old gemini that rejects
-// `--experimental-acp`) surfaces through the normal stream path as
+// `--acp`) surfaces through the normal stream path as
 // `gemini_acp_stderr` frames plus a terminal `gemini_acp_ended` with the
 // non-zero exit code — matching how Grok startup failures are reported.
 func (m *GeminiACPManager) Start(id, cwd string, extraArgs []string, workspaceID, uid string, opts GeminiStartOptions, publishFn PublishFunc) error {
 	return m.start(id, cwd, opts.WorkspaceRoot, opts.TimeoutMs, workspaceID, uid, publishFn, func() (acpSpawnPlan, error) {
 		// The argv/env sanitizers close the flag/env routes to auto-approval
-		// and containment escape, but `gemini --experimental-acp` still loads
+		// and containment escape, but `gemini --acp` still loads
 		// the workspace's own `cwd/.gemini/settings.json`, which Gemini
 		// documents as overriding user settings. A repo-local settings file
 		// could re-enable auto-approval (general.defaultApprovalMode /
@@ -157,7 +157,7 @@ func (m *GeminiACPManager) Start(id, cwd string, extraArgs []string, workspaceID
    argv + env builders
    -------------------------------------------------------------------------- */
 
-// buildGeminiACPArgs constructs argv for `gemini --experimental-acp`.
+// buildGeminiACPArgs constructs argv for `gemini --acp`.
 //
 // The transport flag comes first and is owned here; extraArgs are appended
 // after it with the tokens that would break ACP mode stripped by
@@ -165,13 +165,13 @@ func (m *GeminiACPManager) Start(id, cwd string, extraArgs []string, workspaceID
 // constraint — gemini takes plain flags — so surviving extras can trail the
 // transport flag directly.
 func buildGeminiACPArgs(extraArgs []string) []string {
-	args := []string{"--experimental-acp"}
+	args := []string{"--acp"}
 	args = append(args, sanitizeGeminiACPExtraArgs(extraArgs)...)
 	return args
 }
 
 // sanitizeGeminiACPExtraArgs filters caller-supplied extra args down to
-// tokens that are safe to splice onto a `gemini --experimental-acp` argv.
+// tokens that are safe to splice onto a `gemini --acp` argv.
 // Dropped tokens:
 //
 //   - `--experimental-acp` / `--acp` — owned by buildGeminiACPArgs; duplicates
@@ -314,11 +314,11 @@ func geminiACPSeparateValueFlagShaped(tok string) bool {
 }
 
 // geminiACPOwnedTransportFlag reports whether lower is an ACP transport flag
-// spelling owned by buildGeminiACPArgs. Gemini's yargs parser maps
-// `--experimental-acp` to `experimentalAcp`, accepts camelCase, may expose
-// `--acp` as an alias, and honors yargs' `--no-*` boolean negation syntax, so
-// every long-form spelling and inline value is stripped before caller extras
-// are appended after the built-in `--experimental-acp`.
+// spelling owned by buildGeminiACPArgs. Current Gemini docs use `--acp`, and
+// older/alias spellings include `--experimental-acp` / `experimentalAcp`.
+// Gemini's yargs parser accepts camelCase and honors `--no-*` boolean negation
+// syntax, so every long-form spelling and inline value is stripped before
+// caller extras are appended after the built-in `--acp`.
 func geminiACPOwnedTransportFlag(lower string) bool {
 	switch lower {
 	case "--experimental-acp", "--experimentalacp", "--acp",

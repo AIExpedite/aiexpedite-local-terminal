@@ -192,7 +192,7 @@ func TestDefaultAllowList_GhCliIsDefaultAllowed(t *testing.T) {
 
 func TestDefaultAllowList_GeminiACPArgvIsDefaultAllowed(t *testing.T) {
 	// gemini_acp_start is gated against the SYNTHESIZED `gemini
-	// --experimental-acp …` argv (unlike grok_acp_start, which short-circuits
+	// --acp …` argv (unlike grok_acp_start, which short-circuits
 	// in signed mode because bare `grok` is deliberately absent from the
 	// default allowlist). That gate decision is only safe while the default
 	// list keeps its `gemini` / `gemini *` entries — pin both directions so a

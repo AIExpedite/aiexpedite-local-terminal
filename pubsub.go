@@ -2545,8 +2545,8 @@ var globalGrokACPManager *GrokACPManager
 
 // globalGeminiACPManager is the package-level GeminiACPManager instance,
 // initialized in StartAgent (agent.go). Sessions launched here drive Google's
-// Gemini CLI via its experimental ACP (Agent Client Protocol) JSON-RPC stdio
-// interface (`gemini --experimental-acp`), authenticating with the user's
+// Gemini CLI via its ACP (Agent Client Protocol) JSON-RPC stdio interface
+// (`gemini --acp`), authenticating with the user's
 // local `gemini` OAuth login so usage ties to the terminal computer user's
 // Google account.
 var globalGeminiACPManager *GeminiACPManager
@@ -2638,7 +2638,7 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		dialogArgs = allowArgs
 		denyOutput = "claude native session denied by user: not in allow list"
 	case "gemini_acp_start":
-		// Gate against the synthesised `gemini --experimental-acp …` argv the
+		// Gate against the synthesised `gemini --acp …` argv the
 		// manager will actually exec so the default `gemini *` allowlist entry
 		// covers ACP access without operators having to maintain a parallel
 		// allowlist for the new entry kind. Unlike grok_acp_start there is no
