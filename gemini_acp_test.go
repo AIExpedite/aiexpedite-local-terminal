@@ -213,6 +213,15 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
 		},
 		{
+			// `--sandbox` / `-s` can enable or steer Gemini's full-process
+			// startup sandbox before ACP approvals; `--no-sandbox` can also
+			// disable an operator-provided sandbox. Strip every spelling so a
+			// signed start cannot alter sandbox posture.
+			"sandbox_flags_stripped",
+			[]string{"--sandbox", "--sandbox=true", "--no-sandbox", "--noSandbox=false", "-s", "-s=true", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
 			"privileged_equals_forms_stripped",
 			[]string{"--yolo=true", "--skip-trust=true", "--approval-mode=auto_edit", "--include-directories=/outside", "--allowed-tools=run_shell_command", "--policy=/tmp/allow.toml", "--admin-policy=/tmp/admin"},
 			[]string{"--experimental-acp"},
@@ -237,6 +246,13 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// out of ACP mode just like their standalone forms.
 			"grouped_prompt_cluster_stripped",
 			[]string{"-dp", "-iv", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
+			// Clusters carrying the sandbox short flag (`-s`) must also fail
+			// closed because yargs expands grouped booleans before parsing.
+			"grouped_sandbox_cluster_stripped",
+			[]string{"-sd", "--model", "gemini-3-pro"},
 			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
 		},
 		{
@@ -266,10 +282,10 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			// option as that option's ATTACHED value (`-w/tmp/foo` ->
 			// worktree=/tmp/foo, `-p/tmp/foo` -> prompt=/tmp/foo). The `/`
 			// must not end the privilege scan before the dangerous letter is
-			// seen, or the token survives and re-enables worktree mode / flips
-			// out of ACP mode.
+			// seen, or the token survives and re-enables worktree/sandbox mode
+			// or flips out of ACP mode.
 			"attached_short_option_value_stripped",
-			[]string{"-w/tmp/foo", "-p/tmp/foo", "--model", "gemini-3-pro"},
+			[]string{"-w/tmp/foo", "-p/tmp/foo", "-s/tmp/profile", "--model", "gemini-3-pro"},
 			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
 		},
 		{
