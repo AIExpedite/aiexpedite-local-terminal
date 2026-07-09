@@ -29,7 +29,8 @@
 // own headless trust opt-in from the agent's launch environment, pins
 // GEMINI_CLI_IDE_WORKSPACE_PATH empty so the same `.env` cannot add outside
 // directories (the env twin of `--include-directories`), and pins Gemini
-// config-location env vars so workspace dotenv cannot redirect settings.
+// config-location and sandbox env vars so workspace dotenv cannot redirect
+// settings or enable repo-controlled sandbox startup.
 // -----------------------------------------------------------------------------
 
 package main
@@ -523,6 +524,23 @@ var geminiACPConfigPathEnvVars = []string{
 	"GEMINI_CLI_TRUSTED_FOLDERS_PATH",
 }
 
+// geminiACPSandboxEnvVars are Gemini sandbox controls that must be present
+// before Gemini loads workspace dotenv. Inherited operator values are
+// preserved; absent vars are pinned empty so a repo-local `.env` cannot enable
+// sandbox startup, declare that Gemini is already sandboxed, select a
+// repo-controlled proxy/mount/flags, or build `.gemini/sandbox.Dockerfile`
+// before the ACP permission loop exists.
+var geminiACPSandboxEnvVars = []string{
+	"SANDBOX",
+	"GEMINI_SANDBOX",
+	"GEMINI_SANDBOX_PROXY_COMMAND",
+	"BUILD_SANDBOX",
+	"BUILD_SANDBOX_FLAGS",
+	"SANDBOX_FLAGS",
+	"SANDBOX_MOUNTS",
+	"SEATBELT_PROFILE",
+}
+
 // sanitizeGeminiACPEnv applies a strip list to the inherited environment
 // before forwarding it to the Gemini ACP child, then pins the workspace-trust
 // variable off. Mirrors sanitizeCodexAppServerEnv for the IDE markers:
@@ -573,15 +591,28 @@ var geminiACPConfigPathEnvVars = []string{
 // settings screen never inspected. Pin each variable before dotenv runs:
 // inherited operator values survive, absent variables become empty so Gemini
 // falls back to its default paths and dotenv cannot fill them in later.
+//
+// The sandbox env family follows the same "preserve operator, pin repo" rule:
+// inherited values from the terminal agent's launch environment remain
+// available, but absent entries are pinned empty before Gemini loads project
+// dotenv. That blocks a committed `.env` from turning on full-process
+// sandboxing (`GEMINI_SANDBOX`), selecting a project-controlled profile/
+// proxy/mount/flags, or building `.gemini/sandbox.Dockerfile`
+// (`BUILD_SANDBOX`) during CLI startup before ACP approvals can run.
 func sanitizeGeminiACPEnv(env []string) []string {
-	filtered := make([]string, 0, len(env)+2+len(geminiACPConfigPathEnvVars))
+	filtered := make([]string, 0, len(env)+2+len(geminiACPConfigPathEnvVars)+len(geminiACPSandboxEnvVars))
 	inheritedTrust := false
 	configPathValues := make(map[string]string, len(geminiACPConfigPathEnvVars))
+	sandboxValues := make(map[string]string, len(geminiACPSandboxEnvVars))
 	for _, e := range env {
 		upper := strings.ToUpper(e)
 		if key, value, ok := strings.Cut(e, "="); ok {
 			if canonical, found := geminiACPConfigPathEnvVar(strings.ToUpper(key)); found {
 				configPathValues[canonical] = value
+				continue
+			}
+			if canonical, found := geminiACPSandboxEnvVar(strings.ToUpper(key)); found {
+				sandboxValues[canonical] = value
 				continue
 			}
 		}
@@ -617,16 +648,42 @@ func sanitizeGeminiACPEnv(env []string) []string {
 	for _, name := range geminiACPConfigPathEnvVars {
 		filtered = append(filtered, name+"="+configPathValues[name])
 	}
+	// Pin sandbox controls so workspace dotenv cannot enable or steer sandbox
+	// startup unless the operator already supplied those values.
+	for _, name := range geminiACPSandboxEnvVars {
+		value, ok := sandboxValues[name]
+		if !ok {
+			value = geminiACPSandboxDefaultEnvValue(name)
+		}
+		filtered = append(filtered, name+"="+value)
+	}
 	return filtered
 }
 
 func geminiACPConfigPathEnvVar(upperKey string) (string, bool) {
-	for _, name := range geminiACPConfigPathEnvVars {
+	return geminiACPListedEnvVar(upperKey, geminiACPConfigPathEnvVars)
+}
+
+func geminiACPSandboxEnvVar(upperKey string) (string, bool) {
+	return geminiACPListedEnvVar(upperKey, geminiACPSandboxEnvVars)
+}
+
+func geminiACPListedEnvVar(upperKey string, names []string) (string, bool) {
+	for _, name := range names {
 		if upperKey == name {
 			return name, true
 		}
 	}
 	return "", false
+}
+
+func geminiACPSandboxDefaultEnvValue(name string) string {
+	if name == "SEATBELT_PROFILE" {
+		// Match Gemini's default macOS sandbox profile while still blocking a
+		// workspace dotenv value from selecting `.gemini/sandbox-macos-*.sb`.
+		return "permissive-open"
+	}
+	return ""
 }
 
 /* --------------------------------------------------------------------------
@@ -888,6 +945,31 @@ func geminiSettingsPrivilegeReasonUnder(v any, parent string) string {
 						return fmt.Sprintf("auto-approval mode %q", s)
 					}
 				}
+			case "sandbox":
+				if parent == "tools" {
+					if reason := geminiSandboxSettingReason(k, val); reason != "" {
+						return reason
+					}
+				}
+			case "sandboxallowedpaths":
+				if parent == "tools" {
+					switch paths := val.(type) {
+					case string:
+						if strings.TrimSpace(paths) != "" {
+							return fmt.Sprintf("extra sandbox paths (%s)", k)
+						}
+					case []any:
+						if len(paths) > 0 {
+							return fmt.Sprintf("extra sandbox paths (%s)", k)
+						}
+					}
+				}
+			case "sandboxnetworkaccess":
+				if parent == "tools" {
+					if b, ok := val.(bool); ok && b {
+						return fmt.Sprintf("sandbox network access (%s)", k)
+					}
+				}
 			case "autoaccept", "yolo":
 				if b, ok := val.(bool); ok && b {
 					return fmt.Sprintf("tool auto-acceptance (%s)", k)
@@ -990,6 +1072,51 @@ func geminiSettingsPrivilegeReasonUnder(v any, parent string) string {
 		}
 	}
 	return ""
+}
+
+func geminiSandboxSettingReason(rawKey string, val any) string {
+	switch sandbox := val.(type) {
+	case bool:
+		if sandbox {
+			return fmt.Sprintf("full-process sandbox startup (%s)", rawKey)
+		}
+	case string:
+		switch geminiSettingsKey(sandbox) {
+		case "", "false", "0":
+			return ""
+		default:
+			return fmt.Sprintf("full-process sandbox startup (%s)", rawKey)
+		}
+	case map[string]any:
+		if geminiSandboxConfigEnabled(sandbox) {
+			return fmt.Sprintf("full-process sandbox startup (%s)", rawKey)
+		}
+	}
+	return ""
+}
+
+func geminiSandboxConfigEnabled(config map[string]any) bool {
+	for k, enabled := range config {
+		if geminiSettingsKey(k) != "enabled" {
+			continue
+		}
+		switch v := enabled.(type) {
+		case bool:
+			return v
+		case string:
+			switch geminiSettingsKey(v) {
+			case "", "false", "0":
+				return false
+			default:
+				return true
+			}
+		case float64:
+			return v != 0
+		default:
+			return enabled != nil
+		}
+	}
+	return false
 }
 
 // geminiAllowedToolsReason returns a privilege reason for a `tools.allowed` /

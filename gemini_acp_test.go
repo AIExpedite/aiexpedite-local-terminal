@@ -364,7 +364,8 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 
 // TestSanitizeGeminiACPEnv pins the nested-agent strip: CLAUDECODE / CLAUDE_*
 // / CODEX_IDE_* must not leak into the gemini child, while the rest of the
-// shell environment (including GEMINI_*/GOOGLE_*) survives by omission.
+// shell environment survives by omission unless it is a Gemini env var that
+// must be pinned before workspace dotenv runs.
 func TestSanitizeGeminiACPEnv(t *testing.T) {
 	in := []string{
 		"PATH=/usr/bin",
@@ -391,6 +392,16 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 		"GEMINI_CLI_SYSTEM_SETTINGS_PATH=/operator/system-settings.json",
 		"GEMINI_CLI_SYSTEM_DEFAULTS_PATH=/operator/system-defaults.json",
 		"GEMINI_CLI_TRUSTED_FOLDERS_PATH=/operator/trustedFolders.json",
+		// Operator-provided sandbox controls must also be preserved and pinned
+		// canonically so a repo-local `.env` cannot replace or add them later.
+		"SANDBOX=operator-sandbox",
+		"GEMINI_SANDBOX=docker",
+		"GEMINI_SANDBOX_PROXY_COMMAND=/operator/proxy",
+		"BUILD_SANDBOX=1",
+		"BUILD_SANDBOX_FLAGS=--pull",
+		"SANDBOX_FLAGS=--network=none",
+		"SANDBOX_MOUNTS=/operator/cache:/cache:ro",
+		"SEATBELT_PROFILE=operator-profile",
 	}
 	got := sanitizeGeminiACPEnv(in)
 	for _, w := range []string{"PATH=/usr/bin", "GEMINI_API_KEY=g-key", "GOOGLE_CLOUD_PROJECT=proj", "HOME=/home/user"} {
@@ -452,6 +463,30 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 			t.Errorf("expected exactly one %s entry, got %d in %v", key, count, got)
 		}
 	}
+	for _, w := range []string{
+		"SANDBOX=operator-sandbox",
+		"GEMINI_SANDBOX=docker",
+		"GEMINI_SANDBOX_PROXY_COMMAND=/operator/proxy",
+		"BUILD_SANDBOX=1",
+		"BUILD_SANDBOX_FLAGS=--pull",
+		"SANDBOX_FLAGS=--network=none",
+		"SANDBOX_MOUNTS=/operator/cache:/cache:ro",
+		"SEATBELT_PROFILE=operator-profile",
+	} {
+		if !envContains(got, w) {
+			t.Errorf("expected env to preserve pinned operator sandbox value %q; got %v", w, got)
+		}
+		key := strings.SplitN(w, "=", 2)[0]
+		count := 0
+		for _, e := range got {
+			if strings.HasPrefix(strings.ToUpper(e), key+"=") {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("expected exactly one %s entry, got %d in %v", key, count, got)
+		}
+	}
 
 	// Even with no inherited trust/IDE variables, the pinned values are appended.
 	gotClean := sanitizeGeminiACPEnv([]string{"PATH=/usr/bin"})
@@ -474,6 +509,28 @@ func TestSanitizeGeminiACPEnv(t *testing.T) {
 		}
 		if count != 1 {
 			t.Errorf("expected exactly one %s entry, got %d in %v", key, count, gotClean)
+		}
+	}
+	for _, key := range geminiACPSandboxEnvVars {
+		pinnedValue := key + "=" + geminiACPSandboxDefaultEnvValue(key)
+		if !envContains(gotClean, pinnedValue) {
+			t.Errorf("expected %s pinned to %q when absent from input; got %v", key, pinnedValue, gotClean)
+		}
+		count := 0
+		for _, e := range gotClean {
+			if strings.HasPrefix(strings.ToUpper(e), key+"=") {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Errorf("expected exactly one %s entry, got %d in %v", key, count, gotClean)
+		}
+	}
+	for _, key := range []string{"GEMINI_SANDBOX_IMAGE", "GEMINI_SANDBOX_IMAGE_DEFAULT"} {
+		for _, e := range gotClean {
+			if strings.HasPrefix(strings.ToUpper(e), key+"=") {
+				t.Errorf("expected %s to remain absent so Gemini can use package defaults; got %v", key, gotClean)
+			}
 		}
 	}
 
@@ -537,6 +594,11 @@ func TestScreenGeminiWorkspaceSettings_Allows(t *testing.T) {
 		"autoAccept false":    `{"tools":{"autoAccept":false}}`,
 		"empty includeDirs":   `{"context":{"includeDirectories":[]}}`,
 		"empty allowed tools": `{"tools":{"allowed":[]}}`,
+		"sandbox false":       `{"tools":{"sandbox":false}}`,
+		"sandbox string off":  `{"tools":{"sandbox":"false"}}`,
+		"sandbox object off":  `{"tools":{"sandbox":{"enabled":false,"allowedPaths":["/tmp"],"networkAccess":true}}}`,
+		"empty sandbox paths": `{"tools":{"sandboxAllowedPaths":[]}}`,
+		"sandbox network off": `{"tools":{"sandboxNetworkAccess":false}}`,
 		// `allowed` is only a pre-approved-tools grant under `tools`. A
 		// non-empty `mcp.allowed` (permitted MCP server names) is a benign
 		// restriction, and other blocks spell similar allowlists — none of
@@ -584,6 +646,12 @@ func TestScreenGeminiWorkspaceSettings_Blocks(t *testing.T) {
 		"allowed tools":       `{"tools":{"allowed":["run_shell_command"]}}`,
 		"legacy allowedTools": `{"allowedTools":"run_shell_command"}`,
 		"adminPolicy string":  `{"admin_policy_paths":"/tmp/admin"}`,
+		"sandbox true":        `{"tools":{"sandbox":true}}`,
+		"sandbox command":     `{"tools":{"sandbox":"docker"}}`,
+		"sandbox object":      `{"tools":{"sandbox":{"enabled":true,"command":"docker","image":"repo/image"}}}`,
+		"sandbox string bool": `{"tools":{"sandbox":{"enabled":"true","command":"podman"}}}`,
+		"sandbox paths":       `{"tools":{"sandboxAllowedPaths":["/outside"]}}`,
+		"sandbox network":     `{"tools":{"sandboxNetworkAccess":true}}`,
 		"trusted mcp server":  `{"mcpServers":{"local":{"command":"npx","trust":true}}}`,
 		// Any workspace-declared MCP server spawns local code during discovery
 		// before any approval — blocked even when trust is false/absent.
