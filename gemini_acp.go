@@ -171,8 +171,9 @@ func buildGeminiACPArgs(extraArgs []string) []string {
 // tokens that are safe to splice onto a `gemini --experimental-acp` argv.
 // Dropped tokens:
 //
-//   - `--experimental-acp` — owned by buildGeminiACPArgs; a duplicate is
-//     harmless on current gemini but pointless on the argv.
+//   - `--experimental-acp` / `--acp` — owned by buildGeminiACPArgs; duplicates
+//     and yargs alias/equals forms are dropped so a trailing false value cannot
+//     override ACP mode.
 //   - `-p`/`--prompt` and `-i`/`--prompt-interactive` (both forms) — any of
 //     these switches gemini OUT of ACP stdio mode into a one-shot headless /
 //     interactive run, which would break the JSON-RPC handshake the
@@ -222,7 +223,7 @@ func sanitizeGeminiACPExtraArgs(extraArgs []string) []string {
 		}
 		lower := strings.ToLower(a)
 
-		if lower == "--experimental-acp" {
+		if geminiACPOwnedTransportFlag(lower) {
 			continue
 		}
 
@@ -300,6 +301,28 @@ func geminiACPFlagShaped(tok string) bool {
 // after it is a positional).
 func geminiACPSeparateValueFlagShaped(tok string) bool {
 	return geminiACPFlagShaped(tok) && !strings.Contains(tok, "=")
+}
+
+// geminiACPOwnedTransportFlag reports whether lower is an ACP transport flag
+// spelling owned by buildGeminiACPArgs. Gemini's yargs parser maps
+// `--experimental-acp` to `experimentalAcp`, accepts camelCase, and may expose
+// `--acp` as an alias, so every long-form spelling and inline value is stripped
+// before caller extras are appended after the built-in `--experimental-acp`.
+func geminiACPOwnedTransportFlag(lower string) bool {
+	switch lower {
+	case "--experimental-acp", "--experimentalacp", "--acp":
+		return true
+	}
+	for _, prefix := range []string{
+		"--experimental-acp=",
+		"--experimentalacp=",
+		"--acp=",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // geminiACPKnownValueFlags is the set of gemini flags that consume the NEXT

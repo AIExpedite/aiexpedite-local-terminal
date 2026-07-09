@@ -85,6 +85,23 @@ func TestBuildGeminiACPArgs(t *testing.T) {
 			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
 		},
 		{
+			// The ACP transport flag is owned by buildGeminiACPArgs. A trailing
+			// false value in yargs' equals/camelCase forms can override the
+			// built-in `--experimental-acp`, so every transport spelling is
+			// stripped before extras are appended.
+			"transport_alias_equals_forms_dropped",
+			[]string{"--experimental-acp=false", "--experimentalAcp=false", "--acp=false", "--acp", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
+			// If a caller uses separate-token boolean syntax, the flag is
+			// stripped and the value falls through the normal bare-positional
+			// screen, so it cannot become a prompt that breaks ACP mode.
+			"transport_alias_separate_false_value_dropped",
+			[]string{"--experimental-acp", "false", "--model", "gemini-3-pro"},
+			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
+		},
+		{
 			"prompt_flag_and_value_stripped",
 			[]string{"-p", "hello there", "--model", "gemini-3-pro"},
 			[]string{"--experimental-acp", "--model", "gemini-3-pro"},
