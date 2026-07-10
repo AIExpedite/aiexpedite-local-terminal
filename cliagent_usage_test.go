@@ -75,6 +75,94 @@ func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
 	}
 }
 
+func helperWriteClaudeOAuth(t *testing.T, home string, extra map[string]any) {
+	t.Helper()
+	oauth := map[string]any{}
+	for k, v := range extra {
+		oauth[k] = v
+	}
+	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
+		"email":         "ada@example.com",
+		"claudeAiOauth": oauth,
+	})
+}
+
+func TestClaudeCodeUsageParser_AuthExpiredNotice(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	now := time.Now()
+	// Access token still valid, but the REFRESH token expired 2h ago → re-login.
+	helperWriteClaudeOAuth(t, home, map[string]any{
+		"expiresAt":             now.Add(2 * time.Hour).UnixMilli(),
+		"refreshTokenExpiresAt": now.Add(-2 * time.Hour).UnixMilli(),
+	})
+
+	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" {
+		t.Errorf("NoticeSeverity=%q, want error", usage.NoticeSeverity)
+	}
+	if !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q, want an expired re-login prompt", usage.Notice)
+	}
+}
+
+func TestClaudeCodeUsageParser_AuthExpiringSoonNotice(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteClaudeOAuth(t, home, map[string]any{
+		"refreshTokenExpiresAt": now.Add(12 * time.Hour).UnixMilli(), // within the 48h window
+	})
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.NoticeSeverity != "warning" {
+		t.Errorf("NoticeSeverity=%q, want warning", usage.NoticeSeverity)
+	}
+	if !strings.Contains(usage.Notice, "expires soon") {
+		t.Errorf("Notice=%q, want an expiring-soon prompt", usage.Notice)
+	}
+}
+
+func TestClaudeCodeUsageParser_AuthHealthyNoNotice(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	now := time.Now()
+	// Access token EXPIRED but the refresh token is valid for 10 days — the CLI
+	// silently refreshes, so this must NOT warn.
+	helperWriteClaudeOAuth(t, home, map[string]any{
+		"expiresAt":             now.Add(-1 * time.Hour).UnixMilli(),
+		"refreshTokenExpiresAt": now.Add(10 * 24 * time.Hour).UnixMilli(),
+	})
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Notice != "" {
+		t.Errorf("expected no auth notice while the refresh token is valid, got %q", usage.Notice)
+	}
+}
+
+func TestClaudeCodeUsageParser_ApiKeyNoOAuthNoNotice(t *testing.T) {
+	// Flat / API-key creds (no claudeAiOauth) must not raise a false auth notice:
+	// absence of an OAuth deadline is not a "signed out" signal.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
+		"email": "ada@example.com",
+		"plan":  "max",
+	})
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if usage.Notice != "" {
+		t.Errorf("unexpected notice for non-OAuth credentials: %q", usage.Notice)
+	}
+}
+
 func TestClaudeCodeUsageParser_HonorsClaudeConfigDir(t *testing.T) {
 	home := t.TempDir()
 	configDir := t.TempDir()

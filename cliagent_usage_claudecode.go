@@ -33,6 +33,50 @@ type claudeCredentials struct {
 	Subscription string `json:"subscription"`
 }
 
+// claudeOAuthCredentials mirrors the nested `claudeAiOauth` object Claude Code
+// writes to .credentials.json for a claude.ai subscription login. The access
+// token (ExpiresAt) auto-refreshes silently in the real ~/.claude using
+// RefreshToken, so its short expiry is NOT a re-login signal — the user only has
+// to interactively `/login` again once the REFRESH token expires
+// (RefreshTokenExpiresAt). That's the real re-authentication deadline.
+type claudeOAuthCredentials struct {
+	ClaudeAiOauth struct {
+		ExpiresAt             int64 `json:"expiresAt"`
+		RefreshTokenExpiresAt int64 `json:"refreshTokenExpiresAt"`
+	} `json:"claudeAiOauth"`
+}
+
+// claudeAuthExpiryWarnWindow is how far ahead of the refresh-token deadline we
+// warn. Claude native strips env credentials and requires a subscription
+// /login, so an expired OAuth session stalls a chat headlessly (the same class
+// of failure Grok hits).
+const claudeAuthExpiryWarnWindow = 48 * time.Hour
+
+// claudeAuthNotice returns a card notice + severity when the claude.ai
+// subscription login is (nearly) expired. It keys off the REFRESH-token expiry —
+// the access token auto-refreshes, so its shorter expiry would false-alarm.
+// Returns ("","") when the refresh token is still valid, or when there's no
+// OAuth login on disk (API-key installs have no credentials file, so absence
+// is not a reliable "signed out" signal — we don't guess).
+func claudeAuthNotice(base string, now time.Time) (string, string) {
+	creds := claudeOAuthCredentials{}
+	if !readJSONFile(expandHome(base, ".credentials.json"), &creds) {
+		return "", ""
+	}
+	deadlineMs := creds.ClaudeAiOauth.RefreshTokenExpiresAt
+	if deadlineMs <= 0 {
+		return "", "" // no OAuth deadline (API-key or unexpected layout) — don't guess
+	}
+	deadline := time.UnixMilli(deadlineMs)
+	if !deadline.After(now) {
+		return "Claude login has expired — run `claude` on the terminal computer and sign in (/login) again.", "error"
+	}
+	if deadline.Before(now.Add(claudeAuthExpiryWarnWindow)) {
+		return "Claude login expires soon — run `claude` on the terminal computer and sign in (/login) to avoid an interrupted session.", "warning"
+	}
+	return "", ""
+}
+
 func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
 	base := claudeConfigDir(home)
 	if base == "" {
@@ -56,6 +100,19 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
 	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)
+
+	// Proactive auth-expiry notice. Chat-direct Claude spawns
+	// `claude --output-format stream-json` with env credentials stripped
+	// (claude_auth_detect.go) so it MUST use the claude.ai subscription login on
+	// disk — an expired one stalls the session on a `/login` it can't show
+	// headlessly. Surface it in this regular usage scan so the dashboard prompts
+	// a re-login first. (No numeric usage-limit notice exists on this parser, so
+	// there's nothing to prioritize against.)
+	if notice, severity := claudeAuthNotice(base, now); notice != "" {
+		usage.Notice = notice
+		usage.NoticeSeverity = severity
+	}
+
 	return usage, true
 }
 
