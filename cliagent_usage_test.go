@@ -877,6 +877,86 @@ func TestGrokUsageParser_CachedTokenAuthFile(t *testing.T) {
 			t.Errorf("metric %q should be Unknown (no observable counter)", m.Kind)
 		}
 	}
+	// A bare identity-only fixture (no expires_at / token) must not raise a
+	// false auth notice — we only warn on a DEFINITE expiry.
+	if usage.Notice != "" {
+		t.Errorf("unexpected notice for identity-only auth: %q", usage.Notice)
+	}
+}
+
+// Grok's on-disk `auth.json` (current CLI) keys entries by
+// "<oidc_issuer>::<client_id>" and stamps each with an RFC3339 `expires_at`.
+func helperWriteGrokScopedAuth(t *testing.T, home string, expiresAt time.Time, extra map[string]any) {
+	t.Helper()
+	entry := map[string]any{"email": "rick@example.com"}
+	if !expiresAt.IsZero() {
+		entry["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+	}
+	for k, v := range extra {
+		entry[k] = v
+	}
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		"https://auth.x.ai::client-1": entry,
+	})
+}
+
+func TestGrokUsageParser_AuthExpiredNotice(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteGrokScopedAuth(t, home, now.Add(-14*24*time.Hour), nil) // expired 2 weeks ago
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" {
+		t.Errorf("NoticeSeverity=%q, want error", usage.NoticeSeverity)
+	}
+	if !strings.Contains(usage.Notice, "expired") || !strings.Contains(usage.Notice, "grok login") {
+		t.Errorf("Notice=%q, want an expired re-login prompt", usage.Notice)
+	}
+}
+
+func TestGrokUsageParser_AuthExpiringSoonNotice(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteGrokScopedAuth(t, home, now.Add(6*time.Hour), nil) // within the 24h warn window
+
+	usage, _ := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.NoticeSeverity != "warning" {
+		t.Errorf("NoticeSeverity=%q, want warning", usage.NoticeSeverity)
+	}
+	if !strings.Contains(usage.Notice, "expires soon") {
+		t.Errorf("Notice=%q, want an expiring-soon prompt", usage.Notice)
+	}
+}
+
+func TestGrokUsageParser_AuthValidNoNotice(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteGrokScopedAuth(t, home, now.Add(30*24*time.Hour), nil) // valid for a month
+
+	usage, _ := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Notice != "" {
+		t.Errorf("expected no auth notice for a valid token, got %q", usage.Notice)
+	}
+}
+
+func TestGrokUsageParser_AuthMissingNotice(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir() // no ~/.grok/auth.json at all
+	now := time.Now()
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected a usage entry even without auth")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+		t.Errorf("Notice=%q sev=%q, want a 'not signed in' error", usage.Notice, usage.NoticeSeverity)
+	}
 }
 
 func TestGrokUsageParser_LegacyCachedTokenLayout(t *testing.T) {

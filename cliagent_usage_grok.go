@@ -98,11 +98,22 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 		},
 	}
 
-	// xAI exposes no numeric quota, so the bars stay Unknown — but Grok DOES
-	// push a discrete usage-limit warning on the streaming-json output, which
-	// captureGrokUsageLimitLine caches. Surface the latest live state as a
-	// card-level notice (approaching → warning banner, reached → error banner).
-	if state, ok := loadGrokUsageLimitState(usage.AccountFingerprint, now); ok {
+	// Notice priority: an expired/missing local Grok login blocks every request
+	// AND can't be re-established headlessly (grok agent stdio falls back to an
+	// interactive device-code sign-in the terminal can't show), so surface it
+	// FIRST — ahead of the usage-limit banner. Grok's token is short-lived
+	// relative to the other agents' credentials, which is exactly why we fold
+	// this into the regular usage check instead of only failing at session
+	// start. Fall back to the live usage-limit state only when auth is healthy.
+	//
+	// xAI exposes no numeric quota, so the capacity bars stay Unknown — but Grok
+	// DOES push a discrete usage-limit warning on the streaming-json output,
+	// which captureGrokUsageLimitLine caches (approaching → warning, reached →
+	// error).
+	if authNotice, authSeverity := grokAuthNotice(base, usage.Account, now); authNotice != "" {
+		usage.Notice = authNotice
+		usage.NoticeSeverity = authSeverity
+	} else if state, ok := loadGrokUsageLimitState(usage.AccountFingerprint, now); ok {
 		usage.Notice = grokNoticeText(state)
 		usage.NoticeURL = state.UpgradeURL
 		if state.Severity == grokLimitReached {
@@ -125,6 +136,118 @@ func grokNoticeText(state grokUsageLimitState) string {
 		return "Grok usage limit reached — new requests may be blocked until your quota resets."
 	}
 	return "Approaching your Grok usage limit."
+}
+
+// grokAuthExpiryWarnWindow is how far ahead of expiry we surface a heads-up.
+// Grok access tokens are short-lived relative to the other agents' credentials,
+// and once expired `grok agent stdio` falls back to an interactive device-code
+// sign-in it cannot complete over its headless stdio pipe — so we warn before
+// the ACP `authenticate` step would start failing mid-session.
+const grokAuthExpiryWarnWindow = 24 * time.Hour
+
+// grokTokenExpClaims pulls the standard `exp` (seconds since epoch) out of a
+// JWT when the on-disk credential carries no explicit `expires_at`.
+type grokTokenExpClaims struct {
+	Exp int64 `json:"exp"`
+}
+
+// readGrokAuthExpiry returns the access-token expiry Grok wrote under
+// $GROK_HOME/auth.json. The current CLI keys the file by
+// "<oidc_issuer>::<client_id>" with an RFC3339 `expires_at` per entry; older
+// layouts store a flat top-level `expires_at` or only a JWT whose `exp` claim we
+// fall back to. Returns the LATEST expiry found so a stale sibling entry can't
+// mask a fresh re-login. Best-effort: (zero, false) when nothing is readable.
+func readGrokAuthExpiry(base string) (time.Time, bool) {
+	raw, err := os.ReadFile(filepath.Join(base, "auth.json"))
+	if err != nil {
+		raw, err = os.ReadFile(filepath.Join(base, "cached_token.json"))
+		if err != nil {
+			return time.Time{}, false
+		}
+	}
+
+	var latest time.Time
+	consider := func(t time.Time, ok bool) {
+		if ok && t.After(latest) {
+			latest = t
+		}
+	}
+	fromRFC3339 := func(s string) (time.Time, bool) {
+		if s == "" {
+			return time.Time{}, false
+		}
+		t, perr := time.Parse(time.RFC3339, s)
+		return t, perr == nil
+	}
+	fromJWT := func(token string) (time.Time, bool) {
+		if token == "" {
+			return time.Time{}, false
+		}
+		var claims grokTokenExpClaims
+		if parseJWTClaims(token, &claims) && claims.Exp > 0 {
+			return time.Unix(claims.Exp, 0).UTC(), true
+		}
+		return time.Time{}, false
+	}
+
+	// Scoped/keyed format (current): a top-level map of issuer::client → entry.
+	// A flat auth.json fails this unmarshal (its string values don't fit the
+	// struct), so we fall through to the flat shape below.
+	var scoped map[string]struct {
+		ExpiresAt   string `json:"expires_at"`
+		Key         string `json:"key"`
+		Token       string `json:"token"`
+		IDToken     string `json:"id_token"`
+		AccessToken string `json:"access_token"`
+	}
+	if json.Unmarshal(raw, &scoped) == nil {
+		for _, v := range scoped {
+			consider(fromRFC3339(v.ExpiresAt))
+			consider(fromJWT(firstNonEmpty(v.Key, v.Token, v.IDToken, v.AccessToken)))
+		}
+	}
+
+	// Flat / legacy format: top-level `expires_at` and/or a cached_token JWT.
+	var flat struct {
+		ExpiresAt   string `json:"expires_at"`
+		CachedToken struct {
+			IDToken     string `json:"id_token"`
+			AccessToken string `json:"access_token"`
+		} `json:"cached_token"`
+	}
+	if json.Unmarshal(raw, &flat) == nil {
+		consider(fromRFC3339(flat.ExpiresAt))
+		consider(fromJWT(firstNonEmpty(flat.CachedToken.IDToken, flat.CachedToken.AccessToken)))
+	}
+
+	if latest.IsZero() {
+		return time.Time{}, false
+	}
+	return latest, true
+}
+
+// grokAuthNotice returns a card-level notice + severity when the local Grok
+// login is missing or (nearly) expired, so the dashboard can prompt a re-run of
+// `grok login` on the terminal computer BEFORE a chat session stalls on an
+// un-showable browser sign-in. Returns ("", "") when auth looks healthy.
+func grokAuthNotice(base, account string, now time.Time) (string, string) {
+	expiry, ok := readGrokAuthExpiry(base)
+	if !ok {
+		// No parseable token. Only call it "not signed in" when there's also no
+		// identity — a readable account with an unusual token layout shouldn't
+		// raise a false alarm.
+		if account == "" {
+			return "Grok is not signed in on this computer — run `grok login` on the terminal computer to authenticate.", "error"
+		}
+		return "", ""
+	}
+	if !expiry.After(now) {
+		return "Grok login has expired — run `grok login` on the terminal computer to re-authenticate.", "error"
+	}
+	if expiry.Before(now.Add(grokAuthExpiryWarnWindow)) {
+		return "Grok login expires soon — run `grok login` on the terminal computer to avoid an interrupted session.", "warning"
+	}
+	return "", ""
 }
 
 // readGrokAccountAndPlan extracts the account identifier and plan from the Grok
