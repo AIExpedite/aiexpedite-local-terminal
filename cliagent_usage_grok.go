@@ -29,24 +29,34 @@ import (
 // "auth.x.ai" (OIDC), which would pick the legacy sibling and let a stale OIDC
 // token slip through — the very case a re-login warning exists to catch.
 const (
+	// grokExactOIDCScope is the CLI's own OIDC scope — the exact key
+	// read_grok_token resolves first (OIDC_SCOPE in https://x.ai/cli/install.sh).
+	// We rank this exact match ahead of the bare prefix so a stale token for a
+	// DIFFERENT xAI client that happens to share the "https://auth.x.ai" host
+	// (a sibling "https://auth.x.ai::<other-client>" entry) can't sort ahead of
+	// the credential Grok will actually present.
+	grokExactOIDCScope    = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
 	grokOIDCScopePrefix   = "https://auth.x.ai"
 	grokLegacyScopePrefix = "https://accounts.x.ai"
 )
 
 // grokScopeKeysByPrecedence orders auth.json scope keys the way Grok resolves a
-// token: OIDC scope first, legacy sign-in scope next, then any other keys in
-// stable alphabetical order. Callers walk the result and take the first entry
-// that carries a usable token, mirroring the installer's OIDC-then-legacy
-// fallback instead of aggregating unrelated siblings.
+// token: the exact CLI OIDC scope first, then any other OIDC-host scope, then
+// the legacy sign-in scope, then any other keys — each tier broken by stable
+// alphabetical order. Callers walk the result and take the first entry that
+// carries a usable token, mirroring the installer's OIDC-then-legacy fallback
+// instead of aggregating unrelated siblings.
 func grokScopeKeysByPrecedence(keys []string) []string {
 	rank := func(k string) int {
 		switch {
-		case strings.HasPrefix(k, grokOIDCScopePrefix):
+		case k == grokExactOIDCScope:
 			return 0
-		case strings.HasPrefix(k, grokLegacyScopePrefix):
+		case strings.HasPrefix(k, grokOIDCScopePrefix):
 			return 1
-		default:
+		case strings.HasPrefix(k, grokLegacyScopePrefix):
 			return 2
+		default:
+			return 3
 		}
 	}
 	ordered := append([]string(nil), keys...)

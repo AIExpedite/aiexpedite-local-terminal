@@ -1286,6 +1286,43 @@ func TestGrokUsageParser_CachedTokenPrefersAccessTokenExpiry(t *testing.T) {
 	}
 }
 
+// TestGrokUsageParser_ScopedExpiryPrefersExactCLIScopeOverSiblingOIDCHost pins
+// that the EXACT CLI OIDC scope outranks an unrelated sibling that merely shares
+// the "https://auth.x.ai" host. read_grok_token resolves the CLI's own
+// OIDC_SCOPE, not any auth.x.ai key, so a stale token for a different xAI client
+// (e.g. "https://auth.x.ai::00000000-...", which sorts alphabetically first)
+// must NOT mask the health of the CLI credential Grok will actually present.
+// Here the sibling OIDC-host entry is expired while the exact CLI scope is valid
+// — no notice must surface.
+func TestGrokUsageParser_ScopedExpiryPrefersExactCLIScopeOverSiblingOIDCHost(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// A different xAI client sharing the auth.x.ai host — sorts first
+		// alphabetically (all-zero UUID) and is expired, but Grok never presents it.
+		"https://auth.x.ai::00000000-0000-0000-0000-000000000000": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+		// The CLI's exact OIDC scope — the credential Grok presents — is valid.
+		"https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Notice != "" {
+		t.Errorf("Notice=%q, want no notice — the exact CLI OIDC scope is valid; an unrelated expired auth.x.ai sibling must not drive the expiry", usage.Notice)
+	}
+}
+
 func TestGrokUsageParser_HonorsGrokHomeEnv(t *testing.T) {
 	home := t.TempDir()
 	grokHome := t.TempDir()
