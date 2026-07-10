@@ -163,6 +163,55 @@ func TestClaudeCodeUsageParser_ApiKeyNoOAuthNoNotice(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeUsageParser_AuthFromKeychainWhenNoFile(t *testing.T) {
+	// On macOS Claude Code stores the credential in the Keychain, not
+	// ~/.claude/.credentials.json. When the file is absent, the parser must fall
+	// back to the platform reader so an expired login is still surfaced. Override
+	// the reader so this exercises cross-platform.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir() // no .credentials.json on disk
+	now := time.Now()
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	raw, _ := json.Marshal(map[string]any{
+		"email": "kc@example.com",
+		"claudeAiOauth": map[string]any{
+			"refreshTokenExpiresAt": now.Add(-time.Hour).UnixMilli(), // expired
+		},
+	})
+	claudeKeychainReader = func() ([]byte, bool) { return raw, true }
+
+	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Account != "kc@example.com" {
+		t.Errorf("Account=%q, want kc@example.com (resolved from keychain)", usage.Account)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want expired error from the keychain credential",
+			usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+func TestClaudeCodeUsageParser_NoFileNoKeychainNoNotice(t *testing.T) {
+	// Fresh box / API-key install with neither a file nor a keychain credential
+	// must not raise a false auth notice.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if usage.Notice != "" {
+		t.Errorf("unexpected notice with no credential source: %q", usage.Notice)
+	}
+}
+
 func TestClaudeCodeUsageParser_HonorsClaudeConfigDir(t *testing.T) {
 	home := t.TempDir()
 	configDir := t.TempDir()
