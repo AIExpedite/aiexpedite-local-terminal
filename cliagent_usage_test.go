@@ -940,6 +940,65 @@ func TestGrokUsageParser_AuthExpiringSoonNotice(t *testing.T) {
 	}
 }
 
+// A reached usage limit blocks requests right now, while an expiring-soon login
+// is only a heads-up (the token still works) — so the reached-quota error must
+// win over the auth warning instead of being suppressed by it.
+func TestGrokUsageParser_ReachedLimitBeatsExpiringSoonAuth(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteGrokScopedAuth(t, home, now.Add(6*time.Hour), nil) // within the 24h warn window
+
+	cache := filepath.Join(t.TempDir(), "grok_usage_limit.json")
+	t.Setenv("AIEXPEDITE_GROK_LIMIT_CACHE", cache)
+	helperWriteJSON(t, cache, map[string]any{
+		"severity":           grokLimitReached,
+		"message":            "Grok usage limit reached — upgrade to keep going.",
+		"upgradeUrl":         "https://x.ai/upgrade",
+		"observedAt":         now.UTC().Format(time.RFC3339),
+		"observedAtMs":       now.UnixMilli(),
+		"accountFingerprint": fingerprintAccount("grok", "rick@example.com"),
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" {
+		t.Errorf("NoticeSeverity=%q, want error (reached quota must not be hidden by an expiring-soon auth warning)", usage.NoticeSeverity)
+	}
+	if !strings.Contains(usage.Notice, "usage limit reached") {
+		t.Errorf("Notice=%q, want the reached usage-limit banner, not the re-login heads-up", usage.Notice)
+	}
+	if usage.NoticeURL != "https://x.ai/upgrade" {
+		t.Errorf("NoticeURL=%q, want the upgrade URL preserved from the cached limit state", usage.NoticeURL)
+	}
+}
+
+// Expired/missing auth DOES block every request and can't be re-established
+// headlessly, so it still takes precedence even over a reached usage limit.
+func TestGrokUsageParser_ExpiredAuthBeatsReachedLimit(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteGrokScopedAuth(t, home, now.Add(-time.Hour), nil) // already expired
+
+	cache := filepath.Join(t.TempDir(), "grok_usage_limit.json")
+	t.Setenv("AIEXPEDITE_GROK_LIMIT_CACHE", cache)
+	helperWriteJSON(t, cache, map[string]any{
+		"severity":           grokLimitReached,
+		"message":            "Grok usage limit reached — upgrade to keep going.",
+		"observedAt":         now.UTC().Format(time.RFC3339),
+		"observedAtMs":       now.UnixMilli(),
+		"accountFingerprint": fingerprintAccount("grok", "rick@example.com"),
+	})
+
+	usage, _ := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want the expired re-login prompt to win — it blocks requests and can't be fixed headlessly", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
 func TestGrokUsageParser_AuthValidNoNotice(t *testing.T) {
 	t.Setenv("GROK_HOME", "")
 	home := t.TempDir()

@@ -136,29 +136,51 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 		},
 	}
 
-	// Notice priority: an expired/missing local Grok login blocks every request
-	// AND can't be re-established headlessly (grok agent stdio falls back to an
-	// interactive device-code sign-in the terminal can't show), so surface it
-	// FIRST — ahead of the usage-limit banner. Grok's token is short-lived
-	// relative to the other agents' credentials, which is exactly why we fold
-	// this into the regular usage check instead of only failing at session
-	// start. Fall back to the live usage-limit state only when auth is healthy.
+	// Notice priority is by whether the condition blocks requests RIGHT NOW, not
+	// simply auth-before-limit:
+	//   1. expired/missing login  — blocks every request AND can't be
+	//      re-established headlessly (grok agent stdio falls back to an
+	//      interactive device-code sign-in the terminal can't show);
+	//   2. reached usage limit     — quota is exhausted, so requests are blocked
+	//      until it resets;
+	//   3. login expires soon      — a heads-up only; the token still works, so a
+	//      request-blocking limit must not be hidden behind it;
+	//   4. approaching usage limit — the other heads-up.
+	// Grok's token is short-lived relative to the other agents' credentials,
+	// which is why we fold the auth check into the regular usage check instead of
+	// only failing at session start.
 	//
 	// xAI exposes no numeric quota, so the capacity bars stay Unknown — but Grok
 	// DOES push a discrete usage-limit warning on the streaming-json output,
 	// which captureGrokUsageLimitLine caches (approaching → warning, reached →
 	// error).
-	if authNotice, authSeverity := grokAuthNotice(base, usage.Account, now); authNotice != "" {
-		usage.Notice = authNotice
-		usage.NoticeSeverity = authSeverity
-	} else if state, ok := loadGrokUsageLimitState(usage.AccountFingerprint, now); ok {
-		usage.Notice = grokNoticeText(state)
-		usage.NoticeURL = state.UpgradeURL
-		if state.Severity == grokLimitReached {
+	authNotice, authSeverity := grokAuthNotice(base, usage.Account, now)
+	limitState, hasLimit := loadGrokUsageLimitState(usage.AccountFingerprint, now)
+	applyLimitNotice := func() {
+		usage.Notice = grokNoticeText(limitState)
+		usage.NoticeURL = limitState.UpgradeURL
+		if limitState.Severity == grokLimitReached {
 			usage.NoticeSeverity = "error"
 		} else {
 			usage.NoticeSeverity = "warning"
 		}
+	}
+	switch {
+	case authNotice != "" && authSeverity == "error":
+		// Expired/missing login — surface ahead of any usage-limit banner.
+		usage.Notice = authNotice
+		usage.NoticeSeverity = authSeverity
+	case hasLimit && limitState.Severity == grokLimitReached:
+		// A reached quota blocks requests now, whereas an expiring-soon auth
+		// warning does not — don't let the re-login heads-up hide it.
+		applyLimitNotice()
+	case authNotice != "":
+		// Expiring-soon auth warning: nudge a re-login before the token lapses.
+		usage.Notice = authNotice
+		usage.NoticeSeverity = authSeverity
+	case hasLimit:
+		// Only an approaching (warning) usage limit is left.
+		applyLimitNotice()
 	}
 
 	return usage, true
