@@ -1189,6 +1189,42 @@ func TestGrokUsageParser_ScopedExpirySkipsTokenlessEntry(t *testing.T) {
 	}
 }
 
+// TestGrokUsageParser_ScopedExpiryStopsAtSelectedScopeWithUnknownExpiry pins that
+// once the preferred token-bearing scope is selected, an UNREADABLE expiry there
+// (opaque key: no `expires_at`, no JWT `exp`) reports unknown instead of falling
+// through to a lower-precedence sibling. read_grok_token stops at the first
+// non-empty token, so consulting the legacy sibling's expired timestamp would
+// surface a false expired-login error for a token Grok never presents. Unknown
+// expiry + a readable account must stay quiet (no notice).
+func TestGrokUsageParser_ScopedExpiryStopsAtSelectedScopeWithUnknownExpiry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// OIDC scope (resolved first) carries an opaque, non-JWT key with no
+		// `expires_at` — its expiry is unknown, but it IS the token Grok presents.
+		"https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": map[string]any{
+			"email": "scoped-grok@example.com",
+			"key":   "opaque-non-jwt-access-token",
+		},
+		// Legacy scope is expired, but Grok never falls back to it while the OIDC
+		// token exists — so its expiry must NOT drive the notice.
+		"https://accounts.x.ai/sign-in": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Notice != "" {
+		t.Errorf("Notice=%q, want no notice — the selected OIDC scope's expiry is unknown, so we must not borrow the legacy sibling's expired timestamp", usage.Notice)
+	}
+}
+
 func TestGrokUsageParser_HonorsGrokHomeEnv(t *testing.T) {
 	home := t.TempDir()
 	grokHome := t.TempDir()

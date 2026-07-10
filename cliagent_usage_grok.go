@@ -277,12 +277,20 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 			if token == "" {
 				continue
 			}
+			// This is the scope Grok's resolver stops at — the token it will
+			// present. Its expiry is the only one that matters, so read it and
+			// STOP: don't fall through to lower-precedence siblings whose token
+			// Grok will never use. If this scope's expiry is unreadable (opaque
+			// key, no `expires_at` and no JWT `exp`), report unknown rather than
+			// borrowing an unrelated sibling's — which could surface a stale
+			// legacy token's expiry as a false expired-login error.
 			if t, ok := fromRFC3339(v.ExpiresAt); ok {
 				return t, true
 			}
 			if t, ok := fromJWT(token); ok {
 				return t, true
 			}
+			return time.Time{}, false
 		}
 	}
 
