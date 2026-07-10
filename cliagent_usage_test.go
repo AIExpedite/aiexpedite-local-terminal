@@ -1225,6 +1225,33 @@ func TestGrokUsageParser_ScopedExpiryStopsAtSelectedScopeWithUnknownExpiry(t *te
 	}
 }
 
+// TestGrokUsageParser_OpaqueTokenWithoutIdentityStaysSignedIn pins that a scoped
+// entry with a usable but opaque token — no `expires_at`, no JWT `exp`, and no
+// parseable identity — does NOT surface a false "not signed in" error. Grok's
+// resolver would still present the token, so the best-effort check must stay
+// quiet rather than telling the user to re-run `grok login`.
+func TestGrokUsageParser_OpaqueTokenWithoutIdentityStaysSignedIn(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// Opaque, non-JWT key with no `expires_at` and no identity claims: expiry
+		// is unknown AND the account can't be parsed, yet the token IS present and
+		// is what Grok would present on each request.
+		"https://auth.x.ai::client-1": map[string]any{
+			"key": "opaque-non-jwt-access-token",
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Notice != "" {
+		t.Errorf("Notice=%q, want no notice — a usable-but-opaque token must not read as 'not signed in'", usage.Notice)
+	}
+}
+
 // TestGrokUsageParser_CachedTokenPrefersAccessTokenExpiry pins that a legacy
 // cached_token file carrying BOTH tokens reads the expiry from the access token
 // — the credential Grok actually presents on each request — not the id_token.

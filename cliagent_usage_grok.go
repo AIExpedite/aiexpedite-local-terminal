@@ -324,6 +324,54 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// grokHasUsableToken reports whether Grok's auth file carries a non-empty
+// credential Grok's resolver would present — regardless of whether that token's
+// expiry or identity is parseable. grokAuthNotice uses it to avoid a false "not
+// signed in" error for a usable-but-opaque token (unreadable expiry AND
+// unreadable account): Grok would still present it, so surfacing a login error
+// contradicts the best-effort intent — warn on a DEFINITE stale login, stay
+// quiet when the layout is merely unparseable.
+func grokHasUsableToken(base string) bool {
+	raw, err := os.ReadFile(filepath.Join(base, "auth.json"))
+	if err != nil {
+		raw, err = os.ReadFile(filepath.Join(base, "cached_token.json"))
+		if err != nil {
+			return false
+		}
+	}
+
+	// Scoped/keyed format (current): any entry carrying a non-empty token —
+	// presence alone matters here, so precedence order is irrelevant.
+	var scoped map[string]struct {
+		Key         string `json:"key"`
+		Token       string `json:"token"`
+		IDToken     string `json:"id_token"`
+		AccessToken string `json:"access_token"`
+	}
+	if json.Unmarshal(raw, &scoped) == nil && len(scoped) > 0 {
+		for _, v := range scoped {
+			if firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken) != "" {
+				return true
+			}
+		}
+	}
+
+	// Flat / legacy cached_token format.
+	var flat struct {
+		CachedToken struct {
+			IDToken     string `json:"id_token"`
+			AccessToken string `json:"access_token"`
+		} `json:"cached_token"`
+	}
+	if json.Unmarshal(raw, &flat) == nil {
+		if firstNonEmpty(flat.CachedToken.AccessToken, flat.CachedToken.IDToken) != "" {
+			return true
+		}
+	}
+
+	return false
+}
+
 // grokAuthNotice returns a card-level notice + severity when the local Grok
 // login is missing or (nearly) expired, so the dashboard can prompt a re-run of
 // `grok login` on the terminal computer BEFORE a chat session stalls on an
@@ -331,10 +379,11 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 func grokAuthNotice(base, account string, now time.Time) (string, string) {
 	expiry, ok := readGrokAuthExpiry(base)
 	if !ok {
-		// No parseable token. Only call it "not signed in" when there's also no
-		// identity — a readable account with an unusual token layout shouldn't
-		// raise a false alarm.
-		if account == "" {
+		// No parseable expiry. Only call it "not signed in" when there's also no
+		// identity AND no usable token — a readable account, or an opaque token
+		// Grok would still present, shouldn't raise a false alarm just because
+		// its layout is unparseable.
+		if account == "" && !grokHasUsableToken(base) {
 			return "Grok is not signed in on this computer — run `grok login` on the terminal computer to authenticate.", "error"
 		}
 		return "", ""
