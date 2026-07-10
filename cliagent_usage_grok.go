@@ -272,8 +272,12 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 			// usable when it carries a non-empty token. Skip metadata/empty-key
 			// entries so a tokenless preferred (OIDC) scope can't surface its
 			// `expires_at` and mask the health of the legacy scope Grok will
-			// actually present.
-			token := firstNonEmpty(v.Key, v.Token, v.IDToken, v.AccessToken)
+			// actually present. Prefer the access token over the id_token — that's
+			// the credential Grok presents on each request — so a stale
+			// `access_token` paired with a later-expiring `id_token` can't read as
+			// healthy (this also covers a nested `cached_token` object, which
+			// unmarshals into this scoped map as a single entry).
+			token := firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken)
 			if token == "" {
 				continue
 			}
@@ -307,7 +311,12 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		if t, ok := fromRFC3339(flat.ExpiresAt); ok {
 			return t, true
 		}
-		if t, ok := fromJWT(firstNonEmpty(flat.CachedToken.IDToken, flat.CachedToken.AccessToken)); ok {
+		// Prefer the access token — that's the credential Grok actually presents
+		// on each request — and only fall back to the id_token when no access
+		// token is present. Otherwise a stale `access_token` paired with a
+		// later-expiring `id_token` would report the login as healthy and hide
+		// the impending stall.
+		if t, ok := fromJWT(firstNonEmpty(flat.CachedToken.AccessToken, flat.CachedToken.IDToken)); ok {
 			return t, true
 		}
 	}

@@ -1225,6 +1225,40 @@ func TestGrokUsageParser_ScopedExpiryStopsAtSelectedScopeWithUnknownExpiry(t *te
 	}
 }
 
+// TestGrokUsageParser_CachedTokenPrefersAccessTokenExpiry pins that a legacy
+// cached_token file carrying BOTH tokens reads the expiry from the access token
+// — the credential Grok actually presents on each request — not the id_token.
+// Here the access_token is already expired while the id_token still has a later
+// exp; the expired re-login warning must surface instead of a healthy read off
+// the id_token.
+func TestGrokUsageParser_CachedTokenPrefersAccessTokenExpiry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "cached_token.json"), map[string]any{
+		"cached_token": map[string]any{
+			// id_token is still valid for a month — must NOT drive the notice.
+			"id_token": helperJWT(t, map[string]any{
+				"email": "oauth-grok@example.com",
+				"exp":   now.Add(30 * 24 * time.Hour).Unix(),
+			}),
+			// access_token is the credential Grok presents — and it is expired.
+			"access_token": helperJWT(t, map[string]any{
+				"email": "oauth-grok@example.com",
+				"exp":   now.Add(-14 * 24 * time.Hour).Unix(),
+			}),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt from the presented access token, not a healthy read off the later-expiring id_token", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
 func TestGrokUsageParser_HonorsGrokHomeEnv(t *testing.T) {
 	home := t.TempDir()
 	grokHome := t.TempDir()
