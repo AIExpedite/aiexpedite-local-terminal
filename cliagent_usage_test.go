@@ -1018,6 +1018,40 @@ func TestGrokUsageParser_ScopedInstallerAuthFile(t *testing.T) {
 	}
 }
 
+// TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry pins that when auth.json
+// holds multiple scoped entries, the expiry check follows the SAME entry the
+// account resolver selects (first key in sorted order) rather than borrowing the
+// latest expiry from a sibling. Grok presents the selected scoped token, so an
+// expired selected entry must surface even if a fresher legacy sibling exists —
+// otherwise the re-login warning would be wrongly suppressed.
+func TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	// "aaa::selected" sorts before "zzz::legacy"; the selected scope is expired
+	// while the fresher sibling is valid for a month.
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		"aaa::selected": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+		"zzz::legacy": map[string]any{
+			"email":      "old-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "old-grok@example.com"}),
+			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt tied to the selected scope", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
 func TestGrokUsageParser_HonorsGrokHomeEnv(t *testing.T) {
 	home := t.TempDir()
 	grokHome := t.TempDir()

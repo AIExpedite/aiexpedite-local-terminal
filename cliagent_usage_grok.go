@@ -155,8 +155,12 @@ type grokTokenExpClaims struct {
 // $GROK_HOME/auth.json. The current CLI keys the file by
 // "<oidc_issuer>::<client_id>" with an RFC3339 `expires_at` per entry; older
 // layouts store a flat top-level `expires_at` or only a JWT whose `exp` claim we
-// fall back to. Returns the LATEST expiry found so a stale sibling entry can't
-// mask a fresh re-login. Best-effort: (zero, false) when nothing is readable.
+// fall back to. For the scoped format we tie the expiry to the SAME entry
+// readGrokAccountAndPlan/readGrokScopedAuthClaims select — the first key in
+// sorted order — rather than aggregating siblings: Grok presents that one scoped
+// token, so a fresher sibling must not mask it when it is stale (and a re-login
+// rewrites the selected entry, so keying off it still clears a resolved warning).
+// Best-effort: (zero, false) when nothing is readable.
 func readGrokAuthExpiry(base string) (time.Time, bool) {
 	raw, err := os.ReadFile(filepath.Join(base, "auth.json"))
 	if err != nil {
@@ -166,12 +170,6 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		}
 	}
 
-	var latest time.Time
-	consider := func(t time.Time, ok bool) {
-		if ok && t.After(latest) {
-			latest = t
-		}
-	}
 	fromRFC3339 := func(s string) (time.Time, bool) {
 		if s == "" {
 			return time.Time{}, false
@@ -192,7 +190,10 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 
 	// Scoped/keyed format (current): a top-level map of issuer::client → entry.
 	// A flat auth.json fails this unmarshal (its string values don't fit the
-	// struct), so we fall through to the flat shape below.
+	// struct), so we fall through to the flat shape below. Walk keys in the same
+	// sorted order readGrokScopedAuthClaims uses to pick the account, and return
+	// the expiry of the FIRST entry that carries one — the scope Grok will
+	// actually present — instead of the max across unrelated siblings.
 	var scoped map[string]struct {
 		ExpiresAt   string `json:"expires_at"`
 		Key         string `json:"key"`
@@ -200,14 +201,25 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		IDToken     string `json:"id_token"`
 		AccessToken string `json:"access_token"`
 	}
-	if json.Unmarshal(raw, &scoped) == nil {
-		for _, v := range scoped {
-			consider(fromRFC3339(v.ExpiresAt))
-			consider(fromJWT(firstNonEmpty(v.Key, v.Token, v.IDToken, v.AccessToken)))
+	if json.Unmarshal(raw, &scoped) == nil && len(scoped) > 0 {
+		keys := make([]string, 0, len(scoped))
+		for k := range scoped {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			v := scoped[k]
+			if t, ok := fromRFC3339(v.ExpiresAt); ok {
+				return t, true
+			}
+			if t, ok := fromJWT(firstNonEmpty(v.Key, v.Token, v.IDToken, v.AccessToken)); ok {
+				return t, true
+			}
 		}
 	}
 
-	// Flat / legacy format: top-level `expires_at` and/or a cached_token JWT.
+	// Flat / legacy format: top-level `expires_at` and/or a cached_token JWT —
+	// a single account, so preferring `expires_at` then the JWT is unambiguous.
 	var flat struct {
 		ExpiresAt   string `json:"expires_at"`
 		CachedToken struct {
@@ -216,14 +228,15 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		} `json:"cached_token"`
 	}
 	if json.Unmarshal(raw, &flat) == nil {
-		consider(fromRFC3339(flat.ExpiresAt))
-		consider(fromJWT(firstNonEmpty(flat.CachedToken.IDToken, flat.CachedToken.AccessToken)))
+		if t, ok := fromRFC3339(flat.ExpiresAt); ok {
+			return t, true
+		}
+		if t, ok := fromJWT(firstNonEmpty(flat.CachedToken.IDToken, flat.CachedToken.AccessToken)); ok {
+			return t, true
+		}
 	}
 
-	if latest.IsZero() {
-		return time.Time{}, false
-	}
-	return latest, true
+	return time.Time{}, false
 }
 
 // grokAuthNotice returns a card-level notice + severity when the local Grok
