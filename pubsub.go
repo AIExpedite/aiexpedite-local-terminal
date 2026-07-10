@@ -1412,10 +1412,9 @@ func runPubSubConnection(cfg *Config) error {
 			// Show approval dialog
 			result := ShowCommandApprovalDialog(cmd.Command, cmd.Args, timeoutSec)
 
-			// Handle timeout based on config
-			if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
-				result = ApprovalOnce
-			}
+			// Resolve the allow-on-timeout policy — deliberately NOT honored for
+			// destructive Environment Setup steps (see applyTimeoutPolicy).
+			result = applyTimeoutPolicy(result, cfg, cmd)
 
 			switch result {
 			case ApprovalDeny:
@@ -2685,6 +2684,22 @@ func shouldGateExecuteCommand(cfg *Config, al *AllowList, cmd string, args []str
 // HMAC-signed (see signaturePayload) so it cannot be stripped to skip the gate.
 func requiresNativeApprovalForStep(cmd commandMsg) bool {
 	return cmd.RiskLevel == "destructive"
+}
+
+// applyTimeoutPolicy resolves a native-approval dialog result under the
+// operator's allow-on-timeout setting. A timeout (or explicit deny) is upgraded
+// to a one-time approval ONLY when allow-on-timeout is configured AND the step
+// is not a destructive Environment Setup step. Destructive cleanup/delete steps
+// must never auto-approve on an unattended dialog, so for them a deny stays a
+// deny regardless of the allow-on-timeout convenience — matching the feature's
+// safety model (destructive requires an explicit local confirmation).
+func applyTimeoutPolicy(result ApprovalResult, cfg *Config, cmd commandMsg) ApprovalResult {
+	if result == ApprovalDeny &&
+		cfg.ApprovalTimeoutAction == "allow" &&
+		!requiresNativeApprovalForStep(cmd) {
+		return ApprovalOnce
+	}
+	return result
 }
 
 // gateSessionEntryCommand applies the allowlist + user-approval dialog flow

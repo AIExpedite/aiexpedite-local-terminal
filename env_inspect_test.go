@@ -34,6 +34,33 @@ func TestRequiresNativeApprovalForStep(t *testing.T) {
 	}
 }
 
+func TestApplyTimeoutPolicy_DestructiveNeverAutoApprovedOnTimeout(t *testing.T) {
+	allowOnTimeout := &Config{ApprovalTimeoutAction: "allow"}
+	denyOnTimeout := &Config{ApprovalTimeoutAction: "deny"}
+
+	// Destructive step + allow-on-timeout: a timeout/deny MUST stay denied.
+	destructive := commandMsg{RiskLevel: "destructive"}
+	if got := applyTimeoutPolicy(ApprovalDeny, allowOnTimeout, destructive); got != ApprovalDeny {
+		t.Errorf("destructive step must stay denied on timeout even with allow-on-timeout, got %v", got)
+	}
+
+	// Non-destructive step + allow-on-timeout: timeout upgrades to a one-time approval.
+	safe := commandMsg{RiskLevel: "safe_write"}
+	if got := applyTimeoutPolicy(ApprovalDeny, allowOnTimeout, safe); got != ApprovalOnce {
+		t.Errorf("safe_write step should auto-approve on timeout with allow-on-timeout, got %v", got)
+	}
+
+	// deny-on-timeout: nothing is ever upgraded.
+	if got := applyTimeoutPolicy(ApprovalDeny, denyOnTimeout, safe); got != ApprovalDeny {
+		t.Errorf("deny-on-timeout config must keep a deny, got %v", got)
+	}
+
+	// An explicit approval is passed through unchanged.
+	if got := applyTimeoutPolicy(ApprovalOnce, allowOnTimeout, destructive); got != ApprovalOnce {
+		t.Errorf("an explicit approval should pass through, got %v", got)
+	}
+}
+
 // helper: recompute the canonical signature bytes the agent verifies against.
 func canonicalSig(t *testing.T, cmd commandMsg, secret string) (string, string) {
 	t.Helper()
