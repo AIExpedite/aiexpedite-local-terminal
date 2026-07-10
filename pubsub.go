@@ -438,15 +438,22 @@ func isSigFailRateLimited() bool {
 // still matches. Only the new __cli_usage_refresh__ command carries the
 // field, and both ends include it.
 type signaturePayload struct {
-	ID              string          `json:"id"`
-	Command         string          `json:"command"`
-	Args            []string        `json:"args"`
-	Ts              int64           `json:"ts"`
-	Type            string          `json:"type"`
-	SessionID       string          `json:"sessionID"`
-	Input           string          `json:"input"`
-	Signal          string          `json:"signal"`
-	RefreshID       string          `json:"refreshId,omitempty"`
+	ID        string   `json:"id"`
+	Command   string   `json:"command"`
+	Args      []string `json:"args"`
+	Ts        int64    `json:"ts"`
+	Type      string   `json:"type"`
+	SessionID string   `json:"sessionID"`
+	Input     string   `json:"input"`
+	Signal    string   `json:"signal"`
+	RefreshID string   `json:"refreshId,omitempty"`
+	// riskLevel is signed and omitempty so non-env-setup commands (which never
+	// carry one) produce the identical canonical JSON as the pre-riskLevel
+	// format — preserving signature compatibility across the agent/service
+	// upgrade window, exactly like refreshId. Only env-setup steps set it, and
+	// both ends include it. Signing it prevents a "destructive"→"" downgrade
+	// that would skip native approval.
+	RiskLevel       string          `json:"riskLevel,omitempty"`
 	CliAgentCatalog json.RawMessage `json:"cliAgentCatalog,omitempty"`
 }
 
@@ -470,6 +477,7 @@ func verifySignature(cmd commandMsg, secret string) bool {
 		Input:           cmd.Input,
 		Signal:          cmd.Signal,
 		RefreshID:       cmd.RefreshID,
+		RiskLevel:       cmd.RiskLevel,
 		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
 	}
 
@@ -530,6 +538,15 @@ func pubSubMessageSizeLimit(cmd commandMsg) int {
 	return maxPubSubCommandMessageBytes
 }
 
+// isInternalDemandCommand reports whether cmd is a server-internal, read-only
+// demand command (CLI-usage refresh or environment inspection). These are
+// exempt from staleness and rate-limiting because they are dispatched by the
+// backend's own state machines (not the LLM) and MUST always run so the
+// correlated result clears the backend's in-flight / pending marker.
+func isInternalDemandCommand(command string) bool {
+	return command == "__cli_usage_refresh__" || command == "__env_inspect__"
+}
+
 func commandPayloadTooLargeMessage(sizeBytes, limitBytes int) string {
 	return fmt.Sprintf("Command rejected: payload size %d bytes exceeds %d byte limit", sizeBytes, limitBytes)
 }
@@ -559,6 +576,15 @@ type commandMsg struct {
 	SessionID string `json:"sessionID,omitempty"` // Unique session identifier
 	Input     string `json:"input,omitempty"`     // stdin text for session_input; raw JSON-RPC frame for codex_appserver_send / grok_acp_send
 	Signal    string `json:"signal,omitempty"`    // "interrupt"|"kill" for session_signal
+
+	// Environment Setup plan attribution + risk. RiskLevel is SIGNED (see
+	// signaturePayload) so an attacker who can alter a signed command cannot
+	// downgrade a "destructive" step to bypass the on-device native approval
+	// dialog. PlanID/StepID are unsigned correlation metadata for the audit
+	// trail (like WorkspaceID/UID, which are also unsigned).
+	RiskLevel string `json:"riskLevel,omitempty"` // env-setup step risk (mirrors shared-constants RISK_LEVELS)
+	PlanID    string `json:"planId,omitempty"`    // env-setup plan id (audit correlation)
+	StepID    string `json:"stepId,omitempty"`    // env-setup step id (audit correlation)
 
 	rawCliAgentCatalog json.RawMessage
 }
@@ -635,6 +661,13 @@ type resultMsg struct {
 	// poll down the handled-failure path.
 	CliAgents []cliAgentUsage      `json:"cliAgents"`
 	Errors    []cliAgentUsageError `json:"errors,omitempty"`
+
+	// __env_inspect_result__ payload — populated only when
+	// Type == "__env_inspect_result__". Carries the read-only workstation
+	// readiness report (state + friendly findings + full specs) for the
+	// Environment Setup capability. Echoes RefreshID so terminal-service can
+	// correlate the response with its pending inspection request.
+	Readiness *ReadinessReport `json:"readiness,omitempty"`
 }
 
 /*
@@ -856,6 +889,59 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 		return err
 	}
 	return nil
+}
+
+// handleEnvInspectCommand fulfils a read-only __env_inspect__ demand command
+// from terminal-service's Environment Setup flow. It gathers full machine info,
+// derives a friendly readiness report, and publishes an __env_inspect_result__
+// carrying the report + echoing RefreshID for correlation. Read-only — never
+// mutates the workstation, so no allowlist/approval gating applies.
+//
+// Modeled on handleCLIUsageRefreshCommand: always publishes a result (even on
+// panic) so the backend's pending-inspection marker is never orphaned, and
+// returns non-nil only when the publish itself failed (caller nacks so Pub/Sub
+// redelivers).
+func handleEnvInspectCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) (publishErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("%s[pubsub] panic in env inspect handler: %v%s\n", colorRed, r, colorReset)
+			res := makeEnvInspectResult(cmd, cfg, evaluateReadiness(nil))
+			if err := publishMsg(ctx, topic, res); err != nil {
+				publishErr = err
+			}
+		}
+	}()
+
+	// Bound the gather so a hung probe can't stall the inspection round trip.
+	gatherCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	report := GatherReadinessOnly(gatherCtx)
+	res := makeEnvInspectResult(cmd, cfg, report)
+	if err := publishMsg(ctx, topic, res); err != nil {
+		fmt.Printf("%s[pubsub] Failed to publish env inspect result: %v%s\n", colorRed, err, colorReset)
+		return err
+	}
+	return nil
+}
+
+func makeEnvInspectResult(cmd commandMsg, cfg *Config, report ReadinessReport) resultMsg {
+	agentID := cmd.AgentID
+	if cfg != nil && cfg.AgentID != "" {
+		agentID = cfg.AgentID
+	}
+	return resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		AgentID:     agentID,
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "__env_inspect_result__",
+		RefreshID:   cmd.RefreshID,
+		Status:      "success",
+		Readiness:   &report,
+	}
 }
 
 func makeCLIUsageRefreshFailureResult(cmd commandMsg, cfg *Config, message string) resultMsg {
@@ -1136,12 +1222,12 @@ func runPubSubConnection(cfg *Config) error {
 		// Reject commands older than maxCommandAgeSec to prevent processing
 		// stale queued commands when terminal reconnects after being offline.
 		//
-		// Exempt __cli_usage_refresh__: it's a server-internal command that
-		// MUST always publish a __cli_usage_refresh_result__ carrying the
-		// refreshId so the backend can clear cliUsageInFlightRefreshId.
-		// Emitting a generic "stale" rejection here would orphan the in-flight
-		// marker and block the active loop until its 60s timeout.
-		if cmd.Command != "__cli_usage_refresh__" && isCommandStale(cmd.Ts) {
+		// Exempt server-internal demand commands (__cli_usage_refresh__,
+		// __env_inspect__): they MUST always publish a correlated result
+		// carrying refreshId so the backend can clear its in-flight / pending
+		// marker. A generic "stale" rejection here would orphan that marker and
+		// block the loop until its timeout. See isInternalDemandCommand.
+		if !isInternalDemandCommand(cmd.Command) && isCommandStale(cmd.Ts) {
 			ageSec := (time.Now().UnixMilli() - cmd.Ts) / 1000
 			fmt.Printf("%s[aiexpedite] Stale command rejected (age: %ds, max: %ds)%s\n",
 				colorYellow, ageSec, maxCommandAgeSec, colorReset)
@@ -1164,10 +1250,10 @@ func runPubSubConnection(cfg *Config) error {
 		// ─────────────────────────────────────────────────────────────────
 
 		// ─── Per-UID Rate Limiting ─────────────────────────────────────────
-		// Exempt __cli_usage_refresh__ for the same reason as the staleness
-		// check above — a "rate_limited" rejection would not carry refreshId
-		// and would orphan the backend's cliUsageInFlightRefreshId.
-		if cmd.Command != "__cli_usage_refresh__" && !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
+		// Exempt server-internal demand commands for the same reason as the
+		// staleness check above — a "rate_limited" rejection would not carry
+		// refreshId and would orphan the backend's in-flight / pending marker.
+		if !isInternalDemandCommand(cmd.Command) && !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
 			fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
 
 			// Send rate_limited response back to user for immediate feedback
@@ -1274,6 +1360,21 @@ func runPubSubConnection(cfg *Config) error {
 			return
 		}
 
+		if cmd.Command == "__env_inspect__" {
+			// Read-only workstation inspection for the Environment Setup
+			// capability. Gathers machine info + readiness verdict and
+			// publishes an __env_inspect_result__ carrying the report. Like
+			// __cli_usage_refresh__ it always publishes a result so the
+			// backend's pending marker never sticks; nack on publish failure
+			// so Pub/Sub redelivers.
+			if err := handleEnvInspectCommand(ctx, topic, cmd, cfg); err != nil {
+				m.Nack()
+			} else {
+				m.Ack()
+			}
+			return
+		}
+
 		// ─── Interactive Session Routing ─────────────────────────────────
 		// Route session_* and codex_appserver_* commands to their respective
 		// managers instead of shell execution. Long-running entry-point
@@ -1293,8 +1394,14 @@ func runPubSubConnection(cfg *Config) error {
 		// ─────────────────────────────────────────────────────────────────
 
 		// ─── Command Allow List Validation ───────────────────────────────
-		if shouldGateExecuteCommand(cfg, defaultAllowList, cmd.Command, cmd.Args) {
-			// Command not in allow list - show approval dialog
+		// A high-risk (destructive) Environment Setup step ALWAYS shows the
+		// native approval dialog — in addition to the chat-side scoped
+		// confirmation the backend already enforced — even if the raw command
+		// would otherwise be allowlisted. The riskLevel is HMAC-signed so it
+		// can't be stripped to skip this gate. See requiresNativeApprovalForStep.
+		if shouldGateExecuteCommand(cfg, defaultAllowList, cmd.Command, cmd.Args) ||
+			requiresNativeApprovalForStep(cmd) {
+			// Command not in allow list (or high-risk step) - show approval dialog
 
 			// Get timeout settings from config
 			timeoutSec := cfg.ApprovalTimeoutSec
@@ -2567,6 +2674,17 @@ func shouldGateExecuteCommand(cfg *Config, al *AllowList, cmd string, args []str
 		return false
 	}
 	return !al.IsAllowed(cmd, args)
+}
+
+// requiresNativeApprovalForStep forces the on-device native approval dialog for
+// a high-risk Environment Setup step regardless of the allow-list or the
+// AllowAllCommands override. Destructive steps (disk cleanup, permanent
+// deletion, broad package updates) require BOTH the chat-side scoped
+// confirmation (enforced server-side by terminal-service's approval gate) AND
+// this native approval, per the feature's safety model. The riskLevel is
+// HMAC-signed (see signaturePayload) so it cannot be stripped to skip the gate.
+func requiresNativeApprovalForStep(cmd commandMsg) bool {
+	return cmd.RiskLevel == "destructive"
 }
 
 // gateSessionEntryCommand applies the allowlist + user-approval dialog flow
