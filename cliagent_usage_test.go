@@ -1019,11 +1019,11 @@ func TestGrokUsageParser_ScopedInstallerAuthFile(t *testing.T) {
 }
 
 // TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry pins that when auth.json
-// holds multiple scoped entries, the expiry check follows the SAME entry the
-// account resolver selects (first key in sorted order) rather than borrowing the
-// latest expiry from a sibling. Grok presents the selected scoped token, so an
-// expired selected entry must surface even if a fresher legacy sibling exists —
-// otherwise the re-login warning would be wrongly suppressed.
+// holds multiple scoped entries, the expiry check follows the SAME entry Grok's
+// resolver selects rather than borrowing the latest expiry from a sibling. Grok
+// presents the selected scoped token, so an expired selected entry must surface
+// even if a fresher sibling exists — otherwise the re-login warning would be
+// wrongly suppressed.
 func TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry(t *testing.T) {
 	t.Setenv("GROK_HOME", "")
 	home := t.TempDir()
@@ -1049,6 +1049,42 @@ func TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry(t *testing.T) {
 	}
 	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
 		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt tied to the selected scope", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+// TestGrokUsageParser_ScopedExpiryPrefersOIDCOverLegacy pins Grok's REAL scope
+// precedence with the official scope keys. The legacy sign-in scope
+// ("https://accounts.x.ai/sign-in") sorts alphabetically BEFORE the OIDC scope
+// ("https://auth.x.ai::..."), but read_grok_token in x.ai/cli/install.sh resolves
+// OIDC first and only falls back to legacy. So a valid legacy sibling must NOT
+// mask an expired OIDC token: expiry must be read from the OIDC entry Grok will
+// actually present, surfacing the re-login warning.
+func TestGrokUsageParser_ScopedExpiryPrefersOIDCOverLegacy(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// OIDC scope (resolved first) — expired two weeks ago.
+		"https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+		// Legacy scope — sorts first alphabetically and is still valid, but Grok
+		// only falls back to it when the OIDC token is absent.
+		"https://accounts.x.ai/sign-in": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt from the OIDC scope, not a healthy read from the legacy sibling", usage.Notice, usage.NoticeSeverity)
 	}
 }
 

@@ -18,8 +18,46 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
+
+// Grok's own token resolver (read_grok_token in https://x.ai/cli/install.sh)
+// prefers the OIDC scope and only falls back to the legacy sign-in scope, so we
+// must read the expiry/identity from the SAME scoped token Grok will present.
+// A plain alphabetical sort is wrong here: "accounts.x.ai" (legacy) sorts before
+// "auth.x.ai" (OIDC), which would pick the legacy sibling and let a stale OIDC
+// token slip through — the very case a re-login warning exists to catch.
+const (
+	grokOIDCScopePrefix   = "https://auth.x.ai"
+	grokLegacyScopePrefix = "https://accounts.x.ai"
+)
+
+// grokScopeKeysByPrecedence orders auth.json scope keys the way Grok resolves a
+// token: OIDC scope first, legacy sign-in scope next, then any other keys in
+// stable alphabetical order. Callers walk the result and take the first entry
+// that carries a usable token, mirroring the installer's OIDC-then-legacy
+// fallback instead of aggregating unrelated siblings.
+func grokScopeKeysByPrecedence(keys []string) []string {
+	rank := func(k string) int {
+		switch {
+		case strings.HasPrefix(k, grokOIDCScopePrefix):
+			return 0
+		case strings.HasPrefix(k, grokLegacyScopePrefix):
+			return 1
+		default:
+			return 2
+		}
+	}
+	ordered := append([]string(nil), keys...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ri, rj := rank(ordered[i]), rank(ordered[j]); ri != rj {
+			return ri < rj
+		}
+		return ordered[i] < ordered[j]
+	})
+	return ordered
+}
 
 type grokUsageParser struct{}
 
@@ -155,12 +193,12 @@ type grokTokenExpClaims struct {
 // $GROK_HOME/auth.json. The current CLI keys the file by
 // "<oidc_issuer>::<client_id>" with an RFC3339 `expires_at` per entry; older
 // layouts store a flat top-level `expires_at` or only a JWT whose `exp` claim we
-// fall back to. For the scoped format we tie the expiry to the SAME entry
-// readGrokAccountAndPlan/readGrokScopedAuthClaims select — the first key in
-// sorted order — rather than aggregating siblings: Grok presents that one scoped
-// token, so a fresher sibling must not mask it when it is stale (and a re-login
-// rewrites the selected entry, so keying off it still clears a resolved warning).
-// Best-effort: (zero, false) when nothing is readable.
+// fall back to. For the scoped format we tie the expiry to the SAME entry Grok's
+// resolver selects — the OIDC scope first, then the legacy sign-in scope (see
+// grokScopeKeysByPrecedence) — rather than aggregating siblings: Grok presents
+// that one scoped token, so a fresher sibling must not mask it when it is stale
+// (and a re-login rewrites the selected entry, so keying off it still clears a
+// resolved warning). Best-effort: (zero, false) when nothing is readable.
 func readGrokAuthExpiry(base string) (time.Time, bool) {
 	raw, err := os.ReadFile(filepath.Join(base, "auth.json"))
 	if err != nil {
@@ -190,10 +228,10 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 
 	// Scoped/keyed format (current): a top-level map of issuer::client → entry.
 	// A flat auth.json fails this unmarshal (its string values don't fit the
-	// struct), so we fall through to the flat shape below. Walk keys in the same
-	// sorted order readGrokScopedAuthClaims uses to pick the account, and return
-	// the expiry of the FIRST entry that carries one — the scope Grok will
-	// actually present — instead of the max across unrelated siblings.
+	// struct), so we fall through to the flat shape below. Walk keys in Grok's
+	// own resolution order (OIDC scope, then legacy) and return the expiry of the
+	// FIRST entry that carries one — the scope Grok will actually present —
+	// instead of the max across unrelated siblings.
 	var scoped map[string]struct {
 		ExpiresAt   string `json:"expires_at"`
 		Key         string `json:"key"`
@@ -206,8 +244,7 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		for k := range scoped {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
-		for _, k := range keys {
+		for _, k := range grokScopeKeysByPrecedence(keys) {
 			v := scoped[k]
 			if t, ok := fromRFC3339(v.ExpiresAt); ok {
 				return t, true
@@ -344,7 +381,9 @@ func currentGrokAccountFingerprint() string {
 
 // readGrokScopedAuthClaims decodes the installer-produced `auth.json`, whose
 // top level is keyed by auth scope (e.g. `grok-cli`) and whose values wrap a
-// JWT under `key`. Returns the JWT claims from the first non-empty token.
+// JWT under `key`. Returns the JWT claims from the first non-empty token, walked
+// in Grok's own scope-resolution order (grokScopeKeysByPrecedence) so identity
+// and expiry come from the SAME entry Grok will present.
 func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 	var claims grokIDTokenClaims
 	raw, err := os.ReadFile(path)
@@ -362,8 +401,7 @@ func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 	for k := range scoped {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
-	for _, k := range keys {
+	for _, k := range grokScopeKeysByPrecedence(keys) {
 		v := scoped[k]
 		token := firstNonEmpty(v.Key, v.Token)
 		if token == "" {
