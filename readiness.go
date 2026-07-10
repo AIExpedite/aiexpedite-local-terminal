@@ -69,13 +69,13 @@ type ReadinessReport struct {
 // Dev repos and package caches can live on any drive, so the most permissive
 // volume is the fair capacity signal; 0 when no disk info was gathered.
 func maxFreeDiskGB(disks []diskEntry) float64 {
-	max := 0.0
+	maxFree := 0.0
 	for _, d := range disks {
-		if d.FreeGB > max {
-			max = d.FreeGB
+		if d.FreeGB > maxFree {
+			maxFree = d.FreeGB
 		}
 	}
-	return max
+	return maxFree
 }
 
 // evaluateReadiness derives a readiness verdict from gathered machine info.
