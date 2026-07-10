@@ -246,10 +246,19 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		}
 		for _, k := range grokScopeKeysByPrecedence(keys) {
 			v := scoped[k]
+			// Mirror read_grok_token (and readGrokScopedAuthClaims): a scope is only
+			// usable when it carries a non-empty token. Skip metadata/empty-key
+			// entries so a tokenless preferred (OIDC) scope can't surface its
+			// `expires_at` and mask the health of the legacy scope Grok will
+			// actually present.
+			token := firstNonEmpty(v.Key, v.Token, v.IDToken, v.AccessToken)
+			if token == "" {
+				continue
+			}
 			if t, ok := fromRFC3339(v.ExpiresAt); ok {
 				return t, true
 			}
-			if t, ok := fromJWT(firstNonEmpty(v.Key, v.Token, v.IDToken, v.AccessToken)); ok {
+			if t, ok := fromJWT(token); ok {
 				return t, true
 			}
 		}

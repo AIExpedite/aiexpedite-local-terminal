@@ -888,7 +888,14 @@ func TestGrokUsageParser_CachedTokenAuthFile(t *testing.T) {
 // "<oidc_issuer>::<client_id>" and stamps each with an RFC3339 `expires_at`.
 func helperWriteGrokScopedAuth(t *testing.T, home string, expiresAt time.Time, extra map[string]any) {
 	t.Helper()
-	entry := map[string]any{"email": "rick@example.com"}
+	// Real installer-written scoped entries always carry the token under `key`
+	// (what read_grok_token extracts); include one so the entry is treated as a
+	// usable scope. `expires_at` still drives the notice (RFC3339 is read before
+	// the JWT fallback in readGrokAuthExpiry).
+	entry := map[string]any{
+		"email": "rick@example.com",
+		"key":   helperJWT(t, map[string]any{"email": "rick@example.com"}),
+	}
 	if !expiresAt.IsZero() {
 		entry["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
 	}
@@ -1085,6 +1092,41 @@ func TestGrokUsageParser_ScopedExpiryPrefersOIDCOverLegacy(t *testing.T) {
 	}
 	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
 		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt from the OIDC scope, not a healthy read from the legacy sibling", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+// TestGrokUsageParser_ScopedExpirySkipsTokenlessEntry pins that a preferred
+// (OIDC) scope left as metadata with an empty key does NOT get its `expires_at`
+// read: read_grok_token only treats a scope as usable when it can extract a
+// non-empty token, so the health must come from the legacy entry that actually
+// carries the token Grok will present. Here the tokenless OIDC entry looks valid
+// for a month while the real (legacy) token is expired — the expired warning
+// must still surface.
+func TestGrokUsageParser_ScopedExpirySkipsTokenlessEntry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// OIDC scope (resolved first) but tokenless — only metadata + a fresh
+		// expires_at. Grok can't use it, so its expiry must be ignored.
+		"https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+		// Legacy scope carries the token Grok actually presents — and it is expired.
+		"https://accounts.x.ai/sign-in": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt from the token-bearing legacy scope, not a healthy read from the tokenless OIDC entry", usage.Notice, usage.NoticeSeverity)
 	}
 }
 
