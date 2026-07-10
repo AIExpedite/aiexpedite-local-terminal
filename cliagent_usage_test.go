@@ -1323,6 +1323,42 @@ func TestGrokUsageParser_ScopedExpiryPrefersExactCLIScopeOverSiblingOIDCHost(t *
 	}
 }
 
+// TestGrokUsageParser_ScopedExpiryPrefersLegacyOverUnrelatedOIDCSibling pins that
+// when there is NO exact CLI OIDC entry, the legacy sign-in scope outranks an
+// unrelated "https://auth.x.ai::<other-client>" sibling. read_grok_token resolves
+// only OIDC_SCOPE then LEGACY_SCOPE (x.ai/cli/install.sh) — it never scans other
+// auth.x.ai keys — so a valid sibling for a different xAI client must NOT mask an
+// expired legacy token Grok will actually fall back to. Here the sibling is fresh
+// while the legacy token is expired: the expired warning must still surface.
+func TestGrokUsageParser_ScopedExpiryPrefersLegacyOverUnrelatedOIDCSibling(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// A different xAI client sharing the auth.x.ai host — valid, but Grok's
+		// resolver never presents it (only the exact OIDC scope, then legacy).
+		"https://auth.x.ai::00000000-0000-0000-0000-000000000000": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+		// Legacy scope carries the token Grok falls back to — and it is expired.
+		"https://accounts.x.ai/sign-in": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt from the legacy scope Grok falls back to, not a healthy read from the unrelated OIDC-host sibling", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
 func TestGrokUsageParser_HonorsGrokHomeEnv(t *testing.T) {
 	home := t.TempDir()
 	grokHome := t.TempDir()
