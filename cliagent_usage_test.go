@@ -212,6 +212,43 @@ func TestClaudeCodeUsageParser_NoFileNoKeychainNoNotice(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeUsageParser_KeychainSkippedForCustomConfigDir(t *testing.T) {
+	// On macOS the "Claude Code-credentials" Keychain item is a single shared
+	// entry for the DEFAULT account. When a non-default CLAUDE_CONFIG_DIR selects
+	// a side-by-side profile whose .credentials.json is absent, the parser must
+	// NOT fall back to that Keychain item — doing so would misattribute the
+	// default account's identity/auth-expiry to the profile.
+	configDir := t.TempDir() // custom profile, no .credentials.json on disk
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	now := time.Now()
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	keychainRead := false
+	raw, _ := json.Marshal(map[string]any{
+		"email": "default-account@example.com",
+		"claudeAiOauth": map[string]any{
+			"refreshTokenExpiresAt": now.Add(-time.Hour).UnixMilli(), // expired
+		},
+	})
+	claudeKeychainReader = func() ([]byte, bool) { keychainRead = true; return raw, true }
+
+	usage, ok := claudeCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected baseline usage entry")
+	}
+	if keychainRead {
+		t.Errorf("Keychain must not be consulted for a non-default CLAUDE_CONFIG_DIR profile")
+	}
+	if usage.Account != "" {
+		t.Errorf("Account=%q, want empty (default-account keychain credential must not leak into a custom profile)", usage.Account)
+	}
+	if usage.Notice != "" {
+		t.Errorf("Notice=%q, want empty (must not surface the default account's expiry for a custom profile)", usage.Notice)
+	}
+}
+
 func TestClaudeCodeUsageParser_HonorsClaudeConfigDir(t *testing.T) {
 	home := t.TempDir()
 	configDir := t.TempDir()
