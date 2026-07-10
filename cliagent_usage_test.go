@@ -877,6 +877,152 @@ func TestGrokUsageParser_CachedTokenAuthFile(t *testing.T) {
 			t.Errorf("metric %q should be Unknown (no observable counter)", m.Kind)
 		}
 	}
+	// A bare identity-only fixture (no expires_at / token) must not raise a
+	// false auth notice — we only warn on a DEFINITE expiry.
+	if usage.Notice != "" {
+		t.Errorf("unexpected notice for identity-only auth: %q", usage.Notice)
+	}
+}
+
+// Grok's on-disk `auth.json` (current CLI) keys entries by
+// "<oidc_issuer>::<client_id>" and stamps each with an RFC3339 `expires_at`.
+func helperWriteGrokScopedAuth(t *testing.T, home string, expiresAt time.Time, extra map[string]any) {
+	t.Helper()
+	// Real installer-written scoped entries always carry the token under `key`
+	// (what read_grok_token extracts); include one so the entry is treated as a
+	// usable scope. `expires_at` still drives the notice (RFC3339 is read before
+	// the JWT fallback in readGrokAuthExpiry).
+	entry := map[string]any{
+		"email": "rick@example.com",
+		"key":   helperJWT(t, map[string]any{"email": "rick@example.com"}),
+	}
+	if !expiresAt.IsZero() {
+		entry["expires_at"] = expiresAt.UTC().Format(time.RFC3339)
+	}
+	for k, v := range extra {
+		entry[k] = v
+	}
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		"https://auth.x.ai::client-1": entry,
+	})
+}
+
+func TestGrokUsageParser_AuthExpiredNotice(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteGrokScopedAuth(t, home, now.Add(-14*24*time.Hour), nil) // expired 2 weeks ago
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" {
+		t.Errorf("NoticeSeverity=%q, want error", usage.NoticeSeverity)
+	}
+	if !strings.Contains(usage.Notice, "expired") || !strings.Contains(usage.Notice, "grok login") {
+		t.Errorf("Notice=%q, want an expired re-login prompt", usage.Notice)
+	}
+}
+
+func TestGrokUsageParser_AuthExpiringSoonNotice(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteGrokScopedAuth(t, home, now.Add(6*time.Hour), nil) // within the 24h warn window
+
+	usage, _ := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.NoticeSeverity != "warning" {
+		t.Errorf("NoticeSeverity=%q, want warning", usage.NoticeSeverity)
+	}
+	if !strings.Contains(usage.Notice, "expires soon") {
+		t.Errorf("Notice=%q, want an expiring-soon prompt", usage.Notice)
+	}
+}
+
+// A reached usage limit blocks requests right now, while an expiring-soon login
+// is only a heads-up (the token still works) — so the reached-quota error must
+// win over the auth warning instead of being suppressed by it.
+func TestGrokUsageParser_ReachedLimitBeatsExpiringSoonAuth(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteGrokScopedAuth(t, home, now.Add(6*time.Hour), nil) // within the 24h warn window
+
+	cache := filepath.Join(t.TempDir(), "grok_usage_limit.json")
+	t.Setenv("AIEXPEDITE_GROK_LIMIT_CACHE", cache)
+	helperWriteJSON(t, cache, map[string]any{
+		"severity":           grokLimitReached,
+		"message":            "Grok usage limit reached — upgrade to keep going.",
+		"upgradeUrl":         "https://x.ai/upgrade",
+		"observedAt":         now.UTC().Format(time.RFC3339),
+		"observedAtMs":       now.UnixMilli(),
+		"accountFingerprint": fingerprintAccount("grok", "rick@example.com"),
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" {
+		t.Errorf("NoticeSeverity=%q, want error (reached quota must not be hidden by an expiring-soon auth warning)", usage.NoticeSeverity)
+	}
+	if !strings.Contains(usage.Notice, "usage limit reached") {
+		t.Errorf("Notice=%q, want the reached usage-limit banner, not the re-login heads-up", usage.Notice)
+	}
+	if usage.NoticeURL != "https://x.ai/upgrade" {
+		t.Errorf("NoticeURL=%q, want the upgrade URL preserved from the cached limit state", usage.NoticeURL)
+	}
+}
+
+// Expired/missing auth DOES block every request and can't be re-established
+// headlessly, so it still takes precedence even over a reached usage limit.
+func TestGrokUsageParser_ExpiredAuthBeatsReachedLimit(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteGrokScopedAuth(t, home, now.Add(-time.Hour), nil) // already expired
+
+	cache := filepath.Join(t.TempDir(), "grok_usage_limit.json")
+	t.Setenv("AIEXPEDITE_GROK_LIMIT_CACHE", cache)
+	helperWriteJSON(t, cache, map[string]any{
+		"severity":           grokLimitReached,
+		"message":            "Grok usage limit reached — upgrade to keep going.",
+		"observedAt":         now.UTC().Format(time.RFC3339),
+		"observedAtMs":       now.UnixMilli(),
+		"accountFingerprint": fingerprintAccount("grok", "rick@example.com"),
+	})
+
+	usage, _ := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want the expired re-login prompt to win — it blocks requests and can't be fixed headlessly", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+func TestGrokUsageParser_AuthValidNoNotice(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteGrokScopedAuth(t, home, now.Add(30*24*time.Hour), nil) // valid for a month
+
+	usage, _ := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Notice != "" {
+		t.Errorf("expected no auth notice for a valid token, got %q", usage.Notice)
+	}
+}
+
+func TestGrokUsageParser_AuthMissingNotice(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir() // no ~/.grok/auth.json at all
+	now := time.Now()
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected a usage entry even without auth")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+		t.Errorf("Notice=%q sev=%q, want a 'not signed in' error", usage.Notice, usage.NoticeSeverity)
+	}
 }
 
 func TestGrokUsageParser_LegacyCachedTokenLayout(t *testing.T) {
@@ -935,6 +1081,281 @@ func TestGrokUsageParser_ScopedInstallerAuthFile(t *testing.T) {
 	}
 	if usage.AccountFingerprint == "" {
 		t.Errorf("expected fingerprint for scoped account")
+	}
+}
+
+// TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry pins that when auth.json
+// holds multiple scoped entries, the expiry check follows the SAME entry Grok's
+// resolver selects rather than borrowing the latest expiry from a sibling. Grok
+// presents the selected scoped token, so an expired selected entry must surface
+// even if a fresher sibling exists — otherwise the re-login warning would be
+// wrongly suppressed.
+func TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	// "aaa::selected" sorts before "zzz::legacy"; the selected scope is expired
+	// while the fresher sibling is valid for a month.
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		"aaa::selected": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+		"zzz::legacy": map[string]any{
+			"email":      "old-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "old-grok@example.com"}),
+			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt tied to the selected scope", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+// TestGrokUsageParser_ScopedExpiryPrefersOIDCOverLegacy pins Grok's REAL scope
+// precedence with the official scope keys. The legacy sign-in scope
+// ("https://accounts.x.ai/sign-in") sorts alphabetically BEFORE the OIDC scope
+// ("https://auth.x.ai::..."), but read_grok_token in x.ai/cli/install.sh resolves
+// OIDC first and only falls back to legacy. So a valid legacy sibling must NOT
+// mask an expired OIDC token: expiry must be read from the OIDC entry Grok will
+// actually present, surfacing the re-login warning.
+func TestGrokUsageParser_ScopedExpiryPrefersOIDCOverLegacy(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// OIDC scope (resolved first) — expired two weeks ago.
+		"https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+		// Legacy scope — sorts first alphabetically and is still valid, but Grok
+		// only falls back to it when the OIDC token is absent.
+		"https://accounts.x.ai/sign-in": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt from the OIDC scope, not a healthy read from the legacy sibling", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+// TestGrokUsageParser_ScopedExpirySkipsTokenlessEntry pins that a preferred
+// (OIDC) scope left as metadata with an empty key does NOT get its `expires_at`
+// read: read_grok_token only treats a scope as usable when it can extract a
+// non-empty token, so the health must come from the legacy entry that actually
+// carries the token Grok will present. Here the tokenless OIDC entry looks valid
+// for a month while the real (legacy) token is expired — the expired warning
+// must still surface.
+func TestGrokUsageParser_ScopedExpirySkipsTokenlessEntry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// OIDC scope (resolved first) but tokenless — only metadata + a fresh
+		// expires_at. Grok can't use it, so its expiry must be ignored.
+		"https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+		// Legacy scope carries the token Grok actually presents — and it is expired.
+		"https://accounts.x.ai/sign-in": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt from the token-bearing legacy scope, not a healthy read from the tokenless OIDC entry", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+// TestGrokUsageParser_ScopedExpiryStopsAtSelectedScopeWithUnknownExpiry pins that
+// once the preferred token-bearing scope is selected, an UNREADABLE expiry there
+// (opaque key: no `expires_at`, no JWT `exp`) reports unknown instead of falling
+// through to a lower-precedence sibling. read_grok_token stops at the first
+// non-empty token, so consulting the legacy sibling's expired timestamp would
+// surface a false expired-login error for a token Grok never presents. Unknown
+// expiry + a readable account must stay quiet (no notice).
+func TestGrokUsageParser_ScopedExpiryStopsAtSelectedScopeWithUnknownExpiry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// OIDC scope (resolved first) carries an opaque, non-JWT key with no
+		// `expires_at` — its expiry is unknown, but it IS the token Grok presents.
+		"https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": map[string]any{
+			"email": "scoped-grok@example.com",
+			"key":   "opaque-non-jwt-access-token",
+		},
+		// Legacy scope is expired, but Grok never falls back to it while the OIDC
+		// token exists — so its expiry must NOT drive the notice.
+		"https://accounts.x.ai/sign-in": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Notice != "" {
+		t.Errorf("Notice=%q, want no notice — the selected OIDC scope's expiry is unknown, so we must not borrow the legacy sibling's expired timestamp", usage.Notice)
+	}
+}
+
+// TestGrokUsageParser_OpaqueTokenWithoutIdentityStaysSignedIn pins that a scoped
+// entry with a usable but opaque token — no `expires_at`, no JWT `exp`, and no
+// parseable identity — does NOT surface a false "not signed in" error. Grok's
+// resolver would still present the token, so the best-effort check must stay
+// quiet rather than telling the user to re-run `grok login`.
+func TestGrokUsageParser_OpaqueTokenWithoutIdentityStaysSignedIn(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// Opaque, non-JWT key with no `expires_at` and no identity claims: expiry
+		// is unknown AND the account can't be parsed, yet the token IS present and
+		// is what Grok would present on each request.
+		"https://auth.x.ai::client-1": map[string]any{
+			"key": "opaque-non-jwt-access-token",
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Notice != "" {
+		t.Errorf("Notice=%q, want no notice — a usable-but-opaque token must not read as 'not signed in'", usage.Notice)
+	}
+}
+
+// TestGrokUsageParser_CachedTokenPrefersAccessTokenExpiry pins that a legacy
+// cached_token file carrying BOTH tokens reads the expiry from the access token
+// — the credential Grok actually presents on each request — not the id_token.
+// Here the access_token is already expired while the id_token still has a later
+// exp; the expired re-login warning must surface instead of a healthy read off
+// the id_token.
+func TestGrokUsageParser_CachedTokenPrefersAccessTokenExpiry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "cached_token.json"), map[string]any{
+		"cached_token": map[string]any{
+			// id_token is still valid for a month — must NOT drive the notice.
+			"id_token": helperJWT(t, map[string]any{
+				"email": "oauth-grok@example.com",
+				"exp":   now.Add(30 * 24 * time.Hour).Unix(),
+			}),
+			// access_token is the credential Grok presents — and it is expired.
+			"access_token": helperJWT(t, map[string]any{
+				"email": "oauth-grok@example.com",
+				"exp":   now.Add(-14 * 24 * time.Hour).Unix(),
+			}),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt from the presented access token, not a healthy read off the later-expiring id_token", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+// TestGrokUsageParser_ScopedExpiryPrefersExactCLIScopeOverSiblingOIDCHost pins
+// that the EXACT CLI OIDC scope outranks an unrelated sibling that merely shares
+// the "https://auth.x.ai" host. read_grok_token resolves the CLI's own
+// OIDC_SCOPE, not any auth.x.ai key, so a stale token for a different xAI client
+// (e.g. "https://auth.x.ai::00000000-...", which sorts alphabetically first)
+// must NOT mask the health of the CLI credential Grok will actually present.
+// Here the sibling OIDC-host entry is expired while the exact CLI scope is valid
+// — no notice must surface.
+func TestGrokUsageParser_ScopedExpiryPrefersExactCLIScopeOverSiblingOIDCHost(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// A different xAI client sharing the auth.x.ai host — sorts first
+		// alphabetically (all-zero UUID) and is expired, but Grok never presents it.
+		"https://auth.x.ai::00000000-0000-0000-0000-000000000000": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+		// The CLI's exact OIDC scope — the credential Grok presents — is valid.
+		"https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Notice != "" {
+		t.Errorf("Notice=%q, want no notice — the exact CLI OIDC scope is valid; an unrelated expired auth.x.ai sibling must not drive the expiry", usage.Notice)
+	}
+}
+
+// TestGrokUsageParser_ScopedExpiryPrefersLegacyOverUnrelatedOIDCSibling pins that
+// when there is NO exact CLI OIDC entry, the legacy sign-in scope outranks an
+// unrelated "https://auth.x.ai::<other-client>" sibling. read_grok_token resolves
+// only OIDC_SCOPE then LEGACY_SCOPE (x.ai/cli/install.sh) — it never scans other
+// auth.x.ai keys — so a valid sibling for a different xAI client must NOT mask an
+// expired legacy token Grok will actually fall back to. Here the sibling is fresh
+// while the legacy token is expired: the expired warning must still surface.
+func TestGrokUsageParser_ScopedExpiryPrefersLegacyOverUnrelatedOIDCSibling(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		// A different xAI client sharing the auth.x.ai host — valid, but Grok's
+		// resolver never presents it (only the exact OIDC scope, then legacy).
+		"https://auth.x.ai::00000000-0000-0000-0000-000000000000": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+		// Legacy scope carries the token Grok falls back to — and it is expired.
+		"https://accounts.x.ai/sign-in": map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt from the legacy scope Grok falls back to, not a healthy read from the unrelated OIDC-host sibling", usage.Notice, usage.NoticeSeverity)
 	}
 }
 
