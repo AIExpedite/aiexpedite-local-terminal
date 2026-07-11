@@ -10,12 +10,13 @@ func boolPtr(b bool) *bool { return &b }
 // healthyMachine returns a MachineInfo that should evaluate to "ready".
 func healthyMachine() *MachineInfo {
 	return &MachineInfo{
-		Architecture: "arm64",
-		CPU:          &cpuInfo{Cores: 10, Threads: 10},
-		Memory:       &memoryInfo{TotalGB: 32, AvailableGB: 20},
-		Disk:         []diskEntry{{Drive: "/", SizeGB: 500, FreeGB: 200}},
-		Runtimes:     map[string]string{"node": "20.0.0"},
-		Tools:        map[string]string{"git": "2.42.0"},
+		Architecture:    "arm64",
+		CPU:             &cpuInfo{Cores: 10, Threads: 10},
+		Memory:          &memoryInfo{TotalGB: 32, AvailableGB: 20},
+		Disk:            []diskEntry{{Drive: "/", SizeGB: 500, FreeGB: 200}},
+		Runtimes:        map[string]string{"node": "20.0.0"},
+		PackageManagers: map[string]string{"npm": "10.0.0"},
+		Tools:           map[string]string{"git": "2.42.0"},
 		DetectedCliAgents: map[string]detectedCLIAgent{
 			"codex": {Detected: true, Version: "1.0.0"},
 		},
@@ -73,6 +74,44 @@ func TestEvaluateReadiness_MissingToolsNeedsSetup(t *testing.T) {
 		if f.Severity != FindingWarning {
 			t.Fatalf("expected %s to be a warning, got %s", code, f.Severity)
 		}
+	}
+}
+
+func TestEvaluateReadiness_NodeWithoutNpmWarns(t *testing.T) {
+	// Split-package distros can have node present but npm absent; the
+	// npm-based setup steps would then fail on a machine reported "ready".
+	m := healthyMachine()
+	delete(m.PackageManagers, "npm")
+
+	report := evaluateReadiness(m)
+	if report.State != ReadinessNeedsSetup {
+		t.Fatalf("expected needs_setup when npm is missing, got %s (findings: %+v)", report.State, report.Findings)
+	}
+	f := findFinding(report.Findings, "missing_npm")
+	if f == nil {
+		t.Fatalf("expected a missing_npm finding when node is present but npm is not")
+	}
+	if f.Severity != FindingWarning {
+		t.Fatalf("expected missing_npm to be a warning, got %s", f.Severity)
+	}
+	// When node itself is missing we warn on node, not npm (npm-comes-with-node).
+	if findFinding(report.Findings, "missing_node") != nil {
+		t.Fatalf("did not expect missing_node when node is installed")
+	}
+}
+
+func TestEvaluateReadiness_MissingNodeDoesNotAlsoWarnNpm(t *testing.T) {
+	m := healthyMachine()
+	delete(m.Runtimes, "node")
+	delete(m.PackageManagers, "npm")
+
+	report := evaluateReadiness(m)
+	if findFinding(report.Findings, "missing_node") == nil {
+		t.Fatalf("expected missing_node finding")
+	}
+	// npm warning is redundant when node is missing — installing node brings npm.
+	if findFinding(report.Findings, "missing_npm") != nil {
+		t.Fatalf("did not expect a separate missing_npm finding when node is absent")
 	}
 }
 

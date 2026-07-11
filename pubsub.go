@@ -2715,15 +2715,26 @@ func applyTimeoutPolicy(result ApprovalResult, cfg *Config, cmd commandMsg) Appr
 // pub/sub message has been acked. Centralising this here removes the
 // 40-line duplicate block that used to live inline for each entry kind.
 func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pubsub.Message, cmd commandMsg, cfg *Config) bool {
+	// A high-risk Environment Setup step (signed destructive/external_write —
+	// e.g. an interactive CLI-agent / gh / git sign-in launched as
+	// session_start) ALWAYS shows the native approval dialog, exactly like the
+	// execute path's requiresNativeApprovalForStep gate. It therefore bypasses
+	// the AllowAllCommands / disabled-allowlist / already-allowlisted
+	// short-circuits below, so an interactive auth/setup flow can't skip local
+	// approval. The riskLevel is HMAC-signed so it can't be stripped.
+	forceNative := requiresNativeApprovalForStep(cmd)
+
 	// AllowAllCommands short-circuits before any allow-list / dialog work
 	// so session entry points behave the same as the execute path when
 	// the operator has flipped the tray bypass. Read via the synchronised
 	// accessor — see shouldGateExecuteCommand for the rationale.
-	if cfg.IsAllowAllCommands() {
-		return true
-	}
-	if !cfg.EnableAllowList || defaultAllowList == nil {
-		return true
+	if !forceNative {
+		if cfg.IsAllowAllCommands() {
+			return true
+		}
+		if !cfg.EnableAllowList || defaultAllowList == nil {
+			return true
+		}
 	}
 
 	var allowCommand string
@@ -2792,7 +2803,11 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// `grok …` argv mirrors what the manager will actually exec,
 		// keeping the dialog's display text and the persisted Always
 		// pattern truthful.
-		if cfg.CommandSecret != "" {
+		//
+		// forceNative overrides this short-circuit: a signed high-risk step
+		// (external_write sign-in/config) must still get the native dialog even
+		// in signed mode — the manager's argv/env sanitisation still applies.
+		if cfg.CommandSecret != "" && !forceNative {
 			return true
 		}
 		allowCommand = "grok"
@@ -2800,11 +2815,22 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		dialogArgs = redactGrokACPArgsForLog(allowArgs)
 		denyOutput = "grok ACP session denied by user: not in allow list"
 	default:
-		// Mid-session interactive commands don't re-prompt.
-		return true
+		// Mid-session interactive commands don't re-prompt — unless the step
+		// itself is signed high-risk, in which case fall through to the native
+		// dialog using the raw command/args.
+		if !forceNative {
+			return true
+		}
+		allowCommand = cmd.Command
+		allowArgs = cmd.Args
+		dialogArgs = allowArgs
+		denyOutput = "Command denied by user: high-risk step requires approval"
 	}
 
-	if defaultAllowList.IsAllowed(allowCommand, allowArgs) {
+	// A non-high-risk step that's already allowlisted needs no dialog; a
+	// high-risk step is never allowed to skip it (defaultAllowList may be nil
+	// when the allowlist is disabled — guarded by !forceNative above).
+	if !forceNative && defaultAllowList.IsAllowed(allowCommand, allowArgs) {
 		return true
 	}
 
@@ -2813,9 +2839,10 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		timeoutSec = 60
 	}
 	result := ShowCommandApprovalDialog(allowCommand, dialogArgs, timeoutSec)
-	if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
-		result = ApprovalOnce
-	}
+	// Deny/timeout honours the allow-on-timeout convenience ONLY for
+	// non-high-risk steps — destructive/external_write never auto-approve on an
+	// unattended dialog (see applyTimeoutPolicy).
+	result = applyTimeoutPolicy(result, cfg, cmd)
 	switch result {
 	case ApprovalDeny:
 		fmt.Printf("%s[aiexpedite] %s denied by user%s\n", colorYellow, cmd.Type, colorReset)
@@ -2833,9 +2860,13 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		}
 		return false
 	case ApprovalAlways:
-		pattern := GeneratePatternFromCommand(allowCommand, allowArgs)
-		if err := defaultAllowList.AddPattern(pattern); err != nil {
-			fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
+		// defaultAllowList can be nil on the forceNative path when the
+		// allowlist is disabled — skip persistence rather than panic.
+		if defaultAllowList != nil {
+			pattern := GeneratePatternFromCommand(allowCommand, allowArgs)
+			if err := defaultAllowList.AddPattern(pattern); err != nil {
+				fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
+			}
 		}
 	}
 	return true

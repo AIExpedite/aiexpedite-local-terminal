@@ -136,8 +136,15 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 	}
 
 	// Node/npm runtime (needed for most AIExpedite dev workflows).
-	if _, ok := info.Runtimes["node"]; !ok {
+	_, hasNode := info.Runtimes["node"]
+	if !hasNode {
 		add("missing_node", FindingWarning, "Node.js isn't installed yet. Many development workflows need it.")
+	} else if _, ok := info.PackageManagers["npm"]; !ok {
+		// On distros where node and npm are split packages, node can be
+		// present without npm. The Codex/setup workflows install via npm, so
+		// surface this rather than reporting the machine ready and failing on
+		// the first install step.
+		add("missing_npm", FindingWarning, "npm isn't installed yet. It comes with Node.js on most systems and is needed to install CLI tools like Codex.")
 	}
 
 	// Codex CLI — the launch install workflow.
