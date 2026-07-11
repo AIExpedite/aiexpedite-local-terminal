@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -64,6 +65,14 @@ const claudeAuthExpiryWarnWindow = 48 * time.Hour
 // Overridable in tests.
 var claudeKeychainReader = readClaudeKeychainCredential
 
+// claudeKeychainReadTimeout bounds the macOS `security find-generic-password`
+// call. That command can block on a Keychain unlock/access prompt (Apple docs:
+// the Keychain may require a password after inactivity or ask whether an app may
+// retrieve a password), and this parser runs from gatherCLIAgentUsage with no
+// per-call deadline — a waiting child would otherwise hang the whole CLI-usage
+// refresh. On timeout we treat it as "no credential" and fall through.
+const claudeKeychainReadTimeout = 3 * time.Second
+
 // readClaudeKeychainCredential reads the macOS Keychain generic-password item
 // Claude Code stores its credential JSON under. No-op (nil,false) off Darwin or
 // on any error, so callers transparently fall back to "no credential" on Linux/
@@ -72,8 +81,10 @@ func readClaudeKeychainCredential() ([]byte, bool) {
 	if runtime.GOOS != "darwin" {
 		return nil, false
 	}
-	out, err := exec.Command(
-		"security", "find-generic-password", "-s", "Claude Code-credentials", "-w",
+	ctx, cancel := context.WithTimeout(context.Background(), claudeKeychainReadTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(
+		ctx, "security", "find-generic-password", "-s", "Claude Code-credentials", "-w",
 	).Output()
 	if err != nil {
 		return nil, false
