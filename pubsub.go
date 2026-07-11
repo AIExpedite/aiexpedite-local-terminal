@@ -1410,7 +1410,7 @@ func runPubSubConnection(cfg *Config) error {
 			}
 
 			// Show approval dialog
-			result := ShowCommandApprovalDialog(cmd.Command, cmd.Args, timeoutSec)
+			result := commandApprovalDialogFn(cmd.Command, cmd.Args, timeoutSec)
 
 			// Resolve the allow-on-timeout policy — deliberately NOT honored for
 			// destructive Environment Setup steps (see applyTimeoutPolicy).
@@ -2683,6 +2683,11 @@ func shouldGateExecuteCommand(cfg *Config, al *AllowList, cmd string, args []str
 	return !al.IsAllowed(cmd, args)
 }
 
+// commandApprovalDialogFn is an indirection over ShowCommandApprovalDialog so
+// the approval-dialog branches (which otherwise shell out to native OS UI and
+// can't run headless) are stubbable in tests. Production keeps the real dialog.
+var commandApprovalDialogFn = ShowCommandApprovalDialog
+
 // requiresNativeApprovalForStep forces the on-device native approval dialog for
 // a high-risk Environment Setup step regardless of the allow-list or the
 // AllowAllCommands override. Destructive steps (disk cleanup, permanent
@@ -2754,6 +2759,12 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 	// dialog text (the platform dialogs concatenate argv for display).
 	var dialogArgs []string
 	var denyOutput string
+	// persistOnAlways controls whether an "Always" click persists an allow-list
+	// pattern for this entry. Defaults to true; the grok_acp_start path forces
+	// it false (see that case) so "Always" degrades to a one-time approval
+	// there — persisting `grok *` would reopen the raw-execute bypass the grok
+	// short-circuit exists to prevent.
+	persistOnAlways := true
 
 	switch cmd.Type {
 	case "session_start":
@@ -2822,6 +2833,14 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAlwaysApprove)
 		dialogArgs = redactGrokACPArgsForLog(allowArgs)
 		denyOutput = "grok ACP session denied by user: not in allow list"
+		// NEVER persist an allow-list entry for a Grok ACP session. Both paths
+		// that reach here (unsigned mode, or a signed forced-native high-risk
+		// step) set allowCommand="grok", so an "Always" click would persist
+		// `grok *` (GeneratePatternFromCommand) — permanently allow-listing a
+		// bare `grok` and reopening the raw `execute grok …` bypass this
+		// short-circuit exists to close (a later raw execute would skip the ACP
+		// manager's API-key/env-sanitisation gates). Treat "Always" as one-time.
+		persistOnAlways = false
 	default:
 		// Mid-session interactive commands don't re-prompt — unless the step
 		// itself is signed high-risk, in which case fall through to the native
@@ -2846,7 +2865,7 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 	if timeoutSec <= 0 {
 		timeoutSec = 60
 	}
-	result := ShowCommandApprovalDialog(allowCommand, dialogArgs, timeoutSec)
+	result := commandApprovalDialogFn(allowCommand, dialogArgs, timeoutSec)
 	// Deny/timeout honours the allow-on-timeout convenience ONLY for
 	// non-high-risk steps — destructive/external_write never auto-approve on an
 	// unattended dialog (see applyTimeoutPolicy).
@@ -2869,8 +2888,10 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		return false
 	case ApprovalAlways:
 		// defaultAllowList can be nil on the forceNative path when the
-		// allowlist is disabled — skip persistence rather than panic.
-		if defaultAllowList != nil {
+		// allowlist is disabled — skip persistence rather than panic. The
+		// grok_acp_start path also opts out (persistOnAlways=false) so "Always"
+		// never persists `grok *` and reopens the raw-execute bypass.
+		if persistOnAlways && defaultAllowList != nil {
 			pattern := GeneratePatternFromCommand(allowCommand, allowArgs)
 			if err := defaultAllowList.AddPattern(pattern); err != nil {
 				fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
