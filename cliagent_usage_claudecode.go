@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"time"
 )
@@ -98,13 +99,13 @@ func readClaudeKeychainCredential() ([]byte, bool) {
 //
 // The Keychain is only consulted for the DEFAULT config dir. The macOS Keychain
 // item ("Claude Code-credentials") is a single shared entry that reflects the
-// default account, so when a non-default CLAUDE_CONFIG_DIR selects a side-by-side
+// default account, so when the RESOLVED config dir is a non-default side-by-side
 // profile (per Claude's env-vars docs), reading the Keychain would misattribute
 // that profile's quota and auth-expiry notice to the default account. For a
 // non-default profile we read only its on-disk file, and report "no credential"
 // when it is absent instead of guessing.
-func readClaudeCredentialsRaw(base string) ([]byte, bool) {
-	if usingDefaultClaudeConfigDir() {
+func readClaudeCredentialsRaw(home, base string) ([]byte, bool) {
+	if isDefaultClaudeConfigDir(home, base) {
 		if raw, ok := claudeKeychainReader(); ok {
 			return raw, true
 		}
@@ -115,12 +116,19 @@ func readClaudeCredentialsRaw(base string) ([]byte, bool) {
 	return nil, false
 }
 
-// usingDefaultClaudeConfigDir reports whether Claude Code is resolving to its
-// default ~/.claude config dir (CLAUDE_CONFIG_DIR unset/empty) — the only case
-// where the shared macOS Keychain credential is guaranteed to belong to the
-// account we're inspecting.
-func usingDefaultClaudeConfigDir() bool {
-	return os.Getenv("CLAUDE_CONFIG_DIR") == ""
+// isDefaultClaudeConfigDir reports whether the RESOLVED config dir `base` is
+// Claude Code's default ~/.claude — the only case where the shared macOS
+// Keychain credential is guaranteed to belong to the account we're inspecting.
+// It keys off the resolved path rather than "CLAUDE_CONFIG_DIR unset" so that
+// explicitly pointing CLAUDE_CONFIG_DIR at the default dir (a supported way to
+// move history/settings while still using the default login) still consults the
+// Keychain, while a genuine side-by-side profile (e.g. ~/.claude-work) does not.
+func isDefaultClaudeConfigDir(home, base string) bool {
+	def := expandHome(home, ".claude")
+	if def == "" || base == "" {
+		return false
+	}
+	return filepath.Clean(base) == filepath.Clean(def)
 }
 
 // claudeAuthNoticeFromRaw returns a card notice + severity when the claude.ai
@@ -165,7 +173,7 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 
 	// Read the credential ONCE (file, or macOS Keychain) and use it for both the
 	// account/plan fingerprint and the auth-expiry notice.
-	if raw, ok := readClaudeCredentialsRaw(base); ok {
+	if raw, ok := readClaudeCredentialsRaw(home, base); ok {
 		creds := claudeCredentials{}
 		if json.Unmarshal(raw, &creds) == nil {
 			usage.Account = firstNonEmpty(creds.Email, creds.Account, creds.Organization)
@@ -208,7 +216,7 @@ func currentClaudeAccountFingerprint() string {
 	if base == "" {
 		return ""
 	}
-	raw, ok := readClaudeCredentialsRaw(base)
+	raw, ok := readClaudeCredentialsRaw(home, base)
 	if !ok {
 		return ""
 	}

@@ -249,6 +249,43 @@ func TestClaudeCodeUsageParser_KeychainSkippedForCustomConfigDir(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeUsageParser_KeychainUsedWhenConfigDirSetToDefault(t *testing.T) {
+	// CLAUDE_CONFIG_DIR explicitly pointed at the default ~/.claude (a supported
+	// way to relocate history/settings while still using the default login). The
+	// resolved dir IS the default, so the shared "Claude Code-credentials"
+	// Keychain item belongs to this account and MUST still be consulted — gating
+	// on "env var unset" alone would wrongly drop the fingerprint + expiry notice.
+	home := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude")) // == default dir
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	now := time.Now()
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	keychainRead := false
+	raw, _ := json.Marshal(map[string]any{
+		"email": "kc@example.com",
+		"claudeAiOauth": map[string]any{
+			"refreshTokenExpiresAt": now.Add(-time.Hour).UnixMilli(), // expired
+		},
+	})
+	claudeKeychainReader = func() ([]byte, bool) { keychainRead = true; return raw, true }
+
+	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if !keychainRead {
+		t.Errorf("Keychain must be consulted when CLAUDE_CONFIG_DIR resolves to the default dir")
+	}
+	if usage.Account != "kc@example.com" {
+		t.Errorf("Account=%q, want kc@example.com (resolved from keychain)", usage.Account)
+	}
+	if usage.NoticeSeverity != "error" {
+		t.Errorf("NoticeSeverity=%q, want error (expired keychain login must surface)", usage.NoticeSeverity)
+	}
+}
+
 func TestClaudeCodeUsageParser_KeychainPreferredOverStaleFile(t *testing.T) {
 	// Upgraded macOS box on the DEFAULT config dir: a stale ~/.claude/.credentials.json
 	// lingers on disk (older Claude Code wrote it) while the ACTIVE login now lives
