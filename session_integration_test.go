@@ -47,6 +47,13 @@ func TestMain(m *testing.M) {
 		runMockCLI(mode)
 		return
 	}
+	// Isolate the whole suite from the developer's real macOS Keychain. Since the
+	// Claude parser now PREFERS the Keychain credential over the on-disk file on
+	// the default config dir, a Darwin box that actually holds a
+	// "Claude Code-credentials" item would otherwise leak that real login into
+	// file-based tests. Default the reader to "no keychain credential"; tests that
+	// exercise the Keychain path override claudeKeychainReader explicitly.
+	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
 	os.Exit(m.Run())
 }
 

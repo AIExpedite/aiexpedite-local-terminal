@@ -84,15 +84,43 @@ func readClaudeKeychainCredential() ([]byte, bool) {
 	return trimmed, true
 }
 
-// readClaudeCredentialsRaw returns the raw .credentials.json bytes — from the
-// file when present (Linux/Windows, and macOS installs that still write it) and
-// otherwise from the platform Keychain (macOS). (nil,false) when neither yields
-// a credential.
+// readClaudeCredentialsRaw returns the raw Claude credential JSON — from the
+// macOS Keychain when it holds the active login, otherwise from the on-disk
+// .credentials.json. (nil,false) when neither yields a credential.
+//
+// On macOS the active login lives in the encrypted Keychain, and an upgraded box
+// can still carry a STALE ~/.claude/.credentials.json left behind by an older
+// Claude Code that wrote credentials to disk. So on Darwin we PREFER the Keychain
+// credential — reading the stale file instead would fingerprint the wrong account
+// or raise a false expired-login banner. claudeKeychainReader is a no-op off
+// Darwin (and on a Mac with no Keychain item), so Linux/Windows and file-only
+// installs transparently fall through to the on-disk file.
+//
+// The Keychain is only consulted for the DEFAULT config dir. The macOS Keychain
+// item ("Claude Code-credentials") is a single shared entry that reflects the
+// default account, so when a non-default CLAUDE_CONFIG_DIR selects a side-by-side
+// profile (per Claude's env-vars docs), reading the Keychain would misattribute
+// that profile's quota and auth-expiry notice to the default account. For a
+// non-default profile we read only its on-disk file, and report "no credential"
+// when it is absent instead of guessing.
 func readClaudeCredentialsRaw(base string) ([]byte, bool) {
+	if usingDefaultClaudeConfigDir() {
+		if raw, ok := claudeKeychainReader(); ok {
+			return raw, true
+		}
+	}
 	if raw, err := os.ReadFile(expandHome(base, ".credentials.json")); err == nil {
 		return raw, true
 	}
-	return claudeKeychainReader()
+	return nil, false
+}
+
+// usingDefaultClaudeConfigDir reports whether Claude Code is resolving to its
+// default ~/.claude config dir (CLAUDE_CONFIG_DIR unset/empty) — the only case
+// where the shared macOS Keychain credential is guaranteed to belong to the
+// account we're inspecting.
+func usingDefaultClaudeConfigDir() bool {
+	return os.Getenv("CLAUDE_CONFIG_DIR") == ""
 }
 
 // claudeAuthNoticeFromRaw returns a card notice + severity when the claude.ai
