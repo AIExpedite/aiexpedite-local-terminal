@@ -17,7 +17,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
+	"os/exec"
+	"runtime"
 	"time"
 )
 
@@ -31,6 +35,117 @@ type claudeCredentials struct {
 	Organization string `json:"organization"`
 	Plan         string `json:"plan"`
 	Subscription string `json:"subscription"`
+}
+
+// claudeOAuthCredentials mirrors the nested `claudeAiOauth` object Claude Code
+// writes to .credentials.json for a claude.ai subscription login. The access
+// token (ExpiresAt) auto-refreshes silently in the real ~/.claude using
+// RefreshToken, so its short expiry is NOT a re-login signal — the user only has
+// to interactively `/login` again once the REFRESH token expires
+// (RefreshTokenExpiresAt). That's the real re-authentication deadline.
+type claudeOAuthCredentials struct {
+	ClaudeAiOauth struct {
+		ExpiresAt             int64 `json:"expiresAt"`
+		RefreshTokenExpiresAt int64 `json:"refreshTokenExpiresAt"`
+	} `json:"claudeAiOauth"`
+}
+
+// claudeAuthExpiryWarnWindow is how far ahead of the refresh-token deadline we
+// warn. Claude native strips env credentials and requires a subscription
+// /login, so an expired OAuth session stalls a chat headlessly (the same class
+// of failure Grok hits).
+const claudeAuthExpiryWarnWindow = 48 * time.Hour
+
+// claudeKeychainReader returns the raw Claude credential JSON from the platform
+// credential store used when Claude Code does NOT persist it to
+// ~/.claude/.credentials.json — on macOS the login lives in the encrypted
+// Keychain, not on disk (https://code.claude.com/docs/en/authentication).
+// Overridable in tests.
+var claudeKeychainReader = readClaudeKeychainCredential
+
+// readClaudeKeychainCredential reads the macOS Keychain generic-password item
+// Claude Code stores its credential JSON under. No-op (nil,false) off Darwin or
+// on any error, so callers transparently fall back to "no credential" on Linux/
+// Windows (where the on-disk file IS authoritative) and on a fresh macOS box.
+func readClaudeKeychainCredential() ([]byte, bool) {
+	if runtime.GOOS != "darwin" {
+		return nil, false
+	}
+	out, err := exec.Command(
+		"security", "find-generic-password", "-s", "Claude Code-credentials", "-w",
+	).Output()
+	if err != nil {
+		return nil, false
+	}
+	trimmed := bytes.TrimSpace(out)
+	if len(trimmed) == 0 {
+		return nil, false
+	}
+	return trimmed, true
+}
+
+// readClaudeCredentialsRaw returns the raw Claude credential JSON — from the
+// macOS Keychain when it holds the active login, otherwise from the on-disk
+// .credentials.json. (nil,false) when neither yields a credential.
+//
+// On macOS the active login lives in the encrypted Keychain, and an upgraded box
+// can still carry a STALE ~/.claude/.credentials.json left behind by an older
+// Claude Code that wrote credentials to disk. So on Darwin we PREFER the Keychain
+// credential — reading the stale file instead would fingerprint the wrong account
+// or raise a false expired-login banner. claudeKeychainReader is a no-op off
+// Darwin (and on a Mac with no Keychain item), so Linux/Windows and file-only
+// installs transparently fall through to the on-disk file.
+//
+// The Keychain is only consulted for the DEFAULT config dir. The macOS Keychain
+// item ("Claude Code-credentials") is a single shared entry that reflects the
+// default account, so when a non-default CLAUDE_CONFIG_DIR selects a side-by-side
+// profile (per Claude's env-vars docs), reading the Keychain would misattribute
+// that profile's quota and auth-expiry notice to the default account. For a
+// non-default profile we read only its on-disk file, and report "no credential"
+// when it is absent instead of guessing.
+func readClaudeCredentialsRaw(base string) ([]byte, bool) {
+	if usingDefaultClaudeConfigDir() {
+		if raw, ok := claudeKeychainReader(); ok {
+			return raw, true
+		}
+	}
+	if raw, err := os.ReadFile(expandHome(base, ".credentials.json")); err == nil {
+		return raw, true
+	}
+	return nil, false
+}
+
+// usingDefaultClaudeConfigDir reports whether Claude Code is resolving to its
+// default ~/.claude config dir (CLAUDE_CONFIG_DIR unset/empty) — the only case
+// where the shared macOS Keychain credential is guaranteed to belong to the
+// account we're inspecting.
+func usingDefaultClaudeConfigDir() bool {
+	return os.Getenv("CLAUDE_CONFIG_DIR") == ""
+}
+
+// claudeAuthNoticeFromRaw returns a card notice + severity when the claude.ai
+// subscription login in a raw .credentials.json blob is (nearly) expired. It
+// keys off the REFRESH-token expiry — the access token auto-refreshes, so its
+// shorter expiry would false-alarm. Returns ("","") when the refresh token is
+// still valid, or when there's no OAuth login (API-key installs have no
+// claudeAiOauth object, so absence is not a reliable "signed out" signal).
+func claudeAuthNoticeFromRaw(raw []byte, now time.Time) (string, string) {
+	creds := claudeOAuthCredentials{}
+	if json.Unmarshal(raw, &creds) != nil {
+		return "", ""
+	}
+	deadlineMs := creds.ClaudeAiOauth.RefreshTokenExpiresAt
+	if deadlineMs <= 0 {
+		return "", "" // no OAuth deadline (API-key or unexpected layout) — don't guess
+	}
+	deadline := time.UnixMilli(deadlineMs)
+	if !deadline.After(now) {
+		return "Claude login has expired — run `claude` on the terminal computer and sign in (/login) again.", "error"
+	}
+	if deadline.Before(now.Add(claudeAuthExpiryWarnWindow)) {
+		return "Claude login expires soon — run `claude` on the terminal computer and sign in (/login) to avoid an interrupted session.", "warning"
+	}
+	return "", ""
 }
 
 func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
@@ -48,14 +163,31 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
 
-	creds := claudeCredentials{}
-	if readJSONFile(expandHome(base, ".credentials.json"), &creds) {
-		usage.Account = firstNonEmpty(creds.Email, creds.Account, creds.Organization)
-		usage.Plan = firstNonEmpty(creds.Plan, creds.Subscription)
+	// Read the credential ONCE (file, or macOS Keychain) and use it for both the
+	// account/plan fingerprint and the auth-expiry notice.
+	if raw, ok := readClaudeCredentialsRaw(base); ok {
+		creds := claudeCredentials{}
+		if json.Unmarshal(raw, &creds) == nil {
+			usage.Account = firstNonEmpty(creds.Email, creds.Account, creds.Organization)
+			usage.Plan = firstNonEmpty(creds.Plan, creds.Subscription)
+		}
+
+		// Proactive auth-expiry notice. Chat-direct Claude spawns
+		// `claude --output-format stream-json` with env credentials stripped
+		// (claude_auth_detect.go) so it MUST use the claude.ai subscription login —
+		// an expired one stalls the session on a `/login` it can't show headlessly.
+		// Surface it in this regular usage scan so the dashboard prompts a re-login
+		// first. (No numeric usage-limit notice exists on this parser, so there's
+		// nothing to prioritize against.)
+		if notice, severity := claudeAuthNoticeFromRaw(raw, now); notice != "" {
+			usage.Notice = notice
+			usage.NoticeSeverity = severity
+		}
 	}
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
 	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)
+
 	return usage, true
 }
 
@@ -76,8 +208,12 @@ func currentClaudeAccountFingerprint() string {
 	if base == "" {
 		return ""
 	}
+	raw, ok := readClaudeCredentialsRaw(base)
+	if !ok {
+		return ""
+	}
 	creds := claudeCredentials{}
-	if !readJSONFile(expandHome(base, ".credentials.json"), &creds) {
+	if json.Unmarshal(raw, &creds) != nil {
 		return ""
 	}
 	account := firstNonEmpty(creds.Email, creds.Account, creds.Organization)

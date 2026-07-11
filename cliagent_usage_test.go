@@ -75,6 +75,221 @@ func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
 	}
 }
 
+func helperWriteClaudeOAuth(t *testing.T, home string, extra map[string]any) {
+	t.Helper()
+	oauth := map[string]any{}
+	for k, v := range extra {
+		oauth[k] = v
+	}
+	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
+		"email":         "ada@example.com",
+		"claudeAiOauth": oauth,
+	})
+}
+
+func TestClaudeCodeUsageParser_AuthExpiredNotice(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	now := time.Now()
+	// Access token still valid, but the REFRESH token expired 2h ago → re-login.
+	helperWriteClaudeOAuth(t, home, map[string]any{
+		"expiresAt":             now.Add(2 * time.Hour).UnixMilli(),
+		"refreshTokenExpiresAt": now.Add(-2 * time.Hour).UnixMilli(),
+	})
+
+	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" {
+		t.Errorf("NoticeSeverity=%q, want error", usage.NoticeSeverity)
+	}
+	if !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q, want an expired re-login prompt", usage.Notice)
+	}
+}
+
+func TestClaudeCodeUsageParser_AuthExpiringSoonNotice(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteClaudeOAuth(t, home, map[string]any{
+		"refreshTokenExpiresAt": now.Add(12 * time.Hour).UnixMilli(), // within the 48h window
+	})
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.NoticeSeverity != "warning" {
+		t.Errorf("NoticeSeverity=%q, want warning", usage.NoticeSeverity)
+	}
+	if !strings.Contains(usage.Notice, "expires soon") {
+		t.Errorf("Notice=%q, want an expiring-soon prompt", usage.Notice)
+	}
+}
+
+func TestClaudeCodeUsageParser_AuthHealthyNoNotice(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	now := time.Now()
+	// Access token EXPIRED but the refresh token is valid for 10 days — the CLI
+	// silently refreshes, so this must NOT warn.
+	helperWriteClaudeOAuth(t, home, map[string]any{
+		"expiresAt":             now.Add(-1 * time.Hour).UnixMilli(),
+		"refreshTokenExpiresAt": now.Add(10 * 24 * time.Hour).UnixMilli(),
+	})
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Notice != "" {
+		t.Errorf("expected no auth notice while the refresh token is valid, got %q", usage.Notice)
+	}
+}
+
+func TestClaudeCodeUsageParser_ApiKeyNoOAuthNoNotice(t *testing.T) {
+	// Flat / API-key creds (no claudeAiOauth) must not raise a false auth notice:
+	// absence of an OAuth deadline is not a "signed out" signal.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
+		"email": "ada@example.com",
+		"plan":  "max",
+	})
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if usage.Notice != "" {
+		t.Errorf("unexpected notice for non-OAuth credentials: %q", usage.Notice)
+	}
+}
+
+func TestClaudeCodeUsageParser_AuthFromKeychainWhenNoFile(t *testing.T) {
+	// On macOS Claude Code stores the credential in the Keychain, not
+	// ~/.claude/.credentials.json. When the file is absent, the parser must fall
+	// back to the platform reader so an expired login is still surfaced. Override
+	// the reader so this exercises cross-platform.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir() // no .credentials.json on disk
+	now := time.Now()
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	raw, _ := json.Marshal(map[string]any{
+		"email": "kc@example.com",
+		"claudeAiOauth": map[string]any{
+			"refreshTokenExpiresAt": now.Add(-time.Hour).UnixMilli(), // expired
+		},
+	})
+	claudeKeychainReader = func() ([]byte, bool) { return raw, true }
+
+	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Account != "kc@example.com" {
+		t.Errorf("Account=%q, want kc@example.com (resolved from keychain)", usage.Account)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want expired error from the keychain credential",
+			usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+func TestClaudeCodeUsageParser_NoFileNoKeychainNoNotice(t *testing.T) {
+	// Fresh box / API-key install with neither a file nor a keychain credential
+	// must not raise a false auth notice.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if usage.Notice != "" {
+		t.Errorf("unexpected notice with no credential source: %q", usage.Notice)
+	}
+}
+
+func TestClaudeCodeUsageParser_KeychainSkippedForCustomConfigDir(t *testing.T) {
+	// On macOS the "Claude Code-credentials" Keychain item is a single shared
+	// entry for the DEFAULT account. When a non-default CLAUDE_CONFIG_DIR selects
+	// a side-by-side profile whose .credentials.json is absent, the parser must
+	// NOT fall back to that Keychain item — doing so would misattribute the
+	// default account's identity/auth-expiry to the profile.
+	configDir := t.TempDir() // custom profile, no .credentials.json on disk
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	now := time.Now()
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	keychainRead := false
+	raw, _ := json.Marshal(map[string]any{
+		"email": "default-account@example.com",
+		"claudeAiOauth": map[string]any{
+			"refreshTokenExpiresAt": now.Add(-time.Hour).UnixMilli(), // expired
+		},
+	})
+	claudeKeychainReader = func() ([]byte, bool) { keychainRead = true; return raw, true }
+
+	usage, ok := claudeCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected baseline usage entry")
+	}
+	if keychainRead {
+		t.Errorf("Keychain must not be consulted for a non-default CLAUDE_CONFIG_DIR profile")
+	}
+	if usage.Account != "" {
+		t.Errorf("Account=%q, want empty (default-account keychain credential must not leak into a custom profile)", usage.Account)
+	}
+	if usage.Notice != "" {
+		t.Errorf("Notice=%q, want empty (must not surface the default account's expiry for a custom profile)", usage.Notice)
+	}
+}
+
+func TestClaudeCodeUsageParser_KeychainPreferredOverStaleFile(t *testing.T) {
+	// Upgraded macOS box on the DEFAULT config dir: a stale ~/.claude/.credentials.json
+	// lingers on disk (older Claude Code wrote it) while the ACTIVE login now lives
+	// in the Keychain. The parser must fingerprint + expiry-check the Keychain
+	// credential, not the stale file — otherwise the stale file raises a false
+	// expired banner and attributes usage to the wrong account.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	now := time.Now()
+
+	// Stale on-disk file: a different account whose refresh token expired days ago.
+	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
+		"email": "stale@example.com",
+		"claudeAiOauth": map[string]any{
+			"refreshTokenExpiresAt": now.Add(-72 * time.Hour).UnixMilli(),
+		},
+	})
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	raw, _ := json.Marshal(map[string]any{
+		"email": "active@example.com",
+		"claudeAiOauth": map[string]any{
+			"refreshTokenExpiresAt": now.Add(30 * 24 * time.Hour).UnixMilli(), // healthy
+		},
+	})
+	claudeKeychainReader = func() ([]byte, bool) { return raw, true }
+
+	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Account != "active@example.com" {
+		t.Errorf("Account=%q, want active@example.com (keychain must win over the stale file)", usage.Account)
+	}
+	if usage.Notice != "" {
+		t.Errorf("Notice=%q, want empty (active keychain login is healthy; the stale file must not raise a false banner)", usage.Notice)
+	}
+}
+
 func TestClaudeCodeUsageParser_HonorsClaudeConfigDir(t *testing.T) {
 	home := t.TempDir()
 	configDir := t.TempDir()
