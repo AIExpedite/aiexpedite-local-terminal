@@ -171,27 +171,42 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
 
-	// Read the credential ONCE (file, or macOS Keychain) and use it for both the
-	// account/plan fingerprint and the auth-expiry notice.
-	if raw, ok := readClaudeCredentialsRaw(home, base); ok {
+	// Account/plan fingerprint is scoped to the RESOLVED config dir so a
+	// side-by-side profile's quota isn't attributed to the default account (and
+	// vice versa). For a non-default profile with no on-disk credential this
+	// stays empty rather than borrowing the shared default Keychain identity —
+	// the misattribution guard from readClaudeCredentialsRaw.
+	profileRaw, profileOK := readClaudeCredentialsRaw(home, base)
+	if profileOK {
 		creds := claudeCredentials{}
-		if json.Unmarshal(raw, &creds) == nil {
+		if json.Unmarshal(profileRaw, &creds) == nil {
 			usage.Account = firstNonEmpty(creds.Email, creds.Account, creds.Organization)
 			usage.Plan = firstNonEmpty(creds.Plan, creds.Subscription)
 		}
+	}
 
-		// Proactive auth-expiry notice. Chat-direct Claude spawns
-		// `claude --output-format stream-json` with env credentials stripped
-		// (claude_auth_detect.go) so it MUST use the claude.ai subscription login —
-		// an expired one stalls the session on a `/login` it can't show headlessly.
-		// Surface it in this regular usage scan so the dashboard prompts a re-login
-		// first. (No numeric usage-limit notice exists on this parser, so there's
-		// nothing to prioritize against.)
-		if notice, severity := claudeAuthNoticeFromRaw(raw, now); notice != "" {
+	// Proactive auth-expiry notice — keyed off the credential the driver's
+	// spawned `claude` child ACTUALLY authenticates with, which is NOT
+	// necessarily the profile fingerprinted above. sanitizeClaudeChildEnv strips
+	// every CLAUDE_ variable (incl. CLAUDE_CONFIG_DIR) before launching claude
+	// (session.go), so the child always falls back to the DEFAULT ~/.claude
+	// login: the macOS Keychain, else the default on-disk file. An expired
+	// default login stalls that headless session on a `/login` it can't show, so
+	// we must warn even when the driver runs under a custom CLAUDE_CONFIG_DIR
+	// whose own credential is absent or healthy. In the common case (config dir
+	// IS the default) this is the very credential just read, so reuse it rather
+	// than pay a second Keychain lookup.
+	childRaw, childOK := profileRaw, profileOK
+	if !isDefaultClaudeConfigDir(home, base) {
+		childRaw, childOK = readClaudeCredentialsRaw(home, expandHome(home, ".claude"))
+	}
+	if childOK {
+		if notice, severity := claudeAuthNoticeFromRaw(childRaw, now); notice != "" {
 			usage.Notice = notice
 			usage.NoticeSeverity = severity
 		}
 	}
+
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
 	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)

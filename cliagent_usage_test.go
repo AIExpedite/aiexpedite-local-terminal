@@ -212,12 +212,16 @@ func TestClaudeCodeUsageParser_NoFileNoKeychainNoNotice(t *testing.T) {
 	}
 }
 
-func TestClaudeCodeUsageParser_KeychainSkippedForCustomConfigDir(t *testing.T) {
-	// On macOS the "Claude Code-credentials" Keychain item is a single shared
-	// entry for the DEFAULT account. When a non-default CLAUDE_CONFIG_DIR selects
-	// a side-by-side profile whose .credentials.json is absent, the parser must
-	// NOT fall back to that Keychain item — doing so would misattribute the
-	// default account's identity/auth-expiry to the profile.
+func TestClaudeCodeUsageParser_CustomConfigDirIdentityVsChildExpiry(t *testing.T) {
+	// A non-default CLAUDE_CONFIG_DIR profile whose .credentials.json is absent.
+	// Two distinct concerns must be decoupled:
+	//   * IDENTITY/quota is scoped to the profile — the shared default-account
+	//     "Claude Code-credentials" Keychain item must NOT leak into Account,
+	//     else the default account's usage is misattributed to this profile.
+	//   * The AUTH-EXPIRY notice reflects what the driver's spawned `claude`
+	//     child actually uses. sanitizeClaudeChildEnv strips CLAUDE_CONFIG_DIR
+	//     (session.go), so the child falls back to the DEFAULT login — here an
+	//     expired one — and WILL stall headlessly. That must still warn.
 	configDir := t.TempDir() // custom profile, no .credentials.json on disk
 	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
@@ -225,27 +229,57 @@ func TestClaudeCodeUsageParser_KeychainSkippedForCustomConfigDir(t *testing.T) {
 
 	orig := claudeKeychainReader
 	t.Cleanup(func() { claudeKeychainReader = orig })
-	keychainRead := false
 	raw, _ := json.Marshal(map[string]any{
 		"email": "default-account@example.com",
 		"claudeAiOauth": map[string]any{
 			"refreshTokenExpiresAt": now.Add(-time.Hour).UnixMilli(), // expired
 		},
 	})
-	claudeKeychainReader = func() ([]byte, bool) { keychainRead = true; return raw, true }
+	claudeKeychainReader = func() ([]byte, bool) { return raw, true }
 
 	usage, ok := claudeCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
 	if !ok || usage == nil {
 		t.Fatalf("expected baseline usage entry")
 	}
-	if keychainRead {
-		t.Errorf("Keychain must not be consulted for a non-default CLAUDE_CONFIG_DIR profile")
+	if usage.Account != "" {
+		t.Errorf("Account=%q, want empty (default-account keychain identity must not leak into a custom profile)", usage.Account)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want an expired-login warning: the spawned child strips CLAUDE_CONFIG_DIR and uses the expired default login",
+			usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+func TestClaudeCodeUsageParser_CustomConfigDirNoWarnWhenDefaultLoginHealthy(t *testing.T) {
+	// Same custom-profile setup, but the DEFAULT login (what the spawned child
+	// uses) is healthy: no false alarm. This locks the boundary of the
+	// child-expiry warning added above — it fires only for a genuinely
+	// expired/expiring default login, never merely because a custom profile is
+	// selected.
+	configDir := t.TempDir() // custom profile, no .credentials.json on disk
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	now := time.Now()
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	raw, _ := json.Marshal(map[string]any{
+		"email": "default-account@example.com",
+		"claudeAiOauth": map[string]any{
+			"refreshTokenExpiresAt": now.Add(10 * 24 * time.Hour).UnixMilli(), // healthy
+		},
+	})
+	claudeKeychainReader = func() ([]byte, bool) { return raw, true }
+
+	usage, ok := claudeCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected baseline usage entry")
 	}
 	if usage.Account != "" {
-		t.Errorf("Account=%q, want empty (default-account keychain credential must not leak into a custom profile)", usage.Account)
+		t.Errorf("Account=%q, want empty (default-account keychain identity must not leak into a custom profile)", usage.Account)
 	}
 	if usage.Notice != "" {
-		t.Errorf("Notice=%q, want empty (must not surface the default account's expiry for a custom profile)", usage.Notice)
+		t.Errorf("Notice=%q, want empty (default child login is healthy — no false alarm)", usage.Notice)
 	}
 }
 
