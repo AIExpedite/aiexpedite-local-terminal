@@ -438,15 +438,22 @@ func isSigFailRateLimited() bool {
 // still matches. Only the new __cli_usage_refresh__ command carries the
 // field, and both ends include it.
 type signaturePayload struct {
-	ID              string          `json:"id"`
-	Command         string          `json:"command"`
-	Args            []string        `json:"args"`
-	Ts              int64           `json:"ts"`
-	Type            string          `json:"type"`
-	SessionID       string          `json:"sessionID"`
-	Input           string          `json:"input"`
-	Signal          string          `json:"signal"`
-	RefreshID       string          `json:"refreshId,omitempty"`
+	ID        string   `json:"id"`
+	Command   string   `json:"command"`
+	Args      []string `json:"args"`
+	Ts        int64    `json:"ts"`
+	Type      string   `json:"type"`
+	SessionID string   `json:"sessionID"`
+	Input     string   `json:"input"`
+	Signal    string   `json:"signal"`
+	RefreshID string   `json:"refreshId,omitempty"`
+	// riskLevel is signed and omitempty so non-env-setup commands (which never
+	// carry one) produce the identical canonical JSON as the pre-riskLevel
+	// format — preserving signature compatibility across the agent/service
+	// upgrade window, exactly like refreshId. Only env-setup steps set it, and
+	// both ends include it. Signing it prevents a "destructive"→"" downgrade
+	// that would skip native approval.
+	RiskLevel       string          `json:"riskLevel,omitempty"`
 	CliAgentCatalog json.RawMessage `json:"cliAgentCatalog,omitempty"`
 }
 
@@ -470,6 +477,7 @@ func verifySignature(cmd commandMsg, secret string) bool {
 		Input:           cmd.Input,
 		Signal:          cmd.Signal,
 		RefreshID:       cmd.RefreshID,
+		RiskLevel:       cmd.RiskLevel,
 		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
 	}
 
@@ -530,6 +538,15 @@ func pubSubMessageSizeLimit(cmd commandMsg) int {
 	return maxPubSubCommandMessageBytes
 }
 
+// isInternalDemandCommand reports whether cmd is a server-internal, read-only
+// demand command (CLI-usage refresh or environment inspection). These are
+// exempt from staleness and rate-limiting because they are dispatched by the
+// backend's own state machines (not the LLM) and MUST always run so the
+// correlated result clears the backend's in-flight / pending marker.
+func isInternalDemandCommand(command string) bool {
+	return command == "__cli_usage_refresh__" || command == "__env_inspect__"
+}
+
 func commandPayloadTooLargeMessage(sizeBytes, limitBytes int) string {
 	return fmt.Sprintf("Command rejected: payload size %d bytes exceeds %d byte limit", sizeBytes, limitBytes)
 }
@@ -559,6 +576,15 @@ type commandMsg struct {
 	SessionID string `json:"sessionID,omitempty"` // Unique session identifier
 	Input     string `json:"input,omitempty"`     // stdin text for session_input; raw JSON-RPC frame for codex_appserver_send / grok_acp_send
 	Signal    string `json:"signal,omitempty"`    // "interrupt"|"kill" for session_signal
+
+	// Environment Setup plan attribution + risk. RiskLevel is SIGNED (see
+	// signaturePayload) so an attacker who can alter a signed command cannot
+	// downgrade a "destructive" step to bypass the on-device native approval
+	// dialog. PlanID/StepID are unsigned correlation metadata for the audit
+	// trail (like WorkspaceID/UID, which are also unsigned).
+	RiskLevel string `json:"riskLevel,omitempty"` // env-setup step risk (mirrors shared-constants RISK_LEVELS)
+	PlanID    string `json:"planId,omitempty"`    // env-setup plan id (audit correlation)
+	StepID    string `json:"stepId,omitempty"`    // env-setup step id (audit correlation)
 
 	rawCliAgentCatalog json.RawMessage
 }
@@ -635,6 +661,13 @@ type resultMsg struct {
 	// poll down the handled-failure path.
 	CliAgents []cliAgentUsage      `json:"cliAgents"`
 	Errors    []cliAgentUsageError `json:"errors,omitempty"`
+
+	// __env_inspect_result__ payload — populated only when
+	// Type == "__env_inspect_result__". Carries the read-only workstation
+	// readiness report (state + friendly findings + full specs) for the
+	// Environment Setup capability. Echoes RefreshID so terminal-service can
+	// correlate the response with its pending inspection request.
+	Readiness *ReadinessReport `json:"readiness,omitempty"`
 }
 
 /*
@@ -856,6 +889,59 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 		return err
 	}
 	return nil
+}
+
+// handleEnvInspectCommand fulfils a read-only __env_inspect__ demand command
+// from terminal-service's Environment Setup flow. It gathers full machine info,
+// derives a friendly readiness report, and publishes an __env_inspect_result__
+// carrying the report + echoing RefreshID for correlation. Read-only — never
+// mutates the workstation, so no allowlist/approval gating applies.
+//
+// Modeled on handleCLIUsageRefreshCommand: always publishes a result (even on
+// panic) so the backend's pending-inspection marker is never orphaned, and
+// returns non-nil only when the publish itself failed (caller nacks so Pub/Sub
+// redelivers).
+func handleEnvInspectCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) (publishErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("%s[pubsub] panic in env inspect handler: %v%s\n", colorRed, r, colorReset)
+			res := makeEnvInspectResult(cmd, cfg, evaluateReadiness(nil))
+			if err := publishMsg(ctx, topic, res); err != nil {
+				publishErr = err
+			}
+		}
+	}()
+
+	// Bound the gather so a hung probe can't stall the inspection round trip.
+	gatherCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	report := GatherReadinessOnly(gatherCtx)
+	res := makeEnvInspectResult(cmd, cfg, report)
+	if err := publishMsg(ctx, topic, res); err != nil {
+		fmt.Printf("%s[pubsub] Failed to publish env inspect result: %v%s\n", colorRed, err, colorReset)
+		return err
+	}
+	return nil
+}
+
+func makeEnvInspectResult(cmd commandMsg, cfg *Config, report ReadinessReport) resultMsg {
+	agentID := cmd.AgentID
+	if cfg != nil && cfg.AgentID != "" {
+		agentID = cfg.AgentID
+	}
+	return resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		AgentID:     agentID,
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "__env_inspect_result__",
+		RefreshID:   cmd.RefreshID,
+		Status:      "success",
+		Readiness:   &report,
+	}
 }
 
 func makeCLIUsageRefreshFailureResult(cmd commandMsg, cfg *Config, message string) resultMsg {
@@ -1136,12 +1222,12 @@ func runPubSubConnection(cfg *Config) error {
 		// Reject commands older than maxCommandAgeSec to prevent processing
 		// stale queued commands when terminal reconnects after being offline.
 		//
-		// Exempt __cli_usage_refresh__: it's a server-internal command that
-		// MUST always publish a __cli_usage_refresh_result__ carrying the
-		// refreshId so the backend can clear cliUsageInFlightRefreshId.
-		// Emitting a generic "stale" rejection here would orphan the in-flight
-		// marker and block the active loop until its 60s timeout.
-		if cmd.Command != "__cli_usage_refresh__" && isCommandStale(cmd.Ts) {
+		// Exempt server-internal demand commands (__cli_usage_refresh__,
+		// __env_inspect__): they MUST always publish a correlated result
+		// carrying refreshId so the backend can clear its in-flight / pending
+		// marker. A generic "stale" rejection here would orphan that marker and
+		// block the loop until its timeout. See isInternalDemandCommand.
+		if !isInternalDemandCommand(cmd.Command) && isCommandStale(cmd.Ts) {
 			ageSec := (time.Now().UnixMilli() - cmd.Ts) / 1000
 			fmt.Printf("%s[aiexpedite] Stale command rejected (age: %ds, max: %ds)%s\n",
 				colorYellow, ageSec, maxCommandAgeSec, colorReset)
@@ -1164,10 +1250,10 @@ func runPubSubConnection(cfg *Config) error {
 		// ─────────────────────────────────────────────────────────────────
 
 		// ─── Per-UID Rate Limiting ─────────────────────────────────────────
-		// Exempt __cli_usage_refresh__ for the same reason as the staleness
-		// check above — a "rate_limited" rejection would not carry refreshId
-		// and would orphan the backend's cliUsageInFlightRefreshId.
-		if cmd.Command != "__cli_usage_refresh__" && !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
+		// Exempt server-internal demand commands for the same reason as the
+		// staleness check above — a "rate_limited" rejection would not carry
+		// refreshId and would orphan the backend's in-flight / pending marker.
+		if !isInternalDemandCommand(cmd.Command) && !checkRateLimit(cmd.UID, cmd.AgentID, cfg) {
 			fmt.Printf("%s[aiexpedite] Rate limit exceeded%s\n", colorYellow, colorReset)
 
 			// Send rate_limited response back to user for immediate feedback
@@ -1274,6 +1360,21 @@ func runPubSubConnection(cfg *Config) error {
 			return
 		}
 
+		if cmd.Command == "__env_inspect__" {
+			// Read-only workstation inspection for the Environment Setup
+			// capability. Gathers machine info + readiness verdict and
+			// publishes an __env_inspect_result__ carrying the report. Like
+			// __cli_usage_refresh__ it always publishes a result so the
+			// backend's pending marker never sticks; nack on publish failure
+			// so Pub/Sub redelivers.
+			if err := handleEnvInspectCommand(ctx, topic, cmd, cfg); err != nil {
+				m.Nack()
+			} else {
+				m.Ack()
+			}
+			return
+		}
+
 		// ─── Interactive Session Routing ─────────────────────────────────
 		// Route session_* and codex_appserver_* commands to their respective
 		// managers instead of shell execution. Long-running entry-point
@@ -1293,8 +1394,14 @@ func runPubSubConnection(cfg *Config) error {
 		// ─────────────────────────────────────────────────────────────────
 
 		// ─── Command Allow List Validation ───────────────────────────────
-		if shouldGateExecuteCommand(cfg, defaultAllowList, cmd.Command, cmd.Args) {
-			// Command not in allow list - show approval dialog
+		// A high-risk (destructive) Environment Setup step ALWAYS shows the
+		// native approval dialog — in addition to the chat-side scoped
+		// confirmation the backend already enforced — even if the raw command
+		// would otherwise be allowlisted. The riskLevel is HMAC-signed so it
+		// can't be stripped to skip this gate. See requiresNativeApprovalForStep.
+		if shouldGateExecuteCommand(cfg, defaultAllowList, cmd.Command, cmd.Args) ||
+			requiresNativeApprovalForStep(cmd) {
+			// Command not in allow list (or high-risk step) - show approval dialog
 
 			// Get timeout settings from config
 			timeoutSec := cfg.ApprovalTimeoutSec
@@ -1303,12 +1410,11 @@ func runPubSubConnection(cfg *Config) error {
 			}
 
 			// Show approval dialog
-			result := ShowCommandApprovalDialog(cmd.Command, cmd.Args, timeoutSec)
+			result := commandApprovalDialogFn(cmd.Command, cmd.Args, timeoutSec)
 
-			// Handle timeout based on config
-			if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
-				result = ApprovalOnce
-			}
+			// Resolve the allow-on-timeout policy — deliberately NOT honored for
+			// destructive Environment Setup steps (see applyTimeoutPolicy).
+			result = applyTimeoutPolicy(result, cfg, cmd)
 
 			switch result {
 			case ApprovalDeny:
@@ -1330,9 +1436,17 @@ func runPubSubConnection(cfg *Config) error {
 				return
 
 			case ApprovalAlways:
-				pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
-				if err := defaultAllowList.AddPattern(pattern); err != nil {
-					fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
+				// defaultAllowList can be nil here when the allowlist is
+				// disabled and this dialog was reached solely via
+				// requiresNativeApprovalForStep (forced-native high-risk step) —
+				// InitAllowList is skipped in that config. Guard persistence
+				// like the session path does rather than panic (which would
+				// nack/redeliver the setup step forever).
+				if defaultAllowList != nil {
+					pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
+					if err := defaultAllowList.AddPattern(pattern); err != nil {
+						fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
+					}
 				}
 				// Fall through to execute
 
@@ -2569,6 +2683,40 @@ func shouldGateExecuteCommand(cfg *Config, al *AllowList, cmd string, args []str
 	return !al.IsAllowed(cmd, args)
 }
 
+// commandApprovalDialogFn is an indirection over ShowCommandApprovalDialog so
+// the approval-dialog branches (which otherwise shell out to native OS UI and
+// can't run headless) are stubbable in tests. Production keeps the real dialog.
+var commandApprovalDialogFn = ShowCommandApprovalDialog
+
+// requiresNativeApprovalForStep forces the on-device native approval dialog for
+// a high-risk Environment Setup step regardless of the allow-list or the
+// AllowAllCommands override. Destructive steps (disk cleanup, permanent
+// deletion, broad package updates) AND external/credential writes (CLI-agent /
+// gh / git sign-in and config) require BOTH the chat-side scoped confirmation
+// (enforced server-side by terminal-service's approval gate) AND this native
+// approval, per the feature's safety model. Mirrors requiresNativeApproval() in
+// shared-constants. The riskLevel is HMAC-signed (see signaturePayload) so it
+// cannot be stripped to skip the gate.
+func requiresNativeApprovalForStep(cmd commandMsg) bool {
+	return cmd.RiskLevel == "destructive" || cmd.RiskLevel == "external_write"
+}
+
+// applyTimeoutPolicy resolves a native-approval dialog result under the
+// operator's allow-on-timeout setting. A timeout (or explicit deny) is upgraded
+// to a one-time approval ONLY when allow-on-timeout is configured AND the step
+// is not a destructive Environment Setup step. Destructive cleanup/delete steps
+// must never auto-approve on an unattended dialog, so for them a deny stays a
+// deny regardless of the allow-on-timeout convenience — matching the feature's
+// safety model (destructive requires an explicit local confirmation).
+func applyTimeoutPolicy(result ApprovalResult, cfg *Config, cmd commandMsg) ApprovalResult {
+	if result == ApprovalDeny &&
+		cfg.ApprovalTimeoutAction == "allow" &&
+		!requiresNativeApprovalForStep(cmd) {
+		return ApprovalOnce
+	}
+	return result
+}
+
 // gateSessionEntryCommand applies the allowlist + user-approval dialog flow
 // to the long-running entry-point commands (session_start and
 // codex_appserver_start). For all other interactive commands it is a no-op
@@ -2580,15 +2728,26 @@ func shouldGateExecuteCommand(cfg *Config, al *AllowList, cmd string, args []str
 // pub/sub message has been acked. Centralising this here removes the
 // 40-line duplicate block that used to live inline for each entry kind.
 func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pubsub.Message, cmd commandMsg, cfg *Config) bool {
+	// A high-risk Environment Setup step (signed destructive/external_write —
+	// e.g. an interactive CLI-agent / gh / git sign-in launched as
+	// session_start) ALWAYS shows the native approval dialog, exactly like the
+	// execute path's requiresNativeApprovalForStep gate. It therefore bypasses
+	// the AllowAllCommands / disabled-allowlist / already-allowlisted
+	// short-circuits below, so an interactive auth/setup flow can't skip local
+	// approval. The riskLevel is HMAC-signed so it can't be stripped.
+	forceNative := requiresNativeApprovalForStep(cmd)
+
 	// AllowAllCommands short-circuits before any allow-list / dialog work
 	// so session entry points behave the same as the execute path when
 	// the operator has flipped the tray bypass. Read via the synchronised
 	// accessor — see shouldGateExecuteCommand for the rationale.
-	if cfg.IsAllowAllCommands() {
-		return true
-	}
-	if !cfg.EnableAllowList || defaultAllowList == nil {
-		return true
+	if !forceNative {
+		if cfg.IsAllowAllCommands() {
+			return true
+		}
+		if !cfg.EnableAllowList || defaultAllowList == nil {
+			return true
+		}
 	}
 
 	var allowCommand string
@@ -2600,6 +2759,12 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 	// dialog text (the platform dialogs concatenate argv for display).
 	var dialogArgs []string
 	var denyOutput string
+	// persistOnAlways controls whether an "Always" click persists an allow-list
+	// pattern for this entry. Defaults to true; the grok_acp_start path forces
+	// it false (see that case) so "Always" degrades to a one-time approval
+	// there — persisting `grok *` would reopen the raw-execute bypass the grok
+	// short-circuit exists to prevent.
+	persistOnAlways := true
 
 	switch cmd.Type {
 	case "session_start":
@@ -2657,19 +2822,42 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// `grok …` argv mirrors what the manager will actually exec,
 		// keeping the dialog's display text and the persisted Always
 		// pattern truthful.
-		if cfg.CommandSecret != "" {
+		//
+		// forceNative overrides this short-circuit: a signed high-risk step
+		// (external_write sign-in/config) must still get the native dialog even
+		// in signed mode — the manager's argv/env sanitisation still applies.
+		if cfg.CommandSecret != "" && !forceNative {
 			return true
 		}
 		allowCommand = "grok"
 		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAlwaysApprove)
 		dialogArgs = redactGrokACPArgsForLog(allowArgs)
 		denyOutput = "grok ACP session denied by user: not in allow list"
+		// NEVER persist an allow-list entry for a Grok ACP session. Both paths
+		// that reach here (unsigned mode, or a signed forced-native high-risk
+		// step) set allowCommand="grok", so an "Always" click would persist
+		// `grok *` (GeneratePatternFromCommand) — permanently allow-listing a
+		// bare `grok` and reopening the raw `execute grok …` bypass this
+		// short-circuit exists to close (a later raw execute would skip the ACP
+		// manager's API-key/env-sanitisation gates). Treat "Always" as one-time.
+		persistOnAlways = false
 	default:
-		// Mid-session interactive commands don't re-prompt.
-		return true
+		// Mid-session interactive commands don't re-prompt — unless the step
+		// itself is signed high-risk, in which case fall through to the native
+		// dialog using the raw command/args.
+		if !forceNative {
+			return true
+		}
+		allowCommand = cmd.Command
+		allowArgs = cmd.Args
+		dialogArgs = allowArgs
+		denyOutput = "Command denied by user: high-risk step requires approval"
 	}
 
-	if defaultAllowList.IsAllowed(allowCommand, allowArgs) {
+	// A non-high-risk step that's already allowlisted needs no dialog; a
+	// high-risk step is never allowed to skip it (defaultAllowList may be nil
+	// when the allowlist is disabled — guarded by !forceNative above).
+	if !forceNative && defaultAllowList.IsAllowed(allowCommand, allowArgs) {
 		return true
 	}
 
@@ -2677,10 +2865,11 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 	if timeoutSec <= 0 {
 		timeoutSec = 60
 	}
-	result := ShowCommandApprovalDialog(allowCommand, dialogArgs, timeoutSec)
-	if result == ApprovalDeny && cfg.ApprovalTimeoutAction == "allow" {
-		result = ApprovalOnce
-	}
+	result := commandApprovalDialogFn(allowCommand, dialogArgs, timeoutSec)
+	// Deny/timeout honours the allow-on-timeout convenience ONLY for
+	// non-high-risk steps — destructive/external_write never auto-approve on an
+	// unattended dialog (see applyTimeoutPolicy).
+	result = applyTimeoutPolicy(result, cfg, cmd)
 	switch result {
 	case ApprovalDeny:
 		fmt.Printf("%s[aiexpedite] %s denied by user%s\n", colorYellow, cmd.Type, colorReset)
@@ -2698,9 +2887,15 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		}
 		return false
 	case ApprovalAlways:
-		pattern := GeneratePatternFromCommand(allowCommand, allowArgs)
-		if err := defaultAllowList.AddPattern(pattern); err != nil {
-			fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
+		// defaultAllowList can be nil on the forceNative path when the
+		// allowlist is disabled — skip persistence rather than panic. The
+		// grok_acp_start path also opts out (persistOnAlways=false) so "Always"
+		// never persists `grok *` and reopens the raw-execute bypass.
+		if persistOnAlways && defaultAllowList != nil {
+			pattern := GeneratePatternFromCommand(allowCommand, allowArgs)
+			if err := defaultAllowList.AddPattern(pattern); err != nil {
+				fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
+			}
 		}
 	}
 	return true

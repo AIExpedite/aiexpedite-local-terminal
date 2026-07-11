@@ -5,6 +5,8 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"regexp"
 	"testing"
 )
@@ -153,6 +155,71 @@ func TestGateSessionEntryCommand_AllowAllBypassesAllKinds(t *testing.T) {
 				t.Errorf("gateSessionEntryCommand kind=%q returned false with AllowAllCommands=true; expected immediate pass-through", kind)
 			}
 		})
+	}
+}
+
+// writableRestrictiveAllowList mirrors restrictiveAllowList but is backed by a
+// real temp file so AddPattern (the "Always" persistence path) can append.
+func writableRestrictiveAllowList(t *testing.T) *AllowList {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "allow.txt")
+	if err := os.WriteFile(path, []byte("__ping__\n"), 0600); err != nil {
+		t.Fatalf("seed allow file: %v", err)
+	}
+	return &AllowList{
+		configPath: path,
+		patterns:   []string{"__ping__"},
+		compiled:   []*regexp.Regexp{patternToRegex("__ping__")},
+	}
+}
+
+// A grok_acp_start approved with "Always" must NEVER persist a `grok`
+// allow-list entry: GeneratePatternFromCommand would emit `grok *`, permanently
+// allow-listing a bare `grok` and reopening the raw `execute grok …` bypass the
+// grok_acp_start short-circuit exists to close. "Always" degrades to one-time
+// for that path. A session_start control proves the persist path is otherwise
+// live (so the grok exception is real, not the dialog stub failing to fire).
+func TestGateSessionEntryCommand_GrokAlwaysDoesNotPersistBypass(t *testing.T) {
+	prevList := defaultAllowList
+	al := writableRestrictiveAllowList(t)
+	defaultAllowList = al
+	t.Cleanup(func() { defaultAllowList = prevList })
+
+	prevDialog := commandApprovalDialogFn
+	commandApprovalDialogFn = func(string, []string, int) ApprovalResult { return ApprovalAlways }
+	t.Cleanup(func() { commandApprovalDialogFn = prevDialog })
+
+	// CommandSecret empty → unsigned mode, so grok_acp_start does NOT take the
+	// signed short-circuit and instead reaches the dialog + Always branch.
+	cfg := &Config{EnableAllowList: true}
+	cfg.SetAllowAllCommands(false)
+
+	grokCmd := commandMsg{
+		ID:      "g",
+		Type:    "grok_acp_start",
+		Command: "grok",
+		Args:    []string{"sessionID", "--always-approve"},
+	}
+	if !gateSessionEntryCommand(context.Background(), nil, nil, grokCmd, cfg) {
+		t.Fatalf("grok_acp_start with Always approval should pass through (return true)")
+	}
+	if al.IsAllowed("grok", []string{"agent", "stdio"}) {
+		t.Errorf("grok_acp_start Always persisted a grok allow-list entry; raw `execute grok …` bypass reopened")
+	}
+	for _, p := range al.patterns {
+		if p == "grok *" {
+			t.Errorf("allow list gained %q after grok_acp_start Always; must never persist", p)
+		}
+	}
+
+	// Control: a session_start Always DOES persist, so the stub is reaching the
+	// persistence branch — the grok result above is the deliberate exception.
+	sessCmd := commandMsg{ID: "s", Type: "session_start", Command: "mytool", Args: []string{"--go"}}
+	if !gateSessionEntryCommand(context.Background(), nil, nil, sessCmd, cfg) {
+		t.Fatalf("session_start with Always approval should pass through")
+	}
+	if !al.IsAllowed("mytool", []string{"--go"}) {
+		t.Errorf("session_start Always did not persist `mytool *`; persistence path is dead, so the grok assertion proves nothing")
 	}
 }
 

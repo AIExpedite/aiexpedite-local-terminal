@@ -18,6 +18,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -67,12 +68,19 @@ var claudeKeychainReader = readClaudeKeychainCredential
 // Claude Code stores its credential JSON under. No-op (nil,false) off Darwin or
 // on any error, so callers transparently fall back to "no credential" on Linux/
 // Windows (where the on-disk file IS authoritative) and on a fresh macOS box.
+//
+// The `security` call runs under machineInfoProbeTimeout so a locked Keychain or
+// an access prompt can't hang the 10s/20s usage/inspect gather contexts (it would
+// otherwise leave stuck processes on __env_inspect__ timeouts); on timeout we
+// return "no credential" and fall through to the on-disk file.
 func readClaudeKeychainCredential() ([]byte, bool) {
 	if runtime.GOOS != "darwin" {
 		return nil, false
 	}
-	out, err := exec.Command(
-		"security", "find-generic-password", "-s", "Claude Code-credentials", "-w",
+	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(
+		ctx, "security", "find-generic-password", "-s", "Claude Code-credentials", "-w",
 	).Output()
 	if err != nil {
 		return nil, false

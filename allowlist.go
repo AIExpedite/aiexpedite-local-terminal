@@ -384,8 +384,19 @@ ruby
 ruby *
 
 # --- Package Managers ---
+# Environment Setup install/clone/cleanup steps reuse these patterns (brew /
+# winget / choco / scoop / apt) plus git, npm, mkdir, and rm below. Steps that
+# terminal-service classifies "destructive" additionally carry a signed
+# riskLevel that forces the on-device native approval dialog even when the raw
+# command matches a pattern here (see requiresNativeApprovalForStep). sudo-
+# wrapped Linux installs are intentionally NOT allowlisted, so they fall through
+# to the native approval prompt.
 apt list *
 apt show *
+apt install *
+apt-get install *
+apt update
+apt-get update
 brew *
 choco *
 winget *
