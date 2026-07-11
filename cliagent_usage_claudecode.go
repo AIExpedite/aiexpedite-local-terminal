@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -142,6 +143,44 @@ func isDefaultClaudeConfigDir(home, base string) bool {
 	return filepath.Clean(base) == filepath.Clean(def)
 }
 
+// claudeSettings mirrors the Claude Code settings.json keys that change WHICH
+// credential a spawned `claude` authenticates with. `apiKeyHelper` is a script
+// Claude Code runs to mint an API key / auth token; when it is set the child
+// authenticates through that helper INSTEAD of the claude.ai subscription
+// /login, so a stale/expired `claudeAiOauth` blob is not a real re-login signal.
+type claudeSettings struct {
+	APIKeyHelper string `json:"apiKeyHelper"`
+}
+
+// claudeChildUsesHelperAuth reports whether a Claude Code `apiKeyHelper` is
+// configured in the settings that apply to the driver's spawned `claude` child.
+// The child runs under the DEFAULT ~/.claude config dir (sanitizeClaudeChildEnv
+// strips CLAUDE_CONFIG_DIR), so only the enterprise managed-settings.json
+// locations and the default user ~/.claude/settings.json can steer its auth. A
+// per-project .claude/settings.json is deliberately NOT consulted: it depends
+// on the child's working directory, which this usage scan doesn't know.
+//
+// When true, the child authenticates via the helper rather than the
+// subscription login, so an expired/expiring `claudeAiOauth` deadline must NOT
+// raise the "run /login" notice — chat-direct Claude keeps authenticating fine,
+// and the warning would be a false alarm. env-based ANTHROPIC_API_KEY /
+// ANTHROPIC_AUTH_TOKEN need no equivalent guard: sanitizeClaudeChildEnv strips
+// them, so the child falls back to the OAuth login the notice is keyed off.
+// Best-effort: missing or malformed settings files are treated as "no helper".
+func claudeChildUsesHelperAuth(home string) bool {
+	paths := append([]string{}, claudeManagedSettingsPathsFn()...)
+	if def := expandHome(home, ".claude"); def != "" {
+		paths = append(paths, filepath.Join(def, "settings.json"))
+	}
+	for _, p := range paths {
+		settings := claudeSettings{}
+		if readJSONFile(p, &settings) && strings.TrimSpace(settings.APIKeyHelper) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // claudeAuthNoticeFromRaw returns a card notice + severity when the claude.ai
 // subscription login in a raw .credentials.json blob is (nearly) expired. It
 // keys off the REFRESH-token expiry — the access token auto-refreshes, so its
@@ -207,11 +246,17 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 	// whose own credential is absent or healthy. In the common case (config dir
 	// IS the default) this is the very credential just read, so reuse it rather
 	// than pay a second Keychain lookup.
+	//
+	// One exception: a configured `apiKeyHelper` (settings.json) makes the child
+	// authenticate through that helper, not the OAuth login — and it isn't an env
+	// var, so sanitizeClaudeChildEnv can't strip it. When it's set an expired
+	// claudeAiOauth deadline is not a real re-login signal, so skip the notice
+	// rather than false-alarm a correctly-authenticated user.
 	childRaw, childOK := profileRaw, profileOK
 	if !isDefaultClaudeConfigDir(home, base) {
 		childRaw, childOK = readClaudeCredentialsRaw(home, expandHome(home, ".claude"))
 	}
-	if childOK {
+	if childOK && !claudeChildUsesHelperAuth(home) {
 		if notice, severity := claudeAuthNoticeFromRaw(childRaw, now); notice != "" {
 			usage.Notice = notice
 			usage.NoticeSeverity = severity

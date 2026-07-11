@@ -163,6 +163,79 @@ func TestClaudeCodeUsageParser_ApiKeyNoOAuthNoNotice(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeUsageParser_ApiKeyHelperSuppressesExpiryNotice(t *testing.T) {
+	// A user with `apiKeyHelper` configured has the spawned `claude` child
+	// authenticate through that helper (settings.json isn't stripped by
+	// sanitizeClaudeChildEnv), so a stale/expired claudeAiOauth deadline must NOT
+	// raise a "run /login" notice — the child stays authenticated.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteClaudeOAuth(t, home, map[string]any{
+		"expiresAt":             now.Add(2 * time.Hour).UnixMilli(),
+		"refreshTokenExpiresAt": now.Add(-2 * time.Hour).UnixMilli(), // expired
+	})
+	helperWriteJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"apiKeyHelper": "/usr/local/bin/get-claude-key.sh",
+	})
+
+	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Notice != "" {
+		t.Errorf("expected no auth notice when apiKeyHelper drives the child's auth, got %q", usage.Notice)
+	}
+}
+
+func TestClaudeCodeUsageParser_ExpiryNoticeStillFiresWithoutHelper(t *testing.T) {
+	// Guard the negative: an empty apiKeyHelper (or absent settings.json) must
+	// not suppress the expired-login notice — the child falls back to OAuth.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteClaudeOAuth(t, home, map[string]any{
+		"expiresAt":             now.Add(2 * time.Hour).UnixMilli(),
+		"refreshTokenExpiresAt": now.Add(-2 * time.Hour).UnixMilli(), // expired
+	})
+	helperWriteJSON(t, filepath.Join(home, ".claude", "settings.json"), map[string]any{
+		"apiKeyHelper": "", // present but empty → not helper auth
+	})
+
+	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want the expired-login notice when no apiKeyHelper is set",
+			usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+func TestClaudeChildUsesHelperAuth_ManagedSettings(t *testing.T) {
+	// apiKeyHelper pinned in an enterprise managed-settings.json also steers the
+	// child's auth, so it must be detected regardless of the user config dir.
+	home := t.TempDir()
+	managed := filepath.Join(t.TempDir(), "managed-settings.json")
+	helperWriteJSON(t, managed, map[string]any{"apiKeyHelper": "/opt/mdm/claude-key.sh"})
+
+	orig := claudeManagedSettingsPathsFn
+	t.Cleanup(func() { claudeManagedSettingsPathsFn = orig })
+	claudeManagedSettingsPathsFn = func() []string { return []string{managed} }
+
+	if !claudeChildUsesHelperAuth(home) {
+		t.Errorf("expected helper auth detected from managed-settings.json")
+	}
+
+	// No apiKeyHelper anywhere → false.
+	claudeManagedSettingsPathsFn = func() []string { return nil }
+	if claudeChildUsesHelperAuth(home) {
+		t.Errorf("expected no helper auth when neither managed nor user settings pin apiKeyHelper")
+	}
+}
+
 func TestClaudeCodeUsageParser_AuthFromKeychainWhenNoFile(t *testing.T) {
 	// On macOS Claude Code stores the credential in the Keychain, not
 	// ~/.claude/.credentials.json. When the file is absent, the parser must fall
