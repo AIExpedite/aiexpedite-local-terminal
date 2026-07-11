@@ -2678,12 +2678,14 @@ func shouldGateExecuteCommand(cfg *Config, al *AllowList, cmd string, args []str
 // requiresNativeApprovalForStep forces the on-device native approval dialog for
 // a high-risk Environment Setup step regardless of the allow-list or the
 // AllowAllCommands override. Destructive steps (disk cleanup, permanent
-// deletion, broad package updates) require BOTH the chat-side scoped
-// confirmation (enforced server-side by terminal-service's approval gate) AND
-// this native approval, per the feature's safety model. The riskLevel is
-// HMAC-signed (see signaturePayload) so it cannot be stripped to skip the gate.
+// deletion, broad package updates) AND external/credential writes (CLI-agent /
+// gh / git sign-in and config) require BOTH the chat-side scoped confirmation
+// (enforced server-side by terminal-service's approval gate) AND this native
+// approval, per the feature's safety model. Mirrors requiresNativeApproval() in
+// shared-constants. The riskLevel is HMAC-signed (see signaturePayload) so it
+// cannot be stripped to skip the gate.
 func requiresNativeApprovalForStep(cmd commandMsg) bool {
-	return cmd.RiskLevel == "destructive"
+	return cmd.RiskLevel == "destructive" || cmd.RiskLevel == "external_write"
 }
 
 // applyTimeoutPolicy resolves a native-approval dialog result under the

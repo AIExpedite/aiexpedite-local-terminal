@@ -24,10 +24,14 @@ func TestIsInternalDemandCommand(t *testing.T) {
 }
 
 func TestRequiresNativeApprovalForStep(t *testing.T) {
-	if !requiresNativeApprovalForStep(commandMsg{RiskLevel: "destructive"}) {
-		t.Errorf("destructive step should require native approval")
+	// Destructive AND external/credential writes both force native approval
+	// (mirrors requiresNativeApproval() in shared-constants).
+	for _, risk := range []string{"destructive", "external_write"} {
+		if !requiresNativeApprovalForStep(commandMsg{RiskLevel: risk}) {
+			t.Errorf("risk %q should require native approval", risk)
+		}
 	}
-	for _, risk := range []string{"", "read_only", "safe_write", "external_write"} {
+	for _, risk := range []string{"", "read_only", "safe_write"} {
 		if requiresNativeApprovalForStep(commandMsg{RiskLevel: risk}) {
 			t.Errorf("risk %q should NOT force native approval", risk)
 		}
