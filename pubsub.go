@@ -1436,9 +1436,17 @@ func runPubSubConnection(cfg *Config) error {
 				return
 
 			case ApprovalAlways:
-				pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
-				if err := defaultAllowList.AddPattern(pattern); err != nil {
-					fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
+				// defaultAllowList can be nil here when the allowlist is
+				// disabled and this dialog was reached solely via
+				// requiresNativeApprovalForStep (forced-native high-risk step) —
+				// InitAllowList is skipped in that config. Guard persistence
+				// like the session path does rather than panic (which would
+				// nack/redeliver the setup step forever).
+				if defaultAllowList != nil {
+					pattern := GeneratePatternFromCommand(cmd.Command, cmd.Args)
+					if err := defaultAllowList.AddPattern(pattern); err != nil {
+						fmt.Printf("%s[aiexpedite] Failed to add pattern to allow list: %v%s\n", colorYellow, err, colorReset)
+					}
 				}
 				// Fall through to execute
 
