@@ -108,7 +108,11 @@ func TestIsTestRunnerCommand(t *testing.T) {
 }
 
 func TestIsPTYIneligibleCommand_GitAndTestRunnersForcedOffPTY(t *testing.T) {
-	ineligible := []string{"git fetch --all", "git", "pytest", "npm test", "jest"}
+	ineligible := []string{
+		"git fetch --all", "git", "pytest", "npm test", "jest",
+		// Path-qualified / suffixed git must still be forced off the PTY path.
+		"/usr/bin/git fetch", "git.exe pull",
+	}
 	eligible := []string{"agy", "antigravity chat", "node repl.js", "bash"}
 	for _, c := range ineligible {
 		if !isPTYIneligibleCommand(c) {

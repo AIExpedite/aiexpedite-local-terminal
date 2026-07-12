@@ -138,10 +138,20 @@ func isTestRunnerCommand(command string) bool {
 }
 
 // isGitCommand reports whether the effective command line invokes git. Used to
-// keep git off the PTY path (guardrail: never route git through a PTY).
+// keep git off the PTY path (guardrail: never route git through a PTY). Robust
+// to an explicit path (`/usr/bin/git`) and a Windows suffix (`git.exe`) so a
+// path-qualified invocation can't slip past the guardrail onto the PTY path.
 func isGitCommand(command string) bool {
-	c := strings.ToLower(strings.TrimSpace(command))
-	return c == "git" || strings.HasPrefix(c, "git ")
+	fields := strings.Fields(command)
+	if len(fields) == 0 {
+		return false
+	}
+	base := strings.ToLower(fields[0])
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
+	base = strings.TrimSuffix(base, ".exe")
+	return base == "git"
 }
 
 // isPTYIneligibleCommand reports whether a command must never run under a PTY
