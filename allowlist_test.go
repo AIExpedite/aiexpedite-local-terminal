@@ -358,6 +358,135 @@ func TestDefaultAllowList_CarriesGhMigrationMarker(t *testing.T) {
 	}
 }
 
+func TestEnsureGeminiRemoved_StripsLegacyDefaults(t *testing.T) {
+	// Upgraded installs still carry the pre-removal default `gemini`/`gemini *`
+	// patterns on disk, so a raw `gemini` execute/session request would be
+	// auto-allowed without a dialog even though the CLI support was removed.
+	// The one-time migration must strip those lines while preserving every
+	// other pattern, including user additions.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	legacy := "# --- CLI Coding Agents ---\nclaude *\ngemini\ngemini *\nagy *\n" +
+		"# Added by user approval\ngemini deploy *\nmy-custom-tool *\n"
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatalf("seed legacy allow list: %v", err)
+	}
+
+	al := &AllowList{configPath: path}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !al.IsAllowed("gemini", []string{"chat"}) {
+		t.Fatalf("precondition: legacy list should auto-allow gemini")
+	}
+
+	if err := al.ensureGeminiRemoved(); err != nil {
+		t.Fatalf("ensureGeminiRemoved: %v", err)
+	}
+
+	if al.IsAllowed("gemini", []string{"chat"}) {
+		t.Errorf("after migration, bare `gemini` should no longer be auto-allowed")
+	}
+	if al.IsAllowed("gemini", nil) {
+		t.Errorf("after migration, exact `gemini` pattern should be gone")
+	}
+	// A gemini line a user explicitly added via approval must survive.
+	if !al.IsAllowed("gemini", []string{"deploy", "prod"}) {
+		t.Errorf("user-approved `gemini deploy *` was stripped")
+	}
+	// Unrelated user pattern must survive.
+	if !al.IsAllowed("my-custom-tool", []string{"--flag"}) {
+		t.Errorf("unrelated user pattern was lost after migration")
+	}
+	// Antigravity remains the supported CLI.
+	if !al.IsAllowed("agy", []string{"run"}) {
+		t.Errorf("antigravity (agy) should remain allowed")
+	}
+
+	// Idempotency: a second call must not change the file (marker present).
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if err := al.ensureGeminiRemoved(); err != nil {
+		t.Fatalf("ensureGeminiRemoved (second call): %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("ensureGeminiRemoved is not idempotent; file changed on second call")
+	}
+}
+
+func TestEnsureGeminiRemoved_DoesNotResurrectManualReadd(t *testing.T) {
+	// After the migration runs once, a user who deliberately re-adds `gemini *`
+	// via Edit Allow List must keep it — the marker makes the strip one-shot.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	legacy := "gemini\ngemini *\n"
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatalf("seed legacy allow list: %v", err)
+	}
+
+	al := &AllowList{configPath: path}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := al.ensureGeminiRemoved(); err != nil {
+		t.Fatalf("first ensureGeminiRemoved: %v", err)
+	}
+	if al.IsAllowed("gemini", []string{"chat"}) {
+		t.Fatalf("precondition: gemini should be stripped after first migration")
+	}
+
+	// User re-adds gemini * after the migration (marker already in file).
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if err := os.WriteFile(path, append(raw, []byte("\n# Added by user approval\ngemini *\n")...), 0600); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	if err := al.ensureGeminiRemoved(); err != nil {
+		t.Fatalf("second ensureGeminiRemoved: %v", err)
+	}
+	if !al.IsAllowed("gemini", []string{"chat"}) {
+		t.Errorf("ensureGeminiRemoved stripped a deliberately re-added gemini entry")
+	}
+}
+
+func TestDefaultAllowList_GeminiIsNotDefaultAllowed(t *testing.T) {
+	// Fresh installs must never auto-allow the removed Gemini CLI, and the
+	// default content must ship the migration marker so a Reset writes a
+	// "migration already ran" state.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	al := &AllowList{configPath: path}
+	if err := al.CreateDefault(); err != nil {
+		t.Fatalf("CreateDefault: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if al.IsAllowed("gemini", []string{"chat"}) {
+		t.Errorf("default allow list must not auto-allow gemini")
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read default file: %v", err)
+	}
+	if !strings.Contains(string(raw), geminiMigrationMarker) {
+		t.Errorf("default allow list content missing %q marker; reset would re-trigger gemini migration", geminiMigrationMarker)
+	}
+}
+
 func TestDefaultAllowList_GrokIsNeverDefaultAllowed(t *testing.T) {
 	// The default allowlist must NOT match any `grok ...` argv — neither
 	// bare `grok` nor the synthesised `grok agent stdio ...` shape. A raw
