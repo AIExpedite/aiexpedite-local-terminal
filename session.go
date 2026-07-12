@@ -226,8 +226,9 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// NOT the one-shot execute path — so without this a git/editor/credential
 	// prompt would escape the captured pipes via /dev/tty and hang until the
 	// session timeout. hardenNonAgentCommand applies the authoritative
-	// non-interactive git/editor/credential env (overwriting the utility's
-	// unchanged passthrough env), detaches the controlling terminal, and layers
+	// non-interactive git/editor/credential env on top of the sanitized proc.Env
+	// prepared above (preserving the stripped CLAUDE_* filtering rather than
+	// reverting to os.Environ()), detaches the controlling terminal, and layers
 	// the test-runner defaults for recognized runners. Resident CLI agents
 	// (claude/codex/gemini/grok/agy) keep their interactive-capable env + stdin.
 	// See EXECUTION_LIVENESS_REDESIGN.md → headless hardening.

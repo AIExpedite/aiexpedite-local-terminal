@@ -95,9 +95,16 @@ func testRunnerEnvDefaults(base []string) []string {
 // defaults are layered in underneath the safety overlay.
 //
 // It must be called before c.Start(). It is safe to call on a command that
-// already has SysProcAttr / Env set — it merges rather than clobbers.
+// already has SysProcAttr / Env set — it merges rather than clobbers. When the
+// caller has pre-sanitised c.Env (e.g. prepareClaudeChildEnv strips CLAUDE_*
+// from a utility session's environment), that filtered env is used as the base
+// so the overlay layers on top of it instead of reintroducing the stripped
+// variables from os.Environ().
 func hardenNonAgentCommand(c *exec.Cmd, effectiveCommand string) {
-	base := os.Environ()
+	base := c.Env
+	if base == nil {
+		base = os.Environ()
+	}
 	if isTestRunnerCommand(effectiveCommand) {
 		base = append(base, testRunnerEnvDefaults(base)...)
 	}
@@ -153,9 +160,18 @@ var ptyEligibleAgents = map[string]bool{
 }
 
 // isPTYEligibleCommand reports whether a command may run under a PTY when
-// tty=true. Robust to an explicit path (`/usr/local/bin/agy`) and a Windows
-// suffix (`agy.exe`).
+// tty=true. The whole effective command line must be a SINGLE invocation of a
+// recognized agent — robust to an explicit path (`/usr/local/bin/agy`) and a
+// Windows suffix (`agy.exe`). A compound payload (e.g. terminal-service's
+// `bash -c "agy && git push"`, which effectiveCommandLine unwraps to
+// `agy && git push`) is rejected: only the first token would be the agent while
+// the trailing git/test-runner command would inherit the PTY's controlling
+// terminal and bypass headless hardening. Such payloads fall back to the
+// hardened pipe path instead of riding the PTY on their first token alone.
 func isPTYEligibleCommand(command string) bool {
+	if hasShellCommandChaining(command) {
+		return false
+	}
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
 		return false
@@ -166,6 +182,16 @@ func isPTYEligibleCommand(command string) bool {
 	}
 	base = strings.TrimSuffix(base, ".exe")
 	return ptyEligibleAgents[base]
+}
+
+// hasShellCommandChaining reports whether a command line contains shell
+// operators that would launch a second program: chaining (`&&`, `||`, `;`),
+// piping (`|`), backgrounding (`&`), command substitution (`$(...)` or
+// backticks), or a newline. Used to keep multi-command payloads off the
+// single-agent PTY path so a trailing git/test-runner command cannot inherit a
+// controlling terminal.
+func hasShellCommandChaining(command string) bool {
+	return strings.ContainsAny(command, "|&;`\n") || strings.Contains(command, "$(")
 }
 
 // effectiveCommandLine returns the command string to classify for profiling. A

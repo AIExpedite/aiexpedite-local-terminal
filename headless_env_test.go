@@ -63,6 +63,29 @@ func TestHardenNonAgentCommand_TestRunnerGetsCIDefaults(t *testing.T) {
 	}
 }
 
+func TestHardenNonAgentCommand_PreservesPreSanitizedEnv(t *testing.T) {
+	// When the caller has already sanitized c.Env (as StartSession does via
+	// prepareClaudeChildEnv, stripping CLAUDE_* from a utility session), that
+	// filtered env must be the base — hardening layers on top instead of
+	// reverting to os.Environ() and reintroducing the stripped variables.
+	clearAmbientTestRunnerEnv(t)
+	c := exec.Command("git", "status")
+	c.Env = []string{"PATH=/usr/bin", "SAFE=keep"} // pre-sanitized: no CLAUDE_*
+	t.Setenv("CLAUDE_NESTED_MARKER", "leaked") // present in os.Environ()
+	hardenNonAgentCommand(c, "git status")
+	m := envMap(c.Env)
+	if _, leaked := m["CLAUDE_NESTED_MARKER"]; leaked {
+		t.Errorf("hardening reintroduced a stripped env var from os.Environ(): %v", m)
+	}
+	if m["SAFE"] != "keep" {
+		t.Errorf("pre-sanitized caller env not preserved as base: %v", m)
+	}
+	// Authoritative overlay still wins on top of the preserved base.
+	if m["GIT_TERMINAL_PROMPT"] != "0" {
+		t.Errorf("overlay must still apply over the preserved base: %v", m)
+	}
+}
+
 func envMap(kvs []string) map[string]string {
 	m := map[string]string{}
 	for _, kv := range kvs {
@@ -143,6 +166,14 @@ func TestIsPTYEligibleCommand_AllowlistOnly(t *testing.T) {
 		"pytest", "npm test", "jest",
 		"bash", "bash -c 'echo hi'", "sh", "powershell", "pwsh",
 		"ssh user@host", "node repl.js", "claude --print x", "codex", "grok", "gemini",
+		// A shell-wrapped payload that chains a non-agent command after the
+		// agent must NOT ride the PTY on its first token — the trailing
+		// git/test-runner would inherit the controlling terminal and bypass
+		// headless hardening. effectiveCommandLine unwraps `bash -c "..."` to
+		// these strings, so isPTYEligibleCommand sees them directly.
+		"agy && git push", "agy && npm test", "agy || git pull",
+		"agy; git status", "agy | tee out.log", "agy & git fetch",
+		"agy $(git rev-parse HEAD)", "agy `git rev-parse HEAD`",
 		"",
 	}
 	for _, c := range eligible {

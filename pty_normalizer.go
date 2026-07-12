@@ -271,8 +271,13 @@ var promptPatterns = []*regexp.Regexp{
 // ("", false) otherwise. Ordinary quiet (a TUI working after emitting output)
 // does not match, so it is left to the resident-session backstop.
 func (n *PTYNormalizer) PendingPromptLine() (string, bool) {
-	s := strings.TrimRight(string(n.line), " ")
-	if s == "" {
+	// Match the rendered line UNTRIMMED: the generic inquirer detector is
+	// `\?\s+$`, so a prompt like "Project name? " only matches while its
+	// trailing space is intact — trimming first would drop it and let the
+	// session hang until the much longer session timeout. Trim only the text
+	// we return.
+	s := string(n.line)
+	if strings.TrimSpace(s) == "" {
 		return "", false
 	}
 	if looksLikePrompt(s) {

@@ -198,6 +198,12 @@ func TestNormalizer_PendingPromptDetection(t *testing.T) {
 		{"Are you sure you want to continue connecting (yes/no)? ", true},
 		{"Overwrite? [y/N] ", true},
 		{"Enter passphrase for key '/root/.ssh/id_rsa': ", true},
+		// Inquirer-style "? " prompt: the trailing space is what the generic
+		// `\?\s+$` detector matches on, so it must survive the un-emitted line
+		// undetected-trimmed. A regression here left the session hanging until
+		// the much longer session timeout.
+		{"Project name? ", true},
+		{"Overwrite files? ", true},
 		{"Building project...", false},
 		{"", false},
 	}
