@@ -2,7 +2,7 @@
 // -----------------------------------------------------------------------------
 // Periodic scanner that detects and (optionally) kills orphaned CLI processes.
 //
-// Background: when an interactive CLI session (claude/codex/gemini) is started
+// Background: when an interactive CLI session (claude/codex) is started
 // via session.go and the parent terminal session is torn down or times out,
 // the spawned CLI process can keep running detached — autonomously consuming
 // AI credits and disk while the user has no UI control over it. This scanner

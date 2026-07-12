@@ -1,13 +1,12 @@
 // File: stream_parser.go
 // -----------------------------------------------------------------------------
-// Parses structured JSON streaming output from CLI agents (Claude, Codex,
-// Gemini) and extracts human-readable display text. This allows the frontend
+// Parses structured JSON streaming output from CLI agents (Claude, Codex)
+// and extracts human-readable display text. This allows the frontend
 // to show clean text instead of raw JSON events.
 //
 // Each CLI uses a different JSON streaming format:
 //   - Claude: --output-format stream-json     (Anthropic API streaming events)
 //   - Codex:  --json                          (JSONL events)
-//   - Gemini: -o stream-json                  (NDJSON events)
 //   - Grok:   --output-format streaming-json  (NDJSON: text / thought / end frames)
 // -----------------------------------------------------------------------------
 
@@ -99,8 +98,6 @@ func extractDisplayText(command, line string) string {
 		return extractClaudeDisplayText(raw)
 	case strings.HasPrefix(base, "codex"):
 		return extractCodexDisplayText(raw)
-	case strings.HasPrefix(base, "gemini"):
-		return extractGeminiDisplayText(raw)
 	case strings.HasPrefix(base, "grok"):
 		return extractGrokDisplayText(raw, line)
 	default:
@@ -314,52 +311,6 @@ func extractCodexItemCompleted(raw map[string]interface{}) string {
 }
 
 /* --------------------------------------------------------------------------
-   Gemini CLI parser
-   -------------------------------------------------------------------------- */
-
-// extractGeminiDisplayText extracts display text from a Gemini stream-json event.
-func extractGeminiDisplayText(raw map[string]interface{}) string {
-	eventType, _ := raw["type"].(string)
-
-	switch eventType {
-	case "message":
-		role, _ := raw["role"].(string)
-		if role != "assistant" && role != "model" {
-			return ""
-		}
-		// Try content array first, then direct string
-		if text := extractContentArray(raw); text != "" {
-			return text
-		}
-		if content, ok := raw["content"].(string); ok {
-			return content
-		}
-		return ""
-
-	case "tool_use":
-		name, _ := raw["tool_name"].(string)
-		if name == "" {
-			name, _ = raw["name"].(string)
-		}
-		if name != "" {
-			return fmt.Sprintf("\n[Using tool: %s]\n", name)
-		}
-		return ""
-
-	case "error":
-		if errMsg, _ := raw["message"].(string); errMsg != "" {
-			return fmt.Sprintf("\n[Error: %s]\n", errMsg)
-		}
-		return ""
-
-	case "tool_result", "result", "init":
-		return "" // skip metadata
-	}
-
-	return ""
-}
-
-/* --------------------------------------------------------------------------
    Grok parser
    -------------------------------------------------------------------------- */
 
@@ -414,8 +365,8 @@ func extractGrokDisplayText(raw map[string]interface{}, line string) string {
    Shared helpers
    -------------------------------------------------------------------------- */
 
-// extractContentArray extracts text from a "content" array field, used by both
-// Claude and Gemini flat events. The content array contains items like
+// extractContentArray extracts text from a "content" array field, used by
+// Claude flat events. The content array contains items like
 // {"type": "text", "text": "..."}.
 func extractContentArray(raw map[string]interface{}) string {
 	content, ok := raw["content"].([]interface{})

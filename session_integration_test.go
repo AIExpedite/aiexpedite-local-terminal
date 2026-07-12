@@ -1,8 +1,8 @@
 // session_integration_test.go
 // -----------------------------------------------------------------------------
 // End-to-end lifecycle tests for SessionManager + the 3 CLI flows
-// (claude / codex / gemini). Uses the test binary itself as a mock CLI so we
-// don't need claude / codex / gemini installed on the test host and so we get
+// (claude / codex). Uses the test binary itself as a mock CLI so we
+// don't need claude / codex installed on the test host and so we get
 // deterministic timing.
 //
 // The mock CLI is dispatched by the TEST_MOCK_CLI_MODE env var inside TestMain.
@@ -66,7 +66,6 @@ func TestMain(m *testing.M) {
 //   - codex:  print streaming events including item.completed,
 //     thread.completed, then exit. Prompt is in argv (we don't actually use
 //     it — the mock has fixed output).
-//   - gemini: emit message events then a result event, then exit.
 //   - sleep-then-emit: emit the events AFTER a delay so we can test stream
 //     completion ordering under load.
 func runMockCLI(mode string) {
@@ -123,12 +122,6 @@ func runMockCLI(mode string) {
 		fmt.Println(`{"type":"turn.completed"}`)
 		os.Exit(0)
 
-	case "gemini":
-		// gemini stream-json output. Prompt is in argv.
-		fmt.Println(`{"type":"message","role":"assistant","content":"hello from gemini"}`)
-		fmt.Println(`{"type":"result","subtype":"success"}`)
-		os.Exit(0)
-
 	case "stream-burst":
 		// Emit many lines quickly to stress the async publish path. Used to
 		// verify no stream chunks get dropped under load.
@@ -148,9 +141,9 @@ func runMockCLI(mode string) {
 		os.Exit(0)
 
 	case "stderr-and-exit":
-		// CLI that writes only to stderr (some Gemini error paths look like
+		// CLI that writes only to stderr (some CLI error paths look like
 		// this). SessionManager should still surface this content.
-		fmt.Fprintln(os.Stderr, "permission denied: refresh your gemini token")
+		fmt.Fprintln(os.Stderr, "permission denied: refresh your auth token")
 		os.Exit(2)
 
 	case "agy-tty-frames":
@@ -351,7 +344,7 @@ func runMockCLI(mode string) {
 //
 // Since buildInteractiveCLIArgs picks the builder based on the command name,
 // and resolveExecutable picks the binary based on the command name, we DO
-// need the command name to be exactly "claude" / "codex" / "gemini" for the
+// need the command name to be exactly "claude" / "codex" for the
 // argv shape to match. For the integration tests below, we sidestep this
 // by directly calling StartSession with a mock command — accepting that
 // resolveExecutable for "claude" goes through cachedResolveClaudePath which
@@ -398,7 +391,21 @@ func captureSession(t *testing.T, mockMode string, sessionCmd string, args []str
 	// runs buildInteractiveCLIArgs which returns the args/stdinPrompt shape
 	// for the configured CLI — and resolveExecutable will use exec.LookPath
 	// which finds our mock in tmpDir.
-	startErr := sm.StartSession(id, sessionCmd, args, tmpDir, "ws-test", "uid-test", 30000, false, publishFn)
+	//
+	// Retry on ETXTBSY ("text file busy"): we copy the (large) test binary
+	// into tmpDir and immediately exec it. On Linux a concurrent fork/exec
+	// in another goroutine can transiently inherit a writable fd to the
+	// freshly-written mock, so the kernel refuses the exec until that fd is
+	// closed. This is a known, transient race (golang/go#22315); the stdlib's
+	// own tests retry the same way. It clears within milliseconds.
+	var startErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		startErr = sm.StartSession(id, sessionCmd, args, tmpDir, "ws-test", "uid-test", 30000, false, publishFn)
+		if startErr == nil || !strings.Contains(startErr.Error(), "text file busy") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if startErr != nil {
 		return id, nil, fmt.Errorf("StartSession: %w", startErr)
 	}
@@ -512,20 +519,6 @@ func TestSessionLifecycle_CodexDeferredStdinPrompt(t *testing.T) {
 	}
 }
 
-func TestSessionLifecycle_Gemini(t *testing.T) {
-	_, messages, err := captureSession(t, "gemini", "gemini", []string{"summarize this repo"}, "")
-	if err != nil {
-		t.Fatalf("captureSession: %v", err)
-	}
-
-	assertLifecycleOrdering(t, messages)
-
-	streamText := concatStreamOutput(messages)
-	if !strings.Contains(streamText, "hello from gemini") {
-		t.Errorf("expected stream output to contain assistant message text; got %q", streamText)
-	}
-}
-
 // TestSessionLifecycle_GenericShim runs the same lifecycle assertions but
 // using a command name ("shim") that doesn't match any of the special CLI
 // handlers in buildInteractiveCLIArgs. The args go through unmodified and
@@ -623,7 +616,7 @@ func TestSessionLifecycle_ImmediateExitDoesNotHang(t *testing.T) {
 }
 
 /* --------------------------------------------------------------------------
-   Edge-case: CLI that writes only to stderr (Gemini error paths)
+   Edge-case: CLI that writes only to stderr (CLI error paths)
    ------------------------------------------------------------------------ */
 
 func TestSessionLifecycle_StderrOnlyIsStreamed(t *testing.T) {

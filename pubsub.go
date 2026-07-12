@@ -2260,11 +2260,11 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 		}
 	}
 
-	// CLI coding agents (claude, codex, gemini) use interactive/streaming output
+	// CLI coding agents (claude, codex) use interactive/streaming output
 	// that doesn't work with persistent PowerShell stdin pipes.
 	// Always spawn a new powershell.exe process for these commands.
 	cmdLower := strings.ToLower(cmd)
-	isCLIAgent := cmdLower == "claude" || cmdLower == "codex" || cmdLower == "gemini"
+	isCLIAgent := cmdLower == "claude" || cmdLower == "codex"
 	if isCLIAgent {
 		fmt.Printf("%s[aiexpedite] Using dedicated process for CLI agent: %s%s\n", colorCyan, cmd, colorReset)
 		// Resolve full path for claude since it may not be in fallback PowerShell's PATH.

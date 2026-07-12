@@ -976,71 +976,6 @@ func TestCodexUsageParser_RolloutRanksByMtimeNotFilename(t *testing.T) {
 	}
 }
 
-func TestGeminiUsageParser_FreeTierFramesTotal(t *testing.T) {
-	home := t.TempDir()
-	helperWriteJSON(t, filepath.Join(home, ".gemini", "settings.json"), map[string]any{
-		"email": "bob@example.com",
-		"tier":  "free",
-	})
-	usage, _ := geminiUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
-	if usage == nil {
-		t.Fatalf("expected usage")
-	}
-	if usage.Plan != "free" {
-		t.Errorf("Plan=%q, want free", usage.Plan)
-	}
-	if len(usage.Metrics) != 1 || usage.Metrics[0].Total == nil || *usage.Metrics[0].Total != 1000 {
-		t.Errorf("expected daily free cap of 1000 requests, got %+v", usage.Metrics)
-	}
-}
-
-func TestGeminiUsageParser_OAuthCredentialsAccount(t *testing.T) {
-	home := t.TempDir()
-	helperWriteJSON(t, filepath.Join(home, ".gemini", "oauth_creds.json"), map[string]any{
-		"id_token": helperJWT(t, map[string]any{
-			"email": "gemini-oauth@example.com",
-			"sub":   "gemini-subject",
-		}),
-	})
-	helperWriteJSON(t, filepath.Join(home, ".gemini", "settings.json"), map[string]any{
-		"tier": "free",
-	})
-
-	usage, _ := geminiUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
-	if usage == nil {
-		t.Fatalf("expected usage")
-	}
-	if usage.Account != "gemini-oauth@example.com" {
-		t.Errorf("Account=%q, want gemini-oauth@example.com", usage.Account)
-	}
-	if usage.AccountFingerprint == "" {
-		t.Errorf("expected fingerprint for OAuth account")
-	}
-	if usage.Plan != "free" {
-		t.Errorf("Plan=%q, want free", usage.Plan)
-	}
-	if len(usage.Metrics) != 1 || usage.Metrics[0].Total == nil || *usage.Metrics[0].Total != 1000 {
-		t.Errorf("expected daily free cap of 1000 requests, got %+v", usage.Metrics)
-	}
-}
-
-func TestGeminiUsageParser_MissingTierKeepsTotalUnknown(t *testing.T) {
-	home := t.TempDir()
-	helperWriteJSON(t, filepath.Join(home, ".gemini", "settings.json"), map[string]any{
-		"email": "paid-or-unknown@example.com",
-	})
-	usage, _ := geminiUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
-	if usage == nil {
-		t.Fatalf("expected usage")
-	}
-	if len(usage.Metrics) != 1 {
-		t.Fatalf("expected one metric, got %d", len(usage.Metrics))
-	}
-	if usage.Metrics[0].Total != nil {
-		t.Errorf("missing tier should leave Total unknown, got %v", *usage.Metrics[0].Total)
-	}
-}
-
 func TestAntigravityUsageParser_PlanFromSettings(t *testing.T) {
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".gemini", "antigravity-cli", "settings.json"), map[string]any{
@@ -1638,7 +1573,7 @@ func TestGatherCLIAgentUsage_StableOrderAndOptIn(t *testing.T) {
 		t.Errorf("ordering changed: %s, %s", out[0].Provider, out[1].Provider)
 	}
 	for _, u := range out {
-		if u.Provider == "geminiCli" || u.Provider == "antigravity" {
+		if u.Provider == "antigravity" {
 			t.Errorf("unexpected entry for undetected agent: %s", u.Provider)
 		}
 	}

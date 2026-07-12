@@ -204,7 +204,7 @@ func TestMachineInfo_JSONShape_OmitsEmpty(t *testing.T) {
 
 // TestGatherCLIAgents_PopulatesDisplayName verifies that the Name field on
 // each emitted detectedCLIAgent carries the canonical product label
-// ("Antigravity", "Claude Code", "Codex", "Gemini CLI") rather than the
+// ("Antigravity", "Claude Code", "Codex") rather than the
 // binary name. The frontend's About-tab "CLI Tools" chips read
 // info.name || agentKey, so this is what shows in the UI.
 func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
@@ -222,7 +222,7 @@ func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
 	// LookPath only checks the executable bit; the version probe will time
 	// out / exit non-zero, but Detected + Name are populated before the
 	// version probe runs.
-	for _, bin := range []string{"claude", "codex", "gemini", "agy", "grok"} {
+	for _, bin := range []string{"claude", "codex", "agy", "grok"} {
 		stub := filepath.Join(dir, bin)
 		if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 			t.Fatalf("write stub %s: %v", stub, err)
@@ -237,7 +237,6 @@ func TestGatherCLIAgents_PopulatesDisplayName(t *testing.T) {
 	wantNames := map[string]string{
 		"claudeCode":  "Claude Code",
 		"codex":       "Codex",
-		"geminiCli":   "Gemini CLI",
 		"antigravity": "Antigravity",
 		"grok":        "Grok Build",
 	}

@@ -28,12 +28,29 @@ var (
 	configuredCLIAgentCatalog []cliAgentCatalogEntry
 )
 
+// removedCLIAgentKeys lists catalog identifiers and commands for CLI agents
+// whose support has been dropped. Backend-provided catalogs persisted on
+// upgraded agents may still carry these entries, so they are filtered out
+// during normalization to keep them from being detected or advertised.
+var removedCLIAgentKeys = map[string]bool{
+	"geminicli": true,
+	"gemini":    true,
+}
+
+func isRemovedCLIAgent(id, command string) bool {
+	// Normalize the command through commandBaseName so shimmed/pathed entries
+	// (e.g. "gemini.cmd", "gemini.exe", "/usr/local/bin/gemini") are filtered
+	// out too — the same normalization the rest of command routing uses. An
+	// exact-string match here would let those survive and keep being detected.
+	return removedCLIAgentKeys[strings.ToLower(strings.TrimSpace(id))] ||
+		removedCLIAgentKeys[commandBaseName(command)]
+}
+
 func defaultCLIAgentCatalog() []cliAgentCatalogEntry {
 	return []cliAgentCatalogEntry{
 		{ID: "antigravity", DisplayName: "Antigravity", DisplayOrder: 10, Command: "agy", DetectionKeys: []string{"antigravity", "agy"}},
 		{ID: "claudeCode", DisplayName: "Claude Code", DisplayOrder: 20, Command: "claude", DetectionKeys: []string{"claudeCode", "claude"}},
 		{ID: "codex", DisplayName: "Codex", DisplayOrder: 30, Command: "codex", DetectionKeys: []string{"codex"}},
-		{ID: "geminiCli", DisplayName: "Gemini CLI", DisplayOrder: 40, Command: "gemini", DetectionKeys: []string{"geminiCli", "gemini"}},
 		{ID: "grok", DisplayName: "Grok Build", DisplayOrder: 50, Command: "grok", DetectionKeys: []string{"grok", "grokBuild"}},
 	}
 }
@@ -70,6 +87,9 @@ func normalizeCLIAgentCatalog(entries []cliAgentCatalogEntry) []cliAgentCatalogE
 		}
 		command := firstCommandToken(raw.Command)
 		if command == "" {
+			continue
+		}
+		if isRemovedCLIAgent(id, command) {
 			continue
 		}
 		key := strings.ToLower(id)

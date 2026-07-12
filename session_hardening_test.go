@@ -77,12 +77,15 @@ func TestStartSession_UtilityGetsHeadlessGitEnv(t *testing.T) {
 func TestIsResidentAgentSessionCommand(t *testing.T) {
 	resident := []string{
 		"claude", "claude --print x", "/usr/local/bin/claude", "claude.cmd",
-		"codex", "codex exec", "gemini", "grok", "grok agent stdio",
+		"codex", "codex exec", "grok", "grok agent stdio",
 		"agy", "agy --print", "antigravity", "/opt/bin/antigravity", "antigravity.exe",
 	}
 	utility := []string{
 		"bash", "bash -c 'git push'", "sh", "git", "git fetch --all",
 		"powershell", "pwsh", "npm test", "pytest", "node app.js", "",
+		// Gemini's CLI-agent router was removed, so a stale/manual `gemini`
+		// session_start must fall through to headless hardening, not stay resident.
+		"gemini", "gemini --model x", "/usr/local/bin/gemini", "gemini.cmd",
 	}
 	for _, c := range resident {
 		if !isResidentAgentSessionCommand(c) {

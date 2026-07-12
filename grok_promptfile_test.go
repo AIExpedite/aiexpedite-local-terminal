@@ -4,7 +4,7 @@
 // from the inline `-p <prompt>` argv pair to `--prompt-file <tempPath>` so a
 // long review brief does not overflow the Windows command-line-length cap.
 // (grok's headless mode does not read piped stdin, so a temp file is the
-// file-based analog of the stdin route claude/codex/gemini use.)
+// file-based analog of the stdin route claude/codex use.)
 // -----------------------------------------------------------------------------
 
 package main

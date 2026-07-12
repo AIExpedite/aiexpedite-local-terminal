@@ -1,7 +1,7 @@
 // File: session.go
 // -----------------------------------------------------------------------------
 // SessionManager manages long-lived interactive CLI agent sessions (claude,
-// codex, gemini).  Each session holds a process with stdin/stdout/stderr pipes.
+// codex).  Each session holds a process with stdin/stdout/stderr pipes.
 // Output is streamed back via a publish function, and stdin input can be sent
 // by session ID.
 // -----------------------------------------------------------------------------
@@ -51,7 +51,7 @@ const (
 // bidirectional I/O pipes and streaming output.
 type CLISession struct {
 	ID        string
-	Command   string // "claude", "codex", "gemini"
+	Command   string // "claude", "codex"
 	Process   *exec.Cmd
 	Stdin     io.WriteCloser
 	Stdout    io.ReadCloser
@@ -73,7 +73,7 @@ type CLISession struct {
 	// Removed exactly once after the process exits (see waitForExit).
 	promptFile string
 
-	// deferredStdinClose marks a one-shot, stdin-fed CLI (codex/gemini) that
+	// deferredStdinClose marks a one-shot, stdin-fed CLI (codex) that
 	// was started with NO prompt — the chat-direct flow opens the session
 	// eagerly and delivers the first message later via SendInput. Stdin is left
 	// open at start (see shouldCloseStdinAfterStart) and closed by SendInput
@@ -190,7 +190,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	}
 
 	// grok's headless mode takes its prompt on argv (`-p <prompt>`) and does NOT
-	// read a piped stdin, so — unlike claude/codex/gemini, which route a long
+	// read a piped stdin, so — unlike claude/codex, which route a long
 	// prompt through stdinPrompt — a long review brief would blow past the
 	// Windows command-line-length cap ("command line too long"). grok accepts
 	// `--prompt-file <path>` as a drop-in for `-p <prompt>`, so relocate the
@@ -286,7 +286,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		UID:         uid,
 		TimeoutMs:   timeoutMs,
 		promptFile:  promptFile,
-		// A stdin-fed one-shot CLI (codex/gemini) started without a prompt keeps
+		// A stdin-fed one-shot CLI (codex) started without a prompt keeps
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
 		deferredStdinClose: stdinPromptFormat(command) == "plain" && stdinPrompt == "",
@@ -427,7 +427,7 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		return fmt.Errorf("timeout writing to session %s stdin (pipe buffer full)", id)
 	}
 
-	// One-shot, stdin-fed CLIs (codex/gemini) started without a prompt held
+	// One-shot, stdin-fed CLIs (codex) started without a prompt held
 	// their stdin open waiting for this first message. codex exec reads stdin
 	// to EOF before running, so close the pipe now that the prompt is written —
 	// otherwise the child waits forever for EOF. Done once: a subsequent
@@ -639,28 +639,25 @@ func (sm *SessionManager) removeSession(id string) {
 //     event detection in readOutputStream) or when the orchestrator ends the
 //     session explicitly.
 //
-//   - codex and gemini are one-shot AND receive their prompt via stdin (codex
-//     via the `-` positional placeholder; gemini via its interactive piped
-//     stdin) so multi-KB briefs don't overflow Windows' command-line cap. Both
-//     read stdin to completion before/at the start of inference, so we ALWAYS
-//     close stdin after the prompt write — leaving it open hangs the process
-//     indefinitely waiting for EOF. (Gemini's stdin was already closed right
-//     after launch on the old argv path, so this is no multi-turn regression.)
+//   - codex is one-shot AND receives its prompt via stdin (via the `-`
+//     positional placeholder) so multi-KB briefs don't overflow Windows'
+//     command-line cap. It reads stdin to completion before/at the start of
+//     inference, so we ALWAYS close stdin after the prompt write — leaving it
+//     open hangs the process indefinitely waiting for EOF.
 //
 //   - agy and all non-CLI commands (powershell, bash, git, ...) keep the
 //     pre-existing rule: close stdin iff no stdinPrompt was queued. agy gets
 //     its prompt on argv (it ignores piped stdin), so stdinPrompt is empty.
 func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
 	// Route through commandBaseName so absolute/relative paths like
-	// `/opt/bin/codex` or `C:\tools\gemini.cmd` follow the same stdin policy
-	// as bare names — otherwise the argv builder would shape them as stdin-
-	// fed codex/gemini sessions while this function left the pipe open,
-	// hanging the child waiting for EOF.
+	// `/opt/bin/codex` follow the same stdin policy as bare names — otherwise
+	// the argv builder would shape them as stdin-fed codex sessions while this
+	// function left the pipe open, hanging the child waiting for EOF.
 	base := commandBaseName(command)
 	switch {
 	case strings.HasPrefix(base, "claude"):
 		return false
-	case strings.HasPrefix(base, "codex"), strings.HasPrefix(base, "gemini"):
+	case strings.HasPrefix(base, "codex"):
 		// One-shot, stdin-fed CLIs: close stdin right after start ONLY when a
 		// prompt was delivered at start (the delegate/one-shot path). When the
 		// session is started with NO prompt — the chat-direct flow eagerly
@@ -689,13 +686,13 @@ func waitForStreamCompletion(session *CLISession, timeout time.Duration) {
 }
 
 // detectCLITerminalEvent returns true if the JSON line marks the natural end of
-// a CLI agent turn — Claude "result", Codex "thread.completed"/"turn.completed",
-// or Gemini "result". Used to flush any pending stream batch before the CLI
+// a CLI agent turn — Claude "result", Codex "thread.completed"/"turn.completed".
+// Used to flush any pending stream batch before the CLI
 // process exits, so the final text chunk does not race with session_ended.
 //
 // Returning true means: "this CLI has just announced it is done; flush now and
 // expect process exit very soon." Unlike detectResultEvent, this does NOT cause
-// stdin to be closed (only Claude needs that — codex/gemini exit on their own
+// stdin to be closed (only Claude needs that — codex exits on its own
 // once stdin is closed at start). Detection here is best-effort: if a CLI emits
 // a terminal event we don't recognise, the existing process-exit path still
 // triggers the flush in the !ok branch of readOutputStream.
@@ -721,8 +718,6 @@ func detectCLITerminalEvent(command, line string) bool {
 		// Codex emits turn.completed when the turn is done. thread.completed is
 		// the very last event before the process exits.
 		return eventType == "thread.completed" || eventType == "turn.completed"
-	case strings.HasPrefix(base, "gemini"):
-		return eventType == "result"
 	case strings.HasPrefix(base, "grok"):
 		// Grok's `--output-format streaming-json` emits per-event frames
 		// (thought / text / end); `end` marks the natural end of the turn,
@@ -986,10 +981,10 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			}
 
 			// Detect CLI-terminal events (Claude "result", Codex
-			// "thread.completed"/"turn.completed", Gemini "result"). When we see
+			// "thread.completed"/"turn.completed"). When we see
 			// one we flush any buffered text BEFORE the CLI process exits — the
 			// process-exit path also flushes via the !ok branch, but on a fast
-			// exit (Claude after stdin close, codex/gemini after final event)
+			// exit (Claude after stdin close, codex after final event)
 			// the timing race can leave the final batch in flight while
 			// session_ended is already being published. Flushing here guarantees
 			// the last chunk is enqueued for publish before the exit cascade.
@@ -1377,7 +1372,7 @@ var claudeBillingStripped = []string{
 // of the stripped variables in the order they appeared, suitable for an
 // auditable [session] log line.
 //
-// The billing-var strip is gated on isClaudeCommand(command): codex / gemini
+// The billing-var strip is gated on isClaudeCommand(command): codex
 // / arbitrary shells are unaffected so they keep working with whatever auth
 // the user has configured for those tools.
 func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
@@ -1430,7 +1425,7 @@ func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 // of relying on claude's default-when-unset. It is the truthful tag for an
 // interactive session — NOT spoofing (we never set "claude-vscode"/"sdk-ts").
 //
-// Non-claude commands (codex / gemini / shells) get only the sanitise step;
+// Non-claude commands (codex / shells) get only the sanitise step;
 // no entrypoint is injected.
 func prepareClaudeChildEnv(command string, env []string) ([]string, []string) {
 	filtered, stripped := sanitizeClaudeChildEnv(command, env)
@@ -1504,16 +1499,21 @@ func isAntigravityCommand(command string) bool {
 
 // isResidentAgentSessionCommand reports whether a session_start command is a
 // resident CLI agent that keeps its interactive-capable env. These are exactly
-// the commands buildInteractiveCLIArgs shapes (claude/codex/gemini/grok) plus
-// the PTY-only TUI agents (agy/antigravity). Everything else is a one-shot
-// utility (bash/sh/git/PowerShell/test runner) that MUST be headless-hardened
-// on the pipe session path — see StartSession.
+// the commands buildInteractiveCLIArgs shapes (claude/codex/grok) plus the
+// PTY-only TUI agents (agy/antigravity). Everything else is a one-shot utility
+// (bash/sh/git/PowerShell/test runner) that MUST be headless-hardened on the
+// pipe session path — see StartSession.
+//
+// Gemini is intentionally NOT listed: its CLI-agent router was removed, so a
+// stale or manually approved `gemini` session_start now falls through to
+// generic execution and MUST be headless-hardened like any other non-agent
+// command (otherwise it would keep the interactive terminal behavior #69
+// removed from generic session commands).
 func isResidentAgentSessionCommand(command string) bool {
 	base := commandBaseName(command)
 	switch {
 	case strings.HasPrefix(base, "claude"),
 		strings.HasPrefix(base, "codex"),
-		strings.HasPrefix(base, "gemini"),
 		strings.HasPrefix(base, "grok"):
 		return true
 	}
@@ -1533,17 +1533,12 @@ func isResidentAgentSessionCommand(command string) bool {
 //   - codex:       stdinPrompt is the prompt, written as raw text; codex exec
 //     reads stdin to completion (`-` positional placeholder)
 //     then exits; one-shot per process
-//   - gemini:      stdinPrompt is the prompt, written as raw text; gemini runs
-//     in its default INTERACTIVE mode (no -p) and reads the prompt
-//     from the piped stdin, so multi-KB briefs don't overflow
-//     Windows' cmd.exe command-line cap. Over a pipe gemini reads
-//     to EOF, so stdin is closed after the write (one-shot).
 //   - antigravity: prompt as positional argv via `--print`. agy does NOT read
 //     piped stdin (verified against agy 1.0.4: ignored in both
 //     interactive and --print modes — it needs a real TTY), so the
 //     prompt must stay on argv. agy resolves to a native `agy.exe`
 //     (NOT a cmd.exe shim), so the relevant cap is the 32KB
-//     CreateProcess limit, not gemini's 8191-char cmd.exe cap.
+//     CreateProcess limit, not an 8191-char cmd.exe cap.
 //   - other:       prompt stays in args
 //
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
@@ -1556,8 +1551,6 @@ func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysAppr
 		return buildClaudeInteractiveArgs(args)
 	case strings.HasPrefix(base, "codex"):
 		return buildCodexInteractiveArgs(args)
-	case strings.HasPrefix(base, "gemini"):
-		return buildGeminiInteractiveArgs(args)
 	case isAntigravityCommand(command):
 		return buildAntigravityInteractiveArgs(args), ""
 	case strings.HasPrefix(base, "grok"):
@@ -1583,7 +1576,7 @@ func stdinPromptFormat(command string) string {
 	switch {
 	case strings.HasPrefix(base, "claude"):
 		return "ndjson"
-	case strings.HasPrefix(base, "codex"), strings.HasPrefix(base, "gemini"):
+	case strings.HasPrefix(base, "codex"):
 		return "plain"
 	}
 	return ""
@@ -1846,12 +1839,12 @@ func sanitizeCodexExecArgs(args []string) []string {
 // stream-json input — so we cannot drive it as a multi-turn streaming session
 // like claude. We run a one-shot `--print` with the prompt as a positional arg.
 //
-// WHY NOT STDIN (unlike gemini/codex): agy does NOT read a piped stdin —
+// WHY NOT STDIN (unlike codex): agy does NOT read a piped stdin —
 // verified live against agy 1.0.4, piped input is ignored in BOTH interactive
 // and --print modes (agy appears to require a real TTY for interactive input),
 // so the prompt MUST be passed on argv. agy also resolves to a NATIVE `agy.exe`
 // (not an npm cmd.exe/.ps1 shim), so it is launched directly via CreateProcess —
-// the relevant ceiling is the ~32KB CreateProcess command-line cap, NOT gemini's
+// the relevant ceiling is the ~32KB CreateProcess command-line cap, NOT an
 // 8191-char cmd.exe cap. So agy does NOT have the "command line is too long."
 // failure for normal (≤ ~32KB) briefs; only briefs approaching 32KB would risk
 // it, which would need a TTY/ACP-style redesign rather than the stdin trick.
@@ -1911,7 +1904,7 @@ var grokSubcommandActions = map[string]bool{
 // exits (empty when no rewrite happened).
 //
 // WHY: buildGrokInteractiveArgs always appends the prompt on argv as `-p
-// <prompt>` (the LAST two tokens). claude/codex/gemini sidestep the OS
+// <prompt>` (the LAST two tokens). claude/codex sidestep the OS
 // command-line-length cap by piping long prompts through stdin, but grok's
 // headless mode does NOT read piped stdin — so a long review brief overflows
 // the Windows command line ("command line too long" / "powershell path too
@@ -2378,116 +2371,6 @@ func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []str
 	return result
 }
 
-// buildGeminiInteractiveArgs builds Gemini CLI args, routing the prompt via
-// STDIN instead of argv and running gemini in its default INTERACTIVE mode
-// (no -p/--print).
-//
-// WHY STDIN: on Windows, `gemini` resolves to the npm `gemini.cmd` / `gemini.ps1`
-// shim, which cmd.exe executes. cmd.exe rejects command lines longer than 8191
-// characters with "The command line is too long." A multi-KB kickoff brief
-// passed as a positional arg blew past that limit — the CLI exited 1 with no
-// work done (observed as a failing "kickoff tertiary: gemini with 9 KB brief").
-//
-// WHY NO -p: gemini's interactive mode reads the prompt from a piped (non-TTY)
-// stdin just like headless `-p` does — verified against gemini 0.32.1: piped
-// stdin becomes the user prompt and `-o stream-json` output is emitted as
-// expected — so we run it WITHOUT -p per the chosen integration style.
-// `-o stream-json` keeps the structured output the stream parser understands;
-// `--approval-mode auto_edit` preserves the prior autonomy posture. A
-// caller-supplied `-p`/`--prompt` is still stripped from argv and folded into
-// the stdin prompt below (we never want -p on argv — it would switch gemini to
-// headless mode and collide with the interactive piped-stdin contract).
-//
-// LIFECYCLE: over a pipe, gemini reads stdin to EOF and treats it as a SINGLE
-// prompt (verified: two newline-separated lines arrived as one user message),
-// so StartSession writes the brief then CLOSES stdin to let gemini start — see
-// shouldCloseStdinAfterStart (returns true for gemini). This matches gemini's
-// pre-existing one-shot lifecycle on the old argv path. True multi-turn over a
-// pipe is not possible here (gemini would block waiting for EOF); that would
-// require gemini's experimental ACP stdio protocol — a separate, larger change.
-//
-// Returns (cliArgs, stdinPrompt):
-//   - cliArgs carries only flags (no prompt on argv, no -p).
-//   - stdinPrompt is the joined positional + caller -p/--prompt text.
-func buildGeminiInteractiveArgs(args []string) ([]string, string) {
-	// Gemini flags that consume the next argument as their value — without this
-	// e.g. `--model gemini-3-pro` would treat "gemini-3-pro" as a prompt word.
-	// The `--flag=value` form is a single token and doesn't need an entry here.
-	// -p/--prompt is intentionally NOT in this map: when the caller supplies a
-	// prompt flag, we route its value into stdinPrompt below instead of leaving
-	// a stray `-p VALUE` on argv (any -p would switch gemini to headless mode).
-	valuedFlags := map[string]bool{
-		"-m": true, "--model": true,
-		"-o": true, "--output-format": true,
-		"-e": true, "--extensions": true,
-		"-r": true, "--resume": true,
-		"-i": true, "--prompt-interactive": true,
-		"-w": true, "--worktree": true,
-		"--approval-mode": true, "--policy": true,
-		"--allowed-tools": true, "--allowed-mcp-server-names": true,
-		"--include-directories": true, "--delete-session": true,
-	}
-
-	// Split user-provided flags (with their values) from positional prompt
-	// parts. Positional parts become the stdin prompt; flags stay on argv.
-	// User-supplied `-p`/`--prompt` is converted into stdin prompt input — we
-	// must never leave a `-p` on argv because it switches gemini out of the
-	// interactive piped-stdin mode this builder relies on.
-	var flagArgs []string
-	var promptParts []string
-	skipNext := false
-	captureNextAsPrompt := false
-	for i, a := range args {
-		if skipNext {
-			skipNext = false
-			flagArgs = append(flagArgs, a)
-			continue
-		}
-		if captureNextAsPrompt {
-			captureNextAsPrompt = false
-			if a != "" {
-				promptParts = append(promptParts, a)
-			}
-			continue
-		}
-		if strings.HasPrefix(a, "-") {
-			if a == "-p" || a == "--prompt" {
-				if i+1 < len(args) {
-					captureNextAsPrompt = true
-				}
-				continue
-			}
-			if strings.HasPrefix(a, "-p=") {
-				if v := strings.TrimPrefix(a, "-p="); v != "" {
-					promptParts = append(promptParts, v)
-				}
-				continue
-			}
-			if strings.HasPrefix(a, "--prompt=") {
-				if v := strings.TrimPrefix(a, "--prompt="); v != "" {
-					promptParts = append(promptParts, v)
-				}
-				continue
-			}
-			flagArgs = append(flagArgs, a)
-			if !strings.Contains(a, "=") && valuedFlags[a] && i+1 < len(args) {
-				skipNext = true
-			}
-			continue
-		}
-		promptParts = append(promptParts, a)
-	}
-
-	result := make([]string, 0, len(flagArgs)+4)
-	result = append(result, flagArgs...)
-	result = append(result, "-o", "stream-json")
-	result = append(result, "--approval-mode", "auto_edit")
-	// No -p: gemini runs in interactive mode and reads the prompt from the
-	// piped stdin (StartSession writes it, then closes stdin so gemini starts).
-
-	return result, strings.Join(promptParts, " ")
-}
-
 /* --------------------------------------------------------------------------
    Executable resolution
    -------------------------------------------------------------------------- */
@@ -2521,7 +2404,7 @@ func resolveExecutable(command string) string {
 		return cachedResolveClaudePath()
 	}
 
-	// For codex and gemini, try PATH lookup
+	// For codex, try PATH lookup
 	if path, err := exec.LookPath(command); err == nil {
 		return path
 	}
@@ -2619,8 +2502,6 @@ func detectPromptFromJSON(command, line string) *promptInfo {
 		return detectClaudePrompt(event)
 	case strings.HasPrefix(base, "codex"):
 		return detectCodexPrompt(event)
-	case strings.HasPrefix(base, "gemini"):
-		return detectGeminiPrompt(event)
 	}
 
 	return nil
@@ -2685,23 +2566,6 @@ func detectCodexPrompt(event map[string]interface{}) *promptInfo {
 		text := "Codex is requesting approval"
 		if command != "" {
 			text = fmt.Sprintf("Approve command: %s", command)
-		}
-		return &promptInfo{Text: text, Type: "permission"}
-	}
-
-	return nil
-}
-
-// detectGeminiPrompt detects approval requests in Gemini stream-json output.
-func detectGeminiPrompt(event map[string]interface{}) *promptInfo {
-	eventType, _ := event["type"].(string)
-
-	switch eventType {
-	case "toolCallApproval", "approval_request":
-		toolName, _ := event["toolName"].(string)
-		text := "Gemini CLI is requesting tool approval"
-		if toolName != "" {
-			text = fmt.Sprintf("Approve tool: %s", toolName)
 		}
 		return &promptInfo{Text: text, Type: "permission"}
 	}

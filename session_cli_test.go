@@ -1,9 +1,9 @@
 // session_cli_test.go
 // -----------------------------------------------------------------------------
 // Unit tests for the per-CLI argument builders, event detection, and display-text
-// extraction used by the SessionManager when proxying claude / codex / gemini.
+// extraction used by the SessionManager when proxying claude / codex / antigravity / grok.
 //
-// This is the safety net that pins behaviour for the three supported CLI agents:
+// This is the safety net that pins behaviour for the supported CLI agents:
 //
 //   - claude:  --output-format stream-json + --input-format stream-json + -p,
 //              prompt sent as NDJSON on stdin, stdin held open until the
@@ -13,8 +13,6 @@
 //              as a positional arg, stdin closed at start (codex exec appends
 //              piped stdin to the prompt; leaving the pipe open makes it wait
 //              indefinitely for EOF).
-//   - gemini:  prompt as the first positional arg, -o stream-json,
-//              --approval-mode auto_edit, stdin closed at start.
 //
 // Critical regression context (v0.9.6/v0.9.7): a fix to make codex exec actually
 // terminate (PR #17) changed stdin handling in a way that risked breaking the
@@ -263,125 +261,6 @@ func TestBuildClaudeInteractiveArgs_PromptEndsWithDashedToken(t *testing.T) {
 }
 
 /* --------------------------------------------------------------------------
-   buildGeminiInteractiveArgs
-   --------------------------------------------------------------------------
-   Gemini receives the prompt via STDIN in its default INTERACTIVE mode (no -p)
-   rather than as a positional argv — the switch fixes the Windows cmd.exe
-   8191-char command-line cap that bit multi-KB kickoff briefs ("The command
-   line is too long.", exit 1). The prompt is returned as stdinPrompt; argv
-   carries only flags plus our fixed -o stream-json / --approval-mode auto_edit.
-   No -p/--print: gemini's interactive mode reads the piped stdin as the prompt
-   (verified against gemini 0.32.1).
-   ------------------------------------------------------------------------ */
-
-func TestBuildGeminiInteractiveArgs_PromptGoesToStdin(t *testing.T) {
-	args, prompt := buildGeminiInteractiveArgs([]string{"explain the auth flow"})
-	if prompt != "explain the auth flow" {
-		t.Errorf("gemini stdinPrompt = %q, want %q", prompt, "explain the auth flow")
-	}
-	// The prompt MUST NOT appear on argv (that's the whole point of the fix).
-	for _, a := range args {
-		if a == "explain the auth flow" {
-			t.Errorf("prompt leaked onto argv: %v", args)
-		}
-	}
-	// stream-json flags present; NO -p (interactive mode, per the chosen style).
-	mustContain(t, args, "-o", "stream-json", "--approval-mode", "auto_edit")
-	for _, a := range args {
-		if a == "-p" || a == "--prompt" {
-			t.Errorf("gemini must run interactive (no -p/--print), got %v", args)
-		}
-	}
-}
-
-func TestBuildGeminiInteractiveArgs_PreservesUserFlags(t *testing.T) {
-	args, prompt := buildGeminiInteractiveArgs([]string{"explain", "--model", "gemini-3-pro"})
-	if prompt != "explain" {
-		t.Errorf("gemini stdinPrompt = %q, want %q", prompt, "explain")
-	}
-	// User flag + its value stay on argv (and the value is NOT misread as prompt).
-	mustContain(t, args, "--model", "gemini-3-pro", "-o", "stream-json", "--approval-mode", "auto_edit")
-}
-
-func TestBuildGeminiInteractiveArgs_EmptyArgs(t *testing.T) {
-	// No prompt → empty stdinPrompt, but the stream-json flags must still be
-	// present so gemini boots in stream-json mode.
-	args, prompt := buildGeminiInteractiveArgs([]string{})
-	if prompt != "" {
-		t.Errorf("empty input should yield empty stdinPrompt, got %q", prompt)
-	}
-	mustContain(t, args, "-o", "stream-json", "--approval-mode", "auto_edit")
-}
-
-// Regression: a user-supplied `-p "..."` must be converted into stdinPrompt
-// and stripped from argv. In interactive mode we never want ANY `-p` on argv —
-// a stray `-p` would switch gemini to headless mode and collide with the
-// interactive piped-stdin contract.
-func TestBuildGeminiInteractiveArgs_UserPromptFlagRoutedToStdin(t *testing.T) {
-	args, prompt := buildGeminiInteractiveArgs([]string{"-p", "explain the auth flow"})
-	if prompt != "explain the auth flow" {
-		t.Errorf("gemini stdinPrompt = %q, want %q", prompt, "explain the auth flow")
-	}
-	// NO `-p`/`--prompt` may appear on argv (interactive mode).
-	for _, a := range args {
-		if a == "-p" || a == "--prompt" {
-			t.Errorf("`-p`/`--prompt` must be stripped from argv (interactive mode), got %v", args)
-		}
-		if a == "explain the auth flow" {
-			t.Errorf("prompt leaked onto argv: %v", args)
-		}
-	}
-}
-
-func TestBuildGeminiInteractiveArgs_UserPromptEqualsFormRoutedToStdin(t *testing.T) {
-	// `--prompt=foo` is a single token; the value still has to end up on stdin
-	// rather than argv. Same for `-p=foo`.
-	for _, in := range [][]string{
-		{"--prompt=explain"},
-		{"-p=explain"},
-	} {
-		args, prompt := buildGeminiInteractiveArgs(in)
-		if prompt != "explain" {
-			t.Errorf("input=%v: stdinPrompt = %q, want %q", in, prompt, "explain")
-		}
-		for _, a := range args {
-			if a == "--prompt=explain" || a == "-p=explain" {
-				t.Errorf("input=%v: prompt-equals token leaked onto argv: %v", in, args)
-			}
-		}
-	}
-}
-
-// User-supplied `-p` plus positional prompt parts should both end up on stdin
-// (joined), not silently dropped.
-func TestBuildGeminiInteractiveArgs_UserPromptFlagAndPositionalCombine(t *testing.T) {
-	args, prompt := buildGeminiInteractiveArgs([]string{"-p", "first", "second"})
-	if prompt != "first second" {
-		t.Errorf("stdinPrompt = %q, want %q (args=%v)", prompt, "first second", args)
-	}
-}
-
-// Regression for P2 review on PR #33: Gemini's `--worktree`/`-w` is a string
-// option (https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/cli-reference.md).
-// Without marking it as value-taking, `gemini --worktree fix-branch "do the task"`
-// would keep only `--worktree` on argv and fold `fix-branch` into the stdin
-// prompt — gemini receives an empty worktree value and a polluted prompt.
-func TestBuildGeminiInteractiveArgs_PreservesWorktreeFlag(t *testing.T) {
-	for _, flag := range []string{"--worktree", "-w"} {
-		t.Run(flag, func(t *testing.T) {
-			args, prompt := buildGeminiInteractiveArgs([]string{flag, "fix-branch", "do the task"})
-			if prompt != "do the task" {
-				t.Errorf("prompt = %q, want %q (args=%v)", prompt, "do the task", args)
-			}
-			mustContain(t, args, flag, "fix-branch")
-			if strings.Contains(prompt, "fix-branch") {
-				t.Errorf("worktree value leaked into stdinPrompt %q", prompt)
-			}
-		})
-	}
-}
-
-/* --------------------------------------------------------------------------
    buildCodexInteractiveArgs
    --------------------------------------------------------------------------
    Codex receives the prompt via stdin (`-` placeholder) rather than as a
@@ -549,7 +428,7 @@ func TestBuildCodexInteractiveArgs_PromptWordResumeNotMistakenForSubcommand(t *t
    does NOT read a piped stdin — so the prompt stays a POSITIONAL argv and we
    run a one-shot `--print`. agy resolves to a native agy.exe (not a cmd.exe
    shim), so it is launched via CreateProcess (~32KB cap) and is not subject to
-   gemini's 8191-char cmd.exe cap. Single return value (no stdinPrompt).
+   the 8191-char cmd.exe command-line cap. Single return value (no stdinPrompt).
    ------------------------------------------------------------------------ */
 
 func TestBuildAntigravityInteractiveArgs_PrintAndPrompt(t *testing.T) {
@@ -695,10 +574,8 @@ func TestStdinPromptFormat(t *testing.T) {
 		{"codex", "plain"},
 		{"codex.cmd", "plain"},
 		{"CODEX", "plain"},
-		{"gemini", "plain"},     // gemini routes the prompt via stdin (interactive, no -p)
-		{"gemini.cmd", "plain"}, // normalize the Windows npm shim suffix too
-		{"agy", ""},             // antigravity keeps argv (it ignores piped stdin); no stdin prompt
-		{"agy.exe", ""},         // native agy.exe — still positional, no stdin prompt
+		{"agy", ""},     // antigravity keeps argv (it ignores piped stdin); no stdin prompt
+		{"agy.exe", ""}, // native agy.exe — still positional, no stdin prompt
 		{"powershell", ""},
 		{"", ""},
 	}
@@ -716,7 +593,6 @@ func TestStdinPromptFormat(t *testing.T) {
    Each CLI has its own stdinPrompt contract:
      - claude: prompt goes via NDJSON on stdin
      - codex:  prompt goes via raw stdin (`-` placeholder)
-     - gemini: prompt goes via raw stdin (interactive mode, no -p)
      - agy:    prompt stays positional (agy ignores piped stdin)
      - other:  passes through verbatim
    ------------------------------------------------------------------------ */
@@ -736,22 +612,6 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 		if len(args) == 0 || args[len(args)-1] != "-" {
 			t.Errorf("codex args must end with `-` placeholder, got %v", args)
 		}
-	})
-	t.Run("gemini", func(t *testing.T) {
-		args, prompt := buildInteractiveCLIArgs("gemini", []string{"hello"}, false)
-		if prompt != "hello" {
-			t.Errorf("gemini stdinPrompt = %q, want %q (prompt now goes via stdin)", prompt, "hello")
-		}
-		// Prompt must be off argv; interactive stream-json flags present, no -p.
-		for _, a := range args {
-			if a == "hello" {
-				t.Errorf("gemini prompt must NOT be on argv, got %v", args)
-			}
-			if a == "-p" || a == "--prompt" {
-				t.Errorf("gemini must run interactive (no -p), got %v", args)
-			}
-		}
-		mustContain(t, args, "-o", "stream-json")
 	})
 	t.Run("antigravity", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("agy", []string{"hello"}, false)
@@ -880,11 +740,11 @@ func TestDetectResultEvent_ClaudeResultEvent(t *testing.T) {
 }
 
 func TestDetectResultEvent_OnlyTriggersForClaude(t *testing.T) {
-	// codex and gemini both emit events with type:"result" too, but THEIR
+	// codex also emits events with type:"result" too, but THEIR
 	// result events do NOT mean stdin should be closed — they're already
 	// going to exit on their own.
 	line := `{"type":"result","result":"done"}`
-	for _, cmd := range []string{"codex", "gemini", "git", "powershell"} {
+	for _, cmd := range []string{"codex", "git", "powershell"} {
 		t.Run(cmd, func(t *testing.T) {
 			if detectResultEvent(cmd, line) {
 				t.Errorf("detectResultEvent(%q, ...) returned true — only claude should trigger stdin close", cmd)
@@ -937,15 +797,6 @@ func TestDetectCLITerminalEvent_Codex(t *testing.T) {
 	}
 }
 
-func TestDetectCLITerminalEvent_Gemini(t *testing.T) {
-	if !detectCLITerminalEvent("gemini", `{"type":"result"}`) {
-		t.Error("gemini result event must be a terminal event")
-	}
-	if detectCLITerminalEvent("gemini", `{"type":"message"}`) {
-		t.Error("gemini message event is NOT a terminal event")
-	}
-}
-
 func TestDetectCLITerminalEvent_NonJsonAndMalformedReturnFalse(t *testing.T) {
 	// We must NEVER flushBatch on a plain-text line by mistake — that would
 	// cause double flushes and could publish empty batches.
@@ -956,7 +807,7 @@ func TestDetectCLITerminalEvent_NonJsonAndMalformedReturnFalse(t *testing.T) {
 		`{"type":"result"`, // malformed JSON
 	}
 	for _, line := range cases {
-		for _, cmd := range []string{"claude", "codex", "gemini"} {
+		for _, cmd := range []string{"claude", "codex"} {
 			if detectCLITerminalEvent(cmd, line) {
 				t.Errorf("detectCLITerminalEvent(%q, %q) returned true; expected false", cmd, line)
 			}
@@ -1122,67 +973,6 @@ func TestExtractDisplayText_Codex_SkipsLifecycleEvents(t *testing.T) {
 }
 
 /* --------------------------------------------------------------------------
-   extractDisplayText — Gemini
-   ------------------------------------------------------------------------ */
-
-func TestExtractDisplayText_Gemini_AssistantMessageWithContentArray(t *testing.T) {
-	line := `{"type":"message","role":"assistant","content":[{"type":"text","text":"Hi"}]}`
-	got := extractDisplayText("gemini", line)
-	if got != "Hi" {
-		t.Errorf("got %q, want %q", got, "Hi")
-	}
-}
-
-func TestExtractDisplayText_Gemini_AssistantMessageWithStringContent(t *testing.T) {
-	// Older Gemini event shape used a plain string for content; both must work.
-	line := `{"type":"message","role":"assistant","content":"Hi there"}`
-	got := extractDisplayText("gemini", line)
-	if got != "Hi there" {
-		t.Errorf("got %q, want %q", got, "Hi there")
-	}
-}
-
-func TestExtractDisplayText_Gemini_ModelRoleIsTreatedAsAssistant(t *testing.T) {
-	// "model" is what the Google AI Studio / Vertex APIs use for the assistant
-	// turn; the gemini CLI may surface either.
-	line := `{"type":"message","role":"model","content":"From the model"}`
-	got := extractDisplayText("gemini", line)
-	if got != "From the model" {
-		t.Errorf("got %q, want %q", got, "From the model")
-	}
-}
-
-func TestExtractDisplayText_Gemini_SkipsUserRole(t *testing.T) {
-	line := `{"type":"message","role":"user","content":"the original prompt"}`
-	got := extractDisplayText("gemini", line)
-	if got != "" {
-		t.Errorf("user role must NOT echo back into stream output, got %q", got)
-	}
-}
-
-func TestExtractDisplayText_Gemini_ToolUse(t *testing.T) {
-	line := `{"type":"tool_use","tool_name":"ReadFile"}`
-	got := extractDisplayText("gemini", line)
-	if !strings.Contains(got, "ReadFile") {
-		t.Errorf("got %q, want output to mention 'ReadFile'", got)
-	}
-
-	// Gemini sometimes uses "name" instead of "tool_name" — both must work.
-	got2 := extractDisplayText("gemini", `{"type":"tool_use","name":"WriteFile"}`)
-	if !strings.Contains(got2, "WriteFile") {
-		t.Errorf("got %q, want output to mention 'WriteFile' (name field)", got2)
-	}
-}
-
-func TestExtractDisplayText_Gemini_ErrorEventSurfacesMessage(t *testing.T) {
-	line := `{"type":"error","message":"context window exceeded"}`
-	got := extractDisplayText("gemini", line)
-	if !strings.Contains(got, "context window exceeded") {
-		t.Errorf("error event must surface message: got %q", got)
-	}
-}
-
-/* --------------------------------------------------------------------------
    extractDisplayText — Grok
    --------------------------------------------------------------------------
    buildGrokInteractiveArgs forces `--output-format streaming-json`, which
@@ -1221,7 +1011,7 @@ func TestExtractDisplayText_Grok_SkipsThoughtAndEndAndMetadata(t *testing.T) {
 
 func TestExtractDisplayText_Grok_ToolUseSurfacesName(t *testing.T) {
 	// Grok's tool-use frames carry the tool name under either `name` or
-	// `tool_name` across versions; both must work, mirroring gemini.
+	// `tool_name` across versions; both must work.
 	got := extractDisplayText("grok", `{"type":"tool_use","name":"Bash"}`)
 	if !strings.Contains(got, "Bash") {
 		t.Errorf("got %q, want output to mention 'Bash'", got)
@@ -1277,7 +1067,7 @@ func TestExtractDisplayText_Grok_SubcommandJSONPassthrough(t *testing.T) {
 // managed streaming-json `-p` headless turn. extractDisplayText must use the
 // same normalisation — otherwise the parser fell through to default and
 // raw NDJSON frames were emitted as chat text. Same risk for claude / codex
-// / gemini installed at a non-bare path.
+// installed at a non-bare path.
 func TestExtractDisplayText_RoutesByBasename(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -1314,12 +1104,6 @@ func TestExtractDisplayText_RoutesByBasename(t *testing.T) {
 			command: `C:\Users\u\AppData\Roaming\npm\codex.cmd`,
 			line:    `{"type":"turn.started"}`,
 			want:    "",
-		},
-		{
-			name:    "gemini absolute path routes to gemini parser",
-			command: "/opt/bin/gemini",
-			line:    `{"type":"message","role":"assistant","content":"hi"}`,
-			want:    "hi",
 		},
 	}
 	for _, tc := range cases {
@@ -1369,28 +1153,16 @@ func TestDetectPromptFromJSON_Codex_ApprovalRequest(t *testing.T) {
 	}
 }
 
-func TestDetectPromptFromJSON_Gemini_ToolCallApproval(t *testing.T) {
-	line := `{"type":"toolCallApproval","toolName":"WriteFile"}`
-	info := detectPromptFromJSON("gemini", line)
-	if info == nil || info.Type != "permission" {
-		t.Fatalf("expected permission prompt, got %+v", info)
-	}
-	if !strings.Contains(info.Text, "WriteFile") {
-		t.Errorf("tool name should appear, got %q", info.Text)
-	}
-}
-
 func TestDetectPromptFromJSON_NonPromptEventsReturnNil(t *testing.T) {
 	cases := map[string]string{
 		"claude assistant": `{"type":"assistant","message":{}}`,
 		"codex item":       `{"type":"item.completed"}`,
-		"gemini message":   `{"type":"message","role":"assistant"}`,
 		"malformed":        `{"type":"permission_request"`,
 		"non-JSON":         "plain text",
 		"empty":            "",
 	}
 	for name, line := range cases {
-		for _, cmd := range []string{"claude", "codex", "gemini"} {
+		for _, cmd := range []string{"claude", "codex"} {
 			if info := detectPromptFromJSON(cmd, line); info != nil {
 				t.Errorf("%s on %s: expected nil, got %+v", name, cmd, info)
 			}
@@ -1407,8 +1179,9 @@ func TestDetectPromptFromJSON_NonPromptEventsReturnNil(t *testing.T) {
      initial prompt was queued. Closing stdin makes claude EOF and exit in
      ~3s — the prod failure mode for `terminal({command: "claude"})` with
      empty args observed in chatDefault test runs.
-   - Codex AND gemini: ALWAYS close — both read the stdin-piped prompt to
-     EOF before/at inference start, so leaving stdin open hangs them.
+   - Codex: close after the write when a prompt was queued at start — codex
+     exec reads the stdin-piped prompt to EOF before inference, so leaving
+     stdin open hangs it.
    - Everything else (powershell, git, ...): close stdin when stdinPrompt is
      empty.
    ------------------------------------------------------------------------ */
@@ -1439,19 +1212,13 @@ func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *test
 		{cmd: "codex", stdinPrompt: "review the diff", want: true},
 		{cmd: "codex.cmd", stdinPrompt: "review", want: true},
 		{cmd: "CODEX", stdinPrompt: "review", want: true},
-		// Gemini — same one-shot policy as codex: close when a prompt was queued
-		// at start, defer (stdin stays open for the first SendInput) when not.
-		{cmd: "gemini", stdinPrompt: "", want: false},
-		{cmd: "gemini", stdinPrompt: "hello", want: true},
-		{cmd: "gemini.cmd", stdinPrompt: "review", want: true},
-		// Path-routed claude/codex/gemini — same policy must apply when the
+		// Path-routed claude/codex — same policy must apply when the
 		// caller supplied an absolute or relative path. Otherwise the argv
-		// builder shapes a stdin-fed codex/gemini session but stdin is left
+		// builder shapes a stdin-fed codex session but stdin is left
 		// open and the child hangs waiting for EOF.
 		{cmd: "/opt/claude-nightly/claude", stdinPrompt: "", want: false},
 		{cmd: `C:\tools\claude.cmd`, stdinPrompt: "hi", want: false},
 		{cmd: "/opt/bin/codex", stdinPrompt: "review", want: true},
-		{cmd: `C:\tools\gemini.cmd`, stdinPrompt: "review", want: true},
 		{cmd: "./codex", stdinPrompt: "", want: false},
 		// Shells / non-CLI: legacy rule — close iff empty prompt.
 		{cmd: "powershell", stdinPrompt: "", want: true},

@@ -62,7 +62,7 @@ func TestSanitizeClaudeChildEnv_StripsBillingVarsForClaude(t *testing.T) {
 }
 
 func TestSanitizeClaudeChildEnv_PreservesBillingVarsForNonClaude(t *testing.T) {
-	// Codex / gemini / arbitrary shells must keep ANTHROPIC_* — those tools
+	// Codex / arbitrary shells must keep ANTHROPIC_* — those tools
 	// have unrelated auth wiring (or none) and this driver should not
 	// silently rewrite their environment.
 	in := []string{
@@ -70,7 +70,7 @@ func TestSanitizeClaudeChildEnv_PreservesBillingVarsForNonClaude(t *testing.T) {
 		"ANTHROPIC_API_KEY=sk-ant-keep",
 		"ANTHROPIC_AUTH_TOKEN=tok-keep",
 	}
-	for _, cmd := range []string{"codex", "gemini", "agy", "powershell", "git", ""} {
+	for _, cmd := range []string{"codex", "agy", "powershell", "git", ""} {
 		t.Run(cmd, func(t *testing.T) {
 			out, stripped := sanitizeClaudeChildEnv(cmd, in)
 			if !envHas(out, "ANTHROPIC_API_KEY") || !envHas(out, "ANTHROPIC_AUTH_TOKEN") {
@@ -230,10 +230,10 @@ func TestPrepareClaudeChildEnv_PinsCliEntrypointForClaude(t *testing.T) {
 }
 
 func TestPrepareClaudeChildEnv_NoEntrypointForNonClaude(t *testing.T) {
-	// codex / gemini / shells must not be tagged with claude's entrypoint —
+	// codex / shells must not be tagged with claude's entrypoint —
 	// the pin is claude-specific.
 	in := []string{"PATH=/usr/bin"}
-	for _, cmd := range []string{"codex", "gemini", "agy", "git", ""} {
+	for _, cmd := range []string{"codex", "agy", "git", ""} {
 		t.Run(cmd, func(t *testing.T) {
 			out, _ := prepareClaudeChildEnv(cmd, in)
 			if envHas(out, "CLAUDE_CODE_ENTRYPOINT") {
@@ -268,7 +268,6 @@ func TestIsClaudeCommand(t *testing.T) {
 		{`C:\Users\u\AppData\Roaming\npm\claude.cmd`, true},
 		{"./claude", true},
 		{"codex", false},
-		{"gemini", false},
 		{"agy", false},
 		// Matches the router's HasPrefix("claude") behaviour — any future
 		// `claude-edge` / `claude-next` variant gets the same env policy as
@@ -301,7 +300,6 @@ func TestIsCodexCommand(t *testing.T) {
 		{"./codex", true},
 		{"codex-next", true},
 		{"claude", false},
-		{"gemini", false},
 		{"agy", false},
 		{"mycodex", false},
 		{"", false},

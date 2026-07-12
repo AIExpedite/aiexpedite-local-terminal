@@ -54,6 +54,16 @@ func InitAllowList() (*AllowList, error) {
 		log.Printf("allowlist: gh defaults migration failed, continuing with existing list: %v", err)
 	}
 
+	// Strip the legacy Gemini CLI default patterns from upgraded installs.
+	// The default template no longer ships `gemini` / `gemini *`, but on-disk
+	// allowed-commands.txt written before the removal still carries them, so
+	// deployed agents would keep auto-allowing raw `gemini` execute/session
+	// requests without a dialog. Best-effort like ensureGhDefaults: on failure
+	// keep the loaded list active rather than dropping gating entirely.
+	if err := al.ensureGeminiRemoved(); err != nil {
+		log.Printf("allowlist: gemini removal migration failed, continuing with existing list: %v", err)
+	}
+
 	defaultAllowList = al
 	return al, nil
 }
@@ -111,6 +121,73 @@ func (al *AllowList) ensureGhDefaults() error {
 	return al.Load()
 }
 
+// geminiMigrationMarker records that the legacy Gemini CLI default patterns
+// have been stripped from allowed-commands.txt. Keying off a marker makes the
+// migration one-shot: if a user deliberately re-adds `gemini *` later via Edit
+// Allow List, the marker is already present so the entry is not stripped again.
+const geminiMigrationMarker = "# allowlist-migration: remove-gemini-cli-v1"
+
+// legacyGeminiDefaults are the exact default patterns the pre-removal template
+// shipped for the Gemini CLI. Only these exact lines are stripped, so unrelated
+// user patterns (and gemini lines a user explicitly added via approval) survive.
+var legacyGeminiDefaults = map[string]bool{
+	"gemini":   true,
+	"gemini *": true,
+}
+
+// ensureGeminiRemoved rewrites allowed-commands.txt once to delete the legacy
+// Gemini CLI default patterns, preserving every other line — including user
+// additions, which are recognised by the "# Added by user approval" marker that
+// AddPattern writes ahead of them. Runs once; subsequent boots see the marker
+// and skip so manual re-adds stick like any other entry.
+func (al *AllowList) ensureGeminiRemoved() error {
+	raw, err := os.ReadFile(al.configPath)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(string(raw), geminiMigrationMarker) {
+		return nil
+	}
+
+	lines := strings.Split(string(raw), "\n")
+	out := make([]string, 0, len(lines)+1)
+	userApprovalPending := false
+	changed := false
+	for _, line := range lines {
+		trimmed := strings.ToLower(strings.TrimSpace(line))
+		if !userApprovalPending && legacyGeminiDefaults[trimmed] {
+			changed = true
+			continue
+		}
+		userApprovalPending = strings.TrimSpace(line) == "# Added by user approval"
+		out = append(out, line)
+	}
+
+	// Record the marker even when nothing was stripped (fresh installs) so the
+	// scan runs exactly once per install.
+	out = append(out, geminiMigrationMarker)
+	if !changed {
+		// Fast path: nothing to remove, just append the marker comment.
+		f, err := os.OpenFile(al.configPath, os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			return err
+		}
+		if _, err := f.WriteString("\n" + geminiMigrationMarker + "\n"); err != nil {
+			f.Close()
+			return err
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+		return al.Load()
+	}
+
+	if err := os.WriteFile(al.configPath, []byte(strings.Join(out, "\n")), 0600); err != nil {
+		return err
+	}
+	return al.Load()
+}
+
 // Load reads patterns from the config file
 func (al *AllowList) Load() error {
 	al.mu.Lock()
@@ -142,7 +219,7 @@ func (al *AllowList) Load() error {
 // IsAllowed checks if a command matches any pattern.
 //
 // Newlines inside individual args (e.g. a multi-line prompt passed to
-// `claude`/`codex`/`gemini`) are collapsed to spaces before matching. The
+// `claude`/`codex`) are collapsed to spaces before matching. The
 // allowlist's job is to decide whether the *command pattern* is permitted —
 // the newline-injection defense lives downstream in pubsub.go's shell-quoting
 // layer, which rejects newlines for shell-bound invocations. Direct-exec
@@ -561,12 +638,11 @@ Format-Table *
 $*
 
 # --- CLI Coding Agents ---
+# allowlist-migration: remove-gemini-cli-v1
 claude
 claude *
 codex
 codex *
-gemini
-gemini *
 agy
 agy *
 # No "grok" / "grok *" / "grok agent stdio *" entries: the ACP manager owns
