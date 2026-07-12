@@ -28,6 +28,20 @@ var (
 	configuredCLIAgentCatalog []cliAgentCatalogEntry
 )
 
+// removedCLIAgentKeys lists catalog identifiers and commands for CLI agents
+// whose support has been dropped. Backend-provided catalogs persisted on
+// upgraded agents may still carry these entries, so they are filtered out
+// during normalization to keep them from being detected or advertised.
+var removedCLIAgentKeys = map[string]bool{
+	"geminicli": true,
+	"gemini":    true,
+}
+
+func isRemovedCLIAgent(id, command string) bool {
+	return removedCLIAgentKeys[strings.ToLower(strings.TrimSpace(id))] ||
+		removedCLIAgentKeys[strings.ToLower(strings.TrimSpace(command))]
+}
+
 func defaultCLIAgentCatalog() []cliAgentCatalogEntry {
 	return []cliAgentCatalogEntry{
 		{ID: "antigravity", DisplayName: "Antigravity", DisplayOrder: 10, Command: "agy", DetectionKeys: []string{"antigravity", "agy"}},
@@ -69,6 +83,9 @@ func normalizeCLIAgentCatalog(entries []cliAgentCatalogEntry) []cliAgentCatalogE
 		}
 		command := firstCommandToken(raw.Command)
 		if command == "" {
+			continue
+		}
+		if isRemovedCLIAgent(id, command) {
 			continue
 		}
 		key := strings.ToLower(id)
