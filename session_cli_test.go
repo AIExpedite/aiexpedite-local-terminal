@@ -639,6 +639,44 @@ func TestShapePTYExecArgs_PassesThroughNonAntigravity(t *testing.T) {
 	}
 }
 
+// TestShapeShellWrappedPTYArgs_SessionStartPath mirrors StartSession's tty PTY
+// branch: cliArgs comes from buildInteractiveCLIArgs, then shapeShellWrappedPTYArgs
+// runs before startPTYSession. A shell-wrapped `bash -c "agy …"` must be shaped
+// there (buildInteractiveCLIArgs leaves it on the shell's default branch), while
+// a DIRECT agy — already shaped by buildInteractiveCLIArgs — must NOT be shaped
+// twice.
+func TestShapeShellWrappedPTYArgs_SessionStartPath(t *testing.T) {
+	// Shell-wrapped: buildInteractiveCLIArgs("bash", …) passes the payload through
+	// unshaped, so shapeShellWrappedPTYArgs must inject the one-shot flags.
+	cliArgs, _ := buildInteractiveCLIArgs("bash", []string{"-c", "agy --brief x"}, false)
+	ptyArgs := shapeShellWrappedPTYArgs("bash", cliArgs)
+	want := "agy --print --dangerously-skip-permissions --brief x"
+	if len(ptyArgs) != 2 || ptyArgs[0] != "-c" || ptyArgs[1] != want {
+		t.Errorf("session_start shell-wrapped agy = %v, want -c %q", ptyArgs, want)
+	}
+
+	// Direct agy: buildInteractiveCLIArgs already shaped it; shapeShellWrappedPTYArgs
+	// must leave it untouched (no duplicate --print/--dangerously-skip-permissions).
+	directArgs, _ := buildInteractiveCLIArgs("agy", []string{"fix the bug"}, false)
+	got := shapeShellWrappedPTYArgs("agy", directArgs)
+	if strings.Join(got, " ") != strings.Join(directArgs, " ") {
+		t.Errorf("shapeShellWrappedPTYArgs double-shaped direct agy: %v -> %v", directArgs, got)
+	}
+	if n := countOccurrences(got, "--print"); n != 1 {
+		t.Errorf("direct agy has %d --print flags, want exactly 1: %v", n, got)
+	}
+}
+
+func countOccurrences(s []string, want string) int {
+	n := 0
+	for _, v := range s {
+		if v == want {
+			n++
+		}
+	}
+	return n
+}
+
 /* --------------------------------------------------------------------------
    stdinPromptFormat
    --------------------------------------------------------------------------

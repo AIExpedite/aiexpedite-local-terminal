@@ -175,7 +175,18 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// stay on the pipe path below, so tty is a no-op for anything not on the
 	// allowlist. See EXECUTION_LIVENESS_REDESIGN.md → PTY mode.
 	if tty && isPTYEligibleCommand(command, args) {
-		return sm.startPTYSession(id, command, cliArgs, cwd, workspaceID, uid, timeoutMs, publishFn)
+		// buildInteractiveCLIArgs shapes a DIRECT agy/antigravity invocation into
+		// its one-shot `--print --dangerously-skip-permissions <prompt>` form, but
+		// a shell-wrapped single-agent payload (`bash -c "agy …"`, how
+		// terminal-service ships operator-joined commands) falls through its
+		// default branch unshaped — the base command is the shell, not agy. Apply
+		// the same shell-payload shaping the execute path (shapePTYExecArgs) uses
+		// so the inner agy reaches its non-interactive `--print` path and returns a
+		// one-shot result instead of dropping into the interactive TUI and hanging
+		// until the prompt timeout. Direct agy argv is already shaped and passes
+		// through unchanged (shellDashCPayload only matches a shell -c wrapper).
+		ptyArgs := shapeShellWrappedPTYArgs(command, cliArgs)
+		return sm.startPTYSession(id, command, ptyArgs, cwd, workspaceID, uid, timeoutMs, publishFn)
 	}
 
 	// grok's headless mode takes its prompt on argv (`-p <prompt>`) and does NOT

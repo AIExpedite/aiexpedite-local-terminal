@@ -2152,14 +2152,26 @@ func shapePTYExecArgs(command string, args []string) (string, []string) {
 	if isAntigravityCommand(command) {
 		return command, buildAntigravityInteractiveArgs(args)
 	}
-	// isPTYEligibleCommand already cleared this payload of shell chaining, so the
-	// first token is the whole program and the remainder is the literal prompt.
+	return command, shapeShellWrappedPTYArgs(command, args)
+}
+
+// shapeShellWrappedPTYArgs applies antigravity one-shot shaping to a
+// shell-wrapped single-agent PTY payload (`bash -c "agy …"`), returning args
+// with the inner agy given `--print --dangerously-skip-permissions`. A DIRECT
+// agy/antigravity invocation is already shaped by its caller
+// (buildInteractiveCLIArgs on the session_start path, shapePTYExecArgs'
+// antigravity branch on the execute path), so this only rewrites the `-c`
+// payload of a shell wrapper and leaves everything else (including
+// already-shaped direct argv) untouched. isPTYEligibleCommand has already
+// cleared the payload of shell chaining, so its first token is the whole
+// program and the remainder is preserved verbatim as the literal prompt.
+func shapeShellWrappedPTYArgs(command string, args []string) []string {
 	if payload, ok := shellDashCPayload(command, args); ok {
 		if shaped, ok := shapeAntigravityShellPayload(payload); ok {
-			return command, replaceDashCPayload(args, shaped)
+			return replaceDashCPayload(args, shaped)
 		}
 	}
-	return command, args
+	return args
 }
 
 // shapeAntigravityShellPayload rewrites a `bash -c` payload whose leading token
