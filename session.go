@@ -1499,16 +1499,21 @@ func isAntigravityCommand(command string) bool {
 
 // isResidentAgentSessionCommand reports whether a session_start command is a
 // resident CLI agent that keeps its interactive-capable env. These are exactly
-// the commands buildInteractiveCLIArgs shapes (claude/codex/gemini/grok) plus
-// the PTY-only TUI agents (agy/antigravity). Everything else is a one-shot
-// utility (bash/sh/git/PowerShell/test runner) that MUST be headless-hardened
-// on the pipe session path — see StartSession.
+// the commands buildInteractiveCLIArgs shapes (claude/codex/grok) plus the
+// PTY-only TUI agents (agy/antigravity). Everything else is a one-shot utility
+// (bash/sh/git/PowerShell/test runner) that MUST be headless-hardened on the
+// pipe session path — see StartSession.
+//
+// Gemini is intentionally NOT listed: its CLI-agent router was removed, so a
+// stale or manually approved `gemini` session_start now falls through to
+// generic execution and MUST be headless-hardened like any other non-agent
+// command (otherwise it would keep the interactive terminal behavior #69
+// removed from generic session commands).
 func isResidentAgentSessionCommand(command string) bool {
 	base := commandBaseName(command)
 	switch {
 	case strings.HasPrefix(base, "claude"),
 		strings.HasPrefix(base, "codex"),
-		strings.HasPrefix(base, "gemini"),
 		strings.HasPrefix(base, "grok"):
 		return true
 	}

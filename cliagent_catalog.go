@@ -38,8 +38,12 @@ var removedCLIAgentKeys = map[string]bool{
 }
 
 func isRemovedCLIAgent(id, command string) bool {
+	// Normalize the command through commandBaseName so shimmed/pathed entries
+	// (e.g. "gemini.cmd", "gemini.exe", "/usr/local/bin/gemini") are filtered
+	// out too — the same normalization the rest of command routing uses. An
+	// exact-string match here would let those survive and keep being detected.
 	return removedCLIAgentKeys[strings.ToLower(strings.TrimSpace(id))] ||
-		removedCLIAgentKeys[strings.ToLower(strings.TrimSpace(command))]
+		removedCLIAgentKeys[commandBaseName(command)]
 }
 
 func defaultCLIAgentCatalog() []cliAgentCatalogEntry {
