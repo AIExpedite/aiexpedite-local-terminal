@@ -391,7 +391,21 @@ func captureSession(t *testing.T, mockMode string, sessionCmd string, args []str
 	// runs buildInteractiveCLIArgs which returns the args/stdinPrompt shape
 	// for the configured CLI — and resolveExecutable will use exec.LookPath
 	// which finds our mock in tmpDir.
-	startErr := sm.StartSession(id, sessionCmd, args, tmpDir, "ws-test", "uid-test", 30000, false, publishFn)
+	//
+	// Retry on ETXTBSY ("text file busy"): we copy the (large) test binary
+	// into tmpDir and immediately exec it. On Linux a concurrent fork/exec
+	// in another goroutine can transiently inherit a writable fd to the
+	// freshly-written mock, so the kernel refuses the exec until that fd is
+	// closed. This is a known, transient race (golang/go#22315); the stdlib's
+	// own tests retry the same way. It clears within milliseconds.
+	var startErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		startErr = sm.StartSession(id, sessionCmd, args, tmpDir, "ws-test", "uid-test", 30000, false, publishFn)
+		if startErr == nil || !strings.Contains(startErr.Error(), "text file busy") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if startErr != nil {
 		return id, nil, fmt.Errorf("StartSession: %w", startErr)
 	}
