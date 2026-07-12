@@ -71,7 +71,7 @@ func TestHardenNonAgentCommand_PreservesPreSanitizedEnv(t *testing.T) {
 	clearAmbientTestRunnerEnv(t)
 	c := exec.Command("git", "status")
 	c.Env = []string{"PATH=/usr/bin", "SAFE=keep"} // pre-sanitized: no CLAUDE_*
-	t.Setenv("CLAUDE_NESTED_MARKER", "leaked") // present in os.Environ()
+	t.Setenv("CLAUDE_NESTED_MARKER", "leaked")     // present in os.Environ()
 	hardenNonAgentCommand(c, "git status")
 	m := envMap(c.Env)
 	if _, leaked := m["CLAUDE_NESTED_MARKER"]; leaked {
