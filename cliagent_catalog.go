@@ -33,7 +33,6 @@ func defaultCLIAgentCatalog() []cliAgentCatalogEntry {
 		{ID: "antigravity", DisplayName: "Antigravity", DisplayOrder: 10, Command: "agy", DetectionKeys: []string{"antigravity", "agy"}},
 		{ID: "claudeCode", DisplayName: "Claude Code", DisplayOrder: 20, Command: "claude", DetectionKeys: []string{"claudeCode", "claude"}},
 		{ID: "codex", DisplayName: "Codex", DisplayOrder: 30, Command: "codex", DetectionKeys: []string{"codex"}},
-		{ID: "geminiCli", DisplayName: "Gemini CLI", DisplayOrder: 40, Command: "gemini", DetectionKeys: []string{"geminiCli", "gemini"}},
 		{ID: "grok", DisplayName: "Grok Build", DisplayOrder: 50, Command: "grok", DetectionKeys: []string{"grok", "grokBuild"}},
 	}
 }

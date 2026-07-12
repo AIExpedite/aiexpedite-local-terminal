@@ -142,7 +142,7 @@ func (al *AllowList) Load() error {
 // IsAllowed checks if a command matches any pattern.
 //
 // Newlines inside individual args (e.g. a multi-line prompt passed to
-// `claude`/`codex`/`gemini`) are collapsed to spaces before matching. The
+// `claude`/`codex`) are collapsed to spaces before matching. The
 // allowlist's job is to decide whether the *command pattern* is permitted —
 // the newline-injection defense lives downstream in pubsub.go's shell-quoting
 // layer, which rejects newlines for shell-bound invocations. Direct-exec
@@ -565,8 +565,6 @@ claude
 claude *
 codex
 codex *
-gemini
-gemini *
 agy
 agy *
 # No "grok" / "grok *" / "grok agent stdio *" entries: the ACP manager owns

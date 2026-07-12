@@ -418,7 +418,7 @@ func TestIsClaudeRateLimitEventLine(t *testing.T) {
 }
 
 // TestArmClaudeFirstFrameWatchdog_NoopForNonClaude ensures the arm helper is
-// safely a no-op for codex/gemini/grok — only claude has the not-signed-in
+// safely a no-op for codex/grok — only claude has the not-signed-in
 // stall signature this watchdog targets.
 func TestArmClaudeFirstFrameWatchdog_NoopForNonClaude(t *testing.T) {
 	sm := &SessionManager{}

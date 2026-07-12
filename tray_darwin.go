@@ -43,7 +43,7 @@ func applyDisconnectedTrayIcon() {
 // When launched by launchd or Finder, a GUI app inherits a minimal PATH
 // (typically /usr/bin:/bin:/usr/sbin:/sbin) that excludes the common tool
 // directories a developer uses from a login shell. That means
-// `exec.LookPath("ttyd")`, `claude`, `codex`, `gemini`, `brew`, etc. can
+// `exec.LookPath("ttyd")`, `claude`, `codex`, `brew`, etc. can
 // all fail to resolve even when they are installed. Prepend the
 // standard locations so PATH-based resolution matches a typical terminal.
 func init() {

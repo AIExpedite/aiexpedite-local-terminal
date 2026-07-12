@@ -85,18 +85,17 @@ func TestPatternToRegex_NewlineInjectionBlocked(t *testing.T) {
 }
 
 func TestIsAllowed_MultiLinePromptArgsAccepted(t *testing.T) {
-	// Regression: CLI coding agents (claude/codex/gemini) are invoked with
+	// Regression: CLI coding agents (claude/codex) are invoked with
 	// large multi-line prompts as positional args. Before the newline
 	// normalization in IsAllowed, these were rejected because the joined
 	// match string "claude <prompt with \n>" failed `^claude [^\n]*$`, which
 	// silently bounced every agent run to the approval dialog and timed out
 	// after 60s with "Command denied by user: not in allow list".
 	al := &AllowList{
-		patterns: []string{"claude *", "codex *", "gemini *"},
+		patterns: []string{"claude *", "codex *"},
 		compiled: []*regexp.Regexp{
 			patternToRegex("claude *"),
 			patternToRegex("codex *"),
-			patternToRegex("gemini *"),
 		},
 	}
 
@@ -110,7 +109,6 @@ func TestIsAllowed_MultiLinePromptArgsAccepted(t *testing.T) {
 		// The actual step-7 runAndWait shape from prod — this was failing.
 		{"claude", []string{multiLinePrompt, "Feature Title", "\n\nFEATURE DESCRIPTION:\n"}, true},
 		{"codex", []string{multiLinePrompt}, true},
-		{"gemini", []string{multiLinePrompt}, true},
 		// Single-line still works.
 		{"claude", []string{"hello world"}, true},
 		// Carriage-return variants (Windows line endings in user-entered markdown).

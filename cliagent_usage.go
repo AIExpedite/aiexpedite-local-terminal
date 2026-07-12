@@ -1,7 +1,7 @@
 // cliagent_usage.go — discovers per-provider utilization for CLI agents
 // installed on this device.
 //
-// The CLI agents in scope (Claude Code, Codex, Gemini CLI, Antigravity) do not
+// The CLI agents in scope (Claude Code, Codex, Antigravity) do not
 // today expose a public utilization API the way provider account-usage pages
 // do. What they DO expose, on the local filesystem, are credential files we
 // can fingerprint (so multi-device dedup can aggregate the same account), and

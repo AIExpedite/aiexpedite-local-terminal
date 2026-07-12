@@ -4,7 +4,7 @@
 // File: processes_windows.go
 // -----------------------------------------------------------------------------
 // Windows OS process scanner. Queries the local process table for processes
-// that match the orphan-scanner allowlist (claude/codex/gemini/agy). Used by
+// that match the orphan-scanner allowlist (claude/codex/agy). Used by
 // orphanScanner.go to identify candidate orphans.
 //
 // Data source: Microsoft deprecated WMIC starting with Windows 11 24H2 and it
@@ -58,7 +58,7 @@ var (
 )
 
 // ScanCLIProcesses returns all currently-running processes whose image name
-// matches the orphan allowlist (claude / codex / gemini). Returns an empty
+// matches the orphan allowlist (claude / codex). Returns an empty
 // slice on error so the caller can treat it as a no-op rather than crashing.
 func ScanCLIProcesses() []ProcessInfo {
 	backend := selectScanBackend()
@@ -104,7 +104,7 @@ func selectScanBackend() scanBackend {
 // and doesn't need to assume time.Local matches the system timezone.
 func scanViaPowerShell() []ProcessInfo {
 	script := `$ErrorActionPreference = 'SilentlyContinue';` +
-		` Get-CimInstance Win32_Process -Filter "Name='claude.exe' OR Name='codex.exe' OR Name='gemini.exe' OR Name='agy.exe' OR Name='grok.exe'"` +
+		` Get-CimInstance Win32_Process -Filter "Name='claude.exe' OR Name='codex.exe' OR Name='agy.exe' OR Name='grok.exe'"` +
 		` | Select-Object @{Name='Name';Expression={$_.Name}},` +
 		` @{Name='ProcessId';Expression={$_.ProcessId}},` +
 		` @{Name='ParentProcessId';Expression={$_.ParentProcessId}},` +
@@ -126,7 +126,7 @@ func scanViaPowerShell() []ProcessInfo {
 // scanViaWMIC queries via the legacy `wmic` tool. Kept as a fallback for Windows
 // versions where PowerShell is unavailable.
 func scanViaWMIC() []ProcessInfo {
-	whereClause := `name="claude.exe" or name="codex.exe" or name="gemini.exe" or name="agy.exe" or name="grok.exe"`
+	whereClause := `name="claude.exe" or name="codex.exe" or name="agy.exe" or name="grok.exe"`
 	args := []string{
 		"process",
 		"where", whereClause,

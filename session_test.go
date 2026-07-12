@@ -90,7 +90,7 @@ func TestShouldCloseStdinAfterStart(t *testing.T) {
 		// in ~3s, which is the prod failure mode we're patching here.
 		{name: "claude_with_stdin_prompt_stays_open", command: "claude", stdinPrompt: "do work", want: false},
 		{name: "claude_without_prompt_stays_open", command: "claude", want: false},
-		// Codex / gemini are one-shot by design and read the stdin-piped prompt
+		// Codex is one-shot by design and reads the stdin-piped prompt
 		// to EOF. When a prompt was queued at start (delegate path), close stdin
 		// right after the write — leaving it open hangs them. When NO prompt was
 		// queued (chat-direct opens the session eagerly and delivers the first
@@ -100,8 +100,6 @@ func TestShouldCloseStdinAfterStart(t *testing.T) {
 		// first prompt instead (see deferredStdinClose).
 		{name: "codex_with_prompt_closes", command: "codex", stdinPrompt: "do work", want: true},
 		{name: "codex_without_prompt_defers", command: "codex", want: false},
-		{name: "gemini_with_prompt_closes", command: "gemini", stdinPrompt: "do work", want: true},
-		{name: "gemini_without_prompt_defers", command: "gemini", want: false},
 		{name: "powershell_closes", command: "powershell", want: true},
 	}
 

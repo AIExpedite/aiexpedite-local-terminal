@@ -4,7 +4,7 @@
 // Both interactive sessions (session.go) and one-shot commands (pubsub.go)
 // register their PIDs here on spawn and deregister on completion. The orphan
 // scanner (orphanScanner.go) consults this registry to determine which CLI
-// processes (claude/codex/gemini/agy) are legitimately backed by an active call
+// processes (claude/codex/agy) are legitimately backed by an active call
 // vs. orphans that should be killed.
 // -----------------------------------------------------------------------------
 
