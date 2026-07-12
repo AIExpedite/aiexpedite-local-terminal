@@ -57,6 +57,13 @@ func runPTYCommand(cmd string, args []string, workDir string, env []string,
 
 	dataCh := make(chan []byte, 64)
 	exitCh := make(chan struct{}, 1)
+	// Closed when runPTYCommand returns so the reader goroutine can never leak:
+	// on the abort path we return without draining dataCh, and a reader blocked
+	// on `dataCh <- chunk` (buffer full) would otherwise hang forever —
+	// ptmx.Close() only unblocks a reader parked in Read, not one parked on the
+	// channel send.
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -64,10 +71,17 @@ func runPTYCommand(cmd string, args []string, workDir string, env []string,
 			if nr > 0 {
 				chunk := make([]byte, nr)
 				copy(chunk, buf[:nr])
-				dataCh <- chunk
+				select {
+				case dataCh <- chunk:
+				case <-done:
+					return
+				}
 			}
 			if rerr != nil {
-				exitCh <- struct{}{}
+				select {
+				case exitCh <- struct{}{}:
+				case <-done:
+				}
 				return
 			}
 		}
