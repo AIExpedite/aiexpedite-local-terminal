@@ -164,7 +164,7 @@ func TestStartSession_RemovesGrokPromptFileOnEarlyFailure(t *testing.T) {
 		"leak-test",
 		missing,
 		[]string{"a long review brief that would have ridden on argv"},
-		"", "ws", "uid", 0,
+		"", "ws", "uid", 0, false,
 		func(resultMsg) {},
 	)
 	if err == nil {

@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -112,6 +113,12 @@ func NewPersistentPowerShell() (*PersistentPowerShell, error) {
 		"-Command", "-", // Read commands from stdin
 	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	// Headless hardening: the persistent shell is the default fast path for
+	// non-agent Windows commands, so inject the authoritative non-interactive
+	// git/editor/credential overlay at spawn time — every command it later runs
+	// inherits it and fails fast on prompts instead of blocking on /dev/tty's
+	// Windows equivalent. See headless_env.go / EXECUTION_LIVENESS_REDESIGN.md.
+	cmd.Env = append(os.Environ(), headlessEnvOverlay()...)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
