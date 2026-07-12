@@ -4,14 +4,36 @@
 package main
 
 import (
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
 )
 
+// clearAmbientTestRunnerEnv removes any inherited test-runner env keys (notably
+// CI, which GitHub Actions exports as "true") for the duration of a test so the
+// wiring assertions below observe only what hardenNonAgentCommand adds — not
+// what the CI runner already put in os.Environ(). Without this these tests are
+// non-hermetic on a CI runner: an ambient CI=true both masks the "non-test
+// command gets no CI" check and blocks testRunnerEnvDefaults from filling CI=1
+// (it only fills MISSING keys). Values are restored via t.Cleanup.
+func clearAmbientTestRunnerEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{"CI", "FORCE_COLOR", "NO_COLOR", "PYTHONUNBUFFERED"} {
+		key := key
+		if v, ok := os.LookupEnv(key); ok {
+			t.Cleanup(func() { os.Setenv(key, v) })
+		} else {
+			t.Cleanup(func() { os.Unsetenv(key) })
+		}
+		os.Unsetenv(key)
+	}
+}
+
 func TestHardenNonAgentCommand_AppliesEnvOverlayToCmd(t *testing.T) {
 	// The security-critical wiring: hardenNonAgentCommand must actually stamp
 	// the authoritative non-interactive overlay onto the spawned command's env.
+	clearAmbientTestRunnerEnv(t)
 	c := exec.Command("git", "status")
 	hardenNonAgentCommand(c, "git status")
 	m := envMap(c.Env)
@@ -28,6 +50,7 @@ func TestHardenNonAgentCommand_AppliesEnvOverlayToCmd(t *testing.T) {
 }
 
 func TestHardenNonAgentCommand_TestRunnerGetsCIDefaults(t *testing.T) {
+	clearAmbientTestRunnerEnv(t)
 	c := exec.Command("bash", "-c", "pytest -q")
 	hardenNonAgentCommand(c, effectiveCommandLine("bash", []string{"-c", "pytest -q"}))
 	m := envMap(c.Env)
