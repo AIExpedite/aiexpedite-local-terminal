@@ -597,12 +597,45 @@ func TestShapePTYExecArgs_ShapesAntigravity(t *testing.T) {
 	mustContain(t, pathArgs, "--print", "--dangerously-skip-permissions", "go")
 }
 
-func TestShapePTYExecArgs_PassesThroughNonAntigravity(t *testing.T) {
-	// A shell-wrapped payload keeps the shell as its base command and its args
-	// unchanged — the prompt already rides on argv inside the payload.
+func TestShapePTYExecArgs_ShapesShellWrappedAntigravity(t *testing.T) {
+	// A shell-wrapped single-agent payload (`bash -c "agy …"`) keeps the shell as
+	// its base command, but the inner agy must still gain the one-shot shaping —
+	// otherwise it drops into the interactive TUI and hangs until the prompt
+	// timeout. isPTYEligibleCommand already cleared it of shell chaining.
 	cmd, args := shapePTYExecArgs("bash", []string{"-c", "agy --brief x"})
-	if cmd != "bash" || len(args) != 2 || args[0] != "-c" || args[1] != "agy --brief x" {
+	if cmd != "bash" || len(args) != 2 || args[0] != "-c" {
+		t.Fatalf("shapePTYExecArgs reshaped shell wrapper: cmd=%q args=%v", cmd, args)
+	}
+	want := "agy --print --dangerously-skip-permissions --brief x"
+	if args[1] != want {
+		t.Errorf("shell-wrapped payload = %q, want %q", args[1], want)
+	}
+
+	// A bare `bash -c "agy"` with no prompt still gains the flags.
+	_, bareArgs := shapePTYExecArgs("bash", []string{"-c", "agy"})
+	if bareArgs[1] != "agy --print --dangerously-skip-permissions" {
+		t.Errorf("bare shell-wrapped agy = %q", bareArgs[1])
+	}
+
+	// The `antigravity` alias inside a shell wrapper is shaped identically.
+	_, aliasArgs := shapePTYExecArgs("bash", []string{"-c", "antigravity do it"})
+	if aliasArgs[1] != "antigravity --print --dangerously-skip-permissions do it" {
+		t.Errorf("shell-wrapped antigravity = %q", aliasArgs[1])
+	}
+}
+
+func TestShapePTYExecArgs_PassesThroughNonAntigravity(t *testing.T) {
+	// A non-antigravity command is never shaped — the direct check and the
+	// shell-wrapped check both miss it, so cmd/args pass through untouched.
+	cmd, args := shapePTYExecArgs("git", []string{"fetch", "--all"})
+	if cmd != "git" || len(args) != 2 || args[0] != "fetch" || args[1] != "--all" {
 		t.Errorf("shapePTYExecArgs mutated non-antigravity command: cmd=%q args=%v", cmd, args)
+	}
+
+	// A shell-wrapped non-antigravity payload is likewise left alone.
+	_, shArgs := shapePTYExecArgs("bash", []string{"-c", "echo hi"})
+	if shArgs[1] != "echo hi" {
+		t.Errorf("shapePTYExecArgs mutated non-antigravity shell payload: %q", shArgs[1])
 	}
 }
 

@@ -167,6 +167,13 @@ func TestIsPTYEligibleCommand_AllowlistOnly(t *testing.T) {
 		{"agy", []string{"--brief", "x"}},
 		{"/usr/local/bin/agy", nil},
 		{"agy.exe", []string{"run"}},
+		// Windows launcher shims must normalize the same as commandBaseName —
+		// otherwise a tty=true agy.cmd skips PTY routing and falls back to pipes.
+		{"agy.cmd", []string{"run"}},
+		{"antigravity.cmd", nil},
+		{"agy.bat", nil},
+		{"agy.ps1", nil},
+		{`C:\tools\agy.cmd`, []string{"go"}},
 		{"agy", []string{"--print", "fix A; then B"}},
 		{"agy", []string{"--message", "use a && b || c | d"}},
 		// A bash-wrapped SINGLE agent invocation is still eligible.

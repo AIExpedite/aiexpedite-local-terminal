@@ -2139,14 +2139,62 @@ func runTTYCommand(cfg *Config, cmd commandMsg) (string, error) {
 // request reaches the agent's non-interactive `--print` path rather than
 // launching the raw interactive TUI. Only antigravity (agy/antigravity) needs
 // shaping — `--print --dangerously-skip-permissions <prompt>`; other eligible
-// commands pass through unchanged. A shell-wrapped payload (`bash -c "agy …"`)
-// is left as-is: its base command is the shell, not the agent, and the shell
-// already carries the prompt on argv.
+// commands pass through unchanged.
+//
+// Two eligible shapes are handled: a direct agy invocation (`agy fix this`),
+// and a shell-wrapped single-agent payload (`bash -c "agy fix this"`, how
+// terminal-service ships operator-joined commands). The shell-wrapped form must
+// ALSO be shaped: its base command is the shell so isAntigravityCommand misses
+// it, but isPTYEligibleCommand routes it here on the payload's first token, and
+// without shaping the inner agy drops into the interactive TUI and hangs until
+// the prompt timeout instead of returning a one-shot result.
 func shapePTYExecArgs(command string, args []string) (string, []string) {
 	if isAntigravityCommand(command) {
 		return command, buildAntigravityInteractiveArgs(args)
 	}
+	// isPTYEligibleCommand already cleared this payload of shell chaining, so the
+	// first token is the whole program and the remainder is the literal prompt.
+	if payload, ok := shellDashCPayload(command, args); ok {
+		if shaped, ok := shapeAntigravityShellPayload(payload); ok {
+			return command, replaceDashCPayload(args, shaped)
+		}
+	}
 	return command, args
+}
+
+// shapeAntigravityShellPayload rewrites a `bash -c` payload whose leading token
+// is agy/antigravity so the inner invocation gains the one-shot
+// `--print --dangerously-skip-permissions` shaping, returning the rewritten
+// payload and true. It returns ("", false) when the first token is not an
+// antigravity command. The flag list is sourced from buildAntigravityInteractiveArgs
+// so it cannot drift from the direct path. Only reached for payloads
+// isPTYEligibleCommand has cleared of shell chaining, so fields[0] is the whole
+// program and the remainder is preserved verbatim as the literal prompt.
+func shapeAntigravityShellPayload(payload string) (string, bool) {
+	fields := strings.Fields(payload)
+	if len(fields) == 0 || !isAntigravityCommand(fields[0]) {
+		return "", false
+	}
+	flags := strings.Join(buildAntigravityInteractiveArgs(nil), " ")
+	shaped := fields[0] + " " + flags
+	if rest := strings.TrimSpace(strings.TrimPrefix(payload, fields[0])); rest != "" {
+		shaped += " " + rest
+	}
+	return shaped, true
+}
+
+// replaceDashCPayload returns a copy of args with the string following the first
+// `-c` flag replaced by payload, mirroring how shellDashCPayload locates it.
+func replaceDashCPayload(args []string, payload string) []string {
+	out := make([]string, len(args))
+	copy(out, args)
+	for i, a := range out {
+		if a == "-c" && i+1 < len(out) {
+			out[i+1] = payload
+			return out
+		}
+	}
+	return out
 }
 
 func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {

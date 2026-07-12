@@ -185,18 +185,20 @@ func isPTYEligibleCommand(cmd string, args []string) bool {
 }
 
 // firstTokenIsPTYAgent reports whether the leading token of command names a
-// PTY-eligible agent, normalizing an explicit path and a `.exe` suffix.
+// PTY-eligible agent. Normalization is single-sourced through commandBaseName
+// so it matches the rest of the command routing: an explicit path
+// (`/usr/local/bin/agy`) and every recognized shim suffix (`.exe`, and the
+// Windows launcher shims `.cmd`/`.bat`/`.ps1`) resolve to the same base name.
+// Stripping only `.exe` here would leave `agy.cmd`/`antigravity.cmd` classified
+// ineligible, so a tty=true Antigravity session would skip the Windows PTY
+// rejection (or the Unix PTY path) and silently fall back to the pipe path where
+// Antigravity has no terminal and hangs.
 func firstTokenIsPTYAgent(command string) bool {
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
 		return false
 	}
-	base := strings.ToLower(fields[0])
-	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
-		base = base[i+1:]
-	}
-	base = strings.TrimSuffix(base, ".exe")
-	return ptyEligibleAgents[base]
+	return ptyEligibleAgents[commandBaseName(fields[0])]
 }
 
 // hasShellCommandChaining reports whether a command line contains shell
