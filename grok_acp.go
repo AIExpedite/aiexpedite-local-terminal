@@ -1334,24 +1334,11 @@ func setupIsolatedGrokHome(allowAPIKeyFallback bool, runtimeModel string) (strin
 	// without it, an updater check can race `grok agent stdio` and dump non-JSON
 	// stdout that readStream treats as a fatal `grok_acp_error`.
 	//
-<<<<<<< Updated upstream
 	// `[compat.cursor] mcps = false` + `[compat.claude] mcps = false` suppress
 	// grok's vendor-MCP scan of the HOST's `~/.cursor/mcp.json` and
 	// `~/.claude.json` — those files live outside $GROK_HOME so the isolated
 	// dir alone can't hide them, and a slow vendor MCP (e.g. a `visualization`
 	// proxy) otherwise blocks `session/new` ~10s before the ACP turn times out.
-=======
-	// `[compat.cursor] mcps = false` + `[compat.claude] mcps = false` disable
-	// Grok's default scanning of the host's Cursor / Claude MCP configs
-	// (`~/.cursor/mcp.json`, `~/.claude.json`). Those vendor MCP servers are
-	// irrelevant to an AI Expedite ACP turn and actively harmful: each is
-	// spawned + connected at `session/new`, and a slow/broken one (e.g. a
-	// Cursor `visualization` proxy) blocks the turn for ~10s before timing out.
-	// The isolated home's clean config can't suppress these via omission because
-	// the scan reads the *host* vendor configs, not `$GROK_HOME` — so we disable
-	// the scan explicitly. Validated: with these set, `initialize` reports zero
-	// mcpServers and no `mcp/init_progress`.
->>>>>>> Stashed changes
 	cfg := "[cli]\ninstaller = \"internal\"\nauto_update = false\n" +
 		"\n[compat.cursor]\nmcps = false\n" +
 		"\n[compat.claude]\nmcps = false\n"

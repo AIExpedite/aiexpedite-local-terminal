@@ -234,7 +234,6 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 	if !strings.Contains(string(cfg), `auto_update = false`) {
 		t.Fatalf("config.toml missing auto_update = false: %q", cfg)
 	}
-<<<<<<< Updated upstream
 	// Vendor-MCP scan must be disabled for both Cursor and Claude — without
 	// these, grok scans the host's `~/.cursor/mcp.json` / `~/.claude.json`
 	// at session/new and a slow vendor MCP blocks the ACP turn.
@@ -254,14 +253,6 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 		if !strings.Contains(rest, "mcps = false") {
 			t.Fatalf("%s section missing mcps = false: %q", header, cfg)
 		}
-=======
-	// Vendor MCP scanning must be disabled so the ACP turn doesn't spawn the
-	// host's Cursor/Claude MCP servers (a slow one blocks session/new ~10s).
-	if !strings.Contains(string(cfg), "[compat.cursor]") ||
-		!strings.Contains(string(cfg), "[compat.claude]") ||
-		!strings.Contains(string(cfg), "mcps = false") {
-		t.Fatalf("config.toml missing vendor MCP-disable (compat.*/mcps=false): %q", cfg)
->>>>>>> Stashed changes
 	}
 	if strings.Contains(string(cfg), "api_key") || strings.Contains(string(cfg), "approve") {
 		t.Fatalf("clean config.toml must not carry api_key/approval knobs: %q", cfg)
