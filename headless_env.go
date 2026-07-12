@@ -200,13 +200,16 @@ func firstTokenIsPTYAgent(command string) bool {
 }
 
 // hasShellCommandChaining reports whether a command line contains shell
-// operators that would launch a second program: chaining (`&&`, `||`, `;`),
-// piping (`|`), backgrounding (`&`), command substitution (`$(...)` or
-// backticks), or a newline. Used to keep multi-command payloads off the
-// single-agent PTY path so a trailing git/test-runner command cannot inherit a
-// controlling terminal.
+// operators that would launch a second program or reach another process/file:
+// chaining (`&&`, `||`, `;`), piping (`|`), backgrounding (`&`), command
+// substitution (`$(...)` or backticks), process substitution (`<(...)` /
+// `>(...)`) and any redirection or here-string/here-doc (`<`, `>`), or a
+// newline. Used to keep multi-command payloads off the single-agent PTY path so
+// a trailing git/test-runner command (whether joined by an operator or launched
+// via process substitution such as `agy <(git credential fill)`) cannot inherit
+// a controlling terminal and bypass headless hardening.
 func hasShellCommandChaining(command string) bool {
-	return strings.ContainsAny(command, "|&;`\n") || strings.Contains(command, "$(")
+	return strings.ContainsAny(command, "|&;<>`\n") || strings.Contains(command, "$(")
 }
 
 // shellDashCPayload returns the payload of a `bash -c "<payload>"` invocation

@@ -570,6 +570,43 @@ func TestBuildAntigravityInteractiveArgs_PassesArgsThroughPositional(t *testing.
 }
 
 /* --------------------------------------------------------------------------
+   shapePTYExecArgs
+   --------------------------------------------------------------------------
+   A tty=true `execute` request routed to the PTY path must get the SAME
+   one-shot argv shaping StartSession applies, otherwise agy/antigravity starts
+   its interactive TUI and hangs until the prompt timeout instead of returning
+   a result. Only antigravity needs shaping; other eligible commands pass
+   through untouched.
+   ------------------------------------------------------------------------ */
+
+func TestShapePTYExecArgs_ShapesAntigravity(t *testing.T) {
+	// Direct agy execute: must gain --print --dangerously-skip-permissions with
+	// the prompt preserved on argv (matches buildInteractiveCLIArgs).
+	cmd, args := shapePTYExecArgs("agy", []string{"fix the bug"})
+	if cmd != "agy" {
+		t.Errorf("shapePTYExecArgs command = %q, want agy", cmd)
+	}
+	mustContain(t, args, "--print", "--dangerously-skip-permissions", "fix the bug")
+
+	// The `antigravity` alias is shaped identically.
+	_, aliasArgs := shapePTYExecArgs("antigravity", []string{"do it"})
+	mustContain(t, aliasArgs, "--print", "--dangerously-skip-permissions", "do it")
+
+	// Robust to an explicit path / .exe suffix (isAntigravityCommand normalizes).
+	_, pathArgs := shapePTYExecArgs("/usr/local/bin/agy", []string{"go"})
+	mustContain(t, pathArgs, "--print", "--dangerously-skip-permissions", "go")
+}
+
+func TestShapePTYExecArgs_PassesThroughNonAntigravity(t *testing.T) {
+	// A shell-wrapped payload keeps the shell as its base command and its args
+	// unchanged — the prompt already rides on argv inside the payload.
+	cmd, args := shapePTYExecArgs("bash", []string{"-c", "agy --brief x"})
+	if cmd != "bash" || len(args) != 2 || args[0] != "-c" || args[1] != "agy --brief x" {
+		t.Errorf("shapePTYExecArgs mutated non-antigravity command: cmd=%q args=%v", cmd, args)
+	}
+}
+
+/* --------------------------------------------------------------------------
    stdinPromptFormat
    --------------------------------------------------------------------------
    Centralises per-CLI stdin protocol so StartSession's write path doesn't

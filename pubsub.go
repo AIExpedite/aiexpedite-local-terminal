@@ -2118,8 +2118,13 @@ func executeTerminalCommand(cfg *Config, cmd commandMsg) (string, error) {
 func runTTYCommand(cfg *Config, cmd commandMsg) (string, error) {
 	timeout := resolveExecTimeout(cmd.TimeoutMs)
 	workDir := resolveWorkDir(cfg, cmd.Cwd)
+	// Apply the same one-shot argv shaping StartSession uses for an eligible PTY
+	// agent so a tty=true `execute` request returns a result instead of dropping
+	// into the interactive TUI and hanging until the prompt timeout. agy/
+	// antigravity need `--print --dangerously-skip-permissions <prompt>`.
+	ptyCommand, ptyArgs := shapePTYExecArgs(cmd.Command, cmd.Args)
 	out, aborted, abortMsg, err := runPTYCommand(
-		cmd.Command, cmd.Args, workDir, nil, timeout, DefaultPTYPromptTimeout, nil)
+		ptyCommand, ptyArgs, workDir, nil, timeout, DefaultPTYPromptTimeout, nil)
 	if err != nil {
 		return out, err
 	}
@@ -2127,6 +2132,21 @@ func runTTYCommand(cfg *Config, cmd commandMsg) (string, error) {
 		return out, errors.New(abortMsg)
 	}
 	return out, nil
+}
+
+// shapePTYExecArgs applies the same one-shot CLI argv shaping StartSession uses
+// (buildInteractiveCLIArgs) for a PTY-eligible agent, so a tty=true `execute`
+// request reaches the agent's non-interactive `--print` path rather than
+// launching the raw interactive TUI. Only antigravity (agy/antigravity) needs
+// shaping — `--print --dangerously-skip-permissions <prompt>`; other eligible
+// commands pass through unchanged. A shell-wrapped payload (`bash -c "agy …"`)
+// is left as-is: its base command is the shell, not the agent, and the shell
+// already carries the prompt on argv.
+func shapePTYExecArgs(command string, args []string) (string, []string) {
+	if isAntigravityCommand(command) {
+		return command, buildAntigravityInteractiveArgs(args)
+	}
+	return command, args
 }
 
 func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {

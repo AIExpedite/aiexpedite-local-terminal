@@ -193,6 +193,13 @@ func TestIsPTYEligibleCommand_AllowlistOnly(t *testing.T) {
 		{"bash", []string{"-c", "agy & git fetch"}},
 		{"bash", []string{"-c", "agy $(git rev-parse HEAD)"}},
 		{"bash", []string{"-c", "agy `git rev-parse HEAD`"}},
+		// Process substitution / redirection launch or reach another process
+		// without any of the chaining operators above — still must not ride the
+		// PTY on the agent's first token.
+		{"bash", []string{"-c", "agy <(git credential fill)"}},
+		{"bash", []string{"-c", "agy >(git hash-object -w --stdin)"}},
+		{"bash", []string{"-c", "agy > /dev/tty"}},
+		{"bash", []string{"-c", "agy < /dev/tty"}},
 		{"", nil},
 	}
 	for _, c := range eligible {
