@@ -4,9 +4,41 @@
 package main
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 )
+
+func TestHardenNonAgentCommand_AppliesEnvOverlayToCmd(t *testing.T) {
+	// The security-critical wiring: hardenNonAgentCommand must actually stamp
+	// the authoritative non-interactive overlay onto the spawned command's env.
+	c := exec.Command("git", "status")
+	hardenNonAgentCommand(c, "git status")
+	m := envMap(c.Env)
+	if m["GIT_TERMINAL_PROMPT"] != "0" {
+		t.Errorf("GIT_TERMINAL_PROMPT not forced on cmd env: %q", m["GIT_TERMINAL_PROMPT"])
+	}
+	if m["GIT_EDITOR"] != "true" || m["GCM_INTERACTIVE"] != "never" {
+		t.Errorf("expected editor/credential hardening on cmd env, got %v", m)
+	}
+	// A non-test command must NOT get the test-runner niceties.
+	if _, present := m["CI"]; present {
+		t.Errorf("non-test command should not receive CI=1")
+	}
+}
+
+func TestHardenNonAgentCommand_TestRunnerGetsCIDefaults(t *testing.T) {
+	c := exec.Command("bash", "-c", "pytest -q")
+	hardenNonAgentCommand(c, effectiveCommandLine("bash", []string{"-c", "pytest -q"}))
+	m := envMap(c.Env)
+	if m["CI"] != "1" || m["PYTHONUNBUFFERED"] != "1" {
+		t.Errorf("test-runner command should get CI/unbuffering defaults, got %v", m)
+	}
+	// Safety overlay still applies underneath the test profile.
+	if m["GIT_TERMINAL_PROMPT"] != "0" {
+		t.Errorf("safety overlay missing on test-runner command: %v", m)
+	}
+}
 
 func envMap(kvs []string) map[string]string {
 	m := map[string]string{}
