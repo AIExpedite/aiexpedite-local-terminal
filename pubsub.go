@@ -2102,13 +2102,11 @@ func resolveWorkDir(cfg *Config, cwd string) string {
 // agent commands only) and everything else to the hardened pipe path. Git and
 // test runners are forced onto pipes even when tty=true (design guardrail).
 func executeTerminalCommand(cfg *Config, cmd commandMsg) (string, error) {
-	if cmd.Tty {
-		eff := effectiveCommandLine(cmd.Command, cmd.Args)
-		if isPTYIneligibleCommand(eff) {
-			// Guardrail: never route git/repository sync or test runners through
-			// a PTY — fall back to the hardened pipe path (safe direction).
-			return runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
-		}
+	// PTY is an allowlist: only a recognized resident TUI agent may run under a
+	// PTY. Everything else (git, test runners, bash/sh/PowerShell, ssh, …) stays
+	// on the hardened pipe path even with tty=true, so unsigned tty can't flip a
+	// utility off the headless hardening.
+	if cmd.Tty && isPTYEligibleCommand(effectiveCommandLine(cmd.Command, cmd.Args)) {
 		return runTTYCommand(cfg, cmd)
 	}
 	return runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
@@ -3043,6 +3041,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			cmd.WorkspaceID,
 			cmd.UID,
 			cmd.TimeoutMs,
+			cmd.Tty,
 			publishFn,
 		)
 		if err != nil {

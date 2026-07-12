@@ -107,21 +107,29 @@ func TestIsTestRunnerCommand(t *testing.T) {
 	}
 }
 
-func TestIsPTYIneligibleCommand_GitAndTestRunnersForcedOffPTY(t *testing.T) {
-	ineligible := []string{
-		"git fetch --all", "git", "pytest", "npm test", "jest",
-		// Path-qualified / suffixed git must still be forced off the PTY path.
-		"/usr/bin/git fetch", "git.exe pull",
+func TestIsPTYEligibleCommand_AllowlistOnly(t *testing.T) {
+	// Only recognized resident TUI agents are PTY-eligible; robust to path/suffix.
+	eligible := []string{
+		"agy", "antigravity chat", "agy --brief x",
+		"/usr/local/bin/agy", "agy.exe run",
 	}
-	eligible := []string{"agy", "antigravity chat", "node repl.js", "bash"}
-	for _, c := range ineligible {
-		if !isPTYIneligibleCommand(c) {
-			t.Errorf("isPTYIneligibleCommand(%q) = false, want true", c)
-		}
+	// Everything else stays on the hardened pipe path even with tty=true — this
+	// is the security guardrail: unsigned tty can't flip a utility onto a PTY.
+	ineligible := []string{
+		"git fetch --all", "git", "/usr/bin/git fetch", "git.exe pull",
+		"pytest", "npm test", "jest",
+		"bash", "bash -c 'echo hi'", "sh", "powershell", "pwsh",
+		"ssh user@host", "node repl.js", "claude --print x", "codex", "grok", "gemini",
+		"",
 	}
 	for _, c := range eligible {
-		if isPTYIneligibleCommand(c) {
-			t.Errorf("isPTYIneligibleCommand(%q) = true, want false", c)
+		if !isPTYEligibleCommand(c) {
+			t.Errorf("isPTYEligibleCommand(%q) = false, want true", c)
+		}
+	}
+	for _, c := range ineligible {
+		if isPTYEligibleCommand(c) {
+			t.Errorf("isPTYEligibleCommand(%q) = true, want false", c)
 		}
 	}
 }

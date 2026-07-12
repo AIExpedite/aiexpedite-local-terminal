@@ -21,3 +21,8 @@ var errPTYUnsupportedWindows = errors.New(
 // prompt (not general quiet) so a TUI legitimately working after output is not
 // killed. Order-of-magnitude aligned with the utility short window.
 const DefaultPTYPromptTimeout = 15 * time.Minute
+
+// ptySessionPromptTimeout is the quiet-after-prompt abort window for an
+// interactive PTY session (readPTYStream). A package var (not a const) so tests
+// can shorten it; production uses DefaultPTYPromptTimeout.
+var ptySessionPromptTimeout = DefaultPTYPromptTimeout

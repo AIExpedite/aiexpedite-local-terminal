@@ -155,7 +155,7 @@ type PublishFunc func(res resultMsg)
 
 // StartSession creates and starts a new interactive CLI session. The process
 // is spawned with stdin/stdout/stderr pipes and output is streamed via publishFn.
-func (sm *SessionManager) StartSession(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, publishFn PublishFunc) error {
+func (sm *SessionManager) StartSession(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, tty bool, publishFn PublishFunc) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -167,6 +167,16 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// stdinPrompt is non-empty for Claude — the prompt is sent as NDJSON on stdin.
 	enableGrokAlwaysApprove := sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
 	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
+
+	// Opt-in PTY path for recognized resident TUI agents (agy/antigravity) that
+	// require a real terminal. macOS/Linux only — startPTYSession rejects on
+	// Windows (ConPTY deferred). PTY output is merged (stdout+stderr) and
+	// normalized before streaming; the JSON-protocol agents and all utilities
+	// stay on the pipe path below, so tty is a no-op for anything not on the
+	// allowlist. See EXECUTION_LIVENESS_REDESIGN.md → PTY mode.
+	if tty && isPTYEligibleCommand(command) {
+		return sm.startPTYSession(id, command, cliArgs, cwd, workspaceID, uid, timeoutMs, publishFn)
+	}
 
 	// grok's headless mode takes its prompt on argv (`-p <prompt>`) and does NOT
 	// read a piped stdin, so — unlike claude/codex/gemini, which route a long

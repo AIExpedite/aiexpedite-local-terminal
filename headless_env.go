@@ -137,11 +137,25 @@ func isTestRunnerCommand(command string) bool {
 	return false
 }
 
-// isGitCommand reports whether the effective command line invokes git. Used to
-// keep git off the PTY path (guardrail: never route git through a PTY). Robust
-// to an explicit path (`/usr/bin/git`) and a Windows suffix (`git.exe`) so a
-// path-qualified invocation can't slip past the guardrail onto the PTY path.
-func isGitCommand(command string) bool {
+// ptyEligibleAgents is the allowlist of recognized resident interactive/TUI
+// agents that genuinely require a real terminal (Antigravity's `agy`). PTY is an
+// ALLOWLIST, not a blocklist: only these commands may run under a PTY when
+// tty=true. Everything else — git, test runners, bash/sh/PowerShell, ssh,
+// credential-helper probes, and the pipe-protocol agents (claude/codex/gemini/
+// grok, which use structured stdio) — stays on the hardened pipe path. This is
+// deliberate: `tty` is unsigned metadata, so a blocklist would let an attacker
+// flip a signed `bash`/`ssh` command from the hardened pipe path onto a PTY
+// (no controlling-terminal hardening, free to prompt). An allowlist makes tty a
+// no-op on anything but a recognized TUI agent.
+var ptyEligibleAgents = map[string]bool{
+	"agy":         true,
+	"antigravity": true,
+}
+
+// isPTYEligibleCommand reports whether a command may run under a PTY when
+// tty=true. Robust to an explicit path (`/usr/local/bin/agy`) and a Windows
+// suffix (`agy.exe`).
+func isPTYEligibleCommand(command string) bool {
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
 		return false
@@ -151,15 +165,7 @@ func isGitCommand(command string) bool {
 		base = base[i+1:]
 	}
 	base = strings.TrimSuffix(base, ".exe")
-	return base == "git"
-}
-
-// isPTYIneligibleCommand reports whether a command must never run under a PTY
-// even when tty=true is requested: git/repository sync and test runners always
-// stay on the headless pipe path so their separate-stderr, ANSI-free contract
-// holds. See design guardrails.
-func isPTYIneligibleCommand(command string) bool {
-	return isGitCommand(command) || isTestRunnerCommand(command)
+	return ptyEligibleAgents[base]
 }
 
 // effectiveCommandLine returns the command string to classify for profiling. A
