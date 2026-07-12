@@ -2199,6 +2199,19 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 		return runLocalCommandFallback(cmdLine, workDir, timeout)
 	}
 
+	// Test runners need per-command non-interactive defaults (CI=1,
+	// FORCE_COLOR=0, NO_COLOR=1, PYTHONUNBUFFERED=1). The long-lived persistent
+	// PowerShell fixes its env at startup and cannot inject them per command, so
+	// route a detected test runner through a one-shot hardened process instead —
+	// runLocalCommandFallback calls hardenNonAgentCommand, which layers
+	// testRunnerEnvDefaults UNDER the authoritative git/editor safety overlay.
+	// See EXECUTION_LIVENESS_REDESIGN.md → test-runner profile.
+	if isTestRunnerCommand(cmdLine) {
+		fmt.Printf("%s[aiexpedite] Using one-shot hardened process for test runner: %s%s\n",
+			colorCyan, cmd, colorReset)
+		return runLocalCommandFallback(cmdLine, workDir, timeout)
+	}
+
 	// Route bash-style commands (containing && or ||) through a one-shot
 	// PowerShell process on Windows when the persistent PS instance is not
 	// available. pwsh.exe is preferred (supports && natively); powershell.exe

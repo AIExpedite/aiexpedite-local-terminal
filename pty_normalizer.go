@@ -24,9 +24,22 @@ import (
 )
 
 // DefaultRedrawInterval bounds how often an un-terminated (carriage-return only)
-// line is flushed as an intermediate frame. Progress bars that redraw hundreds
-// of times per second collapse to roughly one line per interval.
-const DefaultRedrawInterval = 200 * time.Millisecond
+// line is flushed as an intermediate frame. Kept coarse (seconds) so a progress
+// bar redrawing hundreds of times per second surfaces at most a heartbeat of
+// liveness, not a per-frame stream. See also maxRedrawEmitsPerRun.
+const DefaultRedrawInterval = 1 * time.Second
+
+// maxRedrawEmitsPerRun caps how many intermediate frames a SINGLE un-terminated
+// line-run (a carriage-return-only redraw sequence with no newline) may emit
+// before it goes quiet until the line is terminated or the stream flushes. This
+// makes token cost independent of animation DURATION: a 1,000-frame progress
+// bar spread over tens of seconds still yields ~one final useful line
+// (≤ maxRedrawEmitsPerRun heartbeats + the final terminated line) rather than a
+// frame every DefaultRedrawInterval for the whole run. The counter resets when
+// a newline terminates the line (resetLine), so multi-line logs keep per-line
+// liveness. Prompt detection (PendingPromptLine) reads internal state and is
+// unaffected by this emission cap.
+const maxRedrawEmitsPerRun = 2
 
 // NormalizerCounters are structured metrics about how much raw terminal noise
 // was collapsed. Logged (without any command content) for observability.
@@ -50,8 +63,9 @@ type PTYNormalizer struct {
 	lastEmitted string
 	haveLast    bool
 
-	redrawInterval time.Duration
-	lastRedrawEmit time.Time
+	redrawInterval     time.Duration
+	lastRedrawEmit     time.Time
+	redrawEmitsThisRun int // intermediate frames emitted for the current line-run
 
 	Counters NormalizerCounters
 }
@@ -165,6 +179,9 @@ func (n *PTYNormalizer) resetLine() {
 	n.line = n.line[:0]
 	n.col = 0
 	n.crPending = false
+	// A new logical line begins — restore the intermediate-redraw budget so the
+	// next line-run gets its own liveness heartbeats (see maxRedrawEmitsPerRun).
+	n.redrawEmitsThisRun = 0
 }
 
 // finalizeLine renders the current line to a trimmed string.
@@ -193,6 +210,14 @@ func (n *PTYNormalizer) MaybeFlushRedraw(now time.Time) (string, bool) {
 	if len(n.line) == 0 {
 		return "", false
 	}
+	// Hard per-line-run cap: once a single continuously-redrawn line has emitted
+	// its budget of intermediate frames, stay quiet until it is terminated
+	// (newline → resetLine) or the stream flushes. Bounds token cost by frame
+	// COUNT, not just rate, so duration can't reinflate a progress bar.
+	if n.redrawEmitsThisRun >= maxRedrawEmitsPerRun {
+		n.Counters.RedrawsRateLimited++
+		return "", false
+	}
 	if !n.lastRedrawEmit.IsZero() && now.Sub(n.lastRedrawEmit) < n.redrawInterval {
 		n.Counters.RedrawsRateLimited++
 		return "", false
@@ -203,6 +228,7 @@ func (n *PTYNormalizer) MaybeFlushRedraw(now time.Time) (string, bool) {
 		return "", false
 	}
 	n.lastRedrawEmit = now
+	n.redrawEmitsThisRun++
 	n.lastEmitted = s
 	n.haveLast = true
 	n.Counters.LinesEmitted++

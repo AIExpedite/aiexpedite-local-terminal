@@ -220,6 +220,22 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 			colorYellow, id, strings.Join(strippedVars, ", "), colorReset)
 	}
 
+	// Headless hardening for NON-resident utility session_start commands.
+	// Ordinary orchestrator commands (bash/sh/git/PowerShell/test runners) are
+	// dispatched through session_start (terminal.execute.command/runAndWait),
+	// NOT the one-shot execute path — so without this a git/editor/credential
+	// prompt would escape the captured pipes via /dev/tty and hang until the
+	// session timeout. hardenNonAgentCommand applies the authoritative
+	// non-interactive git/editor/credential env (overwriting the utility's
+	// unchanged passthrough env), detaches the controlling terminal, and layers
+	// the test-runner defaults for recognized runners. Resident CLI agents
+	// (claude/codex/gemini/grok/agy) keep their interactive-capable env + stdin.
+	// See EXECUTION_LIVENESS_REDESIGN.md → headless hardening.
+	utilitySession := !isResidentAgentSessionCommand(command)
+	if utilitySession {
+		hardenNonAgentCommand(proc, effectiveCommandLine(command, cliArgs))
+	}
+
 	// Set up pipes
 	stdin, err := proc.StdinPipe()
 	if err != nil {
@@ -341,6 +357,13 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		session.Stdin.Close()
 		fmt.Printf("%s[session] Closed stdin for one-shot session %s (%s)%s\n",
 			colorYellow, id, command, colorReset)
+	} else if utilitySession {
+		// A utility never reads interactive stdin; close it so a child that does
+		// read stdin sees EOF immediately instead of blocking on the open pipe.
+		// (The /dev/tty prompt vector is already closed by the TTY detachment in
+		// hardenNonAgentCommand.) Mutually exclusive with the one-shot close
+		// above, which only fires for resident stdin-fed agents.
+		session.Stdin.Close()
 	}
 
 	return nil
@@ -1456,6 +1479,35 @@ func isGrokCommand(command string) bool {
 	return strings.HasPrefix(commandBaseName(command), "grok")
 }
 
+// isAntigravityCommand reports whether command routes to the Antigravity CLI.
+// Accepts BOTH the `agy` binary and the `antigravity` alias — the PTY
+// eligibility allowlist (isPTYEligibleCommand) admits both, so both MUST get
+// the same one-shot argv shaping (`--print --dangerously-skip-permissions`) in
+// buildInteractiveCLIArgs; otherwise a `tty=true` `antigravity` session would
+// start under a PTY with no prompt flag and hang. Robust to paths / .exe shims.
+func isAntigravityCommand(command string) bool {
+	base := commandBaseName(command)
+	return strings.HasPrefix(base, "agy") || strings.HasPrefix(base, "antigravity")
+}
+
+// isResidentAgentSessionCommand reports whether a session_start command is a
+// resident CLI agent that keeps its interactive-capable env. These are exactly
+// the commands buildInteractiveCLIArgs shapes (claude/codex/gemini/grok) plus
+// the PTY-only TUI agents (agy/antigravity). Everything else is a one-shot
+// utility (bash/sh/git/PowerShell/test runner) that MUST be headless-hardened
+// on the pipe session path — see StartSession.
+func isResidentAgentSessionCommand(command string) bool {
+	base := commandBaseName(command)
+	switch {
+	case strings.HasPrefix(base, "claude"),
+		strings.HasPrefix(base, "codex"),
+		strings.HasPrefix(base, "gemini"),
+		strings.HasPrefix(base, "grok"):
+		return true
+	}
+	return isAntigravityCommand(command)
+}
+
 /* --------------------------------------------------------------------------
    CLI argument builders
    -------------------------------------------------------------------------- */
@@ -1494,7 +1546,7 @@ func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysAppr
 		return buildCodexInteractiveArgs(args)
 	case strings.HasPrefix(base, "gemini"):
 		return buildGeminiInteractiveArgs(args)
-	case strings.HasPrefix(base, "agy"):
+	case isAntigravityCommand(command):
 		return buildAntigravityInteractiveArgs(args), ""
 	case strings.HasPrefix(base, "grok"):
 		return buildGrokInteractiveArgs(args, enableGrokAlwaysApprove), ""

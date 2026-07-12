@@ -5,6 +5,7 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -122,6 +123,58 @@ func TestNormalizer_RateLimitsUnterminatedRedraw(t *testing.T) {
 	}
 	if n.Counters.RedrawsRateLimited == 0 {
 		t.Errorf("expected some redraws rate-limited, got 0")
+	}
+}
+
+// A single un-terminated line-run that redraws for a LONG time (ticking well
+// past the redraw interval on every frame) must still emit at most
+// maxRedrawEmitsPerRun intermediate frames — token cost is bounded by frame
+// COUNT, not duration. Then the terminating newline yields exactly one final
+// useful line. This is the real-world 1,000-frame progress-bar case that a
+// pure interval limiter would leak dozens of lines for.
+func TestNormalizer_LongRedrawRunCappedByFrameBudget(t *testing.T) {
+	n := NewPTYNormalizer(10 * time.Millisecond)
+	now := t0
+	emitted := 0
+	// 500 distinct redraw frames, each a full interval apart (so the interval
+	// limiter alone would let ALL of them through).
+	for i := 0; i < 500; i++ {
+		n.Write([]byte(fmt.Sprintf("\rprogress %d%%", i)), now)
+		if _, ok := n.MaybeFlushRedraw(now); ok {
+			emitted++
+		}
+		now = now.Add(50 * time.Millisecond)
+	}
+	if emitted > maxRedrawEmitsPerRun {
+		t.Fatalf("frame budget: emitted %d intermediate frames over the run, want <= %d",
+			emitted, maxRedrawEmitsPerRun)
+	}
+	// Terminating the line resets the budget and always emits the final state.
+	final := n.Write([]byte("progress 100%\n"), now)
+	if len(final) != 1 || !strings.Contains(final[0], "100%") {
+		t.Fatalf("final terminated line: got %q, want one line containing 100%%", final)
+	}
+}
+
+// The per-run budget resets on newline, so a multi-line log keeps per-line
+// liveness rather than being permanently muted after the first busy line.
+func TestNormalizer_RedrawBudgetResetsPerLine(t *testing.T) {
+	n := NewPTYNormalizer(10 * time.Millisecond)
+	now := t0
+	total := 0
+	for line := 0; line < 3; line++ {
+		for i := 0; i < 5; i++ {
+			n.Write([]byte(fmt.Sprintf("\rline%d step %d", line, i)), now)
+			if _, ok := n.MaybeFlushRedraw(now); ok {
+				total++
+			}
+			now = now.Add(50 * time.Millisecond)
+		}
+		n.Write([]byte("\n"), now) // terminate → resets the per-run budget
+	}
+	// Up to maxRedrawEmitsPerRun intermediate frames per line-run across 3 runs.
+	if total == 0 || total > 3*maxRedrawEmitsPerRun {
+		t.Fatalf("per-line budget: emitted %d intermediate frames, want 1..=%d", total, 3*maxRedrawEmitsPerRun)
 	}
 }
 
