@@ -153,6 +153,20 @@ func runMockCLI(mode string) {
 		fmt.Fprintln(os.Stderr, "permission denied: refresh your gemini token")
 		os.Exit(2)
 
+	case "agy-tty-frames":
+		// TUI-style output: colored carriage-return redraws of one line, then
+		// the final rendered state and exit. Exercises the PTY normalizer on the
+		// interactive session_start path (CR collapse + ANSI strip).
+		fmt.Print("\x1b[32mstep 1\x1b[0m\r\x1b[Kstep 2\r\x1b[Kdone\n")
+		os.Exit(0)
+
+	case "agy-prompt-hang":
+		// Emit an input prompt then go quiet — the PTY session must abort on the
+		// quiet-after-prompt timeout instead of hanging for the full sleep.
+		fmt.Print("Password: ")
+		time.Sleep(30 * time.Second)
+		os.Exit(0)
+
 	case "codex-appserver-echo":
 		runMockCodexAppServer()
 
@@ -384,7 +398,7 @@ func captureSession(t *testing.T, mockMode string, sessionCmd string, args []str
 	// runs buildInteractiveCLIArgs which returns the args/stdinPrompt shape
 	// for the configured CLI — and resolveExecutable will use exec.LookPath
 	// which finds our mock in tmpDir.
-	startErr := sm.StartSession(id, sessionCmd, args, tmpDir, "ws-test", "uid-test", 30000, publishFn)
+	startErr := sm.StartSession(id, sessionCmd, args, tmpDir, "ws-test", "uid-test", 30000, false, publishFn)
 	if startErr != nil {
 		return id, nil, fmt.Errorf("StartSession: %w", startErr)
 	}

@@ -586,6 +586,14 @@ type commandMsg struct {
 	PlanID    string `json:"planId,omitempty"`    // env-setup plan id (audit correlation)
 	StepID    string `json:"stepId,omitempty"`    // env-setup step id (audit correlation)
 
+	// Tty opts an execute/session command into the PTY path (macOS/Linux only)
+	// for interactive/TUI CLIs (e.g. agy). Default false = the hardened pipe
+	// path. Unsigned metadata (like WorkspaceID/UID): flipping it cannot bypass
+	// approval or run a different command — git and test runners are forced back
+	// onto pipes regardless, and Windows rejects tty outright. See
+	// EXECUTION_LIVENESS_REDESIGN.md → PTY mode.
+	Tty bool `json:"tty,omitempty"`
+
 	rawCliAgentCatalog json.RawMessage
 }
 
@@ -1488,8 +1496,9 @@ func runPubSubConnection(cfg *Config) error {
 		// the user's custom config chose.
 		cmdStartedAt := time.Now()
 
-		// Execute command (silently - no internal logs)
-		out, execErr := runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
+		// Execute command (silently - no internal logs). Routes tty=true to the
+		// PTY path; all other commands take the hardened pipe path.
+		out, execErr := executeTerminalCommand(cfg, cmd)
 
 		// Debug mode: show raw output details (redacted)
 		if cfg.DebugMode {
@@ -1780,6 +1789,10 @@ func runEncodedPowerShellViaArg(encodedScript string, workDir string, timeout ti
 
 	c := exec.CommandContext(ctx, "powershell.exe", psArgs...)
 	hideWindow(c)
+	// Headless hardening: authoritative non-interactive git/editor/credential env.
+	// Command text is base64-encoded here, so no test-runner detection is
+	// possible; the git safety overlay still applies.
+	hardenNonAgentCommand(c, "")
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -1858,6 +1871,8 @@ func runPowerShellCommandViaTempFile(script string, workDir string, timeout time
 
 	c := exec.CommandContext(ctx, "powershell.exe", psArgs...)
 	hideWindow(c)
+	// Headless hardening: authoritative non-interactive git/editor/credential env.
+	hardenNonAgentCommand(c, "")
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -1969,6 +1984,9 @@ func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string,
 	// runEncodedPowerShellCommand for the full explanation.
 	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", cmdLine)
 	hideWindow(c)
+	// Headless hardening: authoritative non-interactive git/editor/credential env
+	// so git/ssh/credential prompts fail fast rather than blocking.
+	hardenNonAgentCommand(c, cmdLine)
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -2010,6 +2028,19 @@ func runLocalCommandUnix(cmd string, args []string, workDir string, timeout time
 		c.Dir = workDir
 	}
 
+	// Headless hardening: authoritative non-interactive git/editor/credential
+	// env, EOF stdin, and detachment from any controlling terminal so git/ssh/
+	// credential helpers fail fast instead of prompting on /dev/tty and hanging.
+	hardenNonAgentCommand(c, effectiveCommandLine(cmd, args))
+	// On timeout, reap the whole detached process group (git spawns ssh /
+	// credential-helper descendants that must not survive the parent). Swallow
+	// the kill error (e.g. ESRCH if the group already exited) and return nil so
+	// os/exec still reports the natural context-deadline result from Wait.
+	c.Cancel = func() error {
+		_ = killProcessGroup(c.Process.Pid)
+		return nil
+	}
+
 	var combined bytes.Buffer
 	c.Stdout = &combined
 	c.Stderr = &combined
@@ -2030,26 +2061,26 @@ runLocalCommand executes the command using persistent PowerShell for low latency
 
 	timeoutMs controls the maximum execution time. If 0, defaults to 120 seconds.
 */
-func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {
-	// Default timeout: 120 seconds (matches server-side default)
+// resolveExecTimeout normalizes a caller-supplied timeout (ms) to a bounded
+// duration: default 120s when unset, capped at 4h so an unbounded caller cannot
+// pin a Pub/Sub receive goroutine (exhausting MaxOutstandingMessages) forever.
+func resolveExecTimeout(timeoutMs int64) time.Duration {
 	if timeoutMs <= 0 {
 		timeoutMs = 120000
 	}
-	// Cap timeout at 4 hours regardless of what the server sends.
-	// An unbounded caller-supplied timeout would hold a Pub/Sub receive goroutine
-	// indefinitely, silently exhausting MaxOutstandingMessages slots and
-	// preventing any new commands from being processed.
-	// 4 hours accommodates long-running operations such as codex agent runs.
-	const maxTimeoutMs = 4 * 60 * 60 * 1000 // 4 hours
+	const maxTimeoutMs = 4 * 60 * 60 * 1000 // 4 hours (accommodates long codex runs)
 	if timeoutMs > maxTimeoutMs {
 		timeoutMs = maxTimeoutMs
 	}
-	timeout := time.Duration(timeoutMs) * time.Millisecond
+	return time.Duration(timeoutMs) * time.Millisecond
+}
 
-	// Set working directory with tracked cwd support:
-	// 1. If server sent an explicit cwd that differs from the config default, use it (user changed settings)
-	// 2. If server sent the same default cwd as config, prefer tracked cwd (user may have cd'd)
-	// 3. If no cwd at all, use tracked cwd or config default
+// resolveWorkDir picks the working directory for a command with tracked-cwd
+// support:
+//  1. explicit cwd that differs from the config default → use it (user changed settings)
+//  2. cwd equals the config default → prefer tracked cwd (user may have cd'd)
+//  3. no cwd → tracked cwd or config default
+func resolveWorkDir(cfg *Config, cwd string) string {
 	workDir := cwd
 	if workDir != "" && cfg != nil && strings.EqualFold(workDir, cfg.WorkingDirectory) {
 		if tc := getTrackedCwd(); tc != "" {
@@ -2063,6 +2094,124 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 			workDir = cfg.WorkingDirectory
 		}
 	}
+	return workDir
+}
+
+// executeTerminalCommand is the single dispatch point for an `execute` command.
+// It routes an opt-in tty=true request to the PTY path (macOS/Linux, eligible
+// agent commands only) and everything else to the hardened pipe path. Git and
+// test runners are forced onto pipes even when tty=true (design guardrail).
+func executeTerminalCommand(cfg *Config, cmd commandMsg) (string, error) {
+	// PTY is an allowlist: only a recognized resident TUI agent may run under a
+	// PTY. Everything else (git, test runners, bash/sh/PowerShell, ssh, …) stays
+	// on the hardened pipe path even with tty=true, so unsigned tty can't flip a
+	// utility off the headless hardening.
+	if cmd.Tty && isPTYEligibleCommand(cmd.Command, cmd.Args) {
+		return runTTYCommand(cfg, cmd)
+	}
+	return runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
+}
+
+// runTTYCommand runs an eligible command under a pseudo-terminal and returns its
+// normalized, model-safe output. On Windows this fails fast with a clear
+// captured error (ConPTY deferred).
+func runTTYCommand(cfg *Config, cmd commandMsg) (string, error) {
+	timeout := resolveExecTimeout(cmd.TimeoutMs)
+	workDir := resolveWorkDir(cfg, cmd.Cwd)
+	// Apply the same one-shot argv shaping StartSession uses for an eligible PTY
+	// agent so a tty=true `execute` request returns a result instead of dropping
+	// into the interactive TUI and hanging until the prompt timeout. agy/
+	// antigravity need `--print --dangerously-skip-permissions <prompt>`.
+	ptyCommand, ptyArgs := shapePTYExecArgs(cmd.Command, cmd.Args)
+	out, aborted, abortMsg, err := runPTYCommand(
+		ptyCommand, ptyArgs, workDir, nil, timeout, DefaultPTYPromptTimeout, nil)
+	if err != nil {
+		return out, err
+	}
+	if aborted {
+		return out, errors.New(abortMsg)
+	}
+	return out, nil
+}
+
+// shapePTYExecArgs applies the same one-shot CLI argv shaping StartSession uses
+// (buildInteractiveCLIArgs) for a PTY-eligible agent, so a tty=true `execute`
+// request reaches the agent's non-interactive `--print` path rather than
+// launching the raw interactive TUI. Only antigravity (agy/antigravity) needs
+// shaping — `--print --dangerously-skip-permissions <prompt>`; other eligible
+// commands pass through unchanged.
+//
+// Two eligible shapes are handled: a direct agy invocation (`agy fix this`),
+// and a shell-wrapped single-agent payload (`bash -c "agy fix this"`, how
+// terminal-service ships operator-joined commands). The shell-wrapped form must
+// ALSO be shaped: its base command is the shell so isAntigravityCommand misses
+// it, but isPTYEligibleCommand routes it here on the payload's first token, and
+// without shaping the inner agy drops into the interactive TUI and hangs until
+// the prompt timeout instead of returning a one-shot result.
+func shapePTYExecArgs(command string, args []string) (string, []string) {
+	if isAntigravityCommand(command) {
+		return command, buildAntigravityInteractiveArgs(args)
+	}
+	return command, shapeShellWrappedPTYArgs(command, args)
+}
+
+// shapeShellWrappedPTYArgs applies antigravity one-shot shaping to a
+// shell-wrapped single-agent PTY payload (`bash -c "agy …"`), returning args
+// with the inner agy given `--print --dangerously-skip-permissions`. A DIRECT
+// agy/antigravity invocation is already shaped by its caller
+// (buildInteractiveCLIArgs on the session_start path, shapePTYExecArgs'
+// antigravity branch on the execute path), so this only rewrites the `-c`
+// payload of a shell wrapper and leaves everything else (including
+// already-shaped direct argv) untouched. isPTYEligibleCommand has already
+// cleared the payload of shell chaining, so its first token is the whole
+// program and the remainder is preserved verbatim as the literal prompt.
+func shapeShellWrappedPTYArgs(command string, args []string) []string {
+	if payload, ok := shellDashCPayload(command, args); ok {
+		if shaped, ok := shapeAntigravityShellPayload(payload); ok {
+			return replaceDashCPayload(args, shaped)
+		}
+	}
+	return args
+}
+
+// shapeAntigravityShellPayload rewrites a `bash -c` payload whose leading token
+// is agy/antigravity so the inner invocation gains the one-shot
+// `--print --dangerously-skip-permissions` shaping, returning the rewritten
+// payload and true. It returns ("", false) when the first token is not an
+// antigravity command. The flag list is sourced from buildAntigravityInteractiveArgs
+// so it cannot drift from the direct path. Only reached for payloads
+// isPTYEligibleCommand has cleared of shell chaining, so fields[0] is the whole
+// program and the remainder is preserved verbatim as the literal prompt.
+func shapeAntigravityShellPayload(payload string) (string, bool) {
+	fields := strings.Fields(payload)
+	if len(fields) == 0 || !isAntigravityCommand(fields[0]) {
+		return "", false
+	}
+	flags := strings.Join(buildAntigravityInteractiveArgs(nil), " ")
+	shaped := fields[0] + " " + flags
+	if rest := strings.TrimSpace(strings.TrimPrefix(payload, fields[0])); rest != "" {
+		shaped += " " + rest
+	}
+	return shaped, true
+}
+
+// replaceDashCPayload returns a copy of args with the string following the first
+// `-c` flag replaced by payload, mirroring how shellDashCPayload locates it.
+func replaceDashCPayload(args []string, payload string) []string {
+	out := make([]string, len(args))
+	copy(out, args)
+	for i, a := range out {
+		if a == "-c" && i+1 < len(out) {
+			out[i+1] = payload
+			return out
+		}
+	}
+	return out
+}
+
+func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {
+	timeout := resolveExecTimeout(timeoutMs)
+	workDir := resolveWorkDir(cfg, cwd)
 
 	// Unix (macOS/Linux): exec the command directly. The terminal-service
 	// already wraps shell-bound commands (built-ins, &&/||, pipes) in
@@ -2127,6 +2276,19 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 				cmdLine = claudePath + cmdLine[6:] // 6 = len("claude")
 			}
 		}
+		return runLocalCommandFallback(cmdLine, workDir, timeout)
+	}
+
+	// Test runners need per-command non-interactive defaults (CI=1,
+	// FORCE_COLOR=0, NO_COLOR=1, PYTHONUNBUFFERED=1). The long-lived persistent
+	// PowerShell fixes its env at startup and cannot inject them per command, so
+	// route a detected test runner through a one-shot hardened process instead —
+	// runLocalCommandFallback calls hardenNonAgentCommand, which layers
+	// testRunnerEnvDefaults UNDER the authoritative git/editor safety overlay.
+	// See EXECUTION_LIVENESS_REDESIGN.md → test-runner profile.
+	if isTestRunnerCommand(cmdLine) {
+		fmt.Printf("%s[aiexpedite] Using one-shot hardened process for test runner: %s%s\n",
+			colorCyan, cmd, colorReset)
 		return runLocalCommandFallback(cmdLine, workDir, timeout)
 	}
 
@@ -2219,6 +2381,33 @@ func cachedResolveClaudePath() string {
 	return claudePathCached
 }
 
+// buildFallbackProbeCommand wraps a user command line for the one-shot fallback
+// PowerShell so it (a) PRESERVES the user command's native exit code and (b)
+// still reports the final working directory for cd tracking.
+//
+// The exit code must be captured into $__aix_exit IMMEDIATELY after the user
+// command — before the Write-Host/Get-Location cwd probe runs — because those
+// trailing cmdlets succeed and would otherwise reset the effective exit status,
+// making `powershell -Command` exit 0 and mask a failing native command such as
+// `npm test` / `pytest` as success. $LASTEXITCODE is $null when the command ran
+// no native process (a pure cmdlet that did not fail terminally); treat that as
+// success. A terminating error aborts before the probe, so PS already exits
+// non-zero (cwd tracking is best-effort and skipped in that case).
+//
+// $LASTEXITCODE is reset to 0 BEFORE the user command: PowerShell only updates
+// it when a native executable runs, and a fresh pwsh.exe can start with a
+// non-zero value from internal startup steps, so a cmdlet-only fallback command
+// would otherwise capture that stale non-zero code and be reported as a failure.
+// This mirrors the persistent-shell reset in powershell_windows.go.
+func buildFallbackProbeCommand(cmdLine, sentinel string) string {
+	return "$LASTEXITCODE = 0\n" +
+		cmdLine +
+		"\n$__aix_exit = $LASTEXITCODE" +
+		"\nWrite-Host '" + sentinel + "'" +
+		"\n(Get-Location).Path" +
+		"\nif ($null -eq $__aix_exit) { exit 0 } else { exit $__aix_exit }"
+}
+
 // runLocalCommandFallback uses traditional process spawning (slow but reliable).
 // Prefers pwsh.exe (PowerShell 7+) when available for better compatibility.
 // After the command runs, it queries the final working directory so that cd
@@ -2232,12 +2421,14 @@ func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Durati
 	// Append a pwd probe so we can track directory changes from this process.
 	// The sentinel line lets us split user output from the directory result.
 	const cwdSentinel = "<<<AIX_CWD_PROBE>>>"
-	probeCmd := cmdLine + "\nWrite-Host '" + cwdSentinel + "'\n(Get-Location).Path"
+	probeCmd := buildFallbackProbeCommand(cmdLine, cwdSentinel)
 
 	// `-OutputFormat Text` prevents CLIXML error serialization — see
 	// runEncodedPowerShellCommand for the full explanation.
 	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", probeCmd)
 	hideWindow(c)
+	// Headless hardening: authoritative non-interactive git/editor/credential env.
+	hardenNonAgentCommand(c, cmdLine)
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -2970,6 +3161,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			cmd.WorkspaceID,
 			cmd.UID,
 			cmd.TimeoutMs,
+			cmd.Tty,
 			publishFn,
 		)
 		if err != nil {

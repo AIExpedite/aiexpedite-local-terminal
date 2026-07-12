@@ -155,7 +155,7 @@ type PublishFunc func(res resultMsg)
 
 // StartSession creates and starts a new interactive CLI session. The process
 // is spawned with stdin/stdout/stderr pipes and output is streamed via publishFn.
-func (sm *SessionManager) StartSession(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, publishFn PublishFunc) error {
+func (sm *SessionManager) StartSession(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, tty bool, publishFn PublishFunc) error {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -167,6 +167,27 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// stdinPrompt is non-empty for Claude — the prompt is sent as NDJSON on stdin.
 	enableGrokAlwaysApprove := sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
 	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
+
+	// Opt-in PTY path for recognized resident TUI agents (agy/antigravity) that
+	// require a real terminal. macOS/Linux only — startPTYSession rejects on
+	// Windows (ConPTY deferred). PTY output is merged (stdout+stderr) and
+	// normalized before streaming; the JSON-protocol agents and all utilities
+	// stay on the pipe path below, so tty is a no-op for anything not on the
+	// allowlist. See EXECUTION_LIVENESS_REDESIGN.md → PTY mode.
+	if tty && isPTYEligibleCommand(command, args) {
+		// buildInteractiveCLIArgs shapes a DIRECT agy/antigravity invocation into
+		// its one-shot `--print --dangerously-skip-permissions <prompt>` form, but
+		// a shell-wrapped single-agent payload (`bash -c "agy …"`, how
+		// terminal-service ships operator-joined commands) falls through its
+		// default branch unshaped — the base command is the shell, not agy. Apply
+		// the same shell-payload shaping the execute path (shapePTYExecArgs) uses
+		// so the inner agy reaches its non-interactive `--print` path and returns a
+		// one-shot result instead of dropping into the interactive TUI and hanging
+		// until the prompt timeout. Direct agy argv is already shaped and passes
+		// through unchanged (shellDashCPayload only matches a shell -c wrapper).
+		ptyArgs := shapeShellWrappedPTYArgs(command, cliArgs)
+		return sm.startPTYSession(id, command, ptyArgs, cwd, workspaceID, uid, timeoutMs, publishFn)
+	}
 
 	// grok's headless mode takes its prompt on argv (`-p <prompt>`) and does NOT
 	// read a piped stdin, so — unlike claude/codex/gemini, which route a long
@@ -208,6 +229,23 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	if len(strippedVars) > 0 {
 		fmt.Printf("%s[session] Stripped env vars from session %s: %s%s\n",
 			colorYellow, id, strings.Join(strippedVars, ", "), colorReset)
+	}
+
+	// Headless hardening for NON-resident utility session_start commands.
+	// Ordinary orchestrator commands (bash/sh/git/PowerShell/test runners) are
+	// dispatched through session_start (terminal.execute.command/runAndWait),
+	// NOT the one-shot execute path — so without this a git/editor/credential
+	// prompt would escape the captured pipes via /dev/tty and hang until the
+	// session timeout. hardenNonAgentCommand applies the authoritative
+	// non-interactive git/editor/credential env on top of the sanitized proc.Env
+	// prepared above (preserving the stripped CLAUDE_* filtering rather than
+	// reverting to os.Environ()), detaches the controlling terminal, and layers
+	// the test-runner defaults for recognized runners. Resident CLI agents
+	// (claude/codex/gemini/grok/agy) keep their interactive-capable env + stdin.
+	// See EXECUTION_LIVENESS_REDESIGN.md → headless hardening.
+	utilitySession := !isResidentAgentSessionCommand(command)
+	if utilitySession {
+		hardenNonAgentCommand(proc, effectiveCommandLine(command, cliArgs))
 	}
 
 	// Set up pipes
@@ -331,6 +369,13 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		session.Stdin.Close()
 		fmt.Printf("%s[session] Closed stdin for one-shot session %s (%s)%s\n",
 			colorYellow, id, command, colorReset)
+	} else if utilitySession {
+		// A utility never reads interactive stdin; close it so a child that does
+		// read stdin sees EOF immediately instead of blocking on the open pipe.
+		// (The /dev/tty prompt vector is already closed by the TTY detachment in
+		// hardenNonAgentCommand.) Mutually exclusive with the one-shot close
+		// above, which only fires for resident stdin-fed agents.
+		session.Stdin.Close()
 	}
 
 	return nil
@@ -1446,6 +1491,35 @@ func isGrokCommand(command string) bool {
 	return strings.HasPrefix(commandBaseName(command), "grok")
 }
 
+// isAntigravityCommand reports whether command routes to the Antigravity CLI.
+// Accepts BOTH the `agy` binary and the `antigravity` alias — the PTY
+// eligibility allowlist (isPTYEligibleCommand) admits both, so both MUST get
+// the same one-shot argv shaping (`--print --dangerously-skip-permissions`) in
+// buildInteractiveCLIArgs; otherwise a `tty=true` `antigravity` session would
+// start under a PTY with no prompt flag and hang. Robust to paths / .exe shims.
+func isAntigravityCommand(command string) bool {
+	base := commandBaseName(command)
+	return strings.HasPrefix(base, "agy") || strings.HasPrefix(base, "antigravity")
+}
+
+// isResidentAgentSessionCommand reports whether a session_start command is a
+// resident CLI agent that keeps its interactive-capable env. These are exactly
+// the commands buildInteractiveCLIArgs shapes (claude/codex/gemini/grok) plus
+// the PTY-only TUI agents (agy/antigravity). Everything else is a one-shot
+// utility (bash/sh/git/PowerShell/test runner) that MUST be headless-hardened
+// on the pipe session path — see StartSession.
+func isResidentAgentSessionCommand(command string) bool {
+	base := commandBaseName(command)
+	switch {
+	case strings.HasPrefix(base, "claude"),
+		strings.HasPrefix(base, "codex"),
+		strings.HasPrefix(base, "gemini"),
+		strings.HasPrefix(base, "grok"):
+		return true
+	}
+	return isAntigravityCommand(command)
+}
+
 /* --------------------------------------------------------------------------
    CLI argument builders
    -------------------------------------------------------------------------- */
@@ -1484,7 +1558,7 @@ func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysAppr
 		return buildCodexInteractiveArgs(args)
 	case strings.HasPrefix(base, "gemini"):
 		return buildGeminiInteractiveArgs(args)
-	case strings.HasPrefix(base, "agy"):
+	case isAntigravityCommand(command):
 		return buildAntigravityInteractiveArgs(args), ""
 	case strings.HasPrefix(base, "grok"):
 		return buildGrokInteractiveArgs(args, enableGrokAlwaysApprove), ""

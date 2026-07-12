@@ -570,6 +570,114 @@ func TestBuildAntigravityInteractiveArgs_PassesArgsThroughPositional(t *testing.
 }
 
 /* --------------------------------------------------------------------------
+   shapePTYExecArgs
+   --------------------------------------------------------------------------
+   A tty=true `execute` request routed to the PTY path must get the SAME
+   one-shot argv shaping StartSession applies, otherwise agy/antigravity starts
+   its interactive TUI and hangs until the prompt timeout instead of returning
+   a result. Only antigravity needs shaping; other eligible commands pass
+   through untouched.
+   ------------------------------------------------------------------------ */
+
+func TestShapePTYExecArgs_ShapesAntigravity(t *testing.T) {
+	// Direct agy execute: must gain --print --dangerously-skip-permissions with
+	// the prompt preserved on argv (matches buildInteractiveCLIArgs).
+	cmd, args := shapePTYExecArgs("agy", []string{"fix the bug"})
+	if cmd != "agy" {
+		t.Errorf("shapePTYExecArgs command = %q, want agy", cmd)
+	}
+	mustContain(t, args, "--print", "--dangerously-skip-permissions", "fix the bug")
+
+	// The `antigravity` alias is shaped identically.
+	_, aliasArgs := shapePTYExecArgs("antigravity", []string{"do it"})
+	mustContain(t, aliasArgs, "--print", "--dangerously-skip-permissions", "do it")
+
+	// Robust to an explicit path / .exe suffix (isAntigravityCommand normalizes).
+	_, pathArgs := shapePTYExecArgs("/usr/local/bin/agy", []string{"go"})
+	mustContain(t, pathArgs, "--print", "--dangerously-skip-permissions", "go")
+}
+
+func TestShapePTYExecArgs_ShapesShellWrappedAntigravity(t *testing.T) {
+	// A shell-wrapped single-agent payload (`bash -c "agy …"`) keeps the shell as
+	// its base command, but the inner agy must still gain the one-shot shaping —
+	// otherwise it drops into the interactive TUI and hangs until the prompt
+	// timeout. isPTYEligibleCommand already cleared it of shell chaining.
+	cmd, args := shapePTYExecArgs("bash", []string{"-c", "agy --brief x"})
+	if cmd != "bash" || len(args) != 2 || args[0] != "-c" {
+		t.Fatalf("shapePTYExecArgs reshaped shell wrapper: cmd=%q args=%v", cmd, args)
+	}
+	want := "agy --print --dangerously-skip-permissions --brief x"
+	if args[1] != want {
+		t.Errorf("shell-wrapped payload = %q, want %q", args[1], want)
+	}
+
+	// A bare `bash -c "agy"` with no prompt still gains the flags.
+	_, bareArgs := shapePTYExecArgs("bash", []string{"-c", "agy"})
+	if bareArgs[1] != "agy --print --dangerously-skip-permissions" {
+		t.Errorf("bare shell-wrapped agy = %q", bareArgs[1])
+	}
+
+	// The `antigravity` alias inside a shell wrapper is shaped identically.
+	_, aliasArgs := shapePTYExecArgs("bash", []string{"-c", "antigravity do it"})
+	if aliasArgs[1] != "antigravity --print --dangerously-skip-permissions do it" {
+		t.Errorf("shell-wrapped antigravity = %q", aliasArgs[1])
+	}
+}
+
+func TestShapePTYExecArgs_PassesThroughNonAntigravity(t *testing.T) {
+	// A non-antigravity command is never shaped — the direct check and the
+	// shell-wrapped check both miss it, so cmd/args pass through untouched.
+	cmd, args := shapePTYExecArgs("git", []string{"fetch", "--all"})
+	if cmd != "git" || len(args) != 2 || args[0] != "fetch" || args[1] != "--all" {
+		t.Errorf("shapePTYExecArgs mutated non-antigravity command: cmd=%q args=%v", cmd, args)
+	}
+
+	// A shell-wrapped non-antigravity payload is likewise left alone.
+	_, shArgs := shapePTYExecArgs("bash", []string{"-c", "echo hi"})
+	if shArgs[1] != "echo hi" {
+		t.Errorf("shapePTYExecArgs mutated non-antigravity shell payload: %q", shArgs[1])
+	}
+}
+
+// TestShapeShellWrappedPTYArgs_SessionStartPath mirrors StartSession's tty PTY
+// branch: cliArgs comes from buildInteractiveCLIArgs, then shapeShellWrappedPTYArgs
+// runs before startPTYSession. A shell-wrapped `bash -c "agy …"` must be shaped
+// there (buildInteractiveCLIArgs leaves it on the shell's default branch), while
+// a DIRECT agy — already shaped by buildInteractiveCLIArgs — must NOT be shaped
+// twice.
+func TestShapeShellWrappedPTYArgs_SessionStartPath(t *testing.T) {
+	// Shell-wrapped: buildInteractiveCLIArgs("bash", …) passes the payload through
+	// unshaped, so shapeShellWrappedPTYArgs must inject the one-shot flags.
+	cliArgs, _ := buildInteractiveCLIArgs("bash", []string{"-c", "agy --brief x"}, false)
+	ptyArgs := shapeShellWrappedPTYArgs("bash", cliArgs)
+	want := "agy --print --dangerously-skip-permissions --brief x"
+	if len(ptyArgs) != 2 || ptyArgs[0] != "-c" || ptyArgs[1] != want {
+		t.Errorf("session_start shell-wrapped agy = %v, want -c %q", ptyArgs, want)
+	}
+
+	// Direct agy: buildInteractiveCLIArgs already shaped it; shapeShellWrappedPTYArgs
+	// must leave it untouched (no duplicate --print/--dangerously-skip-permissions).
+	directArgs, _ := buildInteractiveCLIArgs("agy", []string{"fix the bug"}, false)
+	got := shapeShellWrappedPTYArgs("agy", directArgs)
+	if strings.Join(got, " ") != strings.Join(directArgs, " ") {
+		t.Errorf("shapeShellWrappedPTYArgs double-shaped direct agy: %v -> %v", directArgs, got)
+	}
+	if n := countOccurrences(got, "--print"); n != 1 {
+		t.Errorf("direct agy has %d --print flags, want exactly 1: %v", n, got)
+	}
+}
+
+func countOccurrences(s []string, want string) int {
+	n := 0
+	for _, v := range s {
+		if v == want {
+			n++
+		}
+	}
+	return n
+}
+
+/* --------------------------------------------------------------------------
    stdinPromptFormat
    --------------------------------------------------------------------------
    Centralises per-CLI stdin protocol so StartSession's write path doesn't
