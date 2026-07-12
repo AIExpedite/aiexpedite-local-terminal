@@ -10,12 +10,28 @@
 package main
 
 import (
+	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/creack/pty"
 )
+
+// ensurePTYTerm guarantees a TERM entry in a PTY child's environment. TUI/curses
+// agents (agy/antigravity) read TERM to select their rendering; when the tray/
+// desktop app is launched outside a terminal the inherited environment often has
+// no TERM, so such an agent sees it unset and aborts even though a real PTY was
+// allocated. A caller-supplied TERM (including an intentional TERM=dumb) is left
+// untouched; only a missing one is defaulted to xterm-256color.
+func ensurePTYTerm(env []string) []string {
+	for _, e := range env {
+		if strings.HasPrefix(e, "TERM=") {
+			return env
+		}
+	}
+	return append(env, "TERM=xterm-256color")
+}
 
 // runPTYCommand spawns cmd+args under a PTY, streams normalized lines via emit
 // (also accumulated into the returned string), and enforces two deadlines: an
@@ -30,9 +46,14 @@ func runPTYCommand(cmd string, args []string, workDir string, env []string,
 	if workDir != "" {
 		c.Dir = workDir
 	}
-	if env != nil {
-		c.Env = env
+	// A nil env means "inherit the parent environment" — materialize it via
+	// os.Environ() so ensurePTYTerm can guarantee TERM without dropping the rest
+	// of the environment (setting c.Env replaces, not merges).
+	childEnv := env
+	if childEnv == nil {
+		childEnv = os.Environ()
 	}
+	c.Env = ensurePTYTerm(childEnv)
 
 	ptmx, err := pty.Start(c)
 	if err != nil {

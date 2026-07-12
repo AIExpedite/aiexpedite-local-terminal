@@ -174,7 +174,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// normalized before streaming; the JSON-protocol agents and all utilities
 	// stay on the pipe path below, so tty is a no-op for anything not on the
 	// allowlist. See EXECUTION_LIVENESS_REDESIGN.md → PTY mode.
-	if tty && isPTYEligibleCommand(command) {
+	if tty && isPTYEligibleCommand(command, args) {
 		return sm.startPTYSession(id, command, cliArgs, cwd, workspaceID, uid, timeoutMs, publishFn)
 	}
 

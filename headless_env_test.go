@@ -154,36 +154,55 @@ func TestIsTestRunnerCommand(t *testing.T) {
 }
 
 func TestIsPTYEligibleCommand_AllowlistOnly(t *testing.T) {
+	type tc struct {
+		cmd  string
+		args []string
+	}
 	// Only recognized resident TUI agents are PTY-eligible; robust to path/suffix.
-	eligible := []string{
-		"agy", "antigravity chat", "agy --brief x",
-		"/usr/local/bin/agy", "agy.exe run",
+	// Direct argv: punctuation inside a literal prompt/argument is NOT chaining, so
+	// an eligible agent still rides the PTY even when an argument contains `;`/`&`/`|`.
+	eligible := []tc{
+		{"agy", nil},
+		{"antigravity", []string{"chat"}},
+		{"agy", []string{"--brief", "x"}},
+		{"/usr/local/bin/agy", nil},
+		{"agy.exe", []string{"run"}},
+		{"agy", []string{"--print", "fix A; then B"}},
+		{"agy", []string{"--message", "use a && b || c | d"}},
+		// A bash-wrapped SINGLE agent invocation is still eligible.
+		{"bash", []string{"-c", "agy --brief x"}},
 	}
 	// Everything else stays on the hardened pipe path even with tty=true — this
 	// is the security guardrail: unsigned tty can't flip a utility onto a PTY.
-	ineligible := []string{
-		"git fetch --all", "git", "/usr/bin/git fetch", "git.exe pull",
-		"pytest", "npm test", "jest",
-		"bash", "bash -c 'echo hi'", "sh", "powershell", "pwsh",
-		"ssh user@host", "node repl.js", "claude --print x", "codex", "grok", "gemini",
-		// A shell-wrapped payload that chains a non-agent command after the
-		// agent must NOT ride the PTY on its first token — the trailing
-		// git/test-runner would inherit the controlling terminal and bypass
-		// headless hardening. effectiveCommandLine unwraps `bash -c "..."` to
-		// these strings, so isPTYEligibleCommand sees them directly.
-		"agy && git push", "agy && npm test", "agy || git pull",
-		"agy; git status", "agy | tee out.log", "agy & git fetch",
-		"agy $(git rev-parse HEAD)", "agy `git rev-parse HEAD`",
-		"",
+	ineligible := []tc{
+		{"git", []string{"fetch", "--all"}}, {"git", nil},
+		{"/usr/bin/git", []string{"fetch"}}, {"git.exe", []string{"pull"}},
+		{"pytest", nil}, {"npm", []string{"test"}}, {"jest", nil},
+		{"bash", nil}, {"bash", []string{"-c", "echo hi"}}, {"sh", nil},
+		{"powershell", nil}, {"pwsh", nil},
+		{"ssh", []string{"user@host"}}, {"node", []string{"repl.js"}},
+		{"claude", []string{"--print", "x"}}, {"codex", nil}, {"grok", nil}, {"gemini", nil},
+		// A shell-wrapped payload that chains a non-agent command after the agent
+		// must NOT ride the PTY on its first token — the trailing git/test-runner
+		// would inherit the controlling terminal and bypass headless hardening.
+		{"bash", []string{"-c", "agy && git push"}},
+		{"bash", []string{"-c", "agy && npm test"}},
+		{"bash", []string{"-c", "agy || git pull"}},
+		{"bash", []string{"-c", "agy; git status"}},
+		{"bash", []string{"-c", "agy | tee out.log"}},
+		{"bash", []string{"-c", "agy & git fetch"}},
+		{"bash", []string{"-c", "agy $(git rev-parse HEAD)"}},
+		{"bash", []string{"-c", "agy `git rev-parse HEAD`"}},
+		{"", nil},
 	}
 	for _, c := range eligible {
-		if !isPTYEligibleCommand(c) {
-			t.Errorf("isPTYEligibleCommand(%q) = false, want true", c)
+		if !isPTYEligibleCommand(c.cmd, c.args) {
+			t.Errorf("isPTYEligibleCommand(%q, %v) = false, want true", c.cmd, c.args)
 		}
 	}
 	for _, c := range ineligible {
-		if isPTYEligibleCommand(c) {
-			t.Errorf("isPTYEligibleCommand(%q) = true, want false", c)
+		if isPTYEligibleCommand(c.cmd, c.args) {
+			t.Errorf("isPTYEligibleCommand(%q, %v) = true, want false", c.cmd, c.args)
 		}
 	}
 }

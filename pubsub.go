@@ -2106,7 +2106,7 @@ func executeTerminalCommand(cfg *Config, cmd commandMsg) (string, error) {
 	// PTY. Everything else (git, test runners, bash/sh/PowerShell, ssh, …) stays
 	// on the hardened pipe path even with tty=true, so unsigned tty can't flip a
 	// utility off the headless hardening.
-	if cmd.Tty && isPTYEligibleCommand(effectiveCommandLine(cmd.Command, cmd.Args)) {
+	if cmd.Tty && isPTYEligibleCommand(cmd.Command, cmd.Args) {
 		return runTTYCommand(cfg, cmd)
 	}
 	return runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)

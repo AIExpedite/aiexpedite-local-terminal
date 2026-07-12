@@ -36,7 +36,10 @@ func (sm *SessionManager) startPTYSession(id, command string, cliArgs []string,
 		proc.Dir = cwd
 	}
 	filtered, strippedVars := prepareClaudeChildEnv(command, os.Environ())
-	proc.Env = filtered
+	// Seed TERM for the PTY child so TUI agents render instead of aborting when
+	// the tray/desktop app was launched without a controlling terminal (and thus
+	// with no TERM in its environment). See ensurePTYTerm.
+	proc.Env = ensurePTYTerm(filtered)
 	if len(strippedVars) > 0 {
 		fmt.Printf("%s[session] Stripped env vars from PTY session %s: %s%s\n",
 			colorYellow, id, strings.Join(strippedVars, ", "), colorReset)

@@ -159,19 +159,34 @@ var ptyEligibleAgents = map[string]bool{
 	"antigravity": true,
 }
 
-// isPTYEligibleCommand reports whether a command may run under a PTY when
-// tty=true. The whole effective command line must be a SINGLE invocation of a
-// recognized agent — robust to an explicit path (`/usr/local/bin/agy`) and a
-// Windows suffix (`agy.exe`). A compound payload (e.g. terminal-service's
-// `bash -c "agy && git push"`, which effectiveCommandLine unwraps to
-// `agy && git push`) is rejected: only the first token would be the agent while
-// the trailing git/test-runner command would inherit the PTY's controlling
-// terminal and bypass headless hardening. Such payloads fall back to the
-// hardened pipe path instead of riding the PTY on their first token alone.
-func isPTYEligibleCommand(command string) bool {
-	if hasShellCommandChaining(command) {
-		return false
+// isPTYEligibleCommand reports whether a tty=true command may run under a PTY.
+// The command must resolve to a SINGLE invocation of a recognized agent — robust
+// to an explicit path (`/usr/local/bin/agy`) and a Windows suffix (`agy.exe`).
+//
+// Two command shapes are handled distinctly so that literal argv punctuation is
+// never mistaken for shell chaining:
+//   - Direct argv (`agy --print "fix A; then B"`): the executable is the first
+//     token and the arguments are literal data. Punctuation such as `;`/`&`/`|`
+//     inside a prompt argument is NOT shell chaining, so eligibility is decided by
+//     the executable's base name alone.
+//   - Shell-wrapped payload (`bash -c "agy && git push"`, how terminal-service
+//     ships operator-joined commands): the payload IS a real shell string, so a
+//     chaining operator means a second program (git/test-runner) would inherit the
+//     PTY's controlling terminal and bypass headless hardening. Such payloads are
+//     rejected and fall back to the hardened pipe path.
+func isPTYEligibleCommand(cmd string, args []string) bool {
+	if payload, ok := shellDashCPayload(cmd, args); ok {
+		if hasShellCommandChaining(payload) {
+			return false
+		}
+		return firstTokenIsPTYAgent(payload)
 	}
+	return firstTokenIsPTYAgent(cmd)
+}
+
+// firstTokenIsPTYAgent reports whether the leading token of command names a
+// PTY-eligible agent, normalizing an explicit path and a `.exe` suffix.
+func firstTokenIsPTYAgent(command string) bool {
 	fields := strings.Fields(command)
 	if len(fields) == 0 {
 		return false
@@ -194,19 +209,31 @@ func hasShellCommandChaining(command string) bool {
 	return strings.ContainsAny(command, "|&;`\n") || strings.Contains(command, "$(")
 }
 
+// shellDashCPayload returns the payload of a `bash -c "<payload>"` invocation
+// (any of bash/sh/zsh/dash) and true, or ("", false) when the command is not a
+// shell running a `-c` string. This is how terminal-service ships shell built-ins
+// and operator-joined commands, so the payload is a genuine shell string whose
+// operators (unlike literal argv) really do launch further programs.
+func shellDashCPayload(cmd string, args []string) (string, bool) {
+	base := commandBaseName(cmd)
+	if (base == "bash" || base == "sh" || base == "zsh" || base == "dash") && len(args) >= 2 {
+		for i, a := range args {
+			if a == "-c" && i+1 < len(args) {
+				return strings.TrimSpace(args[i+1]), true
+			}
+		}
+	}
+	return "", false
+}
+
 // effectiveCommandLine returns the command string to classify for profiling. A
 // command wrapped as `bash -c "<payload>"` (how terminal-service ships shell
 // built-ins / operator-joined commands) is unwrapped to its payload so
 // test-runner and git detection see the real leading program rather than the
 // shell.
 func effectiveCommandLine(cmd string, args []string) string {
-	base := commandBaseName(cmd)
-	if (base == "bash" || base == "sh" || base == "zsh" || base == "dash") && len(args) >= 2 {
-		for i, a := range args {
-			if a == "-c" && i+1 < len(args) {
-				return strings.TrimSpace(args[i+1])
-			}
-		}
+	if payload, ok := shellDashCPayload(cmd, args); ok {
+		return payload
 	}
 	if len(args) == 0 {
 		return cmd
