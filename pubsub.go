@@ -2301,6 +2301,26 @@ func cachedResolveClaudePath() string {
 	return claudePathCached
 }
 
+// buildFallbackProbeCommand wraps a user command line for the one-shot fallback
+// PowerShell so it (a) PRESERVES the user command's native exit code and (b)
+// still reports the final working directory for cd tracking.
+//
+// The exit code must be captured into $__aix_exit IMMEDIATELY after the user
+// command — before the Write-Host/Get-Location cwd probe runs — because those
+// trailing cmdlets succeed and would otherwise reset the effective exit status,
+// making `powershell -Command` exit 0 and mask a failing native command such as
+// `npm test` / `pytest` as success. $LASTEXITCODE is $null when the command ran
+// no native process (a pure cmdlet that did not fail terminally); treat that as
+// success. A terminating error aborts before the probe, so PS already exits
+// non-zero (cwd tracking is best-effort and skipped in that case).
+func buildFallbackProbeCommand(cmdLine, sentinel string) string {
+	return cmdLine +
+		"\n$__aix_exit = $LASTEXITCODE" +
+		"\nWrite-Host '" + sentinel + "'" +
+		"\n(Get-Location).Path" +
+		"\nif ($null -eq $__aix_exit) { exit 0 } else { exit $__aix_exit }"
+}
+
 // runLocalCommandFallback uses traditional process spawning (slow but reliable).
 // Prefers pwsh.exe (PowerShell 7+) when available for better compatibility.
 // After the command runs, it queries the final working directory so that cd
@@ -2314,7 +2334,7 @@ func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Durati
 	// Append a pwd probe so we can track directory changes from this process.
 	// The sentinel line lets us split user output from the directory result.
 	const cwdSentinel = "<<<AIX_CWD_PROBE>>>"
-	probeCmd := cmdLine + "\nWrite-Host '" + cwdSentinel + "'\n(Get-Location).Path"
+	probeCmd := buildFallbackProbeCommand(cmdLine, cwdSentinel)
 
 	// `-OutputFormat Text` prevents CLIXML error serialization — see
 	// runEncodedPowerShellCommand for the full explanation.
