@@ -586,6 +586,14 @@ type commandMsg struct {
 	PlanID    string `json:"planId,omitempty"`    // env-setup plan id (audit correlation)
 	StepID    string `json:"stepId,omitempty"`    // env-setup step id (audit correlation)
 
+	// Tty opts an execute/session command into the PTY path (macOS/Linux only)
+	// for interactive/TUI CLIs (e.g. agy). Default false = the hardened pipe
+	// path. Unsigned metadata (like WorkspaceID/UID): flipping it cannot bypass
+	// approval or run a different command — git and test runners are forced back
+	// onto pipes regardless, and Windows rejects tty outright. See
+	// EXECUTION_LIVENESS_REDESIGN.md → PTY mode.
+	Tty bool `json:"tty,omitempty"`
+
 	rawCliAgentCatalog json.RawMessage
 }
 
@@ -1488,8 +1496,9 @@ func runPubSubConnection(cfg *Config) error {
 		// the user's custom config chose.
 		cmdStartedAt := time.Now()
 
-		// Execute command (silently - no internal logs)
-		out, execErr := runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
+		// Execute command (silently - no internal logs). Routes tty=true to the
+		// PTY path; all other commands take the hardened pipe path.
+		out, execErr := executeTerminalCommand(cfg, cmd)
 
 		// Debug mode: show raw output details (redacted)
 		if cfg.DebugMode {
@@ -1780,6 +1789,10 @@ func runEncodedPowerShellViaArg(encodedScript string, workDir string, timeout ti
 
 	c := exec.CommandContext(ctx, "powershell.exe", psArgs...)
 	hideWindow(c)
+	// Headless hardening: authoritative non-interactive git/editor/credential env.
+	// Command text is base64-encoded here, so no test-runner detection is
+	// possible; the git safety overlay still applies.
+	hardenNonAgentCommand(c, "")
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -1858,6 +1871,8 @@ func runPowerShellCommandViaTempFile(script string, workDir string, timeout time
 
 	c := exec.CommandContext(ctx, "powershell.exe", psArgs...)
 	hideWindow(c)
+	// Headless hardening: authoritative non-interactive git/editor/credential env.
+	hardenNonAgentCommand(c, "")
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -1969,6 +1984,9 @@ func runViaShell(cmdLine string, workDir string, timeout time.Duration) (string,
 	// runEncodedPowerShellCommand for the full explanation.
 	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", cmdLine)
 	hideWindow(c)
+	// Headless hardening: authoritative non-interactive git/editor/credential env
+	// so git/ssh/credential prompts fail fast rather than blocking.
+	hardenNonAgentCommand(c, cmdLine)
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -2010,6 +2028,19 @@ func runLocalCommandUnix(cmd string, args []string, workDir string, timeout time
 		c.Dir = workDir
 	}
 
+	// Headless hardening: authoritative non-interactive git/editor/credential
+	// env, EOF stdin, and detachment from any controlling terminal so git/ssh/
+	// credential helpers fail fast instead of prompting on /dev/tty and hanging.
+	hardenNonAgentCommand(c, effectiveCommandLine(cmd, args))
+	// On timeout, reap the whole detached process group (git spawns ssh /
+	// credential-helper descendants that must not survive the parent). Swallow
+	// the kill error (e.g. ESRCH if the group already exited) and return nil so
+	// os/exec still reports the natural context-deadline result from Wait.
+	c.Cancel = func() error {
+		_ = killProcessGroup(c.Process.Pid)
+		return nil
+	}
+
 	var combined bytes.Buffer
 	c.Stdout = &combined
 	c.Stderr = &combined
@@ -2030,26 +2061,26 @@ runLocalCommand executes the command using persistent PowerShell for low latency
 
 	timeoutMs controls the maximum execution time. If 0, defaults to 120 seconds.
 */
-func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {
-	// Default timeout: 120 seconds (matches server-side default)
+// resolveExecTimeout normalizes a caller-supplied timeout (ms) to a bounded
+// duration: default 120s when unset, capped at 4h so an unbounded caller cannot
+// pin a Pub/Sub receive goroutine (exhausting MaxOutstandingMessages) forever.
+func resolveExecTimeout(timeoutMs int64) time.Duration {
 	if timeoutMs <= 0 {
 		timeoutMs = 120000
 	}
-	// Cap timeout at 4 hours regardless of what the server sends.
-	// An unbounded caller-supplied timeout would hold a Pub/Sub receive goroutine
-	// indefinitely, silently exhausting MaxOutstandingMessages slots and
-	// preventing any new commands from being processed.
-	// 4 hours accommodates long-running operations such as codex agent runs.
-	const maxTimeoutMs = 4 * 60 * 60 * 1000 // 4 hours
+	const maxTimeoutMs = 4 * 60 * 60 * 1000 // 4 hours (accommodates long codex runs)
 	if timeoutMs > maxTimeoutMs {
 		timeoutMs = maxTimeoutMs
 	}
-	timeout := time.Duration(timeoutMs) * time.Millisecond
+	return time.Duration(timeoutMs) * time.Millisecond
+}
 
-	// Set working directory with tracked cwd support:
-	// 1. If server sent an explicit cwd that differs from the config default, use it (user changed settings)
-	// 2. If server sent the same default cwd as config, prefer tracked cwd (user may have cd'd)
-	// 3. If no cwd at all, use tracked cwd or config default
+// resolveWorkDir picks the working directory for a command with tracked-cwd
+// support:
+//  1. explicit cwd that differs from the config default → use it (user changed settings)
+//  2. cwd equals the config default → prefer tracked cwd (user may have cd'd)
+//  3. no cwd → tracked cwd or config default
+func resolveWorkDir(cfg *Config, cwd string) string {
 	workDir := cwd
 	if workDir != "" && cfg != nil && strings.EqualFold(workDir, cfg.WorkingDirectory) {
 		if tc := getTrackedCwd(); tc != "" {
@@ -2063,6 +2094,46 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 			workDir = cfg.WorkingDirectory
 		}
 	}
+	return workDir
+}
+
+// executeTerminalCommand is the single dispatch point for an `execute` command.
+// It routes an opt-in tty=true request to the PTY path (macOS/Linux, eligible
+// agent commands only) and everything else to the hardened pipe path. Git and
+// test runners are forced onto pipes even when tty=true (design guardrail).
+func executeTerminalCommand(cfg *Config, cmd commandMsg) (string, error) {
+	if cmd.Tty {
+		eff := effectiveCommandLine(cmd.Command, cmd.Args)
+		if isPTYIneligibleCommand(eff) {
+			// Guardrail: never route git/repository sync or test runners through
+			// a PTY — fall back to the hardened pipe path (safe direction).
+			return runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
+		}
+		return runTTYCommand(cfg, cmd)
+	}
+	return runLocalCommand(cfg, cmd.Command, cmd.Args, cmd.Cwd, cmd.TimeoutMs)
+}
+
+// runTTYCommand runs an eligible command under a pseudo-terminal and returns its
+// normalized, model-safe output. On Windows this fails fast with a clear
+// captured error (ConPTY deferred).
+func runTTYCommand(cfg *Config, cmd commandMsg) (string, error) {
+	timeout := resolveExecTimeout(cmd.TimeoutMs)
+	workDir := resolveWorkDir(cfg, cmd.Cwd)
+	out, aborted, abortMsg, err := runPTYCommand(
+		cmd.Command, cmd.Args, workDir, nil, timeout, DefaultPTYPromptTimeout, nil)
+	if err != nil {
+		return out, err
+	}
+	if aborted {
+		return out, errors.New(abortMsg)
+	}
+	return out, nil
+}
+
+func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {
+	timeout := resolveExecTimeout(timeoutMs)
+	workDir := resolveWorkDir(cfg, cwd)
 
 	// Unix (macOS/Linux): exec the command directly. The terminal-service
 	// already wraps shell-bound commands (built-ins, &&/||, pipes) in
@@ -2238,6 +2309,8 @@ func runLocalCommandFallback(cmdLine string, workDir string, timeout time.Durati
 	// runEncodedPowerShellCommand for the full explanation.
 	c := exec.CommandContext(ctx, psExe, "-NoProfile", "-NonInteractive", "-OutputFormat", "Text", "-Command", probeCmd)
 	hideWindow(c)
+	// Headless hardening: authoritative non-interactive git/editor/credential env.
+	hardenNonAgentCommand(c, cmdLine)
 	if workDir != "" {
 		c.Dir = workDir
 	}
