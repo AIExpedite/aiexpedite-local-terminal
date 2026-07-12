@@ -178,6 +178,13 @@ func TestIsPTYEligibleCommand_AllowlistOnly(t *testing.T) {
 		{"agy", []string{"--message", "use a && b || c | d"}},
 		// A bash-wrapped SINGLE agent invocation is still eligible.
 		{"bash", []string{"-c", "agy --brief x"}},
+		// Operators that are literal shell DATA inside quotes are NOT chaining —
+		// a single-agent payload with a quoted `&`/`;`/`|`/`<`/`>` in its prompt
+		// still rides the PTY instead of falling back to pipes and hanging.
+		{"bash", []string{"-c", "agy 'fix A & B'"}},
+		{"bash", []string{"-c", "agy 'use | pipe; then stop'"}},
+		{"bash", []string{"-c", `agy "commit; push < now"`}},
+		{"bash", []string{"-c", `agy "$literal not substitution"`}},
 	}
 	// Everything else stays on the hardened pipe path even with tty=true — this
 	// is the security guardrail: unsigned tty can't flip a utility onto a PTY.
@@ -207,6 +214,11 @@ func TestIsPTYEligibleCommand_AllowlistOnly(t *testing.T) {
 		{"bash", []string{"-c", "agy >(git hash-object -w --stdin)"}},
 		{"bash", []string{"-c", "agy > /dev/tty"}},
 		{"bash", []string{"-c", "agy < /dev/tty"}},
+		// Command substitution stays active INSIDE double quotes, so a
+		// double-quoted `$(...)`/backtick still launches a second program and
+		// must not ride the PTY — only single quotes fully neutralize it.
+		{"bash", []string{"-c", `agy "$(git rev-parse HEAD)"`}},
+		{"bash", []string{"-c", "agy \"`git rev-parse HEAD`\""}},
 		{"", nil},
 	}
 	for _, c := range eligible {

@@ -2393,8 +2393,15 @@ func cachedResolveClaudePath() string {
 // no native process (a pure cmdlet that did not fail terminally); treat that as
 // success. A terminating error aborts before the probe, so PS already exits
 // non-zero (cwd tracking is best-effort and skipped in that case).
+//
+// $LASTEXITCODE is reset to 0 BEFORE the user command: PowerShell only updates
+// it when a native executable runs, and a fresh pwsh.exe can start with a
+// non-zero value from internal startup steps, so a cmdlet-only fallback command
+// would otherwise capture that stale non-zero code and be reported as a failure.
+// This mirrors the persistent-shell reset in powershell_windows.go.
 func buildFallbackProbeCommand(cmdLine, sentinel string) string {
-	return cmdLine +
+	return "$LASTEXITCODE = 0\n" +
+		cmdLine +
 		"\n$__aix_exit = $LASTEXITCODE" +
 		"\nWrite-Host '" + sentinel + "'" +
 		"\n(Get-Location).Path" +

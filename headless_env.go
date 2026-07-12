@@ -210,8 +210,63 @@ func firstTokenIsPTYAgent(command string) bool {
 // a trailing git/test-runner command (whether joined by an operator or launched
 // via process substitution such as `agy <(git credential fill)`) cannot inherit
 // a controlling terminal and bypass headless hardening.
+//
+// The scan is quote-aware so operators that are literal shell DATA — e.g. an
+// `agy 'fix A & B'` prompt — are not mistaken for chaining and forced off the
+// PTY. It follows bash quoting: single quotes make every character literal;
+// double quotes neutralize `|&;<>` and newline but keep command substitution
+// (`$(...)` / backticks) active; a backslash escapes the next character outside
+// single quotes. Only genuinely unquoted operators (plus substitution active in
+// an unquoted or double-quoted context) trigger the pipe fallback. An
+// unterminated quote leaves any trailing operator treated as literal, which is
+// safe: bash itself rejects such a payload before launching anything.
 func hasShellCommandChaining(command string) bool {
-	return strings.ContainsAny(command, "|&;<>`\n") || strings.Contains(command, "$(")
+	const (
+		stateNone = iota
+		stateSingle
+		stateDouble
+	)
+	state := stateNone
+	runes := []rune(command)
+	for i := 0; i < len(runes); i++ {
+		c := runes[i]
+		switch state {
+		case stateSingle:
+			// Single quotes preserve the literal value of every character.
+			if c == '\'' {
+				state = stateNone
+			}
+		case stateDouble:
+			switch c {
+			case '\\':
+				i++ // backslash escapes the next character inside double quotes
+			case '"':
+				state = stateNone
+			case '`':
+				return true // command substitution stays active inside double quotes
+			case '$':
+				if i+1 < len(runes) && runes[i+1] == '(' {
+					return true
+				}
+			}
+		default: // stateNone
+			switch c {
+			case '\\':
+				i++ // backslash escapes the next character
+			case '\'':
+				state = stateSingle
+			case '"':
+				state = stateDouble
+			case '|', '&', ';', '<', '>', '\n', '`':
+				return true
+			case '$':
+				if i+1 < len(runes) && runes[i+1] == '(' {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // shellDashCPayload returns the payload of a `bash -c "<payload>"` invocation
