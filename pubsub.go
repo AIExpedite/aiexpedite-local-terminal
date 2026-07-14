@@ -3589,9 +3589,14 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			timeout = time.Duration(cmd.TimeoutMs) * time.Millisecond
 		}
 		if err := globalAntigravityNativeManager.Send(cmd.SessionID, cmd.Input, publishFn, timeout); err != nil {
-			// Send already published antigravity_native_error for most failures;
-			// only publish a synchronous error when the session itself was missing.
-			if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "has ended") {
+			// Send publishes antigravity_native_error for ordinary turn failures
+			// (timeout, empty response, oversize). Publish here only when Send
+			// could not (missing/ended session) so the UI never stays stuck
+			// running without a terminal frame. "session ended during turn" is
+			// covered by antigravity_native_ended from End — do not double-fire.
+			msg := err.Error()
+			if strings.Contains(msg, "not found") ||
+				(strings.Contains(msg, "has ended") && !strings.Contains(msg, "during turn")) {
 				publishAntigravityNativeError(ctx, topic, cmd, fmt.Sprintf("failed to send to antigravity native: %v", err))
 			}
 			return

@@ -27,7 +27,6 @@ package main
 //   same flag for legacy terminal invocations.
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -210,9 +209,6 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	if text == "" {
 		return fmt.Errorf("input is empty")
 	}
-	if len(text) > antigravityNativeMaxPromptBytes {
-		return fmt.Errorf("prompt exceeds maximum size of %d bytes", antigravityNativeMaxPromptBytes)
-	}
 	if turnTimeout <= 0 {
 		turnTimeout = antigravityNativeDefaultTurnTimeout
 	}
@@ -232,6 +228,14 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	if session.Status() == "ended" {
 		return fmt.Errorf("antigravity native session %s has ended", id)
 	}
+
+	// Fail closed with a published error frame so the chat UI cannot stay
+	// stuck in "running" after the HTTP send already returned 200.
+	if len(text) > antigravityNativeMaxPromptBytes {
+		return m.publishTurnError(session, publishFn,
+			fmt.Sprintf("prompt exceeds maximum size of %d bytes", antigravityNativeMaxPromptBytes))
+	}
+
 	session.setStatus("running")
 	defer func() {
 		if session.Status() != "ended" {
@@ -263,13 +267,19 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 		m.firstTurnMu.Unlock()
 	}
 
-	outText, errText, exitCode, timedOut, runErr := m.runOneShot(
+	outText, errText, exitCode, timedOut, truncated, runErr := m.runOneShot(
 		session, executable, text, nativeID, turnTimeout, "antigravity-native:"+id,
 	)
 	if runErr != nil {
 		return m.publishTurnError(session, publishFn, runErr.Error())
 	}
 	m.publishStderrIfAny(session, publishFn, errText)
+	if truncated {
+		// Requirements: oversize output must not be silently dropped/truncated
+		// as if it were a complete assistant answer.
+		return m.publishTurnError(session, publishFn,
+			"Antigravity output exceeded the maximum capture size")
+	}
 
 	if session.Status() == "ended" {
 		// Cancelled mid-turn — do not promote late output to a completion.
@@ -296,7 +306,7 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 		beforeIDs = listAntigravityConversationIDs()
 		m.firstTurnMu.Unlock()
 
-		out2, err2, exit2, timed2, run2 := m.runOneShot(
+		out2, err2, exit2, timed2, trunc2, run2 := m.runOneShot(
 			session, executable, replayPrompt, "", turnTimeout, "antigravity-native:"+id+":replay",
 		)
 		if run2 != nil {
@@ -308,6 +318,10 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 		}
 		if timed2 {
 			return m.publishTurnError(session, publishFn, "Antigravity replay recovery timed out")
+		}
+		if trunc2 {
+			return m.publishTurnError(session, publishFn,
+				"Antigravity replay output exceeded the maximum capture size")
 		}
 		outText, errText, exitCode = out2, err2, exit2
 		usedReplay = true
@@ -377,7 +391,7 @@ func (m *AntigravityNativeManager) runOneShot(
 	executable, prompt, nativeID string,
 	turnTimeout time.Duration,
 	registryLabel string,
-) (stdoutText, stderrText string, exitCode int, timedOut bool, err error) {
+) (stdoutText, stderrText string, exitCode int, timedOut, truncated bool, err error) {
 	args := buildAntigravityNativeArgs(prompt, nativeID)
 	// Unattended remote chat cannot answer local permission prompts — see
 	// package threat-model comment.
@@ -390,15 +404,15 @@ func (m *AntigravityNativeManager) runOneShot(
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", "", 0, false, fmt.Errorf("stdout pipe: %w", err)
+		return "", "", 0, false, false, fmt.Errorf("stdout pipe: %w", err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return "", "", 0, false, fmt.Errorf("stderr pipe: %w", err)
+		return "", "", 0, false, false, fmt.Errorf("stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return "", "", 0, false, fmt.Errorf("failed to start agy (is Antigravity CLI installed?): %w", err)
+		return "", "", 0, false, false, fmt.Errorf("failed to start agy (is Antigravity CLI installed?): %w", err)
 	}
 	if cmd.Process != nil {
 		globalProcessRegistry.Register(cmd.Process.Pid, registryLabel)
@@ -450,10 +464,21 @@ func (m *AntigravityNativeManager) runOneShot(
 		if ee, ok := waitErr.(*exec.ExitError); ok {
 			exitCode = ee.ExitCode()
 		} else {
-			return "", "", 0, timedOutFlag.Load(), fmt.Errorf("agy process error: %w", waitErr)
+			return "", "", 0, timedOutFlag.Load(), false, fmt.Errorf("agy process error: %w", waitErr)
 		}
 	}
-	return strings.TrimSpace(stdoutBuf.String()), strings.TrimSpace(stderrBuf.String()), exitCode, timedOutFlag.Load(), nil
+	// Report truncation without the decorative "…[truncated]" suffix so we can
+	// fail closed rather than present a partial body as a full answer.
+	out := ""
+	if stdoutBuf != nil {
+		out = strings.TrimSpace(stdoutBuf.b.String())
+	}
+	errOut := ""
+	if stderrBuf != nil {
+		errOut = strings.TrimSpace(stderrBuf.b.String())
+	}
+	trunc := (stdoutBuf != nil && stdoutBuf.trunc) || (stderrBuf != nil && stderrBuf.trunc)
+	return out, errOut, exitCode, timedOutFlag.Load(), trunc, nil
 }
 
 func (m *AntigravityNativeManager) publishStderrIfAny(session *AntigravityNativeSession, publishFn PublishFunc, errText string) {
@@ -908,20 +933,34 @@ type limitedBuffer struct {
 
 func captureLimited(r io.Reader, limit int) *limitedBuffer {
 	lb := &limitedBuffer{limit: limit}
-	sc := bufio.NewScanner(r)
-	// Allow large lines up to limit.
-	buf := make([]byte, 0, 64*1024)
-	sc.Buffer(buf, limit)
-	for sc.Scan() {
-		line := sc.Text()
-		if lb.b.Len()+len(line)+1 > limit {
-			lb.trunc = true
+	// Byte-oriented read (not line Scanner): agy --print is complete-only text
+	// and may emit long lines; Scanner would reject oversized tokens.
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			remaining := limit - lb.b.Len()
+			if remaining <= 0 {
+				lb.trunc = true
+				// Drain the rest so the child does not block on a full pipe
+				// (which would deadlock cmd.Wait).
+				_, _ = io.Copy(io.Discard, r)
+				return lb
+			}
+			if n > remaining {
+				lb.b.Write(buf[:remaining])
+				lb.trunc = true
+				_, _ = io.Copy(io.Discard, r)
+				return lb
+			}
+			lb.b.Write(buf[:n])
+		}
+		if err == io.EOF {
 			break
 		}
-		if lb.b.Len() > 0 {
-			lb.b.WriteByte('\n')
+		if err != nil {
+			break
 		}
-		lb.b.WriteString(line)
 	}
 	return lb
 }

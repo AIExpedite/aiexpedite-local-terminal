@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -267,6 +268,43 @@ func TestBuildAntigravityNativeArgs_RejectsOversizedPromptAtSend(t *testing.T) {
 	// Size gate is in Send; ensure constant is sane relative to CreateProcess budget.
 	if antigravityNativeMaxPromptBytes <= 0 || antigravityNativeMaxPromptBytes >= 32*1024 {
 		t.Fatalf("max prompt bytes should be positive and under 32KB, got %d", antigravityNativeMaxPromptBytes)
+	}
+}
+
+func TestCaptureLimited_DrainsAfterTruncate(t *testing.T) {
+	// Truncation must keep reading so a producer writing past the limit cannot
+	// block forever on a full pipe (would deadlock cmd.Wait in runOneShot).
+	pr, pw := io.Pipe()
+	const limit = 64
+	done := make(chan *limitedBuffer, 1)
+	go func() {
+		done <- captureLimited(pr, limit)
+	}()
+
+	// Write more than limit; producer must not hang after consumer truncates.
+	payload := strings.Repeat("x", limit*4)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(pw, payload)
+		_ = pw.Close()
+		writeDone <- err
+	}()
+
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("writer blocked or failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer hung — captureLimited did not drain after truncate")
+	}
+
+	lb := <-done
+	if !lb.trunc {
+		t.Fatal("expected truncation")
+	}
+	if lb.b.Len() != limit {
+		t.Fatalf("captured %d bytes, want %d", lb.b.Len(), limit)
 	}
 }
 
