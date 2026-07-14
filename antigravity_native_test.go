@@ -22,7 +22,7 @@ func TestIsAntigravityNativeCommand(t *testing.T) {
 }
 
 func TestBuildAntigravityNativeArgs_PrintTakesPromptValue(t *testing.T) {
-	args := buildAntigravityNativeArgs("hello world", "", false)
+	args := buildAntigravityNativeArgs("hello world", "")
 	// --print must take the prompt as its value (agy 1.1.x contract).
 	if len(args) < 2 || args[0] != "--print" || args[1] != "hello world" {
 		t.Fatalf("expected --print <prompt>, got %#v", args)
@@ -34,7 +34,7 @@ func TestBuildAntigravityNativeArgs_PrintTakesPromptValue(t *testing.T) {
 }
 
 func TestBuildAntigravityNativeArgs_ExactConversationResume(t *testing.T) {
-	args := buildAntigravityNativeArgs("follow up", "abc-123-def", false)
+	args := buildAntigravityNativeArgs("follow up", "abc-123-def")
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--conversation") {
 		t.Fatalf("expected --conversation, got %q", joined)
@@ -58,7 +58,7 @@ func TestBuildAntigravityNativeArgs_NeverContinueFlag(t *testing.T) {
 	// Prompt text may literally contain "--continue"; that is the --print
 	// value, not a CLI flag. The builder must never emit a free-standing
 	// --continue / -c flag token (only --conversation for resume).
-	args := buildAntigravityNativeArgs("please --continue later", "id-1", false)
+	args := buildAntigravityNativeArgs("please --continue later", "id-1")
 	for i, a := range args {
 		if a == "--continue" || a == "-c" {
 			// Only allowed as the value of --print (index 1).
@@ -127,6 +127,32 @@ func TestRedactAntigravitySecrets(t *testing.T) {
 	}
 	if !strings.Contains(out, "REDACTED") {
 		t.Fatalf("expected REDACTED marker: %q", out)
+	}
+}
+
+func TestCaptureAntigravityNativeID_PrefersNewDBOverLastConversations(t *testing.T) {
+	// Concurrent first turns: last_conversations may point at another chat's
+	// ID for the same cwd; when beforeIDs is provided we must prefer the new DB.
+	tmp := t.TempDir()
+	oldHome := os.Getenv("HOME")
+	t.Cleanup(func() { _ = os.Setenv("HOME", oldHome) })
+	_ = os.Setenv("HOME", tmp)
+
+	base := filepath.Join(tmp, ".gemini", "antigravity-cli")
+	_ = os.MkdirAll(filepath.Join(base, "cache"), 0o755)
+	_ = os.MkdirAll(filepath.Join(base, "conversations"), 0o755)
+	cwd := "/tmp/shared-cwd"
+	staleID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	newID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	_ = os.WriteFile(filepath.Join(base, "cache", "last_conversations.json"),
+		[]byte(`{"`+cwd+`":"`+staleID+`"}`), 0o644)
+	_ = os.WriteFile(filepath.Join(base, "conversations", staleID+".db"), []byte("old"), 0o644)
+	_ = os.WriteFile(filepath.Join(base, "conversations", newID+".db"), []byte("new"), 0o644)
+	// beforeIDs includes stale so only newID is "new"
+	before := map[string]struct{}{staleID: {}}
+	got := captureAntigravityNativeID(cwd, before)
+	if got != newID {
+		t.Fatalf("capture with beforeIDs = %q, want new %q (not last_conversations %q)", got, newID, staleID)
 	}
 }
 
@@ -255,6 +281,8 @@ func TestLooksLikeMissingConversation_DoesNotMatchGenericErrors(t *testing.T) {
 	if !looksLikeMissingConversation("", "Error: conversation not found") {
 		t.Fatal("expected missing-conversation match")
 	}
+	// Successful exit with prose mentioning the phrase is handled by the
+	// Send-path exitCode != 0 gate (not this helper alone).
 }
 
 func TestRedactAntigravitySecrets_PreservesShortDiagnostics(t *testing.T) {

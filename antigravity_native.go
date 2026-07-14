@@ -280,8 +280,10 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	}
 
 	// Exact-ID resume failed with a recognized missing/stale conversation.
+	// Require a non-zero exit so ordinary assistant text that mentions
+	// "conversation not found" cannot trigger a costly false-positive replay.
 	// At most one replay recovery for this turn.
-	if useNativeResume && looksLikeMissingConversation(outText, errText) {
+	if useNativeResume && exitCode != 0 && looksLikeMissingConversation(outText, errText) {
 		fmt.Printf("%s[antigravity-native] Native resume failed for %s — replaying bounded transcript%s\n",
 			colorYellow, id, colorReset)
 		session.NativeConversationID = ""
@@ -376,7 +378,7 @@ func (m *AntigravityNativeManager) runOneShot(
 	turnTimeout time.Duration,
 	registryLabel string,
 ) (stdoutText, stderrText string, exitCode int, timedOut bool, err error) {
-	args := buildAntigravityNativeArgs(prompt, nativeID, false)
+	args := buildAntigravityNativeArgs(prompt, nativeID)
 	// Unattended remote chat cannot answer local permission prompts — see
 	// package threat-model comment.
 	args = append([]string{"--dangerously-skip-permissions"}, args...)
@@ -585,7 +587,7 @@ func (m *AntigravityNativeManager) publishTurnError(session *AntigravityNativeSe
 //
 // The legacy one-shot builder (buildAntigravityInteractiveArgs) remains
 // unchanged for generic terminal invocations.
-func buildAntigravityNativeArgs(prompt, nativeConversationID string, _ bool) []string {
+func buildAntigravityNativeArgs(prompt, nativeConversationID string) []string {
 	args := make([]string, 0, 6)
 	// --print takes the prompt as its value (verified agy 1.1.2).
 	args = append(args, "--print", prompt)
@@ -744,26 +746,63 @@ func listAntigravityConversationIDs() map[string]struct{} {
 }
 
 func captureAntigravityNativeID(cwd string, beforeIDs map[string]struct{}) string {
-	// Prefer last_conversations.json[cwd] — documented stable mapping.
 	base := antigravityHomeBase()
-	if base != "" {
-		path := filepath.Join(base, "cache", "last_conversations.json")
-		data, err := os.ReadFile(path)
-		if err == nil {
-			var m map[string]string
-			if json.Unmarshal(data, &m) == nil {
-				if id, ok := m[cwd]; ok && id != "" {
-					// Verify the conversation db exists so we don't store a stale mapping.
-					dbPath := filepath.Join(base, "conversations", id+".db")
-					if _, err := os.Stat(dbPath); err == nil {
-						return id
-					}
+
+	// When a before-snapshot is available (normal first-turn path), only accept
+	// conversation IDs that appeared after the snapshot. last_conversations.json
+	// is last-writer-wins per cwd and may still point at an older AIExpedite
+	// chat (or local TUI session) — never adopt a pre-existing ID into a new
+	// logical conversation (cross-chat isolation).
+	if beforeIDs != nil {
+		lastID := readAntigravityLastConversationID(base, cwd)
+		if lastID != "" {
+			if _, existed := beforeIDs[lastID]; !existed {
+				if antigravityConversationDBExists(base, lastID) {
+					return lastID
 				}
 			}
 		}
+		// Concurrent first turns: last_conversations may have been overwritten
+		// by a sibling; take the newest DB that was not in the before snapshot.
+		return newestNewAntigravityConversationID(base, beforeIDs)
 	}
 
-	// Fallback: newly created conversation db not present in beforeIDs.
+	// No snapshot (tests / recovery): last_conversations only.
+	return readAntigravityLastConversationID(base, cwd)
+}
+
+func readAntigravityLastConversationID(base, cwd string) string {
+	if base == "" || cwd == "" {
+		return ""
+	}
+	path := filepath.Join(base, "cache", "last_conversations.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var m map[string]string
+	if json.Unmarshal(data, &m) != nil {
+		return ""
+	}
+	id := m[cwd]
+	if id == "" || !antigravityConversationDBExists(base, id) {
+		return ""
+	}
+	return id
+}
+
+func antigravityConversationDBExists(base, id string) bool {
+	if base == "" || id == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(base, "conversations", id+".db"))
+	return err == nil
+}
+
+func newestNewAntigravityConversationID(base string, beforeIDs map[string]struct{}) string {
+	if base == "" {
+		return ""
+	}
 	after := listAntigravityConversationIDs()
 	var newest string
 	var newestMod time.Time
