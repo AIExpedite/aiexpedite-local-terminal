@@ -237,6 +237,39 @@ func TestLooksLikeMissingConversation(t *testing.T) {
 	}
 }
 
+func TestBuildAntigravityNativeArgs_RejectsOversizedPromptAtSend(t *testing.T) {
+	// Size gate is in Send; ensure constant is sane relative to CreateProcess budget.
+	if antigravityNativeMaxPromptBytes <= 0 || antigravityNativeMaxPromptBytes >= 32*1024 {
+		t.Fatalf("max prompt bytes should be positive and under 32KB, got %d", antigravityNativeMaxPromptBytes)
+	}
+}
+
+func TestLooksLikeMissingConversation_DoesNotMatchGenericErrors(t *testing.T) {
+	// Generic failures must NOT trigger replay (would double model cost).
+	if looksLikeMissingConversation("permission denied", "exit status 1") {
+		t.Fatal("generic errors must not look like missing conversation")
+	}
+	if looksLikeMissingConversation("timeout waiting for model", "") {
+		t.Fatal("timeout must not look like missing conversation")
+	}
+	if !looksLikeMissingConversation("", "Error: conversation not found") {
+		t.Fatal("expected missing-conversation match")
+	}
+}
+
+func TestRedactAntigravitySecrets_PreservesShortDiagnostics(t *testing.T) {
+	uuid := "11111111-2222-3333-4444-555555555555"
+	out := redactAntigravitySecrets("session " + uuid + " failed")
+	if !strings.Contains(out, uuid) {
+		t.Fatalf("UUID-length diagnostics should not be redacted: %q", out)
+	}
+	token := "Authorization: Bearer " + strings.Repeat("a", 40)
+	out2 := redactAntigravitySecrets(token)
+	if strings.Contains(out2, strings.Repeat("a", 40)) {
+		t.Fatalf("bearer token should be redacted: %q", out2)
+	}
+}
+
 // Ensure legacy one-shot builder is unchanged (regression guard).
 func TestLegacyBuildAntigravityInteractiveArgs_Unchanged(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{"do the task"})

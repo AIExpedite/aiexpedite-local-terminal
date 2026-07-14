@@ -54,6 +54,13 @@ const (
 	antigravityReplayMaxChars    = 48_000
 	// Minimum supported version for native chat (semver major.minor.patch).
 	antigravityNativeMinVersion = "1.1.1"
+	// Prompt is passed as `--print` flag value. Keep well under CreateProcess
+	// ~32KB argv ceiling (flags + path also consume budget). Fail closed —
+	// never silently truncate user input.
+	antigravityNativeMaxPromptBytes = 24 * 1024
+	// Cache capability probes so Start does not spawn `agy --version` on every
+	// chat open. Invalidated after this TTL or when a probe fails.
+	antigravityCapabilityCacheTTL = 5 * time.Minute
 )
 
 /* --------------------------------------------------------------------------
@@ -189,11 +196,12 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string
 // when a native ID is known), capture complete-only stdout as the assistant
 // message, update the native conversation ID, and append to the bounded
 // transcript. publishFn receives message / stderr / error frames; the logical
-// session stays open (idle) after a successful turn.
+// session stays open (idle) after a successful turn so the user can retry.
 //
-// replayContext, when non-empty and native resume is unavailable, is prepended
-// as a recovery preamble. Callers should only pass replay context after a
-// documented failed native resume; first turns leave it empty.
+// Replay recovery runs only when native resume is active AND the CLI reports a
+// recognized missing/stale conversation — never on generic non-zero exits
+// (auth, timeout, tool failures), which would burn a second model call and
+// silently start a new conversation.
 func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, turnTimeout time.Duration) error {
 	if publishFn == nil {
 		return fmt.Errorf("publishFn is required")
@@ -201,6 +209,9 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return fmt.Errorf("input is empty")
+	}
+	if len(text) > antigravityNativeMaxPromptBytes {
+		return fmt.Errorf("prompt exceeds maximum size of %d bytes", antigravityNativeMaxPromptBytes)
 	}
 	if turnTimeout <= 0 {
 		turnTimeout = antigravityNativeDefaultTurnTimeout
@@ -231,190 +242,88 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 
 	nativeID := session.NativeConversationID
 	useNativeResume := nativeID != ""
-	prompt := text
 	usedReplay := false
-
-	// Build argv. Prompt is the --print flag value (agy 1.1.x contract).
-	args := buildAntigravityNativeArgs(prompt, nativeID, false /*skipPermissions documented*/)
-
-	// Capability-research-approved permission flag for unattended remote chat.
-	// See package comment threat model.
-	args = append([]string{"--dangerously-skip-permissions"}, args...)
+	needCapture := nativeID == ""
 
 	executable := resolveExecutable("agy")
 	if executable == "" {
 		executable = "agy"
 	}
 
-	fmt.Printf("%s[antigravity-native] Turn on %s (resume=%v nativeID_set=%v)%s\n",
-		colorCyan, id, useNativeResume, nativeID != "", colorReset)
+	fmt.Printf("%s[antigravity-native] Turn on %s (resume=%v)%s\n",
+		colorCyan, id, useNativeResume, colorReset)
 
-	// Snapshot conversation state before first-turn capture.
+	// Snapshot conversation IDs only for the capture window — do NOT hold
+	// firstTurnMu across the multi-minute process (that would serialize all
+	// first turns globally).
 	var beforeIDs map[string]struct{}
-	needCapture := nativeID == ""
 	if needCapture {
 		m.firstTurnMu.Lock()
-		defer m.firstTurnMu.Unlock()
 		beforeIDs = listAntigravityConversationIDs()
+		m.firstTurnMu.Unlock()
 	}
 
-	cmd := exec.Command(executable, args...)
-	hideWindow(cmd)
-	cmd.Dir = session.Cwd
-	cmd.Env = sanitizeAntigravityEnv(os.Environ())
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return m.publishTurnError(session, publishFn, fmt.Sprintf("stdout pipe: %v", err))
+	outText, errText, exitCode, timedOut, runErr := m.runOneShot(
+		session, executable, text, nativeID, turnTimeout, "antigravity-native:"+id,
+	)
+	if runErr != nil {
+		return m.publishTurnError(session, publishFn, runErr.Error())
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return m.publishTurnError(session, publishFn, fmt.Sprintf("stderr pipe: %v", err))
-	}
-
-	if err := cmd.Start(); err != nil {
-		return m.publishTurnError(session, publishFn,
-			fmt.Sprintf("failed to start agy (is Antigravity CLI installed?): %v", err))
-	}
-	if cmd.Process != nil {
-		globalProcessRegistry.Register(cmd.Process.Pid, "antigravity-native:"+id)
-	}
-
-	// Cancel closes the process after turnTimeout or End().
-	timedOut := false
-	timer := time.AfterFunc(turnTimeout, func() {
-		timedOut = true
-		_ = interruptProcess(cmd)
-		time.AfterFunc(antigravityNativeGracefulKillWait, func() {
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-		})
-	})
-	session.setActiveProcess(cmd, func() {
-		timer.Stop()
-		_ = interruptProcess(cmd)
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-	})
-
-	stdoutBuf, stderrBuf := captureLimited(stdout, antigravityNativeMaxStdout), captureLimited(stderr, antigravityNativeMaxStderr)
-	waitErr := cmd.Wait()
-	timer.Stop()
-	session.clearActiveProcess()
-	if cmd.Process != nil {
-		globalProcessRegistry.Deregister(cmd.Process.Pid)
-	}
-
-	outText := strings.TrimSpace(stdoutBuf.String())
-	errText := strings.TrimSpace(stderrBuf.String())
-
-	// Redact secret-looking fragments from stderr before publish.
-	if errText != "" {
-		seq := int(atomic.AddInt64(&session.seq, 1))
-		publishFn(resultMsg{
-			ID:          session.ID,
-			WorkspaceID: session.WorkspaceID,
-			UID:         session.UID,
-			Output:      redactAntigravitySecrets(errText),
-			Status:      "info",
-			Ts:          time.Now().UnixMilli(),
-			Version:     Version,
-			Type:        "antigravity_native_stderr",
-			SessionID:   session.ID,
-			Seq:         seq,
-		})
-	}
+	m.publishStderrIfAny(session, publishFn, errText)
 
 	if session.Status() == "ended" {
 		// Cancelled mid-turn — do not promote late output to a completion.
 		return fmt.Errorf("session ended during turn")
 	}
-
 	if timedOut {
 		return m.publishTurnError(session, publishFn, "Antigravity turn timed out")
 	}
 
-	exitCode := 0
-	if waitErr != nil {
-		if ee, ok := waitErr.(*exec.ExitError); ok {
-			exitCode = ee.ExitCode()
-		} else {
-			return m.publishTurnError(session, publishFn, fmt.Sprintf("agy process error: %v", waitErr))
-		}
-	}
-
-	// Detect missing/stale native conversation for resume failures.
-	if useNativeResume && (exitCode != 0 || looksLikeMissingConversation(outText, errText)) {
-		// One-shot replay recovery for this turn.
-		replayPrompt := buildAntigravityReplayPrompt(session.Transcript, text)
-		usedReplay = true
+	// Exact-ID resume failed with a recognized missing/stale conversation.
+	// At most one replay recovery for this turn.
+	if useNativeResume && looksLikeMissingConversation(outText, errText) {
 		fmt.Printf("%s[antigravity-native] Native resume failed for %s — replaying bounded transcript%s\n",
 			colorYellow, id, colorReset)
-
-		// Clear stale native ID and re-run without --conversation.
 		session.NativeConversationID = ""
-		args = buildAntigravityNativeArgs(replayPrompt, "", false)
-		args = append([]string{"--dangerously-skip-permissions"}, args...)
+		replayPrompt := buildAntigravityReplayPrompt(session.Transcript, text)
+		if len(replayPrompt) > antigravityNativeMaxPromptBytes {
+			return m.publishTurnError(session, publishFn,
+				"Antigravity resume failed and replay prompt exceeds size limit")
+		}
+		m.firstTurnMu.Lock()
 		beforeIDs = listAntigravityConversationIDs()
+		m.firstTurnMu.Unlock()
 
-		cmd2 := exec.Command(executable, args...)
-		hideWindow(cmd2)
-		cmd2.Dir = session.Cwd
-		cmd2.Env = sanitizeAntigravityEnv(os.Environ())
-		stdout2, err2 := cmd2.StdoutPipe()
-		if err2 != nil {
-			return m.publishTurnError(session, publishFn, fmt.Sprintf("replay stdout pipe: %v", err2))
+		out2, err2, exit2, timed2, run2 := m.runOneShot(
+			session, executable, replayPrompt, "", turnTimeout, "antigravity-native:"+id+":replay",
+		)
+		if run2 != nil {
+			return m.publishTurnError(session, publishFn, fmt.Sprintf("replay failed: %v", run2))
 		}
-		stderr2, err2 := cmd2.StderrPipe()
-		if err2 != nil {
-			return m.publishTurnError(session, publishFn, fmt.Sprintf("replay stderr pipe: %v", err2))
+		m.publishStderrIfAny(session, publishFn, err2)
+		if session.Status() == "ended" {
+			return fmt.Errorf("session ended during turn")
 		}
-		if err2 := cmd2.Start(); err2 != nil {
-			return m.publishTurnError(session, publishFn, fmt.Sprintf("replay start failed: %v", err2))
+		if timed2 {
+			return m.publishTurnError(session, publishFn, "Antigravity replay recovery timed out")
 		}
-		if cmd2.Process != nil {
-			globalProcessRegistry.Register(cmd2.Process.Pid, "antigravity-native:"+id+":replay")
-		}
-		session.setActiveProcess(cmd2, func() {
-			if cmd2.Process != nil {
-				_ = cmd2.Process.Kill()
-			}
-		})
-		out2 := captureLimited(stdout2, antigravityNativeMaxStdout)
-		err2b := captureLimited(stderr2, antigravityNativeMaxStderr)
-		wait2 := cmd2.Wait()
-		session.clearActiveProcess()
-		if cmd2.Process != nil {
-			globalProcessRegistry.Deregister(cmd2.Process.Pid)
-		}
-		outText = strings.TrimSpace(out2.String())
-		errText = strings.TrimSpace(err2b.String())
-		exitCode = 0
-		if wait2 != nil {
-			if ee, ok := wait2.(*exec.ExitError); ok {
-				exitCode = ee.ExitCode()
-			} else {
-				return m.publishTurnError(session, publishFn, fmt.Sprintf("replay process error: %v", wait2))
-			}
-		}
+		outText, errText, exitCode = out2, err2, exit2
+		usedReplay = true
+		needCapture = true
 		if exitCode != 0 && outText == "" {
 			return m.publishTurnError(session, publishFn,
 				fmt.Sprintf("Antigravity resume failed and replay recovery failed (exit %d)", exitCode))
 		}
-		// Capture replacement native ID after replay.
-		needCapture = true
 	}
 
 	if needCapture || session.NativeConversationID == "" {
+		// Serialize only the capture read of last_conversations.json.
+		m.firstTurnMu.Lock()
 		captured := captureAntigravityNativeID(session.Cwd, beforeIDs)
+		m.firstTurnMu.Unlock()
 		if captured != "" {
-			// Atomic replace of native ID (never keep stale mapping after replay).
 			session.NativeConversationID = captured
 		} else if session.NativeConversationID == "" {
-			// First turn without capturable ID — still deliver response but
-			// follow-ups will use replay until an ID appears.
 			fmt.Printf("%s[antigravity-native] Warning: could not capture native conversation ID for %s%s\n",
 				colorYellow, id, colorReset)
 		}
@@ -433,13 +342,9 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	session.Transcript = appendAntigravityTranscript(session.Transcript, "user", text)
 	session.Transcript = appendAntigravityTranscript(session.Transcript, "assistant", outText)
 
-	// Publish complete-only assistant message. Include a small non-secret
-	// metadata prefix only when replay recovery ran (user-facing notice is
-	// handled by frontend when output carries the marker).
 	messageOut := outText
 	if usedReplay {
-		// Structured marker for telemetry/frontend — not assistant prose.
-		// Frontend strips the marker before rendering assistant text.
+		// Structured marker for frontend/telemetry — stripped before rendering.
 		messageOut = "[[antigravity_replay_recovery]]\n" + outText
 	}
 
@@ -461,6 +366,111 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	fmt.Printf("%s[antigravity-native] Turn complete on %s (chars=%d replay=%v)%s\n",
 		colorGreen, id, len(outText), usedReplay, colorReset)
 	return nil
+}
+
+// runOneShot spawns one `agy --print` process, drains stdout/stderr concurrently
+// (required to avoid pipe deadlock), and waits for exit. Does not publish frames.
+func (m *AntigravityNativeManager) runOneShot(
+	session *AntigravityNativeSession,
+	executable, prompt, nativeID string,
+	turnTimeout time.Duration,
+	registryLabel string,
+) (stdoutText, stderrText string, exitCode int, timedOut bool, err error) {
+	args := buildAntigravityNativeArgs(prompt, nativeID, false)
+	// Unattended remote chat cannot answer local permission prompts — see
+	// package threat-model comment.
+	args = append([]string{"--dangerously-skip-permissions"}, args...)
+
+	cmd := exec.Command(executable, args...)
+	hideWindow(cmd)
+	cmd.Dir = session.Cwd
+	cmd.Env = sanitizeAntigravityEnv(os.Environ())
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", "", 0, false, fmt.Errorf("stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return "", "", 0, false, fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return "", "", 0, false, fmt.Errorf("failed to start agy (is Antigravity CLI installed?): %w", err)
+	}
+	if cmd.Process != nil {
+		globalProcessRegistry.Register(cmd.Process.Pid, registryLabel)
+		defer globalProcessRegistry.Deregister(cmd.Process.Pid)
+	}
+
+	var timedOutFlag atomic.Bool
+	timer := time.AfterFunc(turnTimeout, func() {
+		timedOutFlag.Store(true)
+		_ = interruptProcess(cmd)
+		time.AfterFunc(antigravityNativeGracefulKillWait, func() {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		})
+	})
+	session.setActiveProcess(cmd, func() {
+		timer.Stop()
+		_ = interruptProcess(cmd)
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+	defer func() {
+		timer.Stop()
+		session.clearActiveProcess()
+	}()
+
+	// Drain both pipes concurrently — sequential read deadlocks when the child
+	// fills the unread pipe buffer (Go exec docs).
+	var (
+		stdoutBuf, stderrBuf *limitedBuffer
+		wg                   sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		stdoutBuf = captureLimited(stdout, antigravityNativeMaxStdout)
+	}()
+	go func() {
+		defer wg.Done()
+		stderrBuf = captureLimited(stderr, antigravityNativeMaxStderr)
+	}()
+	wg.Wait()
+
+	waitErr := cmd.Wait()
+	exitCode = 0
+	if waitErr != nil {
+		if ee, ok := waitErr.(*exec.ExitError); ok {
+			exitCode = ee.ExitCode()
+		} else {
+			return "", "", 0, timedOutFlag.Load(), fmt.Errorf("agy process error: %w", waitErr)
+		}
+	}
+	return strings.TrimSpace(stdoutBuf.String()), strings.TrimSpace(stderrBuf.String()), exitCode, timedOutFlag.Load(), nil
+}
+
+func (m *AntigravityNativeManager) publishStderrIfAny(session *AntigravityNativeSession, publishFn PublishFunc, errText string) {
+	if errText == "" || publishFn == nil {
+		return
+	}
+	seq := int(atomic.AddInt64(&session.seq, 1))
+	publishFn(resultMsg{
+		ID:          session.ID,
+		WorkspaceID: session.WorkspaceID,
+		UID:         session.UID,
+		Output:      redactAntigravitySecrets(errText),
+		Status:      "info",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "antigravity_native_stderr",
+		SessionID:   session.ID,
+		Seq:         seq,
+	})
 }
 
 // End terminates any in-flight turn and removes the logical session.
@@ -616,7 +626,39 @@ func sanitizeAntigravityEnv(env []string) []string {
 
 var antigravityVersionRe = regexp.MustCompile(`(\d+)\.(\d+)\.(\d+)`)
 
+// Capability probe cache — avoids spawning `agy --version` on every Start.
+var (
+	antigravityCapabilityMu      sync.Mutex
+	antigravityCapabilityOK      bool
+	antigravityCapabilityChecked time.Time
+	antigravityCapabilityErr     error
+)
+
 func probeAntigravityNativeCapability() error {
+	antigravityCapabilityMu.Lock()
+	defer antigravityCapabilityMu.Unlock()
+	if antigravityCapabilityOK && time.Since(antigravityCapabilityChecked) < antigravityCapabilityCacheTTL {
+		return nil
+	}
+	// Negative cache is short-lived so installing/auth-fixing agy recovers quickly.
+	if !antigravityCapabilityOK && antigravityCapabilityErr != nil &&
+		time.Since(antigravityCapabilityChecked) < 30*time.Second {
+		return antigravityCapabilityErr
+	}
+
+	err := probeAntigravityNativeCapabilityUncached()
+	antigravityCapabilityChecked = time.Now()
+	if err != nil {
+		antigravityCapabilityOK = false
+		antigravityCapabilityErr = err
+		return err
+	}
+	antigravityCapabilityOK = true
+	antigravityCapabilityErr = nil
+	return nil
+}
+
+func probeAntigravityNativeCapabilityUncached() error {
 	executable := resolveExecutable("agy")
 	if executable == "" {
 		// Still try bare name — may be on PATH at spawn time.
@@ -637,7 +679,7 @@ func probeAntigravityNativeCapability() error {
 	}
 	ver := strings.TrimSpace(string(out))
 	if ver == "" {
-		// `agy --version` may print just "1.1.2" — accept if we got it above.
+		// Empty but successful version probe — accept (rare builds).
 		return nil
 	}
 	m := antigravityVersionRe.FindStringSubmatch(ver)
@@ -866,12 +908,10 @@ func redactAntigravitySecrets(s string) string {
 	for _, re := range antigravitySecretPatterns {
 		out = re.ReplaceAllString(out, "${1}[REDACTED]")
 	}
-	// Collapse long hex/base64 blobs that look like tokens.
-	out = regexp.MustCompile(`[A-Za-z0-9_-]{40,}`).ReplaceAllStringFunc(out, func(m string) string {
-		if len(m) > 64 {
-			return m[:8] + "…[REDACTED]"
-		}
-		return m
+	// Only redact very long opaque blobs (likely tokens/JWTs), not ordinary
+	// UUIDs (~36 chars) or short hashes that appear in diagnostics.
+	out = regexp.MustCompile(`[A-Za-z0-9_-]{80,}`).ReplaceAllStringFunc(out, func(m string) string {
+		return m[:8] + "…[REDACTED]"
 	})
 	return out
 }

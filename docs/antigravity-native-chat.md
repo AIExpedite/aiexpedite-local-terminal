@@ -11,6 +11,8 @@
 | Native ID capture | After first turn: `~/.gemini/antigravity-cli/cache/last_conversations.json[cwd]` (verify `.db` exists); fallback: new `conversations/*.db` |
 | Streaming | Complete-only stdout (no reliable incremental stream) |
 | Local storage | Per-conversation SQLite under `~/.gemini/antigravity-cli/conversations/` |
+| Prompt size | Fail closed above 24KB (under CreateProcess ~32KB argv budget) |
+| Replay trigger | Only recognized missing/stale conversation text — not generic non-zero exits |
 
 Minimum supported version for native chat: **1.1.1**.
 
