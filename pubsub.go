@@ -216,6 +216,9 @@ func rejectionResultType(cmdType string) string {
 	if isClaudeNativeCommand(cmdType) {
 		return "claude_native_error"
 	}
+	if isAntigravityNativeCommand(cmdType) {
+		return "antigravity_native_error"
+	}
 	return "session_error"
 }
 
@@ -2852,6 +2855,12 @@ var globalGrokACPManager *GrokACPManager
 // display-text `stream` integration in session.go).
 var globalClaudeNativeManager *ClaudeNativeManager
 
+// globalAntigravityNativeManager is the package-level AntigravityNativeManager
+// instance, initialized in StartAgent (agent.go). Sessions use one-shot
+// `agy --print` with exact `--conversation <id>` resume and publish
+// antigravity_native_* chunks for the frontend native chat path.
+var globalAntigravityNativeManager *AntigravityNativeManager
+
 /* --------------------------------------------------------------------------
    handleSessionCommand — routes session_* commands to the SessionManager
    -------------------------------------------------------------------------- */
@@ -2982,6 +2991,14 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		allowArgs, _ = buildClaudeInteractiveArgs(cmd.Args)
 		dialogArgs = allowArgs
 		denyOutput = "claude native session denied by user: not in allow list"
+	case "antigravity_native_start":
+		// Gate against `agy` so the default `agy *` / `antigravity *` allowlist
+		// entry covers native-chat access. The actual per-turn argv is built
+		// later in Send; Start only registers the logical session.
+		allowCommand = "agy"
+		allowArgs = []string{"--print", "<prompt>"}
+		dialogArgs = allowArgs
+		denyOutput = "antigravity native session denied by user: not in allow list"
 	case "grok_acp_start":
 		// Unlike codex_appserver_start, grok_acp_start is NOT gated through
 		// the shared execute allowlist or approval dialog WHEN signing is
@@ -3129,6 +3146,10 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 	}
 	if isClaudeNativeCommand(cmd.Type) {
 		handleClaudeNativeCommand(ctx, topic, cmd)
+		return
+	}
+	if isAntigravityNativeCommand(cmd.Type) {
+		handleAntigravityNativeCommand(ctx, topic, cmd)
 		return
 	}
 	if isGrokACPCommand(cmd.Type) {
@@ -3495,6 +3516,149 @@ func publishClaudeNativeError(ctx context.Context, topic *pubsub.Publisher, cmd 
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[claude-native] Failed to publish error: %v%s\n", colorRed, err, colorReset)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Antigravity native (one-shot --print + --conversation resume) routing
+   -------------------------------------------------------------------------- */
+
+// handleAntigravityNativeCommand dispatches antigravity_native_* commands to
+// the AntigravityNativeManager. Start registers a logical session (no process);
+// Send runs one-shot agy --print with exact --conversation resume; End cancels
+// any in-flight turn and drops the logical session.
+func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg) {
+	if globalAntigravityNativeManager == nil {
+		publishAntigravityNativeError(ctx, topic, cmd, "antigravity native manager not initialized")
+		return
+	}
+
+	publishFn := newSessionPublishFn(topic, "[antigravity-native]")
+
+	switch cmd.Type {
+	case "antigravity_native_start":
+		if cmd.SessionID == "" {
+			publishAntigravityNativeError(ctx, topic, cmd, "sessionID is required for antigravity_native_start")
+			return
+		}
+
+		fmt.Printf("%s[antigravity-native] Starting session %s (workspace=%s)%s\n",
+			colorCyan, cmd.SessionID, cmd.WorkspaceID, colorReset)
+
+		onStarted := func() {
+			publishFn(resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				Output:      "Antigravity native started",
+				Status:      "success",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        "antigravity_native_started",
+				SessionID:   cmd.SessionID,
+			})
+		}
+
+		err := globalAntigravityNativeManager.Start(
+			cmd.SessionID,
+			cmd.Cwd,
+			cmd.WorkspaceID,
+			cmd.UID,
+			onStarted,
+		)
+		if err != nil {
+			publishAntigravityNativeError(ctx, topic, cmd, fmt.Sprintf("failed to start antigravity native: %v", err))
+			return
+		}
+
+	case "antigravity_native_send":
+		if cmd.SessionID == "" {
+			publishAntigravityNativeError(ctx, topic, cmd, "sessionID is required for antigravity_native_send")
+			return
+		}
+		if cmd.Input == "" {
+			publishAntigravityNativeError(ctx, topic, cmd, "input (user turn text) is required for antigravity_native_send")
+			return
+		}
+
+		// Send is synchronous for the duration of the one-shot process so
+		// Pub/Sub ack semantics match "turn accepted" after completion frames
+		// are published. Run in-process; turn timeouts are enforced inside Send.
+		timeout := time.Duration(0)
+		if cmd.TimeoutMs > 0 {
+			timeout = time.Duration(cmd.TimeoutMs) * time.Millisecond
+		}
+		if err := globalAntigravityNativeManager.Send(cmd.SessionID, cmd.Input, publishFn, timeout); err != nil {
+			// Send already published antigravity_native_error for most failures;
+			// only publish a synchronous error when the session itself was missing.
+			if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "has ended") {
+				publishAntigravityNativeError(ctx, topic, cmd, fmt.Sprintf("failed to send to antigravity native: %v", err))
+			}
+			return
+		}
+
+	case "antigravity_native_end":
+		if cmd.SessionID == "" {
+			publishAntigravityNativeError(ctx, topic, cmd, "sessionID is required for antigravity_native_end")
+			return
+		}
+
+		fmt.Printf("%s[antigravity-native] Ending session %s%s\n",
+			colorYellow, cmd.SessionID, colorReset)
+
+		if err := globalAntigravityNativeManager.End(cmd.SessionID); err != nil {
+			// Still publish ended so the cloud can release reservations even if
+			// the local session was already gone (idempotent teardown).
+			publishFn(resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				Output:      fmt.Sprintf("end: %v", err),
+				Status:      "success",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        "antigravity_native_ended",
+				SessionID:   cmd.SessionID,
+				ExitCode:    0,
+			})
+			return
+		}
+		publishFn(resultMsg{
+			ID:          cmd.ID,
+			WorkspaceID: cmd.WorkspaceID,
+			UID:         cmd.UID,
+			Output:      "Antigravity native ended",
+			Status:      "success",
+			Ts:          time.Now().UnixMilli(),
+			Version:     Version,
+			Type:        "antigravity_native_ended",
+			SessionID:   cmd.SessionID,
+			ExitCode:    0,
+		})
+
+	default:
+		publishAntigravityNativeError(ctx, topic, cmd, fmt.Sprintf("unknown antigravity native command type: %s", cmd.Type))
+	}
+}
+
+// publishAntigravityNativeError surfaces a synchronous failure back to the
+// orchestrator as an `antigravity_native_error` frame.
+func publishAntigravityNativeError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
+	fmt.Printf("%s[antigravity-native] Error: %s%s\n", colorRed, errMsg, colorReset)
+
+	res := resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		Output:      redactAntigravitySecrets(errMsg),
+		Status:      "error",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "antigravity_native_error",
+		SessionID:   cmd.SessionID,
+	}
+	if err := publishMsg(ctx, topic, res); err != nil {
+		fmt.Printf("%s[antigravity-native] Failed to publish error: %v%s\n", colorRed, err, colorReset)
 	}
 }
 

@@ -309,6 +309,16 @@ func StartAgent(cfg *Config) {
 	go globalClaudeNativeManager.CleanupStale(claudeNativeMaxLifetime)
 	fmt.Println("[aiexpedite] Claude native manager ready")
 
+
+	/* 3b4. Initialize Antigravity native manager (one-shot --print + resume) */
+	// Drives agy --print with exact --conversation <id> resume for
+	// Antigravity Chat. Logical sessions persist between one-shot processes;
+	// never uses ambiguous --continue.
+
+	globalAntigravityNativeManager = NewAntigravityNativeManager()
+	go globalAntigravityNativeManager.CleanupStale(antigravityNativeMaxAge)
+	fmt.Println("[aiexpedite] Antigravity native manager ready")
+
 	/* 3c. Begin gathering machine info for /auth/token uploads ------------ */
 	// Runs in a background goroutine so we don't block startup. The first
 	// gather typically completes within a few seconds, comfortably before
