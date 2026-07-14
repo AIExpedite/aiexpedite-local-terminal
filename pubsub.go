@@ -3530,6 +3530,23 @@ func publishClaudeNativeError(ctx context.Context, topic *pubsub.Publisher, cmd 
 func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg) {
 	if globalAntigravityNativeManager == nil {
 		publishAntigravityNativeError(ctx, topic, cmd, "antigravity native manager not initialized")
+		// Start commands leave a cloud-side `starting` session + reservation;
+		// emit ended so the orchestrator can tear them down.
+		if cmd.Type == "antigravity_native_start" && cmd.SessionID != "" {
+			publishFn := newSessionPublishFn(topic, "[antigravity-native]")
+			publishFn(resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				Output:      "antigravity native manager not initialized",
+				Status:      "error",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        "antigravity_native_ended",
+				SessionID:   cmd.SessionID,
+				ExitCode:    -1,
+			})
+		}
 		return
 	}
 
@@ -3567,7 +3584,22 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			onStarted,
 		)
 		if err != nil {
+			// Start never produced a live process — publish error + ended so the
+			// cloud can flip status off `starting` and release the chatSession
+			// reservation (turn-level errors deliberately stay non-terminal).
 			publishAntigravityNativeError(ctx, topic, cmd, fmt.Sprintf("failed to start antigravity native: %v", err))
+			publishFn(resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				Output:      redactAntigravitySecrets(fmt.Sprintf("start failed: %v", err)),
+				Status:      "error",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        "antigravity_native_ended",
+				SessionID:   cmd.SessionID,
+				ExitCode:    -1,
+			})
 			return
 		}
 
