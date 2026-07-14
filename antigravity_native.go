@@ -467,8 +467,9 @@ func (m *AntigravityNativeManager) runOneShot(
 			return "", "", 0, timedOutFlag.Load(), false, fmt.Errorf("agy process error: %w", waitErr)
 		}
 	}
-	// Report truncation without the decorative "…[truncated]" suffix so we can
-	// fail closed rather than present a partial body as a full answer.
+	// Fail closed only when assistant stdout was truncated. Stderr may hit its
+	// smaller cap without invalidating a complete assistant response; the
+	// partial stderr is still published (redacted) for diagnostics.
 	out := ""
 	if stdoutBuf != nil {
 		out = strings.TrimSpace(stdoutBuf.b.String())
@@ -477,7 +478,7 @@ func (m *AntigravityNativeManager) runOneShot(
 	if stderrBuf != nil {
 		errOut = strings.TrimSpace(stderrBuf.b.String())
 	}
-	trunc := (stdoutBuf != nil && stdoutBuf.trunc) || (stderrBuf != nil && stderrBuf.trunc)
+	trunc := stdoutBuf != nil && stdoutBuf.trunc
 	return out, errOut, exitCode, timedOutFlag.Load(), trunc, nil
 }
 
@@ -963,14 +964,6 @@ func captureLimited(r io.Reader, limit int) *limitedBuffer {
 		}
 	}
 	return lb
-}
-
-func (lb *limitedBuffer) String() string {
-	s := lb.b.String()
-	if lb.trunc {
-		s += "\n…[truncated]"
-	}
-	return s
 }
 
 var antigravitySecretPatterns = []*regexp.Regexp{
