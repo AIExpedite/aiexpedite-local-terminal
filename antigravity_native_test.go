@@ -135,9 +135,10 @@ func TestCaptureAntigravityNativeID_PrefersNewDBOverLastConversations(t *testing
 	// Concurrent first turns: last_conversations may point at another chat's
 	// ID for the same cwd; when beforeIDs is provided we must prefer the new DB.
 	tmp := t.TempDir()
-	oldHome := os.Getenv("HOME")
-	t.Cleanup(func() { _ = os.Setenv("HOME", oldHome) })
-	_ = os.Setenv("HOME", tmp)
+	// Redirect both HOME (Unix) and USERPROFILE (Windows) so os.UserHomeDir
+	// resolves to the temp fixture on every platform, not just Unix.
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
 
 	base := filepath.Join(tmp, ".gemini", "antigravity-cli")
 	_ = os.MkdirAll(filepath.Join(base, "cache"), 0o755)
@@ -158,13 +159,11 @@ func TestCaptureAntigravityNativeID_PrefersNewDBOverLastConversations(t *testing
 }
 
 func TestCaptureAntigravityNativeID_FromLastConversations(t *testing.T) {
-	// Point home at a temp dir by temporarily setting HOME.
+	// Point home at a temp dir. Redirect both HOME (Unix) and USERPROFILE
+	// (Windows) so os.UserHomeDir resolves to the fixture on every platform.
 	tmp := t.TempDir()
-	oldHome := os.Getenv("HOME")
-	t.Cleanup(func() { _ = os.Setenv("HOME", oldHome) })
-	if err := os.Setenv("HOME", tmp); err != nil {
-		t.Fatal(err)
-	}
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
 
 	base := filepath.Join(tmp, ".gemini", "antigravity-cli")
 	if err := os.MkdirAll(filepath.Join(base, "cache"), 0o755); err != nil {
@@ -192,9 +191,10 @@ func TestCaptureAntigravityNativeID_FromLastConversations(t *testing.T) {
 
 func TestCaptureAntigravityNativeID_NewDBFallback(t *testing.T) {
 	tmp := t.TempDir()
-	oldHome := os.Getenv("HOME")
-	t.Cleanup(func() { _ = os.Setenv("HOME", oldHome) })
-	_ = os.Setenv("HOME", tmp)
+	// Redirect both HOME (Unix) and USERPROFILE (Windows) so os.UserHomeDir
+	// resolves to the temp fixture on every platform, not just Unix.
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
 
 	base := filepath.Join(tmp, ".gemini", "antigravity-cli", "conversations")
 	if err := os.MkdirAll(base, 0o755); err != nil {
