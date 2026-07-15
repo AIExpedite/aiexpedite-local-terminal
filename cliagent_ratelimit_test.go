@@ -576,6 +576,34 @@ func TestClaudeCodeMetricsFromCache_WeeklyTieBreaksOnLaterReset(t *testing.T) {
 	}
 }
 
+// A write that can't identify the capturing account (empty stamp) must CLEAR any
+// prior DotfileAccount stamp — the buckets were just replaced, so a leftover
+// stamp would misattribute the fresh capture to the old account (hiding it for
+// the real one, or later showing it under the stale account after a switch-back).
+func TestMergeClaudeRateLimitCache_EmptyStampClearsPriorStamp(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(time.Hour).UnixMilli()
+
+	// Account A stamps the unscoped snapshot.
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 40, ResetsAtMs: reset, usageKnown: true},
+	}, now, "", "alice@example.com")
+	if snap, _ := loadClaudeRateLimitSnapshot(cache); snap.DotfileAccount != "alice@example.com" {
+		t.Fatalf("setup: DotfileAccount=%q, want alice@example.com", snap.DotfileAccount)
+	}
+
+	// An unstamped write replaces the reading — the stale stamp must be cleared.
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 12, ResetsAtMs: reset, usageKnown: true},
+	}, now, "", "")
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok || snap.DotfileAccount != "" {
+		t.Errorf("DotfileAccount=%q, want empty (unstamped write must clear the stale stamp)", snap.DotfileAccount)
+	}
+}
+
 func TestNormalizeResetMs(t *testing.T) {
 	if got := normalizeResetMs(1781544600); got != 1781544600000 {
 		t.Errorf("seconds: got %d, want 1781544600000", got)

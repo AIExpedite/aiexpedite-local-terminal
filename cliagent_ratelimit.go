@@ -270,9 +270,14 @@ func captureClaudeRateLimitLine(line string, now time.Time) *claudeRateLimitBuck
 	nowMs := now.UnixMilli()
 	updates := extractClaudeRateLimitBuckets(raw, nowMs)
 	if len(updates) > 0 {
-		// Stream-capture runs in the daemon hot path and doesn't read the dotfile;
-		// leave the account stamp empty (the reader accepts unstamped snapshots).
-		mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint(), "")
+		// Stamp the current dotfile account, same as the status-line hook. This runs
+		// only when a line actually carries rate-limit telemetry (rare), so the
+		// dotfile read is not a hot-path cost — and it keeps the stamp describing the
+		// account these fresh buckets belong to, so a /login switch can't leave the
+		// previous account's stamp on them.
+		mergeClaudeRateLimitCache(
+			claudeRateLimitCachePath(), updates, now,
+			currentClaudeAccountFingerprint(), currentClaudeDotfileAccount())
 	}
 
 	// Surface the rejected window with the LATEST reset time. When multiple
@@ -410,12 +415,11 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
 	snap.AccountFingerprint = fingerprint
 	// Stamp the capturing dotfile account so the reader can reject this "" snapshot
-	// after a same-user /login switch. A non-empty stamp wins; an empty one (the
-	// stream-capture hot path, which doesn't read the dotfile) preserves whatever
-	// a prior status-line write recorded rather than wiping it.
-	if dotfileAccount != "" {
-		snap.DotfileAccount = dotfileAccount
-	}
+	// after a same-user /login switch. Assigned unconditionally: these buckets were
+	// just written by the current capture, so the stamp must describe THEM — an
+	// empty stamp (a caller that can't identify the account) must CLEAR any prior
+	// stamp, never leave a stale one attached to freshly replaced buckets.
+	snap.DotfileAccount = dotfileAccount
 
 	out, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
