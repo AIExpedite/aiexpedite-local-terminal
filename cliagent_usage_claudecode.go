@@ -38,6 +38,26 @@ type claudeCredentials struct {
 	Subscription string `json:"subscription"`
 }
 
+// claudeDotJSON mirrors the (non-secret) `oauthAccount` block Claude Code writes
+// to ~/.claude.json — the main config file, distinct from .credentials.json.
+// This is the ONLY on-disk place the signed-in account email lives: a
+// claude.ai `/login` populates emailAddress / displayName / organizationName
+// here, while .credentials.json holds only the OAuth token object (no email).
+// Reading it lets the CLI Agents card show `Account: …` for Claude Code, the
+// same way Codex surfaces it from ~/.codex/auth.json. Contains NO tokens, so
+// it's safe to read alongside the credential probe.
+//
+// https://code.claude.com/docs/en/authentication documents this layout; note
+// that an unhydrated block (Windows Desktop / SSO Team-plan — anthropics/
+// claude-code#57026) leaves emailAddress empty, in which case we degrade to no
+// account line, exactly as before this fallback existed.
+type claudeDotJSON struct {
+	OAuthAccount struct {
+		EmailAddress string `json:"emailAddress"`
+		DisplayName  string `json:"displayName"`
+	} `json:"oauthAccount"`
+}
+
 // claudeOAuthCredentials mirrors the nested `claudeAiOauth` object Claude Code
 // writes to .credentials.json for a claude.ai subscription login. The access
 // token (ExpiresAt) auto-refreshes silently in the real ~/.claude using
@@ -192,6 +212,15 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 			usage.NoticeSeverity = severity
 		}
 	}
+
+	// .credentials.json carries only the OAuth token object, so the account
+	// email above is almost always empty. The signed-in email lives in
+	// ~/.claude.json's oauthAccount block — fall back to it so the card shows
+	// `Account: …` like Codex does. Also feeds accountFingerprint below, which
+	// scopes the rate-limit cache and dedups the same account across devices.
+	if usage.Account == "" {
+		usage.Account = claudeAccountFromDotJSON(home)
+	}
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
 	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)
@@ -205,6 +234,36 @@ func claudeConfigDir(home string) string {
 	return firstNonEmpty(os.Getenv("CLAUDE_CONFIG_DIR"), expandHome(home, ".claude"))
 }
 
+// claudeDotJSONPath resolves Claude Code's main config file, ~/.claude.json. It
+// sits at the HOME root next to the ~/.claude dir, NOT inside it — but when
+// CLAUDE_CONFIG_DIR selects a side-by-side profile, .claude.json moves into
+// that dir alongside .credentials.json. Empty when neither resolves.
+func claudeDotJSONPath(home string) string {
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		return expandHome(dir, ".claude.json")
+	}
+	return expandHome(home, ".claude.json")
+}
+
+// claudeAccountFromDotJSON returns the signed-in account identity from
+// ~/.claude.json's oauthAccount block (email preferred, display name as a
+// last resort), or "" when the file is absent/unparseable or the block is
+// unhydrated. Shared by Parse (card display + fingerprint) and the capture
+// path (currentClaudeAccountFingerprint) so both derive the SAME account —
+// a mismatch would scope the rate-limit cache to a different fingerprint and
+// silently drop the real utilization metrics.
+func claudeAccountFromDotJSON(home string) string {
+	path := claudeDotJSONPath(home)
+	if path == "" {
+		return ""
+	}
+	cfg := claudeDotJSON{}
+	if !readJSONFile(path, &cfg) {
+		return ""
+	}
+	return firstNonEmpty(cfg.OAuthAccount.EmailAddress, cfg.OAuthAccount.DisplayName)
+}
+
 // currentClaudeAccountFingerprint reads the Claude credentials on disk and
 // returns the same fingerprint Parse would attach to a usage snapshot. Used by
 // the capture path to scope the rate-limit cache to the active account.
@@ -216,15 +275,20 @@ func currentClaudeAccountFingerprint() string {
 	if base == "" {
 		return ""
 	}
-	raw, ok := readClaudeCredentialsRaw(base)
-	if !ok {
-		return ""
+	account := ""
+	if raw, ok := readClaudeCredentialsRaw(base); ok {
+		creds := claudeCredentials{}
+		if json.Unmarshal(raw, &creds) == nil {
+			account = firstNonEmpty(creds.Email, creds.Account, creds.Organization)
+		}
 	}
-	creds := claudeCredentials{}
-	if json.Unmarshal(raw, &creds) != nil {
-		return ""
+	// Mirror Parse's fallback: the email almost always comes from ~/.claude.json,
+	// not .credentials.json. Without this, the captured snapshot would be
+	// fingerprinted "" while Parse fingerprints the email — the two would never
+	// match and claudeCodeMetricsFromCache would discard the cached windows.
+	if account == "" {
+		account = claudeAccountFromDotJSON(home)
 	}
-	account := firstNonEmpty(creds.Email, creds.Account, creds.Organization)
 	return fingerprintAccount("claudeCode", account)
 }
 

@@ -75,6 +75,101 @@ func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
 	}
 }
 
+// The account email is NOT in .credentials.json (it holds only the OAuth token
+// object) — it lives in ~/.claude.json's oauthAccount block. The parser must
+// fall back to it so the card can show `Account: …`, and the derived
+// fingerprint must be non-empty so the same account dedups across devices.
+func TestClaudeCodeUsageParser_AccountFromDotJSON(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+
+	// macOS default-config-dir reads the shared Keychain first; stub it off so
+	// the test never picks up the real dev-machine login.
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+
+	// .credentials.json present but carrying only the token object (no email),
+	// so the ONLY email source is .claude.json below.
+	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
+		"claudeAiOauth": map[string]any{},
+	})
+	helperWriteJSON(t, filepath.Join(home, ".claude.json"), map[string]any{
+		"oauthAccount": map[string]any{
+			"emailAddress": "grace@example.com",
+			"displayName":  "Grace",
+		},
+	})
+
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage, got ok=%v", ok)
+	}
+	if usage.Account != "grace@example.com" {
+		t.Errorf("Account=%q, want grace@example.com (from ~/.claude.json)", usage.Account)
+	}
+	// Parse must fingerprint the resolved email. The capture path
+	// (currentClaudeAccountFingerprint) derives its home from os.UserHomeDir
+	// exactly as gatherCLIAgentUsage does and reuses this same helper, so both
+	// agree at runtime — we assert against the expected fingerprint here rather
+	// than calling the capture path, which can't be pointed at the test's temp
+	// home.
+	want := fingerprintAccount("claudeCode", "grace@example.com")
+	if usage.AccountFingerprint != want {
+		t.Errorf("AccountFingerprint=%q, want %q", usage.AccountFingerprint, want)
+	}
+}
+
+// An account email inside .credentials.json (older Claude Code layouts / API-key
+// installs that populate it) wins over ~/.claude.json — the parser only falls
+// back when the credential yields no account.
+func TestClaudeCodeUsageParser_CredentialsAccountWinsOverDotJSON(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+
+	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
+		"email": "creds@example.com",
+	})
+	helperWriteJSON(t, filepath.Join(home, ".claude.json"), map[string]any{
+		"oauthAccount": map[string]any{"emailAddress": "dotjson@example.com"},
+	})
+
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Account != "creds@example.com" {
+		t.Errorf("Account=%q, want creds@example.com (credential should win)", usage.Account)
+	}
+}
+
+// displayName is used only when emailAddress is absent (e.g. an SSO profile that
+// hydrated a name but not an email).
+func TestClaudeCodeUsageParser_DotJSONDisplayNameFallback(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+
+	helperWriteJSON(t, filepath.Join(home, ".claude.json"), map[string]any{
+		"oauthAccount": map[string]any{"displayName": "Grace"},
+	})
+
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Account != "Grace" {
+		t.Errorf("Account=%q, want Grace (displayName fallback)", usage.Account)
+	}
+}
+
 func helperWriteClaudeOAuth(t *testing.T, home string, extra map[string]any) {
 	t.Helper()
 	oauth := map[string]any{}
