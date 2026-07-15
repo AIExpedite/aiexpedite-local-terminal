@@ -62,6 +62,20 @@ func captureClaudeRateLimitsFromStatusline(raw []byte, now time.Time) {
 	if len(updates) == 0 {
 		return
 	}
+	// This hook runs as a child of the Claude session that rendered the status
+	// line, so our environment IS that session's. When it is authenticated with
+	// an env credential that outranks the stored /login (ANTHROPIC_AUTH_TOKEN, an
+	// approved ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or a cloud provider —
+	// see claudeEnvAuthActive), these rate_limits belong to that env account, not
+	// the stored login. DON'T record them at all: the cache is scoped by the
+	// stored credential — which is "" for the common claude.ai login, the very
+	// same scope a subscription capture uses — so writing env usage here (even
+	// "unscoped") would let the stored-login card read it back as its own. There
+	// is no env-account card to show it on, so simply skip the capture, which also
+	// leaves the stored login's existing buckets untouched.
+	if claudeEnvAuthActive() {
+		return
+	}
 	mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint())
 }
 

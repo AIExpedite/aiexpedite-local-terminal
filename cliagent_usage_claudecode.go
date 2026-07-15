@@ -38,6 +38,35 @@ type claudeCredentials struct {
 	Subscription string `json:"subscription"`
 }
 
+// claudeDotJSON mirrors the (non-secret) `oauthAccount` block Claude Code writes
+// to ~/.claude.json — the main config file, distinct from .credentials.json.
+// This is the ONLY on-disk place the signed-in account email lives: a
+// claude.ai `/login` populates emailAddress / displayName / organizationName
+// here, while .credentials.json holds only the OAuth token object (no email).
+// Reading it lets the CLI Agents card show `Account: …` for Claude Code, the
+// same way Codex surfaces it from ~/.codex/auth.json. Contains NO tokens, so
+// it's safe to read alongside the credential probe.
+//
+// https://code.claude.com/docs/en/authentication documents this layout; note
+// that an unhydrated block (Windows Desktop / SSO Team-plan — anthropics/
+// claude-code#57026) leaves emailAddress empty, in which case we degrade to no
+// account line, exactly as before this fallback existed.
+type claudeDotJSON struct {
+	OAuthAccount struct {
+		EmailAddress string `json:"emailAddress"`
+		DisplayName  string `json:"displayName"`
+	} `json:"oauthAccount"`
+	// customApiKeyResponses records the user's one-time approve/decline decision
+	// for an ANTHROPIC_API_KEY seen in the environment. Each entry is the LAST 20
+	// CHARACTERS of the key (Claude Code never stores the full secret). A key that
+	// is present in the env but NOT in `approved` is not the active credential —
+	// Claude keeps using the stored /login — so its rate_limits still belong to
+	// the oauthAccount.
+	CustomApiKeyResponses struct {
+		Approved []string `json:"approved"`
+	} `json:"customApiKeyResponses"`
+}
+
 // claudeOAuthCredentials mirrors the nested `claudeAiOauth` object Claude Code
 // writes to .credentials.json for a claude.ai subscription login. The access
 // token (ExpiresAt) auto-refreshes silently in the real ~/.claude using
@@ -192,8 +221,42 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 			usage.NoticeSeverity = severity
 		}
 	}
-	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
+	// The account from .credentials.json is the ONLY identity used for scoping —
+	// it is stable per config dir. Everything downstream (the published/dedup
+	// fingerprint AND the rate-limit cache read) uses this one identity so they
+	// can never disagree.
+	credsAccount := usage.Account
+
+	// .credentials.json carries only the OAuth token object, so the account
+	// above is almost always empty. The signed-in email lives in ~/.claude.json's
+	// oauthAccount block — surface it as the card's DISPLAY label so the account
+	// line shows like Codex's, exactly the same feature the ticket asked for.
+	//
+	// DISPLAY ONLY — never a fingerprint, and never used to scope/gate the cached
+	// metrics. Claude's status-line/stream telemetry does NOT include the session's
+	// authenticated account (anthropics/claude-code#17909), and ~/.claude.json is a
+	// single shared file any concurrent session rewrites on `/login`. So there is
+	// no reliable way to tie a captured window to a specific account: reading the
+	// dotfile at capture time can stamp one session's usage with another session's
+	// login. We therefore treat the email as "the account currently signed in on
+	// this device" and leave the metrics DEVICE-scoped (the credential-only
+	// fingerprint is empty for claude.ai, so gatherCLIAgentUsage device-scopes it).
+	// In the common single-account case the label and the device's own captures
+	// agree; in the rare concurrent/just-switched multi-account case the label may
+	// momentarily lead the cached numbers until the next capture — a bounded,
+	// self-healing display skew, not a cross-account data leak (the metrics are
+	// this device's own usage regardless of which email is shown).
+	if usage.Account == "" {
+		email, displayName := claudeDotJSONAccount(home)
+		usage.Account = firstNonEmpty(email, displayName) // label only
+	}
+
+	// One identity for publish + dedup + cache scope: the credential account.
+	// Empty for the common claude.ai login, in which case gatherCLIAgentUsage
+	// device-scopes the fingerprint and the cache read is unscoped ("") — matching
+	// what the status-line hook / stream-capture wrote.
+	usage.AccountFingerprint = fingerprintAccount(p.Provider(), credsAccount)
 	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)
 
 	return usage, true
@@ -205,26 +268,154 @@ func claudeConfigDir(home string) string {
 	return firstNonEmpty(os.Getenv("CLAUDE_CONFIG_DIR"), expandHome(home, ".claude"))
 }
 
-// currentClaudeAccountFingerprint reads the Claude credentials on disk and
-// returns the same fingerprint Parse would attach to a usage snapshot. Used by
-// the capture path to scope the rate-limit cache to the active account.
-// Returns "" when no creds are readable, in which case the cache is unscoped
-// (best-effort, matches pre-scoping behavior).
+// claudeDotJSONPath resolves Claude Code's main config file, ~/.claude.json. It
+// sits at the HOME root next to the ~/.claude dir, NOT inside it — but when
+// CLAUDE_CONFIG_DIR selects a side-by-side profile, .claude.json moves into
+// that dir alongside .credentials.json. Empty when neither resolves.
+func claudeDotJSONPath(home string) string {
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		return expandHome(dir, ".claude.json")
+	}
+	return expandHome(home, ".claude.json")
+}
+
+// claudeDotJSONAccount returns (email, displayName) from ~/.claude.json's
+// oauthAccount block, or ("","") when the file is absent/unparseable or the
+// block is unhydrated. Used ONLY to pick a human-facing DISPLAY label for the
+// card (email preferred, display name as a fallback) — never as a fingerprint.
+// ~/.claude.json is shared and mutable (any session's `/login` rewrites it), so
+// it must not scope the cache or drive cross-device dedup; Parse fingerprints by
+// the stable credential account instead.
+func claudeDotJSONAccount(home string) (email, displayName string) {
+	path := claudeDotJSONPath(home)
+	if path == "" {
+		return "", ""
+	}
+	cfg := claudeDotJSON{}
+	if !readJSONFile(path, &cfg) {
+		return "", ""
+	}
+	return cfg.OAuthAccount.EmailAddress, cfg.OAuthAccount.DisplayName
+}
+
+// claudeEnvAuthActive reports whether the ACTIVE credential for this Claude
+// session is an env credential rather than the stored /login — i.e. whether the
+// captured rate_limits belong to a different account than the ~/.claude.json
+// oauthAccount and must therefore NOT be scoped to it.
+//
+// This is only meaningful where the current process IS the Claude session — the
+// status-line hook, which Claude Code spawns as a child of the session and which
+// therefore inherits that session's environment. The daemon paths (Parse /
+// gather, and the stream-capture in captureClaudeRateLimitLine) deliberately do
+// NOT consult this: the daemon's env reflects the shell it was launched from,
+// not the driver-launched sessions it parses, and those sessions strip these
+// vars — so treating a stray daemon-shell key as "this account is env-auth"
+// would wrongly blank the stored subscription account.
+//
+// Presence of the env var is NOT sufficient — it must actually WIN Claude's
+// authentication precedence (https://code.claude.com/docs/en/authentication),
+// which ranks credentials above the stored /login (#6) as:
+//   - #1 cloud / alternate provider selectors (see env-vars reference) — routes
+//     inference off the first-party subscription: BEDROCK, VERTEX, FOUNDRY,
+//     ANTHROPIC_AWS (Claude Platform on AWS), and MANTLE (Bedrock Mantle).
+//   - #2 ANTHROPIC_AUTH_TOKEN — always wins when set (bearer token, no approval).
+//   - #3 ANTHROPIC_API_KEY — wins only ONCE APPROVED. In interactive mode (the
+//     only mode that renders a status line) the user is prompted once to
+//     approve/decline and the choice is remembered in .claude.json's
+//     customApiKeyResponses. A present-but-declined (or not-yet-approved) key is
+//     ignored and Claude keeps billing the subscription — so those rate_limits
+//     DO belong to the oauthAccount and must stay scoped to it.
+//   - #5 CLAUDE_CODE_OAUTH_TOKEN — a long-lived subscription token (claude
+//     setup-token) that may belong to a DIFFERENT account than the stored
+//     /login, and still emits subscription rate_limits — so it too must unscope.
+//
+// #4 apiKeyHelper is deliberately not handled: it lives in settings.json rather
+// than the environment, and it supplies an API-key credential (Console/API
+// billing) which does not emit the subscription 5h/weekly rate_limits this
+// capture path records — so there is nothing to misattribute.
+func claudeEnvAuthActive() bool {
+	// #1 cloud / alternate provider selection. Every CLAUDE_CODE_USE_* provider
+	// selector from https://code.claude.com/docs/en/env-vars must be covered so
+	// provider-session rate_limits never merge into the stored /login card.
+	if os.Getenv("CLAUDE_CODE_USE_BEDROCK") != "" ||
+		os.Getenv("CLAUDE_CODE_USE_VERTEX") != "" ||
+		os.Getenv("CLAUDE_CODE_USE_FOUNDRY") != "" ||
+		os.Getenv("CLAUDE_CODE_USE_ANTHROPIC_AWS") != "" ||
+		os.Getenv("CLAUDE_CODE_USE_MANTLE") != "" {
+		return true
+	}
+	// #2 bearer token, and #5 long-lived OAuth token: both outrank the stored
+	// /login unconditionally when set.
+	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != "" || os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") != "" {
+		return true
+	}
+	// #3 API key: active only once approved.
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		return false
+	}
+	home, _ := os.UserHomeDir()
+	return claudeApiKeyApproved(home, key)
+}
+
+// claudeApiKeyApproved reports whether the given ANTHROPIC_API_KEY has been
+// approved as the active credential, per ~/.claude.json's customApiKeyResponses
+// (whose entries are the key's last 20 characters — the form Claude Code
+// persists). Returns false when the file/field is absent or the key isn't listed
+// as approved: the safe default is to keep attributing to the stored /login so a
+// declined or not-yet-approved key never blanks real subscription usage.
+func claudeApiKeyApproved(home, key string) bool {
+	path := claudeDotJSONPath(home)
+	if path == "" {
+		return false
+	}
+	cfg := claudeDotJSON{}
+	if !readJSONFile(path, &cfg) {
+		return false
+	}
+	// Claude stores key.slice(-20): the last 20 chars, or the whole key if shorter.
+	suffix := key
+	if len(key) > 20 {
+		suffix = key[len(key)-20:]
+	}
+	for _, approved := range cfg.CustomApiKeyResponses.Approved {
+		if approved == suffix {
+			return true
+		}
+	}
+	return false
+}
+
+// currentClaudeAccountFingerprint returns the fingerprint used to SCOPE the
+// on-disk rate-limit cache to the account that produced a capture. It reads ONLY
+// the stable, per-config-dir credential (email/account/organization) — never the
+// shared ~/.claude.json oauthAccount.
+//
+// Why not fall back to ~/.claude.json here (unlike Parse's display/dedup path):
+// this feeds the LIVE writers — the status-line hook (called on every render)
+// and the stream-capture — and ~/.claude.json is a single shared file that any
+// interactive session rewrites on `/login`. Scoping a live capture by it would
+// let a concurrent `/login` in a second session misattribute the first session's
+// rate limits to the newly written account, and mergeClaudeRateLimitCache drops
+// the prior account's buckets on that fingerprint flip. The credential is stable
+// per config dir and can't be swapped out mid-render.
+//
+// Returns "" when the credential carries no account — the common claude.ai
+// login. The cache is then unscoped, matching the behavior before this feature;
+// Parse reads it with the same "" so the windows still display.
 func currentClaudeAccountFingerprint() string {
 	home, _ := os.UserHomeDir()
 	base := claudeConfigDir(home)
 	if base == "" {
 		return ""
 	}
-	raw, ok := readClaudeCredentialsRaw(base)
-	if !ok {
-		return ""
+	account := ""
+	if raw, ok := readClaudeCredentialsRaw(base); ok {
+		creds := claudeCredentials{}
+		if json.Unmarshal(raw, &creds) == nil {
+			account = firstNonEmpty(creds.Email, creds.Account, creds.Organization)
+		}
 	}
-	creds := claudeCredentials{}
-	if json.Unmarshal(raw, &creds) != nil {
-		return ""
-	}
-	account := firstNonEmpty(creds.Email, creds.Account, creds.Organization)
 	return fingerprintAccount("claudeCode", account)
 }
 
