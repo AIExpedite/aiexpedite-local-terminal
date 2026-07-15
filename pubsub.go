@@ -3584,22 +3584,27 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			onStarted,
 		)
 		if err != nil {
-			// Start never produced a live process — publish error + ended so the
-			// cloud can flip status off `starting` and release the chatSession
-			// reservation (turn-level errors deliberately stay non-terminal).
+			// Only emit antigravity_native_ended when no local session exists.
+			// A residual "already exists" path (or any Start error after a live
+			// session is registered) must not release the cloud reservation
+			// while the manager can still accept Sends — that desync breaks
+			// later turns after Pub/Sub redelivery / terminal-service retries.
+			// (Start itself treats redelivery as an idempotent started ack.)
 			publishAntigravityNativeError(ctx, topic, cmd, fmt.Sprintf("failed to start antigravity native: %v", err))
-			publishFn(resultMsg{
-				ID:          cmd.ID,
-				WorkspaceID: cmd.WorkspaceID,
-				UID:         cmd.UID,
-				Output:      redactAntigravitySecrets(fmt.Sprintf("start failed: %v", err)),
-				Status:      "error",
-				Ts:          time.Now().UnixMilli(),
-				Version:     Version,
-				Type:        "antigravity_native_ended",
-				SessionID:   cmd.SessionID,
-				ExitCode:    -1,
-			})
+			if globalAntigravityNativeManager.Get(cmd.SessionID) == nil {
+				publishFn(resultMsg{
+					ID:          cmd.ID,
+					WorkspaceID: cmd.WorkspaceID,
+					UID:         cmd.UID,
+					Output:      redactAntigravitySecrets(fmt.Sprintf("start failed: %v", err)),
+					Status:      "error",
+					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
+					Type:        "antigravity_native_ended",
+					SessionID:   cmd.SessionID,
+					ExitCode:    -1,
+				})
+			}
 			return
 		}
 

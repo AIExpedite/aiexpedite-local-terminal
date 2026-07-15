@@ -162,9 +162,10 @@ func TestRedactAntigravitySecrets(t *testing.T) {
 	}
 }
 
-func TestCaptureAntigravityNativeID_PrefersNewDBOverLastConversations(t *testing.T) {
-	// Concurrent first turns: last_conversations may point at another chat's
-	// ID for the same cwd; when beforeIDs is provided we must prefer the new DB.
+func TestCaptureAntigravityNativeID_RequiresCwdMappedNewID(t *testing.T) {
+	// When last_conversations still maps this cwd to a pre-existing ID, a new
+	// global DB (other cwd / local TUI) must NOT be adopted. Fail closed so
+	// Send falls back to bounded transcript replay.
 	tmp := t.TempDir()
 	// Redirect both HOME (Unix) and USERPROFILE (Windows) so os.UserHomeDir
 	// resolves to the temp fixture on every platform, not just Unix.
@@ -176,16 +177,39 @@ func TestCaptureAntigravityNativeID_PrefersNewDBOverLastConversations(t *testing
 	_ = os.MkdirAll(filepath.Join(base, "conversations"), 0o755)
 	cwd := "/tmp/shared-cwd"
 	staleID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
-	newID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	unrelatedID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 	_ = os.WriteFile(filepath.Join(base, "cache", "last_conversations.json"),
 		[]byte(`{"`+cwd+`":"`+staleID+`"}`), 0o644)
 	_ = os.WriteFile(filepath.Join(base, "conversations", staleID+".db"), []byte("old"), 0o644)
-	_ = os.WriteFile(filepath.Join(base, "conversations", newID+".db"), []byte("new"), 0o644)
-	// beforeIDs includes stale so only newID is "new"
+	_ = os.WriteFile(filepath.Join(base, "conversations", unrelatedID+".db"), []byte("other-cwd"), 0o644)
 	before := map[string]struct{}{staleID: {}}
 	got := captureAntigravityNativeID(cwd, before)
+	if got != "" {
+		t.Fatalf("capture must not adopt unrelated new DB; got %q", got)
+	}
+}
+
+func TestCaptureAntigravityNativeID_AcceptsNewCwdMappedID(t *testing.T) {
+	// Happy path with beforeIDs: last_conversations maps this cwd to an ID that
+	// was not in the pre-turn snapshot.
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	base := filepath.Join(tmp, ".gemini", "antigravity-cli")
+	_ = os.MkdirAll(filepath.Join(base, "cache"), 0o755)
+	_ = os.MkdirAll(filepath.Join(base, "conversations"), 0o755)
+	cwd := "/tmp/proj-capture"
+	oldID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	newID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	_ = os.WriteFile(filepath.Join(base, "cache", "last_conversations.json"),
+		[]byte(`{"`+cwd+`":"`+newID+`"}`), 0o644)
+	_ = os.WriteFile(filepath.Join(base, "conversations", oldID+".db"), []byte("old"), 0o644)
+	_ = os.WriteFile(filepath.Join(base, "conversations", newID+".db"), []byte("new"), 0o644)
+	before := map[string]struct{}{oldID: {}}
+	got := captureAntigravityNativeID(cwd, before)
 	if got != newID {
-		t.Fatalf("capture with beforeIDs = %q, want new %q (not last_conversations %q)", got, newID, staleID)
+		t.Fatalf("capture = %q, want cwd-mapped new ID %q", got, newID)
 	}
 }
 
@@ -220,7 +244,9 @@ func TestCaptureAntigravityNativeID_FromLastConversations(t *testing.T) {
 	}
 }
 
-func TestCaptureAntigravityNativeID_NewDBFallback(t *testing.T) {
+func TestCaptureAntigravityNativeID_NoCwdMappingDoesNotAdoptGlobalDB(t *testing.T) {
+	// Without a last_conversations entry for this cwd, a new global DB must
+	// not be adopted (it may belong to another workspace).
 	tmp := t.TempDir()
 	// Redirect both HOME (Unix) and USERPROFILE (Windows) so os.UserHomeDir
 	// resolves to the temp fixture on every platform, not just Unix.
@@ -237,8 +263,8 @@ func TestCaptureAntigravityNativeID_NewDBFallback(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(base, newID+".db"), []byte("n"), 0o644)
 
 	got := captureAntigravityNativeID("/no/mapping", before)
-	if got != newID {
-		t.Fatalf("fallback capture = %q, want %q", got, newID)
+	if got != "" {
+		t.Fatalf("capture without cwd mapping must be empty (got %q); do not adopt global DB %q", got, newID)
 	}
 }
 
@@ -480,4 +506,71 @@ func TestSetActiveProcess_DoesNotCancelWhenRunning(t *testing.T) {
 	if s.activeCancel == nil {
 		t.Fatal("activeCancel should be stored")
 	}
+}
+
+func TestSanitizeAntigravityEnv_StripsCredentialsCaseInsensitive(t *testing.T) {
+	env := []string{
+		"PATH=/usr/bin",
+		"ANTHROPIC_API_KEY=sk-upper",
+		"OpenAI_API_KEY=sk-mixed",
+		"anthropic_api_key=sk-lower",
+		"xai_api_key=xai-lower",
+		"CODEX_API_KEY=codex-upper",
+		"SAFE_VAR=keep",
+		"HOME=/tmp",
+	}
+	out := sanitizeAntigravityEnv(env)
+	joined := strings.Join(out, "\n")
+	for _, secret := range []string{
+		"ANTHROPIC_API_KEY=",
+		"OpenAI_API_KEY=",
+		"anthropic_api_key=",
+		"xai_api_key=",
+		"CODEX_API_KEY=",
+	} {
+		for _, e := range out {
+			if strings.HasPrefix(strings.ToUpper(e), strings.ToUpper(secret)) {
+				t.Fatalf("credential %q must be stripped; got env %v", secret, out)
+			}
+		}
+	}
+	if !strings.Contains(joined, "PATH=") || !strings.Contains(joined, "SAFE_VAR=") || !strings.Contains(joined, "HOME=") {
+		t.Fatalf("harmless vars must be preserved: %v", out)
+	}
+}
+
+func TestAntigravityNativeManager_StartIsIdempotent(t *testing.T) {
+	// Pub/Sub redelivery of antigravity_native_start must re-ack without
+	// erroring (which would previously emit antigravity_native_ended and
+	// desync cloud vs local session).
+	m := NewAntigravityNativeManager()
+	cwd := t.TempDir()
+
+	var acks int
+	onStarted := func() { acks++ }
+
+	if err := m.Start("sess-idem", cwd, "ws", "uid", onStarted); err != nil {
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not runnable") ||
+			strings.Contains(err.Error(), "below minimum") || strings.Contains(err.Error(), "unsupported") {
+			t.Skipf("agy not available for capability probe: %v", err)
+		}
+		t.Fatalf("first start: %v", err)
+	}
+	if acks != 1 {
+		t.Fatalf("expected 1 started ack after first start, got %d", acks)
+	}
+	if m.Get("sess-idem") == nil {
+		t.Fatal("session missing after first start")
+	}
+
+	if err := m.Start("sess-idem", cwd, "ws", "uid", onStarted); err != nil {
+		t.Fatalf("duplicate start must be idempotent nil, got %v", err)
+	}
+	if acks != 2 {
+		t.Fatalf("expected second started ack on redelivery, got %d", acks)
+	}
+	if m.Get("sess-idem") == nil {
+		t.Fatal("session must still exist after idempotent re-start")
+	}
+	_ = m.End("sess-idem")
 }

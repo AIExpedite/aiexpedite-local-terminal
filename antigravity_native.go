@@ -9,9 +9,12 @@ package main
 //   - `--conversation <uuid>` resumes the exact prior conversation.
 //   - `--continue` resumes the most recent conversation globally and is
 //     NEVER used (cross-chat contamination risk).
-//   - After a first turn, the native conversation ID is available from
-//     ~/.gemini/antigravity-cli/cache/last_conversations.json keyed by cwd,
-//     with a filesystem snapshot of conversations/*.db as a race-safe fallback.
+//   - After a first turn, the native conversation ID is read only from
+//     ~/.gemini/antigravity-cli/cache/last_conversations.json keyed by cwd
+//     (and only when that ID is new vs the pre-turn snapshot). We deliberately
+//     do not adopt the newest global conversations/*.db — it may belong to
+//     another cwd (local TUI or concurrent AIExpedite session). Missed capture
+//     falls back to bounded transcript replay.
 //   - Output is complete-only (no reliable incremental stream).
 //   - Pre-chosen conversation IDs are ignored; agy always mints its own UUID.
 //
@@ -201,7 +204,16 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, exists := m.sessions[id]; exists {
-		return fmt.Errorf("antigravity native session %s already exists", id)
+		// Pub/Sub redelivery / terminal-service retry of the same start must
+		// re-ack started without ending the still-usable local session. Emitting
+		// antigravity_native_ended here would release the cloud reservation while
+		// the manager still holds the session, breaking later Sends.
+		fmt.Printf("%s[antigravity-native] Session %s already registered — idempotent start ack%s\n",
+			colorCyan, id, colorReset)
+		if onStarted != nil {
+			onStarted()
+		}
+		return nil
 	}
 
 	session := &AntigravityNativeSession{
@@ -718,6 +730,9 @@ func buildAntigravityNativeArgs(prompt, nativeConversationID string) []string {
 
 func sanitizeAntigravityEnv(env []string) []string {
 	// Strip unrelated provider credentials that might leak into child tools.
+	// Compare case-insensitively: Windows and some shells export mixed/lower
+	// names (OpenAI_API_KEY, anthropic_api_key) that would otherwise survive
+	// into `agy --dangerously-skip-permissions` tool subprocesses.
 	denyPrefixes := []string{
 		"ANTHROPIC_API_KEY=",
 		"OPENAI_API_KEY=",
@@ -726,9 +741,10 @@ func sanitizeAntigravityEnv(env []string) []string {
 	}
 	out := make([]string, 0, len(env))
 	for _, e := range env {
+		upper := strings.ToUpper(e)
 		deny := false
 		for _, p := range denyPrefixes {
-			if strings.HasPrefix(e, p) {
+			if strings.HasPrefix(upper, p) {
 				deny = true
 				break
 			}
@@ -867,10 +883,14 @@ func captureAntigravityNativeID(cwd string, beforeIDs map[string]struct{}) strin
 	base := antigravityHomeBase()
 
 	// When a before-snapshot is available (normal first-turn path), only accept
-	// conversation IDs that appeared after the snapshot. last_conversations.json
-	// is last-writer-wins per cwd and may still point at an older AIExpedite
-	// chat (or local TUI session) — never adopt a pre-existing ID into a new
-	// logical conversation (cross-chat isolation).
+	// conversation IDs that appeared after the snapshot AND are mapped to this
+	// cwd in last_conversations.json. Never adopt the newest global
+	// conversations/*.db: another Antigravity process (local TUI or a second
+	// AIExpedite session in a different cwd) can create a DB during the capture
+	// window, and resuming that ID would cross-wire conversation state.
+	// Same-cwd concurrent first turns are serialized by cwdCaptureLock; if the
+	// cwd mapping is missing/stale after the run, return "" so Send uses
+	// bounded transcript replay instead of a wrong native ID.
 	if beforeIDs != nil {
 		lastID := readAntigravityLastConversationID(base, cwd)
 		if lastID != "" {
@@ -880,9 +900,7 @@ func captureAntigravityNativeID(cwd string, beforeIDs map[string]struct{}) strin
 				}
 			}
 		}
-		// Concurrent first turns: last_conversations may have been overwritten
-		// by a sibling; take the newest DB that was not in the before snapshot.
-		return newestNewAntigravityConversationID(base, beforeIDs)
+		return ""
 	}
 
 	// No snapshot (tests / recovery): last_conversations only.
@@ -915,30 +933,6 @@ func antigravityConversationDBExists(base, id string) bool {
 	}
 	_, err := os.Stat(filepath.Join(base, "conversations", id+".db"))
 	return err == nil
-}
-
-func newestNewAntigravityConversationID(base string, beforeIDs map[string]struct{}) string {
-	if base == "" {
-		return ""
-	}
-	after := listAntigravityConversationIDs()
-	var newest string
-	var newestMod time.Time
-	convDir := filepath.Join(base, "conversations")
-	for id := range after {
-		if _, was := beforeIDs[id]; was {
-			continue
-		}
-		info, err := os.Stat(filepath.Join(convDir, id+".db"))
-		if err != nil {
-			continue
-		}
-		if newest == "" || info.ModTime().After(newestMod) {
-			newest = id
-			newestMod = info.ModTime()
-		}
-	}
-	return newest
 }
 
 func looksLikeMissingConversation(stdout, stderr string) bool {
