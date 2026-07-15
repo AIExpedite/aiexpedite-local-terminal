@@ -233,19 +233,22 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 	// oauthAccount block — surface it as the card's DISPLAY label so the account
 	// line shows like Codex's, exactly the same feature the ticket asked for.
 	//
-	// It is used for DISPLAY ONLY — never as a fingerprint. ~/.claude.json is a
-	// single shared file any interactive session rewrites on `/login`, so
-	// fingerprinting by it would (a) let the status-line hook misattribute a live
-	// capture after a concurrent `/login`, and (b) attach the unscoped ("")
-	// cache — which also collects env-auth captures and a previous account's
-	// windows — to the email-backed card. Keeping the fingerprint credential-only
-	// keeps the published identity and the cache scope identical, so a claude.ai
-	// login (empty credential account) publishes "" and reads the "" cache it
-	// actually wrote — never another account's data under this email.
-	dotfileEmail := ""
+	// DISPLAY ONLY — never a fingerprint, and never used to scope/gate the cached
+	// metrics. Claude's status-line/stream telemetry does NOT include the session's
+	// authenticated account (anthropics/claude-code#17909), and ~/.claude.json is a
+	// single shared file any concurrent session rewrites on `/login`. So there is
+	// no reliable way to tie a captured window to a specific account: reading the
+	// dotfile at capture time can stamp one session's usage with another session's
+	// login. We therefore treat the email as "the account currently signed in on
+	// this device" and leave the metrics DEVICE-scoped (the credential-only
+	// fingerprint is empty for claude.ai, so gatherCLIAgentUsage device-scopes it).
+	// In the common single-account case the label and the device's own captures
+	// agree; in the rare concurrent/just-switched multi-account case the label may
+	// momentarily lead the cached numbers until the next capture — a bounded,
+	// self-healing display skew, not a cross-account data leak (the metrics are
+	// this device's own usage regardless of which email is shown).
 	if usage.Account == "" {
 		email, displayName := claudeDotJSONAccount(home)
-		dotfileEmail = email
 		usage.Account = firstNonEmpty(email, displayName) // label only
 	}
 
@@ -254,11 +257,7 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 	// device-scopes the fingerprint and the cache read is unscoped ("") — matching
 	// what the status-line hook / stream-capture wrote.
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), credsAccount)
-	// The dotfile email disambiguates the unscoped cache: it lets the reader reject
-	// the "" snapshot when it was captured under a DIFFERENT signed-in email (a
-	// same-user /login switch), so the freshly displayed account never shows the
-	// previous one's quota.
-	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint, dotfileEmail)
+	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)
 
 	return usage, true
 }
@@ -420,17 +419,6 @@ func currentClaudeAccountFingerprint() string {
 	return fingerprintAccount("claudeCode", account)
 }
 
-// currentClaudeDotfileAccount returns the signed-in ~/.claude.json account email
-// for the current default home — the stamp the status-line hook records so the
-// reader can tell an unscoped ("") snapshot from one captured under a different
-// login after a `/login` switch. Empty when the dotfile has no email; that
-// leaves the snapshot unstamped (accepted best-effort by the reader).
-func currentClaudeDotfileAccount() string {
-	home, _ := os.UserHomeDir()
-	email, _ := claudeDotJSONAccount(home)
-	return email
-}
-
 // claudeCodeMetricsFromCache builds the metric rows from the rate-limit cache,
 // falling back to the Unknown placeholders when a window hasn't been observed.
 // Two rows are always shown so the card layout is stable: the 5-hour session
@@ -442,25 +430,11 @@ func currentClaudeDotfileAccount() string {
 // the current account cannot be identified: otherwise `gatherCLIAgentUsage`
 // would attribute a previous user's reset windows to the device-scoped
 // fallback entry after the local credentials were removed.
-//
-// For the UNSCOPED ("") case — the common claude.ai login, where every signed-in
-// email shares the "" scope — the fingerprint match is not enough: after a
-// `/login` account switch the old snapshot still matches "". So we additionally
-// require the snapshot's DotfileAccount stamp to agree with the account now being
-// displayed (currentDotfileAccount). A stamp naming a different account means the
-// buckets belong to the previous login — show Unknown until that account's next
-// capture overwrites them. An empty stamp (stream-capture / legacy) is accepted
-// best-effort. This gate is display-only; it never drops buckets, so it can't
-// reintroduce the cross-session race the dotfile was removed from scoping.
-func claudeCodeMetricsFromCache(now time.Time, currentFingerprint, currentDotfileAccount string) []cliAgentUsageMetric {
+func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentUsageMetric {
 	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
 	buckets := map[string]claudeRateLimitBucket{}
 	if ok && snap.AccountFingerprint == currentFingerprint {
-		staleUnscoped := currentFingerprint == "" &&
-			snap.DotfileAccount != "" && snap.DotfileAccount != currentDotfileAccount
-		if !staleUnscoped {
-			buckets = snap.Buckets
-		}
+		buckets = snap.Buckets
 	}
 
 	session := observedMetricOrUnknown(

@@ -122,9 +122,9 @@ func TestClaudeCodeMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowFiveHour: {UsedPercentage: 23.5, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
 		claudeWindowSevenDay: {UsedPercentage: 90, ResetsAtMs: now.Add(-time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
-	}, now, "", "")
+	}, now, "")
 
-	metrics := claudeCodeMetricsFromCache(now, "", "")
+	metrics := claudeCodeMetricsFromCache(now, "")
 	if len(metrics) != 2 {
 		t.Fatalf("want 2 metrics, got %d", len(metrics))
 	}
@@ -151,7 +151,7 @@ func TestClaudeCodeMetricsFromCache_NoCacheFallsBackToUnknown(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "absent.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
 
-	metrics := claudeCodeMetricsFromCache(time.Now(), "", "")
+	metrics := claudeCodeMetricsFromCache(time.Now(), "")
 	if len(metrics) != 2 {
 		t.Fatalf("want 2 metrics, got %d", len(metrics))
 	}
@@ -235,9 +235,9 @@ func TestClaudeCodeMetricsFromCache_SplitWeeklyAggregatesConservatively(t *testi
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowSevenDaySonnet: {UsedPercentage: 32, ResetsAtMs: sonnetReset, Status: "allowed", usageKnown: true},
 		claudeWindowSevenDayOpus:   {UsedPercentage: 99, ResetsAtMs: opusReset, Status: "allowed", usageKnown: true},
-	}, now, "", "")
+	}, now, "")
 
-	metrics := claudeCodeMetricsFromCache(now, "", "")
+	metrics := claudeCodeMetricsFromCache(now, "")
 	weekly := metrics[1]
 	if weekly.Unknown {
 		t.Fatalf("weekly should be observed")
@@ -260,9 +260,9 @@ func TestClaudeCodeMetricsFromCache_IgnoresOtherAccountSnapshot(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowFiveHour: {UsedPercentage: 80, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
-	}, now, "fp-previous-account", "")
+	}, now, "fp-previous-account")
 
-	metrics := claudeCodeMetricsFromCache(now, "fp-current-account", "")
+	metrics := claudeCodeMetricsFromCache(now, "fp-current-account")
 	for _, m := range metrics {
 		if !m.Unknown {
 			t.Errorf("metric %q must be Unknown when snapshot belongs to another account", m.Kind)
@@ -278,11 +278,11 @@ func TestMergeClaudeRateLimitCache_DropsOtherAccountBuckets(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowSevenDay: {UsedPercentage: 70, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
-	}, now, "fp-A", "")
+	}, now, "fp-A")
 
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowFiveHour: {UsedPercentage: 10, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
-	}, now, "fp-B", "")
+	}, now, "fp-B")
 
 	snap, ok := loadClaudeRateLimitSnapshot(cache)
 	if !ok {
@@ -311,9 +311,9 @@ func TestClaudeCodeMetricsFromCache_IgnoresScopedSnapshotWhenAccountUnknown(t *t
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowFiveHour: {UsedPercentage: 80, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
 		claudeWindowSevenDay: {UsedPercentage: 91, ResetsAtMs: now.Add(48 * time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
-	}, now, "fp-prior-signed-in-account", "")
+	}, now, "fp-prior-signed-in-account")
 
-	metrics := claudeCodeMetricsFromCache(now, "", "")
+	metrics := claudeCodeMetricsFromCache(now, "")
 	for _, m := range metrics {
 		if !m.Unknown {
 			t.Errorf("metric %q must be Unknown when current account is unidentifiable (scoped cache must not leak)", m.Kind)
@@ -331,9 +331,9 @@ func TestClaudeCodeMetricsFromCache_UnscopedSnapshotWithUnknownAccount(t *testin
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowFiveHour: {UsedPercentage: 25, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
-	}, now, "", "")
+	}, now, "")
 
-	metrics := claudeCodeMetricsFromCache(now, "", "")
+	metrics := claudeCodeMetricsFromCache(now, "")
 	if metrics[0].Unknown {
 		t.Errorf("unscoped reader must accept unscoped snapshot, got Unknown")
 	}
@@ -381,11 +381,11 @@ func TestMergeClaudeRateLimitCache_DropsUnscopedBucketsOnAccountSignIn(t *testin
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowSevenDay: {UsedPercentage: 88, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
-	}, now, "", "")
+	}, now, "")
 
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowFiveHour: {UsedPercentage: 5, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
-	}, now, "fp-new-account", "")
+	}, now, "fp-new-account")
 
 	snap, ok := loadClaudeRateLimitSnapshot(cache)
 	if !ok {
@@ -454,7 +454,7 @@ func TestCaptureClaudeRateLimit_AllowedHeartbeatWithoutPriorUsageDoesNotPersist(
 			t.Fatalf("first heartbeat without usage must not persist a zero-usage bucket")
 		}
 	}
-	metrics := claudeCodeMetricsFromCache(now, "", "")
+	metrics := claudeCodeMetricsFromCache(now, "")
 	for _, m := range metrics {
 		if !m.Unknown {
 			t.Errorf("metric %q want Unknown until a usage reading arrives, got Consumed=%v", m.Kind, m.Consumed)
@@ -513,7 +513,7 @@ func TestCaptureClaudeRateLimit_RolledOverHeartbeatDropsStaleUsage(t *testing.T)
 		itoa(later.Add(5*time.Hour).Unix()) + `}}`
 	captureClaudeRateLimitLine(heartbeat, later)
 
-	metrics := claudeCodeMetricsFromCache(later, "", "")
+	metrics := claudeCodeMetricsFromCache(later, "")
 	session := metrics[0]
 	if session.Consumed != nil && *session.Consumed > 0 {
 		t.Errorf("rolled-over window Consumed=%v, want 0 — stale 95%% must not carry under the new reset", *session.Consumed)
@@ -535,9 +535,9 @@ func TestClaudeCodeMetricsFromCache_WeeklyResetTracksWorstBucket(t *testing.T) {
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowSevenDaySonnet: {UsedPercentage: 10, ResetsAtMs: sonnetReset, Status: "allowed", usageKnown: true},
 		claudeWindowSevenDayOpus:   {UsedPercentage: 99, ResetsAtMs: opusReset, Status: "allowed", usageKnown: true},
-	}, now, "", "")
+	}, now, "")
 
-	metrics := claudeCodeMetricsFromCache(now, "", "")
+	metrics := claudeCodeMetricsFromCache(now, "")
 	weekly := metrics[1]
 	if weekly.Consumed == nil || *weekly.Consumed != 99 {
 		t.Fatalf("weekly Consumed=%v, want 99", weekly.Consumed)
@@ -563,9 +563,9 @@ func TestClaudeCodeMetricsFromCache_WeeklyTieBreaksOnLaterReset(t *testing.T) {
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowSevenDaySonnet: {UsedPercentage: 100, ResetsAtMs: sonnetReset, Status: "rejected", usageKnown: true},
 		claudeWindowSevenDayOpus:   {UsedPercentage: 100, ResetsAtMs: opusReset, Status: "rejected", usageKnown: true},
-	}, now, "", "")
+	}, now, "")
 
-	metrics := claudeCodeMetricsFromCache(now, "", "")
+	metrics := claudeCodeMetricsFromCache(now, "")
 	weekly := metrics[1]
 	if weekly.Consumed == nil || *weekly.Consumed != 100 {
 		t.Fatalf("weekly Consumed=%v, want 100", weekly.Consumed)
@@ -573,77 +573,6 @@ func TestClaudeCodeMetricsFromCache_WeeklyTieBreaksOnLaterReset(t *testing.T) {
 	wantReset := time.UnixMilli(opusReset).UTC().Format(time.RFC3339)
 	if weekly.ResetAt != wantReset {
 		t.Errorf("weekly ResetAt=%q, want %q (later of two tied buckets)", weekly.ResetAt, wantReset)
-	}
-}
-
-// A write that can't identify the capturing account (empty stamp) must CLEAR any
-// prior DotfileAccount stamp — the buckets were just replaced, so a leftover
-// stamp would misattribute the fresh capture to the old account (hiding it for
-// the real one, or later showing it under the stale account after a switch-back).
-func TestMergeClaudeRateLimitCache_EmptyStampClearsPriorStamp(t *testing.T) {
-	cache := filepath.Join(t.TempDir(), "rl.json")
-	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
-	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
-	reset := now.Add(time.Hour).UnixMilli()
-
-	// Account A stamps the unscoped snapshot.
-	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowFiveHour: {UsedPercentage: 40, ResetsAtMs: reset, usageKnown: true},
-	}, now, "", "alice@example.com")
-	if snap, _ := loadClaudeRateLimitSnapshot(cache); snap.DotfileAccount != "alice@example.com" {
-		t.Fatalf("setup: DotfileAccount=%q, want alice@example.com", snap.DotfileAccount)
-	}
-
-	// An unstamped write replaces the reading — the stale stamp must be cleared.
-	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowFiveHour: {UsedPercentage: 12, ResetsAtMs: reset, usageKnown: true},
-	}, now, "", "")
-	snap, ok := loadClaudeRateLimitSnapshot(cache)
-	if !ok || snap.DotfileAccount != "" {
-		t.Errorf("DotfileAccount=%q, want empty (unstamped write must clear the stale stamp)", snap.DotfileAccount)
-	}
-}
-
-// After a same-user /login switch, a PARTIAL capture by the new account (e.g. a
-// stream-capture carrying only five_hour) must not leave the previous account's
-// other windows to be trusted under the new card. Because both claude.ai logins
-// share the "" fingerprint, the dotfile-account change is the only signal — so
-// the merge drops the prior account's buckets before applying the partial update.
-func TestMergeClaudeRateLimitCache_DotfileSwitchDropsStalePartialWindows(t *testing.T) {
-	cache := filepath.Join(t.TempDir(), "rl.json")
-	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
-	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
-	reset := now.Add(time.Hour).UnixMilli()
-
-	// Alice captured BOTH windows.
-	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowFiveHour: {UsedPercentage: 40, ResetsAtMs: reset, usageKnown: true},
-		claudeWindowSevenDay: {UsedPercentage: 70, ResetsAtMs: reset, usageKnown: true},
-	}, now, "", "alice@example.com")
-
-	// Bob (after the switch) captures ONLY five_hour.
-	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowFiveHour: {UsedPercentage: 10, ResetsAtMs: reset, usageKnown: true},
-	}, now, "", "bob@example.com")
-
-	snap, ok := loadClaudeRateLimitSnapshot(cache)
-	if !ok {
-		t.Fatalf("expected cache")
-	}
-	if _, present := snap.Buckets[claudeWindowSevenDay]; present {
-		t.Errorf("Alice's seven_day must be dropped on the account switch, snapshot=%+v", snap.Buckets)
-	}
-	if b := snap.Buckets[claudeWindowFiveHour]; b.UsedPercentage != 10 {
-		t.Errorf("five_hour=%v, want Bob's 10", b.UsedPercentage)
-	}
-
-	// Read as Bob: five_hour observed, seven_day Unknown (not Alice's 70).
-	metrics := claudeCodeMetricsFromCache(now, "", "bob@example.com")
-	if metrics[0].Unknown || metrics[0].Consumed == nil || *metrics[0].Consumed != 10 {
-		t.Errorf("five_hour metric=%+v, want observed 10%%", metrics[0])
-	}
-	if !metrics[1].Unknown {
-		t.Errorf("weekly metric=%+v, want Unknown (Alice's window dropped)", metrics[1])
 	}
 }
 

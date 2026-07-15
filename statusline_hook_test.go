@@ -39,7 +39,7 @@ func TestCaptureClaudeRateLimitsFromStatusline_BothWindows(t *testing.T) {
 
 	// The 5-hour window now populates from the status line even though no
 	// rate_limit_event ever carried it — the whole point of the side channel.
-	metrics := claudeCodeMetricsFromCache(now, "", "")
+	metrics := claudeCodeMetricsFromCache(now, "")
 	if metrics[0].Unknown {
 		t.Errorf("5-hour session window should be observed from the status line")
 	}

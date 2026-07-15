@@ -76,12 +76,7 @@ func captureClaudeRateLimitsFromStatusline(raw []byte, now time.Time) {
 	if claudeEnvAuthActive() {
 		return
 	}
-	// Stamp the capturing dotfile account so a later render under a different
-	// /login (which keeps the same "" fingerprint for a claude.ai session) can't
-	// have this account's windows shown on the new email's card.
-	mergeClaudeRateLimitCache(
-		claudeRateLimitCachePath(), updates, now,
-		currentClaudeAccountFingerprint(), currentClaudeDotfileAccount())
+	mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint())
 }
 
 // renderStatusLine forwards to the user's previous status-line command when we
