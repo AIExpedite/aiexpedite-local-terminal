@@ -222,14 +222,21 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 		}
 	}
 
-	// The credential account (from .credentials.json) is a unique identity, so
-	// it's safe to fingerprint directly.
-	identity := usage.Account
+	// The account from .credentials.json is a stable, per-config-dir identity.
+	// Keep it as the account used to SCOPE the on-disk rate-limit cache below.
+	credsAccount := usage.Account
+
+	// dedupIdentity is the unique account used for the Firestore cross-device
+	// dedup fingerprint on this snapshot. It may come from the shared
+	// ~/.claude.json (see below); that is safe here because this snapshot is
+	// rebuilt on every daemon gather and self-corrects, and it only affects
+	// frontend grouping — never the live per-render cache.
+	dedupIdentity := credsAccount
 
 	// .credentials.json carries only the OAuth token object, so the account
 	// above is almost always empty. The signed-in email lives in ~/.claude.json's
 	// oauthAccount block — fall back to it so the card shows `Account: …` like
-	// Codex does.
+	// Codex does, and so the same account dedups across devices.
 	//
 	// No env-auth guard here: this runs in the local-terminal DAEMON, whose
 	// environment reflects the shell it was launched from, NOT the Claude
@@ -237,9 +244,7 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 	// ANTHROPIC_AUTH_TOKEN (session.go's claudeBillingStripped) to force
 	// subscription billing. So the stored /login oauthAccount IS the account that
 	// produces the driver's rate-limit events; a stray API key in the daemon's
-	// own shell must not blank the account line. The env-auth signal is only
-	// meaningful where the process IS the Claude session — the status-line hook,
-	// which applies it at its own capture site.
+	// own shell must not blank the account line.
 	if usage.Account == "" {
 		email, displayName := claudeDotJSONAccount(home)
 		// Show the email when we have it, else the display name — a friendly
@@ -249,11 +254,19 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 		// unique (two users named "Grace", or a rename) and would collapse
 		// distinct accounts' quotas into one — so when only a name is available
 		// the identity stays empty and gatherCLIAgentUsage device-scopes it.
-		identity = email
+		dedupIdentity = email
 	}
-	usage.AccountFingerprint = fingerprintAccount(p.Provider(), identity)
+	usage.AccountFingerprint = fingerprintAccount(p.Provider(), dedupIdentity)
 
-	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)
+	// Read the rate-limit cache scoped ONLY by the stable credential account —
+	// never by the ~/.claude.json email. The cache writers (status-line hook /
+	// stream-capture) scope by the same creds-only fingerprint
+	// (currentClaudeAccountFingerprint), because ~/.claude.json is shared and
+	// mutable: a concurrent `/login` in another interactive session rewrites it,
+	// which would misattribute a live capture to the wrong account. For the
+	// common claude.ai login (no account in the credential) both sides are
+	// unscoped (""), which matches and is the pre-existing behavior.
+	usage.Metrics = claudeCodeMetricsFromCache(now, fingerprintAccount(p.Provider(), credsAccount))
 
 	return usage, true
 }
@@ -379,11 +392,23 @@ func claudeApiKeyApproved(home, key string) bool {
 	return false
 }
 
-// currentClaudeAccountFingerprint reads the Claude credentials on disk and
-// returns the same fingerprint Parse would attach to a usage snapshot. Used by
-// the capture path to scope the rate-limit cache to the active account.
-// Returns "" when no creds are readable, in which case the cache is unscoped
-// (best-effort, matches pre-scoping behavior).
+// currentClaudeAccountFingerprint returns the fingerprint used to SCOPE the
+// on-disk rate-limit cache to the account that produced a capture. It reads ONLY
+// the stable, per-config-dir credential (email/account/organization) — never the
+// shared ~/.claude.json oauthAccount.
+//
+// Why not fall back to ~/.claude.json here (unlike Parse's display/dedup path):
+// this feeds the LIVE writers — the status-line hook (called on every render)
+// and the stream-capture — and ~/.claude.json is a single shared file that any
+// interactive session rewrites on `/login`. Scoping a live capture by it would
+// let a concurrent `/login` in a second session misattribute the first session's
+// rate limits to the newly written account, and mergeClaudeRateLimitCache drops
+// the prior account's buckets on that fingerprint flip. The credential is stable
+// per config dir and can't be swapped out mid-render.
+//
+// Returns "" when the credential carries no account — the common claude.ai
+// login. The cache is then unscoped, matching the behavior before this feature;
+// Parse reads it with the same "" so the windows still display.
 func currentClaudeAccountFingerprint() string {
 	home, _ := os.UserHomeDir()
 	base := claudeConfigDir(home)
@@ -396,22 +421,6 @@ func currentClaudeAccountFingerprint() string {
 		if json.Unmarshal(raw, &creds) == nil {
 			account = firstNonEmpty(creds.Email, creds.Account, creds.Organization)
 		}
-	}
-	// Mirror Parse's fallback: the email almost always comes from ~/.claude.json,
-	// not .credentials.json. Without this, the captured snapshot would be
-	// fingerprinted "" while Parse fingerprints the email — the two would never
-	// match and claudeCodeMetricsFromCache would discard the cached windows. Use
-	// the email ONLY (never the non-unique display name), exactly as Parse does,
-	// so the two stay in lockstep.
-	//
-	// No env-auth guard here either: this feeds the stream-capture path
-	// (captureClaudeRateLimitLine), which only ever parses driver-launched
-	// sessions — and those strip the env credentials, so their usage genuinely
-	// belongs to the stored oauthAccount. The env-auth exception is applied only
-	// by the status-line hook, whose process env really is the session's.
-	if account == "" {
-		email, _ := claudeDotJSONAccount(home)
-		account = email
 	}
 	return fingerprintAccount("claudeCode", account)
 }

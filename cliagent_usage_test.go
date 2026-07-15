@@ -213,6 +213,52 @@ func TestClaudeCodeUsageParser_DaemonEnvKeyDoesNotSuppressStoredAccount(t *testi
 	}
 }
 
+// Parse reads the rate-limit cache scoped by the CREDENTIAL account only — never
+// the ~/.claude.json email. A claude.ai login (no credential account) reads the
+// UNSCOPED ("") cache the status-line hook wrote, so those windows still display,
+// even though the card's dedup fingerprint uses the dotfile email. This is the
+// decoupling that keeps a concurrent /login (which rewrites the shared dotfile)
+// from misattributing a live capture.
+func TestClaudeCodeUsageParser_CacheScopedByCredentialNotDotJSON(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	home := t.TempDir()
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+
+	// claude.ai login: email only in ~/.claude.json, no account in the credential.
+	helperWriteJSON(t, filepath.Join(home, ".claude.json"), map[string]any{
+		"oauthAccount": map[string]any{"emailAddress": "grace@example.com"},
+	})
+
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	// Seed the cache UNSCOPED (""), exactly as the status-line hook does for a
+	// claude.ai login whose credential carries no account.
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now, "")
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+
+	// Dedup/display fingerprint still comes from the dotfile email.
+	if usage.AccountFingerprint != fingerprintAccount("claudeCode", "grace@example.com") {
+		t.Errorf("AccountFingerprint=%q, want the dotfile-email fingerprint", usage.AccountFingerprint)
+	}
+	// But the cache read used the creds-only "" scope, so the seeded window shows.
+	if len(usage.Metrics) == 0 || usage.Metrics[0].Unknown {
+		t.Errorf("5-hour metric should be observed from the unscoped cache, got %+v", usage.Metrics)
+	}
+}
+
 func helperWriteClaudeOAuth(t *testing.T, home string, extra map[string]any) {
 	t.Helper()
 	oauth := map[string]any{}
