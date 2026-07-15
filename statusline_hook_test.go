@@ -48,14 +48,16 @@ func TestCaptureClaudeRateLimitsFromStatusline_BothWindows(t *testing.T) {
 // The status-line hook scopes each capture to the account that produced it by
 // the STABLE credential (.credentials.json), never the shared, mutable
 // ~/.claude.json — so a concurrent /login can't misattribute a live capture.
-// On top of that, the capture is written UNSCOPED ("") whenever an env
-// credential actually WINS Claude's auth precedence, so its usage never merges
-// into the credential account's card:
-//   - credential account, no env credential   -> scoped to that account
-//   - ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN / cloud provider -> unscoped
-//   - ANTHROPIC_API_KEY, approved              -> unscoped
-//   - ANTHROPIC_API_KEY, declined/unapproved   -> scoped (subscription still active)
-//   - identity only in ~/.claude.json          -> unscoped (dotfile must not scope)
+// And whenever an env credential actually WINS Claude's auth precedence, the
+// capture is SKIPPED entirely: those rate_limits belong to the env account, and
+// writing them (even "unscoped") would let the stored login — which is also ""
+// for a claude.ai login — read them back as its own. There is no env-account
+// card, so we simply don't record them.
+//   - credential account, no env credential   -> written, scoped to that account
+//   - identity only in ~/.claude.json          -> written unscoped (dotfile must not scope)
+//   - ANTHROPIC_AUTH_TOKEN / CLAUDE_CODE_OAUTH_TOKEN / cloud provider -> skipped
+//   - ANTHROPIC_API_KEY, approved              -> skipped
+//   - ANTHROPIC_API_KEY, declined/unapproved   -> written, scoped (subscription active)
 func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testing.T) {
 	const apiKey = "sk-ant-api03-EXAMPLEKEYSUFFIX20xx" // > 20 chars, exercises truncation
 	keySuffix := apiKey[len(apiKey)-20:]
@@ -83,15 +85,17 @@ func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testi
 		})
 	}
 
-	capture := func(t *testing.T) string {
+	// capture runs the hook and reports whether a snapshot was written and, if so,
+	// the fingerprint it was scoped to.
+	capture := func(t *testing.T) (fingerprint string, wrote bool) {
 		cache := filepath.Join(t.TempDir(), "rl.json")
 		t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
 		captureClaudeRateLimitsFromStatusline([]byte(payload), now)
 		snap, ok := loadClaudeRateLimitSnapshot(cache)
 		if !ok {
-			t.Fatalf("expected cache write")
+			return "", false
 		}
-		return snap.AccountFingerprint
+		return snap.AccountFingerprint, true
 	}
 
 	// clearEnvAuth zeroes every env credential the guard consults so each subtest
@@ -105,17 +109,17 @@ func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testi
 		}
 	}
 
-	t.Run("credential account, no env -> scoped", func(t *testing.T) {
+	t.Run("credential account, no env -> written & scoped", func(t *testing.T) {
 		configDir := t.TempDir()
 		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
 		clearEnvAuth(t)
 		writeCreds(t, configDir, credsAccount)
-		if got := capture(t); got != accountFP {
-			t.Errorf("AccountFingerprint=%q, want %q (scoped to credential account)", got, accountFP)
+		if got, wrote := capture(t); !wrote || got != accountFP {
+			t.Errorf("(fp=%q, wrote=%v), want (%q, true)", got, wrote, accountFP)
 		}
 	})
 
-	t.Run("dotfile-only identity does NOT scope the live capture", func(t *testing.T) {
+	t.Run("dotfile-only identity written unscoped, never by the dotfile", func(t *testing.T) {
 		configDir := t.TempDir()
 		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
 		clearEnvAuth(t)
@@ -125,55 +129,39 @@ func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testi
 		helperWriteJSON(t, filepath.Join(configDir, ".claude.json"), map[string]any{
 			"oauthAccount": map[string]any{"emailAddress": "grace@example.com"},
 		})
-		if got := capture(t); got != "" {
-			t.Errorf("AccountFingerprint=%q, want empty (dotfile must not scope a live capture)", got)
+		if got, wrote := capture(t); !wrote || got != "" {
+			t.Errorf("(fp=%q, wrote=%v), want (\"\", true) — dotfile must not scope a live capture", got, wrote)
 		}
 	})
 
-	t.Run("auth-token always unscopes", func(t *testing.T) {
-		configDir := t.TempDir()
-		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
-		clearEnvAuth(t)
-		t.Setenv("ANTHROPIC_AUTH_TOKEN", "bearer-xyz")
-		writeCreds(t, configDir, credsAccount)
-		if got := capture(t); got != "" {
-			t.Errorf("AccountFingerprint=%q, want empty (auth token is active)", got)
-		}
-	})
-
-	t.Run("oauth token unscopes", func(t *testing.T) {
-		configDir := t.TempDir()
-		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
-		clearEnvAuth(t)
-		t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-xyz")
-		writeCreds(t, configDir, credsAccount)
-		if got := capture(t); got != "" {
-			t.Errorf("AccountFingerprint=%q, want empty (oauth token may be a different account)", got)
-		}
-	})
-
-	t.Run("cloud provider unscopes", func(t *testing.T) {
-		configDir := t.TempDir()
-		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
-		clearEnvAuth(t)
-		t.Setenv("CLAUDE_CODE_USE_VERTEX", "1")
-		writeCreds(t, configDir, credsAccount)
-		if got := capture(t); got != "" {
-			t.Errorf("AccountFingerprint=%q, want empty (cloud provider routes off the subscription)", got)
-		}
-	})
-
-	t.Run("approved api key unscopes", func(t *testing.T) {
-		configDir := t.TempDir()
-		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
-		clearEnvAuth(t)
-		t.Setenv("ANTHROPIC_API_KEY", apiKey)
-		writeCreds(t, configDir, credsAccount)
-		writeApproval(t, configDir, []string{keySuffix})
-		if got := capture(t); got != "" {
-			t.Errorf("AccountFingerprint=%q, want empty (approved api key is active)", got)
-		}
-	})
+	// Every env credential that outranks the stored /login must SKIP the write, so
+	// its usage never lands in the stored login's (possibly "") bucket.
+	for _, tc := range []struct {
+		name   string
+		set    map[string]string
+		approv []string
+	}{
+		{name: "auth-token", set: map[string]string{"ANTHROPIC_AUTH_TOKEN": "bearer-xyz"}},
+		{name: "oauth-token", set: map[string]string{"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-xyz"}},
+		{name: "cloud-provider", set: map[string]string{"CLAUDE_CODE_USE_VERTEX": "1"}},
+		{name: "approved-api-key", set: map[string]string{"ANTHROPIC_API_KEY": apiKey}, approv: []string{keySuffix}},
+	} {
+		t.Run(tc.name+" skips the write", func(t *testing.T) {
+			configDir := t.TempDir()
+			t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+			clearEnvAuth(t)
+			for k, v := range tc.set {
+				t.Setenv(k, v)
+			}
+			writeCreds(t, configDir, credsAccount)
+			if tc.approv != nil {
+				writeApproval(t, configDir, tc.approv)
+			}
+			if got, wrote := capture(t); wrote {
+				t.Errorf("(fp=%q, wrote=true), want no write (env credential is active)", got)
+			}
+		})
+	}
 
 	t.Run("declined api key stays scoped", func(t *testing.T) {
 		configDir := t.TempDir()
@@ -182,8 +170,8 @@ func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testi
 		t.Setenv("ANTHROPIC_API_KEY", apiKey)
 		writeCreds(t, configDir, credsAccount)
 		writeApproval(t, configDir, []string{}) // present but not approved
-		if got := capture(t); got != accountFP {
-			t.Errorf("AccountFingerprint=%q, want %q (declined key -> subscription active)", got, accountFP)
+		if got, wrote := capture(t); !wrote || got != accountFP {
+			t.Errorf("(fp=%q, wrote=%v), want (%q, true) — declined key, subscription active", got, wrote, accountFP)
 		}
 	})
 }
