@@ -213,15 +213,29 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 		}
 	}
 
+	// The credential account (from .credentials.json) is a unique identity, so
+	// it's safe to fingerprint directly.
+	identity := usage.Account
+
 	// .credentials.json carries only the OAuth token object, so the account
-	// email above is almost always empty. The signed-in email lives in
-	// ~/.claude.json's oauthAccount block — fall back to it so the card shows
-	// `Account: …` like Codex does. Also feeds accountFingerprint below, which
-	// scopes the rate-limit cache and dedups the same account across devices.
-	if usage.Account == "" {
-		usage.Account = claudeAccountFromDotJSON(home)
+	// above is almost always empty. The signed-in email lives in ~/.claude.json's
+	// oauthAccount block — fall back to it so the card shows `Account: …` like
+	// Codex does. Skipped under env-auth: an ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN
+	// in the environment overrides the stored /login (CLI_AGENT_INTEGRATION.md), so
+	// the active credential is NOT this oauthAccount and its usage must not be
+	// merged into that subscription — leave it unknown/device-scoped instead.
+	if usage.Account == "" && !claudeEnvAuthActive() {
+		email, displayName := claudeDotJSONAccount(home)
+		// Show the email when we have it, else the display name — a friendly
+		// label is better than a blank card.
+		usage.Account = firstNonEmpty(email, displayName)
+		// But fingerprint ONLY from the unique email. A display name is not
+		// unique (two users named "Grace", or a rename) and would collapse
+		// distinct accounts' quotas into one — so when only a name is available
+		// the identity stays empty and gatherCLIAgentUsage device-scopes it.
+		identity = email
 	}
-	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
+	usage.AccountFingerprint = fingerprintAccount(p.Provider(), identity)
 
 	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)
 
@@ -245,23 +259,36 @@ func claudeDotJSONPath(home string) string {
 	return expandHome(home, ".claude.json")
 }
 
-// claudeAccountFromDotJSON returns the signed-in account identity from
-// ~/.claude.json's oauthAccount block (email preferred, display name as a
-// last resort), or "" when the file is absent/unparseable or the block is
-// unhydrated. Shared by Parse (card display + fingerprint) and the capture
-// path (currentClaudeAccountFingerprint) so both derive the SAME account —
-// a mismatch would scope the rate-limit cache to a different fingerprint and
-// silently drop the real utilization metrics.
-func claudeAccountFromDotJSON(home string) string {
+// claudeDotJSONAccount returns (email, displayName) from ~/.claude.json's
+// oauthAccount block, or ("","") when the file is absent/unparseable or the
+// block is unhydrated. The email is a stable UNIQUE identity suitable for
+// fingerprinting; the display name is NOT unique and must only be used as a
+// human-facing label, never as the account fingerprint. Shared by Parse (card
+// display + fingerprint) and the capture path (currentClaudeAccountFingerprint)
+// so both derive the SAME identity — a mismatch would scope the rate-limit
+// cache to a different fingerprint and silently drop the real utilization
+// metrics.
+func claudeDotJSONAccount(home string) (email, displayName string) {
 	path := claudeDotJSONPath(home)
 	if path == "" {
-		return ""
+		return "", ""
 	}
 	cfg := claudeDotJSON{}
 	if !readJSONFile(path, &cfg) {
-		return ""
+		return "", ""
 	}
-	return firstNonEmpty(cfg.OAuthAccount.EmailAddress, cfg.OAuthAccount.DisplayName)
+	return cfg.OAuthAccount.EmailAddress, cfg.OAuthAccount.DisplayName
+}
+
+// claudeEnvAuthActive reports whether an env-based Anthropic credential is
+// present in this process's environment. Anthropic SDK precedence puts these
+// ahead of the stored /login (CLI_AGENT_INTEGRATION.md → claudeBillingStripped),
+// so when set the active account is NOT the ~/.claude.json oauthAccount. The
+// oauthAccount fallback is skipped in that case so env/API-key usage is never
+// merged into the stored subscription account. Mirrors the strip list in
+// session.go's claudeBillingStripped.
+func claudeEnvAuthActive() bool {
+	return os.Getenv("ANTHROPIC_API_KEY") != "" || os.Getenv("ANTHROPIC_AUTH_TOKEN") != ""
 }
 
 // currentClaudeAccountFingerprint reads the Claude credentials on disk and
@@ -285,9 +312,12 @@ func currentClaudeAccountFingerprint() string {
 	// Mirror Parse's fallback: the email almost always comes from ~/.claude.json,
 	// not .credentials.json. Without this, the captured snapshot would be
 	// fingerprinted "" while Parse fingerprints the email — the two would never
-	// match and claudeCodeMetricsFromCache would discard the cached windows.
-	if account == "" {
-		account = claudeAccountFromDotJSON(home)
+	// match and claudeCodeMetricsFromCache would discard the cached windows. Use
+	// the email ONLY (never the non-unique display name), and skip it under
+	// env-auth, exactly as Parse does — so the two stay in lockstep.
+	if account == "" && !claudeEnvAuthActive() {
+		email, _ := claudeDotJSONAccount(home)
+		account = email
 	}
 	return fingerprintAccount("claudeCode", account)
 }

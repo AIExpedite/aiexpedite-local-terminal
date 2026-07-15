@@ -82,6 +82,10 @@ func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
 func TestClaudeCodeUsageParser_AccountFromDotJSON(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	// Env-auth would suppress the oauthAccount fallback; clear it so this asserts
+	// the subscription-login path deterministically on a dev box.
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
 	home := t.TempDir()
 
 	// macOS default-config-dir reads the shared Keychain first; stub it off so
@@ -148,11 +152,16 @@ func TestClaudeCodeUsageParser_CredentialsAccountWinsOverDotJSON(t *testing.T) {
 	}
 }
 
-// displayName is used only when emailAddress is absent (e.g. an SSO profile that
-// hydrated a name but not an email).
-func TestClaudeCodeUsageParser_DotJSONDisplayNameFallback(t *testing.T) {
+// displayName is shown as a friendly label when emailAddress is absent (e.g. an
+// SSO profile that hydrated a name but not an email) — but it is NOT unique, so
+// it must never become the account fingerprint (that would collapse two users
+// named "Grace" into one quota). The identity, and therefore the fingerprint,
+// stays empty; gatherCLIAgentUsage then device-scopes it.
+func TestClaudeCodeUsageParser_DotJSONDisplayNameNotFingerprinted(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
 	home := t.TempDir()
 
 	orig := claudeKeychainReader
@@ -166,7 +175,38 @@ func TestClaudeCodeUsageParser_DotJSONDisplayNameFallback(t *testing.T) {
 	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
 	if usage.Account != "Grace" {
-		t.Errorf("Account=%q, want Grace (displayName fallback)", usage.Account)
+		t.Errorf("Account=%q, want Grace (displayName shown as label)", usage.Account)
+	}
+	if usage.AccountFingerprint != "" {
+		t.Errorf("AccountFingerprint=%q, want empty (a display name must not be fingerprinted)", usage.AccountFingerprint)
+	}
+}
+
+// Under env-auth (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN present) the active
+// credential is a different account than the stored /login, so the oauthAccount
+// email in ~/.claude.json must NOT be attributed — the card stays account-less
+// and the fingerprint stays empty (device-scoped by gatherCLIAgentUsage).
+func TestClaudeCodeUsageParser_EnvAuthSuppressesDotJSONAccount(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+	home := t.TempDir()
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+
+	helperWriteJSON(t, filepath.Join(home, ".claude.json"), map[string]any{
+		"oauthAccount": map[string]any{"emailAddress": "grace@example.com"},
+	})
+
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Account != "" {
+		t.Errorf("Account=%q, want empty (env-auth must not attribute the oauthAccount)", usage.Account)
+	}
+	if usage.AccountFingerprint != "" {
+		t.Errorf("AccountFingerprint=%q, want empty under env-auth", usage.AccountFingerprint)
 	}
 }
 
