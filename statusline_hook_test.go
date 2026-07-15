@@ -46,51 +46,84 @@ func TestCaptureClaudeRateLimitsFromStatusline_BothWindows(t *testing.T) {
 }
 
 // The status-line hook runs as a child of the Claude session, so its env IS the
-// session's. When that session is authenticated with an env credential, the
-// captured rate_limits belong to the env account, not the stored oauthAccount —
-// so the snapshot must be written UNSCOPED (fingerprint "") to keep it off the
-// subscription card. With no env credential the same capture scopes to the
-// stored account, proving the env-auth guard is what makes the difference.
-func TestCaptureClaudeRateLimitsFromStatusline_EnvAuthUnscopesAccount(t *testing.T) {
-	configDir := t.TempDir()
-	t.Setenv("CLAUDE_CONFIG_DIR", configDir) // .claude.json + fingerprint resolve here
-	helperWriteJSON(t, filepath.Join(configDir, ".claude.json"), map[string]any{
-		"oauthAccount": map[string]any{"emailAddress": "grace@example.com"},
-	})
+// session's. Whether the capture is scoped to the stored oauthAccount or written
+// UNSCOPED ("") turns on which credential actually WINS Claude's auth precedence
+// — not merely whether an env var is present:
+//   - ANTHROPIC_AUTH_TOKEN always wins        -> unscoped
+//   - ANTHROPIC_API_KEY, approved in config   -> unscoped
+//   - ANTHROPIC_API_KEY, declined/unapproved  -> scoped (subscription still active)
+//   - no env credential                       -> scoped
+func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testing.T) {
+	const apiKey = "sk-ant-api03-EXAMPLEKEYSUFFIX20xx" // > 20 chars, exercises truncation
+	keySuffix := apiKey[len(apiKey)-20:]
 	accountFP := fingerprintAccount("claudeCode", "grace@example.com")
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	payload := `{"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":` +
 		strconv.FormatInt(now.Add(time.Hour).Unix(), 10) + `}}}`
 
-	// With an env credential present, the capture is unscoped.
-	t.Run("env-auth -> unscoped", func(t *testing.T) {
+	// writeConfig writes a .claude.json with the oauthAccount email plus an
+	// optional list of approved API-key suffixes.
+	writeConfig := func(t *testing.T, dir string, approved []string) {
+		cfg := map[string]any{"oauthAccount": map[string]any{"emailAddress": "grace@example.com"}}
+		if approved != nil {
+			cfg["customApiKeyResponses"] = map[string]any{"approved": approved}
+		}
+		helperWriteJSON(t, filepath.Join(dir, ".claude.json"), cfg)
+	}
+
+	capture := func(t *testing.T) string {
 		cache := filepath.Join(t.TempDir(), "rl.json")
 		t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
-		t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
 		captureClaudeRateLimitsFromStatusline([]byte(payload), now)
 		snap, ok := loadClaudeRateLimitSnapshot(cache)
 		if !ok {
 			t.Fatalf("expected cache write")
 		}
-		if snap.AccountFingerprint != "" {
-			t.Errorf("AccountFingerprint=%q, want empty under env-auth", snap.AccountFingerprint)
+		return snap.AccountFingerprint
+	}
+
+	t.Run("auth-token always unscopes", func(t *testing.T) {
+		configDir := t.TempDir()
+		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+		t.Setenv("ANTHROPIC_API_KEY", "")
+		t.Setenv("ANTHROPIC_AUTH_TOKEN", "bearer-xyz")
+		writeConfig(t, configDir, nil)
+		if got := capture(t); got != "" {
+			t.Errorf("AccountFingerprint=%q, want empty (auth token is active)", got)
 		}
 	})
 
-	// Without one, the same capture scopes to the stored oauthAccount.
-	t.Run("subscription -> scoped", func(t *testing.T) {
-		cache := filepath.Join(t.TempDir(), "rl.json")
-		t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Run("approved api key unscopes", func(t *testing.T) {
+		configDir := t.TempDir()
+		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+		t.Setenv("ANTHROPIC_API_KEY", apiKey)
+		writeConfig(t, configDir, []string{keySuffix})
+		if got := capture(t); got != "" {
+			t.Errorf("AccountFingerprint=%q, want empty (approved api key is active)", got)
+		}
+	})
+
+	t.Run("declined api key stays scoped", func(t *testing.T) {
+		configDir := t.TempDir()
+		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+		t.Setenv("ANTHROPIC_API_KEY", apiKey)
+		writeConfig(t, configDir, []string{}) // present but not approved
+		if got := capture(t); got != accountFP {
+			t.Errorf("AccountFingerprint=%q, want %q (declined key -> subscription active)", got, accountFP)
+		}
+	})
+
+	t.Run("no env credential stays scoped", func(t *testing.T) {
+		configDir := t.TempDir()
+		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
 		t.Setenv("ANTHROPIC_API_KEY", "")
 		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
-		captureClaudeRateLimitsFromStatusline([]byte(payload), now)
-		snap, ok := loadClaudeRateLimitSnapshot(cache)
-		if !ok {
-			t.Fatalf("expected cache write")
-		}
-		if snap.AccountFingerprint != accountFP {
-			t.Errorf("AccountFingerprint=%q, want %q (stored account)", snap.AccountFingerprint, accountFP)
+		writeConfig(t, configDir, nil)
+		if got := capture(t); got != accountFP {
+			t.Errorf("AccountFingerprint=%q, want %q (subscription active)", got, accountFP)
 		}
 	})
 }

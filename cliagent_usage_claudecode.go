@@ -56,6 +56,15 @@ type claudeDotJSON struct {
 		EmailAddress string `json:"emailAddress"`
 		DisplayName  string `json:"displayName"`
 	} `json:"oauthAccount"`
+	// customApiKeyResponses records the user's one-time approve/decline decision
+	// for an ANTHROPIC_API_KEY seen in the environment. Each entry is the LAST 20
+	// CHARACTERS of the key (Claude Code never stores the full secret). A key that
+	// is present in the env but NOT in `approved` is not the active credential —
+	// Claude keeps using the stored /login — so its rate_limits still belong to
+	// the oauthAccount.
+	CustomApiKeyResponses struct {
+		Approved []string `json:"approved"`
+	} `json:"customApiKeyResponses"`
 }
 
 // claudeOAuthCredentials mirrors the nested `claudeAiOauth` object Claude Code
@@ -287,10 +296,10 @@ func claudeDotJSONAccount(home string) (email, displayName string) {
 	return cfg.OAuthAccount.EmailAddress, cfg.OAuthAccount.DisplayName
 }
 
-// claudeEnvAuthActive reports whether an env-based Anthropic credential is
-// present in this process's environment. Anthropic SDK precedence puts these
-// ahead of the stored /login (CLI_AGENT_INTEGRATION.md → claudeBillingStripped),
-// so when set the active account is NOT the ~/.claude.json oauthAccount.
+// claudeEnvAuthActive reports whether the ACTIVE credential for this Claude
+// session is an env credential rather than the stored /login — i.e. whether the
+// captured rate_limits belong to a different account than the ~/.claude.json
+// oauthAccount and must therefore NOT be scoped to it.
 //
 // This is only meaningful where the current process IS the Claude session — the
 // status-line hook, which Claude Code spawns as a child of the session and which
@@ -299,10 +308,55 @@ func claudeDotJSONAccount(home string) (email, displayName string) {
 // NOT consult this: the daemon's env reflects the shell it was launched from,
 // not the driver-launched sessions it parses, and those sessions strip these
 // vars — so treating a stray daemon-shell key as "this account is env-auth"
-// would wrongly blank the stored subscription account. Mirrors the strip list in
-// session.go's claudeBillingStripped.
+// would wrongly blank the stored subscription account.
+//
+// Presence of the env var is NOT sufficient — it must actually WIN Claude's
+// authentication precedence (https://code.claude.com/docs/en/authentication):
+//   - ANTHROPIC_AUTH_TOKEN (precedence #2) always wins when set — no approval.
+//   - ANTHROPIC_API_KEY (precedence #3) wins only ONCE APPROVED. In interactive
+//     mode (the only mode that renders a status line) the user is prompted once
+//     to approve/decline and the choice is remembered in .claude.json's
+//     customApiKeyResponses. A present-but-declined (or not-yet-approved) key is
+//     ignored and Claude keeps billing the subscription — so those rate_limits
+//     DO belong to the oauthAccount and must stay scoped to it.
 func claudeEnvAuthActive() bool {
-	return os.Getenv("ANTHROPIC_API_KEY") != "" || os.Getenv("ANTHROPIC_AUTH_TOKEN") != ""
+	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != "" {
+		return true
+	}
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		return false
+	}
+	home, _ := os.UserHomeDir()
+	return claudeApiKeyApproved(home, key)
+}
+
+// claudeApiKeyApproved reports whether the given ANTHROPIC_API_KEY has been
+// approved as the active credential, per ~/.claude.json's customApiKeyResponses
+// (whose entries are the key's last 20 characters — the form Claude Code
+// persists). Returns false when the file/field is absent or the key isn't listed
+// as approved: the safe default is to keep attributing to the stored /login so a
+// declined or not-yet-approved key never blanks real subscription usage.
+func claudeApiKeyApproved(home, key string) bool {
+	path := claudeDotJSONPath(home)
+	if path == "" {
+		return false
+	}
+	cfg := claudeDotJSON{}
+	if !readJSONFile(path, &cfg) {
+		return false
+	}
+	// Claude stores key.slice(-20): the last 20 chars, or the whole key if shorter.
+	suffix := key
+	if len(key) > 20 {
+		suffix = key[len(key)-20:]
+	}
+	for _, approved := range cfg.CustomApiKeyResponses.Approved {
+		if approved == suffix {
+			return true
+		}
+	}
+	return false
 }
 
 // currentClaudeAccountFingerprint reads the Claude credentials on disk and

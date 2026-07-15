@@ -188,7 +188,7 @@ func TestClaudeCodeUsageParser_DotJSONDisplayNameNotFingerprinted(t *testing.T) 
 // daemon's shell must NOT blank the stored oauthAccount: those driver sessions
 // still bill the subscription, and the account line/fingerprint must reflect it.
 // (The env-auth exception is applied only by the status-line hook — see
-// TestCaptureClaudeRateLimitsFromStatusline_EnvAuthUnscopesAccount.)
+// TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential.)
 func TestClaudeCodeUsageParser_DaemonEnvKeyDoesNotSuppressStoredAccount(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
