@@ -241,7 +241,7 @@ func TestClaudeCodeUsageParser_FingerprintAndCacheScopeAreCredentialOnly(t *test
 			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
 			usageKnown:     true,
 		},
-	}, now, "")
+	}, now, "", "")
 
 	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
 
@@ -256,6 +256,60 @@ func TestClaudeCodeUsageParser_FingerprintAndCacheScopeAreCredentialOnly(t *test
 	// The "" cache the login actually wrote is read back, so the window displays.
 	if len(usage.Metrics) == 0 || usage.Metrics[0].Unknown {
 		t.Errorf("5-hour metric should be observed from the matching-scope cache, got %+v", usage.Metrics)
+	}
+}
+
+// After a same-user /login switch, the previous account's unscoped ("") snapshot
+// still matches the new login's "" fingerprint — but its DotfileAccount stamp
+// names the OLD email, so the reader must NOT show its quota under the newly
+// displayed email. Once the new account captures (stamp updates), it shows again.
+func TestClaudeCodeUsageParser_UnscopedCacheRejectedAfterAccountSwitch(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	home := t.TempDir()
+
+	orig := claudeKeychainReader
+	t.Cleanup(func() { claudeKeychainReader = orig })
+	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	// Account A captured an unscoped snapshot stamped with A's email.
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now, "", "alice@example.com")
+
+	// The user has since /login-switched to bob@example.com (dotfile rewritten).
+	helperWriteJSON(t, filepath.Join(home, ".claude.json"), map[string]any{
+		"oauthAccount": map[string]any{"emailAddress": "bob@example.com"},
+	})
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Account != "bob@example.com" {
+		t.Errorf("Account=%q, want bob@example.com (new login label)", usage.Account)
+	}
+	// Alice's window must NOT appear under Bob's card.
+	if len(usage.Metrics) == 0 || !usage.Metrics[0].Unknown {
+		t.Errorf("5-hour metric should be Unknown for the switched-to account, got %+v", usage.Metrics)
+	}
+
+	// Bob's own capture (re-stamped) makes the window observable again.
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 12,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now, "", "bob@example.com")
+	usage2, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if len(usage2.Metrics) == 0 || usage2.Metrics[0].Unknown {
+		t.Errorf("5-hour metric should be observed after Bob's own capture, got %+v", usage2.Metrics)
 	}
 }
 

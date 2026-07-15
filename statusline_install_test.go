@@ -295,7 +295,7 @@ func TestMergeClaudeRateLimitCache_CreatesLockFile(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowFiveHour: {UsedPercentage: 5, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
-	}, now, "")
+	}, now, "", "")
 
 	matches, _ := filepath.Glob(cache + ".lock")
 	if len(matches) == 0 {

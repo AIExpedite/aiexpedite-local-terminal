@@ -73,9 +73,20 @@ type claudeRateLimitBucket struct {
 // be attributed to the new account (the CLI Agents tab would otherwise show
 // another user's capacity until the new account emits its own telemetry).
 type claudeRateLimitSnapshot struct {
-	UpdatedAt          string                           `json:"updatedAt"`
-	AccountFingerprint string                           `json:"accountFingerprint,omitempty"`
-	Buckets            map[string]claudeRateLimitBucket `json:"buckets"`
+	UpdatedAt          string `json:"updatedAt"`
+	AccountFingerprint string `json:"accountFingerprint,omitempty"`
+	// DotfileAccount stamps the ~/.claude.json account the snapshot was captured
+	// under. It disambiguates the UNSCOPED ("") cache: a claude.ai login has no
+	// account in its credential, so every signed-in email shares the "" scope,
+	// and after a `/login` switch the fingerprint alone can't tell the new email's
+	// card that the buckets still belong to the previous account. The reader
+	// (claudeCodeMetricsFromCache) rejects an "" snapshot whose stamp names a
+	// different account than the one now displayed. Empty means "unstamped"
+	// (stream-capture / legacy) and is accepted best-effort. Never used to DROP
+	// buckets — only to gate display — so it can't reintroduce the cross-session
+	// drop race the dotfile was removed from scoping to avoid.
+	DotfileAccount string                           `json:"dotfileAccount,omitempty"`
+	Buckets        map[string]claudeRateLimitBucket `json:"buckets"`
 }
 
 // claudeRateLimitMu serialises the read-modify-write of the cache file
@@ -259,7 +270,9 @@ func captureClaudeRateLimitLine(line string, now time.Time) *claudeRateLimitBuck
 	nowMs := now.UnixMilli()
 	updates := extractClaudeRateLimitBuckets(raw, nowMs)
 	if len(updates) > 0 {
-		mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint())
+		// Stream-capture runs in the daemon hot path and doesn't read the dotfile;
+		// leave the account stamp empty (the reader accepts unstamped snapshots).
+		mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint(), "")
 	}
 
 	// Surface the rejected window with the LATEST reset time. When multiple
@@ -327,7 +340,7 @@ func windowlessRejectedBucket(raw map[string]interface{}, nowMs int64) (claudeRa
 // fresh five-hour/seven-day update. The tmp file is also given a per-process
 // unique suffix so even if the lock is unavailable (some odd filesystem) two
 // writers can't clobber each other's intermediate state.
-func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint string) {
+func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, dotfileAccount string) {
 	if path == "" || len(updates) == 0 {
 		return
 	}
@@ -363,6 +376,7 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 	// reset windows on the CLI Agents tab.
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]claudeRateLimitBucket{}
+		snap.DotfileAccount = ""
 	}
 	nowMs := now.UnixMilli()
 	for window, bucket := range updates {
@@ -395,6 +409,13 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
 	snap.AccountFingerprint = fingerprint
+	// Stamp the capturing dotfile account so the reader can reject this "" snapshot
+	// after a same-user /login switch. A non-empty stamp wins; an empty one (the
+	// stream-capture hot path, which doesn't read the dotfile) preserves whatever
+	// a prior status-line write recorded rather than wiping it.
+	if dotfileAccount != "" {
+		snap.DotfileAccount = dotfileAccount
+	}
 
 	out, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
