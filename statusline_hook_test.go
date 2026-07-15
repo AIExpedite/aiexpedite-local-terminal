@@ -83,10 +83,21 @@ func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testi
 		return snap.AccountFingerprint
 	}
 
+	// clearEnvAuth zeroes every env credential the guard consults so each subtest
+	// starts from a clean "subscription only" baseline before setting its one var.
+	clearEnvAuth := func(t *testing.T) {
+		for _, k := range []string{
+			"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+			"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+		} {
+			t.Setenv(k, "")
+		}
+	}
+
 	t.Run("auth-token always unscopes", func(t *testing.T) {
 		configDir := t.TempDir()
 		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
-		t.Setenv("ANTHROPIC_API_KEY", "")
+		clearEnvAuth(t)
 		t.Setenv("ANTHROPIC_AUTH_TOKEN", "bearer-xyz")
 		writeConfig(t, configDir, nil)
 		if got := capture(t); got != "" {
@@ -94,10 +105,32 @@ func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testi
 		}
 	})
 
+	t.Run("oauth token unscopes", func(t *testing.T) {
+		configDir := t.TempDir()
+		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+		clearEnvAuth(t)
+		t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-xyz")
+		writeConfig(t, configDir, nil)
+		if got := capture(t); got != "" {
+			t.Errorf("AccountFingerprint=%q, want empty (oauth token may be a different account)", got)
+		}
+	})
+
+	t.Run("cloud provider unscopes", func(t *testing.T) {
+		configDir := t.TempDir()
+		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+		clearEnvAuth(t)
+		t.Setenv("CLAUDE_CODE_USE_VERTEX", "1")
+		writeConfig(t, configDir, nil)
+		if got := capture(t); got != "" {
+			t.Errorf("AccountFingerprint=%q, want empty (cloud provider routes off the subscription)", got)
+		}
+	})
+
 	t.Run("approved api key unscopes", func(t *testing.T) {
 		configDir := t.TempDir()
 		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
-		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+		clearEnvAuth(t)
 		t.Setenv("ANTHROPIC_API_KEY", apiKey)
 		writeConfig(t, configDir, []string{keySuffix})
 		if got := capture(t); got != "" {
@@ -108,7 +141,7 @@ func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testi
 	t.Run("declined api key stays scoped", func(t *testing.T) {
 		configDir := t.TempDir()
 		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
-		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+		clearEnvAuth(t)
 		t.Setenv("ANTHROPIC_API_KEY", apiKey)
 		writeConfig(t, configDir, []string{}) // present but not approved
 		if got := capture(t); got != accountFP {
@@ -119,8 +152,7 @@ func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testi
 	t.Run("no env credential stays scoped", func(t *testing.T) {
 		configDir := t.TempDir()
 		t.Setenv("CLAUDE_CONFIG_DIR", configDir)
-		t.Setenv("ANTHROPIC_API_KEY", "")
-		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+		clearEnvAuth(t)
 		writeConfig(t, configDir, nil)
 		if got := capture(t); got != accountFP {
 			t.Errorf("AccountFingerprint=%q, want %q (subscription active)", got, accountFP)

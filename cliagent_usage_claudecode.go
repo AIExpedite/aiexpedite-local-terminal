@@ -311,18 +311,38 @@ func claudeDotJSONAccount(home string) (email, displayName string) {
 // would wrongly blank the stored subscription account.
 //
 // Presence of the env var is NOT sufficient — it must actually WIN Claude's
-// authentication precedence (https://code.claude.com/docs/en/authentication):
-//   - ANTHROPIC_AUTH_TOKEN (precedence #2) always wins when set — no approval.
-//   - ANTHROPIC_API_KEY (precedence #3) wins only ONCE APPROVED. In interactive
-//     mode (the only mode that renders a status line) the user is prompted once
-//     to approve/decline and the choice is remembered in .claude.json's
+// authentication precedence (https://code.claude.com/docs/en/authentication),
+// which ranks credentials above the stored /login (#6) as:
+//   - #1 cloud provider (CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY) — routes
+//     inference off the subscription entirely.
+//   - #2 ANTHROPIC_AUTH_TOKEN — always wins when set (bearer token, no approval).
+//   - #3 ANTHROPIC_API_KEY — wins only ONCE APPROVED. In interactive mode (the
+//     only mode that renders a status line) the user is prompted once to
+//     approve/decline and the choice is remembered in .claude.json's
 //     customApiKeyResponses. A present-but-declined (or not-yet-approved) key is
 //     ignored and Claude keeps billing the subscription — so those rate_limits
 //     DO belong to the oauthAccount and must stay scoped to it.
+//   - #5 CLAUDE_CODE_OAUTH_TOKEN — a long-lived subscription token (claude
+//     setup-token) that may belong to a DIFFERENT account than the stored
+//     /login, and still emits subscription rate_limits — so it too must unscope.
+//
+// #4 apiKeyHelper is deliberately not handled: it lives in settings.json rather
+// than the environment, and it supplies an API-key credential (Console/API
+// billing) which does not emit the subscription 5h/weekly rate_limits this
+// capture path records — so there is nothing to misattribute.
 func claudeEnvAuthActive() bool {
-	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != "" {
+	// #1 cloud provider selection.
+	if os.Getenv("CLAUDE_CODE_USE_BEDROCK") != "" ||
+		os.Getenv("CLAUDE_CODE_USE_VERTEX") != "" ||
+		os.Getenv("CLAUDE_CODE_USE_FOUNDRY") != "" {
 		return true
 	}
+	// #2 bearer token, and #5 long-lived OAuth token: both outrank the stored
+	// /login unconditionally when set.
+	if os.Getenv("ANTHROPIC_AUTH_TOKEN") != "" || os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") != "" {
+		return true
+	}
+	// #3 API key: active only once approved.
 	key := os.Getenv("ANTHROPIC_API_KEY")
 	if key == "" {
 		return false
