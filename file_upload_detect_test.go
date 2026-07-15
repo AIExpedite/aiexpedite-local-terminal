@@ -414,3 +414,82 @@ func TestDetectOutputFilesSince_MtimeExcludesPreExistingInNonIgnoredDir(t *testi
 		t.Fatalf("expected %v, got %v — mtime filter failed to exclude pre-existing file in a non-ignored subdir", want, got)
 	}
 }
+
+// TestUniqueScanRoots_DedupesAndDropsEmpty verifies the candidate-root
+// builder skips empties and de-duplicates (case-insensitively on Windows).
+func TestUniqueScanRoots_DedupesAndDropsEmpty(t *testing.T) {
+	got := uniqueScanRoots("", "/a/repo", "/a/repo", "", "/b/other")
+	want := []string{"/a/repo", "/b/other"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("order/content mismatch: expected %v, got %v", want, got)
+		}
+	}
+
+	// All-empty → empty slice (never nil-panics downstream).
+	if r := uniqueScanRoots("", ""); len(r) != 0 {
+		t.Fatalf("expected empty, got %v", r)
+	}
+
+	// Case-insensitive de-dup on Windows only.
+	roots := uniqueScanRoots("C:\\Repo", "c:\\repo")
+	if runtime.GOOS == "windows" {
+		if len(roots) != 1 {
+			t.Fatalf("windows: expected case-insensitive dedup to 1 root, got %v", roots)
+		}
+	} else if len(roots) != 2 {
+		t.Fatalf("non-windows: expected 2 distinct roots, got %v", roots)
+	}
+}
+
+// TestDetectOutputFilesAcross_MergesSiblingRoots is the regression seal for
+// the headline bug: the agent is spawned in one dir (home) but writes
+// screenshots under a SIBLING repo dir. Scanning both roots finds them;
+// scanning only the spawn dir would miss them.
+func TestDetectOutputFilesAcross_MergesSiblingRoots(t *testing.T) {
+	base := t.TempDir()
+	sessionStart := time.Now()
+
+	spawnDir := filepath.Join(base, "home") // where the CLI launched
+	repoDir := filepath.Join(base, "repo")  // where it cd'd + wrote
+	if err := os.MkdirAll(spawnDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Screenshot written under the sibling repo's output dir.
+	writeFileAt(t, filepath.Join(repoDir, "test-results-ui", "step-1.png"), "x", sessionStart.Add(freshOffset))
+
+	// Spawn dir alone → nothing.
+	if got := detectOutputFilesAcross([]string{spawnDir}, sessionStart); len(got) != 0 {
+		t.Fatalf("spawn-dir-only scan should find nothing, got %v", baseNames(got))
+	}
+	// Both roots → the screenshot surfaces.
+	got := baseNames(detectOutputFilesAcross([]string{spawnDir, repoDir}, sessionStart))
+	want := []string{"step-1.png"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("expected %v across roots, got %v", want, got)
+	}
+}
+
+// TestDetectOutputFilesAcross_DedupesOverlappingRoots ensures a file
+// reachable from two overlapping roots is only returned once.
+func TestDetectOutputFilesAcross_DedupesOverlappingRoots(t *testing.T) {
+	dir := t.TempDir()
+	sessionStart := time.Now()
+	writeFileAt(t, filepath.Join(dir, "sub", "shot.png"), "x", sessionStart.Add(freshOffset))
+
+	// dir and dir/sub overlap; the file under sub must appear exactly once.
+	got := detectOutputFilesAcross([]string{dir, filepath.Join(dir, "sub")}, sessionStart)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 file after dedup, got %d: %v", len(got), baseNames(got))
+	}
+}
+
+// TestDetectOutputFilesAcross_EmptyRoots returns an empty slice, never nil-panics.
+func TestDetectOutputFilesAcross_EmptyRoots(t *testing.T) {
+	if got := detectOutputFilesAcross(nil, time.Now()); got == nil || len(got) != 0 {
+		t.Fatalf("expected non-nil empty slice, got %v", got)
+	}
+}
