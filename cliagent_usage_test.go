@@ -76,16 +76,13 @@ func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
 }
 
 // The account email is NOT in .credentials.json (it holds only the OAuth token
-// object) — it lives in ~/.claude.json's oauthAccount block. The parser must
-// fall back to it so the card can show `Account: …`, and the derived
-// fingerprint must be non-empty so the same account dedups across devices.
+// object) — it lives in ~/.claude.json's oauthAccount block. The parser surfaces
+// it as the card's DISPLAY label, but must NOT fingerprint by it: the shared
+// dotfile is mutable, so the fingerprint stays credential-only (empty here) and
+// gatherCLIAgentUsage device-scopes it.
 func TestClaudeCodeUsageParser_AccountFromDotJSON(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
-	// Env-auth would suppress the oauthAccount fallback; clear it so this asserts
-	// the subscription-login path deterministically on a dev box.
-	t.Setenv("ANTHROPIC_API_KEY", "")
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
 	home := t.TempDir()
 
 	// macOS default-config-dir reads the shared Keychain first; stub it off so
@@ -111,18 +108,14 @@ func TestClaudeCodeUsageParser_AccountFromDotJSON(t *testing.T) {
 	if !ok || usage == nil {
 		t.Fatalf("expected usage, got ok=%v", ok)
 	}
+	// Displayed as the account label…
 	if usage.Account != "grace@example.com" {
 		t.Errorf("Account=%q, want grace@example.com (from ~/.claude.json)", usage.Account)
 	}
-	// Parse must fingerprint the resolved email. The capture path
-	// (currentClaudeAccountFingerprint) derives its home from os.UserHomeDir
-	// exactly as gatherCLIAgentUsage does and reuses this same helper, so both
-	// agree at runtime — we assert against the expected fingerprint here rather
-	// than calling the capture path, which can't be pointed at the test's temp
-	// home.
-	want := fingerprintAccount("claudeCode", "grace@example.com")
-	if usage.AccountFingerprint != want {
-		t.Errorf("AccountFingerprint=%q, want %q", usage.AccountFingerprint, want)
+	// …but the dotfile email is NEVER fingerprinted. Credential has no account,
+	// so the fingerprint is empty (gatherCLIAgentUsage then device-scopes it).
+	if usage.AccountFingerprint != "" {
+		t.Errorf("AccountFingerprint=%q, want empty (dotfile email must not be fingerprinted)", usage.AccountFingerprint)
 	}
 }
 
@@ -205,21 +198,24 @@ func TestClaudeCodeUsageParser_DaemonEnvKeyDoesNotSuppressStoredAccount(t *testi
 
 	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	// The daemon still shows the stored account label despite the stray env key…
 	if usage.Account != "grace@example.com" {
 		t.Errorf("Account=%q, want grace@example.com (daemon must show stored account despite stray env key)", usage.Account)
 	}
-	if usage.AccountFingerprint != fingerprintAccount("claudeCode", "grace@example.com") {
-		t.Errorf("AccountFingerprint=%q, want the oauthAccount email fingerprint", usage.AccountFingerprint)
+	// …and the fingerprint is credential-only (empty for this claude.ai login),
+	// never the dotfile email.
+	if usage.AccountFingerprint != "" {
+		t.Errorf("AccountFingerprint=%q, want empty (credential-only fingerprint)", usage.AccountFingerprint)
 	}
 }
 
-// Parse reads the rate-limit cache scoped by the CREDENTIAL account only — never
-// the ~/.claude.json email. A claude.ai login (no credential account) reads the
-// UNSCOPED ("") cache the status-line hook wrote, so those windows still display,
-// even though the card's dedup fingerprint uses the dotfile email. This is the
-// decoupling that keeps a concurrent /login (which rewrites the shared dotfile)
-// from misattributing a live capture.
-func TestClaudeCodeUsageParser_CacheScopedByCredentialNotDotJSON(t *testing.T) {
+// Parse's fingerprint (published + cache-read scope) is the CREDENTIAL account
+// only, never the ~/.claude.json email. A claude.ai login (no credential
+// account) publishes "" and reads the "" cache it actually wrote — so the windows
+// display, and env-auth / previous-account data is never pulled onto the
+// email-labelled card under a mismatched identity. This is the consistency the
+// P1 review required: the cache scope and the published identity are identical.
+func TestClaudeCodeUsageParser_FingerprintAndCacheScopeAreCredentialOnly(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
@@ -249,13 +245,17 @@ func TestClaudeCodeUsageParser_CacheScopedByCredentialNotDotJSON(t *testing.T) {
 
 	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
 
-	// Dedup/display fingerprint still comes from the dotfile email.
-	if usage.AccountFingerprint != fingerprintAccount("claudeCode", "grace@example.com") {
-		t.Errorf("AccountFingerprint=%q, want the dotfile-email fingerprint", usage.AccountFingerprint)
+	// Published fingerprint == cache scope == "" (credential-only). The email is
+	// a display label only.
+	if usage.Account != "grace@example.com" {
+		t.Errorf("Account=%q, want grace@example.com (display label)", usage.Account)
 	}
-	// But the cache read used the creds-only "" scope, so the seeded window shows.
+	if usage.AccountFingerprint != "" {
+		t.Errorf("AccountFingerprint=%q, want empty (credential-only, matches cache scope)", usage.AccountFingerprint)
+	}
+	// The "" cache the login actually wrote is read back, so the window displays.
 	if len(usage.Metrics) == 0 || usage.Metrics[0].Unknown {
-		t.Errorf("5-hour metric should be observed from the unscoped cache, got %+v", usage.Metrics)
+		t.Errorf("5-hour metric should be observed from the matching-scope cache, got %+v", usage.Metrics)
 	}
 }
 
