@@ -104,6 +104,7 @@ func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testi
 		for _, k := range []string{
 			"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
 			"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+			"CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_MANTLE",
 		} {
 			t.Setenv(k, "")
 		}
@@ -143,7 +144,9 @@ func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testi
 	}{
 		{name: "auth-token", set: map[string]string{"ANTHROPIC_AUTH_TOKEN": "bearer-xyz"}},
 		{name: "oauth-token", set: map[string]string{"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-xyz"}},
-		{name: "cloud-provider", set: map[string]string{"CLAUDE_CODE_USE_VERTEX": "1"}},
+		{name: "cloud-provider-vertex", set: map[string]string{"CLAUDE_CODE_USE_VERTEX": "1"}},
+		{name: "cloud-provider-anthropic-aws", set: map[string]string{"CLAUDE_CODE_USE_ANTHROPIC_AWS": "1"}},
+		{name: "cloud-provider-mantle", set: map[string]string{"CLAUDE_CODE_USE_MANTLE": "1"}},
 		{name: "approved-api-key", set: map[string]string{"ANTHROPIC_API_KEY": apiKey}, approv: []string{keySuffix}},
 	} {
 		t.Run(tc.name+" skips the write", func(t *testing.T) {

@@ -310,8 +310,9 @@ func claudeDotJSONAccount(home string) (email, displayName string) {
 // Presence of the env var is NOT sufficient — it must actually WIN Claude's
 // authentication precedence (https://code.claude.com/docs/en/authentication),
 // which ranks credentials above the stored /login (#6) as:
-//   - #1 cloud provider (CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY) — routes
-//     inference off the subscription entirely.
+//   - #1 cloud / alternate provider selectors (see env-vars reference) — routes
+//     inference off the first-party subscription: BEDROCK, VERTEX, FOUNDRY,
+//     ANTHROPIC_AWS (Claude Platform on AWS), and MANTLE (Bedrock Mantle).
 //   - #2 ANTHROPIC_AUTH_TOKEN — always wins when set (bearer token, no approval).
 //   - #3 ANTHROPIC_API_KEY — wins only ONCE APPROVED. In interactive mode (the
 //     only mode that renders a status line) the user is prompted once to
@@ -328,10 +329,14 @@ func claudeDotJSONAccount(home string) (email, displayName string) {
 // billing) which does not emit the subscription 5h/weekly rate_limits this
 // capture path records — so there is nothing to misattribute.
 func claudeEnvAuthActive() bool {
-	// #1 cloud provider selection.
+	// #1 cloud / alternate provider selection. Every CLAUDE_CODE_USE_* provider
+	// selector from https://code.claude.com/docs/en/env-vars must be covered so
+	// provider-session rate_limits never merge into the stored /login card.
 	if os.Getenv("CLAUDE_CODE_USE_BEDROCK") != "" ||
 		os.Getenv("CLAUDE_CODE_USE_VERTEX") != "" ||
-		os.Getenv("CLAUDE_CODE_USE_FOUNDRY") != "" {
+		os.Getenv("CLAUDE_CODE_USE_FOUNDRY") != "" ||
+		os.Getenv("CLAUDE_CODE_USE_ANTHROPIC_AWS") != "" ||
+		os.Getenv("CLAUDE_CODE_USE_MANTLE") != "" {
 		return true
 	}
 	// #2 bearer token, and #5 long-lived OAuth token: both outrank the stored
