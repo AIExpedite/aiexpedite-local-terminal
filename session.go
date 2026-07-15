@@ -1256,30 +1256,38 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	var uploadErrors []UploadError
 	cfg := sm.Config
 	if cfg != nil && cfg.EnableFileUpload && session.WorkspaceID != "" {
-		// Scan every root we have a signal for, not just the spawn cwd. A
-		// bundled CLI agent is often launched in the user's home dir and
-		// `cd`s into the target repo, so screenshots land in a SIBLING of
-		// Process.Dir (`<repo>/test-results-ui/`) — a single-root walk
-		// rooted at the spawn dir misses them entirely and the session
-		// reports zero files (surfaced downstream as `hasFiles:false` +
-		// broken-image placeholders). getTrackedCwd() catches a mid-session
-		// `cd` on the one-shot path; both are deduped.
-		scanRoots := uniqueScanRoots(session.Process.Dir, getTrackedCwd())
-		if len(scanRoots) == 0 {
+		// Scope the scan to THIS session's own spawn dir. Process.Dir is
+		// per-session; getTrackedCwd() is a process-wide value mutated by
+		// unrelated one-shot commands, so it's only a last-resort fallback
+		// when Process.Dir is empty — never an additional root (scanning it
+		// while another workspace's command wrote fresh media there would
+		// upload those files under THIS session's workspaceID).
+		//
+		// NOTE: when a bundled CLI agent is launched in the home dir and
+		// `cd`s into the repo, its screenshots land in a SIBLING of
+		// Process.Dir and this walk won't see them. That's fixed upstream
+		// by spawning the session IN the repo (ai-service seeds `cwd` →
+		// Process.Dir); the always-on log line below makes the miss
+		// diagnosable if the cwd hint is ever absent.
+		effectiveDir := session.Process.Dir
+		if effectiveDir == "" {
+			effectiveDir = getTrackedCwd()
+		}
+		if effectiveDir == "" {
 			// Without a workdir we cannot scope the upload scan, so we skip
 			// it entirely. Surface the reason — silently dropping every
 			// screenshot from a session is the kind of thing operators need
 			// to see, not have to git-blame for.
 			fmt.Printf("[session-file-upload] Skipping upload for session %s — no effective workdir (Process.Dir and trackedCwd both empty)\n", session.ID)
 		} else {
-			files := detectOutputFilesAcross(scanRoots, session.StartedAt)
-			// Always log the scan outcome (roots + count), even on zero
+			files := detectOutputFilesSince(effectiveDir, session.StartedAt)
+			// Always log the scan outcome (root + count), even on zero
 			// hits. A silent zero-file result was previously
 			// indistinguishable from "upload disabled" — this line is what
 			// turns a future `hasFiles:false` report into a one-grep
 			// diagnosis (scan root vs. where the agent actually wrote).
-			fmt.Printf("[session-file-upload] Session %s: scanned roots %v since %s → %d media file(s)\n",
-				session.ID, scanRoots, session.StartedAt.Format(time.RFC3339), len(files))
+			fmt.Printf("[session-file-upload] Session %s: scanned %s since %s → %d media file(s)\n",
+				session.ID, effectiveDir, session.StartedAt.Format(time.RFC3339), len(files))
 			if len(files) > 0 {
 				fmt.Printf("[session-file-upload] Detected %d output files, uploading to GCS (workspace: %s)...\n", len(files), session.WorkspaceID)
 

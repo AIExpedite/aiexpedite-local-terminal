@@ -1545,20 +1545,24 @@ func runPubSubConnection(cfg *Config) error {
 		// successful exit code was the previous behavior, and it dropped
 		// screenshots from the crashes we most needed to debug.
 		if cfg.EnableFileUpload {
-			// Prefer the tracked cwd (post-`cd`) and the command's own cwd;
-			// only fall back to the home WorkingDirectory when neither is
-			// known (unchanged from prior behavior — just deduped and
-			// scanned together so a `cd` mid-command can't hide artifacts
-			// written under the original cwd, or vice-versa).
-			scanRoots := uniqueScanRoots(getTrackedCwd(), cmd.Cwd)
-			if len(scanRoots) == 0 && cfg != nil && cfg.WorkingDirectory != "" {
-				scanRoots = []string{cfg.WorkingDirectory}
+			// Resolve a single, correctly-scoped scan dir (unchanged
+			// precedence): the post-`cd` tracked cwd, else the command's
+			// own cwd, else the home WorkingDirectory as last resort. These
+			// are NOT scanned together — walking the default home tree on
+			// top of the real exec dir would sweep up unrelated fresh media
+			// and make detection expensive.
+			effectiveDir := getTrackedCwd()
+			if effectiveDir == "" {
+				effectiveDir = cmd.Cwd
 			}
-			files := detectOutputFilesAcross(scanRoots, cmdStartedAt)
+			if effectiveDir == "" && cfg != nil {
+				effectiveDir = cfg.WorkingDirectory
+			}
+			files := detectOutputFilesSince(effectiveDir, cmdStartedAt)
 			// Always log the scan outcome so a zero-file result is
 			// diagnosable rather than silent (mirrors the session path).
-			fmt.Printf("[file-upload] Command %s: scanned roots %v since %s → %d media file(s)\n",
-				cmd.ID, scanRoots, cmdStartedAt.Format(time.RFC3339), len(files))
+			fmt.Printf("[file-upload] Command %s: scanned %s since %s → %d media file(s)\n",
+				cmd.ID, effectiveDir, cmdStartedAt.Format(time.RFC3339), len(files))
 			if len(files) > 0 {
 				// Security: Block file upload if workspaceID is missing
 				workspaceID := extractWorkspaceID(cmd)
@@ -2821,72 +2825,6 @@ func detectOutputFilesSince(workDir string, sessionStart time.Time) []string {
 	}
 
 	return files
-}
-
-// uniqueScanRoots returns the non-empty inputs in order, de-duplicated.
-// Comparison is case-insensitive on Windows (NTFS is case-insensitive, so
-// `C:\Repo` and `c:\repo` are the same tree and must not be walked twice).
-// Used to build the candidate set for detectOutputFilesAcross — the spawn
-// cwd (session.Process.Dir) is the primary signal, but a mid-session `cd`
-// (getTrackedCwd) or a command-supplied Cwd can point elsewhere, and we
-// want to catch artifacts under any of them without double-walking.
-func uniqueScanRoots(dirs ...string) []string {
-	seen := make(map[string]struct{}, len(dirs))
-	out := make([]string, 0, len(dirs))
-	for _, d := range dirs {
-		if d == "" {
-			continue
-		}
-		key := d
-		if runtime.GOOS == "windows" {
-			key = strings.ToLower(d)
-		}
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		out = append(out, d)
-	}
-	return out
-}
-
-// detectOutputFilesAcross runs detectOutputFilesSince over several candidate
-// roots and merges the results, de-duplicated and capped at maxUploadFiles.
-// A single spawn cwd is often NOT where a bundled CLI agent writes its
-// screenshots: the agent is frequently launched in the user's home dir and
-// `cd`s into the target repo before running the test framework, so the
-// artifacts land in `<repo>/test-results-ui/` — a sibling of, not a
-// descendant of, the launch dir. Scanning every root we know about (spawn
-// cwd, tracked cwd, command cwd) makes detection resilient to that instead
-// of silently returning zero files (which surfaced downstream as
-// `hasFiles:false` + broken-image placeholders in the chat card).
-//
-// The authoritative fix is to spawn the session IN the repo (ai-service
-// resolveSessionCwd seeds `cwd`); this multi-root scan is the local
-// defense-in-depth so a missing/wrong cwd hint can't drop screenshots.
-func detectOutputFilesAcross(roots []string, sessionStart time.Time) []string {
-	if len(roots) == 0 {
-		return []string{}
-	}
-	merged := make([]string, 0, maxUploadFiles)
-	seen := make(map[string]struct{})
-	for _, root := range roots {
-		for _, f := range detectOutputFilesSince(root, sessionStart) {
-			key := f
-			if runtime.GOOS == "windows" {
-				key = strings.ToLower(f)
-			}
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			merged = append(merged, f)
-			if len(merged) >= maxUploadFiles {
-				return merged
-			}
-		}
-	}
-	return merged
 }
 
 // extractWorkspaceID extracts workspaceID from command message
