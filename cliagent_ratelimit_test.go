@@ -604,6 +604,49 @@ func TestMergeClaudeRateLimitCache_EmptyStampClearsPriorStamp(t *testing.T) {
 	}
 }
 
+// After a same-user /login switch, a PARTIAL capture by the new account (e.g. a
+// stream-capture carrying only five_hour) must not leave the previous account's
+// other windows to be trusted under the new card. Because both claude.ai logins
+// share the "" fingerprint, the dotfile-account change is the only signal — so
+// the merge drops the prior account's buckets before applying the partial update.
+func TestMergeClaudeRateLimitCache_DotfileSwitchDropsStalePartialWindows(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(time.Hour).UnixMilli()
+
+	// Alice captured BOTH windows.
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 40, ResetsAtMs: reset, usageKnown: true},
+		claudeWindowSevenDay: {UsedPercentage: 70, ResetsAtMs: reset, usageKnown: true},
+	}, now, "", "alice@example.com")
+
+	// Bob (after the switch) captures ONLY five_hour.
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {UsedPercentage: 10, ResetsAtMs: reset, usageKnown: true},
+	}, now, "", "bob@example.com")
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if _, present := snap.Buckets[claudeWindowSevenDay]; present {
+		t.Errorf("Alice's seven_day must be dropped on the account switch, snapshot=%+v", snap.Buckets)
+	}
+	if b := snap.Buckets[claudeWindowFiveHour]; b.UsedPercentage != 10 {
+		t.Errorf("five_hour=%v, want Bob's 10", b.UsedPercentage)
+	}
+
+	// Read as Bob: five_hour observed, seven_day Unknown (not Alice's 70).
+	metrics := claudeCodeMetricsFromCache(now, "", "bob@example.com")
+	if metrics[0].Unknown || metrics[0].Consumed == nil || *metrics[0].Consumed != 10 {
+		t.Errorf("five_hour metric=%+v, want observed 10%%", metrics[0])
+	}
+	if !metrics[1].Unknown {
+		t.Errorf("weekly metric=%+v, want Unknown (Alice's window dropped)", metrics[1])
+	}
+}
+
 func TestNormalizeResetMs(t *testing.T) {
 	if got := normalizeResetMs(1781544600); got != 1781544600000 {
 		t.Errorf("seconds: got %d, want 1781544600000", got)

@@ -383,6 +383,19 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 		snap.Buckets = map[string]claudeRateLimitBucket{}
 		snap.DotfileAccount = ""
 	}
+	// For the UNSCOPED ("") cache, every claude.ai login shares the same ""
+	// fingerprint, so the check above can't see a same-user /login switch. The
+	// dotfile-account stamp can: when it changes to a different known account, the
+	// prior account's buckets are stale and must be dropped BEFORE the merge —
+	// otherwise a partial capture (a stream-capture writing only `five_hour`, or a
+	// no-usage heartbeat) would re-stamp the whole snapshot to the new account
+	// while leaving the previous account's other windows behind, and the reader
+	// would then trust them under the new card. Only fires on a non-empty→different
+	// non-empty transition, so a steady single account never drops.
+	if fingerprint == "" && dotfileAccount != "" &&
+		snap.DotfileAccount != "" && snap.DotfileAccount != dotfileAccount {
+		snap.Buckets = map[string]claudeRateLimitBucket{}
+	}
 	nowMs := now.UnixMilli()
 	for window, bucket := range updates {
 		// An "allowed" heartbeat refreshes status / reset time but carries no
