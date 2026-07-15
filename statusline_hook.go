@@ -62,7 +62,19 @@ func captureClaudeRateLimitsFromStatusline(raw []byte, now time.Time) {
 	if len(updates) == 0 {
 		return
 	}
-	mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint())
+	// This hook runs as a child of the Claude session that rendered the status
+	// line, so our environment IS that session's. When it is authenticated with
+	// an env credential (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN), those
+	// rate_limits belong to the env account, not the stored /login oauthAccount —
+	// capture them UNSCOPED ("") so they can't merge into the subscription card
+	// (Parse fingerprints by the oauthAccount email, which won't match ""). Only
+	// this call site applies the guard; the daemon capture paths only ever see
+	// driver-launched sessions, which strip these vars.
+	fingerprint := currentClaudeAccountFingerprint()
+	if claudeEnvAuthActive() {
+		fingerprint = ""
+	}
+	mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, fingerprint)
 }
 
 // renderStatusLine forwards to the user's previous status-line command when we

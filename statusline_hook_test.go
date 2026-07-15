@@ -45,6 +45,56 @@ func TestCaptureClaudeRateLimitsFromStatusline_BothWindows(t *testing.T) {
 	}
 }
 
+// The status-line hook runs as a child of the Claude session, so its env IS the
+// session's. When that session is authenticated with an env credential, the
+// captured rate_limits belong to the env account, not the stored oauthAccount —
+// so the snapshot must be written UNSCOPED (fingerprint "") to keep it off the
+// subscription card. With no env credential the same capture scopes to the
+// stored account, proving the env-auth guard is what makes the difference.
+func TestCaptureClaudeRateLimitsFromStatusline_EnvAuthUnscopesAccount(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir) // .claude.json + fingerprint resolve here
+	helperWriteJSON(t, filepath.Join(configDir, ".claude.json"), map[string]any{
+		"oauthAccount": map[string]any{"emailAddress": "grace@example.com"},
+	})
+	accountFP := fingerprintAccount("claudeCode", "grace@example.com")
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	payload := `{"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":` +
+		strconv.FormatInt(now.Add(time.Hour).Unix(), 10) + `}}}`
+
+	// With an env credential present, the capture is unscoped.
+	t.Run("env-auth -> unscoped", func(t *testing.T) {
+		cache := filepath.Join(t.TempDir(), "rl.json")
+		t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+		t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+		captureClaudeRateLimitsFromStatusline([]byte(payload), now)
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		if !ok {
+			t.Fatalf("expected cache write")
+		}
+		if snap.AccountFingerprint != "" {
+			t.Errorf("AccountFingerprint=%q, want empty under env-auth", snap.AccountFingerprint)
+		}
+	})
+
+	// Without one, the same capture scopes to the stored oauthAccount.
+	t.Run("subscription -> scoped", func(t *testing.T) {
+		cache := filepath.Join(t.TempDir(), "rl.json")
+		t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+		t.Setenv("ANTHROPIC_API_KEY", "")
+		t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+		captureClaudeRateLimitsFromStatusline([]byte(payload), now)
+		snap, ok := loadClaudeRateLimitSnapshot(cache)
+		if !ok {
+			t.Fatalf("expected cache write")
+		}
+		if snap.AccountFingerprint != accountFP {
+			t.Errorf("AccountFingerprint=%q, want %q (stored account)", snap.AccountFingerprint, accountFP)
+		}
+	})
+}
+
 func TestDefaultStatusLine(t *testing.T) {
 	payload := `{"model":{"display_name":"Opus 4.8"},"cwd":"C:\\code\\my-repo",` +
 		`"rate_limits":{"five_hour":{"used_percentage":23.5},"seven_day":{"used_percentage":81}}}`

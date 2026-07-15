@@ -220,11 +220,18 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 	// .credentials.json carries only the OAuth token object, so the account
 	// above is almost always empty. The signed-in email lives in ~/.claude.json's
 	// oauthAccount block — fall back to it so the card shows `Account: …` like
-	// Codex does. Skipped under env-auth: an ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN
-	// in the environment overrides the stored /login (CLI_AGENT_INTEGRATION.md), so
-	// the active credential is NOT this oauthAccount and its usage must not be
-	// merged into that subscription — leave it unknown/device-scoped instead.
-	if usage.Account == "" && !claudeEnvAuthActive() {
+	// Codex does.
+	//
+	// No env-auth guard here: this runs in the local-terminal DAEMON, whose
+	// environment reflects the shell it was launched from, NOT the Claude
+	// sessions it drives — and those sessions strip ANTHROPIC_API_KEY /
+	// ANTHROPIC_AUTH_TOKEN (session.go's claudeBillingStripped) to force
+	// subscription billing. So the stored /login oauthAccount IS the account that
+	// produces the driver's rate-limit events; a stray API key in the daemon's
+	// own shell must not blank the account line. The env-auth signal is only
+	// meaningful where the process IS the Claude session — the status-line hook,
+	// which applies it at its own capture site.
+	if usage.Account == "" {
 		email, displayName := claudeDotJSONAccount(home)
 		// Show the email when we have it, else the display name — a friendly
 		// label is better than a blank card.
@@ -283,9 +290,16 @@ func claudeDotJSONAccount(home string) (email, displayName string) {
 // claudeEnvAuthActive reports whether an env-based Anthropic credential is
 // present in this process's environment. Anthropic SDK precedence puts these
 // ahead of the stored /login (CLI_AGENT_INTEGRATION.md → claudeBillingStripped),
-// so when set the active account is NOT the ~/.claude.json oauthAccount. The
-// oauthAccount fallback is skipped in that case so env/API-key usage is never
-// merged into the stored subscription account. Mirrors the strip list in
+// so when set the active account is NOT the ~/.claude.json oauthAccount.
+//
+// This is only meaningful where the current process IS the Claude session — the
+// status-line hook, which Claude Code spawns as a child of the session and which
+// therefore inherits that session's environment. The daemon paths (Parse /
+// gather, and the stream-capture in captureClaudeRateLimitLine) deliberately do
+// NOT consult this: the daemon's env reflects the shell it was launched from,
+// not the driver-launched sessions it parses, and those sessions strip these
+// vars — so treating a stray daemon-shell key as "this account is env-auth"
+// would wrongly blank the stored subscription account. Mirrors the strip list in
 // session.go's claudeBillingStripped.
 func claudeEnvAuthActive() bool {
 	return os.Getenv("ANTHROPIC_API_KEY") != "" || os.Getenv("ANTHROPIC_AUTH_TOKEN") != ""
@@ -313,9 +327,15 @@ func currentClaudeAccountFingerprint() string {
 	// not .credentials.json. Without this, the captured snapshot would be
 	// fingerprinted "" while Parse fingerprints the email — the two would never
 	// match and claudeCodeMetricsFromCache would discard the cached windows. Use
-	// the email ONLY (never the non-unique display name), and skip it under
-	// env-auth, exactly as Parse does — so the two stay in lockstep.
-	if account == "" && !claudeEnvAuthActive() {
+	// the email ONLY (never the non-unique display name), exactly as Parse does,
+	// so the two stay in lockstep.
+	//
+	// No env-auth guard here either: this feeds the stream-capture path
+	// (captureClaudeRateLimitLine), which only ever parses driver-launched
+	// sessions — and those strip the env credentials, so their usage genuinely
+	// belongs to the stored oauthAccount. The env-auth exception is applied only
+	// by the status-line hook, whose process env really is the session's.
+	if account == "" {
 		email, _ := claudeDotJSONAccount(home)
 		account = email
 	}

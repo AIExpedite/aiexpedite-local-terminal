@@ -182,14 +182,17 @@ func TestClaudeCodeUsageParser_DotJSONDisplayNameNotFingerprinted(t *testing.T) 
 	}
 }
 
-// Under env-auth (ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN present) the active
-// credential is a different account than the stored /login, so the oauthAccount
-// email in ~/.claude.json must NOT be attributed — the card stays account-less
-// and the fingerprint stays empty (device-scoped by gatherCLIAgentUsage).
-func TestClaudeCodeUsageParser_EnvAuthSuppressesDotJSONAccount(t *testing.T) {
+// Parse runs in the local-terminal DAEMON, whose environment reflects the shell
+// it was launched from — NOT the Claude sessions it drives, which strip the env
+// credentials to force subscription billing. So a stray ANTHROPIC_API_KEY in the
+// daemon's shell must NOT blank the stored oauthAccount: those driver sessions
+// still bill the subscription, and the account line/fingerprint must reflect it.
+// (The env-auth exception is applied only by the status-line hook — see
+// TestCaptureClaudeRateLimitsFromStatusline_EnvAuthUnscopesAccount.)
+func TestClaudeCodeUsageParser_DaemonEnvKeyDoesNotSuppressStoredAccount(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
-	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-test") // stray daemon-shell key
 	home := t.TempDir()
 
 	orig := claudeKeychainReader
@@ -202,11 +205,11 @@ func TestClaudeCodeUsageParser_EnvAuthSuppressesDotJSONAccount(t *testing.T) {
 
 	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
-	if usage.Account != "" {
-		t.Errorf("Account=%q, want empty (env-auth must not attribute the oauthAccount)", usage.Account)
+	if usage.Account != "grace@example.com" {
+		t.Errorf("Account=%q, want grace@example.com (daemon must show stored account despite stray env key)", usage.Account)
 	}
-	if usage.AccountFingerprint != "" {
-		t.Errorf("AccountFingerprint=%q, want empty under env-auth", usage.AccountFingerprint)
+	if usage.AccountFingerprint != fingerprintAccount("claudeCode", "grace@example.com") {
+		t.Errorf("AccountFingerprint=%q, want the oauthAccount email fingerprint", usage.AccountFingerprint)
 	}
 }
 
