@@ -129,17 +129,38 @@ func (s *AntigravityNativeSession) clearActiveProcess() {
 type AntigravityNativeManager struct {
 	sessions map[string]*AntigravityNativeSession
 	mu       sync.RWMutex
-	// firstTurnMu serialises native-ID capture across sessions so concurrent
-	// first turns on the same cwd cannot steal each other's last_conversations
-	// mapping.
-	firstTurnMu sync.Mutex
+	// captureMu guards the per-cwd capture-lock registry below.
+	captureMu sync.Mutex
+	// cwdCaptureLocks serialises capture-scoped turns (first turn or replay
+	// replacement) per cwd. It is held across the whole `agy` run — not just the
+	// snapshot/capture reads — so two concurrent first turns in the same cwd
+	// cannot both run `agy` in parallel and then adopt the same last-writer-wins
+	// last_conversations.json mapping (which would resume each other's native
+	// conversation). Different cwds still run fully in parallel.
+	cwdCaptureLocks map[string]*sync.Mutex
 }
 
 // NewAntigravityNativeManager creates a fresh manager.
 func NewAntigravityNativeManager() *AntigravityNativeManager {
 	return &AntigravityNativeManager{
-		sessions: make(map[string]*AntigravityNativeSession),
+		sessions:        make(map[string]*AntigravityNativeSession),
+		cwdCaptureLocks: make(map[string]*sync.Mutex),
 	}
+}
+
+// cwdCaptureLock returns the shared capture mutex for a cwd, creating it once.
+func (m *AntigravityNativeManager) cwdCaptureLock(cwd string) *sync.Mutex {
+	m.captureMu.Lock()
+	defer m.captureMu.Unlock()
+	if m.cwdCaptureLocks == nil {
+		m.cwdCaptureLocks = make(map[string]*sync.Mutex)
+	}
+	lk, ok := m.cwdCaptureLocks[cwd]
+	if !ok {
+		lk = &sync.Mutex{}
+		m.cwdCaptureLocks[cwd] = lk
+	}
+	return lk
 }
 
 // Start registers a logical session. No CLI process is launched until Send.
@@ -257,18 +278,45 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	fmt.Printf("%s[antigravity-native] Turn on %s (resume=%v)%s\n",
 		colorCyan, id, useNativeResume, colorReset)
 
-	// Snapshot conversation IDs only for the capture window — do NOT hold
-	// firstTurnMu across the multi-minute process (that would serialize all
-	// first turns globally).
+	// Per-cwd capture lock: acquired lazily and held across the entire capturing
+	// `agy` run (snapshot → run → capture) so concurrent same-cwd first turns
+	// cannot misattribute each other's freshly created conversation DB. Different
+	// cwds never contend, and native-resume turns (nativeID known) never acquire
+	// it, so only the rare capturing turns serialize.
+	var captureLock *sync.Mutex
+	lockCapture := func() {
+		if captureLock == nil {
+			captureLock = m.cwdCaptureLock(session.Cwd)
+			captureLock.Lock()
+		}
+	}
+	defer func() {
+		if captureLock != nil {
+			captureLock.Unlock()
+		}
+	}()
+
+	// No native ID but prior turns exist (never captured, or lost): replay the
+	// bounded transcript so a follow-up keeps context instead of silently going
+	// stateless. The first turn (empty transcript) still sends bare text.
+	promptToSend, replayForContinuity := antigravityTurnPrompt(nativeID, session.Transcript, text)
+	if replayForContinuity {
+		if len(promptToSend) > antigravityNativeMaxPromptBytes {
+			return m.publishTurnError(session, publishFn,
+				"Antigravity has no resumable conversation and the replay prompt exceeds the size limit")
+		}
+		usedReplay = true
+	}
+
+	// Snapshot conversation IDs for the capture window under the per-cwd lock.
 	var beforeIDs map[string]struct{}
 	if needCapture {
-		m.firstTurnMu.Lock()
+		lockCapture()
 		beforeIDs = listAntigravityConversationIDs()
-		m.firstTurnMu.Unlock()
 	}
 
 	outText, errText, exitCode, timedOut, truncated, runErr := m.runOneShot(
-		session, executable, text, nativeID, turnTimeout, "antigravity-native:"+id,
+		session, executable, promptToSend, nativeID, turnTimeout, "antigravity-native:"+id,
 	)
 	if runErr != nil {
 		return m.publishTurnError(session, publishFn, runErr.Error())
@@ -302,9 +350,8 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 			return m.publishTurnError(session, publishFn,
 				"Antigravity resume failed and replay prompt exceeds size limit")
 		}
-		m.firstTurnMu.Lock()
+		lockCapture()
 		beforeIDs = listAntigravityConversationIDs()
-		m.firstTurnMu.Unlock()
 
 		out2, err2, exit2, timed2, trunc2, run2 := m.runOneShot(
 			session, executable, replayPrompt, "", turnTimeout, "antigravity-native:"+id+":replay",
@@ -333,10 +380,11 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	}
 
 	if needCapture || session.NativeConversationID == "" {
-		// Serialize only the capture read of last_conversations.json.
-		m.firstTurnMu.Lock()
+		// Capture read runs under the per-cwd lock acquired before this turn's
+		// run (idempotent: native-resume turns that reach here already replayed
+		// and locked, so this only guards genuine capture turns).
+		lockCapture()
 		captured := captureAntigravityNativeID(session.Cwd, beforeIDs)
-		m.firstTurnMu.Unlock()
 		if captured != "" {
 			session.NativeConversationID = captured
 		} else if session.NativeConversationID == "" {
@@ -890,6 +938,19 @@ func totalChars(t []antigravityTurn) int {
 		n += len(x.Content)
 	}
 	return n
+}
+
+// antigravityTurnPrompt decides what text a turn sends. A turn with a known
+// native conversation ID (native resume) or a brand-new conversation (no prior
+// history) sends the bare prompt. When there is prior history but no resumable
+// native ID — capture failed on an earlier turn, or the CLI never emitted one —
+// it sends the bounded transcript replay so the follow-up keeps context instead
+// of silently becoming stateless. replay reports whether replay was used.
+func antigravityTurnPrompt(nativeID string, transcript []antigravityTurn, newUserText string) (prompt string, replay bool) {
+	if nativeID == "" && len(transcript) > 0 {
+		return buildAntigravityReplayPrompt(transcript, newUserText), true
+	}
+	return newUserText, false
 }
 
 func buildAntigravityReplayPrompt(transcript []antigravityTurn, newUserText string) string {

@@ -117,6 +117,33 @@ func TestBuildAntigravityReplayPrompt_RetainsCurrentUserTurn(t *testing.T) {
 	}
 }
 
+func TestAntigravityTurnPrompt_ReplaysWhenNoNativeIDButHistory(t *testing.T) {
+	tr := []antigravityTurn{
+		{Role: "user", Content: "secret is ORANGE", At: time.Now()},
+		{Role: "assistant", Content: "OK", At: time.Now()},
+	}
+
+	// First turn: no native ID, no history -> bare prompt, no replay.
+	if p, replay := antigravityTurnPrompt("", nil, "hi"); replay || p != "hi" {
+		t.Fatalf("first turn should send bare prompt without replay, got prompt=%q replay=%v", p, replay)
+	}
+
+	// Follow-up with a captured native ID -> native resume, bare prompt.
+	if p, replay := antigravityTurnPrompt("native-123", tr, "what is the secret?"); replay || p != "what is the secret?" {
+		t.Fatalf("native-resume turn should send bare prompt, got prompt=%q replay=%v", p, replay)
+	}
+
+	// Follow-up where capture failed (no native ID) but history exists -> replay
+	// so context is not silently lost.
+	p, replay := antigravityTurnPrompt("", tr, "what is the secret?")
+	if !replay {
+		t.Fatalf("expected replay when history exists but no native ID")
+	}
+	if !strings.Contains(p, "ORANGE") || !strings.Contains(p, "what is the secret?") {
+		t.Fatalf("replay prompt must carry prior context and current turn, got %q", p)
+	}
+}
+
 func TestRedactAntigravitySecrets(t *testing.T) {
 	in := "Authorization: Bearer supersecrettoken12345 and api_key=abcdefghijklmnop"
 	out := redactAntigravitySecrets(in)
