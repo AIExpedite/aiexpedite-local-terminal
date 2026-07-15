@@ -15,6 +15,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -408,9 +410,44 @@ func grokAuthNotice(base, account string, now time.Time) (string, string) {
 		return "Grok login has expired — run `grok login` on the terminal computer to re-authenticate.", "error"
 	}
 	if expiry.Before(now.Add(grokAuthExpiryWarnWindow)) {
-		return "Grok login expires soon — run `grok login` on the terminal computer to avoid an interrupted session.", "warning"
+		// Surface the exact expiry instant (in the terminal computer's local time,
+		// where `grok login` must be re-run) plus a coarse time-remaining hint, then
+		// the re-login instruction on its own line. The frontend Alert renders the
+		// notice with `white-space: pre-line`, so the `\n` becomes a real line break.
+		when := expiry.Local().Format("1/2/2006, 3:04 PM")
+		return fmt.Sprintf(
+			"Grok login expires %s (%s)\nRun `grok login` on the terminal computer to avoid an interrupted session.",
+			when, humanizeGrokRemaining(expiry.Sub(now)),
+		), "warning"
 	}
 	return "", ""
+}
+
+// humanizeGrokRemaining renders a coarse "time left" hint for the expiry banner
+// — minutes under an hour, whole hours up to two days, whole days beyond — so
+// the notice reads e.g. "(45 min)", "(2 hrs)", "(3 days)". Always at least
+// "1 min" so a token expiring within the current minute never reads "(0 min)".
+func humanizeGrokRemaining(d time.Duration) string {
+	switch {
+	case d < time.Hour:
+		m := int(math.Round(d.Minutes()))
+		if m < 1 {
+			m = 1
+		}
+		return fmt.Sprintf("%d min", m)
+	case d < 48*time.Hour:
+		h := int(math.Round(d.Hours()))
+		if h == 1 {
+			return "1 hr"
+		}
+		return fmt.Sprintf("%d hrs", h)
+	default:
+		days := int(math.Round(d.Hours() / 24))
+		if days == 1 {
+			return "1 day"
+		}
+		return fmt.Sprintf("%d days", days)
+	}
 }
 
 // readGrokAccountAndPlan extracts the account identifier and plan from the Grok

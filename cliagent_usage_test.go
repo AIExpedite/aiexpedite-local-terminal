@@ -1079,14 +1079,24 @@ func TestGrokUsageParser_AuthExpiringSoonNotice(t *testing.T) {
 	t.Setenv("GROK_HOME", "")
 	home := t.TempDir()
 	now := time.Now()
-	helperWriteGrokScopedAuth(t, home, now.Add(6*time.Hour), nil) // within the 24h warn window
+	expiry := now.Add(6 * time.Hour)
+	helperWriteGrokScopedAuth(t, home, expiry, nil) // within the 24h warn window
 
 	usage, _ := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
 	if usage.NoticeSeverity != "warning" {
 		t.Errorf("NoticeSeverity=%q, want warning", usage.NoticeSeverity)
 	}
-	if !strings.Contains(usage.Notice, "expires soon") {
-		t.Errorf("Notice=%q, want an expiring-soon prompt", usage.Notice)
+	// The warning now names the exact expiry instant + a coarse time-left hint,
+	// then the re-login instruction on its own line.
+	wantWhen := expiry.Local().Format("1/2/2006, 3:04 PM")
+	if !strings.Contains(usage.Notice, "Grok login expires "+wantWhen) {
+		t.Errorf("Notice=%q, want the exact expiry time %q", usage.Notice, wantWhen)
+	}
+	if !strings.Contains(usage.Notice, "(6 hrs)") {
+		t.Errorf("Notice=%q, want a '(6 hrs)' time-remaining hint", usage.Notice)
+	}
+	if !strings.Contains(usage.Notice, "\nRun `grok login`") {
+		t.Errorf("Notice=%q, want the re-login instruction on a new line", usage.Notice)
 	}
 }
 
