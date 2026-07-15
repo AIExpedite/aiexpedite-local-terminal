@@ -1,10 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -376,5 +380,104 @@ func TestLegacyBuildAntigravityInteractiveArgs_Unchanged(t *testing.T) {
 	// Prompt remains positional on the legacy path.
 	if args[len(args)-1] != "do the task" {
 		t.Fatalf("legacy path keeps positional prompt: %#v", args)
+	}
+}
+
+func TestAntigravityNativeEnvelopePublishable_AcceptsNormalMessage(t *testing.T) {
+	msg := resultMsg{
+		ID:     "sess",
+		UID:    "uid",
+		Output: "hello from antigravity",
+		Status: "success",
+		Type:   "antigravity_native_message",
+	}
+	if err := antigravityNativeEnvelopePublishable(msg); err != nil {
+		t.Fatalf("expected publishable envelope: %v", err)
+	}
+}
+
+func TestAntigravityNativeEnvelopePublishable_RejectsJSONInflatedPayload(t *testing.T) {
+	// Backslashes double under JSON string escaping. ~5.5 MiB of "\" becomes
+	// >10 MiB marshaled while still under the raw 8 MiB stdout capture cap —
+	// the failure mode Codex called out for silent Pub/Sub rejection.
+	raw := strings.Repeat("\\", 5_500_000)
+	if len(raw) > antigravityNativeMaxStdout {
+		t.Fatalf("test payload must stay under stdout cap; got %d", len(raw))
+	}
+	msg := resultMsg{
+		ID:     "sess",
+		UID:    "uid",
+		Output: raw,
+		Status: "success",
+		Type:   "antigravity_native_message",
+	}
+	encoded, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if len(encoded) <= antigravityNativeMaxPublishSize {
+		t.Fatalf("test setup: expected marshaled size > %d, got %d", antigravityNativeMaxPublishSize, len(encoded))
+	}
+	if err := antigravityNativeEnvelopePublishable(msg); err == nil {
+		t.Fatal("expected oversize envelope to be rejected")
+	} else if !strings.Contains(err.Error(), "publishable limit") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSetActiveProcess_CancelsWhenAlreadyEnded(t *testing.T) {
+	// End-before-registration race: session is already ended when the one-shot
+	// process finally stores activeCancel. setActiveProcess must invoke cancel
+	// immediately so tools cannot keep running after stop.
+	s := &AntigravityNativeSession{status: "ended"}
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("ping", "-n", "30", "127.0.0.1")
+	} else {
+		cmd = exec.Command("sleep", "30")
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start long-running process: %v", err)
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	}()
+
+	var cancelled atomic.Bool
+	cancel := func() {
+		cancelled.Store(true)
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}
+	s.setActiveProcess(cmd, cancel)
+	if !cancelled.Load() {
+		t.Fatal("expected cancel to run when session already ended")
+	}
+
+	// Process should exit promptly after kill.
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+		// ok
+	case <-time.After(3 * time.Second):
+		t.Fatal("process still running after ended-session cancel")
+	}
+}
+
+func TestSetActiveProcess_DoesNotCancelWhenRunning(t *testing.T) {
+	s := &AntigravityNativeSession{status: "running"}
+	var cancelled atomic.Bool
+	s.setActiveProcess(nil, func() { cancelled.Store(true) })
+	if cancelled.Load() {
+		t.Fatal("cancel must not run for non-ended session")
+	}
+	if s.activeCancel == nil {
+		t.Fatal("activeCancel should be stored")
 	}
 }

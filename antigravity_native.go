@@ -60,6 +60,10 @@ const (
 	// Cache capability probes so Start does not spawn `agy --version` on every
 	// chat open. Invalidated after this TTL or when a probe fails.
 	antigravityCapabilityCacheTTL = 5 * time.Minute
+	// GCP Pub/Sub documented per-message publish ceiling. Authoritative gate
+	// after marshaling the resultMsg envelope (JSON escaping can inflate raw
+	// stdout that already fits antigravityNativeMaxStdout).
+	antigravityNativeMaxPublishSize = 10_000_000
 )
 
 /* --------------------------------------------------------------------------
@@ -107,11 +111,19 @@ func (s *AntigravityNativeSession) setStatus(st string) {
 	s.mu.Unlock()
 }
 
+// setActiveProcess registers the in-flight one-shot process. If End already
+// marked the session ended (race before activeCancel was stored), the cancel
+// callback is invoked immediately so a late-started agy process cannot keep
+// running tools after the chat was stopped.
 func (s *AntigravityNativeSession) setActiveProcess(cmd *exec.Cmd, cancel func()) {
 	s.mu.Lock()
+	ended := s.status == "ended"
 	s.activeProcess = cmd
 	s.activeCancel = cancel
 	s.mu.Unlock()
+	if ended && cancel != nil {
+		cancel()
+	}
 }
 
 func (s *AntigravityNativeSession) clearActiveProcess() {
@@ -402,10 +414,6 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 			"Antigravity produced no response (empty completion is not treated as success)")
 	}
 
-	// Append transcript (bounded).
-	session.Transcript = appendAntigravityTranscript(session.Transcript, "user", text)
-	session.Transcript = appendAntigravityTranscript(session.Transcript, "assistant", outText)
-
 	messageOut := outText
 	if usedReplay {
 		// Structured marker for frontend/telemetry — stripped before rendering.
@@ -413,7 +421,7 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	}
 
 	seq := int(atomic.AddInt64(&session.seq, 1))
-	publishFn(resultMsg{
+	msg := resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,
@@ -425,7 +433,20 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 		SessionID:   session.ID,
 		Seq:         seq,
 		ExitCode:    exitCode,
-	})
+	}
+	// Preflight marshaled size: JSON escaping of quotes/backslashes can push an
+	// under-stdout-cap payload over Pub/Sub's 10 MB limit. newSessionPublishFn
+	// only logs publish failures, so treat oversize as an explicit turn error
+	// before appending transcript or claiming success.
+	if err := antigravityNativeEnvelopePublishable(msg); err != nil {
+		return m.publishTurnError(session, publishFn, err.Error())
+	}
+
+	// Append transcript only after the completion is known to be publishable.
+	session.Transcript = appendAntigravityTranscript(session.Transcript, "user", text)
+	session.Transcript = appendAntigravityTranscript(session.Transcript, "assistant", outText)
+
+	publishFn(msg)
 
 	fmt.Printf("%s[antigravity-native] Turn complete on %s (chars=%d replay=%v)%s\n",
 		colorGreen, id, len(outText), usedReplay, colorReset)
@@ -459,6 +480,11 @@ func (m *AntigravityNativeManager) runOneShot(
 		return "", "", 0, false, false, fmt.Errorf("stderr pipe: %w", err)
 	}
 
+	// Avoid spawning when End already won the race during turn setup.
+	if session.Status() == "ended" {
+		return "", "", 0, false, false, fmt.Errorf("session ended during turn")
+	}
+
 	if err := cmd.Start(); err != nil {
 		return "", "", 0, false, false, fmt.Errorf("failed to start agy (is Antigravity CLI installed?): %w", err)
 	}
@@ -477,6 +503,8 @@ func (m *AntigravityNativeManager) runOneShot(
 			}
 		})
 	})
+	// setActiveProcess kills immediately if End already marked the session
+	// ended before cancel was stored (including the cmd.Start window).
 	session.setActiveProcess(cmd, func() {
 		timer.Stop()
 		_ = interruptProcess(cmd)
@@ -649,6 +677,22 @@ func (m *AntigravityNativeManager) publishTurnError(session *AntigravityNativeSe
 		Seq:         seq,
 	})
 	return fmt.Errorf("%s", msg)
+}
+
+// antigravityNativeEnvelopePublishable returns an error when the marshaled
+// resultMsg cannot fit in a single Pub/Sub publish (or cannot marshal).
+func antigravityNativeEnvelopePublishable(msg resultMsg) error {
+	encoded, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("Antigravity response failed to marshal: %w", err)
+	}
+	if len(encoded) > antigravityNativeMaxPublishSize {
+		return fmt.Errorf(
+			"Antigravity response marshaled to %d bytes after JSON escaping, exceeding the %d-byte publishable limit",
+			len(encoded), antigravityNativeMaxPublishSize,
+		)
+	}
+	return nil
 }
 
 /* --------------------------------------------------------------------------
