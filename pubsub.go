@@ -1545,6 +1545,12 @@ func runPubSubConnection(cfg *Config) error {
 		// successful exit code was the previous behavior, and it dropped
 		// screenshots from the crashes we most needed to debug.
 		if cfg.EnableFileUpload {
+			// Resolve a single, correctly-scoped scan dir (unchanged
+			// precedence): the post-`cd` tracked cwd, else the command's
+			// own cwd, else the home WorkingDirectory as last resort. These
+			// are NOT scanned together — walking the default home tree on
+			// top of the real exec dir would sweep up unrelated fresh media
+			// and make detection expensive.
 			effectiveDir := getTrackedCwd()
 			if effectiveDir == "" {
 				effectiveDir = cmd.Cwd
@@ -1553,6 +1559,10 @@ func runPubSubConnection(cfg *Config) error {
 				effectiveDir = cfg.WorkingDirectory
 			}
 			files := detectOutputFilesSince(effectiveDir, cmdStartedAt)
+			// Always log the scan outcome so a zero-file result is
+			// diagnosable rather than silent (mirrors the session path).
+			fmt.Printf("[file-upload] Command %s: scanned %s since %s → %d media file(s)\n",
+				cmd.ID, effectiveDir, cmdStartedAt.Format(time.RFC3339), len(files))
 			if len(files) > 0 {
 				// Security: Block file upload if workspaceID is missing
 				workspaceID := extractWorkspaceID(cmd)

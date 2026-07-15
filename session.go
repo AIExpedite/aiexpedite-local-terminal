@@ -1256,6 +1256,19 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	var uploadErrors []UploadError
 	cfg := sm.Config
 	if cfg != nil && cfg.EnableFileUpload && session.WorkspaceID != "" {
+		// Scope the scan to THIS session's own spawn dir. Process.Dir is
+		// per-session; getTrackedCwd() is a process-wide value mutated by
+		// unrelated one-shot commands, so it's only a last-resort fallback
+		// when Process.Dir is empty — never an additional root (scanning it
+		// while another workspace's command wrote fresh media there would
+		// upload those files under THIS session's workspaceID).
+		//
+		// NOTE: when a bundled CLI agent is launched in the home dir and
+		// `cd`s into the repo, its screenshots land in a SIBLING of
+		// Process.Dir and this walk won't see them. That's fixed upstream
+		// by spawning the session IN the repo (ai-service seeds `cwd` →
+		// Process.Dir); the always-on log line below makes the miss
+		// diagnosable if the cwd hint is ever absent.
 		effectiveDir := session.Process.Dir
 		if effectiveDir == "" {
 			effectiveDir = getTrackedCwd()
@@ -1268,6 +1281,13 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 			fmt.Printf("[session-file-upload] Skipping upload for session %s — no effective workdir (Process.Dir and trackedCwd both empty)\n", session.ID)
 		} else {
 			files := detectOutputFilesSince(effectiveDir, session.StartedAt)
+			// Always log the scan outcome (root + count), even on zero
+			// hits. A silent zero-file result was previously
+			// indistinguishable from "upload disabled" — this line is what
+			// turns a future `hasFiles:false` report into a one-grep
+			// diagnosis (scan root vs. where the agent actually wrote).
+			fmt.Printf("[session-file-upload] Session %s: scanned %s since %s → %d media file(s)\n",
+				session.ID, effectiveDir, session.StartedAt.Format(time.RFC3339), len(files))
 			if len(files) > 0 {
 				fmt.Printf("[session-file-upload] Detected %d output files, uploading to GCS (workspace: %s)...\n", len(files), session.WorkspaceID)
 
