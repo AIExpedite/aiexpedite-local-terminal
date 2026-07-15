@@ -11,10 +11,26 @@ import (
 	"time"
 )
 
+// clearClaudeEnvAuth zeroes every env credential the status-line env-auth guard
+// consults, so a captureClaudeRateLimitsFromStatusline call writes the cache
+// deterministically regardless of a dev/CI shell exporting one of them (which
+// would otherwise make the guard skip the write and fail the cache-write assert).
+func clearClaudeEnvAuth(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{
+		"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+		"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+		"CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_MANTLE",
+	} {
+		t.Setenv(k, "")
+	}
+}
+
 func TestCaptureClaudeRateLimitsFromStatusline_BothWindows(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
 	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // unscoped fingerprint ""
+	clearClaudeEnvAuth(t)                      // env-auth would make the hook skip the write
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	fiveReset := now.Add(time.Hour).Unix()
@@ -98,17 +114,7 @@ func TestCaptureClaudeRateLimitsFromStatusline_ScopesByActiveCredential(t *testi
 		return snap.AccountFingerprint, true
 	}
 
-	// clearEnvAuth zeroes every env credential the guard consults so each subtest
-	// starts from a clean "subscription only" baseline before setting its one var.
-	clearEnvAuth := func(t *testing.T) {
-		for _, k := range []string{
-			"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
-			"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
-			"CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_MANTLE",
-		} {
-			t.Setenv(k, "")
-		}
-	}
+	clearEnvAuth := clearClaudeEnvAuth
 
 	t.Run("credential account, no env -> written & scoped", func(t *testing.T) {
 		configDir := t.TempDir()
