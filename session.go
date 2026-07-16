@@ -253,25 +253,52 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	if err != nil {
 		return fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
-	stdout, err := proc.StdoutPipe()
+	// Own the stdout/stderr READ ends ourselves via os.Pipe rather than
+	// proc.StdoutPipe()/StderrPipe(). With the exec-owned pipes, Process.Wait()
+	// closes the read end the instant the child is reaped — discarding any bytes
+	// still buffered in the pipe that the scanner goroutine hasn't read yet.
+	// Reaping is independent of draining, so a background Wait() or a fixed
+	// grace can't avoid the loss. For a fast one-shot (`sh -c 'printf …'`) the
+	// child can exit before the scanner is even scheduled, dropping its entire
+	// output — observed as the flaky TestStartSession_UtilityGetsHeadlessGitEnv
+	// `streamed=""` failure under -race. Owning the read ends means only the
+	// child's exit (closing the write end) produces EOF, so the scanner always
+	// drains every byte first; Wait() no longer touches these fds. waitForExit
+	// still force-closes them to unblock a scanner stuck on a lingering Windows
+	// pipe handle (see its comment) — that path is unchanged.
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		stdin.Close()
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
-	stderr, err := proc.StderrPipe()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
 		stdin.Close()
-		stdout.Close()
+		stdoutR.Close()
+		stdoutW.Close()
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
+	proc.Stdout = stdoutW
+	proc.Stderr = stderrW
+	stdout := stdoutR
+	stderr := stderrR
 
 	// Start the process
 	if err := proc.Start(); err != nil {
 		stdin.Close()
-		stdout.Close()
-		stderr.Close()
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
 		return fmt.Errorf("failed to start %s: %w", command, err)
 	}
+
+	// The child now holds its own dup of the write ends; close the parent's
+	// copies so the read ends see EOF when (and only when) the child exits.
+	// Without this the parent stays a writer and the scanners never EOF. Must
+	// run after Start (that's where the fds are handed to the child).
+	stdoutW.Close()
+	stderrW.Close()
 
 	session := &CLISession{
 		ID:          id,
