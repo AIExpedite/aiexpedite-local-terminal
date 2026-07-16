@@ -311,14 +311,21 @@ func ackExistingAntigravitySession(existing *AntigravityNativeSession, id string
 // message, update the native conversation ID, and append to the bounded
 // transcript. publishFn receives message / stderr / error frames; the logical
 // session stays open (idle) after a successful turn so the user can retry.
+// publishCompletion publishes the single ack-critical terminal completion frame
+// and returns its publish error so a lost completion is surfaced as a turn error
+// instead of silently advancing the transcript (see the completion site below);
+// when nil it falls back to publishFn (fire-and-forget).
 //
 // Replay recovery runs only when native resume is active AND the CLI reports a
 // recognized missing/stale conversation — never on generic non-zero exits
 // (auth, timeout, tool failures), which would burn a second model call and
 // silently start a new conversation.
-func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, turnTimeout time.Duration) error {
+func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, publishCompletion PublishResultFunc, turnTimeout time.Duration) error {
 	if publishFn == nil {
 		return fmt.Errorf("publishFn is required")
+	}
+	if publishCompletion == nil {
+		publishCompletion = func(res resultMsg) error { publishFn(res); return nil }
 	}
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -566,11 +573,21 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 		return m.publishTurnError(session, publishFn, err.Error())
 	}
 
-	// Append transcript only after the completion is known to be publishable.
+	// Publish the ack-critical completion BEFORE recording the turn, via the
+	// error-returning path. newSessionPublishFn swallows publish errors, so a
+	// transient Pub/Sub failure on this frame would otherwise leave the chat
+	// stuck running while the local transcript silently advanced — the next
+	// turn would then resume assistant context the UI never received. On
+	// delivery failure, surface a retryable turn error and leave the transcript
+	// untouched so no hidden turn leaks into a later resume/replay.
+	if err := publishCompletion(msg); err != nil {
+		return m.publishTurnError(session, publishFn,
+			"Antigravity completed but the response could not be delivered; please retry")
+	}
+
+	// Append transcript only after the completion is confirmed delivered.
 	session.Transcript = appendAntigravityTranscript(session.Transcript, "user", text)
 	session.Transcript = appendAntigravityTranscript(session.Transcript, "assistant", outText)
-
-	publishFn(msg)
 
 	fmt.Printf("%s[antigravity-native] Turn complete on %s (chars=%d replay=%v)%s\n",
 		colorGreen, id, len(outText), usedReplay, colorReset)

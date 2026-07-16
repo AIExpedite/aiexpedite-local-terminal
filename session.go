@@ -156,6 +156,11 @@ func NewSessionManager(cfg *Config) *SessionManager {
 // PublishFunc is the callback signature for publishing result messages.
 type PublishFunc func(res resultMsg)
 
+// PublishResultFunc publishes a result frame and returns any publish error so
+// the caller can confirm an ack-critical frame (e.g. a turn's terminal
+// completion) was actually delivered before recording it or claiming success.
+type PublishResultFunc func(res resultMsg) error
+
 /* --------------------------------------------------------------------------
    StartSession — spawn a new interactive CLI process
    -------------------------------------------------------------------------- */

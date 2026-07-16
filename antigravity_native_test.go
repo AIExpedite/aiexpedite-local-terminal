@@ -1051,7 +1051,7 @@ func TestAntigravityNativeManager_SendNonzeroExitWithStdoutIsError(t *testing.T)
 		frames = append(frames, res)
 	}
 
-	err := m.Send(id, "hello", publishFn, 10*time.Second)
+	err := m.Send(id, "hello", publishFn, nil, 10*time.Second)
 	if err == nil {
 		t.Fatal("expected Send to fail on non-zero agy exit")
 	}
@@ -1081,6 +1081,81 @@ func TestAntigravityNativeManager_SendNonzeroExitWithStdoutIsError(t *testing.T)
 	}
 	if len(sess.Transcript) != 0 {
 		t.Fatalf("failed turn must not append transcript, got %#v", sess.Transcript)
+	}
+	_ = m.End(id)
+}
+
+func TestAntigravityNativeManager_CompletionPublishFailureIsTurnError(t *testing.T) {
+	// A successful agy run whose terminal completion cannot be delivered must
+	// surface a retryable turn error and must NOT advance the transcript — a
+	// silently swallowed publish would otherwise strand the chat running while
+	// the next turn resumes an assistant turn the UI never received.
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim for fake agy is unix-oriented")
+	}
+
+	binDir := t.TempDir()
+	fakeAgy := filepath.Join(binDir, "agy")
+	// Exit 0 with a complete assistant response so the completion path is reached.
+	script := "#!/bin/sh\necho 'the answer is 42'\nexit 0\n"
+	if err := os.WriteFile(fakeAgy, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewAntigravityNativeManager()
+	cwd := t.TempDir()
+	id := "sess-publish-fail"
+
+	m.mu.Lock()
+	m.sessions[id] = &AntigravityNativeSession{
+		ID:          id,
+		Cwd:         cwd,
+		WorkspaceID: "ws",
+		UID:         "uid",
+		StartedAt:   time.Now(),
+		status:      "idle",
+	}
+	m.mu.Unlock()
+
+	var frames []resultMsg
+	publishFn := func(res resultMsg) {
+		frames = append(frames, res)
+	}
+	// Completion delivery fails transiently.
+	publishCompletion := func(resultMsg) error {
+		return fmt.Errorf("pubsub unavailable")
+	}
+
+	err := m.Send(id, "hello", publishFn, publishCompletion, 10*time.Second)
+	if err == nil {
+		t.Fatal("expected Send to fail when the completion cannot be published")
+	}
+
+	// A terminal error frame must be emitted (chat leaves running), and no
+	// success completion may be recorded as delivered.
+	var sawError, sawSuccess bool
+	for _, f := range frames {
+		if f.Type == "antigravity_native_error" {
+			sawError = true
+		}
+		if f.Type == "antigravity_native_message" && f.Status == "success" {
+			sawSuccess = true
+		}
+	}
+	if !sawError {
+		t.Fatalf("expected antigravity_native_error frame on publish failure, got %#v", frames)
+	}
+	if sawSuccess {
+		t.Fatalf("must not report a delivered success completion via publishFn: %#v", frames)
+	}
+
+	sess := m.Get(id)
+	if sess == nil {
+		t.Fatal("session should remain registered after undelivered completion")
+	}
+	if len(sess.Transcript) != 0 {
+		t.Fatalf("undelivered completion must not append transcript, got %#v", sess.Transcript)
 	}
 	_ = m.End(id)
 }
@@ -1138,7 +1213,7 @@ func TestAntigravityNativeManager_NativeIDNotAdoptedOnNonzeroExit(t *testing.T) 
 	}
 	m.mu.Unlock()
 
-	err := m.Send(id, "hello", func(resultMsg) {}, 10*time.Second)
+	err := m.Send(id, "hello", func(resultMsg) {}, nil, 10*time.Second)
 	if err == nil {
 		t.Fatal("expected Send to fail on non-zero agy exit")
 	}
@@ -1190,7 +1265,7 @@ func TestAntigravityNativeManager_TimeoutReapsProcessTree(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- m.Send(id, "hello", func(resultMsg) {}, 1*time.Second)
+		done <- m.Send(id, "hello", func(resultMsg) {}, nil, 1*time.Second)
 	}()
 
 	// turnTimeout (1s) + graceful kill wait (~3s) ≈ 4s. If the child were not
@@ -1243,7 +1318,7 @@ func TestAntigravityNativeManager_EndWaitsForInFlightTurn(t *testing.T) {
 	sendDone := make(chan struct{})
 	go func() {
 		defer close(sendDone)
-		_ = m.Send(id, "hello", func(resultMsg) {}, 120*time.Second)
+		_ = m.Send(id, "hello", func(resultMsg) {}, nil, 120*time.Second)
 	}()
 
 	// Wait until the turn has actually spawned agy before ending.

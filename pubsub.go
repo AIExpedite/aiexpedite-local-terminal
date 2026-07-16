@@ -3639,7 +3639,17 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 		if cmd.TimeoutMs > 0 {
 			timeout = time.Duration(cmd.TimeoutMs) * time.Millisecond
 		}
-		if err := globalAntigravityNativeManager.Send(cmd.SessionID, cmd.Input, publishFn, timeout); err != nil {
+		// Error-returning publisher for the ack-critical turn completion. Uses a
+		// fresh background context (the receive-callback ctx is cancelled on ack)
+		// with the same 30s bound newSessionPublishFn applies, so a lost
+		// completion becomes a retryable turn error instead of a silently dropped
+		// frame that strands the chat running.
+		publishCompletion := func(res resultMsg) error {
+			pubCtx, pubCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer pubCancel()
+			return publishMsg(pubCtx, topic, res)
+		}
+		if err := globalAntigravityNativeManager.Send(cmd.SessionID, cmd.Input, publishFn, publishCompletion, timeout); err != nil {
 			// Send publishes antigravity_native_error for ordinary turn failures
 			// (timeout, empty response, oversize). Publish here only when Send
 			// could not (missing/ended session) so the UI never stays stuck
