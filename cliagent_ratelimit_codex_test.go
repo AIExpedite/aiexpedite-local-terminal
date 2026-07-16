@@ -1584,3 +1584,83 @@ func TestCaptureCodexRateLimit_FullSnapshotOmitsIdentityWithinSharedSlot(t *test
 		t.Errorf("weekly row=%+v, want Unknown — the stale weekly identity sharing the primary slot must be reconciled away", metrics[1])
 	}
 }
+
+// Finding (empty-full-snapshot precision): a full account/rateLimits/read whose
+// container is NON-empty but yields no recognised windows — unknown window keys,
+// or an unparseable/empty bucket object like primary:{} — is NOT authoritative
+// "clear all". Such forward-compatible or partial reads must preserve prior live
+// observations, exactly as the old early-return did. Only a literal {} clears.
+func TestCaptureCodexRateLimit_FullSnapshotUnknownKeysPreserveCache(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed live session + weekly observations.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{`+
+			`"primary":{"used_percent":30,"window_minutes":300,"resets_in_seconds":1800},`+
+			`"secondary":{"used_percent":40,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+	if snap, ok := loadCodexRateLimitSnapshot(cache); !ok || len(snap.Buckets) != 2 {
+		t.Fatalf("seed should cache two windows, got ok=%v %+v", ok, snap.Buckets)
+	}
+
+	// Full read carrying only an UNKNOWN window key — nothing we recognise, and
+	// not a literal {}. Must be a no-op, not a cache wipe.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","id":8,"result":{"rateLimits":{"tertiary":{"used_percent":5,"window_minutes":60,"resets_in_seconds":3600}}}}`,
+		now.Add(time.Minute),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if p, present := snap.Buckets[codexWindowPrimary]; !present || p.UsedPercentage != 30 {
+		t.Errorf("primary must survive a full read of only unknown keys: %+v", snap.Buckets)
+	}
+	if s, present := snap.Buckets[codexWindowSecondary]; !present || s.UsedPercentage != 40 {
+		t.Errorf("secondary must survive a full read of only unknown keys: %+v", snap.Buckets)
+	}
+}
+
+// Companion to the above: a full read whose recognised window carries an
+// unparseable bucket object (primary:{} — no usage, no reset) extracts nothing,
+// so it is not authoritative-empty and must preserve the prior cache.
+func TestCaptureCodexRateLimit_FullSnapshotUnparseableBucketPreservesCache(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{`+
+			`"primary":{"used_percent":30,"window_minutes":300,"resets_in_seconds":1800},`+
+			`"secondary":{"used_percent":40,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+
+	// Full read with an empty bucket object for a recognised window: codexBucketFromInfo
+	// rejects it (no usage/reset), so extraction yields nothing.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","id":9,"result":{"rateLimits":{"primary":{}}}}`,
+		now.Add(time.Minute),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if p, present := snap.Buckets[codexWindowPrimary]; !present || p.UsedPercentage != 30 {
+		t.Errorf("primary must survive a full read carrying only an unparseable bucket: %+v", snap.Buckets)
+	}
+	if s, present := snap.Buckets[codexWindowSecondary]; !present || s.UsedPercentage != 40 {
+		t.Errorf("secondary must survive a full read carrying only an unparseable bucket: %+v", snap.Buckets)
+	}
+	metrics := codexMetricsFromCache(now.Add(time.Minute), "")
+	if metrics[0].Unknown || metrics[1].Unknown {
+		t.Errorf("both rows should remain known after a non-authoritative full read, got [%+v %+v]", metrics[0], metrics[1])
+	}
+}

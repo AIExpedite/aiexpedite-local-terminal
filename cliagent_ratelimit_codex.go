@@ -224,7 +224,7 @@ func codexBucketFromInfo(info map[string]interface{}, now time.Time) (codexRateL
 // window there means "no update for this window," not "clear it," so we
 // only honour clears that arrive via the `result` path.
 func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (map[string]map[string]codexRateLimitBucket, map[string]bool) {
-	out, clears, _, _ := extractCodexRateLimitBucketsFull(raw, now)
+	out, clears, _, _, _ := extractCodexRateLimitBucketsFull(raw, now)
 	return out, clears
 }
 
@@ -239,11 +239,21 @@ func extractCodexRateLimitBuckets(raw map[string]interface{}, now time.Time) (ma
 // snapshot explicitly nulled, so a reclassified/omitted window is reconciled
 // against the complete picture. Callers that only need the buckets/clears use
 // the thin extractCodexRateLimitBuckets wrapper above.
-func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time) (map[string]map[string]codexRateLimitBucket, map[string]bool, bool, map[string]bool) {
+func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time) (map[string]map[string]codexRateLimitBucket, map[string]bool, bool, map[string]bool, bool) {
 	out := map[string]map[string]codexRateLimitBucket{}
 	clears := map[string]bool{}
 	fullSnapshot := false
 	present := map[string]bool{}
+	// sawEmptyFullContainer records that a full-snapshot rate-limit container
+	// (`rateLimits` / `rateLimitsByLimitId`) was present but literally empty
+	// (`{}`). That is the ONLY shape that authoritatively declares "this account
+	// now has zero quota windows" and may clear the cache. A full snapshot whose
+	// container is non-empty but yields nothing we recognise (unknown window
+	// keys, unparseable `primary:{}` bucket objects, forward-compatible fields)
+	// must NOT be treated as authoritative-empty — that would let a partial or
+	// forward-compatible read erase live observations. Such frames fall back to
+	// the same no-op the old early-return produced.
+	sawEmptyFullContainer := false
 	addContributor := func(window, limit string, b codexRateLimitBucket) {
 		if out[window] == nil {
 			out[window] = map[string]codexRateLimitBucket{}
@@ -306,6 +316,9 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 			if rl, ok := v.(map[string]interface{}); ok {
 				if c.fullSnapshot {
 					fullSnapshot = true
+					if len(rl) == 0 {
+						sawEmptyFullContainer = true
+					}
 				}
 				for window, val := range rl {
 					id, ok := codexWindowAliases[window]
@@ -342,6 +355,9 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 			if rl, ok := v.(map[string]interface{}); ok {
 				if c.fullSnapshot {
 					fullSnapshot = true
+					if len(rl) == 0 {
+						sawEmptyFullContainer = true
+					}
 				}
 				for limitKey, val := range rl {
 					info, ok := val.(map[string]interface{})
@@ -422,7 +438,12 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 			}
 		}
 	}
-	return out, clears, fullSnapshot, present
+	// Authoritative-empty: a full snapshot carried an empty container AND produced
+	// no buckets and no explicit clears. Only then may the merger clear the whole
+	// cache. If the frame extracted anything (buckets → present non-empty, or an
+	// explicit null → clears), those signals drive reconciliation instead.
+	emptyAuthoritative := sawEmptyFullContainer && len(out) == 0 && len(clears) == 0
+	return out, clears, fullSnapshot, present, emptyAuthoritative
 }
 
 // aggregateCodexBuckets folds per-(window, limit) contributors into a single
@@ -852,16 +873,19 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
 		return
 	}
-	updates, clears, fullSnapshot, present := extractCodexRateLimitBucketsFull(raw, now)
+	updates, clears, fullSnapshot, present, emptyAuthoritative := extractCodexRateLimitBucketsFull(raw, now)
 	// A full snapshot must be processed even when it carries no buckets and no
-	// explicit nulls: an authoritative `account/rateLimits/read` response whose
-	// `rateLimits` object is empty (`{}`) is declaring the account now has NO
-	// quota windows, so every cached observation has to be reconciled away. Only
-	// sparse frames with nothing to say are dropped here.
-	if len(updates) == 0 && len(clears) == 0 && !fullSnapshot {
+	// explicit nulls IF it is authoritative-empty: an `account/rateLimits/read`
+	// response whose container is literally `{}` declares the account now has NO
+	// quota windows, so every cached observation has to be reconciled away. A full
+	// snapshot that is non-empty but yields nothing recognised (unknown keys,
+	// unparseable buckets, forward-compatible fields) is NOT authoritative-empty
+	// and is dropped here, exactly like a sparse frame with nothing to say — it
+	// must never erase live observations.
+	if len(updates) == 0 && len(clears) == 0 && !emptyAuthoritative {
 		return
 	}
-	mergeCodexRateLimitCachePerLimit(codexRateLimitCachePath(), updates, clears, fullSnapshot, present, now, currentCodexAccountFingerprint())
+	mergeCodexRateLimitCachePerLimit(codexRateLimitCachePath(), updates, clears, fullSnapshot, present, emptyAuthoritative, now, currentCodexAccountFingerprint())
 }
 
 // mergeCodexRateLimitCache is the flat-shape entry point preserved for callers
@@ -878,8 +902,8 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 		perLimit[window] = map[string]codexRateLimitBucket{codexLegacyLimitID: bucket}
 	}
 	// Flat callers are pre-aggregated sparse updates, never full snapshots, so
-	// no full-snapshot omission reconcile applies (present is unused).
-	mergeCodexRateLimitCachePerLimit(path, perLimit, clears, false, nil, now, fingerprint)
+	// no full-snapshot omission reconcile applies (present/emptyAuthoritative unused).
+	mergeCodexRateLimitCachePerLimit(path, perLimit, clears, false, nil, false, now, fingerprint)
 }
 
 // mergeCodexRateLimitCachePerLimit read-modify-writes the cache, preserving
@@ -900,17 +924,20 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 // stale duplicate of the same window that migrated storage slots (sparse-safe),
 // and — for full snapshots only — omission reconcile drops any cached window the
 // authoritative complete picture no longer mentions. `fullSnapshot`/`present`
-// come from extractCodexRateLimitBucketsFull; sparse callers pass (false, nil).
+// come from extractCodexRateLimitBucketsFull; sparse callers pass
+// (false, nil, false). `emptyAuthoritative` marks a full snapshot whose container
+// was literally `{}` — the only shape allowed to clear the whole cache.
 func mergeCodexRateLimitCachePerLimit(
 	path string,
 	perLimit map[string]map[string]codexRateLimitBucket,
 	clears map[string]bool,
 	fullSnapshot bool,
 	present map[string]bool,
+	emptyAuthoritative bool,
 	now time.Time,
 	fingerprint string,
 ) {
-	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !fullSnapshot) {
+	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !emptyAuthoritative) {
 		return
 	}
 	codexRateLimitMu.Lock()
@@ -1032,11 +1059,14 @@ func mergeCodexRateLimitCachePerLimit(
 	// contributor whose IDENTITY it omitted entirely (reclassified elsewhere, or
 	// the plan lost it). Keyed by identity, not slot, so a stale weekly copy that
 	// migrated into the same slot the snapshot still uses for the session is
-	// reconciled away rather than preserved by the slot surviving. An empty full
-	// snapshot has an empty present-set, so every cached observation is cleared.
-	// Sparse frames never trigger this — an unmentioned metric there just means
-	// "no update."
-	if fullSnapshot {
+	// reconciled away rather than preserved by the slot surviving. This runs only
+	// when the snapshot is AUTHORITATIVE about its contents: either it reported at
+	// least one recognised metric (present non-empty) or it was authoritative-empty
+	// (container literally `{}`, clearing every cached observation). A full frame
+	// that merely failed to yield anything recognisable (unknown keys / unparseable
+	// buckets) is NOT authoritative and must not wipe live data. Sparse frames
+	// never trigger this — an unmentioned metric there just means "no update."
+	if fullSnapshot && (len(present) > 0 || emptyAuthoritative) {
 		for slot, contribs := range snap.Contributors {
 			for limit, b := range contribs {
 				if !present[codexWindowIdentity(b.WindowMinutes, slot)] {
