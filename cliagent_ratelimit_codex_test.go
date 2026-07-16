@@ -6,6 +6,72 @@ import (
 	"time"
 )
 
+// codexWindowIdentity is the linchpin classifier for dedupe/rows/labels. Cover
+// its contract directly: canonical bands (incl. floored), non-canonical
+// duration, and length-less slot-default — independent of any cache plumbing.
+func TestCodexWindowIdentity(t *testing.T) {
+	cases := []struct {
+		name    string
+		minutes float64
+		slot    string
+		want    string
+	}{
+		{"canonical session", 300, codexWindowPrimary, codexIdentitySession},
+		{"floored session", 299, codexWindowSecondary, codexIdentitySession},
+		{"canonical weekly", 10080, codexWindowSecondary, codexIdentityWeekly},
+		{"floored weekly", 10079, codexWindowPrimary, codexIdentityWeekly},
+		{"weekly-band under primary stays weekly", 10080, codexWindowPrimary, codexIdentityWeekly},
+		{"non-canonical duration", 240, codexWindowPrimary, "duration:240"},
+		{"non-canonical duration secondary", 8640, codexWindowSecondary, "duration:8640"},
+		{"lengthless primary defaults session", 0, codexWindowPrimary, codexIdentitySession},
+		{"lengthless secondary defaults weekly", 0, codexWindowSecondary, codexIdentityWeekly},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := codexWindowIdentity(c.minutes, c.slot); got != c.want {
+				t.Errorf("codexWindowIdentity(%v, %q)=%q, want %q", c.minutes, c.slot, got, c.want)
+			}
+		})
+	}
+}
+
+// codexPlacementBeats is the total order used to pick a winner among same-metric
+// placements. Freshness dominates; on an exact freshness tie the ladder falls to
+// higher usage, then primary-over-secondary, then known-over-unknown. The
+// equal-freshness branches are otherwise only reachable via rare same-timestamp
+// duplicates, so exercise them directly.
+func TestCodexPlacementBeats_TieBreakLadder(t *testing.T) {
+	base := codexRateLimitBucket{ObservedAtMs: 1000, UsedPercentage: 50, usageKnown: true}
+
+	// Freshness dominates even when the stale side reports higher usage.
+	newerLower := codexRateLimitBucket{ObservedAtMs: 2000, UsedPercentage: 10, usageKnown: true}
+	if !codexPlacementBeats(newerLower, codexWindowSecondary, base, codexWindowPrimary) {
+		t.Error("newer observation must beat an older one regardless of usage/slot")
+	}
+
+	// Equal freshness → higher usage wins.
+	higher := codexRateLimitBucket{ObservedAtMs: 1000, UsedPercentage: 80, usageKnown: true}
+	if !codexPlacementBeats(higher, codexWindowSecondary, base, codexWindowPrimary) {
+		t.Error("on equal freshness the higher usage must win")
+	}
+
+	// Equal freshness and usage → primary slot precedence.
+	primaryTie := codexRateLimitBucket{ObservedAtMs: 1000, UsedPercentage: 50, usageKnown: true}
+	if !codexPlacementBeats(primaryTie, codexWindowPrimary, base, codexWindowSecondary) {
+		t.Error("on a full tie the primary slot must take precedence")
+	}
+	if codexPlacementBeats(base, codexWindowSecondary, primaryTie, codexWindowPrimary) {
+		t.Error("secondary must not beat primary on a full tie")
+	}
+
+	// Everything equal incl. slot → known usage beats unknown.
+	known := codexRateLimitBucket{ObservedAtMs: 1000, UsedPercentage: 50, usageKnown: true}
+	unknown := codexRateLimitBucket{ObservedAtMs: 1000, UsedPercentage: 50, usageKnown: false}
+	if !codexPlacementBeats(known, codexWindowPrimary, unknown, codexWindowPrimary) {
+		t.Error("a known-usage reading must beat an unknown one on an otherwise full tie")
+	}
+}
+
 func TestCaptureCodexRateLimit_TokenCountNotification(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
