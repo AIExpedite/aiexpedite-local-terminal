@@ -273,7 +273,7 @@ func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 	// when we set them independently (no real agy needed).
 	m := NewAntigravityNativeManager()
 	cwd := t.TempDir()
-	if err := m.Start("sess-a", cwd, "ws", "uid", nil); err != nil {
+	if err := m.Start("sess-a", cwd, "ws", "uid", nil, nil); err != nil {
 		// probeAntigravityNativeCapability may fail if agy missing — skip.
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not runnable") ||
 			strings.Contains(err.Error(), "below minimum") || strings.Contains(err.Error(), "unsupported") {
@@ -281,7 +281,7 @@ func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 		}
 		t.Fatalf("start a: %v", err)
 	}
-	if err := m.Start("sess-b", cwd, "ws", "uid", nil); err != nil {
+	if err := m.Start("sess-b", cwd, "ws", "uid", nil, nil); err != nil {
 		t.Fatalf("start b: %v", err)
 	}
 	sa, sb := m.Get("sess-a"), m.Get("sess-b")
@@ -549,7 +549,7 @@ func TestAntigravityNativeManager_StartIsIdempotent(t *testing.T) {
 	var acks int
 	onStarted := func() { acks++ }
 
-	if err := m.Start("sess-idem", cwd, "ws", "uid", onStarted); err != nil {
+	if err := m.Start("sess-idem", cwd, "ws", "uid", nil, onStarted); err != nil {
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not runnable") ||
 			strings.Contains(err.Error(), "below minimum") || strings.Contains(err.Error(), "unsupported") {
 			t.Skipf("agy not available for capability probe: %v", err)
@@ -563,7 +563,7 @@ func TestAntigravityNativeManager_StartIsIdempotent(t *testing.T) {
 		t.Fatal("session missing after first start")
 	}
 
-	if err := m.Start("sess-idem", cwd, "ws", "uid", onStarted); err != nil {
+	if err := m.Start("sess-idem", cwd, "ws", "uid", nil, onStarted); err != nil {
 		t.Fatalf("duplicate start must be idempotent nil, got %v", err)
 	}
 	if acks != 2 {
@@ -573,4 +573,80 @@ func TestAntigravityNativeManager_StartIsIdempotent(t *testing.T) {
 		t.Fatal("session must still exist after idempotent re-start")
 	}
 	_ = m.End("sess-idem")
+}
+
+func TestAntigravityNativeManager_EndStaleSessionsPublishesEnded(t *testing.T) {
+	// Idle GC must emit antigravity_native_ended so the cloud releases
+	// reservations when antigravity_native_end never arrives (6h expiry /
+	// dropped end command). Unlike Claude/Codex/Grok there is no long-lived
+	// process whose exit path publishes ended.
+	m := NewAntigravityNativeManager()
+	cwd := t.TempDir()
+
+	var captured []resultMsg
+	publishFn := func(res resultMsg) {
+		captured = append(captured, res)
+	}
+
+	// Bypass Start's capability probe: inject a session directly with an old
+	// StartedAt so the test does not depend on an installed agy binary.
+	id := "sess-stale-gc"
+	m.mu.Lock()
+	m.sessions[id] = &AntigravityNativeSession{
+		ID:          id,
+		Cwd:         cwd,
+		WorkspaceID: "ws-stale",
+		UID:         "uid-stale",
+		StartedAt:   time.Now().Add(-7 * time.Hour),
+		status:      "idle",
+		publishFn:   publishFn,
+	}
+	m.mu.Unlock()
+
+	m.endStaleSessions(6 * time.Hour)
+
+	if m.Get(id) != nil {
+		t.Fatal("stale session must be removed after GC")
+	}
+	if len(captured) != 1 {
+		t.Fatalf("expected exactly one antigravity_native_ended frame, got %d: %#v", len(captured), captured)
+	}
+	got := captured[0]
+	if got.Type != "antigravity_native_ended" {
+		t.Fatalf("type=%q want antigravity_native_ended", got.Type)
+	}
+	if got.SessionID != id || got.ID != id {
+		t.Fatalf("session identity mismatch: id=%q session=%q", got.ID, got.SessionID)
+	}
+	if got.WorkspaceID != "ws-stale" || got.UID != "uid-stale" {
+		t.Fatalf("routing fields lost: workspace=%q uid=%q", got.WorkspaceID, got.UID)
+	}
+	if got.Status != "success" || got.ExitCode != 0 {
+		t.Fatalf("status/exit: status=%q exit=%d", got.Status, got.ExitCode)
+	}
+	if !strings.Contains(got.Output, "expired") && !strings.Contains(got.Output, "stale") {
+		t.Fatalf("ended output should mention expiry/stale: %q", got.Output)
+	}
+
+	// Fresh sessions must not be reaped or published.
+	freshID := "sess-fresh"
+	m.mu.Lock()
+	m.sessions[freshID] = &AntigravityNativeSession{
+		ID:          freshID,
+		Cwd:         cwd,
+		WorkspaceID: "ws",
+		UID:         "uid",
+		StartedAt:   time.Now(),
+		status:      "idle",
+		publishFn:   publishFn,
+	}
+	m.mu.Unlock()
+	m.endStaleSessions(6 * time.Hour)
+	if m.Get(freshID) == nil {
+		t.Fatal("fresh session must not be reaped")
+	}
+	if len(captured) != 1 {
+		t.Fatalf("fresh session must not emit ended; captured=%d", len(captured))
+	}
+	_ = m.End(freshID)
 }

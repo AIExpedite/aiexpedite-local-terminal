@@ -91,6 +91,10 @@ type AntigravityNativeSession struct {
 	activeProcess *exec.Cmd
 	activeCancel  func()
 	seq           int64
+	// publishFn is the Pub/Sub publisher bound at Start (refreshed on Send).
+	// Stale GC uses it to emit antigravity_native_ended when reaping — End
+	// alone does not publish (the explicit antigravity_native_end handler does).
+	publishFn PublishFunc
 	// turnMu serialises Send so two concurrent turns cannot race on the same
 	// native conversation or interleave transcript updates.
 	turnMu sync.Mutex
@@ -179,9 +183,11 @@ func (m *AntigravityNativeManager) cwdCaptureLock(cwd string) *sync.Mutex {
 }
 
 // Start registers a logical session. No CLI process is launched until Send.
+// publishFn is retained so stale GC can emit antigravity_native_ended when the
+// cloud never sends antigravity_native_end (idle expiry / dropped end command).
 // onStarted is invoked after the session is registered so callers can publish
 // antigravity_native_started before any later frames.
-func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string, onStarted func()) error {
+func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -203,11 +209,17 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, exists := m.sessions[id]; exists {
+	if existing, exists := m.sessions[id]; exists {
 		// Pub/Sub redelivery / terminal-service retry of the same start must
 		// re-ack started without ending the still-usable local session. Emitting
 		// antigravity_native_ended here would release the cloud reservation while
 		// the manager still holds the session, breaking later Sends.
+		// Refresh publishFn so a newer publisher binding still reaches GC.
+		if publishFn != nil {
+			existing.mu.Lock()
+			existing.publishFn = publishFn
+			existing.mu.Unlock()
+		}
 		fmt.Printf("%s[antigravity-native] Session %s already registered — idempotent start ack%s\n",
 			colorCyan, id, colorReset)
 		if onStarted != nil {
@@ -224,6 +236,7 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string
 		StartedAt:   time.Now(),
 		status:      "idle",
 		Transcript:  nil,
+		publishFn:   publishFn,
 	}
 	m.sessions[id] = session
 
@@ -273,6 +286,11 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	if session.Status() == "ended" {
 		return fmt.Errorf("antigravity native session %s has ended", id)
 	}
+
+	// Keep the GC publisher current (Send always has a live Pub/Sub binding).
+	session.mu.Lock()
+	session.publishFn = publishFn
+	session.mu.Unlock()
 
 	// Fail closed with a published error frame so the chat UI cannot stay
 	// stuck in "running" after the HTTP send already returned 200.
@@ -640,19 +658,55 @@ func (m *AntigravityNativeManager) CleanupStale(maxAge time.Duration) {
 	}
 }
 
+// endStaleSessions ends any session older than maxAge and publishes
+// antigravity_native_ended so the cloud can release reservations. Unlike
+// Claude/Codex/Grok (process exit → waitForExit publishes ended), Antigravity
+// sessions are logical and End alone does not publish — so GC must emit the
+// frame itself using the publisher bound at Start/Send.
 func (m *AntigravityNativeManager) endStaleSessions(maxAge time.Duration) {
+	type staleInfo struct {
+		id          string
+		workspaceID string
+		uid         string
+		publishFn   PublishFunc
+	}
 	m.mu.RLock()
-	var stale []string
+	var stale []staleInfo
 	now := time.Now()
 	for id, s := range m.sessions {
 		if now.Sub(s.StartedAt) > maxAge {
-			stale = append(stale, id)
+			s.mu.Lock()
+			stale = append(stale, staleInfo{
+				id:          id,
+				workspaceID: s.WorkspaceID,
+				uid:         s.UID,
+				publishFn:   s.publishFn,
+			})
+			s.mu.Unlock()
 		}
 	}
 	m.mu.RUnlock()
-	for _, id := range stale {
-		fmt.Printf("%s[antigravity-native] Reaping stale session %s%s\n", colorYellow, id, colorReset)
-		_ = m.End(id)
+	for _, ss := range stale {
+		fmt.Printf("%s[antigravity-native] Reaping stale session %s%s\n", colorYellow, ss.id, colorReset)
+		_ = m.End(ss.id)
+		if ss.publishFn == nil {
+			continue
+		}
+		// Publish after End so a successful reaping is mirrored to the cloud.
+		// Explicit antigravity_native_end still publishes from pubsub.go; this
+		// path only covers idle GC when the end command never arrives.
+		ss.publishFn(resultMsg{
+			ID:          ss.id,
+			WorkspaceID: ss.workspaceID,
+			UID:         ss.uid,
+			Output:      "Antigravity native session expired (stale)",
+			Status:      "success",
+			Ts:          time.Now().UnixMilli(),
+			Version:     Version,
+			Type:        "antigravity_native_ended",
+			SessionID:   ss.id,
+			ExitCode:    0,
+		})
 	}
 }
 

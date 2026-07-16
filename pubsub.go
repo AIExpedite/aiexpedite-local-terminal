@@ -3581,6 +3581,7 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			cmd.Cwd,
 			cmd.WorkspaceID,
 			cmd.UID,
+			publishFn,
 			onStarted,
 		)
 		if err != nil {
