@@ -1270,3 +1270,52 @@ func TestAntigravityNativeManager_EndWaitsForInFlightTurn(t *testing.T) {
 		t.Fatal("End returned while the turn was still in-flight — drain barrier missing")
 	}
 }
+
+// TestAntigravityNativeManager_DuplicateEndWaitsForInFlightTurn covers the race
+// where a second antigravity_native_end (retry / double-click / stale-GC)
+// arrives after the first End has flipped status to "ended" but is still
+// draining the in-flight Send on turnMu. The duplicate must also block on the
+// drain barrier before returning, otherwise its handler would publish a
+// terminal antigravity_native_ended frame while the running turn can still emit
+// stderr/error frames afterwards, breaking the stop/cancel ordering guarantee.
+func TestAntigravityNativeManager_DuplicateEndWaitsForInFlightTurn(t *testing.T) {
+	m := NewAntigravityNativeManager()
+	id := "sess-dup-end"
+
+	sess := &AntigravityNativeSession{
+		ID:          id,
+		WorkspaceID: "ws",
+		UID:         "uid",
+		StartedAt:   time.Now(),
+		status:      "ended", // the first End already flipped this
+	}
+	m.mu.Lock()
+	m.sessions[id] = sess
+	m.mu.Unlock()
+
+	// Simulate the first End still draining a running turn: the turn goroutine
+	// holds turnMu until it has emitted its final frame.
+	sess.turnMu.Lock()
+
+	endReturned := make(chan struct{})
+	go func() {
+		_ = m.End(id)
+		close(endReturned)
+	}()
+
+	// The duplicate End hits the status=="ended" branch and must block on the
+	// turnMu drain barrier rather than returning immediately.
+	select {
+	case <-endReturned:
+		t.Fatal("duplicate End returned while the in-flight turn still held turnMu — drain barrier missing")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Turn finishes and releases turnMu; the duplicate End must now return.
+	sess.turnMu.Unlock()
+	select {
+	case <-endReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("duplicate End did not return after the turn drained turnMu")
+	}
+}

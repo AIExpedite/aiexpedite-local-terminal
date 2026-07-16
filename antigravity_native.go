@@ -767,6 +767,14 @@ func (m *AntigravityNativeManager) End(id string) error {
 	session.mu.Lock()
 	if session.status == "ended" {
 		session.mu.Unlock()
+		// A concurrent End (retry / double-click / stale-GC race) may have set
+		// "ended" but still be draining the in-flight Send on turnMu below. Block
+		// on the same barrier here so this duplicate End does not return — letting
+		// its handler publish antigravity_native_ended — before the running turn
+		// has emitted its final stderr/error frames. Returns immediately when no
+		// turn is active.
+		session.turnMu.Lock()
+		session.turnMu.Unlock() //nolint:staticcheck // intentional drain barrier, not a guarded region
 		m.removeSession(id)
 		return nil
 	}
