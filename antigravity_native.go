@@ -1027,6 +1027,20 @@ func listAntigravityConversationIDs() map[string]struct{} {
 	return out
 }
 
+// antigravityNewConversationIDs returns the set of conversation DB IDs that
+// exist now but were absent from the pre-run snapshot. Used to detect whether a
+// captured cwd-mapped ID is unambiguously the single conversation created by our
+// run (vs a concurrent local TUI / other-cwd session that also wrote a DB).
+func antigravityNewConversationIDs(beforeIDs map[string]struct{}) map[string]struct{} {
+	newIDs := make(map[string]struct{})
+	for id := range listAntigravityConversationIDs() {
+		if _, existed := beforeIDs[id]; !existed {
+			newIDs[id] = struct{}{}
+		}
+	}
+	return newIDs
+}
+
 func captureAntigravityNativeID(cwd string, beforeIDs map[string]struct{}) string {
 	base := antigravityHomeBase()
 
@@ -1039,12 +1053,28 @@ func captureAntigravityNativeID(cwd string, beforeIDs map[string]struct{}) strin
 	// Same-cwd concurrent first turns are serialized by cwdCaptureLock; if the
 	// cwd mapping is missing/stale after the run, return "" so Send uses
 	// bounded transcript replay instead of a wrong native ID.
+	//
+	// cwdCaptureLock only serializes AIExpedite's own same-cwd first turns — it
+	// cannot stop a user's local Antigravity TUI (or any other agy process) in
+	// the same cwd from creating its own conversation during our capture window.
+	// last_conversations.json is last-writer-wins per cwd, so a TUI write after
+	// our run would leave lastID pointing at the user's conversation, which is
+	// also "new vs beforeIDs". To avoid adopting and later resuming an unrelated
+	// local conversation, additionally require that lastID is the ONLY new DB to
+	// appear since the pre-run snapshot. If more than one new conversation DB
+	// exists, the capture is ambiguous and we fail closed to bounded transcript
+	// replay rather than guess.
 	if beforeIDs != nil {
 		lastID := readAntigravityLastConversationID(base, cwd)
 		if lastID != "" {
 			if _, existed := beforeIDs[lastID]; !existed {
 				if antigravityConversationDBExists(base, lastID) {
-					return lastID
+					newIDs := antigravityNewConversationIDs(beforeIDs)
+					if len(newIDs) == 1 {
+						if _, ok := newIDs[lastID]; ok {
+							return lastID
+						}
+					}
 				}
 			}
 		}

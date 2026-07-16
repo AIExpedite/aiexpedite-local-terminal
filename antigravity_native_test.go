@@ -319,6 +319,36 @@ func TestCaptureAntigravityNativeID_AcceptsNewCwdMappedID(t *testing.T) {
 	}
 }
 
+func TestCaptureAntigravityNativeID_RejectsAmbiguousNewDBs(t *testing.T) {
+	// A concurrent local Antigravity TUI in the same cwd creates its own
+	// conversation during our capture window. Because last_conversations.json is
+	// last-writer-wins per cwd, the TUI's write leaves the cwd mapped to its ID,
+	// which is also "new vs beforeIDs". Two new DBs now exist, so the capture is
+	// ambiguous and must fail closed to replay rather than adopt the user's
+	// unrelated local conversation.
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	base := filepath.Join(tmp, ".gemini", "antigravity-cli")
+	_ = os.MkdirAll(filepath.Join(base, "cache"), 0o755)
+	_ = os.MkdirAll(filepath.Join(base, "conversations"), 0o755)
+	cwd := "/tmp/proj-ambiguous"
+	oldID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	ourID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	tuiID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	// Last writer (the TUI) owns the cwd mapping.
+	_ = os.WriteFile(filepath.Join(base, "cache", "last_conversations.json"),
+		[]byte(`{"`+cwd+`":"`+tuiID+`"}`), 0o644)
+	_ = os.WriteFile(filepath.Join(base, "conversations", oldID+".db"), []byte("old"), 0o644)
+	_ = os.WriteFile(filepath.Join(base, "conversations", ourID+".db"), []byte("ours"), 0o644)
+	_ = os.WriteFile(filepath.Join(base, "conversations", tuiID+".db"), []byte("tui"), 0o644)
+	before := map[string]struct{}{oldID: {}}
+	if got := captureAntigravityNativeID(cwd, before); got != "" {
+		t.Fatalf("capture = %q, want \"\" (ambiguous multi-new-DB window fails closed)", got)
+	}
+}
+
 func TestCaptureAntigravityNativeID_FromLastConversations(t *testing.T) {
 	// Point home at a temp dir. Redirect both HOME (Unix) and USERPROFILE
 	// (Windows) so os.UserHomeDir resolves to the fixture on every platform.
