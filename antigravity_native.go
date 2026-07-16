@@ -674,13 +674,22 @@ func (m *AntigravityNativeManager) runOneShot(
 	}
 
 	var timedOutFlag atomic.Bool
+	// turnDone is set once the process has been reaped and this turn is
+	// returning. The delayed force-kill callback re-checks it before signaling
+	// so it can never fire against the reaped PID/PGID even if it was armed
+	// after the defer ran stopForceKillTimer (see below).
+	var turnDone atomic.Bool
 	// forceKillTimer holds the delayed force-kill armed after a graceful
 	// interrupt. It must be stopped once the process exits: if agy exits during
 	// the grace period, cmd.Wait() reaps the child and this turn returns, but a
 	// still-armed callback would later call killAntigravityProcessTree with the
 	// now-reaped PID/PGID — after PID/PGID reuse that signals an unrelated
 	// process. Stored via atomic.Pointer because the timeout callback (its own
-	// goroutine) arms it while the defer / cancel closure stop it.
+	// goroutine) arms it while the defer / cancel closure stop it. Stopping the
+	// timer alone is not sufficient: the timeout goroutine arms it *after*
+	// interruptProcess, so a fast graceful exit whose defer runs
+	// stopForceKillTimer before that Store would leave the callback armed —
+	// hence the turnDone guard in the callback.
 	var forceKillTimer atomic.Pointer[time.Timer]
 	stopForceKillTimer := func() {
 		if fk := forceKillTimer.Load(); fk != nil {
@@ -691,6 +700,9 @@ func (m *AntigravityNativeManager) runOneShot(
 		timedOutFlag.Store(true)
 		_ = interruptProcess(cmd)
 		forceKillTimer.Store(time.AfterFunc(antigravityNativeGracefulKillWait, func() {
+			if turnDone.Load() {
+				return
+			}
 			killAntigravityProcessTree(cmd)
 		}))
 	})
@@ -703,6 +715,10 @@ func (m *AntigravityNativeManager) runOneShot(
 		killAntigravityProcessTree(cmd)
 	})
 	defer func() {
+		// Set turnDone before stopping the timer so the delayed force-kill
+		// callback observes it even in the race where the timeout goroutine
+		// arms forceKillTimer after this stopForceKillTimer() runs.
+		turnDone.Store(true)
 		timer.Stop()
 		stopForceKillTimer()
 		session.clearActiveProcess()
