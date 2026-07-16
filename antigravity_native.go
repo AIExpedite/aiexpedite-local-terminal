@@ -540,18 +540,25 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	return nil
 }
 
-// killAntigravityProcessTree SIGKILLs the agy process and, on unix, its whole
-// process group so tool descendants that inherited the stdout/stderr pipes die
-// too (otherwise they keep the pipes open and block the drain past the timeout).
-// On Windows killProcessGroup is a no-op, so this matches the prior single-
-// process kill there. Errors (e.g. ESRCH when the group already exited) are
-// swallowed — this is best-effort teardown.
+// killAntigravityProcessTree force-kills the agy process and its tool descendants
+// so children that inherited the stdout/stderr pipes die too (otherwise they keep
+// the pipes open and block the drain past the timeout). On unix it kills the whole
+// process group (agy is the Setsid group leader); on Windows killProcessGroup is a
+// no-op, so it uses taskkill /F /T to reap the tree. The tree kill runs BEFORE
+// Process.Kill() because severing the parent first lets Windows re-parent the tool
+// children out of taskkill /T's reach. Errors (e.g. ESRCH when the group already
+// exited, or the unix no-op KillProcessTree) are swallowed — best-effort teardown.
 func killAntigravityProcessTree(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
+	pid := cmd.Process.Pid
+	// Windows: reap the whole tree (no-op error on unix, where the group kill
+	// below does the reaping). Must precede Kill() so the parent still anchors
+	// the tree taskkill /T enumerates.
+	_ = KillProcessTree(pid)
 	_ = cmd.Process.Kill()
-	_ = killProcessGroup(cmd.Process.Pid)
+	_ = killProcessGroup(pid)
 }
 
 // runOneShot spawns one `agy --print` process, drains stdout/stderr concurrently
@@ -881,11 +888,11 @@ func sanitizeAntigravityEnv(env []string) []string {
 	// names (OpenAI_API_KEY, anthropic_api_key) that would otherwise survive.
 	denyPrefixes := []string{
 		"CLAUDECODE=",
-		"CLAUDE_",     // CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_API_KEY, …
-		"ANTHROPIC_",  // ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN
-		"OPENAI_",     // OPENAI_API_KEY, …
-		"XAI_",        // XAI_API_KEY
-		"CODEX_",      // CODEX_API_KEY, CODEX_IDE_*
+		"CLAUDE_",    // CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_API_KEY, …
+		"ANTHROPIC_", // ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN
+		"OPENAI_",    // OPENAI_API_KEY, …
+		"XAI_",       // XAI_API_KEY
+		"CODEX_",     // CODEX_API_KEY, CODEX_IDE_*
 	}
 	out := make([]string, 0, len(env))
 	for _, e := range env {
