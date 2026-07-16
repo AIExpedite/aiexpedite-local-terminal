@@ -147,7 +147,65 @@ func TestBuildAntigravityReplayPrompt_FitsSendLimit(t *testing.T) {
 		t.Fatalf("replay dropped the preamble instructions")
 	}
 	if !utf8.ValidString(prompt) {
-		t.Fatalf("replay produced invalid UTF-8 after tail trim")
+		t.Fatalf("replay produced invalid UTF-8")
+	}
+}
+
+// When the current user prompt is near the 24KB send limit, prior history must
+// be dropped whole-turn (or the prompt must fail closed oversized) — never
+// byte-slice into the middle of the current "User: ..." turn.
+func TestBuildAntigravityReplayPrompt_NeverTruncatesCurrentTurn(t *testing.T) {
+	const preamble = "You are continuing an AIExpedite Antigravity Chat conversation after native resume failed. " +
+		"Prior turns (oldest first) follow. Treat them as history only. " +
+		"Answer ONLY the final user message.\n\n"
+	budget := antigravityNativeMaxPromptBytes - len(preamble)
+	// Near-limit current turn: leaves only a few dozen bytes for history.
+	// Prefix/suffix markers prove the full current turn survived (not a tail).
+	markerHead := "HEAD_MARKER_xyz"
+	markerTail := "TAIL_MARKER_xyz"
+	// "User: " + text + "\n" should be budget-80 so some history would have fit
+	// under a naïve total-size check, but a large prior turn still forces drop.
+	overhead := len("User: ") + len("\n") + len(markerHead) + len(markerTail)
+	midLen := budget - 80 - overhead
+	if midLen < 100 {
+		t.Fatalf("test setup: budget too small (%d)", budget)
+	}
+	final := markerHead + strings.Repeat("Q", midLen) + markerTail
+
+	tr := []antigravityTurn{
+		{Role: "user", Content: strings.Repeat("OLD_HISTORY_SHOULD_DROP_", 200), At: time.Now()},
+		{Role: "assistant", Content: strings.Repeat("OLD_ASSIST_", 200), At: time.Now()},
+	}
+	prompt := buildAntigravityReplayPrompt(tr, final)
+
+	if !strings.Contains(prompt, markerHead) {
+		t.Fatalf("replay truncated leading bytes of current user turn")
+	}
+	if !strings.Contains(prompt, markerTail) {
+		t.Fatalf("replay lost trailing bytes of current user turn")
+	}
+	// Full current text must appear as a single contiguous "User: ..." line.
+	wantLine := "User: " + final + "\n"
+	if !strings.Contains(prompt, wantLine) {
+		t.Fatalf("current turn was rewritten or split; want contiguous %q… in prompt", wantLine[:min(60, len(wantLine))])
+	}
+	if strings.Contains(prompt, "OLD_HISTORY_SHOULD_DROP_") {
+		// History may remain only if it fits; with our sizes it must not.
+		t.Fatalf("expected oversized prior history to be dropped, still present")
+	}
+	if len(prompt) > antigravityNativeMaxPromptBytes {
+		t.Fatalf("replay prompt %d exceeds send limit %d", len(prompt), antigravityNativeMaxPromptBytes)
+	}
+
+	// Near-limit bare prompt: preamble + final alone exceed the limit. Must
+	// still keep the full current turn (callers fail closed on size).
+	huge := strings.Repeat("H", antigravityNativeMaxPromptBytes-10)
+	oversized := buildAntigravityReplayPrompt(tr, huge)
+	if !strings.Contains(oversized, "User: "+huge+"\n") {
+		t.Fatalf("oversized current turn must still appear in full for fail-closed callers")
+	}
+	if len(oversized) <= antigravityNativeMaxPromptBytes {
+		t.Fatalf("expected oversized replay so Send rejects rather than truncating user text")
 	}
 }
 

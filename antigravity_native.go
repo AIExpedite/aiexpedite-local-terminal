@@ -41,7 +41,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 )
 
 const (
@@ -1066,45 +1065,58 @@ func buildAntigravityReplayPrompt(transcript []antigravityTurn, newUserText stri
 		"Prior turns (oldest first) follow. Treat them as history only. " +
 		"Answer ONLY the final user message.\n\n"
 
-	var body strings.Builder
-	// Use bounded transcript without the just-submitted user turn if it was already appended.
-	for _, turn := range transcript {
-		switch turn.Role {
+	formatTurn := func(role, content string) string {
+		var b strings.Builder
+		switch role {
 		case "user":
-			body.WriteString("User: ")
+			b.WriteString("User: ")
 		case "assistant":
-			body.WriteString("Assistant: ")
+			b.WriteString("Assistant: ")
 		default:
-			body.WriteString(turn.Role + ": ")
+			b.WriteString(role + ": ")
 		}
-		body.WriteString(turn.Content)
-		body.WriteString("\n\n")
+		b.WriteString(content)
+		b.WriteString("\n\n")
+		return b.String()
 	}
-	body.WriteString("User: ")
-	body.WriteString(newUserText)
-	body.WriteString("\n")
 
-	// The replay is delivered through Send, which rejects prompts larger than
-	// antigravityNativeMaxPromptBytes (24KB). Cap here to that SEND limit — not
-	// the larger antigravityReplayMaxChars (48KB) — so a history whose replay
-	// lands between the two limits drops its oldest turns to fit instead of
-	// failing recovery outright. Keep the preamble (instructions) plus the tail
-	// of the body: the final user turn sits at the end and is itself within the
-	// limit (oversize raw prompts are rejected upstream before replay).
-	bodyStr := body.String()
+	// Current turn is never truncated. Tail-slicing the whole body could drop
+	// the leading bytes of "User: <new prompt>" when that turn is close to the
+	// send limit, silently changing the request Antigravity sees.
+	final := "User: " + newUserText + "\n"
 	budget := antigravityNativeMaxPromptBytes - len(preamble)
 	if budget < 0 {
 		budget = 0
 	}
-	if len(bodyStr) > budget {
-		bodyStr = bodyStr[len(bodyStr)-budget:]
-		// Advance to the next rune boundary so the byte-oriented slice cannot
-		// split a multi-byte character into invalid UTF-8.
-		for len(bodyStr) > 0 && !utf8.RuneStart(bodyStr[0]) {
-			bodyStr = bodyStr[1:]
-		}
+
+	// If preamble + current turn alone cannot fit the send limit, return that
+	// oversized prompt so Send / recovery fail closed instead of rewriting the
+	// user request. (Raw Send already rejects bare prompts > 24KB; preamble
+	// overhead can still push a near-limit prompt over.)
+	if len(final) > budget {
+		return preamble + final
 	}
-	return preamble + bodyStr
+
+	// Drop oldest prior turns (whole turns only) until history + final fit.
+	history := make([]string, 0, len(transcript))
+	historySize := 0
+	for _, turn := range transcript {
+		s := formatTurn(turn.Role, turn.Content)
+		history = append(history, s)
+		historySize += len(s)
+	}
+	start := 0
+	for start < len(history) && historySize+len(final) > budget {
+		historySize -= len(history[start])
+		start++
+	}
+
+	var body strings.Builder
+	for _, h := range history[start:] {
+		body.WriteString(h)
+	}
+	body.WriteString(final)
+	return preamble + body.String()
 }
 
 /* --------------------------------------------------------------------------
