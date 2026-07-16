@@ -614,6 +614,28 @@ func TestSetActiveProcess_DoesNotCancelWhenRunning(t *testing.T) {
 	}
 }
 
+func TestBeginTurn_DoesNotReviveEndedSession(t *testing.T) {
+	// End wins the race after Send's pre-check: beginTurn must refuse to
+	// overwrite "ended" with "running", otherwise setActiveProcess/runOneShot
+	// stop seeing the cancellation and an agy turn survives a Stop.
+	ended := &AntigravityNativeSession{status: "ended"}
+	if ended.beginTurn() {
+		t.Fatal("beginTurn must return false for an ended session")
+	}
+	if got := ended.Status(); got != "ended" {
+		t.Fatalf("ended status was overwritten to %q", got)
+	}
+
+	// Normal idle→running transition still works.
+	idle := &AntigravityNativeSession{status: "idle"}
+	if !idle.beginTurn() {
+		t.Fatal("beginTurn must return true for an idle session")
+	}
+	if got := idle.Status(); got != "running" {
+		t.Fatalf("expected running, got %q", got)
+	}
+}
+
 func TestSanitizeAntigravityEnv_StripsCredentialsCaseInsensitive(t *testing.T) {
 	env := []string{
 		"PATH=/usr/bin",

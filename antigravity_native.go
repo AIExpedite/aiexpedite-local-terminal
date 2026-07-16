@@ -118,6 +118,21 @@ func (s *AntigravityNativeSession) setStatus(st string) {
 	s.mu.Unlock()
 }
 
+// beginTurn atomically transitions an idle session to "running". It returns
+// false if End marked the session "ended" in the race between the caller's
+// prior Status() check and this transition — so a turn cannot overwrite an
+// "ended" status back to "running" and thereby hide the cancellation from
+// setActiveProcess/runOneShot, leaving an agy process alive after a Stop.
+func (s *AntigravityNativeSession) beginTurn() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status == "ended" {
+		return false
+	}
+	s.status = "running"
+	return true
+}
+
 // setActiveProcess registers the in-flight one-shot process. If End already
 // marked the session ended (race before activeCancel was stored), the cancel
 // callback is invoked immediately so a late-started agy process cannot keep
@@ -318,7 +333,12 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 			fmt.Sprintf("prompt exceeds maximum size of %d bytes", antigravityNativeMaxPromptBytes))
 	}
 
-	session.setStatus("running")
+	// Conditional idle→running under the session mutex: if End won the race
+	// after the check above, do not revive the ended session — fail closed so
+	// the stopped turn never spawns agy.
+	if !session.beginTurn() {
+		return fmt.Errorf("antigravity native session %s has ended", id)
+	}
 	defer func() {
 		if session.Status() != "ended" {
 			session.setStatus("idle")
