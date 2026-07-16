@@ -1072,6 +1072,305 @@ func TestCaptureCodexRateLimit_SparseByLimitPreservesPriorStricterContributor(t 
 	}
 }
 
+// AC1 / stale-observation: when both an older and a newer 10,080-minute
+// (weekly) observation are cached — the newer one having migrated to the
+// `primary` storage slot while the older one lingers under `secondary` — only
+// the newest weekly is displayed, even though the stale one reports a HIGHER
+// used %. The session row is Unknown because no session-identity reading exists.
+func TestCodexMetricsFromCache_DuplicateWeeklyKeepsNewest(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	older := now.Add(-time.Minute)
+
+	// Older weekly under secondary at 70%.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowSecondary: {
+			UsedPercentage: 70, ResetsAtMs: now.Add(7 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, ObservedAtMs: older.UnixMilli(), usageKnown: true, resetKnown: true,
+		},
+	}, nil, older, "")
+	// Newer weekly-band observation lands under primary at 30%.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 30, ResetsAtMs: now.Add(7 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, ObservedAtMs: now.UnixMilli(), usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, "")
+
+	metrics := codexMetricsFromCache(now, "")
+	if len(metrics) != 2 {
+		t.Fatalf("want 2 metrics, got %d", len(metrics))
+	}
+	session, weekly := metrics[0], metrics[1]
+	if !session.Unknown || session.Kind != limitKindSession {
+		t.Errorf("session row=%+v, want Unknown session (no 5-hour observation)", session)
+	}
+	if weekly.Kind != limitKindWeekly || weekly.Unknown {
+		t.Errorf("weekly row=%+v, want observed weekly", weekly)
+	}
+	if weekly.Consumed == nil || *weekly.Consumed != 30 {
+		t.Errorf("weekly Consumed=%v, want 30 (newest wins; stale 70%% discarded despite higher usage)", weekly.Consumed)
+	}
+	if weekly.Label != "Weekly quota" {
+		t.Errorf("weekly label=%q, want Weekly quota", weekly.Label)
+	}
+}
+
+// AC2 / AC6: valid 300-minute and 10,080-minute observations render as
+// "5-hour session window" first and "Weekly quota" second, both known.
+func TestCodexMetricsFromCache_SessionFirstThenWeekly(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 22, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(),
+			WindowMinutes: 300, usageKnown: true, resetKnown: true,
+		},
+		codexWindowSecondary: {
+			UsedPercentage: 48, ResetsAtMs: now.Add(5 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, "")
+
+	metrics := codexMetricsFromCache(now, "")
+	if len(metrics) != 2 {
+		t.Fatalf("want 2 metrics, got %d", len(metrics))
+	}
+	if metrics[0].Kind != limitKindSession || metrics[0].Unknown || metrics[0].Label != "5-hour session window" {
+		t.Errorf("metrics[0]=%+v, want known 5-hour session window first", metrics[0])
+	}
+	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown || metrics[1].Label != "Weekly quota" {
+		t.Errorf("metrics[1]=%+v, want known Weekly quota second", metrics[1])
+	}
+}
+
+// Swapped placement: a weekly-band reading physically under `primary` and a
+// session-band reading under `secondary` must still emit session first / weekly
+// second — identity, not storage slot, decides the row.
+func TestCodexMetricsFromCache_SwappedSlotsPreserveClaudeOrder(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 25, ResetsAtMs: now.Add(6 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, usageKnown: true, resetKnown: true,
+		},
+		codexWindowSecondary: {
+			UsedPercentage: 60, ResetsAtMs: now.Add(2 * time.Hour).UnixMilli(),
+			WindowMinutes: 300, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, "")
+
+	metrics := codexMetricsFromCache(now, "")
+	if metrics[0].Kind != limitKindSession || metrics[0].Unknown {
+		t.Errorf("metrics[0]=%+v, want known session from the secondary-slot 300-min reading", metrics[0])
+	}
+	if metrics[0].Consumed == nil || *metrics[0].Consumed != 60 {
+		t.Errorf("session Consumed=%v, want 60 (session-band under secondary)", metrics[0].Consumed)
+	}
+	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
+		t.Errorf("metrics[1]=%+v, want known weekly from the primary-slot 10080-min reading", metrics[1])
+	}
+	if metrics[1].Consumed == nil || *metrics[1].Consumed != 25 {
+		t.Errorf("weekly Consumed=%v, want 25 (weekly-band under primary)", metrics[1].Consumed)
+	}
+}
+
+// AC4: a missing 5-hour observation must never let a weekly value be mislabeled
+// as a 5-hour/daily/shift quota. With only a weekly reading cached, row 0 stays
+// an Unknown session and row 1 is the real weekly.
+func TestCodexMetricsFromCache_MissingSessionLeavesWeeklyUnmangled(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowSecondary: {
+			UsedPercentage: 40, ResetsAtMs: now.Add(4 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, "")
+
+	metrics := codexMetricsFromCache(now, "")
+	if !metrics[0].Unknown || metrics[0].Kind != limitKindSession || metrics[0].Label != "5-hour session window" {
+		t.Errorf("metrics[0]=%+v, want Unknown 5-hour session window", metrics[0])
+	}
+	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
+		t.Errorf("metrics[1]=%+v, want known weekly", metrics[1])
+	}
+	if metrics[1].Label != "Weekly quota" {
+		t.Errorf("weekly label=%q, want Weekly quota (never daily/shift/5-hour)", metrics[1].Label)
+	}
+}
+
+// AC4 boundary: a positively weekly-band observation stored under `primary` is
+// identity `weekly`; it must fill the weekly row, never the session row.
+func TestCodexMetricsFromCache_WeeklyBandUnderPrimaryDoesNotFillSession(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 50, ResetsAtMs: now.Add(6 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, "")
+
+	metrics := codexMetricsFromCache(now, "")
+	if !metrics[0].Unknown || metrics[0].Kind != limitKindSession {
+		t.Errorf("metrics[0]=%+v, want Unknown session (weekly-band must not be promoted to 5-hour)", metrics[0])
+	}
+	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
+		t.Errorf("metrics[1]=%+v, want known weekly from the primary-slot weekly-band reading", metrics[1])
+	}
+	if metrics[1].Consumed == nil || *metrics[1].Consumed != 50 {
+		t.Errorf("weekly Consumed=%v, want 50", metrics[1].Consumed)
+	}
+}
+
+// Mainline Codex omit: a primary reading with usage but WindowMinutes==0 is a
+// KNOWN session by slot-default identity (Codex legitimately omits
+// window_minutes), keeping the "5-hour session window" default label.
+func TestCodexMetricsFromCache_DurationlessPrimaryIsKnownSession(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 45, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(),
+			usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, "")
+
+	metrics := codexMetricsFromCache(now, "")
+	if metrics[0].Unknown || metrics[0].Kind != limitKindSession {
+		t.Errorf("metrics[0]=%+v, want known session by slot-default", metrics[0])
+	}
+	if metrics[0].Label != "5-hour session window" {
+		t.Errorf("session label=%q, want default 5-hour session window", metrics[0].Label)
+	}
+	if metrics[0].Consumed == nil || *metrics[0].Consumed != 45 {
+		t.Errorf("session Consumed=%v, want 45", metrics[0].Consumed)
+	}
+}
+
+// Multi-limit within one identity: two weekly metered limits (distinct limit
+// ids) fold most-constrained — the higher usage wins — while freshness is the
+// max across the weekly partition. Only one weekly row surfaces.
+func TestCaptureCodexRateLimit_MultiLimitWeeklyMostConstrained(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	// No auth.json under CODEX_HOME → capture writes with an empty fingerprint,
+	// matching the codexMetricsFromCache(now, "") reads below regardless of any
+	// real Codex login on the dev machine.
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Older, stricter weekly limit at 90%.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{"rateLimitsByLimitId":{`+
+			`"codex_weekly_a":{"secondary":{"usedPercent":90,"windowDurationMins":10080,"resetsInSeconds":604800}}`+
+			`}}}`,
+		now,
+	)
+	// Newer, looser weekly limit at 20%.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{"rateLimitsByLimitId":{`+
+			`"codex_weekly_b":{"secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsInSeconds":604800}}`+
+			`}}}`,
+		now.Add(30*time.Second),
+	)
+
+	metrics := codexMetricsFromCache(now, "")
+	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
+		t.Fatalf("metrics[1]=%+v, want known weekly", metrics[1])
+	}
+	if metrics[1].Consumed == nil || *metrics[1].Consumed != 90 {
+		t.Errorf("weekly Consumed=%v, want 90 (most-constrained across the two weekly limits)", metrics[1].Consumed)
+	}
+	if !metrics[0].Unknown {
+		t.Errorf("session row=%+v, want Unknown (no session-identity reading)", metrics[0])
+	}
+}
+
+// AC3: a sparse frame that re-places a weekly reading under a new storage slot
+// must not leave the superseded slot's stale weekly lingering in the cache.
+func TestCaptureCodexRateLimit_SameIdentitySupersessionAcrossSlots(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed a weekly reading under secondary.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"secondary":{"used_percent":40,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+	// A newer weekly-band reading arrives under primary (bucket migration).
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"used_percent":30,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
+		now.Add(30*time.Second),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if contribs, present := snap.Contributors[codexWindowSecondary]; present && len(contribs) > 0 {
+		t.Errorf("superseded secondary weekly must be dropped, still present: %+v", contribs)
+	}
+	metrics := codexMetricsFromCache(now.Add(30*time.Second), "")
+	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
+		t.Fatalf("metrics[1]=%+v, want single known weekly", metrics[1])
+	}
+	if metrics[1].Consumed == nil || *metrics[1].Consumed != 30 {
+		t.Errorf("weekly Consumed=%v, want 30 (migrated primary weekly wins)", metrics[1].Consumed)
+	}
+}
+
+// AC3: a full snapshot that OMITS a previously-cached window (no key at all,
+// not merely null) drops that window — the complete picture is authoritative.
+func TestCaptureCodexRateLimit_FullSnapshotOmissionDropsWindow(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed a weekly reading via a sparse notification.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"secondary":{"used_percent":40,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+	// Full account/rateLimits/read response that mentions ONLY primary — the
+	// secondary key is entirely absent, so the weekly window is gone.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","id":9,"result":{"rateLimits":{"primary":{"usedPercent":33,"resetsInSeconds":1800}}}}`,
+		now.Add(time.Minute),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if _, present := snap.Buckets[codexWindowSecondary]; present {
+		t.Errorf("weekly must be dropped when a full snapshot omits it: %+v", snap.Buckets)
+	}
+	metrics := codexMetricsFromCache(now.Add(time.Minute), "")
+	if !metrics[1].Unknown {
+		t.Errorf("weekly row=%+v, want Unknown after full-snapshot omission", metrics[1])
+	}
+	if metrics[0].Unknown || metrics[0].Kind != limitKindSession {
+		t.Errorf("session row=%+v, want known session from the full snapshot", metrics[0])
+	}
+}
+
 func TestCodexMetricsFromCache_FingerprintMismatchHidesSnapshot(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)

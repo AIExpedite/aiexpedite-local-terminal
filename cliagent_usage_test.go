@@ -574,6 +574,98 @@ func TestCodexUsageParser_PopulatesObservedMetricsFromCache(t *testing.T) {
 	}
 }
 
+// Parse composition (AC1/AC6): two same-identity weekly observations that would
+// previously surface as duplicate "Weekly quota" rows collapse to a single
+// weekly metric, with the 5-hour session row first (Unknown here) and the weekly
+// row second.
+func TestCodexUsageParser_DeduplicatesWeeklyAndKeepsClaudeOrder(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"email": "carol@example.com",
+		"plan":  "pro",
+	})
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	older := now.Add(-time.Minute)
+	fp := fingerprintAccount("codex", "carol@example.com")
+
+	// Older weekly under secondary; newer weekly-band reading under primary.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowSecondary: {
+			UsedPercentage: 70, ResetsAtMs: now.Add(7 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, ObservedAtMs: older.UnixMilli(), usageKnown: true, resetKnown: true,
+		},
+	}, nil, older, fp)
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 30, ResetsAtMs: now.Add(7 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, ObservedAtMs: now.UnixMilli(), usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, fp)
+
+	usage, ok := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	if len(usage.Metrics) != 2 {
+		t.Fatalf("expected exactly 2 metrics (no duplicate weekly), got %d: %+v", len(usage.Metrics), usage.Metrics)
+	}
+	if usage.Metrics[0].Kind != limitKindSession || !usage.Metrics[0].Unknown {
+		t.Errorf("metrics[0]=%+v, want Unknown session first", usage.Metrics[0])
+	}
+	weekly := usage.Metrics[1]
+	if weekly.Kind != limitKindWeekly || weekly.Unknown {
+		t.Errorf("metrics[1]=%+v, want single known weekly", weekly)
+	}
+	if weekly.Consumed == nil || *weekly.Consumed != 30 {
+		t.Errorf("weekly Consumed=%v, want 30 (newest weekly wins)", weekly.Consumed)
+	}
+}
+
+// Parse composition (AC4): a weekly-only cache with no 5-hour observation yields
+// an Unknown session row first and a real weekly row second — never a weekly
+// value mislabeled as a 5-hour/daily/shift quota. With CODEX_HOME empty there is
+// no rollout backfill to fill the session row.
+func TestCodexUsageParser_MissingSessionStaysUnknown(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"email": "carol@example.com",
+		"plan":  "pro",
+	})
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowSecondary: {
+			UsedPercentage: 40, ResetsAtMs: now.Add(4 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, fp)
+
+	usage, ok := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	if len(usage.Metrics) != 2 {
+		t.Fatalf("expected 2 metrics, got %d", len(usage.Metrics))
+	}
+	if usage.Metrics[0].Kind != limitKindSession || !usage.Metrics[0].Unknown {
+		t.Errorf("metrics[0]=%+v, want Unknown session", usage.Metrics[0])
+	}
+	if usage.Metrics[1].Kind != limitKindWeekly || usage.Metrics[1].Unknown {
+		t.Errorf("metrics[1]=%+v, want known weekly", usage.Metrics[1])
+	}
+	if usage.Metrics[1].Label != "Weekly quota" {
+		t.Errorf("weekly label=%q, want Weekly quota", usage.Metrics[1].Label)
+	}
+}
+
 func TestCodexUsageParser_HonorsCodexHome(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	home := t.TempDir()
