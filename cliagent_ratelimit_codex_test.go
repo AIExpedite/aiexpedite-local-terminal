@@ -1717,6 +1717,59 @@ func TestCaptureCodexRateLimit_SparseMigrationKeepsUnmentionedConcurrentLimit(t 
 	}
 }
 
+// Finding (full-snapshot omits a concurrent limit of a surviving identity): two
+// weekly metered limits A@90% and B@20% are cached under secondary; a later FULL
+// account/rateLimits/read restates ONLY B at 30%. The `weekly` identity survives
+// via B, but A — which the authoritative snapshot omits — must be dropped, not
+// shielded by the identity surviving. Identity-only omission keying would keep A
+// and let most-constrained folding still display 90%.
+func TestCaptureCodexRateLimit_FullSnapshotOmitsConcurrentLimitOfSurvivingIdentity(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed weekly limits A@90 and B@20, both under secondary, via a sparse frame.
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimitsByLimitId":{`+
+			`"codex_weekly_a":{"secondary":{"usedPercent":90,"windowDurationMins":10080,"resetsInSeconds":604800}},`+
+			`"codex_weekly_b":{"secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsInSeconds":604800}}`+
+			`}}}`,
+		now,
+	)
+	// Sanity: the aggregate most-constrains to A's 90%.
+	if pre := codexMetricsFromCache(now, ""); pre[1].Consumed == nil || *pre[1].Consumed != 90 {
+		t.Fatalf("precondition: weekly should most-constrain to 90, got %+v", pre[1])
+	}
+
+	// FULL account/rateLimits/read restating ONLY weekly limit B at 30%. A is
+	// authoritatively omitted and must be reconciled away.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","id":11,"result":{"rateLimitsByLimitId":{`+
+			`"codex_weekly_b":{"secondary":{"usedPercent":30,"windowDurationMins":10080,"resetsInSeconds":604800}}`+
+			`}}}`,
+		now.Add(time.Minute),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if _, present := snap.Contributors[codexWindowSecondary]["codex_weekly_a"]; present {
+		t.Errorf("omitted concurrent limit A must be dropped by the full snapshot: %+v", snap.Contributors[codexWindowSecondary])
+	}
+	if b, present := snap.Contributors[codexWindowSecondary]["codex_weekly_b"]; !present || b.UsedPercentage != 30 {
+		t.Errorf("restated limit B must survive at 30%%: %+v", snap.Contributors[codexWindowSecondary])
+	}
+	metrics := codexMetricsFromCache(now.Add(time.Minute), "")
+	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
+		t.Fatalf("metrics[1]=%+v, want known weekly", metrics[1])
+	}
+	if metrics[1].Consumed == nil || *metrics[1].Consumed != 30 {
+		t.Errorf("weekly Consumed=%v, want 30 (stale A dropped by authoritative full snapshot)", metrics[1].Consumed)
+	}
+}
+
 // Finding (dual-container authoritative-empty): a full read with an empty
 // `rateLimits:{}` alongside a NON-empty `rateLimitsByLimitId` that recognises
 // nothing (unknown limit / non-window nesting) carried real content and must NOT

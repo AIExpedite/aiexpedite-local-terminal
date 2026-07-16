@@ -432,20 +432,25 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 		}
 	}
 
-	// On a full snapshot, the present-set is every metric IDENTITY the frame
-	// actually reported a bucket for. It is keyed by identity — not storage slot —
-	// so the merger can drop a stale contributor that migrated into a slot the
-	// snapshot still uses for a DIFFERENT identity (e.g. a lingering weekly copy
-	// under `primary` while the snapshot only restated the primary session). An
-	// identity absent from the snapshot is being omitted by an authoritative
-	// complete picture, so it is reconciled as "gone". A nulled window is NOT
-	// added to present: its clear already removes the slot, and leaving its
-	// identity out of present lets any copy that migrated elsewhere be dropped too.
-	// Sparse frames leave present empty (unused).
+	// On a full snapshot, the present-set is every (IDENTITY, limit id) contributor
+	// the frame actually reported a bucket for. It is keyed by identity — not
+	// storage slot — so the merger can drop a stale contributor that migrated into a
+	// slot the snapshot still uses for a DIFFERENT identity (e.g. a lingering weekly
+	// copy under `primary` while the snapshot only restated the primary session).
+	// It is ALSO keyed by limit id, not identity alone: a full snapshot enumerates
+	// every metered limit that currently constrains a window, so an authoritative
+	// read that restates weekly limit `codex_weekly_b` but omits a previously-cached
+	// `codex_weekly_a` is declaring `a` gone — identity-only keying would keep `a`
+	// (its `weekly` identity is still present via `b`) and let most-constrained
+	// folding resurrect its stale usage. A contributor absent from the full snapshot
+	// is being omitted by a complete picture, so it is reconciled as "gone". A nulled
+	// window is NOT added to present: its clear already removes the slot, and leaving
+	// it out lets any copy that migrated elsewhere be dropped too. Sparse frames leave
+	// present empty (unused) — they never enumerate the full set of limits.
 	if fullSnapshot {
 		for slot, contribs := range out {
-			for _, b := range contribs {
-				present[codexWindowIdentity(b.WindowMinutes, slot)] = true
+			for limit, b := range contribs {
+				present[codexWindowIdentity(b.WindowMinutes, slot)+"\x00"+limit] = true
 			}
 		}
 	}
@@ -1084,11 +1089,14 @@ func mergeCodexRateLimitCachePerLimit(
 	// every frame — it only ever deletes a genuine same-identity+limit duplicate,
 	// so sparse frames stay non-destructive to unrelated windows.
 	codexReconcileIdentitySupersession(snap.Contributors)
-	// A full snapshot states every metric that currently applies; drop any cached
-	// contributor whose IDENTITY it omitted entirely (reclassified elsewhere, or
-	// the plan lost it). Keyed by identity, not slot, so a stale weekly copy that
+	// A full snapshot states every metric+limit that currently applies; drop any
+	// cached contributor the snapshot omitted (reclassified elsewhere, or the plan
+	// lost it). Keyed by (identity, limit id), not slot: so a stale weekly copy that
 	// migrated into the same slot the snapshot still uses for the session is
-	// reconciled away rather than preserved by the slot surviving. This runs only
+	// reconciled away rather than preserved by the slot surviving, AND a stale weekly
+	// limit (`codex_weekly_a`) is dropped even when the snapshot restated a DIFFERENT
+	// weekly limit (`codex_weekly_b`) — the `weekly` identity surviving via `b` must
+	// not shield `a` from an authoritative omission. This runs only
 	// when the snapshot is AUTHORITATIVE about its contents: either it reported at
 	// least one recognised metric (present non-empty) or it was authoritative-empty
 	// (container literally `{}`, clearing every cached observation). A full frame
@@ -1098,7 +1106,7 @@ func mergeCodexRateLimitCachePerLimit(
 	if fullSnapshot && (len(present) > 0 || emptyAuthoritative) {
 		for slot, contribs := range snap.Contributors {
 			for limit, b := range contribs {
-				if !present[codexWindowIdentity(b.WindowMinutes, slot)] {
+				if !present[codexWindowIdentity(b.WindowMinutes, slot)+"\x00"+limit] {
 					delete(contribs, limit)
 				}
 			}
