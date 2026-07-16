@@ -876,3 +876,122 @@ func TestAntigravityNativeManager_SendNonzeroExitWithStdoutIsError(t *testing.T)
 	}
 	_ = m.End(id)
 }
+
+func TestAntigravityNativeManager_NativeIDNotAdoptedOnNonzeroExit(t *testing.T) {
+	// A run that creates/updates the cwd conversation mapping and then exits
+	// non-zero must NOT adopt the native conversation ID: the failed turn is
+	// rejected without a transcript append, so resuming it later would replay a
+	// hidden turn the UI never saw. Capture must run only after exitCode == 0.
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim for fake agy is unix-oriented")
+	}
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	base := filepath.Join(home, ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(filepath.Join(base, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(base, "conversations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cwd := t.TempDir()
+	newID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+	binDir := t.TempDir()
+	fakeAgy := filepath.Join(binDir, "agy")
+	// Create the cwd->conversation mapping + DB (as a real first turn would), then
+	// fail. Paths are baked in so the shim needs no env/pwd resolution.
+	script := fmt.Sprintf("#!/bin/sh\n"+
+		"printf '{\"%s\":\"%s\"}' > '%s'\n"+
+		": > '%s'\n"+
+		"echo 'Error: quota exceeded after creating conversation'\n"+
+		"exit 2\n",
+		cwd, newID,
+		filepath.Join(base, "cache", "last_conversations.json"),
+		filepath.Join(base, "conversations", newID+".db"))
+	if err := os.WriteFile(fakeAgy, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewAntigravityNativeManager()
+	id := "sess-nonzero-capture"
+	m.mu.Lock()
+	m.sessions[id] = &AntigravityNativeSession{
+		ID:          id,
+		Cwd:         cwd,
+		WorkspaceID: "ws",
+		UID:         "uid",
+		StartedAt:   time.Now(),
+		status:      "idle",
+	}
+	m.mu.Unlock()
+
+	err := m.Send(id, "hello", func(resultMsg) {}, 10*time.Second)
+	if err == nil {
+		t.Fatal("expected Send to fail on non-zero agy exit")
+	}
+
+	sess := m.Get(id)
+	if sess == nil {
+		t.Fatal("session should remain registered after failed turn")
+	}
+	if sess.NativeConversationID != "" {
+		t.Fatalf("must not adopt native conversation ID on non-zero exit; got %q", sess.NativeConversationID)
+	}
+	if len(sess.Transcript) != 0 {
+		t.Fatalf("failed turn must not append transcript, got %#v", sess.Transcript)
+	}
+	_ = m.End(id)
+}
+
+func TestAntigravityNativeManager_TimeoutReapsProcessTree(t *testing.T) {
+	// agy can spawn tool children that inherit the stdout/stderr pipes and outlive
+	// it. If the timeout only kills agy, such a child keeps the pipe open and the
+	// concurrent drain blocks long past the turn timeout (the unix orphan scanner
+	// is a no-op). Starting agy as its own process-group leader and killing the
+	// whole group on timeout must reap the child so the drain unblocks promptly.
+	if runtime.GOOS == "windows" {
+		t.Skip("process-group reaping is unix-specific; Windows uses job objects tracked separately")
+	}
+
+	binDir := t.TempDir()
+	fakeAgy := filepath.Join(binDir, "agy")
+	script := "#!/bin/sh\nsleep 60 &\necho started\nexit 0\n"
+	if err := os.WriteFile(fakeAgy, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewAntigravityNativeManager()
+	cwd := t.TempDir()
+	id := "sess-timeout-reap"
+	m.mu.Lock()
+	m.sessions[id] = &AntigravityNativeSession{
+		ID:          id,
+		Cwd:         cwd,
+		WorkspaceID: "ws",
+		UID:         "uid",
+		StartedAt:   time.Now(),
+		status:      "idle",
+	}
+	m.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Send(id, "hello", func(resultMsg) {}, 1*time.Second)
+	}()
+
+	// turnTimeout (1s) + graceful kill wait (~3s) ≈ 4s. If the child were not
+	// reaped, the drain would stay blocked on the inherited pipe for ~60s.
+	select {
+	case <-done:
+		// Returned promptly — the process tree was reaped and the drain unblocked.
+	case <-time.After(20 * time.Second):
+		t.Fatal("Send blocked past the timeout — agy child was not reaped (drain stuck on inherited pipe)")
+	}
+	_ = m.End(id)
+}

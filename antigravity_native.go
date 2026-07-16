@@ -438,20 +438,6 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 		// below (including stdout-bearing diagnostics such as auth/quota).
 	}
 
-	if needCapture || session.NativeConversationID == "" {
-		// Capture read runs under the per-cwd lock acquired before this turn's
-		// run (idempotent: native-resume turns that reach here already replayed
-		// and locked, so this only guards genuine capture turns).
-		lockCapture()
-		captured := captureAntigravityNativeID(session.Cwd, beforeIDs)
-		if captured != "" {
-			session.NativeConversationID = captured
-		} else if session.NativeConversationID == "" {
-			fmt.Printf("%s[antigravity-native] Warning: could not capture native conversation ID for %s%s\n",
-				colorYellow, id, colorReset)
-		}
-	}
-
 	// After missing-conversation replay is handled, remaining non-zero exits
 	// (auth, quota, invalid flags, tool failures) must surface as turn errors
 	// even when stdout carries diagnostic text — never publish success or
@@ -476,6 +462,23 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	if outText == "" {
 		return m.publishTurnError(session, publishFn,
 			"Antigravity produced no response (empty completion is not treated as success)")
+	}
+
+	// Adopt the native conversation ID only after the turn is known to have
+	// succeeded (exitCode == 0, non-empty output). A run that creates/updates the
+	// cwd conversation mapping and then exits non-zero is rejected above without
+	// appending to the transcript, so capturing its ID earlier would resume a
+	// conversation containing a failed/hidden turn the UI and replay never saw.
+	// Capture read runs under the per-cwd lock acquired before this turn's run.
+	if needCapture || session.NativeConversationID == "" {
+		lockCapture()
+		captured := captureAntigravityNativeID(session.Cwd, beforeIDs)
+		if captured != "" {
+			session.NativeConversationID = captured
+		} else if session.NativeConversationID == "" {
+			fmt.Printf("%s[antigravity-native] Warning: could not capture native conversation ID for %s%s\n",
+				colorYellow, id, colorReset)
+		}
 	}
 
 	messageOut := outText
@@ -517,6 +520,20 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	return nil
 }
 
+// killAntigravityProcessTree SIGKILLs the agy process and, on unix, its whole
+// process group so tool descendants that inherited the stdout/stderr pipes die
+// too (otherwise they keep the pipes open and block the drain past the timeout).
+// On Windows killProcessGroup is a no-op, so this matches the prior single-
+// process kill there. Errors (e.g. ESRCH when the group already exited) are
+// swallowed — this is best-effort teardown.
+func killAntigravityProcessTree(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Kill()
+	_ = killProcessGroup(cmd.Process.Pid)
+}
+
 // runOneShot spawns one `agy --print` process, drains stdout/stderr concurrently
 // (required to avoid pipe deadlock), and waits for exit. Does not publish frames.
 func (m *AntigravityNativeManager) runOneShot(
@@ -531,7 +548,12 @@ func (m *AntigravityNativeManager) runOneShot(
 	args := append(antigravityDangerousFlags(), buildAntigravityNativeArgs(prompt, nativeID)...)
 
 	cmd := exec.Command(executable, args...)
-	hideWindow(cmd)
+	// Setsid on unix (hides the console window on Windows) so agy becomes its own
+	// process-group leader. A tool `agy` spawns can outlive it and keep the stdout/
+	// stderr pipes open past the timeout; because the unix orphan scanner is a
+	// no-op, cancel/timeout must reap the whole group (killAntigravityProcessTree),
+	// not just cmd.Process, or those descendants leak and block the drain.
+	detachControllingTTY(cmd)
 	cmd.Dir = session.Cwd
 	cmd.Env = sanitizeAntigravityEnv(os.Environ())
 
@@ -562,9 +584,7 @@ func (m *AntigravityNativeManager) runOneShot(
 		timedOutFlag.Store(true)
 		_ = interruptProcess(cmd)
 		time.AfterFunc(antigravityNativeGracefulKillWait, func() {
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
+			killAntigravityProcessTree(cmd)
 		})
 	})
 	// setActiveProcess kills immediately if End already marked the session
@@ -572,9 +592,7 @@ func (m *AntigravityNativeManager) runOneShot(
 	session.setActiveProcess(cmd, func() {
 		timer.Stop()
 		_ = interruptProcess(cmd)
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
+		killAntigravityProcessTree(cmd)
 	})
 	defer func() {
 		timer.Stop()
@@ -664,7 +682,7 @@ func (m *AntigravityNativeManager) End(id string) error {
 	} else if proc != nil && proc.Process != nil {
 		_ = interruptProcess(proc)
 		time.Sleep(antigravityNativeGracefulKillWait)
-		_ = proc.Process.Kill()
+		killAntigravityProcessTree(proc)
 	}
 
 	m.removeSession(id)
