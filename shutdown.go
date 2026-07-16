@@ -135,6 +135,12 @@ func tearDownSubprocesses() {
 		globalClaudeNativeManager.ShutdownAll()
 	}
 
+	// Same rationale for Antigravity native — in-flight --print children may
+	// still be running a turn when the agent exits.
+	if globalAntigravityNativeManager != nil {
+		globalAntigravityNativeManager.ShutdownAll()
+	}
+
 	// Cleanup GCS storage client (closes idle HTTP/2 streams cleanly).
 	CloseStorageClient()
 

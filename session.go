@@ -41,6 +41,13 @@ const (
 
 	// gracefulShutdownTimeout is how long to wait after interrupt before force killing
 	gracefulShutdownTimeout = 5 * time.Second
+
+	// sessionStreamDrainTimeout is how long waitForExit waits for the scanner
+	// goroutines to reach EOF and drain the pipe buffer after the child exits
+	// before force-closing the owned read ends to unblock a wedged scanner
+	// (e.g. a lingering Windows pipe handle). Mirrors the Claude/Grok/Codex
+	// native managers' drain timeouts.
+	sessionStreamDrainTimeout = 30 * time.Second
 )
 
 /* --------------------------------------------------------------------------
@@ -253,25 +260,53 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	if err != nil {
 		return fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
-	stdout, err := proc.StdoutPipe()
+	// Own the stdout/stderr READ ends ourselves via os.Pipe rather than
+	// proc.StdoutPipe()/StderrPipe(). With the exec-owned pipes, Process.Wait()
+	// closes the read end the instant the child is reaped — discarding any bytes
+	// still buffered in the pipe that the scanner goroutine hasn't read yet.
+	// Reaping is independent of draining, so a background Wait() or a fixed
+	// grace can't avoid the loss. For a fast one-shot (`sh -c 'printf …'`) the
+	// child can exit before the scanner is even scheduled, dropping its entire
+	// output — observed as the flaky TestStartSession_UtilityGetsHeadlessGitEnv
+	// `streamed=""` failure under -race. Owning the read ends means only the
+	// child's exit (closing the write end) produces EOF, so the scanner always
+	// drains every byte first; Wait() no longer touches these fds. waitForExit
+	// closes them only after the scanner reaches EOF (gated on streamDone), and
+	// force-closes early solely to unblock a scanner stuck on a lingering Windows
+	// pipe handle after a drain timeout (see its comment).
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
 		stdin.Close()
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
-	stderr, err := proc.StderrPipe()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
 		stdin.Close()
-		stdout.Close()
+		stdoutR.Close()
+		stdoutW.Close()
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
+	proc.Stdout = stdoutW
+	proc.Stderr = stderrW
+	stdout := stdoutR
+	stderr := stderrR
 
 	// Start the process
 	if err := proc.Start(); err != nil {
 		stdin.Close()
-		stdout.Close()
-		stderr.Close()
+		stdoutR.Close()
+		stdoutW.Close()
+		stderrR.Close()
+		stderrW.Close()
 		return fmt.Errorf("failed to start %s: %w", command, err)
 	}
+
+	// The child now holds its own dup of the write ends; close the parent's
+	// copies so the read ends see EOF when (and only when) the child exits.
+	// Without this the parent stays a writer and the scanners never EOF. Must
+	// run after Start (that's where the fds are handed to the child).
+	stdoutW.Close()
+	stderrW.Close()
 
 	session := &CLISession{
 		ID:          id,
@@ -1208,10 +1243,28 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 		timeoutTimer.Stop()
 	}
 
-	// Explicitly close pipes so the scanner goroutines in readOutputStream
-	// receive EOF and can exit.  On Windows, process exit does not always
-	// immediately release the pipe handles, so the scanners could block on
-	// Read() indefinitely without this.
+	// Drain the readOutputStream scanners BEFORE closing the owned os.Pipe read
+	// ends. With parent-owned read ends, Process.Wait() returning does NOT close
+	// them, so force-closing here immediately (as this used to) races the
+	// scanner: a fast-exiting child (`sh -c 'printf …'`) can be reaped before the
+	// scanner has drained the kernel pipe buffer, discarding its final output —
+	// the exact loss the owned-read-end change (see StartSession pipe comment)
+	// was meant to fix. The child's write ends are already closed (Wait only
+	// returns post-exit), so the scanners reach EOF naturally; a wedged scanner
+	// (e.g. a lingering Windows pipe handle that never releases on exit) falls
+	// through to the drain timeout and we force-close to unblock it. Same pattern
+	// as the Claude/Grok/Codex native managers.
+	select {
+	case <-session.streamDone:
+	case <-time.After(sessionStreamDrainTimeout):
+		fmt.Printf("%s[session] Stream drain timed out for %s — forcing pipe close%s\n",
+			colorYellow, session.ID, colorReset)
+		session.Stdout.Close()
+		session.Stderr.Close()
+	}
+
+	// Mop up the parent read ends. Close-after-Close returns ErrClosed with no
+	// side effects, so repeating the force-close branch above is safe.
 	session.Stdout.Close()
 	session.Stderr.Close()
 

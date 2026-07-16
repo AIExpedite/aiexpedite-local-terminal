@@ -30,7 +30,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v0.10.19"
+var Version = "v0.10.20"
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -308,6 +308,15 @@ func StartAgent(cfg *Config) {
 	globalClaudeNativeManager = NewClaudeNativeManager()
 	go globalClaudeNativeManager.CleanupStale(claudeNativeMaxLifetime)
 	fmt.Println("[aiexpedite] Claude native manager ready")
+
+	/* 3b4. Initialize Antigravity native manager (one-shot --print + resume) */
+	// Drives agy --print with exact --conversation <id> resume for
+	// Antigravity Chat. Logical sessions persist between one-shot processes;
+	// never uses ambiguous --continue.
+
+	globalAntigravityNativeManager = NewAntigravityNativeManager()
+	go globalAntigravityNativeManager.CleanupStale(antigravityNativeMaxAge)
+	fmt.Println("[aiexpedite] Antigravity native manager ready")
 
 	/* 3c. Begin gathering machine info for /auth/token uploads ------------ */
 	// Runs in a background goroutine so we don't block startup. The first

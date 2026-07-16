@@ -324,3 +324,24 @@ seeing every frame in `Seq` order; a silent drop would deadlock.
   [`cliagent_usage_test.go`](cliagent_usage_test.go) — pins the
   cached-token discovery (auth.json + cached_token.json layouts,
   `$GROK_HOME` override) and the missing-login baseline entry.
+
+# CLI Agent Integration — Google Antigravity (`agy`) native chat
+
+Antigravity native chat is documented in full in
+[`docs/antigravity-native-chat.md`](docs/antigravity-native-chat.md).
+
+Summary:
+
+- **Process model:** one-shot `agy --print` per turn (no long-lived stdin).
+- **Resume:** exact `--conversation <uuid>` only — never `--continue`.
+- **Native ID capture:** after first turn, from
+  `~/.gemini/antigravity-cli/cache/last_conversations.json` (cwd key) with a
+  conversations-dir snapshot fallback.
+- **Manager:** [`AntigravityNativeManager`](antigravity_native.go).
+- **Pub/Sub:** `antigravity_native_{start,send,end}` →
+  `antigravity_native_{started,message,stderr,error,ended}`.
+- **Minimum version:** agy ≥ 1.1.1.
+- **Permissions:** `--dangerously-skip-permissions` on the native-chat path only
+  (remote users cannot answer local prompts). Threat model + safeguards are in
+  the doc above. Legacy one-shot `buildAntigravityInteractiveArgs` is unchanged.
+
