@@ -80,9 +80,14 @@ type AntigravityNativeSession struct {
 	ID                   string
 	NativeConversationID string
 	Cwd                  string
-	WorkspaceID          string
-	UID                  string
-	StartedAt            time.Time
+	// WorkspaceRoot is the agent's configured working directory captured at
+	// Start. Retained so each turn can re-verify Cwd containment right before
+	// launch (closing the start→send symlink-swap TOCTOU); empty means the
+	// dispatcher configured no root and the containment check is skipped.
+	WorkspaceRoot string
+	WorkspaceID   string
+	UID           string
+	StartedAt     time.Time
 	// Bounded transcript for replay recovery (user/assistant pairs).
 	Transcript []antigravityTurn
 
@@ -226,17 +231,12 @@ func (m *AntigravityNativeManager) Start(id, cwd, workspaceRoot string, workspac
 	// exactly as the Grok ACP Start path does. When the dispatcher configures no
 	// root (workspaceRoot == "") the check is skipped, preserving the plain
 	// absolute/exists contract for callers with out-of-band containment.
+	// The same check is repeated per turn in runOneShot (see antigravityContainedCwd)
+	// because no CLI process launches until a later Send, leaving a TOCTOU window
+	// in which the cwd subdirectory could be swapped for a symlink escaping the root.
 	if workspaceRoot != "" {
-		resolvedCwd, err := filepath.EvalSymlinks(cwd)
-		if err != nil {
-			return fmt.Errorf("cwd %q symlink resolution failed: %w", cwd, err)
-		}
-		resolvedRoot, err := filepath.EvalSymlinks(workspaceRoot)
-		if err != nil {
-			return fmt.Errorf("workspace root %q symlink resolution failed: %w", workspaceRoot, err)
-		}
-		if !pathInsideRoot(resolvedCwd, resolvedRoot) {
-			return fmt.Errorf("cwd %q is outside the configured workspace root %q", resolvedCwd, resolvedRoot)
+		if _, err := antigravityContainedCwd(cwd, workspaceRoot); err != nil {
+			return err
 		}
 	}
 
@@ -265,14 +265,15 @@ func (m *AntigravityNativeManager) Start(id, cwd, workspaceRoot string, workspac
 	}
 
 	session := &AntigravityNativeSession{
-		ID:          id,
-		Cwd:         cwd,
-		WorkspaceID: workspaceID,
-		UID:         uid,
-		StartedAt:   time.Now(),
-		status:      "idle",
-		Transcript:  nil,
-		publishFn:   publishFn,
+		ID:            id,
+		Cwd:           cwd,
+		WorkspaceRoot: workspaceRoot,
+		WorkspaceID:   workspaceID,
+		UID:           uid,
+		StartedAt:     time.Now(),
+		status:        "idle",
+		Transcript:    nil,
+		publishFn:     publishFn,
 	}
 	m.sessions[id] = session
 
@@ -585,6 +586,31 @@ func killAntigravityProcessTree(cmd *exec.Cmd) {
 
 // runOneShot spawns one `agy --print` process, drains stdout/stderr concurrently
 // (required to avoid pipe deadlock), and waits for exit. Does not publish frames.
+// antigravityContainedCwd resolves symlinks on cwd and, when workspaceRoot is
+// set, verifies the resolved cwd stays inside the resolved root, returning the
+// real (symlink-free) cwd to use as the process working directory. Called from
+// Start and again from runOneShot immediately before launch so a cwd
+// subdirectory that is swapped for a symlink escaping the root between
+// antigravity_native_start and antigravity_native_send cannot run
+// `agy --dangerously-skip-permissions` outside the approved workspace.
+func antigravityContainedCwd(cwd, workspaceRoot string) (string, error) {
+	resolvedCwd, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return "", fmt.Errorf("cwd %q symlink resolution failed: %w", cwd, err)
+	}
+	if workspaceRoot == "" {
+		return resolvedCwd, nil
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(workspaceRoot)
+	if err != nil {
+		return "", fmt.Errorf("workspace root %q symlink resolution failed: %w", workspaceRoot, err)
+	}
+	if !pathInsideRoot(resolvedCwd, resolvedRoot) {
+		return "", fmt.Errorf("cwd %q is outside the configured workspace root %q", resolvedCwd, resolvedRoot)
+	}
+	return resolvedCwd, nil
+}
+
 func (m *AntigravityNativeManager) runOneShot(
 	session *AntigravityNativeSession,
 	executable, prompt, nativeID string,
@@ -603,7 +629,16 @@ func (m *AntigravityNativeManager) runOneShot(
 	// no-op, cancel/timeout must reap the whole group (killAntigravityProcessTree),
 	// not just cmd.Process, or those descendants leak and block the drain.
 	detachControllingTTY(cmd)
-	cmd.Dir = session.Cwd
+	// Re-verify workspace-root containment right before assigning the working
+	// directory: Start's check can go stale because no process launches until
+	// this later Send, so a cwd subdirectory swapped for a symlink escaping the
+	// root would otherwise run agy outside the approved workspace. Use the
+	// resolved (symlink-free) cwd so the swap cannot redirect the launch.
+	runDir, err := antigravityContainedCwd(session.Cwd, session.WorkspaceRoot)
+	if err != nil {
+		return "", "", 0, false, false, fmt.Errorf("cwd containment revalidation failed: %w", err)
+	}
+	cmd.Dir = runDir
 	cmd.Env = sanitizeAntigravityEnv(os.Environ())
 
 	stdout, err := cmd.StdoutPipe()

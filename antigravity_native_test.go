@@ -470,6 +470,52 @@ func TestAntigravityNativeManager_StartRejectsCwdOutsideWorkspaceRoot(t *testing
 	}
 }
 
+// TestAntigravityContainedCwd_RevalidatesSymlinkSwap proves the per-turn
+// containment revalidation runOneShot performs right before assigning cmd.Dir:
+// Start's check can go stale because no `agy` process launches until a later
+// Send, so a cwd subdirectory swapped for a symlink escaping the workspace root
+// between antigravity_native_start and antigravity_native_send must be caught
+// before launch. antigravityContainedCwd returns the resolved cwd when contained
+// and an error once the path escapes.
+func TestAntigravityContainedCwd_RevalidatesSymlinkSwap(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir() // sibling temp dir, not inside root
+
+	cwd := filepath.Join(root, "work")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatalf("mkdir cwd: %v", err)
+	}
+
+	// While the real directory is inside root, the check passes and returns the
+	// resolved (symlink-free) path to use as the working directory.
+	resolved, err := antigravityContainedCwd(cwd, root)
+	if err != nil {
+		t.Fatalf("contained cwd must pass; got %v", err)
+	}
+	if resolved == "" {
+		t.Fatal("expected a resolved cwd for a contained path")
+	}
+
+	// Simulate the TOCTOU: replace the subdirectory with a symlink pointing
+	// outside the workspace root, as could happen between Start and Send.
+	if err := os.RemoveAll(cwd); err != nil {
+		t.Fatalf("remove cwd: %v", err)
+	}
+	if err := os.Symlink(outside, cwd); err != nil {
+		t.Skipf("symlink unsupported on this platform: %v", err)
+	}
+	if _, err := antigravityContainedCwd(cwd, root); err == nil {
+		t.Fatal("expected revalidation to reject a cwd swapped to a symlink outside the root")
+	} else if !strings.Contains(err.Error(), "outside the configured workspace root") {
+		t.Fatalf("unexpected error (want containment rejection): %v", err)
+	}
+
+	// With no configured root the check is skipped (plain absolute/exists contract).
+	if _, err := antigravityContainedCwd(cwd, ""); err != nil {
+		t.Fatalf("empty root must skip containment; got %v", err)
+	}
+}
+
 func TestCompareSemver(t *testing.T) {
 	if compareSemver("1.1.1", "1.1.1") != 0 {
 		t.Fatal("equal")
