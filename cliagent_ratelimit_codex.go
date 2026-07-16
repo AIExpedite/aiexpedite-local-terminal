@@ -253,7 +253,14 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 	// must NOT be treated as authoritative-empty — that would let a partial or
 	// forward-compatible read erase live observations. Such frames fall back to
 	// the same no-op the old early-return produced.
+	//
+	// sawNonEmptyFullContainer records that SOME full-snapshot container was
+	// non-empty (len>0). A dual-container read (`rateLimits:{}` alongside a
+	// non-empty `rateLimitsByLimitId` that happens to recognise nothing) carried
+	// real content and must not count as authoritative-empty just because one of
+	// its containers was `{}`.
 	sawEmptyFullContainer := false
+	sawNonEmptyFullContainer := false
 	addContributor := func(window, limit string, b codexRateLimitBucket) {
 		if out[window] == nil {
 			out[window] = map[string]codexRateLimitBucket{}
@@ -318,6 +325,8 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 					fullSnapshot = true
 					if len(rl) == 0 {
 						sawEmptyFullContainer = true
+					} else {
+						sawNonEmptyFullContainer = true
 					}
 				}
 				for window, val := range rl {
@@ -357,6 +366,8 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 					fullSnapshot = true
 					if len(rl) == 0 {
 						sawEmptyFullContainer = true
+					} else {
+						sawNonEmptyFullContainer = true
 					}
 				}
 				for limitKey, val := range rl {
@@ -438,11 +449,13 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 			}
 		}
 	}
-	// Authoritative-empty: a full snapshot carried an empty container AND produced
-	// no buckets and no explicit clears. Only then may the merger clear the whole
-	// cache. If the frame extracted anything (buckets → present non-empty, or an
-	// explicit null → clears), those signals drive reconciliation instead.
-	emptyAuthoritative := sawEmptyFullContainer && len(out) == 0 && len(clears) == 0
+	// Authoritative-empty: a full snapshot carried an empty container, NO non-empty
+	// container, and produced no buckets and no explicit clears. Only then may the
+	// merger clear the whole cache. A dual-container read whose other container was
+	// non-empty (even if unrecognised), or any frame that extracted buckets/clears,
+	// drives reconciliation through those signals instead of clearing everything.
+	emptyAuthoritative := sawEmptyFullContainer && !sawNonEmptyFullContainer &&
+		len(out) == 0 && len(clears) == 0
 	return out, clears, fullSnapshot, present, emptyAuthoritative
 }
 
@@ -693,50 +706,71 @@ func codexPlacementBeats(aBucket codexRateLimitBucket, aSlot string, bBucket cod
 	return aBucket.usageKnown && !bBucket.usageKnown
 }
 
+// codexSurvivingContributions reconciles one metric identity's contributors down
+// to the placements that should feed display and remain on disk. Two rules,
+// applied together, keep it sparse-safe:
+//
+//   - Per limit id, the newest cross-slot PLACEMENT wins. When the SAME metered
+//     limit is restated under a new storage slot (a migration), the old-slot copy
+//     of that limit is superseded — but a DISTINCT limit id that only exists on
+//     the other slot is NOT retracted (sparse frames never drop a limit they
+//     didn't mention), so it still contributes to the most-constrained fold.
+//   - The coarse `__legacy__` aggregate contributor is dropped only when a
+//     STRICTLY NEWER non-legacy placement of the same identity exists: once a
+//     named `codex_*` limit restates the metric more recently, the aggregate
+//     view is a stale duplicate. Within a single frame (equal ObservedAtMs) the
+//     aggregate and named views coexist and fold most-constrained, so a genuinely
+//     stricter aggregate is never silently discarded.
+//
+// Returned in sorted-limit-id order so downstream folding is deterministic and
+// never depends on Go map iteration order.
+func codexSurvivingContributions(contribs []codexIdentityContribution) []codexIdentityContribution {
+	winners := map[string]codexIdentityContribution{}
+	for _, c := range contribs {
+		cur, ok := winners[c.limitID]
+		if !ok || codexPlacementBeats(c.bucket, c.slot, cur.bucket, cur.slot) {
+			winners[c.limitID] = c
+		}
+	}
+	if legacy, ok := winners[codexLegacyLimitID]; ok {
+		for id, w := range winners {
+			if id == codexLegacyLimitID {
+				continue
+			}
+			if w.bucket.ObservedAtMs > legacy.bucket.ObservedAtMs {
+				delete(winners, codexLegacyLimitID)
+				break
+			}
+		}
+	}
+	ids := make([]string, 0, len(winners))
+	for id := range winners {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]codexIdentityContribution, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, winners[id])
+	}
+	return out
+}
+
 // codexAggregateIdentity folds one identity partition into a single display
-// bucket. Within a limit id, the newest placement wins (same-identity
-// supersession, so a stale duplicate never resurfaces). Across DISTINCT limit
-// ids it folds most-constrained (a stricter metered limit still tightens the
-// window), walking limit ids in sorted order so WindowMinutes/reset selection is
-// deterministic. A contributor whose reset has already passed is zeroed for the
-// comparison, matching aggregateCodexBuckets, so a stale-but-high reading can't
-// shadow a live one.
+// bucket. Contributors are first reconciled by codexSurvivingContributions
+// (newest placement per limit id; stale __legacy__ aggregate dropped), then the
+// survivors fold most-constrained across DISTINCT metered limits so a stricter
+// concurrent limit still tightens the window — even when the surviving limits sit
+// on different storage slots. A contributor whose reset has already passed is
+// zeroed for the comparison, matching aggregateCodexBuckets, so a stale-but-high
+// reading can't shadow a live one.
 func codexAggregateIdentity(contribs []codexIdentityContribution, now time.Time) (codexRateLimitBucket, bool) {
 	if len(contribs) == 0 {
 		return codexRateLimitBucket{}, false
 	}
-	// Collapse cross-slot placements of this one metric to a single winning
-	// storage slot before folding. A reading that migrated slots (a weekly that
-	// moved secondary→primary, possibly changing limit-id shape from the
-	// __legacy__ aggregate to a named codex_* limit) can leave a stale copy behind
-	// under the old slot; most-constraining ACROSS the slots would let the stale
-	// higher-usage copy shadow the fresher one. The freshest placement's slot is
-	// the live generation. This mirrors codexReconcileIdentitySupersession so the
-	// display is correct even when reading a cache written before that reconcile
-	// existed (or seeded directly in a test). Determinism: codexPlacementBeats is a
-	// total order across distinct slots, so the winning slot never depends on Go
-	// map iteration order.
-	winnerSlot := ""
-	var best codexIdentityContribution
-	for i, c := range contribs {
-		if i == 0 || codexPlacementBeats(c.bucket, c.slot, best.bucket, best.slot) {
-			best = c
-			winnerSlot = c.slot
-		}
-	}
-	scoped := make([]codexIdentityContribution, 0, len(contribs))
-	for _, c := range contribs {
-		if c.slot == winnerSlot {
-			scoped = append(scoped, c)
-		}
-	}
-	// Deterministic fold order across the winning slot's distinct metered limits.
-	sort.Slice(scoped, func(i, j int) bool { return scoped[i].limitID < scoped[j].limitID })
-
 	const key = "identity"
 	out := map[string]codexRateLimitBucket{}
 	nowMs := now.UnixMilli()
-	for _, c := range scoped {
+	for _, c := range codexSurvivingContributions(contribs) {
 		b := c.bucket
 		if b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs {
 			b.UsedPercentage = 0
@@ -787,34 +821,30 @@ func codexIdentityDisplayBucket(parts map[string][]codexIdentityContribution, id
 	return codexAggregateIdentity(scoped, now)
 }
 
-// codexReconcileIdentitySupersession drops cross-slot duplicates of the same
-// metric identity: when a metric is stored under more than one display slot —
-// e.g. a weekly-band reading migrated to `primary` while the old `secondary`
-// weekly lingered — only the newest storage slot's contributors survive.
+// codexReconcileIdentitySupersession removes stale duplicates of the same metric
+// so no two versions of a window ever linger in the cache. It partitions every
+// contributor by identity and keeps exactly the placements
+// codexSurvivingContributions selects, so display and on-disk state agree:
 //
-// Supersession is keyed by IDENTITY, not (identity, limit id): a migration can
-// also change the limit-id shape (the `__legacy__` aggregate `rate_limits` view
-// vs a named `codex_*` bucket from `rateLimitsByLimitId`), so keying on the limit
-// id would leave the stale copy behind and let an older, higher-usage reading
-// shadow the fresher one via most-constrained folding. Distinct metered limits of
-// the SAME live reading are emitted together and therefore share the winning
-// slot, so they are preserved for the most-constrained merge; only contributors
-// of that identity under an OLDER slot are removed. Sparse-safe: an identity that
-// simply wasn't restated this frame keeps its single slot and is never touched.
+//   - the SAME limit id restated under a new storage slot supersedes its old-slot
+//     copy (newest placement wins);
+//   - a stale `__legacy__` aggregate is dropped once a strictly-newer named limit
+//     of the same identity exists (the cross-shape migration case).
+//
+// Crucially it is SPARSE-SAFE: a DISTINCT metered limit that this frame did not
+// mention — e.g. weekly limit A under `secondary` while a sparse frame only
+// restated weekly limit B under `primary` — is left in place, so it still
+// contributes to the most-constrained fold instead of being silently retracted.
 // Walks slots/limit ids in sorted order so the outcome never depends on Go map
 // iteration order.
 func codexReconcileIdentitySupersession(contributors map[string]map[string]codexRateLimitBucket) {
-	type ref struct {
-		slot, limitID string
-		bucket        codexRateLimitBucket
-	}
-	byIdentity := map[string][]ref{}
-
 	slots := make([]string, 0, len(contributors))
 	for slot := range contributors {
 		slots = append(slots, slot)
 	}
 	sort.Strings(slots)
+
+	byIdentity := map[string][]codexIdentityContribution{}
 	for _, slot := range slots {
 		contribs := contributors[slot]
 		limitIDs := make([]string, 0, len(contribs))
@@ -825,25 +855,24 @@ func codexReconcileIdentitySupersession(contributors map[string]map[string]codex
 		for _, limitID := range limitIDs {
 			b := contribs[limitID]
 			id := codexWindowIdentity(b.WindowMinutes, slot)
-			byIdentity[id] = append(byIdentity[id], ref{slot: slot, limitID: limitID, bucket: b})
+			byIdentity[id] = append(byIdentity[id], codexIdentityContribution{
+				slot: slot, limitID: limitID, identity: id, bucket: b,
+			})
 		}
 	}
-	for _, refs := range byIdentity {
-		winnerSlot := ""
-		var best ref
-		for i, r := range refs {
-			if i == 0 || codexPlacementBeats(r.bucket, r.slot, best.bucket, best.slot) {
-				best = r
-				winnerSlot = r.slot
-			}
-		}
-		for _, r := range refs {
-			if r.slot != winnerSlot {
-				delete(contributors[r.slot], r.limitID)
-			}
+
+	survive := map[string]bool{}
+	for _, contribs := range byIdentity {
+		for _, s := range codexSurvivingContributions(contribs) {
+			survive[s.slot+"\x00"+s.limitID] = true
 		}
 	}
 	for slot, contribs := range contributors {
+		for limitID := range contribs {
+			if !survive[slot+"\x00"+limitID] {
+				delete(contribs, limitID)
+			}
+		}
 		if len(contribs) == 0 {
 			delete(contributors, slot)
 		}

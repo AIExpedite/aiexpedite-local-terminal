@@ -1664,3 +1664,96 @@ func TestCaptureCodexRateLimit_FullSnapshotUnparseableBucketPreservesCache(t *te
 		t.Errorf("both rows should remain known after a non-authoritative full read, got [%+v %+v]", metrics[0], metrics[1])
 	}
 }
+
+// Finding (sparse-safe concurrent limits): two weekly metered limits A@90% and
+// B@20% are cached under secondary; a later sparse frame restates ONLY B, moving
+// it to the primary slot at 30%. B's old secondary copy is superseded (newest
+// placement wins), but A — which the sparse frame never mentioned — must NOT be
+// retracted. Weekly must still display 90% (A most-constrains), not 30%.
+func TestCaptureCodexRateLimit_SparseMigrationKeepsUnmentionedConcurrentLimit(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed weekly limits A@90 and B@20, both under secondary.
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimitsByLimitId":{`+
+			`"codex_weekly_a":{"secondary":{"usedPercent":90,"windowDurationMins":10080,"resetsInSeconds":604800}},`+
+			`"codex_weekly_b":{"secondary":{"usedPercent":20,"windowDurationMins":10080,"resetsInSeconds":604800}}`+
+			`}}}`,
+		now,
+	)
+	// Sparse frame restates ONLY B, now under the primary slot at 30%.
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimitsByLimitId":{`+
+			`"codex_weekly_b":{"primary":{"usedPercent":30,"windowDurationMins":10080,"resetsInSeconds":604800}}`+
+			`}}}`,
+		now.Add(30*time.Second),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	// A survives under secondary (never mentioned by the sparse frame).
+	if a, present := snap.Contributors[codexWindowSecondary]["codex_weekly_a"]; !present || a.UsedPercentage != 90 {
+		t.Errorf("unmentioned concurrent limit A must survive under secondary: %+v", snap.Contributors[codexWindowSecondary])
+	}
+	// B migrated: its secondary copy is superseded, the primary copy remains.
+	if _, present := snap.Contributors[codexWindowSecondary]["codex_weekly_b"]; present {
+		t.Errorf("migrated limit B must not keep its stale secondary copy: %+v", snap.Contributors[codexWindowSecondary])
+	}
+	if b, present := snap.Contributors[codexWindowPrimary]["codex_weekly_b"]; !present || b.UsedPercentage != 30 {
+		t.Errorf("migrated limit B must live under primary at 30%%: %+v", snap.Contributors[codexWindowPrimary])
+	}
+
+	metrics := codexMetricsFromCache(now.Add(30*time.Second), "")
+	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
+		t.Fatalf("metrics[1]=%+v, want known weekly", metrics[1])
+	}
+	if metrics[1].Consumed == nil || *metrics[1].Consumed != 90 {
+		t.Errorf("weekly Consumed=%v, want 90 (unmentioned A still most-constrains after B migrates)", metrics[1].Consumed)
+	}
+}
+
+// Finding (dual-container authoritative-empty): a full read with an empty
+// `rateLimits:{}` alongside a NON-empty `rateLimitsByLimitId` that recognises
+// nothing (unknown limit / non-window nesting) carried real content and must NOT
+// be treated as authoritative-empty — it is a no-op that preserves prior cache.
+func TestCaptureCodexRateLimit_DualContainerEmptyPlusUnrecognizedPreservesCache(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{`+
+			`"primary":{"used_percent":30,"window_minutes":300,"resets_in_seconds":1800},`+
+			`"secondary":{"used_percent":40,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+	if snap, ok := loadCodexRateLimitSnapshot(cache); !ok || len(snap.Buckets) != 2 {
+		t.Fatalf("seed should cache two windows, got ok=%v %+v", ok, snap.Buckets)
+	}
+
+	// Empty rateLimits container, but a non-empty rateLimitsByLimitId whose only
+	// entry recognises no window — the frame is NOT a clear-all.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","id":11,"result":{"rateLimits":{},"rateLimitsByLimitId":{`+
+			`"mystery_limit":{"tertiary":{"usedPercent":5,"windowDurationMins":60}}`+
+			`}}}`,
+		now.Add(time.Minute),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if p, present := snap.Buckets[codexWindowPrimary]; !present || p.UsedPercentage != 30 {
+		t.Errorf("primary must survive dual-container non-authoritative read: %+v", snap.Buckets)
+	}
+	if s, present := snap.Buckets[codexWindowSecondary]; !present || s.UsedPercentage != 40 {
+		t.Errorf("secondary must survive dual-container non-authoritative read: %+v", snap.Buckets)
+	}
+}
