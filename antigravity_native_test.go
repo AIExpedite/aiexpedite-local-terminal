@@ -438,8 +438,15 @@ func TestCaptureAntigravityNativeID_UsesResolvedCwdKey(t *testing.T) {
 
 	id := "99999999-8888-7777-6666-555555555555"
 	// agy records the mapping under the RESOLVED process cwd (cmd.Dir == runDir).
+	// Marshal the map rather than concatenating the path into a JSON literal:
+	// on Windows the resolved path contains backslashes, which are invalid JSON
+	// escapes when interpolated raw and would make json.Unmarshal fail.
+	lastConv, err := json.Marshal(map[string]string{resolved: id})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(base, "cache", "last_conversations.json"),
-		[]byte(`{"`+resolved+`":"`+id+`"}`), 0o644); err != nil {
+		lastConv, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(base, "conversations", id+".db"), []byte("x"), 0o644); err != nil {
