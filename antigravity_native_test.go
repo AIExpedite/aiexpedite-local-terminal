@@ -1056,3 +1056,77 @@ func TestAntigravityNativeManager_TimeoutReapsProcessTree(t *testing.T) {
 	}
 	_ = m.End(id)
 }
+
+// TestAntigravityNativeManager_EndWaitsForInFlightTurn verifies End does not
+// return while a Send turn is still in-flight. End cancels the running agy
+// process and then blocks on turnMu until the turn goroutine unwinds, so the
+// antigravity_native_end handler publishes its terminal antigravity_native_ended
+// frame only after every frame the turn emits (no post-ended stderr on
+// stop/cancel), matching the Claude/Codex/Grok managers which wait on
+// process/stream completion before emitting ended.
+func TestAntigravityNativeManager_EndWaitsForInFlightTurn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim for fake agy is unix-oriented")
+	}
+
+	binDir := t.TempDir()
+	fakeAgy := filepath.Join(binDir, "agy")
+	// Block for far longer than the test so only End's cancel can stop it.
+	script := "#!/bin/sh\nsleep 120\n"
+	if err := os.WriteFile(fakeAgy, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewAntigravityNativeManager()
+	cwd := t.TempDir()
+	id := "sess-end-wait"
+
+	m.mu.Lock()
+	m.sessions[id] = &AntigravityNativeSession{
+		ID:          id,
+		Cwd:         cwd,
+		WorkspaceID: "ws",
+		UID:         "uid",
+		StartedAt:   time.Now(),
+		status:      "idle",
+	}
+	m.mu.Unlock()
+
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		_ = m.Send(id, "hello", func(resultMsg) {}, 120*time.Second)
+	}()
+
+	// Wait until the turn has actually spawned agy before ending.
+	sess := m.Get(id)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		sess.mu.Lock()
+		running := sess.activeProcess != nil
+		sess.mu.Unlock()
+		if running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("turn never spawned agy within 5s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The turn is blocked in agy. End must cancel it and only return once the
+	// turn goroutine has unwound (turnMu released) — never while agy still runs.
+	if err := m.End(id); err != nil {
+		t.Fatalf("End returned error: %v", err)
+	}
+
+	// Barrier guarantee: by the time End returns, the in-flight Send has already
+	// finished. Without the barrier End would return in microseconds while agy
+	// slept for 120s, leaving sendDone open. A 2s tolerance is far below that.
+	select {
+	case <-sendDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("End returned while the turn was still in-flight — drain barrier missing")
+	}
+}

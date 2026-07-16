@@ -677,12 +677,16 @@ func (m *AntigravityNativeManager) publishStderrIfAny(session *AntigravityNative
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,
 		Output:      redactAntigravitySecrets(errText),
-		Status:      "info",
-		Ts:          time.Now().UnixMilli(),
-		Version:     Version,
-		Type:        "antigravity_native_stderr",
-		SessionID:   session.ID,
-		Seq:         seq,
+		// "success" matches the documented resultMsg status enum and the
+		// claude_native_stderr / codex_appserver_stderr / grok_acp_stderr
+		// frames — a diagnostic stderr line is a valid (non-error) frame, and
+		// consumers switching on the known status values would drop "info".
+		Status:    "success",
+		Ts:        time.Now().UnixMilli(),
+		Version:   Version,
+		Type:      "antigravity_native_stderr",
+		SessionID: session.ID,
+		Seq:       seq,
 	})
 }
 
@@ -711,6 +715,17 @@ func (m *AntigravityNativeManager) End(id string) error {
 		time.Sleep(antigravityNativeGracefulKillWait)
 		killAntigravityProcessTree(proc)
 	}
+
+	// Wait for any in-flight Send to fully drain before returning. A turn holds
+	// turnMu for its whole run and publishes its final stderr/error frames on
+	// the way out; the antigravity_native_end handler publishes
+	// antigravity_native_ended only after End returns. Blocking on turnMu here
+	// orders that terminal frame last (no post-ended stderr on stop/cancel),
+	// matching Claude/Codex/Grok which wait on process/stream completion before
+	// emitting ended. Returns immediately when no turn is active, and the
+	// cancel/kill above guarantees the running turn unwinds promptly.
+	session.turnMu.Lock()
+	session.turnMu.Unlock() //nolint:staticcheck // intentional drain barrier, not a guarded region
 
 	m.removeSession(id)
 	fmt.Printf("%s[antigravity-native] Session %s ended%s\n", colorYellow, id, colorReset)
