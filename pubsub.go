@@ -2994,9 +2994,13 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 	case "antigravity_native_start":
 		// Gate against `agy` so the default `agy *` / `antigravity *` allowlist
 		// entry covers native-chat access. The actual per-turn argv is built
-		// later in Send; Start only registers the logical session.
+		// later in Send; Start only registers the logical session. Gate/display
+		// the SAME argv shape runOneShot will execute — including the leading
+		// --dangerously-skip-permissions — so a narrowed allowlist (e.g.
+		// `agy --print *`) cannot approve a command that then silently runs with
+		// auto-approved tool permissions the operator never saw.
 		allowCommand = "agy"
-		allowArgs = []string{"--print", "<prompt>"}
+		allowArgs = buildAntigravityNativeGateArgs()
 		dialogArgs = allowArgs
 		denyOutput = "antigravity native session denied by user: not in allow list"
 	case "grok_acp_start":

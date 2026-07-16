@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestIsAntigravityNativeCommand(t *testing.T) {
@@ -118,6 +119,52 @@ func TestBuildAntigravityReplayPrompt_RetainsCurrentUserTurn(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "Answer ONLY the final user message") {
 		t.Fatalf("replay must mark the final turn: %q", prompt)
+	}
+}
+
+// A replay built from a large history must fit the SEND limit (24KB), not the
+// larger 48KB transcript bound — otherwise Send rejects it and recovery fails
+// for histories between the two limits. The final user turn must survive.
+func TestBuildAntigravityReplayPrompt_FitsSendLimit(t *testing.T) {
+	var tr []antigravityTurn
+	// ~40KB of prior history: over the 24KB send limit, under the 48KB bound.
+	for i := 0; i < 20; i++ {
+		tr = append(tr,
+			antigravityTurn{Role: "user", Content: strings.Repeat("u", 1000), At: time.Now()},
+			antigravityTurn{Role: "assistant", Content: strings.Repeat("a", 1000), At: time.Now()},
+		)
+	}
+	final := "FINAL_USER_QUESTION_marker"
+	prompt := buildAntigravityReplayPrompt(tr, final)
+
+	if len(prompt) > antigravityNativeMaxPromptBytes {
+		t.Fatalf("replay prompt %d bytes exceeds send limit %d", len(prompt), antigravityNativeMaxPromptBytes)
+	}
+	if !strings.Contains(prompt, final) {
+		t.Fatalf("replay dropped the final user turn: %q", prompt[:min(200, len(prompt))])
+	}
+	if !strings.Contains(prompt, "Answer ONLY the final user message") {
+		t.Fatalf("replay dropped the preamble instructions")
+	}
+	if !utf8.ValidString(prompt) {
+		t.Fatalf("replay produced invalid UTF-8 after tail trim")
+	}
+}
+
+// The approval gate must display/allow the same argv runOneShot executes,
+// including the leading --dangerously-skip-permissions, so a narrowed allowlist
+// (e.g. `agy --print *`) cannot approve a command that silently runs with
+// auto-approved tool permissions.
+func TestAntigravityNativeGateArgs_MatchExecutedShape(t *testing.T) {
+	gate := buildAntigravityNativeGateArgs()
+	if len(gate) == 0 || gate[0] != "--dangerously-skip-permissions" {
+		t.Fatalf("gate argv must lead with --dangerously-skip-permissions, got %#v", gate)
+	}
+	// Gate must equal the first-turn launch shape (dangerous flags + native args
+	// with the prompt placeholder, no --conversation).
+	want := append(antigravityDangerousFlags(), buildAntigravityNativeArgs("<prompt>", "")...)
+	if strings.Join(gate, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("gate argv %#v drifted from executed shape %#v", gate, want)
 	}
 }
 

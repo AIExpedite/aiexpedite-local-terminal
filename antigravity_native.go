@@ -41,6 +41,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -491,10 +492,10 @@ func (m *AntigravityNativeManager) runOneShot(
 	turnTimeout time.Duration,
 	registryLabel string,
 ) (stdoutText, stderrText string, exitCode int, timedOut, truncated bool, err error) {
-	args := buildAntigravityNativeArgs(prompt, nativeID)
 	// Unattended remote chat cannot answer local permission prompts — see
-	// package threat-model comment.
-	args = append([]string{"--dangerously-skip-permissions"}, args...)
+	// package threat-model comment. Same prefix the approval gate displays
+	// (buildAntigravityNativeGateArgs) so the two never drift.
+	args := append(antigravityDangerousFlags(), buildAntigravityNativeArgs(prompt, nativeID)...)
 
 	cmd := exec.Command(executable, args...)
 	hideWindow(cmd)
@@ -782,6 +783,21 @@ func buildAntigravityNativeArgs(prompt, nativeConversationID string) []string {
 	return args
 }
 
+// buildAntigravityNativeGateArgs returns the argv shape the approval dialog and
+// allowlist gate should match: exactly what runOneShot spawns for a first turn
+// (--dangerously-skip-permissions prepended, prompt placeholder). Kept here so
+// the gate and the real launch never drift — a narrowed allowlist must approve
+// the permission-skipping flag it will actually run with.
+func buildAntigravityNativeGateArgs() []string {
+	return append(antigravityDangerousFlags(), buildAntigravityNativeArgs("<prompt>", "")...)
+}
+
+// antigravityDangerousFlags is the prefix runOneShot prepends before the
+// per-turn argv. Centralised so the gate and the launch stay in lockstep.
+func antigravityDangerousFlags() []string {
+	return []string{"--dangerously-skip-permissions"}
+}
+
 func sanitizeAntigravityEnv(env []string) []string {
 	// Strip unrelated provider credentials that might leak into child tools.
 	// Compare case-insensitively: Windows and some shells export mixed/lower
@@ -1046,33 +1062,49 @@ func antigravityTurnPrompt(nativeID string, transcript []antigravityTurn, newUse
 }
 
 func buildAntigravityReplayPrompt(transcript []antigravityTurn, newUserText string) string {
-	var b strings.Builder
-	b.WriteString("You are continuing an AIExpedite Antigravity Chat conversation after native resume failed. ")
-	b.WriteString("Prior turns (oldest first) follow. Treat them as history only. ")
-	b.WriteString("Answer ONLY the final user message.\n\n")
+	const preamble = "You are continuing an AIExpedite Antigravity Chat conversation after native resume failed. " +
+		"Prior turns (oldest first) follow. Treat them as history only. " +
+		"Answer ONLY the final user message.\n\n"
+
+	var body strings.Builder
 	// Use bounded transcript without the just-submitted user turn if it was already appended.
 	for _, turn := range transcript {
 		switch turn.Role {
 		case "user":
-			b.WriteString("User: ")
+			body.WriteString("User: ")
 		case "assistant":
-			b.WriteString("Assistant: ")
+			body.WriteString("Assistant: ")
 		default:
-			b.WriteString(turn.Role + ": ")
+			body.WriteString(turn.Role + ": ")
 		}
-		b.WriteString(turn.Content)
-		b.WriteString("\n\n")
+		body.WriteString(turn.Content)
+		body.WriteString("\n\n")
 	}
-	b.WriteString("User: ")
-	b.WriteString(newUserText)
-	b.WriteString("\n")
-	// Cap total prompt size.
-	s := b.String()
-	if len(s) > antigravityReplayMaxChars {
-		// Keep tail (includes final user message).
-		s = s[len(s)-antigravityReplayMaxChars:]
+	body.WriteString("User: ")
+	body.WriteString(newUserText)
+	body.WriteString("\n")
+
+	// The replay is delivered through Send, which rejects prompts larger than
+	// antigravityNativeMaxPromptBytes (24KB). Cap here to that SEND limit — not
+	// the larger antigravityReplayMaxChars (48KB) — so a history whose replay
+	// lands between the two limits drops its oldest turns to fit instead of
+	// failing recovery outright. Keep the preamble (instructions) plus the tail
+	// of the body: the final user turn sits at the end and is itself within the
+	// limit (oversize raw prompts are rejected upstream before replay).
+	bodyStr := body.String()
+	budget := antigravityNativeMaxPromptBytes - len(preamble)
+	if budget < 0 {
+		budget = 0
 	}
-	return s
+	if len(bodyStr) > budget {
+		bodyStr = bodyStr[len(bodyStr)-budget:]
+		// Advance to the next rune boundary so the byte-oriented slice cannot
+		// split a multi-byte character into invalid UTF-8.
+		for len(bodyStr) > 0 && !utf8.RuneStart(bodyStr[0]) {
+			bodyStr = bodyStr[1:]
+		}
+	}
+	return preamble + bodyStr
 }
 
 /* --------------------------------------------------------------------------
