@@ -674,22 +674,37 @@ func (m *AntigravityNativeManager) runOneShot(
 	}
 
 	var timedOutFlag atomic.Bool
+	// forceKillTimer holds the delayed force-kill armed after a graceful
+	// interrupt. It must be stopped once the process exits: if agy exits during
+	// the grace period, cmd.Wait() reaps the child and this turn returns, but a
+	// still-armed callback would later call killAntigravityProcessTree with the
+	// now-reaped PID/PGID — after PID/PGID reuse that signals an unrelated
+	// process. Stored via atomic.Pointer because the timeout callback (its own
+	// goroutine) arms it while the defer / cancel closure stop it.
+	var forceKillTimer atomic.Pointer[time.Timer]
+	stopForceKillTimer := func() {
+		if fk := forceKillTimer.Load(); fk != nil {
+			fk.Stop()
+		}
+	}
 	timer := time.AfterFunc(turnTimeout, func() {
 		timedOutFlag.Store(true)
 		_ = interruptProcess(cmd)
-		time.AfterFunc(antigravityNativeGracefulKillWait, func() {
+		forceKillTimer.Store(time.AfterFunc(antigravityNativeGracefulKillWait, func() {
 			killAntigravityProcessTree(cmd)
-		})
+		}))
 	})
 	// setActiveProcess kills immediately if End already marked the session
 	// ended before cancel was stored (including the cmd.Start window).
 	session.setActiveProcess(cmd, func() {
 		timer.Stop()
+		stopForceKillTimer()
 		_ = interruptProcess(cmd)
 		killAntigravityProcessTree(cmd)
 	})
 	defer func() {
 		timer.Stop()
+		stopForceKillTimer()
 		session.clearActiveProcess()
 	}()
 
