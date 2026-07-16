@@ -574,6 +574,98 @@ func TestCodexUsageParser_PopulatesObservedMetricsFromCache(t *testing.T) {
 	}
 }
 
+// Parse composition (AC1/AC6): two same-identity weekly observations that would
+// previously surface as duplicate "Weekly quota" rows collapse to a single
+// weekly metric, with the 5-hour session row first (Unknown here) and the weekly
+// row second.
+func TestCodexUsageParser_DeduplicatesWeeklyAndKeepsClaudeOrder(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"email": "carol@example.com",
+		"plan":  "pro",
+	})
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	older := now.Add(-time.Minute)
+	fp := fingerprintAccount("codex", "carol@example.com")
+
+	// Older weekly under secondary; newer weekly-band reading under primary.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowSecondary: {
+			UsedPercentage: 70, ResetsAtMs: now.Add(7 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, ObservedAtMs: older.UnixMilli(), usageKnown: true, resetKnown: true,
+		},
+	}, nil, older, fp)
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 30, ResetsAtMs: now.Add(7 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, ObservedAtMs: now.UnixMilli(), usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, fp)
+
+	usage, ok := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	if len(usage.Metrics) != 2 {
+		t.Fatalf("expected exactly 2 metrics (no duplicate weekly), got %d: %+v", len(usage.Metrics), usage.Metrics)
+	}
+	if usage.Metrics[0].Kind != limitKindSession || !usage.Metrics[0].Unknown {
+		t.Errorf("metrics[0]=%+v, want Unknown session first", usage.Metrics[0])
+	}
+	weekly := usage.Metrics[1]
+	if weekly.Kind != limitKindWeekly || weekly.Unknown {
+		t.Errorf("metrics[1]=%+v, want single known weekly", weekly)
+	}
+	if weekly.Consumed == nil || *weekly.Consumed != 30 {
+		t.Errorf("weekly Consumed=%v, want 30 (newest weekly wins)", weekly.Consumed)
+	}
+}
+
+// Parse composition (AC4): a weekly-only cache with no 5-hour observation yields
+// an Unknown session row first and a real weekly row second — never a weekly
+// value mislabeled as a 5-hour/daily/shift quota. With CODEX_HOME empty there is
+// no rollout backfill to fill the session row.
+func TestCodexUsageParser_MissingSessionStaysUnknown(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"email": "carol@example.com",
+		"plan":  "pro",
+	})
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowSecondary: {
+			UsedPercentage: 40, ResetsAtMs: now.Add(4 * 24 * time.Hour).UnixMilli(),
+			WindowMinutes: 10080, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, fp)
+
+	usage, ok := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	if len(usage.Metrics) != 2 {
+		t.Fatalf("expected 2 metrics, got %d", len(usage.Metrics))
+	}
+	if usage.Metrics[0].Kind != limitKindSession || !usage.Metrics[0].Unknown {
+		t.Errorf("metrics[0]=%+v, want Unknown session", usage.Metrics[0])
+	}
+	if usage.Metrics[1].Kind != limitKindWeekly || usage.Metrics[1].Unknown {
+		t.Errorf("metrics[1]=%+v, want known weekly", usage.Metrics[1])
+	}
+	if usage.Metrics[1].Label != "Weekly quota" {
+		t.Errorf("weekly label=%q, want Weekly quota", usage.Metrics[1].Label)
+	}
+}
+
 func TestCodexUsageParser_HonorsCodexHome(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	home := t.TempDir()
@@ -792,6 +884,165 @@ func TestCodexUsageParser_RolloutBackfillsRolledOverCacheBucket(t *testing.T) {
 	}
 }
 
+// AC4 in the rollout path: a rollout log carrying ONLY the weekly window must
+// fill the weekly row and leave the session row Unknown — the identity-gated
+// backfill must never promote a weekly reading into the 5-hour session row.
+func TestCodexUsageParser_WeeklyOnlyRolloutLeavesSessionUnknown(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Rollout frame with the weekly window only — no primary/session key at all.
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-weeklyonly", []map[string]any{
+		{"secondary": map[string]any{
+			"used_percent":   44.0,
+			"window_minutes": 10080.0,
+			"resets_at":      float64(now.Add(72 * time.Hour).Unix()),
+		}},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if !session.Unknown {
+		t.Errorf("session metric=%+v, want Unknown (weekly-only rollout must not fill the 5-hour row)", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 44 {
+		t.Errorf("weekly metric=%+v, want observed 44%% from weekly-only rollout", weekly)
+	}
+	if weekly.Label != "Weekly quota" {
+		t.Errorf("weekly Label=%q, want Weekly quota", weekly.Label)
+	}
+}
+
+// helperWriteRolloutRawPayload writes a single rollout log line whose
+// event_msg payload is exactly `payload` — used for shapes helperWriteRolloutLog
+// can't express, such as `rate_limits_by_limit_id`.
+func helperWriteRolloutRawPayload(t *testing.T, base, day, name string, payload map[string]any) {
+	t.Helper()
+	dir := filepath.Join(base, "sessions", "2026", "06", day)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	line, err := json.Marshal(map[string]any{
+		"timestamp": "2026-06-19T11:00:00.000Z",
+		"type":      "event_msg",
+		"payload":   payload,
+	})
+	if err != nil {
+		t.Fatalf("marshal rollout line: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "rollout-"+name+".jsonl"), append(line, '\n'), 0o600); err != nil {
+		t.Fatalf("write rollout log: %v", err)
+	}
+}
+
+// A TUI-only rollout frame can carry two DISTINCT-identity limits under the same
+// physical slot during bucket migration (e.g. a 5-hour session limit and a
+// weekly limit both keyed under `primary`). The rollout fallback must carry each
+// per-limit contributor through identity partitioning rather than collapsing the
+// slot into a single most-constrained bucket, or one utilization row is lost.
+func TestCodexUsageParser_RolloutPreservesMixedIdentitySameSlot(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Both a session (300-min) and a weekly (10080-min) metered limit keyed under
+	// the SAME physical `primary` slot.
+	helperWriteRolloutRawPayload(t, codexHome, "19", "2026-06-19T11-00-00-mixed", map[string]any{
+		"type": "token_count",
+		"info": map[string]any{"total_token_usage": map[string]any{"total_tokens": 1}},
+		"rate_limits_by_limit_id": map[string]any{
+			"codex_session": map[string]any{"primary": map[string]any{
+				"used_percent": 30.0, "window_minutes": 300.0, "resets_at": float64(now.Add(time.Hour).Unix()),
+			}},
+			"codex_weekly": map[string]any{"primary": map[string]any{
+				"used_percent": 60.0, "window_minutes": 10080.0, "resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			}},
+		},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Unknown || session.Consumed == nil || *session.Consumed != 30 {
+		t.Errorf("session metric=%+v, want observed 30%% from mixed-slot rollout", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 60 {
+		t.Errorf("weekly metric=%+v, want observed 60%% (must not be lost to slot aggregation)", weekly)
+	}
+}
+
+// The rollout accumulator is keyed by (identity, limit id) so a distinct metered
+// limit that newer logs never restated is still folded into its identity's
+// most-constrained aggregate. The scan must NOT stop as soon as both display
+// identities are present: an older in-cap log can hold a separate, stricter
+// weekly limit that the newest log omitted, and dropping it would understate the
+// weekly row.
+func TestCodexUsageParser_RolloutFoldsOmittedStricterWeeklyLimit(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Newest log restates a session limit and a weekly limit B (40%). On its own
+	// this already covers both display identities, so an identity-presence break
+	// would stop here.
+	helperWriteRolloutRawPayload(t, codexHome, "19", "2026-06-19T11-30-00-newest", map[string]any{
+		"type": "token_count",
+		"info": map[string]any{"total_token_usage": map[string]any{"total_tokens": 1}},
+		"rate_limits_by_limit_id": map[string]any{
+			"codex_session": map[string]any{"primary": map[string]any{
+				"used_percent": 30.0, "window_minutes": 300.0, "resets_at": float64(now.Add(time.Hour).Unix()),
+			}},
+			"codex_weekly_b": map[string]any{"secondary": map[string]any{
+				"used_percent": 40.0, "window_minutes": 10080.0, "resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			}},
+		},
+	})
+	// An older (still in-scope) log holds a SEPARATE, stricter weekly limit A
+	// (85%) the newest log did not restate. It must still be folded so the weekly
+	// row reflects the most-constrained reading.
+	helperWriteRolloutRawPayload(t, codexHome, "19", "2026-06-19T11-00-00-older", map[string]any{
+		"type": "token_count",
+		"info": map[string]any{"total_token_usage": map[string]any{"total_tokens": 1}},
+		"rate_limits_by_limit_id": map[string]any{
+			"codex_weekly_a": map[string]any{"secondary": map[string]any{
+				"used_percent": 85.0, "window_minutes": 10080.0, "resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			}},
+		},
+	})
+	// Pin mtimes so the newest log is scanned first regardless of write order.
+	sessionsDir := filepath.Join(codexHome, "sessions", "2026", "06", "19")
+	if err := os.Chtimes(filepath.Join(sessionsDir, "rollout-2026-06-19T11-30-00-newest.jsonl"), now.Add(-time.Minute), now.Add(-time.Minute)); err != nil {
+		t.Fatalf("chtimes newest: %v", err)
+	}
+	if err := os.Chtimes(filepath.Join(sessionsDir, "rollout-2026-06-19T11-00-00-older.jsonl"), now.Add(-10*time.Minute), now.Add(-10*time.Minute)); err != nil {
+		t.Fatalf("chtimes older: %v", err)
+	}
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Unknown || session.Consumed == nil || *session.Consumed != 30 {
+		t.Errorf("session metric=%+v, want observed 30%% from newest rollout", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 85 {
+		t.Errorf("weekly metric=%+v, want most-constrained 85%% from the older log's stricter weekly limit", weekly)
+	}
+}
+
 // Codex emits rate_limits: null between real readings; the parser must take the
 // LAST populated frame, ignoring nulls and earlier values.
 func TestCodexUsageParser_RolloutPrefersLastPopulatedFrame(t *testing.T) {
@@ -986,6 +1237,41 @@ func TestCodexUsageParser_RolloutAccumulatesAcrossFiles(t *testing.T) {
 	}
 	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 50 {
 		t.Errorf("weekly metric=%+v, want 50 from older log", weekly)
+	}
+}
+
+// The rollout accumulator must key by metric IDENTITY, not physical slot. When
+// the newest log carries only a MIGRATED weekly under the `primary` slot
+// (weekly-band minutes), a slot-keyed accumulator would lock `primary` and drop
+// an older log's real `primary` session reading, leaving the session row Unknown.
+// Identity keying keeps both, so session and weekly are each backfilled.
+func TestCodexUsageParser_RolloutAccumulatesByIdentityNotSlot(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Older log: a real 5-hour session reading under the primary slot.
+	helperWriteRolloutLog(t, codexHome, "18", "2026-06-18T10-00-00-session", []map[string]any{
+		{"primary": map[string]any{"used_percent": 55.0, "window_minutes": 300.0, "resets_at": float64(now.Add(time.Hour).Unix())}},
+	})
+	// Newest log: a weekly reading MIGRATED into the primary slot, and nothing
+	// else. A slot-keyed accumulator would lock `primary` to this weekly.
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-weeklymigrated", []map[string]any{
+		{"primary": map[string]any{"used_percent": 22.0, "window_minutes": 10080.0, "resets_at": float64(now.Add(72 * time.Hour).Unix())}},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Unknown || session.Consumed == nil || *session.Consumed != 55 {
+		t.Errorf("session metric=%+v, want 55 from older log (identity keying preserves it)", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 22 {
+		t.Errorf("weekly metric=%+v, want 22 from migrated primary weekly", weekly)
 	}
 }
 
@@ -1930,5 +2216,49 @@ func TestReadJSONFile_GracefulOnMissing(t *testing.T) {
 	var into map[string]any
 	if readJSONFile(filepath.Join(t.TempDir(), "does-not-exist.json"), &into) {
 		t.Errorf("readJSONFile should return false on missing file")
+	}
+}
+
+// Finding 1 (identity-gated rollout recovery): a weekly reading that migrated
+// into the PRIMARY storage slot with a reset already in the past rolls over to a
+// stale concrete 0% (Unknown=false). A slot-keyed rolled-over check would look
+// for weekly under `secondary`, find nothing, and leave the bogus 0% on the card
+// forever. The identity-gated check must recognise the migrated weekly as rolled
+// over and refill it from the fresher rollout reading.
+func TestCodexUsageParser_RolloutFillsRolledOverMigratedWeekly(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	// Weekly-band reading physically under the primary slot, reset already passed.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 55, ResetsAtMs: now.Add(-time.Hour).UnixMilli(),
+			WindowMinutes: 10080, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now.Add(-2*time.Hour), fp)
+	// Rollout carries fresher weekly usage in the current window (weekly only).
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-migrated", []map[string]any{
+		{"secondary": map[string]any{
+			"used_percent":   18.0,
+			"window_minutes": 10080.0,
+			"resets_at":      float64(now.Add(96 * time.Hour).Unix()),
+		}},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if !session.Unknown {
+		t.Errorf("session metric=%+v, want Unknown (no session reading; weekly-band must not fill it)", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 18 {
+		t.Errorf("weekly metric=%+v, want 18 refilled from rollout (stale rolled-over migrated weekly must not stick at 0%%)", weekly)
 	}
 }
