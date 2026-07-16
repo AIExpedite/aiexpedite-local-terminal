@@ -1269,9 +1269,10 @@ func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentU
 
 // codexRolloutScanFileCap bounds how many of the most-recent rollout logs the
 // fallback opens before giving up, so a sessions directory holding thousands of
-// files can't turn a usage refresh into a long scan. The newest log carrying a
-// populated rate_limits frame wins, so in practice this resolves on the first
-// file or two.
+// files can't turn a usage refresh into a long scan. Every in-cap log is folded
+// so distinct per-(identity, limit) contributors that newer logs omitted are
+// still gathered; newest-first (identity, limit) dedup keeps the freshest
+// reading per contributor.
 const codexRolloutScanFileCap = 16
 
 // codexBackfillUnknownFromRollout fills any Unknown or rolled-over window in
@@ -1488,14 +1489,15 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 				}
 			}
 		}
-		// Stop once BOTH display identities are represented — not merely once both
-		// physical slots hold something, since a slot can be occupied by a migrated
-		// other-identity reading (weekly under `primary`) that would satisfy a
-		// slot-only check while the session identity is still missing.
-		if codexWinnersHaveIdentity(winners, codexIdentitySession) &&
-			codexWinnersHaveIdentity(winners, codexIdentityWeekly) {
-			break
-		}
+		// Do NOT stop once both display identities are present. Winners are keyed by
+		// (identity, limit id), and this accumulation exists precisely to backfill
+		// distinct metered limits that newer logs never restated. Breaking on
+		// identity presence would stop before an older log's separate, stricter
+		// weekly limit is seen, dropping it from the weekly identity's
+		// most-constrained aggregate and understating usage. The scan is already
+		// bounded by codexRolloutScanFileCap, so keep folding every in-cap log and
+		// let newest-first (identity, limit) dedup keep the freshest reading per
+		// contributor.
 	}
 	if len(winners) == 0 {
 		return nil, false
@@ -1522,20 +1524,6 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		slotMap[limitKey] = c.bucket
 	}
 	return acc, true
-}
-
-// codexWinnersHaveIdentity reports whether any accumulated rollout winner
-// resolves to the metric identity `want`, using codexWindowIdentity (the same
-// classifier display and cache reconciliation use) so a weekly reading migrated
-// into the `primary` slot counts as `weekly`, not `session`.
-func codexWinnersHaveIdentity[T any](winners map[string]T, want string) bool {
-	prefix := want + "\x00"
-	for key := range winners {
-		if strings.HasPrefix(key, prefix) {
-			return true
-		}
-	}
-	return false
 }
 
 // codexBucketsFromRolloutFile returns the per-(window, limit) contributors from

@@ -981,6 +981,68 @@ func TestCodexUsageParser_RolloutPreservesMixedIdentitySameSlot(t *testing.T) {
 	}
 }
 
+// The rollout accumulator is keyed by (identity, limit id) so a distinct metered
+// limit that newer logs never restated is still folded into its identity's
+// most-constrained aggregate. The scan must NOT stop as soon as both display
+// identities are present: an older in-cap log can hold a separate, stricter
+// weekly limit that the newest log omitted, and dropping it would understate the
+// weekly row.
+func TestCodexUsageParser_RolloutFoldsOmittedStricterWeeklyLimit(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Newest log restates a session limit and a weekly limit B (40%). On its own
+	// this already covers both display identities, so an identity-presence break
+	// would stop here.
+	helperWriteRolloutRawPayload(t, codexHome, "19", "2026-06-19T11-30-00-newest", map[string]any{
+		"type": "token_count",
+		"info": map[string]any{"total_token_usage": map[string]any{"total_tokens": 1}},
+		"rate_limits_by_limit_id": map[string]any{
+			"codex_session": map[string]any{"primary": map[string]any{
+				"used_percent": 30.0, "window_minutes": 300.0, "resets_at": float64(now.Add(time.Hour).Unix()),
+			}},
+			"codex_weekly_b": map[string]any{"secondary": map[string]any{
+				"used_percent": 40.0, "window_minutes": 10080.0, "resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			}},
+		},
+	})
+	// An older (still in-scope) log holds a SEPARATE, stricter weekly limit A
+	// (85%) the newest log did not restate. It must still be folded so the weekly
+	// row reflects the most-constrained reading.
+	helperWriteRolloutRawPayload(t, codexHome, "19", "2026-06-19T11-00-00-older", map[string]any{
+		"type": "token_count",
+		"info": map[string]any{"total_token_usage": map[string]any{"total_tokens": 1}},
+		"rate_limits_by_limit_id": map[string]any{
+			"codex_weekly_a": map[string]any{"secondary": map[string]any{
+				"used_percent": 85.0, "window_minutes": 10080.0, "resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			}},
+		},
+	})
+	// Pin mtimes so the newest log is scanned first regardless of write order.
+	sessionsDir := filepath.Join(codexHome, "sessions", "2026", "06", "19")
+	if err := os.Chtimes(filepath.Join(sessionsDir, "rollout-2026-06-19T11-30-00-newest.jsonl"), now.Add(-time.Minute), now.Add(-time.Minute)); err != nil {
+		t.Fatalf("chtimes newest: %v", err)
+	}
+	if err := os.Chtimes(filepath.Join(sessionsDir, "rollout-2026-06-19T11-00-00-older.jsonl"), now.Add(-10*time.Minute), now.Add(-10*time.Minute)); err != nil {
+		t.Fatalf("chtimes older: %v", err)
+	}
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Unknown || session.Consumed == nil || *session.Consumed != 30 {
+		t.Errorf("session metric=%+v, want observed 30%% from newest rollout", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 85 {
+		t.Errorf("weekly metric=%+v, want most-constrained 85%% from the older log's stricter weekly limit", weekly)
+	}
+}
+
 // Codex emits rate_limits: null between real readings; the parser must take the
 // LAST populated frame, ignoring nulls and earlier values.
 func TestCodexUsageParser_RolloutPrefersLastPopulatedFrame(t *testing.T) {
