@@ -919,6 +919,68 @@ func TestCodexUsageParser_WeeklyOnlyRolloutLeavesSessionUnknown(t *testing.T) {
 	}
 }
 
+// helperWriteRolloutRawPayload writes a single rollout log line whose
+// event_msg payload is exactly `payload` — used for shapes helperWriteRolloutLog
+// can't express, such as `rate_limits_by_limit_id`.
+func helperWriteRolloutRawPayload(t *testing.T, base, day, name string, payload map[string]any) {
+	t.Helper()
+	dir := filepath.Join(base, "sessions", "2026", "06", day)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	line, err := json.Marshal(map[string]any{
+		"timestamp": "2026-06-19T11:00:00.000Z",
+		"type":      "event_msg",
+		"payload":   payload,
+	})
+	if err != nil {
+		t.Fatalf("marshal rollout line: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "rollout-"+name+".jsonl"), append(line, '\n'), 0o600); err != nil {
+		t.Fatalf("write rollout log: %v", err)
+	}
+}
+
+// A TUI-only rollout frame can carry two DISTINCT-identity limits under the same
+// physical slot during bucket migration (e.g. a 5-hour session limit and a
+// weekly limit both keyed under `primary`). The rollout fallback must carry each
+// per-limit contributor through identity partitioning rather than collapsing the
+// slot into a single most-constrained bucket, or one utilization row is lost.
+func TestCodexUsageParser_RolloutPreservesMixedIdentitySameSlot(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Both a session (300-min) and a weekly (10080-min) metered limit keyed under
+	// the SAME physical `primary` slot.
+	helperWriteRolloutRawPayload(t, codexHome, "19", "2026-06-19T11-00-00-mixed", map[string]any{
+		"type": "token_count",
+		"info": map[string]any{"total_token_usage": map[string]any{"total_tokens": 1}},
+		"rate_limits_by_limit_id": map[string]any{
+			"codex_session": map[string]any{"primary": map[string]any{
+				"used_percent": 30.0, "window_minutes": 300.0, "resets_at": float64(now.Add(time.Hour).Unix()),
+			}},
+			"codex_weekly": map[string]any{"primary": map[string]any{
+				"used_percent": 60.0, "window_minutes": 10080.0, "resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			}},
+		},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Unknown || session.Consumed == nil || *session.Consumed != 30 {
+		t.Errorf("session metric=%+v, want observed 30%% from mixed-slot rollout", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 60 {
+		t.Errorf("weekly metric=%+v, want observed 60%% (must not be lost to slot aggregation)", weekly)
+	}
+}
+
 // Codex emits rate_limits: null between real readings; the parser must take the
 // LAST populated frame, ignoring nulls and earlier values.
 func TestCodexUsageParser_RolloutPrefersLastPopulatedFrame(t *testing.T) {

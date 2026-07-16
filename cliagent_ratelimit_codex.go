@@ -1103,7 +1103,16 @@ func mergeCodexRateLimitCachePerLimit(
 	// that merely failed to yield anything recognisable (unknown keys / unparseable
 	// buckets) is NOT authoritative and must not wipe live data. Sparse frames
 	// never trigger this — an unmentioned metric there just means "no update."
-	if fullSnapshot && (len(present) > 0 || emptyAuthoritative) {
+	//
+	// A clear-only full snapshot (`len(clears) > 0` with no restated buckets, e.g.
+	// `result.rateLimits: {"secondary": null}`) is ALSO authoritative: the explicit
+	// null is a positive declaration that the window is gone. The slot-keyed clears
+	// pass above only deletes the physical `secondary` slot, so a stale weekly-band
+	// contributor that had migrated into `primary` would otherwise survive and keep
+	// rendering the retired window. Running the identity-keyed omission pass with an
+	// empty present-set drops every contributor the authoritative snapshot did not
+	// restate, clearing the migrated copy too.
+	if fullSnapshot && (len(present) > 0 || emptyAuthoritative || len(clears) > 0) {
 		for slot, contribs := range snap.Contributors {
 			for limit, b := range contribs {
 				if !present[codexWindowIdentity(b.WindowMinutes, slot)+"\x00"+limit] {
@@ -1322,21 +1331,21 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, curren
 		return metrics
 	}
 
-	buckets, ok := codexRolloutFallbackBuckets(base, now)
+	contribs, ok := codexRolloutFallbackBuckets(base, now)
 	if !ok {
 		return metrics
 	}
 
-	// Partition the rollout-derived slot buckets by metric identity, exactly as
-	// the cache display path does, so fill is identity-gated: the session row is
-	// only ever filled from a session-identity reading (including a duration-less
-	// primary), and a weekly-only rollout leaves the session row Unknown rather
-	// than promoting the weekly value into it (AC4).
-	rolloutContribs := make(map[string]map[string]codexRateLimitBucket, len(buckets))
-	for slot, b := range buckets {
-		rolloutContribs[slot] = map[string]codexRateLimitBucket{codexLegacyLimitID: b}
-	}
-	parts := codexPartitionByIdentity(rolloutContribs)
+	// Partition the rollout-derived per-limit contributors by metric identity,
+	// exactly as the cache display path does, so fill is identity-gated: the
+	// session row is only ever filled from a session-identity reading (including a
+	// duration-less primary), and a weekly-only rollout leaves the session row
+	// Unknown rather than promoting the weekly value into it (AC4). The
+	// contributors are kept per (window, limit) — NOT pre-aggregated per storage
+	// slot — so a rollout frame that carried both a session and a weekly limit
+	// under the same physical slot during bucket migration still surfaces both
+	// identities instead of collapsing into one slot bucket.
+	parts := codexPartitionByIdentity(contribs)
 	fillFor := func(kind string) (codexRateLimitBucket, bool) {
 		identity, fallbackSlot, ok := identityForKind(kind)
 		if !ok {
@@ -1364,7 +1373,11 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, curren
 
 // codexRolloutFallbackBuckets reads Codex's session rollout logs
 // (CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl) for the most recent populated
-// `rate_limits` frame and returns aggregated display-window buckets.
+// `rate_limits` frame and returns its per-(window, limit) contributors. The
+// contributors are returned un-collapsed so the caller can partition them by
+// metric identity — a slot that carried two distinct-identity limits (e.g. a
+// session and a weekly reading during bucket migration) must not be flattened to
+// a single bucket here or one row would be lost.
 //
 // Account scoping: rollout logs carry no account identity of their own, so they
 // can't be fingerprint-matched the way the on-disk cache is. Instead we reject
@@ -1376,7 +1389,7 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, curren
 // is disabled, matching the best-effort unscoped behaviour the parser already
 // uses when the account is unknown. Best-effort: returns (nil, false) on any
 // problem.
-func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRateLimitBucket, bool) {
+func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[string]codexRateLimitBucket, bool) {
 	if base == "" {
 		return nil, false
 	}
@@ -1435,7 +1448,7 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRa
 	// slightly older log that did carry `secondary`. The newest reading for a
 	// given window wins, so once a window is in `acc` an older file never
 	// overwrites it.
-	acc := map[string]codexRateLimitBucket{}
+	acc := map[string]map[string]codexRateLimitBucket{}
 	for scanned, c := range candidates {
 		if scanned >= codexRolloutScanFileCap {
 			break
@@ -1450,9 +1463,12 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRa
 		if !authMod.IsZero() && !sessionStart.IsZero() && sessionStart.Before(authMod) {
 			continue
 		}
-		for w, b := range buckets {
+		// Newest file wins a whole window: once a window is populated, an older
+		// file never overwrites it. The window's full per-limit contributor map is
+		// kept intact so downstream identity partitioning sees every reading.
+		for w, limits := range buckets {
 			if _, exists := acc[w]; !exists {
-				acc[w] = b
+				acc[w] = limits
 			}
 		}
 		_, hasPrimary := acc[codexWindowPrimary]
@@ -1467,15 +1483,19 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]codexRa
 	return acc, true
 }
 
-// codexBucketsFromRolloutFile returns the aggregated buckets from the LAST
-// populated `rate_limits` frame in a single rollout log, plus the session's
-// start time (the first line's `timestamp`). Codex emits `rate_limits: null` on
-// most token_count events and the real object only periodically, so the last
-// non-empty extraction — not the first — is the live reading. The start time is
-// used by the caller to scope logs to the current account. Best-effort: returns
-// ok=false when the file holds no usable frame or can't be read; the returned
-// start time is zero when no line carried a parseable timestamp.
-func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]codexRateLimitBucket, time.Time, bool) {
+// codexBucketsFromRolloutFile returns the per-(window, limit) contributors from
+// the LAST populated `rate_limits` frame in a single rollout log, plus the
+// session's start time (the first line's `timestamp`). Codex emits
+// `rate_limits: null` on most token_count events and the real object only
+// periodically, so the last non-empty extraction — not the first — is the live
+// reading. Contributors are returned un-aggregated so the caller can partition
+// them by identity; reset-passed rollover to 0% is applied downstream per
+// contributor (codexAggregateIdentity), matching aggregateCodexBuckets. The
+// start time is used by the caller to scope logs to the current account.
+// Best-effort: returns ok=false when the file holds no usable frame or can't be
+// read; the returned start time is zero when no line carried a parseable
+// timestamp.
+func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, bool) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, time.Time{}, false
@@ -1542,10 +1562,12 @@ func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]codexRa
 	if len(acc) == 0 {
 		return nil, sessionStart, false
 	}
-	// Roll over against the real current time: aggregateCodexBuckets zeroes any
-	// window whose reset is already in the past as of now, so a stale relative
-	// reset anchored above correctly clears instead of showing old usage.
-	return aggregateCodexBuckets(acc, now), sessionStart, true
+	// Return the per-limit contributors un-collapsed. Rollover-to-0% for a window
+	// whose reset already passed as of `now` is applied by the display path
+	// (codexAggregateIdentity), so a stale relative reset anchored above still
+	// clears instead of showing old usage — without flattening two distinct
+	// identities that share a storage slot into one bucket here.
+	return acc, sessionStart, true
 }
 
 // codexRolloutLineTimestamp extracts the top-level `timestamp` (RFC3339) from

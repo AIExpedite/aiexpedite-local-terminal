@@ -256,6 +256,46 @@ func TestCaptureCodexRateLimit_FullReadNullClearsWindow(t *testing.T) {
 	}
 }
 
+// A clear-only full read (`result.rateLimits: {"secondary": null}` with no
+// restated bucket) is authoritative that the weekly window is gone. The
+// slot-keyed clear only removes the physical `secondary` slot, so a stale
+// weekly-band contributor that had migrated into `primary` must also be dropped
+// by the identity-keyed omission pass — otherwise the retired weekly keeps
+// rendering under primary even though the snapshot declared it gone.
+func TestCaptureCodexRateLimit_ClearOnlyFullReadDropsMigratedWeekly(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed a weekly-band reading that lives under the PRIMARY slot (bucket
+	// migration): identity is `weekly` even though it sits in `primary`.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"primary":{"used_percent":90,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+	if snap, ok := loadCodexRateLimitSnapshot(cache); !ok || snap.Buckets[codexWindowPrimary].UsedPercentage != 90 {
+		t.Fatalf("seed failed: %+v", snap.Buckets)
+	}
+
+	// Full read that ONLY clears secondary — no restated primary. The weekly
+	// window is authoritatively gone; the migrated copy under primary must not
+	// survive.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","id":3,"result":{"rateLimits":{"secondary":null}}}`,
+		now,
+	)
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache after full read")
+	}
+	if b, present := snap.Buckets[codexWindowPrimary]; present {
+		t.Errorf("migrated weekly under primary must be dropped by clear-only full read: %+v", b)
+	}
+	if _, present := snap.Contributors[codexWindowPrimary]; present {
+		t.Errorf("migrated weekly contributor under primary must be reconciled away: %+v", snap.Contributors)
+	}
+}
+
 // A null window inside a sparse account/rateLimits/updated notification is
 // "no update for this window," not "clear the window" — clearing is only the
 // semantics of a full account/rateLimits/read response. A previously cached
