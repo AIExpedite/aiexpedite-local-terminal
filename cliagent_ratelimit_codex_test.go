@@ -1850,3 +1850,41 @@ func TestCaptureCodexRateLimit_DualContainerEmptyPlusUnrecognizedPreservesCache(
 		t.Errorf("secondary must survive dual-container non-authoritative read: %+v", snap.Buckets)
 	}
 }
+
+// A `token_count` typed event can ride inside a JSON-RPC `result` envelope as
+// `result.msg`. Unlike the authoritative `account/rateLimits/read` response
+// (whose `rate_limits` sit DIRECTLY under `result`), a `result.msg` payload is an
+// inherently SPARSE typed event — it only restates the window(s) it just
+// observed. It must NOT be treated as a full snapshot and prune windows it
+// omitted: a `result.msg` restating only `primary` must PRESERVE a live cached
+// weekly.
+func TestCaptureCodexRateLimit_ResultMsgIsSparseNotFullSnapshot(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Seed a weekly reading.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"secondary":{"used_percent":40,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+	// A token_count typed event wrapped under result.msg, restating ONLY primary.
+	// Before the fix this inherited fullSnapshot=true and the omission reconcile
+	// dropped the weekly it didn't mention.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","id":4,"result":{"msg":{"type":"token_count","rate_limits":{"primary":{"used_percent":33,"window_minutes":300,"resets_in_seconds":1800}}}}}`,
+		now.Add(time.Minute),
+	)
+
+	metrics := codexMetricsFromCache(now.Add(time.Minute), "")
+	if metrics[1].Unknown || metrics[1].Kind != limitKindWeekly {
+		t.Errorf("weekly row=%+v, want preserved known weekly (result.msg is sparse, must not prune)", metrics[1])
+	}
+	if metrics[1].Consumed == nil || *metrics[1].Consumed != 40 {
+		t.Errorf("weekly Consumed=%v, want 40 preserved", metrics[1].Consumed)
+	}
+	if metrics[0].Unknown || metrics[0].Kind != limitKindSession {
+		t.Errorf("session row=%+v, want known session from result.msg", metrics[0])
+	}
+}

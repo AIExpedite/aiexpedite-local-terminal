@@ -1178,6 +1178,41 @@ func TestCodexUsageParser_RolloutAccumulatesAcrossFiles(t *testing.T) {
 	}
 }
 
+// The rollout accumulator must key by metric IDENTITY, not physical slot. When
+// the newest log carries only a MIGRATED weekly under the `primary` slot
+// (weekly-band minutes), a slot-keyed accumulator would lock `primary` and drop
+// an older log's real `primary` session reading, leaving the session row Unknown.
+// Identity keying keeps both, so session and weekly are each backfilled.
+func TestCodexUsageParser_RolloutAccumulatesByIdentityNotSlot(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Older log: a real 5-hour session reading under the primary slot.
+	helperWriteRolloutLog(t, codexHome, "18", "2026-06-18T10-00-00-session", []map[string]any{
+		{"primary": map[string]any{"used_percent": 55.0, "window_minutes": 300.0, "resets_at": float64(now.Add(time.Hour).Unix())}},
+	})
+	// Newest log: a weekly reading MIGRATED into the primary slot, and nothing
+	// else. A slot-keyed accumulator would lock `primary` to this weekly.
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-weeklymigrated", []map[string]any{
+		{"primary": map[string]any{"used_percent": 22.0, "window_minutes": 10080.0, "resets_at": float64(now.Add(72 * time.Hour).Unix())}},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if session.Unknown || session.Consumed == nil || *session.Consumed != 55 {
+		t.Errorf("session metric=%+v, want 55 from older log (identity keying preserves it)", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 22 {
+		t.Errorf("weekly metric=%+v, want 22 from migrated primary weekly", weekly)
+	}
+}
+
 // A reset-only sparse frame that jumps to a NEW window must not carry the prior
 // window's usage onto the fresh reset — drop the stale reading so the window is
 // reported Unknown rather than the old percentage.

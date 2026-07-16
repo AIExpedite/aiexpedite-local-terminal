@@ -310,10 +310,18 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 		fullSnap := key == "result"
 		candidates = append(candidates, candidate{src: m, fullSnapshot: fullSnap})
 		// `params.msg` / `result.msg` is the shape codex's app-server uses for
-		// typed event payloads carried inside a JSON-RPC frame.
+		// typed event payloads (e.g. `token_count`) carried inside a JSON-RPC
+		// frame. Such a `msg` payload is an inherently SPARSE typed event — it
+		// only restates the window(s) it currently observed. The authoritative
+		// `account/rateLimits/read` snapshot puts `rate_limits` DIRECTLY under
+		// `result`, not under `result.msg`; so a `msg` payload must stay
+		// fullSnapshot=false even when it rides inside a `result` envelope,
+		// otherwise a sparse `result.msg` `token_count` that only restates
+		// `primary` would wrongly prune a live cached weekly window via the
+		// omission reconcile.
 		if v, ok := m["msg"]; ok {
 			if mm, ok := v.(map[string]interface{}); ok {
-				candidates = append(candidates, candidate{src: mm, fullSnapshot: fullSnap})
+				candidates = append(candidates, candidate{src: mm, fullSnapshot: false})
 			}
 		}
 	}
@@ -1443,12 +1451,21 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		}
 		return candidates[i].path > candidates[j].path
 	})
-	// Accumulate across files newest-first: a window the newest log never
-	// restated (e.g. it only carried `primary`) can still be filled from a
-	// slightly older log that did carry `secondary`. The newest reading for a
-	// given window wins, so once a window is in `acc` an older file never
-	// overwrites it.
-	acc := map[string]map[string]codexRateLimitBucket{}
+	// Accumulate across files newest-first, keyed by (identity, limit id) — NOT by
+	// physical slot. Keying on the slot would let a newer log that only carried a
+	// migrated weekly contributor under `primary` block an older log's `primary`
+	// session contributor, leaving the session identity Unknown even though a
+	// slightly older log still holds it. Deduping by identity+limit keeps the
+	// newest reading per contributor while still backfilling identities/limits the
+	// newer logs never restated, so downstream identity partitioning sees every
+	// distinct reading. Newest-first iteration means the first-seen reading of a
+	// given (identity, limit) wins.
+	type rolloutContribution struct {
+		slot    string
+		limitID string
+		bucket  codexRateLimitBucket
+	}
+	winners := map[string]rolloutContribution{}
 	for scanned, c := range candidates {
 		if scanned >= codexRolloutScanFileCap {
 			break
@@ -1463,24 +1480,62 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		if !authMod.IsZero() && !sessionStart.IsZero() && sessionStart.Before(authMod) {
 			continue
 		}
-		// Newest file wins a whole window: once a window is populated, an older
-		// file never overwrites it. The window's full per-limit contributor map is
-		// kept intact so downstream identity partitioning sees every reading.
 		for w, limits := range buckets {
-			if _, exists := acc[w]; !exists {
-				acc[w] = limits
+			for limitID, b := range limits {
+				key := codexWindowIdentity(b.WindowMinutes, w) + "\x00" + limitID
+				if _, exists := winners[key]; !exists {
+					winners[key] = rolloutContribution{slot: w, limitID: limitID, bucket: b}
+				}
 			}
 		}
-		_, hasPrimary := acc[codexWindowPrimary]
-		_, hasSecondary := acc[codexWindowSecondary]
-		if hasPrimary && hasSecondary {
+		// Stop once BOTH display identities are represented — not merely once both
+		// physical slots hold something, since a slot can be occupied by a migrated
+		// other-identity reading (weekly under `primary`) that would satisfy a
+		// slot-only check while the session identity is still missing.
+		if codexWinnersHaveIdentity(winners, codexIdentitySession) &&
+			codexWinnersHaveIdentity(winners, codexIdentityWeekly) {
 			break
 		}
 	}
-	if len(acc) == 0 {
+	if len(winners) == 0 {
 		return nil, false
 	}
+	// Rebuild the slot-keyed contributor map downstream expects. Each winner is
+	// stored under its original slot (so a duration-less bucket keeps its
+	// slot-default identity) and its limit id. When two DIFFERENT identities
+	// collide on the same (slot, limit id) — a banded weekly and a banded session
+	// both observed under the `primary` slot as the same legacy limit — the second
+	// is stored under an identity-suffixed limit key so neither is lost. The suffix
+	// never changes identity (that derives from window minutes + slot), so it is
+	// invisible to downstream partitioning.
+	acc := map[string]map[string]codexRateLimitBucket{}
+	for _, c := range winners {
+		slotMap := acc[c.slot]
+		if slotMap == nil {
+			slotMap = map[string]codexRateLimitBucket{}
+			acc[c.slot] = slotMap
+		}
+		limitKey := c.limitID
+		if _, taken := slotMap[limitKey]; taken {
+			limitKey = c.limitID + "\x00" + codexWindowIdentity(c.bucket.WindowMinutes, c.slot)
+		}
+		slotMap[limitKey] = c.bucket
+	}
 	return acc, true
+}
+
+// codexWinnersHaveIdentity reports whether any accumulated rollout winner
+// resolves to the metric identity `want`, using codexWindowIdentity (the same
+// classifier display and cache reconciliation use) so a weekly reading migrated
+// into the `primary` slot counts as `weekly`, not `session`.
+func codexWinnersHaveIdentity[T any](winners map[string]T, want string) bool {
+	prefix := want + "\x00"
+	for key := range winners {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // codexBucketsFromRolloutFile returns the per-(window, limit) contributors from
