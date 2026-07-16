@@ -2059,3 +2059,47 @@ func TestReadJSONFile_GracefulOnMissing(t *testing.T) {
 		t.Errorf("readJSONFile should return false on missing file")
 	}
 }
+
+// Finding 1 (identity-gated rollout recovery): a weekly reading that migrated
+// into the PRIMARY storage slot with a reset already in the past rolls over to a
+// stale concrete 0% (Unknown=false). A slot-keyed rolled-over check would look
+// for weekly under `secondary`, find nothing, and leave the bogus 0% on the card
+// forever. The identity-gated check must recognise the migrated weekly as rolled
+// over and refill it from the fresher rollout reading.
+func TestCodexUsageParser_RolloutFillsRolledOverMigratedWeekly(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	// Weekly-band reading physically under the primary slot, reset already passed.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 55, ResetsAtMs: now.Add(-time.Hour).UnixMilli(),
+			WindowMinutes: 10080, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now.Add(-2*time.Hour), fp)
+	// Rollout carries fresher weekly usage in the current window (weekly only).
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-migrated", []map[string]any{
+		{"secondary": map[string]any{
+			"used_percent":   18.0,
+			"window_minutes": 10080.0,
+			"resets_at":      float64(now.Add(96 * time.Hour).Unix()),
+		}},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if !session.Unknown {
+		t.Errorf("session metric=%+v, want Unknown (no session reading; weekly-band must not fill it)", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 18 {
+		t.Errorf("weekly metric=%+v, want 18 refilled from rollout (stale rolled-over migrated weekly must not stick at 0%%)", weekly)
+	}
+}

@@ -405,16 +405,21 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 		}
 	}
 
-	// On a full snapshot, the present-set is every display window the frame
-	// touched — one it wrote a bucket for OR explicitly nulled. A window absent
-	// from both is being omitted by an authoritative complete picture, which the
-	// merger reconciles as "gone". Sparse frames leave present empty (unused).
+	// On a full snapshot, the present-set is every metric IDENTITY the frame
+	// actually reported a bucket for. It is keyed by identity — not storage slot —
+	// so the merger can drop a stale contributor that migrated into a slot the
+	// snapshot still uses for a DIFFERENT identity (e.g. a lingering weekly copy
+	// under `primary` while the snapshot only restated the primary session). An
+	// identity absent from the snapshot is being omitted by an authoritative
+	// complete picture, so it is reconciled as "gone". A nulled window is NOT
+	// added to present: its clear already removes the slot, and leaving its
+	// identity out of present lets any copy that migrated elsewhere be dropped too.
+	// Sparse frames leave present empty (unused).
 	if fullSnapshot {
-		for id := range out {
-			present[id] = true
-		}
-		for id := range clears {
-			present[id] = true
+		for slot, contribs := range out {
+			for _, b := range contribs {
+				present[codexWindowIdentity(b.WindowMinutes, slot)] = true
+			}
 		}
 	}
 	return out, clears, fullSnapshot, present
@@ -679,24 +684,39 @@ func codexAggregateIdentity(contribs []codexIdentityContribution, now time.Time)
 	if len(contribs) == 0 {
 		return codexRateLimitBucket{}, false
 	}
-	winners := map[string]codexIdentityContribution{}
-	for _, c := range contribs {
-		cur, ok := winners[c.limitID]
-		if !ok || codexPlacementBeats(c.bucket, c.slot, cur.bucket, cur.slot) {
-			winners[c.limitID] = c
+	// Collapse cross-slot placements of this one metric to a single winning
+	// storage slot before folding. A reading that migrated slots (a weekly that
+	// moved secondary→primary, possibly changing limit-id shape from the
+	// __legacy__ aggregate to a named codex_* limit) can leave a stale copy behind
+	// under the old slot; most-constraining ACROSS the slots would let the stale
+	// higher-usage copy shadow the fresher one. The freshest placement's slot is
+	// the live generation. This mirrors codexReconcileIdentitySupersession so the
+	// display is correct even when reading a cache written before that reconcile
+	// existed (or seeded directly in a test). Determinism: codexPlacementBeats is a
+	// total order across distinct slots, so the winning slot never depends on Go
+	// map iteration order.
+	winnerSlot := ""
+	var best codexIdentityContribution
+	for i, c := range contribs {
+		if i == 0 || codexPlacementBeats(c.bucket, c.slot, best.bucket, best.slot) {
+			best = c
+			winnerSlot = c.slot
 		}
 	}
-	limitIDs := make([]string, 0, len(winners))
-	for id := range winners {
-		limitIDs = append(limitIDs, id)
+	scoped := make([]codexIdentityContribution, 0, len(contribs))
+	for _, c := range contribs {
+		if c.slot == winnerSlot {
+			scoped = append(scoped, c)
+		}
 	}
-	sort.Strings(limitIDs)
+	// Deterministic fold order across the winning slot's distinct metered limits.
+	sort.Slice(scoped, func(i, j int) bool { return scoped[i].limitID < scoped[j].limitID })
 
 	const key = "identity"
 	out := map[string]codexRateLimitBucket{}
 	nowMs := now.UnixMilli()
-	for _, id := range limitIDs {
-		b := winners[id].bucket
+	for _, c := range scoped {
+		b := c.bucket
 		if b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs {
 			b.UsedPercentage = 0
 		}
@@ -747,17 +767,27 @@ func codexIdentityDisplayBucket(parts map[string][]codexIdentityContribution, id
 }
 
 // codexReconcileIdentitySupersession drops cross-slot duplicates of the same
-// (window identity, limit id): when a metric identity is stored under more than
-// one display slot — e.g. a weekly-band reading migrated to `primary` while the
-// old `secondary` weekly lingered — only the newest placement survives. Distinct
-// limit ids under the winning slot are left untouched so multi-limit
-// most-constrained merges are preserved. Sparse-safe: an identity that simply
-// wasn't restated this frame is never touched; only genuine same-identity+limit
-// duplicates across slots are removed. Walks slots/limit ids in sorted order so
-// the outcome never depends on Go map iteration order.
+// metric identity: when a metric is stored under more than one display slot —
+// e.g. a weekly-band reading migrated to `primary` while the old `secondary`
+// weekly lingered — only the newest storage slot's contributors survive.
+//
+// Supersession is keyed by IDENTITY, not (identity, limit id): a migration can
+// also change the limit-id shape (the `__legacy__` aggregate `rate_limits` view
+// vs a named `codex_*` bucket from `rateLimitsByLimitId`), so keying on the limit
+// id would leave the stale copy behind and let an older, higher-usage reading
+// shadow the fresher one via most-constrained folding. Distinct metered limits of
+// the SAME live reading are emitted together and therefore share the winning
+// slot, so they are preserved for the most-constrained merge; only contributors
+// of that identity under an OLDER slot are removed. Sparse-safe: an identity that
+// simply wasn't restated this frame keeps its single slot and is never touched.
+// Walks slots/limit ids in sorted order so the outcome never depends on Go map
+// iteration order.
 func codexReconcileIdentitySupersession(contributors map[string]map[string]codexRateLimitBucket) {
-	type placement struct{ slot, limitID string }
-	winners := map[string]placement{}
+	type ref struct {
+		slot, limitID string
+		bucket        codexRateLimitBucket
+	}
+	byIdentity := map[string][]ref{}
 
 	slots := make([]string, 0, len(contributors))
 	for slot := range contributors {
@@ -773,18 +803,22 @@ func codexReconcileIdentitySupersession(contributors map[string]map[string]codex
 		sort.Strings(limitIDs)
 		for _, limitID := range limitIDs {
 			b := contribs[limitID]
-			key := codexWindowIdentity(b.WindowMinutes, slot) + "\x00" + limitID
-			cur, ok := winners[key]
-			if !ok {
-				winners[key] = placement{slot: slot, limitID: limitID}
-				continue
+			id := codexWindowIdentity(b.WindowMinutes, slot)
+			byIdentity[id] = append(byIdentity[id], ref{slot: slot, limitID: limitID, bucket: b})
+		}
+	}
+	for _, refs := range byIdentity {
+		winnerSlot := ""
+		var best ref
+		for i, r := range refs {
+			if i == 0 || codexPlacementBeats(r.bucket, r.slot, best.bucket, best.slot) {
+				best = r
+				winnerSlot = r.slot
 			}
-			curB := contributors[cur.slot][cur.limitID]
-			if codexPlacementBeats(b, slot, curB, cur.slot) {
-				delete(contributors[cur.slot], cur.limitID)
-				winners[key] = placement{slot: slot, limitID: limitID}
-			} else {
-				delete(contributors[slot], limitID)
+		}
+		for _, r := range refs {
+			if r.slot != winnerSlot {
+				delete(contributors[r.slot], r.limitID)
 			}
 		}
 	}
@@ -819,7 +853,12 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 		return
 	}
 	updates, clears, fullSnapshot, present := extractCodexRateLimitBucketsFull(raw, now)
-	if len(updates) == 0 && len(clears) == 0 {
+	// A full snapshot must be processed even when it carries no buckets and no
+	// explicit nulls: an authoritative `account/rateLimits/read` response whose
+	// `rateLimits` object is empty (`{}`) is declaring the account now has NO
+	// quota windows, so every cached observation has to be reconciled away. Only
+	// sparse frames with nothing to say are dropped here.
+	if len(updates) == 0 && len(clears) == 0 && !fullSnapshot {
 		return
 	}
 	mergeCodexRateLimitCachePerLimit(codexRateLimitCachePath(), updates, clears, fullSnapshot, present, now, currentCodexAccountFingerprint())
@@ -871,7 +910,7 @@ func mergeCodexRateLimitCachePerLimit(
 	now time.Time,
 	fingerprint string,
 ) {
-	if path == "" || (len(perLimit) == 0 && len(clears) == 0) {
+	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !fullSnapshot) {
 		return
 	}
 	codexRateLimitMu.Lock()
@@ -989,14 +1028,23 @@ func mergeCodexRateLimitCachePerLimit(
 	// every frame — it only ever deletes a genuine same-identity+limit duplicate,
 	// so sparse frames stay non-destructive to unrelated windows.
 	codexReconcileIdentitySupersession(snap.Contributors)
-	// A full snapshot states every window that currently applies; drop any
-	// cached window it omitted entirely (reclassified elsewhere, or the plan lost
-	// it). Sparse frames never trigger this — an unmentioned window there just
-	// means "no update."
+	// A full snapshot states every metric that currently applies; drop any cached
+	// contributor whose IDENTITY it omitted entirely (reclassified elsewhere, or
+	// the plan lost it). Keyed by identity, not slot, so a stale weekly copy that
+	// migrated into the same slot the snapshot still uses for the session is
+	// reconciled away rather than preserved by the slot surviving. An empty full
+	// snapshot has an empty present-set, so every cached observation is cleared.
+	// Sparse frames never trigger this — an unmentioned metric there just means
+	// "no update."
 	if fullSnapshot {
-		for window := range snap.Contributors {
-			if !present[window] {
-				delete(snap.Contributors, window)
+		for slot, contribs := range snap.Contributors {
+			for limit, b := range contribs {
+				if !present[codexWindowIdentity(b.WindowMinutes, slot)] {
+					delete(contribs, limit)
+				}
+			}
+			if len(contribs) == 0 {
+				delete(snap.Contributors, slot)
 			}
 		}
 	}
@@ -1111,15 +1159,6 @@ func codexContributorsForAccount(currentFingerprint string) map[string]map[strin
 	return legacy
 }
 
-// codexCachedBucketsForAccount returns the most-constrained bucket per STORAGE
-// SLOT (primary / secondary) for `currentFingerprint`. Used by the rollout
-// backfill to decide whether a slot's cached row has rolled over. Display uses
-// codexContributorsForAccount + identity partitioning instead, so a weekly
-// reading physically stored under `primary` is never rendered as a session row.
-func codexCachedBucketsForAccount(now time.Time, currentFingerprint string) map[string]codexRateLimitBucket {
-	return aggregateCodexBuckets(codexContributorsForAccount(currentFingerprint), now)
-}
-
 // codexMetricsFromCache builds the two Claude-aligned metric rows from the
 // rate-limit cache: the 5-hour session window first, the weekly quota second.
 // Rows are selected by metric IDENTITY (partitioning every contributor across
@@ -1171,27 +1210,38 @@ const codexRolloutScanFileCap = 16
 // rolled-over cache row is treated as fillable too, identically to Unknown.
 // The rollout scan still runs at most once per call.
 func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, currentFingerprint string, now time.Time) []cliAgentUsageMetric {
-	cacheBuckets := codexCachedBucketsForAccount(now, currentFingerprint)
-	nowMs := now.UnixMilli()
-	cacheRolledOver := func(windowID string) bool {
-		b, ok := cacheBuckets[windowID]
-		return ok && b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs
-	}
-	windowIDFor := func(kind string) (string, bool) {
+	// Map a layout kind to the identity + fallback slot the display path selects
+	// it from — reused by both the rolled-over check below and the rollout fill.
+	identityForKind := func(kind string) (identity, fallbackSlot string, ok bool) {
 		switch kind {
 		case limitKindSession:
-			return codexWindowPrimary, true
+			return codexIdentitySession, codexWindowPrimary, true
 		case limitKindWeekly:
-			return codexWindowSecondary, true
+			return codexIdentityWeekly, codexWindowSecondary, true
 		}
-		return "", false
+		return "", "", false
+	}
+	// Decide "rolled over → fillable" from the SAME identity-selected bucket the
+	// display path renders, not from a raw storage slot. After identity
+	// supersession a weekly reading can live under the `primary` slot (and a
+	// session under `secondary`), so a slot-keyed rolled-over check would miss the
+	// migrated window and leave a stale concrete 0% row on the card forever — the
+	// exact TUI-recovery case this backfill exists for.
+	cacheParts := codexPartitionByIdentity(codexContributorsForAccount(currentFingerprint))
+	nowMs := now.UnixMilli()
+	cacheRolledOver := func(kind string) bool {
+		identity, fallbackSlot, ok := identityForKind(kind)
+		if !ok {
+			return false
+		}
+		b, present := codexIdentityDisplayBucket(cacheParts, identity, fallbackSlot, now)
+		return present && b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs
 	}
 	fillable := func(m cliAgentUsageMetric) bool {
 		if m.Unknown {
 			return true
 		}
-		w, ok := windowIDFor(m.Kind)
-		return ok && cacheRolledOver(w)
+		return cacheRolledOver(m.Kind)
 	}
 
 	anyFillable := false
@@ -1221,13 +1271,11 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, curren
 	}
 	parts := codexPartitionByIdentity(rolloutContribs)
 	fillFor := func(kind string) (codexRateLimitBucket, bool) {
-		switch kind {
-		case limitKindSession:
-			return codexIdentityDisplayBucket(parts, codexIdentitySession, codexWindowPrimary, now)
-		case limitKindWeekly:
-			return codexIdentityDisplayBucket(parts, codexIdentityWeekly, codexWindowSecondary, now)
+		identity, fallbackSlot, ok := identityForKind(kind)
+		if !ok {
+			return codexRateLimitBucket{}, false
 		}
-		return codexRateLimitBucket{}, false
+		return codexIdentityDisplayBucket(parts, identity, fallbackSlot, now)
 	}
 
 	for i, m := range metrics {

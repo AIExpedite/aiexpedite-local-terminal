@@ -1453,3 +1453,134 @@ func TestCodexMetricsFromCache_FingerprintMismatchHidesSnapshot(t *testing.T) {
 		}
 	}
 }
+
+// Finding 2 (cross-shape migration): a weekly first observed via the aggregate
+// `rate_limits` view (limit id __legacy__ under secondary) then re-reported via
+// the per-limit `rateLimitsByLimitId` view under the primary slot (a NAMED limit
+// id) is the SAME weekly metric. Supersession keys on identity, not limit id, so
+// the stale secondary copy is dropped and the newest reading wins — even though
+// it reports a LOWER used %. Keying on (identity, limit id) would keep both and
+// let most-constrained folding resurrect the stale higher %.
+func TestCaptureCodexRateLimit_CrossShapeWeeklyMigrationNewestWins(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// Older weekly via the aggregate view (secondary / __legacy__) at 70%.
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{"secondary":{"used_percent":70,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+	// Newer weekly via the per-limit view, nested under the primary slot as a
+	// NAMED limit at a LOWER 30%.
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimitsByLimitId":{`+
+			`"codex_secondary":{"primary":{"usedPercent":30,"windowDurationMins":10080,"resetsInSeconds":604800}}`+
+			`}}}`,
+		now.Add(30*time.Second),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if contribs, present := snap.Contributors[codexWindowSecondary]; present && len(contribs) > 0 {
+		t.Errorf("stale aggregate weekly under secondary must be dropped, still present: %+v", contribs)
+	}
+	metrics := codexMetricsFromCache(now.Add(30*time.Second), "")
+	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
+		t.Fatalf("metrics[1]=%+v, want single known weekly", metrics[1])
+	}
+	if metrics[1].Consumed == nil || *metrics[1].Consumed != 30 {
+		t.Errorf("weekly Consumed=%v, want 30 (newest wins across payload shapes despite lower usage)", metrics[1].Consumed)
+	}
+	if !metrics[0].Unknown {
+		t.Errorf("session row=%+v, want Unknown (no session reading)", metrics[0])
+	}
+}
+
+// Finding 3 (empty full snapshot): a full account/rateLimits/read response whose
+// `rateLimits` object is empty declares the account now has NO quota windows, so
+// every cached observation must be reconciled away — the frame must not be
+// dropped just because it carries no buckets and no explicit nulls.
+func TestCaptureCodexRateLimit_EmptyFullSnapshotClearsAll(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{`+
+			`"primary":{"used_percent":30,"window_minutes":300,"resets_in_seconds":1800},`+
+			`"secondary":{"used_percent":40,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
+		now,
+	)
+	if snap, ok := loadCodexRateLimitSnapshot(cache); !ok || len(snap.Buckets) != 2 {
+		t.Fatalf("seed should cache two windows, got ok=%v %+v", ok, snap.Buckets)
+	}
+
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","id":7,"result":{"rateLimits":{}}}`,
+		now.Add(time.Minute),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatalf("expected cache")
+	}
+	if len(snap.Buckets) != 0 || len(snap.Contributors) != 0 {
+		t.Errorf("empty full snapshot must clear all cached windows, got Buckets=%+v Contributors=%+v", snap.Buckets, snap.Contributors)
+	}
+	metrics := codexMetricsFromCache(now.Add(time.Minute), "")
+	if !metrics[0].Unknown || !metrics[1].Unknown {
+		t.Errorf("both rows should be Unknown after empty full snapshot, got [%+v %+v]", metrics[0], metrics[1])
+	}
+}
+
+// Finding 4 (identity-level omission): when one storage slot holds contributors
+// for TWO identities — a live session and a stale weekly that migrated into the
+// primary slot — a full snapshot that restates only the session must drop the
+// omitted weekly identity, not preserve the whole slot. Slot-level omission would
+// keep the stale weekly because the primary slot itself survives.
+func TestCaptureCodexRateLimit_FullSnapshotOmitsIdentityWithinSharedSlot(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	// A weekly-band reading migrated into the primary slot (named limit id).
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimitsByLimitId":{`+
+			`"codex_secondary":{"primary":{"usedPercent":50,"windowDurationMins":10080,"resetsInSeconds":604800}}`+
+			`}}}`,
+		now,
+	)
+	// A session reading also under the primary slot (distinct named limit id), so
+	// the primary slot now holds two identities.
+	captureCodexRateLimitLine(
+		`{"method":"account/rateLimits/updated","params":{"rateLimitsByLimitId":{`+
+			`"codex_primary":{"primary":{"usedPercent":30,"windowDurationMins":300,"resetsInSeconds":1800}}`+
+			`}}}`,
+		now.Add(30*time.Second),
+	)
+	// Sanity: before the full snapshot the stale weekly is visible.
+	if pre := codexMetricsFromCache(now.Add(30*time.Second), ""); pre[1].Unknown {
+		t.Fatalf("precondition: weekly should be visible before the full snapshot, got %+v", pre[1])
+	}
+
+	// Full snapshot restates ONLY the session window; the weekly identity is
+	// omitted entirely.
+	captureCodexRateLimitLine(
+		`{"jsonrpc":"2.0","id":5,"result":{"rateLimits":{"primary":{"usedPercent":33,"windowDurationMins":300,"resetsInSeconds":1800}}}}`,
+		now.Add(time.Minute),
+	)
+
+	metrics := codexMetricsFromCache(now.Add(time.Minute), "")
+	if metrics[0].Unknown || metrics[0].Kind != limitKindSession {
+		t.Errorf("session row=%+v, want known session retained by the full snapshot", metrics[0])
+	}
+	if !metrics[1].Unknown {
+		t.Errorf("weekly row=%+v, want Unknown — the stale weekly identity sharing the primary slot must be reconciled away", metrics[1])
+	}
+}
