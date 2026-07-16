@@ -3153,7 +3153,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		return
 	}
 	if isAntigravityNativeCommand(cmd.Type) {
-		handleAntigravityNativeCommand(ctx, topic, cmd)
+		handleAntigravityNativeCommand(ctx, topic, cmd, cfg)
 		return
 	}
 	if isGrokACPCommand(cmd.Type) {
@@ -3531,7 +3531,7 @@ func publishClaudeNativeError(ctx context.Context, topic *pubsub.Publisher, cmd 
 // the AntigravityNativeManager. Start registers a logical session (no process);
 // Send runs one-shot agy --print with exact --conversation resume; End cancels
 // any in-flight turn and drops the logical session.
-func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg) {
+func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
 	if globalAntigravityNativeManager == nil {
 		publishAntigravityNativeError(ctx, topic, cmd, "antigravity native manager not initialized")
 		// Start commands leave a cloud-side `starting` session + reservation;
@@ -3580,9 +3580,14 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			})
 		}
 
+		antigravityWorkspaceRoot := ""
+		if cfg != nil {
+			antigravityWorkspaceRoot = cfg.WorkingDirectory
+		}
 		err := globalAntigravityNativeManager.Start(
 			cmd.SessionID,
 			cmd.Cwd,
+			antigravityWorkspaceRoot,
 			cmd.WorkspaceID,
 			cmd.UID,
 			publishFn,

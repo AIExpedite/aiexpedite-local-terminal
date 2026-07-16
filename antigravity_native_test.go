@@ -409,7 +409,7 @@ func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 	// when we set them independently (no real agy needed).
 	m := NewAntigravityNativeManager()
 	cwd := t.TempDir()
-	if err := m.Start("sess-a", cwd, "ws", "uid", nil, nil); err != nil {
+	if err := m.Start("sess-a", cwd, "", "ws", "uid", nil, nil); err != nil {
 		// probeAntigravityNativeCapability may fail if agy missing — skip.
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not runnable") ||
 			strings.Contains(err.Error(), "below minimum") || strings.Contains(err.Error(), "unsupported") {
@@ -417,7 +417,7 @@ func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 		}
 		t.Fatalf("start a: %v", err)
 	}
-	if err := m.Start("sess-b", cwd, "ws", "uid", nil, nil); err != nil {
+	if err := m.Start("sess-b", cwd, "", "ws", "uid", nil, nil); err != nil {
 		t.Fatalf("start b: %v", err)
 	}
 	sa, sb := m.Get("sess-a"), m.Get("sess-b")
@@ -433,6 +433,40 @@ func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 	_ = m.End("sess-b")
 	if m.Get("sess-a") != nil || m.Get("sess-b") != nil {
 		t.Fatal("ended sessions must be removed")
+	}
+}
+
+// TestAntigravityNativeManager_StartRejectsCwdOutsideWorkspaceRoot proves the
+// workspace-root containment gate: a signed antigravity_native_start whose cwd
+// escapes the configured working directory is rejected before any session is
+// registered or `agy` is spawned, so a later --dangerously-skip-permissions
+// turn cannot run outside the containment root. Mirrors the Grok ACP gate.
+func TestAntigravityNativeManager_StartRejectsCwdOutsideWorkspaceRoot(t *testing.T) {
+	m := NewAntigravityNativeManager()
+	root := t.TempDir()
+	outside := t.TempDir() // a sibling temp dir, not inside root
+
+	err := m.Start("sess-escape", outside, root, "ws", "uid", nil, nil)
+	if err == nil {
+		t.Fatal("expected Start to reject a cwd outside the workspace root")
+	}
+	if !strings.Contains(err.Error(), "outside the configured workspace root") {
+		t.Fatalf("unexpected error (want containment rejection): %v", err)
+	}
+	if m.Get("sess-escape") != nil {
+		t.Fatal("rejected start must not register a session")
+	}
+
+	// A cwd inside the root passes the containment gate. If agy is unavailable
+	// the probe (which runs after the gate) is what fails — assert we got past
+	// containment either way.
+	inside := filepath.Join(root, "sub")
+	if err := os.MkdirAll(inside, 0o755); err != nil {
+		t.Fatalf("mkdir inside: %v", err)
+	}
+	err = m.Start("sess-inside", inside, root, "ws", "uid", nil, nil)
+	if err != nil && strings.Contains(err.Error(), "outside the configured workspace root") {
+		t.Fatalf("cwd inside root must pass containment; got %v", err)
 	}
 }
 
@@ -716,7 +750,7 @@ func TestAntigravityNativeManager_StartIsIdempotent(t *testing.T) {
 	var acks int
 	onStarted := func() { acks++ }
 
-	if err := m.Start("sess-idem", cwd, "ws", "uid", nil, onStarted); err != nil {
+	if err := m.Start("sess-idem", cwd, "", "ws", "uid", nil, onStarted); err != nil {
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not runnable") ||
 			strings.Contains(err.Error(), "below minimum") || strings.Contains(err.Error(), "unsupported") {
 			t.Skipf("agy not available for capability probe: %v", err)
@@ -730,7 +764,7 @@ func TestAntigravityNativeManager_StartIsIdempotent(t *testing.T) {
 		t.Fatal("session missing after first start")
 	}
 
-	if err := m.Start("sess-idem", cwd, "ws", "uid", nil, onStarted); err != nil {
+	if err := m.Start("sess-idem", cwd, "", "ws", "uid", nil, onStarted); err != nil {
 		t.Fatalf("duplicate start must be idempotent nil, got %v", err)
 	}
 	if acks != 2 {
@@ -854,7 +888,7 @@ func TestAntigravityNativeManager_StartIdempotentSkipsCapabilityProbe(t *testing
 	})
 
 	var acks int
-	if err := m.Start(id, cwd, "ws", "uid", nil, func() { acks++ }); err != nil {
+	if err := m.Start(id, cwd, "", "ws", "uid", nil, func() { acks++ }); err != nil {
 		t.Fatalf("existing session must re-ack without capability probe: %v", err)
 	}
 	if acks != 1 {

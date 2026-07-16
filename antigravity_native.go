@@ -202,7 +202,7 @@ func (m *AntigravityNativeManager) cwdCaptureLock(cwd string) *sync.Mutex {
 // cloud never sends antigravity_native_end (idle expiry / dropped end command).
 // onStarted is invoked after the session is registered so callers can publish
 // antigravity_native_started before any later frames.
-func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string, publishFn PublishFunc, onStarted func()) error {
+func (m *AntigravityNativeManager) Start(id, cwd, workspaceRoot string, workspaceID, uid string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -216,6 +216,28 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string
 		return fmt.Errorf("cwd %q is not accessible: %w", cwd, err)
 	} else if !info.IsDir() {
 		return fmt.Errorf("cwd %q is not a directory", cwd)
+	}
+
+	// Workspace-root containment: a bad/stale signed antigravity_native_start
+	// could otherwise carry a cwd outside the agent's configured working
+	// directory, and the later Send would run `agy --dangerously-skip-permissions`
+	// from that path — sidestepping the working-directory scope this native path's
+	// threat model claims. Resolve symlinks on both sides and reject escapes,
+	// exactly as the Grok ACP Start path does. When the dispatcher configures no
+	// root (workspaceRoot == "") the check is skipped, preserving the plain
+	// absolute/exists contract for callers with out-of-band containment.
+	if workspaceRoot != "" {
+		resolvedCwd, err := filepath.EvalSymlinks(cwd)
+		if err != nil {
+			return fmt.Errorf("cwd %q symlink resolution failed: %w", cwd, err)
+		}
+		resolvedRoot, err := filepath.EvalSymlinks(workspaceRoot)
+		if err != nil {
+			return fmt.Errorf("workspace root %q symlink resolution failed: %w", workspaceRoot, err)
+		}
+		if !pathInsideRoot(resolvedCwd, resolvedRoot) {
+			return fmt.Errorf("cwd %q is outside the configured workspace root %q", resolvedCwd, resolvedRoot)
+		}
 	}
 
 	// Idempotent redelivery first: if the session is already registered, re-ack
