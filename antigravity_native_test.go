@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -754,4 +755,124 @@ func TestAntigravityNativeManager_EndStaleSessionsPublishesEnded(t *testing.T) {
 		t.Fatalf("fresh session must not emit ended; captured=%d", len(captured))
 	}
 	_ = m.End(freshID)
+}
+
+func TestAntigravityNativeManager_StartIdempotentSkipsCapabilityProbe(t *testing.T) {
+	// Duplicate antigravity_native_start must re-ack even when the capability
+	// cache is a recent failure (expired TTL / upgrade blip). Probing first
+	// would return an error and desync cloud retry state from a live session.
+	m := NewAntigravityNativeManager()
+	cwd := t.TempDir()
+	id := "sess-skip-probe"
+
+	m.mu.Lock()
+	m.sessions[id] = &AntigravityNativeSession{
+		ID:          id,
+		Cwd:         cwd,
+		WorkspaceID: "ws",
+		UID:         "uid",
+		StartedAt:   time.Now(),
+		status:      "idle",
+	}
+	m.mu.Unlock()
+
+	antigravityCapabilityMu.Lock()
+	prevOK := antigravityCapabilityOK
+	prevErr := antigravityCapabilityErr
+	prevChecked := antigravityCapabilityChecked
+	antigravityCapabilityOK = false
+	antigravityCapabilityErr = fmt.Errorf("Antigravity CLI not found or not runnable: install agy ≥ %s", antigravityNativeMinVersion)
+	antigravityCapabilityChecked = time.Now()
+	antigravityCapabilityMu.Unlock()
+	t.Cleanup(func() {
+		antigravityCapabilityMu.Lock()
+		antigravityCapabilityOK = prevOK
+		antigravityCapabilityErr = prevErr
+		antigravityCapabilityChecked = prevChecked
+		antigravityCapabilityMu.Unlock()
+	})
+
+	var acks int
+	if err := m.Start(id, cwd, "ws", "uid", nil, func() { acks++ }); err != nil {
+		t.Fatalf("existing session must re-ack without capability probe: %v", err)
+	}
+	if acks != 1 {
+		t.Fatalf("expected one started ack, got %d", acks)
+	}
+	if m.Get(id) == nil {
+		t.Fatal("session must still be registered")
+	}
+	_ = m.End(id)
+}
+
+func TestAntigravityNativeManager_SendNonzeroExitWithStdoutIsError(t *testing.T) {
+	// Auth/quota/invalid-flag failures often print diagnostics to stdout and
+	// exit non-zero. Those must publish antigravity_native_error — never success
+	// with the diagnostic appended as an assistant transcript turn.
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim for fake agy is unix-oriented")
+	}
+
+	binDir := t.TempDir()
+	fakeAgy := filepath.Join(binDir, "agy")
+	// Always fail with stdout diagnostic so PATH lookup of "agy" is deterministic.
+	script := "#!/bin/sh\necho 'Error: authentication required — please run agy login'\nexit 2\n"
+	if err := os.WriteFile(fakeAgy, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewAntigravityNativeManager()
+	cwd := t.TempDir()
+	id := "sess-nonzero-stdout"
+
+	// Bypass Start probe — inject session directly (same pattern as stale GC test).
+	m.mu.Lock()
+	m.sessions[id] = &AntigravityNativeSession{
+		ID:          id,
+		Cwd:         cwd,
+		WorkspaceID: "ws",
+		UID:         "uid",
+		StartedAt:   time.Now(),
+		status:      "idle",
+	}
+	m.mu.Unlock()
+
+	var frames []resultMsg
+	publishFn := func(res resultMsg) {
+		frames = append(frames, res)
+	}
+
+	err := m.Send(id, "hello", publishFn, 10*time.Second)
+	if err == nil {
+		t.Fatal("expected Send to fail on non-zero agy exit")
+	}
+	if !strings.Contains(err.Error(), "exited with code 2") {
+		t.Fatalf("error should mention exit code: %v", err)
+	}
+
+	var sawError, sawSuccess bool
+	for _, f := range frames {
+		if f.Type == "antigravity_native_error" {
+			sawError = true
+		}
+		if f.Type == "antigravity_native_message" && f.Status == "success" {
+			sawSuccess = true
+		}
+	}
+	if !sawError {
+		t.Fatalf("expected antigravity_native_error frame, got %#v", frames)
+	}
+	if sawSuccess {
+		t.Fatalf("must not publish success for non-zero exit: %#v", frames)
+	}
+
+	sess := m.Get(id)
+	if sess == nil {
+		t.Fatal("session should remain registered after failed turn")
+	}
+	if len(sess.Transcript) != 0 {
+		t.Fatalf("failed turn must not append transcript, got %#v", sess.Transcript)
+	}
+	_ = m.End(id)
 }

@@ -203,28 +203,27 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string
 		return fmt.Errorf("cwd %q is not a directory", cwd)
 	}
 
+	// Idempotent redelivery first: if the session is already registered, re-ack
+	// without re-probing. A transient `agy --version` failure (cache expiry,
+	// upgrade, PATH blip) must not turn a usable local session into a cloud-side
+	// error and desync Pub/Sub retry state from the manager.
+	m.mu.Lock()
+	if existing, exists := m.sessions[id]; exists {
+		ackExistingAntigravitySession(existing, id, publishFn, onStarted)
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+
 	if err := probeAntigravityNativeCapability(); err != nil {
 		return err
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Re-check after probe: a concurrent Start for the same id may have won.
 	if existing, exists := m.sessions[id]; exists {
-		// Pub/Sub redelivery / terminal-service retry of the same start must
-		// re-ack started without ending the still-usable local session. Emitting
-		// antigravity_native_ended here would release the cloud reservation while
-		// the manager still holds the session, breaking later Sends.
-		// Refresh publishFn so a newer publisher binding still reaches GC.
-		if publishFn != nil {
-			existing.mu.Lock()
-			existing.publishFn = publishFn
-			existing.mu.Unlock()
-		}
-		fmt.Printf("%s[antigravity-native] Session %s already registered — idempotent start ack%s\n",
-			colorCyan, id, colorReset)
-		if onStarted != nil {
-			onStarted()
-		}
+		ackExistingAntigravitySession(existing, id, publishFn, onStarted)
 		return nil
 	}
 
@@ -247,6 +246,26 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string
 		onStarted()
 	}
 	return nil
+}
+
+// ackExistingAntigravitySession refreshes the publisher binding and re-acks
+// started for an already-registered logical session. Caller must hold m.mu.
+func ackExistingAntigravitySession(existing *AntigravityNativeSession, id string, publishFn PublishFunc, onStarted func()) {
+	// Pub/Sub redelivery / terminal-service retry of the same start must
+	// re-ack started without ending the still-usable local session. Emitting
+	// antigravity_native_ended here would release the cloud reservation while
+	// the manager still holds the session, breaking later Sends.
+	// Refresh publishFn so a newer publisher binding still reaches GC.
+	if publishFn != nil {
+		existing.mu.Lock()
+		existing.publishFn = publishFn
+		existing.mu.Unlock()
+	}
+	fmt.Printf("%s[antigravity-native] Session %s already registered — idempotent start ack%s\n",
+		colorCyan, id, colorReset)
+	if onStarted != nil {
+		onStarted()
+	}
 }
 
 // Send runs one user turn: spawn `agy --print <prompt>` (with --conversation
@@ -415,10 +434,8 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 		outText, errText, exitCode = out2, err2, exit2
 		usedReplay = true
 		needCapture = true
-		if exitCode != 0 && outText == "" {
-			return m.publishTurnError(session, publishFn,
-				fmt.Sprintf("Antigravity resume failed and replay recovery failed (exit %d)", exitCode))
-		}
+		// Non-zero exit after replay is handled by the unified exit-code gate
+		// below (including stdout-bearing diagnostics such as auth/quota).
 	}
 
 	if needCapture || session.NativeConversationID == "" {
@@ -435,7 +452,24 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 		}
 	}
 
-	if outText == "" && exitCode != 0 {
+	// After missing-conversation replay is handled, remaining non-zero exits
+	// (auth, quota, invalid flags, tool failures) must surface as turn errors
+	// even when stdout carries diagnostic text — never publish success or
+	// append diagnostics into the conversation transcript as an assistant turn.
+	if exitCode != 0 {
+		detail := strings.TrimSpace(outText)
+		if detail == "" {
+			detail = strings.TrimSpace(errText)
+		}
+		if detail != "" {
+			// Keep the user-facing message bounded; full stderr is already
+			// published (redacted) via publishStderrIfAny when present.
+			if len(detail) > 400 {
+				detail = detail[:400] + "…"
+			}
+			return m.publishTurnError(session, publishFn,
+				fmt.Sprintf("Antigravity exited with code %d: %s", exitCode, detail))
+		}
 		return m.publishTurnError(session, publishFn,
 			fmt.Sprintf("Antigravity exited with code %d and produced no response", exitCode))
 	}
