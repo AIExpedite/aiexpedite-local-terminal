@@ -884,6 +884,41 @@ func TestCodexUsageParser_RolloutBackfillsRolledOverCacheBucket(t *testing.T) {
 	}
 }
 
+// AC4 in the rollout path: a rollout log carrying ONLY the weekly window must
+// fill the weekly row and leave the session row Unknown — the identity-gated
+// backfill must never promote a weekly reading into the 5-hour session row.
+func TestCodexUsageParser_WeeklyOnlyRolloutLeavesSessionUnknown(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Rollout frame with the weekly window only — no primary/session key at all.
+	helperWriteRolloutLog(t, codexHome, "19", "2026-06-19T11-00-00-weeklyonly", []map[string]any{
+		{"secondary": map[string]any{
+			"used_percent":   44.0,
+			"window_minutes": 10080.0,
+			"resets_at":      float64(now.Add(72 * time.Hour).Unix()),
+		}},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	session, weekly := usage.Metrics[0], usage.Metrics[1]
+	if !session.Unknown {
+		t.Errorf("session metric=%+v, want Unknown (weekly-only rollout must not fill the 5-hour row)", session)
+	}
+	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 44 {
+		t.Errorf("weekly metric=%+v, want observed 44%% from weekly-only rollout", weekly)
+	}
+	if weekly.Label != "Weekly quota" {
+		t.Errorf("weekly Label=%q, want Weekly quota", weekly.Label)
+	}
+}
+
 // Codex emits rate_limits: null between real readings; the parser must take the
 // LAST populated frame, ignoring nulls and earlier values.
 func TestCodexUsageParser_RolloutPrefersLastPopulatedFrame(t *testing.T) {
