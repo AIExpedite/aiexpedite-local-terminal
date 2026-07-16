@@ -231,7 +231,7 @@ func (m *AntigravityNativeManager) Start(id, cwd, workspaceRoot string, workspac
 	// exactly as the Grok ACP Start path does. When the dispatcher configures no
 	// root (workspaceRoot == "") the check is skipped, preserving the plain
 	// absolute/exists contract for callers with out-of-band containment.
-	// The same check is repeated per turn in runOneShot (see antigravityContainedCwd)
+	// The same check is repeated per turn in the Send path (see antigravityContainedCwd)
 	// because no CLI process launches until a later Send, leaving a TOCTOU window
 	// in which the cwd subdirectory could be swapped for a symlink escaping the root.
 	if workspaceRoot != "" {
@@ -382,15 +382,29 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	fmt.Printf("%s[antigravity-native] Turn on %s (resume=%v)%s\n",
 		colorCyan, id, useNativeResume, colorReset)
 
+	// Resolve the cwd once for this turn: symlink-free and workspace-contained.
+	// agy launches from (cmd.Dir) and records last_conversations.json keyed by
+	// this resolved directory, so the capture lock and native-ID lookup MUST use
+	// the same value — session.Cwd may be a symlink whose key never matches, which
+	// would silently drop every captured ID and force perpetual replay. Resolving
+	// per turn just before launch also closes the start→send symlink-swap TOCTOU
+	// that Start's earlier check cannot (no process launches until this Send).
+	runDir, cwdErr := antigravityContainedCwd(session.Cwd, session.WorkspaceRoot)
+	if cwdErr != nil {
+		return m.publishTurnError(session, publishFn,
+			fmt.Sprintf("cwd containment revalidation failed: %v", cwdErr))
+	}
+
 	// Per-cwd capture lock: acquired lazily and held across the entire capturing
 	// `agy` run (snapshot → run → capture) so concurrent same-cwd first turns
 	// cannot misattribute each other's freshly created conversation DB. Different
 	// cwds never contend, and native-resume turns (nativeID known) never acquire
-	// it, so only the rare capturing turns serialize.
+	// it, so only the rare capturing turns serialize. Keyed by the resolved runDir
+	// so two symlink aliases of the same real dir still serialize.
 	var captureLock *sync.Mutex
 	lockCapture := func() {
 		if captureLock == nil {
-			captureLock = m.cwdCaptureLock(session.Cwd)
+			captureLock = m.cwdCaptureLock(runDir)
 			captureLock.Lock()
 		}
 	}
@@ -420,7 +434,7 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	}
 
 	outText, errText, exitCode, timedOut, truncated, runErr := m.runOneShot(
-		session, executable, promptToSend, nativeID, turnTimeout, "antigravity-native:"+id,
+		session, runDir, executable, promptToSend, nativeID, turnTimeout, "antigravity-native:"+id,
 	)
 	if runErr != nil {
 		return m.publishTurnError(session, publishFn, runErr.Error())
@@ -458,7 +472,7 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 		beforeIDs = listAntigravityConversationIDs()
 
 		out2, err2, exit2, timed2, trunc2, run2 := m.runOneShot(
-			session, executable, replayPrompt, "", turnTimeout, "antigravity-native:"+id+":replay",
+			session, runDir, executable, replayPrompt, "", turnTimeout, "antigravity-native:"+id+":replay",
 		)
 		if run2 != nil {
 			return m.publishTurnError(session, publishFn, fmt.Sprintf("replay failed: %v", run2))
@@ -515,7 +529,7 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	// Capture read runs under the per-cwd lock acquired before this turn's run.
 	if needCapture || session.NativeConversationID == "" {
 		lockCapture()
-		captured := captureAntigravityNativeID(session.Cwd, beforeIDs)
+		captured := captureAntigravityNativeID(runDir, beforeIDs)
 		if captured != "" {
 			session.NativeConversationID = captured
 		} else if session.NativeConversationID == "" {
@@ -589,7 +603,7 @@ func killAntigravityProcessTree(cmd *exec.Cmd) {
 // antigravityContainedCwd resolves symlinks on cwd and, when workspaceRoot is
 // set, verifies the resolved cwd stays inside the resolved root, returning the
 // real (symlink-free) cwd to use as the process working directory. Called from
-// Start and again from runOneShot immediately before launch so a cwd
+// Start and again per turn (in the Send path, just before launch) so a cwd
 // subdirectory that is swapped for a symlink escaping the root between
 // antigravity_native_start and antigravity_native_send cannot run
 // `agy --dangerously-skip-permissions` outside the approved workspace.
@@ -613,7 +627,7 @@ func antigravityContainedCwd(cwd, workspaceRoot string) (string, error) {
 
 func (m *AntigravityNativeManager) runOneShot(
 	session *AntigravityNativeSession,
-	executable, prompt, nativeID string,
+	runDir, executable, prompt, nativeID string,
 	turnTimeout time.Duration,
 	registryLabel string,
 ) (stdoutText, stderrText string, exitCode int, timedOut, truncated bool, err error) {
@@ -629,15 +643,11 @@ func (m *AntigravityNativeManager) runOneShot(
 	// no-op, cancel/timeout must reap the whole group (killAntigravityProcessTree),
 	// not just cmd.Process, or those descendants leak and block the drain.
 	detachControllingTTY(cmd)
-	// Re-verify workspace-root containment right before assigning the working
-	// directory: Start's check can go stale because no process launches until
-	// this later Send, so a cwd subdirectory swapped for a symlink escaping the
-	// root would otherwise run agy outside the approved workspace. Use the
-	// resolved (symlink-free) cwd so the swap cannot redirect the launch.
-	runDir, err := antigravityContainedCwd(session.Cwd, session.WorkspaceRoot)
-	if err != nil {
-		return "", "", 0, false, false, fmt.Errorf("cwd containment revalidation failed: %w", err)
-	}
+	// runDir is the caller's per-turn symlink-resolved, workspace-contained cwd
+	// (antigravityContainedCwd, computed just before this Send). agy launches from
+	// it AND keys last_conversations.json by it, so the caller reuses the exact
+	// same value for the capture lock and native-ID lookup — a symlinked
+	// session.Cwd would otherwise never match agy's recorded key.
 	cmd.Dir = runDir
 	cmd.Env = sanitizeAntigravityEnv(os.Environ())
 

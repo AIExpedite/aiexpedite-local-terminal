@@ -404,6 +404,64 @@ func TestCaptureAntigravityNativeID_NoCwdMappingDoesNotAdoptGlobalDB(t *testing.
 	}
 }
 
+// TestCaptureAntigravityNativeID_UsesResolvedCwdKey is the regression for the
+// symlinked-cwd capture miss: agy launches from and keys last_conversations.json
+// by the symlink-resolved cwd (antigravityContainedCwd → cmd.Dir), so the capture
+// lookup must use that same resolved path. Passing the raw symlinked session.Cwd
+// never matches agy's key, silently dropping every native ID and forcing
+// perpetual bounded replay instead of exact --conversation resume.
+func TestCaptureAntigravityNativeID_UsesResolvedCwdKey(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+
+	base := filepath.Join(tmp, ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(filepath.Join(base, "cache"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(base, "conversations"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	realDir := filepath.Join(tmp, "real-proj")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(tmp, "link-proj")
+	if err := os.Symlink(realDir, link); err != nil {
+		t.Skipf("symlinks unavailable on this platform: %v", err)
+	}
+	resolved, err := filepath.EvalSymlinks(realDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := "99999999-8888-7777-6666-555555555555"
+	// agy records the mapping under the RESOLVED process cwd (cmd.Dir == runDir).
+	if err := os.WriteFile(filepath.Join(base, "cache", "last_conversations.json"),
+		[]byte(`{"`+resolved+`":"`+id+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "conversations", id+".db"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := map[string]struct{}{}
+
+	// Pre-fix: passing the raw symlinked cwd finds nothing.
+	if got := captureAntigravityNativeID(link, before); got != "" {
+		t.Fatalf("symlinked cwd must not match agy's resolved key; got %q", got)
+	}
+	// Fixed: the Send path passes the resolved runDir (antigravityContainedCwd
+	// output, also assigned to cmd.Dir), which matches agy's recorded key.
+	runDir, err := antigravityContainedCwd(link, "")
+	if err != nil {
+		t.Fatalf("containment resolution failed: %v", err)
+	}
+	if got := captureAntigravityNativeID(runDir, before); got != id {
+		t.Fatalf("capture with resolved cwd = %q, want %q", got, id)
+	}
+}
+
 func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 	// Unit-level: two sessions with different IDs never share native IDs
 	// when we set them independently (no real agy needed).
@@ -471,12 +529,14 @@ func TestAntigravityNativeManager_StartRejectsCwdOutsideWorkspaceRoot(t *testing
 }
 
 // TestAntigravityContainedCwd_RevalidatesSymlinkSwap proves the per-turn
-// containment revalidation runOneShot performs right before assigning cmd.Dir:
+// containment revalidation the Send path performs before assigning cmd.Dir:
 // Start's check can go stale because no `agy` process launches until a later
 // Send, so a cwd subdirectory swapped for a symlink escaping the workspace root
 // between antigravity_native_start and antigravity_native_send must be caught
 // before launch. antigravityContainedCwd returns the resolved cwd when contained
-// and an error once the path escapes.
+// and an error once the path escapes. The Send path reuses that resolved cwd for
+// cmd.Dir, the capture lock, and the native-ID lookup so a symlinked cwd cannot
+// silently drop captured conversation IDs.
 func TestAntigravityContainedCwd_RevalidatesSymlinkSwap(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir() // sibling temp dir, not inside root
