@@ -429,7 +429,7 @@ func extractCodexRateLimitBucketsFull(raw map[string]interface{}, now time.Time)
 // fresh telemetry frame at the start of the new window), and leaving the
 // stale percentage in the merge would let it shadow a live contributor that
 // has a smaller usage but a real future reset. The reset itself is preserved
-// so codexObservedMetricOrUnknown still recognises the rollover at display
+// so codexMetricFromBucket still recognises the rollover at display
 // time when no other contributor is live.
 func aggregateCodexBuckets(perLimit map[string]map[string]codexRateLimitBucket, now time.Time) map[string]codexRateLimitBucket {
 	out := map[string]codexRateLimitBucket{}
@@ -1163,7 +1163,7 @@ const codexRolloutScanFileCap = 16
 //
 // A live captured bucket with a still-future reset is authoritative: it wins
 // over any rollout reading. But when the cache row's reset has already passed,
-// codexObservedMetricOrUnknown rolls it over to a concrete 0% (Unknown=false)
+// codexMetricFromBucket rolls it over to a concrete 0% (Unknown=false)
 // — and without this fallback the card would show that bogus 0% indefinitely
 // for a user who once streamed through the app-server, let the window reset,
 // and then drove Codex only through the TUI (where the new window's usage is
@@ -1461,14 +1461,14 @@ func codexRolloutLineTimestamp(line string) (time.Time, bool) {
 //   - A bucket with no known usage is NEVER stored as a standalone observed
 //     contributor — the live path ignores reset-only updates that have no prior
 //     same-window usage to merge into, and so do we. Storing one would make
-//     codexObservedMetricOrUnknown report a bogus 0% and block an older file
+//     codexMetricFromBucket report a bogus 0% and block an older file
 //     from filling the real usage.
 //   - When a reset-only update jumps to a NEW window (reset beyond jitter), the
 //     prior reading is stale: drop it so it can't keep rendering an expired
 //     percentage, and leave the window unobserved until a real usage frame lands.
 //   - A usage-only update arriving after the prior window has already expired
 //     stands on its own — copying the expired prev reset would make
-//     codexObservedMetricOrUnknown zero out the fresh usage as rolled over.
+//     codexMetricFromBucket zero out the fresh usage as rolled over.
 //
 // Windows/limits the frame doesn't mention are left untouched (rollout frames
 // never clear). `frameTime` is the line's own timestamp so liveness is judged
@@ -1589,17 +1589,4 @@ func codexMetricFromBucket(b codexRateLimitBucket, ok bool, kind, defaultLabel s
 		Remaining: floatPtr(100 - used),
 		ResetAt:   resetAt,
 	}
-}
-
-// codexObservedMetricOrUnknown is the map+windowID form retained as a thin
-// wrapper over codexMetricFromBucket for callers/tests that look a window up by
-// storage slot. Prefer codexMetricFromBucket with an identity-selected bucket in
-// new code.
-func codexObservedMetricOrUnknown(
-	buckets map[string]codexRateLimitBucket,
-	windowID, kind, defaultLabel string,
-	now time.Time,
-) cliAgentUsageMetric {
-	b, ok := buckets[windowID]
-	return codexMetricFromBucket(b, ok, kind, defaultLabel, now)
 }
