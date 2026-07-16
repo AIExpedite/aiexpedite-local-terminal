@@ -871,14 +871,21 @@ func antigravityDangerousFlags() []string {
 
 func sanitizeAntigravityEnv(env []string) []string {
 	// Strip unrelated provider credentials that might leak into child tools.
+	// agy is Google's CLI and needs none of these; native turns run with
+	// `--dangerously-skip-permissions`, so any inherited token is readable by
+	// whatever tool Antigravity spawns for a remote prompt. Deny whole provider
+	// prefixes (not just `*_API_KEY`) so OAuth/session tokens are covered too —
+	// e.g. CLAUDE_CODE_OAUTH_TOKEN and ANTHROPIC_AUTH_TOKEN — matching the
+	// CLAUDE_/prefix sweep the codex/grok launch paths already apply.
 	// Compare case-insensitively: Windows and some shells export mixed/lower
-	// names (OpenAI_API_KEY, anthropic_api_key) that would otherwise survive
-	// into `agy --dangerously-skip-permissions` tool subprocesses.
+	// names (OpenAI_API_KEY, anthropic_api_key) that would otherwise survive.
 	denyPrefixes := []string{
-		"ANTHROPIC_API_KEY=",
-		"OPENAI_API_KEY=",
-		"XAI_API_KEY=",
-		"CODEX_API_KEY=",
+		"CLAUDECODE=",
+		"CLAUDE_",     // CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_API_KEY, …
+		"ANTHROPIC_",  // ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN
+		"OPENAI_",     // OPENAI_API_KEY, …
+		"XAI_",        // XAI_API_KEY
+		"CODEX_",      // CODEX_API_KEY, CODEX_IDE_*
 	}
 	out := make([]string, 0, len(env))
 	for _, e := range env {

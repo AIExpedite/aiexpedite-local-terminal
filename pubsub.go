@@ -3618,7 +3618,11 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			publishAntigravityNativeError(ctx, topic, cmd, "sessionID is required for antigravity_native_send")
 			return
 		}
-		if cmd.Input == "" {
+		if strings.TrimSpace(cmd.Input) == "" {
+			// Reject whitespace-only sends here too: Send() trims and returns
+			// "input is empty" before it holds a session, and the error filter
+			// below only re-publishes not-found/ended — so a spaces-only turn
+			// would otherwise leave the chat stuck running with no terminal frame.
 			publishAntigravityNativeError(ctx, topic, cmd, "input (user turn text) is required for antigravity_native_send")
 			return
 		}

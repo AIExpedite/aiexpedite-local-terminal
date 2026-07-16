@@ -644,6 +644,11 @@ func TestSanitizeAntigravityEnv_StripsCredentialsCaseInsensitive(t *testing.T) {
 		"anthropic_api_key=sk-lower",
 		"xai_api_key=xai-lower",
 		"CODEX_API_KEY=codex-upper",
+		// OAuth / session tokens must be stripped too, not just *_API_KEY.
+		"CLAUDE_CODE_OAUTH_TOKEN=oauth-token",
+		"ANTHROPIC_AUTH_TOKEN=auth-token",
+		"anthropic_auth_token=auth-lower",
+		"CLAUDECODE=1",
 		"SAFE_VAR=keep",
 		"HOME=/tmp",
 	}
@@ -655,6 +660,10 @@ func TestSanitizeAntigravityEnv_StripsCredentialsCaseInsensitive(t *testing.T) {
 		"anthropic_api_key=",
 		"xai_api_key=",
 		"CODEX_API_KEY=",
+		"CLAUDE_CODE_OAUTH_TOKEN=",
+		"ANTHROPIC_AUTH_TOKEN=",
+		"anthropic_auth_token=",
+		"CLAUDECODE=",
 	} {
 		for _, e := range out {
 			if strings.HasPrefix(strings.ToUpper(e), strings.ToUpper(secret)) {
