@@ -93,15 +93,38 @@ func (w *rotatingWriter) rotate() {
 	for i := logMaxBackups - 1; i >= 1; i-- {
 		_ = os.Rename(fmt.Sprintf("%s.%d", w.path, i), fmt.Sprintf("%s.%d", w.path, i+1))
 	}
-	_ = os.Rename(w.path, w.path+".1")
+	// If renaming the active file away fails (e.g. on Windows agent.log.1 is
+	// held open by another process), the file we reopen below is the SAME
+	// oversized agent.log. Resetting w.size to 0 in that case would let it grow
+	// without bound — a full 5 MB gets appended every cycle before we retry the
+	// (still-failing) rename. So track whether the move actually happened.
+	renamed := os.Rename(w.path, w.path+".1") == nil
 	f, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		w.f = nil
 		w.size = 0
 		return
 	}
+	if !renamed {
+		// Bound the still-present oversized file by truncating it (we lose that
+		// window of logs, but bounded logging beats unbounded growth). If even
+		// truncation fails, disable file logging rather than grow forever.
+		if truncErr := f.Truncate(0); truncErr != nil {
+			_ = f.Close()
+			w.f = nil
+			w.size = 0
+			return
+		}
+	}
 	w.f = f
-	w.size = 0
+	// Trust the on-disk size, not an assumption: a successful rotation reopens a
+	// fresh (empty) file; a failed-but-truncated one is also 0; anything else
+	// keeps the size bound honest.
+	if info, statErr := f.Stat(); statErr == nil {
+		w.size = info.Size()
+	} else {
+		w.size = 0
+	}
 }
 
 // The log tee mirrors os.Stdout/os.Stderr to agent.log AND to a console target.
