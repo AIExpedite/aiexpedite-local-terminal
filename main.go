@@ -54,6 +54,14 @@ func main() {
 		}
 	}
 
+	// Mirror stdout/stderr to a size-bounded rotating log file so the agent's
+	// diagnostics (codex app-server teardown reasons, stale cleanup, etc.)
+	// survive after the fact — the agent runs as a tray app with no persisted
+	// console. Placed AFTER the fast early-return arg handlers above
+	// (statusline-hook / --version / --uninstall / --elevated-copy) so those
+	// keep a clean, untouched stdout. Fail-open + disk-bounded (see logtee.go).
+	defer setupLogTee()()
+
 	// Handle --update-from=<original_path> argument (self-replacement after update)
 	// When the app is launched from a temp path after an auto-update, this flag
 	// tells it to copy itself over the original exe and re-launch from there.
