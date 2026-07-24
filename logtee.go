@@ -46,13 +46,20 @@ type rotatingWriter struct {
 }
 
 func newRotatingWriter(path string) (*rotatingWriter, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// Owner-only logs dir + file, matching security.log (security_log.go):
+	// agent.log can hold command display/debug output and must not be
+	// world-readable on shared machines.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
+	// OpenFile only applies the mode on create; tighten an existing world-
+	// readable file left by an earlier build (best-effort on Unix; no-op-ish
+	// on Windows where POSIX modes aren't enforced the same way).
+	_ = f.Chmod(0o600)
 	var size int64
 	if info, statErr := f.Stat(); statErr == nil {
 		size = info.Size()
@@ -99,12 +106,13 @@ func (w *rotatingWriter) rotate() {
 	// without bound — a full 5 MB gets appended every cycle before we retry the
 	// (still-failing) rename. So track whether the move actually happened.
 	renamed := os.Rename(w.path, w.path+".1") == nil
-	f, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		w.f = nil
 		w.size = 0
 		return
 	}
+	_ = f.Chmod(0o600)
 	if !renamed {
 		// Bound the still-present oversized file by truncating it (we lose that
 		// window of logs, but bounded logging beats unbounded growth). If even

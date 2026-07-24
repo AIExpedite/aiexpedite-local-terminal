@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -60,6 +61,60 @@ func TestRotatingWriterBoundsDiskUsage(t *testing.T) {
 	// A file beyond the last backup must NOT exist (oldest is deleted on rotate).
 	if _, err := os.Stat(fmt.Sprintf("%s.%d", path, logMaxBackups+1)); err == nil {
 		t.Fatalf("backup beyond logMaxBackups was not deleted")
+	}
+}
+
+// agent.log holds process stdout/stderr (including command display/debug) and
+// must be owner-only — same posture as security.log (0o700 dir / 0o600 file).
+func TestRotatingWriterPrivatePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes are not enforced the same way on Windows")
+	}
+	dir := t.TempDir()
+	// Nested path so MkdirAll creates the logs directory with our mode.
+	logsDir := filepath.Join(dir, "logs")
+	path := filepath.Join(logsDir, "agent.log")
+	w, err := newRotatingWriter(path)
+	if err != nil {
+		t.Fatalf("newRotatingWriter: %v", err)
+	}
+	w.mu.Lock()
+	if w.f != nil {
+		_ = w.f.Close()
+		w.f = nil
+	}
+	w.mu.Unlock()
+
+	if info, err := os.Stat(logsDir); err != nil {
+		t.Fatalf("stat logs dir: %v", err)
+	} else if mode := info.Mode().Perm(); mode != 0o700 {
+		t.Errorf("logs dir mode = %04o, want 0700", mode)
+	}
+	if info, err := os.Stat(path); err != nil {
+		t.Fatalf("stat agent.log: %v", err)
+	} else if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("agent.log mode = %04o, want 0600", mode)
+	}
+
+	// Reopen a pre-existing world-readable file and ensure we tighten it.
+	worldPath := filepath.Join(dir, "world.log")
+	if err := os.WriteFile(worldPath, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w2, err := newRotatingWriter(worldPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	w2.mu.Lock()
+	if w2.f != nil {
+		_ = w2.f.Close()
+		w2.f = nil
+	}
+	w2.mu.Unlock()
+	if info, err := os.Stat(worldPath); err != nil {
+		t.Fatalf("stat world.log: %v", err)
+	} else if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("reopened log mode = %04o, want 0600 (chmod on open)", mode)
 	}
 }
 
