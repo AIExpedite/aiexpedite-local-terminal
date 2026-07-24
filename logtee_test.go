@@ -66,9 +66,52 @@ func TestRotatingWriterBoundsDiskUsage(t *testing.T) {
 // teeSink must never return an error, or the io.Copy pump feeding it could stop
 // draining the pipe and block every fmt.Print in the agent.
 func TestTeeSinkNeverErrors(t *testing.T) {
-	// nil console + nil file: still must not error.
+	// nil consoleRef + nil file: still must not error.
 	s := teeSink{}
 	if n, err := s.Write([]byte("hello")); err != nil || n != 5 {
 		t.Fatalf("teeSink.Write = (%d, %v), want (5, nil)", n, err)
+	}
+}
+
+// Regression for the P2: allocateConsole() allocates a Windows console AFTER the
+// tee is installed and used to overwrite os.Stdout, bypassing it. The tee now
+// keeps a swappable console sink; setLogTeeConsole re-points it so output keeps
+// reaching the (new) console while os.Stdout stays the tee pipe.
+func TestLogTeeConsoleSwap(t *testing.T) {
+	c1, err := os.CreateTemp(t.TempDir(), "console1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	c2, err := os.CreateTemp(t.TempDir(), "console2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+
+	teeActive.Store(true)
+	teeOutConsole.Store(c1)
+	defer teeActive.Store(false)
+
+	sink := teeSink{consoleRef: &teeOutConsole}
+	_, _ = sink.Write([]byte("before\n"))
+
+	// This is what allocateConsole() does on "Show Console" / non-prod startup.
+	if !setLogTeeConsole(c2, c2) {
+		t.Fatal("setLogTeeConsole returned false while the tee is active")
+	}
+	_, _ = sink.Write([]byte("after\n"))
+
+	if b, _ := os.ReadFile(c1.Name()); string(b) != "before\n" {
+		t.Fatalf("old console = %q, want %q", b, "before\n")
+	}
+	if b, _ := os.ReadFile(c2.Name()); string(b) != "after\n" {
+		t.Fatalf("new console = %q, want %q (output did not follow the swap)", b, "after\n")
+	}
+
+	// Inactive tee → caller must fall back to reassigning os.Stdout directly.
+	teeActive.Store(false)
+	if setLogTeeConsole(c1, c1) {
+		t.Fatal("setLogTeeConsole returned true while the tee is inactive")
 	}
 }

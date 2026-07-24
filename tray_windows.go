@@ -329,9 +329,16 @@ func allocateConsole() error {
 	// Enable ANSI escape code support for colored output
 	enableANSISupport(uintptr(conout))
 
-	// Update Go's os.Stdout and os.Stderr to use the console
-	os.Stdout = os.NewFile(uintptr(conout), "stdout")
-	os.Stderr = os.NewFile(uintptr(conout), "stderr")
+	// Point Go's stdout/stderr at the console. If the log tee is active, just
+	// re-point its console mirror (os.Stdout stays the tee pipe) so diagnostics
+	// keep reaching BOTH the console and agent.log; otherwise fall back to
+	// replacing os.Stdout/os.Stderr directly (logtee.go).
+	conoutOut := os.NewFile(uintptr(conout), "stdout")
+	conoutErr := os.NewFile(uintptr(conout), "stderr")
+	if !setLogTeeConsole(conoutOut, conoutErr) {
+		os.Stdout = conoutOut
+		os.Stderr = conoutErr
+	}
 
 	consoleAllocated = true
 

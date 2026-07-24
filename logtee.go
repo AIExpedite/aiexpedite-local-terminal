@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 )
 
 // The agent runs as a background tray app with no persisted console, so its
@@ -103,23 +104,53 @@ func (w *rotatingWriter) rotate() {
 	w.size = 0
 }
 
-// teeSink writes to the log file and (best-effort) the original console. It
-// NEVER returns an error, so the io.Copy pump feeding it can never stop draining
-// the pipe — otherwise a broken/absent console (a tray app often has no console)
-// would fill the pipe buffer and block every fmt.Print in the agent.
+// The log tee mirrors os.Stdout/os.Stderr to agent.log AND to a console target.
+// The console target is SWAPPABLE at runtime because allocateConsole()
+// (tray_windows.go) allocates a Windows console on demand and would otherwise
+// overwrite os.Stdout/os.Stderr with CONOUT$, bypassing the tee. Instead the tee
+// keeps os.Stdout pointed at its pipe for the whole process lifetime and just
+// re-points these console sinks — so diagnostics keep reaching both the console
+// and the file whether the console is allocated at startup (non-prod) or later
+// via "Show Console" (prod). Loaded lock-free on the hot Write path.
+var (
+	teeOutConsole atomic.Pointer[os.File]
+	teeErrConsole atomic.Pointer[os.File]
+	teeActive     atomic.Bool
+)
+
+// teeSink writes to the log file and (best-effort) the current console target.
+// It NEVER returns an error, so the io.Copy pump feeding it can never stop
+// draining the pipe — otherwise a broken/absent console (a tray app often has
+// none) would fill the pipe buffer and block every fmt.Print in the agent.
 type teeSink struct {
-	console io.Writer
-	file    io.Writer
+	consoleRef *atomic.Pointer[os.File]
+	file       io.Writer
 }
 
 func (t teeSink) Write(p []byte) (int, error) {
 	if t.file != nil {
 		_, _ = t.file.Write(p)
 	}
-	if t.console != nil {
-		_, _ = t.console.Write(p) // best-effort; a dead console must not stop us
+	if t.consoleRef != nil {
+		if c := t.consoleRef.Load(); c != nil {
+			_, _ = c.Write(p) // best-effort; a dead console must not stop us
+		}
 	}
 	return len(p), nil
+}
+
+// setLogTeeConsole re-points the tee's console mirror at out/err — called by
+// allocateConsole() after it opens a fresh Windows console (CONOUT$) so console
+// output keeps flowing to BOTH the console and agent.log. Returns false when the
+// tee isn't active (setup failed / logging disabled) so the caller can fall back
+// to reassigning os.Stdout/os.Stderr directly.
+func setLogTeeConsole(out, err *os.File) bool {
+	if !teeActive.Load() {
+		return false
+	}
+	teeOutConsole.Store(out)
+	teeErrConsole.Store(err)
+	return true
 }
 
 // agentLogPath returns <configDir>/logs/agent.log, alongside security.log.
@@ -144,12 +175,19 @@ func setupLogTee() func() {
 	}
 
 	origOut, origErr := os.Stdout, os.Stderr
+	// Seed the swappable console sinks with the current console (the real
+	// console, or the GUI's NUL-ish handle). allocateConsole() re-points these
+	// later via setLogTeeConsole without touching os.Stdout.
+	teeOutConsole.Store(origOut)
+	teeErrConsole.Store(origErr)
 	var wg sync.WaitGroup
 
 	// pump replaces *dst (os.Stdout or os.Stderr) with the write end of a pipe
-	// and copies the read end into console+file. Returns a closer for the write
-	// end. On os.Pipe failure it leaves dst as-is (that stream just isn't teed).
-	pump := func(dst **os.File, console *os.File) func() {
+	// and copies the read end into (current console)+file. Returns a closer for
+	// the write end. On os.Pipe failure it leaves dst as-is (that stream isn't
+	// teed). os.Stdout stays this pipe for the whole process lifetime — the
+	// console target is swapped via the atomic ref, never by reassigning it.
+	pump := func(dst **os.File, consoleRef *atomic.Pointer[os.File]) func() {
 		r, w, perr := os.Pipe()
 		if perr != nil {
 			return func() {}
@@ -158,18 +196,20 @@ func setupLogTee() func() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = io.Copy(teeSink{console: console, file: rw}, r)
+			_, _ = io.Copy(teeSink{consoleRef: consoleRef, file: rw}, r)
 		}()
 		return func() { _ = w.Close() }
 	}
 
-	closeOut := pump(&os.Stdout, origOut)
-	closeErr := pump(&os.Stderr, origErr)
+	closeOut := pump(&os.Stdout, &teeOutConsole)
+	closeErr := pump(&os.Stderr, &teeErrConsole)
+	teeActive.Store(true)
 
 	fmt.Printf("[log] mirroring stdout/stderr → %s (rotating, max %d MB × %d files)\n",
 		path, logMaxSizeBytes/(1024*1024), logMaxBackups+1)
 
 	return func() {
+		teeActive.Store(false)
 		os.Stdout, os.Stderr = origOut, origErr
 		closeOut()
 		closeErr()
