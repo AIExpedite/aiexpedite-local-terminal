@@ -118,6 +118,58 @@ func TestRotatingWriterPrivatePermissions(t *testing.T) {
 	}
 }
 
+// Upgrade path: older builds left logs/ at 0755 and rotated backups at 0644.
+// Startup must tighten those too — MkdirAll/OpenFile only apply modes on create.
+func TestRotatingWriterTightensExistingDirAndBackups(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes are not enforced the same way on Windows")
+	}
+	dir := t.TempDir()
+	logsDir := filepath.Join(dir, "logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(logsDir, "agent.log")
+	if err := os.WriteFile(path, []byte("active\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= logMaxBackups; i++ {
+		if err := os.WriteFile(fmt.Sprintf("%s.%d", path, i), []byte("backup\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	w, err := newRotatingWriter(path)
+	if err != nil {
+		t.Fatalf("newRotatingWriter: %v", err)
+	}
+	w.mu.Lock()
+	if w.f != nil {
+		_ = w.f.Close()
+		w.f = nil
+	}
+	w.mu.Unlock()
+
+	if info, err := os.Stat(logsDir); err != nil {
+		t.Fatalf("stat logs dir: %v", err)
+	} else if mode := info.Mode().Perm(); mode != 0o700 {
+		t.Errorf("existing logs dir mode = %04o, want 0700 after reopen", mode)
+	}
+	if info, err := os.Stat(path); err != nil {
+		t.Fatalf("stat agent.log: %v", err)
+	} else if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Errorf("agent.log mode = %04o, want 0600", mode)
+	}
+	for i := 1; i <= logMaxBackups; i++ {
+		bp := fmt.Sprintf("%s.%d", path, i)
+		if info, err := os.Stat(bp); err != nil {
+			t.Fatalf("stat %s: %v", bp, err)
+		} else if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Errorf("%s mode = %04o, want 0600", bp, mode)
+		}
+	}
+}
+
 // teeSink must never return an error, or the io.Copy pump feeding it could stop
 // draining the pipe and block every fmt.Print in the agent.
 func TestTeeSinkNeverErrors(t *testing.T) {

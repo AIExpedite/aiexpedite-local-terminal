@@ -49,8 +49,17 @@ func newRotatingWriter(path string) (*rotatingWriter, error) {
 	// Owner-only logs dir + file, matching security.log (security_log.go):
 	// agent.log can hold command display/debug output and must not be
 	// world-readable on shared machines.
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
+	}
+	// MkdirAll does not change mode on an existing directory — tighten a
+	// pre-upgrade 0755 logs/ so the sensitive history stays private.
+	_ = os.Chmod(dir, 0o700)
+	// Same for rotated backups left at 0644 by older builds; they hold the
+	// same stdout/stderr content as agent.log until rotation overwrites them.
+	for i := 1; i <= logMaxBackups; i++ {
+		_ = os.Chmod(fmt.Sprintf("%s.%d", path, i), 0o600)
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
