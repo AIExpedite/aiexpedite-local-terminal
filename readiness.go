@@ -19,12 +19,18 @@ import (
 // failed build halfway through setup.
 
 // Readiness overall states. Mirrors the product vocabulary consumed by the
-// frontend readiness card (ready | needs_setup | underpowered | blocked).
+// frontend readiness card and terminal-service onboarding mapping
+// (ready | ready_with_warnings | needs_setup | underpowered | blocked).
+//
+// ready_with_warnings = required tools present, only capacity/utilization
+// advisories (e.g. low RAM warning). Backend mapReadinessStateToOnboarding
+// treats this as onboarding "ready" so the device stays routable for work.
 const (
-	ReadinessReady      = "ready"
-	ReadinessNeedsSetup = "needs_setup"
-	ReadinessUnderpower = "underpowered"
-	ReadinessBlocked    = "blocked"
+	ReadinessReady             = "ready"
+	ReadinessReadyWithWarnings = "ready_with_warnings"
+	ReadinessNeedsSetup        = "needs_setup"
+	ReadinessUnderpower        = "underpowered"
+	ReadinessBlocked           = "blocked"
 )
 
 // Finding severities, ordered from least to most serious.
@@ -37,13 +43,33 @@ const (
 // Product-defined readiness thresholds (GB / cores). Not user-configurable at
 // launch. A machine below the "blocker" disk floor cannot safely clone/build;
 // below the "underpowered" RAM/CPU floor dev work will thrash.
+//
+// RAM comparisons use marketed tiers (8 / 16 GB) with ramMarketedSlackGB so
+// OS-reported usable memory — which is almost always a bit under the stick
+// size (16 GB → ~15.x, 32 GB → ~31.x because firmware reserves pages) — is
+// classified against the marketed class rather than the raw float.
 const (
-	diskBlockerFreeGB = 5.0  // below this, cloning/building will fail
-	diskWarnFreeGB    = 20.0 // below this, warn before large clones/builds
-	ramUnderpowerGB   = 8.0  // below this, treat as underpowered for dev work
-	ramWarnGB         = 16.0 // below this, warn about heavy workloads
-	cpuUnderpowerCore = 2    // below this, treat as underpowered
+	diskBlockerFreeGB  = 5.0  // below this, cloning/building will fail
+	diskWarnFreeGB     = 20.0 // below this, warn before large clones/builds
+	ramUnderpowerGB    = 8.0  // marketed tier: below this → underpowered
+	ramWarnGB          = 16.0 // marketed tier: below this → advisory warning
+	ramMarketedSlackGB = 1.0  // OS under-reports usable RAM vs marketed stick
+	cpuUnderpowerCore  = 2    // below this, treat as underpowered
 )
+
+// capacityAdvisoryCodes are warning findings that do NOT require installable
+// setup steps. They must not flip the overall state to needs_setup (that would
+// map to onboarding setup_required and block work routing). See deriveReadinessState.
+var capacityAdvisoryCodes = map[string]struct{}{
+	"low_memory": {},
+	"low_disk":   {},
+}
+
+// marketedComparableRAM returns reported usable RAM plus slack so thresholds
+// express marketed stick sizes. 15.7 GB usable → 16.7 comparable ≥ 16 (no warn).
+func marketedComparableRAM(reportedGB float64) float64 {
+	return reportedGB + ramMarketedSlackGB
+}
 
 // ReadinessFinding is a single user-friendly observation about the machine.
 // Message is always plain language — never raw tool output — so it can be
@@ -80,8 +106,9 @@ func maxFreeDiskGB(disks []diskEntry) float64 {
 
 // evaluateReadiness derives a readiness verdict from gathered machine info.
 // Pure and deterministic (given info) so it is straightforward to unit-test.
-// blocked > underpowered > needs_setup > ready, with the most serious finding
-// winning the overall state.
+// Ranking (most serious wins):
+//
+//	blocked > underpowered > needs_setup > ready_with_warnings > ready
 func evaluateReadiness(info *MachineInfo) ReadinessReport {
 	report := ReadinessReport{
 		State:       ReadinessReady,
@@ -115,12 +142,15 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 		}
 	}
 
-	// Memory.
+	// Memory — compare against marketed tiers with slack so a "16 GB" stick
+	// that reports 15.7 usable is not flagged, while a true ~12–14 GB class
+	// still gets the heavy-workload advisory.
 	if info.Memory != nil && info.Memory.TotalGB > 0 {
+		comparable := marketedComparableRAM(info.Memory.TotalGB)
 		switch {
-		case info.Memory.TotalGB < ramUnderpowerGB:
+		case comparable < ramUnderpowerGB:
 			add("low_memory", FindingBlocker, fmt.Sprintf("This computer has %.0f GB of RAM, which is below the recommended minimum for development work.", info.Memory.TotalGB))
-		case info.Memory.TotalGB < ramWarnGB:
+		case comparable < ramWarnGB:
 			add("low_memory", FindingWarning, fmt.Sprintf("This computer has %.0f GB of RAM. Heavier builds and multiple tools at once may be slow.", info.Memory.TotalGB))
 		}
 	}
@@ -173,9 +203,15 @@ func cliAgentDetected(info *MachineInfo, id string) bool {
 }
 
 // deriveReadinessState folds the findings into a single overall state, most
-// serious wins. Blocker disk/CPU/memory issues that make dev work impractical
-// map to blocked/underpowered; missing-but-installable tooling maps to
-// needs_setup; no findings means ready.
+// serious wins:
+//
+//	blocked > underpowered > needs_setup > ready_with_warnings > ready
+//
+// Capacity/utilization warnings (low_memory, low_disk) are advisories only —
+// they become ready_with_warnings so terminal-service keeps the device
+// routable for work. Missing-but-installable tooling becomes needs_setup.
+// Collapsing every warning into needs_setup previously blocked assignment for
+// nominal 16 GB laptops that only carried a RAM advisory.
 func deriveReadinessState(findings []ReadinessFinding) string {
 	state := ReadinessReady
 	for _, f := range findings {
@@ -189,8 +225,19 @@ func deriveReadinessState(findings []ReadinessFinding) string {
 		case f.Severity == FindingBlocker:
 			state = ReadinessBlocked
 		case f.Severity == FindingWarning:
-			if state == ReadinessReady {
-				state = ReadinessNeedsSetup
+			if _, capacity := capacityAdvisoryCodes[f.Code]; capacity {
+				// Advisory only — do not demote past ready_with_warnings, and
+				// never override needs_setup / underpowered / blocked.
+				if state == ReadinessReady {
+					state = ReadinessReadyWithWarnings
+				}
+			} else {
+				// Installable tooling gap — setup required.
+				// May promote from ready or ready_with_warnings; never override
+				// underpowered / blocked.
+				if state == ReadinessReady || state == ReadinessReadyWithWarnings {
+					state = ReadinessNeedsSetup
+				}
 			}
 		}
 	}

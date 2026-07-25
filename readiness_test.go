@@ -157,16 +157,100 @@ func TestEvaluateReadiness_BlockedBeatsUnderpowered(t *testing.T) {
 }
 
 func TestEvaluateReadiness_LowDiskWarningOnly(t *testing.T) {
+	// Capacity advisories must NOT force needs_setup — that maps to onboarding
+	// setup_required and blocks work routing. ready_with_warnings keeps the
+	// finding visible while leaving the device assignable.
 	m := healthyMachine()
 	m.Disk = []diskEntry{{Drive: "/", SizeGB: 500, FreeGB: 12}}
 
 	report := evaluateReadiness(m)
-	if report.State != ReadinessNeedsSetup {
-		t.Fatalf("expected needs_setup for a low-disk warning, got %s", report.State)
+	if report.State != ReadinessReadyWithWarnings {
+		t.Fatalf("expected ready_with_warnings for a low-disk warning, got %s", report.State)
 	}
 	f := findFinding(report.Findings, "low_disk")
 	if f == nil || f.Severity != FindingWarning {
 		t.Fatalf("expected a warning low_disk finding, got %+v", f)
+	}
+}
+
+func TestEvaluateReadiness_LowRAMWarningOnly(t *testing.T) {
+	// True mid-range RAM (below the 16 GB marketed class even with slack)
+	// is an advisory, not a setup requirement.
+	m := healthyMachine()
+	m.Memory = &memoryInfo{TotalGB: 12.0, AvailableGB: 6.0}
+
+	report := evaluateReadiness(m)
+	if report.State != ReadinessReadyWithWarnings {
+		t.Fatalf("expected ready_with_warnings for 12 GB RAM advisory, got %s (findings: %+v)", report.State, report.Findings)
+	}
+	f := findFinding(report.Findings, "low_memory")
+	if f == nil || f.Severity != FindingWarning {
+		t.Fatalf("expected a warning low_memory finding, got %+v", f)
+	}
+}
+
+func TestEvaluateReadiness_Nominal16GBReportsAs15xIsReady(t *testing.T) {
+	// OS-reported usable RAM for a marketed 16 GB stick is typically ~15.x
+	// (firmware reserved). With marketed-size slack this must not warn, or
+	// every 16 GB laptop looks under-spec'd.
+	m := healthyMachine()
+	m.Memory = &memoryInfo{TotalGB: 15.7, AvailableGB: 5.8}
+
+	report := evaluateReadiness(m)
+	if report.State != ReadinessReady {
+		t.Fatalf("expected ready for nominal 16 GB (reported 15.7), got %s (findings: %+v)", report.State, report.Findings)
+	}
+	if findFinding(report.Findings, "low_memory") != nil {
+		t.Fatalf("did not expect low_memory finding for reported 15.7 GB (marketed 16 GB class)")
+	}
+}
+
+func TestEvaluateReadiness_Nominal32GBReportsAs31xIsReady(t *testing.T) {
+	m := healthyMachine()
+	m.Memory = &memoryInfo{TotalGB: 31.2, AvailableGB: 20.0}
+
+	report := evaluateReadiness(m)
+	if report.State != ReadinessReady {
+		t.Fatalf("expected ready for nominal 32 GB (reported 31.2), got %s (findings: %+v)", report.State, report.Findings)
+	}
+	if findFinding(report.Findings, "low_memory") != nil {
+		t.Fatalf("did not expect low_memory finding for reported 31.2 GB")
+	}
+}
+
+func TestEvaluateReadiness_CapacityWarningPlusMissingToolNeedsSetup(t *testing.T) {
+	// Installable gaps outrank capacity advisories: the machine still needs
+	// setup, even if it also has a low-disk warning.
+	m := healthyMachine()
+	m.Disk = []diskEntry{{Drive: "/", SizeGB: 500, FreeGB: 12}}
+	delete(m.Tools, "git")
+
+	report := evaluateReadiness(m)
+	if report.State != ReadinessNeedsSetup {
+		t.Fatalf("expected needs_setup when a tool is missing (capacity advisory present), got %s", report.State)
+	}
+	if findFinding(report.Findings, "low_disk") == nil {
+		t.Fatalf("expected low_disk finding to still be present")
+	}
+	if findFinding(report.Findings, "missing_git") == nil {
+		t.Fatalf("expected missing_git finding")
+	}
+}
+
+func TestEvaluateReadiness_Nominal8GBReportsAs7xNotUnderpowered(t *testing.T) {
+	// Same marketed-size slack applies at the underpowered floor: ~7.x usable
+	// is a marketed 8 GB stick, not underpowered (it may still warn if under
+	// the 16 GB class).
+	m := healthyMachine()
+	m.Memory = &memoryInfo{TotalGB: 7.5, AvailableGB: 3.0}
+
+	report := evaluateReadiness(m)
+	if report.State == ReadinessUnderpower {
+		t.Fatalf("expected marketed 8 GB (reported 7.5) not underpowered, got %s", report.State)
+	}
+	// 7.5 + 1.0 slack = 8.5, still below the 16 GB warn tier → advisory.
+	if report.State != ReadinessReadyWithWarnings {
+		t.Fatalf("expected ready_with_warnings for ~8 GB marketed class, got %s (findings: %+v)", report.State, report.Findings)
 	}
 }
 
