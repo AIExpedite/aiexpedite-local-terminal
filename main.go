@@ -185,22 +185,25 @@ var setupHideDelay = 2 * time.Second
 // hideAfterSetup minimizes the agent to the system tray once first-time setup
 // (device registration) has completed successfully. On Windows this hides the
 // on-demand console window; on macOS/Linux showConsoleWindow is a no-op and the
-// agent already runs headless from the menu-bar/tray. It runs in the
-// registration goroutine, so it must not mutate the tray event loop's
-// goroutine-local consoleVisible flag directly — instead it reuses the same
-// ConsoleHiddenChan the minimize-to-tray watcher uses, which flips that flag and
-// unchecks "Show Console" so a later click shows the window rather than
-// re-hiding it. Safe when no window exists: showConsoleWindow(false) early
-// returns for the prod GUI app that never allocated a console, and a nil
-// mConsole (systray not ready) is tolerated.
+// agent already runs headless from the menu-bar/tray. Safe when no window
+// exists: showConsoleWindow(false) early returns for the prod GUI app that
+// never allocated a console, and a nil mConsole (systray not ready) is tolerated.
+//
+// This runs in the registration goroutine, so it splits the "console hidden"
+// bookkeeping in two: it unchecks the "Show Console" item directly (the
+// established in-file pattern — mConsole.Uncheck is goroutine-safe), and it
+// signals ConsoleHiddenChan so the tray event loop clears its goroutine-local
+// consoleVisible flag (which it alone may write). Without the flag sync a later
+// "Show Console" click would toggle a stale true and re-hide instead of show.
+// The send is non-blocking: if the single-slot buffer already holds a pending
+// signal from monitorConsoleMinimize, that queued signal clears the flag just
+// the same, so dropping this duplicate is harmless.
 func hideAfterSetup(mConsole *systray.MenuItem) {
 	time.Sleep(setupHideDelay)
 	showConsoleWindow(false)
 	if mConsole != nil {
 		mConsole.Uncheck()
 	}
-	// Non-blocking: the buffered channel may already hold a pending signal
-	// from monitorConsoleMinimize; dropping a duplicate is harmless.
 	select {
 	case ConsoleHiddenChan <- true:
 	default:
