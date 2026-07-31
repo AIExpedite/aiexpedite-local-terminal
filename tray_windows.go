@@ -401,6 +401,13 @@ func showConsoleWindow(show bool) {
 			procSetForegroundWindow.Call(hwnd)
 		}
 	} else {
+		// Nothing to hide if a console was never allocated — e.g. the prod GUI
+		// app that never showed a window. This makes hideAfterSetup a safe
+		// no-op after setup when there is no window to minimize.
+		hwnd := getConsoleWindow()
+		if hwnd == 0 {
+			return
+		}
 		// Just hide the window - don't free the console.
 		// Using freeConsole() causes an infinite loop because:
 		// 1. freeConsole() invalidates stdout/stderr handles
@@ -408,10 +415,7 @@ func showConsoleWindow(show bool) {
 		// 3. The new console triggers close handlers, which call showConsoleWindow(false)
 		// 4. Loop continues indefinitely
 		// SW_HIDE keeps the console allocated but hidden, avoiding this issue.
-		hwnd := getConsoleWindow()
-		if hwnd != 0 {
-			procShowWindow.Call(hwnd, SW_HIDE)
-		}
+		procShowWindow.Call(hwnd, SW_HIDE)
 	}
 }
 
