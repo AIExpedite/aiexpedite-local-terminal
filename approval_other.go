@@ -23,7 +23,7 @@ type InstallChoice int
 const (
 	InstallYes InstallChoice = iota
 	InstallNo
-	InstallManual
+	InstallCancel
 )
 
 // UpdateChoice represents the user's response to update dialog
@@ -120,11 +120,14 @@ func ShowUpdateDialog(currentVersion, newVersion string) UpdateChoice {
 }
 
 // ---------------------------------------------------------------------------
-// Install prompt (3 choices: Yes / No / Manual)
+// Install prompt (3 choices: Yes / No / Cancel)
 // ---------------------------------------------------------------------------
 
 // ShowInstallPrompt displays a dialog asking user permission to install a dependency.
-// Returns InstallYes, InstallNo, or InstallManual.
+// Returns:
+//   - InstallYes: install automatically
+//   - InstallNo: open the download page, then exit the install flow
+//   - InstallCancel: cancel only — close the dialog and take no other action
 func ShowInstallPrompt(component, description string) InstallChoice {
 	message := fmt.Sprintf(
 		"%s is required but not installed.\n\n%s\n\n"+
@@ -192,20 +195,21 @@ func showOsascriptUpdateDialog(title, message string) UpdateChoice {
 
 func showOsascriptInstallPrompt(title, message string) InstallChoice {
 	script := fmt.Sprintf(
-		`display dialog "%s" buttons {"Open Download Page", "Exit", "Install"} default button "Install" with title "%s" with icon note`,
+		`display dialog "%s" buttons {"Cancel", "Open Download Page", "Install"} default button "Install" with title "%s" with icon note`,
 		escapeOsascript(message), escapeOsascript(title))
 	out, err := exec.Command("osascript", "-e", script).Output()
 	if err != nil {
-		return InstallNo
+		// Non-zero exit (e.g. user pressed Cancel or dismissed the dialog).
+		return InstallCancel
 	}
 	result := string(out)
 	switch {
+	case strings.Contains(result, "Open Download Page"):
+		return InstallNo
 	case strings.Contains(result, "Install"):
 		return InstallYes
-	case strings.Contains(result, "Open Download Page"):
-		return InstallManual
 	default:
-		return InstallNo
+		return InstallCancel
 	}
 }
 
@@ -299,32 +303,32 @@ func showLinuxInstallPrompt(title, message string) InstallChoice {
 	if _, err := exec.LookPath("zenity"); err == nil {
 		out, err := exec.Command("zenity", "--question",
 			"--title="+title,
-			"--text="+escapeZenityMarkup(message)+"\n\nYes = Install automatically\nNo = Exit\nManual = Open download page",
+			"--text="+escapeZenityMarkup(message)+"\n\nInstall = Install automatically\nOpen Download Page = Open download page\nCancel = Cancel",
 			"--ok-label=Install",
-			"--cancel-label=Exit",
+			"--cancel-label=Cancel",
 			"--extra-button=Open Download Page",
 			"--width=500").Output()
 		if err == nil {
 			return InstallYes
 		}
 		if strings.TrimSpace(string(out)) == "Open Download Page" {
-			return InstallManual
+			return InstallNo
 		}
-		return InstallNo
+		return InstallCancel
 	}
 	if _, err := exec.LookPath("kdialog"); err == nil {
 		cmd := exec.Command("kdialog", "--title", title,
-			"--yesnocancel", message+"\n\nYes = Install\nNo = Open download page\nCancel = Exit")
+			"--yesnocancel", message+"\n\nYes = Install automatically\nNo = Open download page\nCancel = Cancel")
 		_ = cmd.Run()
 		if cmd.ProcessState != nil {
 			switch cmd.ProcessState.ExitCode() {
 			case 0:
 				return InstallYes
 			case 1:
-				return InstallManual
+				return InstallNo
 			}
 		}
-		return InstallNo
+		return InstallCancel
 	}
 	return consoleInstallPrompt(title, message)
 }
@@ -361,17 +365,17 @@ func consoleUpdateDialog(title, message string) UpdateChoice {
 func consoleInstallPrompt(title, message string) InstallChoice {
 	fmt.Printf("\n[%s]\n%s\n\n", title, message)
 	fmt.Println("  1) Install automatically")
-	fmt.Println("  2) Exit (install manually)")
-	fmt.Println("  3) Open download page")
+	fmt.Println("  2) Open download page")
+	fmt.Println("  3) Cancel")
 	fmt.Print("\nChoice [1/2/3]: ")
 	reader := bufio.NewReader(os.Stdin)
 	input, _ := reader.ReadString('\n')
 	switch strings.TrimSpace(input) {
 	case "1":
 		return InstallYes
-	case "3":
-		return InstallManual
-	default:
+	case "2":
 		return InstallNo
+	default:
+		return InstallCancel
 	}
 }

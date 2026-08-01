@@ -11,6 +11,33 @@ import (
 
 const ttydDownloadURL = "https://github.com/tsl0922/ttyd/releases"
 
+// Seams for testing the install-choice side effects without opening a real
+// browser or terminating the test process.
+var (
+	openBrowserFn = openBrowser
+	exitFn        = os.Exit
+)
+
+// handleInstallChoice applies the side effects for the user's install-prompt
+// choice and reports whether the automatic installation should proceed.
+//   - InstallYes:    returns (true, nil); the caller continues the winget/scoop install.
+//   - InstallNo:     opens the dependency's download page, then exits the flow
+//     (manual installation path). The dialog does not proceed with auto-install.
+//   - InstallCancel: cancel only — no browser, no install; returns an error so the
+//     caller aborts (the app cannot run without ttyd).
+func handleInstallChoice(choice InstallChoice) (proceed bool, err error) {
+	switch choice {
+	case InstallNo:
+		openBrowserFn(ttydDownloadURL)
+		exitFn(0)
+		return false, nil
+	case InstallCancel:
+		return false, errors.New("ttyd installation cancelled by user")
+	default: // InstallYes
+		return true, nil
+	}
+}
+
 // ensureTtyd verifies ttyd is on PATH or tries to install it automatically.
 func ensureTtyd() error {
 	if checkTtydInstalled() {
@@ -67,32 +94,10 @@ func installTtydWindows() error {
 			"It will be installed via Windows Package Manager (winget).",
 	)
 
-	switch choice {
-	case InstallNo:
-		ShowInfoDialog(
-			"Installation Cancelled",
-			"You chose to exit. To use AI Expedite, please install ttyd manually:\n\n"+
-				"Open PowerShell and run:\n"+
-				"  winget install tsl0922.ttyd\n\n"+
-				"Then restart this application.",
-		)
-		os.Exit(0)
-		return nil
-
-	case InstallManual:
-		// Open download page in browser
-		openBrowser(ttydDownloadURL)
-		ShowInfoDialog(
-			"Manual Installation",
-			"Opening ttyd releases page in your browser.\n\n"+
-				"Download the Windows executable and add it to your PATH.\n"+
-				"Then restart this application.",
-		)
-		os.Exit(0)
-		return nil
-
-	case InstallYes:
-		// Continue with automatic installation
+	// No -> open download page and exit; Cancel -> abort with no action.
+	// Only InstallYes falls through to the automatic winget/scoop install below.
+	if proceed, err := handleInstallChoice(choice); !proceed {
+		return err
 	}
 
 	// Show console during installation
