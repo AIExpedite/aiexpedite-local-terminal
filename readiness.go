@@ -80,12 +80,26 @@ type ReadinessFinding struct {
 	Message  string `json:"message"`  // friendly, user-facing explanation
 }
 
+// ReadinessAction describes user-visible work discovered by inspection. It is
+// intentionally presentation-only: terminal-service remains responsible for
+// constructing and approving executable commands from the trusted report.
+type ReadinessAction struct {
+	ID                 string `json:"id"`
+	FindingCode        string `json:"findingCode"`
+	Kind               string `json:"kind"`
+	Label              string `json:"label"`
+	Instruction        string `json:"instruction"`
+	ManualInstruction  string `json:"manualInstruction,omitempty"`
+	RequiresUserAction bool   `json:"requiresUserAction"`
+}
+
 // ReadinessReport is the structured result of a workstation inspection. Specs
 // carries the full MachineInfo so the frontend card can offer progressive
 // disclosure ("Show details") without a second round trip.
 type ReadinessReport struct {
 	State       string             `json:"state"`
 	Findings    []ReadinessFinding `json:"findings"`
+	Actions     []ReadinessAction  `json:"actions"`
 	Specs       *MachineInfo       `json:"specs,omitempty"`
 	OS          string             `json:"os"`
 	CollectedAt string             `json:"collectedAt"`
@@ -113,6 +127,7 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 	report := ReadinessReport{
 		State:       ReadinessReady,
 		Findings:    []ReadinessFinding{},
+		Actions:     []ReadinessAction{},
 		Specs:       info,
 		OS:          runtime.GOOS,
 		CollectedAt: time.Now().UTC().Format(time.RFC3339),
@@ -127,8 +142,17 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 		return report
 	}
 
-	add := func(code, severity, message string) {
+	add := func(code, severity, message string, action *ReadinessAction) {
 		report.Findings = append(report.Findings, ReadinessFinding{Code: code, Severity: severity, Message: message})
+		if action != nil {
+			report.Actions = append(report.Actions, *action)
+		}
+	}
+	softwareAction := func(code, label, instruction, manualInstruction string) *ReadinessAction {
+		return &ReadinessAction{
+			ID: code, FindingCode: code, Kind: "software_update", Label: label,
+			Instruction: instruction, ManualInstruction: manualInstruction, RequiresUserAction: true,
+		}
 	}
 
 	// Disk capacity.
@@ -136,9 +160,9 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 	if len(info.Disk) > 0 {
 		switch {
 		case freeGB < diskBlockerFreeGB:
-			add("low_disk", FindingBlocker, fmt.Sprintf("Very low free disk space (%.0f GB). Free up space before installing tools or cloning repos.", freeGB))
+			add("low_disk", FindingBlocker, fmt.Sprintf("Very low free disk space (%.0f GB). Free up space before installing tools or cloning repos.", freeGB), nil)
 		case freeGB < diskWarnFreeGB:
-			add("low_disk", FindingWarning, fmt.Sprintf("Low free disk space (%.0f GB). Cloning large repos or building may run out of room.", freeGB))
+			add("low_disk", FindingWarning, fmt.Sprintf("Low free disk space (%.0f GB). Cloning large repos or building may run out of room.", freeGB), nil)
 		}
 	}
 
@@ -149,37 +173,37 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 		comparable := marketedComparableRAM(info.Memory.TotalGB)
 		switch {
 		case comparable < ramUnderpowerGB:
-			add("low_memory", FindingBlocker, fmt.Sprintf("This computer has %.0f GB of RAM, which is below the recommended minimum for development work.", info.Memory.TotalGB))
+			add("low_memory", FindingBlocker, fmt.Sprintf("This computer has %.0f GB of RAM, which is below the recommended minimum for development work.", info.Memory.TotalGB), nil)
 		case comparable < ramWarnGB:
-			add("low_memory", FindingWarning, fmt.Sprintf("This computer has %.0f GB of RAM. Heavier builds and multiple tools at once may be slow.", info.Memory.TotalGB))
+			add("low_memory", FindingWarning, fmt.Sprintf("This computer has %.0f GB of RAM. Heavier builds and multiple tools at once may be slow.", info.Memory.TotalGB), nil)
 		}
 	}
 
 	// CPU cores.
 	if info.CPU != nil && info.CPU.Cores > 0 && info.CPU.Cores < cpuUnderpowerCore {
-		add("low_cpu", FindingBlocker, fmt.Sprintf("This computer has %d CPU core(s), which is below the recommended minimum for development work.", info.CPU.Cores))
+		add("low_cpu", FindingBlocker, fmt.Sprintf("This computer has %d CPU core(s), which is below the recommended minimum for development work.", info.CPU.Cores), nil)
 	}
 
 	// Git tooling.
 	if _, ok := info.Tools["git"]; !ok {
-		add("missing_git", FindingWarning, "Git isn't installed yet. It's needed to clone and work with repositories.")
+		add("missing_git", FindingWarning, "Git isn't installed yet. It's needed to clone and work with repositories.", softwareAction("missing_git", "Install Git", "Create a setup plan to install Git.", "Install Git using the recommended package for this operating system."))
 	}
 
 	// Node/npm runtime (needed for most AIExpedite dev workflows).
 	_, hasNode := info.Runtimes["node"]
 	if !hasNode {
-		add("missing_node", FindingWarning, "Node.js isn't installed yet. Many development workflows need it.")
+		add("missing_node", FindingWarning, "Node.js isn't installed yet. Many development workflows need it.", softwareAction("missing_node", "Install Node.js", "Create a setup plan to install Node.js and npm.", "Install the current Node.js LTS release, including npm."))
 	} else if _, ok := info.PackageManagers["npm"]; !ok {
 		// On distros where node and npm are split packages, node can be
 		// present without npm. The Codex/setup workflows install via npm, so
 		// surface this rather than reporting the machine ready and failing on
 		// the first install step.
-		add("missing_npm", FindingWarning, "npm isn't installed yet. It comes with Node.js on most systems and is needed to install CLI tools like Codex.")
+		add("missing_npm", FindingWarning, "npm isn't installed yet. It comes with Node.js on most systems and is needed to install CLI tools like Codex.", softwareAction("missing_npm", "Install npm", "Create a setup plan to install npm.", "Install npm for the detected Node.js runtime."))
 	}
 
 	// Codex CLI — the launch install workflow.
 	if !cliAgentDetected(info, "codex") {
-		add("missing_codex", FindingWarning, "Codex CLI isn't set up yet. AIExpedite can install and sign you in with your permission.")
+		add("missing_codex", FindingWarning, "Codex CLI isn't set up yet. AIExpedite can install and sign you in with your permission.", softwareAction("missing_codex", "Install Codex", "Create a setup plan to install Codex CLI.", "Install Codex CLI, then follow its sign-in prompt."))
 	}
 
 	report.State = deriveReadinessState(report.Findings)
