@@ -31,6 +31,11 @@ import (
 // machine) from trapping the user in an infinite retry loop.
 const maxInstallRetries = 2
 
+// diagnosticCaptureBytes bounds how much package-manager output the platform
+// installers retain (the tail) for diagnostics, keeping memory bounded even
+// when a manager emits verbose progress output.
+const diagnosticCaptureBytes = 8192
+
 // DependencySpec describes a workstation dependency the setup flow can install.
 type DependencySpec struct {
 	// DisplayName is the human-facing name shown in dialogs, e.g. "Git".
@@ -40,12 +45,22 @@ type DependencySpec struct {
 	PromptDescription string
 	// WingetID is the WinGet package identifier, e.g. "Git.Git".
 	WingetID string
+	// ScoopID, when non-empty, is a Scoop package id used as a Windows
+	// fallback if WinGet is unavailable or fails (e.g. "ttyd").
+	ScoopID string
 	// UnixPackage is the package name for brew/apt on macOS/Linux, e.g. "git".
 	UnixPackage string
 	// VerifyCommand is the executable that must appear on PATH once the
 	// install succeeds, e.g. "git". Used to confirm the install actually
 	// landed (WinGet can report success while the binary isn't yet visible).
 	VerifyCommand string
+	// PostInstall, when set, is an in-process detector run after each manager
+	// attempt; its result — not the manager exit code — decides success, and
+	// it may augment the process PATH so a freshly-installed tool is usable
+	// immediately (needed for tools used in-process, e.g. ttyd). When nil,
+	// success is inferred from the manager exit code (fine for tools the app
+	// only needs after a restart, e.g. Git).
+	PostInstall func() bool
 	// ManualURL is the vendor download page opened for "install manually".
 	ManualURL string
 	// TroubleshootURL is the docs page opened for "view troubleshooting".
@@ -115,6 +130,7 @@ var (
 	installExec     = performInstall
 	installRecovery = ShowInstallRecovery
 	installOpenURL  = openBrowser
+	installShowInfo = ShowInfoDialog
 )
 
 // runDependencyInstall walks a dependency through the permission prompt, the
@@ -129,7 +145,7 @@ func runDependencyInstall(spec DependencySpec) error {
 			"component", spec.DisplayName, "at", "prompt")
 		return errInstallDeclined
 	case InstallManual:
-		openRecoveryURL(spec, spec.ManualURL, "manual_from_prompt")
+		presentRecoveryURL(spec, spec.ManualURL, "manual_from_prompt")
 		return errInstallManual
 	case InstallYes:
 		// fall through to the install / recovery loop
@@ -177,10 +193,14 @@ func runDependencyInstall(spec DependencySpec) error {
 				attempt++
 				retry = true
 			case RecoveryManual:
-				openRecoveryURL(spec, spec.ManualURL, "manual_from_recovery")
-				return errInstallManual
+				if presentRecoveryURL(spec, spec.ManualURL, "manual_from_recovery") {
+					return errInstallManual
+				}
+				// The browser couldn't be launched; the URL was shown in a
+				// dialog instead. Keep the recovery choices open rather than
+				// falsely reporting the page was opened.
 			case RecoveryTroubleshoot:
-				openRecoveryURL(spec, spec.TroubleshootURL, "troubleshoot")
+				presentRecoveryURL(spec, spec.TroubleshootURL, "troubleshoot")
 				// stay in the recovery sub-loop
 			case RecoveryExit:
 				return installGaveUp(spec, outcome)
@@ -199,18 +219,28 @@ func installGaveUp(spec DependencySpec, o installOutcome) error {
 		spec.DisplayName, installFailureReason(o.Kind))
 }
 
-// openRecoveryURL opens a recovery URL in the browser and records whether the
-// launch itself failed — a failed "manual install" / "troubleshoot" click is
-// otherwise silently dropped and looks like the button did nothing.
-func openRecoveryURL(spec DependencySpec, url, purpose string) {
+// presentRecoveryURL tries to open a recovery URL in the browser and returns
+// true only if the browser was actually launched. On failure it records the
+// error AND surfaces the URL in a dialog so the user can copy it manually —
+// otherwise a failed "manual install" / "troubleshoot" click (common under a
+// hidden/tray launch) is silently dropped and looks like the button did
+// nothing. Callers use the return value to avoid falsely reporting that the
+// page was opened.
+func presentRecoveryURL(spec DependencySpec, url, purpose string) bool {
 	if url == "" {
-		return
+		return false
 	}
 	if err := installOpenURL(url); err != nil {
 		LogSecurityEvent(SecEvtInstallFailed, "could not open recovery URL",
 			"component", spec.DisplayName, "purpose", purpose,
 			"url", url, "error", err.Error())
+		installShowInfo(
+			spec.DisplayName+" — Open This Link",
+			"We couldn't open your browser automatically.\n\n"+
+				"Please copy this link and open it manually:\n"+url)
+		return false
 	}
+	return true
 }
 
 // installFailureReason returns a short, log-friendly reason slug.
@@ -272,14 +302,16 @@ func installDiagnosticsSummary(spec DependencySpec, o installOutcome) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// truncateDiagnostic trims captured output to a bounded, single-block snippet
-// so a runaway installer log can't bloat the audit record or overflow a dialog.
+// truncateDiagnostic trims captured output to a bounded snippet, keeping the
+// TAIL rather than the head: package managers (WinGet in particular) emit
+// headers and progress first and place the actionable error last, so the end
+// of the output is what support needs.
 func truncateDiagnostic(s string, max int) string {
 	s = strings.TrimSpace(s)
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "…"
+	return "…" + s[len(s)-max:]
 }
 
 func errString(err error) string {
@@ -287,4 +319,46 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// packageManagerLabel returns the human-facing name of the package manager the
+// runner will use on the given OS, so consent prompts don't misdescribe the
+// mechanism (e.g. claiming "winget" on macOS/Linux).
+func packageManagerLabel(goos string) string {
+	switch goos {
+	case "windows":
+		return "the Windows Package Manager (winget)"
+	case "darwin":
+		return "Homebrew (brew)"
+	default:
+		return "your system package manager (apt)"
+	}
+}
+
+// tailWriter is an io.Writer that retains only the last maxBytes of everything
+// written to it, bounding memory even when a manager emits verbose output
+// (e.g. progress bars). Combined with truncateDiagnostic's tail-keeping, the
+// actionable trailing error is preserved without unbounded growth.
+type tailWriter struct {
+	buf       []byte
+	maxBytes  int
+	truncated bool
+}
+
+func newTailWriter(maxBytes int) *tailWriter { return &tailWriter{maxBytes: maxBytes} }
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	if len(w.buf) > w.maxBytes {
+		w.buf = w.buf[len(w.buf)-w.maxBytes:]
+		w.truncated = true
+	}
+	return len(p), nil
+}
+
+func (w *tailWriter) String() string {
+	if w.truncated {
+		return "…" + string(w.buf)
+	}
+	return string(w.buf)
 }

@@ -7,6 +7,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,9 +19,12 @@ import (
 // overrides never leak between tests.
 func withInstallSeams(t *testing.T) func() {
 	t.Helper()
-	origPrompt, origExec, origRecovery, origOpen := installPrompt, installExec, installRecovery, installOpenURL
+	origPrompt, origExec, origRecovery, origOpen, origInfo := installPrompt, installExec, installRecovery, installOpenURL, installShowInfo
+	// Default the info-dialog seam to a no-op so a stray call can never block
+	// the test on a real modal dialog.
+	installShowInfo = func(string, string) {}
 	return func() {
-		installPrompt, installExec, installRecovery, installOpenURL = origPrompt, origExec, origRecovery, origOpen
+		installPrompt, installExec, installRecovery, installOpenURL, installShowInfo = origPrompt, origExec, origRecovery, origOpen, origInfo
 	}
 }
 
@@ -219,5 +223,85 @@ func TestInstallDiagnosticsSummary_Truncates(t *testing.T) {
 	}
 	if len(out) > 500 {
 		t.Errorf("summary should be bounded, got %d chars", len(out))
+	}
+}
+
+// Finding 4: a failed browser launch on "Install manually" must NOT be
+// reported as a successful navigation; recovery choices stay available.
+func TestRunDependencyInstall_ManualBrowserFailureKeepsChoices(t *testing.T) {
+	defer withInstallSeams(t)()
+
+	openAttempts, recoveryCalls := 0, 0
+	installPrompt = func(string, string) InstallChoice { return InstallYes }
+	installExec = func(DependencySpec) installOutcome { return installOutcome{Kind: InstallLaunchFailed} }
+	installOpenURL = func(string) error { openAttempts++; return errors.New("no browser") }
+	installRecovery = func(string, string, string, bool) InstallRecoveryChoice {
+		recoveryCalls++
+		if recoveryCalls == 1 {
+			return RecoveryManual // browser fails → must stay in loop
+		}
+		return RecoveryExit
+	}
+
+	err := runDependencyInstall(testSpec())
+	if errors.Is(err, errInstallManual) {
+		t.Fatal("must not report manual success when the browser failed to launch")
+	}
+	if err == nil {
+		t.Fatal("expected a failure error after exiting recovery")
+	}
+	if openAttempts != 1 {
+		t.Fatalf("expected exactly 1 browser attempt, got %d", openAttempts)
+	}
+	if recoveryCalls != 2 {
+		t.Fatalf("expected recovery dialog re-shown after failed browser launch, got %d calls", recoveryCalls)
+	}
+}
+
+// Finding 3: truncateDiagnostic keeps the TAIL (where the actionable error
+// lives), not the head.
+func TestTruncateDiagnostic_KeepsTail(t *testing.T) {
+	s := strings.Repeat("HEADER ", 100) + "ACTUAL_ERROR_AT_END"
+	out := truncateDiagnostic(s, 40)
+	if !strings.Contains(out, "ACTUAL_ERROR_AT_END") {
+		t.Errorf("expected tail (actual error) retained, got %q", out)
+	}
+	if len(out) > 40+len("…") {
+		t.Errorf("expected bounded output, got %d chars", len(out))
+	}
+}
+
+// Finding 3: tailWriter bounds memory while retaining the tail of the stream.
+func TestTailWriter_BoundsAndKeepsTail(t *testing.T) {
+	w := newTailWriter(16)
+	for i := 0; i < 1000; i++ {
+		if _, err := w.Write([]byte("0123456789")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(w.buf) > 16 {
+		t.Fatalf("buffer must stay bounded to maxBytes, got %d", len(w.buf))
+	}
+	got := w.String()
+	if !strings.HasPrefix(got, "…") {
+		t.Errorf("truncated output should be marked with an ellipsis, got %q", got)
+	}
+	// The last bytes written were "...0123456789"; the tail must reflect them.
+	if !strings.HasSuffix(got, "6789") {
+		t.Errorf("expected the tail of the stream, got %q", got)
+	}
+}
+
+// Finding 5: prompts must name the package manager that actually runs per OS.
+func TestPackageManagerLabel(t *testing.T) {
+	cases := map[string]string{
+		"windows": "winget",
+		"darwin":  "brew",
+		"linux":   "apt",
+	}
+	for goos, want := range cases {
+		if got := packageManagerLabel(goos); !strings.Contains(got, want) {
+			t.Errorf("packageManagerLabel(%q) = %q, want it to mention %q", goos, got, want)
+		}
 	}
 }

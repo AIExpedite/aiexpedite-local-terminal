@@ -11,7 +11,6 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -51,12 +50,12 @@ func performInstall(spec DependencySpec) installOutcome {
 	fmt.Printf("\n→ Installing %s via %s...\n\n", spec.DisplayName, binary)
 
 	cmd := exec.Command(cmdName, args...)
-	var outBuf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &outBuf)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &outBuf)
+	tail := newTailWriter(diagnosticCaptureBytes)
+	cmd.Stdout = io.MultiWriter(os.Stdout, tail)
+	cmd.Stderr = io.MultiWriter(os.Stderr, tail)
 
 	runErr := cmd.Run()
-	output := outBuf.String()
+	output := tail.String()
 
 	if runErr == nil {
 		if spec.VerifyCommand == "" {

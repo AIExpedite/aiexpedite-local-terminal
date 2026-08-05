@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"runtime"
 )
 
 const (
@@ -19,12 +20,14 @@ const (
 	gitTroubleshootURL = "https://git-scm.com/book/en/v2/Getting-Started-Installing-Git"
 )
 
-// gitDependencySpec describes Git for the shared install runner.
+// gitDependencySpec describes Git for the shared install runner. The prompt
+// names the actual package manager for the current OS so the consent dialog
+// matches what will run (winget / brew / apt).
 func gitDependencySpec() DependencySpec {
 	return DependencySpec{
 		DisplayName: "Git",
 		PromptDescription: "Git is used to clone and work with repositories.\n" +
-			"It can be installed automatically via the Windows Package Manager (winget).",
+			"It can be installed automatically via " + packageManagerLabel(runtime.GOOS) + ".",
 		WingetID:        "Git.Git",
 		UnixPackage:     "git",
 		VerifyCommand:   "git",

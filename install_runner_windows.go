@@ -10,7 +10,6 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -19,106 +18,161 @@ import (
 	"strings"
 )
 
-// WinGet exit codes (HRESULT-style, from the winget APPINSTALLER_CLI_ERROR_*
-// set) that indicate the downloaded installer could not be found or launched.
-// WinGet returns these as 32-bit values; Go's ExitCode() hands them back as a
-// signed int, so we compare on the uint32 reinterpretation.
+// WinGet return codes (HRESULT-style, from winget-cli's authoritative
+// APPINSTALLER_CLI_ERROR_* set). WinGet returns these as 32-bit values; Go's
+// ExitCode() hands them back as a signed int, so we compare on the uint32
+// reinterpretation.
+//
+// Installer-launch failures — the "installer couldn't be found / failed to
+// launch" case this feature targets:
 const (
 	// ERROR_FILE_NOT_FOUND — "the system cannot find the file specified":
 	// the installer WinGet tried to launch was not present on disk.
 	wingetErrFileNotFound uint32 = 0x80070002
-	// APPINSTALLER_CLI_ERROR_EXEC_INSTALL_FAILED — the installer process was
-	// invoked but failed to run to completion (failed to launch / start).
-	wingetErrInstallFailed uint32 = 0x8A150102
-	// APPINSTALLER_CLI_ERROR_INSTALLER_HASH_MISMATCH — the downloaded
-	// installer was corrupt, so it is effectively unusable to launch.
-	wingetErrHashMismatch uint32 = 0x8A15002B
-	// APPINSTALLER_CLI_ERROR_MISSING_FROM_PATH — installed binary not visible.
-	wingetErrMissingFromPath uint32 = 0x8A150041
+	// APPINSTALLER_CLI_ERROR_SHELLEXEC_INSTALL_FAILED — WinGet located the
+	// installer but ShellExecute failed to launch it. This is the primary
+	// installer-launch failure this feature targets.
+	wingetErrShellExecFailed uint32 = 0x8A150006
+)
+
+// Other documented WinGet failures that are NOT installer-launch problems.
+// Declared so the distinction is explicit and pinned by tests; they route to
+// the generic recovery path (retry / manual / troubleshoot) rather than the
+// "installer couldn't launch" explanation.
+const (
+	wingetErrDownloadFailed    uint32 = 0x8A150008 // installer download failed
+	wingetErrHashMismatch      uint32 = 0x8A150011 // corrupt / tampered installer
+	wingetErrUpdateNotApplic   uint32 = 0x8A15002B // no applicable update found
+	wingetErrAgreementsNotOK   uint32 = 0x8A150041 // package agreements not accepted
+	wingetErrInstallInProgress uint32 = 0x8A150102 // another install already running
 )
 
 // launchFailureSubstrings is an English-language fallback for WinGet builds /
-// locales whose exit codes we don't recognise but whose stderr still names the
-// installer-not-found / launch problem. Best-effort: non-English Windows may
-// fall through to the generic recovery path (still recoverable).
+// locales whose exit codes we don't recognise but whose output still names the
+// installer-not-found / launch problem. Kept tight to avoid misclassifying
+// unrelated failures; best-effort — non-English Windows may fall through to
+// the generic recovery path (still recoverable).
 var launchFailureSubstrings = []string{
 	"cannot find the file",
 	"could not find the file",
-	"installer file",
-	"failed to install",
 	"failed to launch",
 	"unable to launch",
-	"downloaded installer",
-	"installer hash does not match",
+	"shellexecute",
 }
 
-// performInstall runs `winget install` for the dependency, streams output to
-// the console (preserving the existing setup UX) while also capturing stderr
-// for diagnostics, and classifies the result.
+// performInstall installs the dependency via WinGet, falling back to Scoop
+// when the spec configures it (e.g. ttyd). Output streams to the console
+// (preserving the setup UX) while a bounded tail is captured for diagnostics
+// and classification.
 func performInstall(spec DependencySpec) installOutcome {
-	// If WinGet isn't even present we can't launch anything — that's an
-	// exec-failure, not an installer-launch failure.
-	if _, err := exec.LookPath("winget"); err != nil {
+	showConsoleWindow(true)
+
+	// detected reports whether the tool is now installed. When the spec
+	// provides an in-process detector (e.g. ttyd, which the app uses
+	// immediately), its result is authoritative and it may augment PATH.
+	// Otherwise we trust the manager's clean exit — fine for tools only needed
+	// after a restart (e.g. Git): a freshly-installed binary won't appear on
+	// this process's already-captured PATH, so re-probing would spuriously
+	// report success as failure.
+	detected := func(exitOK bool) bool {
+		if spec.PostInstall != nil {
+			return spec.PostInstall()
+		}
+		return exitOK
+	}
+
+	var failure installOutcome
+	haveFailure, triedManager := false, false
+
+	// 1) WinGet (primary).
+	if _, err := exec.LookPath("winget"); err == nil {
+		triedManager = true
+		exitOK, out, code, runErr := runInstallManager(spec.DisplayName, "winget", []string{
+			"install", "-e", "--id", spec.WingetID,
+			"--accept-package-agreements", "--accept-source-agreements",
+			"--disable-interactivity",
+		})
+		if detected(exitOK) {
+			return installOutcome{Kind: InstallOK}
+		}
+		failure, haveFailure = classifyRun(code, out, runErr), true
+	}
+
+	// 2) Scoop (optional Windows fallback, e.g. ttyd).
+	if spec.ScoopID != "" {
+		if _, err := exec.LookPath("scoop"); err == nil {
+			triedManager = true
+			exitOK, out, code, runErr := runInstallManager(spec.DisplayName, "scoop", []string{"install", spec.ScoopID})
+			if detected(exitOK) {
+				return installOutcome{Kind: InstallOK}
+			}
+			// Prefer WinGet's classification when we have one (its output names
+			// the installer-launch problem); otherwise use Scoop's.
+			if !haveFailure {
+				failure, haveFailure = classifyRun(code, out, runErr), true
+			}
+		}
+	}
+
+	if !triedManager {
+		managers := "winget"
+		if spec.ScoopID != "" {
+			managers = "winget/scoop"
+		}
 		return installOutcome{
 			Kind:   InstallExecFailed,
-			Err:    fmt.Errorf("winget not found on PATH: %w", err),
-			Output: "Windows Package Manager (winget) is not installed or not on PATH.",
+			Output: fmt.Sprintf("No supported package manager (%s) is available to install %s.", managers, spec.DisplayName),
 		}
 	}
+	return failure
+}
 
-	showConsoleWindow(true)
-	fmt.Printf("\n→ Installing %s via Windows Package Manager (winget)...\n", spec.DisplayName)
-	fmt.Printf("→ Running: winget install --id %s\n\n", spec.WingetID)
+// runInstallManager runs a package-manager command, streaming its output live
+// to the console while capturing a bounded tail for diagnostics/classification.
+// Returns (exitedZero, capturedTail, exitCode, runErr). exitCode is 0 on a
+// spawn failure (runErr will be a non-ExitError in that case).
+func runInstallManager(display, manager string, args []string) (bool, string, int, error) {
+	fmt.Printf("\n→ Installing %s via %s...\n→ Running: %s %s\n\n",
+		display, manager, manager, strings.Join(args, " "))
 
-	cmd := exec.Command("winget", "install",
-		"-e", "--id", spec.WingetID,
-		"--accept-package-agreements",
-		"--accept-source-agreements",
-		"--disable-interactivity")
-
-	// Tee both streams so the user still sees progress in real time AND we
-	// retain a copy for classification / the audit log. WinGet writes most of
-	// its output — including error text — to stdout, so classification must
-	// consider both streams, not stderr alone.
-	var outBuf bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &outBuf)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &outBuf)
+	cmd := exec.Command(manager, args...)
+	// Tee both streams into one bounded tail buffer: WinGet writes most output
+	// (including the actionable error, which comes last) to stdout, so
+	// classification must see both streams and keep the end.
+	tail := newTailWriter(diagnosticCaptureBytes)
+	cmd.Stdout = io.MultiWriter(os.Stdout, tail)
+	cmd.Stderr = io.MultiWriter(os.Stderr, tail)
 
 	runErr := cmd.Run()
-	output := outBuf.String()
-
-	// Trust WinGet's exit status: a clean exit means the install succeeded.
-	// We deliberately do NOT re-probe PATH here — a freshly-installed binary
-	// won't appear on this process's (already-captured) PATH until a restart,
-	// so a LookPath check would spuriously report a successful install as a
-	// failure. Callers re-detect the tool on the next launch.
+	out := tail.String()
 	if runErr == nil {
-		return installOutcome{Kind: InstallOK}
+		return true, out, 0, nil
 	}
-
-	// The process ran but exited non-zero → classify by exit code + output.
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) {
-		code := exitErr.ExitCode()
-		return installOutcome{
-			Kind:     classifyInstallFailure(code, output),
-			ExitCode: code,
-			Output:   output,
-			Err:      runErr,
-		}
+		return false, out, exitErr.ExitCode(), runErr
 	}
+	return false, out, 0, runErr // spawn error
+}
 
-	// Couldn't start the process at all (spawn error) → exec failure.
+// classifyRun turns a single manager run into an installOutcome.
+func classifyRun(exitCode int, output string, runErr error) installOutcome {
+	// A non-ExitError means the process couldn't be started → exec failure.
+	var exitErr *exec.ExitError
+	if runErr != nil && !errors.As(runErr, &exitErr) {
+		return installOutcome{Kind: InstallExecFailed, Output: output, Err: runErr}
+	}
 	return installOutcome{
-		Kind:   InstallExecFailed,
-		Output: output,
-		Err:    runErr,
+		Kind:     classifyInstallFailure(exitCode, output),
+		ExitCode: exitCode,
+		Output:   output,
+		Err:      runErr,
 	}
 }
 
 // classifyInstallFailure maps a WinGet exit code (and, as a fallback, its
-// captured output text) to an InstallFailureKind. Keyed off documented
-// installer not-found / launch codes, with an English substring fallback for
+// captured output text) to an InstallFailureKind. Keyed off the documented
+// installer-launch codes, with a tight English substring fallback for
 // unrecognised builds.
 func classifyInstallFailure(exitCode int, output string) InstallFailureKind {
 	if exitCode == 0 {
@@ -126,10 +180,7 @@ func classifyInstallFailure(exitCode int, output string) InstallFailureKind {
 	}
 
 	switch uint32(exitCode) {
-	case wingetErrFileNotFound,
-		wingetErrInstallFailed,
-		wingetErrHashMismatch,
-		wingetErrMissingFromPath:
+	case wingetErrFileNotFound, wingetErrShellExecFailed:
 		return InstallLaunchFailed
 	}
 
