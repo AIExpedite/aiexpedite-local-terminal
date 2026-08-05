@@ -44,19 +44,19 @@ func performInstall(spec DependencySpec) installOutcome {
 		return installOutcome{
 			Kind:   InstallExecFailed,
 			Err:    fmt.Errorf("%s not found on PATH: %w", binary, err),
-			Stderr: fmt.Sprintf("No supported package manager (%s) is available to install %s automatically.", binary, spec.DisplayName),
+			Output: fmt.Sprintf("No supported package manager (%s) is available to install %s automatically.", binary, spec.DisplayName),
 		}
 	}
 
 	fmt.Printf("\n→ Installing %s via %s...\n\n", spec.DisplayName, binary)
 
 	cmd := exec.Command(cmdName, args...)
-	var stderrBuf bytes.Buffer
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+	var outBuf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &outBuf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &outBuf)
 
 	runErr := cmd.Run()
-	stderr := stderrBuf.String()
+	output := outBuf.String()
 
 	if runErr == nil {
 		if spec.VerifyCommand == "" {
@@ -67,7 +67,7 @@ func performInstall(spec DependencySpec) installOutcome {
 		}
 		return installOutcome{
 			Kind:   InstallOther,
-			Stderr: fmt.Sprintf("%s installed but %q is not on PATH.", spec.DisplayName, spec.VerifyCommand),
+			Output: fmt.Sprintf("%s installed but %q is not on PATH.", spec.DisplayName, spec.VerifyCommand),
 		}
 	}
 
@@ -76,14 +76,14 @@ func performInstall(spec DependencySpec) installOutcome {
 		return installOutcome{
 			Kind:     InstallOther,
 			ExitCode: exitErr.ExitCode(),
-			Stderr:   stderr,
+			Output:   output,
 			Err:      runErr,
 		}
 	}
 
 	return installOutcome{
 		Kind:   InstallExecFailed,
-		Stderr: stderr,
+		Output: output,
 		Err:    runErr,
 	}
 }

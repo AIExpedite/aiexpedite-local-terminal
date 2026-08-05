@@ -62,7 +62,7 @@ func performInstall(spec DependencySpec) installOutcome {
 		return installOutcome{
 			Kind:   InstallExecFailed,
 			Err:    fmt.Errorf("winget not found on PATH: %w", err),
-			Stderr: "Windows Package Manager (winget) is not installed or not on PATH.",
+			Output: "Windows Package Manager (winget) is not installed or not on PATH.",
 		}
 	}
 
@@ -76,37 +76,34 @@ func performInstall(spec DependencySpec) installOutcome {
 		"--accept-source-agreements",
 		"--disable-interactivity")
 
-	// Tee stderr so the user still sees progress in real time AND we retain a
-	// copy for classification / the audit log.
-	var stderrBuf bytes.Buffer
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+	// Tee both streams so the user still sees progress in real time AND we
+	// retain a copy for classification / the audit log. WinGet writes most of
+	// its output — including error text — to stdout, so classification must
+	// consider both streams, not stderr alone.
+	var outBuf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &outBuf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &outBuf)
 
 	runErr := cmd.Run()
-	stderr := stderrBuf.String()
+	output := outBuf.String()
 
-	// A clean exit still needs a PATH re-check: WinGet occasionally reports
-	// success before the shim is visible, and we'd rather report the truth.
+	// Trust WinGet's exit status: a clean exit means the install succeeded.
+	// We deliberately do NOT re-probe PATH here — a freshly-installed binary
+	// won't appear on this process's (already-captured) PATH until a restart,
+	// so a LookPath check would spuriously report a successful install as a
+	// failure. Callers re-detect the tool on the next launch.
 	if runErr == nil {
-		if spec.VerifyCommand == "" || isCommandAvailable(spec.VerifyCommand) {
-			return installOutcome{Kind: InstallOK}
-		}
-		// Installed per WinGet but not yet on PATH — treat as launch/other so
-		// the user is guided (a shell restart usually fixes it).
-		return installOutcome{
-			Kind:   InstallOther,
-			Stderr: fmt.Sprintf("%s installed but %q is not yet on PATH (a terminal restart may be required).", spec.DisplayName, spec.VerifyCommand),
-		}
+		return installOutcome{Kind: InstallOK}
 	}
 
-	// The process ran but exited non-zero → classify by exit code + stderr.
+	// The process ran but exited non-zero → classify by exit code + output.
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) {
 		code := exitErr.ExitCode()
 		return installOutcome{
-			Kind:     classifyInstallFailure(code, stderr),
+			Kind:     classifyInstallFailure(code, output),
 			ExitCode: code,
-			Stderr:   stderr,
+			Output:   output,
 			Err:      runErr,
 		}
 	}
@@ -114,16 +111,16 @@ func performInstall(spec DependencySpec) installOutcome {
 	// Couldn't start the process at all (spawn error) → exec failure.
 	return installOutcome{
 		Kind:   InstallExecFailed,
-		Stderr: stderr,
+		Output: output,
 		Err:    runErr,
 	}
 }
 
 // classifyInstallFailure maps a WinGet exit code (and, as a fallback, its
-// stderr text) to an InstallFailureKind. Keyed off documented installer
-// not-found / launch codes, with an English substring fallback for
+// captured output text) to an InstallFailureKind. Keyed off documented
+// installer not-found / launch codes, with an English substring fallback for
 // unrecognised builds.
-func classifyInstallFailure(exitCode int, stderr string) InstallFailureKind {
+func classifyInstallFailure(exitCode int, output string) InstallFailureKind {
 	if exitCode == 0 {
 		return InstallOK
 	}
@@ -136,7 +133,7 @@ func classifyInstallFailure(exitCode int, stderr string) InstallFailureKind {
 		return InstallLaunchFailed
 	}
 
-	lower := strings.ToLower(stderr)
+	lower := strings.ToLower(output)
 	for _, sub := range launchFailureSubstrings {
 		if strings.Contains(lower, sub) {
 			return InstallLaunchFailed
@@ -144,10 +141,4 @@ func classifyInstallFailure(exitCode int, stderr string) InstallFailureKind {
 	}
 
 	return InstallOther
-}
-
-// isCommandAvailable reports whether name resolves on PATH.
-func isCommandAvailable(name string) bool {
-	_, err := exec.LookPath(name)
-	return err == nil
 }

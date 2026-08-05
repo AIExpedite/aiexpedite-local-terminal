@@ -9,6 +9,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 )
@@ -43,9 +44,9 @@ func ensureGit() {
 	switch err := runDependencyInstall(gitDependencySpec()); {
 	case err == nil:
 		fmt.Printf("%s✓ Git installed successfully%s\n", colorGreen, colorReset)
-	case err == errInstallDeclined:
+	case errors.Is(err, errInstallDeclined):
 		fmt.Printf("%s[setup] Git install skipped — some workflows that need Git may not work until it's installed.%s\n", colorYellow, colorReset)
-	case err == errInstallManual:
+	case errors.Is(err, errInstallManual):
 		fmt.Printf("%s[setup] Opened the Git download page for manual installation.%s\n", colorYellow, colorReset)
 	default:
 		fmt.Printf("%s[setup] Git could not be installed automatically: %v%s\n", colorYellow, err, colorReset)

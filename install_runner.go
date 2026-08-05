@@ -92,7 +92,7 @@ const (
 type installOutcome struct {
 	Kind     InstallFailureKind
 	ExitCode int    // package-manager exit code (0 when not applicable)
-	Stderr   string // captured stderr / diagnostic text (may be truncated)
+	Output   string // captured package-manager output for diagnostics
 	Err      error  // underlying Go error, if any
 }
 
@@ -152,7 +152,7 @@ func runDependencyInstall(spec DependencySpec) error {
 			"reason", installFailureReason(outcome.Kind),
 			"exit_code", outcome.ExitCode,
 			"error", errString(outcome.Err),
-			"stderr", truncateDiagnostic(outcome.Stderr, 500),
+			"output", truncateDiagnostic(outcome.Output, 500),
 			"attempt", attempt)
 
 		// Recovery sub-loop: stays open across "view troubleshooting" so the
@@ -266,7 +266,7 @@ func installDiagnosticsSummary(spec DependencySpec, o installOutcome) string {
 	if o.Err != nil {
 		fmt.Fprintf(&b, "Error: %s\n", o.Err.Error())
 	}
-	if snippet := truncateDiagnostic(o.Stderr, 300); snippet != "" {
+	if snippet := truncateDiagnostic(o.Output, 300); snippet != "" {
 		fmt.Fprintf(&b, "Details: %s", snippet)
 	}
 	return strings.TrimRight(b.String(), "\n")

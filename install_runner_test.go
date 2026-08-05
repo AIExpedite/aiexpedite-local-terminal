@@ -192,7 +192,7 @@ func TestRunDependencyInstall_LogsDiagnosticsOnFailure(t *testing.T) {
 
 	installPrompt = func(string, string) InstallChoice { return InstallYes }
 	installExec = func(DependencySpec) installOutcome {
-		return installOutcome{Kind: InstallLaunchFailed, ExitCode: 42, Stderr: "installer file not found"}
+		return installOutcome{Kind: InstallLaunchFailed, ExitCode: 42, Output: "installer file not found"}
 	}
 	installRecovery = func(string, string, string, bool) InstallRecoveryChoice { return RecoveryExit }
 
@@ -213,7 +213,7 @@ func TestRunDependencyInstall_LogsDiagnosticsOnFailure(t *testing.T) {
 
 func TestInstallDiagnosticsSummary_Truncates(t *testing.T) {
 	long := strings.Repeat("x", 1000)
-	out := installDiagnosticsSummary(testSpec(), installOutcome{Kind: InstallOther, ExitCode: 5, Stderr: long})
+	out := installDiagnosticsSummary(testSpec(), installOutcome{Kind: InstallOther, ExitCode: 5, Output: long})
 	if !strings.Contains(out, "Git.Git") {
 		t.Errorf("summary should include package id: %q", out)
 	}
