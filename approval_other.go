@@ -355,11 +355,13 @@ func showLinuxInstallPrompt(title, message string) InstallChoice {
 			"--cancel-label=Exit",
 			"--extra-button=Open Download Page",
 			"--width=500").Output()
-		if err == nil {
-			return InstallYes
-		}
+		// The extra button writes its label to stdout and may still exit 0, so
+		// check the label before treating a successful exit as the OK button.
 		if strings.TrimSpace(string(out)) == "Open Download Page" {
 			return InstallManual
+		}
+		if err == nil {
+			return InstallYes
 		}
 		return InstallNo
 	}
@@ -400,21 +402,23 @@ func showLinuxInstallRecovery(title, message string, allowRetry bool) InstallRec
 		zargs = append(zargs, "--extra-button=Troubleshooting")
 
 		out, err := exec.Command("zenity", zargs...).Output()
-		if err == nil {
-			// OK button.
-			if allowRetry {
-				return RecoveryRetry
-			}
-			return RecoveryManual
-		}
+		// An --extra-button selection writes its label to stdout and may still
+		// exit 0, so inspect the label before treating a successful exit as the
+		// OK button; otherwise extra buttons get misread as Retry/Manual.
 		switch strings.TrimSpace(string(out)) {
 		case "Install Manually":
 			return RecoveryManual
 		case "Troubleshooting":
 			return RecoveryTroubleshoot
-		default:
-			return RecoveryExit // cancel/skip
 		}
+		if err == nil {
+			// OK button (no extra-button label on stdout).
+			if allowRetry {
+				return RecoveryRetry
+			}
+			return RecoveryManual
+		}
+		return RecoveryExit // cancel/skip
 	}
 	if _, err := exec.LookPath("kdialog"); err == nil {
 		// kdialog yesnocancel is only 3 outcomes; map to the three most
