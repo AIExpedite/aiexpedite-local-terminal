@@ -40,6 +40,8 @@ const (
 	FindingBlocker = "blocker"
 )
 
+const ReadinessActionKindSoftwareUpdate = "software_update"
+
 // Product-defined readiness thresholds (GB / cores). Not user-configurable at
 // launch. A machine below the "blocker" disk floor cannot safely clone/build;
 // below the "underpowered" RAM/CPU floor dev work will thrash.
@@ -150,7 +152,7 @@ func evaluateReadiness(info *MachineInfo) ReadinessReport {
 	}
 	softwareAction := func(code, label, instruction, manualInstruction string) *ReadinessAction {
 		return &ReadinessAction{
-			ID: code, FindingCode: code, Kind: "software_update", Label: label,
+			ID: code, FindingCode: code, Kind: ReadinessActionKindSoftwareUpdate, Label: label,
 			Instruction: instruction, ManualInstruction: manualInstruction, RequiresUserAction: true,
 		}
 	}

@@ -42,6 +42,13 @@ func findAction(actions []ReadinessAction, code string) *ReadinessAction {
 	return nil
 }
 
+func requireNoReadinessActions(t *testing.T, report ReadinessReport) {
+	t.Helper()
+	if report.Actions == nil || len(report.Actions) != 0 {
+		t.Fatalf("expected a non-nil empty actions array, got %+v", report.Actions)
+	}
+}
+
 func TestEvaluateReadiness_ReadyMachine(t *testing.T) {
 	report := evaluateReadiness(healthyMachine())
 	if report.State != ReadinessReady {
@@ -50,9 +57,7 @@ func TestEvaluateReadiness_ReadyMachine(t *testing.T) {
 	if len(report.Findings) != 0 {
 		t.Fatalf("expected no findings for a healthy machine, got %+v", report.Findings)
 	}
-	if report.Actions == nil || len(report.Actions) != 0 {
-		t.Fatalf("expected a non-nil empty actions array, got %+v", report.Actions)
-	}
+	requireNoReadinessActions(t, report)
 	if report.Specs == nil {
 		t.Fatalf("readiness report should carry the specs for progressive disclosure")
 	}
@@ -66,6 +71,7 @@ func TestEvaluateReadiness_NilMachineIsBlocked(t *testing.T) {
 	if findFinding(report.Findings, "inspection_failed") == nil {
 		t.Fatalf("expected an inspection_failed finding")
 	}
+	requireNoReadinessActions(t, report)
 }
 
 func TestEvaluateReadiness_MissingToolsNeedsSetup(t *testing.T) {
@@ -87,12 +93,17 @@ func TestEvaluateReadiness_MissingToolsNeedsSetup(t *testing.T) {
 			t.Fatalf("expected %s to be a warning, got %s", code, f.Severity)
 		}
 		a := findAction(report.Actions, code)
-		if a == nil || a.ID != code || a.Kind != "software_update" || !a.RequiresUserAction {
+		if a == nil || a.ID != code || a.Kind != ReadinessActionKindSoftwareUpdate || !a.RequiresUserAction {
 			t.Fatalf("expected a paired software action for %s, got %+v", code, a)
 		}
 	}
 	if len(report.Actions) != 3 {
 		t.Fatalf("expected exactly three ordered software actions, got %+v", report.Actions)
+	}
+	for i, code := range []string{"missing_git", "missing_node", "missing_codex"} {
+		if report.Actions[i].ID != code {
+			t.Fatalf("expected action %d to be %s, got %+v", i, code, report.Actions)
+		}
 	}
 }
 
@@ -149,9 +160,7 @@ func TestEvaluateReadiness_LowRAMIsUnderpowered(t *testing.T) {
 	if f == nil || f.Severity != FindingBlocker {
 		t.Fatalf("expected a blocker low_memory finding, got %+v", f)
 	}
-	if len(report.Actions) != 0 {
-		t.Fatalf("hardware limitations must not create software actions: %+v", report.Actions)
-	}
+	requireNoReadinessActions(t, report)
 }
 
 func TestEvaluateReadiness_LowDiskIsBlocked(t *testing.T) {
@@ -166,6 +175,21 @@ func TestEvaluateReadiness_LowDiskIsBlocked(t *testing.T) {
 	if f == nil || f.Severity != FindingBlocker {
 		t.Fatalf("expected a blocker low_disk finding, got %+v", f)
 	}
+	requireNoReadinessActions(t, report)
+}
+
+func TestEvaluateReadiness_LowCPUIsUnderpoweredWithoutActions(t *testing.T) {
+	m := healthyMachine()
+	m.CPU = &cpuInfo{Cores: 1, Threads: 1}
+
+	report := evaluateReadiness(m)
+	if report.State != ReadinessUnderpower {
+		t.Fatalf("expected underpowered for one CPU core, got %s", report.State)
+	}
+	if f := findFinding(report.Findings, "low_cpu"); f == nil || f.Severity != FindingBlocker {
+		t.Fatalf("expected a blocker low_cpu finding, got %+v", f)
+	}
+	requireNoReadinessActions(t, report)
 }
 
 func TestEvaluateReadiness_BlockedBeatsUnderpowered(t *testing.T) {
@@ -196,6 +220,7 @@ func TestEvaluateReadiness_LowDiskWarningOnly(t *testing.T) {
 	if f == nil || f.Severity != FindingWarning {
 		t.Fatalf("expected a warning low_disk finding, got %+v", f)
 	}
+	requireNoReadinessActions(t, report)
 }
 
 func TestEvaluateReadiness_LowRAMWarningOnly(t *testing.T) {
@@ -212,6 +237,7 @@ func TestEvaluateReadiness_LowRAMWarningOnly(t *testing.T) {
 	if f == nil || f.Severity != FindingWarning {
 		t.Fatalf("expected a warning low_memory finding, got %+v", f)
 	}
+	requireNoReadinessActions(t, report)
 }
 
 func TestEvaluateReadiness_Nominal16GBReportsAs15xIsReady(t *testing.T) {
