@@ -292,6 +292,27 @@ func TestTailWriter_BoundsAndKeepsTail(t *testing.T) {
 	}
 }
 
+// Finding 3: tailWriter is teed into a command's stdout and stderr, which
+// os/exec copies on separate goroutines — so writes must be race-free. Run
+// under `go test -race` to catch regressions.
+func TestTailWriter_ConcurrentWrites(t *testing.T) {
+	w := newTailWriter(64)
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				_, _ = w.Write([]byte("abcdefghij"))
+			}
+		}()
+	}
+	wg.Wait()
+	if got := w.String(); len(got) > 64+len("…") {
+		t.Fatalf("buffer must stay bounded under concurrent writes, got %d chars", len(got))
+	}
+}
+
 // Finding 5: prompts must name the package manager that actually runs per OS.
 func TestPackageManagerLabel(t *testing.T) {
 	cases := map[string]string{

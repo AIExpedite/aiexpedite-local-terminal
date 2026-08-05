@@ -60,6 +60,14 @@ var launchFailureSubstrings = []string{
 	"shellexecute",
 }
 
+// installAttempt records the result of one package-manager attempt so that,
+// when every manager fails, diagnostics can report each one (which ran and
+// why it failed) rather than only the first.
+type installAttempt struct {
+	manager string
+	outcome installOutcome
+}
+
 // performInstall installs the dependency via WinGet, falling back to Scoop
 // when the spec configures it (e.g. ttyd). Output streams to the console
 // (preserving the setup UX) while a bounded tail is captured for diagnostics
@@ -67,54 +75,41 @@ var launchFailureSubstrings = []string{
 func performInstall(spec DependencySpec) installOutcome {
 	showConsoleWindow(true)
 
-	// detected reports whether the tool is now installed. When the spec
-	// provides an in-process detector (e.g. ttyd, which the app uses
-	// immediately), its result is authoritative and it may augment PATH.
-	// Otherwise we trust the manager's clean exit — fine for tools only needed
-	// after a restart (e.g. Git): a freshly-installed binary won't appear on
-	// this process's already-captured PATH, so re-probing would spuriously
-	// report success as failure.
-	detected := func(exitOK bool) bool {
-		if spec.PostInstall != nil {
-			return spec.PostInstall()
-		}
-		return exitOK
-	}
+	var attempts []installAttempt
 
-	var failure installOutcome
-	haveFailure, triedManager := false, false
+	// tryManager runs one manager and returns true on success. On failure it
+	// appends the attempt's outcome to attempts.
+	tryManager := func(manager string, args []string) bool {
+		exitOK, out, code, runErr := runInstallManager(spec.DisplayName, manager, args)
+		oc, ok := attemptOutcome(spec, manager, exitOK, out, code, runErr)
+		if ok {
+			return true
+		}
+		attempts = append(attempts, installAttempt{manager, oc})
+		return false
+	}
 
 	// 1) WinGet (primary).
 	if _, err := exec.LookPath("winget"); err == nil {
-		triedManager = true
-		exitOK, out, code, runErr := runInstallManager(spec.DisplayName, "winget", []string{
+		if tryManager("winget", []string{
 			"install", "-e", "--id", spec.WingetID,
 			"--accept-package-agreements", "--accept-source-agreements",
 			"--disable-interactivity",
-		})
-		if detected(exitOK) {
+		}) {
 			return installOutcome{Kind: InstallOK}
 		}
-		failure, haveFailure = classifyRun(code, out, runErr), true
 	}
 
 	// 2) Scoop (optional Windows fallback, e.g. ttyd).
 	if spec.ScoopID != "" {
 		if _, err := exec.LookPath("scoop"); err == nil {
-			triedManager = true
-			exitOK, out, code, runErr := runInstallManager(spec.DisplayName, "scoop", []string{"install", spec.ScoopID})
-			if detected(exitOK) {
+			if tryManager("scoop", []string{"install", spec.ScoopID}) {
 				return installOutcome{Kind: InstallOK}
-			}
-			// Prefer WinGet's classification when we have one (its output names
-			// the installer-launch problem); otherwise use Scoop's.
-			if !haveFailure {
-				failure, haveFailure = classifyRun(code, out, runErr), true
 			}
 		}
 	}
 
-	if !triedManager {
+	if len(attempts) == 0 {
 		managers := "winget"
 		if spec.ScoopID != "" {
 			managers = "winget/scoop"
@@ -124,7 +119,69 @@ func performInstall(spec DependencySpec) installOutcome {
 			Output: fmt.Sprintf("No supported package manager (%s) is available to install %s.", managers, spec.DisplayName),
 		}
 	}
-	return failure
+	return aggregateFailures(attempts)
+}
+
+// attemptOutcome interprets a single manager run. It returns (outcome, success).
+// success is true when the tool is now considered installed — which, when the
+// spec provides an in-process detector (e.g. ttyd), is decided by PostInstall
+// (it may also augment PATH) rather than the exit code; otherwise a clean exit
+// is trusted (fine for tools only needed after a restart, e.g. Git).
+//
+// A clean exit with a FAILED PostInstall check is NOT success: the manager
+// reported success but the tool isn't usable/visible, so we return an explicit
+// InstallOther verification-failure outcome instead of leaking a zero exit
+// code through classifyRun (which would look like InstallOK).
+func attemptOutcome(spec DependencySpec, manager string, exitOK bool, out string, code int, runErr error) (installOutcome, bool) {
+	detected := exitOK
+	if spec.PostInstall != nil {
+		detected = spec.PostInstall()
+	}
+	if detected {
+		return installOutcome{Kind: InstallOK}, true
+	}
+	if exitOK {
+		return installOutcome{
+			Kind: InstallOther,
+			Output: fmt.Sprintf("%s reported success but %s could not be verified on PATH.\n%s",
+				manager, spec.DisplayName, out),
+		}, false
+	}
+	return classifyRun(code, out, runErr), false
+}
+
+// aggregateFailures combines every attempted manager's failure into one
+// outcome. For the user-facing classification it prefers a launch failure (the
+// most actionable), else the first attempt. The Output aggregates each
+// manager's reason/exit/tail so the audit trail shows the fallback ran too.
+func aggregateFailures(attempts []installAttempt) installOutcome {
+	if len(attempts) == 1 {
+		return attempts[0].outcome
+	}
+
+	chosen := attempts[0].outcome
+	for _, a := range attempts {
+		if a.outcome.Kind == InstallLaunchFailed {
+			chosen = a.outcome
+			break
+		}
+	}
+
+	var b strings.Builder
+	for i, a := range attempts {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "[%s] %s", a.manager, installFailureReason(a.outcome.Kind))
+		if a.outcome.ExitCode != 0 {
+			fmt.Fprintf(&b, " (exit 0x%X)", uint32(a.outcome.ExitCode))
+		}
+		if snippet := truncateDiagnostic(a.outcome.Output, 300); snippet != "" {
+			fmt.Fprintf(&b, ": %s", snippet)
+		}
+	}
+	chosen.Output = b.String()
+	return chosen
 }
 
 // runInstallManager runs a package-manager command, streaming its output live

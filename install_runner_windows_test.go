@@ -6,7 +6,10 @@
 // Tests for WinGet install-failure classification.
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // asExit reinterprets a WinGet HRESULT-style uint32 as the signed int Go's
 // exec ExitCode() would report (a runtime conversion — a constant one would
@@ -66,5 +69,65 @@ func TestClassifyInstallFailure(t *testing.T) {
 func TestClassifyInstallFailure_CaseInsensitiveOutput(t *testing.T) {
 	if got := classifyInstallFailure(1, "CANNOT FIND THE FILE on disk"); got != InstallLaunchFailed {
 		t.Errorf("expected case-insensitive output match, got %v", got)
+	}
+}
+
+// Finding 1: a clean manager exit with a FAILED PostInstall check must NOT be
+// treated as success — it becomes an explicit InstallOther verification error.
+func TestAttemptOutcome_ExitZeroButVerificationFails(t *testing.T) {
+	spec := DependencySpec{DisplayName: "ttyd", PostInstall: func() bool { return false }}
+	oc, ok := attemptOutcome(spec, "winget", true /*exitOK*/, "winget: Successfully installed", 0, nil)
+	if ok {
+		t.Fatal("exit-zero with failed PostInstall must not be reported as success")
+	}
+	if oc.Kind != InstallOther {
+		t.Fatalf("want InstallOther verification failure, got %v", oc.Kind)
+	}
+	if !strings.Contains(oc.Output, "could not be verified") {
+		t.Errorf("expected a verification-failure diagnostic, got %q", oc.Output)
+	}
+}
+
+func TestAttemptOutcome_PostInstallDetectsSuccessDespiteNonZeroExit(t *testing.T) {
+	// ttyd pattern: manager exit is ignored; PostInstall (PATH probe) is truth.
+	spec := DependencySpec{DisplayName: "ttyd", PostInstall: func() bool { return true }}
+	if _, ok := attemptOutcome(spec, "scoop", false /*exitOK*/, "", 1, nil); !ok {
+		t.Fatal("PostInstall true should report success regardless of exit code")
+	}
+}
+
+func TestAttemptOutcome_NoDetectorTrustsExitZero(t *testing.T) {
+	spec := DependencySpec{DisplayName: "Git"} // no PostInstall
+	if _, ok := attemptOutcome(spec, "winget", true, "", 0, nil); !ok {
+		t.Fatal("no detector + clean exit should be success")
+	}
+	if oc, ok := attemptOutcome(spec, "winget", false, "boom", asExit(0x8A150006), nil); ok || oc.Kind != InstallLaunchFailed {
+		t.Fatalf("no detector + shellexec failure should classify as launch failure, got %v ok=%v", oc.Kind, ok)
+	}
+}
+
+// Finding 4: when both managers fail, diagnostics aggregate BOTH attempts and
+// the user-facing classification prefers the launch failure.
+func TestAggregateFailures_CombinesBothManagers(t *testing.T) {
+	attempts := []installAttempt{
+		{"winget", installOutcome{Kind: InstallOther, ExitCode: 3, Output: "winget network error"}},
+		{"scoop", installOutcome{Kind: InstallLaunchFailed, ExitCode: asExit(0x8A150006), Output: "scoop shellexec failed"}},
+	}
+	got := aggregateFailures(attempts)
+	if got.Kind != InstallLaunchFailed {
+		t.Errorf("expected the launch-failure classification to win, got %v", got.Kind)
+	}
+	for _, want := range []string{"[winget]", "winget network error", "[scoop]", "scoop shellexec failed"} {
+		if !strings.Contains(got.Output, want) {
+			t.Errorf("aggregated diagnostics missing %q; got:\n%s", want, got.Output)
+		}
+	}
+}
+
+func TestAggregateFailures_SingleManagerUnchanged(t *testing.T) {
+	only := installOutcome{Kind: InstallLaunchFailed, ExitCode: 7, Output: "raw winget tail"}
+	got := aggregateFailures([]installAttempt{{"winget", only}})
+	if got.Output != "raw winget tail" {
+		t.Errorf("single-manager output should be untouched, got %q", got.Output)
 	}
 }

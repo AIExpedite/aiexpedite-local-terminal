@@ -50,7 +50,10 @@ func ensureGit() {
 	case errors.Is(err, errInstallDeclined):
 		fmt.Printf("%s[setup] Git install skipped — some workflows that need Git may not work until it's installed.%s\n", colorYellow, colorReset)
 	case errors.Is(err, errInstallManual):
-		fmt.Printf("%s[setup] Opened the Git download page for manual installation.%s\n", colorYellow, colorReset)
+		// The runner surfaces the download link either via the browser or, if
+		// that can't be launched, a copyable-link dialog — so avoid claiming
+		// the browser specifically opened.
+		fmt.Printf("%s[setup] Follow the on-screen instructions to install Git manually, then restart.%s\n", colorYellow, colorReset)
 	default:
 		fmt.Printf("%s[setup] Git could not be installed automatically: %v%s\n", colorYellow, err, colorReset)
 	}

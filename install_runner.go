@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // maxInstallRetries bounds how many times the recovery dialog will offer an
@@ -145,6 +146,10 @@ func runDependencyInstall(spec DependencySpec) error {
 			"component", spec.DisplayName, "at", "prompt")
 		return errInstallDeclined
 	case InstallManual:
+		// The user chose to install manually and exit. presentRecoveryURL
+		// surfaces the link either way (browser, or a copyable-link dialog if
+		// the browser can't launch), so callers must not claim the browser
+		// specifically opened — errInstallManual means "deferred to manual".
 		presentRecoveryURL(spec, spec.ManualURL, "manual_from_prompt")
 		return errInstallManual
 	case InstallYes:
@@ -339,7 +344,12 @@ func packageManagerLabel(goos string) string {
 // written to it, bounding memory even when a manager emits verbose output
 // (e.g. progress bars). Combined with truncateDiagnostic's tail-keeping, the
 // actionable trailing error is preserved without unbounded growth.
+//
+// It is safe for concurrent writes: os/exec copies a command's stdout and
+// stderr on separate goroutines when they are distinct writers, so a single
+// tailWriter teed into both streams would otherwise be written concurrently.
 type tailWriter struct {
+	mu        sync.Mutex
 	buf       []byte
 	maxBytes  int
 	truncated bool
@@ -348,6 +358,8 @@ type tailWriter struct {
 func newTailWriter(maxBytes int) *tailWriter { return &tailWriter{maxBytes: maxBytes} }
 
 func (w *tailWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.buf = append(w.buf, p...)
 	if len(w.buf) > w.maxBytes {
 		w.buf = w.buf[len(w.buf)-w.maxBytes:]
@@ -357,6 +369,8 @@ func (w *tailWriter) Write(p []byte) (int, error) {
 }
 
 func (w *tailWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.truncated {
 		return "…" + string(w.buf)
 	}
