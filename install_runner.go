@@ -202,13 +202,13 @@ func installGaveUp(spec DependencySpec, o installOutcome) error {
 // openRecoveryURL opens a recovery URL in the browser and records whether the
 // launch itself failed — a failed "manual install" / "troubleshoot" click is
 // otherwise silently dropped and looks like the button did nothing.
-func openRecoveryURL(spec DependencySpec, url, context string) {
+func openRecoveryURL(spec DependencySpec, url, purpose string) {
 	if url == "" {
 		return
 	}
 	if err := installOpenURL(url); err != nil {
 		LogSecurityEvent(SecEvtInstallFailed, "could not open recovery URL",
-			"component", spec.DisplayName, "context", context,
+			"component", spec.DisplayName, "purpose", purpose,
 			"url", url, "error", err.Error())
 	}
 }
