@@ -58,6 +58,16 @@ const (
 	// shows when normal posture was restored.
 	SecEvtAllowAllEnabled  SecurityEvent = "allow_all_commands_enabled"
 	SecEvtAllowAllDisabled SecurityEvent = "allow_all_commands_disabled"
+
+	// SecEvtInstall* record the workstation-setup dependency install flow
+	// (e.g. installing Git via WinGet). These aren't security decisions per
+	// se, but the audit log is the one durable support artifact, so install
+	// attempts/outcomes and their diagnostics land here for troubleshooting
+	// rather than in a separate file.
+	SecEvtInstallStarted   SecurityEvent = "install_started"
+	SecEvtInstallSucceeded SecurityEvent = "install_succeeded"
+	SecEvtInstallFailed    SecurityEvent = "install_failed"
+	SecEvtInstallDeclined  SecurityEvent = "install_declined"
 )
 
 var (

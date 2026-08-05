@@ -223,6 +223,10 @@ func StartAgent(cfg *Config) {
 		return
 	}
 
+	// Git is a warning-level dependency (see readiness.go): offer to install it
+	// with guided recovery, but never block startup on a decline or failure.
+	ensureGit()
+
 	if useTmux {
 		if err := startTmuxSession(); err != nil {
 			fmt.Println("Fatal:", err)

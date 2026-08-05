@@ -141,6 +141,28 @@ func ShowInstallPrompt(component, description string) InstallChoice {
 	return consoleInstallPrompt(title, message)
 }
 
+// ---------------------------------------------------------------------------
+// Install recovery dialog (Retry / Manual / Troubleshoot / Exit)
+// ---------------------------------------------------------------------------
+
+// ShowInstallRecovery displays the guided recovery dialog after an install
+// attempt fails. Retry is only offered when allowRetry is true (the runner
+// caps automatic retries). The InstallRecoveryChoice enum is shared (defined
+// in install_runner.go). Mirrors the ShowInstallPrompt multi-choice pattern.
+func ShowInstallRecovery(component, explanation, diagnostics string, allowRetry bool) InstallRecoveryChoice {
+	title := "AI Expedite - Setup Problem"
+	message := fmt.Sprintf("%s could not be installed.\n\n%s\n\n%s",
+		component, explanation, diagnostics)
+
+	switch runtime.GOOS {
+	case "darwin":
+		return showOsascriptInstallRecovery(title, message, allowRetry)
+	case "linux":
+		return showLinuxInstallRecovery(title, message, allowRetry)
+	}
+	return consoleInstallRecovery(title, message, allowRetry)
+}
+
 // ===========================================================================
 // macOS (osascript) implementations
 // ===========================================================================
@@ -206,6 +228,35 @@ func showOsascriptInstallPrompt(title, message string) InstallChoice {
 		return InstallManual
 	default:
 		return InstallNo
+	}
+}
+
+func showOsascriptInstallRecovery(title, message string, allowRetry bool) InstallRecoveryChoice {
+	// macOS dialogs allow up to three buttons; Exit is reachable by dismissing
+	// (Escape), which osascript reports as an error.
+	buttons := `{"Install Manually", "Troubleshooting", "Retry"}`
+	defaultBtn := "Retry"
+	if !allowRetry {
+		buttons = `{"Skip", "Install Manually", "Troubleshooting"}`
+		defaultBtn = "Install Manually"
+	}
+	script := fmt.Sprintf(
+		`display dialog "%s" buttons %s default button "%s" with title "%s" with icon caution`,
+		escapeOsascript(message), buttons, defaultBtn, escapeOsascript(title))
+	out, err := exec.Command("osascript", "-e", script).Output()
+	if err != nil {
+		return RecoveryExit // dismissed / cancelled
+	}
+	result := string(out)
+	switch {
+	case allowRetry && strings.Contains(result, "Retry"):
+		return RecoveryRetry
+	case strings.Contains(result, "Install Manually"):
+		return RecoveryManual
+	case strings.Contains(result, "Troubleshooting"):
+		return RecoveryTroubleshoot
+	default:
+		return RecoveryExit
 	}
 }
 
@@ -329,6 +380,68 @@ func showLinuxInstallPrompt(title, message string) InstallChoice {
 	return consoleInstallPrompt(title, message)
 }
 
+func showLinuxInstallRecovery(title, message string, allowRetry bool) InstallRecoveryChoice {
+	if _, err := exec.LookPath("zenity"); err == nil {
+		okLabel := "Retry"
+		if !allowRetry {
+			okLabel = "Install Manually"
+		}
+		zargs := []string{
+			"--question",
+			"--title=" + title,
+			"--text=" + escapeZenityMarkup(message),
+			"--ok-label=" + okLabel,
+			"--cancel-label=Skip",
+			"--width=520",
+		}
+		if allowRetry {
+			zargs = append(zargs, "--extra-button=Install Manually")
+		}
+		zargs = append(zargs, "--extra-button=Troubleshooting")
+
+		out, err := exec.Command("zenity", zargs...).Output()
+		if err == nil {
+			// OK button.
+			if allowRetry {
+				return RecoveryRetry
+			}
+			return RecoveryManual
+		}
+		switch strings.TrimSpace(string(out)) {
+		case "Install Manually":
+			return RecoveryManual
+		case "Troubleshooting":
+			return RecoveryTroubleshoot
+		default:
+			return RecoveryExit // cancel/skip
+		}
+	}
+	if _, err := exec.LookPath("kdialog"); err == nil {
+		// kdialog yesnocancel is only 3 outcomes; map to the three most
+		// actionable choices and reach troubleshooting via the console path.
+		yes := "Retry"
+		if !allowRetry {
+			yes = "Install Manually"
+		}
+		cmd := exec.Command("kdialog", "--title", title,
+			"--yesnocancel", message+fmt.Sprintf("\n\nYes = %s\nNo = Install Manually\nCancel = Skip", yes))
+		_ = cmd.Run()
+		if cmd.ProcessState != nil {
+			switch cmd.ProcessState.ExitCode() {
+			case 0:
+				if allowRetry {
+					return RecoveryRetry
+				}
+				return RecoveryManual
+			case 1:
+				return RecoveryManual
+			}
+		}
+		return RecoveryExit
+	}
+	return consoleInstallRecovery(title, message, allowRetry)
+}
+
 // ===========================================================================
 // Console fallbacks (when no GUI tool is available)
 // ===========================================================================
@@ -373,5 +486,34 @@ func consoleInstallPrompt(title, message string) InstallChoice {
 		return InstallManual
 	default:
 		return InstallNo
+	}
+}
+
+// consoleInstallRecovery maps a numeric choice to an InstallRecoveryChoice.
+// Retry (option 1) is only listed when allowRetry is true; otherwise the menu
+// starts at Install Manually.
+func consoleInstallRecovery(title, message string, allowRetry bool) InstallRecoveryChoice {
+	fmt.Printf("\n[%s]\n%s\n\n", title, message)
+	if allowRetry {
+		fmt.Println("  1) Retry the automatic install")
+	}
+	fmt.Println("  2) Install manually (open download page)")
+	fmt.Println("  3) View troubleshooting guidance")
+	fmt.Println("  4) Skip for now")
+	fmt.Print("\nChoice [1/2/3/4]: ")
+	reader := bufio.NewReader(os.Stdin)
+	input, _ := reader.ReadString('\n')
+	switch strings.TrimSpace(input) {
+	case "1":
+		if allowRetry {
+			return RecoveryRetry
+		}
+		return RecoveryExit
+	case "2":
+		return RecoveryManual
+	case "3":
+		return RecoveryTroubleshoot
+	default:
+		return RecoveryExit
 	}
 }
