@@ -51,17 +51,67 @@ func unixInstallPackage(spec DependencySpec) string {
 	return spec.VerifyCommand
 }
 
-// linuxInstallCommand builds the apt-get invocation for the given package,
-// choosing whether to elevate through sudo. A process already running as root
-// (euid 0) invokes apt-get directly: it has the privileges to install, and
-// minimal root environments (e.g. containers) may ship apt-get without a sudo
-// binary, so spawning sudo there would fail to launch and drop into recovery
-// even though the install could have succeeded.
-func linuxInstallCommand(pkg string, euid int) (string, []string) {
-	if euid == 0 {
-		return "apt-get", []string{"-y", "install", pkg}
+// linuxElevation describes the ambient conditions that decide how a Linux
+// install elevates. Kept as plain data so linuxInstallCommand stays a pure
+// function the tests can drive without touching the real process environment.
+type linuxElevation struct {
+	// EUID is the effective user id of this process.
+	EUID int
+	// HasTTY reports whether stdin is a character device, i.e. whether sudo
+	// would have a terminal on which to prompt for a password.
+	HasTTY bool
+	// HasGraphicalSession reports whether a desktop session is present
+	// (DISPLAY / WAYLAND_DISPLAY), which polkit's agent needs to show its
+	// authentication dialog.
+	HasGraphicalSession bool
+	// HasPkexec reports whether the pkexec binary resolves on PATH.
+	HasPkexec bool
+}
+
+// currentLinuxElevation samples the real process environment.
+func currentLinuxElevation() linuxElevation {
+	env := linuxElevation{
+		EUID:                os.Geteuid(),
+		HasGraphicalSession: os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != "",
 	}
-	return "sudo", []string{"apt-get", "-y", "install", pkg}
+	if fi, err := os.Stdin.Stat(); err == nil {
+		env.HasTTY = fi.Mode()&os.ModeCharDevice != 0
+	}
+	if _, err := exec.LookPath("pkexec"); err == nil {
+		env.HasPkexec = true
+	}
+	return env
+}
+
+// linuxInstallCommand builds the apt-get invocation for the given package,
+// choosing how (and whether) to elevate.
+//
+//   - Already root (euid 0): invoke apt-get directly. It has the privileges to
+//     install, and minimal root environments (e.g. containers) may ship apt-get
+//     without a sudo binary, so spawning sudo there would fail to launch and
+//     drop into recovery even though the install could have succeeded.
+//   - Non-root with no controlling terminal: prefer pkexec when a desktop
+//     session and the binary are both present. The agent normally starts from
+//     the XDG autostart entry, which sets Terminal=false (tray_linux.go), so
+//     sudo has neither a tty to prompt on nor an askpass helper — it would fail
+//     to authenticate and send every automatic install into recovery on any
+//     machine without cached credentials or a NOPASSWD rule. pkexec routes the
+//     prompt through the polkit agent, matching the GUI-first approach the
+//     zenity/kdialog dialogs already take on this platform.
+//   - Otherwise: sudo, which prompts on the terminal we do have. This is also
+//     the fallback when pkexec or the desktop session is missing, since sudo
+//     still succeeds under NOPASSWD or cached credentials and its failure text
+//     is captured into the recovery diagnostics either way.
+func linuxInstallCommand(pkg string, env linuxElevation) (string, []string) {
+	aptArgs := []string{"apt-get", "-y", "install", pkg}
+	switch {
+	case env.EUID == 0:
+		return "apt-get", []string{"-y", "install", pkg}
+	case !env.HasTTY && env.HasGraphicalSession && env.HasPkexec:
+		return "pkexec", aptArgs
+	default:
+		return "sudo", aptArgs
+	}
 }
 
 // performInstall attempts a package-manager install on macOS/Linux.
@@ -69,11 +119,9 @@ func performInstall(spec DependencySpec) installOutcome {
 	pkg := unixInstallPackage(spec)
 
 	// binary is the package manager that must exist on PATH; cmdName/args is what
-	// we actually spawn. On Linux apt-get normally needs sudo to elevate, but a
-	// process already running as root (e.g. a root container with apt-get but no
-	// sudo binary) has the privileges to install directly — spawning a missing
-	// sudo there would fail to launch and drop straight into recovery even though
-	// the install could have succeeded. So invoke apt-get directly when euid is 0.
+	// we actually spawn. On Linux apt-get normally needs elevation, and which
+	// launcher can actually authenticate depends on how the agent was started —
+	// see linuxInstallCommand for the root / pkexec / sudo selection.
 	var binary, cmdName string
 	var args []string
 	switch runtime.GOOS {
@@ -82,7 +130,7 @@ func performInstall(spec DependencySpec) installOutcome {
 		args = []string{"install", pkg}
 	default: // linux and other unix
 		binary = "apt-get"
-		cmdName, args = linuxInstallCommand(pkg, os.Geteuid())
+		cmdName, args = linuxInstallCommand(pkg, currentLinuxElevation())
 	}
 
 	// Verify both the package manager and the launcher we'll actually spawn

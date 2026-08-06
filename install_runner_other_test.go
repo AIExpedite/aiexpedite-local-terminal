@@ -48,27 +48,68 @@ func TestVerifyInstalledOnPath_AcceptsWorkingCommand(t *testing.T) {
 	t.Skip("no command with a working --version available to verify against")
 }
 
-// A process already running as root must invoke apt-get directly rather than
-// through sudo: a minimal root environment can have apt-get but no sudo binary,
-// and spawning the missing wrapper would fail to launch and drop into recovery
-// even though the install would have succeeded. Non-root keeps the sudo path.
-func TestLinuxInstallCommand_RootSkipsSudo(t *testing.T) {
-	cmd, args := linuxInstallCommand("git", 0)
-	if cmd != "apt-get" {
-		t.Errorf("root should invoke apt-get directly, got %q", cmd)
-	}
-	want := []string{"-y", "install", "git"}
-	if strings.Join(args, " ") != strings.Join(want, " ") {
-		t.Errorf("root args = %v, want %v", args, want)
+// Elevation selection has to cover three distinct environments: a root process
+// (no wrapper at all — a minimal root container can have apt-get but no sudo
+// binary, and spawning the missing wrapper would drop into recovery even though
+// the install would have succeeded); a non-root process with a terminal (sudo
+// can prompt); and a non-root process started from the XDG autostart entry,
+// which sets Terminal=false, so sudo has no tty and no askpass helper and
+// cannot authenticate — that one must route through pkexec's polkit agent.
+func TestLinuxInstallCommand_ElevationSelection(t *testing.T) {
+	tests := []struct {
+		name     string
+		env      linuxElevation
+		wantCmd  string
+		wantArgs []string
+	}{
+		{
+			name:     "root invokes apt-get directly",
+			env:      linuxElevation{EUID: 0, HasTTY: true},
+			wantCmd:  "apt-get",
+			wantArgs: []string{"-y", "install", "git"},
+		},
+		{
+			name:     "root without tty still skips any wrapper",
+			env:      linuxElevation{EUID: 0, HasGraphicalSession: true, HasPkexec: true},
+			wantCmd:  "apt-get",
+			wantArgs: []string{"-y", "install", "git"},
+		},
+		{
+			name:     "non-root with a terminal prompts via sudo",
+			env:      linuxElevation{EUID: 1000, HasTTY: true, HasGraphicalSession: true, HasPkexec: true},
+			wantCmd:  "sudo",
+			wantArgs: []string{"apt-get", "-y", "install", "git"},
+		},
+		{
+			name:     "autostart session without a tty elevates via pkexec",
+			env:      linuxElevation{EUID: 1000, HasGraphicalSession: true, HasPkexec: true},
+			wantCmd:  "pkexec",
+			wantArgs: []string{"apt-get", "-y", "install", "git"},
+		},
+		{
+			name:     "no tty and no pkexec falls back to sudo",
+			env:      linuxElevation{EUID: 1000, HasGraphicalSession: true},
+			wantCmd:  "sudo",
+			wantArgs: []string{"apt-get", "-y", "install", "git"},
+		},
+		{
+			name:     "no tty and no desktop session falls back to sudo",
+			env:      linuxElevation{EUID: 1000, HasPkexec: true},
+			wantCmd:  "sudo",
+			wantArgs: []string{"apt-get", "-y", "install", "git"},
+		},
 	}
 
-	cmd, args = linuxInstallCommand("git", 1000)
-	if cmd != "sudo" {
-		t.Errorf("non-root should elevate via sudo, got %q", cmd)
-	}
-	want = []string{"apt-get", "-y", "install", "git"}
-	if strings.Join(args, " ") != strings.Join(want, " ") {
-		t.Errorf("non-root args = %v, want %v", args, want)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd, args := linuxInstallCommand("git", tc.env)
+			if cmd != tc.wantCmd {
+				t.Errorf("launcher = %q, want %q", cmd, tc.wantCmd)
+			}
+			if strings.Join(args, " ") != strings.Join(tc.wantArgs, " ") {
+				t.Errorf("args = %v, want %v", args, tc.wantArgs)
+			}
+		})
 	}
 }
 
