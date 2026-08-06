@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -396,6 +397,12 @@ func freeConsole() {
 // exists. Reading the flag there would misreport that console as hidden and the
 // install's deferred restore would hide an originally-visible window.
 func consoleWindowVisible() bool {
+	consoleVisibilityMu.Lock()
+	defer consoleVisibilityMu.Unlock()
+	return consoleWindowVisibleLocked()
+}
+
+func consoleWindowVisibleLocked() bool {
 	hwnd := getConsoleWindow()
 	if hwnd == 0 {
 		return false
@@ -403,6 +410,17 @@ func consoleWindowVisible() bool {
 	ret, _, _ := procIsWindowVisible.Call(hwnd)
 	return ret != 0
 }
+
+// consoleVisibilityMu serializes every console visibility read/mutation so a
+// snapshot of the current state and the sequence claim that follows it can be
+// made atomic (see snapshotAndShowConsole). Without it there is a TOCTOU gap
+// between reading consoleWindowVisible() and claiming a sequence number, and a
+// concurrent showConsoleWindow(true) landing in that gap would receive an
+// *earlier* sequence than the installer — invisible to both the prior-visible
+// snapshot and the "changed since" check — so the deferred restore would hide a
+// console the tray legitimately requested (leaving it hidden behind a checked
+// "Show Console" menu item).
+var consoleVisibilityMu sync.Mutex
 
 // consoleVisibilitySeq counts every visibility request made through
 // showConsoleWindow. A caller that forces the console open for the duration of
@@ -420,6 +438,22 @@ func consoleVisibilityChangedSince(seq uint64) bool {
 	return consoleVisibilitySeq.Load() != seq
 }
 
+// snapshotAndShowConsole atomically captures whether the console is currently
+// visible and then issues a show request, returning the prior visibility and
+// the sequence number of that show request. Holding consoleVisibilityMu across
+// both steps closes the TOCTOU gap the installer's deferred restore depends on:
+// any concurrent showConsoleWindow request is now ordered either fully before
+// this call (and thus reflected in priorVisible) or fully after it (and thus
+// detectable via consoleVisibilityChangedSince), never interleaved between the
+// snapshot and the sequence claim.
+func snapshotAndShowConsole() (priorVisible bool, seq uint64) {
+	consoleVisibilityMu.Lock()
+	defer consoleVisibilityMu.Unlock()
+	priorVisible = consoleWindowVisibleLocked()
+	seq = showConsoleWindowSeqLocked(true)
+	return priorVisible, seq
+}
+
 // showConsoleWindow shows or hides the console window.
 // When built as a GUI app (-H=windowsgui), this allocates a console on-demand.
 func showConsoleWindow(show bool) { showConsoleWindowSeq(show) }
@@ -429,6 +463,14 @@ func showConsoleWindow(show bool) { showConsoleWindowSeq(show) }
 // recent one. The counter is bumped even when the request can't be carried out
 // (no console allocatable), so a stale snapshot never wins over a newer intent.
 func showConsoleWindowSeq(show bool) uint64 {
+	consoleVisibilityMu.Lock()
+	defer consoleVisibilityMu.Unlock()
+	return showConsoleWindowSeqLocked(show)
+}
+
+// showConsoleWindowSeqLocked is the body of showConsoleWindowSeq; callers must
+// already hold consoleVisibilityMu (e.g. snapshotAndShowConsole).
+func showConsoleWindowSeqLocked(show bool) uint64 {
 	seq := consoleVisibilitySeq.Add(1)
 	if show {
 		// Allocate console if we don't have one (GUI app mode)

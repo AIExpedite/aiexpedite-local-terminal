@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 // asExit reinterprets a WinGet HRESULT-style uint32 as the signed int Go's
@@ -184,6 +185,41 @@ func TestConsoleVisibilityChangedSince(t *testing.T) {
 	consoleVisibilitySeq.Add(1)
 	if !consoleVisibilityChangedSince(seq) {
 		t.Error("a later visibility request must invalidate the installer's snapshot")
+	}
+}
+
+// The installer's snapshot-then-claim (snapshotAndShowConsole) must be atomic
+// with respect to concurrent visibility mutations: consoleVisibilityMu has to
+// actually serialize them. Otherwise a showConsoleWindow request could slip
+// between the prior-visibility read and the sequence claim, receive an earlier
+// sequence than the installer, and be silently undone by the deferred restore
+// (a hidden console behind a checked "Show Console" menu item). Use the hide
+// path (show=false) so no real console is allocated in a headless test env.
+func TestConsoleVisibilityMutexSerializesMutations(t *testing.T) {
+	consoleVisibilityMu.Lock()
+	before := consoleVisibilitySeq.Load()
+
+	done := make(chan uint64, 1)
+	go func() { done <- showConsoleWindowSeq(false) }()
+
+	// While we hold the mutex, the concurrent request must not advance the
+	// counter — it has to wait for the lock.
+	select {
+	case <-done:
+		consoleVisibilityMu.Unlock()
+		t.Fatal("showConsoleWindowSeq advanced while consoleVisibilityMu was held; snapshot/claim is not atomic")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := consoleVisibilitySeq.Load(); got != before {
+		consoleVisibilityMu.Unlock()
+		t.Fatalf("sequence advanced under held lock: before=%d got=%d", before, got)
+	}
+
+	consoleVisibilityMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("showConsoleWindowSeq did not proceed after mutex release")
 	}
 }
 

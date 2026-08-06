@@ -80,8 +80,12 @@ func performInstall(spec DependencySpec) installOutcome {
 	// "Show Console" checkbox is initialized from registration state, not this
 	// call, so leaving a forced-visible console would desync the menu item and
 	// leave the user having to toggle it twice to hide the window again.
-	consoleWasVisible := consoleWindowVisible()
-	showSeq := showConsoleWindowSeq(true)
+	// Snapshot prior visibility and claim the show sequence atomically so a
+	// concurrent showConsoleWindow(true) (auto-registration or the tray's "Show
+	// Console" toggle, both racing StartAgent) can't slip between the two and be
+	// lost — it is now ordered either fully before us (captured in
+	// consoleWasVisible) or fully after (caught by consoleVisibilityChangedSince).
+	consoleWasVisible, showSeq := snapshotAndShowConsole()
 	defer func() {
 		if consoleWasVisible {
 			return
