@@ -421,25 +421,32 @@ func showLinuxInstallRecovery(title, message string, allowRetry bool) InstallRec
 		return RecoveryExit // cancel/skip
 	}
 	if _, err := exec.LookPath("kdialog"); err == nil {
-		// kdialog yesnocancel is only 3 outcomes; map to the three most
-		// actionable choices and reach troubleshooting via the console path.
-		yes := "Retry"
-		if !allowRetry {
-			yes = "Install Manually"
+		// kdialog --yesnocancel only exposes three outcomes, which drops the
+		// troubleshooting option; use --menu so every recovery choice
+		// (including RecoveryTroubleshoot) is reachable. The selected tag is
+		// written to stdout; a cancel/dismiss exits non-zero.
+		margs := []string{"--title", title, "--menu", message}
+		if allowRetry {
+			margs = append(margs, "retry", "Retry the automatic install")
 		}
-		cmd := exec.Command("kdialog", "--title", title,
-			"--yesnocancel", message+fmt.Sprintf("\n\nYes = %s\nNo = Install Manually\nCancel = Skip", yes))
-		_ = cmd.Run()
-		if cmd.ProcessState != nil {
-			switch cmd.ProcessState.ExitCode() {
-			case 0:
-				if allowRetry {
-					return RecoveryRetry
-				}
-				return RecoveryManual
-			case 1:
-				return RecoveryManual
+		margs = append(margs,
+			"manual", "Install manually (open download page)",
+			"troubleshoot", "View troubleshooting guidance",
+			"skip", "Skip for now")
+		out, err := exec.Command("kdialog", margs...).Output()
+		if err != nil {
+			return RecoveryExit // cancelled / dismissed
+		}
+		switch strings.TrimSpace(string(out)) {
+		case "retry":
+			if allowRetry {
+				return RecoveryRetry
 			}
+			return RecoveryExit
+		case "manual":
+			return RecoveryManual
+		case "troubleshoot":
+			return RecoveryTroubleshoot
 		}
 		return RecoveryExit
 	}
