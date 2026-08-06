@@ -16,6 +16,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"golang.org/x/sys/windows/registry"
 )
 
 // WinGet return codes (HRESULT-style, from winget-cli's authoritative
@@ -123,19 +125,30 @@ func performInstall(spec DependencySpec) installOutcome {
 }
 
 // attemptOutcome interprets a single manager run. It returns (outcome, success).
-// success is true when the tool is now considered installed — which, when the
-// spec provides an in-process detector (e.g. ttyd), is decided by PostInstall
-// (it may also augment PATH) rather than the exit code; otherwise a clean exit
-// is trusted (fine for tools only needed after a restart, e.g. Git).
+// success is true when the tool is now considered installed. How that is
+// decided depends on the spec:
 //
-// A clean exit with a FAILED PostInstall check is NOT success: the manager
+//   - PostInstall set (e.g. ttyd): its in-process detector — not the exit code —
+//     is authoritative, and it may augment PATH so the tool is usable now.
+//   - No PostInstall but VerifyCommand set (e.g. Git): a clean exit is NOT
+//     trusted on its own. WinGet writes the updated PATH to the registry but
+//     cannot mutate this already-running process's environment, so a tool it
+//     just installed stays invisible to this process (and to the ttyd/shell
+//     StartAgent launches next) until a restart. verifyInstalledOnPath refreshes
+//     PATH from the registry and re-checks, so success means "usable now".
+//   - Neither set: the exit code is trusted directly.
+//
+// A clean exit that still fails verification is NOT success: the manager
 // reported success but the tool isn't usable/visible, so we return an explicit
 // InstallOther verification-failure outcome instead of leaking a zero exit
 // code through classifyRun (which would look like InstallOK).
 func attemptOutcome(spec DependencySpec, manager string, exitOK bool, out string, code int, runErr error) (installOutcome, bool) {
 	detected := exitOK
-	if spec.PostInstall != nil {
+	switch {
+	case spec.PostInstall != nil:
 		detected = spec.PostInstall()
+	case exitOK && spec.VerifyCommand != "":
+		detected = verifyInstalledOnPath(spec.VerifyCommand)
 	}
 	if detected {
 		return installOutcome{Kind: InstallOK}, true
@@ -143,11 +156,90 @@ func attemptOutcome(spec DependencySpec, manager string, exitOK bool, out string
 	if exitOK {
 		return installOutcome{
 			Kind: InstallOther,
-			Output: fmt.Sprintf("%s reported success but %s could not be verified on PATH.\n%s",
+			Output: fmt.Sprintf("%s reported success but %s could not be verified on PATH — a restart may be required.\n%s",
 				manager, spec.DisplayName, out),
 		}, false
 	}
 	return classifyRun(code, out, runErr), false
+}
+
+// verifyInstalledOnPath reports whether cmd resolves on PATH, refreshing this
+// process's PATH from the persisted Windows environment first when it doesn't.
+// It is a package-level seam so tests can exercise attemptOutcome's verify
+// branch without a real registry or a real install.
+var verifyInstalledOnPath = func(cmd string) bool {
+	if _, err := exec.LookPath(cmd); err == nil {
+		return true
+	}
+	refreshProcessPathFromRegistry()
+	_, err := exec.LookPath(cmd)
+	return err == nil
+}
+
+// refreshProcessPathFromRegistry re-reads the persisted machine and user PATH
+// from the registry and merges them into this process's PATH. WinGet writes the
+// updated PATH there when it installs a tool, but it cannot mutate the
+// environment of an already-running process — so without this refresh a tool
+// WinGet just installed stays invisible to this process (and to everything it
+// spawns) until the app restarts.
+func refreshProcessPathFromRegistry() {
+	sep := string(os.PathListSeparator)
+	persisted := make([]string, 0, 2)
+	if p := readPersistedPath(registry.LOCAL_MACHINE,
+		`SYSTEM\CurrentControlSet\Control\Session Manager\Environment`); p != "" {
+		persisted = append(persisted, p)
+	}
+	if p := readPersistedPath(registry.CURRENT_USER, `Environment`); p != "" {
+		persisted = append(persisted, p)
+	}
+	if len(persisted) == 0 {
+		return
+	}
+	// Put the freshly-persisted entries ahead of the inherited PATH so a
+	// just-installed dir wins, then dedup so PATH doesn't grow across refreshes.
+	os.Setenv("PATH", mergePathList(strings.Join(persisted, sep)+sep+os.Getenv("PATH")))
+}
+
+// readPersistedPath reads and expands the "Path" value under the given registry
+// key, returning "" if it is absent or unreadable.
+func readPersistedPath(root registry.Key, subkey string) string {
+	key, err := registry.OpenKey(root, subkey, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer key.Close()
+	// PATH is usually REG_EXPAND_SZ (contains %SystemRoot% etc.); read the raw
+	// value and expand any embedded environment variables.
+	val, _, err := key.GetStringValue("Path")
+	if err != nil {
+		return ""
+	}
+	if expanded, err := registry.ExpandString(val); err == nil {
+		return expanded
+	}
+	return val
+}
+
+// mergePathList drops empty and case-insensitively duplicate entries from a
+// PATH-style list while preserving first-seen order, so merged machine/user/
+// process PATHs stay bounded across repeated refreshes.
+func mergePathList(list string) string {
+	sep := string(os.PathListSeparator)
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+	for _, e := range strings.Split(list, sep) {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		k := strings.ToLower(e)
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, e)
+	}
+	return strings.Join(out, sep)
 }
 
 // aggregateFailures combines every attempted manager's failure into one

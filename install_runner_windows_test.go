@@ -7,6 +7,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -97,12 +98,62 @@ func TestAttemptOutcome_PostInstallDetectsSuccessDespiteNonZeroExit(t *testing.T
 }
 
 func TestAttemptOutcome_NoDetectorTrustsExitZero(t *testing.T) {
-	spec := DependencySpec{DisplayName: "Git"} // no PostInstall
+	spec := DependencySpec{DisplayName: "Git"} // no PostInstall, no VerifyCommand
 	if _, ok := attemptOutcome(spec, "winget", true, "", 0, nil); !ok {
 		t.Fatal("no detector + clean exit should be success")
 	}
 	if oc, ok := attemptOutcome(spec, "winget", false, "boom", asExit(0x8A150006), nil); ok || oc.Kind != InstallLaunchFailed {
 		t.Fatalf("no detector + shellexec failure should classify as launch failure, got %v ok=%v", oc.Kind, ok)
+	}
+}
+
+// A clean exit for a spec with a VerifyCommand (e.g. Git) must be re-verified on
+// a refreshed PATH — WinGet updates the registry PATH but not this process's —
+// so success is only reported when the tool is actually resolvable now.
+func TestAttemptOutcome_VerifyCommandGatesCleanExit(t *testing.T) {
+	spec := DependencySpec{DisplayName: "Git", VerifyCommand: "git"}
+
+	orig := verifyInstalledOnPath
+	t.Cleanup(func() { verifyInstalledOnPath = orig })
+
+	// Verify succeeds (PATH refresh made git visible) → success.
+	var gotCmd string
+	verifyInstalledOnPath = func(cmd string) bool { gotCmd = cmd; return true }
+	if _, ok := attemptOutcome(spec, "winget", true, "", 0, nil); !ok {
+		t.Fatal("clean exit with a passing verify should be success")
+	}
+	if gotCmd != "git" {
+		t.Errorf("verify should be called with the spec's VerifyCommand, got %q", gotCmd)
+	}
+
+	// Verify still fails even after refresh → NOT success; explicit
+	// verification-failure outcome that points the user at a restart.
+	verifyInstalledOnPath = func(string) bool { return false }
+	oc, ok := attemptOutcome(spec, "winget", true, "winget: Successfully installed", 0, nil)
+	if ok {
+		t.Fatal("clean exit with a failing verify must not be reported as success")
+	}
+	if oc.Kind != InstallOther {
+		t.Fatalf("want InstallOther verification failure, got %v", oc.Kind)
+	}
+	if !strings.Contains(oc.Output, "could not be verified") || !strings.Contains(oc.Output, "restart") {
+		t.Errorf("expected a verify-failure diagnostic mentioning a restart, got %q", oc.Output)
+	}
+
+	// A non-zero exit is still classified normally, without consulting verify.
+	verifyInstalledOnPath = func(string) bool { t.Fatal("verify must not run on a failed exit"); return false }
+	if oc, ok := attemptOutcome(spec, "winget", false, "boom", asExit(0x8A150006), nil); ok || oc.Kind != InstallLaunchFailed {
+		t.Fatalf("failed exit should classify as launch failure, got %v ok=%v", oc.Kind, ok)
+	}
+}
+
+func TestMergePathList_DedupsAndDropsEmpties(t *testing.T) {
+	sep := string(os.PathListSeparator)
+	in := strings.Join([]string{`C:\Git\cmd`, "", `C:\Windows`, `c:\git\cmd`, `C:\Windows`}, sep)
+	got := mergePathList(in)
+	want := strings.Join([]string{`C:\Git\cmd`, `C:\Windows`}, sep)
+	if got != want {
+		t.Errorf("mergePathList(%q) = %q, want %q", in, got, want)
 	}
 }
 
