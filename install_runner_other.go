@@ -17,7 +17,23 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+
+	"golang.org/x/sys/unix"
 )
+
+// isTerminalFd reports whether fd is connected to a real terminal, using a
+// termios probe rather than a bare character-device test. os.ModeCharDevice is
+// also true for /dev/null (a common stdin for autostart / session-manager
+// launches) and for other non-tty character devices, so keying HasTTY off it
+// would wrongly report a terminal and push linuxInstallCommand onto sudo — the
+// very no-password-prompt failure the pkexec branch exists to avoid.
+// IoctlGetTermios only succeeds on an actual tty line discipline, so /dev/null,
+// pipes, and regular files are all correctly rejected. A package-level seam so
+// tests can exercise the non-tty case deterministically.
+var isTerminalFd = func(fd int) bool {
+	_, err := unix.IoctlGetTermios(fd, ttyIoctlReadTermios)
+	return err == nil
+}
 
 // verifyInstalledOnPath reports whether cmd is actually usable after a
 // package-manager run. It executes the working-version probe (`cmd --version`)
@@ -57,7 +73,8 @@ func unixInstallPackage(spec DependencySpec) string {
 type linuxElevation struct {
 	// EUID is the effective user id of this process.
 	EUID int
-	// HasTTY reports whether stdin is a character device, i.e. whether sudo
+	// HasTTY reports whether stdin is connected to a real terminal (verified
+	// via a termios probe, not just a character-device test), i.e. whether sudo
 	// would have a terminal on which to prompt for a password.
 	HasTTY bool
 	// HasGraphicalSession reports whether a desktop session is present
@@ -74,9 +91,7 @@ func currentLinuxElevation() linuxElevation {
 		EUID:                os.Geteuid(),
 		HasGraphicalSession: os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != "",
 	}
-	if fi, err := os.Stdin.Stat(); err == nil {
-		env.HasTTY = fi.Mode()&os.ModeCharDevice != 0
-	}
+	env.HasTTY = isTerminalFd(int(os.Stdin.Fd()))
 	if _, err := exec.LookPath("pkexec"); err == nil {
 		env.HasPkexec = true
 	}

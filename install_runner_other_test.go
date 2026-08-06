@@ -7,10 +7,39 @@
 package main
 
 import (
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
 )
+
+// The TTY probe must reject non-terminal character devices. /dev/null is a
+// character device (its os.ModeCharDevice bit is set), so the previous
+// ModeCharDevice heuristic reported HasTTY=true for a session-manager launch
+// whose stdin is /dev/null — which flipped linuxInstallCommand from pkexec to
+// sudo and reproduced the no-password-prompt failure this runner avoids. A pipe
+// stands in for the redirected-stdin case. A real tty can't be opened in CI, so
+// only the false cases are asserted; those are exactly the regression.
+func TestIsTerminalFd_RejectsNonTTY(t *testing.T) {
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	defer devNull.Close()
+	if isTerminalFd(int(devNull.Fd())) {
+		t.Errorf("%s is a character device but not a terminal; isTerminalFd must return false", os.DevNull)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer r.Close()
+	defer w.Close()
+	if isTerminalFd(int(r.Fd())) {
+		t.Error("a pipe read end is not a terminal; isTerminalFd must return false")
+	}
+}
 
 // verifyInstalledOnPath must execute the working-version probe, not just resolve
 // the command on PATH. Setup can be triggered precisely because a stale or
