@@ -11,7 +11,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"os/exec"
 	"runtime"
 )
 
@@ -40,11 +39,19 @@ func gitDependencySpec() DependencySpec {
 	}
 }
 
-// ensureGit checks whether Git is on PATH and, if not, walks the user through
-// the guided install + recovery flow. Non-fatal: it never returns an error to
-// abort startup; it logs the outcome and lets readiness report the warning.
+// ensureGit checks whether a working Git is available and, if not, walks the
+// user through the guided install + recovery flow. Non-fatal: it never returns
+// an error to abort startup; it logs the outcome and lets readiness report the
+// warning.
+//
+// It probes with `git --version` (the same executable/version check the
+// readiness collector uses in systemInfo.go) rather than exec.LookPath alone.
+// On a fresh macOS without the Command Line Tools, /usr/bin/git is present as
+// Apple's developer-tools shim, so LookPath succeeds even though `git`
+// can't actually run — that would skip setup here while readiness still
+// reported missing_git, leaving the user stuck with no prompt.
 func ensureGit() {
-	if _, err := exec.LookPath("git"); err == nil {
+	if probeVersion("git", "--version") != "" {
 		return
 	}
 

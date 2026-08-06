@@ -236,20 +236,25 @@ func showOsascriptInstallPrompt(title, message, declineBtn string) InstallChoice
 }
 
 func showOsascriptInstallRecovery(title, message string, allowRetry bool) InstallRecoveryChoice {
-	// macOS dialogs allow up to three buttons; Exit is reachable by dismissing
-	// (Escape), which osascript reports as an error.
-	buttons := `{"Install Manually", "Troubleshooting", "Retry"}`
+	// macOS `display dialog` allows at most three buttons, and Escape only
+	// dismisses (returning an error osascript maps to Exit) when a `cancel
+	// button` is designated. Skip is therefore always a real, designated cancel
+	// button so users can bail out at any time — including while retries remain.
+	// With retries offered the three slots are Skip / Install Manually / Retry;
+	// Troubleshooting takes Retry's slot once the retry cap is reached (it stays
+	// reachable across the recovery loop, which re-shows this dialog).
+	buttons := `{"Skip", "Install Manually", "Retry"}`
 	defaultBtn := "Retry"
 	if !allowRetry {
 		buttons = `{"Skip", "Install Manually", "Troubleshooting"}`
 		defaultBtn = "Install Manually"
 	}
 	script := fmt.Sprintf(
-		`display dialog "%s" buttons %s default button "%s" with title "%s" with icon caution`,
+		`display dialog "%s" buttons %s default button "%s" cancel button "Skip" with title "%s" with icon caution`,
 		escapeOsascript(message), buttons, defaultBtn, escapeOsascript(title))
 	out, err := exec.Command("osascript", "-e", script).Output()
 	if err != nil {
-		return RecoveryExit // dismissed / cancelled
+		return RecoveryExit // Skip button, Escape, or dismissed / cancelled
 	}
 	result := string(out)
 	switch {
