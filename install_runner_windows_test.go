@@ -168,6 +168,25 @@ func TestVerifyInstalledOnPath_RejectsResolvableButBroken(t *testing.T) {
 	}
 }
 
+// performInstall forces the console open and restores the prior state on the
+// way out, but only when its own request is still the most recent one. The tray
+// runs concurrently with StartAgent, so a "Show Console" toggle or
+// auto-registration can ask for the console mid-install; that newer request
+// must survive the installer's deferred restore. Exercise the guard directly
+// (showConsoleWindowSeq itself calls into Win32 and needs a real console).
+func TestConsoleVisibilityChangedSince(t *testing.T) {
+	seq := consoleVisibilitySeq.Add(1)
+	if consoleVisibilityChangedSince(seq) {
+		t.Error("no later visibility request was made; snapshot should still be current")
+	}
+
+	// A concurrent flow asks for the console while the install runs.
+	consoleVisibilitySeq.Add(1)
+	if !consoleVisibilityChangedSince(seq) {
+		t.Error("a later visibility request must invalidate the installer's snapshot")
+	}
+}
+
 func TestMergePathList_DedupsAndDropsEmpties(t *testing.T) {
 	sep := string(os.PathListSeparator)
 	in := strings.Join([]string{`C:\Git\cmd`, "", `C:\Windows`, `c:\git\cmd`, `C:\Windows`}, sep)

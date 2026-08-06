@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -403,15 +404,38 @@ func consoleWindowVisible() bool {
 	return ret != 0
 }
 
+// consoleVisibilitySeq counts every visibility request made through
+// showConsoleWindow. A caller that forces the console open for the duration of
+// a long operation (the dependency installer) snapshots the sequence of its own
+// request and only restores the prior state if no later request arrived. The
+// tray runs concurrently with StartAgent, so auto-registration or the user's
+// "Show Console" menu item can legitimately ask for the console mid-install;
+// without this check the installer's deferred restore would undo that newer
+// request and leave a hidden window behind a checked menu item.
+var consoleVisibilitySeq atomic.Uint64
+
+// consoleVisibilityChangedSince reports whether any visibility request was made
+// after the one identified by seq (as returned by showConsoleWindowSeq).
+func consoleVisibilityChangedSince(seq uint64) bool {
+	return consoleVisibilitySeq.Load() != seq
+}
+
 // showConsoleWindow shows or hides the console window.
 // When built as a GUI app (-H=windowsgui), this allocates a console on-demand.
-func showConsoleWindow(show bool) {
+func showConsoleWindow(show bool) { showConsoleWindowSeq(show) }
+
+// showConsoleWindowSeq is showConsoleWindow plus the sequence number of this
+// request, for callers that later need to know whether theirs is still the most
+// recent one. The counter is bumped even when the request can't be carried out
+// (no console allocatable), so a stale snapshot never wins over a newer intent.
+func showConsoleWindowSeq(show bool) uint64 {
+	seq := consoleVisibilitySeq.Add(1)
 	if show {
 		// Allocate console if we don't have one (GUI app mode)
 		if !consoleAllocated {
 			if err := allocateConsole(); err != nil {
 				// Can't print error - no console yet
-				return
+				return seq
 			}
 		}
 
@@ -434,6 +458,7 @@ func showConsoleWindow(show bool) {
 			procShowWindow.Call(hwnd, SW_HIDE)
 		}
 	}
+	return seq
 }
 
 // monitorConsoleMinimize watches for minimize events and hides console to tray.

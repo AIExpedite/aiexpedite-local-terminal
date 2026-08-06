@@ -81,11 +81,21 @@ func performInstall(spec DependencySpec) installOutcome {
 	// call, so leaving a forced-visible console would desync the menu item and
 	// leave the user having to toggle it twice to hide the window again.
 	consoleWasVisible := consoleWindowVisible()
-	showConsoleWindow(true)
+	showSeq := showConsoleWindowSeq(true)
 	defer func() {
-		if !consoleWasVisible {
-			showConsoleWindow(false)
+		if consoleWasVisible {
+			return
 		}
+		// Another flow may have asked for the console while WinGet was running —
+		// the tray runs concurrently with StartAgent, so auto-registration
+		// (showConsoleWindow(true) + a checked menu item) or the user toggling
+		// "Show Console" can land mid-install. That request is newer than ours
+		// and wins; hiding on our stale snapshot would leave a hidden window
+		// behind a checked menu item.
+		if consoleVisibilityChangedSince(showSeq) {
+			return
+		}
+		showConsoleWindow(false)
 	}()
 
 	var attempts []installAttempt

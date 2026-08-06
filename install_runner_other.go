@@ -19,6 +19,20 @@ import (
 	"runtime"
 )
 
+// verifyInstalledOnPath reports whether cmd is actually usable after a
+// package-manager run. It executes the working-version probe (`cmd --version`)
+// — the same check ensureGit/readiness use — rather than exec.LookPath alone:
+// setup can be triggered precisely because a stale or broken git already
+// resolves on PATH, and a bare LookPath would accept that same broken entry
+// once brew/apt exits cleanly, letting ensureGit announce success while every
+// subsequent Git command still fails. Mirrors the Windows runner's helper of
+// the same name (which additionally refreshes PATH from the registry, a
+// WinGet-specific concern). Package-level seam so tests can exercise the
+// post-install verify branch without a real install.
+var verifyInstalledOnPath = func(cmd string) bool {
+	return probeVersion(cmd, "--version") != ""
+}
+
 // performInstall attempts a package-manager install on macOS/Linux.
 func performInstall(spec DependencySpec) installOutcome {
 	pkg := spec.UnixPackage
@@ -61,12 +75,12 @@ func performInstall(spec DependencySpec) installOutcome {
 		if spec.VerifyCommand == "" {
 			return installOutcome{Kind: InstallOK}
 		}
-		if _, err := exec.LookPath(spec.VerifyCommand); err == nil {
+		if verifyInstalledOnPath(spec.VerifyCommand) {
 			return installOutcome{Kind: InstallOK}
 		}
 		return installOutcome{
 			Kind:   InstallOther,
-			Output: fmt.Sprintf("%s installed but %q is not on PATH.", spec.DisplayName, spec.VerifyCommand),
+			Output: fmt.Sprintf("%s installed but %q is not usable on PATH.", spec.DisplayName, spec.VerifyCommand),
 		}
 	}
 
