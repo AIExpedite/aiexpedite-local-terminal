@@ -8,6 +8,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -144,6 +145,26 @@ func TestAttemptOutcome_VerifyCommandGatesCleanExit(t *testing.T) {
 	verifyInstalledOnPath = func(string) bool { t.Fatal("verify must not run on a failed exit"); return false }
 	if oc, ok := attemptOutcome(spec, "winget", false, "boom", asExit(0x8A150006), nil); ok || oc.Kind != InstallLaunchFailed {
 		t.Fatalf("failed exit should classify as launch failure, got %v ok=%v", oc.Kind, ok)
+	}
+}
+
+// verifyInstalledOnPath must execute the working-version probe, not just resolve
+// the command on PATH: setup can be triggered because a stale/broken entry
+// already resolves, and a bare LookPath would accept that same entry after
+// WinGet exits. `go` is guaranteed present when tests run yet fails `--version`
+// (it uses `go version`), so it stands in for a resolvable-but-broken command —
+// the real seam must reject it even though exec.LookPath("go") succeeds.
+func TestVerifyInstalledOnPath_RejectsResolvableButBroken(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not on PATH; cannot exercise the resolvable-but-broken case")
+	}
+	// refreshProcessPathFromRegistry mutates the process PATH; restore it so
+	// this test can't leak into others.
+	origPath := os.Getenv("PATH")
+	t.Cleanup(func() { os.Setenv("PATH", origPath) })
+
+	if verifyInstalledOnPath("go") {
+		t.Error("verifyInstalledOnPath should reject a command that resolves on PATH but fails --version")
 	}
 }
 

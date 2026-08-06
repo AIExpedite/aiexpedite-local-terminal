@@ -174,17 +174,24 @@ func attemptOutcome(spec DependencySpec, manager string, exitOK bool, out string
 	return classifyRun(code, out, runErr), false
 }
 
-// verifyInstalledOnPath reports whether cmd resolves on PATH, refreshing this
-// process's PATH from the persisted Windows environment first when it doesn't.
+// verifyInstalledOnPath reports whether cmd is actually usable, refreshing this
+// process's PATH from the persisted Windows environment first when it isn't.
+// It executes the working-version probe (`cmd --version`) — the same check
+// ensureGit/readiness use — rather than exec.LookPath alone: setup can be
+// triggered precisely because a stale or broken git already resolves on PATH,
+// and a bare LookPath would accept that same broken entry after WinGet exits,
+// short-circuiting before the PATH refresh that would surface the freshly
+// installed (working) git. Probing execution instead means a resolvable-but-
+// broken command fails the first probe, the refresh promotes the newly
+// installed directory, and only a genuinely working command reports success.
 // It is a package-level seam so tests can exercise attemptOutcome's verify
 // branch without a real registry or a real install.
 var verifyInstalledOnPath = func(cmd string) bool {
-	if _, err := exec.LookPath(cmd); err == nil {
+	if probeVersion(cmd, "--version") != "" {
 		return true
 	}
 	refreshProcessPathFromRegistry()
-	_, err := exec.LookPath(cmd)
-	return err == nil
+	return probeVersion(cmd, "--version") != ""
 }
 
 // refreshProcessPathFromRegistry re-reads the persisted machine and user PATH

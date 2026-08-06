@@ -385,14 +385,16 @@ func freeConsole() {
 	consoleAllocated = false
 }
 
-// consoleWindowVisible reports whether an allocated console window currently
-// exists and is visible on screen. It returns false when no console has been
-// allocated yet, so callers can capture the pre-existing visibility and restore
-// it later (e.g. around a dependency install that forces the console open).
+// consoleWindowVisible reports whether a console window currently exists and is
+// visible on screen, so callers can capture the pre-existing visibility and
+// restore it later (e.g. around a dependency install that forces the console
+// open). It queries the console window directly rather than gating on the
+// consoleAllocated bookkeeping flag: a process relaunched with CREATE_NEW_CONSOLE
+// (see setNewConsole) inherits a real, visible console without ever calling
+// allocateConsole, so consoleAllocated can be false while a visible console
+// exists. Reading the flag there would misreport that console as hidden and the
+// install's deferred restore would hide an originally-visible window.
 func consoleWindowVisible() bool {
-	if !consoleAllocated {
-		return false
-	}
 	hwnd := getConsoleWindow()
 	if hwnd == 0 {
 		return false
