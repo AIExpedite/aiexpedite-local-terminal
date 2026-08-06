@@ -85,22 +85,10 @@ func performInstall(spec DependencySpec) installOutcome {
 	// Console" toggle, both racing StartAgent) can't slip between the two and be
 	// lost — it is now ordered either fully before us (captured in
 	// consoleWasVisible) or fully after (caught by consoleVisibilityChangedSince).
+	// The restore is guarded the same way: another flow may have asked for the
+	// console while WinGet was running, and that newer request wins.
 	consoleWasVisible, showSeq := snapshotAndShowConsole()
-	defer func() {
-		if consoleWasVisible {
-			return
-		}
-		// Another flow may have asked for the console while WinGet was running —
-		// the tray runs concurrently with StartAgent, so auto-registration
-		// (showConsoleWindow(true) + a checked menu item) or the user toggling
-		// "Show Console" can land mid-install. That request is newer than ours
-		// and wins; hiding on our stale snapshot would leave a hidden window
-		// behind a checked menu item.
-		if consoleVisibilityChangedSince(showSeq) {
-			return
-		}
-		showConsoleWindow(false)
-	}()
+	defer restoreConsoleVisibility(consoleWasVisible, showSeq)
 
 	var attempts []installAttempt
 

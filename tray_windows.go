@@ -454,6 +454,27 @@ func snapshotAndShowConsole() (priorVisible bool, seq uint64) {
 	return priorVisible, seq
 }
 
+// restoreConsoleVisibility undoes a snapshotAndShowConsole claim: it hides the
+// console only when it was hidden before the claim AND no visibility request
+// arrived after ours (a newer request — auto-registration or the tray's "Show
+// Console" toggle landing mid-install — wins, since hiding on our stale
+// snapshot would leave a hidden window behind a checked menu item).
+//
+// The "changed since" check and the hide are one atomic step for the same
+// reason the snapshot and claim are: checking outside the lock leaves a gap in
+// which a concurrent show can land after the check and be hidden right back.
+func restoreConsoleVisibility(priorVisible bool, seq uint64) {
+	if priorVisible {
+		return
+	}
+	consoleVisibilityMu.Lock()
+	defer consoleVisibilityMu.Unlock()
+	if consoleVisibilityChangedSince(seq) {
+		return
+	}
+	showConsoleWindowSeqLocked(false)
+}
+
 // showConsoleWindow shows or hides the console window.
 // When built as a GUI app (-H=windowsgui), this allocates a console on-demand.
 func showConsoleWindow(show bool) { showConsoleWindowSeq(show) }

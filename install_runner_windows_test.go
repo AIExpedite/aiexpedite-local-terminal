@@ -223,6 +223,35 @@ func TestConsoleVisibilityMutexSerializesMutations(t *testing.T) {
 	}
 }
 
+// restoreConsoleVisibility hides only when the console was hidden before the
+// claim AND no newer request arrived. A hide claims a sequence number of its
+// own, so the counter is the observable here — no real console required.
+func TestRestoreConsoleVisibility(t *testing.T) {
+	// A newer request landed mid-install: it wins, so the restore stands down.
+	seq := consoleVisibilitySeq.Add(1)
+	consoleVisibilitySeq.Add(1) // concurrent "Show Console"
+	before := consoleVisibilitySeq.Load()
+	restoreConsoleVisibility(false, seq)
+	if got := consoleVisibilitySeq.Load(); got != before {
+		t.Errorf("a newer visibility request must survive the restore; counter %d → %d", before, got)
+	}
+
+	// The console was already visible before the claim: leave it alone.
+	seq = consoleVisibilitySeq.Add(1)
+	before = consoleVisibilitySeq.Load()
+	restoreConsoleVisibility(true, seq)
+	if got := consoleVisibilitySeq.Load(); got != before {
+		t.Errorf("an originally-visible console must not be hidden; counter %d → %d", before, got)
+	}
+
+	// Hidden before, still the most recent request: restore hides it.
+	seq = consoleVisibilitySeq.Add(1)
+	restoreConsoleVisibility(false, seq)
+	if got := consoleVisibilitySeq.Load(); got != seq+1 {
+		t.Errorf("restore should have issued a hide request; counter %d, want %d", got, seq+1)
+	}
+}
+
 func TestMergePathList_DedupsAndDropsEmpties(t *testing.T) {
 	sep := string(os.PathListSeparator)
 	in := strings.Join([]string{`C:\Git\cmd`, "", `C:\Windows`, `c:\git\cmd`, `C:\Windows`}, sep)
