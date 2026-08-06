@@ -48,6 +48,30 @@ func TestVerifyInstalledOnPath_AcceptsWorkingCommand(t *testing.T) {
 	t.Skip("no command with a working --version available to verify against")
 }
 
+// A process already running as root must invoke apt-get directly rather than
+// through sudo: a minimal root environment can have apt-get but no sudo binary,
+// and spawning the missing wrapper would fail to launch and drop into recovery
+// even though the install would have succeeded. Non-root keeps the sudo path.
+func TestLinuxInstallCommand_RootSkipsSudo(t *testing.T) {
+	cmd, args := linuxInstallCommand("git", 0)
+	if cmd != "apt-get" {
+		t.Errorf("root should invoke apt-get directly, got %q", cmd)
+	}
+	want := []string{"-y", "install", "git"}
+	if strings.Join(args, " ") != strings.Join(want, " ") {
+		t.Errorf("root args = %v, want %v", args, want)
+	}
+
+	cmd, args = linuxInstallCommand("git", 1000)
+	if cmd != "sudo" {
+		t.Errorf("non-root should elevate via sudo, got %q", cmd)
+	}
+	want = []string{"apt-get", "-y", "install", "git"}
+	if strings.Join(args, " ") != strings.Join(want, " ") {
+		t.Errorf("non-root args = %v, want %v", args, want)
+	}
+}
+
 // Support diagnostics must name the package that was actually attempted. Off
 // Windows that is the brew/apt package (`git`), never the WinGet id (`Git.Git`)
 // — reporting the latter is misleading on exactly the failure path the recovery

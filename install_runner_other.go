@@ -51,12 +51,29 @@ func unixInstallPackage(spec DependencySpec) string {
 	return spec.VerifyCommand
 }
 
+// linuxInstallCommand builds the apt-get invocation for the given package,
+// choosing whether to elevate through sudo. A process already running as root
+// (euid 0) invokes apt-get directly: it has the privileges to install, and
+// minimal root environments (e.g. containers) may ship apt-get without a sudo
+// binary, so spawning sudo there would fail to launch and drop into recovery
+// even though the install could have succeeded.
+func linuxInstallCommand(pkg string, euid int) (string, []string) {
+	if euid == 0 {
+		return "apt-get", []string{"-y", "install", pkg}
+	}
+	return "sudo", []string{"apt-get", "-y", "install", pkg}
+}
+
 // performInstall attempts a package-manager install on macOS/Linux.
 func performInstall(spec DependencySpec) installOutcome {
 	pkg := unixInstallPackage(spec)
 
-	// binary is what must exist on PATH; cmdName/args is what we actually run
-	// (apt-get needs sudo, mirroring ensureTtyd's Linux path).
+	// binary is the package manager that must exist on PATH; cmdName/args is what
+	// we actually spawn. On Linux apt-get normally needs sudo to elevate, but a
+	// process already running as root (e.g. a root container with apt-get but no
+	// sudo binary) has the privileges to install directly — spawning a missing
+	// sudo there would fail to launch and drop straight into recovery even though
+	// the install could have succeeded. So invoke apt-get directly when euid is 0.
 	var binary, cmdName string
 	var args []string
 	switch runtime.GOOS {
@@ -64,15 +81,21 @@ func performInstall(spec DependencySpec) installOutcome {
 		binary, cmdName = "brew", "brew"
 		args = []string{"install", pkg}
 	default: // linux and other unix
-		binary, cmdName = "apt-get", "sudo"
-		args = []string{"apt-get", "-y", "install", pkg}
+		binary = "apt-get"
+		cmdName, args = linuxInstallCommand(pkg, os.Geteuid())
 	}
 
-	if _, err := exec.LookPath(binary); err != nil {
-		return installOutcome{
-			Kind:   InstallExecFailed,
-			Err:    fmt.Errorf("%s not found on PATH: %w", binary, err),
-			Output: fmt.Sprintf("No supported package manager (%s) is available to install %s automatically.", binary, spec.DisplayName),
+	// Verify both the package manager and the launcher we'll actually spawn
+	// (sudo, when elevation is required) are present, so a missing wrapper is
+	// reported as "no package manager available" up front rather than surfacing
+	// as an opaque spawn failure once we try to run it.
+	for _, exe := range []string{binary, cmdName} {
+		if _, err := exec.LookPath(exe); err != nil {
+			return installOutcome{
+				Kind:   InstallExecFailed,
+				Err:    fmt.Errorf("%s not found on PATH: %w", exe, err),
+				Output: fmt.Sprintf("No supported package manager (%s) is available to install %s automatically.", binary, spec.DisplayName),
+			}
 		}
 	}
 

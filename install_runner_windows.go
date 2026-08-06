@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"golang.org/x/sys/windows/registry"
@@ -204,7 +205,62 @@ var verifyInstalledOnPath = func(cmd string) bool {
 		return true
 	}
 	refreshProcessPathFromRegistry()
-	return probeVersion(cmd, "--version") != ""
+	if probeVersion(cmd, "--version") != "" {
+		return true
+	}
+	// The refresh prepends the persisted PATH but preserves the registry's
+	// internal ordering, so a pre-existing broken entry (the reason setup ran)
+	// can still resolve ahead of the directory WinGet just added — `cmd` keeps
+	// probing the broken one. Scan every PATH directory for a copy of cmd that
+	// actually runs and, when found, promote its directory to the front so this
+	// probe and everything StartAgent spawns next resolve the working binary.
+	return promoteWorkingCommandDir(cmd)
+}
+
+// promoteWorkingCommandDir walks the process PATH looking for a directory whose
+// copy of cmd actually executes (`cmd --version` succeeds). On the first match
+// it moves that directory to the front of PATH (deduped via mergePathList) so
+// subsequent lookups resolve the working binary instead of an earlier broken
+// one, and reports true. Returns false when no directory yields a working cmd.
+func promoteWorkingCommandDir(cmd string) bool {
+	sep := string(os.PathListSeparator)
+	exts := commandExtensions()
+	for _, dir := range strings.Split(os.Getenv("PATH"), sep) {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			continue
+		}
+		for _, ext := range exts {
+			full := filepath.Join(dir, cmd+ext)
+			if _, err := os.Stat(full); err != nil {
+				continue
+			}
+			if probeVersion(full, "--version") == "" {
+				continue
+			}
+			os.Setenv("PATH", mergePathList(dir+sep+os.Getenv("PATH")))
+			return true
+		}
+	}
+	return false
+}
+
+// commandExtensions returns the executable suffixes to try when resolving a
+// bare command name in a specific directory, driven by Windows' PATHEXT (with
+// the documented default when it is unset). The empty suffix is included first
+// so a name that already carries its extension still matches.
+func commandExtensions() []string {
+	pathext := os.Getenv("PATHEXT")
+	if pathext == "" {
+		pathext = ".COM;.EXE;.BAT;.CMD"
+	}
+	exts := []string{""}
+	for _, e := range strings.Split(pathext, ";") {
+		if e = strings.TrimSpace(e); e != "" {
+			exts = append(exts, e)
+		}
+	}
+	return exts
 }
 
 // refreshProcessPathFromRegistry re-reads the persisted machine and user PATH

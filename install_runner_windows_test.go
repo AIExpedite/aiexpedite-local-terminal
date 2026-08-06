@@ -169,6 +169,58 @@ func TestVerifyInstalledOnPath_RejectsResolvableButBroken(t *testing.T) {
 	}
 }
 
+// When a broken copy of the command resolves ahead of a working one on PATH
+// (the reason setup ran in the first place), verifyInstalledOnPath's plain probe
+// keeps hitting the broken entry even after the registry refresh, because the
+// refresh preserves the persisted PATH's internal ordering. promoteWorkingCommandDir
+// must scan for a directory whose command actually runs and move it to the front.
+func TestPromoteWorkingCommandDir_PromotesWorkingOverBroken(t *testing.T) {
+	sep := string(os.PathListSeparator)
+
+	origPath := os.Getenv("PATH")
+	origExt := os.Getenv("PATHEXT")
+	t.Cleanup(func() { os.Setenv("PATH", origPath); os.Setenv("PATHEXT", origExt) })
+	os.Setenv("PATHEXT", ".BAT;.EXE")
+
+	brokenDir := t.TempDir()
+	workingDir := t.TempDir()
+	// A .bat that exits non-zero stands in for a resolvable-but-broken command;
+	// one that prints a version stands in for the freshly installed, working one.
+	if err := os.WriteFile(brokenDir+`\promotetool.bat`, []byte("@exit /b 1\r\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(workingDir+`\promotetool.bat`, []byte("@echo promotetool 1.2.3\r\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Broken directory first — a bare lookup would resolve it.
+	os.Setenv("PATH", brokenDir+sep+workingDir)
+
+	if !promoteWorkingCommandDir("promotetool") {
+		t.Fatal("promoteWorkingCommandDir should find the working copy and report success")
+	}
+	if got := os.Getenv("PATH"); !strings.HasPrefix(strings.ToLower(got), strings.ToLower(workingDir)) {
+		t.Errorf("working directory should be promoted to the front of PATH; got %q", got)
+	}
+}
+
+func TestPromoteWorkingCommandDir_NoWorkingCopy(t *testing.T) {
+	origPath := os.Getenv("PATH")
+	origExt := os.Getenv("PATHEXT")
+	t.Cleanup(func() { os.Setenv("PATH", origPath); os.Setenv("PATHEXT", origExt) })
+	os.Setenv("PATHEXT", ".BAT;.EXE")
+
+	brokenDir := t.TempDir()
+	if err := os.WriteFile(brokenDir+`\promotetool.bat`, []byte("@exit /b 1\r\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.Setenv("PATH", brokenDir)
+
+	if promoteWorkingCommandDir("promotetool") {
+		t.Error("promoteWorkingCommandDir must report false when no directory yields a working command")
+	}
+}
+
 // performInstall forces the console open and restores the prior state on the
 // way out, but only when its own request is still the most recent one. The tray
 // runs concurrently with StartAgent, so a "Show Console" toggle or
