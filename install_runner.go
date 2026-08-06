@@ -165,7 +165,7 @@ func runDependencyInstall(spec DependencySpec) error {
 	attempt := 0
 	for {
 		LogSecurityEvent(SecEvtInstallStarted, "starting dependency install",
-			"component", spec.DisplayName, "package", spec.WingetID, "attempt", attempt)
+			"component", spec.DisplayName, "package", platformPackageID(spec), "attempt", attempt)
 
 		outcome := installExec(spec)
 		if outcome.Kind == InstallOK {
@@ -356,12 +356,20 @@ func installExplanation(spec DependencySpec, o installOutcome) string {
 	}
 }
 
+// platformPackageID is implemented per platform (install_runner_windows.go /
+// install_runner_other.go) and returns the package identifier the platform's
+// performInstall actually passes to the package manager: the WinGet id on
+// Windows, the brew/apt package name elsewhere. Diagnostics must name the
+// package that was really attempted — reporting the WinGet id on macOS/Linux
+// would be misleading on exactly the failure path these diagnostics exist to
+// explain.
+
 // installDiagnosticsSummary builds the short technical summary surfaced in the
 // recovery dialog (and useful when a user pastes it to support). Full detail
 // lives in the audit log.
 func installDiagnosticsSummary(spec DependencySpec, o installOutcome) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Package: %s\n", spec.WingetID)
+	fmt.Fprintf(&b, "Package: %s\n", platformPackageID(spec))
 	fmt.Fprintf(&b, "Reason: %s\n", installFailureReason(o.Kind))
 	if o.ExitCode != 0 {
 		fmt.Fprintf(&b, "Exit code: %d (0x%X)\n", o.ExitCode, uint32(o.ExitCode))

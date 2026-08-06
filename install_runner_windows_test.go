@@ -252,6 +252,70 @@ func TestRestoreConsoleVisibility(t *testing.T) {
 	}
 }
 
+// The minimize-driven hide must go through the same locked/sequence-aware path
+// as every other visibility mutation. If it called procShowWindow(SW_HIDE)
+// directly it could land between snapshotAndShowConsole's visibility read and
+// its sequence claim: the installer would then reopen the console, record it as
+// previously visible, and drop the user's minimize on the floor. Holding the
+// mutex here must block it, exactly as it blocks showConsoleWindowSeq.
+func TestHideMinimizedConsole_SerializedUnderVisibilityMutex(t *testing.T) {
+	consoleVisibilityMu.Lock()
+
+	done := make(chan bool, 1)
+	go func() { done <- hideMinimizedConsole() }()
+
+	select {
+	case <-done:
+		consoleVisibilityMu.Unlock()
+		t.Fatal("hideMinimizedConsole ran while consoleVisibilityMu was held; the minimize hide bypasses the visibility serialization protocol")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	consoleVisibilityMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("hideMinimizedConsole did not proceed after mutex release")
+	}
+}
+
+// When there is nothing to hide (no console window, or one that isn't
+// minimized) the poll must be a no-op: it may not claim a sequence number,
+// which would otherwise invalidate an in-flight installer snapshot ten times a
+// second and leave the console forced open.
+func TestHideMinimizedConsole_NoOpWhenNotMinimized(t *testing.T) {
+	before := consoleVisibilitySeq.Load()
+	if hideMinimizedConsole() {
+		t.Skip("test console is minimized; nothing to assert about the no-op path")
+	}
+	if got := consoleVisibilitySeq.Load(); got != before {
+		t.Errorf("a hide that did nothing must not claim a sequence number; counter %d → %d", before, got)
+	}
+}
+
+// Diagnostics have to name the package this platform actually installs. On
+// Windows that is the WinGet id, plus the Scoop id when a fallback is wired up
+// (either manager may be the one that failed).
+func TestPlatformPackageID_Windows(t *testing.T) {
+	spec := DependencySpec{DisplayName: "Git", WingetID: "Git.Git", UnixPackage: "git"}
+	if got := platformPackageID(spec); got != "Git.Git" {
+		t.Errorf("platformPackageID = %q, want the WinGet id %q", got, "Git.Git")
+	}
+
+	spec.ScoopID = "ttyd"
+	got := platformPackageID(spec)
+	if !strings.Contains(got, "Git.Git") || !strings.Contains(got, "ttyd") {
+		t.Errorf("platformPackageID = %q, want both the WinGet and Scoop ids", got)
+	}
+
+	summary := installDiagnosticsSummary(
+		DependencySpec{DisplayName: "Git", WingetID: "Git.Git", UnixPackage: "git"},
+		installOutcome{Kind: InstallLaunchFailed})
+	if !strings.Contains(summary, "Package: Git.Git") {
+		t.Errorf("recovery diagnostics should report the WinGet id on Windows: %q", summary)
+	}
+}
+
 func TestMergePathList_DedupsAndDropsEmpties(t *testing.T) {
 	sep := string(os.PathListSeparator)
 	in := strings.Join([]string{`C:\Git\cmd`, "", `C:\Windows`, `c:\git\cmd`, `C:\Windows`}, sep)

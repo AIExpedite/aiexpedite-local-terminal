@@ -524,6 +524,40 @@ func showConsoleWindowSeqLocked(show bool) uint64 {
 	return seq
 }
 
+// hideMinimizedConsole hides the console window if it is currently minimized,
+// performing the "is it minimized" check and the hide as ONE step under
+// consoleVisibilityMu. Routing the minimize-driven hide through
+// showConsoleWindowSeqLocked (rather than calling procShowWindow directly) is
+// what keeps it part of the same serialization protocol as every other
+// visibility mutation: it both takes the mutex and bumps consoleVisibilitySeq.
+//
+// Without that, a minimize landing inside snapshotAndShowConsole could hide the
+// console after the prior-visibility read but before the installer's show — the
+// installer would reopen the window, record it as previously visible, and its
+// deferred restore would leave it open, silently discarding the user's minimize
+// while ConsoleHiddenChan had already unchecked the tray's "Show Console" item.
+// Now the hide is ordered either fully before the snapshot (so priorVisible is
+// false and the restore hides again) or fully after the sequence claim (so
+// consoleVisibilityChangedSince makes the restore stand down).
+//
+// Returns true when it actually hid the window, so the caller only notifies the
+// tray on a real state change.
+func hideMinimizedConsole() bool {
+	consoleVisibilityMu.Lock()
+	defer consoleVisibilityMu.Unlock()
+
+	hwnd := getConsoleWindow()
+	if hwnd == 0 {
+		return false
+	}
+	// IsIconic returns non-zero if window is minimized.
+	if ret, _, _ := procIsIconic.Call(hwnd); ret == 0 {
+		return false
+	}
+	showConsoleWindowSeqLocked(false)
+	return true
+}
+
 // monitorConsoleMinimize watches for minimize events and hides console to tray.
 // This runs as a goroutine and polls the window state periodically.
 // Exits when shutdownChan is closed to prevent a leaked goroutine on app exit.
@@ -542,23 +576,19 @@ func monitorConsoleMinimize() {
 			continue
 		}
 
-		hwnd := getConsoleWindow()
-		if hwnd == 0 {
+		// Window was minimized - hide it to tray instead. The check and the
+		// hide happen together under consoleVisibilityMu (see
+		// hideMinimizedConsole) so this mutation can't race the installer's
+		// visibility snapshot.
+		if !hideMinimizedConsole() {
 			continue
 		}
 
-		// IsIconic returns non-zero if window is minimized
-		ret, _, _ := procIsIconic.Call(hwnd)
-		if ret != 0 {
-			// Window was minimized - hide it to tray instead
-			procShowWindow.Call(hwnd, SW_HIDE)
-
-			// Notify main.go to update the checkbox state
-			select {
-			case ConsoleHiddenChan <- true:
-			default:
-				// Channel full, skip (non-blocking)
-			}
+		// Notify main.go to update the checkbox state
+		select {
+		case ConsoleHiddenChan <- true:
+		default:
+			// Channel full, skip (non-blocking)
 		}
 	}
 }

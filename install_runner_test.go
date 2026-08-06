@@ -317,8 +317,12 @@ func TestGitDependencySpec_IsOptional(t *testing.T) {
 func TestInstallDiagnosticsSummary_Truncates(t *testing.T) {
 	long := strings.Repeat("x", 1000)
 	out := installDiagnosticsSummary(testSpec(), installOutcome{Kind: InstallOther, ExitCode: 5, Output: long})
-	if !strings.Contains(out, "Git.Git") {
-		t.Errorf("summary should include package id: %q", out)
+	// The package line names whatever THIS platform actually installs (the
+	// WinGet id on Windows, the brew/apt package elsewhere), so assert against
+	// platformPackageID rather than a hard-coded id. The per-platform values
+	// are pinned in install_runner_windows_test.go / install_runner_other_test.go.
+	if want := "Package: " + platformPackageID(testSpec()); !strings.Contains(out, want) {
+		t.Errorf("summary should include %q: %q", want, out)
 	}
 	if len(out) > 500 {
 		t.Errorf("summary should be bounded, got %d chars", len(out))

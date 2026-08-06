@@ -33,12 +33,27 @@ var verifyInstalledOnPath = func(cmd string) bool {
 	return probeVersion(cmd, "--version") != ""
 }
 
+// platformPackageID returns the package identifier performInstall actually
+// hands to brew/apt on this platform, so the recovery dialog and the audit log
+// name the package that was really attempted (`git`) rather than the WinGet id
+// (`Git.Git`), which is meaningless off Windows.
+func platformPackageID(spec DependencySpec) string {
+	return unixInstallPackage(spec)
+}
+
+// unixInstallPackage is the single source of truth for which package name the
+// Unix managers install, shared by performInstall and platformPackageID so the
+// attempted package and the reported one can't drift.
+func unixInstallPackage(spec DependencySpec) string {
+	if spec.UnixPackage != "" {
+		return spec.UnixPackage
+	}
+	return spec.VerifyCommand
+}
+
 // performInstall attempts a package-manager install on macOS/Linux.
 func performInstall(spec DependencySpec) installOutcome {
-	pkg := spec.UnixPackage
-	if pkg == "" {
-		pkg = spec.VerifyCommand
-	}
+	pkg := unixInstallPackage(spec)
 
 	// binary is what must exist on PATH; cmdName/args is what we actually run
 	// (apt-get needs sudo, mirroring ensureTtyd's Linux path).

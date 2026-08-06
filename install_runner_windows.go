@@ -70,6 +70,17 @@ type installAttempt struct {
 	outcome installOutcome
 }
 
+// platformPackageID returns the package identifier performInstall actually
+// hands to the Windows package managers. WinGet is the primary, so its id
+// leads; when a Scoop fallback is configured it is named too, since either
+// manager may be the one that failed.
+func platformPackageID(spec DependencySpec) string {
+	if spec.ScoopID != "" {
+		return fmt.Sprintf("%s (scoop: %s)", spec.WingetID, spec.ScoopID)
+	}
+	return spec.WingetID
+}
+
 // performInstall installs the dependency via WinGet, falling back to Scoop
 // when the spec configures it (e.g. ttyd). Output streams to the console
 // (preserving the setup UX) while a bounded tail is captured for diagnostics
