@@ -75,7 +75,18 @@ type installAttempt struct {
 // (preserving the setup UX) while a bounded tail is captured for diagnostics
 // and classification.
 func performInstall(spec DependencySpec) installOutcome {
+	// Surface the console so install progress is visible, but remember whether it
+	// was already showing and restore that state when we're done. The tray's
+	// "Show Console" checkbox is initialized from registration state, not this
+	// call, so leaving a forced-visible console would desync the menu item and
+	// leave the user having to toggle it twice to hide the window again.
+	consoleWasVisible := consoleWindowVisible()
 	showConsoleWindow(true)
+	defer func() {
+		if !consoleWasVisible {
+			showConsoleWindow(false)
+		}
+	}()
 
 	var attempts []installAttempt
 

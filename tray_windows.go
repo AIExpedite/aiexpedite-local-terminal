@@ -61,6 +61,9 @@ var (
 	// For detecting minimized window state
 	procIsIconic = user32.NewProc("IsIconic")
 
+	// For detecting whether the console window is currently shown
+	procIsWindowVisible = user32.NewProc("IsWindowVisible")
+
 	// For UAC elevation (auto-update in Program Files)
 	shell32             = syscall.NewLazyDLL("shell32.dll")
 	procShellExecuteExW = shell32.NewProc("ShellExecuteExW")
@@ -380,6 +383,22 @@ func freeConsole() {
 	}
 	procFreeConsole.Call()
 	consoleAllocated = false
+}
+
+// consoleWindowVisible reports whether an allocated console window currently
+// exists and is visible on screen. It returns false when no console has been
+// allocated yet, so callers can capture the pre-existing visibility and restore
+// it later (e.g. around a dependency install that forces the console open).
+func consoleWindowVisible() bool {
+	if !consoleAllocated {
+		return false
+	}
+	hwnd := getConsoleWindow()
+	if hwnd == 0 {
+		return false
+	}
+	ret, _, _ := procIsWindowVisible.Call(hwnd)
+	return ret != 0
 }
 
 // showConsoleWindow shows or hides the console window.
