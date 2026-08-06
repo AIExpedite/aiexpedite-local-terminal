@@ -22,7 +22,10 @@ const (
 
 // gitDependencySpec describes Git for the shared install runner. The prompt
 // names the actual package manager for the current OS so the consent dialog
-// matches what will run (winget / brew / apt).
+// matches what will run (winget / brew / apt). Optional is set because
+// ensureGit is non-fatal: startup continues when Git is declined, so the prompt
+// must offer "skip" rather than claiming Git is required and labelling the
+// decline "Exit".
 func gitDependencySpec() DependencySpec {
 	return DependencySpec{
 		DisplayName: "Git",
@@ -31,6 +34,7 @@ func gitDependencySpec() DependencySpec {
 		WingetID:        "Git.Git",
 		UnixPackage:     "git",
 		VerifyCommand:   "git",
+		Optional:        true,
 		ManualURL:       gitDownloadURL,
 		TroubleshootURL: gitTroubleshootURL,
 	}

@@ -65,7 +65,7 @@ func TestRunDependencyInstall_SuccessFirstAttempt(t *testing.T) {
 	defer withInstallSeams(t)()
 
 	execCalls := 0
-	installPrompt = func(string, string) InstallChoice { return InstallYes }
+	installPrompt = func(string, string, bool) InstallChoice { return InstallYes }
 	installExec = func(DependencySpec) installOutcome { execCalls++; return installOutcome{Kind: InstallOK} }
 	installRecovery = func(string, string, string, bool) InstallRecoveryChoice {
 		t.Fatal("recovery dialog should not be shown on success")
@@ -84,7 +84,7 @@ func TestRunDependencyInstall_RetryThenSucceeds(t *testing.T) {
 	defer withInstallSeams(t)()
 
 	execCalls, recoveryCalls := 0, 0
-	installPrompt = func(string, string) InstallChoice { return InstallYes }
+	installPrompt = func(string, string, bool) InstallChoice { return InstallYes }
 	installExec = func(DependencySpec) installOutcome {
 		execCalls++
 		if execCalls == 1 {
@@ -115,7 +115,7 @@ func TestRunDependencyInstall_RetryCapEnforced(t *testing.T) {
 	defer withInstallSeams(t)()
 
 	execCalls := 0
-	installPrompt = func(string, string) InstallChoice { return InstallYes }
+	installPrompt = func(string, string, bool) InstallChoice { return InstallYes }
 	installExec = func(DependencySpec) installOutcome {
 		execCalls++
 		return installOutcome{Kind: InstallLaunchFailed}
@@ -136,7 +136,7 @@ func TestRunDependencyInstall_ManualOpensBrowserOnce(t *testing.T) {
 	defer withInstallSeams(t)()
 
 	var openedURLs []string
-	installPrompt = func(string, string) InstallChoice { return InstallYes }
+	installPrompt = func(string, string, bool) InstallChoice { return InstallYes }
 	installExec = func(DependencySpec) installOutcome { return installOutcome{Kind: InstallOther} }
 	installRecovery = func(string, string, string, bool) InstallRecoveryChoice { return RecoveryManual }
 	installOpenURL = func(url string) error { openedURLs = append(openedURLs, url); return nil }
@@ -154,7 +154,7 @@ func TestRunDependencyInstall_TroubleshootThenExit(t *testing.T) {
 
 	var openedURLs []string
 	recoveryCalls := 0
-	installPrompt = func(string, string) InstallChoice { return InstallYes }
+	installPrompt = func(string, string, bool) InstallChoice { return InstallYes }
 	installExec = func(DependencySpec) installOutcome { return installOutcome{Kind: InstallLaunchFailed} }
 	installOpenURL = func(url string) error { openedURLs = append(openedURLs, url); return nil }
 	installRecovery = func(string, string, string, bool) InstallRecoveryChoice {
@@ -179,7 +179,7 @@ func TestRunDependencyInstall_TroubleshootThenExit(t *testing.T) {
 func TestRunDependencyInstall_DeclineAtPrompt(t *testing.T) {
 	defer withInstallSeams(t)()
 
-	installPrompt = func(string, string) InstallChoice { return InstallNo }
+	installPrompt = func(string, string, bool) InstallChoice { return InstallNo }
 	installExec = func(DependencySpec) installOutcome {
 		t.Fatal("install must not run when declined at the prompt")
 		return installOutcome{}
@@ -194,7 +194,7 @@ func TestRunDependencyInstall_LogsDiagnosticsOnFailure(t *testing.T) {
 	defer withInstallSeams(t)()
 	logPath := redirectSecurityLog(t)
 
-	installPrompt = func(string, string) InstallChoice { return InstallYes }
+	installPrompt = func(string, string, bool) InstallChoice { return InstallYes }
 	installExec = func(DependencySpec) installOutcome {
 		return installOutcome{Kind: InstallLaunchFailed, ExitCode: 42, Output: "installer file not found"}
 	}
@@ -215,6 +215,105 @@ func TestRunDependencyInstall_LogsDiagnosticsOnFailure(t *testing.T) {
 	}
 }
 
+// Skipping at the recovery dialog is an explicit opt-out, so the error must
+// satisfy errors.Is(err, errInstallDeclined) — installTtydWindows keys its
+// "install it and restart" exit branch off that sentinel, and without it the
+// tray app would keep running with no ttyd.
+func TestRunDependencyInstall_RecoveryExitReturnsDeclineSentinel(t *testing.T) {
+	defer withInstallSeams(t)()
+
+	installPrompt = func(string, string, bool) InstallChoice { return InstallYes }
+	installExec = func(DependencySpec) installOutcome { return installOutcome{Kind: InstallLaunchFailed} }
+	installRecovery = func(string, string, string, bool) InstallRecoveryChoice { return RecoveryExit }
+
+	err := runDependencyInstall(testSpec())
+	if !errors.Is(err, errInstallDeclined) {
+		t.Fatalf("expected an error wrapping errInstallDeclined, got %v", err)
+	}
+	// The classified reason must survive in the message for logs/support.
+	if !strings.Contains(err.Error(), "installer_launch_failed") {
+		t.Errorf("expected the failure reason in the message, got %q", err.Error())
+	}
+}
+
+// Exhausting retries is NOT a user opt-out, so it must not masquerade as one.
+func TestRunDependencyInstall_RetryCapIsNotADecline(t *testing.T) {
+	defer withInstallSeams(t)()
+
+	installPrompt = func(string, string, bool) InstallChoice { return InstallYes }
+	installExec = func(DependencySpec) installOutcome { return installOutcome{Kind: InstallLaunchFailed} }
+	installRecovery = func(string, string, string, bool) InstallRecoveryChoice { return RecoveryRetry }
+
+	err := runDependencyInstall(testSpec())
+	if err == nil {
+		t.Fatal("expected a failure error once retries are exhausted")
+	}
+	if errors.Is(err, errInstallDeclined) {
+		t.Fatalf("exhausted retries must not report a user decline, got %v", err)
+	}
+}
+
+// The spec's Optional flag must reach the permission prompt so an optional
+// dependency isn't described as required.
+func TestRunDependencyInstall_PassesOptionalToPrompt(t *testing.T) {
+	defer withInstallSeams(t)()
+
+	var gotOptional bool
+	installPrompt = func(_, _ string, optional bool) InstallChoice {
+		gotOptional = optional
+		return InstallNo
+	}
+
+	spec := testSpec()
+	spec.Optional = true
+	if err := runDependencyInstall(spec); !errors.Is(err, errInstallDeclined) {
+		t.Fatalf("expected errInstallDeclined, got %v", err)
+	}
+	if !gotOptional {
+		t.Fatal("expected the prompt to be told the dependency is optional")
+	}
+}
+
+// An optional dependency must not be told it "is required", and declining it
+// must not be labelled as exiting — ensureGit continues startup either way.
+func TestInstallPromptWording_OptionalVsRequired(t *testing.T) {
+	required := installPromptHeadline("Git", false)
+	if !strings.Contains(required, "required") {
+		t.Errorf("required headline should say so, got %q", required)
+	}
+	optional := installPromptHeadline("Git", true)
+	if strings.Contains(optional, "is required") {
+		t.Errorf("optional headline must not claim the dependency is required, got %q", optional)
+	}
+	if !strings.Contains(optional, "optional") {
+		t.Errorf("optional headline should say it's optional, got %q", optional)
+	}
+
+	if got := installDeclineLabel("Git", true); !strings.Contains(strings.ToLower(got), "skip") {
+		t.Errorf("optional decline label should offer to skip, got %q", got)
+	}
+	if got := installDeclineLabel("Git", false); !strings.Contains(got, "Exit") {
+		t.Errorf("required decline label should exit, got %q", got)
+	}
+	if got := installDeclineButton(true); got != "Skip" {
+		t.Errorf("optional decline button = %q, want Skip", got)
+	}
+	if got := installDeclineButton(false); got != "Exit" {
+		t.Errorf("required decline button = %q, want Exit", got)
+	}
+	if installPromptTitle(true) == installPromptTitle(false) {
+		t.Error("optional and required prompts should not share a title")
+	}
+}
+
+// Git is warning-level for readiness (ensureGit never aborts startup), so its
+// spec must be marked optional or the prompt misdescribes what happens next.
+func TestGitDependencySpec_IsOptional(t *testing.T) {
+	if !gitDependencySpec().Optional {
+		t.Error("Git is non-fatal for startup, so its spec must be Optional")
+	}
+}
+
 func TestInstallDiagnosticsSummary_Truncates(t *testing.T) {
 	long := strings.Repeat("x", 1000)
 	out := installDiagnosticsSummary(testSpec(), installOutcome{Kind: InstallOther, ExitCode: 5, Output: long})
@@ -232,7 +331,7 @@ func TestRunDependencyInstall_ManualBrowserFailureKeepsChoices(t *testing.T) {
 	defer withInstallSeams(t)()
 
 	openAttempts, recoveryCalls := 0, 0
-	installPrompt = func(string, string) InstallChoice { return InstallYes }
+	installPrompt = func(string, string, bool) InstallChoice { return InstallYes }
 	installExec = func(DependencySpec) installOutcome { return installOutcome{Kind: InstallLaunchFailed} }
 	installOpenURL = func(string) error { openAttempts++; return errors.New("no browser") }
 	installRecovery = func(string, string, string, bool) InstallRecoveryChoice {

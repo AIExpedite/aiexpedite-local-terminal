@@ -51,6 +51,12 @@ type DependencySpec struct {
 	ScoopID string
 	// UnixPackage is the package name for brew/apt on macOS/Linux, e.g. "git".
 	UnixPackage string
+	// Optional marks a dependency the app keeps running without (e.g. Git,
+	// which readiness only warns about). It changes the permission prompt so it
+	// doesn't claim the dependency "is required" and labels declining as "skip"
+	// rather than "exit" — otherwise the dialog contradicts what actually
+	// happens after the user declines.
+	Optional bool
 	// VerifyCommand is the executable that must appear on PATH once the
 	// install succeeds, e.g. "git". Used to confirm the install actually
 	// landed (WinGet can report success while the binary isn't yet visible).
@@ -140,7 +146,7 @@ var (
 // out, or the classified failure error when an install could not be
 // recovered. Callers decide whether that is fatal.
 func runDependencyInstall(spec DependencySpec) error {
-	switch installPrompt(spec.DisplayName, spec.PromptDescription) {
+	switch installPrompt(spec.DisplayName, spec.PromptDescription, spec.Optional) {
 	case InstallNo:
 		LogSecurityEvent(SecEvtInstallDeclined, "user declined install",
 			"component", spec.DisplayName, "at", "prompt")
@@ -208,16 +214,32 @@ func runDependencyInstall(spec DependencySpec) error {
 				presentRecoveryURL(spec, spec.TroubleshootURL, "troubleshoot")
 				// stay in the recovery sub-loop
 			case RecoveryExit:
-				return installGaveUp(spec, outcome)
+				return installDeclinedAtRecovery(spec, outcome)
 			}
 		}
 	}
 }
 
-// installGaveUp logs the user giving up on recovery and returns the classified
-// failure error.
-func installGaveUp(spec DependencySpec, o installOutcome) error {
+// installDeclinedAtRecovery records an explicit opt-out from the recovery
+// dialog ("Skip for now") and returns an error WRAPPING errInstallDeclined.
+// Callers distinguish the two outcomes: installTtydWindows exits cleanly with
+// finish-the-install instructions on an opt-out but treats an unrecovered
+// failure as fatal, and ensureGit reports "skipped" rather than a raw error. It
+// still carries the classified reason in its message for logs and support.
+func installDeclinedAtRecovery(spec DependencySpec, o installOutcome) error {
 	LogSecurityEvent(SecEvtInstallDeclined, "user exited recovery",
+		"component", spec.DisplayName, "at", "recovery",
+		"reason", installFailureReason(o.Kind))
+	return fmt.Errorf("%s install skipped after failure (%s): %w",
+		spec.DisplayName, installFailureReason(o.Kind), errInstallDeclined)
+}
+
+// installGaveUp handles the defensive path where recovery cannot continue even
+// though the user did not opt out (the dialog returned Retry past the cap). It
+// returns the classified failure error and deliberately does NOT wrap
+// errInstallDeclined — nothing was declined.
+func installGaveUp(spec DependencySpec, o installOutcome) error {
+	LogSecurityEvent(SecEvtInstallFailed, "install recovery exhausted",
 		"component", spec.DisplayName, "at", "recovery",
 		"reason", installFailureReason(o.Kind))
 	return fmt.Errorf("%s install failed: %s",
@@ -246,6 +268,52 @@ func presentRecoveryURL(spec DependencySpec, url, purpose string) bool {
 		return false
 	}
 	return true
+}
+
+// Permission-prompt wording. These live here (no build tag) so the Windows and
+// non-Windows ShowInstallPrompt implementations share one source of truth and
+// can't drift — the same reason InstallRecoveryChoice is defined here.
+
+// installPromptTitle returns the dialog title for a required vs optional
+// dependency.
+func installPromptTitle(optional bool) string {
+	if optional {
+		return "AI Expedite - Optional Setup"
+	}
+	return "AI Expedite - Setup Required"
+}
+
+// installPromptHeadline returns the opening line of the permission dialog. An
+// optional dependency must not claim to be "required": startup continues when
+// it is declined (see ensureGit), so a "required" headline would tell the user
+// something that isn't true of what happens next.
+func installPromptHeadline(component string, optional bool) string {
+	if optional {
+		return fmt.Sprintf(
+			"%s is not installed.\n\n"+
+				"It's optional — AI Expedite will keep running without it, but "+
+				"workflows that need %s won't work until it's installed.",
+			component, component)
+	}
+	return fmt.Sprintf("%s is required but not installed.", component)
+}
+
+// installDeclineLabel returns the long-form wording for the "don't install"
+// choice, used where the dialog spells out what each button does.
+func installDeclineLabel(component string, optional bool) string {
+	if optional {
+		return fmt.Sprintf("Skip for now (continue without %s)", component)
+	}
+	return "Exit and install manually"
+}
+
+// installDeclineButton returns the short button caption for the "don't
+// install" choice, for GUI toolkits that render captions rather than a list.
+func installDeclineButton(optional bool) string {
+	if optional {
+		return "Skip"
+	}
+	return "Exit"
 }
 
 // installFailureReason returns a short, log-friendly reason slug.

@@ -142,22 +142,25 @@ const (
 	InstallManual
 )
 
-// ShowInstallPrompt displays a dialog asking user permission to install a dependency
-// Returns: InstallYes (auto-install), InstallNo (exit), InstallManual (open download page)
-func ShowInstallPrompt(component, description string) InstallChoice {
+// ShowInstallPrompt displays a dialog asking user permission to install a dependency.
+// optional selects the wording for a dependency the app runs without (see
+// DependencySpec.Optional): NO then means "skip and continue", not "exit".
+// Returns: InstallYes (auto-install), InstallNo (decline), InstallManual (open download page)
+func ShowInstallPrompt(component, description string, optional bool) InstallChoice {
 	message := fmt.Sprintf(
-		"%s is required but not installed.\n\n"+
+		"%s\n\n"+
 			"%s\n\n"+
 			"Would you like to install it automatically?\n\n"+
 			"Click:\n"+
 			"  YES = Install automatically (via winget)\n"+
-			"  NO = Exit and install manually\n"+
+			"  NO = %s\n"+
 			"  CANCEL = Open download page",
-		component,
+		installPromptHeadline(component, optional),
 		description,
+		installDeclineLabel(component, optional),
 	)
 
-	title := "AI Expedite - Setup Required"
+	title := installPromptTitle(optional)
 
 	titlePtr, _ := syscall.UTF16PtrFromString(title)
 	msgPtr, _ := syscall.UTF16PtrFromString(message)
