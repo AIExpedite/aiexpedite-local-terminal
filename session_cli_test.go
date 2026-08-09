@@ -29,6 +29,7 @@
 package main
 
 import (
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -820,6 +821,39 @@ func TestDetectCLITerminalEvent_UnknownCommand(t *testing.T) {
 	// based on JSON event content — those flows use plain-text output.
 	if detectCLITerminalEvent("git", `{"type":"result"}`) {
 		t.Error("non-CLI command must never match a terminal event")
+	}
+}
+
+func TestReadOutputStream_ClaudeFailurePrecedesTurnComplete(t *testing.T) {
+	session := &CLISession{
+		ID:             "claude-failed-turn",
+		Command:        "claude",
+		Stdout:         io.NopCloser(strings.NewReader(`{"type":"result","is_error":true,"error":"Prompt is too long"}` + "\n")),
+		Stderr:         io.NopCloser(strings.NewReader("")),
+		streamDone:     make(chan struct{}),
+		firstRealFrame: make(chan struct{}),
+	}
+	published := make(chan resultMsg, 4)
+
+	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
+		published <- msg
+	})
+	close(published)
+
+	var errorSeq, completeSeq int
+	for msg := range published {
+		if msg.Type == "stream" && strings.Contains(msg.Output, "Prompt is too long") {
+			errorSeq = msg.Seq
+		}
+		if msg.Type == "prompt" && msg.PromptType == "turn_complete" {
+			completeSeq = msg.Seq
+		}
+	}
+	if errorSeq == 0 || completeSeq == 0 {
+		t.Fatalf("missing failure stream or turn_complete prompt: error Seq=%d, complete Seq=%d", errorSeq, completeSeq)
+	}
+	if errorSeq >= completeSeq {
+		t.Fatalf("failure stream Seq=%d must precede turn_complete Seq=%d", errorSeq, completeSeq)
 	}
 }
 
