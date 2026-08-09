@@ -876,14 +876,16 @@ func TestExtractDisplayText_Claude_AssistantWholesaleRecapSkipped(t *testing.T) 
 }
 
 func TestExtractDisplayText_Claude_SkipsMetadataEvents(t *testing.T) {
-	// init / system / user / tool_result / result / rate_limit_event must NOT
-	// produce display text — they're metadata.
+	// init / system / user / tool_result / SUCCESSFUL result / rate_limit_event
+	// must NOT produce display text — they're metadata. (A failing result is a
+	// different case entirely — see the is_error tests below.)
 	cases := []string{
 		`{"type":"init","session_id":"abc"}`,
 		`{"type":"system","msg":"hi"}`,
 		`{"type":"user","message":{}}`,
 		`{"type":"tool_result","tool_use_id":"x"}`,
 		`{"type":"result","subtype":"success","result":"final"}`,
+		`{"type":"result","subtype":"success","result":"final","is_error":false}`,
 		`{"type":"rate_limit_event","retry_after":5}`,
 	}
 	for _, line := range cases {
@@ -891,6 +893,41 @@ func TestExtractDisplayText_Claude_SkipsMetadataEvents(t *testing.T) {
 		if got != "" {
 			t.Errorf("expected empty display text for %q, got %q", line, got)
 		}
+	}
+}
+
+func TestExtractDisplayText_Claude_FailedResultSurfacesErrorText(t *testing.T) {
+	// The 2026-08-07 stall: every turn ended in an is_error result whose text
+	// this parser discarded, so the orchestrator only ever saw empty output and
+	// backed off for 16h instead of failing. The reason must reach the chunk
+	// stream. Claude Code has used three different field names for it across
+	// versions — all three must surface.
+	cases := []struct {
+		line string
+		want string
+	}{
+		{`{"type":"result","is_error":true,"result":"Claude AI usage limit reached"}`, "Claude AI usage limit reached"},
+		{`{"type":"result","is_error":true,"error":"Prompt is too long"}`, "Prompt is too long"},
+		{`{"type":"result","is_error":true,"message":"OAuth token expired"}`, "OAuth token expired"},
+	}
+	for _, tc := range cases {
+		got := extractDisplayText("claude", tc.line)
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("extractDisplayText(%q) = %q, want it to contain %q", tc.line, got, tc.want)
+		}
+		if !strings.Contains(got, "Claude turn failed") {
+			t.Errorf("extractDisplayText(%q) = %q, want a 'Claude turn failed' marker", tc.line, got)
+		}
+	}
+}
+
+func TestExtractDisplayText_Claude_FailedResultWithoutTextStillReportsFailure(t *testing.T) {
+	// An is_error result carrying no readable text must still tell the reader
+	// the turn FAILED. Silence here is what let the orchestrator mistake a
+	// broken CLI for a CLI that simply had nothing to say.
+	got := extractDisplayText("claude", `{"type":"result","is_error":true}`)
+	if !strings.Contains(got, "Claude turn failed") {
+		t.Errorf("got %q, want a 'Claude turn failed' marker", got)
 	}
 }
 

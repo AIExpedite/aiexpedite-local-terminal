@@ -208,7 +208,35 @@ func extractClaudeFlatEvent(raw map[string]interface{}, eventType string) string
 		}
 		return ""
 
-	case "tool_result", "result", "init", "system", "user", "rate_limit_event":
+	case "result":
+		// A SUCCESSFUL result is the turn recap — skip it, the deltas already
+		// carried every word (same reasoning as the assistant branch above).
+		//
+		// An `is_error` result is different in kind: it is the ONLY record of
+		// WHY the turn failed, and discarding it is what made the 2026-08-07
+		// prod stall unreadable. Claude Code on a terminal computer with an
+		// expired login completed turn after turn in ~1s, each one emitting an
+		// is_error result this branch threw away. The device still published
+		// the `turn_complete` prompt marker (session.go keys that off the
+		// result event), so the session looked healthy while every chunk was
+		// empty — the orchestrator saw "empty output", could not tell a broken
+		// CLI from a quiet one, and backed off 54 times over 16 hours.
+		//
+		// Auth-class failures never reach here: detectClaudeAuthFailure runs
+		// first in the read loop and `continue`s after publishing its own
+		// actionable message. What surfaces here is every OTHER fatal turn
+		// error — quota exhaustion, context overflow, a killed subprocess.
+		if isErr, _ := raw["is_error"].(bool); isErr {
+			if text := claudeResultErrorText(raw); text != "" {
+				return fmt.Sprintf("\n[Claude turn failed: %s]\n", text)
+			}
+			// is_error with no text still beats silence: the orchestrator
+			// learns the turn FAILED rather than inferring an empty answer.
+			return "\n[Claude turn failed with no error detail]\n"
+		}
+		return ""
+
+	case "tool_result", "init", "system", "user", "rate_limit_event":
 		return "" // skip metadata
 	}
 
