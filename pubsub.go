@@ -2603,21 +2603,27 @@ func shellExpandHasParamBackslash(s string) bool {
 // substitution (`=ls` → /bin/ls under zsh EQUALS). Rebuilding as a single-quoted
 // --print value freezes the `=` and changes the prompt; callers must decline
 // reshape on zsh when this is set.
+//
+// Classification uses segment Unquoted, not the stripped Value alone:
+//   - `\=ls` — tokenizer writes the escaped `=` with wasEscaped (Unquoted=false),
+//     so this is literal even though Value is "=ls".
+//   - `"=ls"` / `'=ls'` — quoted leading `=` (Unquoted=false) is literal.
+//   - `”=ls` / `""=ls` — empty leading quotes contribute no bytes; the unquoted
+//     `=` that follows is still word-initial EQUALS after quote removal.
 func (w shellWord) hasZshEqualsSub() bool {
-	segs := w.effectiveSegments()
-	if len(segs) == 0 {
+	if len(w.Value) < 2 || w.Value[0] != '=' {
 		return false
 	}
-	// Leading unquoted "=" with at least one following character in the word.
-	first := segs[0]
-	if !first.Unquoted || !strings.HasPrefix(first.Value, "=") {
-		return false
+	// Locate the segment that contributes the leading '=' of the joined value.
+	// Skip empty segments from '' / "" so ''=ls is still word-initial EQUALS.
+	for _, seg := range w.effectiveSegments() {
+		if len(seg.Value) == 0 {
+			continue
+		}
+		// First non-empty segment owns the first byte of w.Value.
+		return seg.Unquoted && seg.Value[0] == '='
 	}
-	if len(first.Value) >= 2 {
-		return true
-	}
-	// "=" alone in the first segment, more content in later segments.
-	return len(w.Value) >= 2 && w.Value[0] == '='
+	return false
 }
 
 // shellExpandIsMultiWord reports whether s contains a bash/zsh expansion that

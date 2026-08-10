@@ -1187,12 +1187,37 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	}
 	// An escaped leading equals is literal even on zsh, so the eligible
 	// one-shot should still reshape. Bash follows the same literal path.
+	// Tokenizer marks escaped `=` Unquoted=false so hasZshEqualsSub does not
+	// treat stripped Value "=ls" as EQUALS.
 	escapedZshEq := `agy \=ls review`
 	wantEscapedZshEq := `agy --dangerously-skip-permissions --print '=ls review'`
 	for _, shell := range []string{"zsh", "bash"} {
 		_, args := shapePTYExecArgs(shell, []string{"-c", escapedZshEq})
 		if args[1] != wantEscapedZshEq {
 			t.Errorf("%s escaped literal =ls = %q, want %q", shell, args[1], wantEscapedZshEq)
+		}
+	}
+	// Quoted leading `=` is also literal (EQUALS requires unquoted `=`).
+	for _, quotedEq := range []string{`agy "=ls" review`, `agy '=ls' review`} {
+		wantQuoted := `agy --dangerously-skip-permissions --print '=ls review'`
+		for _, shell := range []string{"zsh", "bash"} {
+			_, args := shapePTYExecArgs(shell, []string{"-c", quotedEq})
+			if args[1] != wantQuoted {
+				t.Errorf("%s quoted literal =ls (%s) = %q, want %q", shell, quotedEq, args[1], wantQuoted)
+			}
+		}
+	}
+	// Empty quotes before unquoted `=` still leave word-initial EQUALS after
+	// quote removal (`''=ls` → =ls). Decline reshape on zsh only.
+	for _, emptyQ := range []string{`agy ''=ls review`, `agy ""=ls review`} {
+		_, zshEmpty := shapePTYExecArgs("zsh", []string{"-c", emptyQ})
+		if zshEmpty[1] != emptyQ {
+			t.Errorf("zsh empty-quote equals sub was reshaped: got %q, want original %q", zshEmpty[1], emptyQ)
+		}
+		_, bashEmpty := shapePTYExecArgs("bash", []string{"-c", emptyQ})
+		wantBashEmpty := `agy --dangerously-skip-permissions --print '=ls review'`
+		if bashEmpty[1] != wantBashEmpty {
+			t.Errorf("bash empty-quote literal =ls (%s) = %q, want %q", emptyQ, bashEmpty[1], wantBashEmpty)
 		}
 	}
 
