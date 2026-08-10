@@ -1156,6 +1156,20 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	if arith[1] != wantArith {
 		t.Errorf("legacy arithmetic expand = %q, want %q", arith[1], wantArith)
 	}
+
+	// Dash leaves `$[…]` literal (no legacy arith). Incomplete `$[1+2` must not
+	// be treated as unquoted expansion — still reshape with --print.
+	_, dashArith := shapePTYExecArgs("dash", []string{"-c", `agy $[1+2`})
+	wantDashArith := `agy --dangerously-skip-permissions --print '$[1+2'`
+	if dashArith[1] != wantDashArith {
+		t.Errorf("dash literal $[ = %q, want %q", dashArith[1], wantDashArith)
+	}
+	// Bash unquoted `$[…]` is expansion — leave unshaped (hasUnquotedExpand).
+	origBashArith := `agy $[1+2]`
+	_, bashUnq := shapePTYExecArgs("bash", []string{"-c", origBashArith})
+	if bashUnq[1] != origBashArith {
+		t.Errorf("bash unquoted $[ was reshaped: got %q, want original %q", bashUnq[1], origBashArith)
+	}
 }
 
 // Dash lacks ANSI-C / locale dollar-quoting: $'text' is literal "$text" and
@@ -1453,7 +1467,7 @@ func TestShellWords(t *testing.T) {
 		{`agy review#note`, []string{"agy", "review#note"}, []bool{false, false}, false},
 	}
 	// Table cases model bash (brace expand + dollar-quote).
-	bashOpts := shellWordOptions{braceExpand: true, dollarQuote: true, assignTilde: true}
+	bashOpts := shellWordOptions{braceExpand: true, dollarQuote: true, assignTilde: true, legacyArith: true}
 	for _, tc := range cases {
 		got, err := shellWords(tc.in, bashOpts)
 		if tc.wantErr {

@@ -2208,6 +2208,7 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 		braceExpand: shellSupportsBraceExpansion(shellCmd),
 		dollarQuote: shellSupportsDollarQuote(shellCmd),
 		assignTilde: shellSupportsAssignTilde(shellCmd),
+		legacyArith: shellSupportsLegacyArith(shellCmd),
 	})
 	if err != nil {
 		// Malformed shell (unterminated quote, etc.) — do not reshape into a
@@ -2761,6 +2762,10 @@ type shellWordOptions struct {
 	// dash/ash leave those forms literal; word-initial ~/x still expands
 	// on all shells and is gated separately.
 	assignTilde bool
+	// legacyArith is true when the wrapper evaluates bash-style `$[…]`
+	// arithmetic. Dash/ash leave `$[…]` as literal `$` + text; treating `[`
+	// as expansion there declines reshape and leaves interactive agy waiting.
+	legacyArith bool
 }
 
 // shellSupportsBraceExpansion reports whether the named shell executable
@@ -2816,6 +2821,14 @@ func shellSupportsDollarQuote(command string) bool {
 		// bash, zsh, ksh, and unknown → assume dollar-quoting exists.
 		return true
 	}
+}
+
+// shellSupportsLegacyArith reports whether the named shell evaluates bash
+// legacy `$[…]` arithmetic. Dash/ash leave those forms literal. Bare `sh`
+// resolves like dollar-quote/brace (bash-as-sh still has `$[…]`).
+func shellSupportsLegacyArith(command string) bool {
+	// Same dialect split as dollar-quote for practical purposes.
+	return shellSupportsDollarQuote(command)
 }
 
 // shellCommandBase returns the lowercased executable basename without .exe.
@@ -3143,7 +3156,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// `{`/`}` still nest paramDepth inside an open ${…}.
 			if c == '$' {
 				j := nextAfterLineContinuations(s, i+1)
-				expandable := j < len(s) && shellDollarStartsExpand(s[j])
+				expandable := j < len(s) && shellDollarStartsExpand(s[j], opts.legacyArith)
 				writeSeg(c, expandable)
 				if expandable {
 					markPendingParamBrace(s[j])
@@ -3258,7 +3271,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 					writeSeg(c, false)
 					continue
 				}
-				expandable := j < len(s) && shellDollarStartsExpand(s[j])
+				expandable := j < len(s) && shellDollarStartsExpand(s[j], opts.legacyArith)
 				writeSeg(c, expandable)
 				if expandable {
 					markPendingParamBrace(s[j])
@@ -3289,16 +3302,20 @@ func nextAfterLineContinuations(s string, i int) int {
 	return i
 }
 
-// shellDollarStartsExpand reports whether b can begin a bash expansion after
-// '$' (parameter name, special parameter, ${…}, $(…), $((…)), $[…], $$). A
-// lone or otherwise non-expanding '$' is left as a literal character.
-// `$[…]` is bash's legacy arithmetic form (still evaluated in double quotes
-// on bash 5.x); without recognizing it the reshaper would single-quote the
-// token and freeze the expression as the model prompt.
-func shellDollarStartsExpand(b byte) bool {
+// shellDollarStartsExpand reports whether b can begin an expansion after '$'
+// (parameter name, special parameter, ${…}, $(…), $((…)), $$; and `$[…]` when
+// legacyArith is true). A lone or otherwise non-expanding '$' is left literal.
+// `$[…]` is bash's legacy arithmetic form (still evaluated in double quotes on
+// bash 5.x); without recognizing it on bash the reshaper would single-quote
+// the token and freeze the expression. On dash/ash, `$[` is literal — do not
+// mark expand (that would decline reshape for unquoted `$[1+2` and leave
+// interactive agy waiting).
+func shellDollarStartsExpand(b byte, legacyArith bool) bool {
 	switch b {
-	case '{', '(', '[', '@', '*', '#', '?', '-', '!', '_', '$':
+	case '{', '(', '@', '*', '#', '?', '-', '!', '_', '$':
 		return true
+	case '[':
+		return legacyArith
 	}
 	if b >= '0' && b <= '9' {
 		return true
