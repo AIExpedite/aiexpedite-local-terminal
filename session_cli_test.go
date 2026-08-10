@@ -830,6 +830,27 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		}
 	}
 
+	// Closed-but-invalid bracket expressions (`[]`, `[!]`, `[^]`) are literal
+	// in bash even with failglob — still reshape with --print rather than
+	// treating the first `]` as enough to decline.
+	for _, tc := range []struct {
+		orig, want string
+	}{
+		{`agy []`, `agy --dangerously-skip-permissions --print '[]'`},
+		{`agy [!]`, `agy --dangerously-skip-permissions --print '[!]'`},
+		{`agy [^]`, `agy --dangerously-skip-permissions --print '[^]'`},
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", tc.orig})
+		if args[1] != tc.want {
+			t.Errorf("invalid bracket class %q = %q, want %q", tc.orig, args[1], tc.want)
+		}
+	}
+	// Valid class with ] as first member still expands — leave unshaped.
+	_, closeFirst := shapePTYExecArgs("bash", []string{"-c", `agy []]`})
+	if closeFirst[1] != `agy []]` {
+		t.Errorf("valid []] class was reshaped: got %q", closeFirst[1])
+	}
+
 	// Quoted braces/globs are literal — safe to reshape with single quotes.
 	_, qArgs := shapePTYExecArgs("bash", []string{"-c", `agy 'file{1,2}'`})
 	wantQ := `agy --dangerously-skip-permissions --print 'file{1,2}'`
@@ -1059,6 +1080,27 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	wantBashEq := `agy --dangerously-skip-permissions --print '=ls review'`
 	if bashEq[1] != wantBashEq {
 		t.Errorf("bash literal =ls = %q, want %q", bashEq[1], wantBashEq)
+	}
+
+	// zsh PE split/array flags still multi-field when double-quoted
+	// (`"${(s.:.)TASK}"` with TASK=fix:bug → fix bug). Reshape would put only
+	// the first field in --print — leave unshaped. Single-field flags ((U))
+	// still reshape.
+	for _, orig := range []string{
+		`agy "${(s.:.)TASK}"`,
+		`agy "${(@)arr}"`,
+		`agy "${(f)TASK}"`,
+		`agy "${(z)TASK}"`,
+	} {
+		_, args := shapePTYExecArgs("zsh", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("zsh multi-field PE flags was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+	_, zshU := shapePTYExecArgs("zsh", []string{"-c", `agy "${(U)TASK}"`})
+	wantZshU := `agy --dangerously-skip-permissions --print "${(U)TASK}"`
+	if zshU[1] != wantZshU {
+		t.Errorf("zsh single-field PE flag = %q, want %q", zshU[1], wantZshU)
 	}
 
 	// "$*" / "${files[*]}" stay a single field when double-quoted — still reshape.

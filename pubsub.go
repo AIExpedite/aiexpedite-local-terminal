@@ -2617,10 +2617,11 @@ func (w shellWord) hasZshEqualsSub() bool {
 	return len(w.Value) >= 2 && w.Value[0] == '='
 }
 
-// shellExpandIsMultiWord reports whether s contains a bash expansion that
-// produces multiple fields even when double-quoted: $@ / ${@…} / ${name[@]…}.
-// Nested ${…} bodies are extracted with balanced braces so
-// "${x:-${@:1}}" is classified as multi-word (not truncated at the inner }).
+// shellExpandIsMultiWord reports whether s contains a bash/zsh expansion that
+// produces multiple fields even when double-quoted: $@ / ${@…} / ${name[@]…}
+// and zsh ${(s…)/(@)/f/z…} parameter flags. Nested ${…} bodies are extracted
+// with balanced braces so "${x:-${@:1}}" is classified as multi-word (not
+// truncated at the inner }).
 func shellExpandIsMultiWord(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] != '$' || i+1 >= len(s) {
@@ -2666,8 +2667,8 @@ func shellParamCloseBrace(s string, bodyStart int) int {
 
 // shellParamBodyIsMultiWord reports whether a ${…} body (without braces) is a
 // multi-field expansion: @ with optional operators, name[@] / !name[@],
-// prefix-name expansion ${!prefix@}, or a nested multi-field form in an
-// operator value (${x:+$@}, ${x:-${a[@]}}, …).
+// prefix-name expansion ${!prefix@}, zsh ${(flags)…} split/array flags, or a
+// nested multi-field form in an operator value (${x:+$@}, ${x:-${a[@]}}, …).
 //
 // Literal text in operator words that merely contains the substring "[@]"
 // (e.g. ${x:-foo[@]}) is NOT multi-field — only a structural array subscript
@@ -2675,6 +2676,22 @@ func shellParamCloseBrace(s string, bodyStart int) int {
 func shellParamBodyIsMultiWord(body string) bool {
 	if body == "" {
 		return false
+	}
+	// Zsh ${(flags)param}: a leading parenthesized flag list. Split/array
+	// flags still yield multiple fields when double-quoted
+	// (`"${(s.:.)TASK}"` → fix bug; `"${(@)arr}"` → separate elements).
+	// Single-field flags ((U), (L), (j:…:), …) are stripped so the name is
+	// classified normally.
+	if body[0] == '(' {
+		if flags, rest, ok := splitZshPEFlagPrefix(body); ok {
+			if zshPEFlagsAreMultiWord(flags) {
+				return true
+			}
+			body = rest
+			if body == "" {
+				return false
+			}
+		}
 	}
 	hadBang := false
 	// Indirect / nameref / prefix-name forms start with '!': ${!name[@]},
@@ -2734,6 +2751,71 @@ func shellParamBodyIsMultiWord(body string) bool {
 	// literal operator defaults like foo[@] stay single-field.
 	if i < len(body) {
 		return shellExpandIsMultiWord(body[i:])
+	}
+	return false
+}
+
+// splitZshPEFlagPrefix peels a leading zsh ${(flags)…} flag list off a ${…}
+// body. body must start with '('. Returns the flags (without parens), the
+// remainder after the closing ')', and true when a balanced list is found.
+func splitZshPEFlagPrefix(body string) (flags, rest string, ok bool) {
+	if body == "" || body[0] != '(' {
+		return "", body, false
+	}
+	depth := 0
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return body[1:i], body[i+1:], true
+			}
+		}
+	}
+	return "", body, false
+}
+
+// zshPEFlagsAreMultiWord reports zsh parameter-expansion flags that still
+// produce multiple fields when the expansion is double-quoted.
+//
+//	@     — array elements as separate words ("${(@)a}")
+//	s/S   — split on a string ("${(s.:.)TASK}")
+//	f/F   — split on newlines
+//	z/Z   — shell-word split
+//	0     — split on NUL
+//
+// Join (j) and case (U/L) flags stay single-field.
+func zshPEFlagsAreMultiWord(flags string) bool {
+	i := 0
+	for i < len(flags) {
+		c := flags[i]
+		switch c {
+		case '@', 's', 'S', 'f', 'F', 'z', 'Z', '0':
+			return true
+		case ':':
+			// Orphan :arg: payload — skip to its closer.
+			i++
+			for i < len(flags) && flags[i] != ':' {
+				i++
+			}
+			if i < len(flags) {
+				i++
+			}
+		default:
+			i++
+			// Flag argument form letter:arg: (e.g. j:/: join — single-field).
+			if i < len(flags) && flags[i] == ':' {
+				i++
+				for i < len(flags) && flags[i] != ':' {
+					i++
+				}
+				if i < len(flags) {
+					i++
+				}
+			}
+		}
 	}
 	return false
 }
@@ -3327,37 +3409,56 @@ func shellDollarStartsExpand(b byte, legacyArith bool) bool {
 }
 
 // looksLikeUnquotedBracketGlob reports whether s[openIdx] (must be '[') starts
-// a complete unquoted bracket expression […]. Bash/dash treat unmatched `[` as
-// a literal character, not a pathname pattern; only a matching `]` within the
-// same word makes it expandable. Quote/escape-aware: spaces inside quotes or
-// after backslash (`[a" "b]`, `[a\ b]`) stay in the same word and still form
-// a complete class. Unquoted whitespace ends the word (incomplete). We do not
-// validate class contents — any closed form is enough to decline reshape.
+// a complete, valid unquoted bracket expression […]. Bash/dash treat unmatched
+// `[` as a literal character, not a pathname pattern; only a matching `]`
+// within the same word can make it expandable — and only when the class body
+// is non-empty. Closed-but-invalid forms (`[]`, `[!]`, `[^]`) stay literal in
+// bash even with failglob, so those must return false (eligible one-shots still
+// gain --print). Quote/escape-aware: spaces inside quotes or after backslash
+// (`[a" "b]`, `[a\ b]`) stay in the same word. Unquoted whitespace ends the
+// word (incomplete). A leading `]` after optional `!`/`^` is a class member
+// (POSIX), not the closer (`[]]` matches `]`).
 func looksLikeUnquotedBracketGlob(s string, openIdx int) bool {
 	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != '[' {
 		return false
 	}
 	inSingle, inDouble := false, false
 	escaped := false
-	for j := openIdx + 1; j < len(s); j++ {
+	// memberCount counts class members after optional leading !/^ negation.
+	// memberCount==0 means the next unquoted ] is itself a member (POSIX),
+	// not the expression closer.
+	memberCount := 0
+	j := openIdx + 1
+	// Optional negation only at the first class position (unquoted, unescaped).
+	if j < len(s) && (s[j] == '!' || s[j] == '^') {
+		j++
+	}
+	for ; j < len(s); j++ {
 		c := s[j]
 		if escaped {
+			// Escaped byte is always a class member.
 			escaped = false
+			memberCount++
 			continue
 		}
 		if inSingle {
 			if c == '\'' {
 				inSingle = false
+			} else {
+				memberCount++
 			}
 			continue
 		}
 		if inDouble {
 			if c == '\\' && j+1 < len(s) {
 				j++ // skip escaped byte inside double quotes
+				memberCount++
 				continue
 			}
 			if c == '"' {
 				inDouble = false
+			} else {
+				memberCount++
 			}
 			continue
 		}
@@ -3373,7 +3474,15 @@ func looksLikeUnquotedBracketGlob(s string, openIdx int) bool {
 			// CR is not IFS whitespace (same as shellWords).
 			return false
 		case ']':
+			if memberCount == 0 {
+				// First character of the matching list is ] — include it.
+				memberCount++
+				continue
+			}
+			// Closer after at least one member → valid bracket expression.
 			return true
+		default:
+			memberCount++
 		}
 	}
 	return false
