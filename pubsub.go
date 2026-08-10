@@ -2471,7 +2471,7 @@ func (w shellWord) effectiveSegments() []shellSegment {
 // An unquoted `#` at a word boundary ends tokenization (shell comment).
 // Backslash-newline line continuations (quoted or unquoted) drop both chars and
 // do not start a word (so a following `#` stays a comment).
-// Escaped `$` / `` ` `` inside an open `${…}` declines reshape (segment splits
+// Escaped `$` / “ ` “ inside an open `${…}` declines reshape (segment splits
 // would break the expansion syntax on rebuild).
 // Callers must not turn rejected payloads into a valid command.
 func shellWords(s string) ([]shellWord, error) {
