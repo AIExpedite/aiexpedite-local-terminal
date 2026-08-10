@@ -2191,108 +2191,161 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 // is agy/antigravity so the inner invocation gains the one-shot
 // `--dangerously-skip-permissions --print <prompt>` shaping, returning the
 // rewritten payload and true. It returns ("", false) when the first token is
-// not an antigravity command. Argv is sourced from buildAntigravityInteractiveArgs
-// so it cannot drift from the direct path.
+// not an antigravity command, or when the payload has unterminated shell
+// quotes (leave the original payload alone so bash reports the syntax error
+// rather than inventing a valid permission-skipping invocation).
 //
-// The payload is shell-tokenized first (quotes / backslash escapes removed as
-// bash would) so a caller-supplied `agy "fix the bug"` does NOT re-quote the
-// quote characters into the --print value. Multi-word prompt values are then
-// re-quoted on rebuild so bash -c does not re-split them.
+// Tokenization strips protective quotes/escapes and tracks whether each word
+// came from an expansion-eligible context (unquoted / double-quoted) so the
+// rebuild can preserve `$VAR` expansion for `agy "$TASK"` while keeping
+// single-quoted material literal.
 func shapeAntigravityShellPayload(payload string) (string, bool) {
-	words := shellWords(payload)
-	if len(words) == 0 || !isAntigravityCommand(words[0]) {
+	words, err := shellWords(payload)
+	if err != nil {
+		// Malformed shell (unterminated quote, etc.) — do not reshape into a
+		// runnable agy command.
 		return "", false
 	}
-	// words[1:] are already shell-evaluated values (quotes/escapes applied),
-	// matching what bash would pass as argv to agy.
-	shapedArgs := buildAntigravityInteractiveArgs(words[1:])
-	return joinAntigravityShellCommand(words[0], shapedArgs...), true
+	if len(words) == 0 || !isAntigravityCommand(words[0].Value) {
+		return "", false
+	}
+	callerVals := make([]string, 0, len(words)-1)
+	promptExpand := false
+	for _, w := range words[1:] {
+		callerVals = append(callerVals, w.Value)
+		if w.Expand {
+			promptExpand = true
+		}
+	}
+	shapedArgs := buildAntigravityInteractiveArgs(callerVals)
+	return joinAntigravityShellCommand(words[0].Value, shapedArgs, promptExpand), true
+}
+
+// shellWord is one token from shellWords. Expand is true when any unquoted or
+// double-quoted content contributed to the value (bash would expand $/` there).
+// Single-quoted-only material sets Expand=false so rebuild can keep it literal.
+type shellWord struct {
+	Value  string
+	Expand bool
 }
 
 // shellWords splits a shell-style command line into argument values, applying
 // a POSIX-ish subset of quote and backslash rules (single quotes, double
 // quotes, and backslash escapes outside single quotes). Enough for the
 // operator-joined `bash -c "agy …"` payloads we reshape — not a full shell.
-func shellWords(s string) []string {
-	var words []string
+//
+// Returns an error when a quote remains open at end-of-input (unterminated
+// syntax). Callers must not turn such payloads into a valid command.
+func shellWords(s string) ([]shellWord, error) {
+	var words []shellWord
 	var cur strings.Builder
 	inSingle, inDouble := false, false
 	escaped := false
 	started := false
+	// expandWord is sticky true once any expansion-eligible char is written.
+	expandWord := false
 	flush := func() {
 		if started {
-			words = append(words, cur.String())
+			words = append(words, shellWord{Value: cur.String(), Expand: expandWord})
 			cur.Reset()
 			started = false
+			expandWord = false
 		}
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if escaped {
 			cur.WriteByte(c)
+			// Backslash-escaped content outside single quotes is literal, but
+			// the surrounding context is still expansion-eligible for other chars.
 			escaped = false
 			started = true
+			expandWord = true
 			continue
 		}
 		if inSingle {
 			if c == '\'' {
 				inSingle = false
 			} else {
+				// Single-quoted: literal, no expansion.
 				cur.WriteByte(c)
 			}
+			// Opening '' still counts as a started word (empty single-quoted).
+			started = true
 			continue
 		}
 		if inDouble {
 			if c == '\\' && i+1 < len(s) {
 				next := s[i+1]
-				// bash double-quote escapes: \, ", $, `, newline
+				// bash double-quote escapes: \, ", $, `, newline — remove the
+				// backslash and keep the next char as literal (so \$ → $).
 				if next == '\\' || next == '"' || next == '$' || next == '`' || next == '\n' {
 					i++
 					cur.WriteByte(next)
+					started = true
+					expandWord = true
 					continue
 				}
 			}
 			if c == '"' {
 				inDouble = false
+				started = true
+				expandWord = true // "" is expansion-eligible empty
 				continue
 			}
+			// Double-quoted: keep $ / ` so rebuild can re-expand.
 			cur.WriteByte(c)
+			started = true
+			expandWord = true
 			continue
 		}
 		switch c {
 		case '\\':
 			escaped = true
 			started = true
+			expandWord = true
 		case '\'':
 			inSingle = true
 			started = true
+			// expandWord unchanged — pure single-quoted stays non-expanding
 		case '"':
 			inDouble = true
 			started = true
+			expandWord = true
 		case ' ', '\t', '\n', '\r':
 			flush()
 		default:
 			cur.WriteByte(c)
 			started = true
+			expandWord = true // unquoted
 		}
+	}
+	if inSingle || inDouble {
+		return nil, fmt.Errorf("unterminated quote in shell payload")
 	}
 	if escaped {
 		// Trailing backslash is kept as a literal.
 		cur.WriteByte('\\')
 		started = true
+		expandWord = true
 	}
 	flush()
-	return words
+	return words, nil
 }
 
-// joinAntigravityShellCommand serializes cmd+args into a bash -c payload,
-// quoting any token that contains shell metacharacters so multi-word
-// --print values (and values with control operators) survive re-parsing.
-func joinAntigravityShellCommand(cmd string, args ...string) string {
+// joinAntigravityShellCommand serializes cmd+args into a bash -c payload.
+// printExpand controls quoting of the --print value: true preserves $VAR /
+// `cmd` expansion (double-quote without escaping $ `); false keeps the value
+// literal (prefer single quotes).
+func joinAntigravityShellCommand(cmd string, args []string, printExpand bool) string {
 	parts := make([]string, 0, 1+len(args))
 	parts = append(parts, cmd)
-	for _, a := range args {
-		parts = append(parts, quoteAntigravityShellArg(a))
+	for i, a := range args {
+		allowExpand := false
+		if i > 0 && args[i-1] == "--print" {
+			allowExpand = printExpand
+		}
+		parts = append(parts, quoteAntigravityShellArg(a, allowExpand))
 	}
 	return strings.Join(parts, " ")
 }
@@ -2304,20 +2357,44 @@ func joinAntigravityShellCommand(cmd string, args ...string) string {
 // grouping, comments, history, and tilde.
 const shellArgMeta = " \t\n\r\"'\\$`;&|<>*?[](){}#!~"
 
-func quoteAntigravityShellArg(s string) string {
+// quoteAntigravityShellArg quotes s for inclusion in a bash -c string.
+// allowExpand=true: double-quote and leave $ / ` unescaped so parameter /
+// command expansion still runs (needed for wrappers like agy "$TASK").
+// allowExpand=false: prefer single quotes so $ stays literal.
+func quoteAntigravityShellArg(s string, allowExpand bool) string {
 	if s == "" {
 		return `""`
 	}
 	if !strings.ContainsAny(s, shellArgMeta) {
 		return s
 	}
+	if allowExpand {
+		// Double-quote; escape \ and " only. Do NOT escape $ or ` — bash must
+		// still expand them inside the rebuilt -c payload.
+		var b strings.Builder
+		b.Grow(len(s) + 2)
+		b.WriteByte('"')
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c == '\\' || c == '"' {
+				b.WriteByte('\\')
+			}
+			b.WriteByte(c)
+		}
+		b.WriteByte('"')
+		return b.String()
+	}
+	// Literal: single quotes preserve $ and ` exactly (bash single-quote rules).
+	if !strings.Contains(s, "'") {
+		return "'" + s + "'"
+	}
+	// Value contains single quotes — fall back to double quotes with full
+	// escapes including $ and ` so nothing expands.
 	var b strings.Builder
 	b.Grow(len(s) + 2)
 	b.WriteByte('"')
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		// Double-quote escapes: \, ", $, ` (bash). Control ops like ; & | are
-		// literal inside double quotes and need no extra escaping.
 		if c == '\\' || c == '"' || c == '$' || c == '`' {
 			b.WriteByte('\\')
 		}

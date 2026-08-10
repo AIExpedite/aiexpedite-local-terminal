@@ -443,9 +443,34 @@ func TestBuildAntigravityInteractiveArgs_PrintAndPrompt(t *testing.T) {
 
 func TestBuildAntigravityInteractiveArgs_EmptyArgs(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{})
-	// No prompt → no bare --print (would consume the next token as value).
+	// No prompt at all → omit --print (distinct from explicit empty below).
 	if len(args) != 1 || args[0] != "--dangerously-skip-permissions" {
 		t.Fatalf("want [--dangerously-skip-permissions], got %#v", args)
+	}
+}
+
+// Explicit empty prompt must still emit --print "" so agy stays one-shot
+// (not interactive TUI). Covers args [""], --print=, and bare --print.
+func TestBuildAntigravityInteractiveArgs_ExplicitEmptyPrint(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+	}{
+		{"empty string arg", []string{""}},
+		{"print equals empty", []string{"--print="}},
+		{"bare print flag", []string{"--print"}},
+		{"prompt equals empty", []string{"--prompt="}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := buildAntigravityInteractiveArgs(tc.in)
+			if len(args) != 3 ||
+				args[0] != "--dangerously-skip-permissions" ||
+				args[1] != "--print" ||
+				args[2] != "" {
+				t.Fatalf("want [skip --print \"\"], got %#v", args)
+			}
+		})
 	}
 }
 
@@ -562,6 +587,7 @@ func TestShapePTYExecArgs_ShapesShellWrappedAntigravity(t *testing.T) {
 // does not receive literal quote or backslash characters that bash would strip.
 func TestShapePTYExecArgs_ShellWrappedPreservesQuoteSemantics(t *testing.T) {
 	// bash -c 'agy "fix the bug"' → prompt value is fix the bug (no quote chars).
+	// Double-quoted origin → expand-eligible rebuild uses double quotes.
 	_, args := shapePTYExecArgs("bash", []string{"-c", `agy "fix the bug"`})
 	wantMulti := `agy --dangerously-skip-permissions --print "fix the bug"`
 	if args[1] != wantMulti {
@@ -575,51 +601,114 @@ func TestShapePTYExecArgs_ShellWrappedPreservesQuoteSemantics(t *testing.T) {
 		t.Errorf("backslash-escaped prompt = %q, want %q", escArgs[1], wantEsc)
 	}
 
-	// Single quotes: agy 'fix the bug'
+	// Single quotes: agy 'fix the bug' → literal rebuild prefers single quotes.
 	_, sqArgs := shapePTYExecArgs("bash", []string{"-c", `agy 'fix the bug'`})
-	if sqArgs[1] != wantMulti {
-		t.Errorf("single-quoted prompt = %q, want %q", sqArgs[1], wantMulti)
+	wantSQ := `agy --dangerously-skip-permissions --print 'fix the bug'`
+	if sqArgs[1] != wantSQ {
+		t.Errorf("single-quoted prompt = %q, want %q", sqArgs[1], wantSQ)
 	}
 
 	// Control operators must be re-quoted on rebuild. After shellWords strips the
-	// protective quotes from `agy 'review;id'`, an unquoted rebuild would become
-	// `agy … --print review;id` and bash would run `id` as a separate command.
+	// protective single quotes from `agy 'review;id'`, literal rebuild uses
+	// single quotes so bash does not treat `;` as a command separator.
 	_, semiArgs := shapePTYExecArgs("bash", []string{"-c", `agy 'review;id'`})
-	wantSemi := `agy --dangerously-skip-permissions --print "review;id"`
+	wantSemi := `agy --dangerously-skip-permissions --print 'review;id'`
 	if semiArgs[1] != wantSemi {
 		t.Errorf("semicolon prompt = %q, want %q", semiArgs[1], wantSemi)
 	}
 
-	// Other control / glob metacharacters also force quoting.
+	// Other control / glob metacharacters also force quoting (literal path).
 	_, pipeArgs := shapePTYExecArgs("bash", []string{"-c", `agy 'a|b&c'`})
-	wantPipe := `agy --dangerously-skip-permissions --print "a|b&c"`
+	wantPipe := `agy --dangerously-skip-permissions --print 'a|b&c'`
 	if pipeArgs[1] != wantPipe {
 		t.Errorf("pipe/amp prompt = %q, want %q", pipeArgs[1], wantPipe)
 	}
 }
 
+// Parameter expansion in double-quoted shell payloads must survive rebuild:
+// agy "$TASK" → --print "$TASK" (not "\$TASK").
+func TestShapePTYExecArgs_PreservesParameterExpansion(t *testing.T) {
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK"`})
+	want := `agy --dangerously-skip-permissions --print "$TASK"`
+	if args[1] != want {
+		t.Errorf("expanding prompt = %q, want %q", args[1], want)
+	}
+
+	// Single-quoted $ stays literal (prefer single quotes on rebuild).
+	_, litArgs := shapePTYExecArgs("bash", []string{"-c", `agy '$TASK'`})
+	wantLit := `agy --dangerously-skip-permissions --print '$TASK'`
+	if litArgs[1] != wantLit {
+		t.Errorf("literal $ prompt = %q, want %q", litArgs[1], wantLit)
+	}
+}
+
+// Unterminated quotes must NOT be repaired into a runnable permission-skipping
+// agy command — leave the original payload so bash reports the syntax error.
+func TestShapePTYExecArgs_RejectsUnterminatedShellQuotes(t *testing.T) {
+	orig := `agy 'review`
+	_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+	if args[1] != orig {
+		t.Errorf("unterminated payload was reshaped: got %q, want original %q", args[1], orig)
+	}
+
+	orig2 := `agy "fix`
+	_, args2 := shapePTYExecArgs("bash", []string{"-c", orig2})
+	if args2[1] != orig2 {
+		t.Errorf("unterminated double-quote was reshaped: got %q, want original %q", args2[1], orig2)
+	}
+}
+
+// Explicit empty shell prompt agy "" must emit --print "".
+func TestShapePTYExecArgs_ShellWrappedExplicitEmptyPrint(t *testing.T) {
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy ""`})
+	want := `agy --dangerously-skip-permissions --print ""`
+	if args[1] != want {
+		t.Errorf("empty print = %q, want %q", args[1], want)
+	}
+}
+
 func TestShellWords(t *testing.T) {
 	cases := []struct {
-		in   string
-		want []string
+		in         string
+		wantVals   []string
+		wantExpand []bool
+		wantErr    bool
 	}{
-		{`agy fix the bug`, []string{"agy", "fix", "the", "bug"}},
-		{`agy "fix the bug"`, []string{"agy", "fix the bug"}},
-		{`agy 'fix the bug'`, []string{"agy", "fix the bug"}},
-		{`agy fix\ bug`, []string{"agy", "fix bug"}},
-		{`agy --add-dir "../shared library" do it`, []string{"agy", "--add-dir", "../shared library", "do", "it"}},
-		{`  agy   `, []string{"agy"}},
-		{``, nil},
+		{`agy fix the bug`, []string{"agy", "fix", "the", "bug"}, []bool{true, true, true, true}, false},
+		{`agy "fix the bug"`, []string{"agy", "fix the bug"}, []bool{true, true}, false},
+		{`agy 'fix the bug'`, []string{"agy", "fix the bug"}, []bool{true, false}, false},
+		{`agy fix\ bug`, []string{"agy", "fix bug"}, []bool{true, true}, false},
+		{`agy --add-dir "../shared library" do it`, []string{"agy", "--add-dir", "../shared library", "do", "it"}, []bool{true, true, true, true, true}, false},
+		{`agy "$TASK"`, []string{"agy", "$TASK"}, []bool{true, true}, false},
+		{`agy '$TASK'`, []string{"agy", "$TASK"}, []bool{true, false}, false},
+		{`agy ""`, []string{"agy", ""}, []bool{true, true}, false},
+		{`  agy   `, []string{"agy"}, []bool{true}, false},
+		{``, nil, nil, false},
+		{`agy 'review`, nil, nil, true},
+		{`agy "fix`, nil, nil, true},
 	}
 	for _, tc := range cases {
-		got := shellWords(tc.in)
-		if len(got) != len(tc.want) {
-			t.Errorf("shellWords(%q) = %#v, want %#v", tc.in, got, tc.want)
+		got, err := shellWords(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("shellWords(%q) expected error, got %#v", tc.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("shellWords(%q) unexpected error: %v", tc.in, err)
+			continue
+		}
+		if len(got) != len(tc.wantVals) {
+			t.Errorf("shellWords(%q) = %#v, want vals %#v", tc.in, got, tc.wantVals)
 			continue
 		}
 		for i := range got {
-			if got[i] != tc.want[i] {
-				t.Errorf("shellWords(%q)[%d] = %q, want %q", tc.in, i, got[i], tc.want[i])
+			if got[i].Value != tc.wantVals[i] {
+				t.Errorf("shellWords(%q)[%d].Value = %q, want %q", tc.in, i, got[i].Value, tc.wantVals[i])
+			}
+			if got[i].Expand != tc.wantExpand[i] {
+				t.Errorf("shellWords(%q)[%d].Expand = %v, want %v", tc.in, i, got[i].Expand, tc.wantExpand[i])
 			}
 		}
 	}
