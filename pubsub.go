@@ -2696,9 +2696,9 @@ func shellParamBodyIsMultiWord(body string) bool {
 			}
 		}
 	}
-	// Zsh ${=spec} / ${==spec} SH_WORD_SPLIT shorthand — multi-field even
-	// inside double quotes ("${=TASK}" with TASK='fix bug' → fix bug).
-	if body[0] == '=' {
+	// Zsh ${=spec} / ${==spec} SH_WORD_SPLIT and ${^spec} RC_EXPAND_PARAM
+	// shorthands are multi-field even inside double quotes.
+	if body[0] == '=' || body[0] == '^' {
 		return true
 	}
 	hadBang := false

@@ -535,6 +535,14 @@ func TestBuildAntigravityInteractiveArgs_CaseSensitiveFlags(t *testing.T) {
 	}
 }
 
+func TestBuildAntigravityInteractiveArgs_PreservesTokensAfterExplicitPrint(t *testing.T) {
+	args := buildAntigravityInteractiveArgs([]string{"--print", "review", "--PRINT"})
+	want := []string{"--dangerously-skip-permissions", "--print", "review", "--PRINT"}
+	if !reflect.DeepEqual(args, want) {
+		t.Fatalf("trailing unknown token was dropped: got %#v, want %#v", args, want)
+	}
+}
+
 /* --------------------------------------------------------------------------
    shapePTYExecArgs
    --------------------------------------------------------------------------
@@ -1189,6 +1197,7 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		`agy "${(z)TASK}"`,
 		`agy "${=TASK}"`,
 		`agy "${==TASK}"`,
+		`agy "${^argv}"`,
 	} {
 		_, args := shapePTYExecArgs("zsh", []string{"-c", orig})
 		if args[1] != orig {

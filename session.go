@@ -1949,7 +1949,7 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	// Permission skip first — never immediately after bare --print.
 	result = append(result, "--dangerously-skip-permissions")
 
-	flags, prompt, hasPrompt := partitionAntigravityCallerArgs(args)
+	flags, prompt, trailing, hasPrompt := partitionAntigravityCallerArgs(args)
 	result = append(result, flags...)
 	// Distinguish "no prompt" from an *explicit* empty prompt (args [""],
 	// --print=, or --print with no value). Omitting --print for the latter
@@ -1957,6 +1957,7 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	if hasPrompt {
 		result = append(result, "--print", prompt)
 	}
+	result = append(result, trailing...)
 	return result
 }
 
@@ -1995,7 +1996,7 @@ var antigravityBoolFlags = map[string]bool{
 // hasPrompt is true when the caller supplied a print value — including an
 // *empty* one ("" / --print= / bare --print). It is false only when no prompt
 // material was present at all (so the builder should omit --print).
-func partitionAntigravityCallerArgs(args []string) (flags []string, prompt string, hasPrompt bool) {
+func partitionAntigravityCallerArgs(args []string) (flags []string, prompt string, trailing []string, hasPrompt bool) {
 	i := 0
 	var printVal string
 	gotPrint := false
@@ -2066,12 +2067,14 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 		break
 	}
 	if gotPrint {
-		return flags, printVal, true
+		// Anything not recognized after an explicit print value must remain on
+		// argv so agy can preserve its own positional/unknown-option behavior.
+		return flags, printVal, args[i:], true
 	}
 	if i < len(args) {
-		return flags, strings.Join(args[i:], " "), true
+		return flags, strings.Join(args[i:], " "), nil, true
 	}
-	return flags, "", false
+	return flags, "", nil, false
 }
 
 func isAntigravityPrintFlag(name string) bool {
