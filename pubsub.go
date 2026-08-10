@@ -2235,7 +2235,7 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 		if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
 			return "", false
 		}
-		if zshEquals && f.hasZshEqualsSub() {
+		if zshEquals && (f.hasZshEqualsSub() || f.hasQuotedZshArrayExpand()) {
 			return "", false
 		}
 	}
@@ -2244,7 +2244,7 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 			if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
 				return "", false
 			}
-			if zshEquals && f.hasZshEqualsSub() {
+			if zshEquals && (f.hasZshEqualsSub() || f.hasQuotedZshArrayExpand()) {
 				return "", false
 			}
 		}
@@ -2626,11 +2626,32 @@ func (w shellWord) hasZshEqualsSub() bool {
 	return false
 }
 
+// hasQuotedZshArrayExpand reports double-quoted expansions of zsh's built-in
+// array parameters (`"$argv"`, `"${path}"`, …). Unlike bash, zsh can still
+// emit multiple fields from those forms without an explicit `[@]` / `(@)` flag,
+// so riding them inside one --print value spills trailing elements as argv.
+// Unquoted `$argv` is already covered by hasUnquotedExpand; this is zsh-only
+// (callers gate on shellSupportsZshEquals).
+func (w shellWord) hasQuotedZshArrayExpand() bool {
+	for _, seg := range w.effectiveSegments() {
+		if !seg.Expand || seg.Unquoted {
+			continue
+		}
+		if shellExpandHasZshOrdinaryArray(seg.Value) {
+			return true
+		}
+	}
+	return false
+}
+
 // shellExpandIsMultiWord reports whether s contains a bash/zsh expansion that
 // produces multiple fields even when double-quoted: $@ / ${@…} / ${name[@]…}
 // and zsh ${(s…)/(@)/f/z…} parameter flags. Nested ${…} bodies are extracted
 // with balanced braces so "${x:-${@:1}}" is classified as multi-word (not
 // truncated at the inner }).
+//
+// Ordinary zsh array params (`$argv`, `$path`, …) are handled separately by
+// shellExpandHasZshOrdinaryArray so bash `$path` scalars still reshape.
 func shellExpandIsMultiWord(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] != '$' || i+1 >= len(s) {
@@ -2653,6 +2674,98 @@ func shellExpandIsMultiWord(s string) bool {
 		i = close // continue after the matched '}'
 	}
 	return false
+}
+
+// shellExpandHasZshOrdinaryArray reports expansions of zsh built-in array
+// parameters that can still be multi-field when double-quoted without `[@]` /
+// split flags — e.g. `"$argv"` with argv=(fix bug).
+func shellExpandHasZshOrdinaryArray(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '$' || i+1 >= len(s) {
+			continue
+		}
+		next := s[i+1]
+		if next == '{' {
+			close := shellParamCloseBrace(s, i+2)
+			if close < 0 {
+				continue
+			}
+			if shellParamBodyIsZshOrdinaryArray(s[i+2 : close]) {
+				return true
+			}
+			// Nested ${…} inside operators may still reference argv/path.
+			if shellExpandHasZshOrdinaryArray(s[i+2 : close]) {
+				return true
+			}
+			i = close
+			continue
+		}
+		// Unbraced $name (and $name[…] / $name:… trailing junk ignored for name).
+		if (next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z') || next == '_' {
+			j := i + 1
+			for j < len(s) && isShellNameByte(s[j]) {
+				j++
+			}
+			if shellNameIsZshOrdinaryArray(s[i+1 : j]) {
+				return true
+			}
+			i = j - 1
+		}
+	}
+	return false
+}
+
+// shellParamBodyIsZshOrdinaryArray reports whether a ${…} body names a zsh
+// built-in array (after optional flag / ! / operator prefixes).
+func shellParamBodyIsZshOrdinaryArray(body string) bool {
+	if body == "" {
+		return false
+	}
+	// ${(flags)name…}
+	if body[0] == '(' {
+		if _, rest, ok := splitZshPEFlagPrefix(body); ok {
+			body = rest
+			if body == "" {
+				return false
+			}
+		}
+	}
+	// ${=name} / ${^name} / ${==name} shorthands — peel one or two markers.
+	for len(body) > 0 && (body[0] == '=' || body[0] == '^') {
+		body = body[1:]
+	}
+	if body == "" {
+		return false
+	}
+	if body[0] == '!' {
+		body = body[1:]
+		if body == "" {
+			return false
+		}
+	}
+	// Parameter name at the start of the (remaining) body.
+	if !((body[0] >= 'A' && body[0] <= 'Z') || (body[0] >= 'a' && body[0] <= 'z') || body[0] == '_') {
+		return false
+	}
+	j := 1
+	for j < len(body) && isShellNameByte(body[j]) {
+		j++
+	}
+	return shellNameIsZshOrdinaryArray(body[:j])
+}
+
+// shellNameIsZshOrdinaryArray reports zsh parameters that are always arrays
+// and can expand to multiple fields even when double-quoted without `[@]`.
+// Conservative: includes common path arrays, not user scalars.
+func shellNameIsZshOrdinaryArray(name string) bool {
+	switch name {
+	case "argv",
+		"path", "cdpath", "fpath", "mailpath", "manpath",
+		"module_path", "watch", "psvar", "signals":
+		return true
+	default:
+		return false
+	}
 }
 
 // shellParamCloseBrace returns the index of the balanced closing '}' for a

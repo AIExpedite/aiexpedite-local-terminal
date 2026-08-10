@@ -1239,6 +1239,28 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 			t.Errorf("zsh multi-field PE flags was reshaped: got %q, want original %q", args[1], orig)
 		}
 	}
+	// Ordinary zsh array params (`$argv`, `$path`, …) can still be multi-field
+	// when double-quoted without [@]/(@). Decline reshape on zsh only; bash
+	// treats unknown names as scalars and still reshapes.
+	for _, orig := range []string{
+		`agy "$argv"`,
+		`agy "${argv}"`,
+		`agy "${argv:1}"`,
+		`agy "$path"`,
+		`agy "${path}"`,
+		`agy "do $argv please"`,
+	} {
+		_, zshArgs := shapePTYExecArgs("zsh", []string{"-c", orig})
+		if zshArgs[1] != orig {
+			t.Errorf("zsh ordinary array was reshaped: got %q, want original %q", zshArgs[1], orig)
+		}
+	}
+	// bash: $argv / $path are ordinary scalars — still reshape with --print.
+	_, bashArgv := shapePTYExecArgs("bash", []string{"-c", `agy "$argv"`})
+	wantBashArgv := `agy --dangerously-skip-permissions --print "$argv"`
+	if bashArgv[1] != wantBashArgv {
+		t.Errorf("bash scalar argv = %q, want %q", bashArgv[1], wantBashArgv)
+	}
 	_, zshU := shapePTYExecArgs("zsh", []string{"-c", `agy "${(U)TASK}"`})
 	wantZshU := `agy --dangerously-skip-permissions --print "${(U)TASK}"`
 	if zshU[1] != wantZshU {
