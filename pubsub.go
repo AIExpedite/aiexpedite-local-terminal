@@ -3346,6 +3346,9 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// Assignment-position tilde (`HOME=~`, `PATH=/bin:~/x`) is
 			// bash/zsh/ksh only (opts.assignTilde). Dash leaves those literal
 			// so we still reshape with --print rather than hanging interactive.
+			// Position alone is not enough: `HOME=~"root"` and
+			// `PATH=/bin:~no_such_user/x` stay literal in bash — use the same
+			// prefix/login validation as word-initial tildes before declining.
 			// Mid-word forms without that context (`foo~bar`, `foo:~`) are
 			// ordinary literals on all shells.
 			if !wordStarted {
@@ -3355,7 +3358,8 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				writeSeg(c, false)
 				continue
 			}
-			if opts.assignTilde && wordPrefixIsTildeExpandPosition() {
+			if opts.assignTilde && wordPrefixIsTildeExpandPosition() &&
+				looksLikeExpandingWordInitialTilde(s, i, opts) {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)

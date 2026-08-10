@@ -1015,6 +1015,17 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 			t.Errorf("assignment tilde was reshaped: got %q, want original %q", args[1], orig)
 		}
 	}
+	// Assignment position with a non-expanding tilde prefix is literal in
+	// bash (quoted login / unknown user) — still reshape with --print.
+	for _, tc := range []struct{ in, want string }{
+		{`agy HOME=~"root"`, `agy --dangerously-skip-permissions --print 'HOME=~root'`},
+		{`agy PATH=/bin:~user_that_does_not_exist_xyzzy/x`, `agy --dangerously-skip-permissions --print 'PATH=/bin:~user_that_does_not_exist_xyzzy/x'`},
+	} {
+		_, got := shapePTYExecArgs("bash", []string{"-c", tc.in})
+		if got[1] != tc.want {
+			t.Errorf("literal assign-tilde %q = %q, want %q", tc.in, got[1], tc.want)
+		}
+	}
 
 	// Dash does not expand assignment-position tilde — reshape as literals
 	// so one-shots still get --print (do not hang interactive).
