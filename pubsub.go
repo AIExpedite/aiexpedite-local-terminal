@@ -2219,16 +2219,14 @@ func shapeAntigravityShellPayload(payload string) (string, bool) {
 		parts = append(parts, quoteShellWord(f))
 	}
 	if hasPrompt {
-		// Multi-fragment prompts with unquoted expansions cannot be joined into
-		// one double-quoted --print value without changing bash word-splitting /
-		// pathname-expansion / empty-expand semantics (e.g. `agy $OPTIONAL task`
-		// drops an unset $OPTIONAL entirely; `"$OPTIONAL task"` keeps a leading
-		// space). Leave those payloads unshaped.
-		if len(promptFrags) > 1 {
-			for _, f := range promptFrags {
-				if f.hasUnquotedExpand() {
-					return "", false
-				}
+		// Unquoted expansions cannot be rebuilt as double-quoted --print values
+		// without changing bash word-splitting / pathname-expansion / empty-
+		// expand semantics (e.g. `agy $OPTIONAL` with OPTIONAL='*.go' must glob;
+		// `agy $OPTIONAL task` drops an unset $OPTIONAL entirely). Leave those
+		// payloads unshaped. Double-quoted expansions (`"$TASK"`) still reshape.
+		for _, f := range promptFrags {
+			if f.hasUnquotedExpand() {
+				return "", false
 			}
 		}
 		parts = append(parts, "--print", quoteAntigravityPrintFragments(promptFrags))
@@ -2742,8 +2740,11 @@ func shellWords(s string) ([]shellWord, error) {
 			writeSeg(c, false)
 		case '}':
 			// Closing brace alone is literal; expanding forms are rejected
-			// when the opening `{` is seen.
+			// when the opening `{` is seen. Still close ${…} paramDepth so a
+			// later escaped \$ outside the expansion is not mis-attributed
+			// (e.g. `${ROOT}\$dir`).
 			writeSeg(c, false)
+			noteParamClose(c)
 		default:
 			// ANSI-C ($'…') / locale ($"…") quoting: not implemented. A bare
 			// unquoted $ followed by a quote (possibly after deleted line

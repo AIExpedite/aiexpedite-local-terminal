@@ -793,21 +793,18 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	}
 }
 
-// Multi-fragment prompts with unquoted expansions must not be joined into one
-// double-quoted --print value (word-split / empty-expand semantics change).
-// Double-quoted expansions across fragments still reshape.
-func TestShapePTYExecArgs_RejectsUnquotedMultiFragmentExpand(t *testing.T) {
-	orig := `agy $OPTIONAL task`
-	_, args := shapePTYExecArgs("bash", []string{"-c", orig})
-	if args[1] != orig {
-		t.Errorf("unquoted multi-frag expand was reshaped: got %q, want original %q", args[1], orig)
-	}
-
-	// Single-word unquoted expand still reshapes (double-quoted rebuild).
-	_, single := shapePTYExecArgs("bash", []string{"-c", `agy $OPTIONAL`})
-	wantSingle := `agy --dangerously-skip-permissions --print "$OPTIONAL"`
-	if single[1] != wantSingle {
-		t.Errorf("single unquoted expand = %q, want %q", single[1], wantSingle)
+// Unquoted expansions (single- or multi-fragment) must not be double-quoted on
+// rebuild (word-split / pathname-expand / empty-expand semantics change).
+// Double-quoted expansions still reshape.
+func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
+	for _, orig := range []string{
+		`agy $OPTIONAL`,
+		`agy $OPTIONAL task`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("unquoted expand was reshaped: got %q, want original %q", args[1], orig)
+		}
 	}
 
 	// Double-quoted multi-frag expand may still join into one --print value.
@@ -815,6 +812,16 @@ func TestShapePTYExecArgs_RejectsUnquotedMultiFragmentExpand(t *testing.T) {
 	wantDQ := `agy --dangerously-skip-permissions --print "$TASK more"`
 	if dq[1] != wantDQ {
 		t.Errorf("double-quoted multi-frag expand = %q, want %q", dq[1], wantDQ)
+	}
+}
+
+// Unquoted ${…} must close paramDepth so a later escaped \$ outside the
+// expansion is not mis-treated as inside it (which would decline reshape).
+func TestShapePTYExecArgs_ClosesUnquotedParamExpansion(t *testing.T) {
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy --add-dir ${ROOT}\$dir task`})
+	want := `agy --dangerously-skip-permissions --add-dir "${ROOT}"'$dir' --print task`
+	if args[1] != want {
+		t.Errorf("unquoted param + escaped $ = %q, want %q", args[1], want)
 	}
 }
 
