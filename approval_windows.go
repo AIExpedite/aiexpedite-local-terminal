@@ -142,25 +142,27 @@ const (
 	InstallCancel
 )
 
-// ShowInstallPrompt displays a dialog asking user permission to install a dependency
+// ShowInstallPrompt displays a dialog asking user permission to install a dependency.
+// optional selects wording that accurately describes dependencies the app can
+// run without; it does not change the Yes / No / Cancel button semantics.
 // Returns:
 //   - InstallYes: install automatically
 //   - InstallNo: open the download page, then exit the install flow
 //   - InstallCancel: cancel only — close the dialog and take no other action
-func ShowInstallPrompt(component, description string) InstallChoice {
+func ShowInstallPrompt(component, description string, optional bool) InstallChoice {
 	message := fmt.Sprintf(
-		"%s is required but not installed.\n\n"+
+		"%s\n\n"+
 			"%s\n\n"+
 			"Would you like to install it automatically?\n\n"+
 			"Click:\n"+
 			"  YES = Install automatically (via winget)\n"+
 			"  NO = Open download page\n"+
 			"  CANCEL = Cancel",
-		component,
+		installPromptHeadline(component, optional),
 		description,
 	)
 
-	title := "AI Expedite - Setup Required"
+	title := installPromptTitle(optional)
 
 	titlePtr, _ := syscall.UTF16PtrFromString(title)
 	msgPtr, _ := syscall.UTF16PtrFromString(message)
@@ -181,6 +183,61 @@ func ShowInstallPrompt(component, description string) InstallChoice {
 		return InstallNo
 	default: // IDCANCEL or dialog closed
 		return InstallCancel
+	}
+}
+
+// ShowInstallRecovery displays the guided recovery dialog shown after an
+// install attempt fails. The Win32 MessageBox exposes at most three buttons,
+// so Retry/Manual are the buttons and troubleshooting guidance is reachable
+// via the third button (which re-shows or opens docs through the caller's
+// recovery loop). Mapping:
+//   - Yes    = Retry (only offered when allowRetry; otherwise "View troubleshooting")
+//   - No     = Install manually (open download page)
+//   - Cancel = Exit
+//
+// The InstallRecoveryChoice enum is shared (defined in install_runner.go).
+func ShowInstallRecovery(component, explanation, diagnostics string, allowRetry bool) InstallRecoveryChoice {
+	var firstButton string
+	if allowRetry {
+		firstButton = "  YES = Retry the automatic install"
+	} else {
+		firstButton = "  YES = View troubleshooting guidance"
+	}
+
+	message := fmt.Sprintf(
+		"%s could not be installed.\n\n"+
+			"%s\n\n"+
+			"%s\n\n"+
+			"Click:\n"+
+			"%s\n"+
+			"  NO = Install manually (open download page)\n"+
+			"  CANCEL = Skip for now",
+		component, explanation, diagnostics, firstButton)
+
+	title := "AI Expedite - Setup Problem"
+
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	msgPtr, _ := syscall.UTF16PtrFromString(message)
+
+	flags := uint32(MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON1 | MB_SETFOREGROUND | MB_TOPMOST)
+
+	ret, _, _ := procMsgBox.Call(
+		0,
+		uintptr(unsafe.Pointer(msgPtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		uintptr(flags),
+	)
+
+	switch int(ret) {
+	case IDYES:
+		if allowRetry {
+			return RecoveryRetry
+		}
+		return RecoveryTroubleshoot
+	case IDNO:
+		return RecoveryManual
+	default: // IDCANCEL or dialog closed
+		return RecoveryExit
 	}
 }
 

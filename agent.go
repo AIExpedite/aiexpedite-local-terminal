@@ -30,7 +30,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v0.10.24"
+var Version = "v0.10.25"
 
 var (
 	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
@@ -222,6 +222,10 @@ func StartAgent(cfg *Config) {
 		fmt.Println("Fatal:", err)
 		return
 	}
+
+	// Git is a warning-level dependency (see readiness.go): offer to install it
+	// with guided recovery, but never block startup on a decline or failure.
+	ensureGit()
 
 	if useTmux {
 		if err := startTmuxSession(); err != nil {

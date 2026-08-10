@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -60,6 +62,9 @@ var (
 
 	// For detecting minimized window state
 	procIsIconic = user32.NewProc("IsIconic")
+
+	// For detecting whether the console window is currently shown
+	procIsWindowVisible = user32.NewProc("IsWindowVisible")
 
 	// For UAC elevation (auto-update in Program Files)
 	shell32             = syscall.NewLazyDLL("shell32.dll")
@@ -382,15 +387,118 @@ func freeConsole() {
 	consoleAllocated = false
 }
 
+// consoleWindowVisible reports whether a console window currently exists and is
+// visible on screen, so callers can capture the pre-existing visibility and
+// restore it later (e.g. around a dependency install that forces the console
+// open). It queries the console window directly rather than gating on the
+// consoleAllocated bookkeeping flag: a process relaunched with CREATE_NEW_CONSOLE
+// (see setNewConsole) inherits a real, visible console without ever calling
+// allocateConsole, so consoleAllocated can be false while a visible console
+// exists. Reading the flag there would misreport that console as hidden and the
+// install's deferred restore would hide an originally-visible window.
+func consoleWindowVisible() bool {
+	consoleVisibilityMu.Lock()
+	defer consoleVisibilityMu.Unlock()
+	return consoleWindowVisibleLocked()
+}
+
+func consoleWindowVisibleLocked() bool {
+	hwnd := getConsoleWindow()
+	if hwnd == 0 {
+		return false
+	}
+	ret, _, _ := procIsWindowVisible.Call(hwnd)
+	return ret != 0
+}
+
+// consoleVisibilityMu serializes every console visibility read/mutation so a
+// snapshot of the current state and the sequence claim that follows it can be
+// made atomic (see snapshotAndShowConsole). Without it there is a TOCTOU gap
+// between reading consoleWindowVisible() and claiming a sequence number, and a
+// concurrent showConsoleWindow(true) landing in that gap would receive an
+// *earlier* sequence than the installer — invisible to both the prior-visible
+// snapshot and the "changed since" check — so the deferred restore would hide a
+// console the tray legitimately requested (leaving it hidden behind a checked
+// "Show Console" menu item).
+var consoleVisibilityMu sync.Mutex
+
+// consoleVisibilitySeq counts every visibility request made through
+// showConsoleWindow. A caller that forces the console open for the duration of
+// a long operation (the dependency installer) snapshots the sequence of its own
+// request and only restores the prior state if no later request arrived. The
+// tray runs concurrently with StartAgent, so auto-registration or the user's
+// "Show Console" menu item can legitimately ask for the console mid-install;
+// without this check the installer's deferred restore would undo that newer
+// request and leave a hidden window behind a checked menu item.
+var consoleVisibilitySeq atomic.Uint64
+
+// consoleVisibilityChangedSince reports whether any visibility request was made
+// after the one identified by seq (as returned by showConsoleWindowSeq).
+func consoleVisibilityChangedSince(seq uint64) bool {
+	return consoleVisibilitySeq.Load() != seq
+}
+
+// snapshotAndShowConsole atomically captures whether the console is currently
+// visible and then issues a show request, returning the prior visibility and
+// the sequence number of that show request. Holding consoleVisibilityMu across
+// both steps closes the TOCTOU gap the installer's deferred restore depends on:
+// any concurrent showConsoleWindow request is now ordered either fully before
+// this call (and thus reflected in priorVisible) or fully after it (and thus
+// detectable via consoleVisibilityChangedSince), never interleaved between the
+// snapshot and the sequence claim.
+func snapshotAndShowConsole() (priorVisible bool, seq uint64) {
+	consoleVisibilityMu.Lock()
+	defer consoleVisibilityMu.Unlock()
+	priorVisible = consoleWindowVisibleLocked()
+	seq = showConsoleWindowSeqLocked(true)
+	return priorVisible, seq
+}
+
+// restoreConsoleVisibility undoes a snapshotAndShowConsole claim: it hides the
+// console only when it was hidden before the claim AND no visibility request
+// arrived after ours (a newer request — auto-registration or the tray's "Show
+// Console" toggle landing mid-install — wins, since hiding on our stale
+// snapshot would leave a hidden window behind a checked menu item).
+//
+// The "changed since" check and the hide are one atomic step for the same
+// reason the snapshot and claim are: checking outside the lock leaves a gap in
+// which a concurrent show can land after the check and be hidden right back.
+func restoreConsoleVisibility(priorVisible bool, seq uint64) {
+	if priorVisible {
+		return
+	}
+	consoleVisibilityMu.Lock()
+	defer consoleVisibilityMu.Unlock()
+	if consoleVisibilityChangedSince(seq) {
+		return
+	}
+	showConsoleWindowSeqLocked(false)
+}
+
 // showConsoleWindow shows or hides the console window.
 // When built as a GUI app (-H=windowsgui), this allocates a console on-demand.
-func showConsoleWindow(show bool) {
+func showConsoleWindow(show bool) { showConsoleWindowSeq(show) }
+
+// showConsoleWindowSeq is showConsoleWindow plus the sequence number of this
+// request, for callers that later need to know whether theirs is still the most
+// recent one. The counter is bumped even when the request can't be carried out
+// (no console allocatable), so a stale snapshot never wins over a newer intent.
+func showConsoleWindowSeq(show bool) uint64 {
+	consoleVisibilityMu.Lock()
+	defer consoleVisibilityMu.Unlock()
+	return showConsoleWindowSeqLocked(show)
+}
+
+// showConsoleWindowSeqLocked is the body of showConsoleWindowSeq; callers must
+// already hold consoleVisibilityMu (e.g. snapshotAndShowConsole).
+func showConsoleWindowSeqLocked(show bool) uint64 {
+	seq := consoleVisibilitySeq.Add(1)
 	if show {
 		// Allocate console if we don't have one (GUI app mode)
 		if !consoleAllocated {
 			if err := allocateConsole(); err != nil {
 				// Can't print error - no console yet
-				return
+				return seq
 			}
 		}
 
@@ -401,6 +509,13 @@ func showConsoleWindow(show bool) {
 			procSetForegroundWindow.Call(hwnd)
 		}
 	} else {
+		// Nothing to hide if a console was never allocated — e.g. the prod GUI
+		// app that never showed a window. This makes hideAfterSetup a safe
+		// no-op after setup when there is no window to minimize.
+		hwnd := getConsoleWindow()
+		if hwnd == 0 {
+			return seq
+		}
 		// Just hide the window - don't free the console.
 		// Using freeConsole() causes an infinite loop because:
 		// 1. freeConsole() invalidates stdout/stderr handles
@@ -408,11 +523,43 @@ func showConsoleWindow(show bool) {
 		// 3. The new console triggers close handlers, which call showConsoleWindow(false)
 		// 4. Loop continues indefinitely
 		// SW_HIDE keeps the console allocated but hidden, avoiding this issue.
-		hwnd := getConsoleWindow()
-		if hwnd != 0 {
-			procShowWindow.Call(hwnd, SW_HIDE)
-		}
+		procShowWindow.Call(hwnd, SW_HIDE)
 	}
+	return seq
+}
+
+// hideMinimizedConsole hides the console window if it is currently minimized,
+// performing the "is it minimized" check and the hide as ONE step under
+// consoleVisibilityMu. Routing the minimize-driven hide through
+// showConsoleWindowSeqLocked (rather than calling procShowWindow directly) is
+// what keeps it part of the same serialization protocol as every other
+// visibility mutation: it both takes the mutex and bumps consoleVisibilitySeq.
+//
+// Without that, a minimize landing inside snapshotAndShowConsole could hide the
+// console after the prior-visibility read but before the installer's show — the
+// installer would reopen the window, record it as previously visible, and its
+// deferred restore would leave it open, silently discarding the user's minimize
+// while ConsoleHiddenChan had already unchecked the tray's "Show Console" item.
+// Now the hide is ordered either fully before the snapshot (so priorVisible is
+// false and the restore hides again) or fully after the sequence claim (so
+// consoleVisibilityChangedSince makes the restore stand down).
+//
+// Returns true when it actually hid the window, so the caller only notifies the
+// tray on a real state change.
+func hideMinimizedConsole() bool {
+	consoleVisibilityMu.Lock()
+	defer consoleVisibilityMu.Unlock()
+
+	hwnd := getConsoleWindow()
+	if hwnd == 0 {
+		return false
+	}
+	// IsIconic returns non-zero if window is minimized.
+	if ret, _, _ := procIsIconic.Call(hwnd); ret == 0 {
+		return false
+	}
+	showConsoleWindowSeqLocked(false)
+	return true
 }
 
 // monitorConsoleMinimize watches for minimize events and hides console to tray.
@@ -433,23 +580,19 @@ func monitorConsoleMinimize() {
 			continue
 		}
 
-		hwnd := getConsoleWindow()
-		if hwnd == 0 {
+		// Window was minimized - hide it to tray instead. The check and the
+		// hide happen together under consoleVisibilityMu (see
+		// hideMinimizedConsole) so this mutation can't race the installer's
+		// visibility snapshot.
+		if !hideMinimizedConsole() {
 			continue
 		}
 
-		// IsIconic returns non-zero if window is minimized
-		ret, _, _ := procIsIconic.Call(hwnd)
-		if ret != 0 {
-			// Window was minimized - hide it to tray instead
-			procShowWindow.Call(hwnd, SW_HIDE)
-
-			// Notify main.go to update the checkbox state
-			select {
-			case ConsoleHiddenChan <- true:
-			default:
-				// Channel full, skip (non-blocking)
-			}
+		// Notify main.go to update the checkbox state
+		select {
+		case ConsoleHiddenChan <- true:
+		default:
+			// Channel full, skip (non-blocking)
 		}
 	}
 }

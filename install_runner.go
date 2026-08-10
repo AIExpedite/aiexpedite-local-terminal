@@ -1,0 +1,435 @@
+// File: install_runner.go
+//
+// Cross-platform orchestration for installing a missing workstation
+// dependency (e.g. Git) via the platform package manager. The goal is that a
+// failed install — in particular the WinGet case where the downloaded
+// installer can't be found or won't launch — never leaves the user staring at
+// a raw OS error dialog. Instead we:
+//
+//  1. Ask permission (ShowInstallPrompt).
+//  2. Run the platform install command and classify the outcome.
+//  3. On failure, explain what happened in plain language and offer a guided
+//     recovery dialog (retry / install manually / view troubleshooting).
+//  4. Log full diagnostics (command, exit code, captured stderr, classified
+//     reason) to the audit log so support can investigate.
+//
+// The actual install execution is platform-specific and lives in
+// install_runner_windows.go (WinGet) and install_runner_other.go (brew/apt).
+// This file is deliberately platform-agnostic so the orchestration and its
+// tests compile everywhere.
+package main
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+)
+
+// maxInstallRetries bounds how many times the recovery dialog will offer an
+// automatic retry before only Manual / Troubleshooting / Exit remain. This
+// stops a persistently-broken package source (bad WinGet cache, offline
+// machine) from trapping the user in an infinite retry loop.
+const maxInstallRetries = 2
+
+// diagnosticCaptureBytes bounds how much package-manager output the platform
+// installers retain (the tail) for diagnostics, keeping memory bounded even
+// when a manager emits verbose progress output.
+const diagnosticCaptureBytes = 8192
+
+// DependencySpec describes a workstation dependency the setup flow can install.
+type DependencySpec struct {
+	// DisplayName is the human-facing name shown in dialogs, e.g. "Git".
+	DisplayName string
+	// PromptDescription is the one-paragraph explanation shown in the initial
+	// permission dialog.
+	PromptDescription string
+	// WingetID is the WinGet package identifier, e.g. "Git.Git".
+	WingetID string
+	// ScoopID, when non-empty, is a Scoop package id used as a Windows
+	// fallback if WinGet is unavailable or fails (e.g. "ttyd").
+	ScoopID string
+	// UnixPackage is the package name for brew/apt on macOS/Linux, e.g. "git".
+	UnixPackage string
+	// Optional marks a dependency the app keeps running without (e.g. Git,
+	// which readiness only warns about). It changes the prompt headline so it
+	// doesn't claim the dependency "is required"; the Yes / No / Cancel actions
+	// retain their standard meanings.
+	Optional bool
+	// VerifyCommand is the executable that must appear on PATH once the
+	// install succeeds, e.g. "git". Used to confirm the install actually
+	// landed (WinGet can report success while the binary isn't yet visible).
+	VerifyCommand string
+	// PostInstall, when set, is an in-process detector run after each manager
+	// attempt; its result — not the manager exit code — decides success, and
+	// it may augment the process PATH so a freshly-installed tool is usable
+	// immediately (needed for tools used in-process, e.g. ttyd). When nil,
+	// success is inferred from the manager exit code (fine for tools the app
+	// only needs after a restart, e.g. Git).
+	PostInstall func() bool
+	// ManualURL is the vendor download page opened for "install manually".
+	ManualURL string
+	// TroubleshootURL is the docs page opened for "view troubleshooting".
+	TroubleshootURL string
+}
+
+// InstallFailureKind classifies why an install attempt did not succeed. The
+// classification drives both the plain-language explanation shown to the user
+// and the diagnostics recorded for support.
+type InstallFailureKind int
+
+const (
+	// InstallOK — the install completed and the dependency is now available.
+	InstallOK InstallFailureKind = iota
+	// InstallLaunchFailed — the package manager downloaded the installer but
+	// could not find or launch it (the case this feature primarily targets).
+	InstallLaunchFailed
+	// InstallExecFailed — the package manager process itself could not be
+	// spawned (winget/brew absent from PATH, permission denied).
+	InstallExecFailed
+	// InstallOther — any other non-zero exit (network, hash mismatch,
+	// user-cancelled UAC). Routed to the generic recovery path.
+	InstallOther
+)
+
+// InstallRecoveryChoice is the user's response to the guided recovery dialog.
+// Defined once here (no build tag) so the Windows and non-Windows
+// ShowInstallRecovery implementations can't drift apart.
+type InstallRecoveryChoice int
+
+const (
+	// RecoveryRetry — try the automatic install again.
+	RecoveryRetry InstallRecoveryChoice = iota
+	// RecoveryManual — open the vendor download page and install by hand.
+	RecoveryManual
+	// RecoveryTroubleshoot — open troubleshooting guidance, then return to
+	// the recovery dialog.
+	RecoveryTroubleshoot
+	// RecoveryExit — give up on this dependency for now.
+	RecoveryExit
+)
+
+// installOutcome is the result of a single platform install attempt.
+type installOutcome struct {
+	Kind     InstallFailureKind
+	ExitCode int    // package-manager exit code (0 when not applicable)
+	Output   string // captured package-manager output for diagnostics
+	Err      error  // underlying Go error, if any
+}
+
+// Sentinel errors so callers can distinguish user intent from real failures
+// and decide whether to treat them as fatal.
+var (
+	// errInstallDeclined — user cancelled at the prompt or exited the
+	// recovery dialog).
+	errInstallDeclined = errors.New("dependency install declined by user")
+	// errInstallManual — user opted to install manually; the download page
+	// was opened for them.
+	errInstallManual = errors.New("dependency install deferred to manual")
+)
+
+// Seams — package-level function variables so tests can substitute the
+// dialog, install execution, and browser calls without touching real
+// WinGet / GUI. Mirrors the existing repo pattern (see auth.go).
+var (
+	installPrompt   = ShowInstallPrompt
+	installExec     = performInstall
+	installRecovery = ShowInstallRecovery
+	installOpenURL  = openBrowser
+	installShowInfo = ShowInfoDialog
+)
+
+// runDependencyInstall walks a dependency through the permission prompt, the
+// platform install, and — on failure — the guided recovery loop. It returns
+// nil on success, errInstallDeclined / errInstallManual when the user opts
+// out, or the classified failure error when an install could not be
+// recovered. Callers decide whether that is fatal.
+func runDependencyInstall(spec DependencySpec) error {
+	switch installPrompt(spec.DisplayName, spec.PromptDescription, spec.Optional) {
+	case InstallNo:
+		// The user chose to install manually and exit. presentRecoveryURL
+		// surfaces the link either way (browser, or a copyable-link dialog if
+		// the browser can't launch), so callers must not claim the browser
+		// specifically opened — errInstallManual means "deferred to manual".
+		presentRecoveryURL(spec, spec.ManualURL, "manual_from_prompt")
+		return errInstallManual
+	case InstallCancel:
+		LogSecurityEvent(SecEvtInstallDeclined, "user cancelled install",
+			"component", spec.DisplayName, "at", "prompt")
+		return errInstallDeclined
+	case InstallYes:
+		// fall through to the install / recovery loop
+	}
+
+	attempt := 0
+	for {
+		LogSecurityEvent(SecEvtInstallStarted, "starting dependency install",
+			"component", spec.DisplayName, "package", platformPackageID(spec), "attempt", attempt)
+
+		outcome := installExec(spec)
+		if outcome.Kind == InstallOK {
+			LogSecurityEvent(SecEvtInstallSucceeded, "dependency installed",
+				"component", spec.DisplayName, "attempt", attempt)
+			return nil
+		}
+
+		LogSecurityEvent(SecEvtInstallFailed, "dependency install failed",
+			"component", spec.DisplayName,
+			"reason", installFailureReason(outcome.Kind),
+			"exit_code", outcome.ExitCode,
+			"error", errString(outcome.Err),
+			"output", truncateDiagnostic(outcome.Output, 500),
+			"attempt", attempt)
+
+		// Recovery sub-loop: stays open across "view troubleshooting" so the
+		// user can read the docs and then still choose retry / manual / exit.
+		// retry becomes true only when the user asks (and is allowed) to retry,
+		// which breaks back out to re-run the install.
+		retry := false
+		for !retry {
+			allowRetry := attempt < maxInstallRetries
+			switch installRecovery(
+				spec.DisplayName,
+				installExplanation(spec, outcome),
+				installDiagnosticsSummary(spec, outcome),
+				allowRetry,
+			) {
+			case RecoveryRetry:
+				if !allowRetry {
+					// The dialog shouldn't offer Retry past the cap; guard
+					// against a stuck dialog by treating it as giving up.
+					return installGaveUp(spec, outcome)
+				}
+				attempt++
+				retry = true
+			case RecoveryManual:
+				if presentRecoveryURL(spec, spec.ManualURL, "manual_from_recovery") {
+					return errInstallManual
+				}
+				// The browser couldn't be launched; the URL was shown in a
+				// dialog instead. Keep the recovery choices open rather than
+				// falsely reporting the page was opened.
+			case RecoveryTroubleshoot:
+				presentRecoveryURL(spec, spec.TroubleshootURL, "troubleshoot")
+				// stay in the recovery sub-loop
+			case RecoveryExit:
+				return installDeclinedAtRecovery(spec, outcome)
+			}
+		}
+	}
+}
+
+// installDeclinedAtRecovery records an explicit opt-out from the recovery
+// dialog ("Skip for now") and returns an error WRAPPING errInstallDeclined.
+// Callers distinguish the two outcomes: installTtydWindows exits cleanly with
+// finish-the-install instructions on an opt-out but treats an unrecovered
+// failure as fatal, and ensureGit reports "skipped" rather than a raw error. It
+// still carries the classified reason in its message for logs and support.
+func installDeclinedAtRecovery(spec DependencySpec, o installOutcome) error {
+	LogSecurityEvent(SecEvtInstallDeclined, "user exited recovery",
+		"component", spec.DisplayName, "at", "recovery",
+		"reason", installFailureReason(o.Kind))
+	return fmt.Errorf("%s install skipped after failure (%s): %w",
+		spec.DisplayName, installFailureReason(o.Kind), errInstallDeclined)
+}
+
+// installGaveUp handles the defensive path where recovery cannot continue even
+// though the user did not opt out (the dialog returned Retry past the cap). It
+// returns the classified failure error and deliberately does NOT wrap
+// errInstallDeclined — nothing was declined.
+func installGaveUp(spec DependencySpec, o installOutcome) error {
+	LogSecurityEvent(SecEvtInstallFailed, "install recovery exhausted",
+		"component", spec.DisplayName, "at", "recovery",
+		"reason", installFailureReason(o.Kind))
+	return fmt.Errorf("%s install failed: %s",
+		spec.DisplayName, installFailureReason(o.Kind))
+}
+
+// presentRecoveryURL tries to open a recovery URL in the browser and returns
+// true only if the browser was actually launched. On failure it records the
+// error AND surfaces the URL in a dialog so the user can copy it manually —
+// otherwise a failed "manual install" / "troubleshoot" click (common under a
+// hidden/tray launch) is silently dropped and looks like the button did
+// nothing. Callers use the return value to avoid falsely reporting that the
+// page was opened.
+func presentRecoveryURL(spec DependencySpec, url, purpose string) bool {
+	if url == "" {
+		return false
+	}
+	if err := installOpenURL(url); err != nil {
+		LogSecurityEvent(SecEvtInstallFailed, "could not open recovery URL",
+			"component", spec.DisplayName, "purpose", purpose,
+			"url", url, "error", err.Error())
+		installShowInfo(
+			spec.DisplayName+" — Open This Link",
+			"We couldn't open your browser automatically.\n\n"+
+				"Please copy this link and open it manually:\n"+url)
+		return false
+	}
+	return true
+}
+
+// Permission-prompt wording. These live here (no build tag) so the Windows and
+// non-Windows ShowInstallPrompt implementations share one source of truth and
+// can't drift — the same reason InstallRecoveryChoice is defined here.
+
+// installPromptTitle returns the dialog title for a required vs optional
+// dependency.
+func installPromptTitle(optional bool) string {
+	if optional {
+		return "AI Expedite - Optional Setup"
+	}
+	return "AI Expedite - Setup Required"
+}
+
+// installPromptHeadline returns the opening line of the permission dialog. An
+// optional dependency must not claim to be "required": startup continues when
+// it is declined (see ensureGit), so a "required" headline would tell the user
+// something that isn't true of what happens next.
+func installPromptHeadline(component string, optional bool) string {
+	if optional {
+		return fmt.Sprintf(
+			"%s is not installed.\n\n"+
+				"It's optional — AI Expedite will keep running without it, but "+
+				"workflows that need %s won't work until it's installed.",
+			component, component)
+	}
+	return fmt.Sprintf("%s is required but not installed.", component)
+}
+
+// installFailureReason returns a short, log-friendly reason slug.
+func installFailureReason(k InstallFailureKind) string {
+	switch k {
+	case InstallLaunchFailed:
+		return "installer_launch_failed"
+	case InstallExecFailed:
+		return "package_manager_unavailable"
+	case InstallOther:
+		return "install_failed"
+	default:
+		return "ok"
+	}
+}
+
+// installExplanation returns the plain-language explanation shown to the user
+// in the recovery dialog for the given outcome.
+func installExplanation(spec DependencySpec, o installOutcome) string {
+	switch o.Kind {
+	case InstallLaunchFailed:
+		return fmt.Sprintf(
+			"%s was downloaded, but Windows could not start its installer "+
+				"(the setup file couldn't be found or failed to launch).\n\n"+
+				"This is usually temporary — a retry often succeeds. You can "+
+				"also install it yourself or view troubleshooting steps.",
+			spec.DisplayName)
+	case InstallExecFailed:
+		return fmt.Sprintf(
+			"%s could not be installed because the package manager could not "+
+				"be started (it may not be installed or on your PATH).\n\n"+
+				"You can install %s manually or view troubleshooting steps.",
+			spec.DisplayName, spec.DisplayName)
+	default:
+		return fmt.Sprintf(
+			"%s could not be installed automatically.\n\n"+
+				"You can retry, install it manually, or view troubleshooting "+
+				"steps.",
+			spec.DisplayName)
+	}
+}
+
+// platformPackageID is implemented per platform (install_runner_windows.go /
+// install_runner_other.go) and returns the package identifier the platform's
+// performInstall actually passes to the package manager: the WinGet id on
+// Windows, the brew/apt package name elsewhere. Diagnostics must name the
+// package that was really attempted — reporting the WinGet id on macOS/Linux
+// would be misleading on exactly the failure path these diagnostics exist to
+// explain.
+
+// installDiagnosticsSummary builds the short technical summary surfaced in the
+// recovery dialog (and useful when a user pastes it to support). Full detail
+// lives in the audit log.
+func installDiagnosticsSummary(spec DependencySpec, o installOutcome) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Package: %s\n", platformPackageID(spec))
+	fmt.Fprintf(&b, "Reason: %s\n", installFailureReason(o.Kind))
+	if o.ExitCode != 0 {
+		fmt.Fprintf(&b, "Exit code: %d (0x%X)\n", o.ExitCode, uint32(o.ExitCode))
+	}
+	if o.Err != nil {
+		fmt.Fprintf(&b, "Error: %s\n", o.Err.Error())
+	}
+	if snippet := truncateDiagnostic(o.Output, 300); snippet != "" {
+		fmt.Fprintf(&b, "Details: %s", snippet)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// truncateDiagnostic trims captured output to a bounded snippet, keeping the
+// TAIL rather than the head: package managers (WinGet in particular) emit
+// headers and progress first and place the actionable error last, so the end
+// of the output is what support needs.
+func truncateDiagnostic(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	return "…" + s[len(s)-max:]
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// packageManagerLabel returns the human-facing name of the package manager the
+// runner will use on the given OS, so consent prompts don't misdescribe the
+// mechanism (e.g. claiming "winget" on macOS/Linux).
+func packageManagerLabel(goos string) string {
+	switch goos {
+	case "windows":
+		return "the Windows Package Manager (winget)"
+	case "darwin":
+		return "Homebrew (brew)"
+	default:
+		return "your system package manager (apt)"
+	}
+}
+
+// tailWriter is an io.Writer that retains only the last maxBytes of everything
+// written to it, bounding memory even when a manager emits verbose output
+// (e.g. progress bars). Combined with truncateDiagnostic's tail-keeping, the
+// actionable trailing error is preserved without unbounded growth.
+//
+// It is safe for concurrent writes: os/exec copies a command's stdout and
+// stderr on separate goroutines when they are distinct writers, so a single
+// tailWriter teed into both streams would otherwise be written concurrently.
+type tailWriter struct {
+	mu        sync.Mutex
+	buf       []byte
+	maxBytes  int
+	truncated bool
+}
+
+func newTailWriter(maxBytes int) *tailWriter { return &tailWriter{maxBytes: maxBytes} }
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, p...)
+	if len(w.buf) > w.maxBytes {
+		w.buf = w.buf[len(w.buf)-w.maxBytes:]
+		w.truncated = true
+	}
+	return len(p), nil
+}
+
+func (w *tailWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.truncated {
+		return "…" + string(w.buf)
+	}
+	return string(w.buf)
+}

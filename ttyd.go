@@ -11,33 +11,6 @@ import (
 
 const ttydDownloadURL = "https://github.com/tsl0922/ttyd/releases"
 
-// Seams for testing the install-choice side effects without opening a real
-// browser or terminating the test process.
-var (
-	openBrowserFn = openBrowser
-	exitFn        = os.Exit
-)
-
-// handleInstallChoice applies the side effects for the user's install-prompt
-// choice and reports whether the automatic installation should proceed.
-//   - InstallYes:    returns (true, nil); the caller continues the winget/scoop install.
-//   - InstallNo:     opens the dependency's download page, then exits the flow
-//     (manual installation path). The dialog does not proceed with auto-install.
-//   - InstallCancel: cancel only — no browser, no install; returns an error so the
-//     caller aborts (the app cannot run without ttyd).
-func handleInstallChoice(choice InstallChoice) (proceed bool, err error) {
-	switch choice {
-	case InstallNo:
-		openBrowserFn(ttydDownloadURL)
-		exitFn(0)
-		return false, nil
-	case InstallCancel:
-		return false, errors.New("ttyd installation cancelled by user")
-	default: // InstallYes
-		return true, nil
-	}
-}
-
 // ensureTtyd verifies ttyd is on PATH or tries to install it automatically.
 func ensureTtyd() error {
 	if checkTtydInstalled() {
@@ -84,110 +57,42 @@ func checkTtydInstalled() bool {
 	return false
 }
 
-// installTtydWindows attempts to install ttyd on Windows via winget or scoop
-// Shows user-friendly dialogs and progress
+// ttydDependencySpec describes ttyd for the shared install runner. Unlike Git,
+// ttyd is used in-process immediately after install, so PostInstall
+// (checkTtydInstalled) is the authoritative success signal and augments PATH;
+// Scoop is kept as the Windows fallback.
+func ttydDependencySpec() DependencySpec {
+	return DependencySpec{
+		DisplayName: "ttyd (Terminal Server)",
+		PromptDescription: "ttyd provides the web-based terminal interface.\n" +
+			"It can be installed automatically via the Windows Package Manager " +
+			"(winget), with Scoop as a fallback.",
+		WingetID:        "tsl0922.ttyd",
+		ScoopID:         "ttyd",
+		VerifyCommand:   "ttyd",
+		PostInstall:     checkTtydInstalled,
+		ManualURL:       ttydDownloadURL,
+		TroubleshootURL: "https://github.com/tsl0922/ttyd#installation",
+	}
+}
+
+// installTtydWindows installs ttyd on Windows through the shared dependency
+// runner, so an installer-launch failure gets the same guided recovery
+// (retry / manual / troubleshoot) and diagnostics as every other package
+// install. ttyd is required, so any opt-out or unrecovered failure stops
+// startup.
 func installTtydWindows() error {
-	// Show install prompt dialog
-	choice := ShowInstallPrompt(
-		"ttyd (Terminal Server)",
-		"ttyd provides the web-based terminal interface.\n"+
-			"It will be installed via Windows Package Manager (winget).",
-	)
-
-	// No -> open download page and exit; Cancel -> abort with no action.
-	// Only InstallYes falls through to the automatic winget/scoop install below.
-	if proceed, err := handleInstallChoice(choice); !proceed {
-		return err
+	err := runDependencyInstall(ttydDependencySpec())
+	if err == nil {
+		return nil
 	}
-
-	// Show console during installation
-	showConsoleWindow(true)
-
-	fmt.Println("")
-	fmt.Println("╔════════════════════════════════════════════════════════════╗")
-	fmt.Println("║           Installing ttyd - Please wait...                 ║")
-	fmt.Println("╚════════════════════════════════════════════════════════════╝")
-	fmt.Println("")
-
-	// Try winget first
-	if _, err := exec.LookPath("winget"); err == nil {
-		fmt.Println("→ Using Windows Package Manager (winget)...")
-		fmt.Println("→ Running: winget install tsl0922.ttyd")
-		fmt.Println("")
-
-		cmd := exec.Command("winget", "install",
-			"-e", "--id", "tsl0922.ttyd",
-			"--accept-package-agreements",
-			"--accept-source-agreements",
-			"--disable-interactivity")
-
-		// Show output in real-time
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		err := cmd.Run()
-		if err != nil {
-			fmt.Printf("\n⚠ winget install returned: %v\n", err)
-		}
-
-		// Check if ttyd is now available
-		if checkTtydInstalled() {
-			fmt.Println("")
-			fmt.Println("╔════════════════════════════════════════════════════════════╗")
-			fmt.Println("║              ✓ ttyd installed successfully!                ║")
-			fmt.Println("╚════════════════════════════════════════════════════════════╝")
-			fmt.Println("")
-			return nil
-		}
+	// No opens the manual download page and exits the automatic flow. Cancel is
+	// returned untouched so it performs no browser/install action; any other
+	// error is surfaced to the caller as fatal.
+	if errors.Is(err, errInstallManual) {
+		os.Exit(0)
 	}
-
-	// Try scoop as fallback
-	if _, err := exec.LookPath("scoop"); err == nil {
-		fmt.Println("")
-		fmt.Println("→ Trying Scoop as fallback...")
-		fmt.Println("→ Running: scoop install ttyd")
-		fmt.Println("")
-
-		cmd := exec.Command("scoop", "install", "ttyd")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		err := cmd.Run()
-		if err != nil {
-			fmt.Printf("\n⚠ scoop install returned: %v\n", err)
-		}
-
-		if checkTtydInstalled() {
-			fmt.Println("")
-			fmt.Println("╔════════════════════════════════════════════════════════════╗")
-			fmt.Println("║              ✓ ttyd installed successfully!                ║")
-			fmt.Println("╚════════════════════════════════════════════════════════════╝")
-			fmt.Println("")
-			return nil
-		}
-	}
-
-	// Installation failed
-	fmt.Println("")
-	fmt.Println("╔════════════════════════════════════════════════════════════╗")
-	fmt.Println("║              ✗ Installation failed                         ║")
-	fmt.Println("╚════════════════════════════════════════════════════════════╝")
-	fmt.Println("")
-	fmt.Println("Please install ttyd manually:")
-	fmt.Println("  Option 1: winget install tsl0922.ttyd")
-	fmt.Println("  Option 2: scoop install ttyd")
-	fmt.Println("  Option 3: Download from", ttydDownloadURL)
-	fmt.Println("")
-
-	ShowErrorDialog(
-		"Installation Failed",
-		"ttyd could not be installed automatically.\n\n"+
-			"Please install it manually:\n"+
-			"  winget install tsl0922.ttyd\n\n"+
-			"Then restart this application.",
-	)
-
-	return errors.New("ttyd installation failed")
+	return err
 }
 
 // installTtydDarwin attempts to install ttyd on macOS via Homebrew
