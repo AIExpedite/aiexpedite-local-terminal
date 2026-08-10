@@ -2379,26 +2379,25 @@ func quoteAntigravityPrintFragments(frags []shellWord) string {
 // `"$"'(touch …)'`), each segment is quoted independently and juxtaposed so
 // bash re-joins them into one argv token without gluing an expandable `$`
 // onto a following literal to form `$(…)`, `${…}`, or `$name…`.
+// Multiple Expand segments are also quoted separately: `"$""${TASK}"` must
+// stay `"$""${TASK}"`, not `"$${TASK}"` (which would expand `$$` as PID).
 func quoteShellWord(w shellWord) string {
 	segs := mergeAdjacentShellSegments(w.effectiveSegments())
 	if len(segs) <= 1 {
 		return quoteAntigravityShellArg(w.Value, w.Expand)
 	}
 	anyExpand := false
-	anyLiteral := false
 	for _, seg := range segs {
 		if seg.Expand {
 			anyExpand = true
-		} else {
-			anyLiteral = true
+			break
 		}
 	}
-	// Pure-expand or pure-literal: one quote pass on the joined value.
-	// Mixed expand + literal: always per-segment (not only when the literal
-	// still contains $ / `) — otherwise `"$"'(touch)'` flattens to
-	// `"$(touch)"` and runs a command substitution.
-	if !anyExpand || !anyLiteral {
-		return quoteAntigravityShellArg(w.Value, anyExpand)
+	// Pure-literal multi-seg: one single-quote pass on the joined value.
+	// Any expand (pure multi-seg expand or mixed): always per-segment so
+	// quote boundaries that split `$` / `${…}` / `$(…)` stay intact.
+	if !anyExpand {
+		return quoteAntigravityShellArg(w.Value, false)
 	}
 	var b strings.Builder
 	for _, seg := range segs {
@@ -2407,9 +2406,11 @@ func quoteShellWord(w shellWord) string {
 	return b.String()
 }
 
-// mergeAdjacentShellSegments joins consecutive segments that share the same
-// Expand and Unquoted flags so rebuild quoting stays compact
-// (`$`+`(cmd)` → one literal).
+// mergeAdjacentShellSegments joins consecutive *literal* segments that share
+// the same Unquoted flag so rebuild quoting stays compact
+// (`$`+`(cmd)` escaped literals → one single-quoted blob). Expandable
+// segments are never merged: their quote-region boundaries are lexical for
+// `$` / ` (` (`"$""${TASK}"` must not become "$${TASK}").
 func mergeAdjacentShellSegments(segs []shellSegment) []shellSegment {
 	if len(segs) <= 1 {
 		return segs
@@ -2417,7 +2418,9 @@ func mergeAdjacentShellSegments(segs []shellSegment) []shellSegment {
 	out := make([]shellSegment, 0, len(segs))
 	cur := segs[0]
 	for i := 1; i < len(segs); i++ {
-		if segs[i].Expand == cur.Expand && segs[i].Unquoted == cur.Unquoted {
+		// Only glue pure-literal neighbours. Expandable regions keep their
+		// original segment splits from the tokenizer.
+		if !cur.Expand && !segs[i].Expand && segs[i].Unquoted == cur.Unquoted {
 			cur.Value += segs[i].Value
 			continue
 		}
@@ -2719,19 +2722,25 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 	// paramDepth tracks nested ${…} in expansion-eligible contexts so that
 	// escaped \$ / \` inside a still-open parameter expansion can decline reshape.
 	paramDepth := 0
-	// sawUnquotedAssign is true once this word has written an unquoted '='.
-	// Bash only tilde-expands after ':' inside assignment-like words, so a
-	// colon without a prior unquoted '=' (`foo:~`) stays literal.
+	// sawUnquotedAssign is true once this word has written an unquoted '='
+	// that follows a valid unquoted assignment name (HOME=…, not 1foo=… or
+	// 'HOME'=…). Bash only tilde-expands after ':' inside such words, so a
+	// colon without a prior valid assignment (`foo:~`) stays literal.
 	sawUnquotedAssign := false
 	// endsWithUnquotedAssignSep is set when the most recent character written
-	// into this word was an unquoted '=' or (after sawUnquotedAssign) ':'.
-	// Quoted separators (e.g. 'HOME='~) must not activate tilde expansion —
-	// only the resulting byte value is not enough.
+	// into this word was an unquoted '=' (after a valid name) or ':' (after
+	// sawUnquotedAssign). Quoted separators ('HOME='~) must not activate tilde
+	// expansion — only the resulting byte value is not enough.
 	endsWithUnquotedAssignSep := false
+	// assignName tracks unquoted bytes before the first unquoted '='. Quoted
+	// content before that '=' sets assignNamePolluted so 'HOME'=~ is not
+	// treated as an assignment.
+	var assignName strings.Builder
+	assignNamePolluted := false
 
 	// wordPrefixIsTildeExpandPosition reports whether a following unquoted '~'
-	// would tilde-expand: after an unquoted '=' always, or after an unquoted
-	// ':' only when the word is already assignment-like.
+	// would tilde-expand: after a valid unquoted assignment '=', or after an
+	// unquoted ':' only when the word is already assignment-like.
 	wordPrefixIsTildeExpandPosition := func() bool {
 		return endsWithUnquotedAssignSep
 	}
@@ -2767,6 +2776,8 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		wordStarted = false
 		sawUnquotedAssign = false
 		endsWithUnquotedAssignSep = false
+		assignName.Reset()
+		assignNamePolluted = false
 	}
 	writeSeg := func(c byte, expandable bool) {
 		unquotedCtx := !inSingle && !inDouble
@@ -2780,17 +2791,35 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		}
 		if unquotedCtx {
 			if c == '=' {
-				sawUnquotedAssign = true
-				endsWithUnquotedAssignSep = true
+				// Only a valid unquoted assignment name activates tilde-after-=
+				// (HOME=~ expands; 1foo=~ and 'HOME'=~ stay literal).
+				if !sawUnquotedAssign && !assignNamePolluted && isValidBashAssignName(assignName.String()) {
+					sawUnquotedAssign = true
+					endsWithUnquotedAssignSep = true
+				} else if sawUnquotedAssign {
+					// name=value=… — further '=' is just value content; still
+					// not a fresh assign-sep for tilde (value continues).
+					endsWithUnquotedAssignSep = false
+				} else {
+					endsWithUnquotedAssignSep = false
+				}
 			} else if c == ':' && sawUnquotedAssign {
 				endsWithUnquotedAssignSep = true
 			} else {
 				// Any other unquoted byte ends the "separator just written" state.
 				endsWithUnquotedAssignSep = false
+				if !sawUnquotedAssign {
+					assignName.WriteByte(c)
+				}
 			}
 		} else {
 			// Quoted / escaped content never leaves an unquoted assign sep.
 			endsWithUnquotedAssignSep = false
+			if !sawUnquotedAssign {
+				// Quoted bytes before '=' mean the prefix is not a pure
+				// unquoted assignment name ('HOME'=~).
+				assignNamePolluted = true
+			}
 		}
 		segCur.WriteByte(c)
 		segStarted = true
@@ -3159,7 +3188,11 @@ func braceSeqEndpointOK(s string) bool {
 }
 
 func braceSeqIncrOK(s string) bool {
-	// Increment is a non-zero integer (optional leading -).
+	// Increment is an integer (optional leading -). Zero is allowed: bash uses
+	// the default step of 1 when the increment is 0 (`{1..3..0}` → 1 2 3).
+	if s == "" {
+		return false
+	}
 	i := 0
 	if s[0] == '-' {
 		i = 1
@@ -3167,16 +3200,31 @@ func braceSeqIncrOK(s string) bool {
 	if i >= len(s) {
 		return false
 	}
-	allZero := true
 	for ; i < len(s); i++ {
 		if s[i] < '0' || s[i] > '9' {
 			return false
 		}
-		if s[i] != '0' {
-			allZero = false
+	}
+	return true
+}
+
+// isValidBashAssignName reports whether s is a POSIX/bash shell variable name
+// suitable for an assignment word (`NAME=value`): [A-Za-z_][A-Za-z0-9_]*.
+func isValidBashAssignName(s string) bool {
+	if s == "" {
+		return false
+	}
+	c0 := s[0]
+	if c0 != '_' && (c0 < 'a' || c0 > 'z') && (c0 < 'A' || c0 > 'Z') {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if c != '_' && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+			return false
 		}
 	}
-	return !allZero
+	return true
 }
 
 // shellArgMeta is the set of characters that force quoting when serializing a

@@ -797,10 +797,12 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	}
 
 	// Valid numeric / letter sequences still expand — leave unshaped.
+	// Zero increment uses bash's default step and still expands.
 	for _, orig := range []string{
 		`agy {1..3}`,
 		`agy {a..c}`,
 		`agy file{1..2}`,
+		`agy {1..3..0}`,
 	} {
 		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
 		if args[1] != orig {
@@ -852,6 +854,17 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	wantQEqTilde := `agy --dangerously-skip-permissions --print 'HOME=~'`
 	if qEqTilde[1] != wantQEqTilde {
 		t.Errorf("quoted-eq tilde prompt = %q, want %q", qEqTilde[1], wantQEqTilde)
+	}
+
+	// Invalid / quoted assignment names do not tilde-expand after '='.
+	for _, tc := range []struct{ in, want string }{
+		{`agy 1foo=~`, `agy --dangerously-skip-permissions --print '1foo=~'`},
+		{`agy 'HOME'=~`, `agy --dangerously-skip-permissions --print 'HOME=~'`},
+	} {
+		_, got := shapePTYExecArgs("bash", []string{"-c", tc.in})
+		if got[1] != tc.want {
+			t.Errorf("non-assign tilde %q = %q, want %q", tc.in, got[1], tc.want)
+		}
 	}
 
 	// Dash does not brace-expand — reshape `file{1,2}` as a literal prompt.
@@ -920,6 +933,16 @@ func TestShapePTYExecArgs_DashDollarQuoteIsLiteral(t *testing.T) {
 	_, bashArgs := shapePTYExecArgs("bash", []string{"-c", orig})
 	if bashArgs[1] != orig {
 		t.Errorf("bash ANSI-C was reshaped: got %q, want original %q", bashArgs[1], orig)
+	}
+}
+
+// Adjacent expandable quote segments must not be glued: `"$""${TASK}"`
+// rebuilds as `"$""${TASK}"`, not `"$${TASK}"` (which would expand $$ as PID).
+func TestShapePTYExecArgs_PreservesExpandSegmentBoundaries(t *testing.T) {
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy "$""${TASK}"`})
+	want := `agy --dangerously-skip-permissions --print "$""${TASK}"`
+	if args[1] != want {
+		t.Errorf("adjacent expand segments = %q, want %q", args[1], want)
 	}
 }
 
@@ -1141,6 +1164,7 @@ func TestShellWords(t *testing.T) {
 		{`agy {1..3}`, nil, nil, true},
 		{`agy {a..c}`, nil, nil, true},
 		{`agy file{1..2}`, nil, nil, true},
+		{`agy {1..3..0}`, nil, nil, true},
 		{`agy {foo..bar}`, []string{"agy", "{foo..bar}"}, []bool{false, false}, false},
 		{`agy {1..x}`, []string{"agy", "{1..x}"}, []bool{false, false}, false},
 		{`agy review *.go`, nil, nil, true},
@@ -1152,6 +1176,9 @@ func TestShellWords(t *testing.T) {
 		{`agy PATH=/bin:~/x`, nil, nil, true},
 		{`agy foo:~`, []string{"agy", "foo:~"}, []bool{false, false}, false},
 		{`agy 'HOME='~`, []string{"agy", "HOME=~"}, []bool{false, false}, false},
+		{`agy 1foo=~`, []string{"agy", "1foo=~"}, []bool{false, false}, false},
+		{`agy 'HOME'=~`, []string{"agy", "HOME=~"}, []bool{false, false}, false},
+		{`agy "$""${TASK}"`, []string{"agy", "$${TASK}"}, []bool{false, true}, false},
 		{`agy "$@"`, []string{"agy", "$@"}, []bool{false, true}, false},
 		{`agy "${files[@]}"`, []string{"agy", `${files[@]}`}, []bool{false, true}, false},
 		{`agy "${!pre_@}"`, []string{"agy", `${!pre_@}`}, []bool{false, true}, false},
