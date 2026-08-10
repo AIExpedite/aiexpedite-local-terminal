@@ -1985,14 +1985,20 @@ var antigravityBoolFlags = map[string]bool{
 }
 
 // partitionAntigravityCallerArgs peels known leading agy flags off args and
-// joins the remainder into a single --print value. Unknown tokens (including
-// anything that merely starts with "-") begin the prompt.
+// returns a single --print value. When the caller already used --print /
+// --print=value, only that one value is the prompt — subsequent recognized
+// flags (e.g. --conversation <id> from buildAntigravityNativeArgs) stay
+// options, not prompt text. Without an explicit --print, the remainder is
+// joined as the prompt. Unknown tokens (including anything that merely starts
+// with "-") begin the prompt when no --print was seen.
 //
 // hasPrompt is true when the caller supplied a print value — including an
 // *empty* one ("" / --print= / bare --print). It is false only when no prompt
 // material was present at all (so the builder should omit --print).
 func partitionAntigravityCallerArgs(args []string) (flags []string, prompt string, hasPrompt bool) {
 	i := 0
+	var printVal string
+	gotPrint := false
 	for i < len(args) {
 		a := args[i]
 		lower := strings.ToLower(a)
@@ -2000,11 +2006,12 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 		// Equals-form: --flag=value / -p=value
 		if name, val, ok := splitAntigravityEqualsFlag(lower, a); ok {
 			if isAntigravityPrintFlag(name) {
-				// Caller already supplied the print value (possibly empty) —
-				// rest of argv is also prompt material (join so nothing drops).
-				parts := []string{val}
-				parts = append(parts, args[i+1:]...)
-				return flags, strings.Join(parts, " "), true
+				// Explicit print value (possibly empty). Keep peeling flags
+				// after it so `--print=hi --conversation id` preserves options.
+				printVal = val
+				gotPrint = true
+				i++
+				continue
 			}
 			if name == "--dangerously-skip-permissions" || name == "--continue" {
 				i++
@@ -2015,19 +2022,22 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 				i++
 				continue
 			}
-			// Unknown --foo=bar → prompt starts here.
+			// Unknown --foo=bar → prompt starts here (only if no --print yet).
 			break
 		}
 
 		if isAntigravityPrintFlag(lower) {
-			// --print / -p / --prompt [value...]; value + remainder = prompt.
-			// Bare --print with no following token is still an explicit empty
-			// print (hasPrompt=true), not "no prompt".
+			// --print / -p / --prompt takes exactly one value token. Bare
+			// --print with no following token is still an explicit empty print.
 			i++
+			gotPrint = true
 			if i < len(args) {
-				return flags, strings.Join(args[i:], " "), true
+				printVal = args[i]
+				i++
+			} else {
+				printVal = ""
 			}
-			return flags, "", true
+			continue
 		}
 
 		if antigravityBoolFlags[lower] {
@@ -2053,6 +2063,9 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 
 		// First non-flag token → prompt starts here (may begin with "-" or be "").
 		break
+	}
+	if gotPrint {
+		return flags, printVal, true
 	}
 	if i < len(args) {
 		return flags, strings.Join(args[i:], " "), true

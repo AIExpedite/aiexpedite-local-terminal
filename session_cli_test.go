@@ -785,6 +785,29 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		t.Errorf("literal brace prompt = %q, want %q", litBrace[1], wantLitBrace)
 	}
 
+	// Invalid sequence endpoints stay literal in bash (`{foo..bar}`, `{1..x}`).
+	for _, tc := range []struct{ in, want string }{
+		{`agy {foo..bar}`, `agy --dangerously-skip-permissions --print '{foo..bar}'`},
+		{`agy {1..x}`, `agy --dangerously-skip-permissions --print '{1..x}'`},
+	} {
+		_, got := shapePTYExecArgs("bash", []string{"-c", tc.in})
+		if got[1] != tc.want {
+			t.Errorf("invalid brace sequence %q = %q, want %q", tc.in, got[1], tc.want)
+		}
+	}
+
+	// Valid numeric / letter sequences still expand — leave unshaped.
+	for _, orig := range []string{
+		`agy {1..3}`,
+		`agy {a..c}`,
+		`agy file{1..2}`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("valid brace sequence was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+
 	// Brace expansion spanning quoted segments (`{a,'b'}`) still expands in
 	// bash — leave unshaped rather than freezing to '{a,b}'.
 	for _, orig := range []string{
@@ -897,6 +920,31 @@ func TestShapePTYExecArgs_DashDollarQuoteIsLiteral(t *testing.T) {
 	_, bashArgs := shapePTYExecArgs("bash", []string{"-c", orig})
 	if bashArgs[1] != orig {
 		t.Errorf("bash ANSI-C was reshaped: got %q, want original %q", bashArgs[1], orig)
+	}
+}
+
+// Explicit --print takes one value; trailing recognized options (native
+// --conversation id) stay flags, not prompt text.
+func TestShapePTYExecArgs_PreservesTrailingOptionsAfterPrint(t *testing.T) {
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy --print "fix bug" --conversation abc-123`})
+	want := `agy --dangerously-skip-permissions --conversation abc-123 --print 'fix bug'`
+	if args[1] != want {
+		t.Errorf("print+conversation = %q, want %q", args[1], want)
+	}
+
+	// Direct (non-shell) argv path — same partitioner.
+	cmd, dArgs := shapePTYExecArgs("agy", []string{"--print", "fix bug", "--conversation", "abc-123"})
+	if cmd != "agy" {
+		t.Fatalf("cmd=%q", cmd)
+	}
+	wantDirect := []string{"--dangerously-skip-permissions", "--conversation", "abc-123", "--print", "fix bug"}
+	if len(dArgs) != len(wantDirect) {
+		t.Fatalf("direct args=%#v, want %#v", dArgs, wantDirect)
+	}
+	for i := range wantDirect {
+		if dArgs[i] != wantDirect[i] {
+			t.Errorf("direct args[%d]=%q, want %q (full %#v)", i, dArgs[i], wantDirect[i], dArgs)
+		}
 	}
 }
 
@@ -1090,6 +1138,11 @@ func TestShellWords(t *testing.T) {
 		{`agy review {a,b}`, nil, nil, true},
 		{`agy {a,'b'}`, nil, nil, true},
 		{`agy {a,"b"}`, nil, nil, true},
+		{`agy {1..3}`, nil, nil, true},
+		{`agy {a..c}`, nil, nil, true},
+		{`agy file{1..2}`, nil, nil, true},
+		{`agy {foo..bar}`, []string{"agy", "{foo..bar}"}, []bool{false, false}, false},
+		{`agy {1..x}`, []string{"agy", "{1..x}"}, []bool{false, false}, false},
 		{`agy review *.go`, nil, nil, true},
 		{`agy review ~/proj`, nil, nil, true},
 		{`agy review {foo}`, []string{"agy", "review", "{foo}"}, []bool{false, false, false}, false},

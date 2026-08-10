@@ -2251,22 +2251,26 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 }
 
 // partitionAntigravityCallerShellWords peels known leading agy flags off words
-// and returns the remaining prompt fragments (preserving per-word Expand and
-// Segments). Mirrors partitionAntigravityCallerArgs on []string.
+// and returns prompt fragments (preserving per-word Expand and Segments).
+// Mirrors partitionAntigravityCallerArgs: an explicit --print / --print=value
+// consumes exactly one prompt value so trailing options like --conversation
+// stay flags; without --print, the remainder is the prompt.
 func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord, prompt []shellWord, hasPrompt bool) {
 	i := 0
+	var printFrags []shellWord
+	gotPrint := false
 	for i < len(words) {
 		a := words[i].Value
 		lower := strings.ToLower(a)
 
 		if name, _, ok := splitAntigravityEqualsFlag(lower, a); ok {
 			if isAntigravityPrintFlag(name) {
-				// --print=value: slice the value out of the word while retaining
-				// per-segment expand metadata after the '=' (critical for
-				// --print="$TASK"'$(evil)' so the single-quoted part stays inert).
-				prompt = append(prompt, shellWordAfterEquals(words[i]))
-				prompt = append(prompt, words[i+1:]...)
-				return flags, prompt, true
+				// --print=value: peel value with segment metadata after '='.
+				// Continue so later recognized flags are not swallowed.
+				printFrags = []shellWord{shellWordAfterEquals(words[i])}
+				gotPrint = true
+				i++
+				continue
 			}
 			if name == "--dangerously-skip-permissions" || name == "--continue" {
 				i++
@@ -2281,12 +2285,16 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord,
 		}
 
 		if isAntigravityPrintFlag(lower) {
+			// Exactly one value token (or explicit empty when bare --print).
 			i++
+			gotPrint = true
 			if i < len(words) {
-				return flags, words[i:], true
+				printFrags = []shellWord{words[i]}
+				i++
+			} else {
+				printFrags = []shellWord{{Value: "", Expand: false}}
 			}
-			// Bare --print with no value → explicit empty print.
-			return flags, []shellWord{{Value: "", Expand: false}}, true
+			continue
 		}
 
 		if antigravityBoolFlags[lower] {
@@ -2310,6 +2318,9 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord,
 		}
 
 		break
+	}
+	if gotPrint {
+		return flags, printFrags, true
 	}
 	if i < len(words) {
 		return flags, words[i:], true
@@ -2617,16 +2628,57 @@ func shellSupportsBraceExpansion(command string) bool {
 }
 
 // shellSupportsDollarQuote reports whether the named shell supports ANSI-C
-// ($'…') and locale ($"…") quoting. Dash/POSIX sh do not — they treat the
-// leading $ as an ordinary character before the quote.
+// ($'…') and locale ($"…") quoting. Explicit dash/ash/busybox do not. Bare
+// `sh` is ambiguous (/bin/sh may be bash or dash), so we resolve symlinks /
+// PATH when possible; if the implementation cannot be determined we assume
+// dollar-quoting exists (decline reshape) rather than treating $'…' as a
+// literal "$…" that would mis-shape bash-as-sh.
 func shellSupportsDollarQuote(command string) bool {
-	base := strings.ToLower(filepath.Base(filepath.ToSlash(command)))
-	base = strings.TrimSuffix(base, ".exe")
+	base := shellCommandBase(command)
 	switch base {
-	case "sh", "dash", "ash", "busybox":
+	case "dash", "ash", "busybox":
 		return false
+	case "sh":
+		return shellShSupportsDollarQuote(command)
 	default:
 		// bash, zsh, ksh, and unknown → assume dollar-quoting exists.
+		return true
+	}
+}
+
+// shellCommandBase returns the lowercased executable basename without .exe.
+func shellCommandBase(command string) string {
+	base := strings.ToLower(filepath.Base(filepath.ToSlash(command)))
+	return strings.TrimSuffix(base, ".exe")
+}
+
+// shellShSupportsDollarQuote resolves what `sh` actually is. Dash-family →
+// false (literal $'…'). Bash-family or unresolvable → true (reject $'…').
+func shellShSupportsDollarQuote(command string) bool {
+	path := command
+	// Bare "sh": locate on PATH so EvalSymlinks can see /bin/sh → dash|bash.
+	if !strings.ContainsAny(filepath.ToSlash(command), "/") {
+		if p, err := exec.LookPath(command); err == nil {
+			path = p
+		} else {
+			return true // ambiguous
+		}
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		resolved = path
+	}
+	base := shellCommandBase(resolved)
+	switch {
+	case base == "dash", base == "ash", base == "busybox":
+		return false
+	case base == "bash", strings.HasPrefix(base, "bash"),
+		base == "zsh", strings.HasPrefix(base, "zsh"),
+		base == "ksh", strings.HasPrefix(base, "ksh"):
+		return true
+	default:
+		// Still named "sh" after resolve (e.g. macOS /bin/sh is bash-based
+		// but not a symlink) — decline $'…' rather than assume dash semantics.
 		return true
 	}
 }
@@ -2975,7 +3027,9 @@ func nextAfterLineContinuations(s string, i int) int {
 
 // looksLikeUnquotedBraceExpansion reports whether s[openIdx] (must be '{')
 // starts a bash brace-expansion pattern in the current unquoted word: a
-// matching `}` with an active `,` or `..` separator. Bash performs brace
+// matching `}` with an active list `,` or a *valid* sequence `..` form.
+// Invalid sequences such as `{foo..bar}` or `{1..x}` are ordinary literals in
+// bash (endpoints must be integers or single letters). Bash performs brace
 // expansion before quote removal, so separators inside quoted segments do not
 // count, but quoted text may appear between unquoted separators
 // (`{a,'b'}` expands; `{foo}` does not). Nested braces are tracked at depth;
@@ -2987,7 +3041,8 @@ func looksLikeUnquotedBraceExpansion(s string, openIdx int) bool {
 	depth := 0
 	inSingle, inDouble := false, false
 	escaped := false
-	active := false // unquoted `,` or `..` seen at depth 1
+	listActive := false // unquoted `,` at depth 1
+	seqDots := false    // unquoted `..` at depth 1 (validated on close)
 	for j := openIdx; j < len(s); j++ {
 		c := s[j]
 		if escaped {
@@ -3024,19 +3079,104 @@ func looksLikeUnquotedBraceExpansion(s string, openIdx int) bool {
 		case '}':
 			depth--
 			if depth == 0 {
-				return active
+				if listActive {
+					return true
+				}
+				if seqDots {
+					return isValidBashBraceSequenceBody(s[openIdx+1 : j])
+				}
+				return false
 			}
 		case ',':
 			if depth == 1 {
-				active = true
+				listActive = true
 			}
 		case '.':
 			if depth == 1 && j+1 < len(s) && s[j+1] == '.' {
-				active = true
+				seqDots = true
+				j++ // consume second '.'
 			}
 		}
 	}
 	return false
+}
+
+// isValidBashBraceSequenceBody reports whether body (contents inside `{…}`,
+// without braces) is a bash sequence expression that actually expands:
+// `start..end` or `start..end..incr` where start/end are both integers or both
+// single ASCII letters. `{foo..bar}` and `{1..x}` stay literal in bash.
+func isValidBashBraceSequenceBody(body string) bool {
+	// Nested braces / list commas are not pure sequence forms; list form is
+	// handled separately via listActive. Be conservative on nested content.
+	if strings.ContainsAny(body, "{},") {
+		// Nested `{…}` with `..` somewhere — treat as expansion-active so we
+		// never freeze a real nested expand into a quoted literal.
+		return strings.Contains(body, "..")
+	}
+	parts := strings.Split(body, "..")
+	if len(parts) != 2 && len(parts) != 3 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return false
+		}
+	}
+	if !braceSeqEndpointOK(parts[0]) || !braceSeqEndpointOK(parts[1]) {
+		return false
+	}
+	// Both integers or both single letters — mixed types do not expand.
+	if braceSeqIsAlpha(parts[0]) != braceSeqIsAlpha(parts[1]) {
+		return false
+	}
+	if len(parts) == 3 && !braceSeqIncrOK(parts[2]) {
+		return false
+	}
+	return true
+}
+
+func braceSeqIsAlpha(s string) bool {
+	return len(s) == 1 && ((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z'))
+}
+
+func braceSeqEndpointOK(s string) bool {
+	if braceSeqIsAlpha(s) {
+		return true
+	}
+	i := 0
+	if s[0] == '-' {
+		i = 1
+	}
+	if i >= len(s) {
+		return false
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func braceSeqIncrOK(s string) bool {
+	// Increment is a non-zero integer (optional leading -).
+	i := 0
+	if s[0] == '-' {
+		i = 1
+	}
+	if i >= len(s) {
+		return false
+	}
+	allZero := true
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+		if s[i] != '0' {
+			allZero = false
+		}
+	}
+	return !allZero
 }
 
 // shellArgMeta is the set of characters that force quoting when serializing a

@@ -696,6 +696,21 @@ func TestBuildAntigravityInteractiveArgs_MatchesNativePrintContract(t *testing.T
 	}
 }
 
+// Native resume shape `--print <prompt> --conversation <id>` must keep the
+// conversation flag as an option, not fold it into the print value.
+func TestBuildAntigravityInteractiveArgs_PreservesTrailingConversation(t *testing.T) {
+	args := buildAntigravityInteractiveArgs([]string{"--print", "fix bug", "--conversation", "abc-123"})
+	want := []string{"--dangerously-skip-permissions", "--conversation", "abc-123", "--print", "fix bug"}
+	if len(args) != len(want) {
+		t.Fatalf("got %#v, want %#v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("args[%d]=%q, want %q (full %#v)", i, args[i], want[i], args)
+		}
+	}
+}
+
 func TestAntigravityNativeEnvelopePublishable_AcceptsNormalMessage(t *testing.T) {
 	msg := resultMsg{
 		ID:     "sess",
