@@ -1429,6 +1429,19 @@ func TestShapePTYExecArgs_PreservesTrailingOptionsAfterPrint(t *testing.T) {
 			t.Errorf("direct args[%d]=%q, want %q (full %#v)", i, dArgs[i], wantDirect[i], dArgs)
 		}
 	}
+
+	// Unknown trailing tokens after explicit --print (e.g. case-sensitive
+	// --PRINT) must not be dropped — same as buildAntigravityInteractiveArgs.
+	_, trail := shapePTYExecArgs("bash", []string{"-c", `agy --print review --PRINT`})
+	wantTrail := `agy --dangerously-skip-permissions --print review --PRINT`
+	if trail[1] != wantTrail {
+		t.Errorf("print+unknown trailing = %q, want %q", trail[1], wantTrail)
+	}
+	_, trailEq := shapePTYExecArgs("bash", []string{"-c", `agy --print=review --PRINT extra`})
+	wantTrailEq := `agy --dangerously-skip-permissions --print review --PRINT extra`
+	if trailEq[1] != wantTrailEq {
+		t.Errorf("print=value+unknown trailing = %q, want %q", trailEq[1], wantTrailEq)
+	}
 }
 
 // Unquoted ${…} must close paramDepth so a later escaped \$ outside the

@@ -2221,7 +2221,7 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 	if len(words) == 0 || !isAntigravityCommand(words[0].Value) {
 		return "", false
 	}
-	flags, promptFrags, hasPrompt := partitionAntigravityCallerShellWords(words[1:])
+	flags, promptFrags, trailing, hasPrompt := partitionAntigravityCallerShellWords(words[1:])
 	// Unquoted expansions cannot be rebuilt as double-quoted tokens without
 	// changing bash word-splitting / pathname-expansion / empty-expand semantics
 	// (e.g. `agy $OPTIONAL` with OPTIONAL='*.go' must glob; `agy --add-dir $ROOT
@@ -2231,25 +2231,33 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 	// multiple argv tokens after --print). Single-field double-quoted forms
 	// (`"$TASK"`, `--add-dir "$ROOT"`) still reshape.
 	zshEquals := shellSupportsZshEquals(shellCmd)
-	for _, f := range flags {
+	checkWord := func(f shellWord) bool {
 		if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
-			return "", false
+			return false
 		}
 		if zshEquals && (f.hasZshEqualsSub() || f.hasQuotedZshArrayExpand()) {
+			return false
+		}
+		return true
+	}
+	for _, f := range flags {
+		if !checkWord(f) {
 			return "", false
 		}
 	}
 	if hasPrompt {
 		for _, f := range promptFrags {
-			if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
-				return "", false
-			}
-			if zshEquals && (f.hasZshEqualsSub() || f.hasQuotedZshArrayExpand()) {
+			if !checkWord(f) {
 				return "", false
 			}
 		}
 	}
-	parts := make([]string, 0, 2+len(flags)+2)
+	for _, f := range trailing {
+		if !checkWord(f) {
+			return "", false
+		}
+	}
+	parts := make([]string, 0, 2+len(flags)+2+len(trailing))
 	parts = append(parts, words[0].Value, "--dangerously-skip-permissions")
 	for _, f := range flags {
 		// Flag tokens (and their values) keep per-segment expand, e.g.
@@ -2259,6 +2267,12 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 	if hasPrompt {
 		parts = append(parts, "--print", quoteAntigravityPrintFragments(promptFrags))
 	}
+	// Unknown tokens after an explicit --print (e.g. --PRINT) must stay on the
+	// command line so agy keeps its own positional/unknown-option behavior —
+	// same rule as partitionAntigravityCallerArgs / buildAntigravityInteractiveArgs.
+	for _, f := range trailing {
+		parts = append(parts, quoteShellWord(f))
+	}
 	return strings.Join(parts, " "), true
 }
 
@@ -2266,8 +2280,10 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 // and returns prompt fragments (preserving per-word Expand and Segments).
 // Mirrors partitionAntigravityCallerArgs: an explicit --print / --print=value
 // consumes exactly one prompt value so trailing options like --conversation
-// stay flags; without --print, the remainder is the prompt.
-func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord, prompt []shellWord, hasPrompt bool) {
+// stay flags; without --print, the remainder is the prompt. Tokens that remain
+// after an explicit print value (unknown options, positionals) are returned as
+// trailing so the reshaper can append them after --print.
+func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, trailing []shellWord, hasPrompt bool) {
 	i := 0
 	var printFrags []shellWord
 	gotPrint := false
@@ -2333,12 +2349,14 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord,
 		break
 	}
 	if gotPrint {
-		return flags, printFrags, true
+		// Anything not recognized after an explicit print value must remain on
+		// the reshaped command (unknown options, positionals).
+		return flags, printFrags, words[i:], true
 	}
 	if i < len(words) {
-		return flags, words[i:], true
+		return flags, words[i:], nil, true
 	}
-	return flags, nil, false
+	return flags, nil, nil, false
 }
 
 // quoteAntigravityPrintFragments serializes one or more prompt tokens into a
