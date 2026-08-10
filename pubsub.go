@@ -2797,21 +2797,26 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		assignName.Reset()
 		assignNamePolluted = false
 	}
-	writeSeg := func(c byte, expandable bool) {
-		unquotedCtx := !inSingle && !inDouble
+	// writeSeg appends c. wasEscaped marks a backslash-escaped byte in an
+	// otherwise unquoted context (e.g. HOME\=~): bash treats that byte as
+	// literal and does NOT use it as an assignment separator / tilde trigger.
+	writeSeg := func(c byte, expandable bool, wasEscaped bool) {
+		unquotedCtx := !inSingle && !inDouble && !wasEscaped
 		// Starting an expansion after literal content: split so a later
 		// Expand=true rebuild cannot re-activate earlier escaped $ / `.
 		if expandable && segStarted && !segExpand {
 			flushSeg()
 		}
 		if !segStarted {
-			segUnquoted = unquotedCtx
+			// Escaped bytes are still outside quotes for segment bookkeeping.
+			segUnquoted = !inSingle && !inDouble
 		}
 		if unquotedCtx {
 			if c == '=' {
 				// Only a valid unquoted assignment LHS activates tilde-after-=
 				// (HOME=~, HOME+=~ expand; 1foo=~ and 'HOME'=~ stay literal).
-				// Compound += / -= leave a trailing + / - on assignName.
+				// Compound += leaves a trailing + on assignName. -= is NOT a
+				// bash assignment operator (isValidBashAssignLHS rejects it).
 				if !sawUnquotedAssign && !assignNamePolluted && isValidBashAssignLHS(assignName.String()) {
 					sawUnquotedAssign = true
 					endsWithUnquotedAssignSep = true
@@ -2835,8 +2840,8 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// Quoted / escaped content never leaves an unquoted assign sep.
 			endsWithUnquotedAssignSep = false
 			if !sawUnquotedAssign {
-				// Quoted bytes before '=' mean the prefix is not a pure
-				// unquoted assignment name ('HOME'=~).
+				// Quoted or escaped bytes before a later '=' mean the prefix is
+				// not a pure unquoted assignment name ('HOME'=~, H\OME=~).
 				assignNamePolluted = true
 			}
 		}
@@ -2862,7 +2867,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		if segStarted && segExpand {
 			flushSeg()
 		}
-		writeSeg(c, false)
+		writeSeg(c, false, true)
 		flushSeg()
 		return true
 	}
@@ -2891,12 +2896,14 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				continue
 			}
 			// Backslash-escaped content is literal — including \$ and \`.
+			// wasEscaped=true so e.g. HOME\=~ does not open an assignment
+			// separator at the escaped '=' (bash passes HOME=~ literally).
 			if c == '$' || c == '`' {
 				if !writeEscapedExpansion(c) {
 					return nil, fmt.Errorf("unsupported escaped expansion inside parameter expansion")
 				}
 			} else {
-				writeSeg(c, false)
+				writeSeg(c, false, true)
 			}
 			escaped = false
 			continue
@@ -2913,7 +2920,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				wordStarted = true
 			} else {
 				// Single-quoted: literal, no expansion.
-				writeSeg(c, false)
+				writeSeg(c, false, false)
 			}
 			continue
 		}
@@ -2937,7 +2944,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				}
 				if next == '\\' || next == '"' {
 					i++
-					writeSeg(next, false)
+					writeSeg(next, false, false)
 					continue
 				}
 			}
@@ -2964,12 +2971,12 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			if c == '$' {
 				j := nextAfterLineContinuations(s, i+1)
 				expandable := j < len(s) && shellDollarStartsExpand(s[j])
-				writeSeg(c, expandable)
+				writeSeg(c, expandable, false)
 				if expandable {
 					noteParamOpen(true, s[j])
 				}
 			} else {
-				writeSeg(c, c == '`')
+				writeSeg(c, c == '`', false)
 			}
 			noteParamClose(c)
 			continue
@@ -2998,7 +3005,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				flushWord()
 				return words, nil
 			}
-			writeSeg(c, false)
+			writeSeg(c, false, false)
 		case '(', ')':
 			// We do not parse subshells/groups. Unquoted parens are either
 			// unmatched (bash syntax error) or full shell syntax we would
@@ -3016,7 +3023,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			if !wordStarted || wordPrefixIsTildeExpandPosition() {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
-			writeSeg(c, false)
+			writeSeg(c, false, false)
 		case '{':
 			// Brace expansion (`file{1,2}`, `{a,b}`, `{1..3}`) runs before
 			// agy sees argv on bash/zsh/ksh — decline reshape. Dash/sh leave
@@ -3025,13 +3032,13 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			if opts.braceExpand && looksLikeUnquotedBraceExpansion(s, i) {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
-			writeSeg(c, false)
+			writeSeg(c, false, false)
 		case '}':
 			// Closing brace alone is literal; expanding forms are rejected
 			// when the opening `{` is seen. Still close ${…} paramDepth so a
 			// later escaped \$ outside the expansion is not mis-attributed
 			// (e.g. `${ROOT}\$dir`).
-			writeSeg(c, false)
+			writeSeg(c, false, false)
 			noteParamClose(c)
 		default:
 			// ANSI-C ($'…') / locale ($"…") quoting: not implemented on bash-
@@ -3049,17 +3056,17 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 					}
 					// Non-dollar-quote shell: leading $ is an ordinary literal
 					// character before the quote (dash yields value "$text").
-					writeSeg(c, false)
+					writeSeg(c, false, false)
 					continue
 				}
 				expandable := j < len(s) && shellDollarStartsExpand(s[j])
-				writeSeg(c, expandable)
+				writeSeg(c, expandable, false)
 				if expandable {
 					noteParamOpen(true, s[j])
 				}
 				continue
 			}
-			writeSeg(c, c == '`')
+			writeSeg(c, c == '`', false)
 			// Unquoted `}` is handled above as brace expansion error, so
 			// paramDepth only closes inside double quotes (noteParamClose there).
 		}
@@ -3069,7 +3076,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 	}
 	if escaped {
 		// Trailing backslash is kept as a literal.
-		writeSeg('\\', false)
+		writeSeg('\\', false, false)
 	}
 	flushWord()
 	return words, nil
@@ -3220,29 +3227,24 @@ func braceSeqEndpointOK(s string) bool {
 	if braceSeqIsAlpha(s) {
 		return true
 	}
-	i := 0
-	if s[0] == '-' {
-		i = 1
-	}
-	if i >= len(s) {
-		return false
-	}
-	for ; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return true
+	// Integers may have an optional leading + or - (bash `{+1..+3}` expands).
+	return braceSeqSignedIntOK(s)
 }
 
 func braceSeqIncrOK(s string) bool {
-	// Increment is an integer (optional leading -). Zero is allowed: bash uses
-	// the default step of 1 when the increment is 0 (`{1..3..0}` → 1 2 3).
+	// Increment is an integer (optional leading + or -). Zero is allowed: bash
+	// uses the default step of 1 when the increment is 0 (`{1..3..0}` → 1 2 3).
+	return braceSeqSignedIntOK(s)
+}
+
+// braceSeqSignedIntOK reports whether s is a non-empty decimal integer with an
+// optional leading + or - sign (bash brace-sequence endpoints/increments).
+func braceSeqSignedIntOK(s string) bool {
 	if s == "" {
 		return false
 	}
 	i := 0
-	if s[0] == '-' {
+	if s[0] == '-' || s[0] == '+' {
 		i = 1
 	}
 	if i >= len(s) {
@@ -3277,8 +3279,9 @@ func isValidBashAssignName(s string) bool {
 
 // isValidBashAssignLHS reports whether s is a valid assignment left-hand side
 // as accumulated before the '=' character. Covers plain NAME and compound
-// assignment operators NAME+ / NAME- (i.e. NAME+=value / NAME-=value), which
-// also activate tilde expansion after the '=' (HOME+=~ → HOME+=/home/…).
+// assignment NAME+ (i.e. NAME+=value), which activate tilde expansion after
+// the '=' (HOME+=~ → HOME+=/home/…). NAME-= is NOT a bash assignment operator
+// (HOME-=~ is a literal argument), so trailing '-' is rejected.
 // Indexed forms (A[0]=) hit the unquoted '[' path earlier and already decline.
 func isValidBashAssignLHS(s string) bool {
 	if isValidBashAssignName(s) {
@@ -3286,7 +3289,8 @@ func isValidBashAssignLHS(s string) bool {
 	}
 	if n := len(s); n >= 2 {
 		last := s[n-1]
-		if last == '+' || last == '-' {
+		// Only += is a compound assignment in bash (not -=).
+		if last == '+' {
 			return isValidBashAssignName(s[:n-1])
 		}
 	}

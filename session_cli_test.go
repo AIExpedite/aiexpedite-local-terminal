@@ -819,6 +819,8 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		`agy {a..c}`,
 		`agy file{1..2}`,
 		`agy {1..3..0}`,
+		`agy {1..3..+1}`,
+		`agy {+1..+3}`,
 	} {
 		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
 		if args[1] != orig {
@@ -854,11 +856,10 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	}
 
 	// Assignment-like tilde (`HOME=~`, `HOME+=~`, `PATH=…:~/x`) expands in
-	// bash — leave unshaped. Compound += / -= also activate tilde expansion.
+	// bash — leave unshaped. Compound += also activates tilde expansion.
 	for _, orig := range []string{
 		`agy HOME=~`,
 		`agy HOME+=~`,
-		`agy HOME-=~`,
 		`agy PATH=~/bin:~/x`,
 		`agy PATH=/bin:~/x`,
 	} {
@@ -882,10 +883,12 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		t.Errorf("quoted-eq tilde prompt = %q, want %q", qEqTilde[1], wantQEqTilde)
 	}
 
-	// Invalid / quoted assignment names do not tilde-expand after '='.
+	// Invalid, quoted, escaped, and non-assignment prefixes do not tilde-expand.
 	for _, tc := range []struct{ in, want string }{
 		{`agy 1foo=~`, `agy --dangerously-skip-permissions --print '1foo=~'`},
 		{`agy 'HOME'=~`, `agy --dangerously-skip-permissions --print 'HOME=~'`},
+		{`agy HOME\=~`, `agy --dangerously-skip-permissions --print 'HOME=~'`},
+		{`agy HOME-=~`, `agy --dangerously-skip-permissions --print 'HOME-=~'`},
 	} {
 		_, got := shapePTYExecArgs("bash", []string{"-c", tc.in})
 		if got[1] != tc.want {
@@ -1256,6 +1259,8 @@ func TestShellWords(t *testing.T) {
 		{`agy {a..c}`, nil, nil, true},
 		{`agy file{1..2}`, nil, nil, true},
 		{`agy {1..3..0}`, nil, nil, true},
+		{`agy {1..3..+1}`, nil, nil, true},
+		{`agy {+1..+3}`, nil, nil, true},
 		{`agy {foo..bar}`, []string{"agy", "{foo..bar}"}, []bool{false, false}, false},
 		{`agy {1..x}`, []string{"agy", "{1..x}"}, []bool{false, false}, false},
 		{`agy review *.go`, nil, nil, true},
@@ -1264,7 +1269,8 @@ func TestShellWords(t *testing.T) {
 		{`agy review foo~bar`, []string{"agy", "review", "foo~bar"}, []bool{false, false, false}, false},
 		{`agy HOME=~`, nil, nil, true},
 		{`agy HOME+=~`, nil, nil, true},
-		{`agy HOME-=~`, nil, nil, true},
+		{`agy HOME-=~`, []string{"agy", "HOME-=~"}, []bool{false, false}, false},
+		{`agy HOME\=~`, []string{"agy", "HOME=~"}, []bool{false, false}, false},
 		{`agy PATH=~/bin:~/x`, nil, nil, true},
 		{`agy PATH=/bin:~/x`, nil, nil, true},
 		{`agy foo:~`, []string{"agy", "foo:~"}, []bool{false, false}, false},
