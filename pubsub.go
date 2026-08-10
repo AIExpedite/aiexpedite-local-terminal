@@ -2338,24 +2338,29 @@ func quoteAntigravityPrintFragments(frags []shellWord) string {
 }
 
 // quoteShellWord serializes one shell word. When the word is built from
-// concatenated quote segments with mixed expand (e.g. `"$TASK"'$(evil)'`),
-// each segment is quoted independently and juxtaposed so bash re-joins them
-// into one argv token without reactivating literal $(...).
+// concatenated quote segments with mixed expand (e.g. `"$TASK"'$(evil)'` or
+// `"$"'(touch …)'`), each segment is quoted independently and juxtaposed so
+// bash re-joins them into one argv token without gluing an expandable `$`
+// onto a following literal to form `$(…)`, `${…}`, or `$name…`.
 func quoteShellWord(w shellWord) string {
 	segs := mergeAdjacentShellSegments(w.effectiveSegments())
 	if len(segs) <= 1 {
 		return quoteAntigravityShellArg(w.Value, w.Expand)
 	}
 	anyExpand := false
-	mixedLiteralExpand := false
+	anyLiteral := false
 	for _, seg := range segs {
 		if seg.Expand {
 			anyExpand = true
-		} else if strings.ContainsAny(seg.Value, "$`") {
-			mixedLiteralExpand = true
+		} else {
+			anyLiteral = true
 		}
 	}
-	if !anyExpand || !mixedLiteralExpand {
+	// Pure-expand or pure-literal: one quote pass on the joined value.
+	// Mixed expand + literal: always per-segment (not only when the literal
+	// still contains $ / `) — otherwise `"$"'(touch)'` flattens to
+	// `"$(touch)"` and runs a command substitution.
+	if !anyExpand || !anyLiteral {
 		return quoteAntigravityShellArg(w.Value, anyExpand)
 	}
 	var b strings.Builder

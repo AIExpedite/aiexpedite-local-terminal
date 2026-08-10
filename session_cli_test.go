@@ -717,6 +717,24 @@ func TestShapePTYExecArgs_PreservesPerFragmentExpansion(t *testing.T) {
 	if concatArgs[1] != wantConcat {
 		t.Errorf("concatenated segments = %q, want %q", concatArgs[1], wantConcat)
 	}
+
+	// Expandable `$` alone + literal suffix that would form $(…) if flattened.
+	// Bash passes literal `$(touch /tmp/pwn)`; rebuild must not double-quote
+	// the joined value into a live command substitution.
+	_, dollarArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$"'(touch /tmp/pwn)'`})
+	wantDollar := `agy --dangerously-skip-permissions --print "$"'(touch /tmp/pwn)'`
+	if dollarArgs[1] != wantDollar {
+		t.Errorf("expandable $ + literal paren = %q, want %q", dollarArgs[1], wantDollar)
+	}
+
+	// Same for `$` + literal name suffix (must not become one double-quoted
+	// `$TASKmore` which would expand a different variable name). Adjacent
+	// unquoted more is fine — bash concatenates `"$TASK"more` → TASK+more.
+	_, nameArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK"'more'`})
+	wantName := `agy --dangerously-skip-permissions --print "$TASK"more`
+	if nameArgs[1] != wantName {
+		t.Errorf("expandable $TASK + literal more = %q, want %q", nameArgs[1], wantName)
+	}
 }
 
 // Unmatched / unsupported unquoted parentheses must NOT be reshaped into a valid
