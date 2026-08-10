@@ -2473,6 +2473,8 @@ func (w shellWord) effectiveSegments() []shellSegment {
 // do not start a word (so a following `#` stays a comment).
 // Escaped `$` / “ ` “ inside an open `${…}` declines reshape (segment splits
 // would break the expansion syntax on rebuild).
+// `$` + line-continuation(s) + quote is treated as ANSI-C / locale quoting
+// (bash joins them before quote recognition).
 // Callers must not turn rejected payloads into a valid command.
 func shellWords(s string) ([]shellWord, error) {
 	var words []shellWord
@@ -2639,8 +2641,11 @@ func shellWords(s string) ([]shellWord, error) {
 			// Brace/glob/tilde do not expand inside double quotes — literal OK.
 			expandable := c == '$' || c == '`'
 			writeSeg(c, expandable)
-			if expandable && c == '$' && i+1 < len(s) {
-				noteParamOpen(true, s[i+1])
+			if expandable && c == '$' {
+				j := nextAfterLineContinuations(s, i+1)
+				if j < len(s) {
+					noteParamOpen(true, s[j])
+				}
 			}
 			noteParamClose(c)
 			continue
@@ -2685,15 +2690,22 @@ func shellWords(s string) ([]shellWord, error) {
 			return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 		default:
 			// ANSI-C ($'…') / locale ($"…") quoting: not implemented. A bare
-			// unquoted $ followed by a quote would otherwise be misread as
-			// expandable $ + ordinary quotes (e.g. $'(touch …)' → executed).
-			if c == '$' && i+1 < len(s) && (s[i+1] == '\'' || s[i+1] == '"') {
-				return nil, fmt.Errorf("unsupported ANSI-C or locale quoted string")
+			// unquoted $ followed by a quote (possibly after deleted line
+			// continuations) would otherwise be misread as expandable $ +
+			// ordinary quotes (e.g. $'(touch …)' or $\n'(…)' → executed).
+			if c == '$' {
+				j := nextAfterLineContinuations(s, i+1)
+				if j < len(s) && (s[j] == '\'' || s[j] == '"') {
+					return nil, fmt.Errorf("unsupported ANSI-C or locale quoted string")
+				}
 			}
 			expandable := c == '$' || c == '`'
 			writeSeg(c, expandable)
-			if expandable && c == '$' && i+1 < len(s) {
-				noteParamOpen(true, s[i+1])
+			if expandable && c == '$' {
+				j := nextAfterLineContinuations(s, i+1)
+				if j < len(s) {
+					noteParamOpen(true, s[j])
+				}
 			}
 			// Unquoted `}` is handled above as brace expansion error, so
 			// paramDepth only closes inside double quotes (noteParamClose there).
@@ -2708,6 +2720,16 @@ func shellWords(s string) ([]shellWord, error) {
 	}
 	flushWord()
 	return words, nil
+}
+
+// nextAfterLineContinuations returns the index of the next byte in s at or after
+// i once unquoted backslash-newline pairs are skipped (bash deletes them before
+// other tokenization). Returns len(s) when only continuations remain.
+func nextAfterLineContinuations(s string, i int) int {
+	for i+1 < len(s) && s[i] == '\\' && s[i+1] == '\n' {
+		i += 2
+	}
+	return i
 }
 
 // shellArgMeta is the set of characters that force quoting when serializing a

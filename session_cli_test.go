@@ -820,6 +820,19 @@ func TestShapePTYExecArgs_RejectsANSICQuoting(t *testing.T) {
 	if args2[1] != orig2 {
 		t.Errorf("locale quote was reshaped: got %q, want original %q", args2[1], orig2)
 	}
+
+	// Line continuation between $ and quote still forms ANSI-C after bash joins.
+	orig3 := "agy $\\\n'(touch /tmp/pwn)'"
+	_, args3 := shapePTYExecArgs("bash", []string{"-c", orig3})
+	if args3[1] != orig3 {
+		t.Errorf("ANSI-C via line continuation was reshaped: got %q, want original %q", args3[1], orig3)
+	}
+
+	orig4 := "agy $\\\n\"hello\""
+	_, args4 := shapePTYExecArgs("bash", []string{"-c", orig4})
+	if args4[1] != orig4 {
+		t.Errorf("locale quote via line continuation was reshaped: got %q, want original %q", args4[1], orig4)
+	}
 }
 
 // Unquoted # at a word boundary is a shell comment — not part of the prompt.
@@ -898,6 +911,8 @@ func TestShellWords(t *testing.T) {
 		{`agy "${TASK:-\$(x)}"`, nil, nil, true},
 		{`agy $'(x)'`, nil, nil, true},
 		{`agy $"x"`, nil, nil, true},
+		{"agy $\\\n'(x)'", nil, nil, true},
+		{"agy $\\\n\"x\"", nil, nil, true},
 		{`agy review # note`, []string{"agy", "review"}, []bool{false, false}, false},
 		{`agy review#note`, []string{"agy", "review#note"}, []bool{false, false}, false},
 	}
