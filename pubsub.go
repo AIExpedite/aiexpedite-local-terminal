@@ -2214,6 +2214,7 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 		pwdTilde:          shellSupportsPwdTilde(shellCmd),
 		failUnknownTilde:  shellFailsUnknownTildeLogin(shellCmd),
 		homeTildeNeedsEnv: shellBareTildeNeedsHome(shellCmd),
+		startupFiles:      shellRunsStartupFiles(shellCmd),
 	})
 	if err != nil {
 		// Malformed shell (unterminated quote, etc.) — do not reshape into a
@@ -3022,6 +3023,11 @@ type shellWordOptions struct {
 	// arithmetic. Dash/ash leave `$[…]` as literal `$` + text; treating `[`
 	// as expansion there declines reshape and leaves interactive agy waiting.
 	legacyArith bool
+	// startupFiles is true when the wrapper may source a startup file before
+	// running the payload (zsh always reads .zshenv; bash reads $BASH_ENV for
+	// non-interactive shells). Such a file can define variables this process
+	// cannot see — notably OLDPWD, which decides whether `~-` expands.
+	startupFiles bool
 	// pwdTilde is true when the wrapper expands word-initial `~+` / `~-`
 	// (PWD/OLDPWD). Bash/zsh/ksh do; dash/ash leave them literal.
 	pwdTilde bool
@@ -3083,6 +3089,27 @@ func shellSupportsAssignTilde(command string) bool {
 		return false
 	default:
 		return true
+	}
+}
+
+// shellRunsStartupFiles reports whether the wrapper may source a startup file
+// before running its `-c` payload, which can define variables (notably
+// OLDPWD) that this process cannot observe.
+//
+//   - zsh always reads .zshenv, even non-interactively.
+//   - bash reads $BASH_ENV for non-interactive shells; in POSIX mode (`sh`) it
+//     reads $ENV instead. Both are only a hazard when the variable is set.
+//   - dash/ash read $ENV for interactive shells only — `dash -c` sources
+//     nothing.
+func shellRunsStartupFiles(command string) bool {
+	switch shellCommandBase(command) {
+	case "dash", "ash", "busybox":
+		return false
+	case "zsh":
+		return true
+	default:
+		// bash, sh, ksh, unknown.
+		return os.Getenv("BASH_ENV") != "" || os.Getenv("ENV") != ""
 	}
 }
 
@@ -3731,11 +3758,16 @@ func shellTildePrefixExpands(login string, opts shellWordOptions) bool {
 		return opts.pwdTilde
 	}
 	// ~- needs a usable OLDPWD; otherwise bash leaves the token literal.
+	// Our environment is not the whole story: a startup file the wrapper
+	// sources first (zsh's .zshenv, bash's $BASH_ENV) can export OLDPWD, and
+	// then `agy ~-` expands even though this process sees nothing — verified on
+	// bash 5.2.21 (`env -u OLDPWD BASH_ENV=… bash -c 'printf %s ~-'` → /var).
+	// Treat it as expanding whenever such a file may run.
 	if login == "-" {
 		if !opts.pwdTilde {
 			return false
 		}
-		return os.Getenv("OLDPWD") != ""
+		return os.Getenv("OLDPWD") != "" || opts.startupFiles
 	}
 	if opts.pwdTilde && isPwdTildeStackZero(login) {
 		return true

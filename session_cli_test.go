@@ -986,13 +986,45 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 			t.Errorf("bash tilde special was reshaped: got %q, want original %q", args[1], orig)
 		}
 	}
-	// Empty/unset OLDPWD: bash leaves ~- literal — still reshape with --print.
+	// Empty/unset OLDPWD and no startup file: bash leaves ~- literal — still
+	// reshape with --print.
 	t.Setenv("OLDPWD", "")
+	t.Setenv("BASH_ENV", "")
+	t.Setenv("ENV", "")
 	_, emptyOld := shapePTYExecArgs("bash", []string{"-c", `agy ~-`})
 	wantEmptyOld := `agy --dangerously-skip-permissions --print '~-'`
 	if emptyOld[1] != wantEmptyOld {
 		t.Errorf("bash ~- without OLDPWD = %q, want %q", emptyOld[1], wantEmptyOld)
 	}
+	// A startup file runs before the payload and can export OLDPWD where this
+	// process cannot see it (verified on bash 5.2.21:
+	// `env -u OLDPWD BASH_ENV=… bash -c 'printf %s ~-'` → /var). Decline the
+	// reshape whenever such a file may run: $BASH_ENV / $ENV for bash, and zsh
+	// unconditionally (.zshenv).
+	t.Setenv("BASH_ENV", "/tmp/env.sh")
+	_, bashEnvOld := shapePTYExecArgs("bash", []string{"-c", `agy ~-`})
+	if bashEnvOld[1] != `agy ~-` {
+		t.Errorf("bash ~- with BASH_ENV was reshaped: got %q", bashEnvOld[1])
+	}
+	t.Setenv("BASH_ENV", "")
+	t.Setenv("ENV", "/tmp/env.sh")
+	_, shEnvOld := shapePTYExecArgs("sh", []string{"-c", `agy ~-`})
+	if shEnvOld[1] != `agy ~-` {
+		t.Errorf("sh ~- with ENV was reshaped: got %q", shEnvOld[1])
+	}
+	t.Setenv("ENV", "")
+	_, zshOld := shapePTYExecArgs("zsh", []string{"-c", `agy ~-`})
+	if zshOld[1] != `agy ~-` {
+		t.Errorf("zsh ~- was reshaped: got %q", zshOld[1])
+	}
+	// dash sources nothing for `-c`, so an ambient $ENV must not change it.
+	t.Setenv("ENV", "/tmp/env.sh")
+	_, dashOld := shapePTYExecArgs("dash", []string{"-c", `agy ~-`})
+	wantDashOld := `agy --dangerously-skip-permissions --print '~-'`
+	if dashOld[1] != wantDashOld {
+		t.Errorf("dash ~- with ENV = %q, want %q", dashOld[1], wantDashOld)
+	}
+	t.Setenv("ENV", "")
 	// Dash leaves ~+ / ~- / ~+0 literal — still reshape with --print.
 	for _, tc := range []struct {
 		orig, want string
