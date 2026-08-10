@@ -176,12 +176,12 @@ func TestRunDependencyInstall_TroubleshootThenExit(t *testing.T) {
 	}
 }
 
-func TestRunDependencyInstall_DeclineAtPrompt(t *testing.T) {
+func TestRunDependencyInstall_CancelAtPrompt(t *testing.T) {
 	defer withInstallSeams(t)()
 
-	installPrompt = func(string, string, bool) InstallChoice { return InstallNo }
+	installPrompt = func(string, string, bool) InstallChoice { return InstallCancel }
 	installExec = func(DependencySpec) installOutcome {
-		t.Fatal("install must not run when declined at the prompt")
+		t.Fatal("install must not run when cancelled at the prompt")
 		return installOutcome{}
 	}
 
@@ -261,7 +261,7 @@ func TestRunDependencyInstall_PassesOptionalToPrompt(t *testing.T) {
 	var gotOptional bool
 	installPrompt = func(_, _ string, optional bool) InstallChoice {
 		gotOptional = optional
-		return InstallNo
+		return InstallCancel
 	}
 
 	spec := testSpec()
@@ -274,8 +274,8 @@ func TestRunDependencyInstall_PassesOptionalToPrompt(t *testing.T) {
 	}
 }
 
-// An optional dependency must not be told it "is required", and declining it
-// must not be labelled as exiting — ensureGit continues startup either way.
+// An optional dependency must not be told it "is required". Button semantics
+// remain Yes / No / Cancel regardless of whether the dependency is optional.
 func TestInstallPromptWording_OptionalVsRequired(t *testing.T) {
 	required := installPromptHeadline("Git", false)
 	if !strings.Contains(required, "required") {
@@ -289,18 +289,6 @@ func TestInstallPromptWording_OptionalVsRequired(t *testing.T) {
 		t.Errorf("optional headline should say it's optional, got %q", optional)
 	}
 
-	if got := installDeclineLabel("Git", true); !strings.Contains(strings.ToLower(got), "skip") {
-		t.Errorf("optional decline label should offer to skip, got %q", got)
-	}
-	if got := installDeclineLabel("Git", false); !strings.Contains(got, "Exit") {
-		t.Errorf("required decline label should exit, got %q", got)
-	}
-	if got := installDeclineButton(true); got != "Skip" {
-		t.Errorf("optional decline button = %q, want Skip", got)
-	}
-	if got := installDeclineButton(false); got != "Exit" {
-		t.Errorf("required decline button = %q, want Exit", got)
-	}
 	if installPromptTitle(true) == installPromptTitle(false) {
 		t.Error("optional and required prompts should not share a title")
 	}

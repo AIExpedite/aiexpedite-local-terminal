@@ -139,13 +139,16 @@ type InstallChoice int
 const (
 	InstallYes InstallChoice = iota
 	InstallNo
-	InstallManual
+	InstallCancel
 )
 
 // ShowInstallPrompt displays a dialog asking user permission to install a dependency.
-// optional selects the wording for a dependency the app runs without (see
-// DependencySpec.Optional): NO then means "skip and continue", not "exit".
-// Returns: InstallYes (auto-install), InstallNo (decline), InstallManual (open download page)
+// optional selects wording that accurately describes dependencies the app can
+// run without; it does not change the Yes / No / Cancel button semantics.
+// Returns:
+//   - InstallYes: install automatically
+//   - InstallNo: open the download page, then exit the install flow
+//   - InstallCancel: cancel only — close the dialog and take no other action
 func ShowInstallPrompt(component, description string, optional bool) InstallChoice {
 	message := fmt.Sprintf(
 		"%s\n\n"+
@@ -153,11 +156,10 @@ func ShowInstallPrompt(component, description string, optional bool) InstallChoi
 			"Would you like to install it automatically?\n\n"+
 			"Click:\n"+
 			"  YES = Install automatically (via winget)\n"+
-			"  NO = %s\n"+
-			"  CANCEL = Open download page",
+			"  NO = Open download page\n"+
+			"  CANCEL = Cancel",
 		installPromptHeadline(component, optional),
 		description,
-		installDeclineLabel(component, optional),
 	)
 
 	title := installPromptTitle(optional)
@@ -179,8 +181,8 @@ func ShowInstallPrompt(component, description string, optional bool) InstallChoi
 		return InstallYes
 	case IDNO:
 		return InstallNo
-	default: // IDCANCEL
-		return InstallManual
+	default: // IDCANCEL or dialog closed
+		return InstallCancel
 	}
 }
 

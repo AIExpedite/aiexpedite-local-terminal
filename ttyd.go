@@ -86,17 +86,10 @@ func installTtydWindows() error {
 	if err == nil {
 		return nil
 	}
-	// The runner already opened the browser / showed the guided recovery. ttyd
-	// can't run without being installed, so on an explicit opt-out we tell the
-	// user how to finish and exit cleanly (matching prior behavior); any other
+	// No opens the manual download page and exits the automatic flow. Cancel is
+	// returned untouched so it performs no browser/install action; any other
 	// error is surfaced to the caller as fatal.
-	if errors.Is(err, errInstallDeclined) || errors.Is(err, errInstallManual) {
-		ShowInfoDialog(
-			"Setup Incomplete",
-			"ttyd is required to run AI Expedite.\n\n"+
-				"Install it and restart the app:\n"+
-				"  winget install tsl0922.ttyd",
-		)
+	if errors.Is(err, errInstallManual) {
 		os.Exit(0)
 	}
 	return err

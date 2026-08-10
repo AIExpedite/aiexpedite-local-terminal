@@ -514,7 +514,7 @@ func showConsoleWindowSeqLocked(show bool) uint64 {
 		// no-op after setup when there is no window to minimize.
 		hwnd := getConsoleWindow()
 		if hwnd == 0 {
-			return
+			return seq
 		}
 		// Just hide the window - don't free the console.
 		// Using freeConsole() causes an infinite loop because:

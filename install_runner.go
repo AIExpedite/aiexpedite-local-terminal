@@ -52,10 +52,9 @@ type DependencySpec struct {
 	// UnixPackage is the package name for brew/apt on macOS/Linux, e.g. "git".
 	UnixPackage string
 	// Optional marks a dependency the app keeps running without (e.g. Git,
-	// which readiness only warns about). It changes the permission prompt so it
-	// doesn't claim the dependency "is required" and labels declining as "skip"
-	// rather than "exit" — otherwise the dialog contradicts what actually
-	// happens after the user declines.
+	// which readiness only warns about). It changes the prompt headline so it
+	// doesn't claim the dependency "is required"; the Yes / No / Cancel actions
+	// retain their standard meanings.
 	Optional bool
 	// VerifyCommand is the executable that must appear on PATH once the
 	// install succeeds, e.g. "git". Used to confirm the install actually
@@ -121,7 +120,7 @@ type installOutcome struct {
 // Sentinel errors so callers can distinguish user intent from real failures
 // and decide whether to treat them as fatal.
 var (
-	// errInstallDeclined — user chose not to install (Exit at the prompt or
+	// errInstallDeclined — user cancelled at the prompt or exited the
 	// recovery dialog).
 	errInstallDeclined = errors.New("dependency install declined by user")
 	// errInstallManual — user opted to install manually; the download page
@@ -148,16 +147,16 @@ var (
 func runDependencyInstall(spec DependencySpec) error {
 	switch installPrompt(spec.DisplayName, spec.PromptDescription, spec.Optional) {
 	case InstallNo:
-		LogSecurityEvent(SecEvtInstallDeclined, "user declined install",
-			"component", spec.DisplayName, "at", "prompt")
-		return errInstallDeclined
-	case InstallManual:
 		// The user chose to install manually and exit. presentRecoveryURL
 		// surfaces the link either way (browser, or a copyable-link dialog if
 		// the browser can't launch), so callers must not claim the browser
 		// specifically opened — errInstallManual means "deferred to manual".
 		presentRecoveryURL(spec, spec.ManualURL, "manual_from_prompt")
 		return errInstallManual
+	case InstallCancel:
+		LogSecurityEvent(SecEvtInstallDeclined, "user cancelled install",
+			"component", spec.DisplayName, "at", "prompt")
+		return errInstallDeclined
 	case InstallYes:
 		// fall through to the install / recovery loop
 	}
@@ -296,24 +295,6 @@ func installPromptHeadline(component string, optional bool) string {
 			component, component)
 	}
 	return fmt.Sprintf("%s is required but not installed.", component)
-}
-
-// installDeclineLabel returns the long-form wording for the "don't install"
-// choice, used where the dialog spells out what each button does.
-func installDeclineLabel(component string, optional bool) string {
-	if optional {
-		return fmt.Sprintf("Skip for now (continue without %s)", component)
-	}
-	return "Exit and install manually"
-}
-
-// installDeclineButton returns the short button caption for the "don't
-// install" choice, for GUI toolkits that render captions rather than a list.
-func installDeclineButton(optional bool) string {
-	if optional {
-		return "Skip"
-	}
-	return "Exit"
 }
 
 // installFailureReason returns a short, log-friendly reason slug.

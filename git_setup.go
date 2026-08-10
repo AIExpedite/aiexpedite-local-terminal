@@ -23,8 +23,7 @@ const (
 // names the actual package manager for the current OS so the consent dialog
 // matches what will run (winget / brew / apt). Optional is set because
 // ensureGit is non-fatal: startup continues when Git is declined, so the prompt
-// must offer "skip" rather than claiming Git is required and labelling the
-// decline "Exit".
+// must describe Git as optional while retaining the shared button semantics.
 func gitDependencySpec() DependencySpec {
 	return DependencySpec{
 		DisplayName: "Git",
