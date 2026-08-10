@@ -179,14 +179,45 @@ func TestRunDependencyInstall_TroubleshootThenExit(t *testing.T) {
 func TestRunDependencyInstall_CancelAtPrompt(t *testing.T) {
 	defer withInstallSeams(t)()
 
+	openAttempts := 0
 	installPrompt = func(string, string, bool) InstallChoice { return InstallCancel }
 	installExec = func(DependencySpec) installOutcome {
 		t.Fatal("install must not run when cancelled at the prompt")
 		return installOutcome{}
 	}
+	installOpenURL = func(string) error { openAttempts++; return nil }
+	installShowInfo = func(string, string) { t.Fatal("cancel must not show a follow-up dialog") }
 
-	if err := runDependencyInstall(testSpec()); err != errInstallDeclined {
-		t.Fatalf("expected errInstallDeclined, got %v", err)
+	err := runDependencyInstall(testSpec())
+	if !errors.Is(err, errInstallCancelled) {
+		t.Fatalf("expected errInstallCancelled, got %v", err)
+	}
+	// Callers that only care about the opt-out must still match the generic
+	// sentinel (ensureGit keys its "skipped" message off it).
+	if !errors.Is(err, errInstallDeclined) {
+		t.Fatalf("a cancel is still a decline, got %v", err)
+	}
+	if openAttempts != 0 {
+		t.Fatalf("cancel must not open any page, got %d browser attempts", openAttempts)
+	}
+}
+
+// Only a prompt-level Cancel is errInstallCancelled: skipping at the recovery
+// dialog (after an install actually failed) must stay distinguishable, since
+// installTtydWindows shows finish-the-install guidance for that path.
+func TestRunDependencyInstall_RecoverySkipIsNotACancel(t *testing.T) {
+	defer withInstallSeams(t)()
+
+	installPrompt = func(string, string, bool) InstallChoice { return InstallYes }
+	installExec = func(DependencySpec) installOutcome { return installOutcome{Kind: InstallLaunchFailed} }
+	installRecovery = func(string, string, string, bool) InstallRecoveryChoice { return RecoveryExit }
+
+	err := runDependencyInstall(testSpec())
+	if errors.Is(err, errInstallCancelled) {
+		t.Fatalf("a recovery skip must not report a prompt cancel, got %v", err)
+	}
+	if !errors.Is(err, errInstallDeclined) {
+		t.Fatalf("expected an error wrapping errInstallDeclined, got %v", err)
 	}
 }
 
@@ -289,8 +320,39 @@ func TestInstallPromptWording_OptionalVsRequired(t *testing.T) {
 		t.Errorf("optional headline should say it's optional, got %q", optional)
 	}
 
+	// Cancelling an optional dependency continues without it, so the button
+	// must not be captioned as though setup were being abandoned.
+	if got := installCancelLabel("Git", true); !strings.Contains(strings.ToLower(got), "skip") {
+		t.Errorf("optional cancel label should offer to skip, got %q", got)
+	}
+	if got := installCancelLabel("Git", false); !strings.Contains(strings.ToLower(got), "exit") {
+		t.Errorf("required cancel label should say startup can't continue, got %q", got)
+	}
+	if got := installCancelButton(true); got != "Skip" {
+		t.Errorf("optional cancel button = %q, want Skip", got)
+	}
+	if got := installCancelButton(false); got != "Cancel" {
+		t.Errorf("required cancel button = %q, want Cancel", got)
+	}
+
 	if installPromptTitle(true) == installPromptTitle(false) {
 		t.Error("optional and required prompts should not share a title")
+	}
+}
+
+// The "No" button is the manual path on every platform, so its label must name
+// the download page rather than repeating the cancel wording — the overloading
+// this dialog previously had is exactly what the wording has to rule out.
+func TestInstallManualLabel_NamesTheDownloadPage(t *testing.T) {
+	got := installManualLabel("Git")
+	if !strings.Contains(strings.ToLower(got), "download page") {
+		t.Errorf("manual label should mention the download page, got %q", got)
+	}
+	if !strings.Contains(got, "Git") {
+		t.Errorf("manual label should name the component, got %q", got)
+	}
+	if got == installCancelLabel("Git", true) || got == installCancelLabel("Git", false) {
+		t.Errorf("manual and cancel labels must differ, both were %q", got)
 	}
 }
 
