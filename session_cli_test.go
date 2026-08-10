@@ -840,25 +840,22 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		}
 	}
 
-	// Closed-but-invalid bracket expressions (`[]`, `[!]`, `[^]`) are literal
-	// in bash even with failglob — still reshape with --print rather than
-	// treating the first `]` as enough to decline.
-	for _, tc := range []struct {
-		orig, want string
-	}{
-		{`agy []`, `agy --dangerously-skip-permissions --print '[]'`},
-		{`agy [!]`, `agy --dangerously-skip-permissions --print '[!]'`},
-		{`agy [^]`, `agy --dangerously-skip-permissions --print '[^]'`},
+	// Degenerate closed classes (`[]`, `[!]`, `[^]`, `[]]`) are still pathname
+	// patterns to bash: with failglob (verified on bash 5.2.21 via an exported
+	// BASHOPTS) `agy [!]` dies with `no match: [!]`, and with nullglob the word
+	// disappears. Reshaping them into `--print '[!]'` would run agy instead —
+	// leave the payload unshaped so the shell keeps its behaviour.
+	for _, orig := range []string{
+		`agy []`,
+		`agy [!]`,
+		`agy [^]`,
+		`agy []]`,
+		`agy [!]x`,
 	} {
-		_, args := shapePTYExecArgs("bash", []string{"-c", tc.orig})
-		if args[1] != tc.want {
-			t.Errorf("invalid bracket class %q = %q, want %q", tc.orig, args[1], tc.want)
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("degenerate bracket class was reshaped: got %q, want original %q", args[1], orig)
 		}
-	}
-	// Valid class with ] as first member still expands — leave unshaped.
-	_, closeFirst := shapePTYExecArgs("bash", []string{"-c", `agy []]`})
-	if closeFirst[1] != `agy []]` {
-		t.Errorf("valid []] class was reshaped: got %q", closeFirst[1])
 	}
 
 	// Word-initial tilde with a quoted prefix is literal in bash/dash

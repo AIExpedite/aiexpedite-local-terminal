@@ -3724,56 +3724,49 @@ func isPwdTildeStackZero(login string) bool {
 }
 
 // looksLikeUnquotedBracketGlob reports whether s[openIdx] (must be '[') starts
-// a complete, valid unquoted bracket expression […]. Bash/dash treat unmatched
-// `[` as a literal character, not a pathname pattern; only a matching `]`
-// within the same word can make it expandable — and only when the class body
-// is non-empty. Closed-but-invalid forms (`[]`, `[!]`, `[^]`) stay literal in
-// bash even with failglob, so those must return false (eligible one-shots still
-// gain --print). Quote/escape-aware: spaces inside quotes or after backslash
-// (`[a" "b]`, `[a\ b]`) stay in the same word. Unquoted whitespace ends the
-// word (incomplete). A leading `]` after optional `!`/`^` is a class member
-// (POSIX), not the closer (`[]]` matches `]`).
+// an unquoted bracket expression […] that bash treats as a pathname pattern.
+// Unmatched `[` is a literal character (`agy review [draft` reshapes), so only
+// a matching unquoted `]` within the same word makes the word expandable.
+//
+// Any closing `]` counts — including the degenerate `[]`, `[!]`, `[^]` and
+// `[]]` forms. Bash's glob detector does not validate the class body, so those
+// words still go through pathname expansion and their behaviour depends on
+// shell options we cannot preserve: with `failglob` (inherited through an
+// exported BASHOPTS, verified on bash 5.2.21) `agy [!]` aborts with
+// `no match: [!]` before agy ever runs, and with `nullglob` the word would
+// vanish entirely. Rebuilding them as a quoted `--print '[!]'` value would
+// instead launch a permission-skipping agy run, so decline the reshape.
+//
+// Quote/escape-aware: spaces inside quotes or after a backslash (`[a" "b]`,
+// `[a\ b]`) stay in the same word, and a quoted/escaped `]` does not close the
+// expression. Unquoted IFS whitespace ends the shell word (CR is not IFS
+// whitespace — same as shellWords), leaving the `[` unmatched and literal.
 func looksLikeUnquotedBracketGlob(s string, openIdx int) bool {
 	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != '[' {
 		return false
 	}
 	inSingle, inDouble := false, false
 	escaped := false
-	// memberCount counts class members after optional leading !/^ negation.
-	// memberCount==0 means the next unquoted ] is itself a member (POSIX),
-	// not the expression closer.
-	memberCount := 0
-	j := openIdx + 1
-	// Optional negation only at the first class position (unquoted, unescaped).
-	if j < len(s) && (s[j] == '!' || s[j] == '^') {
-		j++
-	}
-	for ; j < len(s); j++ {
+	for j := openIdx + 1; j < len(s); j++ {
 		c := s[j]
 		if escaped {
-			// Escaped byte is always a class member.
+			// Escaped byte is a literal class member, never the closer.
 			escaped = false
-			memberCount++
 			continue
 		}
 		if inSingle {
 			if c == '\'' {
 				inSingle = false
-			} else {
-				memberCount++
 			}
 			continue
 		}
 		if inDouble {
 			if c == '\\' && j+1 < len(s) {
 				j++ // skip escaped byte inside double quotes
-				memberCount++
 				continue
 			}
 			if c == '"' {
 				inDouble = false
-			} else {
-				memberCount++
 			}
 			continue
 		}
@@ -3785,19 +3778,11 @@ func looksLikeUnquotedBracketGlob(s string, openIdx int) bool {
 		case '"':
 			inDouble = true
 		case ' ', '\t', '\n':
-			// Unquoted IFS whitespace ends the shell word — incomplete class.
-			// CR is not IFS whitespace (same as shellWords).
+			// Unquoted IFS whitespace ends the shell word — `[` stays literal.
 			return false
 		case ']':
-			if memberCount == 0 {
-				// First character of the matching list is ] — include it.
-				memberCount++
-				continue
-			}
-			// Closer after at least one member → valid bracket expression.
+			// Closed bracket expression → bash globs the word.
 			return true
-		default:
-			memberCount++
 		}
 	}
 	return false
