@@ -2784,7 +2784,7 @@ func shellNameIsZshOrdinaryArray(name string) bool {
 	switch name {
 	case "argv",
 		"path", "cdpath", "fpath", "mailpath", "manpath",
-		"module_path", "watch", "psvar", "signals":
+		"module_path", "watch", "psvar", "signals", "commands":
 		return true
 	default:
 		return false

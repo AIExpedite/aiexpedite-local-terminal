@@ -1268,6 +1268,8 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		`agy "${argv:1}"`,
 		`agy "$path"`,
 		`agy "${path}"`,
+		`agy "$commands"`,
+		`agy "${commands}"`,
 		`agy "do $argv please"`,
 	} {
 		_, zshArgs := shapePTYExecArgs("zsh", []string{"-c", orig})
