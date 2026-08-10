@@ -2001,10 +2001,11 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 	gotPrint := false
 	for i < len(args) {
 		a := args[i]
-		lower := strings.ToLower(a)
+		// Match only exact lowercase CLI spellings (agy flag names are
+		// case-sensitive). Uppercase forms like --PRINT are prompt text.
 
 		// Equals-form: --flag=value / -p=value
-		if name, val, ok := splitAntigravityEqualsFlag(lower, a); ok {
+		if name, val, ok := splitAntigravityEqualsFlag(a); ok {
 			if isAntigravityPrintFlag(name) {
 				// Explicit print value (possibly empty). Keep peeling flags
 				// after it so `--print=hi --conversation id` preserves options.
@@ -2026,7 +2027,7 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 			break
 		}
 
-		if isAntigravityPrintFlag(lower) {
+		if isAntigravityPrintFlag(a) {
 			// --print / -p / --prompt takes exactly one value token. Bare
 			// --print with no following token is still an explicit empty print.
 			i++
@@ -2040,9 +2041,9 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 			continue
 		}
 
-		if antigravityBoolFlags[lower] {
+		if antigravityBoolFlags[a] {
 			// Strip injected / unsafe flags; keep other booleans.
-			if lower == "--dangerously-skip-permissions" || lower == "--continue" || lower == "-c" {
+			if a == "--dangerously-skip-permissions" || a == "--continue" || a == "-c" {
 				i++
 				continue
 			}
@@ -2051,7 +2052,7 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 			continue
 		}
 
-		if antigravityValuedFlags[lower] {
+		if antigravityValuedFlags[a] {
 			flags = append(flags, a)
 			i++
 			if i < len(args) {
@@ -2078,22 +2079,18 @@ func isAntigravityPrintFlag(name string) bool {
 }
 
 // splitAntigravityEqualsFlag returns (flagName, value, true) for --flag=value
-// forms. name is lowercased; raw is the original token (preserved for flags).
-func splitAntigravityEqualsFlag(lower, raw string) (name, val string, ok bool) {
-	eq := strings.IndexByte(lower, '=')
+// forms. The flag name is matched case-sensitively against known CLI spellings;
+// the value keeps the original token's casing.
+func splitAntigravityEqualsFlag(raw string) (name, val string, ok bool) {
+	eq := strings.IndexByte(raw, '=')
 	if eq <= 0 {
 		return "", "", false
 	}
-	name = lower[:eq]
+	name = raw[:eq]
 	if !strings.HasPrefix(name, "-") {
 		return "", "", false
 	}
-	// Value from the original token so prompt casing is preserved.
-	rawEq := strings.IndexByte(raw, '=')
-	if rawEq < 0 {
-		return name, "", true
-	}
-	return name, raw[rawEq+1:], true
+	return name, raw[eq+1:], true
 }
 
 // grokKnownSubcommands are the `grok <cmd>` subcommands whose argv grammar must

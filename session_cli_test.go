@@ -515,6 +515,24 @@ func TestBuildAntigravityInteractiveArgs_DashPrefixedPrompt(t *testing.T) {
 	}
 }
 
+// agy flag matching is case-sensitive: --PRINT / -P are not --print / -p and
+// must stay part of the prompt rather than being treated as control syntax.
+func TestBuildAntigravityInteractiveArgs_CaseSensitiveFlags(t *testing.T) {
+	args := buildAntigravityInteractiveArgs([]string{"--PRINT", "review"})
+	if len(args) != 3 ||
+		args[0] != "--dangerously-skip-permissions" ||
+		args[1] != "--print" ||
+		args[2] != "--PRINT review" {
+		t.Fatalf("uppercase --PRINT must be prompt text, got %#v", args)
+	}
+
+	// Known lowercase flags still peel.
+	ok := buildAntigravityInteractiveArgs([]string{"--print", "review"})
+	if len(ok) != 3 || ok[1] != "--print" || ok[2] != "review" {
+		t.Fatalf("lowercase --print must still peel, got %#v", ok)
+	}
+}
+
 /* --------------------------------------------------------------------------
    shapePTYExecArgs
    --------------------------------------------------------------------------
@@ -785,6 +803,20 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		if args[1] != orig {
 			t.Errorf("unquoted expansion was reshaped: got %q, want original %q", args[1], orig)
 		}
+	}
+
+	// Unmatched '[' is literal in bash/dash (not a pathname pattern) — reshape
+	// so the one-shot still gets --print rather than hanging interactive.
+	_, openBracket := shapePTYExecArgs("bash", []string{"-c", `agy review [draft`})
+	wantOpenBracket := `agy --dangerously-skip-permissions --print 'review [draft'`
+	if openBracket[1] != wantOpenBracket {
+		t.Errorf("unmatched [ prompt = %q, want %q", openBracket[1], wantOpenBracket)
+	}
+	// Lone ] is also literal.
+	_, closeBracket := shapePTYExecArgs("bash", []string{"-c", `agy review draft]`})
+	wantCloseBracket := `agy --dangerously-skip-permissions --print 'review draft]'`
+	if closeBracket[1] != wantCloseBracket {
+		t.Errorf("literal ] prompt = %q, want %q", closeBracket[1], wantCloseBracket)
 	}
 
 	// Quoted braces/globs are literal — safe to reshape with single quotes.
@@ -1287,6 +1319,10 @@ func TestShellWords(t *testing.T) {
 		{`agy {1..x}`, []string{"agy", "{1..x}"}, []bool{false, false}, false},
 		{`agy review *.go`, nil, nil, true},
 		{`agy review ~/proj`, nil, nil, true},
+		{`agy review file[ab]`, nil, nil, true},
+		{`agy review [draft`, []string{"agy", "review", "[draft"}, []bool{false, false, false}, false},
+		{`agy review draft]`, []string{"agy", "review", "draft]"}, []bool{false, false, false}, false},
+		{`agy A[0]=~`, nil, nil, true},
 		{`agy review {foo}`, []string{"agy", "review", "{foo}"}, []bool{false, false, false}, false},
 		{`agy review foo~bar`, []string{"agy", "review", "foo~bar"}, []bool{false, false, false}, false},
 		{`agy HOME=~`, nil, nil, true},

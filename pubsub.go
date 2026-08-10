@@ -2261,9 +2261,10 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord,
 	gotPrint := false
 	for i < len(words) {
 		a := words[i].Value
-		lower := strings.ToLower(a)
+		// Exact lowercase CLI spellings only (same case-sensitive rule as
+		// partitionAntigravityCallerArgs). --PRINT is prompt text.
 
-		if name, _, ok := splitAntigravityEqualsFlag(lower, a); ok {
+		if name, _, ok := splitAntigravityEqualsFlag(a); ok {
 			if isAntigravityPrintFlag(name) {
 				// --print=value: peel value with segment metadata after '='.
 				// Continue so later recognized flags are not swallowed.
@@ -2284,7 +2285,7 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord,
 			break
 		}
 
-		if isAntigravityPrintFlag(lower) {
+		if isAntigravityPrintFlag(a) {
 			// Exactly one value token (or explicit empty when bare --print).
 			i++
 			gotPrint = true
@@ -2297,8 +2298,8 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord,
 			continue
 		}
 
-		if antigravityBoolFlags[lower] {
-			if lower == "--dangerously-skip-permissions" || lower == "--continue" || lower == "-c" {
+		if antigravityBoolFlags[a] {
+			if a == "--dangerously-skip-permissions" || a == "--continue" || a == "-c" {
 				i++
 				continue
 			}
@@ -2307,7 +2308,7 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord,
 			continue
 		}
 
-		if antigravityValuedFlags[lower] {
+		if antigravityValuedFlags[a] {
 			flags = append(flags, words[i])
 			i++
 			if i < len(words) {
@@ -3028,10 +3029,22 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// unmatched (bash syntax error) or full shell syntax we would
 			// mis-reshape — leave the original payload alone.
 			return nil, fmt.Errorf("unsupported unquoted shell metacharacter %q", c)
-		case '*', '?', '[', ']':
+		case '*', '?':
 			// Unquoted glob patterns expand before agy sees the argv.
 			// Rebuilding would single-quote them and freeze the pattern.
 			return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+		case '[':
+			// Only a complete bracket expression ([…]) is pathname expansion.
+			// Unmatched `[` (e.g. `[draft`) is literal in bash/dash — keep it
+			// so eligible one-shots still gain --print rather than hanging in
+			// the interactive TUI.
+			if looksLikeUnquotedBracketGlob(s, i) {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
+		case ']':
+			// A lone unquoted ] is literal (it does not open a glob).
+			writeSeg(c, false)
 		case '~':
 			// Bash tilde expansion: word-initial (`~/x`, `~user`) and in
 			// assignment-like positions after unquoted `=` (`HOME=~`) or after
@@ -3125,6 +3138,28 @@ func shellDollarStartsExpand(b byte) bool {
 	}
 	if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') {
 		return true
+	}
+	return false
+}
+
+// looksLikeUnquotedBracketGlob reports whether s[openIdx] (must be '[') starts
+// a complete unquoted bracket expression […]. Bash/dash treat unmatched `[` as
+// a literal character, not a pathname pattern; only a matching `]` within the
+// same word makes it expandable. We do not validate class contents — any
+// closed form is enough to decline reshape (rebuild would freeze the pattern).
+func looksLikeUnquotedBracketGlob(s string, openIdx int) bool {
+	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != '[' {
+		return false
+	}
+	for j := openIdx + 1; j < len(s); j++ {
+		c := s[j]
+		// Word boundary before a close → incomplete, literal '['.
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			return false
+		}
+		if c == ']' {
+			return true
+		}
 	}
 	return false
 }
