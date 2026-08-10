@@ -899,6 +899,38 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if dashBrace[1] != wantDashBrace {
 		t.Errorf("dash brace prompt = %q, want %q", dashBrace[1], wantDashBrace)
 	}
+
+	// Bare `sh` is resolved like dollar-quote: bash-backed or ambiguous sh
+	// still brace-expands, so expanding forms must stay unshaped (not frozen
+	// as a single-quoted 'file{1,2}' prompt). Dash-backed sh reshapes.
+	if shellSupportsBraceExpansion("sh") {
+		origSh := `agy file{1,2}`
+		_, shBrace := shapePTYExecArgs("sh", []string{"-c", origSh})
+		if shBrace[1] != origSh {
+			t.Errorf("bash-like sh brace was reshaped: got %q, want original %q", shBrace[1], origSh)
+		}
+	} else {
+		_, shBrace := shapePTYExecArgs("sh", []string{"-c", `agy file{1,2}`})
+		wantSh := `agy --dangerously-skip-permissions --print 'file{1,2}'`
+		if shBrace[1] != wantSh {
+			t.Errorf("dash-like sh brace prompt = %q, want %q", shBrace[1], wantSh)
+		}
+	}
+}
+
+// shellSupportsBraceExpansion("sh") must use the same resolution as
+// shellSupportsDollarQuote — never hardcode every `sh` as non-expanding.
+func TestShellSupportsBraceExpansion_ShMatchesDollarQuote(t *testing.T) {
+	if shellSupportsBraceExpansion("dash") {
+		t.Error("dash must not brace-expand")
+	}
+	if !shellSupportsBraceExpansion("bash") {
+		t.Error("bash must brace-expand")
+	}
+	if shellSupportsBraceExpansion("sh") != shellSupportsDollarQuote("sh") {
+		t.Errorf("sh brace=%v dollarQuote=%v; resolution must match",
+			shellSupportsBraceExpansion("sh"), shellSupportsDollarQuote("sh"))
+	}
 }
 
 // Unquoted expansions (single- or multi-fragment) must not be double-quoted on

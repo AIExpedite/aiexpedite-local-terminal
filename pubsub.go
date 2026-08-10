@@ -2630,14 +2630,17 @@ type shellWordOptions struct {
 
 // shellSupportsBraceExpansion reports whether the named shell executable
 // performs brace expansion on unquoted `{a,b}` / `file{1,2}` forms.
+// Explicit dash/ash/busybox leave braces literal. Bare `sh` is ambiguous
+// (/bin/sh may be bash — which still brace-expands when invoked as sh — or
+// dash), so we resolve like dollar-quote: bash-family or unknown → true
+// (decline reshape) rather than freezing `file{1,2}` as a literal prompt.
 func shellSupportsBraceExpansion(command string) bool {
-	base := strings.ToLower(filepath.Base(filepath.ToSlash(command)))
-	base = strings.TrimSuffix(base, ".exe")
+	base := shellCommandBase(command)
 	switch base {
-	case "sh", "dash", "ash", "busybox":
-		// POSIX sh and dash/ash: braces are ordinary characters.
-		// (bash invoked as sh also disables brace expansion in POSIX mode.)
+	case "dash", "ash", "busybox":
 		return false
+	case "sh":
+		return shellShIsBashFamily(command)
 	default:
 		// bash, zsh, ksh, and unknown → assume brace expansion exists.
 		return true
@@ -2656,7 +2659,7 @@ func shellSupportsDollarQuote(command string) bool {
 	case "dash", "ash", "busybox":
 		return false
 	case "sh":
-		return shellShSupportsDollarQuote(command)
+		return shellShIsBashFamily(command)
 	default:
 		// bash, zsh, ksh, and unknown → assume dollar-quoting exists.
 		return true
@@ -2669,9 +2672,10 @@ func shellCommandBase(command string) string {
 	return strings.TrimSuffix(base, ".exe")
 }
 
-// shellShSupportsDollarQuote resolves what `sh` actually is. Dash-family →
-// false (literal $'…'). Bash-family or unresolvable → true (reject $'…').
-func shellShSupportsDollarQuote(command string) bool {
+// shellShIsBashFamily resolves what `sh` actually is. Dash-family → false
+// (literal braces / $'…'). Bash-family or unresolvable → true (decline
+// reshape for brace expansion and ANSI-C quotes rather than assume dash).
+func shellShIsBashFamily(command string) bool {
 	path := command
 	// Bare "sh": locate on PATH so EvalSymlinks can see /bin/sh → dash|bash.
 	if !strings.ContainsAny(filepath.ToSlash(command), "/") {
@@ -2695,7 +2699,7 @@ func shellShSupportsDollarQuote(command string) bool {
 		return true
 	default:
 		// Still named "sh" after resolve (e.g. macOS /bin/sh is bash-based
-		// but not a symlink) — decline $'…' rather than assume dash semantics.
+		// but not a symlink) — treat as bash-family rather than dash.
 		return true
 	}
 }
