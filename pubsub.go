@@ -2192,23 +2192,97 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 // `--dangerously-skip-permissions --print <prompt>` shaping, returning the
 // rewritten payload and true. It returns ("", false) when the first token is
 // not an antigravity command. Argv is sourced from buildAntigravityInteractiveArgs
-// so it cannot drift from the direct path. The remainder after the command
-// name is the literal prompt (one --print value); multi-word prompts are
-// shell-quoted so bash -c does not split them into separate tokens.
+// so it cannot drift from the direct path.
+//
+// The payload is shell-tokenized first (quotes / backslash escapes removed as
+// bash would) so a caller-supplied `agy "fix the bug"` does NOT re-quote the
+// quote characters into the --print value. Multi-word prompt values are then
+// re-quoted on rebuild so bash -c does not re-split them.
 func shapeAntigravityShellPayload(payload string) (string, bool) {
-	fields := strings.Fields(payload)
-	if len(fields) == 0 || !isAntigravityCommand(fields[0]) {
+	words := shellWords(payload)
+	if len(words) == 0 || !isAntigravityCommand(words[0]) {
 		return "", false
 	}
-	rest := strings.TrimSpace(strings.TrimPrefix(payload, fields[0]))
-	var callerArgs []string
-	if rest != "" {
-		// Single element so multi-word rest becomes one --print value (not
-		// Fields-split into fake flags).
-		callerArgs = []string{rest}
+	// words[1:] are already shell-evaluated values (quotes/escapes applied),
+	// matching what bash would pass as argv to agy.
+	shapedArgs := buildAntigravityInteractiveArgs(words[1:])
+	return joinAntigravityShellCommand(words[0], shapedArgs...), true
+}
+
+// shellWords splits a shell-style command line into argument values, applying
+// a POSIX-ish subset of quote and backslash rules (single quotes, double
+// quotes, and backslash escapes outside single quotes). Enough for the
+// operator-joined `bash -c "agy …"` payloads we reshape — not a full shell.
+func shellWords(s string) []string {
+	var words []string
+	var cur strings.Builder
+	inSingle, inDouble := false, false
+	escaped := false
+	started := false
+	flush := func() {
+		if started {
+			words = append(words, cur.String())
+			cur.Reset()
+			started = false
+		}
 	}
-	shapedArgs := buildAntigravityInteractiveArgs(callerArgs)
-	return joinAntigravityShellCommand(fields[0], shapedArgs...), true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			cur.WriteByte(c)
+			escaped = false
+			started = true
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			} else {
+				cur.WriteByte(c)
+			}
+			continue
+		}
+		if inDouble {
+			if c == '\\' && i+1 < len(s) {
+				next := s[i+1]
+				// bash double-quote escapes: \, ", $, `, newline
+				if next == '\\' || next == '"' || next == '$' || next == '`' || next == '\n' {
+					i++
+					cur.WriteByte(next)
+					continue
+				}
+			}
+			if c == '"' {
+				inDouble = false
+				continue
+			}
+			cur.WriteByte(c)
+			continue
+		}
+		switch c {
+		case '\\':
+			escaped = true
+			started = true
+		case '\'':
+			inSingle = true
+			started = true
+		case '"':
+			inDouble = true
+			started = true
+		case ' ', '\t', '\n', '\r':
+			flush()
+		default:
+			cur.WriteByte(c)
+			started = true
+		}
+	}
+	if escaped {
+		// Trailing backslash is kept as a literal.
+		cur.WriteByte('\\')
+		started = true
+	}
+	flush()
+	return words
 }
 
 // joinAntigravityShellCommand serializes cmd+args into a bash -c payload,
