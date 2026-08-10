@@ -2214,8 +2214,9 @@ func shapeAntigravityShellPayload(payload string) (string, bool) {
 	parts := make([]string, 0, 2+len(flags)+2)
 	parts = append(parts, words[0].Value, "--dangerously-skip-permissions")
 	for _, f := range flags {
-		// Flag tokens keep their own expand bit (e.g. --add-dir "$DIR").
-		parts = append(parts, quoteAntigravityShellArg(f.Value, f.Expand))
+		// Flag tokens (and their values) keep per-segment expand, e.g.
+		// --add-dir "$ROOT"'$(evil)' must not OR Expand across segments.
+		parts = append(parts, quoteShellWord(f))
 	}
 	if hasPrompt {
 		parts = append(parts, "--print", quoteAntigravityPrintFragments(promptFrags))
@@ -2224,19 +2225,20 @@ func shapeAntigravityShellPayload(payload string) (string, bool) {
 }
 
 // partitionAntigravityCallerShellWords peels known leading agy flags off words
-// and returns the remaining prompt fragments (preserving per-word Expand).
-// Mirrors partitionAntigravityCallerArgs on []string.
+// and returns the remaining prompt fragments (preserving per-word Expand and
+// Segments). Mirrors partitionAntigravityCallerArgs on []string.
 func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord, prompt []shellWord, hasPrompt bool) {
 	i := 0
 	for i < len(words) {
 		a := words[i].Value
 		lower := strings.ToLower(a)
 
-		if name, val, ok := splitAntigravityEqualsFlag(lower, a); ok {
+		if name, _, ok := splitAntigravityEqualsFlag(lower, a); ok {
 			if isAntigravityPrintFlag(name) {
-				// --print=value: value inherits Expand of the equals token;
-				// following words are also prompt material.
-				prompt = append(prompt, shellWord{Value: val, Expand: words[i].Expand})
+				// --print=value: slice the value out of the word while retaining
+				// per-segment expand metadata after the '=' (critical for
+				// --print="$TASK"'$(evil)' so the single-quoted part stays inert).
+				prompt = append(prompt, shellWordAfterEquals(words[i]))
 				prompt = append(prompt, words[i+1:]...)
 				return flags, prompt, true
 			}
@@ -2383,6 +2385,52 @@ func mergeAdjacentShellSegments(segs []shellSegment) []shellSegment {
 	return out
 }
 
+// shellWordAfterEquals returns the portion of w after the first '=' as a new
+// shellWord, preserving segment Expand metadata for the value region. Used for
+// --print=value forms so concatenated quote segments survive the peel.
+func shellWordAfterEquals(w shellWord) shellWord {
+	eq := strings.IndexByte(w.Value, '=')
+	if eq < 0 {
+		return w
+	}
+	skip := eq + 1
+	val := w.Value[skip:]
+	segs := sliceShellSegmentsAfter(w.effectiveSegments(), skip)
+	anyExpand := false
+	for _, seg := range segs {
+		if seg.Expand {
+			anyExpand = true
+		}
+	}
+	return shellWord{Value: val, Expand: anyExpand, Segments: segs}
+}
+
+// sliceShellSegmentsAfter drops the first skip bytes of the concatenated
+// segment stream, splitting a boundary segment if needed.
+func sliceShellSegmentsAfter(segs []shellSegment, skip int) []shellSegment {
+	if skip <= 0 {
+		return segs
+	}
+	var out []shellSegment
+	seen := 0
+	for _, seg := range segs {
+		if seen+len(seg.Value) <= skip {
+			seen += len(seg.Value)
+			continue
+		}
+		if seen < skip {
+			out = append(out, shellSegment{
+				Value:  seg.Value[skip-seen:],
+				Expand: seg.Expand,
+			})
+			seen = skip
+			continue
+		}
+		out = append(out, seg)
+	}
+	return out
+}
+
 // shellSegment is one quote/unquoted region within a shellWord. Concatenated
 // forms like `"$TASK"'$(cmd)'` are one word with two segments so rebuild can
 // keep each region's expansion semantics.
@@ -2475,9 +2523,13 @@ func shellWords(s string) ([]shellWord, error) {
 		}
 	}
 	// writeEscapedExpansion writes a literal $ or ` that was backslash-escaped
-	// and ends the segment so a subsequent unescaped expansion in the same
-	// quoted region cannot OR Expand over it (e.g. "\$(cmd)$TASK").
+	// in its own Expand=false segment. Flushes both before (if current segment
+	// is expanding — e.g. "$TASK\$(cmd)") and after, so escaped dollars never
+	// share a segment with expandable content in either order.
 	writeEscapedExpansion := func(c byte) {
+		if segStarted && segExpand {
+			flushSeg()
+		}
 		writeSeg(c, false)
 		flushSeg()
 	}

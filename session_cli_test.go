@@ -667,6 +667,30 @@ func TestShapePTYExecArgs_KeepsEscapedCommandSubstitutionLiteral(t *testing.T) {
 	if mixArgs[1] != wantMix {
 		t.Errorf("escaped+expand mix = %q, want %q", mixArgs[1], wantMix)
 	}
+
+	// Reverse order: expand first, then escaped substitution in the same region.
+	_, revArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK\$(touch /tmp/pwn)"`})
+	wantRev := `agy --dangerously-skip-permissions --print "$TASK"'$(touch /tmp/pwn)'`
+	if revArgs[1] != wantRev {
+		t.Errorf("expand+escaped mix = %q, want %q", revArgs[1], wantRev)
+	}
+}
+
+// --print=value and valued flags must retain per-segment expand metadata.
+func TestShapePTYExecArgs_PrintEqualsAndFlagSegments(t *testing.T) {
+	// Equals form with concatenated expand + literal single-quoted $(...).
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy --print="$TASK"'$(touch /tmp/pwn)'`})
+	want := `agy --dangerously-skip-permissions --print "$TASK"'$(touch /tmp/pwn)'`
+	if args[1] != want {
+		t.Errorf("print= segments = %q, want %q", args[1], want)
+	}
+
+	// Valued flag operand with mixed segments; prompt is plain "task".
+	_, flagArgs := shapePTYExecArgs("bash", []string{"-c", `agy --add-dir "$ROOT"'$(touch /tmp/pwn)' task`})
+	wantFlag := `agy --dangerously-skip-permissions --add-dir "$ROOT"'$(touch /tmp/pwn)' --print task`
+	if flagArgs[1] != wantFlag {
+		t.Errorf("flag segments = %q, want %q", flagArgs[1], wantFlag)
+	}
 }
 
 // Mixed expand fragments must not OR Expand into one double-quoted blob:
