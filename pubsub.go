@@ -2464,10 +2464,11 @@ func (w shellWord) effectiveSegments() []shellSegment {
 // operator-joined `bash -c "agy …"` payloads we reshape — not a full shell.
 //
 // Returns an error when a quote remains open at end-of-input (unterminated
-// syntax) or when unquoted parentheses appear (bash rejects unmatched ones;
-// we do not parse subshells/groups). Unquoted braces are allowed (valid brace
-// expansion / prompt text). Callers must not turn rejected payloads into a
-// valid command.
+// syntax), when unquoted parentheses appear (bash rejects unmatched ones; we
+// do not parse subshells/groups), or when ANSI-C / locale quoting ($'…' / $"…")
+// appears (we do not implement those forms). Unquoted braces are allowed.
+// An unquoted `#` at a word boundary ends tokenization (shell comment).
+// Callers must not turn rejected payloads into a valid command.
 func shellWords(s string) ([]shellWord, error) {
 	var words []shellWord
 	var segs []shellSegment
@@ -2606,6 +2607,15 @@ func shellWords(s string) ([]shellWord, error) {
 			wordStarted = true
 		case ' ', '\t', '\n', '\r':
 			flushWord()
+		case '#':
+			// Unquoted # at a word boundary starts a shell comment — stop.
+			// Mid-word (# after content or concatenated after a quote close
+			// with wordStarted still true) is literal.
+			if !wordStarted {
+				flushWord()
+				return words, nil
+			}
+			writeSeg(c, false)
 		case '(', ')':
 			// We do not parse subshells/groups. Unquoted parens are either
 			// unmatched (bash syntax error) or full shell syntax we would
@@ -2613,6 +2623,12 @@ func shellWords(s string) ([]shellWord, error) {
 			// allowed (brace expansion / ordinary prompt text).
 			return nil, fmt.Errorf("unsupported unquoted shell metacharacter %q", c)
 		default:
+			// ANSI-C ($'…') / locale ($"…") quoting: not implemented. A bare
+			// unquoted $ followed by a quote would otherwise be misread as
+			// expandable $ + ordinary quotes (e.g. $'(touch …)' → executed).
+			if c == '$' && i+1 < len(s) && (s[i+1] == '\'' || s[i+1] == '"') {
+				return nil, fmt.Errorf("unsupported ANSI-C or locale quoted string")
+			}
 			writeSeg(c, c == '$' || c == '`')
 		}
 	}

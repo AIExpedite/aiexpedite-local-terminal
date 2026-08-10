@@ -751,6 +751,38 @@ func TestShapePTYExecArgs_AllowsUnquotedBraces(t *testing.T) {
 	}
 }
 
+// ANSI-C ($'…') / locale ($"…") quoting is not implemented — leave unshaped so
+// we never rebuild $'(touch …)' into an expandable "$(touch …)".
+func TestShapePTYExecArgs_RejectsANSICQuoting(t *testing.T) {
+	orig := `agy $'(touch /tmp/pwn)'`
+	_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+	if args[1] != orig {
+		t.Errorf("ANSI-C quote was reshaped: got %q, want original %q", args[1], orig)
+	}
+
+	orig2 := `agy $"hello"`
+	_, args2 := shapePTYExecArgs("bash", []string{"-c", orig2})
+	if args2[1] != orig2 {
+		t.Errorf("locale quote was reshaped: got %q, want original %q", args2[1], orig2)
+	}
+}
+
+// Unquoted # at a word boundary is a shell comment — not part of the prompt.
+func TestShapePTYExecArgs_StopsAtShellComment(t *testing.T) {
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy review # internal note`})
+	want := `agy --dangerously-skip-permissions --print review`
+	if args[1] != want {
+		t.Errorf("comment payload = %q, want %q", args[1], want)
+	}
+
+	// Mid-word # stays literal (not a comment).
+	_, mid := shapePTYExecArgs("bash", []string{"-c", `agy review#note`})
+	wantMid := `agy --dangerously-skip-permissions --print 'review#note'`
+	if mid[1] != wantMid {
+		t.Errorf("mid-word hash = %q, want %q", mid[1], wantMid)
+	}
+}
+
 // Unterminated quotes must NOT be repaired into a runnable permission-skipping
 // agy command — leave the original payload so bash reports the syntax error.
 func TestShapePTYExecArgs_RejectsUnterminatedShellQuotes(t *testing.T) {
@@ -802,6 +834,10 @@ func TestShellWords(t *testing.T) {
 		{`agy "fix`, nil, nil, true},
 		{`agy review)`, nil, nil, true},
 		{`agy review(`, nil, nil, true},
+		{`agy $'(x)'`, nil, nil, true},
+		{`agy $"x"`, nil, nil, true},
+		{`agy review # note`, []string{"agy", "review"}, []bool{false, false}, false},
+		{`agy review#note`, []string{"agy", "review#note"}, []bool{false, false}, false},
 	}
 	for _, tc := range cases {
 		got, err := shellWords(tc.in)
