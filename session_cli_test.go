@@ -954,6 +954,17 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if bashAssign[1] != origBashAssign {
 		t.Errorf("bash assignment tilde was reshaped: got %q, want original %q", bashAssign[1], origBashAssign)
 	}
+	// ...unless the wrapper's own argv asks for POSIX mode, which disables the
+	// extension the same way `sh` does (`bash --posix -c 'printf %s HOME=~'`
+	// prints `HOME=~` on 5.2.21). Flags after -c belong to the payload.
+	for _, pre := range [][]string{{"--posix"}, {"-o", "posix"}} {
+		args := append(append([]string{}, pre...), "-c", origBashAssign)
+		got := shapeShellWrappedPTYArgs("bash", args)
+		want := `agy --dangerously-skip-permissions --print 'HOME=~ review'`
+		if got[len(got)-1] != want {
+			t.Errorf("bash %v assignment tilde = %q, want %q", pre, got[len(got)-1], want)
+		}
+	}
 	// Dash keeps ':' inside the login name, where it never resolves, so the
 	// tilde stays literal there and the payload still reshapes.
 	_, dashColon := shapePTYExecArgs("dash", []string{"-c", `agy ~:suffix`})
@@ -1014,6 +1025,18 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		if args[1] != orig {
 			t.Errorf("bash %q with BASH_ENV was reshaped: got %q", orig, args[1])
 		}
+	}
+	// bash invoked as `sh`, or with an explicit POSIX flag, ignores $BASH_ENV
+	// (verified: `env -u OLDPWD BASH_ENV=… sh -c 'printf %s ~-'` and the same
+	// through `bash --posix` both print a literal `~-`) — those still reshape.
+	wantLiteralOld := `agy --dangerously-skip-permissions --print '~-'`
+	_, shBashEnv := shapePTYExecArgs("sh", []string{"-c", `agy ~-`})
+	if shBashEnv[1] != wantLiteralOld {
+		t.Errorf("sh ~- with BASH_ENV = %q, want %q", shBashEnv[1], wantLiteralOld)
+	}
+	posixArgs := shapeShellWrappedPTYArgs("bash", []string{"--posix", "-c", `agy ~-`})
+	if posixArgs[len(posixArgs)-1] != wantLiteralOld {
+		t.Errorf("bash --posix ~- with BASH_ENV = %q, want %q", posixArgs[len(posixArgs)-1], wantLiteralOld)
 	}
 	t.Setenv("BASH_ENV", "")
 	// Without a startup file the stack has only entry 0, so `~+1` is literal
@@ -1426,6 +1449,23 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		_, zshArgs := shapePTYExecArgs("zsh", []string{"-c", orig})
 		if zshArgs[1] != orig {
 			t.Errorf("zsh extended-glob operator was reshaped: got %q, want original %q", zshArgs[1], orig)
+		}
+	}
+	// zsh also rejects unmatched bracket patterns outright (`zsh -c 'printf %s
+	// [draft'` → `bad pattern: [draft`, likewise `foo[bar`), where bash keeps
+	// them literal. Decline every unquoted `[` on zsh.
+	for _, orig := range []string{
+		`agy [draft`,
+		`agy review foo[bar`,
+	} {
+		_, zshArgs := shapePTYExecArgs("zsh", []string{"-c", orig})
+		if zshArgs[1] != orig {
+			t.Errorf("zsh unmatched bracket was reshaped: got %q, want original %q", zshArgs[1], orig)
+		}
+		// bash keeps them literal and still reshapes.
+		_, bashArgs := shapePTYExecArgs("bash", []string{"-c", orig})
+		if bashArgs[1] == orig {
+			t.Errorf("bash unmatched bracket was declined: %q", bashArgs[1])
 		}
 	}
 	// Quoted / escaped forms are literal in zsh too — still reshape.

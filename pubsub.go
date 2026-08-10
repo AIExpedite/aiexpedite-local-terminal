@@ -2181,7 +2181,7 @@ func shapePTYExecArgs(command string, args []string) (string, []string) {
 // program and the remainder is preserved verbatim as the literal prompt.
 func shapeShellWrappedPTYArgs(command string, args []string) []string {
 	if payload, ok := shellDashCPayload(command, args); ok {
-		if shaped, ok := shapeAntigravityShellPayload(command, payload); ok {
+		if shaped, ok := shapeAntigravityShellPayload(command, shellArgsForcePosix(args), payload); ok {
 			return replaceDashCPayload(args, shaped)
 		}
 	}
@@ -2204,18 +2204,18 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 // expansion per prompt fragment so `agy "$TASK"` still expands while
 // `agy '$(cmd)'` and `agy "\$(cmd)"` stay literal — never OR-ing expand across
 // mixed fragments into one double-quoted blob that reactivates substitutions.
-func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
+func shapeAntigravityShellPayload(shellCmd string, posixMode bool, payload string) (string, bool) {
 	words, err := shellWords(payload, shellWordOptions{
 		braceExpand:       shellSupportsBraceExpansion(shellCmd),
 		dollarQuote:       shellSupportsDollarQuote(shellCmd),
-		assignTilde:       shellSupportsAssignTilde(shellCmd),
+		assignTilde:       shellSupportsAssignTilde(shellCmd) && !posixMode,
 		colonTilde:        shellSupportsColonTildePrefix(shellCmd),
 		legacyArith:       shellSupportsLegacyArith(shellCmd),
 		pwdTilde:          shellSupportsPwdTilde(shellCmd),
 		failUnknownTilde:  shellFailsUnknownTildeLogin(shellCmd),
 		homeTildeNeedsEnv: shellBareTildeNeedsHome(shellCmd),
-		startupFiles:      shellRunsStartupFiles(shellCmd),
-		zshExtGlob:        shellSupportsZshEquals(shellCmd),
+		startupFiles:      shellRunsStartupFiles(shellCmd) && !posixMode,
+		zshPatterns:       shellSupportsZshEquals(shellCmd),
 	})
 	if err != nil {
 		// Malformed shell (unterminated quote, etc.) — do not reshape into a
@@ -3024,10 +3024,11 @@ type shellWordOptions struct {
 	// arithmetic. Dash/ash leave `$[…]` as literal `$` + text; treating `[`
 	// as expansion there declines reshape and leaves interactive agy waiting.
 	legacyArith bool
-	// zshExtGlob is true for zsh wrappers, where `.zshenv` may `setopt
-	// EXTENDED_GLOB` and turn unquoted `#`, `^` and mid-word `~` into
-	// pathname-generation operators we cannot safely freeze into --print.
-	zshExtGlob bool
+	// zshPatterns is true for zsh wrappers, whose pattern rules are stricter
+	// than bash's: `.zshenv` may `setopt EXTENDED_GLOB` (turning unquoted `#`,
+	// `^` and mid-word `~` into pathname-generation operators), and an
+	// unmatched `[` is a fatal `bad pattern` error rather than literal text.
+	zshPatterns bool
 	// startupFiles is true when the wrapper may source a startup file before
 	// running the payload (zsh always reads .zshenv; bash reads $BASH_ENV for
 	// non-interactive shells). Such a file can define variables this process
@@ -3097,6 +3098,27 @@ func shellSupportsAssignTilde(command string) bool {
 	}
 }
 
+// shellArgsForcePosix reports whether the wrapper's own argv puts bash into
+// POSIX mode (`bash --posix -c …`, `bash -o posix -c …`). Only flags before the
+// `-c` payload count — anything after it belongs to the payload's own argv.
+// POSIX mode disables the bash extensions this reshaper cares about:
+// assignment-word tilde expansion and $BASH_ENV sourcing (both verified on
+// bash 5.2.21).
+func shellArgsForcePosix(args []string) bool {
+	for i, a := range args {
+		if a == "-c" {
+			return false
+		}
+		if a == "--posix" {
+			return true
+		}
+		if a == "-o" && i+1 < len(args) && args[i+1] == "posix" {
+			return true
+		}
+	}
+	return false
+}
+
 // shellRunsStartupFiles reports whether the wrapper may source a startup file
 // before running its `-c` payload, which can define variables (notably
 // OLDPWD) that this process cannot observe.
@@ -3116,8 +3138,13 @@ func shellRunsStartupFiles(command string) bool {
 		return false
 	case "zsh":
 		return true
-	case "bash", "sh":
+	case "bash":
 		return os.Getenv("BASH_ENV") != ""
+	case "sh":
+		// bash invoked as `sh` starts in POSIX mode and ignores $BASH_ENV
+		// (verified: `env -u OLDPWD BASH_ENV=… sh -c 'printf %s ~-'` prints a
+		// literal `~-`); dash-as-sh sources nothing for `-c` either.
+		return false
 	default:
 		// ksh and unknown shells.
 		return os.Getenv("BASH_ENV") != "" || os.Getenv("ENV") != ""
@@ -3549,7 +3576,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				flushWord()
 				return words, nil
 			}
-			if opts.zshExtGlob {
+			if opts.zshPatterns {
 				// zsh EXTENDED_GLOB (settable from the .zshenv we cannot read)
 				// makes a mid-word `#` a pathname-generation operator: with the
 				// option on, `agy foo#` expands to the matching files and a
@@ -3561,7 +3588,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		case '^':
 			// Same story as `#`: with EXTENDED_GLOB, `^pat` is zsh's
 			// "everything except" operator. Literal on every other shell.
-			if opts.zshExtGlob {
+			if opts.zshPatterns {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)
@@ -3579,7 +3606,10 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// Unmatched `[` (e.g. `[draft`) is literal in bash/dash — keep it
 			// so eligible one-shots still gain --print rather than hanging in
 			// the interactive TUI.
-			if looksLikeUnquotedBracketGlob(s, i) {
+			// zsh is stricter than bash/dash: an unmatched `[` aborts the whole
+			// command with `bad pattern: [draft` (verified on zsh 5.9, also for
+			// mid-word `foo[bar`), so any unquoted `[` declines there.
+			if opts.zshPatterns || looksLikeUnquotedBracketGlob(s, i) {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)
@@ -3611,7 +3641,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				writeSeg(c, false)
 				continue
 			}
-			if opts.zshExtGlob {
+			if opts.zshPatterns {
 				// Mid-word `~` is EXTENDED_GLOB's "except" operator on zsh (`a~b`).
 				// Word-initial tildes are handled above.
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
