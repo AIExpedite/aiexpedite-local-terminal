@@ -979,8 +979,18 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		if envPosix[1] != wantPosixAssign {
 			t.Errorf("bash %s assignment tilde = %q, want %q", env.k, envPosix[1], wantPosixAssign)
 		}
-		t.Setenv(env.k, "")
+		// Unset rather than blank it: an exported-but-empty POSIXLY_CORRECT
+		// still means POSIX mode, which is exactly what the next case relies on
+		// NOT being in effect.
+		os.Unsetenv(env.k)
 	}
+	// An exported-but-empty POSIXLY_CORRECT is still POSIX mode on bash 5.2.21.
+	t.Setenv("POSIXLY_CORRECT", "")
+	_, emptyPosix := shapePTYExecArgs("bash", []string{"-c", origBashAssign})
+	if emptyPosix[1] != wantPosixAssign {
+		t.Errorf("bash empty POSIXLY_CORRECT = %q, want %q", emptyPosix[1], wantPosixAssign)
+	}
+	os.Unsetenv("POSIXLY_CORRECT")
 	// Dash keeps ':' inside the login name, where it never resolves, so the
 	// tilde stays literal there and the payload still reshapes.
 	_, dashColon := shapePTYExecArgs("dash", []string{"-c", `agy ~:suffix`})
@@ -1412,6 +1422,10 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	// the first field in --print — leave unshaped. Single-field flags ((U))
 	// still reshape. ${=TASK} is the SH_WORD_SPLIT shorthand (same issue).
 	for _, orig := range []string{
+		// `(=)` is documented as forcing SH_WORD_SPLIT; zsh 5.9 instead rejects
+		// it with "error in flags", aborting before agy runs. Either way a
+		// frozen --print value would diverge, so decline.
+		`agy "${(=)1}"`,
 		`agy "${(s.:.)TASK}"`,
 		`agy "${(@)arr}"`,
 		`agy "${(f)TASK}"`,

@@ -2986,6 +2986,10 @@ func splitZshPEFlagPrefix(body string) (flags, rest string, ok bool) {
 // produce multiple fields when the expansion is double-quoted.
 //
 //	@     — array elements as separate words ("${(@)a}")
+//	=     — documented as forcing SH_WORD_SPLIT rules. zsh 5.9 actually rejects
+//	        a parenthesized `=` outright ("error in flags near position 4"),
+//	        which aborts the command before agy runs — so either reading
+//	        diverges from a frozen --print value and must decline.
 //	s/S   — split on a string ("${(s.:.)TASK}")
 //	f/F   — split on newlines
 //	z/Z   — shell-word split
@@ -2997,7 +3001,7 @@ func zshPEFlagsAreMultiWord(flags string) bool {
 	for i < len(flags) {
 		c := flags[i]
 		switch c {
-		case '@', 's', 'S', 'f', 'F', 'z', 'Z', '0':
+		case '@', '=', 's', 'S', 'f', 'F', 'z', 'Z', '0':
 			return true
 		case ':':
 			// Orphan :arg: payload — skip to its closer.
@@ -3165,7 +3169,10 @@ func shellForcesPosixMode(command string, args []string) bool {
 			return true
 		}
 	}
-	if os.Getenv("POSIXLY_CORRECT") != "" {
+	// An exported-but-empty POSIXLY_CORRECT still starts bash in POSIX mode
+	// (verified: `env POSIXLY_CORRECT= HOME=/tmp bash -c 'printf %s HOME=~'`
+	// prints a literal `HOME=~`), so presence is what matters, not the value.
+	if _, ok := os.LookupEnv("POSIXLY_CORRECT"); ok {
 		return true
 	}
 	for _, opt := range strings.Split(os.Getenv("SHELLOPTS"), ":") {
