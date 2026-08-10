@@ -2220,16 +2220,18 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 	// changing bash word-splitting / pathname-expansion / empty-expand semantics
 	// (e.g. `agy $OPTIONAL` with OPTIONAL='*.go' must glob; `agy --add-dir $ROOT
 	// task` with unset ROOT makes `task` the flag value). Leave those payloads
-	// unshaped. Double-quoted expansions (`"$TASK"`, `--add-dir "$ROOT"`) still
-	// reshape.
+	// unshaped. Double-quoted multi-field expansions (`"$@"`, `"${arr[@]}"`)
+	// also cannot ride inside one --print value (bash would re-split them into
+	// multiple argv tokens after --print). Single-field double-quoted forms
+	// (`"$TASK"`, `--add-dir "$ROOT"`) still reshape.
 	for _, f := range flags {
-		if f.hasUnquotedExpand() {
+		if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() {
 			return "", false
 		}
 	}
 	if hasPrompt {
 		for _, f := range promptFrags {
-			if f.hasUnquotedExpand() {
+			if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() {
 				return "", false
 			}
 		}
@@ -2502,6 +2504,70 @@ func (w shellWord) hasUnquotedExpand() bool {
 	return false
 }
 
+// hasQuotedMultiWordExpand reports double-quoted expansions that still yield
+// multiple fields (`"$@"`, `"${name[@]}"`, `"${!name[@]}"`, …). Putting those
+// inside a single rebuilt --print "…" leaves only the first field as the flag
+// value and spills the rest as positional args — decline reshape instead.
+// Unquoted multi-field forms are already covered by hasUnquotedExpand.
+func (w shellWord) hasQuotedMultiWordExpand() bool {
+	for _, seg := range w.effectiveSegments() {
+		if !seg.Expand || seg.Unquoted {
+			continue
+		}
+		if shellExpandIsMultiWord(seg.Value) {
+			return true
+		}
+	}
+	return false
+}
+
+// shellExpandIsMultiWord reports whether s contains a bash expansion that
+// produces multiple fields even when double-quoted: $@ / ${@…} / ${name[@]…}.
+func shellExpandIsMultiWord(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '$' || i+1 >= len(s) {
+			continue
+		}
+		next := s[i+1]
+		if next == '@' {
+			return true
+		}
+		if next != '{' {
+			continue
+		}
+		close := strings.IndexByte(s[i+2:], '}')
+		if close < 0 {
+			continue
+		}
+		if shellParamBodyIsMultiWord(s[i+2 : i+2+close]) {
+			return true
+		}
+		i = i + 1 + close // advance toward the closing '}'
+	}
+	return false
+}
+
+// shellParamBodyIsMultiWord reports whether a ${…} body (without braces) is a
+// multi-field expansion: @ with optional operators, or name[@] / !name[@].
+func shellParamBodyIsMultiWord(body string) bool {
+	if body == "" {
+		return false
+	}
+	// Indirect / nameref forms used with arrays: ${!name[@]}
+	if body[0] == '!' {
+		body = body[1:]
+		if body == "" {
+			return false
+		}
+	}
+	if body[0] == '@' {
+		// ${@}, ${@:1}, ${@#pat}, …
+		return true
+	}
+	// Array all-elements subscript: name[@], name[@]:offset, …
+	return strings.Contains(body, "[@]")
+}
+
 // shellWords splits a shell-style command line into argument values, applying
 // a POSIX-ish subset of quote and backslash rules (single quotes, double
 // quotes, and backslash escapes outside single quotes). Enough for the
@@ -2535,10 +2601,13 @@ func shellSupportsBraceExpansion(command string) bool {
 // do not parse subshells/groups), when unquoted glob / expanding-brace / tilde
 // metacharacters appear (we cannot rebuild without losing expansion), or
 // when ANSI-C / locale quoting ($'…' / $"…") appears (we do not implement those
-// forms). Mid-word `~` (not after `=`/`:`) and non-expanding brace forms
-// (`{foo}`) are ordinary literals. Brace-expansion rejection is gated by
-// opts.braceExpand (dash/sh leave braces literal). An unquoted `#` at a word
-// boundary ends tokenization (shell comment).
+// forms). Mid-word `~` (not word-initial and not in an assignment-like tilde
+// position) and non-expanding brace forms (`{foo}`) are ordinary literals.
+// Assignment-like tilde positions are after unquoted `=` (`HOME=~`) and after
+// `:` only once an unquoted `=` has already appeared (`PATH=/bin:~/x`); a bare
+// `foo:~` is literal. Brace-expansion rejection is gated by opts.braceExpand
+// (dash/sh leave braces literal). An unquoted `#` at a word boundary ends
+// tokenization (shell comment).
 // Backslash-newline line continuations (quoted or unquoted) drop both chars and
 // do not start a word (so a following `#` stays a comment).
 // Escaped `$` / “ ` “ inside an open `${…}` declines reshape (segment splits
@@ -2562,25 +2631,39 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 	// paramDepth tracks nested ${…} in expansion-eligible contexts so that
 	// escaped \$ / \` inside a still-open parameter expansion can decline reshape.
 	paramDepth := 0
+	// sawUnquotedAssign is true once this word has written an unquoted '='.
+	// Bash only tilde-expands after ':' inside assignment-like words, so a
+	// colon without a prior unquoted '=' (`foo:~`) stays literal.
+	sawUnquotedAssign := false
 
-	// wordPrefixEndsWithAssignSep reports whether the partial word so far ends
-	// with unquoted '=' or ':' — positions where bash performs tilde expansion
-	// inside assignment-like words (`HOME=~`, `PATH=~/bin:~/x`).
-	wordPrefixEndsWithAssignSep := func() bool {
+	// wordPrefixIsTildeExpandPosition reports whether a following unquoted '~'
+	// would tilde-expand: after unquoted '=' always, or after ':' only when
+	// the word is already assignment-like (saw unquoted '=').
+	wordPrefixIsTildeExpandPosition := func() bool {
+		var last byte
+		var ok bool
 		if segCur.Len() > 0 {
 			b := segCur.String()
-			c := b[len(b)-1]
-			return c == '=' || c == ':'
-		}
-		for i := len(segs) - 1; i >= 0; i-- {
-			v := segs[i].Value
-			if len(v) == 0 {
-				continue
+			last = b[len(b)-1]
+			ok = true
+		} else {
+			for i := len(segs) - 1; i >= 0; i-- {
+				v := segs[i].Value
+				if len(v) == 0 {
+					continue
+				}
+				last = v[len(v)-1]
+				ok = true
+				break
 			}
-			c := v[len(v)-1]
-			return c == '=' || c == ':'
 		}
-		return false
+		if !ok {
+			return false
+		}
+		if last == '=' {
+			return true
+		}
+		return last == ':' && sawUnquotedAssign
 	}
 
 	flushSeg := func() {
@@ -2612,6 +2695,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		})
 		segs = nil
 		wordStarted = false
+		sawUnquotedAssign = false
 	}
 	writeSeg := func(c byte, expandable bool) {
 		unquotedCtx := !inSingle && !inDouble
@@ -2622,6 +2706,9 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		}
 		if !segStarted {
 			segUnquoted = unquotedCtx
+		}
+		if unquotedCtx && c == '=' {
+			sawUnquotedAssign = true
 		}
 		segCur.WriteByte(c)
 		segStarted = true
@@ -2782,10 +2869,11 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// Rebuilding would single-quote them and freeze the pattern.
 			return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 		case '~':
-			// Bash tilde expansion: word-initial (`~/x`, `~user`) and after
-			// unquoted `=` / `:` in assignment-like words (`HOME=~`,
-			// `PATH=~/bin:~/x`). Mid-word `foo~bar` is ordinary literal data.
-			if !wordStarted || wordPrefixEndsWithAssignSep() {
+			// Bash tilde expansion: word-initial (`~/x`, `~user`) and in
+			// assignment-like positions after unquoted `=` (`HOME=~`) or after
+			// `:` once `=` has appeared (`PATH=/bin:~/x`). Mid-word forms
+			// without that context (`foo~bar`, `foo:~`) are ordinary literals.
+			if !wordStarted || wordPrefixIsTildeExpandPosition() {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)

@@ -804,10 +804,19 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		t.Errorf("mid-word tilde prompt = %q, want %q", midTilde[1], wantMidTilde)
 	}
 
-	// Assignment-like tilde (`HOME=~`, after `:`) expands in bash — leave unshaped.
+	// Colon without a prior unquoted '=' is not an assignment-like tilde
+	// position in bash (`foo:~` stays literal) — reshape safely.
+	_, colonTilde := shapePTYExecArgs("bash", []string{"-c", `agy foo:~`})
+	wantColonTilde := `agy --dangerously-skip-permissions --print 'foo:~'`
+	if colonTilde[1] != wantColonTilde {
+		t.Errorf("non-assignment colon-tilde = %q, want %q", colonTilde[1], wantColonTilde)
+	}
+
+	// Assignment-like tilde (`HOME=~`, `PATH=…:~/x`) expands in bash — leave unshaped.
 	for _, orig := range []string{
 		`agy HOME=~`,
 		`agy PATH=~/bin:~/x`,
+		`agy PATH=/bin:~/x`,
 	} {
 		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
 		if args[1] != orig {
@@ -825,7 +834,8 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 
 // Unquoted expansions (single- or multi-fragment) must not be double-quoted on
 // rebuild (word-split / pathname-expand / empty-expand semantics change).
-// Double-quoted expansions still reshape.
+// Double-quoted single-field expansions still reshape; multi-field forms
+// (`"$@"`, `"${arr[@]}"`) leave the payload unshaped so --print cannot re-split.
 func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	for _, orig := range []string{
 		`agy $OPTIONAL`,
@@ -842,6 +852,26 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	wantDQ := `agy --dangerously-skip-permissions --print "$TASK more"`
 	if dq[1] != wantDQ {
 		t.Errorf("double-quoted multi-frag expand = %q, want %q", dq[1], wantDQ)
+	}
+
+	// Quoted multi-field expansions still split after --print — leave unshaped.
+	for _, orig := range []string{
+		`agy "$@"`,
+		`agy "${files[@]}"`,
+		`agy --add-dir "$@" task`,
+		`agy "$@"'more'`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("multi-field quoted expand was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+
+	// "$*" / "${files[*]}" stay a single field when double-quoted — still reshape.
+	_, star := shapePTYExecArgs("bash", []string{"-c", `agy "$*"`})
+	wantStar := `agy --dangerously-skip-permissions --print "$*"`
+	if star[1] != wantStar {
+		t.Errorf("quoted $* expand = %q, want %q", star[1], wantStar)
 	}
 }
 
@@ -1041,6 +1071,11 @@ func TestShellWords(t *testing.T) {
 		{`agy review foo~bar`, []string{"agy", "review", "foo~bar"}, []bool{false, false, false}, false},
 		{`agy HOME=~`, nil, nil, true},
 		{`agy PATH=~/bin:~/x`, nil, nil, true},
+		{`agy PATH=/bin:~/x`, nil, nil, true},
+		{`agy foo:~`, []string{"agy", "foo:~"}, []bool{false, false}, false},
+		{`agy "$@"`, []string{"agy", "$@"}, []bool{false, true}, false},
+		{`agy "${files[@]}"`, []string{"agy", `${files[@]}`}, []bool{false, true}, false},
+		{`agy "$*"`, []string{"agy", "$*"}, []bool{false, true}, false},
 		{`agy $OPTIONAL task`, []string{"agy", "$OPTIONAL", "task"}, []bool{false, true, false}, false},
 		{`agy --add-dir ${ROOT}\$dir task`, []string{"agy", "--add-dir", `${ROOT}$dir`, "task"}, []bool{false, false, true, false}, false},
 		{`agy "${TASK:-\$(x)}"`, nil, nil, true},
