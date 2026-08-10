@@ -176,6 +176,40 @@ func installSignalHandler(cfg *Config) {
 
 /* ---------- tray helpers ---------- */
 
+// setupHideDelay is the brief pause after successful setup (device registration)
+// before the window is hidden to tray, so the user can read the
+// "registration succeeded" message first. Kept as a package var so tests can
+// shorten it and product can tune the single value in one place.
+var setupHideDelay = 2 * time.Second
+
+// hideAfterSetup minimizes the agent to the system tray once first-time setup
+// (device registration) has completed successfully. On Windows this hides the
+// on-demand console window; on macOS/Linux showConsoleWindow is a no-op and the
+// agent already runs headless from the menu-bar/tray. Safe when no window
+// exists: showConsoleWindow(false) early returns for the prod GUI app that
+// never allocated a console, and a nil mConsole (systray not ready) is tolerated.
+//
+// This runs in the registration goroutine, so it splits the "console hidden"
+// bookkeeping in two: it unchecks the "Show Console" item directly (the
+// established in-file pattern — mConsole.Uncheck is goroutine-safe), and it
+// signals ConsoleHiddenChan so the tray event loop clears its goroutine-local
+// consoleVisible flag (which it alone may write). Without the flag sync a later
+// "Show Console" click would toggle a stale true and re-hide instead of show.
+// The send is non-blocking: if the single-slot buffer already holds a pending
+// signal from monitorConsoleMinimize, that queued signal clears the flag just
+// the same, so dropping this duplicate is harmless.
+func hideAfterSetup(mConsole *systray.MenuItem) {
+	time.Sleep(setupHideDelay)
+	showConsoleWindow(false)
+	if mConsole != nil {
+		mConsole.Uncheck()
+	}
+	select {
+	case ConsoleHiddenChan <- true:
+	default:
+	}
+}
+
 func onTrayReady(cfg *Config) func() {
 	return func() {
 		// Use template icon on macOS so the icon auto-inverts for light/dark
@@ -268,12 +302,10 @@ func onTrayReady(cfg *Config) func() {
 					// Update tooltip to show registered status
 					systray.SetTooltip(fmt.Sprintf("%s – Connected as %s", EnvDisplayName, cfg.AgentID))
 
-					// Hide console after successful registration
-					if runtime.GOOS == "windows" {
-						time.Sleep(2 * time.Second) // Brief delay to let user see success message
-						showConsoleWindow(false)
-						mConsole.Uncheck()
-					}
+					// Setup complete: minimize the agent to the system tray.
+					// Runs in its own goroutine so the brief read-the-message
+					// delay doesn't hold up the Pub/Sub loop start below.
+					go hideAfterSetup(mConsole)
 
 					// Start Pub/Sub loop with new credentials
 					fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
@@ -499,6 +531,11 @@ func onTrayReady(cfg *Config) func() {
 							mRegister.Disable()
 							// Update tooltip to show registered status
 							systray.SetTooltip(fmt.Sprintf("%s – Connected as %s", EnvDisplayName, cfg.AgentID))
+
+							// Setup complete via the manual "Register Device"
+							// flow: minimize to tray just like the auto-register
+							// path so the console doesn't linger as a window.
+							go hideAfterSetup(mConsole)
 
 							// Start Pub/Sub loop with new credentials
 							fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
