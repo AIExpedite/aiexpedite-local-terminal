@@ -3482,19 +3482,41 @@ func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, pwdTilde bool) b
 // shellTildePrefixExpands reports whether an unquoted tilde-prefix body
 // (characters after '~', without a trailing path) would expand on this host.
 // Empty → HOME (`~`, `~/x`). Bare `~+` / `~-` expand via PWD/OLDPWD only when
-// pwdTilde is true (bash/zsh/ksh; dash leaves them literal). Indexed `~+N` /
-// `~-N` need a live directory-stack entry we cannot see, so they reshape.
-// Otherwise only when user.Lookup succeeds — unknown logins stay literal.
+// pwdTilde is true (bash/zsh/ksh; dash leaves them literal). Stack index zero
+// (`~+0` / `~-0`, including leading zeros) always resolves to the current
+// directory on those shells even in a fresh process — decline reshape.
+// Non-zero `~+N` / `~-N` need a live directory-stack entry we cannot see, so
+// they reshape. Otherwise only when user.Lookup succeeds — unknown logins
+// stay literal.
 func shellTildePrefixExpands(login string, pwdTilde bool) bool {
 	if login == "" {
 		return true
 	}
-	// Bash/zsh PWD/OLDPWD forms: ~+ and ~- only (no index). Dash: literal.
+	// Bash/zsh PWD/OLDPWD / dirs forms. Dash: literal (pwdTilde false).
 	if login == "+" || login == "-" {
 		return pwdTilde
 	}
+	if pwdTilde && isPwdTildeStackZero(login) {
+		return true
+	}
 	_, err := user.Lookup(login)
 	return err == nil
+}
+
+// isPwdTildeStackZero reports whether login is a bash-style directory-stack
+// index of zero after `~` (`+0`, `-0`, `+00`, …). Index 0 always exists and
+// expands to the current directory; non-zero indices may be missing and are
+// left to reshape as literals.
+func isPwdTildeStackZero(login string) bool {
+	if len(login) < 2 || (login[0] != '+' && login[0] != '-') {
+		return false
+	}
+	for i := 1; i < len(login); i++ {
+		if login[i] != '0' {
+			return false
+		}
+	}
+	return true
 }
 
 // looksLikeUnquotedBracketGlob reports whether s[openIdx] (must be '[') starts

@@ -878,30 +878,37 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if noUser[1] != wantNoUser {
 		t.Errorf("unknown tilde login = %q, want %q", noUser[1], wantNoUser)
 	}
-	// Bash specials ~+ / ~- (PWD/OLDPWD) still expand — leave unshaped.
+	// Bash specials ~+ / ~- (PWD/OLDPWD) and stack index 0 (~+0 / ~-0) always
+	// expand — leave unshaped.
 	for _, orig := range []string{
 		`agy ~+`,
 		`agy ~-`,
 		`agy ~+/x`,
+		`agy ~+0`,
+		`agy ~-0`,
+		`agy ~+0/x`,
+		`agy ~+00`,
 	} {
 		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
 		if args[1] != orig {
 			t.Errorf("bash tilde special was reshaped: got %q, want original %q", args[1], orig)
 		}
 	}
-	// Dash leaves ~+ / ~- literal — still reshape with --print.
+	// Dash leaves ~+ / ~- / ~+0 literal — still reshape with --print.
 	for _, tc := range []struct {
 		orig, want string
 	}{
 		{`agy ~+`, `agy --dangerously-skip-permissions --print '~+'`},
 		{`agy ~-`, `agy --dangerously-skip-permissions --print '~-'`},
+		{`agy ~+0`, `agy --dangerously-skip-permissions --print '~+0'`},
+		{`agy ~-0`, `agy --dangerously-skip-permissions --print '~-0'`},
 	} {
 		_, args := shapePTYExecArgs("dash", []string{"-c", tc.orig})
 		if args[1] != tc.want {
 			t.Errorf("dash literal tilde special %q = %q, want %q", tc.orig, args[1], tc.want)
 		}
 	}
-	// Indexed ~+N / ~-N need a live directory-stack entry; fresh bash usually
+	// Non-zero ~+N / ~-N need a live directory-stack entry; fresh bash usually
 	// has none, so leave literal and still reshape with --print.
 	_, stackIdx := shapePTYExecArgs("bash", []string{"-c", `agy ~+1`})
 	wantStackIdx := `agy --dangerously-skip-permissions --print '~+1'`
