@@ -676,6 +676,30 @@ func TestShapePTYExecArgs_PreservesPerFragmentExpansion(t *testing.T) {
 	if mixArgs[1] != wantMix {
 		t.Errorf("mixed expand/literal = %q, want %q", mixArgs[1], wantMix)
 	}
+
+	// Concatenated quote segments within ONE shell word (no space between):
+	// "$TASK"'$(touch /tmp/pwn)' must not OR Expand across segments.
+	_, concatArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK"'$(touch /tmp/pwn)'`})
+	wantConcat := `agy --dangerously-skip-permissions --print "$TASK"'$(touch /tmp/pwn)'`
+	if concatArgs[1] != wantConcat {
+		t.Errorf("concatenated segments = %q, want %q", concatArgs[1], wantConcat)
+	}
+}
+
+// Unmatched / unsupported unquoted grouping must NOT be reshaped into a valid
+// permission-skipping agy command — leave the original so bash reports the error.
+func TestShapePTYExecArgs_RejectsUnmatchedShellGrouping(t *testing.T) {
+	orig := `agy review)`
+	_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+	if args[1] != orig {
+		t.Errorf("unmatched ) was reshaped: got %q, want original %q", args[1], orig)
+	}
+
+	orig2 := `agy review(`
+	_, args2 := shapePTYExecArgs("bash", []string{"-c", orig2})
+	if args2[1] != orig2 {
+		t.Errorf("unmatched ( was reshaped: got %q, want original %q", args2[1], orig2)
+	}
 }
 
 // Unterminated quotes must NOT be repaired into a runnable permission-skipping
@@ -719,11 +743,14 @@ func TestShellWords(t *testing.T) {
 		{`agy "$TASK"`, []string{"agy", "$TASK"}, []bool{false, true}, false},
 		{`agy '$TASK'`, []string{"agy", "$TASK"}, []bool{false, false}, false},
 		{`agy "\$(touch /tmp/pwn)"`, []string{"agy", "$(touch /tmp/pwn)"}, []bool{false, false}, false},
+		{`agy "$TASK"'$(x)'`, []string{"agy", "$TASK$(x)"}, []bool{false, true}, false},
 		{`agy ""`, []string{"agy", ""}, []bool{false, false}, false},
 		{`  agy   `, []string{"agy"}, []bool{false}, false},
 		{``, nil, nil, false},
 		{`agy 'review`, nil, nil, true},
 		{`agy "fix`, nil, nil, true},
+		{`agy review)`, nil, nil, true},
+		{`agy review(`, nil, nil, true},
 	}
 	for _, tc := range cases {
 		got, err := shellWords(tc.in)

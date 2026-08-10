@@ -2291,15 +2291,15 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord,
 
 // quoteAntigravityPrintFragments serializes one or more prompt tokens into a
 // single bash -c argument for --print. Expansion eligibility is retained per
-// fragment: mixed `"$TASK" '$(evil)'` rebuilds as adjacent quoted pieces so the
-// single-quoted substitution stays inert instead of OR-ing Expand and
-// double-quoting the joined string.
+// quoted segment (within and across whitespace-delimited words): mixed
+// `"$TASK"'$(evil)'` rebuilds as adjacent quoted pieces so the single-quoted
+// substitution stays inert instead of OR-ing Expand into one double-quoted blob.
 func quoteAntigravityPrintFragments(frags []shellWord) string {
 	if len(frags) == 0 {
 		return `""`
 	}
 	if len(frags) == 1 {
-		return quoteAntigravityShellArg(frags[0].Value, frags[0].Expand)
+		return quoteShellWord(frags[0])
 	}
 
 	anyExpand := false
@@ -2307,40 +2307,87 @@ func quoteAntigravityPrintFragments(frags []shellWord) string {
 	vals := make([]string, len(frags))
 	for i, f := range frags {
 		vals[i] = f.Value
-		if f.Expand {
-			anyExpand = true
-		} else if strings.ContainsAny(f.Value, "$`") {
-			// Literal fragment still carries $ / ` (single-quoted or escaped
-			// origin) — cannot double-quote a joined blob with expanding peers.
-			mixedLiteralExpand = true
+		for _, seg := range f.effectiveSegments() {
+			if seg.Expand {
+				anyExpand = true
+			} else if strings.ContainsAny(seg.Value, "$`") {
+				// Literal segment still carries $ / ` — cannot double-quote a
+				// joined blob with expanding peers.
+				mixedLiteralExpand = true
+			}
 		}
 	}
-	// All-literal (including single-quoted $(...) fragments): join + single-quote.
+	// All-literal (including single-quoted $(...) segments): join + single-quote.
 	// Pure expanding (or plain text with expand peers): join + one quote pass.
 	if !anyExpand || !mixedLiteralExpand {
 		return quoteAntigravityShellArg(strings.Join(vals, " "), anyExpand)
 	}
 
-	// Mixed expanding + literal-with-$/` : per-fragment adjacent concatenation.
-	// Space between tokens is a separate double-quoted " " so bash re-joins
-	// into one argv word without reactivating the literal fragment's $(...).
+	// Mixed expanding + literal-with-$/` : per-word quoting with " " between
+	// words; each word may further split into per-segment adjacent quotes.
 	var b strings.Builder
 	for i, f := range frags {
 		if i > 0 {
 			b.WriteString(`" "`)
 		}
-		b.WriteString(quoteAntigravityShellArg(f.Value, f.Expand))
+		b.WriteString(quoteShellWord(f))
 	}
 	return b.String()
 }
 
-// shellWord is one token from shellWords. Expand is true when the value
-// contains unescaped `$` or “ ` “ from an unquoted or double-quoted context
-// (bash would expand them). Escaped forms (`\$`, `\“) and single-quoted
-// material set Expand=false so rebuild keeps them literal.
-type shellWord struct {
+// quoteShellWord serializes one shell word. When the word is built from
+// concatenated quote segments with mixed expand (e.g. `"$TASK"'$(evil)'`),
+// each segment is quoted independently and juxtaposed so bash re-joins them
+// into one argv token without reactivating literal $(...).
+func quoteShellWord(w shellWord) string {
+	segs := w.effectiveSegments()
+	if len(segs) <= 1 {
+		return quoteAntigravityShellArg(w.Value, w.Expand)
+	}
+	anyExpand := false
+	mixedLiteralExpand := false
+	for _, seg := range segs {
+		if seg.Expand {
+			anyExpand = true
+		} else if strings.ContainsAny(seg.Value, "$`") {
+			mixedLiteralExpand = true
+		}
+	}
+	if !anyExpand || !mixedLiteralExpand {
+		return quoteAntigravityShellArg(w.Value, anyExpand)
+	}
+	var b strings.Builder
+	for _, seg := range segs {
+		b.WriteString(quoteAntigravityShellArg(seg.Value, seg.Expand))
+	}
+	return b.String()
+}
+
+// shellSegment is one quote/unquoted region within a shellWord. Concatenated
+// forms like `"$TASK"'$(cmd)'` are one word with two segments so rebuild can
+// keep each region's expansion semantics.
+type shellSegment struct {
 	Value  string
 	Expand bool
+}
+
+// shellWord is one whitespace-delimited token from shellWords. Value is the
+// joined semantic text (quotes/escapes stripped). Expand is true when any
+// segment contains unescaped `$` / “ ` “ from an unquoted or double-quoted
+// context. Segments retain per-region expand so mixed concatenation stays safe.
+type shellWord struct {
+	Value    string
+	Expand   bool
+	Segments []shellSegment
+}
+
+// effectiveSegments returns Segments, or a single synthetic segment when the
+// word was built without segment tracking (defensive).
+func (w shellWord) effectiveSegments() []shellSegment {
+	if len(w.Segments) > 0 {
+		return w.Segments
+	}
+	return []shellSegment{{Value: w.Value, Expand: w.Expand}}
 }
 
 // shellWords splits a shell-style command line into argument values, applying
@@ -2349,43 +2396,82 @@ type shellWord struct {
 // operator-joined `bash -c "agy …"` payloads we reshape — not a full shell.
 //
 // Returns an error when a quote remains open at end-of-input (unterminated
-// syntax). Callers must not turn such payloads into a valid command.
+// syntax) or when unquoted grouping metacharacters `(){}` appear (bash would
+// reject unmatched ones; we do not parse groups). Callers must not turn such
+// payloads into a valid command.
 func shellWords(s string) ([]shellWord, error) {
 	var words []shellWord
-	var cur strings.Builder
+	var segs []shellSegment
+	var segCur strings.Builder
 	inSingle, inDouble := false, false
 	escaped := false
-	started := false
-	// expandWord is sticky true once an unescaped $ or ` is written in an
+	wordStarted := false
+	segStarted := false
+	// segExpand is true once an unescaped $ or ` is written in this segment's
 	// expansion-eligible context (unquoted / double-quoted).
-	expandWord := false
-	flush := func() {
-		if started {
-			words = append(words, shellWord{Value: cur.String(), Expand: expandWord})
-			cur.Reset()
-			started = false
-			expandWord = false
+	segExpand := false
+
+	flushSeg := func() {
+		if segStarted {
+			segs = append(segs, shellSegment{Value: segCur.String(), Expand: segExpand})
+			segCur.Reset()
+			segStarted = false
+			segExpand = false
 		}
 	}
+	flushWord := func() {
+		flushSeg()
+		if !wordStarted && len(segs) == 0 {
+			return
+		}
+		var val strings.Builder
+		anyExpand := false
+		for _, seg := range segs {
+			val.WriteString(seg.Value)
+			if seg.Expand {
+				anyExpand = true
+			}
+		}
+		words = append(words, shellWord{
+			Value:    val.String(),
+			Expand:   anyExpand,
+			Segments: segs,
+		})
+		segs = nil
+		wordStarted = false
+	}
+	writeSeg := func(c byte, expandable bool) {
+		segCur.WriteByte(c)
+		segStarted = true
+		wordStarted = true
+		if expandable {
+			segExpand = true
+		}
+	}
+
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if escaped {
 			// Backslash-escaped content is literal — including \$ and \`.
-			// Do NOT set expandWord: rebuild must keep these inert.
-			cur.WriteByte(c)
+			// Do NOT set segExpand: rebuild must keep these inert.
+			writeSeg(c, false)
 			escaped = false
-			started = true
 			continue
 		}
 		if inSingle {
 			if c == '\'' {
+				// Close single-quoted segment (may be empty '').
+				if !segStarted {
+					segs = append(segs, shellSegment{Value: "", Expand: false})
+				} else {
+					flushSeg()
+				}
 				inSingle = false
+				wordStarted = true
 			} else {
 				// Single-quoted: literal, no expansion.
-				cur.WriteByte(c)
+				writeSeg(c, false)
 			}
-			// Opening '' still counts as a started word (empty single-quoted).
-			started = true
 			continue
 		}
 		if inDouble {
@@ -2396,42 +2482,45 @@ func shellWords(s string) ([]shellWord, error) {
 				// Escaped $ / ` must NOT mark Expand (would re-activate on rebuild).
 				if next == '\\' || next == '"' || next == '$' || next == '`' || next == '\n' {
 					i++
-					cur.WriteByte(next)
-					started = true
+					writeSeg(next, false)
 					continue
 				}
 			}
 			if c == '"' {
+				if !segStarted {
+					segs = append(segs, shellSegment{Value: "", Expand: false})
+				} else {
+					flushSeg()
+				}
 				inDouble = false
-				started = true
+				wordStarted = true
 				continue
 			}
 			// Double-quoted: unescaped $ / ` are expandable; other chars literal.
-			cur.WriteByte(c)
-			started = true
-			if c == '$' || c == '`' {
-				expandWord = true
-			}
+			writeSeg(c, c == '$' || c == '`')
 			continue
 		}
 		switch c {
 		case '\\':
 			escaped = true
-			started = true
+			wordStarted = true
 		case '\'':
+			flushSeg() // start a new single-quoted segment
 			inSingle = true
-			started = true
+			wordStarted = true
 		case '"':
+			flushSeg() // start a new double-quoted segment
 			inDouble = true
-			started = true
+			wordStarted = true
 		case ' ', '\t', '\n', '\r':
-			flush()
+			flushWord()
+		case '(', ')', '{', '}':
+			// We do not parse grouping / subshells. Unquoted parens/braces are
+			// either unmatched (bash syntax error) or full shell syntax we
+			// would mis-reshape — leave the original payload alone.
+			return nil, fmt.Errorf("unsupported unquoted shell metacharacter %q", c)
 		default:
-			cur.WriteByte(c)
-			started = true
-			if c == '$' || c == '`' {
-				expandWord = true
-			}
+			writeSeg(c, c == '$' || c == '`')
 		}
 	}
 	if inSingle || inDouble {
@@ -2439,10 +2528,9 @@ func shellWords(s string) ([]shellWord, error) {
 	}
 	if escaped {
 		// Trailing backslash is kept as a literal.
-		cur.WriteByte('\\')
-		started = true
+		writeSeg('\\', false)
 	}
-	flush()
+	flushWord()
 	return words, nil
 }
 
