@@ -785,6 +785,18 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		t.Errorf("literal brace prompt = %q, want %q", litBrace[1], wantLitBrace)
 	}
 
+	// Brace expansion spanning quoted segments (`{a,'b'}`) still expands in
+	// bash — leave unshaped rather than freezing to '{a,b}'.
+	for _, orig := range []string{
+		`agy {a,'b'}`,
+		`agy {a,"b"}`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("quoted-span brace expansion was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+
 	// Mid-word tilde does not tilde-expand — reshape as a literal prompt.
 	_, midTilde := shapePTYExecArgs("bash", []string{"-c", `agy review foo~bar`})
 	wantMidTilde := `agy --dangerously-skip-permissions --print 'review foo~bar'`
@@ -816,12 +828,43 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 }
 
 // Unquoted ${…} must close paramDepth so a later escaped \$ outside the
-// expansion is not mis-treated as inside it (which would decline reshape).
+// expansion is not mis-treated as inside it (shellWords must succeed). Flag
+// unquoted expand still declines reshape (see RejectsUnquotedExpandInFlags).
 func TestShapePTYExecArgs_ClosesUnquotedParamExpansion(t *testing.T) {
-	_, args := shapePTYExecArgs("bash", []string{"-c", `agy --add-dir ${ROOT}\$dir task`})
+	// Double-quoted param + escaped $ still reshapes with per-segment split.
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy --add-dir "${ROOT}\$dir" task`})
 	want := `agy --dangerously-skip-permissions --add-dir "${ROOT}"'$dir' --print task`
 	if args[1] != want {
-		t.Errorf("unquoted param + escaped $ = %q, want %q", args[1], want)
+		t.Errorf("quoted param + escaped $ = %q, want %q", args[1], want)
+	}
+
+	// Unquoted form must parse without "inside parameter expansion" error.
+	words, err := shellWords(`agy --add-dir ${ROOT}\$dir task`)
+	if err != nil {
+		t.Fatalf("shellWords unquoted param+escaped $: %v", err)
+	}
+	if len(words) != 4 || words[2].Value != `${ROOT}$dir` {
+		t.Fatalf("shellWords unquoted param+escaped $ = %#v", words)
+	}
+}
+
+// Unquoted expansions on flag operands must not be double-quoted on rebuild.
+func TestShapePTYExecArgs_RejectsUnquotedExpandInFlags(t *testing.T) {
+	for _, orig := range []string{
+		`agy --add-dir $ROOT task`,
+		`agy --add-dir ${ROOT}\$dir task`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("unquoted flag expand was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+
+	// Double-quoted flag expand still reshapes.
+	_, dq := shapePTYExecArgs("bash", []string{"-c", `agy --add-dir "$ROOT" task`})
+	wantDQ := `agy --dangerously-skip-permissions --add-dir "$ROOT" --print task`
+	if dq[1] != wantDQ {
+		t.Errorf("double-quoted flag expand = %q, want %q", dq[1], wantDQ)
 	}
 }
 
@@ -972,11 +1015,14 @@ func TestShellWords(t *testing.T) {
 		{`agy review(`, nil, nil, true},
 		{`agy file{1,2}`, nil, nil, true},
 		{`agy review {a,b}`, nil, nil, true},
+		{`agy {a,'b'}`, nil, nil, true},
+		{`agy {a,"b"}`, nil, nil, true},
 		{`agy review *.go`, nil, nil, true},
 		{`agy review ~/proj`, nil, nil, true},
 		{`agy review {foo}`, []string{"agy", "review", "{foo}"}, []bool{false, false, false}, false},
 		{`agy review foo~bar`, []string{"agy", "review", "foo~bar"}, []bool{false, false, false}, false},
 		{`agy $OPTIONAL task`, []string{"agy", "$OPTIONAL", "task"}, []bool{false, true, false}, false},
+		{`agy --add-dir ${ROOT}\$dir task`, []string{"agy", "--add-dir", `${ROOT}$dir`, "task"}, []bool{false, false, true, false}, false},
 		{`agy "${TASK:-\$(x)}"`, nil, nil, true},
 		{`agy $'(x)'`, nil, nil, true},
 		{`agy $"x"`, nil, nil, true},

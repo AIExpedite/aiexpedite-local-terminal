@@ -2211,6 +2211,24 @@ func shapeAntigravityShellPayload(payload string) (string, bool) {
 		return "", false
 	}
 	flags, promptFrags, hasPrompt := partitionAntigravityCallerShellWords(words[1:])
+	// Unquoted expansions cannot be rebuilt as double-quoted tokens without
+	// changing bash word-splitting / pathname-expansion / empty-expand semantics
+	// (e.g. `agy $OPTIONAL` with OPTIONAL='*.go' must glob; `agy --add-dir $ROOT
+	// task` with unset ROOT makes `task` the flag value). Leave those payloads
+	// unshaped. Double-quoted expansions (`"$TASK"`, `--add-dir "$ROOT"`) still
+	// reshape.
+	for _, f := range flags {
+		if f.hasUnquotedExpand() {
+			return "", false
+		}
+	}
+	if hasPrompt {
+		for _, f := range promptFrags {
+			if f.hasUnquotedExpand() {
+				return "", false
+			}
+		}
+	}
 	parts := make([]string, 0, 2+len(flags)+2)
 	parts = append(parts, words[0].Value, "--dangerously-skip-permissions")
 	for _, f := range flags {
@@ -2219,16 +2237,6 @@ func shapeAntigravityShellPayload(payload string) (string, bool) {
 		parts = append(parts, quoteShellWord(f))
 	}
 	if hasPrompt {
-		// Unquoted expansions cannot be rebuilt as double-quoted --print values
-		// without changing bash word-splitting / pathname-expansion / empty-
-		// expand semantics (e.g. `agy $OPTIONAL` with OPTIONAL='*.go' must glob;
-		// `agy $OPTIONAL task` drops an unset $OPTIONAL entirely). Leave those
-		// payloads unshaped. Double-quoted expansions (`"$TASK"`) still reshape.
-		for _, f := range promptFrags {
-			if f.hasUnquotedExpand() {
-				return "", false
-			}
-		}
 		parts = append(parts, "--print", quoteAntigravityPrintFragments(promptFrags))
 	}
 	return strings.Join(parts, " "), true
@@ -2791,26 +2799,64 @@ func nextAfterLineContinuations(s string, i int) int {
 
 // looksLikeUnquotedBraceExpansion reports whether s[openIdx] (must be '{')
 // starts a bash brace-expansion pattern in the current unquoted word: a
-// matching `}` whose interior contains `,` or `..`. Nested braces are tracked
-// at depth; whitespace / quotes end the scan (word / quote boundary). Non-
-// expanding forms like `{foo}` return false so they can be treated as literal.
+// matching `}` with an active `,` or `..` separator. Bash performs brace
+// expansion before quote removal, so separators inside quoted segments do not
+// count, but quoted text may appear between unquoted separators
+// (`{a,'b'}` expands; `{foo}` does not). Nested braces are tracked at depth;
+// unquoted whitespace ends the scan (word boundary).
 func looksLikeUnquotedBraceExpansion(s string, openIdx int) bool {
 	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != '{' {
 		return false
 	}
 	depth := 0
+	inSingle, inDouble := false, false
+	escaped := false
+	active := false // unquoted `,` or `..` seen at depth 1
 	for j := openIdx; j < len(s); j++ {
 		c := s[j]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '\\' && j+1 < len(s) {
+				j++ // skip escaped byte inside double quotes
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
 		switch c {
-		case ' ', '\t', '\n', '\r', '\'', '"':
+		case '\\':
+			escaped = true
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case ' ', '\t', '\n', '\r':
 			return false
 		case '{':
 			depth++
 		case '}':
 			depth--
 			if depth == 0 {
-				inner := s[openIdx+1 : j]
-				return strings.Contains(inner, ",") || strings.Contains(inner, "..")
+				return active
+			}
+		case ',':
+			if depth == 1 {
+				active = true
+			}
+		case '.':
+			if depth == 1 && j+1 < len(s) && s[j+1] == '.' {
+				active = true
 			}
 		}
 	}
