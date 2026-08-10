@@ -2219,6 +2219,18 @@ func shapeAntigravityShellPayload(payload string) (string, bool) {
 		parts = append(parts, quoteShellWord(f))
 	}
 	if hasPrompt {
+		// Multi-fragment prompts with unquoted expansions cannot be joined into
+		// one double-quoted --print value without changing bash word-splitting /
+		// pathname-expansion / empty-expand semantics (e.g. `agy $OPTIONAL task`
+		// drops an unset $OPTIONAL entirely; `"$OPTIONAL task"` keeps a leading
+		// space). Leave those payloads unshaped.
+		if len(promptFrags) > 1 {
+			for _, f := range promptFrags {
+				if f.hasUnquotedExpand() {
+					return "", false
+				}
+			}
+		}
 		parts = append(parts, "--print", quoteAntigravityPrintFragments(promptFrags))
 	}
 	return strings.Join(parts, " "), true
@@ -2371,7 +2383,8 @@ func quoteShellWord(w shellWord) string {
 }
 
 // mergeAdjacentShellSegments joins consecutive segments that share the same
-// Expand flag so rebuild quoting stays compact (`$`+`(cmd)` → one literal).
+// Expand and Unquoted flags so rebuild quoting stays compact
+// (`$`+`(cmd)` → one literal).
 func mergeAdjacentShellSegments(segs []shellSegment) []shellSegment {
 	if len(segs) <= 1 {
 		return segs
@@ -2379,7 +2392,7 @@ func mergeAdjacentShellSegments(segs []shellSegment) []shellSegment {
 	out := make([]shellSegment, 0, len(segs))
 	cur := segs[0]
 	for i := 1; i < len(segs); i++ {
-		if segs[i].Expand == cur.Expand {
+		if segs[i].Expand == cur.Expand && segs[i].Unquoted == cur.Unquoted {
 			cur.Value += segs[i].Value
 			continue
 		}
@@ -2442,6 +2455,10 @@ func sliceShellSegmentsAfter(segs []shellSegment, skip int) []shellSegment {
 type shellSegment struct {
 	Value  string
 	Expand bool
+	// Unquoted is true when this segment was written outside quotes. Combined
+	// with Expand, that means bash applies word-splitting and pathname
+	// expansion to the result — semantics a double-quoted rebuild would lose.
+	Unquoted bool
 }
 
 // shellWord is one whitespace-delimited token from shellWords. Value is the
@@ -2463,6 +2480,17 @@ func (w shellWord) effectiveSegments() []shellSegment {
 	return []shellSegment{{Value: w.Value, Expand: w.Expand}}
 }
 
+// hasUnquotedExpand reports whether any segment carries an unescaped `$` / `
+// written outside quotes (IFS word-split / pathname expansion apply).
+func (w shellWord) hasUnquotedExpand() bool {
+	for _, seg := range w.effectiveSegments() {
+		if seg.Expand && seg.Unquoted {
+			return true
+		}
+	}
+	return false
+}
+
 // shellWords splits a shell-style command line into argument values, applying
 // a POSIX-ish subset of quote and backslash rules (single quotes, double
 // quotes, and backslash escapes outside single quotes). Enough for the
@@ -2470,10 +2498,11 @@ func (w shellWord) effectiveSegments() []shellSegment {
 //
 // Returns an error when a quote remains open at end-of-input (unterminated
 // syntax), when unquoted parentheses appear (bash rejects unmatched ones; we
-// do not parse subshells/groups), when unquoted glob/brace/tilde metacharacters
-// appear (we cannot rebuild without losing expansion), or when ANSI-C / locale
-// quoting ($'…' / $"…") appears (we do not implement those forms).
-// An unquoted `#` at a word boundary ends tokenization (shell comment).
+// do not parse subshells/groups), when unquoted glob / expanding-brace / leading
+// tilde metacharacters appear (we cannot rebuild without losing expansion), or
+// when ANSI-C / locale quoting ($'…' / $"…") appears (we do not implement those
+// forms). Mid-word `~` and non-expanding brace forms (`{foo}`) are ordinary
+// literals. An unquoted `#` at a word boundary ends tokenization (shell comment).
 // Backslash-newline line continuations (quoted or unquoted) drop both chars and
 // do not start a word (so a following `#` stays a comment).
 // Escaped `$` / “ ` “ inside an open `${…}` declines reshape (segment splits
@@ -2492,16 +2521,19 @@ func shellWords(s string) ([]shellWord, error) {
 	// segExpand is true once an unescaped $ or ` is written in this segment's
 	// expansion-eligible context (unquoted / double-quoted).
 	segExpand := false
+	// segUnquoted is true when the current segment was written outside quotes.
+	segUnquoted := false
 	// paramDepth tracks nested ${…} in expansion-eligible contexts so that
 	// escaped \$ / \` inside a still-open parameter expansion can decline reshape.
 	paramDepth := 0
 
 	flushSeg := func() {
 		if segStarted {
-			segs = append(segs, shellSegment{Value: segCur.String(), Expand: segExpand})
+			segs = append(segs, shellSegment{Value: segCur.String(), Expand: segExpand, Unquoted: segUnquoted})
 			segCur.Reset()
 			segStarted = false
 			segExpand = false
+			segUnquoted = false
 		}
 	}
 	flushWord := func() {
@@ -2526,10 +2558,14 @@ func shellWords(s string) ([]shellWord, error) {
 		wordStarted = false
 	}
 	writeSeg := func(c byte, expandable bool) {
+		unquotedCtx := !inSingle && !inDouble
 		// Starting an expansion after literal content: split so a later
 		// Expand=true rebuild cannot re-activate earlier escaped $ / `.
 		if expandable && segStarted && !segExpand {
 			flushSeg()
+		}
+		if !segStarted {
+			segUnquoted = unquotedCtx
 		}
 		segCur.WriteByte(c)
 		segStarted = true
@@ -2685,14 +2721,29 @@ func shellWords(s string) ([]shellWord, error) {
 			// unmatched (bash syntax error) or full shell syntax we would
 			// mis-reshape — leave the original payload alone.
 			return nil, fmt.Errorf("unsupported unquoted shell metacharacter %q", c)
-		case '*', '?', '[', ']', '{', '}', '~':
-			// Unquoted glob / brace / tilde expansion runs before agy sees the
-			// argv. Rebuilding with quoteAntigravityShellArg would single-quote
-			// these characters and lose that semantics (e.g. file{1,2} →
-			// 'file{1,2}'). Quoted forms stay literal and are handled above.
-			// Closing `}` of ${…} only appears here when unquoted outside a
-			// double-quoted region — still unsupported as brace expansion.
+		case '*', '?', '[', ']':
+			// Unquoted glob patterns expand before agy sees the argv.
+			// Rebuilding would single-quote them and freeze the pattern.
 			return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+		case '~':
+			// Tilde expansion only applies at the start of a word (`~/x`,
+			// `~user`). Mid-word `foo~bar` is ordinary literal data.
+			if !wordStarted {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
+		case '{':
+			// Brace expansion (`file{1,2}`, `{a,b}`, `{1..3}`) runs before
+			// agy sees argv — decline reshape. Non-expanding forms like
+			// `{foo}` (no comma / `..`) are ordinary literals.
+			if looksLikeUnquotedBraceExpansion(s, i) {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
+		case '}':
+			// Closing brace alone is literal; expanding forms are rejected
+			// when the opening `{` is seen.
+			writeSeg(c, false)
 		default:
 			// ANSI-C ($'…') / locale ($"…") quoting: not implemented. A bare
 			// unquoted $ followed by a quote (possibly after deleted line
@@ -2735,6 +2786,34 @@ func nextAfterLineContinuations(s string, i int) int {
 		i += 2
 	}
 	return i
+}
+
+// looksLikeUnquotedBraceExpansion reports whether s[openIdx] (must be '{')
+// starts a bash brace-expansion pattern in the current unquoted word: a
+// matching `}` whose interior contains `,` or `..`. Nested braces are tracked
+// at depth; whitespace / quotes end the scan (word / quote boundary). Non-
+// expanding forms like `{foo}` return false so they can be treated as literal.
+func looksLikeUnquotedBraceExpansion(s string, openIdx int) bool {
+	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != '{' {
+		return false
+	}
+	depth := 0
+	for j := openIdx; j < len(s); j++ {
+		c := s[j]
+		switch c {
+		case ' ', '\t', '\n', '\r', '\'', '"':
+			return false
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				inner := s[openIdx+1 : j]
+				return strings.Contains(inner, ",") || strings.Contains(inner, "..")
+			}
+		}
+	}
+	return false
 }
 
 // shellArgMeta is the set of characters that force quoting when serializing a

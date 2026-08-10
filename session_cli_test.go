@@ -753,13 +753,14 @@ func TestShapePTYExecArgs_RejectsUnmatchedShellGrouping(t *testing.T) {
 	}
 }
 
-// Unquoted glob / brace / tilde expansion cannot be reshaped without losing
-// bash semantics (rebuild would single-quote and freeze the metacharacters).
-// Leave the original payload alone. Quoted forms still reshape as literals.
+// Unquoted glob / expanding-brace / leading-tilde expansion cannot be reshaped
+// without losing bash semantics (rebuild would single-quote and freeze the
+// metacharacters). Leave the original payload alone. Quoted forms, mid-word
+// tilde, and non-expanding braces still reshape as literals.
 func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	for _, orig := range []string{
 		`agy file{1,2}`,
-		`agy review {foo}`,
+		`agy review {a,b}`,
 		`agy review *.go`,
 		`agy review ~/proj`,
 		`agy review file[ab]`,
@@ -775,6 +776,45 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	wantQ := `agy --dangerously-skip-permissions --print 'file{1,2}'`
 	if qArgs[1] != wantQ {
 		t.Errorf("quoted brace prompt = %q, want %q", qArgs[1], wantQ)
+	}
+
+	// Non-expanding brace form `{foo}` is ordinary literal data.
+	_, litBrace := shapePTYExecArgs("bash", []string{"-c", `agy review {foo}`})
+	wantLitBrace := `agy --dangerously-skip-permissions --print 'review {foo}'`
+	if litBrace[1] != wantLitBrace {
+		t.Errorf("literal brace prompt = %q, want %q", litBrace[1], wantLitBrace)
+	}
+
+	// Mid-word tilde does not tilde-expand — reshape as a literal prompt.
+	_, midTilde := shapePTYExecArgs("bash", []string{"-c", `agy review foo~bar`})
+	wantMidTilde := `agy --dangerously-skip-permissions --print 'review foo~bar'`
+	if midTilde[1] != wantMidTilde {
+		t.Errorf("mid-word tilde prompt = %q, want %q", midTilde[1], wantMidTilde)
+	}
+}
+
+// Multi-fragment prompts with unquoted expansions must not be joined into one
+// double-quoted --print value (word-split / empty-expand semantics change).
+// Double-quoted expansions across fragments still reshape.
+func TestShapePTYExecArgs_RejectsUnquotedMultiFragmentExpand(t *testing.T) {
+	orig := `agy $OPTIONAL task`
+	_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+	if args[1] != orig {
+		t.Errorf("unquoted multi-frag expand was reshaped: got %q, want original %q", args[1], orig)
+	}
+
+	// Single-word unquoted expand still reshapes (double-quoted rebuild).
+	_, single := shapePTYExecArgs("bash", []string{"-c", `agy $OPTIONAL`})
+	wantSingle := `agy --dangerously-skip-permissions --print "$OPTIONAL"`
+	if single[1] != wantSingle {
+		t.Errorf("single unquoted expand = %q, want %q", single[1], wantSingle)
+	}
+
+	// Double-quoted multi-frag expand may still join into one --print value.
+	_, dq := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK" more`})
+	wantDQ := `agy --dangerously-skip-permissions --print "$TASK more"`
+	if dq[1] != wantDQ {
+		t.Errorf("double-quoted multi-frag expand = %q, want %q", dq[1], wantDQ)
 	}
 }
 
@@ -924,8 +964,12 @@ func TestShellWords(t *testing.T) {
 		{`agy review)`, nil, nil, true},
 		{`agy review(`, nil, nil, true},
 		{`agy file{1,2}`, nil, nil, true},
+		{`agy review {a,b}`, nil, nil, true},
 		{`agy review *.go`, nil, nil, true},
 		{`agy review ~/proj`, nil, nil, true},
+		{`agy review {foo}`, []string{"agy", "review", "{foo}"}, []bool{false, false, false}, false},
+		{`agy review foo~bar`, []string{"agy", "review", "foo~bar"}, []bool{false, false, false}, false},
+		{`agy $OPTIONAL task`, []string{"agy", "$OPTIONAL", "task"}, []bool{false, true, false}, false},
 		{`agy "${TASK:-\$(x)}"`, nil, nil, true},
 		{`agy $'(x)'`, nil, nil, true},
 		{`agy $"x"`, nil, nil, true},
