@@ -2556,16 +2556,41 @@ func (w shellWord) hasQuotedMultiWordExpand() bool {
 	return false
 }
 
-// hasExpandWithBackslash reports expandable segments whose value still contains
-// a backslash (e.g. "${x%\}}" pattern escapes). quoteAntigravityShellArg with
-// allowExpand doubles every `\` for double-quote safety, which changes
-// parameter-expansion grammar (`${x%\}}` → `${x%\\}}`). Decline reshape rather
-// than rewrite expansion syntax; pure-literal segments with `\` are fine.
+// hasExpandWithBackslash reports expandable segments that contain a backslash
+// inside parameter-expansion grammar (e.g. "${x%\}}" pattern escapes).
+// quoteAntigravityShellArg with allowExpand doubles every `\` for double-quote
+// safety, which changes PE meaning (`${x%\}}` → `${x%\\}}`). Decline reshape
+// rather than rewrite expansion syntax.
+//
+// Literal backslashes outside `${…}` (e.g. "$ROOT\docs") are safe: doubling
+// `\` in double quotes still yields one literal backslash for non-special
+// followers, so those prompts still reshape.
 func (w shellWord) hasExpandWithBackslash() bool {
 	for _, seg := range w.effectiveSegments() {
-		if seg.Expand && strings.Contains(seg.Value, `\`) {
+		if seg.Expand && shellExpandHasParamBackslash(seg.Value) {
 			return true
 		}
+	}
+	return false
+}
+
+// shellExpandHasParamBackslash reports whether s contains a `\` inside any
+// balanced `${…}` body (the only backslash forms that PE grammar cares about
+// when we re-double-quote).
+func shellExpandHasParamBackslash(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '$' || i+1 >= len(s) || s[i+1] != '{' {
+			continue
+		}
+		close := shellParamCloseBrace(s, i+2)
+		if close < 0 {
+			// Unmatched `${` — any trailing `\` is still PE-body material.
+			return strings.Contains(s[i+2:], `\`)
+		}
+		if strings.Contains(s[i+2:close], `\`) {
+			return true
+		}
+		i = close
 	}
 	return false
 }
@@ -2642,6 +2667,10 @@ func shellParamCloseBrace(s string, bodyStart int) int {
 // multi-field expansion: @ with optional operators, name[@] / !name[@],
 // prefix-name expansion ${!prefix@}, or a nested multi-field form in an
 // operator value (${x:+$@}, ${x:-${a[@]}}, …).
+//
+// Literal text in operator words that merely contains the substring "[@]"
+// (e.g. ${x:-foo[@]}) is NOT multi-field — only a structural array subscript
+// on the parameter (or nested ${…[@]…} / $@ in the operand) is.
 func shellParamBodyIsMultiWord(body string) bool {
 	if body == "" {
 		return false
@@ -2660,21 +2689,57 @@ func shellParamBodyIsMultiWord(body string) bool {
 		// ${@}, ${@:1}, ${@#pat}, …
 		return true
 	}
-	// Array all-elements subscript: name[@], name[@]:offset, !name[@], …
-	if strings.Contains(body, "[@]") {
-		return true
+
+	// Parse the parameter name / special, then optional [subscript].
+	i := 0
+	switch {
+	case body[0] >= '0' && body[0] <= '9':
+		for i < len(body) && body[i] >= '0' && body[i] <= '9' {
+			i++
+		}
+	case (body[0] >= 'a' && body[0] <= 'z') || (body[0] >= 'A' && body[0] <= 'Z') || body[0] == '_':
+		for i < len(body) && (isShellNameByte(body[i])) {
+			i++
+		}
+	case body[0] == '*':
+		// ${*} / ${*:…} — single field when double-quoted.
+		i = 1
+	default:
+		// Other specials (# ? $ ! - _) or unparseable: only nested $ expansions
+		// in the remainder can be multi-field.
+		return shellExpandIsMultiWord(body)
 	}
-	// Prefix-name expansion ${!prefix@} (quoted) yields multiple matching
-	// names. After stripping '!', body is "prefix@" — not the array form
-	// name[@] (handled above) and not bare indirect ${!name} (no '@').
-	if hadBang {
-		if at := strings.IndexByte(body, '@'); at > 0 && body[at-1] != '[' {
-			return true
+
+	if i < len(body) && body[i] == '[' {
+		// Find matching ']' (subscripts are rarely nested; scan for first ]).
+		if close := strings.IndexByte(body[i+1:], ']'); close >= 0 {
+			sub := body[i+1 : i+1+close]
+			if sub == "@" {
+				// name[@], name[@]:offset, !name[@], …
+				return true
+			}
+			i = i + 1 + close + 1
 		}
 	}
-	// Nested multi-field expansions inside operator values, e.g. ${x:+$@}
-	// or ${var:-${arr[@]}}. shellExpandIsMultiWord scans for $@ / ${…[@]…}.
-	return shellExpandIsMultiWord(body)
+
+	// Prefix-name expansion ${!prefix@} (quoted) yields multiple matching
+	// names. After stripping '!' and parsing name, a bare trailing '@' (not
+	// inside [...]) is the prefix form — not bare indirect ${!name}.
+	if hadBang && i < len(body) && body[i] == '@' {
+		return true
+	}
+
+	// Operator / remainder text: recurse only for nested $ expansions so
+	// literal operator defaults like foo[@] stay single-field.
+	if i < len(body) {
+		return shellExpandIsMultiWord(body[i:])
+	}
+	return false
+}
+
+// isShellNameByte reports a valid character inside a bash variable name.
+func isShellNameByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
 }
 
 // shellWords splits a shell-style command line into argument values, applying

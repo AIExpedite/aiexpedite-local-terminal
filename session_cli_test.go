@@ -1039,6 +1039,14 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		}
 	}
 
+	// Literal "[@]" in an operator default is not multi-field — Bash yields a
+	// single field (e.g. foo[@] when x is unset). Still reshape with --print.
+	_, litAt := shapePTYExecArgs("bash", []string{"-c", `agy "${x:-foo[@]}"`})
+	wantLitAt := `agy --dangerously-skip-permissions --print "${x:-foo[@]}"`
+	if litAt[1] != wantLitAt {
+		t.Errorf("literal [@] in PE default = %q, want %q", litAt[1], wantLitAt)
+	}
+
 	// zsh EQUALS: unquoted =cmd expands to the command path. Joining into a
 	// single-quoted --print freezes it — leave unshaped on zsh only.
 	origZsh := `agy =ls review`
@@ -1122,6 +1130,14 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		if args[1] != orig {
 			t.Errorf("PE backslash pattern was reshaped: got %q, want original %q", args[1], orig)
 		}
+	}
+
+	// Literal backslash after a simple expansion (`"$ROOT\docs"`) is safe to
+	// re-double-quote — do not treat it like PE pattern escapes.
+	_, rootDocs := shapePTYExecArgs("bash", []string{"-c", `agy "$ROOT\docs"`})
+	wantRootDocs := `agy --dangerously-skip-permissions --print "$ROOT\\docs"`
+	if rootDocs[1] != wantRootDocs {
+		t.Errorf("expand + literal backslash = %q, want %q", rootDocs[1], wantRootDocs)
 	}
 
 	// Legacy bash arithmetic `$[…]` still expands inside double quotes — keep
