@@ -562,7 +562,8 @@ func TestShapePTYExecArgs_ShapesShellWrappedAntigravity(t *testing.T) {
 		t.Fatalf("shapePTYExecArgs reshaped shell wrapper: cmd=%q args=%v", cmd, args)
 	}
 	// Unknown leading tokens after agy become the --print value (quoted: space).
-	want := `agy --dangerously-skip-permissions --print "--brief x"`
+	// No unescaped $ / ` → literal rebuild prefers single quotes.
+	want := `agy --dangerously-skip-permissions --print '--brief x'`
 	if args[1] != want {
 		t.Errorf("shell-wrapped payload = %q, want %q", args[1], want)
 	}
@@ -577,7 +578,7 @@ func TestShapePTYExecArgs_ShapesShellWrappedAntigravity(t *testing.T) {
 	// The `antigravity` alias inside a shell wrapper is shaped identically.
 	// Multi-word prompt is quoted so bash -c re-parse keeps it as one --print value.
 	_, aliasArgs := shapePTYExecArgs("bash", []string{"-c", "antigravity do it"})
-	wantAlias := `antigravity --dangerously-skip-permissions --print "do it"`
+	wantAlias := `antigravity --dangerously-skip-permissions --print 'do it'`
 	if aliasArgs[1] != wantAlias {
 		t.Errorf("shell-wrapped antigravity = %q, want %q", aliasArgs[1], wantAlias)
 	}
@@ -587,16 +588,16 @@ func TestShapePTYExecArgs_ShapesShellWrappedAntigravity(t *testing.T) {
 // does not receive literal quote or backslash characters that bash would strip.
 func TestShapePTYExecArgs_ShellWrappedPreservesQuoteSemantics(t *testing.T) {
 	// bash -c 'agy "fix the bug"' → prompt value is fix the bug (no quote chars).
-	// Double-quoted origin → expand-eligible rebuild uses double quotes.
+	// No unescaped $ / ` → literal rebuild prefers single quotes.
 	_, args := shapePTYExecArgs("bash", []string{"-c", `agy "fix the bug"`})
-	wantMulti := `agy --dangerously-skip-permissions --print "fix the bug"`
+	wantMulti := `agy --dangerously-skip-permissions --print 'fix the bug'`
 	if args[1] != wantMulti {
 		t.Errorf("double-quoted prompt = %q, want %q", args[1], wantMulti)
 	}
 
 	// bash -c 'agy fix\ bug' → backslash escape yields "fix bug" (one space word).
 	_, escArgs := shapePTYExecArgs("bash", []string{"-c", `agy fix\ bug`})
-	wantEsc := `agy --dangerously-skip-permissions --print "fix bug"`
+	wantEsc := `agy --dangerously-skip-permissions --print 'fix bug'`
 	if escArgs[1] != wantEsc {
 		t.Errorf("backslash-escaped prompt = %q, want %q", escArgs[1], wantEsc)
 	}
@@ -642,6 +643,41 @@ func TestShapePTYExecArgs_PreservesParameterExpansion(t *testing.T) {
 	}
 }
 
+// Escaped command substitutions must stay inert on rebuild:
+// agy "\$(touch /tmp/pwn)" must NOT become --print "$(touch /tmp/pwn)".
+func TestShapePTYExecArgs_KeepsEscapedCommandSubstitutionLiteral(t *testing.T) {
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy "\$(touch /tmp/pwn)"`})
+	want := `agy --dangerously-skip-permissions --print '$(touch /tmp/pwn)'`
+	if args[1] != want {
+		t.Errorf("escaped substitution = %q, want %q", args[1], want)
+	}
+
+	// Unquoted escaped form without spaces (space would split shell words).
+	_, uArgs := shapePTYExecArgs("bash", []string{"-c", `agy \$\(cmd\)`})
+	wantU := `agy --dangerously-skip-permissions --print '$(cmd)'`
+	if uArgs[1] != wantU {
+		t.Errorf("unquoted escaped substitution = %q, want %q", uArgs[1], wantU)
+	}
+}
+
+// Mixed expand fragments must not OR Expand into one double-quoted blob:
+// agy prefix '$(touch /tmp/pwn)' must keep the single-quoted substitution inert.
+func TestShapePTYExecArgs_PreservesPerFragmentExpansion(t *testing.T) {
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy prefix '$(touch /tmp/pwn)'`})
+	// No expanding fragment → join then single-quote the whole prompt.
+	want := `agy --dangerously-skip-permissions --print 'prefix $(touch /tmp/pwn)'`
+	if args[1] != want {
+		t.Errorf("mixed literal prompt = %q, want %q", args[1], want)
+	}
+
+	// Expanding + literal-with-$ uses adjacent quote concatenation.
+	_, mixArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK" '$(touch /tmp/pwn)'`})
+	wantMix := `agy --dangerously-skip-permissions --print "$TASK"" "'$(touch /tmp/pwn)'`
+	if mixArgs[1] != wantMix {
+		t.Errorf("mixed expand/literal = %q, want %q", mixArgs[1], wantMix)
+	}
+}
+
 // Unterminated quotes must NOT be repaired into a runnable permission-skipping
 // agy command — leave the original payload so bash reports the syntax error.
 func TestShapePTYExecArgs_RejectsUnterminatedShellQuotes(t *testing.T) {
@@ -674,15 +710,17 @@ func TestShellWords(t *testing.T) {
 		wantExpand []bool
 		wantErr    bool
 	}{
-		{`agy fix the bug`, []string{"agy", "fix", "the", "bug"}, []bool{true, true, true, true}, false},
-		{`agy "fix the bug"`, []string{"agy", "fix the bug"}, []bool{true, true}, false},
-		{`agy 'fix the bug'`, []string{"agy", "fix the bug"}, []bool{true, false}, false},
-		{`agy fix\ bug`, []string{"agy", "fix bug"}, []bool{true, true}, false},
-		{`agy --add-dir "../shared library" do it`, []string{"agy", "--add-dir", "../shared library", "do", "it"}, []bool{true, true, true, true, true}, false},
-		{`agy "$TASK"`, []string{"agy", "$TASK"}, []bool{true, true}, false},
-		{`agy '$TASK'`, []string{"agy", "$TASK"}, []bool{true, false}, false},
-		{`agy ""`, []string{"agy", ""}, []bool{true, true}, false},
-		{`  agy   `, []string{"agy"}, []bool{true}, false},
+		// Expand is true only when a word carries unescaped $ or ` .
+		{`agy fix the bug`, []string{"agy", "fix", "the", "bug"}, []bool{false, false, false, false}, false},
+		{`agy "fix the bug"`, []string{"agy", "fix the bug"}, []bool{false, false}, false},
+		{`agy 'fix the bug'`, []string{"agy", "fix the bug"}, []bool{false, false}, false},
+		{`agy fix\ bug`, []string{"agy", "fix bug"}, []bool{false, false}, false},
+		{`agy --add-dir "../shared library" do it`, []string{"agy", "--add-dir", "../shared library", "do", "it"}, []bool{false, false, false, false, false}, false},
+		{`agy "$TASK"`, []string{"agy", "$TASK"}, []bool{false, true}, false},
+		{`agy '$TASK'`, []string{"agy", "$TASK"}, []bool{false, false}, false},
+		{`agy "\$(touch /tmp/pwn)"`, []string{"agy", "$(touch /tmp/pwn)"}, []bool{false, false}, false},
+		{`agy ""`, []string{"agy", ""}, []bool{false, false}, false},
+		{`  agy   `, []string{"agy"}, []bool{false}, false},
 		{``, nil, nil, false},
 		{`agy 'review`, nil, nil, true},
 		{`agy "fix`, nil, nil, true},
@@ -741,7 +779,7 @@ func TestShapeShellWrappedPTYArgs_SessionStartPath(t *testing.T) {
 	cliArgs, _ := buildInteractiveCLIArgs("bash", []string{"-c", "agy --brief x"}, false)
 	ptyArgs := shapeShellWrappedPTYArgs("bash", cliArgs)
 	// agy ≥ 1.1.x: --dangerously-skip-permissions --print <value>
-	want := `agy --dangerously-skip-permissions --print "--brief x"`
+	want := `agy --dangerously-skip-permissions --print '--brief x'`
 	if len(ptyArgs) != 2 || ptyArgs[0] != "-c" || ptyArgs[1] != want {
 		t.Errorf("session_start shell-wrapped agy = %v, want -c %q", ptyArgs, want)
 	}

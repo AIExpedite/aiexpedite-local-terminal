@@ -2196,9 +2196,10 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 // rather than inventing a valid permission-skipping invocation).
 //
 // Tokenization strips protective quotes/escapes and tracks whether each word
-// came from an expansion-eligible context (unquoted / double-quoted) so the
-// rebuild can preserve `$VAR` expansion for `agy "$TASK"` while keeping
-// single-quoted material literal.
+// contains unescaped `$` / `` ` `` (bash would expand them). Rebuild preserves
+// expansion per prompt fragment so `agy "$TASK"` still expands while
+// `agy '$(cmd)'` and `agy "\$(cmd)"` stay literal — never OR-ing expand across
+// mixed fragments into one double-quoted blob that reactivates substitutions.
 func shapeAntigravityShellPayload(payload string) (string, bool) {
 	words, err := shellWords(payload)
 	if err != nil {
@@ -2209,21 +2210,134 @@ func shapeAntigravityShellPayload(payload string) (string, bool) {
 	if len(words) == 0 || !isAntigravityCommand(words[0].Value) {
 		return "", false
 	}
-	callerVals := make([]string, 0, len(words)-1)
-	promptExpand := false
-	for _, w := range words[1:] {
-		callerVals = append(callerVals, w.Value)
-		if w.Expand {
-			promptExpand = true
-		}
+	flags, promptFrags, hasPrompt := partitionAntigravityCallerShellWords(words[1:])
+	parts := make([]string, 0, 2+len(flags)+2)
+	parts = append(parts, words[0].Value, "--dangerously-skip-permissions")
+	for _, f := range flags {
+		// Flag tokens keep their own expand bit (e.g. --add-dir "$DIR").
+		parts = append(parts, quoteAntigravityShellArg(f.Value, f.Expand))
 	}
-	shapedArgs := buildAntigravityInteractiveArgs(callerVals)
-	return joinAntigravityShellCommand(words[0].Value, shapedArgs, promptExpand), true
+	if hasPrompt {
+		parts = append(parts, "--print", quoteAntigravityPrintFragments(promptFrags))
+	}
+	return strings.Join(parts, " "), true
 }
 
-// shellWord is one token from shellWords. Expand is true when any unquoted or
-// double-quoted content contributed to the value (bash would expand $/` there).
-// Single-quoted-only material sets Expand=false so rebuild can keep it literal.
+// partitionAntigravityCallerShellWords peels known leading agy flags off words
+// and returns the remaining prompt fragments (preserving per-word Expand).
+// Mirrors partitionAntigravityCallerArgs on []string.
+func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord, prompt []shellWord, hasPrompt bool) {
+	i := 0
+	for i < len(words) {
+		a := words[i].Value
+		lower := strings.ToLower(a)
+
+		if name, val, ok := splitAntigravityEqualsFlag(lower, a); ok {
+			if isAntigravityPrintFlag(name) {
+				// --print=value: value inherits Expand of the equals token;
+				// following words are also prompt material.
+				prompt = append(prompt, shellWord{Value: val, Expand: words[i].Expand})
+				prompt = append(prompt, words[i+1:]...)
+				return flags, prompt, true
+			}
+			if name == "--dangerously-skip-permissions" || name == "--continue" {
+				i++
+				continue
+			}
+			if antigravityValuedFlags[name] || antigravityBoolFlags[name] {
+				flags = append(flags, words[i])
+				i++
+				continue
+			}
+			break
+		}
+
+		if isAntigravityPrintFlag(lower) {
+			i++
+			if i < len(words) {
+				return flags, words[i:], true
+			}
+			// Bare --print with no value → explicit empty print.
+			return flags, []shellWord{{Value: "", Expand: false}}, true
+		}
+
+		if antigravityBoolFlags[lower] {
+			if lower == "--dangerously-skip-permissions" || lower == "--continue" || lower == "-c" {
+				i++
+				continue
+			}
+			flags = append(flags, words[i])
+			i++
+			continue
+		}
+
+		if antigravityValuedFlags[lower] {
+			flags = append(flags, words[i])
+			i++
+			if i < len(words) {
+				flags = append(flags, words[i])
+				i++
+			}
+			continue
+		}
+
+		break
+	}
+	if i < len(words) {
+		return flags, words[i:], true
+	}
+	return flags, nil, false
+}
+
+// quoteAntigravityPrintFragments serializes one or more prompt tokens into a
+// single bash -c argument for --print. Expansion eligibility is retained per
+// fragment: mixed `"$TASK" '$(evil)'` rebuilds as adjacent quoted pieces so the
+// single-quoted substitution stays inert instead of OR-ing Expand and
+// double-quoting the joined string.
+func quoteAntigravityPrintFragments(frags []shellWord) string {
+	if len(frags) == 0 {
+		return `""`
+	}
+	if len(frags) == 1 {
+		return quoteAntigravityShellArg(frags[0].Value, frags[0].Expand)
+	}
+
+	anyExpand := false
+	mixedLiteralExpand := false
+	vals := make([]string, len(frags))
+	for i, f := range frags {
+		vals[i] = f.Value
+		if f.Expand {
+			anyExpand = true
+		} else if strings.ContainsAny(f.Value, "$`") {
+			// Literal fragment still carries $ / ` (single-quoted or escaped
+			// origin) — cannot double-quote a joined blob with expanding peers.
+			mixedLiteralExpand = true
+		}
+	}
+	// All-literal (including single-quoted $(...) fragments): join + single-quote.
+	// Pure expanding (or plain text with expand peers): join + one quote pass.
+	if !anyExpand || !mixedLiteralExpand {
+		return quoteAntigravityShellArg(strings.Join(vals, " "), anyExpand)
+	}
+
+	// Mixed expanding + literal-with-$/` : per-fragment adjacent concatenation.
+	// Space between tokens is a separate double-quoted " " so bash re-joins
+	// into one argv word without reactivating the literal fragment's $(...).
+	var b strings.Builder
+	for i, f := range frags {
+		if i > 0 {
+			b.WriteString(`" "`)
+		}
+		b.WriteString(quoteAntigravityShellArg(f.Value, f.Expand))
+	}
+	return b.String()
+}
+
+// shellWord is one token from shellWords. Expand is true when the value
+// contains unescaped `$` or `` ` `` from an unquoted or double-quoted context
+// (bash would expand them). Escaped forms (`\$`, `\``) and single-quoted
+// material set Expand=false so rebuild keeps them literal.
 type shellWord struct {
 	Value  string
 	Expand bool
@@ -2242,7 +2356,8 @@ func shellWords(s string) ([]shellWord, error) {
 	inSingle, inDouble := false, false
 	escaped := false
 	started := false
-	// expandWord is sticky true once any expansion-eligible char is written.
+	// expandWord is sticky true once an unescaped $ or ` is written in an
+	// expansion-eligible context (unquoted / double-quoted).
 	expandWord := false
 	flush := func() {
 		if started {
@@ -2255,12 +2370,11 @@ func shellWords(s string) ([]shellWord, error) {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if escaped {
+			// Backslash-escaped content is literal — including \$ and \`.
+			// Do NOT set expandWord: rebuild must keep these inert.
 			cur.WriteByte(c)
-			// Backslash-escaped content outside single quotes is literal, but
-			// the surrounding context is still expansion-eligible for other chars.
 			escaped = false
 			started = true
-			expandWord = true
 			continue
 		}
 		if inSingle {
@@ -2279,45 +2393,45 @@ func shellWords(s string) ([]shellWord, error) {
 				next := s[i+1]
 				// bash double-quote escapes: \, ", $, `, newline — remove the
 				// backslash and keep the next char as literal (so \$ → $).
+				// Escaped $ / ` must NOT mark Expand (would re-activate on rebuild).
 				if next == '\\' || next == '"' || next == '$' || next == '`' || next == '\n' {
 					i++
 					cur.WriteByte(next)
 					started = true
-					expandWord = true
 					continue
 				}
 			}
 			if c == '"' {
 				inDouble = false
 				started = true
-				expandWord = true // "" is expansion-eligible empty
 				continue
 			}
-			// Double-quoted: keep $ / ` so rebuild can re-expand.
+			// Double-quoted: unescaped $ / ` are expandable; other chars literal.
 			cur.WriteByte(c)
 			started = true
-			expandWord = true
+			if c == '$' || c == '`' {
+				expandWord = true
+			}
 			continue
 		}
 		switch c {
 		case '\\':
 			escaped = true
 			started = true
-			expandWord = true
 		case '\'':
 			inSingle = true
 			started = true
-			// expandWord unchanged — pure single-quoted stays non-expanding
 		case '"':
 			inDouble = true
 			started = true
-			expandWord = true
 		case ' ', '\t', '\n', '\r':
 			flush()
 		default:
 			cur.WriteByte(c)
 			started = true
-			expandWord = true // unquoted
+			if c == '$' || c == '`' {
+				expandWord = true
+			}
 		}
 	}
 	if inSingle || inDouble {
@@ -2327,27 +2441,9 @@ func shellWords(s string) ([]shellWord, error) {
 		// Trailing backslash is kept as a literal.
 		cur.WriteByte('\\')
 		started = true
-		expandWord = true
 	}
 	flush()
 	return words, nil
-}
-
-// joinAntigravityShellCommand serializes cmd+args into a bash -c payload.
-// printExpand controls quoting of the --print value: true preserves $VAR /
-// `cmd` expansion (double-quote without escaping $ `); false keeps the value
-// literal (prefer single quotes).
-func joinAntigravityShellCommand(cmd string, args []string, printExpand bool) string {
-	parts := make([]string, 0, 1+len(args))
-	parts = append(parts, cmd)
-	for i, a := range args {
-		allowExpand := false
-		if i > 0 && args[i-1] == "--print" {
-			allowExpand = printExpand
-		}
-		parts = append(parts, quoteAntigravityShellArg(a, allowExpand))
-	}
-	return strings.Join(parts, " ")
 }
 
 // shellArgMeta is the set of characters that force quoting when serializing a
