@@ -2824,9 +2824,18 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 	segExpand := false
 	// segUnquoted is true when the current segment was written outside quotes.
 	segUnquoted := false
-	// paramDepth tracks nested ${…} in expansion-eligible contexts so that
-	// escaped \$ / \` inside a still-open parameter expansion can decline reshape.
+	// paramDepth counts braces inside ${…} the same way as shellParamCloseBrace:
+	// +1 on the `{` that opens a PE (after expandable `$`) and on every later
+	// `{` while still inside that PE; -1 on each `}`. Nested literal braces in
+	// a default (`${x:-{…}}`) and nested `${…}` therefore keep depth > 0 until
+	// the real close — so `"${x:-{}"foo"}"` still looks like open PE when the
+	// inner quote is seen (decline reshape) instead of treating `}` after `{`
+	// as the PE closer and mis-closing the outer double quotes.
+	// Escaped \$ / \` inside a still-open PE also declines reshape.
 	paramDepth := 0
+	// pendingParamBrace is set after an expandable `$` whose next significant
+	// byte is `{`. The following `{` opens (or nests) a PE brace region.
+	pendingParamBrace := false
 	// sawUnquotedAssign is true once this word has written an unquoted '='
 	// that follows a valid unquoted assignment name (HOME=…, not 1foo=… or
 	// 'HOME'=…). Bash only tilde-expands after ':' inside such words, so a
@@ -2961,16 +2970,24 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		flushSeg()
 		return true
 	}
-	// noteParamOpen tracks ${…} depth after writing an expandable '$' so that
-	// a following '{' opens a parameter-expansion region.
-	noteParamOpen := func(wroteExpandableDollar bool, next byte) {
-		if wroteExpandableDollar && next == '{' {
+	// noteParamBrace runs after writing '{': open PE when pending after $, or
+	// nest when already inside PE (literal braces / nested ${…}).
+	noteParamBrace := func() {
+		if pendingParamBrace || paramDepth > 0 {
 			paramDepth++
 		}
+		pendingParamBrace = false
 	}
 	noteParamClose := func(c byte) {
 		if c == '}' && paramDepth > 0 {
 			paramDepth--
+		}
+	}
+	// markPendingParamBrace records that an expandable `$` is followed by `{`
+	// (after line continuations); the `{` itself increments paramDepth.
+	markPendingParamBrace := func(next byte) {
+		if next == '{' {
+			pendingParamBrace = true
 		}
 	}
 
@@ -3057,16 +3074,20 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			}
 			// Double-quoted: unescaped $ / ` are expandable only when bash would
 			// actually expand them; a lone trailing `$` (`cost$`, `"$"`) is
-			// literal. Brace/glob/tilde do not expand inside double quotes.
+			// literal. Brace/glob/tilde do not expand inside double quotes, but
+			// `{`/`}` still nest paramDepth inside an open ${…}.
 			if c == '$' {
 				j := nextAfterLineContinuations(s, i+1)
 				expandable := j < len(s) && shellDollarStartsExpand(s[j])
 				writeSeg(c, expandable)
 				if expandable {
-					noteParamOpen(true, s[j])
+					markPendingParamBrace(s[j])
 				}
 			} else {
 				writeSeg(c, c == '`')
+				if c == '{' {
+					noteParamBrace()
+				}
 			}
 			noteParamClose(c)
 			continue
@@ -3137,10 +3158,13 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// agy sees argv on bash/zsh/ksh — decline reshape. Dash/sh leave
 			// braces literal (opts.braceExpand false). Non-expanding forms
 			// like `{foo}` (no comma / `..`) are ordinary literals.
-			if opts.braceExpand && looksLikeUnquotedBraceExpansion(s, i) {
+			// Inside ${…} (or the PE-opening `{` after `$`) this is PE syntax /
+			// PE body content — track depth and do not treat as brace-expand.
+			if !(pendingParamBrace || paramDepth > 0) && opts.braceExpand && looksLikeUnquotedBraceExpansion(s, i) {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)
+			noteParamBrace()
 		case '}':
 			// Closing brace alone is literal; expanding forms are rejected
 			// when the opening `{` is seen. Still close ${…} paramDepth so a
@@ -3170,13 +3194,11 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				expandable := j < len(s) && shellDollarStartsExpand(s[j])
 				writeSeg(c, expandable)
 				if expandable {
-					noteParamOpen(true, s[j])
+					markPendingParamBrace(s[j])
 				}
 				continue
 			}
 			writeSeg(c, c == '`')
-			// Unquoted `}` is handled above as brace expansion error, so
-			// paramDepth only closes inside double quotes (noteParamClose there).
 		}
 	}
 	if inSingle || inDouble {

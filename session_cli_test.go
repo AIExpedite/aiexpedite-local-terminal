@@ -1081,6 +1081,28 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		}
 	}
 
+	// Literal braces inside ${…} must balance before PE close. Bash treats
+	// `"${x:-{}"foo"}"` as one word (`{foo}` when x is empty); closing PE at
+	// the first `}` would exit double-quote mode at the inner `"` and rebuild
+	// a broken command — leave unshaped (same as nested PE quotes).
+	for _, orig := range []string{
+		`agy "${x:-{}"foo"}"`,
+		`agy "${x:-{}"bar"}"`,
+		`agy "${x:-{}""}"`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("PE literal-brace + nested quote was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+
+	// Balanced literal braces without nested quotes still reshape.
+	_, peBrace := shapePTYExecArgs("bash", []string{"-c", `agy "${x:-{}y}"`})
+	wantPEBrace := `agy --dangerously-skip-permissions --print "${x:-{}y}"`
+	if peBrace[1] != wantPEBrace {
+		t.Errorf("PE balanced literal braces = %q, want %q", peBrace[1], wantPEBrace)
+	}
+
 	// Plain double-quoted PE without nested quotes still reshapes.
 	_, pe := shapePTYExecArgs("bash", []string{"-c", `agy "${x:-foo}"`})
 	wantPE := `agy --dangerously-skip-permissions --print "${x:-foo}"`
