@@ -2694,6 +2694,11 @@ func shellParamBodyIsMultiWord(body string) bool {
 			}
 		}
 	}
+	// Zsh ${=spec} / ${==spec} SH_WORD_SPLIT shorthand — multi-field even
+	// inside double quotes ("${=TASK}" with TASK='fix bug' → fix bug).
+	if body[0] == '=' {
+		return true
+	}
 	hadBang := false
 	// Indirect / nameref / prefix-name forms start with '!': ${!name[@]},
 	// ${!prefix@}. Strip one leading '!' then classify the remainder.
@@ -3455,26 +3460,21 @@ func looksLikeExpandingWordInitialTilde(s string, tildeIdx int) bool {
 
 // shellTildePrefixExpands reports whether an unquoted tilde-prefix body
 // (characters after '~', without a trailing path) would expand on this host.
-// Empty → HOME (`~`, `~/x`). Bash `+`/`-` specials (optional digits) expand
-// via PWD/OLDPWD/dirstack. Otherwise only when user.Lookup succeeds — unknown
-// logins stay literal in bash, so those payloads must still reshape.
+// Empty → HOME (`~`, `~/x`). Bare bash `~+` / `~-` expand via PWD/OLDPWD.
+// Indexed `~+N` / `~-N` only expand when that directory-stack slot exists; a
+// fresh non-interactive bash usually has no stack entries, so unknown indices
+// stay literal — we cannot query the caller's dirs here, so only bare `+`/`-`
+// (no digits) decline reshape. Otherwise only when user.Lookup succeeds —
+// unknown logins stay literal in bash, so those payloads must still reshape.
 func shellTildePrefixExpands(login string) bool {
 	if login == "" {
 		return true
 	}
-	// Bash directory-stack / PWD forms: ~+ ~- ~+N ~-N (N digits only).
-	if login[0] == '+' || login[0] == '-' {
-		rest := login[1:]
-		allDigits := true
-		for i := 0; i < len(rest); i++ {
-			if rest[i] < '0' || rest[i] > '9' {
-				allDigits = false
-				break
-			}
-		}
-		if allDigits {
-			return true
-		}
+	// Bash PWD/OLDPWD forms: ~+ and ~- only (no index). ~+N/~-N need a live
+	// directory-stack entry; without one bash leaves them literal, and we
+	// cannot see the stack from here — reshape those so --print still applies.
+	if login == "+" || login == "-" {
+		return true
 	}
 	_, err := user.Lookup(login)
 	return err == nil

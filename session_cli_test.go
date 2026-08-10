@@ -878,7 +878,7 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if noUser[1] != wantNoUser {
 		t.Errorf("unknown tilde login = %q, want %q", noUser[1], wantNoUser)
 	}
-	// Bash specials ~+ / ~- still expand — leave unshaped.
+	// Bash specials ~+ / ~- (PWD/OLDPWD) still expand — leave unshaped.
 	for _, orig := range []string{
 		`agy ~+`,
 		`agy ~-`,
@@ -888,6 +888,13 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		if args[1] != orig {
 			t.Errorf("bash tilde special was reshaped: got %q, want original %q", args[1], orig)
 		}
+	}
+	// Indexed ~+N / ~-N need a live directory-stack entry; fresh bash usually
+	// has none, so leave literal and still reshape with --print.
+	_, stackIdx := shapePTYExecArgs("bash", []string{"-c", `agy ~+1`})
+	wantStackIdx := `agy --dangerously-skip-permissions --print '~+1'`
+	if stackIdx[1] != wantStackIdx {
+		t.Errorf("tilde stack index = %q, want %q", stackIdx[1], wantStackIdx)
 	}
 
 	// Quoted braces/globs are literal — safe to reshape with single quotes.
@@ -1124,12 +1131,14 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	// zsh PE split/array flags still multi-field when double-quoted
 	// (`"${(s.:.)TASK}"` with TASK=fix:bug → fix bug). Reshape would put only
 	// the first field in --print — leave unshaped. Single-field flags ((U))
-	// still reshape.
+	// still reshape. ${=TASK} is the SH_WORD_SPLIT shorthand (same issue).
 	for _, orig := range []string{
 		`agy "${(s.:.)TASK}"`,
 		`agy "${(@)arr}"`,
 		`agy "${(f)TASK}"`,
 		`agy "${(z)TASK}"`,
+		`agy "${=TASK}"`,
+		`agy "${==TASK}"`,
 	} {
 		_, args := shapePTYExecArgs("zsh", []string{"-c", orig})
 		if args[1] != orig {
