@@ -2196,7 +2196,7 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 // rather than inventing a valid permission-skipping invocation).
 //
 // Tokenization strips protective quotes/escapes and tracks whether each word
-// contains unescaped `$` / `` ` `` (bash would expand them). Rebuild preserves
+// contains unescaped `$` / “ ` “ (bash would expand them). Rebuild preserves
 // expansion per prompt fragment so `agy "$TASK"` still expands while
 // `agy '$(cmd)'` and `agy "\$(cmd)"` stay literal — never OR-ing expand across
 // mixed fragments into one double-quoted blob that reactivates substitutions.
@@ -2335,8 +2335,8 @@ func quoteAntigravityPrintFragments(frags []shellWord) string {
 }
 
 // shellWord is one token from shellWords. Expand is true when the value
-// contains unescaped `$` or `` ` `` from an unquoted or double-quoted context
-// (bash would expand them). Escaped forms (`\$`, `\``) and single-quoted
+// contains unescaped `$` or “ ` “ from an unquoted or double-quoted context
+// (bash would expand them). Escaped forms (`\$`, `\“) and single-quoted
 // material set Expand=false so rebuild keeps them literal.
 type shellWord struct {
 	Value  string
