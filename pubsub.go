@@ -2340,7 +2340,7 @@ func quoteAntigravityPrintFragments(frags []shellWord) string {
 // each segment is quoted independently and juxtaposed so bash re-joins them
 // into one argv token without reactivating literal $(...).
 func quoteShellWord(w shellWord) string {
-	segs := w.effectiveSegments()
+	segs := mergeAdjacentShellSegments(w.effectiveSegments())
 	if len(segs) <= 1 {
 		return quoteAntigravityShellArg(w.Value, w.Expand)
 	}
@@ -2361,6 +2361,26 @@ func quoteShellWord(w shellWord) string {
 		b.WriteString(quoteAntigravityShellArg(seg.Value, seg.Expand))
 	}
 	return b.String()
+}
+
+// mergeAdjacentShellSegments joins consecutive segments that share the same
+// Expand flag so rebuild quoting stays compact (`$`+`(cmd)` → one literal).
+func mergeAdjacentShellSegments(segs []shellSegment) []shellSegment {
+	if len(segs) <= 1 {
+		return segs
+	}
+	out := make([]shellSegment, 0, len(segs))
+	cur := segs[0]
+	for i := 1; i < len(segs); i++ {
+		if segs[i].Expand == cur.Expand {
+			cur.Value += segs[i].Value
+			continue
+		}
+		out = append(out, cur)
+		cur = segs[i]
+	}
+	out = append(out, cur)
+	return out
 }
 
 // shellSegment is one quote/unquoted region within a shellWord. Concatenated
@@ -2396,9 +2416,10 @@ func (w shellWord) effectiveSegments() []shellSegment {
 // operator-joined `bash -c "agy …"` payloads we reshape — not a full shell.
 //
 // Returns an error when a quote remains open at end-of-input (unterminated
-// syntax) or when unquoted grouping metacharacters `(){}` appear (bash would
-// reject unmatched ones; we do not parse groups). Callers must not turn such
-// payloads into a valid command.
+// syntax) or when unquoted parentheses appear (bash rejects unmatched ones;
+// we do not parse subshells/groups). Unquoted braces are allowed (valid brace
+// expansion / prompt text). Callers must not turn rejected payloads into a
+// valid command.
 func shellWords(s string) ([]shellWord, error) {
 	var words []shellWord
 	var segs []shellSegment
@@ -2441,6 +2462,11 @@ func shellWords(s string) ([]shellWord, error) {
 		wordStarted = false
 	}
 	writeSeg := func(c byte, expandable bool) {
+		// Starting an expansion after literal content: split so a later
+		// Expand=true rebuild cannot re-activate earlier escaped $ / `.
+		if expandable && segStarted && !segExpand {
+			flushSeg()
+		}
 		segCur.WriteByte(c)
 		segStarted = true
 		wordStarted = true
@@ -2448,13 +2474,23 @@ func shellWords(s string) ([]shellWord, error) {
 			segExpand = true
 		}
 	}
+	// writeEscapedExpansion writes a literal $ or ` that was backslash-escaped
+	// and ends the segment so a subsequent unescaped expansion in the same
+	// quoted region cannot OR Expand over it (e.g. "\$(cmd)$TASK").
+	writeEscapedExpansion := func(c byte) {
+		writeSeg(c, false)
+		flushSeg()
+	}
 
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if escaped {
 			// Backslash-escaped content is literal — including \$ and \`.
-			// Do NOT set segExpand: rebuild must keep these inert.
-			writeSeg(c, false)
+			if c == '$' || c == '`' {
+				writeEscapedExpansion(c)
+			} else {
+				writeSeg(c, false)
+			}
 			escaped = false
 			continue
 		}
@@ -2479,8 +2515,12 @@ func shellWords(s string) ([]shellWord, error) {
 				next := s[i+1]
 				// bash double-quote escapes: \, ", $, `, newline — remove the
 				// backslash and keep the next char as literal (so \$ → $).
-				// Escaped $ / ` must NOT mark Expand (would re-activate on rebuild).
-				if next == '\\' || next == '"' || next == '$' || next == '`' || next == '\n' {
+				if next == '$' || next == '`' {
+					i++
+					writeEscapedExpansion(next)
+					continue
+				}
+				if next == '\\' || next == '"' || next == '\n' {
 					i++
 					writeSeg(next, false)
 					continue
@@ -2514,10 +2554,11 @@ func shellWords(s string) ([]shellWord, error) {
 			wordStarted = true
 		case ' ', '\t', '\n', '\r':
 			flushWord()
-		case '(', ')', '{', '}':
-			// We do not parse grouping / subshells. Unquoted parens/braces are
-			// either unmatched (bash syntax error) or full shell syntax we
-			// would mis-reshape — leave the original payload alone.
+		case '(', ')':
+			// We do not parse subshells/groups. Unquoted parens are either
+			// unmatched (bash syntax error) or full shell syntax we would
+			// mis-reshape — leave the original payload alone. Braces stay
+			// allowed (brace expansion / ordinary prompt text).
 			return nil, fmt.Errorf("unsupported unquoted shell metacharacter %q", c)
 		default:
 			writeSeg(c, c == '$' || c == '`')

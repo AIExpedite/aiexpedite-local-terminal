@@ -653,10 +653,19 @@ func TestShapePTYExecArgs_KeepsEscapedCommandSubstitutionLiteral(t *testing.T) {
 	}
 
 	// Unquoted escaped form without spaces (space would split shell words).
+	// Parentheses must also be escaped or shellWords rejects unquoted ().
 	_, uArgs := shapePTYExecArgs("bash", []string{"-c", `agy \$\(cmd\)`})
 	wantU := `agy --dangerously-skip-permissions --print '$(cmd)'`
 	if uArgs[1] != wantU {
 		t.Errorf("unquoted escaped substitution = %q, want %q", uArgs[1], wantU)
+	}
+
+	// Escaped $(...) followed by a later legitimate expansion in the same
+	// double-quoted region must not OR Expand over the escaped dollars.
+	_, mixArgs := shapePTYExecArgs("bash", []string{"-c", `agy "\$(touch /tmp/pwn)$TASK"`})
+	wantMix := `agy --dangerously-skip-permissions --print '$(touch /tmp/pwn)'"$TASK"`
+	if mixArgs[1] != wantMix {
+		t.Errorf("escaped+expand mix = %q, want %q", mixArgs[1], wantMix)
 	}
 }
 
@@ -686,7 +695,7 @@ func TestShapePTYExecArgs_PreservesPerFragmentExpansion(t *testing.T) {
 	}
 }
 
-// Unmatched / unsupported unquoted grouping must NOT be reshaped into a valid
+// Unmatched / unsupported unquoted parentheses must NOT be reshaped into a valid
 // permission-skipping agy command — leave the original so bash reports the error.
 func TestShapePTYExecArgs_RejectsUnmatchedShellGrouping(t *testing.T) {
 	orig := `agy review)`
@@ -699,6 +708,22 @@ func TestShapePTYExecArgs_RejectsUnmatchedShellGrouping(t *testing.T) {
 	_, args2 := shapePTYExecArgs("bash", []string{"-c", orig2})
 	if args2[1] != orig2 {
 		t.Errorf("unmatched ( was reshaped: got %q, want original %q", args2[1], orig2)
+	}
+}
+
+// Unquoted braces are valid bash (brace expansion / prompt text) and must still
+// receive one-shot shaping rather than being left as an interactive TUI hang.
+func TestShapePTYExecArgs_AllowsUnquotedBraces(t *testing.T) {
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy file{1,2}`})
+	want := `agy --dangerously-skip-permissions --print 'file{1,2}'`
+	if args[1] != want {
+		t.Errorf("brace word = %q, want %q", args[1], want)
+	}
+
+	_, spaced := shapePTYExecArgs("bash", []string{"-c", `agy review {foo}`})
+	wantSpaced := `agy --dangerously-skip-permissions --print 'review {foo}'`
+	if spaced[1] != wantSpaced {
+		t.Errorf("brace prompt = %q, want %q", spaced[1], wantSpaced)
 	}
 }
 
@@ -744,6 +769,8 @@ func TestShellWords(t *testing.T) {
 		{`agy '$TASK'`, []string{"agy", "$TASK"}, []bool{false, false}, false},
 		{`agy "\$(touch /tmp/pwn)"`, []string{"agy", "$(touch /tmp/pwn)"}, []bool{false, false}, false},
 		{`agy "$TASK"'$(x)'`, []string{"agy", "$TASK$(x)"}, []bool{false, true}, false},
+		{`agy "\$(x)$TASK"`, []string{"agy", "$(x)$TASK"}, []bool{false, true}, false},
+		{`agy file{1,2}`, []string{"agy", "file{1,2}"}, []bool{false, false}, false},
 		{`agy ""`, []string{"agy", ""}, []bool{false, false}, false},
 		{`  agy   `, []string{"agy"}, []bool{false}, false},
 		{``, nil, nil, false},
