@@ -1021,7 +1021,8 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 
 	// Quoted multi-field expansions still split after --print — leave unshaped.
 	// Nested forms (${x:+$@}) also yield multiple fields when the outer
-	// expansion is active — decline those too.
+	// expansion is active — decline those too. Nested ${@:1} needs balanced
+	// brace matching (first-} would truncate the body and miss multi-word).
 	for _, orig := range []string{
 		`agy "$@"`,
 		`agy "${files[@]}"`,
@@ -1030,11 +1031,26 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		`agy "$@"'more'`,
 		`agy "${x:+$@}"`,
 		`agy "${x:-${files[@]}}"`,
+		`agy "${x:-${@:1}}"`,
 	} {
 		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
 		if args[1] != orig {
 			t.Errorf("multi-field quoted expand was reshaped: got %q, want original %q", args[1], orig)
 		}
+	}
+
+	// zsh EQUALS: unquoted =cmd expands to the command path. Joining into a
+	// single-quoted --print freezes it — leave unshaped on zsh only.
+	origZsh := `agy =ls review`
+	_, zshArgs := shapePTYExecArgs("zsh", []string{"-c", origZsh})
+	if zshArgs[1] != origZsh {
+		t.Errorf("zsh equals sub was reshaped: got %q, want original %q", zshArgs[1], origZsh)
+	}
+	// bash leaves =ls literal — still reshape.
+	_, bashEq := shapePTYExecArgs("bash", []string{"-c", origZsh})
+	wantBashEq := `agy --dangerously-skip-permissions --print '=ls review'`
+	if bashEq[1] != wantBashEq {
+		t.Errorf("bash literal =ls = %q, want %q", bashEq[1], wantBashEq)
 	}
 
 	// "$*" / "${files[*]}" stay a single field when double-quoted — still reshape.

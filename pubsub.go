@@ -2226,14 +2226,21 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 	// also cannot ride inside one --print value (bash would re-split them into
 	// multiple argv tokens after --print). Single-field double-quoted forms
 	// (`"$TASK"`, `--add-dir "$ROOT"`) still reshape.
+	zshEquals := shellSupportsZshEquals(shellCmd)
 	for _, f := range flags {
 		if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
+			return "", false
+		}
+		if zshEquals && f.hasZshEqualsSub() {
 			return "", false
 		}
 	}
 	if hasPrompt {
 		for _, f := range promptFrags {
 			if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
+				return "", false
+			}
+			if zshEquals && f.hasZshEqualsSub() {
 				return "", false
 			}
 		}
@@ -2563,8 +2570,31 @@ func (w shellWord) hasExpandWithBackslash() bool {
 	return false
 }
 
+// hasZshEqualsSub reports an unquoted word-initial `=` command equals
+// substitution (`=ls` → /bin/ls under zsh EQUALS). Rebuilding as a single-quoted
+// --print value freezes the `=` and changes the prompt; callers must decline
+// reshape on zsh when this is set.
+func (w shellWord) hasZshEqualsSub() bool {
+	segs := w.effectiveSegments()
+	if len(segs) == 0 {
+		return false
+	}
+	// Leading unquoted "=" with at least one following character in the word.
+	first := segs[0]
+	if !first.Unquoted || !strings.HasPrefix(first.Value, "=") {
+		return false
+	}
+	if len(first.Value) >= 2 {
+		return true
+	}
+	// "=" alone in the first segment, more content in later segments.
+	return len(w.Value) >= 2 && w.Value[0] == '='
+}
+
 // shellExpandIsMultiWord reports whether s contains a bash expansion that
 // produces multiple fields even when double-quoted: $@ / ${@…} / ${name[@]…}.
+// Nested ${…} bodies are extracted with balanced braces so
+// "${x:-${@:1}}" is classified as multi-word (not truncated at the inner }).
 func shellExpandIsMultiWord(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] != '$' || i+1 >= len(s) {
@@ -2577,16 +2607,35 @@ func shellExpandIsMultiWord(s string) bool {
 		if next != '{' {
 			continue
 		}
-		close := strings.IndexByte(s[i+2:], '}')
+		close := shellParamCloseBrace(s, i+2)
 		if close < 0 {
 			continue
 		}
-		if shellParamBodyIsMultiWord(s[i+2 : i+2+close]) {
+		if shellParamBodyIsMultiWord(s[i+2 : close]) {
 			return true
 		}
-		i = i + 1 + close // advance toward the closing '}'
+		i = close // continue after the matched '}'
 	}
 	return false
+}
+
+// shellParamCloseBrace returns the index of the balanced closing '}' for a
+// ${…} body starting at bodyStart (first byte after '{'), or -1 if unmatched.
+// Nested braces (including nested ${…}) are counted so the outer close is used.
+func shellParamCloseBrace(s string, bodyStart int) int {
+	depth := 1
+	for j := bodyStart; j < len(s); j++ {
+		switch s[j] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return j
+			}
+		}
+	}
+	return -1
 }
 
 // shellParamBodyIsMultiWord reports whether a ${…} body (without braces) is a
@@ -2675,6 +2724,14 @@ func shellSupportsBraceExpansion(command string) bool {
 func shellSupportsAssignTilde(command string) bool {
 	// Same dialect split as brace expansion for practical purposes.
 	return shellSupportsBraceExpansion(command)
+}
+
+// shellSupportsZshEquals reports whether the named shell performs zsh-style
+// equals substitution (`=cmd` → absolute path of cmd) under the default EQUALS
+// option. Only zsh does this; bash/dash leave `=cmd` literal.
+func shellSupportsZshEquals(command string) bool {
+	base := shellCommandBase(command)
+	return base == "zsh" || strings.HasPrefix(base, "zsh")
 }
 
 // shellSupportsDollarQuote reports whether the named shell supports ANSI-C
