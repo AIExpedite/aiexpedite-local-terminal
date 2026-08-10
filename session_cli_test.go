@@ -1484,6 +1484,30 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 			t.Errorf("bash unmatched bracket was declined: %q", bashArgs[1])
 		}
 	}
+	// zsh MAGIC_EQUAL_SUBST extends equals-substitution to the value side of an
+	// assignment-like word: with the option on, `agy review foo==ls` passes
+	// `foo=/usr/bin/ls` and `p=a:==ls` errors with `=ls not found` (zsh 5.9).
+	// Decline both on zsh; bash keeps them literal.
+	for _, orig := range []string{
+		`agy review foo==ls`,
+		`agy p=a:==ls`,
+	} {
+		_, zshArgs := shapePTYExecArgs("zsh", []string{"-c", orig})
+		if zshArgs[1] != orig {
+			t.Errorf("zsh magic-equals was reshaped: got %q, want original %q", zshArgs[1], orig)
+		}
+		_, bashArgs := shapePTYExecArgs("bash", []string{"-c", orig})
+		if bashArgs[1] == orig {
+			t.Errorf("bash magic-equals was declined: %q", bashArgs[1])
+		}
+	}
+	// A single `=` in an ordinary flag or word is not equals-substitution —
+	// still reshape on zsh.
+	_, zshFlagEq := shapePTYExecArgs("zsh", []string{"-c", `agy --model=fast review`})
+	wantZshFlagEq := `agy --dangerously-skip-permissions --model=fast --print review`
+	if zshFlagEq[1] != wantZshFlagEq {
+		t.Errorf("zsh flag with = = %q, want %q", zshFlagEq[1], wantZshFlagEq)
+	}
 	// Quoted / escaped forms are literal in zsh too — still reshape.
 	for _, tc := range []struct{ orig, want string }{
 		{`agy 'foo#'`, `agy --dangerously-skip-permissions --print 'foo#'`},

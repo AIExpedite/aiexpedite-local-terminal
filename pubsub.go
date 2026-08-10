@@ -3729,6 +3729,21 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// (e.g. `${ROOT}\$dir`).
 			writeSeg(c, false)
 			noteParamClose(c)
+		case '=', ':':
+			// zsh MAGIC_EQUAL_SUBST (settable from the unreadable .zshenv)
+			// extends equals-substitution to the *value* side of any
+			// assignment-like word, not just word-initial `=cmd`: with the
+			// option on, `agy review foo==ls` passes `foo=/usr/bin/ls` and
+			// `p=a:==ls` fails with `=ls not found` (verified on zsh 5.9), while
+			// both are literal without it. A ':' only opens a fresh value
+			// segment inside a word that already has an unquoted assignment
+			// separator. (`foo=~` needs no special case: mid-word `~` already
+			// declines on zsh as an EXTENDED_GLOB operator.)
+			if opts.zshPatterns && i+1 < len(s) && s[i+1] == '=' &&
+				(c == '=' || sawUnquotedAssign) {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
 		default:
 			// ANSI-C ($'…') / locale ($"…") quoting: not implemented on bash-
 			// family shells — reject so we never rebuild $'(touch …)' into an
