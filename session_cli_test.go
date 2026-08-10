@@ -1140,6 +1140,15 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		t.Errorf("expand + literal backslash = %q, want %q", rootDocs[1], wantRootDocs)
 	}
 
+	// Carriage return is not shell IFS whitespace — keep it inside the prompt
+	// word (do not split into fragments and rejoin with a space).
+	crPayload := "agy a\rb"
+	_, crArgs := shapePTYExecArgs("bash", []string{"-c", crPayload})
+	wantCR := "agy --dangerously-skip-permissions --print 'a\rb'"
+	if crArgs[1] != wantCR {
+		t.Errorf("literal CR prompt = %q, want %q", crArgs[1], wantCR)
+	}
+
 	// Legacy bash arithmetic `$[…]` still expands inside double quotes — keep
 	// Expand so rebuild emits --print "$[1+2]" (not a single-quoted literal).
 	_, arith := shapePTYExecArgs("bash", []string{"-c", `agy "$[1+2]"`})

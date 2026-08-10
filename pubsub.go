@@ -3171,7 +3171,9 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			flushSeg() // start a new double-quoted segment
 			inDouble = true
 			wordStarted = true
-		case ' ', '\t', '\n', '\r':
+		case ' ', '\t', '\n':
+			// POSIX/bash IFS whitespace is space, tab, newline only — not CR.
+			// A literal `\r` stays inside the word (bash/dash pass one field).
 			flushWord()
 		case '#':
 			// Unquoted # at a word boundary starts a shell comment — stop.
@@ -3349,8 +3351,9 @@ func looksLikeUnquotedBracketGlob(s string, openIdx int) bool {
 			inSingle = true
 		case '"':
 			inDouble = true
-		case ' ', '\t', '\n', '\r':
-			// Unquoted whitespace ends the shell word — incomplete class.
+		case ' ', '\t', '\n':
+			// Unquoted IFS whitespace ends the shell word — incomplete class.
+			// CR is not IFS whitespace (same as shellWords).
 			return false
 		case ']':
 			return true
@@ -3406,7 +3409,8 @@ func looksLikeUnquotedBraceExpansion(s string, openIdx int) bool {
 			inSingle = true
 		case '"':
 			inDouble = true
-		case ' ', '\t', '\n', '\r':
+		case ' ', '\t', '\n':
+			// IFS whitespace only (not CR) — same as shellWords.
 			return false
 		case '{':
 			depth++
