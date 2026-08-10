@@ -1048,7 +1048,9 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 			t.Errorf("dash assign-tilde %q = %q, want %q", tc.in, got[1], tc.want)
 		}
 	}
-	// Word-initial ~/ still expands on dash (POSIX) — leave unshaped.
+	// Word-initial ~/ still expands on dash when HOME is set (POSIX) — leave
+	// unshaped. Pin HOME so Windows CI (HOME often unset) matches that path.
+	t.Setenv("HOME", filepath.ToSlash(os.TempDir()))
 	origHome := `agy review ~/proj`
 	_, dashHome := shapePTYExecArgs("dash", []string{"-c", origHome})
 	if dashHome[1] != origHome {
