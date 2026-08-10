@@ -1054,6 +1054,22 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if dashHome[1] != origHome {
 		t.Errorf("dash word-initial tilde was reshaped: got %q, want original %q", dashHome[1], origHome)
 	}
+	// Dash leaves bare ~ / ~/x literal when HOME is unavailable; preserve the
+	// one-shot reshape in that environment. Bash falls back to passwd data.
+	t.Setenv("HOME", "")
+	for _, tc := range []struct{ in, want string }{
+		{`agy ~`, `agy --dangerously-skip-permissions --print '~'`},
+		{`agy ~/x`, `agy --dangerously-skip-permissions --print '~/x'`},
+	} {
+		_, got := shapePTYExecArgs("dash", []string{"-c", tc.in})
+		if got[1] != tc.want {
+			t.Errorf("dash tilde without HOME %q = %q, want %q", tc.in, got[1], tc.want)
+		}
+	}
+	_, bashHomeFallback := shapePTYExecArgs("bash", []string{"-c", `agy ~`})
+	if bashHomeFallback[1] != `agy ~` {
+		t.Errorf("bash bare tilde without HOME was reshaped: got %q", bashHomeFallback[1])
+	}
 
 	// Indexed assignment A[0]=~ also tilde-expands; unquoted '[' declines reshape.
 	origIdx := `agy A[0]=~`

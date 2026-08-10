@@ -2206,12 +2206,13 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 // mixed fragments into one double-quoted blob that reactivates substitutions.
 func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 	words, err := shellWords(payload, shellWordOptions{
-		braceExpand:      shellSupportsBraceExpansion(shellCmd),
-		dollarQuote:      shellSupportsDollarQuote(shellCmd),
-		assignTilde:      shellSupportsAssignTilde(shellCmd),
-		legacyArith:      shellSupportsLegacyArith(shellCmd),
-		pwdTilde:         shellSupportsPwdTilde(shellCmd),
-		failUnknownTilde: shellFailsUnknownTildeLogin(shellCmd),
+		braceExpand:       shellSupportsBraceExpansion(shellCmd),
+		dollarQuote:       shellSupportsDollarQuote(shellCmd),
+		assignTilde:       shellSupportsAssignTilde(shellCmd),
+		legacyArith:       shellSupportsLegacyArith(shellCmd),
+		pwdTilde:          shellSupportsPwdTilde(shellCmd),
+		failUnknownTilde:  shellFailsUnknownTildeLogin(shellCmd),
+		homeTildeNeedsEnv: shellBareTildeNeedsHome(shellCmd),
 	})
 	if err != nil {
 		// Malformed shell (unterminated quote, etc.) — do not reshape into a
@@ -3013,6 +3014,23 @@ type shellWordOptions struct {
 	// (zsh) rather than a literal word (bash/dash). Decline reshape so the
 	// wrapper still fails instead of launching agy with a frozen name.
 	failUnknownTilde bool
+	// homeTildeNeedsEnv is true for dash-family shells, which leave bare ~
+	// literal when HOME is unset or empty. Bash can fall back to passwd data.
+	homeTildeNeedsEnv bool
+}
+
+// shellBareTildeNeedsHome reports whether bare ~ expansion depends on HOME.
+// Dash-family shells do not use the passwd-database fallback that bash uses.
+func shellBareTildeNeedsHome(command string) bool {
+	base := shellCommandBase(command)
+	switch base {
+	case "dash", "ash", "busybox":
+		return true
+	case "sh":
+		return !shellShIsBashFamily(command)
+	default:
+		return false
+	}
 }
 
 // shellSupportsBraceExpansion reports whether the named shell executable
@@ -3665,7 +3683,7 @@ func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, opts shellWordOp
 // stay literal on bash/dash (reshape) but fail on zsh (opts.failUnknownTilde).
 func shellTildePrefixExpands(login string, opts shellWordOptions) bool {
 	if login == "" {
-		return true
+		return !opts.homeTildeNeedsEnv || os.Getenv("HOME") != ""
 	}
 	// Bash/zsh PWD form. Dash: literal (pwdTilde false).
 	if login == "+" {
