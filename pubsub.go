@@ -2151,7 +2151,7 @@ func runTTYCommand(cfg *Config, cmd commandMsg) (string, error) {
 // (buildInteractiveCLIArgs) for a PTY-eligible agent, so a tty=true `execute`
 // request reaches the agent's non-interactive `--print` path rather than
 // launching the raw interactive TUI. Only antigravity (agy/antigravity) needs
-// shaping — `--print --dangerously-skip-permissions <prompt>`; other eligible
+// shaping — `--dangerously-skip-permissions --print <prompt>`; other eligible
 // commands pass through unchanged.
 //
 // Two eligible shapes are handled: a direct agy invocation (`agy fix this`),
@@ -2170,8 +2170,8 @@ func shapePTYExecArgs(command string, args []string) (string, []string) {
 
 // shapeShellWrappedPTYArgs applies antigravity one-shot shaping to a
 // shell-wrapped single-agent PTY payload (`bash -c "agy …"`), returning args
-// with the inner agy given `--print --dangerously-skip-permissions`. A DIRECT
-// agy/antigravity invocation is already shaped by its caller
+// with the inner agy given `--dangerously-skip-permissions --print <prompt>`.
+// A DIRECT agy/antigravity invocation is already shaped by its caller
 // (buildInteractiveCLIArgs on the session_start path, shapePTYExecArgs'
 // antigravity branch on the execute path), so this only rewrites the `-c`
 // payload of a shell wrapper and leaves everything else (including
@@ -2189,23 +2189,59 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 
 // shapeAntigravityShellPayload rewrites a `bash -c` payload whose leading token
 // is agy/antigravity so the inner invocation gains the one-shot
-// `--print --dangerously-skip-permissions` shaping, returning the rewritten
-// payload and true. It returns ("", false) when the first token is not an
-// antigravity command. The flag list is sourced from buildAntigravityInteractiveArgs
-// so it cannot drift from the direct path. Only reached for payloads
-// isPTYEligibleCommand has cleared of shell chaining, so fields[0] is the whole
-// program and the remainder is preserved verbatim as the literal prompt.
+// `--dangerously-skip-permissions --print <prompt>` shaping, returning the
+// rewritten payload and true. It returns ("", false) when the first token is
+// not an antigravity command. Argv is sourced from buildAntigravityInteractiveArgs
+// so it cannot drift from the direct path. The remainder after the command
+// name is the literal prompt (one --print value); multi-word prompts are
+// shell-quoted so bash -c does not split them into separate tokens.
 func shapeAntigravityShellPayload(payload string) (string, bool) {
 	fields := strings.Fields(payload)
 	if len(fields) == 0 || !isAntigravityCommand(fields[0]) {
 		return "", false
 	}
-	flags := strings.Join(buildAntigravityInteractiveArgs(nil), " ")
-	shaped := fields[0] + " " + flags
-	if rest := strings.TrimSpace(strings.TrimPrefix(payload, fields[0])); rest != "" {
-		shaped += " " + rest
+	rest := strings.TrimSpace(strings.TrimPrefix(payload, fields[0]))
+	var callerArgs []string
+	if rest != "" {
+		// Single element so multi-word rest becomes one --print value (not
+		// Fields-split into fake flags).
+		callerArgs = []string{rest}
 	}
-	return shaped, true
+	shapedArgs := buildAntigravityInteractiveArgs(callerArgs)
+	return joinAntigravityShellCommand(fields[0], shapedArgs...), true
+}
+
+// joinAntigravityShellCommand serializes cmd+args into a bash -c payload,
+// quoting any token that contains shell metacharacters so multi-word
+// --print values survive re-parsing.
+func joinAntigravityShellCommand(cmd string, args ...string) string {
+	parts := make([]string, 0, 1+len(args))
+	parts = append(parts, cmd)
+	for _, a := range args {
+		parts = append(parts, quoteAntigravityShellArg(a))
+	}
+	return strings.Join(parts, " ")
+}
+
+func quoteAntigravityShellArg(s string) string {
+	if s == "" {
+		return `""`
+	}
+	if !strings.ContainsAny(s, " \t\n\r\"'\\$`") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c == '"' || c == '$' || c == '`' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(c)
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // replaceDashCPayload returns a copy of args with the string following the first

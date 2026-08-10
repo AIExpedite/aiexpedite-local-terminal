@@ -44,7 +44,11 @@ Safeguards for the native-chat path:
 6. Telemetry redaction (no prompts, tokens, OAuth URLs)
 7. Unrelated provider credentials stripped from child env
 
-Legacy one-shot `buildAntigravityInteractiveArgs` is **unchanged**.
+Legacy one-shot `buildAntigravityInteractiveArgs` (session_start / PTY execute)
+uses the **same** `--dangerously-skip-permissions --print <prompt>` contract —
+not a trailing positional. An older order (`--print` then the permission flag)
+made agy 1.1.x treat `--dangerously-skip-permissions` as the prompt (tertiary
+Review kickoff symptom).
 
 ## Recovery semantics
 

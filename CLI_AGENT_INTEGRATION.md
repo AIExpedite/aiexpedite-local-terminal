@@ -341,7 +341,9 @@ Summary:
 - **Pub/Sub:** `antigravity_native_{start,send,end}` →
   `antigravity_native_{started,message,stderr,error,ended}`.
 - **Minimum version:** agy ≥ 1.1.1.
-- **Permissions:** `--dangerously-skip-permissions` on the native-chat path only
-  (remote users cannot answer local prompts). Threat model + safeguards are in
-  the doc above. Legacy one-shot `buildAntigravityInteractiveArgs` is unchanged.
+- **Permissions:** `--dangerously-skip-permissions` on native-chat and on the
+  session_start / PTY one-shot path (remote users cannot answer local prompts).
+  Threat model + safeguards are in the doc above. Both paths use
+  `--dangerously-skip-permissions --print <prompt>` (print takes the prompt as
+  its flag value on agy ≥ 1.1.x).
 

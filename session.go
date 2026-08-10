@@ -1572,9 +1572,10 @@ func isGrokCommand(command string) bool {
 // isAntigravityCommand reports whether command routes to the Antigravity CLI.
 // Accepts BOTH the `agy` binary and the `antigravity` alias — the PTY
 // eligibility allowlist (isPTYEligibleCommand) admits both, so both MUST get
-// the same one-shot argv shaping (`--print --dangerously-skip-permissions`) in
-// buildInteractiveCLIArgs; otherwise a `tty=true` `antigravity` session would
-// start under a PTY with no prompt flag and hang. Robust to paths / .exe shims.
+// the same one-shot argv shaping (`--dangerously-skip-permissions --print
+// <prompt>`) in buildInteractiveCLIArgs; otherwise a `tty=true` `antigravity`
+// session would start under a PTY with no prompt flag and hang. Robust to
+// paths / .exe shims.
 func isAntigravityCommand(command string) bool {
 	base := commandBaseName(command)
 	return strings.HasPrefix(base, "agy") || strings.HasPrefix(base, "antigravity")
@@ -1616,12 +1617,14 @@ func isResidentAgentSessionCommand(command string) bool {
 //   - codex:       stdinPrompt is the prompt, written as raw text; codex exec
 //     reads stdin to completion (`-` positional placeholder)
 //     then exits; one-shot per process
-//   - antigravity: prompt as positional argv via `--print`. agy does NOT read
-//     piped stdin (verified against agy 1.0.4: ignored in both
-//     interactive and --print modes — it needs a real TTY), so the
-//     prompt must stay on argv. agy resolves to a native `agy.exe`
-//     (NOT a cmd.exe shim), so the relevant cap is the 32KB
-//     CreateProcess limit, not an 8191-char cmd.exe cap.
+//   - antigravity: prompt as the VALUE of `--print` (agy ≥ 1.1.x; verified
+//     1.1.2 / 1.1.11). Order is `--dangerously-skip-permissions --print
+//     <prompt>` — a bare `--print` followed by another flag makes agy treat
+//     that flag as the prompt. agy does NOT read piped stdin (verified
+//     against agy 1.0.4: ignored in both interactive and --print modes —
+//     it needs a real TTY), so the prompt must stay on argv. agy resolves
+//     to a native `agy.exe` (NOT a cmd.exe shim), so the relevant cap is
+//     the 32KB CreateProcess limit, not an 8191-char cmd.exe cap.
 //   - other:       prompt stays in args
 //
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
@@ -1915,12 +1918,22 @@ func sanitizeCodexExecArgs(args []string) []string {
 }
 
 // buildAntigravityInteractiveArgs builds Antigravity CLI (`agy`) args for
-// one-shot prompt execution. The prompt stays a POSITIONAL argv.
+// one-shot prompt execution.
 //
-// agy v1.0.x ships claude-code-shaped flags (--print / --prompt-interactive /
-// --dangerously-skip-permissions) but does NOT expose --output-format or
-// stream-json input — so we cannot drive it as a multi-turn streaming session
-// like claude. We run a one-shot `--print` with the prompt as a positional arg.
+// agy ≥ 1.1.x: `--print` / `-p` / `--prompt` takes the prompt as its FLAG
+// VALUE (not a trailing positional). Verified against agy 1.1.2 and 1.1.11.
+// The native-chat path (buildAntigravityNativeArgs) already uses this contract;
+// the session_start / PTY one-shot path must match or tertiary Review kickoffs
+// (and any other terminalWithFeatureDetails agy role) answer a question about
+// `--dangerously-skip-permissions` and ignore the real brief:
+//
+//	WRONG: agy --print --dangerously-skip-permissions <brief>
+//	       → --print's value is "--dangerously-skip-permissions"
+//	RIGHT: agy --dangerously-skip-permissions --print <brief>
+//
+// agy ships claude-code-shaped flags but does NOT expose stream-json input, so
+// we cannot drive it as a multi-turn streaming session like claude. We run a
+// one-shot `--print` per session_start.
 //
 // WHY NOT STDIN (unlike codex): agy does NOT read a piped stdin —
 // verified live against agy 1.0.4, piped input is ignored in BOTH interactive
@@ -1932,11 +1945,133 @@ func sanitizeCodexExecArgs(args []string) []string {
 // failure for normal (≤ ~32KB) briefs; only briefs approaching 32KB would risk
 // it, which would need a TTY/ACP-style redesign rather than the stdin trick.
 func buildAntigravityInteractiveArgs(args []string) []string {
-	result := make([]string, 0, len(args)+2)
-	result = append(result, "--print")
+	result := make([]string, 0, len(args)+3)
+	// Permission skip first — never immediately after bare --print.
 	result = append(result, "--dangerously-skip-permissions")
-	result = append(result, args...)
+
+	flags, prompt := partitionAntigravityCallerArgs(args)
+	result = append(result, flags...)
+	if prompt != "" {
+		result = append(result, "--print", prompt)
+	}
 	return result
+}
+
+// antigravityValuedFlags are agy flags whose next argv token is their value.
+// Only exact known flags are peeled off the front of caller args so a brief
+// that happens to start with "-" (markdown hr, bullet) is still treated as
+// prompt text.
+var antigravityValuedFlags = map[string]bool{
+	"--add-dir": true, "--agent": true, "--conversation": true,
+	"--effort": true, "--json-schema": true, "--log-file": true,
+	"--mode": true, "--model": true, "--output-format": true,
+	"--print-timeout": true, "--project": true,
+	"--prompt-interactive": true, "-i": true,
+}
+
+// antigravityBoolFlags are agy flags that take no value. Injected duplicates
+// of --dangerously-skip-permissions are stripped; --continue/-c are stripped
+// (cross-chat contamination risk — same rule as native chat).
+var antigravityBoolFlags = map[string]bool{
+	"--dangerously-skip-permissions": true,
+	"--disable-slash-commands":       true,
+	"--new-project":                  true,
+	"--sandbox":                      true,
+	"--continue":                     true,
+	"-c":                             true,
+}
+
+// partitionAntigravityCallerArgs peels known leading agy flags off args and
+// joins the remainder into a single --print value. Unknown tokens (including
+// anything that merely starts with "-") begin the prompt.
+func partitionAntigravityCallerArgs(args []string) (flags []string, prompt string) {
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		lower := strings.ToLower(a)
+
+		// Equals-form: --flag=value / -p=value
+		if name, val, ok := splitAntigravityEqualsFlag(lower, a); ok {
+			if isAntigravityPrintFlag(name) {
+				// Caller already supplied the print value — rest of argv is
+				// also prompt material (join so nothing is dropped).
+				parts := []string{val}
+				parts = append(parts, args[i+1:]...)
+				return flags, strings.Join(parts, " ")
+			}
+			if name == "--dangerously-skip-permissions" || name == "--continue" {
+				i++
+				continue
+			}
+			if antigravityValuedFlags[name] || antigravityBoolFlags[name] {
+				flags = append(flags, a)
+				i++
+				continue
+			}
+			// Unknown --foo=bar → prompt starts here.
+			break
+		}
+
+		if isAntigravityPrintFlag(lower) {
+			// --print / -p / --prompt [value...]; value + remainder = prompt.
+			i++
+			if i < len(args) {
+				return flags, strings.Join(args[i:], " ")
+			}
+			return flags, ""
+		}
+
+		if antigravityBoolFlags[lower] {
+			// Strip injected / unsafe flags; keep other booleans.
+			if lower == "--dangerously-skip-permissions" || lower == "--continue" || lower == "-c" {
+				i++
+				continue
+			}
+			flags = append(flags, a)
+			i++
+			continue
+		}
+
+		if antigravityValuedFlags[lower] {
+			flags = append(flags, a)
+			i++
+			if i < len(args) {
+				flags = append(flags, args[i])
+				i++
+			}
+			continue
+		}
+
+		// First non-flag token → prompt starts here (may begin with "-").
+		break
+	}
+	if i < len(args) {
+		return flags, strings.Join(args[i:], " ")
+	}
+	return flags, ""
+}
+
+func isAntigravityPrintFlag(name string) bool {
+	return name == "--print" || name == "-p" || name == "--prompt"
+}
+
+// splitAntigravityEqualsFlag returns (flagName, value, true) for --flag=value
+// forms. name is lowercased; raw is the original token (preserved for flags).
+func splitAntigravityEqualsFlag(lower, raw string) (name, val string, ok bool) {
+	eq := strings.IndexByte(lower, '=')
+	if eq <= 0 {
+		return "", "", false
+	}
+	name = lower[:eq]
+	if !strings.HasPrefix(name, "-") {
+		return "", "", false
+	}
+	// Value from the original token so prompt casing is preserved.
+	rawEq := strings.IndexByte(raw, '=')
+	if rawEq < 0 {
+		return name, "", true
+	}
+	return name, raw[rawEq+1:], true
 }
 
 // grokKnownSubcommands are the `grok <cmd>` subcommands whose argv grammar must

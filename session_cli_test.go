@@ -424,29 +424,70 @@ func TestBuildCodexInteractiveArgs_PromptWordResumeNotMistakenForSubcommand(t *t
 /* --------------------------------------------------------------------------
    buildAntigravityInteractiveArgs
    --------------------------------------------------------------------------
-   agy is claude-code-shaped on its flag surface but ships without
-   --output-format / stream-json input, and (verified against agy 1.0.4) it
-   does NOT read a piped stdin — so the prompt stays a POSITIONAL argv and we
-   run a one-shot `--print`. agy resolves to a native agy.exe (not a cmd.exe
-   shim), so it is launched via CreateProcess (~32KB cap) and is not subject to
-   the 8191-char cmd.exe command-line cap. Single return value (no stdinPrompt).
+   agy ≥ 1.1.x: --print takes the prompt as its FLAG VALUE. Order must be
+   --dangerously-skip-permissions --print <prompt>. Putting --print first
+   makes agy treat --dangerously-skip-permissions as the prompt (tertiary
+   Review symptom). No stdin path (agy ignores piped input).
    ------------------------------------------------------------------------ */
 
 func TestBuildAntigravityInteractiveArgs_PrintAndPrompt(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{"hello"})
-	mustContain(t, args, "--print", "--dangerously-skip-permissions", "hello")
+	// Exact shape: permission skip, then --print <prompt> as flag value.
+	if len(args) != 3 ||
+		args[0] != "--dangerously-skip-permissions" ||
+		args[1] != "--print" ||
+		args[2] != "hello" {
+		t.Fatalf("want [--dangerously-skip-permissions --print hello], got %#v", args)
+	}
 }
 
 func TestBuildAntigravityInteractiveArgs_EmptyArgs(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{})
-	mustContain(t, args, "--print", "--dangerously-skip-permissions")
+	// No prompt → no bare --print (would consume the next token as value).
+	if len(args) != 1 || args[0] != "--dangerously-skip-permissions" {
+		t.Fatalf("want [--dangerously-skip-permissions], got %#v", args)
+	}
 }
 
-// agy gets every arg on argv (prompt + any flags), in order, after the two
-// leading flags. Nothing is reclassified or routed to stdin (agy ignores it).
-func TestBuildAntigravityInteractiveArgs_PassesArgsThroughPositional(t *testing.T) {
+// Known leading flags stay on argv; the remainder becomes the single --print value.
+func TestBuildAntigravityInteractiveArgs_LeadingFlagsThenPrompt(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{"--add-dir", "../shared-library", "do the task"})
-	mustContain(t, args, "--print", "--dangerously-skip-permissions", "--add-dir", "../shared-library", "do the task")
+	if len(args) != 5 ||
+		args[0] != "--dangerously-skip-permissions" ||
+		args[1] != "--add-dir" ||
+		args[2] != "../shared-library" ||
+		args[3] != "--print" ||
+		args[4] != "do the task" {
+		t.Fatalf("want [skip --add-dir path --print prompt], got %#v", args)
+	}
+}
+
+// Regression: --print must NOT be followed by another flag (agy 1.1.x eats it as the prompt).
+func TestBuildAntigravityInteractiveArgs_PrintValueIsNeverAFlag(t *testing.T) {
+	args := buildAntigravityInteractiveArgs([]string{"review this design"})
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--print" || args[i] == "-p" || args[i] == "--prompt" {
+			if strings.HasPrefix(args[i+1], "-") {
+				t.Fatalf("--print value must not be a flag token: %#v", args)
+			}
+		}
+	}
+}
+
+// Multi-token prompt joins into one --print value (not truncated at first word).
+func TestBuildAntigravityInteractiveArgs_JoinsMultiTokenPrompt(t *testing.T) {
+	args := buildAntigravityInteractiveArgs([]string{"fix", "the", "bug"})
+	if len(args) != 3 || args[2] != "fix the bug" {
+		t.Fatalf("want single --print value %q, got %#v", "fix the bug", args)
+	}
+}
+
+// A brief that starts with "-" is still prompt text (not a flag).
+func TestBuildAntigravityInteractiveArgs_DashPrefixedPrompt(t *testing.T) {
+	args := buildAntigravityInteractiveArgs([]string{"---", "title"})
+	if len(args) != 3 || args[1] != "--print" || args[2] != "--- title" {
+		t.Fatalf("dash-prefixed brief must be --print value, got %#v", args)
+	}
 }
 
 /* --------------------------------------------------------------------------
@@ -460,21 +501,30 @@ func TestBuildAntigravityInteractiveArgs_PassesArgsThroughPositional(t *testing.
    ------------------------------------------------------------------------ */
 
 func TestShapePTYExecArgs_ShapesAntigravity(t *testing.T) {
-	// Direct agy execute: must gain --print --dangerously-skip-permissions with
-	// the prompt preserved on argv (matches buildInteractiveCLIArgs).
+	// Direct agy execute: --dangerously-skip-permissions --print <prompt>
+	// (agy 1.1.x: --print takes the prompt as its value).
 	cmd, args := shapePTYExecArgs("agy", []string{"fix the bug"})
 	if cmd != "agy" {
 		t.Errorf("shapePTYExecArgs command = %q, want agy", cmd)
 	}
-	mustContain(t, args, "--print", "--dangerously-skip-permissions", "fix the bug")
+	if len(args) != 3 ||
+		args[0] != "--dangerously-skip-permissions" ||
+		args[1] != "--print" ||
+		args[2] != "fix the bug" {
+		t.Fatalf("shaped argv = %#v, want [skip --print fix the bug]", args)
+	}
 
 	// The `antigravity` alias is shaped identically.
 	_, aliasArgs := shapePTYExecArgs("antigravity", []string{"do it"})
-	mustContain(t, aliasArgs, "--print", "--dangerously-skip-permissions", "do it")
+	if len(aliasArgs) != 3 || aliasArgs[1] != "--print" || aliasArgs[2] != "do it" {
+		t.Fatalf("alias shaped argv = %#v", aliasArgs)
+	}
 
 	// Robust to an explicit path / .exe suffix (isAntigravityCommand normalizes).
 	_, pathArgs := shapePTYExecArgs("/usr/local/bin/agy", []string{"go"})
-	mustContain(t, pathArgs, "--print", "--dangerously-skip-permissions", "go")
+	if len(pathArgs) != 3 || pathArgs[2] != "go" {
+		t.Fatalf("path shaped argv = %#v", pathArgs)
+	}
 }
 
 func TestShapePTYExecArgs_ShapesShellWrappedAntigravity(t *testing.T) {
@@ -486,21 +536,25 @@ func TestShapePTYExecArgs_ShapesShellWrappedAntigravity(t *testing.T) {
 	if cmd != "bash" || len(args) != 2 || args[0] != "-c" {
 		t.Fatalf("shapePTYExecArgs reshaped shell wrapper: cmd=%q args=%v", cmd, args)
 	}
-	want := "agy --print --dangerously-skip-permissions --brief x"
+	// Remainder after `agy` is the literal --print value (quoted: has a space).
+	want := `agy --dangerously-skip-permissions --print "--brief x"`
 	if args[1] != want {
 		t.Errorf("shell-wrapped payload = %q, want %q", args[1], want)
 	}
 
-	// A bare `bash -c "agy"` with no prompt still gains the flags.
+	// A bare `bash -c "agy"` with no prompt still gains the permission flag
+	// (no bare --print — that would steal the next token as its value).
 	_, bareArgs := shapePTYExecArgs("bash", []string{"-c", "agy"})
-	if bareArgs[1] != "agy --print --dangerously-skip-permissions" {
+	if bareArgs[1] != "agy --dangerously-skip-permissions" {
 		t.Errorf("bare shell-wrapped agy = %q", bareArgs[1])
 	}
 
 	// The `antigravity` alias inside a shell wrapper is shaped identically.
+	// Multi-word prompt is quoted so bash -c re-parse keeps it as one --print value.
 	_, aliasArgs := shapePTYExecArgs("bash", []string{"-c", "antigravity do it"})
-	if aliasArgs[1] != "antigravity --print --dangerously-skip-permissions do it" {
-		t.Errorf("shell-wrapped antigravity = %q", aliasArgs[1])
+	wantAlias := `antigravity --dangerously-skip-permissions --print "do it"`
+	if aliasArgs[1] != wantAlias {
+		t.Errorf("shell-wrapped antigravity = %q, want %q", aliasArgs[1], wantAlias)
 	}
 }
 

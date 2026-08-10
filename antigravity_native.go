@@ -26,8 +26,8 @@ package main
 //   (3) parent orchestration approval for terminal access, (4) working-directory
 //   scope on Start, (5) process registration + orphan cleanup limited to
 //   AIExpedite-owned PIDs, (6) redacted telemetry (no prompts/secrets).
-//   One-shot buildAntigravityInteractiveArgs is unchanged and still uses the
-//   same flag for legacy terminal invocations.
+//   One-shot buildAntigravityInteractiveArgs (session_start / PTY) uses the
+//   same permission flag and the same --print <prompt> VALUE contract.
 
 import (
 	"encoding/json"
@@ -938,8 +938,8 @@ func antigravityNativeEnvelopePublishable(msg resultMsg) error {
 // Prompt is always the value of --print (agy 1.1.x). Native ID, when set,
 // is passed via --conversation. --continue is never emitted.
 //
-// The legacy one-shot builder (buildAntigravityInteractiveArgs) remains
-// unchanged for generic terminal invocations.
+// Session one-shot (buildAntigravityInteractiveArgs) uses the same
+// --print <prompt> adjacency for generic terminal / feature-agent kicks.
 func buildAntigravityNativeArgs(prompt, nativeConversationID string) []string {
 	args := make([]string, 0, 6)
 	// --print takes the prompt as its value (verified agy 1.1.2).
