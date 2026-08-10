@@ -871,6 +871,25 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		}
 	}
 
+	// Unknown login names stay literal in bash — reshape with --print rather
+	// than declining and leaving interactive agy waiting.
+	_, noUser := shapePTYExecArgs("bash", []string{"-c", `agy ~user_that_does_not_exist_xyzzy`})
+	wantNoUser := `agy --dangerously-skip-permissions --print '~user_that_does_not_exist_xyzzy'`
+	if noUser[1] != wantNoUser {
+		t.Errorf("unknown tilde login = %q, want %q", noUser[1], wantNoUser)
+	}
+	// Bash specials ~+ / ~- still expand — leave unshaped.
+	for _, orig := range []string{
+		`agy ~+`,
+		`agy ~-`,
+		`agy ~+/x`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("bash tilde special was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+
 	// Quoted braces/globs are literal — safe to reshape with single quotes.
 	_, qArgs := shapePTYExecArgs("bash", []string{"-c", `agy 'file{1,2}'`})
 	wantQ := `agy --dangerously-skip-permissions --print 'file{1,2}'`
