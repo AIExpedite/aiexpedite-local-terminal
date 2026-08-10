@@ -889,6 +889,18 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 			t.Errorf("bash tilde special was reshaped: got %q, want original %q", args[1], orig)
 		}
 	}
+	// Dash leaves ~+ / ~- literal — still reshape with --print.
+	for _, tc := range []struct {
+		orig, want string
+	}{
+		{`agy ~+`, `agy --dangerously-skip-permissions --print '~+'`},
+		{`agy ~-`, `agy --dangerously-skip-permissions --print '~-'`},
+	} {
+		_, args := shapePTYExecArgs("dash", []string{"-c", tc.orig})
+		if args[1] != tc.want {
+			t.Errorf("dash literal tilde special %q = %q, want %q", tc.orig, args[1], tc.want)
+		}
+	}
 	// Indexed ~+N / ~-N need a live directory-stack entry; fresh bash usually
 	// has none, so leave literal and still reshape with --print.
 	_, stackIdx := shapePTYExecArgs("bash", []string{"-c", `agy ~+1`})
@@ -1090,10 +1102,12 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	// Nested forms (${x:+$@}) also yield multiple fields when the outer
 	// expansion is active — decline those too. Nested ${@:1} needs balanced
 	// brace matching (first-} would truncate the body and miss multi-word).
+	// Bare indirect ${!ref} may resolve to @/* (ref=@ → multi fields).
 	for _, orig := range []string{
 		`agy "$@"`,
 		`agy "${files[@]}"`,
 		`agy "${!pre_@}"`,
+		`agy "${!ref}"`,
 		`agy --add-dir "$@" task`,
 		`agy "$@"'more'`,
 		`agy "${x:+$@}"`,
