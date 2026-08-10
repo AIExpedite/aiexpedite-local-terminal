@@ -580,6 +580,22 @@ func TestShapePTYExecArgs_ShellWrappedPreservesQuoteSemantics(t *testing.T) {
 	if sqArgs[1] != wantMulti {
 		t.Errorf("single-quoted prompt = %q, want %q", sqArgs[1], wantMulti)
 	}
+
+	// Control operators must be re-quoted on rebuild. After shellWords strips the
+	// protective quotes from `agy 'review;id'`, an unquoted rebuild would become
+	// `agy … --print review;id` and bash would run `id` as a separate command.
+	_, semiArgs := shapePTYExecArgs("bash", []string{"-c", `agy 'review;id'`})
+	wantSemi := `agy --dangerously-skip-permissions --print "review;id"`
+	if semiArgs[1] != wantSemi {
+		t.Errorf("semicolon prompt = %q, want %q", semiArgs[1], wantSemi)
+	}
+
+	// Other control / glob metacharacters also force quoting.
+	_, pipeArgs := shapePTYExecArgs("bash", []string{"-c", `agy 'a|b&c'`})
+	wantPipe := `agy --dangerously-skip-permissions --print "a|b&c"`
+	if pipeArgs[1] != wantPipe {
+		t.Errorf("pipe/amp prompt = %q, want %q", pipeArgs[1], wantPipe)
+	}
 }
 
 func TestShellWords(t *testing.T) {

@@ -2287,7 +2287,7 @@ func shellWords(s string) []string {
 
 // joinAntigravityShellCommand serializes cmd+args into a bash -c payload,
 // quoting any token that contains shell metacharacters so multi-word
-// --print values survive re-parsing.
+// --print values (and values with control operators) survive re-parsing.
 func joinAntigravityShellCommand(cmd string, args ...string) string {
 	parts := make([]string, 0, 1+len(args))
 	parts = append(parts, cmd)
@@ -2297,11 +2297,18 @@ func joinAntigravityShellCommand(cmd string, args ...string) string {
 	return strings.Join(parts, " ")
 }
 
+// shellArgMeta is the set of characters that force quoting when serializing a
+// token into a bash -c payload. Without this, an unquoted prompt like
+// `review;id` becomes two shell statements (`;` is a command separator).
+// Covers whitespace, quotes/escapes, expansions, control operators, globbing,
+// grouping, comments, history, and tilde.
+const shellArgMeta = " \t\n\r\"'\\$`;&|<>*?[](){}#!~"
+
 func quoteAntigravityShellArg(s string) string {
 	if s == "" {
 		return `""`
 	}
-	if !strings.ContainsAny(s, " \t\n\r\"'\\$`") {
+	if !strings.ContainsAny(s, shellArgMeta) {
 		return s
 	}
 	var b strings.Builder
@@ -2309,6 +2316,8 @@ func quoteAntigravityShellArg(s string) string {
 	b.WriteByte('"')
 	for i := 0; i < len(s); i++ {
 		c := s[i]
+		// Double-quote escapes: \, ", $, ` (bash). Control ops like ; & | are
+		// literal inside double quotes and need no extra escaping.
 		if c == '\\' || c == '"' || c == '$' || c == '`' {
 			b.WriteByte('\\')
 		}
