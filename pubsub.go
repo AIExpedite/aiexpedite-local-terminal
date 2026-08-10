@@ -2180,14 +2180,14 @@ func shapePTYExecArgs(command string, args []string) (string, []string) {
 // program and the remainder is preserved verbatim as the literal prompt.
 func shapeShellWrappedPTYArgs(command string, args []string) []string {
 	if payload, ok := shellDashCPayload(command, args); ok {
-		if shaped, ok := shapeAntigravityShellPayload(payload); ok {
+		if shaped, ok := shapeAntigravityShellPayload(command, payload); ok {
 			return replaceDashCPayload(args, shaped)
 		}
 	}
 	return args
 }
 
-// shapeAntigravityShellPayload rewrites a `bash -c` payload whose leading token
+// shapeAntigravityShellPayload rewrites a shell `-c` payload whose leading token
 // is agy/antigravity so the inner invocation gains the one-shot
 // `--dangerously-skip-permissions --print <prompt>` shaping, returning the
 // rewritten payload and true. It returns ("", false) when the first token is
@@ -2195,13 +2195,18 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 // quotes (leave the original payload alone so bash reports the syntax error
 // rather than inventing a valid permission-skipping invocation).
 //
+// shellCmd is the wrapper executable (bash/dash/sh/…) so dialect-specific
+// expansions (brace expansion) are only rejected when that shell performs them.
+//
 // Tokenization strips protective quotes/escapes and tracks whether each word
 // contains unescaped `$` / “ ` “ (bash would expand them). Rebuild preserves
 // expansion per prompt fragment so `agy "$TASK"` still expands while
 // `agy '$(cmd)'` and `agy "\$(cmd)"` stay literal — never OR-ing expand across
 // mixed fragments into one double-quoted blob that reactivates substitutions.
-func shapeAntigravityShellPayload(payload string) (string, bool) {
-	words, err := shellWords(payload)
+func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
+	words, err := shellWords(payload, shellWordOptions{
+		braceExpand: shellSupportsBraceExpansion(shellCmd),
+	})
 	if err != nil {
 		// Malformed shell (unterminated quote, etc.) — do not reshape into a
 		// runnable agy command.
@@ -2502,13 +2507,38 @@ func (w shellWord) hasUnquotedExpand() bool {
 // quotes, and backslash escapes outside single quotes). Enough for the
 // operator-joined `bash -c "agy …"` payloads we reshape — not a full shell.
 //
+// shellWordOptions controls dialect-sensitive tokenization rules.
+type shellWordOptions struct {
+	// braceExpand is true when the wrapper shell performs brace expansion
+	// (bash/zsh/ksh). POSIX sh/dash leave braces literal.
+	braceExpand bool
+}
+
+// shellSupportsBraceExpansion reports whether the named shell executable
+// performs brace expansion on unquoted `{a,b}` / `file{1,2}` forms.
+func shellSupportsBraceExpansion(command string) bool {
+	base := strings.ToLower(filepath.Base(filepath.ToSlash(command)))
+	base = strings.TrimSuffix(base, ".exe")
+	switch base {
+	case "sh", "dash", "ash", "busybox":
+		// POSIX sh and dash/ash: braces are ordinary characters.
+		// (bash invoked as sh also disables brace expansion in POSIX mode.)
+		return false
+	default:
+		// bash, zsh, ksh, and unknown → assume brace expansion exists.
+		return true
+	}
+}
+
 // Returns an error when a quote remains open at end-of-input (unterminated
 // syntax), when unquoted parentheses appear (bash rejects unmatched ones; we
-// do not parse subshells/groups), when unquoted glob / expanding-brace / leading
-// tilde metacharacters appear (we cannot rebuild without losing expansion), or
+// do not parse subshells/groups), when unquoted glob / expanding-brace / tilde
+// metacharacters appear (we cannot rebuild without losing expansion), or
 // when ANSI-C / locale quoting ($'…' / $"…") appears (we do not implement those
-// forms). Mid-word `~` and non-expanding brace forms (`{foo}`) are ordinary
-// literals. An unquoted `#` at a word boundary ends tokenization (shell comment).
+// forms). Mid-word `~` (not after `=`/`:`) and non-expanding brace forms
+// (`{foo}`) are ordinary literals. Brace-expansion rejection is gated by
+// opts.braceExpand (dash/sh leave braces literal). An unquoted `#` at a word
+// boundary ends tokenization (shell comment).
 // Backslash-newline line continuations (quoted or unquoted) drop both chars and
 // do not start a word (so a following `#` stays a comment).
 // Escaped `$` / “ ` “ inside an open `${…}` declines reshape (segment splits
@@ -2516,7 +2546,7 @@ func (w shellWord) hasUnquotedExpand() bool {
 // `$` + line-continuation(s) + quote is treated as ANSI-C / locale quoting
 // (bash joins them before quote recognition).
 // Callers must not turn rejected payloads into a valid command.
-func shellWords(s string) ([]shellWord, error) {
+func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 	var words []shellWord
 	var segs []shellSegment
 	var segCur strings.Builder
@@ -2532,6 +2562,26 @@ func shellWords(s string) ([]shellWord, error) {
 	// paramDepth tracks nested ${…} in expansion-eligible contexts so that
 	// escaped \$ / \` inside a still-open parameter expansion can decline reshape.
 	paramDepth := 0
+
+	// wordPrefixEndsWithAssignSep reports whether the partial word so far ends
+	// with unquoted '=' or ':' — positions where bash performs tilde expansion
+	// inside assignment-like words (`HOME=~`, `PATH=~/bin:~/x`).
+	wordPrefixEndsWithAssignSep := func() bool {
+		if segCur.Len() > 0 {
+			b := segCur.String()
+			c := b[len(b)-1]
+			return c == '=' || c == ':'
+		}
+		for i := len(segs) - 1; i >= 0; i-- {
+			v := segs[i].Value
+			if len(v) == 0 {
+				continue
+			}
+			c := v[len(v)-1]
+			return c == '=' || c == ':'
+		}
+		return false
+	}
 
 	flushSeg := func() {
 		if segStarted {
@@ -2732,17 +2782,19 @@ func shellWords(s string) ([]shellWord, error) {
 			// Rebuilding would single-quote them and freeze the pattern.
 			return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 		case '~':
-			// Tilde expansion only applies at the start of a word (`~/x`,
-			// `~user`). Mid-word `foo~bar` is ordinary literal data.
-			if !wordStarted {
+			// Bash tilde expansion: word-initial (`~/x`, `~user`) and after
+			// unquoted `=` / `:` in assignment-like words (`HOME=~`,
+			// `PATH=~/bin:~/x`). Mid-word `foo~bar` is ordinary literal data.
+			if !wordStarted || wordPrefixEndsWithAssignSep() {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)
 		case '{':
 			// Brace expansion (`file{1,2}`, `{a,b}`, `{1..3}`) runs before
-			// agy sees argv — decline reshape. Non-expanding forms like
-			// `{foo}` (no comma / `..`) are ordinary literals.
-			if looksLikeUnquotedBraceExpansion(s, i) {
+			// agy sees argv on bash/zsh/ksh — decline reshape. Dash/sh leave
+			// braces literal (opts.braceExpand false). Non-expanding forms
+			// like `{foo}` (no comma / `..`) are ordinary literals.
+			if opts.braceExpand && looksLikeUnquotedBraceExpansion(s, i) {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)

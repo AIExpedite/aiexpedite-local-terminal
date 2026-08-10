@@ -803,6 +803,24 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if midTilde[1] != wantMidTilde {
 		t.Errorf("mid-word tilde prompt = %q, want %q", midTilde[1], wantMidTilde)
 	}
+
+	// Assignment-like tilde (`HOME=~`, after `:`) expands in bash — leave unshaped.
+	for _, orig := range []string{
+		`agy HOME=~`,
+		`agy PATH=~/bin:~/x`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("assignment tilde was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+
+	// Dash does not brace-expand — reshape `file{1,2}` as a literal prompt.
+	_, dashBrace := shapePTYExecArgs("dash", []string{"-c", `agy file{1,2}`})
+	wantDashBrace := `agy --dangerously-skip-permissions --print 'file{1,2}'`
+	if dashBrace[1] != wantDashBrace {
+		t.Errorf("dash brace prompt = %q, want %q", dashBrace[1], wantDashBrace)
+	}
 }
 
 // Unquoted expansions (single- or multi-fragment) must not be double-quoted on
@@ -839,7 +857,7 @@ func TestShapePTYExecArgs_ClosesUnquotedParamExpansion(t *testing.T) {
 	}
 
 	// Unquoted form must parse without "inside parameter expansion" error.
-	words, err := shellWords(`agy --add-dir ${ROOT}\$dir task`)
+	words, err := shellWords(`agy --add-dir ${ROOT}\$dir task`, shellWordOptions{braceExpand: true})
 	if err != nil {
 		t.Fatalf("shellWords unquoted param+escaped $: %v", err)
 	}
@@ -1021,6 +1039,8 @@ func TestShellWords(t *testing.T) {
 		{`agy review ~/proj`, nil, nil, true},
 		{`agy review {foo}`, []string{"agy", "review", "{foo}"}, []bool{false, false, false}, false},
 		{`agy review foo~bar`, []string{"agy", "review", "foo~bar"}, []bool{false, false, false}, false},
+		{`agy HOME=~`, nil, nil, true},
+		{`agy PATH=~/bin:~/x`, nil, nil, true},
 		{`agy $OPTIONAL task`, []string{"agy", "$OPTIONAL", "task"}, []bool{false, true, false}, false},
 		{`agy --add-dir ${ROOT}\$dir task`, []string{"agy", "--add-dir", `${ROOT}$dir`, "task"}, []bool{false, false, true, false}, false},
 		{`agy "${TASK:-\$(x)}"`, nil, nil, true},
@@ -1032,7 +1052,7 @@ func TestShellWords(t *testing.T) {
 		{`agy review#note`, []string{"agy", "review#note"}, []bool{false, false}, false},
 	}
 	for _, tc := range cases {
-		got, err := shellWords(tc.in)
+		got, err := shellWords(tc.in, shellWordOptions{braceExpand: true})
 		if tc.wantErr {
 			if err == nil {
 				t.Errorf("shellWords(%q) expected error, got %#v", tc.in, got)
@@ -1055,6 +1075,15 @@ func TestShellWords(t *testing.T) {
 				t.Errorf("shellWords(%q)[%d].Expand = %v, want %v", tc.in, i, got[i].Expand, tc.wantExpand[i])
 			}
 		}
+	}
+
+	// Dash/POSIX: braces are literal — no error, token preserved.
+	gotDash, errDash := shellWords(`agy file{1,2}`, shellWordOptions{braceExpand: false})
+	if errDash != nil {
+		t.Fatalf("shellWords dash braces: %v", errDash)
+	}
+	if len(gotDash) != 2 || gotDash[1].Value != "file{1,2}" {
+		t.Errorf("shellWords dash braces = %#v, want file{1,2}", gotDash)
 	}
 }
 
