@@ -735,19 +735,48 @@ func TestShapePTYExecArgs_RejectsUnmatchedShellGrouping(t *testing.T) {
 	}
 }
 
-// Unquoted braces are valid bash (brace expansion / prompt text) and must still
-// receive one-shot shaping rather than being left as an interactive TUI hang.
-func TestShapePTYExecArgs_AllowsUnquotedBraces(t *testing.T) {
-	_, args := shapePTYExecArgs("bash", []string{"-c", `agy file{1,2}`})
-	want := `agy --dangerously-skip-permissions --print 'file{1,2}'`
-	if args[1] != want {
-		t.Errorf("brace word = %q, want %q", args[1], want)
+// Unquoted glob / brace / tilde expansion cannot be reshaped without losing
+// bash semantics (rebuild would single-quote and freeze the metacharacters).
+// Leave the original payload alone. Quoted forms still reshape as literals.
+func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
+	for _, orig := range []string{
+		`agy file{1,2}`,
+		`agy review {foo}`,
+		`agy review *.go`,
+		`agy review ~/proj`,
+		`agy review file[ab]`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("unquoted expansion was reshaped: got %q, want original %q", args[1], orig)
+		}
 	}
 
-	_, spaced := shapePTYExecArgs("bash", []string{"-c", `agy review {foo}`})
-	wantSpaced := `agy --dangerously-skip-permissions --print 'review {foo}'`
-	if spaced[1] != wantSpaced {
-		t.Errorf("brace prompt = %q, want %q", spaced[1], wantSpaced)
+	// Quoted braces/globs are literal — safe to reshape with single quotes.
+	_, qArgs := shapePTYExecArgs("bash", []string{"-c", `agy 'file{1,2}'`})
+	wantQ := `agy --dangerously-skip-permissions --print 'file{1,2}'`
+	if qArgs[1] != wantQ {
+		t.Errorf("quoted brace prompt = %q, want %q", qArgs[1], wantQ)
+	}
+}
+
+// Bash line continuation (backslash-newline) removes both characters; the
+// reshaped --print value must not contain a literal newline.
+func TestShapePTYExecArgs_DropsShellLineContinuation(t *testing.T) {
+	// Double-quoted: agy "fix\<newline>bug" → prompt "fixbug".
+	payload := "agy \"fix\\\nbug\""
+	_, args := shapePTYExecArgs("bash", []string{"-c", payload})
+	want := `agy --dangerously-skip-permissions --print fixbug`
+	if args[1] != want {
+		t.Errorf("double-quoted line continuation = %q, want %q", args[1], want)
+	}
+
+	// Unquoted: agy fix\<newline>bug → same joined word.
+	payloadU := "agy fix\\\nbug"
+	_, uArgs := shapePTYExecArgs("bash", []string{"-c", payloadU})
+	wantU := `agy --dangerously-skip-permissions --print fixbug`
+	if uArgs[1] != wantU {
+		t.Errorf("unquoted line continuation = %q, want %q", uArgs[1], wantU)
 	}
 }
 
@@ -826,7 +855,9 @@ func TestShellWords(t *testing.T) {
 		{`agy "\$(touch /tmp/pwn)"`, []string{"agy", "$(touch /tmp/pwn)"}, []bool{false, false}, false},
 		{`agy "$TASK"'$(x)'`, []string{"agy", "$TASK$(x)"}, []bool{false, true}, false},
 		{`agy "\$(x)$TASK"`, []string{"agy", "$(x)$TASK"}, []bool{false, true}, false},
-		{`agy file{1,2}`, []string{"agy", "file{1,2}"}, []bool{false, false}, false},
+		{`agy 'file{1,2}'`, []string{"agy", "file{1,2}"}, []bool{false, false}, false},
+		{"agy \"fix\\\nbug\"", []string{"agy", "fixbug"}, []bool{false, false}, false},
+		{"agy fix\\\nbug", []string{"agy", "fixbug"}, []bool{false, false}, false},
 		{`agy ""`, []string{"agy", ""}, []bool{false, false}, false},
 		{`  agy   `, []string{"agy"}, []bool{false}, false},
 		{``, nil, nil, false},
@@ -834,6 +865,9 @@ func TestShellWords(t *testing.T) {
 		{`agy "fix`, nil, nil, true},
 		{`agy review)`, nil, nil, true},
 		{`agy review(`, nil, nil, true},
+		{`agy file{1,2}`, nil, nil, true},
+		{`agy review *.go`, nil, nil, true},
+		{`agy review ~/proj`, nil, nil, true},
 		{`agy $'(x)'`, nil, nil, true},
 		{`agy $"x"`, nil, nil, true},
 		{`agy review # note`, []string{"agy", "review"}, []bool{false, false}, false},

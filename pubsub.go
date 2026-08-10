@@ -2465,9 +2465,11 @@ func (w shellWord) effectiveSegments() []shellSegment {
 //
 // Returns an error when a quote remains open at end-of-input (unterminated
 // syntax), when unquoted parentheses appear (bash rejects unmatched ones; we
-// do not parse subshells/groups), or when ANSI-C / locale quoting ($'…' / $"…")
-// appears (we do not implement those forms). Unquoted braces are allowed.
+// do not parse subshells/groups), when unquoted glob/brace/tilde metacharacters
+// appear (we cannot rebuild without losing expansion), or when ANSI-C / locale
+// quoting ($'…' / $"…") appears (we do not implement those forms).
 // An unquoted `#` at a word boundary ends tokenization (shell comment).
+// Backslash-newline line continuations (quoted or unquoted) drop both chars.
 // Callers must not turn rejected payloads into a valid command.
 func shellWords(s string) ([]shellWord, error) {
 	var words []shellWord
@@ -2538,6 +2540,12 @@ func shellWords(s string) ([]shellWord, error) {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if escaped {
+			// Unquoted line continuation: backslash-newline is deleted entirely
+			// (bash joins physical lines; do not keep a literal newline).
+			if c == '\n' {
+				escaped = false
+				continue
+			}
 			// Backslash-escaped content is literal — including \$ and \`.
 			if c == '$' || c == '`' {
 				writeEscapedExpansion(c)
@@ -2567,13 +2575,19 @@ func shellWords(s string) ([]shellWord, error) {
 			if c == '\\' && i+1 < len(s) {
 				next := s[i+1]
 				// bash double-quote escapes: \, ", $, `, newline — remove the
-				// backslash and keep the next char as literal (so \$ → $).
+				// backslash and keep the next char as literal (so \$ → $),
+				// except line continuation (backslash-newline) removes both.
 				if next == '$' || next == '`' {
 					i++
 					writeEscapedExpansion(next)
 					continue
 				}
-				if next == '\\' || next == '"' || next == '\n' {
+				if next == '\n' {
+					i++
+					// Line continuation inside double quotes: drop \ and newline.
+					continue
+				}
+				if next == '\\' || next == '"' {
 					i++
 					writeSeg(next, false)
 					continue
@@ -2590,6 +2604,7 @@ func shellWords(s string) ([]shellWord, error) {
 				continue
 			}
 			// Double-quoted: unescaped $ / ` are expandable; other chars literal.
+			// Brace/glob/tilde do not expand inside double quotes — literal OK.
 			writeSeg(c, c == '$' || c == '`')
 			continue
 		}
@@ -2619,9 +2634,14 @@ func shellWords(s string) ([]shellWord, error) {
 		case '(', ')':
 			// We do not parse subshells/groups. Unquoted parens are either
 			// unmatched (bash syntax error) or full shell syntax we would
-			// mis-reshape — leave the original payload alone. Braces stay
-			// allowed (brace expansion / ordinary prompt text).
+			// mis-reshape — leave the original payload alone.
 			return nil, fmt.Errorf("unsupported unquoted shell metacharacter %q", c)
+		case '*', '?', '[', ']', '{', '}', '~':
+			// Unquoted glob / brace / tilde expansion runs before agy sees the
+			// argv. Rebuilding with quoteAntigravityShellArg would single-quote
+			// these characters and lose that semantics (e.g. file{1,2} →
+			// 'file{1,2}'). Quoted forms stay literal and are handled above.
+			return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 		default:
 			// ANSI-C ($'…') / locale ($"…") quoting: not implemented. A bare
 			// unquoted $ followed by a quote would otherwise be misread as
