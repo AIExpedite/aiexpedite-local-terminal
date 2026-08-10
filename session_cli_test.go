@@ -1185,6 +1185,16 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	if bashEq[1] != wantBashEq {
 		t.Errorf("bash literal =ls = %q, want %q", bashEq[1], wantBashEq)
 	}
+	// An escaped leading equals is literal even on zsh, so the eligible
+	// one-shot should still reshape. Bash follows the same literal path.
+	escapedZshEq := `agy \=ls review`
+	wantEscapedZshEq := `agy --dangerously-skip-permissions --print '=ls review'`
+	for _, shell := range []string{"zsh", "bash"} {
+		_, args := shapePTYExecArgs(shell, []string{"-c", escapedZshEq})
+		if args[1] != wantEscapedZshEq {
+			t.Errorf("%s escaped literal =ls = %q, want %q", shell, args[1], wantEscapedZshEq)
+		}
+	}
 
 	// zsh PE split/array flags still multi-field when double-quoted
 	// (`"${(s.:.)TASK}"` with TASK=fix:bug → fix bug). Reshape would put only

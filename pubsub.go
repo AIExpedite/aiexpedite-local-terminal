@@ -3102,8 +3102,10 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			flushSeg()
 		}
 		if !segStarted {
-			// Escaped bytes are still outside quotes for segment bookkeeping.
-			segUnquoted = !inSingle && !inDouble
+			// Escaped bytes are protected from shell substitutions just like
+			// quoted bytes. Preserve that distinction for dialect checks such as
+			// zsh's word-initial EQUALS expansion (`=cmd`, but not `\=cmd`).
+			segUnquoted = unquotedCtx
 		}
 		if unquotedCtx {
 			if c == '=' {
