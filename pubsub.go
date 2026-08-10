@@ -2206,6 +2206,7 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 	words, err := shellWords(payload, shellWordOptions{
 		braceExpand: shellSupportsBraceExpansion(shellCmd),
+		dollarQuote: shellSupportsDollarQuote(shellCmd),
 	})
 	if err != nil {
 		// Malformed shell (unterminated quote, etc.) — do not reshape into a
@@ -2548,13 +2549,17 @@ func shellExpandIsMultiWord(s string) bool {
 }
 
 // shellParamBodyIsMultiWord reports whether a ${…} body (without braces) is a
-// multi-field expansion: @ with optional operators, or name[@] / !name[@].
+// multi-field expansion: @ with optional operators, name[@] / !name[@], or
+// prefix-name expansion ${!prefix@}.
 func shellParamBodyIsMultiWord(body string) bool {
 	if body == "" {
 		return false
 	}
-	// Indirect / nameref forms used with arrays: ${!name[@]}
+	hadBang := false
+	// Indirect / nameref / prefix-name forms start with '!': ${!name[@]},
+	// ${!prefix@}. Strip one leading '!' then classify the remainder.
 	if body[0] == '!' {
+		hadBang = true
 		body = body[1:]
 		if body == "" {
 			return false
@@ -2564,8 +2569,19 @@ func shellParamBodyIsMultiWord(body string) bool {
 		// ${@}, ${@:1}, ${@#pat}, …
 		return true
 	}
-	// Array all-elements subscript: name[@], name[@]:offset, …
-	return strings.Contains(body, "[@]")
+	// Array all-elements subscript: name[@], name[@]:offset, !name[@], …
+	if strings.Contains(body, "[@]") {
+		return true
+	}
+	// Prefix-name expansion ${!prefix@} (quoted) yields multiple matching
+	// names. After stripping '!', body is "prefix@" — not the array form
+	// name[@] (handled above) and not bare indirect ${!name} (no '@').
+	if hadBang {
+		if at := strings.IndexByte(body, '@'); at > 0 && body[at-1] != '[' {
+			return true
+		}
+	}
+	return false
 }
 
 // shellWords splits a shell-style command line into argument values, applying
@@ -2578,6 +2594,10 @@ type shellWordOptions struct {
 	// braceExpand is true when the wrapper shell performs brace expansion
 	// (bash/zsh/ksh). POSIX sh/dash leave braces literal.
 	braceExpand bool
+	// dollarQuote is true when the wrapper supports ANSI-C ($'…') / locale
+	// ($"…") quoting (bash/zsh/ksh). POSIX sh/dash treat $'…' as a literal
+	// dollar concatenated with a quoted string.
+	dollarQuote bool
 }
 
 // shellSupportsBraceExpansion reports whether the named shell executable
@@ -2596,18 +2616,34 @@ func shellSupportsBraceExpansion(command string) bool {
 	}
 }
 
+// shellSupportsDollarQuote reports whether the named shell supports ANSI-C
+// ($'…') and locale ($"…") quoting. Dash/POSIX sh do not — they treat the
+// leading $ as an ordinary character before the quote.
+func shellSupportsDollarQuote(command string) bool {
+	base := strings.ToLower(filepath.Base(filepath.ToSlash(command)))
+	base = strings.TrimSuffix(base, ".exe")
+	switch base {
+	case "sh", "dash", "ash", "busybox":
+		return false
+	default:
+		// bash, zsh, ksh, and unknown → assume dollar-quoting exists.
+		return true
+	}
+}
+
 // Returns an error when a quote remains open at end-of-input (unterminated
 // syntax), when unquoted parentheses appear (bash rejects unmatched ones; we
 // do not parse subshells/groups), when unquoted glob / expanding-brace / tilde
 // metacharacters appear (we cannot rebuild without losing expansion), or
-// when ANSI-C / locale quoting ($'…' / $"…") appears (we do not implement those
-// forms). Mid-word `~` (not word-initial and not in an assignment-like tilde
-// position) and non-expanding brace forms (`{foo}`) are ordinary literals.
-// Assignment-like tilde positions are after unquoted `=` (`HOME=~`) and after
-// `:` only once an unquoted `=` has already appeared (`PATH=/bin:~/x`); a bare
-// `foo:~` is literal. Brace-expansion rejection is gated by opts.braceExpand
-// (dash/sh leave braces literal). An unquoted `#` at a word boundary ends
-// tokenization (shell comment).
+// when ANSI-C / locale quoting ($'…' / $"…") appears on dollarQuote shells (we
+// do not implement those forms; dash/sh leave $'…' as literal '$'+quoted text).
+// Mid-word `~` (not word-initial and not after an unquoted assign separator)
+// and non-expanding brace forms (`{foo}`) are ordinary literals.
+// Assignment-like tilde positions require an unquoted `=` (`HOME=~`) or an
+// unquoted `:` after such an `=` (`PATH=/bin:~/x`); quoted separators
+// (`'HOME='~`) and bare `foo:~` stay literal. Brace-expansion / dollar-quote
+// rejection is gated by opts (dash/sh leave both features off). An unquoted
+// `#` at a word boundary ends tokenization (shell comment).
 // Backslash-newline line continuations (quoted or unquoted) drop both chars and
 // do not start a word (so a following `#` stays a comment).
 // Escaped `$` / “ ` “ inside an open `${…}` declines reshape (segment splits
@@ -2635,35 +2671,17 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 	// Bash only tilde-expands after ':' inside assignment-like words, so a
 	// colon without a prior unquoted '=' (`foo:~`) stays literal.
 	sawUnquotedAssign := false
+	// endsWithUnquotedAssignSep is set when the most recent character written
+	// into this word was an unquoted '=' or (after sawUnquotedAssign) ':'.
+	// Quoted separators (e.g. 'HOME='~) must not activate tilde expansion —
+	// only the resulting byte value is not enough.
+	endsWithUnquotedAssignSep := false
 
 	// wordPrefixIsTildeExpandPosition reports whether a following unquoted '~'
-	// would tilde-expand: after unquoted '=' always, or after ':' only when
-	// the word is already assignment-like (saw unquoted '=').
+	// would tilde-expand: after an unquoted '=' always, or after an unquoted
+	// ':' only when the word is already assignment-like.
 	wordPrefixIsTildeExpandPosition := func() bool {
-		var last byte
-		var ok bool
-		if segCur.Len() > 0 {
-			b := segCur.String()
-			last = b[len(b)-1]
-			ok = true
-		} else {
-			for i := len(segs) - 1; i >= 0; i-- {
-				v := segs[i].Value
-				if len(v) == 0 {
-					continue
-				}
-				last = v[len(v)-1]
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return false
-		}
-		if last == '=' {
-			return true
-		}
-		return last == ':' && sawUnquotedAssign
+		return endsWithUnquotedAssignSep
 	}
 
 	flushSeg := func() {
@@ -2696,6 +2714,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		segs = nil
 		wordStarted = false
 		sawUnquotedAssign = false
+		endsWithUnquotedAssignSep = false
 	}
 	writeSeg := func(c byte, expandable bool) {
 		unquotedCtx := !inSingle && !inDouble
@@ -2707,8 +2726,19 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		if !segStarted {
 			segUnquoted = unquotedCtx
 		}
-		if unquotedCtx && c == '=' {
-			sawUnquotedAssign = true
+		if unquotedCtx {
+			if c == '=' {
+				sawUnquotedAssign = true
+				endsWithUnquotedAssignSep = true
+			} else if c == ':' && sawUnquotedAssign {
+				endsWithUnquotedAssignSep = true
+			} else {
+				// Any other unquoted byte ends the "separator just written" state.
+				endsWithUnquotedAssignSep = false
+			}
+		} else {
+			// Quoted / escaped content never leaves an unquoted assign sep.
+			endsWithUnquotedAssignSep = false
 		}
 		segCur.WriteByte(c)
 		segStarted = true
@@ -2894,14 +2924,20 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			writeSeg(c, false)
 			noteParamClose(c)
 		default:
-			// ANSI-C ($'…') / locale ($"…") quoting: not implemented. A bare
-			// unquoted $ followed by a quote (possibly after deleted line
-			// continuations) would otherwise be misread as expandable $ +
-			// ordinary quotes (e.g. $'(touch …)' or $\n'(…)' → executed).
+			// ANSI-C ($'…') / locale ($"…") quoting: not implemented on bash-
+			// family shells — reject so we never rebuild $'(touch …)' into an
+			// expandable substitution. Dash/POSIX sh lack dollar-quotes and
+			// treat $'text' as literal '$' + quoted text; keep that path.
 			if c == '$' {
 				j := nextAfterLineContinuations(s, i+1)
 				if j < len(s) && (s[j] == '\'' || s[j] == '"') {
-					return nil, fmt.Errorf("unsupported ANSI-C or locale quoted string")
+					if opts.dollarQuote {
+						return nil, fmt.Errorf("unsupported ANSI-C or locale quoted string")
+					}
+					// Non-dollar-quote shell: leading $ is an ordinary literal
+					// character before the quote (dash yields value "$text").
+					writeSeg(c, false)
+					continue
 				}
 			}
 			expandable := c == '$' || c == '`'

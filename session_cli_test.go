@@ -824,6 +824,13 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		}
 	}
 
+	// Quoted '=' is not an assignment separator — `'HOME='~` is literal HOME=~.
+	_, qEqTilde := shapePTYExecArgs("bash", []string{"-c", `agy 'HOME='~`})
+	wantQEqTilde := `agy --dangerously-skip-permissions --print 'HOME=~'`
+	if qEqTilde[1] != wantQEqTilde {
+		t.Errorf("quoted-eq tilde prompt = %q, want %q", qEqTilde[1], wantQEqTilde)
+	}
+
 	// Dash does not brace-expand — reshape `file{1,2}` as a literal prompt.
 	_, dashBrace := shapePTYExecArgs("dash", []string{"-c", `agy file{1,2}`})
 	wantDashBrace := `agy --dangerously-skip-permissions --print 'file{1,2}'`
@@ -858,6 +865,7 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	for _, orig := range []string{
 		`agy "$@"`,
 		`agy "${files[@]}"`,
+		`agy "${!pre_@}"`,
 		`agy --add-dir "$@" task`,
 		`agy "$@"'more'`,
 	} {
@@ -872,6 +880,23 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	wantStar := `agy --dangerously-skip-permissions --print "$*"`
 	if star[1] != wantStar {
 		t.Errorf("quoted $* expand = %q, want %q", star[1], wantStar)
+	}
+}
+
+// Dash lacks ANSI-C / locale dollar-quoting: $'text' is literal "$text" and
+// must still reshape (unlike bash, which we refuse to reshape for $'…').
+func TestShapePTYExecArgs_DashDollarQuoteIsLiteral(t *testing.T) {
+	_, args := shapePTYExecArgs("dash", []string{"-c", `agy $'review text'`})
+	want := `agy --dangerously-skip-permissions --print '$review text'`
+	if args[1] != want {
+		t.Errorf("dash dollar-quote prompt = %q, want %q", args[1], want)
+	}
+
+	// Bash still declines ANSI-C so we never rebuild into an expandable form.
+	orig := `agy $'review text'`
+	_, bashArgs := shapePTYExecArgs("bash", []string{"-c", orig})
+	if bashArgs[1] != orig {
+		t.Errorf("bash ANSI-C was reshaped: got %q, want original %q", bashArgs[1], orig)
 	}
 }
 
@@ -1073,8 +1098,10 @@ func TestShellWords(t *testing.T) {
 		{`agy PATH=~/bin:~/x`, nil, nil, true},
 		{`agy PATH=/bin:~/x`, nil, nil, true},
 		{`agy foo:~`, []string{"agy", "foo:~"}, []bool{false, false}, false},
+		{`agy 'HOME='~`, []string{"agy", "HOME=~"}, []bool{false, false}, false},
 		{`agy "$@"`, []string{"agy", "$@"}, []bool{false, true}, false},
 		{`agy "${files[@]}"`, []string{"agy", `${files[@]}`}, []bool{false, true}, false},
+		{`agy "${!pre_@}"`, []string{"agy", `${!pre_@}`}, []bool{false, true}, false},
 		{`agy "$*"`, []string{"agy", "$*"}, []bool{false, true}, false},
 		{`agy $OPTIONAL task`, []string{"agy", "$OPTIONAL", "task"}, []bool{false, true, false}, false},
 		{`agy --add-dir ${ROOT}\$dir task`, []string{"agy", "--add-dir", `${ROOT}$dir`, "task"}, []bool{false, false, true, false}, false},
@@ -1086,8 +1113,10 @@ func TestShellWords(t *testing.T) {
 		{`agy review # note`, []string{"agy", "review"}, []bool{false, false}, false},
 		{`agy review#note`, []string{"agy", "review#note"}, []bool{false, false}, false},
 	}
+	// Table cases model bash (brace expand + dollar-quote).
+	bashOpts := shellWordOptions{braceExpand: true, dollarQuote: true}
 	for _, tc := range cases {
-		got, err := shellWords(tc.in, shellWordOptions{braceExpand: true})
+		got, err := shellWords(tc.in, bashOpts)
 		if tc.wantErr {
 			if err == nil {
 				t.Errorf("shellWords(%q) expected error, got %#v", tc.in, got)
@@ -1113,12 +1142,21 @@ func TestShellWords(t *testing.T) {
 	}
 
 	// Dash/POSIX: braces are literal — no error, token preserved.
-	gotDash, errDash := shellWords(`agy file{1,2}`, shellWordOptions{braceExpand: false})
+	gotDash, errDash := shellWords(`agy file{1,2}`, shellWordOptions{braceExpand: false, dollarQuote: false})
 	if errDash != nil {
 		t.Fatalf("shellWords dash braces: %v", errDash)
 	}
 	if len(gotDash) != 2 || gotDash[1].Value != "file{1,2}" {
 		t.Errorf("shellWords dash braces = %#v, want file{1,2}", gotDash)
+	}
+
+	// Dash: $'text' is literal dollar + quoted text, not ANSI-C.
+	gotDQ, errDQ := shellWords(`agy $'review text'`, shellWordOptions{braceExpand: false, dollarQuote: false})
+	if errDQ != nil {
+		t.Fatalf("shellWords dash dollar-quote: %v", errDQ)
+	}
+	if len(gotDQ) != 2 || gotDQ[1].Value != "$review text" || gotDQ[1].Expand {
+		t.Errorf("shellWords dash dollar-quote = %#v, want $review text Expand=false", gotDQ)
 	}
 }
 
