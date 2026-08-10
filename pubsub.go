@@ -2230,13 +2230,15 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 	// unshaped. Double-quoted multi-field expansions (`"$@"`, `"${arr[@]}"`)
 	// also cannot ride inside one --print value (bash would re-split them into
 	// multiple argv tokens after --print). Single-field double-quoted forms
-	// (`"$TASK"`, `--add-dir "$ROOT"`) still reshape.
+	// (`"$TASK"`, `--add-dir "$ROOT"`) still reshape on bash — but NOT on zsh,
+	// where .zshenv can have declared any name an array (see
+	// hasQuotedZshNamedParamExpand).
 	zshEquals := shellSupportsZshEquals(shellCmd)
 	checkWord := func(f shellWord) bool {
 		if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
 			return false
 		}
-		if zshEquals && (f.hasZshEqualsSub() || f.hasQuotedZshArrayExpand()) {
+		if zshEquals && (f.hasZshEqualsSub() || f.hasQuotedZshNamedParamExpand()) {
 			return false
 		}
 		return true
@@ -2649,18 +2651,28 @@ func (w shellWord) hasZshEqualsSub() bool {
 	return false
 }
 
-// hasQuotedZshArrayExpand reports double-quoted expansions of zsh's built-in
-// array parameters (`"$argv"`, `"${path}"`, …). Unlike bash, zsh can still
-// emit multiple fields from those forms without an explicit `[@]` / `(@)` flag,
-// so riding them inside one --print value spills trailing elements as argv.
-// Unquoted `$argv` is already covered by hasUnquotedExpand; this is zsh-only
-// (callers gate on shellSupportsZshEquals).
-func (w shellWord) hasQuotedZshArrayExpand() bool {
+// hasQuotedZshNamedParamExpand reports double-quoted expansions that reference
+// a zsh parameter *by name* (`"$TASK"`, `"${path}"`, `"${(U)TASK}"`, …).
+//
+// zsh sources `.zshenv` on every invocation — including non-interactive
+// `zsh -c` — so any name may have been declared an array (`TASK=(fix bug)`)
+// before our payload runs, on top of the built-in arrays (`argv`, `path`, …).
+// Nothing in the payload proves a name is scalar, and an array riding inside
+// one rebuilt `--print "…"` value spills its trailing elements into argv
+// (`--print fix bug` → prompt "fix" plus a stray positional "bug"). So decline
+// the reshape for every named reference and run the caller's command verbatim.
+//
+// Provably single-field forms still reshape: `$(cmd)` / `$((expr))`
+// substitutions, `${#name}` counts, and positional / non-name specials
+// (`$1`, `${1}`, `$?`, `$*`, …). Unquoted expansions are already covered by
+// hasUnquotedExpand; this is zsh-only (callers gate on shellSupportsZshEquals),
+// so bash payloads like `agy "$TASK"` keep their --print shaping.
+func (w shellWord) hasQuotedZshNamedParamExpand() bool {
 	for _, seg := range w.effectiveSegments() {
 		if !seg.Expand || seg.Unquoted {
 			continue
 		}
-		if shellExpandHasZshOrdinaryArray(seg.Value) {
+		if shellExpandHasZshNamedParam(seg.Value) {
 			return true
 		}
 	}
@@ -2699,96 +2711,78 @@ func shellExpandIsMultiWord(s string) bool {
 	return false
 }
 
-// shellExpandHasZshOrdinaryArray reports expansions of zsh built-in array
-// parameters that can still be multi-field when double-quoted without `[@]` /
-// split flags — e.g. `"$argv"` with argv=(fix bug).
-func shellExpandHasZshOrdinaryArray(s string) bool {
+// shellExpandHasZshNamedParam reports whether s references a zsh parameter by
+// name — the forms that cannot be proven scalar because `.zshenv` may have
+// declared the name an array. `$(cmd)` / `$((expr))` bodies are skipped: they
+// are one field when double-quoted no matter what they reference internally.
+func shellExpandHasZshNamedParam(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] != '$' || i+1 >= len(s) {
 			continue
 		}
 		next := s[i+1]
-		if next == '{' {
-			close := shellParamCloseBrace(s, i+2)
+		switch {
+		case next == '(':
+			// $(cmd) and $((expr)) — skip the balanced body.
+			close := shellSubstCloseParen(s, i+1)
 			if close < 0 {
-				continue
-			}
-			if shellParamBodyIsZshOrdinaryArray(s[i+2 : close]) {
-				return true
-			}
-			// Nested ${…} inside operators may still reference argv/path.
-			if shellExpandHasZshOrdinaryArray(s[i+2 : close]) {
+				// Unbalanced substitution — decline rather than guess.
 				return true
 			}
 			i = close
-			continue
-		}
-		// Unbraced $name (and $name[…] / $name:… trailing junk ignored for name).
-		if (next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z') || next == '_' {
-			j := i + 1
-			for j < len(s) && isShellNameByte(s[j]) {
-				j++
-			}
-			if shellNameIsZshOrdinaryArray(s[i+1 : j]) {
+		case next == '{':
+			close := shellParamCloseBrace(s, i+2)
+			if close < 0 {
 				return true
 			}
-			i = j - 1
+			if shellParamBodyHasName(s[i+2 : close]) {
+				return true
+			}
+			i = close
+		case isShellNameStartByte(next):
+			// Unbraced $name / $name[…] / $name:… .
+			return true
 		}
 	}
 	return false
 }
 
-// shellParamBodyIsZshOrdinaryArray reports whether a ${…} body names a zsh
-// built-in array (after optional flag / ! / operator prefixes).
-func shellParamBodyIsZshOrdinaryArray(body string) bool {
-	if body == "" {
+// shellParamBodyHasName reports whether a ${…} body (without braces) references
+// a parameter by name, as opposed to a positional / special parameter or a
+// length-count form.
+//
+// Names can appear after PE flags (`(U)TASK`), markers (`=`, `^`, `!`),
+// subscripts and operator words, so any name character anywhere in the body is
+// treated as "not provably scalar". `${#…}` is exempt: a length / element count
+// is always a single field.
+func shellParamBodyHasName(body string) bool {
+	if body == "" || body[0] == '#' {
 		return false
 	}
-	// ${(flags)name…}
-	if body[0] == '(' {
-		if _, rest, ok := splitZshPEFlagPrefix(body); ok {
-			body = rest
-			if body == "" {
-				return false
+	for i := 0; i < len(body); i++ {
+		if isShellNameStartByte(body[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// shellSubstCloseParen returns the index of the ')' that balances the '(' at
+// openIdx (so `$((expr))` closes on its outer paren), or -1 when unmatched.
+func shellSubstCloseParen(s string, openIdx int) int {
+	depth := 0
+	for i := openIdx; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
 			}
 		}
 	}
-	// ${=name} / ${^name} / ${==name} shorthands — peel one or two markers.
-	for len(body) > 0 && (body[0] == '=' || body[0] == '^') {
-		body = body[1:]
-	}
-	if body == "" {
-		return false
-	}
-	if body[0] == '!' {
-		body = body[1:]
-		if body == "" {
-			return false
-		}
-	}
-	// Parameter name at the start of the (remaining) body.
-	if !((body[0] >= 'A' && body[0] <= 'Z') || (body[0] >= 'a' && body[0] <= 'z') || body[0] == '_') {
-		return false
-	}
-	j := 1
-	for j < len(body) && isShellNameByte(body[j]) {
-		j++
-	}
-	return shellNameIsZshOrdinaryArray(body[:j])
-}
-
-// shellNameIsZshOrdinaryArray reports zsh parameters that are always arrays
-// and can expand to multiple fields even when double-quoted without `[@]`.
-// Conservative: includes common path arrays, not user scalars.
-func shellNameIsZshOrdinaryArray(name string) bool {
-	switch name {
-	case "argv",
-		"path", "cdpath", "fpath", "mailpath", "manpath",
-		"module_path", "watch", "psvar", "signals", "commands":
-		return true
-	default:
-		return false
-	}
+	return -1
 }
 
 // shellParamCloseBrace returns the index of the balanced closing '}' for a
@@ -2977,6 +2971,12 @@ func zshPEFlagsAreMultiWord(flags string) bool {
 		}
 	}
 	return false
+}
+
+// isShellNameStartByte reports a valid first character of a shell variable
+// name (digits are positional parameters, not names).
+func isShellNameStartByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
 }
 
 // isShellNameByte reports a valid character inside a bash variable name.

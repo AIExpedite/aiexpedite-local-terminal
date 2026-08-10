@@ -1259,9 +1259,10 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 			t.Errorf("zsh multi-field PE flags was reshaped: got %q, want original %q", args[1], orig)
 		}
 	}
-	// Ordinary zsh array params (`$argv`, `$path`, …) can still be multi-field
-	// when double-quoted without [@]/(@). Decline reshape on zsh only; bash
-	// treats unknown names as scalars and still reshapes.
+	// Any *named* zsh parameter can be an array: zsh sources .zshenv even for
+	// `zsh -c`, so a user file may hold `TASK=(fix bug)` alongside the built-in
+	// arrays (argv, path, …). Nothing proves a name is scalar, so decline the
+	// reshape for every named reference on zsh — bash keeps its shaping.
 	for _, orig := range []string{
 		`agy "$argv"`,
 		`agy "${argv}"`,
@@ -1271,22 +1272,42 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		`agy "$commands"`,
 		`agy "${commands}"`,
 		`agy "do $argv please"`,
+		// User-defined names from .zshenv — same hazard, no allowlist to hit.
+		`agy "$TASK"`,
+		`agy "${TASK}"`,
+		`agy "${TASK:-fallback}"`,
+		`agy "${(U)TASK}"`,
+		`agy "do $TASK please"`,
+		`agy --add-dir "$ROOT" task`,
 	} {
 		_, zshArgs := shapePTYExecArgs("zsh", []string{"-c", orig})
 		if zshArgs[1] != orig {
-			t.Errorf("zsh ordinary array was reshaped: got %q, want original %q", zshArgs[1], orig)
+			t.Errorf("zsh named param was reshaped: got %q, want original %q", zshArgs[1], orig)
 		}
 	}
-	// bash: $argv / $path are ordinary scalars — still reshape with --print.
-	_, bashArgv := shapePTYExecArgs("bash", []string{"-c", `agy "$argv"`})
-	wantBashArgv := `agy --dangerously-skip-permissions --print "$argv"`
-	if bashArgv[1] != wantBashArgv {
-		t.Errorf("bash scalar argv = %q, want %q", bashArgv[1], wantBashArgv)
+	// bash: $argv / $path / $TASK are ordinary scalars — still reshape.
+	for _, c := range []struct{ orig, want string }{
+		{`agy "$argv"`, `agy --dangerously-skip-permissions --print "$argv"`},
+		{`agy "$TASK"`, `agy --dangerously-skip-permissions --print "$TASK"`},
+		{`agy "${(U)TASK}"`, `agy --dangerously-skip-permissions --print "${(U)TASK}"`},
+	} {
+		_, bashArgs := shapePTYExecArgs("bash", []string{"-c", c.orig})
+		if bashArgs[1] != c.want {
+			t.Errorf("bash scalar param %q = %q, want %q", c.orig, bashArgs[1], c.want)
+		}
 	}
-	_, zshU := shapePTYExecArgs("zsh", []string{"-c", `agy "${(U)TASK}"`})
-	wantZshU := `agy --dangerously-skip-permissions --print "${(U)TASK}"`
-	if zshU[1] != wantZshU {
-		t.Errorf("zsh single-field PE flag = %q, want %q", zshU[1], wantZshU)
+	// zsh: provably single-field forms still reshape — command / arithmetic
+	// substitutions and length counts cannot be arrays regardless of .zshenv.
+	for _, c := range []struct{ orig, want string }{
+		{`agy "$(cat brief.txt)"`, `agy --dangerously-skip-permissions --print "$(cat brief.txt)"`},
+		{`agy "$((1 + 2))"`, `agy --dangerously-skip-permissions --print "$((1 + 2))"`},
+		{`agy "${#argv}"`, `agy --dangerously-skip-permissions --print "${#argv}"`},
+		{`agy "$1"`, `agy --dangerously-skip-permissions --print "$1"`},
+	} {
+		_, zshArgs := shapePTYExecArgs("zsh", []string{"-c", c.orig})
+		if zshArgs[1] != c.want {
+			t.Errorf("zsh scalar form %q = %q, want %q", c.orig, zshArgs[1], c.want)
+		}
 	}
 
 	// "$*" / "${files[*]}" stay a single field when double-quoted — still reshape.
