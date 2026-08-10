@@ -851,6 +851,26 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		t.Errorf("valid []] class was reshaped: got %q", closeFirst[1])
 	}
 
+	// Word-initial tilde with a quoted prefix is literal in bash/dash
+	// (`~"root"` → ~root). Still reshape with --print rather than declining
+	// as an expanding tilde. Fully unquoted ~/x stays unshaped (above).
+	for _, tc := range []struct {
+		orig, want string
+	}{
+		{`agy ~"root"`, `agy --dangerously-skip-permissions --print '~root'`},
+		{`agy ~'user'`, `agy --dangerously-skip-permissions --print '~user'`},
+		{`agy ~us"er"/x`, `agy --dangerously-skip-permissions --print '~user/x'`},
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", tc.orig})
+		if args[1] != tc.want {
+			t.Errorf("quoted tilde prefix %q = %q, want %q", tc.orig, args[1], tc.want)
+		}
+		_, dashArgs := shapePTYExecArgs("dash", []string{"-c", tc.orig})
+		if dashArgs[1] != tc.want {
+			t.Errorf("dash quoted tilde prefix %q = %q, want %q", tc.orig, dashArgs[1], tc.want)
+		}
+	}
+
 	// Quoted braces/globs are literal — safe to reshape with single quotes.
 	_, qArgs := shapePTYExecArgs("bash", []string{"-c", `agy 'file{1,2}'`})
 	wantQ := `agy --dangerously-skip-permissions --print 'file{1,2}'`

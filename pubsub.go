@@ -3302,14 +3302,20 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			writeSeg(c, false)
 		case '~':
 			// Word-initial tilde (`~/x`, `~user`) is POSIX — expands on bash
-			// and dash; decline reshape on every dialect.
+			// and dash when the whole tilde-prefix is unquoted; decline reshape
+			// only then. Quoted prefixes (`~"root"`, `~'u'ser`) stay literal
+			// so eligible one-shots still gain --print.
 			// Assignment-position tilde (`HOME=~`, `PATH=/bin:~/x`) is
 			// bash/zsh/ksh only (opts.assignTilde). Dash leaves those literal
 			// so we still reshape with --print rather than hanging interactive.
 			// Mid-word forms without that context (`foo~bar`, `foo:~`) are
 			// ordinary literals on all shells.
 			if !wordStarted {
-				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+				if looksLikeExpandingWordInitialTilde(s, i) {
+					return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+				}
+				writeSeg(c, false)
+				continue
 			}
 			if opts.assignTilde && wordPrefixIsTildeExpandPosition() {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
@@ -3406,6 +3412,42 @@ func shellDollarStartsExpand(b byte, legacyArith bool) bool {
 		return true
 	}
 	return false
+}
+
+// looksLikeExpandingWordInitialTilde reports whether s[tildeIdx] ('~') starts
+// a POSIX tilde expansion. The tilde-prefix runs from '~' through the first
+// unquoted '/', or through the end of the word when there is no '/'. Expansion
+// occurs only when every character of that prefix is unquoted and unescaped.
+// Forms like `~"root"`, `~'user'`, and `~us\er` keep the tilde literal (bash
+// and dash pass `~root` / `~user` as text) — return false so reshape can still
+// add --print. Bare `~`, `~/x`, and `~user/path` with a fully unquoted prefix
+// return true (decline reshape).
+func looksLikeExpandingWordInitialTilde(s string, tildeIdx int) bool {
+	if tildeIdx < 0 || tildeIdx >= len(s) || s[tildeIdx] != '~' {
+		return false
+	}
+	// '~' itself is unquoted (caller is in the unquoted branch). Scan the rest
+	// of the tilde-prefix; any quote or escape in it cancels expansion.
+	for j := tildeIdx + 1; j < len(s); j++ {
+		switch s[j] {
+		case '\\':
+			// Backslash-quoted character in the prefix → not all-unquoted.
+			return false
+		case '\'', '"':
+			// Quoted material in the prefix (e.g. ~"root") → literal tilde.
+			return false
+		case '/':
+			// Unquoted slash ends the tilde-prefix; prefix so far is clean.
+			return true
+		case ' ', '\t', '\n':
+			// Unquoted IFS ends the word; bare ~ / ~user all unquoted → expands.
+			return true
+		default:
+			// Unquoted login-name / path character — still in prefix.
+		}
+	}
+	// End of string after a fully unquoted prefix (bare ~ or ~user).
+	return true
 }
 
 // looksLikeUnquotedBracketGlob reports whether s[openIdx] (must be '[') starts
