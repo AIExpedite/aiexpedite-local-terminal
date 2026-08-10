@@ -2785,15 +2785,18 @@ func shellSubstCloseParen(s string, openIdx int) int {
 	return -1
 }
 
-// shellParamCloseBrace returns the index of the balanced closing '}' for a
-// ${…} body starting at bodyStart (first byte after '{'), or -1 if unmatched.
-// Nested braces (including nested ${…}) are counted so the outer close is used.
+// shellParamCloseBrace returns the index of the closing '}' for a ${…} body
+// starting at bodyStart (first byte after '{'), or -1 if unmatched. Only nested
+// `${…}` raises the depth: bash closes a PE at the first `}` even when the
+// operand holds literal braces (`"${x:-a{b}c}"` → `a{bc}`).
 func shellParamCloseBrace(s string, bodyStart int) int {
 	depth := 1
 	for j := bodyStart; j < len(s); j++ {
 		switch s[j] {
 		case '{':
-			depth++
+			if j > 0 && s[j-1] == '$' {
+				depth++
+			}
 		case '}':
 			depth--
 			if depth == 0 {
@@ -3181,14 +3184,12 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 	segExpand := false
 	// segUnquoted is true when the current segment was written outside quotes.
 	segUnquoted := false
-	// paramDepth counts braces inside ${…} the same way as shellParamCloseBrace:
-	// +1 on the `{` that opens a PE (after expandable `$`) and on every later
-	// `{` while still inside that PE; -1 on each `}`. Nested literal braces in
-	// a default (`${x:-{…}}`) and nested `${…}` therefore keep depth > 0 until
-	// the real close — so `"${x:-{}"foo"}"` still looks like open PE when the
-	// inner quote is seen (decline reshape) instead of treating `}` after `{`
-	// as the PE closer and mis-closing the outer double quotes.
-	// Escaped \$ / \` inside a still-open PE also declines reshape.
+	// paramDepth counts open ${…} parameter expansions the same way as
+	// shellParamCloseBrace: +1 on the `{` of a `${`, -1 on each `}`. Only `${`
+	// nests — bash closes a PE at the first `}` regardless of literal braces in
+	// the operand (`"${x:-{}"` is the one-character argument `{`), so a bare `{`
+	// must not increment the depth.
+	// Escaped \$ / \` inside a still-open PE declines reshape.
 	paramDepth := 0
 	// pendingParamBrace is set after an expandable `$` whose next significant
 	// byte is `{`. The following `{` opens (or nests) a PE brace region.
@@ -3329,10 +3330,13 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		flushSeg()
 		return true
 	}
-	// noteParamBrace runs after writing '{': open PE when pending after $, or
-	// nest when already inside PE (literal braces / nested ${…}).
+	// noteParamBrace runs after writing '{': only a `${` opens or nests a
+	// parameter expansion. A bare `{` inside a PE operand is ordinary text to
+	// bash — `"${x:-{}"` (x unset) is the single argument `{`, and
+	// `"${x:-a{b}c}"` is `a{bc}` — so counting it would leave paramDepth stuck
+	// open and decline reshape for valid payloads.
 	noteParamBrace := func() {
-		if pendingParamBrace || paramDepth > 0 {
+		if pendingParamBrace {
 			paramDepth++
 		}
 		pendingParamBrace = false
@@ -3513,7 +3517,11 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// Mid-word forms without that context (`foo~bar`, `foo:~`) are
 			// ordinary literals on all shells.
 			if !wordStarted {
-				if looksLikeExpandingWordInitialTilde(s, i, opts, false) {
+				// bash/zsh/ksh end a tilde-prefix at an unquoted ':' anywhere in
+				// the word, not just in assignment values: `bash -c 'agy ~:x'`
+				// passes `$HOME:x`. Dash keeps `~:x` literal (opts.assignTilde
+				// false) so those payloads still reshape with --print.
+				if looksLikeExpandingWordInitialTilde(s, i, opts, opts.assignTilde) {
 					return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 				}
 				writeSeg(c, false)
@@ -3653,9 +3661,11 @@ func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, opts shellWordOp
 			// Unquoted slash ends the tilde-prefix.
 			return shellTildePrefixExpands(login.String(), opts)
 		case ':':
-			// Assignment values: ':' separates PATH-style elements and ends
-			// each tilde-prefix (PATH=~: → empty login → HOME). Word-initial
-			// tildes do not treat ':' as a terminator (login may be ":…").
+			// bash/zsh/ksh end a tilde-prefix at an unquoted ':' — both in
+			// assignment values (PATH=~: → $HOME:) and in ordinary words
+			// (`agy ~:x` → `$HOME:x`, verified on bash 5.2.21). Dash keeps the
+			// ':' in the login name, where it never resolves, so the tilde stays
+			// literal there (callers pass colonEndsPrefix=false).
 			if colonEndsPrefix {
 				return shellTildePrefixExpands(login.String(), opts)
 			}

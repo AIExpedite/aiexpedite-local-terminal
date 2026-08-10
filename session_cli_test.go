@@ -885,6 +885,28 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if noUser[1] != wantNoUser {
 		t.Errorf("unknown tilde login = %q, want %q", noUser[1], wantNoUser)
 	}
+	// An unquoted ':' ends a word-initial tilde-prefix on bash/zsh/ksh, not just
+	// in assignment values: `bash -c 'agy ~:x'` passes `$HOME:x` (verified on
+	// bash 5.2.21). Reshaping to `--print '~:x'` would silently drop the
+	// expansion — leave those unshaped.
+	// (`~user:x` depends on the host's user database, so only the HOME forms are
+	// pinned here.)
+	for _, orig := range []string{
+		`agy ~:suffix`,
+		`agy ~:a:b`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("bash colon-terminated tilde was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+	// Dash keeps ':' inside the login name, where it never resolves, so the
+	// tilde stays literal there and the payload still reshapes.
+	_, dashColon := shapePTYExecArgs("dash", []string{"-c", `agy ~:suffix`})
+	wantDashColon := `agy --dangerously-skip-permissions --print '~:suffix'`
+	if dashColon[1] != wantDashColon {
+		t.Errorf("dash colon tilde = %q, want %q", dashColon[1], wantDashColon)
+	}
 	// zsh fails unknown ~user before invoking agy — leave unshaped so the
 	// shell still errors instead of launching with a frozen name.
 	origZshNoUser := `agy ~user_that_does_not_exist_xyzzy`
@@ -1335,18 +1357,32 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		}
 	}
 
-	// Literal braces inside ${…} must balance before PE close. Bash treats
-	// `"${x:-{}"foo"}"` as one word (`{foo}` when x is empty); closing PE at
-	// the first `}` would exit double-quote mode at the inner `"` and rebuild
-	// a broken command — leave unshaped (same as nested PE quotes).
+	// Bash closes a ${…} at the first `}` even when the operand holds literal
+	// braces: `"${x:-{}"` (x unset) is the one-character argument `{`, and
+	// `"${x:-{}"foo"}"` is the single word `{foo}`. Treating the operand `{` as
+	// a nested level left the PE "open" forever and declined the reshape, so
+	// these payloads must reshape — with the prompt bytes preserved (verified
+	// against bash 5.2.21: both forms deliver the same argv).
+	for _, tc := range []struct{ orig, want string }{
+		{`agy "${x:-{}"`, `agy --dangerously-skip-permissions --print "${x:-{}"`},
+		{`agy "${x:-{}"foo"}"`, `agy --dangerously-skip-permissions --print "${x:-{}"foo'}'`},
+		{`agy "${x:-{}""}"`, `agy --dangerously-skip-permissions --print "${x:-{}"'}'`},
+		{`agy "${x:-a{b}c}"`, `agy --dangerously-skip-permissions --print "${x:-a{b}c}"`},
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", tc.orig})
+		if args[1] != tc.want {
+			t.Errorf("PE literal brace %q = %q, want %q", tc.orig, args[1], tc.want)
+		}
+	}
+
+	// Nested ${…} still raises the depth, so a quote inside the *outer* PE is
+	// PE content and the payload stays unshaped.
 	for _, orig := range []string{
-		`agy "${x:-{}"foo"}"`,
-		`agy "${x:-{}"bar"}"`,
-		`agy "${x:-{}""}"`,
+		`agy "${x:-${y:-"foo bar"}}"`,
 	} {
 		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
 		if args[1] != orig {
-			t.Errorf("PE literal-brace + nested quote was reshaped: got %q, want original %q", args[1], orig)
+			t.Errorf("nested PE quotes was reshaped: got %q, want original %q", args[1], orig)
 		}
 	}
 
