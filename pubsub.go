@@ -3495,14 +3495,16 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// Mid-word forms without that context (`foo~bar`, `foo:~`) are
 			// ordinary literals on all shells.
 			if !wordStarted {
-				if looksLikeExpandingWordInitialTilde(s, i, opts) {
+				if looksLikeExpandingWordInitialTilde(s, i, opts, false) {
 					return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 				}
 				writeSeg(c, false)
 				continue
 			}
+			// Assignment-position: ':' ends each tilde-prefix the same as '/'
+			// (PATH=~: → PATH=$HOME:). Word-initial tildes only end on '/'.
 			if opts.assignTilde && wordPrefixIsTildeExpandPosition() &&
-				looksLikeExpandingWordInitialTilde(s, i, opts) {
+				looksLikeExpandingWordInitialTilde(s, i, opts, true) {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)
@@ -3602,9 +3604,11 @@ func shellDollarStartsExpand(b byte, legacyArith bool) bool {
 // looksLikeExpandingWordInitialTilde reports whether s[tildeIdx] ('~') starts
 // a tilde expansion the wrapper shell would actually perform. The tilde-prefix
 // runs from '~' through the first unquoted '/', or through the end of the word
-// when there is no '/'. Expansion requires every character of that prefix to be
-// unquoted and unescaped. Forms like `~"root"`, `~'user'`, and `~us\er` keep
-// the tilde literal — return false so reshape can still add --print.
+// when there is no '/'. When colonEndsPrefix is true (assignment-position
+// tilde after '=' / ':'), an unquoted ':' also ends the prefix — bash expands
+// PATH=~: to PATH=$HOME:. Expansion requires every character of that prefix to
+// be unquoted and unescaped. Forms like `~"root"`, `~'user'`, and `~us\er`
+// keep the tilde literal — return false so reshape can still add --print.
 //
 // Even a fully unquoted `~name` is only expanding when the login resolves on
 // bash/dash (unknown names stay literal). On zsh (opts.failUnknownTilde)
@@ -3612,7 +3616,7 @@ func shellDollarStartsExpand(b byte, legacyArith bool) bool {
 // always expand via HOME (POSIX). Bare `~+` expands when pwdTilde; bare `~-`
 // only when pwdTilde and OLDPWD is non-empty (bash leaves `~-` literal when
 // OLDPWD is unset/empty).
-func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, opts shellWordOptions) bool {
+func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, opts shellWordOptions, colonEndsPrefix bool) bool {
 	if tildeIdx < 0 || tildeIdx >= len(s) || s[tildeIdx] != '~' {
 		return false
 	}
@@ -3630,6 +3634,14 @@ func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, opts shellWordOp
 		case '/':
 			// Unquoted slash ends the tilde-prefix.
 			return shellTildePrefixExpands(login.String(), opts)
+		case ':':
+			// Assignment values: ':' separates PATH-style elements and ends
+			// each tilde-prefix (PATH=~: → empty login → HOME). Word-initial
+			// tildes do not treat ':' as a terminator (login may be ":…").
+			if colonEndsPrefix {
+				return shellTildePrefixExpands(login.String(), opts)
+			}
+			login.WriteByte(':')
 		case ' ', '\t', '\n':
 			// Unquoted IFS ends the word.
 			return shellTildePrefixExpands(login.String(), opts)

@@ -1012,11 +1012,13 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 
 	// Assignment-like tilde (`HOME=~`, `HOME+=~`, `PATH=…:~/x`) expands in
 	// bash — leave unshaped. Compound += also activates tilde expansion.
+	// PATH=~: ends the empty tilde-prefix at ':' (PATH=$HOME:) — same rule.
 	for _, orig := range []string{
 		`agy HOME=~`,
 		`agy HOME+=~`,
 		`agy PATH=~/bin:~/x`,
 		`agy PATH=/bin:~/x`,
+		`agy PATH=~:`,
 	} {
 		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
 		if args[1] != orig {
