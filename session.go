@@ -906,6 +906,31 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		batch = batch[:0]
 	}
 
+	appendDisplayText := func(lineText string) {
+		displayText := extractDisplayText(session.Command, lineText)
+		if displayText == "" {
+			return
+		}
+		batch = append(batch, displayText)
+		// Genuine assistant output (text/thinking delta or tool_use)
+		// — the session is alive and producing, so disarm the claude
+		// no-output watchdog. No-op for non-claude sessions (they
+		// never arm it). Deliberately NOT signalled from init/system
+		// or successful result events: those can fire for a stalled
+		// claude and the parser swallows them. Prompt detection
+		// (permission_request/input_request) also disarms the watchdog
+		// — see the sibling branch below.
+		//
+		// Gate on isClaudeStructuredStreamLine so a not-signed-in
+		// claude that prints a plain stderr/login banner (which
+		// extractDisplayText passes through verbatim) does NOT disarm
+		// the fail-fast watchdog — otherwise a stalled session with a
+		// banner would hang until stale GC.
+		if isClaudeCommand(session.Command) && isClaudeStructuredStreamLine(lineText) {
+			session.signalFirstRealFrame()
+		}
+	}
+
 	for {
 		select {
 		case line, ok := <-lines:
@@ -1023,7 +1048,12 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// the timing race can leave the final batch in flight while
 			// session_ended is already being published. Flushing here guarantees
 			// the last chunk is enqueued for publish before the exit cascade.
-			if detectCLITerminalEvent(session.Command, line.text) {
+			terminalEvent := detectCLITerminalEvent(session.Command, line.text)
+			if terminalEvent {
+				// A failed Claude result carries its only useful error text in
+				// the terminal event itself. Add it before flushing so its stream
+				// sequence precedes the turn_complete prompt sequence.
+				appendDisplayText(line.text)
 				flushBatch()
 			}
 
@@ -1109,28 +1139,8 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				if isClaudeCommand(session.Command) {
 					session.signalFirstRealFrame()
 				}
-			} else {
-				displayText := extractDisplayText(session.Command, line.text)
-				if displayText != "" {
-					batch = append(batch, displayText)
-					// Genuine assistant output (text/thinking delta or tool_use)
-					// — the session is alive and producing, so disarm the claude
-					// no-output watchdog. No-op for non-claude sessions (they
-					// never arm it). Deliberately NOT signalled from init/system
-					// or result events: those can fire for a stalled/errored
-					// claude and the parser swallows result events. Prompt
-					// detection (permission_request/input_request) also disarms
-					// the watchdog — see the sibling branch above.
-					//
-					// Gate on isClaudeStructuredStreamLine so a not-signed-in
-					// claude that prints a plain stderr/login banner (which
-					// extractDisplayText passes through verbatim) does NOT
-					// disarm the fail-fast watchdog — otherwise a stalled
-					// session with a banner would hang until stale GC.
-					if isClaudeCommand(session.Command) && isClaudeStructuredStreamLine(line.text) {
-						session.signalFirstRealFrame()
-					}
-				}
+			} else if !terminalEvent {
+				appendDisplayText(line.text)
 			}
 
 		case <-batchTimer.C:
