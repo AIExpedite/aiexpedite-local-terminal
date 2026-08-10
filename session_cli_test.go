@@ -30,6 +30,8 @@ package main
 
 import (
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -878,12 +880,21 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if noUser[1] != wantNoUser {
 		t.Errorf("unknown tilde login = %q, want %q", noUser[1], wantNoUser)
 	}
-	// Bash specials ~+ / ~- (PWD/OLDPWD) and stack index 0 (~+0 / ~-0) always
-	// expand — leave unshaped.
+	// zsh fails unknown ~user before invoking agy — leave unshaped so the
+	// shell still errors instead of launching with a frozen name.
+	origZshNoUser := `agy ~user_that_does_not_exist_xyzzy`
+	_, zshNoUser := shapePTYExecArgs("zsh", []string{"-c", origZshNoUser})
+	if zshNoUser[1] != origZshNoUser {
+		t.Errorf("zsh unknown tilde was reshaped: got %q, want original %q", zshNoUser[1], origZshNoUser)
+	}
+	// Bash specials ~+ and stack index 0 (~+0 / ~-0) always expand — leave
+	// unshaped. ~- expands only when OLDPWD is set (covered next).
+	t.Setenv("OLDPWD", filepath.ToSlash(os.TempDir()))
 	for _, orig := range []string{
 		`agy ~+`,
 		`agy ~-`,
 		`agy ~+/x`,
+		`agy ~-/x`,
 		`agy ~+0`,
 		`agy ~-0`,
 		`agy ~+0/x`,
@@ -893,6 +904,13 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		if args[1] != orig {
 			t.Errorf("bash tilde special was reshaped: got %q, want original %q", args[1], orig)
 		}
+	}
+	// Empty/unset OLDPWD: bash leaves ~- literal — still reshape with --print.
+	t.Setenv("OLDPWD", "")
+	_, emptyOld := shapePTYExecArgs("bash", []string{"-c", `agy ~-`})
+	wantEmptyOld := `agy --dangerously-skip-permissions --print '~-'`
+	if emptyOld[1] != wantEmptyOld {
+		t.Errorf("bash ~- without OLDPWD = %q, want %q", emptyOld[1], wantEmptyOld)
 	}
 	// Dash leaves ~+ / ~- / ~+0 literal — still reshape with --print.
 	for _, tc := range []struct {

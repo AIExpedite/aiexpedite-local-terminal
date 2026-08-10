@@ -2206,11 +2206,12 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 // mixed fragments into one double-quoted blob that reactivates substitutions.
 func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 	words, err := shellWords(payload, shellWordOptions{
-		braceExpand: shellSupportsBraceExpansion(shellCmd),
-		dollarQuote: shellSupportsDollarQuote(shellCmd),
-		assignTilde: shellSupportsAssignTilde(shellCmd),
-		legacyArith: shellSupportsLegacyArith(shellCmd),
-		pwdTilde:    shellSupportsPwdTilde(shellCmd),
+		braceExpand:      shellSupportsBraceExpansion(shellCmd),
+		dollarQuote:      shellSupportsDollarQuote(shellCmd),
+		assignTilde:      shellSupportsAssignTilde(shellCmd),
+		legacyArith:      shellSupportsLegacyArith(shellCmd),
+		pwdTilde:         shellSupportsPwdTilde(shellCmd),
+		failUnknownTilde: shellFailsUnknownTildeLogin(shellCmd),
 	})
 	if err != nil {
 		// Malformed shell (unterminated quote, etc.) — do not reshape into a
@@ -2867,6 +2868,10 @@ type shellWordOptions struct {
 	// pwdTilde is true when the wrapper expands word-initial `~+` / `~-`
 	// (PWD/OLDPWD). Bash/zsh/ksh do; dash/ash leave them literal.
 	pwdTilde bool
+	// failUnknownTilde is true when an unknown `~user` is a shell error
+	// (zsh) rather than a literal word (bash/dash). Decline reshape so the
+	// wrapper still fails instead of launching agy with a frozen name.
+	failUnknownTilde bool
 }
 
 // shellSupportsBraceExpansion reports whether the named shell executable
@@ -2937,6 +2942,13 @@ func shellSupportsLegacyArith(command string) bool {
 // Bare `sh` resolves like brace/assign-tilde.
 func shellSupportsPwdTilde(command string) bool {
 	return shellSupportsBraceExpansion(command)
+}
+
+// shellFailsUnknownTildeLogin reports whether the named shell treats an
+// unquoted unknown `~user` as an expansion failure (zsh: "no such user or
+// named directory") rather than a literal word (bash/dash). Only zsh.
+func shellFailsUnknownTildeLogin(command string) bool {
+	return shellSupportsZshEquals(command)
 }
 
 // shellCommandBase returns the lowercased executable basename without .exe.
@@ -3337,7 +3349,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// Mid-word forms without that context (`foo~bar`, `foo:~`) are
 			// ordinary literals on all shells.
 			if !wordStarted {
-				if looksLikeExpandingWordInitialTilde(s, i, opts.pwdTilde) {
+				if looksLikeExpandingWordInitialTilde(s, i, opts) {
 					return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 				}
 				writeSeg(c, false)
@@ -3447,11 +3459,13 @@ func shellDollarStartsExpand(b byte, legacyArith bool) bool {
 // unquoted and unescaped. Forms like `~"root"`, `~'user'`, and `~us\er` keep
 // the tilde literal — return false so reshape can still add --print.
 //
-// Even a fully unquoted `~name` is only expanding when the login resolves
-// (bash leaves `~no_such_user` literal). Bare `~` / `~/path` always expand via
-// HOME (POSIX). Bare `~+` / `~-` expand only when pwdTilde is true (bash/zsh;
-// dash leaves them literal).
-func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, pwdTilde bool) bool {
+// Even a fully unquoted `~name` is only expanding when the login resolves on
+// bash/dash (unknown names stay literal). On zsh (opts.failUnknownTilde)
+// unknown names fail the expansion — decline reshape. Bare `~` / `~/path`
+// always expand via HOME (POSIX). Bare `~+` expands when pwdTilde; bare `~-`
+// only when pwdTilde and OLDPWD is non-empty (bash leaves `~-` literal when
+// OLDPWD is unset/empty).
+func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, opts shellWordOptions) bool {
 	if tildeIdx < 0 || tildeIdx >= len(s) || s[tildeIdx] != '~' {
 		return false
 	}
@@ -3468,39 +3482,52 @@ func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, pwdTilde bool) b
 			return false
 		case '/':
 			// Unquoted slash ends the tilde-prefix.
-			return shellTildePrefixExpands(login.String(), pwdTilde)
+			return shellTildePrefixExpands(login.String(), opts)
 		case ' ', '\t', '\n':
 			// Unquoted IFS ends the word.
-			return shellTildePrefixExpands(login.String(), pwdTilde)
+			return shellTildePrefixExpands(login.String(), opts)
 		default:
 			login.WriteByte(s[j])
 		}
 	}
-	return shellTildePrefixExpands(login.String(), pwdTilde)
+	return shellTildePrefixExpands(login.String(), opts)
 }
 
 // shellTildePrefixExpands reports whether an unquoted tilde-prefix body
 // (characters after '~', without a trailing path) would expand on this host.
-// Empty → HOME (`~`, `~/x`). Bare `~+` / `~-` expand via PWD/OLDPWD only when
-// pwdTilde is true (bash/zsh/ksh; dash leaves them literal). Stack index zero
-// (`~+0` / `~-0`, including leading zeros) always resolves to the current
-// directory on those shells even in a fresh process — decline reshape.
-// Non-zero `~+N` / `~-N` need a live directory-stack entry we cannot see, so
-// they reshape. Otherwise only when user.Lookup succeeds — unknown logins
-// stay literal.
-func shellTildePrefixExpands(login string, pwdTilde bool) bool {
+// Empty → HOME (`~`, `~/x`). Bare `~+` expands via PWD when pwdTilde is true
+// (bash/zsh/ksh; dash leaves it literal). Bare `~-` expands only when
+// pwdTilde and OLDPWD is non-empty — bash 5.x passes literal `~-` when
+// OLDPWD is unset/empty, so those should still reshape with --print.
+// Stack index zero (`~+0` / `~-0`, including leading zeros) always resolves
+// to the current directory on those shells even in a fresh process — decline
+// reshape. Non-zero `~+N` / `~-N` need a live directory-stack entry we cannot
+// see, so they reshape. Known logins expand via user.Lookup; unknown logins
+// stay literal on bash/dash (reshape) but fail on zsh (opts.failUnknownTilde).
+func shellTildePrefixExpands(login string, opts shellWordOptions) bool {
 	if login == "" {
 		return true
 	}
-	// Bash/zsh PWD/OLDPWD / dirs forms. Dash: literal (pwdTilde false).
-	if login == "+" || login == "-" {
-		return pwdTilde
+	// Bash/zsh PWD form. Dash: literal (pwdTilde false).
+	if login == "+" {
+		return opts.pwdTilde
 	}
-	if pwdTilde && isPwdTildeStackZero(login) {
+	// ~- needs a usable OLDPWD; otherwise bash leaves the token literal.
+	if login == "-" {
+		if !opts.pwdTilde {
+			return false
+		}
+		return os.Getenv("OLDPWD") != ""
+	}
+	if opts.pwdTilde && isPwdTildeStackZero(login) {
 		return true
 	}
 	_, err := user.Lookup(login)
-	return err == nil
+	if err == nil {
+		return true
+	}
+	// Unknown login: bash/dash leave literal; zsh fails the expansion.
+	return opts.failUnknownTilde
 }
 
 // isPwdTildeStackZero reports whether login is a bash-style directory-stack
