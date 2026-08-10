@@ -818,6 +818,17 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if closeBracket[1] != wantCloseBracket {
 		t.Errorf("literal ] prompt = %q, want %q", closeBracket[1], wantCloseBracket)
 	}
+	// Quoted/escaped whitespace inside a bracket class stays one word and still
+	// expands — leave unshaped (do not treat the space as a word boundary).
+	for _, orig := range []string{
+		`agy [a" "b]`,
+		`agy [a\ b]`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("quoted-space bracket glob was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
 
 	// Quoted braces/globs are literal — safe to reshape with single quotes.
 	_, qArgs := shapePTYExecArgs("bash", []string{"-c", `agy 'file{1,2}'`})
@@ -899,6 +910,24 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		if args[1] != orig {
 			t.Errorf("assignment tilde was reshaped: got %q, want original %q", args[1], orig)
 		}
+	}
+
+	// Dash does not expand assignment-position tilde — reshape as literals
+	// so one-shots still get --print (do not hang interactive).
+	for _, tc := range []struct{ in, want string }{
+		{`agy HOME=~`, `agy --dangerously-skip-permissions --print 'HOME=~'`},
+		{`agy PATH=/bin:~/x`, `agy --dangerously-skip-permissions --print 'PATH=/bin:~/x'`},
+	} {
+		_, got := shapePTYExecArgs("dash", []string{"-c", tc.in})
+		if got[1] != tc.want {
+			t.Errorf("dash assign-tilde %q = %q, want %q", tc.in, got[1], tc.want)
+		}
+	}
+	// Word-initial ~/ still expands on dash (POSIX) — leave unshaped.
+	origHome := `agy review ~/proj`
+	_, dashHome := shapePTYExecArgs("dash", []string{"-c", origHome})
+	if dashHome[1] != origHome {
+		t.Errorf("dash word-initial tilde was reshaped: got %q, want original %q", dashHome[1], origHome)
 	}
 
 	// Indexed assignment A[0]=~ also tilde-expands; unquoted '[' declines reshape.
@@ -1361,7 +1390,7 @@ func TestShellWords(t *testing.T) {
 		{`agy review#note`, []string{"agy", "review#note"}, []bool{false, false}, false},
 	}
 	// Table cases model bash (brace expand + dollar-quote).
-	bashOpts := shellWordOptions{braceExpand: true, dollarQuote: true}
+	bashOpts := shellWordOptions{braceExpand: true, dollarQuote: true, assignTilde: true}
 	for _, tc := range cases {
 		got, err := shellWords(tc.in, bashOpts)
 		if tc.wantErr {

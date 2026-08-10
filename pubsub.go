@@ -2207,6 +2207,7 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 	words, err := shellWords(payload, shellWordOptions{
 		braceExpand: shellSupportsBraceExpansion(shellCmd),
 		dollarQuote: shellSupportsDollarQuote(shellCmd),
+		assignTilde: shellSupportsAssignTilde(shellCmd),
 	})
 	if err != nil {
 		// Malformed shell (unterminated quote, etc.) — do not reshape into a
@@ -2641,6 +2642,11 @@ type shellWordOptions struct {
 	// ($"…") quoting (bash/zsh/ksh). POSIX sh/dash treat $'…' as a literal
 	// dollar concatenated with a quoted string.
 	dollarQuote bool
+	// assignTilde is true when the wrapper expands ~ after unquoted
+	// assignment `=` / `:` (bash/zsh/ksh: HOME=~, PATH=/bin:~/x). POSIX
+	// dash/ash leave those forms literal; word-initial ~/x still expands
+	// on all shells and is gated separately.
+	assignTilde bool
 }
 
 // shellSupportsBraceExpansion reports whether the named shell executable
@@ -2660,6 +2666,15 @@ func shellSupportsBraceExpansion(command string) bool {
 		// bash, zsh, ksh, and unknown → assume brace expansion exists.
 		return true
 	}
+}
+
+// shellSupportsAssignTilde reports whether the named shell expands ~ in
+// assignment-like positions (HOME=~, PATH=/bin:~/x). Bash/zsh/ksh do; dash/ash
+// pass those forms literally. Bare `sh` resolves like brace/dollar-quote.
+// Word-initial ~/x is POSIX and is always treated as expanding elsewhere.
+func shellSupportsAssignTilde(command string) bool {
+	// Same dialect split as brace expansion for practical purposes.
+	return shellSupportsBraceExpansion(command)
 }
 
 // shellSupportsDollarQuote reports whether the named shell supports ANSI-C
@@ -3046,11 +3061,17 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// A lone unquoted ] is literal (it does not open a glob).
 			writeSeg(c, false)
 		case '~':
-			// Bash tilde expansion: word-initial (`~/x`, `~user`) and in
-			// assignment-like positions after unquoted `=` (`HOME=~`) or after
-			// `:` once `=` has appeared (`PATH=/bin:~/x`). Mid-word forms
-			// without that context (`foo~bar`, `foo:~`) are ordinary literals.
-			if !wordStarted || wordPrefixIsTildeExpandPosition() {
+			// Word-initial tilde (`~/x`, `~user`) is POSIX — expands on bash
+			// and dash; decline reshape on every dialect.
+			// Assignment-position tilde (`HOME=~`, `PATH=/bin:~/x`) is
+			// bash/zsh/ksh only (opts.assignTilde). Dash leaves those literal
+			// so we still reshape with --print rather than hanging interactive.
+			// Mid-word forms without that context (`foo~bar`, `foo:~`) are
+			// ordinary literals on all shells.
+			if !wordStarted {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			if opts.assignTilde && wordPrefixIsTildeExpandPosition() {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)
@@ -3145,19 +3166,49 @@ func shellDollarStartsExpand(b byte) bool {
 // looksLikeUnquotedBracketGlob reports whether s[openIdx] (must be '[') starts
 // a complete unquoted bracket expression […]. Bash/dash treat unmatched `[` as
 // a literal character, not a pathname pattern; only a matching `]` within the
-// same word makes it expandable. We do not validate class contents — any
-// closed form is enough to decline reshape (rebuild would freeze the pattern).
+// same word makes it expandable. Quote/escape-aware: spaces inside quotes or
+// after backslash (`[a" "b]`, `[a\ b]`) stay in the same word and still form
+// a complete class. Unquoted whitespace ends the word (incomplete). We do not
+// validate class contents — any closed form is enough to decline reshape.
 func looksLikeUnquotedBracketGlob(s string, openIdx int) bool {
 	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != '[' {
 		return false
 	}
+	inSingle, inDouble := false, false
+	escaped := false
 	for j := openIdx + 1; j < len(s); j++ {
 		c := s[j]
-		// Word boundary before a close → incomplete, literal '['.
-		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-			return false
+		if escaped {
+			escaped = false
+			continue
 		}
-		if c == ']' {
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '\\' && j+1 < len(s) {
+				j++ // skip escaped byte inside double quotes
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch c {
+		case '\\':
+			escaped = true
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case ' ', '\t', '\n', '\r':
+			// Unquoted whitespace ends the shell word — incomplete class.
+			return false
+		case ']':
 			return true
 		}
 	}
