@@ -2469,7 +2469,10 @@ func (w shellWord) effectiveSegments() []shellSegment {
 // appear (we cannot rebuild without losing expansion), or when ANSI-C / locale
 // quoting ($'…' / $"…") appears (we do not implement those forms).
 // An unquoted `#` at a word boundary ends tokenization (shell comment).
-// Backslash-newline line continuations (quoted or unquoted) drop both chars.
+// Backslash-newline line continuations (quoted or unquoted) drop both chars and
+// do not start a word (so a following `#` stays a comment).
+// Escaped `$` / `` ` `` inside an open `${…}` declines reshape (segment splits
+// would break the expansion syntax on rebuild).
 // Callers must not turn rejected payloads into a valid command.
 func shellWords(s string) ([]shellWord, error) {
 	var words []shellWord
@@ -2482,6 +2485,9 @@ func shellWords(s string) ([]shellWord, error) {
 	// segExpand is true once an unescaped $ or ` is written in this segment's
 	// expansion-eligible context (unquoted / double-quoted).
 	segExpand := false
+	// paramDepth tracks nested ${…} in expansion-eligible contexts so that
+	// escaped \$ / \` inside a still-open parameter expansion can decline reshape.
+	paramDepth := 0
 
 	flushSeg := func() {
 		if segStarted {
@@ -2529,12 +2535,32 @@ func shellWords(s string) ([]shellWord, error) {
 	// in its own Expand=false segment. Flushes both before (if current segment
 	// is expanding — e.g. "$TASK\$(cmd)") and after, so escaped dollars never
 	// share a segment with expandable content in either order.
-	writeEscapedExpansion := func(c byte) {
+	//
+	// Returns false when the escape sits inside an open ${…} parameter
+	// expansion: splitting there rebuilds invalid quote nests
+	// (`"${TASK:-"'$(…)}'`). Callers must leave those payloads unshaped.
+	writeEscapedExpansion := func(c byte) bool {
+		if paramDepth > 0 {
+			return false
+		}
 		if segStarted && segExpand {
 			flushSeg()
 		}
 		writeSeg(c, false)
 		flushSeg()
+		return true
+	}
+	// noteParamOpen tracks ${…} depth after writing an expandable '$' so that
+	// a following '{' opens a parameter-expansion region.
+	noteParamOpen := func(wroteExpandableDollar bool, next byte) {
+		if wroteExpandableDollar && next == '{' {
+			paramDepth++
+		}
+	}
+	noteParamClose := func(c byte) {
+		if c == '}' && paramDepth > 0 {
+			paramDepth--
+		}
 	}
 
 	for i := 0; i < len(s); i++ {
@@ -2542,13 +2568,17 @@ func shellWords(s string) ([]shellWord, error) {
 		if escaped {
 			// Unquoted line continuation: backslash-newline is deleted entirely
 			// (bash joins physical lines; do not keep a literal newline).
+			// wordStarted was intentionally NOT set when the backslash was seen,
+			// so a following `#` at the next line remains a comment.
 			if c == '\n' {
 				escaped = false
 				continue
 			}
 			// Backslash-escaped content is literal — including \$ and \`.
 			if c == '$' || c == '`' {
-				writeEscapedExpansion(c)
+				if !writeEscapedExpansion(c) {
+					return nil, fmt.Errorf("unsupported escaped expansion inside parameter expansion")
+				}
 			} else {
 				writeSeg(c, false)
 			}
@@ -2579,7 +2609,9 @@ func shellWords(s string) ([]shellWord, error) {
 				// except line continuation (backslash-newline) removes both.
 				if next == '$' || next == '`' {
 					i++
-					writeEscapedExpansion(next)
+					if !writeEscapedExpansion(next) {
+						return nil, fmt.Errorf("unsupported escaped expansion inside parameter expansion")
+					}
 					continue
 				}
 				if next == '\n' {
@@ -2605,13 +2637,20 @@ func shellWords(s string) ([]shellWord, error) {
 			}
 			// Double-quoted: unescaped $ / ` are expandable; other chars literal.
 			// Brace/glob/tilde do not expand inside double quotes — literal OK.
-			writeSeg(c, c == '$' || c == '`')
+			expandable := c == '$' || c == '`'
+			writeSeg(c, expandable)
+			if expandable && c == '$' && i+1 < len(s) {
+				noteParamOpen(true, s[i+1])
+			}
+			noteParamClose(c)
 			continue
 		}
 		switch c {
 		case '\\':
+			// Do not set wordStarted here: a line-continuation backslash must
+			// not turn a following `#` into mid-word content. writeSeg (when
+			// an escaped character actually contributes) sets wordStarted.
 			escaped = true
-			wordStarted = true
 		case '\'':
 			flushSeg() // start a new single-quoted segment
 			inSingle = true
@@ -2641,6 +2680,8 @@ func shellWords(s string) ([]shellWord, error) {
 			// argv. Rebuilding with quoteAntigravityShellArg would single-quote
 			// these characters and lose that semantics (e.g. file{1,2} →
 			// 'file{1,2}'). Quoted forms stay literal and are handled above.
+			// Closing `}` of ${…} only appears here when unquoted outside a
+			// double-quoted region — still unsupported as brace expansion.
 			return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 		default:
 			// ANSI-C ($'…') / locale ($"…") quoting: not implemented. A bare
@@ -2649,7 +2690,13 @@ func shellWords(s string) ([]shellWord, error) {
 			if c == '$' && i+1 < len(s) && (s[i+1] == '\'' || s[i+1] == '"') {
 				return nil, fmt.Errorf("unsupported ANSI-C or locale quoted string")
 			}
-			writeSeg(c, c == '$' || c == '`')
+			expandable := c == '$' || c == '`'
+			writeSeg(c, expandable)
+			if expandable && c == '$' && i+1 < len(s) {
+				noteParamOpen(true, s[i+1])
+			}
+			// Unquoted `}` is handled above as brace expansion error, so
+			// paramDepth only closes inside double quotes (noteParamClose there).
 		}
 	}
 	if inSingle || inDouble {

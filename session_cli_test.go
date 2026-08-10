@@ -778,6 +778,32 @@ func TestShapePTYExecArgs_DropsShellLineContinuation(t *testing.T) {
 	if uArgs[1] != wantU {
 		t.Errorf("unquoted line continuation = %q, want %q", uArgs[1], wantU)
 	}
+
+	// Continuation at a word boundary must not start a word: following #
+	// remains a shell comment (not mid-word prompt text).
+	payloadC := "agy review \\\n# internal note"
+	_, cArgs := shapePTYExecArgs("bash", []string{"-c", payloadC})
+	wantC := `agy --dangerously-skip-permissions --print review`
+	if cArgs[1] != wantC {
+		t.Errorf("continuation before comment = %q, want %q", cArgs[1], wantC)
+	}
+}
+
+// Escaped $ / ` inside an open ${…} cannot be segment-split without breaking
+// the expansion on rebuild — leave the original payload unshaped.
+func TestShapePTYExecArgs_RejectsEscapedExpansionInsideParam(t *testing.T) {
+	orig := `agy "${TASK:-\$(touch /tmp/pwn)}"`
+	_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+	if args[1] != orig {
+		t.Errorf("escaped $ inside ${…} was reshaped: got %q, want original %q", args[1], orig)
+	}
+
+	// Outside ${…}, escaped $ still splits cleanly into inert rebuild.
+	_, okArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK\$(touch /tmp/pwn)"`})
+	wantOK := `agy --dangerously-skip-permissions --print "$TASK"'$(touch /tmp/pwn)'`
+	if okArgs[1] != wantOK {
+		t.Errorf("escaped $ outside ${…} = %q, want %q", okArgs[1], wantOK)
+	}
 }
 
 // ANSI-C ($'…') / locale ($"…") quoting is not implemented — leave unshaped so
@@ -858,6 +884,7 @@ func TestShellWords(t *testing.T) {
 		{`agy 'file{1,2}'`, []string{"agy", "file{1,2}"}, []bool{false, false}, false},
 		{"agy \"fix\\\nbug\"", []string{"agy", "fixbug"}, []bool{false, false}, false},
 		{"agy fix\\\nbug", []string{"agy", "fixbug"}, []bool{false, false}, false},
+		{"agy review \\\n# note", []string{"agy", "review"}, []bool{false, false}, false},
 		{`agy ""`, []string{"agy", ""}, []bool{false, false}, false},
 		{`  agy   `, []string{"agy"}, []bool{false}, false},
 		{``, nil, nil, false},
@@ -868,6 +895,7 @@ func TestShellWords(t *testing.T) {
 		{`agy file{1,2}`, nil, nil, true},
 		{`agy review *.go`, nil, nil, true},
 		{`agy review ~/proj`, nil, nil, true},
+		{`agy "${TASK:-\$(x)}"`, nil, nil, true},
 		{`agy $'(x)'`, nil, nil, true},
 		{`agy $"x"`, nil, nil, true},
 		{`agy review # note`, []string{"agy", "review"}, []bool{false, false}, false},
