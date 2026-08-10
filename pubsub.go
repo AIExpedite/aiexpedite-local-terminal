@@ -2215,6 +2215,7 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 		failUnknownTilde:  shellFailsUnknownTildeLogin(shellCmd),
 		homeTildeNeedsEnv: shellBareTildeNeedsHome(shellCmd),
 		startupFiles:      shellRunsStartupFiles(shellCmd),
+		zshExtGlob:        shellSupportsZshEquals(shellCmd),
 	})
 	if err != nil {
 		// Malformed shell (unterminated quote, etc.) — do not reshape into a
@@ -3023,6 +3024,10 @@ type shellWordOptions struct {
 	// arithmetic. Dash/ash leave `$[…]` as literal `$` + text; treating `[`
 	// as expansion there declines reshape and leaves interactive agy waiting.
 	legacyArith bool
+	// zshExtGlob is true for zsh wrappers, where `.zshenv` may `setopt
+	// EXTENDED_GLOB` and turn unquoted `#`, `^` and mid-word `~` into
+	// pathname-generation operators we cannot safely freeze into --print.
+	zshExtGlob bool
 	// startupFiles is true when the wrapper may source a startup file before
 	// running the payload (zsh always reads .zshenv; bash reads $BASH_ENV for
 	// non-interactive shells). Such a file can define variables this process
@@ -3544,6 +3549,21 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				flushWord()
 				return words, nil
 			}
+			if opts.zshExtGlob {
+				// zsh EXTENDED_GLOB (settable from the .zshenv we cannot read)
+				// makes a mid-word `#` a pathname-generation operator: with the
+				// option on, `agy foo#` expands to the matching files and a
+				// non-matching `agy zzz#` aborts with "no matches found".
+				// Freezing it into a quoted --print value would suppress both.
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
+		case '^':
+			// Same story as `#`: with EXTENDED_GLOB, `^pat` is zsh's
+			// "everything except" operator. Literal on every other shell.
+			if opts.zshExtGlob {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
 			writeSeg(c, false)
 		case '(', ')':
 			// We do not parse subshells/groups. Unquoted parens are either
@@ -3590,6 +3610,11 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				}
 				writeSeg(c, false)
 				continue
+			}
+			if opts.zshExtGlob {
+				// Mid-word `~` is EXTENDED_GLOB's "except" operator on zsh (`a~b`).
+				// Word-initial tildes are handled above.
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			// Assignment-position: ':' ends each tilde-prefix the same as '/'
 			// (PATH=~: → PATH=$HOME:). Word-initial tildes only end on '/'.

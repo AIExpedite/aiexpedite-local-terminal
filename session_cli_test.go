@@ -1412,6 +1412,40 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 			t.Errorf("zsh named param was reshaped: got %q, want original %q", zshArgs[1], orig)
 		}
 	}
+	// zsh EXTENDED_GLOB (settable from the .zshenv we cannot see) turns unquoted
+	// `#`, `^` and `~` into pathname-generation operators: on zsh 5.9 with the
+	// option set, `foo#` expands to the matching files and a non-matching
+	// `zzz#` aborts with `no matches found`. Decline on zsh; bash keeps them
+	// literal and still reshapes.
+	for _, orig := range []string{
+		`agy foo#`,
+		`agy issue#12`,
+		`agy f^o`,
+		`agy a~b`,
+	} {
+		_, zshArgs := shapePTYExecArgs("zsh", []string{"-c", orig})
+		if zshArgs[1] != orig {
+			t.Errorf("zsh extended-glob operator was reshaped: got %q, want original %q", zshArgs[1], orig)
+		}
+	}
+	// Quoted / escaped forms are literal in zsh too — still reshape.
+	for _, tc := range []struct{ orig, want string }{
+		{`agy 'foo#'`, `agy --dangerously-skip-permissions --print 'foo#'`},
+		{`agy foo\#`, `agy --dangerously-skip-permissions --print 'foo#'`},
+	} {
+		_, zshArgs := shapePTYExecArgs("zsh", []string{"-c", tc.orig})
+		if zshArgs[1] != tc.want {
+			t.Errorf("zsh quoted %q = %q, want %q", tc.orig, zshArgs[1], tc.want)
+		}
+	}
+	// bash treats them as ordinary text. (A `#` at a word boundary is a comment
+	// on every shell, so only mid-word forms are meaningful here.)
+	_, bashHash := shapePTYExecArgs("bash", []string{"-c", `agy issue#12 f^o a~b`})
+	wantBashHash := `agy --dangerously-skip-permissions --print 'issue#12 f^o a~b'`
+	if bashHash[1] != wantBashHash {
+		t.Errorf("bash mid-word # = %q, want %q", bashHash[1], wantBashHash)
+	}
+
 	// bash: $argv / $path / $TASK are ordinary scalars — still reshape.
 	for _, c := range []struct{ orig, want string }{
 		{`agy "$argv"`, `agy --dangerously-skip-permissions --print "$argv"`},
