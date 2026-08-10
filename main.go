@@ -1116,8 +1116,12 @@ del /f /q "%%~f0" > nul 2>&1
 	return cmd.Start()
 }
 
-// openBrowser opens the supplied URL in the platform's default browser.
-func openBrowser(url string) {
+// openBrowser opens the supplied URL in the platform's default browser. It
+// returns an error when the launcher process can't be started so callers that
+// care (e.g. the install-recovery "manual install" / "troubleshoot" actions)
+// can log a failed launch instead of silently dropping it. Callers that don't
+// care may ignore the return value.
+func openBrowser(url string) error {
 	var cmd string
 	var args []string
 
@@ -1132,5 +1136,9 @@ func openBrowser(url string) {
 		cmd = "xdg-open"
 		args = []string{url}
 	}
-	_ = exec.Command(cmd, args...).Start()
+	if err := exec.Command(cmd, args...).Start(); err != nil {
+		fmt.Printf("%s[browser] Could not open %s: %v%s\n", colorYellow, url, err, colorReset)
+		return err
+	}
+	return nil
 }
