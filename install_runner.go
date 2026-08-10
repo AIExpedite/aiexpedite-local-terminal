@@ -53,7 +53,9 @@ type DependencySpec struct {
 	UnixPackage string
 	// Optional marks a dependency the app keeps running without (e.g. Git,
 	// which readiness only warns about). It changes the prompt headline so it
-	// doesn't claim the dependency "is required"; the Yes / No / Cancel actions
+	// doesn't claim the dependency "is required", and describes Cancel as
+	// "skip and continue" rather than exit — otherwise the dialog contradicts
+	// what actually happens next. The Yes / No / Cancel actions themselves
 	// retain their standard meanings.
 	Optional bool
 	// VerifyCommand is the executable that must appear on PATH once the
@@ -120,9 +122,15 @@ type installOutcome struct {
 // Sentinel errors so callers can distinguish user intent from real failures
 // and decide whether to treat them as fatal.
 var (
-	// errInstallDeclined — user cancelled at the prompt or exited the
-	// recovery dialog).
+	// errInstallDeclined — user chose not to install (Cancel at the prompt, or
+	// Skip at the recovery dialog).
 	errInstallDeclined = errors.New("dependency install declined by user")
+	// errInstallCancelled — user pressed Cancel at the permission prompt. It
+	// wraps errInstallDeclined (it IS a decline for every caller that only
+	// cares about the opt-out), but stays distinguishable so callers can honour
+	// "Cancel does nothing else" and skip the follow-up guidance dialog they
+	// still show for the other opt-outs.
+	errInstallCancelled = fmt.Errorf("dependency install cancelled by user: %w", errInstallDeclined)
 	// errInstallManual — user opted to install manually; the download page
 	// was opened for them.
 	errInstallManual = errors.New("dependency install deferred to manual")
@@ -154,9 +162,10 @@ func runDependencyInstall(spec DependencySpec) error {
 		presentRecoveryURL(spec, spec.ManualURL, "manual_from_prompt")
 		return errInstallManual
 	case InstallCancel:
+		// Cancel means cancel only: no browser, no install, no further dialogs.
 		LogSecurityEvent(SecEvtInstallDeclined, "user cancelled install",
 			"component", spec.DisplayName, "at", "prompt")
-		return errInstallDeclined
+		return errInstallCancelled
 	case InstallYes:
 		// fall through to the install / recovery loop
 	}
@@ -295,6 +304,35 @@ func installPromptHeadline(component string, optional bool) string {
 			component, component)
 	}
 	return fmt.Sprintf("%s is required but not installed.", component)
+}
+
+// installManualLabel returns the long-form wording for the "No" choice, which
+// opens the vendor download page so the user can install by hand and leaves the
+// automatic flow. Used where the dialog spells out what each button does.
+func installManualLabel(component string) string {
+	return fmt.Sprintf("Open the %s download page and install it manually", component)
+}
+
+// installCancelLabel returns the long-form wording for the "Cancel" choice.
+// Cancel does nothing but close the dialog, so the label describes what the app
+// does next rather than promising an install: an optional dependency is simply
+// skipped, while startup can't continue without a required one.
+func installCancelLabel(component string, optional bool) string {
+	if optional {
+		return fmt.Sprintf("Skip for now (continue without %s)", component)
+	}
+	return "Cancel (exit without installing)"
+}
+
+// installCancelButton returns the short button caption for the "Cancel" choice,
+// for GUI toolkits that render captions rather than a list. Cancelling an
+// optional dependency is a skip, not a cancelled setup, so it is labelled as
+// such — otherwise the button overstates what happens next.
+func installCancelButton(optional bool) string {
+	if optional {
+		return "Skip"
+	}
+	return "Cancel"
 }
 
 // installFailureReason returns a short, log-friendly reason slug.

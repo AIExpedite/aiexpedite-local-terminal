@@ -125,7 +125,8 @@ func ShowUpdateDialog(currentVersion, newVersion string) UpdateChoice {
 
 // ShowInstallPrompt displays a dialog asking user permission to install a dependency.
 // optional selects wording that accurately describes dependencies the app can
-// run without; it does not change the Yes / No / Cancel button semantics.
+// run without (Cancel is then "skip and continue", not "exit"); it does not
+// change the Yes / No / Cancel button semantics.
 // Returns:
 //   - InstallYes: install automatically
 //   - InstallNo: open the download page, then exit the install flow
@@ -135,13 +136,17 @@ func ShowInstallPrompt(component, description string, optional bool) InstallChoi
 		"%s\n\n%s\n\nWould you like to install it automatically?",
 		installPromptHeadline(component, optional), description)
 	title := installPromptTitle(optional)
+	cancelBtn := installCancelButton(optional)
+	cancelLabel := installCancelLabel(component, optional)
+	manualLabel := installManualLabel(component)
+
 	switch runtime.GOOS {
 	case "darwin":
-		return showOsascriptInstallPrompt(title, message)
+		return showOsascriptInstallPrompt(title, message, cancelBtn)
 	case "linux":
-		return showLinuxInstallPrompt(title, message)
+		return showLinuxInstallPrompt(title, message, cancelBtn, cancelLabel, manualLabel)
 	}
-	return consoleInstallPrompt(title, message)
+	return consoleInstallPrompt(title, message, cancelLabel, manualLabel)
 }
 
 // ---------------------------------------------------------------------------
@@ -215,10 +220,13 @@ func showOsascriptUpdateDialog(title, message string) UpdateChoice {
 	}
 }
 
-func showOsascriptInstallPrompt(title, message string) InstallChoice {
+func showOsascriptInstallPrompt(title, message, cancelBtn string) InstallChoice {
+	// The cancel button is designated explicitly rather than relying on it being
+	// named "Cancel": an optional dependency labels it "Skip", and without the
+	// clause Escape would leave the dialog stuck open.
 	script := fmt.Sprintf(
-		`display dialog "%s" buttons {"Cancel", "Open Download Page", "Install"} default button "Install" with title "%s" with icon note`,
-		escapeOsascript(message), escapeOsascript(title))
+		`display dialog "%s" buttons {"%s", "Open Download Page", "Install"} default button "Install" cancel button "%s" with title "%s" with icon note`,
+		escapeOsascript(message), escapeOsascript(cancelBtn), escapeOsascript(cancelBtn), escapeOsascript(title))
 	out, err := exec.Command("osascript", "-e", script).Output()
 	if err != nil {
 		// Non-zero exit (e.g. user pressed Cancel or dismissed the dialog).
@@ -355,13 +363,16 @@ func showLinuxUpdateDialog(title, message string) UpdateChoice {
 	return consoleUpdateDialog(title, message)
 }
 
-func showLinuxInstallPrompt(title, message string) InstallChoice {
+func showLinuxInstallPrompt(title, message, cancelBtn, cancelLabel, manualLabel string) InstallChoice {
 	if _, err := exec.LookPath("zenity"); err == nil {
 		out, err := exec.Command("zenity", "--question",
 			"--title="+title,
-			"--text="+escapeZenityMarkup(message)+"\n\nInstall = Install automatically\nOpen Download Page = Open download page\nCancel = Cancel",
+			"--text="+escapeZenityMarkup(message)+
+				"\n\nInstall = Install automatically"+
+				"\nOpen Download Page = "+escapeZenityMarkup(manualLabel)+
+				"\n"+escapeZenityMarkup(cancelBtn)+" = "+escapeZenityMarkup(cancelLabel),
 			"--ok-label=Install",
-			"--cancel-label=Cancel",
+			"--cancel-label="+cancelBtn,
 			"--extra-button=Open Download Page",
 			"--width=500").Output()
 		// The extra button writes its label to stdout and may still exit 0, so
@@ -376,7 +387,7 @@ func showLinuxInstallPrompt(title, message string) InstallChoice {
 	}
 	if _, err := exec.LookPath("kdialog"); err == nil {
 		cmd := exec.Command("kdialog", "--title", title,
-			"--yesnocancel", message+"\n\nYes = Install automatically\nNo = Open download page\nCancel = Cancel")
+			"--yesnocancel", message+"\n\nYes = Install automatically\nNo = "+manualLabel+"\nCancel = "+cancelLabel)
 		_ = cmd.Run()
 		if cmd.ProcessState != nil {
 			switch cmd.ProcessState.ExitCode() {
@@ -388,7 +399,7 @@ func showLinuxInstallPrompt(title, message string) InstallChoice {
 		}
 		return InstallCancel
 	}
-	return consoleInstallPrompt(title, message)
+	return consoleInstallPrompt(title, message, cancelLabel, manualLabel)
 }
 
 func showLinuxInstallRecovery(title, message string, allowRetry bool) InstallRecoveryChoice {
@@ -491,11 +502,11 @@ func consoleUpdateDialog(title, message string) UpdateChoice {
 	}
 }
 
-func consoleInstallPrompt(title, message string) InstallChoice {
+func consoleInstallPrompt(title, message, cancelLabel, manualLabel string) InstallChoice {
 	fmt.Printf("\n[%s]\n%s\n\n", title, message)
 	fmt.Println("  1) Install automatically")
-	fmt.Println("  2) Open download page")
-	fmt.Println("  3) Cancel")
+	fmt.Println("  2) " + manualLabel)
+	fmt.Println("  3) " + cancelLabel)
 	fmt.Print("\nChoice [1/2/3]: ")
 	reader := bufio.NewReader(os.Stdin)
 	input, _ := reader.ReadString('\n')

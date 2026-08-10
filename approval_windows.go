@@ -144,7 +144,8 @@ const (
 
 // ShowInstallPrompt displays a dialog asking user permission to install a dependency.
 // optional selects wording that accurately describes dependencies the app can
-// run without; it does not change the Yes / No / Cancel button semantics.
+// run without (CANCEL is then "skip and continue", not "exit"); it does not
+// change the Yes / No / Cancel button semantics.
 // Returns:
 //   - InstallYes: install automatically
 //   - InstallNo: open the download page, then exit the install flow
@@ -156,10 +157,12 @@ func ShowInstallPrompt(component, description string, optional bool) InstallChoi
 			"Would you like to install it automatically?\n\n"+
 			"Click:\n"+
 			"  YES = Install automatically (via winget)\n"+
-			"  NO = Open download page\n"+
-			"  CANCEL = Cancel",
+			"  NO = %s\n"+
+			"  CANCEL = %s",
 		installPromptHeadline(component, optional),
 		description,
+		installManualLabel(component),
+		installCancelLabel(component, optional),
 	)
 
 	title := installPromptTitle(optional)
