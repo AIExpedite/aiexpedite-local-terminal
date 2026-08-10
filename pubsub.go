@@ -2205,16 +2205,25 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 // `agy '$(cmd)'` and `agy "\$(cmd)"` stay literal — never OR-ing expand across
 // mixed fragments into one double-quoted blob that reactivates substitutions.
 func shapeAntigravityShellPayload(shellCmd string, posixMode bool, payload string) (string, bool) {
+	// A startup file runs before the payload and its contents are invisible to
+	// us. POSIX mode suppresses the sourcing itself, so this stays false there.
+	startupFiles := shellRunsStartupFiles(shellCmd) && !posixMode
 	words, err := shellWords(payload, shellWordOptions{
-		braceExpand:       shellSupportsBraceExpansion(shellCmd),
-		dollarQuote:       shellSupportsDollarQuote(shellCmd),
-		assignTilde:       shellSupportsAssignTilde(shellCmd) && !posixMode,
+		braceExpand: shellSupportsBraceExpansion(shellCmd),
+		dollarQuote: shellSupportsDollarQuote(shellCmd),
+		// A startup file can itself `set -o posix` (verified on bash 5.2.21:
+		// with `set -o posix` in $BASH_ENV, `bash -c 'printf %s HOME=~'` prints
+		// a literal `HOME=~`; with a no-op file it prints $HOME). We cannot read
+		// the file, so the assignment-tilde extension is treated as off: the
+		// cost is freezing a would-be $HOME inside prompt text, versus declining
+		// the reshape and letting agy sit in its interactive TUI until timeout.
+		assignTilde:       shellSupportsAssignTilde(shellCmd) && !posixMode && !startupFiles,
 		colonTilde:        shellSupportsColonTildePrefix(shellCmd),
 		legacyArith:       shellSupportsLegacyArith(shellCmd),
 		pwdTilde:          shellSupportsPwdTilde(shellCmd),
 		failUnknownTilde:  shellFailsUnknownTildeLogin(shellCmd),
 		homeTildeNeedsEnv: shellBareTildeNeedsHome(shellCmd),
-		startupFiles:      shellRunsStartupFiles(shellCmd) && !posixMode,
+		startupFiles:      startupFiles,
 		zshPatterns:       shellSupportsZshEquals(shellCmd),
 	})
 	if err != nil {

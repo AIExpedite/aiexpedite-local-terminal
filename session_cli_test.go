@@ -967,10 +967,12 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	}
 	// POSIX mode also arrives through the environment ($POSIXLY_CORRECT, or an
 	// inherited $SHELLOPTS listing posix) — both leave `HOME=~` literal on bash
-	// 5.2.21, so both must reshape.
+	// 5.2.21, so both must reshape. A $BASH_ENV startup file can `set -o posix`
+	// itself, and we cannot read it, so that counts too.
 	for _, env := range []struct{ k, v string }{
 		{"POSIXLY_CORRECT", "1"},
 		{"SHELLOPTS", "braceexpand:posix"},
+		{"BASH_ENV", "/tmp/startup.sh"},
 	} {
 		t.Setenv(env.k, env.v)
 		_, envPosix := shapePTYExecArgs("bash", []string{"-c", origBashAssign})
