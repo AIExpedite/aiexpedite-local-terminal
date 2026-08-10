@@ -2474,8 +2474,9 @@ func mergeAdjacentShellSegments(segs []shellSegment) []shellSegment {
 }
 
 // shellWordAfterEquals returns the portion of w after the first '=' as a new
-// shellWord, preserving segment Expand metadata for the value region. Used for
-// --print=value forms so concatenated quote segments survive the peel.
+// shellWord, preserving segment Expand and Unquoted metadata for the value
+// region. Used for --print=value forms so concatenated quote segments and
+// dialect checks (e.g. zsh EQUALS on a peeled `=ls` value) survive the peel.
 func shellWordAfterEquals(w shellWord) shellWord {
 	eq := strings.IndexByte(w.Value, '=')
 	if eq < 0 {
@@ -2494,7 +2495,9 @@ func shellWordAfterEquals(w shellWord) shellWord {
 }
 
 // sliceShellSegmentsAfter drops the first skip bytes of the concatenated
-// segment stream, splitting a boundary segment if needed.
+// segment stream, splitting a boundary segment if needed. Expand and Unquoted
+// are copied onto the residual slice so hasZshEqualsSub / expand checks still
+// see the original quote context (e.g. unquoted `=ls` from `--print==ls`).
 func sliceShellSegmentsAfter(segs []shellSegment, skip int) []shellSegment {
 	if skip <= 0 {
 		return segs
@@ -2508,8 +2511,9 @@ func sliceShellSegmentsAfter(segs []shellSegment, skip int) []shellSegment {
 		}
 		if seen < skip {
 			out = append(out, shellSegment{
-				Value:  seg.Value[skip-seen:],
-				Expand: seg.Expand,
+				Value:    seg.Value[skip-seen:],
+				Expand:   seg.Expand,
+				Unquoted: seg.Unquoted,
 			})
 			seen = skip
 			continue

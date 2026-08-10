@@ -1442,6 +1442,21 @@ func TestShapePTYExecArgs_PreservesTrailingOptionsAfterPrint(t *testing.T) {
 	if trailEq[1] != wantTrailEq {
 		t.Errorf("print=value+unknown trailing = %q, want %q", trailEq[1], wantTrailEq)
 	}
+
+	// --print==ls peels value "=ls". On zsh, reshaping to a separate word
+	// `--print =ls` would trigger EQUALS; decline. Bash still reshapes with
+	// a safely quoted print value. Unquoted must survive sliceShellSegmentsAfter.
+	origPrintEq := `agy --print==ls`
+	_, zshPrintEq := shapePTYExecArgs("zsh", []string{"-c", origPrintEq})
+	if zshPrintEq[1] != origPrintEq {
+		t.Errorf("zsh --print==ls was reshaped: got %q, want original %q", zshPrintEq[1], origPrintEq)
+	}
+	// bash has no EQUALS; literal =ls is fine unquoted (shellArgMeta omits =).
+	_, bashPrintEq := shapePTYExecArgs("bash", []string{"-c", origPrintEq})
+	wantBashPrintEq := `agy --dangerously-skip-permissions --print =ls`
+	if bashPrintEq[1] != wantBashPrintEq {
+		t.Errorf("bash --print==ls = %q, want %q", bashPrintEq[1], wantBashPrintEq)
+	}
 }
 
 // Unquoted ${…} must close paramDepth so a later escaped \$ outside the
