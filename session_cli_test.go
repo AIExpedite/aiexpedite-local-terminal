@@ -957,13 +957,27 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	// ...unless the wrapper's own argv asks for POSIX mode, which disables the
 	// extension the same way `sh` does (`bash --posix -c 'printf %s HOME=~'`
 	// prints `HOME=~` on 5.2.21). Flags after -c belong to the payload.
+	wantPosixAssign := `agy --dangerously-skip-permissions --print 'HOME=~ review'`
 	for _, pre := range [][]string{{"--posix"}, {"-o", "posix"}} {
 		args := append(append([]string{}, pre...), "-c", origBashAssign)
 		got := shapeShellWrappedPTYArgs("bash", args)
-		want := `agy --dangerously-skip-permissions --print 'HOME=~ review'`
-		if got[len(got)-1] != want {
-			t.Errorf("bash %v assignment tilde = %q, want %q", pre, got[len(got)-1], want)
+		if got[len(got)-1] != wantPosixAssign {
+			t.Errorf("bash %v assignment tilde = %q, want %q", pre, got[len(got)-1], wantPosixAssign)
 		}
+	}
+	// POSIX mode also arrives through the environment ($POSIXLY_CORRECT, or an
+	// inherited $SHELLOPTS listing posix) — both leave `HOME=~` literal on bash
+	// 5.2.21, so both must reshape.
+	for _, env := range []struct{ k, v string }{
+		{"POSIXLY_CORRECT", "1"},
+		{"SHELLOPTS", "braceexpand:posix"},
+	} {
+		t.Setenv(env.k, env.v)
+		_, envPosix := shapePTYExecArgs("bash", []string{"-c", origBashAssign})
+		if envPosix[1] != wantPosixAssign {
+			t.Errorf("bash %s assignment tilde = %q, want %q", env.k, envPosix[1], wantPosixAssign)
+		}
+		t.Setenv(env.k, "")
 	}
 	// Dash keeps ':' inside the login name, where it never resolves, so the
 	// tilde stays literal there and the payload still reshapes.
@@ -1495,6 +1509,24 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		_, bashArgs := shapePTYExecArgs("bash", []string{"-c", c.orig})
 		if bashArgs[1] != c.want {
 			t.Errorf("bash scalar param %q = %q, want %q", c.orig, bashArgs[1], c.want)
+		}
+	}
+	// A positional slot with a literal default is provably one field — the
+	// letters belong to the operand, not to a parameter name (zsh 5.9:
+	// `zsh -c 'printf [%s] "${1:-review}"'` → `[review]`). Nested expansions in
+	// the operand are still inspected, so `${1:-$TASK}` declines.
+	_, zshPositional := shapePTYExecArgs("zsh", []string{"-c", `agy "${1:-review}"`})
+	wantZshPositional := `agy --dangerously-skip-permissions --print "${1:-review}"`
+	if zshPositional[1] != wantZshPositional {
+		t.Errorf("zsh positional default = %q, want %q", zshPositional[1], wantZshPositional)
+	}
+	for _, orig := range []string{
+		`agy "${1:-$TASK}"`,
+		`agy "${1:-${TASK}}"`,
+	} {
+		_, zshNested := shapePTYExecArgs("zsh", []string{"-c", orig})
+		if zshNested[1] != orig {
+			t.Errorf("zsh nested named param in operand was reshaped: got %q, want original %q", zshNested[1], orig)
 		}
 	}
 	// zsh: provably single-field forms still reshape — command / arithmetic

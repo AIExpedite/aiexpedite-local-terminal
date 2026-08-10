@@ -2181,7 +2181,7 @@ func shapePTYExecArgs(command string, args []string) (string, []string) {
 // program and the remainder is preserved verbatim as the literal prompt.
 func shapeShellWrappedPTYArgs(command string, args []string) []string {
 	if payload, ok := shellDashCPayload(command, args); ok {
-		if shaped, ok := shapeAntigravityShellPayload(command, shellArgsForcePosix(args), payload); ok {
+		if shaped, ok := shapeAntigravityShellPayload(command, shellForcesPosixMode(command, args), payload); ok {
 			return replaceDashCPayload(args, shaped)
 		}
 	}
@@ -2761,20 +2761,50 @@ func shellExpandHasZshNamedParam(s string) bool {
 // a parameter by name, as opposed to a positional / special parameter or a
 // length-count form.
 //
-// Names can appear after PE flags (`(U)TASK`), markers (`=`, `^`, `!`),
-// subscripts and operator words, so any name character anywhere in the body is
-// treated as "not provably scalar". `${#…}` is exempt: a length / element count
-// is always a single field.
+// The parameter slot is parsed on its own so a literal operator operand does
+// not count as a name: `${1:-review}` references the positional `1` with a
+// one-field literal default and still reshapes, while `${1:-$TASK}` does not
+// (the operand's own expansion is inspected recursively). PE flags (`(U)`) and
+// the `=`/`^`/`!` markers are peeled first; anything still starting with a name
+// character — including subscripted `name[…]` — is a name. `${#…}` is exempt:
+// a length / element count is always a single field.
 func shellParamBodyHasName(body string) bool {
 	if body == "" || body[0] == '#' {
 		return false
 	}
-	for i := 0; i < len(body); i++ {
-		if isShellNameStartByte(body[i]) {
-			return true
+	// ${(flags)name…}
+	if body[0] == '(' {
+		if _, rest, ok := splitZshPEFlagPrefix(body); ok {
+			body = rest
+			if body == "" {
+				return false
+			}
 		}
 	}
-	return false
+	// ${=name} / ${^name} / ${==name} shorthands.
+	for len(body) > 0 && (body[0] == '=' || body[0] == '^') {
+		body = body[1:]
+	}
+	if body == "" {
+		return false
+	}
+	// Indirect ${!name} resolves to a parameter we cannot see — never provable.
+	if body[0] == '!' {
+		return true
+	}
+	if isShellNameStartByte(body[0]) {
+		return true
+	}
+	// Positional (`1`, `12`) or special (`*`, `@`, `?`, `$`, `-`, …) slot: skip
+	// it, then inspect the operator remainder for nested expansions only.
+	i := 0
+	for i < len(body) && body[i] >= '0' && body[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		i = 1 // single-byte special parameter
+	}
+	return shellExpandHasZshNamedParam(body[i:])
 }
 
 // shellSubstCloseParen returns the index of the ')' that balances the '(' at
@@ -3098,21 +3128,39 @@ func shellSupportsAssignTilde(command string) bool {
 	}
 }
 
-// shellArgsForcePosix reports whether the wrapper's own argv puts bash into
-// POSIX mode (`bash --posix -c …`, `bash -o posix -c …`). Only flags before the
-// `-c` payload count — anything after it belongs to the payload's own argv.
-// POSIX mode disables the bash extensions this reshaper cares about:
-// assignment-word tilde expansion and $BASH_ENV sourcing (both verified on
-// bash 5.2.21).
-func shellArgsForcePosix(args []string) bool {
+// shellForcesPosixMode reports whether the bash wrapper starts in POSIX mode,
+// which disables the bash extensions this reshaper cares about: assignment-word
+// tilde expansion and $BASH_ENV sourcing (both verified on bash 5.2.21).
+//
+// Three activation paths, all confirmed to leave `HOME=~` literal:
+//   - argv before the `-c` payload: `bash --posix -c`, `bash -o posix -c`
+//     (flags after `-c` belong to the payload's own argv, not the wrapper).
+//   - $POSIXLY_CORRECT in the inherited environment.
+//   - an inherited $SHELLOPTS listing `posix`.
+//
+// Only bash reads these; `sh` is already POSIX and other shells ignore them.
+func shellForcesPosixMode(command string, args []string) bool {
+	switch shellCommandBase(command) {
+	case "bash", "sh":
+	default:
+		return false
+	}
 	for i, a := range args {
 		if a == "-c" {
-			return false
+			break
 		}
 		if a == "--posix" {
 			return true
 		}
 		if a == "-o" && i+1 < len(args) && args[i+1] == "posix" {
+			return true
+		}
+	}
+	if os.Getenv("POSIXLY_CORRECT") != "" {
+		return true
+	}
+	for _, opt := range strings.Split(os.Getenv("SHELLOPTS"), ":") {
+		if opt == "posix" {
 			return true
 		}
 	}
