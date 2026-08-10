@@ -718,13 +718,21 @@ func TestShapePTYExecArgs_PreservesPerFragmentExpansion(t *testing.T) {
 		t.Errorf("concatenated segments = %q, want %q", concatArgs[1], wantConcat)
 	}
 
-	// Expandable `$` alone + literal suffix that would form $(…) if flattened.
-	// Bash passes literal `$(touch /tmp/pwn)`; rebuild must not double-quote
-	// the joined value into a live command substitution.
+	// Lone `"$"` is not a bash expansion (literal `$`); concatenated with a
+	// single-quoted suffix that would form $(…) if double-quoted as one blob.
+	// Bash passes literal `$(touch /tmp/pwn)`; rebuild must keep it inert.
 	_, dollarArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$"'(touch /tmp/pwn)'`})
-	wantDollar := `agy --dangerously-skip-permissions --print "$"'(touch /tmp/pwn)'`
+	wantDollar := `agy --dangerously-skip-permissions --print '$(touch /tmp/pwn)'`
 	if dollarArgs[1] != wantDollar {
-		t.Errorf("expandable $ + literal paren = %q, want %q", dollarArgs[1], wantDollar)
+		t.Errorf("literal $ + paren suffix = %q, want %q", dollarArgs[1], wantDollar)
+	}
+
+	// Multi-word form of the same trap: must not flatten into
+	// --print "$(touch /tmp/pwn) more" (live command substitution under PTY).
+	_, dollarMore := shapePTYExecArgs("bash", []string{"-c", `agy "$"'(touch /tmp/pwn)' more`})
+	wantDollarMore := `agy --dangerously-skip-permissions --print '$(touch /tmp/pwn) more'`
+	if dollarMore[1] != wantDollarMore {
+		t.Errorf("literal $ + paren + more = %q, want %q", dollarMore[1], wantDollarMore)
 	}
 
 	// Same for `$` + literal name suffix (must not become one double-quoted
@@ -734,6 +742,14 @@ func TestShapePTYExecArgs_PreservesPerFragmentExpansion(t *testing.T) {
 	wantName := `agy --dangerously-skip-permissions --print "$TASK"more`
 	if nameArgs[1] != wantName {
 		t.Errorf("expandable $TASK + literal more = %q, want %q", nameArgs[1], wantName)
+	}
+
+	// Multi-word with multi-seg expand (`"$x"'y' more`): must not flatten to
+	// `"$xy more"` (wrong parameter name). Per-word/segment quoting.
+	_, multiSegMore := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK"'x' more`})
+	wantMultiSegMore := `agy --dangerously-skip-permissions --print "$TASK"x" "more`
+	if multiSegMore[1] != wantMultiSegMore {
+		t.Errorf("multi-seg expand + more = %q, want %q", multiSegMore[1], wantMultiSegMore)
 	}
 }
 
@@ -898,12 +914,16 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	}
 
 	// Quoted multi-field expansions still split after --print — leave unshaped.
+	// Nested forms (${x:+$@}) also yield multiple fields when the outer
+	// expansion is active — decline those too.
 	for _, orig := range []string{
 		`agy "$@"`,
 		`agy "${files[@]}"`,
 		`agy "${!pre_@}"`,
 		`agy --add-dir "$@" task`,
 		`agy "$@"'more'`,
+		`agy "${x:+$@}"`,
+		`agy "${x:-${files[@]}}"`,
 	} {
 		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
 		if args[1] != orig {
@@ -916,6 +936,14 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	wantStar := `agy --dangerously-skip-permissions --print "$*"`
 	if star[1] != wantStar {
 		t.Errorf("quoted $* expand = %q, want %q", star[1], wantStar)
+	}
+
+	// Trailing bare `$` is not an expansion — reshape (do not decline as
+	// unquoted expand and leave interactive agy waiting on the PTY).
+	_, cost := shapePTYExecArgs("bash", []string{"-c", `agy cost$`})
+	wantCost := `agy --dangerously-skip-permissions --print 'cost$'`
+	if cost[1] != wantCost {
+		t.Errorf("trailing literal $ = %q, want %q", cost[1], wantCost)
 	}
 }
 
@@ -936,11 +964,12 @@ func TestShapePTYExecArgs_DashDollarQuoteIsLiteral(t *testing.T) {
 	}
 }
 
-// Adjacent expandable quote segments must not be glued: `"$""${TASK}"`
-// rebuilds as `"$""${TASK}"`, not `"$${TASK}"` (which would expand $$ as PID).
+// Adjacent quote segments must not be glued: `"$""${TASK}"` rebuilds with the
+// bare `$` (not an expansion) single-quoted and `${TASK}` double-quoted —
+// never `"$${TASK}"` (which would expand $$ as PID).
 func TestShapePTYExecArgs_PreservesExpandSegmentBoundaries(t *testing.T) {
 	_, args := shapePTYExecArgs("bash", []string{"-c", `agy "$""${TASK}"`})
-	want := `agy --dangerously-skip-permissions --print "$""${TASK}"`
+	want := `agy --dangerously-skip-permissions --print '$'"${TASK}"`
 	if args[1] != want {
 		t.Errorf("adjacent expand segments = %q, want %q", args[1], want)
 	}
@@ -1182,8 +1211,13 @@ func TestShellWords(t *testing.T) {
 		{`agy "$@"`, []string{"agy", "$@"}, []bool{false, true}, false},
 		{`agy "${files[@]}"`, []string{"agy", `${files[@]}`}, []bool{false, true}, false},
 		{`agy "${!pre_@}"`, []string{"agy", `${!pre_@}`}, []bool{false, true}, false},
+		{`agy "${x:+$@}"`, []string{"agy", `${x:+$@}`}, []bool{false, true}, false},
 		{`agy "$*"`, []string{"agy", "$*"}, []bool{false, true}, false},
 		{`agy $OPTIONAL task`, []string{"agy", "$OPTIONAL", "task"}, []bool{false, true, false}, false},
+		// Trailing / non-expanding `$` is literal (not unquoted expand).
+		{`agy cost$`, []string{"agy", "cost$"}, []bool{false, false}, false},
+		{`agy "cost$"`, []string{"agy", "cost$"}, []bool{false, false}, false},
+		{`agy "$"`, []string{"agy", "$"}, []bool{false, false}, false},
 		{`agy --add-dir ${ROOT}\$dir task`, []string{"agy", "--add-dir", `${ROOT}$dir`, "task"}, []bool{false, false, true, false}, false},
 		{`agy "${TASK:-\$(x)}"`, nil, nil, true},
 		{`agy $'(x)'`, nil, nil, true},

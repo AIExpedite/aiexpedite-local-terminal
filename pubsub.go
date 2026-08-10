@@ -2333,6 +2333,8 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags []shellWord,
 // quoted segment (within and across whitespace-delimited words): mixed
 // `"$TASK"'$(evil)'` rebuilds as adjacent quoted pieces so the single-quoted
 // substitution stays inert instead of OR-ing Expand into one double-quoted blob.
+// Multi-segment expand words also stay per-segment even when peers are plain
+// (`"$"'(touch …)' more` must not flatten into `"$(touch …) more"`).
 func quoteAntigravityPrintFragments(frags []shellWord) string {
 	if len(frags) == 0 {
 		return `""`
@@ -2342,28 +2344,37 @@ func quoteAntigravityPrintFragments(frags []shellWord) string {
 	}
 
 	anyExpand := false
-	mixedLiteralExpand := false
+	needsPerWord := false
 	vals := make([]string, len(frags))
 	for i, f := range frags {
 		vals[i] = f.Value
-		for _, seg := range f.effectiveSegments() {
+		segs := mergeAdjacentShellSegments(f.effectiveSegments())
+		segExpandCount := 0
+		for _, seg := range segs {
 			if seg.Expand {
 				anyExpand = true
+				segExpandCount++
 			} else if strings.ContainsAny(seg.Value, "$`") {
 				// Literal segment still carries $ / ` — cannot double-quote a
 				// joined blob with expanding peers.
-				mixedLiteralExpand = true
+				needsPerWord = true
 			}
+		}
+		// Multiple segments with any expand: quote boundaries are lexical for
+		// `$` / `$(…)` / `$name` — never flatten this word into a joined blob.
+		if len(segs) > 1 && segExpandCount > 0 {
+			needsPerWord = true
 		}
 	}
 	// All-literal (including single-quoted $(...) segments): join + single-quote.
-	// Pure expanding (or plain text with expand peers): join + one quote pass.
-	if !anyExpand || !mixedLiteralExpand {
+	// Pure single-seg expanding (or plain text with expand peers): join + one
+	// quote pass. Mixed / multi-seg expand: per-word quoteShellWord.
+	if !anyExpand || !needsPerWord {
 		return quoteAntigravityShellArg(strings.Join(vals, " "), anyExpand)
 	}
 
-	// Mixed expanding + literal-with-$/` : per-word quoting with " " between
-	// words; each word may further split into per-segment adjacent quotes.
+	// Per-word quoting with " " between words; each word may further split
+	// into per-segment adjacent quotes.
 	var b strings.Builder
 	for i, f := range frags {
 		if i > 0 {
@@ -2563,8 +2574,9 @@ func shellExpandIsMultiWord(s string) bool {
 }
 
 // shellParamBodyIsMultiWord reports whether a ${…} body (without braces) is a
-// multi-field expansion: @ with optional operators, name[@] / !name[@], or
-// prefix-name expansion ${!prefix@}.
+// multi-field expansion: @ with optional operators, name[@] / !name[@],
+// prefix-name expansion ${!prefix@}, or a nested multi-field form in an
+// operator value (${x:+$@}, ${x:-${a[@]}}, …).
 func shellParamBodyIsMultiWord(body string) bool {
 	if body == "" {
 		return false
@@ -2595,7 +2607,9 @@ func shellParamBodyIsMultiWord(body string) bool {
 			return true
 		}
 	}
-	return false
+	// Nested multi-field expansions inside operator values, e.g. ${x:+$@}
+	// or ${var:-${arr[@]}}. shellExpandIsMultiWord scans for $@ / ${…[@]…}.
+	return shellExpandIsMultiWord(body)
 }
 
 // shellWords splits a shell-style command line into argument values, applying
@@ -2932,15 +2946,18 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				wordStarted = true
 				continue
 			}
-			// Double-quoted: unescaped $ / ` are expandable; other chars literal.
-			// Brace/glob/tilde do not expand inside double quotes — literal OK.
-			expandable := c == '$' || c == '`'
-			writeSeg(c, expandable)
-			if expandable && c == '$' {
+			// Double-quoted: unescaped $ / ` are expandable only when bash would
+			// actually expand them; a lone trailing `$` (`cost$`, `"$"`) is
+			// literal. Brace/glob/tilde do not expand inside double quotes.
+			if c == '$' {
 				j := nextAfterLineContinuations(s, i+1)
-				if j < len(s) {
+				expandable := j < len(s) && shellDollarStartsExpand(s[j])
+				writeSeg(c, expandable)
+				if expandable {
 					noteParamOpen(true, s[j])
 				}
+			} else {
+				writeSeg(c, c == '`')
 			}
 			noteParamClose(c)
 			continue
@@ -3009,6 +3026,9 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// family shells — reject so we never rebuild $'(touch …)' into an
 			// expandable substitution. Dash/POSIX sh lack dollar-quotes and
 			// treat $'text' as literal '$' + quoted text; keep that path.
+			// A bare `$` that does not start an expansion (`cost$`, `foo$.`) is
+			// literal so we can still reshape instead of declining for
+			// "unquoted expand".
 			if c == '$' {
 				j := nextAfterLineContinuations(s, i+1)
 				if j < len(s) && (s[j] == '\'' || s[j] == '"') {
@@ -3020,15 +3040,14 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 					writeSeg(c, false)
 					continue
 				}
-			}
-			expandable := c == '$' || c == '`'
-			writeSeg(c, expandable)
-			if expandable && c == '$' {
-				j := nextAfterLineContinuations(s, i+1)
-				if j < len(s) {
+				expandable := j < len(s) && shellDollarStartsExpand(s[j])
+				writeSeg(c, expandable)
+				if expandable {
 					noteParamOpen(true, s[j])
 				}
+				continue
 			}
+			writeSeg(c, c == '`')
 			// Unquoted `}` is handled above as brace expansion error, so
 			// paramDepth only closes inside double quotes (noteParamClose there).
 		}
@@ -3052,6 +3071,23 @@ func nextAfterLineContinuations(s string, i int) int {
 		i += 2
 	}
 	return i
+}
+
+// shellDollarStartsExpand reports whether b can begin a bash expansion after
+// '$' (parameter name, special parameter, ${…}, $(…), $((…)), $$). A lone or
+// otherwise non-expanding '$' is left as a literal character.
+func shellDollarStartsExpand(b byte) bool {
+	switch b {
+	case '{', '(', '@', '*', '#', '?', '-', '!', '_', '$':
+		return true
+	}
+	if b >= '0' && b <= '9' {
+		return true
+	}
+	if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') {
+		return true
+	}
+	return false
 }
 
 // looksLikeUnquotedBraceExpansion reports whether s[openIdx] (must be '{')
