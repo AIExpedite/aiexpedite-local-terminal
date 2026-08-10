@@ -1006,11 +1006,33 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if bashEnvOld[1] != `agy ~-` {
 		t.Errorf("bash ~- with BASH_ENV was reshaped: got %q", bashEnvOld[1])
 	}
+	// A startup-file $BASH_ENV can also push onto the directory stack, making
+	// non-zero `~+N` / `~-N` resolve (bash 5.2.21 with `pushd /tmp` in
+	// BASH_ENV expands `~+1` to the pre-push directory). Decline those too.
+	for _, orig := range []string{`agy ~+1`, `agy ~-1`, `agy ~+2/x`} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("bash %q with BASH_ENV was reshaped: got %q", orig, args[1])
+		}
+	}
 	t.Setenv("BASH_ENV", "")
+	// Without a startup file the stack has only entry 0, so `~+1` is literal
+	// (verified: `bash -c 'printf %s ~+1'` prints `~+1`) — reshape.
+	_, stackOne := shapePTYExecArgs("bash", []string{"-c", `agy ~+1`})
+	wantStackOne := `agy --dangerously-skip-permissions --print '~+1'`
+	if stackOne[1] != wantStackOne {
+		t.Errorf("bash ~+1 without startup file = %q, want %q", stackOne[1], wantStackOne)
+	}
+	// $ENV is not a bash startup-file signal: `env ENV=… bash -c`, a
+	// bash-backed `sh -c`, and `bash --posix -c` all ignore it (POSIX sources
+	// $ENV only for interactive shells), so these must still reshape.
 	t.Setenv("ENV", "/tmp/env.sh")
-	_, shEnvOld := shapePTYExecArgs("sh", []string{"-c", `agy ~-`})
-	if shEnvOld[1] != `agy ~-` {
-		t.Errorf("sh ~- with ENV was reshaped: got %q", shEnvOld[1])
+	for _, shell := range []string{"bash", "sh"} {
+		_, envOld := shapePTYExecArgs(shell, []string{"-c", `agy ~-`})
+		wantEnvOld := `agy --dangerously-skip-permissions --print '~-'`
+		if envOld[1] != wantEnvOld {
+			t.Errorf("%s ~- with ENV = %q, want %q", shell, envOld[1], wantEnvOld)
+		}
 	}
 	t.Setenv("ENV", "")
 	_, zshOld := shapePTYExecArgs("zsh", []string{"-c", `agy ~-`})

@@ -3097,18 +3097,24 @@ func shellSupportsAssignTilde(command string) bool {
 // OLDPWD) that this process cannot observe.
 //
 //   - zsh always reads .zshenv, even non-interactively.
-//   - bash reads $BASH_ENV for non-interactive shells; in POSIX mode (`sh`) it
-//     reads $ENV instead. Both are only a hazard when the variable is set.
+//   - bash reads $BASH_ENV for non-interactive shells. $ENV is *not* a bash
+//     signal here: verified on bash 5.2.21 that `env ENV=… bash -c`, a
+//     bash-backed `sh -c`, and `bash --posix -c` all ignore it (POSIX sources
+//     $ENV only for interactive shells).
 //   - dash/ash read $ENV for interactive shells only — `dash -c` sources
 //     nothing.
+//   - ksh88-era shells did source $ENV non-interactively, so keep it as a
+//     signal for ksh / unrecognized shells.
 func shellRunsStartupFiles(command string) bool {
 	switch shellCommandBase(command) {
 	case "dash", "ash", "busybox":
 		return false
 	case "zsh":
 		return true
+	case "bash", "sh":
+		return os.Getenv("BASH_ENV") != ""
 	default:
-		// bash, sh, ksh, unknown.
+		// ksh and unknown shells.
 		return os.Getenv("BASH_ENV") != "" || os.Getenv("ENV") != ""
 	}
 }
@@ -3772,12 +3778,33 @@ func shellTildePrefixExpands(login string, opts shellWordOptions) bool {
 	if opts.pwdTilde && isPwdTildeStackZero(login) {
 		return true
 	}
+	// Non-zero stack indices (`~+1`, `~-2`) need a directory stack this process
+	// cannot see. A fresh `bash -c` has only entry 0, but a startup file can
+	// push onto it — with $BASH_ENV running `pushd /tmp`, bash 5.2.21 expands
+	// `~+1` to the pre-push directory. Decline reshape when that is possible.
+	if opts.pwdTilde && opts.startupFiles && isPwdTildeStackIndex(login) {
+		return true
+	}
 	_, err := user.Lookup(login)
 	if err == nil {
 		return true
 	}
 	// Unknown login: bash/dash leave literal; zsh fails the expansion.
 	return opts.failUnknownTilde
+}
+
+// isPwdTildeStackIndex reports whether login is a bash-style directory-stack
+// reference (`+N` / `-N`, any index).
+func isPwdTildeStackIndex(login string) bool {
+	if len(login) < 2 || (login[0] != '+' && login[0] != '-') {
+		return false
+	}
+	for i := 1; i < len(login); i++ {
+		if login[i] < '0' || login[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // isPwdTildeStackZero reports whether login is a bash-style directory-stack
