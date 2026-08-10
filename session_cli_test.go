@@ -853,9 +853,12 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		t.Errorf("non-assignment colon-tilde = %q, want %q", colonTilde[1], wantColonTilde)
 	}
 
-	// Assignment-like tilde (`HOME=~`, `PATH=…:~/x`) expands in bash — leave unshaped.
+	// Assignment-like tilde (`HOME=~`, `HOME+=~`, `PATH=…:~/x`) expands in
+	// bash — leave unshaped. Compound += / -= also activate tilde expansion.
 	for _, orig := range []string{
 		`agy HOME=~`,
+		`agy HOME+=~`,
+		`agy HOME-=~`,
 		`agy PATH=~/bin:~/x`,
 		`agy PATH=/bin:~/x`,
 	} {
@@ -863,6 +866,13 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		if args[1] != orig {
 			t.Errorf("assignment tilde was reshaped: got %q, want original %q", args[1], orig)
 		}
+	}
+
+	// Indexed assignment A[0]=~ also tilde-expands; unquoted '[' declines reshape.
+	origIdx := `agy A[0]=~`
+	_, idxArgs := shapePTYExecArgs("bash", []string{"-c", origIdx})
+	if idxArgs[1] != origIdx {
+		t.Errorf("indexed assignment tilde was reshaped: got %q, want original %q", idxArgs[1], origIdx)
 	}
 
 	// Quoted '=' is not an assignment separator — `'HOME='~` is literal HOME=~.
@@ -944,6 +954,26 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	wantCost := `agy --dangerously-skip-permissions --print 'cost$'`
 	if cost[1] != wantCost {
 		t.Errorf("trailing literal $ = %q, want %q", cost[1], wantCost)
+	}
+
+	// Nested quotes inside ${…} (`"${x:-"foo bar"}"`) must not exit double-quote
+	// mode and split the word — leave unshaped rather than rebuild broken.
+	for _, orig := range []string{
+		`agy "${x:-"foo bar"}"`,
+		`agy "${x:-"foo"}"`,
+		`agy ${x:-"foo bar"}`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("nested PE quotes was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+
+	// Plain double-quoted PE without nested quotes still reshapes.
+	_, pe := shapePTYExecArgs("bash", []string{"-c", `agy "${x:-foo}"`})
+	wantPE := `agy --dangerously-skip-permissions --print "${x:-foo}"`
+	if pe[1] != wantPE {
+		t.Errorf("plain PE default = %q, want %q", pe[1], wantPE)
 	}
 }
 
@@ -1201,12 +1231,19 @@ func TestShellWords(t *testing.T) {
 		{`agy review {foo}`, []string{"agy", "review", "{foo}"}, []bool{false, false, false}, false},
 		{`agy review foo~bar`, []string{"agy", "review", "foo~bar"}, []bool{false, false, false}, false},
 		{`agy HOME=~`, nil, nil, true},
+		{`agy HOME+=~`, nil, nil, true},
+		{`agy HOME-=~`, nil, nil, true},
 		{`agy PATH=~/bin:~/x`, nil, nil, true},
 		{`agy PATH=/bin:~/x`, nil, nil, true},
 		{`agy foo:~`, []string{"agy", "foo:~"}, []bool{false, false}, false},
 		{`agy 'HOME='~`, []string{"agy", "HOME=~"}, []bool{false, false}, false},
 		{`agy 1foo=~`, []string{"agy", "1foo=~"}, []bool{false, false}, false},
 		{`agy 'HOME'=~`, []string{"agy", "HOME=~"}, []bool{false, false}, false},
+		// Nested quotes inside ${…} decline (do not split the outer word).
+		{`agy "${x:-"foo bar"}"`, nil, nil, true},
+		{`agy ${x:-"foo bar"}`, nil, nil, true},
+		{`agy "${x:-foo}"`, []string{"agy", `${x:-foo}`}, []bool{false, true}, false},
+
 		{`agy "$""${TASK}"`, []string{"agy", "$${TASK}"}, []bool{false, true}, false},
 		{`agy "$@"`, []string{"agy", "$@"}, []bool{false, true}, false},
 		{`agy "${files[@]}"`, []string{"agy", `${files[@]}`}, []bool{false, true}, false},

@@ -2805,9 +2805,10 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		}
 		if unquotedCtx {
 			if c == '=' {
-				// Only a valid unquoted assignment name activates tilde-after-=
-				// (HOME=~ expands; 1foo=~ and 'HOME'=~ stay literal).
-				if !sawUnquotedAssign && !assignNamePolluted && isValidBashAssignName(assignName.String()) {
+				// Only a valid unquoted assignment LHS activates tilde-after-=
+				// (HOME=~, HOME+=~ expand; 1foo=~ and 'HOME'=~ stay literal).
+				// Compound += / -= leave a trailing + / - on assignName.
+				if !sawUnquotedAssign && !assignNamePolluted && isValidBashAssignLHS(assignName.String()) {
 					sawUnquotedAssign = true
 					endsWithUnquotedAssignSep = true
 				} else if sawUnquotedAssign {
@@ -2937,6 +2938,13 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				}
 			}
 			if c == '"' {
+				// Quotes inside an open ${…} are part of the expansion operand
+				// (`"${x:-"foo bar"}"`), not word delimiters. We do not track
+				// that nested quoting state — decline reshape rather than
+				// exit double-quote mode and split the word.
+				if paramDepth > 0 {
+					return nil, fmt.Errorf("unsupported nested quotes inside parameter expansion")
+				}
 				if !segStarted {
 					segs = append(segs, shellSegment{Value: "", Expand: false})
 				} else {
@@ -3261,6 +3269,24 @@ func isValidBashAssignName(s string) bool {
 		}
 	}
 	return true
+}
+
+// isValidBashAssignLHS reports whether s is a valid assignment left-hand side
+// as accumulated before the '=' character. Covers plain NAME and compound
+// assignment operators NAME+ / NAME- (i.e. NAME+=value / NAME-=value), which
+// also activate tilde expansion after the '=' (HOME+=~ → HOME+=/home/…).
+// Indexed forms (A[0]=) hit the unquoted '[' path earlier and already decline.
+func isValidBashAssignLHS(s string) bool {
+	if isValidBashAssignName(s) {
+		return true
+	}
+	if n := len(s); n >= 2 {
+		last := s[n-1]
+		if last == '+' || last == '-' {
+			return isValidBashAssignName(s[:n-1])
+		}
+	}
+	return false
 }
 
 // shellArgMeta is the set of characters that force quoting when serializing a
