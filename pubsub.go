@@ -2226,13 +2226,13 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 	// multiple argv tokens after --print). Single-field double-quoted forms
 	// (`"$TASK"`, `--add-dir "$ROOT"`) still reshape.
 	for _, f := range flags {
-		if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() {
+		if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
 			return "", false
 		}
 	}
 	if hasPrompt {
 		for _, f := range promptFrags {
-			if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() {
+			if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
 				return "", false
 			}
 		}
@@ -2541,6 +2541,20 @@ func (w shellWord) hasQuotedMultiWordExpand() bool {
 			continue
 		}
 		if shellExpandIsMultiWord(seg.Value) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasExpandWithBackslash reports expandable segments whose value still contains
+// a backslash (e.g. "${x%\}}" pattern escapes). quoteAntigravityShellArg with
+// allowExpand doubles every `\` for double-quote safety, which changes
+// parameter-expansion grammar (`${x%\}}` → `${x%\\}}`). Decline reshape rather
+// than rewrite expansion syntax; pure-literal segments with `\` are fine.
+func (w shellWord) hasExpandWithBackslash() bool {
+	for _, seg := range w.effectiveSegments() {
+		if seg.Expand && strings.Contains(seg.Value, `\`) {
 			return true
 		}
 	}
@@ -3096,11 +3110,14 @@ func nextAfterLineContinuations(s string, i int) int {
 }
 
 // shellDollarStartsExpand reports whether b can begin a bash expansion after
-// '$' (parameter name, special parameter, ${…}, $(…), $((…)), $$). A lone or
-// otherwise non-expanding '$' is left as a literal character.
+// '$' (parameter name, special parameter, ${…}, $(…), $((…)), $[…], $$). A
+// lone or otherwise non-expanding '$' is left as a literal character.
+// `$[…]` is bash's legacy arithmetic form (still evaluated in double quotes
+// on bash 5.x); without recognizing it the reshaper would single-quote the
+// token and freeze the expression as the model prompt.
 func shellDollarStartsExpand(b byte) bool {
 	switch b {
-	case '{', '(', '@', '*', '#', '?', '-', '!', '_', '$':
+	case '{', '(', '[', '@', '*', '#', '?', '-', '!', '_', '$':
 		return true
 	}
 	if b >= '0' && b <= '9' {

@@ -1010,6 +1010,28 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	if pe[1] != wantPE {
 		t.Errorf("plain PE default = %q, want %q", pe[1], wantPE)
 	}
+
+	// Parameter expansions whose pattern uses backslash escapes (e.g. %\} to
+	// match a literal '}') cannot be re-double-quoted: allowExpand doubling
+	// turns \ into \\ and changes the expansion. Leave unshaped.
+	for _, orig := range []string{
+		`agy "${x%\}}"`,
+		`agy "${x#\*}"`,
+		`agy --add-dir "${x%\}}" task`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("PE backslash pattern was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+
+	// Legacy bash arithmetic `$[…]` still expands inside double quotes — keep
+	// Expand so rebuild emits --print "$[1+2]" (not a single-quoted literal).
+	_, arith := shapePTYExecArgs("bash", []string{"-c", `agy "$[1+2]"`})
+	wantArith := `agy --dangerously-skip-permissions --print "$[1+2]"`
+	if arith[1] != wantArith {
+		t.Errorf("legacy arithmetic expand = %q, want %q", arith[1], wantArith)
+	}
 }
 
 // Dash lacks ANSI-C / locale dollar-quoting: $'text' is literal "$text" and
