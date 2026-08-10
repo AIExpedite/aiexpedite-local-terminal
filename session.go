@@ -2000,6 +2000,9 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 	i := 0
 	var printVal string
 	gotPrint := false
+	// dangling holds a recognized valued flag that arrived without its operand.
+	// It must stay behind the prompt so it cannot consume --print.
+	var dangling []string
 	for i < len(args) {
 		a := args[i]
 		// Match only exact lowercase CLI spellings (agy flag names are
@@ -2054,12 +2057,18 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 		}
 
 		if antigravityValuedFlags[a] {
-			flags = append(flags, a)
-			i++
-			if i < len(args) {
-				flags = append(flags, args[i])
+			if i+1 >= len(args) {
+				// Recognized valued flag with no operand (always the last
+				// token). Hoisting it into flags would emit
+				// `--conversation --print review`, where agy takes `--print` as
+				// the conversation value and the one-shot silently disappears.
+				// Keep it last so --print <prompt> stays intact.
+				dangling = append(dangling, a)
 				i++
+				continue
 			}
+			flags = append(flags, a, args[i+1])
+			i += 2
 			continue
 		}
 
@@ -2069,12 +2078,12 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 	if gotPrint {
 		// Anything not recognized after an explicit print value must remain on
 		// argv so agy can preserve its own positional/unknown-option behavior.
-		return flags, printVal, args[i:], true
+		return flags, printVal, append(append([]string{}, args[i:]...), dangling...), true
 	}
 	if i < len(args) {
-		return flags, strings.Join(args[i:], " "), nil, true
+		return flags, strings.Join(args[i:], " "), dangling, true
 	}
-	return flags, "", nil, false
+	return flags, "", dangling, false
 }
 
 func isAntigravityPrintFlag(name string) bool {

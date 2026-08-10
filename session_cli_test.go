@@ -489,6 +489,45 @@ func TestBuildAntigravityInteractiveArgs_LeadingFlagsThenPrompt(t *testing.T) {
 	}
 }
 
+// A recognized valued flag with no operand must not be hoisted ahead of
+// --print: `--conversation --print review` would make `--print` the
+// conversation value and drop the one-shot entirely. It stays last instead.
+func TestBuildAntigravityInteractiveArgs_ValuelessFlagStaysAfterPrint(t *testing.T) {
+	for _, tc := range []struct {
+		in   []string
+		want []string
+	}{
+		{
+			[]string{"--print", "review", "--conversation"},
+			[]string{"--dangerously-skip-permissions", "--print", "review", "--conversation"},
+		},
+		{
+			[]string{"--add-dir", "/repo", "--print", "review", "--model"},
+			[]string{"--dangerously-skip-permissions", "--add-dir", "/repo", "--print", "review", "--model"},
+		},
+		{
+			// No print at all: the flag is the whole argv, nothing to swallow.
+			[]string{"--conversation"},
+			[]string{"--dangerously-skip-permissions", "--conversation"},
+		},
+	} {
+		got := buildAntigravityInteractiveArgs(tc.in)
+		if strings.Join(got, "\x00") != strings.Join(tc.want, "\x00") {
+			t.Errorf("buildAntigravityInteractiveArgs(%#v) = %#v, want %#v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Same contract for the shell-wrapped reshaper: a value-less flag may not end
+// up in front of --print in the rebuilt payload.
+func TestShapePTYExecArgs_ValuelessFlagStaysAfterPrint(t *testing.T) {
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy --print review --conversation`})
+	want := `agy --dangerously-skip-permissions --print review --conversation`
+	if args[1] != want {
+		t.Errorf("shaped payload = %q, want %q", args[1], want)
+	}
+}
+
 // Regression: --print must NOT be followed by another flag (agy 1.1.x eats it as the prompt).
 func TestBuildAntigravityInteractiveArgs_PrintValueIsNeverAFlag(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{"review this design"})
@@ -899,6 +938,21 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		if args[1] != orig {
 			t.Errorf("bash colon-terminated tilde was reshaped: got %q, want original %q", args[1], orig)
 		}
+	}
+	// Assignment-word tilde expansion is a bash extension that POSIX mode turns
+	// off, so a `sh` wrapper passes `HOME=~` literally even when /bin/sh is
+	// bash (verified with a sh symlink and `bash --posix` on 5.2.21) — reshape
+	// rather than declining and leaving agy in the TUI.
+	_, shAssign := shapePTYExecArgs("sh", []string{"-c", `agy HOME=~ review`})
+	wantShAssign := `agy --dangerously-skip-permissions --print 'HOME=~ review'`
+	if shAssign[1] != wantShAssign {
+		t.Errorf("sh assignment tilde = %q, want %q", shAssign[1], wantShAssign)
+	}
+	// bash proper does expand it — decline there.
+	origBashAssign := `agy HOME=~ review`
+	_, bashAssign := shapePTYExecArgs("bash", []string{"-c", origBashAssign})
+	if bashAssign[1] != origBashAssign {
+		t.Errorf("bash assignment tilde was reshaped: got %q, want original %q", bashAssign[1], origBashAssign)
 	}
 	// Dash keeps ':' inside the login name, where it never resolves, so the
 	// tilde stays literal there and the payload still reshapes.

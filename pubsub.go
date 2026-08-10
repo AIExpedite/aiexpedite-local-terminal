@@ -2209,6 +2209,7 @@ func shapeAntigravityShellPayload(shellCmd, payload string) (string, bool) {
 		braceExpand:       shellSupportsBraceExpansion(shellCmd),
 		dollarQuote:       shellSupportsDollarQuote(shellCmd),
 		assignTilde:       shellSupportsAssignTilde(shellCmd),
+		colonTilde:        shellSupportsColonTildePrefix(shellCmd),
 		legacyArith:       shellSupportsLegacyArith(shellCmd),
 		pwdTilde:          shellSupportsPwdTilde(shellCmd),
 		failUnknownTilde:  shellFailsUnknownTildeLogin(shellCmd),
@@ -2290,6 +2291,10 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 	i := 0
 	var printFrags []shellWord
 	gotPrint := false
+	// dangling holds a recognized valued flag that arrived without its operand
+	// (mirrors partitionAntigravityCallerArgs): it must stay behind the prompt
+	// so the rebuilt command cannot let it swallow --print.
+	var dangling []shellWord
 	for i < len(words) {
 		a := words[i].Value
 		// Exact lowercase CLI spellings only (same case-sensitive rule as
@@ -2340,12 +2345,15 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 		}
 
 		if antigravityValuedFlags[a] {
-			flags = append(flags, words[i])
-			i++
-			if i < len(words) {
-				flags = append(flags, words[i])
+			if i+1 >= len(words) {
+				// Valued flag with no operand — keep it after the prompt so the
+				// rebuild cannot emit `--conversation --print <prompt>`.
+				dangling = append(dangling, words[i])
 				i++
+				continue
 			}
+			flags = append(flags, words[i], words[i+1])
+			i += 2
 			continue
 		}
 
@@ -2354,12 +2362,12 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 	if gotPrint {
 		// Anything not recognized after an explicit print value must remain on
 		// the reshaped command (unknown options, positionals).
-		return flags, printFrags, words[i:], true
+		return flags, printFrags, append(append([]shellWord{}, words[i:]...), dangling...), true
 	}
 	if i < len(words) {
-		return flags, words[i:], nil, true
+		return flags, words[i:], dangling, true
 	}
-	return flags, nil, nil, false
+	return flags, nil, dangling, false
 }
 
 // quoteAntigravityPrintFragments serializes one or more prompt tokens into a
@@ -3006,6 +3014,10 @@ type shellWordOptions struct {
 	// dash/ash leave those forms literal; word-initial ~/x still expands
 	// on all shells and is gated separately.
 	assignTilde bool
+	// colonTilde is true when an unquoted ':' ends a word-initial tilde-prefix
+	// (`agy ~:x` → `$HOME:x`). True on the bash family including bash-as-sh;
+	// dash keeps the ':' in the login name.
+	colonTilde bool
 	// legacyArith is true when the wrapper evaluates bash-style `$[…]`
 	// arithmetic. Dash/ash leave `$[…]` as literal `$` + text; treating `[`
 	// as expansion there declines reshape and leaves interactive agy waiting.
@@ -3057,10 +3069,28 @@ func shellSupportsBraceExpansion(command string) bool {
 
 // shellSupportsAssignTilde reports whether the named shell expands ~ in
 // assignment-like positions (HOME=~, PATH=/bin:~/x). Bash/zsh/ksh do; dash/ash
-// pass those forms literally. Bare `sh` resolves like brace/dollar-quote.
-// Word-initial ~/x is POSIX and is always treated as expanding elsewhere.
+// pass those forms literally. Word-initial ~/x is POSIX and is handled
+// elsewhere.
+//
+// `sh` is POSIX regardless of the implementation behind it: assignment-word
+// tilde expansion on ordinary arguments is a bash extension disabled in POSIX
+// mode, so bash-backed `sh` passes `HOME=~` literally (verified on bash 5.2.21
+// via both a `sh` symlink and `bash --posix`). Treating it as bash-family would
+// decline the reshape and leave agy waiting in the TUI.
 func shellSupportsAssignTilde(command string) bool {
-	// Same dialect split as brace expansion for practical purposes.
+	switch shellCommandBase(command) {
+	case "dash", "ash", "busybox", "sh":
+		return false
+	default:
+		return true
+	}
+}
+
+// shellSupportsColonTildePrefix reports whether an unquoted ':' terminates a
+// *word-initial* tilde-prefix (`agy ~:x` → `$HOME:x`). Unlike assignment-word
+// tildes this survives POSIX mode, so bash-backed `sh` still does it — resolve
+// the implementation the same way brace expansion does.
+func shellSupportsColonTildePrefix(command string) bool {
 	return shellSupportsBraceExpansion(command)
 }
 
@@ -3517,11 +3547,12 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// Mid-word forms without that context (`foo~bar`, `foo:~`) are
 			// ordinary literals on all shells.
 			if !wordStarted {
-				// bash/zsh/ksh end a tilde-prefix at an unquoted ':' anywhere in
-				// the word, not just in assignment values: `bash -c 'agy ~:x'`
-				// passes `$HOME:x`. Dash keeps `~:x` literal (opts.assignTilde
-				// false) so those payloads still reshape with --print.
-				if looksLikeExpandingWordInitialTilde(s, i, opts, opts.assignTilde) {
+				// The bash family ends a tilde-prefix at an unquoted ':' anywhere
+				// in the word, not just in assignment values: `bash -c 'agy ~:x'`
+				// passes `$HOME:x`. This survives POSIX mode, so bash-as-sh does
+				// it too (opts.colonTilde, not opts.assignTilde). Dash keeps
+				// `~:x` literal so those payloads still reshape with --print.
+				if looksLikeExpandingWordInitialTilde(s, i, opts, opts.colonTilde) {
 					return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 				}
 				writeSeg(c, false)
