@@ -492,6 +492,51 @@ func TestBuildAntigravityInteractiveArgs_BarePrintKeepsItsError(t *testing.T) {
 	if shaped[1] != orig {
 		t.Errorf("shell-wrapped bare --print = %q, want it unchanged", shaped[1])
 	}
+	// ...but a print flag whose value merely looks like a flag is a valid
+	// one-shot: agy takes the next token as the value, so `agy --print --print`
+	// has the prompt "--print" and must still be shaped.
+	for _, tc := range []struct {
+		in   []string
+		want []string
+	}{
+		{[]string{"--print", "--print"}, []string{"--dangerously-skip-permissions", "--print", "--print"}},
+		{[]string{"-p", "-p"}, []string{"--dangerously-skip-permissions", "--print", "-p"}},
+		{[]string{"--add-dir", "/repo", "--print", "--prompt"}, []string{"--dangerously-skip-permissions", "--add-dir", "/repo", "--print", "--prompt"}},
+	} {
+		got := buildAntigravityInteractiveArgs(tc.in)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("buildAntigravityInteractiveArgs(%#v) = %#v, want %#v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// agy rejects an equals-form boolean it cannot parse — `agy --continue=maybe
+// review` exits with `invalid boolean value "maybe" for -continue` on 1.1.11 —
+// so the safety strip must not swallow the token and run the prompt anyway.
+func TestBuildAntigravityInteractiveArgs_KeepsInvalidBoolEqualsError(t *testing.T) {
+	for _, in := range [][]string{
+		{"--continue=maybe", "review"},
+		{"-c=yes-please", "review"},
+		{"--dangerously-skip-permissions=nope", "review"},
+	} {
+		got := buildAntigravityInteractiveArgs(in)
+		if !reflect.DeepEqual(got, in) {
+			t.Errorf("buildAntigravityInteractiveArgs(%#v) = %#v, want it unchanged", in, got)
+		}
+	}
+	// Valid boolean spellings still strip (Go accepts 1/0/t/f/TRUE/...).
+	for _, in := range [][]string{{"--continue=1", "review"}, {"-c=false", "review"}} {
+		got := buildAntigravityInteractiveArgs(in)
+		want := []string{"--dangerously-skip-permissions", "--print", "review"}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("buildAntigravityInteractiveArgs(%#v) = %#v, want %#v", in, got, want)
+		}
+	}
+	orig := `agy --continue=maybe review`
+	_, shaped := shapePTYExecArgs("bash", []string{"-c", orig})
+	if shaped[1] != orig {
+		t.Errorf("shell-wrapped invalid bool = %q, want it unchanged", shaped[1])
+	}
 }
 
 // Known leading flags stay on argv; the remainder becomes the single --print value.

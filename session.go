@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1949,7 +1950,8 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	// is exactly how probeAntigravityNativeCapabilityUncached queries the CLI,
 	// but shaping would turn it into `--print --version` and burn a model run.
 	// Same for a lone `--help` / `-h` or a bare subcommand (`agy models`).
-	if isAntigravityDiagnosticInvocation(args) || endsWithBareAntigravityPrintFlag(args) {
+	if isAntigravityDiagnosticInvocation(args) || endsWithBareAntigravityPrintFlag(args) ||
+		hasInvalidAntigravityBoolEquals(args) {
 		return args
 	}
 	result := make([]string, 0, len(args)+3)
@@ -2146,14 +2148,70 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 	return flags, "", dangling, false
 }
 
-// endsWithBareAntigravityPrintFlag reports a trailing `--print` / `-p` /
-// `--prompt` with no operand. agy's string flag then has no value and the CLI
-// exits with `flag needs an argument: -print` (verified on 1.1.11), so inventing
-// an empty prompt would convert a caller's error into a permission-skipping
-// model run. Passing the argv through preserves that error - and unlike simply
-// omitting --print, it cannot drop agy into the interactive TUI.
+// endsWithBareAntigravityPrintFlag reports a `--print` / `-p` / `--prompt` that
+// runs out of argv before its operand. agy's string flag then has no value and
+// the CLI exits with `flag needs an argument: -print` (verified on 1.1.11), so
+// inventing an empty prompt would convert a caller's error into a
+// permission-skipping model run. Passing the argv through preserves that error —
+// and unlike simply omitting --print, it cannot drop agy into the TUI.
+//
+// The scan mirrors the partitioner's token walk rather than looking at the last
+// token alone: in `agy --print --print` the second token is the first flag's
+// *value* (prompt "--print"), which is a perfectly valid one-shot and must
+// still be shaped.
 func endsWithBareAntigravityPrintFlag(args []string) bool {
-	return len(args) > 0 && isAntigravityPrintFlag(args[len(args)-1])
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if name, _, ok := splitAntigravityEqualsFlag(a); ok {
+			// `--print=` carries a value (possibly empty); other recognized
+			// equals-form flags are self-contained.
+			if isAntigravityPrintFlag(name) || antigravityValuedFlags[name] || antigravityBoolFlags[name] {
+				continue
+			}
+			return false // unknown token: the prompt starts here
+		}
+		if isAntigravityPrintFlag(a) {
+			if i+1 >= len(args) {
+				return true
+			}
+			i++ // the next token is this flag's value, whatever it looks like
+			continue
+		}
+		if antigravityBoolFlags[a] {
+			continue
+		}
+		if antigravityValuedFlags[a] {
+			if i+1 >= len(args) {
+				return false // dangling valued flag: handled by the partitioner
+			}
+			i++
+			continue
+		}
+		return false // first non-flag token: the prompt starts here
+	}
+	return false
+}
+
+// hasInvalidAntigravityBoolEquals reports an equals-form spelling of a flag the
+// safety guard strips whose value is not a Go boolean. agy would reject the
+// whole invocation — `agy --continue=maybe review` exits with `invalid boolean
+// value "maybe" for -continue` on 1.1.11 — so stripping the token would launch a
+// model run the caller never got. Only the stripped flags need this: anything
+// we forward reaches agy and produces its own error.
+func hasInvalidAntigravityBoolEquals(args []string) bool {
+	for _, a := range args {
+		name, val, ok := splitAntigravityEqualsFlag(a)
+		if !ok {
+			continue
+		}
+		if name != "--dangerously-skip-permissions" && name != "--continue" && name != "-c" {
+			continue
+		}
+		if _, err := strconv.ParseBool(val); err != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func isAntigravityPrintFlag(name string) bool {
