@@ -2003,6 +2003,20 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 	// dangling holds a recognized valued flag that arrived without its operand.
 	// It must stay behind the prompt so it cannot consume --print.
 	var dangling []string
+	// postFlags keeps flags that followed the explicit print value in that same
+	// position. Hoisting them ahead of the prompt would reverse shell expansion
+	// order: `agy --print "${x:=review}" --add-dir "$x"` passes review to both,
+	// but `--add-dir "$x" --print "${x:=review}"` passes an empty --add-dir
+	// (verified in bash 5.2.21 with a stub agy). agy itself accepts options
+	// after the print value -- that is the native resume shape.
+	var postFlags []string
+	addFlag := func(tokens ...string) {
+		if gotPrint {
+			postFlags = append(postFlags, tokens...)
+			return
+		}
+		flags = append(flags, tokens...)
+	}
 	for i < len(args) {
 		a := args[i]
 		// Match only exact lowercase CLI spellings (agy flag names are
@@ -2023,7 +2037,7 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 				continue
 			}
 			if antigravityValuedFlags[name] || antigravityBoolFlags[name] {
-				flags = append(flags, a)
+				addFlag(a)
 				i++
 				continue
 			}
@@ -2051,7 +2065,7 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 				i++
 				continue
 			}
-			flags = append(flags, a)
+			addFlag(a)
 			i++
 			continue
 		}
@@ -2067,7 +2081,7 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 				i++
 				continue
 			}
-			flags = append(flags, a, args[i+1])
+			addFlag(a, args[i+1])
 			i += 2
 			continue
 		}
@@ -2078,7 +2092,9 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 	if gotPrint {
 		// Anything not recognized after an explicit print value must remain on
 		// argv so agy can preserve its own positional/unknown-option behavior.
-		return flags, printVal, append(append([]string{}, args[i:]...), dangling...), true
+		trailing := append([]string{}, postFlags...)
+		trailing = append(trailing, args[i:]...)
+		return flags, printVal, append(trailing, dangling...), true
 	}
 	if i < len(args) {
 		return flags, strings.Join(args[i:], " "), dangling, true

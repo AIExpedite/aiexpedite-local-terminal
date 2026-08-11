@@ -2181,7 +2181,8 @@ func shapePTYExecArgs(command string, args []string) (string, []string) {
 // program and the remainder is preserved verbatim as the literal prompt.
 func shapeShellWrappedPTYArgs(command string, args []string) []string {
 	if payload, ok := shellDashCPayload(command, args); ok {
-		if shaped, ok := shapeAntigravityShellPayload(command, shellForcesPosixMode(command, args), payload); ok {
+		if shaped, ok := shapeAntigravityShellPayload(command, shellForcesPosixMode(command, args),
+			shellArgsDisableBraceExpand(args), payload); ok {
 			return replaceDashCPayload(args, shaped)
 		}
 	}
@@ -2204,12 +2205,12 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 // expansion per prompt fragment so `agy "$TASK"` still expands while
 // `agy '$(cmd)'` and `agy "\$(cmd)"` stay literal — never OR-ing expand across
 // mixed fragments into one double-quoted blob that reactivates substitutions.
-func shapeAntigravityShellPayload(shellCmd string, posixMode bool, payload string) (string, bool) {
+func shapeAntigravityShellPayload(shellCmd string, posixMode, noBraceExpand bool, payload string) (string, bool) {
 	// A startup file runs before the payload and its contents are invisible to
 	// us. POSIX mode suppresses the sourcing itself, so this stays false there.
 	startupFiles := shellRunsStartupFiles(shellCmd) && !posixMode
 	words, err := shellWords(payload, shellWordOptions{
-		braceExpand: shellSupportsBraceExpansion(shellCmd),
+		braceExpand: shellSupportsBraceExpansion(shellCmd) && !noBraceExpand,
 		dollarQuote: shellSupportsDollarQuote(shellCmd),
 		// A startup file can itself `set -o posix` (verified on bash 5.2.21:
 		// with `set -o posix` in $BASH_ENV, `bash -c 'printf %s HOME=~'` prints
@@ -2306,6 +2307,17 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 	// (mirrors partitionAntigravityCallerArgs): it must stay behind the prompt
 	// so the rebuilt command cannot let it swallow --print.
 	var dangling []shellWord
+	// postFlags keeps flags that followed the explicit print value in place;
+	// hoisting them would reverse shell expansion order (see
+	// partitionAntigravityCallerArgs).
+	var postFlags []shellWord
+	addFlag := func(tokens ...shellWord) {
+		if gotPrint {
+			postFlags = append(postFlags, tokens...)
+			return
+		}
+		flags = append(flags, tokens...)
+	}
 	for i < len(words) {
 		a := words[i].Value
 		// Exact lowercase CLI spellings only (same case-sensitive rule as
@@ -2325,7 +2337,7 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 				continue
 			}
 			if antigravityValuedFlags[name] || antigravityBoolFlags[name] {
-				flags = append(flags, words[i])
+				addFlag(words[i])
 				i++
 				continue
 			}
@@ -2350,7 +2362,7 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 				i++
 				continue
 			}
-			flags = append(flags, words[i])
+			addFlag(words[i])
 			i++
 			continue
 		}
@@ -2363,7 +2375,7 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 				i++
 				continue
 			}
-			flags = append(flags, words[i], words[i+1])
+			addFlag(words[i], words[i+1])
 			i += 2
 			continue
 		}
@@ -2373,7 +2385,9 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 	if gotPrint {
 		// Anything not recognized after an explicit print value must remain on
 		// the reshaped command (unknown options, positionals).
-		return flags, printFrags, append(append([]shellWord{}, words[i:]...), dangling...), true
+		trailing := append([]shellWord{}, postFlags...)
+		trailing = append(trailing, words[i:]...)
+		return flags, printFrags, append(trailing, dangling...), true
 	}
 	if i < len(words) {
 		return flags, words[i:], dangling, true
@@ -3188,6 +3202,26 @@ func shellForcesPosixMode(command string, args []string) bool {
 	return false
 }
 
+// shellArgsDisableBraceExpand reports whether the wrapper's own argv turns
+// brace expansion off (`bash +B -c …`, `bash +o braceexpand -c …`). Verified on
+// bash 5.2.21: both pass a literal `{a,b}`, while `-B` / the default expands.
+// Only flags before the `-c` payload count. The `+` forms are bash/zsh/ksh
+// spellings; shells that never brace-expand are already handled by dialect.
+func shellArgsDisableBraceExpand(args []string) bool {
+	for i, a := range args {
+		if a == "-c" {
+			return false
+		}
+		if a == "+B" {
+			return true
+		}
+		if a == "+o" && i+1 < len(args) && args[i+1] == "braceexpand" {
+			return true
+		}
+	}
+	return false
+}
+
 // shellRunsStartupFiles reports whether the wrapper may source a startup file
 // before running its `-c` payload, which can define variables (notably
 // OLDPWD) that this process cannot observe.
@@ -3905,7 +3939,14 @@ func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, opts shellWordOp
 // stay literal on bash/dash (reshape) but fail on zsh (opts.failUnknownTilde).
 func shellTildePrefixExpands(login string, opts shellWordOptions) bool {
 	if login == "" {
-		return !opts.homeTildeNeedsEnv || os.Getenv("HOME") != ""
+		if !opts.homeTildeNeedsEnv {
+			return true
+		}
+		// Presence, not value: dash 0.5.12 with an exported-but-empty HOME still
+		// expands (`HOME= dash -c 'printf "[%s]" ~ ~/x'` gives `[]` and `[/x]`),
+		// while an unset HOME leaves both literal.
+		_, ok := os.LookupEnv("HOME")
+		return ok
 	}
 	// Bash/zsh PWD form. Dash: literal (pwdTilde false).
 	if login == "+" {

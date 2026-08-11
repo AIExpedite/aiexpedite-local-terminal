@@ -700,7 +700,7 @@ func TestBuildAntigravityInteractiveArgs_MatchesNativePrintContract(t *testing.T
 // conversation flag as an option, not fold it into the print value.
 func TestBuildAntigravityInteractiveArgs_PreservesTrailingConversation(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{"--print", "fix bug", "--conversation", "abc-123"})
-	want := []string{"--dangerously-skip-permissions", "--conversation", "abc-123", "--print", "fix bug"}
+	want := []string{"--dangerously-skip-permissions", "--print", "fix bug", "--conversation", "abc-123"}
 	if len(args) != len(want) {
 		t.Fatalf("got %#v, want %#v", args, want)
 	}

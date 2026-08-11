@@ -939,6 +939,31 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 			t.Errorf("bash colon-terminated tilde was reshaped: got %q, want original %q", args[1], orig)
 		}
 	}
+	// `bash +B` / `bash +o braceexpand` turn brace expansion off, so `{a,b}` is
+	// literal (verified on 5.2.21) — reshape instead of declining.
+	for _, pre := range [][]string{{"+B"}, {"+o", "braceexpand"}} {
+		args := append(append([]string{}, pre...), "-c", `agy {a,b}`)
+		got := shapeShellWrappedPTYArgs("bash", args)
+		want := `agy --dangerously-skip-permissions --print '{a,b}'`
+		if got[len(got)-1] != want {
+			t.Errorf("bash %v brace = %q, want %q", pre, got[len(got)-1], want)
+		}
+	}
+	// Default bash still brace-expands — decline.
+	origBrace := `agy {a,b}`
+	_, braceOn := shapePTYExecArgs("bash", []string{"-c", origBrace})
+	if braceOn[1] != origBrace {
+		t.Errorf("bash brace expansion was reshaped: got %q", braceOn[1])
+	}
+	// An exported-but-empty HOME still expands on dash (`HOME= dash -c 'printf
+	// "[%s]" ~ ~/x'` gives `[]` and `[/x]`), so presence decides, not value.
+	t.Setenv("HOME", "")
+	for _, orig := range []string{`agy ~`, `agy ~/x`} {
+		_, emptyHome := shapePTYExecArgs("dash", []string{"-c", orig})
+		if emptyHome[1] != orig {
+			t.Errorf("dash tilde with empty HOME was reshaped: got %q, want original %q", emptyHome[1], orig)
+		}
+	}
 	// Assignment-word tilde expansion is a bash extension that POSIX mode turns
 	// off, so a `sh` wrapper passes `HOME=~` literally even when /bin/sh is
 	// bash (verified with a sh symlink and `bash --posix` on 5.2.21) — reshape
@@ -1268,7 +1293,10 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	}
 	// Dash leaves bare ~ / ~/x literal when HOME is unavailable; preserve the
 	// one-shot reshape in that environment. Bash falls back to passwd data.
-	t.Setenv("HOME", "")
+	// Unset, not blank: dash expands an exported-but-empty HOME (`HOME= dash -c
+	// 'printf "[%s]" ~ ~/x'` gives `[]` and `[/x]`), so blanking would exercise
+	// the opposite path.
+	os.Unsetenv("HOME")
 	for _, tc := range []struct{ in, want string }{
 		{`agy ~`, `agy --dangerously-skip-permissions --print '~'`},
 		{`agy ~/x`, `agy --dangerously-skip-permissions --print '~/x'`},
@@ -1778,10 +1806,23 @@ func TestShapePTYExecArgs_PreservesExpandSegmentBoundaries(t *testing.T) {
 // Explicit --print takes one value; trailing recognized options (native
 // --conversation id) stay flags, not prompt text.
 func TestShapePTYExecArgs_PreservesTrailingOptionsAfterPrint(t *testing.T) {
+	// Order is preserved: a flag that followed the print value stays after it,
+	// so shell expansions keep their original left-to-right order. agy accepts
+	// options after the print value (that is the native resume shape).
 	_, args := shapePTYExecArgs("bash", []string{"-c", `agy --print "fix bug" --conversation abc-123`})
-	want := `agy --dangerously-skip-permissions --conversation abc-123 --print 'fix bug'`
+	want := `agy --dangerously-skip-permissions --print 'fix bug' --conversation abc-123`
 	if args[1] != want {
 		t.Errorf("print+conversation = %q, want %q", args[1], want)
+	}
+
+	// Reordering would change what the shell computes: with the original order
+	// `${x:=review}` assigns before `"$x"` is read, so both are `review`;
+	// hoisting the flag makes --add-dir empty (verified against bash 5.2.21
+	// with a stub agy).
+	_, ordered := shapePTYExecArgs("bash", []string{"-c", `agy --print "${x:=review}" --add-dir "$x"`})
+	wantOrdered := `agy --dangerously-skip-permissions --print "${x:=review}" --add-dir "$x"`
+	if ordered[1] != wantOrdered {
+		t.Errorf("expansion order = %q, want %q", ordered[1], wantOrdered)
 	}
 
 	// Direct (non-shell) argv path — same partitioner.
@@ -1789,7 +1830,7 @@ func TestShapePTYExecArgs_PreservesTrailingOptionsAfterPrint(t *testing.T) {
 	if cmd != "agy" {
 		t.Fatalf("cmd=%q", cmd)
 	}
-	wantDirect := []string{"--dangerously-skip-permissions", "--conversation", "abc-123", "--print", "fix bug"}
+	wantDirect := []string{"--dangerously-skip-permissions", "--print", "fix bug", "--conversation", "abc-123"}
 	if len(dArgs) != len(wantDirect) {
 		t.Fatalf("direct args=%#v, want %#v", dArgs, wantDirect)
 	}
