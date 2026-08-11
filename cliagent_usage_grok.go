@@ -296,6 +296,13 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		}
 		for _, k := range grokScopeKeysByPrecedence(keys) {
 			v := scoped[k]
+			// A refresh token is renewal metadata, not the credential Grok
+			// presents. Skip refresh-only preferred scopes just as Grok's
+			// resolver does, allowing it to fall back to a token-bearing scope.
+			token := firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken)
+			if token == "" {
+				continue
+			}
 			// Grok v1.0 stores a short-lived access JWT plus an opaque refresh
 			// token. The access expiry is not the login expiry: Grok can refresh it
 			// without another interactive sign-in. Treat the deadline as unknown
@@ -312,10 +319,6 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 			// `access_token` paired with a later-expiring `id_token` can't read as
 			// healthy (this also covers a nested `cached_token` object, which
 			// unmarshals into this scoped map as a single entry).
-			token := firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken)
-			if token == "" {
-				continue
-			}
 			// This is the scope Grok's resolver stops at — the token it will
 			// present. Its expiry is the only one that matters, so read it and
 			// STOP: don't fall through to lower-precedence siblings whose token
@@ -406,7 +409,7 @@ func grokHasUsableToken(base string) bool {
 		}
 		for _, key := range grokScopeKeysByPrecedence(keys) {
 			v := scoped[key]
-			if firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken, v.RefreshToken) != "" {
+			if firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken) != "" {
 				return true
 			}
 		}
@@ -462,7 +465,7 @@ func grokHasRefreshToken(base string) bool {
 		}
 		for _, key := range grokScopeKeysByPrecedence(keys) {
 			entry := scoped[key]
-			if firstNonEmpty(entry.Key, entry.Token, entry.AccessToken, entry.IDToken, entry.RefreshToken) != "" {
+			if firstNonEmpty(entry.Key, entry.Token, entry.AccessToken, entry.IDToken) != "" {
 				return entry.RefreshToken != ""
 			}
 		}

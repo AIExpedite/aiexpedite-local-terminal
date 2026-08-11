@@ -2056,6 +2056,37 @@ func TestGrokUsageParser_ScopedExpirySkipsTokenlessEntry(t *testing.T) {
 	}
 }
 
+func TestGrokUsageParser_ScopedExpirySkipsRefreshOnlyPreferredEntry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		grokExactOIDCScope: map[string]any{
+			"email":         "metadata-only@example.com",
+			"refresh_token": "renewal-metadata-without-presented-token",
+		},
+		grokExactLegacyScope: map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
+		t.Errorf("auth state=(%v, %q), want false/expired from token-bearing legacy scope", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationKnown {
+		t.Errorf("LoginExpirationState=%q, want known legacy expiry rather than refreshable", usage.LoginExpirationState)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want expired legacy prompt", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
 // TestGrokUsageParser_ScopedExpiryStopsAtSelectedScopeWithUnknownExpiry pins that
 // once the preferred token-bearing scope is selected, an UNREADABLE expiry there
 // (opaque key: no `expires_at`, no JWT `exp`) reports unknown instead of falling
