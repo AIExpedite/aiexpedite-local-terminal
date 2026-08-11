@@ -1772,28 +1772,18 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		t.Errorf("bash mid-word # = %q, want %q", bashHash[1], wantBashHash)
 	}
 
-	// `zsh -f` skips .zshenv, which is the only place a name can be declared an
-	// array or EXTENDED_GLOB / MAGIC_EQUAL_SUBST enabled — an inherited env var
-	// is always a scalar. Those payloads become knowable and reshape again
-	// (verified on zsh 5.9: `zsh -f -c 'printf "[%s]" foo#'` is literal, and
-	// TASK from the environment stays one field).
-	for _, tc := range []struct{ orig, want string }{
-		{`agy "$TASK"`, `agy --dangerously-skip-permissions --print "$TASK"`},
-		{`agy foo#`, `agy --dangerously-skip-permissions --print 'foo#'`},
-		{`agy review foo==ls`, `agy --dangerously-skip-permissions --print 'review foo==ls'`},
-	} {
-		got := shapeShellWrappedPTYArgs("zsh", []string{"-f", "-c", tc.orig})
-		if got[len(got)-1] != tc.want {
-			t.Errorf("zsh -f %q = %q, want %q", tc.orig, got[len(got)-1], tc.want)
-		}
-	}
-	// Last-wins here too: `-f +f` puts RCS back, so .zshenv can enable
-	// EXTENDED_GLOB again and `foo#` must keep declining (zsh 5.9 expands it).
-	for _, pre := range [][]string{{"-f", "+f"}, {"+f"}} {
-		args := append(append([]string{}, pre...), "-c", `agy foo#`)
-		got := shapeShellWrappedPTYArgs("zsh", args)
-		if got[len(got)-1] != `agy foo#` {
-			t.Errorf("zsh %v extended-glob was reshaped: got %q", pre, got[len(got)-1])
+	// `zsh -f` narrows the startup hazard but does not remove it: /etc/zshenv
+	// (Debian/Ubuntu /etc/zsh/zshenv) is read unconditionally, so EXTENDED_GLOB
+	// / MAGIC_EQUAL_SUBST and array declarations remain possible. Verified on
+	// zsh 5.9 with `setopt EXTENDED_GLOB` in /etc/zsh/zshenv: `zsh -f -c
+	// 'printf "[%s]" foo#'` still glob-expands. These must keep declining.
+	for _, pre := range [][]string{{"-f"}, {"-f", "+f"}, {"+f"}, {"--no-rcs"}} {
+		for _, orig := range []string{`agy "$TASK"`, `agy foo#`, `agy review foo==ls`} {
+			args := append(append([]string{}, pre...), "-c", orig)
+			got := shapeShellWrappedPTYArgs("zsh", args)
+			if got[len(got)-1] != orig {
+				t.Errorf("zsh %v %q was reshaped: got %q", pre, orig, got[len(got)-1])
+			}
 		}
 	}
 	// Default zsh behaviour does not depend on startup files, so an unmatched
