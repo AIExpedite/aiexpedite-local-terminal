@@ -828,6 +828,27 @@ func TestBuildAntigravityInteractiveArgs_SingleDashAndTerminator(t *testing.T) {
 	if shapedProbe[1] != origProbe {
 		t.Errorf("shell-wrapped equals probe = %q, want it unchanged", shapedProbe[1])
 	}
+	// A bare flag-shaped diagnostic in the leading flag region is agy's to
+	// answer: `agy --model gemini -v` reports `flag needs an argument: -v`, so
+	// it must not become a prompt. Bare words like `models` past the first flag
+	// stay prompt text.
+	if got := buildAntigravityInteractiveArgs([]string{"--model", "gemini", "-v"}); !reflect.DeepEqual(
+		got, []string{"--model", "gemini", "-v"}) {
+		t.Errorf("bare -v after flags = %#v, want it unchanged", got)
+	}
+	if got := buildAntigravityInteractiveArgs([]string{"--model", "gemini", "models"}); !reflect.DeepEqual(
+		got, []string{"--dangerously-skip-permissions", "--model", "gemini", "--print", "models"}) {
+		t.Errorf("bare word after flags = %#v", got)
+	}
+	// A payload ending in backslash-newline is a line continuation the shell
+	// deletes, so the prompt is `review`. Trimming the payload before rewriting
+	// used to leave a dangling backslash, which bash passes as an extra
+	// argument (verified on 5.2.21).
+	_, contShaped := shapePTYExecArgs("bash", []string{"-c", "agy review " + `\` + "\n"})
+	wantCont := `agy --dangerously-skip-permissions --print review`
+	if contShaped[1] != wantCont {
+		t.Errorf("trailing continuation = %q, want %q", contShaped[1], wantCont)
+	}
 	// Short flags keep their meaning: -p is print, -c is the stripped continue.
 	if got := buildAntigravityInteractiveArgs([]string{"-p", "review"}); !reflect.DeepEqual(
 		got, []string{"--dangerously-skip-permissions", "--print", "review"}) {

@@ -2180,7 +2180,10 @@ func shapePTYExecArgs(command string, args []string) (string, []string) {
 // cleared the payload of shell chaining, so its first token is the whole
 // program and the remainder is preserved verbatim as the literal prompt.
 func shapeShellWrappedPTYArgs(command string, args []string) []string {
-	if payload, ok := shellDashCPayload(command, args); ok {
+	// Use the raw payload: the trimmed form drops the newline of a trailing
+	// backslash-newline and leaves a dangling `\` that bash would pass as an
+	// extra argument.
+	if payload, ok := shellDashCPayloadRaw(command, args); ok {
 		if shaped, ok := shapeAntigravityShellPayload(command, shellWrapperFlagsFor(command, args), payload); ok {
 			return replaceDashCPayload(args, shaped)
 		}

@@ -2259,6 +2259,16 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 			i++
 			continue
 		}
+		// A flag-shaped diagnostic token in the leading flag region is answered
+		// or rejected by agy rather than run: `agy --model gemini -v` reports
+		// `flag needs an argument: -v` on 1.1.12, so folding it into a --print
+		// value would start a model run the caller never got. (Bare words such
+		// as `models` are not included here — past the first flag they are
+		// ordinary prompt text.)
+		if strings.HasPrefix(a, "-") && antigravityDiagnosticTokens[a] {
+			diagnostic = true
+			return barePrint, invalidBool, diagnostic
+		}
 		return barePrint, invalidBool, diagnostic // first non-flag token: the prompt starts here
 	}
 	return barePrint, invalidBool, diagnostic
