@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -261,7 +262,7 @@ func TestClaudeCodeUsageParser_FingerprintAndCacheScopeAreCredentialOnly(t *test
 
 func helperWriteClaudeOAuth(t *testing.T, home string, extra map[string]any) {
 	t.Helper()
-	oauth := map[string]any{}
+	oauth := map[string]any{"refreshToken": "test-refresh-token"}
 	for k, v := range extra {
 		oauth[k] = v
 	}
@@ -292,6 +293,55 @@ func TestClaudeCodeUsageParser_AuthExpiredNotice(t *testing.T) {
 	if !strings.Contains(usage.Notice, "expired") {
 		t.Errorf("Notice=%q, want an expired re-login prompt", usage.Notice)
 	}
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
+		t.Errorf("auth state = (%v, %q), want false/expired", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationKnown || usage.LoginExpiresAt == "" {
+		t.Errorf("login expiration = (%q, %q), want known deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("expired login must make utilization unobservable, got %+v", metric)
+		}
+	}
+}
+
+func TestClaudeCodeUsageParser_ExpiredAccessTokenWithoutRefreshIsUnobservable(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
+		"claudeAiOauth": map[string]any{
+			"accessToken": "expired-access-token",
+			"expiresAt":   now.Add(-time.Hour).UnixMilli(),
+		},
+	})
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 55,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs:   now.UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now, "")
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
+		t.Errorf("auth state=(%v, %q), want false/expired", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationKnown || usage.LoginExpiresAt == "" {
+		t.Errorf("login expiration=(%q, %q), want known access-token deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("notice=(%q, %q), want expired-login error", usage.Notice, usage.NoticeSeverity)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("expired access-only login must make cached usage unobservable: %+v", metric)
+		}
+	}
 }
 
 func TestClaudeCodeUsageParser_AuthExpiringSoonNotice(t *testing.T) {
@@ -309,6 +359,9 @@ func TestClaudeCodeUsageParser_AuthExpiringSoonNotice(t *testing.T) {
 	}
 	if !strings.Contains(usage.Notice, "expires soon") {
 		t.Errorf("Notice=%q, want an expiring-soon prompt", usage.Notice)
+	}
+	if usage.Authenticated == nil || !*usage.Authenticated || usage.LoginExpiresAt == "" {
+		t.Errorf("healthy expiring login should publish authenticated exact deadline: %+v", usage)
 	}
 }
 
@@ -335,6 +388,9 @@ func TestClaudeCodeUsageParser_ApiKeyNoOAuthNoNotice(t *testing.T) {
 	// absence of an OAuth deadline is not a "signed out" signal.
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	originalProbe := claudeAuthStatusProbe
+	claudeAuthStatusProbe = func(string) (bool, bool) { return true, true }
+	t.Cleanup(func() { claudeAuthStatusProbe = originalProbe })
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
 		"email": "ada@example.com",
@@ -362,6 +418,7 @@ func TestClaudeCodeUsageParser_AuthFromKeychainWhenNoFile(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{
 		"email": "kc@example.com",
 		"claudeAiOauth": map[string]any{
+			"refreshToken":          "test-refresh-token",
 			"refreshTokenExpiresAt": now.Add(-time.Hour).UnixMilli(), // expired
 		},
 	})
@@ -380,19 +437,40 @@ func TestClaudeCodeUsageParser_AuthFromKeychainWhenNoFile(t *testing.T) {
 	}
 }
 
-func TestClaudeCodeUsageParser_NoFileNoKeychainNoNotice(t *testing.T) {
-	// Fresh box / API-key install with neither a file nor a keychain credential
-	// must not raise a false auth notice.
+func TestClaudeCodeUsageParser_NoFileNoKeychainIsMissing(t *testing.T) {
+	// The driven Claude child strips environment credentials, so a fresh box
+	// with neither a file nor a keychain credential cannot use cached telemetry.
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
 	home := t.TempDir()
+	now := time.Now()
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs:   now.UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now, "")
 	orig := claudeKeychainReader
 	t.Cleanup(func() { claudeKeychainReader = orig })
 	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+	originalProbe := claudeAuthStatusProbe
+	t.Cleanup(func() { claudeAuthStatusProbe = originalProbe })
+	claudeAuthStatusProbe = func(string) (bool, bool) { return false, false }
 
-	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
-	if usage.Notice != "" {
-		t.Errorf("unexpected notice with no credential source: %q", usage.Notice)
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true, Path: "claude-test"}, now)
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("auth state=(%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "credentials are unavailable") {
+		t.Errorf("Notice=%q sev=%q, want unavailable-credentials error", usage.Notice, usage.NoticeSeverity)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("credential-less Claude usage must be unobservable: %+v", metric)
+		}
 	}
 }
 
@@ -413,6 +491,7 @@ func TestClaudeCodeUsageParser_KeychainSkippedForCustomConfigDir(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{
 		"email": "default-account@example.com",
 		"claudeAiOauth": map[string]any{
+			"refreshToken":          "test-refresh-token",
 			"refreshTokenExpiresAt": now.Add(-time.Hour).UnixMilli(), // expired
 		},
 	})
@@ -457,6 +536,7 @@ func TestClaudeCodeUsageParser_KeychainPreferredOverStaleFile(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{
 		"email": "active@example.com",
 		"claudeAiOauth": map[string]any{
+			"refreshToken":          "test-refresh-token",
 			"refreshTokenExpiresAt": now.Add(30 * 24 * time.Hour).UnixMilli(), // healthy
 		},
 	})
@@ -507,6 +587,103 @@ func TestClaudeCodeUsageParser_MissingCredentials(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeUsageParser_InvalidCredentialsDoNotAuthenticate(t *testing.T) {
+	originalProbe := claudeAuthStatusProbe
+	claudeAuthStatusProbe = func(string) (bool, bool) { return false, false }
+	t.Cleanup(func() { claudeAuthStatusProbe = originalProbe })
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "empty file", raw: ""},
+		{name: "malformed json", raw: "{"},
+		{name: "missing credential", raw: `{"claudeAiOauth":{}}`},
+		{name: "expiry metadata only", raw: `{"claudeAiOauth":{"refreshTokenExpiresAt":4102444800000}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			cache := filepath.Join(t.TempDir(), "rl.json")
+			t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+			now := time.Now()
+			mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+				claudeWindowFiveHour: {
+					UsedPercentage: 40,
+					ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+					ObservedAtMs:   now.UnixMilli(),
+					usageKnown:     true,
+				},
+			}, now, "")
+
+			credentialPath := filepath.Join(home, ".claude", ".credentials.json")
+			if err := os.MkdirAll(filepath.Dir(credentialPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(credentialPath, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+			if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+				t.Errorf("auth state=(%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+			}
+			for _, metric := range usage.Metrics {
+				if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+					t.Errorf("invalid credentials must make cached usage unobservable: %+v", metric)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeCodeUsageParser_DefiniteLoggedOutProbeMakesUsageUnobservable(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	original := claudeAuthStatusProbe
+	claudeAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	t.Cleanup(func() { claudeAuthStatusProbe = original })
+
+	usage, _ := claudeCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
+		Detected: true, Path: "claude-test",
+	}, time.Now())
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("logged-out Claude usage must be unobservable: %+v", metric)
+		}
+	}
+}
+
+func TestClaudeAuthStatusProbe_ParsesLoggedOutJSONAndSanitizesEnvironment(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "must-not-reach-probe")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "must-not-reach-probe")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-reach-probe")
+
+	originalRunner := runClaudeAuthStatusCommand
+	t.Cleanup(func() { runClaudeAuthStatusCommand = originalRunner })
+	var capturedEnv []string
+	runClaudeAuthStatusCommand = func(_ context.Context, _ string, env []string) ([]byte, error) {
+		capturedEnv = append([]string(nil), env...)
+		return []byte(`{"loggedIn":false}`), errors.New("exit status 1")
+	}
+
+	loggedIn, known := claudeAuthStatusProbe("claude")
+	if !known || loggedIn {
+		t.Fatalf("probe=(%v, %v), want false/known from logged-out JSON despite exit status 1", loggedIn, known)
+	}
+	for _, entry := range capturedEnv {
+		upper := strings.ToUpper(entry)
+		if strings.HasPrefix(upper, "ANTHROPIC_API_KEY=") ||
+			strings.HasPrefix(upper, "ANTHROPIC_AUTH_TOKEN=") ||
+			strings.HasPrefix(upper, "CLAUDE_CODE_OAUTH_TOKEN=") {
+			t.Errorf("sanitized auth probe leaked ambient credential %q", entry)
+		}
+	}
+}
+
 func TestCodexUsageParser_IdentityFromAuth(t *testing.T) {
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
@@ -531,6 +708,126 @@ func TestCodexUsageParser_IdentityFromAuth(t *testing.T) {
 	for _, m := range usage.Metrics {
 		if !m.Unknown {
 			t.Errorf("metric %q should be Unknown without an observed app-server frame", m.Kind)
+		}
+	}
+}
+
+func TestCodexUsageParser_RefreshTokenHasNoMisleadingLoginDeadline(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":      "opaque-id-token",
+			"refresh_token": "opaque-refresh-token",
+		},
+	})
+	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
+		t.Errorf("auth state = (%v, %q), want true/authenticated", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationRefreshable || usage.LoginExpiresAt != "" {
+		t.Errorf("login expiration = (%q, %q), want refreshable without a deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+	}
+}
+
+func TestCodexUsageParser_DefiniteLoggedOutProbeMakesUsageUnobservable(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	original := codexAuthStatusProbe
+	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	t.Cleanup(func() { codexAuthStatusProbe = original })
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
+		Detected: true, Path: "codex-test",
+	}, time.Now())
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+		t.Errorf("notice = (%q, %q), want login error", usage.Notice, usage.NoticeSeverity)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("logged-out Codex usage must be unobservable: %+v", metric)
+		}
+	}
+}
+
+func TestCodexUsageParser_NoCredentialAndInconclusiveProbeMakesUsageUnobservable(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Now()
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 21,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs:   now.UnixMilli(),
+			usageKnown:     true,
+			resetKnown:     true,
+		},
+	}, nil, now, "")
+
+	original := codexAuthStatusProbe
+	codexAuthStatusProbe = func(string) (bool, bool) { return false, false }
+	t.Cleanup(func() { codexAuthStatusProbe = original })
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
+		Detected: true, Path: "codex-test",
+	}, now)
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+		t.Errorf("notice = (%q, %q), want login error", usage.Notice, usage.NoticeSeverity)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("credential-less Codex usage must be unobservable: %+v", metric)
+		}
+	}
+}
+
+func TestCodexUsageParser_EnvironmentAPIKeySurvivesPersistedLogoutProbe(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("OPENAI_API_KEY", "sk-environment-test")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Now()
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 21,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			usageKnown:     true,
+			resetKnown:     true,
+		},
+		codexWindowSecondary: {
+			UsedPercentage: 34,
+			ResetsAtMs:     now.Add(24 * time.Hour).UnixMilli(),
+			usageKnown:     true,
+			resetKnown:     true,
+		},
+	}, nil, now, "")
+
+	original := codexAuthStatusProbe
+	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	t.Cleanup(func() { codexAuthStatusProbe = original })
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
+		Detected: true, Path: "codex-test",
+	}, now)
+	if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
+		t.Errorf("environment API-key auth state = (%v, %q), want true/authenticated", usage.Authenticated, usage.AuthState)
+	}
+	if usage.Notice != "" {
+		t.Errorf("Notice=%q, want no persisted-login warning for environment API-key auth", usage.Notice)
+	}
+	for _, metric := range usage.Metrics {
+		if metric.Unknown {
+			t.Errorf("environment API-key auth must preserve observed usage: %+v", metric)
 		}
 	}
 }
@@ -1102,8 +1399,8 @@ func TestCodexUsageParser_RolloutScopesBySessionStartNotMtime(t *testing.T) {
 
 // A relative reset (`resets_in_seconds`) in a historical rollout line must be
 // anchored to the line's own emit time, so a window whose reset has already
-// passed rolls over to 0% instead of showing stale usage with a bogus future
-// reset.
+// passed becomes unobservable instead of showing stale usage with a bogus
+// future reset or a misleading 0%.
 func TestCodexUsageParser_RolloutAnchorsRelativeResetToEventTime(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
@@ -1125,11 +1422,8 @@ func TestCodexUsageParser_RolloutAnchorsRelativeResetToEventTime(t *testing.T) {
 		t.Fatalf("expected usage")
 	}
 	session := usage.Metrics[0]
-	if session.Unknown {
-		t.Fatalf("session should be observed (rolled over), got Unknown")
-	}
-	if session.Consumed == nil || *session.Consumed != 0 {
-		t.Errorf("session Consumed=%v, want 0 (window rolled over via event-time anchor)", session.Consumed)
+	if !session.Unknown || session.Consumed != nil {
+		t.Fatalf("rolled-over session should be unobservable, got %+v", session)
 	}
 	if session.ResetAt != "" {
 		t.Errorf("session ResetAt=%q, want empty for a rolled-over window", session.ResetAt)
@@ -1497,10 +1791,14 @@ func TestGrokUsageParser_CachedTokenAuthFile(t *testing.T) {
 			t.Errorf("metric %q should be Unknown (no observable counter)", m.Kind)
 		}
 	}
-	// A bare identity-only fixture (no expires_at / token) must not raise a
-	// false auth notice — we only warn on a DEFINITE expiry.
-	if usage.Notice != "" {
-		t.Errorf("unexpected notice for identity-only auth: %q", usage.Notice)
+	// Identity metadata can outlive the credential that authenticated it. A
+	// bare identity-only record must report missing rather than implying that
+	// the stale account fields are sufficient to sign requests.
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("auth state=(%v, %q), want false/missing for identity-only auth", usage.Authenticated, usage.AuthState)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+		t.Errorf("Notice=%q sev=%q, want not-signed-in prompt for identity-only auth", usage.Notice, usage.NoticeSeverity)
 	}
 }
 
@@ -1523,7 +1821,7 @@ func helperWriteGrokScopedAuth(t *testing.T, home string, expiresAt time.Time, e
 		entry[k] = v
 	}
 	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
-		"https://auth.x.ai::client-1": entry,
+		grokExactOIDCScope: entry,
 	})
 }
 
@@ -1641,6 +1939,31 @@ func TestGrokUsageParser_AuthValidNoNotice(t *testing.T) {
 	}
 }
 
+func TestGrokUsageParser_RefreshTokenMakesAccessExpiryNonAuthoritative(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	// Grok v1.0: the access JWT is short-lived/expired, but the opaque refresh
+	// token keeps the login renewable without another browser sign-in.
+	helperWriteGrokScopedAuth(t, home, now.Add(-time.Hour), map[string]any{
+		"refresh_token": "opaque-refresh-token",
+	})
+
+	usage, _ := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Notice != "" || usage.NoticeSeverity != "" {
+		t.Errorf("refreshable login must not be called expired: notice=%q severity=%q", usage.Notice, usage.NoticeSeverity)
+	}
+	if !grokHasUsableToken(filepath.Join(home, ".grok")) {
+		t.Errorf("refresh token should count as usable auth")
+	}
+	if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
+		t.Errorf("refreshable Grok login should be authenticated: %+v", usage)
+	}
+	if usage.LoginExpirationState != loginExpirationRefreshable || usage.LoginExpiresAt != "" {
+		t.Errorf("access expiry must not be published as login expiry: %+v", usage)
+	}
+}
+
 func TestGrokUsageParser_AuthMissingNotice(t *testing.T) {
 	t.Setenv("GROK_HOME", "")
 	home := t.TempDir() // no ~/.grok/auth.json at all
@@ -1652,6 +1975,9 @@ func TestGrokUsageParser_AuthMissingNotice(t *testing.T) {
 	}
 	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
 		t.Errorf("Notice=%q sev=%q, want a 'not signed in' error", usage.Notice, usage.NoticeSeverity)
+	}
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("missing Grok auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
 	}
 }
 
@@ -1690,7 +2016,7 @@ func TestGrokUsageParser_ScopedInstallerAuthFile(t *testing.T) {
 	// scopes, values wrap the JWT under `key`. Without scoped-format support
 	// the parser would silently report a logged-in user as no-account.
 	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
-		"grok-cli": map[string]any{
+		grokExactOIDCScope: map[string]any{
 			"key": helperJWT(t, map[string]any{
 				"email":     "scoped-grok@example.com",
 				"sub":       "scoped-sub",
@@ -1714,37 +2040,37 @@ func TestGrokUsageParser_ScopedInstallerAuthFile(t *testing.T) {
 	}
 }
 
-// TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry pins that when auth.json
-// holds multiple scoped entries, the expiry check follows the SAME entry Grok's
-// resolver selects rather than borrowing the latest expiry from a sibling. Grok
-// presents the selected scoped token, so an expired selected entry must surface
-// even if a fresher sibling exists — otherwise the re-login warning would be
-// wrongly suppressed.
-func TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry(t *testing.T) {
+// TestGrokUsageParser_UnrelatedScopedTokenDoesNotAuthenticate pins that auth
+// entries belonging to another client are not credentials Grok's resolver can
+// present. Their presence must not make this CLI appear signed in.
+func TestGrokUsageParser_UnrelatedScopedTokenDoesNotAuthenticate(t *testing.T) {
 	t.Setenv("GROK_HOME", "")
-	home := t.TempDir()
 	now := time.Now()
-	// "aaa::selected" sorts before "zzz::legacy"; the selected scope is expired
-	// while the fresher sibling is valid for a month.
-	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
-		"aaa::selected": map[string]any{
-			"email":      "scoped-grok@example.com",
-			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
-			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
-		},
-		"zzz::legacy": map[string]any{
-			"email":      "old-grok@example.com",
-			"key":        helperJWT(t, map[string]any{"email": "old-grok@example.com"}),
-			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
-		},
-	})
+	for name, scope := range map[string]string{
+		"other OIDC client":   "https://auth.x.ai::another-client",
+		"other legacy client": "https://accounts.x.ai/another-client",
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+				scope: map[string]any{
+					"email":      "other-client@example.com",
+					"key":        helperJWT(t, map[string]any{"email": "other-client@example.com"}),
+					"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+				},
+			})
 
-	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
-	if !ok || usage == nil {
-		t.Fatalf("expected usage entry")
-	}
-	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
-		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt tied to the selected scope", usage.Notice, usage.NoticeSeverity)
+			usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+			if !ok || usage == nil {
+				t.Fatalf("expected usage entry")
+			}
+			if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+				t.Errorf("unrelated scoped auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+			}
+			if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+				t.Errorf("Notice=%q sev=%q, want a not-signed-in prompt for an unrelated scoped token", usage.Notice, usage.NoticeSeverity)
+			}
+		})
 	}
 }
 
@@ -1819,6 +2145,82 @@ func TestGrokUsageParser_ScopedExpirySkipsTokenlessEntry(t *testing.T) {
 	}
 }
 
+func TestGrokUsageParser_ScopedExpirySkipsRefreshOnlyPreferredEntry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		grokExactOIDCScope: map[string]any{
+			"email":         "metadata-only@example.com",
+			"refresh_token": "renewal-metadata-without-presented-token",
+		},
+		grokExactLegacyScope: map[string]any{
+			"email":      "scoped-grok@example.com",
+			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
+			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
+		t.Errorf("auth state=(%v, %q), want false/expired from token-bearing legacy scope", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationKnown {
+		t.Errorf("LoginExpirationState=%q, want known legacy expiry rather than refreshable", usage.LoginExpirationState)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want expired legacy prompt", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+func TestGrokUsageParser_FlatRefreshOnlyCredentialIsMissing(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+
+	tests := map[string]map[string]any{
+		"top-level": {
+			"refresh_token": "renewal-metadata-without-presented-token",
+		},
+		"top-level with stale identity": {
+			"email":         "stale-identity@example.com",
+			"refresh_token": "renewal-metadata-without-presented-token",
+		},
+		"nested cached_token": {
+			"cached_token": map[string]any{
+				"refresh_token": "renewal-metadata-without-presented-token",
+			},
+		},
+		"nested cached_token with stale identity": {
+			"cached_token": map[string]any{
+				"email":         "stale-identity@example.com",
+				"refresh_token": "renewal-metadata-without-presented-token",
+			},
+		},
+	}
+	for name, auth := range tests {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), auth)
+
+			usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+			if !ok || usage == nil {
+				t.Fatalf("expected usage entry")
+			}
+			if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+				t.Errorf("auth state=(%v, %q), want false/missing for refresh-only flat credential", usage.Authenticated, usage.AuthState)
+			}
+			if usage.LoginExpirationState == loginExpirationRefreshable {
+				t.Error("refresh-only flat metadata must not publish a refreshable login")
+			}
+			if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+				t.Errorf("Notice=%q sev=%q, want not-signed-in prompt", usage.Notice, usage.NoticeSeverity)
+			}
+		})
+	}
+}
+
 // TestGrokUsageParser_ScopedExpiryStopsAtSelectedScopeWithUnknownExpiry pins that
 // once the preferred token-bearing scope is selected, an UNREADABLE expiry there
 // (opaque key: no `expires_at`, no JWT `exp`) reports unknown instead of falling
@@ -1868,7 +2270,7 @@ func TestGrokUsageParser_OpaqueTokenWithoutIdentityStaysSignedIn(t *testing.T) {
 		// Opaque, non-JWT key with no `expires_at` and no identity claims: expiry
 		// is unknown AND the account can't be parsed, yet the token IS present and
 		// is what Grok would present on each request.
-		"https://auth.x.ai::client-1": map[string]any{
+		grokExactOIDCScope: map[string]any{
 			"key": "opaque-non-jwt-access-token",
 		},
 	})
@@ -1913,6 +2315,154 @@ func TestGrokUsageParser_CachedTokenPrefersAccessTokenExpiry(t *testing.T) {
 	}
 	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
 		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt from the presented access token, not a healthy read off the later-expiring id_token", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+func TestGrokUsageParser_TopLevelAccessTokenExpiry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		"email": "oauth-grok@example.com",
+		"access_token": helperJWT(t, map[string]any{
+			"email": "oauth-grok@example.com",
+			"exp":   now.Add(-time.Hour).Unix(),
+		}),
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
+		t.Errorf("auth state=(%v, %q), want false/expired", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationKnown || usage.LoginExpiresAt == "" {
+		t.Errorf("login expiry=(%q, %q), want top-level JWT deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want expired top-level access-token prompt", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+// Flat legacy auth files may call the presented access credential `token` or
+// `key`. Those fields must take precedence over the identity-only id_token,
+// just as access_token does.
+func TestGrokUsageParser_TopLevelGenericTokenPrefersAccessExpiry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	now := time.Now()
+
+	for _, field := range []string{"token", "key"} {
+		t.Run(field, func(t *testing.T) {
+			home := t.TempDir()
+			helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+				"email": "oauth-grok@example.com",
+				field: helperJWT(t, map[string]any{
+					"email": "oauth-grok@example.com",
+					"exp":   now.Add(-time.Hour).Unix(),
+				}),
+				"id_token": helperJWT(t, map[string]any{
+					"email": "oauth-grok@example.com",
+					"exp":   now.Add(30 * 24 * time.Hour).Unix(),
+				}),
+			})
+
+			usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+			if !ok || usage == nil {
+				t.Fatalf("expected usage entry")
+			}
+			if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
+				t.Errorf("auth state=(%v, %q), want false/expired from %s", usage.Authenticated, usage.AuthState, field)
+			}
+			if usage.LoginExpirationState != loginExpirationKnown || usage.LoginExpiresAt == "" {
+				t.Errorf("login expiry=(%q, %q), want %s JWT deadline", usage.LoginExpirationState, usage.LoginExpiresAt, field)
+			}
+			if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+				t.Errorf("Notice=%q sev=%q, want expired %s prompt", usage.Notice, usage.NoticeSeverity, field)
+			}
+		})
+	}
+}
+
+func TestGrokUsageParser_NestedAccessTokenPrecedesTopLevelIDToken(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		"email": "oauth-grok@example.com",
+		"id_token": helperJWT(t, map[string]any{
+			"email": "oauth-grok@example.com",
+			"exp":   now.Add(30 * 24 * time.Hour).Unix(),
+		}),
+		"cached_token": map[string]any{
+			"access_token": helperJWT(t, map[string]any{
+				"email": "oauth-grok@example.com",
+				"exp":   now.Add(-time.Hour).Unix(),
+			}),
+		},
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
+		t.Errorf("auth state=(%v, %q), want false/expired from nested access token", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationKnown || usage.LoginExpiresAt == "" {
+		t.Errorf("login expiry=(%q, %q), want nested access-token JWT deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want expired nested access-token prompt", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+// TestGrokUsageParser_FlatRefreshTokenSuppressesAccessExpiry pins both legacy
+// auth layouts. A renewable access-token deadline is not a login expiry and
+// must never tell the user to sign in again.
+func TestGrokUsageParser_FlatRefreshTokenSuppressesAccessExpiry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	now := time.Now()
+	expiredAccessToken := helperJWT(t, map[string]any{
+		"email": "oauth-grok@example.com",
+		"exp":   now.Add(-time.Hour).Unix(),
+	})
+
+	tests := map[string]map[string]any{
+		"top-level": {
+			"email":         "oauth-grok@example.com",
+			"access_token":  expiredAccessToken,
+			"refresh_token": "renewable-top-level",
+			"expires_at":    now.Add(-time.Hour).UTC().Format(time.RFC3339),
+		},
+		"nested cached_token": {
+			"cached_token": map[string]any{
+				"access_token":  expiredAccessToken,
+				"refresh_token": "renewable-nested",
+			},
+			"expires_at": now.Add(-time.Hour).UTC().Format(time.RFC3339),
+		},
+	}
+
+	for name, auth := range tests {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), auth)
+
+			usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+			if !ok || usage == nil {
+				t.Fatalf("expected usage entry")
+			}
+			if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
+				t.Errorf("renewable auth state = (%v, %q), want true/authenticated", usage.Authenticated, usage.AuthState)
+			}
+			if usage.LoginExpirationState != loginExpirationRefreshable || usage.LoginExpiresAt != "" {
+				t.Errorf("login expiry = (%q, %q), want refreshable with no deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+			}
+			if usage.Notice != "" {
+				t.Errorf("Notice=%q, want no re-login notice for renewable credentials", usage.Notice)
+			}
+		})
 	}
 }
 
@@ -2124,7 +2674,7 @@ func TestGatherCLIAgentUsage_RespectsUtilizationDisabledCatalogEntry(t *testing.
 func TestGatherCLIAgentUsage_UnknownAccountGetsDeviceScopedFingerprint(t *testing.T) {
 	SetCLIAgentCatalog(nil)
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateTestUserHome(t, home)
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 
@@ -2168,7 +2718,7 @@ func TestGatherCLIAgentUsage_EmptyDetectedReturnsExplicitEmptySlice(t *testing.T
 func TestGatherCLIAgentUsageOnly_EmptyWhenNoAgentsDetected(t *testing.T) {
 	SetCLIAgentCatalog(nil)
 	// Confine HOME so no real providers are picked up off the host.
-	t.Setenv("HOME", t.TempDir())
+	isolateTestUserHome(t, t.TempDir())
 	t.Setenv("PATH", "/nonexistent")
 	usage, errs := GatherCLIAgentUsageOnly(context.Background())
 	if usage == nil {
@@ -2184,7 +2734,7 @@ func TestGatherCLIAgentUsageOnly_EmptyWhenNoAgentsDetected(t *testing.T) {
 
 func TestGatherCLIAgentUsageOnly_RespectsCanceledContext(t *testing.T) {
 	SetCLIAgentCatalog(nil)
-	t.Setenv("HOME", t.TempDir())
+	isolateTestUserHome(t, t.TempDir())
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	// The function should return promptly without panic.

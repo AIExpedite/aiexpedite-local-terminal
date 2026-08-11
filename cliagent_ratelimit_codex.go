@@ -98,6 +98,7 @@ type codexRateLimitBucket struct {
 	// treated as fully observed.
 	usageKnown bool `json:"-"`
 	resetKnown bool `json:"-"`
+	rolledOver bool `json:"-"`
 }
 
 // codexRateLimitSnapshot is the on-disk cache, keyed by window id (primary /
@@ -490,6 +491,7 @@ func aggregateCodexBuckets(perLimit map[string]map[string]codexRateLimitBucket, 
 		for _, b := range contributors {
 			if b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs {
 				b.UsedPercentage = 0
+				b.rolledOver = true
 			}
 			mergeCodexBucketMostConstrained(out, window, b)
 		}
@@ -529,6 +531,7 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 		merged.UsedPercentage = b.UsedPercentage
 		merged.usageKnown = true
 		merged.ObservedAtMs = b.ObservedAtMs
+		merged.rolledOver = b.rolledOver
 	}
 
 	usageTie := prev.usageKnown && b.UsedPercentage == prev.UsedPercentage
@@ -536,15 +539,51 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 	case b.resetKnown && prev.resetKnown:
 		if b.ResetsAtMs > prev.ResetsAtMs {
 			merged.ResetsAtMs = b.ResetsAtMs
+		} else if prev.ResetsAtMs > b.ResetsAtMs {
+			merged.ResetsAtMs = prev.ResetsAtMs
 		} else {
 			merged.ResetsAtMs = prev.ResetsAtMs
 		}
 		merged.resetKnown = true
+		if usageTie {
+			// The later reset controls when the aggregate clears, but all live
+			// tied contributors are equivalent evidence for the displayed usage.
+			// Keep the freshest live observation; never borrow freshness from a
+			// contributor whose window has already rolled over.
+			switch {
+			case prev.rolledOver && !b.rolledOver:
+				merged.ObservedAtMs = b.ObservedAtMs
+			case !prev.rolledOver && b.rolledOver:
+				merged.ObservedAtMs = prev.ObservedAtMs
+			case b.ObservedAtMs > prev.ObservedAtMs:
+				merged.ObservedAtMs = b.ObservedAtMs
+			default:
+				merged.ObservedAtMs = prev.ObservedAtMs
+			}
+			// Preserve aggregate provenance for later contributors: a tied
+			// aggregate is rolled over only when every contributor is.
+			merged.rolledOver = prev.rolledOver && b.rolledOver
+		}
 	case usageTie:
 		// Same exhaustion, only one side has a reset hint — don't promise a
-		// time the unknown side can't confirm; render "—" instead.
+		// time the unknown side can't confirm; render "—" instead. Keep the
+		// observation paired with the live contributor when the other side has
+		// rolled over. Otherwise both values are current evidence, so use the
+		// freshest tied observation.
 		merged.ResetsAtMs = 0
 		merged.resetKnown = false
+		switch {
+		case prev.rolledOver && !b.rolledOver:
+			merged.ObservedAtMs = b.ObservedAtMs
+		case !prev.rolledOver && b.rolledOver:
+			merged.ObservedAtMs = prev.ObservedAtMs
+		case b.ObservedAtMs > prev.ObservedAtMs:
+			merged.ObservedAtMs = b.ObservedAtMs
+		}
+		// The aggregate remains rolled over only when every equally
+		// constrained contributor is rolled over. This provenance must fold
+		// alongside the timestamp so later contributors see the true state.
+		merged.rolledOver = prev.rolledOver && b.rolledOver
 	case usageDrivenByB && b.resetKnown:
 		merged.ResetsAtMs = b.ResetsAtMs
 		merged.resetKnown = true
@@ -787,6 +826,7 @@ func codexAggregateIdentity(contribs []codexIdentityContribution, now time.Time)
 		b := c.bucket
 		if b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs {
 			b.UsedPercentage = 0
+			b.rolledOver = true
 		}
 		mergeCodexBucketMostConstrained(out, key, b)
 	}
@@ -1070,6 +1110,10 @@ func mergeCodexRateLimitCachePerLimit(
 			sameLiveWindow := priorStillLive && (!bucket.resetKnown || resetsWithinJitter(bucket.ResetsAtMs, prev.ResetsAtMs))
 			if !bucket.usageKnown && sameLiveWindow {
 				bucket.UsedPercentage = prev.UsedPercentage
+				// A reset-only frame did not re-observe utilization. Preserve the
+				// usage timestamp with the carried percentage instead of stamping it
+				// with this sparse frame's receive time.
+				bucket.ObservedAtMs = prev.ObservedAtMs
 			}
 			if !bucket.resetKnown && priorStillLive {
 				bucket.ResetsAtMs = prev.ResetsAtMs
@@ -1287,8 +1331,8 @@ const codexRolloutScanFileCap = 16
 //
 // A live captured bucket with a still-future reset is authoritative: it wins
 // over any rollout reading. But when the cache row's reset has already passed,
-// codexMetricFromBucket rolls it over to a concrete 0% (Unknown=false)
-// — and without this fallback the card would show that bogus 0% indefinitely
+// codexMetricFromBucket marks it unobservable
+// — and without this fallback the card would remain unobservable indefinitely
 // for a user who once streamed through the app-server, let the window reset,
 // and then drove Codex only through the TUI (where the new window's usage is
 // only ever written to the rollout log, never back to our cache). So a stale
@@ -1669,6 +1713,10 @@ func mergeCodexRolloutFrame(acc, updates map[string]map[string]codexRateLimitBuc
 
 			if !b.usageKnown && sameLiveWindow && prev.usageKnown {
 				b.UsedPercentage = prev.UsedPercentage
+				// The sparse frame re-observed the reset, not utilization. Keep the
+				// carried percentage paired with its original observation time so
+				// repeated rollout heartbeats cannot make stale usage appear fresh.
+				b.ObservedAtMs = prev.ObservedAtMs
 				b.usageKnown = true
 			}
 			if !b.resetKnown && priorStillLive {
@@ -1740,8 +1788,8 @@ func codexWindowLabel(minutes float64, fallback string) string {
 // placeholder when no bucket was selected (`ok == false`). The label is derived
 // from the bucket's own WindowMinutes so a migrated/non-canonical window still
 // reads correctly, falling back to `defaultLabel` when no length is known. A
-// window whose reset has already passed is reported as 0% used (rolled over),
-// matching Claude's observedMetricOrUnknown behaviour.
+// window whose reset has passed becomes unobservable, matching Claude's
+// behaviour; assuming 0% ignores usage that may occur on another computer.
 //
 // Selection is now identity-based (a session row may be sourced from the
 // `secondary` slot and vice-versa), so unlike the old windowID lookup this
@@ -1754,19 +1802,18 @@ func codexMetricFromBucket(b codexRateLimitBucket, ok bool, kind, defaultLabel s
 	var resetAt string
 	if b.ResetsAtMs > 0 {
 		if now.UnixMilli() >= b.ResetsAtMs {
-			used = 0
+			return cliAgentUsageMetric{
+				Kind: kind, Label: codexWindowLabel(b.WindowMinutes, defaultLabel), Unit: "%",
+				ObservedAt: observedAtRFC3339(b.ObservedAtMs), Unknown: true,
+			}
 		} else {
 			resetAt = time.UnixMilli(b.ResetsAtMs).UTC().Format(time.RFC3339)
 		}
 	}
 	used = clampPercent(used)
 	return cliAgentUsageMetric{
-		Kind:      kind,
-		Label:     codexWindowLabel(b.WindowMinutes, defaultLabel),
-		Unit:      "%",
-		Total:     floatPtr(100),
-		Consumed:  floatPtr(used),
-		Remaining: floatPtr(100 - used),
-		ResetAt:   resetAt,
+		Kind: kind, Label: codexWindowLabel(b.WindowMinutes, defaultLabel), Unit: "%",
+		Total: floatPtr(100), Consumed: floatPtr(used), Remaining: floatPtr(100 - used),
+		ResetAt: resetAt, ObservedAt: observedAtRFC3339(b.ObservedAtMs),
 	}
 }

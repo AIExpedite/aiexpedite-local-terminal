@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -372,11 +373,13 @@ func TestCaptureCodexRateLimit_SparseUpdatesPreservePriorFields(t *testing.T) {
 		now,
 	)
 
-	// Sparse update #1: reset-only restating the same live reset. Must
-	// preserve 60% (same window, just a fresh notification).
+	// Sparse update #1: reset-only restating the same live reset five minutes
+	// later. It must preserve both 60% and that percentage's original
+	// observation timestamp; the reset notification did not observe usage.
+	later := now.Add(5 * time.Minute)
 	captureCodexRateLimitLine(
-		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"resetsInSeconds":3600}}}}`,
-		now,
+		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"resetsInSeconds":3300}}}}`,
+		later,
 	)
 	snap, ok := loadCodexRateLimitSnapshot(cache)
 	if !ok {
@@ -388,11 +391,14 @@ func TestCaptureCodexRateLimit_SparseUpdatesPreservePriorFields(t *testing.T) {
 	if got := snap.Buckets[codexWindowPrimary].ResetsAtMs; got != now.Add(3600*time.Second).UnixMilli() {
 		t.Errorf("after reset-only update ResetsAtMs=%d, want live reset preserved", got)
 	}
+	if got := snap.Buckets[codexWindowPrimary].ObservedAtMs; got != now.UnixMilli() {
+		t.Errorf("after reset-only update ObservedAtMs=%d, want original usage observation %d", got, now.UnixMilli())
+	}
 
 	// Sparse update #2: usage-only (no reset). Must preserve the live reset.
 	captureCodexRateLimitLine(
 		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":72}}}}`,
-		now,
+		later,
 	)
 	snap, _ = loadCodexRateLimitSnapshot(cache)
 	if got := snap.Buckets[codexWindowPrimary].UsedPercentage; got != 72 {
@@ -753,6 +759,315 @@ func TestExtractCodexRateLimitBuckets_TieKeepsLaterReset(t *testing.T) {
 	}
 }
 
+func TestMergeCodexBucketMostConstrained_ZeroTieKeepsLiveObservation(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	expired := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     now.Add(-time.Hour).UnixMilli(),
+		ObservedAtMs:   now.Add(-2 * time.Hour).UnixMilli(),
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+	live := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+		ObservedAtMs:   now.Add(-time.Minute).UnixMilli(),
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		first  codexRateLimitBucket
+		second codexRateLimitBucket
+	}{
+		{name: "expired first", first: expired, second: live},
+		{name: "live first", first: live, second: expired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{codexWindowPrimary: tc.first}
+			mergeCodexBucketMostConstrained(out, codexWindowPrimary, tc.second)
+			got := out[codexWindowPrimary]
+			if got.ResetsAtMs != live.ResetsAtMs {
+				t.Fatalf("ResetsAtMs=%d, want live reset %d", got.ResetsAtMs, live.ResetsAtMs)
+			}
+			if got.ObservedAtMs != live.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want live observation %d", got.ObservedAtMs, live.ObservedAtMs)
+			}
+		})
+	}
+}
+
+func TestMergeCodexBucketMostConstrained_LiveKnownResetTieKeepsFreshestObservation(t *testing.T) {
+	freshEarlierReset := codexRateLimitBucket{
+		UsedPercentage: 55,
+		ResetsAtMs:     4000,
+		ObservedAtMs:   3000,
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+	staleLaterReset := codexRateLimitBucket{
+		UsedPercentage: 55,
+		ResetsAtMs:     5000,
+		ObservedAtMs:   1000,
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		first  codexRateLimitBucket
+		second codexRateLimitBucket
+	}{
+		{name: "fresh first", first: freshEarlierReset, second: staleLaterReset},
+		{name: "stale first", first: staleLaterReset, second: freshEarlierReset},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{codexWindowPrimary: tc.first}
+			mergeCodexBucketMostConstrained(out, codexWindowPrimary, tc.second)
+			got := out[codexWindowPrimary]
+			if got.ResetsAtMs != staleLaterReset.ResetsAtMs {
+				t.Errorf("ResetsAtMs=%d, want later aggregate reset %d", got.ResetsAtMs, staleLaterReset.ResetsAtMs)
+			}
+			if got.ObservedAtMs != freshEarlierReset.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want freshest tied live observation %d", got.ObservedAtMs, freshEarlierReset.ObservedAtMs)
+			}
+		})
+	}
+}
+
+func TestMergeCodexRolloutFrame_ResetOnlyPreservesUsageObservationTime(t *testing.T) {
+	frameTime := time.Date(2026, 6, 15, 12, 30, 0, 0, time.UTC)
+	resetAt := frameTime.Add(time.Hour).UnixMilli()
+	originalObservedAt := frameTime.Add(-30 * time.Minute).UnixMilli()
+	acc := map[string]map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			"codex_primary": {
+				UsedPercentage: 64,
+				ResetsAtMs:     resetAt,
+				ObservedAtMs:   originalObservedAt,
+				usageKnown:     true,
+				resetKnown:     true,
+			},
+		},
+	}
+	updates := map[string]map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			"codex_primary": {
+				ResetsAtMs:   resetAt,
+				ObservedAtMs: frameTime.UnixMilli(),
+				resetKnown:   true,
+			},
+		},
+	}
+
+	mergeCodexRolloutFrame(acc, updates, frameTime)
+	got := acc[codexWindowPrimary]["codex_primary"]
+	if !got.usageKnown || got.UsedPercentage != 64 {
+		t.Errorf("carried usage=(known=%v, used=%v), want true/64", got.usageKnown, got.UsedPercentage)
+	}
+	if got.ObservedAtMs != originalObservedAt {
+		t.Errorf("ObservedAtMs=%d, want original usage observation %d", got.ObservedAtMs, originalObservedAt)
+	}
+}
+
+func TestMergeCodexBucketMostConstrained_TieWithoutCommonResetKeepsFreshObservation(t *testing.T) {
+	older := codexRateLimitBucket{
+		UsedPercentage: 50,
+		ResetsAtMs:     time.Now().Add(time.Hour).UnixMilli(),
+		ObservedAtMs:   1000,
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+	fresher := codexRateLimitBucket{
+		UsedPercentage: 50,
+		ObservedAtMs:   2000,
+		usageKnown:     true,
+		resetKnown:     false,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		first  codexRateLimitBucket
+		second codexRateLimitBucket
+	}{
+		{name: "known reset first", first: older, second: fresher},
+		{name: "unknown reset first", first: fresher, second: older},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{codexWindowPrimary: tc.first}
+			mergeCodexBucketMostConstrained(out, codexWindowPrimary, tc.second)
+			got := out[codexWindowPrimary]
+			if got.resetKnown || got.ResetsAtMs != 0 {
+				t.Errorf("reset=(%v, %d), want unknown", got.resetKnown, got.ResetsAtMs)
+			}
+			if got.ObservedAtMs != fresher.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want freshest observation %d", got.ObservedAtMs, fresher.ObservedAtMs)
+			}
+		})
+	}
+}
+
+func TestMergeCodexBucketMostConstrained_ZeroTieDoesNotBorrowExpiredObservation(t *testing.T) {
+	expired := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     1000,
+		ObservedAtMs:   3000,
+		usageKnown:     true,
+		resetKnown:     true,
+		rolledOver:     true,
+	}
+	resetless := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ObservedAtMs:   2000,
+		usageKnown:     true,
+		resetKnown:     false,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		first  codexRateLimitBucket
+		second codexRateLimitBucket
+	}{
+		{name: "expired first", first: expired, second: resetless},
+		{name: "resetless first", first: resetless, second: expired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{codexWindowPrimary: tc.first}
+			mergeCodexBucketMostConstrained(out, codexWindowPrimary, tc.second)
+			got := out[codexWindowPrimary]
+			if got.ObservedAtMs != resetless.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want reset-less observation %d", got.ObservedAtMs, resetless.ObservedAtMs)
+			}
+		})
+	}
+}
+
+func TestMergeCodexBucketMostConstrained_LiveOneResetTieKeepsFreshObservation(t *testing.T) {
+	liveKnownReset := codexRateLimitBucket{
+		UsedPercentage: 40,
+		ResetsAtMs:     4000,
+		ObservedAtMs:   3000,
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+	staleResetless := codexRateLimitBucket{
+		UsedPercentage: 40,
+		ObservedAtMs:   2000,
+		usageKnown:     true,
+		resetKnown:     false,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		first  codexRateLimitBucket
+		second codexRateLimitBucket
+	}{
+		{name: "known reset first", first: liveKnownReset, second: staleResetless},
+		{name: "resetless first", first: staleResetless, second: liveKnownReset},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{codexWindowPrimary: tc.first}
+			mergeCodexBucketMostConstrained(out, codexWindowPrimary, tc.second)
+			if got := out[codexWindowPrimary].ObservedAtMs; got != liveKnownReset.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want freshest live observation %d", got, liveKnownReset.ObservedAtMs)
+			}
+		})
+	}
+}
+
+func TestMergeCodexBucketMostConstrained_MultiWayZeroTiePreservesLiveProvenance(t *testing.T) {
+	live := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ObservedAtMs:   2000,
+		usageKnown:     true,
+	}
+	expiredA := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     1000,
+		ObservedAtMs:   3000,
+		usageKnown:     true,
+		resetKnown:     true,
+		rolledOver:     true,
+	}
+	expiredB := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     1500,
+		ObservedAtMs:   4000,
+		usageKnown:     true,
+		resetKnown:     true,
+		rolledOver:     true,
+	}
+
+	orders := [][]codexRateLimitBucket{
+		{expiredA, live, expiredB},
+		{expiredA, expiredB, live},
+		{live, expiredA, expiredB},
+	}
+	for i, order := range orders {
+		t.Run(fmt.Sprintf("order %d", i), func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{}
+			for _, bucket := range order {
+				mergeCodexBucketMostConstrained(out, codexWindowPrimary, bucket)
+			}
+			got := out[codexWindowPrimary]
+			if got.rolledOver {
+				t.Error("aggregate with a live tied contributor must not remain rolled over")
+			}
+			if got.ObservedAtMs != live.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want live observation %d", got.ObservedAtMs, live.ObservedAtMs)
+			}
+		})
+	}
+}
+
+func TestMergeCodexBucketMostConstrained_MultiWayKnownResetTiePreservesLiveProvenance(t *testing.T) {
+	liveKnownReset := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     5000,
+		ObservedAtMs:   3000,
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+	liveResetless := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ObservedAtMs:   1000,
+		usageKnown:     true,
+	}
+	expired := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     2000,
+		ObservedAtMs:   4000,
+		usageKnown:     true,
+		resetKnown:     true,
+		rolledOver:     true,
+	}
+
+	orders := [][]codexRateLimitBucket{
+		{expired, liveKnownReset, liveResetless},
+		{expired, liveResetless, liveKnownReset},
+		{liveKnownReset, expired, liveResetless},
+		{liveKnownReset, liveResetless, expired},
+		{liveResetless, expired, liveKnownReset},
+		{liveResetless, liveKnownReset, expired},
+	}
+	for i, order := range orders {
+		t.Run(fmt.Sprintf("order %d", i), func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{}
+			for _, bucket := range order {
+				mergeCodexBucketMostConstrained(out, codexWindowPrimary, bucket)
+			}
+			got := out[codexWindowPrimary]
+			if got.rolledOver {
+				t.Error("aggregate with live tied contributors must not remain rolled over")
+			}
+			if got.ObservedAtMs != liveKnownReset.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want freshest live observation %d", got.ObservedAtMs, liveKnownReset.ObservedAtMs)
+			}
+		})
+	}
+}
+
 // When two equally-exhausted buckets disagree on whether a reset is known, the
 // safe answer is "unknown" — don't promise a reset time that the unknown side
 // can't confirm.
@@ -840,8 +1155,8 @@ func TestCodexMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
-		codexWindowPrimary:   {UsedPercentage: 31.2, ResetsAtMs: now.Add(2 * time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
-		codexWindowSecondary: {UsedPercentage: 95, ResetsAtMs: now.Add(-time.Minute).UnixMilli(), usageKnown: true, resetKnown: true},
+		codexWindowPrimary:   {UsedPercentage: 31.2, ResetsAtMs: now.Add(2 * time.Hour).UnixMilli(), ObservedAtMs: now.UnixMilli(), usageKnown: true, resetKnown: true},
+		codexWindowSecondary: {UsedPercentage: 95, ResetsAtMs: now.Add(-time.Minute).UnixMilli(), ObservedAtMs: now.UnixMilli(), usageKnown: true, resetKnown: true},
 	}, nil, now, "")
 
 	metrics := codexMetricsFromCache(now, "")
@@ -861,11 +1176,14 @@ func TestCodexMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	if weekly.Kind != limitKindWeekly {
 		t.Errorf("weekly metric kind=%q, want %q", weekly.Kind, limitKindWeekly)
 	}
-	if weekly.Consumed == nil || *weekly.Consumed != 0 {
-		t.Errorf("past-reset weekly Consumed=%v, want 0 (rolled over)", weekly.Consumed)
+	if !weekly.Unknown || weekly.Consumed != nil {
+		t.Errorf("past-reset weekly metric=%+v, want unobservable", weekly)
 	}
 	if weekly.ResetAt != "" {
 		t.Errorf("past-reset window must not advertise a stale ResetAt")
+	}
+	if weekly.ObservedAt == "" || session.ObservedAt == "" {
+		t.Errorf("metrics must preserve observation time: session=%+v weekly=%+v", session, weekly)
 	}
 }
 

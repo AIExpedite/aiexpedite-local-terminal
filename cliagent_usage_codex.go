@@ -18,13 +18,33 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/exec"
+	"strings"
 	"time"
 )
 
 type codexUsageParser struct{}
 
 func (codexUsageParser) Provider() string { return "codex" }
+
+var codexAuthStatusProbe = func(path string) (bool, bool) {
+	if strings.TrimSpace(path) == "" {
+		return false, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "login", "status").CombinedOutput()
+	status := strings.ToLower(string(out))
+	if strings.Contains(status, "not logged in") || strings.Contains(status, "login required") {
+		return false, true
+	}
+	if err == nil && strings.Contains(status, "logged in") {
+		return true, true
+	}
+	return false, false
+}
 
 type codexAuth struct {
 	Account  string `json:"account"`
@@ -33,9 +53,11 @@ type codexAuth struct {
 	Plan     string `json:"plan"`
 	PlanType string `json:"plan_type"`
 	OrgID    string `json:"org_id"`
+	APIKey   string `json:"OPENAI_API_KEY"`
 	Tokens   struct {
-		IDToken   string `json:"id_token"`
-		AccountID string `json:"account_id"`
+		IDToken      string `json:"id_token"`
+		AccountID    string `json:"account_id"`
+		RefreshToken string `json:"refresh_token"`
 	} `json:"tokens"`
 }
 
@@ -63,6 +85,12 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 		DataSource:  "token_count",
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
+	hasAPIKeyAuth := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")) != ""
+	if hasAPIKeyAuth {
+		usage.Authenticated = authBoolPtr(true)
+		usage.AuthState = "authenticated"
+		usage.LoginExpirationState = loginExpirationNotReported
+	}
 
 	auth := codexAuth{}
 	if readJSONFile(expandHome(base, "auth.json"), &auth) {
@@ -79,6 +107,16 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 			claims.Subject,
 		)
 		usage.Plan = firstNonEmpty(auth.Plan, auth.PlanType, claims.Plan, claims.PlanType)
+		if firstNonEmpty(auth.APIKey, auth.Tokens.IDToken, auth.Tokens.RefreshToken) != "" {
+			hasAPIKeyAuth = hasAPIKeyAuth || strings.TrimSpace(auth.APIKey) != ""
+			usage.Authenticated = authBoolPtr(true)
+			usage.AuthState = "authenticated"
+			if auth.Tokens.RefreshToken != "" {
+				usage.LoginExpirationState = loginExpirationRefreshable
+			} else {
+				usage.LoginExpirationState = loginExpirationNotReported
+			}
+		}
 	}
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
@@ -87,5 +125,30 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 	// even when Codex is only ever driven through its TUI.
 	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
 	usage.Metrics = codexBackfillUnknownFromRollout(usage.Metrics, base, usage.AccountFingerprint, now)
+	if loggedIn, known := codexAuthStatusProbe(detected.Path); known {
+		// `codex login status` describes persisted login state, not inherited
+		// OPENAI_API_KEY authentication. A definite persisted logout therefore
+		// cannot invalidate a credential mode the app-server will actually use.
+		if !loggedIn && hasAPIKeyAuth {
+			return usage, true
+		}
+		usage.Authenticated = authBoolPtr(loggedIn)
+		if loggedIn {
+			usage.AuthState = "authenticated"
+		} else {
+			usage.AuthState = "missing"
+			usage.Notice = "Codex is not signed in on this computer — run `codex login` on the terminal computer to authenticate."
+			usage.NoticeSeverity = "error"
+			usage.Metrics = utilizationMetricsUnknown(usage.Metrics)
+		}
+	} else if usage.Authenticated == nil && strings.TrimSpace(detected.Path) != "" {
+		// No supported credential remains to explain an inconclusive status
+		// probe, so cached telemetry cannot be attributed to a usable login.
+		usage.Authenticated = authBoolPtr(false)
+		usage.AuthState = "missing"
+		usage.Notice = "Codex is not signed in on this computer — run `codex login` on the terminal computer to authenticate."
+		usage.NoticeSeverity = "error"
+		usage.Metrics = utilizationMetricsUnknown(usage.Metrics)
+	}
 	return usage, true
 }

@@ -48,6 +48,10 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 		usage.Plan = firstNonEmpty(cfg.Plan, cfg.Tier)
 	}
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
+	// Antigravity keeps its renewable session in the OS keyring and does not
+	// publish a durable session deadline. Do not reinterpret an access token or
+	// the settings-file mtime as login expiration.
+	usage.LoginExpirationState = loginExpirationNotReported
 
 	usage.Metrics = []cliAgentUsageMetric{
 		{

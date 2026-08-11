@@ -1183,6 +1183,7 @@ func TestGrokACPLifecycle_TimeoutKillsBeforeBlockingPublish(t *testing.T) {
 // than failing the call with an opaque exec error.
 func TestGrokACPLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	tmpDir := t.TempDir()
+	isolateTestUserHome(t, tmpDir)
 	t.Setenv("PATH", tmpDir)
 
 	m := NewGrokACPManager()

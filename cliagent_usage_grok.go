@@ -19,8 +19,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 	"time"
 )
 
@@ -37,43 +35,34 @@ const (
 	// DIFFERENT xAI client that happens to share the "https://auth.x.ai" host
 	// (a sibling "https://auth.x.ai::<other-client>" entry) can't sort ahead of
 	// the credential Grok will actually present.
-	grokExactOIDCScope    = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
-	grokOIDCScopePrefix   = "https://auth.x.ai"
-	grokLegacyScopePrefix = "https://accounts.x.ai"
+	grokExactOIDCScope   = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+	grokExactLegacyScope = "https://accounts.x.ai/sign-in"
 )
 
-// grokScopeKeysByPrecedence orders auth.json scope keys the way Grok resolves a
-// token: the exact CLI OIDC scope first, then the legacy sign-in scope, then any
-// other OIDC-host sibling, then any other keys — each tier broken by stable
-// alphabetical order. read_grok_token resolves only OIDC_SCOPE then LEGACY_SCOPE
-// (https://x.ai/cli/install.sh); it never scans arbitrary "https://auth.x.ai::"
-// siblings, so an unrelated OIDC-host entry for a DIFFERENT xAI client must NOT
-// outrank the legacy scope — otherwise a valid sibling would mask an expired
-// legacy token Grok will actually fall back to and stall on. The bare OIDC-host
-// tier is kept below legacy only as a forward-compat last resort (e.g. if xAI
-// rotates the exact client id). Callers walk the result and take the first entry
-// that carries a usable token, mirroring the installer's OIDC-then-legacy
-// fallback instead of aggregating unrelated siblings.
+// grokScopeKeysByPrecedence returns only scopes Grok's resolver can present:
+// the exact CLI OIDC scope first, then the exact legacy sign-in scope.
+// read_grok_token resolves only OIDC_SCOPE then LEGACY_SCOPE
+// (https://x.ai/cli/install.sh); it never scans arbitrary siblings. Filtering
+// here prevents another xAI client's credential from making this Grok CLI look
+// authenticated or from supplying a misleading expiry/identity.
 func grokScopeKeysByPrecedence(keys []string) []string {
-	rank := func(k string) int {
+	hasExactOIDC := false
+	hasExactLegacy := false
+	for _, key := range keys {
 		switch {
-		case k == grokExactOIDCScope:
-			return 0
-		case strings.HasPrefix(k, grokLegacyScopePrefix):
-			return 1
-		case strings.HasPrefix(k, grokOIDCScopePrefix):
-			return 2
-		default:
-			return 3
+		case key == grokExactOIDCScope:
+			hasExactOIDC = true
+		case key == grokExactLegacyScope:
+			hasExactLegacy = true
 		}
 	}
-	ordered := append([]string(nil), keys...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		if ri, rj := rank(ordered[i]), rank(ordered[j]); ri != rj {
-			return ri < rj
-		}
-		return ordered[i] < ordered[j]
-	})
+	ordered := make([]string, 0, 2)
+	if hasExactOIDC {
+		ordered = append(ordered, grokExactOIDCScope)
+	}
+	if hasExactLegacy {
+		ordered = append(ordered, grokExactLegacyScope)
+	}
 	return ordered
 }
 
@@ -172,7 +161,27 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	// DOES push a discrete usage-limit warning on the streaming-json output,
 	// which captureGrokUsageLimitLine caches (approaching → warning, reached →
 	// error).
-	authNotice, authSeverity := grokAuthNotice(base, usage.Account, now)
+	authNotice, authSeverity := grokAuthNotice(base, now)
+	usableToken := grokHasUsableToken(base)
+	if usableToken {
+		usage.Authenticated = authBoolPtr(true)
+		usage.AuthState = "authenticated"
+		if grokHasRefreshToken(base) {
+			usage.LoginExpirationState = loginExpirationRefreshable
+		} else if expiry, ok := readGrokAuthExpiry(base); ok {
+			usage.LoginExpirationState = loginExpirationKnown
+			usage.LoginExpiresAt = expiry.UTC().Format(time.RFC3339)
+			if !expiry.After(now) {
+				usage.Authenticated = authBoolPtr(false)
+				usage.AuthState = "expired"
+			}
+		} else {
+			usage.LoginExpirationState = loginExpirationNotReported
+		}
+	} else if authNotice != "" && authSeverity == "error" {
+		usage.Authenticated = authBoolPtr(false)
+		usage.AuthState = "missing"
+	}
 	limitState, hasLimit := loadGrokUsageLimitState(usage.AccountFingerprint, now)
 	applyLimitNotice := func() {
 		usage.Notice = grokNoticeText(limitState)
@@ -273,11 +282,12 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 	// FIRST entry that carries one — the scope Grok will actually present —
 	// instead of the max across unrelated siblings.
 	var scoped map[string]struct {
-		ExpiresAt   string `json:"expires_at"`
-		Key         string `json:"key"`
-		Token       string `json:"token"`
-		IDToken     string `json:"id_token"`
-		AccessToken string `json:"access_token"`
+		ExpiresAt    string `json:"expires_at"`
+		Key          string `json:"key"`
+		Token        string `json:"token"`
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 	if json.Unmarshal(raw, &scoped) == nil && len(scoped) > 0 {
 		keys := make([]string, 0, len(scoped))
@@ -286,6 +296,20 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		}
 		for _, k := range grokScopeKeysByPrecedence(keys) {
 			v := scoped[k]
+			// A refresh token is renewal metadata, not the credential Grok
+			// presents. Skip refresh-only preferred scopes just as Grok's
+			// resolver does, allowing it to fall back to a token-bearing scope.
+			token := firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken)
+			if token == "" {
+				continue
+			}
+			// Grok v1.0 stores a short-lived access JWT plus an opaque refresh
+			// token. The access expiry is not the login expiry: Grok can refresh it
+			// without another interactive sign-in. Treat the deadline as unknown
+			// while refresh auth is present instead of warning every six hours.
+			if v.RefreshToken != "" {
+				return time.Time{}, false
+			}
 			// Mirror read_grok_token (and readGrokScopedAuthClaims): a scope is only
 			// usable when it carries a non-empty token. Skip metadata/empty-key
 			// entries so a tokenless preferred (OIDC) scope can't surface its
@@ -295,10 +319,6 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 			// `access_token` paired with a later-expiring `id_token` can't read as
 			// healthy (this also covers a nested `cached_token` object, which
 			// unmarshals into this scoped map as a single entry).
-			token := firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken)
-			if token == "" {
-				continue
-			}
 			// This is the scope Grok's resolver stops at — the token it will
 			// present. Its expiry is the only one that matters, so read it and
 			// STOP: don't fall through to lower-precedence siblings whose token
@@ -319,13 +339,24 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 	// Flat / legacy format: top-level `expires_at` and/or a cached_token JWT —
 	// a single account, so preferring `expires_at` then the JWT is unambiguous.
 	var flat struct {
-		ExpiresAt   string `json:"expires_at"`
-		CachedToken struct {
-			IDToken     string `json:"id_token"`
-			AccessToken string `json:"access_token"`
+		ExpiresAt    string `json:"expires_at"`
+		Key          string `json:"key"`
+		Token        string `json:"token"`
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		CachedToken  struct {
+			IDToken      string `json:"id_token"`
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
 		} `json:"cached_token"`
 	}
 	if json.Unmarshal(raw, &flat) == nil {
+		// A refresh token makes the access-token deadline unsuitable as a login
+		// deadline in legacy layouts too: Grok can renew it headlessly.
+		if firstNonEmpty(flat.RefreshToken, flat.CachedToken.RefreshToken) != "" {
+			return time.Time{}, false
+		}
 		if t, ok := fromRFC3339(flat.ExpiresAt); ok {
 			return t, true
 		}
@@ -334,7 +365,11 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		// token is present. Otherwise a stale `access_token` paired with a
 		// later-expiring `id_token` would report the login as healthy and hide
 		// the impending stall.
-		if t, ok := fromJWT(firstNonEmpty(flat.CachedToken.AccessToken, flat.CachedToken.IDToken)); ok {
+		if t, ok := fromJWT(firstNonEmpty(
+			flat.AccessToken, flat.Token, flat.Key,
+			flat.CachedToken.AccessToken,
+			flat.IDToken, flat.CachedToken.IDToken,
+		)); ok {
 			return t, true
 		}
 	}
@@ -358,16 +393,22 @@ func grokHasUsableToken(base string) bool {
 		}
 	}
 
-	// Scoped/keyed format (current): any entry carrying a non-empty token —
-	// presence alone matters here, so precedence order is irrelevant.
+	// Scoped/keyed format (current): inspect only the entry Grok's resolver
+	// would select. Unrelated sibling credentials are not usable by this CLI.
 	var scoped map[string]struct {
-		Key         string `json:"key"`
-		Token       string `json:"token"`
-		IDToken     string `json:"id_token"`
-		AccessToken string `json:"access_token"`
+		Key          string `json:"key"`
+		Token        string `json:"token"`
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 	if json.Unmarshal(raw, &scoped) == nil && len(scoped) > 0 {
-		for _, v := range scoped {
+		keys := make([]string, 0, len(scoped))
+		for key := range scoped {
+			keys = append(keys, key)
+		}
+		for _, key := range grokScopeKeysByPrecedence(keys) {
+			v := scoped[key]
 			if firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken) != "" {
 				return true
 			}
@@ -376,13 +417,22 @@ func grokHasUsableToken(base string) bool {
 
 	// Flat / legacy cached_token format.
 	var flat struct {
-		CachedToken struct {
-			IDToken     string `json:"id_token"`
-			AccessToken string `json:"access_token"`
+		Key          string `json:"key"`
+		Token        string `json:"token"`
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		CachedToken  struct {
+			IDToken      string `json:"id_token"`
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
 		} `json:"cached_token"`
 	}
 	if json.Unmarshal(raw, &flat) == nil {
-		if firstNonEmpty(flat.CachedToken.AccessToken, flat.CachedToken.IDToken) != "" {
+		if firstNonEmpty(
+			flat.Key, flat.Token, flat.AccessToken, flat.IDToken,
+			flat.CachedToken.AccessToken, flat.CachedToken.IDToken,
+		) != "" {
 			return true
 		}
 	}
@@ -390,18 +440,56 @@ func grokHasUsableToken(base string) bool {
 	return false
 }
 
+// grokHasRefreshToken follows the same selected-scope precedence as Grok's
+// token resolver. A refresh token makes access-token expires_at unsuitable as
+// a login deadline.
+func grokHasRefreshToken(base string) bool {
+	raw, err := os.ReadFile(filepath.Join(base, "auth.json"))
+	if err != nil {
+		raw, err = os.ReadFile(filepath.Join(base, "cached_token.json"))
+		if err != nil {
+			return false
+		}
+	}
+	var scoped map[string]struct {
+		Key          string `json:"key"`
+		Token        string `json:"token"`
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if json.Unmarshal(raw, &scoped) == nil && len(scoped) > 0 {
+		keys := make([]string, 0, len(scoped))
+		for key := range scoped {
+			keys = append(keys, key)
+		}
+		for _, key := range grokScopeKeysByPrecedence(keys) {
+			entry := scoped[key]
+			if firstNonEmpty(entry.Key, entry.Token, entry.AccessToken, entry.IDToken) != "" {
+				return entry.RefreshToken != ""
+			}
+		}
+	}
+	var flat struct {
+		RefreshToken string `json:"refresh_token"`
+		CachedToken  struct {
+			RefreshToken string `json:"refresh_token"`
+		} `json:"cached_token"`
+	}
+	return json.Unmarshal(raw, &flat) == nil && firstNonEmpty(flat.RefreshToken, flat.CachedToken.RefreshToken) != ""
+}
+
 // grokAuthNotice returns a card-level notice + severity when the local Grok
 // login is missing or (nearly) expired, so the dashboard can prompt a re-run of
 // `grok login` on the terminal computer BEFORE a chat session stalls on an
 // un-showable browser sign-in. Returns ("", "") when auth looks healthy.
-func grokAuthNotice(base, account string, now time.Time) (string, string) {
+func grokAuthNotice(base string, now time.Time) (string, string) {
 	expiry, ok := readGrokAuthExpiry(base)
 	if !ok {
-		// No parseable expiry. Only call it "not signed in" when there's also no
-		// identity AND no usable token — a readable account, or an opaque token
-		// Grok would still present, shouldn't raise a false alarm just because
-		// its layout is unparseable.
-		if account == "" && !grokHasUsableToken(base) {
+		// No parseable expiry. Authentication depends on a credential Grok can
+		// present, not stale identity metadata left in the file. An opaque but
+		// usable token stays quiet; identity without a presented token is missing.
+		if !grokHasUsableToken(base) {
 			return "Grok is not signed in on this computer — run `grok login` on the terminal computer to authenticate.", "error"
 		}
 		return "", ""

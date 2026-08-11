@@ -390,6 +390,10 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 				bucket.ResetsAtMs = prev.ResetsAtMs
 			}
 			bucket.UsedPercentage = prev.UsedPercentage
+			// The heartbeat observed the reset/status, not utilization. Keep the
+			// carried percentage paired with its original observation so repeated
+			// heartbeats cannot make stale usage appear fresh indefinitely.
+			bucket.ObservedAtMs = prev.ObservedAtMs
 		}
 		snap.Buckets[window] = bucket
 	}

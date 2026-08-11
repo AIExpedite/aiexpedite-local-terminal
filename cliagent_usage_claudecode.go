@@ -23,12 +23,42 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 )
 
 type claudeCodeUsageParser struct{}
 
 func (claudeCodeUsageParser) Provider() string { return "claudeCode" }
+
+var claudeAuthStatusProbe = func(path string) (bool, bool) {
+	if path == "" {
+		return false, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
+	defer cancel()
+	probeEnv, _ := prepareClaudeChildEnv(path, os.Environ())
+	out, err := runClaudeAuthStatusCommand(ctx, path, probeEnv)
+	var status struct {
+		LoggedIn *bool `json:"loggedIn"`
+	}
+	// Claude intentionally exits 1 for a logged-out status while still emitting
+	// definitive JSON. Parse stdout first; only treat the command error as
+	// inconclusive when no documented status payload was returned.
+	if json.Unmarshal(out, &status) == nil && status.LoggedIn != nil {
+		return *status.LoggedIn, true
+	}
+	if err != nil {
+		return false, false
+	}
+	return false, false
+}
+
+var runClaudeAuthStatusCommand = func(ctx context.Context, path string, env []string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, path, "auth", "status", "--json")
+	cmd.Env = env
+	return cmd.Output()
+}
 
 type claudeCredentials struct {
 	Account      string `json:"account"`
@@ -75,8 +105,10 @@ type claudeDotJSON struct {
 // (RefreshTokenExpiresAt). That's the real re-authentication deadline.
 type claudeOAuthCredentials struct {
 	ClaudeAiOauth struct {
-		ExpiresAt             int64 `json:"expiresAt"`
-		RefreshTokenExpiresAt int64 `json:"refreshTokenExpiresAt"`
+		AccessToken           string `json:"accessToken"`
+		RefreshToken          string `json:"refreshToken"`
+		ExpiresAt             int64  `json:"expiresAt"`
+		RefreshTokenExpiresAt int64  `json:"refreshTokenExpiresAt"`
 	} `json:"claudeAiOauth"`
 }
 
@@ -160,18 +192,28 @@ func usingDefaultClaudeConfigDir() bool {
 	return os.Getenv("CLAUDE_CONFIG_DIR") == ""
 }
 
+func claudeLoginDeadlineMs(creds claudeOAuthCredentials) int64 {
+	oauth := creds.ClaudeAiOauth
+	if oauth.RefreshToken != "" {
+		return oauth.RefreshTokenExpiresAt
+	}
+	if oauth.AccessToken != "" {
+		return oauth.ExpiresAt
+	}
+	return 0
+}
+
 // claudeAuthNoticeFromRaw returns a card notice + severity when the claude.ai
-// subscription login in a raw .credentials.json blob is (nearly) expired. It
-// keys off the REFRESH-token expiry — the access token auto-refreshes, so its
-// shorter expiry would false-alarm. Returns ("","") when the refresh token is
-// still valid, or when there's no OAuth login (API-key installs have no
-// claudeAiOauth object, so absence is not a reliable "signed out" signal).
+// subscription login in a raw .credentials.json blob is (nearly) expired.
+// Renewable credentials use the refresh-token expiry; access-token-only
+// credentials use the access expiry because they cannot renew. Returns ("","")
+// when no reliable OAuth deadline is available.
 func claudeAuthNoticeFromRaw(raw []byte, now time.Time) (string, string) {
 	creds := claudeOAuthCredentials{}
 	if json.Unmarshal(raw, &creds) != nil {
 		return "", ""
 	}
-	deadlineMs := creds.ClaudeAiOauth.RefreshTokenExpiresAt
+	deadlineMs := claudeLoginDeadlineMs(creds)
 	if deadlineMs <= 0 {
 		return "", "" // no OAuth deadline (API-key or unexpected layout) — don't guess
 	}
@@ -183,6 +225,35 @@ func claudeAuthNoticeFromRaw(raw []byte, now time.Time) (string, string) {
 		return "Claude login expires soon — run `claude` on the terminal computer and sign in (/login) to avoid an interrupted session.", "warning"
 	}
 	return "", ""
+}
+
+func applyClaudeAuthState(usage *cliAgentUsage, raw []byte, now time.Time) bool {
+	if usage == nil || len(raw) == 0 {
+		return false
+	}
+	creds := claudeOAuthCredentials{}
+	if json.Unmarshal(raw, &creds) != nil {
+		return false
+	}
+	oauth := creds.ClaudeAiOauth
+	if oauth.AccessToken == "" && oauth.RefreshToken == "" {
+		return false
+	}
+	usage.Authenticated = authBoolPtr(true)
+	usage.AuthState = "authenticated"
+	usage.LoginExpirationState = loginExpirationNotReported
+	deadlineMs := claudeLoginDeadlineMs(creds)
+	if deadlineMs <= 0 {
+		return true
+	}
+	deadline := time.UnixMilli(deadlineMs).UTC()
+	usage.LoginExpirationState = loginExpirationKnown
+	usage.LoginExpiresAt = deadline.Format(time.RFC3339)
+	if !deadline.After(now) {
+		usage.Authenticated = authBoolPtr(false)
+		usage.AuthState = "expired"
+	}
+	return true
 }
 
 func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
@@ -202,7 +273,11 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 
 	// Read the credential ONCE (file, or macOS Keychain) and use it for both the
 	// account/plan fingerprint and the auth-expiry notice.
+	credentialFound := false
+	credentialUsable := false
 	if raw, ok := readClaudeCredentialsRaw(base); ok {
+		credentialFound = true
+		credentialUsable = applyClaudeAuthState(usage, raw, now)
 		creds := claudeCredentials{}
 		if json.Unmarshal(raw, &creds) == nil {
 			usage.Account = firstNonEmpty(creds.Email, creds.Account, creds.Organization)
@@ -258,8 +333,45 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 	// what the status-line hook / stream-capture wrote.
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), credsAccount)
 	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)
+	if loggedIn, known := claudeAuthStatusProbe(detected.Path); known {
+		if !loggedIn {
+			usage.Authenticated = authBoolPtr(false)
+			usage.AuthState = "missing"
+			usage.LoginExpiresAt = ""
+			usage.LoginExpirationState = loginExpirationNotReported
+			usage.Notice = "Claude is not signed in on this computer — run `claude` and sign in (/login) on the terminal computer."
+			usage.NoticeSeverity = "error"
+		} else if usage.AuthState != "expired" {
+			usage.Authenticated = authBoolPtr(true)
+			usage.AuthState = "authenticated"
+		}
+	} else if !credentialUsable && (credentialFound || strings.TrimSpace(detected.Path) != "") {
+		usage.Authenticated = authBoolPtr(false)
+		usage.AuthState = "missing"
+		usage.LoginExpiresAt = ""
+		usage.LoginExpirationState = loginExpirationNotReported
+		usage.Notice = "Claude credentials are unavailable on this computer — run `claude` and sign in (/login) on the terminal computer."
+		usage.NoticeSeverity = "error"
+	}
+	if usage.NoticeSeverity == "error" {
+		usage.Metrics = utilizationMetricsUnknown(usage.Metrics)
+	}
 
 	return usage, true
+}
+
+// utilizationMetricsUnknown preserves metric identity and provenance while
+// removing numeric values that cannot be trusted for an unavailable login.
+func utilizationMetricsUnknown(metrics []cliAgentUsageMetric) []cliAgentUsageMetric {
+	out := make([]cliAgentUsageMetric, len(metrics))
+	for i, metric := range metrics {
+		out[i] = cliAgentUsageMetric{
+			Kind: metric.Kind, Label: metric.Label, Unit: metric.Unit,
+			ResetAt: metric.ResetAt, ObservedAt: metric.ObservedAt,
+			Model: metric.Model, Unknown: true,
+		}
+	}
+	return out
 }
 
 // claudeConfigDir resolves the Claude config dir using the same precedence Parse
@@ -455,9 +567,11 @@ func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliA
 func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Time) cliAgentUsageMetric {
 	windowIDs := []string{claudeWindowSevenDay, claudeWindowSevenDaySonnet, claudeWindowSevenDayOpus}
 	var (
-		observed   bool
-		worstUsed  float64
-		worstReset int64
+		observed      bool
+		worstUsed     float64
+		worstReset    int64
+		worstObserved int64
+		worstCurrent  bool
 	)
 	for _, id := range windowIDs {
 		b, ok := buckets[id]
@@ -466,7 +580,8 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 		}
 		used := b.UsedPercentage
 		liveReset := b.ResetsAtMs > 0 && now.UnixMilli() < b.ResetsAtMs
-		if b.ResetsAtMs > 0 && now.UnixMilli() >= b.ResetsAtMs {
+		current := b.ResetsAtMs <= 0 || liveReset
+		if !current {
 			used = 0 // this sub-window has already rolled over
 		}
 		used = clampPercent(used)
@@ -480,13 +595,26 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 		switch {
 		case !observed || used > worstUsed:
 			worstUsed = used
+			worstObserved = b.ObservedAtMs
+			worstCurrent = current
 			if liveReset {
 				worstReset = b.ResetsAtMs
 			} else {
 				worstReset = 0
 			}
 		case used == worstUsed:
+			wasCurrent := worstCurrent
+			if current && (!worstCurrent || b.ObservedAtMs > worstObserved) {
+				worstObserved = b.ObservedAtMs
+			}
+			worstCurrent = worstCurrent || current
 			switch {
+			case !current:
+				// An expired tied bucket no longer constrains the live aggregate.
+			case !wasCurrent && liveReset:
+				worstReset = b.ResetsAtMs
+			case !wasCurrent:
+				worstReset = 0
 			case !liveReset:
 				// New tied bucket has no known live reset, so we can't say
 				// when the combined constraint clears — surface Unknown.
@@ -500,25 +628,28 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 	if !observed {
 		return cliAgentUsageMetric{Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%", Unknown: true}
 	}
+	observedAt := observedAtRFC3339(worstObserved)
+	if !worstCurrent {
+		return cliAgentUsageMetric{
+			Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%",
+			ObservedAt: observedAt, Unknown: true,
+		}
+	}
 	var resetAt string
 	if worstReset > 0 {
 		resetAt = time.UnixMilli(worstReset).UTC().Format(time.RFC3339)
 	}
 	return cliAgentUsageMetric{
-		Kind:      limitKindWeekly,
-		Label:     "Weekly quota",
-		Unit:      "%",
-		Total:     floatPtr(100),
-		Consumed:  floatPtr(worstUsed),
-		Remaining: floatPtr(100 - worstUsed),
-		ResetAt:   resetAt,
+		Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%",
+		Total: floatPtr(100), Consumed: floatPtr(worstUsed), Remaining: floatPtr(100 - worstUsed),
+		ResetAt: resetAt, ObservedAt: observedAt,
 	}
 }
 
 // observedMetricOrUnknown returns a real percentage metric for the first window
 // id present in the cache, or an Unknown placeholder when none is observed. A
-// window whose reset time has already passed is reported as 0% used (the window
-// rolled over), which is more honest than showing a stale high-water mark.
+// window whose reset time has passed is unobservable: assuming 0% ignores usage
+// that may already have happened on another computer.
 func observedMetricOrUnknown(
 	buckets map[string]claudeRateLimitBucket,
 	windowIDs []string,
@@ -534,21 +665,27 @@ func observedMetricOrUnknown(
 		var resetAt string
 		if b.ResetsAtMs > 0 {
 			if now.UnixMilli() >= b.ResetsAtMs {
-				used = 0 // window has reset since we last observed it
+				return cliAgentUsageMetric{
+					Kind: kind, Label: label, Unit: "%",
+					ObservedAt: observedAtRFC3339(b.ObservedAtMs), Unknown: true,
+				}
 			} else {
 				resetAt = time.UnixMilli(b.ResetsAtMs).UTC().Format(time.RFC3339)
 			}
 		}
 		used = clampPercent(used)
 		return cliAgentUsageMetric{
-			Kind:      kind,
-			Label:     label,
-			Unit:      "%",
-			Total:     floatPtr(100),
-			Consumed:  floatPtr(used),
-			Remaining: floatPtr(100 - used),
-			ResetAt:   resetAt,
+			Kind: kind, Label: label, Unit: "%",
+			Total: floatPtr(100), Consumed: floatPtr(used), Remaining: floatPtr(100 - used),
+			ResetAt: resetAt, ObservedAt: observedAtRFC3339(b.ObservedAtMs),
 		}
 	}
 	return cliAgentUsageMetric{Kind: kind, Label: label, Unit: "%", Unknown: true}
+}
+
+func observedAtRFC3339(ms int64) string {
+	if ms <= 0 {
+		return ""
+	}
+	return time.UnixMilli(ms).UTC().Format(time.RFC3339)
 }
