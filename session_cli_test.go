@@ -676,6 +676,42 @@ func TestBuildAntigravityInteractiveArgs_PassesThroughDiagnostics(t *testing.T) 
 			t.Errorf("shell-wrapped %q = %q, want it unchanged", orig, shaped[1])
 		}
 	}
+	// agy pre-scans its whole command line for --version / --help / -h ahead of
+	// Go's flag parsing, so they act from any position: on 1.1.12
+	// `agy --model gemini --help` and even `agy explain the --help flag please`
+	// print the usage banner, and `agy review -version` prints the version.
+	// Reshaping those would launch a model run the caller never asked for.
+	for _, in := range [][]string{
+		{"--model", "gemini", "--help"},
+		{"--model", "gemini", "--version"},
+		{"review", "--help"},
+		{"review", "-version"},
+		{"explain", "the", "--help", "flag", "please"},
+		{"review", "-h"},
+	} {
+		got := buildAntigravityInteractiveArgs(in)
+		if !reflect.DeepEqual(got, in) {
+			t.Errorf("buildAntigravityInteractiveArgs(%#v) = %#v, want it unchanged", in, got)
+		}
+		orig := "agy " + strings.Join(in, " ")
+		_, shaped := shapePTYExecArgs("bash", []string{"-c", orig})
+		if shaped[1] != orig {
+			t.Errorf("shell-wrapped %q = %q, want it unchanged", orig, shaped[1])
+		}
+	}
+	// `-v` is an ordinary int flag, so `agy review -v now` really is a prompt.
+	vPrompt := buildAntigravityInteractiveArgs([]string{"review", "-v", "now"})
+	wantV := []string{"--dangerously-skip-permissions", "--print", "review -v now"}
+	if !reflect.DeepEqual(vPrompt, wantV) {
+		t.Errorf("prompt containing -v = %#v, want %#v", vPrompt, wantV)
+	}
+	// A near-miss spelling is prompt text (`agy review --versions` runs it).
+	nearMiss := buildAntigravityInteractiveArgs([]string{"review", "--versions"})
+	wantNearMiss := []string{"--dangerously-skip-permissions", "--print", "review --versions"}
+	if !reflect.DeepEqual(nearMiss, wantNearMiss) {
+		t.Errorf("near-miss spelling = %#v, want %#v", nearMiss, wantNearMiss)
+	}
+
 	// Multi-token invocations stay prompts — a brief may open with such a word.
 	got := buildAntigravityInteractiveArgs([]string{"help", "me", "refactor"})
 	want := []string{"--dangerously-skip-permissions", "--print", "help me refactor"}

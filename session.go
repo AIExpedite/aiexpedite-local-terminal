@@ -1989,12 +1989,33 @@ var antigravityDiagnosticTokens = map[string]bool{
 	"update": true,
 }
 
-// isAntigravityDiagnosticInvocation reports a lone diagnostic token, in either
-// the bare or `flag=value` spelling. Only the single-token form counts: a brief
-// can legitimately start with a word like "help" or "update", and folding a
-// multi-word invocation into a prompt is the documented behaviour for
-// everything else.
+// antigravityGlobalDiagnosticTokens are handled wherever they appear in argv.
+// agy pre-scans its whole command line for these, ahead of Go's flag parsing:
+// on 1.1.12 `agy review --help` and even `agy explain the --help flag please`
+// print the usage banner, and `agy review -version` prints the version, instead
+// of running the prompt. Reshaping those into a --print value would launch a
+// permission-skipping model run the caller would never have got.
+//
+// `-v` is deliberately absent: it is an ordinary int flag, so `agy review -v
+// now` really does run the prompt.
+var antigravityGlobalDiagnosticTokens = map[string]bool{
+	"--version": true, "-version": true,
+	"--help": true, "-help": true, "-h": true,
+}
+
+// isAntigravityDiagnosticInvocation reports an invocation agy answers with
+// information instead of a model run.
+//
+// Two shapes: a global diagnostic flag anywhere in argv (see above), or a lone
+// diagnostic token in the bare or `flag=value` spelling. The lone-token rule
+// covers the bare subcommands and `-v`, which only act in the leading flag
+// region — a brief can legitimately start with a word like "help" or "update".
 func isAntigravityDiagnosticInvocation(args []string) bool {
+	for _, a := range args {
+		if antigravityGlobalDiagnosticTokens[a] {
+			return true
+		}
+	}
 	if len(args) != 1 {
 		return false
 	}

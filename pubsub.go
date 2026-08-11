@@ -2247,7 +2247,11 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 	}
 	// `agy --version` / `agy models` are diagnostics, not prompts — leave them
 	// exactly as the caller wrote them (see isAntigravityDiagnosticInvocation).
-	if len(words) == 2 && isAntigravityDiagnosticInvocation([]string{words[1].Value}) {
+	callerValues := make([]string, 0, len(words)-1)
+	for _, w := range words[1:] {
+		callerValues = append(callerValues, w.Value)
+	}
+	if isAntigravityDiagnosticInvocation(callerValues) {
 		return "", false
 	}
 	// A `--print` that runs out of argv leaves agy's string flag without a
@@ -2256,11 +2260,7 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 	// run. Same for an equals-form safety flag whose value is not a Go boolean:
 	// agy rejects `--continue=maybe` outright, so stripping it would run a
 	// prompt the caller never got.
-	callerTokens := make([]string, 0, len(words)-1)
-	for _, w := range words[1:] {
-		callerTokens = append(callerTokens, w.Value)
-	}
-	if barePrint, invalidBool := scanAntigravityCallerArgs(callerTokens); barePrint || invalidBool {
+	if barePrint, invalidBool := scanAntigravityCallerArgs(callerValues); barePrint || invalidBool {
 		return "", false
 	}
 	flags, promptFrags, trailing, hasPrompt, ok := partitionAntigravityCallerShellWords(words[1:], zshEquals)
