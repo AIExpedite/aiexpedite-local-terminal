@@ -3352,22 +3352,27 @@ func shellOptsEnablesBraceExpand() bool {
 // EXTENDED_GLOB` in .zshenv, `zsh -c 'printf "[%s]" foo#'` globs while
 // `zsh -f -c` prints a literal `foo#` (verified on zsh 5.9). Bash's --norc only
 // covers interactive rc files — $BASH_ENV still runs — so it does not count.
+// Like the other wrapper options this is last-wins: `zsh -f +f -c` re-enables
+// RCS, so .zshenv runs again and `agy foo#` glob-expands (verified on 5.9).
 func shellArgsSkipStartupFiles(command string, args []string) bool {
 	if shellCommandBase(command) != "zsh" {
 		return false
 	}
+	skips := false
 	for _, a := range args {
 		if a == "-c" {
-			return false
+			break
 		}
-		if a == "--no-rcs" {
-			return true
-		}
-		if isCompactShellOptionGroup(a) && a[0] == '-' && strings.ContainsRune(a[1:], 'f') {
-			return true
+		switch {
+		case a == "--no-rcs":
+			skips = true
+		case a == "--rcs":
+			skips = false
+		case isCompactShellOptionGroup(a) && strings.ContainsRune(a[1:], 'f'):
+			skips = a[0] == '-'
 		}
 	}
-	return false
+	return skips
 }
 
 // shellArgsDisableGlob reports whether the wrapper turned pathname generation

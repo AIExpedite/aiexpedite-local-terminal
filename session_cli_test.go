@@ -1743,6 +1743,15 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 			t.Errorf("zsh -f %q = %q, want %q", tc.orig, got[len(got)-1], tc.want)
 		}
 	}
+	// Last-wins here too: `-f +f` puts RCS back, so .zshenv can enable
+	// EXTENDED_GLOB again and `foo#` must keep declining (zsh 5.9 expands it).
+	for _, pre := range [][]string{{"-f", "+f"}, {"+f"}} {
+		args := append(append([]string{}, pre...), "-c", `agy foo#`)
+		got := shapeShellWrappedPTYArgs("zsh", args)
+		if got[len(got)-1] != `agy foo#` {
+			t.Errorf("zsh %v extended-glob was reshaped: got %q", pre, got[len(got)-1])
+		}
+	}
 	// Default zsh behaviour does not depend on startup files, so an unmatched
 	// `[` still declines even with -f.
 	zshDashFBracket := shapeShellWrappedPTYArgs("zsh", []string{"-f", "-c", `agy [draft`})
