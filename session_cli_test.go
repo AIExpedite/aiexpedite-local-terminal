@@ -549,6 +549,19 @@ func TestBuildAntigravityInteractiveArgs_StripsContinueEqualsForms(t *testing.T)
 	if strings.Contains(shaped[1], "-c=true") {
 		t.Errorf("shaped payload forwarded -c=true: %q", shaped[1])
 	}
+	// Stripping the word must not discard an expansion the shell already ran:
+	// bash gives `agy --continue="${x:=false}" "$x"` the prompt `false`, while
+	// dropping the flag leaves x unset and the prompt empty (stub-agy diff on
+	// 5.2.21). Those payloads decline rather than silently changing the prompt.
+	for _, orig := range []string{
+		`agy --continue="${x:=false}" "$x"`,
+		`agy -c="${x:=1}" "$x"`,
+	} {
+		_, expanding := shapePTYExecArgs("bash", []string{"-c", orig})
+		if expanding[1] != orig {
+			t.Errorf("stripped expanding flag was reshaped: got %q, want original %q", expanding[1], orig)
+		}
+	}
 }
 
 // Diagnostic invocations must reach agy untouched: `agy --version` prints the

@@ -2358,6 +2358,15 @@ func partitionAntigravityCallerShellWords(words []shellWord, zshEquals bool) (fl
 			// must be stripped here too or the cross-chat-contamination guard
 			// is bypassed.
 			if name == "--dangerously-skip-permissions" || name == "--continue" || name == "-c" {
+				// Dropping the word also drops whatever its value expanded to,
+				// and the shell had already evaluated it: bash runs
+				// `agy --continue="${x:=false}" "$x"` with the prompt `false`,
+				// while the stripped rebuild leaves x unset and the prompt empty
+				// (stub-agy diff on 5.2.21). Decline instead of silently
+				// changing the prompt.
+				if discardsExpandingPrint([]shellWord{words[i]}, zshEquals) {
+					return nil, nil, nil, false, false
+				}
 				i++
 				continue
 			}
@@ -2406,6 +2415,12 @@ func partitionAntigravityCallerShellWords(words []shellWord, zshEquals bool) (fl
 
 		if antigravityBoolFlags[a] {
 			if a == "--dangerously-skip-permissions" || a == "--continue" || a == "-c" {
+				// Same reasoning as the equals form: a quoted/expanding spelling
+				// of the flag word cannot be dropped without losing its
+				// evaluation.
+				if discardsExpandingPrint([]shellWord{words[i]}, zshEquals) {
+					return nil, nil, nil, false, false
+				}
 				i++
 				continue
 			}
