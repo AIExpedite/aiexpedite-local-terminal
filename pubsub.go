@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -2151,7 +2152,7 @@ func runTTYCommand(cfg *Config, cmd commandMsg) (string, error) {
 // (buildInteractiveCLIArgs) for a PTY-eligible agent, so a tty=true `execute`
 // request reaches the agent's non-interactive `--print` path rather than
 // launching the raw interactive TUI. Only antigravity (agy/antigravity) needs
-// shaping — `--print --dangerously-skip-permissions <prompt>`; other eligible
+// shaping — `--dangerously-skip-permissions --print <prompt>`; other eligible
 // commands pass through unchanged.
 //
 // Two eligible shapes are handled: a direct agy invocation (`agy fix this`),
@@ -2170,8 +2171,8 @@ func shapePTYExecArgs(command string, args []string) (string, []string) {
 
 // shapeShellWrappedPTYArgs applies antigravity one-shot shaping to a
 // shell-wrapped single-agent PTY payload (`bash -c "agy …"`), returning args
-// with the inner agy given `--print --dangerously-skip-permissions`. A DIRECT
-// agy/antigravity invocation is already shaped by its caller
+// with the inner agy given `--dangerously-skip-permissions --print <prompt>`.
+// A DIRECT agy/antigravity invocation is already shaped by its caller
 // (buildInteractiveCLIArgs on the session_start path, shapePTYExecArgs'
 // antigravity branch on the execute path), so this only rewrites the `-c`
 // payload of a shell wrapper and leaves everything else (including
@@ -2179,33 +2180,2513 @@ func shapePTYExecArgs(command string, args []string) (string, []string) {
 // cleared the payload of shell chaining, so its first token is the whole
 // program and the remainder is preserved verbatim as the literal prompt.
 func shapeShellWrappedPTYArgs(command string, args []string) []string {
-	if payload, ok := shellDashCPayload(command, args); ok {
-		if shaped, ok := shapeAntigravityShellPayload(payload); ok {
+	// Use the raw payload: the trimmed form drops the newline of a trailing
+	// backslash-newline and leaves a dangling `\` that bash would pass as an
+	// extra argument.
+	if payload, ok := shellDashCPayloadRaw(command, args); ok {
+		if shaped, ok := shapeAntigravityShellPayload(command, shellWrapperFlagsFor(command, args), payload); ok {
 			return replaceDashCPayload(args, shaped)
 		}
 	}
 	return args
 }
 
-// shapeAntigravityShellPayload rewrites a `bash -c` payload whose leading token
+// shapeAntigravityShellPayload rewrites a shell `-c` payload whose leading token
 // is agy/antigravity so the inner invocation gains the one-shot
-// `--print --dangerously-skip-permissions` shaping, returning the rewritten
-// payload and true. It returns ("", false) when the first token is not an
-// antigravity command. The flag list is sourced from buildAntigravityInteractiveArgs
-// so it cannot drift from the direct path. Only reached for payloads
-// isPTYEligibleCommand has cleared of shell chaining, so fields[0] is the whole
-// program and the remainder is preserved verbatim as the literal prompt.
-func shapeAntigravityShellPayload(payload string) (string, bool) {
-	fields := strings.Fields(payload)
-	if len(fields) == 0 || !isAntigravityCommand(fields[0]) {
+// `--dangerously-skip-permissions --print <prompt>` shaping, returning the
+// rewritten payload and true. It returns ("", false) when the first token is
+// not an antigravity command, or when the payload has unterminated shell
+// quotes (leave the original payload alone so bash reports the syntax error
+// rather than inventing a valid permission-skipping invocation).
+//
+// shellCmd is the wrapper executable (bash/dash/sh/…) so dialect-specific
+// expansions (brace expansion) are only rejected when that shell performs them.
+//
+// Tokenization strips protective quotes/escapes and tracks whether each word
+// contains unescaped `$` / “ ` “ (bash would expand them). Rebuild preserves
+// expansion per prompt fragment so `agy "$TASK"` still expands while
+// `agy '$(cmd)'` and `agy "\$(cmd)"` stay literal — never OR-ing expand across
+// mixed fragments into one double-quoted blob that reactivates substitutions.
+func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, payload string) (string, bool) {
+	posixMode, noBraceExpand, noGlob := wrapper.posix, wrapper.noBrace, wrapper.noGlob
+	// A startup file runs before the payload and its contents are invisible to
+	// us. POSIX mode suppresses the sourcing itself, so this stays false there.
+	startupFiles := shellRunsStartupFiles(shellCmd) && !posixMode
+	zshEquals := shellSupportsZshEquals(shellCmd)
+	words, err := shellWords(payload, shellWordOptions{
+		// A `+B` wrapper flag is only trustworthy when no startup file can undo
+		// it: with `set -B` in $BASH_ENV, `bash +B -c 'printf "[%s]" {a,b}'`
+		// prints `[a][b]` again (verified on 5.2.21). When the file is
+		// unreadable, keep brace expansion classified as active so the payload
+		// declines rather than freezing an expansion the shell would perform.
+		braceExpand: shellSupportsBraceExpansion(shellCmd) && !(noBraceExpand && !startupFiles),
+		// Same reasoning for `set -f` / `-o noglob`: a startup file can `set +f`
+		// and put globbing back (verified on 5.2.21), so only trust the wrapper
+		// flag when no such file can run.
+		noGlob:      noGlob && !startupFiles,
+		dollarQuote: shellSupportsDollarQuote(shellCmd),
+		// A startup file can go either way here — `set -o posix` in $BASH_ENV
+		// makes `bash -c 'printf "[%s]" HOME=~'` print a literal `HOME=~`, while
+		// a no-op $BASH_ENV leaves it expanding to $HOME (both verified on
+		// 5.2.21). Unknowable state resolves the same way as brace expansion and
+		// globbing: assume the shell expands and decline, rather than freezing a
+		// value the shell would have substituted.
+		assignTilde:       shellSupportsAssignTilde(shellCmd) && !posixMode,
+		colonTilde:        shellSupportsColonTildePrefix(shellCmd),
+		legacyArith:       shellSupportsLegacyArith(shellCmd),
+		pwdTilde:          shellSupportsPwdTilde(shellCmd),
+		failUnknownTilde:  shellFailsUnknownTildeLogin(shellCmd),
+		homeTildeNeedsEnv: shellBareTildeNeedsHome(shellCmd),
+		startupFiles:      startupFiles,
+		zshPatterns:       shellSupportsZshEquals(shellCmd),
+	})
+	if err != nil {
+		// Malformed shell (unterminated quote, etc.) — do not reshape into a
+		// runnable agy command.
 		return "", false
 	}
-	flags := strings.Join(buildAntigravityInteractiveArgs(nil), " ")
-	shaped := fields[0] + " " + flags
-	if rest := strings.TrimSpace(strings.TrimPrefix(payload, fields[0])); rest != "" {
-		shaped += " " + rest
+	if len(words) == 0 || !isAntigravityCommand(words[0].Value) {
+		return "", false
 	}
-	return shaped, true
+	// `agy --version` / `agy models` are diagnostics, not prompts — leave them
+	// exactly as the caller wrote them (see isAntigravityDiagnosticInvocation).
+	callerValues := make([]string, 0, len(words)-1)
+	for _, w := range words[1:] {
+		callerValues = append(callerValues, w.Value)
+	}
+	if isAntigravityDiagnosticInvocation(callerValues) {
+		return "", false
+	}
+	// A `--print` that runs out of argv leaves agy's string flag without a
+	// value, and the CLI exits with `flag needs an argument: -print`. Inventing
+	// an empty prompt would turn that error into a permission-skipping model
+	// run. Same for an equals-form safety flag whose value is not a Go boolean:
+	// agy rejects `--continue=maybe` outright, so stripping it would run a
+	// prompt the caller never got.
+	if barePrint, invalidBool, diagnostic := scanAntigravityCallerArgs(callerValues); barePrint || invalidBool || diagnostic {
+		return "", false
+	}
+	flags, promptFrags, trailing, hasPrompt, ok := partitionAntigravityCallerShellWords(words[1:], zshEquals)
+	if !ok {
+		return "", false
+	}
+	// Unquoted expansions cannot be rebuilt as double-quoted tokens without
+	// changing bash word-splitting / pathname-expansion / empty-expand semantics
+	// (e.g. `agy $OPTIONAL` with OPTIONAL='*.go' must glob; `agy --add-dir $ROOT
+	// task` with unset ROOT makes `task` the flag value). Leave those payloads
+	// unshaped. Double-quoted multi-field expansions (`"$@"`, `"${arr[@]}"`)
+	// also cannot ride inside one --print value (bash would re-split them into
+	// multiple argv tokens after --print). Single-field double-quoted forms
+	// (`"$TASK"`, `--add-dir "$ROOT"`) still reshape on bash — but NOT on zsh,
+	// where .zshenv can have declared any name an array (see
+	// hasQuotedZshNamedParamExpand).
+	checkWord := func(f shellWord) bool {
+		if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
+			return false
+		}
+		if zshEquals && (f.hasZshEqualsSub() || f.hasQuotedZshNamedParamExpand()) {
+			return false
+		}
+		return true
+	}
+	// The command word is rebuilt like every other token, so it has to satisfy
+	// the same rules. Unquoted expansions are the sharp case: `$BIN/agy` with
+	// BIN='/tmp/my dir' splits and fails in the original command, but quoting it
+	// on rebuild would resolve `/tmp/my dir/agy` and run it with
+	// --dangerously-skip-permissions (stub-agy diff on bash 5.2.21). Quoted
+	// expansions (`"$BIN"/agy`) do not split and still reshape.
+	if !checkWord(words[0]) {
+		return "", false
+	}
+	for _, f := range flags {
+		if !checkWord(f) {
+			return "", false
+		}
+	}
+	if hasPrompt {
+		for _, f := range promptFrags {
+			if !checkWord(f) {
+				return "", false
+			}
+		}
+	}
+	for _, f := range trailing {
+		if !checkWord(f) {
+			return "", false
+		}
+	}
+	parts := make([]string, 0, 2+len(flags)+2+len(trailing))
+	// The command word needs the same segment-aware quoting as everything else:
+	// emitting its raw value turns a quoted-literal path such as
+	// `/tmp/'$(touch marker)'/agy` into a live command substitution.
+	parts = append(parts, quoteShellWord(words[0]), "--dangerously-skip-permissions")
+	for _, f := range flags {
+		// Flag tokens (and their values) keep per-segment expand, e.g.
+		// --add-dir "$ROOT"'$(evil)' must not OR Expand across segments.
+		parts = append(parts, quoteShellWord(f))
+	}
+	if hasPrompt {
+		parts = append(parts, "--print", quoteAntigravityPrintFragments(promptFrags))
+	}
+	// Unknown tokens after an explicit --print (e.g. --PRINT) must stay on the
+	// command line so agy keeps its own positional/unknown-option behavior —
+	// same rule as partitionAntigravityCallerArgs / buildAntigravityInteractiveArgs.
+	for _, f := range trailing {
+		parts = append(parts, quoteShellWord(f))
+	}
+	return strings.Join(parts, " "), true
+}
+
+// partitionAntigravityCallerShellWords peels known leading agy flags off words
+// and returns prompt fragments (preserving per-word Expand and Segments).
+// Mirrors partitionAntigravityCallerArgs: an explicit --print / --print=value
+// consumes exactly one prompt value so trailing options like --conversation
+// stay flags; without --print, the remainder is the prompt. Tokens that remain
+// after an explicit print value (unknown options, positionals) are returned as
+// trailing so the reshaper can append them after --print.
+func partitionAntigravityCallerShellWords(words []shellWord, zshEquals bool) (flags, prompt, trailing []shellWord, hasPrompt, ok bool) {
+	i := 0
+	var printFrags []shellWord
+	gotPrint := false
+	// dangling holds a recognized valued flag that arrived without its operand
+	// (mirrors partitionAntigravityCallerArgs): it must stay behind the prompt
+	// so the rebuilt command cannot let it swallow --print.
+	var dangling []shellWord
+	// postFlags keeps flags that followed the explicit print value in place;
+	// hoisting them would reverse shell expansion order (see
+	// partitionAntigravityCallerArgs).
+	var postFlags []shellWord
+	addFlag := func(tokens ...shellWord) {
+		if gotPrint {
+			postFlags = append(postFlags, tokens...)
+			return
+		}
+		flags = append(flags, tokens...)
+	}
+	for i < len(words) {
+		a := canonicalAntigravityFlag(words[i].Value)
+		// `--` ends flag parsing and is dropped from the arguments, so the
+		// prompt starts after it (`agy -- review` has the prompt `review`).
+		if a == antigravityFlagTerminator {
+			// Dropped only when it starts the implicit prompt; after an explicit
+			// print value it must stay so the trailing positionals are not
+			// re-exposed to flag parsing.
+			if !gotPrint {
+				i++
+			}
+			break
+		}
+		// Exact lowercase CLI spellings only (same case-sensitive rule as
+		// partitionAntigravityCallerArgs). --PRINT is prompt text.
+
+		if name, _, ok := splitAntigravityEqualsFlag(a); ok {
+			name = canonicalAntigravityFlag(name)
+			if isAntigravityPrintFlag(name) {
+				// --print=value: peel value with segment metadata after '='.
+				// Continue so later recognized flags are not swallowed.
+				if discardsExpandingPrint(printFrags, zshEquals) ||
+					reordersAcrossPostFlags(postFlags, shellWordAfterEquals(words[i]), zshEquals) {
+					return nil, nil, nil, false, false
+				}
+				printFrags = []shellWord{shellWordAfterEquals(words[i])}
+				gotPrint = true
+				i++
+				continue
+			}
+			// `-c` is agy's documented short alias for --continue, and Go's
+			// flag package accepts `-c=true` for booleans, so the equals form
+			// must be stripped here too or the cross-chat-contamination guard
+			// is bypassed.
+			if name == "--dangerously-skip-permissions" || name == "--continue" || name == "-c" {
+				// Dropping the word also drops whatever its value expanded to,
+				// and the shell had already evaluated it: bash runs
+				// `agy --continue="${x:=false}" "$x"` with the prompt `false`,
+				// while the stripped rebuild leaves x unset and the prompt empty
+				// (stub-agy diff on 5.2.21). Decline instead of silently
+				// changing the prompt.
+				if discardsExpandingPrint([]shellWord{words[i]}, zshEquals) {
+					return nil, nil, nil, false, false
+				}
+				i++
+				continue
+			}
+			if antigravityValuedFlags[name] || antigravityBoolFlags[name] {
+				addFlag(words[i])
+				i++
+				continue
+			}
+			break
+		}
+
+		if isAntigravityPrintFlag(a) {
+			// Exactly one value token (or explicit empty when bare --print).
+			// A second explicit print discards the first value; that is fine for
+			// literals (agy also keeps the last one) but not when the discarded
+			// word expanded: the shell evaluated it left-to-right, so dropping
+			// `--print "${x:=review}"` from `agy --print "${x:=review}" --print
+			// "$x"` leaves x unset and the prompt empty (verified against bash
+			// 5.2.21 with a stub agy). Decline instead.
+			if discardsExpandingPrint(printFrags, zshEquals) {
+				return nil, nil, nil, false, false
+			}
+			// The final prompt is emitted before postFlags, so a print that
+			// arrives *after* a state-mutating flag operand would be evaluated
+			// too early: bash runs `agy --print first --add-dir "${x:=dir}"
+			// --print "$x"` with the prompt `dir`, while the rebuilt
+			// `--print "$x" --add-dir "${x:=dir}"` yields an empty prompt
+			// (stub-agy diff on 5.2.21). Decline when either side expands.
+			var next shellWord
+			if i+1 < len(words) {
+				next = words[i+1]
+			}
+			if reordersAcrossPostFlags(postFlags, next, zshEquals) {
+				return nil, nil, nil, false, false
+			}
+			i++
+			gotPrint = true
+			if i < len(words) {
+				printFrags = []shellWord{words[i]}
+				i++
+			} else {
+				printFrags = []shellWord{{Value: "", Expand: false}}
+			}
+			continue
+		}
+
+		if antigravityBoolFlags[a] {
+			if a == "--dangerously-skip-permissions" || a == "--continue" || a == "-c" {
+				// Same reasoning as the equals form: a quoted/expanding spelling
+				// of the flag word cannot be dropped without losing its
+				// evaluation.
+				if discardsExpandingPrint([]shellWord{words[i]}, zshEquals) {
+					return nil, nil, nil, false, false
+				}
+				i++
+				continue
+			}
+			addFlag(words[i])
+			i++
+			continue
+		}
+
+		if antigravityValuedFlags[a] {
+			if i+1 >= len(words) {
+				// Valued flag with no operand — keep it after the prompt so the
+				// rebuild cannot emit `--conversation --print <prompt>`.
+				dangling = append(dangling, words[i])
+				i++
+				continue
+			}
+			addFlag(words[i], words[i+1])
+			i += 2
+			continue
+		}
+
+		break
+	}
+	if gotPrint {
+		// Anything not recognized after an explicit print value must remain on
+		// the reshaped command (unknown options, positionals).
+		trailing := append([]shellWord{}, postFlags...)
+		trailing = append(trailing, words[i:]...)
+		return flags, printFrags, append(trailing, dangling...), true, true
+	}
+	if i < len(words) {
+		// An implicit prompt is folded into one --print value, so any expansion
+		// inside it is evaluated in a different argv position than the caller
+		// wrote. Two ways that changes behaviour, both verified on agy 1.1.12:
+		//
+		//   - flag position: with FLAG=--print, `agy "$FLAG" review` is really
+		//     `agy --print review` (prompt "review"), not the prompt
+		//     "--print review".
+		//   - anywhere at all: agy pre-scans its whole argv for --help /
+		//     --version, so with HELP=--help `agy review "$HELP"` prints the
+		//     usage banner, while the folded `--print "review --help"` runs the
+		//     prompt instead.
+		//
+		// The value is unknowable, so decline for any expanding fragment. An
+		// explicit `--print "$TASK"` stays shaped: it is already one argv token
+		// there, so the rebuild reproduces the caller's own layout.
+		for _, w := range words[i:] {
+			if discardsExpandingPrint([]shellWord{w}, zshEquals) {
+				return nil, nil, nil, false, false
+			}
+		}
+		return flags, words[i:], dangling, true, true
+	}
+	return flags, nil, dangling, false, true
+}
+
+// reordersAcrossPostFlags reports a later explicit print whose value would be
+// hoisted ahead of already-collected post-print flags, where the move could
+// change what the shell computes. Harmless when neither side expands.
+func reordersAcrossPostFlags(postFlags []shellWord, next shellWord, zshEquals bool) bool {
+	if len(postFlags) == 0 {
+		return false
+	}
+	return discardsExpandingPrint(postFlags, zshEquals) ||
+		discardsExpandingPrint([]shellWord{next}, zshEquals)
+}
+
+// discardsExpandingPrint reports whether replacing these already-collected
+// print fragments would throw away a shell expansion the original command had
+// already performed.
+func discardsExpandingPrint(frags []shellWord, zshEquals bool) bool {
+	for _, f := range frags {
+		if f.Expand {
+			return true
+		}
+		// zsh's default EQUALS lookup runs on a word-initial `=` even though no
+		// segment is marked expandable: `zsh -c 'agy --print =missing --print
+		// review'` aborts with `missing not found` before agy starts, so
+		// dropping that value would turn a shell error into a model run.
+		if zshEquals && f.hasZshEqualsSub() {
+			return true
+		}
+		for _, seg := range f.effectiveSegments() {
+			if seg.Expand {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// quoteAntigravityPrintFragments serializes one or more prompt tokens into a
+// single bash -c argument for --print. Expansion eligibility is retained per
+// quoted segment (within and across whitespace-delimited words): mixed
+// `"$TASK"'$(evil)'` rebuilds as adjacent quoted pieces so the single-quoted
+// substitution stays inert instead of OR-ing Expand into one double-quoted blob.
+// Multi-segment expand words also stay per-segment even when peers are plain
+// (`"$"'(touch …)' more` must not flatten into `"$(touch …) more"`).
+func quoteAntigravityPrintFragments(frags []shellWord) string {
+	if len(frags) == 0 {
+		return `""`
+	}
+	if len(frags) == 1 {
+		return quoteShellWord(frags[0])
+	}
+
+	anyExpand := false
+	needsPerWord := false
+	vals := make([]string, len(frags))
+	for i, f := range frags {
+		vals[i] = f.Value
+		segs := mergeAdjacentShellSegments(f.effectiveSegments())
+		segExpandCount := 0
+		for _, seg := range segs {
+			if seg.Expand {
+				anyExpand = true
+				segExpandCount++
+			} else if strings.ContainsAny(seg.Value, "$`") {
+				// Literal segment still carries $ / ` — cannot double-quote a
+				// joined blob with expanding peers.
+				needsPerWord = true
+			}
+		}
+		// Multiple segments with any expand: quote boundaries are lexical for
+		// `$` / `$(…)` / `$name` — never flatten this word into a joined blob.
+		if len(segs) > 1 && segExpandCount > 0 {
+			needsPerWord = true
+		}
+	}
+	// All-literal (including single-quoted $(...) segments): join + single-quote.
+	// Pure single-seg expanding (or plain text with expand peers): join + one
+	// quote pass. Mixed / multi-seg expand: per-word quoteShellWord.
+	if !anyExpand || !needsPerWord {
+		return quoteAntigravityShellArg(strings.Join(vals, " "), anyExpand)
+	}
+
+	// Per-word quoting with " " between words; each word may further split
+	// into per-segment adjacent quotes.
+	var b strings.Builder
+	for i, f := range frags {
+		if i > 0 {
+			b.WriteString(`" "`)
+		}
+		b.WriteString(quoteShellWord(f))
+	}
+	return b.String()
+}
+
+// quoteShellWord serializes one shell word. When the word is built from
+// concatenated quote segments with mixed expand (e.g. `"$TASK"'$(evil)'` or
+// `"$"'(touch …)'`), each segment is quoted independently and juxtaposed so
+// bash re-joins them into one argv token without gluing an expandable `$`
+// onto a following literal to form `$(…)`, `${…}`, or `$name…`.
+// Multiple Expand segments are also quoted separately: `"$""${TASK}"` must
+// stay `"$""${TASK}"`, not `"$${TASK}"` (which would expand `$$` as PID).
+func quoteShellWord(w shellWord) string {
+	segs := mergeAdjacentShellSegments(w.effectiveSegments())
+	if len(segs) <= 1 {
+		return quoteAntigravityShellArg(w.Value, w.Expand)
+	}
+	anyExpand := false
+	for _, seg := range segs {
+		if seg.Expand {
+			anyExpand = true
+			break
+		}
+	}
+	// Pure-literal multi-seg: one single-quote pass on the joined value.
+	// Any expand (pure multi-seg expand or mixed): always per-segment so
+	// quote boundaries that split `$` / `${…}` / `$(…)` stay intact.
+	if !anyExpand {
+		return quoteAntigravityShellArg(w.Value, false)
+	}
+	var b strings.Builder
+	for _, seg := range segs {
+		b.WriteString(quoteAntigravityShellArg(seg.Value, seg.Expand))
+	}
+	return b.String()
+}
+
+// mergeAdjacentShellSegments joins consecutive *literal* segments that share
+// the same Unquoted flag so rebuild quoting stays compact
+// (`$`+`(cmd)` escaped literals → one single-quoted blob). Expandable
+// segments are never merged: their quote-region boundaries are lexical for
+// `$` / ` (` (`"$""${TASK}"` must not become "$${TASK}").
+func mergeAdjacentShellSegments(segs []shellSegment) []shellSegment {
+	if len(segs) <= 1 {
+		return segs
+	}
+	out := make([]shellSegment, 0, len(segs))
+	cur := segs[0]
+	for i := 1; i < len(segs); i++ {
+		// Only glue pure-literal neighbours. Expandable regions keep their
+		// original segment splits from the tokenizer.
+		if !cur.Expand && !segs[i].Expand && segs[i].Unquoted == cur.Unquoted {
+			cur.Value += segs[i].Value
+			continue
+		}
+		out = append(out, cur)
+		cur = segs[i]
+	}
+	out = append(out, cur)
+	return out
+}
+
+// shellWordAfterEquals returns the portion of w after the first '=' as a new
+// shellWord, preserving segment Expand and Unquoted metadata for the value
+// region. Used for --print=value forms so concatenated quote segments and
+// dialect checks (e.g. zsh EQUALS on a peeled `=ls` value) survive the peel.
+func shellWordAfterEquals(w shellWord) shellWord {
+	eq := strings.IndexByte(w.Value, '=')
+	if eq < 0 {
+		return w
+	}
+	skip := eq + 1
+	val := w.Value[skip:]
+	segs := sliceShellSegmentsAfter(w.effectiveSegments(), skip)
+	anyExpand := false
+	for _, seg := range segs {
+		if seg.Expand {
+			anyExpand = true
+		}
+	}
+	return shellWord{Value: val, Expand: anyExpand, Segments: segs}
+}
+
+// sliceShellSegmentsAfter drops the first skip bytes of the concatenated
+// segment stream, splitting a boundary segment if needed. Expand and Unquoted
+// are copied onto the residual slice so hasZshEqualsSub / expand checks still
+// see the original quote context (e.g. unquoted `=ls` from `--print==ls`).
+func sliceShellSegmentsAfter(segs []shellSegment, skip int) []shellSegment {
+	if skip <= 0 {
+		return segs
+	}
+	var out []shellSegment
+	seen := 0
+	for _, seg := range segs {
+		if seen+len(seg.Value) <= skip {
+			seen += len(seg.Value)
+			continue
+		}
+		if seen < skip {
+			out = append(out, shellSegment{
+				Value:    seg.Value[skip-seen:],
+				Expand:   seg.Expand,
+				Unquoted: seg.Unquoted,
+			})
+			seen = skip
+			continue
+		}
+		out = append(out, seg)
+	}
+	return out
+}
+
+// shellSegment is one quote/unquoted region within a shellWord. Concatenated
+// forms like `"$TASK"'$(cmd)'` are one word with two segments so rebuild can
+// keep each region's expansion semantics.
+type shellSegment struct {
+	Value  string
+	Expand bool
+	// Unquoted is true when this segment was written outside quotes. Combined
+	// with Expand, that means bash applies word-splitting and pathname
+	// expansion to the result — semantics a double-quoted rebuild would lose.
+	Unquoted bool
+}
+
+// shellWord is one whitespace-delimited token from shellWords. Value is the
+// joined semantic text (quotes/escapes stripped). Expand is true when any
+// segment contains unescaped `$` / “ ` “ from an unquoted or double-quoted
+// context. Segments retain per-region expand so mixed concatenation stays safe.
+type shellWord struct {
+	Value    string
+	Expand   bool
+	Segments []shellSegment
+}
+
+// effectiveSegments returns Segments, or a single synthetic segment when the
+// word was built without segment tracking (defensive).
+func (w shellWord) effectiveSegments() []shellSegment {
+	if len(w.Segments) > 0 {
+		return w.Segments
+	}
+	return []shellSegment{{Value: w.Value, Expand: w.Expand}}
+}
+
+// hasUnquotedExpand reports whether any segment carries an unescaped `$` / `
+// written outside quotes (IFS word-split / pathname expansion apply).
+func (w shellWord) hasUnquotedExpand() bool {
+	for _, seg := range w.effectiveSegments() {
+		if seg.Expand && seg.Unquoted {
+			return true
+		}
+	}
+	return false
+}
+
+// hasQuotedMultiWordExpand reports double-quoted expansions that still yield
+// multiple fields (`"$@"`, `"${name[@]}"`, `"${!name[@]}"`, …). Putting those
+// inside a single rebuilt --print "…" leaves only the first field as the flag
+// value and spills the rest as positional args — decline reshape instead.
+// Unquoted multi-field forms are already covered by hasUnquotedExpand.
+func (w shellWord) hasQuotedMultiWordExpand() bool {
+	for _, seg := range w.effectiveSegments() {
+		if !seg.Expand || seg.Unquoted {
+			continue
+		}
+		if shellExpandIsMultiWord(seg.Value) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasExpandWithBackslash reports expandable segments that contain a backslash
+// inside expansion grammar — parameter expansions ("${x%\}}" pattern escapes)
+// as well as command / arithmetic / backtick substitutions
+// ("$(printf '\141')").
+// quoteAntigravityShellArg with allowExpand doubles every `\` for double-quote
+// safety, which changes PE meaning (`${x%\}}` → `${x%\\}}`). Decline reshape
+// rather than rewrite expansion syntax.
+//
+// Literal backslashes outside `${…}` (e.g. "$ROOT\docs") are safe: doubling
+// `\` in double quotes still yields one literal backslash for non-special
+// followers, so those prompts still reshape.
+func (w shellWord) hasExpandWithBackslash() bool {
+	for _, seg := range w.effectiveSegments() {
+		if seg.Expand && shellExpandHasParamBackslash(seg.Value) {
+			return true
+		}
+	}
+	return false
+}
+
+// shellExpandHasParamBackslash reports whether s contains a `\` inside any
+// balanced `${…}` body, `$(…)` / `$((…))` substitution, or backtick
+// substitution — every construct whose body is code the shell re-parses, where
+// the double-quote-safe doubling of `\` would change its meaning.
+//
+// `${x%\}}` would become `${x%\\}}` (different PE pattern), and
+// `"$(printf '\141')"` would become `"$(printf '\\141')"`, which supplies the
+// literal `\141` instead of `a` (verified against bash 5.2.21 with a stub agy).
+// Literal backslashes outside these bodies (e.g. "$ROOT\docs") stay safe:
+// doubling `\` inside double quotes still yields one literal backslash for
+// non-special followers, so those prompts keep reshaping.
+func shellExpandHasParamBackslash(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch {
+		case s[i] == '`':
+			// Backtick substitution: body runs to the next unescaped backtick.
+			for j := i + 1; j < len(s); j++ {
+				if s[j] == '\\' {
+					return true
+				}
+				if s[j] == '`' {
+					i = j
+					break
+				}
+			}
+		case s[i] == '$' && i+1 < len(s) && s[i+1] == '(':
+			close := shellSubstCloseParen(s, i+1)
+			if close < 0 {
+				// Unbalanced `$(` — any trailing `\` is still body material.
+				return strings.Contains(s[i+2:], `\`)
+			}
+			if strings.Contains(s[i+2:close], `\`) {
+				return true
+			}
+			i = close
+		case s[i] == '$' && i+1 < len(s) && s[i+1] == '{':
+			close := shellParamCloseBrace(s, i+2)
+			if close < 0 {
+				// Unmatched `${` — any trailing `\` is still PE-body material.
+				return strings.Contains(s[i+2:], `\`)
+			}
+			if strings.Contains(s[i+2:close], `\`) {
+				return true
+			}
+			i = close
+		}
+	}
+	return false
+}
+
+// hasZshEqualsSub reports an unquoted word-initial `=` command equals
+// substitution (`=ls` → /bin/ls under zsh EQUALS). Rebuilding as a single-quoted
+// --print value freezes the `=` and changes the prompt; callers must decline
+// reshape on zsh when this is set.
+//
+// Classification uses segment Unquoted, not the stripped Value alone:
+//   - `\=ls` — tokenizer writes the escaped `=` with wasEscaped (Unquoted=false),
+//     so this is literal even though Value is "=ls".
+//   - `"=ls"` / `'=ls'` — quoted leading `=` (Unquoted=false) is literal.
+//   - `”=ls` / `""=ls` — empty leading quotes contribute no bytes; the unquoted
+//     `=` that follows is still word-initial EQUALS after quote removal.
+func (w shellWord) hasZshEqualsSub() bool {
+	if len(w.Value) < 2 || w.Value[0] != '=' {
+		return false
+	}
+	// Locate the segment that contributes the leading '=' of the joined value.
+	// Skip empty segments from '' / "" so ''=ls is still word-initial EQUALS.
+	for _, seg := range w.effectiveSegments() {
+		if len(seg.Value) == 0 {
+			continue
+		}
+		// First non-empty segment owns the first byte of w.Value.
+		return seg.Unquoted && seg.Value[0] == '='
+	}
+	return false
+}
+
+// hasQuotedZshNamedParamExpand reports double-quoted expansions that reference
+// a zsh parameter *by name* (`"$TASK"`, `"${path}"`, `"${(U)TASK}"`, …).
+//
+// zsh sources `.zshenv` on every invocation — including non-interactive
+// `zsh -c` — so any name may have been declared an array (`TASK=(fix bug)`)
+// before our payload runs, on top of the built-in arrays (`argv`, `path`, …).
+// Nothing in the payload proves a name is scalar, and an array riding inside
+// one rebuilt `--print "…"` value spills its trailing elements into argv
+// (`--print fix bug` → prompt "fix" plus a stray positional "bug"). So decline
+// the reshape for every named reference and run the caller's command verbatim.
+//
+// Provably single-field forms still reshape: `$(cmd)` / `$((expr))`
+// substitutions, `${#name}` counts, and positional / non-name specials
+// (`$1`, `${1}`, `$?`, `$*`, …). Unquoted expansions are already covered by
+// hasUnquotedExpand; this is zsh-only (callers gate on shellSupportsZshEquals),
+// so bash payloads like `agy "$TASK"` keep their --print shaping.
+func (w shellWord) hasQuotedZshNamedParamExpand() bool {
+	for _, seg := range w.effectiveSegments() {
+		if !seg.Expand || seg.Unquoted {
+			continue
+		}
+		if shellExpandHasZshNamedParam(seg.Value) {
+			return true
+		}
+	}
+	return false
+}
+
+// shellExpandIsMultiWord reports whether s contains a bash/zsh expansion that
+// produces multiple fields even when double-quoted: $@ / ${@…} / ${name[@]…}
+// and zsh ${(s…)/(@)/f/z…} parameter flags. Nested ${…} bodies are extracted
+// with balanced braces so "${x:-${@:1}}" is classified as multi-word (not
+// truncated at the inner }).
+//
+// Ordinary zsh array params (`$argv`, `$path`, …) are handled separately by
+// shellExpandHasZshOrdinaryArray so bash `$path` scalars still reshape.
+func shellExpandIsMultiWord(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '$' || i+1 >= len(s) {
+			continue
+		}
+		next := s[i+1]
+		if next == '@' {
+			return true
+		}
+		if next != '{' {
+			continue
+		}
+		close := shellParamCloseBrace(s, i+2)
+		if close < 0 {
+			continue
+		}
+		if shellParamBodyIsMultiWord(s[i+2 : close]) {
+			return true
+		}
+		i = close // continue after the matched '}'
+	}
+	return false
+}
+
+// shellExpandHasZshNamedParam reports whether s references a zsh parameter by
+// name — the forms that cannot be proven scalar because `.zshenv` may have
+// declared the name an array. `$(cmd)` / `$((expr))` bodies are skipped: they
+// are one field when double-quoted no matter what they reference internally.
+func shellExpandHasZshNamedParam(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '$' || i+1 >= len(s) {
+			continue
+		}
+		next := s[i+1]
+		switch {
+		case next == '(':
+			// $(cmd) and $((expr)) — skip the balanced body.
+			close := shellSubstCloseParen(s, i+1)
+			if close < 0 {
+				// Unbalanced substitution — decline rather than guess.
+				return true
+			}
+			i = close
+		case next == '{':
+			close := shellParamCloseBrace(s, i+2)
+			if close < 0 {
+				return true
+			}
+			if shellParamBodyHasName(s[i+2 : close]) {
+				return true
+			}
+			i = close
+		case isShellNameStartByte(next):
+			// Unbraced $name / $name[…] / $name:… .
+			return true
+		}
+	}
+	return false
+}
+
+// shellParamBodyHasName reports whether a ${…} body (without braces) references
+// a parameter by name, as opposed to a positional / special parameter or a
+// length-count form.
+//
+// The parameter slot is parsed on its own so a literal operator operand does
+// not count as a name: `${1:-review}` references the positional `1` with a
+// one-field literal default and still reshapes, while `${1:-$TASK}` does not
+// (the operand's own expansion is inspected recursively). PE flags (`(U)`) and
+// the `=`/`^`/`!` markers are peeled first; anything still starting with a name
+// character — including subscripted `name[…]` — is a name. `${#…}` is exempt:
+// a length / element count is always a single field.
+func shellParamBodyHasName(body string) bool {
+	if body == "" || body[0] == '#' {
+		return false
+	}
+	// ${(flags)name…}
+	if body[0] == '(' {
+		if _, rest, ok := splitZshPEFlagPrefix(body); ok {
+			body = rest
+			if body == "" {
+				return false
+			}
+		}
+	}
+	// ${=name} / ${^name} / ${==name} shorthands.
+	for len(body) > 0 && (body[0] == '=' || body[0] == '^') {
+		body = body[1:]
+	}
+	if body == "" {
+		return false
+	}
+	// Indirect ${!name} resolves to a parameter we cannot see — never provable.
+	if body[0] == '!' {
+		return true
+	}
+	if isShellNameStartByte(body[0]) {
+		return true
+	}
+	// Positional (`1`, `12`) or special (`*`, `@`, `?`, `$`, `-`, …) slot: skip
+	// it, then inspect the operator remainder for nested expansions only.
+	i := 0
+	for i < len(body) && body[i] >= '0' && body[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		i = 1 // single-byte special parameter
+	}
+	return shellExpandHasZshNamedParam(body[i:])
+}
+
+// shellSubstCloseParen returns the index of the ')' that balances the '(' at
+// openIdx (so `$((expr))` closes on its outer paren), or -1 when unmatched.
+func shellSubstCloseParen(s string, openIdx int) int {
+	depth := 0
+	for i := openIdx; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// shellParamCloseBrace returns the index of the closing '}' for a ${…} body
+// starting at bodyStart (first byte after '{'), or -1 if unmatched. Only nested
+// `${…}` raises the depth: bash closes a PE at the first `}` even when the
+// operand holds literal braces (`"${x:-a{b}c}"` → `a{bc}`).
+func shellParamCloseBrace(s string, bodyStart int) int {
+	depth := 1
+	for j := bodyStart; j < len(s); j++ {
+		switch s[j] {
+		case '{':
+			if j > 0 && s[j-1] == '$' {
+				depth++
+			}
+		case '}':
+			depth--
+			if depth == 0 {
+				return j
+			}
+		}
+	}
+	return -1
+}
+
+// shellParamBodyIsMultiWord reports whether a ${…} body (without braces) is a
+// multi-field expansion: @ with optional operators, name[@] / !name[@],
+// prefix-name expansion ${!prefix@}, zsh ${(flags)…} split/array flags, or a
+// nested multi-field form in an operator value (${x:+$@}, ${x:-${a[@]}}, …).
+//
+// Literal text in operator words that merely contains the substring "[@]"
+// (e.g. ${x:-foo[@]}) is NOT multi-field — only a structural array subscript
+// on the parameter (or nested ${…[@]…} / $@ in the operand) is.
+func shellParamBodyIsMultiWord(body string) bool {
+	if body == "" {
+		return false
+	}
+	// Zsh ${(flags)param}: a leading parenthesized flag list. Split/array
+	// flags still yield multiple fields when double-quoted
+	// (`"${(s.:.)TASK}"` → fix bug; `"${(@)arr}"` → separate elements).
+	// Single-field flags ((U), (L), (j:…:), …) are stripped so the name is
+	// classified normally.
+	if body[0] == '(' {
+		if flags, rest, ok := splitZshPEFlagPrefix(body); ok {
+			if zshPEFlagsAreMultiWord(flags) {
+				return true
+			}
+			body = rest
+			if body == "" {
+				return false
+			}
+		}
+	}
+	// Zsh ${=spec} / ${==spec} SH_WORD_SPLIT and ${^spec} RC_EXPAND_PARAM
+	// shorthands are multi-field even inside double quotes.
+	if body[0] == '=' || body[0] == '^' {
+		return true
+	}
+	hadBang := false
+	// Indirect / nameref / prefix-name forms start with '!': ${!name[@]},
+	// ${!prefix@}. Strip one leading '!' then classify the remainder.
+	if body[0] == '!' {
+		hadBang = true
+		body = body[1:]
+		if body == "" {
+			return false
+		}
+	}
+	if body[0] == '@' {
+		// ${@}, ${@:1}, ${@#pat}, …
+		return true
+	}
+
+	// Parse the parameter name / special, then optional [subscript].
+	i := 0
+	switch {
+	case body[0] >= '0' && body[0] <= '9':
+		for i < len(body) && body[i] >= '0' && body[i] <= '9' {
+			i++
+		}
+	case (body[0] >= 'a' && body[0] <= 'z') || (body[0] >= 'A' && body[0] <= 'Z') || body[0] == '_':
+		for i < len(body) && (isShellNameByte(body[i])) {
+			i++
+		}
+	case body[0] == '*':
+		// ${*} / ${*:…} — single field when double-quoted.
+		i = 1
+	default:
+		// Other specials (# ? $ ! - _) or unparseable: only nested $ expansions
+		// in the remainder can be multi-field.
+		return shellExpandIsMultiWord(body)
+	}
+
+	if i < len(body) && body[i] == '[' {
+		// Find matching ']' (subscripts are rarely nested; scan for first ]).
+		if close := strings.IndexByte(body[i+1:], ']'); close >= 0 {
+			sub := body[i+1 : i+1+close]
+			if sub == "@" {
+				// name[@], name[@]:offset, !name[@], …
+				return true
+			}
+			i = i + 1 + close + 1
+		}
+	}
+
+	// Prefix-name expansion ${!prefix@} (quoted) yields multiple matching
+	// names. After stripping '!' and parsing name, a bare trailing '@' (not
+	// inside [...]) is the prefix form — not bare indirect ${!name}.
+	if hadBang && i < len(body) && body[i] == '@' {
+		return true
+	}
+
+	// Bare / operator indirect ${!name}, ${!name:…}, ${!prefix*}: the
+	// referent is unknown statically. When it is @ / * / an array
+	// (`ref=@; "${!ref}"` → fix bug), double-quoted expansion is multi-field
+	// and must not ride inside one --print value. Decline all remaining
+	// indirect forms rather than assume a scalar.
+	if hadBang {
+		return true
+	}
+
+	// Operator / remainder text: recurse only for nested $ expansions so
+	// literal operator defaults like foo[@] stay single-field.
+	if i < len(body) {
+		return shellExpandIsMultiWord(body[i:])
+	}
+	return false
+}
+
+// splitZshPEFlagPrefix peels a leading zsh ${(flags)…} flag list off a ${…}
+// body. body must start with '('. Returns the flags (without parens), the
+// remainder after the closing ')', and true when a balanced list is found.
+func splitZshPEFlagPrefix(body string) (flags, rest string, ok bool) {
+	if body == "" || body[0] != '(' {
+		return "", body, false
+	}
+	depth := 0
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return body[1:i], body[i+1:], true
+			}
+		}
+	}
+	return "", body, false
+}
+
+// zshPEFlagsAreMultiWord reports zsh parameter-expansion flags that still
+// produce multiple fields when the expansion is double-quoted.
+//
+//	@     — array elements as separate words ("${(@)a}")
+//	=     — documented as forcing SH_WORD_SPLIT rules. zsh 5.9 actually rejects
+//	        a parenthesized `=` outright ("error in flags near position 4"),
+//	        which aborts the command before agy runs — so either reading
+//	        diverges from a frozen --print value and must decline.
+//	s/S   — split on a string ("${(s.:.)TASK}")
+//	f/F   — split on newlines
+//	z/Z   — shell-word split
+//	0     — split on NUL
+//	P     — indirection: expands the parameter *named* by the value, which we
+//	        cannot resolve statically. An array referent joins inside double
+//	        quotes ("${(P)1}" with 1=arr gives one field), but a referent of
+//	        `@` / `name[@]` re-splits: `zsh script @ fix bug` yields three
+//	        fields on 5.9. Same treatment as bash's indirect ${!name}.
+//
+// Join (j) and case (U/L) flags stay single-field.
+func zshPEFlagsAreMultiWord(flags string) bool {
+	i := 0
+	for i < len(flags) {
+		c := flags[i]
+		switch c {
+		case '@', '=', 'P', 's', 'S', 'f', 'F', 'z', 'Z', '0':
+			return true
+		case ':':
+			// Orphan :arg: payload — skip to its closer.
+			i++
+			for i < len(flags) && flags[i] != ':' {
+				i++
+			}
+			if i < len(flags) {
+				i++
+			}
+		default:
+			i++
+			// Flag argument form letter:arg: (e.g. j:/: join — single-field).
+			if i < len(flags) && flags[i] == ':' {
+				i++
+				for i < len(flags) && flags[i] != ':' {
+					i++
+				}
+				if i < len(flags) {
+					i++
+				}
+			}
+		}
+	}
+	return false
+}
+
+// isShellNameStartByte reports a valid first character of a shell variable
+// name (digits are positional parameters, not names).
+func isShellNameStartByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+// isShellNameByte reports a valid character inside a bash variable name.
+func isShellNameByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// shellWords splits a shell-style command line into argument values, applying
+// a POSIX-ish subset of quote and backslash rules (single quotes, double
+// quotes, and backslash escapes outside single quotes). Enough for the
+// operator-joined `bash -c "agy …"` payloads we reshape — not a full shell.
+//
+// shellWordOptions controls dialect-sensitive tokenization rules.
+type shellWordOptions struct {
+	// braceExpand is true when the wrapper shell performs brace expansion
+	// (bash/zsh/ksh). POSIX sh/dash leave braces literal.
+	braceExpand bool
+	// dollarQuote is true when the wrapper supports ANSI-C ($'…') / locale
+	// ($"…") quoting (bash/zsh/ksh). POSIX sh/dash treat $'…' as a literal
+	// dollar concatenated with a quoted string.
+	dollarQuote bool
+	// assignTilde is true when the wrapper expands ~ after unquoted
+	// assignment `=` / `:` (bash/zsh/ksh: HOME=~, PATH=/bin:~/x). POSIX
+	// dash/ash leave those forms literal; word-initial ~/x still expands
+	// on all shells and is gated separately.
+	assignTilde bool
+	// colonTilde is true when an unquoted ':' ends a word-initial tilde-prefix
+	// (`agy ~:x` → `$HOME:x`). True on the bash family including bash-as-sh;
+	// dash keeps the ':' in the login name.
+	colonTilde bool
+	// legacyArith is true when the wrapper evaluates bash-style `$[…]`
+	// arithmetic. Dash/ash leave `$[…]` as literal `$` + text; treating `[`
+	// as expansion there declines reshape and leaves interactive agy waiting.
+	legacyArith bool
+	// noGlob is true when the wrapper disabled pathname generation (`bash -f`,
+	// `-o noglob`), so `*`, `?` and `[…]` are ordinary literals.
+	noGlob bool
+	// zshPatterns is true for zsh wrappers, whose pattern rules are stricter
+	// than bash's: `.zshenv` may `setopt EXTENDED_GLOB` (turning unquoted `#`,
+	// `^` and mid-word `~` into pathname-generation operators), and an
+	// unmatched `[` is a fatal `bad pattern` error rather than literal text.
+	zshPatterns bool
+	// startupFiles is true when the wrapper may source a startup file before
+	// running the payload (zsh always reads .zshenv; bash reads $BASH_ENV for
+	// non-interactive shells). Such a file can define variables this process
+	// cannot see — notably OLDPWD, which decides whether `~-` expands.
+	startupFiles bool
+	// pwdTilde is true when the wrapper expands word-initial `~+` / `~-`
+	// (PWD/OLDPWD). Bash/zsh/ksh do; dash/ash leave them literal.
+	pwdTilde bool
+	// failUnknownTilde is true when an unknown `~user` is a shell error
+	// (zsh) rather than a literal word (bash/dash). Decline reshape so the
+	// wrapper still fails instead of launching agy with a frozen name.
+	failUnknownTilde bool
+	// homeTildeNeedsEnv is true for dash-family shells, which leave bare ~
+	// literal when HOME is unset or empty. Bash can fall back to passwd data.
+	homeTildeNeedsEnv bool
+}
+
+// shellBareTildeNeedsHome reports whether bare ~ expansion depends on HOME.
+// Dash-family shells do not use the passwd-database fallback that bash uses.
+func shellBareTildeNeedsHome(command string) bool {
+	base := shellCommandBase(command)
+	switch base {
+	case "dash", "ash", "busybox":
+		return true
+	case "sh":
+		return !shellShIsBashFamily(command)
+	default:
+		return false
+	}
+}
+
+// shellSupportsBraceExpansion reports whether the named shell executable
+// performs brace expansion on unquoted `{a,b}` / `file{1,2}` forms.
+// Explicit dash/ash/busybox leave braces literal. Bare `sh` is ambiguous
+// (/bin/sh may be bash — which still brace-expands when invoked as sh — or
+// dash), so we resolve like dollar-quote: bash-family or unknown → true
+// (decline reshape) rather than freezing `file{1,2}` as a literal prompt.
+func shellSupportsBraceExpansion(command string) bool {
+	base := shellCommandBase(command)
+	switch base {
+	case "dash", "ash", "busybox":
+		return false
+	case "sh":
+		return shellShIsBashFamily(command)
+	default:
+		// bash, zsh, ksh, and unknown → assume brace expansion exists.
+		return true
+	}
+}
+
+// shellSupportsAssignTilde reports whether the named shell expands ~ in
+// assignment-like positions (HOME=~, PATH=/bin:~/x). Bash/zsh/ksh do; dash/ash
+// pass those forms literally. Word-initial ~/x is POSIX and is handled
+// elsewhere.
+//
+// `sh` is POSIX regardless of the implementation behind it: assignment-word
+// tilde expansion on ordinary arguments is a bash extension disabled in POSIX
+// mode, so bash-backed `sh` passes `HOME=~` literally (verified on bash 5.2.21
+// via both a `sh` symlink and `bash --posix`). Treating it as bash-family would
+// decline the reshape and leave agy waiting in the TUI.
+func shellSupportsAssignTilde(command string) bool {
+	switch shellCommandBase(command) {
+	case "dash", "ash", "busybox", "sh":
+		return false
+	default:
+		return true
+	}
+}
+
+// shellForcesPosixMode reports whether the bash wrapper starts in POSIX mode,
+// which disables the bash extensions this reshaper cares about: assignment-word
+// tilde expansion and $BASH_ENV sourcing (both verified on bash 5.2.21).
+//
+// Three activation paths, all confirmed to leave `HOME=~` literal:
+//   - argv before the `-c` payload: `bash --posix -c`, `bash -o posix -c`
+//     (flags after `-c` belong to the payload's own argv, not the wrapper).
+//   - $POSIXLY_CORRECT in the inherited environment.
+//   - an inherited $SHELLOPTS listing `posix`.
+//
+// Only bash reads these; `sh` is already POSIX and other shells ignore them.
+func shellForcesPosixMode(command string, args []string) bool {
+	switch shellCommandBase(command) {
+	case "bash", "sh":
+	default:
+		return false
+	}
+	// Options apply left to right, so the last one wins: `bash -o posix +o posix
+	// -c` is NOT posix (5.2.21 prints `[HOME=/tmp]` for that wrapper).
+	argvPosix := false
+	for i, a := range args {
+		if a == "-c" {
+			break
+		}
+		switch {
+		case a == "--posix":
+			argvPosix = true
+		case (a == "-o" || a == "+o") && i+1 < len(args) && args[i+1] == "posix":
+			argvPosix = a == "-o"
+		}
+	}
+	if argvPosix {
+		return true
+	}
+	// Env-activated POSIX mode is not cancelled by a `+o posix` wrapper flag:
+	// `POSIXLY_CORRECT=1 bash +o posix -c 'printf "[%s]" HOME=~'` still prints a
+	// literal `HOME=~`, so this check stays independent of the argv state.
+	// An exported-but-empty POSIXLY_CORRECT still starts bash in POSIX mode
+	// (verified: `env POSIXLY_CORRECT= HOME=/tmp bash -c 'printf %s HOME=~'`
+	// prints a literal `HOME=~`), so presence is what matters, not the value.
+	if _, ok := os.LookupEnv("POSIXLY_CORRECT"); ok {
+		return true
+	}
+	for _, opt := range strings.Split(os.Getenv("SHELLOPTS"), ":") {
+		if opt == "posix" {
+			return true
+		}
+	}
+	return false
+}
+
+// shellArgsDisableBraceExpand reports whether the wrapper's own argv turns
+// brace expansion off (`bash +B -c …`, `bash +o braceexpand -c …`). Verified on
+// bash 5.2.21: both pass a literal `{a,b}`, while `-B` / the default expands.
+// Only flags before the `-c` payload count. The `+` forms are bash/zsh/ksh
+// spellings; shells that never brace-expand are already handled by dialect.
+// shellWrapperFlags captures the option state the wrapper's own argv selects
+// before its `-c` payload.
+type shellWrapperFlags struct {
+	posix   bool
+	noBrace bool
+	noGlob  bool
+}
+
+// shellWrapperFlagsFor computes that state for one wrapper invocation.
+func shellWrapperFlagsFor(command string, args []string) shellWrapperFlags {
+	return shellWrapperFlags{
+		posix:   shellForcesPosixMode(command, args),
+		noBrace: shellArgsDisableBraceExpand(args) && !shellOptsListsOption(command, "braceexpand"),
+		noGlob:  shellArgsDisableGlob(command, args) || shellOptsListsOption(command, "noglob"),
+	}
+}
+
+// shellOptsListsOption reports an inherited $SHELLOPTS that names opt. Bash
+// re-enables every option listed there after applying the invocation flags, so
+// `env SHELLOPTS=braceexpand bash +B -c 'printf "[%s]" {a,b}'` prints `[a][b]`
+// on 5.2.21 (the `+B` cannot be trusted) and `env SHELLOPTS=noglob bash -c
+// 'printf "[%s]" f*'` prints `[f*]` with no `-f` at all.
+//
+// $SHELLOPTS is a bash variable: dash and zsh ignore it entirely (verified —
+// both still glob under `SHELLOPTS=noglob`), so this only applies to
+// bash-family wrappers. Bare `sh` resolves like the other dialect checks.
+//
+// Note the asymmetry: SHELLOPTS only turns options *on*, so it can override a
+// `+B` disable but never undoes `-f`.
+func shellOptsListsOption(command, opt string) bool {
+	switch shellCommandBase(command) {
+	case "bash":
+	case "sh":
+		if !shellShIsBashFamily(command) {
+			return false
+		}
+	default:
+		return false
+	}
+	for _, entry := range strings.Split(os.Getenv("SHELLOPTS"), ":") {
+		if entry == opt {
+			return true
+		}
+	}
+	return false
+}
+
+// shellArgsSkipStartupFiles reports a wrapper that will not read its startup
+// files at all. zsh's `-f` (--no-rcs) does exactly that: with `setopt
+// EXTENDED_GLOB` in .zshenv, `zsh -c 'printf "[%s]" foo#'` globs while
+// `zsh -f -c` prints a literal `foo#` (verified on zsh 5.9). Bash's --norc only
+// covers interactive rc files — $BASH_ENV still runs — so it does not count.
+
+// shellArgsDisableGlob reports whether the wrapper turned pathname generation
+// off (`bash -f -c …`, `bash -o noglob -c …`, `dash -f -c …`). Verified on bash
+// 5.2.21 and dash 0.5.12: `-f` passes a literal `f*`, and `-f +f` globs again
+// (last wins). zsh is excluded from the single-letter form on purpose — there
+// `-f` means "skip startup files", not noglob, and `zsh -f -c` still globs —
+// but the long `-o noglob` spelling applies everywhere.
+func shellArgsDisableGlob(command string, args []string) bool {
+	letterIsNoGlob := shellCommandBase(command) != "zsh"
+	disabled := false
+	for i, a := range args {
+		if a == "-c" {
+			break
+		}
+		switch {
+		case (a == "-o" || a == "+o") && i+1 < len(args) && args[i+1] == "noglob":
+			disabled = a == "-o"
+		case letterIsNoGlob && isCompactShellOptionGroup(a) && strings.ContainsRune(a[1:], 'f'):
+			disabled = a[0] == '-'
+		}
+	}
+	return disabled
+}
+
+// Options apply left to right, so the last one wins: `bash +B -B -c` still
+// brace-expands (5.2.21 passes `a` and `b`).
+func shellArgsDisableBraceExpand(args []string) bool {
+	disabled := false
+	for i, a := range args {
+		if a == "-c" {
+			break
+		}
+		switch {
+		case (a == "-o" || a == "+o") && i+1 < len(args) && args[i+1] == "braceexpand":
+			disabled = a == "+o"
+		case isCompactShellOptionGroup(a) && strings.ContainsRune(a[1:], 'B'):
+			// Single-letter options combine: `bash +BH -c` passes a literal
+			// `{a,b}` while `-BH` expands (verified on 5.2.21).
+			disabled = a[0] == '+'
+		}
+	}
+	return disabled
+}
+
+// isCompactShellOptionGroup reports a `-abc` / `+abc` single-letter option
+// bundle (the form `set` accepts at invocation). Long options (`--posix`) and
+// non-letter operands are excluded, so callers can test the letters directly.
+func isCompactShellOptionGroup(a string) bool {
+	if len(a) < 2 || (a[0] != '-' && a[0] != '+') {
+		return false
+	}
+	for i := 1; i < len(a); i++ {
+		if (a[i] < 'a' || a[i] > 'z') && (a[i] < 'A' || a[i] > 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+// shellSkipContinuations returns the index of the next byte at or after idx,
+// stepping over backslash-newline line continuations (which the shell deletes
+// before any expansion runs).
+func shellSkipContinuations(s string, idx int) int {
+	for idx+1 < len(s) && s[idx] == '\\' && s[idx+1] == '\n' {
+		idx += 2
+	}
+	return idx
+}
+
+// shellStripContinuations removes backslash-newline pairs so a classifier sees
+// the bytes the shell will actually act on: the continued sequence
+// `{1.` + backslash-newline + `.3}` is `{1..3}` and expands to 1 2 3.
+func shellStripContinuations(s string) string {
+	if !strings.Contains(s, "\\\n") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) && s[i+1] == '\n' {
+			i++
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// shellRunsStartupFiles reports whether the wrapper may source a startup file
+// before running its `-c` payload, which can define variables (notably
+// OLDPWD) that this process cannot observe.
+//
+//   - zsh always reads a startup file, even non-interactively and even under
+//     `-f` / --no-rcs: /etc/zshenv (Debian/Ubuntu: /etc/zsh/zshenv) is
+//     unconditional. Verified on zsh 5.9 — with `setopt EXTENDED_GLOB` there,
+//     `zsh -f -c 'printf "[%s]" foo#'` still glob-expands, so `-f` narrows the
+//     hazard to the user file but never removes it.
+//   - bash reads $BASH_ENV for non-interactive shells. $ENV is *not* a bash
+//     signal here: verified on bash 5.2.21 that `env ENV=… bash -c`, a
+//     bash-backed `sh -c`, and `bash --posix -c` all ignore it (POSIX sources
+//     $ENV only for interactive shells).
+//   - dash/ash read $ENV for interactive shells only — `dash -c` sources
+//     nothing.
+//   - ksh88-era shells did source $ENV non-interactively, so keep it as a
+//     signal for ksh / unrecognized shells.
+func shellRunsStartupFiles(command string) bool {
+	switch shellCommandBase(command) {
+	case "dash", "ash", "busybox":
+		return false
+	case "zsh":
+		return true
+	case "bash":
+		return os.Getenv("BASH_ENV") != ""
+	case "sh":
+		// bash invoked as `sh` starts in POSIX mode and ignores $BASH_ENV
+		// (verified: `env -u OLDPWD BASH_ENV=… sh -c 'printf %s ~-'` prints a
+		// literal `~-`); dash-as-sh sources nothing for `-c` either.
+		return false
+	default:
+		// ksh and unknown shells.
+		return os.Getenv("BASH_ENV") != "" || os.Getenv("ENV") != ""
+	}
+}
+
+// shellSupportsColonTildePrefix reports whether an unquoted ':' terminates a
+// *word-initial* tilde-prefix (`agy ~:x` → `$HOME:x`). Unlike assignment-word
+// tildes this survives POSIX mode, so bash-backed `sh` still does it — resolve
+// the implementation the same way brace expansion does.
+func shellSupportsColonTildePrefix(command string) bool {
+	return shellSupportsBraceExpansion(command)
+}
+
+// shellSupportsZshEquals reports whether the named shell performs zsh-style
+// equals substitution (`=cmd` → absolute path of cmd) under the default EQUALS
+// option. Only zsh does this; bash/dash leave `=cmd` literal.
+func shellSupportsZshEquals(command string) bool {
+	base := shellCommandBase(command)
+	return base == "zsh" || strings.HasPrefix(base, "zsh")
+}
+
+// shellSupportsDollarQuote reports whether the named shell supports ANSI-C
+// ($'…') and locale ($"…") quoting. Explicit dash/ash/busybox do not. Bare
+// `sh` is ambiguous (/bin/sh may be bash or dash), so we resolve symlinks /
+// PATH when possible; if the implementation cannot be determined we assume
+// dollar-quoting exists (decline reshape) rather than treating $'…' as a
+// literal "$…" that would mis-shape bash-as-sh.
+func shellSupportsDollarQuote(command string) bool {
+	base := shellCommandBase(command)
+	switch base {
+	case "dash", "ash", "busybox":
+		return false
+	case "sh":
+		return shellShIsBashFamily(command)
+	default:
+		// bash, zsh, ksh, and unknown → assume dollar-quoting exists.
+		return true
+	}
+}
+
+// shellSupportsLegacyArith reports whether the named shell evaluates bash
+// legacy `$[…]` arithmetic. Dash/ash leave those forms literal. Bare `sh`
+// resolves like dollar-quote/brace (bash-as-sh still has `$[…]`).
+func shellSupportsLegacyArith(command string) bool {
+	// Same dialect split as dollar-quote for practical purposes.
+	return shellSupportsDollarQuote(command)
+}
+
+// shellSupportsPwdTilde reports whether the named shell expands word-initial
+// `~+` / `~-` to PWD/OLDPWD. Bash/zsh/ksh do; dash/ash leave them literal.
+// Bare `sh` resolves like brace/assign-tilde.
+func shellSupportsPwdTilde(command string) bool {
+	return shellSupportsBraceExpansion(command)
+}
+
+// shellFailsUnknownTildeLogin reports whether the named shell treats an
+// unquoted unknown `~user` as an expansion failure (zsh: "no such user or
+// named directory") rather than a literal word (bash/dash). Only zsh.
+func shellFailsUnknownTildeLogin(command string) bool {
+	return shellSupportsZshEquals(command)
+}
+
+// shellCommandBase returns the lowercased executable basename without .exe.
+func shellCommandBase(command string) string {
+	base := strings.ToLower(filepath.Base(filepath.ToSlash(command)))
+	return strings.TrimSuffix(base, ".exe")
+}
+
+// shellShIsBashFamily resolves what `sh` actually is. Dash-family → false
+// (literal braces / $'…'). Bash-family or unresolvable → true (decline
+// reshape for brace expansion and ANSI-C quotes rather than assume dash).
+func shellShIsBashFamily(command string) bool {
+	path := command
+	// Bare "sh": locate on PATH so EvalSymlinks can see /bin/sh → dash|bash.
+	if !strings.ContainsAny(filepath.ToSlash(command), "/") {
+		if p, err := exec.LookPath(command); err == nil {
+			path = p
+		} else {
+			return true // ambiguous
+		}
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		resolved = path
+	}
+	base := shellCommandBase(resolved)
+	switch {
+	case base == "dash", base == "ash", base == "busybox":
+		return false
+	case base == "bash", strings.HasPrefix(base, "bash"),
+		base == "zsh", strings.HasPrefix(base, "zsh"),
+		base == "ksh", strings.HasPrefix(base, "ksh"):
+		return true
+	default:
+		// Still named "sh" after resolve (e.g. macOS /bin/sh is bash-based
+		// but not a symlink) — treat as bash-family rather than dash.
+		return true
+	}
+}
+
+// Returns an error when a quote remains open at end-of-input (unterminated
+// syntax), when unquoted parentheses appear (bash rejects unmatched ones; we
+// do not parse subshells/groups), when unquoted glob / expanding-brace / tilde
+// metacharacters appear (we cannot rebuild without losing expansion), or
+// when ANSI-C / locale quoting ($'…' / $"…") appears on dollarQuote shells (we
+// do not implement those forms; dash/sh leave $'…' as literal '$'+quoted text).
+// Mid-word `~` (not word-initial and not after an unquoted assign separator)
+// and non-expanding brace forms (`{foo}`) are ordinary literals.
+// Assignment-like tilde positions require an unquoted `=` (`HOME=~`) or an
+// unquoted `:` after such an `=` (`PATH=/bin:~/x`); quoted separators
+// (`'HOME='~`) and bare `foo:~` stay literal. Brace-expansion / dollar-quote
+// rejection is gated by opts (dash/sh leave both features off). An unquoted
+// `#` at a word boundary ends tokenization (shell comment).
+// Backslash-newline line continuations (quoted or unquoted) drop both chars and
+// do not start a word (so a following `#` stays a comment).
+// Escaped `$` / “ ` “ inside an open `${…}` declines reshape (segment splits
+// would break the expansion syntax on rebuild).
+// `$` + line-continuation(s) + quote is treated as ANSI-C / locale quoting
+// (bash joins them before quote recognition).
+// Callers must not turn rejected payloads into a valid command.
+func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
+	var words []shellWord
+	var segs []shellSegment
+	var segCur strings.Builder
+	inSingle, inDouble := false, false
+	escaped := false
+	wordStarted := false
+	segStarted := false
+	// segExpand is true once an unescaped $ or ` is written in this segment's
+	// expansion-eligible context (unquoted / double-quoted).
+	segExpand := false
+	// segUnquoted is true when the current segment was written outside quotes.
+	segUnquoted := false
+	// paramDepth counts open ${…} parameter expansions the same way as
+	// shellParamCloseBrace: +1 on the `{` of a `${`, -1 on each `}`. Only `${`
+	// nests — bash closes a PE at the first `}` regardless of literal braces in
+	// the operand (`"${x:-{}"` is the one-character argument `{`), so a bare `{`
+	// must not increment the depth.
+	// Escaped \$ / \` inside a still-open PE declines reshape.
+	paramDepth := 0
+	// pendingParamBrace is set after an expandable `$` whose next significant
+	// byte is `{`. The following `{` opens (or nests) a PE brace region.
+	pendingParamBrace := false
+	// sawUnquotedAssign is true once this word has written an unquoted '='
+	// that follows a valid unquoted assignment name (HOME=…, not 1foo=… or
+	// 'HOME'=…). Bash only tilde-expands after ':' inside such words, so a
+	// colon without a prior valid assignment (`foo:~`) stays literal.
+	sawUnquotedAssign := false
+	// endsWithUnquotedAssignSep is set when the most recent character written
+	// into this word was an unquoted '=' (after a valid name) or ':' (after
+	// sawUnquotedAssign). Quoted separators ('HOME='~) must not activate tilde
+	// expansion — only the resulting byte value is not enough.
+	endsWithUnquotedAssignSep := false
+	// assignName tracks unquoted bytes before the first unquoted '='. Quoted
+	// content before that '=' sets assignNamePolluted so 'HOME'=~ is not
+	// treated as an assignment.
+	var assignName strings.Builder
+	assignNamePolluted := false
+
+	// wordPrefixIsTildeExpandPosition reports whether a following unquoted '~'
+	// would tilde-expand: after a valid unquoted assignment '=', or after an
+	// unquoted ':' only when the word is already assignment-like.
+	wordPrefixIsTildeExpandPosition := func() bool {
+		return endsWithUnquotedAssignSep
+	}
+
+	flushSeg := func() {
+		if segStarted {
+			segs = append(segs, shellSegment{Value: segCur.String(), Expand: segExpand, Unquoted: segUnquoted})
+			segCur.Reset()
+			segStarted = false
+			segExpand = false
+			segUnquoted = false
+		}
+	}
+	flushWord := func() {
+		flushSeg()
+		if !wordStarted && len(segs) == 0 {
+			return
+		}
+		var val strings.Builder
+		anyExpand := false
+		for _, seg := range segs {
+			val.WriteString(seg.Value)
+			if seg.Expand {
+				anyExpand = true
+			}
+		}
+		words = append(words, shellWord{
+			Value:    val.String(),
+			Expand:   anyExpand,
+			Segments: segs,
+		})
+		segs = nil
+		wordStarted = false
+		sawUnquotedAssign = false
+		endsWithUnquotedAssignSep = false
+		assignName.Reset()
+		assignNamePolluted = false
+	}
+	// writeSegWithContext appends c. wasEscaped marks a backslash-escaped byte in an
+	// otherwise unquoted context (e.g. HOME\=~): bash treats that byte as
+	// literal and does NOT use it as an assignment separator / tilde trigger.
+	writeSegWithContext := func(c byte, expandable bool, wasEscaped bool) {
+		unquotedCtx := !inSingle && !inDouble && !wasEscaped
+		// Starting an expansion after literal content: split so a later
+		// Expand=true rebuild cannot re-activate earlier escaped $ / `.
+		if expandable && segStarted && !segExpand {
+			flushSeg()
+		}
+		if !segStarted {
+			// Escaped bytes are protected from shell substitutions just like
+			// quoted bytes. Preserve that distinction for dialect checks such as
+			// zsh's word-initial EQUALS expansion (`=cmd`, but not `\=cmd`).
+			segUnquoted = unquotedCtx
+		}
+		if unquotedCtx {
+			if c == '=' {
+				// Only a valid unquoted assignment LHS activates tilde-after-=
+				// (HOME=~, HOME+=~ expand; 1foo=~ and 'HOME'=~ stay literal).
+				// Compound += leaves a trailing + on assignName. -= is NOT a
+				// bash assignment operator (isValidBashAssignLHS rejects it).
+				if !sawUnquotedAssign && !assignNamePolluted && isValidBashAssignLHS(assignName.String()) {
+					sawUnquotedAssign = true
+					endsWithUnquotedAssignSep = true
+				} else if sawUnquotedAssign {
+					// name=value=… — further '=' is just value content; still
+					// not a fresh assign-sep for tilde (value continues).
+					endsWithUnquotedAssignSep = false
+				} else {
+					endsWithUnquotedAssignSep = false
+				}
+			} else if c == ':' && sawUnquotedAssign {
+				endsWithUnquotedAssignSep = true
+			} else {
+				// Any other unquoted byte ends the "separator just written" state.
+				endsWithUnquotedAssignSep = false
+				if !sawUnquotedAssign {
+					assignName.WriteByte(c)
+				}
+			}
+		} else {
+			// Quoted / escaped content never leaves an unquoted assign sep.
+			endsWithUnquotedAssignSep = false
+			if !sawUnquotedAssign {
+				// Quoted or escaped bytes before a later '=' mean the prefix is
+				// not a pure unquoted assignment name ('HOME'=~, H\OME=~).
+				assignNamePolluted = true
+			}
+		}
+		segCur.WriteByte(c)
+		segStarted = true
+		wordStarted = true
+		if expandable {
+			segExpand = true
+		}
+	}
+	writeSeg := func(c byte, expandable bool) {
+		writeSegWithContext(c, expandable, false)
+	}
+	// writeEscapedExpansion writes a literal $ or ` that was backslash-escaped
+	// in its own Expand=false segment. Flushes both before (if current segment
+	// is expanding — e.g. "$TASK\$(cmd)") and after, so escaped dollars never
+	// share a segment with expandable content in either order.
+	//
+	// Returns false when the escape sits inside an open ${…} parameter
+	// expansion: splitting there rebuilds invalid quote nests
+	// (`"${TASK:-"'$(…)}'`). Callers must leave those payloads unshaped.
+	writeEscapedExpansion := func(c byte) bool {
+		if paramDepth > 0 {
+			return false
+		}
+		if segStarted && segExpand {
+			flushSeg()
+		}
+		writeSegWithContext(c, false, true)
+		flushSeg()
+		return true
+	}
+	// noteParamBrace runs after writing '{': only a `${` opens or nests a
+	// parameter expansion. A bare `{` inside a PE operand is ordinary text to
+	// bash — `"${x:-{}"` (x unset) is the single argument `{`, and
+	// `"${x:-a{b}c}"` is `a{bc}` — so counting it would leave paramDepth stuck
+	// open and decline reshape for valid payloads.
+	noteParamBrace := func() {
+		if pendingParamBrace {
+			paramDepth++
+		}
+		pendingParamBrace = false
+	}
+	noteParamClose := func(c byte) {
+		if c == '}' && paramDepth > 0 {
+			paramDepth--
+		}
+	}
+	// markPendingParamBrace records that an expandable `$` is followed by `{`
+	// (after line continuations); the `{` itself increments paramDepth.
+	markPendingParamBrace := func(next byte) {
+		if next == '{' {
+			pendingParamBrace = true
+		}
+	}
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if escaped {
+			// Unquoted line continuation: backslash-newline is deleted entirely
+			// (bash joins physical lines; do not keep a literal newline).
+			// wordStarted was intentionally NOT set when the backslash was seen,
+			// so a following `#` at the next line remains a comment.
+			if c == '\n' {
+				escaped = false
+				continue
+			}
+			// Backslash-escaped content is literal — including \$ and \`.
+			// wasEscaped=true so e.g. HOME\=~ does not open an assignment
+			// separator at the escaped '=' (bash passes HOME=~ literally).
+			if c == '$' || c == '`' {
+				if !writeEscapedExpansion(c) {
+					return nil, fmt.Errorf("unsupported escaped expansion inside parameter expansion")
+				}
+			} else {
+				writeSegWithContext(c, false, true)
+			}
+			escaped = false
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				// Close single-quoted segment (may be empty '').
+				if !segStarted {
+					segs = append(segs, shellSegment{Value: "", Expand: false})
+				} else {
+					flushSeg()
+				}
+				inSingle = false
+				wordStarted = true
+			} else {
+				// Single-quoted: literal, no expansion.
+				writeSeg(c, false)
+			}
+			continue
+		}
+		if inDouble {
+			if c == '\\' && i+1 < len(s) {
+				next := s[i+1]
+				// bash double-quote escapes: \, ", $, `, newline — remove the
+				// backslash and keep the next char as literal (so \$ → $),
+				// except line continuation (backslash-newline) removes both.
+				if next == '$' || next == '`' {
+					i++
+					if !writeEscapedExpansion(next) {
+						return nil, fmt.Errorf("unsupported escaped expansion inside parameter expansion")
+					}
+					continue
+				}
+				if next == '\n' {
+					i++
+					// Line continuation inside double quotes: drop \ and newline.
+					continue
+				}
+				if next == '\\' || next == '"' {
+					i++
+					writeSeg(next, false)
+					continue
+				}
+			}
+			if c == '"' {
+				// Quotes inside an open ${…} are part of the expansion operand
+				// (`"${x:-"foo bar"}"`), not word delimiters. We do not track
+				// that nested quoting state — decline reshape rather than
+				// exit double-quote mode and split the word.
+				if paramDepth > 0 {
+					return nil, fmt.Errorf("unsupported nested quotes inside parameter expansion")
+				}
+				if !segStarted {
+					segs = append(segs, shellSegment{Value: "", Expand: false})
+				} else {
+					flushSeg()
+				}
+				inDouble = false
+				wordStarted = true
+				continue
+			}
+			// Double-quoted: unescaped $ / ` are expandable only when bash would
+			// actually expand them; a lone trailing `$` (`cost$`, `"$"`) is
+			// literal. Brace/glob/tilde do not expand inside double quotes, but
+			// `{`/`}` still nest paramDepth inside an open ${…}.
+			if c == '$' {
+				j := nextAfterLineContinuations(s, i+1)
+				expandable := j < len(s) && shellDollarStartsExpand(s[j], opts.legacyArith)
+				writeSeg(c, expandable)
+				if expandable {
+					markPendingParamBrace(s[j])
+				}
+			} else {
+				writeSeg(c, c == '`')
+				if c == '{' {
+					noteParamBrace()
+				}
+			}
+			noteParamClose(c)
+			continue
+		}
+		switch c {
+		case '\\':
+			// Do not set wordStarted here: a line-continuation backslash must
+			// not turn a following `#` into mid-word content. writeSeg (when
+			// an escaped character actually contributes) sets wordStarted.
+			escaped = true
+		case '\'':
+			flushSeg() // start a new single-quoted segment
+			inSingle = true
+			wordStarted = true
+		case '"':
+			flushSeg() // start a new double-quoted segment
+			inDouble = true
+			wordStarted = true
+		case ' ', '\t', '\n':
+			// POSIX/bash IFS whitespace is space, tab, newline only — not CR.
+			// A literal `\r` stays inside the word (bash/dash pass one field).
+			flushWord()
+		case '#':
+			// Unquoted # at a word boundary starts a shell comment — stop.
+			// Mid-word (# after content or concatenated after a quote close
+			// with wordStarted still true) is literal.
+			if !wordStarted {
+				flushWord()
+				return words, nil
+			}
+			if opts.zshPatterns {
+				// zsh EXTENDED_GLOB (settable from the .zshenv we cannot read)
+				// makes a mid-word `#` a pathname-generation operator: with the
+				// option on, `agy foo#` expands to the matching files and a
+				// non-matching `agy zzz#` aborts with "no matches found".
+				// Freezing it into a quoted --print value would suppress both.
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
+		case '^':
+			// Same story as `#`: with EXTENDED_GLOB, `^pat` is zsh's
+			// "everything except" operator. Literal on every other shell.
+			if opts.zshPatterns {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
+		case '(', ')':
+			// We do not parse subshells/groups. Unquoted parens are either
+			// unmatched (bash syntax error) or full shell syntax we would
+			// mis-reshape — leave the original payload alone.
+			return nil, fmt.Errorf("unsupported unquoted shell metacharacter %q", c)
+		case '*', '?':
+			// Unquoted glob patterns expand before agy sees the argv.
+			// Rebuilding would single-quote them and freeze the pattern —
+			// unless the wrapper turned pathname generation off.
+			if !opts.noGlob {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
+		case '[':
+			// Only a complete bracket expression ([…]) is pathname expansion.
+			// Unmatched `[` (e.g. `[draft`) is literal in bash/dash — keep it
+			// so eligible one-shots still gain --print rather than hanging in
+			// the interactive TUI.
+			// zsh is stricter than bash/dash: an unmatched `[` aborts the whole
+			// command with `bad pattern: [draft` (verified on zsh 5.9, also for
+			// mid-word `foo[bar`), so any unquoted `[` declines there.
+			if !opts.noGlob && (opts.zshPatterns || looksLikeUnquotedBracketGlob(s, i)) {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
+		case ']':
+			// A lone unquoted ] is literal (it does not open a glob).
+			writeSeg(c, false)
+		case '~':
+			// Word-initial tilde (`~/x`, `~user`) is POSIX — expands on bash
+			// and dash when the whole tilde-prefix is unquoted; decline reshape
+			// only then. Quoted prefixes (`~"root"`, `~'u'ser`) stay literal
+			// so eligible one-shots still gain --print.
+			// Assignment-position tilde (`HOME=~`, `PATH=/bin:~/x`) is
+			// bash/zsh/ksh only (opts.assignTilde). Dash leaves those literal
+			// so we still reshape with --print rather than hanging interactive.
+			// Position alone is not enough: `HOME=~"root"` and
+			// `PATH=/bin:~no_such_user/x` stay literal in bash — use the same
+			// prefix/login validation as word-initial tildes before declining.
+			// Mid-word forms without that context (`foo~bar`, `foo:~`) are
+			// ordinary literals on all shells.
+			if !wordStarted {
+				// The bash family ends a tilde-prefix at an unquoted ':' anywhere
+				// in the word, not just in assignment values: `bash -c 'agy ~:x'`
+				// passes `$HOME:x`. This survives POSIX mode, so bash-as-sh does
+				// it too (opts.colonTilde, not opts.assignTilde). Dash keeps
+				// `~:x` literal so those payloads still reshape with --print.
+				if looksLikeExpandingWordInitialTilde(s, i, opts, opts.colonTilde) {
+					return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+				}
+				writeSeg(c, false)
+				continue
+			}
+			if opts.zshPatterns {
+				// Mid-word `~` is EXTENDED_GLOB's "except" operator on zsh (`a~b`).
+				// Word-initial tildes are handled above.
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			// Assignment-position: ':' ends each tilde-prefix the same as '/'
+			// (PATH=~: → PATH=$HOME:). Word-initial tildes only end on '/'.
+			if opts.assignTilde && wordPrefixIsTildeExpandPosition() &&
+				looksLikeExpandingWordInitialTilde(s, i, opts, true) {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
+		case '{':
+			// Brace expansion (`file{1,2}`, `{a,b}`, `{1..3}`) runs before
+			// agy sees argv on bash/zsh/ksh — decline reshape. Dash/sh leave
+			// braces literal (opts.braceExpand false). Non-expanding forms
+			// like `{foo}` (no comma / `..`) are ordinary literals.
+			// Inside ${…} (or the PE-opening `{` after `$`) this is PE syntax /
+			// PE body content — track depth and do not treat as brace-expand.
+			if !(pendingParamBrace || paramDepth > 0) && opts.braceExpand &&
+				looksLikeUnquotedBraceExpansion(s, i, opts.zshPatterns) {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
+			noteParamBrace()
+		case '}':
+			// Closing brace alone is literal; expanding forms are rejected
+			// when the opening `{` is seen. Still close ${…} paramDepth so a
+			// later escaped \$ outside the expansion is not mis-attributed
+			// (e.g. `${ROOT}\$dir`).
+			writeSeg(c, false)
+			noteParamClose(c)
+		case '=', ':':
+			// zsh MAGIC_EQUAL_SUBST (settable from the unreadable .zshenv)
+			// extends equals-substitution to the *value* side of any
+			// assignment-like word, not just word-initial `=cmd`: with the
+			// option on, `agy review foo==ls` passes `foo=/usr/bin/ls` and
+			// `p=a:==ls` fails with `=ls not found` (verified on zsh 5.9), while
+			// both are literal without it. A ':' only opens a fresh value
+			// segment inside a word that already has an unquoted assignment
+			// separator. (`foo=~` needs no special case: mid-word `~` already
+			// declines on zsh as an EXTENDED_GLOB operator.)
+			// The second `=` may sit past a line continuation, which zsh deletes
+			// first: `foo=` + backslash-newline + `=ls` is `foo==ls` and
+			// substitutes (verified on zsh 5.9 with MAGIC_EQUAL_SUBST).
+			if next := shellSkipContinuations(s, i+1); opts.zshPatterns &&
+				next < len(s) && s[next] == '=' && (c == '=' || sawUnquotedAssign) {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
+		default:
+			// ANSI-C ($'…') / locale ($"…") quoting: not implemented on bash-
+			// family shells — reject so we never rebuild $'(touch …)' into an
+			// expandable substitution. Dash/POSIX sh lack dollar-quotes and
+			// treat $'text' as literal '$' + quoted text; keep that path.
+			// A bare `$` that does not start an expansion (`cost$`, `foo$.`) is
+			// literal so we can still reshape instead of declining for
+			// "unquoted expand".
+			if c == '$' {
+				j := nextAfterLineContinuations(s, i+1)
+				if j < len(s) && (s[j] == '\'' || s[j] == '"') {
+					if opts.dollarQuote {
+						return nil, fmt.Errorf("unsupported ANSI-C or locale quoted string")
+					}
+					// Non-dollar-quote shell: leading $ is an ordinary literal
+					// character before the quote (dash yields value "$text").
+					writeSeg(c, false)
+					continue
+				}
+				expandable := j < len(s) && shellDollarStartsExpand(s[j], opts.legacyArith)
+				writeSeg(c, expandable)
+				if expandable {
+					markPendingParamBrace(s[j])
+				}
+				continue
+			}
+			writeSeg(c, c == '`')
+		}
+	}
+	if inSingle || inDouble {
+		return nil, fmt.Errorf("unterminated quote in shell payload")
+	}
+	if escaped {
+		// Trailing backslash is kept as a literal.
+		writeSeg('\\', false)
+	}
+	flushWord()
+	return words, nil
+}
+
+// nextAfterLineContinuations returns the index of the next byte in s at or after
+// i once unquoted backslash-newline pairs are skipped (bash deletes them before
+// other tokenization). Returns len(s) when only continuations remain.
+func nextAfterLineContinuations(s string, i int) int {
+	for i+1 < len(s) && s[i] == '\\' && s[i+1] == '\n' {
+		i += 2
+	}
+	return i
+}
+
+// shellDollarStartsExpand reports whether b can begin an expansion after '$'
+// (parameter name, special parameter, ${…}, $(…), $((…)), $$; and `$[…]` when
+// legacyArith is true). A lone or otherwise non-expanding '$' is left literal.
+// `$[…]` is bash's legacy arithmetic form (still evaluated in double quotes on
+// bash 5.x); without recognizing it on bash the reshaper would single-quote
+// the token and freeze the expression. On dash/ash, `$[` is literal — do not
+// mark expand (that would decline reshape for unquoted `$[1+2` and leave
+// interactive agy waiting).
+func shellDollarStartsExpand(b byte, legacyArith bool) bool {
+	switch b {
+	case '{', '(', '@', '*', '#', '?', '-', '!', '_', '$':
+		return true
+	case '[':
+		return legacyArith
+	}
+	if b >= '0' && b <= '9' {
+		return true
+	}
+	if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') {
+		return true
+	}
+	return false
+}
+
+// looksLikeExpandingWordInitialTilde reports whether s[tildeIdx] ('~') starts
+// a tilde expansion the wrapper shell would actually perform. The tilde-prefix
+// runs from '~' through the first unquoted '/', or through the end of the word
+// when there is no '/'. When colonEndsPrefix is true (assignment-position
+// tilde after '=' / ':'), an unquoted ':' also ends the prefix — bash expands
+// PATH=~: to PATH=$HOME:. Expansion requires every character of that prefix to
+// be unquoted and unescaped. Forms like `~"root"`, `~'user'`, and `~us\er`
+// keep the tilde literal — return false so reshape can still add --print.
+//
+// Even a fully unquoted `~name` is only expanding when the login resolves on
+// bash/dash (unknown names stay literal). On zsh (opts.failUnknownTilde)
+// unknown names fail the expansion — decline reshape. Bare `~` / `~/path`
+// always expand via HOME (POSIX). Bare `~+` expands when pwdTilde; bare `~-`
+// only when pwdTilde and OLDPWD is non-empty (bash leaves `~-` literal when
+// OLDPWD is unset/empty).
+func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, opts shellWordOptions, colonEndsPrefix bool) bool {
+	if tildeIdx < 0 || tildeIdx >= len(s) || s[tildeIdx] != '~' {
+		return false
+	}
+	// '~' itself is unquoted (caller is in the unquoted branch). Collect the
+	// login / special body; any quote or escape in it cancels expansion.
+	var login strings.Builder
+	for j := tildeIdx + 1; j < len(s); j++ {
+		switch s[j] {
+		case '\\':
+			// Backslash-newline is a line continuation the shell deletes
+			// entirely, so the prefix continues on the next line: the two-line
+			// payload `~\<newline>/brief` expands to $HOME/brief on bash and
+			// dash (verified on 5.2.21 / 0.5.12). Skip both bytes rather than
+			// treating this as a quoted character.
+			if j+1 < len(s) && s[j+1] == '\n' {
+				j++
+				continue
+			}
+			// Any other backslash quotes the next character → not all-unquoted.
+			return false
+		case '\'', '"':
+			// Quoted material in the prefix (e.g. ~"root") → literal tilde.
+			return false
+		case '/':
+			// Unquoted slash ends the tilde-prefix.
+			return shellTildePrefixExpands(login.String(), opts)
+		case ':':
+			// bash/zsh/ksh end a tilde-prefix at an unquoted ':' — both in
+			// assignment values (PATH=~: → $HOME:) and in ordinary words
+			// (`agy ~:x` → `$HOME:x`, verified on bash 5.2.21). Dash keeps the
+			// ':' in the login name, where it never resolves, so the tilde stays
+			// literal there (callers pass colonEndsPrefix=false).
+			if colonEndsPrefix {
+				return shellTildePrefixExpands(login.String(), opts)
+			}
+			login.WriteByte(':')
+		case ' ', '\t', '\n':
+			// Unquoted IFS ends the word.
+			return shellTildePrefixExpands(login.String(), opts)
+		default:
+			login.WriteByte(s[j])
+		}
+	}
+	return shellTildePrefixExpands(login.String(), opts)
+}
+
+// shellTildePrefixExpands reports whether an unquoted tilde-prefix body
+// (characters after '~', without a trailing path) would expand on this host.
+// Empty → HOME (`~`, `~/x`). Bare `~+` expands via PWD when pwdTilde is true
+// (bash/zsh/ksh; dash leaves it literal). Bare `~-` expands only when
+// pwdTilde and OLDPWD is non-empty — bash 5.x passes literal `~-` when
+// OLDPWD is unset/empty, so those should still reshape with --print.
+// Stack index zero (`~+0` / `~-0`, including leading zeros) always resolves
+// to the current directory on those shells even in a fresh process — decline
+// reshape. Non-zero `~+N` / `~-N` need a live directory-stack entry we cannot
+// see, so they reshape. Known logins expand via user.Lookup; unknown logins
+// stay literal on bash/dash (reshape) but fail on zsh (opts.failUnknownTilde).
+func shellTildePrefixExpands(login string, opts shellWordOptions) bool {
+	if login == "" {
+		if !opts.homeTildeNeedsEnv {
+			return true
+		}
+		// Presence, not value: dash 0.5.12 with an exported-but-empty HOME still
+		// expands (`HOME= dash -c 'printf "[%s]" ~ ~/x'` gives `[]` and `[/x]`),
+		// while an unset HOME leaves both literal.
+		_, ok := os.LookupEnv("HOME")
+		return ok
+	}
+	// Bash/zsh PWD form. Dash: literal (pwdTilde false).
+	if login == "+" {
+		return opts.pwdTilde
+	}
+	// ~- needs a usable OLDPWD; otherwise bash leaves the token literal.
+	// Our environment is not the whole story: a startup file the wrapper
+	// sources first (zsh's .zshenv, bash's $BASH_ENV) can export OLDPWD, and
+	// then `agy ~-` expands even though this process sees nothing — verified on
+	// bash 5.2.21 (`env -u OLDPWD BASH_ENV=… bash -c 'printf %s ~-'` → /var).
+	// Treat it as expanding whenever such a file may run.
+	if login == "-" {
+		if !opts.pwdTilde {
+			return false
+		}
+		if opts.startupFiles {
+			return true
+		}
+		return shellOldPwdIsUsable(os.Getenv("OLDPWD"))
+	}
+	if opts.pwdTilde && isPwdTildeStackZero(login) {
+		return true
+	}
+	// Non-zero stack indices (`~+1`, `~-2`) need a directory stack this process
+	// cannot see. A fresh `bash -c` has only entry 0, but a startup file can
+	// push onto it — with $BASH_ENV running `pushd /tmp`, bash 5.2.21 expands
+	// `~+1` to the pre-push directory. Decline reshape when that is possible.
+	if opts.pwdTilde && opts.startupFiles && isPwdTildeStackIndex(login) {
+		return true
+	}
+	_, err := user.Lookup(login)
+	if err == nil {
+		return true
+	}
+	// Unknown login: bash/dash leave literal; zsh fails the expansion.
+	return opts.failUnknownTilde
+}
+
+// shellOldPwdIsUsable reports whether an inherited $OLDPWD would survive bash's
+// startup validation and therefore make `~-` expand. Bash requires an absolute
+// path naming an existing directory and silently clears anything else —
+// verified on 5.2.21 that `OLDPWD=/no/such`, `OLDPWD=rel` and
+// `OLDPWD=/etc/hosts` all leave `~-` literal, while a real directory expands.
+func shellOldPwdIsUsable(v string) bool {
+	if v == "" {
+		return false
+	}
+	if !strings.HasPrefix(v, "/") && !filepath.IsAbs(v) {
+		return false
+	}
+	info, err := os.Stat(v)
+	return err == nil && info.IsDir()
+}
+
+// isPwdTildeStackIndex reports whether login is a bash-style directory-stack
+// reference (`+N` / `-N`, any index).
+func isPwdTildeStackIndex(login string) bool {
+	if len(login) < 2 || (login[0] != '+' && login[0] != '-') {
+		return false
+	}
+	for i := 1; i < len(login); i++ {
+		if login[i] < '0' || login[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isPwdTildeStackZero reports whether login is a bash-style directory-stack
+// index of zero after `~` (`+0`, `-0`, `+00`, …). Index 0 always exists and
+// expands to the current directory; non-zero indices may be missing and are
+// left to reshape as literals.
+func isPwdTildeStackZero(login string) bool {
+	if len(login) < 2 || (login[0] != '+' && login[0] != '-') {
+		return false
+	}
+	for i := 1; i < len(login); i++ {
+		if login[i] != '0' {
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikeUnquotedBracketGlob reports whether s[openIdx] (must be '[') starts
+// an unquoted bracket expression […] that bash treats as a pathname pattern.
+// Unmatched `[` is a literal character (`agy review [draft` reshapes), so only
+// a matching unquoted `]` within the same word makes the word expandable.
+//
+// Any closing `]` counts — including the degenerate `[]`, `[!]`, `[^]` and
+// `[]]` forms. Bash's glob detector does not validate the class body, so those
+// words still go through pathname expansion and their behaviour depends on
+// shell options we cannot preserve: with `failglob` (inherited through an
+// exported BASHOPTS, verified on bash 5.2.21) `agy [!]` aborts with
+// `no match: [!]` before agy ever runs, and with `nullglob` the word would
+// vanish entirely. Rebuilding them as a quoted `--print '[!]'` value would
+// instead launch a permission-skipping agy run, so decline the reshape.
+//
+// Quote/escape-aware: spaces inside quotes or after a backslash (`[a" "b]`,
+// `[a\ b]`) stay in the same word, and a quoted/escaped `]` does not close the
+// expression. Unquoted IFS whitespace ends the shell word (CR is not IFS
+// whitespace — same as shellWords), leaving the `[` unmatched and literal.
+func looksLikeUnquotedBracketGlob(s string, openIdx int) bool {
+	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != '[' {
+		return false
+	}
+	inSingle, inDouble := false, false
+	escaped := false
+	for j := openIdx + 1; j < len(s); j++ {
+		c := s[j]
+		if escaped {
+			// Escaped byte is a literal class member, never the closer.
+			escaped = false
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '\\' && j+1 < len(s) {
+				j++ // skip escaped byte inside double quotes
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch c {
+		case '\\':
+			escaped = true
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case ' ', '\t', '\n':
+			// Unquoted IFS whitespace ends the shell word — `[` stays literal.
+			return false
+		case ']':
+			// Closed bracket expression → bash globs the word.
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeUnquotedBraceExpansion reports whether s[openIdx] (must be '{')
+// starts a bash brace-expansion pattern in the current unquoted word: a
+// matching `}` with an active list `,` or a *valid* sequence `..` form.
+// Invalid sequences such as `{foo..bar}` or `{1..x}` are ordinary literals in
+// bash (endpoints must be integers or single letters). Bash performs brace
+// expansion before quote removal, so separators inside quoted segments do not
+// count, but quoted text may appear between unquoted separators
+// (`{a,'b'}` expands; `{foo}` does not). Nested braces are tracked at depth;
+// unquoted whitespace ends the scan (word boundary).
+// braceCCL widens the test for zsh wrappers, where the BRACE_CCL option (which
+// .zshenv or the unconditional /etc/zshenv may set) expands a brace group with
+// neither a comma nor `..`: with it on, `zsh -c 'printf "[%s]" x{ab}y'` prints
+// `[xay][xby]`, while default zsh and bash print `[x{ab}y]` (verified on 5.9 /
+// 5.2.21). Any balanced group therefore has to decline on zsh.
+func looksLikeUnquotedBraceExpansion(s string, openIdx int, braceCCL bool) bool {
+	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != '{' {
+		return false
+	}
+	depth := 0
+	inSingle, inDouble := false, false
+	escaped := false
+	listActive := false // unquoted `,` at depth 1
+	seqDots := false    // unquoted `..` at depth 1 (validated on close)
+	for j := openIdx; j < len(s); j++ {
+		c := s[j]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '\\' && j+1 < len(s) {
+				j++ // skip escaped byte inside double quotes
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch c {
+		case '\\':
+			// Backslash-newline is deleted by the shell, so it does not quote
+			// the next byte and does not break up `..`.
+			if j+1 < len(s) && s[j+1] == '\n' {
+				j++
+				continue
+			}
+			escaped = true
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case ' ', '\t', '\n':
+			// IFS whitespace only (not CR) — same as shellWords.
+			return false
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				if listActive || braceCCL {
+					return true
+				}
+				if seqDots {
+					// Validate the body the shell will see, with continuations
+					// already removed (`{1.\<newline>.3}` is `{1..3}`).
+					return isValidBashBraceSequenceBody(shellStripContinuations(s[openIdx+1 : j]))
+				}
+				return false
+			}
+		case ',':
+			if depth == 1 {
+				listActive = true
+			}
+		case '.':
+			// The second '.' may sit past a line continuation.
+			if next := shellSkipContinuations(s, j+1); depth == 1 && next < len(s) && s[next] == '.' {
+				seqDots = true
+				j = next // consume second '.'
+			}
+		}
+	}
+	return false
+}
+
+// isValidBashBraceSequenceBody reports whether body (contents inside `{…}`,
+// without braces) is a bash sequence expression that actually expands:
+// `start..end` or `start..end..incr` where start/end are both integers or both
+// single ASCII letters. `{foo..bar}` and `{1..x}` stay literal in bash.
+func isValidBashBraceSequenceBody(body string) bool {
+	// Nested braces / list commas are not pure sequence forms; list form is
+	// handled separately via listActive. Be conservative on nested content.
+	if strings.ContainsAny(body, "{},") {
+		// Nested `{…}` with `..` somewhere — treat as expansion-active so we
+		// never freeze a real nested expand into a quoted literal.
+		return strings.Contains(body, "..")
+	}
+	parts := strings.Split(body, "..")
+	if len(parts) != 2 && len(parts) != 3 {
+		return false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return false
+		}
+	}
+	if !braceSeqEndpointOK(parts[0]) || !braceSeqEndpointOK(parts[1]) {
+		return false
+	}
+	// Both integers or both single letters — mixed types do not expand.
+	if braceSeqIsAlpha(parts[0]) != braceSeqIsAlpha(parts[1]) {
+		return false
+	}
+	if len(parts) == 3 && !braceSeqIncrOK(parts[2]) {
+		return false
+	}
+	return true
+}
+
+func braceSeqIsAlpha(s string) bool {
+	return len(s) == 1 && ((s[0] >= 'a' && s[0] <= 'z') || (s[0] >= 'A' && s[0] <= 'Z'))
+}
+
+func braceSeqEndpointOK(s string) bool {
+	if braceSeqIsAlpha(s) {
+		return true
+	}
+	// Integers may have an optional leading + or - (bash `{+1..+3}` expands).
+	return braceSeqSignedIntOK(s)
+}
+
+func braceSeqIncrOK(s string) bool {
+	// Increment is an integer (optional leading + or -). Zero is allowed: bash
+	// uses the default step of 1 when the increment is 0 (`{1..3..0}` → 1 2 3).
+	return braceSeqSignedIntOK(s)
+}
+
+// braceSeqSignedIntOK reports whether s is a non-empty decimal integer with an
+// optional leading + or - sign (bash brace-sequence endpoints/increments).
+func braceSeqSignedIntOK(s string) bool {
+	if s == "" {
+		return false
+	}
+	i := 0
+	if s[0] == '-' || s[0] == '+' {
+		i = 1
+	}
+	if i >= len(s) {
+		return false
+	}
+	for ; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidBashAssignName reports whether s is a POSIX/bash shell variable name
+// suitable for an assignment word (`NAME=value`): [A-Za-z_][A-Za-z0-9_]*.
+func isValidBashAssignName(s string) bool {
+	if s == "" {
+		return false
+	}
+	c0 := s[0]
+	if c0 != '_' && (c0 < 'a' || c0 > 'z') && (c0 < 'A' || c0 > 'Z') {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if c != '_' && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// isValidBashAssignLHS reports whether s is a valid assignment left-hand side
+// as accumulated before the '=' character. Covers plain NAME and compound
+// assignment NAME+ (i.e. NAME+=value), which activate tilde expansion after
+// the '=' (HOME+=~ → HOME+=/home/…). NAME-= is NOT a bash assignment operator
+// (HOME-=~ is a literal argument), so trailing '-' is rejected.
+// Indexed forms (A[0]=) hit the unquoted '[' path earlier and already decline.
+func isValidBashAssignLHS(s string) bool {
+	if isValidBashAssignName(s) {
+		return true
+	}
+	if n := len(s); n >= 2 {
+		last := s[n-1]
+		// Only += is a compound assignment in bash (not -=).
+		if last == '+' {
+			return isValidBashAssignName(s[:n-1])
+		}
+	}
+	return false
+}
+
+// shellArgMeta is the set of characters that force quoting when serializing a
+// token into a bash -c payload. Without this, an unquoted prompt like
+// `review;id` becomes two shell statements (`;` is a command separator).
+// Covers whitespace, quotes/escapes, expansions, control operators, globbing,
+// grouping, comments, history, and tilde.
+const shellArgMeta = " \t\n\r\"'\\$`;&|<>*?[](){}#!~"
+
+// quoteAntigravityShellArg quotes s for inclusion in a bash -c string.
+// allowExpand=true: double-quote and leave $ / ` unescaped so parameter /
+// command expansion still runs (needed for wrappers like agy "$TASK").
+// allowExpand=false: prefer single quotes so $ stays literal.
+func quoteAntigravityShellArg(s string, allowExpand bool) string {
+	if s == "" {
+		return `""`
+	}
+	if !strings.ContainsAny(s, shellArgMeta) {
+		return s
+	}
+	if allowExpand {
+		// Double-quote; escape \ and " only. Do NOT escape $ or ` — bash must
+		// still expand them inside the rebuilt -c payload.
+		var b strings.Builder
+		b.Grow(len(s) + 2)
+		b.WriteByte('"')
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c == '\\' || c == '"' {
+				b.WriteByte('\\')
+			}
+			b.WriteByte(c)
+		}
+		b.WriteByte('"')
+		return b.String()
+	}
+	// Literal: single quotes preserve $ and ` exactly (bash single-quote rules).
+	if !strings.Contains(s, "'") {
+		return "'" + s + "'"
+	}
+	// Value contains single quotes — fall back to double quotes with full
+	// escapes including $ and ` so nothing expands.
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\\' || c == '"' || c == '$' || c == '`' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(c)
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // replaceDashCPayload returns a copy of args with the string following the first

@@ -275,11 +275,24 @@ func hasShellCommandChaining(command string) bool {
 // and operator-joined commands, so the payload is a genuine shell string whose
 // operators (unlike literal argv) really do launch further programs.
 func shellDashCPayload(cmd string, args []string) (string, bool) {
+	raw, ok := shellDashCPayloadRaw(cmd, args)
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(raw), true
+}
+
+// shellDashCPayloadRaw is shellDashCPayload without the whitespace trim.
+// Rewriters must use this: trimming a trailing backslash-newline leaves a
+// dangling `\`, which bash then passes as an extra argument — verified on
+// 5.2.21, where a payload ending in backslash-newline supplies just `review`,
+// while the same text trimmed supplies `review` and a literal backslash.
+func shellDashCPayloadRaw(cmd string, args []string) (string, bool) {
 	base := commandBaseName(cmd)
 	if (base == "bash" || base == "sh" || base == "zsh" || base == "dash") && len(args) >= 2 {
 		for i, a := range args {
 			if a == "-c" && i+1 < len(args) {
-				return strings.TrimSpace(args[i+1]), true
+				return args[i+1], true
 			}
 		}
 	}

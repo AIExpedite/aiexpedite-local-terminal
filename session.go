@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1572,9 +1573,10 @@ func isGrokCommand(command string) bool {
 // isAntigravityCommand reports whether command routes to the Antigravity CLI.
 // Accepts BOTH the `agy` binary and the `antigravity` alias — the PTY
 // eligibility allowlist (isPTYEligibleCommand) admits both, so both MUST get
-// the same one-shot argv shaping (`--print --dangerously-skip-permissions`) in
-// buildInteractiveCLIArgs; otherwise a `tty=true` `antigravity` session would
-// start under a PTY with no prompt flag and hang. Robust to paths / .exe shims.
+// the same one-shot argv shaping (`--dangerously-skip-permissions --print
+// <prompt>`) in buildInteractiveCLIArgs; otherwise a `tty=true` `antigravity`
+// session would start under a PTY with no prompt flag and hang. Robust to
+// paths / .exe shims.
 func isAntigravityCommand(command string) bool {
 	base := commandBaseName(command)
 	return strings.HasPrefix(base, "agy") || strings.HasPrefix(base, "antigravity")
@@ -1616,12 +1618,14 @@ func isResidentAgentSessionCommand(command string) bool {
 //   - codex:       stdinPrompt is the prompt, written as raw text; codex exec
 //     reads stdin to completion (`-` positional placeholder)
 //     then exits; one-shot per process
-//   - antigravity: prompt as positional argv via `--print`. agy does NOT read
-//     piped stdin (verified against agy 1.0.4: ignored in both
-//     interactive and --print modes — it needs a real TTY), so the
-//     prompt must stay on argv. agy resolves to a native `agy.exe`
-//     (NOT a cmd.exe shim), so the relevant cap is the 32KB
-//     CreateProcess limit, not an 8191-char cmd.exe cap.
+//   - antigravity: prompt as the VALUE of `--print` (agy ≥ 1.1.x; verified
+//     1.1.2 / 1.1.11). Order is `--dangerously-skip-permissions --print
+//     <prompt>` — a bare `--print` followed by another flag makes agy treat
+//     that flag as the prompt. agy does NOT read piped stdin (verified
+//     against agy 1.0.4: ignored in both interactive and --print modes —
+//     it needs a real TTY), so the prompt must stay on argv. agy resolves
+//     to a native `agy.exe` (NOT a cmd.exe shim), so the relevant cap is
+//     the 32KB CreateProcess limit, not an 8191-char cmd.exe cap.
 //   - other:       prompt stays in args
 //
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
@@ -1915,12 +1919,22 @@ func sanitizeCodexExecArgs(args []string) []string {
 }
 
 // buildAntigravityInteractiveArgs builds Antigravity CLI (`agy`) args for
-// one-shot prompt execution. The prompt stays a POSITIONAL argv.
+// one-shot prompt execution.
 //
-// agy v1.0.x ships claude-code-shaped flags (--print / --prompt-interactive /
-// --dangerously-skip-permissions) but does NOT expose --output-format or
-// stream-json input — so we cannot drive it as a multi-turn streaming session
-// like claude. We run a one-shot `--print` with the prompt as a positional arg.
+// agy ≥ 1.1.x: `--print` / `-p` / `--prompt` takes the prompt as its FLAG
+// VALUE (not a trailing positional). Verified against agy 1.1.2 and 1.1.11.
+// The native-chat path (buildAntigravityNativeArgs) already uses this contract;
+// the session_start / PTY one-shot path must match or tertiary Review kickoffs
+// (and any other terminalWithFeatureDetails agy role) answer a question about
+// `--dangerously-skip-permissions` and ignore the real brief:
+//
+//	WRONG: agy --print --dangerously-skip-permissions <brief>
+//	       → --print's value is "--dangerously-skip-permissions"
+//	RIGHT: agy --dangerously-skip-permissions --print <brief>
+//
+// agy ships claude-code-shaped flags but does NOT expose stream-json input, so
+// we cannot drive it as a multi-turn streaming session like claude. We run a
+// one-shot `--print` per session_start.
 //
 // WHY NOT STDIN (unlike codex): agy does NOT read a piped stdin —
 // verified live against agy 1.0.4, piped input is ignored in BOTH interactive
@@ -1932,11 +1946,373 @@ func sanitizeCodexExecArgs(args []string) []string {
 // failure for normal (≤ ~32KB) briefs; only briefs approaching 32KB would risk
 // it, which would need a TTY/ACP-style redesign rather than the stdin trick.
 func buildAntigravityInteractiveArgs(args []string) []string {
-	result := make([]string, 0, len(args)+2)
-	result = append(result, "--print")
+	// Diagnostic invocations are not prompts: `agy --version` prints 1.1.11 and
+	// is exactly how probeAntigravityNativeCapabilityUncached queries the CLI,
+	// but shaping would turn it into `--print --version` and burn a model run.
+	// Same for a lone `--help` / `-h` or a bare subcommand (`agy models`).
+	if isAntigravityDiagnosticInvocation(args) {
+		return args
+	}
+	if barePrint, invalidBool, diagnostic := scanAntigravityCallerArgs(args); barePrint || invalidBool || diagnostic {
+		return args
+	}
+	result := make([]string, 0, len(args)+3)
+	// Permission skip first — never immediately after bare --print.
 	result = append(result, "--dangerously-skip-permissions")
-	result = append(result, args...)
+
+	flags, prompt, trailing, hasPrompt := partitionAntigravityCallerArgs(args)
+	result = append(result, flags...)
+	// Distinguish "no prompt" from an *explicit* empty prompt (args [""],
+	// --print=, or --print with no value). Omitting --print for the latter
+	// drops agy into the interactive TUI and hangs the PTY until timeout.
+	if hasPrompt {
+		result = append(result, "--print", prompt)
+	}
+	result = append(result, trailing...)
 	return result
+}
+
+// antigravityDiagnosticTokens are single-token invocations that ask the CLI for
+// information instead of running a prompt. Subcommands are from `agy --help` on
+// 1.1.11; `--version` prints the version there.
+//
+// `-v` and the equals spellings are included so their *errors* survive rather
+// than becoming prompts — on 1.1.11 `agy -v` reports "flag needs an argument:
+// -v" (it is an int flag, not a version alias), `agy -v=true` reports an
+// invalid value, and `agy --version=true` prints nothing at all. None of those
+// should turn into a permission-skipping model run.
+var antigravityDiagnosticTokens = map[string]bool{
+	"--version": true, "-version": true, "-v": true,
+	"--help": true, "-help": true, "-h": true,
+	"agent": true, "agents": true, "changelog": true, "help": true,
+	"install": true, "models": true, "plugin": true, "plugins": true,
+	"update": true,
+}
+
+// antigravityGlobalDiagnosticTokens are handled wherever they appear in argv.
+// agy pre-scans its whole command line for these, ahead of Go's flag parsing:
+// on 1.1.12 `agy review --help` and even `agy explain the --help flag please`
+// print the usage banner, and `agy review -version` prints the version, instead
+// of running the prompt. Reshaping those into a --print value would launch a
+// permission-skipping model run the caller would never have got.
+//
+// `-v` is deliberately absent: it is an ordinary int flag, so `agy review -v
+// now` really does run the prompt.
+var antigravityGlobalDiagnosticTokens = map[string]bool{
+	"--version": true, "-version": true,
+	"--help": true, "-help": true, "-h": true,
+}
+
+// isAntigravityDiagnosticInvocation reports an invocation agy answers with
+// information instead of a model run.
+//
+// Two shapes: a global diagnostic flag anywhere in argv (see above), or a lone
+// diagnostic token in the bare or `flag=value` spelling. The lone-token rule
+// covers the bare subcommands and `-v`, which only act in the leading flag
+// region — a brief can legitimately start with a word like "help" or "update".
+func isAntigravityDiagnosticInvocation(args []string) bool {
+	for _, a := range args {
+		if antigravityGlobalDiagnosticTokens[a] {
+			return true
+		}
+	}
+	if len(args) != 1 {
+		return false
+	}
+	if antigravityDiagnosticTokens[args[0]] {
+		return true
+	}
+	name, _, ok := splitAntigravityEqualsFlag(args[0])
+	return ok && antigravityDiagnosticTokens[name]
+}
+
+// antigravityValuedFlags are agy flags whose next argv token is their value.
+// Only exact known flags are peeled off the front of caller args so a brief
+// that happens to start with "-" (markdown hr, bullet) is still treated as
+// prompt text.
+var antigravityValuedFlags = map[string]bool{
+	"--add-dir": true, "--agent": true, "--conversation": true,
+	"--effort": true, "--json-schema": true, "--log-file": true,
+	"--mode": true, "--model": true, "--output-format": true,
+	"--print-timeout": true, "--project": true,
+	"--prompt-interactive": true, "-i": true,
+}
+
+// antigravityBoolFlags are agy flags that take no value. Injected duplicates
+// of --dangerously-skip-permissions are stripped; --continue/-c are stripped
+// (cross-chat contamination risk — same rule as native chat).
+var antigravityBoolFlags = map[string]bool{
+	"--dangerously-skip-permissions": true,
+	"--disable-slash-commands":       true,
+	"--new-project":                  true,
+	"--sandbox":                      true,
+	"--continue":                     true,
+	"-c":                             true,
+}
+
+// partitionAntigravityCallerArgs peels known leading agy flags off args and
+// returns a single --print value. When the caller already used --print /
+// --print=value, only that one value is the prompt — subsequent recognized
+// flags (e.g. --conversation <id> from buildAntigravityNativeArgs) stay
+// options, not prompt text. Without an explicit --print, the remainder is
+// joined as the prompt. Unknown tokens (including anything that merely starts
+// with "-") begin the prompt when no --print was seen.
+//
+// hasPrompt is true when the caller supplied a print value — including an
+// *empty* one ("" / --print= / bare --print). It is false only when no prompt
+// material was present at all (so the builder should omit --print).
+func partitionAntigravityCallerArgs(args []string) (flags []string, prompt string, trailing []string, hasPrompt bool) {
+	i := 0
+	var printVal string
+	gotPrint := false
+	// dangling holds a recognized valued flag that arrived without its operand.
+	// It must stay behind the prompt so it cannot consume --print.
+	var dangling []string
+	// postFlags keeps flags that followed the explicit print value in that same
+	// position. Hoisting them ahead of the prompt would reverse shell expansion
+	// order: `agy --print "${x:=review}" --add-dir "$x"` passes review to both,
+	// but `--add-dir "$x" --print "${x:=review}"` passes an empty --add-dir
+	// (verified in bash 5.2.21 with a stub agy). agy itself accepts options
+	// after the print value -- that is the native resume shape.
+	var postFlags []string
+	addFlag := func(tokens ...string) {
+		if gotPrint {
+			postFlags = append(postFlags, tokens...)
+			return
+		}
+		flags = append(flags, tokens...)
+	}
+	for i < len(args) {
+		// Classify on the canonical spelling (Go accepts -flag and --flag alike)
+		// but keep the caller's own token when re-emitting it.
+		raw := args[i]
+		a := canonicalAntigravityFlag(raw)
+		// `--` ends flag parsing and is itself dropped, so the implicit prompt
+		// starts after it. After an explicit print value it must stay on the
+		// command line: dropping it would expose the remaining positionals to
+		// flag parsing again, turning `agy --print review -- --model gemini`
+		// into a real --model selection.
+		if a == antigravityFlagTerminator {
+			if !gotPrint {
+				i++
+			}
+			break
+		}
+		// Match only exact lowercase CLI spellings (agy flag names are
+		// case-sensitive). Uppercase forms like --PRINT are prompt text.
+
+		// Equals-form: --flag=value / -p=value
+		if name, val, ok := splitAntigravityEqualsFlag(a); ok {
+			name = canonicalAntigravityFlag(name)
+			if isAntigravityPrintFlag(name) {
+				// Explicit print value (possibly empty). Keep peeling flags
+				// after it so `--print=hi --conversation id` preserves options.
+				printVal = val
+				gotPrint = true
+				i++
+				continue
+			}
+			// `-c` is agy's documented short alias for --continue, and Go's
+			// flag package accepts `-c=true` for booleans, so the equals form
+			// must be stripped here too or the cross-chat-contamination guard
+			// is bypassed.
+			if name == "--dangerously-skip-permissions" || name == "--continue" || name == "-c" {
+				i++
+				continue
+			}
+			if antigravityValuedFlags[name] || antigravityBoolFlags[name] {
+				addFlag(a)
+				i++
+				continue
+			}
+			// Unknown --foo=bar → prompt starts here (only if no --print yet).
+			break
+		}
+
+		if isAntigravityPrintFlag(a) {
+			// --print / -p / --prompt takes exactly one value token. Bare
+			// --print with no following token is still an explicit empty print.
+			i++
+			gotPrint = true
+			if i < len(args) {
+				printVal = args[i]
+				i++
+			} else {
+				printVal = ""
+			}
+			continue
+		}
+
+		if antigravityBoolFlags[a] {
+			// Strip injected / unsafe flags; keep other booleans.
+			if a == "--dangerously-skip-permissions" || a == "--continue" || a == "-c" {
+				i++
+				continue
+			}
+			addFlag(raw)
+			i++
+			continue
+		}
+
+		if antigravityValuedFlags[a] {
+			if i+1 >= len(args) {
+				// Recognized valued flag with no operand (always the last
+				// token). Hoisting it into flags would emit
+				// `--conversation --print review`, where agy takes `--print` as
+				// the conversation value and the one-shot silently disappears.
+				// Keep it last so --print <prompt> stays intact.
+				dangling = append(dangling, raw)
+				i++
+				continue
+			}
+			addFlag(raw, args[i+1])
+			i += 2
+			continue
+		}
+
+		// First non-flag token → prompt starts here (may begin with "-" or be "").
+		break
+	}
+	if gotPrint {
+		// Anything not recognized after an explicit print value must remain on
+		// argv so agy can preserve its own positional/unknown-option behavior.
+		trailing := append([]string{}, postFlags...)
+		trailing = append(trailing, args[i:]...)
+		return flags, printVal, append(trailing, dangling...), true
+	}
+	if i < len(args) {
+		return flags, strings.Join(args[i:], " "), dangling, true
+	}
+	return flags, "", dangling, false
+}
+
+// scanAntigravityCallerArgs walks the caller's tokens the same way the
+// partitioner does — consuming each recognized flag's operand and stopping at
+// the first token that starts the prompt — and reports two invocations that
+// must reach agy untouched instead of being reshaped.
+//
+// barePrint: a `--print` / `-p` / `--prompt` that runs out of argv before its
+// operand. agy's string flag then has no value and the CLI exits with `flag
+// needs an argument: -print` (1.1.11), so inventing an empty prompt would turn
+// a caller error into a permission-skipping model run. Passing the argv through
+// preserves that error and — unlike omitting --print — cannot drop agy into the
+// TUI. Note `agy --print --print` is NOT bare: the second token is the first
+// flag's value, a valid one-shot with the prompt "--print".
+//
+// invalidBool: an equals-form spelling of a flag the safety guard strips whose
+// value is not a Go boolean. `agy --continue=maybe review` exits with `invalid
+// boolean value "maybe" for -continue`, so stripping the token would run a
+// prompt the caller never got. Flags we forward rather than strip need no check
+// — they reach agy and produce their own error.
+//
+// Both stop at the prompt boundary: in `agy review --continue=maybe` the flag
+// text is prompt material (Go's flag parsing already stopped at `review`), so
+// it must not block the reshape.
+func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnostic bool) {
+	stripped := func(name string) bool {
+		return name == "--dangerously-skip-permissions" || name == "--continue" || name == "-c"
+	}
+	for i := 0; i < len(args); i++ {
+		a := canonicalAntigravityFlag(args[i])
+		if a == antigravityFlagTerminator {
+			return barePrint, invalidBool, diagnostic // `--` ends flag parsing
+		}
+		if name, val, ok := splitAntigravityEqualsFlag(a); ok {
+			name = canonicalAntigravityFlag(name)
+			// An equals-form probe in the flag region is answered (or rejected)
+			// by agy rather than run: `agy --model gemini -v=true` reports an
+			// invalid value for the int flag `-v`, so folding it into a --print
+			// value would start a model run the caller never got.
+			if antigravityDiagnosticTokens[name] {
+				diagnostic = true
+				return barePrint, invalidBool, diagnostic
+			}
+			// `--print=` carries a value (possibly empty).
+			if isAntigravityPrintFlag(name) {
+				continue
+			}
+			if antigravityValuedFlags[name] || antigravityBoolFlags[name] {
+				if stripped(name) {
+					if _, err := strconv.ParseBool(val); err != nil {
+						invalidBool = true
+					}
+				}
+				continue
+			}
+			return barePrint, invalidBool, diagnostic // unknown token: the prompt starts here
+		}
+		if isAntigravityPrintFlag(a) {
+			if i+1 >= len(args) {
+				barePrint = true
+				return barePrint, invalidBool, diagnostic
+			}
+			i++ // the next token is this flag's value, whatever it looks like
+			continue
+		}
+		if antigravityBoolFlags[a] {
+			continue
+		}
+		if antigravityValuedFlags[a] {
+			if i+1 >= len(args) {
+				return barePrint, invalidBool, diagnostic // dangling flag: handled by the partitioner
+			}
+			i++
+			continue
+		}
+		// A flag-shaped diagnostic token in the leading flag region is answered
+		// or rejected by agy rather than run: `agy --model gemini -v` reports
+		// `flag needs an argument: -v` on 1.1.12, so folding it into a --print
+		// value would start a model run the caller never got. (Bare words such
+		// as `models` are not included here — past the first flag they are
+		// ordinary prompt text.)
+		if strings.HasPrefix(a, "-") && antigravityDiagnosticTokens[a] {
+			diagnostic = true
+			return barePrint, invalidBool, diagnostic
+		}
+		return barePrint, invalidBool, diagnostic // first non-flag token: the prompt starts here
+	}
+	return barePrint, invalidBool, diagnostic
+}
+
+// canonicalAntigravityFlag normalizes a single-dash long flag to its double-dash
+// spelling. Go's flag package treats `-flag` and `--flag` as the same option —
+// verified on agy 1.1.12, where `agy -model` reports `flag needs an argument:
+// -model` — so classification must accept both. Short flags (-p, -c, -h) and
+// non-flag tokens are returned unchanged, and callers keep the caller's own
+// spelling when re-emitting the token.
+func canonicalAntigravityFlag(tok string) string {
+	if len(tok) < 3 || !strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "--") {
+		return tok
+	}
+	double := "-" + tok
+	if antigravityValuedFlags[double] || antigravityBoolFlags[double] || isAntigravityPrintFlag(double) {
+		return double
+	}
+	return tok
+}
+
+// antigravityFlagTerminator is Go's `--`: it ends flag parsing and is dropped
+// from the argument list, so `agy -- review` has the prompt `review`, not
+// `-- review`.
+const antigravityFlagTerminator = "--"
+
+func isAntigravityPrintFlag(name string) bool {
+	return name == "--print" || name == "-p" || name == "--prompt"
+}
+
+// splitAntigravityEqualsFlag returns (flagName, value, true) for --flag=value
+// forms. The flag name is matched case-sensitively against known CLI spellings;
+// the value keeps the original token's casing.
+func splitAntigravityEqualsFlag(raw string) (name, val string, ok bool) {
+	eq := strings.IndexByte(raw, '=')
+	if eq <= 0 {
+		return "", "", false
+	}
+	name = raw[:eq]
+	if !strings.HasPrefix(name, "-") {
+		return "", "", false
+	}
+	return name, raw[eq+1:], true
 }
 
 // grokKnownSubcommands are the `grok <cmd>` subcommands whose argv grammar must

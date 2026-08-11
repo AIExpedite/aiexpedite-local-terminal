@@ -676,19 +676,38 @@ func TestRedactAntigravitySecrets_PreservesShortDiagnostics(t *testing.T) {
 	}
 }
 
-// Ensure legacy one-shot builder is unchanged (regression guard).
-func TestLegacyBuildAntigravityInteractiveArgs_Unchanged(t *testing.T) {
+// Session one-shot builder must match the native-chat --print VALUE contract
+// (agy ≥ 1.1.x). Previously this test froze the broken order
+// (`--print --dangerously-skip-permissions <prompt>`), which made agy treat
+// the permission flag as the prompt.
+func TestBuildAntigravityInteractiveArgs_MatchesNativePrintContract(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{"do the task"})
-	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "--print") {
-		t.Fatalf("legacy one-shot must still use --print: %q", joined)
+	if len(args) != 3 ||
+		args[0] != "--dangerously-skip-permissions" ||
+		args[1] != "--print" ||
+		args[2] != "do the task" {
+		t.Fatalf("want [skip --print do the task], got %#v", args)
 	}
-	if !strings.Contains(joined, "--dangerously-skip-permissions") {
-		t.Fatalf("legacy one-shot still uses permission skip: %q", joined)
+	// Native path uses the same --print <prompt> adjacency (dangerous flags
+	// prepended separately in runOneShot).
+	native := append(antigravityDangerousFlags(), buildAntigravityNativeArgs("do the task", "")...)
+	if strings.Join(args, "\x00") != strings.Join(native, "\x00") {
+		t.Fatalf("interactive one-shot %#v must match native first-turn %#v", args, native)
 	}
-	// Prompt remains positional on the legacy path.
-	if args[len(args)-1] != "do the task" {
-		t.Fatalf("legacy path keeps positional prompt: %#v", args)
+}
+
+// Native resume shape `--print <prompt> --conversation <id>` must keep the
+// conversation flag as an option, not fold it into the print value.
+func TestBuildAntigravityInteractiveArgs_PreservesTrailingConversation(t *testing.T) {
+	args := buildAntigravityInteractiveArgs([]string{"--print", "fix bug", "--conversation", "abc-123"})
+	want := []string{"--dangerously-skip-permissions", "--print", "fix bug", "--conversation", "abc-123"}
+	if len(args) != len(want) {
+		t.Fatalf("got %#v, want %#v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("args[%d]=%q, want %q (full %#v)", i, args[i], want[i], args)
+		}
 	}
 }
 
