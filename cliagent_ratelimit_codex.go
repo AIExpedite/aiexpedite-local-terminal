@@ -1713,6 +1713,10 @@ func mergeCodexRolloutFrame(acc, updates map[string]map[string]codexRateLimitBuc
 
 			if !b.usageKnown && sameLiveWindow && prev.usageKnown {
 				b.UsedPercentage = prev.UsedPercentage
+				// The sparse frame re-observed the reset, not utilization. Keep the
+				// carried percentage paired with its original observation time so
+				// repeated rollout heartbeats cannot make stale usage appear fresh.
+				b.ObservedAtMs = prev.ObservedAtMs
 				b.usageKnown = true
 			}
 			if !b.resetKnown && priorStillLive {

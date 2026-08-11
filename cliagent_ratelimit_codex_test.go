@@ -836,6 +836,41 @@ func TestMergeCodexBucketMostConstrained_LiveKnownResetTieKeepsFreshestObservati
 	}
 }
 
+func TestMergeCodexRolloutFrame_ResetOnlyPreservesUsageObservationTime(t *testing.T) {
+	frameTime := time.Date(2026, 6, 15, 12, 30, 0, 0, time.UTC)
+	resetAt := frameTime.Add(time.Hour).UnixMilli()
+	originalObservedAt := frameTime.Add(-30 * time.Minute).UnixMilli()
+	acc := map[string]map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			"codex_primary": {
+				UsedPercentage: 64,
+				ResetsAtMs:     resetAt,
+				ObservedAtMs:   originalObservedAt,
+				usageKnown:     true,
+				resetKnown:     true,
+			},
+		},
+	}
+	updates := map[string]map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			"codex_primary": {
+				ResetsAtMs:   resetAt,
+				ObservedAtMs: frameTime.UnixMilli(),
+				resetKnown:   true,
+			},
+		},
+	}
+
+	mergeCodexRolloutFrame(acc, updates, frameTime)
+	got := acc[codexWindowPrimary]["codex_primary"]
+	if !got.usageKnown || got.UsedPercentage != 64 {
+		t.Errorf("carried usage=(known=%v, used=%v), want true/64", got.usageKnown, got.UsedPercentage)
+	}
+	if got.ObservedAtMs != originalObservedAt {
+		t.Errorf("ObservedAtMs=%d, want original usage observation %d", got.ObservedAtMs, originalObservedAt)
+	}
+}
+
 func TestMergeCodexBucketMostConstrained_TieWithoutCommonResetKeepsFreshObservation(t *testing.T) {
 	older := codexRateLimitBucket{
 		UsedPercentage: 50,
