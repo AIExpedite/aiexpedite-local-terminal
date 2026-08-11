@@ -800,6 +800,34 @@ func TestBuildAntigravityInteractiveArgs_SingleDashAndTerminator(t *testing.T) {
 			t.Errorf("shaped %q = %q, want %q", tc.orig, shaped[1], tc.want)
 		}
 	}
+	// After an explicit print value the terminator must stay: dropping it would
+	// re-expose the trailing positionals to flag parsing and really select a
+	// model.
+	if got := buildAntigravityInteractiveArgs([]string{"--print", "review", "--", "--model", "gemini"}); !reflect.DeepEqual(
+		got, []string{"--dangerously-skip-permissions", "--print", "review", "--", "--model", "gemini"}) {
+		t.Errorf("terminator after explicit print = %#v", got)
+	}
+	_, shapedTerm := shapePTYExecArgs("bash", []string{"-c", `agy --print review -- --model gemini`})
+	wantTerm := `agy --dangerously-skip-permissions --print review -- --model gemini`
+	if shapedTerm[1] != wantTerm {
+		t.Errorf("shell-wrapped terminator = %q, want %q", shapedTerm[1], wantTerm)
+	}
+	// An equals-form probe inside the leading flag region is answered (or
+	// rejected) by agy: `-v=true` is an invalid value for its int flag, so the
+	// invocation must reach agy instead of becoming a prompt.
+	for _, in := range [][]string{
+		{"--model", "gemini", "-v=true"},
+		{"--model", "gemini", "--help=true"},
+	} {
+		if got := buildAntigravityInteractiveArgs(in); !reflect.DeepEqual(got, in) {
+			t.Errorf("buildAntigravityInteractiveArgs(%#v) = %#v, want it unchanged", in, got)
+		}
+	}
+	origProbe := `agy --model gemini -v=true`
+	_, shapedProbe := shapePTYExecArgs("bash", []string{"-c", origProbe})
+	if shapedProbe[1] != origProbe {
+		t.Errorf("shell-wrapped equals probe = %q, want it unchanged", shapedProbe[1])
+	}
 	// Short flags keep their meaning: -p is print, -c is the stripped continue.
 	if got := buildAntigravityInteractiveArgs([]string{"-p", "review"}); !reflect.DeepEqual(
 		got, []string{"--dangerously-skip-permissions", "--print", "review"}) {

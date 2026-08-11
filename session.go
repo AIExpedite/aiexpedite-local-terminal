@@ -1953,7 +1953,7 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	if isAntigravityDiagnosticInvocation(args) {
 		return args
 	}
-	if barePrint, invalidBool := scanAntigravityCallerArgs(args); barePrint || invalidBool {
+	if barePrint, invalidBool, diagnostic := scanAntigravityCallerArgs(args); barePrint || invalidBool || diagnostic {
 		return args
 	}
 	result := make([]string, 0, len(args)+3)
@@ -2087,10 +2087,15 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 		// but keep the caller's own token when re-emitting it.
 		raw := args[i]
 		a := canonicalAntigravityFlag(raw)
-		// `--` ends flag parsing and is itself dropped, so the prompt starts
-		// after it.
+		// `--` ends flag parsing and is itself dropped, so the implicit prompt
+		// starts after it. After an explicit print value it must stay on the
+		// command line: dropping it would expose the remaining positionals to
+		// flag parsing again, turning `agy --print review -- --model gemini`
+		// into a real --model selection.
 		if a == antigravityFlagTerminator {
-			i++
+			if !gotPrint {
+				i++
+			}
 			break
 		}
 		// Match only exact lowercase CLI spellings (agy flag names are
@@ -2203,17 +2208,25 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 // Both stop at the prompt boundary: in `agy review --continue=maybe` the flag
 // text is prompt material (Go's flag parsing already stopped at `review`), so
 // it must not block the reshape.
-func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool bool) {
+func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnostic bool) {
 	stripped := func(name string) bool {
 		return name == "--dangerously-skip-permissions" || name == "--continue" || name == "-c"
 	}
 	for i := 0; i < len(args); i++ {
 		a := canonicalAntigravityFlag(args[i])
 		if a == antigravityFlagTerminator {
-			return barePrint, invalidBool // `--` ends flag parsing
+			return barePrint, invalidBool, diagnostic // `--` ends flag parsing
 		}
 		if name, val, ok := splitAntigravityEqualsFlag(a); ok {
 			name = canonicalAntigravityFlag(name)
+			// An equals-form probe in the flag region is answered (or rejected)
+			// by agy rather than run: `agy --model gemini -v=true` reports an
+			// invalid value for the int flag `-v`, so folding it into a --print
+			// value would start a model run the caller never got.
+			if antigravityDiagnosticTokens[name] {
+				diagnostic = true
+				return barePrint, invalidBool, diagnostic
+			}
 			// `--print=` carries a value (possibly empty).
 			if isAntigravityPrintFlag(name) {
 				continue
@@ -2226,12 +2239,12 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool bool) {
 				}
 				continue
 			}
-			return barePrint, invalidBool // unknown token: the prompt starts here
+			return barePrint, invalidBool, diagnostic // unknown token: the prompt starts here
 		}
 		if isAntigravityPrintFlag(a) {
 			if i+1 >= len(args) {
 				barePrint = true
-				return barePrint, invalidBool
+				return barePrint, invalidBool, diagnostic
 			}
 			i++ // the next token is this flag's value, whatever it looks like
 			continue
@@ -2241,14 +2254,14 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool bool) {
 		}
 		if antigravityValuedFlags[a] {
 			if i+1 >= len(args) {
-				return barePrint, invalidBool // dangling flag: handled by the partitioner
+				return barePrint, invalidBool, diagnostic // dangling flag: handled by the partitioner
 			}
 			i++
 			continue
 		}
-		return barePrint, invalidBool // first non-flag token: the prompt starts here
+		return barePrint, invalidBool, diagnostic // first non-flag token: the prompt starts here
 	}
-	return barePrint, invalidBool
+	return barePrint, invalidBool, diagnostic
 }
 
 // canonicalAntigravityFlag normalizes a single-dash long flag to its double-dash
