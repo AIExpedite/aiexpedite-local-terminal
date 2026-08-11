@@ -872,13 +872,26 @@ func TestShapePTYExecArgs_ShellWrappedPreservesQuoteSemantics(t *testing.T) {
 	}
 }
 
-// Parameter expansion in double-quoted shell payloads must survive rebuild:
-// agy "$TASK" → --print "$TASK" (not "\$TASK").
+// Parameter expansion after a literal prompt boundary must survive rebuild.
+// A leading expansion is left unshaped because it can evaluate to an agy flag.
 func TestShapePTYExecArgs_PreservesParameterExpansion(t *testing.T) {
-	_, args := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK"`})
-	want := `agy --dangerously-skip-permissions --print "$TASK"`
+	origLeading := `agy "$TASK"`
+	_, leading := shapePTYExecArgs("bash", []string{"-c", origLeading})
+	if leading[1] != origLeading {
+		t.Errorf("leading expanding word was reshaped: got %q, want original %q", leading[1], origLeading)
+	}
+
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy review "$TASK"`})
+	want := `agy --dangerously-skip-permissions --print "review $TASK"`
 	if args[1] != want {
 		t.Errorf("expanding prompt = %q, want %q", args[1], want)
+	}
+
+	// An explicit print operand cannot be reclassified as a flag.
+	_, explicit := shapePTYExecArgs("bash", []string{"-c", `agy --print "$TASK"`})
+	wantExplicit := `agy --dangerously-skip-permissions --print "$TASK"`
+	if explicit[1] != wantExplicit {
+		t.Errorf("explicit expanding print = %q, want %q", explicit[1], wantExplicit)
 	}
 
 	// Single-quoted $ stays literal (prefer single quotes on rebuild).
@@ -886,6 +899,26 @@ func TestShapePTYExecArgs_PreservesParameterExpansion(t *testing.T) {
 	wantLit := `agy --dangerously-skip-permissions --print '$TASK'`
 	if litArgs[1] != wantLit {
 		t.Errorf("literal $ prompt = %q, want %q", litArgs[1], wantLit)
+	}
+}
+
+func TestShapePTYExecArgs_DeclinesExpansionBeforePromptBoundary(t *testing.T) {
+	for _, orig := range []string{
+		`agy "$FLAG" review`,
+		`agy "$FLAG"`,
+	} {
+		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("leading flag-capable expansion was reshaped: got %q, want original %q", args[1], orig)
+		}
+	}
+
+	// Once a literal positional starts the prompt, later expansions cannot be
+	// parsed as flags by agy's Go flag parser.
+	_, safe := shapePTYExecArgs("bash", []string{"-c", `agy review "$FLAG"`})
+	wantSafe := `agy --dangerously-skip-permissions --print "review $FLAG"`
+	if safe[1] != wantSafe {
+		t.Errorf("post-boundary expansion = %q, want %q", safe[1], wantSafe)
 	}
 }
 
@@ -908,14 +941,14 @@ func TestShapePTYExecArgs_KeepsEscapedCommandSubstitutionLiteral(t *testing.T) {
 
 	// Escaped $(...) followed by a later legitimate expansion in the same
 	// double-quoted region must not OR Expand over the escaped dollars.
-	_, mixArgs := shapePTYExecArgs("bash", []string{"-c", `agy "\$(touch /tmp/pwn)$TASK"`})
+	_, mixArgs := shapePTYExecArgs("bash", []string{"-c", `agy --print "\$(touch /tmp/pwn)$TASK"`})
 	wantMix := `agy --dangerously-skip-permissions --print '$(touch /tmp/pwn)'"$TASK"`
 	if mixArgs[1] != wantMix {
 		t.Errorf("escaped+expand mix = %q, want %q", mixArgs[1], wantMix)
 	}
 
 	// Reverse order: expand first, then escaped substitution in the same region.
-	_, revArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK\$(touch /tmp/pwn)"`})
+	_, revArgs := shapePTYExecArgs("bash", []string{"-c", `agy --print "$TASK\$(touch /tmp/pwn)"`})
 	wantRev := `agy --dangerously-skip-permissions --print "$TASK"'$(touch /tmp/pwn)'`
 	if revArgs[1] != wantRev {
 		t.Errorf("expand+escaped mix = %q, want %q", revArgs[1], wantRev)
@@ -950,15 +983,15 @@ func TestShapePTYExecArgs_PreservesPerFragmentExpansion(t *testing.T) {
 	}
 
 	// Expanding + literal-with-$ uses adjacent quote concatenation.
-	_, mixArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK" '$(touch /tmp/pwn)'`})
-	wantMix := `agy --dangerously-skip-permissions --print "$TASK"" "'$(touch /tmp/pwn)'`
+	_, mixArgs := shapePTYExecArgs("bash", []string{"-c", `agy review "$TASK" '$(touch /tmp/pwn)'`})
+	wantMix := `agy --dangerously-skip-permissions --print review" ""$TASK"" "'$(touch /tmp/pwn)'`
 	if mixArgs[1] != wantMix {
 		t.Errorf("mixed expand/literal = %q, want %q", mixArgs[1], wantMix)
 	}
 
 	// Concatenated quote segments within ONE shell word (no space between):
 	// "$TASK"'$(touch /tmp/pwn)' must not OR Expand across segments.
-	_, concatArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK"'$(touch /tmp/pwn)'`})
+	_, concatArgs := shapePTYExecArgs("bash", []string{"-c", `agy --print "$TASK"'$(touch /tmp/pwn)'`})
 	wantConcat := `agy --dangerously-skip-permissions --print "$TASK"'$(touch /tmp/pwn)'`
 	if concatArgs[1] != wantConcat {
 		t.Errorf("concatenated segments = %q, want %q", concatArgs[1], wantConcat)
@@ -984,7 +1017,7 @@ func TestShapePTYExecArgs_PreservesPerFragmentExpansion(t *testing.T) {
 	// Same for `$` + literal name suffix (must not become one double-quoted
 	// `$TASKmore` which would expand a different variable name). Adjacent
 	// unquoted more is fine — bash concatenates `"$TASK"more` → TASK+more.
-	_, nameArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK"'more'`})
+	_, nameArgs := shapePTYExecArgs("bash", []string{"-c", `agy --print "$TASK"'more'`})
 	wantName := `agy --dangerously-skip-permissions --print "$TASK"more`
 	if nameArgs[1] != wantName {
 		t.Errorf("expandable $TASK + literal more = %q, want %q", nameArgs[1], wantName)
@@ -992,8 +1025,8 @@ func TestShapePTYExecArgs_PreservesPerFragmentExpansion(t *testing.T) {
 
 	// Multi-word with multi-seg expand (`"$x"'y' more`): must not flatten to
 	// `"$xy more"` (wrong parameter name). Per-word/segment quoting.
-	_, multiSegMore := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK"'x' more`})
-	wantMultiSegMore := `agy --dangerously-skip-permissions --print "$TASK"x" "more`
+	_, multiSegMore := shapePTYExecArgs("bash", []string{"-c", `agy review "$TASK"'x' more`})
+	wantMultiSegMore := `agy --dangerously-skip-permissions --print review" ""$TASK"x" "more`
 	if multiSegMore[1] != wantMultiSegMore {
 		t.Errorf("multi-seg expand + more = %q, want %q", multiSegMore[1], wantMultiSegMore)
 	}
@@ -1696,9 +1729,10 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		}
 	}
 
-	// Double-quoted multi-frag expand may still join into one --print value.
-	_, dq := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK" more`})
-	wantDQ := `agy --dangerously-skip-permissions --print "$TASK more"`
+	// A double-quoted expansion after a literal boundary may still join into
+	// one --print value.
+	_, dq := shapePTYExecArgs("bash", []string{"-c", `agy review "$TASK" more`})
+	wantDQ := `agy --dangerously-skip-permissions --print "review $TASK more"`
 	if dq[1] != wantDQ {
 		t.Errorf("double-quoted multi-frag expand = %q, want %q", dq[1], wantDQ)
 	}
@@ -1727,7 +1761,7 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 
 	// Literal "[@]" in an operator default is not multi-field — Bash yields a
 	// single field (e.g. foo[@] when x is unset). Still reshape with --print.
-	_, litAt := shapePTYExecArgs("bash", []string{"-c", `agy "${x:-foo[@]}"`})
+	_, litAt := shapePTYExecArgs("bash", []string{"-c", `agy --print "${x:-foo[@]}"`})
 	wantLitAt := `agy --dangerously-skip-permissions --print "${x:-foo[@]}"`
 	if litAt[1] != wantLitAt {
 		t.Errorf("literal [@] in PE default = %q, want %q", litAt[1], wantLitAt)
@@ -1946,11 +1980,11 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		t.Errorf("zsh -f unmatched bracket was reshaped: got %q", zshDashFBracket[len(zshDashFBracket)-1])
 	}
 
-	// bash: $argv / $path / $TASK are ordinary scalars — still reshape.
+	// bash: $argv / $path / $TASK are ordinary scalar print values.
 	for _, c := range []struct{ orig, want string }{
-		{`agy "$argv"`, `agy --dangerously-skip-permissions --print "$argv"`},
-		{`agy "$TASK"`, `agy --dangerously-skip-permissions --print "$TASK"`},
-		{`agy "${(U)TASK}"`, `agy --dangerously-skip-permissions --print "${(U)TASK}"`},
+		{`agy --print "$argv"`, `agy --dangerously-skip-permissions --print "$argv"`},
+		{`agy --print "$TASK"`, `agy --dangerously-skip-permissions --print "$TASK"`},
+		{`agy --print "${(U)TASK}"`, `agy --dangerously-skip-permissions --print "${(U)TASK}"`},
 	} {
 		_, bashArgs := shapePTYExecArgs("bash", []string{"-c", c.orig})
 		if bashArgs[1] != c.want {
@@ -1961,7 +1995,7 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	// letters belong to the operand, not to a parameter name (zsh 5.9:
 	// `zsh -c 'printf [%s] "${1:-review}"'` → `[review]`). Nested expansions in
 	// the operand are still inspected, so `${1:-$TASK}` declines.
-	_, zshPositional := shapePTYExecArgs("zsh", []string{"-c", `agy "${1:-review}"`})
+	_, zshPositional := shapePTYExecArgs("zsh", []string{"-c", `agy --print "${1:-review}"`})
 	wantZshPositional := `agy --dangerously-skip-permissions --print "${1:-review}"`
 	if zshPositional[1] != wantZshPositional {
 		t.Errorf("zsh positional default = %q, want %q", zshPositional[1], wantZshPositional)
@@ -1975,13 +2009,12 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 			t.Errorf("zsh nested named param in operand was reshaped: got %q, want original %q", zshNested[1], orig)
 		}
 	}
-	// zsh: provably single-field forms still reshape — command / arithmetic
-	// substitutions and length counts cannot be arrays regardless of .zshenv.
+	// zsh: provably single-field forms remain safe explicit print values.
 	for _, c := range []struct{ orig, want string }{
-		{`agy "$(cat brief.txt)"`, `agy --dangerously-skip-permissions --print "$(cat brief.txt)"`},
-		{`agy "$((1 + 2))"`, `agy --dangerously-skip-permissions --print "$((1 + 2))"`},
-		{`agy "${#argv}"`, `agy --dangerously-skip-permissions --print "${#argv}"`},
-		{`agy "$1"`, `agy --dangerously-skip-permissions --print "$1"`},
+		{`agy --print "$(cat brief.txt)"`, `agy --dangerously-skip-permissions --print "$(cat brief.txt)"`},
+		{`agy --print "$((1 + 2))"`, `agy --dangerously-skip-permissions --print "$((1 + 2))"`},
+		{`agy --print "${#argv}"`, `agy --dangerously-skip-permissions --print "${#argv}"`},
+		{`agy --print "$1"`, `agy --dangerously-skip-permissions --print "$1"`},
 	} {
 		_, zshArgs := shapePTYExecArgs("zsh", []string{"-c", c.orig})
 		if zshArgs[1] != c.want {
@@ -1990,7 +2023,7 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	}
 
 	// "$*" / "${files[*]}" stay a single field when double-quoted — still reshape.
-	_, star := shapePTYExecArgs("bash", []string{"-c", `agy "$*"`})
+	_, star := shapePTYExecArgs("bash", []string{"-c", `agy --print "$*"`})
 	wantStar := `agy --dangerously-skip-permissions --print "$*"`
 	if star[1] != wantStar {
 		t.Errorf("quoted $* expand = %q, want %q", star[1], wantStar)
@@ -2024,10 +2057,10 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	// these payloads must reshape — with the prompt bytes preserved (verified
 	// against bash 5.2.21: both forms deliver the same argv).
 	for _, tc := range []struct{ orig, want string }{
-		{`agy "${x:-{}"`, `agy --dangerously-skip-permissions --print "${x:-{}"`},
-		{`agy "${x:-{}"foo"}"`, `agy --dangerously-skip-permissions --print "${x:-{}"foo'}'`},
-		{`agy "${x:-{}""}"`, `agy --dangerously-skip-permissions --print "${x:-{}"'}'`},
-		{`agy "${x:-a{b}c}"`, `agy --dangerously-skip-permissions --print "${x:-a{b}c}"`},
+		{`agy --print "${x:-{}"`, `agy --dangerously-skip-permissions --print "${x:-{}"`},
+		{`agy --print "${x:-{}"foo"}"`, `agy --dangerously-skip-permissions --print "${x:-{}"foo'}'`},
+		{`agy --print "${x:-{}""}"`, `agy --dangerously-skip-permissions --print "${x:-{}"'}'`},
+		{`agy --print "${x:-a{b}c}"`, `agy --dangerously-skip-permissions --print "${x:-a{b}c}"`},
 	} {
 		_, args := shapePTYExecArgs("bash", []string{"-c", tc.orig})
 		if args[1] != tc.want {
@@ -2047,14 +2080,14 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	}
 
 	// Balanced literal braces without nested quotes still reshape.
-	_, peBrace := shapePTYExecArgs("bash", []string{"-c", `agy "${x:-{}y}"`})
+	_, peBrace := shapePTYExecArgs("bash", []string{"-c", `agy --print "${x:-{}y}"`})
 	wantPEBrace := `agy --dangerously-skip-permissions --print "${x:-{}y}"`
 	if peBrace[1] != wantPEBrace {
 		t.Errorf("PE balanced literal braces = %q, want %q", peBrace[1], wantPEBrace)
 	}
 
 	// Plain double-quoted PE without nested quotes still reshapes.
-	_, pe := shapePTYExecArgs("bash", []string{"-c", `agy "${x:-foo}"`})
+	_, pe := shapePTYExecArgs("bash", []string{"-c", `agy --print "${x:-foo}"`})
 	wantPE := `agy --dangerously-skip-permissions --print "${x:-foo}"`
 	if pe[1] != wantPE {
 		t.Errorf("plain PE default = %q, want %q", pe[1], wantPE)
@@ -2081,7 +2114,7 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		}
 	}
 	// A substitution without backslashes still reshapes.
-	_, cleanSub := shapePTYExecArgs("bash", []string{"-c", `agy "$(cat brief.txt)"`})
+	_, cleanSub := shapePTYExecArgs("bash", []string{"-c", `agy --print "$(cat brief.txt)"`})
 	wantCleanSub := `agy --dangerously-skip-permissions --print "$(cat brief.txt)"`
 	if cleanSub[1] != wantCleanSub {
 		t.Errorf("clean substitution = %q, want %q", cleanSub[1], wantCleanSub)
@@ -2089,7 +2122,7 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 
 	// Literal backslash after a simple expansion (`"$ROOT\docs"`) is safe to
 	// re-double-quote — do not treat it like PE pattern escapes.
-	_, rootDocs := shapePTYExecArgs("bash", []string{"-c", `agy "$ROOT\docs"`})
+	_, rootDocs := shapePTYExecArgs("bash", []string{"-c", `agy --print "$ROOT\docs"`})
 	wantRootDocs := `agy --dangerously-skip-permissions --print "$ROOT\\docs"`
 	if rootDocs[1] != wantRootDocs {
 		t.Errorf("expand + literal backslash = %q, want %q", rootDocs[1], wantRootDocs)
@@ -2106,7 +2139,7 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 
 	// Legacy bash arithmetic `$[…]` still expands inside double quotes — keep
 	// Expand so rebuild emits --print "$[1+2]" (not a single-quoted literal).
-	_, arith := shapePTYExecArgs("bash", []string{"-c", `agy "$[1+2]"`})
+	_, arith := shapePTYExecArgs("bash", []string{"-c", `agy --print "$[1+2]"`})
 	wantArith := `agy --dangerously-skip-permissions --print "$[1+2]"`
 	if arith[1] != wantArith {
 		t.Errorf("legacy arithmetic expand = %q, want %q", arith[1], wantArith)
@@ -2148,7 +2181,7 @@ func TestShapePTYExecArgs_DashDollarQuoteIsLiteral(t *testing.T) {
 // bare `$` (not an expansion) single-quoted and `${TASK}` double-quoted —
 // never `"$${TASK}"` (which would expand $$ as PID).
 func TestShapePTYExecArgs_PreservesExpandSegmentBoundaries(t *testing.T) {
-	_, args := shapePTYExecArgs("bash", []string{"-c", `agy "$""${TASK}"`})
+	_, args := shapePTYExecArgs("bash", []string{"-c", `agy --print "$""${TASK}"`})
 	want := `agy --dangerously-skip-permissions --print '$'"${TASK}"`
 	if args[1] != want {
 		t.Errorf("adjacent expand segments = %q, want %q", args[1], want)
@@ -2345,7 +2378,7 @@ func TestShapePTYExecArgs_RejectsEscapedExpansionInsideParam(t *testing.T) {
 	}
 
 	// Outside ${…}, escaped $ still splits cleanly into inert rebuild.
-	_, okArgs := shapePTYExecArgs("bash", []string{"-c", `agy "$TASK\$(touch /tmp/pwn)"`})
+	_, okArgs := shapePTYExecArgs("bash", []string{"-c", `agy --print "$TASK\$(touch /tmp/pwn)"`})
 	wantOK := `agy --dangerously-skip-permissions --print "$TASK"'$(touch /tmp/pwn)'`
 	if okArgs[1] != wantOK {
 		t.Errorf("escaped $ outside ${…} = %q, want %q", okArgs[1], wantOK)

@@ -2468,6 +2468,15 @@ func partitionAntigravityCallerShellWords(words []shellWord, zshEquals bool) (fl
 		return flags, printFrags, append(trailing, dangling...), true, true
 	}
 	if i < len(words) {
+		// An expansion in the first would-be positional can still become an agy
+		// flag after the shell evaluates it. For example, with FLAG=--print,
+		// `agy "$FLAG" review` is really `agy --print review`; treating the
+		// unevaluated word as the prompt boundary instead would freeze the prompt
+		// as `--print review`. Once a literal positional has been seen, Go flag
+		// parsing has stopped and later expansions are ordinary prompt text.
+		if words[i].Expand {
+			return nil, nil, nil, false, false
+		}
 		return flags, words[i:], dangling, true, true
 	}
 	return flags, nil, dangling, false, true
