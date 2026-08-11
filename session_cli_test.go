@@ -1069,6 +1069,15 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if shelloptsNoGlob[1] != wantNoGlob {
 		t.Errorf("bash with SHELLOPTS=noglob = %q, want %q", shelloptsNoGlob[1], wantNoGlob)
 	}
+	// $SHELLOPTS is a bash variable — dash and zsh ignore it (both still glob
+	// under SHELLOPTS=noglob), so it must not leak into their classification.
+	for _, shell := range []string{"dash", "zsh"} {
+		orig := `agy review *.go`
+		_, ignored := shapePTYExecArgs(shell, []string{"-c", orig})
+		if ignored[1] != orig {
+			t.Errorf("%s with SHELLOPTS=noglob was reshaped: got %q", shell, ignored[1])
+		}
+	}
 	os.Unsetenv("SHELLOPTS")
 	t.Setenv("BASH_ENV", "/tmp/startup.sh")
 	// Same caveat for `-f`: a startup file can `set +f` and put globbing back.
@@ -2046,6 +2055,21 @@ func TestShapePTYExecArgs_PreservesTrailingOptionsAfterPrint(t *testing.T) {
 	_, zshEqDup := shapePTYExecArgs("zsh", []string{"-c", origZshEqDup})
 	if zshEqDup[1] != origZshEqDup {
 		t.Errorf("discarded zsh equals print was reshaped: got %q, want original %q", zshEqDup[1], origZshEqDup)
+	}
+	// A print that arrives after a state-mutating post-flag would be hoisted
+	// ahead of it: bash runs `agy --print first --add-dir "${x:=dir}" --print
+	// "$x"` with the prompt `dir`, while the reordered rebuild yields an empty
+	// prompt (stub-agy diff on 5.2.21). Decline those.
+	origReorder := `agy --print first --add-dir "${x:=dir}" --print "$x"`
+	_, reorder := shapePTYExecArgs("bash", []string{"-c", origReorder})
+	if reorder[1] != origReorder {
+		t.Errorf("print reordered across expanding post-flag: got %q, want original %q", reorder[1], origReorder)
+	}
+	// Literal post-flags carry no state, so those still reshape.
+	_, litReorder := shapePTYExecArgs("bash", []string{"-c", `agy --print first --add-dir /repo --print second`})
+	wantLitReorder := `agy --dangerously-skip-permissions --print second --add-dir /repo`
+	if litReorder[1] != wantLitReorder {
+		t.Errorf("literal post-flag reorder = %q, want %q", litReorder[1], wantLitReorder)
 	}
 	// Literal duplicates still reshape (last value wins, same as agy).
 	_, dupLit := shapePTYExecArgs("bash", []string{"-c", `agy --print first --print second`})

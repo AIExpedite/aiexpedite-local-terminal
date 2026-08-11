@@ -2354,7 +2354,8 @@ func partitionAntigravityCallerShellWords(words []shellWord, zshEquals bool) (fl
 			if isAntigravityPrintFlag(name) {
 				// --print=value: peel value with segment metadata after '='.
 				// Continue so later recognized flags are not swallowed.
-				if discardsExpandingPrint(printFrags, zshEquals) {
+				if discardsExpandingPrint(printFrags, zshEquals) ||
+					reordersAcrossPostFlags(postFlags, shellWordAfterEquals(words[i]), zshEquals) {
 					return nil, nil, nil, false, false
 				}
 				printFrags = []shellWord{shellWordAfterEquals(words[i])}
@@ -2387,6 +2388,19 @@ func partitionAntigravityCallerShellWords(words []shellWord, zshEquals bool) (fl
 			// "$x"` leaves x unset and the prompt empty (verified against bash
 			// 5.2.21 with a stub agy). Decline instead.
 			if discardsExpandingPrint(printFrags, zshEquals) {
+				return nil, nil, nil, false, false
+			}
+			// The final prompt is emitted before postFlags, so a print that
+			// arrives *after* a state-mutating flag operand would be evaluated
+			// too early: bash runs `agy --print first --add-dir "${x:=dir}"
+			// --print "$x"` with the prompt `dir`, while the rebuilt
+			// `--print "$x" --add-dir "${x:=dir}"` yields an empty prompt
+			// (stub-agy diff on 5.2.21). Decline when either side expands.
+			var next shellWord
+			if i+1 < len(words) {
+				next = words[i+1]
+			}
+			if reordersAcrossPostFlags(postFlags, next, zshEquals) {
 				return nil, nil, nil, false, false
 			}
 			i++
@@ -2436,6 +2450,17 @@ func partitionAntigravityCallerShellWords(words []shellWord, zshEquals bool) (fl
 		return flags, words[i:], dangling, true, true
 	}
 	return flags, nil, dangling, false, true
+}
+
+// reordersAcrossPostFlags reports a later explicit print whose value would be
+// hoisted ahead of already-collected post-print flags, where the move could
+// change what the shell computes. Harmless when neither side expands.
+func reordersAcrossPostFlags(postFlags []shellWord, next shellWord, zshEquals bool) bool {
+	if len(postFlags) == 0 {
+		return false
+	}
+	return discardsExpandingPrint(postFlags, zshEquals) ||
+		discardsExpandingPrint([]shellWord{next}, zshEquals)
 }
 
 // discardsExpandingPrint reports whether replacing these already-collected
@@ -3338,33 +3363,36 @@ type shellWrapperFlags struct {
 func shellWrapperFlagsFor(command string, args []string) shellWrapperFlags {
 	return shellWrapperFlags{
 		posix:        shellForcesPosixMode(command, args),
-		noBrace:      shellArgsDisableBraceExpand(args) && !shellOptsEnablesBraceExpand(),
-		noGlob:       shellArgsDisableGlob(command, args) || shellOptsListsNoGlob(),
+		noBrace:      shellArgsDisableBraceExpand(args) && !shellOptsListsOption(command, "braceexpand"),
+		noGlob:       shellArgsDisableGlob(command, args) || shellOptsListsOption(command, "noglob"),
 		skipsStartup: shellArgsSkipStartupFiles(command, args),
 	}
 }
 
-// shellOptsEnablesBraceExpand reports an inherited $SHELLOPTS that lists
-// `braceexpand`. Bash re-enables every option named there after applying the
-// invocation flags, so `env SHELLOPTS=braceexpand bash +B -c 'printf "[%s]"
-// {a,b}'` prints `[a][b]` on 5.2.21 — the `+B` is overridden and cannot be
-// trusted. SHELLOPTS only turns options on, so it never undoes `-f`: the same
-// wrapper with `-f` still passes a literal `f*`.
-func shellOptsEnablesBraceExpand() bool {
-	for _, opt := range strings.Split(os.Getenv("SHELLOPTS"), ":") {
-		if opt == "braceexpand" {
-			return true
+// shellOptsListsOption reports an inherited $SHELLOPTS that names opt. Bash
+// re-enables every option listed there after applying the invocation flags, so
+// `env SHELLOPTS=braceexpand bash +B -c 'printf "[%s]" {a,b}'` prints `[a][b]`
+// on 5.2.21 (the `+B` cannot be trusted) and `env SHELLOPTS=noglob bash -c
+// 'printf "[%s]" f*'` prints `[f*]` with no `-f` at all.
+//
+// $SHELLOPTS is a bash variable: dash and zsh ignore it entirely (verified —
+// both still glob under `SHELLOPTS=noglob`), so this only applies to
+// bash-family wrappers. Bare `sh` resolves like the other dialect checks.
+//
+// Note the asymmetry: SHELLOPTS only turns options *on*, so it can override a
+// `+B` disable but never undoes `-f`.
+func shellOptsListsOption(command, opt string) bool {
+	switch shellCommandBase(command) {
+	case "bash":
+	case "sh":
+		if !shellShIsBashFamily(command) {
+			return false
 		}
+	default:
+		return false
 	}
-	return false
-}
-
-// shellOptsListsNoGlob reports an inherited $SHELLOPTS that lists `noglob`,
-// which bash applies even without a `-f` flag: `env SHELLOPTS=noglob bash -c
-// 'printf "[%s]" f*'` prints `[f*]` on 5.2.21.
-func shellOptsListsNoGlob() bool {
-	for _, opt := range strings.Split(os.Getenv("SHELLOPTS"), ":") {
-		if opt == "noglob" {
+	for _, entry := range strings.Split(os.Getenv("SHELLOPTS"), ":") {
+		if entry == opt {
 			return true
 		}
 	}
