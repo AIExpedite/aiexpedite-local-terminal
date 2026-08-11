@@ -2209,6 +2209,7 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 	// A startup file runs before the payload and its contents are invisible to
 	// us. POSIX mode suppresses the sourcing itself, so this stays false there.
 	startupFiles := shellRunsStartupFiles(shellCmd) && !posixMode && !wrapper.skipsStartup
+	zshEquals := shellSupportsZshEquals(shellCmd)
 	words, err := shellWords(payload, shellWordOptions{
 		// A `+B` wrapper flag is only trustworthy when no startup file can undo
 		// it: with `set -B` in $BASH_ENV, `bash +B -c 'printf "[%s]" {a,b}'`
@@ -2248,7 +2249,12 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 	if len(words) == 0 || !isAntigravityCommand(words[0].Value) {
 		return "", false
 	}
-	flags, promptFrags, trailing, hasPrompt, ok := partitionAntigravityCallerShellWords(words[1:])
+	// `agy --version` / `agy models` are diagnostics, not prompts — leave them
+	// exactly as the caller wrote them (see isAntigravityDiagnosticInvocation).
+	if len(words) == 2 && isAntigravityDiagnosticInvocation([]string{words[1].Value}) {
+		return "", false
+	}
+	flags, promptFrags, trailing, hasPrompt, ok := partitionAntigravityCallerShellWords(words[1:], zshEquals)
 	if !ok {
 		return "", false
 	}
@@ -2262,7 +2268,6 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 	// (`"$TASK"`, `--add-dir "$ROOT"`) still reshape on bash — but NOT on zsh,
 	// where .zshenv can have declared any name an array (see
 	// hasQuotedZshNamedParamExpand).
-	zshEquals := shellSupportsZshEquals(shellCmd)
 	checkWord := func(f shellWord) bool {
 		if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
 			return false
@@ -2321,7 +2326,7 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 // stay flags; without --print, the remainder is the prompt. Tokens that remain
 // after an explicit print value (unknown options, positionals) are returned as
 // trailing so the reshaper can append them after --print.
-func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, trailing []shellWord, hasPrompt, ok bool) {
+func partitionAntigravityCallerShellWords(words []shellWord, zshEquals bool) (flags, prompt, trailing []shellWord, hasPrompt, ok bool) {
 	i := 0
 	var printFrags []shellWord
 	gotPrint := false
@@ -2349,7 +2354,7 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 			if isAntigravityPrintFlag(name) {
 				// --print=value: peel value with segment metadata after '='.
 				// Continue so later recognized flags are not swallowed.
-				if discardsExpandingPrint(printFrags) {
+				if discardsExpandingPrint(printFrags, zshEquals) {
 					return nil, nil, nil, false, false
 				}
 				printFrags = []shellWord{shellWordAfterEquals(words[i])}
@@ -2381,7 +2386,7 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 			// `--print "${x:=review}"` from `agy --print "${x:=review}" --print
 			// "$x"` leaves x unset and the prompt empty (verified against bash
 			// 5.2.21 with a stub agy). Decline instead.
-			if discardsExpandingPrint(printFrags) {
+			if discardsExpandingPrint(printFrags, zshEquals) {
 				return nil, nil, nil, false, false
 			}
 			i++
@@ -2436,9 +2441,16 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 // discardsExpandingPrint reports whether replacing these already-collected
 // print fragments would throw away a shell expansion the original command had
 // already performed.
-func discardsExpandingPrint(frags []shellWord) bool {
+func discardsExpandingPrint(frags []shellWord, zshEquals bool) bool {
 	for _, f := range frags {
 		if f.Expand {
+			return true
+		}
+		// zsh's default EQUALS lookup runs on a word-initial `=` even though no
+		// segment is marked expandable: `zsh -c 'agy --print =missing --print
+		// review'` aborts with `missing not found` before agy starts, so
+		// dropping that value would turn a shell error into a model run.
+		if zshEquals && f.hasZshEqualsSub() {
 			return true
 		}
 		for _, seg := range f.effectiveSegments() {
@@ -3327,7 +3339,7 @@ func shellWrapperFlagsFor(command string, args []string) shellWrapperFlags {
 	return shellWrapperFlags{
 		posix:        shellForcesPosixMode(command, args),
 		noBrace:      shellArgsDisableBraceExpand(args) && !shellOptsEnablesBraceExpand(),
-		noGlob:       shellArgsDisableGlob(command, args),
+		noGlob:       shellArgsDisableGlob(command, args) || shellOptsListsNoGlob(),
 		skipsStartup: shellArgsSkipStartupFiles(command, args),
 	}
 }
@@ -3341,6 +3353,18 @@ func shellWrapperFlagsFor(command string, args []string) shellWrapperFlags {
 func shellOptsEnablesBraceExpand() bool {
 	for _, opt := range strings.Split(os.Getenv("SHELLOPTS"), ":") {
 		if opt == "braceexpand" {
+			return true
+		}
+	}
+	return false
+}
+
+// shellOptsListsNoGlob reports an inherited $SHELLOPTS that lists `noglob`,
+// which bash applies even without a `-f` flag: `env SHELLOPTS=noglob bash -c
+// 'printf "[%s]" f*'` prints `[f*]` on 5.2.21.
+func shellOptsListsNoGlob() bool {
+	for _, opt := range strings.Split(os.Getenv("SHELLOPTS"), ":") {
+		if opt == "noglob" {
 			return true
 		}
 	}

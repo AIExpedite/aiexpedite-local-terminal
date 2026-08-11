@@ -551,6 +551,32 @@ func TestBuildAntigravityInteractiveArgs_StripsContinueEqualsForms(t *testing.T)
 	}
 }
 
+// Diagnostic invocations must reach agy untouched: `agy --version` prints the
+// version (1.1.11 locally, and that is how the native capability probe queries
+// it), while shaping would emit `--print --version` and burn a model run.
+func TestBuildAntigravityInteractiveArgs_PassesThroughDiagnostics(t *testing.T) {
+	for _, in := range [][]string{
+		{"--version"}, {"-v"}, {"--help"}, {"-h"}, {"models"}, {"update"},
+	} {
+		got := buildAntigravityInteractiveArgs(in)
+		if len(got) != 1 || got[0] != in[0] {
+			t.Errorf("buildAntigravityInteractiveArgs(%#v) = %#v, want it unchanged", in, got)
+		}
+		// Same through the shell-wrapped reshaper.
+		orig := "agy " + in[0]
+		_, shaped := shapePTYExecArgs("bash", []string{"-c", orig})
+		if shaped[1] != orig {
+			t.Errorf("shell-wrapped %q = %q, want it unchanged", orig, shaped[1])
+		}
+	}
+	// Multi-token invocations stay prompts — a brief may open with such a word.
+	got := buildAntigravityInteractiveArgs([]string{"help", "me", "refactor"})
+	want := []string{"--dangerously-skip-permissions", "--print", "help me refactor"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("multi-token prompt = %#v, want %#v", got, want)
+	}
+}
+
 // Regression: --print must NOT be followed by another flag (agy 1.1.x eats it as the prompt).
 func TestBuildAntigravityInteractiveArgs_PrintValueIsNeverAFlag(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{"review this design"})
@@ -1033,6 +1059,15 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	wantShelloptsGlob := `agy --dangerously-skip-permissions --print 'review *.go'`
 	if shelloptsGlob[len(shelloptsGlob)-1] != wantShelloptsGlob {
 		t.Errorf("bash -f with SHELLOPTS = %q, want %q", shelloptsGlob[len(shelloptsGlob)-1], wantShelloptsGlob)
+	}
+	// An inherited SHELLOPTS listing noglob turns globbing off with no `-f` at
+	// all (`env SHELLOPTS=noglob bash -c 'printf "[%s]" f*'` prints `[f*]`), so
+	// wildcard prompts become literals and reshape.
+	t.Setenv("SHELLOPTS", "noglob:hashall")
+	_, shelloptsNoGlob := shapePTYExecArgs("bash", []string{"-c", `agy review *.go`})
+	wantNoGlob := `agy --dangerously-skip-permissions --print 'review *.go'`
+	if shelloptsNoGlob[1] != wantNoGlob {
+		t.Errorf("bash with SHELLOPTS=noglob = %q, want %q", shelloptsNoGlob[1], wantNoGlob)
 	}
 	os.Unsetenv("SHELLOPTS")
 	t.Setenv("BASH_ENV", "/tmp/startup.sh")
@@ -2003,6 +2038,14 @@ func TestShapePTYExecArgs_PreservesTrailingOptionsAfterPrint(t *testing.T) {
 		if dup[1] != orig {
 			t.Errorf("duplicate expanding print was reshaped: got %q, want original %q", dup[1], orig)
 		}
+	}
+	// zsh's EQUALS lookup runs on a discarded word-initial `=` value even though
+	// no segment is expandable: `zsh -c 'agy --print =missing --print review'`
+	// aborts with `missing not found` before agy starts (zsh 5.9).
+	origZshEqDup := `agy --print =definitely_missing_xyz --print review`
+	_, zshEqDup := shapePTYExecArgs("zsh", []string{"-c", origZshEqDup})
+	if zshEqDup[1] != origZshEqDup {
+		t.Errorf("discarded zsh equals print was reshaped: got %q, want original %q", zshEqDup[1], origZshEqDup)
 	}
 	// Literal duplicates still reshape (last value wins, same as agy).
 	_, dupLit := shapePTYExecArgs("bash", []string{"-c", `agy --print first --print second`})

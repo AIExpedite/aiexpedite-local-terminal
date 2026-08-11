@@ -1945,6 +1945,13 @@ func sanitizeCodexExecArgs(args []string) []string {
 // failure for normal (≤ ~32KB) briefs; only briefs approaching 32KB would risk
 // it, which would need a TTY/ACP-style redesign rather than the stdin trick.
 func buildAntigravityInteractiveArgs(args []string) []string {
+	// Diagnostic invocations are not prompts: `agy --version` prints 1.1.11 and
+	// is exactly how probeAntigravityNativeCapabilityUncached queries the CLI,
+	// but shaping would turn it into `--print --version` and burn a model run.
+	// Same for a lone `--help` / `-h` or a bare subcommand (`agy models`).
+	if isAntigravityDiagnosticInvocation(args) {
+		return args
+	}
 	result := make([]string, 0, len(args)+3)
 	// Permission skip first — never immediately after bare --print.
 	result = append(result, "--dangerously-skip-permissions")
@@ -1959,6 +1966,24 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	}
 	result = append(result, trailing...)
 	return result
+}
+
+// antigravityDiagnosticTokens are single-token invocations that ask the CLI for
+// information instead of running a prompt. Taken from `agy --help` on 1.1.11.
+var antigravityDiagnosticTokens = map[string]bool{
+	"--version": true, "-version": true, "-v": true,
+	"--help": true, "-help": true, "-h": true,
+	"agent": true, "agents": true, "changelog": true, "help": true,
+	"install": true, "models": true, "plugin": true, "plugins": true,
+	"update": true,
+}
+
+// isAntigravityDiagnosticInvocation reports a lone diagnostic token. Only the
+// single-token form counts: a brief can legitimately start with a word like
+// "help" or "update", and folding a multi-word invocation into a prompt is the
+// documented behaviour for everything else.
+func isAntigravityDiagnosticInvocation(args []string) bool {
+	return len(args) == 1 && antigravityDiagnosticTokens[args[0]]
 }
 
 // antigravityValuedFlags are agy flags whose next argv token is their value.
