@@ -305,6 +305,44 @@ func TestClaudeCodeUsageParser_AuthExpiredNotice(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeUsageParser_ExpiredAccessTokenWithoutRefreshIsUnobservable(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
+		"claudeAiOauth": map[string]any{
+			"accessToken": "expired-access-token",
+			"expiresAt":   now.Add(-time.Hour).UnixMilli(),
+		},
+	})
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 55,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs:   now.UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now, "")
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
+		t.Errorf("auth state=(%v, %q), want false/expired", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationKnown || usage.LoginExpiresAt == "" {
+		t.Errorf("login expiration=(%q, %q), want known access-token deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("notice=(%q, %q), want expired-login error", usage.Notice, usage.NoticeSeverity)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("expired access-only login must make cached usage unobservable: %+v", metric)
+		}
+	}
+}
+
 func TestClaudeCodeUsageParser_AuthExpiringSoonNotice(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))

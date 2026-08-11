@@ -181,18 +181,28 @@ func usingDefaultClaudeConfigDir() bool {
 	return os.Getenv("CLAUDE_CONFIG_DIR") == ""
 }
 
+func claudeLoginDeadlineMs(creds claudeOAuthCredentials) int64 {
+	oauth := creds.ClaudeAiOauth
+	if oauth.RefreshToken != "" {
+		return oauth.RefreshTokenExpiresAt
+	}
+	if oauth.AccessToken != "" {
+		return oauth.ExpiresAt
+	}
+	return 0
+}
+
 // claudeAuthNoticeFromRaw returns a card notice + severity when the claude.ai
-// subscription login in a raw .credentials.json blob is (nearly) expired. It
-// keys off the REFRESH-token expiry — the access token auto-refreshes, so its
-// shorter expiry would false-alarm. Returns ("","") when the refresh token is
-// still valid, or when there's no OAuth login (API-key installs have no
-// claudeAiOauth object, so absence is not a reliable "signed out" signal).
+// subscription login in a raw .credentials.json blob is (nearly) expired.
+// Renewable credentials use the refresh-token expiry; access-token-only
+// credentials use the access expiry because they cannot renew. Returns ("","")
+// when no reliable OAuth deadline is available.
 func claudeAuthNoticeFromRaw(raw []byte, now time.Time) (string, string) {
 	creds := claudeOAuthCredentials{}
 	if json.Unmarshal(raw, &creds) != nil {
 		return "", ""
 	}
-	deadlineMs := creds.ClaudeAiOauth.RefreshTokenExpiresAt
+	deadlineMs := claudeLoginDeadlineMs(creds)
 	if deadlineMs <= 0 {
 		return "", "" // no OAuth deadline (API-key or unexpected layout) — don't guess
 	}
@@ -221,10 +231,11 @@ func applyClaudeAuthState(usage *cliAgentUsage, raw []byte, now time.Time) bool 
 	usage.Authenticated = authBoolPtr(true)
 	usage.AuthState = "authenticated"
 	usage.LoginExpirationState = loginExpirationNotReported
-	if oauth.RefreshTokenExpiresAt <= 0 {
+	deadlineMs := claudeLoginDeadlineMs(creds)
+	if deadlineMs <= 0 {
 		return true
 	}
-	deadline := time.UnixMilli(oauth.RefreshTokenExpiresAt).UTC()
+	deadline := time.UnixMilli(deadlineMs).UTC()
 	usage.LoginExpirationState = loginExpirationKnown
 	usage.LoginExpiresAt = deadline.Format(time.RFC3339)
 	if !deadline.After(now) {
