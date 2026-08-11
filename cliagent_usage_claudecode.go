@@ -36,17 +36,27 @@ var claudeAuthStatusProbe = func(path string) (bool, bool) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, path, "auth", "status", "--json").Output()
-	if err != nil {
-		return false, false
-	}
+	probeEnv, _ := prepareClaudeChildEnv(path, os.Environ())
+	out, err := runClaudeAuthStatusCommand(ctx, path, probeEnv)
 	var status struct {
 		LoggedIn *bool `json:"loggedIn"`
 	}
-	if json.Unmarshal(out, &status) != nil || status.LoggedIn == nil {
+	// Claude intentionally exits 1 for a logged-out status while still emitting
+	// definitive JSON. Parse stdout first; only treat the command error as
+	// inconclusive when no documented status payload was returned.
+	if json.Unmarshal(out, &status) == nil && status.LoggedIn != nil {
+		return *status.LoggedIn, true
+	}
+	if err != nil {
 		return false, false
 	}
-	return *status.LoggedIn, true
+	return false, false
+}
+
+var runClaudeAuthStatusCommand = func(ctx context.Context, path string, env []string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, path, "auth", "status", "--json")
+	cmd.Env = env
+	return cmd.Output()
 }
 
 type claudeCredentials struct {

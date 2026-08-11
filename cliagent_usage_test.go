@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -631,6 +632,33 @@ func TestClaudeCodeUsageParser_DefiniteLoggedOutProbeMakesUsageUnobservable(t *t
 	for _, metric := range usage.Metrics {
 		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
 			t.Errorf("logged-out Claude usage must be unobservable: %+v", metric)
+		}
+	}
+}
+
+func TestClaudeAuthStatusProbe_ParsesLoggedOutJSONAndSanitizesEnvironment(t *testing.T) {
+	t.Setenv("ANTHROPIC_API_KEY", "must-not-reach-probe")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "must-not-reach-probe")
+	t.Setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-reach-probe")
+
+	originalRunner := runClaudeAuthStatusCommand
+	t.Cleanup(func() { runClaudeAuthStatusCommand = originalRunner })
+	var capturedEnv []string
+	runClaudeAuthStatusCommand = func(_ context.Context, _ string, env []string) ([]byte, error) {
+		capturedEnv = append([]string(nil), env...)
+		return []byte(`{"loggedIn":false}`), errors.New("exit status 1")
+	}
+
+	loggedIn, known := claudeAuthStatusProbe("claude")
+	if !known || loggedIn {
+		t.Fatalf("probe=(%v, %v), want false/known from logged-out JSON despite exit status 1", loggedIn, known)
+	}
+	for _, entry := range capturedEnv {
+		upper := strings.ToUpper(entry)
+		if strings.HasPrefix(upper, "ANTHROPIC_API_KEY=") ||
+			strings.HasPrefix(upper, "ANTHROPIC_AUTH_TOKEN=") ||
+			strings.HasPrefix(upper, "CLAUDE_CODE_OAUTH_TOKEN=") {
+			t.Errorf("sanitized auth probe leaked ambient credential %q", entry)
 		}
 	}
 }

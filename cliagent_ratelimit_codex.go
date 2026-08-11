@@ -539,25 +539,27 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 	case b.resetKnown && prev.resetKnown:
 		if b.ResetsAtMs > prev.ResetsAtMs {
 			merged.ResetsAtMs = b.ResetsAtMs
-			if usageTie {
-				// On a usage tie, the later reset is the contributor that keeps
-				// the aggregate live. Keep its observation timestamp paired with
-				// that reset so freshness checks do not inherit the expired side.
-				merged.ObservedAtMs = b.ObservedAtMs
-			}
 		} else if prev.ResetsAtMs > b.ResetsAtMs {
 			merged.ResetsAtMs = prev.ResetsAtMs
-			if usageTie {
-				merged.ObservedAtMs = prev.ObservedAtMs
-			}
 		} else {
 			merged.ResetsAtMs = prev.ResetsAtMs
-			if usageTie && b.ObservedAtMs > prev.ObservedAtMs {
-				merged.ObservedAtMs = b.ObservedAtMs
-			}
 		}
 		merged.resetKnown = true
 		if usageTie {
+			// The later reset controls when the aggregate clears, but all live
+			// tied contributors are equivalent evidence for the displayed usage.
+			// Keep the freshest live observation; never borrow freshness from a
+			// contributor whose window has already rolled over.
+			switch {
+			case prev.rolledOver && !b.rolledOver:
+				merged.ObservedAtMs = b.ObservedAtMs
+			case !prev.rolledOver && b.rolledOver:
+				merged.ObservedAtMs = prev.ObservedAtMs
+			case b.ObservedAtMs > prev.ObservedAtMs:
+				merged.ObservedAtMs = b.ObservedAtMs
+			default:
+				merged.ObservedAtMs = prev.ObservedAtMs
+			}
 			// Preserve aggregate provenance for later contributors: a tied
 			// aggregate is rolled over only when every contributor is.
 			merged.rolledOver = prev.rolledOver && b.rolledOver

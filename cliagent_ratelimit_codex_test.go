@@ -798,6 +798,44 @@ func TestMergeCodexBucketMostConstrained_ZeroTieKeepsLiveObservation(t *testing.
 	}
 }
 
+func TestMergeCodexBucketMostConstrained_LiveKnownResetTieKeepsFreshestObservation(t *testing.T) {
+	freshEarlierReset := codexRateLimitBucket{
+		UsedPercentage: 55,
+		ResetsAtMs:     4000,
+		ObservedAtMs:   3000,
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+	staleLaterReset := codexRateLimitBucket{
+		UsedPercentage: 55,
+		ResetsAtMs:     5000,
+		ObservedAtMs:   1000,
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		first  codexRateLimitBucket
+		second codexRateLimitBucket
+	}{
+		{name: "fresh first", first: freshEarlierReset, second: staleLaterReset},
+		{name: "stale first", first: staleLaterReset, second: freshEarlierReset},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{codexWindowPrimary: tc.first}
+			mergeCodexBucketMostConstrained(out, codexWindowPrimary, tc.second)
+			got := out[codexWindowPrimary]
+			if got.ResetsAtMs != staleLaterReset.ResetsAtMs {
+				t.Errorf("ResetsAtMs=%d, want later aggregate reset %d", got.ResetsAtMs, staleLaterReset.ResetsAtMs)
+			}
+			if got.ObservedAtMs != freshEarlierReset.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want freshest tied live observation %d", got.ObservedAtMs, freshEarlierReset.ObservedAtMs)
+			}
+		})
+	}
+}
+
 func TestMergeCodexBucketMostConstrained_TieWithoutCommonResetKeepsFreshObservation(t *testing.T) {
 	older := codexRateLimitBucket{
 		UsedPercentage: 50,
