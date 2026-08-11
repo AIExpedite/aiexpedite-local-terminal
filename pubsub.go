@@ -4020,7 +4020,8 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// like `{foo}` (no comma / `..`) are ordinary literals.
 			// Inside ${…} (or the PE-opening `{` after `$`) this is PE syntax /
 			// PE body content — track depth and do not treat as brace-expand.
-			if !(pendingParamBrace || paramDepth > 0) && opts.braceExpand && looksLikeUnquotedBraceExpansion(s, i) {
+			if !(pendingParamBrace || paramDepth > 0) && opts.braceExpand &&
+				looksLikeUnquotedBraceExpansion(s, i, opts.zshPatterns) {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)
@@ -4365,7 +4366,12 @@ func looksLikeUnquotedBracketGlob(s string, openIdx int) bool {
 // count, but quoted text may appear between unquoted separators
 // (`{a,'b'}` expands; `{foo}` does not). Nested braces are tracked at depth;
 // unquoted whitespace ends the scan (word boundary).
-func looksLikeUnquotedBraceExpansion(s string, openIdx int) bool {
+// braceCCL widens the test for zsh wrappers, where the BRACE_CCL option (which
+// .zshenv or the unconditional /etc/zshenv may set) expands a brace group with
+// neither a comma nor `..`: with it on, `zsh -c 'printf "[%s]" x{ab}y'` prints
+// `[xay][xby]`, while default zsh and bash print `[x{ab}y]` (verified on 5.9 /
+// 5.2.21). Any balanced group therefore has to decline on zsh.
+func looksLikeUnquotedBraceExpansion(s string, openIdx int, braceCCL bool) bool {
 	if openIdx < 0 || openIdx >= len(s) || s[openIdx] != '{' {
 		return false
 	}
@@ -4417,7 +4423,7 @@ func looksLikeUnquotedBraceExpansion(s string, openIdx int) bool {
 		case '}':
 			depth--
 			if depth == 0 {
-				if listActive {
+				if listActive || braceCCL {
 					return true
 				}
 				if seqDots {

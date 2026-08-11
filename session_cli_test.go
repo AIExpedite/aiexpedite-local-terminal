@@ -1786,6 +1786,21 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 			}
 		}
 	}
+	// zsh's BRACE_CCL (settable from either zshenv) expands a brace group with
+	// no comma and no `..`: `zsh -c 'printf "[%s]" x{ab}y'` prints `[xay][xby]`
+	// with it on, while default zsh and bash print `[x{ab}y]`. Decline every
+	// balanced group on zsh; bash keeps the non-expanding forms literal.
+	for _, orig := range []string{`agy x{ab}y`, `agy {foo}`} {
+		_, zshBrace := shapePTYExecArgs("zsh", []string{"-c", orig})
+		if zshBrace[1] != orig {
+			t.Errorf("zsh brace group was reshaped: got %q, want original %q", zshBrace[1], orig)
+		}
+		_, bashBrace := shapePTYExecArgs("bash", []string{"-c", orig})
+		if bashBrace[1] == orig {
+			t.Errorf("bash non-expanding brace was declined: %q", bashBrace[1])
+		}
+	}
+
 	// Default zsh behaviour does not depend on startup files, so an unmatched
 	// `[` still declines even with -f.
 	zshDashFBracket := shapeShellWrappedPTYArgs("zsh", []string{"-f", "-c", `agy [draft`})
