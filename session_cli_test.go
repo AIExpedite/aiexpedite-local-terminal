@@ -949,6 +949,29 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 			t.Errorf("bash %v brace = %q, want %q", pre, got[len(got)-1], want)
 		}
 	}
+	// Wrapper options apply left to right, so the last one wins: `+B -B` still
+	// expands (5.2.21 passes a and b) and `-o posix +o posix` is not POSIX.
+	lastWins := shapeShellWrappedPTYArgs("bash", []string{"+B", "-B", "-c", `agy {a,b}`})
+	if lastWins[len(lastWins)-1] != `agy {a,b}` {
+		t.Errorf("bash +B -B brace was reshaped: got %q", lastWins[len(lastWins)-1])
+	}
+	posixOff := shapeShellWrappedPTYArgs("bash", []string{"-o", "posix", "+o", "posix", "-c", `agy HOME=~ review`})
+	if posixOff[len(posixOff)-1] != `agy HOME=~ review` {
+		t.Errorf("bash -o posix +o posix assignment tilde was reshaped: got %q", posixOff[len(posixOff)-1])
+	}
+	// A line continuation inside a brace sequence is deleted before expansion,
+	// so `{1.\<newline>.3}` expands to 1 2 3 on bash 5.2.21 — decline.
+	origSeq := "agy {1.\\\n.3}"
+	_, contSeq := shapePTYExecArgs("bash", []string{"-c", origSeq})
+	if contSeq[1] != origSeq {
+		t.Errorf("continued brace sequence was reshaped: got %q, want original %q", contSeq[1], origSeq)
+	}
+	// Same for zsh MAGIC_EQUAL_SUBST split across a continuation.
+	origMagicCont := "agy review foo=\\\n=ls"
+	_, magicCont := shapePTYExecArgs("zsh", []string{"-c", origMagicCont})
+	if magicCont[1] != origMagicCont {
+		t.Errorf("continued magic-equals was reshaped: got %q, want original %q", magicCont[1], origMagicCont)
+	}
 	// Default bash still brace-expands — decline.
 	origBrace := `agy {a,b}`
 	_, braceOn := shapePTYExecArgs("bash", []string{"-c", origBrace})
@@ -1823,6 +1846,27 @@ func TestShapePTYExecArgs_PreservesTrailingOptionsAfterPrint(t *testing.T) {
 	wantOrdered := `agy --dangerously-skip-permissions --print "${x:=review}" --add-dir "$x"`
 	if ordered[1] != wantOrdered {
 		t.Errorf("expansion order = %q, want %q", ordered[1], wantOrdered)
+	}
+
+	// A second explicit --print discards the first value. Harmless for literals
+	// (agy keeps the last one too), but when the discarded word expanded, the
+	// shell had already evaluated it: `agy --print "${x:=review}" --print "$x"`
+	// passes review twice, while emitting only `--print "$x"` leaves x unset and
+	// the prompt empty (bash 5.2.21 + stub agy). Decline those.
+	for _, orig := range []string{
+		`agy --print "${x:=review}" --print "$x"`,
+		`agy --print="${x:=review}" --print "$x"`,
+	} {
+		_, dup := shapePTYExecArgs("bash", []string{"-c", orig})
+		if dup[1] != orig {
+			t.Errorf("duplicate expanding print was reshaped: got %q, want original %q", dup[1], orig)
+		}
+	}
+	// Literal duplicates still reshape (last value wins, same as agy).
+	_, dupLit := shapePTYExecArgs("bash", []string{"-c", `agy --print first --print second`})
+	wantDupLit := `agy --dangerously-skip-permissions --print second`
+	if dupLit[1] != wantDupLit {
+		t.Errorf("duplicate literal print = %q, want %q", dupLit[1], wantDupLit)
 	}
 
 	// Direct (non-shell) argv path — same partitioner.

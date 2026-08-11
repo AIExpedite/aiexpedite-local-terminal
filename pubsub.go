@@ -2235,7 +2235,10 @@ func shapeAntigravityShellPayload(shellCmd string, posixMode, noBraceExpand bool
 	if len(words) == 0 || !isAntigravityCommand(words[0].Value) {
 		return "", false
 	}
-	flags, promptFrags, trailing, hasPrompt := partitionAntigravityCallerShellWords(words[1:])
+	flags, promptFrags, trailing, hasPrompt, ok := partitionAntigravityCallerShellWords(words[1:])
+	if !ok {
+		return "", false
+	}
 	// Unquoted expansions cannot be rebuilt as double-quoted tokens without
 	// changing bash word-splitting / pathname-expansion / empty-expand semantics
 	// (e.g. `agy $OPTIONAL` with OPTIONAL='*.go' must glob; `agy --add-dir $ROOT
@@ -2299,7 +2302,7 @@ func shapeAntigravityShellPayload(shellCmd string, posixMode, noBraceExpand bool
 // stay flags; without --print, the remainder is the prompt. Tokens that remain
 // after an explicit print value (unknown options, positionals) are returned as
 // trailing so the reshaper can append them after --print.
-func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, trailing []shellWord, hasPrompt bool) {
+func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, trailing []shellWord, hasPrompt, ok bool) {
 	i := 0
 	var printFrags []shellWord
 	gotPrint := false
@@ -2327,6 +2330,9 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 			if isAntigravityPrintFlag(name) {
 				// --print=value: peel value with segment metadata after '='.
 				// Continue so later recognized flags are not swallowed.
+				if discardsExpandingPrint(printFrags) {
+					return nil, nil, nil, false, false
+				}
 				printFrags = []shellWord{shellWordAfterEquals(words[i])}
 				gotPrint = true
 				i++
@@ -2346,6 +2352,15 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 
 		if isAntigravityPrintFlag(a) {
 			// Exactly one value token (or explicit empty when bare --print).
+			// A second explicit print discards the first value; that is fine for
+			// literals (agy also keeps the last one) but not when the discarded
+			// word expanded: the shell evaluated it left-to-right, so dropping
+			// `--print "${x:=review}"` from `agy --print "${x:=review}" --print
+			// "$x"` leaves x unset and the prompt empty (verified against bash
+			// 5.2.21 with a stub agy). Decline instead.
+			if discardsExpandingPrint(printFrags) {
+				return nil, nil, nil, false, false
+			}
 			i++
 			gotPrint = true
 			if i < len(words) {
@@ -2387,12 +2402,29 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 		// the reshaped command (unknown options, positionals).
 		trailing := append([]shellWord{}, postFlags...)
 		trailing = append(trailing, words[i:]...)
-		return flags, printFrags, append(trailing, dangling...), true
+		return flags, printFrags, append(trailing, dangling...), true, true
 	}
 	if i < len(words) {
-		return flags, words[i:], dangling, true
+		return flags, words[i:], dangling, true, true
 	}
-	return flags, nil, dangling, false
+	return flags, nil, dangling, false, true
+}
+
+// discardsExpandingPrint reports whether replacing these already-collected
+// print fragments would throw away a shell expansion the original command had
+// already performed.
+func discardsExpandingPrint(frags []shellWord) bool {
+	for _, f := range frags {
+		if f.Expand {
+			return true
+		}
+		for _, seg := range f.effectiveSegments() {
+			if seg.Expand {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // quoteAntigravityPrintFragments serializes one or more prompt tokens into a
@@ -3177,17 +3209,26 @@ func shellForcesPosixMode(command string, args []string) bool {
 	default:
 		return false
 	}
+	// Options apply left to right, so the last one wins: `bash -o posix +o posix
+	// -c` is NOT posix (5.2.21 prints `[HOME=/tmp]` for that wrapper).
+	argvPosix := false
 	for i, a := range args {
 		if a == "-c" {
 			break
 		}
-		if a == "--posix" {
-			return true
-		}
-		if a == "-o" && i+1 < len(args) && args[i+1] == "posix" {
-			return true
+		switch {
+		case a == "--posix":
+			argvPosix = true
+		case (a == "-o" || a == "+o") && i+1 < len(args) && args[i+1] == "posix":
+			argvPosix = a == "-o"
 		}
 	}
+	if argvPosix {
+		return true
+	}
+	// Env-activated POSIX mode is not cancelled by a `+o posix` wrapper flag:
+	// `POSIXLY_CORRECT=1 bash +o posix -c 'printf "[%s]" HOME=~'` still prints a
+	// literal `HOME=~`, so this check stays independent of the argv state.
 	// An exported-but-empty POSIXLY_CORRECT still starts bash in POSIX mode
 	// (verified: `env POSIXLY_CORRECT= HOME=/tmp bash -c 'printf %s HOME=~'`
 	// prints a literal `HOME=~`), so presence is what matters, not the value.
@@ -3207,19 +3248,52 @@ func shellForcesPosixMode(command string, args []string) bool {
 // bash 5.2.21: both pass a literal `{a,b}`, while `-B` / the default expands.
 // Only flags before the `-c` payload count. The `+` forms are bash/zsh/ksh
 // spellings; shells that never brace-expand are already handled by dialect.
+// Options apply left to right, so the last one wins: `bash +B -B -c` still
+// brace-expands (5.2.21 passes `a` and `b`).
 func shellArgsDisableBraceExpand(args []string) bool {
+	disabled := false
 	for i, a := range args {
 		if a == "-c" {
-			return false
+			break
 		}
-		if a == "+B" {
-			return true
-		}
-		if a == "+o" && i+1 < len(args) && args[i+1] == "braceexpand" {
-			return true
+		switch {
+		case a == "+B":
+			disabled = true
+		case a == "-B":
+			disabled = false
+		case (a == "-o" || a == "+o") && i+1 < len(args) && args[i+1] == "braceexpand":
+			disabled = a == "+o"
 		}
 	}
-	return false
+	return disabled
+}
+
+// shellSkipContinuations returns the index of the next byte at or after idx,
+// stepping over backslash-newline line continuations (which the shell deletes
+// before any expansion runs).
+func shellSkipContinuations(s string, idx int) int {
+	for idx+1 < len(s) && s[idx] == '\\' && s[idx+1] == '\n' {
+		idx += 2
+	}
+	return idx
+}
+
+// shellStripContinuations removes backslash-newline pairs so a classifier sees
+// the bytes the shell will actually act on: the continued sequence
+// `{1.` + backslash-newline + `.3}` is `{1..3}` and expands to 1 2 3.
+func shellStripContinuations(s string) string {
+	if !strings.Contains(s, "\\\n") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) && s[i+1] == '\n' {
+			i++
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // shellRunsStartupFiles reports whether the wrapper may source a startup file
@@ -3785,8 +3859,11 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// segment inside a word that already has an unquoted assignment
 			// separator. (`foo=~` needs no special case: mid-word `~` already
 			// declines on zsh as an EXTENDED_GLOB operator.)
-			if opts.zshPatterns && i+1 < len(s) && s[i+1] == '=' &&
-				(c == '=' || sawUnquotedAssign) {
+			// The second `=` may sit past a line continuation, which zsh deletes
+			// first: `foo=` + backslash-newline + `=ls` is `foo==ls` and
+			// substitutes (verified on zsh 5.9 with MAGIC_EQUAL_SUBST).
+			if next := shellSkipContinuations(s, i+1); opts.zshPatterns &&
+				next < len(s) && s[next] == '=' && (c == '=' || sawUnquotedAssign) {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)
@@ -4138,6 +4215,12 @@ func looksLikeUnquotedBraceExpansion(s string, openIdx int) bool {
 		}
 		switch c {
 		case '\\':
+			// Backslash-newline is deleted by the shell, so it does not quote
+			// the next byte and does not break up `..`.
+			if j+1 < len(s) && s[j+1] == '\n' {
+				j++
+				continue
+			}
 			escaped = true
 		case '\'':
 			inSingle = true
@@ -4155,7 +4238,9 @@ func looksLikeUnquotedBraceExpansion(s string, openIdx int) bool {
 					return true
 				}
 				if seqDots {
-					return isValidBashBraceSequenceBody(s[openIdx+1 : j])
+					// Validate the body the shell will see, with continuations
+					// already removed (`{1.\<newline>.3}` is `{1..3}`).
+					return isValidBashBraceSequenceBody(shellStripContinuations(s[openIdx+1 : j]))
 				}
 				return false
 			}
@@ -4164,9 +4249,10 @@ func looksLikeUnquotedBraceExpansion(s string, openIdx int) bool {
 				listActive = true
 			}
 		case '.':
-			if depth == 1 && j+1 < len(s) && s[j+1] == '.' {
+			// The second '.' may sit past a line continuation.
+			if next := shellSkipContinuations(s, j+1); depth == 1 && next < len(s) && s[next] == '.' {
 				seqDots = true
-				j++ // consume second '.'
+				j = next // consume second '.'
 			}
 		}
 	}
