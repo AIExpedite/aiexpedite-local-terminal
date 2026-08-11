@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -344,7 +345,7 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 			usage.Authenticated = authBoolPtr(true)
 			usage.AuthState = "authenticated"
 		}
-	} else if credentialFound && !credentialUsable {
+	} else if !credentialUsable && (credentialFound || strings.TrimSpace(detected.Path) != "") {
 		usage.Authenticated = authBoolPtr(false)
 		usage.AuthState = "missing"
 		usage.LoginExpiresAt = ""

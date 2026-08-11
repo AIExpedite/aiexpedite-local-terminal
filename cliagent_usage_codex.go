@@ -141,6 +141,14 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 			usage.NoticeSeverity = "error"
 			usage.Metrics = utilizationMetricsUnknown(usage.Metrics)
 		}
+	} else if usage.Authenticated == nil && strings.TrimSpace(detected.Path) != "" {
+		// No supported credential remains to explain an inconclusive status
+		// probe, so cached telemetry cannot be attributed to a usable login.
+		usage.Authenticated = authBoolPtr(false)
+		usage.AuthState = "missing"
+		usage.Notice = "Codex is not signed in on this computer — run `codex login` on the terminal computer to authenticate."
+		usage.NoticeSeverity = "error"
+		usage.Metrics = utilizationMetricsUnknown(usage.Metrics)
 	}
 	return usage, true
 }

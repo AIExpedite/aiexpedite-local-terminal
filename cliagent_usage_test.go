@@ -437,19 +437,40 @@ func TestClaudeCodeUsageParser_AuthFromKeychainWhenNoFile(t *testing.T) {
 	}
 }
 
-func TestClaudeCodeUsageParser_NoFileNoKeychainNoNotice(t *testing.T) {
-	// Fresh box / API-key install with neither a file nor a keychain credential
-	// must not raise a false auth notice.
+func TestClaudeCodeUsageParser_NoFileNoKeychainIsMissing(t *testing.T) {
+	// The driven Claude child strips environment credentials, so a fresh box
+	// with neither a file nor a keychain credential cannot use cached telemetry.
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
 	home := t.TempDir()
+	now := time.Now()
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs:   now.UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now, "")
 	orig := claudeKeychainReader
 	t.Cleanup(func() { claudeKeychainReader = orig })
 	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
+	originalProbe := claudeAuthStatusProbe
+	t.Cleanup(func() { claudeAuthStatusProbe = originalProbe })
+	claudeAuthStatusProbe = func(string) (bool, bool) { return false, false }
 
-	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
-	if usage.Notice != "" {
-		t.Errorf("unexpected notice with no credential source: %q", usage.Notice)
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true, Path: "claude-test"}, now)
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("auth state=(%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "credentials are unavailable") {
+		t.Errorf("Notice=%q sev=%q, want unavailable-credentials error", usage.Notice, usage.NoticeSeverity)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("credential-less Claude usage must be unobservable: %+v", metric)
+		}
 	}
 }
 
@@ -730,6 +751,42 @@ func TestCodexUsageParser_DefiniteLoggedOutProbeMakesUsageUnobservable(t *testin
 	for _, metric := range usage.Metrics {
 		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
 			t.Errorf("logged-out Codex usage must be unobservable: %+v", metric)
+		}
+	}
+}
+
+func TestCodexUsageParser_NoCredentialAndInconclusiveProbeMakesUsageUnobservable(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Now()
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 21,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs:   now.UnixMilli(),
+			usageKnown:     true,
+			resetKnown:     true,
+		},
+	}, nil, now, "")
+
+	original := codexAuthStatusProbe
+	codexAuthStatusProbe = func(string) (bool, bool) { return false, false }
+	t.Cleanup(func() { codexAuthStatusProbe = original })
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
+		Detected: true, Path: "codex-test",
+	}, now)
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+		t.Errorf("notice = (%q, %q), want login error", usage.Notice, usage.NoticeSeverity)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("credential-less Codex usage must be unobservable: %+v", metric)
 		}
 	}
 }
