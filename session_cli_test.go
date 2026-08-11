@@ -1460,6 +1460,11 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		// it with "error in flags", aborting before agy runs. Either way a
 		// frozen --print value would diverge, so decline.
 		`agy "${(=)1}"`,
+		// (P) dereferences the parameter named by the value. A referent of
+		// `@` / `name[@]` re-splits inside double quotes (zsh 5.9: three fields
+		// for `zsh script @ fix bug`), and we cannot resolve the referent.
+		`agy "${(P)1}"`,
+		`agy "${(P)TARGET}"`,
 		`agy "${(s.:.)TASK}"`,
 		`agy "${(@)arr}"`,
 		`agy "${(f)TASK}"`,

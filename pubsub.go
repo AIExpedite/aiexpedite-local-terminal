@@ -2994,6 +2994,11 @@ func splitZshPEFlagPrefix(body string) (flags, rest string, ok bool) {
 //	f/F   — split on newlines
 //	z/Z   — shell-word split
 //	0     — split on NUL
+//	P     — indirection: expands the parameter *named* by the value, which we
+//	        cannot resolve statically. An array referent joins inside double
+//	        quotes ("${(P)1}" with 1=arr gives one field), but a referent of
+//	        `@` / `name[@]` re-splits: `zsh script @ fix bug` yields three
+//	        fields on 5.9. Same treatment as bash's indirect ${!name}.
 //
 // Join (j) and case (U/L) flags stay single-field.
 func zshPEFlagsAreMultiWord(flags string) bool {
@@ -3001,7 +3006,7 @@ func zshPEFlagsAreMultiWord(flags string) bool {
 	for i < len(flags) {
 		c := flags[i]
 		switch c {
-		case '@', '=', 's', 'S', 'f', 'F', 'z', 'Z', '0':
+		case '@', '=', 'P', 's', 'S', 'f', 'F', 'z', 'Z', '0':
 			return true
 		case ':':
 			// Orphan :arg: payload — skip to its closer.
