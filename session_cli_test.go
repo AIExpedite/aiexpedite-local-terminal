@@ -1026,6 +1026,9 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	// A backslash-newline inside the tilde-prefix is a line continuation the
 	// shell deletes, so `~\<newline>/brief` expands to $HOME/brief on bash and
 	// dash (verified on 5.2.21 / 0.5.12) — decline rather than freezing it.
+	// Pin HOME so the dash path (which needs it to expand ~/…) matches on
+	// Windows CI, where HOME is often unset.
+	t.Setenv("HOME", filepath.ToSlash(os.TempDir()))
 	for _, shell := range []string{"bash", "dash"} {
 		orig := "agy ~\\\n/brief"
 		_, args := shapePTYExecArgs(shell, []string{"-c", orig})
