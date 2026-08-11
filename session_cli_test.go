@@ -983,6 +983,15 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if compactOn[len(compactOn)-1] != `agy {a,b}` {
 		t.Errorf("bash -BH brace was reshaped: got %q", compactOn[len(compactOn)-1])
 	}
+	// A startup file can undo the wrapper flag (`set -B` in $BASH_ENV makes
+	// `bash +B -c` expand again on 5.2.21), so when one may run the disable is
+	// not trustworthy — decline instead of freezing the braces.
+	t.Setenv("BASH_ENV", "/tmp/startup.sh")
+	braceStartup := shapeShellWrappedPTYArgs("bash", []string{"+B", "-c", `agy {a,b}`})
+	if braceStartup[len(braceStartup)-1] != `agy {a,b}` {
+		t.Errorf("bash +B with BASH_ENV was reshaped: got %q", braceStartup[len(braceStartup)-1])
+	}
+	os.Unsetenv("BASH_ENV")
 	// Groups take part in the last-wins state too.
 	groupLastWins := shapeShellWrappedPTYArgs("bash", []string{"+BH", "-HB", "-c", `agy {a,b}`})
 	if groupLastWins[len(groupLastWins)-1] != `agy {a,b}` {

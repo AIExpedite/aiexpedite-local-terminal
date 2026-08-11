@@ -2210,7 +2210,12 @@ func shapeAntigravityShellPayload(shellCmd string, posixMode, noBraceExpand bool
 	// us. POSIX mode suppresses the sourcing itself, so this stays false there.
 	startupFiles := shellRunsStartupFiles(shellCmd) && !posixMode
 	words, err := shellWords(payload, shellWordOptions{
-		braceExpand: shellSupportsBraceExpansion(shellCmd) && !noBraceExpand,
+		// A `+B` wrapper flag is only trustworthy when no startup file can undo
+		// it: with `set -B` in $BASH_ENV, `bash +B -c 'printf "[%s]" {a,b}'`
+		// prints `[a][b]` again (verified on 5.2.21). When the file is
+		// unreadable, keep brace expansion classified as active so the payload
+		// declines rather than freezing an expansion the shell would perform.
+		braceExpand: shellSupportsBraceExpansion(shellCmd) && !(noBraceExpand && !startupFiles),
 		dollarQuote: shellSupportsDollarQuote(shellCmd),
 		// A startup file can itself `set -o posix` (verified on bash 5.2.21:
 		// with `set -o posix` in $BASH_ENV, `bash -c 'printf %s HOME=~'` prints
