@@ -983,6 +983,34 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if compactOn[len(compactOn)-1] != `agy {a,b}` {
 		t.Errorf("bash -BH brace was reshaped: got %q", compactOn[len(compactOn)-1])
 	}
+	// `-f` / `-o noglob` disable pathname generation, so `*`, `?` and `[…]` are
+	// literals and the payload can be reshaped (bash 5.2.21 and dash 0.5.12
+	// both pass a literal `f*`). `-f +f` globs again — last wins.
+	for _, tc := range []struct {
+		shell string
+		pre   []string
+	}{
+		{"bash", []string{"-f"}},
+		{"bash", []string{"-o", "noglob"}},
+		{"dash", []string{"-f"}},
+	} {
+		args := append(append([]string{}, tc.pre...), "-c", `agy review *.go`)
+		got := shapeShellWrappedPTYArgs(tc.shell, args)
+		want := `agy --dangerously-skip-permissions --print 'review *.go'`
+		if got[len(got)-1] != want {
+			t.Errorf("%s %v glob = %q, want %q", tc.shell, tc.pre, got[len(got)-1], want)
+		}
+	}
+	globBack := shapeShellWrappedPTYArgs("bash", []string{"-f", "+f", "-c", `agy review *.go`})
+	if globBack[len(globBack)-1] != `agy review *.go` {
+		t.Errorf("bash -f +f glob was reshaped: got %q", globBack[len(globBack)-1])
+	}
+	// zsh's `-f` means "skip startup files", not noglob — `zsh -f -c` still
+	// globs, so it must keep declining.
+	zshDashF := shapeShellWrappedPTYArgs("zsh", []string{"-f", "-c", `agy review *.go`})
+	if zshDashF[len(zshDashF)-1] != `agy review *.go` {
+		t.Errorf("zsh -f glob was reshaped: got %q", zshDashF[len(zshDashF)-1])
+	}
 	// A startup file can undo the wrapper flag (`set -B` in $BASH_ENV makes
 	// `bash +B -c` expand again on 5.2.21), so when one may run the disable is
 	// not trustworthy — decline instead of freezing the braces.
@@ -990,6 +1018,11 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	braceStartup := shapeShellWrappedPTYArgs("bash", []string{"+B", "-c", `agy {a,b}`})
 	if braceStartup[len(braceStartup)-1] != `agy {a,b}` {
 		t.Errorf("bash +B with BASH_ENV was reshaped: got %q", braceStartup[len(braceStartup)-1])
+	}
+	// Same caveat for `-f`: a startup file can `set +f` and put globbing back.
+	globStartup := shapeShellWrappedPTYArgs("bash", []string{"-f", "-c", `agy review *.go`})
+	if globStartup[len(globStartup)-1] != `agy review *.go` {
+		t.Errorf("bash -f with BASH_ENV was reshaped: got %q", globStartup[len(globStartup)-1])
 	}
 	os.Unsetenv("BASH_ENV")
 	// Groups take part in the last-wins state too.

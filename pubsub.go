@@ -2181,8 +2181,7 @@ func shapePTYExecArgs(command string, args []string) (string, []string) {
 // program and the remainder is preserved verbatim as the literal prompt.
 func shapeShellWrappedPTYArgs(command string, args []string) []string {
 	if payload, ok := shellDashCPayload(command, args); ok {
-		if shaped, ok := shapeAntigravityShellPayload(command, shellForcesPosixMode(command, args),
-			shellArgsDisableBraceExpand(args), payload); ok {
+		if shaped, ok := shapeAntigravityShellPayload(command, shellWrapperFlagsFor(command, args), payload); ok {
 			return replaceDashCPayload(args, shaped)
 		}
 	}
@@ -2205,7 +2204,8 @@ func shapeShellWrappedPTYArgs(command string, args []string) []string {
 // expansion per prompt fragment so `agy "$TASK"` still expands while
 // `agy '$(cmd)'` and `agy "\$(cmd)"` stay literal — never OR-ing expand across
 // mixed fragments into one double-quoted blob that reactivates substitutions.
-func shapeAntigravityShellPayload(shellCmd string, posixMode, noBraceExpand bool, payload string) (string, bool) {
+func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, payload string) (string, bool) {
+	posixMode, noBraceExpand, noGlob := wrapper.posix, wrapper.noBrace, wrapper.noGlob
 	// A startup file runs before the payload and its contents are invisible to
 	// us. POSIX mode suppresses the sourcing itself, so this stays false there.
 	startupFiles := shellRunsStartupFiles(shellCmd) && !posixMode
@@ -2216,6 +2216,10 @@ func shapeAntigravityShellPayload(shellCmd string, posixMode, noBraceExpand bool
 		// unreadable, keep brace expansion classified as active so the payload
 		// declines rather than freezing an expansion the shell would perform.
 		braceExpand: shellSupportsBraceExpansion(shellCmd) && !(noBraceExpand && !startupFiles),
+		// Same reasoning for `set -f` / `-o noglob`: a startup file can `set +f`
+		// and put globbing back (verified on 5.2.21), so only trust the wrapper
+		// flag when no such file can run.
+		noGlob:      noGlob && !startupFiles,
 		dollarQuote: shellSupportsDollarQuote(shellCmd),
 		// A startup file can itself `set -o posix` (verified on bash 5.2.21:
 		// with `set -o posix` in $BASH_ENV, `bash -c 'printf %s HOME=~'` prints
@@ -3127,6 +3131,9 @@ type shellWordOptions struct {
 	// arithmetic. Dash/ash leave `$[…]` as literal `$` + text; treating `[`
 	// as expansion there declines reshape and leaves interactive agy waiting.
 	legacyArith bool
+	// noGlob is true when the wrapper disabled pathname generation (`bash -f`,
+	// `-o noglob`), so `*`, `?` and `[…]` are ordinary literals.
+	noGlob bool
 	// zshPatterns is true for zsh wrappers, whose pattern rules are stricter
 	// than bash's: `.zshenv` may `setopt EXTENDED_GLOB` (turning unquoted `#`,
 	// `^` and mid-word `~` into pathname-generation operators), and an
@@ -3257,6 +3264,46 @@ func shellForcesPosixMode(command string, args []string) bool {
 // bash 5.2.21: both pass a literal `{a,b}`, while `-B` / the default expands.
 // Only flags before the `-c` payload count. The `+` forms are bash/zsh/ksh
 // spellings; shells that never brace-expand are already handled by dialect.
+// shellWrapperFlags captures the option state the wrapper's own argv selects
+// before its `-c` payload.
+type shellWrapperFlags struct {
+	posix   bool
+	noBrace bool
+	noGlob  bool
+}
+
+// shellWrapperFlagsFor computes that state for one wrapper invocation.
+func shellWrapperFlagsFor(command string, args []string) shellWrapperFlags {
+	return shellWrapperFlags{
+		posix:   shellForcesPosixMode(command, args),
+		noBrace: shellArgsDisableBraceExpand(args),
+		noGlob:  shellArgsDisableGlob(command, args),
+	}
+}
+
+// shellArgsDisableGlob reports whether the wrapper turned pathname generation
+// off (`bash -f -c …`, `bash -o noglob -c …`, `dash -f -c …`). Verified on bash
+// 5.2.21 and dash 0.5.12: `-f` passes a literal `f*`, and `-f +f` globs again
+// (last wins). zsh is excluded from the single-letter form on purpose — there
+// `-f` means "skip startup files", not noglob, and `zsh -f -c` still globs —
+// but the long `-o noglob` spelling applies everywhere.
+func shellArgsDisableGlob(command string, args []string) bool {
+	letterIsNoGlob := shellCommandBase(command) != "zsh"
+	disabled := false
+	for i, a := range args {
+		if a == "-c" {
+			break
+		}
+		switch {
+		case (a == "-o" || a == "+o") && i+1 < len(args) && args[i+1] == "noglob":
+			disabled = a == "-o"
+		case letterIsNoGlob && isCompactShellOptionGroup(a) && strings.ContainsRune(a[1:], 'f'):
+			disabled = a[0] == '-'
+		}
+	}
+	return disabled
+}
+
 // Options apply left to right, so the last one wins: `bash +B -B -c` still
 // brace-expands (5.2.21 passes `a` and `b`).
 func shellArgsDisableBraceExpand(args []string) bool {
@@ -3800,8 +3847,12 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			return nil, fmt.Errorf("unsupported unquoted shell metacharacter %q", c)
 		case '*', '?':
 			// Unquoted glob patterns expand before agy sees the argv.
-			// Rebuilding would single-quote them and freeze the pattern.
-			return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			// Rebuilding would single-quote them and freeze the pattern —
+			// unless the wrapper turned pathname generation off.
+			if !opts.noGlob {
+				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
+			}
+			writeSeg(c, false)
 		case '[':
 			// Only a complete bracket expression ([…]) is pathname expansion.
 			// Unmatched `[` (e.g. `[draft`) is literal in bash/dash — keep it
@@ -3810,7 +3861,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// zsh is stricter than bash/dash: an unmatched `[` aborts the whole
 			// command with `bad pattern: [draft` (verified on zsh 5.9, also for
 			// mid-word `foo[bar`), so any unquoted `[` declines there.
-			if opts.zshPatterns || looksLikeUnquotedBracketGlob(s, i) {
+			if !opts.noGlob && (opts.zshPatterns || looksLikeUnquotedBracketGlob(s, i)) {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)
