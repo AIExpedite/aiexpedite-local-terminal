@@ -1734,10 +1734,14 @@ func TestGrokUsageParser_CachedTokenAuthFile(t *testing.T) {
 			t.Errorf("metric %q should be Unknown (no observable counter)", m.Kind)
 		}
 	}
-	// A bare identity-only fixture (no expires_at / token) must not raise a
-	// false auth notice — we only warn on a DEFINITE expiry.
-	if usage.Notice != "" {
-		t.Errorf("unexpected notice for identity-only auth: %q", usage.Notice)
+	// Identity metadata can outlive the credential that authenticated it. A
+	// bare identity-only record must report missing rather than implying that
+	// the stale account fields are sufficient to sign requests.
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("auth state=(%v, %q), want false/missing for identity-only auth", usage.Authenticated, usage.AuthState)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+		t.Errorf("Notice=%q sev=%q, want not-signed-in prompt for identity-only auth", usage.Notice, usage.NoticeSeverity)
 	}
 }
 
@@ -2122,8 +2126,18 @@ func TestGrokUsageParser_FlatRefreshOnlyCredentialIsMissing(t *testing.T) {
 		"top-level": {
 			"refresh_token": "renewal-metadata-without-presented-token",
 		},
+		"top-level with stale identity": {
+			"email":         "stale-identity@example.com",
+			"refresh_token": "renewal-metadata-without-presented-token",
+		},
 		"nested cached_token": {
 			"cached_token": map[string]any{
+				"refresh_token": "renewal-metadata-without-presented-token",
+			},
+		},
+		"nested cached_token with stale identity": {
+			"cached_token": map[string]any{
+				"email":         "stale-identity@example.com",
 				"refresh_token": "renewal-metadata-without-presented-token",
 			},
 		},

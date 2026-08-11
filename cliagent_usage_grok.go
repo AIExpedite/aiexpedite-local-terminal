@@ -161,7 +161,7 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	// DOES push a discrete usage-limit warning on the streaming-json output,
 	// which captureGrokUsageLimitLine caches (approaching → warning, reached →
 	// error).
-	authNotice, authSeverity := grokAuthNotice(base, usage.Account, now)
+	authNotice, authSeverity := grokAuthNotice(base, now)
 	usableToken := grokHasUsableToken(base)
 	if usableToken {
 		usage.Authenticated = authBoolPtr(true)
@@ -483,14 +483,13 @@ func grokHasRefreshToken(base string) bool {
 // login is missing or (nearly) expired, so the dashboard can prompt a re-run of
 // `grok login` on the terminal computer BEFORE a chat session stalls on an
 // un-showable browser sign-in. Returns ("", "") when auth looks healthy.
-func grokAuthNotice(base, account string, now time.Time) (string, string) {
+func grokAuthNotice(base string, now time.Time) (string, string) {
 	expiry, ok := readGrokAuthExpiry(base)
 	if !ok {
-		// No parseable expiry. Only call it "not signed in" when there's also no
-		// identity AND no usable token — a readable account, or an opaque token
-		// Grok would still present, shouldn't raise a false alarm just because
-		// its layout is unparseable.
-		if account == "" && !grokHasUsableToken(base) {
+		// No parseable expiry. Authentication depends on a credential Grok can
+		// present, not stale identity metadata left in the file. An opaque but
+		// usable token stays quiet; identity without a presented token is missing.
+		if !grokHasUsableToken(base) {
 			return "Grok is not signed in on this computer — run `grok login` on the terminal computer to authenticate.", "error"
 		}
 		return "", ""
