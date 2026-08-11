@@ -684,6 +684,29 @@ func TestBuildAntigravityInteractiveArgs_PassesThroughDiagnostics(t *testing.T) 
 	}
 }
 
+// The command word must keep its quoting. A path whose text contains shell
+// metacharacters is literal when the caller quoted it, but emitting the raw
+// value turned it into live syntax: verified in bash 5.2.21 that
+// `/tmp/'$(touch /tmp/marker)'/agy review` runs the binary and leaves no
+// marker, while the unquoted rebuild created one.
+func TestShapePTYExecArgs_QuotesCommandWord(t *testing.T) {
+	_, got := shapePTYExecArgs("bash", []string{"-c", `/tmp/'$(touch marker)'/agy review`})
+	want := `'/tmp/$(touch marker)/agy' --dangerously-skip-permissions --print review`
+	if got[1] != want {
+		t.Errorf("command word = %q, want %q", got[1], want)
+	}
+	// Ordinary paths stay unquoted.
+	for _, tc := range []struct{ orig, want string }{
+		{`agy review`, `agy --dangerously-skip-permissions --print review`},
+		{`/usr/local/bin/agy review`, `/usr/local/bin/agy --dangerously-skip-permissions --print review`},
+	} {
+		_, plain := shapePTYExecArgs("bash", []string{"-c", tc.orig})
+		if plain[1] != tc.want {
+			t.Errorf("plain command word = %q, want %q", plain[1], tc.want)
+		}
+	}
+}
+
 // Regression: --print must NOT be followed by another flag (agy 1.1.x eats it as the prompt).
 func TestBuildAntigravityInteractiveArgs_PrintValueIsNeverAFlag(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{"review this design"})

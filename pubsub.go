@@ -2304,7 +2304,10 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 		}
 	}
 	parts := make([]string, 0, 2+len(flags)+2+len(trailing))
-	parts = append(parts, words[0].Value, "--dangerously-skip-permissions")
+	// The command word needs the same segment-aware quoting as everything else:
+	// emitting its raw value turns a quoted-literal path such as
+	// `/tmp/'$(touch marker)'/agy` into a live command substitution.
+	parts = append(parts, quoteShellWord(words[0]), "--dangerously-skip-permissions")
 	for _, f := range flags {
 		// Flag tokens (and their values) keep per-segment expand, e.g.
 		// --add-dir "$ROOT"'$(evil)' must not OR Expand across segments.
