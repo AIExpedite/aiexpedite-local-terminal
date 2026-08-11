@@ -829,6 +829,40 @@ func TestMergeCodexBucketMostConstrained_TieWithoutCommonResetKeepsFreshObservat
 	}
 }
 
+func TestMergeCodexBucketMostConstrained_ZeroTieDoesNotBorrowExpiredObservation(t *testing.T) {
+	expired := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     1000,
+		ObservedAtMs:   3000,
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+	resetless := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ObservedAtMs:   2000,
+		usageKnown:     true,
+		resetKnown:     false,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		first  codexRateLimitBucket
+		second codexRateLimitBucket
+	}{
+		{name: "expired first", first: expired, second: resetless},
+		{name: "resetless first", first: resetless, second: expired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{codexWindowPrimary: tc.first}
+			mergeCodexBucketMostConstrained(out, codexWindowPrimary, tc.second)
+			got := out[codexWindowPrimary]
+			if got.ObservedAtMs != resetless.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want reset-less observation %d", got.ObservedAtMs, resetless.ObservedAtMs)
+			}
+		})
+	}
+}
+
 // When two equally-exhausted buckets disagree on whether a reset is known, the
 // safe answer is "unknown" — don't promise a reset time that the unknown side
 // can't confirm.

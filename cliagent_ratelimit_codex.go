@@ -556,12 +556,18 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 		merged.resetKnown = true
 	case usageTie:
 		// Same exhaustion, only one side has a reset hint — don't promise a
-		// time the unknown side can't confirm; render "—" instead. Since no
-		// reset can identify the active contributor, retain the freshest tied
-		// observation deterministically.
+		// time the unknown side can't confirm; render "—" instead. Keep the
+		// observation paired with the reset-less contributor: the known-reset
+		// side may already have rolled over and must not lend its timestamp to
+		// the surviving value. If neither side has a reset, use the freshest.
 		merged.ResetsAtMs = 0
 		merged.resetKnown = false
-		if b.ObservedAtMs > prev.ObservedAtMs {
+		switch {
+		case prev.resetKnown && !b.resetKnown:
+			merged.ObservedAtMs = b.ObservedAtMs
+		case !prev.resetKnown && b.resetKnown:
+			merged.ObservedAtMs = prev.ObservedAtMs
+		case b.ObservedAtMs > prev.ObservedAtMs:
 			merged.ObservedAtMs = b.ObservedAtMs
 		}
 	case usageDrivenByB && b.resetKnown:
