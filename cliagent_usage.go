@@ -58,8 +58,11 @@ type cliAgentUsageMetric struct {
 	Remaining *float64 `json:"remaining,omitempty"`
 	Consumed  *float64 `json:"consumed,omitempty"`
 	ResetAt   string   `json:"resetAt,omitempty"`
-	Model     string   `json:"model,omitempty"`
-	Unknown   bool     `json:"unknown,omitempty"`
+	// ObservedAt is when the provider emitted this utilization value. It is
+	// deliberately distinct from CollectedAt, which is only the cache-read time.
+	ObservedAt string `json:"observedAt,omitempty"`
+	Model      string `json:"model,omitempty"`
+	Unknown    bool   `json:"unknown,omitempty"`
 }
 
 // cliAgentUsage is the per-provider snapshot embedded in `cliAgents[]`. One
@@ -77,6 +80,12 @@ type cliAgentUsage struct {
 	Metrics            []cliAgentUsageMetric `json:"metrics,omitempty"`
 	CollectedAt        string                `json:"collectedAt"`
 	DataSource         string                `json:"dataSource,omitempty"`
+	// Authentication is deliberately separate from access-token expiry. A
+	// refreshable access token expiring is not a logged-out session.
+	Authenticated        *bool  `json:"authenticated,omitempty"`
+	AuthState            string `json:"authState,omitempty"`
+	LoginExpiresAt       string `json:"loginExpiresAt,omitempty"`
+	LoginExpirationState string `json:"loginExpirationState,omitempty"`
 	// Notice is a card-level banner shown above the capacity bars — used when a
 	// provider exposes a discrete usage-limit WARNING rather than a numeric
 	// quota (e.g. Grok's server-pushed `usage_limit_reached` / access-gate).
@@ -86,6 +95,14 @@ type cliAgentUsage struct {
 	NoticeSeverity string `json:"noticeSeverity,omitempty"`
 	NoticeURL      string `json:"noticeUrl,omitempty"`
 }
+
+const (
+	loginExpirationKnown       = "known"
+	loginExpirationRefreshable = "refreshable"
+	loginExpirationNotReported = "not_reported"
+)
+
+func authBoolPtr(v bool) *bool { return &v }
 
 // cliAgentUsageParser is the small interface every provider parser
 // implements. Parsers MUST be best-effort: a missing config dir, unreadable

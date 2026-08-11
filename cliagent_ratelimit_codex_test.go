@@ -840,8 +840,8 @@ func TestCodexMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 
 	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
-		codexWindowPrimary:   {UsedPercentage: 31.2, ResetsAtMs: now.Add(2 * time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
-		codexWindowSecondary: {UsedPercentage: 95, ResetsAtMs: now.Add(-time.Minute).UnixMilli(), usageKnown: true, resetKnown: true},
+		codexWindowPrimary:   {UsedPercentage: 31.2, ResetsAtMs: now.Add(2 * time.Hour).UnixMilli(), ObservedAtMs: now.UnixMilli(), usageKnown: true, resetKnown: true},
+		codexWindowSecondary: {UsedPercentage: 95, ResetsAtMs: now.Add(-time.Minute).UnixMilli(), ObservedAtMs: now.UnixMilli(), usageKnown: true, resetKnown: true},
 	}, nil, now, "")
 
 	metrics := codexMetricsFromCache(now, "")
@@ -861,11 +861,14 @@ func TestCodexMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	if weekly.Kind != limitKindWeekly {
 		t.Errorf("weekly metric kind=%q, want %q", weekly.Kind, limitKindWeekly)
 	}
-	if weekly.Consumed == nil || *weekly.Consumed != 0 {
-		t.Errorf("past-reset weekly Consumed=%v, want 0 (rolled over)", weekly.Consumed)
+	if !weekly.Unknown || weekly.Consumed != nil {
+		t.Errorf("past-reset weekly metric=%+v, want unobservable", weekly)
 	}
 	if weekly.ResetAt != "" {
 		t.Errorf("past-reset window must not advertise a stale ResetAt")
+	}
+	if weekly.ObservedAt == "" || session.ObservedAt == "" {
+		t.Errorf("metrics must preserve observation time: session=%+v weekly=%+v", session, weekly)
 	}
 }
 

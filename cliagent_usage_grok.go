@@ -173,6 +173,26 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	// which captureGrokUsageLimitLine caches (approaching → warning, reached →
 	// error).
 	authNotice, authSeverity := grokAuthNotice(base, usage.Account, now)
+	usableToken := grokHasUsableToken(base)
+	if usableToken {
+		usage.Authenticated = authBoolPtr(true)
+		usage.AuthState = "authenticated"
+		if grokHasRefreshToken(base) {
+			usage.LoginExpirationState = loginExpirationRefreshable
+		} else if expiry, ok := readGrokAuthExpiry(base); ok {
+			usage.LoginExpirationState = loginExpirationKnown
+			usage.LoginExpiresAt = expiry.UTC().Format(time.RFC3339)
+			if !expiry.After(now) {
+				usage.Authenticated = authBoolPtr(false)
+				usage.AuthState = "expired"
+			}
+		} else {
+			usage.LoginExpirationState = loginExpirationNotReported
+		}
+	} else if authNotice != "" && authSeverity == "error" {
+		usage.Authenticated = authBoolPtr(false)
+		usage.AuthState = "missing"
+	}
 	limitState, hasLimit := loadGrokUsageLimitState(usage.AccountFingerprint, now)
 	applyLimitNotice := func() {
 		usage.Notice = grokNoticeText(limitState)
@@ -273,11 +293,12 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 	// FIRST entry that carries one — the scope Grok will actually present —
 	// instead of the max across unrelated siblings.
 	var scoped map[string]struct {
-		ExpiresAt   string `json:"expires_at"`
-		Key         string `json:"key"`
-		Token       string `json:"token"`
-		IDToken     string `json:"id_token"`
-		AccessToken string `json:"access_token"`
+		ExpiresAt    string `json:"expires_at"`
+		Key          string `json:"key"`
+		Token        string `json:"token"`
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 	if json.Unmarshal(raw, &scoped) == nil && len(scoped) > 0 {
 		keys := make([]string, 0, len(scoped))
@@ -286,6 +307,13 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		}
 		for _, k := range grokScopeKeysByPrecedence(keys) {
 			v := scoped[k]
+			// Grok v1.0 stores a short-lived access JWT plus an opaque refresh
+			// token. The access expiry is not the login expiry: Grok can refresh it
+			// without another interactive sign-in. Treat the deadline as unknown
+			// while refresh auth is present instead of warning every six hours.
+			if v.RefreshToken != "" {
+				return time.Time{}, false
+			}
 			// Mirror read_grok_token (and readGrokScopedAuthClaims): a scope is only
 			// usable when it carries a non-empty token. Skip metadata/empty-key
 			// entries so a tokenless preferred (OIDC) scope can't surface its
@@ -361,14 +389,15 @@ func grokHasUsableToken(base string) bool {
 	// Scoped/keyed format (current): any entry carrying a non-empty token —
 	// presence alone matters here, so precedence order is irrelevant.
 	var scoped map[string]struct {
-		Key         string `json:"key"`
-		Token       string `json:"token"`
-		IDToken     string `json:"id_token"`
-		AccessToken string `json:"access_token"`
+		Key          string `json:"key"`
+		Token        string `json:"token"`
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
 	}
 	if json.Unmarshal(raw, &scoped) == nil && len(scoped) > 0 {
 		for _, v := range scoped {
-			if firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken) != "" {
+			if firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken, v.RefreshToken) != "" {
 				return true
 			}
 		}
@@ -388,6 +417,45 @@ func grokHasUsableToken(base string) bool {
 	}
 
 	return false
+}
+
+// grokHasRefreshToken follows the same selected-scope precedence as Grok's
+// token resolver. A refresh token makes access-token expires_at unsuitable as
+// a login deadline.
+func grokHasRefreshToken(base string) bool {
+	raw, err := os.ReadFile(filepath.Join(base, "auth.json"))
+	if err != nil {
+		raw, err = os.ReadFile(filepath.Join(base, "cached_token.json"))
+		if err != nil {
+			return false
+		}
+	}
+	var scoped map[string]struct {
+		Key          string `json:"key"`
+		Token        string `json:"token"`
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if json.Unmarshal(raw, &scoped) == nil && len(scoped) > 0 {
+		keys := make([]string, 0, len(scoped))
+		for key := range scoped {
+			keys = append(keys, key)
+		}
+		for _, key := range grokScopeKeysByPrecedence(keys) {
+			entry := scoped[key]
+			if firstNonEmpty(entry.Key, entry.Token, entry.AccessToken, entry.IDToken, entry.RefreshToken) != "" {
+				return entry.RefreshToken != ""
+			}
+		}
+	}
+	var flat struct {
+		RefreshToken string `json:"refresh_token"`
+		CachedToken  struct {
+			RefreshToken string `json:"refresh_token"`
+		} `json:"cached_token"`
+	}
+	return json.Unmarshal(raw, &flat) == nil && firstNonEmpty(flat.RefreshToken, flat.CachedToken.RefreshToken) != ""
 }
 
 // grokAuthNotice returns a card-level notice + severity when the local Grok

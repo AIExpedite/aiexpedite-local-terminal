@@ -404,6 +404,7 @@ func TestClaudeNativeLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	skipIfUnsupportedOS(t)
 	// Point PATH at an empty dir so resolveExecutable("claude") can't find it.
 	tmpDir := t.TempDir()
+	isolateTestUserHome(t, tmpDir)
 	t.Setenv("PATH", tmpDir)
 	claudePathOnce = sync.Once{}
 	claudePathCached = ""

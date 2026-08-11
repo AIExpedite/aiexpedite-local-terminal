@@ -1287,8 +1287,8 @@ const codexRolloutScanFileCap = 16
 //
 // A live captured bucket with a still-future reset is authoritative: it wins
 // over any rollout reading. But when the cache row's reset has already passed,
-// codexMetricFromBucket rolls it over to a concrete 0% (Unknown=false)
-// — and without this fallback the card would show that bogus 0% indefinitely
+// codexMetricFromBucket marks it unobservable
+// — and without this fallback the card would remain unobservable indefinitely
 // for a user who once streamed through the app-server, let the window reset,
 // and then drove Codex only through the TUI (where the new window's usage is
 // only ever written to the rollout log, never back to our cache). So a stale
@@ -1740,8 +1740,8 @@ func codexWindowLabel(minutes float64, fallback string) string {
 // placeholder when no bucket was selected (`ok == false`). The label is derived
 // from the bucket's own WindowMinutes so a migrated/non-canonical window still
 // reads correctly, falling back to `defaultLabel` when no length is known. A
-// window whose reset has already passed is reported as 0% used (rolled over),
-// matching Claude's observedMetricOrUnknown behaviour.
+// window whose reset has passed becomes unobservable, matching Claude's
+// behaviour; assuming 0% ignores usage that may occur on another computer.
 //
 // Selection is now identity-based (a session row may be sourced from the
 // `secondary` slot and vice-versa), so unlike the old windowID lookup this
@@ -1754,19 +1754,18 @@ func codexMetricFromBucket(b codexRateLimitBucket, ok bool, kind, defaultLabel s
 	var resetAt string
 	if b.ResetsAtMs > 0 {
 		if now.UnixMilli() >= b.ResetsAtMs {
-			used = 0
+			return cliAgentUsageMetric{
+				Kind: kind, Label: codexWindowLabel(b.WindowMinutes, defaultLabel), Unit: "%",
+				ObservedAt: observedAtRFC3339(b.ObservedAtMs), Unknown: true,
+			}
 		} else {
 			resetAt = time.UnixMilli(b.ResetsAtMs).UTC().Format(time.RFC3339)
 		}
 	}
 	used = clampPercent(used)
 	return cliAgentUsageMetric{
-		Kind:      kind,
-		Label:     codexWindowLabel(b.WindowMinutes, defaultLabel),
-		Unit:      "%",
-		Total:     floatPtr(100),
-		Consumed:  floatPtr(used),
-		Remaining: floatPtr(100 - used),
-		ResetAt:   resetAt,
+		Kind: kind, Label: codexWindowLabel(b.WindowMinutes, defaultLabel), Unit: "%",
+		Total: floatPtr(100), Consumed: floatPtr(used), Remaining: floatPtr(100 - used),
+		ResetAt: resetAt, ObservedAt: observedAtRFC3339(b.ObservedAtMs),
 	}
 }

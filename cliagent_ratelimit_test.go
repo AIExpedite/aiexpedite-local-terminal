@@ -120,8 +120,8 @@ func TestClaudeCodeMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	// five_hour observed and live; seven_day's reset already passed.
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-		claudeWindowFiveHour: {UsedPercentage: 23.5, ResetsAtMs: now.Add(time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
-		claudeWindowSevenDay: {UsedPercentage: 90, ResetsAtMs: now.Add(-time.Hour).UnixMilli(), Status: "allowed", usageKnown: true},
+		claudeWindowFiveHour: {UsedPercentage: 23.5, ResetsAtMs: now.Add(time.Hour).UnixMilli(), ObservedAtMs: now.UnixMilli(), Status: "allowed", usageKnown: true},
+		claudeWindowSevenDay: {UsedPercentage: 90, ResetsAtMs: now.Add(-time.Hour).UnixMilli(), ObservedAtMs: now.UnixMilli(), Status: "allowed", usageKnown: true},
 	}, now, "")
 
 	metrics := claudeCodeMetricsFromCache(now, "")
@@ -139,11 +139,14 @@ func TestClaudeCodeMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 		t.Errorf("live window should carry a ResetAt")
 	}
 	weekly := metrics[1]
-	if weekly.Consumed == nil || *weekly.Consumed != 0 {
-		t.Errorf("weekly past-reset Consumed=%v, want 0 (rolled over)", weekly.Consumed)
+	if !weekly.Unknown || weekly.Consumed != nil {
+		t.Errorf("weekly past-reset metric=%+v, want unobservable", weekly)
 	}
 	if weekly.ResetAt != "" {
 		t.Errorf("past-reset window should not advertise a stale ResetAt")
+	}
+	if weekly.ObservedAt == "" || session.ObservedAt == "" {
+		t.Errorf("metrics must preserve observation time: session=%+v weekly=%+v", session, weekly)
 	}
 }
 

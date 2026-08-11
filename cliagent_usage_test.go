@@ -292,6 +292,17 @@ func TestClaudeCodeUsageParser_AuthExpiredNotice(t *testing.T) {
 	if !strings.Contains(usage.Notice, "expired") {
 		t.Errorf("Notice=%q, want an expired re-login prompt", usage.Notice)
 	}
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
+		t.Errorf("auth state = (%v, %q), want false/expired", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationKnown || usage.LoginExpiresAt == "" {
+		t.Errorf("login expiration = (%q, %q), want known deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("expired login must make utilization unobservable, got %+v", metric)
+		}
+	}
 }
 
 func TestClaudeCodeUsageParser_AuthExpiringSoonNotice(t *testing.T) {
@@ -309,6 +320,9 @@ func TestClaudeCodeUsageParser_AuthExpiringSoonNotice(t *testing.T) {
 	}
 	if !strings.Contains(usage.Notice, "expires soon") {
 		t.Errorf("Notice=%q, want an expiring-soon prompt", usage.Notice)
+	}
+	if usage.Authenticated == nil || !*usage.Authenticated || usage.LoginExpiresAt == "" {
+		t.Errorf("healthy expiring login should publish authenticated exact deadline: %+v", usage)
 	}
 }
 
@@ -507,6 +521,26 @@ func TestClaudeCodeUsageParser_MissingCredentials(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeUsageParser_DefiniteLoggedOutProbeMakesUsageUnobservable(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	original := claudeAuthStatusProbe
+	claudeAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	t.Cleanup(func() { claudeAuthStatusProbe = original })
+
+	usage, _ := claudeCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
+		Detected: true, Path: "claude-test",
+	}, time.Now())
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("logged-out Claude usage must be unobservable: %+v", metric)
+		}
+	}
+}
+
 func TestCodexUsageParser_IdentityFromAuth(t *testing.T) {
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
@@ -531,6 +565,48 @@ func TestCodexUsageParser_IdentityFromAuth(t *testing.T) {
 	for _, m := range usage.Metrics {
 		if !m.Unknown {
 			t.Errorf("metric %q should be Unknown without an observed app-server frame", m.Kind)
+		}
+	}
+}
+
+func TestCodexUsageParser_RefreshTokenHasNoMisleadingLoginDeadline(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token":      "opaque-id-token",
+			"refresh_token": "opaque-refresh-token",
+		},
+	})
+	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
+		t.Errorf("auth state = (%v, %q), want true/authenticated", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationRefreshable || usage.LoginExpiresAt != "" {
+		t.Errorf("login expiration = (%q, %q), want refreshable without a deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+	}
+}
+
+func TestCodexUsageParser_DefiniteLoggedOutProbeMakesUsageUnobservable(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	original := codexAuthStatusProbe
+	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	t.Cleanup(func() { codexAuthStatusProbe = original })
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
+		Detected: true, Path: "codex-test",
+	}, time.Now())
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+		t.Errorf("notice = (%q, %q), want login error", usage.Notice, usage.NoticeSeverity)
+	}
+	for _, metric := range usage.Metrics {
+		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+			t.Errorf("logged-out Codex usage must be unobservable: %+v", metric)
 		}
 	}
 }
@@ -1102,8 +1178,8 @@ func TestCodexUsageParser_RolloutScopesBySessionStartNotMtime(t *testing.T) {
 
 // A relative reset (`resets_in_seconds`) in a historical rollout line must be
 // anchored to the line's own emit time, so a window whose reset has already
-// passed rolls over to 0% instead of showing stale usage with a bogus future
-// reset.
+// passed becomes unobservable instead of showing stale usage with a bogus
+// future reset or a misleading 0%.
 func TestCodexUsageParser_RolloutAnchorsRelativeResetToEventTime(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
@@ -1125,11 +1201,8 @@ func TestCodexUsageParser_RolloutAnchorsRelativeResetToEventTime(t *testing.T) {
 		t.Fatalf("expected usage")
 	}
 	session := usage.Metrics[0]
-	if session.Unknown {
-		t.Fatalf("session should be observed (rolled over), got Unknown")
-	}
-	if session.Consumed == nil || *session.Consumed != 0 {
-		t.Errorf("session Consumed=%v, want 0 (window rolled over via event-time anchor)", session.Consumed)
+	if !session.Unknown || session.Consumed != nil {
+		t.Fatalf("rolled-over session should be unobservable, got %+v", session)
 	}
 	if session.ResetAt != "" {
 		t.Errorf("session ResetAt=%q, want empty for a rolled-over window", session.ResetAt)
@@ -1641,6 +1714,31 @@ func TestGrokUsageParser_AuthValidNoNotice(t *testing.T) {
 	}
 }
 
+func TestGrokUsageParser_RefreshTokenMakesAccessExpiryNonAuthoritative(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	// Grok v1.0: the access JWT is short-lived/expired, but the opaque refresh
+	// token keeps the login renewable without another browser sign-in.
+	helperWriteGrokScopedAuth(t, home, now.Add(-time.Hour), map[string]any{
+		"refresh_token": "opaque-refresh-token",
+	})
+
+	usage, _ := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if usage.Notice != "" || usage.NoticeSeverity != "" {
+		t.Errorf("refreshable login must not be called expired: notice=%q severity=%q", usage.Notice, usage.NoticeSeverity)
+	}
+	if !grokHasUsableToken(filepath.Join(home, ".grok")) {
+		t.Errorf("refresh token should count as usable auth")
+	}
+	if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
+		t.Errorf("refreshable Grok login should be authenticated: %+v", usage)
+	}
+	if usage.LoginExpirationState != loginExpirationRefreshable || usage.LoginExpiresAt != "" {
+		t.Errorf("access expiry must not be published as login expiry: %+v", usage)
+	}
+}
+
 func TestGrokUsageParser_AuthMissingNotice(t *testing.T) {
 	t.Setenv("GROK_HOME", "")
 	home := t.TempDir() // no ~/.grok/auth.json at all
@@ -1652,6 +1750,9 @@ func TestGrokUsageParser_AuthMissingNotice(t *testing.T) {
 	}
 	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
 		t.Errorf("Notice=%q sev=%q, want a 'not signed in' error", usage.Notice, usage.NoticeSeverity)
+	}
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("missing Grok auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
 	}
 }
 
@@ -2124,7 +2225,7 @@ func TestGatherCLIAgentUsage_RespectsUtilizationDisabledCatalogEntry(t *testing.
 func TestGatherCLIAgentUsage_UnknownAccountGetsDeviceScopedFingerprint(t *testing.T) {
 	SetCLIAgentCatalog(nil)
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	isolateTestUserHome(t, home)
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 
@@ -2168,7 +2269,7 @@ func TestGatherCLIAgentUsage_EmptyDetectedReturnsExplicitEmptySlice(t *testing.T
 func TestGatherCLIAgentUsageOnly_EmptyWhenNoAgentsDetected(t *testing.T) {
 	SetCLIAgentCatalog(nil)
 	// Confine HOME so no real providers are picked up off the host.
-	t.Setenv("HOME", t.TempDir())
+	isolateTestUserHome(t, t.TempDir())
 	t.Setenv("PATH", "/nonexistent")
 	usage, errs := GatherCLIAgentUsageOnly(context.Background())
 	if usage == nil {
@@ -2184,7 +2285,7 @@ func TestGatherCLIAgentUsageOnly_EmptyWhenNoAgentsDetected(t *testing.T) {
 
 func TestGatherCLIAgentUsageOnly_RespectsCanceledContext(t *testing.T) {
 	SetCLIAgentCatalog(nil)
-	t.Setenv("HOME", t.TempDir())
+	isolateTestUserHome(t, t.TempDir())
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	// The function should return promptly without panic.
