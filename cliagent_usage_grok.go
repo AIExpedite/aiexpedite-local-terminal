@@ -19,8 +19,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 	"time"
 )
 
@@ -37,33 +35,34 @@ const (
 	// DIFFERENT xAI client that happens to share the "https://auth.x.ai" host
 	// (a sibling "https://auth.x.ai::<other-client>" entry) can't sort ahead of
 	// the credential Grok will actually present.
-	grokExactOIDCScope    = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
-	grokLegacyScopePrefix = "https://accounts.x.ai"
+	grokExactOIDCScope   = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
+	grokExactLegacyScope = "https://accounts.x.ai/sign-in"
 )
 
 // grokScopeKeysByPrecedence returns only scopes Grok's resolver can present:
-// the exact CLI OIDC scope first, then legacy sign-in scopes in stable order.
+// the exact CLI OIDC scope first, then the exact legacy sign-in scope.
 // read_grok_token resolves only OIDC_SCOPE then LEGACY_SCOPE
 // (https://x.ai/cli/install.sh); it never scans arbitrary siblings. Filtering
 // here prevents another xAI client's credential from making this Grok CLI look
 // authenticated or from supplying a misleading expiry/identity.
 func grokScopeKeysByPrecedence(keys []string) []string {
-	legacy := make([]string, 0, len(keys))
 	hasExactOIDC := false
+	hasExactLegacy := false
 	for _, key := range keys {
 		switch {
 		case key == grokExactOIDCScope:
 			hasExactOIDC = true
-		case strings.HasPrefix(key, grokLegacyScopePrefix):
-			legacy = append(legacy, key)
+		case key == grokExactLegacyScope:
+			hasExactLegacy = true
 		}
 	}
-	sort.Strings(legacy)
-	ordered := make([]string, 0, len(legacy)+1)
+	ordered := make([]string, 0, 2)
 	if hasExactOIDC {
 		ordered = append(ordered, grokExactOIDCScope)
 	}
-	ordered = append(ordered, legacy...)
+	if hasExactLegacy {
+		ordered = append(ordered, grokExactLegacyScope)
+	}
 	return ordered
 }
 

@@ -1820,25 +1820,32 @@ func TestGrokUsageParser_ScopedInstallerAuthFile(t *testing.T) {
 // present. Their presence must not make this CLI appear signed in.
 func TestGrokUsageParser_UnrelatedScopedTokenDoesNotAuthenticate(t *testing.T) {
 	t.Setenv("GROK_HOME", "")
-	home := t.TempDir()
 	now := time.Now()
-	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
-		"https://auth.x.ai::another-client": map[string]any{
-			"email":      "other-client@example.com",
-			"key":        helperJWT(t, map[string]any{"email": "old-grok@example.com"}),
-			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
-		},
-	})
+	for name, scope := range map[string]string{
+		"other OIDC client":   "https://auth.x.ai::another-client",
+		"other legacy client": "https://accounts.x.ai/another-client",
+	} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+				scope: map[string]any{
+					"email":      "other-client@example.com",
+					"key":        helperJWT(t, map[string]any{"email": "other-client@example.com"}),
+					"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
+				},
+			})
 
-	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
-	if !ok || usage == nil {
-		t.Fatalf("expected usage entry")
-	}
-	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
-		t.Errorf("unrelated scoped auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
-	}
-	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
-		t.Errorf("Notice=%q sev=%q, want a not-signed-in prompt for an unrelated scoped token", usage.Notice, usage.NoticeSeverity)
+			usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+			if !ok || usage == nil {
+				t.Fatalf("expected usage entry")
+			}
+			if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+				t.Errorf("unrelated scoped auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+			}
+			if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+				t.Errorf("Notice=%q sev=%q, want a not-signed-in prompt for an unrelated scoped token", usage.Notice, usage.NoticeSeverity)
+			}
+		})
 	}
 }
 
