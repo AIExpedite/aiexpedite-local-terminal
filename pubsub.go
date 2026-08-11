@@ -2260,7 +2260,7 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 	for _, w := range words[1:] {
 		callerTokens = append(callerTokens, w.Value)
 	}
-	if endsWithBareAntigravityPrintFlag(callerTokens) || hasInvalidAntigravityBoolEquals(callerTokens) {
+	if barePrint, invalidBool := scanAntigravityCallerArgs(callerTokens); barePrint || invalidBool {
 		return "", false
 	}
 	flags, promptFrags, trailing, hasPrompt, ok := partitionAntigravityCallerShellWords(words[1:], zshEquals)

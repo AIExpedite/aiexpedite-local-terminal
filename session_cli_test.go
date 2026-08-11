@@ -537,6 +537,32 @@ func TestBuildAntigravityInteractiveArgs_KeepsInvalidBoolEqualsError(t *testing.
 	if shaped[1] != orig {
 		t.Errorf("shell-wrapped invalid bool = %q, want it unchanged", shaped[1])
 	}
+	// Past the prompt boundary the same text is prompt material, not a flag —
+	// Go's parsing already stopped at `review` — so it must not block shaping.
+	for _, tc := range []struct {
+		in   []string
+		want []string
+	}{
+		{
+			[]string{"review", "--continue=maybe"},
+			[]string{"--dangerously-skip-permissions", "--print", "review --continue=maybe"},
+		},
+		{
+			[]string{"review", "--print"},
+			[]string{"--dangerously-skip-permissions", "--print", "review --print"},
+		},
+	} {
+		got := buildAntigravityInteractiveArgs(tc.in)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("buildAntigravityInteractiveArgs(%#v) = %#v, want %#v", tc.in, got, tc.want)
+		}
+	}
+	origAfterPrompt := `agy review --continue=maybe`
+	_, shapedAfter := shapePTYExecArgs("bash", []string{"-c", origAfterPrompt})
+	wantAfter := `agy --dangerously-skip-permissions --print 'review --continue=maybe'`
+	if shapedAfter[1] != wantAfter {
+		t.Errorf("post-prompt flag text = %q, want %q", shapedAfter[1], wantAfter)
+	}
 }
 
 // Known leading flags stay on argv; the remainder becomes the single --print value.
