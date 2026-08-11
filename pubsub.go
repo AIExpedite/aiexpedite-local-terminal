@@ -2338,7 +2338,11 @@ func partitionAntigravityCallerShellWords(words []shellWord) (flags, prompt, tra
 				i++
 				continue
 			}
-			if name == "--dangerously-skip-permissions" || name == "--continue" {
+			// `-c` is agy's documented short alias for --continue, and Go's
+			// flag package accepts `-c=true` for booleans, so the equals form
+			// must be stripped here too or the cross-chat-contamination guard
+			// is bypassed.
+			if name == "--dangerously-skip-permissions" || name == "--continue" || name == "-c" {
 				i++
 				continue
 			}
@@ -3257,15 +3261,30 @@ func shellArgsDisableBraceExpand(args []string) bool {
 			break
 		}
 		switch {
-		case a == "+B":
-			disabled = true
-		case a == "-B":
-			disabled = false
 		case (a == "-o" || a == "+o") && i+1 < len(args) && args[i+1] == "braceexpand":
 			disabled = a == "+o"
+		case isCompactShellOptionGroup(a) && strings.ContainsRune(a[1:], 'B'):
+			// Single-letter options combine: `bash +BH -c` passes a literal
+			// `{a,b}` while `-BH` expands (verified on 5.2.21).
+			disabled = a[0] == '+'
 		}
 	}
 	return disabled
+}
+
+// isCompactShellOptionGroup reports a `-abc` / `+abc` single-letter option
+// bundle (the form `set` accepts at invocation). Long options (`--posix`) and
+// non-letter operands are excluded, so callers can test the letters directly.
+func isCompactShellOptionGroup(a string) bool {
+	if len(a) < 2 || (a[0] != '-' && a[0] != '+') {
+		return false
+	}
+	for i := 1; i < len(a); i++ {
+		if (a[i] < 'a' || a[i] > 'z') && (a[i] < 'A' || a[i] > 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 // shellSkipContinuations returns the index of the next byte at or after idx,

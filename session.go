@@ -2032,7 +2032,11 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 				i++
 				continue
 			}
-			if name == "--dangerously-skip-permissions" || name == "--continue" {
+			// `-c` is agy's documented short alias for --continue, and Go's
+			// flag package accepts `-c=true` for booleans, so the equals form
+			// must be stripped here too or the cross-chat-contamination guard
+			// is bypassed.
+			if name == "--dangerously-skip-permissions" || name == "--continue" || name == "-c" {
 				i++
 				continue
 			}

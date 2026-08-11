@@ -528,6 +528,29 @@ func TestShapePTYExecArgs_ValuelessFlagStaysAfterPrint(t *testing.T) {
 	}
 }
 
+// The cross-chat-contamination guard strips --continue / -c. Go's flag package
+// also accepts `-flag=x` for booleans, so the equals spellings must be stripped
+// too — otherwise `-c=true` reaches agy and resumes an unrelated conversation.
+func TestBuildAntigravityInteractiveArgs_StripsContinueEqualsForms(t *testing.T) {
+	for _, in := range [][]string{
+		{"-c=true", "--print", "hi"},
+		{"--continue=true", "--print", "hi"},
+		{"-c=1", "--print", "hi"},
+	} {
+		got := buildAntigravityInteractiveArgs(in)
+		for _, a := range got {
+			if strings.HasPrefix(a, "-c=") || strings.HasPrefix(a, "--continue=") {
+				t.Errorf("buildAntigravityInteractiveArgs(%#v) forwarded %q (full %#v)", in, a, got)
+			}
+		}
+	}
+	// Same through the shell-wrapped reshaper.
+	_, shaped := shapePTYExecArgs("bash", []string{"-c", `agy -c=true --print hi`})
+	if strings.Contains(shaped[1], "-c=true") {
+		t.Errorf("shaped payload forwarded -c=true: %q", shaped[1])
+	}
+}
+
 // Regression: --print must NOT be followed by another flag (agy 1.1.x eats it as the prompt).
 func TestBuildAntigravityInteractiveArgs_PrintValueIsNeverAFlag(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{"review this design"})
@@ -948,6 +971,22 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		if got[len(got)-1] != want {
 			t.Errorf("bash %v brace = %q, want %q", pre, got[len(got)-1], want)
 		}
+	}
+	// Single-letter options combine, and the `+` prefix disables: `bash +BH -c`
+	// passes a literal `{a,b}` while `-BH` expands (verified on 5.2.21).
+	compactOff := shapeShellWrappedPTYArgs("bash", []string{"+BH", "-c", `agy {a,b}`})
+	wantCompactOff := `agy --dangerously-skip-permissions --print '{a,b}'`
+	if compactOff[len(compactOff)-1] != wantCompactOff {
+		t.Errorf("bash +BH brace = %q, want %q", compactOff[len(compactOff)-1], wantCompactOff)
+	}
+	compactOn := shapeShellWrappedPTYArgs("bash", []string{"-BH", "-c", `agy {a,b}`})
+	if compactOn[len(compactOn)-1] != `agy {a,b}` {
+		t.Errorf("bash -BH brace was reshaped: got %q", compactOn[len(compactOn)-1])
+	}
+	// Groups take part in the last-wins state too.
+	groupLastWins := shapeShellWrappedPTYArgs("bash", []string{"+BH", "-HB", "-c", `agy {a,b}`})
+	if groupLastWins[len(groupLastWins)-1] != `agy {a,b}` {
+		t.Errorf("bash +BH -HB brace was reshaped: got %q", groupLastWins[len(groupLastWins)-1])
 	}
 	// Wrapper options apply left to right, so the last one wins: `+B -B` still
 	// expands (5.2.21 passes a and b) and `-o posix +o posix` is not POSIX.
