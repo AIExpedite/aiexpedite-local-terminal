@@ -215,7 +215,7 @@ func applyClaudeAuthState(usage *cliAgentUsage, raw []byte, now time.Time) bool 
 		return false
 	}
 	oauth := creds.ClaudeAiOauth
-	if oauth.AccessToken == "" && oauth.RefreshToken == "" && oauth.ExpiresAt <= 0 && oauth.RefreshTokenExpiresAt <= 0 {
+	if oauth.AccessToken == "" && oauth.RefreshToken == "" {
 		return false
 	}
 	usage.Authenticated = authBoolPtr(true)

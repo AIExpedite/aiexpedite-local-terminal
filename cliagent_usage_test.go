@@ -261,7 +261,7 @@ func TestClaudeCodeUsageParser_FingerprintAndCacheScopeAreCredentialOnly(t *test
 
 func helperWriteClaudeOAuth(t *testing.T, home string, extra map[string]any) {
 	t.Helper()
-	oauth := map[string]any{}
+	oauth := map[string]any{"refreshToken": "test-refresh-token"}
 	for k, v := range extra {
 		oauth[k] = v
 	}
@@ -379,6 +379,7 @@ func TestClaudeCodeUsageParser_AuthFromKeychainWhenNoFile(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{
 		"email": "kc@example.com",
 		"claudeAiOauth": map[string]any{
+			"refreshToken":          "test-refresh-token",
 			"refreshTokenExpiresAt": now.Add(-time.Hour).UnixMilli(), // expired
 		},
 	})
@@ -430,6 +431,7 @@ func TestClaudeCodeUsageParser_KeychainSkippedForCustomConfigDir(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{
 		"email": "default-account@example.com",
 		"claudeAiOauth": map[string]any{
+			"refreshToken":          "test-refresh-token",
 			"refreshTokenExpiresAt": now.Add(-time.Hour).UnixMilli(), // expired
 		},
 	})
@@ -474,6 +476,7 @@ func TestClaudeCodeUsageParser_KeychainPreferredOverStaleFile(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{
 		"email": "active@example.com",
 		"claudeAiOauth": map[string]any{
+			"refreshToken":          "test-refresh-token",
 			"refreshTokenExpiresAt": now.Add(30 * 24 * time.Hour).UnixMilli(), // healthy
 		},
 	})
@@ -536,6 +539,7 @@ func TestClaudeCodeUsageParser_InvalidCredentialsDoNotAuthenticate(t *testing.T)
 		{name: "empty file", raw: ""},
 		{name: "malformed json", raw: "{"},
 		{name: "missing credential", raw: `{"claudeAiOauth":{}}`},
+		{name: "expiry metadata only", raw: `{"claudeAiOauth":{"refreshTokenExpiresAt":4102444800000}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			home := t.TempDir()
