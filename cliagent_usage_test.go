@@ -2180,6 +2180,45 @@ func TestGrokUsageParser_TopLevelAccessTokenExpiry(t *testing.T) {
 	}
 }
 
+// Flat legacy auth files may call the presented access credential `token` or
+// `key`. Those fields must take precedence over the identity-only id_token,
+// just as access_token does.
+func TestGrokUsageParser_TopLevelGenericTokenPrefersAccessExpiry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	now := time.Now()
+
+	for _, field := range []string{"token", "key"} {
+		t.Run(field, func(t *testing.T) {
+			home := t.TempDir()
+			helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+				"email": "oauth-grok@example.com",
+				field: helperJWT(t, map[string]any{
+					"email": "oauth-grok@example.com",
+					"exp":   now.Add(-time.Hour).Unix(),
+				}),
+				"id_token": helperJWT(t, map[string]any{
+					"email": "oauth-grok@example.com",
+					"exp":   now.Add(30 * 24 * time.Hour).Unix(),
+				}),
+			})
+
+			usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+			if !ok || usage == nil {
+				t.Fatalf("expected usage entry")
+			}
+			if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
+				t.Errorf("auth state=(%v, %q), want false/expired from %s", usage.Authenticated, usage.AuthState, field)
+			}
+			if usage.LoginExpirationState != loginExpirationKnown || usage.LoginExpiresAt == "" {
+				t.Errorf("login expiry=(%q, %q), want %s JWT deadline", usage.LoginExpirationState, usage.LoginExpiresAt, field)
+			}
+			if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+				t.Errorf("Notice=%q sev=%q, want expired %s prompt", usage.Notice, usage.NoticeSeverity, field)
+			}
+		})
+	}
+}
+
 // TestGrokUsageParser_FlatRefreshTokenSuppressesAccessExpiry pins both legacy
 // auth layouts. A renewable access-token deadline is not a login expiry and
 // must never tell the user to sign in again.

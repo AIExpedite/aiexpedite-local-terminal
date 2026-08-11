@@ -531,6 +531,7 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 		merged.UsedPercentage = b.UsedPercentage
 		merged.usageKnown = true
 		merged.ObservedAtMs = b.ObservedAtMs
+		merged.rolledOver = b.rolledOver
 	}
 
 	usageTie := prev.usageKnown && b.UsedPercentage == prev.UsedPercentage
@@ -572,6 +573,10 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 		case b.ObservedAtMs > prev.ObservedAtMs:
 			merged.ObservedAtMs = b.ObservedAtMs
 		}
+		// The aggregate remains rolled over only when every equally
+		// constrained contributor is rolled over. This provenance must fold
+		// alongside the timestamp so later contributors see the true state.
+		merged.rolledOver = prev.rolledOver && b.rolledOver
 	case usageDrivenByB && b.resetKnown:
 		merged.ResetsAtMs = b.ResetsAtMs
 		merged.resetKnown = true

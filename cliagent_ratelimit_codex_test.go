@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -892,6 +893,51 @@ func TestMergeCodexBucketMostConstrained_LiveOneResetTieKeepsFreshObservation(t 
 			mergeCodexBucketMostConstrained(out, codexWindowPrimary, tc.second)
 			if got := out[codexWindowPrimary].ObservedAtMs; got != liveKnownReset.ObservedAtMs {
 				t.Errorf("ObservedAtMs=%d, want freshest live observation %d", got, liveKnownReset.ObservedAtMs)
+			}
+		})
+	}
+}
+
+func TestMergeCodexBucketMostConstrained_MultiWayZeroTiePreservesLiveProvenance(t *testing.T) {
+	live := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ObservedAtMs:   2000,
+		usageKnown:     true,
+	}
+	expiredA := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     1000,
+		ObservedAtMs:   3000,
+		usageKnown:     true,
+		resetKnown:     true,
+		rolledOver:     true,
+	}
+	expiredB := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     1500,
+		ObservedAtMs:   4000,
+		usageKnown:     true,
+		resetKnown:     true,
+		rolledOver:     true,
+	}
+
+	orders := [][]codexRateLimitBucket{
+		{expiredA, live, expiredB},
+		{expiredA, expiredB, live},
+		{live, expiredA, expiredB},
+	}
+	for i, order := range orders {
+		t.Run(fmt.Sprintf("order %d", i), func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{}
+			for _, bucket := range order {
+				mergeCodexBucketMostConstrained(out, codexWindowPrimary, bucket)
+			}
+			got := out[codexWindowPrimary]
+			if got.rolledOver {
+				t.Error("aggregate with a live tied contributor must not remain rolled over")
+			}
+			if got.ObservedAtMs != live.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want live observation %d", got.ObservedAtMs, live.ObservedAtMs)
 			}
 		})
 	}
