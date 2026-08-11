@@ -38,42 +38,32 @@ const (
 	// (a sibling "https://auth.x.ai::<other-client>" entry) can't sort ahead of
 	// the credential Grok will actually present.
 	grokExactOIDCScope    = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
-	grokOIDCScopePrefix   = "https://auth.x.ai"
 	grokLegacyScopePrefix = "https://accounts.x.ai"
 )
 
-// grokScopeKeysByPrecedence orders auth.json scope keys the way Grok resolves a
-// token: the exact CLI OIDC scope first, then the legacy sign-in scope, then any
-// other OIDC-host sibling, then any other keys — each tier broken by stable
-// alphabetical order. read_grok_token resolves only OIDC_SCOPE then LEGACY_SCOPE
-// (https://x.ai/cli/install.sh); it never scans arbitrary "https://auth.x.ai::"
-// siblings, so an unrelated OIDC-host entry for a DIFFERENT xAI client must NOT
-// outrank the legacy scope — otherwise a valid sibling would mask an expired
-// legacy token Grok will actually fall back to and stall on. The bare OIDC-host
-// tier is kept below legacy only as a forward-compat last resort (e.g. if xAI
-// rotates the exact client id). Callers walk the result and take the first entry
-// that carries a usable token, mirroring the installer's OIDC-then-legacy
-// fallback instead of aggregating unrelated siblings.
+// grokScopeKeysByPrecedence returns only scopes Grok's resolver can present:
+// the exact CLI OIDC scope first, then legacy sign-in scopes in stable order.
+// read_grok_token resolves only OIDC_SCOPE then LEGACY_SCOPE
+// (https://x.ai/cli/install.sh); it never scans arbitrary siblings. Filtering
+// here prevents another xAI client's credential from making this Grok CLI look
+// authenticated or from supplying a misleading expiry/identity.
 func grokScopeKeysByPrecedence(keys []string) []string {
-	rank := func(k string) int {
+	legacy := make([]string, 0, len(keys))
+	hasExactOIDC := false
+	for _, key := range keys {
 		switch {
-		case k == grokExactOIDCScope:
-			return 0
-		case strings.HasPrefix(k, grokLegacyScopePrefix):
-			return 1
-		case strings.HasPrefix(k, grokOIDCScopePrefix):
-			return 2
-		default:
-			return 3
+		case key == grokExactOIDCScope:
+			hasExactOIDC = true
+		case strings.HasPrefix(key, grokLegacyScopePrefix):
+			legacy = append(legacy, key)
 		}
 	}
-	ordered := append([]string(nil), keys...)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		if ri, rj := rank(ordered[i]), rank(ordered[j]); ri != rj {
-			return ri < rj
-		}
-		return ordered[i] < ordered[j]
-	})
+	sort.Strings(legacy)
+	ordered := make([]string, 0, len(legacy)+1)
+	if hasExactOIDC {
+		ordered = append(ordered, grokExactOIDCScope)
+	}
+	ordered = append(ordered, legacy...)
 	return ordered
 }
 
@@ -347,13 +337,20 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 	// Flat / legacy format: top-level `expires_at` and/or a cached_token JWT —
 	// a single account, so preferring `expires_at` then the JWT is unambiguous.
 	var flat struct {
-		ExpiresAt   string `json:"expires_at"`
-		CachedToken struct {
-			IDToken     string `json:"id_token"`
-			AccessToken string `json:"access_token"`
+		ExpiresAt    string `json:"expires_at"`
+		RefreshToken string `json:"refresh_token"`
+		CachedToken  struct {
+			IDToken      string `json:"id_token"`
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
 		} `json:"cached_token"`
 	}
 	if json.Unmarshal(raw, &flat) == nil {
+		// A refresh token makes the access-token deadline unsuitable as a login
+		// deadline in legacy layouts too: Grok can renew it headlessly.
+		if firstNonEmpty(flat.RefreshToken, flat.CachedToken.RefreshToken) != "" {
+			return time.Time{}, false
+		}
 		if t, ok := fromRFC3339(flat.ExpiresAt); ok {
 			return t, true
 		}
@@ -386,8 +383,8 @@ func grokHasUsableToken(base string) bool {
 		}
 	}
 
-	// Scoped/keyed format (current): any entry carrying a non-empty token —
-	// presence alone matters here, so precedence order is irrelevant.
+	// Scoped/keyed format (current): inspect only the entry Grok's resolver
+	// would select. Unrelated sibling credentials are not usable by this CLI.
 	var scoped map[string]struct {
 		Key          string `json:"key"`
 		Token        string `json:"token"`
@@ -396,7 +393,12 @@ func grokHasUsableToken(base string) bool {
 		RefreshToken string `json:"refresh_token"`
 	}
 	if json.Unmarshal(raw, &scoped) == nil && len(scoped) > 0 {
-		for _, v := range scoped {
+		keys := make([]string, 0, len(scoped))
+		for key := range scoped {
+			keys = append(keys, key)
+		}
+		for _, key := range grokScopeKeysByPrecedence(keys) {
+			v := scoped[key]
 			if firstNonEmpty(v.Key, v.Token, v.AccessToken, v.IDToken, v.RefreshToken) != "" {
 				return true
 			}
@@ -405,13 +407,22 @@ func grokHasUsableToken(base string) bool {
 
 	// Flat / legacy cached_token format.
 	var flat struct {
-		CachedToken struct {
-			IDToken     string `json:"id_token"`
-			AccessToken string `json:"access_token"`
+		Key          string `json:"key"`
+		Token        string `json:"token"`
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		CachedToken  struct {
+			IDToken      string `json:"id_token"`
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
 		} `json:"cached_token"`
 	}
 	if json.Unmarshal(raw, &flat) == nil {
-		if firstNonEmpty(flat.CachedToken.AccessToken, flat.CachedToken.IDToken) != "" {
+		if firstNonEmpty(
+			flat.Key, flat.Token, flat.AccessToken, flat.IDToken, flat.RefreshToken,
+			flat.CachedToken.AccessToken, flat.CachedToken.IDToken, flat.CachedToken.RefreshToken,
+		) != "" {
 			return true
 		}
 	}

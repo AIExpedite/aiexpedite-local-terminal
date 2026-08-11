@@ -1596,7 +1596,7 @@ func helperWriteGrokScopedAuth(t *testing.T, home string, expiresAt time.Time, e
 		entry[k] = v
 	}
 	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
-		"https://auth.x.ai::client-1": entry,
+		grokExactOIDCScope: entry,
 	})
 }
 
@@ -1791,7 +1791,7 @@ func TestGrokUsageParser_ScopedInstallerAuthFile(t *testing.T) {
 	// scopes, values wrap the JWT under `key`. Without scoped-format support
 	// the parser would silently report a logged-in user as no-account.
 	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
-		"grok-cli": map[string]any{
+		grokExactOIDCScope: map[string]any{
 			"key": helperJWT(t, map[string]any{
 				"email":     "scoped-grok@example.com",
 				"sub":       "scoped-sub",
@@ -1815,26 +1815,16 @@ func TestGrokUsageParser_ScopedInstallerAuthFile(t *testing.T) {
 	}
 }
 
-// TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry pins that when auth.json
-// holds multiple scoped entries, the expiry check follows the SAME entry Grok's
-// resolver selects rather than borrowing the latest expiry from a sibling. Grok
-// presents the selected scoped token, so an expired selected entry must surface
-// even if a fresher sibling exists — otherwise the re-login warning would be
-// wrongly suppressed.
-func TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry(t *testing.T) {
+// TestGrokUsageParser_UnrelatedScopedTokenDoesNotAuthenticate pins that auth
+// entries belonging to another client are not credentials Grok's resolver can
+// present. Their presence must not make this CLI appear signed in.
+func TestGrokUsageParser_UnrelatedScopedTokenDoesNotAuthenticate(t *testing.T) {
 	t.Setenv("GROK_HOME", "")
 	home := t.TempDir()
 	now := time.Now()
-	// "aaa::selected" sorts before "zzz::legacy"; the selected scope is expired
-	// while the fresher sibling is valid for a month.
 	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
-		"aaa::selected": map[string]any{
-			"email":      "scoped-grok@example.com",
-			"key":        helperJWT(t, map[string]any{"email": "scoped-grok@example.com"}),
-			"expires_at": now.Add(-14 * 24 * time.Hour).UTC().Format(time.RFC3339),
-		},
-		"zzz::legacy": map[string]any{
-			"email":      "old-grok@example.com",
+		"https://auth.x.ai::another-client": map[string]any{
+			"email":      "other-client@example.com",
 			"key":        helperJWT(t, map[string]any{"email": "old-grok@example.com"}),
 			"expires_at": now.Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339),
 		},
@@ -1844,8 +1834,11 @@ func TestGrokUsageParser_ScopedExpiryTiedToSelectedEntry(t *testing.T) {
 	if !ok || usage == nil {
 		t.Fatalf("expected usage entry")
 	}
-	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
-		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt tied to the selected scope", usage.Notice, usage.NoticeSeverity)
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("unrelated scoped auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+		t.Errorf("Notice=%q sev=%q, want a not-signed-in prompt for an unrelated scoped token", usage.Notice, usage.NoticeSeverity)
 	}
 }
 
@@ -1969,7 +1962,7 @@ func TestGrokUsageParser_OpaqueTokenWithoutIdentityStaysSignedIn(t *testing.T) {
 		// Opaque, non-JWT key with no `expires_at` and no identity claims: expiry
 		// is unknown AND the account can't be parsed, yet the token IS present and
 		// is what Grok would present on each request.
-		"https://auth.x.ai::client-1": map[string]any{
+		grokExactOIDCScope: map[string]any{
 			"key": "opaque-non-jwt-access-token",
 		},
 	})
@@ -2014,6 +2007,55 @@ func TestGrokUsageParser_CachedTokenPrefersAccessTokenExpiry(t *testing.T) {
 	}
 	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
 		t.Errorf("Notice=%q sev=%q, want an expired re-login prompt from the presented access token, not a healthy read off the later-expiring id_token", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
+// TestGrokUsageParser_FlatRefreshTokenSuppressesAccessExpiry pins both legacy
+// auth layouts. A renewable access-token deadline is not a login expiry and
+// must never tell the user to sign in again.
+func TestGrokUsageParser_FlatRefreshTokenSuppressesAccessExpiry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	now := time.Now()
+	expiredAccessToken := helperJWT(t, map[string]any{
+		"email": "oauth-grok@example.com",
+		"exp":   now.Add(-time.Hour).Unix(),
+	})
+
+	tests := map[string]map[string]any{
+		"top-level": {
+			"email":         "oauth-grok@example.com",
+			"access_token":  expiredAccessToken,
+			"refresh_token": "renewable-top-level",
+			"expires_at":    now.Add(-time.Hour).UTC().Format(time.RFC3339),
+		},
+		"nested cached_token": {
+			"cached_token": map[string]any{
+				"access_token":  expiredAccessToken,
+				"refresh_token": "renewable-nested",
+			},
+			"expires_at": now.Add(-time.Hour).UTC().Format(time.RFC3339),
+		},
+	}
+
+	for name, auth := range tests {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), auth)
+
+			usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+			if !ok || usage == nil {
+				t.Fatalf("expected usage entry")
+			}
+			if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
+				t.Errorf("renewable auth state = (%v, %q), want true/authenticated", usage.Authenticated, usage.AuthState)
+			}
+			if usage.LoginExpirationState != loginExpirationRefreshable || usage.LoginExpiresAt != "" {
+				t.Errorf("login expiry = (%q, %q), want refreshable with no deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+			}
+			if usage.Notice != "" {
+				t.Errorf("Notice=%q, want no re-login notice for renewable credentials", usage.Notice)
+			}
+		})
 	}
 }
 
