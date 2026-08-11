@@ -836,6 +836,7 @@ func TestMergeCodexBucketMostConstrained_ZeroTieDoesNotBorrowExpiredObservation(
 		ObservedAtMs:   3000,
 		usageKnown:     true,
 		resetKnown:     true,
+		rolledOver:     true,
 	}
 	resetless := codexRateLimitBucket{
 		UsedPercentage: 0,
@@ -858,6 +859,39 @@ func TestMergeCodexBucketMostConstrained_ZeroTieDoesNotBorrowExpiredObservation(
 			got := out[codexWindowPrimary]
 			if got.ObservedAtMs != resetless.ObservedAtMs {
 				t.Errorf("ObservedAtMs=%d, want reset-less observation %d", got.ObservedAtMs, resetless.ObservedAtMs)
+			}
+		})
+	}
+}
+
+func TestMergeCodexBucketMostConstrained_LiveOneResetTieKeepsFreshObservation(t *testing.T) {
+	liveKnownReset := codexRateLimitBucket{
+		UsedPercentage: 40,
+		ResetsAtMs:     4000,
+		ObservedAtMs:   3000,
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+	staleResetless := codexRateLimitBucket{
+		UsedPercentage: 40,
+		ObservedAtMs:   2000,
+		usageKnown:     true,
+		resetKnown:     false,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		first  codexRateLimitBucket
+		second codexRateLimitBucket
+	}{
+		{name: "known reset first", first: liveKnownReset, second: staleResetless},
+		{name: "resetless first", first: staleResetless, second: liveKnownReset},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{codexWindowPrimary: tc.first}
+			mergeCodexBucketMostConstrained(out, codexWindowPrimary, tc.second)
+			if got := out[codexWindowPrimary].ObservedAtMs; got != liveKnownReset.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want freshest live observation %d", got, liveKnownReset.ObservedAtMs)
 			}
 		})
 	}

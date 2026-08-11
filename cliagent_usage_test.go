@@ -2153,6 +2153,33 @@ func TestGrokUsageParser_CachedTokenPrefersAccessTokenExpiry(t *testing.T) {
 	}
 }
 
+func TestGrokUsageParser_TopLevelAccessTokenExpiry(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+	home := t.TempDir()
+	now := time.Now()
+	helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), map[string]any{
+		"email": "oauth-grok@example.com",
+		"access_token": helperJWT(t, map[string]any{
+			"email": "oauth-grok@example.com",
+			"exp":   now.Add(-time.Hour).Unix(),
+		}),
+	})
+
+	usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+	if !ok || usage == nil {
+		t.Fatalf("expected usage entry")
+	}
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
+		t.Errorf("auth state=(%v, %q), want false/expired", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpirationState != loginExpirationKnown || usage.LoginExpiresAt == "" {
+		t.Errorf("login expiry=(%q, %q), want top-level JWT deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "expired") {
+		t.Errorf("Notice=%q sev=%q, want expired top-level access-token prompt", usage.Notice, usage.NoticeSeverity)
+	}
+}
+
 // TestGrokUsageParser_FlatRefreshTokenSuppressesAccessExpiry pins both legacy
 // auth layouts. A renewable access-token deadline is not a login expiry and
 // must never tell the user to sign in again.

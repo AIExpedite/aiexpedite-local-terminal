@@ -337,6 +337,10 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 	// a single account, so preferring `expires_at` then the JWT is unambiguous.
 	var flat struct {
 		ExpiresAt    string `json:"expires_at"`
+		Key          string `json:"key"`
+		Token        string `json:"token"`
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
 		CachedToken  struct {
 			IDToken      string `json:"id_token"`
@@ -358,7 +362,10 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		// token is present. Otherwise a stale `access_token` paired with a
 		// later-expiring `id_token` would report the login as healthy and hide
 		// the impending stall.
-		if t, ok := fromJWT(firstNonEmpty(flat.CachedToken.AccessToken, flat.CachedToken.IDToken)); ok {
+		if t, ok := fromJWT(firstNonEmpty(
+			flat.AccessToken, flat.IDToken, flat.Token, flat.Key,
+			flat.CachedToken.AccessToken, flat.CachedToken.IDToken,
+		)); ok {
 			return t, true
 		}
 	}

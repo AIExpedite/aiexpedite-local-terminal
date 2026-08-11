@@ -98,6 +98,7 @@ type codexRateLimitBucket struct {
 	// treated as fully observed.
 	usageKnown bool `json:"-"`
 	resetKnown bool `json:"-"`
+	rolledOver bool `json:"-"`
 }
 
 // codexRateLimitSnapshot is the on-disk cache, keyed by window id (primary /
@@ -490,6 +491,7 @@ func aggregateCodexBuckets(perLimit map[string]map[string]codexRateLimitBucket, 
 		for _, b := range contributors {
 			if b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs {
 				b.UsedPercentage = 0
+				b.rolledOver = true
 			}
 			mergeCodexBucketMostConstrained(out, window, b)
 		}
@@ -557,15 +559,15 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 	case usageTie:
 		// Same exhaustion, only one side has a reset hint — don't promise a
 		// time the unknown side can't confirm; render "—" instead. Keep the
-		// observation paired with the reset-less contributor: the known-reset
-		// side may already have rolled over and must not lend its timestamp to
-		// the surviving value. If neither side has a reset, use the freshest.
+		// observation paired with the live contributor when the other side has
+		// rolled over. Otherwise both values are current evidence, so use the
+		// freshest tied observation.
 		merged.ResetsAtMs = 0
 		merged.resetKnown = false
 		switch {
-		case prev.resetKnown && !b.resetKnown:
+		case prev.rolledOver && !b.rolledOver:
 			merged.ObservedAtMs = b.ObservedAtMs
-		case !prev.resetKnown && b.resetKnown:
+		case !prev.rolledOver && b.rolledOver:
 			merged.ObservedAtMs = prev.ObservedAtMs
 		case b.ObservedAtMs > prev.ObservedAtMs:
 			merged.ObservedAtMs = b.ObservedAtMs
@@ -812,6 +814,7 @@ func codexAggregateIdentity(contribs []codexIdentityContribution, now time.Time)
 		b := c.bucket
 		if b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs {
 			b.UsedPercentage = 0
+			b.rolledOver = true
 		}
 		mergeCodexBucketMostConstrained(out, key, b)
 	}
