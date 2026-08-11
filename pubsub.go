@@ -2208,7 +2208,7 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 	posixMode, noBraceExpand, noGlob := wrapper.posix, wrapper.noBrace, wrapper.noGlob
 	// A startup file runs before the payload and its contents are invisible to
 	// us. POSIX mode suppresses the sourcing itself, so this stays false there.
-	startupFiles := shellRunsStartupFiles(shellCmd) && !posixMode
+	startupFiles := shellRunsStartupFiles(shellCmd) && !posixMode && !wrapper.skipsStartup
 	words, err := shellWords(payload, shellWordOptions{
 		// A `+B` wrapper flag is only trustworthy when no startup file can undo
 		// it: with `set -B` in $BASH_ENV, `bash +B -c 'printf "[%s]" {a,b}'`
@@ -2235,6 +2235,10 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 		homeTildeNeedsEnv: shellBareTildeNeedsHome(shellCmd),
 		startupFiles:      startupFiles,
 		zshPatterns:       shellSupportsZshEquals(shellCmd),
+		// EXTENDED_GLOB / MAGIC_EQUAL_SUBST are off by default and can only
+		// arrive from .zshenv, and only .zshenv can redeclare an inherited
+		// scalar as an array — so `zsh -f` makes all of that knowable again.
+		zshStartupOptions: shellSupportsZshEquals(shellCmd) && startupFiles,
 	})
 	if err != nil {
 		// Malformed shell (unterminated quote, etc.) — do not reshape into a
@@ -2263,7 +2267,13 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 		if f.hasUnquotedExpand() || f.hasQuotedMultiWordExpand() || f.hasExpandWithBackslash() {
 			return false
 		}
-		if zshEquals && (f.hasZshEqualsSub() || f.hasQuotedZshNamedParamExpand()) {
+		if zshEquals && f.hasZshEqualsSub() {
+			return false
+		}
+		// "any name may be an array" only holds while .zshenv can run: an
+		// inherited environment variable is always a scalar, so
+		// `TASK='fix bug' zsh -f -c 'agy "$TASK"'` is one field (zsh 5.9).
+		if zshEquals && startupFiles && f.hasQuotedZshNamedParamExpand() {
 			return false
 		}
 		return true
@@ -3162,6 +3172,11 @@ type shellWordOptions struct {
 	// arithmetic. Dash/ash leave `$[…]` as literal `$` + text; treating `[`
 	// as expansion there declines reshape and leaves interactive agy waiting.
 	legacyArith bool
+	// zshStartupOptions is true for zsh wrappers that may read .zshenv, the only
+	// place EXTENDED_GLOB / MAGIC_EQUAL_SUBST can be enabled or a name declared
+	// an array. zsh -f clears it; zshPatterns stays set either way, for the
+	// behaviour zsh has by default (an unmatched `[` is a fatal bad pattern).
+	zshStartupOptions bool
 	// noGlob is true when the wrapper disabled pathname generation (`bash -f`,
 	// `-o noglob`), so `*`, `?` and `[…]` are ordinary literals.
 	noGlob bool
@@ -3301,15 +3316,58 @@ type shellWrapperFlags struct {
 	posix   bool
 	noBrace bool
 	noGlob  bool
+	// skipsStartup is set when the wrapper will not read startup files at all
+	// (zsh -f), which makes the options and variables they could have defined
+	// knowable again.
+	skipsStartup bool
 }
 
 // shellWrapperFlagsFor computes that state for one wrapper invocation.
 func shellWrapperFlagsFor(command string, args []string) shellWrapperFlags {
 	return shellWrapperFlags{
-		posix:   shellForcesPosixMode(command, args),
-		noBrace: shellArgsDisableBraceExpand(args),
-		noGlob:  shellArgsDisableGlob(command, args),
+		posix:        shellForcesPosixMode(command, args),
+		noBrace:      shellArgsDisableBraceExpand(args) && !shellOptsEnablesBraceExpand(),
+		noGlob:       shellArgsDisableGlob(command, args),
+		skipsStartup: shellArgsSkipStartupFiles(command, args),
 	}
+}
+
+// shellOptsEnablesBraceExpand reports an inherited $SHELLOPTS that lists
+// `braceexpand`. Bash re-enables every option named there after applying the
+// invocation flags, so `env SHELLOPTS=braceexpand bash +B -c 'printf "[%s]"
+// {a,b}'` prints `[a][b]` on 5.2.21 — the `+B` is overridden and cannot be
+// trusted. SHELLOPTS only turns options on, so it never undoes `-f`: the same
+// wrapper with `-f` still passes a literal `f*`.
+func shellOptsEnablesBraceExpand() bool {
+	for _, opt := range strings.Split(os.Getenv("SHELLOPTS"), ":") {
+		if opt == "braceexpand" {
+			return true
+		}
+	}
+	return false
+}
+
+// shellArgsSkipStartupFiles reports a wrapper that will not read its startup
+// files at all. zsh's `-f` (--no-rcs) does exactly that: with `setopt
+// EXTENDED_GLOB` in .zshenv, `zsh -c 'printf "[%s]" foo#'` globs while
+// `zsh -f -c` prints a literal `foo#` (verified on zsh 5.9). Bash's --norc only
+// covers interactive rc files — $BASH_ENV still runs — so it does not count.
+func shellArgsSkipStartupFiles(command string, args []string) bool {
+	if shellCommandBase(command) != "zsh" {
+		return false
+	}
+	for _, a := range args {
+		if a == "-c" {
+			return false
+		}
+		if a == "--no-rcs" {
+			return true
+		}
+		if isCompactShellOptionGroup(a) && a[0] == '-' && strings.ContainsRune(a[1:], 'f') {
+			return true
+		}
+	}
+	return false
 }
 
 // shellArgsDisableGlob reports whether the wrapper turned pathname generation
@@ -3855,7 +3913,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				flushWord()
 				return words, nil
 			}
-			if opts.zshPatterns {
+			if opts.zshStartupOptions {
 				// zsh EXTENDED_GLOB (settable from the .zshenv we cannot read)
 				// makes a mid-word `#` a pathname-generation operator: with the
 				// option on, `agy foo#` expands to the matching files and a
@@ -3867,7 +3925,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 		case '^':
 			// Same story as `#`: with EXTENDED_GLOB, `^pat` is zsh's
 			// "everything except" operator. Literal on every other shell.
-			if opts.zshPatterns {
+			if opts.zshStartupOptions {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}
 			writeSeg(c, false)
@@ -3924,7 +3982,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 				writeSeg(c, false)
 				continue
 			}
-			if opts.zshPatterns {
+			if opts.zshStartupOptions {
 				// Mid-word `~` is EXTENDED_GLOB's "except" operator on zsh (`a~b`).
 				// Word-initial tildes are handled above.
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
@@ -3968,7 +4026,7 @@ func shellWords(s string, opts shellWordOptions) ([]shellWord, error) {
 			// The second `=` may sit past a line continuation, which zsh deletes
 			// first: `foo=` + backslash-newline + `=ls` is `foo==ls` and
 			// substitutes (verified on zsh 5.9 with MAGIC_EQUAL_SUBST).
-			if next := shellSkipContinuations(s, i+1); opts.zshPatterns &&
+			if next := shellSkipContinuations(s, i+1); opts.zshStartupOptions &&
 				next < len(s) && s[next] == '=' && (c == '=' || sawUnquotedAssign) {
 				return nil, fmt.Errorf("unsupported unquoted shell expansion %q", c)
 			}

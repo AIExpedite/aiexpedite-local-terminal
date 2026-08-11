@@ -1019,6 +1019,23 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	if braceStartup[len(braceStartup)-1] != `agy {a,b}` {
 		t.Errorf("bash +B with BASH_ENV was reshaped: got %q", braceStartup[len(braceStartup)-1])
 	}
+	// An inherited $SHELLOPTS listing braceexpand is reapplied after the
+	// invocation flags, so `env SHELLOPTS=braceexpand bash +B -c` expands again
+	// (5.2.21) and `+B` cannot be trusted. SHELLOPTS only turns options on, so
+	// it never undoes `-f`.
+	os.Unsetenv("BASH_ENV")
+	t.Setenv("SHELLOPTS", "braceexpand:hashall")
+	shelloptsBrace := shapeShellWrappedPTYArgs("bash", []string{"+B", "-c", `agy {a,b}`})
+	if shelloptsBrace[len(shelloptsBrace)-1] != `agy {a,b}` {
+		t.Errorf("bash +B with SHELLOPTS=braceexpand was reshaped: got %q", shelloptsBrace[len(shelloptsBrace)-1])
+	}
+	shelloptsGlob := shapeShellWrappedPTYArgs("bash", []string{"-f", "-c", `agy review *.go`})
+	wantShelloptsGlob := `agy --dangerously-skip-permissions --print 'review *.go'`
+	if shelloptsGlob[len(shelloptsGlob)-1] != wantShelloptsGlob {
+		t.Errorf("bash -f with SHELLOPTS = %q, want %q", shelloptsGlob[len(shelloptsGlob)-1], wantShelloptsGlob)
+	}
+	os.Unsetenv("SHELLOPTS")
+	t.Setenv("BASH_ENV", "/tmp/startup.sh")
 	// Same caveat for `-f`: a startup file can `set +f` and put globbing back.
 	globStartup := shapeShellWrappedPTYArgs("bash", []string{"-f", "-c", `agy review *.go`})
 	if globStartup[len(globStartup)-1] != `agy review *.go` {
@@ -1709,6 +1726,28 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	wantBashHash := `agy --dangerously-skip-permissions --print 'issue#12 f^o a~b'`
 	if bashHash[1] != wantBashHash {
 		t.Errorf("bash mid-word # = %q, want %q", bashHash[1], wantBashHash)
+	}
+
+	// `zsh -f` skips .zshenv, which is the only place a name can be declared an
+	// array or EXTENDED_GLOB / MAGIC_EQUAL_SUBST enabled — an inherited env var
+	// is always a scalar. Those payloads become knowable and reshape again
+	// (verified on zsh 5.9: `zsh -f -c 'printf "[%s]" foo#'` is literal, and
+	// TASK from the environment stays one field).
+	for _, tc := range []struct{ orig, want string }{
+		{`agy "$TASK"`, `agy --dangerously-skip-permissions --print "$TASK"`},
+		{`agy foo#`, `agy --dangerously-skip-permissions --print 'foo#'`},
+		{`agy review foo==ls`, `agy --dangerously-skip-permissions --print 'review foo==ls'`},
+	} {
+		got := shapeShellWrappedPTYArgs("zsh", []string{"-f", "-c", tc.orig})
+		if got[len(got)-1] != tc.want {
+			t.Errorf("zsh -f %q = %q, want %q", tc.orig, got[len(got)-1], tc.want)
+		}
+	}
+	// Default zsh behaviour does not depend on startup files, so an unmatched
+	// `[` still declines even with -f.
+	zshDashFBracket := shapeShellWrappedPTYArgs("zsh", []string{"-f", "-c", `agy [draft`})
+	if zshDashFBracket[len(zshDashFBracket)-1] != `agy [draft` {
+		t.Errorf("zsh -f unmatched bracket was reshaped: got %q", zshDashFBracket[len(zshDashFBracket)-1])
 	}
 
 	// bash: $argv / $path / $TASK are ordinary scalars — still reshape.
