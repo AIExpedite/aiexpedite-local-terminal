@@ -430,8 +430,8 @@ func grokHasUsableToken(base string) bool {
 	}
 	if json.Unmarshal(raw, &flat) == nil {
 		if firstNonEmpty(
-			flat.Key, flat.Token, flat.AccessToken, flat.IDToken, flat.RefreshToken,
-			flat.CachedToken.AccessToken, flat.CachedToken.IDToken, flat.CachedToken.RefreshToken,
+			flat.Key, flat.Token, flat.AccessToken, flat.IDToken,
+			flat.CachedToken.AccessToken, flat.CachedToken.IDToken,
 		) != "" {
 			return true
 		}

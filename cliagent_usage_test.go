@@ -2115,6 +2115,41 @@ func TestGrokUsageParser_ScopedExpirySkipsRefreshOnlyPreferredEntry(t *testing.T
 	}
 }
 
+func TestGrokUsageParser_FlatRefreshOnlyCredentialIsMissing(t *testing.T) {
+	t.Setenv("GROK_HOME", "")
+
+	tests := map[string]map[string]any{
+		"top-level": {
+			"refresh_token": "renewal-metadata-without-presented-token",
+		},
+		"nested cached_token": {
+			"cached_token": map[string]any{
+				"refresh_token": "renewal-metadata-without-presented-token",
+			},
+		},
+	}
+	for name, auth := range tests {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			helperWriteJSON(t, filepath.Join(home, ".grok", "auth.json"), auth)
+
+			usage, ok := grokUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+			if !ok || usage == nil {
+				t.Fatalf("expected usage entry")
+			}
+			if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+				t.Errorf("auth state=(%v, %q), want false/missing for refresh-only flat credential", usage.Authenticated, usage.AuthState)
+			}
+			if usage.LoginExpirationState == loginExpirationRefreshable {
+				t.Error("refresh-only flat metadata must not publish a refreshable login")
+			}
+			if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "not signed in") {
+				t.Errorf("Notice=%q sev=%q, want not-signed-in prompt", usage.Notice, usage.NoticeSeverity)
+			}
+		})
+	}
+}
+
 // TestGrokUsageParser_ScopedExpiryStopsAtSelectedScopeWithUnknownExpiry pins that
 // once the preferred token-bearing scope is selected, an UNREADABLE expiry there
 // (opaque key: no `expires_at`, no JWT `exp`) reports unknown instead of falling
