@@ -460,7 +460,6 @@ func TestBuildAntigravityInteractiveArgs_ExplicitEmptyPrint(t *testing.T) {
 	}{
 		{"empty string arg", []string{""}},
 		{"print equals empty", []string{"--print="}},
-		{"bare print flag", []string{"--print"}},
 		{"prompt equals empty", []string{"--prompt="}},
 	}
 	for _, tc := range cases {
@@ -473,6 +472,25 @@ func TestBuildAntigravityInteractiveArgs_ExplicitEmptyPrint(t *testing.T) {
 				t.Fatalf("want [skip --print \"\"], got %#v", args)
 			}
 		})
+	}
+}
+
+// A *bare* trailing --print is different from an explicitly empty one: agy's
+// string flag has no value, so the CLI exits with `flag needs an argument:
+// -print` (verified on 1.1.11). Inventing `--print ""` would turn the caller's
+// error into a permission-skipping empty-prompt run, so the argv passes through
+// untouched — which, unlike omitting --print, cannot drop agy into the TUI.
+func TestBuildAntigravityInteractiveArgs_BarePrintKeepsItsError(t *testing.T) {
+	for _, in := range [][]string{{"--print"}, {"-p"}, {"--prompt"}, {"--print", "hi", "--print"}} {
+		got := buildAntigravityInteractiveArgs(in)
+		if !reflect.DeepEqual(got, in) {
+			t.Errorf("buildAntigravityInteractiveArgs(%#v) = %#v, want it unchanged", in, got)
+		}
+	}
+	orig := `agy --print`
+	_, shaped := shapePTYExecArgs("bash", []string{"-c", orig})
+	if shaped[1] != orig {
+		t.Errorf("shell-wrapped bare --print = %q, want it unchanged", shaped[1])
 	}
 }
 
@@ -568,8 +586,13 @@ func TestBuildAntigravityInteractiveArgs_StripsContinueEqualsForms(t *testing.T)
 // version (1.1.11 locally, and that is how the native capability probe queries
 // it), while shaping would emit `--print --version` and burn a model run.
 func TestBuildAntigravityInteractiveArgs_PassesThroughDiagnostics(t *testing.T) {
+	// The equals spellings are included so their errors survive too: on 1.1.11
+	// `agy -v=true` reports an invalid value (it is an int flag, not a version
+	// alias) and `agy --version=true` prints nothing — neither should become a
+	// permission-skipping model run.
 	for _, in := range [][]string{
 		{"--version"}, {"-v"}, {"--help"}, {"-h"}, {"models"}, {"update"},
+		{"-v=true"}, {"--version=true"}, {"--help=true"},
 	} {
 		got := buildAntigravityInteractiveArgs(in)
 		if len(got) != 1 || got[0] != in[0] {

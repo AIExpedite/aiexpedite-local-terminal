@@ -1949,7 +1949,7 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	// is exactly how probeAntigravityNativeCapabilityUncached queries the CLI,
 	// but shaping would turn it into `--print --version` and burn a model run.
 	// Same for a lone `--help` / `-h` or a bare subcommand (`agy models`).
-	if isAntigravityDiagnosticInvocation(args) {
+	if isAntigravityDiagnosticInvocation(args) || endsWithBareAntigravityPrintFlag(args) {
 		return args
 	}
 	result := make([]string, 0, len(args)+3)
@@ -1969,7 +1969,14 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 }
 
 // antigravityDiagnosticTokens are single-token invocations that ask the CLI for
-// information instead of running a prompt. Taken from `agy --help` on 1.1.11.
+// information instead of running a prompt. Subcommands are from `agy --help` on
+// 1.1.11; `--version` prints the version there.
+//
+// `-v` and the equals spellings are included so their *errors* survive rather
+// than becoming prompts — on 1.1.11 `agy -v` reports "flag needs an argument:
+// -v" (it is an int flag, not a version alias), `agy -v=true` reports an
+// invalid value, and `agy --version=true` prints nothing at all. None of those
+// should turn into a permission-skipping model run.
 var antigravityDiagnosticTokens = map[string]bool{
 	"--version": true, "-version": true, "-v": true,
 	"--help": true, "-help": true, "-h": true,
@@ -1978,12 +1985,20 @@ var antigravityDiagnosticTokens = map[string]bool{
 	"update": true,
 }
 
-// isAntigravityDiagnosticInvocation reports a lone diagnostic token. Only the
-// single-token form counts: a brief can legitimately start with a word like
-// "help" or "update", and folding a multi-word invocation into a prompt is the
-// documented behaviour for everything else.
+// isAntigravityDiagnosticInvocation reports a lone diagnostic token, in either
+// the bare or `flag=value` spelling. Only the single-token form counts: a brief
+// can legitimately start with a word like "help" or "update", and folding a
+// multi-word invocation into a prompt is the documented behaviour for
+// everything else.
 func isAntigravityDiagnosticInvocation(args []string) bool {
-	return len(args) == 1 && antigravityDiagnosticTokens[args[0]]
+	if len(args) != 1 {
+		return false
+	}
+	if antigravityDiagnosticTokens[args[0]] {
+		return true
+	}
+	name, _, ok := splitAntigravityEqualsFlag(args[0])
+	return ok && antigravityDiagnosticTokens[name]
 }
 
 // antigravityValuedFlags are agy flags whose next argv token is their value.
@@ -2129,6 +2144,16 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 		return flags, strings.Join(args[i:], " "), dangling, true
 	}
 	return flags, "", dangling, false
+}
+
+// endsWithBareAntigravityPrintFlag reports a trailing `--print` / `-p` /
+// `--prompt` with no operand. agy's string flag then has no value and the CLI
+// exits with `flag needs an argument: -print` (verified on 1.1.11), so inventing
+// an empty prompt would convert a caller's error into a permission-skipping
+// model run. Passing the argv through preserves that error - and unlike simply
+// omitting --print, it cannot drop agy into the interactive TUI.
+func endsWithBareAntigravityPrintFlag(args []string) bool {
+	return len(args) > 0 && isAntigravityPrintFlag(args[len(args)-1])
 }
 
 func isAntigravityPrintFlag(name string) bool {

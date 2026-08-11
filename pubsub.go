@@ -2250,6 +2250,12 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 	if len(words) == 2 && isAntigravityDiagnosticInvocation([]string{words[1].Value}) {
 		return "", false
 	}
+	// A trailing bare `--print` leaves agy's string flag without a value, and
+	// the CLI exits with `flag needs an argument: -print`. Inventing an empty
+	// prompt would turn that error into a permission-skipping model run.
+	if len(words) > 1 && isAntigravityPrintFlag(words[len(words)-1].Value) {
+		return "", false
+	}
 	flags, promptFrags, trailing, hasPrompt, ok := partitionAntigravityCallerShellWords(words[1:], zshEquals)
 	if !ok {
 		return "", false
