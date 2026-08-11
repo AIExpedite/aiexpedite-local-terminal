@@ -85,6 +85,12 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 		DataSource:  "token_count",
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
+	hasAPIKeyAuth := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")) != ""
+	if hasAPIKeyAuth {
+		usage.Authenticated = authBoolPtr(true)
+		usage.AuthState = "authenticated"
+		usage.LoginExpirationState = loginExpirationNotReported
+	}
 
 	auth := codexAuth{}
 	if readJSONFile(expandHome(base, "auth.json"), &auth) {
@@ -102,6 +108,7 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 		)
 		usage.Plan = firstNonEmpty(auth.Plan, auth.PlanType, claims.Plan, claims.PlanType)
 		if firstNonEmpty(auth.APIKey, auth.Tokens.IDToken, auth.Tokens.RefreshToken) != "" {
+			hasAPIKeyAuth = hasAPIKeyAuth || strings.TrimSpace(auth.APIKey) != ""
 			usage.Authenticated = authBoolPtr(true)
 			usage.AuthState = "authenticated"
 			if auth.Tokens.RefreshToken != "" {
@@ -119,6 +126,12 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
 	usage.Metrics = codexBackfillUnknownFromRollout(usage.Metrics, base, usage.AccountFingerprint, now)
 	if loggedIn, known := codexAuthStatusProbe(detected.Path); known {
+		// `codex login status` describes persisted login state, not inherited
+		// OPENAI_API_KEY authentication. A definite persisted logout therefore
+		// cannot invalidate a credential mode the app-server will actually use.
+		if !loggedIn && hasAPIKeyAuth {
+			return usage, true
+		}
 		usage.Authenticated = authBoolPtr(loggedIn)
 		if loggedIn {
 			usage.AuthState = "authenticated"

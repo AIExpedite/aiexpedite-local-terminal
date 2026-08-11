@@ -590,6 +590,7 @@ func TestCodexUsageParser_RefreshTokenHasNoMisleadingLoginDeadline(t *testing.T)
 
 func TestCodexUsageParser_DefiniteLoggedOutProbeMakesUsageUnobservable(t *testing.T) {
 	t.Setenv("CODEX_HOME", "")
+	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	original := codexAuthStatusProbe
 	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
@@ -607,6 +608,47 @@ func TestCodexUsageParser_DefiniteLoggedOutProbeMakesUsageUnobservable(t *testin
 	for _, metric := range usage.Metrics {
 		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
 			t.Errorf("logged-out Codex usage must be unobservable: %+v", metric)
+		}
+	}
+}
+
+func TestCodexUsageParser_EnvironmentAPIKeySurvivesPersistedLogoutProbe(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("OPENAI_API_KEY", "sk-environment-test")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Now()
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 21,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			usageKnown:     true,
+			resetKnown:     true,
+		},
+		codexWindowSecondary: {
+			UsedPercentage: 34,
+			ResetsAtMs:     now.Add(24 * time.Hour).UnixMilli(),
+			usageKnown:     true,
+			resetKnown:     true,
+		},
+	}, nil, now, "")
+
+	original := codexAuthStatusProbe
+	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	t.Cleanup(func() { codexAuthStatusProbe = original })
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
+		Detected: true, Path: "codex-test",
+	}, now)
+	if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
+		t.Errorf("environment API-key auth state = (%v, %q), want true/authenticated", usage.Authenticated, usage.AuthState)
+	}
+	if usage.Notice != "" {
+		t.Errorf("Notice=%q, want no persisted-login warning for environment API-key auth", usage.Notice)
+	}
+	for _, metric := range usage.Metrics {
+		if metric.Unknown {
+			t.Errorf("environment API-key auth must preserve observed usage: %+v", metric)
 		}
 	}
 }
