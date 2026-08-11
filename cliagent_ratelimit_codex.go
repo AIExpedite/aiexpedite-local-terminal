@@ -1108,6 +1108,10 @@ func mergeCodexRateLimitCachePerLimit(
 			sameLiveWindow := priorStillLive && (!bucket.resetKnown || resetsWithinJitter(bucket.ResetsAtMs, prev.ResetsAtMs))
 			if !bucket.usageKnown && sameLiveWindow {
 				bucket.UsedPercentage = prev.UsedPercentage
+				// A reset-only frame did not re-observe utilization. Preserve the
+				// usage timestamp with the carried percentage instead of stamping it
+				// with this sparse frame's receive time.
+				bucket.ObservedAtMs = prev.ObservedAtMs
 			}
 			if !bucket.resetKnown && priorStillLive {
 				bucket.ResetsAtMs = prev.ResetsAtMs

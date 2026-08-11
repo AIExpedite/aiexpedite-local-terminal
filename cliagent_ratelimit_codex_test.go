@@ -373,11 +373,13 @@ func TestCaptureCodexRateLimit_SparseUpdatesPreservePriorFields(t *testing.T) {
 		now,
 	)
 
-	// Sparse update #1: reset-only restating the same live reset. Must
-	// preserve 60% (same window, just a fresh notification).
+	// Sparse update #1: reset-only restating the same live reset five minutes
+	// later. It must preserve both 60% and that percentage's original
+	// observation timestamp; the reset notification did not observe usage.
+	later := now.Add(5 * time.Minute)
 	captureCodexRateLimitLine(
-		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"resetsInSeconds":3600}}}}`,
-		now,
+		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"resetsInSeconds":3300}}}}`,
+		later,
 	)
 	snap, ok := loadCodexRateLimitSnapshot(cache)
 	if !ok {
@@ -389,11 +391,14 @@ func TestCaptureCodexRateLimit_SparseUpdatesPreservePriorFields(t *testing.T) {
 	if got := snap.Buckets[codexWindowPrimary].ResetsAtMs; got != now.Add(3600*time.Second).UnixMilli() {
 		t.Errorf("after reset-only update ResetsAtMs=%d, want live reset preserved", got)
 	}
+	if got := snap.Buckets[codexWindowPrimary].ObservedAtMs; got != now.UnixMilli() {
+		t.Errorf("after reset-only update ObservedAtMs=%d, want original usage observation %d", got, now.UnixMilli())
+	}
 
 	// Sparse update #2: usage-only (no reset). Must preserve the live reset.
 	captureCodexRateLimitLine(
 		`{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":72}}}}`,
-		now,
+		later,
 	)
 	snap, _ = loadCodexRateLimitSnapshot(cache)
 	if got := snap.Buckets[codexWindowPrimary].UsedPercentage; got != 72 {

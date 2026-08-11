@@ -436,6 +436,9 @@ func TestCaptureClaudeRateLimit_AllowedHeartbeatPreservesPriorUsage(t *testing.T
 	if b.ResetsAtMs != heartbeatReset*1000 {
 		t.Errorf("ResetsAtMs=%d, want updated %d from the heartbeat", b.ResetsAtMs, heartbeatReset*1000)
 	}
+	if b.ObservedAtMs != now.UnixMilli() {
+		t.Errorf("ObservedAtMs=%d, want original usage observation %d (heartbeat did not observe utilization)", b.ObservedAtMs, now.UnixMilli())
+	}
 }
 
 // A first-ever "allowed" heartbeat with no utilization must not seed the cache
