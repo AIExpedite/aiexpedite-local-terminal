@@ -2222,13 +2222,13 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 		// flag when no such file can run.
 		noGlob:      noGlob && !startupFiles,
 		dollarQuote: shellSupportsDollarQuote(shellCmd),
-		// A startup file can itself `set -o posix` (verified on bash 5.2.21:
-		// with `set -o posix` in $BASH_ENV, `bash -c 'printf %s HOME=~'` prints
-		// a literal `HOME=~`; with a no-op file it prints $HOME). We cannot read
-		// the file, so the assignment-tilde extension is treated as off: the
-		// cost is freezing a would-be $HOME inside prompt text, versus declining
-		// the reshape and letting agy sit in its interactive TUI until timeout.
-		assignTilde:       shellSupportsAssignTilde(shellCmd) && !posixMode && !startupFiles,
+		// A startup file can go either way here — `set -o posix` in $BASH_ENV
+		// makes `bash -c 'printf "[%s]" HOME=~'` print a literal `HOME=~`, while
+		// a no-op $BASH_ENV leaves it expanding to $HOME (both verified on
+		// 5.2.21). Unknowable state resolves the same way as brace expansion and
+		// globbing: assume the shell expands and decline, rather than freezing a
+		// value the shell would have substituted.
+		assignTilde:       shellSupportsAssignTilde(shellCmd) && !posixMode,
 		colonTilde:        shellSupportsColonTildePrefix(shellCmd),
 		legacyArith:       shellSupportsLegacyArith(shellCmd),
 		pwdTilde:          shellSupportsPwdTilde(shellCmd),

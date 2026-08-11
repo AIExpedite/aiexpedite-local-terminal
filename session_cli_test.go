@@ -1170,12 +1170,10 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 	}
 	// POSIX mode also arrives through the environment ($POSIXLY_CORRECT, or an
 	// inherited $SHELLOPTS listing posix) — both leave `HOME=~` literal on bash
-	// 5.2.21, so both must reshape. A $BASH_ENV startup file can `set -o posix`
-	// itself, and we cannot read it, so that counts too.
+	// 5.2.21, so both must reshape.
 	for _, env := range []struct{ k, v string }{
 		{"POSIXLY_CORRECT", "1"},
 		{"SHELLOPTS", "braceexpand:posix"},
-		{"BASH_ENV", "/tmp/startup.sh"},
 	} {
 		t.Setenv(env.k, env.v)
 		_, envPosix := shapePTYExecArgs("bash", []string{"-c", origBashAssign})
@@ -1187,6 +1185,16 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 		// NOT being in effect.
 		os.Unsetenv(env.k)
 	}
+	// A $BASH_ENV startup file could `set -o posix` (making `HOME=~` literal) or
+	// be a no-op (leaving it expanding to $HOME) — both verified on 5.2.21. That
+	// is unknowable, so it resolves the same way as brace expansion and
+	// globbing: assume the shell expands, and decline.
+	t.Setenv("BASH_ENV", "/tmp/startup.sh")
+	_, startupAssign := shapePTYExecArgs("bash", []string{"-c", origBashAssign})
+	if startupAssign[1] != origBashAssign {
+		t.Errorf("bash assignment tilde with BASH_ENV was reshaped: got %q", startupAssign[1])
+	}
+	os.Unsetenv("BASH_ENV")
 	// An exported-but-empty POSIXLY_CORRECT is still POSIX mode on bash 5.2.21.
 	t.Setenv("POSIXLY_CORRECT", "")
 	_, emptyPosix := shapePTYExecArgs("bash", []string{"-c", origBashAssign})
