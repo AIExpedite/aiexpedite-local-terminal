@@ -3850,7 +3850,16 @@ func looksLikeExpandingWordInitialTilde(s string, tildeIdx int, opts shellWordOp
 	for j := tildeIdx + 1; j < len(s); j++ {
 		switch s[j] {
 		case '\\':
-			// Backslash-quoted character in the prefix → not all-unquoted.
+			// Backslash-newline is a line continuation the shell deletes
+			// entirely, so the prefix continues on the next line: the two-line
+			// payload `~\<newline>/brief` expands to $HOME/brief on bash and
+			// dash (verified on 5.2.21 / 0.5.12). Skip both bytes rather than
+			// treating this as a quoted character.
+			if j+1 < len(s) && s[j+1] == '\n' {
+				j++
+				continue
+			}
+			// Any other backslash quotes the next character → not all-unquoted.
 			return false
 		case '\'', '"':
 			// Quoted material in the prefix (e.g. ~"root") → literal tilde.
@@ -3907,7 +3916,10 @@ func shellTildePrefixExpands(login string, opts shellWordOptions) bool {
 		if !opts.pwdTilde {
 			return false
 		}
-		return os.Getenv("OLDPWD") != "" || opts.startupFiles
+		if opts.startupFiles {
+			return true
+		}
+		return shellOldPwdIsUsable(os.Getenv("OLDPWD"))
 	}
 	if opts.pwdTilde && isPwdTildeStackZero(login) {
 		return true
@@ -3925,6 +3937,22 @@ func shellTildePrefixExpands(login string, opts shellWordOptions) bool {
 	}
 	// Unknown login: bash/dash leave literal; zsh fails the expansion.
 	return opts.failUnknownTilde
+}
+
+// shellOldPwdIsUsable reports whether an inherited $OLDPWD would survive bash's
+// startup validation and therefore make `~-` expand. Bash requires an absolute
+// path naming an existing directory and silently clears anything else —
+// verified on 5.2.21 that `OLDPWD=/no/such`, `OLDPWD=rel` and
+// `OLDPWD=/etc/hosts` all leave `~-` literal, while a real directory expands.
+func shellOldPwdIsUsable(v string) bool {
+	if v == "" {
+		return false
+	}
+	if !strings.HasPrefix(v, "/") && !filepath.IsAbs(v) {
+		return false
+	}
+	info, err := os.Stat(v)
+	return err == nil && info.IsDir()
 }
 
 // isPwdTildeStackIndex reports whether login is a bash-style directory-stack

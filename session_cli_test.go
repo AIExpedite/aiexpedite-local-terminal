@@ -1023,6 +1023,37 @@ func TestShapePTYExecArgs_RejectsUnquotedShellExpansion(t *testing.T) {
 			t.Errorf("bash tilde special was reshaped: got %q, want original %q", args[1], orig)
 		}
 	}
+	// A backslash-newline inside the tilde-prefix is a line continuation the
+	// shell deletes, so `~\<newline>/brief` expands to $HOME/brief on bash and
+	// dash (verified on 5.2.21 / 0.5.12) — decline rather than freezing it.
+	for _, shell := range []string{"bash", "dash"} {
+		orig := "agy ~\\\n/brief"
+		_, args := shapePTYExecArgs(shell, []string{"-c", orig})
+		if args[1] != orig {
+			t.Errorf("%s continued tilde was reshaped: got %q, want original %q", shell, args[1], orig)
+		}
+	}
+	// A backslash before anything else still quotes the prefix (literal tilde).
+	origEscaped := `agy ~\user_no_such/brief`
+	_, escaped := shapePTYExecArgs("bash", []string{"-c", origEscaped})
+	if escaped[1] == origEscaped {
+		t.Errorf("bash escaped tilde prefix was declined: %q", escaped[1])
+	}
+	// Bash validates $OLDPWD at startup and clears anything that is not an
+	// existing absolute directory, so `~-` stays literal for those (verified:
+	// /no/such, a relative path, and a regular file all print `~-`).
+	regularFile := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(regularFile, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	for _, bad := range []string{"/no/such/dir", "relative/path", filepath.ToSlash(regularFile)} {
+		t.Setenv("OLDPWD", bad)
+		_, badOld := shapePTYExecArgs("bash", []string{"-c", `agy ~-`})
+		wantBadOld := `agy --dangerously-skip-permissions --print '~-'`
+		if badOld[1] != wantBadOld {
+			t.Errorf("bash ~- with OLDPWD=%q = %q, want %q", bad, badOld[1], wantBadOld)
+		}
+	}
 	// Empty/unset OLDPWD and no startup file: bash leaves ~- literal — still
 	// reshape with --print.
 	t.Setenv("OLDPWD", "")
