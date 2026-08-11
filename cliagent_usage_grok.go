@@ -363,8 +363,9 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 		// later-expiring `id_token` would report the login as healthy and hide
 		// the impending stall.
 		if t, ok := fromJWT(firstNonEmpty(
-			flat.AccessToken, flat.Token, flat.Key, flat.IDToken,
-			flat.CachedToken.AccessToken, flat.CachedToken.IDToken,
+			flat.AccessToken, flat.Token, flat.Key,
+			flat.CachedToken.AccessToken,
+			flat.IDToken, flat.CachedToken.IDToken,
 		)); ok {
 			return t, true
 		}

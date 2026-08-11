@@ -943,6 +943,53 @@ func TestMergeCodexBucketMostConstrained_MultiWayZeroTiePreservesLiveProvenance(
 	}
 }
 
+func TestMergeCodexBucketMostConstrained_MultiWayKnownResetTiePreservesLiveProvenance(t *testing.T) {
+	liveKnownReset := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     5000,
+		ObservedAtMs:   3000,
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+	liveResetless := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ObservedAtMs:   1000,
+		usageKnown:     true,
+	}
+	expired := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     2000,
+		ObservedAtMs:   4000,
+		usageKnown:     true,
+		resetKnown:     true,
+		rolledOver:     true,
+	}
+
+	orders := [][]codexRateLimitBucket{
+		{expired, liveKnownReset, liveResetless},
+		{expired, liveResetless, liveKnownReset},
+		{liveKnownReset, expired, liveResetless},
+		{liveKnownReset, liveResetless, expired},
+		{liveResetless, expired, liveKnownReset},
+		{liveResetless, liveKnownReset, expired},
+	}
+	for i, order := range orders {
+		t.Run(fmt.Sprintf("order %d", i), func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{}
+			for _, bucket := range order {
+				mergeCodexBucketMostConstrained(out, codexWindowPrimary, bucket)
+			}
+			got := out[codexWindowPrimary]
+			if got.rolledOver {
+				t.Error("aggregate with live tied contributors must not remain rolled over")
+			}
+			if got.ObservedAtMs != liveKnownReset.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want freshest live observation %d", got.ObservedAtMs, liveKnownReset.ObservedAtMs)
+			}
+		})
+	}
+}
+
 // When two equally-exhausted buckets disagree on whether a reset is known, the
 // safe answer is "unknown" — don't promise a reset time that the unknown side
 // can't confirm.

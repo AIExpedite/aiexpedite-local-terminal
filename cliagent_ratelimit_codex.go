@@ -557,6 +557,11 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 			}
 		}
 		merged.resetKnown = true
+		if usageTie {
+			// Preserve aggregate provenance for later contributors: a tied
+			// aggregate is rolled over only when every contributor is.
+			merged.rolledOver = prev.rolledOver && b.rolledOver
+		}
 	case usageTie:
 		// Same exhaustion, only one side has a reset hint — don't promise a
 		// time the unknown side can't confirm; render "—" instead. Keep the
