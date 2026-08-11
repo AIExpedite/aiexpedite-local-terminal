@@ -753,6 +753,45 @@ func TestExtractCodexRateLimitBuckets_TieKeepsLaterReset(t *testing.T) {
 	}
 }
 
+func TestMergeCodexBucketMostConstrained_ZeroTieKeepsLiveObservation(t *testing.T) {
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	expired := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     now.Add(-time.Hour).UnixMilli(),
+		ObservedAtMs:   now.Add(-2 * time.Hour).UnixMilli(),
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+	live := codexRateLimitBucket{
+		UsedPercentage: 0,
+		ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+		ObservedAtMs:   now.Add(-time.Minute).UnixMilli(),
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		first  codexRateLimitBucket
+		second codexRateLimitBucket
+	}{
+		{name: "expired first", first: expired, second: live},
+		{name: "live first", first: live, second: expired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{codexWindowPrimary: tc.first}
+			mergeCodexBucketMostConstrained(out, codexWindowPrimary, tc.second)
+			got := out[codexWindowPrimary]
+			if got.ResetsAtMs != live.ResetsAtMs {
+				t.Fatalf("ResetsAtMs=%d, want live reset %d", got.ResetsAtMs, live.ResetsAtMs)
+			}
+			if got.ObservedAtMs != live.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want live observation %d", got.ObservedAtMs, live.ObservedAtMs)
+			}
+		})
+	}
+}
+
 // When two equally-exhausted buckets disagree on whether a reset is known, the
 // safe answer is "unknown" — don't promise a reset time that the unknown side
 // can't confirm.

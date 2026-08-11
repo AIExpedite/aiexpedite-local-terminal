@@ -536,8 +536,17 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 	case b.resetKnown && prev.resetKnown:
 		if b.ResetsAtMs > prev.ResetsAtMs {
 			merged.ResetsAtMs = b.ResetsAtMs
+			if usageTie {
+				// On a usage tie, the later reset is the contributor that keeps
+				// the aggregate live. Keep its observation timestamp paired with
+				// that reset so freshness checks do not inherit the expired side.
+				merged.ObservedAtMs = b.ObservedAtMs
+			}
 		} else {
 			merged.ResetsAtMs = prev.ResetsAtMs
+			if usageTie && b.ResetsAtMs == prev.ResetsAtMs && b.ObservedAtMs > prev.ObservedAtMs {
+				merged.ObservedAtMs = b.ObservedAtMs
+			}
 		}
 		merged.resetKnown = true
 	case usageTie:
