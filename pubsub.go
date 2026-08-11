@@ -2286,6 +2286,15 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 		}
 		return true
 	}
+	// The command word is rebuilt like every other token, so it has to satisfy
+	// the same rules. Unquoted expansions are the sharp case: `$BIN/agy` with
+	// BIN='/tmp/my dir' splits and fails in the original command, but quoting it
+	// on rebuild would resolve `/tmp/my dir/agy` and run it with
+	// --dangerously-skip-permissions (stub-agy diff on bash 5.2.21). Quoted
+	// expansions (`"$BIN"/agy`) do not split and still reshape.
+	if !checkWord(words[0]) {
+		return "", false
+	}
 	for _, f := range flags {
 		if !checkWord(f) {
 			return "", false

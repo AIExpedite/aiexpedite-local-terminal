@@ -695,6 +695,22 @@ func TestShapePTYExecArgs_QuotesCommandWord(t *testing.T) {
 	if got[1] != want {
 		t.Errorf("command word = %q, want %q", got[1], want)
 	}
+	// An *unquoted* expansion in the command word must decline instead: with
+	// BIN='/tmp/my dir', bash splits `$BIN/agy` and fails with
+	// `/tmp/my: No such file or directory`, while quoting it on rebuild would
+	// resolve the path and run agy with --dangerously-skip-permissions.
+	origSplit := `$BIN/agy --print review`
+	_, split := shapePTYExecArgs("bash", []string{"-c", origSplit})
+	if split[1] != origSplit {
+		t.Errorf("unquoted expanding command word was reshaped: got %q", split[1])
+	}
+	// A quoted expansion cannot split, so it still reshapes.
+	_, quoted := shapePTYExecArgs("bash", []string{"-c", `"$BIN"/agy --print review`})
+	wantQuoted := `"$BIN"/agy --dangerously-skip-permissions --print review`
+	if quoted[1] != wantQuoted {
+		t.Errorf("quoted expanding command word = %q, want %q", quoted[1], wantQuoted)
+	}
+
 	// Ordinary paths stay unquoted.
 	for _, tc := range []struct{ orig, want string }{
 		{`agy review`, `agy --dangerously-skip-permissions --print review`},
