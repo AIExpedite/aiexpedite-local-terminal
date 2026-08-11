@@ -2477,14 +2477,25 @@ func partitionAntigravityCallerShellWords(words []shellWord, zshEquals bool) (fl
 		return flags, printFrags, append(trailing, dangling...), true, true
 	}
 	if i < len(words) {
-		// An expansion in the first would-be positional can still become an agy
-		// flag after the shell evaluates it. For example, with FLAG=--print,
-		// `agy "$FLAG" review` is really `agy --print review`; treating the
-		// unevaluated word as the prompt boundary instead would freeze the prompt
-		// as `--print review`. Once a literal positional has been seen, Go flag
-		// parsing has stopped and later expansions are ordinary prompt text.
-		if words[i].Expand {
-			return nil, nil, nil, false, false
+		// An implicit prompt is folded into one --print value, so any expansion
+		// inside it is evaluated in a different argv position than the caller
+		// wrote. Two ways that changes behaviour, both verified on agy 1.1.12:
+		//
+		//   - flag position: with FLAG=--print, `agy "$FLAG" review` is really
+		//     `agy --print review` (prompt "review"), not the prompt
+		//     "--print review".
+		//   - anywhere at all: agy pre-scans its whole argv for --help /
+		//     --version, so with HELP=--help `agy review "$HELP"` prints the
+		//     usage banner, while the folded `--print "review --help"` runs the
+		//     prompt instead.
+		//
+		// The value is unknowable, so decline for any expanding fragment. An
+		// explicit `--print "$TASK"` stays shaped: it is already one argv token
+		// there, so the rebuild reproduces the caller's own layout.
+		for _, w := range words[i:] {
+			if discardsExpandingPrint([]shellWord{w}, zshEquals) {
+				return nil, nil, nil, false, false
+			}
 		}
 		return flags, words[i:], dangling, true, true
 	}

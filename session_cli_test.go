@@ -933,10 +933,13 @@ func TestShapePTYExecArgs_PreservesParameterExpansion(t *testing.T) {
 		t.Errorf("leading expanding word was reshaped: got %q, want original %q", leading[1], origLeading)
 	}
 
-	_, args := shapePTYExecArgs("bash", []string{"-c", `agy review "$TASK"`})
-	want := `agy --dangerously-skip-permissions --print "review $TASK"`
-	if args[1] != want {
-		t.Errorf("expanding prompt = %q, want %q", args[1], want)
+	// A later expansion in an implicit prompt is no safer: agy pre-scans its
+	// whole argv for --help / --version, so an expansion anywhere in it can
+	// change what the command does once folded into a single --print value.
+	origLater := `agy review "$TASK"`
+	_, later := shapePTYExecArgs("bash", []string{"-c", origLater})
+	if later[1] != origLater {
+		t.Errorf("later expanding word was reshaped: got %q, want original %q", later[1], origLater)
 	}
 
 	// An explicit print operand cannot be reclassified as a flag.
@@ -965,12 +968,21 @@ func TestShapePTYExecArgs_DeclinesExpansionBeforePromptBoundary(t *testing.T) {
 		}
 	}
 
-	// Once a literal positional starts the prompt, later expansions cannot be
-	// parsed as flags by agy's Go flag parser.
-	_, safe := shapePTYExecArgs("bash", []string{"-c", `agy review "$FLAG"`})
-	wantSafe := `agy --dangerously-skip-permissions --print "review $FLAG"`
-	if safe[1] != wantSafe {
-		t.Errorf("post-boundary expansion = %q, want %q", safe[1], wantSafe)
+	// A literal positional stops Go's flag parsing, but not agy's argv pre-scan
+	// for --help / --version: with HELP=--help, `agy review "$HELP"` prints the
+	// usage banner while the folded `--print "review --help"` runs the prompt
+	// (verified on 1.1.12). So later expansions decline as well.
+	origPost := `agy review "$FLAG"`
+	_, post := shapePTYExecArgs("bash", []string{"-c", origPost})
+	if post[1] != origPost {
+		t.Errorf("post-boundary expansion was reshaped: got %q, want original %q", post[1], origPost)
+	}
+	// The explicit form keeps its shaping: the expansion is already its own
+	// argv token there, so the rebuild reproduces the caller's layout.
+	_, explicitPost := shapePTYExecArgs("bash", []string{"-c", `agy --print "$FLAG"`})
+	wantExplicitPost := `agy --dangerously-skip-permissions --print "$FLAG"`
+	if explicitPost[1] != wantExplicitPost {
+		t.Errorf("explicit expanding print = %q, want %q", explicitPost[1], wantExplicitPost)
 	}
 }
 
@@ -1034,9 +1046,12 @@ func TestShapePTYExecArgs_PreservesPerFragmentExpansion(t *testing.T) {
 		t.Errorf("mixed literal prompt = %q, want %q", args[1], want)
 	}
 
-	// Expanding + literal-with-$ uses adjacent quote concatenation.
-	_, mixArgs := shapePTYExecArgs("bash", []string{"-c", `agy review "$TASK" '$(touch /tmp/pwn)'`})
-	wantMix := `agy --dangerously-skip-permissions --print review" ""$TASK"" "'$(touch /tmp/pwn)'`
+	// Expanding + literal-with-$ uses adjacent quote concatenation. Implicit
+	// prompts containing an expansion now decline, so the serializer is
+	// exercised through the explicit --print form (the trailing literal word
+	// stays on argv as a trailing token, exactly as agy would receive it).
+	_, mixArgs := shapePTYExecArgs("bash", []string{"-c", `agy --print "$TASK" '$(touch /tmp/pwn)'`})
+	wantMix := `agy --dangerously-skip-permissions --print "$TASK" '$(touch /tmp/pwn)'`
 	if mixArgs[1] != wantMix {
 		t.Errorf("mixed expand/literal = %q, want %q", mixArgs[1], wantMix)
 	}
@@ -1075,10 +1090,10 @@ func TestShapePTYExecArgs_PreservesPerFragmentExpansion(t *testing.T) {
 		t.Errorf("expandable $TASK + literal more = %q, want %q", nameArgs[1], wantName)
 	}
 
-	// Multi-word with multi-seg expand (`"$x"'y' more`): must not flatten to
-	// `"$xy more"` (wrong parameter name). Per-word/segment quoting.
-	_, multiSegMore := shapePTYExecArgs("bash", []string{"-c", `agy review "$TASK"'x' more`})
-	wantMultiSegMore := `agy --dangerously-skip-permissions --print review" ""$TASK"x" "more`
+	// Multi-seg expand (`"$x"'y'`) must not flatten to `"$xy"` (wrong parameter
+	// name). Per-segment quoting, via the explicit --print form.
+	_, multiSegMore := shapePTYExecArgs("bash", []string{"-c", `agy --print "$TASK"'x' more`})
+	wantMultiSegMore := `agy --dangerously-skip-permissions --print "$TASK"x more`
 	if multiSegMore[1] != wantMultiSegMore {
 		t.Errorf("multi-seg expand + more = %q, want %q", multiSegMore[1], wantMultiSegMore)
 	}
@@ -1781,12 +1796,12 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 		}
 	}
 
-	// A double-quoted expansion after a literal boundary may still join into
-	// one --print value.
-	_, dq := shapePTYExecArgs("bash", []string{"-c", `agy review "$TASK" more`})
-	wantDQ := `agy --dangerously-skip-permissions --print "review $TASK more"`
-	if dq[1] != wantDQ {
-		t.Errorf("double-quoted multi-frag expand = %q, want %q", dq[1], wantDQ)
+	// A double-quoted expansion inside an implicit prompt declines, wherever it
+	// sits: folding it into one --print value hides it from agy's argv pre-scan.
+	origDQ := `agy review "$TASK" more`
+	_, dq := shapePTYExecArgs("bash", []string{"-c", origDQ})
+	if dq[1] != origDQ {
+		t.Errorf("double-quoted multi-frag expand was reshaped: got %q, want original %q", dq[1], origDQ)
 	}
 
 	// Quoted multi-field expansions still split after --print — leave unshaped.
