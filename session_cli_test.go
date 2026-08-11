@@ -759,6 +759,54 @@ func TestShapePTYExecArgs_QuotesCommandWord(t *testing.T) {
 	}
 }
 
+// Go's flag package treats `-flag` and `--flag` as the same option (verified on
+// agy 1.1.12: `agy -model` reports `flag needs an argument: -model`), and `--`
+// ends flag parsing and is dropped from the arguments.
+func TestBuildAntigravityInteractiveArgs_SingleDashAndTerminator(t *testing.T) {
+	for _, tc := range []struct {
+		in   []string
+		want []string
+	}{
+		// Single-dash long flags are recognized; the caller's spelling is kept.
+		{
+			[]string{"-model", "gemini", "review"},
+			[]string{"--dangerously-skip-permissions", "-model", "gemini", "--print", "review"},
+		},
+		{[]string{"-print", "review"}, []string{"--dangerously-skip-permissions", "--print", "review"}},
+		{[]string{"-prompt", "review"}, []string{"--dangerously-skip-permissions", "--print", "review"}},
+		// `--` is consumed, so the prompt is what follows it.
+		{[]string{"--", "review"}, []string{"--dangerously-skip-permissions", "--print", "review"}},
+		{[]string{"--", "review", "this"}, []string{"--dangerously-skip-permissions", "--print", "review this"}},
+		{
+			[]string{"-add-dir", "/repo", "--", "review"},
+			[]string{"--dangerously-skip-permissions", "-add-dir", "/repo", "--print", "review"},
+		},
+		// The single-dash spelling of a stripped flag is still stripped.
+		{[]string{"-continue", "review"}, []string{"--dangerously-skip-permissions", "--print", "review"}},
+	} {
+		got := buildAntigravityInteractiveArgs(tc.in)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("buildAntigravityInteractiveArgs(%#v) = %#v, want %#v", tc.in, got, tc.want)
+		}
+	}
+	// Same through the shell-wrapped reshaper.
+	for _, tc := range []struct{ orig, want string }{
+		{`agy -model gemini review`, `agy --dangerously-skip-permissions -model gemini --print review`},
+		{`agy -- review`, `agy --dangerously-skip-permissions --print review`},
+		{`agy -print review`, `agy --dangerously-skip-permissions --print review`},
+	} {
+		_, shaped := shapePTYExecArgs("bash", []string{"-c", tc.orig})
+		if shaped[1] != tc.want {
+			t.Errorf("shaped %q = %q, want %q", tc.orig, shaped[1], tc.want)
+		}
+	}
+	// Short flags keep their meaning: -p is print, -c is the stripped continue.
+	if got := buildAntigravityInteractiveArgs([]string{"-p", "review"}); !reflect.DeepEqual(
+		got, []string{"--dangerously-skip-permissions", "--print", "review"}) {
+		t.Errorf("-p prompt = %#v", got)
+	}
+}
+
 // Regression: --print must NOT be followed by another flag (agy 1.1.x eats it as the prompt).
 func TestBuildAntigravityInteractiveArgs_PrintValueIsNeverAFlag(t *testing.T) {
 	args := buildAntigravityInteractiveArgs([]string{"review this design"})

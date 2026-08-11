@@ -2083,12 +2083,22 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 		flags = append(flags, tokens...)
 	}
 	for i < len(args) {
-		a := args[i]
+		// Classify on the canonical spelling (Go accepts -flag and --flag alike)
+		// but keep the caller's own token when re-emitting it.
+		raw := args[i]
+		a := canonicalAntigravityFlag(raw)
+		// `--` ends flag parsing and is itself dropped, so the prompt starts
+		// after it.
+		if a == antigravityFlagTerminator {
+			i++
+			break
+		}
 		// Match only exact lowercase CLI spellings (agy flag names are
 		// case-sensitive). Uppercase forms like --PRINT are prompt text.
 
 		// Equals-form: --flag=value / -p=value
 		if name, val, ok := splitAntigravityEqualsFlag(a); ok {
+			name = canonicalAntigravityFlag(name)
 			if isAntigravityPrintFlag(name) {
 				// Explicit print value (possibly empty). Keep peeling flags
 				// after it so `--print=hi --conversation id` preserves options.
@@ -2134,7 +2144,7 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 				i++
 				continue
 			}
-			addFlag(a)
+			addFlag(raw)
 			i++
 			continue
 		}
@@ -2146,11 +2156,11 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 				// `--conversation --print review`, where agy takes `--print` as
 				// the conversation value and the one-shot silently disappears.
 				// Keep it last so --print <prompt> stays intact.
-				dangling = append(dangling, a)
+				dangling = append(dangling, raw)
 				i++
 				continue
 			}
-			addFlag(a, args[i+1])
+			addFlag(raw, args[i+1])
 			i += 2
 			continue
 		}
@@ -2198,8 +2208,12 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool bool) {
 		return name == "--dangerously-skip-permissions" || name == "--continue" || name == "-c"
 	}
 	for i := 0; i < len(args); i++ {
-		a := args[i]
+		a := canonicalAntigravityFlag(args[i])
+		if a == antigravityFlagTerminator {
+			return barePrint, invalidBool // `--` ends flag parsing
+		}
 		if name, val, ok := splitAntigravityEqualsFlag(a); ok {
+			name = canonicalAntigravityFlag(name)
 			// `--print=` carries a value (possibly empty).
 			if isAntigravityPrintFlag(name) {
 				continue
@@ -2236,6 +2250,28 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool bool) {
 	}
 	return barePrint, invalidBool
 }
+
+// canonicalAntigravityFlag normalizes a single-dash long flag to its double-dash
+// spelling. Go's flag package treats `-flag` and `--flag` as the same option —
+// verified on agy 1.1.12, where `agy -model` reports `flag needs an argument:
+// -model` — so classification must accept both. Short flags (-p, -c, -h) and
+// non-flag tokens are returned unchanged, and callers keep the caller's own
+// spelling when re-emitting the token.
+func canonicalAntigravityFlag(tok string) string {
+	if len(tok) < 3 || !strings.HasPrefix(tok, "-") || strings.HasPrefix(tok, "--") {
+		return tok
+	}
+	double := "-" + tok
+	if antigravityValuedFlags[double] || antigravityBoolFlags[double] || isAntigravityPrintFlag(double) {
+		return double
+	}
+	return tok
+}
+
+// antigravityFlagTerminator is Go's `--`: it ends flag parsing and is dropped
+// from the argument list, so `agy -- review` has the prompt `review`, not
+// `-- review`.
+const antigravityFlagTerminator = "--"
 
 func isAntigravityPrintFlag(name string) bool {
 	return name == "--print" || name == "-p" || name == "--prompt"

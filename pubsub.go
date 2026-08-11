@@ -2361,11 +2361,18 @@ func partitionAntigravityCallerShellWords(words []shellWord, zshEquals bool) (fl
 		flags = append(flags, tokens...)
 	}
 	for i < len(words) {
-		a := words[i].Value
+		a := canonicalAntigravityFlag(words[i].Value)
+		// `--` ends flag parsing and is dropped from the arguments, so the
+		// prompt starts after it (`agy -- review` has the prompt `review`).
+		if a == antigravityFlagTerminator {
+			i++
+			break
+		}
 		// Exact lowercase CLI spellings only (same case-sensitive rule as
 		// partitionAntigravityCallerArgs). --PRINT is prompt text.
 
 		if name, _, ok := splitAntigravityEqualsFlag(a); ok {
+			name = canonicalAntigravityFlag(name)
 			if isAntigravityPrintFlag(name) {
 				// --print=value: peel value with segment metadata after '='.
 				// Continue so later recognized flags are not swallowed.
