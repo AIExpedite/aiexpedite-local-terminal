@@ -349,6 +349,9 @@ func TestClaudeCodeUsageParser_ApiKeyNoOAuthNoNotice(t *testing.T) {
 	// absence of an OAuth deadline is not a "signed out" signal.
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	originalProbe := claudeAuthStatusProbe
+	claudeAuthStatusProbe = func(string) (bool, bool) { return true, true }
+	t.Cleanup(func() { claudeAuthStatusProbe = originalProbe })
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
 		"email": "ada@example.com",
@@ -518,6 +521,55 @@ func TestClaudeCodeUsageParser_MissingCredentials(t *testing.T) {
 	}
 	if usage.AccountFingerprint != "" {
 		t.Errorf("fingerprint should be empty when account is unknown")
+	}
+}
+
+func TestClaudeCodeUsageParser_InvalidCredentialsDoNotAuthenticate(t *testing.T) {
+	originalProbe := claudeAuthStatusProbe
+	claudeAuthStatusProbe = func(string) (bool, bool) { return false, false }
+	t.Cleanup(func() { claudeAuthStatusProbe = originalProbe })
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{name: "empty file", raw: ""},
+		{name: "malformed json", raw: "{"},
+		{name: "missing credential", raw: `{"claudeAiOauth":{}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			cache := filepath.Join(t.TempDir(), "rl.json")
+			t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+			now := time.Now()
+			mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+				claudeWindowFiveHour: {
+					UsedPercentage: 40,
+					ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+					ObservedAtMs:   now.UnixMilli(),
+					usageKnown:     true,
+				},
+			}, now, "")
+
+			credentialPath := filepath.Join(home, ".claude", ".credentials.json")
+			if err := os.MkdirAll(filepath.Dir(credentialPath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(credentialPath, []byte(tc.raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+			if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+				t.Errorf("auth state=(%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+			}
+			for _, metric := range usage.Metrics {
+				if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
+					t.Errorf("invalid credentials must make cached usage unobservable: %+v", metric)
+				}
+			}
+		})
 	}
 }
 

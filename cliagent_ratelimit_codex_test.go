@@ -792,6 +792,43 @@ func TestMergeCodexBucketMostConstrained_ZeroTieKeepsLiveObservation(t *testing.
 	}
 }
 
+func TestMergeCodexBucketMostConstrained_TieWithoutCommonResetKeepsFreshObservation(t *testing.T) {
+	older := codexRateLimitBucket{
+		UsedPercentage: 50,
+		ResetsAtMs:     time.Now().Add(time.Hour).UnixMilli(),
+		ObservedAtMs:   1000,
+		usageKnown:     true,
+		resetKnown:     true,
+	}
+	fresher := codexRateLimitBucket{
+		UsedPercentage: 50,
+		ObservedAtMs:   2000,
+		usageKnown:     true,
+		resetKnown:     false,
+	}
+
+	for _, tc := range []struct {
+		name   string
+		first  codexRateLimitBucket
+		second codexRateLimitBucket
+	}{
+		{name: "known reset first", first: older, second: fresher},
+		{name: "unknown reset first", first: fresher, second: older},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := map[string]codexRateLimitBucket{codexWindowPrimary: tc.first}
+			mergeCodexBucketMostConstrained(out, codexWindowPrimary, tc.second)
+			got := out[codexWindowPrimary]
+			if got.resetKnown || got.ResetsAtMs != 0 {
+				t.Errorf("reset=(%v, %d), want unknown", got.resetKnown, got.ResetsAtMs)
+			}
+			if got.ObservedAtMs != fresher.ObservedAtMs {
+				t.Errorf("ObservedAtMs=%d, want freshest observation %d", got.ObservedAtMs, fresher.ObservedAtMs)
+			}
+		})
+	}
+}
+
 // When two equally-exhausted buckets disagree on whether a reset is known, the
 // safe answer is "unknown" — don't promise a reset time that the unknown side
 // can't confirm.

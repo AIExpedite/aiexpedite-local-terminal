@@ -94,8 +94,10 @@ type claudeDotJSON struct {
 // (RefreshTokenExpiresAt). That's the real re-authentication deadline.
 type claudeOAuthCredentials struct {
 	ClaudeAiOauth struct {
-		ExpiresAt             int64 `json:"expiresAt"`
-		RefreshTokenExpiresAt int64 `json:"refreshTokenExpiresAt"`
+		AccessToken           string `json:"accessToken"`
+		RefreshToken          string `json:"refreshToken"`
+		ExpiresAt             int64  `json:"expiresAt"`
+		RefreshTokenExpiresAt int64  `json:"refreshTokenExpiresAt"`
 	} `json:"claudeAiOauth"`
 }
 
@@ -204,24 +206,32 @@ func claudeAuthNoticeFromRaw(raw []byte, now time.Time) (string, string) {
 	return "", ""
 }
 
-func applyClaudeAuthState(usage *cliAgentUsage, raw []byte, now time.Time) {
+func applyClaudeAuthState(usage *cliAgentUsage, raw []byte, now time.Time) bool {
 	if usage == nil || len(raw) == 0 {
-		return
+		return false
+	}
+	creds := claudeOAuthCredentials{}
+	if json.Unmarshal(raw, &creds) != nil {
+		return false
+	}
+	oauth := creds.ClaudeAiOauth
+	if oauth.AccessToken == "" && oauth.RefreshToken == "" && oauth.ExpiresAt <= 0 && oauth.RefreshTokenExpiresAt <= 0 {
+		return false
 	}
 	usage.Authenticated = authBoolPtr(true)
 	usage.AuthState = "authenticated"
 	usage.LoginExpirationState = loginExpirationNotReported
-	creds := claudeOAuthCredentials{}
-	if json.Unmarshal(raw, &creds) != nil || creds.ClaudeAiOauth.RefreshTokenExpiresAt <= 0 {
-		return
+	if oauth.RefreshTokenExpiresAt <= 0 {
+		return true
 	}
-	deadline := time.UnixMilli(creds.ClaudeAiOauth.RefreshTokenExpiresAt).UTC()
+	deadline := time.UnixMilli(oauth.RefreshTokenExpiresAt).UTC()
 	usage.LoginExpirationState = loginExpirationKnown
 	usage.LoginExpiresAt = deadline.Format(time.RFC3339)
 	if !deadline.After(now) {
 		usage.Authenticated = authBoolPtr(false)
 		usage.AuthState = "expired"
 	}
+	return true
 }
 
 func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
@@ -241,8 +251,11 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 
 	// Read the credential ONCE (file, or macOS Keychain) and use it for both the
 	// account/plan fingerprint and the auth-expiry notice.
+	credentialFound := false
+	credentialUsable := false
 	if raw, ok := readClaudeCredentialsRaw(base); ok {
-		applyClaudeAuthState(usage, raw, now)
+		credentialFound = true
+		credentialUsable = applyClaudeAuthState(usage, raw, now)
 		creds := claudeCredentials{}
 		if json.Unmarshal(raw, &creds) == nil {
 			usage.Account = firstNonEmpty(creds.Email, creds.Account, creds.Organization)
@@ -310,6 +323,13 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 			usage.Authenticated = authBoolPtr(true)
 			usage.AuthState = "authenticated"
 		}
+	} else if credentialFound && !credentialUsable {
+		usage.Authenticated = authBoolPtr(false)
+		usage.AuthState = "missing"
+		usage.LoginExpiresAt = ""
+		usage.LoginExpirationState = loginExpirationNotReported
+		usage.Notice = "Claude credentials are unavailable on this computer — run `claude` and sign in (/login) on the terminal computer."
+		usage.NoticeSeverity = "error"
 	}
 	if usage.NoticeSeverity == "error" {
 		usage.Metrics = utilizationMetricsUnknown(usage.Metrics)

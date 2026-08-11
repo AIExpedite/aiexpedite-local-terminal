@@ -542,18 +542,28 @@ func mergeCodexBucketMostConstrained(out map[string]codexRateLimitBucket, id str
 				// that reset so freshness checks do not inherit the expired side.
 				merged.ObservedAtMs = b.ObservedAtMs
 			}
+		} else if prev.ResetsAtMs > b.ResetsAtMs {
+			merged.ResetsAtMs = prev.ResetsAtMs
+			if usageTie {
+				merged.ObservedAtMs = prev.ObservedAtMs
+			}
 		} else {
 			merged.ResetsAtMs = prev.ResetsAtMs
-			if usageTie && b.ResetsAtMs == prev.ResetsAtMs && b.ObservedAtMs > prev.ObservedAtMs {
+			if usageTie && b.ObservedAtMs > prev.ObservedAtMs {
 				merged.ObservedAtMs = b.ObservedAtMs
 			}
 		}
 		merged.resetKnown = true
 	case usageTie:
 		// Same exhaustion, only one side has a reset hint — don't promise a
-		// time the unknown side can't confirm; render "—" instead.
+		// time the unknown side can't confirm; render "—" instead. Since no
+		// reset can identify the active contributor, retain the freshest tied
+		// observation deterministically.
 		merged.ResetsAtMs = 0
 		merged.resetKnown = false
+		if b.ObservedAtMs > prev.ObservedAtMs {
+			merged.ObservedAtMs = b.ObservedAtMs
+		}
 	case usageDrivenByB && b.resetKnown:
 		merged.ResetsAtMs = b.ResetsAtMs
 		merged.resetKnown = true
