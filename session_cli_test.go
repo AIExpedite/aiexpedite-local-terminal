@@ -1828,15 +1828,28 @@ func TestShapePTYExecArgs_RejectsUnquotedExpandPrompts(t *testing.T) {
 	// Parameter expansions whose pattern uses backslash escapes (e.g. %\} to
 	// match a literal '}') cannot be re-double-quoted: allowExpand doubling
 	// turns \ into \\ and changes the expansion. Leave unshaped.
+	// Command / arithmetic / backtick substitution bodies are code the shell
+	// re-parses, so the same doubling corrupts them: `agy "$(printf '\141')"`
+	// supplies `a`, but `--print "$(printf '\\141')"` supplies the literal
+	// `\141` (verified on bash 5.2.21 with a stub agy).
 	for _, orig := range []string{
 		`agy "${x%\}}"`,
 		`agy "${x#\*}"`,
 		`agy --add-dir "${x%\}}" task`,
+		`agy "$(printf '\141')"`,
+		"agy \"`printf '\\141'`\"",
+		`agy "$(( 1 + \0 ))"`,
 	} {
 		_, args := shapePTYExecArgs("bash", []string{"-c", orig})
 		if args[1] != orig {
-			t.Errorf("PE backslash pattern was reshaped: got %q, want original %q", args[1], orig)
+			t.Errorf("expansion backslash was reshaped: got %q, want original %q", args[1], orig)
 		}
+	}
+	// A substitution without backslashes still reshapes.
+	_, cleanSub := shapePTYExecArgs("bash", []string{"-c", `agy "$(cat brief.txt)"`})
+	wantCleanSub := `agy --dangerously-skip-permissions --print "$(cat brief.txt)"`
+	if cleanSub[1] != wantCleanSub {
+		t.Errorf("clean substitution = %q, want %q", cleanSub[1], wantCleanSub)
 	}
 
 	// Literal backslash after a simple expansion (`"$ROOT\docs"`) is safe to

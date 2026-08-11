@@ -2664,7 +2664,9 @@ func (w shellWord) hasQuotedMultiWordExpand() bool {
 }
 
 // hasExpandWithBackslash reports expandable segments that contain a backslash
-// inside parameter-expansion grammar (e.g. "${x%\}}" pattern escapes).
+// inside expansion grammar — parameter expansions ("${x%\}}" pattern escapes)
+// as well as command / arithmetic / backtick substitutions
+// ("$(printf '\141')").
 // quoteAntigravityShellArg with allowExpand doubles every `\` for double-quote
 // safety, which changes PE meaning (`${x%\}}` → `${x%\\}}`). Decline reshape
 // rather than rewrite expansion syntax.
@@ -2682,22 +2684,51 @@ func (w shellWord) hasExpandWithBackslash() bool {
 }
 
 // shellExpandHasParamBackslash reports whether s contains a `\` inside any
-// balanced `${…}` body (the only backslash forms that PE grammar cares about
-// when we re-double-quote).
+// balanced `${…}` body, `$(…)` / `$((…))` substitution, or backtick
+// substitution — every construct whose body is code the shell re-parses, where
+// the double-quote-safe doubling of `\` would change its meaning.
+//
+// `${x%\}}` would become `${x%\\}}` (different PE pattern), and
+// `"$(printf '\141')"` would become `"$(printf '\\141')"`, which supplies the
+// literal `\141` instead of `a` (verified against bash 5.2.21 with a stub agy).
+// Literal backslashes outside these bodies (e.g. "$ROOT\docs") stay safe:
+// doubling `\` inside double quotes still yields one literal backslash for
+// non-special followers, so those prompts keep reshaping.
 func shellExpandHasParamBackslash(s string) bool {
 	for i := 0; i < len(s); i++ {
-		if s[i] != '$' || i+1 >= len(s) || s[i+1] != '{' {
-			continue
+		switch {
+		case s[i] == '`':
+			// Backtick substitution: body runs to the next unescaped backtick.
+			for j := i + 1; j < len(s); j++ {
+				if s[j] == '\\' {
+					return true
+				}
+				if s[j] == '`' {
+					i = j
+					break
+				}
+			}
+		case s[i] == '$' && i+1 < len(s) && s[i+1] == '(':
+			close := shellSubstCloseParen(s, i+1)
+			if close < 0 {
+				// Unbalanced `$(` — any trailing `\` is still body material.
+				return strings.Contains(s[i+2:], `\`)
+			}
+			if strings.Contains(s[i+2:close], `\`) {
+				return true
+			}
+			i = close
+		case s[i] == '$' && i+1 < len(s) && s[i+1] == '{':
+			close := shellParamCloseBrace(s, i+2)
+			if close < 0 {
+				// Unmatched `${` — any trailing `\` is still PE-body material.
+				return strings.Contains(s[i+2:], `\`)
+			}
+			if strings.Contains(s[i+2:close], `\`) {
+				return true
+			}
+			i = close
 		}
-		close := shellParamCloseBrace(s, i+2)
-		if close < 0 {
-			// Unmatched `${` — any trailing `\` is still PE-body material.
-			return strings.Contains(s[i+2:], `\`)
-		}
-		if strings.Contains(s[i+2:close], `\`) {
-			return true
-		}
-		i = close
 	}
 	return false
 }
