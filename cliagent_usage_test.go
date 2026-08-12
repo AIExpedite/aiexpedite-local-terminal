@@ -832,6 +832,99 @@ func TestCodexUsageParser_EnvironmentAPIKeySurvivesPersistedLogoutProbe(t *testi
 	}
 }
 
+func TestCodexUsageParser_APIKeyFallbackDropsStaleOAuthExpiry(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("OPENAI_API_KEY", "sk-environment-test")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token": helperJWT(t, map[string]any{
+				"email": "oauth@example.com",
+				"exp":   time.Now().Add(time.Hour).Unix(),
+			}),
+			"refresh_token": "opaque-refresh-token",
+		},
+	})
+
+	original := codexAuthStatusProbe
+	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	t.Cleanup(func() { codexAuthStatusProbe = original })
+
+	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{
+		Detected: true, Path: "codex-test",
+	}, time.Now())
+	if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
+		t.Errorf("auth state = (%v, %q), want true/authenticated for the API key in use", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpiresAt != "" || usage.LoginExpirationState != loginExpirationNotReported {
+		t.Errorf("login expiration = (%q, %q), want none — the expiry belongs to the logged-out OAuth token, not the API key",
+			usage.LoginExpirationState, usage.LoginExpiresAt)
+	}
+}
+
+func TestCodexUsageParser_LoggedOutProbeDropsStaleOAuthExpiry(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token": helperJWT(t, map[string]any{
+				"email": "oauth@example.com",
+				"exp":   time.Now().Add(time.Hour).Unix(),
+			}),
+			"refresh_token": "opaque-refresh-token",
+		},
+	})
+
+	original := codexAuthStatusProbe
+	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	t.Cleanup(func() { codexAuthStatusProbe = original })
+
+	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{
+		Detected: true, Path: "codex-test",
+	}, time.Now())
+	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
+		t.Errorf("auth state = (%v, %q), want false/missing", usage.Authenticated, usage.AuthState)
+	}
+	if usage.LoginExpiresAt != "" || usage.LoginExpirationState != loginExpirationNotReported {
+		t.Errorf("login expiration = (%q, %q), want none on a signed-out card",
+			usage.LoginExpirationState, usage.LoginExpiresAt)
+	}
+}
+
+func TestCodexUsageParser_ReportsAccessTokenExpiryForActiveOAuthLogin(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	exp := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token": helperJWT(t, map[string]any{
+				"email": "oauth@example.com",
+				"exp":   exp.Unix(),
+			}),
+			"refresh_token": "opaque-refresh-token",
+		},
+	})
+
+	original := codexAuthStatusProbe
+	codexAuthStatusProbe = func(string) (bool, bool) { return true, true }
+	t.Cleanup(func() { codexAuthStatusProbe = original })
+
+	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{
+		Detected: true, Path: "codex-test",
+	}, time.Now())
+	if usage.LoginExpiresAt != exp.Format(time.RFC3339) {
+		t.Errorf("LoginExpiresAt=%q, want %q for the live OAuth credential", usage.LoginExpiresAt, exp.Format(time.RFC3339))
+	}
+	if usage.LoginExpirationState != loginExpirationRefreshable {
+		t.Errorf("LoginExpirationState=%q, want refreshable", usage.LoginExpirationState)
+	}
+}
+
 func TestCodexUsageParser_PopulatesObservedMetricsFromCache(t *testing.T) {
 	t.Setenv("CODEX_HOME", "")
 	cache := filepath.Join(t.TempDir(), "rl.json")

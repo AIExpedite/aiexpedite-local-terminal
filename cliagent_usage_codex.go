@@ -142,6 +142,12 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 		// OPENAI_API_KEY authentication. A definite persisted logout therefore
 		// cannot invalidate a credential mode the app-server will actually use.
 		if !loggedIn && hasAPIKeyAuth {
+			// The probe is definite: the persisted OAuth login is gone, so any
+			// expiry parsed out of a leftover auth.json id_token describes a
+			// credential Codex will not use. The API key that IS in use carries
+			// no expiry, so report none rather than a stale OAuth one.
+			usage.LoginExpiresAt = ""
+			usage.LoginExpirationState = loginExpirationNotReported
 			return usage, true
 		}
 		usage.Authenticated = authBoolPtr(loggedIn)
@@ -149,6 +155,8 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 			usage.AuthState = "authenticated"
 		} else {
 			usage.AuthState = "missing"
+			usage.LoginExpiresAt = ""
+			usage.LoginExpirationState = loginExpirationNotReported
 			usage.Notice = "Codex is not signed in on this computer — run `codex login` on the terminal computer to authenticate."
 			usage.NoticeSeverity = "error"
 			usage.Metrics = utilizationMetricsUnknown(usage.Metrics)
