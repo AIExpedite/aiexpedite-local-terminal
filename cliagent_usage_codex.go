@@ -69,6 +69,9 @@ type codexIDTokenClaims struct {
 	Plan     string `json:"plan"`
 	PlanType string `json:"plan_type"`
 	OrgID    string `json:"org_id"`
+	// Standard JWT expiry (seconds since epoch). Reported even when the
+	// credential refreshes itself — see the LoginExpiresAt assignment below.
+	Exp int64 `json:"exp"`
 }
 
 func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
@@ -115,6 +118,15 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 				usage.LoginExpirationState = loginExpirationRefreshable
 			} else {
 				usage.LoginExpirationState = loginExpirationNotReported
+			}
+			// Report the expiry even for a refreshing credential. It is the
+			// ACCESS token's, not a logout date, so the card must label it as
+			// such — but withholding it left the row permanently blank, which
+			// tells the reader nothing about whether the login is healthy.
+			// authState is deliberately NOT flipped on a passed expiry here: a
+			// refreshable token renews on next use, so "expired" would be a lie.
+			if claims.Exp > 0 {
+				usage.LoginExpiresAt = time.Unix(claims.Exp, 0).UTC().Format(time.RFC3339)
 			}
 		}
 	}

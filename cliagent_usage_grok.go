@@ -180,6 +180,14 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 		usage.AuthState = "authenticated"
 		if grokHasRefreshToken(base) {
 			usage.LoginExpirationState = loginExpirationRefreshable
+			// Same as Codex: surface the access-token expiry even though the
+			// token renews, so the row says something. NOT a logout date, and
+			// authState stays authenticated past it — the refresh happens on
+			// next use, and Grok's real sign-out shows up through the auth
+			// notice path (an interactive `grok login`), not this timestamp.
+			if expiry, ok := readGrokAuthExpiry(base); ok {
+				usage.LoginExpiresAt = expiry.UTC().Format(time.RFC3339)
+			}
 		} else if expiry, ok := readGrokAuthExpiry(base); ok {
 			usage.LoginExpirationState = loginExpirationKnown
 			usage.LoginExpiresAt = expiry.UTC().Format(time.RFC3339)
