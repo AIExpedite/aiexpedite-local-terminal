@@ -1783,12 +1783,14 @@ func TestGrokUsageParser_CachedTokenAuthFile(t *testing.T) {
 	if usage.DataSource != "~/.grok" {
 		t.Errorf("DataSource=%q, want ~/.grok", usage.DataSource)
 	}
-	if len(usage.Metrics) != 2 {
-		t.Fatalf("expected 2 metrics (requests + tokens), got %d", len(usage.Metrics))
+	// No billing line in the CLI log (this fixture has no logs at all), so the
+	// card keeps a single placeholder credit row rather than inventing counters.
+	if len(usage.Metrics) != 1 {
+		t.Fatalf("expected 1 placeholder credit metric, got %d", len(usage.Metrics))
 	}
 	for _, m := range usage.Metrics {
 		if !m.Unknown {
-			t.Errorf("metric %q should be Unknown (no observable counter)", m.Kind)
+			t.Errorf("metric %q should be Unknown (nothing observed yet)", m.Kind)
 		}
 	}
 	// Identity metadata can outlive the credential that authenticated it. A

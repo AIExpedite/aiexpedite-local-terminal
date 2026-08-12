@@ -1,13 +1,14 @@
 // cliagent_usage_antigravity.go — Antigravity (`agy`) usage parser.
 //
 // Antigravity CLI stores per-user settings under
-// ~/.gemini/antigravity-cli/settings.json. The provider does not currently
-// expose request- or token-level quotas, only the active account/plan.
-// Capacity rows are flagged Unknown because there is no observable counter to
-// plot.
+// ~/.gemini/antigravity-cli/settings.json. Quota is NOT on disk: it comes from
+// the language server each `agy` run starts on loopback
+// (cliagent_usage_antigravity_quota.go), which we read when one is up and cache
+// for the gaps in between.
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"time"
 )
@@ -47,19 +48,43 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 		usage.Account = firstNonEmpty(cfg.Email, cfg.Account)
 		usage.Plan = firstNonEmpty(cfg.Plan, cfg.Tier)
 	}
-	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 	// Antigravity keeps its renewable session in the OS keyring and does not
 	// publish a durable session deadline. Do not reinterpret an access token or
 	// the settings-file mtime as login expiration.
 	usage.LoginExpirationState = loginExpirationNotReported
 
-	usage.Metrics = []cliAgentUsageMetric{
-		{
-			Kind:    limitKindMonthly,
-			Label:   "Monthly quota",
-			Unit:    "requests",
-			Unknown: true,
-		},
+	// A live language server knows the account it is signed in as; settings.json
+	// usually does not. Prefer the server's identity so the fingerprint that
+	// scopes the cache is the same one the quota was captured under.
+	ctx, cancel := context.WithTimeout(context.Background(), antigravityQuotaTimeout)
+	defer cancel()
+	fresh, gotFresh := fetchAntigravityQuota(ctx, base, now)
+	if gotFresh {
+		usage.Account = firstNonEmpty(fresh.Account, usage.Account)
+		usage.Plan = firstNonEmpty(fresh.Plan, usage.Plan)
+	}
+	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
+
+	snap := fresh
+	if gotFresh {
+		snap.AccountFingerprint = usage.AccountFingerprint
+		saveAntigravityQuotaSnapshot(snap)
+	} else if cached, ok := loadAntigravityQuotaSnapshot(usage.AccountFingerprint); ok {
+		// No `agy` running right now. Replay the last reading with its ORIGINAL
+		// observation time so the card ages it honestly instead of presenting a
+		// day-old pool as current.
+		snap = cached
+	}
+
+	usage.Metrics = antigravityQuotaMetrics(snap, now)
+	if len(usage.Metrics) == 0 {
+		// Never observed on this machine (no session since install, or a plan
+		// with no metered pool). Keep placeholder rows so the agent still shows
+		// up as "limits exist, values unobservable".
+		usage.Metrics = []cliAgentUsageMetric{
+			{Kind: limitKindSession, Label: "5-hour session window", Unit: "%", Unknown: true},
+			{Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%", Unknown: true},
+		}
 	}
 	return usage, true
 }

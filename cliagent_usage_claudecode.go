@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -531,6 +532,71 @@ func currentClaudeAccountFingerprint() string {
 	return fingerprintAccount("claudeCode", account)
 }
 
+// installedClaudeRateLimitCachePath returns the cache path the CURRENTLY
+// INSTALLED status-line hook writes to, or "" when Claude has no hook of ours.
+//
+// `ourStatusLineCommand` pins the path to the installing binary's
+// `GetConfigDir()`, but Claude's settings.json is a single machine-wide file:
+// with two channels installed (release + dev), whichever agent booted last owns
+// the hook, and the other one keeps reading a cache nothing writes to any more.
+// Its Claude card then freezes at whatever was observed before the handover —
+// the reported observation ages by days while the device is plainly online.
+func installedClaudeRateLimitCachePath(home string) string {
+	base := claudeConfigDir(home)
+	if base == "" {
+		return ""
+	}
+	settings := map[string]json.RawMessage{}
+	if !readJSONFile(filepath.Join(base, "settings.json"), &settings) {
+		return ""
+	}
+	raw, ok := settings["statusLine"]
+	if !ok {
+		return ""
+	}
+	var sl claudeStatusLine
+	if json.Unmarshal(raw, &sl) != nil || !isOurStatusLineCommand(sl.Command) {
+		return ""
+	}
+	return extractInstalledPinnedPath(sl.Command, "RL_CACHE")
+}
+
+// loadMergedClaudeRateLimitBuckets reads every cache this machine could have
+// captured into — our own config dir plus the one the installed hook pins — and
+// returns the freshest observation per window.
+//
+// Merging rather than preferring one path: the agent's own stream capture writes
+// to OUR path while the status-line hook writes to the PINNED one, so on a
+// dual-channel box each file holds a genuine subset of the observations. Taking
+// the higher ObservedAtMs per window is the same precedence the cache itself
+// applies on merge, so this can only move a window forward in time.
+//
+// A snapshot whose `accountFingerprint` doesn't match the current account is
+// skipped entirely — see claudeCodeMetricsFromCache for why that scoping is
+// exact rather than best-effort.
+func loadMergedClaudeRateLimitBuckets(currentFingerprint string) map[string]claudeRateLimitBucket {
+	home, _ := os.UserHomeDir()
+	paths := []string{claudeRateLimitCachePath()}
+	if pinned := installedClaudeRateLimitCachePath(home); pinned != "" && pinned != paths[0] {
+		paths = append(paths, pinned)
+	}
+
+	merged := map[string]claudeRateLimitBucket{}
+	for _, path := range paths {
+		snap, ok := loadClaudeRateLimitSnapshot(path)
+		if !ok || snap.AccountFingerprint != currentFingerprint {
+			continue
+		}
+		for window, bucket := range snap.Buckets {
+			prev, seen := merged[window]
+			if !seen || bucket.ObservedAtMs > prev.ObservedAtMs {
+				merged[window] = bucket
+			}
+		}
+	}
+	return merged
+}
+
 // claudeCodeMetricsFromCache builds the metric rows from the rate-limit cache,
 // falling back to the Unknown placeholders when a window hasn't been observed.
 // Two rows are always shown so the card layout is stable: the 5-hour session
@@ -543,11 +609,7 @@ func currentClaudeAccountFingerprint() string {
 // would attribute a previous user's reset windows to the device-scoped
 // fallback entry after the local credentials were removed.
 func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentUsageMetric {
-	snap, ok := loadClaudeRateLimitSnapshot(claudeRateLimitCachePath())
-	buckets := map[string]claudeRateLimitBucket{}
-	if ok && snap.AccountFingerprint == currentFingerprint {
-		buckets = snap.Buckets
-	}
+	buckets := loadMergedClaudeRateLimitBuckets(currentFingerprint)
 
 	session := observedMetricOrUnknown(
 		buckets, []string{claudeWindowFiveHour}, limitKindSession, "5-hour session window", now)

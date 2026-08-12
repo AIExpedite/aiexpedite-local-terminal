@@ -128,19 +128,30 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	usage.Plan = plan
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
-	usage.Metrics = []cliAgentUsageMetric{
-		{
-			Kind:    limitKindRequests,
-			Label:   "Daily requests",
-			Unit:    "requests",
-			Unknown: true,
-		},
-		{
-			Kind:    limitKindTokens,
-			Label:   "Daily tokens",
-			Unit:    "tokens",
-			Unknown: true,
-		},
+	// Grok's real quota is a credit pool over a billing period, not the
+	// request/token counters this card used to guess at. The CLI logs the pool
+	// it fetched for itself; when that log has a usable record we plot it and
+	// take the subscription tier from the same record (the auth file rarely
+	// carries a plan).
+	if snap, ok := readGrokBillingSnapshot(base); ok {
+		if metrics := grokBillingMetrics(snap, now); len(metrics) > 0 {
+			usage.Metrics = metrics
+			usage.Plan = firstNonEmpty(usage.Plan, snap.SubscriptionTier)
+		}
+	}
+	if len(usage.Metrics) == 0 {
+		// No billing line yet (fresh install, or the CLI has not fetched credits
+		// since the log rotated). Keep a placeholder row so the agent still
+		// appears on the card as "limit exists, value unobservable" rather than
+		// vanishing.
+		usage.Metrics = []cliAgentUsageMetric{
+			{
+				Kind:    limitKindWeekly,
+				Label:   "Weekly credits",
+				Unit:    "%",
+				Unknown: true,
+			},
+		}
 	}
 
 	// Notice priority is by whether the condition blocks requests RIGHT NOW, not
