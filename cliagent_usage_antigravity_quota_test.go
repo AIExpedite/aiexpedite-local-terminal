@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -491,5 +492,88 @@ func TestDiscoverAntigravityHTTPPorts_ReadsBoundedHeadAndTail(t *testing.T) {
 	// The restart (tail) is the newer listener and must be probed first.
 	if ports[0] != 44442 || ports[1] != 44441 {
 		t.Errorf("ports=%v, want [44442 44441]", ports)
+	}
+}
+
+// A bucket with an absent or null remainingFraction decodes to 0 in a plain
+// float64 — i.e. "100% consumed". It is not a reading and must not count as an
+// observation, or a malformed payload would replace a good cached one.
+func TestFetchAntigravityQuota_SkipsBucketsWithoutARemainingFraction(t *testing.T) {
+	base := t.TempDir()
+	helperAntigravityServer(t, base, `{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+	  {"bucketId":"gemini-weekly","window":"weekly","resetTime":"2126-08-14T00:00:00Z"},
+	  {"bucketId":"gemini-5h","window":"5h","remainingFraction":null,"resetTime":"2126-08-12T04:37:41Z"}]}]}}`,
+		helperStatusJSON)
+
+	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+		t.Errorf("buckets with no usable fraction must not count as an observation")
+	}
+}
+
+// An out-of-range fraction is equally unusable.
+func TestFetchAntigravityQuota_SkipsOutOfRangeFraction(t *testing.T) {
+	base := t.TempDir()
+	helperAntigravityServer(t, base, `{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+	  {"bucketId":"gemini-weekly","window":"weekly","remainingFraction":42,"resetTime":"2126-08-14T00:00:00Z"}]}]}}`,
+		helperStatusJSON)
+
+	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+		t.Errorf("a fraction outside 0..1 must not be plotted")
+	}
+}
+
+// A valid bucket alongside a malformed one still reads, carrying only the usable
+// row into the cache.
+func TestFetchAntigravityQuota_KeepsValidBucketsBesideMalformedOnes(t *testing.T) {
+	base := t.TempDir()
+	helperAntigravityServer(t, base, `{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+	  {"bucketId":"gemini-weekly","window":"weekly","resetTime":"2126-08-14T00:00:00Z"},
+	  {"bucketId":"gemini-5h","window":"5h","remainingFraction":0.9,"resetTime":"2126-08-12T04:37:41Z"}]}]}}`,
+		helperStatusJSON)
+
+	snap, ok := fetchAntigravityQuota(context.Background(), base, time.Now())
+	if !ok {
+		t.Fatalf("expected the usable bucket to yield a snapshot")
+	}
+	if len(snap.Buckets) != 1 || snap.Buckets[0].Window != "5h" {
+		t.Errorf("buckets=%+v, want only the 5h row", snap.Buckets)
+	}
+}
+
+// Concurrent savers must never expose a partial cache: a shared temp name lets
+// one writer truncate bytes another is about to rename into place.
+func TestSaveAntigravityQuotaSnapshot_ConcurrentWritesStayIntact(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			saveAntigravityQuotaSnapshot(antigravityQuotaSnapshot{
+				ObservedAt:         "2026-08-11T09:00:00Z",
+				AccountFingerprint: fingerprintAccount("antigravity", "ada@example.com"),
+				Account:            "ada@example.com",
+				Buckets: []antigravityQuotaBucket{
+					{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.4,
+						ResetTime: "2126-08-14T00:00:00Z"},
+				},
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	var persisted antigravityQuotaSnapshot
+	if !readJSONFile(cache, &persisted) {
+		t.Fatalf("cache must be readable after concurrent writes")
+	}
+	if len(persisted.Buckets) != 1 {
+		t.Errorf("persisted=%+v, want one intact bucket", persisted)
+	}
+	// No temp files may survive.
+	matches, _ := filepath.Glob(cache + ".tmp.*")
+	if len(matches) != 0 {
+		t.Errorf("leftover temp files: %v", matches)
 	}
 }

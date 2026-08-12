@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -36,6 +37,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -91,6 +93,10 @@ type antigravityQuotaSnapshot struct {
 	Plan               string                   `json:"plan"`
 	Buckets            []antigravityQuotaBucket `json:"buckets"`
 }
+
+// antigravityQuotaCacheMu serializes cache writers within this process — see
+// saveAntigravityQuotaSnapshot.
+var antigravityQuotaCacheMu sync.Mutex
 
 // antigravityQuotaCachePath is the cache location inside the agent's data dir.
 // AIEXPEDITE_AGY_QUOTA_CACHE overrides it (tests isolate from the real machine
@@ -270,11 +276,14 @@ func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (ant
 				Groups []struct {
 					DisplayName string `json:"displayName"`
 					Buckets     []struct {
-						BucketID          string  `json:"bucketId"`
-						DisplayName       string  `json:"displayName"`
-						Window            string  `json:"window"`
-						RemainingFraction float64 `json:"remainingFraction"`
-						ResetTime         string  `json:"resetTime"`
+						BucketID    string `json:"bucketId"`
+						DisplayName string `json:"displayName"`
+						Window      string `json:"window"`
+						// Pointer so an absent or null fraction is distinguishable
+						// from a real 0 — decoded into a plain float64 it would
+						// silently become "100% consumed".
+						RemainingFraction *float64 `json:"remainingFraction"`
+						ResetTime         string   `json:"resetTime"`
 					} `json:"buckets"`
 				} `json:"groups"`
 			} `json:"response"`
@@ -286,12 +295,20 @@ func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (ant
 		plottable := 0
 		for _, group := range quota.Response.Groups {
 			for _, bucket := range group.Buckets {
+				// A bucket with no usable fraction is not a reading. Keeping it
+				// would both render as 100% consumed and let a malformed payload
+				// count as an observation that replaces a good cached one.
+				if bucket.RemainingFraction == nil ||
+					math.IsNaN(*bucket.RemainingFraction) ||
+					*bucket.RemainingFraction < 0 || *bucket.RemainingFraction > 1 {
+					continue
+				}
 				snap.Buckets = append(snap.Buckets, antigravityQuotaBucket{
 					BucketID:          bucket.BucketID,
 					Group:             group.DisplayName,
 					DisplayName:       bucket.DisplayName,
 					Window:            bucket.Window,
-					RemainingFraction: bucket.RemainingFraction,
+					RemainingFraction: *bucket.RemainingFraction,
 					ResetTime:         bucket.ResetTime,
 				})
 				if _, _, ok := antigravityWindowKind(bucket.Window); ok {
@@ -401,7 +418,15 @@ func saveAntigravityQuotaSnapshot(snap antigravityQuotaSnapshot) {
 	if err != nil {
 		return
 	}
-	tmp := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
+	// The periodic machine-info gather and a demand-driven refresh can both save
+	// here at once IN THE SAME PROCESS. The mutex serializes them, and the
+	// nanosecond suffix keeps two writers (or a stale temp from a crashed run)
+	// off the same intermediate file — a shared temp name would let one writer
+	// truncate the bytes another is about to rename into place.
+	antigravityQuotaCacheMu.Lock()
+	defer antigravityQuotaCacheMu.Unlock()
+
+	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), time.Now().UnixNano())
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return
 	}
