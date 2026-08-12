@@ -143,6 +143,10 @@ func TestAntigravityUsageParser_DoesNotCacheQuotaWithoutServerIdentity(t *testin
 	cache := filepath.Join(t.TempDir(), "agyq.json")
 	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
 	helperAntigravityServer(t, base, helperQuotaJSON, "") // GetUserStatus 500s
+	// A stale identity from a previous login, exactly what must NOT be adopted.
+	helperWriteJSON(t, filepath.Join(base, "settings.json"), map[string]any{
+		"email": "previous-login@example.com",
+	})
 
 	usage, ok := antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true},
 		time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC))
@@ -154,6 +158,13 @@ func TestAntigravityUsageParser_DoesNotCacheQuotaWithoutServerIdentity(t *testin
 	}
 	if _, err := os.Stat(cache); err == nil {
 		t.Errorf("an unattributable reading must not be cached")
+	}
+	// settings.json's account is from a previous login and cannot be assumed to
+	// own the quota the server just reported — publishing under it would attach
+	// this reading to that account's fingerprint across every device.
+	if usage.Account != "" || usage.AccountFingerprint != "" {
+		t.Errorf("account/fingerprint=%q/%q, want unattributed",
+			usage.Account, usage.AccountFingerprint)
 	}
 }
 

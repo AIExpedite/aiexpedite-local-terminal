@@ -41,7 +41,7 @@ func TestReadGrokBillingSnapshot_TakesNewestRecord(t *testing.T) {
 		`{"ts":"2026-08-10T17:09:00Z","msg":"chat: turn complete","ctx":{}}`,
 	)
 
-	snap, ok := readGrokBillingSnapshot(base)
+	snap, ok := readGrokBillingSnapshot(base, nil)
 	if !ok {
 		t.Fatalf("expected a billing snapshot")
 	}
@@ -69,7 +69,7 @@ func TestReadGrokBillingSnapshot_SkipsTruncatedLeadingLine(t *testing.T) {
 			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
 	)
 
-	snap, ok := readGrokBillingSnapshot(base)
+	snap, ok := readGrokBillingSnapshot(base, nil)
 	if !ok {
 		t.Fatalf("expected a billing snapshot")
 	}
@@ -84,13 +84,13 @@ func TestReadGrokBillingSnapshot_RejectsRecordWithoutObservationTime(t *testing.
 		fmt.Sprintf(`{"msg":%q,"ctx":{"config":{"creditUsagePercent":52.0}}}`, grokBillingLogMessage),
 	)
 
-	if _, ok := readGrokBillingSnapshot(base); ok {
+	if _, ok := readGrokBillingSnapshot(base, nil); ok {
 		t.Errorf("a percentage with no ts must be rejected — it cannot be aged")
 	}
 }
 
 func TestReadGrokBillingSnapshot_MissingLogIsNotAnError(t *testing.T) {
-	if _, ok := readGrokBillingSnapshot(t.TempDir()); ok {
+	if _, ok := readGrokBillingSnapshot(t.TempDir(), nil); ok {
 		t.Errorf("absent log should report no snapshot")
 	}
 }
@@ -244,5 +244,89 @@ func TestReadGrokBillingSnapshot_HonorsRelocatedHome(t *testing.T) {
 	}
 	if usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 7 {
 		t.Errorf("Consumed=%v, want 7 from $GROK_HOME", usage.Metrics[0].Consumed)
+	}
+}
+
+// The log outlives a logout. A billing record left by a previous account carries
+// no identity of its own, so it must not be republished as the current one's.
+func TestReadGrokBillingSnapshot_RejectsRecordFromAnotherAccount(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
+		`{"ts":"2026-08-11T09:00:00Z","msg":"chat: turn start","ctx":{"user_id":"new-account-uuid"}}`,
+	)
+
+	if _, ok := readGrokBillingSnapshot(base, []string{"old-account-uuid"}); ok {
+		t.Errorf("a record from before an account switch must not be attributed to the new one")
+	}
+	if _, ok := readGrokBillingSnapshot(base, []string{"new-account-uuid"}); !ok {
+		t.Errorf("the record must still be read when the log's identity matches")
+	}
+}
+
+// The log's identity may be a user id while the credential's display account is
+// an email — matching against every candidate keeps that case working.
+func TestReadGrokBillingSnapshot_MatchesAnyIdentityCandidate(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"user_id":"abc-123"}}`,
+		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
+	)
+
+	if _, ok := readGrokBillingSnapshot(base, []string{"ada@example.com", "abc-123"}); !ok {
+		t.Errorf("a user_id match must be enough even when the display account is an email")
+	}
+}
+
+// A log that names an account while the local credentials resolve to nothing is
+// the signed-out case: refuse rather than publish somebody else's pool.
+func TestReadGrokBillingSnapshot_RejectsIdentifiedLogWithoutCredentials(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
+		`{"ts":"2026-08-10T17:09:00Z","msg":"chat","ctx":{"user_id":"someone"}}`,
+	)
+
+	if _, ok := readGrokBillingSnapshot(base, nil); ok {
+		t.Errorf("an identified log with no readable credentials must not be trusted")
+	}
+}
+
+// An older CLI logs no identity at all; there is nothing to contradict the
+// record, so it stays readable.
+func TestReadGrokBillingSnapshot_AcceptsLogWithoutAnyIdentity(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
+	)
+
+	if _, ok := readGrokBillingSnapshot(base, []string{"ada@example.com"}); !ok {
+		t.Errorf("a log with no identity lines must still be readable")
+	}
+}
+
+func TestGrokIdentityCandidates_CollectsEveryAccountField(t *testing.T) {
+	base := t.TempDir()
+	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{
+		"email":    "ada@example.com",
+		"user_id":  "abc-123",
+		"username": "ada",
+	})
+
+	got := grokIdentityCandidates(base)
+	for _, want := range []string{"ada@example.com", "abc-123", "ada"} {
+		found := false
+		for _, candidate := range got {
+			if candidate == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("candidates %v missing %q", got, want)
+		}
 	}
 }

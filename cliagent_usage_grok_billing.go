@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -37,6 +38,12 @@ const grokBillingLogTailBytes = 1 << 20 // 1 MiB
 // grokBillingLogMessage is the log `msg` that carries the credits config. Grok
 // writes it when the CLI fetches billing (session start / periodic refresh).
 const grokBillingLogMessage = "billing: fetched credits config"
+
+// grokLogUserIDRe extracts the account the CLI was acting as. The billing record
+// itself carries no identity, but the surrounding log lines do, and the log
+// survives `grok login` as a different user — so without this check a retained
+// record from a previous account would be published as the current one's.
+var grokLogUserIDRe = regexp.MustCompile(`"user_?[Ii]d"\s*:\s*"([^"]{1,128})"`)
 
 // grokBillingRecord mirrors the fields we consume from that line. Everything is
 // optional: an older CLI, a different plan shape, or a partially written line
@@ -88,13 +95,21 @@ func grokBillingLogPath(base string) string {
 	return filepath.Join(base, "logs", "unified.jsonl")
 }
 
-// readGrokBillingSnapshot returns the NEWEST billing record in the log tail.
+// readGrokBillingSnapshot returns the NEWEST billing record in the log tail,
+// provided it can be tied to the CURRENT credentials.
 //
 // Lines are scanned back-to-front and the first well-formed billing record wins:
 // the log is append-only, so the last such line is the most recent fetch. A
 // truncated first line (the tail almost always starts mid-record) simply fails
 // to unmarshal and is skipped like any other non-billing line.
-func readGrokBillingSnapshot(base string) (grokBillingSnapshot, bool) {
+//
+// `identities` are the account values the current auth file resolves to (see
+// grokIdentityCandidates). The log outlives a logout, so a record left by a
+// previous account must not be attributed to the one signed in now: the newest
+// `user_id` in the tail has to match one of them. When the log carries no
+// identity at all — an older CLI — there is nothing to contradict the record and
+// it is accepted, which is no worse than before this check existed.
+func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnapshot, bool) {
 	path := grokBillingLogPath(base)
 	if path == "" {
 		return grokBillingSnapshot{}, false
@@ -122,6 +137,9 @@ func readGrokBillingSnapshot(base string) (grokBillingSnapshot, bool) {
 	}
 
 	lines := bytes.Split(tail, []byte("\n"))
+	if !grokLogBelongsToCurrentAccount(lines, identities) {
+		return grokBillingSnapshot{}, false
+	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
 		// Cheap pre-filter before the JSON decode: the vast majority of lines in
@@ -141,6 +159,37 @@ func readGrokBillingSnapshot(base string) (grokBillingSnapshot, bool) {
 		return snap, true
 	}
 	return grokBillingSnapshot{}, false
+}
+
+// grokLogBelongsToCurrentAccount reports whether the newest identity in the log
+// tail is one the current credentials resolve to.
+//
+// Only the NEWEST identity is compared: the log is append-only and shared across
+// logins, so an older `user_id` simply means the account changed at some point,
+// while a newer one that does not match the current credentials means the
+// billing record we are about to read was written by somebody else.
+func grokLogBelongsToCurrentAccount(lines [][]byte, identities []string) bool {
+	wanted := make(map[string]bool, len(identities))
+	for _, identity := range identities {
+		if trimmed := strings.ToLower(strings.TrimSpace(identity)); trimmed != "" {
+			wanted[trimmed] = true
+		}
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		match := grokLogUserIDRe.FindSubmatch(lines[i])
+		if match == nil {
+			continue
+		}
+		if len(wanted) == 0 {
+			// The log names an account but the credentials resolve to nothing we
+			// can compare. Refuse rather than guess: an unidentifiable local login
+			// is exactly the logged-out case this check exists for.
+			return false
+		}
+		return wanted[strings.ToLower(string(match[1]))]
+	}
+	// No identity anywhere in the tail (older CLI) — nothing contradicts it.
+	return true
 }
 
 // grokBillingSnapshotFromRecord validates one record. A record with no usage

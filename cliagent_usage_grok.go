@@ -19,6 +19,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -133,7 +134,7 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	// it fetched for itself; when that log has a usable record we plot it and
 	// take the subscription tier from the same record (the auth file rarely
 	// carries a plan).
-	if snap, ok := readGrokBillingSnapshot(base); ok {
+	if snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base)); ok {
 		if metrics := grokBillingMetrics(snap, now); len(metrics) > 0 {
 			usage.Metrics = metrics
 			usage.Plan = firstNonEmpty(usage.Plan, snap.SubscriptionTier)
@@ -612,6 +613,44 @@ func readGrokAccountAndPlan(base string) (string, string) {
 		}
 	}
 	return account, plan
+}
+
+// grokIdentityCandidates returns EVERY account value the current credentials
+// resolve to — email, username, user id, subject — from both the flat and the
+// scoped auth layouts.
+//
+// readGrokAccountAndPlan picks just one by precedence, which is right for
+// display but wrong for matching the log: the log records `user_id`, while the
+// display account may well be an email. Comparing against the whole set lets the
+// billing-log check confirm the record belongs to this login regardless of which
+// field happened to win.
+func grokIdentityCandidates(base string) []string {
+	authPath := filepath.Join(base, "auth.json")
+	auth := grokAuthFile{}
+	if !readJSONFile(authPath, &auth) {
+		readJSONFile(filepath.Join(base, "cached_token.json"), &auth)
+	}
+	claims := grokIDTokenClaims{}
+	parseJWTClaims(firstNonEmpty(auth.CachedToken.IDToken, auth.CachedToken.AccessToken), &claims)
+	scoped, _ := readGrokScopedAuthClaims(authPath)
+
+	candidates := []string{
+		auth.Email, auth.Account, auth.UserName, auth.UserID,
+		auth.CachedToken.Email, auth.CachedToken.Account, auth.CachedToken.Subject,
+		claims.Email, claims.Account, claims.UserName, claims.UserID, claims.Subject,
+		scoped.Email, scoped.Account, scoped.UserName, scoped.UserID, scoped.Subject,
+	}
+	out := make([]string, 0, len(candidates))
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		trimmed := strings.TrimSpace(candidate)
+		if trimmed == "" || seen[trimmed] {
+			continue
+		}
+		seen[trimmed] = true
+		out = append(out, trimmed)
+	}
+	return out
 }
 
 // currentGrokAccountFingerprint reads the Grok auth on disk and returns the

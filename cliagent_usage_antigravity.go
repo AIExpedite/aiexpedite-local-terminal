@@ -59,22 +59,27 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 	ctx, cancel := context.WithTimeout(context.Background(), antigravityQuotaTimeout)
 	defer cancel()
 	fresh, gotFresh := fetchAntigravityQuota(ctx, base, now)
+	// A live reading may ONLY be published under an identity the server itself
+	// reported. settings.json can hold an account from a previous login, so
+	// falling back to it here would publish the current server's quota under the
+	// old account — the fingerprint that dedups this snapshot across devices —
+	// and a transient GetUserStatus failure is enough to trigger it. When the
+	// server answers quota but not identity, the entry goes out unattributed:
+	// gatherCLIAgentUsage then scopes it to this device, which is exactly what
+	// "we don't know whose quota this is" should look like.
 	if gotFresh {
-		usage.Account = firstNonEmpty(fresh.Account, usage.Account)
-		usage.Plan = firstNonEmpty(fresh.Plan, usage.Plan)
+		usage.Account = fresh.Account
+		usage.Plan = fresh.Plan
 	}
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
 	snap := fresh
 	if gotFresh {
-		// Scope the cache by the identity the SERVER reported, never by the one
-		// settings.json happens to carry: if GetUserStatus failed we do not know
-		// which account this quota belongs to, and stamping it with a
-		// settings-derived (or empty) fingerprint is how one account's pool ends
-		// up replayed under another. Displaying it this once is still correct —
-		// it came from the server that is about to run the work.
-		snap.AccountFingerprint = fingerprintAccount(p.Provider(), fresh.Account)
-		if fresh.Account != "" {
+		snap.AccountFingerprint = usage.AccountFingerprint
+		// An unattributable reading is still worth DISPLAYING — it came from the
+		// server about to run the work — but caching it would let an unscoped
+		// snapshot be replayed under a later account.
+		if usage.AccountFingerprint != "" {
 			saveAntigravityQuotaSnapshot(snap)
 		}
 	} else if cached, ok := loadAntigravityQuotaSnapshot(usage.AccountFingerprint); ok {
