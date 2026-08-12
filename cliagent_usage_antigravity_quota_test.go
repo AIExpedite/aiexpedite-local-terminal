@@ -386,3 +386,110 @@ func TestAntigravityUsageParser_FreshReadOverwritesCache(t *testing.T) {
 		t.Errorf("cached buckets=%d, want 3", len(persisted.Buckets))
 	}
 }
+
+// settings.json usually names nobody, so scoping the replay by the current
+// fingerprint alone would leave the between-runs cache permanently unreachable.
+// Replay under the producer's identity instead — the card then names the account
+// the reading belongs to.
+func TestAntigravityUsageParser_ReplaysCacheUnderItsProducerWhenSettingsHasNoIdentity(t *testing.T) {
+	home := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+
+	fingerprint := fingerprintAccount("antigravity", "ada@example.com")
+	body, _ := json.Marshal(antigravityQuotaSnapshot{
+		ObservedAt:         "2026-08-11T09:00:00Z",
+		AccountFingerprint: fingerprint,
+		Account:            "ada@example.com",
+		Plan:               "Pro",
+		Buckets: []antigravityQuotaBucket{
+			{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.4, ResetTime: "2126-08-14T00:00:00Z"},
+		},
+	})
+	if err := os.WriteFile(cache, body, 0o600); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	// No settings.json at all: the account lives in the OS keyring.
+	if err := os.MkdirAll(filepath.Join(home, ".gemini", "antigravity-cli"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	usage, ok := antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatalf("Parse failed")
+	}
+	if len(usage.Metrics) != 1 || usage.Metrics[0].Unknown {
+		t.Fatalf("expected the cached bucket to plot, got %+v", usage.Metrics)
+	}
+	if usage.Account != "ada@example.com" || usage.AccountFingerprint != fingerprint {
+		t.Errorf("account/fingerprint=%q/%q, want the producing identity",
+			usage.Account, usage.AccountFingerprint)
+	}
+	if usage.Plan != "Pro" {
+		t.Errorf("Plan=%q, want the producer's plan", usage.Plan)
+	}
+	if usage.Metrics[0].ObservedAt != "2026-08-11T09:00:00Z" {
+		t.Errorf("ObservedAt=%q, want the original observation", usage.Metrics[0].ObservedAt)
+	}
+}
+
+// A settings file that names a DIFFERENT account still blocks the replay: the
+// scoped load fails and the producer fallback is only for an unknown identity.
+func TestAntigravityUsageParser_DoesNotReplayProducerCacheUnderAConflictingAccount(t *testing.T) {
+	home := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+
+	body, _ := json.Marshal(antigravityQuotaSnapshot{
+		ObservedAt:         "2026-08-11T09:00:00Z",
+		AccountFingerprint: fingerprintAccount("antigravity", "someone-else@example.com"),
+		Account:            "someone-else@example.com",
+		Buckets: []antigravityQuotaBucket{
+			{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.4, ResetTime: "2126-08-14T00:00:00Z"},
+		},
+	})
+	if err := os.WriteFile(cache, body, 0o600); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	helperWriteJSON(t, filepath.Join(home, ".gemini", "antigravity-cli", "settings.json"),
+		map[string]any{"email": "ada@example.com"})
+
+	usage, _ := antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	for _, m := range usage.Metrics {
+		if !m.Unknown {
+			t.Errorf("another account's cache must not be plotted: %+v", m)
+		}
+	}
+	if usage.Account != "ada@example.com" {
+		t.Errorf("Account=%q, want the settings identity to stand", usage.Account)
+	}
+}
+
+// A long-running session's log must not be slurped whole, and the port has to
+// survive being logged at the head of a file whose tail is far away.
+func TestDiscoverAntigravityHTTPPorts_ReadsBoundedHeadAndTail(t *testing.T) {
+	base := t.TempDir()
+	filler := strings.Repeat("I0811 12:00:00.000000 42 chatter: noise noise noise\n", 12000)
+	helperWriteAntigravityLog(t, base, "cli-big.log",
+		"server.go:584] Language server listening on random port at 44441 for HTTP\n"+
+			filler+
+			"server.go:584] Language server listening on random port at 44442 for HTTP\n")
+
+	info, err := os.Stat(filepath.Join(antigravityLogDir(base), "cli-big.log"))
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size() <= 2*antigravityLogScanBytes {
+		t.Fatalf("fixture must exceed the scan window, got %d bytes", info.Size())
+	}
+
+	ports := discoverAntigravityHTTPPorts(base)
+	if len(ports) != 2 {
+		t.Fatalf("ports=%v, want both the startup and restart ports", ports)
+	}
+	// The restart (tail) is the newer listener and must be probed first.
+	if ports[0] != 44442 || ports[1] != 44441 {
+		t.Errorf("ports=%v, want [44442 44441]", ports)
+	}
+}

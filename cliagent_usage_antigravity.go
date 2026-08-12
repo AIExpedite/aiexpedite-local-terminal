@@ -87,6 +87,18 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 		// observation time so the card ages it honestly instead of presenting a
 		// day-old pool as current.
 		snap = cached
+	} else if usage.AccountFingerprint == "" {
+		// settings.json names nobody — the usual case, since the account lives in
+		// the OS keyring. Replay under the identity that PRODUCED the reading
+		// rather than dropping it: there is no current identity for it to
+		// conflict with, and the card then names the account the quota belongs
+		// to instead of implying it is whoever is signed in now.
+		if cached, ok := loadAntigravityQuotaSnapshotByProducer(); ok {
+			snap = cached
+			usage.Account = cached.Account
+			usage.Plan = firstNonEmpty(cached.Plan, usage.Plan)
+			usage.AccountFingerprint = cached.AccountFingerprint
+		}
 	}
 
 	usage.Metrics = antigravityQuotaMetrics(snap, now)

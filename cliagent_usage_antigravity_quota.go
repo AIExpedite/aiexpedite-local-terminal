@@ -53,6 +53,12 @@ const (
 	// case where the newest run has already exited.
 	antigravityQuotaMaxLogs  = 4
 	antigravityQuotaMaxPorts = 8
+	// Per-side cap when scanning a log for port lines. A long-running `agy`
+	// session writes an unbounded log, and slurping four of those would cost
+	// real memory and could blow the 10s gather budget shared with every other
+	// provider. Both ends are read because the ports are logged at STARTUP —
+	// near the head — while an in-run restart appends a newer pair at the tail.
+	antigravityLogScanBytes = 128 * 1024
 
 	antigravityQuotaRPC  = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
 	antigravityStatusRPC = "/exa.language_server_pb.LanguageServerService/GetUserStatus"
@@ -140,7 +146,7 @@ func discoverAntigravityHTTPPorts(base string) []int {
 	ports := make([]int, 0, antigravityQuotaMaxPorts)
 	seen := map[int]bool{}
 	for _, file := range files {
-		body, err := os.ReadFile(file.path)
+		body, err := readBoundedHeadTail(file.path, antigravityLogScanBytes)
 		if err != nil {
 			continue
 		}
@@ -162,6 +168,39 @@ func discoverAntigravityHTTPPorts(base string) []int {
 		}
 	}
 	return ports
+}
+
+// readBoundedHeadTail returns at most `limit` bytes from the start of a file and
+// at most `limit` from its end, joined by a newline so no match can straddle the
+// gap. A file within 2*limit is returned whole. The two halves are concatenated
+// head-then-tail, which keeps the caller's "later match wins" scan correct.
+func readBoundedHeadTail(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() <= 2*limit {
+		return io.ReadAll(io.LimitReader(f, 2*limit))
+	}
+
+	head := make([]byte, limit)
+	if _, err := io.ReadFull(f, head); err != nil {
+		return nil, err
+	}
+	if _, err := f.Seek(-limit, io.SeekEnd); err != nil {
+		return nil, err
+	}
+	tail := make([]byte, limit)
+	if _, err := io.ReadFull(f, tail); err != nil {
+		return nil, err
+	}
+	return append(append(head, '\n'), tail...), nil
 }
 
 // antigravityLoopbackClient is an HTTP client pinned to the loopback interface.
@@ -301,11 +340,39 @@ func loadAntigravityQuotaSnapshot(currentFingerprint string) (antigravityQuotaSn
 	if currentFingerprint == "" {
 		return antigravityQuotaSnapshot{}, false
 	}
+	snap, ok := readAntigravityQuotaCache()
+	if !ok || snap.AccountFingerprint != currentFingerprint {
+		return antigravityQuotaSnapshot{}, false
+	}
+	return snap, true
+}
+
+// loadAntigravityQuotaSnapshotByProducer returns the cached snapshot together
+// with the identity that PRODUCED it, for the case where no current identity is
+// known at all.
+//
+// settings.json usually carries no account, so scoping the replay by the current
+// fingerprint alone would make the between-runs cache dead in the common case —
+// it would only ever load for the unusual settings file that happens to
+// duplicate the server identity. Replaying under the stored producer is honest:
+// the card names the account the reading belongs to instead of assuming it is
+// whoever is signed in now, and there is no current identity for it to conflict
+// with. A settings file that DOES name a different account fails the scoped load
+// above and never reaches here.
+func loadAntigravityQuotaSnapshotByProducer() (antigravityQuotaSnapshot, bool) {
+	snap, ok := readAntigravityQuotaCache()
+	if !ok || snap.AccountFingerprint == "" {
+		return antigravityQuotaSnapshot{}, false
+	}
+	return snap, true
+}
+
+func readAntigravityQuotaCache() (antigravityQuotaSnapshot, bool) {
 	var snap antigravityQuotaSnapshot
 	if !readJSONFile(antigravityQuotaCachePath(), &snap) {
 		return antigravityQuotaSnapshot{}, false
 	}
-	if snap.AccountFingerprint != currentFingerprint || len(snap.Buckets) == 0 {
+	if len(snap.Buckets) == 0 {
 		return antigravityQuotaSnapshot{}, false
 	}
 	return snap, true
