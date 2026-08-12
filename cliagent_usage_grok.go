@@ -669,9 +669,16 @@ func currentGrokAccountFingerprint() string {
 
 // readGrokScopedAuthClaims decodes the installer-produced `auth.json`, whose
 // top level is keyed by auth scope (e.g. `grok-cli`) and whose values wrap a
-// JWT under `key`. Returns the JWT claims from the first non-empty token, walked
-// in Grok's own scope-resolution order (grokScopeKeysByPrecedence) so identity
-// and expiry come from the SAME entry Grok will present.
+// JWT under `key`. Returns the identity for the first entry carrying a token,
+// walked in Grok's own scope-resolution order (grokScopeKeysByPrecedence) so
+// identity and expiry come from the SAME entry Grok will present.
+//
+// The entry stores the signed-in identity as plain sibling fields (`email`,
+// `user_id`, …) NEXT TO the token, and Grok's JWT carries no email claim — so
+// reading claims alone left the card showing a bare `sub` UUID where every
+// other provider shows an address. Both sources are merged, JWT first: a claim
+// is signed, a sibling field is not, so the token wins any disagreement and the
+// plain fields only fill what it omits.
 func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 	var claims grokIDTokenClaims
 	raw, err := os.ReadFile(path)
@@ -679,8 +686,14 @@ func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 		return claims, false
 	}
 	var scoped map[string]struct {
-		Key   string `json:"key"`
-		Token string `json:"token"`
+		Key      string `json:"key"`
+		Token    string `json:"token"`
+		Email    string `json:"email"`
+		UserID   string `json:"user_id"`
+		UserName string `json:"username"`
+		Account  string `json:"account"`
+		Plan     string `json:"plan"`
+		PlanType string `json:"plan_type"`
 	}
 	if err := json.Unmarshal(raw, &scoped); err != nil {
 		return claims, false
@@ -695,8 +708,24 @@ func readGrokScopedAuthClaims(path string) (grokIDTokenClaims, bool) {
 		if token == "" {
 			continue
 		}
-		if parseJWTClaims(token, &claims) {
-			return claims, true
+		// A fresh value per iteration: a partial decode must not leak fields
+		// from an entry we then walk past.
+		var entry grokIDTokenClaims
+		parsed := parseJWTClaims(token, &entry)
+		entry.Email = firstNonEmpty(entry.Email, v.Email)
+		entry.UserID = firstNonEmpty(entry.UserID, v.UserID)
+		entry.UserName = firstNonEmpty(entry.UserName, v.UserName)
+		entry.Account = firstNonEmpty(entry.Account, v.Account)
+		entry.Plan = firstNonEmpty(entry.Plan, v.Plan)
+		entry.PlanType = firstNonEmpty(entry.PlanType, v.PlanType)
+		// An unparseable token is not automatically an unusable entry: the
+		// sibling fields still name the account, and reporting that beats
+		// falling through to a later scope that describes a different login.
+		hasIdentity := firstNonEmpty(
+			entry.Email, entry.Account, entry.UserName, entry.UserID, entry.Subject,
+		) != ""
+		if parsed || hasIdentity {
+			return entry, true
 		}
 	}
 	return claims, false
