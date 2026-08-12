@@ -137,9 +137,6 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 	}
 
 	lines := bytes.Split(tail, []byte("\n"))
-	if !grokLogBelongsToCurrentAccount(lines, identities) {
-		return grokBillingSnapshot{}, false
-	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
 		// Cheap pre-filter before the JSON decode: the vast majority of lines in
@@ -156,39 +153,53 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 		if !ok {
 			continue
 		}
+		// Stop at the newest usable record either way: an older one is even less
+		// likely to belong to the account signed in now.
+		if !grokRecordBelongsToCurrentAccount(lines, i, identities) {
+			return grokBillingSnapshot{}, false
+		}
 		return snap, true
 	}
 	return grokBillingSnapshot{}, false
 }
 
-// grokLogBelongsToCurrentAccount reports whether the newest identity in the log
-// tail is one the current credentials resolve to.
+// grokRecordBelongsToCurrentAccount reports whether the billing record at
+// lineIdx was PRODUCED by the account the current credentials resolve to.
 //
-// Only the NEWEST identity is compared: the log is append-only and shared across
-// logins, so an older `user_id` simply means the account changed at some point,
-// while a newer one that does not match the current credentials means the
-// billing record we are about to read was written by somebody else.
-func grokLogBelongsToCurrentAccount(lines [][]byte, identities []string) bool {
+// Binding is per-record, not per-log: the identity that counts is the newest one
+// logged at or before the record, because that is who the CLI was acting as when
+// it fetched those credits. Comparing the newest identity in the whole tail
+// instead would accept account B's older record as soon as account A logged in
+// and had not fetched billing yet.
+func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities []string) bool {
 	wanted := make(map[string]bool, len(identities))
 	for _, identity := range identities {
 		if trimmed := strings.ToLower(strings.TrimSpace(identity)); trimmed != "" {
 			wanted[trimmed] = true
 		}
 	}
-	for i := len(lines) - 1; i >= 0; i-- {
+	for i := lineIdx; i >= 0; i-- {
 		match := grokLogUserIDRe.FindSubmatch(lines[i])
 		if match == nil {
 			continue
 		}
 		if len(wanted) == 0 {
-			// The log names an account but the credentials resolve to nothing we
+			// The log names a producer but the credentials resolve to nothing we
 			// can compare. Refuse rather than guess: an unidentifiable local login
 			// is exactly the logged-out case this check exists for.
 			return false
 		}
 		return wanted[strings.ToLower(string(match[1]))]
 	}
-	// No identity anywhere in the tail (older CLI) — nothing contradicts it.
+	// Nothing identifies the producer. If a later line names an account, one was
+	// active after this record was written and we cannot show the record is
+	// theirs — refuse. With no identity anywhere (an older CLI), there is nothing
+	// to contradict the record.
+	for i := lineIdx + 1; i < len(lines); i++ {
+		if grokLogUserIDRe.Match(lines[i]) {
+			return false
+		}
+	}
 	return true
 }
 

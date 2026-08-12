@@ -249,19 +249,41 @@ func TestReadGrokBillingSnapshot_HonorsRelocatedHome(t *testing.T) {
 
 // The log outlives a logout. A billing record left by a previous account carries
 // no identity of its own, so it must not be republished as the current one's.
+// The binding is per-record: what matters is who the CLI was acting as when the
+// record was written, not who is named most recently in the log.
 func TestReadGrokBillingSnapshot_RejectsRecordFromAnotherAccount(t *testing.T) {
 	base := t.TempDir()
 	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"user_id":"old-account-uuid"}}`,
 		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
 		`{"ts":"2026-08-11T09:00:00Z","msg":"chat: turn start","ctx":{"user_id":"new-account-uuid"}}`,
 	)
 
-	if _, ok := readGrokBillingSnapshot(base, []string{"old-account-uuid"}); ok {
-		t.Errorf("a record from before an account switch must not be attributed to the new one")
+	// The new account has not fetched billing yet, so the newest record is still
+	// the previous account's — publishing it as the new account's quota is
+	// exactly the bug this guards.
+	if _, ok := readGrokBillingSnapshot(base, []string{"new-account-uuid"}); ok {
+		t.Errorf("a record produced by a previous account must not be attributed to the new one")
 	}
-	if _, ok := readGrokBillingSnapshot(base, []string{"new-account-uuid"}); !ok {
-		t.Errorf("the record must still be read when the log's identity matches")
+	// For the account that actually produced it, it is still readable.
+	if _, ok := readGrokBillingSnapshot(base, []string{"old-account-uuid"}); !ok {
+		t.Errorf("the producing account must still be able to read its own record")
+	}
+}
+
+// A record with no identity before it, followed by a login, cannot be shown to
+// belong to that login — refuse rather than attribute it.
+func TestReadGrokBillingSnapshot_RejectsUnattributableRecordFollowedByLogin(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
+		`{"ts":"2026-08-11T09:00:00Z","msg":"session start","ctx":{"user_id":"new-account-uuid"}}`,
+	)
+
+	if _, ok := readGrokBillingSnapshot(base, []string{"new-account-uuid"}); ok {
+		t.Errorf("a record that predates the only identity in the log must not be attributed to it")
 	}
 }
 
@@ -285,9 +307,9 @@ func TestReadGrokBillingSnapshot_MatchesAnyIdentityCandidate(t *testing.T) {
 func TestReadGrokBillingSnapshot_RejectsIdentifiedLogWithoutCredentials(t *testing.T) {
 	base := t.TempDir()
 	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"user_id":"someone"}}`,
 		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
-		`{"ts":"2026-08-10T17:09:00Z","msg":"chat","ctx":{"user_id":"someone"}}`,
 	)
 
 	if _, ok := readGrokBillingSnapshot(base, nil); ok {
