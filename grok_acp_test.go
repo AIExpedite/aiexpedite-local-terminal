@@ -30,6 +30,35 @@ import (
 )
 
 /* --------------------------------------------------------------------------
+   test helpers
+   -------------------------------------------------------------------------- */
+
+// waitUntil polls cond until it reports true or the deadline passes, and
+// returns cond's final verdict. It exists because several lifecycle tests have
+// to wait on TWO independent observations that waitForExit produces at
+// different moments: the terminal `grok_acp_ended` frame (published on its own
+// goroutine) and the session's removal from the manager registry (which happens
+// after that publish is *started*, with an os.RemoveAll of the isolated home in
+// between). There is no happens-before edge between the two, so breaking out of
+// a poll loop on the message alone and immediately asserting ActiveCount()==0
+// is a race that a loaded runner loses.
+//
+// cond must do its own locking and must NOT be called with a test-local mutex
+// held if it also queries the manager (ActiveCount takes the manager's RLock),
+// so that lock order stays one-way.
+func waitUntil(deadline time.Time, cond func() bool) bool {
+	for {
+		if cond() {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+/* --------------------------------------------------------------------------
    argv builder
    -------------------------------------------------------------------------- */
 
@@ -718,18 +747,26 @@ func TestGrokACPLifecycle_StartSendEnd(t *testing.T) {
 		t.Fatalf("End: %v", err)
 	}
 
-	endedDeadline := time.Now().Add(5 * time.Second)
-	var last resultMsg
-	for time.Now().Before(endedDeadline) {
+	// Wait for BOTH the terminal frame and the unregistration: waitForExit
+	// publishes `grok_acp_ended` on its own goroutine and only afterwards
+	// removes the session from the registry, so breaking on the message alone
+	// races the ActiveCount assertion below. The 10s deadline still fails a
+	// genuine hang.
+	waitUntil(time.Now().Add(10*time.Second), func() bool {
 		mu.Lock()
+		var lastType string
 		if len(captured) > 0 {
-			last = captured[len(captured)-1]
+			lastType = captured[len(captured)-1].Type
 		}
 		mu.Unlock()
-		if last.Type == "grok_acp_ended" {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+		return lastType == "grok_acp_ended" && m.ActiveCount() == 0
+	})
+
+	// Read ActiveCount before taking the capture mutex: publishFn takes `mu`,
+	// so querying the manager (which takes its own RLock) while holding `mu`
+	// would introduce a second lock order between the two.
+	if active := m.ActiveCount(); active != 0 {
+		t.Errorf("expected 0 active sessions after End; got %d", active)
 	}
 
 	mu.Lock()
@@ -737,15 +774,12 @@ func TestGrokACPLifecycle_StartSendEnd(t *testing.T) {
 	if len(captured) == 0 {
 		t.Fatal("no messages captured")
 	}
-	last = captured[len(captured)-1]
+	last := captured[len(captured)-1]
 	if last.Type != "grok_acp_ended" {
 		t.Errorf("expected final message to be grok_acp_ended; got %q", last.Type)
 	}
 	if last.SessionID != id {
 		t.Errorf("expected SessionID=%q on ended frame; got %q", id, last.SessionID)
-	}
-	if m.ActiveCount() != 0 {
-		t.Errorf("expected 0 active sessions after End; got %d", m.ActiveCount())
 	}
 }
 
@@ -800,8 +834,12 @@ func TestGrokACPLifecycle_CancelTerminatesSession(t *testing.T) {
 		t.Fatalf("End: %v", err)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	// Wait for the ended frame AND the unregistration — waitForExit publishes
+	// the terminal frame asynchronously and unregisters the session afterwards
+	// (with a filesystem RemoveAll in between), so the message arriving does
+	// not imply ActiveCount() has dropped yet. The 10s deadline still bounds a
+	// real hang.
+	waitUntil(time.Now().Add(10*time.Second), func() bool {
 		mu.Lock()
 		ended := false
 		for _, msg := range captured {
@@ -811,17 +849,18 @@ func TestGrokACPLifecycle_CancelTerminatesSession(t *testing.T) {
 			}
 		}
 		mu.Unlock()
-		if ended {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+		return ended && m.ActiveCount() == 0
+	})
+
+	// Read ActiveCount before taking the capture mutex: publishFn takes `mu`,
+	// so querying the manager (which takes its own RLock) while holding `mu`
+	// would introduce a second lock order between the two.
+	if active := m.ActiveCount(); active != 0 {
+		t.Errorf("expected manager to drop session after cancel+end; got %d active", active)
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
-	if m.ActiveCount() != 0 {
-		t.Errorf("expected manager to drop session after cancel+end; got %d active", m.ActiveCount())
-	}
 	sawEnded := false
 	for _, msg := range captured {
 		if msg.Type == "grok_acp_ended" && msg.SessionID == id {
@@ -1494,8 +1533,15 @@ func TestWaitForExit_StatusFlipsBeforeStreamDrain(t *testing.T) {
 	// Poll for the terminal ended frame — when it arrives, the session
 	// status MUST already be "ended" (we never observe a "running" status
 	// after grok_acp_ended is published).
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
+	//
+	// Wait for the unregistration too, not just the frame: waitForExit
+	// publishes `grok_acp_ended` on a separate goroutine and only then closes
+	// session.done, removes the isolated GROK_HOME (filesystem work) and calls
+	// m.removeSession. Nothing orders the publish against the removal, so the
+	// frame can be observed while the session is still registered — which is
+	// exactly what made this test flake on loaded macOS runners. The 10s
+	// deadline still fails a session that genuinely never exits.
+	waitUntil(time.Now().Add(10*time.Second), func() bool {
 		mu.Lock()
 		var sawEnded bool
 		for _, msg := range captured {
@@ -1504,25 +1550,27 @@ func TestWaitForExit_StatusFlipsBeforeStreamDrain(t *testing.T) {
 			}
 		}
 		mu.Unlock()
-		if sawEnded {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+		return sawEnded && m.ActiveCount() == 0
+	})
 
 	// At this point the session was removed by waitForExit (m.removeSession);
 	// the only direct status observation is via active count. The behavioural
 	// invariant — no spurious grok_acp_error for a clean exit — is captured
 	// below.
+	//
+	// ActiveCount is read before the capture mutex is taken: publishFn takes
+	// `mu`, so querying the manager (which takes its own RLock) while holding
+	// `mu` would introduce a second lock order between the two.
+	if active := m.ActiveCount(); active != 0 {
+		t.Errorf("clean exit must unregister session; %d still active", active)
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
 	for _, msg := range captured {
 		if msg.Type == "grok_acp_error" {
 			t.Fatalf("clean exit must not publish grok_acp_error; got %q", msg.Output)
 		}
-	}
-	if m.ActiveCount() != 0 {
-		t.Errorf("clean exit must unregister session; %d still active", m.ActiveCount())
 	}
 }
 
