@@ -577,3 +577,47 @@ func TestSaveAntigravityQuotaSnapshot_ConcurrentWritesStayIntact(t *testing.T) {
 		t.Errorf("leftover temp files: %v", matches)
 	}
 }
+
+// A legacy ~/.agy install keeps its logs under ~/.agy/log. Quota discovery must
+// follow the install that is actually in use, not the modern path.
+func TestAntigravityUsageParser_DiscoversQuotaFromLegacyInstall(t *testing.T) {
+	home := t.TempDir()
+	legacyBase := filepath.Join(home, ".agy")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", filepath.Join(t.TempDir(), "agyq.json"))
+	// Legacy config selects the ~/.agy tree; its log names the live server.
+	helperWriteJSON(t, filepath.Join(legacyBase, "config.json"), map[string]any{})
+	helperAntigravityServer(t, legacyBase, helperQuotaJSON, helperStatusJSON)
+
+	usage, ok := antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatalf("Parse failed")
+	}
+	if usage.DataSource != "~/.agy" {
+		t.Errorf("DataSource=%q, want ~/.agy", usage.DataSource)
+	}
+	if len(usage.Metrics) != 3 {
+		t.Fatalf("expected the legacy install's live rows, got %+v", usage.Metrics)
+	}
+	if usage.Account != "ada@example.com" {
+		t.Errorf("Account=%q, want the server identity", usage.Account)
+	}
+}
+
+// The reverse case: a modern install whose settings.json does not exist yet must
+// still be probed, rather than the parser giving up on the configured tree.
+func TestAntigravityUsageParser_DiscoversQuotaWithoutASettingsFile(t *testing.T) {
+	home := t.TempDir()
+	base := filepath.Join(home, ".gemini", "antigravity-cli")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", filepath.Join(t.TempDir(), "agyq.json"))
+	helperAntigravityServer(t, base, helperQuotaJSON, helperStatusJSON)
+
+	usage, ok := antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatalf("Parse failed")
+	}
+	if len(usage.Metrics) != 3 {
+		t.Fatalf("expected live rows without a settings file, got %+v", usage.Metrics)
+	}
+}

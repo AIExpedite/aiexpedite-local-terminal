@@ -39,14 +39,23 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
 
+	legacyBase := expandHome(home, ".agy")
+	// Quota discovery reads the CLI's logs, which live under whichever install
+	// is actually in use. Probe the configured one first and the other second:
+	// selecting only the config-bearing tree would miss a running server whose
+	// install has no config file yet, and probing only the modern tree would
+	// never find a legacy install's `~/.agy/log`.
+	quotaBases := []string{base, legacyBase}
+
 	cfg := antigravityConfig{}
 	if readJSONFile(expandHome(base, "settings.json"), &cfg) {
 		usage.Account = firstNonEmpty(cfg.Email, cfg.Account)
 		usage.Plan = firstNonEmpty(cfg.Plan, cfg.Tier)
-	} else if legacyBase := expandHome(home, ".agy"); readJSONFile(expandHome(legacyBase, "config.json"), &cfg) {
+	} else if readJSONFile(expandHome(legacyBase, "config.json"), &cfg) {
 		usage.DataSource = "~/.agy"
 		usage.Account = firstNonEmpty(cfg.Email, cfg.Account)
 		usage.Plan = firstNonEmpty(cfg.Plan, cfg.Tier)
+		quotaBases = []string{legacyBase, base}
 	}
 	// Antigravity keeps its renewable session in the OS keyring and does not
 	// publish a durable session deadline. Do not reinterpret an access token or
@@ -58,7 +67,16 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 	// scopes the cache is the same one the quota was captured under.
 	ctx, cancel := context.WithTimeout(context.Background(), antigravityQuotaTimeout)
 	defer cancel()
-	fresh, gotFresh := fetchAntigravityQuota(ctx, base, now)
+	var fresh antigravityQuotaSnapshot
+	var gotFresh bool
+	for _, quotaBase := range quotaBases {
+		if quotaBase == "" {
+			continue
+		}
+		if fresh, gotFresh = fetchAntigravityQuota(ctx, quotaBase, now); gotFresh {
+			break
+		}
+	}
 	// A live reading may ONLY be published under an identity the server itself
 	// reported. settings.json can hold an account from a previous login, so
 	// falling back to it here would publish the current server's quota under the
