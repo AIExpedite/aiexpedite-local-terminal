@@ -175,6 +175,7 @@ func TestGrokBillingMetrics_OnDemandOnlyWhenCapped(t *testing.T) {
 	}
 
 	base.HasOnDemand = true
+	base.HasOnDemandUsed = true
 	base.OnDemandCap = 50
 	base.OnDemandUsed = 20
 	metrics := grokBillingMetrics(base, now)
@@ -363,5 +364,60 @@ func TestGrokIdentityCandidates_CollectsEveryAccountField(t *testing.T) {
 		if !found {
 			t.Errorf("candidates %v missing %q", got, want)
 		}
+	}
+}
+
+// A configured cap whose usage the record never reported must not read as an
+// untouched pool — the row exists, its value does not.
+func TestGrokBillingMetrics_OnDemandWithoutUsageIsUnobservable(t *testing.T) {
+	now := time.Date(2026, 8, 10, 18, 0, 0, 0, time.UTC)
+	snap := grokBillingSnapshot{
+		UsedPercent:  10,
+		ObservedAt:   now,
+		PeriodType:   "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd:    now.Add(time.Hour),
+		HasPeriodEnd: true,
+		HasOnDemand:  true,
+		OnDemandCap:  50,
+		// HasOnDemandUsed deliberately false: `onDemandUsed` was absent or null.
+	}
+
+	metrics := grokBillingMetrics(snap, now)
+	if len(metrics) != 2 {
+		t.Fatalf("len(metrics)=%d, want 2", len(metrics))
+	}
+	onDemand := metrics[1]
+	if !onDemand.Unknown {
+		t.Errorf("on-demand row must be Unknown without an observed usage: %+v", onDemand)
+	}
+	if onDemand.Consumed != nil || onDemand.Remaining != nil {
+		t.Errorf("unobserved on-demand must carry no value: %+v", onDemand)
+	}
+	if onDemand.Total == nil || *onDemand.Total != 50 {
+		t.Errorf("the configured cap should still be reported: %+v", onDemand)
+	}
+}
+
+// A null onDemandUsed decodes to a nil pointer, not 0 — the record never said
+// the pool was untouched.
+func TestReadGrokBillingSnapshot_NullOnDemandUsedIsNotZero(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
+		`{"ts":"2026-08-10T17:08:10Z","msg":"`+grokBillingLogMessage+`","ctx":{"config":{`+
+			`"creditUsagePercent":52.0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY",`+
+			`"start":"2026-08-03T22:28:32Z","end":"2026-08-10T22:28:32Z"},`+
+			`"onDemandCap":{"val":50},"onDemandUsed":{"val":null}},"subscriptionTier":"SuperGrok"}}`,
+	)
+
+	snap, ok := readGrokBillingSnapshot(base, []string{"acct-1"})
+	if !ok {
+		t.Fatalf("expected a billing snapshot")
+	}
+	if !snap.HasOnDemand {
+		t.Errorf("a positive cap should still register the pool")
+	}
+	if snap.HasOnDemandUsed {
+		t.Errorf("a null onDemandUsed must not count as an observed 0")
 	}
 }

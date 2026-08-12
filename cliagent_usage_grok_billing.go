@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -83,6 +84,7 @@ type grokBillingSnapshot struct {
 	OnDemandCap      float64
 	OnDemandUsed     float64
 	HasOnDemand      bool
+	HasOnDemandUsed  bool
 	SubscriptionTier string
 }
 
@@ -105,10 +107,8 @@ func grokBillingLogPath(base string) string {
 //
 // `identities` are the account values the current auth file resolves to (see
 // grokIdentityCandidates). The log outlives a logout, so a record left by a
-// previous account must not be attributed to the one signed in now: the newest
-// `user_id` in the tail has to match one of them. When the log carries no
-// identity at all — an older CLI — there is nothing to contradict the record and
-// it is accepted, which is no worse than before this check existed.
+// previous account must not be attributed to the one signed in now — see
+// grokRecordBelongsToCurrentAccount for how a record is tied to its producer.
 func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnapshot, bool) {
 	path := grokBillingLogPath(base)
 	if path == "" {
@@ -223,10 +223,15 @@ func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, 
 	}
 	// On-demand is a separate, opt-in pool: only plot it when a cap exists, or
 	// the row would read as a hard 0-of-0 limit on every subscription account.
-	if cap := rec.Ctx.Config.OnDemandCap.Val; cap != nil && *cap > 0 {
+	if cap := rec.Ctx.Config.OnDemandCap.Val; cap != nil && *cap > 0 && !math.IsNaN(*cap) {
 		snap.HasOnDemand = true
 		snap.OnDemandCap = *cap
-		if used := rec.Ctx.Config.OnDemandUsed.Val; used != nil {
+		// A cap with no reported usage is a pool we know exists but have not
+		// observed. Leaving the zero default here would report it as completely
+		// unused — an assertion the record never made.
+		if used := rec.Ctx.Config.OnDemandUsed.Val; used != nil &&
+			!math.IsNaN(*used) && *used >= 0 {
+			snap.HasOnDemandUsed = true
 			snap.OnDemandUsed = *used
 		}
 	}
@@ -281,19 +286,27 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 	metrics := []cliAgentUsageMetric{credits}
 
 	if snap.HasOnDemand {
-		used := snap.OnDemandUsed
-		if used > snap.OnDemandCap {
-			used = snap.OnDemandCap
-		}
-		metrics = append(metrics, cliAgentUsageMetric{
+		onDemand := cliAgentUsageMetric{
 			Kind:       limitKindTokens,
 			Label:      "On-demand credits",
 			Unit:       "credits",
 			Total:      floatPtr(snap.OnDemandCap),
-			Consumed:   floatPtr(used),
-			Remaining:  floatPtr(snap.OnDemandCap - used),
 			ObservedAt: observedAt,
-		})
+		}
+		if snap.HasOnDemandUsed {
+			used := snap.OnDemandUsed
+			if used > snap.OnDemandCap {
+				used = snap.OnDemandCap
+			}
+			onDemand.Consumed = floatPtr(used)
+			onDemand.Remaining = floatPtr(snap.OnDemandCap - used)
+		} else {
+			// The cap is configured but the record reported no usage against it.
+			// Show the pool as existing-but-unobserved rather than as untouched:
+			// "0 of 50 used" is an assertion the record never made.
+			onDemand.Unknown = true
+		}
+		metrics = append(metrics, onDemand)
 	}
 	return metrics
 }
