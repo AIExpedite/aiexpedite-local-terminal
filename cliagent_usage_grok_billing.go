@@ -191,16 +191,13 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 		}
 		return wanted[strings.ToLower(string(match[1]))]
 	}
-	// Nothing identifies the producer. If a later line names an account, one was
-	// active after this record was written and we cannot show the record is
-	// theirs — refuse. With no identity anywhere (an older CLI), there is nothing
-	// to contradict the record.
-	for i := lineIdx + 1; i < len(lines); i++ {
-		if grokLogUserIDRe.Match(lines[i]) {
-			return false
-		}
-	}
-	return true
+	// Nothing identifies the producer, anywhere at or before the record. That is
+	// not evidence it belongs to the current login: `unified.jsonl` is shared
+	// across logins, so a CLI old enough never to log an identity leaves the
+	// previous account's credits sitting in the same file for the next one to
+	// publish as its own. Refuse — the card falls back to "unobservable", which
+	// is what it showed before this source existed.
+	return false
 }
 
 // grokBillingSnapshotFromRecord validates one record. A record with no usage

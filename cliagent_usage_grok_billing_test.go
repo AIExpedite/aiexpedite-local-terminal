@@ -33,6 +33,7 @@ func grokBillingLine(ts string, percent float64, periodType, start, end string) 
 func TestReadGrokBillingSnapshot_TakesNewestRecord(t *testing.T) {
 	base := t.TempDir()
 	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-03T22:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
 		grokBillingLine("2026-08-03T22:30:00Z", 12, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
 		`{"ts":"2026-08-04T10:00:00Z","msg":"chat: turn complete","ctx":{}}`,
@@ -41,7 +42,7 @@ func TestReadGrokBillingSnapshot_TakesNewestRecord(t *testing.T) {
 		`{"ts":"2026-08-10T17:09:00Z","msg":"chat: turn complete","ctx":{}}`,
 	)
 
-	snap, ok := readGrokBillingSnapshot(base, nil)
+	snap, ok := readGrokBillingSnapshot(base, []string{"acct-1"})
 	if !ok {
 		t.Fatalf("expected a billing snapshot")
 	}
@@ -65,11 +66,12 @@ func TestReadGrokBillingSnapshot_SkipsTruncatedLeadingLine(t *testing.T) {
 	base := t.TempDir()
 	helperWriteGrokLog(t, base,
 		`sagePercent":99.0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY"}}}`,
+		`{"ts":"2026-08-03T22:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
 		grokBillingLine("2026-08-10T17:08:10Z", 41, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
 	)
 
-	snap, ok := readGrokBillingSnapshot(base, nil)
+	snap, ok := readGrokBillingSnapshot(base, []string{"acct-1"})
 	if !ok {
 		t.Fatalf("expected a billing snapshot")
 	}
@@ -191,7 +193,12 @@ func TestGrokUsageParser_PlotsCreditsFromCliLog(t *testing.T) {
 	home := t.TempDir()
 	base := filepath.Join(home, ".grok")
 	t.Setenv("GROK_HOME", "")
+	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{
+		"email":   "ada@example.com",
+		"user_id": "acct-1",
+	})
 	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-03T22:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
 		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
 	)
@@ -231,7 +238,11 @@ func TestGrokUsageParser_KeepsPlaceholderRowWithoutBillingLog(t *testing.T) {
 // $GROK_HOME relocates the whole tree, log included.
 func TestReadGrokBillingSnapshot_HonorsRelocatedHome(t *testing.T) {
 	relocated := t.TempDir()
+	helperWriteJSON(t, filepath.Join(relocated, "auth.json"), map[string]any{
+		"user_id": "acct-1",
+	})
 	helperWriteGrokLog(t, relocated,
+		`{"ts":"2026-08-03T22:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
 		grokBillingLine("2026-08-10T17:08:10Z", 7, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
 	)
@@ -272,8 +283,8 @@ func TestReadGrokBillingSnapshot_RejectsRecordFromAnotherAccount(t *testing.T) {
 	}
 }
 
-// A record with no identity before it, followed by a login, cannot be shown to
-// belong to that login — refuse rather than attribute it.
+// A record with no identity before it cannot be shown to belong to the current
+// login — refuse rather than attribute it.
 func TestReadGrokBillingSnapshot_RejectsUnattributableRecordFollowedByLogin(t *testing.T) {
 	base := t.TempDir()
 	helperWriteGrokLog(t, base,
@@ -317,17 +328,19 @@ func TestReadGrokBillingSnapshot_RejectsIdentifiedLogWithoutCredentials(t *testi
 	}
 }
 
-// An older CLI logs no identity at all; there is nothing to contradict the
-// record, so it stays readable.
-func TestReadGrokBillingSnapshot_AcceptsLogWithoutAnyIdentity(t *testing.T) {
+// A CLI old enough never to log an identity leaves the previous account's
+// credits in the shared log for the next login to publish as its own. Absence of
+// contradiction is not evidence of ownership: refuse, and let the card show
+// "unobservable" as it did before this source existed.
+func TestReadGrokBillingSnapshot_RejectsLogWithoutAnyIdentity(t *testing.T) {
 	base := t.TempDir()
 	helperWriteGrokLog(t, base,
 		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
 	)
 
-	if _, ok := readGrokBillingSnapshot(base, []string{"ada@example.com"}); !ok {
-		t.Errorf("a log with no identity lines must still be readable")
+	if _, ok := readGrokBillingSnapshot(base, []string{"ada@example.com"}); ok {
+		t.Errorf("a record whose producer cannot be identified must not be attributed")
 	}
 }
 
