@@ -13,6 +13,7 @@ func itoa(v int64) string { return strconv.FormatInt(v, 10) }
 func TestCaptureClaudeRateLimit_NestedInfo_SecondsAndUtilization(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	resetSec := now.Add(2 * time.Hour).Unix() // seconds, as the status-line/SDK uses
@@ -43,6 +44,7 @@ func TestCaptureClaudeRateLimit_NestedInfo_SecondsAndUtilization(t *testing.T) {
 func TestCaptureClaudeRateLimit_RateLimitsMapShape_MsAndPercentage(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	fiveReset := now.Add(time.Hour).UnixMilli() // already ms
@@ -66,6 +68,7 @@ func TestCaptureClaudeRateLimit_RateLimitsMapShape_MsAndPercentage(t *testing.T)
 func TestCaptureClaudeRateLimit_RejectedSurfacesResetLine(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	reset := now.Add(28 * time.Minute)
@@ -95,6 +98,7 @@ func TestCaptureClaudeRateLimit_RejectedSurfacesResetLine(t *testing.T) {
 func TestCaptureClaudeRateLimit_MultiRejectedPicksLatestReset(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	soonReset := now.Add(28 * time.Minute)
@@ -116,6 +120,7 @@ func TestCaptureClaudeRateLimit_MultiRejectedPicksLatestReset(t *testing.T) {
 func TestClaudeCodeMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	// five_hour observed and live; seven_day's reset already passed.
@@ -153,6 +158,7 @@ func TestClaudeCodeMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 func TestClaudeCodeMetricsFromCache_NoCacheFallsBackToUnknown(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "absent.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	metrics := claudeCodeMetricsFromCache(time.Now(), "")
 	if len(metrics) != 2 {
@@ -173,6 +179,7 @@ func TestClaudeCodeMetricsFromCache_NoCacheFallsBackToUnknown(t *testing.T) {
 func TestCaptureClaudeRateLimit_CamelCase_RejectedSurfacesResetLine(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	reset := now.Add(45 * time.Minute)
@@ -209,6 +216,7 @@ func TestCaptureClaudeRateLimit_CamelCase_RejectedSurfacesResetLine(t *testing.T
 func TestCaptureClaudeRateLimit_CamelCase_RateLimitsMapShape(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	fiveReset := now.Add(time.Hour).UnixMilli()
@@ -231,6 +239,7 @@ func TestCaptureClaudeRateLimit_CamelCase_RateLimitsMapShape(t *testing.T) {
 func TestClaudeCodeMetricsFromCache_SplitWeeklyAggregatesConservatively(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	sonnetReset := now.Add(96 * time.Hour).UnixMilli()
@@ -259,6 +268,7 @@ func TestClaudeCodeMetricsFromCache_SplitWeeklyAggregatesConservatively(t *testi
 func TestClaudeCodeMetricsFromCache_IgnoresOtherAccountSnapshot(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
@@ -309,6 +319,7 @@ func TestMergeClaudeRateLimitCache_DropsOtherAccountBuckets(t *testing.T) {
 func TestClaudeCodeMetricsFromCache_IgnoresScopedSnapshotWhenAccountUnknown(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
@@ -330,6 +341,7 @@ func TestClaudeCodeMetricsFromCache_IgnoresScopedSnapshotWhenAccountUnknown(t *t
 func TestClaudeCodeMetricsFromCache_UnscopedSnapshotWithUnknownAccount(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
@@ -351,6 +363,7 @@ func TestClaudeCodeMetricsFromCache_UnscopedSnapshotWithUnknownAccount(t *testin
 func TestCaptureClaudeRateLimit_RejectedWithoutUsageMarksExhausted(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	reset := now.Add(30 * time.Minute)
@@ -412,6 +425,7 @@ func TestMergeClaudeRateLimitCache_DropsUnscopedBucketsOnAccountSignIn(t *testin
 func TestCaptureClaudeRateLimit_AllowedHeartbeatPreservesPriorUsage(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	firstReset := now.Add(2 * time.Hour).Unix()
@@ -447,6 +461,7 @@ func TestCaptureClaudeRateLimit_AllowedHeartbeatPreservesPriorUsage(t *testing.T
 func TestCaptureClaudeRateLimit_AllowedHeartbeatWithoutPriorUsageDoesNotPersist(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	resetSec := now.Add(2 * time.Hour).Unix()
@@ -534,6 +549,7 @@ func TestCaptureClaudeRateLimit_RolledOverHeartbeatDropsStaleUsage(t *testing.T)
 func TestClaudeCodeMetricsFromCache_WeeklyResetTracksWorstBucket(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	sonnetReset := now.Add(24 * time.Hour).UnixMilli()   // sooner, but healthy
@@ -562,6 +578,7 @@ func TestClaudeCodeMetricsFromCache_WeeklyResetTracksWorstBucket(t *testing.T) {
 func TestClaudeCodeMetricsFromCache_WeeklyTieBreaksOnLaterReset(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	sonnetReset := now.Add(24 * time.Hour).UnixMilli() // sooner
@@ -591,5 +608,91 @@ func TestNormalizeResetMs(t *testing.T) {
 	}
 	if got := normalizeResetMs(0); got != 0 {
 		t.Errorf("zero: got %d, want 0", got)
+	}
+}
+
+// A machine with two agent channels installed shares ONE ~/.claude/settings.json,
+// so only the agent that booted last owns the status-line hook — and the hook
+// pins the cache to THAT agent's config dir. The reader must follow the pinned
+// path, or the losing channel's Claude card freezes at its last capture and ages
+// indefinitely while the device is online.
+func TestClaudeCodeMetricsFromCache_ReadsCachePinnedByTheInstalledHook(t *testing.T) {
+	ownCache := filepath.Join(t.TempDir(), "own", "rl.json")
+	pinnedCache := filepath.Join(t.TempDir(), "pinned", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(pinnedCache) +
+				" AIEXPEDITE_CLAUDE_STATUSLINE_PREV='/tmp/prev.json'" +
+				" '/opt/aiexpedite/aiexpedite-terminal' " + statusLineHookArg,
+		},
+	})
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	// Our own cache holds an OLD capture from before the other channel took over.
+	mergeClaudeRateLimitCache(ownCache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 10,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs:   now.Add(-72 * time.Hour).UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now.Add(-72*time.Hour), "")
+	// The hook has been writing here ever since.
+	mergeClaudeRateLimitCache(pinnedCache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 91,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs:   now.Add(-5 * time.Minute).UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now, "")
+
+	session := claudeCodeMetricsFromCache(now, "")[0]
+	if session.Unknown {
+		t.Fatalf("5-hour window should be observed from the pinned cache, got %+v", session)
+	}
+	if session.Consumed == nil || *session.Consumed != 91 {
+		t.Errorf("Consumed=%v, want 91 (freshest observation across both caches)", session.Consumed)
+	}
+	wantObserved := observedAtRFC3339(now.Add(-5 * time.Minute).UnixMilli())
+	if session.ObservedAt != wantObserved {
+		t.Errorf("ObservedAt=%q, want %q", session.ObservedAt, wantObserved)
+	}
+}
+
+// A cache pinned by a hook that is NOT ours must not be read: the value would be
+// attributed to this account with no evidence it came from our capture at all.
+func TestClaudeCodeMetricsFromCache_IgnoresForeignStatusLineCommand(t *testing.T) {
+	ownCache := filepath.Join(t.TempDir(), "own", "rl.json")
+	foreignCache := filepath.Join(t.TempDir(), "foreign", "rl.json")
+	configDir := t.TempDir()
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", ownCache)
+	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+
+	helperWriteJSON(t, filepath.Join(configDir, "settings.json"), map[string]any{
+		"statusLine": map[string]any{
+			"type": "command",
+			"command": "AIEXPEDITE_CLAUDE_RL_CACHE=" + posixSingleQuote(foreignCache) +
+				" ~/.claude/my-own-statusline.sh",
+		},
+	})
+
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	mergeClaudeRateLimitCache(foreignCache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 91,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs:   now.UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now, "")
+
+	if session := claudeCodeMetricsFromCache(now, "")[0]; !session.Unknown {
+		t.Errorf("5-hour window should stay unobserved, got %+v", session)
 	}
 }
