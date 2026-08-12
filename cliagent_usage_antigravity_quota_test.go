@@ -119,6 +119,63 @@ func TestFetchAntigravityQuota_EmptyGroupsIsNotASnapshot(t *testing.T) {
 	}
 }
 
+// A payload whose windows we cannot map is not an observation: treating it as
+// one would overwrite the last usable cached reading with all-Unknown rows the
+// moment the provider renames a window.
+func TestFetchAntigravityQuota_UnrecognizedWindowsAreNotASnapshot(t *testing.T) {
+	base := t.TempDir()
+	helperAntigravityServer(t, base, `{"response":{"groups":[{"displayName":"Gemini Models","buckets":[
+	  {"bucketId":"gemini-fortnightly","window":"fortnightly","remainingFraction":0.5,"resetTime":"2126-08-14T00:00:00Z"}]}]}}`,
+		helperStatusJSON)
+
+	if _, ok := fetchAntigravityQuota(context.Background(), base, time.Now()); ok {
+		t.Errorf("a response with no plottable bucket must not count as an observation")
+	}
+}
+
+// The quota RPC can succeed while GetUserStatus does not. That reading is fine
+// to DISPLAY (it came from the server about to run the work) but must not be
+// cached: we cannot say whose pool it is, and an unscoped snapshot would be
+// replayed under the next unidentified account.
+func TestAntigravityUsageParser_DoesNotCacheQuotaWithoutServerIdentity(t *testing.T) {
+	home := t.TempDir()
+	base := filepath.Join(home, ".gemini", "antigravity-cli")
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	helperAntigravityServer(t, base, helperQuotaJSON, "") // GetUserStatus 500s
+
+	usage, ok := antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatalf("Parse failed")
+	}
+	if len(usage.Metrics) != 3 {
+		t.Errorf("the live reading should still display, got %+v", usage.Metrics)
+	}
+	if _, err := os.Stat(cache); err == nil {
+		t.Errorf("an unattributable reading must not be cached")
+	}
+}
+
+// Even a cache left by an older build must not be replayed unscoped.
+func TestLoadAntigravityQuotaSnapshot_RefusesUnscopedCache(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	body, _ := json.Marshal(antigravityQuotaSnapshot{
+		ObservedAt: "2026-08-11T09:00:00Z",
+		Buckets: []antigravityQuotaBucket{
+			{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.4},
+		},
+	})
+	if err := os.WriteFile(cache, body, 0o600); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	if _, ok := loadAntigravityQuotaSnapshot(""); ok {
+		t.Errorf("an unscoped snapshot must never be replayed")
+	}
+}
+
 func TestDiscoverAntigravityHTTPPorts_PrefersNewestLogAndLastLine(t *testing.T) {
 	base := t.TempDir()
 	helperWriteAntigravityLog(t, base, "cli-old.log",

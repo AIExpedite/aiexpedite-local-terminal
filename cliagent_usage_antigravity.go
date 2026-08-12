@@ -67,8 +67,16 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 
 	snap := fresh
 	if gotFresh {
-		snap.AccountFingerprint = usage.AccountFingerprint
-		saveAntigravityQuotaSnapshot(snap)
+		// Scope the cache by the identity the SERVER reported, never by the one
+		// settings.json happens to carry: if GetUserStatus failed we do not know
+		// which account this quota belongs to, and stamping it with a
+		// settings-derived (or empty) fingerprint is how one account's pool ends
+		// up replayed under another. Displaying it this once is still correct —
+		// it came from the server that is about to run the work.
+		snap.AccountFingerprint = fingerprintAccount(p.Provider(), fresh.Account)
+		if fresh.Account != "" {
+			saveAntigravityQuotaSnapshot(snap)
+		}
 	} else if cached, ok := loadAntigravityQuotaSnapshot(usage.AccountFingerprint); ok {
 		// No `agy` running right now. Replay the last reading with its ORIGINAL
 		// observation time so the card ages it honestly instead of presenting a

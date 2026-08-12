@@ -244,6 +244,7 @@ func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (ant
 			continue
 		}
 		snap := antigravityQuotaSnapshot{ObservedAt: now.UTC().Format(time.RFC3339)}
+		plottable := 0
 		for _, group := range quota.Response.Groups {
 			for _, bucket := range group.Buckets {
 				snap.Buckets = append(snap.Buckets, antigravityQuotaBucket{
@@ -254,9 +255,16 @@ func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (ant
 					RemainingFraction: bucket.RemainingFraction,
 					ResetTime:         bucket.ResetTime,
 				})
+				if _, _, ok := antigravityWindowKind(bucket.Window); ok {
+					plottable++
+				}
 			}
 		}
-		if len(snap.Buckets) == 0 {
+		// A response we cannot plot is not an observation. Counting raw buckets
+		// here would let a schema addition — every window renamed, say — pass as
+		// success and overwrite the last usable cached reading with rows that
+		// all render Unknown.
+		if plottable == 0 {
 			continue
 		}
 		// Identity comes from the same server, on the same port, in the same
@@ -286,6 +294,13 @@ func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (ant
 // account exactly as the Claude/Codex caches are: a snapshot captured under a
 // different signed-in account must not be attributed to this one.
 func loadAntigravityQuotaSnapshot(currentFingerprint string) (antigravityQuotaSnapshot, bool) {
+	// An unscoped snapshot matches every unidentified account, so replaying one
+	// could attribute a previous account's quota to whoever is signed in now.
+	// saveAntigravityQuotaSnapshot never writes one; refuse to read one too, so
+	// a cache left by an older build cannot be replayed either.
+	if currentFingerprint == "" {
+		return antigravityQuotaSnapshot{}, false
+	}
 	var snap antigravityQuotaSnapshot
 	if !readJSONFile(antigravityQuotaCachePath(), &snap) {
 		return antigravityQuotaSnapshot{}, false
@@ -300,6 +315,14 @@ func loadAntigravityQuotaSnapshot(currentFingerprint string) (antigravityQuotaSn
 // concurrent gather never observes a half-written file. Best-effort: a read-only
 // data dir costs us the between-runs display, not the live one.
 func saveAntigravityQuotaSnapshot(snap antigravityQuotaSnapshot) {
+	// Persist ONLY a reading whose account the server itself named. If
+	// GetUserStatus failed, the fingerprint would fall back to settings.json —
+	// usually empty — and an empty scope matches any later unidentified
+	// account, which is exactly how one account's quota would end up displayed
+	// under another. Losing the between-runs display is the safe failure.
+	if snap.AccountFingerprint == "" {
+		return
+	}
 	path := antigravityQuotaCachePath()
 	if path == "" {
 		return
