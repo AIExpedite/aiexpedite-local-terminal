@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // helperGrokScopedAuth writes an auth.json in the installer's scoped shape: the
@@ -126,5 +127,78 @@ func TestGrokIdentityCandidates_IncludesBothEmailAndUserID(t *testing.T) {
 		if !got[want] {
 			t.Errorf("candidates missing %q, got %v", want, got)
 		}
+	}
+}
+
+// The bug Codex caught on PR #99: readGrokAuthExpiry bails the moment a
+// refresh token is present — which is exactly the branch that wants to display
+// the expiry — so populating LoginExpiresAt through it was a no-op. The
+// display path reads through readGrokAccessTokenExpiry instead.
+func TestReadGrokAccessTokenExpiry_ReportsExpiryDespiteRefreshToken(t *testing.T) {
+	base := t.TempDir()
+	helperGrokScopedAuth(t, base, map[string]any{
+		"key":           unsignedJWT(t, map[string]any{"sub": "uuid"}),
+		"email":         "ada@example.com",
+		"expires_at":    "2126-08-12T21:04:17Z",
+		"refresh_token": "refresh-token-value",
+	})
+
+	if _, ok := readGrokAuthExpiry(base); ok {
+		t.Fatal("readGrokAuthExpiry must still refuse a refreshable credential — " +
+			"its callers treat what it returns as a LOGIN deadline and warn on it")
+	}
+
+	got, ok := readGrokAccessTokenExpiry(base)
+	if !ok {
+		t.Fatal("readGrokAccessTokenExpiry returned no expiry for a refreshable credential")
+	}
+	want := time.Date(2126, 8, 12, 21, 4, 17, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("expiry=%v, want %v", got, want)
+	}
+}
+
+func TestReadGrokAccessTokenExpiry_FallsBackToTheTokenExpClaim(t *testing.T) {
+	// No `expires_at` field — the JWT's own `exp` still has to surface, or a
+	// credential layout that omits the plain field shows a blank row again.
+	exp := time.Date(2126, 8, 12, 21, 4, 17, 0, time.UTC)
+	base := t.TempDir()
+	helperGrokScopedAuth(t, base, map[string]any{
+		"key":           unsignedJWT(t, map[string]any{"sub": "uuid", "exp": exp.Unix()}),
+		"refresh_token": "refresh-token-value",
+	})
+
+	got, ok := readGrokAccessTokenExpiry(base)
+	if !ok || !got.Equal(exp) {
+		t.Errorf("expiry=%v ok=%v, want %v true", got, ok, exp)
+	}
+}
+
+func TestGrokUsage_RefreshableCredentialReportsExpiryWithoutClaimingExpired(t *testing.T) {
+	// End-to-end on the parser: the card gets a timestamp AND stays
+	// authenticated. A past access-token expiry must never read as a logout —
+	// the next request renews it.
+	base := t.TempDir()
+	helperGrokScopedAuth(t, base, map[string]any{
+		"key":           unsignedJWT(t, map[string]any{"sub": "uuid"}),
+		"email":         "ada@example.com",
+		"expires_at":    "2000-01-01T00:00:00Z", // long past
+		"refresh_token": "refresh-token-value",
+	})
+	t.Setenv("GROK_HOME", base)
+
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{}, time.Now())
+	if !ok || usage == nil {
+		t.Fatal("grok parser returned no usage")
+	}
+	if usage.LoginExpiresAt == "" {
+		t.Error("LoginExpiresAt is empty — the row would stay blank")
+	}
+	if usage.LoginExpirationState != loginExpirationRefreshable {
+		t.Errorf("LoginExpirationState=%q, want %q", usage.LoginExpirationState, loginExpirationRefreshable)
+	}
+	if usage.AuthState == "expired" || (usage.Authenticated != nil && !*usage.Authenticated) {
+		t.Errorf("a PASSED access-token expiry must not read as a logout: authState=%q authenticated=%v",
+			usage.AuthState, usage.Authenticated)
 	}
 }

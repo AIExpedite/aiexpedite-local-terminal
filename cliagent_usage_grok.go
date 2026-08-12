@@ -185,7 +185,7 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 			// authState stays authenticated past it — the refresh happens on
 			// next use, and Grok's real sign-out shows up through the auth
 			// notice path (an interactive `grok login`), not this timestamp.
-			if expiry, ok := readGrokAuthExpiry(base); ok {
+			if expiry, ok := readGrokAccessTokenExpiry(base); ok {
 				usage.LoginExpiresAt = expiry.UTC().Format(time.RFC3339)
 			}
 		} else if expiry, ok := readGrokAuthExpiry(base); ok {
@@ -268,7 +268,31 @@ type grokTokenExpClaims struct {
 // that one scoped token, so a fresher sibling must not mask it when it is stale
 // (and a re-login rewrites the selected entry, so keying off it still clears a
 // resolved warning). Best-effort: (zero, false) when nothing is readable.
+//
+// A credential carrying a refresh token reports NOTHING here: its access-token
+// deadline is not a login deadline, and every caller of this function treats
+// what it returns as one — warning the user, and flipping authState to
+// "expired". Use readGrokAccessTokenExpiry for the raw timestamp.
 func readGrokAuthExpiry(base string) (time.Time, bool) {
+	return grokAuthExpiry(base, false)
+}
+
+// readGrokAccessTokenExpiry returns the selected scope's access-token expiry
+// EVEN WHEN a refresh token is present — the case readGrokAuthExpiry refuses.
+//
+// Display only. The value is a rolling deadline the CLI renews without an
+// interactive sign-in (Grok's is ~6 hours), so it must never drive a warning,
+// an authState of "expired", or anything else that tells the user to sign in.
+// It exists so the card can show when the live credential was last renewed
+// against instead of leaving the row permanently blank.
+func readGrokAccessTokenExpiry(base string) (time.Time, bool) {
+	return grokAuthExpiry(base, true)
+}
+
+// grokAuthExpiry is the shared reader. `includeRefreshable` selects between the
+// two contracts above: false = authoritative login deadline (absent whenever
+// the credential can renew itself), true = the raw access-token expiry.
+func grokAuthExpiry(base string, includeRefreshable bool) (time.Time, bool) {
 	raw, err := os.ReadFile(filepath.Join(base, "auth.json"))
 	if err != nil {
 		raw, err = os.ReadFile(filepath.Join(base, "cached_token.json"))
@@ -326,8 +350,10 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 			// Grok v1.0 stores a short-lived access JWT plus an opaque refresh
 			// token. The access expiry is not the login expiry: Grok can refresh it
 			// without another interactive sign-in. Treat the deadline as unknown
-			// while refresh auth is present instead of warning every six hours.
-			if v.RefreshToken != "" {
+			// while refresh auth is present instead of warning every six hours —
+			// unless the caller explicitly asked for the raw access-token expiry
+			// to display, which never drives a warning.
+			if v.RefreshToken != "" && !includeRefreshable {
 				return time.Time{}, false
 			}
 			// Mirror read_grok_token (and readGrokScopedAuthClaims): a scope is only
@@ -374,7 +400,8 @@ func readGrokAuthExpiry(base string) (time.Time, bool) {
 	if json.Unmarshal(raw, &flat) == nil {
 		// A refresh token makes the access-token deadline unsuitable as a login
 		// deadline in legacy layouts too: Grok can renew it headlessly.
-		if firstNonEmpty(flat.RefreshToken, flat.CachedToken.RefreshToken) != "" {
+		if firstNonEmpty(flat.RefreshToken, flat.CachedToken.RefreshToken) != "" &&
+			!includeRefreshable {
 			return time.Time{}, false
 		}
 		if t, ok := fromRFC3339(flat.ExpiresAt); ok {

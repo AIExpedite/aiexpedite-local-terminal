@@ -1961,8 +1961,16 @@ func TestGrokUsageParser_RefreshTokenMakesAccessExpiryNonAuthoritative(t *testin
 	if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
 		t.Errorf("refreshable Grok login should be authenticated: %+v", usage)
 	}
-	if usage.LoginExpirationState != loginExpirationRefreshable || usage.LoginExpiresAt != "" {
-		t.Errorf("access expiry must not be published as login expiry: %+v", usage)
+	// The expiry IS published now (PR #99) so the card has something to show,
+	// but only as an access-token timestamp: the state stays `refreshable`, so
+	// the UI labels it rather than presenting it as a logout date, and the
+	// assertions above still pin the part that matters — an hour-past access
+	// expiry produces no notice and no loss of authentication.
+	if usage.LoginExpirationState != loginExpirationRefreshable {
+		t.Errorf("access expiry must not be published as a LOGIN expiry: %+v", usage)
+	}
+	if usage.LoginExpiresAt == "" {
+		t.Errorf("access-token expiry should be reported for display: %+v", usage)
 	}
 }
 
@@ -2419,10 +2427,10 @@ func TestGrokUsageParser_NestedAccessTokenPrecedesTopLevelIDToken(t *testing.T) 
 	}
 }
 
-// TestGrokUsageParser_FlatRefreshTokenSuppressesAccessExpiry pins both legacy
-// auth layouts. A renewable access-token deadline is not a login expiry and
-// must never tell the user to sign in again.
-func TestGrokUsageParser_FlatRefreshTokenSuppressesAccessExpiry(t *testing.T) {
+// TestGrokUsageParser_FlatRefreshTokenIsNotALoginExpiry pins both legacy auth
+// layouts. A renewable access-token deadline is reported for display but is not
+// a login expiry, and must never tell the user to sign in again.
+func TestGrokUsageParser_FlatRefreshTokenIsNotALoginExpiry(t *testing.T) {
 	t.Setenv("GROK_HOME", "")
 	now := time.Now()
 	expiredAccessToken := helperJWT(t, map[string]any{
@@ -2458,8 +2466,15 @@ func TestGrokUsageParser_FlatRefreshTokenSuppressesAccessExpiry(t *testing.T) {
 			if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
 				t.Errorf("renewable auth state = (%v, %q), want true/authenticated", usage.Authenticated, usage.AuthState)
 			}
-			if usage.LoginExpirationState != loginExpirationRefreshable || usage.LoginExpiresAt != "" {
-				t.Errorf("login expiry = (%q, %q), want refreshable with no deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+			// `refreshable` is the load-bearing part: the timestamp is published
+			// for display (PR #99) but the state is what stops the UI — and the
+			// notice check below — from calling an hour-old access expiry a
+			// logout.
+			if usage.LoginExpirationState != loginExpirationRefreshable {
+				t.Errorf("login expiry state = %q, want refreshable", usage.LoginExpirationState)
+			}
+			if usage.LoginExpiresAt == "" {
+				t.Errorf("access-token expiry should be reported for display")
 			}
 			if usage.Notice != "" {
 				t.Errorf("Notice=%q, want no re-login notice for renewable credentials", usage.Notice)
