@@ -69,6 +69,9 @@ type codexIDTokenClaims struct {
 	Plan     string `json:"plan"`
 	PlanType string `json:"plan_type"`
 	OrgID    string `json:"org_id"`
+	// Standard JWT expiry (seconds since epoch). Reported even when the
+	// credential refreshes itself — see the LoginExpiresAt assignment below.
+	Exp int64 `json:"exp"`
 }
 
 func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
@@ -116,6 +119,15 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 			} else {
 				usage.LoginExpirationState = loginExpirationNotReported
 			}
+			// Report the expiry even for a refreshing credential. It is the
+			// ACCESS token's, not a logout date, so the card must label it as
+			// such — but withholding it left the row permanently blank, which
+			// tells the reader nothing about whether the login is healthy.
+			// authState is deliberately NOT flipped on a passed expiry here: a
+			// refreshable token renews on next use, so "expired" would be a lie.
+			if claims.Exp > 0 {
+				usage.LoginExpiresAt = time.Unix(claims.Exp, 0).UTC().Format(time.RFC3339)
+			}
 		}
 	}
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
@@ -130,6 +142,12 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 		// OPENAI_API_KEY authentication. A definite persisted logout therefore
 		// cannot invalidate a credential mode the app-server will actually use.
 		if !loggedIn && hasAPIKeyAuth {
+			// The probe is definite: the persisted OAuth login is gone, so any
+			// expiry parsed out of a leftover auth.json id_token describes a
+			// credential Codex will not use. The API key that IS in use carries
+			// no expiry, so report none rather than a stale OAuth one.
+			usage.LoginExpiresAt = ""
+			usage.LoginExpirationState = loginExpirationNotReported
 			return usage, true
 		}
 		usage.Authenticated = authBoolPtr(loggedIn)
@@ -137,6 +155,8 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 			usage.AuthState = "authenticated"
 		} else {
 			usage.AuthState = "missing"
+			usage.LoginExpiresAt = ""
+			usage.LoginExpirationState = loginExpirationNotReported
 			usage.Notice = "Codex is not signed in on this computer — run `codex login` on the terminal computer to authenticate."
 			usage.NoticeSeverity = "error"
 			usage.Metrics = utilizationMetricsUnknown(usage.Metrics)
