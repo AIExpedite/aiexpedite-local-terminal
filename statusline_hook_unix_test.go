@@ -34,19 +34,41 @@ func TestRenderStatusLine_TerminatesChainedChildOnSignal(t *testing.T) {
 		t.Fatalf("savePrevStatusLine: %v", err)
 	}
 
+	// Swallow the default-line stdout the wrapper would normally print after
+	// the signal path — we only care about the lifecycle here.
+	//
+	// os.Stderr is redirected for a second, load-bearing reason: renderStatusLine
+	// hands the chained child `cmd.Stdout = os.Stdout` / `cmd.Stderr = os.Stderr`,
+	// i.e. the *test binary's own* stdio descriptors — this is the only place in
+	// the suite that does. `go test` waits for those descriptors to reach EOF
+	// after the tests exit, so if the `sleep 60` here ever outlives us (the
+	// group kill below is best-effort, and the assertion only probes the group
+	// leader), the whole package fails with
+	//
+	//     *** Test I/O incomplete 30s after exiting.
+	//     exec: WaitDelay expired before I/O complete
+	//
+	// long after every test reported PASS. Pointing both at files under
+	// t.TempDir() means a straggler holds a temp file instead of the test
+	// binary's pipes, so the leak can no longer take the package down with it.
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	childOut, err := os.Create(filepath.Join(dir, "render.out"))
+	if err != nil {
+		t.Fatalf("create render.out: %v", err)
+	}
+	childErr, err := os.Create(filepath.Join(dir, "render.err"))
+	if err != nil {
+		t.Fatalf("create render.err: %v", err)
+	}
+	os.Stdout, os.Stderr = childOut, childErr
+	t.Cleanup(func() {
+		os.Stdout, os.Stderr = oldStdout, oldStderr
+		_ = childOut.Close()
+		_ = childErr.Close()
+	})
+
 	done := make(chan struct{})
 	go func() {
-		// Swallow the default-line stdout the wrapper would normally print after
-		// the signal path — we only care about the lifecycle here.
-		oldStdout := os.Stdout
-		devNull, _ := os.Open(os.DevNull)
-		os.Stdout = devNull
-		defer func() {
-			os.Stdout = oldStdout
-			if devNull != nil {
-				_ = devNull.Close()
-			}
-		}()
 		renderStatusLine([]byte(`{}`))
 		close(done)
 	}()
@@ -65,6 +87,14 @@ func TestRenderStatusLine_TerminatesChainedChildOnSignal(t *testing.T) {
 	if leaderPid == 0 {
 		t.Fatal("chained child never wrote its pid — never started?")
 	}
+	// Unconditional backstop: reap the whole group at test end no matter which
+	// way the assertions below go. The success path leaves nothing to kill, but
+	// if the wrapper's group kill ever misses a member (e.g. the shell forked
+	// `sleep` concurrently with kill(-pgid)), the survivor would otherwise sit
+	// around for a full 60s. Registered as Cleanup rather than left to the
+	// failure branch so a *passing* run can't leak it either — a leaked child is
+	// invisible until the package exits and then fails it as an I/O timeout.
+	t.Cleanup(func() { _ = syscall.Kill(-leaderPid, syscall.SIGKILL) })
 
 	// SIGTERM ourselves; signal.Notify inside renderStatusLine should catch it
 	// and relay to the child's process group (`kill(-pgid, SIGTERM)`).
@@ -89,8 +119,7 @@ func TestRenderStatusLine_TerminatesChainedChildOnSignal(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if !gone {
-		// Best-effort cleanup so we don't leak a 60s sleep across the suite.
-		_ = syscall.Kill(-leaderPid, syscall.SIGKILL)
+		// The t.Cleanup above handles the actual reaping.
 		t.Errorf("chained child pgid %d still alive after wrapper got SIGTERM", leaderPid)
 	}
 }
