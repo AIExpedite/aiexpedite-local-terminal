@@ -74,16 +74,18 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// races with a ping that arrived microseconds earlier.
 	time.Sleep(50 * time.Millisecond)
 
-	// Step 1b: If an automatic update was draining when we started shutting
-	// down (e.g. a manual "Update Now" superseded it, or the user quit
-	// mid-drain), report the drain as superseded/finished so the service clears
-	// the draining marker rather than leaving it to expire. The device then
-	// follows the ordinary offline path below. Best-effort — an undeliverable
-	// report never blocks teardown, and drain expiry resolves it either way.
+	// Step 1b: If an automatic update was draining when the user quit mid-drain,
+	// abandon the attempt: report the drain as deferred so the service clears
+	// the draining marker rather than leaving it to expire, then follow the
+	// ordinary offline path below. (A manual "Update Now" that supersedes a
+	// drain does NOT reach here — it goes through the update-handoff branch in
+	// onTrayExit, which restarts and reconciles the attempt on next launch.)
+	// Best-effort — an undeliverable report never blocks teardown, and the next
+	// launch's resolveInterruptedAttempt / drain expiry resolves it either way.
 	if cfg != nil && cfg.IsRegistered() && !cfg.OfflineMode && isDraining() {
 		exitCtx, exitCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := notifyDrainExit(exitCtx, cfg, drainingAttempt(), "superseded"); err != nil {
-			fmt.Printf("%s[shutdown] notifyDrainExit(superseded) failed: %v%s\n", colorYellow, err, colorReset)
+		if err := notifyDrainExit(exitCtx, cfg, drainingAttempt(), "deferred"); err != nil {
+			fmt.Printf("%s[shutdown] notifyDrainExit(deferred) failed: %v%s\n", colorYellow, err, colorReset)
 		}
 		exitCancel()
 	}
