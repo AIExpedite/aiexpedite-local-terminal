@@ -232,11 +232,14 @@ func newAutoUpdater(cfg *Config, tray *trayUpdateHandles) *autoUpdater {
 		stopCh:         make(chan struct{}),
 		triggerCh:      make(chan struct{}, 1),
 	}
+	// Enter and confirm are the same wire call (the service distinguishes by
+	// attempt); kept as two hooks so the state machine reads clearly and tests
+	// can observe enters vs confirms independently.
 	au.drainEnter = func(ctx context.Context, attemptID, target string) error {
-		return notifyDrainEnter(ctx, cfg, attemptID, target)
+		return notifyDrain(ctx, cfg, attemptID, target)
 	}
 	au.drainConfirm = func(ctx context.Context, attemptID, target string) error {
-		return notifyDrainConfirm(ctx, cfg, attemptID, target)
+		return notifyDrain(ctx, cfg, attemptID, target)
 	}
 	au.drainExit = func(ctx context.Context, attemptID, reason string) error {
 		return notifyDrainExit(ctx, cfg, attemptID, reason)

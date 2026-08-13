@@ -59,23 +59,16 @@ func notifyOffline(ctx context.Context, cfg *Config) error {
 	return notifyConnectivity(ctx, cfg, "offline", nil)
 }
 
-// notifyDrainEnter tells the terminal-service this agent has entered the
-// update-draining state for a specific attempt/target version, so the cloud
-// stops routing NEW work to it while it finishes accepted work. Idempotent
-// server-side: repeated calls for the same attempt refresh the drain lease
-// rather than re-entering.
-func notifyDrainEnter(ctx context.Context, cfg *Config, attemptID, targetVersion string) error {
-	return notifyConnectivity(ctx, cfg, "drain", map[string]any{
-		"attemptId":     attemptID,
-		"targetVersion": targetVersion,
-	})
-}
-
-// notifyDrainConfirm re-confirms an active drain (the renewable lease). The
-// service's clock is authoritative — a drain that has not been confirmed for
-// the staleness window expires — so the agent calls this on a short interval
-// while draining. Same endpoint as enter; the service distinguishes by attempt.
-func notifyDrainConfirm(ctx context.Context, cfg *Config, attemptID, targetVersion string) error {
+// notifyDrain tells the terminal-service this agent is draining for a specific
+// attempt/target version, so the cloud stops routing NEW work to it while it
+// finishes accepted work. It is used for BOTH entering the drain and confirming
+// (heartbeating) it — the wire call is identical and the service distinguishes
+// enter vs confirm by whether the attemptId is already active. Idempotent
+// server-side: repeated calls for the same attempt refresh the drain lease. The
+// service's clock is authoritative, so a drain that is not confirmed within the
+// staleness window expires; the agent confirms on a short interval while
+// draining.
+func notifyDrain(ctx context.Context, cfg *Config, attemptID, targetVersion string) error {
 	return notifyConnectivity(ctx, cfg, "drain", map[string]any{
 		"attemptId":     attemptID,
 		"targetVersion": targetVersion,
