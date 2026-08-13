@@ -356,8 +356,11 @@ func onTrayReady(cfg *Config) func() {
 				mUpdateBlocked.Show()
 			},
 			hideBlocked: func() { mUpdateBlocked.Hide() },
+			// Reveal the pending "Install Update (vX)" item. The scheduler owns
+			// the pending UpdateInfo (with its AssetURL) via SetPendingUpdate —
+			// this handle only touches the tray, so a click has a complete,
+			// downloadable info to act on.
 			showPendingInstall: func(version string) {
-				SetPendingUpdate(&UpdateInfo{Available: true, LatestVersion: version})
 				mInstallUpdate.SetTitle(fmt.Sprintf("Install Update (%s)", version))
 				mInstallUpdate.SetTooltip("Click to install the pending update")
 				mInstallUpdate.Show()

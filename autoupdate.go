@@ -27,6 +27,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -351,18 +352,16 @@ func (au *autoUpdater) runAttempt() {
 	}
 	au.tray.blocked(false, "")
 
-	info, path := au.checkAndVerifyWithRetry()
-	if info == nil || path == "" {
-		return // no update, or abandoned after retries
-	}
-
-	// The automatic path deliberately IGNORES cfg.SkippedVersion — Skip Version
-	// is a choice made in the manual dialog and must not suppress an enabled
-	// automatic update. The manual flow keeps honouring it.
-
-	// macOS check-and-offer fallback build: do NOT drain or restart. Surface the
-	// verified update as a pending "Install Update" the user installs by choice.
+	// macOS check-and-offer fallback build: check ONLY — do not download, drain,
+	// or restart. Surface the newer version as a pending "Install Update" the
+	// user installs by choice (which downloads + verifies at click time). We
+	// deliberately skip the download here so a fallback build does not fetch a
+	// full DMG every 6h and leave the verified temp artifact unused.
 	if !silentUpdateCapable() {
+		info := au.checkOnlyWithRetry()
+		if info == nil {
+			return
+		}
 		fmt.Printf("[autoupdate] Check-and-offer build: offering %s for manual install\n", info.LatestVersion)
 		if au.tray != nil && au.tray.showPendingInstall != nil {
 			au.tray.showPendingInstall(info.LatestVersion)
@@ -371,7 +370,38 @@ func (au *autoUpdater) runAttempt() {
 		return
 	}
 
+	info, path := au.checkAndVerifyWithRetry()
+	if info == nil || path == "" {
+		return // no update, or abandoned after retries
+	}
+
+	// The automatic path deliberately IGNORES cfg.SkippedVersion — Skip Version
+	// is a choice made in the manual dialog and must not suppress an enabled
+	// automatic update. The manual flow keeps honouring it.
 	au.drainAndInstall(newAttemptID(au.now(), au.attemptSeq.Add(1)), info, path)
+}
+
+// checkOnlyWithRetry runs the metadata check (no download) with bounded
+// retries, for the macOS check-and-offer fallback. Returns the newer release
+// info, or nil when there is nothing newer or the check was abandoned.
+func (au *autoUpdater) checkOnlyWithRetry() *UpdateInfo {
+	for attempt := 1; attempt <= autoUpdateMaxRetries; attempt++ {
+		info, err := au.checkForUpdate()
+		if err == nil {
+			if info == nil || !info.Available {
+				return nil
+			}
+			return info
+		}
+		fmt.Printf("[autoupdate] check attempt %d/%d failed: %v\n",
+			attempt, autoUpdateMaxRetries, err)
+		if attempt < autoUpdateMaxRetries {
+			if !au.sleep(retryBackoff(attempt)) {
+				return nil
+			}
+		}
+	}
+	return nil
 }
 
 // checkAndVerifyWithRetry runs check+download+verify with bounded retries. A
@@ -406,6 +436,19 @@ func (au *autoUpdater) checkAndVerifyWithRetry() (*UpdateInfo, string) {
 // 7-day deadline), then installs. Handles preference-off cancel, deferral, and
 // confirmation-rejection abandonment.
 func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path string) {
+	// The verified artifact is owned by this call. Delete it on any exit that
+	// does NOT hand it to a successful install (preference-off, deferral,
+	// expiry, install failure, updater stop) so a long-running process that
+	// repeatedly defers doesn't accumulate temp artifacts until the next
+	// startup sweep. A successful apply() sets installed=true because the
+	// artifact is then consumed by the self-replace handoff / bundle swap.
+	installed := false
+	defer func() {
+		if !installed && path != "" {
+			_ = os.Remove(path)
+		}
+	}()
+
 	// Local refusal is authoritative from this instant — before the service
 	// even learns of the drain.
 	closeAdmission(attemptID)
@@ -477,6 +520,7 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		au.exitDrain(attemptID, "deferred", false)
 		return
 	}
+	installed = true // artifact consumed by the self-replace handoff / bundle swap
 	// apply() restarts the process; the new version reconciles the drain via
 	// resolveInterruptedAttempt → notifyOnlineWithVersion on next boot.
 }

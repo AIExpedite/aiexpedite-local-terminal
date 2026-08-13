@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -25,6 +26,7 @@ type autoTestRig struct {
 	info           *UpdateInfo
 
 	checkCalls   int
+	verifyCalls  int
 	applyCalls   int
 	drainEnter   int
 	drainConfirm int
@@ -62,6 +64,7 @@ func newAutoTestRig(t *testing.T, cfg *Config) *autoTestRig {
 		downloadVerify: func(_ *UpdateInfo) (string, error) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
+			r.verifyCalls++
 			if r.verifyErr != nil {
 				return "", r.verifyErr
 			}
@@ -243,6 +246,61 @@ func TestRunAttempt_PreferenceOffDuringDrainCancels(t *testing.T) {
 	}
 	if isDraining() {
 		t.Fatal("admission must be reopened after preference-off cancel")
+	}
+}
+
+func TestDrainAndInstall_CleansUpArtifactOnDefer(t *testing.T) {
+	r := newAutoTestRig(t, registeredCfg())
+	r.activeWork = 1 // never drains → defers at the deadline
+
+	// Point downloadVerify at a REAL temp file so we can assert it is deleted
+	// when the attempt defers instead of installing.
+	artifact := filepath.Join(t.TempDir(), "agent_update_x.bin")
+	if err := os.WriteFile(artifact, []byte("binary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.au.downloadVerify = func(_ *UpdateInfo) (string, error) { return artifact, nil }
+	r.au.sleep = func(_ time.Duration) bool {
+		r.mu.Lock()
+		r.clock = r.clock.Add(8 * 24 * time.Hour)
+		r.mu.Unlock()
+		return true
+	}
+
+	r.au.runAttempt()
+
+	if _, err := os.Stat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("verified artifact should be removed on defer, stat err = %v", err)
+	}
+	if r.applyCalls != 0 {
+		t.Fatal("deferred attempt must not install")
+	}
+}
+
+func TestRunAttempt_MacFallbackChecksOnlyNoDownload(t *testing.T) {
+	prev := silentUpdateCapableFlag
+	silentUpdateCapableFlag = "false"
+	t.Cleanup(func() { silentUpdateCapableFlag = prev })
+	if silentUpdateCapable() {
+		t.Skip("fallback only applies to non-capable macOS builds")
+	}
+
+	t.Cleanup(ClearPendingUpdate)
+	r := newAutoTestRig(t, registeredCfg())
+	r.activeWork = 0
+	r.au.runAttempt()
+
+	if r.verifyCalls != 0 {
+		t.Fatalf("fallback must NOT download/verify, got %d verify calls", r.verifyCalls)
+	}
+	if r.applyCalls != 0 || isDraining() {
+		t.Fatal("fallback must not drain or install")
+	}
+	if len(r.pendingShown) == 0 {
+		t.Fatal("fallback must offer the update via the pending-install tray item")
+	}
+	if GetPendingUpdate() == nil {
+		t.Fatal("fallback must record the pending update (with its AssetURL) for a manual click")
 	}
 }
 
