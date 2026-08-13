@@ -642,7 +642,10 @@ func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliA
 // Order is load-bearing twice over: canonical-first keeps a real
 // `seven_day_fable` bucket winning over a variant (plain sorting would not —
 // `fable_weekly` sorts ahead of it), and sorting the tail makes the choice
-// deterministic where Go map iteration is not. Non-determinism would not just
+// deterministic where Go map iteration is not. This is a preference among LIVE
+// buckets only — observedMetricOrUnknown skips rolled-over candidates first, so
+// a stale canonical bucket left behind by a rename cannot mask a live variant.
+// Non-determinism would not just
 // be untidy: terminal-service delta-skips writes by hashing the marshalled
 // payload, so a row flipping between two fable-ish buckets across polls would
 // churn a Firestore write plus a 7-day history document each time.
@@ -753,37 +756,52 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 }
 
 // observedMetricOrUnknown returns a real percentage metric for the first window
-// id present in the cache, or an Unknown placeholder when none is observed. A
-// window whose reset time has passed is unobservable: assuming 0% ignores usage
-// that may already have happened on another computer.
+// id present in the cache that still describes a LIVE window, or an Unknown
+// placeholder when none is observed. A window whose reset time has passed is
+// unobservable: assuming 0% ignores usage that may already have happened on
+// another computer.
+//
+// Liveness is checked BEFORE candidate precedence, which matters only for a
+// multi-id list (the Fable row): the cache never prunes a window id, so an
+// upstream rename leaves the old canonical bucket behind forever. Returning its
+// rolled-over Unknown on sight would make the tolerant variant fallback inert in
+// exactly the rename case it exists for — the row would stay unobservable while
+// fresh variant telemetry kept arriving. A rolled-over bucket is still the
+// answer when NO candidate is live, and the first such bucket in candidate order
+// supplies the ObservedAt so the result stays deterministic.
 func observedMetricOrUnknown(
 	buckets map[string]claudeRateLimitBucket,
 	windowIDs []string,
 	kind, label string,
 	now time.Time,
 ) cliAgentUsageMetric {
+	rolledOver := ""
 	for _, id := range windowIDs {
 		b, ok := buckets[id]
 		if !ok {
 			continue
 		}
-		used := b.UsedPercentage
 		var resetAt string
 		if b.ResetsAtMs > 0 {
 			if now.UnixMilli() >= b.ResetsAtMs {
-				return cliAgentUsageMetric{
-					Kind: kind, Label: label, Unit: "%",
-					ObservedAt: observedAtRFC3339(b.ObservedAtMs), Unknown: true,
+				if rolledOver == "" {
+					rolledOver = id
 				}
-			} else {
-				resetAt = time.UnixMilli(b.ResetsAtMs).UTC().Format(time.RFC3339)
+				continue
 			}
+			resetAt = time.UnixMilli(b.ResetsAtMs).UTC().Format(time.RFC3339)
 		}
-		used = clampPercent(used)
+		used := clampPercent(b.UsedPercentage)
 		return cliAgentUsageMetric{
 			Kind: kind, Label: label, Unit: "%",
 			Total: floatPtr(100), Consumed: floatPtr(used), Remaining: floatPtr(100 - used),
 			ResetAt: resetAt, ObservedAt: observedAtRFC3339(b.ObservedAtMs),
+		}
+	}
+	if rolledOver != "" {
+		return cliAgentUsageMetric{
+			Kind: kind, Label: label, Unit: "%",
+			ObservedAt: observedAtRFC3339(buckets[rolledOver].ObservedAtMs), Unknown: true,
 		}
 	}
 	return cliAgentUsageMetric{Kind: kind, Label: label, Unit: "%", Unknown: true}

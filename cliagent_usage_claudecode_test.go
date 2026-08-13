@@ -280,6 +280,66 @@ func TestClaudeCodeMetricsFromCache_CanonicalFableWinsDeterministically(t *testi
 	}
 }
 
+// Canonical precedence ranks LIVE candidates; it must not let a stale bucket
+// veto a fresh one. The cache never prunes a window id, so after an upstream
+// rename the old `seven_day_fable` bucket lingers forever — if its rolled-over
+// state ended the search, the tolerant variant fallback would be inert in
+// exactly the case it exists for and the row would stay unobservable while
+// fresh variant telemetry kept arriving.
+func TestClaudeCodeMetricsFromCache_LiveFableVariantBeatsExpiredCanonical(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	live := now.Add(120 * time.Hour)
+	seedClaudeRateLimitCache(t, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDayFable: {
+			UsedPercentage: 88, ResetsAtMs: now.Add(-48 * time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-72 * time.Hour).UnixMilli(), usageKnown: true,
+		},
+		"weekly_fable": {
+			UsedPercentage: 31, ResetsAtMs: live.UnixMilli(),
+			ObservedAtMs: now.UnixMilli(), usageKnown: true,
+		},
+	}, now, "")
+
+	fable := claudeCodeMetricsFromCache(now, "")[2]
+	if fable.Unknown || fable.Consumed == nil || *fable.Consumed != 31 {
+		t.Fatalf("fable row=%+v, want the live variant's 31%% (not the expired canonical bucket)", fable)
+	}
+	if want := live.UTC().Format(time.RFC3339); fable.ResetAt != want {
+		t.Errorf("fable ResetAt=%q, want %q (the live variant's window)", fable.ResetAt, want)
+	}
+	if want := observedAtRFC3339(now.UnixMilli()); fable.ObservedAt != want {
+		t.Errorf("fable ObservedAt=%q, want %q", fable.ObservedAt, want)
+	}
+}
+
+// When every candidate has rolled over the row is still unobservable, and the
+// ObservedAt comes from the first bucket in candidate order so the payload
+// terminal-service hashes for its delta-skip stays stable across polls.
+func TestClaudeCodeMetricsFromCache_AllFableCandidatesRolledOverStayUnknown(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	canonicalObserved := now.Add(-72 * time.Hour)
+	seedClaudeRateLimitCache(t, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDayFable: {
+			UsedPercentage: 88, ResetsAtMs: now.Add(-48 * time.Hour).UnixMilli(),
+			ObservedAtMs: canonicalObserved.UnixMilli(), usageKnown: true,
+		},
+		"weekly_fable": {
+			UsedPercentage: 31, ResetsAtMs: now.Add(-time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-2 * time.Hour).UnixMilli(), usageKnown: true,
+		},
+	}, now, "")
+
+	fable := claudeCodeMetricsFromCache(now, "")[2]
+	if !fable.Unknown || fable.Consumed != nil || fable.ResetAt != "" {
+		t.Fatalf("fable row=%+v, want unobservable with no stale reset", fable)
+	}
+	if want := observedAtRFC3339(canonicalObserved.UnixMilli()); fable.ObservedAt != want {
+		t.Errorf("fable ObservedAt=%q, want %q (first candidate in canonical order)", fable.ObservedAt, want)
+	}
+}
+
 // Claude already splits the weekly window per model, so a symmetric
 // `five_hour_fable` is plausible. Surfacing it under a row labelled "Weekly
 // Fable" would report a session window as a weekly one.
