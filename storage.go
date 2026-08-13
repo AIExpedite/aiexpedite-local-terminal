@@ -123,6 +123,12 @@ func UploadFile(
 	executionID string,
 	log *slog.Logger,
 ) (FileInfo, error) {
+	// Count this upload as in-flight work so a pending automatic update drains
+	// until the artifact has been uploaded (or failed durably) rather than
+	// restarting mid-upload (drain.go).
+	trackUploadStart()
+	defer trackUploadEnd()
+
 	// Open local file
 	file, err := os.Open(localPath)
 	if err != nil {

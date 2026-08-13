@@ -10,13 +10,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/getlantern/systray"
 	"golang.org/x/mod/semver"
 )
 
@@ -238,39 +238,38 @@ func checkForNewVersion() (*UpdateInfo, error) {
 	return info, nil
 }
 
-// downloadAndApplyUpdate downloads the update binary and triggers a restart.
-// Sets updatePath and updatePending globals, then calls systray.Quit().
-func downloadAndApplyUpdate(info *UpdateInfo) error {
-	if !info.Available || info.AssetURL == "" {
-		return errors.New("no update available to download")
-	}
-
-	// macOS: release assets are .dmg disk images, not raw Mach-O binaries,
-	// so performSelfReplace would copy a DMG over the running executable
-	// and brick the install. The proactive/manual check already asked the
-	// user (Update Now / Later / Skip) — if we reach here they chose
-	// "Update Now", so open the release page directly without a second
-	// confirmation dialog. Logged so the console trail still shows what
-	// happened for anyone debugging.
-	if runtime.GOOS == "darwin" {
-		releaseURL := fmt.Sprintf("https://github.com/%s/releases", githubRepo)
-		fmt.Printf("[update] macOS manual upgrade: opening %s\n", releaseURL)
-		openBrowser(releaseURL)
-		return nil
+// downloadAndVerifyUpdate downloads the release asset for info, enforces the
+// size floor/ceiling, computes its SHA-256, and verifies SLSA build provenance.
+// It returns the path to the VERIFIED temp artifact — a raw executable on
+// Windows/Linux, a .dmg on macOS — which the caller owns and must either apply
+// (applyVerifiedUpdate) or delete.
+//
+// This is the "fetch and verify" half of the update, factored out of the old
+// downloadAndApplyUpdate so the automatic path (download → drain → install) and
+// the manual path (download → install now) share ONE integrity check rather
+// than growing a second copy. It performs no restart and mutates no global
+// state, so it is safe to call, verify, and discard.
+func downloadAndVerifyUpdate(info *UpdateInfo) (string, error) {
+	if info == nil || !info.Available || info.AssetURL == "" {
+		return "", errors.New("no update available to download")
 	}
 
 	fmt.Printf("→ Downloading %s...\n", info.AssetName)
 
-	// On Windows, temp files need .exe extension to be executable
+	// Temp artifact extension must match the asset kind so the OS treats it
+	// correctly: an executable on Windows, a mountable image on macOS.
 	pattern := "agent_update_*"
-	if runtime.GOOS == "windows" {
+	switch runtime.GOOS {
+	case "windows":
 		pattern = "agent_update_*.exe"
+	case "darwin":
+		pattern = "agent_update_*.dmg"
 	}
 	tmp, err := os.CreateTemp("", pattern)
 	if err != nil {
-		return err
+		return "", err
 	}
-	// Clean up the temp file on any error path; on success updatePath takes ownership.
+	// Clean up the temp file on any error path; on success the caller owns it.
 	success := false
 	defer func() {
 		tmp.Close()
@@ -281,31 +280,31 @@ func downloadAndApplyUpdate(info *UpdateInfo) error {
 
 	resp, err := updateDownloadClient.Get(info.AssetURL) //nolint:gosec // URL comes from authenticated GitHub API response
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
+		return "", fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
 	}
 
 	// Cap download at 200 MB to prevent disk exhaustion from an unexpectedly
-	// large or malicious response body. Release binaries are typically < 50 MB;
+	// large or malicious response body. Release artifacts are typically < 50 MB;
 	// 200 MB leaves plenty of headroom while still bounding disk usage.
 	const maxBinarySize = 200 << 20 // 200 MB
 	h := sha256.New()
 	if _, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(resp.Body, maxBinarySize)); err != nil {
-		return err
+		return "", err
 	}
 
-	// Verify the download produced a valid binary (not an empty/truncated response)
+	// Verify the download produced a valid artifact (not an empty/truncated response)
 	stat, err := tmp.Stat()
 	if err != nil {
-		return fmt.Errorf("cannot stat downloaded file: %w", err)
+		return "", fmt.Errorf("cannot stat downloaded file: %w", err)
 	}
-	const minBinarySize = 1 << 20 // 1 MB — Go binaries are typically 10-50 MB
+	const minBinarySize = 1 << 20 // 1 MB — release artifacts are typically 10-50 MB
 	if stat.Size() < minBinarySize {
-		return fmt.Errorf("downloaded file too small (%d bytes), likely corrupted", stat.Size())
+		return "", fmt.Errorf("downloaded file too small (%d bytes), likely corrupted", stat.Size())
 	}
 
 	digestHex := hex.EncodeToString(h.Sum(nil))
@@ -322,19 +321,148 @@ func downloadAndApplyUpdate(info *UpdateInfo) error {
 	fmt.Println("→ Verifying build provenance...")
 	if err := verifyBuildProvenance(tmp.Name(), digestHex); err != nil {
 		if !errors.Is(err, errAttestationDisabled) {
-			return fmt.Errorf("attestation verification failed, refusing to apply update: %w", err)
+			return "", fmt.Errorf("attestation verification failed, refusing to apply update: %w", err)
 		}
 	}
 
-	_ = os.Chmod(tmp.Name(), 0o755) // make executable
+	success = true // caller owns the verified temp artifact now
+	return tmp.Name(), nil
+}
 
-	// Set global state for restart
-	success = true // temp file is now owned by the update path; don't delete on defer
-	SetUpdateReady(tmp.Name())
-
+// downloadAndApplyUpdate downloads + verifies the update and applies it right
+// away (the manual "Update Now" / "Install Update" path — the user asked for it
+// explicitly, so it does NOT drain first). The automatic path calls
+// downloadAndVerifyUpdate and applyVerifiedUpdate separately with a drain in
+// between.
+func downloadAndApplyUpdate(info *UpdateInfo) error {
+	path, err := downloadAndVerifyUpdate(info)
+	if err != nil {
+		return err
+	}
 	fmt.Println("→ Restarting with new version...")
-	systray.Quit() // graceful restart
-	return nil
+	return applyVerifiedUpdate(path, info)
+}
+
+// installUpdatable reports whether this installation can update itself without
+// a prompt, and if not, a one-line human reason for the tray "update blocked"
+// status item. It is a cheap, side-effect-free probe run before any download:
+//   - Windows: blocked while still running from the machine-wide (Program Files)
+//     location — the per-user relocation must complete first.
+//   - macOS: blocked when running from a mounted DMG, ~/Downloads, or another
+//     unsupported/read-only location (see darwinLocationSupported).
+//   - Any platform: blocked when the install directory is not writable.
+//
+// When it cannot determine the answer it fails OPEN (updatable) rather than
+// blocking a healthy install.
+func installUpdatable() (bool, string) {
+	exe, err := os.Executable()
+	if err != nil {
+		return true, ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+
+	switch runtime.GOOS {
+	case "windows":
+		if isMachineWideWindowsInstall(exe) {
+			return false, "Automatic update unavailable — run the installer once to move AI Expedite to a per-user location"
+		}
+	case "darwin":
+		if ok, reason := darwinLocationSupported(exe); !ok {
+			return false, reason
+		}
+		// ~/Applications and /Applications (pre-relocation) are supported.
+		return true, ""
+	}
+
+	// Generic writability probe of the install directory (covers Linux and a
+	// relocated Windows install).
+	if !dirWritable(filepath.Dir(exe)) {
+		return false, "Automatic update unavailable — this installation is read-only; move the app to a writable location"
+	}
+	return true, ""
+}
+
+// darwinBundlePath maps the running Mach-O executable path
+// (<App>.app/Contents/MacOS/<binary>) back to the enclosing <App>.app bundle
+// directory. Returns "" if exe is not inside a .app bundle. Pure string logic
+// so it is testable and available on every platform (the location probe below
+// runs from installUpdatable, which is compiled everywhere).
+func darwinBundlePath(exe string) string {
+	marker := ".app/Contents/MacOS/"
+	idx := strings.Index(exe, marker)
+	if idx == -1 {
+		return ""
+	}
+	return exe[:idx+len(".app")]
+}
+
+// darwinLocationSupported reports whether a macOS install can self-update from
+// its current location, with a human reason when it cannot. Supported: the
+// user-writable ~/Applications (the new default) and /Applications before
+// relocation. Unsupported: a mounted DMG, ~/Downloads, or any other read-only
+// / ad-hoc path — those run normally but never self-update and say so.
+func darwinLocationSupported(exe string) (bool, string) {
+	bundle := darwinBundlePath(exe)
+	if bundle == "" {
+		// Not a bundled app (e.g. a raw `go run` build); fall back to a plain
+		// writability check on the directory holding the executable.
+		if !dirWritable(filepath.Dir(exe)) {
+			return false, "Automatic update unavailable — this location is read-only; move AI Expedite to ~/Applications"
+		}
+		return true, ""
+	}
+	lower := strings.ToLower(bundle)
+	home, _ := os.UserHomeDir()
+
+	if strings.HasPrefix(lower, "/volumes/") {
+		return false, "Automatic update unavailable — running from a mounted disk image; move AI Expedite to ~/Applications"
+	}
+	if home != "" && strings.HasPrefix(bundle, filepath.Join(home, "Downloads")+string(filepath.Separator)) {
+		return false, "Automatic update unavailable — running from Downloads; move AI Expedite to ~/Applications"
+	}
+
+	userApps := ""
+	if home != "" {
+		userApps = filepath.Join(home, "Applications")
+	}
+	if (userApps != "" && strings.HasPrefix(bundle, userApps)) ||
+		strings.HasPrefix(bundle, "/Applications") {
+		return true, ""
+	}
+
+	// Any other location must at least be writable to update in place.
+	if !dirWritable(filepath.Dir(bundle)) {
+		return false, "Automatic update unavailable — this location is read-only; move AI Expedite to ~/Applications"
+	}
+	return true, ""
+}
+
+// isMachineWideWindowsInstall reports whether exe sits under a machine-wide
+// Program Files location that requires elevation to write. Used to gate the
+// automatic path until the per-user relocation has happened.
+func isMachineWideWindowsInstall(exe string) bool {
+	lower := strings.ToLower(filepath.Clean(exe))
+	return strings.Contains(lower, `\program files\`) ||
+		strings.Contains(lower, `\program files (x86)\`)
+}
+
+// dirWritable reports whether dir accepts a new file without elevation. It
+// writes and removes a tiny probe file rather than inspecting permission bits,
+// which are unreliable across platforms (ACLs, read-only mounts, MDM).
+func dirWritable(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	f, err := os.CreateTemp(dir, ".aixupd_probe_*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	f.Close()
+	os.Remove(name)
+	return true
 }
 
 // checkForUpdate is the legacy function for manual "Check for Updates" menu option.

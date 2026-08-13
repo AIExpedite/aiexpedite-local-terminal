@@ -583,6 +583,22 @@ jobs:
           echo "[${ARCH}] Stapling ${DMG}"
           xcrun stapler staple "${DMG}"
           xcrun stapler validate "${DMG}"
+
+          # Also staple the ticket to the .app bundle itself. The silent
+          # auto-updater extracts the .app from this DMG and replaces the
+          # installed bundle in place; a stapled bundle is what lets that
+          # replaced copy pass Gatekeeper on first launch offline (the DMG
+          # staple alone does not travel with an extracted app).
+          # NOTE: this staples the staging bundle. For the .app *inside* the
+          # shipped DMG to carry the ticket, the app must be notarized+stapled
+          # before the DMG is packaged (notarize-app-first) — tracked as a
+          # macOS release follow-up validated on real hardware.
+          APP_BUNDLE="$PWD/dmg-staging/AIExpediteTerminal.app"
+          if [ -d "${APP_BUNDLE}" ]; then
+            xcrun stapler staple "${APP_BUNDLE}" || echo "[${ARCH}] app staple skipped"
+            xcrun stapler validate "${APP_BUNDLE}" || true
+          fi
+
           cp "${DMG}" "dist/$(basename "${DMG}")"
 
       - name: Upload final prod darwin DMG
@@ -765,7 +781,7 @@ jobs:
 
             ### Installation
             **Windows:** Download and run the installer (or standalone exe). If SmartScreen appears, click "More info" then "Run anyway".
-            **macOS:** Open the .dmg file and drag to Applications. If blocked, go to System Preferences → Security & Privacy → "Open Anyway".
+            **macOS:** Open the .dmg file and drag AI Expedite to ~/Applications (your user Applications folder). If blocked, go to System Preferences → Security & Privacy → "Open Anyway".
             **Linux:** Download the .AppImage, run `chmod +x` on it, then execute.
             Click "Register Device" in the system tray to connect to your AI Expedite account.
 
@@ -830,7 +846,7 @@ jobs:
 
             ### Installation
             **Windows:** Download and run the installer (or standalone exe). If SmartScreen appears, click "More info" then "Run anyway".
-            **macOS:** Open the .dmg file and drag to Applications. If blocked, go to System Preferences → Security & Privacy → "Open Anyway".
+            **macOS:** Open the .dmg file and drag AI Expedite to ~/Applications (your user Applications folder). If blocked, go to System Preferences → Security & Privacy → "Open Anyway".
             **Linux:** Download the .AppImage, run `chmod +x` on it, then execute.
             Click "Register Device" in the system tray to connect to your AI Expedite account.
 

@@ -652,6 +652,17 @@ jobs:
           echo "[${ARCH}] Stapling ${DMG}"
           xcrun stapler staple "${DMG}"
           xcrun stapler validate "${DMG}"
+
+          # Staple the .app bundle too, so the silent auto-updater's replaced
+          # bundle passes Gatekeeper on first launch offline. See the matching
+          # note in release-prod.yml about notarize-app-first for the DMG-embedded
+          # copy (validated on real macOS hardware).
+          APP_BUNDLE="$PWD/dmg-staging/AIExpediteTerminal.app"
+          if [ -d "${APP_BUNDLE}" ]; then
+            xcrun stapler staple "${APP_BUNDLE}" || echo "[${ARCH}] app staple skipped"
+            xcrun stapler validate "${APP_BUNDLE}" || true
+          fi
+
           cp "${DMG}" "dist/$(basename "${DMG}")"
 
       - name: Upload final beta darwin DMG

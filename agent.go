@@ -33,23 +33,20 @@ import (
 var Version = "v0.10.30"
 
 var (
-	ttydCmd       *exec.Cmd // ttyd process (killed on exit)
-	shutdownChan  = make(chan struct{})
-	offlineChan   = make(chan bool, 1) // Send true to go offline, false to come online
-	isOffline     bool                 // Current offline state
-	offlineMutex  sync.RWMutex
-	updatePath    string
-	updatePending bool
-	updateMutex   sync.RWMutex
-
-	// Pending update state (when user clicks "Later")
-	pendingUpdateInfo  *UpdateInfo
-	pendingUpdateMutex sync.RWMutex
+	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
+	shutdownChan = make(chan struct{})
+	offlineChan  = make(chan bool, 1) // Send true to go offline, false to come online
+	isOffline    bool                 // Current offline state
+	offlineMutex sync.RWMutex
 
 	// Systray ready state - prevents calling systray functions before initialization
 	systrayReady      bool
 	systrayReadyMutex sync.RWMutex
 )
+
+// NOTE: the update-state accessors (updatePath / updatePending /
+// pendingUpdateInfo and their Set/Get/Has/Clear helpers) live in autoupdate.go,
+// next to the scheduler and attempt state machine that own them.
 
 // SetSystrayReady marks the systray as initialized and safe to use
 func SetSystrayReady() {
@@ -120,49 +117,6 @@ func IsOffline() bool {
 	offlineMutex.RLock()
 	defer offlineMutex.RUnlock()
 	return isOffline
-}
-
-// SetPendingUpdate stores update info for later installation (user clicked "Later")
-func SetPendingUpdate(info *UpdateInfo) {
-	pendingUpdateMutex.Lock()
-	pendingUpdateInfo = info
-	pendingUpdateMutex.Unlock()
-}
-
-// GetPendingUpdate returns pending update info or nil if none
-func GetPendingUpdate() *UpdateInfo {
-	pendingUpdateMutex.RLock()
-	defer pendingUpdateMutex.RUnlock()
-	return pendingUpdateInfo
-}
-
-// HasPendingUpdate returns true if an update is waiting to be installed
-func HasPendingUpdate() bool {
-	return GetPendingUpdate() != nil
-}
-
-// ClearPendingUpdate removes the pending update info
-func ClearPendingUpdate() {
-	pendingUpdateMutex.Lock()
-	pendingUpdateInfo = nil
-	pendingUpdateMutex.Unlock()
-}
-
-// SetUpdateReady stores the path of the downloaded update binary and marks the
-// update as pending.  Called from the auto-update goroutine before systray.Quit().
-func SetUpdateReady(path string) {
-	updateMutex.Lock()
-	updatePath = path
-	updatePending = true
-	updateMutex.Unlock()
-}
-
-// GetUpdateReady returns the pending update path and whether an update is ready.
-// Safe to call from any goroutine.
-func GetUpdateReady() (path string, pending bool) {
-	updateMutex.RLock()
-	defer updateMutex.RUnlock()
-	return updatePath, updatePending
 }
 
 /*──────────────────────────────  StartAgent  ──────────────────────────────*/
@@ -322,6 +276,41 @@ func StartAgent(cfg *Config) {
 	go globalAntigravityNativeManager.CleanupStale(antigravityNativeMaxAge)
 	fmt.Println("[aiexpedite] Antigravity native manager ready")
 
+	/* 3b5. Register in-flight work sources for the update-drain accounting -- */
+	// ActiveWork() must see every accepted session before an automatic update
+	// may install. Register one contributor per manager now that they exist so
+	// a drain waits for interactive sessions to finish (drain.go).
+	registerDrainWorkSource(func() int {
+		if globalSessionManager != nil {
+			return globalSessionManager.ActiveSessionCount()
+		}
+		return 0
+	})
+	registerDrainWorkSource(func() int {
+		if globalCodexAppServerManager != nil {
+			return globalCodexAppServerManager.ActiveCount()
+		}
+		return 0
+	})
+	registerDrainWorkSource(func() int {
+		if globalGrokACPManager != nil {
+			return globalGrokACPManager.ActiveCount()
+		}
+		return 0
+	})
+	registerDrainWorkSource(func() int {
+		if globalClaudeNativeManager != nil {
+			return globalClaudeNativeManager.ActiveCount()
+		}
+		return 0
+	})
+	registerDrainWorkSource(func() int {
+		if globalAntigravityNativeManager != nil {
+			return globalAntigravityNativeManager.ActiveCount()
+		}
+		return 0
+	})
+
 	/* 3c. Begin gathering machine info for /auth/token uploads ------------ */
 	// Runs in a background goroutine so we don't block startup. The first
 	// gather typically completes within a few seconds, comfortably before
@@ -329,6 +318,14 @@ func StartAgent(cfg *Config) {
 	// auth.go's getOIDCToken sees a nil cache and sends the request without
 	// the new fields — terminal-service handles the absence gracefully.
 	StartMachineInfoGathering()
+
+	/* 3d. Resolve any interrupted auto-update attempt BEFORE accepting work */
+	// If a previous run crashed mid-drain (or restarted after installing), the
+	// crash-recovery marker is reconciled here: reopen admission and either
+	// report ready on the new version or abandon the attempt and become
+	// routable. This must happen before the Pub/Sub loop can accept work so the
+	// agent never comes back believing it is still draining. See autoupdate.go.
+	resolveInterruptedAttempt(cfg)
 
 	/* 4. Start Pub/Sub loop (non‑blocking) -------------------------------- */
 

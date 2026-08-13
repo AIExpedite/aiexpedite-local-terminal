@@ -74,6 +74,20 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// races with a ping that arrived microseconds earlier.
 	time.Sleep(50 * time.Millisecond)
 
+	// Step 1b: If an automatic update was draining when we started shutting
+	// down (e.g. a manual "Update Now" superseded it, or the user quit
+	// mid-drain), report the drain as superseded/finished so the service clears
+	// the draining marker rather than leaving it to expire. The device then
+	// follows the ordinary offline path below. Best-effort — an undeliverable
+	// report never blocks teardown, and drain expiry resolves it either way.
+	if cfg != nil && cfg.IsRegistered() && !cfg.OfflineMode && isDraining() {
+		exitCtx, exitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := notifyDrainExit(exitCtx, cfg, drainingAttempt(), "superseded"); err != nil {
+			fmt.Printf("%s[shutdown] notifyDrainExit(superseded) failed: %v%s\n", colorYellow, err, colorReset)
+		}
+		exitCancel()
+	}
+
 	// Step 2: Notify the backend synchronously. We want this to complete
 	// before we kill the sub-processes that the connection relies on.
 	if cfg != nil && cfg.AgentID != "" && cfg.CommandSecret != "" {

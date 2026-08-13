@@ -1347,6 +1347,37 @@ func runPubSubConnection(cfg *Config) error {
 		}
 		// ─────────────────────────────────────────────────────────────────
 
+		// ─── Update-Drain Admission Gate ─────────────────────────────────
+		// While an automatic update is draining this device, refuse NEW work
+		// starts (one-shot execute + every *_start session family) but keep
+		// delivering continuation / operational traffic so accepted sessions
+		// can finish. This is the single admission boundary — see drain.go.
+		// For accepted work starts, releaseWork counts the work for exactly
+		// this callback's lifetime so ActiveWork() holds the drain open until
+		// the one-shot completes (or the session is handed to its manager).
+		admitted, releaseWork := admitWork(cmd)
+		if !admitted {
+			fmt.Printf("%s[pubsub] Draining for update — refusing new work start %q (type=%q, id=%s)%s\n",
+				colorYellow, cmd.Command, cmd.Type, cmd.ID, colorReset)
+			res := makeRejectionResult(
+				cmd,
+				cfg.AgentID,
+				"draining",
+				"AGENT_DRAINING",
+				"Device is finishing current work before updating; new work is temporarily unavailable. Please retry.",
+			)
+			if err := publishMsg(ctx, topic, res); err != nil {
+				m.Nack()
+			} else {
+				m.Ack()
+			}
+			return
+		}
+		if releaseWork != nil {
+			defer releaseWork()
+		}
+		// ─────────────────────────────────────────────────────────────────
+
 		if cmd.Command == "__cli_usage_refresh__" {
 			// Demand-driven CLI usage refresh from the backend's
 			// Active/Idle state machine (see terminal-service's
@@ -1421,8 +1452,12 @@ func runPubSubConnection(cfg *Config) error {
 				timeoutSec = 60
 			}
 
-			// Show approval dialog
+			// Show approval dialog. Bracket it as active work so an automatic
+			// update never restarts the process while the user is still
+			// reading the dialog (drain.go).
+			trackApprovalStart()
 			result := commandApprovalDialogFn(cmd.Command, cmd.Args, timeoutSec)
+			trackApprovalEnd()
 
 			// Resolve the allow-on-timeout policy — deliberately NOT honored for
 			// destructive Environment Setup steps (see applyTimeoutPolicy).
@@ -5568,7 +5603,11 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 	if timeoutSec <= 0 {
 		timeoutSec = 60
 	}
+	// Bracket the open dialog as active work so a pending automatic update
+	// waits for the user's answer rather than restarting under the dialog.
+	trackApprovalStart()
 	result := commandApprovalDialogFn(allowCommand, dialogArgs, timeoutSec)
+	trackApprovalEnd()
 	// Deny/timeout honours the allow-on-timeout convenience ONLY for
 	// non-high-risk steps — destructive/external_write never auto-approve on an
 	// unattended dialog (see applyTimeoutPolicy).

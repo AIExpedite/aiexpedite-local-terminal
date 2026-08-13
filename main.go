@@ -46,20 +46,17 @@ func main() {
 			return
 		}
 	}
-	// Windows-only: elevated UAC copy helper used during auto-update.
-	if runtime.GOOS == "windows" && len(os.Args) > 1 {
-		if os.Args[1] == "--elevated-copy" {
-			handleElevatedCopy()
-			return
-		}
-	}
+	// NOTE: the Windows --elevated-copy UAC helper was removed with the move to
+	// a per-user install (%LOCALAPPDATA%) — routine updates no longer need
+	// elevation, and keeping the helper would let a regression silently
+	// re-introduce a UAC prompt on the automatic path.
 
 	// Mirror stdout/stderr to a size-bounded rotating log file so the agent's
 	// diagnostics (codex app-server teardown reasons, stale cleanup, etc.)
 	// survive after the fact — the agent runs as a tray app with no persisted
 	// console. Placed AFTER the fast early-return arg handlers above
-	// (statusline-hook / --version / --uninstall / --elevated-copy) so those
-	// keep a clean, untouched stdout. Fail-open + disk-bounded (see logtee.go).
+	// (statusline-hook / --version / --uninstall) so those keep a clean,
+	// untouched stdout. Fail-open + disk-bounded (see logtee.go).
 	defer setupLogTee()()
 
 	// Handle --update-from=<original_path> argument (self-replacement after update)
@@ -123,6 +120,17 @@ func main() {
 
 	// Store config for use in onTrayExit shutdown handler
 	shutdownConfig = cfg
+
+	// First run of the migration-capable build from a machine-wide (Windows
+	// Program Files / macOS /Applications) location relocates the install to a
+	// per-user, elevation-free location and hands over to the copy. Prompt-free;
+	// a no-op on an already-per-user install, on Linux, and on unsupported
+	// locations. If it relocated and launched the copy, exit this process so
+	// only one agent runs per account. Done before the tray starts so the user
+	// never sees two icons. See relocate_*.go.
+	if relocated := maybeRelocateInstall(cfg); relocated {
+		os.Exit(0)
+	}
 
 	// Initialize command allow list for security
 	if cfg.EnableAllowList {
@@ -264,11 +272,29 @@ func onTrayReady(cfg *Config) func() {
 			cfg.IsAllowAllCommands())
 		systray.AddSeparator()
 
+		// "Automatically update" sits directly above "Check for Updates" and is
+		// checked by default (default-on preference). On a macOS build without
+		// silent-replacement capability the label/tooltip truthfully read
+		// "Automatically check for updates". These two items must stay adjacent,
+		// so the conditional status items below go AFTER "Install Update".
+		autoLabel, autoTooltip := autoUpdateTrayLabel()
+		mAutoUpdate := systray.AddMenuItemCheckbox(autoLabel, autoTooltip, cfg.IsAutoUpdate())
+
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
 
 		// Install Update menu item - initially hidden, shown when update is pending
 		mInstallUpdate := systray.AddMenuItem("", "")
 		mInstallUpdate.Hide()
+
+		// Passive, non-interactive status items for the automatic path. Mutually
+		// exclusive and hidden unless active, so "Automatically update" and
+		// "Check for Updates" stay adjacent. Both are disabled (status only).
+		mDraining := systray.AddMenuItem("Updating after current work", "Finishing current work before updating")
+		mDraining.Disable()
+		mDraining.Hide()
+		mUpdateBlocked := systray.AddMenuItem("Automatic update unavailable", "This installation cannot update itself")
+		mUpdateBlocked.Disable()
+		mUpdateBlocked.Hide()
 
 		// Version display (disabled, just for info)
 		mVersion := systray.AddMenuItem("Version "+Version, "Current version")
@@ -315,56 +341,29 @@ func onTrayReady(cfg *Config) func() {
 			}()
 		}
 
-		// Proactive update check (if AutoUpdate enabled)
-		if cfg.AutoUpdate {
-			go func() {
-				time.Sleep(3 * time.Second) // Let UI stabilize first
-
-				info, err := checkForNewVersion()
-				if err != nil {
-					fmt.Println("[update] Check failed:", err)
-					return
+		// Silent, job-aware automatic update. Replaces the old one-shot 3-second
+		// proactive dialog: the scheduler checks ~5 min after launch then every
+		// 6 hours, and (when the preference is on) drains and installs silently.
+		// The tray handles below let it reflect draining / blocked / pending-
+		// install status without importing systray specifics into autoupdate.go.
+		trayHandles := &trayUpdateHandles{
+			showDraining: func() { mDraining.Show() },
+			hideDraining: func() { mDraining.Hide() },
+			showBlocked: func(reason string) {
+				if reason != "" {
+					mUpdateBlocked.SetTitle(reason)
 				}
-
-				if !info.Available {
-					fmt.Println("[update] No update available")
-					return
-				}
-
-				// Skip if user previously chose to skip this version
-				if info.LatestVersion == cfg.SkippedVersion {
-					fmt.Printf("[update] Skipping version %s (user preference)\n", info.LatestVersion)
-					return
-				}
-
-				fmt.Printf("[update] New version available: %s → %s\n", info.CurrentVersion, info.LatestVersion)
-
-				// Show update dialog to user
-				choice := ShowUpdateDialog(info.CurrentVersion, info.LatestVersion)
-
-				switch choice {
-				case UpdateNow:
-					fmt.Println("[update] User chose: Update Now")
-					if err := downloadAndApplyUpdate(info); err != nil {
-						fmt.Println("[update] Download failed:", err)
-						ShowErrorDialog("Update Failed", err.Error())
-					}
-
-				case UpdateLater:
-					fmt.Println("[update] User chose: Later")
-					SetPendingUpdate(info)
-					// Show the Install Update menu item
-					mInstallUpdate.SetTitle(fmt.Sprintf("Install Update (%s)", info.LatestVersion))
-					mInstallUpdate.SetTooltip("Click to install the pending update")
-					mInstallUpdate.Show()
-
-				case SkipVersion:
-					fmt.Printf("[update] User chose: Skip version %s\n", info.LatestVersion)
-					cfg.SkippedVersion = info.LatestVersion
-					_ = cfg.Save(ConfigPath())
-				}
-			}()
+				mUpdateBlocked.Show()
+			},
+			hideBlocked: func() { mUpdateBlocked.Hide() },
+			showPendingInstall: func(version string) {
+				SetPendingUpdate(&UpdateInfo{Available: true, LatestVersion: version})
+				mInstallUpdate.SetTitle(fmt.Sprintf("Install Update (%s)", version))
+				mInstallUpdate.SetTooltip("Click to install the pending update")
+				mInstallUpdate.Show()
+			},
 		}
+		StartAutoUpdateScheduler(cfg, trayHandles)
 
 		// Create debug click channel - nil channel blocks forever in select, which is what we want for prod
 		var debugClickCh <-chan struct{}
@@ -438,6 +437,35 @@ func onTrayReady(cfg *Config) func() {
 						mAllowAll.Check()
 						LogSecurityEvent(SecEvtAllowAllEnabled,
 							"Allow All Commands enabled by user — allow list bypassed")
+					}
+
+				case <-mAutoUpdate.ClickedCh:
+					// Toggle the "Automatically update" preference. Save-then-
+					// publish ordering mirrors mAllowAll: persist first, then
+					// mirror to the runtime atomic and update the checkbox, so a
+					// failed write leaves the effective behaviour consistent with
+					// the last successfully-persisted state. No confirmation dialog.
+					newVal := !mAutoUpdate.Checked()
+					prev := cfg.AutoUpdate
+					cfg.SetAutoUpdate(newVal)
+					if err := cfg.Save(ConfigPath()); err != nil {
+						// Roll back to the last persisted value on write failure.
+						if prev != nil {
+							cfg.SetAutoUpdate(*prev)
+						}
+						fmt.Printf("[autoupdate] Failed to save preference: %v\n", err)
+						ShowErrorDialog("Automatically Update",
+							fmt.Sprintf("Could not save the auto-update preference:\n\n%v", err))
+						continue
+					}
+					if newVal {
+						mAutoUpdate.Check()
+						// Enabling schedules a check without an app restart.
+						if globalAutoUpdater != nil {
+							globalAutoUpdater.nudge()
+						}
+					} else {
+						mAutoUpdate.Uncheck()
 					}
 
 				case <-mResetAllowList.ClickedCh:
@@ -724,38 +752,6 @@ func closeShutdownChanOnce() {
 
 // aggressiveCleanup is defined in cleanup_windows.go / cleanup_other.go
 
-/* ---------- elevated copy (auto-update UAC) ---------- */
-
-// handleElevatedCopy performs a file copy with elevated privileges and exits.
-// Invoked via: --elevated-copy --copy-from="<src>" --copy-to="<dst>"
-// This runs as a minimal elevated process (no UI, no systray) spawned by
-// requestElevatedCopy when the app cannot write to its install directory.
-func handleElevatedCopy() {
-	var copyFrom, copyTo string
-	for _, arg := range os.Args[2:] {
-		if strings.HasPrefix(arg, "--copy-from=") {
-			copyFrom = strings.TrimPrefix(arg, "--copy-from=")
-		}
-		if strings.HasPrefix(arg, "--copy-to=") {
-			copyTo = strings.TrimPrefix(arg, "--copy-to=")
-		}
-	}
-	if copyFrom == "" || copyTo == "" {
-		fmt.Println("[elevated-copy] Missing --copy-from or --copy-to")
-		os.Exit(1)
-	}
-	if err := validateUpdateTarget(copyTo); err != nil {
-		fmt.Printf("[elevated-copy] Validation failed: %v\n", err)
-		os.Exit(2)
-	}
-	if err := copyFile(copyFrom, copyTo); err != nil {
-		fmt.Printf("[elevated-copy] Copy failed: %v\n", err)
-		os.Exit(3)
-	}
-	fmt.Printf("[elevated-copy] Successfully copied %s -> %s\n", copyFrom, copyTo)
-	os.Exit(0)
-}
-
 /* ---------- self-replace (auto-update) ---------- */
 
 // validateUpdateTarget checks that the target path for self-replacement is safe.
@@ -774,12 +770,15 @@ func validateUpdateTarget(target string) error {
 
 	// Block known protected directories (use trailing separator to avoid
 	// false positives like "c:\windowsapps").
-	// NOTE: c:\program files\ is intentionally NOT blocked — Inno Setup
-	// installs the app there by default ({autopf}), so auto-update must
-	// be able to self-replace the exe at its install location.
+	// NOTE: Program Files is now BLOCKED. With the move to a per-user install
+	// (%LOCALAPPDATA%), a self-replace target under Program Files would require
+	// the elevation the silent-update feature exists to eliminate — an install
+	// still there must relocate first, so reject it rather than prompt.
 	blockedPrefixes := []string{
 		`c:\windows\`,
 		`c:\programdata\`,
+		`c:\program files\`,
+		`c:\program files (x86)\`,
 	}
 	for _, prefix := range blockedPrefixes {
 		if strings.HasPrefix(lower, prefix) {
@@ -864,10 +863,10 @@ func performSelfReplace(originalPath string) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if copyErr != nil {
-		fmt.Printf("[update] Direct copy failed (%v), attempting elevated copy...\n", copyErr)
-		if elevErr := requestElevatedCopy(myPath, originalPath); elevErr != nil {
-			return fmt.Errorf("failed to overwrite %s (direct: %v, elevated: %v)", originalPath, copyErr, elevErr)
-		}
+		// With a per-user install there is no elevated fallback: the target is
+		// writable by definition, so a persistent copy failure is a real error
+		// (locked file, disk full) rather than a permissions problem to escalate.
+		return fmt.Errorf("failed to overwrite %s: %w", originalPath, copyErr)
 	}
 
 	fmt.Printf("[update] Successfully replaced %s\n", originalPath)

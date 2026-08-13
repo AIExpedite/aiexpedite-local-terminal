@@ -27,8 +27,26 @@ type Config struct {
 	CAFile   string `json:"ca_file,omitempty"`
 
 	/* ─── Local ttyd ────────────────────────────────── */
-	LocalTtydPort int  `json:"local_ttyd_port,omitempty"` // 0 = 7681
-	AutoUpdate    bool `json:"auto_update,omitempty"`
+	LocalTtydPort int `json:"local_ttyd_port,omitempty"` // 0 = 7681
+
+	// AutoUpdate is the "Automatically update" tray preference. It is a
+	// *bool (not a plain bool) tagged WITHOUT omitempty so the value is
+	// always written explicitly from this version onward — that is the only
+	// way to distinguish "legacy config that predates this feature" (field
+	// absent → JSON null after unmarshal → nil pointer) from a user who
+	// deliberately turned auto-update off (explicit false). The old plain
+	// `bool` + `omitempty` collapsed those two cases, so a legacy hand-edited
+	// `auto_update: false` cannot be recovered; every legacy config is
+	// therefore treated as enabled (see LoadConfig). Once this version writes
+	// the field, a later "unset" can only mean a replaced/rolled-back file.
+	//
+	// Runtime reads on the Pub/Sub / auto-update goroutines MUST go through
+	// IsAutoUpdate() — the tray goroutine writes the toggle while other
+	// goroutines read it, so a direct pointer deref there is a data race.
+	// autoUpdateRuntime below is the synchronised mirror kept in lockstep by
+	// LoadConfig and SetAutoUpdate, mirroring the AllowAllCommands pattern.
+	AutoUpdate        *bool       `json:"auto_update"`
+	autoUpdateRuntime atomic.Bool // synchronised mirror of *AutoUpdate
 
 	/* ─── File Upload (GCS) ─────────────────────────── */
 	StorageBucket    string `json:"storage_bucket,omitempty"`     // Firebase bucket name
@@ -68,6 +86,17 @@ type Config struct {
 
 	/* ─── Update Preferences ───────────────────────── */
 	SkippedVersion string `json:"skipped_version,omitempty"` // Version user chose to skip (won't prompt again)
+
+	/* ─── Auto-update attempt bookkeeping (crash recovery) ─── */
+	// When the automatic path is about to install, it records the in-flight
+	// attempt id + target version here and Save()s, so a restart (successful
+	// or crashed) can reconcile: if the running Version now equals the target
+	// the update landed (report ready on the new version + attempt id);
+	// otherwise the attempt was interrupted mid-drain and is abandoned so the
+	// agent never comes back believing it is still draining. Cleared once
+	// resolved. See resolveInterruptedAttempt in autoupdate.go.
+	PendingUpdateAttemptID string `json:"pending_update_attempt_id,omitempty"`
+	PendingUpdateVersion   string `json:"pending_update_version,omitempty"`
 
 	/* ─── Performance Tuning ─────────────────────────── */
 	MaxOutstandingMessages int `json:"max_outstanding_messages,omitempty"` // Parallel message processing (default: 5)
@@ -185,6 +214,24 @@ func LoadConfig(path string) (*Config, error) {
 	// first Pub/Sub Receive callback (which reads via IsAllowAllCommands)
 	// sees the same value the user toggled in a previous session.
 	cfg.allowAllRuntime.Store(cfg.AllowAllCommands)
+
+	// Auto-update preference: a nil pointer means the field was absent — a
+	// config written by a version that predates this feature. We cannot tell
+	// a legacy hand-edited opt-out apart from absence (the old format omitted
+	// the field when false), so absence is treated as ENABLED, matching the
+	// default-on product decision. Rewrite the file so the value becomes
+	// explicit from now on; a best-effort failure here is harmless (the
+	// runtime mirror below still reflects the intended value, and the next
+	// successful Save persists it).
+	if cfg.AutoUpdate == nil {
+		enabled := true
+		cfg.AutoUpdate = &enabled
+		if err := cfg.Save(path); err != nil {
+			// Non-fatal: the in-memory value is authoritative for this run.
+			_ = err
+		}
+	}
+	cfg.autoUpdateRuntime.Store(*cfg.AutoUpdate)
 	return cfg, nil
 }
 
@@ -228,6 +275,28 @@ func (cfg *Config) SetAllowAllCommands(v bool) {
 	cfg.allowAllRuntime.Store(v)
 }
 
+// IsAutoUpdate returns the live "Automatically update" preference using an
+// atomic load. The auto-update scheduler and any goroutine other than the
+// tray writer MUST call this rather than dereferencing cfg.AutoUpdate
+// directly — the tray-menu goroutine writes the toggle, so an unsynchronised
+// read from a different goroutine is a data race (go test -race).
+func (cfg *Config) IsAutoUpdate() bool {
+	return cfg.autoUpdateRuntime.Load()
+}
+
+// SetAutoUpdate publishes a new auto-update value to concurrent readers AND
+// keeps the persisted pointer in sync so the next Save() writes the right
+// thing. Call from the tray goroutine AFTER a successful cfg.Save() so disk
+// and in-memory state stay consistent on a failing write — mirroring
+// SetAllowAllCommands.
+func (cfg *Config) SetAutoUpdate(v bool) {
+	if cfg.AutoUpdate == nil {
+		cfg.AutoUpdate = new(bool)
+	}
+	*cfg.AutoUpdate = v
+	cfg.autoUpdateRuntime.Store(v)
+}
+
 func (cfg *Config) Save(path string) error {
 	b, err := json.MarshalIndent(cfg, "", "    ")
 	if err != nil {
@@ -248,13 +317,17 @@ func DefaultConfig() *Config {
 	// Get user home directory for default working directory
 	homeDir, _ := os.UserHomeDir()
 
-	return &Config{
+	// "Automatically update" defaults ON. Uses a local so the *bool field holds
+	// an explicit value (a fresh install writes the preference explicitly).
+	autoUpdateDefault := true
+
+	cfg := &Config{
 		ProjectID:            "", // MUST be filled by the user for Pub/Sub mode
 		CommandsSubscription: "terminal-commands-sub",
 		ResultsTopic:         "terminal-results",
 
 		LocalTtydPort: 7681,
-		AutoUpdate:    false, // Disabled by default (can be enabled in config file)
+		AutoUpdate:    &autoUpdateDefault, // "Automatically update" is enabled by default
 
 		// File upload defaults
 		StorageBucket:    "aix-core-dev-app-s1e4.firebasestorage.app",
@@ -281,6 +354,11 @@ func DefaultConfig() *Config {
 		// Offline mode defaults to false (connected to cloud)
 		OfflineMode: false,
 	}
+	// Keep the runtime mirror in lockstep with the default preference so a
+	// DefaultConfig() used without a subsequent LoadConfig (fresh install,
+	// tests) still reports auto-update enabled via IsAutoUpdate().
+	cfg.autoUpdateRuntime.Store(cfg.AutoUpdate != nil && *cfg.AutoUpdate)
+	return cfg
 }
 
 // Validate makes sure *one* transport (Pub/Sub or relay) is configured.
