@@ -42,9 +42,12 @@ func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
 	// the no-telemetry (Unknown) fallback deterministically.
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	home := t.TempDir()
+	// The plan lives INSIDE claudeAiOauth — Claude Code writes no top-level
+	// `plan` key. The email stays top-level because the fingerprint assertion
+	// below requires the credential to carry an account of its own.
 	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
-		"email": "ada@example.com",
-		"plan":  "max",
+		"email":         "ada@example.com",
+		"claudeAiOauth": map[string]any{"subscriptionType": "max"},
 	})
 
 	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
@@ -66,12 +69,20 @@ func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
 	if usage.AccountFingerprint == "" {
 		t.Errorf("expected fingerprint for known account")
 	}
-	if len(usage.Metrics) != 2 {
-		t.Fatalf("expected 2 metrics, got %d", len(usage.Metrics))
+	// Three rows, always: the card layout stays stable whether or not the
+	// windows have been observed. This test isolates itself to an empty
+	// rate-limit cache, so it is the direct guard on the Fable row being
+	// emitted unconditionally rather than only when a bucket exists.
+	wantLabels := []string{"5-hour session window", "Weekly quota", "Weekly Fable"}
+	if len(usage.Metrics) != len(wantLabels) {
+		t.Fatalf("expected %d metrics, got %d", len(wantLabels), len(usage.Metrics))
 	}
-	for _, m := range usage.Metrics {
+	for i, m := range usage.Metrics {
+		if m.Label != wantLabels[i] {
+			t.Errorf("metric[%d].Label=%q, want %q", i, m.Label, wantLabels[i])
+		}
 		if !m.Unknown {
-			t.Errorf("metric %q should be Unknown (no observable counter)", m.Kind)
+			t.Errorf("metric %q should be Unknown (no observable counter)", m.Label)
 		}
 	}
 }
@@ -394,7 +405,6 @@ func TestClaudeCodeUsageParser_ApiKeyNoOAuthNoNotice(t *testing.T) {
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
 		"email": "ada@example.com",
-		"plan":  "max",
 	})
 
 	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
@@ -559,8 +569,8 @@ func TestClaudeCodeUsageParser_HonorsClaudeConfigDir(t *testing.T) {
 	configDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
 	helperWriteJSON(t, filepath.Join(configDir, ".credentials.json"), map[string]any{
-		"email": "profile@example.com",
-		"plan":  "team",
+		"email":         "profile@example.com",
+		"claudeAiOauth": map[string]any{"subscriptionType": "team"},
 	})
 
 	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
