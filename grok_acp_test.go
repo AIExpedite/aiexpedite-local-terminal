@@ -329,77 +329,49 @@ func TestGrokACPManager_StartRequiresValidCwd(t *testing.T) {
 	}
 }
 
-// TestGrokACPManager_StartEnforcesWorkspaceRootContainment pins finding #1
-// from the secondary review: a configured WorkspaceRoot must contain the
-// requested cwd after symlink resolution. Without this check a signed
-// grok_acp_start could launch Grok against any local directory the OS user
-// can read/write, defeating the workspace/path-safety stance.
-func TestGrokACPManager_StartEnforcesWorkspaceRootContainment(t *testing.T) {
+// TestGrokACPManager_StartRootsContainmentAtSessionCwd pins the fix for the
+// two-roots defect: Start must NOT compare the requested cwd against the
+// agent's configured WorkingDirectory. The server derives the cwd (repo
+// mapping → owner default → inferred ancestor; terminal-service
+// contributedPaths.util.js) and the device home is not a superset of those,
+// so a device-home jail refused directories the server itself had chosen
+// (prod 2026-08-13: every grok review session against a repo outside the
+// device home died at start). Start still requires absolute+exists, and
+// containment moves to the SESSION level: the resolved start cwd becomes the
+// session's workspace root, which Send pins `session/new`/`session/load`
+// frames to (TestValidateGrokACPSendCwd_RejectsEscapingSessionNew).
+func TestGrokACPManager_StartRootsContainmentAtSessionCwd(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		// Windows symlink semantics + permission requirements would force
 		// elevation on most CI machines. The cross-platform invariant is
 		// covered on unix.
-		t.Skip("symlink + containment semantics covered on unix")
+		t.Skip("symlink + path semantics covered on unix")
 	}
 	m := NewGrokACPManager()
 	publishFn := func(resultMsg) {}
 
-	root := t.TempDir()
-	insideDir := filepath.Join(root, "project")
-	if err := os.Mkdir(insideDir, 0o755); err != nil {
-		t.Fatalf("mkdir inside: %v", err)
-	}
-	outsideRoot := t.TempDir()
-	outsideDir := filepath.Join(outsideRoot, "elsewhere")
-	if err := os.Mkdir(outsideDir, 0o755); err != nil {
-		t.Fatalf("mkdir outside: %v", err)
-	}
-
-	t.Run("inside_root_accepted_then_dup_id", func(t *testing.T) {
-		// We don't have a real `grok` binary on PATH so we expect Start to
-		// either fail at exec time or, more directly, the containment check
-		// to pass — we assert the containment-specific error doesn't fire.
-		err := m.Start("dup-1", insideDir, nil, "ws", "uid", GrokStartOptions{WorkspaceRoot: root}, publishFn)
-		if err != nil && strings.Contains(err.Error(), "outside the configured workspace root") {
-			t.Errorf("containment incorrectly rejected %q inside %q: %v", insideDir, root, err)
+	t.Run("any_existing_absolute_dir_accepted", func(t *testing.T) {
+		// A directory that is inside no "configured" root by construction.
+		// Without a real `grok` binary Start fails at exec time — the
+		// assertion is that no containment rejection fires first.
+		dir := t.TempDir()
+		err := m.Start("root-1", dir, nil, "ws", "uid", GrokStartOptions{}, publishFn)
+		if err != nil && strings.Contains(err.Error(), "outside the") {
+			t.Errorf("Start must not jail cwd %q against a device-level root: %v", dir, err)
 		}
 	})
 
-	t.Run("outside_root_rejected", func(t *testing.T) {
-		err := m.Start("dup-2", outsideDir, nil, "ws", "uid", GrokStartOptions{WorkspaceRoot: root}, publishFn)
-		if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
-			t.Fatalf("expected `outside the configured workspace root` error; got %v", err)
-		}
-	})
-
-	t.Run("symlink_escape_rejected", func(t *testing.T) {
-		// Symlink inside root pointing at a sibling root → EvalSymlinks
-		// must resolve through it and reject. This is the canonical
-		// "appears inside, actually escapes" attack.
-		escape := filepath.Join(root, "escape")
-		if err := os.Symlink(outsideDir, escape); err != nil {
+	t.Run("symlinked_cwd_resolves_not_rejected", func(t *testing.T) {
+		// A start THROUGH a symlink resolves to the target before becoming
+		// the session root — resolution, not rejection.
+		target := t.TempDir()
+		link := filepath.Join(t.TempDir(), "link")
+		if err := os.Symlink(target, link); err != nil {
 			t.Skipf("symlink not supported in tempdir: %v", err)
 		}
-		err := m.Start("dup-3", escape, nil, "ws", "uid", GrokStartOptions{WorkspaceRoot: root}, publishFn)
-		if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
-			t.Fatalf("expected symlink-resolved escape to be rejected; got %v", err)
-		}
-	})
-
-	t.Run("filesystem_root_rejected", func(t *testing.T) {
-		err := m.Start("dup-4", "/", nil, "ws", "uid", GrokStartOptions{WorkspaceRoot: root}, publishFn)
-		if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
-			t.Fatalf("expected `/` to be rejected when WorkspaceRoot is a tempdir; got %v", err)
-		}
-	})
-
-	t.Run("empty_root_skips_containment", func(t *testing.T) {
-		// Backwards-compat path: when no root is configured the existing
-		// absolute/exists contract still applies but no containment check.
-		// outsideDir should NOT trigger containment-rejection here.
-		err := m.Start("dup-5", outsideDir, nil, "ws", "uid", GrokStartOptions{}, publishFn)
-		if err != nil && strings.Contains(err.Error(), "outside the configured workspace root") {
-			t.Errorf("containment fired without WorkspaceRoot set; got %v", err)
+		err := m.Start("root-2", link, nil, "ws", "uid", GrokStartOptions{}, publishFn)
+		if err != nil && strings.Contains(err.Error(), "outside the") {
+			t.Errorf("symlinked start cwd must resolve, not be containment-rejected: %v", err)
 		}
 	})
 }
@@ -1274,7 +1246,7 @@ func TestValidateGrokACPSendCwd_RejectsEscapingSessionNew(t *testing.T) {
 			name:      "session_new_outside_root_rejected",
 			frame:     fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}`, outside),
 			wantErr:   true,
-			errSubstr: "outside the configured workspace root",
+			errSubstr: "outside the session's workspace root",
 		},
 		{
 			name:      "session_new_relative_cwd_rejected",
@@ -1305,7 +1277,7 @@ func TestValidateGrokACPSendCwd_RejectsEscapingSessionNew(t *testing.T) {
 			name:      "session_load_outside_root_rejected",
 			frame:     fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"cwd":%q,"sessionId":"sess-1"}}`, outside),
 			wantErr:   true,
-			errSubstr: "outside the configured workspace root",
+			errSubstr: "outside the session's workspace root",
 		},
 		{
 			name:      "session_load_relative_cwd_rejected",
@@ -1367,7 +1339,7 @@ func TestValidateGrokACPSendCwd_SymlinkEscapeRejected(t *testing.T) {
 			}
 			frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%q,"params":{"cwd":%q,"sessionId":"sess-1"}}`, method, escape)
 			err = validateGrokACPSendCwd(frame, resolvedRoot)
-			if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
+			if err == nil || !strings.Contains(err.Error(), "outside the session's workspace root") {
 				t.Fatalf("symlink-resolved escape must be rejected for %s; got %v", method, err)
 			}
 		})
@@ -1400,7 +1372,7 @@ func TestValidateGrokACPSendCwd_SymlinkEscapeWithMissingSuffixRejected(t *testin
 	target := filepath.Join(escape, "new")
 	frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}`, target)
 	err = validateGrokACPSendCwd(frame, resolvedRoot)
-	if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
+	if err == nil || !strings.Contains(err.Error(), "outside the session's workspace root") {
 		t.Fatalf("symlink-escape with missing suffix must be rejected; got %v", err)
 	}
 }
@@ -1460,7 +1432,7 @@ func TestValidateGrokACPSendCwd_SymlinkParentDotDotEscapeRejected(t *testing.T) 
 	target := link + string(filepath.Separator) + ".." + string(filepath.Separator) + "new"
 	frame := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":%q}}`, target)
 	err = validateGrokACPSendCwd(frame, resolvedRoot)
-	if err == nil || !strings.Contains(err.Error(), "outside the configured workspace root") {
+	if err == nil || !strings.Contains(err.Error(), "outside the session's workspace root") {
 		t.Fatalf("link/.. escape must be rejected; got %v", err)
 	}
 }

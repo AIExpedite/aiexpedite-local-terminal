@@ -6071,14 +6071,9 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			})
 		}
 
-		antigravityWorkspaceRoot := ""
-		if cfg != nil {
-			antigravityWorkspaceRoot = cfg.WorkingDirectory
-		}
 		err := globalAntigravityNativeManager.Start(
 			cmd.SessionID,
 			cmd.Cwd,
-			antigravityWorkspaceRoot,
 			cmd.WorkspaceID,
 			cmd.UID,
 			publishFn,
@@ -6229,9 +6224,9 @@ func isGrokACPCommand(cmdType string) bool {
 // with the manager so it can stream JSON-RPC frames (responses, session/update
 // notifications, server-initiated approval requests) back via Pub/Sub for the
 // duration of the session. cfg drives per-session policy: API-key fallback
-// gate (Config.EnableGrokAPIKeyFallback), always-approve gate
-// (Config.EnableGrokAlwaysApprove), and workspace-root containment
-// (Config.WorkingDirectory).
+// gate (Config.EnableGrokAPIKeyFallback) and always-approve gate
+// (Config.EnableGrokAlwaysApprove). Session cwd containment is rooted at the
+// start cwd itself (see GrokACPManager.Start), not at Config.WorkingDirectory.
 func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
 	if globalGrokACPManager == nil {
 		publishGrokACPError(ctx, topic, cmd, "grok acp manager not initialized")
@@ -6254,9 +6249,6 @@ func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			TimeoutMs:           cmd.TimeoutMs,
 			AllowAPIKeyFallback: cfg != nil && cfg.EnableGrokAPIKeyFallback,
 			AllowAlwaysApprove:  cfg != nil && cfg.EnableGrokAlwaysApprove,
-		}
-		if cfg != nil {
-			opts.WorkspaceRoot = cfg.WorkingDirectory
 		}
 
 		err := globalGrokACPManager.Start(

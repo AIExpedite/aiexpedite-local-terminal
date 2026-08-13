@@ -474,7 +474,7 @@ func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 	// when we set them independently (no real agy needed).
 	m := NewAntigravityNativeManager()
 	cwd := t.TempDir()
-	if err := m.Start("sess-a", cwd, "", "ws", "uid", nil, nil); err != nil {
+	if err := m.Start("sess-a", cwd, "ws", "uid", nil, nil); err != nil {
 		// probeAntigravityNativeCapability may fail if agy missing — skip.
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not runnable") ||
 			strings.Contains(err.Error(), "below minimum") || strings.Contains(err.Error(), "unsupported") {
@@ -482,7 +482,7 @@ func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 		}
 		t.Fatalf("start a: %v", err)
 	}
-	if err := m.Start("sess-b", cwd, "", "ws", "uid", nil, nil); err != nil {
+	if err := m.Start("sess-b", cwd, "ws", "uid", nil, nil); err != nil {
 		t.Fatalf("start b: %v", err)
 	}
 	sa, sb := m.Get("sess-a"), m.Get("sess-b")
@@ -501,38 +501,41 @@ func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 	}
 }
 
-// TestAntigravityNativeManager_StartRejectsCwdOutsideWorkspaceRoot proves the
-// workspace-root containment gate: a signed antigravity_native_start whose cwd
-// escapes the configured working directory is rejected before any session is
-// registered or `agy` is spawned, so a later --dangerously-skip-permissions
-// turn cannot run outside the containment root. Mirrors the Grok ACP gate.
-func TestAntigravityNativeManager_StartRejectsCwdOutsideWorkspaceRoot(t *testing.T) {
+// TestAntigravityNativeManager_StartRootsContainmentAtSessionCwd pins the fix
+// for the two-roots defect: Start must NOT compare the requested cwd against
+// the agent's configured WorkingDirectory. The server derives the cwd (repo
+// mapping → owner default → inferred ancestor) and the device home is not a
+// superset of those, so a device-home jail refused directories the server
+// itself had chosen (prod 2026-08-13). Instead, the resolved start cwd
+// BECOMES the session's workspace root, which every later turn re-resolves
+// against (TestAntigravityContainedCwd_RevalidatesSymlinkSwap).
+func TestAntigravityNativeManager_StartRootsContainmentAtSessionCwd(t *testing.T) {
 	m := NewAntigravityNativeManager()
-	root := t.TempDir()
-	outside := t.TempDir() // a sibling temp dir, not inside root
+	anywhere := t.TempDir() // not inside any "configured" root by construction
 
-	err := m.Start("sess-escape", outside, root, "ws", "uid", nil, nil)
-	if err == nil {
-		t.Fatal("expected Start to reject a cwd outside the workspace root")
-	}
-	if !strings.Contains(err.Error(), "outside the configured workspace root") {
-		t.Fatalf("unexpected error (want containment rejection): %v", err)
-	}
-	if m.Get("sess-escape") != nil {
-		t.Fatal("rejected start must not register a session")
+	err := m.Start("sess-anywhere", anywhere, "ws", "uid", nil, nil)
+	if err != nil {
+		// Cwd resolution runs BEFORE the agy capability probe, so a
+		// containment-style rejection here is a real regression; a probe
+		// failure just means agy isn't installed on this machine.
+		if strings.Contains(err.Error(), "outside the") {
+			t.Fatalf("Start must not jail the cwd against a device-level root: %v", err)
+		}
+		t.Skipf("agy not available for registration test: %v", err)
 	}
 
-	// A cwd inside the root passes the containment gate. If agy is unavailable
-	// the probe (which runs after the gate) is what fails — assert we got past
-	// containment either way.
-	inside := filepath.Join(root, "sub")
-	if err := os.MkdirAll(inside, 0o755); err != nil {
-		t.Fatalf("mkdir inside: %v", err)
+	sess := m.Get("sess-anywhere")
+	if sess == nil {
+		t.Fatal("started session missing from manager")
 	}
-	err = m.Start("sess-inside", inside, root, "ws", "uid", nil, nil)
-	if err != nil && strings.Contains(err.Error(), "outside the configured workspace root") {
-		t.Fatalf("cwd inside root must pass containment; got %v", err)
+	resolved, rErr := antigravityContainedCwd(anywhere, "")
+	if rErr != nil {
+		t.Fatalf("resolve start cwd: %v", rErr)
 	}
+	if sess.WorkspaceRoot != resolved {
+		t.Fatalf("session workspace root = %q, want the resolved start cwd %q", sess.WorkspaceRoot, resolved)
+	}
+	_ = m.End("sess-anywhere")
 }
 
 // TestAntigravityContainedCwd_RevalidatesSymlinkSwap proves the per-turn
@@ -573,7 +576,7 @@ func TestAntigravityContainedCwd_RevalidatesSymlinkSwap(t *testing.T) {
 	}
 	if _, err := antigravityContainedCwd(cwd, root); err == nil {
 		t.Fatal("expected revalidation to reject a cwd swapped to a symlink outside the root")
-	} else if !strings.Contains(err.Error(), "outside the configured workspace root") {
+	} else if !strings.Contains(err.Error(), "outside the session's workspace root") {
 		t.Fatalf("unexpected error (want containment rejection): %v", err)
 	}
 
@@ -882,7 +885,7 @@ func TestAntigravityNativeManager_StartIsIdempotent(t *testing.T) {
 	var acks int
 	onStarted := func() { acks++ }
 
-	if err := m.Start("sess-idem", cwd, "", "ws", "uid", nil, onStarted); err != nil {
+	if err := m.Start("sess-idem", cwd, "ws", "uid", nil, onStarted); err != nil {
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not runnable") ||
 			strings.Contains(err.Error(), "below minimum") || strings.Contains(err.Error(), "unsupported") {
 			t.Skipf("agy not available for capability probe: %v", err)
@@ -896,7 +899,7 @@ func TestAntigravityNativeManager_StartIsIdempotent(t *testing.T) {
 		t.Fatal("session missing after first start")
 	}
 
-	if err := m.Start("sess-idem", cwd, "", "ws", "uid", nil, onStarted); err != nil {
+	if err := m.Start("sess-idem", cwd, "ws", "uid", nil, onStarted); err != nil {
 		t.Fatalf("duplicate start must be idempotent nil, got %v", err)
 	}
 	if acks != 2 {
@@ -1020,7 +1023,7 @@ func TestAntigravityNativeManager_StartIdempotentSkipsCapabilityProbe(t *testing
 	})
 
 	var acks int
-	if err := m.Start(id, cwd, "", "ws", "uid", nil, func() { acks++ }); err != nil {
+	if err := m.Start(id, cwd, "ws", "uid", nil, func() { acks++ }); err != nil {
 		t.Fatalf("existing session must re-ack without capability probe: %v", err)
 	}
 	if acks != 1 {

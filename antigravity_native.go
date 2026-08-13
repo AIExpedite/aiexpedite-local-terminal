@@ -80,10 +80,15 @@ type AntigravityNativeSession struct {
 	ID                   string
 	NativeConversationID string
 	Cwd                  string
-	// WorkspaceRoot is the agent's configured working directory captured at
-	// Start. Retained so each turn can re-verify Cwd containment right before
-	// launch (closing the start→send symlink-swap TOCTOU); empty means the
-	// dispatcher configured no root and the containment check is skipped.
+	// WorkspaceRoot is the session's own symlink-resolved start cwd. Retained
+	// so each turn can re-verify Cwd right before launch (closing the
+	// start→send symlink-swap TOCTOU: a Cwd component swapped for a symlink
+	// after Start resolves somewhere else and no longer lands inside this
+	// root). It is deliberately NOT the agent's configured WorkingDirectory —
+	// comparing the server-derived cwd against that unrelated root refused
+	// every repo checked out outside the device home (two sources of truth;
+	// same defect class as terminal-service §8.5). Always set on a started
+	// session; empty only in synthetic test fixtures, which skips the check.
 	WorkspaceRoot string
 	WorkspaceID   string
 	UID           string
@@ -207,7 +212,7 @@ func (m *AntigravityNativeManager) cwdCaptureLock(cwd string) *sync.Mutex {
 // cloud never sends antigravity_native_end (idle expiry / dropped end command).
 // onStarted is invoked after the session is registered so callers can publish
 // antigravity_native_started before any later frames.
-func (m *AntigravityNativeManager) Start(id, cwd, workspaceRoot string, workspaceID, uid string, publishFn PublishFunc, onStarted func()) error {
+func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -223,21 +228,23 @@ func (m *AntigravityNativeManager) Start(id, cwd, workspaceRoot string, workspac
 		return fmt.Errorf("cwd %q is not a directory", cwd)
 	}
 
-	// Workspace-root containment: a bad/stale signed antigravity_native_start
-	// could otherwise carry a cwd outside the agent's configured working
-	// directory, and the later Send would run `agy --dangerously-skip-permissions`
-	// from that path — sidestepping the working-directory scope this native path's
-	// threat model claims. Resolve symlinks on both sides and reject escapes,
-	// exactly as the Grok ACP Start path does. When the dispatcher configures no
-	// root (workspaceRoot == "") the check is skipped, preserving the plain
-	// absolute/exists contract for callers with out-of-band containment.
-	// The same check is repeated per turn in the Send path (see antigravityContainedCwd)
-	// because no CLI process launches until a later Send, leaving a TOCTOU window
-	// in which the cwd subdirectory could be swapped for a symlink escaping the root.
-	if workspaceRoot != "" {
-		if _, err := antigravityContainedCwd(cwd, workspaceRoot); err != nil {
-			return err
-		}
+	// Resolve the start cwd through symlinks; the resolved value becomes the
+	// session's OWN workspace root. Each later Send re-resolves Cwd against
+	// it (see antigravityContainedCwd) because no CLI process launches until
+	// a turn arrives, leaving a TOCTOU window in which a cwd component could
+	// be swapped for a symlink — the swap resolves elsewhere and no longer
+	// lands inside the root captured here.
+	//
+	// This deliberately replaces the earlier check against the agent's
+	// configured WorkingDirectory: that root and the server's cwd derivation
+	// (repo mapping → owner default → inferred ancestor) are two sources of
+	// truth, and every repo checked out outside the device home was refused
+	// at start — a directory the server itself had chosen. The same signed
+	// command channel runs claude/codex/exec anywhere with no such jail, so
+	// the device-home comparison defended nothing.
+	resolvedCwd, err := antigravityContainedCwd(cwd, "")
+	if err != nil {
+		return err
 	}
 
 	// Idempotent redelivery first: if the session is already registered, re-ack
@@ -267,7 +274,7 @@ func (m *AntigravityNativeManager) Start(id, cwd, workspaceRoot string, workspac
 	session := &AntigravityNativeSession{
 		ID:            id,
 		Cwd:           cwd,
-		WorkspaceRoot: workspaceRoot,
+		WorkspaceRoot: resolvedCwd,
 		WorkspaceID:   workspaceID,
 		UID:           uid,
 		StartedAt:     time.Now(),
@@ -603,10 +610,12 @@ func killAntigravityProcessTree(cmd *exec.Cmd) {
 // antigravityContainedCwd resolves symlinks on cwd and, when workspaceRoot is
 // set, verifies the resolved cwd stays inside the resolved root, returning the
 // real (symlink-free) cwd to use as the process working directory. Called from
-// Start and again per turn (in the Send path, just before launch) so a cwd
-// subdirectory that is swapped for a symlink escaping the root between
-// antigravity_native_start and antigravity_native_send cannot run
-// `agy --dangerously-skip-permissions` outside the approved workspace.
+// Start with an empty root (resolve-only — the result BECOMES the session's
+// root) and again per turn (in the Send path, just before launch) against
+// that captured root, so a cwd component that is swapped for a symlink
+// between antigravity_native_start and antigravity_native_send resolves
+// elsewhere and cannot run `agy --dangerously-skip-permissions` outside the
+// directory the session was started in.
 func antigravityContainedCwd(cwd, workspaceRoot string) (string, error) {
 	resolvedCwd, err := filepath.EvalSymlinks(cwd)
 	if err != nil {
@@ -620,7 +629,7 @@ func antigravityContainedCwd(cwd, workspaceRoot string) (string, error) {
 		return "", fmt.Errorf("workspace root %q symlink resolution failed: %w", workspaceRoot, err)
 	}
 	if !pathInsideRoot(resolvedCwd, resolvedRoot) {
-		return "", fmt.Errorf("cwd %q is outside the configured workspace root %q", resolvedCwd, resolvedRoot)
+		return "", fmt.Errorf("cwd %q is outside the session's workspace root %q (the directory the session was started in)", resolvedCwd, resolvedRoot)
 	}
 	return resolvedCwd, nil
 }
