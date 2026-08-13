@@ -262,13 +262,23 @@ the existing per-workspace approval gate and answer with
 
 ## Workspace containment
 
-[`GrokACPManager.Start`](grok_acp.go) accepts a `GrokStartOptions.WorkspaceRoot`
-the dispatcher sources from `Config.WorkingDirectory`. When non-empty,
-Start resolves symlinks on BOTH the requested cwd and the root, then
-rejects any cwd that escapes the root — defends against signed
-`grok_acp_start` payloads targeting arbitrary directories the OS user
-happens to read/write, including symlink-escape paths under a workspace
-that point to a sibling.
+Containment is **session-rooted**: [`GrokACPManager.Start`](grok_acp.go)
+resolves symlinks on the requested cwd and stores the resolved path as the
+session's own workspace root. Later `session/new` / `session/load` frames —
+whose `params.cwd` originates in the orchestrator's LLM tool loop and is
+model-suppliable — must resolve inside that root (`validateGrokACPSendCwd`),
+so a session cannot be re-pointed outside the directory the start named,
+including via symlink-escape paths under the workspace.
+
+Start itself accepts any absolute, existing directory. It deliberately does
+NOT compare the cwd against `Config.WorkingDirectory`: the server derives the
+start cwd from its repo mappings (terminal-service `contributedPaths.util.js`),
+and the device home is not a superset of those — the earlier device-home jail
+refused directories the server itself had chosen (every repo checked out
+outside the device home), while defending against nothing the same signed
+command channel didn't already allow via claude/codex/exec. The antigravity
+manager applies the same session-rooted model, re-resolving the cwd each turn
+against the root captured at start (TOCTOU symlink-swap protection).
 
 ## Per-session timeout
 

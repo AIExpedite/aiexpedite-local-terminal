@@ -164,11 +164,16 @@ type GrokACPSession struct {
 	WorkspaceID string
 	UID         string
 	TimeoutMs   int64 // 0 = no per-session timeout (rely on grokACPMaxLifetime stale GC)
-	// WorkspaceRoot is the symlink-resolved containment root captured at Start
-	// (empty when the dispatcher didn't configure one). Send uses it to
-	// re-enforce containment on later JSON-RPC session-setup frames
-	// (`session/new` and `session/load`) whose `params.cwd` would otherwise
-	// bypass the gate Start applied to the process-level cwd.
+	// WorkspaceRoot is the session's own symlink-resolved start cwd. Send uses
+	// it to pin later JSON-RPC session-setup frames (`session/new` and
+	// `session/load`) whose `params.cwd` could otherwise re-point the session
+	// anywhere: those frames originate in the orchestrator's LLM tool loop,
+	// which accepts a model-supplied cwd, so "the session runs where the start
+	// said" is the invariant this field enforces. It is deliberately NOT the
+	// agent's configured WorkingDirectory — comparing a server-derived cwd
+	// against that unrelated root is the two-sources-of-truth drift that
+	// refused every repo checked out outside the device home (the same defect
+	// class as terminal-service §8.5). Always set on a started session.
 	WorkspaceRoot string
 	// IsolatedHome is the per-session temp dir Start points the child's
 	// GROK_HOME at (a copy of the real auth file + a minimal clean
@@ -225,13 +230,6 @@ type GrokStartOptions struct {
 	// `grok_acp_start` can flip via extra args. Sourced from
 	// Config.EnableGrokAlwaysApprove.
 	AllowAlwaysApprove bool
-
-	// WorkspaceRoot, when non-empty, is treated as a containment root: the
-	// requested cwd must resolve (after EvalSymlinks) to a path strictly
-	// inside this root. When empty, no containment check runs — but Start
-	// still requires cwd to be absolute and exist. Sourced from
-	// Config.WorkingDirectory at the dispatcher.
-	WorkspaceRoot string
 }
 
 // Status returns the current lifecycle status under the session mutex so
@@ -320,28 +318,30 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return fmt.Errorf("cwd %q is not a directory", cwd)
 	}
 
-	// Workspace-root containment (finding #1 from secondary review):
-	// resolve symlinks on both sides and reject anything that escapes the
-	// configured root. Without this, a signed grok_acp_start could launch
-	// Grok against any directory the OS user can read/write, sidestepping
-	// the workspace/path safety stance the rest of the agent enforces. When
-	// the dispatcher does not configure a root (opts.WorkspaceRoot == "")
-	// we skip the check — preserving the existing absolute/exists contract
-	// for callers that have their own out-of-band containment.
+	// Resolve the start cwd through symlinks; the resolved value becomes the
+	// session's OWN workspace root, which the Send path uses to pin later
+	// `session/new`/`session/load` frames (model-supplied `params.cwd`) to
+	// the directory this session was started in.
+	//
+	// This deliberately replaces the earlier check against the agent's
+	// configured WorkingDirectory (secondary-review finding #1). That check
+	// compared a cwd the SERVER derived (repo mapping → owner default →
+	// inferred ancestor; see terminal-service contributedPaths.util.js)
+	// against a root only the DEVICE knows — two sources of truth that were
+	// guaranteed to disagree for any repo checked out outside the device
+	// home, refusing directories the server itself had chosen (observed in
+	// prod 2026-08-13: every grok review session against C:\aiexpedite died
+	// at start on a device whose home is C:\Users\dkupi). It also defended
+	// against nothing: the same signed command channel starts claude/codex
+	// sessions and plain exec commands in arbitrary directories with no such
+	// jail, so a hostile publisher never needed grok to escape. What IS worth
+	// enforcing on this device is "the session stays where the start said" —
+	// hence the session-rooted gate in Send.
 	resolvedCwd, err := filepath.EvalSymlinks(cwd)
 	if err != nil {
 		return fmt.Errorf("cwd %q symlink resolution failed: %w", cwd, err)
 	}
-	var resolvedRoot string
-	if opts.WorkspaceRoot != "" {
-		resolvedRoot, err = filepath.EvalSymlinks(opts.WorkspaceRoot)
-		if err != nil {
-			return fmt.Errorf("workspace root %q symlink resolution failed: %w", opts.WorkspaceRoot, err)
-		}
-		if !pathInsideRoot(resolvedCwd, resolvedRoot) {
-			return fmt.Errorf("cwd %q is outside the configured workspace root %q", resolvedCwd, resolvedRoot)
-		}
-	}
+	resolvedRoot := resolvedCwd
 
 	// Hold the manager mutex across the entire spawn so two concurrent Start
 	// calls for the same id can't both pass the existence check and double-
@@ -606,15 +606,16 @@ func (m *GrokACPManager) Send(id string, payload string) error {
 		return fmt.Errorf("payload must be a single JSON-RPC object; batch arrays and scalar frames are not supported on ACP stdio")
 	}
 
-	// Re-enforce workspace containment on ACP session-setup frames
-	// (`session/new` and `session/load`). Start already gated the
-	// process-level cwd, but both setup verbs can carry their own
-	// `params.cwd` that Grok will use as the session root — without this
-	// check a later signed grok_acp_send (including one that resumes a
-	// prior session) could point Grok at a path outside the configured
-	// workspace and bypass the original Start gate. Skipped when the
-	// session was launched without a containment root (mirrors Start's
-	// behaviour) or when the frame omits `params.cwd`.
+	// Pin ACP session-setup frames (`session/new` and `session/load`) to the
+	// directory the session was started in. Both setup verbs can carry their
+	// own `params.cwd` that Grok will use as the session root, and that value
+	// originates in the orchestrator's LLM tool loop (model-suppliable) — so
+	// without this check a later signed grok_acp_send (including one that
+	// resumes a prior session) could re-point Grok at any local path and
+	// bypass the server's cwd derivation entirely. The root is the session's
+	// own symlink-resolved start cwd (always set on a started session; the
+	// empty-guard covers only synthetic test fixtures). Frames that omit
+	// `params.cwd` pass through.
 	if session.WorkspaceRoot != "" {
 		if err := validateGrokACPSendCwd(trimmed, session.WorkspaceRoot); err != nil {
 			return err
@@ -2053,9 +2054,9 @@ func redactGrokACPArgsForLog(args []string) []string {
 
 // validateGrokACPSendCwd inspects a JSON-RPC frame and, if it is an ACP
 // session-setup request (`session/new` or `session/load`), requires its
-// `params.cwd` to resolve inside root. Mirrors the containment check Start
-// applies to the process-level cwd so the in-protocol session cwd cannot
-// escape it.
+// `params.cwd` to resolve inside root — the session's own symlink-resolved
+// start cwd — so the in-protocol session cwd cannot re-point the session
+// outside the directory the start named.
 //
 // Both methods are covered because ACP exposes `session/load` as the
 // session-setup alternative to `session/new` for resumed sessions, and Grok
@@ -2091,7 +2092,7 @@ func validateGrokACPSendCwd(frame, resolvedRoot string) error {
 		return fmt.Errorf("%s params.cwd %q could not be safely resolved: %w", probe.Method, cwd, err)
 	}
 	if !pathInsideRoot(resolved, resolvedRoot) {
-		return fmt.Errorf("%s params.cwd %q is outside the configured workspace root %q", probe.Method, resolved, resolvedRoot)
+		return fmt.Errorf("%s params.cwd %q is outside the session's workspace root %q (the directory the session was started in)", probe.Method, resolved, resolvedRoot)
 	}
 	return nil
 }
