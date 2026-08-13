@@ -313,6 +313,50 @@ func TestClaudeCodeMetricsFromCache_LiveFableVariantBeatsExpiredCanonical(t *tes
 	}
 }
 
+// Canonical precedence is only a TIE-BREAK among live candidates. A rename can
+// leave the old canonical bucket with a still-future reset (live) while newer
+// telemetry flows to the variant; canonical-first alone would then pin the row
+// to the stale canonical percentage until the retained bucket finally rolls over.
+// The freshest live observation must win.
+func TestClaudeCodeMetricsFromCache_FreshestLiveFableVariantBeatsLiveCanonical(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	live := now.Add(120 * time.Hour)
+	seedClaudeRateLimitCache(t, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDayFable: {
+			UsedPercentage: 88, ResetsAtMs: live.UnixMilli(),
+			ObservedAtMs: now.Add(-72 * time.Hour).UnixMilli(), usageKnown: true,
+		},
+		"weekly_fable": {
+			UsedPercentage: 31, ResetsAtMs: live.UnixMilli(),
+			ObservedAtMs: now.UnixMilli(), usageKnown: true,
+		},
+	}, now, "")
+
+	fable := claudeCodeMetricsFromCache(now, "")[2]
+	if fable.Unknown || fable.Consumed == nil || *fable.Consumed != 31 {
+		t.Fatalf("fable row=%+v, want the freshest live variant's 31%% (not the stale live canonical bucket)", fable)
+	}
+	if want := observedAtRFC3339(now.UnixMilli()); fable.ObservedAt != want {
+		t.Errorf("fable ObservedAt=%q, want %q (freshest live bucket)", fable.ObservedAt, want)
+	}
+	// Determinism guard: freshness ranking must still produce a byte-stable payload
+	// so terminal-service's hash-based delta-skip does not churn writes.
+	firstJSON, err := json.Marshal(claudeCodeMetricsFromCache(now, ""))
+	if err != nil {
+		t.Fatalf("marshal metrics: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		nextJSON, err := json.Marshal(claudeCodeMetricsFromCache(now, ""))
+		if err != nil {
+			t.Fatalf("marshal metrics: %v", err)
+		}
+		if string(nextJSON) != string(firstJSON) {
+			t.Fatalf("metrics differ across calls:\n%s\n%s", firstJSON, nextJSON)
+		}
+	}
+}
+
 // When every candidate has rolled over the row is still unobservable, and the
 // ObservedAt comes from the first bucket in candidate order so the payload
 // terminal-service hashes for its delta-skip stays stable across polls.

@@ -639,16 +639,17 @@ func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliA
 // The tolerant tail exists because the canonical key is an extrapolation from
 // the keys Claude Code is known to emit — a rename or a suffixed variant
 // upstream would otherwise silently drop the row from every shipped agent.
-// Order is load-bearing twice over: canonical-first keeps a real
-// `seven_day_fable` bucket winning over a variant (plain sorting would not —
-// `fable_weekly` sorts ahead of it), and sorting the tail makes the choice
-// deterministic where Go map iteration is not. This is a preference among LIVE
-// buckets only — observedMetricOrUnknown skips rolled-over candidates first, so
-// a stale canonical bucket left behind by a rename cannot mask a live variant.
-// Non-determinism would not just
-// be untidy: terminal-service delta-skips writes by hashing the marshalled
-// payload, so a row flipping between two fable-ish buckets across polls would
-// churn a Firestore write plus a 7-day history document each time.
+// Order is load-bearing twice over: it is observedMetricOrUnknown's TIE-BREAK
+// among equally-fresh live buckets (canonical-first, so a real `seven_day_fable`
+// wins over a same-timestamp variant — plain sorting would not, `fable_weekly`
+// sorts ahead of it), and sorting the tail makes that tie-break deterministic
+// where Go map iteration is not. Precedence is only a tie-break: observedMetric-
+// OrUnknown skips rolled-over candidates first and then prefers the freshest live
+// observation, so neither a stale nor a rolled-over canonical bucket left behind
+// by a rename can mask a live variant. Non-determinism would not just be untidy:
+// terminal-service delta-skips writes by hashing the marshalled payload, so a row
+// flipping between two fable-ish buckets across polls would churn a Firestore
+// write plus a 7-day history document each time.
 //
 // five_hour* keys are excluded: Claude already splits the weekly window
 // per-model, so a symmetric `five_hour_fable` is plausible, and surfacing a
@@ -769,6 +770,14 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 // fresh variant telemetry kept arriving. A rolled-over bucket is still the
 // answer when NO candidate is live, and the first such bucket in candidate order
 // supplies the ObservedAt so the result stays deterministic.
+//
+// Among LIVE candidates the freshest observation wins, not merely the first in
+// candidate order: a rename can leave the old canonical bucket with a still-future
+// reset (live) while newer telemetry flows to the variant, and canonical-first
+// would then pin the row to the stale percentage until the retained bucket finally
+// rolls over. Ranking by ObservedAtMs lets the actively-updated bucket win; equal
+// timestamps fall back to candidate order (canonical-first), so the result stays
+// deterministic for terminal-service's payload-hash delta-skip.
 func observedMetricOrUnknown(
 	buckets map[string]claudeRateLimitBucket,
 	windowIDs []string,
@@ -776,19 +785,27 @@ func observedMetricOrUnknown(
 	now time.Time,
 ) cliAgentUsageMetric {
 	rolledOver := ""
+	freshestLive := ""
 	for _, id := range windowIDs {
 		b, ok := buckets[id]
 		if !ok {
 			continue
 		}
+		if b.ResetsAtMs > 0 && now.UnixMilli() >= b.ResetsAtMs {
+			if rolledOver == "" {
+				rolledOver = id
+			}
+			continue
+		}
+		// Strictly-greater keeps the earlier (canonical-first) candidate on a tie.
+		if freshestLive == "" || b.ObservedAtMs > buckets[freshestLive].ObservedAtMs {
+			freshestLive = id
+		}
+	}
+	if freshestLive != "" {
+		b := buckets[freshestLive]
 		var resetAt string
 		if b.ResetsAtMs > 0 {
-			if now.UnixMilli() >= b.ResetsAtMs {
-				if rolledOver == "" {
-					rolledOver = id
-				}
-				continue
-			}
 			resetAt = time.UnixMilli(b.ResetsAtMs).UTC().Format(time.RFC3339)
 		}
 		used := clampPercent(b.UsedPercentage)
