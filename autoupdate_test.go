@@ -194,6 +194,28 @@ func TestRunAttempt_RegisteredReportsDrainThenInstalls(t *testing.T) {
 	}
 }
 
+func TestDrainAndInstall_AbortsWhenAttemptMarkerCannotBePersisted(t *testing.T) {
+	cfg := registeredCfg()
+	r := newAutoTestRig(t, cfg)
+	r.activeWork = 0
+	r.au.savePath = filepath.Join(t.TempDir(), "missing", "config.json")
+
+	r.au.runAttempt()
+
+	if r.drainEnter != 0 || r.applyCalls != 0 {
+		t.Fatalf("persistence failure must abort before service drain or apply (enter=%d apply=%d)", r.drainEnter, r.applyCalls)
+	}
+	if isDraining() {
+		t.Fatal("persistence failure must reopen admission")
+	}
+	if cfg.PendingUpdateAttemptID != "" || cfg.PendingUpdateVersion != "" {
+		t.Fatal("failed persistence must restore the previous in-memory marker")
+	}
+	if r.hideDraining == 0 {
+		t.Fatal("persistence failure must clear the draining tray state")
+	}
+}
+
 func TestDrainAndInstall_ConfirmsBeforeHeartbeatStalenessWindow(t *testing.T) {
 	r := newAutoTestRig(t, registeredCfg())
 	r.activeWork = 1

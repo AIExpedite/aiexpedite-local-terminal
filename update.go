@@ -395,7 +395,10 @@ func installUpdatable() (bool, string) {
 		if ok, reason := darwinLocationSupported(exe); !ok {
 			return false, reason
 		}
-		// ~/Applications and /Applications (pre-relocation) are supported.
+		// ~/Applications and a writable /Applications (pre-relocation) are
+		// supported. darwinLocationSupported probes the bundle parent so a
+		// failed relocation does not trigger a download and drain that cannot
+		// replace the machine-wide bundle.
 		return true, ""
 	}
 
@@ -452,12 +455,16 @@ func darwinBundlePath(exe string) string {
 // relocation. Unsupported: a mounted DMG, ~/Downloads, or any other read-only
 // / ad-hoc path — those run normally but never self-update and say so.
 func darwinLocationSupported(exe string) (bool, string) {
+	return darwinLocationSupportedWithWritable(exe, dirWritable)
+}
+
+func darwinLocationSupportedWithWritable(exe string, writable func(string) bool) (bool, string) {
 	exe = filepath.ToSlash(exe)
 	bundle := darwinBundlePath(exe)
 	if bundle == "" {
 		// Not a bundled app (e.g. a raw `go run` build); fall back to a plain
 		// writability check on the directory holding the executable.
-		if !dirWritable(filepath.Dir(exe)) {
+		if !writable(filepath.Dir(exe)) {
 			return false, "Automatic update unavailable — this location is read-only; move AI Expedite to ~/Applications"
 		}
 		return true, ""
@@ -476,13 +483,15 @@ func darwinLocationSupported(exe string) (bool, string) {
 	if home != "" {
 		userApps = filepath.ToSlash(filepath.Join(home, "Applications"))
 	}
-	if (userApps != "" && strings.HasPrefix(bundle, userApps)) ||
-		strings.HasPrefix(bundle, "/Applications") {
+	if (userApps != "" && strings.HasPrefix(bundle, userApps)) || strings.HasPrefix(bundle, "/Applications") {
+		if !writable(filepath.Dir(bundle)) {
+			return false, "Automatic update unavailable — this location is read-only; move AI Expedite to ~/Applications"
+		}
 		return true, ""
 	}
 
 	// Any other location must at least be writable to update in place.
-	if !dirWritable(filepath.Dir(bundle)) {
+	if !writable(filepath.Dir(bundle)) {
 		return false, "Automatic update unavailable — this location is read-only; move AI Expedite to ~/Applications"
 	}
 	return true, ""

@@ -117,7 +117,13 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	// runs only after systray exits, causing the new process to lose the lock
 	// race and exit before this process quits too.
 	releaseAgentInstanceForHandoff()
-	if err := exec.Command("open", "-n", currentBundle).Start(); err != nil {
+	if err := relaunchDarwinBundle(currentBundle); err != nil {
+		// The running process remains authoritative on a failed handoff. Restore
+		// its singleton so another launch cannot start a duplicate agent while
+		// this process continues serving work.
+		if release, acquired := acquireAgentInstance(); acquired {
+			trackAgentInstanceRelease(release)
+		}
 		return fmt.Errorf("failed to relaunch %s: %w", currentBundle, err)
 	}
 	// The bundle has already been replaced and relaunched, so tray exit must
@@ -126,6 +132,14 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	// to launch a second updater.
 	SetUpdateHandoff()
 	systray.Quit()
+	return nil
+}
+
+func relaunchDarwinBundle(bundle string) error {
+	out, err := exec.Command("open", "-n", bundle).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("open: %v: %s", err, strings.TrimSpace(string(out)))
+	}
 	return nil
 }
 

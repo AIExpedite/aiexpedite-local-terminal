@@ -507,7 +507,17 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 	closeAdmission(attemptID)
 	au.mu.Unlock()
 	au.tray.draining(true)
-	au.persistAttempt(attemptID, info.LatestVersion)
+	if err := au.persistAttempt(attemptID, info.LatestVersion); err != nil {
+		fmt.Printf("[autoupdate] Could not persist attempt marker; abandoning update: %v\n", err)
+		reopenAdmission()
+		au.tray.draining(false)
+		au.mu.Lock()
+		if au.drainAttempt == attemptID {
+			au.drainAttempt = ""
+		}
+		au.mu.Unlock()
+		return
+	}
 
 	registered := au.cfg.IsRegistered() && !au.cfg.OfflineMode
 	reachedService := false
@@ -708,12 +718,17 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 }
 
 // persistAttempt / clearAttempt maintain the crash-recovery marker.
-func (au *autoUpdater) persistAttempt(attemptID, target string) {
+func (au *autoUpdater) persistAttempt(attemptID, target string) error {
+	previousAttempt := au.cfg.PendingUpdateAttemptID
+	previousVersion := au.cfg.PendingUpdateVersion
 	au.cfg.PendingUpdateAttemptID = attemptID
 	au.cfg.PendingUpdateVersion = target
 	if err := au.cfg.Save(au.savePath); err != nil {
-		fmt.Printf("[autoupdate] Could not persist attempt marker: %v\n", err)
+		au.cfg.PendingUpdateAttemptID = previousAttempt
+		au.cfg.PendingUpdateVersion = previousVersion
+		return err
 	}
+	return nil
 }
 
 func (au *autoUpdater) clearAttempt() {

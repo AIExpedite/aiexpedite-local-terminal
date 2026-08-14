@@ -22,24 +22,43 @@ func TestDarwinBundlePath(t *testing.T) {
 
 func TestDarwinLocationSupported(t *testing.T) {
 	home, _ := os.UserHomeDir()
+	writable := func(string) bool { return true }
 
 	// Mounted DMG — unsupported.
-	if ok, _ := darwinLocationSupported("/Volumes/AI Expedite/AI Expedite.app/Contents/MacOS/aix"); ok {
+	if ok, _ := darwinLocationSupportedWithWritable("/Volumes/AI Expedite/AI Expedite.app/Contents/MacOS/aix", writable); ok {
 		t.Fatal("a mounted DMG must be unsupported")
 	}
 	// ~/Applications — supported.
 	userApp := filepath.Join(home, "Applications", "AI Expedite.app", "Contents", "MacOS", "aix")
-	if ok, _ := darwinLocationSupported(userApp); !ok {
+	if ok, _ := darwinLocationSupportedWithWritable(userApp, writable); !ok {
 		t.Fatal("~/Applications must be supported")
 	}
 	// /Applications — supported (pre-relocation).
-	if ok, _ := darwinLocationSupported("/Applications/AI Expedite.app/Contents/MacOS/aix"); !ok {
+	if ok, _ := darwinLocationSupportedWithWritable("/Applications/AI Expedite.app/Contents/MacOS/aix", writable); !ok {
 		t.Fatal("/Applications must be supported before relocation")
 	}
 	// ~/Downloads — unsupported.
 	dl := filepath.Join(home, "Downloads", "AI Expedite.app", "Contents", "MacOS", "aix")
-	if ok, _ := darwinLocationSupported(dl); ok {
+	if ok, _ := darwinLocationSupportedWithWritable(dl, writable); ok {
 		t.Fatal("~/Downloads must be unsupported")
+	}
+}
+
+func TestDarwinLocationSupportedRequiresWritableApplicationsParent(t *testing.T) {
+	exe := "/Applications/AI Expedite.app/Contents/MacOS/aix"
+	probed := ""
+	ok, reason := darwinLocationSupportedWithWritable(exe, func(dir string) bool {
+		probed = filepath.ToSlash(dir)
+		return false
+	})
+	if ok {
+		t.Fatal("a read-only /Applications install must not silently update")
+	}
+	if probed != "/Applications" {
+		t.Fatalf("writability probe = %q, want /Applications", probed)
+	}
+	if reason == "" {
+		t.Fatal("blocked install must provide a tray reason")
 	}
 }
 
