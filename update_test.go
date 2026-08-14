@@ -76,3 +76,29 @@ func TestAssetSuffixForGOOS(t *testing.T) {
 		}
 	}
 }
+
+func TestDownloadAndApplyUpdateFallbackOpensAssetWithoutDownload(t *testing.T) {
+	prevFlag := silentUpdateCapableFlag
+	prevOpen := openManualUpdateURL
+	silentUpdateCapableFlag = "false"
+	t.Cleanup(func() {
+		silentUpdateCapableFlag = prevFlag
+		openManualUpdateURL = prevOpen
+	})
+	if silentUpdateCapable() {
+		t.Skip("fallback only applies to non-capable macOS builds")
+	}
+
+	const assetURL = "https://example.test/update.dmg"
+	opened := ""
+	openManualUpdateURL = func(url string) error {
+		opened = url
+		return nil
+	}
+	if err := downloadAndApplyUpdate(&UpdateInfo{Available: true, AssetURL: assetURL}); err != nil {
+		t.Fatalf("downloadAndApplyUpdate fallback: %v", err)
+	}
+	if opened != assetURL {
+		t.Fatalf("opened URL = %q, want %q", opened, assetURL)
+	}
+}

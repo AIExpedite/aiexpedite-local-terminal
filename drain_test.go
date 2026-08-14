@@ -17,6 +17,7 @@ func resetDrainState(t *testing.T) {
 	drain.pendingStarts = 0
 	drain.uploads = 0
 	drain.approvals = 0
+	drain.terminalPublishes = 0
 	drain.mu.Unlock()
 	drainWorkSourcesMu.Lock()
 	drainWorkSources = nil
@@ -177,6 +178,22 @@ func TestActiveWork_AggregatesEverySource(t *testing.T) {
 		t.Fatalf("ActiveWork() = %d, want 1 with an open approval dialog", got)
 	}
 	trackApprovalEnd()
+
+	publishStarted := make(chan struct{})
+	publishDone := make(chan struct{})
+	publishTerminalResultAsync(func(resultMsg) {
+		close(publishStarted)
+		<-publishDone
+	}, resultMsg{Type: "session_ended"})
+	<-publishStarted
+	if got := ActiveWork(); got != 1 {
+		t.Fatalf("ActiveWork() = %d, want 1 with a terminal publish in flight", got)
+	}
+	close(publishDone)
+	deadline := time.Now().Add(time.Second)
+	for ActiveWork() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 
 	if got := ActiveWork(); got != 0 {
 		t.Fatalf("ActiveWork() = %d, want 0 after all work ends", got)

@@ -359,21 +359,12 @@ func (au *autoUpdater) tick() {
 // runAttempt performs one full attempt: writability probe, bounded
 // check+download+verify, then drain+install.
 func (au *autoUpdater) runAttempt() {
-	// A read-only / not-yet-relocated install cannot update itself. Say so in
-	// the tray and stop — never retry silently in a loop.
-	if ok, reason := au.installable(); !ok {
-		fmt.Printf("[autoupdate] Install location not updatable: %s\n", reason)
-		au.tray.blocked(true, reason)
-		return
-	}
-	au.tray.blocked(false, "")
-
-	// macOS check-and-offer fallback build: check ONLY — do not download, drain,
-	// or restart. Surface the newer version as a pending "Install Update" the
-	// user installs by choice (which downloads + verifies at click time). We
-	// deliberately skip the download here so a fallback build does not fetch a
-	// full DMG every 6h and leave the verified temp artifact unused.
+	// macOS check-and-offer fallback builds do not replace their bundle, so the
+	// install location is irrelevant: even a copy launched from Downloads or a
+	// mounted DMG can still perform the promised metadata check and offer the
+	// release for user-initiated installation.
 	if !silentUpdateCapable() {
+		au.tray.blocked(false, "")
 		info := au.checkOnlyWithRetry()
 		if info == nil {
 			return
@@ -385,6 +376,15 @@ func (au *autoUpdater) runAttempt() {
 		SetPendingUpdate(info)
 		return
 	}
+
+	// A read-only / not-yet-relocated install cannot update itself. Say so in
+	// the tray and stop — never retry silently in a loop.
+	if ok, reason := au.installable(); !ok {
+		fmt.Printf("[autoupdate] Install location not updatable: %s\n", reason)
+		au.tray.blocked(true, reason)
+		return
+	}
+	au.tray.blocked(false, "")
 
 	info, path := au.checkAndVerifyWithRetry()
 	if info == nil || path == "" {

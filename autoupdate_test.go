@@ -352,6 +352,31 @@ func TestRunAttempt_MacFallbackChecksOnlyNoDownload(t *testing.T) {
 	}
 }
 
+func TestRunAttempt_MacFallbackChecksFromUnsupportedLocation(t *testing.T) {
+	prev := silentUpdateCapableFlag
+	silentUpdateCapableFlag = "false"
+	t.Cleanup(func() { silentUpdateCapableFlag = prev })
+	if silentUpdateCapable() {
+		t.Skip("fallback only applies to non-capable macOS builds")
+	}
+
+	t.Cleanup(ClearPendingUpdate)
+	r := newAutoTestRig(t, registeredCfg())
+	r.installableOK = false
+	r.installableMsg = "unsupported location"
+	r.au.runAttempt()
+
+	if r.checkCalls != 1 {
+		t.Fatalf("fallback checkCalls = %d, want 1 despite unsupported install location", r.checkCalls)
+	}
+	if r.verifyCalls != 0 || r.applyCalls != 0 || isDraining() {
+		t.Fatal("fallback must check and offer without downloading, draining, or installing")
+	}
+	if GetPendingUpdate() == nil {
+		t.Fatal("fallback must offer the update from an unsupported install location")
+	}
+}
+
 func TestCheckAndVerifyWithRetry_ExhaustsAndAbandons(t *testing.T) {
 	r := newAutoTestRig(t, registeredCfg())
 	r.checkErr = errors.New("network down")

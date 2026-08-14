@@ -866,8 +866,10 @@ func (m *AntigravityNativeManager) endStaleSessions(maxAge time.Duration) {
 	m.mu.RUnlock()
 	for _, ss := range stale {
 		fmt.Printf("%s[antigravity-native] Reaping stale session %s%s\n", colorYellow, ss.id, colorReset)
+		trackTerminalPublishStart()
 		_ = m.End(ss.id)
 		if ss.publishFn == nil {
+			trackTerminalPublishEnd()
 			continue
 		}
 		// Publish after End so a successful reaping is mirrored to the cloud.
@@ -885,6 +887,7 @@ func (m *AntigravityNativeManager) endStaleSessions(maxAge time.Duration) {
 			SessionID:   ss.id,
 			ExitCode:    0,
 		})
+		trackTerminalPublishEnd()
 	}
 }
 

@@ -82,6 +82,14 @@ func TestEffectiveUpdateTargetUsesOuterAppImage(t *testing.T) {
 	}
 }
 
+func TestEffectiveUpdateTargetSelectsTemporaryUpdaterAppImage(t *testing.T) {
+	embeddedUpdater := "/tmp/.mount_new/usr/bin/AIExpediteTerminal"
+	temporaryAppImage := filepath.Join(t.TempDir(), "agent_update_123.AppImage")
+	if got := effectiveUpdateTarget(embeddedUpdater, "linux", temporaryAppImage); got != temporaryAppImage {
+		t.Fatalf("self-replace source = %q, want outer updater AppImage %q", got, temporaryAppImage)
+	}
+}
+
 func TestSilentUpdateCapableFlag(t *testing.T) {
 	// Default build is capable; the label reflects that.
 	label, _ := autoUpdateTrayLabel()

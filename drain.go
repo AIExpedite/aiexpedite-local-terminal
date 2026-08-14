@@ -57,8 +57,9 @@ type drainState struct {
 	pendingStarts int
 
 	// uploads / approvals count the two work classes with no manager to ask.
-	uploads   int
-	approvals int
+	uploads           int
+	approvals         int
+	terminalPublishes int
 }
 
 var drain = &drainState{}
@@ -196,6 +197,40 @@ func trackApprovalEnd() {
 	drain.mu.Unlock()
 }
 
+// publishTerminalResultAsync publishes a terminal result without holding a
+// manager session slot, while still keeping the update drain open until the
+// final frame has been handed to Pub/Sub. The counter is incremented before
+// the goroutine starts, so removing the corresponding session cannot expose a
+// false zero to ActiveWork().
+func trackTerminalPublishStart() {
+	drain.mu.Lock()
+	drain.terminalPublishes++
+	drain.mu.Unlock()
+}
+
+func trackTerminalPublishEnd() {
+	drain.mu.Lock()
+	if drain.terminalPublishes > 0 {
+		drain.terminalPublishes--
+	}
+	drain.mu.Unlock()
+}
+
+func publishTerminalResult(publishFn PublishFunc, msg resultMsg) {
+	trackTerminalPublishStart()
+	defer trackTerminalPublishEnd()
+	publishFn(msg)
+}
+
+func publishTerminalResultAsync(publishFn PublishFunc, msg resultMsg) {
+	trackTerminalPublishStart()
+
+	go func() {
+		defer trackTerminalPublishEnd()
+		publishFn(msg)
+	}()
+}
+
 // ActiveWork returns the total number of accepted units of work that have not
 // yet reached a terminal state. A drain may install only when this is zero.
 func ActiveWork() int {
@@ -214,7 +249,7 @@ func ActiveWork() int {
 	}
 	drainWorkSourcesMu.Unlock()
 
-	total += drain.pendingStarts + drain.uploads + drain.approvals
+	total += drain.pendingStarts + drain.uploads + drain.approvals + drain.terminalPublishes
 	return total
 }
 

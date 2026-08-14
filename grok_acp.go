@@ -1090,7 +1090,7 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 
 	seq := atomic.AddInt64(&session.seq, 1)
 
-	go publishFn(resultMsg{
+	publishTerminalResultAsync(publishFn, resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,

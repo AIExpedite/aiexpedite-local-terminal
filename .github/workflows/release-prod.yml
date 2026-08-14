@@ -381,6 +381,28 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --display --verbose=4 "$APP"
 
+      # The updater extracts the .app from the DMG and must be able to launch
+      # it offline after a long drain. Notarize and staple the bundle before
+      # dmgbuild copies it; stapling the already-packaged DMG does not modify
+      # the app inside it.
+      - name: Notarize and staple app bundle before packaging
+        env:
+          APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+          APP_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PWD }}
+        run: |
+          APP="$PWD/dmg-staging/AIExpediteTerminal.app"
+          ZIP="$RUNNER_TEMP/AIExpediteTerminal-${{ matrix.goarch }}.zip"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+          xcrun notarytool submit "$ZIP" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APP_PASSWORD" \
+            --wait
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          rm -f "$ZIP"
+
       - name: Cache pip wheels (dmgbuild)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -583,21 +605,6 @@ jobs:
           echo "[${ARCH}] Stapling ${DMG}"
           xcrun stapler staple "${DMG}"
           xcrun stapler validate "${DMG}"
-
-          # Also staple the ticket to the .app bundle itself. The silent
-          # auto-updater extracts the .app from this DMG and replaces the
-          # installed bundle in place; a stapled bundle is what lets that
-          # replaced copy pass Gatekeeper on first launch offline (the DMG
-          # staple alone does not travel with an extracted app).
-          # NOTE: this staples the staging bundle. For the .app *inside* the
-          # shipped DMG to carry the ticket, the app must be notarized+stapled
-          # before the DMG is packaged (notarize-app-first) — tracked as a
-          # macOS release follow-up validated on real hardware.
-          APP_BUNDLE="$PWD/dmg-staging/AIExpediteTerminal.app"
-          if [ -d "${APP_BUNDLE}" ]; then
-            xcrun stapler staple "${APP_BUNDLE}" || echo "[${ARCH}] app staple skipped"
-            xcrun stapler validate "${APP_BUNDLE}" || true
-          fi
 
           cp "${DMG}" "dist/$(basename "${DMG}")"
 

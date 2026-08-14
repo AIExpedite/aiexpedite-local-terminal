@@ -419,6 +419,28 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --display --verbose=4 "$APP"
 
+      # Beta supports silent bundle replacement, so the app inside its DMG
+      # must itself carry a notarization ticket. dev/stg deliberately use the
+      # browser/manual-install fallback and remain signed but unnotarized.
+      - name: Notarize and staple app bundle before packaging (beta)
+        if: matrix.env == 'beta'
+        env:
+          APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+          APP_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PWD }}
+        run: |
+          APP="$PWD/dmg-staging/AIExpediteTerminal.app"
+          ZIP="$RUNNER_TEMP/AIExpediteTerminal-${{ matrix.env }}-${{ matrix.goarch }}.zip"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+          xcrun notarytool submit "$ZIP" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APP_PASSWORD" \
+            --wait
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          rm -f "$ZIP"
+
       - name: Cache pip wheels (dmgbuild)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -656,16 +678,6 @@ jobs:
           echo "[${ARCH}] Stapling ${DMG}"
           xcrun stapler staple "${DMG}"
           xcrun stapler validate "${DMG}"
-
-          # Staple the .app bundle too, so the silent auto-updater's replaced
-          # bundle passes Gatekeeper on first launch offline. See the matching
-          # note in release-prod.yml about notarize-app-first for the DMG-embedded
-          # copy (validated on real macOS hardware).
-          APP_BUNDLE="$PWD/dmg-staging/AIExpediteTerminal.app"
-          if [ -d "${APP_BUNDLE}" ]; then
-            xcrun stapler staple "${APP_BUNDLE}" || echo "[${ARCH}] app staple skipped"
-            xcrun stapler validate "${APP_BUNDLE}" || true
-          fi
 
           cp "${DMG}" "dist/$(basename "${DMG}")"
 

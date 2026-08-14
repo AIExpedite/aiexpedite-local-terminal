@@ -6068,7 +6068,7 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 		// emit ended so the orchestrator can tear them down.
 		if cmd.Type == "antigravity_native_start" && cmd.SessionID != "" {
 			publishFn := newSessionPublishFn(topic, "[antigravity-native]")
-			publishFn(resultMsg{
+			publishTerminalResult(publishFn, resultMsg{
 				ID:          cmd.ID,
 				WorkspaceID: cmd.WorkspaceID,
 				UID:         cmd.UID,
@@ -6187,6 +6187,11 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 		fmt.Printf("%s[antigravity-native] Ending session %s%s\n",
 			colorYellow, cmd.SessionID, colorReset)
 
+		// Start accounting before End removes the session from its manager, so
+		// ActiveWork cannot observe a zero between local teardown and the final
+		// cloud-owned terminal frame.
+		trackTerminalPublishStart()
+		defer trackTerminalPublishEnd()
 		if err := globalAntigravityNativeManager.End(cmd.SessionID); err != nil {
 			// Still publish ended so the cloud can release reservations even if
 			// the local session was already gone (idempotent teardown).

@@ -57,6 +57,29 @@ func maybeRelocateInstall(_ *Config) bool {
 		fmt.Printf("[relocate] Cannot create %s: %v\n", userApps, err)
 		return false
 	}
+	rel, relErr := filepath.Rel(bundle, exe)
+	newExe := ""
+	if relErr == nil {
+		newExe = filepath.Join(dest, rel)
+	}
+
+	// A previous run may already have relocated and silently updated this
+	// account. Never replace that authoritative per-user bundle with the stale
+	// machine-wide copy when an old Dock shortcut launches /Applications again;
+	// simply re-point startup and hand over to the existing destination.
+	if info, err := os.Stat(dest); err == nil && info.IsDir() {
+		if newExe != "" {
+			if err := writeDarwinLaunchAgentFor(newExe); err != nil {
+				fmt.Printf("[relocate] Could not re-point LaunchAgent (non-fatal): %v\n", err)
+			}
+		}
+		fmt.Printf("[relocate] Per-user bundle already present at %s; handing over\n", dest)
+		if err := exec.Command("open", "-n", dest).Start(); err != nil {
+			fmt.Printf("[relocate] Failed to launch existing per-user copy: %v\n", err)
+			return false
+		}
+		return true
+	}
 
 	// Stage then swap so an interrupted copy never leaves a half-written bundle
 	// at the destination — the legacy /Applications bundle stays launchable.
@@ -76,9 +99,7 @@ func maybeRelocateInstall(_ *Config) bool {
 
 	// Re-point the login LaunchAgent at the relocated binary (its path derives
 	// from the bundle, so relocation must rewrite it).
-	rel, relErr := filepath.Rel(bundle, exe)
-	if relErr == nil {
-		newExe := filepath.Join(dest, rel)
+	if newExe != "" {
 		if err := writeDarwinLaunchAgentFor(newExe); err != nil {
 			fmt.Printf("[relocate] Could not re-point LaunchAgent (non-fatal): %v\n", err)
 		}

@@ -733,7 +733,7 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 
 	seq := atomic.AddInt64(&session.seq, 1)
 
-	go publishFn(resultMsg{
+	publishTerminalResultAsync(publishFn, resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,
