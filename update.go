@@ -442,7 +442,7 @@ func darwinLocationSupported(exe string) (bool, string) {
 	if strings.HasPrefix(lower, "/volumes/") {
 		return false, "Automatic update unavailable — running from a mounted disk image; move AI Expedite to ~/Applications"
 	}
-	if home != "" && strings.HasPrefix(bundle, filepath.Join(home, "Downloads")+string(filepath.Separator)) {
+	if home != "" && strings.HasPrefix(bundle, filepath.ToSlash(filepath.Join(home, "Downloads"))+"/") {
 		return false, "Automatic update unavailable — running from Downloads; move AI Expedite to ~/Applications"
 	}
 
