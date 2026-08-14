@@ -354,7 +354,19 @@ func downloadAndApplyUpdate(info *UpdateInfo) error {
 		return err
 	}
 	fmt.Println("→ Restarting with new version...")
-	return applyVerifiedUpdate(path, info)
+	return applyManualVerifiedUpdate(path, info, applyVerifiedUpdate)
+}
+
+// applyManualVerifiedUpdate transfers a verified artifact to the platform
+// installer. A failed apply leaves the current version running, so ownership
+// remains here and the artifact must be removed immediately rather than
+// waiting for the next process start's temp cleanup.
+func applyManualVerifiedUpdate(path string, info *UpdateInfo, apply func(string, *UpdateInfo) error) error {
+	if err := apply(path, info); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
 }
 
 // installUpdatable reports whether this installation can update itself without

@@ -6,6 +6,8 @@
 package main
 
 import (
+	"errors"
+	"os"
 	"runtime"
 	"testing"
 )
@@ -100,5 +102,30 @@ func TestDownloadAndApplyUpdateFallbackOpensAssetWithoutDownload(t *testing.T) {
 	}
 	if opened != assetURL {
 		t.Fatalf("opened URL = %q, want %q", opened, assetURL)
+	}
+}
+
+func TestApplyManualVerifiedUpdate_RemovesArtifactOnFailure(t *testing.T) {
+	artifact, err := os.CreateTemp(t.TempDir(), "verified-update-*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	path := artifact.Name()
+	if err := artifact.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	wantErr := errors.New("apply failed")
+	err = applyManualVerifiedUpdate(path, &UpdateInfo{}, func(gotPath string, _ *UpdateInfo) error {
+		if gotPath != path {
+			t.Fatalf("apply path = %q, want %q", gotPath, path)
+		}
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("applyManualVerifiedUpdate error = %v, want %v", err, wantErr)
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("verified artifact still exists after apply failure: %v", statErr)
 	}
 }

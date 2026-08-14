@@ -13,7 +13,8 @@
 //     While draining it refuses new work STARTS (one-shot execute, and every
 //     *_start session family) but lets continuation / input / signal / end and
 //     the operational __ping__ / __cli_usage_refresh__ / __env_inspect__
-//     commands through so accepted sessions can finish. It is an ALLOWLIST of
+//     commands through so accepted sessions can finish. Demand commands are
+//     counted until their correlated result has been published. It is an ALLOWLIST of
 //     pass-through commands, not a denylist of starts, so a work type added
 //     later is refused by default without needing its own opt-in.
 //
@@ -55,6 +56,11 @@ type drainState struct {
 	// mu at admission (so it is race-free against closeAdmission) and released
 	// exactly once when the receive callback that accepted the work returns.
 	pendingStarts int
+
+	// operationalCommands counts demand callbacks that must publish a
+	// correlated result before an update may restart the process. Pings are
+	// deliberately excluded because they carry no durable backend marker.
+	operationalCommands int
 
 	// uploads / approvals count the two work classes with no manager to ask.
 	uploads           int
@@ -120,23 +126,30 @@ func reopenAdmission() {
 }
 
 // admitWork is the single admission decision for an inbound command. It returns
-// whether the command may proceed and, for accepted work starts, a release
-// function the caller MUST defer so the work is counted for exactly its
-// processing lifetime. release is nil when there is nothing to release
-// (continuation / operational traffic, or a refused start).
+// whether the command may proceed and, for accepted work starts and demand
+// commands, a release function the caller MUST defer so the callback is
+// counted for exactly its processing lifetime. release is nil when there is
+// nothing to release (continuation traffic, pings, or a refused start).
 func admitWork(cmd commandMsg) (admitted bool, release func()) {
 	start := isWorkStartCommand(cmd)
+	trackedOperational := isInternalDemandCommand(cmd.Command)
 
 	drain.mu.Lock()
 	if drain.draining {
-		drain.mu.Unlock()
 		// While draining, admit only the pass-through allowlist. Everything
 		// else — one-shot execute, every *_start, and any unrecognised future
 		// type — is refused so it is not silently lost or queued indefinitely.
-		if isDrainPassThrough(cmd) {
-			return true, nil
+		if !isDrainPassThrough(cmd) {
+			drain.mu.Unlock()
+			return false, nil
 		}
-		return false, nil
+		if trackedOperational {
+			drain.operationalCommands++
+			drain.mu.Unlock()
+			return true, drain.releaseOperationalCommand()
+		}
+		drain.mu.Unlock()
+		return true, nil
 	}
 
 	// Not draining: admit everything. Track work starts so the close-admission
@@ -146,6 +159,11 @@ func admitWork(cmd commandMsg) (admitted bool, release func()) {
 		drain.pendingStarts++
 		drain.mu.Unlock()
 		return true, drain.releaseStart()
+	}
+	if trackedOperational {
+		drain.operationalCommands++
+		drain.mu.Unlock()
+		return true, drain.releaseOperationalCommand()
 	}
 	drain.mu.Unlock()
 	return true, nil
@@ -159,6 +177,21 @@ func (d *drainState) releaseStart() func() {
 			d.mu.Lock()
 			if d.pendingStarts > 0 {
 				d.pendingStarts--
+			}
+			d.mu.Unlock()
+		})
+	}
+}
+
+// releaseOperationalCommand returns an idempotent function that releases a
+// demand callback after its correlated result publish has completed.
+func (d *drainState) releaseOperationalCommand() func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			d.mu.Lock()
+			if d.operationalCommands > 0 {
+				d.operationalCommands--
 			}
 			d.mu.Unlock()
 		})
@@ -249,7 +282,7 @@ func ActiveWork() int {
 	}
 	drainWorkSourcesMu.Unlock()
 
-	total += drain.pendingStarts + drain.uploads + drain.approvals + drain.terminalPublishes
+	total += drain.pendingStarts + drain.operationalCommands + drain.uploads + drain.approvals + drain.terminalPublishes
 	return total
 }
 

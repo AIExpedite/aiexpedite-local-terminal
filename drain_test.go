@@ -15,6 +15,7 @@ func resetDrainState(t *testing.T) {
 	drain.draining = false
 	drain.attemptID = ""
 	drain.pendingStarts = 0
+	drain.operationalCommands = 0
 	drain.uploads = 0
 	drain.approvals = 0
 	drain.terminalPublishes = 0
@@ -22,6 +23,33 @@ func resetDrainState(t *testing.T) {
 	drainWorkSourcesMu.Lock()
 	drainWorkSources = nil
 	drainWorkSourcesMu.Unlock()
+}
+
+func TestAdmitWork_TracksDemandCommandsDuringDrain(t *testing.T) {
+	resetDrainState(t)
+	closeAdmission("attempt-demand")
+	t.Cleanup(func() { resetDrainState(t) })
+
+	for _, command := range []string{"__cli_usage_refresh__", "__env_inspect__"} {
+		t.Run(command, func(t *testing.T) {
+			admitted, release := admitWork(commandMsg{Command: command})
+			if !admitted || release == nil {
+				t.Fatalf("demand command %q should be admitted and tracked", command)
+			}
+			if got := ActiveWork(); got != 1 {
+				t.Fatalf("ActiveWork() = %d while %q is running, want 1", got, command)
+			}
+			release()
+			if got := ActiveWork(); got != 0 {
+				t.Fatalf("ActiveWork() = %d after %q completes, want 0", got, command)
+			}
+		})
+	}
+
+	admitted, release := admitWork(commandMsg{Command: "__ping__"})
+	if !admitted || release != nil {
+		t.Fatal("ping should remain admitted without holding the drain open")
+	}
 }
 
 func TestActiveWork_SnapshotsManagerHandoffWithPendingStart(t *testing.T) {
