@@ -804,20 +804,22 @@ func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) {
 		return
 	}
 
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if Version == target {
-			// The update landed. Report ready on the new version + attempt id so
-			// the service reconciles the drain it cleared.
-			if err := notifyOnlineWithVersion(ctx, cfg, Version, attemptID); err != nil {
-				fmt.Printf("[autoupdate] post-update online report failed: %v\n", err)
-			}
-		} else {
-			// Interrupted mid-drain (crash / failed install): abandon the
-			// attempt, tell the service to exit the drain, and become routable.
-			_ = notifyDrainExit(ctx, cfg, attemptID, "deferred")
-			_ = notifyOnline(ctx, cfg)
+	// Reconcile synchronously. StartAgent calls this before it starts Pub/Sub
+	// and before it schedules the ordinary boot-time /online signal, so the
+	// version-aware request must reach the service first; otherwise a generic
+	// already-online response can discard the attempt/version outcome.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if Version == target {
+		// The update landed. Report ready on the new version + attempt id so
+		// the service reconciles the drain it cleared.
+		if err := notifyOnlineWithVersion(ctx, cfg, Version, attemptID); err != nil {
+			fmt.Printf("[autoupdate] post-update online report failed: %v\n", err)
 		}
-	}()
+	} else {
+		// Interrupted mid-drain (crash / failed install): abandon the attempt,
+		// tell the service to exit the drain, and become routable.
+		_ = notifyDrainExit(ctx, cfg, attemptID, "deferred")
+		_ = notifyOnline(ctx, cfg)
+	}
 }

@@ -710,44 +710,18 @@ func onTrayExit() {
 	// flipping the device offline mid-handoff would just churn the dot in
 	// the UI. Same for the rest of teardown.
 	if path, pending := GetUpdateReady(); pending {
-		// A platform-specific updater (currently macOS bundle replacement) may
-		// already have launched the new version. The empty-path handoff marker
-		// still suppresses the ordinary offline/teardown path below.
+		// Platform installers launch the replacement before requesting tray
+		// shutdown. The empty-path handoff marker suppresses the ordinary
+		// offline/teardown path below without launching a second updater.
 		if path == "" {
 			return
 		}
 
-		fmt.Println("Launching updated version…")
-
-		// Pass our own exe path so the new process can replace us at the install location.
-		// Resolve symlinks so the new process gets the real filesystem path.
-		originalExe, err := runningUpdateTarget()
-		if err != nil {
-			fmt.Printf("Warning: could not determine own exe path: %v\n", err)
-			originalExe = ""
-		} else if resolved, err := filepath.EvalSymlinks(originalExe); err == nil {
-			originalExe = resolved
-		}
-
-		// If we're already running from a temp path (chained update / previous broken update),
-		// don't pass --update-from pointing at the temp file — that would replace a temp file
-		// instead of the real install location. Let the new binary start without self-replace.
-		args := []string{}
-		if originalExe != "" && !isInTempDir(originalExe) {
-			args = append(args, fmt.Sprintf("--update-from=%s", originalExe))
-		} else if originalExe != "" {
-			fmt.Printf("[update] Current exe is in temp dir (%s), skipping --update-from\n", originalExe)
-		}
-
-		cmd := exec.Command(path, args...)
-		setNewConsole(cmd) // Ensure child process gets a fresh console with valid handles
-		if err := cmd.Start(); err != nil {
-			fmt.Printf("Failed to start update: %v\n", err)
-		}
-		// Give the new process time to fully launch before we exit
-		time.Sleep(2 * time.Second)
-		// Don't do aggressive cleanup after launching update - just exit
-		// The new process is already running independently
+		// Compatibility with an update marker written by an older code path. Do
+		// not try to launch here: tray shutdown is already committed and a start
+		// failure would leave no authoritative agent. A later boot cleans the
+		// stale artifact safely.
+		fmt.Printf("[update] Ignoring unlaunched legacy update marker for %s\n", path)
 		return
 	}
 

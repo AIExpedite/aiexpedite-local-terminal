@@ -25,6 +25,11 @@ import (
 	"github.com/getlantern/systray"
 )
 
+var (
+	acquireAgentInstanceAfterDarwinHandoff = acquireAgentInstance
+	quitAfterDarwinHandoff                 = systray.Quit
+)
+
 // applyVerifiedUpdate replaces the running .app bundle with the one inside the
 // verified DMG at dmgPath and relaunches. dmgPath is the provenance-verified
 // artifact from downloadAndVerifyUpdate.
@@ -118,20 +123,29 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	// race and exit before this process quits too.
 	releaseAgentInstanceForHandoff()
 	if err := relaunchDarwinBundle(currentBundle); err != nil {
-		// The running process remains authoritative on a failed handoff. Restore
-		// its singleton so another launch cannot start a duplicate agent while
-		// this process continues serving work.
-		if release, acquired := acquireAgentInstance(); acquired {
-			trackAgentInstanceRelease(release)
-		}
-		return fmt.Errorf("failed to relaunch %s: %w", currentBundle, err)
+		return handleFailedDarwinRelaunch(currentBundle, err)
 	}
 	// The bundle has already been replaced and relaunched, so tray exit must
 	// skip the ordinary offline notification and subprocess teardown. Using a
 	// handoff marker with no artifact path also prevents onTrayExit from trying
 	// to launch a second updater.
 	SetUpdateHandoff()
-	systray.Quit()
+	quitAfterDarwinHandoff()
+	return nil
+}
+
+// handleFailedDarwinRelaunch restores singleton ownership when the old process
+// can safely remain authoritative. If another process acquired the singleton
+// during the intentionally unlocked LaunchServices window, this process must
+// yield instead of reopening admission and serving concurrently.
+func handleFailedDarwinRelaunch(bundle string, relaunchErr error) error {
+	if release, acquired := acquireAgentInstanceAfterDarwinHandoff(); acquired {
+		trackAgentInstanceRelease(release)
+		return fmt.Errorf("failed to relaunch %s: %w", bundle, relaunchErr)
+	}
+
+	SetUpdateHandoff()
+	quitAfterDarwinHandoff()
 	return nil
 }
 

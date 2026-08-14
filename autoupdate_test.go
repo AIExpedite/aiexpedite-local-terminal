@@ -4,9 +4,12 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -437,6 +440,35 @@ func TestResolveInterruptedAttempt_SuccessReportsVersion(t *testing.T) {
 	}
 	if cfg.PendingUpdateAttemptID != "" || cfg.PendingUpdateVersion != "" {
 		t.Fatal("attempt marker must be cleared")
+	}
+}
+
+func TestResolveInterruptedAttempt_ReportsVersionBeforeReturning(t *testing.T) {
+	resetDrainState(t)
+	resetConnectivityState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/device/agent-reconcile/online" {
+			t.Errorf("request path = %q, want version-aware online path", r.URL.Path)
+		}
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+
+	cfg := DefaultConfig()
+	cfg.AgentID = "agent-reconcile"
+	cfg.CommandSecret = "secret"
+	cfg.PendingUpdateAttemptID = "att-reconcile"
+	cfg.PendingUpdateVersion = Version
+
+	resolveInterruptedAttemptWithPath(cfg, filepath.Join(t.TempDir(), "c.json"))
+
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("version-aware online requests before return = %d, want 1", got)
 	}
 }
 
