@@ -13,6 +13,7 @@ func resetDrainState(t *testing.T) {
 	t.Helper()
 	drain.mu.Lock()
 	drain.draining = false
+	drain.installing = false
 	drain.attemptID = ""
 	drain.pendingStarts = 0
 	drain.operationalCommands = 0
@@ -23,6 +24,26 @@ func resetDrainState(t *testing.T) {
 	drainWorkSourcesMu.Lock()
 	drainWorkSources = nil
 	drainWorkSourcesMu.Unlock()
+}
+
+func TestSealDrainForInstallRefusesNewDemandCommands(t *testing.T) {
+	resetDrainState(t)
+	closeAdmission("attempt-install")
+	t.Cleanup(func() { resetDrainState(t) })
+
+	if !sealDrainForInstall() {
+		t.Fatal("idle drain should be sealed for install")
+	}
+	for _, command := range []string{"__cli_usage_refresh__", "__env_inspect__"} {
+		admitted, release := admitWork(commandMsg{Command: command})
+		if admitted || release != nil {
+			t.Fatalf("demand command %q entered after install seal", command)
+		}
+	}
+	admitted, release := admitWork(commandMsg{Command: "__ping__"})
+	if !admitted || release != nil {
+		t.Fatal("ping should remain admitted after install seal")
+	}
 }
 
 func TestAdmitWork_TracksDemandCommandsDuringDrain(t *testing.T) {

@@ -94,8 +94,9 @@ func newAutoTestRig(t *testing.T, cfg *Config) *autoTestRig {
 			r.applyCalls++
 			return r.applyErr
 		},
-		activeWork:  func() int { r.mu.Lock(); defer r.mu.Unlock(); return r.activeWork },
-		installable: func() (bool, string) { r.mu.Lock(); defer r.mu.Unlock(); return r.installableOK, r.installableMsg },
+		activeWork:   func() int { r.mu.Lock(); defer r.mu.Unlock(); return r.activeWork },
+		claimInstall: func() bool { r.mu.Lock(); defer r.mu.Unlock(); return r.activeWork == 0 },
+		installable:  func() (bool, string) { r.mu.Lock(); defer r.mu.Unlock(); return r.installableOK, r.installableMsg },
 		drainEnter: func(_ context.Context, _, _ string) error {
 			r.mu.Lock()
 			defer r.mu.Unlock()

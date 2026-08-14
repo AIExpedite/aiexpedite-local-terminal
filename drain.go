@@ -32,9 +32,10 @@
 // mutex, so a work start arriving exactly at the close-admission boundary is
 // either fully accepted before the drain completes (and therefore holds it
 // open) or refused — never accepted after ActiveWork() reported zero. Because
-// closeAdmission() flips `draining` under that same lock, once draining begins
-// ActiveWork() can only decrease: no new start can be admitted, so the count
-// converges to zero and stays there until the restart.
+// closeAdmission() flips `draining` under that same lock, no new user-work
+// start can be admitted. Operational demand commands may briefly add tracked
+// work until sealDrainForInstall atomically observes zero and closes that final
+// admission path for the replacement handoff.
 package main
 
 import (
@@ -45,9 +46,10 @@ import (
 // drainState is the process-wide admission gate + work counters. There is one
 // instance (drain); all fields are guarded by mu.
 type drainState struct {
-	mu        sync.Mutex
-	draining  bool
-	attemptID string
+	mu         sync.Mutex
+	draining   bool
+	installing bool
+	attemptID  string
 
 	// pendingStarts counts work STARTS that passed admission but whose
 	// ownership has not yet been handed to a long-lived tracker — a one-shot
@@ -111,6 +113,7 @@ func drainingAttempt() string {
 func closeAdmission(attemptID string) {
 	drain.mu.Lock()
 	drain.draining = true
+	drain.installing = false
 	drain.attemptID = attemptID
 	drain.mu.Unlock()
 }
@@ -121,6 +124,7 @@ func closeAdmission(attemptID string) {
 func reopenAdmission() {
 	drain.mu.Lock()
 	drain.draining = false
+	drain.installing = false
 	drain.attemptID = ""
 	drain.mu.Unlock()
 }
@@ -144,6 +148,12 @@ func admitWork(cmd commandMsg) (admitted bool, release func()) {
 			return false, nil
 		}
 		if trackedOperational {
+			// Once the updater atomically seals an idle drain for install,
+			// demand callbacks may no longer enter and recreate active work.
+			if drain.installing {
+				drain.mu.Unlock()
+				return false, nil
+			}
 			drain.operationalCommands++
 			drain.mu.Unlock()
 			return true, drain.releaseOperationalCommand()
@@ -285,7 +295,6 @@ func startTrackedTerminalPublisher(queue <-chan resultMsg, publishFn PublishFunc
 // ActiveWork returns the total number of accepted units of work that have not
 // yet reached a terminal state. A drain may install only when this is zero.
 func ActiveWork() int {
-	total := 0
 	// Hold the admission lock while sampling manager-owned work and the
 	// pending-start counter. A session start hands ownership to its manager
 	// before its deferred release decrements pendingStarts; serializing that
@@ -293,6 +302,11 @@ func ActiveWork() int {
 	// insertion and pendingStarts after release (a false zero).
 	drain.mu.Lock()
 	defer drain.mu.Unlock()
+	return drain.activeWorkLocked()
+}
+
+func (d *drainState) activeWorkLocked() int {
+	total := 0
 
 	drainWorkSourcesMu.Lock()
 	for _, fn := range drainWorkSources {
@@ -300,8 +314,21 @@ func ActiveWork() int {
 	}
 	drainWorkSourcesMu.Unlock()
 
-	total += drain.pendingStarts + drain.operationalCommands + drain.uploads + drain.approvals + drain.terminalPublishes
+	total += d.pendingStarts + d.operationalCommands + d.uploads + d.approvals + d.terminalPublishes
 	return total
+}
+
+// sealDrainForInstall atomically verifies that the drain is idle and prevents
+// fresh demand commands from entering after that zero-work observation. This
+// closes the final admission-to-install race while leaving pings deliverable.
+func sealDrainForInstall() bool {
+	drain.mu.Lock()
+	defer drain.mu.Unlock()
+	if !drain.draining || drain.installing || drain.activeWorkLocked() != 0 {
+		return false
+	}
+	drain.installing = true
+	return true
 }
 
 // isOperationalCommand reports whether the command carries no user work — it is

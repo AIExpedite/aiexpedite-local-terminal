@@ -206,6 +206,7 @@ type autoUpdater struct {
 	apply          func(path string, info *UpdateInfo) error
 	manualApply    func(info *UpdateInfo) error
 	activeWork     func() int
+	claimInstall   func() bool
 	installable    func() (bool, string)
 	drainEnter     func(ctx context.Context, attemptID, target string) error
 	drainConfirm   func(ctx context.Context, attemptID, target string) error
@@ -247,6 +248,7 @@ func newAutoUpdater(cfg *Config, tray *trayUpdateHandles) *autoUpdater {
 		apply:          applyVerifiedUpdate,
 		manualApply:    downloadAndApplyUpdate,
 		activeWork:     ActiveWork,
+		claimInstall:   sealDrainForInstall,
 		installable:    installUpdatable,
 		savePath:       ConfigPath(),
 		stopCh:         make(chan struct{}),
@@ -535,7 +537,7 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 			return
 		}
 
-		if au.activeWork() == 0 && au.canInstallNow(startedAt, registered, reachedService) {
+		if au.activeWork() == 0 && au.canInstallNow(startedAt, registered, reachedService) && au.claimInstall() {
 			break
 		}
 

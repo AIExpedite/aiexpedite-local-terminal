@@ -136,6 +136,7 @@ func main() {
 		fmt.Println("[startup] Another agent instance is already running; exiting")
 		return
 	}
+	releaseInstance = trackAgentInstanceRelease(releaseInstance)
 	defer releaseInstance()
 
 	// Register startup and uninstall metadata only after relocation and the

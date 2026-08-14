@@ -21,7 +21,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/getlantern/systray"
 )
@@ -113,6 +112,11 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	_ = ensureAutoStart()
 
 	fmt.Printf("[update] Replaced macOS bundle at %s; relaunching\n", currentBundle)
+	// The replacement must be able to acquire the per-account singleton as
+	// soon as LaunchServices starts it. The deferred release in main otherwise
+	// runs only after systray exits, causing the new process to lose the lock
+	// race and exit before this process quits too.
+	releaseAgentInstanceForHandoff()
 	if err := exec.Command("open", "-n", currentBundle).Start(); err != nil {
 		return fmt.Errorf("failed to relaunch %s: %w", currentBundle, err)
 	}
@@ -121,8 +125,6 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	// handoff marker with no artifact path also prevents onTrayExit from trying
 	// to launch a second updater.
 	SetUpdateHandoff()
-	// Give launchservices a beat to spawn the new instance before we exit.
-	time.Sleep(1 * time.Second)
 	systray.Quit()
 	return nil
 }
