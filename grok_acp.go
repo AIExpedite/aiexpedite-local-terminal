@@ -803,13 +803,7 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 	defer close(session.streamDone)
 
 	queue := make(chan resultMsg, grokACPPublishQueueSize)
-	publisherDone := make(chan struct{})
-	go func() {
-		defer close(publisherDone)
-		for msg := range queue {
-			publishFn(msg)
-		}
-	}()
+	publisherDone := startTrackedTerminalPublisher(queue, publishFn)
 	defer func() {
 		close(queue)
 		<-publisherDone

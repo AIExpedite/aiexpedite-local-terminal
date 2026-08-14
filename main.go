@@ -515,7 +515,7 @@ func onTrayReady(cfg *Config) func() {
 						choice := ShowUpdateDialog(info.CurrentVersion, info.LatestVersion)
 						switch choice {
 						case UpdateNow:
-							if err := downloadAndApplyUpdate(info); err != nil {
+							if err := installUpdateManually(info); err != nil {
 								ShowErrorDialog("Update Failed", err.Error())
 							}
 						case UpdateLater:
@@ -533,7 +533,7 @@ func onTrayReady(cfg *Config) func() {
 					// Install pending update
 					if info := GetPendingUpdate(); info != nil {
 						fmt.Printf("[update] Installing pending update: %s\n", info.LatestVersion)
-						if err := downloadAndApplyUpdate(info); err != nil {
+						if err := installUpdateManually(info); err != nil {
 							fmt.Println("[update] Failed:", err)
 							ShowErrorDialog("Update Failed", err.Error())
 						}

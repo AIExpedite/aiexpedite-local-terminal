@@ -442,3 +442,48 @@ func TestIsDrainExpiredErr(t *testing.T) {
 		t.Fatal("nil should not be expired")
 	}
 }
+
+func TestManualInstallTakesOverAutomaticDrainAndRestoresOnFailure(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+	closeAdmission("auto-attempt")
+
+	au := newAutoUpdater(DefaultConfig(), nil)
+	autoDone := make(chan struct{})
+	takeover := make(chan struct{})
+	au.mu.Lock()
+	au.inProgress = true
+	au.autoDone = autoDone
+	au.manualTakeover = takeover
+	au.drainAttempt = "auto-attempt"
+	au.mu.Unlock()
+
+	manualCalled := make(chan struct{})
+	au.manualApply = func(*UpdateInfo) error {
+		close(manualCalled)
+		return errors.New("manual apply failed")
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- au.installManually(&UpdateInfo{Available: true, LatestVersion: "v9.9.9"})
+	}()
+
+	select {
+	case <-takeover:
+	case <-time.After(time.Second):
+		t.Fatal("manual install did not request automatic takeover")
+	}
+	select {
+	case <-manualCalled:
+		t.Fatal("manual apply raced the automatic attempt")
+	default:
+	}
+
+	close(autoDone)
+	if err := <-result; err == nil {
+		t.Fatal("manual apply failure was not returned")
+	}
+	if isDraining() {
+		t.Fatal("failed manual takeover must restore routability")
+	}
+}

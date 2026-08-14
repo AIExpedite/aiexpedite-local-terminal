@@ -300,3 +300,28 @@ func TestIsWorkStartCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestTrackedTerminalPublisherHoldsDrainUntilQueueFlushes(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	queue := make(chan resultMsg, 1)
+	publishStarted := make(chan struct{})
+	releasePublish := make(chan struct{})
+	done := startTrackedTerminalPublisher(queue, func(resultMsg) {
+		close(publishStarted)
+		<-releasePublish
+	})
+	queue <- resultMsg{Type: "codex_appserver_message"}
+	close(queue)
+	<-publishStarted
+
+	if got := ActiveWork(); got != 1 {
+		t.Fatalf("ActiveWork() = %d, want 1 while queued stream publish is blocked", got)
+	}
+	close(releasePublish)
+	<-done
+	if got := ActiveWork(); got != 0 {
+		t.Fatalf("ActiveWork() = %d, want 0 after queued stream publish flushes", got)
+	}
+}

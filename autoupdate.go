@@ -204,6 +204,7 @@ type autoUpdater struct {
 	checkForUpdate func() (*UpdateInfo, error)
 	downloadVerify func(*UpdateInfo) (string, error)
 	apply          func(path string, info *UpdateInfo) error
+	manualApply    func(info *UpdateInfo) error
 	activeWork     func() int
 	installable    func() (bool, string)
 	drainEnter     func(ctx context.Context, attemptID, target string) error
@@ -218,9 +219,14 @@ type autoUpdater struct {
 	// Defaults to ConfigPath(); overridable in tests.
 	savePath string
 
-	mu            sync.Mutex
-	inProgress    bool
-	deferredUntil time.Time // cooldown floor after a defer (24h)
+	mu               sync.Mutex
+	inProgress       bool
+	manualInProgress bool
+	autoDone         chan struct{}
+	manualTakeover   chan struct{}
+	drainAttempt     string
+	installing       bool
+	deferredUntil    time.Time // cooldown floor after a defer (24h)
 
 	attemptSeq atomic.Uint64
 	stopCh     chan struct{}
@@ -239,6 +245,7 @@ func newAutoUpdater(cfg *Config, tray *trayUpdateHandles) *autoUpdater {
 		checkForUpdate: checkForNewVersion,
 		downloadVerify: downloadAndVerifyUpdate,
 		apply:          applyVerifiedUpdate,
+		manualApply:    downloadAndApplyUpdate,
 		activeWork:     ActiveWork,
 		installable:    installUpdatable,
 		savePath:       ConfigPath(),
@@ -340,16 +347,24 @@ func (au *autoUpdater) tick() {
 		return // preference off — no automatic checks
 	}
 	au.mu.Lock()
-	if au.inProgress || au.now().Before(au.deferredUntil) {
+	if au.inProgress || au.manualInProgress || au.now().Before(au.deferredUntil) {
 		au.mu.Unlock()
 		return
 	}
 	au.inProgress = true
+	au.autoDone = make(chan struct{})
+	au.manualTakeover = make(chan struct{})
+	done := au.autoDone
 	au.mu.Unlock()
 
 	defer func() {
 		au.mu.Lock()
 		au.inProgress = false
+		au.autoDone = nil
+		au.manualTakeover = nil
+		au.installing = false
+		au.drainAttempt = ""
+		close(done)
 		au.mu.Unlock()
 	}()
 
@@ -359,6 +374,9 @@ func (au *autoUpdater) tick() {
 // runAttempt performs one full attempt: writability probe, bounded
 // check+download+verify, then drain+install.
 func (au *autoUpdater) runAttempt() {
+	if au.takeoverRequested() {
+		return
+	}
 	// macOS check-and-offer fallback builds do not replace their bundle, so the
 	// install location is irrelevant: even a copy launched from Downloads or a
 	// mounted DMG can still perform the promised metadata check and offer the
@@ -390,6 +408,10 @@ func (au *autoUpdater) runAttempt() {
 	if info == nil || path == "" {
 		return // no update, or abandoned after retries
 	}
+	if au.takeoverRequested() {
+		_ = os.Remove(path)
+		return
+	}
 
 	// The automatic path deliberately IGNORES cfg.SkippedVersion — Skip Version
 	// is a choice made in the manual dialog and must not suppress an enabled
@@ -402,6 +424,9 @@ func (au *autoUpdater) runAttempt() {
 // info, or nil when there is nothing newer or the check was abandoned.
 func (au *autoUpdater) checkOnlyWithRetry() *UpdateInfo {
 	for attempt := 1; attempt <= autoUpdateMaxRetries; attempt++ {
+		if au.takeoverRequested() {
+			return nil
+		}
 		info, err := au.checkForUpdate()
 		if err == nil {
 			if info == nil || !info.Available {
@@ -425,6 +450,9 @@ func (au *autoUpdater) checkOnlyWithRetry() *UpdateInfo {
 // (nil, "") when there is nothing to install or the attempt was abandoned.
 func (au *autoUpdater) checkAndVerifyWithRetry() (*UpdateInfo, string) {
 	for attempt := 1; attempt <= autoUpdateMaxRetries; attempt++ {
+		if au.takeoverRequested() {
+			return nil, ""
+		}
 		info, err := au.checkForUpdate()
 		if err == nil && (info == nil || !info.Available) {
 			return nil, "" // nothing newer
@@ -465,9 +493,17 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		}
 	}()
 
-	// Local refusal is authoritative from this instant — before the service
-	// even learns of the drain.
+	// Publish the attempt identity and close admission while manual takeover is
+	// excluded by au.mu. A manual click therefore either wins before draining
+	// starts, or captures the exact drain it must restore if its install fails.
+	au.mu.Lock()
+	if channelClosed(au.manualTakeover) {
+		au.mu.Unlock()
+		return
+	}
+	au.drainAttempt = attemptID
 	closeAdmission(attemptID)
+	au.mu.Unlock()
 	au.tray.draining(true)
 	au.persistAttempt(attemptID, info.LatestVersion)
 
@@ -486,6 +522,12 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 	lastConfirm := startedAt
 
 	for {
+		// A user-selected Update Now supersedes the automatic attempt. Keep
+		// admission closed and leave the attempt marker intact while ownership
+		// passes to the manual installer; it will restore routing if it fails.
+		if au.takeoverRequested() {
+			return
+		}
 		// Preference turned off before replacement began — cancel cleanly and
 		// return the agent to normal admission without terminating work.
 		if !au.cfg.IsAutoUpdate() {
@@ -528,7 +570,17 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		}
 	}
 
-	// Fully drained: install. The current version stays usable until the
+	// Fully drained: install. Claim replacement under the same mutex used by
+	// manual takeover so a click cannot start a competing handoff.
+	au.mu.Lock()
+	if channelClosed(au.manualTakeover) {
+		au.mu.Unlock()
+		return
+	}
+	au.installing = true
+	au.mu.Unlock()
+
+	// The current version stays usable until the
 	// replacement is complete; on failure we keep running the old version.
 	fmt.Printf("[autoupdate] Drained; installing %s\n", info.LatestVersion)
 	if err := au.apply(path, info); err != nil {
@@ -539,6 +591,77 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 	installed = true // artifact consumed by the self-replace handoff / bundle swap
 	// apply() restarts the process; the new version reconciles the drain via
 	// resolveInterruptedAttempt → notifyOnlineWithVersion on next boot.
+}
+
+func channelClosed(ch <-chan struct{}) bool {
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+func (au *autoUpdater) takeoverRequested() bool {
+	au.mu.Lock()
+	ch := au.manualTakeover
+	au.mu.Unlock()
+	return channelClosed(ch)
+}
+
+// installManually serializes a user-selected install with the automatic state
+// machine. Manual Update Now intentionally wins and still installs without a
+// drain, but the automatic goroutine first yields ownership so two downloads
+// or replacement handoffs cannot race. If the manual path fails after taking
+// over an active drain, routing is restored on the old version.
+func (au *autoUpdater) installManually(info *UpdateInfo) error {
+	if au == nil {
+		return downloadAndApplyUpdate(info)
+	}
+
+	au.mu.Lock()
+	if au.manualInProgress {
+		au.mu.Unlock()
+		return fmt.Errorf("an update install is already in progress")
+	}
+	if au.installing {
+		au.mu.Unlock()
+		return fmt.Errorf("the automatic update is already being installed")
+	}
+	au.manualInProgress = true
+	done := au.autoDone
+	takeover := au.manualTakeover
+	attemptID := au.drainAttempt
+	if takeover != nil && !channelClosed(takeover) {
+		close(takeover)
+	}
+	au.mu.Unlock()
+
+	if done != nil {
+		<-done
+	}
+	defer func() {
+		au.mu.Lock()
+		au.manualInProgress = false
+		au.drainAttempt = ""
+		au.mu.Unlock()
+	}()
+
+	err := au.manualApply(info)
+	if err != nil && attemptID != "" && isDraining() && drainingAttempt() == attemptID {
+		au.exitDrain(attemptID, "superseded", false)
+	}
+	return err
+}
+
+func installUpdateManually(info *UpdateInfo) error {
+	if globalAutoUpdater == nil {
+		return downloadAndApplyUpdate(info)
+	}
+	return globalAutoUpdater.installManually(info)
 }
 
 // canInstallNow decides whether a drained agent may install:

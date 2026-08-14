@@ -394,11 +394,41 @@ jobs:
           APP="$PWD/dmg-staging/AIExpediteTerminal.app"
           ZIP="$RUNNER_TEMP/AIExpediteTerminal-${{ matrix.goarch }}.zip"
           ditto -c -k --keepParent "$APP" "$ZIP"
-          xcrun notarytool submit "$ZIP" \
+          SUBMIT_OUTPUT=$(xcrun notarytool submit "$ZIP" \
             --apple-id "$APPLE_ID" \
             --team-id "$TEAM_ID" \
             --password "$APP_PASSWORD" \
-            --wait
+            --no-wait \
+            --output-format json)
+          SUBMISSION_ID=$(echo "$SUBMIT_OUTPUT" | python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
+          echo "App notarization submitted as ${SUBMISSION_ID}; polling with heartbeats"
+          ELAPSED=0
+          while [ $ELAPSED -lt 7200 ]; do
+            INFO_OUT=$(xcrun notarytool info "$SUBMISSION_ID" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$TEAM_ID" \
+              --password "$APP_PASSWORD" 2>&1) || true
+            STATUS=$(echo "$INFO_OUT" | awk -F': *' '/^[[:space:]]*status:/ {print $2; exit}')
+            case "$STATUS" in
+              Accepted) break ;;
+              Invalid|Rejected)
+                echo "App notarization $STATUS"
+                xcrun notarytool log "$SUBMISSION_ID" \
+                  --apple-id "$APPLE_ID" --team-id "$TEAM_ID" \
+                  --password "$APP_PASSWORD" || true
+                exit 1
+                ;;
+              "In Progress"|"")
+                if [ $((ELAPSED % 300)) -eq 0 ]; then
+                  echo "App notarization still in progress (${ELAPSED}s elapsed)"
+                fi
+                sleep 60
+                ELAPSED=$((ELAPSED + 60))
+                ;;
+              *) echo "Unexpected app notarization status: $STATUS"; exit 1 ;;
+            esac
+          done
+          [ "$STATUS" = "Accepted" ] || { echo "App notarization timed out"; exit 1; }
           xcrun stapler staple "$APP"
           xcrun stapler validate "$APP"
           rm -f "$ZIP"

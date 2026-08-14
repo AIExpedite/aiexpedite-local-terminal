@@ -264,6 +264,24 @@ func publishTerminalResultAsync(publishFn PublishFunc, msg resultMsg) {
 	}()
 }
 
+// startTrackedTerminalPublisher drains an ordered stream queue while counting
+// the publisher as active work. The count starts before the goroutine can race
+// a session removal and ends only after every queued frame has returned from
+// publishFn, so an automatic update cannot restart between manager removal and
+// a slow publisher finishing its backlog.
+func startTrackedTerminalPublisher(queue <-chan resultMsg, publishFn PublishFunc) <-chan struct{} {
+	done := make(chan struct{})
+	trackTerminalPublishStart()
+	go func() {
+		defer close(done)
+		defer trackTerminalPublishEnd()
+		for msg := range queue {
+			publishFn(msg)
+		}
+	}()
+	return done
+}
+
 // ActiveWork returns the total number of accepted units of work that have not
 // yet reached a terminal state. A drain may install only when this is zero.
 func ActiveWork() int {

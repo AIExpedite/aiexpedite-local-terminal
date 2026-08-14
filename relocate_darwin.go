@@ -108,7 +108,12 @@ func maybeRelocateInstall(_ *Config) bool {
 	}
 
 	fmt.Printf("[relocate] Relocated %s -> %s; handing over\n", bundle, dest)
-	if err := exec.Command("open", dest).Start(); err != nil {
+	// This is a newly copied bundle while the source bundle with the same ID is
+	// still running. Force LaunchServices to start the destination; ordinary
+	// `open` may merely activate the source and leave no process after we exit.
+	// The per-account singleton acquired during destination startup prevents a
+	// lasting duplicate if simultaneous relocation launchers race here.
+	if err := exec.Command("open", "-n", dest).Start(); err != nil {
 		fmt.Printf("[relocate] Failed to launch relocated copy: %v\n", err)
 		return false
 	}
