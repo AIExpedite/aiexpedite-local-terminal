@@ -121,11 +121,13 @@ func ClearPendingUpdate() {
 /* ───────────────────────────── scheduler config ─────────────────────────── */
 
 const (
-	autoUpdateFirstCheckDelay   = 5 * time.Minute
-	autoUpdateCheckInterval     = 6 * time.Hour
-	autoUpdateDrainDeadline     = 7 * 24 * time.Hour
-	autoUpdateDeferCooldown     = 24 * time.Hour
-	autoUpdateDrainConfirmEvery = 5 * time.Minute
+	autoUpdateFirstCheckDelay = 5 * time.Minute
+	autoUpdateCheckInterval   = 6 * time.Hour
+	autoUpdateDrainDeadline   = 7 * 24 * time.Hour
+	autoUpdateDeferCooldown   = 24 * time.Hour
+	// Renew substantially before the five-minute heartbeat-staleness safety
+	// window so polling and RPC latency cannot let a live drain lease expire.
+	autoUpdateDrainConfirmEvery = 2 * time.Minute
 	autoUpdateDrainPollInterval = 10 * time.Second
 	autoUpdateMaxRetries        = 3
 	autoUpdateRetryMin          = 1 * time.Minute

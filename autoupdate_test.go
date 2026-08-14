@@ -175,6 +175,36 @@ func TestRunAttempt_RegisteredReportsDrainThenInstalls(t *testing.T) {
 	}
 }
 
+func TestDrainAndInstall_ConfirmsBeforeHeartbeatStalenessWindow(t *testing.T) {
+	r := newAutoTestRig(t, registeredCfg())
+	r.activeWork = 1
+
+	r.mu.Lock()
+	startedAt := r.clock
+	r.mu.Unlock()
+	var confirmedAt time.Time
+	r.au.drainConfirm = func(_ context.Context, _, _ string) error {
+		r.mu.Lock()
+		confirmedAt = r.clock
+		r.drainConfirm++
+		r.activeWork = 0
+		r.mu.Unlock()
+		return nil
+	}
+
+	r.au.runAttempt()
+
+	if confirmedAt.IsZero() {
+		t.Fatal("long-running drain was never confirmed")
+	}
+	if elapsed := confirmedAt.Sub(startedAt); elapsed >= heartbeatStaleWindow {
+		t.Fatalf("first drain confirmation arrived after %v, want before %v", elapsed, heartbeatStaleWindow)
+	}
+	if r.applyCalls != 1 {
+		t.Fatalf("confirmed drain should install after work completes, apply=%d", r.applyCalls)
+	}
+}
+
 func TestRunAttempt_SkippedVersionIgnoredOnAutomaticPath(t *testing.T) {
 	cfg := registeredCfg()
 	cfg.SkippedVersion = "v9.9.9" // same as the available update

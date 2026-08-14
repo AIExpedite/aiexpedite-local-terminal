@@ -449,13 +449,7 @@ func onTrayReady(cfg *Config) func() {
 					// failed write leaves the effective behaviour consistent with
 					// the last successfully-persisted state. No confirmation dialog.
 					newVal := !mAutoUpdate.Checked()
-					prev := cfg.AutoUpdate
-					cfg.SetAutoUpdate(newVal)
-					if err := cfg.Save(ConfigPath()); err != nil {
-						// Roll back to the last persisted value on write failure.
-						if prev != nil {
-							cfg.SetAutoUpdate(*prev)
-						}
+					if err := cfg.SetAndSaveAutoUpdate(newVal, ConfigPath()); err != nil {
 						fmt.Printf("[autoupdate] Failed to save preference: %v\n", err)
 						ShowErrorDialog("Automatically Update",
 							fmt.Sprintf("Could not save the auto-update preference:\n\n%v", err))

@@ -200,15 +200,21 @@ func trackApprovalEnd() {
 // yet reached a terminal state. A drain may install only when this is zero.
 func ActiveWork() int {
 	total := 0
+	// Hold the admission lock while sampling manager-owned work and the
+	// pending-start counter. A session start hands ownership to its manager
+	// before its deferred release decrements pendingStarts; serializing that
+	// release with this whole snapshot prevents observing the manager before
+	// insertion and pendingStarts after release (a false zero).
+	drain.mu.Lock()
+	defer drain.mu.Unlock()
+
 	drainWorkSourcesMu.Lock()
 	for _, fn := range drainWorkSources {
 		total += fn()
 	}
 	drainWorkSourcesMu.Unlock()
 
-	drain.mu.Lock()
 	total += drain.pendingStarts + drain.uploads + drain.approvals
-	drain.mu.Unlock()
 	return total
 }
 

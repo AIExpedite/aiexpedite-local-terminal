@@ -99,3 +99,19 @@ func TestSetAutoUpdate_RoundTripAndMirror(t *testing.T) {
 		t.Fatalf("persisted disable should survive reload, got %v", reloaded.AutoUpdate)
 	}
 }
+
+func TestSetAndSaveAutoUpdate_RollsBackOnSaveFailure(t *testing.T) {
+	cfg := DefaultConfig()
+	if !cfg.IsAutoUpdate() {
+		t.Fatal("test requires auto-update to start enabled")
+	}
+
+	// Writing a file over an existing directory fails on every supported OS.
+	err := cfg.SetAndSaveAutoUpdate(false, t.TempDir())
+	if err == nil {
+		t.Fatal("SetAndSaveAutoUpdate should report the persistence failure")
+	}
+	if cfg.AutoUpdate == nil || !*cfg.AutoUpdate || !cfg.IsAutoUpdate() {
+		t.Fatal("failed persistence must restore both pointer and runtime preference")
+	}
+}

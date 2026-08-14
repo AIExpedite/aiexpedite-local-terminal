@@ -297,6 +297,19 @@ func (cfg *Config) SetAutoUpdate(v bool) {
 	cfg.autoUpdateRuntime.Store(v)
 }
 
+// SetAndSaveAutoUpdate updates the persisted and runtime preference as one
+// operation. If writing fails, both in-memory representations return to the
+// last successfully persisted value.
+func (cfg *Config) SetAndSaveAutoUpdate(v bool, path string) error {
+	previous := cfg.IsAutoUpdate()
+	cfg.SetAutoUpdate(v)
+	if err := cfg.Save(path); err != nil {
+		cfg.SetAutoUpdate(previous)
+		return err
+	}
+	return nil
+}
+
 func (cfg *Config) Save(path string) error {
 	b, err := json.MarshalIndent(cfg, "", "    ")
 	if err != nil {

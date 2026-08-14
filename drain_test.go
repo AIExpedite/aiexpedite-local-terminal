@@ -3,7 +3,9 @@ package main
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // resetDrainState returns the package drain gate to a clean state between tests.
@@ -19,6 +21,58 @@ func resetDrainState(t *testing.T) {
 	drainWorkSourcesMu.Lock()
 	drainWorkSources = nil
 	drainWorkSourcesMu.Unlock()
+}
+
+func TestActiveWork_SnapshotsManagerHandoffWithPendingStart(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	var managerCount atomic.Int32
+	var sourceCalls atomic.Int32
+	sourceSnapshotted := make(chan struct{})
+	allowSourceReturn := make(chan struct{})
+	registerDrainWorkSource(func() int {
+		if sourceCalls.Add(1) != 1 {
+			return int(managerCount.Load())
+		}
+		// Capture the manager count before the admitted start transfers into it,
+		// then pause in the aggregate snapshot to make the handoff deterministic.
+		snapshot := managerCount.Load()
+		close(sourceSnapshotted)
+		<-allowSourceReturn
+		return int(snapshot)
+	})
+
+	admitted, release := admitWork(commandMsg{Type: "session_start"})
+	if !admitted || release == nil {
+		t.Fatal("session start should be admitted and tracked")
+	}
+
+	activeResult := make(chan int, 1)
+	go func() { activeResult <- ActiveWork() }()
+	<-sourceSnapshotted
+
+	handoffDone := make(chan struct{})
+	go func() {
+		managerCount.Store(1) // manager owns the session before pending is released
+		release()
+		close(handoffDone)
+	}()
+
+	select {
+	case <-handoffDone:
+		t.Fatal("pending-start release must wait for the aggregate snapshot")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(allowSourceReturn)
+	if got := <-activeResult; got == 0 {
+		t.Fatal("ActiveWork returned zero during pending-start manager handoff")
+	}
+	<-handoffDone
+	if got := ActiveWork(); got != 1 {
+		t.Fatalf("ActiveWork() after handoff = %d, want manager-owned count 1", got)
+	}
 }
 
 func TestAdmitWork_WhileDraining(t *testing.T) {
