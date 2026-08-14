@@ -64,6 +64,21 @@ func TestDirWritable(t *testing.T) {
 	}
 }
 
+func TestEffectiveUpdateTargetUsesOuterAppImage(t *testing.T) {
+	embedded := filepath.Join(string(filepath.Separator), "tmp", ".mount_aix", "usr", "bin", "AIExpediteTerminal")
+	outer := filepath.Join(t.TempDir(), "AIExpediteTerminal.AppImage")
+
+	if got := effectiveUpdateTarget(embedded, "linux", outer); got != outer {
+		t.Fatalf("effectiveUpdateTarget = %q, want outer AppImage %q", got, outer)
+	}
+	if got := effectiveUpdateTarget(embedded, "linux", ""); got != embedded {
+		t.Fatalf("raw Linux target = %q, want executable %q", got, embedded)
+	}
+	if got := effectiveUpdateTarget(embedded, "windows", outer); got != embedded {
+		t.Fatalf("non-Linux target = %q, want executable %q", got, embedded)
+	}
+}
+
 func TestSilentUpdateCapableFlag(t *testing.T) {
 	// Default build is capable; the label reflects that.
 	label, _ := autoUpdateTrayLabel()

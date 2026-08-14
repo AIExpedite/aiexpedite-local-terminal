@@ -85,6 +85,17 @@ func SetUpdateReady(path string) {
 	updateMutex.Unlock()
 }
 
+// SetUpdateHandoff marks an update whose platform-specific installer already
+// relaunched the replacement. onTrayExit uses this marker to skip the ordinary
+// offline notification and subprocess teardown without launching another
+// update process. macOS uses this after replacing and opening the new bundle.
+func SetUpdateHandoff() {
+	updateMutex.Lock()
+	updatePath = ""
+	updatePending = true
+	updateMutex.Unlock()
+}
+
 // GetUpdateReady returns the pending update path and whether an update is ready.
 func GetUpdateReady() (path string, pending bool) {
 	updateMutex.RLock()

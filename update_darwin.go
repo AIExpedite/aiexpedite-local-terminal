@@ -116,6 +116,11 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	if err := exec.Command("open", "-n", currentBundle).Start(); err != nil {
 		return fmt.Errorf("failed to relaunch %s: %w", currentBundle, err)
 	}
+	// The bundle has already been replaced and relaunched, so tray exit must
+	// skip the ordinary offline notification and subprocess teardown. Using a
+	// handoff marker with no artifact path also prevents onTrayExit from trying
+	// to launch a second updater.
+	SetUpdateHandoff()
 	// Give launchservices a beat to spawn the new instance before we exit.
 	time.Sleep(1 * time.Second)
 	systray.Quit()

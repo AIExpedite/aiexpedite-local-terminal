@@ -355,12 +355,9 @@ func downloadAndApplyUpdate(info *UpdateInfo) error {
 // When it cannot determine the answer it fails OPEN (updatable) rather than
 // blocking a healthy install.
 func installUpdatable() (bool, string) {
-	exe, err := os.Executable()
+	exe, err := runningUpdateTarget()
 	if err != nil {
 		return true, ""
-	}
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
 	}
 
 	switch runtime.GOOS {
@@ -382,6 +379,29 @@ func installUpdatable() (bool, string) {
 		return false, "Automatic update unavailable — this installation is read-only; move the app to a writable location"
 	}
 	return true, ""
+}
+
+// runningUpdateTarget returns the installed artifact that an update must
+// replace. AppImage launches the embedded binary from a read-only mount, while
+// APPIMAGE points at the writable outer artifact the user actually started.
+// Raw Linux binaries and all other platforms use os.Executable directly.
+func runningUpdateTarget() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	target := effectiveUpdateTarget(exe, runtime.GOOS, os.Getenv("APPIMAGE"))
+	if resolved, err := filepath.EvalSymlinks(target); err == nil {
+		target = resolved
+	}
+	return target, nil
+}
+
+func effectiveUpdateTarget(exe, goos, appImage string) string {
+	if goos == "linux" && strings.TrimSpace(appImage) != "" {
+		return filepath.Clean(strings.TrimSpace(appImage))
+	}
+	return exe
 }
 
 // darwinBundlePath maps the running Mach-O executable path

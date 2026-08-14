@@ -11,6 +11,24 @@ import (
 	"time"
 )
 
+func TestSetUpdateHandoffSuppressesArtifactLaunch(t *testing.T) {
+	updateMutex.Lock()
+	previousPath, previousPending := updatePath, updatePending
+	updateMutex.Unlock()
+	t.Cleanup(func() {
+		updateMutex.Lock()
+		updatePath, updatePending = previousPath, previousPending
+		updateMutex.Unlock()
+	})
+
+	SetUpdateReady("downloaded-update")
+	SetUpdateHandoff()
+	path, pending := GetUpdateReady()
+	if !pending || path != "" {
+		t.Fatalf("GetUpdateReady = (%q, %v), want empty-path pending handoff", path, pending)
+	}
+}
+
 // autoTestRig bundles a stubbed autoUpdater and the observations tests assert on.
 type autoTestRig struct {
 	au *autoUpdater

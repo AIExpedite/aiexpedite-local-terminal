@@ -13,10 +13,9 @@ import (
 )
 
 // applyVerifiedUpdate installs a verified update on Windows and Linux. The
-// verified artifact is a raw executable; we mark it ready and quit, and the
-// tray-exit handoff (onTrayExit) relaunches it with --update-from so it copies
-// itself over the install-path executable and restarts. Because the per-user
-// install location is writable, this never requires elevation.
+// verified artifact is an executable (a raw .exe on Windows or an AppImage on
+// Linux); we mark it ready and quit, and the tray-exit handoff relaunches it
+// with --update-from so it replaces the installed artifact and restarts.
 func applyVerifiedUpdate(path string, _ *UpdateInfo) error {
 	_ = os.Chmod(path, 0o755) // ensure the downloaded binary is executable
 	SetUpdateReady(path)

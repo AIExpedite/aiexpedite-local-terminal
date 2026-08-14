@@ -694,12 +694,19 @@ func onTrayExit() {
 	// version will re-register and resume heartbeating immediately, so
 	// flipping the device offline mid-handoff would just churn the dot in
 	// the UI. Same for the rest of teardown.
-	if path, pending := GetUpdateReady(); pending && path != "" {
+	if path, pending := GetUpdateReady(); pending {
+		// A platform-specific updater (currently macOS bundle replacement) may
+		// already have launched the new version. The empty-path handoff marker
+		// still suppresses the ordinary offline/teardown path below.
+		if path == "" {
+			return
+		}
+
 		fmt.Println("Launching updated version…")
 
 		// Pass our own exe path so the new process can replace us at the install location.
 		// Resolve symlinks so the new process gets the real filesystem path.
-		originalExe, err := os.Executable()
+		originalExe, err := runningUpdateTarget()
 		if err != nil {
 			fmt.Printf("Warning: could not determine own exe path: %v\n", err)
 			originalExe = ""
@@ -827,9 +834,9 @@ func isInTempDir(path string) bool {
 //  4. Launches the original path (now the new version) without --update-from
 //  5. Returns nil so the caller can exit the temp process
 func performSelfReplace(originalPath string) error {
-	myPath, err := os.Executable()
+	myPath, err := runningUpdateTarget()
 	if err != nil {
-		return fmt.Errorf("cannot determine own path: %w", err)
+		return fmt.Errorf("cannot determine update artifact path: %w", err)
 	}
 
 	// Resolve symlinks so we compare real paths
