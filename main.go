@@ -92,10 +92,6 @@ func main() {
 
 	// Ensure auto-start at login (Windows)
 	if runtime.GOOS == "windows" {
-		_ = ensureAutoStart()
-		// Register app in Windows "Installed Apps" for easy uninstall
-		_ = ensureAppRegistration()
-
 		// Allocate console early for non-prod environments (dev, stg, beta)
 		// This ensures all startup output (StartAgent, Pub/Sub) is visible
 		// Production builds stay as GUI-only apps with console on-demand
@@ -130,6 +126,24 @@ func main() {
 	// never sees two icons. See relocate_*.go.
 	if relocated := maybeRelocateInstall(cfg); relocated {
 		os.Exit(0)
+	}
+
+	// A stale machine-wide shortcut and the authoritative per-user startup
+	// entry can fire together on Windows. Only the process that owns this
+	// account/channel lock may proceed to create a tray or consume Pub/Sub.
+	releaseInstance, acquired := acquireAgentInstance()
+	if !acquired {
+		fmt.Println("[startup] Another agent instance is already running; exiting")
+		return
+	}
+	defer releaseInstance()
+
+	// Register startup and uninstall metadata only after relocation and the
+	// singleton gate. Otherwise a stale Program Files shortcut could overwrite
+	// the authoritative per-user paths before discovering the relocated agent.
+	if runtime.GOOS == "windows" {
+		_ = ensureAutoStart()
+		_ = ensureAppRegistration()
 	}
 
 	// Initialize command allow list for security

@@ -74,7 +74,9 @@ func maybeRelocateInstall(_ *Config) bool {
 			}
 		}
 		fmt.Printf("[relocate] Per-user bundle already present at %s; handing over\n", dest)
-		if err := exec.Command("open", "-n", dest).Start(); err != nil {
+		// Ordinary `open` activates an existing instance and launches one only
+		// when needed. `open -n` would force a duplicate agent.
+		if err := exec.Command("open", dest).Start(); err != nil {
 			fmt.Printf("[relocate] Failed to launch existing per-user copy: %v\n", err)
 			return false
 		}
@@ -106,7 +108,7 @@ func maybeRelocateInstall(_ *Config) bool {
 	}
 
 	fmt.Printf("[relocate] Relocated %s -> %s; handing over\n", bundle, dest)
-	if err := exec.Command("open", "-n", dest).Start(); err != nil {
+	if err := exec.Command("open", dest).Start(); err != nil {
 		fmt.Printf("[relocate] Failed to launch relocated copy: %v\n", err)
 		return false
 	}

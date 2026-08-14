@@ -50,7 +50,11 @@ func maybeRelocateInstall(_ *Config) bool {
 	// A previous run may have already relocated: if the destination exe exists
 	// and is not this process, hand over to it rather than copying again.
 	if _, statErr := os.Stat(destExe); statErr == nil {
-		fmt.Printf("[relocate] Per-user copy already present at %s; handing over\n", destExe)
+		if relocatedAgentIsRunning() {
+			fmt.Printf("[relocate] Per-user copy already running at %s; exiting legacy copy\n", destExe)
+			return true
+		}
+		fmt.Printf("[relocate] Per-user copy already present at %s; launching it\n", destExe)
 		if err := exec.Command(destExe).Start(); err != nil {
 			fmt.Printf("[relocate] Failed to launch existing per-user copy: %v\n", err)
 			return false
