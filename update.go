@@ -390,6 +390,7 @@ func installUpdatable() (bool, string) {
 // so it is testable and available on every platform (the location probe below
 // runs from installUpdatable, which is compiled everywhere).
 func darwinBundlePath(exe string) string {
+	exe = filepath.ToSlash(exe)
 	marker := ".app/Contents/MacOS/"
 	idx := strings.Index(exe, marker)
 	if idx == -1 {
@@ -404,6 +405,7 @@ func darwinBundlePath(exe string) string {
 // relocation. Unsupported: a mounted DMG, ~/Downloads, or any other read-only
 // / ad-hoc path — those run normally but never self-update and say so.
 func darwinLocationSupported(exe string) (bool, string) {
+	exe = filepath.ToSlash(exe)
 	bundle := darwinBundlePath(exe)
 	if bundle == "" {
 		// Not a bundled app (e.g. a raw `go run` build); fall back to a plain
@@ -425,7 +427,7 @@ func darwinLocationSupported(exe string) (bool, string) {
 
 	userApps := ""
 	if home != "" {
-		userApps = filepath.Join(home, "Applications")
+		userApps = filepath.ToSlash(filepath.Join(home, "Applications"))
 	}
 	if (userApps != "" && strings.HasPrefix(bundle, userApps)) ||
 		strings.HasPrefix(bundle, "/Applications") {
