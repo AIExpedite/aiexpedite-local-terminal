@@ -834,9 +834,12 @@ func isInTempDir(path string) bool {
 //  4. Launches the original path (now the new version) without --update-from
 //  5. Returns nil so the caller can exit the temp process
 func performSelfReplace(originalPath string) error {
-	myPath, err := runningUpdateTarget()
+	// This process is the newly downloaded temporary updater. Do not resolve it
+	// through APPIMAGE: that variable is inherited from the old AppImage and
+	// names the destination, not this source artifact.
+	myPath, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("cannot determine update artifact path: %w", err)
+		return fmt.Errorf("cannot determine own path: %w", err)
 	}
 
 	// Resolve symlinks so we compare real paths

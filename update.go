@@ -398,8 +398,9 @@ func runningUpdateTarget() (string, error) {
 }
 
 func effectiveUpdateTarget(exe, goos, appImage string) string {
-	if goos == "linux" && strings.TrimSpace(appImage) != "" {
-		return filepath.Clean(strings.TrimSpace(appImage))
+	appImage = strings.TrimSpace(appImage)
+	if goos == "linux" && appImage != "" && filepath.IsAbs(appImage) {
+		return filepath.Clean(appImage)
 	}
 	return exe
 }

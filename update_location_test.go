@@ -74,6 +74,9 @@ func TestEffectiveUpdateTargetUsesOuterAppImage(t *testing.T) {
 	if got := effectiveUpdateTarget(embedded, "linux", ""); got != embedded {
 		t.Fatalf("raw Linux target = %q, want executable %q", got, embedded)
 	}
+	if got := effectiveUpdateTarget(embedded, "linux", "relative.AppImage"); got != embedded {
+		t.Fatalf("relative APPIMAGE target = %q, want executable %q", got, embedded)
+	}
 	if got := effectiveUpdateTarget(embedded, "windows", outer); got != embedded {
 		t.Fatalf("non-Linux target = %q, want executable %q", got, embedded)
 	}
