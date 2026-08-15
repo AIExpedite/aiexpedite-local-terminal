@@ -332,14 +332,8 @@ func onTrayReady(cfg *Config) func() {
 
 		mQuit := systray.AddMenuItem("Quit", "Exit the agent")
 
-		// registering is true while a registration flow is in progress.
-		// Declared here (before the auto-register block) so the goroutine below
-		// can safely call registering.Store(false) without a data race.
-		var registering atomic.Bool
-
 		// Auto-trigger registration on first launch (if not registered)
-		if !cfg.IsRegistered() {
-			registering.Store(true)
+		if !cfg.IsRegistered() && beginRegistration() {
 			// Keep console visible during auto-registration
 			if runtime.GOOS == "windows" {
 				showConsoleWindow(true)
@@ -347,6 +341,7 @@ func onTrayReady(cfg *Config) func() {
 			}
 
 			go func() {
+				defer endRegistration()
 				if err := StartRegistration(cfg); err != nil {
 					fmt.Println("Registration failed:", err)
 					ShowErrorDialog("Registration Failed", err.Error())
@@ -366,7 +361,6 @@ func onTrayReady(cfg *Config) func() {
 					fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
 					go StartPubSubLoop(cfg)
 				}
-				registering.Store(false)
 			}()
 		}
 
@@ -395,7 +389,7 @@ func onTrayReady(cfg *Config) func() {
 				mInstallUpdate.Show()
 			},
 		}
-		StartAutoUpdateScheduler(cfg, trayHandles, registering.Load)
+		StartAutoUpdateScheduler(cfg, trayHandles, registrationInProgress)
 
 		// Create debug click channel - nil channel blocks forever in select, which is what we want for prod
 		var debugClickCh <-chan struct{}
@@ -565,10 +559,9 @@ func onTrayReady(cfg *Config) func() {
 						continue
 					}
 
-					if registering.Load() {
-						continue // Already registering
+					if !beginRegistration() {
+						continue // Already registering or draining for an update
 					}
-					registering.Store(true)
 
 					// Show console during registration
 					if runtime.GOOS == "windows" {
@@ -578,6 +571,7 @@ func onTrayReady(cfg *Config) func() {
 					}
 
 					go func() {
+						defer endRegistration()
 						if err := StartRegistration(cfg); err != nil {
 							fmt.Println("Registration failed:", err)
 							ShowErrorDialog("Registration Failed", err.Error())
@@ -597,7 +591,6 @@ func onTrayReady(cfg *Config) func() {
 							fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
 							go StartPubSubLoop(cfg)
 						}
-						registering.Store(false)
 					}()
 
 				case <-mConsole.ClickedCh:

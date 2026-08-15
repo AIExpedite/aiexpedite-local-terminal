@@ -15,6 +15,7 @@ func resetDrainState(t *testing.T) {
 	drain.draining = false
 	drain.installing = false
 	drain.attemptID = ""
+	drain.registering = false
 	drain.pendingStarts = 0
 	drain.operationalCommands = 0
 	drain.uploads = 0
@@ -24,6 +25,29 @@ func resetDrainState(t *testing.T) {
 	drainWorkSourcesMu.Lock()
 	drainWorkSources = nil
 	drainWorkSourcesMu.Unlock()
+}
+
+func TestRegistrationAndDrainEntryAreMutuallyExclusive(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	if !beginRegistration() {
+		t.Fatal("idle agent should begin registration")
+	}
+	if closeAdmission("attempt-during-registration") {
+		t.Fatal("drain must not begin after registration owns the boundary")
+	}
+	if isDraining() {
+		t.Fatal("failed drain claim must leave admission open")
+	}
+
+	endRegistration()
+	if !closeAdmission("attempt-wins") {
+		t.Fatal("drain should begin after registration ends")
+	}
+	if beginRegistration() {
+		t.Fatal("registration must not begin after draining owns the boundary")
+	}
 }
 
 func TestSealDrainForInstallRefusesNewDemandCommands(t *testing.T) {

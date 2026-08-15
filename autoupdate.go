@@ -230,6 +230,8 @@ type autoUpdater struct {
 	manualTakeover   chan struct{}
 	drainAttempt     string
 	installing       bool
+	applying         bool
+	stopping         bool
 	deferredUntil    time.Time // cooldown floor after a defer (24h)
 
 	attemptSeq atomic.Uint64
@@ -320,11 +322,48 @@ func (au *autoUpdater) stop() {
 	if au == nil {
 		return
 	}
+	au.mu.Lock()
+	au.stopping = true
 	select {
 	case <-au.stopCh:
 	default:
 		close(au.stopCh)
 	}
+	au.mu.Unlock()
+}
+
+// stopForShutdown prevents an explicit process exit from turning into an
+// update restart. It abandons local drain state without reporting ready; the
+// ordinary shutdown path reports the captured attempt exit and then offline.
+func (au *autoUpdater) stopForShutdown() string {
+	if au == nil {
+		return ""
+	}
+	au.stop()
+
+	au.mu.Lock()
+	if au.applying {
+		// Replacement has already begun and cannot be safely rolled back here.
+		// Its handoff marker keeps onTrayExit on the update path.
+		au.mu.Unlock()
+		return ""
+	}
+	attemptID := au.drainAttempt
+	if attemptID != "" {
+		au.drainAttempt = ""
+		au.installing = false
+	}
+	au.mu.Unlock()
+	if attemptID == "" || !isDraining() || drainingAttempt() != attemptID {
+		return ""
+	}
+
+	reopenAdmission()
+	if au.tray != nil {
+		au.tray.draining(false)
+	}
+	au.clearAttempt()
+	return attemptID
 }
 
 // run is the scheduling loop: first check after the initial delay, then every
@@ -372,6 +411,7 @@ func (au *autoUpdater) tick() {
 		au.autoDone = nil
 		au.manualTakeover = nil
 		au.installing = false
+		au.applying = false
 		au.drainAttempt = ""
 		close(done)
 		au.mu.Unlock()
@@ -523,12 +563,17 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 	// excluded by au.mu. A manual click therefore either wins before draining
 	// starts, or captures the exact drain it must restore if its install fails.
 	au.mu.Lock()
-	if channelClosed(au.manualTakeover) {
+	if au.stopping || channelClosed(au.manualTakeover) {
 		au.mu.Unlock()
 		return
 	}
 	au.drainAttempt = attemptID
-	closeAdmission(attemptID)
+	if !closeAdmission(attemptID) {
+		au.drainAttempt = ""
+		au.mu.Unlock()
+		fmt.Println("[autoupdate] Deferring verified update because device registration won the admission boundary")
+		return
+	}
 	au.mu.Unlock()
 	au.tray.draining(true)
 	if err := au.persistAttempt(attemptID, info.LatestVersion); err != nil {
@@ -571,8 +616,17 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 			return
 		}
 
-		if au.activeWork() == 0 && au.canInstallNow(startedAt, registered, reachedService) && au.claimInstall() {
-			break
+		if au.activeWork() == 0 && au.canInstallNow(startedAt, registered, reachedService) {
+			// Serialize the final idle-drain claim with stopForShutdown. Once an
+			// explicit exit sets stopping, this process can no longer launch a
+			// replacement even if teardown makes ActiveWork fall to zero.
+			au.mu.Lock()
+			if !au.stopping && au.claimInstall() {
+				au.installing = true
+				au.mu.Unlock()
+				break
+			}
+			au.mu.Unlock()
 		}
 
 		if au.now().After(deadline) {
@@ -606,21 +660,33 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		}
 	}
 
-	// Fully drained: install. Claim replacement under the same mutex used by
-	// manual takeover so a click cannot start a competing handoff.
+	// Fully drained: install. The replacement claim above was made under the
+	// same mutex used by shutdown and manual takeover, so neither can start a
+	// competing transition after the zero-work observation.
 	au.mu.Lock()
-	if channelClosed(au.manualTakeover) {
+	if au.stopping || channelClosed(au.manualTakeover) {
 		au.mu.Unlock()
 		return
 	}
-	au.installing = true
+	au.applying = true
 	au.mu.Unlock()
 
 	// The current version stays usable until the
 	// replacement is complete; on failure we keep running the old version.
 	fmt.Printf("[autoupdate] Drained; installing %s\n", info.LatestVersion)
-	if err := au.apply(path, info); err != nil {
+	err := au.apply(path, info)
+	au.mu.Lock()
+	au.applying = false
+	stopping := au.stopping
+	au.mu.Unlock()
+	if err != nil {
 		fmt.Printf("[autoupdate] Install failed, staying on current version: %v\n", err)
+		if stopping {
+			reopenAdmission()
+			au.tray.draining(false)
+			au.clearAttempt()
+			return
+		}
 		au.exitDrain(attemptID, "deferred", false)
 		return
 	}

@@ -228,6 +228,49 @@ func TestRunAttempt_RegistrationStartingDuringDownloadDefersBeforeDrain(t *testi
 	}
 }
 
+func TestStopForShutdownPreventsDrainFromInstalling(t *testing.T) {
+	r := newAutoTestRig(t, DefaultConfig())
+	r.activeWork = 1
+	artifact := filepath.Join(t.TempDir(), "verified-update")
+	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep the drain loop parked until stopForShutdown closes stopCh. This
+	// models an explicit quit while work is active without waiting for the
+	// production poll interval.
+	r.au.sleep = func(time.Duration) bool {
+		<-r.au.stopCh
+		return false
+	}
+	done := make(chan struct{})
+	go func() {
+		r.au.drainAndInstall("shutdown-attempt", r.info, artifact)
+		close(done)
+	}()
+
+	deadline := time.After(time.Second)
+	for !isDraining() {
+		select {
+		case <-deadline:
+			t.Fatal("updater did not enter draining")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	if got := r.au.stopForShutdown(); got != "shutdown-attempt" {
+		t.Fatalf("stopForShutdown attempt = %q, want shutdown-attempt", got)
+	}
+	<-done
+	if r.applyCalls != 0 {
+		t.Fatalf("explicit shutdown must not apply an update, got %d calls", r.applyCalls)
+	}
+	if isDraining() {
+		t.Fatal("explicit shutdown must abandon local drain state")
+	}
+}
+
 func TestRunAttempt_RegisteredReportsDrainThenInstalls(t *testing.T) {
 	r := newAutoTestRig(t, registeredCfg())
 	r.activeWork = 0

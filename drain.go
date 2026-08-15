@@ -46,10 +46,11 @@ import (
 // drainState is the process-wide admission gate + work counters. There is one
 // instance (drain); all fields are guarded by mu.
 type drainState struct {
-	mu         sync.Mutex
-	draining   bool
-	installing bool
-	attemptID  string
+	mu          sync.Mutex
+	draining    bool
+	installing  bool
+	attemptID   string
+	registering bool
 
 	// pendingStarts counts work STARTS that passed admission but whose
 	// ownership has not yet been handed to a long-lived tracker — a one-shot
@@ -110,12 +111,42 @@ func drainingAttempt() string {
 // closeAdmission enters draining for the given attempt. From this instant the
 // agent's own refusal is authoritative — new work starts are refused whether or
 // not the cloud has learned of the drain yet. Idempotent for the same attempt.
-func closeAdmission(attemptID string) {
+func closeAdmission(attemptID string) bool {
 	drain.mu.Lock()
+	defer drain.mu.Unlock()
+	if drain.registering {
+		return false
+	}
 	drain.draining = true
 	drain.installing = false
 	drain.attemptID = attemptID
+	return true
+}
+
+// beginRegistration and closeAdmission share drain.mu so registration cannot
+// begin in the final check-to-drain window. Whichever transition wins makes
+// the other wait rather than allowing an update to terminate device-code
+// polling midway through registration.
+func beginRegistration() bool {
+	drain.mu.Lock()
+	defer drain.mu.Unlock()
+	if drain.registering || drain.draining {
+		return false
+	}
+	drain.registering = true
+	return true
+}
+
+func endRegistration() {
+	drain.mu.Lock()
+	drain.registering = false
 	drain.mu.Unlock()
+}
+
+func registrationInProgress() bool {
+	drain.mu.Lock()
+	defer drain.mu.Unlock()
+	return drain.registering
 }
 
 // reopenAdmission exits draining and returns the agent to normal admission.

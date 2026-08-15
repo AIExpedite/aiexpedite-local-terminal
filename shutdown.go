@@ -60,6 +60,14 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 
 	fmt.Println("[shutdown] Starting graceful shutdown sequence")
 
+	// Stop the updater before any teardown can make a draining device appear
+	// idle. Otherwise an explicit Quit/SIGTERM could launch a replacement and
+	// restart the app while this path is terminating sessions.
+	drainAttemptID := ""
+	if globalAutoUpdater != nil {
+		drainAttemptID = globalAutoUpdater.stopForShutdown()
+	}
+
 	// Step 1: Flip local offline state and tell the Pub/Sub loop to stop.
 	// Do not persist OfflineMode here — process exit shouldn't permanently
 	// mark the user as disconnected; persistence is reserved for explicit
@@ -82,9 +90,9 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// onTrayExit, which restarts and reconciles the attempt on next launch.)
 	// Best-effort — an undeliverable report never blocks teardown, and the next
 	// launch's resolveInterruptedAttempt / drain expiry resolves it either way.
-	if cfg != nil && cfg.IsRegistered() && !cfg.OfflineMode && isDraining() {
+	if cfg != nil && cfg.IsRegistered() && !cfg.OfflineMode && drainAttemptID != "" {
 		exitCtx, exitCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := notifyDrainExit(exitCtx, cfg, drainingAttempt(), "deferred"); err != nil {
+		if err := notifyDrainExit(exitCtx, cfg, drainAttemptID, "deferred"); err != nil {
 			fmt.Printf("%s[shutdown] notifyDrainExit(deferred) failed: %v%s\n", colorYellow, err, colorReset)
 		}
 		exitCancel()
