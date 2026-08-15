@@ -93,8 +93,9 @@ func SetOffline(offline bool, cfg ...*Config) {
 	// survives a reboot / auto-update / crash recovery. Nil-safe: callers
 	// from tests or signal handlers may not have a live config reference.
 	if len(cfg) > 0 && cfg[0] != nil {
-		cfg[0].OfflineMode = offline
-		if err := cfg[0].Save(ConfigPath()); err != nil {
+		if err := cfg[0].MutateAndSave(ConfigPath(), func() {
+			cfg[0].OfflineMode = offline
+		}); err != nil {
 			fmt.Printf("%s[offline] Failed to save offline state: %v%s\n", colorYellow, err, colorReset)
 		}
 	}

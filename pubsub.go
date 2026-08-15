@@ -770,14 +770,15 @@ func StartPubSubLoop(cfg *Config) {
 			fmt.Printf("%s[pubsub] Clearing local registration. Please re-register the device.%s\n", colorYellow, colorReset)
 
 			// Clear registration credentials from config
-			cfg.AgentID = ""
-			cfg.CommandSecret = ""
-			cfg.UserID = ""
-			cfg.RegisteredAt = ""
-			cfg.TokenEndpoint = ""
-			cfg.WIFAudience = ""
-			cfg.WIFServiceAccount = ""
-			if err := cfg.Save(ConfigPath()); err != nil {
+			if err := cfg.MutateAndSave(ConfigPath(), func() {
+				cfg.AgentID = ""
+				cfg.CommandSecret = ""
+				cfg.UserID = ""
+				cfg.RegisteredAt = ""
+				cfg.TokenEndpoint = ""
+				cfg.WIFAudience = ""
+				cfg.WIFServiceAccount = ""
+			}); err != nil {
 				fmt.Printf("[pubsub] Failed to save config: %v\n", err)
 			}
 

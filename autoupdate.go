@@ -75,7 +75,6 @@ var (
 	// Pending update state (when user clicks "Later" on the manual dialog).
 	pendingUpdateInfo  *UpdateInfo
 	pendingUpdateMutex sync.RWMutex
-	updateAttemptCfgMu sync.Mutex
 )
 
 // SetUpdateReady stores the path of the downloaded update binary and marks the
@@ -211,6 +210,7 @@ type autoUpdater struct {
 	activeWork     func() int
 	claimInstall   func() bool
 	installable    func() (bool, string)
+	registering    func() bool
 	drainEnter     func(ctx context.Context, attemptID, target string) error
 	drainConfirm   func(ctx context.Context, attemptID, target string) error
 	drainExit      func(ctx context.Context, attemptID, reason string) error
@@ -253,6 +253,7 @@ func newAutoUpdater(cfg *Config, tray *trayUpdateHandles) *autoUpdater {
 		activeWork:     ActiveWork,
 		claimInstall:   sealDrainForInstall,
 		installable:    installUpdatable,
+		registering:    func() bool { return false },
 		savePath:       ConfigPath(),
 		stopCh:         make(chan struct{}),
 		triggerCh:      make(chan struct{}, 1),
@@ -280,8 +281,11 @@ func newAutoUpdater(cfg *Config, tray *trayUpdateHandles) *autoUpdater {
 
 // StartAutoUpdateScheduler launches the background scheduler. Replaces the old
 // one-shot 3-second proactive check. Safe to call once from onTrayReady.
-func StartAutoUpdateScheduler(cfg *Config, tray *trayUpdateHandles) *autoUpdater {
+func StartAutoUpdateScheduler(cfg *Config, tray *trayUpdateHandles, registering func() bool) *autoUpdater {
 	au := newAutoUpdater(cfg, tray)
+	if registering != nil {
+		au.registering = registering
+	}
 	globalAutoUpdater = au
 	go au.run()
 	return au
@@ -382,9 +386,10 @@ func (au *autoUpdater) runAttempt() {
 	if au.takeoverRequested() {
 		return
 	}
-	updateAttemptCfgMu.Lock()
-	reconciliationPending := au.cfg.PendingUpdateAttemptID != ""
-	updateAttemptCfgMu.Unlock()
+	var reconciliationPending bool
+	au.cfg.WithPersistenceLock(func() {
+		reconciliationPending = au.cfg.PendingUpdateAttemptID != ""
+	})
 	if reconciliationPending {
 		fmt.Println("[autoupdate] Skipping check while restart reconciliation is pending")
 		return
@@ -406,6 +411,10 @@ func (au *autoUpdater) runAttempt() {
 		SetPendingUpdate(info)
 		return
 	}
+	if au.registering() {
+		fmt.Println("[autoupdate] Skipping automatic install while device registration is in progress")
+		return
+	}
 
 	// A read-only / not-yet-relocated install cannot update itself. Say so in
 	// the tray and stop — never retry silently in a loop.
@@ -421,6 +430,11 @@ func (au *autoUpdater) runAttempt() {
 		return // no update, or abandoned after retries
 	}
 	if au.takeoverRequested() {
+		_ = os.Remove(path)
+		return
+	}
+	if au.registering() {
+		fmt.Println("[autoupdate] Deferring verified update while device registration is in progress")
 		_ = os.Remove(path)
 		return
 	}
@@ -729,33 +743,28 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 
 // persistAttempt / clearAttempt maintain the crash-recovery marker.
 func (au *autoUpdater) persistAttempt(attemptID, target string) error {
-	updateAttemptCfgMu.Lock()
-	defer updateAttemptCfgMu.Unlock()
-	previousAttempt := au.cfg.PendingUpdateAttemptID
-	previousVersion := au.cfg.PendingUpdateVersion
-	previousApplied := au.cfg.PendingUpdateApplied
-	au.cfg.PendingUpdateAttemptID = attemptID
-	au.cfg.PendingUpdateVersion = target
-	au.cfg.PendingUpdateApplied = false
-	if err := au.cfg.Save(au.savePath); err != nil {
+	var previousAttempt, previousVersion string
+	var previousApplied bool
+	return au.cfg.MutateAndSaveRollback(au.savePath, func() {
+		previousAttempt = au.cfg.PendingUpdateAttemptID
+		previousVersion = au.cfg.PendingUpdateVersion
+		previousApplied = au.cfg.PendingUpdateApplied
+		au.cfg.PendingUpdateAttemptID = attemptID
+		au.cfg.PendingUpdateVersion = target
+		au.cfg.PendingUpdateApplied = false
+	}, func() {
 		au.cfg.PendingUpdateAttemptID = previousAttempt
 		au.cfg.PendingUpdateVersion = previousVersion
 		au.cfg.PendingUpdateApplied = previousApplied
-		return err
-	}
-	return nil
+	})
 }
 
 func (au *autoUpdater) clearAttempt() {
-	updateAttemptCfgMu.Lock()
-	defer updateAttemptCfgMu.Unlock()
-	if au.cfg.PendingUpdateAttemptID == "" && au.cfg.PendingUpdateVersion == "" && !au.cfg.PendingUpdateApplied {
-		return
-	}
-	au.cfg.PendingUpdateAttemptID = ""
-	au.cfg.PendingUpdateVersion = ""
-	au.cfg.PendingUpdateApplied = false
-	if err := au.cfg.Save(au.savePath); err != nil {
+	if err := au.cfg.MutateAndSave(au.savePath, func() {
+		au.cfg.PendingUpdateAttemptID = ""
+		au.cfg.PendingUpdateVersion = ""
+		au.cfg.PendingUpdateApplied = false
+	}); err != nil {
 		fmt.Printf("[autoupdate] Could not clear attempt marker: %v\n", err)
 	}
 }
@@ -806,18 +815,26 @@ func resolveInterruptedAttempt(cfg *Config) bool {
 // caller must then suppress the generic boot-time /online call, which lacks the
 // attempt identity and could make a later targeted reconciliation a no-op.
 func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) bool {
-	updateAttemptCfgMu.Lock()
-	defer updateAttemptCfgMu.Unlock()
-	if cfg == nil || cfg.PendingUpdateAttemptID == "" {
+	if cfg == nil {
 		return false
 	}
-	attemptID := cfg.PendingUpdateAttemptID
-	target := cfg.PendingUpdateVersion
+	var attemptID, target string
+	var applied, registered, offline bool
+	cfg.WithPersistenceLock(func() {
+		attemptID = cfg.PendingUpdateAttemptID
+		target = cfg.PendingUpdateVersion
+		applied = cfg.PendingUpdateApplied
+		registered = cfg.IsRegistered()
+		offline = cfg.OfflineMode
+	})
+	if attemptID == "" {
+		return false
+	}
 
 	reopenAdmission()
 
-	if !cfg.IsRegistered() || cfg.OfflineMode {
-		clearInterruptedAttempt(cfg, savePath)
+	if !registered || offline {
+		clearInterruptedAttempt(cfg, savePath, attemptID)
 		return false
 	}
 
@@ -827,7 +844,7 @@ func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) bool {
 	// already-online response can discard the attempt/version outcome.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if cfg.PendingUpdateApplied && Version == target {
+	if applied && Version == target {
 		// The update landed. Report ready on the new version + attempt id so
 		// the service reconciles the drain it cleared.
 		if err := notifyOnlineWithVersion(ctx, cfg, Version, attemptID); err != nil {
@@ -847,15 +864,19 @@ func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) bool {
 		}
 	}
 
-	clearInterruptedAttempt(cfg, savePath)
+	clearInterruptedAttempt(cfg, savePath, attemptID)
 	return false
 }
 
-func clearInterruptedAttempt(cfg *Config, savePath string) {
-	cfg.PendingUpdateAttemptID = ""
-	cfg.PendingUpdateVersion = ""
-	cfg.PendingUpdateApplied = false
-	if err := cfg.Save(savePath); err != nil {
+func clearInterruptedAttempt(cfg *Config, savePath, attemptID string) {
+	if err := cfg.MutateAndSave(savePath, func() {
+		if cfg.PendingUpdateAttemptID != attemptID {
+			return
+		}
+		cfg.PendingUpdateAttemptID = ""
+		cfg.PendingUpdateVersion = ""
+		cfg.PendingUpdateApplied = false
+	}); err != nil {
 		fmt.Printf("[autoupdate] Could not clear interrupted attempt marker: %v\n", err)
 	}
 }

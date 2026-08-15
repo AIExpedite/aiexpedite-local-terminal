@@ -119,8 +119,11 @@ func main() {
 		}
 	}
 	if updateApplied && cfg.PendingUpdateAttemptID != "" && cfg.PendingUpdateVersion == Version {
-		cfg.PendingUpdateApplied = true
-		if err := cfg.Save(ConfigPath()); err != nil {
+		if err := cfg.MutateAndSave(ConfigPath(), func() {
+			if cfg.PendingUpdateAttemptID != "" && cfg.PendingUpdateVersion == Version {
+				cfg.PendingUpdateApplied = true
+			}
+		}); err != nil {
 			fmt.Printf("[update] Could not persist successful replacement marker: %v\n", err)
 		}
 	}
@@ -392,7 +395,7 @@ func onTrayReady(cfg *Config) func() {
 				mInstallUpdate.Show()
 			},
 		}
-		StartAutoUpdateScheduler(cfg, trayHandles)
+		StartAutoUpdateScheduler(cfg, trayHandles, registering.Load)
 
 		// Create debug click channel - nil channel blocks forever in select, which is what we want for prod
 		var debugClickCh <-chan struct{}
@@ -424,10 +427,9 @@ func onTrayReady(cfg *Config) func() {
 					// SetAllowAllCommands. Pub/Sub Receive callbacks only
 					// ever read the atomic via cfg.IsAllowAllCommands(), so
 					// mutating the bool field here while Save() is running
-					// does NOT race with the readers. We deliberately delay
-					// publishing the new value to the atomic until AFTER
-					// Save succeeds — a failed write must leave gating
-					// behaviour unchanged from the readers' perspective.
+					// does NOT race with the readers. Enabling delays publication
+					// to the runtime atomic until AFTER Save succeeds; disabling
+					// publishes immediately so a failed write still fails closed.
 					if mAllowAll.Checked() {
 						// ── Disable bypass — restore normal allow-list posture ──
 						// Fail CLOSED: the user's intent is to re-enforce gating,
@@ -435,10 +437,10 @@ func onTrayReady(cfg *Config) func() {
 						// regardless of whether Save() succeeds. A persistence
 						// failure only means the change may not survive restart;
 						// it must not leave the Pub/Sub readers bypassing checks.
-						cfg.AllowAllCommands = false
-						cfg.SetAllowAllCommands(false)
 						mAllowAll.Uncheck()
-						if err := cfg.Save(ConfigPath()); err != nil {
+						if err := cfg.MutateAndSave(ConfigPath(), func() {
+							cfg.SetAllowAllCommands(false)
+						}); err != nil {
 							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
 							ShowErrorDialog("Allow All Commands",
 								fmt.Sprintf("Allow All Commands has been disabled, but the change could not be saved:\n\n%v\n\nThe bypass is OFF now, but may be restored on next restart.", err))
@@ -454,15 +456,17 @@ func onTrayReady(cfg *Config) func() {
 							continue
 						}
 						prev := cfg.AllowAllCommands
-						cfg.AllowAllCommands = true
-						if err := cfg.Save(ConfigPath()); err != nil {
+						if err := cfg.MutateAndSaveRollback(ConfigPath(), func() {
+							cfg.AllowAllCommands = true
+						}, func() {
 							cfg.AllowAllCommands = prev
+						}); err != nil {
 							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
 							ShowErrorDialog("Allow All Commands",
 								fmt.Sprintf("Could not enable Allow All Commands — config save failed:\n\n%v\n\nThe bypass remains disabled.", err))
 							continue
 						}
-						cfg.SetAllowAllCommands(true)
+						cfg.allowAllRuntime.Store(true)
 						mAllowAll.Check()
 						LogSecurityEvent(SecEvtAllowAllEnabled,
 							"Allow All Commands enabled by user — allow list bypassed")
@@ -536,8 +540,9 @@ func onTrayReady(cfg *Config) func() {
 							mInstallUpdate.SetTooltip("Click to install the pending update")
 							mInstallUpdate.Show()
 						case SkipVersion:
-							cfg.SkippedVersion = info.LatestVersion
-							_ = cfg.Save(ConfigPath())
+							_ = cfg.MutateAndSave(ConfigPath(), func() {
+								cfg.SkippedVersion = info.LatestVersion
+							})
 						}
 					}()
 
@@ -622,8 +627,8 @@ func onTrayReady(cfg *Config) func() {
 
 				case <-debugClickCh:
 					// Toggle debug mode (only in non-prod)
-					cfg.DebugMode = !cfg.DebugMode
-					if cfg.DebugMode {
+					debugMode := !cfg.DebugMode
+					if debugMode {
 						mDebug.Check()
 						fmt.Printf("%s[debug] Debug mode ENABLED - showing detailed command/response info%s\n", colorMagenta, colorReset)
 					} else {
@@ -631,7 +636,9 @@ func onTrayReady(cfg *Config) func() {
 						fmt.Printf("%s[debug] Debug mode DISABLED%s\n", colorMagenta, colorReset)
 					}
 					// Save to config so it persists
-					if err := cfg.Save(ConfigPath()); err != nil {
+					if err := cfg.MutateAndSave(ConfigPath(), func() {
+						cfg.DebugMode = debugMode
+					}); err != nil {
 						fmt.Printf("[debug] Failed to save config: %v\n", err)
 					}
 

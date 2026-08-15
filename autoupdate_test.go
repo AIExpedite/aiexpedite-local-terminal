@@ -37,15 +37,16 @@ func TestSetUpdateHandoffSuppressesArtifactLaunch(t *testing.T) {
 type autoTestRig struct {
 	au *autoUpdater
 
-	mu             sync.Mutex
-	clock          time.Time
-	activeWork     int
-	checkErr       error
-	verifyErr      error
-	applyErr       error
-	installableOK  bool
-	installableMsg string
-	info           *UpdateInfo
+	mu                  sync.Mutex
+	clock               time.Time
+	activeWork          int
+	checkErr            error
+	verifyErr           error
+	applyErr            error
+	installableOK       bool
+	installableMsg      string
+	registrationPending bool
+	info                *UpdateInfo
 
 	checkCalls   int
 	verifyCalls  int
@@ -101,6 +102,7 @@ func newAutoTestRig(t *testing.T, cfg *Config) *autoTestRig {
 		activeWork:   func() int { r.mu.Lock(); defer r.mu.Unlock(); return r.activeWork },
 		claimInstall: func() bool { r.mu.Lock(); defer r.mu.Unlock(); return r.activeWork == 0 },
 		installable:  func() (bool, string) { r.mu.Lock(); defer r.mu.Unlock(); return r.installableOK, r.installableMsg },
+		registering:  func() bool { r.mu.Lock(); defer r.mu.Unlock(); return r.registrationPending },
 		drainEnter: func(_ context.Context, _, _ string) error {
 			r.mu.Lock()
 			defer r.mu.Unlock()
@@ -186,6 +188,46 @@ func TestRunAttempt_UnregisteredInstallsWithoutDraining(t *testing.T) {
 	}
 }
 
+func TestRunAttempt_RegistrationInProgressDefersAutomaticInstall(t *testing.T) {
+	r := newAutoTestRig(t, DefaultConfig())
+	r.registrationPending = true
+
+	r.au.runAttempt()
+
+	if r.checkCalls != 0 || r.verifyCalls != 0 || r.applyCalls != 0 {
+		t.Fatalf("registration must defer check/download/install, got check=%d verify=%d apply=%d",
+			r.checkCalls, r.verifyCalls, r.applyCalls)
+	}
+	if isDraining() {
+		t.Fatal("registration deferral must not enter draining")
+	}
+}
+
+func TestRunAttempt_RegistrationStartingDuringDownloadDefersBeforeDrain(t *testing.T) {
+	r := newAutoTestRig(t, DefaultConfig())
+	artifact := filepath.Join(t.TempDir(), "verified-update")
+	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.au.downloadVerify = func(_ *UpdateInfo) (string, error) {
+		r.mu.Lock()
+		r.verifyCalls++
+		r.registrationPending = true
+		r.mu.Unlock()
+		return artifact, nil
+	}
+
+	r.au.runAttempt()
+
+	if r.applyCalls != 0 || r.drainEnter != 0 || isDraining() {
+		t.Fatalf("registration beginning during download must defer before drain (apply=%d enter=%d draining=%v)",
+			r.applyCalls, r.drainEnter, isDraining())
+	}
+	if _, err := os.Stat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("deferred verified artifact was not removed: %v", err)
+	}
+}
+
 func TestRunAttempt_RegisteredReportsDrainThenInstalls(t *testing.T) {
 	r := newAutoTestRig(t, registeredCfg())
 	r.activeWork = 0
@@ -202,7 +244,8 @@ func TestDrainAndInstall_AbortsWhenAttemptMarkerCannotBePersisted(t *testing.T) 
 	cfg := registeredCfg()
 	r := newAutoTestRig(t, cfg)
 	r.activeWork = 0
-	r.au.savePath = filepath.Join(t.TempDir(), "missing", "config.json")
+	// Replacing a directory with a config file fails on every supported OS.
+	r.au.savePath = t.TempDir()
 
 	r.au.runAttempt()
 

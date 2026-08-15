@@ -5,10 +5,21 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"sync/atomic"
 )
+
+// configPersistenceMu is the single writer lock for the live Config and its
+// on-disk representation. Every mutation that is persisted must hold this
+// lock from before changing memory until after the atomic file replacement,
+// otherwise concurrent registration, tray, and updater saves can lose fields.
+var configPersistenceMu sync.Mutex
+
+// Indirected for failure-path tests. Production always uses the platform's
+// atomic same-directory replacement primitive.
+var configAtomicReplace = atomicReplaceConfigFile
 
 // Config holds configuration for the agent, loaded from a JSON file.
 type Config struct {
@@ -301,24 +312,92 @@ func (cfg *Config) SetAutoUpdate(v bool) {
 // operation. If writing fails, both in-memory representations return to the
 // last successfully persisted value.
 func (cfg *Config) SetAndSaveAutoUpdate(v bool, path string) error {
+	configPersistenceMu.Lock()
+	defer configPersistenceMu.Unlock()
 	previous := cfg.IsAutoUpdate()
-	cfg.SetAutoUpdate(v)
-	if err := cfg.Save(path); err != nil {
-		cfg.SetAutoUpdate(previous)
+	if cfg.AutoUpdate == nil {
+		cfg.AutoUpdate = new(bool)
+	}
+	*cfg.AutoUpdate = v
+	if err := cfg.saveLocked(path); err != nil {
+		*cfg.AutoUpdate = previous
+		return err
+	}
+	cfg.autoUpdateRuntime.Store(v)
+	return nil
+}
+
+func (cfg *Config) Save(path string) error {
+	configPersistenceMu.Lock()
+	defer configPersistenceMu.Unlock()
+	return cfg.saveLocked(path)
+}
+
+// MutateAndSave serializes an in-memory config mutation with its durable
+// write. Callers must put every field change that belongs to the save inside
+// mutate; Save alone cannot protect a mutation performed before it acquires
+// the writer lock.
+func (cfg *Config) MutateAndSave(path string, mutate func()) error {
+	configPersistenceMu.Lock()
+	defer configPersistenceMu.Unlock()
+	mutate()
+	return cfg.saveLocked(path)
+}
+
+// MutateAndSaveRollback is MutateAndSave with an in-memory rollback that runs
+// under the same lock when persistence fails. This prevents another writer
+// from observing or saving a mutation that never became durable.
+func (cfg *Config) MutateAndSaveRollback(path string, mutate, rollback func()) error {
+	configPersistenceMu.Lock()
+	defer configPersistenceMu.Unlock()
+	mutate()
+	if err := cfg.saveLocked(path); err != nil {
+		rollback()
 		return err
 	}
 	return nil
 }
 
-func (cfg *Config) Save(path string) error {
+// WithPersistenceLock provides a consistent snapshot for updater bookkeeping
+// reads that must not interleave with another config mutation.
+func (cfg *Config) WithPersistenceLock(read func()) {
+	configPersistenceMu.Lock()
+	defer configPersistenceMu.Unlock()
+	read()
+}
+
+func (cfg *Config) saveLocked(path string) error {
 	b, err := json.MarshalIndent(cfg, "", "    ")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(GetConfigDir(), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o600)
+
+	tmp, err := os.CreateTemp(dir, ".config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return configAtomicReplace(tmpPath, path)
 }
 
 // IsRegistered returns true if the device has been registered with the backend.
