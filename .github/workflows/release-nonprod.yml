@@ -490,11 +490,13 @@ jobs:
           appname = os.path.basename(application)
           format = "UDZO"
           files = [application]
-          symlinks = {"Applications": "/Applications"}
+          # Do not add the conventional /Applications shortcut: this app must
+          # be copied to the user's ~/Applications directory for silent updates.
+          symlinks = {}
           icon = defines.get("volume_icon", None)
           icon_size = 100
           background = defines.get("background")
-          icon_locations = {appname: (150, 190), "Applications": (450, 190)}
+          icon_locations = {appname: (300, 190)}
           window_rect = ((200, 120), (600, 400))
           default_view = "icon-view"
           PYEOF

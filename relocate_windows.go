@@ -44,7 +44,10 @@ func maybeRelocateInstall(_ *Config) bool {
 	if localAppData == "" {
 		return false
 	}
-	destDir := filepath.Join(localAppData, "AIExpedite"+EnvConfigSuffix)
+	// Keep relocation aligned with the Inno installers' {#MyAppName}
+	// directories (for example "AI Expedite (Dev)"). EnvDisplayName is set
+	// from the same per-environment build metadata.
+	destDir := windowsPerUserInstallDir(localAppData)
 	destExe := filepath.Join(destDir, filepath.Base(exe))
 
 	// A previous run may have already relocated: if the destination exe exists
@@ -73,6 +76,10 @@ func maybeRelocateInstall(_ *Config) bool {
 		return false
 	}
 	return true
+}
+
+func windowsPerUserInstallDir(localAppData string) string {
+	return filepath.Join(localAppData, EnvDisplayName)
 }
 
 // copyInstallTree copies the contents of srcDir into destDir, preserving the
