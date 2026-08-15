@@ -16,7 +16,9 @@
 //     commands through so accepted sessions can finish. Demand commands are
 //     counted until their correlated result has been published. It is an ALLOWLIST of
 //     pass-through commands, not a denylist of starts, so a work type added
-//     later is refused by default without needing its own opt-in.
+//     later is refused by default without needing its own opt-in. Admitted
+//     continuation callbacks are counted through their final correlated
+//     publish, and are refused once the idle drain is sealed for replacement.
 //
 //  2. ActiveWork() — the single aggregate in-flight count. Before this the
 //     count was scattered across the session manager, four CLI-agent managers,
@@ -64,6 +66,10 @@ type drainState struct {
 	// correlated result before an update may restart the process. Pings are
 	// deliberately excluded because they carry no durable backend marker.
 	operationalCommands int
+	// continuationCommands counts callbacks for work accepted before draining.
+	// Managers normally keep the drain open, but this closes the race where a
+	// session disappears while its final input/end callback is still publishing.
+	continuationCommands int
 
 	// uploads / approvals count the two work classes with no manager to ask.
 	uploads           int
@@ -163,11 +169,12 @@ func reopenAdmission() {
 // admitWork is the single admission decision for an inbound command. It returns
 // whether the command may proceed and, for accepted work starts and demand
 // commands, a release function the caller MUST defer so the callback is
-// counted for exactly its processing lifetime. release is nil when there is
-// nothing to release (continuation traffic, pings, or a refused start).
+// counted for exactly its processing lifetime. release is nil only for pings,
+// untracked traffic outside a drain, or a refused command.
 func admitWork(cmd commandMsg) (admitted bool, release func()) {
 	start := isWorkStartCommand(cmd)
 	trackedOperational := isInternalDemandCommand(cmd.Command)
+	continuation := isWorkContinuationCommand(cmd)
 
 	drain.mu.Lock()
 	if drain.draining {
@@ -178,16 +185,21 @@ func admitWork(cmd commandMsg) (admitted bool, release func()) {
 			drain.mu.Unlock()
 			return false, nil
 		}
-		if trackedOperational {
+		if trackedOperational || continuation {
 			// Once the updater atomically seals an idle drain for install,
-			// demand callbacks may no longer enter and recreate active work.
+			// demand and continuation callbacks may no longer enter and
+			// recreate active work after the zero-work observation.
 			if drain.installing {
 				drain.mu.Unlock()
 				return false, nil
 			}
-			drain.operationalCommands++
+			if trackedOperational {
+				drain.operationalCommands++
+			} else {
+				drain.continuationCommands++
+			}
 			drain.mu.Unlock()
-			return true, drain.releaseOperationalCommand()
+			return true, drain.releaseTrackedCommand(trackedOperational)
 		}
 		drain.mu.Unlock()
 		return true, nil
@@ -204,7 +216,12 @@ func admitWork(cmd commandMsg) (admitted bool, release func()) {
 	if trackedOperational {
 		drain.operationalCommands++
 		drain.mu.Unlock()
-		return true, drain.releaseOperationalCommand()
+		return true, drain.releaseTrackedCommand(true)
+	}
+	if continuation {
+		drain.continuationCommands++
+		drain.mu.Unlock()
+		return true, drain.releaseTrackedCommand(false)
 	}
 	drain.mu.Unlock()
 	return true, nil
@@ -224,15 +241,17 @@ func (d *drainState) releaseStart() func() {
 	}
 }
 
-// releaseOperationalCommand returns an idempotent function that releases a
-// demand callback after its correlated result publish has completed.
-func (d *drainState) releaseOperationalCommand() func() {
+// releaseTrackedCommand returns an idempotent function that releases a demand
+// or continuation callback after its correlated result publish has completed.
+func (d *drainState) releaseTrackedCommand(operational bool) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			d.mu.Lock()
-			if d.operationalCommands > 0 {
+			if operational && d.operationalCommands > 0 {
 				d.operationalCommands--
+			} else if !operational && d.continuationCommands > 0 {
+				d.continuationCommands--
 			}
 			d.mu.Unlock()
 		})
@@ -345,7 +364,7 @@ func (d *drainState) activeWorkLocked() int {
 	}
 	drainWorkSourcesMu.Unlock()
 
-	total += d.pendingStarts + d.operationalCommands + d.uploads + d.approvals + d.terminalPublishes
+	total += d.pendingStarts + d.operationalCommands + d.continuationCommands + d.uploads + d.approvals + d.terminalPublishes
 	return total
 }
 
@@ -396,6 +415,13 @@ func isDrainPassThrough(cmd commandMsg) bool {
 	if isOperationalCommand(cmd.Command) {
 		return true
 	}
+	return isWorkContinuationCommand(cmd)
+}
+
+// isWorkContinuationCommand reports traffic correlated to work accepted before
+// a drain. These callbacks remain deliverable while draining, but are tracked
+// until they return and are no longer admitted after the install seal.
+func isWorkContinuationCommand(cmd commandMsg) bool {
 	switch cmd.Type {
 	case "session_input", "session_signal", "session_end",
 		"codex_appserver_send", "codex_appserver_end",

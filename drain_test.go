@@ -18,6 +18,7 @@ func resetDrainState(t *testing.T) {
 	drain.registering = false
 	drain.pendingStarts = 0
 	drain.operationalCommands = 0
+	drain.continuationCommands = 0
 	drain.uploads = 0
 	drain.approvals = 0
 	drain.terminalPublishes = 0
@@ -67,6 +68,34 @@ func TestSealDrainForInstallRefusesNewDemandCommands(t *testing.T) {
 	admitted, release := admitWork(commandMsg{Command: "__ping__"})
 	if !admitted || release != nil {
 		t.Fatal("ping should remain admitted after install seal")
+	}
+}
+
+func TestContinuationCallbacksHoldDrainOpenThroughInstallSeal(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	// A continuation already executing when draining begins must prevent the
+	// updater from observing an idle agent after its manager session disappears.
+	admitted, release := admitWork(commandMsg{Type: "session_input"})
+	if !admitted || release == nil {
+		t.Fatal("continuation should be admitted and tracked before draining")
+	}
+	closeAdmission("attempt-continuation")
+	if got := ActiveWork(); got != 1 {
+		t.Fatalf("ActiveWork() = %d while continuation callback is running, want 1", got)
+	}
+	if sealDrainForInstall() {
+		t.Fatal("install seal must wait for the continuation callback")
+	}
+
+	release()
+	if !sealDrainForInstall() {
+		t.Fatal("idle drain should seal after the continuation callback returns")
+	}
+	admitted, release = admitWork(commandMsg{Type: "codex_appserver_send"})
+	if admitted || release != nil {
+		t.Fatal("continuation must be refused after the install seal")
 	}
 }
 
@@ -187,7 +216,10 @@ func TestAdmitWork_WhileDraining(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _ := admitWork(tc.cmd)
+			got, release := admitWork(tc.cmd)
+			if release != nil {
+				defer release()
+			}
 			if got != tc.wantAdm {
 				t.Fatalf("admitWork(%+v) = %v, want %v", tc.cmd, got, tc.wantAdm)
 			}
