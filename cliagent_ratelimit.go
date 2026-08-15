@@ -39,11 +39,18 @@ import (
 
 // Claude rate-limit window identifiers, as emitted by Claude Code's
 // rate_limit_event.rate_limit_type and the status-line rate_limits map keys.
+//
+// The per-model seven-day splits (Sonnet/Opus) aggregate into the single
+// "Weekly quota" row, because they meter the SAME weekly allowance. The Fable
+// window does not: Claude Code's own /usage panel reports it as a separate
+// "Weekly Fable" meter, so cliagent_usage_claudecode.go reads it as its own row
+// rather than folding it into that aggregate.
 const (
 	claudeWindowFiveHour       = "five_hour"
 	claudeWindowSevenDay       = "seven_day"
 	claudeWindowSevenDayOpus   = "seven_day_opus"
 	claudeWindowSevenDaySonnet = "seven_day_sonnet"
+	claudeWindowSevenDayFable  = "seven_day_fable"
 )
 
 // claudeRateLimitStatusRejected is the status value Claude Code sets once a

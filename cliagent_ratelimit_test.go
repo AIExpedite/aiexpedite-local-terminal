@@ -130,8 +130,11 @@ func TestClaudeCodeMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	}, now, "")
 
 	metrics := claudeCodeMetricsFromCache(now, "")
-	if len(metrics) != 2 {
-		t.Fatalf("want 2 metrics, got %d", len(metrics))
+	if len(metrics) != 3 {
+		t.Fatalf("want 3 metrics, got %d", len(metrics))
+	}
+	if fable := metrics[2]; fable.Label != "Weekly Fable" || !fable.Unknown {
+		t.Errorf("fable metric=%+v, want an Unknown \"Weekly Fable\" row (no fable bucket cached)", fable)
 	}
 	session := metrics[0]
 	if session.Unknown {
@@ -161,13 +164,16 @@ func TestClaudeCodeMetricsFromCache_NoCacheFallsBackToUnknown(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir()) // isolate from the real ~/.claude hook
 
 	metrics := claudeCodeMetricsFromCache(time.Now(), "")
-	if len(metrics) != 2 {
-		t.Fatalf("want 2 metrics, got %d", len(metrics))
+	if len(metrics) != 3 {
+		t.Fatalf("want 3 metrics, got %d", len(metrics))
 	}
 	for _, m := range metrics {
 		if !m.Unknown {
-			t.Errorf("metric %q should be Unknown without a cache", m.Kind)
+			t.Errorf("metric %q should be Unknown without a cache", m.Label)
 		}
+	}
+	if fable := metrics[2]; fable.Label != "Weekly Fable" || fable.Kind != limitKindWeekly {
+		t.Errorf("fable metric=%+v, want the Unknown \"Weekly Fable\" weekly row", fable)
 	}
 }
 
@@ -244,9 +250,13 @@ func TestClaudeCodeMetricsFromCache_SplitWeeklyAggregatesConservatively(t *testi
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	sonnetReset := now.Add(96 * time.Hour).UnixMilli()
 	opusReset := now.Add(36 * time.Hour).UnixMilli() // sooner — Opus exhausted first
+	fableReset := now.Add(120 * time.Hour).UnixMilli()
 	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
 		claudeWindowSevenDaySonnet: {UsedPercentage: 32, ResetsAtMs: sonnetReset, Status: "allowed", usageKnown: true},
 		claudeWindowSevenDayOpus:   {UsedPercentage: 99, ResetsAtMs: opusReset, Status: "allowed", usageKnown: true},
+		// Fable is metered separately and must NOT move the aggregate below,
+		// even though its 100% is the worst number in the cache.
+		claudeWindowSevenDayFable: {UsedPercentage: 100, ResetsAtMs: fableReset, Status: "rejected", usageKnown: true},
 	}, now, "")
 
 	metrics := claudeCodeMetricsFromCache(now, "")
@@ -255,11 +265,18 @@ func TestClaudeCodeMetricsFromCache_SplitWeeklyAggregatesConservatively(t *testi
 		t.Fatalf("weekly should be observed")
 	}
 	if weekly.Consumed == nil || *weekly.Consumed != 99 {
-		t.Errorf("weekly Consumed=%v, want 99 (worst of sonnet/opus)", weekly.Consumed)
+		t.Errorf("weekly Consumed=%v, want 99 (worst of sonnet/opus; fable must not be folded in)", weekly.Consumed)
 	}
 	wantReset := time.UnixMilli(opusReset).UTC().Format(time.RFC3339)
 	if weekly.ResetAt != wantReset {
 		t.Errorf("weekly ResetAt=%q, want %q (soonest of sonnet/opus)", weekly.ResetAt, wantReset)
+	}
+	fable := metrics[2]
+	if fable.Consumed == nil || *fable.Consumed != 100 {
+		t.Fatalf("fable Consumed=%v, want 100 (its own row)", fable.Consumed)
+	}
+	if wantFableReset := time.UnixMilli(fableReset).UTC().Format(time.RFC3339); fable.ResetAt != wantFableReset {
+		t.Errorf("fable ResetAt=%q, want %q", fable.ResetAt, wantFableReset)
 	}
 }
 

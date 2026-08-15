@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -61,14 +62,6 @@ var runClaudeAuthStatusCommand = func(ctx context.Context, path string, env []st
 	return cmd.Output()
 }
 
-type claudeCredentials struct {
-	Account      string `json:"account"`
-	Email        string `json:"email"`
-	Organization string `json:"organization"`
-	Plan         string `json:"plan"`
-	Subscription string `json:"subscription"`
-}
-
 // claudeDotJSON mirrors the (non-secret) `oauthAccount` block Claude Code writes
 // to ~/.claude.json — the main config file, distinct from .credentials.json.
 // This is the ONLY on-disk place the signed-in account email lives: a
@@ -98,19 +91,36 @@ type claudeDotJSON struct {
 	} `json:"customApiKeyResponses"`
 }
 
-// claudeOAuthCredentials mirrors the nested `claudeAiOauth` object Claude Code
-// writes to .credentials.json for a claude.ai subscription login. The access
+// claudeOAuthCredentials mirrors .credentials.json: the account identifiers
+// older/API-key layouts write at the top level, plus the nested `claudeAiOauth`
+// object Claude Code writes for a claude.ai subscription login. The access
 // token (ExpiresAt) auto-refreshes silently in the real ~/.claude using
 // RefreshToken, so its short expiry is NOT a re-login signal — the user only has
 // to interactively `/login` again once the REFRESH token expires
 // (RefreshTokenExpiresAt). That's the real re-authentication deadline.
+//
+// SubscriptionType is the plan Claude Code itself reports in /usage → ACCOUNT
+// ("max", "pro", …) and is the ONLY place the plan is written: there is no
+// top-level `plan`/`subscription` key, so the card's plan chip is driven from
+// here. Published verbatim (lowercase) — the card capitalizes it for display.
 type claudeOAuthCredentials struct {
+	Account       string `json:"account"`
+	Email         string `json:"email"`
+	Organization  string `json:"organization"`
 	ClaudeAiOauth struct {
 		AccessToken           string `json:"accessToken"`
 		RefreshToken          string `json:"refreshToken"`
 		ExpiresAt             int64  `json:"expiresAt"`
 		RefreshTokenExpiresAt int64  `json:"refreshTokenExpiresAt"`
+		SubscriptionType      string `json:"subscriptionType"`
 	} `json:"claudeAiOauth"`
+}
+
+// claudeCredentialAccount is the stable, per-config-dir identity used for
+// fingerprinting and cache scoping. Empty for the common claude.ai login, whose
+// credential carries only the OAuth token object.
+func (c claudeOAuthCredentials) claudeCredentialAccount() string {
+	return firstNonEmpty(c.Email, c.Account, c.Organization)
 }
 
 // claudeAuthExpiryWarnWindow is how far ahead of the refresh-token deadline we
@@ -204,16 +214,12 @@ func claudeLoginDeadlineMs(creds claudeOAuthCredentials) int64 {
 	return 0
 }
 
-// claudeAuthNoticeFromRaw returns a card notice + severity when the claude.ai
-// subscription login in a raw .credentials.json blob is (nearly) expired.
-// Renewable credentials use the refresh-token expiry; access-token-only
-// credentials use the access expiry because they cannot renew. Returns ("","")
-// when no reliable OAuth deadline is available.
-func claudeAuthNoticeFromRaw(raw []byte, now time.Time) (string, string) {
-	creds := claudeOAuthCredentials{}
-	if json.Unmarshal(raw, &creds) != nil {
-		return "", ""
-	}
+// claudeAuthNotice returns a card notice + severity when the claude.ai
+// subscription login is (nearly) expired. Renewable credentials use the
+// refresh-token expiry; access-token-only credentials use the access expiry
+// because they cannot renew. Returns ("","") when no reliable OAuth deadline is
+// available.
+func claudeAuthNotice(creds claudeOAuthCredentials, now time.Time) (string, string) {
 	deadlineMs := claudeLoginDeadlineMs(creds)
 	if deadlineMs <= 0 {
 		return "", "" // no OAuth deadline (API-key or unexpected layout) — don't guess
@@ -228,12 +234,8 @@ func claudeAuthNoticeFromRaw(raw []byte, now time.Time) (string, string) {
 	return "", ""
 }
 
-func applyClaudeAuthState(usage *cliAgentUsage, raw []byte, now time.Time) bool {
-	if usage == nil || len(raw) == 0 {
-		return false
-	}
-	creds := claudeOAuthCredentials{}
-	if json.Unmarshal(raw, &creds) != nil {
+func applyClaudeAuthState(usage *cliAgentUsage, creds claudeOAuthCredentials, now time.Time) bool {
+	if usage == nil {
 		return false
 	}
 	oauth := creds.ClaudeAiOauth
@@ -272,29 +274,30 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 		CollectedAt: now.UTC().Format(time.RFC3339),
 	}
 
-	// Read the credential ONCE (file, or macOS Keychain) and use it for both the
-	// account/plan fingerprint and the auth-expiry notice.
+	// Read AND decode the credential ONCE (file, or macOS Keychain), then use the
+	// decoded value for the account fingerprint, the plan chip, and the
+	// auth-expiry notice — one shape, so those three can never disagree.
 	credentialFound := false
 	credentialUsable := false
 	if raw, ok := readClaudeCredentialsRaw(base); ok {
 		credentialFound = true
-		credentialUsable = applyClaudeAuthState(usage, raw, now)
-		creds := claudeCredentials{}
+		creds := claudeOAuthCredentials{}
 		if json.Unmarshal(raw, &creds) == nil {
-			usage.Account = firstNonEmpty(creds.Email, creds.Account, creds.Organization)
-			usage.Plan = firstNonEmpty(creds.Plan, creds.Subscription)
-		}
+			credentialUsable = applyClaudeAuthState(usage, creds, now)
+			usage.Account = creds.claudeCredentialAccount()
+			usage.Plan = creds.ClaudeAiOauth.SubscriptionType
 
-		// Proactive auth-expiry notice. Chat-direct Claude spawns
-		// `claude --output-format stream-json` with env credentials stripped
-		// (claude_auth_detect.go) so it MUST use the claude.ai subscription login —
-		// an expired one stalls the session on a `/login` it can't show headlessly.
-		// Surface it in this regular usage scan so the dashboard prompts a re-login
-		// first. (No numeric usage-limit notice exists on this parser, so there's
-		// nothing to prioritize against.)
-		if notice, severity := claudeAuthNoticeFromRaw(raw, now); notice != "" {
-			usage.Notice = notice
-			usage.NoticeSeverity = severity
+			// Proactive auth-expiry notice. Chat-direct Claude spawns
+			// `claude --output-format stream-json` with env credentials stripped
+			// (claude_auth_detect.go) so it MUST use the claude.ai subscription login —
+			// an expired one stalls the session on a `/login` it can't show headlessly.
+			// Surface it in this regular usage scan so the dashboard prompts a re-login
+			// first. (No numeric usage-limit notice exists on this parser, so there's
+			// nothing to prioritize against.)
+			if notice, severity := claudeAuthNotice(creds, now); notice != "" {
+				usage.Notice = notice
+				usage.NoticeSeverity = severity
+			}
 		}
 	}
 
@@ -524,9 +527,9 @@ func currentClaudeAccountFingerprint() string {
 	}
 	account := ""
 	if raw, ok := readClaudeCredentialsRaw(base); ok {
-		creds := claudeCredentials{}
+		creds := claudeOAuthCredentials{}
 		if json.Unmarshal(raw, &creds) == nil {
-			account = firstNonEmpty(creds.Email, creds.Account, creds.Organization)
+			account = creds.claudeCredentialAccount()
 		}
 	}
 	return fingerprintAccount("claudeCode", account)
@@ -599,8 +602,8 @@ func loadMergedClaudeRateLimitBuckets(currentFingerprint string) map[string]clau
 
 // claudeCodeMetricsFromCache builds the metric rows from the rate-limit cache,
 // falling back to the Unknown placeholders when a window hasn't been observed.
-// Two rows are always shown so the card layout is stable: the 5-hour session
-// window and the weekly window.
+// Three rows are always shown so the card layout is stable: the 5-hour session
+// window, the weekly window, and the weekly Fable window.
 //
 // The cache is trusted only when its `accountFingerprint` exactly matches the
 // caller-supplied one. Two empty fingerprints match (no creds + unscoped
@@ -617,8 +620,53 @@ func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliA
 	// both per-model buckets are present we aggregate CONSERVATIVELY so an
 	// exhausted Opus quota isn't hidden behind a healthier Sonnet number.
 	weekly := aggregateWeeklyMetric(buckets, now)
+	// Fable is metered SEPARATELY from the weekly quota above — Claude Code's
+	// own /usage panel shows it as its own meter — so it is deliberately NOT
+	// folded into the aggregate. Always emitted: observedMetricOrUnknown returns
+	// the Unknown placeholder when no Fable window has been observed, which the
+	// card renders as the dashed "Usage unobservable" bar rather than a 0% bar
+	// that would read as "plenty of Fable quota left".
+	fable := observedMetricOrUnknown(
+		buckets, claudeFableWindowIDs(buckets), limitKindWeekly, "Weekly Fable", now)
 
-	return []cliAgentUsageMetric{session, weekly}
+	return []cliAgentUsageMetric{session, weekly, fable}
+}
+
+// claudeFableWindowIDs returns the cache keys that may hold the weekly Fable
+// window, in the order observedMetricOrUnknown should try them: the canonical
+// `seven_day_fable` first, then any other observed key naming Fable, sorted.
+//
+// The tolerant tail exists because the canonical key is an extrapolation from
+// the keys Claude Code is known to emit — a rename or a suffixed variant
+// upstream would otherwise silently drop the row from every shipped agent.
+// Order is load-bearing twice over: it is observedMetricOrUnknown's TIE-BREAK
+// among equally-fresh live buckets (canonical-first, so a real `seven_day_fable`
+// wins over a same-timestamp variant — plain sorting would not, `fable_weekly`
+// sorts ahead of it), and sorting the tail makes that tie-break deterministic
+// where Go map iteration is not. Precedence is only a tie-break: observedMetric-
+// OrUnknown skips rolled-over candidates first and then prefers the freshest live
+// observation, so neither a stale nor a rolled-over canonical bucket left behind
+// by a rename can mask a live variant. Non-determinism would not just be untidy:
+// terminal-service delta-skips writes by hashing the marshalled payload, so a row
+// flipping between two fable-ish buckets across polls would churn a Firestore
+// write plus a 7-day history document each time.
+//
+// five_hour* keys are excluded: Claude already splits the weekly window
+// per-model, so a symmetric `five_hour_fable` is plausible, and surfacing a
+// session-window bucket under a row labelled "Weekly Fable" would misreport it.
+func claudeFableWindowIDs(buckets map[string]claudeRateLimitBucket) []string {
+	variants := make([]string, 0, len(buckets))
+	for id := range buckets {
+		lower := strings.ToLower(id)
+		if id == claudeWindowSevenDayFable ||
+			!strings.Contains(lower, "fable") ||
+			strings.HasPrefix(lower, claudeWindowFiveHour) {
+			continue
+		}
+		variants = append(variants, id)
+	}
+	sort.Strings(variants)
+	return append([]string{claudeWindowSevenDayFable}, variants...)
 }
 
 // aggregateWeeklyMetric reports the worst observed seven-day window: the
@@ -709,37 +757,68 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 }
 
 // observedMetricOrUnknown returns a real percentage metric for the first window
-// id present in the cache, or an Unknown placeholder when none is observed. A
-// window whose reset time has passed is unobservable: assuming 0% ignores usage
-// that may already have happened on another computer.
+// id present in the cache that still describes a LIVE window, or an Unknown
+// placeholder when none is observed. A window whose reset time has passed is
+// unobservable: assuming 0% ignores usage that may already have happened on
+// another computer.
+//
+// Liveness is checked BEFORE candidate precedence, which matters only for a
+// multi-id list (the Fable row): the cache never prunes a window id, so an
+// upstream rename leaves the old canonical bucket behind forever. Returning its
+// rolled-over Unknown on sight would make the tolerant variant fallback inert in
+// exactly the rename case it exists for — the row would stay unobservable while
+// fresh variant telemetry kept arriving. A rolled-over bucket is still the
+// answer when NO candidate is live, and the first such bucket in candidate order
+// supplies the ObservedAt so the result stays deterministic.
+//
+// Among LIVE candidates the freshest observation wins, not merely the first in
+// candidate order: a rename can leave the old canonical bucket with a still-future
+// reset (live) while newer telemetry flows to the variant, and canonical-first
+// would then pin the row to the stale percentage until the retained bucket finally
+// rolls over. Ranking by ObservedAtMs lets the actively-updated bucket win; equal
+// timestamps fall back to candidate order (canonical-first), so the result stays
+// deterministic for terminal-service's payload-hash delta-skip.
 func observedMetricOrUnknown(
 	buckets map[string]claudeRateLimitBucket,
 	windowIDs []string,
 	kind, label string,
 	now time.Time,
 ) cliAgentUsageMetric {
+	rolledOver := ""
+	freshestLive := ""
 	for _, id := range windowIDs {
 		b, ok := buckets[id]
 		if !ok {
 			continue
 		}
-		used := b.UsedPercentage
+		if b.ResetsAtMs > 0 && now.UnixMilli() >= b.ResetsAtMs {
+			if rolledOver == "" {
+				rolledOver = id
+			}
+			continue
+		}
+		// Strictly-greater keeps the earlier (canonical-first) candidate on a tie.
+		if freshestLive == "" || b.ObservedAtMs > buckets[freshestLive].ObservedAtMs {
+			freshestLive = id
+		}
+	}
+	if freshestLive != "" {
+		b := buckets[freshestLive]
 		var resetAt string
 		if b.ResetsAtMs > 0 {
-			if now.UnixMilli() >= b.ResetsAtMs {
-				return cliAgentUsageMetric{
-					Kind: kind, Label: label, Unit: "%",
-					ObservedAt: observedAtRFC3339(b.ObservedAtMs), Unknown: true,
-				}
-			} else {
-				resetAt = time.UnixMilli(b.ResetsAtMs).UTC().Format(time.RFC3339)
-			}
+			resetAt = time.UnixMilli(b.ResetsAtMs).UTC().Format(time.RFC3339)
 		}
-		used = clampPercent(used)
+		used := clampPercent(b.UsedPercentage)
 		return cliAgentUsageMetric{
 			Kind: kind, Label: label, Unit: "%",
 			Total: floatPtr(100), Consumed: floatPtr(used), Remaining: floatPtr(100 - used),
 			ResetAt: resetAt, ObservedAt: observedAtRFC3339(b.ObservedAtMs),
+		}
+	}
+	if rolledOver != "" {
+		return cliAgentUsageMetric{
+			Kind: kind, Label: label, Unit: "%",
+			ObservedAt: observedAtRFC3339(buckets[rolledOver].ObservedAtMs), Unknown: true,
 		}
 	}
 	return cliAgentUsageMetric{Kind: kind, Label: label, Unit: "%", Unknown: true}
