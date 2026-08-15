@@ -585,6 +585,65 @@ func TestDrainAndInstall_ConfirmsBeforeHeartbeatStalenessWindow(t *testing.T) {
 	}
 }
 
+func TestDrainAndInstall_RetriesFailedInitialDrainBeforeInstall(t *testing.T) {
+	r := newAutoTestRig(t, registeredCfg())
+	r.activeWork = 0
+	r.au.drainEnter = func(_ context.Context, _, _ string) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.drainEnter++
+		if r.drainEnter == 1 {
+			return errors.New("temporary drain failure")
+		}
+		if r.applyCalls != 0 {
+			t.Fatal("update installed before service accepted the drain")
+		}
+		return nil
+	}
+
+	r.au.runAttempt()
+
+	if r.drainEnter != 2 {
+		t.Fatalf("drain enters = %d, want initial attempt plus retry", r.drainEnter)
+	}
+	if r.applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want 1 after accepted retry", r.applyCalls)
+	}
+}
+
+func TestDrainAndInstall_RenewalFailureRequiresReentryBeforeInstall(t *testing.T) {
+	r := newAutoTestRig(t, registeredCfg())
+	r.activeWork = 1
+	r.au.drainConfirm = func(_ context.Context, _, _ string) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.drainConfirm++
+		r.activeWork = 0
+		return errors.New("temporary confirmation failure")
+	}
+	r.au.drainEnter = func(_ context.Context, _, _ string) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.drainEnter++
+		if r.drainEnter > 1 && r.applyCalls != 0 {
+			t.Fatal("update installed before drain permission was reacquired")
+		}
+		return nil
+	}
+
+	r.au.runAttempt()
+
+	if r.drainConfirm != 1 {
+		t.Fatalf("drain confirms = %d, want 1 failed renewal", r.drainConfirm)
+	}
+	if r.drainEnter != 2 {
+		t.Fatalf("drain enters = %d, want reentry after failed renewal", r.drainEnter)
+	}
+	if r.applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want 1 after reentry", r.applyCalls)
+	}
+}
+
 func TestRunAttempt_SkippedVersionIgnoredOnAutomaticPath(t *testing.T) {
 	cfg := registeredCfg()
 	cfg.SkippedVersion = "v9.9.9" // same as the available update

@@ -1135,6 +1135,12 @@ func runPubSubConnection(cfg *Config) error {
 			if err := json.Unmarshal(m.Data, &cmd); err == nil {
 				message := commandPayloadTooLargeMessage(len(m.Data), maxPubSubCatalogMessageBytes)
 				if cmd.Command == "__cli_usage_refresh__" {
+					release, allowed := beginTrackedRejectionPublish()
+					if !allowed {
+						m.Ack()
+						return
+					}
+					defer release()
 					if err := publishCLIUsageRefreshFailure(ctx, topic, cmd, cfg, message); err != nil {
 						m.Nack()
 					} else {
@@ -1143,6 +1149,12 @@ func runPubSubConnection(cfg *Config) error {
 					return
 				}
 				if cmd.SessionID != "" {
+					release, allowed := beginTrackedRejectionPublish()
+					if !allowed {
+						m.Ack()
+						return
+					}
+					defer release()
 					publishSessionError(ctx, topic, cmd, message)
 				}
 			}
@@ -1168,6 +1180,12 @@ func runPubSubConnection(cfg *Config) error {
 
 			message := commandPayloadTooLargeMessage(len(m.Data), messageSizeLimit)
 			if cmd.Command == "__cli_usage_refresh__" {
+				release, allowed := beginTrackedRejectionPublish()
+				if !allowed {
+					m.Ack()
+					return
+				}
+				defer release()
 				if err := publishCLIUsageRefreshFailure(ctx, topic, cmd, cfg, message); err != nil {
 					m.Nack()
 				} else {
@@ -1176,6 +1194,12 @@ func runPubSubConnection(cfg *Config) error {
 				return
 			}
 			if cmd.SessionID != "" {
+				release, allowed := beginTrackedRejectionPublish()
+				if !allowed {
+					m.Ack()
+					return
+				}
+				defer release()
 				publishSessionError(ctx, topic, cmd, message)
 			}
 			m.Ack()

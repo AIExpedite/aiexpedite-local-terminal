@@ -632,9 +632,11 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 
 	startedAt := au.now()
 	deadline := startedAt.Add(autoUpdateDrainDeadline)
-	lastConfirm := startedAt
+	lastConfirm := time.Time{}
 	lastEnterAttempt := startedAt
-	reconnectedDuringDrain := false
+	if reachedService {
+		lastConfirm = startedAt
+	}
 
 	for {
 		// A user-selected Update Now supersedes the automatic attempt. Keep
@@ -656,12 +658,15 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 			// routable again. From this point, installation is blocked until the
 			// service accepts this attempt's explicit drain (or the user
 			// disconnects again), regardless of the original drain age.
-			reconnectedDuringDrain = true
 			reachedService = false
 			lastEnterAttempt = time.Time{}
 		}
 		connected = liveConnected
-		if connected && reconnectedDuringDrain && !reachedService &&
+		// A connected agent may install only after this attempt's drain has
+		// actually been accepted. Retry both a failed initial entry and an entry
+		// invalidated by reconnect/renewal failure; local refusal alone does not
+		// stop the healthy Pub/Sub heartbeat from keeping cloud routing active.
+		if connected && !reachedService &&
 			(lastEnterAttempt.IsZero() || au.now().Sub(lastEnterAttempt) >= autoUpdateDrainConfirmEvery) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err := au.drainEnter(ctx, attemptID, info.LatestVersion)
@@ -675,7 +680,7 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		}
 
 		safeToInstall := au.canInstallNow(startedAt, connected, reachedService)
-		if reconnectedDuringDrain && connected && !reachedService {
+		if connected && !reachedService {
 			safeToInstall = false
 		}
 		if au.activeWork() == 0 && safeToInstall {
@@ -713,8 +718,14 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 			}
 			if err == nil {
 				reachedService = true
+				lastConfirm = au.now()
+			} else {
+				// Do not extend local installation permission for a renewal the
+				// service did not acknowledge. Re-enter idempotently before this
+				// connected process may install.
+				reachedService = false
+				lastEnterAttempt = au.now()
 			}
-			lastConfirm = au.now()
 		}
 
 		if !au.sleep(autoUpdateDrainPollInterval) {
