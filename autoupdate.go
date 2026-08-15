@@ -678,6 +678,32 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 				completeCloudReconnectDrain()
 			}
 		}
+		// A suspended process may wake after the service-side drain lease has
+		// expired. Renew overdue permission before using it to authorize an
+		// install, even when work became idle while the process was asleep.
+		if connected && reachedService && au.now().Sub(lastConfirm) >= autoUpdateDrainConfirmEvery {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := au.drainConfirm(ctx, attemptID, info.LatestVersion)
+			cancel()
+			if err != nil && isDrainExpiredErr(err) {
+				// The service expired our drain: stop treating ourselves as
+				// draining and become routable again via a ready signal. A new
+				// attempt may start after the cooldown.
+				fmt.Printf("[autoupdate] drain confirm rejected (expired) for %s; abandoning\n", attemptID)
+				au.exitDrain(attemptID, "deferred", true)
+				return
+			}
+			if err == nil {
+				reachedService = true
+				lastConfirm = au.now()
+			} else {
+				// Do not extend local installation permission for a renewal the
+				// service did not acknowledge. Re-enter idempotently before this
+				// connected process may install.
+				reachedService = false
+				lastEnterAttempt = au.now()
+			}
+		}
 
 		safeToInstall := au.canInstallNow(startedAt, connected, reachedService)
 		if connected && !reachedService {
@@ -702,30 +728,6 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 			// device can't re-enter a week-long drain every 6 hours.
 			au.exitDrain(attemptID, "deferred", true)
 			return
-		}
-
-		if connected && reachedService && au.now().Sub(lastConfirm) >= autoUpdateDrainConfirmEvery {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := au.drainConfirm(ctx, attemptID, info.LatestVersion)
-			cancel()
-			if err != nil && isDrainExpiredErr(err) {
-				// The service expired our drain: stop treating ourselves as
-				// draining and become routable again via a ready signal. A new
-				// attempt may start after the cooldown.
-				fmt.Printf("[autoupdate] drain confirm rejected (expired) for %s; abandoning\n", attemptID)
-				au.exitDrain(attemptID, "deferred", true)
-				return
-			}
-			if err == nil {
-				reachedService = true
-				lastConfirm = au.now()
-			} else {
-				// Do not extend local installation permission for a renewal the
-				// service did not acknowledge. Re-enter idempotently before this
-				// connected process may install.
-				reachedService = false
-				lastEnterAttempt = au.now()
-			}
 		}
 
 		if !au.sleep(autoUpdateDrainPollInterval) {

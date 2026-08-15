@@ -644,6 +644,31 @@ func TestDrainAndInstall_RenewalFailureRequiresReentryBeforeInstall(t *testing.T
 	}
 }
 
+func TestDrainAndInstall_RenewsOverdueDrainBeforeInstall(t *testing.T) {
+	r := newAutoTestRig(t, registeredCfg())
+	r.activeWork = 1
+	woke := false
+	r.au.sleep = func(time.Duration) bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if !woke {
+			woke = true
+			r.clock = r.clock.Add(autoUpdateDrainConfirmEvery + time.Second)
+			r.activeWork = 0
+		}
+		return true
+	}
+
+	r.au.runAttempt()
+
+	if r.drainConfirm != 1 {
+		t.Fatalf("drain confirms = %d, want overdue lease renewed before install", r.drainConfirm)
+	}
+	if r.applyCalls != 1 {
+		t.Fatalf("apply calls = %d, want 1 after successful renewal", r.applyCalls)
+	}
+}
+
 func TestRunAttempt_SkippedVersionIgnoredOnAutomaticPath(t *testing.T) {
 	cfg := registeredCfg()
 	cfg.SkippedVersion = "v9.9.9" // same as the available update
