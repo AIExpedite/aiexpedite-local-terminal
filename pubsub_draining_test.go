@@ -12,8 +12,10 @@ func TestDraining_RefusesStartAdmitsContinuation(t *testing.T) {
 
 	// A new session start is refused while draining.
 	start := commandMsg{ID: "c1", Type: "session_start", SessionID: "s1"}
-	if admitted, _ := admitWork(start); admitted {
+	if admitted, release := admitWork(start); admitted || release == nil {
 		t.Fatal("session_start must be refused while draining")
+	} else {
+		release()
 	}
 
 	// Its continuation input is still delivered.

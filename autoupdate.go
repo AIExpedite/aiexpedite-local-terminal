@@ -482,6 +482,11 @@ func (au *autoUpdater) runAttempt() {
 		_ = os.Remove(path)
 		return
 	}
+	if !au.cfg.IsAutoUpdate() {
+		fmt.Println("[autoupdate] Preference disabled after verification; discarding update")
+		_ = os.Remove(path)
+		return
+	}
 	if au.registering() {
 		fmt.Println("[autoupdate] Deferring verified update while device registration is in progress")
 		_ = os.Remove(path)

@@ -16,7 +16,9 @@ import (
 )
 
 var (
-	startSelfReplaceProcess = func(path string, args []string) error {
+	resolveSelfReplaceTarget  = runningUpdateTarget
+	validateSelfReplaceTarget = validateUpdateTarget
+	startSelfReplaceProcess   = func(path string, args []string) error {
 		cmd := exec.Command(path, args...)
 		setNewConsole(cmd)
 		return cmd.Start()
@@ -34,7 +36,7 @@ func applyVerifiedUpdate(path string, _ *UpdateInfo) error {
 		return fmt.Errorf("make updater executable: %w", err)
 	}
 
-	originalExe, err := runningUpdateTarget()
+	originalExe, err := resolveSelfReplaceTarget()
 	if err != nil {
 		return fmt.Errorf("determine update target: %w", err)
 	}
@@ -44,6 +46,9 @@ func applyVerifiedUpdate(path string, _ *UpdateInfo) error {
 
 	args := []string{}
 	if originalExe != "" && !isInTempDir(originalExe) {
+		if err := validateSelfReplaceTarget(originalExe); err != nil {
+			return fmt.Errorf("validate update target: %w", err)
+		}
 		args = append(args, fmt.Sprintf("--update-from=%s", originalExe))
 	} else if originalExe != "" {
 		fmt.Printf("[update] Current exe is in temp dir (%s), skipping --update-from\n", originalExe)

@@ -19,6 +19,7 @@ func resetDrainState(t *testing.T) {
 	drain.pendingStarts = 0
 	drain.operationalCommands = 0
 	drain.continuationCommands = 0
+	drain.rejectionPublishes = 0
 	drain.uploads = 0
 	drain.approvals = 0
 	drain.terminalPublishes = 0
@@ -26,6 +27,32 @@ func resetDrainState(t *testing.T) {
 	drainWorkSourcesMu.Lock()
 	drainWorkSources = nil
 	drainWorkSourcesMu.Unlock()
+}
+
+func TestDrainRejectionPublishHoldsInstallSeal(t *testing.T) {
+	resetDrainState(t)
+	closeAdmission("attempt-rejection")
+	t.Cleanup(func() { resetDrainState(t) })
+
+	admitted, release := admitWork(commandMsg{Type: "session_start"})
+	if admitted || release == nil {
+		t.Fatal("refused start should return a tracked rejection publish")
+	}
+	if got := ActiveWork(); got != 1 {
+		t.Fatalf("ActiveWork() = %d during rejection publish, want 1", got)
+	}
+	if sealDrainForInstall() {
+		t.Fatal("install seal must wait for the rejection publish")
+	}
+
+	release()
+	if !sealDrainForInstall() {
+		t.Fatal("idle drain should seal after rejection publish completes")
+	}
+	admitted, release = admitWork(commandMsg{Type: "session_start"})
+	if admitted || release != nil {
+		t.Fatal("start arriving after install seal should be refused without publishing")
+	}
 }
 
 func TestRegistrationAndDrainEntryAreMutuallyExclusive(t *testing.T) {
@@ -324,14 +351,14 @@ func TestAdmitWork_CloseBoundaryRace(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < n; i++ {
 			admittedOK, release := admitWork(commandMsg{Type: "session_start"})
+			mu.Lock()
 			if admittedOK {
-				mu.Lock()
 				accepted++
-				if release != nil {
-					releases = append(releases, release)
-				}
-				mu.Unlock()
 			}
+			if release != nil {
+				releases = append(releases, release)
+			}
+			mu.Unlock()
 		}
 	}()
 
@@ -339,12 +366,12 @@ func TestAdmitWork_CloseBoundaryRace(t *testing.T) {
 	closeAdmission("race-attempt")
 	wg.Wait()
 
-	// Any accepted start increased pendingStarts and must be reflected by
-	// ActiveWork until released — i.e. the drain could not have completed with
-	// accepted-but-uncounted work.
+	// Any accepted start or correlated rejection publish must be reflected by
+	// ActiveWork until released — i.e. the drain cannot complete with accepted
+	// work or its refusal response still in flight.
 	mu.Lock()
-	if got := ActiveWork(); got != accepted {
-		t.Fatalf("ActiveWork()=%d but accepted=%d — accepted work not counted", got, accepted)
+	if got := ActiveWork(); got != len(releases) {
+		t.Fatalf("ActiveWork()=%d but tracked callbacks=%d (accepted=%d)", got, len(releases), accepted)
 	}
 	for _, r := range releases {
 		r()

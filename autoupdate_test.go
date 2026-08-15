@@ -228,6 +228,32 @@ func TestRunAttempt_RegistrationStartingDuringDownloadDefersBeforeDrain(t *testi
 	}
 }
 
+func TestRunAttempt_PreferenceOffDuringDownloadDefersBeforeDrain(t *testing.T) {
+	cfg := DefaultConfig()
+	r := newAutoTestRig(t, cfg)
+	artifact := filepath.Join(t.TempDir(), "verified-update")
+	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.au.downloadVerify = func(_ *UpdateInfo) (string, error) {
+		r.mu.Lock()
+		r.verifyCalls++
+		r.mu.Unlock()
+		cfg.SetAutoUpdate(false)
+		return artifact, nil
+	}
+
+	r.au.runAttempt()
+
+	if r.applyCalls != 0 || r.drainEnter != 0 || isDraining() {
+		t.Fatalf("preference-off during download must defer before drain (apply=%d enter=%d draining=%v)",
+			r.applyCalls, r.drainEnter, isDraining())
+	}
+	if _, err := os.Stat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("discarded verified artifact was not removed: %v", err)
+	}
+}
+
 func TestStopForShutdownPreventsDrainFromInstalling(t *testing.T) {
 	r := newAutoTestRig(t, DefaultConfig())
 	r.activeWork = 1

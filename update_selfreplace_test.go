@@ -13,6 +13,8 @@ import (
 func TestApplyVerifiedUpdateKeepsAgentAliveWhenUpdaterCannotStart(t *testing.T) {
 	previousStart := startSelfReplaceProcess
 	previousQuit := quitAfterSelfReplaceStart
+	previousResolve := resolveSelfReplaceTarget
+	previousValidate := validateSelfReplaceTarget
 	updateMutex.Lock()
 	previousPath, previousPending := updatePath, updatePending
 	updatePath, updatePending = "", false
@@ -20,6 +22,8 @@ func TestApplyVerifiedUpdateKeepsAgentAliveWhenUpdaterCannotStart(t *testing.T) 
 	t.Cleanup(func() {
 		startSelfReplaceProcess = previousStart
 		quitAfterSelfReplaceStart = previousQuit
+		resolveSelfReplaceTarget = previousResolve
+		validateSelfReplaceTarget = previousValidate
 		updateMutex.Lock()
 		updatePath, updatePending = previousPath, previousPending
 		updateMutex.Unlock()
@@ -51,9 +55,49 @@ func TestApplyVerifiedUpdateKeepsAgentAliveWhenUpdaterCannotStart(t *testing.T) 
 	}
 }
 
+func TestApplyVerifiedUpdateValidatesTargetBeforeHandoff(t *testing.T) {
+	previousStart := startSelfReplaceProcess
+	previousQuit := quitAfterSelfReplaceStart
+	previousResolve := resolveSelfReplaceTarget
+	previousValidate := validateSelfReplaceTarget
+	t.Cleanup(func() {
+		startSelfReplaceProcess = previousStart
+		quitAfterSelfReplaceStart = previousQuit
+		resolveSelfReplaceTarget = previousResolve
+		validateSelfReplaceTarget = previousValidate
+	})
+
+	resolveSelfReplaceTarget = func() (string, error) { return "/protected/agent", nil }
+	validateSelfReplaceTarget = func(string) error { return errors.New("protected target") }
+	var starts, quits atomic.Int32
+	startSelfReplaceProcess = func(string, []string) error {
+		starts.Add(1)
+		return nil
+	}
+	quitAfterSelfReplaceStart = func() { quits.Add(1) }
+
+	artifact, err := os.CreateTemp(t.TempDir(), "verified-update-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := artifact.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = applyVerifiedUpdate(artifact.Name(), nil)
+	if err == nil || !strings.Contains(err.Error(), "protected target") {
+		t.Fatalf("apply error = %v, want target validation failure", err)
+	}
+	if starts.Load() != 0 || quits.Load() != 0 {
+		t.Fatalf("starts/quits = %d/%d, want 0/0", starts.Load(), quits.Load())
+	}
+}
+
 func TestApplyVerifiedUpdateCommitsHandoffAfterUpdaterStarts(t *testing.T) {
 	previousStart := startSelfReplaceProcess
 	previousQuit := quitAfterSelfReplaceStart
+	previousResolve := resolveSelfReplaceTarget
+	previousValidate := validateSelfReplaceTarget
 	updateMutex.Lock()
 	previousPath, previousPending := updatePath, updatePending
 	updatePath, updatePending = "", false
@@ -61,6 +105,8 @@ func TestApplyVerifiedUpdateCommitsHandoffAfterUpdaterStarts(t *testing.T) {
 	t.Cleanup(func() {
 		startSelfReplaceProcess = previousStart
 		quitAfterSelfReplaceStart = previousQuit
+		resolveSelfReplaceTarget = previousResolve
+		validateSelfReplaceTarget = previousValidate
 		updateMutex.Lock()
 		updatePath, updatePending = previousPath, previousPending
 		updateMutex.Unlock()

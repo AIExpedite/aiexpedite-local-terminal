@@ -1358,6 +1358,13 @@ func runPubSubConnection(cfg *Config) error {
 		// the one-shot completes (or the session is handed to its manager).
 		admitted, releaseWork := admitWork(cmd)
 		if !admitted {
+			if releaseWork == nil {
+				// Replacement already owns the sealed drain. Refusal reporting is
+				// best-effort; do not begin a publish that the handoff can cut off.
+				m.Ack()
+				return
+			}
+			defer releaseWork()
 			fmt.Printf("%s[pubsub] Draining for update — refusing new work start %q (type=%q, id=%s)%s\n",
 				colorYellow, cmd.Command, cmd.Type, cmd.ID, colorReset)
 			res := makeRejectionResult(

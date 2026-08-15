@@ -70,6 +70,7 @@ type drainState struct {
 	// Managers normally keep the drain open, but this closes the race where a
 	// session disappears while its final input/end callback is still publishing.
 	continuationCommands int
+	rejectionPublishes   int
 
 	// uploads / approvals count the two work classes with no manager to ask.
 	uploads           int
@@ -167,10 +168,10 @@ func reopenAdmission() {
 }
 
 // admitWork is the single admission decision for an inbound command. It returns
-// whether the command may proceed and, for accepted work starts and demand
-// commands, a release function the caller MUST defer so the callback is
-// counted for exactly its processing lifetime. release is nil only for pings,
-// untracked traffic outside a drain, or a refused command.
+// whether the command may proceed and, for accepted work starts, demand /
+// continuation commands, and pre-seal rejection publishes, a release function
+// the caller MUST defer so the callback is counted for exactly its processing
+// lifetime. A refused command has a nil release only after install is sealed.
 func admitWork(cmd commandMsg) (admitted bool, release func()) {
 	start := isWorkStartCommand(cmd)
 	trackedOperational := isInternalDemandCommand(cmd.Command)
@@ -182,8 +183,16 @@ func admitWork(cmd commandMsg) (admitted bool, release func()) {
 		// else — one-shot execute, every *_start, and any unrecognised future
 		// type — is refused so it is not silently lost or queued indefinitely.
 		if !isDrainPassThrough(cmd) {
+			// Count the correlated refusal publish before releasing the same
+			// mutex used by sealDrainForInstall. Once sealed, acknowledge late
+			// arrivals without starting a publish that replacement could cut off.
+			if drain.installing {
+				drain.mu.Unlock()
+				return false, nil
+			}
+			drain.rejectionPublishes++
 			drain.mu.Unlock()
-			return false, nil
+			return false, drain.releaseRejectionPublish()
 		}
 		if trackedOperational || continuation {
 			// Once the updater atomically seals an idle drain for install,
@@ -225,6 +234,19 @@ func admitWork(cmd commandMsg) (admitted bool, release func()) {
 	}
 	drain.mu.Unlock()
 	return true, nil
+}
+
+func (d *drainState) releaseRejectionPublish() func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			d.mu.Lock()
+			if d.rejectionPublishes > 0 {
+				d.rejectionPublishes--
+			}
+			d.mu.Unlock()
+		})
+	}
 }
 
 // releaseStart returns an idempotent function that decrements pendingStarts.
@@ -364,7 +386,7 @@ func (d *drainState) activeWorkLocked() int {
 	}
 	drainWorkSourcesMu.Unlock()
 
-	total += d.pendingStarts + d.operationalCommands + d.continuationCommands + d.uploads + d.approvals + d.terminalPublishes
+	total += d.pendingStarts + d.operationalCommands + d.continuationCommands + d.rejectionPublishes + d.uploads + d.approvals + d.terminalPublishes
 	return total
 }
 
