@@ -22,6 +22,7 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 DefaultDirName={localappdata}\{#MyAppName}
+UsePreviousAppDir=no
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 LicenseFile=

@@ -462,12 +462,10 @@ func darwinLocationSupportedWithWritable(exe string, writable func(string) bool)
 	exe = filepath.ToSlash(exe)
 	bundle := darwinBundlePath(exe)
 	if bundle == "" {
-		// Not a bundled app (e.g. a raw `go run` build); fall back to a plain
-		// writability check on the directory holding the executable.
-		if !writable(filepath.Dir(exe)) {
-			return false, "Automatic update unavailable — this location is read-only; move AI Expedite to ~/Applications"
-		}
-		return true, ""
+		// The macOS updater replaces a signed .app bundle extracted from the
+		// release DMG. A raw executable has no bundle to replace, even when its
+		// containing directory is writable.
+		return false, "Automatic update unavailable — move AI Expedite to ~/Applications"
 	}
 	lower := strings.ToLower(bundle)
 	home, _ := os.UserHomeDir()

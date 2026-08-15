@@ -42,6 +42,11 @@ func TestDarwinLocationSupported(t *testing.T) {
 	if ok, _ := darwinLocationSupportedWithWritable(dl, writable); ok {
 		t.Fatal("~/Downloads must be unsupported")
 	}
+	// Raw executables cannot be replaced by the bundle updater, even when the
+	// containing directory is writable.
+	if ok, reason := darwinLocationSupportedWithWritable("/usr/local/bin/aix", writable); ok || reason == "" {
+		t.Fatalf("raw executable = (%v, %q), want unsupported with a reason", ok, reason)
+	}
 }
 
 func TestDarwinLocationSupportedRequiresWritableApplicationsParent(t *testing.T) {
