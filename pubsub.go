@@ -680,6 +680,10 @@ type resultMsg struct {
 	// Environment Setup capability. Echoes RefreshID so terminal-service can
 	// correlate the response with its pending inspection request.
 	Readiness *ReadinessReport `json:"readiness,omitempty"`
+
+	// Structured terminal error code. Kept separate from Output so consumers
+	// never infer GROK_NOT_AUTHENTICATED from free-form CLI text.
+	ErrorCode string `json:"errorCode,omitempty"`
 }
 
 /*
@@ -6261,7 +6265,12 @@ func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			publishFn,
 		)
 		if err != nil {
-			publishGrokACPError(ctx, topic, cmd, fmt.Sprintf("failed to start grok acp: %v", err))
+			msg := fmt.Sprintf("failed to start grok acp: %v", err)
+			if typed := grokAuthErrorFrom(err); typed != nil {
+				publishGrokACPError(ctx, topic, cmd, typed.Message, typed.Code)
+				return
+			}
+			publishGrokACPError(ctx, topic, cmd, msg)
 			return
 		}
 
@@ -6325,7 +6334,7 @@ func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 // publishGrokACPError surfaces a synchronous failure (bad request, manager
 // not ready, send failure) back to the orchestrator as a `grok_acp_error`
 // frame so it can fail the in-flight call without waiting for a timeout.
-func publishGrokACPError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
+func publishGrokACPError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string, errorCode ...string) {
 	fmt.Printf("%s[grok-acp] Error: %s%s\n", colorRed, errMsg, colorReset)
 
 	res := resultMsg{
@@ -6338,6 +6347,9 @@ func publishGrokACPError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 		Version:     Version,
 		Type:        "grok_acp_error",
 		SessionID:   cmd.SessionID,
+	}
+	if len(errorCode) > 0 && errorCode[0] != "" {
+		res.ErrorCode = errorCode[0]
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[grok-acp] Failed to publish error: %v%s\n", colorRed, err, colorReset)

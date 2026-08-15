@@ -407,6 +407,21 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)
 	}
 
+	// Authoritative pre-flight against the isolated environment the child
+	// would inherit. Refuse before spawn so we never wait on interactive
+	// browser OAuth or the first-frame watchdog for a missing login.
+	authAssessment := assessIsolatedGrokLaunch(isolatedHome, time.Now(), opts.AllowAPIKeyFallback, resolvedModel)
+	if !authAssessment.Authenticated {
+		_ = os.RemoveAll(isolatedHome)
+		reason := authAssessment.Reason
+		if reason == "" {
+			reason = "Grok is not signed in on this computer — run `grok login` on the terminal computer to authenticate."
+		}
+		fmt.Printf("%s[grok-acp] Refusing session %s: %s (source=%s state=%s)%s\n",
+			colorYellow, id, reason, authAssessment.Source, authAssessment.AuthState, colorReset)
+		return newGrokAuthError(reason)
+	}
+
 	fmt.Printf("%s[grok-acp] Starting session %s: %s %s%s\n",
 		colorCyan, id, executable, strings.Join(redactGrokACPArgsForLog(args), " "), colorReset)
 

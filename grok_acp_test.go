@@ -580,6 +580,7 @@ func TestGrokACPLifecycle_StartSendEnd(t *testing.T) {
 	if runtime.GOOS != "windows" && runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("integration test only runs on win/linux/darwin")
 	}
+	enableTestGrokLogin(t)
 
 	testExe, err := os.Executable()
 	if err != nil {
@@ -763,6 +764,7 @@ func TestGrokACPLifecycle_CancelTerminatesSession(t *testing.T) {
 	if runtime.GOOS != "windows" && runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("integration test only runs on win/linux/darwin")
 	}
+	enableTestGrokLogin(t)
 
 	testExe, err := os.Executable()
 	if err != nil {
@@ -849,6 +851,7 @@ func TestGrokACPLifecycle_CancelTerminatesSession(t *testing.T) {
 // orchestrator can fail the in-flight call instead of misreading the
 // malformed line as a JSON-RPC response.
 func TestGrokACPLifecycle_ForwardsBadFrameAsError(t *testing.T) {
+	enableTestGrokLogin(t)
 	testExe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -923,6 +926,7 @@ func TestGrokACPLifecycle_ForwardsBadFrameAsError(t *testing.T) {
 // produces never populates `grok_usage_limit.json` and the CLI Agents card
 // stays Unknown for the primary Grok flow.
 func TestGrokACPLifecycle_CapturesUsageLimitFromStream(t *testing.T) {
+	enableTestGrokLogin(t)
 	testExe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -1014,6 +1018,7 @@ func TestGrokACPLifecycle_TimeoutKillsRunawaySession(t *testing.T) {
 	if runtime.GOOS != "windows" && runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("integration test only runs on win/linux/darwin")
 	}
+	enableTestGrokLogin(t)
 	testExe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -1108,6 +1113,7 @@ func TestGrokACPLifecycle_TimeoutKillsBeforeBlockingPublish(t *testing.T) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("liveness probe via Signal(0) only runs on unix")
 	}
+	enableTestGrokLogin(t)
 	testExe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -1195,6 +1201,7 @@ func TestGrokACPLifecycle_TimeoutKillsBeforeBlockingPublish(t *testing.T) {
 func TestGrokACPLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	tmpDir := t.TempDir()
 	isolateTestUserHome(t, tmpDir)
+	enableTestGrokLogin(t)
 	t.Setenv("PATH", tmpDir)
 
 	m := NewGrokACPManager()
@@ -1474,6 +1481,7 @@ func TestWaitForExit_StatusFlipsBeforeStreamDrain(t *testing.T) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("mock-binary path uses unix exec semantics")
 	}
+	enableTestGrokLogin(t)
 	testExe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
@@ -1560,6 +1568,7 @@ func TestWaitForExit_FinalFrameSurvivesQuickExit(t *testing.T) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("mock-binary path uses unix exec semantics")
 	}
+	enableTestGrokLogin(t)
 	testExe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
