@@ -336,9 +336,11 @@ func (au *autoUpdater) stop() {
 // stopForShutdown prevents an explicit process exit from turning into an
 // update restart. It abandons local drain state without reporting ready; the
 // ordinary shutdown path reports the captured attempt exit and then offline.
-func (au *autoUpdater) stopForShutdown() string {
+// If replacement already started, it waits and reports whether a successful
+// handoff now owns shutdown so the old process can skip that offline path.
+func (au *autoUpdater) stopForShutdown() (drainAttemptID string, updateHandoff bool) {
 	if au == nil {
-		return ""
+		return "", false
 	}
 	au.stop()
 
@@ -352,7 +354,8 @@ func (au *autoUpdater) stopForShutdown() string {
 		if done != nil {
 			<-done
 		}
-		return ""
+		path, pending := GetUpdateReady()
+		return "", pending && path == ""
 	}
 	attemptID := au.drainAttempt
 	if attemptID != "" {
@@ -361,7 +364,7 @@ func (au *autoUpdater) stopForShutdown() string {
 	}
 	au.mu.Unlock()
 	if attemptID == "" || !isDraining() || drainingAttempt() != attemptID {
-		return ""
+		return "", false
 	}
 
 	reopenAdmission()
@@ -369,7 +372,7 @@ func (au *autoUpdater) stopForShutdown() string {
 		au.tray.draining(false)
 	}
 	au.clearAttempt()
-	return attemptID
+	return attemptID, false
 }
 
 // run is the scheduling loop: first check after the initial delay, then every

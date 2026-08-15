@@ -259,8 +259,8 @@ func TestStopForShutdownPreventsDrainFromInstalling(t *testing.T) {
 		}
 	}
 
-	if got := r.au.stopForShutdown(); got != "shutdown-attempt" {
-		t.Fatalf("stopForShutdown attempt = %q, want shutdown-attempt", got)
+	if got, handoff := r.au.stopForShutdown(); got != "shutdown-attempt" || handoff {
+		t.Fatalf("stopForShutdown = (%q, %v), want (shutdown-attempt, false)", got, handoff)
 	}
 	<-done
 	if r.applyCalls != 0 {
@@ -305,8 +305,15 @@ func TestStopForShutdownWaitsForActiveApplyHandoff(t *testing.T) {
 	}()
 	<-applyStarted
 
-	shutdownDone := make(chan string, 1)
-	go func() { shutdownDone <- r.au.stopForShutdown() }()
+	type shutdownResult struct {
+		attempt string
+		handoff bool
+	}
+	shutdownDone := make(chan shutdownResult, 1)
+	go func() {
+		attempt, handoff := r.au.stopForShutdown()
+		shutdownDone <- shutdownResult{attempt: attempt, handoff: handoff}
+	}()
 	select {
 	case <-shutdownDone:
 		t.Fatal("shutdown returned while replacement was still active")
@@ -315,8 +322,8 @@ func TestStopForShutdownWaitsForActiveApplyHandoff(t *testing.T) {
 
 	close(releaseApply)
 	<-installDone
-	if got := <-shutdownDone; got != "" {
-		t.Fatalf("stopForShutdown attempt = %q, want update-owned shutdown", got)
+	if got := <-shutdownDone; got.attempt != "" || !got.handoff {
+		t.Fatalf("stopForShutdown = (%q, %v), want (empty, true)", got.attempt, got.handoff)
 	}
 	if path, pending := GetUpdateReady(); !pending || path != "" {
 		t.Fatalf("GetUpdateReady = (%q, %v), want completed handoff", path, pending)
@@ -346,8 +353,15 @@ func TestStopForShutdownWaitsForActiveApplyFailureCleanup(t *testing.T) {
 	}()
 	<-applyStarted
 
-	shutdownDone := make(chan string, 1)
-	go func() { shutdownDone <- r.au.stopForShutdown() }()
+	type shutdownResult struct {
+		attempt string
+		handoff bool
+	}
+	shutdownDone := make(chan shutdownResult, 1)
+	go func() {
+		attempt, handoff := r.au.stopForShutdown()
+		shutdownDone <- shutdownResult{attempt: attempt, handoff: handoff}
+	}()
 	select {
 	case <-shutdownDone:
 		t.Fatal("shutdown returned while replacement was still active")
@@ -355,8 +369,8 @@ func TestStopForShutdownWaitsForActiveApplyFailureCleanup(t *testing.T) {
 	}
 
 	close(releaseApply)
-	if got := <-shutdownDone; got != "" {
-		t.Fatalf("stopForShutdown attempt = %q, want update-owned shutdown", got)
+	if got := <-shutdownDone; got.attempt != "" || got.handoff {
+		t.Fatalf("stopForShutdown = (%q, %v), want (empty, false)", got.attempt, got.handoff)
 	}
 	if isDraining() {
 		t.Fatal("failed replacement must reopen admission before shutdown continues")

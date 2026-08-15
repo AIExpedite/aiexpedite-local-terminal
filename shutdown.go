@@ -64,8 +64,16 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// idle. Otherwise an explicit Quit/SIGTERM could launch a replacement and
 	// restart the app while this path is terminating sessions.
 	drainAttemptID := ""
+	updateHandoff := false
 	if globalAutoUpdater != nil {
-		drainAttemptID = globalAutoUpdater.stopForShutdown()
+		drainAttemptID, updateHandoff = globalAutoUpdater.stopForShutdown()
+	}
+	if updateHandoff {
+		// Replacement won the shutdown race while stopForShutdown waited for an
+		// active apply. It now owns connectivity, so the old process must skip
+		// offline notification and teardown just like onTrayExit's handoff path.
+		fmt.Println("[shutdown] Update handoff completed; skipping ordinary teardown")
+		return
 	}
 
 	// Step 1: Flip local offline state and tell the Pub/Sub loop to stop.
