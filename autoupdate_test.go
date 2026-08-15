@@ -644,6 +644,49 @@ func TestDrainAndInstall_RenewalFailureRequiresReentryBeforeInstall(t *testing.T
 	}
 }
 
+func TestDrainAndInstall_ExpiredReentryAbandonsDrain(t *testing.T) {
+	r := newAutoTestRig(t, registeredCfg())
+	r.activeWork = 1
+	r.au.drainConfirm = func(_ context.Context, _, _ string) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.drainConfirm++
+		return errors.New("temporary confirmation failure")
+	}
+	r.au.drainEnter = func(_ context.Context, _, _ string) error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.drainEnter++
+		if r.drainEnter > 1 {
+			return errors.New("server returned status 410: DRAIN_EXPIRED")
+		}
+		return nil
+	}
+	sleeps := 0
+	r.au.sleep = func(time.Duration) bool {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.clock = r.clock.Add(autoUpdateDrainConfirmEvery)
+		sleeps++
+		return sleeps < 3
+	}
+
+	r.au.runAttempt()
+
+	if r.drainEnter != 2 {
+		t.Fatalf("drain enters = %d, want initial entry plus expired re-entry", r.drainEnter)
+	}
+	if r.applyCalls != 0 {
+		t.Fatalf("expired drain must not install, apply calls = %d", r.applyCalls)
+	}
+	if len(r.drainExitR) == 0 || r.drainExitR[len(r.drainExitR)-1] != "deferred" {
+		t.Fatalf("expired re-entry must defer the attempt, exits = %v", r.drainExitR)
+	}
+	if isDraining() {
+		t.Fatal("expired re-entry must reopen local admission")
+	}
+}
+
 func TestDrainAndInstall_RenewsOverdueDrainBeforeInstall(t *testing.T) {
 	r := newAutoTestRig(t, registeredCfg())
 	r.activeWork = 1

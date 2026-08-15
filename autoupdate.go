@@ -672,6 +672,11 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 			err := au.drainEnter(ctx, attemptID, info.LatestVersion)
 			cancel()
 			lastEnterAttempt = au.now()
+			if err != nil && isDrainExpiredErr(err) {
+				fmt.Printf("[autoupdate] drain re-entry rejected (expired) for %s; abandoning\n", attemptID)
+				au.exitDrain(attemptID, "deferred", true)
+				return
+			}
 			if err == nil {
 				reachedService = true
 				lastConfirm = au.now()
