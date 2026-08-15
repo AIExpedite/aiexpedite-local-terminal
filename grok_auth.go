@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,7 +53,8 @@ func grokAuthErrorFrom(err error) *grokAuthError {
 	if err == nil {
 		return nil
 	}
-	if typed, ok := err.(*grokAuthError); ok {
+	var typed *grokAuthError
+	if errors.As(err, &typed) {
 		return typed
 	}
 	return nil

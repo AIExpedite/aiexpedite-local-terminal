@@ -6267,7 +6267,11 @@ func handleGrokACPCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		if err != nil {
 			msg := fmt.Sprintf("failed to start grok acp: %v", err)
 			if typed := grokAuthErrorFrom(err); typed != nil {
-				publishGrokACPError(ctx, topic, cmd, typed.Message, typed.Code)
+				// Keep the "failed to start grok acp:" prefix so
+				// terminal-service's start-refusal settler still
+				// releases the session/device claim. The typed
+				// errorCode is what downstream classifies on.
+				publishGrokACPError(ctx, topic, cmd, msg, typed.Code)
 				return
 			}
 			publishGrokACPError(ctx, topic, cmd, msg)

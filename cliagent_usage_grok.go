@@ -174,11 +174,13 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	// which captureGrokUsageLimitLine caches (approaching → warning, reached →
 	// error).
 	authNotice, authSeverity := grokAuthNotice(base, now)
-	usableToken := grokHasUsableToken(base)
-	if usableToken {
+	// Same classifier the ACP launch pre-flight uses, so the computer
+	// snapshot and the spawn check cannot disagree on missing/expired.
+	assessment := assessGrokAuth(base, now, false, "")
+	if assessment.Authenticated {
 		usage.Authenticated = authBoolPtr(true)
-		usage.AuthState = "authenticated"
-		if grokHasRefreshToken(base) {
+		usage.AuthState = grokAuthStateAuthenticated
+		if assessment.Refreshable {
 			usage.LoginExpirationState = loginExpirationRefreshable
 			// Same as Codex: surface the access-token expiry even though the
 			// token renews, so the row says something. NOT a logout date, and
@@ -191,16 +193,19 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 		} else if expiry, ok := readGrokAuthExpiry(base); ok {
 			usage.LoginExpirationState = loginExpirationKnown
 			usage.LoginExpiresAt = expiry.UTC().Format(time.RFC3339)
-			if !expiry.After(now) {
-				usage.Authenticated = authBoolPtr(false)
-				usage.AuthState = "expired"
-			}
 		} else {
 			usage.LoginExpirationState = loginExpirationNotReported
 		}
-	} else if authNotice != "" && authSeverity == "error" {
+	} else if assessment.AuthState == grokAuthStateExpired {
 		usage.Authenticated = authBoolPtr(false)
-		usage.AuthState = "missing"
+		usage.AuthState = grokAuthStateExpired
+		if expiry, ok := readGrokAuthExpiry(base); ok {
+			usage.LoginExpirationState = loginExpirationKnown
+			usage.LoginExpiresAt = expiry.UTC().Format(time.RFC3339)
+		}
+	} else if assessment.ReasonCode != "" && assessment.AuthState != grokAuthStateUnknown {
+		usage.Authenticated = authBoolPtr(false)
+		usage.AuthState = grokAuthStateMissing
 	}
 	limitState, hasLimit := loadGrokUsageLimitState(usage.AccountFingerprint, now)
 	applyLimitNotice := func() {
