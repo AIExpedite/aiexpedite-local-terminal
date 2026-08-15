@@ -752,6 +752,25 @@ func (au *autoUpdater) installManually(info *UpdateInfo) error {
 		au.mu.Unlock()
 	}()
 
+	// A manual check can select a newer release than the one that started the
+	// automatic drain. Retarget the durable marker before applying so the
+	// replacement's --update-applied signal reconciles against the version that
+	// was actually installed, while preserving the automatic attempt identity.
+	if attemptID != "" {
+		if info == nil || info.LatestVersion == "" {
+			if isDraining() && drainingAttempt() == attemptID {
+				au.exitDrain(attemptID, "superseded", false)
+			}
+			return fmt.Errorf("manual update is missing a target version")
+		}
+		if err := au.persistAttempt(attemptID, info.LatestVersion); err != nil {
+			if isDraining() && drainingAttempt() == attemptID {
+				au.exitDrain(attemptID, "superseded", false)
+			}
+			return fmt.Errorf("could not persist manual update target: %w", err)
+		}
+	}
+
 	err := au.manualApply(info)
 	if err != nil && attemptID != "" && isDraining() && drainingAttempt() == attemptID {
 		au.exitDrain(attemptID, "superseded", false)

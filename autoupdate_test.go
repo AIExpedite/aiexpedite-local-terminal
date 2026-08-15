@@ -658,7 +658,14 @@ func TestManualInstallTakesOverAutomaticDrainAndRestoresOnFailure(t *testing.T) 
 	t.Cleanup(func() { resetDrainState(t) })
 	closeAdmission("auto-attempt")
 
-	au := newAutoUpdater(DefaultConfig(), nil)
+	cfg := DefaultConfig()
+	cfg.PendingUpdateAttemptID = "auto-attempt"
+	cfg.PendingUpdateVersion = "v1.0.0"
+	au := newAutoUpdater(cfg, nil)
+	au.savePath = filepath.Join(t.TempDir(), "config.json")
+	if err := cfg.Save(au.savePath); err != nil {
+		t.Fatal(err)
+	}
 	autoDone := make(chan struct{})
 	takeover := make(chan struct{})
 	au.mu.Lock()
@@ -668,9 +675,11 @@ func TestManualInstallTakesOverAutomaticDrainAndRestoresOnFailure(t *testing.T) 
 	au.drainAttempt = "auto-attempt"
 	au.mu.Unlock()
 
-	manualCalled := make(chan struct{})
+	manualCalled := make(chan string, 1)
 	au.manualApply = func(*UpdateInfo) error {
-		close(manualCalled)
+		cfg.WithPersistenceLock(func() {
+			manualCalled <- cfg.PendingUpdateVersion
+		})
 		return errors.New("manual apply failed")
 	}
 	result := make(chan error, 1)
@@ -692,6 +701,9 @@ func TestManualInstallTakesOverAutomaticDrainAndRestoresOnFailure(t *testing.T) 
 	close(autoDone)
 	if err := <-result; err == nil {
 		t.Fatal("manual apply failure was not returned")
+	}
+	if got := <-manualCalled; got != "v9.9.9" {
+		t.Fatalf("manual apply observed persisted target %q, want v9.9.9", got)
 	}
 	if isDraining() {
 		t.Fatal("failed manual takeover must restore routability")
