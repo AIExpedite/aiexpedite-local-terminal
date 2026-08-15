@@ -271,6 +271,102 @@ func TestStopForShutdownPreventsDrainFromInstalling(t *testing.T) {
 	}
 }
 
+func TestStopForShutdownWaitsForActiveApplyHandoff(t *testing.T) {
+	r := newAutoTestRig(t, DefaultConfig())
+	r.activeWork = 0
+	artifact := filepath.Join(t.TempDir(), "verified-update")
+	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	updateMutex.Lock()
+	previousPath, previousPending := updatePath, updatePending
+	updatePath, updatePending = "", false
+	updateMutex.Unlock()
+	t.Cleanup(func() {
+		updateMutex.Lock()
+		updatePath, updatePending = previousPath, previousPending
+		updateMutex.Unlock()
+	})
+
+	applyStarted := make(chan struct{})
+	releaseApply := make(chan struct{})
+	r.au.apply = func(_ string, _ *UpdateInfo) error {
+		close(applyStarted)
+		<-releaseApply
+		SetUpdateHandoff()
+		return nil
+	}
+
+	installDone := make(chan struct{})
+	go func() {
+		r.au.drainAndInstall("applying-attempt", r.info, artifact)
+		close(installDone)
+	}()
+	<-applyStarted
+
+	shutdownDone := make(chan string, 1)
+	go func() { shutdownDone <- r.au.stopForShutdown() }()
+	select {
+	case <-shutdownDone:
+		t.Fatal("shutdown returned while replacement was still active")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseApply)
+	<-installDone
+	if got := <-shutdownDone; got != "" {
+		t.Fatalf("stopForShutdown attempt = %q, want update-owned shutdown", got)
+	}
+	if path, pending := GetUpdateReady(); !pending || path != "" {
+		t.Fatalf("GetUpdateReady = (%q, %v), want completed handoff", path, pending)
+	}
+}
+
+func TestStopForShutdownWaitsForActiveApplyFailureCleanup(t *testing.T) {
+	r := newAutoTestRig(t, DefaultConfig())
+	r.activeWork = 0
+	artifact := filepath.Join(t.TempDir(), "verified-update")
+	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	applyStarted := make(chan struct{})
+	releaseApply := make(chan struct{})
+	r.au.apply = func(_ string, _ *UpdateInfo) error {
+		close(applyStarted)
+		<-releaseApply
+		return errors.New("replacement failed")
+	}
+
+	installDone := make(chan struct{})
+	go func() {
+		r.au.drainAndInstall("failing-attempt", r.info, artifact)
+		close(installDone)
+	}()
+	<-applyStarted
+
+	shutdownDone := make(chan string, 1)
+	go func() { shutdownDone <- r.au.stopForShutdown() }()
+	select {
+	case <-shutdownDone:
+		t.Fatal("shutdown returned while replacement was still active")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseApply)
+	if got := <-shutdownDone; got != "" {
+		t.Fatalf("stopForShutdown attempt = %q, want update-owned shutdown", got)
+	}
+	if isDraining() {
+		t.Fatal("failed replacement must reopen admission before shutdown continues")
+	}
+	if _, err := os.Stat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("shutdown continued before failed artifact cleanup: %v", err)
+	}
+	<-installDone
+}
+
 func TestRunAttempt_RegisteredReportsDrainThenInstalls(t *testing.T) {
 	r := newAutoTestRig(t, registeredCfg())
 	r.activeWork = 0

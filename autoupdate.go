@@ -231,6 +231,7 @@ type autoUpdater struct {
 	drainAttempt     string
 	installing       bool
 	applying         bool
+	applyDone        chan struct{}
 	stopping         bool
 	deferredUntil    time.Time // cooldown floor after a defer (24h)
 
@@ -344,8 +345,13 @@ func (au *autoUpdater) stopForShutdown() string {
 	au.mu.Lock()
 	if au.applying {
 		// Replacement has already begun and cannot be safely rolled back here.
-		// Its handoff marker keeps onTrayExit on the update path.
+		// Wait until it either establishes the update handoff or finishes its
+		// failure cleanup; ordinary shutdown must not exit between bundle swaps.
+		done := au.applyDone
 		au.mu.Unlock()
+		if done != nil {
+			<-done
+		}
 		return ""
 	}
 	attemptID := au.drainAttempt
@@ -553,9 +559,19 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 	// startup sweep. A successful apply() sets installed=true because the
 	// artifact is then consumed by the self-replace handoff / bundle swap.
 	installed := false
+	var applyDone chan struct{}
 	defer func() {
 		if !installed && path != "" {
 			_ = os.Remove(path)
+		}
+		if applyDone != nil {
+			au.mu.Lock()
+			au.applying = false
+			if au.applyDone == applyDone {
+				close(applyDone)
+				au.applyDone = nil
+			}
+			au.mu.Unlock()
 		}
 	}()
 
@@ -668,7 +684,9 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		au.mu.Unlock()
 		return
 	}
+	applyDone = make(chan struct{})
 	au.applying = true
+	au.applyDone = applyDone
 	au.mu.Unlock()
 
 	// The current version stays usable until the
@@ -676,7 +694,6 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 	fmt.Printf("[autoupdate] Drained; installing %s\n", info.LatestVersion)
 	err := au.apply(path, info)
 	au.mu.Lock()
-	au.applying = false
 	stopping := au.stopping
 	au.mu.Unlock()
 	if err != nil {
