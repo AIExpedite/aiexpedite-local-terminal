@@ -76,7 +76,7 @@ func maybeRelocateInstall(_ *Config) bool {
 		fmt.Printf("[relocate] Per-user bundle already present at %s; handing over\n", dest)
 		// Ordinary `open` activates an existing instance and launches one only
 		// when needed. `open -n` would force a duplicate agent.
-		if err := exec.Command("open", dest).Start(); err != nil {
+		if err := launchRelocatedDarwinBundle(dest, false); err != nil {
 			fmt.Printf("[relocate] Failed to launch existing per-user copy: %v\n", err)
 			return false
 		}
@@ -113,9 +113,21 @@ func maybeRelocateInstall(_ *Config) bool {
 	// `open` may merely activate the source and leave no process after we exit.
 	// The per-account singleton acquired during destination startup prevents a
 	// lasting duplicate if simultaneous relocation launchers race here.
-	if err := exec.Command("open", "-n", dest).Start(); err != nil {
+	if err := launchRelocatedDarwinBundle(dest, true); err != nil {
 		fmt.Printf("[relocate] Failed to launch relocated copy: %v\n", err)
 		return false
 	}
 	return true
+}
+
+func launchRelocatedDarwinBundle(bundle string, forceNew bool) error {
+	args := []string{bundle}
+	if forceNew {
+		args = []string{"-n", bundle}
+	}
+	out, err := exec.Command("open", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("open: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

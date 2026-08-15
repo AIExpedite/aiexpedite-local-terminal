@@ -89,14 +89,14 @@ type Config struct {
 
 	/* ─── Auto-update attempt bookkeeping (crash recovery) ─── */
 	// When the automatic path is about to install, it records the in-flight
-	// attempt id + target version here and Save()s, so a restart (successful
-	// or crashed) can reconcile: if the running Version now equals the target
-	// the update landed (report ready on the new version + attempt id);
-	// otherwise the attempt was interrupted mid-drain and is abandoned so the
-	// agent never comes back believing it is still draining. Cleared once
-	// resolved. See resolveInterruptedAttempt in autoupdate.go.
+	// attempt id + target version here and Save()s. The installed replacement
+	// sets PendingUpdateApplied on its first launch, so a downloaded temporary
+	// binary that falls back after a failed copy cannot be mistaken for a
+	// durable install merely because it embeds the target Version. Cleared only
+	// after service reconciliation succeeds. See resolveInterruptedAttempt.
 	PendingUpdateAttemptID string `json:"pending_update_attempt_id,omitempty"`
 	PendingUpdateVersion   string `json:"pending_update_version,omitempty"`
+	PendingUpdateApplied   bool   `json:"pending_update_applied,omitempty"`
 
 	/* ─── Performance Tuning ─────────────────────────── */
 	MaxOutstandingMessages int `json:"max_outstanding_messages,omitempty"` // Parallel message processing (default: 5)

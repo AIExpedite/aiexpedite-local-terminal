@@ -150,7 +150,7 @@ func handleFailedDarwinRelaunch(bundle string, relaunchErr error) error {
 }
 
 func relaunchDarwinBundle(bundle string) error {
-	out, err := exec.Command("open", "-n", bundle).CombinedOutput()
+	out, err := exec.Command("open", "-n", bundle, "--args", updateAppliedArg).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("open: %v: %s", err, strings.TrimSpace(string(out)))
 	}

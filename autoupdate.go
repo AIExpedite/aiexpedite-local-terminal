@@ -35,6 +35,8 @@ import (
 	"time"
 )
 
+const updateAppliedArg = "--update-applied"
+
 // silentUpdateCapableFlag is "true" on builds that can replace themselves
 // silently (Windows, Linux, and macOS bundle replacement). A macOS build may
 // set it "false" via -ldflags "-X main.silentUpdateCapableFlag=false" to ship
@@ -73,6 +75,7 @@ var (
 	// Pending update state (when user clicks "Later" on the manual dialog).
 	pendingUpdateInfo  *UpdateInfo
 	pendingUpdateMutex sync.RWMutex
+	updateAttemptCfgMu sync.Mutex
 )
 
 // SetUpdateReady stores the path of the downloaded update binary and marks the
@@ -377,6 +380,13 @@ func (au *autoUpdater) tick() {
 // check+download+verify, then drain+install.
 func (au *autoUpdater) runAttempt() {
 	if au.takeoverRequested() {
+		return
+	}
+	updateAttemptCfgMu.Lock()
+	reconciliationPending := au.cfg.PendingUpdateAttemptID != ""
+	updateAttemptCfgMu.Unlock()
+	if reconciliationPending {
+		fmt.Println("[autoupdate] Skipping check while restart reconciliation is pending")
 		return
 	}
 	// macOS check-and-offer fallback builds do not replace their bundle, so the
@@ -719,24 +729,32 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 
 // persistAttempt / clearAttempt maintain the crash-recovery marker.
 func (au *autoUpdater) persistAttempt(attemptID, target string) error {
+	updateAttemptCfgMu.Lock()
+	defer updateAttemptCfgMu.Unlock()
 	previousAttempt := au.cfg.PendingUpdateAttemptID
 	previousVersion := au.cfg.PendingUpdateVersion
+	previousApplied := au.cfg.PendingUpdateApplied
 	au.cfg.PendingUpdateAttemptID = attemptID
 	au.cfg.PendingUpdateVersion = target
+	au.cfg.PendingUpdateApplied = false
 	if err := au.cfg.Save(au.savePath); err != nil {
 		au.cfg.PendingUpdateAttemptID = previousAttempt
 		au.cfg.PendingUpdateVersion = previousVersion
+		au.cfg.PendingUpdateApplied = previousApplied
 		return err
 	}
 	return nil
 }
 
 func (au *autoUpdater) clearAttempt() {
-	if au.cfg.PendingUpdateAttemptID == "" && au.cfg.PendingUpdateVersion == "" {
+	updateAttemptCfgMu.Lock()
+	defer updateAttemptCfgMu.Unlock()
+	if au.cfg.PendingUpdateAttemptID == "" && au.cfg.PendingUpdateVersion == "" && !au.cfg.PendingUpdateApplied {
 		return
 	}
 	au.cfg.PendingUpdateAttemptID = ""
 	au.cfg.PendingUpdateVersion = ""
+	au.cfg.PendingUpdateApplied = false
 	if err := au.cfg.Save(au.savePath); err != nil {
 		fmt.Printf("[autoupdate] Could not clear attempt marker: %v\n", err)
 	}
@@ -778,30 +796,29 @@ func isDrainExpiredErr(err error) bool {
 // install-restart, BEFORE the Pub/Sub loop can accept work. Called from
 // StartAgent. It never leaves the agent believing it is mid-drain without
 // telling the service.
-func resolveInterruptedAttempt(cfg *Config) {
-	resolveInterruptedAttemptWithPath(cfg, ConfigPath())
+func resolveInterruptedAttempt(cfg *Config) bool {
+	return resolveInterruptedAttemptWithPath(cfg, ConfigPath())
 }
 
 // resolveInterruptedAttemptWithPath is resolveInterruptedAttempt with an
 // explicit save path (for tests).
-func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) {
+// The return value reports that service reconciliation is still pending. The
+// caller must then suppress the generic boot-time /online call, which lacks the
+// attempt identity and could make a later targeted reconciliation a no-op.
+func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) bool {
+	updateAttemptCfgMu.Lock()
+	defer updateAttemptCfgMu.Unlock()
 	if cfg == nil || cfg.PendingUpdateAttemptID == "" {
-		return
+		return false
 	}
 	attemptID := cfg.PendingUpdateAttemptID
 	target := cfg.PendingUpdateVersion
 
-	// Clear the marker first so a re-crash cannot loop on it, and make sure we
-	// are not draining.
-	cfg.PendingUpdateAttemptID = ""
-	cfg.PendingUpdateVersion = ""
-	if err := cfg.Save(savePath); err != nil {
-		fmt.Printf("[autoupdate] Could not clear interrupted attempt marker: %v\n", err)
-	}
 	reopenAdmission()
 
 	if !cfg.IsRegistered() || cfg.OfflineMode {
-		return
+		clearInterruptedAttempt(cfg, savePath)
+		return false
 	}
 
 	// Reconcile synchronously. StartAgent calls this before it starts Pub/Sub
@@ -810,16 +827,56 @@ func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) {
 	// already-online response can discard the attempt/version outcome.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if Version == target {
+	if cfg.PendingUpdateApplied && Version == target {
 		// The update landed. Report ready on the new version + attempt id so
 		// the service reconciles the drain it cleared.
 		if err := notifyOnlineWithVersion(ctx, cfg, Version, attemptID); err != nil {
 			fmt.Printf("[autoupdate] post-update online report failed: %v\n", err)
+			return true
 		}
 	} else {
 		// Interrupted mid-drain (crash / failed install): abandon the attempt,
 		// tell the service to exit the drain, and become routable.
-		_ = notifyDrainExit(ctx, cfg, attemptID, "deferred")
-		_ = notifyOnline(ctx, cfg)
+		if err := notifyDrainExit(ctx, cfg, attemptID, "deferred"); err != nil {
+			fmt.Printf("[autoupdate] interrupted-attempt drain exit failed: %v\n", err)
+			return true
+		}
+		if err := notifyOnline(ctx, cfg); err != nil {
+			fmt.Printf("[autoupdate] interrupted-attempt online report failed: %v\n", err)
+			return true
+		}
+	}
+
+	clearInterruptedAttempt(cfg, savePath)
+	return false
+}
+
+func clearInterruptedAttempt(cfg *Config, savePath string) {
+	cfg.PendingUpdateAttemptID = ""
+	cfg.PendingUpdateVersion = ""
+	cfg.PendingUpdateApplied = false
+	if err := cfg.Save(savePath); err != nil {
+		fmt.Printf("[autoupdate] Could not clear interrupted attempt marker: %v\n", err)
+	}
+}
+
+// retryInterruptedAttemptReconciliation keeps a successfully installed agent
+// from remaining unroutable until another process restart when the service was
+// temporarily unavailable during its first version-aware online report.
+func retryInterruptedAttemptReconciliation(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	for attempt := 1; ; attempt++ {
+		timer := time.NewTimer(retryBackoff(attempt))
+		select {
+		case <-shutdownChan:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if !resolveInterruptedAttempt(cfg) {
+			return
+		}
 	}
 }

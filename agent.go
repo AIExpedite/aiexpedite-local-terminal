@@ -325,7 +325,10 @@ func StartAgent(cfg *Config) {
 	// report ready on the new version or abandon the attempt and become
 	// routable. This must happen before the Pub/Sub loop can accept work so the
 	// agent never comes back believing it is still draining. See autoupdate.go.
-	resolveInterruptedAttempt(cfg)
+	updateReconciliationPending := resolveInterruptedAttempt(cfg)
+	if updateReconciliationPending {
+		go retryInterruptedAttemptReconciliation(cfg)
+	}
 
 	/* 4. Start Pub/Sub loop (non‑blocking) -------------------------------- */
 
@@ -349,11 +352,13 @@ func StartAgent(cfg *Config) {
 		// Best-effort, non-blocking: a transient backend failure must not
 		// delay agent startup. The HTTP retry wrapper inside notifyOnline
 		// gives us 2 attempts × 2s within a 5s budget.
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			notifyOnlineIfApplicable(ctx, cfg)
-		}()
+		if !updateReconciliationPending {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				notifyOnlineIfApplicable(ctx, cfg)
+			}()
+		}
 	}
 
 	/* 4b. Start orphan-process scanner (kills detached CLI agents) -------- */

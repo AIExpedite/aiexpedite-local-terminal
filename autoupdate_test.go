@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -464,11 +465,79 @@ func TestResolveInterruptedAttempt_ReportsVersionBeforeReturning(t *testing.T) {
 	cfg.CommandSecret = "secret"
 	cfg.PendingUpdateAttemptID = "att-reconcile"
 	cfg.PendingUpdateVersion = Version
+	cfg.PendingUpdateApplied = true
 
-	resolveInterruptedAttemptWithPath(cfg, filepath.Join(t.TempDir(), "c.json"))
+	if pending := resolveInterruptedAttemptWithPath(cfg, filepath.Join(t.TempDir(), "c.json")); pending {
+		t.Fatal("successful version-aware reconciliation must not remain pending")
+	}
 
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("version-aware online requests before return = %d, want 1", got)
+	}
+}
+
+func TestResolveInterruptedAttempt_RetainsMarkerWhenVersionReportFails(t *testing.T) {
+	resetDrainState(t)
+	resetConnectivityState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+
+	cfg := DefaultConfig()
+	cfg.AgentID = "agent-reconcile-fail"
+	cfg.CommandSecret = "secret"
+	cfg.PendingUpdateAttemptID = "att-reconcile-fail"
+	cfg.PendingUpdateVersion = Version
+	cfg.PendingUpdateApplied = true
+
+	if pending := resolveInterruptedAttemptWithPath(cfg, filepath.Join(t.TempDir(), "c.json")); !pending {
+		t.Fatal("failed version-aware reconciliation must remain pending")
+	}
+	if cfg.PendingUpdateAttemptID == "" || !cfg.PendingUpdateApplied {
+		t.Fatal("failed reconciliation must retain the durable attempt marker")
+	}
+}
+
+func TestResolveInterruptedAttempt_TemporaryFallbackIsNotSuccessfulInstall(t *testing.T) {
+	resetDrainState(t)
+	resetConnectivityState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	var pathsMu sync.Mutex
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pathsMu.Lock()
+		paths = append(paths, r.URL.Path)
+		pathsMu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+
+	cfg := DefaultConfig()
+	cfg.AgentID = "agent-temp-fallback"
+	cfg.CommandSecret = "secret"
+	cfg.PendingUpdateAttemptID = "att-temp-fallback"
+	cfg.PendingUpdateVersion = Version // same binary version, but no applied bit
+
+	if pending := resolveInterruptedAttemptWithPath(cfg, filepath.Join(t.TempDir(), "c.json")); pending {
+		t.Fatal("successful fallback reconciliation must not remain pending")
+	}
+	pathsMu.Lock()
+	defer pathsMu.Unlock()
+	want := []string{
+		"/device/agent-temp-fallback/drain/exit",
+		"/device/agent-temp-fallback/online",
+	}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("reconciliation paths = %v, want %v", paths, want)
+	}
+	if cfg.PendingUpdateAttemptID != "" || cfg.PendingUpdateApplied {
+		t.Fatal("successfully abandoned fallback attempt must be cleared")
 	}
 }
 

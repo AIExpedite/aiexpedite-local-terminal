@@ -22,6 +22,7 @@ import (
 var shutdownConfig *Config
 
 func main() {
+	updateApplied := false
 	// Claude Code status-line hook: invoked as `<binary> statusline-hook` with the
 	// session JSON (incl. rate_limits) on stdin. Must be the FIRST thing main()
 	// does — it runs on every Claude render, so it has to be fast and must never
@@ -63,6 +64,10 @@ func main() {
 	// When the app is launched from a temp path after an auto-update, this flag
 	// tells it to copy itself over the original exe and re-launch from there.
 	for _, arg := range os.Args[1:] {
+		if arg == updateAppliedArg {
+			updateApplied = true
+			continue
+		}
 		if strings.HasPrefix(arg, "--update-from=") {
 			originalPath := strings.TrimPrefix(arg, "--update-from=")
 			if originalPath == "" {
@@ -111,6 +116,12 @@ func main() {
 			_ = cfg.Save(ConfigPath())
 		} else {
 			cfg = DefaultConfig()
+		}
+	}
+	if updateApplied && cfg.PendingUpdateAttemptID != "" && cfg.PendingUpdateVersion == Version {
+		cfg.PendingUpdateApplied = true
+		if err := cfg.Save(ConfigPath()); err != nil {
+			fmt.Printf("[update] Could not persist successful replacement marker: %v\n", err)
 		}
 	}
 
@@ -870,7 +881,7 @@ func performSelfReplace(originalPath string) error {
 	fmt.Printf("[update] Successfully replaced %s\n", originalPath)
 
 	// Re-launch from the install path (no --update-from flag this time)
-	cmd := exec.Command(originalPath)
+	cmd := exec.Command(originalPath, updateAppliedArg)
 	setNewConsole(cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to re-launch from install path: %w", err)
