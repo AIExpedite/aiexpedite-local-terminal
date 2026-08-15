@@ -153,6 +153,25 @@ const (
 	heartbeatStaleWindow = 5 * time.Minute
 )
 
+// elapsedAcrossSuspend returns the larger elapsed duration reported by Go's
+// monotonic clock and the wall clock. Some platform monotonic clocks pause
+// while the machine sleeps, but the service-side drain lease does not; using
+// the wall delta in that case forces the agent to renew before installing.
+// Keeping the monotonic delta as a lower bound also prevents a backwards wall
+// clock adjustment from delaying a safety-critical renewal.
+func elapsedAcrossSuspend(now, since time.Time) time.Duration {
+	monotonicElapsed := now.Sub(since)
+	wallElapsed := time.Duration(now.UnixNano() - since.UnixNano())
+	return largerElapsed(monotonicElapsed, wallElapsed)
+}
+
+func largerElapsed(monotonicElapsed, wallElapsed time.Duration) time.Duration {
+	if wallElapsed > monotonicElapsed {
+		return wallElapsed
+	}
+	return monotonicElapsed
+}
+
 // trayUpdateHandles lets the scheduler reflect draining / blocked status in the
 // tray without importing systray specifics. All fields are optional (nil-safe).
 type trayUpdateHandles struct {
@@ -667,7 +686,7 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		// invalidated by reconnect/renewal failure; local refusal alone does not
 		// stop the healthy Pub/Sub heartbeat from keeping cloud routing active.
 		if connected && !reachedService &&
-			(lastEnterAttempt.IsZero() || au.now().Sub(lastEnterAttempt) >= autoUpdateDrainConfirmEvery) {
+			(lastEnterAttempt.IsZero() || elapsedAcrossSuspend(au.now(), lastEnterAttempt) >= autoUpdateDrainConfirmEvery) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err := au.drainEnter(ctx, attemptID, info.LatestVersion)
 			cancel()
@@ -686,7 +705,7 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		// A suspended process may wake after the service-side drain lease has
 		// expired. Renew overdue permission before using it to authorize an
 		// install, even when work became idle while the process was asleep.
-		if connected && reachedService && au.now().Sub(lastConfirm) >= autoUpdateDrainConfirmEvery {
+		if connected && reachedService && elapsedAcrossSuspend(au.now(), lastConfirm) >= autoUpdateDrainConfirmEvery {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err := au.drainConfirm(ctx, attemptID, info.LatestVersion)
 			cancel()

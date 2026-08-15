@@ -33,6 +33,18 @@ func TestSetUpdateHandoffSuppressesArtifactLaunch(t *testing.T) {
 	}
 }
 
+func TestLargerElapsedPrefersWallClockAfterSuspend(t *testing.T) {
+	monotonicElapsed := autoUpdateDrainPollInterval
+	wallElapsed := autoUpdateDrainConfirmEvery + time.Second
+
+	if got := largerElapsed(monotonicElapsed, wallElapsed); got != wallElapsed {
+		t.Fatalf("largerElapsed = %v, want wall-clock sleep duration %v", got, wallElapsed)
+	}
+	if got := largerElapsed(wallElapsed, monotonicElapsed); got != wallElapsed {
+		t.Fatalf("largerElapsed = %v, want monotonic lower bound %v", got, wallElapsed)
+	}
+}
+
 // autoTestRig bundles a stubbed autoUpdater and the observations tests assert on.
 type autoTestRig struct {
 	au *autoUpdater
