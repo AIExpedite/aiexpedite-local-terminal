@@ -211,6 +211,7 @@ type autoUpdater struct {
 	claimInstall   func() bool
 	installable    func() (bool, string)
 	registering    func() bool
+	cloudConnected func() bool
 	drainEnter     func(ctx context.Context, attemptID, target string) error
 	drainConfirm   func(ctx context.Context, attemptID, target string) error
 	drainExit      func(ctx context.Context, attemptID, reason string) error
@@ -260,6 +261,13 @@ func newAutoUpdater(cfg *Config, tray *trayUpdateHandles) *autoUpdater {
 		savePath:       ConfigPath(),
 		stopCh:         make(chan struct{}),
 		triggerCh:      make(chan struct{}, 1),
+	}
+	au.cloudConnected = func() bool {
+		connected := false
+		cfg.WithPersistenceLock(func() {
+			connected = cfg.IsRegistered() && !cfg.OfflineMode
+		})
+		return connected
 	}
 	// Enter and confirm are the same wire call (the service distinguishes by
 	// attempt); kept as two hooks so the state machine reads clearly and tests
@@ -612,9 +620,9 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		return
 	}
 
-	registered := au.cfg.IsRegistered() && !au.cfg.OfflineMode
+	connected := au.cloudConnected()
 	reachedService := false
-	if registered {
+	if connected {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := au.drainEnter(ctx, attemptID, info.LatestVersion); err == nil {
 			reachedService = true
@@ -625,6 +633,8 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 	startedAt := au.now()
 	deadline := startedAt.Add(autoUpdateDrainDeadline)
 	lastConfirm := startedAt
+	lastEnterAttempt := startedAt
+	reconnectedDuringDrain := false
 
 	for {
 		// A user-selected Update Now supersedes the automatic attempt. Keep
@@ -640,7 +650,35 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 			return
 		}
 
-		if au.activeWork() == 0 && au.canInstallNow(startedAt, registered, reachedService) {
+		liveConnected := au.cloudConnected()
+		if liveConnected && !connected {
+			// A generic reconnect /online can make an offline-origin attempt
+			// routable again. From this point, installation is blocked until the
+			// service accepts this attempt's explicit drain (or the user
+			// disconnects again), regardless of the original drain age.
+			reconnectedDuringDrain = true
+			reachedService = false
+			lastEnterAttempt = time.Time{}
+		}
+		connected = liveConnected
+		if connected && reconnectedDuringDrain && !reachedService &&
+			(lastEnterAttempt.IsZero() || au.now().Sub(lastEnterAttempt) >= autoUpdateDrainConfirmEvery) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := au.drainEnter(ctx, attemptID, info.LatestVersion)
+			cancel()
+			lastEnterAttempt = au.now()
+			if err == nil {
+				reachedService = true
+				lastConfirm = au.now()
+				completeCloudReconnectDrain()
+			}
+		}
+
+		safeToInstall := au.canInstallNow(startedAt, connected, reachedService)
+		if reconnectedDuringDrain && connected && !reachedService {
+			safeToInstall = false
+		}
+		if au.activeWork() == 0 && safeToInstall {
 			// Serialize the final idle-drain claim with stopForShutdown. Once an
 			// explicit exit sets stopping, this process can no longer launch a
 			// replacement even if teardown makes ActiveWork fall to zero.
@@ -661,7 +699,7 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 			return
 		}
 
-		if registered && au.now().Sub(lastConfirm) >= autoUpdateDrainConfirmEvery {
+		if connected && reachedService && au.now().Sub(lastConfirm) >= autoUpdateDrainConfirmEvery {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			err := au.drainConfirm(ctx, attemptID, info.LatestVersion)
 			cancel()

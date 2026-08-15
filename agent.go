@@ -77,6 +77,11 @@ func IsSystrayReady() bool {
 // halt outbound Pub/Sub traffic, then await notifyOffline so the backend can
 // persist offlineSince before sub-processes are torn down.
 func SetOffline(offline bool, cfg ...*Config) {
+	if offline {
+		// A disconnect that follows a reconnect attempt releases the temporary
+		// drain reservation; an explicitly offline agent cannot be routed work.
+		completeCloudReconnectDrain()
+	}
 	offlineMutex.Lock()
 	isOffline = offline
 	offlineMutex.Unlock()

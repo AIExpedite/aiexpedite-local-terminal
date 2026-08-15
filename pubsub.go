@@ -1253,6 +1253,12 @@ func runPubSubConnection(cfg *Config) error {
 				"STALE",
 				fmt.Sprintf("Command rejected: too old (%d seconds, max %d seconds). Terminal may have been offline.", ageSec, maxCommandAgeSec),
 			)
+			releasePublish, allowed := beginTrackedRejectionPublish()
+			if !allowed {
+				m.Ack()
+				return
+			}
+			defer releasePublish()
 			if err := publishMsg(ctx, topic, res); err != nil {
 				m.Nack()
 			} else {
@@ -1277,6 +1283,12 @@ func runPubSubConnection(cfg *Config) error {
 				"RATE_LIMITED",
 				"Command rate limit exceeded. Please wait before retrying.",
 			)
+			releasePublish, allowed := beginTrackedRejectionPublish()
+			if !allowed {
+				m.Ack()
+				return
+			}
+			defer releasePublish()
 			if err := publishMsg(ctx, topic, res); err != nil {
 				m.Nack()
 			} else {
@@ -1315,6 +1327,12 @@ func runPubSubConnection(cfg *Config) error {
 					"UNAUTHORIZED",
 					"Command rejected: signature required but not provided",
 				)
+				releasePublish, allowed := beginTrackedRejectionPublish()
+				if !allowed {
+					m.Ack()
+					return
+				}
+				defer releasePublish()
 				if err := publishMsg(ctx, topic, res); err != nil {
 					m.Nack()
 				} else {
@@ -1337,6 +1355,12 @@ func runPubSubConnection(cfg *Config) error {
 					"UNAUTHORIZED",
 					"Command rejected: invalid signature",
 				)
+				releasePublish, allowed := beginTrackedRejectionPublish()
+				if !allowed {
+					m.Ack()
+					return
+				}
+				defer releasePublish()
 				if err := publishMsg(ctx, topic, res); err != nil {
 					m.Nack()
 				} else {

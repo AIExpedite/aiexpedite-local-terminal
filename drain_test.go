@@ -16,6 +16,7 @@ func resetDrainState(t *testing.T) {
 	drain.installing = false
 	drain.attemptID = ""
 	drain.registering = false
+	drain.reconnectPending = false
 	drain.pendingStarts = 0
 	drain.operationalCommands = 0
 	drain.continuationCommands = 0
@@ -55,6 +56,28 @@ func TestDrainRejectionPublishHoldsInstallSeal(t *testing.T) {
 	}
 }
 
+func TestPreAdmissionRejectionPublishHoldsInstallSeal(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	release, allowed := beginTrackedRejectionPublish()
+	if !allowed || release == nil {
+		t.Fatal("rejection publish beginning before drain should be tracked")
+	}
+	closeAdmission("attempt-early-rejection")
+	if sealDrainForInstall() {
+		t.Fatal("install seal must wait for a pre-admission rejection publish")
+	}
+
+	release()
+	if !sealDrainForInstall() {
+		t.Fatal("idle drain should seal after pre-admission rejection completes")
+	}
+	if release, allowed := beginTrackedRejectionPublish(); allowed || release != nil {
+		t.Fatal("rejection arriving after install seal must not start publishing")
+	}
+}
+
 func TestRegistrationAndDrainEntryAreMutuallyExclusive(t *testing.T) {
 	resetDrainState(t)
 	t.Cleanup(func() { resetDrainState(t) })
@@ -75,6 +98,31 @@ func TestRegistrationAndDrainEntryAreMutuallyExclusive(t *testing.T) {
 	}
 	if beginRegistration() {
 		t.Fatal("registration must not begin after draining owns the boundary")
+	}
+}
+
+func TestReconnectReservationBlocksInstallSealUntilDrainReported(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	if !beginCloudReconnect() {
+		t.Fatal("reconnect should reserve an idle admission boundary")
+	}
+	if !closeAdmission("attempt-reconnect") {
+		t.Fatal("update should still be able to enter draining")
+	}
+	if !finishCloudReconnectPreparation() {
+		t.Fatal("reconnect must observe the drain that began during preparation")
+	}
+	if sealDrainForInstall() {
+		t.Fatal("install seal must wait for reconnect drain reporting")
+	}
+	completeCloudReconnectDrain()
+	if !sealDrainForInstall() {
+		t.Fatal("install may seal after reconnect has joined the service drain")
+	}
+	if beginCloudReconnect() {
+		t.Fatal("reconnect must not begin after replacement is sealed")
 	}
 }
 

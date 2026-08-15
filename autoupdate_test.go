@@ -103,6 +103,13 @@ func newAutoTestRig(t *testing.T, cfg *Config) *autoTestRig {
 		claimInstall: func() bool { r.mu.Lock(); defer r.mu.Unlock(); return r.activeWork == 0 },
 		installable:  func() (bool, string) { r.mu.Lock(); defer r.mu.Unlock(); return r.installableOK, r.installableMsg },
 		registering:  func() bool { r.mu.Lock(); defer r.mu.Unlock(); return r.registrationPending },
+		cloudConnected: func() bool {
+			connected := false
+			cfg.WithPersistenceLock(func() {
+				connected = cfg.IsRegistered() && !cfg.OfflineMode
+			})
+			return connected
+		},
 		drainEnter: func(_ context.Context, _, _ string) error {
 			r.mu.Lock()
 			defer r.mu.Unlock()
@@ -470,6 +477,58 @@ func TestRunAttempt_RegisteredReportsDrainThenInstalls(t *testing.T) {
 	}
 	if r.applyCalls != 1 {
 		t.Fatalf("apply should be called once, got %d", r.applyCalls)
+	}
+}
+
+func TestDrainAndInstall_OfflineReconnectReportsDrainBeforeInstall(t *testing.T) {
+	cfg := registeredCfg()
+	cfg.OfflineMode = true
+	r := newAutoTestRig(t, cfg)
+	r.activeWork = 1
+	artifact := filepath.Join(t.TempDir(), "verified-update")
+	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	enterStarted := make(chan struct{})
+	allowEnter := make(chan struct{})
+	r.au.drainEnter = func(_ context.Context, _, _ string) error {
+		r.mu.Lock()
+		r.drainEnter++
+		r.mu.Unlock()
+		close(enterStarted)
+		<-allowEnter
+		return nil
+	}
+	firstSleep := true
+	r.au.sleep = func(d time.Duration) bool {
+		r.mu.Lock()
+		r.clock = r.clock.Add(d)
+		if firstSleep {
+			firstSleep = false
+			r.activeWork = 0
+		}
+		r.mu.Unlock()
+		cfg.WithPersistenceLock(func() { cfg.OfflineMode = false })
+		return true
+	}
+
+	done := make(chan struct{})
+	go func() {
+		r.au.drainAndInstall("offline-reconnect", r.info, artifact)
+		close(done)
+	}()
+	<-enterStarted
+	r.mu.Lock()
+	applyCalls := r.applyCalls
+	r.mu.Unlock()
+	if applyCalls != 0 {
+		t.Fatalf("reconnected drain installed before service drain entry, apply=%d", applyCalls)
+	}
+	close(allowEnter)
+	<-done
+	if r.applyCalls != 1 {
+		t.Fatalf("service-drained reconnect should install once, apply=%d", r.applyCalls)
 	}
 }
 

@@ -638,9 +638,14 @@ func onTrayReady(cfg *Config) func() {
 				case <-mDisconnect.ClickedCh:
 					if mDisconnect.Checked() {
 						// ── Reconnect flow ─────────────────────────────
+						if !beginCloudReconnect() {
+							fmt.Println("[tray] Reconnect deferred because update replacement has begun")
+							continue
+						}
 						mDisconnect.Uncheck()
 						fmt.Println("[tray] Reconnecting to cloud...")
 						SetOffline(false, cfg) // persists cfg.OfflineMode = false
+						reconnectingIntoDrain := finishCloudReconnectPreparation()
 						systray.SetTooltip(EnvDisplayName + " – Online")
 						applyStandardTrayIcon()
 						// Restart the Pub/Sub loop. SetOffline already signals
@@ -658,6 +663,10 @@ func onTrayReady(cfg *Config) func() {
 						// goroutine so the tray loop isn't blocked, but the
 						// call itself awaits the retry wrapper inside
 						// notifyOnline so transient blips don't leak past.
+						if reconnectingIntoDrain {
+							fmt.Println("[tray] Reconnect joined active update drain; waiting for drain acknowledgement")
+							continue
+						}
 						go func() {
 							ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 							defer cancel()

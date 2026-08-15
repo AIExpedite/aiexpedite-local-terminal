@@ -53,6 +53,10 @@ type drainState struct {
 	installing  bool
 	attemptID   string
 	registering bool
+	// reconnectPending covers the tray's offline->online transition. It keeps
+	// an updater from sealing between the user's reconnect click and the point
+	// where that reconnect either proceeds normally or joins the active drain.
+	reconnectPending bool
 
 	// pendingStarts counts work STARTS that passed admission but whose
 	// ownership has not yet been handed to a long-lived tracker — a one-shot
@@ -164,6 +168,38 @@ func reopenAdmission() {
 	drain.draining = false
 	drain.installing = false
 	drain.attemptID = ""
+	drain.reconnectPending = false
+	drain.mu.Unlock()
+}
+
+// beginCloudReconnect reserves the drain boundary before the tray clears
+// OfflineMode. A replacement that has already sealed cannot be reopened.
+func beginCloudReconnect() bool {
+	drain.mu.Lock()
+	defer drain.mu.Unlock()
+	if drain.installing {
+		return false
+	}
+	drain.reconnectPending = true
+	return true
+}
+
+// finishCloudReconnectPreparation completes the tray-side transition. If a
+// drain began while OfflineMode was being cleared, keep the reservation until
+// the updater has reported that drain to the service and skip generic /online.
+func finishCloudReconnectPreparation() bool {
+	drain.mu.Lock()
+	defer drain.mu.Unlock()
+	if drain.draining {
+		return true
+	}
+	drain.reconnectPending = false
+	return false
+}
+
+func completeCloudReconnectDrain() {
+	drain.mu.Lock()
+	drain.reconnectPending = false
 	drain.mu.Unlock()
 }
 
@@ -247,6 +283,21 @@ func (d *drainState) releaseRejectionPublish() func() {
 			d.mu.Unlock()
 		})
 	}
+}
+
+// beginTrackedRejectionPublish brackets a correlated rejection that occurs
+// before the main admission gate (stale, rate-limited, or unauthorized). It
+// counts even before draining begins so closeAdmission cannot race a publish
+// already in progress. Once replacement has sealed the drain, callers must
+// acknowledge without starting a publish that process exit could interrupt.
+func beginTrackedRejectionPublish() (release func(), allowed bool) {
+	drain.mu.Lock()
+	defer drain.mu.Unlock()
+	if drain.installing {
+		return nil, false
+	}
+	drain.rejectionPublishes++
+	return drain.releaseRejectionPublish(), true
 }
 
 // releaseStart returns an idempotent function that decrements pendingStarts.
@@ -387,6 +438,9 @@ func (d *drainState) activeWorkLocked() int {
 	drainWorkSourcesMu.Unlock()
 
 	total += d.pendingStarts + d.operationalCommands + d.continuationCommands + d.rejectionPublishes + d.uploads + d.approvals + d.terminalPublishes
+	if d.reconnectPending {
+		total++
+	}
 	return total
 }
 
