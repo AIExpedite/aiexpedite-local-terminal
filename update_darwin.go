@@ -95,9 +95,9 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	}
 	defer os.RemoveAll(staged) // no-op if the rename below consumed it
 
-	// Swap: move the old bundle aside, move the staged one into place, then
-	// remove the old. If the process dies between the two renames, the ".old"
-	// bundle is still a complete launchable copy.
+	// Swap: move the old bundle aside, then move the staged one into place. Keep
+	// the old bundle until LaunchServices accepts the relaunch so a rejected
+	// handoff can restore the version that is still running.
 	backup := filepath.Join(parent, ".aixupd_old_"+filepath.Base(currentBundle))
 	_ = os.RemoveAll(backup)
 	if err := os.Rename(currentBundle, backup); err != nil {
@@ -110,8 +110,6 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 		}
 		return fmt.Errorf("cannot move new bundle into place: %w", err)
 	}
-	_ = os.RemoveAll(backup)
-
 	// Re-point the LaunchAgent at the (unchanged-path but freshly written)
 	// bundle so its ProgramArguments stay valid, then relaunch and quit.
 	_ = ensureAutoStart()
@@ -123,8 +121,9 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	// race and exit before this process quits too.
 	releaseAgentInstanceForHandoff()
 	if err := relaunchDarwinBundle(currentBundle); err != nil {
-		return handleFailedDarwinRelaunch(currentBundle, err)
+		return handleFailedDarwinRelaunch(currentBundle, backup, err)
 	}
+	_ = os.RemoveAll(backup)
 	// The bundle has already been replaced and relaunched, so tray exit must
 	// skip the ordinary offline notification and subprocess teardown. Using a
 	// handoff marker with no artifact path also prevents onTrayExit from trying
@@ -138,14 +137,40 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 // can safely remain authoritative. If another process acquired the singleton
 // during the intentionally unlocked LaunchServices window, this process must
 // yield instead of reopening admission and serving concurrently.
-func handleFailedDarwinRelaunch(bundle string, relaunchErr error) error {
+func handleFailedDarwinRelaunch(bundle, backup string, relaunchErr error) error {
 	if release, acquired := acquireAgentInstanceAfterDarwinHandoff(); acquired {
 		trackAgentInstanceRelease(release)
+		if err := restoreDarwinBundleBackup(bundle, backup); err != nil {
+			return fmt.Errorf("failed to relaunch %s (%v) and could not restore the previous bundle: %w", bundle, relaunchErr, err)
+		}
 		return fmt.Errorf("failed to relaunch %s: %w", bundle, relaunchErr)
 	}
 
+	// Another process owns the singleton, so the replacement did start despite
+	// the LaunchServices error. It is authoritative and the old backup is no
+	// longer needed.
+	_ = os.RemoveAll(backup)
 	SetUpdateHandoff()
 	quitAfterDarwinHandoff()
+	return nil
+}
+
+// restoreDarwinBundleBackup replaces the newly installed bundle with the
+// previous complete bundle after a failed relaunch. The rejected bundle is
+// moved aside first so a failed restore can put it back at the installed path.
+func restoreDarwinBundleBackup(bundle, backup string) error {
+	failed := filepath.Join(filepath.Dir(bundle), ".aixupd_failed_"+filepath.Base(bundle))
+	_ = os.RemoveAll(failed)
+	if err := os.Rename(bundle, failed); err != nil {
+		return fmt.Errorf("cannot move rejected bundle aside: %w", err)
+	}
+	if err := os.Rename(backup, bundle); err != nil {
+		if rbErr := os.Rename(failed, bundle); rbErr != nil {
+			return fmt.Errorf("cannot restore backup (%v) and cannot restore rejected bundle (%v)", err, rbErr)
+		}
+		return fmt.Errorf("cannot restore backup: %w", err)
+	}
+	_ = os.RemoveAll(failed)
 	return nil
 }
 

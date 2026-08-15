@@ -50,7 +50,7 @@ func TestFailedDarwinRelaunchYieldsWhenSingletonWasTaken(t *testing.T) {
 	var quits atomic.Int32
 	quitAfterDarwinHandoff = func() { quits.Add(1) }
 
-	if err := handleFailedDarwinRelaunch("/Applications/AI Expedite.app", errors.New("open failed")); err != nil {
+	if err := handleFailedDarwinRelaunch("/Applications/AI Expedite.app", "", errors.New("open failed")); err != nil {
 		t.Fatalf("lost-singleton handoff should yield without reopening admission: %v", err)
 	}
 	if got := quits.Load(); got != 1 {
@@ -77,7 +77,23 @@ func TestFailedDarwinRelaunchStaysAliveAfterReacquiringSingleton(t *testing.T) {
 	var quits atomic.Int32
 	quitAfterDarwinHandoff = func() { quits.Add(1) }
 
-	err := handleFailedDarwinRelaunch("/Applications/AI Expedite.app", errors.New("open failed"))
+	parent := t.TempDir()
+	bundle := filepath.Join(parent, "AI Expedite.app")
+	backup := filepath.Join(parent, ".aixupd_old_AI Expedite.app")
+	if err := os.MkdirAll(bundle, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "version"), []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(backup, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backup, "version"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := handleFailedDarwinRelaunch(bundle, backup, errors.New("open failed"))
 	if err == nil {
 		t.Fatal("reacquired singleton should keep the current process alive and report apply failure")
 	}
@@ -87,5 +103,15 @@ func TestFailedDarwinRelaunchStaysAliveAfterReacquiringSingleton(t *testing.T) {
 	releaseAgentInstanceForHandoff()
 	if got := releases.Load(); got != 1 {
 		t.Fatalf("tracked singleton release calls = %d, want 1", got)
+	}
+	version, readErr := os.ReadFile(filepath.Join(bundle, "version"))
+	if readErr != nil {
+		t.Fatalf("restored bundle is not launchable: %v", readErr)
+	}
+	if string(version) != "old" {
+		t.Fatalf("installed bundle version = %q, want restored old bundle", version)
+	}
+	if _, statErr := os.Stat(backup); !os.IsNotExist(statErr) {
+		t.Fatalf("backup should be consumed by rollback: %v", statErr)
 	}
 }

@@ -381,6 +381,60 @@ func TestStopForShutdownWaitsForActiveApplyFailureCleanup(t *testing.T) {
 	<-installDone
 }
 
+func TestStopForShutdownWaitsForManualApplyHandoff(t *testing.T) {
+	r := newAutoTestRig(t, DefaultConfig())
+	artifact := filepath.Join(t.TempDir(), "verified-update")
+	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.au.downloadVerify = func(*UpdateInfo) (string, error) { return artifact, nil }
+
+	updateMutex.Lock()
+	previousPath, previousPending := updatePath, updatePending
+	updatePath, updatePending = "", false
+	updateMutex.Unlock()
+	t.Cleanup(func() {
+		updateMutex.Lock()
+		updatePath, updatePending = previousPath, previousPending
+		updateMutex.Unlock()
+	})
+
+	applyStarted := make(chan struct{})
+	releaseApply := make(chan struct{})
+	r.au.apply = func(_ string, _ *UpdateInfo) error {
+		close(applyStarted)
+		<-releaseApply
+		SetUpdateHandoff()
+		return nil
+	}
+	installDone := make(chan error, 1)
+	go func() { installDone <- r.au.installManually(r.info) }()
+	<-applyStarted
+
+	type shutdownResult struct {
+		attempt string
+		handoff bool
+	}
+	shutdownDone := make(chan shutdownResult, 1)
+	go func() {
+		attempt, handoff := r.au.stopForShutdown()
+		shutdownDone <- shutdownResult{attempt: attempt, handoff: handoff}
+	}()
+	select {
+	case <-shutdownDone:
+		t.Fatal("shutdown returned while manual replacement was still active")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseApply)
+	if err := <-installDone; err != nil {
+		t.Fatalf("manual install failed: %v", err)
+	}
+	if got := <-shutdownDone; got.attempt != "" || !got.handoff {
+		t.Fatalf("stopForShutdown = (%q, %v), want (empty, true)", got.attempt, got.handoff)
+	}
+}
+
 func TestRunAttempt_RegisteredReportsDrainThenInstalls(t *testing.T) {
 	r := newAutoTestRig(t, registeredCfg())
 	r.activeWork = 0
@@ -785,8 +839,13 @@ func TestManualInstallTakesOverAutomaticDrainAndRestoresOnFailure(t *testing.T) 
 	au.drainAttempt = "auto-attempt"
 	au.mu.Unlock()
 
+	artifact := filepath.Join(t.TempDir(), "verified-update")
+	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	au.downloadVerify = func(*UpdateInfo) (string, error) { return artifact, nil }
 	manualCalled := make(chan string, 1)
-	au.manualApply = func(*UpdateInfo) error {
+	au.apply = func(_ string, _ *UpdateInfo) error {
 		cfg.WithPersistenceLock(func() {
 			manualCalled <- cfg.PendingUpdateVersion
 		})

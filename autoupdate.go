@@ -749,6 +749,10 @@ func (au *autoUpdater) installManually(info *UpdateInfo) error {
 		au.mu.Unlock()
 		return fmt.Errorf("an update install is already in progress")
 	}
+	if au.stopping {
+		au.mu.Unlock()
+		return fmt.Errorf("the application is shutting down")
+	}
 	if au.installing {
 		au.mu.Unlock()
 		return fmt.Errorf("the automatic update is already being installed")
@@ -791,9 +795,47 @@ func (au *autoUpdater) installManually(info *UpdateInfo) error {
 		}
 	}
 
-	err := au.manualApply(info)
+	var (
+		err       error
+		applyDone chan struct{}
+	)
+	if !silentUpdateCapable() {
+		// Check-and-offer macOS builds open the release for an ordinary manual
+		// install; there is no in-process bundle replacement to coordinate.
+		err = au.manualApply(info)
+	} else {
+		var path string
+		path, err = au.downloadVerify(info)
+		if err == nil {
+			au.mu.Lock()
+			if au.stopping {
+				au.mu.Unlock()
+				_ = os.Remove(path)
+				err = fmt.Errorf("the application is shutting down")
+			} else {
+				applyDone = make(chan struct{})
+				au.applying = true
+				au.applyDone = applyDone
+				au.mu.Unlock()
+
+				err = applyManualVerifiedUpdate(path, info, au.apply)
+			}
+		}
+	}
 	if err != nil && attemptID != "" && isDraining() && drainingAttempt() == attemptID {
 		au.exitDrain(attemptID, "superseded", false)
+	}
+	if applyDone != nil {
+		// Keep shutdown waiting through failed-takeover routing restoration, not
+		// just the platform swap itself, so an online recovery cannot race the
+		// ordinary shutdown path's offline notification.
+		au.mu.Lock()
+		au.applying = false
+		if au.applyDone == applyDone {
+			close(applyDone)
+			au.applyDone = nil
+		}
+		au.mu.Unlock()
 	}
 	return err
 }
