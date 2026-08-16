@@ -26,6 +26,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -222,8 +223,8 @@ type autoUpdater struct {
 
 	// Injected dependencies (defaulted by newAutoUpdater to the real impls).
 	now            func() time.Time
-	checkForUpdate func() (*UpdateInfo, error)
-	downloadVerify func(*UpdateInfo) (string, error)
+	checkForUpdate func(ctx context.Context) (*UpdateInfo, error)
+	downloadVerify func(ctx context.Context, info *UpdateInfo) (string, error)
 	apply          func(path string, info *UpdateInfo) error
 	manualApply    func(info *UpdateInfo) error
 	activeWork     func() int
@@ -248,6 +249,7 @@ type autoUpdater struct {
 	manualInProgress bool
 	autoDone         chan struct{}
 	manualTakeover   chan struct{}
+	attemptCancel    context.CancelFunc
 	drainAttempt     string
 	installing       bool
 	applying         bool
@@ -269,8 +271,8 @@ func newAutoUpdater(cfg *Config, tray *trayUpdateHandles) *autoUpdater {
 		cfg:            cfg,
 		tray:           tray,
 		now:            time.Now,
-		checkForUpdate: checkForNewVersion,
-		downloadVerify: downloadAndVerifyUpdate,
+		checkForUpdate: checkForNewVersionWithContext,
+		downloadVerify: downloadAndVerifyUpdateWithContext,
 		apply:          applyVerifiedUpdate,
 		manualApply:    downloadAndApplyUpdate,
 		activeWork:     ActiveWork,
@@ -322,16 +324,60 @@ func StartAutoUpdateScheduler(cfg *Config, tray *trayUpdateHandles, registering 
 	return au
 }
 
-// realSleep waits d unless the updater is stopped. Returns false if stopped.
+// getTakeoverCh returns the current manualTakeover channel under lock.
+func (au *autoUpdater) getTakeoverCh() chan struct{} {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	return au.manualTakeover
+}
+
+// realSleep waits d unless the updater is stopped or manual takeover was requested.
+// Returns false if stopped or canceled.
 func (au *autoUpdater) realSleep(d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
+	takeover := au.getTakeoverCh()
+	if takeover != nil {
+		select {
+		case <-t.C:
+			return true
+		case <-au.stopCh:
+			return false
+		case <-takeover:
+			return false
+		}
+	}
 	select {
 	case <-t.C:
 		return true
 	case <-au.stopCh:
 		return false
 	}
+}
+
+// attemptContext returns a context that is canceled when manualTakeover is triggered,
+// the updater is stopped, or cancel is explicitly invoked.
+func (au *autoUpdater) attemptContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	au.mu.Lock()
+	stopCh := au.stopCh
+	takeoverCh := au.manualTakeover
+	au.attemptCancel = cancel
+	au.mu.Unlock()
+
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-stopCh:
+			cancel()
+		case <-takeoverCh:
+			if takeoverCh != nil {
+				cancel()
+			}
+		}
+	}()
+
+	return ctx, cancel
 }
 
 // nudge asks the scheduler to run a check soon without an app restart. Called
@@ -353,6 +399,9 @@ func (au *autoUpdater) stop() {
 	}
 	au.mu.Lock()
 	au.stopping = true
+	if au.attemptCancel != nil {
+		au.attemptCancel()
+	}
 	select {
 	case <-au.stopCh:
 	default:
@@ -446,6 +495,10 @@ func (au *autoUpdater) tick() {
 		au.inProgress = false
 		au.autoDone = nil
 		au.manualTakeover = nil
+		if au.attemptCancel != nil {
+			au.attemptCancel()
+			au.attemptCancel = nil
+		}
 		au.installing = false
 		au.applying = false
 		au.drainAttempt = ""
@@ -462,6 +515,9 @@ func (au *autoUpdater) runAttempt() {
 	if au.takeoverRequested() {
 		return
 	}
+	ctx, cancel := au.attemptContext()
+	defer cancel()
+
 	var reconciliationPending bool
 	au.cfg.WithPersistenceLock(func() {
 		reconciliationPending = au.cfg.PendingUpdateAttemptID != ""
@@ -476,7 +532,7 @@ func (au *autoUpdater) runAttempt() {
 	// release for user-initiated installation.
 	if !silentUpdateCapable() {
 		au.tray.blocked(false, "")
-		info := au.checkOnlyWithRetry()
+		info := au.checkOnlyWithRetry(ctx)
 		if info == nil {
 			return
 		}
@@ -501,7 +557,7 @@ func (au *autoUpdater) runAttempt() {
 	}
 	au.tray.blocked(false, "")
 
-	info, path := au.checkAndVerifyWithRetry()
+	info, path := au.checkAndVerifyWithRetry(ctx)
 	if info == nil || path == "" {
 		return // no update, or abandoned after retries
 	}
@@ -529,17 +585,20 @@ func (au *autoUpdater) runAttempt() {
 // checkOnlyWithRetry runs the metadata check (no download) with bounded
 // retries, for the macOS check-and-offer fallback. Returns the newer release
 // info, or nil when there is nothing newer or the check was abandoned.
-func (au *autoUpdater) checkOnlyWithRetry() *UpdateInfo {
+func (au *autoUpdater) checkOnlyWithRetry(ctx context.Context) *UpdateInfo {
 	for attempt := 1; attempt <= autoUpdateMaxRetries; attempt++ {
-		if au.takeoverRequested() {
+		if au.takeoverRequested() || ctx.Err() != nil {
 			return nil
 		}
-		info, err := au.checkForUpdate()
+		info, err := au.checkForUpdate(ctx)
 		if err == nil {
 			if info == nil || !info.Available {
 				return nil
 			}
 			return info
+		}
+		if au.takeoverRequested() || errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return nil
 		}
 		fmt.Printf("[autoupdate] check attempt %d/%d failed: %v\n",
 			attempt, autoUpdateMaxRetries, err)
@@ -555,21 +614,24 @@ func (au *autoUpdater) checkOnlyWithRetry() *UpdateInfo {
 // checkAndVerifyWithRetry runs check+download+verify with bounded retries. A
 // "no update available" result returns immediately (not a failure). Returns
 // (nil, "") when there is nothing to install or the attempt was abandoned.
-func (au *autoUpdater) checkAndVerifyWithRetry() (*UpdateInfo, string) {
+func (au *autoUpdater) checkAndVerifyWithRetry(ctx context.Context) (*UpdateInfo, string) {
 	for attempt := 1; attempt <= autoUpdateMaxRetries; attempt++ {
-		if au.takeoverRequested() {
+		if au.takeoverRequested() || ctx.Err() != nil {
 			return nil, ""
 		}
-		info, err := au.checkForUpdate()
+		info, err := au.checkForUpdate(ctx)
 		if err == nil && (info == nil || !info.Available) {
 			return nil, "" // nothing newer
 		}
 		if err == nil {
-			path, dErr := au.downloadVerify(info)
+			path, dErr := au.downloadVerify(ctx, info)
 			if dErr == nil {
 				return info, path
 			}
 			err = dErr
+		}
+		if au.takeoverRequested() || errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return nil, ""
 		}
 		fmt.Printf("[autoupdate] check/verify attempt %d/%d failed: %v\n",
 			attempt, autoUpdateMaxRetries, err)
@@ -843,6 +905,9 @@ func (au *autoUpdater) installManually(info *UpdateInfo) error {
 	if takeover != nil && !channelClosed(takeover) {
 		close(takeover)
 	}
+	if au.attemptCancel != nil {
+		au.attemptCancel()
+	}
 	au.mu.Unlock()
 
 	if done != nil {
@@ -884,7 +949,7 @@ func (au *autoUpdater) installManually(info *UpdateInfo) error {
 		err = au.manualApply(info)
 	} else {
 		var path string
-		path, err = au.downloadVerify(info)
+		path, err = au.downloadVerify(context.Background(), info)
 		if err == nil {
 			au.mu.Lock()
 			if au.stopping {

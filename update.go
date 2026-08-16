@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -77,15 +78,26 @@ type UpdateInfo struct {
 	AssetName      string
 }
 
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // getWithRetry performs an HTTP GET with bounded retries for transient
-// failures. Retries on: network errors, HTTP 5xx, HTTP 429 (respecting the
+// failures, respecting ctx. Retries on: network errors, HTTP 5xx, HTTP 429 (respecting the
 // Retry-After header up to a cap). Does NOT retry on: HTTP 4xx (other than
 // 429), 2xx, 3xx — those are terminal states the caller should inspect.
 //
 // Bounded to 3 attempts with exponential backoff (1s, 2s, 4s) plus any
 // server-directed Retry-After wait, capped so a single check never takes
 // much longer than the caller's HTTP client timeout.
-func getWithRetry(client *http.Client, url string) (*http.Response, error) {
+func getWithRetry(ctx context.Context, client *http.Client, url string) (*http.Response, error) {
 	const maxAttempts = 3
 	const retryAfterCap = 30 * time.Second
 
@@ -94,11 +106,21 @@ func getWithRetry(client *http.Client, url string) (*http.Response, error) {
 		if attempt > 0 {
 			// Exponential backoff before each retry; floor of 1s, doubling.
 			backoff := time.Duration(1<<attempt-1) * time.Second
-			time.Sleep(backoff)
+			if err := sleepWithContext(ctx, backoff); err != nil {
+				return nil, err
+			}
 		}
 
-		resp, err := client.Get(url) //nolint:noctx,gosec // URL is a constant repo endpoint
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
+			return nil, err
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			lastErr = err
 			continue
 		}
@@ -117,7 +139,10 @@ func getWithRetry(client *http.Client, url string) (*http.Response, error) {
 					if wait > retryAfterCap {
 						wait = retryAfterCap
 					}
-					time.Sleep(wait)
+					if err := sleepWithContext(ctx, wait); err != nil {
+						_ = resp.Body.Close()
+						return nil, err
+					}
 				}
 			}
 		}
@@ -128,9 +153,9 @@ func getWithRetry(client *http.Client, url string) (*http.Response, error) {
 	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
 }
 
-// checkForNewVersion checks GitHub for a newer version without downloading.
+// checkForNewVersionWithContext checks GitHub for a newer version without downloading, respecting ctx.
 // Returns UpdateInfo with Available=true if an update exists.
-func checkForNewVersion() (*UpdateInfo, error) {
+func checkForNewVersionWithContext(ctx context.Context) (*UpdateInfo, error) {
 	info := &UpdateInfo{
 		CurrentVersion: Version,
 		Available:      false,
@@ -146,7 +171,7 @@ func checkForNewVersion() (*UpdateInfo, error) {
 		url = fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
 	}
 
-	resp, err := getWithRetry(updateHTTPClient, url)
+	resp, err := getWithRetry(ctx, updateHTTPClient, url)
 	if err != nil {
 		return nil, err
 	}
@@ -242,8 +267,14 @@ func checkForNewVersion() (*UpdateInfo, error) {
 	return info, nil
 }
 
-// downloadAndVerifyUpdate downloads the release asset for info, enforces the
-// size floor/ceiling, computes its SHA-256, and verifies SLSA build provenance.
+// checkForNewVersion checks GitHub for a newer version without downloading.
+// Returns UpdateInfo with Available=true if an update exists.
+func checkForNewVersion() (*UpdateInfo, error) {
+	return checkForNewVersionWithContext(context.Background())
+}
+
+// downloadAndVerifyUpdateWithContext downloads the release asset for info, enforces the
+// size floor/ceiling, computes its SHA-256, and verifies SLSA build provenance, respecting ctx.
 // It returns the path to the VERIFIED temp artifact — a raw executable on
 // Windows/Linux, a .dmg on macOS — which the caller owns and must either apply
 // (applyVerifiedUpdate) or delete.
@@ -253,7 +284,7 @@ func checkForNewVersion() (*UpdateInfo, error) {
 // the manual path (download → install now) share ONE integrity check rather
 // than growing a second copy. It performs no restart and mutates no global
 // state, so it is safe to call, verify, and discard.
-func downloadAndVerifyUpdate(info *UpdateInfo) (string, error) {
+func downloadAndVerifyUpdateWithContext(ctx context.Context, info *UpdateInfo) (string, error) {
 	if info == nil || !info.Available || info.AssetURL == "" {
 		return "", errors.New("no update available to download")
 	}
@@ -282,7 +313,12 @@ func downloadAndVerifyUpdate(info *UpdateInfo) (string, error) {
 		}
 	}()
 
-	resp, err := updateDownloadClient.Get(info.AssetURL) //nolint:gosec // URL comes from authenticated GitHub API response
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, info.AssetURL, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := updateDownloadClient.Do(req) //nolint:gosec // URL comes from authenticated GitHub API response
 	if err != nil {
 		return "", err
 	}
@@ -331,6 +367,12 @@ func downloadAndVerifyUpdate(info *UpdateInfo) (string, error) {
 
 	success = true // caller owns the verified temp artifact now
 	return tmp.Name(), nil
+}
+
+// downloadAndVerifyUpdate downloads the release asset for info, enforces the
+// size floor/ceiling, computes its SHA-256, and verifies SLSA build provenance.
+func downloadAndVerifyUpdate(info *UpdateInfo) (string, error) {
+	return downloadAndVerifyUpdateWithContext(context.Background(), info)
 }
 
 // downloadAndApplyUpdate downloads + verifies the update and applies it right

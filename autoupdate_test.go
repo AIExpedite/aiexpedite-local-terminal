@@ -89,7 +89,7 @@ func newAutoTestRig(t *testing.T, cfg *Config) *autoTestRig {
 		cfg:      cfg,
 		savePath: filepath.Join(t.TempDir(), "config.json"),
 		now:      func() time.Time { r.mu.Lock(); defer r.mu.Unlock(); return r.clock },
-		checkForUpdate: func() (*UpdateInfo, error) {
+		checkForUpdate: func(_ context.Context) (*UpdateInfo, error) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			r.checkCalls++
@@ -98,7 +98,7 @@ func newAutoTestRig(t *testing.T, cfg *Config) *autoTestRig {
 			}
 			return r.info, nil
 		},
-		downloadVerify: func(_ *UpdateInfo) (string, error) {
+		downloadVerify: func(_ context.Context, _ *UpdateInfo) (string, error) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			r.verifyCalls++
@@ -151,8 +151,11 @@ func newAutoTestRig(t *testing.T, cfg *Config) *autoTestRig {
 		stopCh:    make(chan struct{}),
 		triggerCh: make(chan struct{}, 1),
 	}
-	// sleep advances the simulated clock and never blocks.
+	// sleep advances the simulated clock and never blocks unless takeover was requested.
 	au.sleep = func(d time.Duration) bool {
+		if au.takeoverRequested() {
+			return false
+		}
 		r.mu.Lock()
 		r.clock = r.clock.Add(d)
 		r.mu.Unlock()
@@ -235,7 +238,7 @@ func TestRunAttempt_RegistrationStartingDuringDownloadDefersBeforeDrain(t *testi
 	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r.au.downloadVerify = func(_ *UpdateInfo) (string, error) {
+	r.au.downloadVerify = func(_ context.Context, _ *UpdateInfo) (string, error) {
 		r.mu.Lock()
 		r.verifyCalls++
 		r.registrationPending = true
@@ -261,7 +264,7 @@ func TestRunAttempt_PreferenceOffDuringDownloadDefersBeforeDrain(t *testing.T) {
 	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r.au.downloadVerify = func(_ *UpdateInfo) (string, error) {
+	r.au.downloadVerify = func(_ context.Context, _ *UpdateInfo) (string, error) {
 		r.mu.Lock()
 		r.verifyCalls++
 		r.mu.Unlock()
@@ -439,7 +442,7 @@ func TestStopForShutdownWaitsForManualApplyHandoff(t *testing.T) {
 	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r.au.downloadVerify = func(*UpdateInfo) (string, error) { return artifact, nil }
+	r.au.downloadVerify = func(_ context.Context, _ *UpdateInfo) (string, error) { return artifact, nil }
 
 	updateMutex.Lock()
 	previousPath, previousPending := updatePath, updatePending
@@ -918,7 +921,7 @@ func TestDrainAndInstall_CleansUpArtifactOnDefer(t *testing.T) {
 	if err := os.WriteFile(artifact, []byte("binary"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r.au.downloadVerify = func(_ *UpdateInfo) (string, error) { return artifact, nil }
+	r.au.downloadVerify = func(_ context.Context, _ *UpdateInfo) (string, error) { return artifact, nil }
 	r.au.sleep = func(_ time.Duration) bool {
 		r.mu.Lock()
 		r.clock = r.clock.Add(8 * 24 * time.Hour)
@@ -1177,7 +1180,7 @@ func TestManualInstallTakesOverAutomaticDrainAndRestoresOnFailure(t *testing.T) 
 	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	au.downloadVerify = func(*UpdateInfo) (string, error) { return artifact, nil }
+	au.downloadVerify = func(_ context.Context, _ *UpdateInfo) (string, error) { return artifact, nil }
 	manualCalled := make(chan string, 1)
 	au.apply = func(_ string, _ *UpdateInfo) error {
 		cfg.WithPersistenceLock(func() {
@@ -1210,5 +1213,123 @@ func TestManualInstallTakesOverAutomaticDrainAndRestoresOnFailure(t *testing.T) 
 	}
 	if isDraining() {
 		t.Fatal("failed manual takeover must restore routability")
+	}
+}
+
+func TestManualTakeover_CancelsInFlightAutomaticDownload(t *testing.T) {
+	cfg := DefaultConfig()
+	r := newAutoTestRig(t, cfg)
+	artifact := filepath.Join(t.TempDir(), "verified-update")
+	if err := os.WriteFile(artifact, []byte("update"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	downloadStarted := make(chan struct{})
+	downloadCanceled := make(chan struct{})
+	var downloadCalls atomic.Int32
+	r.au.downloadVerify = func(ctx context.Context, _ *UpdateInfo) (string, error) {
+		call := downloadCalls.Add(1)
+		if call == 1 {
+			close(downloadStarted)
+			<-ctx.Done()
+			close(downloadCanceled)
+			return "", ctx.Err()
+		}
+		return artifact, nil
+	}
+
+	r.au.apply = func(_ string, _ *UpdateInfo) error {
+		return nil
+	}
+	r.au.manualApply = func(_ *UpdateInfo) error {
+		return nil
+	}
+
+	attemptDone := make(chan struct{})
+	go func() {
+		r.au.tick()
+		close(attemptDone)
+	}()
+
+	select {
+	case <-downloadStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("automatic download did not start")
+	}
+
+	manualDone := make(chan error, 1)
+	go func() {
+		manualDone <- r.au.installManually(&UpdateInfo{Available: true, LatestVersion: "v9.9.9"})
+	}()
+
+	select {
+	case <-downloadCanceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("manual takeover did not cancel in-flight automatic download")
+	}
+
+	select {
+	case <-attemptDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("automatic attempt did not terminate promptly after takeover")
+	}
+
+	select {
+	case err := <-manualDone:
+		if err != nil {
+			t.Fatalf("manual install failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("manual install timed out waiting for takeover")
+	}
+}
+
+func TestManualTakeover_CancelsRetrySleepPromptly(t *testing.T) {
+	cfg := DefaultConfig()
+	r := newAutoTestRig(t, cfg)
+	r.au.sleep = r.au.realSleep
+
+	checkCalls := 0
+	r.au.checkForUpdate = func(ctx context.Context) (*UpdateInfo, error) {
+		checkCalls++
+		if checkCalls == 1 {
+			return nil, errors.New("transient check failure")
+		}
+		return r.info, nil
+	}
+
+	r.au.apply = func(_ string, _ *UpdateInfo) error {
+		return nil
+	}
+	r.au.manualApply = func(_ *UpdateInfo) error {
+		return nil
+	}
+
+	attemptDone := make(chan struct{})
+	go func() {
+		r.au.tick()
+		close(attemptDone)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	manualDone := make(chan error, 1)
+	go func() {
+		manualDone <- r.au.installManually(&UpdateInfo{Available: true, LatestVersion: "v9.9.9"})
+	}()
+
+	select {
+	case <-attemptDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("manual takeover did not wake automatic retry sleep promptly")
+	}
+
+	select {
+	case err := <-manualDone:
+		if err != nil {
+			t.Fatalf("manual install failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("manual install timed out waiting for retry sleep takeover")
 	}
 }
