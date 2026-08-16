@@ -34,6 +34,10 @@ jobs:
           - { tag: "latest-internal", label: "latest-internal" }
           # Dev auto-update target — what dev installs poll for updates.
           - { tag: "latest-dev", label: "latest-dev" }
+          # Staging auto-update target — what stg installs poll for updates.
+          - { tag: "latest-stg", label: "latest-stg" }
+          # Beta auto-update target — what beta installs poll for updates.
+          - { tag: "latest-beta", label: "latest-beta" }
 
     steps:
       - name: Resolve release tag
