@@ -234,7 +234,7 @@ type autoUpdater struct {
 	drainEnter     func(ctx context.Context, attemptID, target string) error
 	drainConfirm   func(ctx context.Context, attemptID, target string) error
 	drainExit      func(ctx context.Context, attemptID, reason string) error
-	reportOnline   func(ctx context.Context)
+	reportOnline   func(ctx context.Context) error
 	// sleep waits d (or until stopped). It advances the simulated clock in
 	// tests. Returns false if the updater was stopped during the wait.
 	sleep func(d time.Duration) bool
@@ -300,10 +300,11 @@ func newAutoUpdater(cfg *Config, tray *trayUpdateHandles) *autoUpdater {
 	au.drainExit = func(ctx context.Context, attemptID, reason string) error {
 		return notifyDrainExit(ctx, cfg, attemptID, reason)
 	}
-	au.reportOnline = func(ctx context.Context) {
+	au.reportOnline = func(ctx context.Context) error {
 		if cfg.IsRegistered() && !cfg.OfflineMode {
-			_ = notifyOnline(ctx, cfg)
+			return notifyOnline(ctx, cfg)
 		}
+		return nil
 	}
 	au.sleep = au.realSleep
 	return au
@@ -398,7 +399,6 @@ func (au *autoUpdater) stopForShutdown() (drainAttemptID string, updateHandoff b
 	if au.tray != nil {
 		au.tray.draining(false)
 	}
-	au.clearAttempt()
 	return attemptID, false
 }
 
@@ -784,7 +784,6 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		if stopping {
 			reopenAdmission()
 			au.tray.draining(false)
-			au.clearAttempt()
 			return
 		}
 		au.exitDrain(attemptID, "deferred", false)
@@ -941,30 +940,85 @@ func (au *autoUpdater) canInstallNow(startedAt time.Time, registered, reachedSer
 	return au.now().Sub(startedAt) >= heartbeatStaleWindow
 }
 
-// exitDrain leaves the draining state: reopen admission, clear the crash-
-// recovery marker, tell the service (best-effort) and report ready so routing
-// resumes. When cooldown is true (deferral / expiry) it also sets the 24h
-// post-defer floor so a busy device can't re-drain every check.
+// exitDrain leaves the draining state: reopen admission, clear the draining tray
+// UI, and tell the service to clear the drain and report ready so routing
+// resumes. The durable attempt marker is retained until the service acknowledges
+// the cancellation; if the exit/online call fails, background retries continue
+// and next boot's resolveInterruptedAttempt will reconcile it. When cooldown is
+// true (deferral / expiry) it also sets the 24h post-defer floor so a busy
+// device can't re-drain every check.
 func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 	reopenAdmission()
 	au.tray.draining(false)
-	au.clearAttempt()
-
-	if au.cfg.IsRegistered() && !au.cfg.OfflineMode {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = au.drainExit(ctx, attemptID, reason)
-		cancel()
-	}
-	// Report ready so the service restores routing immediately (the agent is
-	// present and says so).
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	au.reportOnline(ctx)
-	cancel()
 
 	if cooldown {
 		au.mu.Lock()
 		au.deferredUntil = au.now().Add(autoUpdateDeferCooldown)
 		au.mu.Unlock()
+	}
+
+	if !au.cfg.IsRegistered() || au.cfg.OfflineMode {
+		au.clearAttempt()
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	exitErr := au.drainExit(ctx, attemptID, reason)
+	cancel()
+
+	ctxOnline, cancelOnline := context.WithTimeout(context.Background(), 5*time.Second)
+	onlineErr := au.reportOnline(ctxOnline)
+	cancelOnline()
+
+	if exitErr == nil && onlineErr == nil {
+		au.clearAttempt()
+		return
+	}
+
+	go au.retryDrainExitReconciliation(attemptID, reason)
+}
+
+func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
+	if au == nil || au.cfg == nil {
+		return
+	}
+	for attempt := 1; ; attempt++ {
+		timer := time.NewTimer(retryBackoff(attempt))
+		select {
+		case <-au.stopCh:
+			timer.Stop()
+			return
+		case <-shutdownChan:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+
+		var currentAttempt string
+		au.cfg.WithPersistenceLock(func() {
+			currentAttempt = au.cfg.PendingUpdateAttemptID
+		})
+		if currentAttempt != attemptID {
+			return
+		}
+
+		if !au.cfg.IsRegistered() || au.cfg.OfflineMode {
+			au.clearAttempt()
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		exitErr := au.drainExit(ctx, attemptID, reason)
+		cancel()
+
+		ctxOnline, cancelOnline := context.WithTimeout(context.Background(), 5*time.Second)
+		onlineErr := au.reportOnline(ctxOnline)
+		cancelOnline()
+
+		if exitErr == nil && onlineErr == nil {
+			au.clearAttempt()
+			return
+		}
 	}
 }
 

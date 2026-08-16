@@ -100,7 +100,9 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// launch's resolveInterruptedAttempt / drain expiry resolves it either way.
 	if cfg != nil && cfg.IsRegistered() && !cfg.OfflineMode && drainAttemptID != "" {
 		exitCtx, exitCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := notifyDrainExit(exitCtx, cfg, drainAttemptID, "deferred"); err != nil {
+		if err := notifyDrainExit(exitCtx, cfg, drainAttemptID, "deferred"); err == nil {
+			clearInterruptedAttempt(cfg, ConfigPath(), drainAttemptID)
+		} else {
 			fmt.Printf("%s[shutdown] notifyDrainExit(deferred) failed: %v%s\n", colorYellow, err, colorReset)
 		}
 		exitCancel()

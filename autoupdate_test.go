@@ -65,7 +65,9 @@ type autoTestRig struct {
 	applyCalls   int
 	drainEnter   int
 	drainConfirm int
+	drainExitErr error
 	drainExitR   []string
+	onlineErr    error
 	onlineCalls  int
 	showBlocked  int
 	showDraining int
@@ -138,9 +140,14 @@ func newAutoTestRig(t *testing.T, cfg *Config) *autoTestRig {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 			r.drainExitR = append(r.drainExitR, reason)
-			return nil
+			return r.drainExitErr
 		},
-		reportOnline: func(_ context.Context) { r.mu.Lock(); defer r.mu.Unlock(); r.onlineCalls++ },
+		reportOnline: func(_ context.Context) error {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.onlineCalls++
+			return r.onlineErr
+		},
 		stopCh:       make(chan struct{}),
 		triggerCh:    make(chan struct{}, 1),
 	}
@@ -795,6 +802,109 @@ func TestRunAttempt_PreferenceOffDuringDrainCancels(t *testing.T) {
 	}
 	if isDraining() {
 		t.Fatal("admission must be reopened after preference-off cancel")
+	}
+	var retained string
+	cfg.WithPersistenceLock(func() {
+		retained = cfg.PendingUpdateAttemptID
+	})
+	if retained != "" {
+		t.Fatalf("successful drain exit must clear attempt marker, got %q", retained)
+	}
+}
+
+func TestRunAttempt_ExitDrainRetainsMarkerOnDrainExitFailure(t *testing.T) {
+	cfg := registeredCfg()
+	r := newAutoTestRig(t, cfg)
+	r.activeWork = 1 // never drains → defers at the deadline
+	r.drainExitErr = errors.New("503 service unavailable")
+
+	r.au.sleep = func(_ time.Duration) bool {
+		r.mu.Lock()
+		r.clock = r.clock.Add(8 * 24 * time.Hour)
+		r.mu.Unlock()
+		return true
+	}
+
+	r.au.runAttempt()
+
+	if len(r.drainExitR) == 0 || r.drainExitR[len(r.drainExitR)-1] != "deferred" {
+		t.Fatalf("expected deferred exit attempt, got %v", r.drainExitR)
+	}
+	if isDraining() {
+		t.Fatal("admission must be reopened even if service notification failed")
+	}
+	var retained string
+	cfg.WithPersistenceLock(func() {
+		retained = cfg.PendingUpdateAttemptID
+	})
+	if retained == "" {
+		t.Fatal("failed drain exit must retain the durable attempt marker")
+	}
+}
+
+func TestRunAttempt_ExitDrainRetainsMarkerOnOnlineFailure(t *testing.T) {
+	cfg := registeredCfg()
+	r := newAutoTestRig(t, cfg)
+	r.activeWork = 1
+	r.onlineErr = errors.New("503 service unavailable")
+
+	first := true
+	r.au.sleep = func(d time.Duration) bool {
+		r.mu.Lock()
+		r.clock = r.clock.Add(d)
+		r.mu.Unlock()
+		if first {
+			first = false
+			cfg.SetAutoUpdate(false)
+		}
+		return true
+	}
+
+	r.au.runAttempt()
+
+	if isDraining() {
+		t.Fatal("admission must be reopened after preference-off cancel")
+	}
+	var retained string
+	cfg.WithPersistenceLock(func() {
+		retained = cfg.PendingUpdateAttemptID
+	})
+	if retained == "" {
+		t.Fatal("failed online report during drain exit must retain the durable attempt marker")
+	}
+}
+
+func TestStopForShutdown_RetainsMarkerUntilDrainExitAcknowledged(t *testing.T) {
+	resetShutdownState(t)
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	cfg := registeredCfg()
+	cfg.PendingUpdateAttemptID = "shutdown-drain-att"
+	cfg.PendingUpdateVersion = "v9.9.9"
+	savePath := filepath.Join(t.TempDir(), "config.json")
+	if err := cfg.Save(savePath); err != nil {
+		t.Fatal(err)
+	}
+
+	au := newAutoUpdater(cfg, nil)
+	au.savePath = savePath
+	closeAdmission("shutdown-drain-att")
+	au.mu.Lock()
+	au.drainAttempt = "shutdown-drain-att"
+	au.mu.Unlock()
+
+	drainAttemptID, updateHandoff := au.stopForShutdown()
+	if drainAttemptID != "shutdown-drain-att" || updateHandoff {
+		t.Fatalf("stopForShutdown = (%q, %v), want (shutdown-drain-att, false)", drainAttemptID, updateHandoff)
+	}
+
+	var retained string
+	cfg.WithPersistenceLock(func() {
+		retained = cfg.PendingUpdateAttemptID
+	})
+	if retained != "shutdown-drain-att" {
+		t.Fatalf("stopForShutdown must retain attempt marker on disk, got %q", retained)
 	}
 }
 
