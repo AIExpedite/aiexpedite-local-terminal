@@ -41,7 +41,6 @@
 package main
 
 import (
-	"strings"
 	"sync"
 )
 
@@ -464,24 +463,10 @@ func isOperationalCommand(command string) bool {
 }
 
 // isWorkStartCommand reports whether the command STARTS a new unit of user work
-// (a one-shot execute, or any interactive session start). These are the only
-// commands refused while draining.
+// (a one-shot execute, interactive session start, or unrecognized command type
+// that publishes a correlated error). These are the commands refused while draining.
 func isWorkStartCommand(cmd commandMsg) bool {
-	switch cmd.Type {
-	case "", "execute":
-		// A one-shot shell execution. Operational demand commands also carry an
-		// empty Type, so exclude them explicitly.
-		return !isOperationalCommand(cmd.Command)
-	case "session_start",
-		"codex_appserver_start",
-		"claude_native_start",
-		"grok_acp_start",
-		"antigravity_native_start":
-		return true
-	default:
-		// Any *_start family added later is a new work start too.
-		return strings.HasSuffix(cmd.Type, "_start")
-	}
+	return !isDrainPassThrough(cmd)
 }
 
 // isDrainPassThrough is the allowlist of commands admitted while draining:

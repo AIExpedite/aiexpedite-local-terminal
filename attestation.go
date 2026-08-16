@@ -42,6 +42,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -80,9 +81,9 @@ type attestationListResponse struct {
 	} `json:"attestations"`
 }
 
-// verifyBuildProvenance checks that the GitHub Attestations API returns at
+// verifyBuildProvenanceWithContext checks that the GitHub Attestations API returns at
 // least one valid attestation for the given binary's SHA-256 digest, scoped
-// to our repository (by immutable repo ID).
+// to our repository (by immutable repo ID), respecting ctx.
 //
 // Returns nil on success. Returns an error if no attestation is found, the
 // API call fails, or the response references a different repo. The caller
@@ -92,7 +93,7 @@ type attestationListResponse struct {
 // The `AIEXPEDITE_SKIP_ATTESTATION_VERIFY=1` env var bypasses this check —
 // intended ONLY as an escape hatch for users behind firewalls that block
 // api.github.com. Logged loudly when used.
-func verifyBuildProvenance(binaryPath string, sha256Hex string) error {
+func verifyBuildProvenanceWithContext(ctx context.Context, binaryPath string, sha256Hex string) error {
 	if os.Getenv("AIEXPEDITE_SKIP_ATTESTATION_VERIFY") == "1" {
 		LogSecurityEvent(SecEvtAttestationSkipped,
 			"attestation verification bypassed via AIEXPEDITE_SKIP_ATTESTATION_VERIFY=1",
@@ -112,8 +113,16 @@ func verifyBuildProvenance(binaryPath string, sha256Hex string) error {
 
 	url := fmt.Sprintf("https://api.github.com/repos/%s/attestations/sha256:%s", githubRepo, sha256Hex)
 
-	resp, err := attestationVerifyClient.Get(url) //nolint:noctx,gosec // URL is repo-scoped + hex-validated
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		return err
+	}
+
+	resp, err := attestationVerifyClient.Do(req) //nolint:gosec // URL is repo-scoped + hex-validated
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		LogSecurityEvent(SecEvtAttestationFailed, "attestation API unreachable",
 			"sha256", sha256Hex, "error", err.Error())
 		return fmt.Errorf("fetch attestation: %w", err)
@@ -173,4 +182,10 @@ func verifyBuildProvenance(binaryPath string, sha256Hex string) error {
 		"sha256", sha256Hex, "expected_repo_id", expectedRepoID, "found_repo_ids", foundIDs)
 	return fmt.Errorf("attestation found but repo_id mismatch (expected %d, got [%s])",
 		expectedRepoID, strings.Join(foundIDs, ", "))
+}
+
+// verifyBuildProvenance checks that the GitHub Attestations API returns at
+// least one valid attestation for the given binary's SHA-256 digest.
+func verifyBuildProvenance(binaryPath string, sha256Hex string) error {
+	return verifyBuildProvenanceWithContext(context.Background(), binaryPath, sha256Hex)
 }

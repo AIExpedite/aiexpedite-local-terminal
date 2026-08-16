@@ -434,7 +434,7 @@ func TestIsWorkStartCommand(t *testing.T) {
 	starts := []commandMsg{
 		{Command: "ls"}, {Type: "execute"}, {Type: "session_start"},
 		{Type: "codex_appserver_start"}, {Type: "grok_acp_start"},
-		{Type: "some_future_start"},
+		{Type: "some_future_start"}, {Type: "unknown_custom_type"},
 	}
 	for _, c := range starts {
 		if !isWorkStartCommand(c) {
@@ -475,5 +475,38 @@ func TestTrackedTerminalPublisherHoldsDrainUntilQueueFlushes(t *testing.T) {
 	<-done
 	if got := ActiveWork(); got != 0 {
 		t.Fatalf("ActiveWork() = %d, want 0 after queued stream publish flushes", got)
+	}
+}
+
+func TestAdmitWork_UnrecognizedTypeTrackedBeforeDrainSealing(t *testing.T) {
+	resetDrainState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	// Before draining: unrecognized command is admitted and tracked via release function
+	admitted, release := admitWork(commandMsg{Type: "unknown_custom_type"})
+	if !admitted {
+		t.Fatal("unrecognized command should be admitted before draining")
+	}
+	if release == nil {
+		t.Fatal("admitWork must return a release function for unrecognized command types")
+	}
+
+	if got := ActiveWork(); got != 1 {
+		t.Fatalf("ActiveWork() = %d, want 1 while unrecognized callback is in flight", got)
+	}
+
+	// Drain cannot seal while unrecognized callback is in flight
+	closeAdmission("test-attempt")
+	if sealDrainForInstall() {
+		t.Fatal("sealDrainForInstall() succeeded while unrecognized callback was in flight")
+	}
+
+	// Releasing the callback decrements active work and allows sealing
+	release()
+	if got := ActiveWork(); got != 0 {
+		t.Fatalf("ActiveWork() = %d, want 0 after callback release", got)
+	}
+	if !sealDrainForInstall() {
+		t.Fatal("sealDrainForInstall() failed after callback release")
 	}
 }

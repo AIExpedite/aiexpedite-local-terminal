@@ -359,7 +359,7 @@ func downloadAndVerifyUpdateWithContext(ctx context.Context, info *UpdateInfo) (
 	// (firewall escape hatch); proceed but with a clear log line. Any other
 	// error means we couldn't establish provenance — refuse to apply.
 	fmt.Println("→ Verifying build provenance...")
-	if err := verifyBuildProvenance(tmp.Name(), digestHex); err != nil {
+	if err := verifyBuildProvenanceWithContext(ctx, tmp.Name(), digestHex); err != nil {
 		if !errors.Is(err, errAttestationDisabled) {
 			return "", fmt.Errorf("attestation verification failed, refusing to apply update: %w", err)
 		}
