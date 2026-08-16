@@ -249,4 +249,3 @@ func TestVerifyDarwinSigningTeam(t *testing.T) {
 		})
 	}
 }
-

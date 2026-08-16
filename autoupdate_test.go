@@ -148,8 +148,8 @@ func newAutoTestRig(t *testing.T, cfg *Config) *autoTestRig {
 			r.onlineCalls++
 			return r.onlineErr
 		},
-		stopCh:       make(chan struct{}),
-		triggerCh:    make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
+		triggerCh: make(chan struct{}, 1),
 	}
 	// sleep advances the simulated clock and never blocks.
 	au.sleep = func(d time.Duration) bool {
