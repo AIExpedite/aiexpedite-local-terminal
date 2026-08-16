@@ -935,7 +935,7 @@ jobs:
   ###############################################################################
   release-channel:
     name: Publish ${{ matrix.channel }} release for auto-update
-    needs: [build-nonprod, build-nonprod-darwin, build-nonprod-linux]
+    needs: [build-nonprod, build-nonprod-darwin, finalize-nonprod-beta-darwin, build-nonprod-linux]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

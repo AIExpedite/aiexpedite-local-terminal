@@ -701,6 +701,16 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		return
 	}
 
+	// If shutdown captured the attempt while persistAttempt was writing, do not
+	// send a new /drain — stopForShutdown already owns cleanup. The check is
+	// serialized through au.mu so the stopping flag is visible.
+	au.mu.Lock()
+	if au.stopping {
+		au.mu.Unlock()
+		return
+	}
+	au.mu.Unlock()
+
 	connected := au.cloudConnected()
 	reachedService := false
 	if connected {
@@ -724,6 +734,14 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		// admission closed and leave the attempt marker intact while ownership
 		// passes to the manual installer; it will restore routing if it fails.
 		if au.takeoverRequested() {
+			return
+		}
+		// Shutdown captured the attempt — stopForShutdown owns drain exit.
+		// Do not send further drain RPCs with independent background contexts.
+		au.mu.Lock()
+		stopping := au.stopping
+		au.mu.Unlock()
+		if stopping {
 			return
 		}
 		// Preference turned off before replacement began — cancel cleanly and
