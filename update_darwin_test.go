@@ -115,3 +115,138 @@ func TestFailedDarwinRelaunchStaysAliveAfterReacquiringSingleton(t *testing.T) {
 		t.Fatalf("backup should be consumed by rollback: %v", statErr)
 	}
 }
+
+func TestParseDarwinTeamID(t *testing.T) {
+	tests := []struct {
+		name    string
+		output  string
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "valid team identifier",
+			output: "Executable=/Applications/AI Expedite.app/Contents/MacOS/aiexpedite\n" +
+				"Identifier=com.aiexpedite.terminal\n" +
+				"Format=app bundle with Mach-O universal (x86_64 arm64)\n" +
+				"TeamIdentifier=ABCDE12345\n" +
+				"Sealed Resources version=2 rules=13 files=0\n",
+			want:    "ABCDE12345",
+			wantErr: false,
+		},
+		{
+			name: "windows line endings",
+			output: "Executable=/Applications/AI Expedite.app\r\n" +
+				"TeamIdentifier=ABCDE12345\r\n",
+			want:    "ABCDE12345",
+			wantErr: false,
+		},
+		{
+			name:    "unset team identifier",
+			output:  "TeamIdentifier=not set\n",
+			wantErr: true,
+		},
+		{
+			name:    "empty team identifier",
+			output:  "TeamIdentifier=\n",
+			wantErr: true,
+		},
+		{
+			name:    "missing team identifier",
+			output:  "Executable=/Applications/AI Expedite.app\nIdentifier=com.aiexpedite.terminal\n",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseDarwinTeamID(tt.output)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseDarwinTeamID() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Fatalf("parseDarwinTeamID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVerifyDarwinSigningTeam(t *testing.T) {
+	prevExtract := extractDarwinTeamID
+	t.Cleanup(func() {
+		extractDarwinTeamID = prevExtract
+	})
+
+	tests := []struct {
+		name          string
+		installedTeam string
+		installedErr  error
+		updateTeam    string
+		updateErr     error
+		wantErrSubstr string
+	}{
+		{
+			name:          "matching teams pass",
+			installedTeam: "TEAM_123",
+			updateTeam:    "TEAM_123",
+		},
+		{
+			name:          "mismatched teams rejected",
+			installedTeam: "TEAM_123",
+			updateTeam:    "OTHER_456",
+			wantErrSubstr: "signing team mismatch",
+		},
+		{
+			name:          "installed extraction failure rejected",
+			installedErr:  errors.New("corrupt signature"),
+			updateTeam:    "TEAM_123",
+			wantErrSubstr: "installed bundle team verification failed",
+		},
+		{
+			name:          "installed empty team rejected",
+			installedTeam: "",
+			updateTeam:    "TEAM_123",
+			wantErrSubstr: "installed bundle has empty signing team identifier",
+		},
+		{
+			name:          "update extraction failure rejected",
+			installedTeam: "TEAM_123",
+			updateErr:     errors.New("no signature"),
+			wantErrSubstr: "update bundle team verification failed",
+		},
+		{
+			name:          "update empty team rejected",
+			installedTeam: "TEAM_123",
+			updateTeam:    "",
+			wantErrSubstr: "update bundle has empty signing team identifier",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			extractDarwinTeamID = func(bundle string) (string, error) {
+				if bundle == "installed.app" {
+					return tt.installedTeam, tt.installedErr
+				}
+				if bundle == "update.app" {
+					return tt.updateTeam, tt.updateErr
+				}
+				return "", errors.New("unexpected bundle")
+			}
+
+			err := verifyDarwinSigningTeam("installed.app", "update.app")
+			if tt.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("expected nil error, got %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErrSubstr)
+				}
+				if !strings.Contains(err.Error(), tt.wantErrSubstr) {
+					t.Fatalf("error %q does not contain %q", err.Error(), tt.wantErrSubstr)
+				}
+			}
+		})
+	}
+}
+

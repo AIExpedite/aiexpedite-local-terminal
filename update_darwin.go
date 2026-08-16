@@ -16,6 +16,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,6 +29,7 @@ import (
 var (
 	acquireAgentInstanceAfterDarwinHandoff = acquireAgentInstance
 	quitAfterDarwinHandoff                 = systray.Quit
+	extractDarwinTeamID                    = darwinTeamID
 )
 
 // applyVerifiedUpdate replaces the running .app bundle with the one inside the
@@ -78,10 +80,8 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	if err := verifyDarwinGatekeeper(newBundle); err != nil {
 		return fmt.Errorf("new bundle failed Gatekeeper assessment: %w", err)
 	}
-	currentTeam, curErr := darwinTeamID(currentBundle)
-	newTeam, newErr := darwinTeamID(newBundle)
-	if curErr == nil && newErr == nil && currentTeam != "" && newTeam != currentTeam {
-		return fmt.Errorf("signing team mismatch: installed=%s update=%s", currentTeam, newTeam)
+	if err := verifyDarwinSigningTeam(currentBundle, newBundle); err != nil {
+		return err
 	}
 
 	// Stage a copy of the new bundle next to the install location, preserving
@@ -208,6 +208,46 @@ func verifyDarwinGatekeeper(bundle string) error {
 	return runDarwinCmd("spctl", "--assess", "--type", "execute", "--verbose=2", bundle)
 }
 
+// verifyDarwinSigningTeam verifies that both the running bundle and the candidate
+// update bundle have valid Developer ID signing team identifiers and that they match.
+// If either bundle lacks a team identifier, extraction fails, or the teams do
+// not match, an error is returned to prevent unauthorized bundle replacement.
+func verifyDarwinSigningTeam(currentBundle, newBundle string) error {
+	currentTeam, err := extractDarwinTeamID(currentBundle)
+	if err != nil {
+		return fmt.Errorf("installed bundle team verification failed: %w", err)
+	}
+	if currentTeam == "" {
+		return errors.New("installed bundle has empty signing team identifier")
+	}
+	newTeam, err := extractDarwinTeamID(newBundle)
+	if err != nil {
+		return fmt.Errorf("update bundle team verification failed: %w", err)
+	}
+	if newTeam == "" {
+		return errors.New("update bundle has empty signing team identifier")
+	}
+	if newTeam != currentTeam {
+		return fmt.Errorf("signing team mismatch: installed=%s update=%s", currentTeam, newTeam)
+	}
+	return nil
+}
+
+// parseDarwinTeamID extracts the Developer ID team identifier from `codesign -dv` output.
+func parseDarwinTeamID(codesignOutput string) (string, error) {
+	for _, line := range strings.Split(codesignOutput, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "TeamIdentifier=") {
+			team := strings.TrimSpace(strings.TrimPrefix(line, "TeamIdentifier="))
+			if team == "" || team == "not set" {
+				return "", errors.New("empty or unset TeamIdentifier in signature")
+			}
+			return team, nil
+		}
+	}
+	return "", errors.New("TeamIdentifier not found in signature")
+}
+
 // darwinTeamID extracts the Developer ID team identifier from a bundle's
 // signature via `codesign -dv`.
 func darwinTeamID(bundle string) (string, error) {
@@ -217,12 +257,11 @@ func darwinTeamID(bundle string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("codesign -dv failed: %w", err)
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.HasPrefix(line, "TeamIdentifier=") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "TeamIdentifier=")), nil
-		}
+	team, err := parseDarwinTeamID(string(out))
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
-	return "", fmt.Errorf("TeamIdentifier not found in signature")
+	return team, nil
 }
 
 // runDarwinCmd runs a command and returns a wrapped error including any output
