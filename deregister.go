@@ -195,6 +195,15 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string, extra map
 
 	url := fmt.Sprintf("%s/device/%s/%s", baseURL, cfg.AgentID, path)
 
+	// Synchronous post-lock check: AfterFunc schedules its callback
+	// asynchronously, so the parent may already be cancelled but the
+	// fresh-budget context not yet cancelled when we reach here. An
+	// explicit check closes the window between lock acquisition and
+	// the AfterFunc goroutine running.
+	if parentCtx != nil && parentCtx.Err() == context.Canceled {
+		return context.Canceled
+	}
+
 	var lastErr error
 	for attempt := 1; attempt <= notifyConnectivityMaxAttempts; attempt++ {
 		// Honor the post-lock budget between attempts so we don't loop
