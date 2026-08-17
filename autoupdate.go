@@ -601,12 +601,20 @@ func (au *autoUpdater) runAttempt() {
 	ctx, cancel := au.attemptContext()
 	defer cancel()
 
-	var reconciliationPending bool
+	var retainedAttempt string
 	au.cfg.WithPersistenceLock(func() {
-		reconciliationPending = au.cfg.PendingUpdateAttemptID != ""
+		retainedAttempt = au.cfg.PendingUpdateAttemptID
 	})
-	if reconciliationPending {
-		fmt.Println("[autoupdate] Skipping check while restart reconciliation is pending")
+	if retainedAttempt != "" {
+		if !au.isDisconnected() {
+			if !resolveInterruptedAttemptWithPath(au.cfg, au.savePath) {
+				// Reconciled successfully; return so the next scheduled check runs cleanly.
+				return
+			}
+			fmt.Println("[autoupdate] Skipping check while restart reconciliation is pending")
+			go au.retryDrainExitReconciliation(retainedAttempt, "deferred")
+			return
+		}
 		return
 	}
 	// macOS check-and-offer fallback builds do not replace their bundle, so the
@@ -1343,8 +1351,12 @@ func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) bool {
 
 	reopenAdmission()
 
-	if !registered || offline {
+	if !registered {
 		clearInterruptedAttempt(cfg, savePath, attemptID)
+		return false
+	}
+	if offline {
+		// Keep the retained attempt marker while offline so it is reconciled when the user reconnects.
 		return false
 	}
 

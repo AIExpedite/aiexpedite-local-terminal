@@ -668,6 +668,20 @@ func onTrayReady(cfg *Config) func() {
 							continue
 						}
 						go func() {
+							var attemptID string
+							cfg.WithPersistenceLock(func() {
+								attemptID = cfg.PendingUpdateAttemptID
+							})
+							if attemptID != "" {
+								// Retained attempt marker from interrupted or cancelled drain:
+								// reconcile the attempt-specific drain exit and online report.
+								if resolveInterruptedAttempt(cfg) {
+									if globalAutoUpdater != nil {
+										go globalAutoUpdater.retryDrainExitReconciliation(attemptID, "deferred")
+									}
+								}
+								return
+							}
 							ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 							defer cancel()
 							if err := notifyOnline(ctx, cfg); err != nil {

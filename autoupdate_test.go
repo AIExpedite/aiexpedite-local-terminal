@@ -1139,6 +1139,26 @@ func TestResolveInterruptedAttempt_NoMarkerNoOp(t *testing.T) {
 	}
 }
 
+func TestResolveInterruptedAttempt_PreservesMarkerAcrossOfflineRestarts(t *testing.T) {
+	resetDrainState(t)
+	resetConnectivityState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	cfg := registeredCfg()
+	cfg.OfflineMode = true
+	cfg.PendingUpdateAttemptID = "att-offline"
+	cfg.PendingUpdateVersion = Version
+
+	savePath := filepath.Join(t.TempDir(), "c.json")
+	if pending := resolveInterruptedAttemptWithPath(cfg, savePath); pending {
+		t.Fatal("offline resolution should not report pending network retry")
+	}
+
+	if cfg.PendingUpdateAttemptID != "att-offline" {
+		t.Fatalf("attempt marker must be preserved while offline, got %q", cfg.PendingUpdateAttemptID)
+	}
+}
+
 func TestIsDrainExpiredErr(t *testing.T) {
 	if !isDrainExpiredErr(errors.New("server returned status 410")) {
 		t.Fatal("410 should be treated as expired")
@@ -1501,6 +1521,57 @@ func TestExitDrain_SuppressesOnlineIfDisconnectBeginsBeforeOnline(t *testing.T) 
 		t.Fatalf("attempt marker must be retained when online report is suppressed by disconnect, got %q", retained)
 	}
 }
+
+func TestRunAttempt_ReconcilesRetainedAttemptWhenConnected(t *testing.T) {
+	resetShutdownState(t)
+	resetDrainState(t)
+	resetConnectivityState(t)
+	t.Cleanup(func() { resetDrainState(t) })
+
+	var drainExitCalls, onlineCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/device/agent-run-reconcile/drain/exit":
+			drainExitCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case "/device/agent-run-reconcile/online":
+			onlineCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+
+	cfg := registeredCfg()
+	cfg.AgentID = "agent-run-reconcile"
+	cfg.CommandSecret = "secret"
+	cfg.PendingUpdateAttemptID = "att-reconcile-run"
+	cfg.PendingUpdateVersion = "v9.9.9"
+
+	r := newAutoTestRig(t, cfg)
+	r.au.savePath = filepath.Join(t.TempDir(), "c.json")
+
+	// runAttempt should reconcile the retained attempt
+	r.au.runAttempt()
+
+	if got := drainExitCalls.Load(); got != 1 {
+		t.Fatalf("drainExit calls = %d, want 1", got)
+	}
+	if got := onlineCalls.Load(); got != 1 {
+		t.Fatalf("online calls = %d, want 1", got)
+	}
+
+	var retained string
+	cfg.WithPersistenceLock(func() {
+		retained = cfg.PendingUpdateAttemptID
+	})
+	if retained != "" {
+		t.Fatalf("reconciled attempt marker must be cleared, got %q", retained)
+	}
+}
+
 
 
 
