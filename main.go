@@ -84,6 +84,7 @@ func main() {
 			}
 			if err := performSelfReplace(originalPath); err != nil {
 				fmt.Printf("[update] Self-replace failed: %v\n", err)
+				fallbackUpdateTarget = originalPath
 				// Fall through to run normally from temp path as fallback
 			} else {
 				return // Successfully re-launched from install path; exit this temp process
@@ -993,34 +994,43 @@ func directCopy(src, dst string) error {
 //   - agent_update_*.exe in the OS temp directory (downloaded update binaries)
 //   - update_*.tmp in the install directory (partial copy artifacts from copyFile)
 func cleanupUpdateTempFiles() {
-	myPath, _ := runningUpdateTarget()
-	if myPath == "" {
-		myPath, _ = os.Executable()
-		if resolved, err := filepath.EvalSymlinks(myPath); err == nil {
-			myPath = resolved
-		}
+	myTarget, _ := runningUpdateTarget()
+	curExe, _ := os.Executable()
+	if curAppImage := os.Getenv("APPIMAGE"); curAppImage != "" && runtime.GOOS == "linux" {
+		curExe = curAppImage
 	}
 
 	// Pattern 1: Downloaded update binaries in OS temp dir
-	cleanupGlob(filepath.Join(os.TempDir(), "agent_update_*"), myPath)
+	cleanupGlob(filepath.Join(os.TempDir(), "agent_update_*"), myTarget, curExe)
 
 	// Pattern 2: Partial copy temp files in our install directory
-	if myPath != "" {
-		installDir := filepath.Dir(myPath)
-		cleanupGlob(filepath.Join(installDir, "update_*.tmp"), myPath)
+	if myTarget != "" {
+		installDir := filepath.Dir(myTarget)
+		cleanupGlob(filepath.Join(installDir, "update_*.tmp"), myTarget, curExe)
 	}
 }
 
-// cleanupGlob removes files matching the glob pattern, skipping our own executable.
-func cleanupGlob(pattern, selfPath string) {
+// cleanupGlob removes files matching the glob pattern, skipping preserved paths.
+func cleanupGlob(pattern string, preservePaths ...string) {
 	matches, err := filepath.Glob(pattern)
 	if err != nil || len(matches) == 0 {
 		return
 	}
 	for _, m := range matches {
 		resolved, _ := filepath.EvalSymlinks(m)
-		if selfPath != "" && strings.EqualFold(resolved, selfPath) {
-			continue // Don't delete ourselves
+		skip := false
+		for _, p := range preservePaths {
+			if p == "" {
+				continue
+			}
+			resP, _ := filepath.EvalSymlinks(p)
+			if strings.EqualFold(m, p) || strings.EqualFold(resolved, p) || (resP != "" && (strings.EqualFold(m, resP) || strings.EqualFold(resolved, resP))) {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue // Don't delete preserved paths
 		}
 		if err := os.Remove(m); err == nil {
 			fmt.Printf("[update] Cleaned up: %s\n", filepath.Base(m))

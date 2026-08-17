@@ -452,11 +452,24 @@ func installUpdatable() (bool, string) {
 	return true, ""
 }
 
+var (
+	fallbackUpdateTarget string
+)
+
 // runningUpdateTarget returns the installed artifact that an update must
 // replace. AppImage launches the embedded binary from a read-only mount, while
 // APPIMAGE points at the writable outer artifact the user actually started.
+// When running in temporary fallback mode after a failed self-replace, the
+// retained fallbackUpdateTarget is returned so subsequent updates continue to
+// target the installed binary.
 // Raw Linux binaries and all other platforms use os.Executable directly.
 func runningUpdateTarget() (string, error) {
+	if fallbackUpdateTarget != "" {
+		if resolved, err := filepath.EvalSymlinks(fallbackUpdateTarget); err == nil {
+			return resolved, nil
+		}
+		return fallbackUpdateTarget, nil
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return "", err

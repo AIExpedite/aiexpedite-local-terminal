@@ -152,3 +152,25 @@ func TestCleanupGlob_PreservesSelf(t *testing.T) {
 		t.Fatalf("cleanupGlob did not remove stale file: %v", err)
 	}
 }
+
+func TestRunningUpdateTarget_FallbackTarget(t *testing.T) {
+	prev := fallbackUpdateTarget
+	t.Cleanup(func() {
+		fallbackUpdateTarget = prev
+	})
+
+	dir := t.TempDir()
+	targetFile := filepath.Join(dir, "my_installed_agent.exe")
+	if err := os.WriteFile(targetFile, []byte("agent"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	fallbackUpdateTarget = targetFile
+	got, err := runningUpdateTarget()
+	if err != nil {
+		t.Fatalf("runningUpdateTarget error: %v", err)
+	}
+	if got != targetFile {
+		t.Fatalf("runningUpdateTarget() = %q, want %q", got, targetFile)
+	}
+}
