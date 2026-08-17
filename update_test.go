@@ -170,7 +170,11 @@ func TestRunningUpdateTarget_FallbackTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runningUpdateTarget error: %v", err)
 	}
-	if got != targetFile {
-		t.Fatalf("runningUpdateTarget() = %q, want %q", got, targetFile)
+	want := targetFile
+	if resolved, err := filepath.EvalSymlinks(targetFile); err == nil {
+		want = resolved
+	}
+	if got != want {
+		t.Fatalf("runningUpdateTarget() = %q, want %q", got, want)
 	}
 }
