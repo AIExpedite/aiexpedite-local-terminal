@@ -993,8 +993,13 @@ func directCopy(src, dst string) error {
 //   - agent_update_*.exe in the OS temp directory (downloaded update binaries)
 //   - update_*.tmp in the install directory (partial copy artifacts from copyFile)
 func cleanupUpdateTempFiles() {
-	myPath, _ := os.Executable()
-	myPath, _ = filepath.EvalSymlinks(myPath)
+	myPath, _ := runningUpdateTarget()
+	if myPath == "" {
+		myPath, _ = os.Executable()
+		if resolved, err := filepath.EvalSymlinks(myPath); err == nil {
+			myPath = resolved
+		}
+	}
 
 	// Pattern 1: Downloaded update binaries in OS temp dir
 	cleanupGlob(filepath.Join(os.TempDir(), "agent_update_*"), myPath)

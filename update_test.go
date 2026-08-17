@@ -8,6 +8,7 @@ package main
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 )
@@ -127,5 +128,27 @@ func TestApplyManualVerifiedUpdate_RemovesArtifactOnFailure(t *testing.T) {
 	}
 	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("verified artifact still exists after apply failure: %v", statErr)
+	}
+}
+
+func TestCleanupGlob_PreservesSelf(t *testing.T) {
+	dir := t.TempDir()
+	self := filepath.Join(dir, "agent_update_running")
+	other := filepath.Join(dir, "agent_update_stale")
+
+	if err := os.WriteFile(self, []byte("self"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other, []byte("other"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupGlob(filepath.Join(dir, "agent_update_*"), self)
+
+	if _, err := os.Stat(self); err != nil {
+		t.Fatalf("cleanupGlob removed self: %v", err)
+	}
+	if _, err := os.Stat(other); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cleanupGlob did not remove stale file: %v", err)
 	}
 }
