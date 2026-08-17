@@ -32,7 +32,7 @@ func TestLaunchRelocatedDarwinBundleWaitsForOpenResult(t *testing.T) {
 func TestHandleDarwinUninstallRemovesUserBundle(t *testing.T) {
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)
-	bundleName := EnvDisplayName + ".app"
+	bundleName := currentDarwinBundleName()
 	userApp := filepath.Join(fakeHome, "Applications", bundleName)
 	if err := os.MkdirAll(userApp, 0o755); err != nil {
 		t.Fatal(err)

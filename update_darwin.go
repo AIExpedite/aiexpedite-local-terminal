@@ -22,8 +22,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
-	"unsafe"
 
 	"github.com/getlantern/systray"
 	"golang.org/x/sys/unix"
@@ -38,28 +36,7 @@ var (
 // atomicSwapDarwin performs an atomic rename swap between two paths on Darwin
 // using renameatx_np(AT_FDCWD, path1, AT_FDCWD, path2, RENAME_SWAP).
 func atomicSwapDarwin(path1, path2 string) error {
-	p1, err := syscall.BytePtrFromString(path1)
-	if err != nil {
-		return err
-	}
-	p2, err := syscall.BytePtrFromString(path2)
-	if err != nil {
-		return err
-	}
-	atFdCwd := -2
-	_, _, errno := syscall.Syscall6(
-		unix.SYS_RENAMEATX_NP,
-		uintptr(atFdCwd),
-		uintptr(unsafe.Pointer(p1)),
-		uintptr(atFdCwd),
-		uintptr(unsafe.Pointer(p2)),
-		uintptr(unix.RENAME_SWAP),
-		0,
-	)
-	if errno != 0 {
-		return errno
-	}
-	return nil
+	return unix.Renameatx(unix.AT_FDCWD, path1, unix.AT_FDCWD, path2, unix.RENAME_SWAP)
 }
 
 func swapDarwinBundles(currentBundle, staged, backup string) error {
