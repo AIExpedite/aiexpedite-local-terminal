@@ -66,24 +66,24 @@ func maybeRelocateInstall(_ *Config) bool {
 	// A previous run may already have relocated and silently updated this
 	// account. Never replace that authoritative per-user bundle with the stale
 	// machine-wide copy when an old Dock shortcut launches /Applications again;
-	// simply re-point startup and hand over to the existing destination.
-	if info, err := os.Stat(dest); err == nil && info.IsDir() {
-		if newExe != "" {
+	// validate the destination binary and hand over to the existing destination.
+	if newExe != "" {
+		if exeInfo, err := os.Stat(newExe); err == nil && !exeInfo.IsDir() {
+			fmt.Printf("[relocate] Per-user bundle already present at %s; handing over\n", dest)
+			// This is the destination bundle while the source bundle with the same ID
+			// is still running. Force LaunchServices to start a new destination
+			// instance; ordinary `open` merely activates the source and leaves no
+			// process after we exit. The per-account singleton acquired during
+			// startup rejects any actual duplicate.
+			if err := launchRelocatedDarwinBundle(dest, true); err != nil {
+				fmt.Printf("[relocate] Failed to launch existing per-user copy: %v\n", err)
+				return false
+			}
 			if err := writeDarwinLaunchAgentFor(newExe); err != nil {
 				fmt.Printf("[relocate] Could not re-point LaunchAgent (non-fatal): %v\n", err)
 			}
+			return true
 		}
-		fmt.Printf("[relocate] Per-user bundle already present at %s; handing over\n", dest)
-		// This is the destination bundle while the source bundle with the same ID
-		// is still running. Force LaunchServices to start a new destination
-		// instance; ordinary `open` merely activates the source and leaves no
-		// process after we exit. The per-account singleton acquired during
-		// startup rejects any actual duplicate.
-		if err := launchRelocatedDarwinBundle(dest, true); err != nil {
-			fmt.Printf("[relocate] Failed to launch existing per-user copy: %v\n", err)
-			return false
-		}
-		return true
 	}
 
 	// Stage then swap so an interrupted copy never leaves a half-written bundle
@@ -140,3 +140,57 @@ func launchRelocatedDarwinBundle(bundle string, forceNew bool) error {
 	}
 	return nil
 }
+
+// handleDarwinUninstall removes user-owned per-user bundles and prints clear removal guidance.
+func handleDarwinUninstall(quiet bool) {
+	exe, err := os.Executable()
+	var runningBundle string
+	if err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		runningBundle = darwinBundlePath(exe)
+	}
+
+	bundleName := EnvDisplayName + ".app"
+	if runningBundle != "" {
+		bundleName = filepath.Base(runningBundle)
+	}
+
+	home, _ := os.UserHomeDir()
+	var userBundle string
+	if home != "" {
+		userBundle = filepath.Join(home, "Applications", bundleName)
+	}
+
+	removedUserBundle := false
+	if userBundle != "" {
+		if info, err := os.Stat(userBundle); err == nil && info.IsDir() {
+			if err := os.RemoveAll(userBundle); err == nil {
+				removedUserBundle = true
+				if !quiet {
+					fmt.Printf("→ Removed per-user application bundle at %s\n", userBundle)
+				}
+			}
+		}
+	}
+
+	if runningBundle != "" && runningBundle != userBundle && home != "" && strings.HasPrefix(runningBundle, home+string(filepath.Separator)) {
+		if err := os.RemoveAll(runningBundle); err == nil {
+			removedUserBundle = true
+			if !quiet {
+				fmt.Printf("→ Removed application bundle at %s\n", runningBundle)
+			}
+		}
+	}
+
+	if !quiet {
+		systemBundle := filepath.Join("/Applications", bundleName)
+		if _, err := os.Stat(systemBundle); err == nil {
+			fmt.Printf("→ To remove the system-wide copy, drag %s from /Applications to the Trash.\n", bundleName)
+		} else if !removedUserBundle {
+			fmt.Printf("→ To finish removal, drag %s from ~/Applications or /Applications to the Trash.\n", bundleName)
+		}
+	}
+}
+

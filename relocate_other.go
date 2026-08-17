@@ -10,3 +10,6 @@ package main
 // maybeRelocateInstall is a no-op on Linux: the automatic update behaviour is
 // the same as on other platforms, but the install location does not move.
 func maybeRelocateInstall(_ *Config) bool { return false }
+
+func handleDarwinUninstall(_ bool) {}
+

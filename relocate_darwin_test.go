@@ -28,3 +28,23 @@ func TestLaunchRelocatedDarwinBundleWaitsForOpenResult(t *testing.T) {
 		}
 	}
 }
+
+func TestHandleDarwinUninstallRemovesUserBundle(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	bundleName := EnvDisplayName + ".app"
+	userApp := filepath.Join(fakeHome, "Applications", bundleName)
+	if err := os.MkdirAll(userApp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(userApp); err != nil {
+		t.Fatalf("expected %s to exist before uninstall", userApp)
+	}
+
+	handleDarwinUninstall(true)
+
+	if _, err := os.Stat(userApp); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be removed by handleDarwinUninstall", userApp)
+	}
+}
+

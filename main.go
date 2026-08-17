@@ -1093,8 +1093,8 @@ func handleUninstall() {
 				fmt.Println("→ Scheduled executable for deletion")
 			}
 		}
-	} else if runtime.GOOS == "darwin" && !quiet {
-		fmt.Println("→ To finish removal, drag AI Expedite.app from /Applications to the Trash.")
+	} else if runtime.GOOS == "darwin" {
+		handleDarwinUninstall(quiet)
 	}
 
 	if !quiet {
