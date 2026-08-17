@@ -18,11 +18,31 @@ import (
 	"strings"
 )
 
+const defaultDarwinBundleName = "AIExpediteTerminal.app"
+
+// currentDarwinBundleName returns the basename of the running .app bundle
+// (e.g. "AIExpediteTerminal.app"), falling back to defaultDarwinBundleName if
+// the process was not started from a .app bundle.
+func currentDarwinBundleName() string {
+	exe, err := os.Executable()
+	if err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		if bundle := darwinBundlePath(exe); bundle != "" {
+			return filepath.Base(bundle)
+		}
+	}
+	return defaultDarwinBundleName
+}
+
 // recoverInterruptedDarwinInstall checks for orphaned backup/staged bundles for
-// the current channel in ~/Applications and /Applications and restores them if the
+// the current bundle name in ~/Applications and /Applications and restores them if the
 // main bundle was left missing after an interrupted update.
-func recoverInterruptedDarwinInstall() {
-	bundleName := EnvDisplayName + ".app"
+func recoverInterruptedDarwinInstall(bundleName string) {
+	if bundleName == "" {
+		bundleName = currentDarwinBundleName()
+	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		recoverDarwinAppBundle(filepath.Join(home, "Applications"), bundleName)
 	}
@@ -69,10 +89,9 @@ func recoverDarwinAppBundle(dir, bundleName string) {
 // unrecoverable copy error leaves the legacy install launchable to retry next
 // start).
 func maybeRelocateInstall(_ *Config) bool {
-	recoverInterruptedDarwinInstall()
-
 	exe, err := os.Executable()
 	if err != nil {
+		recoverInterruptedDarwinInstall(defaultDarwinBundleName)
 		return false
 	}
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
@@ -80,8 +99,11 @@ func maybeRelocateInstall(_ *Config) bool {
 	}
 	bundle := darwinBundlePath(exe)
 	if bundle == "" {
+		recoverInterruptedDarwinInstall(defaultDarwinBundleName)
 		return false // not a bundled app (e.g. `go run`) — nothing to relocate
 	}
+	bundleName := filepath.Base(bundle)
+	recoverInterruptedDarwinInstall(bundleName)
 
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -199,10 +221,7 @@ func handleDarwinUninstall(quiet bool) {
 		runningBundle = darwinBundlePath(exe)
 	}
 
-	bundleName := EnvDisplayName + ".app"
-	if runningBundle != "" {
-		bundleName = filepath.Base(runningBundle)
-	}
+	bundleName := currentDarwinBundleName()
 
 	home, _ := os.UserHomeDir()
 	var userBundle string

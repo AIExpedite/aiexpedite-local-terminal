@@ -91,3 +91,13 @@ func TestRecoverDarwinAppBundle(t *testing.T) {
 		t.Fatalf("expected other channel staged to remain untouched: %v", err)
 	}
 }
+
+func TestCurrentDarwinBundleName_Fallback(t *testing.T) {
+	name := currentDarwinBundleName()
+	if name == "" {
+		t.Fatal("currentDarwinBundleName returned empty string")
+	}
+	if !strings.HasSuffix(name, ".app") {
+		t.Fatalf("currentDarwinBundleName = %q, want *.app suffix", name)
+	}
+}
