@@ -26,6 +26,7 @@ import (
 	"unsafe"
 
 	"github.com/getlantern/systray"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -45,16 +46,14 @@ func atomicSwapDarwin(path1, path2 string) error {
 	if err != nil {
 		return err
 	}
-	const RENAME_SWAP = 2
-	const SYS_RENAMEATX_NP = 480
 	atFdCwd := -2
 	_, _, errno := syscall.Syscall6(
-		SYS_RENAMEATX_NP,
+		unix.SYS_RENAMEATX_NP,
 		uintptr(atFdCwd),
 		uintptr(unsafe.Pointer(p1)),
 		uintptr(atFdCwd),
 		uintptr(unsafe.Pointer(p2)),
-		uintptr(RENAME_SWAP),
+		uintptr(unix.RENAME_SWAP),
 		0,
 	)
 	if errno != 0 {
