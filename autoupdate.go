@@ -1284,10 +1284,14 @@ func (au *autoUpdater) clearAttempt() {
 // retryBackoff returns the backoff before the given (1-based) retry attempt,
 // clamped to [autoUpdateRetryMin, autoUpdateRetryMax].
 func retryBackoff(attempt int) time.Duration {
-	d := autoUpdateRetryMin << (attempt - 1)
-	if d < autoUpdateRetryMin {
-		d = autoUpdateRetryMin
+	if attempt <= 1 {
+		return autoUpdateRetryMin
 	}
+	shift := attempt - 1
+	if shift > 6 {
+		shift = 6
+	}
+	d := autoUpdateRetryMin << shift
 	if d > autoUpdateRetryMax {
 		d = autoUpdateRetryMax
 	}

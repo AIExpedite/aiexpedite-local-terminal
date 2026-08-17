@@ -1010,6 +1010,12 @@ func TestRetryBackoff_Clamped(t *testing.T) {
 	if got := retryBackoff(20); got != autoUpdateRetryMax {
 		t.Fatalf("retryBackoff(20) = %v, want %v (clamped)", got, autoUpdateRetryMax)
 	}
+	if got := retryBackoff(29); got != autoUpdateRetryMax {
+		t.Fatalf("retryBackoff(29) = %v, want %v (clamped)", got, autoUpdateRetryMax)
+	}
+	if got := retryBackoff(100); got != autoUpdateRetryMax {
+		t.Fatalf("retryBackoff(100) = %v, want %v (clamped)", got, autoUpdateRetryMax)
+	}
 }
 
 func TestResolveInterruptedAttempt_SuccessReportsVersion(t *testing.T) {

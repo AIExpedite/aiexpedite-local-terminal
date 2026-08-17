@@ -1137,7 +1137,7 @@ func runPubSubConnection(cfg *Config) error {
 				if cmd.Command == "__cli_usage_refresh__" {
 					release, allowed := beginTrackedRejectionPublish()
 					if !allowed {
-						m.Ack()
+						m.Nack()
 						return
 					}
 					defer release()
@@ -1151,7 +1151,7 @@ func runPubSubConnection(cfg *Config) error {
 				if cmd.SessionID != "" {
 					release, allowed := beginTrackedRejectionPublish()
 					if !allowed {
-						m.Ack()
+						m.Nack()
 						return
 					}
 					defer release()
@@ -1182,7 +1182,7 @@ func runPubSubConnection(cfg *Config) error {
 			if cmd.Command == "__cli_usage_refresh__" {
 				release, allowed := beginTrackedRejectionPublish()
 				if !allowed {
-					m.Ack()
+					m.Nack()
 					return
 				}
 				defer release()
@@ -1196,7 +1196,7 @@ func runPubSubConnection(cfg *Config) error {
 			if cmd.SessionID != "" {
 				release, allowed := beginTrackedRejectionPublish()
 				if !allowed {
-					m.Ack()
+					m.Nack()
 					return
 				}
 				defer release()
@@ -1279,7 +1279,7 @@ func runPubSubConnection(cfg *Config) error {
 			)
 			releasePublish, allowed := beginTrackedRejectionPublish()
 			if !allowed {
-				m.Ack()
+				m.Nack()
 				return
 			}
 			defer releasePublish()
@@ -1309,7 +1309,7 @@ func runPubSubConnection(cfg *Config) error {
 			)
 			releasePublish, allowed := beginTrackedRejectionPublish()
 			if !allowed {
-				m.Ack()
+				m.Nack()
 				return
 			}
 			defer releasePublish()
@@ -1353,7 +1353,7 @@ func runPubSubConnection(cfg *Config) error {
 				)
 				releasePublish, allowed := beginTrackedRejectionPublish()
 				if !allowed {
-					m.Ack()
+					m.Nack()
 					return
 				}
 				defer releasePublish()
@@ -1381,7 +1381,7 @@ func runPubSubConnection(cfg *Config) error {
 				)
 				releasePublish, allowed := beginTrackedRejectionPublish()
 				if !allowed {
-					m.Ack()
+					m.Nack()
 					return
 				}
 				defer releasePublish()
