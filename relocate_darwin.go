@@ -74,9 +74,12 @@ func maybeRelocateInstall(_ *Config) bool {
 			}
 		}
 		fmt.Printf("[relocate] Per-user bundle already present at %s; handing over\n", dest)
-		// Ordinary `open` activates an existing instance and launches one only
-		// when needed. `open -n` would force a duplicate agent.
-		if err := launchRelocatedDarwinBundle(dest, false); err != nil {
+		// This is the destination bundle while the source bundle with the same ID
+		// is still running. Force LaunchServices to start a new destination
+		// instance; ordinary `open` merely activates the source and leaves no
+		// process after we exit. The per-account singleton acquired during
+		// startup rejects any actual duplicate.
+		if err := launchRelocatedDarwinBundle(dest, true); err != nil {
 			fmt.Printf("[relocate] Failed to launch existing per-user copy: %v\n", err)
 			return false
 		}
