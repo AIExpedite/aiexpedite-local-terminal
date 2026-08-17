@@ -47,3 +47,23 @@ func TestHandleDarwinUninstallRemovesUserBundle(t *testing.T) {
 		t.Fatalf("expected %s to be removed by handleDarwinUninstall", userApp)
 	}
 }
+
+func TestRecoverDarwinAppsDir(t *testing.T) {
+	dir := t.TempDir()
+	targetName := "AI Expedite.app"
+	target := filepath.Join(dir, targetName)
+	backup := filepath.Join(dir, ".aixupd_old_"+targetName)
+
+	if err := os.MkdirAll(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	recoverDarwinAppsDir(dir)
+
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("expected backup to be restored to target %s: %v", target, err)
+	}
+	if _, err := os.Stat(backup); !os.IsNotExist(err) {
+		t.Fatalf("expected backup %s to be gone after restore", backup)
+	}
+}

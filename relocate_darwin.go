@@ -10,12 +10,52 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 )
+
+// recoverInterruptedDarwinInstall checks for orphaned backup/staged bundles in
+// ~/Applications and /Applications and restores them if the main bundle was left
+// missing after an interrupted update.
+func recoverInterruptedDarwinInstall() {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		recoverDarwinAppsDir(filepath.Join(home, "Applications"))
+	}
+	recoverDarwinAppsDir("/Applications")
+}
+
+func recoverDarwinAppsDir(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".aixupd_old_") && strings.HasSuffix(name, ".app") {
+			targetName := strings.TrimPrefix(name, ".aixupd_old_")
+			targetPath := filepath.Join(dir, targetName)
+			backupPath := filepath.Join(dir, name)
+			if _, err := os.Stat(targetPath); errors.Is(err, os.ErrNotExist) {
+				_ = os.Rename(backupPath, targetPath)
+			} else {
+				_ = os.RemoveAll(backupPath)
+			}
+		} else if strings.HasPrefix(name, ".aixupd_staged_") && strings.HasSuffix(name, ".app") {
+			targetName := strings.TrimPrefix(name, ".aixupd_staged_")
+			targetPath := filepath.Join(dir, targetName)
+			stagedPath := filepath.Join(dir, name)
+			if _, err := os.Stat(targetPath); errors.Is(err, os.ErrNotExist) {
+				_ = os.Rename(stagedPath, targetPath)
+			} else {
+				_ = os.RemoveAll(stagedPath)
+			}
+		}
+	}
+}
 
 // maybeRelocateInstall relocates a /Applications install to ~/Applications on
 // first run of the migration-capable build, hands over to the copy, and returns
@@ -24,6 +64,8 @@ import (
 // unrecoverable copy error leaves the legacy install launchable to retry next
 // start).
 func maybeRelocateInstall(_ *Config) bool {
+	recoverInterruptedDarwinInstall()
+
 	exe, err := os.Executable()
 	if err != nil {
 		return false

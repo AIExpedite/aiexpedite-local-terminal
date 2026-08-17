@@ -22,6 +22,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"unsafe"
 
 	"github.com/getlantern/systray"
 )
@@ -31,6 +33,59 @@ var (
 	quitAfterDarwinHandoff                 = systray.Quit
 	extractDarwinTeamID                    = darwinTeamID
 )
+
+// atomicSwapDarwin performs an atomic rename swap between two paths on Darwin
+// using renameatx_np(AT_FDCWD, path1, AT_FDCWD, path2, RENAME_SWAP).
+func atomicSwapDarwin(path1, path2 string) error {
+	p1, err := syscall.BytePtrFromString(path1)
+	if err != nil {
+		return err
+	}
+	p2, err := syscall.BytePtrFromString(path2)
+	if err != nil {
+		return err
+	}
+	const RENAME_SWAP = 2
+	const SYS_RENAMEATX_NP = 480
+	atFdCwd := -2
+	_, _, errno := syscall.Syscall6(
+		SYS_RENAMEATX_NP,
+		uintptr(atFdCwd),
+		uintptr(unsafe.Pointer(p1)),
+		uintptr(atFdCwd),
+		uintptr(unsafe.Pointer(p2)),
+		uintptr(RENAME_SWAP),
+		0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func swapDarwinBundles(currentBundle, staged, backup string) error {
+	_ = os.RemoveAll(backup)
+	// Try atomic filesystem exchange first (APFS / macOS 10.12+).
+	// This leaves zero window where currentBundle is absent.
+	if err := atomicSwapDarwin(staged, currentBundle); err == nil {
+		if err := os.Rename(staged, backup); err != nil {
+			_ = os.RemoveAll(staged)
+		}
+		return nil
+	}
+
+	// Fallback to two-step rename if atomic exchange is unavailable:
+	if err := os.Rename(currentBundle, backup); err != nil {
+		return fmt.Errorf("cannot move current bundle aside: %w", err)
+	}
+	if err := os.Rename(staged, currentBundle); err != nil {
+		if rbErr := os.Rename(backup, currentBundle); rbErr != nil {
+			return fmt.Errorf("swap failed (%v) AND rollback failed (%v)", err, rbErr)
+		}
+		return fmt.Errorf("cannot move new bundle into place: %w", err)
+	}
+	return nil
+}
 
 // applyVerifiedUpdate replaces the running .app bundle with the one inside the
 // verified DMG at dmgPath and relaunches. dmgPath is the provenance-verified
@@ -99,16 +154,8 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	// the old bundle until LaunchServices accepts the relaunch so a rejected
 	// handoff can restore the version that is still running.
 	backup := filepath.Join(parent, ".aixupd_old_"+filepath.Base(currentBundle))
-	_ = os.RemoveAll(backup)
-	if err := os.Rename(currentBundle, backup); err != nil {
-		return fmt.Errorf("cannot move current bundle aside: %w", err)
-	}
-	if err := os.Rename(staged, currentBundle); err != nil {
-		// Roll back so we are never left without a bundle at the install path.
-		if rbErr := os.Rename(backup, currentBundle); rbErr != nil {
-			return fmt.Errorf("swap failed (%v) AND rollback failed (%v)", err, rbErr)
-		}
-		return fmt.Errorf("cannot move new bundle into place: %w", err)
+	if err := swapDarwinBundles(currentBundle, staged, backup); err != nil {
+		return err
 	}
 	// Re-point the LaunchAgent at the (unchanged-path but freshly written)
 	// bundle so its ProgramArguments stay valid, then relaunch and quit.
