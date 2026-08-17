@@ -1578,6 +1578,38 @@ func TestRunAttempt_ReconcilesRetainedAttemptWhenConnected(t *testing.T) {
 	}
 }
 
+func TestExitDrain_SchedulesRetryOnTimeout(t *testing.T) {
+	resetShutdownState(t)
+	cfg := registeredCfg()
+	cfg.PendingUpdateAttemptID = "test-attempt"
+	r := newAutoTestRig(t, cfg)
+	r.au.savePath = filepath.Join(t.TempDir(), "c.json")
+
+	drainExitCalled := make(chan struct{}, 2)
+	r.au.drainExit = func(ctx context.Context, attemptID, reason string) error {
+		drainExitCalled <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	go r.au.exitDrain("test-attempt", "deferred", false)
+
+	select {
+	case <-drainExitCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainExit was not called")
+	}
+
+	var retained string
+	cfg.WithPersistenceLock(func() {
+		retained = cfg.PendingUpdateAttemptID
+	})
+	if retained != "test-attempt" {
+		t.Fatalf("attempt marker must be retained across timeout, got %q", retained)
+	}
+}
+
+
 
 
 

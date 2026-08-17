@@ -403,10 +403,12 @@ func (au *autoUpdater) isDisconnected() bool {
 // updater stops (au.stopCh), shutdown begins (shutdownChan / IsShutdownInProgress),
 // the user disconnects (IsOffline / OfflineMode), or cancel is explicitly invoked.
 func (au *autoUpdater) recoveryContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	var timer *time.Timer
+	var ctx context.Context
+	var cancel context.CancelFunc
 	if timeout > 0 {
-		timer = time.AfterFunc(timeout, cancel)
+		ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
 	}
 
 	if au == nil {
@@ -420,9 +422,6 @@ func (au *autoUpdater) recoveryContext(timeout time.Duration) (context.Context, 
 
 	if stopping || IsShutdownInProgress() || au.isDisconnected() {
 		cancel()
-		if timer != nil {
-			timer.Stop()
-		}
 		return ctx, cancel
 	}
 
@@ -432,28 +431,16 @@ func (au *autoUpdater) recoveryContext(timeout time.Duration) (context.Context, 
 		for {
 			select {
 			case <-ctx.Done():
-				if timer != nil {
-					timer.Stop()
-				}
 				return
 			case <-stopCh:
 				cancel()
-				if timer != nil {
-					timer.Stop()
-				}
 				return
 			case <-shutdownChan:
 				cancel()
-				if timer != nil {
-					timer.Stop()
-				}
 				return
 			case <-ticker.C:
 				if au.isDisconnected() {
 					cancel()
-					if timer != nil {
-						timer.Stop()
-					}
 					return
 				}
 			}
