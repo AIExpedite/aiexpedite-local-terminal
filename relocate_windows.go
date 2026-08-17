@@ -107,7 +107,6 @@ func windowsPerUserInstallDir(localAppData string) string {
 
 func handleDarwinUninstall(_ bool) {}
 
-
 // copyInstallTree copies the contents of srcDir into destDir, preserving the
 // relative layout. Best-effort per file; a single failure aborts so the caller
 // does not hand over to a partial install.

@@ -47,4 +47,3 @@ func TestHandleDarwinUninstallRemovesUserBundle(t *testing.T) {
 		t.Fatalf("expected %s to be removed by handleDarwinUninstall", userApp)
 	}
 }
-

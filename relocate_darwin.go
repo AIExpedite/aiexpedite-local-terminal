@@ -193,4 +193,3 @@ func handleDarwinUninstall(quiet bool) {
 		}
 	}
 }
-

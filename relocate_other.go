@@ -12,4 +12,3 @@ package main
 func maybeRelocateInstall(_ *Config) bool { return false }
 
 func handleDarwinUninstall(_ bool) {}
-

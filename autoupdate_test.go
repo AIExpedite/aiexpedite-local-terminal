@@ -1608,8 +1608,3 @@ func TestExitDrain_SchedulesRetryOnTimeout(t *testing.T) {
 		t.Fatalf("attempt marker must be retained across timeout, got %q", retained)
 	}
 }
-
-
-
-
-
