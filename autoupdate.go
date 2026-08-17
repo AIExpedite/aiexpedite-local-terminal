@@ -579,7 +579,7 @@ func (au *autoUpdater) runAttempt() {
 	// The automatic path deliberately IGNORES cfg.SkippedVersion — Skip Version
 	// is a choice made in the manual dialog and must not suppress an enabled
 	// automatic update. The manual flow keeps honouring it.
-	au.drainAndInstall(newAttemptID(au.now(), au.attemptSeq.Add(1)), info, path)
+	au.drainAndInstall(ctx, newAttemptID(au.now(), au.attemptSeq.Add(1)), info, path)
 }
 
 // checkOnlyWithRetry runs the metadata check (no download) with bounded
@@ -648,7 +648,7 @@ func (au *autoUpdater) checkAndVerifyWithRetry(ctx context.Context) (*UpdateInfo
 // drainAndInstall enters draining, waits for work to finish (bounded by the
 // 7-day deadline), then installs. Handles preference-off cancel, deferral, and
 // confirmation-rejection abandonment.
-func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path string) {
+func (au *autoUpdater) drainAndInstall(attemptCtx context.Context, attemptID string, info *UpdateInfo, path string) {
 	// The verified artifact is owned by this call. Delete it on any exit that
 	// does NOT hand it to a successful install (preference-off, deferral,
 	// expiry, install failure, updater stop) so a long-running process that
@@ -714,11 +714,26 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 	connected := au.cloudConnected()
 	reachedService := false
 	if connected {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := au.drainEnter(ctx, attemptID, info.LatestVersion); err == nil {
+		// Derive from attemptCtx so stop() → attemptCancel() aborts this RPC,
+		// closing the race where shutdown completes between the stopping check
+		// above and this call.
+		rpcCtx, cancel := context.WithTimeout(attemptCtx, 5*time.Second)
+		err := au.drainEnter(rpcCtx, attemptID, info.LatestVersion)
+		cancel()
+		// Re-check stopping after the RPC: if shutdown raced in while the call
+		// was in flight and the RPC completed before context cancellation
+		// propagated, stopForShutdown already sent /drain/exit and cleared the
+		// marker. Trusting this late success would leave the service draining
+		// with no local marker to reconcile.
+		au.mu.Lock()
+		stopped := au.stopping
+		au.mu.Unlock()
+		if stopped {
+			return
+		}
+		if err == nil {
 			reachedService = true
 		}
-		cancel()
 	}
 
 	startedAt := au.now()
@@ -767,8 +782,8 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		// stop the healthy Pub/Sub heartbeat from keeping cloud routing active.
 		if connected && !reachedService &&
 			(lastEnterAttempt.IsZero() || elapsedAcrossSuspend(au.now(), lastEnterAttempt) >= autoUpdateDrainConfirmEvery) {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := au.drainEnter(ctx, attemptID, info.LatestVersion)
+			rpcCtx, cancel := context.WithTimeout(attemptCtx, 5*time.Second)
+			err := au.drainEnter(rpcCtx, attemptID, info.LatestVersion)
 			cancel()
 			lastEnterAttempt = au.now()
 			if err != nil && isDrainExpiredErr(err) {
@@ -786,8 +801,8 @@ func (au *autoUpdater) drainAndInstall(attemptID string, info *UpdateInfo, path 
 		// expired. Renew overdue permission before using it to authorize an
 		// install, even when work became idle while the process was asleep.
 		if connected && reachedService && elapsedAcrossSuspend(au.now(), lastConfirm) >= autoUpdateDrainConfirmEvery {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := au.drainConfirm(ctx, attemptID, info.LatestVersion)
+			rpcCtx, cancel := context.WithTimeout(attemptCtx, 5*time.Second)
+			err := au.drainConfirm(rpcCtx, attemptID, info.LatestVersion)
 			cancel()
 			if err != nil && isDrainExpiredErr(err) {
 				// The service expired our drain: stop treating ourselves as

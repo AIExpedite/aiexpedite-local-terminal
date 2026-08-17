@@ -300,7 +300,7 @@ func TestStopForShutdownPreventsDrainFromInstalling(t *testing.T) {
 	}
 	done := make(chan struct{})
 	go func() {
-		r.au.drainAndInstall("shutdown-attempt", r.info, artifact)
+		r.au.drainAndInstall(context.Background(), "shutdown-attempt", r.info, artifact)
 		close(done)
 	}()
 
@@ -355,7 +355,7 @@ func TestStopForShutdownWaitsForActiveApplyHandoff(t *testing.T) {
 
 	installDone := make(chan struct{})
 	go func() {
-		r.au.drainAndInstall("applying-attempt", r.info, artifact)
+		r.au.drainAndInstall(context.Background(), "applying-attempt", r.info, artifact)
 		close(installDone)
 	}()
 	<-applyStarted
@@ -403,7 +403,7 @@ func TestStopForShutdownWaitsForActiveApplyFailureCleanup(t *testing.T) {
 
 	installDone := make(chan struct{})
 	go func() {
-		r.au.drainAndInstall("failing-attempt", r.info, artifact)
+		r.au.drainAndInstall(context.Background(), "failing-attempt", r.info, artifact)
 		close(installDone)
 	}()
 	<-applyStarted
@@ -537,7 +537,7 @@ func TestDrainAndInstall_OfflineReconnectReportsDrainBeforeInstall(t *testing.T)
 
 	done := make(chan struct{})
 	go func() {
-		r.au.drainAndInstall("offline-reconnect", r.info, artifact)
+		r.au.drainAndInstall(context.Background(), "offline-reconnect", r.info, artifact)
 		close(done)
 	}()
 	<-enterStarted
