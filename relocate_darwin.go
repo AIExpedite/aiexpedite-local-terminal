@@ -88,17 +88,23 @@ func maybeRelocateInstall(_ *Config) bool {
 
 	// Stage then swap so an interrupted copy never leaves a half-written bundle
 	// at the destination — the legacy /Applications bundle stays launchable.
-	staged := dest + ".aixupd_new"
+	staged := fmt.Sprintf("%s.aixupd_new-%d", dest, os.Getpid())
 	_ = os.RemoveAll(staged)
+	defer os.RemoveAll(staged)
 	if err := exec.Command("ditto", bundle, staged).Run(); err != nil {
 		fmt.Printf("[relocate] ditto copy failed: %v\n", err)
-		_ = os.RemoveAll(staged)
 		return false
 	}
-	_ = os.RemoveAll(dest)
 	if err := os.Rename(staged, dest); err != nil {
+		if info, statErr := os.Stat(dest); statErr == nil && info.IsDir() {
+			fmt.Printf("[relocate] Concurrent relocation won by another launcher; handing over to %s\n", dest)
+			if err := launchRelocatedDarwinBundle(dest, true); err != nil {
+				fmt.Printf("[relocate] Failed to launch concurrent per-user copy: %v\n", err)
+				return false
+			}
+			return true
+		}
 		fmt.Printf("[relocate] cannot move relocated bundle into place: %v\n", err)
-		_ = os.RemoveAll(staged)
 		return false
 	}
 
