@@ -170,16 +170,27 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string, extra map
 	// cancellation check above already gated entry; once we hold the
 	// mutex, the HTTP work gets a clean budget.
 	//
-	// We deliberately do NOT propagate the caller ctx's cancellation
-	// past this line. All current callers pass plain timeout contexts
-	// with no explicit cancel source (tray click handlers, boot path,
-	// signal handler — each constructs `context.WithTimeout(
-	// context.Background(), 5s)`), so the parent ctx's only signal is
-	// its deadline, which is exactly what we want to ignore here. If
-	// a future caller needs to propagate explicit cancellation through
-	// the mutex (e.g. a "stop everything" abort), this is the place to
-	// thread it via context.AfterFunc.
+	// We deliberately do NOT propagate the caller ctx's deadline
+	// past this line — each call gets a clean budget after the lock.
+	// However, we DO propagate explicit cancellation (e.g. the
+	// autoupdate attempt context cancelled by shutdown) so that a
+	// late RPC cannot send /drain after stopForShutdown has already
+	// sent /drain/exit and cleared the durable marker. Only explicit
+	// cancel (context.Canceled) is forwarded; a parent deadline expiry
+	// is ignored so callers whose timeout expires while waiting on the
+	// mutex still get a full fresh budget for their HTTP work.
+	parentCtx := ctx
 	ctx, cancel := context.WithTimeout(context.Background(), notifyConnectivityHTTPBudget)
+	if parentCtx != nil {
+		stop := context.AfterFunc(parentCtx, func() {
+			// Forward only explicit cancellation (shutdown), not deadline
+			// expiry (a prior caller's timeout that expired on the mutex).
+			if parentCtx.Err() == context.Canceled {
+				cancel()
+			}
+		})
+		defer stop()
+	}
 	defer cancel()
 
 	url := fmt.Sprintf("%s/device/%s/%s", baseURL, cfg.AgentID, path)
