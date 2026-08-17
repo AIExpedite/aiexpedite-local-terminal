@@ -674,11 +674,9 @@ func onTrayReady(cfg *Config) func() {
 							})
 							if attemptID != "" {
 								// Retained attempt marker from interrupted or cancelled drain:
-								// reconcile the attempt-specific drain exit and online report.
+								// reconcile the attempt-specific drain exit or version-aware online report.
 								if resolveInterruptedAttempt(cfg) {
-									if globalAutoUpdater != nil {
-										go globalAutoUpdater.retryDrainExitReconciliation(attemptID, "deferred")
-									}
+									go retryInterruptedAttemptReconciliation(cfg)
 								}
 								return
 							}

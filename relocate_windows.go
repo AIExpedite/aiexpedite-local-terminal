@@ -65,8 +65,19 @@ func maybeRelocateInstall(_ *Config) bool {
 		return true
 	}
 
-	if err := copyInstallTree(filepath.Dir(exe), destDir); err != nil {
-		fmt.Printf("[relocate] Copy to %s failed: %v\n", destDir, err)
+	stageDir := filepath.Join(localAppData, fmt.Sprintf("%s.relocate-%d", filepath.Base(destDir), os.Getpid()))
+	_ = os.RemoveAll(stageDir)
+	defer os.RemoveAll(stageDir)
+
+	if err := copyInstallTree(filepath.Dir(exe), stageDir); err != nil {
+		fmt.Printf("[relocate] Copy to %s failed: %v\n", stageDir, err)
+		return false
+	}
+
+	_ = os.RemoveAll(destDir)
+	if err := os.Rename(stageDir, destDir); err != nil {
+		fmt.Printf("[relocate] Finalizing %s failed: %v\n", destDir, err)
+		_ = os.RemoveAll(destDir)
 		return false
 	}
 

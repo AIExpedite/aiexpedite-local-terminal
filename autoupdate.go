@@ -612,7 +612,7 @@ func (au *autoUpdater) runAttempt() {
 				return
 			}
 			fmt.Println("[autoupdate] Skipping check while restart reconciliation is pending")
-			go au.retryDrainExitReconciliation(retainedAttempt, "deferred")
+			go retryInterruptedAttemptReconciliation(au.cfg)
 			return
 		}
 		return
