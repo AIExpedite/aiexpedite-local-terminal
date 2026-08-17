@@ -380,6 +380,49 @@ func (au *autoUpdater) attemptContext() (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
+// recoveryContext returns a context with timeout that is canceled when the
+// updater stops (au.stopCh), shutdown begins (shutdownChan / IsShutdownInProgress),
+// or cancel is explicitly invoked.
+func (au *autoUpdater) recoveryContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var timer *time.Timer
+	if timeout > 0 {
+		timer = time.AfterFunc(timeout, cancel)
+	}
+
+	if au == nil {
+		return ctx, cancel
+	}
+
+	au.mu.Lock()
+	stopCh := au.stopCh
+	stopping := au.stopping
+	au.mu.Unlock()
+
+	if stopping || IsShutdownInProgress() {
+		cancel()
+		if timer != nil {
+			timer.Stop()
+		}
+		return ctx, cancel
+	}
+
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-stopCh:
+			cancel()
+		case <-shutdownChan:
+			cancel()
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	return ctx, cancel
+}
+
 // nudge asks the scheduler to run a check soon without an app restart. Called
 // when the user turns the preference on. Non-blocking / coalescing.
 func (au *autoUpdater) nudge() {
@@ -1047,7 +1090,9 @@ func (au *autoUpdater) canInstallNow(startedAt time.Time, registered, reachedSer
 // device can't re-drain every check.
 func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 	reopenAdmission()
-	au.tray.draining(false)
+	if au.tray != nil {
+		au.tray.draining(false)
+	}
 
 	if cooldown {
 		au.mu.Lock()
@@ -1060,13 +1105,36 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	au.mu.Lock()
+	stopping := au.stopping
+	au.mu.Unlock()
+	if stopping || IsShutdownInProgress() {
+		return
+	}
+
+	ctx, cancel := au.recoveryContext(5 * time.Second)
 	exitErr := au.drainExit(ctx, attemptID, reason)
+	ctxErr := ctx.Err()
 	cancel()
 
-	ctxOnline, cancelOnline := context.WithTimeout(context.Background(), 5*time.Second)
+	au.mu.Lock()
+	stopping = au.stopping
+	au.mu.Unlock()
+	if stopping || IsShutdownInProgress() || errors.Is(exitErr, context.Canceled) || errors.Is(ctxErr, context.Canceled) {
+		return
+	}
+
+	ctxOnline, cancelOnline := au.recoveryContext(5 * time.Second)
 	onlineErr := au.reportOnline(ctxOnline)
+	onlineCtxErr := ctxOnline.Err()
 	cancelOnline()
+
+	au.mu.Lock()
+	stopping = au.stopping
+	au.mu.Unlock()
+	if stopping || IsShutdownInProgress() || errors.Is(onlineErr, context.Canceled) || errors.Is(onlineCtxErr, context.Canceled) {
+		return
+	}
 
 	if exitErr == nil && onlineErr == nil {
 		au.clearAttempt()
@@ -1092,6 +1160,13 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 		case <-timer.C:
 		}
 
+		au.mu.Lock()
+		stopped := au.stopping
+		au.mu.Unlock()
+		if stopped || IsShutdownInProgress() {
+			return
+		}
+
 		var currentAttempt string
 		au.cfg.WithPersistenceLock(func() {
 			currentAttempt = au.cfg.PendingUpdateAttemptID
@@ -1105,13 +1180,29 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := au.recoveryContext(5 * time.Second)
 		exitErr := au.drainExit(ctx, attemptID, reason)
+		ctxErr := ctx.Err()
 		cancel()
 
-		ctxOnline, cancelOnline := context.WithTimeout(context.Background(), 5*time.Second)
+		au.mu.Lock()
+		stopped = au.stopping
+		au.mu.Unlock()
+		if stopped || IsShutdownInProgress() || errors.Is(exitErr, context.Canceled) || errors.Is(ctxErr, context.Canceled) {
+			return
+		}
+
+		ctxOnline, cancelOnline := au.recoveryContext(5 * time.Second)
 		onlineErr := au.reportOnline(ctxOnline)
+		onlineCtxErr := ctxOnline.Err()
 		cancelOnline()
+
+		au.mu.Lock()
+		stopped = au.stopping
+		au.mu.Unlock()
+		if stopped || IsShutdownInProgress() || errors.Is(onlineErr, context.Canceled) || errors.Is(onlineCtxErr, context.Canceled) {
+			return
+		}
 
 		if exitErr == nil && onlineErr == nil {
 			au.clearAttempt()
