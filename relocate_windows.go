@@ -74,10 +74,22 @@ func maybeRelocateInstall(_ *Config) bool {
 		return false
 	}
 
-	_ = os.RemoveAll(destDir)
+	// Atomically move stageDir into destDir.
+	// If destDir was created concurrently by a racing launcher, treat the winner's
+	// destDir as authoritative rather than deleting it.
 	if err := os.Rename(stageDir, destDir); err != nil {
+		if _, statErr := os.Stat(destExe); statErr == nil {
+			fmt.Printf("[relocate] Concurrent relocation won by another launcher; handing over to %s\n", destExe)
+			if relocatedAgentIsRunning() {
+				return true
+			}
+			if err := exec.Command(destExe).Start(); err != nil {
+				fmt.Printf("[relocate] Failed to launch concurrent per-user copy: %v\n", err)
+				return false
+			}
+			return true
+		}
 		fmt.Printf("[relocate] Finalizing %s failed: %v\n", destDir, err)
-		_ = os.RemoveAll(destDir)
 		return false
 	}
 

@@ -1021,7 +1021,7 @@ jobs:
           tag_name: latest-${{ matrix.channel }}
           name: "${{ matrix.title }} ${{ steps.version.outputs.version }} (${{ steps.sha.outputs.short_sha }})"
           draft: false
-          prerelease: false
+          prerelease: true
           files: dist/**
           body: |
             ## ${{ matrix.name }} Build
