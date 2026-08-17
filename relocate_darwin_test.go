@@ -48,22 +48,46 @@ func TestHandleDarwinUninstallRemovesUserBundle(t *testing.T) {
 	}
 }
 
-func TestRecoverDarwinAppsDir(t *testing.T) {
+func TestRecoverDarwinAppBundle(t *testing.T) {
 	dir := t.TempDir()
-	targetName := "AI Expedite.app"
-	target := filepath.Join(dir, targetName)
-	backup := filepath.Join(dir, ".aixupd_old_"+targetName)
+	myBundle := "AI Expedite Dev.app"
+	otherBundle := "AI Expedite.app"
+
+	target := filepath.Join(dir, myBundle)
+	backup := filepath.Join(dir, ".aixupd_old_"+myBundle)
+
+	otherTarget := filepath.Join(dir, otherBundle)
+	otherBackup := filepath.Join(dir, ".aixupd_old_"+otherBundle)
+	otherStaged := filepath.Join(dir, ".aixupd_staged_"+otherBundle)
 
 	if err := os.MkdirAll(backup, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(otherTarget, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(otherBackup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(otherStaged, 0o755); err != nil {
+		t.Fatal(err)
+	}
 
-	recoverDarwinAppsDir(dir)
+	recoverDarwinAppBundle(dir, myBundle)
 
+	// My bundle should be restored and its backup removed
 	if _, err := os.Stat(target); err != nil {
 		t.Fatalf("expected backup to be restored to target %s: %v", target, err)
 	}
 	if _, err := os.Stat(backup); !os.IsNotExist(err) {
 		t.Fatalf("expected backup %s to be gone after restore", backup)
+	}
+
+	// Other channel's backup and staged artifacts should NOT have been touched
+	if _, err := os.Stat(otherBackup); err != nil {
+		t.Fatalf("expected other channel backup to remain untouched: %v", err)
+	}
+	if _, err := os.Stat(otherStaged); err != nil {
+		t.Fatalf("expected other channel staged to remain untouched: %v", err)
 	}
 }

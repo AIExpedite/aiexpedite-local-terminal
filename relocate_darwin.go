@@ -18,42 +18,47 @@ import (
 	"strings"
 )
 
-// recoverInterruptedDarwinInstall checks for orphaned backup/staged bundles in
-// ~/Applications and /Applications and restores them if the main bundle was left
-// missing after an interrupted update.
+// recoverInterruptedDarwinInstall checks for orphaned backup/staged bundles for
+// the current channel in ~/Applications and /Applications and restores them if the
+// main bundle was left missing after an interrupted update.
 func recoverInterruptedDarwinInstall() {
+	bundleName := EnvDisplayName + ".app"
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		recoverDarwinAppsDir(filepath.Join(home, "Applications"))
+		recoverDarwinAppBundle(filepath.Join(home, "Applications"), bundleName)
 	}
-	recoverDarwinAppsDir("/Applications")
+	recoverDarwinAppBundle("/Applications", bundleName)
 }
 
-func recoverDarwinAppsDir(dir string) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+func recoverDarwinAppBundle(dir, bundleName string) {
+	if bundleName == "" {
 		return
 	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if strings.HasPrefix(name, ".aixupd_old_") && strings.HasSuffix(name, ".app") {
-			targetName := strings.TrimPrefix(name, ".aixupd_old_")
-			targetPath := filepath.Join(dir, targetName)
-			backupPath := filepath.Join(dir, name)
-			if _, err := os.Stat(targetPath); errors.Is(err, os.ErrNotExist) {
-				_ = os.Rename(backupPath, targetPath)
-			} else {
-				_ = os.RemoveAll(backupPath)
+	targetPath := filepath.Join(dir, bundleName)
+	backupPath := filepath.Join(dir, ".aixupd_old_"+bundleName)
+	stagedPath := filepath.Join(dir, ".aixupd_staged_"+bundleName)
+
+	targetExists := false
+	if _, err := os.Stat(targetPath); err == nil {
+		targetExists = true
+	}
+
+	if !targetExists {
+		// Prefer restoring backup, then staged if backup is absent
+		if _, err := os.Stat(backupPath); err == nil {
+			if err := os.Rename(backupPath, targetPath); err == nil {
+				targetExists = true
 			}
-		} else if strings.HasPrefix(name, ".aixupd_staged_") && strings.HasSuffix(name, ".app") {
-			targetName := strings.TrimPrefix(name, ".aixupd_staged_")
-			targetPath := filepath.Join(dir, targetName)
-			stagedPath := filepath.Join(dir, name)
-			if _, err := os.Stat(targetPath); errors.Is(err, os.ErrNotExist) {
-				_ = os.Rename(stagedPath, targetPath)
-			} else {
-				_ = os.RemoveAll(stagedPath)
+		} else if _, err := os.Stat(stagedPath); err == nil {
+			if err := os.Rename(stagedPath, targetPath); err == nil {
+				targetExists = true
 			}
 		}
+	}
+
+	// Clean up stale leftovers belonging strictly to this channel once target is in place
+	if targetExists {
+		_ = os.RemoveAll(backupPath)
+		_ = os.RemoveAll(stagedPath)
 	}
 }
 
