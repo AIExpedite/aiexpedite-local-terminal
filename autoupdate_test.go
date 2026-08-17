@@ -1412,6 +1412,7 @@ func TestExitDrain_SuppressesOnlineIfShutdownBeginsBeforeOnline(t *testing.T) {
 func TestExitDrain_CancelsDrainRecoveryOnDisconnect(t *testing.T) {
 	resetShutdownState(t)
 	cfg := registeredCfg()
+	cfg.PendingUpdateAttemptID = "test-attempt"
 	r := newAutoTestRig(t, cfg)
 
 	drainExitStarted := make(chan struct{})
@@ -1461,11 +1462,20 @@ func TestExitDrain_CancelsDrainRecoveryOnDisconnect(t *testing.T) {
 	if calls != 0 {
 		t.Fatalf("reportOnline must not be called after disconnect, got %d calls", calls)
 	}
+
+	var retained string
+	cfg.WithPersistenceLock(func() {
+		retained = cfg.PendingUpdateAttemptID
+	})
+	if retained != "test-attempt" {
+		t.Fatalf("attempt marker must be retained across unacknowledged disconnect, got %q", retained)
+	}
 }
 
 func TestExitDrain_SuppressesOnlineIfDisconnectBeginsBeforeOnline(t *testing.T) {
 	resetShutdownState(t)
 	cfg := registeredCfg()
+	cfg.PendingUpdateAttemptID = "test-attempt"
 	r := newAutoTestRig(t, cfg)
 
 	r.au.drainExit = func(ctx context.Context, attemptID, reason string) error {
@@ -1482,6 +1492,15 @@ func TestExitDrain_SuppressesOnlineIfDisconnectBeginsBeforeOnline(t *testing.T) 
 	if calls != 0 {
 		t.Fatalf("reportOnline must not be called after disconnect, got %d calls", calls)
 	}
+
+	var retained string
+	cfg.WithPersistenceLock(func() {
+		retained = cfg.PendingUpdateAttemptID
+	})
+	if retained != "test-attempt" {
+		t.Fatalf("attempt marker must be retained when online report is suppressed by disconnect, got %q", retained)
+	}
 }
+
 
 

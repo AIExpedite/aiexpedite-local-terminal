@@ -1140,7 +1140,7 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 		au.mu.Unlock()
 	}
 
-	if au.isDisconnected() {
+	if !au.cfg.IsRegistered() {
 		au.clearAttempt()
 		return
 	}
@@ -1148,7 +1148,7 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 	au.mu.Lock()
 	stopping := au.stopping
 	au.mu.Unlock()
-	if stopping || IsShutdownInProgress() {
+	if stopping || IsShutdownInProgress() || au.isDisconnected() {
 		return
 	}
 
@@ -1161,9 +1161,6 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 	stopping = au.stopping
 	au.mu.Unlock()
 	if stopping || IsShutdownInProgress() || au.isDisconnected() || errors.Is(exitErr, context.Canceled) || errors.Is(ctxErr, context.Canceled) {
-		if au.isDisconnected() {
-			au.clearAttempt()
-		}
 		return
 	}
 
@@ -1176,9 +1173,6 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 	stopping = au.stopping
 	au.mu.Unlock()
 	if stopping || IsShutdownInProgress() || au.isDisconnected() || errors.Is(onlineErr, context.Canceled) || errors.Is(onlineCtxErr, context.Canceled) {
-		if au.isDisconnected() {
-			au.clearAttempt()
-		}
 		return
 	}
 
@@ -1210,9 +1204,6 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 		stopped := au.stopping
 		au.mu.Unlock()
 		if stopped || IsShutdownInProgress() || au.isDisconnected() {
-			if au.isDisconnected() {
-				au.clearAttempt()
-			}
 			return
 		}
 
@@ -1224,7 +1215,7 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 			return
 		}
 
-		if au.isDisconnected() {
+		if !au.cfg.IsRegistered() {
 			au.clearAttempt()
 			return
 		}
@@ -1238,9 +1229,6 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 		stopped = au.stopping
 		au.mu.Unlock()
 		if stopped || IsShutdownInProgress() || au.isDisconnected() || errors.Is(exitErr, context.Canceled) || errors.Is(ctxErr, context.Canceled) {
-			if au.isDisconnected() {
-				au.clearAttempt()
-			}
 			return
 		}
 
@@ -1253,9 +1241,6 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 		stopped = au.stopping
 		au.mu.Unlock()
 		if stopped || IsShutdownInProgress() || au.isDisconnected() || errors.Is(onlineErr, context.Canceled) || errors.Is(onlineCtxErr, context.Canceled) {
-			if au.isDisconnected() {
-				au.clearAttempt()
-			}
 			return
 		}
 
