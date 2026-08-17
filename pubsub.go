@@ -1407,9 +1407,9 @@ func runPubSubConnection(cfg *Config) error {
 		admitted, releaseWork := admitWork(cmd)
 		if !admitted {
 			if releaseWork == nil {
-				// Replacement already owns the sealed drain. Refusal reporting is
-				// best-effort; do not begin a publish that the handoff can cut off.
-				m.Ack()
+				// Replacement already owns the sealed drain. Nack the message so
+				// Pub/Sub keeps and redelivers it to the replacement process.
+				m.Nack()
 				return
 			}
 			defer releaseWork()
