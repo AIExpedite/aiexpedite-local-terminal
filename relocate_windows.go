@@ -25,6 +25,8 @@ import (
 // account). Returns false when no relocation is needed (already per-user, no
 // %LOCALAPPDATA%) or a copy failure leaves the legacy install launchable to
 // retry next start.
+func recoverInterruptedInstall() {}
+
 func maybeRelocateInstall(_ *Config) bool {
 	exe, err := os.Executable()
 	if err != nil {

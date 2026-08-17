@@ -154,6 +154,11 @@ func main() {
 	releaseInstance = trackAgentInstanceRelease(releaseInstance)
 	defer releaseInstance()
 
+	// Same-channel Darwin recovery touches staged/backup bundles that an
+	// in-flight update still owns. Only the singleton holder may run it;
+	// a losing Dock/LaunchAgent launcher must exit without deleting them.
+	recoverInterruptedInstall()
+
 	// Register startup and uninstall metadata only after relocation and the
 	// singleton gate. Otherwise a stale Program Files shortcut could overwrite
 	// the authoritative per-user paths before discovering the relocated agent.

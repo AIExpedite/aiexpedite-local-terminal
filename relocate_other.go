@@ -11,4 +11,6 @@ package main
 // the same as on other platforms, but the install location does not move.
 func maybeRelocateInstall(_ *Config) bool { return false }
 
+func recoverInterruptedInstall() {}
+
 func handleDarwinUninstall(_ bool) {}

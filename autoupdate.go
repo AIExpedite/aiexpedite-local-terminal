@@ -1340,8 +1340,9 @@ func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) bool {
 		clearInterruptedAttempt(cfg, savePath, attemptID)
 		return false
 	}
-	if offline {
-		// Keep the retained attempt marker while offline so it is reconciled when the user reconnects.
+	if offline || IsOffline() || IsShutdownInProgress() {
+		// Keep the retained attempt marker while offline/shutting down so it is
+		// reconciled when the user reconnects or the next process starts.
 		return false
 	}
 
@@ -1349,30 +1350,103 @@ func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) bool {
 	// and before it schedules the ordinary boot-time /online signal, so the
 	// version-aware request must reach the service first; otherwise a generic
 	// already-online response can discard the attempt/version outcome.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	//
+	// The context is cancelled on Disconnect or quit so a reconnect retry that
+	// already snapshotted offline=false cannot still issue /online or
+	// /drain/exit after the user has flipped connectivity — those RPCs wait
+	// on notifyConnectivityMutex and would otherwise overwrite the later
+	// offline signal.
+	ctx, cancel := attemptReconciliationContext(cfg, 5*time.Second)
 	defer cancel()
 	if applied && Version == target {
 		// The update landed. Report ready on the new version + attempt id so
 		// the service reconciles the drain it cleared.
-		if err := notifyOnlineWithVersion(ctx, cfg, Version, attemptID); err != nil {
+		err := notifyOnlineWithVersion(ctx, cfg, Version, attemptID)
+		if attemptReconciliationAborted(cfg, err, ctx) {
+			return false
+		}
+		if err != nil {
 			fmt.Printf("[autoupdate] post-update online report failed: %v\n", err)
 			return true
 		}
 	} else {
 		// Interrupted mid-drain (crash / failed install): abandon the attempt,
 		// tell the service to exit the drain, and become routable.
-		if err := notifyDrainExit(ctx, cfg, attemptID, "deferred"); err != nil {
+		err := notifyDrainExit(ctx, cfg, attemptID, "deferred")
+		if attemptReconciliationAborted(cfg, err, ctx) {
+			return false
+		}
+		if err != nil {
 			fmt.Printf("[autoupdate] interrupted-attempt drain exit failed: %v\n", err)
 			return true
 		}
-		if err := notifyOnline(ctx, cfg); err != nil {
+		err = notifyOnline(ctx, cfg)
+		if attemptReconciliationAborted(cfg, err, ctx) {
+			return false
+		}
+		if err != nil {
 			fmt.Printf("[autoupdate] interrupted-attempt online report failed: %v\n", err)
 			return true
 		}
 	}
 
+	if attemptReconciliationAborted(cfg, nil, ctx) {
+		return false
+	}
 	clearInterruptedAttempt(cfg, savePath, attemptID)
 	return false
+}
+
+func configOfflineMode(cfg *Config) bool {
+	if cfg == nil {
+		return false
+	}
+	var offline bool
+	cfg.WithPersistenceLock(func() {
+		offline = cfg.OfflineMode
+	})
+	return offline
+}
+
+// attemptReconciliationContext is cancelled when the user disconnects, shutdown
+// begins, or the timeout elapses. Unlike a bare Background timeout, this lets
+// notifyConnectivity forward an explicit cancel and drop a queued /online
+// instead of overwriting a later Disconnect.
+func attemptReconciliationContext(cfg *Config, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if IsShutdownInProgress() || IsOffline() || configOfflineMode(cfg) {
+		cancel()
+		return ctx, cancel
+	}
+	go func() {
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-shutdownChan:
+				cancel()
+				return
+			case <-ticker.C:
+				if IsShutdownInProgress() || IsOffline() || configOfflineMode(cfg) {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, cancel
+}
+
+func attemptReconciliationAborted(cfg *Config, err error, ctx context.Context) bool {
+	if IsShutdownInProgress() || IsOffline() || configOfflineMode(cfg) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	return ctx != nil && errors.Is(ctx.Err(), context.Canceled)
 }
 
 func clearInterruptedAttempt(cfg *Config, savePath, attemptID string) {
@@ -1392,18 +1466,38 @@ func clearInterruptedAttempt(cfg *Config, savePath, attemptID string) {
 // from remaining unroutable until another process restart when the service was
 // temporarily unavailable during its first version-aware online report.
 func retryInterruptedAttemptReconciliation(cfg *Config) {
+	retryInterruptedAttemptReconciliationAt(cfg, ConfigPath())
+}
+
+func retryInterruptedAttemptReconciliationAt(cfg *Config, savePath string) {
 	if cfg == nil {
 		return
 	}
 	for attempt := 1; ; attempt++ {
 		timer := time.NewTimer(retryBackoff(attempt))
-		select {
-		case <-shutdownChan:
-			timer.Stop()
-			return
-		case <-timer.C:
+		ticker := time.NewTicker(25 * time.Millisecond)
+		aborted := false
+		for !aborted {
+			select {
+			case <-shutdownChan:
+				timer.Stop()
+				ticker.Stop()
+				return
+			case <-timer.C:
+				aborted = true
+			case <-ticker.C:
+				if IsShutdownInProgress() || IsOffline() || configOfflineMode(cfg) {
+					timer.Stop()
+					ticker.Stop()
+					return
+				}
+			}
 		}
-		if !resolveInterruptedAttempt(cfg) {
+		ticker.Stop()
+		if IsShutdownInProgress() || IsOffline() || configOfflineMode(cfg) {
+			return
+		}
+		if !resolveInterruptedAttemptWithPath(cfg, savePath) {
 			return
 		}
 	}

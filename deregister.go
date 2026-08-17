@@ -203,6 +203,12 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string, extra map
 	if parentCtx != nil && parentCtx.Err() == context.Canceled {
 		return context.Canceled
 	}
+	// A Disconnect can land after the caller snapshotted offline=false and
+	// while this RPC was queued on the mutex. /offline must still go out;
+	// /online and drain RPCs must not overwrite that newer user intent.
+	if path != "offline" && IsOffline() {
+		return context.Canceled
+	}
 
 	var lastErr error
 	for attempt := 1; attempt <= notifyConnectivityMaxAttempts; attempt++ {

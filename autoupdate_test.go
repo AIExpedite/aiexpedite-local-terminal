@@ -1165,6 +1165,116 @@ func TestResolveInterruptedAttempt_PreservesMarkerAcrossOfflineRestarts(t *testi
 	}
 }
 
+func TestResolveInterruptedAttempt_CancelsOnDisconnectBeforeRPC(t *testing.T) {
+	resetDrainState(t)
+	resetConnectivityState(t)
+	resetShutdownState(t)
+	t.Cleanup(func() {
+		resetDrainState(t)
+		resetConnectivityState(t)
+		resetShutdownState(t)
+	})
+
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+
+	cfg := DefaultConfig()
+	cfg.AgentID = "agent-reconcile-disconnect"
+	cfg.CommandSecret = "secret"
+	cfg.PendingUpdateAttemptID = "att-reconcile-disconnect"
+	cfg.PendingUpdateVersion = Version
+	cfg.PendingUpdateApplied = true
+
+	savePath := filepath.Join(t.TempDir(), "c.json")
+
+	// Hold the connectivity mutex so reconciliation snapshots offline=false
+	// and then blocks before the version-aware /online can be sent.
+	notifyConnectivityMutex.Lock()
+	done := make(chan bool, 1)
+	go func() {
+		done <- resolveInterruptedAttemptWithPath(cfg, savePath)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	SetOffline(true, cfg)
+	notifyConnectivityMutex.Unlock()
+
+	select {
+	case pending := <-done:
+		if pending {
+			t.Fatal("disconnect must stop reconciliation without scheduling a network retry")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("resolveInterruptedAttempt did not return after disconnect")
+	}
+
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("queued reconciliation must not send after disconnect, got %d requests", got)
+	}
+	if cfg.PendingUpdateAttemptID != "att-reconcile-disconnect" || !cfg.PendingUpdateApplied {
+		t.Fatal("disconnect must retain the durable attempt marker")
+	}
+}
+
+func TestRetryInterruptedAttemptReconciliation_StopsOnDisconnect(t *testing.T) {
+	resetDrainState(t)
+	resetConnectivityState(t)
+	resetShutdownState(t)
+	t.Cleanup(func() {
+		resetDrainState(t)
+		resetConnectivityState(t)
+		resetShutdownState(t)
+	})
+
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	t.Setenv("TERMINAL_SERVICE_URL", srv.URL)
+
+	cfg := DefaultConfig()
+	cfg.AgentID = "agent-retry-disconnect"
+	cfg.CommandSecret = "secret"
+	cfg.PendingUpdateAttemptID = "att-retry-disconnect"
+	cfg.PendingUpdateVersion = Version
+	cfg.PendingUpdateApplied = true
+
+	savePath := filepath.Join(t.TempDir(), "c.json")
+	if err := cfg.Save(savePath); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		retryInterruptedAttemptReconciliationAt(cfg, savePath)
+		close(done)
+	}()
+
+	// The retry loop backs off before the next RPC. Disconnect during that
+	// wait must abort without issuing another online/drain-exit call.
+	time.Sleep(50 * time.Millisecond)
+	SetOffline(true, cfg)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry loop did not stop after disconnect")
+	}
+
+	if requests.Load() != 0 {
+		t.Fatalf("disconnect during retry backoff issued %d requests, want 0", requests.Load())
+	}
+	if cfg.PendingUpdateAttemptID != "att-retry-disconnect" {
+		t.Fatal("disconnect during retry must retain the durable attempt marker")
+	}
+}
+
 func TestIsDrainExpiredErr(t *testing.T) {
 	if !isDrainExpiredErr(errors.New("server returned status 410")) {
 		t.Fatal("410 should be treated as expired")

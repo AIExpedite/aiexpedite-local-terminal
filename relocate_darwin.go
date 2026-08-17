@@ -87,10 +87,17 @@ func recoverDarwinAppBundle(dir, bundleName string) {
 // relocation is needed (already per-user, running from another location, or an
 // unrecoverable copy error leaves the legacy install launchable to retry next
 // start).
+// recoverInterruptedInstall restores or cleans leftover Darwin update
+// artifacts for this channel. It must run only after the per-account
+// singleton is held so a losing same-channel launcher cannot delete the
+// staged/backup bundles an in-flight update still owns.
+func recoverInterruptedInstall() {
+	recoverInterruptedDarwinInstall("")
+}
+
 func maybeRelocateInstall(_ *Config) bool {
 	exe, err := os.Executable()
 	if err != nil {
-		recoverInterruptedDarwinInstall(defaultDarwinBundleName)
 		return false
 	}
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
@@ -98,11 +105,8 @@ func maybeRelocateInstall(_ *Config) bool {
 	}
 	bundle := darwinBundlePath(exe)
 	if bundle == "" {
-		recoverInterruptedDarwinInstall(defaultDarwinBundleName)
 		return false // not a bundled app (e.g. `go run`) — nothing to relocate
 	}
-	bundleName := filepath.Base(bundle)
-	recoverInterruptedDarwinInstall(bundleName)
 
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {

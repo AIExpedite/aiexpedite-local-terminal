@@ -92,6 +92,63 @@ func TestRecoverDarwinAppBundle(t *testing.T) {
 	}
 }
 
+func TestMaybeRelocateInstallDoesNotCleanInFlightUpdateArtifacts(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	apps := filepath.Join(fakeHome, "Applications")
+	if err := os.MkdirAll(apps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundleName := defaultDarwinBundleName
+	target := filepath.Join(apps, bundleName)
+	staged := filepath.Join(apps, ".aixupd_staged_"+bundleName)
+	backup := filepath.Join(apps, ".aixupd_old_"+bundleName)
+	for _, path := range []string{target, staged, backup} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if maybeRelocateInstall(nil) {
+		t.Fatal("unbundled test process should not relocate")
+	}
+
+	for _, path := range []string{staged, backup} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("in-flight update artifact %s must survive relocation before singleton: %v", path, err)
+		}
+	}
+}
+
+func TestRecoverInterruptedInstallCleansStaleArtifactsAfterSingleton(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	apps := filepath.Join(fakeHome, "Applications")
+	if err := os.MkdirAll(apps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundleName := currentDarwinBundleName()
+	target := filepath.Join(apps, bundleName)
+	staged := filepath.Join(apps, ".aixupd_staged_"+bundleName)
+	backup := filepath.Join(apps, ".aixupd_old_"+bundleName)
+	for _, path := range []string{target, staged, backup} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recoverInterruptedInstall()
+
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("installed target must remain: %v", err)
+	}
+	for _, path := range []string{staged, backup} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("stale artifact %s should be cleaned after singleton recovery: %v", path, err)
+		}
+	}
+}
+
 func TestCurrentDarwinBundleName_Fallback(t *testing.T) {
 	name := currentDarwinBundleName()
 	if name == "" {
