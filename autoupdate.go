@@ -805,12 +805,10 @@ func (au *autoUpdater) drainAndInstall(attemptCtx context.Context, attemptID str
 	connected := au.cloudConnected()
 	reachedService := false
 	if connected {
-		// Derive from attemptCtx so stop() → attemptCancel() aborts this RPC,
-		// closing the race where shutdown completes between the stopping check
-		// above and this call.
-		rpcCtx, cancel := context.WithTimeout(attemptCtx, 5*time.Second)
-		err := au.drainEnter(rpcCtx, attemptID, info.LatestVersion)
-		cancel()
+		// Pass attemptCtx directly so stop() → attemptCancel() aborts this RPC
+		// even if queued on notifyConnectivityMutex, without masking cancellation
+		// with an artificial deadline.
+		err := au.drainEnter(attemptCtx, attemptID, info.LatestVersion)
 		// Re-check stopping after the RPC: if shutdown raced in while the call
 		// was in flight and the RPC completed before context cancellation
 		// propagated, stopForShutdown already sent /drain/exit and cleared the
@@ -873,9 +871,7 @@ func (au *autoUpdater) drainAndInstall(attemptCtx context.Context, attemptID str
 		// stop the healthy Pub/Sub heartbeat from keeping cloud routing active.
 		if connected && !reachedService &&
 			(lastEnterAttempt.IsZero() || elapsedAcrossSuspend(au.now(), lastEnterAttempt) >= autoUpdateDrainConfirmEvery) {
-			rpcCtx, cancel := context.WithTimeout(attemptCtx, 5*time.Second)
-			err := au.drainEnter(rpcCtx, attemptID, info.LatestVersion)
-			cancel()
+			err := au.drainEnter(attemptCtx, attemptID, info.LatestVersion)
 			lastEnterAttempt = au.now()
 			if err != nil && isDrainExpiredErr(err) {
 				fmt.Printf("[autoupdate] drain re-entry rejected (expired) for %s; abandoning\n", attemptID)
@@ -892,9 +888,7 @@ func (au *autoUpdater) drainAndInstall(attemptCtx context.Context, attemptID str
 		// expired. Renew overdue permission before using it to authorize an
 		// install, even when work became idle while the process was asleep.
 		if connected && reachedService && elapsedAcrossSuspend(au.now(), lastConfirm) >= autoUpdateDrainConfirmEvery {
-			rpcCtx, cancel := context.WithTimeout(attemptCtx, 5*time.Second)
-			err := au.drainConfirm(rpcCtx, attemptID, info.LatestVersion)
-			cancel()
+			err := au.drainConfirm(attemptCtx, attemptID, info.LatestVersion)
 			if err != nil && isDrainExpiredErr(err) {
 				// The service expired our drain: stop treating ourselves as
 				// draining and become routable again via a ready signal. A new
