@@ -303,6 +303,9 @@ func newAutoUpdater(cfg *Config, tray *trayUpdateHandles) *autoUpdater {
 		return notifyDrainExit(ctx, cfg, attemptID, reason)
 	}
 	au.reportOnline = func(ctx context.Context) error {
+		if IsOffline() {
+			return nil
+		}
 		if cfg.IsRegistered() && !cfg.OfflineMode {
 			return notifyOnline(ctx, cfg)
 		}
@@ -380,9 +383,25 @@ func (au *autoUpdater) attemptContext() (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
+// isDisconnected returns true if the agent is marked offline or not registered.
+func (au *autoUpdater) isDisconnected() bool {
+	if IsOffline() {
+		return true
+	}
+	if au == nil || au.cfg == nil {
+		return true
+	}
+	var offline, registered bool
+	au.cfg.WithPersistenceLock(func() {
+		offline = au.cfg.OfflineMode
+		registered = au.cfg.IsRegistered()
+	})
+	return offline || !registered
+}
+
 // recoveryContext returns a context with timeout that is canceled when the
 // updater stops (au.stopCh), shutdown begins (shutdownChan / IsShutdownInProgress),
-// or cancel is explicitly invoked.
+// the user disconnects (IsOffline / OfflineMode), or cancel is explicitly invoked.
 func (au *autoUpdater) recoveryContext(timeout time.Duration) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var timer *time.Timer
@@ -399,7 +418,7 @@ func (au *autoUpdater) recoveryContext(timeout time.Duration) (context.Context, 
 	stopping := au.stopping
 	au.mu.Unlock()
 
-	if stopping || IsShutdownInProgress() {
+	if stopping || IsShutdownInProgress() || au.isDisconnected() {
 		cancel()
 		if timer != nil {
 			timer.Stop()
@@ -408,15 +427,36 @@ func (au *autoUpdater) recoveryContext(timeout time.Duration) (context.Context, 
 	}
 
 	go func() {
-		select {
-		case <-ctx.Done():
-		case <-stopCh:
-			cancel()
-		case <-shutdownChan:
-			cancel()
-		}
-		if timer != nil {
-			timer.Stop()
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				if timer != nil {
+					timer.Stop()
+				}
+				return
+			case <-stopCh:
+				cancel()
+				if timer != nil {
+					timer.Stop()
+				}
+				return
+			case <-shutdownChan:
+				cancel()
+				if timer != nil {
+					timer.Stop()
+				}
+				return
+			case <-ticker.C:
+				if au.isDisconnected() {
+					cancel()
+					if timer != nil {
+						timer.Stop()
+					}
+					return
+				}
+			}
 		}
 	}()
 
@@ -1100,7 +1140,7 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 		au.mu.Unlock()
 	}
 
-	if !au.cfg.IsRegistered() || au.cfg.OfflineMode {
+	if au.isDisconnected() {
 		au.clearAttempt()
 		return
 	}
@@ -1120,7 +1160,10 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 	au.mu.Lock()
 	stopping = au.stopping
 	au.mu.Unlock()
-	if stopping || IsShutdownInProgress() || errors.Is(exitErr, context.Canceled) || errors.Is(ctxErr, context.Canceled) {
+	if stopping || IsShutdownInProgress() || au.isDisconnected() || errors.Is(exitErr, context.Canceled) || errors.Is(ctxErr, context.Canceled) {
+		if au.isDisconnected() {
+			au.clearAttempt()
+		}
 		return
 	}
 
@@ -1132,7 +1175,10 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 	au.mu.Lock()
 	stopping = au.stopping
 	au.mu.Unlock()
-	if stopping || IsShutdownInProgress() || errors.Is(onlineErr, context.Canceled) || errors.Is(onlineCtxErr, context.Canceled) {
+	if stopping || IsShutdownInProgress() || au.isDisconnected() || errors.Is(onlineErr, context.Canceled) || errors.Is(onlineCtxErr, context.Canceled) {
+		if au.isDisconnected() {
+			au.clearAttempt()
+		}
 		return
 	}
 
@@ -1163,7 +1209,10 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 		au.mu.Lock()
 		stopped := au.stopping
 		au.mu.Unlock()
-		if stopped || IsShutdownInProgress() {
+		if stopped || IsShutdownInProgress() || au.isDisconnected() {
+			if au.isDisconnected() {
+				au.clearAttempt()
+			}
 			return
 		}
 
@@ -1175,7 +1224,7 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 			return
 		}
 
-		if !au.cfg.IsRegistered() || au.cfg.OfflineMode {
+		if au.isDisconnected() {
 			au.clearAttempt()
 			return
 		}
@@ -1188,7 +1237,10 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 		au.mu.Lock()
 		stopped = au.stopping
 		au.mu.Unlock()
-		if stopped || IsShutdownInProgress() || errors.Is(exitErr, context.Canceled) || errors.Is(ctxErr, context.Canceled) {
+		if stopped || IsShutdownInProgress() || au.isDisconnected() || errors.Is(exitErr, context.Canceled) || errors.Is(ctxErr, context.Canceled) {
+			if au.isDisconnected() {
+				au.clearAttempt()
+			}
 			return
 		}
 
@@ -1200,7 +1252,10 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 		au.mu.Lock()
 		stopped = au.stopping
 		au.mu.Unlock()
-		if stopped || IsShutdownInProgress() || errors.Is(onlineErr, context.Canceled) || errors.Is(onlineCtxErr, context.Canceled) {
+		if stopped || IsShutdownInProgress() || au.isDisconnected() || errors.Is(onlineErr, context.Canceled) || errors.Is(onlineCtxErr, context.Canceled) {
+			if au.isDisconnected() {
+				au.clearAttempt()
+			}
 			return
 		}
 

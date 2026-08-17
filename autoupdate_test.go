@@ -1409,3 +1409,79 @@ func TestExitDrain_SuppressesOnlineIfShutdownBeginsBeforeOnline(t *testing.T) {
 	}
 }
 
+func TestExitDrain_CancelsDrainRecoveryOnDisconnect(t *testing.T) {
+	resetShutdownState(t)
+	cfg := registeredCfg()
+	r := newAutoTestRig(t, cfg)
+
+	drainExitStarted := make(chan struct{})
+	drainExitDone := make(chan error, 1)
+
+	r.au.drainExit = func(ctx context.Context, attemptID, reason string) error {
+		close(drainExitStarted)
+		<-ctx.Done()
+		err := ctx.Err()
+		drainExitDone <- err
+		return err
+	}
+
+	exitDone := make(chan struct{})
+	go func() {
+		r.au.exitDrain("test-attempt", "deferred", false)
+		close(exitDone)
+	}()
+
+	select {
+	case <-drainExitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainExit did not start")
+	}
+
+	// User disconnects while drainExit is blocked
+	SetOffline(true, cfg)
+
+	select {
+	case err := <-drainExitDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("drainExit context error = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainExit did not cancel on disconnect")
+	}
+
+	select {
+	case <-exitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("exitDrain did not finish after disconnect")
+	}
+
+	r.mu.Lock()
+	calls := r.onlineCalls
+	r.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("reportOnline must not be called after disconnect, got %d calls", calls)
+	}
+}
+
+func TestExitDrain_SuppressesOnlineIfDisconnectBeginsBeforeOnline(t *testing.T) {
+	resetShutdownState(t)
+	cfg := registeredCfg()
+	r := newAutoTestRig(t, cfg)
+
+	r.au.drainExit = func(ctx context.Context, attemptID, reason string) error {
+		// Disconnect happens right after drainExit succeeds
+		SetOffline(true, cfg)
+		return nil
+	}
+
+	r.au.exitDrain("test-attempt", "deferred", false)
+
+	r.mu.Lock()
+	calls := r.onlineCalls
+	r.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("reportOnline must not be called after disconnect, got %d calls", calls)
+	}
+}
+
+
