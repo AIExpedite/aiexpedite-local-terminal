@@ -183,7 +183,14 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	// the old bundle until LaunchServices accepts the relaunch so a rejected
 	// handoff can restore the version that is still running.
 	backup := filepath.Join(parent, ".aixupd_old_"+filepath.Base(currentBundle))
-	if err := swapDarwinBundles(currentBundle, staged, backup); err != nil {
+	// Serialize with the DMG installer and the legacy relocation, which mutate
+	// this same path. It matters most on a filesystem without RENAME_SWAP,
+	// where the fallback in swapDarwinBundles leaves currentBundle briefly
+	// absent: an installer looking in that gap would classify the destination
+	// as free, create its own bundle there, and strand this update.
+	if err := withDarwinInstallDirLock(parent, func() error {
+		return swapDarwinBundles(currentBundle, staged, backup)
+	}); err != nil {
 		return err
 	}
 	// Re-point the LaunchAgent at the (unchanged-path but freshly written)
@@ -216,7 +223,11 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 func handleFailedDarwinRelaunch(bundle, backup string, relaunchErr error) error {
 	if release, acquired := acquireAgentInstanceAfterDarwinHandoff(); acquired {
 		trackAgentInstanceRelease(release)
-		if err := restoreDarwinBundleBackup(bundle, backup); err != nil {
+		// The rollback moves the bundle aside too, so it needs the same
+		// exclusion as the swap that put it there.
+		if err := withDarwinInstallDirLock(filepath.Dir(bundle), func() error {
+			return restoreDarwinBundleBackup(bundle, backup)
+		}); err != nil {
 			return fmt.Errorf("failed to relaunch %s (%v) and could not restore the previous bundle: %w", bundle, relaunchErr, err)
 		}
 		return fmt.Errorf("failed to relaunch %s: %w", bundle, relaunchErr)

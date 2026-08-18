@@ -142,13 +142,16 @@ Guards keep that from firing when it shouldn't:
   holds either way.
 - **Installers serialize on the destination.** Each channel holds a *different*
   singleton, so it cannot order two installers against each other. A lock file
-  (`~/Applications/.aixinstall.lock`) does: every installer — the DMG path and
-  the legacy `/Applications` relocation alike — takes it before choosing a
-  path, and placement is create-first (`renameatx_np(RENAME_EXCL)`) with
+  (`~/Applications/.aixinstall.lock`) does: every writer of an installed bundle
+  — the DMG install, the legacy `/Applications` relocation, and the updater's
+  own swap and rollback — takes it before choosing a path, and placement is create-first (`renameatx_np(RENAME_EXCL)`) with
   ownership re-read immediately before any swap, because the decision made
   before the copy is stale by then. A holder is *waited out* (bounded, 30s)
   rather than assumed to be doing this channel's work: it may be installing a
-  different channel, which would leave this one uninstalled.
+  different channel, which would leave this one uninstalled. The updater needs
+  it because `swapDarwinBundles`' non-`RENAME_SWAP` fallback leaves the bundle
+  briefly absent, and an installer looking in that gap would read the
+  destination as free.
 - **A failed launch does not roll back blindly.** `open` can report an error
   after the replacement started. The installer retakes the singleton to decide:
   if it can, nothing else is running and the previous bundle is restored; if it

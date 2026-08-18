@@ -832,3 +832,31 @@ func TestDarwinInstallDestinationRefusesWhenEveryCandidateIsForeign(t *testing.T
 		t.Fatalf("no path is free to take, yet it chose %s", dest)
 	}
 }
+
+func TestWithDarwinInstallDirLockSerializesMutations(t *testing.T) {
+	dir := t.TempDir()
+	setDarwinInstallLockTiming(t, 30*time.Millisecond, 5*time.Millisecond)
+
+	ran := false
+	if err := withDarwinInstallDirLock(dir, func() error { ran = true; return nil }); err != nil {
+		t.Fatalf("a free directory should run the mutation: %v", err)
+	}
+	if !ran {
+		t.Fatal("mutation did not run")
+	}
+
+	// Someone else — an installer, or the updater's own swap — holds it.
+	held, acquired, err := tryAcquireAgentInstanceLock(filepath.Join(dir, ".aixinstall.lock"))
+	if err != nil || !acquired {
+		t.Fatalf("could not simulate a holder: %v", err)
+	}
+	defer held.Close()
+
+	ran = false
+	if err := withDarwinInstallDirLock(dir, func() error { ran = true; return nil }); err == nil {
+		t.Fatal("a held directory must not run the mutation")
+	}
+	if ran {
+		t.Fatal("the mutation ran while another process held the destination")
+	}
+}

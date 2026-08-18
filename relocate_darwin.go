@@ -449,6 +449,21 @@ func waitForDarwinInstallDirLock(dir string) (unlock func(), acquired bool) {
 	}
 }
 
+// withDarwinInstallDirLock runs fn while holding dir's install lock, so every
+// mutation of an installed bundle — the DMG install, the legacy relocation and
+// the updater's own swap and rollback — is serialized against the others.
+// Without it, the fallback path in swapDarwinBundles (used when the filesystem
+// has no RENAME_SWAP) leaves the bundle briefly absent, and an installer that
+// looked in that gap would create its own bundle there and strand the update.
+func withDarwinInstallDirLock(dir string, fn func() error) error {
+	unlock, acquired := waitForDarwinInstallDirLock(dir)
+	if !acquired {
+		return fmt.Errorf("another AI Expedite installer has held %s for %s", dir, darwinInstallLockWait)
+	}
+	defer unlock()
+	return fn()
+}
+
 // darwinPlacement is the outcome of moving a staged bundle into place.
 type darwinPlacement int
 
