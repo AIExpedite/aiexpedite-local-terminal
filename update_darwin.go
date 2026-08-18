@@ -32,6 +32,7 @@ var (
 	acquireAgentInstanceAfterDarwinHandoff = acquireAgentInstance
 	quitAfterDarwinHandoff                 = systray.Quit
 	extractDarwinTeamID                    = darwinTeamID
+	atomicSwapDarwinFn                     = atomicSwapDarwin
 )
 
 // atomicSwapDarwin performs an atomic rename swap between two paths on Darwin
@@ -66,9 +67,12 @@ func swapDarwinBundles(currentBundle, staged, backup string) error {
 	_ = os.RemoveAll(backup)
 	// Try atomic filesystem exchange first (APFS / macOS 10.12+).
 	// This leaves zero window where currentBundle is absent.
-	if err := atomicSwapDarwin(staged, currentBundle); err == nil {
+	if err := atomicSwapDarwinFn(staged, currentBundle); err == nil {
 		if err := os.Rename(staged, backup); err != nil {
-			_ = os.RemoveAll(staged)
+			if rbErr := atomicSwapDarwinFn(staged, currentBundle); rbErr != nil {
+				return fmt.Errorf("failed to archive replaced bundle (%v) and rollback failed (%v)", err, rbErr)
+			}
+			return fmt.Errorf("cannot move replaced bundle to backup: %w", err)
 		}
 		return nil
 	}

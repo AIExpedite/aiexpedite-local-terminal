@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -247,5 +248,144 @@ func TestVerifyDarwinSigningTeam(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSwapDarwinBundles_AtomicExchangeArchivesBackup(t *testing.T) {
+	prevSwap := atomicSwapDarwinFn
+	t.Cleanup(func() {
+		atomicSwapDarwinFn = prevSwap
+	})
+
+	dir := t.TempDir()
+	current := filepath.Join(dir, "AI Expedite.app")
+	staged := filepath.Join(dir, ".aixupd_staged_AI Expedite.app")
+	backup := filepath.Join(dir, ".aixupd_old_AI Expedite.app")
+
+	if err := os.WriteFile(current, []byte("old-version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, []byte("new-version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	atomicSwapDarwinFn = func(path1, path2 string) error {
+		tmp := filepath.Join(dir, "swap_tmp")
+		if err := os.Rename(path1, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(path2, path1); err != nil {
+			_ = os.Rename(tmp, path1)
+			return err
+		}
+		if err := os.Rename(tmp, path2); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if err := swapDarwinBundles(current, staged, backup); err != nil {
+		t.Fatalf("swapDarwinBundles failed: %v", err)
+	}
+
+	curData, _ := os.ReadFile(current)
+	if string(curData) != "new-version" {
+		t.Fatalf("current bundle data = %q, want new-version", curData)
+	}
+	backupData, _ := os.ReadFile(backup)
+	if string(backupData) != "old-version" {
+		t.Fatalf("backup bundle data = %q, want old-version", backupData)
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Fatalf("staged bundle should not exist after archive, got stat err: %v", err)
+	}
+}
+
+func TestSwapDarwinBundles_AtomicExchangeRollsBackWhenBackupFails(t *testing.T) {
+	prevSwap := atomicSwapDarwinFn
+	t.Cleanup(func() {
+		atomicSwapDarwinFn = prevSwap
+	})
+
+	dir := t.TempDir()
+	current := filepath.Join(dir, "AI Expedite.app")
+	staged := filepath.Join(dir, ".aixupd_staged_AI Expedite.app")
+	backup := filepath.Join(dir, "nonexistent_dir", "sub", "backup.app")
+
+	if err := os.WriteFile(current, []byte("old-version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, []byte("new-version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	swapCount := 0
+	atomicSwapDarwinFn = func(path1, path2 string) error {
+		swapCount++
+		tmp := filepath.Join(dir, fmt.Sprintf("swap_tmp_%d", swapCount))
+		if err := os.Rename(path1, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(path2, path1); err != nil {
+			_ = os.Rename(tmp, path1)
+			return err
+		}
+		if err := os.Rename(tmp, path2); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	err := swapDarwinBundles(current, staged, backup)
+	if err == nil {
+		t.Fatal("expected error when backup rename fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot move replaced bundle to backup") {
+		t.Fatalf("error = %q, want 'cannot move replaced bundle to backup'", err.Error())
+	}
+	if swapCount != 2 {
+		t.Fatalf("swapCount = %d, want 2 (1 swap + 1 rollback)", swapCount)
+	}
+
+	curData, _ := os.ReadFile(current)
+	if string(curData) != "old-version" {
+		t.Fatalf("current bundle data = %q, want rolled back old-version", curData)
+	}
+	stagedData, _ := os.ReadFile(staged)
+	if string(stagedData) != "new-version" {
+		t.Fatalf("staged bundle data = %q, want new-version", stagedData)
+	}
+}
+
+func TestSwapDarwinBundles_FallbackRenameRollsBack(t *testing.T) {
+	prevSwap := atomicSwapDarwinFn
+	t.Cleanup(func() {
+		atomicSwapDarwinFn = prevSwap
+	})
+
+	atomicSwapDarwinFn = func(path1, path2 string) error {
+		return errors.New("atomic swap not supported")
+	}
+
+	dir := t.TempDir()
+	current := filepath.Join(dir, "AI Expedite.app")
+	staged := filepath.Join(dir, "nonexistent_staged.app")
+	backup := filepath.Join(dir, ".aixupd_old_AI Expedite.app")
+
+	if err := os.WriteFile(current, []byte("old-version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := swapDarwinBundles(current, staged, backup)
+	if err == nil {
+		t.Fatal("expected error when staged rename fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot move new bundle into place") {
+		t.Fatalf("error = %q, want 'cannot move new bundle into place'", err.Error())
+	}
+
+	curData, _ := os.ReadFile(current)
+	if string(curData) != "old-version" {
+		t.Fatalf("current bundle data = %q, want rolled back old-version", curData)
 	}
 }
