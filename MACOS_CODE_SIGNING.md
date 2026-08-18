@@ -156,7 +156,13 @@ Guards keep that from firing when it shouldn't:
   same `.aixupd_old_*` / `.aixinstall_old_*` artifacts an in-flight swap is
   relying on as its rollback copy, so it must not run beside a live installer or
   update. It also sweeps `*.aixinstall_new-<pid>` staging directories a killed
-  installer left behind.
+  installer left behind. Correspondingly, the updater holds that lock from
+  before its swap until the relaunch outcome is known — its rollback copy is
+  live for that whole stretch, and the replacement runs a recovery pass as soon
+  as it takes the singleton, which the updater releases before relaunching.
+  Because flock is per-descriptor, the rollback inside
+  `handleFailedDarwinRelaunch` must NOT re-take that lock; the caller already
+  holds it (`TestFailedDarwinRelaunchRollsBackUnderTheCallersInstallLock`).
 - **A failed launch does not roll back blindly.** `open` can report an error
   after the replacement started. The installer retakes the singleton to decide:
   if it can, nothing else is running and the previous bundle is restored; if it
