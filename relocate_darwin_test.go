@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestLaunchRelocatedDarwinBundleWaitsForOpenResult(t *testing.T) {
@@ -270,16 +272,37 @@ func stubAgentInstanceForInstall(t *testing.T, acquired bool) *bool {
 	return &released
 }
 
-// newFakeDarwinBundle creates <dir>/<name>/Contents/MacOS/<binary> and returns
-// the bundle and executable paths.
+// testBundleID is the identifier the fake bundles below are signed with —
+// the channel under test.
+const testBundleID = "com.aiexpedite.terminal"
+
+// newFakeDarwinBundle creates <dir>/<name>/Contents/MacOS/<binary> plus an
+// Info.plist carrying testBundleID, and returns the bundle and exe paths.
 func newFakeDarwinBundle(t *testing.T, dir, marker string) (bundle, exe string) {
 	t.Helper()
-	bundle = filepath.Join(dir, defaultDarwinBundleName)
+	return newFakeDarwinBundleAs(t, dir, defaultDarwinBundleName, marker, testBundleID)
+}
+
+// newFakeDarwinBundleAs is newFakeDarwinBundle with an explicit bundle name and
+// identifier, for cross-channel cases.
+func newFakeDarwinBundleAs(t *testing.T, dir, name, marker, bundleID string) (bundle, exe string) {
+	t.Helper()
+	bundle = filepath.Join(dir, name)
 	exe = filepath.Join(bundle, "Contents", "MacOS", "AIExpediteTerminal")
 	if err := os.MkdirAll(filepath.Dir(exe), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(exe, []byte(marker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>%s</string>
+<key>CFBundleExecutable</key><string>AIExpediteTerminal</string>
+</dict></plist>
+`, bundleID)
+	if err := os.WriteFile(filepath.Join(bundle, "Contents", "Info.plist"), []byte(plist), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return bundle, exe
@@ -481,5 +504,149 @@ func TestInstallDarwinFromMediaInstallsWhenNothingIsInstalledYet(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(userApps, defaultDarwinBundleName)); err != nil {
 		t.Fatalf("expected a fresh install at %s: %v", userApps, err)
+	}
+}
+
+func TestChannelScopedDarwinBundleName(t *testing.T) {
+	// EnvConfigSuffix is "" in tests (prod), so the scoped name is -Prod.
+	if got := channelScopedDarwinBundleName("AIExpediteTerminal.app"); got != "AIExpediteTerminal-Prod.app" {
+		t.Fatalf("unexpected scoped name %q", got)
+	}
+	if got := channelScopedDarwinBundleName("AIExpediteTerminal-Prod.app"); got != "AIExpediteTerminal-Prod.app" {
+		t.Fatalf("an already-scoped name must not be scoped twice, got %q", got)
+	}
+}
+
+func TestInstallDarwinFromMediaNeverOverwritesAnotherChannel(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubDarwinInstallTools(t, 0)
+
+	userApps := filepath.Join(home, "Applications")
+	if err := os.MkdirAll(userApps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A dev install occupies the shared bundle name. Its singleton is a
+	// different lock, so nothing else stops this install from eating it.
+	_, devExe := newFakeDarwinBundleAs(t, userApps, defaultDarwinBundleName, "dev", "com.aiexpedite.terminal-Dev")
+
+	media := filepath.Join(t.TempDir(), "AppTranslocation", "d")
+	if err := os.MkdirAll(media, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle, exe := newFakeDarwinBundle(t, media, "prod")
+
+	if !installDarwinFromMedia(bundle, exe, userApps) {
+		t.Fatal("install should proceed alongside the other channel")
+	}
+
+	got, err := os.ReadFile(devExe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "dev" {
+		t.Fatalf("the other channel's install must be untouched, got %q", got)
+	}
+	scoped := filepath.Join(userApps, channelScopedDarwinBundleName(defaultDarwinBundleName))
+	if _, err := os.Stat(scoped); err != nil {
+		t.Fatalf("expected this channel to install alongside at %s: %v", scoped, err)
+	}
+}
+
+func TestInstallDarwinFromMediaStaysAtItsScopedName(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubDarwinInstallTools(t, 0)
+
+	userApps := filepath.Join(home, "Applications")
+	if err := os.MkdirAll(userApps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scopedName := channelScopedDarwinBundleName(defaultDarwinBundleName)
+	_, scopedExe := newFakeDarwinBundleAs(t, userApps, scopedName, "old", testBundleID)
+
+	media := filepath.Join(t.TempDir(), "AppTranslocation", "d")
+	if err := os.MkdirAll(media, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle, exe := newFakeDarwinBundle(t, media, "new")
+
+	if !installDarwinFromMedia(bundle, exe, userApps) {
+		t.Fatal("install should update the existing scoped copy")
+	}
+
+	got, err := os.ReadFile(scopedExe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("expected the scoped install to be updated in place, got %q", got)
+	}
+	// The now-free plain name must NOT collect a second copy of this channel.
+	if _, err := os.Stat(filepath.Join(userApps, defaultDarwinBundleName)); !os.IsNotExist(err) {
+		t.Fatal("install forked into a second copy at the plain name")
+	}
+}
+
+func TestInstallDarwinFromMediaYieldsToALauncherThatWonTheRace(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	openLog := stubDarwinInstallTools(t, 0)
+	stubAgentInstanceForInstall(t, false) // no lock: create-only
+
+	userApps := filepath.Join(home, "Applications")
+	if err := os.MkdirAll(userApps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(userApps, defaultDarwinBundleName)
+
+	media := filepath.Join(t.TempDir(), "AppTranslocation", "d")
+	if err := os.MkdirAll(media, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle, exe := newFakeDarwinBundle(t, media, "loser")
+
+	// The winner lands its install (and starts it) while this one is copying.
+	previous := exclusiveRenameDarwin
+	exclusiveRenameDarwin = func(src, dst string) error {
+		newFakeDarwinBundleAs(t, userApps, defaultDarwinBundleName, "winner", testBundleID)
+		return previous(src, dst)
+	}
+	t.Cleanup(func() { exclusiveRenameDarwin = previous })
+
+	if !installDarwinFromMedia(bundle, exe, userApps) {
+		t.Fatal("the winner's install is authoritative, so this process must exit")
+	}
+
+	got, err := os.ReadFile(filepath.Join(dest, "Contents", "MacOS", "AIExpediteTerminal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "winner" {
+		t.Fatalf("a lockless install must never replace the winner, got %q", got)
+	}
+	if _, err := os.Stat(openLog); !os.IsNotExist(err) {
+		t.Fatal("the loser must not launch a second agent")
+	}
+}
+
+func TestExclusiveRenameDarwinRefusesAnExistingDestination(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dst := filepath.Join(dir, "dst")
+	for _, p := range []string{src, dst} {
+		if err := os.MkdirAll(filepath.Join(p, "Contents"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := exclusiveRenameDarwin(src, dst); !errors.Is(err, unix.EEXIST) {
+		t.Fatalf("expected EEXIST for an occupied destination, got %v", err)
+	}
+	if _, err := os.Stat(src); err != nil {
+		t.Fatalf("a refused rename must leave the source in place: %v", err)
+	}
+	fresh := filepath.Join(dir, "fresh")
+	if err := exclusiveRenameDarwin(src, fresh); err != nil {
+		t.Fatalf("rename to a free path should succeed: %v", err)
 	}
 }
