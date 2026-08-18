@@ -490,8 +490,13 @@ jobs:
           appname = os.path.basename(application)
           format = "UDZO"
           files = [application]
-          # Do not add the conventional /Applications shortcut: this app must
-          # be copied to the user's ~/Applications directory for silent updates.
+          # No /Applications shortcut on purpose: a machine-wide copy needs an
+          # admin prompt and cannot be replaced silently by the auto-updater.
+          # The app installs ITSELF into ~/Applications the first time it is
+          # launched from this image (installDarwinFromMedia in
+          # relocate_darwin.go), so the background says "double-click to
+          # install" and there is nothing to drag to. Keep icon_locations and
+          # window_rect in sync with scripts/generate-dmg-background.py.
           symlinks = {}
           icon = defines.get("volume_icon", None)
           icon_size = 100
