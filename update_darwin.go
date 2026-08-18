@@ -70,6 +70,12 @@ func swapDarwinBundles(currentBundle, staged, backup string) error {
 	if err := atomicSwapDarwinFn(staged, currentBundle); err == nil {
 		if err := os.Rename(staged, backup); err != nil {
 			if rbErr := atomicSwapDarwinFn(staged, currentBundle); rbErr != nil {
+				// staged still holds the previous working bundle. Move it off
+				// that path before returning so applyVerifiedUpdate's
+				// defer os.RemoveAll(staged) cannot delete the only rollback copy.
+				if presErr := preserveDarwinSwappedOutBundle(staged, backup); presErr != nil {
+					return fmt.Errorf("failed to archive replaced bundle (%v) and rollback failed (%v); previous bundle could not be preserved (%v)", err, rbErr, presErr)
+				}
 				return fmt.Errorf("failed to archive replaced bundle (%v) and rollback failed (%v)", err, rbErr)
 			}
 			return fmt.Errorf("cannot move replaced bundle to backup: %w", err)
@@ -86,6 +92,26 @@ func swapDarwinBundles(currentBundle, staged, backup string) error {
 			return fmt.Errorf("swap failed (%v) AND rollback failed (%v)", err, rbErr)
 		}
 		return fmt.Errorf("cannot move new bundle into place: %w", err)
+	}
+	return nil
+}
+
+// preserveDarwinSwappedOutBundle moves the previous bundle off the staged path
+// after a successful atomic swap whose archive and reverse-swap both failed.
+// Prefer the standard backup location so later recovery can restore it; if
+// that path is unusable, park the bundle next to staged so RemoveAll(staged)
+// is a no-op.
+func preserveDarwinSwappedOutBundle(staged, backup string) error {
+	if err := os.MkdirAll(filepath.Dir(backup), 0o700); err == nil {
+		_ = os.RemoveAll(backup)
+		if err := os.Rename(staged, backup); err == nil {
+			return nil
+		}
+	}
+	recovery := staged + ".previous"
+	_ = os.RemoveAll(recovery)
+	if err := os.Rename(staged, recovery); err != nil {
+		return err
 	}
 	return nil
 }

@@ -389,3 +389,127 @@ func TestSwapDarwinBundles_FallbackRenameRollsBack(t *testing.T) {
 		t.Fatalf("current bundle data = %q, want rolled back old-version", curData)
 	}
 }
+
+func TestSwapDarwinBundles_PreservesOldBundleWhenRollbackFails(t *testing.T) {
+	prevSwap := atomicSwapDarwinFn
+	t.Cleanup(func() {
+		atomicSwapDarwinFn = prevSwap
+	})
+
+	dir := t.TempDir()
+	current := filepath.Join(dir, "AI Expedite.app")
+	staged := filepath.Join(dir, ".aixupd_staged_AI Expedite.app")
+	backup := filepath.Join(dir, "nonexistent_dir", "sub", "backup.app")
+
+	if err := os.WriteFile(current, []byte("old-version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, []byte("new-version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	swapCount := 0
+	atomicSwapDarwinFn = func(path1, path2 string) error {
+		swapCount++
+		if swapCount > 1 {
+			return errors.New("rollback swap failed")
+		}
+		tmp := filepath.Join(dir, "swap_tmp")
+		if err := os.Rename(path1, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(path2, path1); err != nil {
+			_ = os.Rename(tmp, path1)
+			return err
+		}
+		if err := os.Rename(tmp, path2); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	err := swapDarwinBundles(current, staged, backup)
+	if err == nil {
+		t.Fatal("expected error when archive and rollback both fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "rollback failed") {
+		t.Fatalf("error = %q, want rollback-failed report", err.Error())
+	}
+
+	// Mimic applyVerifiedUpdate's defer os.RemoveAll(staged).
+	_ = os.RemoveAll(staged)
+
+	curData, readErr := os.ReadFile(current)
+	if readErr != nil {
+		t.Fatalf("installed bundle missing: %v", readErr)
+	}
+	if string(curData) != "new-version" {
+		t.Fatalf("current bundle data = %q, want new-version left in place", curData)
+	}
+	backupData, readErr := os.ReadFile(backup)
+	if readErr != nil {
+		t.Fatalf("previous bundle was not preserved at backup: %v", readErr)
+	}
+	if string(backupData) != "old-version" {
+		t.Fatalf("preserved backup data = %q, want old-version", backupData)
+	}
+}
+
+func TestSwapDarwinBundles_ParksOldBundleWhenBackupUnusable(t *testing.T) {
+	prevSwap := atomicSwapDarwinFn
+	t.Cleanup(func() {
+		atomicSwapDarwinFn = prevSwap
+	})
+
+	dir := t.TempDir()
+	current := filepath.Join(dir, "AI Expedite.app")
+	staged := filepath.Join(dir, ".aixupd_staged_AI Expedite.app")
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("not-a-dir"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(blocker, "backup.app")
+
+	if err := os.WriteFile(current, []byte("old-version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, []byte("new-version"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	swapCount := 0
+	atomicSwapDarwinFn = func(path1, path2 string) error {
+		swapCount++
+		if swapCount > 1 {
+			return errors.New("rollback swap failed")
+		}
+		tmp := filepath.Join(dir, "swap_tmp")
+		if err := os.Rename(path1, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(path2, path1); err != nil {
+			_ = os.Rename(tmp, path1)
+			return err
+		}
+		if err := os.Rename(tmp, path2); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	err := swapDarwinBundles(current, staged, backup)
+	if err == nil {
+		t.Fatal("expected error when archive, rollback, and backup path all fail")
+	}
+
+	_ = os.RemoveAll(staged)
+
+	parked := staged + ".previous"
+	parkedData, readErr := os.ReadFile(parked)
+	if readErr != nil {
+		t.Fatalf("previous bundle was not parked next to staged: %v", readErr)
+	}
+	if string(parkedData) != "old-version" {
+		t.Fatalf("parked bundle data = %q, want old-version", parkedData)
+	}
+}
