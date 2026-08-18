@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -149,6 +150,17 @@ func maybeRelocateInstall(_ *Config) bool {
 		fmt.Printf("[relocate] Cannot create %s: %v\n", userApps, err)
 		return false
 	}
+	// Same destination, same lock as the DMG install: without it a concurrent
+	// image install can land its bundle between the ownership decision below
+	// and the move that acts on it.
+	unlockDir, dirLocked := waitForDarwinInstallDirLock(userApps)
+	if !dirLocked {
+		fmt.Printf("[relocate] %s stayed busy for %s; leaving the machine-wide copy in place\n",
+			userApps, darwinInstallLockWait)
+		return false
+	}
+	defer unlockDir()
+
 	// Same shared-bundle-name hazard as the DMG install: every channel packages
 	// AIExpediteTerminal.app, so a legacy machine-wide install must not land on
 	// top of a different channel's per-user bundle.
@@ -198,8 +210,12 @@ func maybeRelocateInstall(_ *Config) bool {
 		fmt.Printf("[relocate] ditto copy failed: %v\n", err)
 		return false
 	}
-	if err := os.Rename(staged, dest); err != nil {
-		if info, statErr := os.Stat(dest); statErr == nil && info.IsDir() {
+	// Create-only, and hand over ONLY to this channel's own bundle: a directory
+	// at dest is not proof that a relocation of THIS channel won the race, and
+	// launching another channel's app would start the wrong agent.
+	if err := exclusiveRenameDarwin(staged, dest); err != nil {
+		if errors.Is(err, unix.EEXIST) &&
+			darwinDestinationState(dest, sourceID) == darwinDestinationOurs {
 			fmt.Printf("[relocate] Concurrent relocation won by another launcher; handing over to %s\n", dest)
 			if err := launchRelocatedDarwinBundle(dest, true); err != nil {
 				fmt.Printf("[relocate] Failed to launch concurrent per-user copy: %v\n", err)
@@ -409,6 +425,30 @@ func lockDarwinInstallDir(dir string) (unlock func(), acquired bool) {
 	}, true
 }
 
+var (
+	darwinInstallLockWait = 30 * time.Second
+	darwinInstallLockPoll = 250 * time.Millisecond
+)
+
+// waitForDarwinInstallDirLock takes the destination lock, waiting a concurrent
+// installer out rather than assuming it is doing this channel's work: an
+// installer for a DIFFERENT channel places a different bundle and would leave
+// this one uninstalled. Bounded, so a stuck holder can never keep the app from
+// starting.
+func waitForDarwinInstallDirLock(dir string) (unlock func(), acquired bool) {
+	deadline := time.Now().Add(darwinInstallLockWait)
+	for {
+		unlock, ok := lockDarwinInstallDir(dir)
+		if ok {
+			return unlock, true
+		}
+		if !time.Now().Before(deadline) {
+			return func() {}, false
+		}
+		time.Sleep(darwinInstallLockPoll)
+	}
+}
+
 // darwinPlacement is the outcome of moving a staged bundle into place.
 type darwinPlacement int
 
@@ -511,11 +551,13 @@ func installDarwinFromMedia(bundle, exe, userApps string) bool {
 	// whichever channel it belongs to. Every ownership check below reads the
 	// destination and acts on it; without this lock another installer can land
 	// a bundle in between.
-	unlockDir, dirLocked := lockDarwinInstallDir(userApps)
+	unlockDir, dirLocked := waitForDarwinInstallDirLock(userApps)
 	if !dirLocked {
-		fmt.Printf("[install] Another installer is already placing a bundle in %s; leaving it to finish\n", userApps)
-		scheduleDarwinVolumeEject(bundle)
-		return true
+		// Waited out: the holder may be installing a different channel, which
+		// would leave this one uninstalled, so exiting here is not an option.
+		fmt.Printf("[install] %s stayed busy for %s; not installing\n", userApps, darwinInstallLockWait)
+		notifyDarwinInstallBusy()
+		return false
 	}
 	defer unlockDir()
 
@@ -676,6 +718,12 @@ func notifyDarwin(body string) {
 // do nothing: a running agent owns the install and must be quit first.
 func notifyDarwinInstallSkipped() {
 	notifyDarwin("Already installed and running. Quit it from the menu bar first to install this copy.")
+}
+
+// notifyDarwinInstallBusy explains that another installer held the destination
+// for too long, so this image installed nothing.
+func notifyDarwinInstallBusy() {
+	notifyDarwin("Could not install right now — another installer is busy. Open this image again in a moment.")
 }
 
 // notifyDarwinInstallBlocked explains that the install location is held by a

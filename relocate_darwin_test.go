@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -669,17 +670,62 @@ func stubAgentInstanceSequence(t *testing.T, results ...bool) {
 	t.Cleanup(func() { acquireAgentInstanceForInstall = previous })
 }
 
+// setDarwinInstallLockTiming shrinks the destination-lock wait so the tests
+// below do not spend the production timeout.
+func setDarwinInstallLockTiming(t *testing.T, wait, poll time.Duration) {
+	t.Helper()
+	previousWait, previousPoll := darwinInstallLockWait, darwinInstallLockPoll
+	darwinInstallLockWait, darwinInstallLockPoll = wait, poll
+	t.Cleanup(func() { darwinInstallLockWait, darwinInstallLockPoll = previousWait, previousPoll })
+}
+
 func TestInstallDarwinFromMediaWaitsOutAnotherInstaller(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	stubDarwinInstallTools(t, 0)
+	setDarwinInstallLockTiming(t, darwinInstallLockWait, 10*time.Millisecond)
 
 	userApps := filepath.Join(home, "Applications")
 	if err := os.MkdirAll(userApps, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Another installer — possibly from a different channel, whose singleton
-	// is a different lock entirely — is placing a bundle right now.
+	// Another installer holds the directory. It may well be installing a
+	// DIFFERENT channel, which would do nothing for this one, so this install
+	// has to wait rather than treat it as the job being done.
+	held, acquired, err := tryAcquireAgentInstanceLock(filepath.Join(userApps, ".aixinstall.lock"))
+	if err != nil || !acquired {
+		t.Fatalf("could not simulate a competing installer: %v", err)
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		_ = unlockFile(held)
+		_ = held.Close()
+	}()
+
+	media := filepath.Join(t.TempDir(), "AppTranslocation", "d")
+	if err := os.MkdirAll(media, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle, exe := newFakeDarwinBundle(t, media, "new")
+
+	if !installDarwinFromMedia(bundle, exe, userApps) {
+		t.Fatal("install should proceed once the other installer is done")
+	}
+	if _, err := os.Stat(filepath.Join(userApps, defaultDarwinBundleName)); err != nil {
+		t.Fatalf("expected the install to land after waiting: %v", err)
+	}
+}
+
+func TestInstallDarwinFromMediaGivesUpOnAWedgedInstaller(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubDarwinInstallTools(t, 0)
+	setDarwinInstallLockTiming(t, 30*time.Millisecond, 5*time.Millisecond)
+
+	userApps := filepath.Join(home, "Applications")
+	if err := os.MkdirAll(userApps, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	held, acquired, err := tryAcquireAgentInstanceLock(filepath.Join(userApps, ".aixinstall.lock"))
 	if err != nil || !acquired {
 		t.Fatalf("could not simulate a competing installer: %v", err)
@@ -692,11 +738,13 @@ func TestInstallDarwinFromMediaWaitsOutAnotherInstaller(t *testing.T) {
 	}
 	bundle, exe := newFakeDarwinBundle(t, media, "new")
 
-	if !installDarwinFromMedia(bundle, exe, userApps) {
-		t.Fatal("the other installer is finishing the job; this process must exit")
+	// Nothing was installed, so the app must keep running from the image
+	// instead of exiting into nothing.
+	if installDarwinFromMedia(bundle, exe, userApps) {
+		t.Fatal("a wedged installer must not be reported as a completed install")
 	}
 	if _, err := os.Stat(filepath.Join(userApps, defaultDarwinBundleName)); !os.IsNotExist(err) {
-		t.Fatal("nothing may be placed while another installer holds the directory lock")
+		t.Fatal("nothing may be placed while another installer holds the lock")
 	}
 }
 
