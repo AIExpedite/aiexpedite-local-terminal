@@ -103,6 +103,11 @@ var RegistrationInvalidChan = make(chan bool, 1)
 func SetAllowExit() {}
 
 // launchAgentTemplate is the plist content for macOS login-item auto-start.
+// AssociatedBundleIdentifiers ties the job to our .app so System Settings ›
+// General › Login Items & Extensions lists it under the app's name and icon.
+// Without it macOS cannot tell which app owns the agent and falls back to
+// grouping the entry under the signing team ("AI Expedite Inc.") with a blank
+// placeholder icon.
 var launchAgentTemplate = template.Must(template.New("plist").Parse(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -113,6 +118,12 @@ var launchAgentTemplate = template.Must(template.New("plist").Parse(`<?xml versi
 	<array>
 		<string>{{.ExePath}}</string>
 	</array>
+{{- if .BundleID}}
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>{{.BundleID}}</string>
+	</array>
+{{- end}}
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
@@ -120,6 +131,23 @@ var launchAgentTemplate = template.Must(template.New("plist").Parse(`<?xml versi
 </dict>
 </plist>
 `))
+
+// darwinLaunchAgentBundleID returns the bundle identifier to associate the
+// login item with, or "" when the binary is not running from a .app (a `go
+// run` build has no bundle to point at, and naming one that isn't installed
+// would leave the entry blank again).
+func darwinLaunchAgentBundleID(exePath string) string {
+	bundle := darwinBundlePath(exePath)
+	if bundle == "" {
+		return ""
+	}
+	if id, err := darwinBundleIdentifier(bundle); err == nil && id != "" {
+		return id
+	}
+	// The bundle exists but its Info.plist could not be read; fall back to the
+	// identifier the release workflow stamps for this channel.
+	return "com.aiexpedite.terminal" + EnvConfigSuffix
+}
 
 // ensureAutoStart creates a LaunchAgent plist so the app starts at login,
 // pointing at the currently-running binary.
@@ -161,11 +189,13 @@ func writeDarwinLaunchAgentFor(exePath string) error {
 	defer f.Close()
 
 	data := struct {
-		Label   string
-		ExePath string
+		Label    string
+		ExePath  string
+		BundleID string
 	}{
-		Label:   label,
-		ExePath: exePath,
+		Label:    label,
+		ExePath:  exePath,
+		BundleID: darwinLaunchAgentBundleID(exePath),
 	}
 
 	if err := launchAgentTemplate.Execute(f, data); err != nil {
