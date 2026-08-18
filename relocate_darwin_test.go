@@ -97,6 +97,28 @@ func TestRecoverDarwinAppBundle(t *testing.T) {
 	}
 }
 
+func TestRecoverDarwinAppBundleRestoresInstallerBackup(t *testing.T) {
+	dir := t.TempDir()
+	bundleName := "AI Expedite Dev.app"
+
+	target := filepath.Join(dir, bundleName)
+	// An installer interrupted mid-fallback-swap leaves the previous bundle
+	// parked under .aixinstall_old_ with the target path absent.
+	installBackup := filepath.Join(dir, ".aixinstall_old_"+bundleName)
+	if err := os.MkdirAll(installBackup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	recoverDarwinAppBundle(dir, bundleName)
+
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("expected installer backup to be restored to target %s: %v", target, err)
+	}
+	if _, err := os.Stat(installBackup); !os.IsNotExist(err) {
+		t.Fatalf("expected installer backup %s to be gone after restore", installBackup)
+	}
+}
+
 func TestMaybeRelocateInstallDoesNotCleanInFlightUpdateArtifacts(t *testing.T) {
 	fakeHome := t.TempDir()
 	t.Setenv("HOME", fakeHome)

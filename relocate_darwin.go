@@ -70,6 +70,13 @@ func recoverDarwinAppBundle(dir, bundleName string) {
 	targetPath := filepath.Join(dir, bundleName)
 	backupPath := filepath.Join(dir, ".aixupd_old_"+bundleName)
 	stagedPath := filepath.Join(dir, ".aixupd_staged_"+bundleName)
+	// The DMG installer's fallback swap (swapDarwinBundles on a filesystem
+	// without RENAME_SWAP) moves the previous bundle to .aixinstall_old_ before
+	// renaming the staged copy into place, so an interrupt in that window leaves
+	// the target absent with only this backup to restore from. It uses a
+	// deterministic name (unlike the pid-suffixed .aixinstall_new-* staging dir),
+	// so startup recovery can find and restore it too.
+	installBackupPath := filepath.Join(dir, ".aixinstall_old_"+bundleName)
 
 	targetExists := false
 	if _, err := os.Stat(targetPath); err == nil {
@@ -77,14 +84,15 @@ func recoverDarwinAppBundle(dir, bundleName string) {
 	}
 
 	if !targetExists {
-		// Prefer restoring backup, then staged if backup is absent
-		if _, err := os.Stat(backupPath); err == nil {
-			if err := os.Rename(backupPath, targetPath); err == nil {
-				targetExists = true
+		// Restore the first available leftover: the update backup, then the
+		// update staged copy, then the installer's backup.
+		for _, src := range []string{backupPath, stagedPath, installBackupPath} {
+			if _, err := os.Stat(src); err != nil {
+				continue
 			}
-		} else if _, err := os.Stat(stagedPath); err == nil {
-			if err := os.Rename(stagedPath, targetPath); err == nil {
+			if err := os.Rename(src, targetPath); err == nil {
 				targetExists = true
+				break
 			}
 		}
 	}
@@ -93,6 +101,7 @@ func recoverDarwinAppBundle(dir, bundleName string) {
 	if targetExists {
 		_ = os.RemoveAll(backupPath)
 		_ = os.RemoveAll(stagedPath)
+		_ = os.RemoveAll(installBackupPath)
 	}
 }
 
