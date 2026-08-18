@@ -535,13 +535,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 	// which can differ from `Seq` order (the two producers race seq-assign vs
 	// enqueue); the orchestrator sorts by `Seq`, not by arrival.
 	queue := make(chan resultMsg, codexAppServerPublishQueueSize)
-	publisherDone := make(chan struct{})
-	go func() {
-		defer close(publisherDone)
-		for msg := range queue {
-			publishFn(msg)
-		}
-	}()
+	publisherDone := startTrackedTerminalPublisher(queue, publishFn)
 	// Close queue after both scanners finish so the publisher goroutine drains
 	// every remaining frame before signalling streamDone.
 	defer func() {
@@ -825,7 +819,7 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	// session slot (delaying removeSession below) and slow EndSession-style
 	// callers waiting on session.done. Mirrors session.go's session_ended
 	// publish pattern.
-	go publishFn(resultMsg{
+	publishTerminalResultAsync(publishFn, resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,

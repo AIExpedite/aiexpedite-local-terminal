@@ -498,13 +498,7 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 	defer close(session.streamDone)
 
 	queue := make(chan resultMsg, claudeNativePublishQueueSize)
-	publisherDone := make(chan struct{})
-	go func() {
-		defer close(publisherDone)
-		for msg := range queue {
-			publishFn(msg)
-		}
-	}()
+	publisherDone := startTrackedTerminalPublisher(queue, publishFn)
 	defer func() {
 		close(queue)
 		<-publisherDone
@@ -733,7 +727,7 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 
 	seq := atomic.AddInt64(&session.seq, 1)
 
-	go publishFn(resultMsg{
+	publishTerminalResultAsync(publishFn, resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,

@@ -6,11 +6,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestVerifyBuildProvenance_RejectsInvalidHex(t *testing.T) {
@@ -50,7 +53,7 @@ type rewriteTransport struct{ baseURL string }
 func (rt *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Construct a new request to the test server with the original path.
 	newURL := rt.baseURL + req.URL.Path
-	newReq, err := http.NewRequest(req.Method, newURL, req.Body)
+	newReq, err := http.NewRequestWithContext(req.Context(), req.Method, newURL, req.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -139,5 +142,36 @@ func TestVerifyBuildProvenance_EnvVarBypass(t *testing.T) {
 	// Caller distinguishes via errors.Is — verify the sentinel is returned.
 	if err.Error() != errAttestationDisabled.Error() {
 		t.Errorf("expected errAttestationDisabled, got: %v", err)
+	}
+}
+
+func TestVerifyBuildProvenance_ContextCancellation(t *testing.T) {
+	requestStarted := make(chan struct{})
+	withMockedAttestationAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-r.Context().Done()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- verifyBuildProvenanceWithContext(ctx, "/tmp/ignored", strings.Repeat("a", 64))
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attestation request did not start")
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("verifyBuildProvenanceWithContext did not return promptly on context cancellation")
 	}
 }

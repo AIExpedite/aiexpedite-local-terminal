@@ -1389,7 +1389,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// race the async stream publishes already in-flight from readOutputStream —
 	// the session_ended message could arrive at the client before the last
 	// streamed lines despite having a higher sequence number.
-	go publishFn(resultMsg{
+	publishTerminalResultAsync(publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
 		UID:          session.UID,

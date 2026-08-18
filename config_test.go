@@ -3,11 +3,96 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
+
+func TestMutateAndSaveSerializesConfigWriters(t *testing.T) {
+	cfg := DefaultConfig()
+	path := filepath.Join(t.TempDir(), "config.json")
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondStarted := make(chan struct{})
+	secondEntered := make(chan struct{})
+	errs := make(chan error, 2)
+
+	go func() {
+		errs <- cfg.MutateAndSave(path, func() {
+			cfg.AgentID = "registered-agent"
+			close(firstEntered)
+			<-releaseFirst
+		})
+	}()
+	<-firstEntered
+	go func() {
+		close(secondStarted)
+		errs <- cfg.MutateAndSave(path, func() {
+			close(secondEntered)
+			cfg.PendingUpdateAttemptID = "attempt-1"
+		})
+	}()
+	<-secondStarted
+
+	select {
+	case <-secondEntered:
+		t.Fatal("second config mutation entered before the first mutation and save completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirst)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.AgentID != "registered-agent" || loaded.PendingUpdateAttemptID != "attempt-1" {
+		t.Fatalf("serialized saves lost a field: agent=%q attempt=%q", loaded.AgentID, loaded.PendingUpdateAttemptID)
+	}
+}
+
+func TestMutateAndSaveRollbackLeavesOriginalFileOnReplaceFailure(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.ProjectID = "original"
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previousReplace := configAtomicReplace
+	configAtomicReplace = func(_, _ string) error { return errors.New("replace failed") }
+	t.Cleanup(func() { configAtomicReplace = previousReplace })
+
+	err = cfg.MutateAndSaveRollback(path, func() {
+		cfg.ProjectID = "new"
+	}, func() {
+		cfg.ProjectID = "original"
+	})
+	if err == nil {
+		t.Fatal("expected replacement failure")
+	}
+	if cfg.ProjectID != "original" {
+		t.Fatalf("in-memory config was not rolled back: %q", cfg.ProjectID)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, original) {
+		t.Fatal("failed atomic replacement modified the existing config file")
+	}
+}
 
 func TestUpdateCLIAgentCatalog_IgnoresMissingCatalog(t *testing.T) {
 	cfg := &Config{}

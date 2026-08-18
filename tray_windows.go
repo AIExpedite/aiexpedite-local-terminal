@@ -65,12 +65,6 @@ var (
 
 	// For detecting whether the console window is currently shown
 	procIsWindowVisible = user32.NewProc("IsWindowVisible")
-
-	// For UAC elevation (auto-update in Program Files)
-	shell32             = syscall.NewLazyDLL("shell32.dll")
-	procShellExecuteExW = shell32.NewProc("ShellExecuteExW")
-
-	procGetExitCodeProcess = kernel32.NewProc("GetExitCodeProcess")
 )
 
 // Standard handle constants for GetStdHandle/SetStdHandle
@@ -740,82 +734,7 @@ func unregisterApp() error {
 	return nil
 }
 
-/* ---------- UAC elevation for auto-update ---------- */
-
-// shellExecuteInfo maps to the Windows SHELLEXECUTEINFOW struct.
-type shellExecuteInfo struct {
-	cbSize       uint32
-	fMask        uint32
-	hwnd         uintptr
-	lpVerb       *uint16
-	lpFile       *uint16
-	lpParameters *uint16
-	lpDirectory  *uint16
-	nShow        int32
-	hInstApp     uintptr
-	lpIDList     uintptr
-	lpClass      *uint16
-	hkeyClass    uintptr
-	dwHotKey     uint32
-	hIconOrMon   uintptr
-	hProcess     uintptr
-}
-
-const (
-	seeMaskNoCloseProcess = 0x00000040
-	seErrAccessDenied     = 5
-	infinite              = 0xFFFFFFFF
-)
-
-// runElevatedAndWait launches exe with the given args via UAC elevation ("runas")
-// and waits for the elevated process to exit. Returns an error if the user denies
-// the UAC prompt or the elevated process exits with a non-zero code.
-func runElevatedAndWait(exe, args string) error {
-	verbPtr, _ := syscall.UTF16PtrFromString("runas")
-	exePtr, _ := syscall.UTF16PtrFromString(exe)
-	argsPtr, _ := syscall.UTF16PtrFromString(args)
-
-	sei := shellExecuteInfo{
-		fMask:        seeMaskNoCloseProcess,
-		lpVerb:       verbPtr,
-		lpFile:       exePtr,
-		lpParameters: argsPtr,
-		nShow:        SW_HIDE,
-	}
-	sei.cbSize = uint32(unsafe.Sizeof(sei))
-
-	ret, _, err := procShellExecuteExW.Call(uintptr(unsafe.Pointer(&sei)))
-	if ret == 0 {
-		if sei.hInstApp <= seErrAccessDenied {
-			return fmt.Errorf("UAC elevation denied by user")
-		}
-		return fmt.Errorf("ShellExecuteExW failed: %v", err)
-	}
-
-	if sei.hProcess == 0 {
-		return fmt.Errorf("no process handle returned from elevated launch")
-	}
-	handle := syscall.Handle(sei.hProcess)
-	defer syscall.CloseHandle(handle)
-
-	// Wait for the elevated process to finish
-	event, err := syscall.WaitForSingleObject(handle, infinite)
-	if err != nil {
-		return fmt.Errorf("WaitForSingleObject failed: %w", err)
-	}
-	if event != syscall.WAIT_OBJECT_0 {
-		return fmt.Errorf("WaitForSingleObject returned unexpected event: %d", event)
-	}
-
-	// Check exit code
-	var exitCode uint32
-	ret2, _, err := procGetExitCodeProcess.Call(uintptr(handle), uintptr(unsafe.Pointer(&exitCode)))
-	if ret2 == 0 {
-		return fmt.Errorf("GetExitCodeProcess failed: %v", err)
-	}
-	if exitCode != 0 {
-		return fmt.Errorf("elevated copy process exited with code %d", exitCode)
-	}
-
-	return nil
-}
+// NOTE: the UAC elevation helper (runElevatedAndWait + its SHELLEXECUTEINFOW
+// plumbing) was removed with the move to a per-user install — the auto-update
+// path no longer elevates. Reintroducing elevation here would re-open the exact
+// UAC prompt the silent-update feature exists to eliminate.

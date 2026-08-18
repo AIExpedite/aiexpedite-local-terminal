@@ -60,6 +60,22 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 
 	fmt.Println("[shutdown] Starting graceful shutdown sequence")
 
+	// Stop the updater before any teardown can make a draining device appear
+	// idle. Otherwise an explicit Quit/SIGTERM could launch a replacement and
+	// restart the app while this path is terminating sessions.
+	drainAttemptID := ""
+	updateHandoff := false
+	if globalAutoUpdater != nil {
+		drainAttemptID, updateHandoff = globalAutoUpdater.stopForShutdown()
+	}
+	if updateHandoff {
+		// Replacement won the shutdown race while stopForShutdown waited for an
+		// active apply. It now owns connectivity, so the old process must skip
+		// offline notification and teardown just like onTrayExit's handoff path.
+		fmt.Println("[shutdown] Update handoff completed; skipping ordinary teardown")
+		return
+	}
+
 	// Step 1: Flip local offline state and tell the Pub/Sub loop to stop.
 	// Do not persist OfflineMode here — process exit shouldn't permanently
 	// mark the user as disconnected; persistence is reserved for explicit
@@ -73,6 +89,24 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	// reduces the chance of a pong being mid-flight when notifyOffline
 	// races with a ping that arrived microseconds earlier.
 	time.Sleep(50 * time.Millisecond)
+
+	// Step 1b: If an automatic update was draining when the user quit mid-drain,
+	// abandon the attempt: report the drain as deferred so the service clears
+	// the draining marker rather than leaving it to expire, then follow the
+	// ordinary offline path below. (A manual "Update Now" that supersedes a
+	// drain does NOT reach here — it goes through the update-handoff branch in
+	// onTrayExit, which restarts and reconciles the attempt on next launch.)
+	// Best-effort — an undeliverable report never blocks teardown, and the next
+	// launch's resolveInterruptedAttempt / drain expiry resolves it either way.
+	if cfg != nil && cfg.IsRegistered() && !cfg.OfflineMode && drainAttemptID != "" {
+		exitCtx, exitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := notifyDrainExit(exitCtx, cfg, drainAttemptID, "deferred"); err == nil {
+			clearInterruptedAttempt(cfg, ConfigPath(), drainAttemptID)
+		} else {
+			fmt.Printf("%s[shutdown] notifyDrainExit(deferred) failed: %v%s\n", colorYellow, err, colorReset)
+		}
+		exitCancel()
+	}
 
 	// Step 2: Notify the backend synchronously. We want this to complete
 	// before we kill the sub-processes that the connection relies on.

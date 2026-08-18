@@ -7,7 +7,7 @@ on:
       - main
 
 # Cancel any in-flight nonprod release for the same ref when a newer push lands.
-# Prevents racing tag-delete-and-recreate on `latest-internal` / `latest-dev`.
+# Prevents racing tag-delete-and-recreate on `latest-internal` / `latest-dev` / `latest-stg` / `latest-beta`.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -244,16 +244,19 @@ jobs:
             api_endpoint: "https://api.dev.aiexpedite.com/terminal"
             config_suffix: "-Dev"
             exe_suffix: "-dev"
+            silent_update_capable: "false"
           - env: stg
             display_name: "AI Expedite (Stg)"
             api_endpoint: "https://api.stg.aiexpedite.com/terminal"
             config_suffix: "-Stg"
             exe_suffix: "-stg"
+            silent_update_capable: "false"
           - env: beta
             display_name: "AI Expedite (Beta)"
             api_endpoint: "https://api.beta.aiexpedite.com/terminal"
             config_suffix: "-Beta"
             exe_suffix: "-beta"
+            silent_update_capable: "true"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -279,6 +282,7 @@ jobs:
           LDFLAGS="$LDFLAGS -X main.EnvAPIEndpoint=${{ matrix.api_endpoint }}"
           LDFLAGS="$LDFLAGS -X main.EnvConfigSuffix=${{ matrix.config_suffix }}"
           LDFLAGS="$LDFLAGS -X main.ReleaseChannel=${{ matrix.env }}"
+          LDFLAGS="$LDFLAGS -X main.silentUpdateCapableFlag=${{ matrix.silent_update_capable }}"
 
           CGO_ENABLED=1 GOOS=darwin GOARCH=${{ matrix.goarch }} go build -ldflags "$LDFLAGS" -o "dist/aiexpedite-terminal${{ matrix.exe_suffix }}-darwin-${{ matrix.goarch }}" .
 
@@ -415,6 +419,58 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --display --verbose=4 "$APP"
 
+      # Beta supports silent bundle replacement, so the app inside its DMG
+      # must itself carry a notarization ticket. dev/stg deliberately use the
+      # browser/manual-install fallback and remain signed but unnotarized.
+      - name: Notarize and staple app bundle before packaging (beta)
+        if: matrix.env == 'beta'
+        env:
+          APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
+          TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
+          APP_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PWD }}
+        run: |
+          APP="$PWD/dmg-staging/AIExpediteTerminal.app"
+          ZIP="$RUNNER_TEMP/AIExpediteTerminal-${{ matrix.env }}-${{ matrix.goarch }}.zip"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+          SUBMIT_OUTPUT=$(xcrun notarytool submit "$ZIP" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APP_PASSWORD" \
+            --no-wait \
+            --output-format json)
+          SUBMISSION_ID=$(echo "$SUBMIT_OUTPUT" | python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
+          echo "App notarization submitted as ${SUBMISSION_ID}; polling with heartbeats"
+          ELAPSED=0
+          while [ $ELAPSED -lt 7200 ]; do
+            INFO_OUT=$(xcrun notarytool info "$SUBMISSION_ID" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$TEAM_ID" \
+              --password "$APP_PASSWORD" 2>&1) || true
+            STATUS=$(echo "$INFO_OUT" | awk -F': *' '/^[[:space:]]*status:/ {print $2; exit}')
+            case "$STATUS" in
+              Accepted) break ;;
+              Invalid|Rejected)
+                echo "App notarization $STATUS"
+                xcrun notarytool log "$SUBMISSION_ID" \
+                  --apple-id "$APPLE_ID" --team-id "$TEAM_ID" \
+                  --password "$APP_PASSWORD" || true
+                exit 1
+                ;;
+              "In Progress"|"")
+                if [ $((ELAPSED % 300)) -eq 0 ]; then
+                  echo "App notarization still in progress (${ELAPSED}s elapsed)"
+                fi
+                sleep 60
+                ELAPSED=$((ELAPSED + 60))
+                ;;
+              *) echo "Unexpected app notarization status: $STATUS"; exit 1 ;;
+            esac
+          done
+          [ "$STATUS" = "Accepted" ] || { echo "App notarization timed out"; exit 1; }
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          rm -f "$ZIP"
+
       - name: Cache pip wheels (dmgbuild)
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -434,11 +490,13 @@ jobs:
           appname = os.path.basename(application)
           format = "UDZO"
           files = [application]
-          symlinks = {"Applications": "/Applications"}
+          # Do not add the conventional /Applications shortcut: this app must
+          # be copied to the user's ~/Applications directory for silent updates.
+          symlinks = {}
           icon = defines.get("volume_icon", None)
           icon_size = 100
           background = defines.get("background")
-          icon_locations = {appname: (150, 190), "Applications": (450, 190)}
+          icon_locations = {appname: (300, 190)}
           window_rect = ((200, 120), (600, 400))
           default_view = "icon-view"
           PYEOF
@@ -652,6 +710,7 @@ jobs:
           echo "[${ARCH}] Stapling ${DMG}"
           xcrun stapler staple "${DMG}"
           xcrun stapler validate "${DMG}"
+
           cp "${DMG}" "dist/$(basename "${DMG}")"
 
       - name: Upload final beta darwin DMG
@@ -865,21 +924,47 @@ jobs:
             All environments can run side-by-side on the same machine.
 
   ###############################################################################
-  # Create dev-specific release (non-prerelease for auto-update checking)
+  # Create environment-specific releases (non-prerelease for auto-update checking)
   #
   # NOTE on `needs:`. This depends on the WHOLE build-nonprod matrix (all
-  # envs) succeeding, even though release-dev only consumes dev artifacts.
-  # If a stg or beta windows build fails, dev's release is also blocked.
-  # GHA doesn't natively support per-matrix-entry `needs:` — the workaround
-  # would be to split the windows matrix into three separate jobs
-  # (build-nonprod-dev, -stg, -beta), which doubles the YAML. The current
-  # over-conservative behavior is acceptable: failed runs are uncommon and
-  # the operator can re-run only the failed matrix entry from the GH UI.
+  # envs) succeeding, even though each channel only consumes its own artifacts.
+  # If a build fails, channel releases are blocked.
+  # GHA doesn't natively support per-matrix-entry `needs:` — the current
+  # behavior is acceptable: failed runs are uncommon and the operator can
+  # re-run only the failed matrix entry from the GH UI.
   ###############################################################################
-  release-dev:
-    name: Publish dev release for auto-update
-    needs: [build-nonprod, build-nonprod-darwin, build-nonprod-linux]
+  release-channel:
+    name: Publish ${{ matrix.channel }} release for auto-update
+    needs: [build-nonprod, build-nonprod-darwin, finalize-nonprod-beta-darwin, build-nonprod-linux]
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: dev
+            name: "Development"
+            title: "Dev Build"
+            exe: "aiexpedite-terminal-dev-windows-amd64.exe"
+            installer: "AIExpediteTerminal-Dev-Setup.exe"
+            dmg_intel: "aiexpedite-terminal-dev-darwin-amd64.dmg"
+            dmg_arm: "aiexpedite-terminal-dev-darwin-arm64.dmg"
+            appimage: "aiexpedite-terminal-dev-linux-amd64.AppImage"
+          - channel: stg
+            name: "Staging"
+            title: "Staging Build"
+            exe: "aiexpedite-terminal-stg-windows-amd64.exe"
+            installer: "AIExpediteTerminal-Stg-Setup.exe"
+            dmg_intel: "aiexpedite-terminal-stg-darwin-amd64.dmg"
+            dmg_arm: "aiexpedite-terminal-stg-darwin-arm64.dmg"
+            appimage: "aiexpedite-terminal-stg-linux-amd64.AppImage"
+          - channel: beta
+            name: "Beta"
+            title: "Beta Build"
+            exe: "aiexpedite-terminal-beta-windows-amd64.exe"
+            installer: "AIExpediteTerminal-Beta-Setup.exe"
+            dmg_intel: "aiexpedite-terminal-beta-darwin-amd64.dmg"
+            dmg_arm: "aiexpedite-terminal-beta-darwin-arm64.dmg"
+            appimage: "aiexpedite-terminal-beta-linux-amd64.AppImage"
     permissions:
       contents: write
       id-token: write
@@ -887,10 +972,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Download dev binaries
+      - name: Download ${{ matrix.channel }} binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: nonprod-dev-*
+          pattern: nonprod-${{ matrix.channel }}-*
           path: dist
           merge-multiple: true
 
@@ -899,15 +984,15 @@ jobs:
           cd dist
           sha256sum * > SHA256SUMS
 
-      - name: Generate build provenance attestation (dev artifacts)
+      - name: Generate build provenance attestation (${{ matrix.channel }} artifacts)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
-            dist/aiexpedite-terminal-dev-windows-amd64.exe
-            dist/AIExpediteTerminal-Dev-Setup.exe
-            dist/aiexpedite-terminal-dev-darwin-amd64.dmg
-            dist/aiexpedite-terminal-dev-darwin-arm64.dmg
-            dist/aiexpedite-terminal-dev-linux-amd64.AppImage
+            dist/${{ matrix.exe }}
+            dist/${{ matrix.installer }}
+            dist/${{ matrix.dmg_intel }}
+            dist/${{ matrix.dmg_arm }}
+            dist/${{ matrix.appimage }}
 
       - name: Get short SHA
         id: sha
@@ -920,35 +1005,35 @@ jobs:
           [ -n "$VERSION" ] || { echo "version extraction from agent.go failed"; exit 1; }
           echo "version=v${VERSION}" >> $GITHUB_OUTPUT
 
-      - name: Delete existing dev release and recreate tag
+      - name: Delete existing ${{ matrix.channel }} release and recreate tag
         run: |
-          gh release delete latest-dev --yes || true
-          git push origin :refs/tags/latest-dev || true
-          git tag -d latest-dev || true
-          git tag latest-dev
-          git push origin latest-dev
+          gh release delete latest-${{ matrix.channel }} --yes || true
+          git push origin :refs/tags/latest-${{ matrix.channel }} || true
+          git tag -d latest-${{ matrix.channel }} || true
+          git tag latest-${{ matrix.channel }}
+          git push origin latest-${{ matrix.channel }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish dev release
+      - name: Publish ${{ matrix.channel }} release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          tag_name: latest-dev
-          name: "Dev Build ${{ steps.version.outputs.version }} (${{ steps.sha.outputs.short_sha }})"
+          tag_name: latest-${{ matrix.channel }}
+          name: "${{ matrix.title }} ${{ steps.version.outputs.version }} (${{ steps.sha.outputs.short_sha }})"
           draft: false
-          prerelease: false
+          prerelease: true
           files: dist/**
           body: |
-            ## Development Build
+            ## ${{ matrix.name }} Build
 
-            Auto-update target for dev environment.
+            Auto-update target for ${{ matrix.channel }} environment.
 
             **Version:** ${{ steps.version.outputs.version }}
             **Commit:** ${{ github.sha }}
 
             | Platform | Download |
             |----------|----------|
-            | Windows | `aiexpedite-terminal-dev-windows-amd64.exe` |
-            | macOS (Apple Silicon) | `aiexpedite-terminal-dev-darwin-arm64.dmg` |
-            | macOS (Intel) | `aiexpedite-terminal-dev-darwin-amd64.dmg` |
-            | Linux | `aiexpedite-terminal-dev-linux-amd64.AppImage` |
+            | Windows | `${{ matrix.exe }}` |
+            | macOS (Apple Silicon) | `${{ matrix.dmg_arm }}` |
+            | macOS (Intel) | `${{ matrix.dmg_intel }}` |
+            | Linux | `${{ matrix.appimage }}` |

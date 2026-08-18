@@ -271,26 +271,26 @@ func StartRegistration(cfg *Config) error {
 		return fmt.Errorf("authorization failed: %w", err)
 	}
 
-	// Step 4: Save credentials to config
-	cfg.AgentID = credentials.AgentID
-	cfg.CommandSecret = credentials.AgentSecret
-	cfg.ProjectID = credentials.ProjectID
-	cfg.UserID = credentials.UserID
-	cfg.CommandsSubscription = credentials.CommandsSubscription
-	cfg.ResultsTopic = credentials.ResultsTopic
-	cfg.DeviceName = deviceName
-	cfg.RegisteredAt = time.Now().Format(time.RFC3339)
-	// Workload Identity Federation config for GCP authentication
-	cfg.TokenEndpoint = credentials.TokenEndpoint
-	cfg.WIFAudience = credentials.WIFAudience
-	cfg.WIFServiceAccount = credentials.WIFServiceAccount
-	// Override default storage bucket with environment-specific value from backend
-	if credentials.StorageBucket != "" {
-		cfg.StorageBucket = credentials.StorageBucket
-	}
-	cfg.UpdateCLIAgentCatalog(credentials.CliAgentCatalog)
-
-	if err := cfg.Save(ConfigPath()); err != nil {
+	// Step 4: Save credentials to config. Keep the full credential mutation and
+	// atomic replacement under the shared config writer lock so an updater or
+	// tray save cannot erase a newly registered identity.
+	if err := cfg.MutateAndSave(ConfigPath(), func() {
+		cfg.AgentID = credentials.AgentID
+		cfg.CommandSecret = credentials.AgentSecret
+		cfg.ProjectID = credentials.ProjectID
+		cfg.UserID = credentials.UserID
+		cfg.CommandsSubscription = credentials.CommandsSubscription
+		cfg.ResultsTopic = credentials.ResultsTopic
+		cfg.DeviceName = deviceName
+		cfg.RegisteredAt = time.Now().Format(time.RFC3339)
+		cfg.TokenEndpoint = credentials.TokenEndpoint
+		cfg.WIFAudience = credentials.WIFAudience
+		cfg.WIFServiceAccount = credentials.WIFServiceAccount
+		if credentials.StorageBucket != "" {
+			cfg.StorageBucket = credentials.StorageBucket
+		}
+		cfg.UpdateCLIAgentCatalog(credentials.CliAgentCatalog)
+	}); err != nil {
 		return fmt.Errorf("failed to save config: %w", err)
 	}
 

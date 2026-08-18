@@ -32,11 +32,17 @@ var refreshMachineInfoAfterCatalogUpdate = func() {
 }
 
 func persistCLIAgentCatalogUpdate(cfg *Config, entries []cliAgentCatalogEntry, logScope, source string) bool {
-	if cfg == nil || !cfg.UpdateCLIAgentCatalog(entries) {
+	if cfg == nil || entries == nil {
 		return false
 	}
-	if err := cfg.Save(ConfigPath()); err != nil {
+	changed := false
+	if err := cfg.MutateAndSave(ConfigPath(), func() {
+		changed = cfg.UpdateCLIAgentCatalog(entries)
+	}); err != nil {
 		fmt.Printf("%s[%s] Failed to persist CLI-agent catalog from %s: %v%s\n", colorYellow, logScope, source, err, colorReset)
+	}
+	if !changed {
+		return false
 	}
 	refreshMachineInfoAfterCatalogUpdate()
 	return true

@@ -121,7 +121,8 @@ var launchAgentTemplate = template.Must(template.New("plist").Parse(`<?xml versi
 </plist>
 `))
 
-// ensureAutoStart creates a LaunchAgent plist so the app starts at login.
+// ensureAutoStart creates a LaunchAgent plist so the app starts at login,
+// pointing at the currently-running binary.
 func ensureAutoStart() error {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -131,7 +132,14 @@ func ensureAutoStart() error {
 	if resolved, err := filepath.EvalSymlinks(exePath); err == nil {
 		exePath = resolved
 	}
+	return writeDarwinLaunchAgentFor(exePath)
+}
 
+// writeDarwinLaunchAgentFor (re)writes the login LaunchAgent plist so it points
+// at exePath. Factored out of ensureAutoStart so the per-user relocation can
+// re-point auto-start at the moved binary before it hands over (the LaunchAgent
+// path derives from the bundle, so relocation must rewrite it).
+func writeDarwinLaunchAgentFor(exePath string) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return err

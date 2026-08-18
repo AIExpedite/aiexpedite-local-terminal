@@ -803,13 +803,7 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 	defer close(session.streamDone)
 
 	queue := make(chan resultMsg, grokACPPublishQueueSize)
-	publisherDone := make(chan struct{})
-	go func() {
-		defer close(publisherDone)
-		for msg := range queue {
-			publishFn(msg)
-		}
-	}()
+	publisherDone := startTrackedTerminalPublisher(queue, publishFn)
 	defer func() {
 		close(queue)
 		<-publisherDone
@@ -1090,7 +1084,7 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 
 	seq := atomic.AddInt64(&session.seq, 1)
 
-	go publishFn(resultMsg{
+	publishTerminalResultAsync(publishFn, resultMsg{
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,

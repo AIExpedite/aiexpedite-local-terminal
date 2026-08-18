@@ -22,6 +22,7 @@ import (
 var shutdownConfig *Config
 
 func main() {
+	updateApplied := false
 	// Claude Code status-line hook: invoked as `<binary> statusline-hook` with the
 	// session JSON (incl. rate_limits) on stdin. Must be the FIRST thing main()
 	// does — it runs on every Claude render, so it has to be fast and must never
@@ -46,26 +47,27 @@ func main() {
 			return
 		}
 	}
-	// Windows-only: elevated UAC copy helper used during auto-update.
-	if runtime.GOOS == "windows" && len(os.Args) > 1 {
-		if os.Args[1] == "--elevated-copy" {
-			handleElevatedCopy()
-			return
-		}
-	}
+	// NOTE: the Windows --elevated-copy UAC helper was removed with the move to
+	// a per-user install (%LOCALAPPDATA%) — routine updates no longer need
+	// elevation, and keeping the helper would let a regression silently
+	// re-introduce a UAC prompt on the automatic path.
 
 	// Mirror stdout/stderr to a size-bounded rotating log file so the agent's
 	// diagnostics (codex app-server teardown reasons, stale cleanup, etc.)
 	// survive after the fact — the agent runs as a tray app with no persisted
 	// console. Placed AFTER the fast early-return arg handlers above
-	// (statusline-hook / --version / --uninstall / --elevated-copy) so those
-	// keep a clean, untouched stdout. Fail-open + disk-bounded (see logtee.go).
+	// (statusline-hook / --version / --uninstall) so those keep a clean,
+	// untouched stdout. Fail-open + disk-bounded (see logtee.go).
 	defer setupLogTee()()
 
 	// Handle --update-from=<original_path> argument (self-replacement after update)
 	// When the app is launched from a temp path after an auto-update, this flag
 	// tells it to copy itself over the original exe and re-launch from there.
 	for _, arg := range os.Args[1:] {
+		if arg == updateAppliedArg {
+			updateApplied = true
+			continue
+		}
 		if strings.HasPrefix(arg, "--update-from=") {
 			originalPath := strings.TrimPrefix(arg, "--update-from=")
 			if originalPath == "" {
@@ -82,6 +84,7 @@ func main() {
 			}
 			if err := performSelfReplace(originalPath); err != nil {
 				fmt.Printf("[update] Self-replace failed: %v\n", err)
+				fallbackUpdateTarget = originalPath
 				// Fall through to run normally from temp path as fallback
 			} else {
 				return // Successfully re-launched from install path; exit this temp process
@@ -95,10 +98,6 @@ func main() {
 
 	// Ensure auto-start at login (Windows)
 	if runtime.GOOS == "windows" {
-		_ = ensureAutoStart()
-		// Register app in Windows "Installed Apps" for easy uninstall
-		_ = ensureAppRegistration()
-
 		// Allocate console early for non-prod environments (dev, stg, beta)
 		// This ensures all startup output (StartAgent, Pub/Sub) is visible
 		// Production builds stay as GUI-only apps with console on-demand
@@ -120,9 +119,53 @@ func main() {
 			cfg = DefaultConfig()
 		}
 	}
+	if updateApplied && cfg.PendingUpdateAttemptID != "" && cfg.PendingUpdateVersion == Version {
+		if err := cfg.MutateAndSave(ConfigPath(), func() {
+			if cfg.PendingUpdateAttemptID != "" && cfg.PendingUpdateVersion == Version {
+				cfg.PendingUpdateApplied = true
+			}
+		}); err != nil {
+			fmt.Printf("[update] Could not persist successful replacement marker: %v\n", err)
+		}
+	}
 
 	// Store config for use in onTrayExit shutdown handler
 	shutdownConfig = cfg
+
+	// First run of the migration-capable build from a machine-wide (Windows
+	// Program Files / macOS /Applications) location relocates the install to a
+	// per-user, elevation-free location and hands over to the copy. Prompt-free;
+	// a no-op on an already-per-user install, on Linux, and on unsupported
+	// locations. If it relocated and launched the copy, exit this process so
+	// only one agent runs per account. Done before the tray starts so the user
+	// never sees two icons. See relocate_*.go.
+	if relocated := maybeRelocateInstall(cfg); relocated {
+		os.Exit(0)
+	}
+
+	// A stale machine-wide shortcut and the authoritative per-user startup
+	// entry can fire together on Windows. Only the process that owns this
+	// account/channel lock may proceed to create a tray or consume Pub/Sub.
+	releaseInstance, acquired := acquireAgentInstance()
+	if !acquired {
+		fmt.Println("[startup] Another agent instance is already running; exiting")
+		return
+	}
+	releaseInstance = trackAgentInstanceRelease(releaseInstance)
+	defer releaseInstance()
+
+	// Same-channel Darwin recovery touches staged/backup bundles that an
+	// in-flight update still owns. Only the singleton holder may run it;
+	// a losing Dock/LaunchAgent launcher must exit without deleting them.
+	recoverInterruptedInstall()
+
+	// Register startup and uninstall metadata only after relocation and the
+	// singleton gate. Otherwise a stale Program Files shortcut could overwrite
+	// the authoritative per-user paths before discovering the relocated agent.
+	if runtime.GOOS == "windows" {
+		_ = ensureAutoStart()
+		_ = ensureAppRegistration()
+	}
 
 	// Initialize command allow list for security
 	if cfg.EnableAllowList {
@@ -264,11 +307,29 @@ func onTrayReady(cfg *Config) func() {
 			cfg.IsAllowAllCommands())
 		systray.AddSeparator()
 
+		// "Automatically update" sits directly above "Check for Updates" and is
+		// checked by default (default-on preference). On a macOS build without
+		// silent-replacement capability the label/tooltip truthfully read
+		// "Automatically check for updates". These two items must stay adjacent,
+		// so the conditional status items below go AFTER "Install Update".
+		autoLabel, autoTooltip := autoUpdateTrayLabel()
+		mAutoUpdate := systray.AddMenuItemCheckbox(autoLabel, autoTooltip, cfg.IsAutoUpdate())
+
 		mCheck := systray.AddMenuItem("Check for Updates", "Check for a new version")
 
 		// Install Update menu item - initially hidden, shown when update is pending
 		mInstallUpdate := systray.AddMenuItem("", "")
 		mInstallUpdate.Hide()
+
+		// Passive, non-interactive status items for the automatic path. Mutually
+		// exclusive and hidden unless active, so "Automatically update" and
+		// "Check for Updates" stay adjacent. Both are disabled (status only).
+		mDraining := systray.AddMenuItem("Updating after current work", "Finishing current work before updating")
+		mDraining.Disable()
+		mDraining.Hide()
+		mUpdateBlocked := systray.AddMenuItem("Automatic update unavailable", "This installation cannot update itself")
+		mUpdateBlocked.Disable()
+		mUpdateBlocked.Hide()
 
 		// Version display (disabled, just for info)
 		mVersion := systray.AddMenuItem("Version "+Version, "Current version")
@@ -277,14 +338,8 @@ func onTrayReady(cfg *Config) func() {
 
 		mQuit := systray.AddMenuItem("Quit", "Exit the agent")
 
-		// registering is true while a registration flow is in progress.
-		// Declared here (before the auto-register block) so the goroutine below
-		// can safely call registering.Store(false) without a data race.
-		var registering atomic.Bool
-
 		// Auto-trigger registration on first launch (if not registered)
-		if !cfg.IsRegistered() {
-			registering.Store(true)
+		if !cfg.IsRegistered() && beginRegistration() {
 			// Keep console visible during auto-registration
 			if runtime.GOOS == "windows" {
 				showConsoleWindow(true)
@@ -292,6 +347,7 @@ func onTrayReady(cfg *Config) func() {
 			}
 
 			go func() {
+				defer endRegistration()
 				if err := StartRegistration(cfg); err != nil {
 					fmt.Println("Registration failed:", err)
 					ShowErrorDialog("Registration Failed", err.Error())
@@ -311,60 +367,35 @@ func onTrayReady(cfg *Config) func() {
 					fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
 					go StartPubSubLoop(cfg)
 				}
-				registering.Store(false)
 			}()
 		}
 
-		// Proactive update check (if AutoUpdate enabled)
-		if cfg.AutoUpdate {
-			go func() {
-				time.Sleep(3 * time.Second) // Let UI stabilize first
-
-				info, err := checkForNewVersion()
-				if err != nil {
-					fmt.Println("[update] Check failed:", err)
-					return
+		// Silent, job-aware automatic update. Replaces the old one-shot 3-second
+		// proactive dialog: the scheduler checks ~5 min after launch then every
+		// 6 hours, and (when the preference is on) drains and installs silently.
+		// The tray handles below let it reflect draining / blocked / pending-
+		// install status without importing systray specifics into autoupdate.go.
+		trayHandles := &trayUpdateHandles{
+			showDraining: func() { mDraining.Show() },
+			hideDraining: func() { mDraining.Hide() },
+			showBlocked: func(reason string) {
+				if reason != "" {
+					mUpdateBlocked.SetTitle(reason)
 				}
-
-				if !info.Available {
-					fmt.Println("[update] No update available")
-					return
-				}
-
-				// Skip if user previously chose to skip this version
-				if info.LatestVersion == cfg.SkippedVersion {
-					fmt.Printf("[update] Skipping version %s (user preference)\n", info.LatestVersion)
-					return
-				}
-
-				fmt.Printf("[update] New version available: %s → %s\n", info.CurrentVersion, info.LatestVersion)
-
-				// Show update dialog to user
-				choice := ShowUpdateDialog(info.CurrentVersion, info.LatestVersion)
-
-				switch choice {
-				case UpdateNow:
-					fmt.Println("[update] User chose: Update Now")
-					if err := downloadAndApplyUpdate(info); err != nil {
-						fmt.Println("[update] Download failed:", err)
-						ShowErrorDialog("Update Failed", err.Error())
-					}
-
-				case UpdateLater:
-					fmt.Println("[update] User chose: Later")
-					SetPendingUpdate(info)
-					// Show the Install Update menu item
-					mInstallUpdate.SetTitle(fmt.Sprintf("Install Update (%s)", info.LatestVersion))
-					mInstallUpdate.SetTooltip("Click to install the pending update")
-					mInstallUpdate.Show()
-
-				case SkipVersion:
-					fmt.Printf("[update] User chose: Skip version %s\n", info.LatestVersion)
-					cfg.SkippedVersion = info.LatestVersion
-					_ = cfg.Save(ConfigPath())
-				}
-			}()
+				mUpdateBlocked.Show()
+			},
+			hideBlocked: func() { mUpdateBlocked.Hide() },
+			// Reveal the pending "Install Update (vX)" item. The scheduler owns
+			// the pending UpdateInfo (with its AssetURL) via SetPendingUpdate —
+			// this handle only touches the tray, so a click has a complete,
+			// downloadable info to act on.
+			showPendingInstall: func(version string) {
+				mInstallUpdate.SetTitle(fmt.Sprintf("Install Update (%s)", version))
+				mInstallUpdate.SetTooltip("Click to install the pending update")
+				mInstallUpdate.Show()
+			},
 		}
+		StartAutoUpdateScheduler(cfg, trayHandles, registrationInProgress)
 
 		// Create debug click channel - nil channel blocks forever in select, which is what we want for prod
 		var debugClickCh <-chan struct{}
@@ -396,10 +427,9 @@ func onTrayReady(cfg *Config) func() {
 					// SetAllowAllCommands. Pub/Sub Receive callbacks only
 					// ever read the atomic via cfg.IsAllowAllCommands(), so
 					// mutating the bool field here while Save() is running
-					// does NOT race with the readers. We deliberately delay
-					// publishing the new value to the atomic until AFTER
-					// Save succeeds — a failed write must leave gating
-					// behaviour unchanged from the readers' perspective.
+					// does NOT race with the readers. Enabling delays publication
+					// to the runtime atomic until AFTER Save succeeds; disabling
+					// publishes immediately so a failed write still fails closed.
 					if mAllowAll.Checked() {
 						// ── Disable bypass — restore normal allow-list posture ──
 						// Fail CLOSED: the user's intent is to re-enforce gating,
@@ -407,10 +437,10 @@ func onTrayReady(cfg *Config) func() {
 						// regardless of whether Save() succeeds. A persistence
 						// failure only means the change may not survive restart;
 						// it must not leave the Pub/Sub readers bypassing checks.
-						cfg.AllowAllCommands = false
-						cfg.SetAllowAllCommands(false)
 						mAllowAll.Uncheck()
-						if err := cfg.Save(ConfigPath()); err != nil {
+						if err := cfg.MutateAndSave(ConfigPath(), func() {
+							cfg.SetAllowAllCommands(false)
+						}); err != nil {
 							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
 							ShowErrorDialog("Allow All Commands",
 								fmt.Sprintf("Allow All Commands has been disabled, but the change could not be saved:\n\n%v\n\nThe bypass is OFF now, but may be restored on next restart.", err))
@@ -426,18 +456,43 @@ func onTrayReady(cfg *Config) func() {
 							continue
 						}
 						prev := cfg.AllowAllCommands
-						cfg.AllowAllCommands = true
-						if err := cfg.Save(ConfigPath()); err != nil {
+						if err := cfg.MutateAndSaveRollback(ConfigPath(), func() {
+							cfg.AllowAllCommands = true
+						}, func() {
 							cfg.AllowAllCommands = prev
+						}); err != nil {
 							fmt.Printf("[allowlist] Failed to save config: %v\n", err)
 							ShowErrorDialog("Allow All Commands",
 								fmt.Sprintf("Could not enable Allow All Commands — config save failed:\n\n%v\n\nThe bypass remains disabled.", err))
 							continue
 						}
-						cfg.SetAllowAllCommands(true)
+						cfg.allowAllRuntime.Store(true)
 						mAllowAll.Check()
 						LogSecurityEvent(SecEvtAllowAllEnabled,
 							"Allow All Commands enabled by user — allow list bypassed")
+					}
+
+				case <-mAutoUpdate.ClickedCh:
+					// Toggle the "Automatically update" preference. Save-then-
+					// publish ordering mirrors mAllowAll: persist first, then
+					// mirror to the runtime atomic and update the checkbox, so a
+					// failed write leaves the effective behaviour consistent with
+					// the last successfully-persisted state. No confirmation dialog.
+					newVal := !mAutoUpdate.Checked()
+					if err := cfg.SetAndSaveAutoUpdate(newVal, ConfigPath()); err != nil {
+						fmt.Printf("[autoupdate] Failed to save preference: %v\n", err)
+						ShowErrorDialog("Automatically Update",
+							fmt.Sprintf("Could not save the auto-update preference:\n\n%v", err))
+						continue
+					}
+					if newVal {
+						mAutoUpdate.Check()
+						// Enabling schedules a check without an app restart.
+						if globalAutoUpdater != nil {
+							globalAutoUpdater.nudge()
+						}
+					} else {
+						mAutoUpdate.Uncheck()
 					}
 
 				case <-mResetAllowList.ClickedCh:
@@ -476,7 +531,7 @@ func onTrayReady(cfg *Config) func() {
 						choice := ShowUpdateDialog(info.CurrentVersion, info.LatestVersion)
 						switch choice {
 						case UpdateNow:
-							if err := downloadAndApplyUpdate(info); err != nil {
+							if err := installUpdateManually(info); err != nil {
 								ShowErrorDialog("Update Failed", err.Error())
 							}
 						case UpdateLater:
@@ -485,8 +540,9 @@ func onTrayReady(cfg *Config) func() {
 							mInstallUpdate.SetTooltip("Click to install the pending update")
 							mInstallUpdate.Show()
 						case SkipVersion:
-							cfg.SkippedVersion = info.LatestVersion
-							_ = cfg.Save(ConfigPath())
+							_ = cfg.MutateAndSave(ConfigPath(), func() {
+								cfg.SkippedVersion = info.LatestVersion
+							})
 						}
 					}()
 
@@ -494,7 +550,7 @@ func onTrayReady(cfg *Config) func() {
 					// Install pending update
 					if info := GetPendingUpdate(); info != nil {
 						fmt.Printf("[update] Installing pending update: %s\n", info.LatestVersion)
-						if err := downloadAndApplyUpdate(info); err != nil {
+						if err := installUpdateManually(info); err != nil {
 							fmt.Println("[update] Failed:", err)
 							ShowErrorDialog("Update Failed", err.Error())
 						}
@@ -509,10 +565,9 @@ func onTrayReady(cfg *Config) func() {
 						continue
 					}
 
-					if registering.Load() {
-						continue // Already registering
+					if !beginRegistration() {
+						continue // Already registering or draining for an update
 					}
-					registering.Store(true)
 
 					// Show console during registration
 					if runtime.GOOS == "windows" {
@@ -522,6 +577,7 @@ func onTrayReady(cfg *Config) func() {
 					}
 
 					go func() {
+						defer endRegistration()
 						if err := StartRegistration(cfg); err != nil {
 							fmt.Println("Registration failed:", err)
 							ShowErrorDialog("Registration Failed", err.Error())
@@ -541,7 +597,6 @@ func onTrayReady(cfg *Config) func() {
 							fmt.Println("[pubsub] Starting Pub/Sub loop after successful registration...")
 							go StartPubSubLoop(cfg)
 						}
-						registering.Store(false)
 					}()
 
 				case <-mConsole.ClickedCh:
@@ -571,8 +626,8 @@ func onTrayReady(cfg *Config) func() {
 
 				case <-debugClickCh:
 					// Toggle debug mode (only in non-prod)
-					cfg.DebugMode = !cfg.DebugMode
-					if cfg.DebugMode {
+					debugMode := !cfg.DebugMode
+					if debugMode {
 						mDebug.Check()
 						fmt.Printf("%s[debug] Debug mode ENABLED - showing detailed command/response info%s\n", colorMagenta, colorReset)
 					} else {
@@ -580,16 +635,23 @@ func onTrayReady(cfg *Config) func() {
 						fmt.Printf("%s[debug] Debug mode DISABLED%s\n", colorMagenta, colorReset)
 					}
 					// Save to config so it persists
-					if err := cfg.Save(ConfigPath()); err != nil {
+					if err := cfg.MutateAndSave(ConfigPath(), func() {
+						cfg.DebugMode = debugMode
+					}); err != nil {
 						fmt.Printf("[debug] Failed to save config: %v\n", err)
 					}
 
 				case <-mDisconnect.ClickedCh:
 					if mDisconnect.Checked() {
 						// ── Reconnect flow ─────────────────────────────
+						if !beginCloudReconnect() {
+							fmt.Println("[tray] Reconnect deferred because update replacement has begun")
+							continue
+						}
 						mDisconnect.Uncheck()
 						fmt.Println("[tray] Reconnecting to cloud...")
 						SetOffline(false, cfg) // persists cfg.OfflineMode = false
+						reconnectingIntoDrain := finishCloudReconnectPreparation()
 						systray.SetTooltip(EnvDisplayName + " – Online")
 						applyStandardTrayIcon()
 						// Restart the Pub/Sub loop. SetOffline already signals
@@ -607,7 +669,23 @@ func onTrayReady(cfg *Config) func() {
 						// goroutine so the tray loop isn't blocked, but the
 						// call itself awaits the retry wrapper inside
 						// notifyOnline so transient blips don't leak past.
+						if reconnectingIntoDrain {
+							fmt.Println("[tray] Reconnect joined active update drain; waiting for drain acknowledgement")
+							continue
+						}
 						go func() {
+							var attemptID string
+							cfg.WithPersistenceLock(func() {
+								attemptID = cfg.PendingUpdateAttemptID
+							})
+							if attemptID != "" {
+								// Retained attempt marker from interrupted or cancelled drain:
+								// reconcile the attempt-specific drain exit or version-aware online report.
+								if resolveInterruptedAttempt(cfg) {
+									go retryInterruptedAttemptReconciliation(cfg)
+								}
+								return
+							}
 							ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 							defer cancel()
 							if err := notifyOnline(ctx, cfg); err != nil {
@@ -669,38 +747,19 @@ func onTrayExit() {
 	// version will re-register and resume heartbeating immediately, so
 	// flipping the device offline mid-handoff would just churn the dot in
 	// the UI. Same for the rest of teardown.
-	if path, pending := GetUpdateReady(); pending && path != "" {
-		fmt.Println("Launching updated version…")
-
-		// Pass our own exe path so the new process can replace us at the install location.
-		// Resolve symlinks so the new process gets the real filesystem path.
-		originalExe, err := os.Executable()
-		if err != nil {
-			fmt.Printf("Warning: could not determine own exe path: %v\n", err)
-			originalExe = ""
-		} else if resolved, err := filepath.EvalSymlinks(originalExe); err == nil {
-			originalExe = resolved
+	if path, pending := GetUpdateReady(); pending {
+		// Platform installers launch the replacement before requesting tray
+		// shutdown. The empty-path handoff marker suppresses the ordinary
+		// offline/teardown path below without launching a second updater.
+		if path == "" {
+			return
 		}
 
-		// If we're already running from a temp path (chained update / previous broken update),
-		// don't pass --update-from pointing at the temp file — that would replace a temp file
-		// instead of the real install location. Let the new binary start without self-replace.
-		args := []string{}
-		if originalExe != "" && !isInTempDir(originalExe) {
-			args = append(args, fmt.Sprintf("--update-from=%s", originalExe))
-		} else if originalExe != "" {
-			fmt.Printf("[update] Current exe is in temp dir (%s), skipping --update-from\n", originalExe)
-		}
-
-		cmd := exec.Command(path, args...)
-		setNewConsole(cmd) // Ensure child process gets a fresh console with valid handles
-		if err := cmd.Start(); err != nil {
-			fmt.Printf("Failed to start update: %v\n", err)
-		}
-		// Give the new process time to fully launch before we exit
-		time.Sleep(2 * time.Second)
-		// Don't do aggressive cleanup after launching update - just exit
-		// The new process is already running independently
+		// Compatibility with an update marker written by an older code path. Do
+		// not try to launch here: tray shutdown is already committed and a start
+		// failure would leave no authoritative agent. A later boot cleans the
+		// stale artifact safely.
+		fmt.Printf("[update] Ignoring unlaunched legacy update marker for %s\n", path)
 		return
 	}
 
@@ -724,38 +783,6 @@ func closeShutdownChanOnce() {
 
 // aggressiveCleanup is defined in cleanup_windows.go / cleanup_other.go
 
-/* ---------- elevated copy (auto-update UAC) ---------- */
-
-// handleElevatedCopy performs a file copy with elevated privileges and exits.
-// Invoked via: --elevated-copy --copy-from="<src>" --copy-to="<dst>"
-// This runs as a minimal elevated process (no UI, no systray) spawned by
-// requestElevatedCopy when the app cannot write to its install directory.
-func handleElevatedCopy() {
-	var copyFrom, copyTo string
-	for _, arg := range os.Args[2:] {
-		if strings.HasPrefix(arg, "--copy-from=") {
-			copyFrom = strings.TrimPrefix(arg, "--copy-from=")
-		}
-		if strings.HasPrefix(arg, "--copy-to=") {
-			copyTo = strings.TrimPrefix(arg, "--copy-to=")
-		}
-	}
-	if copyFrom == "" || copyTo == "" {
-		fmt.Println("[elevated-copy] Missing --copy-from or --copy-to")
-		os.Exit(1)
-	}
-	if err := validateUpdateTarget(copyTo); err != nil {
-		fmt.Printf("[elevated-copy] Validation failed: %v\n", err)
-		os.Exit(2)
-	}
-	if err := copyFile(copyFrom, copyTo); err != nil {
-		fmt.Printf("[elevated-copy] Copy failed: %v\n", err)
-		os.Exit(3)
-	}
-	fmt.Printf("[elevated-copy] Successfully copied %s -> %s\n", copyFrom, copyTo)
-	os.Exit(0)
-}
-
 /* ---------- self-replace (auto-update) ---------- */
 
 // validateUpdateTarget checks that the target path for self-replacement is safe.
@@ -774,12 +801,15 @@ func validateUpdateTarget(target string) error {
 
 	// Block known protected directories (use trailing separator to avoid
 	// false positives like "c:\windowsapps").
-	// NOTE: c:\program files\ is intentionally NOT blocked — Inno Setup
-	// installs the app there by default ({autopf}), so auto-update must
-	// be able to self-replace the exe at its install location.
+	// NOTE: Program Files is now BLOCKED. With the move to a per-user install
+	// (%LOCALAPPDATA%), a self-replace target under Program Files would require
+	// the elevation the silent-update feature exists to eliminate — an install
+	// still there must relocate first, so reject it rather than prompt.
 	blockedPrefixes := []string{
 		`c:\windows\`,
 		`c:\programdata\`,
+		`c:\program files\`,
+		`c:\program files (x86)\`,
 	}
 	for _, prefix := range blockedPrefixes {
 		if strings.HasPrefix(lower, prefix) {
@@ -831,10 +861,15 @@ func isInTempDir(path string) bool {
 //  4. Launches the original path (now the new version) without --update-from
 //  5. Returns nil so the caller can exit the temp process
 func performSelfReplace(originalPath string) error {
+	// This process is the newly downloaded temporary updater. When that artifact
+	// is an AppImage, os.Executable points at its embedded read-only ELF while
+	// APPIMAGE points at the outer temporary AppImage that must be copied over
+	// the installed destination.
 	myPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("cannot determine own path: %w", err)
 	}
+	myPath = effectiveUpdateTarget(myPath, runtime.GOOS, os.Getenv("APPIMAGE"))
 
 	// Resolve symlinks so we compare real paths
 	if resolved, err := filepath.EvalSymlinks(myPath); err == nil {
@@ -864,16 +899,16 @@ func performSelfReplace(originalPath string) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if copyErr != nil {
-		fmt.Printf("[update] Direct copy failed (%v), attempting elevated copy...\n", copyErr)
-		if elevErr := requestElevatedCopy(myPath, originalPath); elevErr != nil {
-			return fmt.Errorf("failed to overwrite %s (direct: %v, elevated: %v)", originalPath, copyErr, elevErr)
-		}
+		// With a per-user install there is no elevated fallback: the target is
+		// writable by definition, so a persistent copy failure is a real error
+		// (locked file, disk full) rather than a permissions problem to escalate.
+		return fmt.Errorf("failed to overwrite %s: %w", originalPath, copyErr)
 	}
 
 	fmt.Printf("[update] Successfully replaced %s\n", originalPath)
 
 	// Re-launch from the install path (no --update-from flag this time)
-	cmd := exec.Command(originalPath)
+	cmd := exec.Command(originalPath, updateAppliedArg)
 	setNewConsole(cmd)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to re-launch from install path: %w", err)
@@ -964,29 +999,43 @@ func directCopy(src, dst string) error {
 //   - agent_update_*.exe in the OS temp directory (downloaded update binaries)
 //   - update_*.tmp in the install directory (partial copy artifacts from copyFile)
 func cleanupUpdateTempFiles() {
-	myPath, _ := os.Executable()
-	myPath, _ = filepath.EvalSymlinks(myPath)
+	myTarget, _ := runningUpdateTarget()
+	curExe, _ := os.Executable()
+	if curAppImage := os.Getenv("APPIMAGE"); curAppImage != "" && runtime.GOOS == "linux" {
+		curExe = curAppImage
+	}
 
 	// Pattern 1: Downloaded update binaries in OS temp dir
-	cleanupGlob(filepath.Join(os.TempDir(), "agent_update_*"), myPath)
+	cleanupGlob(filepath.Join(os.TempDir(), "agent_update_*"), myTarget, curExe)
 
 	// Pattern 2: Partial copy temp files in our install directory
-	if myPath != "" {
-		installDir := filepath.Dir(myPath)
-		cleanupGlob(filepath.Join(installDir, "update_*.tmp"), myPath)
+	if myTarget != "" {
+		installDir := filepath.Dir(myTarget)
+		cleanupGlob(filepath.Join(installDir, "update_*.tmp"), myTarget, curExe)
 	}
 }
 
-// cleanupGlob removes files matching the glob pattern, skipping our own executable.
-func cleanupGlob(pattern, selfPath string) {
+// cleanupGlob removes files matching the glob pattern, skipping preserved paths.
+func cleanupGlob(pattern string, preservePaths ...string) {
 	matches, err := filepath.Glob(pattern)
 	if err != nil || len(matches) == 0 {
 		return
 	}
 	for _, m := range matches {
 		resolved, _ := filepath.EvalSymlinks(m)
-		if selfPath != "" && strings.EqualFold(resolved, selfPath) {
-			continue // Don't delete ourselves
+		skip := false
+		for _, p := range preservePaths {
+			if p == "" {
+				continue
+			}
+			resP, _ := filepath.EvalSymlinks(p)
+			if strings.EqualFold(m, p) || strings.EqualFold(resolved, p) || (resP != "" && (strings.EqualFold(m, resP) || strings.EqualFold(resolved, resP))) {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue // Don't delete preserved paths
 		}
 		if err := os.Remove(m); err == nil {
 			fmt.Printf("[update] Cleaned up: %s\n", filepath.Base(m))
@@ -1064,8 +1113,8 @@ func handleUninstall() {
 				fmt.Println("→ Scheduled executable for deletion")
 			}
 		}
-	} else if runtime.GOOS == "darwin" && !quiet {
-		fmt.Println("→ To finish removal, drag AI Expedite.app from /Applications to the Trash.")
+	} else if runtime.GOOS == "darwin" {
+		handleDarwinUninstall(quiet)
 	}
 
 	if !quiet {

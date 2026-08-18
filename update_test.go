@@ -6,6 +6,9 @@
 package main
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 )
@@ -74,5 +77,104 @@ func TestAssetSuffixForGOOS(t *testing.T) {
 		if got != "-linux-"+runtime.GOARCH+".AppImage" {
 			t.Errorf("linux suffix = %q, want -linux-%s.AppImage", got, runtime.GOARCH)
 		}
+	}
+}
+
+func TestDownloadAndApplyUpdateFallbackOpensAssetWithoutDownload(t *testing.T) {
+	prevFlag := silentUpdateCapableFlag
+	prevOpen := openManualUpdateURL
+	silentUpdateCapableFlag = "false"
+	t.Cleanup(func() {
+		silentUpdateCapableFlag = prevFlag
+		openManualUpdateURL = prevOpen
+	})
+	if silentUpdateCapable() {
+		t.Skip("fallback only applies to non-capable macOS builds")
+	}
+
+	const assetURL = "https://example.test/update.dmg"
+	opened := ""
+	openManualUpdateURL = func(url string) error {
+		opened = url
+		return nil
+	}
+	if err := downloadAndApplyUpdate(&UpdateInfo{Available: true, AssetURL: assetURL}); err != nil {
+		t.Fatalf("downloadAndApplyUpdate fallback: %v", err)
+	}
+	if opened != assetURL {
+		t.Fatalf("opened URL = %q, want %q", opened, assetURL)
+	}
+}
+
+func TestApplyManualVerifiedUpdate_RemovesArtifactOnFailure(t *testing.T) {
+	artifact, err := os.CreateTemp(t.TempDir(), "verified-update-*")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	path := artifact.Name()
+	if err := artifact.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	wantErr := errors.New("apply failed")
+	err = applyManualVerifiedUpdate(path, &UpdateInfo{}, func(gotPath string, _ *UpdateInfo) error {
+		if gotPath != path {
+			t.Fatalf("apply path = %q, want %q", gotPath, path)
+		}
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("applyManualVerifiedUpdate error = %v, want %v", err, wantErr)
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("verified artifact still exists after apply failure: %v", statErr)
+	}
+}
+
+func TestCleanupGlob_PreservesSelf(t *testing.T) {
+	dir := t.TempDir()
+	self := filepath.Join(dir, "agent_update_running")
+	other := filepath.Join(dir, "agent_update_stale")
+
+	if err := os.WriteFile(self, []byte("self"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other, []byte("other"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupGlob(filepath.Join(dir, "agent_update_*"), self)
+
+	if _, err := os.Stat(self); err != nil {
+		t.Fatalf("cleanupGlob removed self: %v", err)
+	}
+	if _, err := os.Stat(other); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cleanupGlob did not remove stale file: %v", err)
+	}
+}
+
+func TestRunningUpdateTarget_FallbackTarget(t *testing.T) {
+	prev := fallbackUpdateTarget
+	t.Cleanup(func() {
+		fallbackUpdateTarget = prev
+	})
+
+	dir := t.TempDir()
+	targetFile := filepath.Join(dir, "my_installed_agent.exe")
+	if err := os.WriteFile(targetFile, []byte("agent"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	fallbackUpdateTarget = targetFile
+	got, err := runningUpdateTarget()
+	if err != nil {
+		t.Fatalf("runningUpdateTarget error: %v", err)
+	}
+	want := targetFile
+	if resolved, err := filepath.EvalSymlinks(targetFile); err == nil {
+		want = resolved
+	}
+	if got != want {
+		t.Fatalf("runningUpdateTarget() = %q, want %q", got, want)
 	}
 }

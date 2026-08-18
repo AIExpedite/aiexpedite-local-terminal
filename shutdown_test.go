@@ -83,6 +83,47 @@ func TestGracefulShutdownFlipsOfflineImmediately(t *testing.T) {
 	}
 }
 
+func TestGracefulShutdownSkipsOfflineAfterActiveApplyHandoff(t *testing.T) {
+	resetShutdownState(t)
+
+	updateMutex.Lock()
+	previousPath, previousPending := updatePath, updatePending
+	updatePath, updatePending = "", false
+	updateMutex.Unlock()
+	previousUpdater := globalAutoUpdater
+	applyDone := make(chan struct{})
+	globalAutoUpdater = &autoUpdater{
+		stopCh:    make(chan struct{}),
+		applying:  true,
+		applyDone: applyDone,
+	}
+	t.Cleanup(func() {
+		globalAutoUpdater = previousUpdater
+		updateMutex.Lock()
+		updatePath, updatePending = previousPath, previousPending
+		updateMutex.Unlock()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		gracefulShutdown(context.Background(), &Config{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("shutdown returned before the active apply completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	SetUpdateHandoff()
+	close(applyDone)
+	<-done
+	if IsOffline() {
+		t.Fatal("successful update handoff must skip ordinary offline teardown")
+	}
+}
+
 func TestNotifyOfflineRequiresCredentials(t *testing.T) {
 	cfg := &Config{} // empty
 	err := notifyOffline(context.Background(), cfg)

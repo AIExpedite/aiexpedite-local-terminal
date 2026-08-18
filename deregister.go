@@ -56,7 +56,46 @@ const (
 // shutdown routines) should await this so they can log success/failure before
 // tearing down sub-processes.
 func notifyOffline(ctx context.Context, cfg *Config) error {
-	return notifyConnectivity(ctx, cfg, "offline")
+	return notifyConnectivity(ctx, cfg, "offline", nil)
+}
+
+// notifyDrain tells the terminal-service this agent is draining for a specific
+// attempt/target version, so the cloud stops routing NEW work to it while it
+// finishes accepted work. It is used for BOTH entering the drain and confirming
+// (heartbeating) it — the wire call is identical and the service distinguishes
+// enter vs confirm by whether the attemptId is already active. Idempotent
+// server-side: repeated calls for the same attempt refresh the drain lease. The
+// service's clock is authoritative, so a drain that is not confirmed within the
+// staleness window expires; the agent confirms on a short interval while
+// draining.
+func notifyDrain(ctx context.Context, cfg *Config, attemptID, targetVersion string) error {
+	return notifyConnectivity(ctx, cfg, "drain", map[string]any{
+		"attemptId":     attemptID,
+		"targetVersion": targetVersion,
+	})
+}
+
+// notifyDrainExit clears the drain for an attempt. reason is one of
+// "finished" / "deferred" / "superseded" / "preference_off". Clearing drain
+// does NOT by itself restore routability server-side beyond removing the
+// draining marker — the agent becomes routable again via its own online/ready
+// signal (or, after a restart, notifyOnlineWithVersion).
+func notifyDrainExit(ctx context.Context, cfg *Config, attemptID, reason string) error {
+	return notifyConnectivity(ctx, cfg, "drain/exit", map[string]any{
+		"attemptId": attemptID,
+		"reason":    reason,
+	})
+}
+
+// notifyOnlineWithVersion is notifyOnline plus the running version and the
+// attempt id that caused the restart, so the service can reconcile the drain it
+// cleared with the version actually running (and record a mismatch if the
+// update did not land).
+func notifyOnlineWithVersion(ctx context.Context, cfg *Config, version, attemptID string) error {
+	return notifyConnectivity(ctx, cfg, "online", map[string]any{
+		"version":   version,
+		"attemptId": attemptID,
+	})
 }
 
 // notifyOnline sends a POST /device/{agentId}/online request to the
@@ -79,7 +118,7 @@ func notifyOffline(ctx context.Context, cfg *Config) error {
 // already-online device returns 200 with alreadyOnline:true and writes
 // nothing, so the boot-path call is cheap on the common case.
 func notifyOnline(ctx context.Context, cfg *Config) error {
-	return notifyConnectivity(ctx, cfg, "online")
+	return notifyConnectivity(ctx, cfg, "online", nil)
 }
 
 // notifyConnectivity is the shared retry/auth/HTTP wrapper for
@@ -87,11 +126,13 @@ func notifyOnline(ctx context.Context, cfg *Config) error {
 // payload and follow the same retry policy, so we factor the only
 // difference (the URL suffix) into the path argument.
 //
-// path must be either "offline" or "online" — anything else is a
-// programming error caught at call time. We don't validate further
-// because the value is package-private and only set by the two
-// wrapper functions above.
-func notifyConnectivity(ctx context.Context, cfg *Config, path string) error {
+// path is the URL suffix under /device/{agentId}/ — "offline", "online",
+// "drain", or "drain/exit". extra carries additional (unsigned) body fields
+// for the drain/version-aware calls; the HMAC signature always covers only
+// "agentId:timestamp", matching the server's verifier, so extra fields ride
+// alongside without changing the auth scheme. The value is package-private and
+// only set by the wrapper functions above.
+func notifyConnectivity(ctx context.Context, cfg *Config, path string, extra map[string]any) error {
 	if cfg == nil || cfg.AgentID == "" || cfg.CommandSecret == "" {
 		return fmt.Errorf("notify%s: missing agent credentials", capitalize(path))
 	}
@@ -129,19 +170,45 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string) error {
 	// cancellation check above already gated entry; once we hold the
 	// mutex, the HTTP work gets a clean budget.
 	//
-	// We deliberately do NOT propagate the caller ctx's cancellation
-	// past this line. All current callers pass plain timeout contexts
-	// with no explicit cancel source (tray click handlers, boot path,
-	// signal handler — each constructs `context.WithTimeout(
-	// context.Background(), 5s)`), so the parent ctx's only signal is
-	// its deadline, which is exactly what we want to ignore here. If
-	// a future caller needs to propagate explicit cancellation through
-	// the mutex (e.g. a "stop everything" abort), this is the place to
-	// thread it via context.AfterFunc.
+	// We deliberately do NOT propagate the caller ctx's deadline
+	// past this line — each call gets a clean budget after the lock.
+	// However, we DO propagate explicit cancellation (e.g. the
+	// autoupdate attempt context cancelled by shutdown) so that a
+	// late RPC cannot send /drain after stopForShutdown has already
+	// sent /drain/exit and cleared the durable marker. Only explicit
+	// cancel (context.Canceled) is forwarded; a parent deadline expiry
+	// is ignored so callers whose timeout expires while waiting on the
+	// mutex still get a full fresh budget for their HTTP work.
+	parentCtx := ctx
 	ctx, cancel := context.WithTimeout(context.Background(), notifyConnectivityHTTPBudget)
+	if parentCtx != nil {
+		stop := context.AfterFunc(parentCtx, func() {
+			// Forward only explicit cancellation (shutdown), not deadline
+			// expiry (a prior caller's timeout that expired on the mutex).
+			if parentCtx.Err() == context.Canceled {
+				cancel()
+			}
+		})
+		defer stop()
+	}
 	defer cancel()
 
 	url := fmt.Sprintf("%s/device/%s/%s", baseURL, cfg.AgentID, path)
+
+	// Synchronous post-lock check: AfterFunc schedules its callback
+	// asynchronously, so the parent may already be cancelled but the
+	// fresh-budget context not yet cancelled when we reach here. An
+	// explicit check closes the window between lock acquisition and
+	// the AfterFunc goroutine running.
+	if parentCtx != nil && parentCtx.Err() == context.Canceled {
+		return context.Canceled
+	}
+	// A Disconnect can land after the caller snapshotted offline=false and
+	// while this RPC was queued on the mutex. /offline must still go out;
+	// /online and drain RPCs must not overwrite that newer user intent.
+	if path != "offline" && IsOffline() {
+		return context.Canceled
+	}
 
 	var lastErr error
 	for attempt := 1; attempt <= notifyConnectivityMaxAttempts; attempt++ {
@@ -156,14 +223,17 @@ func notifyConnectivity(ctx context.Context, cfg *Config, path string) error {
 		default:
 		}
 
-		err := sendConnectivityRequest(ctx, url, cfg)
+		err := sendConnectivityRequest(ctx, url, cfg, extra)
 		if err == nil {
-			// "shutdown" reads more naturally than "offline" in the offline
-			// path's success log; "reconnect" reads better than "online" in
-			// the online path's. Pick the user-facing word per route.
+			// Pick a user-facing verb per route for the success log.
 			verb := "shutdown"
-			if path == "online" {
+			switch {
+			case path == "online":
 				verb = "reconnect"
+			case path == "drain":
+				verb = "drain"
+			case path == "drain/exit":
+				verb = "drain-exit"
 			}
 			fmt.Printf("%s[%s] Server notified of %s (attempt %d)%s\n",
 				colorGreen, path, verb, attempt, colorReset)
@@ -226,16 +296,25 @@ func capitalize(s string) string {
 // offline-or-online signal. It is intentionally side-effect-free apart
 // from the network call so the retry loop in notifyConnectivity can
 // call it repeatedly within one mutex hold and ctx budget.
-func sendConnectivityRequest(ctx context.Context, url string, cfg *Config) error {
+func sendConnectivityRequest(ctx context.Context, url string, cfg *Config, extra map[string]any) error {
 	// Build HMAC-signed payload (same auth scheme as /auth/token and
-	// /device/:id/offline — the backend's /online route accepts an
-	// identical body shape).
+	// /device/:id/offline). The signature covers only "agentId:timestamp";
+	// any `extra` fields (drain attemptId/targetVersion/reason, online
+	// version/attemptId) ride alongside unsigned, exactly as the server's
+	// verifier expects.
 	timestamp := time.Now().UnixMilli()
 	signature := generateHMAC(fmt.Sprintf("%s:%d", cfg.AgentID, timestamp), cfg.CommandSecret)
 
 	payload := map[string]interface{}{
 		"timestamp": timestamp,
 		"signature": signature,
+	}
+	for k, v := range extra {
+		// Never let an extra field clobber the signed timestamp/signature.
+		if k == "timestamp" || k == "signature" {
+			continue
+		}
+		payload[k] = v
 	}
 
 	body, err := json.Marshal(payload)
