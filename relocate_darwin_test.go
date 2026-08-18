@@ -927,3 +927,55 @@ func TestRecoverDarwinAppBundleSweepsLeakedInstallerStaging(t *testing.T) {
 		t.Fatal("a killed installer's staging directory should be swept once the target is back")
 	}
 }
+
+func TestWriteDarwinLaunchAgentAssociatesTheAppBundle(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	apps := filepath.Join(home, "Applications")
+	if err := os.MkdirAll(apps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, exe := newFakeDarwinBundleAs(t, apps, defaultDarwinBundleName, "app", "com.aiexpedite.terminal-Dev")
+
+	if err := writeDarwinLaunchAgentFor(exe); err != nil {
+		t.Fatal(err)
+	}
+	plist, err := os.ReadFile(filepath.Join(home, "Library", "LaunchAgents",
+		"com.aiexpedite.terminal"+EnvConfigSuffix+".plist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Without this key macOS cannot tell which app owns the login item and
+	// shows it under the signing team with a blank placeholder icon.
+	if !strings.Contains(string(plist), "AssociatedBundleIdentifiers") ||
+		!strings.Contains(string(plist), "com.aiexpedite.terminal-Dev") {
+		t.Fatalf("login item is not associated with the installed app:\n%s", plist)
+	}
+}
+
+func TestWriteDarwinLaunchAgentOmitsAssociationOutsideABundle(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	bare := filepath.Join(home, "bin", "aiexpedite-terminal")
+	if err := os.MkdirAll(filepath.Dir(bare), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bare, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeDarwinLaunchAgentFor(bare); err != nil {
+		t.Fatal(err)
+	}
+	plist, err := os.ReadFile(filepath.Join(home, "Library", "LaunchAgents",
+		"com.aiexpedite.terminal"+EnvConfigSuffix+".plist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Naming a bundle that is not there would leave the entry blank again.
+	if strings.Contains(string(plist), "AssociatedBundleIdentifiers") {
+		t.Fatalf("a bare binary has no bundle to associate:\n%s", plist)
+	}
+}
