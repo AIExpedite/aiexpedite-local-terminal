@@ -452,8 +452,13 @@ jobs:
           appname = os.path.basename(application)
           format = "UDZO"
           files = [application]
-          # Do not add the conventional /Applications shortcut: this app must
-          # be copied to the user's ~/Applications directory for silent updates.
+          # No /Applications shortcut on purpose: a machine-wide copy needs an
+          # admin prompt and cannot be replaced silently by the auto-updater.
+          # The app installs ITSELF into ~/Applications the first time it is
+          # launched from this image (installDarwinFromMedia in
+          # relocate_darwin.go), so the background says "double-click to
+          # install" and there is nothing to drag to. Keep icon_locations and
+          # window_rect in sync with scripts/generate-dmg-background.py.
           symlinks = {}
           icon = defines.get("volume_icon", None)
           icon_size = 100
@@ -820,7 +825,7 @@ jobs:
 
             ### Installation
             **Windows:** Download and run the installer (or standalone exe). If SmartScreen appears, click "More info" then "Run anyway".
-            **macOS:** Open the .dmg file and drag AI Expedite to ~/Applications (your user Applications folder). If blocked, go to System Preferences → Security & Privacy → "Open Anyway".
+            **macOS:** Open the .dmg file and double-click AI Expedite — it installs itself to ~/Applications, starts in the menu bar, and updates itself from then on. If blocked, go to System Preferences → Security & Privacy → "Open Anyway".
             **Linux:** Download the .AppImage, run `chmod +x` on it, then execute.
             Click "Register Device" in the system tray to connect to your AI Expedite account.
 
@@ -885,7 +890,7 @@ jobs:
 
             ### Installation
             **Windows:** Download and run the installer (or standalone exe). If SmartScreen appears, click "More info" then "Run anyway".
-            **macOS:** Open the .dmg file and drag AI Expedite to ~/Applications (your user Applications folder). If blocked, go to System Preferences → Security & Privacy → "Open Anyway".
+            **macOS:** Open the .dmg file and double-click AI Expedite — it installs itself to ~/Applications, starts in the menu bar, and updates itself from then on. If blocked, go to System Preferences → Security & Privacy → "Open Anyway".
             **Linux:** Download the .AppImage, run `chmod +x` on it, then execute.
             Click "Register Device" in the system tray to connect to your AI Expedite account.
 

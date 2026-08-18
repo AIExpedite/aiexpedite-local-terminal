@@ -183,6 +183,26 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	// the old bundle until LaunchServices accepts the relaunch so a rejected
 	// handoff can restore the version that is still running.
 	backup := filepath.Join(parent, ".aixupd_old_"+filepath.Base(currentBundle))
+
+	// Hold the destination lock from before the swap until the relaunch outcome
+	// is resolved. Two reasons it has to span that whole stretch rather than
+	// just the swap:
+	//   - the fallback in swapDarwinBundles (no RENAME_SWAP) leaves
+	//     currentBundle briefly absent, and an installer looking in that gap
+	//     would read the destination as free and strand this update;
+	//   - `backup` stays live until the relaunch is known to have worked, and
+	//     the startup recovery pass DELETES .aixupd_old_* once the target is in
+	//     place. The replacement — or any executable sharing this packaged
+	//     bundle name — runs that pass right after taking the singleton, which
+	//     this process deliberately released before relaunching. Without the
+	//     lock the rollback copy can be gone exactly when rollback needs it.
+	unlockDir, dirLocked := waitForDarwinInstallDirLock(parent)
+	if !dirLocked {
+		return fmt.Errorf("another AI Expedite installer has held %s for %s; not replacing the bundle now",
+			parent, darwinInstallLockWait)
+	}
+	defer unlockDir()
+
 	if err := swapDarwinBundles(currentBundle, staged, backup); err != nil {
 		return err
 	}
@@ -194,7 +214,9 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 	// The replacement must be able to acquire the per-account singleton as
 	// soon as LaunchServices starts it. The deferred release in main otherwise
 	// runs only after systray exits, causing the new process to lose the lock
-	// race and exit before this process quits too.
+	// race and exit before this process quits too. (The DESTINATION lock stays
+	// held: the replacement never needs it to start, it only skips its
+	// best-effort recovery sweep while this process still owns the rollback.)
 	releaseAgentInstanceForHandoff()
 	if err := relaunchDarwinBundle(currentBundle); err != nil {
 		return handleFailedDarwinRelaunch(currentBundle, backup, err)
@@ -216,6 +238,9 @@ func applyVerifiedUpdate(dmgPath string, _ *UpdateInfo) error {
 func handleFailedDarwinRelaunch(bundle, backup string, relaunchErr error) error {
 	if release, acquired := acquireAgentInstanceAfterDarwinHandoff(); acquired {
 		trackAgentInstanceRelease(release)
+		// No destination lock here: applyVerifiedUpdate holds it across the
+		// relaunch, and flock is per-descriptor — re-taking it in the same
+		// process would block on our own lock and skip the rollback entirely.
 		if err := restoreDarwinBundleBackup(bundle, backup); err != nil {
 			return fmt.Errorf("failed to relaunch %s (%v) and could not restore the previous bundle: %w", bundle, relaunchErr, err)
 		}

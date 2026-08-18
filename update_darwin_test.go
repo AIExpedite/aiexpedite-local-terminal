@@ -513,3 +513,48 @@ func TestSwapDarwinBundles_ParksOldBundleWhenBackupUnusable(t *testing.T) {
 		t.Fatalf("parked bundle data = %q, want old-version", parkedData)
 	}
 }
+
+// TestFailedDarwinRelaunchRollsBackUnderTheCallersInstallLock guards the
+// re-entrancy trap in the fix for "keep updater rollback protected through
+// relaunch": applyVerifiedUpdate now holds the destination lock across the
+// relaunch, and flock is per-descriptor, so a rollback that tried to take that
+// same lock again would block on this process's own lock and silently skip the
+// restore.
+func TestFailedDarwinRelaunchRollsBackUnderTheCallersInstallLock(t *testing.T) {
+	previousAcquire := acquireAgentInstanceAfterDarwinHandoff
+	t.Cleanup(func() {
+		acquireAgentInstanceAfterDarwinHandoff = previousAcquire
+		releaseAgentInstanceForHandoff()
+	})
+	acquireAgentInstanceAfterDarwinHandoff = func() (func(), bool) { return func() {}, true }
+
+	parent := t.TempDir()
+	bundle := filepath.Join(parent, "AI Expedite.app")
+	backup := filepath.Join(parent, ".aixupd_old_AI Expedite.app")
+	for path, version := range map[string]string{bundle: "new", backup: "old"} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "version"), []byte(version), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Stand in for applyVerifiedUpdate holding the destination lock.
+	unlock, locked := waitForDarwinInstallDirLock(parent)
+	if !locked {
+		t.Fatal("could not take the destination lock")
+	}
+	defer unlock()
+
+	if err := handleFailedDarwinRelaunch(bundle, backup, errors.New("open failed")); err == nil {
+		t.Fatal("a failed relaunch with the singleton reacquired must report the failure")
+	}
+	version, err := os.ReadFile(filepath.Join(bundle, "version"))
+	if err != nil {
+		t.Fatalf("restored bundle is not launchable: %v", err)
+	}
+	if string(version) != "old" {
+		t.Fatalf("rollback did not run under the caller's lock: version = %q", version)
+	}
+}
