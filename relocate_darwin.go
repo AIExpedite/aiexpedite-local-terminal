@@ -156,7 +156,10 @@ func maybeRelocateInstall(_ *Config) bool {
 	if err != nil {
 		fmt.Printf("[relocate] Cannot read the bundle's identifier: %v\n", err)
 	}
-	dest := darwinInstallDestination(userApps, filepath.Base(bundle), sourceID)
+	dest, ok := darwinInstallDestination(userApps, filepath.Base(bundle), sourceID)
+	if !ok {
+		return false // another channel owns every candidate path; stay put
+	}
 	rel, relErr := filepath.Rel(bundle, exe)
 	newExe := ""
 	if relErr == nil {
@@ -358,21 +361,94 @@ func channelScopedDarwinBundleName(bundleName string) string {
 // dev or beta image could silently overwrite a prod install whose lock this
 // process never even contends for. Another channel's bundle is never touched:
 // the install falls back to a channel-scoped name and the two coexist.
-func darwinInstallDestination(userApps, bundleName, sourceID string) string {
+func darwinInstallDestination(userApps, bundleName, sourceID string) (string, bool) {
 	// Prefer wherever this channel already lives, so an install that once fell
 	// back to the scoped name does not fork into a second copy later when the
 	// plain name frees up.
 	scoped := filepath.Join(userApps, channelScopedDarwinBundleName(bundleName))
-	if darwinDestinationState(scoped, sourceID) == darwinDestinationOurs {
-		return scoped
+	scopedState := darwinDestinationState(scoped, sourceID)
+	if scopedState == darwinDestinationOurs {
+		return scoped, true
 	}
 	preferred := filepath.Join(userApps, bundleName)
 	if darwinDestinationState(preferred, sourceID) != darwinDestinationForeign {
-		return preferred
+		return preferred, true
+	}
+	if scopedState == darwinDestinationForeign {
+		// Both candidates belong to someone else. There is no path left that
+		// can be taken without destroying a bundle this build does not own,
+		// so nothing is installed.
+		fmt.Printf("[install] %s and %s both belong to another AI Expedite channel; not installing\n",
+			preferred, scoped)
+		return "", false
 	}
 	fmt.Printf("[install] %s belongs to another AI Expedite channel; installing alongside it at %s\n",
 		preferred, scoped)
-	return scoped
+	return scoped, true
+}
+
+// lockDarwinInstallDir serializes every installer targeting dir, whatever
+// channel it belongs to. The per-account singleton cannot do this job — each
+// channel holds a different one — so without it two fresh installers can both
+// see a destination as free and the loser can land on top of the winner. The
+// ownership checks below are only meaningful while this is held.
+func lockDarwinInstallDir(dir string) (unlock func(), acquired bool) {
+	file, acquired, err := tryAcquireAgentInstanceLock(filepath.Join(dir, ".aixinstall.lock"))
+	if err != nil {
+		// Cannot create the lock at all (read-only dir, exotic filesystem):
+		// fall through rather than block an otherwise fine install.
+		fmt.Printf("[install] Could not take the install lock in %s (continuing): %v\n", dir, err)
+		return func() {}, true
+	}
+	if !acquired {
+		return func() {}, false
+	}
+	return func() {
+		_ = unlockFile(file)
+		_ = file.Close()
+	}, true
+}
+
+// darwinPlacement is the outcome of moving a staged bundle into place.
+type darwinPlacement int
+
+const (
+	darwinPlacementCreated  darwinPlacement = iota // nothing was there
+	darwinPlacementReplaced                        // this channel's copy was swapped out
+	darwinPlacementYielded                         // another launcher of THIS channel won
+	darwinPlacementBlocked                         // another channel's bundle is there
+	darwinPlacementFailed
+)
+
+// placeDarwinBundle moves staged to dest. It always tries create-first, so a
+// bundle that appeared since the destination was chosen is never silently
+// replaced, and it re-reads ownership immediately before any swap: the choice
+// made before the copy is stale by now, and only a bundle re-verified as this
+// channel's — with the singleton held — may be replaced.
+func placeDarwinBundle(staged, dest, backup, sourceID string, acquired bool) darwinPlacement {
+	err := exclusiveRenameDarwin(staged, dest)
+	if err == nil {
+		return darwinPlacementCreated
+	}
+	if !errors.Is(err, unix.EEXIST) {
+		fmt.Printf("[install] Cannot move installed bundle into place: %v\n", err)
+		return darwinPlacementFailed
+	}
+	if state := darwinDestinationState(dest, sourceID); state != darwinDestinationOurs {
+		fmt.Printf("[install] %s now belongs to another AI Expedite channel; leaving it in place\n", dest)
+		return darwinPlacementBlocked
+	}
+	if !acquired {
+		// Without the singleton this install may only CREATE: a launcher that
+		// won the race may already be running out of that bundle.
+		fmt.Printf("[install] Another launcher installed %s first; leaving it in place\n", dest)
+		return darwinPlacementYielded
+	}
+	if err := swapDarwinBundles(dest, staged, backup); err != nil {
+		fmt.Printf("[install] Cannot replace existing install at %s: %v\n", dest, err)
+		return darwinPlacementFailed
+	}
+	return darwinPlacementReplaced
 }
 
 // exclusiveRenameDarwin renames src to dst only when dst does not exist
@@ -430,17 +506,33 @@ func installDarwinFromMedia(bundle, exe, userApps string) bool {
 	if err != nil {
 		fmt.Printf("[install] Cannot read the image bundle's identifier: %v\n", err)
 	}
-	dest := darwinInstallDestination(userApps, filepath.Base(bundle), sourceID)
+
+	// Serialize with any other AI Expedite installer targeting this directory,
+	// whichever channel it belongs to. Every ownership check below reads the
+	// destination and acts on it; without this lock another installer can land
+	// a bundle in between.
+	unlockDir, dirLocked := lockDarwinInstallDir(userApps)
+	if !dirLocked {
+		fmt.Printf("[install] Another installer is already placing a bundle in %s; leaving it to finish\n", userApps)
+		scheduleDarwinVolumeEject(bundle)
+		return true
+	}
+	defer unlockDir()
+
+	dest, ok := darwinInstallDestination(userApps, filepath.Base(bundle), sourceID)
+	if !ok {
+		notifyDarwinInstallBlocked()
+		return false
+	}
 
 	// Replacing an existing install must not race the installed agent, whose
 	// own updater swaps exactly this bundle from applyVerifiedUpdate. The
-	// per-account singleton is that mutual exclusion — and because dest is now
-	// guaranteed to be this channel's own bundle, it is the lock that actually
-	// governs it. main.go only takes it AFTER this path runs, so take it here
-	// and hold it across the swap. It has to be released again before the
-	// replacement is launched (and on every error return, or main's own
-	// acquisition below would find the lock held by this very process and
-	// exit).
+	// per-account singleton is that mutual exclusion — and because dest is
+	// this channel's own bundle, it is the lock that actually governs it.
+	// main.go only takes it AFTER this path runs, so take it here and hold it
+	// across the swap. It has to be released again before the replacement is
+	// launched (and on every error return, or main's own acquisition below
+	// would find the lock held by this very process and exit).
 	release, acquired := acquireAgentInstanceForInstall()
 	releaseOnce := sync.Once{}
 	releaseLock := func() {
@@ -480,32 +572,21 @@ func installDarwinFromMedia(bundle, exe, userApps string) bool {
 
 	backup := filepath.Join(userApps, ".aixinstall_old_"+filepath.Base(dest))
 	replaced := false
-	if !acquired {
-		// Without the singleton this install may only CREATE. dest was absent
-		// when the lock was checked, but a launcher that won the race can have
-		// created — and started — it while the copy above was running, and
-		// that install is not ours to swap out.
-		if err := exclusiveRenameDarwin(staged, dest); err != nil {
-			if errors.Is(err, unix.EEXIST) {
-				fmt.Printf("[install] Another launcher installed %s first; leaving it in place\n", dest)
-				notifyDarwinInstallSkipped()
-				scheduleDarwinVolumeEject(bundle)
-				return true
-			}
-			fmt.Printf("[install] Cannot move installed bundle into place: %v\n", err)
-			return false
-		}
-	} else if _, err := os.Stat(dest); err == nil {
-		// Reinstall over this channel's existing copy: swap so a complete,
-		// launchable bundle exists at every instant and a rejected launch can
-		// be undone.
-		if err := swapDarwinBundles(dest, staged, backup); err != nil {
-			fmt.Printf("[install] Cannot replace existing install at %s: %v\n", dest, err)
-			return false
-		}
+	switch placeDarwinBundle(staged, dest, backup, sourceID, acquired) {
+	case darwinPlacementCreated:
+	case darwinPlacementReplaced:
 		replaced = true
-	} else if err := os.Rename(staged, dest); err != nil {
-		fmt.Printf("[install] Cannot move installed bundle into place: %v\n", err)
+	case darwinPlacementYielded:
+		// This channel is installed and running from dest, just not by us.
+		notifyDarwinInstallSkipped()
+		scheduleDarwinVolumeEject(bundle)
+		return true
+	case darwinPlacementBlocked:
+		// Nothing was installed: keep running from the image rather than
+		// exiting into nothing.
+		notifyDarwinInstallBlocked()
+		return false
+	default:
 		return false
 	}
 
@@ -526,13 +607,7 @@ func installDarwinFromMedia(bundle, exe, userApps string) bool {
 	// this running process, so a plain `open` would merely activate the image
 	// copy and leave nothing behind once we exit.
 	if err := launchRelocatedDarwinBundle(dest, true); err != nil {
-		fmt.Printf("[install] Failed to launch installed copy: %v\n", err)
-		if replaced {
-			if rErr := restoreDarwinBundleBackup(dest, backup); rErr != nil {
-				fmt.Printf("[install] Could not restore previous install: %v\n", rErr)
-			}
-		}
-		return false
+		return handleFailedDarwinInstallLaunch(bundle, dest, backup, replaced, err)
 	}
 	if replaced {
 		_ = os.RemoveAll(backup)
@@ -543,6 +618,35 @@ func installDarwinFromMedia(bundle, exe, userApps string) bool {
 	// after we exit — hand the detach to a child that outlives us.
 	scheduleDarwinVolumeEject(bundle)
 	return true
+}
+
+// handleFailedDarwinInstallLaunch resolves what a LaunchServices error actually
+// means: the replacement may have started regardless, or another same-channel
+// launcher may have taken the singleton during the intentionally unlocked
+// handoff. Only a process that can retake the lock may roll the bundle back —
+// otherwise the rollback would pull the bundle out from under the authoritative
+// agent. Same ambiguity, and same resolution, as handleFailedDarwinRelaunch in
+// the updater.
+func handleFailedDarwinInstallLaunch(bundle, dest, backup string, replaced bool, launchErr error) bool {
+	release, acquired := acquireAgentInstanceForInstall()
+	if !acquired {
+		fmt.Printf("[install] open reported %v, but another agent owns %s; leaving the new bundle in place\n",
+			launchErr, dest)
+		if replaced {
+			_ = os.RemoveAll(backup)
+		}
+		scheduleDarwinVolumeEject(bundle)
+		return true
+	}
+	defer release()
+
+	fmt.Printf("[install] Failed to launch installed copy: %v\n", launchErr)
+	if replaced {
+		if err := restoreDarwinBundleBackup(dest, backup); err != nil {
+			fmt.Printf("[install] Could not restore previous install: %v\n", err)
+		}
+	}
+	return false
 }
 
 // notifyDarwinInstalled tells the user where the app went. The agent is an
@@ -572,6 +676,12 @@ func notifyDarwin(body string) {
 // do nothing: a running agent owns the install and must be quit first.
 func notifyDarwinInstallSkipped() {
 	notifyDarwin("Already installed and running. Quit it from the menu bar first to install this copy.")
+}
+
+// notifyDarwinInstallBlocked explains that the install location is held by a
+// different AI Expedite channel, which this build will not overwrite.
+func notifyDarwinInstallBlocked() {
+	notifyDarwin("Could not install: another AI Expedite channel occupies the Applications folder entry. Remove it and open this image again.")
 }
 
 // appleScriptString quotes s as an AppleScript string literal.

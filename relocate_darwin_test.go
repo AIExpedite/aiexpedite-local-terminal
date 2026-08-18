@@ -650,3 +650,137 @@ func TestExclusiveRenameDarwinRefusesAnExistingDestination(t *testing.T) {
 		t.Fatalf("rename to a free path should succeed: %v", err)
 	}
 }
+
+// stubAgentInstanceSequence returns the given acquisition results in order,
+// repeating the last one, so a test can model "the replacement took the
+// singleton while we were handing over".
+func stubAgentInstanceSequence(t *testing.T, results ...bool) {
+	t.Helper()
+	previous := acquireAgentInstanceForInstall
+	call := 0
+	acquireAgentInstanceForInstall = func() (func(), bool) {
+		acquired := results[len(results)-1]
+		if call < len(results) {
+			acquired = results[call]
+		}
+		call++
+		return func() {}, acquired
+	}
+	t.Cleanup(func() { acquireAgentInstanceForInstall = previous })
+}
+
+func TestInstallDarwinFromMediaWaitsOutAnotherInstaller(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubDarwinInstallTools(t, 0)
+
+	userApps := filepath.Join(home, "Applications")
+	if err := os.MkdirAll(userApps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Another installer — possibly from a different channel, whose singleton
+	// is a different lock entirely — is placing a bundle right now.
+	held, acquired, err := tryAcquireAgentInstanceLock(filepath.Join(userApps, ".aixinstall.lock"))
+	if err != nil || !acquired {
+		t.Fatalf("could not simulate a competing installer: %v", err)
+	}
+	defer held.Close()
+
+	media := filepath.Join(t.TempDir(), "AppTranslocation", "d")
+	if err := os.MkdirAll(media, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle, exe := newFakeDarwinBundle(t, media, "new")
+
+	if !installDarwinFromMedia(bundle, exe, userApps) {
+		t.Fatal("the other installer is finishing the job; this process must exit")
+	}
+	if _, err := os.Stat(filepath.Join(userApps, defaultDarwinBundleName)); !os.IsNotExist(err) {
+		t.Fatal("nothing may be placed while another installer holds the directory lock")
+	}
+}
+
+func TestInstallDarwinFromMediaRevalidatesOwnershipBeforeSwapping(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubDarwinInstallTools(t, 0) // singleton acquired
+
+	userApps := filepath.Join(home, "Applications")
+	if err := os.MkdirAll(userApps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(userApps, defaultDarwinBundleName)
+
+	media := filepath.Join(t.TempDir(), "AppTranslocation", "d")
+	if err := os.MkdirAll(media, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle, exe := newFakeDarwinBundle(t, media, "ours")
+
+	// The destination was free when it was chosen; another channel's installer
+	// lands there while this one is copying. Holding OUR singleton says
+	// nothing about that bundle — it answers to a different lock.
+	previous := exclusiveRenameDarwin
+	exclusiveRenameDarwin = func(src, dst string) error {
+		newFakeDarwinBundleAs(t, userApps, defaultDarwinBundleName, "other-channel", "com.aiexpedite.terminal-Beta")
+		return previous(src, dst)
+	}
+	t.Cleanup(func() { exclusiveRenameDarwin = previous })
+
+	if installDarwinFromMedia(bundle, exe, userApps) {
+		t.Fatal("nothing was installed, so the app must keep running from the image")
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "Contents", "MacOS", "AIExpediteTerminal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "other-channel" {
+		t.Fatalf("a stale ownership decision must not authorize the swap, got %q", got)
+	}
+}
+
+func TestInstallDarwinFromMediaKeepsNewBundleWhenReplacementOwnsTheSingleton(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubDarwinInstallTools(t, 23) // LaunchServices reports an error...
+	// ...but the replacement started anyway and now owns the singleton, so the
+	// second acquisition (the rollback decision) fails.
+	stubAgentInstanceSequence(t, true, false)
+
+	userApps := filepath.Join(home, "Applications")
+	if err := os.MkdirAll(userApps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, installedExe := newFakeDarwinBundle(t, userApps, "old")
+
+	media := filepath.Join(t.TempDir(), "AppTranslocation", "d")
+	if err := os.MkdirAll(media, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle, exe := newFakeDarwinBundle(t, media, "new")
+
+	if !installDarwinFromMedia(bundle, exe, userApps) {
+		t.Fatal("the replacement is authoritative, so this process must exit")
+	}
+	got, err := os.ReadFile(installedExe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("rolling back under the running replacement, got %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(userApps, ".aixinstall_old_"+defaultDarwinBundleName)); !os.IsNotExist(err) {
+		t.Fatal("the rollback copy should be dropped once the replacement owns the install")
+	}
+}
+
+func TestDarwinInstallDestinationRefusesWhenEveryCandidateIsForeign(t *testing.T) {
+	userApps := t.TempDir()
+	newFakeDarwinBundleAs(t, userApps, defaultDarwinBundleName, "dev", "com.aiexpedite.terminal-Dev")
+	newFakeDarwinBundleAs(t, userApps, channelScopedDarwinBundleName(defaultDarwinBundleName),
+		"beta", "com.aiexpedite.terminal-Beta")
+
+	if dest, ok := darwinInstallDestination(userApps, defaultDarwinBundleName, testBundleID); ok {
+		t.Fatalf("no path is free to take, yet it chose %s", dest)
+	}
+}
