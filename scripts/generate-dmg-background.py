@@ -8,6 +8,10 @@ relocate_darwin.go). The background therefore tells the user to double-click
 the app rather than to drag it, and must not draw an arrow to a drop target
 that no longer exists.
 
+One image ships on every channel, and dev/stg builds are deliberately NOT
+silent-update capable (silent_update_capable: "false" in release-nonprod.yml),
+so the copy must not promise automatic updates.
+
     python aiexpedite-local-terminal/scripts/generate-dmg-background.py
 
 Creates:
@@ -38,7 +42,7 @@ ICON_CENTER_Y = 190
 ICON_SIZE = 100
 
 HEADLINE_TEXT = "Double-click to install"
-SUBTEXT_TEXT = "It copies itself to your Applications folder and updates automatically."
+SUBTEXT_TEXT = "It copies itself to your Applications folder \u2014 nothing to drag."
 
 FONT_CANDIDATES = [
     "/System/Library/Fonts/HelveticaNeue.ttc",

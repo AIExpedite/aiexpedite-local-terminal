@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 const defaultDarwinBundleName = "AIExpediteTerminal.app"
@@ -217,15 +218,75 @@ func maybeRelocateInstall(_ *Config) bool {
 	return true
 }
 
-// runningFromDarwinInstallMedia reports whether bundle is running from
-// read-only install media rather than an installed location: a mounted disk
-// image under /Volumes, or the randomized App Translocation mirror macOS
-// substitutes when a quarantined app is launched straight out of a DMG (in
-// which case os.Executable never mentions /Volumes at all).
+// acquireAgentInstanceForInstall takes the per-account singleton around a
+// bundle replacement; replaced in tests.
+var acquireAgentInstanceForInstall = acquireAgentInstance
+
+// runHdiutilInfo returns `hdiutil info` output; replaced in tests.
+var runHdiutilInfo = func() (string, error) {
+	out, err := exec.Command("hdiutil", "info").Output()
+	return string(out), err
+}
+
+// runningFromDarwinInstallMedia reports whether bundle is running from install
+// media rather than an installed location.
 func runningFromDarwinInstallMedia(bundle string) bool {
 	lower := strings.ToLower(filepath.ToSlash(bundle))
-	return strings.HasPrefix(lower, "/volumes/") ||
-		strings.Contains(lower, "/apptranslocation/")
+	// App Translocation. macOS has already decided this bundle came out of a
+	// quarantined archive or image and mirrored it onto a randomized read-only
+	// path that vanishes when the app quits — there is nothing to keep running
+	// from and nothing that could ever self-update, whatever the origin was.
+	if strings.Contains(lower, "/apptranslocation/") {
+		return true
+	}
+	// A /Volumes path on its own proves nothing: USB sticks, network shares and
+	// external disks mount there too, and quietly installing an app someone
+	// deliberately runs off portable media is not this code's call. Only an
+	// attached disk image — the release DMG — counts as install media.
+	volume := darwinVolumeRoot(bundle)
+	return volume != "" && darwinVolumeIsDiskImage(volume)
+}
+
+// darwinVolumeIsDiskImage reports whether volume is the mount point of an
+// attached disk image. It fails CLOSED: without proof that the volume is an
+// image, the app keeps running where it is instead of installing itself.
+func darwinVolumeIsDiskImage(volume string) bool {
+	out, err := runHdiutilInfo()
+	if err != nil {
+		fmt.Printf("[install] Cannot tell whether %s is a disk image (%v); leaving the app where it is\n", volume, err)
+		return false
+	}
+	for _, mount := range darwinDiskImageMountPoints(out) {
+		if mount == volume {
+			return true
+		}
+	}
+	return false
+}
+
+// darwinDiskImageMountPoints extracts the mount points of every attached disk
+// image from `hdiutil info` output. Each image lists its partitions as
+// tab-separated entity lines whose last field is the mount point:
+//
+//	/dev/disk4          \tGUID_partition_scheme          \t
+//	/dev/disk4s1        \t48465300-0000-11AA-AA11-...    \t/Volumes/AI Expedite
+func darwinDiskImageMountPoints(hdiutilInfo string) []string {
+	var mounts []string
+	for _, line := range strings.Split(hdiutilInfo, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, "/dev/") {
+			continue // a key-value line (image-path, writeable, ...)
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) < 3 {
+			continue
+		}
+		mount := strings.TrimSpace(fields[len(fields)-1])
+		if strings.HasPrefix(mount, "/") {
+			mounts = append(mounts, mount)
+		}
+	}
+	return mounts
 }
 
 // installDarwinFromMedia copies the bundle running off the DMG into
@@ -240,12 +301,37 @@ func installDarwinFromMedia(bundle, exe, userApps string) bool {
 		return false
 	}
 
+	// Replacing an existing install must not race the installed agent, whose
+	// own updater swaps exactly this bundle from applyVerifiedUpdate. The
+	// per-account singleton is that mutual exclusion, and main.go only takes it
+	// AFTER this path runs, so take it here and hold it across the swap. It has
+	// to be released again before the replacement is launched (and on every
+	// error return, or main's own acquisition below would find the lock held by
+	// this very process and exit).
+	release, acquired := acquireAgentInstanceForInstall()
+	releaseOnce := sync.Once{}
+	releaseLock := func() {
+		if acquired {
+			releaseOnce.Do(release)
+		}
+	}
+	defer releaseLock()
+
+	if _, err := os.Stat(dest); err == nil && !acquired {
+		// Another agent owns this install and may be mid-update. Its bundle is
+		// not ours to overwrite, and a second agent must not run alongside it.
+		fmt.Printf("[install] %s is already installed and running; leaving it untouched\n", dest)
+		notifyDarwinInstallSkipped()
+		scheduleDarwinVolumeEject(bundle)
+		return true
+	}
+
 	// Stage beside the destination (same volume, so the move below is a
 	// rename) and only then put it in place: an interrupted copy can never
 	// leave a half-written bundle installed. The pid suffix keeps two
 	// simultaneous installers off each other's staging directory, and the
-	// distinct prefix keeps this pre-singleton path from touching the
-	// .aixupd_* artifacts an in-flight update owns.
+	// prefix stays distinct from the updater's .aixupd_* artifacts so the
+	// startup recovery pass can tell the two apart.
 	staged := fmt.Sprintf("%s.aixinstall_new-%d", dest, os.Getpid())
 	_ = os.RemoveAll(staged)
 	defer os.RemoveAll(staged)
@@ -284,6 +370,9 @@ func installDarwinFromMedia(bundle, exe, userApps string) bool {
 	}
 
 	fmt.Printf("[install] Installed %s -> %s; handing over\n", bundle, dest)
+	// The replacement acquires the same per-account singleton as soon as
+	// LaunchServices starts it, so this process must let go of it first.
+	releaseLock()
 	// Force a new instance: the copy carries the same bundle identifier as
 	// this running process, so a plain `open` would merely activate the image
 	// copy and leave nothing behind once we exit.
@@ -311,19 +400,29 @@ func installDarwinFromMedia(bundle, exe, userApps string) bool {
 // LSUIElement with no window, so without this a double-click on the DMG would
 // look like nothing happened at all.
 func notifyDarwinInstalled(dest string) {
-	title := EnvDisplayName
-	if title == "" {
-		title = "AI Expedite"
-	}
 	shown := dest
 	if home, err := os.UserHomeDir(); err == nil && home != "" &&
 		strings.HasPrefix(dest, home+string(filepath.Separator)) {
 		shown = "~" + strings.TrimPrefix(dest, home)
 	}
-	body := fmt.Sprintf("Installed to %s and running in the menu bar.", shown)
+	notifyDarwin(fmt.Sprintf("Installed to %s and running in the menu bar.", shown))
+}
+
+// notifyDarwin posts a user notification under the channel's display name.
+func notifyDarwin(body string) {
+	title := EnvDisplayName
+	if title == "" {
+		title = "AI Expedite"
+	}
 	script := fmt.Sprintf("display notification %s with title %s",
 		appleScriptString(body), appleScriptString(title))
 	_ = exec.Command("osascript", "-e", script).Run()
+}
+
+// notifyDarwinInstallSkipped explains why double-clicking the image appeared to
+// do nothing: a running agent owns the install and must be quit first.
+func notifyDarwinInstallSkipped() {
+	notifyDarwin("Already installed and running. Quit it from the menu bar first to install this copy.")
 }
 
 // appleScriptString quotes s as an AppleScript string literal.

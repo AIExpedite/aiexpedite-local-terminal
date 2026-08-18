@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -160,13 +161,43 @@ func TestCurrentDarwinBundleName_Fallback(t *testing.T) {
 	}
 }
 
+// hdiutilInfoFixture is `hdiutil info` output with one attached image mounted
+// at /Volumes/AI Expedite. /Volumes/USB below is deliberately absent: an
+// ordinary mounted volume never appears here.
+const hdiutilInfoFixture = "framework       : 594.30.1\n" +
+	"driver          : 594.30.1\n" +
+	"================================================\n" +
+	"image-path      : /Users/test/Downloads/aiexpedite-terminal-darwin-arm64.dmg\n" +
+	"image-type      : read-only disk image\n" +
+	"writeable       : false\n" +
+	"/dev/disk4\tGUID_partition_scheme\t\n" +
+	"/dev/disk4s1\t48465300-0000-11AA-AA11-00306543ECAC\t/Volumes/AI Expedite\n"
+
+func stubHdiutilInfo(t *testing.T, out string, err error) {
+	t.Helper()
+	previous := runHdiutilInfo
+	runHdiutilInfo = func() (string, error) { return out, err }
+	t.Cleanup(func() { runHdiutilInfo = previous })
+}
+
+func TestDarwinDiskImageMountPoints(t *testing.T) {
+	got := darwinDiskImageMountPoints(hdiutilInfoFixture)
+	if len(got) != 1 || got[0] != "/Volumes/AI Expedite" {
+		t.Fatalf("expected the image mount point only, got %q", got)
+	}
+}
+
 func TestRunningFromDarwinInstallMedia(t *testing.T) {
+	stubHdiutilInfo(t, hdiutilInfoFixture, nil)
 	cases := []struct {
 		bundle string
 		want   bool
 	}{
 		{"/Volumes/AI Expedite/AIExpediteTerminal.app", true},
 		{"/private/var/folders/x1/T/AppTranslocation/2B7A/d/AIExpediteTerminal.app", true},
+		// A USB stick or network share is NOT install media: an app someone
+		// deliberately runs off portable media must be left where it is.
+		{"/Volumes/USB/Tools/AIExpediteTerminal.app", false},
 		{"/Users/test/Applications/AIExpediteTerminal.app", false},
 		{"/Applications/AIExpediteTerminal.app", false},
 		{"/Users/test/Downloads/AIExpediteTerminal.app", false},
@@ -175,6 +206,16 @@ func TestRunningFromDarwinInstallMedia(t *testing.T) {
 		if got := runningFromDarwinInstallMedia(c.bundle); got != c.want {
 			t.Errorf("runningFromDarwinInstallMedia(%q) = %v, want %v", c.bundle, got, c.want)
 		}
+	}
+}
+
+func TestRunningFromDarwinInstallMediaFailsClosedWithoutHdiutil(t *testing.T) {
+	stubHdiutilInfo(t, "", errors.New("hdiutil unavailable"))
+	if runningFromDarwinInstallMedia("/Volumes/AI Expedite/AIExpediteTerminal.app") {
+		t.Fatal("an unprovable volume must not be treated as install media")
+	}
+	if !runningFromDarwinInstallMedia("/private/var/folders/x1/T/AppTranslocation/2B7A/d/X.app") {
+		t.Fatal("a translocated bundle is install media regardless of hdiutil")
 	}
 }
 
@@ -211,7 +252,22 @@ func stubDarwinInstallTools(t *testing.T, openExit int) string {
 	write("open", fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %q\nexit %d\n", openLog, openExit))
 
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	stubAgentInstanceForInstall(t, true)
 	return openLog
+}
+
+// stubAgentInstanceForInstall replaces the per-account singleton with an
+// in-memory one so tests never touch the real lock (or contend with an agent
+// actually running on the machine). It reports whether the release ran.
+func stubAgentInstanceForInstall(t *testing.T, acquired bool) *bool {
+	t.Helper()
+	released := false
+	previous := acquireAgentInstanceForInstall
+	acquireAgentInstanceForInstall = func() (func(), bool) {
+		return func() { released = true }, acquired
+	}
+	t.Cleanup(func() { acquireAgentInstanceForInstall = previous })
+	return &released
 }
 
 // newFakeDarwinBundle creates <dir>/<name>/Contents/MacOS/<binary> and returns
@@ -346,5 +402,84 @@ func TestInstallDarwinFromMediaRestoresPreviousInstallOnFailedLaunch(t *testing.
 func TestAppleScriptStringEscapes(t *testing.T) {
 	if got := appleScriptString(`say "hi"\now`); got != `"say \"hi\"\\now"` {
 		t.Fatalf("unexpected AppleScript literal %s", got)
+	}
+}
+
+func TestInstallDarwinFromMediaReleasesSingletonBeforeHandingOver(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubDarwinInstallTools(t, 0)
+	released := stubAgentInstanceForInstall(t, true)
+
+	media := filepath.Join(t.TempDir(), "AppTranslocation", "d")
+	if err := os.MkdirAll(media, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle, exe := newFakeDarwinBundle(t, media, "new")
+
+	if !installDarwinFromMedia(bundle, exe, filepath.Join(home, "Applications")) {
+		t.Fatal("install should hand over")
+	}
+	// The replacement acquires the same lock as soon as LaunchServices starts
+	// it, so it must be free by the time `open` runs.
+	if !*released {
+		t.Fatal("the singleton must be released before the replacement is launched")
+	}
+}
+
+func TestInstallDarwinFromMediaLeavesRunningInstallUntouched(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	openLog := stubDarwinInstallTools(t, 0)
+	stubAgentInstanceForInstall(t, false) // another agent owns this install
+
+	userApps := filepath.Join(home, "Applications")
+	if err := os.MkdirAll(userApps, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, installedExe := newFakeDarwinBundle(t, userApps, "running")
+
+	media := filepath.Join(t.TempDir(), "AppTranslocation", "d")
+	if err := os.MkdirAll(media, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle, exe := newFakeDarwinBundle(t, media, "new")
+
+	if !installDarwinFromMedia(bundle, exe, userApps) {
+		t.Fatal("the running install is authoritative, so this process must exit")
+	}
+
+	// A running agent may be mid-update on exactly this bundle: replacing it
+	// here could overwrite a verified update after its rollback copy is gone.
+	got, err := os.ReadFile(installedExe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "running" {
+		t.Fatalf("the running install must not be replaced, got %q", got)
+	}
+	if _, err := os.Stat(openLog); !os.IsNotExist(err) {
+		t.Fatal("no second agent may be launched alongside the running one")
+	}
+}
+
+func TestInstallDarwinFromMediaInstallsWhenNothingIsInstalledYet(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	stubDarwinInstallTools(t, 0)
+	stubAgentInstanceForInstall(t, false) // an agent runs from somewhere else
+
+	media := filepath.Join(t.TempDir(), "AppTranslocation", "d")
+	if err := os.MkdirAll(media, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle, exe := newFakeDarwinBundle(t, media, "new")
+	userApps := filepath.Join(home, "Applications")
+
+	if !installDarwinFromMedia(bundle, exe, userApps) {
+		t.Fatal("a fresh install destroys nothing and must still proceed")
+	}
+	if _, err := os.Stat(filepath.Join(userApps, defaultDarwinBundleName)); err != nil {
+		t.Fatalf("expected a fresh install at %s: %v", userApps, err)
 	}
 }
