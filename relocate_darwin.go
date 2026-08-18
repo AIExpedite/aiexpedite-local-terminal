@@ -58,9 +58,24 @@ func recoverInterruptedDarwinInstall(bundleName string) {
 		bundleName = currentDarwinBundleName()
 	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		recoverDarwinAppBundle(filepath.Join(home, "Applications"), bundleName)
+		recoverDarwinAppBundleLocked(filepath.Join(home, "Applications"), bundleName)
 	}
-	recoverDarwinAppBundle("/Applications", bundleName)
+	recoverDarwinAppBundleLocked("/Applications", bundleName)
+}
+
+// recoverDarwinAppBundleLocked runs the recovery pass while holding dir's
+// install lock. Recovery restores AND deletes the same .aixinstall_old_ /
+// .aixupd_old_ artifacts a swap in flight is relying on as its only rollback
+// copy, so it must not run beside a live installer, relocation or update. The
+// per-account singleton is not enough: a different channel's installer holds a
+// different one.
+func recoverDarwinAppBundleLocked(dir, bundleName string) {
+	if err := withDarwinInstallDirLock(dir, func() error {
+		recoverDarwinAppBundle(dir, bundleName)
+		return nil
+	}); err != nil {
+		fmt.Printf("[install] Skipping recovery in %s: %v\n", dir, err)
+	}
 }
 
 func recoverDarwinAppBundle(dir, bundleName string) {
@@ -102,6 +117,14 @@ func recoverDarwinAppBundle(dir, bundleName string) {
 		_ = os.RemoveAll(backupPath)
 		_ = os.RemoveAll(stagedPath)
 		_ = os.RemoveAll(installBackupPath)
+		// The installer's staging directory carries the pid of the process that
+		// created it, so a killed installer leaves one behind that no fixed name
+		// matches. Holding the install lock means every one of these is dead.
+		if leaked, err := filepath.Glob(targetPath + ".aixinstall_new-*"); err == nil {
+			for _, dir := range leaked {
+				_ = os.RemoveAll(dir)
+			}
+		}
 	}
 }
 

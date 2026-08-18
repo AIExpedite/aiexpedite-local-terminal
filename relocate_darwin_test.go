@@ -882,3 +882,48 @@ func TestWithDarwinInstallDirLockSerializesMutations(t *testing.T) {
 		t.Fatal("the mutation ran while another process held the destination")
 	}
 }
+
+func TestRecoverDarwinAppBundleLockedLeavesALiveInstallerAlone(t *testing.T) {
+	dir := t.TempDir()
+	setDarwinInstallLockTiming(t, 30*time.Millisecond, 5*time.Millisecond)
+
+	// An installer is mid-swap: it has parked the previous bundle in its
+	// backup and holds the destination lock. That backup is its only rollback
+	// copy, and recovery both restores and DELETES that name.
+	backup := filepath.Join(dir, ".aixinstall_old_"+defaultDarwinBundleName)
+	if err := os.MkdirAll(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, defaultDarwinBundleName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	held, acquired, err := tryAcquireAgentInstanceLock(filepath.Join(dir, ".aixinstall.lock"))
+	if err != nil || !acquired {
+		t.Fatalf("could not simulate the installer holding the destination: %v", err)
+	}
+	defer held.Close()
+
+	recoverDarwinAppBundleLocked(dir, defaultDarwinBundleName)
+
+	if _, err := os.Stat(backup); err != nil {
+		t.Fatalf("recovery deleted a live installer's rollback copy: %v", err)
+	}
+}
+
+func TestRecoverDarwinAppBundleSweepsLeakedInstallerStaging(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, defaultDarwinBundleName)
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	leaked := target + ".aixinstall_new-4242"
+	if err := os.MkdirAll(leaked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	recoverDarwinAppBundle(dir, defaultDarwinBundleName)
+
+	if _, err := os.Stat(leaked); !os.IsNotExist(err) {
+		t.Fatal("a killed installer's staging directory should be swept once the target is back")
+	}
+}
