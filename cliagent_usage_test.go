@@ -283,36 +283,113 @@ func helperWriteClaudeOAuth(t *testing.T, home string, extra map[string]any) {
 	})
 }
 
-func TestClaudeCodeUsageParser_AuthExpiredNotice(t *testing.T) {
+// A renewable credential's stamps say nothing about whether the user must log in
+// again: Claude Code rolls both forward on each silent refresh and only rewrites
+// the file when it refreshes, so an idle machine leaves BOTH in the past on a
+// perfectly healthy Max login (observed in the field with refreshTokenExpiresAt
+// even earlier than expiresAt). Reading either as a deadline reported "Login
+// expired" and blanked every usage bar, so the credential must publish the login
+// as refreshable and keep the cached telemetry observable.
+func TestClaudeCodeUsageParser_LapsedStampsOnRenewableLoginStayAuthenticated(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
 	home := t.TempDir()
 	now := time.Now()
-	// Access token still valid, but the REFRESH token expired 2h ago → re-login.
+	// Both stamps lapsed — the shape an idle-but-signed-in machine has on disk.
 	helperWriteClaudeOAuth(t, home, map[string]any{
-		"expiresAt":             now.Add(2 * time.Hour).UnixMilli(),
+		"accessToken":           "sk-ant-oat-access",
+		"expiresAt":             now.Add(-1 * time.Hour).UnixMilli(),
 		"refreshTokenExpiresAt": now.Add(-2 * time.Hour).UnixMilli(),
 	})
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs:   now.UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now, fingerprintAccount("claudeCode", "ada@example.com"))
 
 	usage, ok := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
 	if !ok || usage == nil {
 		t.Fatalf("expected usage entry")
 	}
-	if usage.NoticeSeverity != "error" {
-		t.Errorf("NoticeSeverity=%q, want error", usage.NoticeSeverity)
+	if usage.Notice != "" || usage.NoticeSeverity != "" {
+		t.Errorf("notice=(%q,%q), want none — a renewable login going idle is not a sign-out",
+			usage.Notice, usage.NoticeSeverity)
 	}
-	if !strings.Contains(usage.Notice, "expired") {
-		t.Errorf("Notice=%q, want an expired re-login prompt", usage.Notice)
+	if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
+		t.Errorf("auth state=(%v, %q), want true/authenticated", usage.Authenticated, usage.AuthState)
 	}
-	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "expired" {
-		t.Errorf("auth state = (%v, %q), want false/expired", usage.Authenticated, usage.AuthState)
+	if usage.LoginExpirationState != loginExpirationRefreshable {
+		t.Errorf("LoginExpirationState=%q, want %q", usage.LoginExpirationState, loginExpirationRefreshable)
 	}
-	if usage.LoginExpirationState != loginExpirationKnown || usage.LoginExpiresAt == "" {
-		t.Errorf("login expiration = (%q, %q), want known deadline", usage.LoginExpirationState, usage.LoginExpiresAt)
+	// The ACCESS token's stamp is published as an informational, card-labelled
+	// "(renews automatically)" date — the refresh stamp is never published.
+	if want := time.UnixMilli(now.Add(-1 * time.Hour).UnixMilli()).UTC().Format(time.RFC3339); usage.LoginExpiresAt != want {
+		t.Errorf("LoginExpiresAt=%q, want the access-token stamp %q", usage.LoginExpiresAt, want)
+	}
+	var fiveHour *cliAgentUsageMetric
+	for i := range usage.Metrics {
+		if usage.Metrics[i].Kind == limitKindSession {
+			fiveHour = &usage.Metrics[i]
+		}
+	}
+	if fiveHour == nil || fiveHour.Unknown || fiveHour.Consumed == nil {
+		t.Fatalf("cached telemetry must stay observable for a healthy login, got %+v", fiveHour)
+	}
+}
+
+// A definite `claude auth status --json` verdict is the only authoritative
+// signal, so it must override the credential in BOTH directions. Before this,
+// the probe could only upgrade a state that was not already "expired" — the one
+// state a lapsed credential produces — so a live session kept reading as expired
+// and its usage bars stayed blank.
+func TestClaudeCodeUsageParser_SignedInProbeOverridesLapsedCredential(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	home := t.TempDir()
+	now := time.Now()
+	// Access-token-only (non-renewable) and lapsed: the credential alone says
+	// "expired", and only the probe can contradict it.
+	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
+		"claudeAiOauth": map[string]any{
+			"accessToken": "expired-access-token",
+			"expiresAt":   now.Add(-time.Hour).UnixMilli(),
+		},
+	})
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40,
+			ResetsAtMs:     now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs:   now.UnixMilli(),
+			usageKnown:     true,
+		},
+	}, now, "")
+	stubClaudeProbes(t, true, true)
+
+	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{
+		Detected: true, Path: "claude-test",
+	}, now)
+	if usage.Authenticated == nil || !*usage.Authenticated || usage.AuthState != "authenticated" {
+		t.Errorf("auth state=(%v, %q), want true/authenticated from the definite probe",
+			usage.Authenticated, usage.AuthState)
+	}
+	if usage.Notice != "" || usage.NoticeSeverity != "" {
+		t.Errorf("notice=(%q,%q), want the credential notice withdrawn by the probe",
+			usage.Notice, usage.NoticeSeverity)
+	}
+	// A passed stamp the probe just contradicted must not be republished — the
+	// card re-derives "Expired" from a known deadline in the past.
+	if usage.LoginExpiresAt != "" || usage.LoginExpirationState != loginExpirationNotReported {
+		t.Errorf("login expiration=(%q,%q), want none once the probe contradicts the stamp",
+			usage.LoginExpiresAt, usage.LoginExpirationState)
 	}
 	for _, metric := range usage.Metrics {
-		if !metric.Unknown || metric.Consumed != nil || metric.Remaining != nil {
-			t.Errorf("expired login must make utilization unobservable, got %+v", metric)
+		if metric.Kind == limitKindSession && (metric.Unknown || metric.Consumed == nil) {
+			t.Errorf("a signed-in session must keep its cached telemetry, got %+v", metric)
 		}
 	}
 }
@@ -355,24 +432,30 @@ func TestClaudeCodeUsageParser_ExpiredAccessTokenWithoutRefreshIsUnobservable(t 
 	}
 }
 
-func TestClaudeCodeUsageParser_AuthExpiringSoonNotice(t *testing.T) {
+// There is deliberately no "expires soon" warning any more. It was computed from
+// refreshTokenExpiresAt, which is a rolling token lifetime rather than a re-login
+// date, so it fired on healthy logins and told the user to do something that was
+// not needed.
+func TestClaudeCodeUsageParser_NoWarningFromAnImminentRefreshStamp(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	home := t.TempDir()
 	now := time.Now()
 	helperWriteClaudeOAuth(t, home, map[string]any{
-		"refreshTokenExpiresAt": now.Add(12 * time.Hour).UnixMilli(), // within the 48h window
+		"accessToken":           "sk-ant-oat-access",
+		"expiresAt":             now.Add(8 * time.Hour).UnixMilli(),
+		"refreshTokenExpiresAt": now.Add(1 * time.Hour).UnixMilli(),
 	})
 
 	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
-	if usage.NoticeSeverity != "warning" {
-		t.Errorf("NoticeSeverity=%q, want warning", usage.NoticeSeverity)
+	if usage.Notice != "" || usage.NoticeSeverity != "" {
+		t.Errorf("notice=(%q,%q), want none for a renewable login", usage.Notice, usage.NoticeSeverity)
 	}
-	if !strings.Contains(usage.Notice, "expires soon") {
-		t.Errorf("Notice=%q, want an expiring-soon prompt", usage.Notice)
+	if usage.Authenticated == nil || !*usage.Authenticated {
+		t.Errorf("Authenticated=%v, want true", usage.Authenticated)
 	}
-	if usage.Authenticated == nil || !*usage.Authenticated || usage.LoginExpiresAt == "" {
-		t.Errorf("healthy expiring login should publish authenticated exact deadline: %+v", usage)
+	if usage.LoginExpirationState != loginExpirationRefreshable {
+		t.Errorf("LoginExpirationState=%q, want %q", usage.LoginExpirationState, loginExpirationRefreshable)
 	}
 }
 
@@ -425,11 +508,14 @@ func TestClaudeCodeUsageParser_AuthFromKeychainWhenNoFile(t *testing.T) {
 
 	orig := claudeKeychainReader
 	t.Cleanup(func() { claudeKeychainReader = orig })
+	// Access-token-only (nothing can renew it) and lapsed — the one credential
+	// shape that is expired on its own evidence, so reaching the Keychain at all
+	// is what this asserts.
 	raw, _ := json.Marshal(map[string]any{
 		"email": "kc@example.com",
 		"claudeAiOauth": map[string]any{
-			"refreshToken":          "test-refresh-token",
-			"refreshTokenExpiresAt": now.Add(-time.Hour).UnixMilli(), // expired
+			"accessToken": "expired-access-token",
+			"expiresAt":   now.Add(-time.Hour).UnixMilli(),
 		},
 	})
 	claudeKeychainReader = func() ([]byte, bool) { return raw, true }
@@ -533,11 +619,13 @@ func TestClaudeCodeUsageParser_KeychainPreferredOverStaleFile(t *testing.T) {
 	home := t.TempDir()
 	now := time.Now()
 
-	// Stale on-disk file: a different account whose refresh token expired days ago.
+	// Stale on-disk file: a different account whose access-only token lapsed days
+	// ago — the shape that WOULD raise an expired banner if it were read.
 	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
 		"email": "stale@example.com",
 		"claudeAiOauth": map[string]any{
-			"refreshTokenExpiresAt": now.Add(-72 * time.Hour).UnixMilli(),
+			"accessToken": "expired-access-token",
+			"expiresAt":   now.Add(-72 * time.Hour).UnixMilli(),
 		},
 	})
 

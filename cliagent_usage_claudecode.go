@@ -59,6 +59,11 @@ var claudeAuthStatusProbe = func(path string) (bool, bool) {
 var runClaudeAuthStatusCommand = func(ctx context.Context, path string, env []string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, path, "auth", "status", "--json")
 	cmd.Env = env
+	// Background probe: the agent is a tray app with no console of its own, so
+	// a console child would otherwise flash a window on the user's desktop
+	// every time usage/rate-limit collection runs. Same treatment as every
+	// other silent probe (see probeVersionArgs in systemInfo.go).
+	hideWindow(cmd)
 	return cmd.Output()
 }
 
@@ -95,9 +100,23 @@ type claudeDotJSON struct {
 // older/API-key layouts write at the top level, plus the nested `claudeAiOauth`
 // object Claude Code writes for a claude.ai subscription login. The access
 // token (ExpiresAt) auto-refreshes silently in the real ~/.claude using
-// RefreshToken, so its short expiry is NOT a re-login signal — the user only has
-// to interactively `/login` again once the REFRESH token expires
-// (RefreshTokenExpiresAt). That's the real re-authentication deadline.
+// RefreshToken, so its short expiry is NOT a re-login signal.
+//
+// RefreshTokenExpiresAt is NOT the re-authentication deadline either, and must
+// never be read as one. Observed on a healthy, actively used Max login: a
+// credential written at 17:31 carried RefreshTokenExpiresAt 20:58 and ExpiresAt
+// 01:31 — the refresh stamp was SHORTER than the access stamp, and both were
+// hours out. Claude Code rolls both forward on each silent refresh and only
+// rewrites the file when it refreshes, so any idle stretch leaves both stamps in
+// the past while `claude auth status` still reports a signed-in session. Treating
+// the stamp as a deadline reported "Login expired" on a working login and (via
+// the error notice) blanked every usage bar on the card.
+//
+// Nothing on disk distinguishes "logged out" from "idle since the last
+// refresh", so the live `claude auth status --json` probe is the only
+// authoritative signal — the credential file answers only "is there a login
+// here, and can it renew itself". RefreshTokenExpiresAt is therefore parsed
+// (documenting the field we deliberately ignore) but never consulted.
 //
 // SubscriptionType is the plan Claude Code itself reports in /usage → ACCOUNT
 // ("max", "pro", …) and is the ONLY place the plan is written: there is no
@@ -123,12 +142,6 @@ func (c claudeOAuthCredentials) claudeCredentialAccount() string {
 	return firstNonEmpty(c.Email, c.Account, c.Organization)
 }
 
-// claudeAuthExpiryWarnWindow is how far ahead of the refresh-token deadline we
-// warn. Claude native strips env credentials and requires a subscription
-// /login, so an expired OAuth session stalls a chat headlessly (the same class
-// of failure Grok hits).
-const claudeAuthExpiryWarnWindow = 48 * time.Hour
-
 // claudeKeychainReader returns the raw Claude credential JSON from the platform
 // credential store used when Claude Code does NOT persist it to
 // ~/.claude/.credentials.json — on macOS the login lives in the encrypted
@@ -151,9 +164,11 @@ func readClaudeKeychainCredential() ([]byte, bool) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(
+	keychainCmd := exec.CommandContext(
 		ctx, "security", "find-generic-password", "-s", "Claude Code-credentials", "-w",
-	).Output()
+	)
+	hideWindow(keychainCmd) // no-op off Windows; kept uniform with the other probes
+	out, err := keychainCmd.Output()
 	if err != nil {
 		return nil, false
 	}
@@ -203,37 +218,43 @@ func usingDefaultClaudeConfigDir() bool {
 	return os.Getenv("CLAUDE_CONFIG_DIR") == ""
 }
 
-func claudeLoginDeadlineMs(creds claudeOAuthCredentials) int64 {
+// claudeCredentialExpiry describes what the on-disk credential can honestly say
+// about the login: the access token's expiry stamp, and whether the credential
+// carries a refresh token (so Claude Code renews it without a re-login).
+//
+// A renewable credential's stamp is informational ONLY — the card labels it
+// "(renews automatically)" and no code path may turn it into an expired verdict.
+// This matches the Codex parser, which reports the access-token expiry for a
+// refreshable credential and never flips authState on it.
+func claudeCredentialExpiry(creds claudeOAuthCredentials) (deadlineMs int64, renewable bool) {
 	oauth := creds.ClaudeAiOauth
-	if oauth.RefreshToken != "" {
-		return oauth.RefreshTokenExpiresAt
-	}
-	if oauth.AccessToken != "" {
-		return oauth.ExpiresAt
-	}
-	return 0
+	return oauth.ExpiresAt, oauth.RefreshToken != ""
 }
 
-// claudeAuthNotice returns a card notice + severity when the claude.ai
-// subscription login is (nearly) expired. Renewable credentials use the
-// refresh-token expiry; access-token-only credentials use the access expiry
-// because they cannot renew. Returns ("","") when no reliable OAuth deadline is
-// available.
+// claudeAuthNotice returns a card notice + severity when the credential ITSELF
+// proves the login is unusable — an access-token-only credential (no refresh
+// token) whose token has already expired, which nothing can renew.
+//
+// A renewable credential never produces a notice here: its stamps go stale
+// whenever Claude Code has been idle, so the only trustworthy sign-out signal is
+// the live `claude auth status` probe in Parse. There is deliberately no
+// "expires soon" warning any more — with the refresh stamp discredited, no field
+// on disk states a future re-login date, and an access token's few-hour expiry
+// would fire the warning permanently.
 func claudeAuthNotice(creds claudeOAuthCredentials, now time.Time) (string, string) {
-	deadlineMs := claudeLoginDeadlineMs(creds)
-	if deadlineMs <= 0 {
-		return "", "" // no OAuth deadline (API-key or unexpected layout) — don't guess
+	deadlineMs, renewable := claudeCredentialExpiry(creds)
+	if renewable || deadlineMs <= 0 {
+		return "", "" // renewable, API-key, or unexpected layout — don't guess
 	}
-	deadline := time.UnixMilli(deadlineMs)
-	if !deadline.After(now) {
+	if !time.UnixMilli(deadlineMs).After(now) {
 		return "Claude login has expired — run `claude` on the terminal computer and sign in (/login) again.", "error"
-	}
-	if deadline.Before(now.Add(claudeAuthExpiryWarnWindow)) {
-		return "Claude login expires soon — run `claude` on the terminal computer and sign in (/login) to avoid an interrupted session.", "warning"
 	}
 	return "", ""
 }
 
+// applyClaudeAuthState publishes the auth state the CREDENTIAL supports, and
+// reports whether a usable credential was found at all. Parse then lets the live
+// probe override this in either direction.
 func applyClaudeAuthState(usage *cliAgentUsage, creds claudeOAuthCredentials, now time.Time) bool {
 	if usage == nil {
 		return false
@@ -245,18 +266,41 @@ func applyClaudeAuthState(usage *cliAgentUsage, creds claudeOAuthCredentials, no
 	usage.Authenticated = authBoolPtr(true)
 	usage.AuthState = "authenticated"
 	usage.LoginExpirationState = loginExpirationNotReported
-	deadlineMs := claudeLoginDeadlineMs(creds)
+	deadlineMs, renewable := claudeCredentialExpiry(creds)
 	if deadlineMs <= 0 {
+		if renewable {
+			usage.LoginExpirationState = loginExpirationRefreshable
+		}
 		return true
 	}
 	deadline := time.UnixMilli(deadlineMs).UTC()
-	usage.LoginExpirationState = loginExpirationKnown
 	usage.LoginExpiresAt = deadline.Format(time.RFC3339)
+	if renewable {
+		// Renewable: report the stamp so the row is not permanently blank, but
+		// leave the login authenticated past it — the next request renews it.
+		usage.LoginExpirationState = loginExpirationRefreshable
+		return true
+	}
+	usage.LoginExpirationState = loginExpirationKnown
 	if !deadline.After(now) {
 		usage.Authenticated = authBoolPtr(false)
 		usage.AuthState = "expired"
 	}
 	return true
+}
+
+// claudeDeadlinePassed reports whether the published login deadline is in the
+// past. Unparseable/absent stamps read as "not passed" so a formatting change
+// can never manufacture an expiry.
+func claudeDeadlinePassed(usage *cliAgentUsage, now time.Time) bool {
+	if usage == nil || usage.LoginExpiresAt == "" {
+		return false
+	}
+	deadline, err := time.Parse(time.RFC3339, usage.LoginExpiresAt)
+	if err != nil {
+		return false
+	}
+	return !deadline.After(now)
 }
 
 func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
@@ -279,6 +323,10 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 	// auth-expiry notice — one shape, so those three can never disagree.
 	credentialFound := false
 	credentialUsable := false
+	// Whether the notice on the card was authored from the credential's own
+	// expiry. Only that notice may be withdrawn by a definite signed-in probe —
+	// a notice from any other source is not this block's to clear.
+	authNoticeApplied := false
 	if raw, ok := readClaudeCredentialsRaw(base); ok {
 		credentialFound = true
 		creds := claudeOAuthCredentials{}
@@ -287,16 +335,18 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 			usage.Account = creds.claudeCredentialAccount()
 			usage.Plan = creds.ClaudeAiOauth.SubscriptionType
 
-			// Proactive auth-expiry notice. Chat-direct Claude spawns
-			// `claude --output-format stream-json` with env credentials stripped
-			// (claude_auth_detect.go) so it MUST use the claude.ai subscription login —
-			// an expired one stalls the session on a `/login` it can't show headlessly.
-			// Surface it in this regular usage scan so the dashboard prompts a re-login
-			// first. (No numeric usage-limit notice exists on this parser, so there's
-			// nothing to prioritize against.)
+			// Auth notice for a credential that cannot renew itself. Chat-direct
+			// Claude spawns `claude --output-format stream-json` with env
+			// credentials stripped (claude_auth_detect.go) so it MUST use the
+			// claude.ai subscription login — an unusable one stalls the session on
+			// a `/login` it can't show headlessly. Surface it in this regular usage
+			// scan so the dashboard prompts a re-login first. A definite signed-in
+			// probe below withdraws it; only a lapsed NON-renewable credential can
+			// raise it, so a renewable login going idle never does.
 			if notice, severity := claudeAuthNotice(creds, now); notice != "" {
 				usage.Notice = notice
 				usage.NoticeSeverity = severity
+				authNoticeApplied = true
 			}
 		}
 	}
@@ -337,6 +387,12 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 	// what the status-line hook / stream-capture wrote.
 	usage.AccountFingerprint = fingerprintAccount(p.Provider(), credsAccount)
 	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)
+	// `claude auth status --json` is the only authoritative signal, so it decides
+	// in BOTH directions. It previously could not clear a credential-derived
+	// "expired" (`else if usage.AuthState != "expired"`), which is exactly the
+	// state a stale-but-valid credential produces — a definite loggedIn:true was
+	// discarded, the card read "Login expired", and the error notice blanked
+	// every usage bar below it.
 	if loggedIn, known := claudeAuthStatusProbe(detected.Path); known {
 		if !loggedIn {
 			usage.Authenticated = authBoolPtr(false)
@@ -345,9 +401,25 @@ func (p claudeCodeUsageParser) Parse(home string, detected detectedCLIAgent, now
 			usage.LoginExpirationState = loginExpirationNotReported
 			usage.Notice = "Claude is not signed in on this computer — run `claude` and sign in (/login) on the terminal computer."
 			usage.NoticeSeverity = "error"
-		} else if usage.AuthState != "expired" {
+		} else {
 			usage.Authenticated = authBoolPtr(true)
 			usage.AuthState = "authenticated"
+			if authNoticeApplied {
+				// The credential's own expiry notice described a session the
+				// probe just proved is live. Drop it — leaving it would keep the
+				// card's "Login expired" chip and (below) blank the metrics.
+				usage.Notice = ""
+				usage.NoticeSeverity = ""
+			}
+			if usage.LoginExpirationState == loginExpirationKnown && claudeDeadlinePassed(usage, now) {
+				// An access-token-only credential whose stamp has lapsed, on a
+				// session the probe says is live: the file is behind the CLI, not
+				// the CLI behind the file. Publishing the passed stamp would let
+				// the card re-derive "Expired" from a date the probe just
+				// contradicted, so report no deadline instead of a wrong one.
+				usage.LoginExpiresAt = ""
+				usage.LoginExpirationState = loginExpirationNotReported
+			}
 		}
 	} else if !credentialUsable && (credentialFound || strings.TrimSpace(detected.Path) != "") {
 		usage.Authenticated = authBoolPtr(false)
