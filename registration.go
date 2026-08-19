@@ -60,15 +60,6 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
-// getDeviceName returns the computer name or a default
-func getDeviceName() string {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return "Unknown Device"
-	}
-	return hostname
-}
-
 // getRegistrationURL returns the base URL for registration API.
 // EnvAPIEndpoint is set via ldflags at build time for each environment.
 // Can be overridden via TERMINAL_SERVICE_URL env var for local development.
