@@ -59,6 +59,11 @@ var claudeAuthStatusProbe = func(path string) (bool, bool) {
 var runClaudeAuthStatusCommand = func(ctx context.Context, path string, env []string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, path, "auth", "status", "--json")
 	cmd.Env = env
+	// Background probe: the agent is a tray app with no console of its own, so
+	// a console child would otherwise flash a window on the user's desktop
+	// every time usage/rate-limit collection runs. Same treatment as every
+	// other silent probe (see probeVersionArgs in systemInfo.go).
+	hideWindow(cmd)
 	return cmd.Output()
 }
 
@@ -151,9 +156,11 @@ func readClaudeKeychainCredential() ([]byte, bool) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(
+	keychainCmd := exec.CommandContext(
 		ctx, "security", "find-generic-password", "-s", "Claude Code-credentials", "-w",
-	).Output()
+	)
+	hideWindow(keychainCmd) // no-op off Windows; kept uniform with the other probes
+	out, err := keychainCmd.Output()
 	if err != nil {
 		return nil, false
 	}

@@ -35,7 +35,11 @@ var codexAuthStatusProbe = func(path string) (bool, bool) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, path, "login", "status").CombinedOutput()
+	cmd := exec.CommandContext(ctx, path, "login", "status")
+	// Background probe: hide the console the child would otherwise pop up on
+	// Windows, where the agent itself runs windowless in the tray.
+	hideWindow(cmd)
+	out, err := cmd.CombinedOutput()
 	status := strings.ToLower(string(out))
 	if strings.Contains(status, "not logged in") || strings.Contains(status, "login required") {
 		return false, true
