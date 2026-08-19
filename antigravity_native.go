@@ -230,7 +230,7 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string
 
 	// Resolve the start cwd through symlinks; the resolved value becomes the
 	// session's OWN workspace root. Each later Send re-resolves Cwd against
-	// it (see antigravityContainedCwd) because no CLI process launches until
+	// it (see containedCwd) because no CLI process launches until
 	// a turn arrives, leaving a TOCTOU window in which a cwd component could
 	// be swapped for a symlink — the swap resolves elsewhere and no longer
 	// lands inside the root captured here.
@@ -242,7 +242,7 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string
 	// at start — a directory the server itself had chosen. The same signed
 	// command channel runs claude/codex/exec anywhere with no such jail, so
 	// the device-home comparison defended nothing.
-	resolvedCwd, err := antigravityContainedCwd(cwd, "")
+	resolvedCwd, err := containedCwd(cwd, "")
 	if err != nil {
 		return err
 	}
@@ -396,7 +396,7 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	// would silently drop every captured ID and force perpetual replay. Resolving
 	// per turn just before launch also closes the start→send symlink-swap TOCTOU
 	// that Start's earlier check cannot (no process launches until this Send).
-	runDir, cwdErr := antigravityContainedCwd(session.Cwd, session.WorkspaceRoot)
+	runDir, cwdErr := containedCwd(session.Cwd, session.WorkspaceRoot)
 	if cwdErr != nil {
 		return m.publishTurnError(session, publishFn,
 			fmt.Sprintf("cwd containment revalidation failed: %v", cwdErr))
@@ -607,16 +607,20 @@ func killAntigravityProcessTree(cmd *exec.Cmd) {
 
 // runOneShot spawns one `agy --print` process, drains stdout/stderr concurrently
 // (required to avoid pipe deadlock), and waits for exit. Does not publish frames.
-// antigravityContainedCwd resolves symlinks on cwd and, when workspaceRoot is
-// set, verifies the resolved cwd stays inside the resolved root, returning the
-// real (symlink-free) cwd to use as the process working directory. Called from
-// Start with an empty root (resolve-only — the result BECOMES the session's
-// root) and again per turn (in the Send path, just before launch) against
-// that captured root, so a cwd component that is swapped for a symlink
-// between antigravity_native_start and antigravity_native_send resolves
-// elsewhere and cannot run `agy --dangerously-skip-permissions` outside the
+// containedCwd resolves symlinks on cwd and, when workspaceRoot is set,
+// verifies the resolved cwd stays inside the resolved root, returning the real
+// (symlink-free) cwd to use as the process working directory. Called from a
+// one-shot-per-turn manager's Start with an empty root (resolve-only — the
+// result BECOMES the session's root) and again per turn (in the Send path,
+// just before launch) against that captured root, so a cwd component that is
+// swapped for a symlink between <kind>_native_start and <kind>_native_send
+// resolves elsewhere and cannot run an auto-approving CLI outside the
 // directory the session was started in.
-func antigravityContainedCwd(cwd, workspaceRoot string) (string, error) {
+//
+// Shared by AntigravityNativeManager and OpenCodeNativeManager: both launch no
+// process until a turn arrives, which is exactly what leaves the TOCTOU window
+// this closes.
+func containedCwd(cwd, workspaceRoot string) (string, error) {
 	resolvedCwd, err := filepath.EvalSymlinks(cwd)
 	if err != nil {
 		return "", fmt.Errorf("cwd %q symlink resolution failed: %w", cwd, err)
@@ -653,7 +657,7 @@ func (m *AntigravityNativeManager) runOneShot(
 	// not just cmd.Process, or those descendants leak and block the drain.
 	detachControllingTTY(cmd)
 	// runDir is the caller's per-turn symlink-resolved, workspace-contained cwd
-	// (antigravityContainedCwd, computed just before this Send). agy launches from
+	// (containedCwd, computed just before this Send). agy launches from
 	// it AND keys last_conversations.json by it, so the caller reuses the exact
 	// same value for the capture lock and native-ID lookup — a symlinked
 	// session.Cwd would otherwise never match agy's recorded key.
@@ -1017,7 +1021,9 @@ func sanitizeAntigravityEnv(env []string) []string {
    Capability probe + native ID capture
    -------------------------------------------------------------------------- */
 
-var antigravityVersionRe = regexp.MustCompile(`(\d+)\.(\d+)\.(\d+)`)
+// semverRe extracts a major.minor.patch triple from arbitrary --version
+// output. Shared by every capability probe that gates on a version floor.
+var semverRe = regexp.MustCompile(`(\d+)\.(\d+)\.(\d+)`)
 
 // Capability probe cache — avoids spawning `agy --version` on every Start.
 var (
@@ -1075,7 +1081,7 @@ func probeAntigravityNativeCapabilityUncached() error {
 		// Empty but successful version probe — accept (rare builds).
 		return nil
 	}
-	m := antigravityVersionRe.FindStringSubmatch(ver)
+	m := semverRe.FindStringSubmatch(ver)
 	if m == nil {
 		// Unknown version format — fail closed for native chat.
 		return fmt.Errorf("unsupported Antigravity CLI version %q (need ≥ %s)", ver, antigravityNativeMinVersion)
@@ -1088,8 +1094,8 @@ func probeAntigravityNativeCapabilityUncached() error {
 
 // compareSemver returns -1/0/1 for a < b / a == b / a > b (major.minor.patch).
 func compareSemver(a, b string) int {
-	pa := antigravityVersionRe.FindStringSubmatch(a)
-	pb := antigravityVersionRe.FindStringSubmatch(b)
+	pa := semverRe.FindStringSubmatch(a)
+	pb := semverRe.FindStringSubmatch(b)
 	if pa == nil || pb == nil {
 		return strings.Compare(a, b)
 	}

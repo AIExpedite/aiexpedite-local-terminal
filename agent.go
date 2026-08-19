@@ -30,7 +30,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.0.4"
+var Version = "v1.0.5"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -282,7 +282,17 @@ func StartAgent(cfg *Config) {
 	go globalAntigravityNativeManager.CleanupStale(antigravityNativeMaxAge)
 	fmt.Println("[aiexpedite] Antigravity native manager ready")
 
-	/* 3b5. Register in-flight work sources for the update-drain accounting -- */
+	/* 3b5. Initialize OpenCode native manager (one-shot run --format json) -- */
+	// Drives `opencode run --format json` with exact `--session <id>` resume for
+	// OpenCode Chat. Same logical-session model as Antigravity (no resident
+	// process between turns), but the JSON events are incremental, so each one
+	// is published as its own chunk. Never uses ambiguous --continue.
+
+	globalOpenCodeNativeManager = NewOpenCodeNativeManager()
+	go globalOpenCodeNativeManager.CleanupStale(openCodeNativeMaxAge)
+	fmt.Println("[aiexpedite] OpenCode native manager ready")
+
+	/* 3b6. Register in-flight work sources for the update-drain accounting -- */
 	// ActiveWork() must see every accepted session before an automatic update
 	// may install. Register one contributor per manager now that they exist so
 	// a drain waits for interactive sessions to finish (drain.go).
@@ -313,6 +323,12 @@ func StartAgent(cfg *Config) {
 	registerDrainWorkSource(func() int {
 		if globalAntigravityNativeManager != nil {
 			return globalAntigravityNativeManager.ActiveCount()
+		}
+		return 0
+	})
+	registerDrainWorkSource(func() int {
+		if globalOpenCodeNativeManager != nil {
+			return globalOpenCodeNativeManager.ActiveCount()
 		}
 		return 0
 	})

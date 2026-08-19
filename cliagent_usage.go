@@ -69,13 +69,20 @@ type cliAgentUsageMetric struct {
 // entry per detected agent on this device — multi-device aggregation is the
 // frontend hook's job, not ours.
 type cliAgentUsage struct {
-	CliAgentID         string                `json:"cliAgentId,omitempty"`
-	Provider           string                `json:"provider"`
-	Name               string                `json:"name,omitempty"`
-	Version            string                `json:"version,omitempty"`
-	Path               string                `json:"path,omitempty"`
-	Account            string                `json:"account,omitempty"`
-	Plan               string                `json:"plan,omitempty"`
+	CliAgentID string `json:"cliAgentId,omitempty"`
+	Provider   string `json:"provider"`
+	Name       string `json:"name,omitempty"`
+	Version    string `json:"version,omitempty"`
+	Path       string `json:"path,omitempty"`
+	Account    string `json:"account,omitempty"`
+	Plan       string `json:"plan,omitempty"`
+	// Model is the DEVICE-LEVEL default model this agent would use, when the
+	// agent can report one. A project-level config in the session cwd can
+	// override it, so the card labels this as the device default rather than
+	// "the model in use". Additive on an existing snapshot shape — older
+	// backends and frontends that do not read it are unaffected, and the four
+	// pre-existing parsers simply never populate it.
+	Model              string                `json:"model,omitempty"`
 	AccountFingerprint string                `json:"accountFingerprint,omitempty"`
 	Metrics            []cliAgentUsageMetric `json:"metrics,omitempty"`
 	CollectedAt        string                `json:"collectedAt"`

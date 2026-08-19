@@ -406,7 +406,7 @@ func TestCaptureAntigravityNativeID_NoCwdMappingDoesNotAdoptGlobalDB(t *testing.
 
 // TestCaptureAntigravityNativeID_UsesResolvedCwdKey is the regression for the
 // symlinked-cwd capture miss: agy launches from and keys last_conversations.json
-// by the symlink-resolved cwd (antigravityContainedCwd → cmd.Dir), so the capture
+// by the symlink-resolved cwd (containedCwd → cmd.Dir), so the capture
 // lookup must use that same resolved path. Passing the raw symlinked session.Cwd
 // never matches agy's key, silently dropping every native ID and forcing
 // perpetual bounded replay instead of exact --conversation resume.
@@ -458,9 +458,9 @@ func TestCaptureAntigravityNativeID_UsesResolvedCwdKey(t *testing.T) {
 	if got := captureAntigravityNativeID(link, before); got != "" {
 		t.Fatalf("symlinked cwd must not match agy's resolved key; got %q", got)
 	}
-	// Fixed: the Send path passes the resolved runDir (antigravityContainedCwd
+	// Fixed: the Send path passes the resolved runDir (containedCwd
 	// output, also assigned to cmd.Dir), which matches agy's recorded key.
-	runDir, err := antigravityContainedCwd(link, "")
+	runDir, err := containedCwd(link, "")
 	if err != nil {
 		t.Fatalf("containment resolution failed: %v", err)
 	}
@@ -528,7 +528,7 @@ func TestAntigravityNativeManager_StartRootsContainmentAtSessionCwd(t *testing.T
 	if sess == nil {
 		t.Fatal("started session missing from manager")
 	}
-	resolved, rErr := antigravityContainedCwd(anywhere, "")
+	resolved, rErr := containedCwd(anywhere, "")
 	if rErr != nil {
 		t.Fatalf("resolve start cwd: %v", rErr)
 	}
@@ -543,7 +543,7 @@ func TestAntigravityNativeManager_StartRootsContainmentAtSessionCwd(t *testing.T
 // Start's check can go stale because no `agy` process launches until a later
 // Send, so a cwd subdirectory swapped for a symlink escaping the workspace root
 // between antigravity_native_start and antigravity_native_send must be caught
-// before launch. antigravityContainedCwd returns the resolved cwd when contained
+// before launch. containedCwd returns the resolved cwd when contained
 // and an error once the path escapes. The Send path reuses that resolved cwd for
 // cmd.Dir, the capture lock, and the native-ID lookup so a symlinked cwd cannot
 // silently drop captured conversation IDs.
@@ -558,7 +558,7 @@ func TestAntigravityContainedCwd_RevalidatesSymlinkSwap(t *testing.T) {
 
 	// While the real directory is inside root, the check passes and returns the
 	// resolved (symlink-free) path to use as the working directory.
-	resolved, err := antigravityContainedCwd(cwd, root)
+	resolved, err := containedCwd(cwd, root)
 	if err != nil {
 		t.Fatalf("contained cwd must pass; got %v", err)
 	}
@@ -574,14 +574,14 @@ func TestAntigravityContainedCwd_RevalidatesSymlinkSwap(t *testing.T) {
 	if err := os.Symlink(outside, cwd); err != nil {
 		t.Skipf("symlink unsupported on this platform: %v", err)
 	}
-	if _, err := antigravityContainedCwd(cwd, root); err == nil {
+	if _, err := containedCwd(cwd, root); err == nil {
 		t.Fatal("expected revalidation to reject a cwd swapped to a symlink outside the root")
 	} else if !strings.Contains(err.Error(), "outside the session's workspace root") {
 		t.Fatalf("unexpected error (want containment rejection): %v", err)
 	}
 
 	// With no configured root the check is skipped (plain absolute/exists contract).
-	if _, err := antigravityContainedCwd(cwd, ""); err != nil {
+	if _, err := containedCwd(cwd, ""); err != nil {
 		t.Fatalf("empty root must skip containment; got %v", err)
 	}
 }
