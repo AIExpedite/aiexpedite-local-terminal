@@ -176,6 +176,23 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	enableGrokAlwaysApprove := sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
 	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
 
+	// OpenCode's LEGACY session_start / PTY path carries its prompt as a
+	// trailing positional (the resident chat path in opencode_native.go writes
+	// it to a temp file consumed on stdin instead), so it is subject to the
+	// Windows CreateProcess ~32KB command-line ceiling. Refuse above the cap
+	// rather than letting CreateProcess fail with an opaque "command line too
+	// long", and measure in BYTES — a character-count check passes a multibyte
+	// prompt that still exceeds the real limit. grok solves the same problem by
+	// relocating its prompt to --prompt-file below; opencode's legacy path has
+	// no such flag, so failing closed is the honest answer.
+	if isOpenCodeCommand(command) {
+		if n := argvByteLen(cliArgs); n > openCodeInteractiveMaxPromptBytes {
+			return fmt.Errorf(
+				"opencode arguments are %d bytes, exceeding the %d-byte limit for a one-shot session; use an OpenCode chat session for long prompts",
+				n, openCodeInteractiveMaxPromptBytes)
+		}
+	}
+
 	// Opt-in PTY path for recognized resident TUI agents (agy/antigravity) that
 	// require a real terminal. macOS/Linux only — startPTYSession rejects on
 	// Windows (ConPTY deferred). PTY output is merged (stdout+stderr) and
@@ -693,6 +710,13 @@ func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
 	switch {
 	case strings.HasPrefix(base, "claude"):
 		return false
+	case isOpenCodeCommand(command):
+		// One-shot with the prompt on argv and NO stdin protocol: leaving the
+		// pipe open would hand `opencode run` an input stream it waits on.
+		// Close unconditionally — unlike codex there is no "session opened with
+		// no prompt yet" case here, because this legacy path always carries its
+		// prompt positionally.
+		return true
 	case strings.HasPrefix(base, "codex"):
 		// One-shot, stdin-fed CLIs: close stdin right after start ONLY when a
 		// prompt was delivered at start (the delegate/one-shot path). When the
@@ -759,6 +783,21 @@ func detectCLITerminalEvent(command, line string) bool {
 		// (thought / text / end); `end` marks the natural end of the turn,
 		// right before the headless `-p` process exits.
 		return eventType == "end"
+	case isOpenCodeCommand(command):
+		// `opencode run --format json` closes a turn with a session/step
+		// completion event, immediately before the one-shot process exits.
+		// Matched by suffix because the exact type name has moved across
+		// releases; an unrecognised terminal event is harmless (the
+		// process-exit path still flushes), a false positive is not, so
+		// `error` is excluded.
+		lowered := strings.ToLower(eventType)
+		if strings.Contains(lowered, "error") {
+			return false
+		}
+		return strings.HasSuffix(lowered, "completed") ||
+			strings.HasSuffix(lowered, "done") ||
+			lowered == "finish" ||
+			lowered == "session.idle"
 	}
 	return false
 }
@@ -1582,6 +1621,18 @@ func isAntigravityCommand(command string) bool {
 	return strings.HasPrefix(base, "agy") || strings.HasPrefix(base, "antigravity")
 }
 
+// isOpenCodeCommand reports whether command routes to the OpenCode CLI.
+// Robust to paths / .exe / .cmd shims, like its siblings.
+//
+// Prefix-matching `opencode` (rather than an exact compare) keeps the argv
+// shaping, the resident-agent classification and the stdin policy in lockstep
+// for any future `opencode-nightly`-style variant — a variant that got the
+// shaping but not the classification would be headless-hardened and then handed
+// interactive-mode argv.
+func isOpenCodeCommand(command string) bool {
+	return strings.HasPrefix(commandBaseName(command), "opencode")
+}
+
 // isResidentAgentSessionCommand reports whether a session_start command is a
 // resident CLI agent that keeps its interactive-capable env. These are exactly
 // the commands buildInteractiveCLIArgs shapes (claude/codex/grok) plus the
@@ -1602,7 +1653,13 @@ func isResidentAgentSessionCommand(command string) bool {
 		strings.HasPrefix(base, "grok"):
 		return true
 	}
-	return isAntigravityCommand(command)
+	// OpenCode belongs here for the same reason `grok` does, and the failure
+	// mode if it is omitted is the one grok_acp.go documents: a bare `opencode`
+	// launches the interactive TUI, which on a headless remote session produces
+	// escape-sequence noise and never exits. Classifying it as a resident agent
+	// is what routes it through buildOpenCodeInteractiveArgs, which forces
+	// `run --format json` and can never fall through to the TUI.
+	return isAntigravityCommand(command) || isOpenCodeCommand(command)
 }
 
 /* --------------------------------------------------------------------------
@@ -1626,6 +1683,14 @@ func isResidentAgentSessionCommand(command string) bool {
 //     it needs a real TTY), so the prompt must stay on argv. agy resolves
 //     to a native `agy.exe` (NOT a cmd.exe shim), so the relevant cap is
 //     the 32KB CreateProcess limit, not an 8191-char cmd.exe cap.
+//   - opencode:    forced `run --format json` with the prompt as a trailing
+//     positional. `opencode run` is one-shot and does not
+//     hold a stdin protocol open, so stdinPrompt is "" and
+//     stdin is closed right after start. (The RESIDENT chat
+//     path in opencode_native.go delivers the prompt on stdin
+//     from a temp file instead; this legacy session_start /
+//     PTY path keeps it positional, which is why it enforces
+//     a byte cap the resident path does not need.)
 //   - other:       prompt stays in args
 //
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
@@ -1640,6 +1705,8 @@ func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysAppr
 		return buildCodexInteractiveArgs(args)
 	case isAntigravityCommand(command):
 		return buildAntigravityInteractiveArgs(args), ""
+	case isOpenCodeCommand(command):
+		return buildOpenCodeInteractiveArgs(args), ""
 	case strings.HasPrefix(base, "grok"):
 		return buildGrokInteractiveArgs(args, enableGrokAlwaysApprove), ""
 	default:
@@ -1971,6 +2038,127 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	result = append(result, trailing...)
 	return result
 }
+
+// buildOpenCodeInteractiveArgs shapes a one-shot `opencode` invocation for the
+// legacy session_start / PTY path.
+//
+// `run --format json` is ALWAYS forced and any caller token that would re-enter
+// the interactive TUI — a bare `opencode`, a second `run`, or a `--format`
+// override — is stripped. A bare `opencode` on a headless remote session starts
+// the TUI, which emits escape-sequence noise and never exits: the identical
+// trap grok_acp.go documents for bare `grok`.
+//
+// Diagnostic invocations (`--version`, `--help`, `models`, `auth …`) are
+// returned verbatim: shaping them would turn an information request into a
+// model run, and `opencode --version` is exactly how the capability probe and
+// the usage parser query the CLI.
+//
+// The prompt stays a trailing POSITIONAL here (unlike the resident chat path in
+// opencode_native.go, which writes it to a temp file consumed on stdin), so
+// this path is subject to the Windows CreateProcess argv ceiling — see
+// openCodeInteractiveMaxPromptBytes.
+func buildOpenCodeInteractiveArgs(args []string) []string {
+	if isOpenCodeDiagnosticInvocation(args) {
+		return args
+	}
+
+	forwarded := make([]string, 0, len(args)+3)
+	prompt := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		name := a
+		inlineValue := false
+		if idx := strings.Index(a, "="); idx > 0 {
+			name = a[:idx]
+			inlineValue = true
+		}
+		if openCodeStrippedFlags[name] {
+			if !inlineValue && openCodeValuedStrippedFlags[name] {
+				i++
+			}
+			continue
+		}
+		if a == "run" && len(forwarded) == 0 && len(prompt) == 0 {
+			// Already forced below; a second `run` parses as prompt text.
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			forwarded = append(forwarded, a)
+			// Flags the manager forwards that consume the next token.
+			if openCodeForwardedValuedFlags[name] && !inlineValue && i+1 < len(args) {
+				i++
+				forwarded = append(forwarded, args[i])
+			}
+			continue
+		}
+		prompt = append(prompt, a)
+	}
+
+	result := append([]string{"run", "--format", "json"}, forwarded...)
+	return append(result, prompt...)
+}
+
+// openCodeForwardedValuedFlags are caller flags the manager passes through that
+// take the NEXT argv token as their value. Without this the value would be
+// mistaken for prompt text and reordered behind the flags.
+var openCodeForwardedValuedFlags = map[string]bool{
+	"--model": true,
+	"-m":      true,
+	"--agent": true,
+	"--port":  true,
+	"--host":  true,
+}
+
+// openCodeDiagnosticTokens are invocations that ask OpenCode for information
+// instead of running a prompt. Reshaping any of these into `run` would burn a
+// model call the caller never asked for.
+var openCodeDiagnosticTokens = map[string]bool{
+	"--version": true, "-version": true, "-v": true,
+	"--help": true, "-help": true, "-h": true,
+	"auth": true, "models": true, "upgrade": true, "serve": true,
+	"github": true, "mcp": true, "agent": true, "stats": true,
+}
+
+// isOpenCodeDiagnosticInvocation reports an invocation OpenCode answers with
+// information rather than a model run. Like agy, OpenCode pre-scans its whole
+// command line for `--help` / `--version`, so those are matched wherever they
+// appear; subcommands only count as the FIRST token.
+func isOpenCodeDiagnosticInvocation(args []string) bool {
+	for i, a := range args {
+		lowered := strings.ToLower(strings.TrimSpace(a))
+		if name, _, ok := strings.Cut(lowered, "="); ok {
+			lowered = name
+		}
+		switch lowered {
+		case "--version", "-version", "-v", "--help", "-help", "-h":
+			return true
+		}
+		if i == 0 && openCodeDiagnosticTokens[lowered] && !strings.HasPrefix(lowered, "-") {
+			return true
+		}
+	}
+	return false
+}
+
+// argvByteLen totals the bytes an argv slice contributes to the command line,
+// including the single separator each token needs. Used for the CreateProcess
+// ceiling check, which is a limit on the assembled command line rather than on
+// any one argument.
+func argvByteLen(args []string) int {
+	n := 0
+	for _, a := range args {
+		n += len(a) + 1
+	}
+	return n
+}
+
+// openCodeInteractiveMaxPromptBytes caps the prompt on the LEGACY positional
+// path only. Measured in BYTES, not characters: Windows CreateProcess caps the
+// whole command line near 32KB and a multibyte prompt passes a character-count
+// check while exceeding the real limit. The resident chat path
+// (opencode_native.go) is exempt — its prompt goes to a temp file consumed on
+// stdin and never touches argv.
+const openCodeInteractiveMaxPromptBytes = 24 * 1024
 
 // antigravityDiagnosticTokens are single-token invocations that ask the CLI for
 // information instead of running a prompt. Subcommands are from `agy --help` on
@@ -2378,15 +2566,7 @@ var grokSubcommandActions = map[string]bool{
 // Returns "" (→ CreateTemp uses the OS temp dir) when the home can't be resolved
 // or the directory can't be created, so the rewrite is always best-effort.
 func grokPromptTempDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return ""
-	}
-	dir := filepath.Join(home, ".ai-expedite", "grok-prompts")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return ""
-	}
-	return dir
+	return cliPromptTempDir("grok-prompts")
 }
 
 // Best-effort: on any temp-file write error, or when the argv was NOT produced

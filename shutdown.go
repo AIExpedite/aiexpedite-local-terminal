@@ -175,6 +175,12 @@ func tearDownSubprocesses() {
 		globalAntigravityNativeManager.ShutdownAll()
 	}
 
+	// Same rationale for OpenCode native — an in-flight `opencode run` child may
+	// still be executing a turn (and its tools) when the agent exits.
+	if globalOpenCodeNativeManager != nil {
+		globalOpenCodeNativeManager.ShutdownAll()
+	}
+
 	// Cleanup GCS storage client (closes idle HTTP/2 streams cleanly).
 	CloseStorageClient()
 

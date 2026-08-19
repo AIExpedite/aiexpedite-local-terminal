@@ -51,6 +51,11 @@ func defaultCLIAgentCatalog() []cliAgentCatalogEntry {
 		{ID: "antigravity", DisplayName: "Antigravity", DisplayOrder: 10, Command: "agy", DetectionKeys: []string{"antigravity", "agy"}},
 		{ID: "claudeCode", DisplayName: "Claude Code", DisplayOrder: 20, Command: "claude", DetectionKeys: []string{"claudeCode", "claude"}},
 		{ID: "codex", DisplayName: "Codex", DisplayOrder: 30, Command: "codex", DetectionKeys: []string{"codex"}},
+		// Same id/command/detection keys as db-content/dev/cliAgents/opencode.json
+		// so the built-in and backend-projected catalogs cannot drift. Devices
+		// detect OpenCode before the backend catalog projection reaches them, and
+		// a device that never receives a catalog still reports it.
+		{ID: "opencode", DisplayName: "OpenCode", DisplayOrder: 40, Command: "opencode", DetectionKeys: []string{"opencode", "openCode"}},
 		{ID: "grok", DisplayName: "Grok Build", DisplayOrder: 50, Command: "grok", DetectionKeys: []string{"grok", "grokBuild"}},
 	}
 }
