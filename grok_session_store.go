@@ -119,8 +119,13 @@ func linkGrokSessionStore(home string) error {
 // startup so a device that never runs grok never touches the directory.
 func pruneGrokSessionStoreOnce() {
 	grokSessionStorePruneOnce.Do(func() {
+		// Resolve the store path on THIS goroutine, not inside the one below.
+		// grokSessionStoreRoot is a plain global that tests swap and restore
+		// via t.Cleanup, so a background read of it races the restore and
+		// trips -race in an unrelated test.
+		store := grokSessionStoreDir()
 		go func() {
-			removed, err := pruneGrokSessionStore(grokSessionStoreMaxAge, time.Now())
+			removed, err := pruneGrokSessionStoreAt(store, grokSessionStoreMaxAge, time.Now())
 			if err != nil {
 				fmt.Printf("%s[grok-acp] session store prune failed: %v%s\n", colorYellow, err, colorReset)
 				return
@@ -143,7 +148,12 @@ func pruneGrokSessionStoreOnce() {
 // children keeps a long-running or recently-resumed conversation from being
 // deleted out from under a live session.
 func pruneGrokSessionStore(maxAge time.Duration, now time.Time) (int, error) {
-	store := grokSessionStoreDir()
+	return pruneGrokSessionStoreAt(grokSessionStoreDir(), maxAge, now)
+}
+
+// pruneGrokSessionStoreAt is pruneGrokSessionStore against an already-resolved
+// store directory, so callers running off-goroutine never read the global.
+func pruneGrokSessionStoreAt(store string, maxAge time.Duration, now time.Time) (int, error) {
 	cwdDirs, err := os.ReadDir(store)
 	if err != nil {
 		if os.IsNotExist(err) {

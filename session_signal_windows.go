@@ -7,40 +7,31 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"syscall"
 )
 
-// procGenerateConsoleCtrlEvent is resolved once at startup using the package-level
-// kernel32 handle (declared in tray_windows.go) to avoid a redundant DLL load and
-// repeated proc-lookup allocations on every sendInterrupt call.
-var procGenerateConsoleCtrlEvent = kernel32.NewProc("GenerateConsoleCtrlEvent")
-
-// sendInterrupt sends a Ctrl+C event to the process on Windows.
-// Uses taskkill as a reliable cross-process interrupt mechanism.
+// sendInterrupt asks the process to terminate gracefully on Windows.
+//
+// It deliberately does NOT use GenerateConsoleCtrlEvent. That call takes a
+// process GROUP id, not a pid, and none of the CLI children are spawned with
+// CREATE_NEW_PROCESS_GROUP — so passing a child's pid either fails or, worse,
+// resolves to the group the agent itself belongs to and delivers CTRL_BREAK to
+// our own console. The agent then dies with STATUS_CONTROL_C_EXIT (0xC000013A)
+// while trying to cancel one turn; under `go test` it took the whole test
+// binary down at TestOpenCodeNativeManager_TurnTimeoutIsReported, which is how
+// this was found.
+//
+// taskkill without /F is the graceful path, and /T covers the CLI's own
+// children. Callers all escalate to Process.Kill() when this returns an error
+// or the process does not exit in time, so a refusal here is never terminal.
 func sendInterrupt(process *os.Process) error {
 	if process == nil {
 		return fmt.Errorf("process is nil")
 	}
 
-	// On Windows, GenerateConsoleCtrlEvent doesn't work well across process groups.
-	// Instead, use taskkill with /T (tree) to send a terminate signal.
-	// For a more graceful approach, we first try sending Ctrl+C via
-	// GenerateConsoleCtrlEvent, then fall back to taskkill.
-
-	// Try GenerateConsoleCtrlEvent first (Ctrl+Break which is more reliable)
-	ret, _, err := procGenerateConsoleCtrlEvent.Call(
-		uintptr(syscall.CTRL_BREAK_EVENT),
-		uintptr(process.Pid),
-	)
-	if ret != 0 {
-		return nil // Success
-	}
-
-	// Fallback: use taskkill for a graceful termination
-	killCmd := exec.Command("taskkill", "/PID", fmt.Sprintf("%d", process.Pid))
+	killCmd := exec.Command("taskkill", "/PID", fmt.Sprintf("%d", process.Pid), "/T")
 	hideWindow(killCmd)
-	if killErr := killCmd.Run(); killErr != nil {
-		return fmt.Errorf("GenerateConsoleCtrlEvent failed (%v), taskkill also failed: %w", err, killErr)
+	if err := killCmd.Run(); err != nil {
+		return fmt.Errorf("taskkill of pid %d failed: %w", process.Pid, err)
 	}
 
 	return nil
