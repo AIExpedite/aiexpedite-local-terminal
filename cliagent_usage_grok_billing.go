@@ -76,7 +76,11 @@ type grokBillingRecord struct {
 
 // grokBillingSnapshot is the normalized view the parser plots.
 type grokBillingSnapshot struct {
-	UsedPercent      float64
+	UsedPercent float64
+	// HasUsedPercent is false when the record named a billing period but no
+	// usage figure — the shape Grok 1.0 emits. UsedPercent is meaningless then
+	// and must never be plotted; the period itself is still authoritative.
+	HasUsedPercent   bool
 	ObservedAt       time.Time
 	PeriodType       string
 	PeriodEnd        time.Time
@@ -204,18 +208,24 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 // percentage or no observation time is rejected outright: the card's freshness
 // rules need both, and a percentage we cannot age is worse than none at all.
 func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, bool) {
-	if rec.Ctx.Config.CreditUsagePercent == nil {
-		return grokBillingSnapshot{}, false
-	}
 	observed, err := time.Parse(time.RFC3339, rec.TS)
 	if err != nil {
 		return grokBillingSnapshot{}, false
 	}
 	snap := grokBillingSnapshot{
-		UsedPercent:      clampPercent(*rec.Ctx.Config.CreditUsagePercent),
 		ObservedAt:       observed,
 		PeriodType:       rec.Ctx.Config.CurrentPeriod.Type,
 		SubscriptionTier: rec.Ctx.SubscriptionTier,
+	}
+	// Grok 1.0 stopped emitting creditUsagePercent. Every other field of the
+	// record is unchanged, so the record is still the authoritative statement of
+	// the CURRENT billing period — it simply no longer says how much of it is
+	// used. Treat that as "usable record, unobserved usage" rather than "not a
+	// record": rejecting it made the scanner walk further back and publish a
+	// PRE-UPGRADE reading, under a period that had since ended.
+	if pct := rec.Ctx.Config.CreditUsagePercent; pct != nil && !math.IsNaN(*pct) {
+		snap.UsedPercent = clampPercent(*pct)
+		snap.HasUsedPercent = true
 	}
 	if end, err := time.Parse(time.RFC3339, rec.Ctx.Config.CurrentPeriod.End); err == nil {
 		snap.PeriodEnd = end
@@ -274,7 +284,20 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 	}
 	switch {
 	case snap.HasPeriodEnd && !now.Before(snap.PeriodEnd):
+		// The period we observed has ended; whatever it read no longer describes
+		// the live one.
 		credits.Unknown = true
+		credits.ObservedAt = observedAt
+	case !snap.HasUsedPercent:
+		// A current period the CLI no longer meters (Grok 1.0+). Report the
+		// window — its reset is real and useful — but never a percentage, and no
+		// ObservedAt: usage was not observed, and saying otherwise is how a card
+		// ends up claiming a six-day-old reading for a live window.
+		credits.Unknown = true
+		credits.ObservedAt = ""
+		if snap.HasPeriodEnd {
+			credits.ResetAt = snap.PeriodEnd.UTC().Format(time.RFC3339)
+		}
 	default:
 		credits.Total = floatPtr(100)
 		credits.Consumed = floatPtr(snap.UsedPercent)
