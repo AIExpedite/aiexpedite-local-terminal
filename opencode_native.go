@@ -61,6 +61,11 @@ import (
 const (
 	openCodeNativeMaxStdout = 8 * 1024 * 1024
 	openCodeNativeMaxStderr = 1 * 1024 * 1024
+	// Bounded copy of raw stdout kept purely for failure diagnosis (the
+	// missing-session probe). It is NEVER used as assistant text — that stays
+	// the parsed-event accumulation — so a banner or a plain-text CLI error
+	// cannot reach the transcript through it.
+	openCodeNativeMaxRawStdout = 64 * 1024
 	// Longest single JSON event line accepted from stdout. A frame beyond this
 	// is a hard turn error rather than a silent truncation — a half-parsed
 	// event would render as a corrupt assistant message.
@@ -422,7 +427,8 @@ func (m *OpenCodeNativeManager) Send(id, text string, publishFn PublishFunc, tur
 	// Exact-id resume failed with a recognized missing/stale session. Require a
 	// non-zero exit so ordinary assistant text mentioning "session not found"
 	// cannot trigger a costly false-positive replay. At most ONE replay per turn.
-	if useNativeResume && result.exitCode != 0 && looksLikeMissingOpenCodeSession(result.text, result.stderr) {
+	if useNativeResume && result.exitCode != 0 &&
+		looksLikeMissingOpenCodeSession(result.rawStdout, result.stderr) {
 		fmt.Printf("%s[opencode-native] Native resume failed for %s — replaying bounded transcript%s\n",
 			colorYellow, id, colorReset)
 		session.NativeSessionID = ""
@@ -554,6 +560,7 @@ func openCodeCompletionFrame(text string, usedReplay bool) string {
 // native id if any event carried one.
 type openCodeRunResult struct {
 	text          string
+	rawStdout     string
 	stderr        string
 	sessionID     string
 	exitCode      int
@@ -694,6 +701,7 @@ func (m *OpenCodeNativeManager) runOneShot(
 	}
 	return openCodeRunResult{
 		text:          strings.TrimSpace(stream.text.String()),
+		rawStdout:     strings.TrimSpace(stream.raw.String()),
 		stderr:        errOut,
 		sessionID:     stream.sessionID,
 		exitCode:      exitCode,
@@ -704,7 +712,12 @@ func (m *OpenCodeNativeManager) runOneShot(
 
 // openCodeStreamState accumulates what the stdout scan learned about a turn.
 type openCodeStreamState struct {
-	text      strings.Builder
+	text strings.Builder
+	// raw is a bounded verbatim copy of stdout. `opencode` reports a stale
+	// `--session` id as a PLAIN line ("Error: Session not found"), not as a
+	// JSON event, so the parsed text is empty on exactly the run that needs
+	// replay recovery. Detection reads this; the transcript never does.
+	raw       strings.Builder
 	sessionID string
 	overflow  bool
 	// bytes counts raw stdout consumed so a pathological run cannot buffer
@@ -737,6 +750,10 @@ func (m *OpenCodeNativeManager) streamOpenCodeEvents(
 		if state.bytes > openCodeNativeMaxStdout {
 			state.overflow = true
 			break
+		}
+		if state.raw.Len() < openCodeNativeMaxRawStdout {
+			state.raw.WriteString(line)
+			state.raw.WriteString("\n")
 		}
 		if text, sid, ok := parseOpenCodeEventLine(line); ok {
 			if text != "" {
