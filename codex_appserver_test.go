@@ -662,16 +662,27 @@ func TestCodexAppServerLifecycle_StartSendEnd(t *testing.T) {
 		t.Errorf("missing `item/started` notification")
 	}
 
-	// Verify stderr forwarding picked up the mock's startup warning.
-	mu.Lock()
+	// Verify stderr forwarding picked up the mock's startup warning. stdout and
+	// stderr are scanned by INDEPENDENT goroutines, so completing the stdout
+	// wait above says nothing about whether the stderr line has been published
+	// yet — asserting immediately raced that goroutine and flaked on macOS.
+	// Poll instead, like the `_ended` wait below.
+	stderrDeadline := time.Now().Add(5 * time.Second)
 	sawStderr := false
-	for _, msg := range captured {
-		if msg.Type == "codex_appserver_stderr" && strings.Contains(msg.Output, "mock-codex") {
-			sawStderr = true
+	for !sawStderr && time.Now().Before(stderrDeadline) {
+		mu.Lock()
+		for _, msg := range captured {
+			if msg.Type == "codex_appserver_stderr" && strings.Contains(msg.Output, "mock-codex") {
+				sawStderr = true
+				break
+			}
+		}
+		mu.Unlock()
+		if sawStderr {
 			break
 		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	mu.Unlock()
 	if !sawStderr {
 		t.Errorf("expected `codex_appserver_stderr` message containing `mock-codex`")
 	}
