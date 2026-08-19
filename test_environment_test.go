@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -14,4 +17,81 @@ func isolateTestUserHome(t *testing.T, home string) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("GROK_BIN_DIR", filepath.Join(home, ".grok", "bin"))
+}
+
+// ─────────────────────────── suite-wide sandbox ───────────────────────────
+//
+// isolateTestUserHome above is opt-in, and opting in is exactly what gets
+// forgotten. sandboxTestConfigDir is the package-wide backstop: TestMain calls
+// it before a single test runs, so no test can reach the developer's live
+// agent install even if it never thinks about paths at all.
+//
+// The incident it pins: on 2026-08-18 a `go test` run on a developer machine
+// overwrote ~/Library/Application Support/AIExpedite/config.json with a test
+// fixture (agent_id "agent-1", command_secret "secret",
+// pending_update_attempt_id "test-attempt") and appended fixture entries to the
+// live security.log. The write path was ordinary — TestExitDrain_* calls
+// SetOffline(true, cfg), SetOffline persists through ConfigPath(), and
+// ConfigPath() resolved the real directory because baseDir is derived from
+// $HOME in init(). The running agent lost its registration and its auto-updater
+// wedged reconciling an attempt id that never existed server-side.
+
+var (
+	// testSandboxDir is the throwaway home the whole suite runs inside.
+	testSandboxDir string
+	// realHomeAtStartup / realConfigDirAtStartup are the developer's actual
+	// paths, captured before the redirect purely so the guard tests can assert
+	// the suite is nowhere near them.
+	realHomeAtStartup      string
+	realConfigDirAtStartup string
+)
+
+// sandboxTestConfigDir redirects the process-wide config/data directory (and
+// the environment it is derived from) into a fresh temp directory. It returns
+// a cleanup func; TestMain must call it explicitly because os.Exit skips
+// deferred calls.
+func sandboxTestConfigDir() func() {
+	realHomeAtStartup = os.Getenv("HOME")
+	realConfigDirAtStartup = baseDir
+
+	dir, err := os.MkdirTemp("", "aix-agent-test-home-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sandboxTestConfigDir: cannot create temp home: %v\n", err)
+		os.Exit(1)
+	}
+	// macOS hands out /var/folders/... which is a symlink to /private/var/...
+	// Resolve it so containment checks compare like with like — production code
+	// that round-trips a path through the filesystem gets the resolved form.
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
+	testSandboxDir = dir
+
+	// Redirect both the resolved baseDir and the environment it came from.
+	// The env vars are not redundant: production code that reaches for
+	// os.UserHomeDir() instead of GetConfigDir() needs them, and so do the
+	// child processes tests spawn from os.Args[0] — a child re-runs init() in a
+	// fresh process and would otherwise resolve the developer's real directory
+	// no matter what this process set baseDir to.
+	appData := filepath.Join(dir, "AppData", "Roaming")
+	xdgConfigHome := filepath.Join(dir, ".config")
+	setEnvOrDie("HOME", dir)
+	setEnvOrDie("USERPROFILE", dir) // os.UserHomeDir on Windows
+	setEnvOrDie("APPDATA", appData)
+	setEnvOrDie("XDG_CONFIG_HOME", xdgConfigHome)
+
+	baseDir = resolveBaseDir(runtime.GOOS, EnvConfigSuffix, dir, appData, xdgConfigHome)
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "sandboxTestConfigDir: cannot create %s: %v\n", baseDir, err)
+		os.Exit(1)
+	}
+
+	return func() { _ = os.RemoveAll(dir) }
+}
+
+func setEnvOrDie(key, value string) {
+	if err := os.Setenv(key, value); err != nil {
+		fmt.Fprintf(os.Stderr, "sandboxTestConfigDir: cannot set %s: %v\n", key, err)
+		os.Exit(1)
+	}
 }

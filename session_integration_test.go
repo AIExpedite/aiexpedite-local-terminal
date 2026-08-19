@@ -54,7 +54,16 @@ func TestMain(m *testing.M) {
 	// file-based tests. Default the reader to "no keychain credential"; tests that
 	// exercise the Keychain path override claudeKeychainReader explicitly.
 	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
-	os.Exit(m.Run())
+
+	// Confine every config/data write in this package to a throwaway directory
+	// BEFORE any test runs. Without this, anything that persists through
+	// ConfigPath() / GetConfigDir() writes to the developer's live agent
+	// install — see sandboxTestConfigDir for the incident this pins.
+	// Called explicitly rather than deferred: os.Exit skips defers.
+	restoreSandbox := sandboxTestConfigDir()
+	code := m.Run()
+	restoreSandbox()
+	os.Exit(code)
 }
 
 // runMockCLI simulates the streaming JSON output of a CLI agent so the
