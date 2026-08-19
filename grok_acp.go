@@ -407,6 +407,21 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)
 	}
 
+	// Authoritative pre-flight against the isolated environment the child
+	// would inherit. Refuse before spawn so we never wait on interactive
+	// browser OAuth or the first-frame watchdog for a missing login.
+	authAssessment := assessIsolatedGrokLaunch(isolatedHome, time.Now(), opts.AllowAPIKeyFallback, resolvedModel)
+	if !authAssessment.Authenticated {
+		_ = os.RemoveAll(isolatedHome)
+		reason := authAssessment.Reason
+		if reason == "" {
+			reason = "Grok is not signed in on this computer — run `grok login` on the terminal computer to authenticate."
+		}
+		fmt.Printf("%s[grok-acp] Refusing session %s: %s (source=%s state=%s)%s\n",
+			colorYellow, id, reason, authAssessment.Source, authAssessment.AuthState, colorReset)
+		return newGrokAuthError(reason)
+	}
+
 	fmt.Printf("%s[grok-acp] Starting session %s: %s %s%s\n",
 		colorCyan, id, executable, strings.Join(redactGrokACPArgsForLog(args), " "), colorReset)
 
@@ -1457,6 +1472,29 @@ var grokSystemManagedConfigPath = "/etc/grok/managed_config.toml"
 // ad-hoc user settings as pinned would over-fail-closed on the common
 // single-user dev box. Held as a var so tests can inject paths.
 var claudeManagedSettingsPathsFn = claudeManagedSettingsPaths
+
+// grokSystemConfigPathsFn enumerates the system-level Grok TOML layers that
+// survive the per-session GROK_HOME isolation. Held as a var so tests can
+// point it at a temp dir; production reads the two documented paths.
+var grokSystemConfigPathsFn = func() []string {
+	return []string{grokSystemRequirementsPath, grokSystemManagedConfigPath}
+}
+
+// grokSystemPinnedAPIKey reports whether a system-level layer pins a non-empty
+// `[model] api_key` (or the per-model `[model.<name>]` form). Those files are
+// NOT redirected by GROK_HOME, so the child grok process reads them even under
+// the isolated home — which makes such a key a REAL credential for the launch
+// pre-flight, not just something to gate on. Only consulted once the workspace
+// has opted into EnableGrokAPIKeyFallback; without that opt-in
+// detectPinnedSystemGrokRequirements has already refused the spawn.
+func grokSystemPinnedAPIKey(runtimeModel string) bool {
+	for _, p := range grokSystemConfigPathsFn() {
+		if _, value := readGrokPersistedAPIKey(p, runtimeModel); strings.TrimSpace(strings.Trim(value, `"'`)) != "" {
+			return true
+		}
+	}
+	return false
+}
 
 // detectPinnedSystemGrokRequirements refuses to start a session when a
 // system-level Grok config layer pins API-key auth or a permissive approval
