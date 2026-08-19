@@ -755,9 +755,19 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 		worstObserved int64
 		worstCurrent  bool
 	)
+	// Live windows whose usage was never observed: they cannot contribute a
+	// percentage, but their reset is current and is the right thing to show when
+	// nothing else was observed.
+	liveUnobservedReset := int64(0)
 	for _, id := range windowIDs {
 		b, ok := buckets[id]
 		if !ok {
+			continue
+		}
+		if !b.hasObservedUsage() {
+			if b.ResetsAtMs > 0 && now.UnixMilli() < b.ResetsAtMs && b.ResetsAtMs > liveUnobservedReset {
+				liveUnobservedReset = b.ResetsAtMs
+			}
 			continue
 		}
 		used := b.UsedPercentage
@@ -808,7 +818,11 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 		observed = true
 	}
 	if !observed {
-		return cliAgentUsageMetric{Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%", Unknown: true}
+		metric := cliAgentUsageMetric{Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%", Unknown: true}
+		if liveUnobservedReset > 0 {
+			metric.ResetAt = time.UnixMilli(liveUnobservedReset).UTC().Format(time.RFC3339)
+		}
+		return metric
 	}
 	observedAt := observedAtRFC3339(worstObserved)
 	if !worstCurrent {
@@ -858,6 +872,11 @@ func observedMetricOrUnknown(
 ) cliAgentUsageMetric {
 	rolledOver := ""
 	freshestLive := ""
+	// A live window we know the reset for but not the usage. Recorded from a
+	// heartbeat, so it carries no percentage — but its reset is current, which
+	// is strictly more useful than falling back to a rolled-over bucket's stale
+	// "last observed".
+	liveUnobserved := ""
 	for _, id := range windowIDs {
 		b, ok := buckets[id]
 		if !ok {
@@ -866,6 +885,12 @@ func observedMetricOrUnknown(
 		if b.ResetsAtMs > 0 && now.UnixMilli() >= b.ResetsAtMs {
 			if rolledOver == "" {
 				rolledOver = id
+			}
+			continue
+		}
+		if !b.hasObservedUsage() {
+			if liveUnobserved == "" || b.ResetsAtMs > buckets[liveUnobserved].ResetsAtMs {
+				liveUnobserved = id
 			}
 			continue
 		}
@@ -885,6 +910,18 @@ func observedMetricOrUnknown(
 			Kind: kind, Label: label, Unit: "%",
 			Total: floatPtr(100), Consumed: floatPtr(used), Remaining: floatPtr(100 - used),
 			ResetAt: resetAt, ObservedAt: observedAtRFC3339(b.ObservedAtMs),
+		}
+	}
+	// A current window with no reading beats a rolled-over one with a stale
+	// reading: "unobservable, resets Friday" is true, where "last observed six
+	// days ago" describes a window that no longer exists. No ObservedAt — the
+	// usage was never observed, and claiming otherwise is what made a stuck card
+	// look merely stale.
+	if liveUnobserved != "" {
+		b := buckets[liveUnobserved]
+		return cliAgentUsageMetric{
+			Kind: kind, Label: label, Unit: "%",
+			ResetAt: time.UnixMilli(b.ResetsAtMs).UTC().Format(time.RFC3339), Unknown: true,
 		}
 	}
 	if rolledOver != "" {
