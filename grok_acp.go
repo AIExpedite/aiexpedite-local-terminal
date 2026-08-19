@@ -1363,6 +1363,17 @@ func setupIsolatedGrokHome(allowAPIKeyFallback bool, runtimeModel string) (strin
 		return "", fmt.Errorf("write isolated config.toml: %w", werr)
 	}
 
+	// Point `sessions` at the persistent per-device conversation store. Grok
+	// keys transcripts by GROK_HOME, so without this the store dies with the
+	// temp dir and every cross-session `session/load` fails FS_NOT_FOUND (see
+	// grok_session_store.go). Non-fatal by design: a session with an
+	// ephemeral store still runs, it just cannot be reattached later.
+	if lerr := linkGrokSessionStore(dir); lerr != nil {
+		fmt.Printf("%s[grok-acp] conversation store not persisted (resume will cold-start): %v%s\n",
+			colorYellow, lerr, colorReset)
+	}
+	pruneGrokSessionStoreOnce()
+
 	return dir, nil
 }
 
