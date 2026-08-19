@@ -141,6 +141,14 @@ func grokHasAPIKeyFallback(base, runtimeModel string) bool {
 	if envKey := strings.TrimSpace(os.Getenv("XAI_API_KEY")); envKey != "" {
 		return true
 	}
+	// A system-level `[model] api_key` (/etc/grok/*.toml) is not redirected by
+	// GROK_HOME, so the child reads it even under the per-session isolated
+	// home. With the API-key gate open that pinned key IS the credential —
+	// ignoring it here would refuse every session on a managed host whose
+	// posture detectPinnedSystemGrokRequirements explicitly permits.
+	if grokSystemPinnedAPIKey(runtimeModel) {
+		return true
+	}
 	if base == "" {
 		return false
 	}

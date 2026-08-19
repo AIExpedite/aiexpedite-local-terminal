@@ -1479,6 +1479,29 @@ var grokSystemManagedConfigPath = "/etc/grok/managed_config.toml"
 // single-user dev box. Held as a var so tests can inject paths.
 var claudeManagedSettingsPathsFn = claudeManagedSettingsPaths
 
+// grokSystemConfigPathsFn enumerates the system-level Grok TOML layers that
+// survive the per-session GROK_HOME isolation. Held as a var so tests can
+// point it at a temp dir; production reads the two documented paths.
+var grokSystemConfigPathsFn = func() []string {
+	return []string{grokSystemRequirementsPath, grokSystemManagedConfigPath}
+}
+
+// grokSystemPinnedAPIKey reports whether a system-level layer pins a non-empty
+// `[model] api_key` (or the per-model `[model.<name>]` form). Those files are
+// NOT redirected by GROK_HOME, so the child grok process reads them even under
+// the isolated home — which makes such a key a REAL credential for the launch
+// pre-flight, not just something to gate on. Only consulted once the workspace
+// has opted into EnableGrokAPIKeyFallback; without that opt-in
+// detectPinnedSystemGrokRequirements has already refused the spawn.
+func grokSystemPinnedAPIKey(runtimeModel string) bool {
+	for _, p := range grokSystemConfigPathsFn() {
+		if _, value := readGrokPersistedAPIKey(p, runtimeModel); strings.TrimSpace(strings.Trim(value, `"'`)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // detectPinnedSystemGrokRequirements refuses to start a session when a
 // system-level Grok config layer pins API-key auth or a permissive approval
 // policy AND the workspace has not opted into the matching gate. Both gates

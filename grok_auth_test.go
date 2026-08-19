@@ -128,3 +128,67 @@ func TestGrokACPManager_StartRefusesUnauthenticatedWithoutSpawn(t *testing.T) {
 		t.Errorf("session must not be registered: %d", m.ActiveCount())
 	}
 }
+
+// A managed host can pin `[model] api_key` in /etc/grok/*.toml. Those layers
+// are not redirected by GROK_HOME, so grok reads them under the isolated home
+// too; with EnableGrokAPIKeyFallback open the pre-flight must accept that
+// credential instead of refusing the session as unauthenticated.
+func TestAssessIsolatedGrokLaunch_SystemPinnedAPIKeyAuthenticates(t *testing.T) {
+	t.Setenv("XAI_API_KEY", "")
+	sysDir := t.TempDir()
+	sysPath := filepath.Join(sysDir, "requirements.toml")
+	if err := os.WriteFile(sysPath, []byte("[model]\napi_key = \"xai-managed-secret\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prev := grokSystemConfigPathsFn
+	grokSystemConfigPathsFn = func() []string { return []string{sysPath} }
+	t.Cleanup(func() { grokSystemConfigPathsFn = prev })
+
+	got := assessIsolatedGrokLaunch(t.TempDir(), time.Now(), true, "grok-build")
+	if !got.Authenticated || got.Source != grokAuthSourceAPIKey {
+		t.Fatalf("system-pinned api key must authenticate the launch: %+v", got)
+	}
+	if strings.Contains(got.Reason, "xai-managed-secret") {
+		t.Fatalf("api key leaked: %+v", got)
+	}
+}
+
+func TestAssessIsolatedGrokLaunch_SystemPinnedAPIKeyIgnoredWithoutOptIn(t *testing.T) {
+	t.Setenv("XAI_API_KEY", "")
+	sysDir := t.TempDir()
+	sysPath := filepath.Join(sysDir, "managed_config.toml")
+	if err := os.WriteFile(sysPath, []byte("[model]\napi_key = \"xai-managed-secret\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prev := grokSystemConfigPathsFn
+	grokSystemConfigPathsFn = func() []string { return []string{sysPath} }
+	t.Cleanup(func() { grokSystemConfigPathsFn = prev })
+
+	got := assessIsolatedGrokLaunch(t.TempDir(), time.Now(), false, "grok-build")
+	if got.Authenticated {
+		t.Fatalf("without EnableGrokAPIKeyFallback the pinned key must not authenticate: %+v", got)
+	}
+	if got.ReasonCode != grokNotAuthenticatedCode {
+		t.Errorf("ReasonCode=%q", got.ReasonCode)
+	}
+}
+
+// Per-model form: `[model.grok-4] api_key = ...` in the system layer is the
+// credential when the session resolves that model.
+func TestAssessIsolatedGrokLaunch_SystemPinnedPerModelAPIKey(t *testing.T) {
+	t.Setenv("XAI_API_KEY", "")
+	sysPath := filepath.Join(t.TempDir(), "requirements.toml")
+	if err := os.WriteFile(sysPath, []byte("[model.grok-4]\napi_key = \"xai-managed-secret\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prev := grokSystemConfigPathsFn
+	grokSystemConfigPathsFn = func() []string { return []string{sysPath} }
+	t.Cleanup(func() { grokSystemConfigPathsFn = prev })
+
+	if got := assessIsolatedGrokLaunch(t.TempDir(), time.Now(), true, "grok-4"); !got.Authenticated {
+		t.Fatalf("per-model system api key must authenticate: %+v", got)
+	}
+	if got := assessIsolatedGrokLaunch(t.TempDir(), time.Now(), true, "grok-build"); got.Authenticated {
+		t.Fatalf("a key pinned for another model must not authenticate: %+v", got)
+	}
+}
