@@ -30,7 +30,8 @@ func applyStandardTrayIcon() {
 }
 
 // applyDisconnectedTrayIcon swaps the tray icon to the "disconnected" variant
-// (with a red/grey dot overlay) so the offline state is visible at a glance.
+// (with a red prohibition-sign overlay) so the offline state is visible at a
+// glance and doesn't read as a pending-message badge.
 // The disconnected PNG is NOT a template icon — we want the red overlay to
 // stay red instead of being auto-inverted by macOS.
 func applyDisconnectedTrayIcon() {
