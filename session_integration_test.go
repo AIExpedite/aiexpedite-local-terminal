@@ -79,6 +79,16 @@ func TestMain(m *testing.M) {
 //     completion ordering under load.
 func runMockCLI(mode string) {
 	switch mode {
+	case "opencode":
+		// The OpenCode usage parser probes `opencode models` and
+		// `opencode auth list`. Replay the exact output a real 1.18.15 install
+		// produced — a plain model list, and a DRAWN FRAME for auth list.
+		if len(os.Args) > 2 && os.Args[1] == "auth" && os.Args[2] == "list" {
+			fmt.Print(realOpenCodeAuthList)
+			return
+		}
+		fmt.Print(realOpenCodeModels)
+		return
 	case "claude":
 		// Real claude waits for NDJSON on stdin before emitting anything. We
 		// mimic that — read one line, then start streaming.
