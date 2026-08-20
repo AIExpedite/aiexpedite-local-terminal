@@ -36,8 +36,9 @@ func applyStandardTrayIcon() {
 }
 
 // applyDisconnectedTrayIcon sets the tray icon to the "disconnected" variant
-// (red overlay). Called on disconnect from the tray toggle so the user can
-// tell at a glance that the agent is no longer talking to the cloud.
+// (red prohibition-sign overlay). Called on disconnect from the tray toggle so
+// the user can tell at a glance that the agent is no longer talking to the
+// cloud — a corner dot read as a pending message instead.
 func applyDisconnectedTrayIcon() {
 	if !IsSystrayReady() {
 		return
