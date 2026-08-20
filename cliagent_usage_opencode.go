@@ -391,8 +391,11 @@ func looksLikeEmptyOpenCodeModelList(out string) bool {
 		}
 	}
 	// A genuinely empty stdout from a zero-exit `models` is also conclusive:
-	// the CLI ran, was asked what it can reach, and named nothing.
-	return strings.TrimSpace(out) == ""
+	// the CLI ran, was asked what it can reach, and named nothing. Check the
+	// escape-stripped value, not the raw `out`: reset codes like "\x1b[0m"
+	// survive TrimSpace, so probing them against `out` would leave an
+	// otherwise-empty response stuck at "unknown".
+	return strings.TrimSpace(lowered) == ""
 }
 
 // ansiEscapeRe matches the SGR/CSI sequences OpenCode writes when it decides it

@@ -145,6 +145,16 @@ func TestEmptyModelListDetectionSeesThroughDecoration(t *testing.T) {
 	}
 }
 
+// A zero-exit `models` that emits only terminal reset codes and whitespace is
+// still "named nothing" and must be conclusive. Reset codes like "\x1b[0m"
+// survive TrimSpace, so the emptiness check has to run against the
+// escape-stripped value or a broken install would appear available.
+func TestEmptyModelListDetectionTreatsEscapeOnlyOutputAsEmpty(t *testing.T) {
+	if !looksLikeEmptyOpenCodeModelList("\x1b[0m\n") {
+		t.Fatal("output that is only reset codes and whitespace must count as empty")
+	}
+}
+
 /* ──────────────────────── what the card ends up with ─────────────────────── */
 
 // The whole point: with no credentials to name, the card shows the providers and
