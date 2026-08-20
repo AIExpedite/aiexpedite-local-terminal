@@ -51,6 +51,17 @@ const (
 	claudeWindowSevenDayOpus   = "seven_day_opus"
 	claudeWindowSevenDaySonnet = "seven_day_sonnet"
 	claudeWindowSevenDayFable  = "seven_day_fable"
+	// claudeWindowSevenDayOverageIncluded is what Claude Code ACTUALLY calls the
+	// weekly Fable window on the wire. Its own limit-label table (Claude Code
+	// 2.1.237) reads:
+	//
+	//	five_hour: "session limit", seven_day: "weekly limit",
+	//	seven_day_opus: "Opus limit", seven_day_sonnet: "Sonnet limit",
+	//	seven_day_overage_included: "Fable 5 limit"
+	//
+	// so this key — not the extrapolated `seven_day_fable` — is the one a real
+	// rate_limit_event carries for the meter /usage draws as "Weekly Fable".
+	claudeWindowSevenDayOverageIncluded = "seven_day_overage_included"
 )
 
 // claudeRateLimitStatusRejected is the status value Claude Code sets once a
