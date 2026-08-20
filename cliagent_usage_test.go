@@ -810,6 +810,75 @@ func TestCodexUsageParser_IdentityFromAuth(t *testing.T) {
 	}
 }
 
+// A ChatGPT `codex login` namespaces every account attribute under the
+// `https://api.openai.com/auth` claim — there is no flat `plan` / `plan_type`
+// anywhere in auth.json or in the id_token. Reading only the flat fields left
+// the plan chip blank for the one auth mode that actually HAS a plan, so pin
+// the nested claim as a supported source for both the plan and the account.
+func TestCodexUsageParser_PlanFromNamespacedChatGPTClaim(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"auth_mode": "chatgpt",
+		"tokens": map[string]any{
+			"id_token": helperJWT(t, map[string]any{
+				"email": "carol@example.com",
+				"https://api.openai.com/auth": map[string]any{
+					"chatgpt_plan_type":  "pro",
+					"chatgpt_user_id":    "user-PPrLthwR0xmzb8mFDad617BZ",
+					"chatgpt_account_id": "c85ea9d0-b292-42eb-9934-bb73bc54c51a",
+				},
+			}),
+			"refresh_token": "opaque-refresh-token",
+		},
+	})
+
+	usage, ok := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	if usage.Plan != "pro" {
+		t.Errorf("Plan=%q, want pro from chatgpt_plan_type", usage.Plan)
+	}
+	// The email still outranks the namespaced ids — it is the label a human
+	// recognises on the card.
+	if usage.Account != "carol@example.com" {
+		t.Errorf("Account=%q, want carol@example.com", usage.Account)
+	}
+}
+
+// With no email anywhere, the namespaced ChatGPT user id is a usable account
+// label — and must be preferred over the opaque `sub`, which identifies the
+// upstream identity provider account rather than the ChatGPT one.
+func TestCodexUsageParser_AccountFallsBackToNamespacedChatGPTUserID(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+	home := t.TempDir()
+	helperWriteJSON(t, filepath.Join(home, ".codex", "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token": helperJWT(t, map[string]any{
+				"sub": "google-oauth2|117053759699842363930",
+				"https://api.openai.com/auth": map[string]any{
+					"chatgpt_plan_type": "plus",
+					"chatgpt_user_id":   "user-PPrLthwR0xmzb8mFDad617BZ",
+				},
+			}),
+			"refresh_token": "opaque-refresh-token",
+		},
+	})
+
+	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
+	if usage.Account != "user-PPrLthwR0xmzb8mFDad617BZ" {
+		t.Errorf("Account=%q, want the namespaced ChatGPT user id", usage.Account)
+	}
+	if usage.Plan != "plus" {
+		t.Errorf("Plan=%q, want plus", usage.Plan)
+	}
+}
+
 func TestCodexUsageParser_RefreshTokenHasNoMisleadingLoginDeadline(t *testing.T) {
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))

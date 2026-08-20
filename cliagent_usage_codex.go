@@ -73,9 +73,25 @@ type codexIDTokenClaims struct {
 	Plan     string `json:"plan"`
 	PlanType string `json:"plan_type"`
 	OrgID    string `json:"org_id"`
+	// ChatGPT-login claims. A `codex login` against a ChatGPT account does NOT
+	// put the plan at the top level: it namespaces every account attribute
+	// under the `https://api.openai.com/auth` claim, where the subscription
+	// tier is `chatgpt_plan_type` ("pro", "plus", "business", …). Reading only
+	// the flat `plan` / `plan_type` above left the plan chip permanently blank
+	// for the common ChatGPT login — the only auth mode that HAS a plan.
+	OpenAIAuth codexOpenAIAuthClaim `json:"https://api.openai.com/auth"`
 	// Standard JWT expiry (seconds since epoch). Reported even when the
 	// credential refreshes itself — see the LoginExpiresAt assignment below.
 	Exp int64 `json:"exp"`
+}
+
+// codexOpenAIAuthClaim is the namespaced `https://api.openai.com/auth` claim
+// carried by a ChatGPT-login id_token. Only the fields the card needs are
+// modelled; the claim also carries org membership we deliberately ignore.
+type codexOpenAIAuthClaim struct {
+	PlanType  string `json:"chatgpt_plan_type"`
+	UserID    string `json:"chatgpt_user_id"`
+	AccountID string `json:"chatgpt_account_id"`
 }
 
 func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
@@ -110,10 +126,13 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 			claims.Email,
 			claims.Account,
 			claims.UserID,
+			claims.OpenAIAuth.UserID,
 			auth.Tokens.AccountID,
+			claims.OpenAIAuth.AccountID,
 			claims.Subject,
 		)
-		usage.Plan = firstNonEmpty(auth.Plan, auth.PlanType, claims.Plan, claims.PlanType)
+		usage.Plan = firstNonEmpty(
+			auth.Plan, auth.PlanType, claims.Plan, claims.PlanType, claims.OpenAIAuth.PlanType)
 		if firstNonEmpty(auth.APIKey, auth.Tokens.IDToken, auth.Tokens.RefreshToken) != "" {
 			hasAPIKeyAuth = hasAPIKeyAuth || strings.TrimSpace(auth.APIKey) != ""
 			usage.Authenticated = authBoolPtr(true)
