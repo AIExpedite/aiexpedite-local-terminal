@@ -94,6 +94,24 @@ type codexOpenAIAuthClaim struct {
 	AccountID string `json:"chatgpt_account_id"`
 }
 
+// codexAccount returns the credential identity used both by the usage parser
+// and by rate-limit capture. Keep the precedence in one place so telemetry is
+// always written under the same fingerprint the parser later reads.
+func codexAccount(auth codexAuth, claims codexIDTokenClaims) string {
+	return firstNonEmpty(
+		auth.Email,
+		auth.Account,
+		auth.UserID,
+		claims.Email,
+		claims.Account,
+		claims.UserID,
+		claims.OpenAIAuth.UserID,
+		auth.Tokens.AccountID,
+		claims.OpenAIAuth.AccountID,
+		claims.Subject,
+	)
+}
+
 func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
 	base := firstNonEmpty(os.Getenv("CODEX_HOME"), expandHome(home, ".codex"))
 	if base == "" {
@@ -119,18 +137,7 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 	if readJSONFile(expandHome(base, "auth.json"), &auth) {
 		claims := codexIDTokenClaims{}
 		parseJWTClaims(auth.Tokens.IDToken, &claims)
-		usage.Account = firstNonEmpty(
-			auth.Email,
-			auth.Account,
-			auth.UserID,
-			claims.Email,
-			claims.Account,
-			claims.UserID,
-			claims.OpenAIAuth.UserID,
-			auth.Tokens.AccountID,
-			claims.OpenAIAuth.AccountID,
-			claims.Subject,
-		)
+		usage.Account = codexAccount(auth, claims)
 		usage.Plan = firstNonEmpty(
 			auth.Plan, auth.PlanType, claims.Plan, claims.PlanType, claims.OpenAIAuth.PlanType)
 		if firstNonEmpty(auth.APIKey, auth.Tokens.IDToken, auth.Tokens.RefreshToken) != "" {

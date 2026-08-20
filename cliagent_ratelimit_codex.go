@@ -1244,17 +1244,7 @@ func currentCodexAccountFingerprint() string {
 	}
 	claims := codexIDTokenClaims{}
 	parseJWTClaims(auth.Tokens.IDToken, &claims)
-	account := firstNonEmpty(
-		auth.Email,
-		auth.Account,
-		auth.UserID,
-		claims.Email,
-		claims.Account,
-		claims.UserID,
-		auth.Tokens.AccountID,
-		claims.Subject,
-	)
-	return fingerprintAccount("codex", account)
+	return fingerprintAccount("codex", codexAccount(auth, claims))
 }
 
 // codexContributorsForAccount loads the rate-limit cache and returns the
