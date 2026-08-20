@@ -1431,6 +1431,25 @@ func TestCodexUsageParser_RolledOverObservationNewerThanRefusalSuppressesNotice(
 	}
 }
 
+// Preserve subsecond precision when comparing an observation with a refusal.
+// A successful frame later in the same second proves that the refusal is stale
+// just as surely as a frame in a later second does.
+func TestCodexUsageLimitNotice_SubsecondObservationNewerThanRefusalSuppressesNotice(t *testing.T) {
+	refusedAt := time.Date(2026, 6, 19, 11, 0, 0, 100*int(time.Millisecond), time.UTC)
+	observedAt := refusedAt.Add(400 * time.Millisecond)
+	metrics := []cliAgentUsageMetric{
+		{Kind: limitKindSession, Label: "5-hour session window", Unit: "%", Unknown: true},
+		{
+			Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%",
+			ObservedAt: observedAtRFC3339(observedAt.UnixMilli()),
+		},
+	}
+
+	if notice := codexUsageLimitNotice(metrics, codexUsageLimitEvidence{At: refusedAt}, refusedAt.Add(time.Hour)); notice != "" {
+		t.Fatalf("notice=%q, want none — the newer same-second observation supersedes the refusal", notice)
+	}
+}
+
 // A refusal carries no reset, so it is expired by age rather than believed
 // forever. Understating a still-exhausted account is the safe direction: Codex
 // writes a fresh rollout on the next attempt, which re-evidences it.

@@ -937,5 +937,8 @@ func observedAtRFC3339(ms int64) string {
 	if ms <= 0 {
 		return ""
 	}
-	return time.UnixMilli(ms).UTC().Format(time.RFC3339)
+	// Preserve the bucket's millisecond precision. Besides making the displayed
+	// observation truthful, freshness checks must be able to order two events
+	// that happened within the same second.
+	return time.UnixMilli(ms).UTC().Format(time.RFC3339Nano)
 }
