@@ -142,6 +142,58 @@ func TestClaudeCodeMetricsFromCache_FableWindowObserved(t *testing.T) {
 	}
 }
 
+// Claude Code's own limit-label table maps `seven_day_overage_included` to
+// "Fable 5 limit", so that — not the extrapolated `seven_day_fable` — is the
+// key a real rate_limit_event carries for the meter /usage draws as "Weekly
+// Fable". Before this was recognised the row could never fill from live
+// telemetry, because the tolerant tail only matches keys containing "fable".
+func TestClaudeCodeMetricsFromCache_FableFromOverageIncludedWindow(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(120 * time.Hour).UnixMilli()
+	seedClaudeRateLimitCache(t, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDay: {
+			UsedPercentage: 55, ResetsAtMs: reset, ObservedAtMs: now.UnixMilli(),
+			Status: "allowed_warning", usageKnown: true,
+		},
+		claudeWindowSevenDayOverageIncluded: {
+			UsedPercentage: 10, ResetsAtMs: reset, ObservedAtMs: now.UnixMilli(),
+			Status: "allowed_warning", usageKnown: true,
+		},
+	}, now, "")
+
+	metrics := claudeCodeMetricsFromCache(now, "")
+	fable := metrics[2]
+	if fable.Unknown || fable.Consumed == nil || *fable.Consumed != 10 {
+		t.Fatalf("fable row=%+v, want 10%% observed from seven_day_overage_included", fable)
+	}
+	// The two weekly rows stay independent: the Fable window must not be folded
+	// into the "Weekly quota" aggregate, nor mask it.
+	if weekly := metrics[1]; weekly.Consumed == nil || *weekly.Consumed != 55 {
+		t.Errorf("weekly Consumed=%v, want 55 (unaffected by the Fable window)", weekly.Consumed)
+	}
+}
+
+// Precedence: the canonical key still wins the tie-break when both are live and
+// equally fresh, so recognising the wire key cannot reorder an existing cache.
+func TestClaudeCodeMetricsFromCache_CanonicalFableBeatsOverageIncluded(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(120 * time.Hour).UnixMilli()
+	seedClaudeRateLimitCache(t, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDayFable: {
+			UsedPercentage: 22, ResetsAtMs: reset, ObservedAtMs: now.UnixMilli(), usageKnown: true,
+		},
+		claudeWindowSevenDayOverageIncluded: {
+			UsedPercentage: 10, ResetsAtMs: reset, ObservedAtMs: now.UnixMilli(), usageKnown: true,
+		},
+	}, now, "")
+
+	if fable := claudeCodeMetricsFromCache(now, "")[2]; fable.Consumed == nil || *fable.Consumed != 22 {
+		t.Fatalf("fable Consumed=%v, want 22 (canonical seven_day_fable)", fable.Consumed)
+	}
+}
+
 // A window whose reset has already passed is unobservable rather than replayed
 // as a stale high-water mark — same rule the 5-hour and weekly rows follow.
 func TestClaudeCodeMetricsFromCache_FableRolledOverWindowIsUnknown(t *testing.T) {

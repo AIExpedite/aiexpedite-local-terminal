@@ -706,7 +706,17 @@ func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliA
 
 // claudeFableWindowIDs returns the cache keys that may hold the weekly Fable
 // window, in the order observedMetricOrUnknown should try them: the canonical
-// `seven_day_fable` first, then any other observed key naming Fable, sorted.
+// `seven_day_fable` first, then Claude Code's actual wire key for the meter
+// (`seven_day_overage_included` — see the constant), then any other observed
+// key naming Fable, sorted.
+//
+// Note on freshness: Claude Code's status-line payload carries ONLY `five_hour`
+// and `seven_day` (verified against 2.1.237), so unlike those two rows the Fable
+// row can never be refreshed from the status-line hook. It fills only from a
+// stream `rate_limit_event`, which Claude emits when a window crosses a warning
+// threshold or is rejected — so a comfortably-unused Fable quota legitimately
+// stays unobservable. That is a reporting gap upstream, not one we can close
+// here; showing a 0% bar instead would be worse (see below).
 //
 // The tolerant tail exists because the canonical key is an extrapolation from
 // the keys Claude Code is known to emit — a rename or a suffixed variant
@@ -731,6 +741,7 @@ func claudeFableWindowIDs(buckets map[string]claudeRateLimitBucket) []string {
 	for id := range buckets {
 		lower := strings.ToLower(id)
 		if id == claudeWindowSevenDayFable ||
+			id == claudeWindowSevenDayOverageIncluded ||
 			!strings.Contains(lower, "fable") ||
 			strings.HasPrefix(lower, claudeWindowFiveHour) {
 			continue
@@ -738,7 +749,7 @@ func claudeFableWindowIDs(buckets map[string]claudeRateLimitBucket) []string {
 		variants = append(variants, id)
 	}
 	sort.Strings(variants)
-	return append([]string{claudeWindowSevenDayFable}, variants...)
+	return append([]string{claudeWindowSevenDayFable, claudeWindowSevenDayOverageIncluded}, variants...)
 }
 
 // aggregateWeeklyMetric reports the worst observed seven-day window: the
