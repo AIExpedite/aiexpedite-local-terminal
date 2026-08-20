@@ -826,6 +826,20 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 	}
 	observedAt := observedAtRFC3339(worstObserved)
 	if !worstCurrent {
+		// Every observed sub-window has rolled over. If a heartbeat left a live
+		// reset on another weekly key (e.g. cache retains an expired `seven_day`
+		// while `seven_day_opus` heartbeats a new window), that current window is
+		// strictly more useful than a stale "last observed" from a window that no
+		// longer exists — mirror observedMetricOrUnknown, which prefers a live
+		// unobserved window over a rolled-over reading. No ObservedAt: usage on
+		// the live window was never observed.
+		if liveUnobservedReset > 0 {
+			return cliAgentUsageMetric{
+				Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%",
+				ResetAt: time.UnixMilli(liveUnobservedReset).UTC().Format(time.RFC3339),
+				Unknown: true,
+			}
+		}
 		return cliAgentUsageMetric{
 			Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%",
 			ObservedAt: observedAt, Unknown: true,

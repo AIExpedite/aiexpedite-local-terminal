@@ -286,6 +286,33 @@ func TestWeeklyAggregateReportsALiveResetWhenNoSubWindowWasObserved(t *testing.T
 	}
 }
 
+// When every observed sub-window has rolled over but a heartbeat left a live
+// reset on another weekly key, report that live reset — not the stale
+// "last observed" from a window that no longer exists. This is the rollover
+// freeze the PR fixes, in the cross-key (unified → per-model) shape change.
+func TestWeeklyAggregatePrefersALiveResetOverAnExpiredObservation(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	expired := now.Add(-40 * time.Hour).UnixMilli()
+	liveReset := now.Add(60 * time.Hour)
+	buckets := map[string]claudeRateLimitBucket{
+		// Expired but observed: the retained unified bucket.
+		claudeWindowSevenDay: {UsedPercentage: 73, ResetsAtMs: expired, ObservedAtMs: expired},
+		// Live but only heartbeated: the new per-model window.
+		claudeWindowSevenDayOpus: {ResetsAtMs: liveReset.UnixMilli(), UsageObserved: usageObservedPtr(false)},
+	}
+
+	metric := aggregateWeeklyMetric(buckets, now)
+	if !metric.Unknown {
+		t.Fatalf("metric = %+v, want Unknown — no live usage was observed", metric)
+	}
+	if metric.ResetAt != liveReset.UTC().Format(time.RFC3339) {
+		t.Fatalf("ResetAt = %q, want the live per-model reset %q", metric.ResetAt, liveReset.UTC().Format(time.RFC3339))
+	}
+	if metric.ObservedAt != "" {
+		t.Fatalf("ObservedAt = %q, want empty — the live window's usage was never observed", metric.ObservedAt)
+	}
+}
+
 // An unobserved sub-window must not drag an observed one down to Unknown: the
 // card's "≥ N%" is a lower bound, and the observed bucket is a real one.
 func TestWeeklyAggregateStillReportsAnObservedSubWindow(t *testing.T) {
