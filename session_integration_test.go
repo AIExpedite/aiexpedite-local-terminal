@@ -54,7 +54,16 @@ func TestMain(m *testing.M) {
 	// file-based tests. Default the reader to "no keychain credential"; tests that
 	// exercise the Keychain path override claudeKeychainReader explicitly.
 	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
-	os.Exit(m.Run())
+
+	// Confine every config/data write in this package to a throwaway directory
+	// BEFORE any test runs. Without this, anything that persists through
+	// ConfigPath() / GetConfigDir() writes to the developer's live agent
+	// install — see sandboxTestConfigDir for the incident this pins.
+	// Called explicitly rather than deferred: os.Exit skips defers.
+	restoreSandbox := sandboxTestConfigDir()
+	code := m.Run()
+	restoreSandbox()
+	os.Exit(code)
 }
 
 // runMockCLI simulates the streaming JSON output of a CLI agent so the
@@ -70,6 +79,16 @@ func TestMain(m *testing.M) {
 //     completion ordering under load.
 func runMockCLI(mode string) {
 	switch mode {
+	case "opencode":
+		// The OpenCode usage parser probes `opencode models` and
+		// `opencode auth list`. Replay the exact output a real 1.18.15 install
+		// produced — a plain model list, and a DRAWN FRAME for auth list.
+		if len(os.Args) > 2 && os.Args[1] == "auth" && os.Args[2] == "list" {
+			fmt.Print(realOpenCodeAuthList)
+			return
+		}
+		fmt.Print(realOpenCodeModels)
+		return
 	case "claude":
 		// Real claude waits for NDJSON on stdin before emitting anything. We
 		// mimic that — read one line, then start streaming.

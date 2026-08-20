@@ -220,6 +220,9 @@ func rejectionResultType(cmdType string) string {
 	if isAntigravityNativeCommand(cmdType) {
 		return "antigravity_native_error"
 	}
+	if isOpenCodeNativeCommand(cmdType) {
+		return "opencode_native_error"
+	}
 	return "session_error"
 }
 
@@ -699,12 +702,90 @@ type resultMsg struct {
 // subscription and fighting for the same offlineChan token.
 var pubsubLoopRunning sync.Mutex
 
+// unusableRegistrationReason reports whether a config that CLAIMS a registration
+// is missing the transport settings that registration itself writes, and why.
+//
+// This is the difference between "never registered" and "registered, but the
+// credentials on disk cannot be used". The first is a normal state the tray
+// already handles. The second is a trap: IsRegistered() is true, so the tray
+// shows "Register Device" ticked and disabled, while StartPubSubLoop returns
+// immediately — the device accepts no work and offers the user no way out.
+//
+// A registration writes agent id, secret, project id, subscription, topic and
+// the WIF fields together (registration.go), so any one of them missing means
+// the stored registration is incomplete, not merely stale.
+func unusableRegistrationReason(cfg *Config) (string, bool) {
+	if cfg == nil || !cfg.IsRegistered() {
+		// Never registered (or half-written credentials): the ordinary
+		// unregistered path already prompts, and clearing here would throw away
+		// a secret whose partner fields may simply not be needed yet.
+		return "", false
+	}
+	switch {
+	case cfg.ProjectID == "":
+		return "This terminal's saved registration is missing its cloud project.", true
+	case cfg.CommandsSubscription == "":
+		return "This terminal's saved registration is missing its command subscription.", true
+	case cfg.ResultsTopic == "":
+		return "This terminal's saved registration is missing its results topic.", true
+	}
+	return "", false
+}
+
+// invalidateRegistration drops the stored credentials, re-enables the tray's
+// "Register Device" item and tells the user what happened. It is the single
+// recovery path for a registration that cannot be used — whether the service
+// disowned it ("Unknown agent") or the local copy is incomplete.
+//
+// The credentials go together: leaving a partial set behind is what produces
+// the ticked-but-broken tray state this function exists to escape.
+func invalidateRegistration(cfg *Config, reason string) {
+	if cfg == nil {
+		return
+	}
+	fmt.Printf("%s[pubsub] %s%s\n", colorRed, reason, colorReset)
+	fmt.Printf("%s[pubsub] Clearing local registration. Please re-register the device.%s\n", colorYellow, colorReset)
+
+	if err := cfg.MutateAndSave(ConfigPath(), func() {
+		cfg.AgentID = ""
+		cfg.CommandSecret = ""
+		cfg.UserID = ""
+		cfg.RegisteredAt = ""
+		cfg.TokenEndpoint = ""
+		cfg.WIFAudience = ""
+		cfg.WIFServiceAccount = ""
+	}); err != nil {
+		fmt.Printf("[pubsub] Failed to save config: %v\n", err)
+	}
+
+	// Non-blocking: the tray reads one signal and re-enables the menu item.
+	select {
+	case RegistrationInvalidChan <- true:
+	default:
+	}
+
+	if IsSystrayReady() {
+		ShowErrorDialog("Terminal Disconnected",
+			reason+"\n\nPlease click 'Register Device' in the tray menu to reconnect.")
+		systray.SetTooltip(EnvDisplayName + " – Not Registered")
+	}
+}
+
 func StartPubSubLoop(cfg *Config) {
 	fmt.Println("[pubsub] StartPubSubLoop called")
 	fmt.Printf("[pubsub] Config: ProjectID=%s, Subscription=%s, Topic=%s\n", cfg.ProjectID, cfg.CommandsSubscription, cfg.ResultsTopic)
 
 	if cfg.ProjectID == "" {
 		fmt.Println("[pubsub] disabled – project_id empty")
+		// A device that has never registered belongs here: the tray already
+		// offers "Register Device" and there is nothing to repair. But a config
+		// that CLAIMS a registration and cannot transport is a dead end — the
+		// tray shows Register Device ticked and disabled, so the user has no way
+		// back. Route it into the same recovery the service's "Unknown agent"
+		// verdict uses.
+		if reason, unusable := unusableRegistrationReason(cfg); unusable {
+			invalidateRegistration(cfg, reason)
+		}
 		return
 	}
 
@@ -770,37 +851,7 @@ func StartPubSubLoop(cfg *Config) {
 		// Check if this is an "Unknown agent" error - means registration is invalid
 		errStr := err.Error()
 		if strings.Contains(errStr, "Unknown agent") || strings.Contains(errStr, "invalid_client") {
-			fmt.Printf("%s[pubsub] Terminal connection was removed via the website%s\n", colorRed, colorReset)
-			fmt.Printf("%s[pubsub] Clearing local registration. Please re-register the device.%s\n", colorYellow, colorReset)
-
-			// Clear registration credentials from config
-			if err := cfg.MutateAndSave(ConfigPath(), func() {
-				cfg.AgentID = ""
-				cfg.CommandSecret = ""
-				cfg.UserID = ""
-				cfg.RegisteredAt = ""
-				cfg.TokenEndpoint = ""
-				cfg.WIFAudience = ""
-				cfg.WIFServiceAccount = ""
-			}); err != nil {
-				fmt.Printf("[pubsub] Failed to save config: %v\n", err)
-			}
-
-			// Notify main.go to update the Register Device menu item
-			select {
-			case RegistrationInvalidChan <- true:
-			default:
-				// Channel full, skip (non-blocking)
-			}
-
-			// Show error dialog to user
-			if IsSystrayReady() {
-				ShowErrorDialog("Terminal Disconnected",
-					"This terminal's connection was removed via the website.\n\n"+
-						"Please click 'Register Device' in the tray menu to reconnect.")
-				systray.SetTooltip(EnvDisplayName + " – Not Registered")
-			}
-
+			invalidateRegistration(cfg, "This terminal's connection was removed via the website.")
 			// Stop the Pub/Sub loop - user needs to re-register
 			return
 		}
@@ -871,6 +922,14 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 		return nil
 	}
 
+	// A __cli_usage_refresh__ is USER-INITIATED (the Refresh button on the
+	// Computers page), so any readiness answer cached for latency must be
+	// bypassed for this gather. Otherwise a user who just ran `opencode
+	// /connect` and pressed Refresh would keep seeing the pre-auth chip until
+	// the TTL lapsed — the exact "must not require deleting and re-adding the
+	// computer" failure. Version probes stay cached: they are keyed on the
+	// binary, which a login does not change.
+	SetOpenCodeReadinessForceProbe(true)
 	usage, errs := GatherCLIAgentUsageOnly(ctx)
 	// Refresh the cached CliAgents on the shared MachineInfo so the next
 	// /auth/token doesn't POST the stale 6h-gather snapshot and revert
@@ -5447,6 +5506,12 @@ var globalClaudeNativeManager *ClaudeNativeManager
 // antigravity_native_* chunks for the frontend native chat path.
 var globalAntigravityNativeManager *AntigravityNativeManager
 
+// globalOpenCodeNativeManager is the package-level OpenCodeNativeManager
+// instance, initialized in StartAgent (agent.go). Sessions use one-shot
+// `opencode run --format json` with exact `--session <id>` resume and publish
+// opencode_native_* chunks for the frontend native chat path.
+var globalOpenCodeNativeManager *OpenCodeNativeManager
+
 /* --------------------------------------------------------------------------
    handleSessionCommand — routes session_* commands to the SessionManager
    -------------------------------------------------------------------------- */
@@ -5589,6 +5654,18 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		allowArgs = buildAntigravityNativeGateArgs()
 		dialogArgs = allowArgs
 		denyOutput = "antigravity native session denied by user: not in allow list"
+	case "opencode_native_start":
+		// Gate against `opencode` so an operator who has approved `opencode *`
+		// covers native-chat access too. Start only registers the logical
+		// session; the per-turn argv is built later in Send. Gate and DISPLAY
+		// the same argv shape runOneShot will execute so a narrowed allowlist
+		// cannot approve one launch shape while another actually runs. The
+		// prompt is deliberately absent — it goes to a temp file consumed on
+		// stdin, never argv.
+		allowCommand = "opencode"
+		allowArgs = buildOpenCodeNativeArgs("")
+		dialogArgs = allowArgs
+		denyOutput = "opencode native session denied by user: not in allow list"
 	case "grok_acp_start":
 		// Unlike codex_appserver_start, grok_acp_start is NOT gated through
 		// the shared execute allowlist or approval dialog WHEN signing is
@@ -5744,6 +5821,10 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 	}
 	if isAntigravityNativeCommand(cmd.Type) {
 		handleAntigravityNativeCommand(ctx, topic, cmd, cfg)
+		return
+	}
+	if isOpenCodeNativeCommand(cmd.Type) {
+		handleOpenCodeNativeCommand(ctx, topic, cmd, cfg)
 		return
 	}
 	if isGrokACPCommand(cmd.Type) {
@@ -6305,6 +6386,209 @@ func publishAntigravityNativeError(ctx context.Context, topic *pubsub.Publisher,
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[antigravity-native] Failed to publish error: %v%s\n", colorRed, err, colorReset)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   OpenCode native (one-shot `run --format json` + --session resume) routing
+   -------------------------------------------------------------------------- */
+
+// handleOpenCodeNativeCommand dispatches opencode_native_* commands to the
+// OpenCodeNativeManager. Start registers a logical session (no process); Send
+// runs one-shot `opencode run --format json` with exact `--session` resume and
+// streams each JSON event back as its own chunk; End cancels any in-flight turn
+// and drops the logical session.
+//
+// Shaped after handleAntigravityNativeCommand because the two share a process
+// model (one short-lived child per turn, logical session in between) — the
+// lifecycle edge cases the Antigravity handler encodes (idempotent start ack
+// without releasing the reservation, whitespace-only send rejection, ended
+// published even when End reports the session already gone) apply identically.
+func handleOpenCodeNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
+	if globalOpenCodeNativeManager == nil {
+		publishOpenCodeNativeError(ctx, topic, cmd, "opencode native manager not initialized")
+		// Start commands leave a cloud-side `starting` session + reservation;
+		// emit ended so the orchestrator can tear them down.
+		if cmd.Type == "opencode_native_start" && cmd.SessionID != "" {
+			publishFn := newSessionPublishFn(topic, "[opencode-native]")
+			publishTerminalResult(publishFn, resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				Output:      "opencode native manager not initialized",
+				Status:      "error",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        "opencode_native_ended",
+				SessionID:   cmd.SessionID,
+				ExitCode:    -1,
+			})
+		}
+		return
+	}
+
+	publishFn := newSessionPublishFn(topic, "[opencode-native]")
+
+	switch cmd.Type {
+	case "opencode_native_start":
+		if cmd.SessionID == "" {
+			publishOpenCodeNativeError(ctx, topic, cmd, "sessionID is required for opencode_native_start")
+			return
+		}
+
+		fmt.Printf("%s[opencode-native] Starting session %s (workspace=%s)%s\n",
+			colorCyan, cmd.SessionID, cmd.WorkspaceID, colorReset)
+
+		onStarted := func() {
+			publishFn(resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				Output:      "OpenCode native started",
+				Status:      "success",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        "opencode_native_started",
+				SessionID:   cmd.SessionID,
+			})
+		}
+
+		err := globalOpenCodeNativeManager.Start(
+			cmd.SessionID,
+			cmd.Cwd,
+			cmd.WorkspaceID,
+			cmd.UID,
+			publishFn,
+			onStarted,
+		)
+		if err != nil {
+			// Only emit opencode_native_ended when NO local session exists. Any
+			// Start error raised after a live session is registered must not
+			// release the cloud reservation while the manager can still accept
+			// Sends — that desync breaks later turns after Pub/Sub redelivery.
+			// (Start itself treats redelivery as an idempotent started ack.)
+			publishOpenCodeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to start opencode native: %v", err))
+			if globalOpenCodeNativeManager.Get(cmd.SessionID) == nil {
+				publishFn(resultMsg{
+					ID:          cmd.ID,
+					WorkspaceID: cmd.WorkspaceID,
+					UID:         cmd.UID,
+					Output:      redactOpenCodeSecrets(fmt.Sprintf("start failed: %v", err)),
+					Status:      "error",
+					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
+					Type:        "opencode_native_ended",
+					SessionID:   cmd.SessionID,
+					ExitCode:    -1,
+				})
+			}
+			return
+		}
+
+	case "opencode_native_send":
+		if cmd.SessionID == "" {
+			publishOpenCodeNativeError(ctx, topic, cmd, "sessionID is required for opencode_native_send")
+			return
+		}
+		if strings.TrimSpace(cmd.Input) == "" {
+			// Reject whitespace-only sends here too: Send() trims and returns
+			// "input is empty" before it holds a session, and the error filter
+			// below only re-publishes not-found/ended — so a spaces-only turn
+			// would otherwise leave the chat stuck running with no terminal frame.
+			publishOpenCodeNativeError(ctx, topic, cmd, "input (user turn text) is required for opencode_native_send")
+			return
+		}
+
+		// Send is synchronous for the duration of the one-shot process so
+		// Pub/Sub ack semantics match "turn accepted" after completion frames
+		// are published. Turn timeouts are enforced inside Send.
+		timeout := time.Duration(0)
+		if cmd.TimeoutMs > 0 {
+			timeout = time.Duration(cmd.TimeoutMs) * time.Millisecond
+		}
+		if err := globalOpenCodeNativeManager.Send(cmd.SessionID, cmd.Input, publishFn, timeout); err != nil {
+			// Send publishes opencode_native_error for ordinary turn failures
+			// (timeout, empty response, oversize frame). Publish here only when
+			// Send could NOT (missing/ended session, or a turn already in
+			// flight) so the UI never stays stuck running without a terminal
+			// frame. "session ended during turn" is covered by
+			// opencode_native_ended from End — do not double-fire.
+			msg := err.Error()
+			if strings.Contains(msg, "not found") ||
+				strings.Contains(msg, "already has a turn in flight") ||
+				(strings.Contains(msg, "has ended") && !strings.Contains(msg, "during turn")) {
+				publishOpenCodeNativeError(ctx, topic, cmd, fmt.Sprintf("failed to send to opencode native: %v", err))
+			}
+			return
+		}
+
+	case "opencode_native_end":
+		if cmd.SessionID == "" {
+			publishOpenCodeNativeError(ctx, topic, cmd, "sessionID is required for opencode_native_end")
+			return
+		}
+
+		fmt.Printf("%s[opencode-native] Ending session %s%s\n",
+			colorYellow, cmd.SessionID, colorReset)
+
+		// Start accounting before End removes the session from its manager, so
+		// ActiveWork cannot observe a zero between local teardown and the final
+		// cloud-owned terminal frame.
+		trackTerminalPublishStart()
+		defer trackTerminalPublishEnd()
+		if err := globalOpenCodeNativeManager.End(cmd.SessionID); err != nil {
+			// Still publish ended so the cloud can release reservations even if
+			// the local session was already gone (idempotent teardown).
+			publishFn(resultMsg{
+				ID:          cmd.ID,
+				WorkspaceID: cmd.WorkspaceID,
+				UID:         cmd.UID,
+				Output:      fmt.Sprintf("end: %v", err),
+				Status:      "success",
+				Ts:          time.Now().UnixMilli(),
+				Version:     Version,
+				Type:        "opencode_native_ended",
+				SessionID:   cmd.SessionID,
+				ExitCode:    0,
+			})
+			return
+		}
+		publishFn(resultMsg{
+			ID:          cmd.ID,
+			WorkspaceID: cmd.WorkspaceID,
+			UID:         cmd.UID,
+			Output:      "OpenCode native ended",
+			Status:      "success",
+			Ts:          time.Now().UnixMilli(),
+			Version:     Version,
+			Type:        "opencode_native_ended",
+			SessionID:   cmd.SessionID,
+			ExitCode:    0,
+		})
+
+	default:
+		publishOpenCodeNativeError(ctx, topic, cmd, fmt.Sprintf("unknown opencode native command type: %s", cmd.Type))
+	}
+}
+
+// publishOpenCodeNativeError surfaces a synchronous failure back to the
+// orchestrator as an `opencode_native_error` frame.
+func publishOpenCodeNativeError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
+	fmt.Printf("%s[opencode-native] Error: %s%s\n", colorRed, errMsg, colorReset)
+
+	res := resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		Output:      redactOpenCodeSecrets(errMsg),
+		Status:      "error",
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        "opencode_native_error",
+		SessionID:   cmd.SessionID,
+	}
+	if err := publishMsg(ctx, topic, res); err != nil {
+		fmt.Printf("%s[opencode-native] Failed to publish error: %v%s\n", colorRed, err, colorReset)
 	}
 }
 

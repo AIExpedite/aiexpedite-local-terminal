@@ -100,11 +100,12 @@ func TestReadGrokBillingSnapshot_MissingLogIsNotAnError(t *testing.T) {
 func TestGrokBillingMetrics_LiveWindowPlotsCredits(t *testing.T) {
 	now := time.Date(2026, 8, 10, 18, 0, 0, 0, time.UTC)
 	snap := grokBillingSnapshot{
-		UsedPercent:  52,
-		ObservedAt:   now.Add(-time.Hour),
-		PeriodType:   "USAGE_PERIOD_TYPE_WEEKLY",
-		PeriodEnd:    now.Add(4 * time.Hour),
-		HasPeriodEnd: true,
+		UsedPercent:    52,
+		HasUsedPercent: true,
+		ObservedAt:     now.Add(-time.Hour),
+		PeriodType:     "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd:      now.Add(4 * time.Hour),
+		HasPeriodEnd:   true,
 	}
 
 	metrics := grokBillingMetrics(snap, now)
@@ -131,11 +132,12 @@ func TestGrokBillingMetrics_LiveWindowPlotsCredits(t *testing.T) {
 func TestGrokBillingMetrics_RolledOverPeriodIsUnobservable(t *testing.T) {
 	now := time.Date(2026, 8, 11, 18, 0, 0, 0, time.UTC)
 	snap := grokBillingSnapshot{
-		UsedPercent:  99,
-		ObservedAt:   now.Add(-26 * time.Hour),
-		PeriodType:   "USAGE_PERIOD_TYPE_WEEKLY",
-		PeriodEnd:    now.Add(-2 * time.Hour),
-		HasPeriodEnd: true,
+		UsedPercent:    99,
+		HasUsedPercent: true,
+		ObservedAt:     now.Add(-26 * time.Hour),
+		PeriodType:     "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd:      now.Add(-2 * time.Hour),
+		HasPeriodEnd:   true,
 	}
 
 	m := grokBillingMetrics(snap, now)[0]
@@ -150,11 +152,37 @@ func TestGrokBillingMetrics_RolledOverPeriodIsUnobservable(t *testing.T) {
 	}
 }
 
+// A rolled-over Grok 1.0 record (no creditUsagePercent) must not date-stamp the
+// row: nothing was observed, so a "Last observed" date would recreate the stale
+// reading this change removes for the still-live unmetered window.
+func TestGrokBillingMetrics_RolledOverUnmeteredPeriodHasNoObservationTime(t *testing.T) {
+	now := time.Date(2026, 8, 11, 18, 0, 0, 0, time.UTC)
+	snap := grokBillingSnapshot{
+		HasUsedPercent: false,
+		ObservedAt:     now.Add(-26 * time.Hour),
+		PeriodType:     "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd:      now.Add(-2 * time.Hour),
+		HasPeriodEnd:   true,
+	}
+
+	m := grokBillingMetrics(snap, now)[0]
+	if !m.Unknown {
+		t.Errorf("rolled-over unmetered pool must be Unknown, got %+v", m)
+	}
+	if m.Consumed != nil {
+		t.Errorf("unmetered pool must carry no value: %+v", m)
+	}
+	if m.ObservedAt != "" {
+		t.Errorf("no percentage was observed, so ObservedAt must be empty: %q", m.ObservedAt)
+	}
+}
+
 func TestGrokBillingMetrics_UnknownPeriodTypeIsNotGuessed(t *testing.T) {
 	snap := grokBillingSnapshot{
-		UsedPercent: 52,
-		ObservedAt:  time.Now(),
-		PeriodType:  "USAGE_PERIOD_TYPE_SOMETHING_NEW",
+		UsedPercent:    52,
+		HasUsedPercent: true,
+		ObservedAt:     time.Now(),
+		PeriodType:     "USAGE_PERIOD_TYPE_SOMETHING_NEW",
 	}
 	if metrics := grokBillingMetrics(snap, time.Now()); metrics != nil {
 		t.Errorf("an unrecognized period must not be plotted under a guessed window: %+v", metrics)
@@ -164,11 +192,12 @@ func TestGrokBillingMetrics_UnknownPeriodTypeIsNotGuessed(t *testing.T) {
 func TestGrokBillingMetrics_OnDemandOnlyWhenCapped(t *testing.T) {
 	now := time.Date(2026, 8, 10, 18, 0, 0, 0, time.UTC)
 	base := grokBillingSnapshot{
-		UsedPercent:  10,
-		ObservedAt:   now,
-		PeriodType:   "USAGE_PERIOD_TYPE_WEEKLY",
-		PeriodEnd:    now.Add(time.Hour),
-		HasPeriodEnd: true,
+		UsedPercent:    10,
+		HasUsedPercent: true,
+		ObservedAt:     now,
+		PeriodType:     "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd:      now.Add(time.Hour),
+		HasPeriodEnd:   true,
 	}
 	if got := len(grokBillingMetrics(base, now)); got != 1 {
 		t.Errorf("uncapped on-demand must not add a 0-of-0 row, got %d rows", got)
@@ -372,13 +401,14 @@ func TestGrokIdentityCandidates_CollectsEveryAccountField(t *testing.T) {
 func TestGrokBillingMetrics_OnDemandWithoutUsageIsUnobservable(t *testing.T) {
 	now := time.Date(2026, 8, 10, 18, 0, 0, 0, time.UTC)
 	snap := grokBillingSnapshot{
-		UsedPercent:  10,
-		ObservedAt:   now,
-		PeriodType:   "USAGE_PERIOD_TYPE_WEEKLY",
-		PeriodEnd:    now.Add(time.Hour),
-		HasPeriodEnd: true,
-		HasOnDemand:  true,
-		OnDemandCap:  50,
+		UsedPercent:    10,
+		HasUsedPercent: true,
+		ObservedAt:     now,
+		PeriodType:     "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd:      now.Add(time.Hour),
+		HasPeriodEnd:   true,
+		HasOnDemand:    true,
+		OnDemandCap:    50,
 		// HasOnDemandUsed deliberately false: `onDemandUsed` was absent or null.
 	}
 

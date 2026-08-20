@@ -6,41 +6,65 @@ import (
 	"runtime"
 )
 
+// baseDir is the per-environment config/data directory that every other path
+// helper hangs off: config.json, allowed-commands.txt, the CLI rate-limit
+// caches, security.log, logs/, bin/, and the single-instance lock. It is
+// resolved once at process start from the environment.
+//
+// The test suite redirects this to a throwaway directory in TestMain (see
+// sandboxTestConfigDir). That redirect is load-bearing, not hygiene: because
+// baseDir is resolved in init() from $HOME, a plain `go test ./...` on a
+// developer's machine otherwise resolves the machine's LIVE agent directory,
+// and any test that persists a Config through ConfigPath() overwrites the real
+// registration. That happened on 2026-08-18 — a test fixture's agent id and a
+// "test-attempt" update marker landed in the running agent's config.json,
+// which unregistered the device and wedged its auto-updater.
 var baseDir string
 
 func init() {
-	// Determine a default base directory for config and data, depending on OS.
-	// EnvConfigSuffix is set via ldflags at build time (e.g., "-Dev", "-Stg", "-Beta", "" for prod)
-	home := os.Getenv("HOME")
-	dirName := "AIExpedite" + EnvConfigSuffix
+	baseDir = resolveBaseDir(
+		runtime.GOOS,
+		EnvConfigSuffix,
+		os.Getenv("HOME"),
+		os.Getenv("APPDATA"),
+		os.Getenv("XDG_CONFIG_HOME"),
+	)
+}
 
-	switch runtime.GOOS {
+// resolveBaseDir computes the config/data directory for one OS + environment.
+// suffix is EnvConfigSuffix, set via ldflags at build time ("-Dev", "-Stg",
+// "-Beta", "" for prod) so each release channel keeps its own directory.
+//
+// Split out of init() as a pure function so every platform branch is testable
+// on any host — init() can only ever exercise the branch for the OS the test
+// binary happens to be running on.
+func resolveBaseDir(goos, suffix, home, appdata, xdgConfigHome string) string {
+	dirName := "AIExpedite" + suffix
+
+	switch goos {
 	case "windows":
 		// On Windows, use %APPDATA% for config (roaming).
-		appdata := os.Getenv("APPDATA")
 		if appdata == "" && home != "" {
 			// Fallback to HOME if APPDATA not set (unlikely).
 			appdata = filepath.Join(home, "AppData", "Roaming")
 		}
-		baseDir = filepath.Join(appdata, dirName)
+		return filepath.Join(appdata, dirName)
 	case "darwin":
 		// On macOS, use ~/Library/Application Support/.
 		if home == "" {
-			baseDir = "./" // fallback to current directory
-		} else {
-			baseDir = filepath.Join(home, "Library", "Application Support", dirName)
+			return "./" // fallback to current directory
 		}
+		return filepath.Join(home, "Library", "Application Support", dirName)
 	default:
 		// On Linux/Unix, use XDG_CONFIG_HOME or ~/.config.
-		configHome := os.Getenv("XDG_CONFIG_HOME")
+		configHome := xdgConfigHome
 		if configHome == "" && home != "" {
 			configHome = filepath.Join(home, ".config")
 		}
 		if configHome == "" {
-			baseDir = "./"
-		} else {
-			baseDir = filepath.Join(configHome, dirName)
+			return "./"
 		}
+		return filepath.Join(configHome, dirName)
 	}
 }
 

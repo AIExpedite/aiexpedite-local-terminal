@@ -28,6 +28,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"runtime"
 	"strings"
@@ -146,6 +147,19 @@ const (
 	autoUpdateMaxRetries        = 3
 	autoUpdateRetryMin          = 1 * time.Minute
 	autoUpdateRetryMax          = 30 * time.Minute
+
+	// autoUpdateReconcileMaxAttempts bounds how long an unreconcilable attempt
+	// marker may hold the update scheduler hostage. Reconciliation runs BEFORE
+	// any release check, so an error that never clears means the agent never
+	// updates again — a silent, permanent stall whose only symptom is a line in
+	// a log file.
+	//
+	// Giving up is safe: terminal-service reads a drain that has not been
+	// confirmed within DRAIN_STALE_MS (15 minutes) as expired and resumes
+	// routing to the device on its own. With retryBackoff's 1→30m ramp this
+	// budget spans about an hour, so the service has long since recovered
+	// routing by the time we abandon the marker.
+	autoUpdateReconcileMaxAttempts = 6
 
 	// heartbeatStaleWindow mirrors terminal-service ONLINE_THRESHOLD_MS: once a
 	// registered agent has been refusing work locally for longer than this, the
@@ -1169,6 +1183,14 @@ func (au *autoUpdater) exitDrain(attemptID, reason string, cooldown bool) {
 		au.clearAttempt()
 		return
 	}
+	if isDeviceUnknownErr(exitErr) || isDeviceUnknownErr(onlineErr) {
+		// No terminalAgents doc, so no drain to clear and no retry that could
+		// ever succeed. Drop the marker rather than spawning a loop that would
+		// block every future update check.
+		fmt.Printf("[autoupdate] service does not recognise this device; abandoning attempt %s without retrying\n", attemptID)
+		au.clearAttempt()
+		return
+	}
 
 	go au.retryDrainExitReconciliation(attemptID, reason)
 }
@@ -1177,8 +1199,8 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 	if au == nil || au.cfg == nil {
 		return
 	}
-	for attempt := 1; ; attempt++ {
-		timer := time.NewTimer(retryBackoff(attempt))
+	for attempt := 1; attempt <= autoUpdateReconcileMaxAttempts; attempt++ {
+		timer := time.NewTimer(reconcileBackoff(attempt))
 		select {
 		case <-au.stopCh:
 			timer.Stop()
@@ -1237,7 +1259,27 @@ func (au *autoUpdater) retryDrainExitReconciliation(attemptID, reason string) {
 			au.clearAttempt()
 			return
 		}
+		if isDeviceUnknownErr(exitErr) || isDeviceUnknownErr(onlineErr) {
+			fmt.Printf("[autoupdate] service does not recognise this device; abandoning attempt %s\n", attemptID)
+			au.clearAttempt()
+			return
+		}
 	}
+
+	// Same bound, and the same reasoning, as the interrupted-attempt loop: a
+	// marker we cannot clear is worth less than the update checks it blocks,
+	// and the service-side drain has already expired by now.
+	//
+	// Re-check the identity first: the budget spans about an hour, long enough
+	// for a newer attempt to own the marker, and that one is still reconcilable.
+	var currentAttempt string
+	au.cfg.WithPersistenceLock(func() { currentAttempt = au.cfg.PendingUpdateAttemptID })
+	if currentAttempt != attemptID {
+		return
+	}
+	fmt.Printf("[autoupdate] giving up on drain exit for attempt %s after %d tries; abandoning it so update checks resume\n",
+		attemptID, autoUpdateReconcileMaxAttempts)
+	au.clearAttempt()
 }
 
 // persistAttempt / clearAttempt maintain the crash-recovery marker.
@@ -1266,6 +1308,24 @@ func (au *autoUpdater) clearAttempt() {
 	}); err != nil {
 		fmt.Printf("[autoupdate] Could not clear attempt marker: %v\n", err)
 	}
+}
+
+// reconcileBackoff is retryBackoff, indirected so tests can exercise the
+// reconciliation budget without waiting out the real 1→30 minute ramp. Only the
+// two reconciliation loops use it; nothing in production reassigns it.
+//
+// The indirection is behind a lock rather than a bare var because those loops
+// run on background goroutines that outlive the call that started them: a test
+// restoring the original function would otherwise race a loop still reading it.
+var (
+	reconcileBackoffMu sync.RWMutex
+	reconcileBackoffFn = retryBackoff
+)
+
+func reconcileBackoff(attempt int) time.Duration {
+	reconcileBackoffMu.RLock()
+	defer reconcileBackoffMu.RUnlock()
+	return reconcileBackoffFn(attempt)
 }
 
 // retryBackoff returns the backoff before the given (1-based) retry attempt,
@@ -1298,10 +1358,39 @@ func isDrainExpiredErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	// notifyConnectivity surfaces the HTTP status in its error text; the drain
-	// route returns 410 for an expired attempt.
+	var httpErr *connectivityHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusGone || httpErr.Code == "DRAIN_EXPIRED"
+	}
+	// Fallback for errors that never went through sendConnectivityRequest: the
+	// status is only available as text. The drain route returns 410 for an
+	// expired attempt.
 	msg := err.Error()
 	return strings.Contains(msg, "410") || strings.Contains(msg, "DRAIN_EXPIRED")
+}
+
+// isDeviceUnknownErr reports whether the service answered "there is no such
+// device". terminal-service returns 404 NOT_FOUND from /drain, /drain/exit and
+// /online when no terminalAgents doc exists for the agent id.
+//
+// This is a PERMANENT refusal, and it has to be told apart from a transient one
+// because reconciliation blocks the update scheduler: an attempt marker naming
+// a device the service has never heard of can never be reconciled, so retrying
+// it forever means never checking for a release again.
+//
+// The service's error code is required, not merely the 404. A bodyless 404 can
+// come from a router with no such route (a service deployed before the drain
+// endpoints existed) or from an intermediary, and those ARE transient — so an
+// unrecognised 404 keeps retrying rather than abandoning a live drain.
+func isDeviceUnknownErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *connectivityHTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	return httpErr.StatusCode == http.StatusNotFound && httpErr.Code == "NOT_FOUND"
 }
 
 // resolveInterruptedAttempt reconciles an attempt marker left by a crash or an
@@ -1366,6 +1455,9 @@ func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) bool {
 			return false
 		}
 		if err != nil {
+			if abandonAttemptIfDeviceUnknown(cfg, savePath, attemptID, err) {
+				return false
+			}
 			fmt.Printf("[autoupdate] post-update online report failed: %v\n", err)
 			return true
 		}
@@ -1377,6 +1469,9 @@ func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) bool {
 			return false
 		}
 		if err != nil {
+			if abandonAttemptIfDeviceUnknown(cfg, savePath, attemptID, err) {
+				return false
+			}
 			fmt.Printf("[autoupdate] interrupted-attempt drain exit failed: %v\n", err)
 			return true
 		}
@@ -1385,6 +1480,9 @@ func resolveInterruptedAttemptWithPath(cfg *Config, savePath string) bool {
 			return false
 		}
 		if err != nil {
+			if abandonAttemptIfDeviceUnknown(cfg, savePath, attemptID, err) {
+				return false
+			}
 			fmt.Printf("[autoupdate] interrupted-attempt online report failed: %v\n", err)
 			return true
 		}
@@ -1462,6 +1560,24 @@ func clearInterruptedAttempt(cfg *Config, savePath, attemptID string) {
 	}
 }
 
+// abandonAttemptIfDeviceUnknown drops the attempt marker when the failure proves
+// the service has no such device, and reports whether it did.
+//
+// There is genuinely nothing left to reconcile in that case: the drain we would
+// be clearing lives on a terminalAgents doc that does not exist. Holding the
+// marker would only keep the update scheduler blocked forever — which is
+// exactly what happened to a device whose config.json was overwritten with a
+// test fixture, leaving an attempt id the service had never issued.
+func abandonAttemptIfDeviceUnknown(cfg *Config, savePath, attemptID string, err error) bool {
+	if !isDeviceUnknownErr(err) {
+		return false
+	}
+	fmt.Printf("[autoupdate] service does not recognise this device (%v); abandoning attempt %s so update checks resume\n",
+		err, attemptID)
+	clearInterruptedAttempt(cfg, savePath, attemptID)
+	return true
+}
+
 // retryInterruptedAttemptReconciliation keeps a successfully installed agent
 // from remaining unroutable until another process restart when the service was
 // temporarily unavailable during its first version-aware online report.
@@ -1469,12 +1585,23 @@ func retryInterruptedAttemptReconciliation(cfg *Config) {
 	retryInterruptedAttemptReconciliationAt(cfg, ConfigPath())
 }
 
+// interruptedReconcileRunning is the single-flight guard for the loop below.
+// runAttempt spawns a reconciliation retry on every scheduled tick that finds a
+// retained marker, so without this a marker that keeps failing accumulates one
+// more goroutine — and one more set of RPCs — every six hours.
+var interruptedReconcileRunning atomic.Bool
+
 func retryInterruptedAttemptReconciliationAt(cfg *Config, savePath string) {
 	if cfg == nil {
 		return
 	}
-	for attempt := 1; ; attempt++ {
-		timer := time.NewTimer(retryBackoff(attempt))
+	if !interruptedReconcileRunning.CompareAndSwap(false, true) {
+		return
+	}
+	defer interruptedReconcileRunning.Store(false)
+
+	for attempt := 1; attempt <= autoUpdateReconcileMaxAttempts; attempt++ {
+		timer := time.NewTimer(reconcileBackoff(attempt))
 		ticker := time.NewTicker(25 * time.Millisecond)
 		aborted := false
 		for !aborted {
@@ -1501,4 +1628,16 @@ func retryInterruptedAttemptReconciliationAt(cfg *Config, savePath string) {
 			return
 		}
 	}
+
+	// Budget exhausted. Abandoning beats holding the scheduler: the service has
+	// long since expired the drain we could not clear, so the only thing this
+	// marker still does is block every future update check.
+	var attemptID string
+	cfg.WithPersistenceLock(func() { attemptID = cfg.PendingUpdateAttemptID })
+	if attemptID == "" {
+		return
+	}
+	fmt.Printf("[autoupdate] giving up reconciling attempt %s after %d tries; abandoning it so update checks resume\n",
+		attemptID, autoUpdateReconcileMaxAttempts)
+	clearInterruptedAttempt(cfg, savePath, attemptID)
 }

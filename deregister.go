@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -339,7 +340,57 @@ func sendConnectivityRequest(ctx context.Context, url string, cfg *Config, extra
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned status %d", resp.StatusCode)
+		return &connectivityHTTPError{
+			StatusCode: resp.StatusCode,
+			Code:       readServiceErrorCode(resp.Body),
+		}
 	}
 	return nil
+}
+
+// connectivityHTTPError is a non-2xx answer from a connectivity RPC, carrying
+// the status and — when the service sent a JSON body with one — its error code.
+// Callers branch on those to tell a permanent refusal ("no such device") from a
+// transient one ("service is down"), instead of substring-matching the message.
+//
+// The message keeps the original "server returned status %d" wording so console
+// output and log greps are unchanged.
+type connectivityHTTPError struct {
+	StatusCode int
+	// Code is the service's machine-readable error code (e.g. "NOT_FOUND",
+	// "DRAIN_EXPIRED"), or "" when the body carried none. Empty is meaningful:
+	// a bodyless 404 is a router or proxy answer, not the device verdict.
+	Code string
+}
+
+func (e *connectivityHTTPError) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("server returned status %d (%s)", e.StatusCode, e.Code)
+	}
+	return fmt.Sprintf("server returned status %d", e.StatusCode)
+}
+
+// maxServiceErrorBody bounds how much of an error body we read. The codes we
+// care about arrive in a small JSON object; anything larger is an HTML error
+// page from an intermediary, which carries no code for us anyway.
+const maxServiceErrorBody = 4 << 10
+
+// readServiceErrorCode extracts `code` from a JSON error body. Any failure —
+// unreadable body, not JSON, no code field — yields "", which callers must
+// treat as "the service did not tell us why".
+func readServiceErrorCode(body io.Reader) string {
+	if body == nil {
+		return ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(body, maxServiceErrorBody))
+	if err != nil || len(raw) == 0 {
+		return ""
+	}
+	var parsed struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return ""
+	}
+	return parsed.Code
 }

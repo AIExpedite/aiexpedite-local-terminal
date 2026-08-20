@@ -486,11 +486,20 @@ func TestCaptureClaudeRateLimit_AllowedHeartbeatWithoutPriorUsageDoesNotPersist(
 		itoa(resetSec) + `}}`
 	captureClaudeRateLimitLine(line, now)
 
+	// The heartbeat DOES record the window it named — that is how the cache
+	// learns about a window it has never seen a reading for. What it must never
+	// do is let the zero UsedPercentage read back as an observation, which is
+	// what usageObserved:false pins.
 	snap, ok := loadClaudeRateLimitSnapshot(cache)
-	if ok {
-		if _, present := snap.Buckets[claudeWindowFiveHour]; present {
-			t.Fatalf("first heartbeat without usage must not persist a zero-usage bucket")
-		}
+	if !ok {
+		t.Fatal("heartbeat naming a reset must persist its window")
+	}
+	bucket, present := snap.Buckets[claudeWindowFiveHour]
+	if !present {
+		t.Fatal("heartbeat naming a reset must persist its window")
+	}
+	if bucket.hasObservedUsage() {
+		t.Fatal("a heartbeat carries no usage; the bucket must be marked unobserved")
 	}
 	metrics := claudeCodeMetricsFromCache(now, "")
 	for _, m := range metrics {
@@ -556,8 +565,15 @@ func TestCaptureClaudeRateLimit_RolledOverHeartbeatDropsStaleUsage(t *testing.T)
 	if session.Consumed != nil && *session.Consumed > 0 {
 		t.Errorf("rolled-over window Consumed=%v, want 0 — stale 95%% must not carry under the new reset", *session.Consumed)
 	}
-	if session.ResetAt != "" {
-		t.Errorf("rolled-over window must not advertise a fresh reset, got %q", session.ResetAt)
+	if !session.Unknown {
+		t.Error("the new window has no reading yet, so the row must be Unknown")
+	}
+	// The heartbeat's reset IS reported. Pairing a STALE PERCENTAGE with a fresh
+	// reset is the hazard; reporting the current window with no percentage is
+	// not. Dropping the reset too is what froze the cache on the expired
+	// window — nothing could then replace it.
+	if want := later.Add(5 * time.Hour).UTC().Format(time.RFC3339); session.ResetAt != want {
+		t.Errorf("session ResetAt = %q, want the heartbeat's current window %q", session.ResetAt, want)
 	}
 }
 

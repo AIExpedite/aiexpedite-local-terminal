@@ -207,6 +207,7 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 		t.Fatalf("seed auth.json: %v", err)
 	}
 	t.Setenv("GROK_HOME", realHome)
+	withTempGrokSessionStore(t)
 
 	dir, err := setupIsolatedGrokHome(false, grokACPDefaultModel)
 	if err != nil {
@@ -265,6 +266,7 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 func TestSetupIsolatedGrokHome_MissingAuthTolerated(t *testing.T) {
 	t.Setenv("GROK_HOME", t.TempDir()) // empty: no auth.json
 
+	withTempGrokSessionStore(t)
 	dir, err := setupIsolatedGrokHome(false, grokACPDefaultModel)
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome must tolerate missing auth: %v", err)
@@ -363,6 +365,7 @@ func TestSetupIsolatedGrokHome_PreservesPersistedAPIKeyWhenFallbackEnabled(t *te
 		t.Fatalf("seed source config.toml: %v", err)
 	}
 	t.Setenv("GROK_HOME", realHome)
+	withTempGrokSessionStore(t)
 
 	on, err := setupIsolatedGrokHome(true, grokACPDefaultModel)
 	if err != nil {
@@ -411,6 +414,7 @@ func TestSetupIsolatedGrokHome_PreservesPerModelAPIKey(t *testing.T) {
 		t.Fatalf("seed source config.toml: %v", err)
 	}
 	t.Setenv("GROK_HOME", realHome)
+	withTempGrokSessionStore(t)
 
 	on, err := setupIsolatedGrokHome(true, "grok-build")
 	if err != nil {
@@ -444,6 +448,7 @@ func TestSetupIsolatedGrokHome_PreservesRootAPIKeyWhenNoPerModelMatch(t *testing
 		t.Fatalf("seed source config.toml: %v", err)
 	}
 	t.Setenv("GROK_HOME", realHome)
+	withTempGrokSessionStore(t)
 
 	on, err := setupIsolatedGrokHome(true, "grok-build")
 	if err != nil {

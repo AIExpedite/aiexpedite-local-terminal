@@ -479,23 +479,19 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 	for _, a := range activeCLIAgentCatalog() {
 		path, err := exec.LookPath(a.Command)
 		if err != nil {
-			// Grok's official installer (https://x.ai/cli/install.sh) drops
-			// the binary in $HOME/.grok/bin (or $GROK_BIN_DIR) and only
-			// updates shell rc files when it cannot symlink into an
-			// already-on-PATH directory. macOS GUI/launchd agents inherit a
-			// sparse PATH that frequently excludes that dir, so a perfectly
-			// functional install would otherwise report missing — and the
-			// later grok_acp_start would fail via the same lookup. Probe the
-			// installer's default bin dir before giving up.
-			if a.Command == "grok" {
-				if p := resolveGrokInstallerBinary(); p != "" {
-					path = p
-				} else {
-					continue
-				}
-			} else {
+			// Several CLI agents ship an official installer that drops the
+			// binary in a per-user directory and only updates shell rc files
+			// when it cannot symlink into an already-on-PATH directory. macOS
+			// GUI/launchd agents inherit a sparse PATH that frequently excludes
+			// those dirs, so a perfectly functional install would otherwise
+			// report missing — and the later native start would fail via the
+			// same lookup. Probe the installer's default bin dir before giving
+			// up. See installerBinDirFallbacks.
+			fallback := resolveInstallerBinary(a.Command, installerBinDirFor(a.Command))
+			if fallback == "" {
 				continue
 			}
+			path = fallback
 		}
 		entry := detectedCLIAgent{
 			Detected: true,
@@ -505,7 +501,7 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 		// Probe via the resolved absolute path so fallback-located binaries
 		// (e.g. grok in ~/.grok/bin) still report a version; probeVersionArgs
 		// runs `exec.LookPath` internally and that accepts absolute paths.
-		if v := probeVersionArgs(path, "--version"); v != "" {
+		if v := cachedProbeVersion(path); v != "" {
 			entry.Version = v
 		}
 		agents[a.ID] = entry
@@ -513,42 +509,156 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 	return agents
 }
 
-// grokInstallerBinDir returns the directory the official Grok installer
-// drops the `grok` binary in. Honors $GROK_BIN_DIR (the override the
-// installer itself reads) and falls back to $HOME/.grok/bin
-// (%USERPROFILE%\.grok\bin on Windows).
-func grokInstallerBinDir() string {
-	if d := strings.TrimSpace(os.Getenv("GROK_BIN_DIR")); d != "" {
-		return d
+/* --------------------------------------------------------------------------
+   Installer bin-dir fallbacks
+   -------------------------------------------------------------------------- */
+
+// installerBinDirFallbacks maps a catalog command to the directory its official
+// installer writes the binary to when it cannot symlink onto PATH, plus the
+// environment variable that overrides that directory (empty when the installer
+// has none). Table-driven rather than a chain of `if command == ...` branches so
+// a sixth agent with the same installer shape is one row, not a new branch.
+//
+//   - grok:     https://x.ai/cli/install.sh writes $GROK_BIN_DIR else
+//     $HOME/.grok/bin (%USERPROFILE%\.grok\bin on Windows).
+//   - opencode: the official install script writes $HOME/.opencode/bin, which
+//     macOS launchd/GUI-spawned agents do not inherit -- exactly the failure the
+//     grok fallback exists for.
+var installerBinDirFallbacks = map[string]struct {
+	EnvVar string
+	Rel    []string
+}{
+	"grok":     {EnvVar: "GROK_BIN_DIR", Rel: []string{".grok", "bin"}},
+	"opencode": {EnvVar: "", Rel: []string{".opencode", "bin"}},
+}
+
+// installerBinDirFor returns the installer bin dir for a command, or "" when
+// the command has no known installer fallback (the common case).
+func installerBinDirFor(command string) string {
+	spec, ok := installerBinDirFallbacks[commandBaseName(command)]
+	if !ok {
+		return ""
+	}
+	if spec.EnvVar != "" {
+		if d := strings.TrimSpace(os.Getenv(spec.EnvVar)); d != "" {
+			return d
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return ""
 	}
-	return filepath.Join(home, ".grok", "bin")
+	return filepath.Join(append([]string{home}, spec.Rel...)...)
 }
 
-// resolveGrokInstallerBinary returns the absolute path to a `grok` binary
-// installed by the official installer, or "" when none exists. Used as a
-// PATH-independent fallback by both CLI detection and the ACP manager so a
-// launchd/GUI-spawned agent process with a sparse PATH still finds the
-// user's grok install.
-func resolveGrokInstallerBinary() string {
-	dir := grokInstallerBinDir()
-	if dir == "" {
+// resolveInstallerBinary returns the absolute path to `command` inside dir, or
+// "" when dir is empty or holds no such executable. PATH-independent fallback
+// used by both CLI detection and the native managers so a launchd/GUI-spawned
+// agent process with a sparse PATH still finds the user's install.
+func resolveInstallerBinary(command, dir string) string {
+	if dir == "" || command == "" {
 		return ""
 	}
-	candidates := []string{"grok"}
+	base := commandBaseName(command)
+	candidates := []string{base}
 	if runtime.GOOS == "windows" {
-		candidates = []string{"grok.exe", "grok"}
+		// The installers drop a native .exe; keep the extensionless spelling as
+		// a later candidate for shim-style installs.
+		candidates = []string{base + ".exe", base + ".cmd", base}
 	}
 	for _, name := range candidates {
-		p := filepath.Join(dir, name)
-		if info, err := os.Stat(p); err == nil && !info.IsDir() {
-			return p
+		candidate := filepath.Join(dir, name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
 		}
 	}
 	return ""
+}
+
+// resolveGrokInstallerBinary returns the absolute path to a `grok` binary
+// installed by the official installer, or "" when none exists. Thin wrapper
+// over the generalized table above so the Grok ACP manager's existing call
+// site keeps working.
+func resolveGrokInstallerBinary() string {
+	return resolveInstallerBinary("grok", installerBinDirFor("grok"))
+}
+
+// resolveOpenCodeInstallerBinary returns the absolute path to an `opencode`
+// binary installed by the official install script, or "" when none exists.
+// Used by the OpenCode native manager for the same reason the Grok one exists.
+func resolveOpenCodeInstallerBinary() string {
+	return resolveInstallerBinary("opencode", installerBinDirFor("opencode"))
+}
+
+/* --------------------------------------------------------------------------
+   Version-probe cache
+   -------------------------------------------------------------------------- */
+
+// gatherCLIAgents runs one `<bin> --version` child per catalog entry on every
+// machine-info gather AND every __cli_usage_refresh__ wake, all inside the
+// single 10-second GatherCLIAgentUsageOnly context. On Windows with real-time
+// AV, a cold --version on a large compiled binary runs in the hundreds of
+// milliseconds, so at 5-6 agents the serialized probes consume a visible
+// fraction of that budget and produce intermittent "no utilization reported"
+// cards.
+//
+// A version string is a pure function of the binary, so the probe is cached on
+// (path, mtime, size): a refresh cycle re-probes only when the binary actually
+// changed (upgrade, reinstall). This is deliberately NOT the right key for
+// readiness/auth probes, which change without the binary changing -- see
+// cliagent_usage_opencode.go, which uses a short time-based TTL instead.
+type versionProbeKey struct {
+	Path    string
+	ModUnix int64
+	Size    int64
+}
+
+var (
+	versionProbeMu    sync.Mutex
+	versionProbeCache = map[versionProbeKey]string{}
+)
+
+// cachedProbeVersion returns `<path> --version` output, reusing a prior result
+// when the binary is unchanged by (path, mtime, size). Falls through to an
+// uncached probe when the binary cannot be stat'ed.
+func cachedProbeVersion(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return probeVersionArgs(path, "--version")
+	}
+	key := versionProbeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
+
+	versionProbeMu.Lock()
+	cached, ok := versionProbeCache[key]
+	versionProbeMu.Unlock()
+	if ok {
+		return cached
+	}
+
+	v := probeVersionArgs(path, "--version")
+	versionProbeMu.Lock()
+	// Cache negatives too: a binary that reliably fails --version would
+	// otherwise re-spawn a doomed child on every single gather, which is the
+	// exact cost this cache exists to remove. A reinstall changes mtime and
+	// invalidates the entry. Drop stale entries for the same path first, since
+	// an upgrade leaves the old (mtime,size) key behind and nothing else prunes
+	// this map.
+	for k := range versionProbeCache {
+		if k.Path == path && k != key {
+			delete(versionProbeCache, k)
+		}
+	}
+	versionProbeCache[key] = v
+	versionProbeMu.Unlock()
+	return v
+}
+
+// resetVersionProbeCache clears the cache. Test-only seam so a case that
+// rewrites a stub binary in place can assert re-probe behaviour deterministically.
+func resetVersionProbeCache() {
+	versionProbeMu.Lock()
+	versionProbeCache = map[versionProbeKey]string{}
+	versionProbeMu.Unlock()
 }
 
 func roundGB(bytes uint64) float64 {
