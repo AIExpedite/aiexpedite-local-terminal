@@ -94,9 +94,9 @@ type codexOpenAIAuthClaim struct {
 	AccountID string `json:"chatgpt_account_id"`
 }
 
-// codexAccount returns the credential identity used both by the usage parser
-// and by rate-limit capture. Keep the precedence in one place so telemetry is
-// always written under the same fingerprint the parser later reads.
+// codexAccount returns the human-readable credential identity shown by the
+// usage parser. Workspace account IDs remain fallbacks here because an email or
+// ChatGPT user ID is a more useful label on the card.
 func codexAccount(auth codexAuth, claims codexIDTokenClaims) string {
 	return firstNonEmpty(
 		auth.Email,
@@ -109,6 +109,18 @@ func codexAccount(auth codexAuth, claims codexIDTokenClaims) string {
 		auth.Tokens.AccountID,
 		claims.OpenAIAuth.AccountID,
 		claims.Subject,
+	)
+}
+
+// codexAccountScope returns the credential identity used to scope cached
+// telemetry. A ChatGPT user can belong to multiple workspace accounts with
+// independent plans and quotas, so the active workspace ID must outrank the
+// display identity whenever Codex provides one.
+func codexAccountScope(auth codexAuth, claims codexIDTokenClaims) string {
+	return firstNonEmpty(
+		auth.Tokens.AccountID,
+		claims.OpenAIAuth.AccountID,
+		codexAccount(auth, claims),
 	)
 }
 
@@ -138,6 +150,7 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 		claims := codexIDTokenClaims{}
 		parseJWTClaims(auth.Tokens.IDToken, &claims)
 		usage.Account = codexAccount(auth, claims)
+		usage.AccountFingerprint = fingerprintAccount(p.Provider(), codexAccountScope(auth, claims))
 		usage.Plan = firstNonEmpty(
 			auth.Plan, auth.PlanType, claims.Plan, claims.PlanType, claims.OpenAIAuth.PlanType)
 		if firstNonEmpty(auth.APIKey, auth.Tokens.IDToken, auth.Tokens.RefreshToken) != "" {
@@ -160,7 +173,6 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 			}
 		}
 	}
-	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
 	// Live app-server telemetry first; for any window never captured live,
 	// fall back to Codex's own on-disk rollout logs so the card is observable

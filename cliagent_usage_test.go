@@ -862,8 +862,9 @@ func TestCodexUsageParser_AccountFallsBackToNamespacedChatGPTUserID(t *testing.T
 			"id_token": helperJWT(t, map[string]any{
 				"sub": "google-oauth2|117053759699842363930",
 				"https://api.openai.com/auth": map[string]any{
-					"chatgpt_plan_type": "plus",
-					"chatgpt_user_id":   "user-PPrLthwR0xmzb8mFDad617BZ",
+					"chatgpt_plan_type":  "plus",
+					"chatgpt_user_id":    "user-PPrLthwR0xmzb8mFDad617BZ",
+					"chatgpt_account_id": "workspace-A",
 				},
 			}),
 			"refresh_token": "opaque-refresh-token",
@@ -873,6 +874,9 @@ func TestCodexUsageParser_AccountFallsBackToNamespacedChatGPTUserID(t *testing.T
 	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, time.Now())
 	if usage.Account != "user-PPrLthwR0xmzb8mFDad617BZ" {
 		t.Errorf("Account=%q, want the namespaced ChatGPT user id", usage.Account)
+	}
+	if want := fingerprintAccount("codex", "workspace-A"); usage.AccountFingerprint != want {
+		t.Errorf("AccountFingerprint=%q, want workspace-scoped %q", usage.AccountFingerprint, want)
 	}
 	if usage.Plan != "plus" {
 		t.Errorf("Plan=%q, want plus", usage.Plan)
