@@ -1453,7 +1453,6 @@ func codexUsageLimitNotice(metrics []cliAgentUsageMetric, limit codexUsageLimitE
 	for _, m := range metrics {
 		if m.Unknown {
 			anyUnknown = true
-			continue
 		}
 		observed, err := time.Parse(time.RFC3339, m.ObservedAt)
 		if err == nil && !observed.Before(limit.At) {

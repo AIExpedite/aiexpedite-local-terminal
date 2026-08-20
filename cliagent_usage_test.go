@@ -1401,6 +1401,36 @@ func TestCodexUsageParser_ObservationNewerThanRefusalSuppressesNotice(t *testing
 	}
 }
 
+// A newer observation still supersedes the refusal after its reset passes and
+// the metric becomes unobservable. ObservedAt remains evidence that the older
+// refusal no longer describes the account, even though no percentage is shown.
+func TestCodexUsageParser_RolledOverObservationNewerThanRefusalSuppressesNotice(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	helperWriteRolloutLimitLog(t, codexHome, "19", "2026-06-19T10-00-00-aaaa",
+		"2026-06-19T10:00:00.000Z", nil, "2026-06-19T11:00:00.000Z")
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T11-30-00-bbbb", "2026-06-19T11:30:00.000Z",
+		[]map[string]any{{
+			"secondary": map[string]any{
+				"used_percent": 6.0, "window_minutes": 10080.0,
+				"resets_at": float64(now.Add(-time.Minute).Unix()),
+			},
+		}})
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	weekly := usage.Metrics[1]
+	if !weekly.Unknown || weekly.ObservedAt != "2026-06-19T11:30:00Z" {
+		t.Fatalf("weekly row=%+v, want a rolled-over observation newer than the refusal", weekly)
+	}
+	if usage.Notice != "" {
+		t.Errorf("notice=%q, want none — the newer rolled-over observation supersedes the refusal", usage.Notice)
+	}
+}
+
 // A refusal carries no reset, so it is expired by age rather than believed
 // forever. Understating a still-exhausted account is the safe direction: Codex
 // writes a fresh rollout on the next attempt, which re-evidences it.
