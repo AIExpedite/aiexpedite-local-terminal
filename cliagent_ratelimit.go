@@ -65,14 +65,34 @@ type claudeRateLimitBucket struct {
 	ResetsAtMs     int64   `json:"resetsAtMs"`
 	Status         string  `json:"status,omitempty"`
 	ObservedAtMs   int64   `json:"observedAtMs"`
+	// UsageObserved records whether UsedPercentage is a real reading.
+	//
+	// PERSISTED, unlike usageKnown below, because a bucket can now be written
+	// from a heartbeat that named a window's reset time while carrying no
+	// utilization — the only way to record that a NEW window exists without
+	// inventing a percentage for it. Readers must render such a bucket as
+	// "unobservable", never as 0%.
+	//
+	// A nil pointer means "observed": every bucket written before this field
+	// existed carried a reading, so an older cache keeps its meaning.
+	UsageObserved *bool `json:"usageObserved,omitempty"`
 	// usageKnown is true when this bucket carries a fresh usage reading
 	// (utilization / used_percentage) or a synthesized 100% from a rejected
 	// status. False marks an "allowed heartbeat" that updated only the reset
 	// time / status — merge must NOT let its 0 default overwrite a previously
-	// observed UsedPercentage. Not persisted: every loaded bucket is treated
-	// as a known usage reading.
+	// observed UsedPercentage. Per-event and not persisted; UsageObserved is
+	// the durable form of the same fact.
 	usageKnown bool `json:"-"`
 }
+
+// hasObservedUsage reports whether UsedPercentage came from an actual reading.
+// Absent (nil) is "observed" so caches written before UsageObserved existed —
+// where every persisted bucket did carry a reading — keep their meaning.
+func (b claudeRateLimitBucket) hasObservedUsage() bool {
+	return b.UsageObserved == nil || *b.UsageObserved
+}
+
+func usageObservedPtr(v bool) *bool { return &v }
 
 // claudeRateLimitSnapshot is the on-disk cache, keyed by window id.
 // AccountFingerprint pins the snapshot to the Claude account that produced it
@@ -390,18 +410,46 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 			// first-ever heartbeat without usage must not seed a fake 0% row.
 			sameLiveWindow := ok && prev.ResetsAtMs > nowMs &&
 				(bucket.ResetsAtMs == 0 || bucket.ResetsAtMs == prev.ResetsAtMs)
-			if !sameLiveWindow {
+			if sameLiveWindow {
+				if bucket.ResetsAtMs == 0 {
+					bucket.ResetsAtMs = prev.ResetsAtMs
+				}
+				bucket.UsedPercentage = prev.UsedPercentage
+				// The heartbeat observed the reset/status, not utilization. Keep
+				// the carried percentage paired with its original observation so
+				// repeated heartbeats cannot make stale usage appear fresh
+				// indefinitely.
+				bucket.ObservedAtMs = prev.ObservedAtMs
+				bucket.UsageObserved = usageObservedPtr(prev.hasObservedUsage())
+				snap.Buckets[window] = bucket
 				continue
 			}
+			// Not the same live window. The percentage is unknown here — but the
+			// heartbeat still OBSERVED this window's reset time and status, and
+			// dropping the whole update (which is what this code used to do)
+			// leaves a rolled-over bucket in the cache that nothing can ever
+			// replace: the next heartbeat is compared against the same expired
+			// prior and discarded too. A Mac sat like that for days, its card
+			// reading "Usage unobservable" under a reset date that had passed,
+			// while fresh heartbeats arrived on every status-line render.
+			//
+			// So record the window WITHOUT a usage reading. UsageObserved=false
+			// is persisted, so a reload cannot mistake the zero UsedPercentage
+			// for an observation, and the readers render the row from ResetsAtMs
+			// as "unobservable, resets <date>". The next usage-bearing event then
+			// lands on a CURRENT window instead of being weighed against an
+			// expired one.
 			if bucket.ResetsAtMs == 0 {
-				bucket.ResetsAtMs = prev.ResetsAtMs
+				// No reset and no usage: nothing the cache does not already hold,
+				// and seeding a bucket here would invent a 0% row.
+				continue
 			}
-			bucket.UsedPercentage = prev.UsedPercentage
-			// The heartbeat observed the reset/status, not utilization. Keep the
-			// carried percentage paired with its original observation so repeated
-			// heartbeats cannot make stale usage appear fresh indefinitely.
-			bucket.ObservedAtMs = prev.ObservedAtMs
+			bucket.UsedPercentage = 0
+			bucket.UsageObserved = usageObservedPtr(false)
+			snap.Buckets[window] = bucket
+			continue
 		}
+		bucket.UsageObserved = usageObservedPtr(true)
 		snap.Buckets[window] = bucket
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
