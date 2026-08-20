@@ -702,12 +702,90 @@ type resultMsg struct {
 // subscription and fighting for the same offlineChan token.
 var pubsubLoopRunning sync.Mutex
 
+// unusableRegistrationReason reports whether a config that CLAIMS a registration
+// is missing the transport settings that registration itself writes, and why.
+//
+// This is the difference between "never registered" and "registered, but the
+// credentials on disk cannot be used". The first is a normal state the tray
+// already handles. The second is a trap: IsRegistered() is true, so the tray
+// shows "Register Device" ticked and disabled, while StartPubSubLoop returns
+// immediately — the device accepts no work and offers the user no way out.
+//
+// A registration writes agent id, secret, project id, subscription, topic and
+// the WIF fields together (registration.go), so any one of them missing means
+// the stored registration is incomplete, not merely stale.
+func unusableRegistrationReason(cfg *Config) (string, bool) {
+	if cfg == nil || !cfg.IsRegistered() {
+		// Never registered (or half-written credentials): the ordinary
+		// unregistered path already prompts, and clearing here would throw away
+		// a secret whose partner fields may simply not be needed yet.
+		return "", false
+	}
+	switch {
+	case cfg.ProjectID == "":
+		return "This terminal's saved registration is missing its cloud project.", true
+	case cfg.CommandsSubscription == "":
+		return "This terminal's saved registration is missing its command subscription.", true
+	case cfg.ResultsTopic == "":
+		return "This terminal's saved registration is missing its results topic.", true
+	}
+	return "", false
+}
+
+// invalidateRegistration drops the stored credentials, re-enables the tray's
+// "Register Device" item and tells the user what happened. It is the single
+// recovery path for a registration that cannot be used — whether the service
+// disowned it ("Unknown agent") or the local copy is incomplete.
+//
+// The credentials go together: leaving a partial set behind is what produces
+// the ticked-but-broken tray state this function exists to escape.
+func invalidateRegistration(cfg *Config, reason string) {
+	if cfg == nil {
+		return
+	}
+	fmt.Printf("%s[pubsub] %s%s\n", colorRed, reason, colorReset)
+	fmt.Printf("%s[pubsub] Clearing local registration. Please re-register the device.%s\n", colorYellow, colorReset)
+
+	if err := cfg.MutateAndSave(ConfigPath(), func() {
+		cfg.AgentID = ""
+		cfg.CommandSecret = ""
+		cfg.UserID = ""
+		cfg.RegisteredAt = ""
+		cfg.TokenEndpoint = ""
+		cfg.WIFAudience = ""
+		cfg.WIFServiceAccount = ""
+	}); err != nil {
+		fmt.Printf("[pubsub] Failed to save config: %v\n", err)
+	}
+
+	// Non-blocking: the tray reads one signal and re-enables the menu item.
+	select {
+	case RegistrationInvalidChan <- true:
+	default:
+	}
+
+	if IsSystrayReady() {
+		ShowErrorDialog("Terminal Disconnected",
+			reason+"\n\nPlease click 'Register Device' in the tray menu to reconnect.")
+		systray.SetTooltip(EnvDisplayName + " – Not Registered")
+	}
+}
+
 func StartPubSubLoop(cfg *Config) {
 	fmt.Println("[pubsub] StartPubSubLoop called")
 	fmt.Printf("[pubsub] Config: ProjectID=%s, Subscription=%s, Topic=%s\n", cfg.ProjectID, cfg.CommandsSubscription, cfg.ResultsTopic)
 
 	if cfg.ProjectID == "" {
 		fmt.Println("[pubsub] disabled – project_id empty")
+		// A device that has never registered belongs here: the tray already
+		// offers "Register Device" and there is nothing to repair. But a config
+		// that CLAIMS a registration and cannot transport is a dead end — the
+		// tray shows Register Device ticked and disabled, so the user has no way
+		// back. Route it into the same recovery the service's "Unknown agent"
+		// verdict uses.
+		if reason, unusable := unusableRegistrationReason(cfg); unusable {
+			invalidateRegistration(cfg, reason)
+		}
 		return
 	}
 
@@ -773,37 +851,7 @@ func StartPubSubLoop(cfg *Config) {
 		// Check if this is an "Unknown agent" error - means registration is invalid
 		errStr := err.Error()
 		if strings.Contains(errStr, "Unknown agent") || strings.Contains(errStr, "invalid_client") {
-			fmt.Printf("%s[pubsub] Terminal connection was removed via the website%s\n", colorRed, colorReset)
-			fmt.Printf("%s[pubsub] Clearing local registration. Please re-register the device.%s\n", colorYellow, colorReset)
-
-			// Clear registration credentials from config
-			if err := cfg.MutateAndSave(ConfigPath(), func() {
-				cfg.AgentID = ""
-				cfg.CommandSecret = ""
-				cfg.UserID = ""
-				cfg.RegisteredAt = ""
-				cfg.TokenEndpoint = ""
-				cfg.WIFAudience = ""
-				cfg.WIFServiceAccount = ""
-			}); err != nil {
-				fmt.Printf("[pubsub] Failed to save config: %v\n", err)
-			}
-
-			// Notify main.go to update the Register Device menu item
-			select {
-			case RegistrationInvalidChan <- true:
-			default:
-				// Channel full, skip (non-blocking)
-			}
-
-			// Show error dialog to user
-			if IsSystrayReady() {
-				ShowErrorDialog("Terminal Disconnected",
-					"This terminal's connection was removed via the website.\n\n"+
-						"Please click 'Register Device' in the tray menu to reconnect.")
-				systray.SetTooltip(EnvDisplayName + " – Not Registered")
-			}
-
+			invalidateRegistration(cfg, "This terminal's connection was removed via the website.")
 			// Stop the Pub/Sub loop - user needs to re-register
 			return
 		}
