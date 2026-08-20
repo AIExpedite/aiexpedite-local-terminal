@@ -287,7 +287,13 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 		// The period we observed has ended; whatever it read no longer describes
 		// the live one.
 		credits.Unknown = true
-		credits.ObservedAt = observedAt
+		if !snap.HasUsedPercent {
+			// Grok 1.0+ never metered this period, so there is no observation to
+			// date-stamp. Keeping ObservedAt would show a stale "Last observed"
+			// for a value we never read — the same misleading state the unmetered
+			// case below removes for a still-live window.
+			credits.ObservedAt = ""
+		}
 	case !snap.HasUsedPercent:
 		// A current period the CLI no longer meters (Grok 1.0+). Report the
 		// window — its reset is real and useful — but never a percentage, and no
