@@ -44,10 +44,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 const (
@@ -85,6 +87,10 @@ type openCodeReadiness struct {
 	Providers []string
 	// Model is the device-level default, when resolvable.
 	Model string
+	// Models is every model id `opencode models` listed, sorted and de-duped.
+	// This is the card's actual content for OpenCode: it has no quota to plot,
+	// so "what can this install reach" is the question the card answers.
+	Models []string
 	// Conclusive is false when a probe timed out, exited non-zero, or printed
 	// something unrecognized. Kept distinct from AuthState so a caller can tell
 	// "we asked and the answer was no" from "we could not ask".
@@ -152,6 +158,7 @@ func (p openCodeUsageParser) Parse(home string, detected detectedCLIAgent, now t
 	if len(readiness.Providers) > 0 {
 		usage.Account = strings.Join(readiness.Providers, ", ")
 	}
+	usage.Models = readiness.Models
 	// OpenCode keeps no durable session deadline of its own — each underlying
 	// provider owns expiry. Do not reinterpret a file mtime as a login deadline.
 	usage.LoginExpirationState = loginExpirationNotReported
@@ -206,6 +213,7 @@ func probeOpenCodeReadinessUncached(executable, home string) openCodeReadiness {
 	if len(modelIDs) > 0 {
 		out.AuthState = openCodeAuthReady
 		out.Conclusive = true
+		out.Models = modelIDs
 	} else if looksLikeEmptyOpenCodeModelList(models) {
 		// Positive evidence of no usable provider — the ONLY path that lights
 		// the red chip.
@@ -268,10 +276,9 @@ func parseOpenCodeModelList(out string) []string {
 	seen := map[string]bool{}
 	var ids []string
 	for _, line := range strings.Split(trimmed, "\n") {
-		id := strings.TrimSpace(line)
-		// Strip a leading list bullet / selection marker.
-		id = strings.TrimLeft(id, "*-• \t")
-		id = strings.TrimSpace(id)
+		// Strips escapes and the frame/bullet glyphs together; the same output is
+		// coloured whenever OpenCode believes it has a terminal.
+		id := stripTerminalDecoration(line)
 		if !looksLikeOpenCodeModelID(id) {
 			continue
 		}
@@ -337,18 +344,27 @@ func parseOpenCodeModelJSON(trimmed string) []string {
 }
 
 // looksLikeOpenCodeModelID gates what counts as a model row. OpenCode addresses
-// models as `provider/model`, so requiring exactly that shape — with no spaces
-// — rejects banners and notices without needing to enumerate their wording.
+// models as `provider/model`, so requiring that shape — with no spaces — rejects
+// banners and notices without needing to enumerate their wording.
+//
+// The model half MAY contain further slashes: a vendor-namespaced id like
+// `mlx/mlx-community/Qwen3.8-27B-8bit` is one model, not a malformed row.
+// Rejecting those dropped every local mlx model from the list AND lost "mlx"
+// from the providers derived from it.
+//
+// What keeps that relaxation safe is the PROVIDER half, which must look like a
+// provider id. That is what separates a model row from a bare path such as
+// `~/.local/share/opencode/auth.json`, which would otherwise now qualify.
 func looksLikeOpenCodeModelID(s string) bool {
 	s = strings.TrimSpace(s)
 	if s == "" || strings.ContainsAny(s, " \t") {
 		return false
 	}
 	provider, model, ok := strings.Cut(s, "/")
-	if !ok {
+	if !ok || model == "" {
 		return false
 	}
-	return provider != "" && model != "" && !strings.Contains(model, "/")
+	return openCodeProviderNameRe.MatchString(strings.ToLower(provider))
 }
 
 // openCodeEmptyModelListNeedles are the phrasings that constitute POSITIVE
@@ -368,7 +384,7 @@ var openCodeEmptyModelListNeedles = []string{
 }
 
 func looksLikeEmptyOpenCodeModelList(out string) bool {
-	lowered := strings.ToLower(out)
+	lowered := strings.ToLower(ansiEscapeRe.ReplaceAllString(out, ""))
 	for _, n := range openCodeEmptyModelListNeedles {
 		if strings.Contains(lowered, n) {
 			return true
@@ -379,31 +395,89 @@ func looksLikeEmptyOpenCodeModelList(out string) bool {
 	return strings.TrimSpace(out) == ""
 }
 
+// ansiEscapeRe matches the SGR/CSI sequences OpenCode writes when it decides it
+// is talking to a terminal. Removing them is not cosmetic: they survive
+// TrimSpace and Fields, so an escape becomes the "first token on the row" and
+// gets published as a provider name.
+var ansiEscapeRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
+// openCodeProviderNameRe is what a provider identifier actually looks like:
+// lowercase alphanumerics with internal separators (anthropic, openai,
+// github-copilot, ollama, mlx). An allowlist rather than a junk denylist,
+// because the junk is unbounded — box-drawing characters, escape sequences,
+// spinner frames — and every unrecognised shape must fail to a name we simply
+// do not show.
+var openCodeProviderNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
+
+// stripTerminalDecoration removes ANSI escapes and the box-drawing / bullet
+// glyphs OpenCode frames its output with, leaving the text a parser can reason
+// about.
+func stripTerminalDecoration(s string) string {
+	s = ansiEscapeRe.ReplaceAllString(s, "")
+	return strings.TrimFunc(s, func(r rune) bool {
+		switch {
+		case unicode.IsSpace(r):
+			return true
+		// General punctuation: the bullets, dashes and exotic spaces used as list
+		// markers (U+2022 •, U+2013 –, U+00A0 …). No identifier character lives
+		// in this block.
+		case r >= 0x2000 && r <= 0x206f:
+			return true
+		// Box drawing, block elements, geometric shapes and dingbats — the frame
+		// OpenCode draws around its output.
+		case r >= 0x2500 && r <= 0x27bf:
+			return true
+		case r == '*' || r == '-' || r == '|':
+			return true
+		}
+		return false
+	})
+}
+
 // parseOpenCodeAuthProviders extracts provider NAMES from `opencode auth list`.
 // Token values are never read: only the leading identifier on each row is kept,
-// and anything containing whitespace or looking like a secret is skipped.
+// and anything that is not shaped like a provider id is skipped.
+//
+// The output is a drawn frame, not a plain list. On a real install:
+//
+//	\x1b[0m
+//	█▌  Credentials \x1b[90m~/.local/share/opencode/auth.json
+//	█▂
+//	█▄  0 credentials
+//
+// Every one of those four lines used to yield a "provider": the bare escape
+// became its own row, and the box glyph was the first whitespace-delimited token
+// on the others — so the card's Account read "[0m, ␍, |, ᴸ". Decoration is now
+// stripped first, header/summary rows are recognised after stripping, and a name
+// must match openCodeProviderNameRe to be published.
 func parseOpenCodeAuthProviders(out string) []string {
 	seen := map[string]bool{}
 	var providers []string
 	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		line = strings.TrimLeft(line, "*-• \t")
+		line = stripTerminalDecoration(line)
 		if line == "" {
 			continue
 		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
 		lowered := strings.ToLower(line)
-		if strings.HasPrefix(lowered, "credentials") || strings.HasPrefix(lowered, "no ") {
+		// Frame chrome: the "Credentials <path>" header, and the "N credentials"
+		// summary footer — which is the row that reports ZERO providers and must
+		// never be mistaken for one.
+		if strings.HasPrefix(lowered, "credentials") ||
+			strings.HasPrefix(lowered, "no ") ||
+			openCodeCredentialCountRe.MatchString(lowered) {
 			continue
 		}
 		// Row shapes seen across releases: "anthropic", "anthropic (oauth)",
 		// "anthropic  api". Take the first whitespace-delimited token.
-		name := strings.Fields(line)[0]
-		name = strings.Trim(name, ":()[]")
+		name := strings.ToLower(strings.Trim(fields[0], ":()[]"))
 		if name == "" || len(name) > 40 || seen[name] {
 			continue
 		}
-		// A token-looking blob is never a provider name.
-		if strings.ContainsAny(name, "=.") && len(name) > 24 {
+		if !openCodeProviderNameRe.MatchString(name) {
 			continue
 		}
 		seen[name] = true
@@ -411,6 +485,11 @@ func parseOpenCodeAuthProviders(out string) []string {
 	}
 	return providers
 }
+
+// openCodeCredentialCountRe matches the "0 credentials" / "3 credentials"
+// summary row. Matched on the whole (stripped) line so a provider literally
+// named e.g. "2credentials" could not be swallowed by it.
+var openCodeCredentialCountRe = regexp.MustCompile(`^\d+\s+credentials?\b`)
 
 // openCodeProvidersFromModelIDs derives provider names from `provider/model`
 // ids, used when `auth list` is unavailable. A local-model install typically

@@ -82,7 +82,13 @@ type cliAgentUsage struct {
 	// "the model in use". Additive on an existing snapshot shape — older
 	// backends and frontends that do not read it are unaffected, and the four
 	// pre-existing parsers simply never populate it.
-	Model              string                `json:"model,omitempty"`
+	Model string `json:"model,omitempty"`
+	// Models are the model ids this agent can currently reach, when it can
+	// enumerate them. OpenCode is the case that needs it: it brokers whatever
+	// providers the user configured and exposes no quota of its own, so the list
+	// of reachable models IS the useful content of its card. Additive, like
+	// Model — parsers that cannot enumerate simply leave it nil.
+	Models             []string              `json:"models,omitempty"`
 	AccountFingerprint string                `json:"accountFingerprint,omitempty"`
 	Metrics            []cliAgentUsageMetric `json:"metrics,omitempty"`
 	CollectedAt        string                `json:"collectedAt"`
