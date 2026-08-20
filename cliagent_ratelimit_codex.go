@@ -1338,7 +1338,7 @@ const codexRolloutScanFileCap = 16
 // only ever written to the rollout log, never back to our cache). So a stale
 // rolled-over cache row is treated as fillable too, identically to Unknown.
 // The rollout scan still runs at most once per call.
-func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, currentFingerprint string, now time.Time) []cliAgentUsageMetric {
+func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence) {
 	// Map a layout kind to the identity + fallback slot the display path selects
 	// it from — reused by both the rolled-over check below and the rollout fill.
 	identityForKind := func(kind string) (identity, fallbackSlot string, ok bool) {
@@ -1381,12 +1381,15 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, curren
 		}
 	}
 	if !anyFillable {
-		return metrics
+		// Every window is already observable, so there is nothing to backfill and
+		// no reason to pay for the scan — and equally no reason to report an
+		// exhaustion that fresh usage numbers already supersede.
+		return metrics, codexUsageLimitEvidence{}
 	}
 
-	contribs, ok := codexRolloutFallbackBuckets(base, now)
+	contribs, limit, ok := codexRolloutFallbackBuckets(base, now)
 	if !ok {
-		return metrics
+		return metrics, limit
 	}
 
 	// Partition the rollout-derived per-limit contributors by metric identity,
@@ -1421,8 +1424,57 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, curren
 		// the right fallback when the frame carried no window_minutes hint.
 		metrics[i] = codexMetricFromBucket(b, true, m.Kind, m.Label, now)
 	}
-	return metrics
+	return metrics, limit
 }
+
+// codexUsageLimitNotice renders the card notice for a quota refusal, or "" when
+// none should be shown.
+//
+// Two guards keep the notice honest:
+//
+//   - It is only shown while a window is still unobservable. Any window we can
+//     actually report supersedes the refusal — a real percentage is strictly
+//     more informative than "you were refused a while ago".
+//   - The evidence must be newer than every observation behind those metrics.
+//     Codex writes a rollout log on every attempt, so a still-exhausted account
+//     re-evidences itself the moment the user tries again; ranking by time means
+//     an old refusal can never shout over telemetry that arrived after it.
+//
+// The age cap exists because a refusal carries no window and therefore no reset:
+// Codex says only "try again at <time>" in prose we deliberately do not parse.
+// Expiring the notice can understate a multi-day weekly exhaustion, which is the
+// safe direction — the next attempt re-evidences it — whereas an unbounded
+// notice would keep declaring a limit that cleared days ago.
+func codexUsageLimitNotice(metrics []cliAgentUsageMetric, limit codexUsageLimitEvidence, now time.Time) string {
+	if limit.At.IsZero() || now.Sub(limit.At) > codexUsageLimitNoticeMaxAge {
+		return ""
+	}
+	anyUnknown := false
+	for _, m := range metrics {
+		if m.Unknown {
+			anyUnknown = true
+			continue
+		}
+		observed, err := time.Parse(time.RFC3339, m.ObservedAt)
+		if err == nil && !observed.Before(limit.At) {
+			return ""
+		}
+	}
+	if !anyUnknown {
+		return ""
+	}
+	notice := "Codex refused a run because this account's usage limit was reached, so its capacity is unreported until Codex sends a fresh window."
+	if limit.Message != "" {
+		notice += " Codex said: " + limit.Message
+	}
+	return notice
+}
+
+// codexUsageLimitNoticeMaxAge is how long a quota refusal keeps explaining an
+// unobservable card. Sized to comfortably outlast Codex's 5-hour window while
+// staying far short of the weekly one, so a cleared limit stops being announced
+// without waiting days for the truth to catch up.
+const codexUsageLimitNoticeMaxAge = 12 * time.Hour
 
 // codexRolloutFallbackBuckets reads Codex's session rollout logs
 // (CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl) for the most recent populated
@@ -1442,9 +1494,9 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, curren
 // is disabled, matching the best-effort unscoped behaviour the parser already
 // uses when the account is unknown. Best-effort: returns (nil, false) on any
 // problem.
-func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[string]codexRateLimitBucket, bool) {
+func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, bool) {
 	if base == "" {
-		return nil, false
+		return nil, codexUsageLimitEvidence{}, false
 	}
 	// auth.json mtime is the account-login watermark (zero = missing → guard
 	// off). A fresh `codex login` rewrites auth.json, so its mtime marks when
@@ -1465,7 +1517,7 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
 	matches, err := filepath.Glob(filepath.Join(base, "sessions", "*", "*", "*", "rollout-*.jsonl"))
 	if err != nil || len(matches) == 0 {
-		return nil, false
+		return nil, codexUsageLimitEvidence{}, false
 	}
 	// Rank candidates by file mtime descending, NOT by filename (= session
 	// start time). When sessions overlap — e.g. an older still-active session
@@ -1488,7 +1540,7 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		candidates = append(candidates, rolloutCandidate{path: m, mtime: info.ModTime()})
 	}
 	if len(candidates) == 0 {
-		return nil, false
+		return nil, codexUsageLimitEvidence{}, false
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if !candidates[i].mtime.Equal(candidates[j].mtime) {
@@ -1511,18 +1563,24 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		bucket  codexRateLimitBucket
 	}
 	winners := map[string]rolloutContribution{}
+	var limit codexUsageLimitEvidence
 	for scanned, c := range candidates {
 		if scanned >= codexRolloutScanFileCap {
 			break
 		}
-		buckets, sessionStart, ok := codexBucketsFromRolloutFile(c.path, now)
-		if !ok {
-			continue
-		}
+		buckets, sessionStart, fileLimit, ok := codexBucketsFromRolloutFile(c.path, now)
 		// Reject logs whose session began before the current login (a possible
 		// prior account). A log with no parseable start time can't be scoped, so
 		// keep it (best-effort, matches the unscoped unknown-account path).
+		// Applied BEFORE the no-buckets skip so exhaustion evidence is scoped to
+		// the current account exactly as usage readings are.
 		if !authMod.IsZero() && !sessionStart.IsZero() && sessionStart.Before(authMod) {
+			continue
+		}
+		if fileLimit.At.After(limit.At) {
+			limit = fileLimit
+		}
+		if !ok {
 			continue
 		}
 		for w, limits := range buckets {
@@ -1544,7 +1602,10 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		// contributor.
 	}
 	if len(winners) == 0 {
-		return nil, false
+		// No usable window anywhere in the scanned logs — but a quota refusal
+		// found along the way still explains WHY, so it is reported even though
+		// there is nothing to backfill.
+		return nil, limit, false
 	}
 	// Rebuild the slot-keyed contributor map downstream expects. Each winner is
 	// stored under its original slot (so a duration-less bucket keeps its
@@ -1567,7 +1628,7 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		}
 		slotMap[limitKey] = c.bucket
 	}
-	return acc, true
+	return acc, limit, true
 }
 
 // codexBucketsFromRolloutFile returns the per-(window, limit) contributors from
@@ -1582,10 +1643,10 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 // Best-effort: returns ok=false when the file holds no usable frame or can't be
 // read; the returned start time is zero when no line carried a parseable
 // timestamp.
-func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, bool) {
+func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, time.Time{}, false
+		return nil, time.Time{}, codexUsageLimitEvidence{}, false
 	}
 	defer f.Close()
 
@@ -1595,9 +1656,17 @@ func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]map[str
 	scanner.Buffer(make([]byte, 0, 64*1024), codexAppServerMaxLineSize)
 
 	var sessionStart time.Time
+	var limit codexUsageLimitEvidence
 	acc := map[string]map[string]codexRateLimitBucket{}
 	for scanner.Scan() {
 		line := scanner.Text()
+		// Exhaustion evidence is collected from the SAME pass, ahead of the
+		// rate-limit prefilter: a refused turn carries no window at all (Codex
+		// sends `primary: null, secondary: null` once the limit is reached), so
+		// these lines are exactly the ones the bucket scan discards.
+		if ev, ok := codexUsageLimitEvidenceFromLine(line); ok && ev.At.After(limit.At) {
+			limit = ev
+		}
 		// The first line carrying a timestamp is the session_meta header, i.e.
 		// when this session STARTED — recorded before any rate-limit frame, so
 		// it's captured ahead of the prefilter below.
@@ -1647,14 +1716,87 @@ func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]map[str
 		}
 	}
 	if len(acc) == 0 {
-		return nil, sessionStart, false
+		// ok=false means "no usable window here", NOT "nothing here": a log whose
+		// every turn was refused for quota is precisely the case that produces no
+		// buckets AND the evidence the card needs, so the evidence is returned
+		// alongside the miss.
+		return nil, sessionStart, limit, false
 	}
 	// Return the per-limit contributors un-collapsed. Rollover-to-0% for a window
 	// whose reset already passed as of `now` is applied by the display path
 	// (codexAggregateIdentity), so a stale relative reset anchored above still
 	// clears instead of showing old usage — without flattening two distinct
 	// identities that share a storage slot into one bucket here.
-	return acc, sessionStart, true
+	return acc, sessionStart, limit, true
+}
+
+// codexUsageLimitEvidence records that Codex refused a turn because the
+// account's quota was exhausted, as seen in a rollout log. `At` is the event's
+// own timestamp (zero = no evidence); `Message` is Codex's own user-facing text,
+// which names the retry time and the top-up link.
+type codexUsageLimitEvidence struct {
+	At      time.Time
+	Message string
+}
+
+// codexUsageLimitErrorCode is the `codex_error_info` value Codex attaches to a
+// turn it refused because the account is out of quota.
+const codexUsageLimitErrorCode = "usage_limit_exceeded"
+
+// codexUsageLimitMessageMaxLen bounds how much of Codex's message the card may
+// carry. Long enough for the real text ("You've hit your usage limit. Visit
+// <url> to purchase more credits or try again at 11:28 PM."), short enough that
+// a future upstream paragraph can't bloat every device document.
+const codexUsageLimitMessageMaxLen = 240
+
+// codexUsageLimitEvidenceFromLine extracts quota-exhaustion evidence from one
+// rollout JSONL line. Codex reports it on the turn's terminal event:
+//
+//	{"timestamp":…,"type":"event_msg","payload":{"type":"task_complete",
+//	  "error":{"message":"You've hit your usage limit…",
+//	           "codex_error_info":"usage_limit_exceeded"}}}
+//
+// The code — not the prose — is what we match on, so a reworded message keeps
+// working and a message merely MENTIONING a limit is never mistaken for one.
+func codexUsageLimitEvidenceFromLine(line string) (codexUsageLimitEvidence, bool) {
+	// Cheap prefilter: the code is a literal, so a line that doesn't contain it
+	// cannot be evidence and is never decoded.
+	if !strings.Contains(line, codexUsageLimitErrorCode) {
+		return codexUsageLimitEvidence{}, false
+	}
+	var raw map[string]interface{}
+	if json.Unmarshal([]byte(line), &raw) != nil {
+		return codexUsageLimitEvidence{}, false
+	}
+	at, hasTime := codexRolloutLineTimestamp(line)
+	if !hasTime {
+		// Without a timestamp the evidence can't be ranked against a usage
+		// reading, and stale exhaustion must never outrank fresh telemetry.
+		return codexUsageLimitEvidence{}, false
+	}
+	// The rollout envelope nests the event under `payload`; the app-server
+	// streams the same object at the top level.
+	scopes := []map[string]interface{}{raw}
+	if payload, ok := raw["payload"].(map[string]interface{}); ok {
+		scopes = append(scopes, payload)
+	}
+	for _, scope := range scopes {
+		errObj, ok := scope["error"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		code, _ := pickField(errObj, "codex_error_info", "codexErrorInfo")
+		if s, _ := code.(string); s != codexUsageLimitErrorCode {
+			continue
+		}
+		message, _ := errObj["message"].(string)
+		message = strings.TrimSpace(message)
+		if len(message) > codexUsageLimitMessageMaxLen {
+			message = strings.TrimSpace(message[:codexUsageLimitMessageMaxLen])
+		}
+		return codexUsageLimitEvidence{At: at, Message: message}, true
+	}
+	return codexUsageLimitEvidence{}, false
 }
 
 // codexRolloutLineTimestamp extracts the top-level `timestamp` (RFC3339) from
