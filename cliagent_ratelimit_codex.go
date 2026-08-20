@@ -1228,9 +1228,9 @@ func loadCodexRateLimitSnapshot(path string) (codexRateLimitSnapshot, bool) {
 }
 
 // currentCodexAccountFingerprint reads the Codex auth.json on disk and returns
-// the same fingerprint codexUsageParser.Parse would attach to a usage
-// snapshot. Used by the capture path to scope the rate-limit cache to the
-// active account. Returns "" when no auth is readable, in which case the
+// the same workspace-scoped fingerprint codexUsageParser.Parse would attach to
+// a usage snapshot. Used by the capture path to scope the rate-limit cache to
+// the active account. Returns "" when no auth is readable, in which case the
 // cache is unscoped (best-effort, matches the Claude analog).
 func currentCodexAccountFingerprint() string {
 	home, _ := os.UserHomeDir()
@@ -1244,17 +1244,7 @@ func currentCodexAccountFingerprint() string {
 	}
 	claims := codexIDTokenClaims{}
 	parseJWTClaims(auth.Tokens.IDToken, &claims)
-	account := firstNonEmpty(
-		auth.Email,
-		auth.Account,
-		auth.UserID,
-		claims.Email,
-		claims.Account,
-		claims.UserID,
-		auth.Tokens.AccountID,
-		claims.Subject,
-	)
-	return fingerprintAccount("codex", account)
+	return fingerprintAccount("codex", codexAccountScope(auth, claims))
 }
 
 // codexContributorsForAccount loads the rate-limit cache and returns the

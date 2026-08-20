@@ -7,6 +7,47 @@ import (
 	"time"
 )
 
+func TestCurrentCodexAccountFingerprint_NamespacedChatGPTUserID(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"id_token": helperJWT(t, map[string]any{
+				"sub": "google-oauth2|117053759699842363930",
+				"https://api.openai.com/auth": map[string]any{
+					"chatgpt_user_id": "user-PPrLthwR0xmzb8mFDad617BZ",
+				},
+			}),
+		},
+	})
+
+	want := fingerprintAccount("codex", "user-PPrLthwR0xmzb8mFDad617BZ")
+	if got := currentCodexAccountFingerprint(); got != want {
+		t.Errorf("currentCodexAccountFingerprint()=%q, want %q", got, want)
+	}
+}
+
+func TestCurrentCodexAccountFingerprint_WorkspaceAccountIDBeatsUserID(t *testing.T) {
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperWriteJSON(t, filepath.Join(codexHome, "auth.json"), map[string]any{
+		"tokens": map[string]any{
+			"account_id": "workspace-B",
+			"id_token": helperJWT(t, map[string]any{
+				"https://api.openai.com/auth": map[string]any{
+					"chatgpt_user_id":    "user-PPrLthwR0xmzb8mFDad617BZ",
+					"chatgpt_account_id": "workspace-A",
+				},
+			}),
+		},
+	})
+
+	want := fingerprintAccount("codex", "workspace-B")
+	if got := currentCodexAccountFingerprint(); got != want {
+		t.Errorf("currentCodexAccountFingerprint()=%q, want %q", got, want)
+	}
+}
+
 // codexWindowIdentity is the linchpin classifier for dedupe/rows/labels. Cover
 // its contract directly: canonical bands (incl. floored), non-canonical
 // duration, and length-less slot-default — independent of any cache plumbing.

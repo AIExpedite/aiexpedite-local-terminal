@@ -73,9 +73,55 @@ type codexIDTokenClaims struct {
 	Plan     string `json:"plan"`
 	PlanType string `json:"plan_type"`
 	OrgID    string `json:"org_id"`
+	// ChatGPT-login claims. A `codex login` against a ChatGPT account does NOT
+	// put the plan at the top level: it namespaces every account attribute
+	// under the `https://api.openai.com/auth` claim, where the subscription
+	// tier is `chatgpt_plan_type` ("pro", "plus", "business", …). Reading only
+	// the flat `plan` / `plan_type` above left the plan chip permanently blank
+	// for the common ChatGPT login — the only auth mode that HAS a plan.
+	OpenAIAuth codexOpenAIAuthClaim `json:"https://api.openai.com/auth"`
 	// Standard JWT expiry (seconds since epoch). Reported even when the
 	// credential refreshes itself — see the LoginExpiresAt assignment below.
 	Exp int64 `json:"exp"`
+}
+
+// codexOpenAIAuthClaim is the namespaced `https://api.openai.com/auth` claim
+// carried by a ChatGPT-login id_token. Only the fields the card needs are
+// modelled; the claim also carries org membership we deliberately ignore.
+type codexOpenAIAuthClaim struct {
+	PlanType  string `json:"chatgpt_plan_type"`
+	UserID    string `json:"chatgpt_user_id"`
+	AccountID string `json:"chatgpt_account_id"`
+}
+
+// codexAccount returns the human-readable credential identity shown by the
+// usage parser. Workspace account IDs remain fallbacks here because an email or
+// ChatGPT user ID is a more useful label on the card.
+func codexAccount(auth codexAuth, claims codexIDTokenClaims) string {
+	return firstNonEmpty(
+		auth.Email,
+		auth.Account,
+		auth.UserID,
+		claims.Email,
+		claims.Account,
+		claims.UserID,
+		claims.OpenAIAuth.UserID,
+		auth.Tokens.AccountID,
+		claims.OpenAIAuth.AccountID,
+		claims.Subject,
+	)
+}
+
+// codexAccountScope returns the credential identity used to scope cached
+// telemetry. A ChatGPT user can belong to multiple workspace accounts with
+// independent plans and quotas, so the active workspace ID must outrank the
+// display identity whenever Codex provides one.
+func codexAccountScope(auth codexAuth, claims codexIDTokenClaims) string {
+	return firstNonEmpty(
+		auth.Tokens.AccountID,
+		claims.OpenAIAuth.AccountID,
+		codexAccount(auth, claims),
+	)
 }
 
 func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
@@ -103,17 +149,10 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 	if readJSONFile(expandHome(base, "auth.json"), &auth) {
 		claims := codexIDTokenClaims{}
 		parseJWTClaims(auth.Tokens.IDToken, &claims)
-		usage.Account = firstNonEmpty(
-			auth.Email,
-			auth.Account,
-			auth.UserID,
-			claims.Email,
-			claims.Account,
-			claims.UserID,
-			auth.Tokens.AccountID,
-			claims.Subject,
-		)
-		usage.Plan = firstNonEmpty(auth.Plan, auth.PlanType, claims.Plan, claims.PlanType)
+		usage.Account = codexAccount(auth, claims)
+		usage.AccountFingerprint = fingerprintAccount(p.Provider(), codexAccountScope(auth, claims))
+		usage.Plan = firstNonEmpty(
+			auth.Plan, auth.PlanType, claims.Plan, claims.PlanType, claims.OpenAIAuth.PlanType)
 		if firstNonEmpty(auth.APIKey, auth.Tokens.IDToken, auth.Tokens.RefreshToken) != "" {
 			hasAPIKeyAuth = hasAPIKeyAuth || strings.TrimSpace(auth.APIKey) != ""
 			usage.Authenticated = authBoolPtr(true)
@@ -134,7 +173,6 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 			}
 		}
 	}
-	usage.AccountFingerprint = fingerprintAccount(p.Provider(), usage.Account)
 
 	// Live app-server telemetry first; for any window never captured live,
 	// fall back to Codex's own on-disk rollout logs so the card is observable
