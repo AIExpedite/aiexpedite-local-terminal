@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1343,6 +1344,261 @@ func helperCodexAuthAt(t *testing.T, codexHome, email string, loginAt time.Time)
 // session timestamps, so the scope guard is deterministic regardless of when the
 // suite runs (auth.json would otherwise carry the real wall-clock mtime).
 var codexTestLogin = time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC)
+
+// helperWriteRolloutLimitLog writes a rollout log for a session whose turn was
+// refused for quota: the `token_count` frame Codex emits in that state carries
+// NO window (both `primary` and `secondary` are null), and the turn ends with a
+// `task_complete` error naming `usage_limit_exceeded`. `frames` may add usable
+// readings ahead of the refusal.
+func helperWriteRolloutLimitLog(t *testing.T, base, day, name, ts string, frames []map[string]any, refusedAt string) {
+	t.Helper()
+	dir := filepath.Join(base, "sessions", "2026", "06", day)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	var b strings.Builder
+	writeLine := func(v map[string]any) {
+		line, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal rollout line: %v", err)
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
+	for _, rl := range frames {
+		writeLine(map[string]any{
+			"timestamp": ts,
+			"type":      "event_msg",
+			"payload": map[string]any{
+				"type":        "token_count",
+				"info":        nil,
+				"rate_limits": rl,
+			},
+		})
+	}
+	writeLine(map[string]any{
+		"timestamp": refusedAt,
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type":              "token_count",
+			"info":              nil,
+			"rate_limits":       map[string]any{"limit_id": "premium", "primary": nil, "secondary": nil},
+			"rate_limit_reason": nil,
+		},
+	})
+	writeLine(map[string]any{
+		"timestamp": refusedAt,
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type": "task_complete",
+			"error": map[string]any{
+				"message":          "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 11:28 PM.",
+				"codex_error_info": "usage_limit_exceeded",
+			},
+		},
+	})
+	if err := os.WriteFile(filepath.Join(dir, "rollout-"+name+".jsonl"), []byte(b.String()), 0o600); err != nil {
+		t.Fatalf("write rollout log: %v", err)
+	}
+}
+
+// An account that is out of quota reports NO window — Codex nulls both windows
+// on a refused turn — so the card used to say "Usage unobservable", which reads
+// as "we cannot see it" when the truth is "it is spent". The refusal must be
+// surfaced instead.
+func TestCodexUsageParser_UsageLimitRefusalExplainsUnobservableCard(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	helperWriteRolloutLimitLog(t, codexHome, "19", "2026-06-19T11-00-00-aaaa",
+		"2026-06-19T11:00:00.000Z", nil, "2026-06-19T11:30:00.000Z")
+
+	usage, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok {
+		t.Fatalf("expected usage")
+	}
+	for _, m := range usage.Metrics {
+		if !m.Unknown {
+			t.Errorf("metric %q should stay unobservable — a refused turn carries no window: %+v", m.Kind, m)
+		}
+	}
+	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "usage limit was reached") {
+		t.Fatalf("notice = (%q, %q), want the quota refusal explained", usage.Notice, usage.NoticeSeverity)
+	}
+	if strings.Contains(usage.Notice, "try again at 11:28 PM") {
+		t.Errorf("notice must not carry untrusted Codex prose, got %q", usage.Notice)
+	}
+	// The frontend reads an error-severity notice mentioning login/sign-in as a
+	// CREDENTIAL failure and marks the agent unavailable. A spent quota is not
+	// that, so the wording must stay clear of those words.
+	if regexp.MustCompile(`(?i)\b(login|signed in|authenticate)\b`).MatchString(usage.Notice) {
+		t.Errorf("quota notice must not read as a login failure: %q", usage.Notice)
+	}
+}
+
+func TestCodexUsageLimitNotice_DoesNotAppendCredentialKeywords(t *testing.T) {
+	refusedAt := time.Date(2026, 6, 19, 11, 30, 0, 0, time.UTC)
+	metrics := []cliAgentUsageMetric{{Kind: limitKindSession, Unknown: true}}
+	limit := codexUsageLimitEvidence{
+		At:      refusedAt,
+		Message: "Please login or authenticate before trying again.",
+	}
+
+	notice := codexUsageLimitNotice(metrics, limit, time.Time{}, refusedAt.Add(time.Minute))
+	if notice == "" {
+		t.Fatal("expected quota notice")
+	}
+	if regexp.MustCompile(`(?i)\b(login|signed in|authenticate)\b`).MatchString(notice) {
+		t.Errorf("quota notice must not append credential-like upstream prose: %q", notice)
+	}
+}
+
+// A reading observed AFTER the refusal supersedes it: a real percentage is
+// strictly more informative, and a stale refusal must never shout over fresh
+// telemetry for a window it no longer describes.
+func TestCodexUsageParser_ObservationNewerThanRefusalSuppressesNotice(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Refused at 11:00, then a weekly-only reading at 11:30. The session row is
+	// still Unknown, so the notice is suppressed by RECENCY, not by having a
+	// complete card.
+	helperWriteRolloutLimitLog(t, codexHome, "19", "2026-06-19T10-00-00-aaaa",
+		"2026-06-19T10:00:00.000Z", nil, "2026-06-19T11:00:00.000Z")
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T11-30-00-bbbb", "2026-06-19T11:30:00.000Z",
+		[]map[string]any{{
+			"secondary": map[string]any{
+				"used_percent": 6.0, "window_minutes": 10080.0,
+				"resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			},
+		}})
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if session := usage.Metrics[0]; !session.Unknown {
+		t.Fatalf("session row should still be Unknown, got %+v", session)
+	}
+	if weekly := usage.Metrics[1]; weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 6 {
+		t.Fatalf("weekly row=%+v, want 6%% observed after the refusal", weekly)
+	}
+	if usage.Notice != "" {
+		t.Errorf("notice=%q, want none — the newer reading supersedes the refusal", usage.Notice)
+	}
+}
+
+// A newer observation still supersedes the refusal after its reset passes and
+// the metric becomes unobservable. ObservedAt remains evidence that the older
+// refusal no longer describes the account, even though no percentage is shown.
+func TestCodexUsageParser_RolledOverObservationNewerThanRefusalSuppressesNotice(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	helperWriteRolloutLimitLog(t, codexHome, "19", "2026-06-19T10-00-00-aaaa",
+		"2026-06-19T10:00:00.000Z", nil, "2026-06-19T11:00:00.000Z")
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T11-30-00-bbbb", "2026-06-19T11:30:00.000Z",
+		[]map[string]any{{
+			"secondary": map[string]any{
+				"used_percent": 6.0, "window_minutes": 10080.0,
+				"resets_at": float64(now.Add(-time.Minute).Unix()),
+			},
+		}})
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	weekly := usage.Metrics[1]
+	if !weekly.Unknown || weekly.ObservedAt != "2026-06-19T11:30:00Z" {
+		t.Fatalf("weekly row=%+v, want a rolled-over observation newer than the refusal", weekly)
+	}
+	if usage.Notice != "" {
+		t.Errorf("notice=%q, want none — the newer rolled-over observation supersedes the refusal", usage.Notice)
+	}
+}
+
+// A rollout reading can be newer than the refusal without being used for
+// backfill: the live cache remains authoritative for an observable row. Its
+// timestamp still proves that an older refusal is stale while another row
+// remains Unknown.
+func TestCodexUsageParser_SkippedRolloutObservationNewerThanRefusalSuppressesNotice(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 42, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			WindowMinutes: 300, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now.Add(-2*time.Hour), fp)
+	helperWriteRolloutLimitLog(t, codexHome, "19", "2026-06-19T11-00-00-aaaa",
+		"2026-06-19T11:00:00.000Z", nil, "2026-06-19T11:00:00.000Z")
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T11-30-00-bbbb", "2026-06-19T11:30:00.000Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 73.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(2 * time.Hour).Unix()),
+			},
+		}})
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if session := usage.Metrics[0]; session.Unknown || session.Consumed == nil || *session.Consumed != 42 {
+		t.Fatalf("session row=%+v, want authoritative cached 42%%", session)
+	}
+	if weekly := usage.Metrics[1]; !weekly.Unknown {
+		t.Fatalf("weekly row=%+v, want Unknown", weekly)
+	}
+	if usage.Notice != "" {
+		t.Errorf("notice=%q, want none — the newer skipped rollout observation supersedes the refusal", usage.Notice)
+	}
+}
+
+// Preserve subsecond precision when comparing an observation with a refusal.
+// A successful frame later in the same second proves that the refusal is stale
+// just as surely as a frame in a later second does.
+func TestCodexUsageLimitNotice_SubsecondObservationNewerThanRefusalSuppressesNotice(t *testing.T) {
+	refusedAt := time.Date(2026, 6, 19, 11, 0, 0, 100*int(time.Millisecond), time.UTC)
+	observedAt := refusedAt.Add(400 * time.Millisecond)
+	metrics := []cliAgentUsageMetric{
+		{Kind: limitKindSession, Label: "5-hour session window", Unit: "%", Unknown: true},
+		{
+			Kind: limitKindWeekly, Label: "Weekly quota", Unit: "%",
+			ObservedAt: observedAtRFC3339(observedAt.UnixMilli()),
+		},
+	}
+
+	if notice := codexUsageLimitNotice(metrics, codexUsageLimitEvidence{At: refusedAt}, time.Time{}, refusedAt.Add(time.Hour)); notice != "" {
+		t.Fatalf("notice=%q, want none — the newer same-second observation supersedes the refusal", notice)
+	}
+}
+
+// A refusal carries no reset, so it is expired by age rather than believed
+// forever. Understating a still-exhausted account is the safe direction: Codex
+// writes a fresh rollout on the next attempt, which re-evidences it.
+func TestCodexUsageParser_StaleUsageLimitRefusalIsNotAnnounced(t *testing.T) {
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	helperWriteRolloutLimitLog(t, codexHome, "19", "2026-06-18T20-00-00-aaaa",
+		"2026-06-18T20:00:00.000Z", nil, "2026-06-18T20:30:00.000Z") // > 12h before now
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if usage.Notice != "" {
+		t.Errorf("notice=%q, want none for a refusal older than the notice window", usage.Notice)
+	}
+}
 
 // When no live app-server frame has been captured, the parser should backfill
 // both windows from Codex's own rollout logs (the TUI-only path).

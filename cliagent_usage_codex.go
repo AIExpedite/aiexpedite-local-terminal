@@ -178,7 +178,20 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 	// fall back to Codex's own on-disk rollout logs so the card is observable
 	// even when Codex is only ever driven through its TUI.
 	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
-	usage.Metrics = codexBackfillUnknownFromRollout(usage.Metrics, base, usage.AccountFingerprint, now)
+	var usageLimit codexUsageLimitEvidence
+	var latestRolloutObservation time.Time
+	usage.Metrics, usageLimit, latestRolloutObservation = codexBackfillUnknownFromRollout(usage.Metrics, base, usage.AccountFingerprint, now)
+	// An account that is OUT of quota reports no window at all — Codex nulls both
+	// `primary` and `secondary` on a refused turn — so the card fell back to
+	// "Usage unobservable", which reads as "we can't see it" when the truth is
+	// "it is spent". Say so instead. A later logged-out verdict overwrites this
+	// with its own error notice, which is the correct precedence: a card that
+	// cannot be attributed to a signed-in account has a worse problem than a
+	// spent quota.
+	if notice := codexUsageLimitNotice(usage.Metrics, usageLimit, latestRolloutObservation, now); notice != "" {
+		usage.Notice = notice
+		usage.NoticeSeverity = "error"
+	}
 	if loggedIn, known := codexAuthStatusProbe(detected.Path); known {
 		// `codex login status` describes persisted login state, not inherited
 		// OPENAI_API_KEY authentication. A definite persisted logout therefore
