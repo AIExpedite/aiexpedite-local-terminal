@@ -141,7 +141,8 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 	// even when Codex is only ever driven through its TUI.
 	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
 	var usageLimit codexUsageLimitEvidence
-	usage.Metrics, usageLimit = codexBackfillUnknownFromRollout(usage.Metrics, base, usage.AccountFingerprint, now)
+	var latestRolloutObservation time.Time
+	usage.Metrics, usageLimit, latestRolloutObservation = codexBackfillUnknownFromRollout(usage.Metrics, base, usage.AccountFingerprint, now)
 	// An account that is OUT of quota reports no window at all — Codex nulls both
 	// `primary` and `secondary` on a refused turn — so the card fell back to
 	// "Usage unobservable", which reads as "we can't see it" when the truth is
@@ -149,7 +150,7 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 	// with its own error notice, which is the correct precedence: a card that
 	// cannot be attributed to a signed-in account has a worse problem than a
 	// spent quota.
-	if notice := codexUsageLimitNotice(usage.Metrics, usageLimit, now); notice != "" {
+	if notice := codexUsageLimitNotice(usage.Metrics, usageLimit, latestRolloutObservation, now); notice != "" {
 		usage.Notice = notice
 		usage.NoticeSeverity = "error"
 	}

@@ -1338,7 +1338,7 @@ const codexRolloutScanFileCap = 16
 // only ever written to the rollout log, never back to our cache). So a stale
 // rolled-over cache row is treated as fillable too, identically to Unknown.
 // The rollout scan still runs at most once per call.
-func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence) {
+func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence, time.Time) {
 	// Map a layout kind to the identity + fallback slot the display path selects
 	// it from — reused by both the rolled-over check below and the rollout fill.
 	identityForKind := func(kind string) (identity, fallbackSlot string, ok bool) {
@@ -1384,12 +1384,12 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, curren
 		// Every window is already observable, so there is nothing to backfill and
 		// no reason to pay for the scan — and equally no reason to report an
 		// exhaustion that fresh usage numbers already supersede.
-		return metrics, codexUsageLimitEvidence{}
+		return metrics, codexUsageLimitEvidence{}, time.Time{}
 	}
 
-	contribs, limit, ok := codexRolloutFallbackBuckets(base, now)
+	contribs, limit, latestObservation, ok := codexRolloutFallbackBuckets(base, now)
 	if !ok {
-		return metrics, limit
+		return metrics, limit, latestObservation
 	}
 
 	// Partition the rollout-derived per-limit contributors by metric identity,
@@ -1424,7 +1424,7 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, curren
 		// the right fallback when the frame carried no window_minutes hint.
 		metrics[i] = codexMetricFromBucket(b, true, m.Kind, m.Label, now)
 	}
-	return metrics, limit
+	return metrics, limit, latestObservation
 }
 
 // codexUsageLimitNotice renders the card notice for a quota refusal, or "" when
@@ -1445,8 +1445,11 @@ func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, curren
 // Expiring the notice can understate a multi-day weekly exhaustion, which is the
 // safe direction — the next attempt re-evidences it — whereas an unbounded
 // notice would keep declaring a limit that cleared days ago.
-func codexUsageLimitNotice(metrics []cliAgentUsageMetric, limit codexUsageLimitEvidence, now time.Time) string {
+func codexUsageLimitNotice(metrics []cliAgentUsageMetric, limit codexUsageLimitEvidence, latestRolloutObservation, now time.Time) string {
 	if limit.At.IsZero() || now.Sub(limit.At) > codexUsageLimitNoticeMaxAge {
+		return ""
+	}
+	if !latestRolloutObservation.IsZero() && !latestRolloutObservation.Before(limit.At) {
 		return ""
 	}
 	anyUnknown := false
@@ -1490,9 +1493,9 @@ const codexUsageLimitNoticeMaxAge = 12 * time.Hour
 // is disabled, matching the best-effort unscoped behaviour the parser already
 // uses when the account is unknown. Best-effort: returns (nil, false) on any
 // problem.
-func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, bool) {
+func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, bool) {
 	if base == "" {
-		return nil, codexUsageLimitEvidence{}, false
+		return nil, codexUsageLimitEvidence{}, time.Time{}, false
 	}
 	// auth.json mtime is the account-login watermark (zero = missing → guard
 	// off). A fresh `codex login` rewrites auth.json, so its mtime marks when
@@ -1513,7 +1516,7 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
 	matches, err := filepath.Glob(filepath.Join(base, "sessions", "*", "*", "*", "rollout-*.jsonl"))
 	if err != nil || len(matches) == 0 {
-		return nil, codexUsageLimitEvidence{}, false
+		return nil, codexUsageLimitEvidence{}, time.Time{}, false
 	}
 	// Rank candidates by file mtime descending, NOT by filename (= session
 	// start time). When sessions overlap — e.g. an older still-active session
@@ -1536,7 +1539,7 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		candidates = append(candidates, rolloutCandidate{path: m, mtime: info.ModTime()})
 	}
 	if len(candidates) == 0 {
-		return nil, codexUsageLimitEvidence{}, false
+		return nil, codexUsageLimitEvidence{}, time.Time{}, false
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if !candidates[i].mtime.Equal(candidates[j].mtime) {
@@ -1560,6 +1563,7 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 	}
 	winners := map[string]rolloutContribution{}
 	var limit codexUsageLimitEvidence
+	var latestObservation time.Time
 	for scanned, c := range candidates {
 		if scanned >= codexRolloutScanFileCap {
 			break
@@ -1581,6 +1585,9 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		}
 		for w, limits := range buckets {
 			for limitID, b := range limits {
+				if observed := time.UnixMilli(b.ObservedAtMs); b.ObservedAtMs > 0 && observed.After(latestObservation) {
+					latestObservation = observed
+				}
 				key := codexWindowIdentity(b.WindowMinutes, w) + "\x00" + limitID
 				if _, exists := winners[key]; !exists {
 					winners[key] = rolloutContribution{slot: w, limitID: limitID, bucket: b}
@@ -1601,7 +1608,7 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		// No usable window anywhere in the scanned logs — but a quota refusal
 		// found along the way still explains WHY, so it is reported even though
 		// there is nothing to backfill.
-		return nil, limit, false
+		return nil, limit, latestObservation, false
 	}
 	// Rebuild the slot-keyed contributor map downstream expects. Each winner is
 	// stored under its original slot (so a duration-less bucket keeps its
@@ -1624,7 +1631,7 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		}
 		slotMap[limitKey] = c.bucket
 	}
-	return acc, limit, true
+	return acc, limit, latestObservation, true
 }
 
 // codexBucketsFromRolloutFile returns the per-(window, limit) contributors from

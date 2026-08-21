@@ -1374,7 +1374,7 @@ func TestCodexUsageLimitNotice_DoesNotAppendCredentialKeywords(t *testing.T) {
 		Message: "Please login or authenticate before trying again.",
 	}
 
-	notice := codexUsageLimitNotice(metrics, limit, refusedAt.Add(time.Minute))
+	notice := codexUsageLimitNotice(metrics, limit, time.Time{}, refusedAt.Add(time.Minute))
 	if notice == "" {
 		t.Fatal("expected quota notice")
 	}
@@ -1448,6 +1448,47 @@ func TestCodexUsageParser_RolledOverObservationNewerThanRefusalSuppressesNotice(
 	}
 }
 
+// A rollout reading can be newer than the refusal without being used for
+// backfill: the live cache remains authoritative for an observable row. Its
+// timestamp still proves that an older refusal is stale while another row
+// remains Unknown.
+func TestCodexUsageParser_SkippedRolloutObservationNewerThanRefusalSuppressesNotice(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 42, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			WindowMinutes: 300, usageKnown: true, resetKnown: true,
+		},
+	}, nil, now.Add(-2*time.Hour), fp)
+	helperWriteRolloutLimitLog(t, codexHome, "19", "2026-06-19T11-00-00-aaaa",
+		"2026-06-19T11:00:00.000Z", nil, "2026-06-19T11:00:00.000Z")
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T11-30-00-bbbb", "2026-06-19T11:30:00.000Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 73.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(2 * time.Hour).Unix()),
+			},
+		}})
+
+	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if session := usage.Metrics[0]; session.Unknown || session.Consumed == nil || *session.Consumed != 42 {
+		t.Fatalf("session row=%+v, want authoritative cached 42%%", session)
+	}
+	if weekly := usage.Metrics[1]; !weekly.Unknown {
+		t.Fatalf("weekly row=%+v, want Unknown", weekly)
+	}
+	if usage.Notice != "" {
+		t.Errorf("notice=%q, want none — the newer skipped rollout observation supersedes the refusal", usage.Notice)
+	}
+}
+
 // Preserve subsecond precision when comparing an observation with a refusal.
 // A successful frame later in the same second proves that the refusal is stale
 // just as surely as a frame in a later second does.
@@ -1462,7 +1503,7 @@ func TestCodexUsageLimitNotice_SubsecondObservationNewerThanRefusalSuppressesNot
 		},
 	}
 
-	if notice := codexUsageLimitNotice(metrics, codexUsageLimitEvidence{At: refusedAt}, refusedAt.Add(time.Hour)); notice != "" {
+	if notice := codexUsageLimitNotice(metrics, codexUsageLimitEvidence{At: refusedAt}, time.Time{}, refusedAt.Add(time.Hour)); notice != "" {
 		t.Fatalf("notice=%q, want none — the newer same-second observation supersedes the refusal", notice)
 	}
 }
