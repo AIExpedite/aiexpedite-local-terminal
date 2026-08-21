@@ -7,6 +7,7 @@
 package main
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -84,5 +85,20 @@ func TestCollectSessionArtifacts_FindsAPlaywrightRecording(t *testing.T) {
 	}
 	if filepath.Base(found[0]) != "capture-1-workflow-1920x1080.webm" {
 		t.Fatalf("detected the wrong file: %v", found)
+	}
+}
+
+func TestUploadErrorsForFiles_ReportsEachDetectedFile(t *testing.T) {
+	files := []string{"capture.png", "recording.webm"}
+
+	got := uploadErrorsForFiles(files, errors.New("credentials unavailable"))
+
+	if len(got) != len(files) {
+		t.Fatalf("expected one upload error per file, got %v", got)
+	}
+	for i, uploadErr := range got {
+		if uploadErr.File != files[i] || uploadErr.Error != "credentials unavailable" {
+			t.Fatalf("unexpected upload error at index %d: %+v", i, uploadErr)
+		}
 	}
 }

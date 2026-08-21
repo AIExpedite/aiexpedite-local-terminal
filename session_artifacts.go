@@ -84,7 +84,7 @@ func collectSessionArtifacts(
 	storageClient, storageErr := GetStorageClient(uploadCtx)
 	if storageErr != nil {
 		fmt.Printf("[session-file-upload] Failed to get storage client: %v\n", storageErr)
-		return nil, nil
+		return nil, uploadErrorsForFiles(files, storageErr)
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -102,4 +102,12 @@ func collectSessionArtifacts(
 		len(uploadResult.Successful), len(uploadResult.Failed))
 
 	return uploadResult.Successful, uploadResult.Failed
+}
+
+func uploadErrorsForFiles(files []string, err error) []UploadError {
+	errors := make([]UploadError, 0, len(files))
+	for _, file := range files {
+		errors = append(errors, UploadError{File: file, Error: err.Error()})
+	}
+	return errors
 }
