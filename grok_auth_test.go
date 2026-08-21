@@ -115,7 +115,7 @@ func TestGrokACPManager_StartRefusesUnauthenticatedWithoutSpawn(t *testing.T) {
 	t.Setenv("GROK_HOME", emptyHome)
 	t.Setenv("XAI_API_KEY", "")
 
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	err := m.Start("no-auth", t.TempDir(), nil, "ws", "uid", GrokStartOptions{}, func(resultMsg) {})
 	if err == nil {
 		t.Fatal("expected GROK_NOT_AUTHENTICATED")

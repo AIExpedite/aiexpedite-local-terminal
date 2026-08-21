@@ -249,7 +249,7 @@ func StartAgent(cfg *Config) {
 	// protocol is fundamentally different (JSON-RPC 2.0 framing vs. one-shot
 	// stream-json output).
 
-	globalCodexAppServerManager = NewCodexAppServerManager()
+	globalCodexAppServerManager = NewCodexAppServerManager(cfg)
 	go globalCodexAppServerManager.CleanupStale(codexAppServerMaxLifetime)
 	fmt.Println("[aiexpedite] Codex app-server manager ready")
 
@@ -260,7 +260,7 @@ func StartAgent(cfg *Config) {
 	// orchestrator dispatches the two families on different command Types
 	// and keeps independent JSON-RPC state machines per provider.
 
-	globalGrokACPManager = NewGrokACPManager()
+	globalGrokACPManager = NewGrokACPManager(cfg)
 	go globalGrokACPManager.CleanupStale(grokACPMaxLifetime)
 	fmt.Println("[aiexpedite] Grok ACP manager ready")
 
@@ -269,7 +269,7 @@ func StartAgent(cfg *Config) {
 	// rendering. Same manager shape as codex/grok, but forwards Claude's
 	// stream-json frames verbatim as claude_native_* chunks.
 
-	globalClaudeNativeManager = NewClaudeNativeManager()
+	globalClaudeNativeManager = NewClaudeNativeManager(cfg)
 	go globalClaudeNativeManager.CleanupStale(claudeNativeMaxLifetime)
 	fmt.Println("[aiexpedite] Claude native manager ready")
 
@@ -278,7 +278,7 @@ func StartAgent(cfg *Config) {
 	// Antigravity Chat. Logical sessions persist between one-shot processes;
 	// never uses ambiguous --continue.
 
-	globalAntigravityNativeManager = NewAntigravityNativeManager()
+	globalAntigravityNativeManager = NewAntigravityNativeManager(cfg)
 	go globalAntigravityNativeManager.CleanupStale(antigravityNativeMaxAge)
 	fmt.Println("[aiexpedite] Antigravity native manager ready")
 

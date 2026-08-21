@@ -268,13 +268,18 @@ func (s *GrokACPSession) signalFirstFrame() {
 // handles many concurrent sessions, mirroring SessionManager's shape.
 type GrokACPManager struct {
 	sessions map[string]*GrokACPSession
-	mu       sync.RWMutex
+	// Config is needed at session end to scan for and upload the media the
+	// session produced (see collectSessionArtifacts). Without it this
+	// manager silently drops every artifact its CLI wrote.
+	Config *Config
+	mu     sync.RWMutex
 }
 
 // NewGrokACPManager creates a fresh manager.
-func NewGrokACPManager() *GrokACPManager {
+func NewGrokACPManager(cfg *Config) *GrokACPManager {
 	return &GrokACPManager{
 		sessions: make(map[string]*GrokACPSession),
+		Config:   cfg,
 	}
 }
 
@@ -1097,20 +1102,35 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	session.Stdout.Close()
 	session.Stderr.Close()
 
+	// Scan for and upload whatever media this session wrote before announcing
+	// the end, so the metadata rides along on the ended frame exactly as it
+	// does on the PTY path's session_ended. Skipping this is what made every
+	// capture run through a bundled CLI report NO_MEDIA_UPLOADED while the
+	// recording sat on the device (prod 2026-08-20, video project vp_a72774c5).
+	uploadedFiles, uploadErrors := collectSessionArtifacts(
+		m.Config,
+		session.ID,
+		session.WorkspaceID,
+		session.Process.Dir,
+		session.StartedAt,
+	)
+
 	seq := atomic.AddInt64(&session.seq, 1)
 
 	publishTerminalResultAsync(publishFn, resultMsg{
-		ID:          session.ID,
-		WorkspaceID: session.WorkspaceID,
-		UID:         session.UID,
-		Output:      fmt.Sprintf("grok agent stdio ended (exit code: %d)", exit),
-		Status:      "success",
-		Ts:          time.Now().UnixMilli(),
-		Version:     Version,
-		Type:        "grok_acp_ended",
-		SessionID:   session.ID,
-		ExitCode:    exit,
-		Seq:         int(seq),
+		ID:           session.ID,
+		WorkspaceID:  session.WorkspaceID,
+		UID:          session.UID,
+		Output:       fmt.Sprintf("grok agent stdio ended (exit code: %d)", exit),
+		Status:       "success",
+		Ts:           time.Now().UnixMilli(),
+		Version:      Version,
+		Type:         "grok_acp_ended",
+		SessionID:    session.ID,
+		ExitCode:     exit,
+		Seq:          int(seq),
+		Files:        uploadedFiles,
+		UploadErrors: uploadErrors,
 	})
 
 	close(session.done)

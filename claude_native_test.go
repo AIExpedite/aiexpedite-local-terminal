@@ -92,7 +92,7 @@ func TestIsClaudeNativeCommand(t *testing.T) {
 }
 
 func TestClaudeNativeManager_Send_NotFound(t *testing.T) {
-	m := NewClaudeNativeManager()
+	m := NewClaudeNativeManager(nil)
 	err := m.Send("missing", "hello")
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("expected `not found` error; got %v", err)
@@ -100,7 +100,7 @@ func TestClaudeNativeManager_Send_NotFound(t *testing.T) {
 }
 
 func TestClaudeNativeManager_Send_Empty(t *testing.T) {
-	m := NewClaudeNativeManager()
+	m := NewClaudeNativeManager(nil)
 	id := "empty-fixture"
 	m.sessions[id] = &ClaudeNativeSession{ID: id, status: "running", done: make(chan struct{}), streamDone: make(chan struct{})}
 	if err := m.Send(id, "   "); err == nil || !strings.Contains(err.Error(), "empty") {
@@ -109,7 +109,7 @@ func TestClaudeNativeManager_Send_Empty(t *testing.T) {
 }
 
 func TestClaudeNativeManager_Send_EndedSession(t *testing.T) {
-	m := NewClaudeNativeManager()
+	m := NewClaudeNativeManager(nil)
 	id := "ended-fixture"
 	fixture := &ClaudeNativeSession{ID: id, status: "ended", done: make(chan struct{}), streamDone: make(chan struct{})}
 	close(fixture.done)
@@ -121,7 +121,7 @@ func TestClaudeNativeManager_Send_EndedSession(t *testing.T) {
 }
 
 func TestClaudeNativeManager_StartRejectsDuplicateID(t *testing.T) {
-	m := NewClaudeNativeManager()
+	m := NewClaudeNativeManager(nil)
 	id := "dupe-fixture"
 	m.sessions[id] = &ClaudeNativeSession{ID: id, status: "running", done: make(chan struct{}), streamDone: make(chan struct{})}
 	err := m.Start(id, t.TempDir(), nil, "", "ws", "uid", func(resultMsg) {}, nil)
@@ -131,7 +131,7 @@ func TestClaudeNativeManager_StartRejectsDuplicateID(t *testing.T) {
 }
 
 func TestClaudeNativeManager_StartRequiresIDAndPublish(t *testing.T) {
-	m := NewClaudeNativeManager()
+	m := NewClaudeNativeManager(nil)
 	cwd := t.TempDir()
 	if err := m.Start("", cwd, nil, "", "ws", "uid", func(resultMsg) {}, nil); err == nil {
 		t.Fatalf("expected error for empty sessionID")
@@ -142,7 +142,7 @@ func TestClaudeNativeManager_StartRequiresIDAndPublish(t *testing.T) {
 }
 
 func TestClaudeNativeManager_StartRequiresValidCwd(t *testing.T) {
-	m := NewClaudeNativeManager()
+	m := NewClaudeNativeManager(nil)
 	publishFn := func(resultMsg) {}
 
 	t.Run("empty_cwd_rejected", func(t *testing.T) {
@@ -167,7 +167,7 @@ func TestClaudeNativeManager_StartRequiresValidCwd(t *testing.T) {
 }
 
 func TestClaudeNativeManager_EndStaleSessions_OldOnly(t *testing.T) {
-	m := NewClaudeNativeManager()
+	m := NewClaudeNativeManager(nil)
 	old := &ClaudeNativeSession{ID: "old", status: "running", StartedAt: time.Now().Add(-2 * time.Hour), done: make(chan struct{}), streamDone: make(chan struct{})}
 	fresh := &ClaudeNativeSession{ID: "fresh", status: "running", StartedAt: time.Now(), done: make(chan struct{}), streamDone: make(chan struct{})}
 	// Pre-close lifecycle channels + mark ended so End() short-circuits without
@@ -231,7 +231,7 @@ func TestClaudeNativeLifecycle_StartSendEnd(t *testing.T) {
 	skipIfUnsupportedOS(t)
 	tmpDir := installMockClaude(t, "claude-native-echo")
 
-	m := NewClaudeNativeManager()
+	m := NewClaudeNativeManager(nil)
 	id := fmt.Sprintf("claude-test-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -316,7 +316,7 @@ func TestClaudeNativeLifecycle_OversizeFrameTerminatesSession(t *testing.T) {
 	skipIfUnsupportedOS(t)
 	tmpDir := installMockClaude(t, "claude-native-oversize")
 
-	m := NewClaudeNativeManager()
+	m := NewClaudeNativeManager(nil)
 	id := fmt.Sprintf("claude-oversize-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -364,7 +364,7 @@ func TestClaudeNativeLifecycle_SurfacesRejectedRateLimit(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
 	tmpDir := installMockClaude(t, "claude-native-ratelimit")
 
-	m := NewClaudeNativeManager()
+	m := NewClaudeNativeManager(nil)
 	id := fmt.Sprintf("claude-ratelimit-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -413,7 +413,7 @@ func TestClaudeNativeLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 		claudePathCached = ""
 	})
 
-	m := NewClaudeNativeManager()
+	m := NewClaudeNativeManager(nil)
 	err := m.Start("nobin", t.TempDir(), nil, "hi", "ws", "uid", func(resultMsg) {}, nil)
 	if err == nil {
 		t.Fatalf("expected Start to fail when `claude` is not on PATH")
