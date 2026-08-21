@@ -5633,6 +5633,18 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// entry unmatched and hang a headless run at the approval dialog.
 		if isOpenCodeCommand(cmd.Command) {
 			allowArgs = buildOpenCodeInteractiveArgs(cmd.Args)
+			// "Always" must NOT persist for OpenCode — same reasoning as
+			// grok_acp_start below. GeneratePatternFromCommand ignores args and
+			// returns `<cmd> *`, so a single "Always" click on any dialog-gated
+			// opencode invocation (a diagnostic like `opencode models`, an
+			// `opencode serve`, or a signed high-risk setup step) would persist
+			// a blanket `opencode *` — permanently pre-approving the bare
+			// interactive TUI and every raw invocation, i.e. undoing the
+			// deliberately narrow `opencode run --format json *` default entry.
+			// The shaped headless form already matches that entry without a
+			// dialog, so nothing legitimate needs the persistence. Treat
+			// "Always" as one-time.
+			persistOnAlways = false
 		}
 		dialogArgs = allowArgs
 		denyOutput = "Command denied by user: not in allow list"
