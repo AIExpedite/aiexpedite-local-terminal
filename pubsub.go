@@ -5621,6 +5621,19 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 	case "session_start":
 		allowCommand = cmd.Command
 		allowArgs = cmd.Args
+		// OpenCode: gate against the SYNTHESISED argv the session path will
+		// actually exec, exactly as codex_appserver_start / claude_native_start
+		// do for their entry kinds. buildOpenCodeInteractiveArgs forces
+		// `run --format json` and strips any token that would re-enter the
+		// interactive TUI, so an orchestration start arriving as
+		// `opencode --model <m> "<prompt>"` becomes
+		// `run --format json --model <m> <prompt>` — which is what the narrow
+		// `opencode run --format json *` allowlist entry matches, and what the
+		// dialog must display. Gating the RAW args instead would leave the
+		// entry unmatched and hang a headless run at the approval dialog.
+		if isOpenCodeCommand(cmd.Command) {
+			allowArgs = buildOpenCodeInteractiveArgs(cmd.Args)
+		}
 		dialogArgs = allowArgs
 		denyOutput = "Command denied by user: not in allow list"
 	case "codex_appserver_start":

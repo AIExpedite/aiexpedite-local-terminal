@@ -522,3 +522,59 @@ func TestDefaultAllowList_GrokIsNeverDefaultAllowed(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultAllowList_OpenCodeShapedRunOnly(t *testing.T) {
+	// OpenCode is pre-approved ONLY in the shaped headless form the managers
+	// synthesise. This is a deliberately narrower entry than the
+	// `claude *` / `codex *` / `agy *` ones: a bare `opencode` starts the
+	// interactive TUI (which never exits on a headless remote session), and
+	// every other raw `opencode ...` execute would skip the managers' env
+	// sanitisation, cwd containment and session-id pinning.
+	//
+	// gateSessionEntryCommand matches session_start against the SYNTHESISED
+	// argv (buildOpenCodeInteractiveArgs), so the allowed shape below is the
+	// argv the device will actually exec — the two must not drift apart.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	al := &AllowList{configPath: path}
+	if err := al.CreateDefault(); err != nil {
+		t.Fatalf("CreateDefault: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	allowed := []struct {
+		name string
+		args []string
+	}{
+		{"shaped run with a model", []string{"run", "--format", "json", "--model", "anthropic/claude-sonnet-4-5", "do the thing"}},
+		{"shaped run with a colon-bearing model", []string{"run", "--format", "json", "--model", "ollama/llama3:8b", "do the thing"}},
+		{"shaped run without a model", []string{"run", "--format", "json", "do the thing"}},
+		{"shaped run with a session pin", []string{"run", "--format", "json", "--session", "s-1", "do the thing"}},
+	}
+	for _, tc := range allowed {
+		if !al.IsAllowed("opencode", tc.args) {
+			t.Errorf("%s: IsAllowed(opencode, %v) = false; want true", tc.name, tc.args)
+		}
+	}
+
+	denied := []struct {
+		name string
+		args []string
+	}{
+		{"bare invocation (interactive TUI)", nil},
+		{"bare invocation, empty args", []string{}},
+		{"serve", []string{"serve"}},
+		{"auth login", []string{"auth", "login"}},
+		{"models probe", []string{"models"}},
+		{"version probe", []string{"--version"}},
+		{"run without the forced json format", []string{"run", "do the thing"}},
+		{"run with a format override", []string{"run", "--format", "text", "do the thing"}},
+	}
+	for _, tc := range denied {
+		if al.IsAllowed("opencode", tc.args) {
+			t.Errorf("%s: IsAllowed(opencode, %v) = true; want false (must stay dialog-gated)", tc.name, tc.args)
+		}
+	}
+}

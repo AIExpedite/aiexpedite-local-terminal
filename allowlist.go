@@ -653,15 +653,28 @@ agy *
 # manager's EnableGrokAPIKeyFallback / EnableGrokAlwaysApprove / env
 # sanitisation.
 #
-# Same reasoning, same absence, for "opencode": OpenCodeNativeManager
-# synthesises the ONLY argv it will execute ("opencode run --format json
-# [--session <id>]") and delivers the prompt on stdin from a temp file, never
-# argv. opencode_native_start is gated against that exact synthesised shape by
-# gateSessionEntryCommand, so no default entry is needed for it; a raw
-# "opencode ..." execute therefore stays behind the approval dialog rather than
-# being pre-approved into a path that skips the manager's env sanitisation, cwd
-# containment and session-id pinning. A bare "opencode" would also start the
-# interactive TUI, which on a headless remote session never exits.
+# OpenCode is pre-approved ONLY in its shaped headless form.
+#
+# "opencode run --format json *" is the exact argv shape the managers
+# synthesise and the only one they will ever execute: "run --format json" is
+# forced, and a caller token that would re-enter the interactive TUI (a bare
+# invocation, a second "run", a "--format" override) is stripped. Orchestrated
+# work reaches the device as a session_start, which gateSessionEntryCommand
+# gates against that SYNTHESISED argv (the codex_appserver_start precedent), so
+# this entry and the argv the device actually execs are the same string. Without
+# it a headless orchestration run stops at the native approval dialog with
+# nobody at the workstation to answer it.
+#
+# Everything else stays dialog-gated, deliberately and narrowly:
+#   - a bare "opencode" starts the interactive TUI, which on a headless remote
+#     session emits escape-sequence noise and never exits;
+#   - "opencode serve", "opencode auth ...", "opencode models" and every other
+#     raw "opencode ..." execute would skip the managers' env sanitisation, cwd
+#     containment and session-id pinning.
+#
+# This is narrower than the "claude *" / "codex *" / "agy *" entries above,
+# which pre-approve any subcommand of those binaries.
+opencode run --format json *
 
 # --- Remote/SSH ---
 ssh *
