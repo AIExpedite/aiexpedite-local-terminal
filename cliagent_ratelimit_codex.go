@@ -1463,9 +1463,6 @@ func codexUsageLimitNotice(metrics []cliAgentUsageMetric, limit codexUsageLimitE
 		return ""
 	}
 	notice := "Codex refused a run because this account's usage limit was reached, so its capacity is unreported until Codex sends a fresh window."
-	if limit.Message != "" {
-		notice += " Codex said: " + limit.Message
-	}
 	return notice
 }
 

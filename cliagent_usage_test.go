@@ -1355,14 +1355,31 @@ func TestCodexUsageParser_UsageLimitRefusalExplainsUnobservableCard(t *testing.T
 	if usage.NoticeSeverity != "error" || !strings.Contains(usage.Notice, "usage limit was reached") {
 		t.Fatalf("notice = (%q, %q), want the quota refusal explained", usage.Notice, usage.NoticeSeverity)
 	}
-	if !strings.Contains(usage.Notice, "try again at 11:28 PM") {
-		t.Errorf("notice should carry Codex's own retry text, got %q", usage.Notice)
+	if strings.Contains(usage.Notice, "try again at 11:28 PM") {
+		t.Errorf("notice must not carry untrusted Codex prose, got %q", usage.Notice)
 	}
 	// The frontend reads an error-severity notice mentioning login/sign-in as a
 	// CREDENTIAL failure and marks the agent unavailable. A spent quota is not
 	// that, so the wording must stay clear of those words.
 	if regexp.MustCompile(`(?i)\b(login|signed in|authenticate)\b`).MatchString(usage.Notice) {
 		t.Errorf("quota notice must not read as a login failure: %q", usage.Notice)
+	}
+}
+
+func TestCodexUsageLimitNotice_DoesNotAppendCredentialKeywords(t *testing.T) {
+	refusedAt := time.Date(2026, 6, 19, 11, 30, 0, 0, time.UTC)
+	metrics := []cliAgentUsageMetric{{Kind: limitKindSession, Unknown: true}}
+	limit := codexUsageLimitEvidence{
+		At:      refusedAt,
+		Message: "Please login or authenticate before trying again.",
+	}
+
+	notice := codexUsageLimitNotice(metrics, limit, refusedAt.Add(time.Minute))
+	if notice == "" {
+		t.Fatal("expected quota notice")
+	}
+	if regexp.MustCompile(`(?i)\b(login|signed in|authenticate)\b`).MatchString(notice) {
+		t.Errorf("quota notice must not append credential-like upstream prose: %q", notice)
 	}
 }
 
