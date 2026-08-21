@@ -173,6 +173,10 @@ func (s *AntigravityNativeSession) clearActiveProcess() {
 type AntigravityNativeManager struct {
 	sessions map[string]*AntigravityNativeSession
 	mu       sync.RWMutex
+	// Config is needed at session end to scan for and upload the media the
+	// session produced (see collectSessionArtifacts). Without it this manager
+	// silently drops every artifact its CLI wrote.
+	Config *Config
 	// captureMu guards the per-cwd capture-lock registry below.
 	captureMu sync.Mutex
 	// cwdCaptureLocks serialises capture-scoped turns (first turn or replay
@@ -185,9 +189,10 @@ type AntigravityNativeManager struct {
 }
 
 // NewAntigravityNativeManager creates a fresh manager.
-func NewAntigravityNativeManager() *AntigravityNativeManager {
+func NewAntigravityNativeManager(cfg *Config) *AntigravityNativeManager {
 	return &AntigravityNativeManager{
 		sessions:        make(map[string]*AntigravityNativeSession),
+		Config:          cfg,
 		cwdCaptureLocks: make(map[string]*sync.Mutex),
 	}
 }

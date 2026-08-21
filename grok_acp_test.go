@@ -201,7 +201,7 @@ func TestIsGrokACPCommand(t *testing.T) {
 }
 
 func TestGrokACPManager_Send_RejectsInvalidPayloads(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := "test-fixture"
 	fixture := &GrokACPSession{
 		ID:         id,
@@ -238,7 +238,7 @@ func TestGrokACPManager_Send_RejectsInvalidPayloads(t *testing.T) {
 }
 
 func TestGrokACPManager_Send_NotFound(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	err := m.Send("missing", `{"jsonrpc":"2.0","id":1,"method":"initialize"}`)
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("expected `not found` error; got %v", err)
@@ -246,7 +246,7 @@ func TestGrokACPManager_Send_NotFound(t *testing.T) {
 }
 
 func TestGrokACPManager_Send_EndedSession(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := "ended-fixture"
 	fixture := &GrokACPSession{ID: id, status: "ended", done: make(chan struct{}), streamDone: make(chan struct{})}
 	close(fixture.done)
@@ -260,7 +260,7 @@ func TestGrokACPManager_Send_EndedSession(t *testing.T) {
 }
 
 func TestGrokACPManager_StartRejectsDuplicateID(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := "dupe-fixture"
 	m.sessions[id] = &GrokACPSession{ID: id, status: "running", done: make(chan struct{}), streamDone: make(chan struct{})}
 
@@ -272,7 +272,7 @@ func TestGrokACPManager_StartRejectsDuplicateID(t *testing.T) {
 }
 
 func TestGrokACPManager_StartRequiresIDAndPublish(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	cwd := t.TempDir()
 	if err := m.Start("", cwd, nil, "ws", "uid", GrokStartOptions{}, func(resultMsg) {}); err == nil {
 		t.Fatalf("expected error for empty sessionID")
@@ -287,7 +287,7 @@ func TestGrokACPManager_StartRequiresIDAndPublish(t *testing.T) {
 // spawned, so a malformed orchestrator command can't accidentally launch grok
 // against the agent's process working directory and edit unintended files.
 func TestGrokACPManager_StartRequiresValidCwd(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	publishFn := func(resultMsg) {}
 
 	t.Run("empty_cwd_rejected", func(t *testing.T) {
@@ -347,7 +347,7 @@ func TestGrokACPManager_StartRootsContainmentAtSessionCwd(t *testing.T) {
 		// covered on unix.
 		t.Skip("symlink + path semantics covered on unix")
 	}
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	publishFn := func(resultMsg) {}
 
 	t.Run("any_existing_absolute_dir_accepted", func(t *testing.T) {
@@ -440,7 +440,7 @@ func TestGrokACPManager_StartClampsTimeoutAtMaxLifetime(t *testing.T) {
 }
 
 func TestGrokACPManager_EndStaleSessions_OldOnly(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 
 	now := time.Now()
 	old := &GrokACPSession{
@@ -599,7 +599,7 @@ func TestGrokACPLifecycle_StartSendEnd(t *testing.T) {
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(mockCLIEnvVar, "grok-acp-echo")
 
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := fmt.Sprintf("grok-test-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -782,7 +782,7 @@ func TestGrokACPLifecycle_CancelTerminatesSession(t *testing.T) {
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(mockCLIEnvVar, "grok-acp-echo")
 
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := fmt.Sprintf("grok-cancel-test-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -869,7 +869,7 @@ func TestGrokACPLifecycle_ForwardsBadFrameAsError(t *testing.T) {
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(mockCLIEnvVar, "grok-acp-bad-frame")
 
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := fmt.Sprintf("grok-badframe-test-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -946,7 +946,7 @@ func TestGrokACPLifecycle_CapturesUsageLimitFromStream(t *testing.T) {
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(mockCLIEnvVar, "grok-acp-usage-limit")
 
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := fmt.Sprintf("grok-usagelimit-test-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -1035,7 +1035,7 @@ func TestGrokACPLifecycle_TimeoutKillsRunawaySession(t *testing.T) {
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(mockCLIEnvVar, "grok-acp-hang")
 
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := fmt.Sprintf("grok-timeout-test-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -1130,7 +1130,7 @@ func TestGrokACPLifecycle_TimeoutKillsBeforeBlockingPublish(t *testing.T) {
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(mockCLIEnvVar, "grok-acp-hang")
 
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := fmt.Sprintf("grok-timeout-killfirst-%d", time.Now().UnixNano())
 
 	// publishGate blocks the timeout publish so we can probe whether Kill
@@ -1204,7 +1204,7 @@ func TestGrokACPLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	enableTestGrokLogin(t)
 	t.Setenv("PATH", tmpDir)
 
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	publishFn := func(resultMsg) {}
 	err := m.Start("missing-bin", tmpDir, nil, "ws", "uid", GrokStartOptions{}, publishFn)
 	if err == nil {
@@ -1496,7 +1496,7 @@ func TestWaitForExit_StatusFlipsBeforeStreamDrain(t *testing.T) {
 	// reaches the status-flip block as quickly as possible.
 	t.Setenv(mockCLIEnvVar, "grok-acp-quick-exit")
 
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := fmt.Sprintf("grok-statusrace-test-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -1588,7 +1588,7 @@ func TestWaitForExit_FinalFrameSurvivesQuickExit(t *testing.T) {
 	// uses for similar lifecycle races.
 	const iterations = 25
 	for i := 0; i < iterations; i++ {
-		m := NewGrokACPManager()
+		m := NewGrokACPManager(nil)
 		id := fmt.Sprintf("grok-final-frame-test-%d-%d", time.Now().UnixNano(), i)
 
 		var mu sync.Mutex
@@ -1670,7 +1670,7 @@ func TestWaitForExit_FinalFrameSurvivesQuickExit(t *testing.T) {
 // validateGrokACPSendCwd only inspects object-shaped frames and a batched
 // `session/new` could otherwise skip the cwd containment gate.
 func TestGrokACPManager_Send_RejectsNonObjectFrame(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := "non-object-fixture"
 	fixture := &GrokACPSession{
 		ID:         id,
@@ -1716,7 +1716,7 @@ func TestGrokACPManager_Send_BatchArrayDoesNotBypassCwdGate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink/path semantics covered on unix")
 	}
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	id := "batch-cwd-fixture"
 	root := t.TempDir()
 	resolvedRoot, err := filepath.EvalSymlinks(root)
@@ -1770,7 +1770,7 @@ func newWatchdogFixtureSession(id string) *GrokACPSession {
 // produce exactly one `grok_acp_error` whose message points the user at
 // re-authenticating, instead of hanging at "Grok ACP started" forever.
 func TestGrokACPManager_WatchFirstFrame_FiresAuthErrorOnSilence(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	session := newWatchdogFixtureSession("silent-1")
 
 	var mu sync.Mutex
@@ -1807,7 +1807,7 @@ func TestGrokACPManager_WatchFirstFrame_FiresAuthErrorOnSilence(t *testing.T) {
 // session (grok emits a frame before the budget) disarms the watchdog with no
 // spurious error frame.
 func TestGrokACPManager_WatchFirstFrame_SilentWhenFrameArrives(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	session := newWatchdogFixtureSession("healthy-1")
 
 	var mu sync.Mutex
@@ -1837,7 +1837,7 @@ func TestGrokACPManager_WatchFirstFrame_SilentWhenFrameArrives(t *testing.T) {
 // watchdog auth error — waitForExit owns the terminal `grok_acp_ended` frame in
 // that case, so the watchdog must stay quiet.
 func TestGrokACPManager_WatchFirstFrame_SilentWhenSessionExits(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	session := newWatchdogFixtureSession("exited-1")
 
 	var mu sync.Mutex
@@ -1880,7 +1880,7 @@ func TestGrokACPManager_WatchFirstFrame_SignalFirstFrameIdempotent(t *testing.T)
 // dispatcher's post-ack arm call is safe if the session is already gone (e.g.
 // removed by a fast natural exit between Start and the ack publish completing).
 func TestGrokACPManager_ArmFirstFrameWatchdog_NoopForUnknownSession(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	var captured []resultMsg
 	publishFn := func(res resultMsg) { captured = append(captured, res) }
 
@@ -1896,7 +1896,7 @@ func TestGrokACPManager_ArmFirstFrameWatchdog_NoopForUnknownSession(t *testing.T
 // waitForExit owns the terminal `grok_acp_ended` frame in that case, so the
 // watchdog must stay quiet.
 func TestGrokACPManager_ArmFirstFrameWatchdog_NoopForEndedSession(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	session := newWatchdogFixtureSession("ended-1")
 	session.status = "ended"
 	m.sessions[session.ID] = session
@@ -1925,7 +1925,7 @@ func TestGrokACPManager_ArmFirstFrameWatchdog_NoopForEndedSession(t *testing.T) 
 // post-ack arm path stays silent when grok produces a frame — the dispatcher
 // integration must not change the disarm semantics watchFirstFrame relies on.
 func TestGrokACPManager_ArmFirstFrameWatchdog_QuietForHealthySession(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 	session := newWatchdogFixtureSession("arm-quiet-1")
 	m.sessions[session.ID] = session
 
@@ -1957,7 +1957,7 @@ func TestGrokACPManager_ArmFirstFrameWatchdog_QuietForHealthySession(t *testing.
 // a valid ACP frame and verifies it DOES disarm — proving the gate is on
 // "spoke the protocol", not "wrote anything to stdout".
 func TestGrokACPManager_ReadStream_NonJSONDoesNotDisarmWatchdog(t *testing.T) {
-	m := NewGrokACPManager()
+	m := NewGrokACPManager(nil)
 
 	stdoutR, stdoutW := io.Pipe()
 	stderrR, stderrW := io.Pipe()

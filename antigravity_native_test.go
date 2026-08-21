@@ -472,7 +472,7 @@ func TestCaptureAntigravityNativeID_UsesResolvedCwdKey(t *testing.T) {
 func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 	// Unit-level: two sessions with different IDs never share native IDs
 	// when we set them independently (no real agy needed).
-	m := NewAntigravityNativeManager()
+	m := NewAntigravityNativeManager(nil)
 	cwd := t.TempDir()
 	if err := m.Start("sess-a", cwd, "ws", "uid", nil, nil); err != nil {
 		// probeAntigravityNativeCapability may fail if agy missing — skip.
@@ -510,7 +510,7 @@ func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 // BECOMES the session's workspace root, which every later turn re-resolves
 // against (TestAntigravityContainedCwd_RevalidatesSymlinkSwap).
 func TestAntigravityNativeManager_StartRootsContainmentAtSessionCwd(t *testing.T) {
-	m := NewAntigravityNativeManager()
+	m := NewAntigravityNativeManager(nil)
 	anywhere := t.TempDir() // not inside any "configured" root by construction
 
 	err := m.Start("sess-anywhere", anywhere, "ws", "uid", nil, nil)
@@ -879,7 +879,7 @@ func TestAntigravityNativeManager_StartIsIdempotent(t *testing.T) {
 	// Pub/Sub redelivery of antigravity_native_start must re-ack without
 	// erroring (which would previously emit antigravity_native_ended and
 	// desync cloud vs local session).
-	m := NewAntigravityNativeManager()
+	m := NewAntigravityNativeManager(nil)
 	cwd := t.TempDir()
 
 	var acks int
@@ -916,7 +916,7 @@ func TestAntigravityNativeManager_EndStaleSessionsPublishesEnded(t *testing.T) {
 	// reservations when antigravity_native_end never arrives (6h expiry /
 	// dropped end command). Unlike Claude/Codex/Grok there is no long-lived
 	// process whose exit path publishes ended.
-	m := NewAntigravityNativeManager()
+	m := NewAntigravityNativeManager(nil)
 	cwd := t.TempDir()
 
 	var captured []resultMsg
@@ -991,7 +991,7 @@ func TestAntigravityNativeManager_StartIdempotentSkipsCapabilityProbe(t *testing
 	// Duplicate antigravity_native_start must re-ack even when the capability
 	// cache is a recent failure (expired TTL / upgrade blip). Probing first
 	// would return an error and desync cloud retry state from a live session.
-	m := NewAntigravityNativeManager()
+	m := NewAntigravityNativeManager(nil)
 	cwd := t.TempDir()
 	id := "sess-skip-probe"
 
@@ -1052,7 +1052,7 @@ func TestAntigravityNativeManager_SendNonzeroExitWithStdoutIsError(t *testing.T)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	m := NewAntigravityNativeManager()
+	m := NewAntigravityNativeManager(nil)
 	cwd := t.TempDir()
 	id := "sess-nonzero-stdout"
 
@@ -1147,7 +1147,7 @@ func TestAntigravityNativeManager_NativeIDNotAdoptedOnNonzeroExit(t *testing.T) 
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	m := NewAntigravityNativeManager()
+	m := NewAntigravityNativeManager(nil)
 	id := "sess-nonzero-capture"
 	m.mu.Lock()
 	m.sessions[id] = &AntigravityNativeSession{
@@ -1196,7 +1196,7 @@ func TestAntigravityNativeManager_TimeoutReapsProcessTree(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	m := NewAntigravityNativeManager()
+	m := NewAntigravityNativeManager(nil)
 	cwd := t.TempDir()
 	id := "sess-timeout-reap"
 	m.mu.Lock()
@@ -1247,7 +1247,7 @@ func TestAntigravityNativeManager_EndWaitsForInFlightTurn(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	m := NewAntigravityNativeManager()
+	m := NewAntigravityNativeManager(nil)
 	cwd := t.TempDir()
 	id := "sess-end-wait"
 
@@ -1308,7 +1308,7 @@ func TestAntigravityNativeManager_EndWaitsForInFlightTurn(t *testing.T) {
 // terminal antigravity_native_ended frame while the running turn can still emit
 // stderr/error frames afterwards, breaking the stop/cancel ordering guarantee.
 func TestAntigravityNativeManager_DuplicateEndWaitsForInFlightTurn(t *testing.T) {
-	m := NewAntigravityNativeManager()
+	m := NewAntigravityNativeManager(nil)
 	id := "sess-dup-end"
 
 	sess := &AntigravityNativeSession{

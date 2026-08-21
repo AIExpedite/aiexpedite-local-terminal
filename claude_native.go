@@ -140,13 +140,18 @@ func claudeUserEnvelope(sessionID, text string) string {
 // ClaudeNativeManager owns the active Claude stream-json processes.
 type ClaudeNativeManager struct {
 	sessions map[string]*ClaudeNativeSession
-	mu       sync.RWMutex
+	// Config is needed at session end to scan for and upload the media the
+	// session produced (see collectSessionArtifacts). Without it this
+	// manager silently drops every artifact its CLI wrote.
+	Config *Config
+	mu     sync.RWMutex
 }
 
 // NewClaudeNativeManager creates a fresh manager.
-func NewClaudeNativeManager() *ClaudeNativeManager {
+func NewClaudeNativeManager(cfg *Config) *ClaudeNativeManager {
 	return &ClaudeNativeManager{
 		sessions: make(map[string]*ClaudeNativeSession),
+		Config:   cfg,
 	}
 }
 
@@ -725,20 +730,35 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 	exit := session.exitCode
 	session.mu.Unlock()
 
+	// Scan for and upload whatever media this session wrote before announcing
+	// the end, so the metadata rides along on the ended frame exactly as it
+	// does on the PTY path's session_ended. Skipping this is what made every
+	// capture run through a bundled CLI report NO_MEDIA_UPLOADED while the
+	// recording sat on the device (prod 2026-08-20, video project vp_a72774c5).
+	uploadedFiles, uploadErrors := collectSessionArtifacts(
+		m.Config,
+		session.ID,
+		session.WorkspaceID,
+		session.Process.Dir,
+		session.StartedAt,
+	)
+
 	seq := atomic.AddInt64(&session.seq, 1)
 
 	publishTerminalResultAsync(publishFn, resultMsg{
-		ID:          session.ID,
-		WorkspaceID: session.WorkspaceID,
-		UID:         session.UID,
-		Output:      fmt.Sprintf("claude native ended (exit code: %d)", exit),
-		Status:      "success",
-		Ts:          time.Now().UnixMilli(),
-		Version:     Version,
-		Type:        "claude_native_ended",
-		SessionID:   session.ID,
-		ExitCode:    exit,
-		Seq:         int(seq),
+		ID:           session.ID,
+		WorkspaceID:  session.WorkspaceID,
+		UID:          session.UID,
+		Output:       fmt.Sprintf("claude native ended (exit code: %d)", exit),
+		Status:       "success",
+		Ts:           time.Now().UnixMilli(),
+		Version:      Version,
+		Type:         "claude_native_ended",
+		SessionID:    session.ID,
+		ExitCode:     exit,
+		Seq:          int(seq),
+		Files:        uploadedFiles,
+		UploadErrors: uploadErrors,
 	})
 
 	close(session.done)

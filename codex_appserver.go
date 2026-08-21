@@ -177,13 +177,18 @@ func (s *CodexAppServerSession) closeStdin() {
 // manager handles many concurrent sessions, mirroring SessionManager's shape.
 type CodexAppServerManager struct {
 	sessions map[string]*CodexAppServerSession
-	mu       sync.RWMutex
+	// Config is needed at session end to scan for and upload the media the
+	// session produced (see collectSessionArtifacts). Without it this
+	// manager silently drops every artifact its CLI wrote.
+	Config *Config
+	mu     sync.RWMutex
 }
 
 // NewCodexAppServerManager creates a fresh manager.
-func NewCodexAppServerManager() *CodexAppServerManager {
+func NewCodexAppServerManager(cfg *Config) *CodexAppServerManager {
 	return &CodexAppServerManager{
 		sessions: make(map[string]*CodexAppServerSession),
+		Config:   cfg,
 	}
 }
 
@@ -812,6 +817,19 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	exit := session.exitCode
 	session.mu.Unlock()
 
+	// Scan for and upload whatever media this session wrote before announcing
+	// the end, so the metadata rides along on the ended frame exactly as it
+	// does on the PTY path's session_ended. Skipping this is what made every
+	// capture run through a bundled CLI report NO_MEDIA_UPLOADED while the
+	// recording sat on the device (prod 2026-08-20, video project vp_a72774c5).
+	uploadedFiles, uploadErrors := collectSessionArtifacts(
+		m.Config,
+		session.ID,
+		session.WorkspaceID,
+		session.Process.Dir,
+		session.StartedAt,
+	)
+
 	seq := atomic.AddInt64(&session.seq, 1)
 
 	// Publish codex_appserver_ended in a goroutine: publishFn can block up to
@@ -820,17 +838,19 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	// callers waiting on session.done. Mirrors session.go's session_ended
 	// publish pattern.
 	publishTerminalResultAsync(publishFn, resultMsg{
-		ID:          session.ID,
-		WorkspaceID: session.WorkspaceID,
-		UID:         session.UID,
-		Output:      fmt.Sprintf("codex app-server ended (exit code: %d)", exit),
-		Status:      "success",
-		Ts:          time.Now().UnixMilli(),
-		Version:     Version,
-		Type:        "codex_appserver_ended",
-		SessionID:   session.ID,
-		ExitCode:    exit,
-		Seq:         int(seq),
+		ID:           session.ID,
+		WorkspaceID:  session.WorkspaceID,
+		UID:          session.UID,
+		Output:       fmt.Sprintf("codex app-server ended (exit code: %d)", exit),
+		Status:       "success",
+		Ts:           time.Now().UnixMilli(),
+		Version:      Version,
+		Type:         "codex_appserver_ended",
+		SessionID:    session.ID,
+		ExitCode:     exit,
+		Seq:          int(seq),
+		Files:        uploadedFiles,
+		UploadErrors: uploadErrors,
 	})
 
 	// Closing `done` after the publish goroutine has been launched (but

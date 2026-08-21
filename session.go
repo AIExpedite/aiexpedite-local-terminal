@@ -10,11 +10,9 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1355,72 +1353,16 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// message. Note: we intentionally do NOT gate on session.ExitCode == 0 —
 	// a UI test that screenshots right before crashing is the case where we
 	// MOST want the image to reach the orchestrator.
-	var uploadedFiles []FileInfo
-	var uploadErrors []UploadError
-	cfg := sm.Config
-	if cfg != nil && cfg.EnableFileUpload && session.WorkspaceID != "" {
-		// Scope the scan to THIS session's own spawn dir. Process.Dir is
-		// per-session; getTrackedCwd() is a process-wide value mutated by
-		// unrelated one-shot commands, so it's only a last-resort fallback
-		// when Process.Dir is empty — never an additional root (scanning it
-		// while another workspace's command wrote fresh media there would
-		// upload those files under THIS session's workspaceID).
-		//
-		// NOTE: when a bundled CLI agent is launched in the home dir and
-		// `cd`s into the repo, its screenshots land in a SIBLING of
-		// Process.Dir and this walk won't see them. That's fixed upstream
-		// by spawning the session IN the repo (ai-service seeds `cwd` →
-		// Process.Dir); the always-on log line below makes the miss
-		// diagnosable if the cwd hint is ever absent.
-		effectiveDir := session.Process.Dir
-		if effectiveDir == "" {
-			effectiveDir = getTrackedCwd()
-		}
-		if effectiveDir == "" {
-			// Without a workdir we cannot scope the upload scan, so we skip
-			// it entirely. Surface the reason — silently dropping every
-			// screenshot from a session is the kind of thing operators need
-			// to see, not have to git-blame for.
-			fmt.Printf("[session-file-upload] Skipping upload for session %s — no effective workdir (Process.Dir and trackedCwd both empty)\n", session.ID)
-		} else {
-			files := detectOutputFilesSince(effectiveDir, session.StartedAt)
-			// Always log the scan outcome (root + count), even on zero
-			// hits. A silent zero-file result was previously
-			// indistinguishable from "upload disabled" — this line is what
-			// turns a future `hasFiles:false` report into a one-grep
-			// diagnosis (scan root vs. where the agent actually wrote).
-			fmt.Printf("[session-file-upload] Session %s: scanned %s since %s → %d media file(s)\n",
-				session.ID, effectiveDir, session.StartedAt.Format(time.RFC3339), len(files))
-			if len(files) > 0 {
-				fmt.Printf("[session-file-upload] Detected %d output files, uploading to GCS (workspace: %s)...\n", len(files), session.WorkspaceID)
-
-				uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-				storageClient, storageErr := GetStorageClient(uploadCtx)
-				if storageErr != nil {
-					uploadCancel()
-					fmt.Printf("[session-file-upload] Failed to get storage client: %v\n", storageErr)
-				} else {
-					logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-					uploadResult := UploadFiles(
-						uploadCtx,
-						storageClient,
-						cfg.StorageBucket,
-						files,
-						session.WorkspaceID,
-						session.ID,
-						logger,
-					)
-					uploadCancel()
-
-					uploadedFiles = uploadResult.Successful
-					uploadErrors = uploadResult.Failed
-
-					fmt.Printf("[session-file-upload] Upload complete: %d successful, %d failed\n",
-						len(uploadResult.Successful), len(uploadResult.Failed))
-				}
-			}
-		}
-	}
+	// Shared with every bundled-CLI manager (see session_artifacts.go): the
+	// scan used to live inline here, which is why only this PTY path ever
+	// uploaded anything.
+	uploadedFiles, uploadErrors := collectSessionArtifacts(
+		sm.Config,
+		session.ID,
+		session.WorkspaceID,
+		session.Process.Dir,
+		session.StartedAt,
+	)
 
 	// Publish session_ended in a goroutine: publishFn blocks up to 30 s on
 	// Pub/Sub network I/O.  Calling it directly here would delay removeSession
