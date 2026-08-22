@@ -1431,6 +1431,18 @@ var claudeBillingStripped = []string{
 	"ANTHROPIC_AUTH_TOKEN=",
 }
 
+// openCodeUnrelatedStripped is the set of other agents' credentials stripped
+// from spawned OpenCode sessions so remotely prompted tools cannot read unrelated
+// provider secrets. Matches sanitizeOpenCodeEnv in opencode_native.go.
+var openCodeUnrelatedStripped = []string{
+	"CLAUDECODE=",
+	"CLAUDE_",
+	"ANTHROPIC_",
+	"CODEX_",
+	"XAI_",
+	"GROK_",
+}
+
 // sanitizeClaudeChildEnv returns env with any variable that would confuse a
 // spawned CLI agent (or, for claude specifically, would override the user's
 // subscription credentials) removed. The second return value lists the names
@@ -1439,9 +1451,11 @@ var claudeBillingStripped = []string{
 //
 // The billing-var strip is gated on isClaudeCommand(command): codex
 // / arbitrary shells are unaffected so they keep working with whatever auth
-// the user has configured for those tools.
+// the user has configured for those tools. OpenCode sessions strip unrelated
+// credentials via openCodeUnrelatedStripped.
 func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 	stripClaudeBilling := isClaudeCommand(command)
+	stripOpenCodeUnrelated := isOpenCodeCommand(command)
 
 	filtered := make([]string, 0, len(env))
 	var stripped []string
@@ -1457,6 +1471,14 @@ func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 		}
 		if !drop && stripClaudeBilling {
 			for _, p := range claudeBillingStripped {
+				if strings.HasPrefix(upper, p) {
+					drop = true
+					break
+				}
+			}
+		}
+		if !drop && stripOpenCodeUnrelated {
+			for _, p := range openCodeUnrelatedStripped {
 				if strings.HasPrefix(upper, p) {
 					drop = true
 					break

@@ -199,3 +199,44 @@ func TestOpenCodeStub_ReceivesShapedModelArgv(t *testing.T) {
 		t.Errorf("stub argv %q put the prompt before the --model value", got)
 	}
 }
+
+func TestOpenCodeSession_SanitizesUnrelatedCredentials(t *testing.T) {
+	rawEnv := []string{
+		"PATH=/usr/bin",
+		"ANTHROPIC_API_KEY=sk-ant-secret",
+		"ANTHROPIC_AUTH_TOKEN=auth-token",
+		"CODEX_API_KEY=codex-secret",
+		"XAI_API_KEY=xai-secret",
+		"GROK_API_KEY=grok-secret",
+		"CLAUDE_CODE_OAUTH_TOKEN=claude-oauth",
+		"OPENCODE_API_KEY=opencode-secret",
+	}
+
+	filtered, stripped := sanitizeClaudeChildEnv("opencode", rawEnv)
+
+	filteredMap := make(map[string]bool)
+	for _, e := range filtered {
+		filteredMap[strings.Split(e, "=")[0]] = true
+	}
+
+	for _, denied := range []string{
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AUTH_TOKEN",
+		"CODEX_API_KEY",
+		"XAI_API_KEY",
+		"GROK_API_KEY",
+		"CLAUDE_CODE_OAUTH_TOKEN",
+	} {
+		if filteredMap[denied] {
+			t.Errorf("filtered env retained unrelated credential %q", denied)
+		}
+	}
+
+	if !filteredMap["OPENCODE_API_KEY"] || !filteredMap["PATH"] {
+		t.Errorf("filtered env dropped legitimate vars: %v", filtered)
+	}
+
+	if len(stripped) != 6 {
+		t.Errorf("expected 6 stripped vars, got %v", stripped)
+	}
+}
