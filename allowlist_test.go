@@ -578,3 +578,129 @@ func TestDefaultAllowList_OpenCodeShapedRunOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestEnsureOpenCodeDefaults_AppendsForUpgradedInstall(t *testing.T) {
+	// The bug this covers: `opencode run --format json *` was added to
+	// defaultAllowListContent, which only ever runs on a FRESH install. Every
+	// upgraded agent kept an allowed-commands.txt without it, so an
+	// orchestrated session_start hit the native approval dialog and the
+	// headless run hung with nobody at the workstation to answer.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	legacy := "# legacy\ngit\ngit *\nmy-custom-tool *\n"
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatalf("seed legacy allow list: %v", err)
+	}
+
+	al := &AllowList{configPath: path}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	shaped := buildOpenCodeInteractiveArgs([]string{"--model", openCodeTestModel, "do the thing"})
+	if al.IsAllowed("opencode", shaped) {
+		t.Fatalf("precondition: legacy list should not yet allow the shaped opencode run")
+	}
+
+	if err := al.ensureOpenCodeDefaults(); err != nil {
+		t.Fatalf("ensureOpenCodeDefaults: %v", err)
+	}
+
+	if !al.IsAllowed("opencode", shaped) {
+		t.Errorf("after migration, the shaped headless run must be pre-approved")
+	}
+	if !al.IsAllowed("my-custom-tool", []string{"--flag"}) {
+		t.Errorf("user-added pattern was lost after migration")
+	}
+
+	// The migration must not widen the entry: everything else stays gated.
+	for _, args := range [][]string{
+		nil,
+		{"serve"},
+		{"auth", "login"},
+		{"models"},
+		{"run", "do the thing"},
+		{"run", "--format", "text", "do the thing"},
+	} {
+		if al.IsAllowed("opencode", args) {
+			t.Errorf("migration pre-approved %v; only the shaped run may be allowed", args)
+		}
+	}
+
+	// Idempotency: a second call must not re-append the block.
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if err := al.ensureOpenCodeDefaults(); err != nil {
+		t.Fatalf("ensureOpenCodeDefaults (second call): %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Errorf("ensureOpenCodeDefaults is not idempotent; file changed on second call")
+	}
+}
+
+func TestEnsureOpenCodeDefaults_DoesNotResurrectManualRemoval(t *testing.T) {
+	// Marker-keyed, like the gh migration: an operator who deletes the entry
+	// via Edit Allow List must stay removed across restarts.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	seeded := openCodeMigrationMarker + "\ngit *\n"
+	if err := os.WriteFile(path, []byte(seeded), 0600); err != nil {
+		t.Fatalf("seed allow list: %v", err)
+	}
+
+	al := &AllowList{configPath: path}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := al.ensureOpenCodeDefaults(); err != nil {
+		t.Fatalf("ensureOpenCodeDefaults: %v", err)
+	}
+
+	shaped := buildOpenCodeInteractiveArgs([]string{"--model", openCodeTestModel, "do the thing"})
+	if al.IsAllowed("opencode", shaped) {
+		t.Errorf("a deliberately removed entry was resurrected by the migration")
+	}
+}
+
+func TestEnsureOpenCodeDefaults_MatchesFreshInstallEntry(t *testing.T) {
+	// A fresh install (defaultAllowListContent) and an upgraded one (this
+	// migration) must agree byte-for-byte about what OpenCode may run,
+	// otherwise the two populations diverge silently.
+	dir := t.TempDir()
+	fresh := &AllowList{configPath: filepath.Join(dir, "fresh.txt")}
+	if err := fresh.CreateDefault(); err != nil {
+		t.Fatalf("CreateDefault: %v", err)
+	}
+	if err := fresh.Load(); err != nil {
+		t.Fatalf("Load fresh: %v", err)
+	}
+
+	upgraded := &AllowList{configPath: filepath.Join(dir, "upgraded.txt")}
+	if err := os.WriteFile(upgraded.configPath, []byte("git *\n"), 0600); err != nil {
+		t.Fatalf("seed upgraded: %v", err)
+	}
+	if err := upgraded.Load(); err != nil {
+		t.Fatalf("Load upgraded: %v", err)
+	}
+	if err := upgraded.ensureOpenCodeDefaults(); err != nil {
+		t.Fatalf("ensureOpenCodeDefaults: %v", err)
+	}
+
+	for _, args := range [][]string{
+		{"run", "--format", "json", "--model", openCodeTestModel, "do the thing"},
+		{"run", "--format", "json", "do the thing"},
+		nil,
+		{"serve"},
+		{"--version"},
+	} {
+		if fresh.IsAllowed("opencode", args) != upgraded.IsAllowed("opencode", args) {
+			t.Errorf("fresh and upgraded disagree for %v: fresh=%v upgraded=%v",
+				args, fresh.IsAllowed("opencode", args), upgraded.IsAllowed("opencode", args))
+		}
+	}
+}

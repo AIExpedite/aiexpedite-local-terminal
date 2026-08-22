@@ -64,6 +64,15 @@ func InitAllowList() (*AllowList, error) {
 		log.Printf("allowlist: gemini removal migration failed, continuing with existing list: %v", err)
 	}
 
+	// Add the shaped OpenCode headless pattern to upgraded installs. Without
+	// this, defaultAllowListContent only reaches FRESH installs, so every
+	// existing agent would hit the native approval dialog on an orchestrated
+	// `session_start` — with nobody at the workstation to answer it, the
+	// headless run just hangs. Same best-effort contract as the two above.
+	if err := al.ensureOpenCodeDefaults(); err != nil {
+		log.Printf("allowlist: opencode defaults migration failed, continuing with existing list: %v", err)
+	}
+
 	defaultAllowList = al
 	return al, nil
 }
@@ -104,6 +113,64 @@ func (al *AllowList) ensureGhDefaults() error {
 			block.WriteString(p)
 			block.WriteString("\n")
 		}
+	}
+
+	f, err := os.OpenFile(al.configPath, os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(block.String()); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	return al.Load()
+}
+
+// openCodeMigrationMarker is written into allowed-commands.txt once the
+// OpenCode migration has run. Keying off a marker (rather than the presence of
+// the pattern) makes it one-shot, so an operator who deliberately removes the
+// entry via Edit Allow List stays removed across restarts.
+const openCodeMigrationMarker = "# allowlist-migration: opencode-defaults-v1"
+
+// openCodeDefaultPattern is the ONLY OpenCode form that is pre-approved: the
+// shaped headless run the managers synthesise. It must stay byte-identical to
+// the entry in defaultAllowListContent, or a fresh install and an upgraded one
+// would disagree about what is allowed. A bare `opencode` (interactive TUI),
+// `opencode serve`, `opencode auth ...` and every other raw invocation stay
+// dialog-gated — see the rationale in defaultAllowListContent.
+const openCodeDefaultPattern = "opencode run --format json *"
+
+// ensureOpenCodeDefaults appends the shaped OpenCode headless pattern to the
+// on-disk allow list once, on the first boot after the upgrade. Mirrors
+// ensureGhDefaults, which exists for the same reason: defaults added to the
+// template only ever reach installs that create the file fresh.
+func (al *AllowList) ensureOpenCodeDefaults() error {
+	raw, err := os.ReadFile(al.configPath)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(string(raw), openCodeMigrationMarker) {
+		return nil
+	}
+
+	al.mu.RLock()
+	existing := make(map[string]bool, len(al.patterns))
+	for _, p := range al.patterns {
+		existing[p] = true
+	}
+	al.mu.RUnlock()
+
+	var block strings.Builder
+	block.WriteString("\n")
+	block.WriteString(openCodeMigrationMarker)
+	block.WriteString("\n# --- OpenCode shaped headless run (migrated default) ---\n")
+	if !existing[openCodeDefaultPattern] {
+		block.WriteString(openCodeDefaultPattern)
+		block.WriteString("\n")
 	}
 
 	f, err := os.OpenFile(al.configPath, os.O_APPEND|os.O_WRONLY, 0600)
