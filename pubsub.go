@@ -5636,11 +5636,10 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// entry unmatched and hang a headless run at the approval dialog.
 		if isOpenCodeCommand(cmd.Command) {
 			allowArgs = buildOpenCodeInteractiveArgs(cmd.Args)
-			// Approve the synthesised shape only inside the session_start gate
-			// rather than adding it to the shared execute allowlist. This keeps
-			// raw `execute` requests gated by the approval dialog so they cannot
-			// bypass the OpenCode manager and its environment sanitisation.
-			if !forceNative && isOpenCodeSynthesizedRun(allowArgs) {
+			// Approve the synthesised shape inside session_start ONLY in signed
+			// mode (cfg.CommandSecret != ""). In unsigned mode, an unauthenticated
+			// sender must still go through the approval dialog.
+			if cfg.CommandSecret != "" && !forceNative && isOpenCodeSynthesizedRun(allowArgs) {
 				return true
 			}
 			// "Always" must NOT persist for OpenCode — same reasoning as
@@ -5686,7 +5685,7 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		dialogArgs = allowArgs
 		denyOutput = "antigravity native session denied by user: not in allow list"
 	case "opencode_native_start":
-		if !forceNative {
+		if cfg.CommandSecret != "" && !forceNative {
 			return true
 		}
 		allowCommand = "opencode"

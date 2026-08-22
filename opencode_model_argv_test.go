@@ -118,7 +118,8 @@ func TestOpenCodeSessionStartGate_MatchesSynthesisedArgv(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	defaultAllowList = al
-	cfg := &Config{EnableAllowList: true}
+	signedCfg := &Config{EnableAllowList: true, CommandSecret: "sec-123"}
+	unsignedCfg := &Config{EnableAllowList: true, CommandSecret: ""}
 
 	prevDialog := commandApprovalDialogFn
 	commandApprovalDialogFn = func(string, []string, int) ApprovalResult { return ApprovalDeny }
@@ -127,20 +128,36 @@ func TestOpenCodeSessionStartGate_MatchesSynthesisedArgv(t *testing.T) {
 	rawArgs := []string{"--model", openCodeTestModel, "implement the feature"}
 	shaped := buildOpenCodeInteractiveArgs(rawArgs)
 
-	// Inbound execute request MUST be gated by approval dialog.
-	if !shouldGateExecuteCommand(cfg, al, "opencode", shaped) {
+	// Inbound execute request MUST be gated by approval dialog in both modes.
+	if !shouldGateExecuteCommand(signedCfg, al, "opencode", shaped) {
 		t.Fatalf("raw execute with shaped OpenCode argv skipped gating — it must stay gated")
 	}
 
-	// Session start with synthesised argv MUST be approved without dialog.
+	// Signed session start with synthesised argv MUST be approved without dialog.
 	cmd := commandMsg{Type: "session_start", Command: "opencode", Args: rawArgs}
-	if !gateSessionEntryCommand(nil, nil, nil, cmd, cfg) {
-		t.Fatalf("session_start for synthesised argv %q was not approved", shaped)
+	if !gateSessionEntryCommand(nil, nil, nil, cmd, signedCfg) {
+		t.Fatalf("signed session_start for synthesised argv %q was not approved", shaped)
 	}
 
-	// Unshaped diagnostic session start (e.g. `opencode serve`) stays dialog-gated.
+	// Unsigned session start MUST stay dialog-gated (fails because stub returns ApprovalDeny).
+	if gateSessionEntryCommand(nil, nil, nil, cmd, unsignedCfg) {
+		t.Fatalf("unsigned session_start for synthesised argv %q was auto-approved; it must require local approval", shaped)
+	}
+
+	// Signed opencode_native_start MUST be approved without dialog.
+	nativeCmd := commandMsg{Type: "opencode_native_start", Command: "opencode"}
+	if !gateSessionEntryCommand(nil, nil, nil, nativeCmd, signedCfg) {
+		t.Fatalf("signed opencode_native_start was not approved")
+	}
+
+	// Unsigned opencode_native_start MUST stay dialog-gated.
+	if gateSessionEntryCommand(nil, nil, nil, nativeCmd, unsignedCfg) {
+		t.Fatalf("unsigned opencode_native_start was auto-approved; it must require local approval")
+	}
+
+	// Unshaped diagnostic session start (e.g. `opencode serve`) stays dialog-gated even when signed.
 	serveCmd := commandMsg{Type: "session_start", Command: "opencode", Args: []string{"serve"}}
-	if gateSessionEntryCommand(nil, nil, nil, serveCmd, cfg) {
+	if gateSessionEntryCommand(nil, nil, nil, serveCmd, signedCfg) {
 		t.Errorf("`opencode serve` session_start was auto-approved; it must stay dialog-gated")
 	}
 }
