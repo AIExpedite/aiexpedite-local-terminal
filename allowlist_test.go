@@ -523,17 +523,12 @@ func TestDefaultAllowList_GrokIsNeverDefaultAllowed(t *testing.T) {
 	}
 }
 
-func TestDefaultAllowList_OpenCodeShapedRunOnly(t *testing.T) {
-	// OpenCode is pre-approved ONLY in the shaped headless form the managers
-	// synthesise. This is a deliberately narrower entry than the
-	// `claude *` / `codex *` / `agy *` ones: a bare `opencode` starts the
-	// interactive TUI (which never exits on a headless remote session), and
-	// every other raw `opencode ...` execute would skip the managers' env
-	// sanitisation, cwd containment and session-id pinning.
-	//
-	// gateSessionEntryCommand matches session_start against the SYNTHESISED
-	// argv (buildOpenCodeInteractiveArgs), so the allowed shape below is the
-	// argv the device will actually exec — the two must not drift apart.
+func TestDefaultAllowList_OpenCodeIsNeverDefaultAllowed(t *testing.T) {
+	// The default allowlist must NOT match any `opencode ...` argv. A raw
+	// `execute` of `opencode ...` must still require approval so it cannot
+	// bypass the OpenCode manager's environment sanitisation and cwd containment.
+	// The session_start and opencode_native_start paths are approved inside
+	// gateSessionEntryCommand, so they do NOT need a default allowlist entry.
 	dir := t.TempDir()
 	path := filepath.Join(dir, "allow.txt")
 	al := &AllowList{configPath: path}
@@ -544,163 +539,21 @@ func TestDefaultAllowList_OpenCodeShapedRunOnly(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	allowed := []struct {
-		name string
+	cases := []struct {
+		cmd  string
 		args []string
+		why  string
 	}{
-		{"shaped run with a model", []string{"run", "--format", "json", "--model", "anthropic/claude-sonnet-4-5", "do the thing"}},
-		{"shaped run with a colon-bearing model", []string{"run", "--format", "json", "--model", "ollama/llama3:8b", "do the thing"}},
-		{"shaped run without a model", []string{"run", "--format", "json", "do the thing"}},
-		{"shaped run with a session pin", []string{"run", "--format", "json", "--session", "s-1", "do the thing"}},
+		{"opencode", []string{"run", "--format", "json", "--model", "anthropic/claude-sonnet-4-5", "do the thing"}, "raw shaped run must not bypass approval"},
+		{"opencode", []string{"run", "--format", "json", "do the thing"}, "raw run without model must require approval"},
+		{"opencode", []string{"serve"}, "raw opencode serve must require approval"},
+		{"opencode", nil, "raw bare opencode must require approval"},
+		{"opencode", []string{"auth", "login"}, "opencode auth must require approval"},
+		{"opencode", []string{"models"}, "opencode models must require approval"},
 	}
-	for _, tc := range allowed {
-		if !al.IsAllowed("opencode", tc.args) {
-			t.Errorf("%s: IsAllowed(opencode, %v) = false; want true", tc.name, tc.args)
-		}
-	}
-
-	denied := []struct {
-		name string
-		args []string
-	}{
-		{"bare invocation (interactive TUI)", nil},
-		{"bare invocation, empty args", []string{}},
-		{"serve", []string{"serve"}},
-		{"auth login", []string{"auth", "login"}},
-		{"models probe", []string{"models"}},
-		{"version probe", []string{"--version"}},
-		{"run without the forced json format", []string{"run", "do the thing"}},
-		{"run with a format override", []string{"run", "--format", "text", "do the thing"}},
-	}
-	for _, tc := range denied {
-		if al.IsAllowed("opencode", tc.args) {
-			t.Errorf("%s: IsAllowed(opencode, %v) = true; want false (must stay dialog-gated)", tc.name, tc.args)
-		}
-	}
-}
-
-func TestEnsureOpenCodeDefaults_AppendsForUpgradedInstall(t *testing.T) {
-	// The bug this covers: `opencode run --format json *` was added to
-	// defaultAllowListContent, which only ever runs on a FRESH install. Every
-	// upgraded agent kept an allowed-commands.txt without it, so an
-	// orchestrated session_start hit the native approval dialog and the
-	// headless run hung with nobody at the workstation to answer.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "allow.txt")
-	legacy := "# legacy\ngit\ngit *\nmy-custom-tool *\n"
-	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
-		t.Fatalf("seed legacy allow list: %v", err)
-	}
-
-	al := &AllowList{configPath: path}
-	if err := al.Load(); err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	shaped := buildOpenCodeInteractiveArgs([]string{"--model", openCodeTestModel, "do the thing"})
-	if al.IsAllowed("opencode", shaped) {
-		t.Fatalf("precondition: legacy list should not yet allow the shaped opencode run")
-	}
-
-	if err := al.ensureOpenCodeDefaults(); err != nil {
-		t.Fatalf("ensureOpenCodeDefaults: %v", err)
-	}
-
-	if !al.IsAllowed("opencode", shaped) {
-		t.Errorf("after migration, the shaped headless run must be pre-approved")
-	}
-	if !al.IsAllowed("my-custom-tool", []string{"--flag"}) {
-		t.Errorf("user-added pattern was lost after migration")
-	}
-
-	// The migration must not widen the entry: everything else stays gated.
-	for _, args := range [][]string{
-		nil,
-		{"serve"},
-		{"auth", "login"},
-		{"models"},
-		{"run", "do the thing"},
-		{"run", "--format", "text", "do the thing"},
-	} {
-		if al.IsAllowed("opencode", args) {
-			t.Errorf("migration pre-approved %v; only the shaped run may be allowed", args)
-		}
-	}
-
-	// Idempotency: a second call must not re-append the block.
-	before, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read file: %v", err)
-	}
-	if err := al.ensureOpenCodeDefaults(); err != nil {
-		t.Fatalf("ensureOpenCodeDefaults (second call): %v", err)
-	}
-	after, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read file: %v", err)
-	}
-	if string(before) != string(after) {
-		t.Errorf("ensureOpenCodeDefaults is not idempotent; file changed on second call")
-	}
-}
-
-func TestEnsureOpenCodeDefaults_DoesNotResurrectManualRemoval(t *testing.T) {
-	// Marker-keyed, like the gh migration: an operator who deletes the entry
-	// via Edit Allow List must stay removed across restarts.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "allow.txt")
-	seeded := openCodeMigrationMarker + "\ngit *\n"
-	if err := os.WriteFile(path, []byte(seeded), 0600); err != nil {
-		t.Fatalf("seed allow list: %v", err)
-	}
-
-	al := &AllowList{configPath: path}
-	if err := al.Load(); err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if err := al.ensureOpenCodeDefaults(); err != nil {
-		t.Fatalf("ensureOpenCodeDefaults: %v", err)
-	}
-
-	shaped := buildOpenCodeInteractiveArgs([]string{"--model", openCodeTestModel, "do the thing"})
-	if al.IsAllowed("opencode", shaped) {
-		t.Errorf("a deliberately removed entry was resurrected by the migration")
-	}
-}
-
-func TestEnsureOpenCodeDefaults_MatchesFreshInstallEntry(t *testing.T) {
-	// A fresh install (defaultAllowListContent) and an upgraded one (this
-	// migration) must agree byte-for-byte about what OpenCode may run,
-	// otherwise the two populations diverge silently.
-	dir := t.TempDir()
-	fresh := &AllowList{configPath: filepath.Join(dir, "fresh.txt")}
-	if err := fresh.CreateDefault(); err != nil {
-		t.Fatalf("CreateDefault: %v", err)
-	}
-	if err := fresh.Load(); err != nil {
-		t.Fatalf("Load fresh: %v", err)
-	}
-
-	upgraded := &AllowList{configPath: filepath.Join(dir, "upgraded.txt")}
-	if err := os.WriteFile(upgraded.configPath, []byte("git *\n"), 0600); err != nil {
-		t.Fatalf("seed upgraded: %v", err)
-	}
-	if err := upgraded.Load(); err != nil {
-		t.Fatalf("Load upgraded: %v", err)
-	}
-	if err := upgraded.ensureOpenCodeDefaults(); err != nil {
-		t.Fatalf("ensureOpenCodeDefaults: %v", err)
-	}
-
-	for _, args := range [][]string{
-		{"run", "--format", "json", "--model", openCodeTestModel, "do the thing"},
-		{"run", "--format", "json", "do the thing"},
-		nil,
-		{"serve"},
-		{"--version"},
-	} {
-		if fresh.IsAllowed("opencode", args) != upgraded.IsAllowed("opencode", args) {
-			t.Errorf("fresh and upgraded disagree for %v: fresh=%v upgraded=%v",
-				args, fresh.IsAllowed("opencode", args), upgraded.IsAllowed("opencode", args))
+	for _, tc := range cases {
+		if al.IsAllowed(tc.cmd, tc.args) {
+			t.Errorf("IsAllowed(%q, %v) = true; want false (%s)", tc.cmd, tc.args, tc.why)
 		}
 	}
 }

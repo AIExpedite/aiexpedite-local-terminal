@@ -1050,6 +1050,9 @@ func publishCLIUsageRefreshFailure(ctx context.Context, topic *pubsub.Publisher,
 // publishMsg marshals res and publishes it on topic using ctx.
 // Logs and returns any error so callers can decide whether to ack or nack.
 func publishMsg(ctx context.Context, topic *pubsub.Publisher, res resultMsg) error {
+	if topic == nil {
+		return nil
+	}
 	bytes, err := json.Marshal(res)
 	if err != nil {
 		fmt.Printf("%s[aiexpedite] Failed to marshal result: %v%s\n", colorRed, err, colorReset)
@@ -5633,17 +5636,20 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		// entry unmatched and hang a headless run at the approval dialog.
 		if isOpenCodeCommand(cmd.Command) {
 			allowArgs = buildOpenCodeInteractiveArgs(cmd.Args)
+			// Approve the synthesised shape only inside the session_start gate
+			// rather than adding it to the shared execute allowlist. This keeps
+			// raw `execute` requests gated by the approval dialog so they cannot
+			// bypass the OpenCode manager and its environment sanitisation.
+			if !forceNative && isOpenCodeSynthesizedRun(allowArgs) {
+				return true
+			}
 			// "Always" must NOT persist for OpenCode — same reasoning as
 			// grok_acp_start below. GeneratePatternFromCommand ignores args and
 			// returns `<cmd> *`, so a single "Always" click on any dialog-gated
 			// opencode invocation (a diagnostic like `opencode models`, an
 			// `opencode serve`, or a signed high-risk setup step) would persist
 			// a blanket `opencode *` — permanently pre-approving the bare
-			// interactive TUI and every raw invocation, i.e. undoing the
-			// deliberately narrow `opencode run --format json *` default entry.
-			// The shaped headless form already matches that entry without a
-			// dialog, so nothing legitimate needs the persistence. Treat
-			// "Always" as one-time.
+			// interactive TUI and every raw invocation. Treat "Always" as one-time.
 			persistOnAlways = false
 		}
 		dialogArgs = allowArgs
@@ -5680,13 +5686,9 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 		dialogArgs = allowArgs
 		denyOutput = "antigravity native session denied by user: not in allow list"
 	case "opencode_native_start":
-		// Gate against `opencode` so an operator who has approved `opencode *`
-		// covers native-chat access too. Start only registers the logical
-		// session; the per-turn argv is built later in Send. Gate and DISPLAY
-		// the same argv shape runOneShot will execute so a narrowed allowlist
-		// cannot approve one launch shape while another actually runs. The
-		// prompt is deliberately absent — it goes to a temp file consumed on
-		// stdin, never argv.
+		if !forceNative {
+			return true
+		}
 		allowCommand = "opencode"
 		allowArgs = buildOpenCodeNativeArgs("")
 		dialogArgs = allowArgs
@@ -5784,10 +5786,14 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 			"ALLOWLIST_DENIED",
 			denyOutput,
 		)
-		if err := publishMsg(ctx, topic, res); err != nil {
-			m.Nack()
+		if m != nil {
+			if err := publishMsg(ctx, topic, res); err != nil {
+				m.Nack()
+			} else {
+				m.Ack()
+			}
 		} else {
-			m.Ack()
+			_ = publishMsg(ctx, topic, res)
 		}
 		return false
 	case ApprovalAlways:

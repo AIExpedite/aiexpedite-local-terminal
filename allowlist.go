@@ -64,15 +64,6 @@ func InitAllowList() (*AllowList, error) {
 		log.Printf("allowlist: gemini removal migration failed, continuing with existing list: %v", err)
 	}
 
-	// Add the shaped OpenCode headless pattern to upgraded installs. Without
-	// this, defaultAllowListContent only reaches FRESH installs, so every
-	// existing agent would hit the native approval dialog on an orchestrated
-	// `session_start` — with nobody at the workstation to answer it, the
-	// headless run just hangs. Same best-effort contract as the two above.
-	if err := al.ensureOpenCodeDefaults(); err != nil {
-		log.Printf("allowlist: opencode defaults migration failed, continuing with existing list: %v", err)
-	}
-
 	defaultAllowList = al
 	return al, nil
 }
@@ -113,64 +104,6 @@ func (al *AllowList) ensureGhDefaults() error {
 			block.WriteString(p)
 			block.WriteString("\n")
 		}
-	}
-
-	f, err := os.OpenFile(al.configPath, os.O_APPEND|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	if _, err := f.WriteString(block.String()); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-
-	return al.Load()
-}
-
-// openCodeMigrationMarker is written into allowed-commands.txt once the
-// OpenCode migration has run. Keying off a marker (rather than the presence of
-// the pattern) makes it one-shot, so an operator who deliberately removes the
-// entry via Edit Allow List stays removed across restarts.
-const openCodeMigrationMarker = "# allowlist-migration: opencode-defaults-v1"
-
-// openCodeDefaultPattern is the ONLY OpenCode form that is pre-approved: the
-// shaped headless run the managers synthesise. It must stay byte-identical to
-// the entry in defaultAllowListContent, or a fresh install and an upgraded one
-// would disagree about what is allowed. A bare `opencode` (interactive TUI),
-// `opencode serve`, `opencode auth ...` and every other raw invocation stay
-// dialog-gated — see the rationale in defaultAllowListContent.
-const openCodeDefaultPattern = "opencode run --format json *"
-
-// ensureOpenCodeDefaults appends the shaped OpenCode headless pattern to the
-// on-disk allow list once, on the first boot after the upgrade. Mirrors
-// ensureGhDefaults, which exists for the same reason: defaults added to the
-// template only ever reach installs that create the file fresh.
-func (al *AllowList) ensureOpenCodeDefaults() error {
-	raw, err := os.ReadFile(al.configPath)
-	if err != nil {
-		return err
-	}
-	if strings.Contains(string(raw), openCodeMigrationMarker) {
-		return nil
-	}
-
-	al.mu.RLock()
-	existing := make(map[string]bool, len(al.patterns))
-	for _, p := range al.patterns {
-		existing[p] = true
-	}
-	al.mu.RUnlock()
-
-	var block strings.Builder
-	block.WriteString("\n")
-	block.WriteString(openCodeMigrationMarker)
-	block.WriteString("\n# --- OpenCode shaped headless run (migrated default) ---\n")
-	if !existing[openCodeDefaultPattern] {
-		block.WriteString(openCodeDefaultPattern)
-		block.WriteString("\n")
 	}
 
 	f, err := os.OpenFile(al.configPath, os.O_APPEND|os.O_WRONLY, 0600)
@@ -720,28 +653,11 @@ agy *
 # manager's EnableGrokAPIKeyFallback / EnableGrokAlwaysApprove / env
 # sanitisation.
 #
-# OpenCode is pre-approved ONLY in its shaped headless form.
-#
-# "opencode run --format json *" is the exact argv shape the managers
-# synthesise and the only one they will ever execute: "run --format json" is
-# forced, and a caller token that would re-enter the interactive TUI (a bare
-# invocation, a second "run", a "--format" override) is stripped. Orchestrated
-# work reaches the device as a session_start, which gateSessionEntryCommand
-# gates against that SYNTHESISED argv (the codex_appserver_start precedent), so
-# this entry and the argv the device actually execs are the same string. Without
-# it a headless orchestration run stops at the native approval dialog with
-# nobody at the workstation to answer it.
-#
-# Everything else stays dialog-gated, deliberately and narrowly:
-#   - a bare "opencode" starts the interactive TUI, which on a headless remote
-#     session emits escape-sequence noise and never exits;
-#   - "opencode serve", "opencode auth ...", "opencode models" and every other
-#     raw "opencode ..." execute would skip the managers' env sanitisation, cwd
-#     containment and session-id pinning.
-#
-# This is narrower than the "claude *" / "codex *" / "agy *" entries above,
-# which pre-approve any subcommand of those binaries.
-opencode run --format json *
+# No "opencode" / "opencode *" / "opencode run --format json *" entries: the
+# session manager owns OpenCode execution. gateSessionEntryCommand approves
+# the synthesised shape on session_start, so it does not need a default
+# allowlist match, and a raw execute of "opencode ..." stays gated by the
+# approval dialog so it cannot bypass the manager's env sanitisation.
 
 # --- Remote/SSH ---
 ssh *

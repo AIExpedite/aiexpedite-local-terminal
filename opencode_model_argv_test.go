@@ -107,8 +107,8 @@ func TestBuildOpenCodeInteractiveArgs_DiagnosticsPassThroughUnshaped(t *testing.
 
 func TestOpenCodeSessionStartGate_MatchesSynthesisedArgv(t *testing.T) {
 	// The composition gateSessionEntryCommand performs for a session_start:
-	// shape the caller's args, THEN match the allowlist. Gating the raw args
-	// instead leaves the narrow default entry unmatched.
+	// shape the caller's args, and approve the synthesised shape inside
+	// the session_start gate while keeping the shared execute allowlist closed.
 	dir := t.TempDir()
 	al := &AllowList{configPath: filepath.Join(dir, "allow.txt")}
 	if err := al.CreateDefault(); err != nil {
@@ -117,22 +117,31 @@ func TestOpenCodeSessionStartGate_MatchesSynthesisedArgv(t *testing.T) {
 	if err := al.Load(); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
+	defaultAllowList = al
+	cfg := &Config{EnableAllowList: true}
+
+	prevDialog := commandApprovalDialogFn
+	commandApprovalDialogFn = func(string, []string, int) ApprovalResult { return ApprovalDeny }
+	t.Cleanup(func() { commandApprovalDialogFn = prevDialog })
 
 	rawArgs := []string{"--model", openCodeTestModel, "implement the feature"}
+	shaped := buildOpenCodeInteractiveArgs(rawArgs)
 
-	if al.IsAllowed("opencode", rawArgs) {
-		t.Fatalf("raw orchestration args were allowlisted directly — the shaping step is doing nothing")
-	}
-	if !al.IsAllowed("opencode", buildOpenCodeInteractiveArgs(rawArgs)) {
-		t.Fatalf("synthesised argv %q is not allowlisted; a headless run would hang at the approval dialog",
-			buildOpenCodeInteractiveArgs(rawArgs))
+	// Inbound execute request MUST be gated by approval dialog.
+	if !shouldGateExecuteCommand(cfg, al, "opencode", shaped) {
+		t.Fatalf("raw execute with shaped OpenCode argv skipped gating — it must stay gated")
 	}
 
-	// The gate must not become a blanket `opencode *`: a raw interactive
-	// invocation stays dialog-gated even after shaping (it is a diagnostic, so
-	// shaping passes it through untouched).
-	if al.IsAllowed("opencode", buildOpenCodeInteractiveArgs([]string{"serve"})) {
-		t.Errorf("`opencode serve` became pre-approved; it must stay dialog-gated")
+	// Session start with synthesised argv MUST be approved without dialog.
+	cmd := commandMsg{Type: "session_start", Command: "opencode", Args: rawArgs}
+	if !gateSessionEntryCommand(nil, nil, nil, cmd, cfg) {
+		t.Fatalf("session_start for synthesised argv %q was not approved", shaped)
+	}
+
+	// Unshaped diagnostic session start (e.g. `opencode serve`) stays dialog-gated.
+	serveCmd := commandMsg{Type: "session_start", Command: "opencode", Args: []string{"serve"}}
+	if gateSessionEntryCommand(nil, nil, nil, serveCmd, cfg) {
+		t.Errorf("`opencode serve` session_start was auto-approved; it must stay dialog-gated")
 	}
 }
 

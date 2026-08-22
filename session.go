@@ -1575,6 +1575,12 @@ func isOpenCodeCommand(command string) bool {
 	return strings.HasPrefix(commandBaseName(command), "opencode")
 }
 
+// isOpenCodeSynthesizedRun reports whether args match the forced one-shot
+// `run --format json ...` shape that buildOpenCodeInteractiveArgs produces.
+func isOpenCodeSynthesizedRun(args []string) bool {
+	return len(args) >= 3 && args[0] == "run" && args[1] == "--format" && args[2] == "json"
+}
+
 // isResidentAgentSessionCommand reports whether a session_start command is a
 // resident CLI agent that keeps its interactive-capable env. These are exactly
 // the commands buildInteractiveCLIArgs shapes (claude/codex/grok) plus the
