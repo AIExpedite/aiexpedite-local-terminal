@@ -243,3 +243,61 @@ func TestGateSessionEntryCommand_AllowAllOffStillGatesUnknownKinds(t *testing.T)
 		}
 	}
 }
+
+func TestGateSessionEntryCommand_OpenCodeAlwaysDoesNotPersistBlanketPattern(t *testing.T) {
+	// GeneratePatternFromCommand ignores args and returns `<cmd> *`, so a
+	// single "Always" click on ANY dialog-gated opencode invocation would
+	// persist a blanket `opencode *` — permanently pre-approving the bare
+	// interactive TUI (which never exits on a headless remote session),
+	// `opencode serve`, `opencode auth login`, and every other raw invocation.
+	// That silently undoes the deliberately narrow
+	// `opencode run --format json *` default entry, so "Always" must degrade to
+	// a one-time approval here exactly as it does for grok_acp_start.
+	prevList := defaultAllowList
+	al := writableRestrictiveAllowList(t)
+	defaultAllowList = al
+	t.Cleanup(func() { defaultAllowList = prevList })
+
+	prevDialog := commandApprovalDialogFn
+	commandApprovalDialogFn = func(string, []string, int) ApprovalResult { return ApprovalAlways }
+	t.Cleanup(func() { commandApprovalDialogFn = prevDialog })
+
+	cfg := &Config{EnableAllowList: true}
+	cfg.SetAllowAllCommands(false)
+
+	// A diagnostic invocation: buildOpenCodeInteractiveArgs passes it through
+	// unshaped, so it does NOT match the narrow default entry and DOES reach
+	// the dialog — the realistic route to an "Always" click.
+	serveCmd := commandMsg{
+		ID:      "oc",
+		Type:    "session_start",
+		Command: "opencode",
+		Args:    []string{"serve"},
+	}
+	if !gateSessionEntryCommand(context.Background(), nil, nil, serveCmd, cfg) {
+		t.Fatalf("opencode session_start with Always approval should pass through (return true)")
+	}
+
+	for _, p := range al.patterns {
+		if p == "opencode *" {
+			t.Fatalf("allow list gained %q after an opencode Always; the narrow entry is undone", p)
+		}
+	}
+	// The concrete consequences of that pattern, asserted directly.
+	if al.IsAllowed("opencode", nil) {
+		t.Errorf("bare `opencode` (interactive TUI) became pre-approved after Always")
+	}
+	if al.IsAllowed("opencode", []string{"auth", "login"}) {
+		t.Errorf("`opencode auth login` became pre-approved after Always")
+	}
+
+	// Control: a plain session_start Always still persists, so the persistence
+	// branch is genuinely reached and the assertions above are meaningful.
+	sessCmd := commandMsg{ID: "s", Type: "session_start", Command: "mytool", Args: []string{"--go"}}
+	if !gateSessionEntryCommand(context.Background(), nil, nil, sessCmd, cfg) {
+		t.Fatalf("session_start with Always approval should pass through")
+	}
+	if !al.IsAllowed("mytool", []string{"--go"}) {
+		t.Errorf("session_start Always did not persist `mytool *`; persistence path is dead, so the opencode assertion proves nothing")
+	}
+}

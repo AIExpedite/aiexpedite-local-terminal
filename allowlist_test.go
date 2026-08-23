@@ -522,3 +522,38 @@ func TestDefaultAllowList_GrokIsNeverDefaultAllowed(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultAllowList_OpenCodeIsNeverDefaultAllowed(t *testing.T) {
+	// The default allowlist must NOT match any `opencode ...` argv. A raw
+	// `execute` of `opencode ...` must still require approval so it cannot
+	// bypass the OpenCode manager's environment sanitisation and cwd containment.
+	// The session_start and opencode_native_start paths are approved inside
+	// gateSessionEntryCommand, so they do NOT need a default allowlist entry.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "allow.txt")
+	al := &AllowList{configPath: path}
+	if err := al.CreateDefault(); err != nil {
+		t.Fatalf("CreateDefault: %v", err)
+	}
+	if err := al.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	cases := []struct {
+		cmd  string
+		args []string
+		why  string
+	}{
+		{"opencode", []string{"run", "--format", "json", "--model", "anthropic/claude-sonnet-4-5", "do the thing"}, "raw shaped run must not bypass approval"},
+		{"opencode", []string{"run", "--format", "json", "do the thing"}, "raw run without model must require approval"},
+		{"opencode", []string{"serve"}, "raw opencode serve must require approval"},
+		{"opencode", nil, "raw bare opencode must require approval"},
+		{"opencode", []string{"auth", "login"}, "opencode auth must require approval"},
+		{"opencode", []string{"models"}, "opencode models must require approval"},
+	}
+	for _, tc := range cases {
+		if al.IsAllowed(tc.cmd, tc.args) {
+			t.Errorf("IsAllowed(%q, %v) = true; want false (%s)", tc.cmd, tc.args, tc.why)
+		}
+	}
+}
