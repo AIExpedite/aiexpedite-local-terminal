@@ -593,6 +593,23 @@ type commandMsg struct {
 	PlanID    string `json:"planId,omitempty"`    // env-setup plan id (audit correlation)
 	StepID    string `json:"stepId,omitempty"`    // env-setup step id (audit correlation)
 
+	// Durable CLI conversation id to RESUME on a session start whose kind keeps
+	// its conversation on this device's filesystem (antigravity_native_start
+	// today). Empty = start a fresh conversation.
+	//
+	// Claude needs no equivalent field: its resume travels as an ordinary
+	// `--resume=<id>` entry in Args, which is already signed.
+	//
+	// UNSIGNED, deliberately, matching `Cwd` on the same session-start commands.
+	// The two are the same class of routing metadata and cwd is strictly the
+	// more powerful of the pair (it selects any directory on the device, while
+	// this selects among conversations agy already holds), so signing this one
+	// while cwd stays unsigned would be inconsistent rather than protective.
+	// If the session-start routing metadata is ever brought under the HMAC, both
+	// belong in that change together — see signaturePayload's notes on adding a
+	// field compatibly.
+	ConversationID string `json:"conversationId,omitempty"`
+
 	// Tty opts an execute/session command into the PTY path (macOS/Linux only)
 	// for interactive/TUI CLIs (e.g. agy). Default false = the hardened pipe
 	// path. Unsigned metadata (like WorkspaceID/UID): flipping it cannot bypass
@@ -687,6 +704,25 @@ type resultMsg struct {
 	// Structured terminal error code. Kept separate from Output so consumers
 	// never infer GROK_NOT_AUTHENTICATED from free-form CLI text.
 	ErrorCode string `json:"errorCode,omitempty"`
+
+	// Durable CLI conversation id for a resident kind whose conversation lives
+	// on THIS device's filesystem and whose id the cloud cannot otherwise learn.
+	//
+	// Antigravity is the only such kind today. Claude publishes its `session_id`
+	// inside the stream-json `system init` frame that claude_native_message
+	// already forwards verbatim, and Grok's arrives in the ACP handshake the
+	// ai-service tool reads — both are observable server-side without a
+	// dedicated field. `agy` mints its own UUID and records it only in
+	// ~/.gemini/antigravity-cli/cache/last_conversations.json, so without this
+	// field terminal-service has nothing to commit and an Antigravity session can
+	// never become conversation-resumable (its per-session eligibility predicate
+	// fails closed on the missing snapshot).
+	//
+	// Published on antigravity_native_message only AFTER a turn is known to have
+	// succeeded, matching where NativeConversationID itself is adopted: an id
+	// captured from a failed turn would resume a conversation containing a
+	// hidden turn the UI and the replay transcript never saw.
+	ConversationID string `json:"conversationId,omitempty"`
 }
 
 /*
@@ -6286,6 +6322,7 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			cmd.Cwd,
 			cmd.WorkspaceID,
 			cmd.UID,
+			cmd.ConversationID,
 			publishFn,
 			onStarted,
 		)
