@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -3314,6 +3315,87 @@ func TestGatherCLIAgentUsageOnly_CapsProvidersBeforeReceiptSigning(t *testing.T)
 		t.Fatalf("capped provider snapshot should sign successfully: %v", err)
 	} else if len(normalized) != cliUsageMaxProviders {
 		t.Fatalf("signed %d providers, want %d", len(normalized), cliUsageMaxProviders)
+	}
+}
+
+func TestGatherCLIAgentUsageOnly_GrokMetricSurvivesCLIUpdate(t *testing.T) {
+	realHome := t.TempDir()
+	seedGrokHomeWithLogin(t, realHome)
+	t.Setenv("GROK_HOME", realHome)
+	t.Setenv("XAI_API_KEY", "")
+	if err := writeMockGrokBillingEvidence(); err != nil {
+		t.Fatalf("write billing evidence: %v", err)
+	}
+
+	SetCLIAgentCatalog([]cliAgentCatalogEntry{{
+		ID:          "grok",
+		DisplayName: "Grok Build",
+		Command:     "grok",
+	}})
+	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
+	resetVersionProbeCache()
+	t.Cleanup(resetVersionProbeCache)
+
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	install := func(mode string) string {
+		t.Helper()
+		dir := t.TempDir()
+		name := "grok"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		path := filepath.Join(dir, name)
+		if err := copyTestBinary(testExe, path); err != nil {
+			t.Fatalf("copy %s: %v", mode, err)
+		}
+		return dir
+	}
+
+	firstDir := install("grok-version-v1")
+	t.Setenv("PATH", firstDir)
+	t.Setenv(mockCLIEnvVar, "grok-version-v1")
+	first, errs := GatherCLIAgentUsageOnly(context.Background())
+	if len(errs) != 0 || len(first) != 1 || len(first[0].Metrics) != 1 {
+		t.Fatalf("first refresh = usage %+v errors %+v", first, errs)
+	}
+	wantMetric, err := json.Marshal(first[0].Metrics[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first[0].Metrics[0].ObservedAt == "" || !first[0].Metrics[0].Unknown {
+		t.Fatalf("first refresh did not expose confirmed-unmetered freshness: %+v", first[0].Metrics[0])
+	}
+
+	secondDir := install("grok-version-v2")
+	t.Setenv("PATH", secondDir)
+	t.Setenv(mockCLIEnvVar, "grok-version-v2")
+	resetVersionProbeCache()
+	second, errs := GatherCLIAgentUsageOnly(context.Background())
+	if len(errs) != 0 || len(second) != 1 || len(second[0].Metrics) != 1 {
+		t.Fatalf("second refresh = usage %+v errors %+v", second, errs)
+	}
+	gotMetric, err := json.Marshal(second[0].Metrics[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotMetric) != string(wantMetric) {
+		t.Fatalf("billing metric changed across CLI replacement:\nfirst  %s\nsecond %s", wantMetric, gotMetric)
+	}
+	if first[0].Path == second[0].Path || first[0].Version == second[0].Version {
+		t.Fatalf("test did not exercise a detected CLI update: first=%s %s second=%s %s",
+			first[0].Path, first[0].Version, second[0].Path, second[0].Version)
+	}
+	out, err := json.Marshal(second[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"credential-sentinel", "prompt-sentinel", "raw-config-sentinel"} {
+		if strings.Contains(string(out), secret) {
+			t.Fatalf("refresh output leaked %q: %s", secret, out)
+		}
 	}
 }
 

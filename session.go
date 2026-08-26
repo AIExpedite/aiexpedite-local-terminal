@@ -996,7 +996,10 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				captureCodexRateLimitLine(line.text, time.Now())
 			}
 
-			// Grok usage-limit telemetry: xAI exposes no numeric quota, but the
+			// Grok notice telemetry: live stdout is deliberately notice-only.
+			// Numeric and confirmed-unmetered usage comes from the account-bound
+			// billing log, never arbitrary response or tool-result fields. xAI
+			// exposes no numeric quota here, but the
 			// server volunteers a discrete `usage_limit_reached` / credit-limit /
 			// access-gate frame on the streaming-json output when you near or hit
 			// the cap. Capture it (best-effort) so the CLI Agents card can show a
@@ -1431,6 +1434,18 @@ var claudeBillingStripped = []string{
 	"ANTHROPIC_AUTH_TOKEN=",
 }
 
+// openCodeUnrelatedStripped is the set of other agents' credentials stripped
+// from spawned OpenCode sessions so remotely prompted tools cannot read unrelated
+// provider secrets. Matches sanitizeOpenCodeEnv in opencode_native.go.
+var openCodeUnrelatedStripped = []string{
+	"CLAUDECODE=",
+	"CLAUDE_",
+	"ANTHROPIC_",
+	"CODEX_",
+	"XAI_",
+	"GROK_",
+}
+
 // sanitizeClaudeChildEnv returns env with any variable that would confuse a
 // spawned CLI agent (or, for claude specifically, would override the user's
 // subscription credentials) removed. The second return value lists the names
@@ -1439,9 +1454,11 @@ var claudeBillingStripped = []string{
 //
 // The billing-var strip is gated on isClaudeCommand(command): codex
 // / arbitrary shells are unaffected so they keep working with whatever auth
-// the user has configured for those tools.
+// the user has configured for those tools. OpenCode sessions strip unrelated
+// credentials via openCodeUnrelatedStripped.
 func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 	stripClaudeBilling := isClaudeCommand(command)
+	stripOpenCodeUnrelated := isOpenCodeCommand(command)
 
 	filtered := make([]string, 0, len(env))
 	var stripped []string
@@ -1457,6 +1474,14 @@ func sanitizeClaudeChildEnv(command string, env []string) ([]string, []string) {
 		}
 		if !drop && stripClaudeBilling {
 			for _, p := range claudeBillingStripped {
+				if strings.HasPrefix(upper, p) {
+					drop = true
+					break
+				}
+			}
+		}
+		if !drop && stripOpenCodeUnrelated {
+			for _, p := range openCodeUnrelatedStripped {
 				if strings.HasPrefix(upper, p) {
 					drop = true
 					break
@@ -1573,6 +1598,12 @@ func isAntigravityCommand(command string) bool {
 // interactive-mode argv.
 func isOpenCodeCommand(command string) bool {
 	return strings.HasPrefix(commandBaseName(command), "opencode")
+}
+
+// isOpenCodeSynthesizedRun reports whether args match the forced one-shot
+// `run --format json ...` shape that buildOpenCodeInteractiveArgs produces.
+func isOpenCodeSynthesizedRun(args []string) bool {
+	return len(args) >= 3 && args[0] == "run" && args[1] == "--format" && args[2] == "json"
 }
 
 // isResidentAgentSessionCommand reports whether a session_start command is a

@@ -107,14 +107,16 @@ func TestGrokCardReportsTheCurrentPeriodWithUsageUnobservable(t *testing.T) {
 	if want := "2026-08-24T22:28:32Z"; m.ResetAt != want {
 		t.Fatalf("ResetAt = %q, want the CURRENT period %q", m.ResetAt, want)
 	}
-	// Nothing was observed, so nothing may claim to have been: the stale
-	// "Last observed 6 days ago" is exactly the symptom this fixes.
-	if m.ObservedAt != "" {
-		t.Fatalf("ObservedAt = %q, want empty for an unobserved period", m.ObservedAt)
+	// No number was exposed, but the provider did freshly confirm the current
+	// unmetered period. The timestamp distinguishes that from a placeholder.
+	if m.ObservedAt != "2026-08-17T23:02:12Z" {
+		t.Fatalf("ObservedAt = %q, want the confirmed-unmetered observation", m.ObservedAt)
 	}
 	if m.Label != "Weekly credits" || m.Kind != limitKindWeekly {
 		t.Fatalf("metric label/kind = %q/%q, want the weekly credits row", m.Label, m.Kind)
 	}
+	assertGrokMetricsJSON(t, metrics,
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","resetAt":"2026-08-24T22:28:32Z","observedAt":"2026-08-17T23:02:12Z","unknown":true}]`)
 }
 
 // A legacy-only log must be unaffected — installs that have not upgraded keep
@@ -137,6 +139,8 @@ func TestGrokBillingStillPlotsALegacyRecord(t *testing.T) {
 	if m.ObservedAt != "2026-08-13T15:49:37Z" {
 		t.Fatalf("ObservedAt = %q, want the record's own timestamp", m.ObservedAt)
 	}
+	assertGrokMetricsJSON(t, []cliAgentUsageMetric{m},
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","total":100,"remaining":67,"consumed":33,"resetAt":"2026-08-17T22:28:32Z","observedAt":"2026-08-13T15:49:37Z"}]`)
 }
 
 // An ended period stays Unknown and keeps its observation time — that row is
@@ -197,9 +201,9 @@ func TestGrokOnDemandSurvivesAMissingUsagePercent(t *testing.T) {
 // A NaN percentage is not a reading. Guarding it here keeps a malformed line
 // from plotting a nonsense bar.
 func TestGrokNaNUsagePercentIsNotAReading(t *testing.T) {
-	rec := grokBillingRecord{TS: "2026-08-17T23:02:12.510Z", Msg: grokBillingLogMessage}
+	rec := grokBillingRecord{TS: "2026-08-17T23:02:12.510Z"}
 	nan := math.NaN()
-	rec.Ctx.Config.CreditUsagePercent = &nan
+	rec.Ctx.Config.CreditUsagePercent = grokBillingNumber{Value: nan, Valid: true}
 	rec.Ctx.Config.CurrentPeriod.Type = "USAGE_PERIOD_TYPE_WEEKLY"
 
 	snap, ok := grokBillingSnapshotFromRecord(rec)
@@ -214,7 +218,7 @@ func TestGrokNaNUsagePercentIsNotAReading(t *testing.T) {
 // A record with no parseable timestamp is still refused: without `ts` there is
 // no observation time, and the scan must keep looking.
 func TestGrokRecordWithoutATimestampIsRefused(t *testing.T) {
-	rec := grokBillingRecord{Msg: grokBillingLogMessage}
+	rec := grokBillingRecord{}
 	rec.Ctx.Config.CurrentPeriod.Type = "USAGE_PERIOD_TYPE_WEEKLY"
 
 	if _, ok := grokBillingSnapshotFromRecord(rec); ok {

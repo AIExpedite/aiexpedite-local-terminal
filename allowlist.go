@@ -653,15 +653,11 @@ agy *
 # manager's EnableGrokAPIKeyFallback / EnableGrokAlwaysApprove / env
 # sanitisation.
 #
-# Same reasoning, same absence, for "opencode": OpenCodeNativeManager
-# synthesises the ONLY argv it will execute ("opencode run --format json
-# [--session <id>]") and delivers the prompt on stdin from a temp file, never
-# argv. opencode_native_start is gated against that exact synthesised shape by
-# gateSessionEntryCommand, so no default entry is needed for it; a raw
-# "opencode ..." execute therefore stays behind the approval dialog rather than
-# being pre-approved into a path that skips the manager's env sanitisation, cwd
-# containment and session-id pinning. A bare "opencode" would also start the
-# interactive TUI, which on a headless remote session never exits.
+# No "opencode" / "opencode *" / "opencode run --format json *" entries: the
+# session manager owns OpenCode execution. gateSessionEntryCommand approves
+# the synthesised shape on session_start, so it does not need a default
+# allowlist match, and a raw execute of "opencode ..." stays gated by the
+# approval dialog so it cannot bypass the manager's env sanitisation.
 
 # --- Remote/SSH ---
 ssh *

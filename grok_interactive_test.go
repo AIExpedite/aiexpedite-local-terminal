@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -961,5 +964,63 @@ func TestGrokLimitStateFromFrame_SessionUpdate(t *testing.T) {
 	st, ok = grokLimitStateFromFrame(frameSnake, now)
 	if !ok || st.Severity != grokLimitApproaching {
 		t.Fatalf("want approaching from snake_case session_update, got ok=%v sev=%q", ok, st.Severity)
+	}
+}
+
+func TestCaptureGrokUsageLimitLine_RemainsNoticeOnly(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "grok_usage_limit.json")
+	t.Setenv("AIEXPEDITE_GROK_LIMIT_CACHE", cache)
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+
+	for _, line := range []string{
+		`{"ts":"2026-08-17T23:02:12Z","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":33}}}`,
+		`{"type":"tool_result","credit_limit_percent":42,"used":12,"credits":50,"credential":"secret"}`,
+	} {
+		captureGrokUsageLimitLine(line, now)
+	}
+	if _, err := os.Stat(cache); !os.IsNotExist(err) {
+		t.Fatalf("billing-shaped and generic numeric ACP frames must not write the notice cache: %v", err)
+	}
+}
+
+func TestWriteGrokUsageLimitState_ReachedWinsUntilTTL(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "grok_usage_limit.json")
+	fingerprint := "account-fingerprint"
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	writeGrokUsageLimitState(cache, grokUsageLimitState{
+		Severity:     grokLimitReached,
+		ObservedAt:   now.Format(time.RFC3339),
+		ObservedAtMs: now.UnixMilli(),
+	}, fingerprint)
+	later := now.Add(time.Minute)
+	writeGrokUsageLimitState(cache, grokUsageLimitState{
+		Severity:     grokLimitApproaching,
+		ObservedAt:   later.Format(time.RFC3339),
+		ObservedAtMs: later.UnixMilli(),
+	}, fingerprint)
+
+	raw, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got grokUsageLimitState
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Severity != grokLimitReached || got.ObservedAtMs != later.UnixMilli() {
+		t.Fatalf("fresh approaching notice downgraded reached state: %+v", got)
+	}
+
+	before, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeGrokUsageLimitState(cache, grokUsageLimitState{ObservedAtMs: later.Add(time.Minute).UnixMilli()}, fingerprint)
+	after, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("severity-empty notice write must be rejected")
 	}
 }

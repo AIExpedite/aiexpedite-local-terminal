@@ -176,12 +176,16 @@ type GrokACPSession struct {
 	// class as terminal-service §8.5). Always set on a started session.
 	WorkspaceRoot string
 	// IsolatedHome is the per-session temp dir Start points the child's
-	// GROK_HOME at (a copy of the real auth file + a minimal clean
-	// config.toml). It is removed best-effort exactly once, after the child
-	// has exited (waitForExit), so we never delete the copied auth.json out
-	// from under a running grok process. Always set on a successfully started
-	// session because Start fails closed when isolation can't be established.
+	// GROK_HOME at: copied auth, a minimal clean config, a persistent sessions
+	// link, and a session-private billing log. It is removed best-effort exactly
+	// once after the child exits, so copied auth is never deleted from under a
+	// running process. Always set on a successfully started session because
+	// Start fails closed when isolation cannot be built.
 	IsolatedHome string
+	// PersistentHome is the real Grok home captured alongside the auth copy.
+	// waitForExit merges only the session's normalized account-bound billing
+	// snapshot here; the child never receives this path as its log directory.
+	PersistentHome string
 
 	mu           sync.Mutex
 	status       string // "running" | "ended"
@@ -398,8 +402,9 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// `--config` / `--permission-mode` / `--no-auto-update` with "unexpected
 	// argument", so the entire persisted-config-clear-via-argv approach is
 	// dead). Instead we point the child at a per-session temp dir that
-	// contains ONLY a copy of the real `grok login` auth file plus a minimal
-	// clean config.toml. By NOT copying the user's real config.toml /
+	// contains only copied auth, a minimal clean config.toml, a narrow link to
+	// persistent conversations, and a private billing log. By NOT copying the
+	// user's real config.toml /
 	// requirements.toml we neutralise every persisted-config vector by
 	// omission: no `api_key` billing override, no auto-approve / permission
 	// bypass, no pinned requirements layer. The cached-token handshake still
@@ -407,7 +412,8 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// Fail closed if isolation can't be established: with `--config` gone, the
 	// argv has no neutralizers, so launching with the inherited (potentially
 	// unsafe) GROK_HOME would silently bypass the workspace's opt-in gates.
-	isolatedHome, err := setupIsolatedGrokHome(opts.AllowAPIKeyFallback, resolvedModel)
+	persistentHome := grokPersistentHome()
+	isolatedHome, err := setupIsolatedGrokHomeFrom(opts.AllowAPIKeyFallback, resolvedModel, persistentHome)
 	if err != nil {
 		return fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)
 	}
@@ -487,21 +493,22 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	}
 
 	session := &GrokACPSession{
-		ID:            id,
-		Process:       proc,
-		Stdin:         stdin,
-		Stdout:        stdout,
-		Stderr:        stderr,
-		StartedAt:     time.Now(),
-		WorkspaceID:   workspaceID,
-		UID:           uid,
-		TimeoutMs:     timeoutMs,
-		WorkspaceRoot: resolvedRoot,
-		IsolatedHome:  isolatedHome,
-		status:        "running",
-		done:          make(chan struct{}),
-		streamDone:    make(chan struct{}),
-		firstFrame:    make(chan struct{}),
+		ID:             id,
+		Process:        proc,
+		Stdin:          stdin,
+		Stdout:         stdout,
+		Stderr:         stderr,
+		StartedAt:      time.Now(),
+		WorkspaceID:    workspaceID,
+		UID:            uid,
+		TimeoutMs:      timeoutMs,
+		WorkspaceRoot:  resolvedRoot,
+		IsolatedHome:   isolatedHome,
+		PersistentHome: persistentHome,
+		status:         "running",
+		done:           make(chan struct{}),
+		streamDone:     make(chan struct{}),
+		firstFrame:     make(chan struct{}),
 	}
 
 	m.sessions[id] = session
@@ -961,7 +968,10 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 					colorCyan, lineCount, session.ID, truncateString(trimmed, 200), colorReset)
 			}
 
-			// Grok usage-limit telemetry: the ACP transport is the primary path
+			// Grok notice telemetry: ACP frames are deliberately notice-only.
+			// Numeric and confirmed-unmetered usage comes from the account-bound
+			// billing log, never arbitrary response or tool-result fields. The ACP
+			// transport is the primary path
 			// for normal Grok sessions (`grok_acp_start`), and xAI surfaces the
 			// `usage_limit_reached` / `credit_limit_*` / `allow_access:false`
 			// signals as `session/update` notifications on this same stdout
@@ -1101,6 +1111,17 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	session.closeStdin()
 	session.Stdout.Close()
 	session.Stderr.Close()
+
+	// The child wrote billing evidence only inside its account-frozen isolated
+	// home. Merge one normalized snapshot before publishing the terminal frame,
+	// so a refresh triggered by that frame observes it. A concurrent `grok
+	// login` can change the real home's account but cannot relabel this record:
+	// persistGrokManagedBillingSnapshot writes the copied producer identity and
+	// billing record together.
+	if err := persistGrokManagedBillingSnapshot(session.IsolatedHome, session.PersistentHome); err != nil {
+		fmt.Printf("%s[grok-acp] managed billing snapshot not persisted: %v%s\n",
+			colorYellow, err, colorReset)
+	}
 
 	// Scan for and upload whatever media this session wrote before announcing
 	// the end, so the metadata rides along on the ended frame exactly as it
@@ -1286,7 +1307,7 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
 }
 
 // setupIsolatedGrokHome creates a per-session temp dir to use as the child's
-// GROK_HOME and seeds it with exactly two things:
+// GROK_HOME and seeds it with the minimum surfaces the CLI needs:
 //
 //   - a copy of the real `grok login` auth file, so cached-token auth keeps
 //     working without us inheriting anything else from the user's real
@@ -1295,6 +1316,9 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
 //     — `auto_update = false` suppresses the headless updater check, which can
 //     otherwise race `grok agent stdio` and emit non-JSON stdout that readStream
 //     would treat as a fatal `grok_acp_error`
+//   - a directory link for conversations so transcripts survive the ephemeral
+//     home, plus a private billing log seeded with the copied account identity;
+//     waitForExit later persists only its normalized allowlisted snapshot
 //
 // This replaces the dead `--config <key>=` neutralizer machinery: grok 0.2.59
 // rejects `--config` outright, so we can no longer clear persisted config via
@@ -1321,18 +1345,13 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
 // Returns the temp dir path. The caller (Start) owns its lifecycle and removes
 // it after the child exits (waitForExit) or on any pre-spawn failure.
 func setupIsolatedGrokHome(allowAPIKeyFallback bool, runtimeModel string) (string, error) {
+	return setupIsolatedGrokHomeFrom(allowAPIKeyFallback, runtimeModel, grokPersistentHome())
+}
+
+func setupIsolatedGrokHomeFrom(allowAPIKeyFallback bool, runtimeModel, srcBase string) (string, error) {
 	dir, err := os.MkdirTemp("", "grok-acp-home-")
 	if err != nil {
 		return "", fmt.Errorf("create isolated grok home: %w", err)
-	}
-
-	// Real ~/.grok base: prefer an inherited GROK_HOME (so a user who
-	// relocated their grok dir is still honoured), else the OS home's .grok.
-	srcBase := os.Getenv("GROK_HOME")
-	if srcBase == "" {
-		if home, herr := os.UserHomeDir(); herr == nil {
-			srcBase = filepath.Join(home, ".grok")
-		}
 	}
 
 	// Copy the auth file under the first name that exists. Best-effort: a
@@ -1350,6 +1369,10 @@ func setupIsolatedGrokHome(allowAPIKeyFallback bool, runtimeModel string) (strin
 				return "", fmt.Errorf("copy grok auth file %s: %w", name, werr)
 			}
 		}
+	}
+	if lerr := seedGrokManagedBillingIdentity(dir); lerr != nil {
+		fmt.Printf("%s[grok-acp] managed billing identity not seeded (usage freshness may be unavailable): %v%s\n",
+			colorYellow, lerr, colorReset)
 	}
 
 	// Minimal clean config.toml — deliberately carries no approval/permission
@@ -1900,16 +1923,22 @@ func lineMentionsGrokApprovalPin(lower string) bool {
 	return false
 }
 
-// setEnvVar returns env with the `KEY=value` entry for key replaced (case-
-// sensitive match on the key) or appended when absent. Used by Start to pin
-// GROK_HOME to the isolated dir, overriding any inherited GROK_HOME the env
-// sanitiser left in place.
+// setEnvVar returns env with the `KEY=value` entry for key replaced or appended
+// when absent. Windows environment keys are case-insensitive, so every casing
+// of key must be removed there; retaining a differently-cased inherited entry
+// would leave CreateProcess to choose between conflicting GROK_HOME or junction
+// values. Unix keeps its native case-sensitive semantics.
 func setEnvVar(env []string, key, value string) []string {
 	prefix := key + "="
 	out := make([]string, 0, len(env)+1)
 	replaced := false
 	for _, e := range env {
-		if strings.HasPrefix(e, prefix) {
+		separator := strings.IndexByte(e, '=')
+		matches := separator >= 0 && e[:separator] == key
+		if runtime.GOOS == "windows" && separator >= 0 {
+			matches = strings.EqualFold(e[:separator], key)
+		}
+		if matches {
 			if !replaced {
 				out = append(out, prefix+value)
 				replaced = true

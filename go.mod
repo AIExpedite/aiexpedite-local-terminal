@@ -3,8 +3,8 @@ module github.com/AIExpedite/aiexpedite-local-terminal
 go 1.25.8
 
 require (
-	cloud.google.com/go/pubsub/v2 v2.6.1 // direct
-	cloud.google.com/go/storage v1.64.0 // direct
+	cloud.google.com/go/pubsub/v2 v2.6.2 // direct
+	cloud.google.com/go/storage v1.65.0 // direct
 	github.com/getlantern/systray v1.2.2 // direct
 	golang.org/x/mod v0.40.0 // semver‑compare helper
 	golang.org/x/sys v0.47.0 // direct

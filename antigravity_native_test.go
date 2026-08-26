@@ -474,7 +474,7 @@ func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 	// when we set them independently (no real agy needed).
 	m := NewAntigravityNativeManager(nil)
 	cwd := t.TempDir()
-	if err := m.Start("sess-a", cwd, "ws", "uid", nil, nil); err != nil {
+	if err := m.Start("sess-a", cwd, "ws", "uid", "", nil, nil); err != nil {
 		// probeAntigravityNativeCapability may fail if agy missing — skip.
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not runnable") ||
 			strings.Contains(err.Error(), "below minimum") || strings.Contains(err.Error(), "unsupported") {
@@ -482,7 +482,7 @@ func TestAntigravityNativeManager_StartSendIsolation(t *testing.T) {
 		}
 		t.Fatalf("start a: %v", err)
 	}
-	if err := m.Start("sess-b", cwd, "ws", "uid", nil, nil); err != nil {
+	if err := m.Start("sess-b", cwd, "ws", "uid", "", nil, nil); err != nil {
 		t.Fatalf("start b: %v", err)
 	}
 	sa, sb := m.Get("sess-a"), m.Get("sess-b")
@@ -513,7 +513,7 @@ func TestAntigravityNativeManager_StartRootsContainmentAtSessionCwd(t *testing.T
 	m := NewAntigravityNativeManager(nil)
 	anywhere := t.TempDir() // not inside any "configured" root by construction
 
-	err := m.Start("sess-anywhere", anywhere, "ws", "uid", nil, nil)
+	err := m.Start("sess-anywhere", anywhere, "ws", "uid", "", nil, nil)
 	if err != nil {
 		// Cwd resolution runs BEFORE the agy capability probe, so a
 		// containment-style rejection here is a real regression; a probe
@@ -885,7 +885,7 @@ func TestAntigravityNativeManager_StartIsIdempotent(t *testing.T) {
 	var acks int
 	onStarted := func() { acks++ }
 
-	if err := m.Start("sess-idem", cwd, "ws", "uid", nil, onStarted); err != nil {
+	if err := m.Start("sess-idem", cwd, "ws", "uid", "", nil, onStarted); err != nil {
 		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not runnable") ||
 			strings.Contains(err.Error(), "below minimum") || strings.Contains(err.Error(), "unsupported") {
 			t.Skipf("agy not available for capability probe: %v", err)
@@ -899,7 +899,7 @@ func TestAntigravityNativeManager_StartIsIdempotent(t *testing.T) {
 		t.Fatal("session missing after first start")
 	}
 
-	if err := m.Start("sess-idem", cwd, "ws", "uid", nil, onStarted); err != nil {
+	if err := m.Start("sess-idem", cwd, "ws", "uid", "", nil, onStarted); err != nil {
 		t.Fatalf("duplicate start must be idempotent nil, got %v", err)
 	}
 	if acks != 2 {
@@ -1023,7 +1023,7 @@ func TestAntigravityNativeManager_StartIdempotentSkipsCapabilityProbe(t *testing
 	})
 
 	var acks int
-	if err := m.Start(id, cwd, "ws", "uid", nil, func() { acks++ }); err != nil {
+	if err := m.Start(id, cwd, "ws", "uid", "", nil, func() { acks++ }); err != nil {
 		t.Fatalf("existing session must re-ack without capability probe: %v", err)
 	}
 	if acks != 1 {
@@ -1346,5 +1346,160 @@ func TestAntigravityNativeManager_DuplicateEndWaitsForInFlightTurn(t *testing.T)
 	case <-endReturned:
 	case <-time.After(2 * time.Second):
 		t.Fatal("duplicate End did not return after the turn drained turnMu")
+	}
+}
+
+// The cloud can only make an Antigravity session conversation-resumable if the
+// device tells it the native conversation id — `agy` mints its own UUID and
+// records it in ~/.gemini/antigravity-cli/cache/last_conversations.json, which
+// terminal-service cannot read. These two tests pin the publish contract that
+// terminal-service's pointer commit depends on.
+func TestAntigravityNativeSend_PublishesConversationIDOnSuccess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim for fake agy is unix-oriented")
+	}
+
+	binDir := t.TempDir()
+	fakeAgy := filepath.Join(binDir, "agy")
+	script := "#!/bin/sh\necho 'done'\nexit 0\n"
+	if err := os.WriteFile(fakeAgy, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewAntigravityNativeManager(nil)
+	id := "sess-convid-success"
+	// Pre-set the native id so needCapture is false and the turn takes the
+	// ordinary native-resume path — the shape every turn after the first has.
+	m.mu.Lock()
+	m.sessions[id] = &AntigravityNativeSession{
+		ID:                   id,
+		Cwd:                  t.TempDir(),
+		WorkspaceID:          "ws",
+		UID:                  "uid",
+		StartedAt:            time.Now(),
+		status:               "idle",
+		NativeConversationID: "conv-abc-123",
+	}
+	m.mu.Unlock()
+
+	var frames []resultMsg
+	if err := m.Send(id, "hello", func(res resultMsg) { frames = append(frames, res) }, 10*time.Second); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	var found bool
+	for _, f := range frames {
+		if f.Type != "antigravity_native_message" || f.Status != "success" {
+			continue
+		}
+		found = true
+		if f.ConversationID != "conv-abc-123" {
+			t.Fatalf("success frame must carry the native conversation id, got %q", f.ConversationID)
+		}
+	}
+	if !found {
+		t.Fatalf("expected an antigravity_native_message success frame, got %#v", frames)
+	}
+}
+
+// A turn that exits non-zero must not advertise a conversation id: the id is
+// only adopted after success, and committing one from a failed turn would let a
+// later resume reattach to a conversation containing a hidden turn that never
+// reached the transcript or the UI.
+func TestAntigravityNativeSend_NoConversationIDOnFailedTurn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim for fake agy is unix-oriented")
+	}
+
+	binDir := t.TempDir()
+	fakeAgy := filepath.Join(binDir, "agy")
+	script := "#!/bin/sh\necho 'Error: boom'\nexit 3\n"
+	if err := os.WriteFile(fakeAgy, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewAntigravityNativeManager(nil)
+	id := "sess-convid-failure"
+	m.mu.Lock()
+	m.sessions[id] = &AntigravityNativeSession{
+		ID:                   id,
+		Cwd:                  t.TempDir(),
+		WorkspaceID:          "ws",
+		UID:                  "uid",
+		StartedAt:            time.Now(),
+		status:               "idle",
+		NativeConversationID: "conv-should-not-leak",
+	}
+	m.mu.Unlock()
+
+	var frames []resultMsg
+	if err := m.Send(id, "hello", func(res resultMsg) { frames = append(frames, res) }, 10*time.Second); err == nil {
+		t.Fatal("expected Send to fail on non-zero agy exit")
+	}
+
+	for _, f := range frames {
+		if f.ConversationID != "" {
+			t.Fatalf("failed turn must not publish a conversation id, frame %q carried %q", f.Type, f.ConversationID)
+		}
+	}
+}
+
+// primeAntigravityCapability marks the `agy --version` probe satisfied for the
+// duration of a test.
+//
+// The surrounding Start tests skip when agy is absent, which means CI (where it
+// is never installed) exercises none of them. Start's conversation seeding is
+// pure registration logic with no dependency on the CLI, so priming the probe's
+// cache keeps these two deterministic everywhere instead of silently skipping
+// on the only machine that gates merges.
+func primeAntigravityCapability(t *testing.T) {
+	t.Helper()
+	antigravityCapabilityMu.Lock()
+	prevOK, prevChecked, prevErr := antigravityCapabilityOK, antigravityCapabilityChecked, antigravityCapabilityErr
+	antigravityCapabilityOK, antigravityCapabilityChecked, antigravityCapabilityErr = true, time.Now(), nil
+	antigravityCapabilityMu.Unlock()
+	t.Cleanup(func() {
+		antigravityCapabilityMu.Lock()
+		antigravityCapabilityOK, antigravityCapabilityChecked, antigravityCapabilityErr = prevOK, prevChecked, prevErr
+		antigravityCapabilityMu.Unlock()
+	})
+}
+
+// A cross-session resume works only if Start can seed the conversation the
+// first turn continues — a new terminal session starts with no transcript, so
+// without the seed the turn silently begins a fresh conversation instead.
+func TestAntigravityNativeStart_SeedsResumeConversationID(t *testing.T) {
+	primeAntigravityCapability(t)
+	m := NewAntigravityNativeManager(nil)
+	cwd := t.TempDir()
+	if err := m.Start("sess-seeded", cwd, "ws", "uid", "conv-seed-1", nil, nil); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	sess := m.Get("sess-seeded")
+	if sess == nil {
+		t.Fatal("session should be registered")
+	}
+	if sess.NativeConversationID != "conv-seed-1" {
+		t.Fatalf("Start must seed NativeConversationID, got %q", sess.NativeConversationID)
+	}
+}
+
+// The default remains a fresh conversation: an empty seed must not be confused
+// with "resume something", or every chat-direct start would try to reattach.
+func TestAntigravityNativeStart_EmptySeedStartsFreshConversation(t *testing.T) {
+	primeAntigravityCapability(t)
+	m := NewAntigravityNativeManager(nil)
+	cwd := t.TempDir()
+	if err := m.Start("sess-fresh", cwd, "ws", "uid", "", nil, nil); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	sess := m.Get("sess-fresh")
+	if sess == nil {
+		t.Fatal("session should be registered")
+	}
+	if sess.NativeConversationID != "" {
+		t.Fatalf("empty seed must leave the conversation unset, got %q", sess.NativeConversationID)
 	}
 }
