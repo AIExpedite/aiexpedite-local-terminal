@@ -674,8 +674,11 @@ type resultMsg struct {
 	// presence of the array as the signal to advance
 	// cliUsageLastCheckedAt; omitempty would force every empty-success
 	// poll down the handled-failure path.
-	CliAgents []cliAgentUsage      `json:"cliAgents"`
-	Errors    []cliAgentUsageError `json:"errors,omitempty"`
+	CliAgents      []cliAgentUsage      `json:"cliAgents"`
+	Errors         []cliAgentUsageError `json:"errors,omitempty"`
+	ReceiptVersion int                  `json:"receiptVersion,omitempty"`
+	ChallengeTs    int64                `json:"challengeTs,omitempty"`
+	Receipt        string               `json:"receipt,omitempty"`
 
 	// __env_inspect_result__ payload — populated only when
 	// Type == "__env_inspect_result__". Carries the read-only workstation
@@ -946,19 +949,26 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	// failure marker. Only treat as failure when at least one provider
 	// threw (panic / context cancel / parse error).
 	success := len(errs) == 0
+	receipt, normalizedUsage, normalizedErrors, receiptErr := signCLIUsageRefreshReceipt(cfg.CommandSecret, cmd.RefreshID, cmd.Ts, success, usage, errs)
+	if receiptErr != nil {
+		return receiptErr
+	}
 
 	res := resultMsg{
-		ID:          cmd.ID,
-		WorkspaceID: cmd.WorkspaceID,
-		UID:         cmd.UID,
-		AgentID:     cfg.AgentID,
-		Ts:          time.Now().UnixMilli(),
-		Version:     Version,
-		Type:        "__cli_usage_refresh_result__",
-		RefreshID:   cmd.RefreshID,
-		Success:     &success,
-		CliAgents:   usage,
-		Errors:      errs,
+		ID:             cmd.ID,
+		WorkspaceID:    cmd.WorkspaceID,
+		UID:            cmd.UID,
+		AgentID:        cfg.AgentID,
+		Ts:             time.Now().UnixMilli(),
+		Version:        Version,
+		Type:           "__cli_usage_refresh_result__",
+		RefreshID:      cmd.RefreshID,
+		Success:        &success,
+		CliAgents:      normalizedUsage,
+		Errors:         normalizedErrors,
+		ReceiptVersion: 1,
+		ChallengeTs:    cmd.Ts,
+		Receipt:        receipt,
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[pubsub] Failed to publish refresh result: %v%s\n", colorRed, err, colorReset)
@@ -1026,19 +1036,33 @@ func makeCLIUsageRefreshFailureResult(cmd commandMsg, cfg *Config, message strin
 	if cfg != nil && cfg.AgentID != "" {
 		agentID = cfg.AgentID
 	}
+	secret := ""
+	if cfg != nil {
+		secret = cfg.CommandSecret
+	}
+	errs := []cliAgentUsageError{{Provider: "_dispatch", Message: message}}
+	receipt, agents, normalizedErrors, receiptErr := signCLIUsageRefreshReceipt(secret, cmd.RefreshID, cmd.Ts, false, nil, errs)
+	receiptVersion := 1
+	challengeTs := cmd.Ts
+	if receiptErr != nil {
+		agents, normalizedErrors = []cliAgentUsage{}, errs
+		receiptVersion, challengeTs = 0, 0
+	}
 	return resultMsg{
-		ID:          cmd.ID,
-		WorkspaceID: cmd.WorkspaceID,
-		UID:         cmd.UID,
-		AgentID:     agentID,
-		Ts:          time.Now().UnixMilli(),
-		Version:     Version,
-		Type:        "__cli_usage_refresh_result__",
-		RefreshID:   cmd.RefreshID,
-		Success:     &failure,
-		Errors: []cliAgentUsageError{
-			{Provider: "_dispatch", Message: message},
-		},
+		ID:             cmd.ID,
+		WorkspaceID:    cmd.WorkspaceID,
+		UID:            cmd.UID,
+		AgentID:        agentID,
+		Ts:             time.Now().UnixMilli(),
+		Version:        Version,
+		Type:           "__cli_usage_refresh_result__",
+		RefreshID:      cmd.RefreshID,
+		Success:        &failure,
+		CliAgents:      agents,
+		Errors:         normalizedErrors,
+		ReceiptVersion: receiptVersion,
+		ChallengeTs:    challengeTs,
+		Receipt:        receipt,
 	}
 }
 
