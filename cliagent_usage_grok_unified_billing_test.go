@@ -201,7 +201,7 @@ func TestGrokOnDemandSurvivesAMissingUsagePercent(t *testing.T) {
 // A NaN percentage is not a reading. Guarding it here keeps a malformed line
 // from plotting a nonsense bar.
 func TestGrokNaNUsagePercentIsNotAReading(t *testing.T) {
-	rec := grokBillingRecord{TS: "2026-08-17T23:02:12.510Z", Msg: grokBillingLogMessage}
+	rec := grokBillingRecord{TS: "2026-08-17T23:02:12.510Z"}
 	nan := math.NaN()
 	rec.Ctx.Config.CreditUsagePercent = grokBillingNumber{Value: nan, Valid: true}
 	rec.Ctx.Config.CurrentPeriod.Type = "USAGE_PERIOD_TYPE_WEEKLY"
@@ -218,7 +218,7 @@ func TestGrokNaNUsagePercentIsNotAReading(t *testing.T) {
 // A record with no parseable timestamp is still refused: without `ts` there is
 // no observation time, and the scan must keep looking.
 func TestGrokRecordWithoutATimestampIsRefused(t *testing.T) {
-	rec := grokBillingRecord{Msg: grokBillingLogMessage}
+	rec := grokBillingRecord{}
 	rec.Ctx.Config.CurrentPeriod.Type = "USAGE_PERIOD_TYPE_WEEKLY"
 
 	if _, ok := grokBillingSnapshotFromRecord(rec); ok {

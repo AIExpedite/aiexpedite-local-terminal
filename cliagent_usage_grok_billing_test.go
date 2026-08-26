@@ -119,6 +119,22 @@ func TestReadGrokBillingSnapshot_NewestInvalidTimestampBlocksOlderPercentage(t *
 	}
 }
 
+func TestReadGrokBillingSnapshot_LookalikeMessageDoesNotSupersedeBilling(t *testing.T) {
+	base := t.TempDir()
+	lookalike := `{"ts":"2026-08-17T23:02:12Z","msg":"not billing: fetched credits config","ctx":{"config":{"creditUsagePercent":99,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-24T22:28:32Z"}}}}`
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
+		grokBillingLine("2026-08-13T15:49:37Z", 33, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-10T22:28:32Z", "2026-08-24T22:28:32Z"),
+		lookalike,
+	)
+
+	snap, ok := readGrokBillingSnapshot(base, []string{"acct-1"})
+	if !ok || !snap.HasUsedPercent || snap.UsedPercent != 33 {
+		t.Fatalf("lookalike message superseded the exact billing record: %+v, ok=%v", snap, ok)
+	}
+}
+
 func TestReadGrokBillingSnapshot_MissingLogIsNotAnError(t *testing.T) {
 	if _, ok := readGrokBillingSnapshot(t.TempDir(), nil); ok {
 		t.Errorf("absent log should report no snapshot")
@@ -277,7 +293,7 @@ func TestGrokBillingMetrics_CurrentUnmeteredPreservesFreshOnDemand(t *testing.T)
 
 func TestGrokBillingSnapshot_InvalidNumbersAreOmittedIndependently(t *testing.T) {
 	for _, invalid := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
-		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z", Msg: grokBillingLogMessage}
+		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z"}
 		rec.Ctx.Config.CreditUsagePercent = grokBillingNumber{Value: invalid, Valid: true}
 		rec.Ctx.Config.CurrentPeriod.Type = "USAGE_PERIOD_TYPE_WEEKLY"
 		rec.Ctx.Config.CurrentPeriod.End = "2026-08-24T22:28:32Z"
@@ -292,7 +308,7 @@ func TestGrokBillingSnapshot_InvalidNumbersAreOmittedIndependently(t *testing.T)
 	}
 
 	for _, invalidUsed := range []float64{-1, 51, math.NaN(), math.Inf(1)} {
-		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z", Msg: grokBillingLogMessage}
+		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z"}
 		cap := 50.0
 		rec.Ctx.Config.OnDemandCap.Val = grokBillingNumber{Value: cap, Valid: true}
 		rec.Ctx.Config.OnDemandUsed.Val = grokBillingNumber{Value: invalidUsed, Valid: true}
@@ -333,7 +349,7 @@ func TestGrokBillingSnapshot_PercentageBoundariesClampSafely(t *testing.T) {
 	for _, tc := range []struct {
 		in, want float64
 	}{{-1, 0}, {0, 0}, {100, 100}, {101, 100}} {
-		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z", Msg: grokBillingLogMessage}
+		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z"}
 		rec.Ctx.Config.CreditUsagePercent = grokBillingNumber{Value: tc.in, Valid: true}
 		snap, ok := grokBillingSnapshotFromRecord(rec)
 		if !ok || !snap.HasUsedPercent || snap.UsedPercent != tc.want {

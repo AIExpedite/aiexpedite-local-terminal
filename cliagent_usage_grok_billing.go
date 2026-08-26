@@ -59,14 +59,12 @@ var grokLogUserIDRe = regexp.MustCompile(`"user_?[Ii]d"\s*:\s*"([^"]{1,128})"`)
 // must degrade to "unobservable", never to a wrong number.
 type grokBillingRecord struct {
 	TS  string `json:"ts"`
-	Msg string `json:"msg"`
 	Ctx struct {
 		Config struct {
 			CreditUsagePercent grokBillingNumber `json:"creditUsagePercent"`
 			CurrentPeriod      struct {
-				Type  string `json:"type"`
-				Start string `json:"start"`
-				End   string `json:"end"`
+				Type string `json:"type"`
+				End  string `json:"end"`
 			} `json:"currentPeriod"`
 			OnDemandCap struct {
 				Val grokBillingNumber `json:"val"`
