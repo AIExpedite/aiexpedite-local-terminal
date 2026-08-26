@@ -1369,7 +1369,9 @@ func mergeCodexRateLimitCachePerLimitProgress(
 	snap.Buckets = aggregateCodexBuckets(snap.Contributors, now)
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
 	snap.AccountFingerprint = fingerprint
-	if rolloutHighWater != nil && (rolloutHighWater.mtimeNs > snap.RolloutHighWaterMtimeNs ||
+	storedRolloutCursorIsFuture := snap.RolloutHighWaterMtimeNs > now.UnixNano() ||
+		(snap.RolloutHighWaterMtimeNs == 0 && snap.RolloutHighWaterMtimeMs > now.UnixMilli())
+	if rolloutHighWater != nil && (storedRolloutCursorIsFuture || rolloutHighWater.mtimeNs > snap.RolloutHighWaterMtimeNs ||
 		(rolloutHighWater.mtimeNs == snap.RolloutHighWaterMtimeNs &&
 			rolloutHighWater.boundaryFingerprint != snap.RolloutHighWaterBoundaryFingerprint)) {
 		snap.RolloutHighWaterMtimeNs = rolloutHighWater.mtimeNs
@@ -2008,11 +2010,13 @@ const (
 	codexRolloutTailProbeMaxBytes = 4 * 1024 * 1024
 )
 
-// codexRecentRolloutLines probes backwards from EOF until it finds the newest
-// complete numeric rate-limit object (within a fixed byte ceiling). The normal
-// forward scan still runs and remains authoritative for sparse carry-forward,
-// session scoping, and completed-scan progress. This small second view prevents
-// a repeatedly slow/large file from replaying only the same prefix forever.
+// codexRecentRolloutLines probes backwards from EOF until it reconstructs both
+// display identities (within a fixed byte ceiling). The normal forward scan
+// still runs and remains authoritative for sparse carry-forward, session
+// scoping, and completed-scan progress. This small second view prevents a
+// repeatedly slow/large file from replaying only the same prefix forever while
+// ensuring a sparse newest frame does not hide the other identity immediately
+// before it.
 func codexRecentRolloutLines(ctx context.Context, f *os.File, size int64, now time.Time) []string {
 	if size <= 0 {
 		return nil
@@ -2021,8 +2025,8 @@ func codexRecentRolloutLines(ctx context.Context, f *os.File, size int64, now ti
 	remaining := int64(codexRolloutTailProbeMaxBytes)
 	var suffix []byte
 	var groups [][]string
-	foundNumeric := false
-	for offset > 0 && remaining > 0 && !foundNumeric {
+	var foundSession, foundWeekly bool
+	for offset > 0 && remaining > 0 && !(foundSession && foundWeekly) {
 		if ctx.Err() != nil {
 			break
 		}
@@ -2062,9 +2066,9 @@ func codexRecentRolloutLines(ctx context.Context, f *os.File, size int64, now ti
 			}
 			line := string(rawLine)
 			group = append(group, line)
-			if codexRolloutLineHasNumericTelemetry(line, now) {
-				foundNumeric = true
-			}
+			hasSession, hasWeekly := codexRolloutLineNumericIdentities(line, now)
+			foundSession = foundSession || hasSession
+			foundWeekly = foundWeekly || hasWeekly
 		}
 		if len(group) > 0 {
 			groups = append(groups, group)
@@ -2080,29 +2084,36 @@ func codexRecentRolloutLines(ctx context.Context, f *os.File, size int64, now ti
 	return lines
 }
 
-func codexRolloutLineHasNumericTelemetry(line string, now time.Time) bool {
+func codexRolloutLineNumericIdentities(line string, now time.Time) (bool, bool) {
 	if !strings.Contains(line, "token_count") &&
 		!strings.Contains(line, "rateLimits") &&
 		!strings.Contains(line, "rate_limit") {
-		return false
+		return false, false
 	}
 	var raw map[string]interface{}
 	if json.Unmarshal([]byte(line), &raw) != nil || !isRecognizedCodexRateLimitEnvelope(raw) {
-		return false
+		return false, false
 	}
 	eventTime, _ := codexObservationTimes(raw, now, false)
 	if eventTime.IsZero() {
-		return false
+		return false, false
 	}
+	var hasSession, hasWeekly bool
 	updates, _ := extractCodexRateLimitBuckets(raw, eventTime)
-	for _, limits := range updates {
+	for slot, limits := range updates {
 		for _, bucket := range limits {
-			if bucket.usageKnown {
-				return true
+			if !bucket.usageKnown {
+				continue
+			}
+			switch codexWindowIdentity(bucket.WindowMinutes, slot) {
+			case codexIdentitySession:
+				hasSession = true
+			case codexIdentityWeekly:
+				hasWeekly = true
 			}
 		}
 	}
-	return false
+	return hasSession, hasWeekly
 }
 
 func codexRolloutSessionStartPrefix(f *os.File) time.Time {
@@ -2139,7 +2150,7 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		// rate-limit prefilter: a refused turn carries no window at all (Codex
 		// sends `primary: null, secondary: null` once the limit is reached), so
 		// these lines are exactly the ones the bucket scan discards.
-		if ev, ok := codexUsageLimitEvidenceFromLine(line); ok && ev.At.After(limit.At) {
+		if ev, ok := codexUsageLimitEvidenceFromLine(line, now); ok && ev.At.After(limit.At) {
 			limit = ev
 		}
 		// The first line carrying a timestamp is the session_meta header, i.e.
@@ -2308,7 +2319,7 @@ const codexUsageLimitMessageMaxLen = 240
 //
 // The code — not the prose — is what we match on, so a reworded message keeps
 // working and a message merely MENTIONING a limit is never mistaken for one.
-func codexUsageLimitEvidenceFromLine(line string) (codexUsageLimitEvidence, bool) {
+func codexUsageLimitEvidenceFromLine(line string, now time.Time) (codexUsageLimitEvidence, bool) {
 	// Cheap prefilter: the code is a literal, so a line that doesn't contain it
 	// cannot be evidence and is never decoded.
 	if !strings.Contains(line, codexUsageLimitErrorCode) {
@@ -2318,10 +2329,12 @@ func codexUsageLimitEvidenceFromLine(line string) (codexUsageLimitEvidence, bool
 	if json.Unmarshal([]byte(line), &raw) != nil {
 		return codexUsageLimitEvidence{}, false
 	}
-	at, hasTime := codexRolloutLineTimestamp(line)
-	if !hasTime {
-		// Without a timestamp the evidence can't be ranked against a usage
-		// reading, and stale exhaustion must never outrank fresh telemetry.
+	_, observedAt := codexObservationTimes(raw, now, false)
+	if observedAt.IsZero() {
+		// Without a valid timestamp the evidence can't be ranked against a usage
+		// reading, and stale or excessively future-dated exhaustion must never
+		// outrank fresh telemetry. Accepted provider skew is clamped to now by the
+		// shared observation-time policy.
 		return codexUsageLimitEvidence{}, false
 	}
 	// The rollout envelope nests the event under `payload`; the app-server
@@ -2344,7 +2357,7 @@ func codexUsageLimitEvidenceFromLine(line string) (codexUsageLimitEvidence, bool
 		if len(message) > codexUsageLimitMessageMaxLen {
 			message = strings.TrimSpace(message[:codexUsageLimitMessageMaxLen])
 		}
-		return codexUsageLimitEvidence{At: at, Message: message}, true
+		return codexUsageLimitEvidence{At: observedAt, Message: message}, true
 	}
 	return codexUsageLimitEvidence{}, false
 }

@@ -2586,6 +2586,34 @@ func TestCodexBucketsFromRolloutFile_SkipsOversizedNonMetricLine(t *testing.T) {
 	}
 }
 
+func TestCodexRecentRolloutLines_ContinuesPastSparseNumericFrame(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	weekly := `{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{"secondary":{"used_percent":41,"window_minutes":10080}}}`
+	primary := `{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":29,"window_minutes":300}}}`
+	padding := `{"padding":"` + strings.Repeat("x", codexRolloutTailReadChunkSize*2) + `"}`
+	if err := os.WriteFile(path, []byte(weekly+"\n"+padding+"\n"+primary), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lines := codexRecentRolloutLines(context.Background(), f, info.Size(), time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC))
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, `"used_percent":29`) {
+		t.Fatal("tail probe did not retain the newest sparse session frame")
+	}
+	if !strings.Contains(joined, `"used_percent":41`) {
+		t.Fatal("tail probe stopped before the older sparse weekly frame")
+	}
+}
+
 func TestCodexRolloutFallbackBuckets_StatFailurePreventsHighWaterAdvance(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "sessions", "2026", "08", "26")
@@ -2898,6 +2926,44 @@ func TestCodexRolloutFallbackBuckets_MixedRefusalPreventsHighWaterAdvance(t *tes
 	}
 }
 
+func TestCodexRolloutFallbackBuckets_ValidatesFutureRefusalTime(t *testing.T) {
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name          string
+		refusedAt     time.Time
+		wantAt        time.Time
+		wantHighWater bool
+	}{
+		{
+			name:      "five minute boundary clamps to now",
+			refusedAt: now.Add(codexProviderObservationFutureTolerance),
+			wantAt:    now,
+		},
+		{
+			name:          "beyond tolerance is rejected",
+			refusedAt:     now.Add(codexProviderObservationFutureTolerance + time.Nanosecond),
+			wantHighWater: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			helperWriteRolloutLimitLog(t, base, "19", "2026-06-19T11-00-00-future-refusal",
+				"2026-06-19T11:00:00.000Z", nil, tc.refusedAt.Format(time.RFC3339Nano))
+
+			_, limit, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+			if ok {
+				t.Fatal("refusal-only rollout unexpectedly produced numeric contributors")
+			}
+			if !limit.At.Equal(tc.wantAt) {
+				t.Fatalf("refusal time=%s, want %s", limit.At, tc.wantAt)
+			}
+			if (highWater != nil) != tc.wantHighWater {
+				t.Fatalf("highWater=%+v, want present=%v", highWater, tc.wantHighWater)
+			}
+		})
+	}
+}
+
 func TestCodexRolloutFallbackBuckets_ClampsFutureMtimeHighWater(t *testing.T) {
 	base := t.TempDir()
 	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
@@ -2973,6 +3039,23 @@ func TestCodexRolloutScanCursorForAccount_ResetsPersistedFutureCursor(t *testing
 			candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
 			if !complete || len(candidates) != 1 || candidates[0].path != path {
 				t.Fatalf("complete=%v candidates=%+v, want post-rollback rollout selected", complete, candidates)
+			}
+			_, _, _, progress, _ := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+			if progress == nil {
+				t.Fatal("expected completed post-rollback scan progress")
+			}
+			mergeCodexRateLimitCachePerLimitProgress(
+				cache, nil, nil, false, nil, false, now, fingerprint, progress, "",
+			)
+			persisted, ok := loadCodexRateLimitSnapshot(cache)
+			if !ok {
+				t.Fatal("expected updated cache")
+			}
+			if persisted.RolloutHighWaterMtimeNs != progress.mtimeNs ||
+				persisted.RolloutHighWaterBoundaryFingerprint != progress.boundaryFingerprint {
+				t.Fatalf("persisted cursor=(%d, %q), want completed lower cursor=(%d, %q)",
+					persisted.RolloutHighWaterMtimeNs, persisted.RolloutHighWaterBoundaryFingerprint,
+					progress.mtimeNs, progress.boundaryFingerprint)
 			}
 		})
 	}
