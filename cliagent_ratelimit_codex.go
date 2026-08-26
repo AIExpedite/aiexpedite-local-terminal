@@ -26,6 +26,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -1513,6 +1514,12 @@ const codexRolloutScanFileCap = 16
 // starvation on every refresh.
 const codexRolloutCandidateReadReserve = time.Second
 
+// Directory enumeration is deliberately chunked so a large, slow, or
+// AV-monitored rollout directory cannot trap the optional scan inside one
+// uncancellable os.ReadDir call. The entries are sorted after collection to
+// preserve the newest-date-first traversal of Codex's YYYY/MM/DD layout.
+const codexRolloutReadDirChunkSize = 128
+
 // codexReconcileFromRollout merges direct-run rollout evidence into the same
 // normalized contributor cache populated by terminal-managed stdout. It is
 // intentionally not Unknown-only: a still-live cached percentage may be older
@@ -1620,6 +1627,33 @@ func codexRolloutBoundaryFingerprint(candidates []codexRolloutCandidate, mtimeNs
 	return fmt.Sprintf("%x", sum[:])
 }
 
+func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var entries []os.DirEntry
+	for {
+		if err := ctx.Err(); err != nil {
+			return entries, err
+		}
+		batch, readErr := f.ReadDir(codexRolloutReadDirChunkSize)
+		entries = append(entries, batch...)
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return entries, readErr
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+	return entries, nil
+}
+
 // codexDiscoverRolloutCandidates walks the fixed YYYY/MM/DD rollout layout
 // newest-first while checking the optional scan context between filesystem
 // entries. Starting with the newest date prevents a large history from starving
@@ -1638,7 +1672,7 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 			complete = false
 			return
 		}
-		entries, err := os.ReadDir(dir)
+		entries, err := codexReadDirContext(ctx, dir)
 		if err != nil {
 			if depth == 0 && os.IsNotExist(err) {
 				return
@@ -1969,6 +2003,124 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 // Best-effort: returns ok=false when the file holds no usable frame or can't be
 // read; the returned start time is zero when no line carried a parseable
 // timestamp.
+const (
+	codexRolloutTailReadChunkSize = 64 * 1024
+	codexRolloutTailProbeMaxBytes = 4 * 1024 * 1024
+)
+
+// codexRecentRolloutLines probes backwards from EOF until it finds the newest
+// complete numeric rate-limit object (within a fixed byte ceiling). The normal
+// forward scan still runs and remains authoritative for sparse carry-forward,
+// session scoping, and completed-scan progress. This small second view prevents
+// a repeatedly slow/large file from replaying only the same prefix forever.
+func codexRecentRolloutLines(ctx context.Context, f *os.File, size int64, now time.Time) []string {
+	if size <= 0 {
+		return nil
+	}
+	offset := size
+	remaining := int64(codexRolloutTailProbeMaxBytes)
+	var suffix []byte
+	var groups [][]string
+	foundNumeric := false
+	for offset > 0 && remaining > 0 && !foundNumeric {
+		if ctx.Err() != nil {
+			break
+		}
+		readSize := int64(codexRolloutTailReadChunkSize)
+		if readSize > offset {
+			readSize = offset
+		}
+		if readSize > remaining {
+			readSize = remaining
+		}
+		offset -= readSize
+		remaining -= readSize
+		chunk := make([]byte, readSize)
+		n, err := f.ReadAt(chunk, offset)
+		if err != nil && err != io.EOF {
+			break
+		}
+		chunk = chunk[:n]
+		combined := make([]byte, 0, len(chunk)+len(suffix))
+		combined = append(combined, chunk...)
+		combined = append(combined, suffix...)
+		parts := bytes.Split(combined, []byte{'\n'})
+		complete := parts
+		if offset > 0 {
+			// The first fragment begins before this chunk. Retain it for the
+			// next backwards read; only newline-delimited suffixes are complete.
+			suffix = append(suffix[:0], parts[0]...)
+			complete = parts[1:]
+		} else {
+			suffix = nil
+		}
+		group := make([]string, 0, len(complete))
+		for _, rawLine := range complete {
+			rawLine = bytes.TrimSuffix(rawLine, []byte{'\r'})
+			if len(rawLine) == 0 {
+				continue
+			}
+			line := string(rawLine)
+			group = append(group, line)
+			if codexRolloutLineHasNumericTelemetry(line, now) {
+				foundNumeric = true
+			}
+		}
+		if len(group) > 0 {
+			groups = append(groups, group)
+		}
+	}
+
+	// Groups were discovered newest-to-oldest; replay them chronologically so
+	// sparse frames retain the same semantics as the forward reader.
+	var lines []string
+	for i := len(groups) - 1; i >= 0; i-- {
+		lines = append(lines, groups[i]...)
+	}
+	return lines
+}
+
+func codexRolloutLineHasNumericTelemetry(line string, now time.Time) bool {
+	if !strings.Contains(line, "token_count") &&
+		!strings.Contains(line, "rateLimits") &&
+		!strings.Contains(line, "rate_limit") {
+		return false
+	}
+	var raw map[string]interface{}
+	if json.Unmarshal([]byte(line), &raw) != nil || !isRecognizedCodexRateLimitEnvelope(raw) {
+		return false
+	}
+	eventTime, _ := codexObservationTimes(raw, now, false)
+	if eventTime.IsZero() {
+		return false
+	}
+	updates, _ := extractCodexRateLimitBuckets(raw, eventTime)
+	for _, limits := range updates {
+		for _, bucket := range limits {
+			if bucket.usageKnown {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func codexRolloutSessionStartPrefix(f *os.File) time.Time {
+	buf := make([]byte, codexRolloutTailReadChunkSize)
+	n, err := f.ReadAt(buf, 0)
+	if err != nil && err != io.EOF {
+		return time.Time{}
+	}
+	line := buf[:n]
+	if newline := bytes.IndexByte(line, '\n'); newline >= 0 {
+		line = line[:newline]
+	}
+	if ts, ok := codexRolloutLineTimestamp(string(bytes.TrimSuffix(line, []byte{'\r'}))); ok {
+		return ts
+	}
+	return time.Time{}
+}
+
 func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1979,10 +2131,10 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	}
 	defer f.Close()
 
-	var sessionStart time.Time
+	sessionStart := codexRolloutSessionStartPrefix(f)
 	var limit codexUsageLimitEvidence
 	acc := map[string]map[string]codexRateLimitBucket{}
-	consumeLine := func(line string) {
+	consumeLine := func(line string, captureSessionStart bool) {
 		// Exhaustion evidence is collected from the SAME pass, ahead of the
 		// rate-limit prefilter: a refused turn carries no window at all (Codex
 		// sends `primary: null, secondary: null` once the limit is reached), so
@@ -1993,7 +2145,7 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		// The first line carrying a timestamp is the session_meta header, i.e.
 		// when this session STARTED — recorded before any rate-limit frame, so
 		// it's captured ahead of the prefilter below.
-		if sessionStart.IsZero() {
+		if captureSessionStart && sessionStart.IsZero() {
 			if ts, ok := codexRolloutLineTimestamp(line); ok {
 				sessionStart = ts
 			}
@@ -2043,6 +2195,17 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 			mergeCodexRolloutFrame(acc, updates, eventTime)
 		}
 	}
+	var size int64
+	if info, statErr := f.Stat(); statErr == nil {
+		size = info.Size()
+	}
+	tailLines := codexRecentRolloutLines(ctx, f, size, now)
+	consumeTail := func() {
+		for _, line := range tailLines {
+			consumeLine(line, false)
+		}
+		tailLines = nil
+	}
 
 	// Scanner cannot recover after an oversized token and cannot be canceled
 	// while accumulating it. Read in bounded fragments instead: complete JSONL
@@ -2052,9 +2215,11 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	reader := bufio.NewReaderSize(f, 64*1024)
 	lineBytes := make([]byte, 0, 64*1024)
 	oversized := false
+	handled := true
 	for {
 		if ctx.Err() != nil {
-			return acc, sessionStart, limit, false, len(acc) > 0
+			handled = false
+			break
 		}
 		fragment, readErr := reader.ReadSlice('\n')
 		if !oversized {
@@ -2069,14 +2234,15 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 			continue
 		}
 		if readErr != nil && readErr != io.EOF {
-			return acc, sessionStart, limit, false, len(acc) > 0
+			handled = false
+			break
 		}
 		if !oversized && len(lineBytes) > 0 {
 			for len(lineBytes) > 0 && (lineBytes[len(lineBytes)-1] == '\n' || lineBytes[len(lineBytes)-1] == '\r') {
 				lineBytes = lineBytes[:len(lineBytes)-1]
 			}
 			if len(lineBytes) > 0 {
-				consumeLine(string(lineBytes))
+				consumeLine(string(lineBytes), true)
 			}
 		}
 		lineBytes = lineBytes[:0]
@@ -2086,6 +2252,13 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		}
 	}
 	if ctx.Err() != nil {
+		handled = false
+	}
+	// Tail lines were already read as complete objects. Fold them even when the
+	// forward pass was interrupted; their newer timestamps supersede any prefix
+	// evidence without treating an incomplete fragment as provider telemetry.
+	consumeTail()
+	if !handled {
 		return acc, sessionStart, limit, false, len(acc) > 0
 	}
 	if len(acc) == 0 {

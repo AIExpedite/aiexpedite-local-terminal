@@ -2572,8 +2572,8 @@ func TestCodexBucketsFromRolloutFile_SkipsOversizedNonMetricLine(t *testing.T) {
 	if handled || !ok {
 		t.Fatalf("interrupted handled=%v ok=%v, want persisted complete evidence with retry required", handled, ok)
 	}
-	if b := partial[codexWindowPrimary][codexLegacyLimitID]; b.UsedPercentage != 17 {
-		t.Fatalf("partial bucket=%+v, want complete object before interruption", b)
+	if b := partial[codexWindowPrimary][codexLegacyLimitID]; b.UsedPercentage != 29 {
+		t.Fatalf("partial bucket=%+v, want newest complete tail object despite forward interruption", b)
 	}
 
 	buckets, _, _, handled, ok := codexBucketsFromRolloutFile(context.Background(), path, now)
@@ -2634,6 +2634,25 @@ func TestCodexDiscoverRolloutCandidates_StopsWhenContextCancels(t *testing.T) {
 	}
 }
 
+func TestCodexReadDirContext_ChecksCancellationBetweenChunks(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < codexRolloutReadDirChunkSize*2; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	entries, err := codexReadDirContext(ctx, dir)
+	if err != context.Canceled {
+		t.Fatalf("err=%v, want context cancellation between directory chunks", err)
+	}
+	if len(entries) != codexRolloutReadDirChunkSize {
+		t.Fatalf("entries=%d, want one %d-entry chunk before cancellation", len(entries), codexRolloutReadDirChunkSize)
+	}
+}
+
 func TestCodexRolloutDiscoveryContext_ReservesCandidateReadBudget(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -2689,7 +2708,7 @@ func TestCodexDiscoverRolloutCandidates_VisitsNewestDateBeforeCancellation(t *te
 	// Allow discovery to reach one rollout, then cancel before it can descend
 	// into the next date. Restarting an interrupted scan must always prioritize
 	// the newest direct-run evidence rather than replaying the oldest history.
-	ctx := &cancelAfterChecksContext{after: 10, done: make(chan struct{})}
+	ctx := &cancelAfterChecksContext{after: 17, done: make(chan struct{})}
 	candidates, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{})
 	if complete {
 		t.Fatal("discovery complete=true, want cancellation after newest candidate")
