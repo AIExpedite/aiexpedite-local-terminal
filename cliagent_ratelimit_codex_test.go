@@ -2498,13 +2498,13 @@ func TestCodexRolloutFallbackBuckets_StatFailurePreventsHighWaterAdvance(t *test
 	}
 
 	_, _, _, highWater, ok := codexRolloutFallbackBuckets(
-		context.Background(), base, time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC), 0,
+		context.Background(), base, time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC), codexRolloutScanCursor{},
 	)
 	if !ok {
 		t.Fatal("expected valid sibling rollout evidence")
 	}
 	if highWater != nil {
-		t.Fatalf("highWater=%d, want unchanged after incomplete metadata discovery", *highWater)
+		t.Fatalf("highWater=%+v, want unchanged after incomplete metadata discovery", *highWater)
 	}
 }
 
@@ -2521,7 +2521,7 @@ func TestCodexDiscoverRolloutCandidates_StopsWhenContextCancels(t *testing.T) {
 	}
 
 	ctx := &cancelAfterChecksContext{after: 5, done: make(chan struct{})}
-	_, complete := codexDiscoverRolloutCandidates(ctx, base, 0)
+	_, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{})
 	if complete {
 		t.Fatal("discovery complete=true, want cancellation to stop traversal and preserve the high-water")
 	}
@@ -2556,9 +2556,63 @@ func TestCodexDiscoverRolloutCandidates_RetainsSameMillisecondUpdate(t *testing.
 		t.Skip("filesystem does not preserve sub-millisecond mtimes")
 	}
 
-	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, first.UnixNano())
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{mtimeNs: first.UnixNano()})
 	if !complete || len(candidates) != 1 || candidates[0].path != path {
 		t.Fatalf("complete=%v candidates=%+v, want same-millisecond append selected", complete, candidates)
+	}
+}
+
+func TestCodexDiscoverRolloutCandidates_RetainsExactMtimeAppend(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "rollout-test.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	coarseMtime := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(path, coarseMtime, coarseMtime); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mtimeNs := info.ModTime().UnixNano()
+	initial, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{})
+	if !complete || len(initial) != 1 {
+		t.Fatalf("complete=%v candidates=%+v, want initial rollout selected", complete, initial)
+	}
+	cursor := codexRolloutScanCursor{
+		mtimeNs:             mtimeNs,
+		boundaryFingerprint: codexRolloutBoundaryFingerprint(initial, mtimeNs),
+	}
+	unchanged, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete || len(unchanged) != 0 {
+		t.Fatalf("complete=%v candidates=%+v, want unchanged boundary skipped", complete, unchanged)
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("{\"type\":\"token_count\"}\n")); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Model a coarse filesystem: the append changes size but not mtime.
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete || len(changed) != 1 || changed[0].path != path {
+		t.Fatalf("complete=%v candidates=%+v, want equal-mtime append selected", complete, changed)
 	}
 }
 
@@ -2580,7 +2634,7 @@ func TestCodexRolloutFallbackBuckets_CanonicalizesMixedIdentitySameLimit(t *test
 			},
 		}})
 
-	contributors, _, _, _, ok := codexRolloutFallbackBuckets(context.Background(), base, now, 0)
+	contributors, _, _, _, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
 	if !ok {
 		t.Fatal("expected mixed-identity rollout contributors")
 	}

@@ -2375,6 +2375,69 @@ func TestCodexUsageParser_DirectRunAdvancesAndPersistsAcrossRestart(t *testing.T
 	}
 }
 
+func TestCodexUsageParser_DirectRunAppendAtExactHighWaterMtimeAdvances(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	helperWriteRolloutLogAt(t, codexHome, "26", "2026-08-26T13-50-00-coarse", "2026-08-26T13:50:00Z",
+		[]map[string]any{codexRateLimitFrame(12, 8, now)})
+	rolloutPath := filepath.Join(codexHome, "sessions", "2026", "06", "26", "rollout-2026-08-26T13-50-00-coarse.jsonl")
+	coarseMtime := now.Add(-time.Minute)
+	if err := os.Chtimes(rolloutPath, coarseMtime, coarseMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	initial, ok := codexUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok || initial.Metrics[0].Consumed == nil || *initial.Metrics[0].Consumed != 12 {
+		t.Fatalf("initial metrics=%+v, want session 12%%", initial.Metrics)
+	}
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok || snap.RolloutHighWaterBoundaryFingerprint == "" {
+		t.Fatalf("snapshot=%+v, want completed boundary fingerprint", snap)
+	}
+
+	line, err := json.Marshal(map[string]any{
+		"timestamp": "2026-08-26T13:59:00Z",
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type":        "token_count",
+			"info":        map[string]any{"total_token_usage": map[string]any{"total_tokens": 2}},
+			"rate_limits": codexRateLimitFrame(35, 24, now),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(rolloutPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a coarse filesystem where the append does not advance mtime.
+	if err := os.Chtimes(rolloutPath, coarseMtime, coarseMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, ok := codexUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Detected: true}, now.Add(time.Minute))
+	if !ok || updated.Metrics[0].Consumed == nil || *updated.Metrics[0].Consumed != 35 ||
+		updated.Metrics[1].Consumed == nil || *updated.Metrics[1].Consumed != 24 {
+		t.Fatalf("updated metrics=%+v, want equal-mtime append 35%%/24%%", updated.Metrics)
+	}
+	if updated.Metrics[0].ObservedAt != "2026-08-26T13:59:00Z" || updated.Metrics[1].ObservedAt != "2026-08-26T13:59:00Z" {
+		t.Fatalf("updated observations=%+v, want appended event timestamp", updated.Metrics)
+	}
+}
+
 func TestCodexUsageParser_ShortParentBudgetReturnsCacheWithoutError(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
