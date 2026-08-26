@@ -119,6 +119,32 @@ func TestReadGrokBillingSnapshot_NewestInvalidTimestampBlocksOlderPercentage(t *
 	}
 }
 
+func TestReadGrokBillingSnapshot_TruncatedNewestRecordBlocksOlderPercentage(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
+		grokBillingLine("2026-08-10T17:08:10Z", 33, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-10T22:28:32Z", "2026-08-17T22:28:32Z"),
+	)
+	path := filepath.Join(base, "logs", "unified.jsonl")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := f.WriteString(`{"ts":"2026-08-17T23:02:12Z","msg":"billing: fetched credits config","ctx":{"config":`)
+	closeErr := f.Close()
+	if writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	if _, ok := readGrokBillingSnapshot(base, []string{"acct-1"}); ok {
+		t.Fatal("a partially appended newest billing record must block an older percentage")
+	}
+}
+
 func TestReadGrokBillingSnapshot_LookalikeMessageDoesNotSupersedeBilling(t *testing.T) {
 	base := t.TempDir()
 	lookalike := `{"ts":"2026-08-17T23:02:12Z","msg":"not billing: fetched credits config","ctx":{"config":{"creditUsagePercent":99,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-24T22:28:32Z"}}}}`

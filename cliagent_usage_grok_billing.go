@@ -208,7 +208,18 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 		var envelope struct {
 			Msg string `json:"msg"`
 		}
-		if json.Unmarshal(line, &envelope) != nil || envelope.Msg != grokBillingLogMessage {
+		if json.Unmarshal(line, &envelope) != nil {
+			// Only the first line of a seeked tail is expected to be truncated: the
+			// 1 MiB offset normally lands in the middle of an older JSON object.
+			// Any later candidate can be the newest billing append observed while it
+			// was still being written. Fail closed so that transient partial record
+			// cannot resurrect an older percentage.
+			if i == 0 && offset > 0 {
+				continue
+			}
+			return grokBillingSnapshot{}, false
+		}
+		if envelope.Msg != grokBillingLogMessage {
 			continue
 		}
 		var rec grokBillingRecord
