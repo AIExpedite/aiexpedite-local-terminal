@@ -2989,6 +2989,86 @@ func TestCodexRolloutFallbackBuckets_ClampsFutureMtimeHighWater(t *testing.T) {
 	}
 }
 
+func TestCodexRolloutFallbackBuckets_FutureMtimesDoNotHideNormalCandidateBehindCap(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+
+	for i := 0; i < codexRolloutScanFileCap+1; i++ {
+		name := fmt.Sprintf("2026-08-26T12-%02d-00-future", i)
+		helperWriteRolloutLogAt(t, base, "26", name, "2026-08-26T12:00:00Z",
+			[]map[string]any{{
+				"secondary": map[string]any{
+					"used_percent": 20.0, "window_minutes": 10080.0,
+					"resets_at": float64(now.Add(72 * time.Hour).Unix()),
+				},
+			}})
+		path := filepath.Join(base, "sessions", "2026", "06", "26", "rollout-"+name+".jsonl")
+		future := now.Add(time.Duration(i+1) * time.Hour)
+		if err := os.Chtimes(path, future, future); err != nil {
+			t.Fatalf("chtimes future rollout %d: %v", i, err)
+		}
+	}
+	rolloutName := "2026-08-26T13-59-00-normal"
+	helperWriteRolloutLogAt(t, base, "26", rolloutName, "2026-08-26T13:59:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 73.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}})
+	normalPath := filepath.Join(base, "sessions", "2026", "06", "26", "rollout-"+rolloutName+".jsonl")
+	normalMtime := now.Add(-time.Minute)
+	if err := os.Chtimes(normalPath, normalMtime, normalMtime); err != nil {
+		t.Fatalf("chtimes normal rollout: %v", err)
+	}
+
+	contributors, _, _, _, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok {
+		t.Fatal("expected normal-time rollout contributor")
+	}
+	if got := contributors[codexWindowPrimary][codexLegacyLimitID]; got.UsedPercentage != 73 {
+		t.Fatalf("primary contributor=%+v, want normal-time rollout selected ahead of future mtimes", got)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_FutureAuthWatermarkLeavesProgressForRetry(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	authPath := filepath.Join(base, "auth.json")
+	if err := os.WriteFile(authPath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	future := now.Add(time.Hour)
+	if err := os.Chtimes(authPath, future, future); err != nil {
+		t.Fatalf("chtimes future auth file: %v", err)
+	}
+	rolloutName := "2026-08-26T13-50-00-current"
+	helperWriteRolloutLogAt(t, base, "26", rolloutName, "2026-08-26T13:50:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 64.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}})
+
+	contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if ok || len(contributors) != 0 || highWater != nil {
+		t.Fatalf("future auth watermark produced contributors=%+v highWater=%+v ok=%v", contributors, highWater, ok)
+	}
+
+	corrected := now.Add(-time.Hour)
+	if err := os.Chtimes(authPath, corrected, corrected); err != nil {
+		t.Fatalf("correct auth file mtime: %v", err)
+	}
+	contributors, _, _, highWater, ok = codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || highWater == nil {
+		t.Fatalf("corrected auth watermark did not retry rollout: contributors=%+v highWater=%+v ok=%v", contributors, highWater, ok)
+	}
+	if got := contributors[codexWindowPrimary][codexLegacyLimitID]; got.UsedPercentage != 64 {
+		t.Fatalf("primary contributor=%+v, want retried current rollout", got)
+	}
+}
+
 func TestCodexRolloutScanCursorForAccount_ResetsPersistedFutureCursor(t *testing.T) {
 	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
 	fingerprint := "account-a"

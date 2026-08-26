@@ -1839,6 +1839,14 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	if info, err := os.Stat(expandHome(base, "auth.json")); err == nil {
 		authMod = info.ModTime()
 	}
+	// A future login watermark cannot safely separate the current account from
+	// earlier sessions. Treat the optional rollout source as unavailable for
+	// this pass instead of rejecting current evidence and then advancing past
+	// it; once the clock or file timestamp is corrected, the unchanged rollout
+	// remains eligible for a retry.
+	if authMod.After(now) {
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
+	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
 	discoveryCtx, cancelDiscovery := codexRolloutDiscoveryContext(ctx)
 	candidates, discoveryComplete := codexDiscoverRolloutCandidates(discoveryCtx, base, cursor)
@@ -1852,9 +1860,18 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	// resumed after newer files exist — filename order treats the stale session
 	// as the "newest" reading. mtime tracks the last append, so the file being
 	// written most recently (the live source of truth) is considered first.
+	// Future-dated mtimes are invalid ordering evidence after a clock rollback
+	// or timestamp-preserving restore, so rank them after every normal-time
+	// candidate. Otherwise more than one capped batch of anomalous files could
+	// hide a newly completed normal-time rollout and then advance past it.
 	// Ties fall back to filename order so a deterministic chronological tiebreak
 	// applies when two files share an mtime.
 	sort.SliceStable(candidates, func(i, j int) bool {
+		iFuture := candidates[i].mtime.After(now)
+		jFuture := candidates[j].mtime.After(now)
+		if iFuture != jFuture {
+			return !iFuture
+		}
 		if !candidates[i].mtime.Equal(candidates[j].mtime) {
 			return candidates[i].mtime.After(candidates[j].mtime)
 		}
