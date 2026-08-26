@@ -93,6 +93,20 @@ func TestReadGrokBillingSnapshot_SkipsTruncatedLeadingLine(t *testing.T) {
 	}
 }
 
+func TestReadGrokBillingSnapshot_DoesNotScanOutsideBoundedTail(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-03T22:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
+		grokBillingLine("2026-08-10T17:08:10Z", 41, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
+		strings.Repeat("x", grokBillingLogTailBytes),
+	)
+
+	if _, ok := readGrokBillingSnapshot(base, []string{"acct-1"}); ok {
+		t.Fatal("a billing record older than the bounded tail must not be revived")
+	}
+}
+
 func TestReadGrokBillingSnapshot_RejectsRecordWithoutObservationTime(t *testing.T) {
 	base := t.TempDir()
 	helperWriteGrokLog(t, base,

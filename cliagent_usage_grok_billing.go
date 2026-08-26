@@ -188,8 +188,14 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return grokBillingSnapshot{}, false
 	}
-	tail, err := io.ReadAll(f)
-	if err != nil {
+	// Read exactly the tail length captured by Stat. An unbounded ReadAll after
+	// seeking can consume more than 1 MiB when Grok appends quickly enough to
+	// keep extending the file, defeating this gather's memory/work bound and
+	// mixing records from different filesystem snapshots.
+	tail := make([]byte, info.Size()-offset)
+	if _, err := io.ReadFull(f, tail); err != nil {
+		// The log was truncated or replaced between Stat and ReadFull. Fail
+		// closed and let the next bounded refresh gather a coherent snapshot.
 		return grokBillingSnapshot{}, false
 	}
 
