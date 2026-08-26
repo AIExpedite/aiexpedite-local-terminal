@@ -2806,3 +2806,51 @@ func TestCodexRolloutFallbackBuckets_CanonicalizesEachFrameBeforeMerge(t *testin
 		t.Fatalf("secondary legacy contributor=%+v, want migrated weekly 47%%", got)
 	}
 }
+
+func TestCodexRolloutFallbackBuckets_MixedRefusalPreventsHighWaterAdvance(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	helperWriteRolloutLimitLog(t, base, "19", "2026-06-19T11-00-00-mixed",
+		"2026-06-19T11:00:00.000Z", []map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 31.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}}, "2026-06-19T11:30:00.000Z")
+
+	contributors, limit, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || len(contributors) == 0 {
+		t.Fatal("expected numeric evidence preceding the refusal")
+	}
+	if limit.At.IsZero() {
+		t.Fatal("expected live refusal evidence")
+	}
+	if highWater != nil {
+		t.Fatalf("highWater=%+v, want unchanged while mixed-file refusal is live", *highWater)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_ClampsFutureMtimeHighWater(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	helperWriteRolloutLogAt(t, base, "26", "2026-08-26T13-50-00-future-mtime", "2026-08-26T13:50:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 31.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}})
+	rollout := filepath.Join(base, "sessions", "2026", "06", "26", "rollout-2026-08-26T13-50-00-future-mtime.jsonl")
+	future := now.Add(24 * time.Hour)
+	if err := os.Chtimes(rollout, future, future); err != nil {
+		t.Fatalf("chtimes rollout: %v", err)
+	}
+
+	_, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || highWater == nil {
+		t.Fatal("expected completed numeric rollout scan")
+	}
+	if highWater.mtimeNs != now.UnixNano() {
+		t.Fatalf("highWater mtime=%s, want clamped to %s", time.Unix(0, highWater.mtimeNs), now)
+	}
+}

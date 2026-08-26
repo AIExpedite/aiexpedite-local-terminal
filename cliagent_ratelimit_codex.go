@@ -1850,11 +1850,12 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		if fileLimit.At.After(limit.At) {
 			limit = fileLimit
 		}
-		if !ok && !fileLimit.At.IsZero() && now.Sub(fileLimit.At) <= codexUsageLimitNoticeMaxAge {
-			// A refusal-only file has no normalized contributor to persist. Keep
+		if !fileLimit.At.IsZero() && now.Sub(fileLimit.At) <= codexUsageLimitNoticeMaxAge {
+			// A refusal has no normalized contributor to persist. Keep
 			// it above the completed-scan watermark while its notice is live so
 			// an unchanged refresh re-reads the bounded rollout set instead of
-			// losing the only explanation for otherwise-Unknown usage rows.
+			// losing the explanation for otherwise-Unknown usage rows. This also
+			// applies when an earlier frame in the same file supplied a bucket.
 			allHandled = false
 		}
 		if !ok {
@@ -1883,6 +1884,12 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	}
 	var highWater *codexRolloutScanProgress
 	if allHandled {
+		// Filesystem mtimes are progress hints, not provider observation times.
+		// Never let a restored/future-dated file move the cursor beyond the
+		// current clock and suppress normally timestamped rollouts written next.
+		if nowNs := now.UnixNano(); maxSelectedMtimeNs > nowNs {
+			maxSelectedMtimeNs = nowNs
+		}
 		highWater = &codexRolloutScanProgress{
 			mtimeNs:             maxSelectedMtimeNs,
 			boundaryFingerprint: codexRolloutBoundaryFingerprint(candidates, maxSelectedMtimeNs),
