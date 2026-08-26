@@ -1419,7 +1419,8 @@ func helperWriteRolloutLimitLog(t *testing.T, base, day, name, ts string, frames
 // as "we cannot see it" when the truth is "it is spent". The refusal must be
 // surfaced instead.
 func TestCodexUsageParser_UsageLimitRefusalExplainsUnobservableCard(t *testing.T) {
-	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	cache := filepath.Join(t.TempDir(), "absent.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
 	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
@@ -1448,6 +1449,18 @@ func TestCodexUsageParser_UsageLimitRefusalExplainsUnobservableCard(t *testing.T
 	// that, so the wording must stay clear of those words.
 	if regexp.MustCompile(`(?i)\b(login|signed in|authenticate)\b`).MatchString(usage.Notice) {
 		t.Errorf("quota notice must not read as a login failure: %q", usage.Notice)
+	}
+	snap, cacheOK := loadCodexRateLimitSnapshot(cache)
+	if cacheOK && snap.RolloutHighWaterMtimeMs != 0 {
+		t.Fatalf("refusal-only rollout advanced high-water to %d; want retry while notice is live", snap.RolloutHighWaterMtimeMs)
+	}
+
+	// The refusal is deliberately not persisted: the typed cache remains
+	// normalized-metrics-only. An unchanged second refresh must therefore keep
+	// the rollout eligible and reproduce the notice from bounded source evidence.
+	again, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now.Add(time.Minute))
+	if !ok || again.NoticeSeverity != "error" || !strings.Contains(again.Notice, "usage limit was reached") {
+		t.Fatalf("second unchanged refresh = (%q, %q, ok=%v), want retained quota notice", again.Notice, again.NoticeSeverity, ok)
 	}
 }
 

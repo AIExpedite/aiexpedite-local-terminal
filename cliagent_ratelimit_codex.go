@@ -1671,6 +1671,13 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		if fileLimit.At.After(limit.At) {
 			limit = fileLimit
 		}
+		if !ok && !fileLimit.At.IsZero() && now.Sub(fileLimit.At) <= codexUsageLimitNoticeMaxAge {
+			// A refusal-only file has no normalized contributor to persist. Keep
+			// it above the completed-scan watermark while its notice is live so
+			// an unchanged refresh re-reads the bounded rollout set instead of
+			// losing the only explanation for otherwise-Unknown usage rows.
+			allHandled = false
+		}
 		if !ok {
 			continue
 		}
@@ -1754,9 +1761,10 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		// A deterministic open failure is handled progress: retrying the same
-		// unchanged mtime cannot yield contributors.
-		return nil, time.Time{}, codexUsageLimitEvidence{}, true, false
+		// Only a file that definitively vanished is handled progress. Permission
+		// failures, descriptor exhaustion, and other open errors can be transient;
+		// advancing the watermark past them would suppress a later successful read.
+		return nil, time.Time{}, codexUsageLimitEvidence{}, codexRolloutOpenFailureHandled(err), false
 	}
 	defer f.Close()
 
@@ -1881,6 +1889,10 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	// clears instead of showing old usage — without flattening two distinct
 	// identities that share a storage slot into one bucket here.
 	return acc, sessionStart, limit, true, true
+}
+
+func codexRolloutOpenFailureHandled(err error) bool {
+	return os.IsNotExist(err)
 }
 
 // codexUsageLimitEvidence records that Codex refused a turn because the

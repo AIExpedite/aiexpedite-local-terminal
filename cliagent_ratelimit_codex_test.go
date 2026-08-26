@@ -2342,6 +2342,24 @@ func TestCodexBucketsFromRolloutFile_UntimestampedNumericLineDoesNotBlockLaterVa
 	}
 }
 
+func TestCodexRolloutOpenFailureHandled_RetriesTransientErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"vanished file", &os.PathError{Op: "open", Path: "rollout.jsonl", Err: os.ErrNotExist}, true},
+		{"temporary permission failure", &os.PathError{Op: "open", Path: "rollout.jsonl", Err: os.ErrPermission}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codexRolloutOpenFailureHandled(tc.err); got != tc.want {
+				t.Fatalf("handled=%v, want %v for %v", got, tc.want, tc.err)
+			}
+		})
+	}
+}
+
 func TestCodexRateLimitSnapshot_RedactsRawEnvelopeFields(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
