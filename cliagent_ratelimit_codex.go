@@ -979,7 +979,7 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 	anchor, observedAt := codexObservationTimes(raw, now, true)
 	updates, clears, fullSnapshot, present, emptyAuthoritative := extractCodexRateLimitBucketsFull(raw, anchor)
 	codexStampContributorObservations(updates, observedAt)
-	updates = codexCanonicalizeLiveContributors(updates)
+	updates = codexCanonicalizeContributors(updates)
 	// A full snapshot must be processed even when it carries no buckets and no
 	// explicit nulls IF it is authoritative-empty: an `account/rateLimits/read`
 	// response whose container is literally `{}` declares the account now has NO
@@ -1075,13 +1075,13 @@ func codexStampContributorObservations(contributors map[string]map[string]codexR
 	}
 }
 
-// codexCanonicalizeLiveContributors normalizes the two displayed identities
+// codexCanonicalizeContributors normalizes the two displayed identities
 // before the slot-keyed cache merge. Codex can report a weekly bucket under
 // `primary` (and vice versa); merging that physical key directly can overwrite a
 // cached session contributor with the same limit id before identity reconciliation
-// gets a chance to preserve both. Rollout contributors are normalized at their
-// reconstruction boundary for the same reason.
-func codexCanonicalizeLiveContributors(contributors map[string]map[string]codexRateLimitBucket) map[string]map[string]codexRateLimitBucket {
+// gets a chance to preserve both. Apply this to each live or rollout frame before
+// sparse merging so successive frames cannot collapse distinct identities first.
+func codexCanonicalizeContributors(contributors map[string]map[string]codexRateLimitBucket) map[string]map[string]codexRateLimitBucket {
 	type placement struct {
 		sourceSlot string
 		bucket     codexRateLimitBucket
@@ -2005,6 +2005,7 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		// treated as clears — exactly what we want when mining for live usage.
 		if updates, _ := extractCodexRateLimitBuckets(raw, eventTime); len(updates) > 0 {
 			codexStampContributorObservations(updates, observedAt)
+			updates = codexCanonicalizeContributors(updates)
 			// Merge, don't replace: token_count notifications are sparse, so a
 			// later frame restating only `primary` must not drop a `secondary`
 			// reading an earlier frame in this same file already captured.

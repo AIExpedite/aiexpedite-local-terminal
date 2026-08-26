@@ -2772,3 +2772,37 @@ func TestCodexRolloutFallbackBuckets_CanonicalizesMixedIdentitySameLimit(t *test
 		}
 	}
 }
+
+func TestCodexRolloutFallbackBuckets_CanonicalizesEachFrameBeforeMerge(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	helperWriteRolloutLogAt(t, base, "26", "2026-08-26T13-50-00-migrated", "2026-08-26T13:50:00Z",
+		[]map[string]any{
+			{
+				"primary": map[string]any{
+					"used_percent": 31.0, "window_minutes": 300.0,
+					"resets_at": float64(now.Add(time.Hour).Unix()),
+				},
+			},
+			{
+				"primary": map[string]any{
+					"used_percent": 47.0, "window_minutes": 10080.0,
+					"resets_at": float64(now.Add(72 * time.Hour).Unix()),
+				},
+			},
+		})
+
+	contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok {
+		t.Fatal("expected migrated rollout contributors")
+	}
+	if highWater == nil {
+		t.Fatal("expected completed rollout scan high-water")
+	}
+	if got := contributors[codexWindowPrimary][codexLegacyLimitID]; got.UsedPercentage != 31 {
+		t.Fatalf("primary legacy contributor=%+v, want preserved session 31%%", got)
+	}
+	if got := contributors[codexWindowSecondary][codexLegacyLimitID]; got.UsedPercentage != 47 {
+		t.Fatalf("secondary legacy contributor=%+v, want migrated weekly 47%%", got)
+	}
+}
