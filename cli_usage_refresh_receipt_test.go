@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -34,5 +35,18 @@ func TestCLIUsageRefreshReceiptDomainSeparation(t *testing.T) {
 	canonical, _, _, _ := canonicalCLIUsageRefreshReceipt("refresh-1", 1700000000000, false, nil, []cliAgentUsageError{{Provider: "codex", Message: "unavailable"}})
 	if !strings.HasPrefix(string(canonical), cliUsageReceiptDomain) {
 		t.Fatal("missing domain")
+	}
+}
+
+func TestCLIUsageRefreshReceiptFormatsMetricsAsDecimalStrings(t *testing.T) {
+	total := 1e-7
+	remaining := math.Copysign(0, -1)
+	canonical, _, _, err := canonicalCLIUsageRefreshReceipt("r1", 1, true, []cliAgentUsage{{Provider: "codex", CollectedAt: "now", Metrics: []cliAgentUsageMetric{{Kind: "quota", Total: &total, Remaining: &remaining}}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := cliUsageReceiptDomain + `{"version":1,"refreshId":"r1","challengeTs":1,"success":true,"cliAgents":[{"provider":"codex","metrics":[{"kind":"quota","total":"0.0000001","remaining":"0"}],"collectedAt":"now"}],"errors":[]}`
+	if string(canonical) != expected {
+		t.Fatalf("unexpected canonical bytes: %s", canonical)
 	}
 }
