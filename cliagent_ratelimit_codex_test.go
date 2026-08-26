@@ -2489,3 +2489,40 @@ func TestCodexRolloutFallbackBuckets_StatFailurePreventsHighWaterAdvance(t *test
 		t.Fatalf("highWater=%d, want unchanged after incomplete metadata discovery", *highWater)
 	}
 }
+
+func TestCodexRolloutFallbackBuckets_CanonicalizesMixedIdentitySameLimit(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	helperWriteRolloutLogAt(t, base, "26", "2026-08-26T13-50-00-session", "2026-08-26T13:50:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 31.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}})
+	helperWriteRolloutLogAt(t, base, "26", "2026-08-26T13-55-00-weekly", "2026-08-26T13:55:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 47.0, "window_minutes": 10080.0,
+				"resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			},
+		}})
+
+	contributors, _, _, _, ok := codexRolloutFallbackBuckets(context.Background(), base, now, 0)
+	if !ok {
+		t.Fatal("expected mixed-identity rollout contributors")
+	}
+	if got := contributors[codexWindowPrimary][codexLegacyLimitID]; got.UsedPercentage != 31 {
+		t.Fatalf("primary legacy contributor=%+v, want canonical session 31%%", got)
+	}
+	if got := contributors[codexWindowSecondary][codexLegacyLimitID]; got.UsedPercentage != 47 {
+		t.Fatalf("secondary legacy contributor=%+v, want canonical weekly 47%%", got)
+	}
+	for slot, limits := range contributors {
+		for limitID := range limits {
+			if strings.ContainsRune(limitID, '\x00') {
+				t.Fatalf("slot %q contains synthetic limit id %q", slot, limitID)
+			}
+		}
+	}
+}

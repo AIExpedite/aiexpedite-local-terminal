@@ -1705,24 +1705,34 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// there is nothing to backfill.
 		return nil, limit, latestObservation, highWater, false
 	}
-	// Rebuild the slot-keyed contributor map downstream expects. Each winner is
-	// stored under its original slot (so a duration-less bucket keeps its
-	// slot-default identity) and its limit id. When two DIFFERENT identities
-	// collide on the same (slot, limit id) — a banded weekly and a banded session
-	// both observed under the `primary` slot as the same legacy limit — the second
-	// is stored under an identity-suffixed limit key so neither is lost. The suffix
-	// never changes identity (that derives from window minutes + slot), so it is
-	// invisible to downstream partitioning.
+	// Rebuild the slot-keyed contributor map downstream expects. Normalize the
+	// displayed identities onto their canonical cache slots while preserving the
+	// provider's real limit id. Codex can transiently emit both a session and
+	// weekly reading under `primary`; inventing a synthetic key for one would no
+	// longer match a later sparse update for the real limit, leaving stale evidence
+	// behind. Non-canonical durations retain their source slot so the display path
+	// can apply its slot-scoped fallback.
 	acc := map[string]map[string]codexRateLimitBucket{}
 	for _, c := range winners {
-		slotMap := acc[c.slot]
+		slot := c.slot
+		switch codexWindowIdentity(c.bucket.WindowMinutes, c.slot) {
+		case codexIdentitySession:
+			slot = codexWindowPrimary
+		case codexIdentityWeekly:
+			slot = codexWindowSecondary
+		}
+		slotMap := acc[slot]
 		if slotMap == nil {
 			slotMap = map[string]codexRateLimitBucket{}
-			acc[c.slot] = slotMap
+			acc[slot] = slotMap
 		}
 		limitKey := c.limitID
 		if _, taken := slotMap[limitKey]; taken {
-			limitKey = c.limitID + "\x00" + codexWindowIdentity(c.bucket.WindowMinutes, c.slot)
+			// Only non-canonical duration identities can still collide after the
+			// displayed rows were normalized above. Preserve both rather than
+			// silently dropping one; these plan-specific fallback rows have no
+			// stable canonical slot available.
+			limitKey += "\x00" + codexWindowIdentity(c.bucket.WindowMinutes, c.slot)
 		}
 		slotMap[limitKey] = c.bucket
 	}
