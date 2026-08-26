@@ -573,6 +573,17 @@ func TestReadGrokBillingSnapshot_RejectsLogWithoutAnyIdentity(t *testing.T) {
 	}
 }
 
+func TestReadGrokBillingSnapshot_RejectsSelfAttributedBillingRecord(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:08:10Z","msg":"billing: fetched credits config","user_id":"acct-1","ctx":{"config":{"creditUsagePercent":52,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-17T22:28:32Z"}}}}`,
+	)
+
+	if _, ok := readGrokBillingSnapshot(base, []string{"acct-1"}); ok {
+		t.Fatal("a billing record must not satisfy its own preceding-identity requirement")
+	}
+}
+
 func TestGrokIdentityCandidates_CollectsEveryAccountField(t *testing.T) {
 	base := t.TempDir()
 	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{

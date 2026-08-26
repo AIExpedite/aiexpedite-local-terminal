@@ -230,7 +230,7 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 // lineIdx was PRODUCED by the account the current credentials resolve to.
 //
 // Binding is per-record, not per-log: the identity that counts is the newest one
-// logged at or before the record, because that is who the CLI was acting as when
+// logged before the record, because that is who the CLI was acting as when
 // it fetched those credits. Comparing the newest identity in the whole tail
 // instead would accept account B's older record as soon as account A logged in
 // and had not fetched billing yet.
@@ -241,7 +241,10 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 			wanted[trimmed] = true
 		}
 	}
-	for i := lineIdx; i >= 0; i-- {
+	// Start before the billing line. The observed billing envelope carries no
+	// identity, so allowing a lookalike user_id on the record to authenticate
+	// itself would defeat the cross-account boundary this scan enforces.
+	for i := lineIdx - 1; i >= 0; i-- {
 		match := grokLogUserIDRe.FindSubmatch(lines[i])
 		if match == nil {
 			continue
@@ -254,7 +257,7 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 		}
 		return wanted[strings.ToLower(string(match[1]))]
 	}
-	// Nothing identifies the producer, anywhere at or before the record. That is
+	// Nothing identifies the producer anywhere before the record. That is
 	// not evidence it belongs to the current login: `unified.jsonl` is shared
 	// across logins, so a CLI old enough never to log an identity leaves the
 	// previous account's credits sitting in the same file for the next one to
