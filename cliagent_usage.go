@@ -142,8 +142,12 @@ type cliAgentUsageParser interface {
 // handleCliUsageRefreshResult uses these to advance cliUsageLastFailedAt
 // when zero providers returned data.
 type cliAgentUsageError struct {
-	Provider string `json:"provider"`
-	Message  string `json:"message"`
+	Provider      string `json:"provider"`
+	ErrorCategory string `json:"errorCategory"`
+	// Message is local-only diagnostic input. Refresh-result serialization and
+	// receipt canonicalization deliberately exclude it so parser/vendor text,
+	// paths, and credential fragments cannot cross the Pub/Sub boundary.
+	Message string `json:"-"`
 }
 
 // gatherCLIAgentUsage walks the active catalog and returns the slice the
