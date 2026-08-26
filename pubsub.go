@@ -691,8 +691,11 @@ type resultMsg struct {
 	// presence of the array as the signal to advance
 	// cliUsageLastCheckedAt; omitempty would force every empty-success
 	// poll down the handled-failure path.
-	CliAgents []cliAgentUsage      `json:"cliAgents"`
-	Errors    []cliAgentUsageError `json:"errors,omitempty"`
+	CliAgents      []cliAgentUsage      `json:"cliAgents"`
+	Errors         []cliAgentUsageError `json:"errors"`
+	ReceiptVersion int                  `json:"receiptVersion,omitempty"`
+	ChallengeTs    int64                `json:"challengeTs,omitempty"`
+	Receipt        string               `json:"receipt,omitempty"`
 
 	// __env_inspect_result__ payload — populated only when
 	// Type == "__env_inspect_result__". Carries the read-only workstation
@@ -940,8 +943,8 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	persistCLIAgentCatalogUpdate(cfg, cmd.CliAgentCatalog, "pubsub", "refresh command")
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Printf("%s[pubsub] panic in CLI usage refresh handler: %v%s\n", colorRed, r, colorReset)
-			res := makeCLIUsageRefreshFailureResult(cmd, cfg, fmt.Sprintf("panic: %v", r))
+			fmt.Printf("%s[pubsub] CLI usage refresh handler failed%s\n", colorRed, colorReset)
+			res := makeCLIUsageRefreshFailureResult(cmd, cfg, "usage collection failed")
 			if err := publishMsg(ctx, topic, res); err != nil {
 				fmt.Printf("%s[pubsub] Failed to publish panic refresh result: %v%s\n", colorRed, err, colorReset)
 				publishErr = err
@@ -967,14 +970,6 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	// binary, which a login does not change.
 	SetOpenCodeReadinessForceProbe(true)
 	usage, errs := GatherCLIAgentUsageOnly(ctx)
-	// Refresh the cached CliAgents on the shared MachineInfo so the next
-	// /auth/token doesn't POST the stale 6h-gather snapshot and revert
-	// the backend's quota state. Only update on a successful poll —
-	// preserving the prior cache on handled failure is intentional and
-	// matches the backend's "don't overwrite snapshot on failure" rule.
-	if len(errs) == 0 {
-		SetCachedCLIAgents(usage)
-	}
 	// success is "we polled successfully", NOT "we found something". An
 	// agent with zero providers installed (or zero providers that
 	// matched our parsers) is a legitimate empty poll — the backend
@@ -982,25 +977,48 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	// failure marker. Only treat as failure when at least one provider
 	// threw (panic / context cancel / parse error).
 	success := len(errs) == 0
+	receipt, normalizedUsage, normalizedErrors, receiptErr := prepareCLIUsageRefreshResult(cfg.CommandSecret, cmd.RefreshID, cmd.Ts, success, usage, errs)
+	if receiptErr != nil {
+		res := makeCLIUsageRefreshFailureResult(cmd, cfg, "usage result rejected")
+		if err := publishMsg(ctx, topic, res); err != nil {
+			return err
+		}
+		return nil
+	}
 
 	res := resultMsg{
-		ID:          cmd.ID,
-		WorkspaceID: cmd.WorkspaceID,
-		UID:         cmd.UID,
-		AgentID:     cfg.AgentID,
-		Ts:          time.Now().UnixMilli(),
-		Version:     Version,
-		Type:        "__cli_usage_refresh_result__",
-		RefreshID:   cmd.RefreshID,
-		Success:     &success,
-		CliAgents:   usage,
-		Errors:      errs,
+		ID:             cmd.ID,
+		WorkspaceID:    cmd.WorkspaceID,
+		UID:            cmd.UID,
+		AgentID:        cfg.AgentID,
+		Ts:             time.Now().UnixMilli(),
+		Version:        Version,
+		Type:           "__cli_usage_refresh_result__",
+		RefreshID:      cmd.RefreshID,
+		Success:        &success,
+		CliAgents:      normalizedUsage,
+		Errors:         normalizedErrors,
+		ReceiptVersion: 1,
+		ChallengeTs:    cmd.Ts,
+		Receipt:        receipt,
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[pubsub] Failed to publish refresh result: %v%s\n", colorRed, err, colorReset)
 		return err
 	}
 	return nil
+}
+
+// prepareCLIUsageRefreshResult validates and signs the exact provider snapshot
+// that will be published. Only that normalized snapshot may replace the shared
+// MachineInfo cache; otherwise a later /auth/token request could persist data
+// that the signed refresh rejected.
+func prepareCLIUsageRefreshResult(secret, refreshID string, challengeTs int64, success bool, usage []cliAgentUsage, errs []cliAgentUsageError) (string, []cliAgentUsage, []cliAgentUsageError, error) {
+	receipt, normalizedUsage, normalizedErrors, err := signCLIUsageRefreshReceipt(secret, refreshID, challengeTs, success, usage, errs)
+	if err == nil && success {
+		SetCachedCLIAgents(normalizedUsage)
+	}
+	return receipt, normalizedUsage, normalizedErrors, err
 }
 
 // handleEnvInspectCommand fulfils a read-only __env_inspect__ demand command
@@ -1062,25 +1080,43 @@ func makeCLIUsageRefreshFailureResult(cmd commandMsg, cfg *Config, message strin
 	if cfg != nil && cfg.AgentID != "" {
 		agentID = cfg.AgentID
 	}
+	secret := ""
+	if cfg != nil {
+		secret = cfg.CommandSecret
+	}
+	errs := []cliAgentUsageError{{Provider: "_dispatch", Message: message}}
+	receipt, agents, normalizedErrors, receiptErr := signCLIUsageRefreshReceipt(secret, cmd.RefreshID, cmd.Ts, false, nil, errs)
+	receiptVersion := 1
+	challengeTs := cmd.Ts
+	if receiptErr != nil {
+		agents, normalizedErrors = []cliAgentUsage{}, errs
+		receiptVersion, challengeTs = 0, 0
+	}
 	return resultMsg{
-		ID:          cmd.ID,
-		WorkspaceID: cmd.WorkspaceID,
-		UID:         cmd.UID,
-		AgentID:     agentID,
-		Ts:          time.Now().UnixMilli(),
-		Version:     Version,
-		Type:        "__cli_usage_refresh_result__",
-		RefreshID:   cmd.RefreshID,
-		Success:     &failure,
-		Errors: []cliAgentUsageError{
-			{Provider: "_dispatch", Message: message},
-		},
+		ID:             cmd.ID,
+		WorkspaceID:    cmd.WorkspaceID,
+		UID:            cmd.UID,
+		AgentID:        agentID,
+		Ts:             time.Now().UnixMilli(),
+		Version:        Version,
+		Type:           "__cli_usage_refresh_result__",
+		RefreshID:      cmd.RefreshID,
+		Success:        &failure,
+		CliAgents:      agents,
+		Errors:         normalizedErrors,
+		ReceiptVersion: receiptVersion,
+		ChallengeTs:    challengeTs,
+		Receipt:        receipt,
 	}
 }
 
 func publishCLIUsageRefreshFailure(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config, message string) error {
 	fmt.Printf("%s[pubsub] CLI usage refresh rejected: %s%s\n", colorRed, message, colorReset)
 	return publishMsg(ctx, topic, makeCLIUsageRefreshFailureResult(cmd, cfg, message))
+}
+
+func canPublishSignedCLIUsageFailure(cmd commandMsg, cfg *Config) bool {
+	return cfg != nil && cfg.CommandSecret != "" && verifySignature(cmd, cfg.CommandSecret)
 }
 
 // publishMsg marshals res and publishes it on topic using ctx.
@@ -1237,6 +1273,10 @@ func runPubSubConnection(cfg *Config) error {
 			if err := json.Unmarshal(m.Data, &cmd); err == nil {
 				message := commandPayloadTooLargeMessage(len(m.Data), maxPubSubCatalogMessageBytes)
 				if cmd.Command == "__cli_usage_refresh__" {
+					if !canPublishSignedCLIUsageFailure(cmd, cfg) {
+						m.Ack()
+						return
+					}
 					release, allowed := beginTrackedRejectionPublish()
 					if !allowed {
 						m.Nack()
@@ -1282,6 +1322,10 @@ func runPubSubConnection(cfg *Config) error {
 
 			message := commandPayloadTooLargeMessage(len(m.Data), messageSizeLimit)
 			if cmd.Command == "__cli_usage_refresh__" {
+				if !canPublishSignedCLIUsageFailure(cmd, cfg) {
+					m.Ack()
+					return
+				}
 				release, allowed := beginTrackedRejectionPublish()
 				if !allowed {
 					m.Nack()

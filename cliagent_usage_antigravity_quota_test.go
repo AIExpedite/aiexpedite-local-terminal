@@ -286,6 +286,30 @@ func TestAntigravityQuotaMetrics_SkipsUnknownWindow(t *testing.T) {
 	}
 }
 
+func TestAntigravityQuotaMetrics_CapsSignedRefreshMetrics(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	snap := antigravityQuotaSnapshot{ObservedAt: now.Format(time.RFC3339)}
+	for i := 0; i < cliUsageMaxMetricsPerProvider+2; i++ {
+		snap.Buckets = append(snap.Buckets, antigravityQuotaBucket{
+			Group:             fmt.Sprintf("Group %02d Models", i),
+			Window:            "weekly",
+			RemainingFraction: 0.5,
+			ResetTime:         "2026-08-19T00:00:00Z",
+		})
+	}
+
+	metrics := antigravityQuotaMetrics(snap, now)
+	if len(metrics) != cliUsageMaxMetricsPerProvider {
+		t.Fatalf("rendered %d metrics, want signed-refresh cap %d", len(metrics), cliUsageMaxMetricsPerProvider)
+	}
+	if metrics[len(metrics)-1].Label != "Group 31 — Weekly quota" {
+		t.Fatalf("last retained metric = %q, want stable first %d entries", metrics[len(metrics)-1].Label, cliUsageMaxMetricsPerProvider)
+	}
+	if _, _, _, err := signCLIUsageRefreshReceipt("secret", "refresh-1", 1, true, []cliAgentUsage{{Provider: "antigravity", Metrics: metrics}}, nil); err != nil {
+		t.Fatalf("bounded Antigravity metrics rejected from signed refresh: %v", err)
+	}
+}
+
 // Between `agy` runs the card replays the cached reading with its ORIGINAL
 // observation time, so the age shown is the age of the provider's figure.
 func TestAntigravityUsageParser_ReplaysCachedSnapshotWhenServerIsDown(t *testing.T) {

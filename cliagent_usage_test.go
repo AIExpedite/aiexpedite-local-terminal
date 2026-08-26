@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -3279,6 +3280,41 @@ func TestGatherCLIAgentUsageOnly_RespectsCanceledContext(t *testing.T) {
 	usage, _ := GatherCLIAgentUsageOnly(ctx)
 	if usage == nil {
 		t.Fatalf("expected empty slice on canceled context, got nil")
+	}
+}
+
+func TestGatherCLIAgentUsageOnly_CapsProvidersBeforeReceiptSigning(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test executable: %v", err)
+	}
+	catalog := make([]cliAgentCatalogEntry, 0, cliUsageMaxProviders+2)
+	for i := 0; i < cliUsageMaxProviders+2; i++ {
+		id := fmt.Sprintf("provider-%03d", i)
+		catalog = append(catalog, cliAgentCatalogEntry{
+			ID:           id,
+			DisplayName:  id,
+			DisplayOrder: i,
+			Command:      executable,
+		})
+	}
+	SetCLIAgentCatalog(catalog)
+	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
+
+	usage, errs := GatherCLIAgentUsageOnly(context.Background())
+	if len(errs) != 0 {
+		t.Fatalf("oversized catalog returned gather errors: %#v", errs)
+	}
+	if len(usage) != cliUsageMaxProviders {
+		t.Fatalf("gathered %d providers, want signed-refresh cap %d", len(usage), cliUsageMaxProviders)
+	}
+	if usage[len(usage)-1].Provider != "provider-063" {
+		t.Fatalf("last retained provider = %q, want stable first %d entries", usage[len(usage)-1].Provider, cliUsageMaxProviders)
+	}
+	if _, normalized, _, err := signCLIUsageRefreshReceipt("secret", "refresh-1", 1, true, usage, errs); err != nil {
+		t.Fatalf("capped provider snapshot should sign successfully: %v", err)
+	} else if len(normalized) != cliUsageMaxProviders {
+		t.Fatalf("signed %d providers, want %d", len(normalized), cliUsageMaxProviders)
 	}
 }
 

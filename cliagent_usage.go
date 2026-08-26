@@ -109,6 +109,16 @@ type cliAgentUsage struct {
 	NoticeURL      string `json:"noticeUrl,omitempty"`
 }
 
+// These are the signed-refresh contract's collection caps. The demand-driven
+// gather and parsers that can enumerate an unbounded number of entries must
+// apply them while collecting so a large catalog or provider response cannot
+// invalidate an otherwise usable refresh result.
+const (
+	cliUsageMaxProviders          = 64
+	cliUsageMaxMetricsPerProvider = 32
+	cliUsageMaxModelsPerProvider  = 128
+)
+
 const (
 	loginExpirationKnown       = "known"
 	loginExpirationRefreshable = "refreshable"
@@ -311,6 +321,9 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}
 		out = append(out, *usage)
+		if len(out) == cliUsageMaxProviders {
+			break
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })
 	return out, errs
