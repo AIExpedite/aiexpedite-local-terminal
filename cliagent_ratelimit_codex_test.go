@@ -2508,6 +2508,28 @@ func TestCodexRolloutFallbackBuckets_StatFailurePreventsHighWaterAdvance(t *test
 	}
 }
 
+func TestCodexDiscoverRolloutCandidates_StopsWhenContextCancels(t *testing.T) {
+	base := t.TempDir()
+	for _, day := range []string{"24", "25", "26"} {
+		dir := filepath.Join(base, "sessions", "2026", "08", day)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "rollout-test.jsonl"), []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := &cancelAfterChecksContext{after: 5, done: make(chan struct{})}
+	_, complete := codexDiscoverRolloutCandidates(ctx, base, 0)
+	if complete {
+		t.Fatal("discovery complete=true, want cancellation to stop traversal and preserve the high-water")
+	}
+	if ctx.checks > 8 {
+		t.Fatalf("context checked %d times, want traversal to stop promptly after cancellation", ctx.checks)
+	}
+}
+
 func TestCodexRolloutFallbackBuckets_CanonicalizesMixedIdentitySameLimit(t *testing.T) {
 	base := t.TempDir()
 	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)

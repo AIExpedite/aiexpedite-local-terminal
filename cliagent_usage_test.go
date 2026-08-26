@@ -2077,6 +2077,48 @@ func TestCodexUsageParser_RolloutAccumulatesAcrossFiles(t *testing.T) {
 	}
 }
 
+// A legacy cache has no rollout high-water. When only one identity is cached,
+// its observation time must not hide an older rollout that can populate the
+// missing identity.
+func TestCodexUsageParser_PartialLegacyCacheScansFromZero(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 18, ObservedAtMs: now.Add(-10 * time.Minute).UnixMilli(),
+			ResetsAtMs: now.Add(time.Hour).UnixMilli(), WindowMinutes: 300,
+			usageKnown: true, resetKnown: true,
+		},
+	}, nil, now.Add(-10*time.Minute), fp)
+
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T11-20-00-weekly", "2026-06-19T11:20:00Z",
+		[]map[string]any{{
+			"secondary": map[string]any{
+				"used_percent": 42.0, "window_minutes": 10080.0,
+				"resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			},
+		}})
+	rolloutPath := filepath.Join(codexHome, "sessions", "2026", "06", "19", "rollout-2026-06-19T11-20-00-weekly.jsonl")
+	olderMtime := now.Add(-20 * time.Minute)
+	if err := os.Chtimes(rolloutPath, olderMtime, olderMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	usage, ok := codexUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 18 {
+		t.Fatalf("session metric=%+v, want cached 18%%", usage.Metrics[0])
+	}
+	if usage.Metrics[1].Consumed == nil || *usage.Metrics[1].Consumed != 42 {
+		t.Fatalf("weekly metric=%+v, want older rollout 42%%", usage.Metrics[1])
+	}
+}
+
 // The rollout accumulator must key by metric IDENTITY, not physical slot. When
 // the newest log carries only a MIGRATED weekly under the `primary` slot
 // (weekly-band minutes), a slot-keyed accumulator would lock `primary` and drop

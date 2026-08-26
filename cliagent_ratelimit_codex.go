@@ -1483,13 +1483,86 @@ func codexRolloutScanThreshold(currentFingerprint string, now time.Time) int64 {
 	} {
 		b, present := codexIdentityDisplayBucket(parts, row.identity, row.slot, now)
 		if !present || b.ObservedAtMs <= 0 || (b.ResetsAtMs > 0 && now.UnixMilli() >= b.ResetsAtMs) {
-			continue
+			// A legacy snapshot has no completed-scan watermark. If either
+			// display row is absent, scanning from the populated row's timestamp
+			// could permanently hide an older rollout that supplies the missing
+			// identity. Start from zero until both rows are observable.
+			return 0
 		}
 		if oldest == 0 || b.ObservedAtMs < oldest {
 			oldest = b.ObservedAtMs
 		}
 	}
 	return oldest
+}
+
+type codexRolloutCandidate struct {
+	path  string
+	mtime time.Time
+}
+
+// codexDiscoverRolloutCandidates walks the fixed YYYY/MM/DD rollout layout
+// while checking the optional scan context between filesystem entries. Unlike
+// filepath.Glob, discovery therefore stops when the Codex child budget expires
+// instead of traversing an arbitrarily large session history after cancellation.
+// complete is false when cancellation or a metadata error means scan progress
+// must not advance.
+func codexDiscoverRolloutCandidates(ctx context.Context, base string, mtimeAfterMs int64) ([]codexRolloutCandidate, bool) {
+	root := filepath.Join(base, "sessions")
+	candidates := []codexRolloutCandidate{}
+	complete := true
+	walkErr := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			complete = false
+			return err
+		}
+		if walkErr != nil {
+			complete = false
+			return nil
+		}
+
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			complete = false
+			return nil
+		}
+		if rel == "." {
+			return nil
+		}
+		depth := len(strings.Split(rel, string(filepath.Separator)))
+		if entry.IsDir() {
+			if depth >= 4 {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if depth != 4 {
+			return nil
+		}
+		matched, err := filepath.Match("rollout-*.jsonl", entry.Name())
+		if err != nil || !matched {
+			return nil
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			// A transient metadata failure leaves this discovery pass incomplete.
+			// We may still consume other candidates, but must not advance progress
+			// past a file whose mtime could not be evaluated.
+			complete = false
+			return nil
+		}
+		if info.ModTime().UnixMilli() > mtimeAfterMs {
+			candidates = append(candidates, codexRolloutCandidate{path: path, mtime: info.ModTime()})
+		}
+		return nil
+	})
+	if walkErr != nil {
+		if os.IsNotExist(walkErr) {
+			return nil, true
+		}
+		complete = false
+	}
+	return candidates, complete
 }
 
 // codexUsageLimitNotice renders the card notice for a quota refusal, or "" when
@@ -1579,8 +1652,8 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		authMod = info.ModTime()
 	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
-	matches, err := filepath.Glob(filepath.Join(base, "sessions", "*", "*", "*", "rollout-*.jsonl"))
-	if err != nil || len(matches) == 0 {
+	candidates, discoveryComplete := codexDiscoverRolloutCandidates(ctx, base, mtimeAfterMs)
+	if len(candidates) == 0 {
 		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
 	}
 	// Rank candidates by file mtime descending, NOT by filename (= session
@@ -1591,32 +1664,6 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	// written most recently (the live source of truth) is considered first.
 	// Ties fall back to filename order so a deterministic chronological tiebreak
 	// applies when two files share an mtime.
-	type rolloutCandidate struct {
-		path  string
-		mtime time.Time
-	}
-	candidates := make([]rolloutCandidate, 0, len(matches))
-	discoveryComplete := true
-	for _, m := range matches {
-		if ctx.Err() != nil {
-			return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
-		}
-		info, err := os.Stat(m)
-		if err != nil {
-			// A transient metadata failure leaves this discovery pass incomplete.
-			// We may still consume other candidates, but must not advance progress
-			// past a file whose mtime could not be evaluated.
-			discoveryComplete = false
-			continue
-		}
-		if info.ModTime().UnixMilli() <= mtimeAfterMs {
-			continue
-		}
-		candidates = append(candidates, rolloutCandidate{path: m, mtime: info.ModTime()})
-	}
-	if len(candidates) == 0 {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
-	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		if !candidates[i].mtime.Equal(candidates[j].mtime) {
 			return candidates[i].mtime.After(candidates[j].mtime)
