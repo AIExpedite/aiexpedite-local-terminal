@@ -87,7 +87,7 @@ func canonicalProvider(agent cliAgentUsage) (canonicalCLIUsageProvider, error) {
 			return canonicalCLIUsageProvider{}, errors.New("invalid receipt bounds")
 		}
 	}
-	if len(agent.Metrics) > 32 || len(agent.Models) > cliUsageMaxModelsPerProvider {
+	if len(agent.Metrics) > cliUsageMaxMetricsPerProvider || len(agent.Models) > cliUsageMaxModelsPerProvider {
 		return canonicalCLIUsageProvider{}, errors.New("invalid receipt bounds")
 	}
 	for _, model := range agent.Models {

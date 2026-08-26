@@ -120,3 +120,36 @@ func TestSignedCLIUsageFailureRequiresVerifiedChallenge(t *testing.T) {
 		t.Fatalf("missing signed failure receipt metadata: %#v", res)
 	}
 }
+
+func TestPrepareCLIUsageRefreshResult_CachesOnlyValidatedNormalizedSnapshot(t *testing.T) {
+	machineInfoMu.Lock()
+	originalCache := machineInfoCache
+	machineInfoCache = &MachineInfo{CliAgents: []cliAgentUsage{{Provider: "previous"}}}
+	machineInfoMu.Unlock()
+	t.Cleanup(func() {
+		machineInfoMu.Lock()
+		machineInfoCache = originalCache
+		machineInfoMu.Unlock()
+	})
+
+	rejected := []cliAgentUsage{{Provider: "invalid", Path: string(make([]byte, 2049))}}
+	if _, _, _, err := prepareCLIUsageRefreshResult("secret", "refresh-1", 1, true, rejected, nil); err == nil {
+		t.Fatal("oversized provider snapshot should be rejected")
+	}
+	if got := GetMachineInfo().CliAgents; len(got) != 1 || got[0].Provider != "previous" {
+		t.Fatalf("rejected snapshot replaced cache: %#v", got)
+	}
+
+	valid := []cliAgentUsage{{Provider: "zeta"}, {Provider: "alpha"}}
+	_, normalized, _, err := prepareCLIUsageRefreshResult("secret", "refresh-2", 2, true, valid, nil)
+	if err != nil {
+		t.Fatalf("valid provider snapshot rejected: %v", err)
+	}
+	got := GetMachineInfo().CliAgents
+	if len(got) != 2 || got[0].Provider != "alpha" || got[1].Provider != "zeta" {
+		t.Fatalf("cache was not replaced with normalized snapshot: %#v", got)
+	}
+	if &got[0] != &normalized[0] {
+		t.Fatal("cache does not contain the exact normalized snapshot returned for publishing")
+	}
+}

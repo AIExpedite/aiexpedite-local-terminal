@@ -109,10 +109,14 @@ type cliAgentUsage struct {
 	NoticeURL      string `json:"noticeUrl,omitempty"`
 }
 
-// cliUsageMaxModelsPerProvider is the signed-refresh contract's per-provider
-// model cap. Parsers that enumerate models must apply it while collecting so a
-// large catalog cannot invalidate an otherwise usable refresh result.
-const cliUsageMaxModelsPerProvider = 128
+// These are the signed-refresh contract's per-provider collection caps.
+// Parsers that can enumerate an unbounded number of entries must apply them
+// while collecting so a large provider response cannot invalidate an otherwise
+// usable refresh result.
+const (
+	cliUsageMaxMetricsPerProvider = 32
+	cliUsageMaxModelsPerProvider  = 128
+)
 
 const (
 	loginExpirationKnown       = "known"

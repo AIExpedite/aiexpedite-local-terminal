@@ -525,6 +525,9 @@ func antigravityQuotaMetrics(snap antigravityQuotaSnapshot, now time.Time) []cli
 		}
 		return rows[i].window < rows[j].window
 	})
+	if len(rows) > cliUsageMaxMetricsPerProvider {
+		rows = rows[:cliUsageMaxMetricsPerProvider]
+	}
 	metrics := make([]cliAgentUsageMetric, 0, len(rows))
 	for _, r := range rows {
 		metrics = append(metrics, r.metric)
