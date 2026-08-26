@@ -3,9 +3,41 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestGrokWindowsJunctionCommand_DoesNotInterpolatePaths(t *testing.T) {
+	link := `C:\temp\grok&(link)`
+	target := `C:\Users\name\grok%target%!`
+	cmd := grokWindowsJunctionCommand(link, target)
+	commandLine := strings.Join(cmd.Args, " ")
+	if strings.Contains(commandLine, link) || strings.Contains(commandLine, target) {
+		t.Fatalf("junction paths leaked into cmd.exe tokens: %q", commandLine)
+	}
+	for _, want := range []string{"/d", "/v:off", `%` + grokJunctionLinkEnv + `%`, `%` + grokJunctionTargetEnv + `%`} {
+		if !strings.Contains(commandLine, want) {
+			t.Fatalf("junction command %q missing %q", commandLine, want)
+		}
+	}
+
+	lookup := func(key string) string {
+		prefix := key + "="
+		for _, value := range cmd.Env {
+			if strings.HasPrefix(value, prefix) {
+				return strings.TrimPrefix(value, prefix)
+			}
+		}
+		return ""
+	}
+	if got := lookup(grokJunctionLinkEnv); got != link {
+		t.Fatalf("junction link env = %q, want %q", got, link)
+	}
+	if got := lookup(grokJunctionTargetEnv); got != target {
+		t.Fatalf("junction target env = %q, want %q", got, target)
+	}
+}
 
 // withTempGrokSessionStore redirects the persistent conversation store into a
 // per-test temp dir so tests never touch the real agent config dir.

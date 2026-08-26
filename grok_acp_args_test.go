@@ -11,11 +11,14 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestBuildGrokACPArgs_DefaultContract pins the validated grok 0.2.59 shape:
@@ -258,6 +261,17 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 	if strings.Contains(string(cfg), "api_key") || strings.Contains(string(cfg), "approve") {
 		t.Fatalf("clean config.toml must not carry api_key/approval knobs: %q", cfg)
 	}
+
+	// Billing must remain session-private while the child runs. A shared logs
+	// link would let this frozen auth copy write under a newly logged-in account.
+	if info, err := os.Lstat(filepath.Join(dir, "logs")); err != nil {
+		t.Fatalf("isolated billing directory missing: %v", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("isolated billing directory must not link to the real GROK_HOME")
+	}
+	if _, err := os.Stat(filepath.Join(realHome, "logs")); !os.IsNotExist(err) {
+		t.Fatalf("setup must not create or share the real billing log; stat err = %v", err)
+	}
 }
 
 // TestSetupIsolatedGrokHome_MissingAuthTolerated pins that a missing real auth
@@ -278,6 +292,91 @@ func TestSetupIsolatedGrokHome_MissingAuthTolerated(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "config.toml")); err != nil {
 		t.Fatalf("config.toml must exist even without auth: %v", err)
+	}
+}
+
+func TestGrokPersistentHome_ResolvesRelativeHome(t *testing.T) {
+	// Resolve the relative home against the temp dir's own parent rather than
+	// the repo checkout: on Windows CI the two live on different volumes, and
+	// filepath.Rel cannot relate paths across volumes.
+	realHome := t.TempDir()
+	t.Chdir(filepath.Dir(realHome))
+
+	// Re-read the cwd after chdir so a symlinked temp root (macOS /var ->
+	// /private/var) is compared against the same resolved form filepath.Abs
+	// will produce inside grokPersistentHome.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(cwd, filepath.Base(realHome))
+
+	t.Setenv("GROK_HOME", filepath.Base(realHome))
+	if got := grokPersistentHome(); got != want {
+		t.Fatalf("persistent Grok home = %q, want %q", got, want)
+	}
+}
+
+func TestPersistGrokManagedBillingSnapshot_BindsCopiedAccountAcrossLoginChange(t *testing.T) {
+	realHome := t.TempDir()
+	seedGrokHomeWithLogin(t, realHome) // account A / user-1
+	withTempGrokSessionStore(t)
+
+	isolatedHome, err := setupIsolatedGrokHomeFrom(false, grokACPDefaultModel, realHome)
+	if err != nil {
+		t.Fatalf("setup isolated home: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(isolatedHome) })
+
+	now := time.Now().UTC()
+	billing := fmt.Sprintf(`{"ts":%q,"msg":%q,"credential":"credential-sentinel","prompt":"prompt-sentinel","ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":%q},"rawConfig":"raw-config-sentinel"},"subscriptionTier":"SuperGrok"}}`+"\n",
+		now.Format(time.RFC3339Nano), grokBillingLogMessage, now.Add(7*24*time.Hour).Format(time.RFC3339Nano))
+	f, err := os.OpenFile(grokBillingLogPath(isolatedHome), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open isolated billing log: %v", err)
+	}
+	if _, err := f.WriteString(billing); err != nil {
+		_ = f.Close()
+		t.Fatalf("write isolated billing log: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close isolated billing log: %v", err)
+	}
+
+	// Simulate `grok login` switching the real home to B while the A session is
+	// still alive. The merged record must retain A's copied producer identity.
+	helperGrokScopedAuth(t, realHome, map[string]any{
+		"key":     unsignedJWT(t, map[string]any{"email": "bea@example.com", "sub": "user-2"}),
+		"email":   "bea@example.com",
+		"user_id": "user-2",
+	})
+	if err := os.MkdirAll(filepath.Join(realHome, "logs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(grokBillingLogPath(realHome), []byte(`{"msg":"session start","ctx":{"user_id":"user-2"}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistGrokManagedBillingSnapshot(isolatedHome, realHome); err != nil {
+		t.Fatalf("persist managed billing: %v", err)
+	}
+
+	if _, ok := readGrokBillingSnapshot(realHome, grokIdentityCandidates(realHome)); ok {
+		t.Fatal("account A managed billing must not be attributed to newly logged-in account B")
+	}
+	persisted, err := os.ReadFile(grokBillingLogPath(realHome))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"credential-sentinel", "prompt-sentinel", "raw-config-sentinel", "bea@example.com"} {
+		if strings.Contains(string(persisted), forbidden) {
+			t.Fatalf("persisted managed billing leaked or misbound %q: %s", forbidden, persisted)
+		}
+	}
+	lines := strings.Split(strings.TrimSpace(string(persisted)), "\n")
+	if len(lines) < 3 || !strings.Contains(lines[len(lines)-2], grokManagedBillingIdentityMessage) ||
+		!strings.Contains(lines[len(lines)-2], `"user_id":"user-1"`) ||
+		!strings.Contains(lines[len(lines)-1], `"msg":"billing: fetched credits config"`) {
+		t.Fatalf("managed billing missing copied account-A identity: %s", persisted)
 	}
 }
 
@@ -304,6 +403,26 @@ func TestSetEnvVar_ReplacesOrAppends(t *testing.T) {
 	appended := setEnvVar([]string{"PATH=/usr/bin"}, "GROK_HOME", "/iso/home")
 	if !grokArgsContain(appended, "GROK_HOME=/iso/home") {
 		t.Fatalf("expected GROK_HOME appended when absent; got %#v", appended)
+	}
+
+	mixedCase := setEnvVar([]string{
+		"PATH=/usr/bin",
+		"Grok_Home=/ambiguous/home",
+		"GROK_HOME=/old/.grok",
+	}, "GROK_HOME", "/iso/home")
+	if runtime.GOOS == "windows" {
+		count := 0
+		for _, entry := range mixedCase {
+			separator := strings.IndexByte(entry, '=')
+			if separator >= 0 && strings.EqualFold(entry[:separator], "GROK_HOME") {
+				count++
+			}
+		}
+		if count != 1 || !grokArgsContain(mixedCase, "GROK_HOME=/iso/home") {
+			t.Fatalf("Windows must retain one unambiguous GROK_HOME entry; got %#v", mixedCase)
+		}
+	} else if !grokArgsContain(mixedCase, "Grok_Home=/ambiguous/home") {
+		t.Fatalf("Unix environment replacement must remain case-sensitive; got %#v", mixedCase)
 	}
 }
 

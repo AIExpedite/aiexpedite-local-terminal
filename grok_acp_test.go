@@ -1008,6 +1008,56 @@ func TestGrokACPLifecycle_CapturesUsageLimitFromStream(t *testing.T) {
 	}
 }
 
+func TestGrokACPLifecycle_PersistsFreshRedactedBillingForRefresh(t *testing.T) {
+	realHome := t.TempDir()
+	seedGrokHomeWithLogin(t, realHome)
+	t.Setenv("GROK_HOME", realHome)
+	t.Setenv("XAI_API_KEY", "")
+	withTempGrokSessionStore(t)
+
+	testExe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	binDir := t.TempDir()
+	mockName := "grok"
+	if runtime.GOOS == "windows" {
+		mockName += ".exe"
+	}
+	if err := copyTestBinary(testExe, filepath.Join(binDir, mockName)); err != nil {
+		t.Fatalf("copy mock binary: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(mockCLIEnvVar, "grok-acp-billing")
+
+	m := NewGrokACPManager(nil)
+	id := fmt.Sprintf("grok-billing-test-%d", time.Now().UnixNano())
+	if err := m.Start(id, t.TempDir(), nil, "ws", "uid", GrokStartOptions{}, func(resultMsg) {}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if !waitUntil(time.Now().Add(10*time.Second), func() bool { return m.ActiveCount() == 0 }) {
+		t.Fatal("managed Grok mock did not exit")
+	}
+
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || len(usage.Metrics) != 1 {
+		t.Fatalf("managed billing parse failed: %+v", usage)
+	}
+	metric := usage.Metrics[0]
+	if !metric.Unknown || metric.ObservedAt == "" || metric.ResetAt == "" {
+		t.Fatalf("managed run must match direct confirmed-unmetered capture: %+v", metric)
+	}
+	out, err := json.Marshal(usage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"credential-sentinel", "prompt-sentinel", "raw-config-sentinel"} {
+		if strings.Contains(string(out), secret) {
+			t.Fatalf("managed usage leaked %q: %s", secret, out)
+		}
+	}
+}
+
 // TestGrokACPLifecycle_TimeoutKillsRunawaySession pins finding #2 end-to-end:
 // when the orchestrator passes a per-session TimeoutMs and the Grok child
 // would otherwise run forever, the deadline timer must fire, publish a typed

@@ -7,10 +7,10 @@
 // `cached_token` and usage ties to the terminal computer user's Grok / X
 // account.
 //
-// xAI does not expose request- or token-level quotas via the on-disk
-// credential files, so the capacity rows are flagged Unknown — the dashboard
-// shows them as a dashed gauge ("metric exists but unobservable") rather than
-// dropping them entirely.
+// Credentials contain no request- or token-level quota. Capacity instead comes
+// from Grok's account-bound billing log: legacy records may expose a numeric
+// percentage, while Grok 1.0 records confirm an unmetered period with freshness.
+// Without a usable record the parser emits an Unknown placeholder.
 package main
 
 import (
@@ -145,14 +145,7 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 		// since the log rotated). Keep a placeholder row so the agent still
 		// appears on the card as "limit exists, value unobservable" rather than
 		// vanishing.
-		usage.Metrics = []cliAgentUsageMetric{
-			{
-				Kind:    limitKindWeekly,
-				Label:   "Weekly credits",
-				Unit:    "%",
-				Unknown: true,
-			},
-		}
+		usage.Metrics = []cliAgentUsageMetric{grokUnknownCreditsMetric()}
 	}
 
 	// Notice priority is by whether the condition blocks requests RIGHT NOW, not
@@ -169,10 +162,9 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 	// which is why we fold the auth check into the regular usage check instead of
 	// only failing at session start.
 	//
-	// xAI exposes no numeric quota, so the capacity bars stay Unknown — but Grok
-	// DOES push a discrete usage-limit warning on the streaming-json output,
-	// which captureGrokUsageLimitLine caches (approaching → warning, reached →
-	// error).
+	// Grok's live stream exposes no numeric quota — billing-log metrics remain
+	// authoritative — but it DOES push a discrete usage-limit warning, which
+	// captureGrokUsageLimitLine caches (approaching → warning, reached → error).
 	authNotice, authSeverity := grokAuthNotice(base, now)
 	// Same classifier the ACP launch pre-flight uses, so the computer
 	// snapshot and the spawn check cannot disagree on missing/expired.

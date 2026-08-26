@@ -24,6 +24,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -289,6 +290,30 @@ func runMockCLI(mode string) {
 	case "grok-acp-echo":
 		runMockGrokACPServer()
 
+	case "grok-direct-billing":
+		if err := writeMockGrokBillingEvidence(); err != nil {
+			fmt.Fprintf(os.Stderr, "write mock Grok billing evidence: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(`{"type":"result","result":"billing refreshed"}`)
+		os.Exit(0)
+
+	case "grok-acp-billing":
+		if err := writeMockGrokBillingEvidence(); err != nil {
+			fmt.Fprintf(os.Stderr, "write mock Grok billing evidence: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_mock","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"billing refreshed"}}}}`)
+		os.Exit(0)
+
+	case "grok-version-v1":
+		fmt.Println("grok 1.0.3")
+		os.Exit(0)
+
+	case "grok-version-v2":
+		fmt.Println("grok 1.1.0")
+		os.Exit(0)
+
 	case "grok-acp-usage-limit":
 		// Emit a single ACP `session/update` notification that carries a
 		// usage_limit_reached signal under params.update.sessionUpdate, then
@@ -347,6 +372,38 @@ func runMockCLI(mode string) {
 		fmt.Fprintf(os.Stderr, "unknown TEST_MOCK_CLI_MODE: %s\n", mode)
 		os.Exit(1)
 	}
+}
+
+// writeMockGrokBillingEvidence mirrors the exact allowlisted shape Grok 1.0
+// appends after fetching its current period. It intentionally includes secret
+// and raw-config sentinels so lifecycle tests prove the parser never republishes
+// arbitrary log fields.
+func writeMockGrokBillingEvidence() error {
+	base := os.Getenv("GROK_HOME")
+	if base == "" {
+		return fmt.Errorf("GROK_HOME is empty")
+	}
+	dir := filepath.Join(base, "logs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create logs directory: %w", err)
+	}
+	path := filepath.Join(dir, "unified.jsonl")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open unified log: %w", err)
+	}
+	now := time.Now().UTC()
+	body := fmt.Sprintf(`{"ts":%q,"msg":"session start","ctx":{"user_id":"user-1"}}`+"\n", now.Add(-time.Second).Format(time.RFC3339Nano)) +
+		fmt.Sprintf(`{"ts":%q,"msg":"billing: fetched credits config","credential":"credential-sentinel","prompt":"prompt-sentinel","ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":%q,"end":%q},"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"rawConfig":"raw-config-sentinel"},"subscriptionTier":"SuperGrok"}}`+"\n",
+			now.Format(time.RFC3339Nano), now.Add(-time.Hour).Format(time.RFC3339Nano), now.Add(7*24*time.Hour).Format(time.RFC3339Nano))
+	if _, err := f.WriteString(body); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write billing log: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close unified log: %w", err)
+	}
+	return nil
 }
 
 // captureSession runs a SessionManager session against the test binary
@@ -510,6 +567,39 @@ func TestSessionLifecycle_Codex(t *testing.T) {
 	streamText := concatStreamOutput(messages)
 	if !strings.Contains(streamText, "hello from codex") {
 		t.Errorf("expected stream output to contain agent_message text; got %q", streamText)
+	}
+}
+
+func TestSessionLifecycle_GrokDirectPublishesFreshRedactedBilling(t *testing.T) {
+	realHome := t.TempDir()
+	seedGrokHomeWithLogin(t, realHome)
+	t.Setenv("GROK_HOME", realHome)
+	t.Setenv("XAI_API_KEY", "")
+
+	_, messages, err := captureSession(t, "grok-direct-billing", "grok", []string{"refresh billing"}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	if len(messages) == 0 || messages[len(messages)-1].Type != "session_ended" {
+		t.Fatalf("direct Grok lifecycle did not complete: %+v", messages)
+	}
+
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || len(usage.Metrics) != 1 {
+		t.Fatalf("direct billing parse failed: %+v", usage)
+	}
+	metric := usage.Metrics[0]
+	if !metric.Unknown || metric.ObservedAt == "" || metric.ResetAt == "" {
+		t.Fatalf("direct run must produce a fresh confirmed-unmetered metric: %+v", metric)
+	}
+	out, err := json.Marshal(usage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"credential-sentinel", "prompt-sentinel", "raw-config-sentinel"} {
+		if strings.Contains(string(out), secret) {
+			t.Fatalf("direct usage leaked %q: %s", secret, out)
+		}
 	}
 }
 

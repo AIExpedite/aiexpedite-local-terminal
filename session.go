@@ -996,7 +996,10 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				captureCodexRateLimitLine(line.text, time.Now())
 			}
 
-			// Grok usage-limit telemetry: xAI exposes no numeric quota, but the
+			// Grok notice telemetry: live stdout is deliberately notice-only.
+			// Numeric and confirmed-unmetered usage comes from the account-bound
+			// billing log, never arbitrary response or tool-result fields. xAI
+			// exposes no numeric quota here, but the
 			// server volunteers a discrete `usage_limit_reached` / credit-limit /
 			// access-gate frame on the streaming-json output when you near or hit
 			// the cap. Capture it (best-effort) so the CLI Agents card can show a
