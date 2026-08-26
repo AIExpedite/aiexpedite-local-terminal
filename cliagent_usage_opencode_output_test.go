@@ -14,6 +14,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -133,6 +134,24 @@ func TestParseOpenCodeModelListStripsDecoration(t *testing.T) {
 	want := []string{"opencode/big-pickle", "ollama/qwen3-coder:30b"}
 	if !reflect.DeepEqual(ids, want) {
 		t.Fatalf("ids = %#v, want %#v", ids, want)
+	}
+}
+
+func TestParseOpenCodeModelListCapsSignedRefreshCatalog(t *testing.T) {
+	var output strings.Builder
+	for i := 0; i < cliUsageMaxModelsPerProvider+2; i++ {
+		fmt.Fprintf(&output, "provider/model-%03d\n", i)
+	}
+
+	ids := parseOpenCodeModelList(output.String())
+	if len(ids) != cliUsageMaxModelsPerProvider {
+		t.Fatalf("parsed %d models, want signed-refresh cap %d", len(ids), cliUsageMaxModelsPerProvider)
+	}
+	if ids[len(ids)-1] != "provider/model-127" {
+		t.Fatalf("last retained model = %q, want stable first %d entries", ids[len(ids)-1], cliUsageMaxModelsPerProvider)
+	}
+	if _, _, _, err := signCLIUsageRefreshReceipt("secret", "refresh-1", 1, true, []cliAgentUsage{{Provider: "opencode", Models: ids}}, nil); err != nil {
+		t.Fatalf("bounded OpenCode catalog rejected from signed refresh: %v", err)
 	}
 }
 

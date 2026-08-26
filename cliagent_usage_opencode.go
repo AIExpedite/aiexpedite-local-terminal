@@ -87,9 +87,9 @@ type openCodeReadiness struct {
 	Providers []string
 	// Model is the device-level default, when resolvable.
 	Model string
-	// Models is every model id `opencode models` listed, sorted and de-duped.
-	// This is the card's actual content for OpenCode: it has no quota to plot,
-	// so "what can this install reach" is the question the card answers.
+	// Models is the bounded list of model ids `opencode models` reports. This is
+	// the card's actual content for OpenCode: it has no quota to plot, so "what
+	// can this install reach" is the question the card answers.
 	Models []string
 	// Conclusive is false when a probe timed out, exited non-zero, or printed
 	// something unrecognized. Kept distinct from AuthState so a caller can tell
@@ -269,7 +269,7 @@ func parseOpenCodeModelList(out string) []string {
 
 	if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
 		if ids := parseOpenCodeModelJSON(trimmed); len(ids) > 0 {
-			return ids
+			return capOpenCodeModelIDs(ids)
 		}
 	}
 
@@ -287,6 +287,16 @@ func parseOpenCodeModelList(out string) []string {
 		}
 		seen[id] = true
 		ids = append(ids, id)
+		if len(ids) == cliUsageMaxModelsPerProvider {
+			break
+		}
+	}
+	return ids
+}
+
+func capOpenCodeModelIDs(ids []string) []string {
+	if len(ids) > cliUsageMaxModelsPerProvider {
+		return ids[:cliUsageMaxModelsPerProvider]
 	}
 	return ids
 }
