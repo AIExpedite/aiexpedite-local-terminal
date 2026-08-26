@@ -3287,7 +3287,9 @@ func TestGatherCLIAgentUsageOnly_GrokMetricSurvivesCLIUpdate(t *testing.T) {
 	seedGrokHomeWithLogin(t, realHome)
 	t.Setenv("GROK_HOME", realHome)
 	t.Setenv("XAI_API_KEY", "")
-	appendMockGrokBillingEvidence()
+	if err := writeMockGrokBillingEvidence(); err != nil {
+		t.Fatalf("write billing evidence: %v", err)
+	}
 
 	SetCLIAgentCatalog([]cliAgentCatalogEntry{{
 		ID:          "grok",

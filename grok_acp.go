@@ -176,11 +176,11 @@ type GrokACPSession struct {
 	// class as terminal-service §8.5). Always set on a started session.
 	WorkspaceRoot string
 	// IsolatedHome is the per-session temp dir Start points the child's
-	// GROK_HOME at (a copy of the real auth file + a minimal clean
-	// config.toml). It is removed best-effort exactly once, after the child
-	// has exited (waitForExit), so we never delete the copied auth.json out
-	// from under a running grok process. Always set on a successfully started
-	// session because Start fails closed when isolation can't be established.
+	// GROK_HOME at: copied auth, a minimal clean config, and links to the two
+	// explicitly persistent data directories (sessions and billing logs). It is
+	// removed best-effort exactly once after the child exits, so copied auth is
+	// never deleted from under a running process. Always set on a successfully
+	// started session because Start fails closed when isolation cannot be built.
 	IsolatedHome string
 
 	mu           sync.Mutex
@@ -398,8 +398,9 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// `--config` / `--permission-mode` / `--no-auto-update` with "unexpected
 	// argument", so the entire persisted-config-clear-via-argv approach is
 	// dead). Instead we point the child at a per-session temp dir that
-	// contains ONLY a copy of the real `grok login` auth file plus a minimal
-	// clean config.toml. By NOT copying the user's real config.toml /
+	// contains only copied auth, a minimal clean config.toml, and narrow links
+	// to persistent conversations and provider billing logs. By NOT copying the
+	// user's real config.toml /
 	// requirements.toml we neutralise every persisted-config vector by
 	// omission: no `api_key` billing override, no auto-approve / permission
 	// bypass, no pinned requirements layer. The cached-token handshake still

@@ -296,6 +296,34 @@ func TestSetupIsolatedGrokHome_MissingAuthTolerated(t *testing.T) {
 	}
 }
 
+func TestLinkGrokBillingLogs_ResolvesRelativeRealHome(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	realHome := t.TempDir()
+	relativeHome, err := filepath.Rel(cwd, realHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	isolatedHome := t.TempDir()
+	if err := linkGrokBillingLogs(isolatedHome, relativeHome); err != nil {
+		t.Fatalf("link relative GROK_HOME: %v", err)
+	}
+
+	const evidence = "relative-home-billing-evidence"
+	if err := os.WriteFile(filepath.Join(isolatedHome, "logs", "unified.jsonl"), []byte(evidence), 0o600); err != nil {
+		t.Fatalf("write through billing link: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(realHome, "logs", "unified.jsonl"))
+	if err != nil {
+		t.Fatalf("read persistent billing log: %v", err)
+	}
+	if string(got) != evidence {
+		t.Fatalf("persistent billing log = %q, want %q", got, evidence)
+	}
+}
+
 // TestSetEnvVar_ReplacesOrAppends pins the GROK_HOME override helper.
 func TestSetEnvVar_ReplacesOrAppends(t *testing.T) {
 	in := []string{"PATH=/usr/bin", "GROK_HOME=/old/.grok", "HOME=/home/u"}

@@ -73,9 +73,6 @@ type grokBillingRecord struct {
 			OnDemandUsed struct {
 				Val *float64 `json:"val"`
 			} `json:"onDemandUsed"`
-			PrepaidBalance struct {
-				Val *float64 `json:"val"`
-			} `json:"prepaidBalance"`
 		} `json:"config"`
 		SubscriptionTier string `json:"subscriptionTier"`
 	} `json:"ctx"`
@@ -115,6 +112,13 @@ func grokBillingLogPath(base string) string {
 func linkGrokBillingLogs(isolatedHome, realHome string) error {
 	if isolatedHome == "" || realHome == "" {
 		return nil
+	}
+	// Symlink targets are resolved relative to the link's parent, not the
+	// daemon's working directory. Normalize a relative GROK_HOME before linking
+	// or `<isolated>/logs` would silently point inside the temp tree.
+	realHome, err := filepath.Abs(realHome)
+	if err != nil {
+		return err
 	}
 	logs := filepath.Join(realHome, "logs")
 	if err := os.MkdirAll(logs, 0o700); err != nil {
@@ -250,7 +254,7 @@ func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, 
 	// used. Treat that as "usable record, unobserved usage" rather than "not a
 	// record": rejecting it made the scanner walk further back and publish a
 	// PRE-UPGRADE reading, under a period that had since ended.
-	if pct := rec.Ctx.Config.CreditUsagePercent; pct != nil && isFinite(*pct) {
+	if pct := rec.Ctx.Config.CreditUsagePercent; pct != nil && grokFiniteNumber(*pct) {
 		snap.UsedPercent = clampPercent(*pct)
 		snap.HasUsedPercent = true
 	}
@@ -260,14 +264,14 @@ func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, 
 	}
 	// On-demand is a separate, opt-in pool: only plot it when a cap exists, or
 	// the row would read as a hard 0-of-0 limit on every subscription account.
-	if cap := rec.Ctx.Config.OnDemandCap.Val; cap != nil && *cap > 0 && isFinite(*cap) {
+	if cap := rec.Ctx.Config.OnDemandCap.Val; cap != nil && *cap > 0 && grokFiniteNumber(*cap) {
 		snap.HasOnDemand = true
 		snap.OnDemandCap = *cap
 		// A cap with no reported usage is a pool we know exists but have not
 		// observed. Leaving the zero default here would report it as completely
 		// unused — an assertion the record never made.
 		if used := rec.Ctx.Config.OnDemandUsed.Val; used != nil &&
-			isFinite(*used) && *used >= 0 && *used <= *cap {
+			grokFiniteNumber(*used) && *used >= 0 && *used <= *cap {
 			snap.HasOnDemandUsed = true
 			snap.OnDemandUsed = *used
 		}
@@ -275,7 +279,7 @@ func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, 
 	return snap, true
 }
 
-func isFinite(value float64) bool {
+func grokFiniteNumber(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
@@ -297,10 +301,10 @@ func grokBillingPeriodKind(periodType string) (kind string, label string, ok boo
 
 // grokBillingMetrics turns a snapshot into the card's capacity rows.
 //
-// A period whose end has already passed is reported Unknown WITH its observation
-// time rather than as 0% used: the pool has rolled over since Grok last looked,
-// and assuming an empty pool would hide usage that may have happened on another
-// computer under the same account.
+// A metered period whose end has passed is reported Unknown WITH its historical
+// observation time rather than as 0% used. An ended unmetered period has no
+// current confirmation and drops the timestamp. In both cases, assuming an
+// empty pool could hide usage from another computer on the same account.
 func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsageMetric {
 	// A future record remains authoritative and blocks older records, but no
 	// value sharing its untrusted observation time may escape this gather.

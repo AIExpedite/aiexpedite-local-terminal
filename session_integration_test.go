@@ -291,12 +291,18 @@ func runMockCLI(mode string) {
 		runMockGrokACPServer()
 
 	case "grok-direct-billing":
-		appendMockGrokBillingEvidence()
+		if err := writeMockGrokBillingEvidence(); err != nil {
+			fmt.Fprintf(os.Stderr, "write mock Grok billing evidence: %v\n", err)
+			os.Exit(1)
+		}
 		fmt.Println(`{"type":"result","result":"billing refreshed"}`)
 		os.Exit(0)
 
 	case "grok-acp-billing":
-		appendMockGrokBillingEvidence()
+		if err := writeMockGrokBillingEvidence(); err != nil {
+			fmt.Fprintf(os.Stderr, "write mock Grok billing evidence: %v\n", err)
+			os.Exit(1)
+		}
 		fmt.Println(`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_mock","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"billing refreshed"}}}}`)
 		os.Exit(0)
 
@@ -368,29 +374,36 @@ func runMockCLI(mode string) {
 	}
 }
 
-// appendMockGrokBillingEvidence mirrors the exact allowlisted shape Grok 1.0
+// writeMockGrokBillingEvidence mirrors the exact allowlisted shape Grok 1.0
 // appends after fetching its current period. It intentionally includes secret
 // and raw-config sentinels so lifecycle tests prove the parser never republishes
 // arbitrary log fields.
-func appendMockGrokBillingEvidence() {
+func writeMockGrokBillingEvidence() error {
 	base := os.Getenv("GROK_HOME")
 	if base == "" {
-		return
+		return fmt.Errorf("GROK_HOME is empty")
 	}
 	dir := filepath.Join(base, "logs")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return
+		return fmt.Errorf("create logs directory: %w", err)
 	}
 	path := filepath.Join(dir, "unified.jsonl")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return
+		return fmt.Errorf("open unified log: %w", err)
 	}
-	defer f.Close()
 	now := time.Now().UTC()
-	fmt.Fprintf(f, `{"ts":%q,"msg":"session start","ctx":{"user_id":"user-1"}}`+"\n", now.Add(-time.Second).Format(time.RFC3339Nano))
-	fmt.Fprintf(f, `{"ts":%q,"msg":"billing: fetched credits config","credential":"credential-sentinel","prompt":"prompt-sentinel","ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":%q,"end":%q},"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"rawConfig":"raw-config-sentinel"},"subscriptionTier":"SuperGrok"}}`+"\n",
-		now.Format(time.RFC3339Nano), now.Add(-time.Hour).Format(time.RFC3339Nano), now.Add(7*24*time.Hour).Format(time.RFC3339Nano))
+	body := fmt.Sprintf(`{"ts":%q,"msg":"session start","ctx":{"user_id":"user-1"}}`+"\n", now.Add(-time.Second).Format(time.RFC3339Nano)) +
+		fmt.Sprintf(`{"ts":%q,"msg":"billing: fetched credits config","credential":"credential-sentinel","prompt":"prompt-sentinel","ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":%q,"end":%q},"onDemandCap":{"val":0},"onDemandUsed":{"val":0},"rawConfig":"raw-config-sentinel"},"subscriptionTier":"SuperGrok"}}`+"\n",
+			now.Format(time.RFC3339Nano), now.Add(-time.Hour).Format(time.RFC3339Nano), now.Add(7*24*time.Hour).Format(time.RFC3339Nano))
+	if _, err := f.WriteString(body); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write billing log: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close unified log: %w", err)
+	}
+	return nil
 }
 
 // captureSession runs a SessionManager session against the test binary
