@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"sync/atomic"
 	"testing"
 )
@@ -96,5 +97,26 @@ func TestMakeCLIUsageRefreshFailureResult_CarriesRefreshMetadata(t *testing.T) {
 	}
 	if len(res.Errors) != 1 || res.Errors[0].Provider != "_dispatch" || res.Errors[0].Message != "payload too large" {
 		t.Fatalf("Errors=%#v, want dispatch payload-too-large error", res.Errors)
+	}
+}
+
+func TestSignedCLIUsageFailureRequiresVerifiedChallenge(t *testing.T) {
+	cfg := &Config{AgentID: "agent-1", CommandSecret: "secret"}
+	cmd := commandMsg{ID: "cmd-1", Command: "__cli_usage_refresh__", Args: []string{}, Ts: 123, AgentID: "agent-1", RefreshID: "refresh-1"}
+	if canPublishSignedCLIUsageFailure(cmd, cfg) {
+		t.Fatal("unsigned challenge must not receive a signed failure receipt")
+	}
+	payload := signaturePayload{ID: cmd.ID, Command: cmd.Command, Args: cmd.Args, Ts: cmd.Ts, RefreshID: cmd.RefreshID}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Signature = generateHMAC(string(data), cfg.CommandSecret)
+	if !canPublishSignedCLIUsageFailure(cmd, cfg) {
+		t.Fatal("valid signed challenge should permit a signed failure receipt")
+	}
+	res := makeCLIUsageRefreshFailureResult(cmd, cfg, "usage result rejected")
+	if res.ReceiptVersion != 1 || res.Receipt == "" || res.ChallengeTs != cmd.Ts {
+		t.Fatalf("missing signed failure receipt metadata: %#v", res)
 	}
 }

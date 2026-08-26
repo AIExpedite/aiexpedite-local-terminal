@@ -907,8 +907,8 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	persistCLIAgentCatalogUpdate(cfg, cmd.CliAgentCatalog, "pubsub", "refresh command")
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Printf("%s[pubsub] panic in CLI usage refresh handler: %v%s\n", colorRed, r, colorReset)
-			res := makeCLIUsageRefreshFailureResult(cmd, cfg, fmt.Sprintf("panic: %v", r))
+			fmt.Printf("%s[pubsub] CLI usage refresh handler failed%s\n", colorRed, colorReset)
+			res := makeCLIUsageRefreshFailureResult(cmd, cfg, "usage collection failed")
 			if err := publishMsg(ctx, topic, res); err != nil {
 				fmt.Printf("%s[pubsub] Failed to publish panic refresh result: %v%s\n", colorRed, err, colorReset)
 				publishErr = err
@@ -951,7 +951,11 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	success := len(errs) == 0
 	receipt, normalizedUsage, normalizedErrors, receiptErr := signCLIUsageRefreshReceipt(cfg.CommandSecret, cmd.RefreshID, cmd.Ts, success, usage, errs)
 	if receiptErr != nil {
-		return receiptErr
+		res := makeCLIUsageRefreshFailureResult(cmd, cfg, "usage result rejected")
+		if err := publishMsg(ctx, topic, res); err != nil {
+			return err
+		}
+		return nil
 	}
 
 	res := resultMsg{
@@ -1069,6 +1073,10 @@ func makeCLIUsageRefreshFailureResult(cmd commandMsg, cfg *Config, message strin
 func publishCLIUsageRefreshFailure(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config, message string) error {
 	fmt.Printf("%s[pubsub] CLI usage refresh rejected: %s%s\n", colorRed, message, colorReset)
 	return publishMsg(ctx, topic, makeCLIUsageRefreshFailureResult(cmd, cfg, message))
+}
+
+func canPublishSignedCLIUsageFailure(cmd commandMsg, cfg *Config) bool {
+	return cfg != nil && cfg.CommandSecret != "" && verifySignature(cmd, cfg.CommandSecret)
 }
 
 // publishMsg marshals res and publishes it on topic using ctx.
@@ -1222,6 +1230,10 @@ func runPubSubConnection(cfg *Config) error {
 			if err := json.Unmarshal(m.Data, &cmd); err == nil {
 				message := commandPayloadTooLargeMessage(len(m.Data), maxPubSubCatalogMessageBytes)
 				if cmd.Command == "__cli_usage_refresh__" {
+					if !canPublishSignedCLIUsageFailure(cmd, cfg) {
+						m.Ack()
+						return
+					}
 					release, allowed := beginTrackedRejectionPublish()
 					if !allowed {
 						m.Nack()
@@ -1267,6 +1279,10 @@ func runPubSubConnection(cfg *Config) error {
 
 			message := commandPayloadTooLargeMessage(len(m.Data), messageSizeLimit)
 			if cmd.Command == "__cli_usage_refresh__" {
+				if !canPublishSignedCLIUsageFailure(cmd, cfg) {
+					m.Ack()
+					return
+				}
 				release, allowed := beginTrackedRejectionPublish()
 				if !allowed {
 					m.Nack()
