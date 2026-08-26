@@ -2530,6 +2530,42 @@ func TestCodexDiscoverRolloutCandidates_StopsWhenContextCancels(t *testing.T) {
 	}
 }
 
+func TestCodexDiscoverRolloutCandidates_VisitsNewestDateBeforeCancellation(t *testing.T) {
+	base := t.TempDir()
+	var newestPath string
+	for _, fixture := range []struct {
+		year, month, day string
+	}{
+		{year: "2024", month: "01", day: "01"},
+		{year: "2025", month: "12", day: "31"},
+		{year: "2026", month: "08", day: "26"},
+	} {
+		dir := filepath.Join(base, "sessions", fixture.year, fixture.month, fixture.day)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "rollout-test.jsonl")
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if fixture.year == "2026" {
+			newestPath = path
+		}
+	}
+
+	// Allow discovery to reach one rollout, then cancel before it can descend
+	// into the next date. Restarting an interrupted scan must always prioritize
+	// the newest direct-run evidence rather than replaying the oldest history.
+	ctx := &cancelAfterChecksContext{after: 10, done: make(chan struct{})}
+	candidates, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{})
+	if complete {
+		t.Fatal("discovery complete=true, want cancellation after newest candidate")
+	}
+	if len(candidates) != 1 || candidates[0].path != newestPath {
+		t.Fatalf("candidates=%+v, want only newest date %q before cancellation", candidates, newestPath)
+	}
+}
+
 func TestCodexDiscoverRolloutCandidates_RetainsSameMillisecondUpdate(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "sessions", "2026", "08", "26")

@@ -1551,71 +1551,76 @@ func codexRolloutBoundaryFingerprint(candidates []codexRolloutCandidate, mtimeNs
 }
 
 // codexDiscoverRolloutCandidates walks the fixed YYYY/MM/DD rollout layout
-// while checking the optional scan context between filesystem entries. Unlike
-// filepath.Glob, discovery therefore stops when the Codex child budget expires
-// instead of traversing an arbitrarily large session history after cancellation.
-// complete is false when cancellation or a metadata error means scan progress
-// must not advance.
+// newest-first while checking the optional scan context between filesystem
+// entries. Starting with the newest date prevents a large history from starving
+// today's direct-run evidence when the Codex child budget expires. Unlike
+// filepath.Glob, discovery also stops promptly after cancellation. complete is
+// false when cancellation or a metadata error means scan progress must not
+// advance.
 func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor codexRolloutScanCursor) ([]codexRolloutCandidate, bool) {
 	root := filepath.Join(base, "sessions")
 	candidates := []codexRolloutCandidate{}
 	boundaryCandidates := []codexRolloutCandidate{}
 	complete := true
-	walkErr := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if err := ctx.Err(); err != nil {
+	var walkDateLayout func(string, int)
+	walkDateLayout = func(dir string, depth int) {
+		if ctx.Err() != nil {
 			complete = false
-			return err
+			return
 		}
-		if walkErr != nil {
-			complete = false
-			return nil
-		}
-
-		rel, err := filepath.Rel(root, path)
+		entries, err := os.ReadDir(dir)
 		if err != nil {
-			complete = false
-			return nil
-		}
-		if rel == "." {
-			return nil
-		}
-		depth := len(strings.Split(rel, string(filepath.Separator)))
-		if entry.IsDir() {
-			if depth >= 4 {
-				return filepath.SkipDir
+			if depth == 0 && os.IsNotExist(err) {
+				return
 			}
-			return nil
-		}
-		if depth != 4 {
-			return nil
-		}
-		matched, err := filepath.Match("rollout-*.jsonl", entry.Name())
-		if err != nil || !matched {
-			return nil
-		}
-		info, err := os.Stat(path)
-		if err != nil {
-			// A transient metadata failure leaves this discovery pass incomplete.
-			// We may still consume other candidates, but must not advance progress
-			// past a file whose mtime could not be evaluated.
 			complete = false
-			return nil
+			return
 		}
-		candidate := codexRolloutCandidate{path: path, boundaryID: rel, mtime: info.ModTime(), size: info.Size()}
-		switch mtimeNs := info.ModTime().UnixNano(); {
-		case mtimeNs > cursor.mtimeNs:
-			candidates = append(candidates, candidate)
-		case cursor.mtimeNs > 0 && mtimeNs == cursor.mtimeNs:
-			boundaryCandidates = append(boundaryCandidates, candidate)
+		// os.ReadDir sorts by filename. Codex's zero-padded YYYY/MM/DD layout
+		// therefore becomes chronological when traversed in reverse.
+		for i := len(entries) - 1; i >= 0; i-- {
+			if ctx.Err() != nil {
+				complete = false
+				return
+			}
+			entry := entries[i]
+			path := filepath.Join(dir, entry.Name())
+			if depth < 3 {
+				if entry.IsDir() {
+					walkDateLayout(path, depth+1)
+				}
+				continue
+			}
+			if entry.IsDir() {
+				continue
+			}
+			matched, err := filepath.Match("rollout-*.jsonl", entry.Name())
+			if err != nil || !matched {
+				continue
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				// A transient metadata failure leaves this discovery pass incomplete.
+				// We may still consume other candidates, but must not advance progress
+				// past a file whose mtime could not be evaluated.
+				complete = false
+				continue
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				complete = false
+				continue
+			}
+			candidate := codexRolloutCandidate{path: path, boundaryID: rel, mtime: info.ModTime(), size: info.Size()}
+			switch mtimeNs := info.ModTime().UnixNano(); {
+			case mtimeNs > cursor.mtimeNs:
+				candidates = append(candidates, candidate)
+			case cursor.mtimeNs > 0 && mtimeNs == cursor.mtimeNs:
+				boundaryCandidates = append(boundaryCandidates, candidate)
+			}
 		}
-		return nil
-	})
-	if walkErr != nil {
-		if os.IsNotExist(walkErr) {
-			return nil, true
-		}
-		complete = false
 	}
+	walkDateLayout(root, 0)
 	// Exact-mtime equality normally means the boundary is unchanged. On coarse
 	// filesystems, however, an append can increase a rollout's size without
 	// changing its reported mtime. Compare a redacted metadata fingerprint and
