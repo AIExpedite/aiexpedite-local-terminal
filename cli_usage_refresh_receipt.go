@@ -134,7 +134,7 @@ func canonicalProvider(agent cliAgentUsage) (canonicalCLIUsageProvider, error) {
 }
 
 func canonicalCLIUsageRefreshReceipt(refreshID string, challengeTs int64, success bool, agents []cliAgentUsage, errs []cliAgentUsageError) ([]byte, []cliAgentUsage, []cliAgentUsageError, error) {
-	if refreshID == "" || len(refreshID) > 256 || challengeTs <= 0 || len(agents) > 64 {
+	if refreshID == "" || len(refreshID) > 256 || challengeTs <= 0 || len(agents) > cliUsageMaxProviders {
 		return nil, nil, nil, errors.New("invalid receipt bounds")
 	}
 	normalizedAgents := append([]cliAgentUsage(nil), agents...)
