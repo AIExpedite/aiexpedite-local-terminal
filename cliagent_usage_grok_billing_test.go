@@ -278,12 +278,12 @@ func TestGrokBillingMetrics_CurrentUnmeteredPreservesFreshOnDemand(t *testing.T)
 func TestGrokBillingSnapshot_InvalidNumbersAreOmittedIndependently(t *testing.T) {
 	for _, invalid := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z", Msg: grokBillingLogMessage}
-		rec.Ctx.Config.CreditUsagePercent = &invalid
+		rec.Ctx.Config.CreditUsagePercent = grokBillingNumber{Value: invalid, Valid: true}
 		rec.Ctx.Config.CurrentPeriod.Type = "USAGE_PERIOD_TYPE_WEEKLY"
 		rec.Ctx.Config.CurrentPeriod.End = "2026-08-24T22:28:32Z"
 		cap, used := 50.0, 12.0
-		rec.Ctx.Config.OnDemandCap.Val = &cap
-		rec.Ctx.Config.OnDemandUsed.Val = &used
+		rec.Ctx.Config.OnDemandCap.Val = grokBillingNumber{Value: cap, Valid: true}
+		rec.Ctx.Config.OnDemandUsed.Val = grokBillingNumber{Value: used, Valid: true}
 
 		snap, ok := grokBillingSnapshotFromRecord(rec)
 		if !ok || snap.HasUsedPercent || !snap.HasOnDemandUsed {
@@ -294,12 +294,38 @@ func TestGrokBillingSnapshot_InvalidNumbersAreOmittedIndependently(t *testing.T)
 	for _, invalidUsed := range []float64{-1, 51, math.NaN(), math.Inf(1)} {
 		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z", Msg: grokBillingLogMessage}
 		cap := 50.0
-		rec.Ctx.Config.OnDemandCap.Val = &cap
-		rec.Ctx.Config.OnDemandUsed.Val = &invalidUsed
+		rec.Ctx.Config.OnDemandCap.Val = grokBillingNumber{Value: cap, Valid: true}
+		rec.Ctx.Config.OnDemandUsed.Val = grokBillingNumber{Value: invalidUsed, Valid: true}
 		snap, ok := grokBillingSnapshotFromRecord(rec)
 		if !ok || !snap.HasOnDemand || snap.HasOnDemandUsed {
 			t.Fatalf("invalid on-demand usage %v must leave a capped unknown pool: %+v", invalidUsed, snap)
 		}
+	}
+}
+
+func TestReadGrokBillingSnapshot_InvalidJSONNumbersBlockOlderAndPreserveOnDemand(t *testing.T) {
+	for _, invalidPercent := range []string{`1e999`, `"NaN"`, `"Infinity"`, `{}`} {
+		t.Run(invalidPercent, func(t *testing.T) {
+			base := t.TempDir()
+			newest := fmt.Sprintf(`{"ts":"2026-08-17T23:02:12Z","msg":%q,"ctx":{"config":{"creditUsagePercent":%s,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-24T22:28:32Z"},"onDemandCap":{"val":50},"onDemandUsed":{"val":12}}}}`,
+				grokBillingLogMessage, invalidPercent)
+			helperWriteGrokLog(t, base,
+				`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
+				grokBillingLine("2026-08-13T15:49:37Z", 33, "USAGE_PERIOD_TYPE_WEEKLY",
+					"2026-08-10T22:28:32Z", "2026-08-17T22:28:32Z"),
+				newest,
+			)
+
+			snap, ok := readGrokBillingSnapshot(base, []string{"acct-1"})
+			if !ok {
+				t.Fatal("newest record must remain usable when only its percentage is invalid")
+			}
+			if snap.HasUsedPercent || !snap.HasOnDemandUsed || snap.OnDemandUsed != 12 {
+				t.Fatalf("invalid percentage must be omitted without reviving 33%% or dropping on-demand: %+v", snap)
+			}
+			assertGrokMetricsJSON(t, grokBillingMetrics(snap, time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)),
+				`[{"kind":"weekly","label":"Weekly credits","unit":"%","resetAt":"2026-08-24T22:28:32Z","observedAt":"2026-08-17T23:02:12Z","unknown":true},{"kind":"tokens","label":"On-demand credits","unit":"credits","total":50,"remaining":38,"consumed":12,"observedAt":"2026-08-17T23:02:12Z"}]`)
+		})
 	}
 }
 
@@ -308,7 +334,7 @@ func TestGrokBillingSnapshot_PercentageBoundariesClampSafely(t *testing.T) {
 		in, want float64
 	}{{-1, 0}, {0, 0}, {100, 100}, {101, 100}} {
 		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z", Msg: grokBillingLogMessage}
-		rec.Ctx.Config.CreditUsagePercent = &tc.in
+		rec.Ctx.Config.CreditUsagePercent = grokBillingNumber{Value: tc.in, Valid: true}
 		snap, ok := grokBillingSnapshotFromRecord(rec)
 		if !ok || !snap.HasUsedPercent || snap.UsedPercent != tc.want {
 			t.Fatalf("percentage %v normalized to %+v, want %v", tc.in, snap, tc.want)

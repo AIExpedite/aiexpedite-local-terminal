@@ -203,7 +203,7 @@ func TestGrokOnDemandSurvivesAMissingUsagePercent(t *testing.T) {
 func TestGrokNaNUsagePercentIsNotAReading(t *testing.T) {
 	rec := grokBillingRecord{TS: "2026-08-17T23:02:12.510Z", Msg: grokBillingLogMessage}
 	nan := math.NaN()
-	rec.Ctx.Config.CreditUsagePercent = &nan
+	rec.Ctx.Config.CreditUsagePercent = grokBillingNumber{Value: nan, Valid: true}
 	rec.Ctx.Config.CurrentPeriod.Type = "USAGE_PERIOD_TYPE_WEEKLY"
 
 	snap, ok := grokBillingSnapshotFromRecord(rec)

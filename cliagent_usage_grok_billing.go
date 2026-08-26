@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -61,21 +62,42 @@ type grokBillingRecord struct {
 	Msg string `json:"msg"`
 	Ctx struct {
 		Config struct {
-			CreditUsagePercent *float64 `json:"creditUsagePercent"`
+			CreditUsagePercent grokBillingNumber `json:"creditUsagePercent"`
 			CurrentPeriod      struct {
 				Type  string `json:"type"`
 				Start string `json:"start"`
 				End   string `json:"end"`
 			} `json:"currentPeriod"`
 			OnDemandCap struct {
-				Val *float64 `json:"val"`
+				Val grokBillingNumber `json:"val"`
 			} `json:"onDemandCap"`
 			OnDemandUsed struct {
-				Val *float64 `json:"val"`
+				Val grokBillingNumber `json:"val"`
 			} `json:"onDemandUsed"`
 		} `json:"config"`
 		SubscriptionTier string `json:"subscriptionTier"`
 	} `json:"ctx"`
+}
+
+// grokBillingNumber decodes one allowlisted numeric leaf without rejecting the
+// entire billing record when that leaf is null, the wrong JSON type, or outside
+// float64's finite range. The record remains authoritative and blocks older
+// data; only the invalid field is omitted from its normalized snapshot.
+type grokBillingNumber struct {
+	Value float64
+	Valid bool
+}
+
+func (n *grokBillingNumber) UnmarshalJSON(data []byte) error {
+	n.Value = 0
+	n.Valid = false
+	value, err := strconv.ParseFloat(string(bytes.TrimSpace(data)), 64)
+	if err != nil || !grokFiniteNumber(value) {
+		return nil
+	}
+	n.Value = value
+	n.Valid = true
+	return nil
 }
 
 // grokBillingSnapshot is the normalized view the parser plots.
@@ -175,9 +197,18 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 		if len(line) == 0 || !bytes.Contains(line, []byte(grokBillingLogMessage)) {
 			continue
 		}
-		var rec grokBillingRecord
-		if json.Unmarshal(line, &rec) != nil || rec.Msg != grokBillingLogMessage {
+		// Decode the envelope first so an exact-message record with a malformed
+		// allowlisted field remains authoritative. If full typed decoding then
+		// fails, stop instead of reviving an older percentage.
+		var envelope struct {
+			Msg string `json:"msg"`
+		}
+		if json.Unmarshal(line, &envelope) != nil || envelope.Msg != grokBillingLogMessage {
 			continue
+		}
+		var rec grokBillingRecord
+		if json.Unmarshal(line, &rec) != nil {
+			return grokBillingSnapshot{}, false
 		}
 		snap, ok := grokBillingSnapshotFromRecord(rec)
 		if !ok {
@@ -254,8 +285,8 @@ func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, 
 	// used. Treat that as "usable record, unobserved usage" rather than "not a
 	// record": rejecting it made the scanner walk further back and publish a
 	// PRE-UPGRADE reading, under a period that had since ended.
-	if pct := rec.Ctx.Config.CreditUsagePercent; pct != nil && grokFiniteNumber(*pct) {
-		snap.UsedPercent = clampPercent(*pct)
+	if pct := rec.Ctx.Config.CreditUsagePercent; pct.Valid && grokFiniteNumber(pct.Value) {
+		snap.UsedPercent = clampPercent(pct.Value)
 		snap.HasUsedPercent = true
 	}
 	if end, err := time.Parse(time.RFC3339, rec.Ctx.Config.CurrentPeriod.End); err == nil {
@@ -264,16 +295,16 @@ func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, 
 	}
 	// On-demand is a separate, opt-in pool: only plot it when a cap exists, or
 	// the row would read as a hard 0-of-0 limit on every subscription account.
-	if cap := rec.Ctx.Config.OnDemandCap.Val; cap != nil && *cap > 0 && grokFiniteNumber(*cap) {
+	if cap := rec.Ctx.Config.OnDemandCap.Val; cap.Valid && cap.Value > 0 && grokFiniteNumber(cap.Value) {
 		snap.HasOnDemand = true
-		snap.OnDemandCap = *cap
+		snap.OnDemandCap = cap.Value
 		// A cap with no reported usage is a pool we know exists but have not
 		// observed. Leaving the zero default here would report it as completely
 		// unused — an assertion the record never made.
-		if used := rec.Ctx.Config.OnDemandUsed.Val; used != nil &&
-			grokFiniteNumber(*used) && *used >= 0 && *used <= *cap {
+		if used := rec.Ctx.Config.OnDemandUsed.Val; used.Valid &&
+			grokFiniteNumber(used.Value) && used.Value >= 0 && used.Value <= cap.Value {
 			snap.HasOnDemandUsed = true
-			snap.OnDemandUsed = *used
+			snap.OnDemandUsed = used.Value
 		}
 	}
 	return snap, true
