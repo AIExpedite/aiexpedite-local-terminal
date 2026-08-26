@@ -2530,6 +2530,35 @@ func TestCodexDiscoverRolloutCandidates_StopsWhenContextCancels(t *testing.T) {
 	}
 }
 
+func TestCodexRolloutDiscoveryContext_ReservesCandidateReadBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		budget    time.Duration
+		wantGap   time.Duration
+		tolerance time.Duration
+	}{
+		{name: "normal scan", budget: 5 * time.Second, wantGap: time.Second, tolerance: 100 * time.Millisecond},
+		{name: "short scan", budget: 500 * time.Millisecond, wantGap: 250 * time.Millisecond, tolerance: 50 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent, cancelParent := context.WithTimeout(context.Background(), tc.budget)
+			defer cancelParent()
+			parentDeadline, _ := parent.Deadline()
+
+			discovery, cancelDiscovery := codexRolloutDiscoveryContext(parent)
+			defer cancelDiscovery()
+			discoveryDeadline, ok := discovery.Deadline()
+			if !ok {
+				t.Fatal("discovery context has no deadline")
+			}
+			gap := parentDeadline.Sub(discoveryDeadline)
+			if gap < tc.wantGap-tc.tolerance || gap > tc.wantGap+tc.tolerance {
+				t.Fatalf("candidate-read reserve=%v, want %v (+/-%v)", gap, tc.wantGap, tc.tolerance)
+			}
+		})
+	}
+}
+
 func TestCodexDiscoverRolloutCandidates_VisitsNewestDateBeforeCancellation(t *testing.T) {
 	base := t.TempDir()
 	var newestPath string

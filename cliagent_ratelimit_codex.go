@@ -1455,6 +1455,12 @@ func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentU
 // reading per contributor.
 const codexRolloutScanFileCap = 16
 
+// Keep part of the optional rollout budget for consuming candidates found by
+// discovery. Otherwise a slow sessions-tree walk can expire the shared child
+// context after finding today's rollout but before opening it, repeating that
+// starvation on every refresh.
+const codexRolloutCandidateReadReserve = time.Second
+
 // codexReconcileFromRollout merges direct-run rollout evidence into the same
 // normalized contributor cache populated by terminal-managed stdout. It is
 // intentionally not Unknown-only: a still-live cached percentage may be older
@@ -1634,6 +1640,19 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 	return candidates, complete
 }
 
+func codexRolloutDiscoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return ctx, func() {}
+	}
+	remaining := time.Until(deadline)
+	reserve := codexRolloutCandidateReadReserve
+	if remaining <= reserve {
+		reserve = remaining / 2
+	}
+	return context.WithDeadline(ctx, deadline.Add(-reserve))
+}
+
 // codexUsageLimitNotice renders the card notice for a quota refusal, or "" when
 // none should be shown.
 //
@@ -1721,7 +1740,9 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		authMod = info.ModTime()
 	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
-	candidates, discoveryComplete := codexDiscoverRolloutCandidates(ctx, base, cursor)
+	discoveryCtx, cancelDiscovery := codexRolloutDiscoveryContext(ctx)
+	candidates, discoveryComplete := codexDiscoverRolloutCandidates(discoveryCtx, base, cursor)
+	cancelDiscovery()
 	if len(candidates) == 0 {
 		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
 	}
