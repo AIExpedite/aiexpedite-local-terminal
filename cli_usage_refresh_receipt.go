@@ -122,7 +122,15 @@ func canonicalProvider(agent cliAgentUsage) (canonicalCLIUsageProvider, error) {
 		}
 		metrics = append(metrics, canonicalCLIUsageMetric{metric.Kind, metric.Label, metric.Unit, total, remaining, consumed, metric.ResetAt, metric.ObservedAt, metric.Model, metric.Unknown})
 	}
-	return canonicalCLIUsageProvider{agent.CliAgentID, agent.Provider, agent.Name, agent.Version, agent.Path, agent.Account, agent.Plan, agent.Model, agent.Models, agent.AccountFingerprint, metrics, agent.CollectedAt, agent.DataSource, agent.Authenticated, agent.AuthState, agent.LoginExpiresAt, agent.LoginExpirationState, agent.Notice, agent.NoticeSeverity, agent.NoticeURL}, nil
+	return canonicalCLIUsageProvider{
+		CliAgentID: agent.CliAgentID, Provider: agent.Provider, Name: agent.Name,
+		Version: agent.Version, Path: agent.Path, Account: agent.Account, Plan: agent.Plan,
+		Model: agent.Model, Models: agent.Models, AccountFingerprint: agent.AccountFingerprint,
+		Metrics: metrics, CollectedAt: agent.CollectedAt, DataSource: agent.DataSource,
+		Authenticated: agent.Authenticated, AuthState: agent.AuthState,
+		LoginExpiresAt: agent.LoginExpiresAt, LoginExpirationState: agent.LoginExpirationState,
+		Notice: agent.Notice, NoticeSeverity: agent.NoticeSeverity, NoticeURL: agent.NoticeURL,
+	}, nil
 }
 
 func canonicalCLIUsageRefreshReceipt(refreshID string, challengeTs int64, success bool, agents []cliAgentUsage, errs []cliAgentUsageError) ([]byte, []cliAgentUsage, []cliAgentUsageError, error) {
@@ -172,7 +180,10 @@ func canonicalCLIUsageRefreshReceipt(refreshID string, challengeTs int64, succes
 	var encoded bytes.Buffer
 	encoder := json.NewEncoder(&encoded)
 	encoder.SetEscapeHTML(false)
-	err := encoder.Encode(cliUsageReceiptBody{1, refreshID, challengeTs, success, canonicalAgents, normalizedErrors})
+	err := encoder.Encode(cliUsageReceiptBody{
+		Version: 1, RefreshID: refreshID, ChallengeTs: challengeTs, Success: success,
+		CliAgents: canonicalAgents, Errors: normalizedErrors,
+	})
 	body := bytes.TrimSuffix(encoded.Bytes(), []byte("\n"))
 	if err != nil || len(body) > 256*1024 {
 		return nil, nil, nil, errors.New("receipt too large")
