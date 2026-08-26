@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+const (
+	grokJunctionLinkEnv   = "AIEXPEDITE_GROK_JUNCTION_LINK"
+	grokJunctionTargetEnv = "AIEXPEDITE_GROK_JUNCTION_TARGET"
+)
+
 // Grok persists every conversation to disk under
 // `$GROK_HOME/sessions/<url-encoded-cwd>/<session-uuid>/`, and ACP
 // `session/load` resolves a conversation by reading that directory. There is
@@ -101,7 +106,7 @@ func linkGrokDirectory(link, target, description string) error {
 		// Mode) and would therefore fail on an ordinary user's machine. Go
 		// has no junction API, so shell out to mklink. os.Symlink is kept as
 		// a fallback for the machines where the privilege IS held.
-		out, err := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput()
+		out, err := grokWindowsJunctionCommand(link, target).CombinedOutput()
 		if err == nil {
 			return nil
 		}
@@ -116,6 +121,21 @@ func linkGrokDirectory(link, target, description string) error {
 		return fmt.Errorf("symlink grok %s: %w", description, err)
 	}
 	return nil
+}
+
+// grokWindowsJunctionCommand keeps filesystem paths out of cmd.exe's command
+// tokens. GROK_HOME is user-controlled and valid Windows paths may contain
+// metacharacters such as `&`; interpolating one into `cmd /c mklink` could run
+// unintended commands. Environment expansion inside quotes makes those paths
+// data, while /d and /v:off disable AutoRun and delayed `!` expansion.
+func grokWindowsJunctionCommand(link, target string) *exec.Cmd {
+	cmd := exec.Command(
+		"cmd", "/d", "/v:off", "/c",
+		`mklink /J "%`+grokJunctionLinkEnv+`%" "%`+grokJunctionTargetEnv+`%"`,
+	)
+	env := setEnvVar(os.Environ(), grokJunctionLinkEnv, link)
+	cmd.Env = setEnvVar(env, grokJunctionTargetEnv, target)
+	return cmd
 }
 
 // pruneGrokSessionStoreOnce prunes the store at most once per agent process,
