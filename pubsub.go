@@ -429,7 +429,8 @@ func isSigFailRateLimited() bool {
    -------------------------------------------------------------------------- */
 
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
-// Field order must match: id, command, args, ts, type, sessionID, input, signal, refreshId, cliAgentCatalog
+// Field order must match: id, command, args, ts, type, sessionID, input, signal,
+// refreshId, riskLevel, conversationId, cliAgentCatalog
 //
 // refreshId is signed so an adversary that can alter a signed
 // __cli_usage_refresh__ command cannot swap the correlation id without
@@ -460,7 +461,11 @@ type signaturePayload struct {
 	// upgrade window, exactly like refreshId. Only env-setup steps set it, and
 	// both ends include it. Signing it prevents a "destructive"→"" downgrade
 	// that would skip native approval.
-	RiskLevel       string          `json:"riskLevel,omitempty"`
+	RiskLevel string `json:"riskLevel,omitempty"`
+	// conversationId selects durable local chat context for Antigravity starts.
+	// It affects execution just like signed Args, so it must be authenticated.
+	// omitempty preserves the existing signature shape for every other command.
+	ConversationID  string          `json:"conversationId,omitempty"`
 	CliAgentCatalog json.RawMessage `json:"cliAgentCatalog,omitempty"`
 }
 
@@ -485,6 +490,7 @@ func verifySignature(cmd commandMsg, secret string) bool {
 		Signal:          cmd.Signal,
 		RefreshID:       cmd.RefreshID,
 		RiskLevel:       cmd.RiskLevel,
+		ConversationID:  cmd.ConversationID,
 		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
 	}
 
@@ -593,6 +599,17 @@ type commandMsg struct {
 	PlanID    string `json:"planId,omitempty"`    // env-setup plan id (audit correlation)
 	StepID    string `json:"stepId,omitempty"`    // env-setup step id (audit correlation)
 
+	// Durable CLI conversation id to RESUME on a session start whose kind keeps
+	// its conversation on this device's filesystem (antigravity_native_start
+	// today). Empty = start a fresh conversation.
+	//
+	// Claude needs no equivalent field: its resume travels as an ordinary
+	// `--resume=<id>` entry in Args, which is already signed.
+	//
+	// SIGNED (see signaturePayload): changing it can select unrelated persisted
+	// chat context, so a tampered selector must invalidate the command HMAC.
+	ConversationID string `json:"conversationId,omitempty"`
+
 	// Tty opts an execute/session command into the PTY path (macOS/Linux only)
 	// for interactive/TUI CLIs (e.g. agy). Default false = the hardened pipe
 	// path. Unsigned metadata (like WorkspaceID/UID): flipping it cannot bypass
@@ -687,6 +704,25 @@ type resultMsg struct {
 	// Structured terminal error code. Kept separate from Output so consumers
 	// never infer GROK_NOT_AUTHENTICATED from free-form CLI text.
 	ErrorCode string `json:"errorCode,omitempty"`
+
+	// Durable CLI conversation id for a resident kind whose conversation lives
+	// on THIS device's filesystem and whose id the cloud cannot otherwise learn.
+	//
+	// Antigravity is the only such kind today. Claude publishes its `session_id`
+	// inside the stream-json `system init` frame that claude_native_message
+	// already forwards verbatim, and Grok's arrives in the ACP handshake the
+	// ai-service tool reads — both are observable server-side without a
+	// dedicated field. `agy` mints its own UUID and records it only in
+	// ~/.gemini/antigravity-cli/cache/last_conversations.json, so without this
+	// field terminal-service has nothing to commit and an Antigravity session can
+	// never become conversation-resumable (its per-session eligibility predicate
+	// fails closed on the missing snapshot).
+	//
+	// Published on antigravity_native_message only AFTER a turn is known to have
+	// succeeded, matching where NativeConversationID itself is adopted: an id
+	// captured from a failed turn would resume a conversation containing a
+	// hidden turn the UI and the replay transcript never saw.
+	ConversationID string `json:"conversationId,omitempty"`
 }
 
 /*
@@ -6286,6 +6322,7 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 			cmd.Cwd,
 			cmd.WorkspaceID,
 			cmd.UID,
+			cmd.ConversationID,
 			publishFn,
 			onStarted,
 		)

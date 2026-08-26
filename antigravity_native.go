@@ -217,7 +217,25 @@ func (m *AntigravityNativeManager) cwdCaptureLock(cwd string) *sync.Mutex {
 // cloud never sends antigravity_native_end (idle expiry / dropped end command).
 // onStarted is invoked after the session is registered so callers can publish
 // antigravity_native_started before any later frames.
-func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string, publishFn PublishFunc, onStarted func()) error {
+// Start registers a logical multi-turn session.
+//
+// resumeConversationID seeds NativeConversationID so the FIRST turn of a NEW
+// terminal session continues an EXISTING agy conversation (`--conversation
+// <id>`), which is what makes conversation-scoped resume possible after the
+// previous session's device claim was reclaimed: the cloud reads the id off the
+// durable pointer it committed from a prior antigravity_native_message and hands
+// it back here.
+//
+// Empty means "start a fresh conversation" — the pre-existing behaviour, where
+// the first turn mints an id and the capture block adopts it.
+//
+// The id is NOT validated against the local conversation store here. A stale or
+// unknown id is recoverable at turn time: Send already detects a recognized
+// missing/stale conversation (looksLikeMissingConversation) and falls back to a
+// bounded transcript replay, which is a strictly better answer than refusing the
+// start — the cloud cannot know whether the device still holds the conversation,
+// and a refusal here would strand the run rather than degrade it.
+func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid, resumeConversationID string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -286,6 +304,12 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid string
 		status:        "idle",
 		Transcript:    nil,
 		publishFn:     publishFn,
+		// Non-empty → the first turn resumes rather than mints (see Start's
+		// doc comment). Set here rather than after registration so a Send that
+		// races the tail of Start cannot observe a session that has already
+		// been published as startable but not yet told which conversation it
+		// continues — that window would silently start a fresh conversation.
+		NativeConversationID: resumeConversationID,
 	}
 	m.sessions[id] = session
 
@@ -569,6 +593,17 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 		SessionID:   session.ID,
 		Seq:         seq,
 		ExitCode:    exitCode,
+		// Durable conversation id for conversation-scoped resume. Published
+		// here — after the success gate above and after the capture block has
+		// adopted it — so the cloud only ever commits an id that names a
+		// conversation whose latest turn actually landed in the transcript.
+		//
+		// May legitimately be empty: captureAntigravityNativeID returns "" when
+		// the cwd mapping could not be read (the warning above). An empty value
+		// is dropped by omitempty and terminal-service treats an absent id as
+		// "nothing new to commit", leaving any previously committed pointer
+		// intact rather than clearing it.
+		ConversationID: session.NativeConversationID,
 	}
 	// Preflight marshaled size: JSON escaping of quotes/backslashes can push an
 	// under-stdout-cap payload over Pub/Sub's 10 MB limit. newSessionPublishFn
