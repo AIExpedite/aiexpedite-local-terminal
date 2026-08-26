@@ -57,8 +57,8 @@ func TestCLIUsageRefreshReceiptFormatsMetricsAsDecimalStrings(t *testing.T) {
 	if err := json.Unmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	if len(vectors.Vectors) != 1 {
-		t.Fatal("expected one shared vector")
+	if len(vectors.Vectors) != 2 {
+		t.Fatal("expected two shared vectors")
 	}
 	if string(canonical) != vectors.Vectors[0].Canonical {
 		t.Fatalf("unexpected canonical bytes: %s", canonical)
@@ -66,5 +66,37 @@ func TestCLIUsageRefreshReceiptFormatsMetricsAsDecimalStrings(t *testing.T) {
 	signature, _, _, err := signCLIUsageRefreshReceipt("secret", "r1", 1, true, []cliAgentUsage{{Provider: "codex", CollectedAt: "now", Metrics: []cliAgentUsageMetric{{Kind: "quota", Total: &total, Remaining: &remaining}}}}, nil)
 	if err != nil || signature != vectors.Vectors[0].Signature {
 		t.Fatalf("unexpected shared-vector signature: %s (%v)", signature, err)
+	}
+
+	noticeAgent := []cliAgentUsage{{
+		Provider:       "codex",
+		CollectedAt:    "now",
+		Notice:         "line\u2028separator",
+		NoticeSeverity: "warning",
+		NoticeURL:      "https://example.test",
+	}}
+	noticeCanonical, _, _, err := canonicalCLIUsageRefreshReceipt("r2", 2, true, noticeAgent, nil)
+	if err != nil || string(noticeCanonical) != vectors.Vectors[1].Canonical {
+		t.Fatalf("unexpected notice canonical bytes: %s (%v)", noticeCanonical, err)
+	}
+	noticeSignature, _, _, err := signCLIUsageRefreshReceipt("secret", "r2", 2, true, noticeAgent, nil)
+	if err != nil || noticeSignature != vectors.Vectors[1].Signature {
+		t.Fatalf("unexpected notice shared-vector signature: %s (%v)", noticeSignature, err)
+	}
+}
+
+func TestCLIUsageRefreshResultAlwaysIncludesErrorsArray(t *testing.T) {
+	success := true
+	payload, err := json.Marshal(resultMsg{
+		Type:      "__cli_usage_refresh_result__",
+		Success:   &success,
+		CliAgents: []cliAgentUsage{},
+		Errors:    []cliAgentUsageError{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(payload), `"errors":[]`) {
+		t.Fatalf("successful receipt omitted errors array: %s", payload)
 	}
 }

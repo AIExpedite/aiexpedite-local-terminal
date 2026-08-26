@@ -675,7 +675,7 @@ type resultMsg struct {
 	// cliUsageLastCheckedAt; omitempty would force every empty-success
 	// poll down the handled-failure path.
 	CliAgents      []cliAgentUsage      `json:"cliAgents"`
-	Errors         []cliAgentUsageError `json:"errors,omitempty"`
+	Errors         []cliAgentUsageError `json:"errors"`
 	ReceiptVersion int                  `json:"receiptVersion,omitempty"`
 	ChallengeTs    int64                `json:"challengeTs,omitempty"`
 	Receipt        string               `json:"receipt,omitempty"`

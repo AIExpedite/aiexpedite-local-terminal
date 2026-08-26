@@ -8,6 +8,14 @@
       "challengeTs": 1,
       "canonical": "AIEXPEDITE_CLI_USAGE_REFRESH_RECEIPT\n{\"version\":1,\"refreshId\":\"r1\",\"challengeTs\":1,\"success\":true,\"cliAgents\":[{\"provider\":\"codex\",\"metrics\":[{\"kind\":\"quota\",\"total\":\"0.0000001\",\"remaining\":\"0\"}],\"collectedAt\":\"now\"}],\"errors\":[]}",
       "signature": "98960c0b3dd9f51c9c653d987f81279898fb3c059df2ae0ff5440d72139ab6df"
+    },
+    {
+      "name": "notice-order-and-unicode-separator",
+      "secret": "secret",
+      "refreshId": "r2",
+      "challengeTs": 2,
+      "canonical": "AIEXPEDITE_CLI_USAGE_REFRESH_RECEIPT\n{\"version\":1,\"refreshId\":\"r2\",\"challengeTs\":2,\"success\":true,\"cliAgents\":[{\"provider\":\"codex\",\"collectedAt\":\"now\",\"notice\":\"line\\u2028separator\",\"noticeSeverity\":\"warning\",\"noticeUrl\":\"https://example.test\"}],\"errors\":[]}",
+      "signature": "91765c4e2398a4bed3aa6b58be599c590b693ca9fd6ee35f0f14c9274d26699b"
     }
   ]
 }
