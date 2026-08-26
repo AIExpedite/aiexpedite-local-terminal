@@ -35,6 +35,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -137,6 +138,9 @@ type codexRateLimitSnapshot struct {
 	// an append whose mtime stayed exactly equal to the high-water without
 	// persisting rollout paths or reopening unchanged files.
 	RolloutHighWaterBoundaryFingerprint string `json:"rolloutHighWaterBoundaryFingerprint,omitempty"`
+	// RolloutRootFingerprint scopes filesystem progress to the CODEX_HOME tree
+	// that produced it. It is a hash of the normalized root, never the raw path.
+	RolloutRootFingerprint string `json:"rolloutRootFingerprint,omitempty"`
 }
 
 // codexRateLimitMu serialises the read-modify-write of the cache file
@@ -1233,6 +1237,7 @@ func mergeCodexRateLimitCachePerLimitProgress(
 		snap.RolloutHighWaterMtimeMs = 0
 		snap.RolloutHighWaterMtimeNs = 0
 		snap.RolloutHighWaterBoundaryFingerprint = ""
+		snap.RolloutRootFingerprint = ""
 	}
 	// Migrate legacy cache files written before Contributors existed: each
 	// pre-existing aggregated bucket becomes a single __legacy__ contributor
@@ -1369,6 +1374,16 @@ func mergeCodexRateLimitCachePerLimitProgress(
 	snap.Buckets = aggregateCodexBuckets(snap.Contributors, now)
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
 	snap.AccountFingerprint = fingerprint
+	rolloutRootFingerprint := codexRolloutRootFingerprint(rolloutAccountBase)
+	if rolloutHighWater != nil && snap.RolloutRootFingerprint != rolloutRootFingerprint {
+		// A cursor from another CODEX_HOME is not meaningful in this sessions
+		// tree. Clear it before comparing mtimes so a lower-mtime rollout in the
+		// new root can establish its own completed progress.
+		snap.RolloutHighWaterMtimeMs = 0
+		snap.RolloutHighWaterMtimeNs = 0
+		snap.RolloutHighWaterBoundaryFingerprint = ""
+		snap.RolloutRootFingerprint = rolloutRootFingerprint
+	}
 	storedRolloutCursorIsFuture := snap.RolloutHighWaterMtimeNs > now.UnixNano() ||
 		(snap.RolloutHighWaterMtimeNs == 0 && snap.RolloutHighWaterMtimeMs > now.UnixMilli())
 	if rolloutHighWater != nil && (storedRolloutCursorIsFuture || rolloutHighWater.mtimeNs > snap.RolloutHighWaterMtimeNs ||
@@ -1377,6 +1392,7 @@ func mergeCodexRateLimitCachePerLimitProgress(
 		snap.RolloutHighWaterMtimeNs = rolloutHighWater.mtimeNs
 		snap.RolloutHighWaterMtimeMs = time.Unix(0, rolloutHighWater.mtimeNs).UnixMilli()
 		snap.RolloutHighWaterBoundaryFingerprint = rolloutHighWater.boundaryFingerprint
+		snap.RolloutRootFingerprint = rolloutRootFingerprint
 	}
 
 	out, err := json.MarshalIndent(snap, "", "  ")
@@ -1529,7 +1545,7 @@ const codexRolloutReadDirChunkSize = 128
 // limit id, then the existing most-constrained aggregate determines the row and
 // its observation timestamp.
 func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence, time.Time) {
-	cursor := codexRolloutScanCursorForAccount(currentFingerprint, now)
+	cursor := codexRolloutScanCursorForAccount(base, currentFingerprint, now)
 	contribs, limit, latestObservation, highWater, ok := codexRolloutFallbackBuckets(ctx, base, now, cursor)
 	// Authentication can change while filesystem I/O is in progress. Never let
 	// an old-account scan clear or overwrite a live capture already scoped to the
@@ -1556,13 +1572,41 @@ type codexRolloutScanProgress struct {
 	boundaryFingerprint string
 }
 
-// codexRolloutScanCursorForAccount separates filesystem progress from provider event
-// time. New caches use the completed-scan high-water. Legacy caches fall back
-// to the oldest observable aggregate so a newer weekly-bearing file is not
-// hidden by a fresher session row; empty/all-Unknown caches scan from zero.
-func codexRolloutScanCursorForAccount(currentFingerprint string, now time.Time) codexRolloutScanCursor {
+// codexRolloutRootFingerprint identifies a CODEX_HOME without persisting its
+// path. Absolute and symlink-resolved normalization prevents equivalent roots
+// from triggering avoidable rescans; Windows paths are case-insensitive.
+func codexRolloutRootFingerprint(base string) string {
+	if base == "" {
+		return ""
+	}
+	normalized, err := filepath.Abs(base)
+	if err != nil {
+		normalized = filepath.Clean(base)
+	}
+	if resolved, err := filepath.EvalSymlinks(normalized); err == nil {
+		normalized = resolved
+	}
+	normalized = filepath.Clean(normalized)
+	if runtime.GOOS == "windows" {
+		normalized = strings.ToLower(normalized)
+	}
+	sum := sha256.Sum256([]byte(normalized))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// codexRolloutScanCursorForAccount separates filesystem progress from provider
+// event time. Completed progress is reusable only for the same account and
+// CODEX_HOME. Legacy/unscoped cursors reset once, then the completed scan writes
+// the root fingerprint. Otherwise legacy caches fall back to the oldest
+// observable aggregate so a newer weekly-bearing file is not hidden by a
+// fresher session row; empty/all-Unknown caches scan from zero.
+func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.Time) codexRolloutScanCursor {
 	snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath())
 	if !ok || snap.AccountFingerprint != currentFingerprint {
+		return codexRolloutScanCursor{}
+	}
+	if (snap.RolloutHighWaterMtimeNs > 0 || snap.RolloutHighWaterMtimeMs > 0) &&
+		snap.RolloutRootFingerprint != codexRolloutRootFingerprint(base) {
 		return codexRolloutScanCursor{}
 	}
 	if snap.RolloutHighWaterMtimeNs > 0 {

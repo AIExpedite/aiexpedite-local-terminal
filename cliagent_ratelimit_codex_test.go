@@ -3069,9 +3069,76 @@ func TestCodexRolloutFallbackBuckets_FutureAuthWatermarkLeavesProgressForRetry(t
 	}
 }
 
+func TestCodexReconcileFromRollout_ResetsCursorForDifferentCodexHome(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	firstBase := filepath.Join(root, "codex-home-one-secret")
+	secondBase := filepath.Join(root, "codex-home-two-secret")
+
+	helperWriteRolloutLogAt(t, firstBase, "26", "2026-08-26T13-40-00-first", "2026-08-26T13:40:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 31.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}})
+	firstPath := filepath.Join(firstBase, "sessions", "2026", "06", "26", "rollout-2026-08-26T13-40-00-first.jsonl")
+	firstMtime := now.Add(-time.Minute)
+	if err := os.Chtimes(firstPath, firstMtime, firstMtime); err != nil {
+		t.Fatal(err)
+	}
+	metrics, _, _ := codexReconcileFromRollout(context.Background(), firstBase, "", now)
+	if got := metrics[0].Consumed; got == nil || *got != 31 {
+		t.Fatalf("first CODEX_HOME session usage=%v, want 31", got)
+	}
+	firstCursor := codexRolloutScanCursorForAccount(firstBase, "", now)
+	if firstCursor.mtimeNs == 0 {
+		t.Fatal("expected completed cursor for first CODEX_HOME")
+	}
+
+	helperWriteRolloutLogAt(t, secondBase, "26", "2026-08-26T13-55-00-second", "2026-08-26T13:55:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 64.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(2 * time.Hour).Unix()),
+			},
+		}})
+	secondPath := filepath.Join(secondBase, "sessions", "2026", "06", "26", "rollout-2026-08-26T13-55-00-second.jsonl")
+	secondMtime := now.Add(-10 * time.Minute)
+	if err := os.Chtimes(secondPath, secondMtime, secondMtime); err != nil {
+		t.Fatal(err)
+	}
+	if cursor := codexRolloutScanCursorForAccount(secondBase, "", now); cursor.mtimeNs != 0 || cursor.boundaryFingerprint != "" {
+		t.Fatalf("different CODEX_HOME cursor=%+v, want reset before discovery", cursor)
+	}
+
+	metrics, _, _ = codexReconcileFromRollout(context.Background(), secondBase, "", now)
+	if got := metrics[0].Consumed; got == nil || *got != 64 {
+		t.Fatalf("second CODEX_HOME session usage=%v, want older-mtime rollout reconciled at 64", got)
+	}
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected reconciled snapshot")
+	}
+	if want := codexRolloutRootFingerprint(secondBase); snap.RolloutRootFingerprint != want {
+		t.Fatalf("rollout root fingerprint=%q, want %q", snap.RolloutRootFingerprint, want)
+	}
+	persisted, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rawPathSentinel := range []string{"codex-home-one-secret", "codex-home-two-secret"} {
+		if strings.Contains(string(persisted), rawPathSentinel) {
+			t.Fatalf("typed cache leaked CODEX_HOME path %q: %s", rawPathSentinel, persisted)
+		}
+	}
+}
+
 func TestCodexRolloutScanCursorForAccount_ResetsPersistedFutureCursor(t *testing.T) {
 	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
-	fingerprint := "account-a"
+	fingerprint := fingerprintAccount("codex", "workspace-a")
 
 	for _, tc := range []struct {
 		name string
@@ -3096,9 +3163,17 @@ func TestCodexRolloutScanCursorForAccount_ResetsPersistedFutureCursor(t *testing
 		t.Run(tc.name, func(t *testing.T) {
 			cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
 			t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
-			helperWriteJSON(t, cache, tc.snap)
 
 			base := t.TempDir()
+			helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{
+				"tokens": map[string]any{"account_id": "workspace-a"},
+			})
+			authMtime := now.Add(-2 * time.Hour)
+			if err := os.Chtimes(filepath.Join(base, "auth.json"), authMtime, authMtime); err != nil {
+				t.Fatal(err)
+			}
+			tc.snap.RolloutRootFingerprint = codexRolloutRootFingerprint(base)
+			helperWriteJSON(t, cache, tc.snap)
 			dir := filepath.Join(base, "sessions", "2026", "08", "26")
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				t.Fatal(err)
@@ -3112,7 +3187,7 @@ func TestCodexRolloutScanCursorForAccount_ResetsPersistedFutureCursor(t *testing
 				t.Fatal(err)
 			}
 
-			cursor := codexRolloutScanCursorForAccount(fingerprint, now)
+			cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
 			if cursor.mtimeNs != 0 || cursor.boundaryFingerprint != "" {
 				t.Fatalf("cursor=%+v, want reset after clock rollback", cursor)
 			}
@@ -3125,7 +3200,7 @@ func TestCodexRolloutScanCursorForAccount_ResetsPersistedFutureCursor(t *testing
 				t.Fatal("expected completed post-rollback scan progress")
 			}
 			mergeCodexRateLimitCachePerLimitProgress(
-				cache, nil, nil, false, nil, false, now, fingerprint, progress, "",
+				cache, nil, nil, false, nil, false, now, fingerprint, progress, base,
 			)
 			persisted, ok := loadCodexRateLimitSnapshot(cache)
 			if !ok {
