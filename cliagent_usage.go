@@ -359,6 +359,12 @@ func runProviderParseSafely(
 	} else {
 		parsed, ok = parser.Parse(home, entry, now)
 	}
+	if ctx.Err() != nil {
+		return nil, &cliAgentUsageError{
+			Provider: parser.Provider(),
+			Message:  "gather context canceled",
+		}
+	}
 	if !ok || parsed == nil {
 		// Non-fatal "we couldn't enrich this provider" — caller will
 		// still emit the baseline entry. Don't surface as an error.

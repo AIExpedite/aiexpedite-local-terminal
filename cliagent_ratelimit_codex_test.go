@@ -11,6 +11,28 @@ import (
 	"time"
 )
 
+type cancelAfterChecksContext struct {
+	checks int
+	after  int
+	done   chan struct{}
+}
+
+func (c *cancelAfterChecksContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelAfterChecksContext) Done() <-chan struct{}       { return c.done }
+func (c *cancelAfterChecksContext) Value(any) any               { return nil }
+func (c *cancelAfterChecksContext) Err() error {
+	c.checks++
+	if c.checks >= c.after {
+		select {
+		case <-c.done:
+		default:
+			close(c.done)
+		}
+		return context.Canceled
+	}
+	return nil
+}
+
 func TestCurrentCodexAccountFingerprint_NamespacedChatGPTUserID(t *testing.T) {
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
@@ -2271,7 +2293,7 @@ func TestCaptureCodexRateLimit_EqualPercentageAdvancesManagedObservation(t *test
 	}
 }
 
-func TestCodexAcceptedObservationTime_FutureToleranceAndClamp(t *testing.T) {
+func TestCodexObservationTimes_FutureToleranceAndClamp(t *testing.T) {
 	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
 	cases := []struct {
 		name string
@@ -2283,14 +2305,17 @@ func TestCodexAcceptedObservationTime_FutureToleranceAndClamp(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := codexAcceptedObservationTime(map[string]interface{}{
+			anchor, got := codexObservationTimes(map[string]interface{}{
 				"timestamp": tc.at.Format(time.RFC3339Nano),
 			}, now, false)
 			if tc.zero {
-				if !got.IsZero() {
-					t.Fatalf("got %s, want rejection", got)
+				if !anchor.IsZero() || !got.IsZero() {
+					t.Fatalf("anchor=%s observed=%s, want rejection", anchor, got)
 				}
 				return
+			}
+			if !anchor.Equal(tc.at) {
+				t.Fatalf("anchor=%s, want provider reset anchor %s", anchor, tc.at)
 			}
 			if !got.Equal(now) {
 				t.Fatalf("got %s, want publication clamp %s", got, now)
@@ -2348,5 +2373,119 @@ func TestCodexRateLimitSnapshot_RedactsRawEnvelopeFields(t *testing.T) {
 	}
 	if !strings.Contains(string(persisted), `"usedPercentage": 28`) {
 		t.Fatalf("normalized metric missing from cache: %s", persisted)
+	}
+}
+
+func TestCaptureCodexRateLimit_UnrecognizedEnvelopeCannotOverwriteCache(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	first := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	captureCodexRateLimitLine(
+		`{"type":"token_count","rate_limits":{"primary":{"used_percent":21,"window_minutes":300}}}`,
+		first,
+	)
+	captureCodexRateLimitLine(
+		`{"type":"tool_output","params":{"rateLimits":{"primary":{"usedPercent":99,"windowDurationMins":300}}}}`,
+		first.Add(time.Minute),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected seeded cache")
+	}
+	b := snap.Buckets[codexWindowPrimary]
+	if b.UsedPercentage != 21 || b.ObservedAtMs != first.UnixMilli() {
+		t.Fatalf("bucket=%+v, arbitrary params.rateLimits must fail closed", b)
+	}
+}
+
+func TestCaptureCodexRateLimit_FutureEventAnchorsResetButClampsObservation(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	providerAt := now.Add(5 * time.Minute)
+	line := fmt.Sprintf(
+		`{"timestamp":%q,"type":"token_count","rate_limits":{"primary":{"used_percent":32,"resets_in_seconds":60}}}`,
+		providerAt.Format(time.RFC3339Nano),
+	)
+	captureCodexRateLimitLine(line, now)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected cache")
+	}
+	b := snap.Buckets[codexWindowPrimary]
+	if b.ObservedAtMs != now.UnixMilli() {
+		t.Fatalf("ObservedAtMs=%d, want receive-time clamp %d", b.ObservedAtMs, now.UnixMilli())
+	}
+	if b.ResetsAtMs != providerAt.Add(time.Minute).UnixMilli() {
+		t.Fatalf("ResetsAtMs=%d, want provider anchor %d", b.ResetsAtMs, providerAt.Add(time.Minute).UnixMilli())
+	}
+}
+
+func TestCodexBucketsFromRolloutFile_SkipsOversizedNonMetricLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := `{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":17,"window_minutes":300}}}`
+	later := `{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":29,"window_minutes":300}}}`
+	if _, err = fmt.Fprintln(f, first); err == nil {
+		_, err = fmt.Fprintln(f, strings.Repeat("x", codexAppServerMaxLineSize+1))
+	}
+	if err == nil {
+		_, err = fmt.Fprint(f, later) // final complete token intentionally has no newline
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	interruptCtx := &cancelAfterChecksContext{after: 3, done: make(chan struct{})}
+	partial, _, _, handled, ok := codexBucketsFromRolloutFile(interruptCtx, path, now)
+	if handled || !ok {
+		t.Fatalf("interrupted handled=%v ok=%v, want persisted complete evidence with retry required", handled, ok)
+	}
+	if b := partial[codexWindowPrimary][codexLegacyLimitID]; b.UsedPercentage != 17 {
+		t.Fatalf("partial bucket=%+v, want complete object before interruption", b)
+	}
+
+	buckets, _, _, handled, ok := codexBucketsFromRolloutFile(context.Background(), path, now)
+	if !handled || !ok {
+		t.Fatalf("handled=%v ok=%v, want complete scan with numeric evidence", handled, ok)
+	}
+	b := buckets[codexWindowPrimary][codexLegacyLimitID]
+	if b.UsedPercentage != 29 || b.ObservedAtMs != time.Date(2026, 8, 26, 14, 10, 0, 0, time.UTC).UnixMilli() {
+		t.Fatalf("bucket=%+v, want later numeric object after oversized line", b)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_StatFailurePreventsHighWaterAdvance(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	validPath := filepath.Join(dir, "rollout-valid.jsonl")
+	valid := `{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":17,"window_minutes":300}}}`
+	if err := os.WriteFile(validPath, []byte(valid+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "missing-target"), filepath.Join(dir, "rollout-broken.jsonl")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	_, _, _, highWater, ok := codexRolloutFallbackBuckets(
+		context.Background(), base, time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC), 0,
+	)
+	if !ok {
+		t.Fatal("expected valid sibling rollout evidence")
+	}
+	if highWater != nil {
+		t.Fatalf("highWater=%d, want unchanged after incomplete metadata discovery", *highWater)
 	}
 }

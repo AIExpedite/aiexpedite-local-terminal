@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -43,9 +44,9 @@ import (
 // `7d`/`weekly`) onto these stable internal keys so cliagent_usage_codex.go
 // can lookup-by-id without re-implementing the alias table.
 const (
-	codexWindowPrimary                 = "primary"
-	codexWindowSecondary               = "secondary"
-	providerObservationFutureTolerance = 5 * time.Minute
+	codexWindowPrimary                      = "primary"
+	codexWindowSecondary                    = "secondary"
+	codexProviderObservationFutureTolerance = 5 * time.Minute
 )
 
 // codexLegacyLimitID is the synthetic contributor id for buckets coming from
@@ -965,8 +966,9 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 	if !isRecognizedCodexRateLimitEnvelope(raw) {
 		return
 	}
-	anchor := codexAcceptedObservationTime(raw, now, true)
+	anchor, observedAt := codexObservationTimes(raw, now, true)
 	updates, clears, fullSnapshot, present, emptyAuthoritative := extractCodexRateLimitBucketsFull(raw, anchor)
+	codexStampContributorObservations(updates, observedAt)
 	// A full snapshot must be processed even when it carries no buckets and no
 	// explicit nulls IF it is authoritative-empty: an `account/rateLimits/read`
 	// response whose container is literally `{}` declares the account now has NO
@@ -998,47 +1000,68 @@ func isRecognizedCodexRateLimitEnvelope(raw map[string]interface{}) bool {
 			}
 		}
 	}
-	for _, key := range []string{"params", "result"} {
-		nested, ok := raw[key].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if _, ok := pickField(nested, "rate_limits", "rateLimits", "rate_limits_by_limit_id", "rateLimitsByLimitId"); ok {
-			return true
-		}
-		if msg, ok := nested["msg"].(map[string]interface{}); ok {
+	if params, ok := raw["params"].(map[string]interface{}); ok {
+		if msg, ok := params["msg"].(map[string]interface{}); ok {
 			if eventType, _ := msg["type"].(string); eventType == "token_count" {
 				return true
+			}
+		}
+	}
+	// A direct result container is the response shape for
+	// account/rateLimits/read. Requiring JSON-RPC framing prevents an arbitrary
+	// application object containing `result.rateLimits` from being trusted.
+	if raw["jsonrpc"] == "2.0" {
+		if result, ok := raw["result"].(map[string]interface{}); ok {
+			if _, ok := pickField(result, "rate_limits", "rateLimits", "rate_limits_by_limit_id", "rateLimitsByLimitId"); ok {
+				return true
+			}
+			if msg, ok := result["msg"].(map[string]interface{}); ok {
+				if eventType, _ := msg["type"].(string); eventType == "token_count" {
+					return true
+				}
 			}
 		}
 	}
 	return false
 }
 
-// codexAcceptedObservationTime returns a safe provider event time. Live
-// envelopes commonly omit one, so allowFallback uses the receive time. Rollout
-// callers pass false: numeric evidence without an enclosing event timestamp is
-// unrankable and must be discarded. Provider clocks up to five minutes ahead
-// are accepted but clamped to receive time before publication.
-func codexAcceptedObservationTime(raw map[string]interface{}, now time.Time, allowFallback bool) time.Time {
+// codexObservationTimes returns the event-time anchor used for relative reset
+// conversion and the safe publication timestamp. Live envelopes commonly omit
+// an event time, so allowFallback uses receive time. Rollout callers pass false:
+// numeric evidence without an enclosing event timestamp is unrankable and must
+// be discarded. Provider clocks up to five minutes ahead are accepted as reset
+// anchors while their published observation is clamped to receive time.
+func codexObservationTimes(raw map[string]interface{}, now time.Time, allowFallback bool) (time.Time, time.Time) {
 	ts, _ := raw["timestamp"].(string)
 	if ts == "" {
 		if allowFallback {
-			return now
+			return now, now
 		}
-		return time.Time{}
+		return time.Time{}, time.Time{}
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, ts)
-	if err != nil || parsed.After(now.Add(providerObservationFutureTolerance)) {
+	if err != nil || parsed.After(now.Add(codexProviderObservationFutureTolerance)) {
 		if allowFallback {
-			return now
+			return now, now
 		}
-		return time.Time{}
+		return time.Time{}, time.Time{}
 	}
 	if parsed.After(now) {
-		return now
+		return parsed, now
 	}
-	return parsed
+	return parsed, parsed
+}
+
+func codexStampContributorObservations(contributors map[string]map[string]codexRateLimitBucket, observedAt time.Time) {
+	if observedAt.IsZero() {
+		return
+	}
+	for window, limits := range contributors {
+		for limitID, bucket := range limits {
+			bucket.ObservedAtMs = observedAt.UnixMilli()
+			contributors[window][limitID] = bucket
+		}
+	}
 }
 
 // mergeCodexRateLimitCache is the flat-shape entry point preserved for callers
@@ -1338,6 +1361,10 @@ func loadCodexRateLimitSnapshot(path string) (codexRateLimitSnapshot, bool) {
 func currentCodexAccountFingerprint() string {
 	home, _ := os.UserHomeDir()
 	base := firstNonEmpty(os.Getenv("CODEX_HOME"), expandHome(home, ".codex"))
+	return codexAccountFingerprintAtBase(base)
+}
+
+func codexAccountFingerprintAtBase(base string) string {
 	if base == "" {
 		return ""
 	}
@@ -1421,6 +1448,12 @@ const codexRolloutScanFileCap = 16
 func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence, time.Time) {
 	threshold := codexRolloutScanThreshold(currentFingerprint, now)
 	contribs, limit, latestObservation, highWater, ok := codexRolloutFallbackBuckets(ctx, base, now, threshold)
+	// Authentication can change while filesystem I/O is in progress. Never let
+	// an old-account scan clear or overwrite a live capture already scoped to the
+	// newly active account; the next refresh will reconcile under that account.
+	if codexAccountFingerprintAtBase(base) != currentFingerprint {
+		return codexMetricsFromCache(now, currentFingerprint), codexUsageLimitEvidence{}, time.Time{}
+	}
 	if ok || highWater != nil {
 		mergeCodexRateLimitCachePerLimitProgress(
 			codexRateLimitCachePath(), contribs, nil, false, nil, false,
@@ -1563,9 +1596,17 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		mtime time.Time
 	}
 	candidates := make([]rolloutCandidate, 0, len(matches))
+	discoveryComplete := true
 	for _, m := range matches {
+		if ctx.Err() != nil {
+			return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
+		}
 		info, err := os.Stat(m)
 		if err != nil {
+			// A transient metadata failure leaves this discovery pass incomplete.
+			// We may still consume other candidates, but must not advance progress
+			// past a file whose mtime could not be evaluated.
+			discoveryComplete = false
 			continue
 		}
 		if info.ModTime().UnixMilli() <= mtimeAfterMs {
@@ -1603,7 +1644,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	if len(selected) > codexRolloutScanFileCap {
 		selected = selected[:codexRolloutScanFileCap]
 	}
-	allHandled := true
+	allHandled := discoveryComplete
 	maxSelectedMtimeMs := int64(0)
 	for _, c := range selected {
 		if c.mtime.UnixMilli() > maxSelectedMtimeMs {
@@ -1709,19 +1750,10 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	// Rollout lines embed full model turns and can be large; match the
-	// app-server's ceiling so a single big line doesn't abort the scan mid-file.
-	scanner.Buffer(make([]byte, 0, 64*1024), codexAppServerMaxLineSize)
-
 	var sessionStart time.Time
 	var limit codexUsageLimitEvidence
 	acc := map[string]map[string]codexRateLimitBucket{}
-	for scanner.Scan() {
-		if ctx.Err() != nil {
-			return acc, sessionStart, limit, false, len(acc) > 0
-		}
-		line := scanner.Text()
+	consumeLine := func(line string) {
 		// Exhaustion evidence is collected from the SAME pass, ahead of the
 		// rate-limit prefilter: a refused turn carries no window at all (Codex
 		// sends `primary: null, secondary: null` once the limit is reached), so
@@ -1744,14 +1776,14 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		if !strings.Contains(line, "token_count") &&
 			!strings.Contains(line, "rateLimits") &&
 			!strings.Contains(line, "rate_limit") {
-			continue
+			return
 		}
 		var raw map[string]interface{}
 		if json.Unmarshal([]byte(line), &raw) != nil {
-			continue
+			return
 		}
 		if !isRecognizedCodexRateLimitEnvelope(raw) {
-			continue
+			return
 		}
 		// Anchor relative reset fields (`resets_in_seconds`) to the moment the
 		// line was EMITTED, not the usage-refresh time. A historical rollout
@@ -1760,11 +1792,11 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		// hour from now, masking a window that has long since rolled over.
 		// Absolute `resets_at` fields ignore this anchor, so the fallback is
 		// when the line carries no parseable timestamp.
-		eventTime := codexAcceptedObservationTime(raw, now, false)
+		eventTime, observedAt := codexObservationTimes(raw, now, false)
 		if eventTime.IsZero() {
 			// Numeric rollout telemetry without an enclosing event time cannot
 			// advance freshness. Drop this object only and continue later lines.
-			continue
+			return
 		}
 		// The rollout shape nests telemetry under `payload`
 		// ({"type":"event_msg","payload":{"type":"token_count","rate_limits":…}}),
@@ -1772,12 +1804,55 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		// false for that envelope, so null windows are ignored rather than
 		// treated as clears — exactly what we want when mining for live usage.
 		if updates, _ := extractCodexRateLimitBuckets(raw, eventTime); len(updates) > 0 {
+			codexStampContributorObservations(updates, observedAt)
 			// Merge, don't replace: token_count notifications are sparse, so a
 			// later frame restating only `primary` must not drop a `secondary`
 			// reading an earlier frame in this same file already captured.
 			// Liveness for sparse-merge is judged at the frame's own event
 			// time so an expired prior reset isn't carried onto fresh usage.
 			mergeCodexRolloutFrame(acc, updates, eventTime)
+		}
+	}
+
+	// Scanner cannot recover after an oversized token and cannot be canceled
+	// while accumulating it. Read in bounded fragments instead: complete JSONL
+	// objects up to the existing 30 MB ceiling are consumed, oversized objects
+	// are discarded through their newline, and cancellation preserves earlier
+	// complete evidence while leaving the file unhandled for retry.
+	reader := bufio.NewReaderSize(f, 64*1024)
+	lineBytes := make([]byte, 0, 64*1024)
+	oversized := false
+	for {
+		if ctx.Err() != nil {
+			return acc, sessionStart, limit, false, len(acc) > 0
+		}
+		fragment, readErr := reader.ReadSlice('\n')
+		if !oversized {
+			if len(lineBytes)+len(fragment) > codexAppServerMaxLineSize {
+				lineBytes = lineBytes[:0]
+				oversized = true
+			} else {
+				lineBytes = append(lineBytes, fragment...)
+			}
+		}
+		if readErr == bufio.ErrBufferFull {
+			continue
+		}
+		if readErr != nil && readErr != io.EOF {
+			return acc, sessionStart, limit, false, len(acc) > 0
+		}
+		if !oversized && len(lineBytes) > 0 {
+			for len(lineBytes) > 0 && (lineBytes[len(lineBytes)-1] == '\n' || lineBytes[len(lineBytes)-1] == '\r') {
+				lineBytes = lineBytes[:len(lineBytes)-1]
+			}
+			if len(lineBytes) > 0 {
+				consumeLine(string(lineBytes))
+			}
+		}
+		lineBytes = lineBytes[:0]
+		oversized = false
+		if readErr == io.EOF {
+			break
 		}
 	}
 	if ctx.Err() != nil {

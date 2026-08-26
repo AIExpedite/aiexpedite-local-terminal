@@ -14,6 +14,17 @@ import (
 	"time"
 )
 
+type cancellationReturningUsageParser struct{}
+
+func (cancellationReturningUsageParser) Provider() string { return "cancel-test" }
+func (cancellationReturningUsageParser) Parse(string, detectedCLIAgent, time.Time) (*cliAgentUsage, bool) {
+	return nil, false
+}
+func (cancellationReturningUsageParser) ParseContext(ctx context.Context, _ string, _ detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
+	<-ctx.Done()
+	return &cliAgentUsage{Provider: "cancel-test", CollectedAt: now.UTC().Format(time.RFC3339)}, true
+}
+
 func helperWriteJSON(t *testing.T, path string, payload any) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -2326,6 +2337,17 @@ func TestCodexUsageParser_ShortParentBudgetReturnsCacheWithoutError(t *testing.T
 	}
 	if ctx.Err() != nil {
 		t.Fatalf("Codex exhausted parent context instead of reserving sibling budget: %v", ctx.Err())
+	}
+}
+
+func TestRunProviderParseSafely_ReportsCancellationDuringContextParser(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	usage, errEntry := runProviderParseSafely(
+		ctx, cancellationReturningUsageParser{}, t.TempDir(), detectedCLIAgent{Detected: true}, time.Now(),
+	)
+	if usage != nil || errEntry == nil || errEntry.Provider != "cancel-test" || errEntry.Message != "gather context canceled" {
+		t.Fatalf("usage=%+v err=%+v, want explicit outer cancellation", usage, errEntry)
 	}
 }
 
