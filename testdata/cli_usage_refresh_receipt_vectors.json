@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "name": "decimal-metric-and-negative-zero",
+      "secret": "secret",
+      "refreshId": "r1",
+      "challengeTs": 1,
+      "canonical": "AIEXPEDITE_CLI_USAGE_REFRESH_RECEIPT\n{\"version\":1,\"refreshId\":\"r1\",\"challengeTs\":1,\"success\":true,\"cliAgents\":[{\"provider\":\"codex\",\"metrics\":[{\"kind\":\"quota\",\"total\":\"0.0000001\",\"remaining\":\"0\"}],\"collectedAt\":\"now\"}],\"errors\":[]}",
+      "signature": "98960c0b3dd9f51c9c653d987f81279898fb3c059df2ae0ff5440d72139ab6df"
+    }
+  ]
+}

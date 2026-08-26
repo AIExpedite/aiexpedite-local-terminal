@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"math"
+	"os"
 	"strings"
 	"testing"
 )
@@ -45,8 +47,24 @@ func TestCLIUsageRefreshReceiptFormatsMetricsAsDecimalStrings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected := cliUsageReceiptDomain + `{"version":1,"refreshId":"r1","challengeTs":1,"success":true,"cliAgents":[{"provider":"codex","metrics":[{"kind":"quota","total":"0.0000001","remaining":"0"}],"collectedAt":"now"}],"errors":[]}`
-	if string(canonical) != expected {
+	data, err := os.ReadFile("testdata/cli_usage_refresh_receipt_vectors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vectors struct {
+		Vectors []struct{ Canonical, Signature string } `json:"vectors"`
+	}
+	if err := json.Unmarshal(data, &vectors); err != nil {
+		t.Fatal(err)
+	}
+	if len(vectors.Vectors) != 1 {
+		t.Fatal("expected one shared vector")
+	}
+	if string(canonical) != vectors.Vectors[0].Canonical {
 		t.Fatalf("unexpected canonical bytes: %s", canonical)
+	}
+	signature, _, _, err := signCLIUsageRefreshReceipt("secret", "r1", 1, true, []cliAgentUsage{{Provider: "codex", CollectedAt: "now", Metrics: []cliAgentUsageMetric{{Kind: "quota", Total: &total, Remaining: &remaining}}}}, nil)
+	if err != nil || signature != vectors.Vectors[0].Signature {
+		t.Fatalf("unexpected shared-vector signature: %s (%v)", signature, err)
 	}
 }
