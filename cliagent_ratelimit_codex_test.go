@@ -2530,6 +2530,38 @@ func TestCodexDiscoverRolloutCandidates_StopsWhenContextCancels(t *testing.T) {
 	}
 }
 
+func TestCodexDiscoverRolloutCandidates_RetainsSameMillisecondUpdate(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "rollout-test.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first := time.Date(2026, 8, 26, 14, 0, 0, 100_000, time.UTC)
+	second := first.Add(700 * time.Microsecond)
+	if first.UnixMilli() != second.UnixMilli() {
+		t.Fatal("test fixture must remain within one millisecond")
+	}
+	if err := os.Chtimes(path, second, second); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ModTime().UnixNano() == info.ModTime().UnixMilli()*int64(time.Millisecond) {
+		t.Skip("filesystem does not preserve sub-millisecond mtimes")
+	}
+
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, first.UnixNano())
+	if !complete || len(candidates) != 1 || candidates[0].path != path {
+		t.Fatalf("complete=%v candidates=%+v, want same-millisecond append selected", complete, candidates)
+	}
+}
+
 func TestCodexRolloutFallbackBuckets_CanonicalizesMixedIdentitySameLimit(t *testing.T) {
 	base := t.TempDir()
 	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)

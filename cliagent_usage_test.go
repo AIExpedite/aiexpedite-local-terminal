@@ -2356,6 +2356,9 @@ func TestCodexUsageParser_DirectRunAdvancesAndPersistsAcrossRestart(t *testing.T
 	if !ok || snap.RolloutHighWaterMtimeMs != mtime.UnixMilli() {
 		t.Fatalf("high-water=%d ok=%v, want %d", snap.RolloutHighWaterMtimeMs, ok, mtime.UnixMilli())
 	}
+	if snap.RolloutHighWaterMtimeNs != mtime.UnixNano() {
+		t.Fatalf("nanosecond high-water=%d, want %d", snap.RolloutHighWaterMtimeNs, mtime.UnixNano())
+	}
 
 	// Simulate an executable replacement/restart. The rollout file remains at
 	// the completed high-water but its raw contents are no longer parseable; a

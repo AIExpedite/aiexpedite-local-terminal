@@ -126,6 +126,10 @@ type codexRateLimitSnapshot struct {
 	// observation time. It advances only after every selected rollout file was
 	// handled, allowing unchanged refreshes to remain cache-only.
 	RolloutHighWaterMtimeMs int64 `json:"rolloutHighWaterMtimeMs,omitempty"`
+	// RolloutHighWaterMtimeNs preserves the filesystem's full timestamp
+	// precision. The millisecond field remains for backwards compatibility with
+	// snapshots written before same-millisecond appends were handled.
+	RolloutHighWaterMtimeNs int64 `json:"rolloutHighWaterMtimeNs,omitempty"`
 }
 
 // codexRateLimitMu serialises the read-modify-write of the cache file
@@ -1168,6 +1172,7 @@ func mergeCodexRateLimitCachePerLimitProgress(
 		snap.Buckets = map[string]codexRateLimitBucket{}
 		snap.Contributors = map[string]map[string]codexRateLimitBucket{}
 		snap.RolloutHighWaterMtimeMs = 0
+		snap.RolloutHighWaterMtimeNs = 0
 	}
 	// Migrate legacy cache files written before Contributors existed: each
 	// pre-existing aggregated bucket becomes a single __legacy__ contributor
@@ -1304,8 +1309,9 @@ func mergeCodexRateLimitCachePerLimitProgress(
 	snap.Buckets = aggregateCodexBuckets(snap.Contributors, now)
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
 	snap.AccountFingerprint = fingerprint
-	if rolloutHighWater != nil && *rolloutHighWater > snap.RolloutHighWaterMtimeMs {
-		snap.RolloutHighWaterMtimeMs = *rolloutHighWater
+	if rolloutHighWater != nil && *rolloutHighWater > snap.RolloutHighWaterMtimeNs {
+		snap.RolloutHighWaterMtimeNs = *rolloutHighWater
+		snap.RolloutHighWaterMtimeMs = time.Unix(0, *rolloutHighWater).UnixMilli()
 	}
 
 	out, err := json.MarshalIndent(snap, "", "  ")
@@ -1472,8 +1478,11 @@ func codexRolloutScanThreshold(currentFingerprint string, now time.Time) int64 {
 	if !ok || snap.AccountFingerprint != currentFingerprint {
 		return 0
 	}
+	if snap.RolloutHighWaterMtimeNs > 0 {
+		return snap.RolloutHighWaterMtimeNs
+	}
 	if snap.RolloutHighWaterMtimeMs > 0 {
-		return snap.RolloutHighWaterMtimeMs
+		return time.UnixMilli(snap.RolloutHighWaterMtimeMs).UnixNano()
 	}
 	parts := codexPartitionByIdentity(codexContributorsForAccount(currentFingerprint))
 	oldest := int64(0)
@@ -1493,7 +1502,7 @@ func codexRolloutScanThreshold(currentFingerprint string, now time.Time) int64 {
 			oldest = b.ObservedAtMs
 		}
 	}
-	return oldest
+	return time.UnixMilli(oldest).UnixNano()
 }
 
 type codexRolloutCandidate struct {
@@ -1507,7 +1516,7 @@ type codexRolloutCandidate struct {
 // instead of traversing an arbitrarily large session history after cancellation.
 // complete is false when cancellation or a metadata error means scan progress
 // must not advance.
-func codexDiscoverRolloutCandidates(ctx context.Context, base string, mtimeAfterMs int64) ([]codexRolloutCandidate, bool) {
+func codexDiscoverRolloutCandidates(ctx context.Context, base string, mtimeAfterNs int64) ([]codexRolloutCandidate, bool) {
 	root := filepath.Join(base, "sessions")
 	candidates := []codexRolloutCandidate{}
 	complete := true
@@ -1551,7 +1560,7 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, mtimeAfter
 			complete = false
 			return nil
 		}
-		if info.ModTime().UnixMilli() > mtimeAfterMs {
+		if info.ModTime().UnixNano() > mtimeAfterNs {
 			candidates = append(candidates, codexRolloutCandidate{path: path, mtime: info.ModTime()})
 		}
 		return nil
@@ -1631,7 +1640,7 @@ const codexUsageLimitNoticeMaxAge = 12 * time.Hour
 // is disabled, matching the best-effort unscoped behaviour the parser already
 // uses when the account is unknown. Best-effort: returns (nil, false) on any
 // problem.
-func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time, mtimeAfterMs int64) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, *int64, bool) {
+func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time, mtimeAfterNs int64) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, *int64, bool) {
 	if base == "" {
 		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
 	}
@@ -1652,7 +1661,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		authMod = info.ModTime()
 	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
-	candidates, discoveryComplete := codexDiscoverRolloutCandidates(ctx, base, mtimeAfterMs)
+	candidates, discoveryComplete := codexDiscoverRolloutCandidates(ctx, base, mtimeAfterNs)
 	if len(candidates) == 0 {
 		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
 	}
@@ -1692,10 +1701,10 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		selected = selected[:codexRolloutScanFileCap]
 	}
 	allHandled := discoveryComplete
-	maxSelectedMtimeMs := int64(0)
+	maxSelectedMtimeNs := int64(0)
 	for _, c := range selected {
-		if c.mtime.UnixMilli() > maxSelectedMtimeMs {
-			maxSelectedMtimeMs = c.mtime.UnixMilli()
+		if c.mtime.UnixNano() > maxSelectedMtimeNs {
+			maxSelectedMtimeNs = c.mtime.UnixNano()
 		}
 	}
 	for _, c := range selected {
@@ -1751,7 +1760,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	}
 	var highWater *int64
 	if allHandled {
-		highWater = &maxSelectedMtimeMs
+		highWater = &maxSelectedMtimeNs
 	}
 	if len(winners) == 0 {
 		// No usable window anywhere in the scanned logs — but a quota refusal
