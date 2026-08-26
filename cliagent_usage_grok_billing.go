@@ -132,26 +132,131 @@ func grokBillingLogPath(base string) string {
 	return filepath.Join(base, "logs", "unified.jsonl")
 }
 
-// linkGrokBillingLogs exposes the real provider-owned log directory inside a
-// terminal-managed session's otherwise ephemeral GROK_HOME. Grok therefore
-// appends the same billing evidence for direct and ACP runs, while auth/config
-// isolation stays intact and no response or tool-result content is harvested.
-func linkGrokBillingLogs(isolatedHome, realHome string) error {
-	if isolatedHome == "" || realHome == "" {
+// grokPersistentHome resolves the provider-owned home used by direct runs. ACP
+// sessions capture this path before spawning so a later `grok login` can change
+// the account in that home without changing where managed evidence is merged.
+func grokPersistentHome() string {
+	base := os.Getenv("GROK_HOME")
+	if base == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			base = filepath.Join(home, ".grok")
+		}
+	}
+	if base == "" {
+		return ""
+	}
+	if absolute, err := filepath.Abs(base); err == nil {
+		return absolute
+	}
+	return base
+}
+
+const grokManagedBillingIdentityMessage = "aiexpedite: managed billing producer"
+
+// seedGrokManagedBillingIdentity records the account copied into an isolated
+// ACP home before the child starts. The isolated log is private to that one
+// process, so this marker cannot be displaced by a concurrent `grok login` in
+// the real home. Prefer the last candidate (normally the opaque JWT subject)
+// over an email while retaining compatibility with older auth layouts.
+func seedGrokManagedBillingIdentity(isolatedHome string) error {
+	path := grokBillingLogPath(isolatedHome)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	identities := grokIdentityCandidates(isolatedHome)
+	if len(identities) == 0 {
 		return nil
 	}
-	// Symlink targets are resolved relative to the link's parent, not the
-	// daemon's working directory. Normalize a relative GROK_HOME before linking
-	// or `<isolated>/logs` would silently point inside the temp tree.
-	realHome, err := filepath.Abs(realHome)
+	identity := strings.TrimSpace(identities[len(identities)-1])
+	if identity == "" {
+		return nil
+	}
+	line, err := json.Marshal(map[string]any{
+		"msg": grokManagedBillingIdentityMessage,
+		"ctx": map[string]any{"user_id": identity},
+	})
 	if err != nil {
 		return err
 	}
-	logs := filepath.Join(realHome, "logs")
-	if err := os.MkdirAll(logs, 0o700); err != nil {
+	return os.WriteFile(path, append(line, '\n'), 0o600)
+}
+
+// persistGrokManagedBillingSnapshot copies one session's newest verified
+// billing observation into the provider-owned log after the managed process
+// exits. The source is bound to the auth copy frozen at session start. The two
+// destination lines are written in one O_APPEND call so a direct Grok process
+// cannot interleave a different account identity between them.
+//
+// Only normalized allowlisted fields are persisted. Prompts, credentials, raw
+// config, tool results, and unrelated log fields never leave the isolated home.
+func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) error {
+	if isolatedHome == "" || persistentHome == "" {
+		return nil
+	}
+	identities := grokIdentityCandidates(isolatedHome)
+	if len(identities) == 0 {
+		return nil
+	}
+	snap, ok := readGrokBillingSnapshot(isolatedHome, identities)
+	if !ok {
+		return nil
+	}
+	identity := strings.TrimSpace(identities[len(identities)-1])
+	if identity == "" {
+		return nil
+	}
+
+	period := map[string]any{"type": snap.PeriodType}
+	if snap.HasPeriodEnd {
+		period["end"] = snap.PeriodEnd.UTC().Format(time.RFC3339Nano)
+	}
+	config := map[string]any{"currentPeriod": period}
+	if snap.HasUsedPercent {
+		config["creditUsagePercent"] = snap.UsedPercent
+	}
+	if snap.HasOnDemand {
+		config["onDemandCap"] = map[string]any{"val": snap.OnDemandCap}
+		if snap.HasOnDemandUsed {
+			config["onDemandUsed"] = map[string]any{"val": snap.OnDemandUsed}
+		}
+	}
+	identityLine, err := json.Marshal(map[string]any{
+		"msg": grokManagedBillingIdentityMessage,
+		"ctx": map[string]any{"user_id": identity},
+	})
+	if err != nil {
 		return err
 	}
-	return linkGrokDirectory(filepath.Join(isolatedHome, "logs"), logs, "billing logs")
+	billingLine, err := json.Marshal(map[string]any{
+		"ts":  snap.ObservedAt.UTC().Format(time.RFC3339Nano),
+		"msg": grokBillingLogMessage,
+		"ctx": map[string]any{
+			"config":           config,
+			"subscriptionTier": snap.SubscriptionTier,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	payload := make([]byte, 0, len(identityLine)+len(billingLine)+2)
+	payload = append(payload, identityLine...)
+	payload = append(payload, '\n')
+	payload = append(payload, billingLine...)
+	payload = append(payload, '\n')
+
+	path := grokBillingLogPath(persistentHome)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(payload); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // readGrokBillingSnapshot returns the NEWEST billing record in the log tail,

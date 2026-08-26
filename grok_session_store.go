@@ -87,9 +87,10 @@ func linkGrokSessionStore(home string) error {
 	return linkGrokDirectory(filepath.Join(home, "sessions"), store, "session store")
 }
 
-// linkGrokDirectory creates a directory link on every supported platform.
-// Both the persistent conversation store and the provider-owned billing log
-// use this helper to stay available from a security-isolated GROK_HOME.
+// linkGrokDirectory creates a directory link on every supported platform. The
+// persistent conversation store uses it to stay available from a
+// security-isolated GROK_HOME; billing logs deliberately remain session-local
+// until an account-bound normalized snapshot is persisted after process exit.
 func linkGrokDirectory(link, target, description string) error {
 	// The isolated home is freshly created, so the entry should not exist;
 	// clear a stray one rather than failing the link. RemoveAll does not follow

@@ -11,12 +11,14 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestBuildGrokACPArgs_DefaultContract pins the validated grok 0.2.59 shape:
@@ -260,19 +262,15 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 		t.Fatalf("clean config.toml must not carry api_key/approval knobs: %q", cfg)
 	}
 
-	// Billing logs are provider-owned telemetry, not user config. Managed runs
-	// must append them to the real GROK_HOME so the next bounded refresh can
-	// observe the same record after this isolated directory is removed.
-	const billingEvidence = `{"ts":"2026-08-17T23:02:12Z","msg":"billing: fetched credits config"}`
-	if err := os.WriteFile(filepath.Join(dir, "logs", "unified.jsonl"), []byte(billingEvidence), 0o600); err != nil {
-		t.Fatalf("write through isolated billing-log link: %v", err)
+	// Billing must remain session-private while the child runs. A shared logs
+	// link would let this frozen auth copy write under a newly logged-in account.
+	if info, err := os.Lstat(filepath.Join(dir, "logs")); err != nil {
+		t.Fatalf("isolated billing directory missing: %v", err)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("isolated billing directory must not link to the real GROK_HOME")
 	}
-	gotBilling, err := os.ReadFile(filepath.Join(realHome, "logs", "unified.jsonl"))
-	if err != nil {
-		t.Fatalf("real billing log not persisted: %v", err)
-	}
-	if string(gotBilling) != billingEvidence {
-		t.Fatalf("real billing log = %q, want %q", gotBilling, billingEvidence)
+	if _, err := os.Stat(filepath.Join(realHome, "logs")); !os.IsNotExist(err) {
+		t.Fatalf("setup must not create or share the real billing log; stat err = %v", err)
 	}
 }
 
@@ -297,7 +295,7 @@ func TestSetupIsolatedGrokHome_MissingAuthTolerated(t *testing.T) {
 	}
 }
 
-func TestLinkGrokBillingLogs_ResolvesRelativeRealHome(t *testing.T) {
+func TestGrokPersistentHome_ResolvesRelativeHome(t *testing.T) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -307,21 +305,72 @@ func TestLinkGrokBillingLogs_ResolvesRelativeRealHome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	isolatedHome := t.TempDir()
-	if err := linkGrokBillingLogs(isolatedHome, relativeHome); err != nil {
-		t.Fatalf("link relative GROK_HOME: %v", err)
+	t.Setenv("GROK_HOME", relativeHome)
+	if got := grokPersistentHome(); got != realHome {
+		t.Fatalf("persistent Grok home = %q, want %q", got, realHome)
+	}
+}
+
+func TestPersistGrokManagedBillingSnapshot_BindsCopiedAccountAcrossLoginChange(t *testing.T) {
+	realHome := t.TempDir()
+	seedGrokHomeWithLogin(t, realHome) // account A / user-1
+	withTempGrokSessionStore(t)
+
+	isolatedHome, err := setupIsolatedGrokHomeFrom(false, grokACPDefaultModel, realHome)
+	if err != nil {
+		t.Fatalf("setup isolated home: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(isolatedHome) })
+
+	now := time.Now().UTC()
+	billing := fmt.Sprintf(`{"ts":%q,"msg":%q,"credential":"credential-sentinel","prompt":"prompt-sentinel","ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":%q},"rawConfig":"raw-config-sentinel"},"subscriptionTier":"SuperGrok"}}`+"\n",
+		now.Format(time.RFC3339Nano), grokBillingLogMessage, now.Add(7*24*time.Hour).Format(time.RFC3339Nano))
+	f, err := os.OpenFile(grokBillingLogPath(isolatedHome), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open isolated billing log: %v", err)
+	}
+	if _, err := f.WriteString(billing); err != nil {
+		_ = f.Close()
+		t.Fatalf("write isolated billing log: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close isolated billing log: %v", err)
 	}
 
-	const evidence = "relative-home-billing-evidence"
-	if err := os.WriteFile(filepath.Join(isolatedHome, "logs", "unified.jsonl"), []byte(evidence), 0o600); err != nil {
-		t.Fatalf("write through billing link: %v", err)
+	// Simulate `grok login` switching the real home to B while the A session is
+	// still alive. The merged record must retain A's copied producer identity.
+	helperGrokScopedAuth(t, realHome, map[string]any{
+		"key":     unsignedJWT(t, map[string]any{"email": "bea@example.com", "sub": "user-2"}),
+		"email":   "bea@example.com",
+		"user_id": "user-2",
+	})
+	if err := os.MkdirAll(filepath.Join(realHome, "logs"), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	got, err := os.ReadFile(filepath.Join(realHome, "logs", "unified.jsonl"))
+	if err := os.WriteFile(grokBillingLogPath(realHome), []byte(`{"msg":"session start","ctx":{"user_id":"user-2"}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistGrokManagedBillingSnapshot(isolatedHome, realHome); err != nil {
+		t.Fatalf("persist managed billing: %v", err)
+	}
+
+	if _, ok := readGrokBillingSnapshot(realHome, grokIdentityCandidates(realHome)); ok {
+		t.Fatal("account A managed billing must not be attributed to newly logged-in account B")
+	}
+	persisted, err := os.ReadFile(grokBillingLogPath(realHome))
 	if err != nil {
-		t.Fatalf("read persistent billing log: %v", err)
+		t.Fatal(err)
 	}
-	if string(got) != evidence {
-		t.Fatalf("persistent billing log = %q, want %q", got, evidence)
+	for _, forbidden := range []string{"credential-sentinel", "prompt-sentinel", "raw-config-sentinel", "bea@example.com"} {
+		if strings.Contains(string(persisted), forbidden) {
+			t.Fatalf("persisted managed billing leaked or misbound %q: %s", forbidden, persisted)
+		}
+	}
+	lines := strings.Split(strings.TrimSpace(string(persisted)), "\n")
+	if len(lines) < 3 || !strings.Contains(lines[len(lines)-2], grokManagedBillingIdentityMessage) ||
+		!strings.Contains(lines[len(lines)-2], `"user_id":"user-1"`) ||
+		!strings.Contains(lines[len(lines)-1], `"msg":"billing: fetched credits config"`) {
+		t.Fatalf("managed billing missing copied account-A identity: %s", persisted)
 	}
 }
 
