@@ -979,6 +979,7 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 	anchor, observedAt := codexObservationTimes(raw, now, true)
 	updates, clears, fullSnapshot, present, emptyAuthoritative := extractCodexRateLimitBucketsFull(raw, anchor)
 	codexStampContributorObservations(updates, observedAt)
+	updates = codexCanonicalizeLiveContributors(updates)
 	// A full snapshot must be processed even when it carries no buckets and no
 	// explicit nulls IF it is authoritative-empty: an `account/rateLimits/read`
 	// response whose container is literally `{}` declares the account now has NO
@@ -1072,6 +1073,47 @@ func codexStampContributorObservations(contributors map[string]map[string]codexR
 			contributors[window][limitID] = bucket
 		}
 	}
+}
+
+// codexCanonicalizeLiveContributors normalizes the two displayed identities
+// before the slot-keyed cache merge. Codex can report a weekly bucket under
+// `primary` (and vice versa); merging that physical key directly can overwrite a
+// cached session contributor with the same limit id before identity reconciliation
+// gets a chance to preserve both. Rollout contributors are normalized at their
+// reconstruction boundary for the same reason.
+func codexCanonicalizeLiveContributors(contributors map[string]map[string]codexRateLimitBucket) map[string]map[string]codexRateLimitBucket {
+	type placement struct {
+		sourceSlot string
+		bucket     codexRateLimitBucket
+	}
+	placed := map[string]map[string]placement{}
+	for sourceSlot, limits := range contributors {
+		for limitID, bucket := range limits {
+			targetSlot := sourceSlot
+			switch codexWindowIdentity(bucket.WindowMinutes, sourceSlot) {
+			case codexIdentitySession:
+				targetSlot = codexWindowPrimary
+			case codexIdentityWeekly:
+				targetSlot = codexWindowSecondary
+			}
+			if placed[targetSlot] == nil {
+				placed[targetSlot] = map[string]placement{}
+			}
+			previous, exists := placed[targetSlot][limitID]
+			if !exists || codexPlacementBeats(bucket, sourceSlot, previous.bucket, previous.sourceSlot) {
+				placed[targetSlot][limitID] = placement{sourceSlot: sourceSlot, bucket: bucket}
+			}
+		}
+	}
+
+	out := make(map[string]map[string]codexRateLimitBucket, len(placed))
+	for slot, limits := range placed {
+		out[slot] = make(map[string]codexRateLimitBucket, len(limits))
+		for limitID, p := range limits {
+			out[slot][limitID] = p.bucket
+		}
+	}
+	return out
 }
 
 // mergeCodexRateLimitCache is the flat-shape entry point preserved for callers

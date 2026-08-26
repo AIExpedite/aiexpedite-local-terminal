@@ -335,12 +335,16 @@ func TestCaptureCodexRateLimit_ClearOnlyFullReadDropsMigratedWeekly(t *testing.T
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 
-	// Seed a weekly-band reading that lives under the PRIMARY slot (bucket
-	// migration): identity is `weekly` even though it sits in `primary`.
-	captureCodexRateLimitLine(
-		`{"method":"token_count","params":{"rate_limits":{"primary":{"used_percent":90,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
-		now,
-	)
+	// Seed the legacy on-disk placement directly: live capture now normalizes
+	// this weekly identity to secondary before merging, but an older cache may
+	// still contain it under primary and the clear path must handle that shape.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 90, WindowMinutes: 10080,
+			ResetsAtMs: now.Add(7 * 24 * time.Hour).UnixMilli(),
+			usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, "")
 	if snap, ok := loadCodexRateLimitSnapshot(cache); !ok || snap.Buckets[codexWindowPrimary].UsedPercentage != 90 {
 		t.Fatalf("seed failed: %+v", snap.Buckets)
 	}
@@ -392,6 +396,47 @@ func TestCaptureCodexRateLimit_SparseUpdateNullDoesNotClear(t *testing.T) {
 	}
 	if p, ok := snap.Buckets[codexWindowPrimary]; !ok || p.UsedPercentage != 12 {
 		t.Errorf("primary update should still apply: %+v", snap.Buckets)
+	}
+}
+
+// A sparse live update can report the weekly identity under the physical
+// `primary` slot. When session and weekly share the legacy limit id, normalize
+// that update before the slot-keyed merge so it cannot overwrite the cached
+// session contributor before identity reconciliation runs.
+func TestCaptureCodexRateLimit_SparseMigratedWeeklyPreservesSessionWithSameLimitID(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{`+
+			`"primary":{"used_percent":25,"window_minutes":300,"resets_in_seconds":1800},`+
+			`"secondary":{"used_percent":60,"window_minutes":10080,"resets_in_seconds":604800}`+
+			`}}}`,
+		now,
+	)
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{`+
+			`"primary":{"used_percent":70,"window_minutes":10080,"resets_in_seconds":604800}`+
+			`}}}`,
+		now.Add(time.Minute),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected cache")
+	}
+	if session, present := snap.Buckets[codexWindowPrimary]; !present || session.UsedPercentage != 25 {
+		t.Errorf("session bucket=%+v, present=%v; want preserved 25%% session", session, present)
+	}
+	if weekly, present := snap.Buckets[codexWindowSecondary]; !present || weekly.UsedPercentage != 70 {
+		t.Errorf("weekly bucket=%+v, present=%v; want refreshed 70%% weekly", weekly, present)
+	}
+	if _, present := snap.Contributors[codexWindowPrimary][codexLegacyLimitID]; !present {
+		t.Errorf("session contributor missing after migrated weekly update: %+v", snap.Contributors)
+	}
+	if _, present := snap.Contributors[codexWindowSecondary][codexLegacyLimitID]; !present {
+		t.Errorf("weekly contributor missing after migrated weekly update: %+v", snap.Contributors)
 	}
 }
 
@@ -1791,8 +1836,8 @@ func TestCaptureCodexRateLimit_MultiLimitWeeklyMostConstrained(t *testing.T) {
 	}
 }
 
-// AC3: a sparse frame that re-places a weekly reading under a new storage slot
-// must not leave the superseded slot's stale weekly lingering in the cache.
+// AC3: a sparse frame that reports a weekly reading under a different provider
+// slot must replace the stale reading while retaining the canonical cache slot.
 func TestCaptureCodexRateLimit_SameIdentitySupersessionAcrossSlots(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
@@ -1814,8 +1859,11 @@ func TestCaptureCodexRateLimit_SameIdentitySupersessionAcrossSlots(t *testing.T)
 	if !ok {
 		t.Fatalf("expected cache")
 	}
-	if contribs, present := snap.Contributors[codexWindowSecondary]; present && len(contribs) > 0 {
-		t.Errorf("superseded secondary weekly must be dropped, still present: %+v", contribs)
+	if weekly, present := snap.Contributors[codexWindowSecondary][codexLegacyLimitID]; !present || weekly.UsedPercentage != 30 {
+		t.Errorf("canonical weekly contributor=%+v, present=%v; want refreshed 30%%", weekly, present)
+	}
+	if contribs := snap.Contributors[codexWindowPrimary]; len(contribs) > 0 {
+		t.Errorf("provider primary placement must be normalized away: %+v", contribs)
 	}
 	metrics := codexMetricsFromCache(now.Add(30*time.Second), "")
 	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
@@ -1881,11 +1929,11 @@ func TestCodexMetricsFromCache_FingerprintMismatchHidesSnapshot(t *testing.T) {
 
 // Finding 2 (cross-shape migration): a weekly first observed via the aggregate
 // `rate_limits` view (limit id __legacy__ under secondary) then re-reported via
-// the per-limit `rateLimitsByLimitId` view under the primary slot (a NAMED limit
-// id) is the SAME weekly metric. Supersession keys on identity, not limit id, so
-// the stale secondary copy is dropped and the newest reading wins — even though
-// it reports a LOWER used %. Keying on (identity, limit id) would keep both and
-// let most-constrained folding resurrect the stale higher %.
+// the per-limit `rateLimitsByLimitId` view under the primary provider slot (a
+// NAMED limit id) is the SAME weekly metric. The stale aggregate is dropped and
+// the newest named reading wins in the canonical weekly cache slot — even though
+// it reports a LOWER used %. Keying only on (identity, limit id) without the
+// legacy-to-named supersession rule would keep both and resurrect the stale high %.
 func TestCaptureCodexRateLimit_CrossShapeWeeklyMigrationNewestWins(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
@@ -1910,8 +1958,15 @@ func TestCaptureCodexRateLimit_CrossShapeWeeklyMigrationNewestWins(t *testing.T)
 	if !ok {
 		t.Fatalf("expected cache")
 	}
-	if contribs, present := snap.Contributors[codexWindowSecondary]; present && len(contribs) > 0 {
-		t.Errorf("stale aggregate weekly under secondary must be dropped, still present: %+v", contribs)
+	weeklyContribs := snap.Contributors[codexWindowSecondary]
+	if _, present := weeklyContribs[codexLegacyLimitID]; present {
+		t.Errorf("stale aggregate weekly must be dropped, still present: %+v", weeklyContribs)
+	}
+	if named, present := weeklyContribs["codex_secondary"]; !present || named.UsedPercentage != 30 {
+		t.Errorf("named weekly contributor=%+v, present=%v; want refreshed 30%%", named, present)
+	}
+	if contribs := snap.Contributors[codexWindowPrimary]; len(contribs) > 0 {
+		t.Errorf("provider primary placement must be normalized away: %+v", contribs)
 	}
 	metrics := codexMetricsFromCache(now.Add(30*time.Second), "")
 	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
@@ -2091,9 +2146,9 @@ func TestCaptureCodexRateLimit_FullSnapshotUnparseableBucketPreservesCache(t *te
 }
 
 // Finding (sparse-safe concurrent limits): two weekly metered limits A@90% and
-// B@20% are cached under secondary; a later sparse frame restates ONLY B, moving
-// it to the primary slot at 30%. B's old secondary copy is superseded (newest
-// placement wins), but A — which the sparse frame never mentioned — must NOT be
+// B@20% are cached under secondary; a later sparse frame restates ONLY B under
+// the primary provider slot at 30%. B is refreshed in the canonical weekly
+// cache slot, but A — which the sparse frame never mentioned — must NOT be
 // retracted. Weekly must still display 90% (A most-constrains), not 30%.
 func TestCaptureCodexRateLimit_SparseMigrationKeepsUnmentionedConcurrentLimit(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
@@ -2125,12 +2180,12 @@ func TestCaptureCodexRateLimit_SparseMigrationKeepsUnmentionedConcurrentLimit(t 
 	if a, present := snap.Contributors[codexWindowSecondary]["codex_weekly_a"]; !present || a.UsedPercentage != 90 {
 		t.Errorf("unmentioned concurrent limit A must survive under secondary: %+v", snap.Contributors[codexWindowSecondary])
 	}
-	// B migrated: its secondary copy is superseded, the primary copy remains.
-	if _, present := snap.Contributors[codexWindowSecondary]["codex_weekly_b"]; present {
-		t.Errorf("migrated limit B must not keep its stale secondary copy: %+v", snap.Contributors[codexWindowSecondary])
+	// B is refreshed in the canonical weekly slot; no physical primary copy remains.
+	if b, present := snap.Contributors[codexWindowSecondary]["codex_weekly_b"]; !present || b.UsedPercentage != 30 {
+		t.Errorf("migrated limit B must refresh under secondary at 30%%: %+v", snap.Contributors[codexWindowSecondary])
 	}
-	if b, present := snap.Contributors[codexWindowPrimary]["codex_weekly_b"]; !present || b.UsedPercentage != 30 {
-		t.Errorf("migrated limit B must live under primary at 30%%: %+v", snap.Contributors[codexWindowPrimary])
+	if contribs := snap.Contributors[codexWindowPrimary]; len(contribs) > 0 {
+		t.Errorf("provider primary placement must be normalized away: %+v", contribs)
 	}
 
 	metrics := codexMetricsFromCache(now.Add(30*time.Second), "")
