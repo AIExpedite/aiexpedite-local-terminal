@@ -296,18 +296,24 @@ func TestSetupIsolatedGrokHome_MissingAuthTolerated(t *testing.T) {
 }
 
 func TestGrokPersistentHome_ResolvesRelativeHome(t *testing.T) {
+	// Resolve the relative home against the temp dir's own parent rather than
+	// the repo checkout: on Windows CI the two live on different volumes, and
+	// filepath.Rel cannot relate paths across volumes.
+	realHome := t.TempDir()
+	t.Chdir(filepath.Dir(realHome))
+
+	// Re-read the cwd after chdir so a symlinked temp root (macOS /var ->
+	// /private/var) is compared against the same resolved form filepath.Abs
+	// will produce inside grokPersistentHome.
 	cwd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
-	realHome := t.TempDir()
-	relativeHome, err := filepath.Rel(cwd, realHome)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GROK_HOME", relativeHome)
-	if got := grokPersistentHome(); got != realHome {
-		t.Fatalf("persistent Grok home = %q, want %q", got, realHome)
+	want := filepath.Join(cwd, filepath.Base(realHome))
+
+	t.Setenv("GROK_HOME", filepath.Base(realHome))
+	if got := grokPersistentHome(); got != want {
+		t.Fatalf("persistent Grok home = %q, want %q", got, want)
 	}
 }
 
