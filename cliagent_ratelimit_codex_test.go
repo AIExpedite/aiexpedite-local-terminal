@@ -1261,6 +1261,55 @@ func TestCaptureCodexRateLimit_DropsStaleSnapshotOnAccountSwitch(t *testing.T) {
 	}
 }
 
+func TestRolloutMerge_RevalidatesAccountInsideCacheTransaction(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	accountBase := t.TempDir()
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	fingerprintA := fingerprintAccount("codex", "workspace-A")
+	fingerprintB := fingerprintAccount("codex", "workspace-B")
+
+	// Account B has already signed in and populated the cache by the time an
+	// account-A rollout scan reaches its locked read-modify-write transaction.
+	helperWriteJSON(t, filepath.Join(accountBase, "auth.json"), map[string]any{
+		"tokens": map[string]any{"account_id": "workspace-B"},
+	})
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowSecondary: {
+			UsedPercentage: 12,
+			ObservedAtMs:   now.UnixMilli(),
+			usageKnown:     true,
+		},
+	}, nil, now, fingerprintB)
+
+	progress := &codexRolloutScanProgress{mtimeNs: now.UnixNano()}
+	mergeCodexRateLimitCachePerLimitProgress(cache, map[string]map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			codexLegacyLimitID: {
+				UsedPercentage: 91,
+				ObservedAtMs:   now.Add(time.Minute).UnixMilli(),
+				usageKnown:     true,
+			},
+		},
+	}, nil, false, nil, false, now.Add(time.Minute), fingerprintA, progress, accountBase)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected account-B cache to remain readable")
+	}
+	if snap.AccountFingerprint != fingerprintB {
+		t.Fatalf("fingerprint=%q, want current account B %q", snap.AccountFingerprint, fingerprintB)
+	}
+	if _, present := snap.Buckets[codexWindowPrimary]; present {
+		t.Fatalf("old account-A rollout must not replace current cache: %+v", snap.Buckets)
+	}
+	if got := snap.Buckets[codexWindowSecondary].UsedPercentage; got != 12 {
+		t.Fatalf("account-B weekly usage=%v, want 12", got)
+	}
+	if snap.RolloutHighWaterMtimeNs != 0 {
+		t.Fatalf("old account-A rollout must not advance current account cursor: %d", snap.RolloutHighWaterMtimeNs)
+	}
+}
+
 func TestCodexMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)

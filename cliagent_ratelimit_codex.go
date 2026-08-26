@@ -1168,7 +1168,7 @@ func mergeCodexRateLimitCachePerLimit(
 	now time.Time,
 	fingerprint string,
 ) {
-	mergeCodexRateLimitCachePerLimitProgress(path, perLimit, clears, fullSnapshot, present, emptyAuthoritative, now, fingerprint, nil)
+	mergeCodexRateLimitCachePerLimitProgress(path, perLimit, clears, fullSnapshot, present, emptyAuthoritative, now, fingerprint, nil, "")
 }
 
 // mergeCodexRateLimitCachePerLimitProgress is the shared live/rollout
@@ -1185,6 +1185,7 @@ func mergeCodexRateLimitCachePerLimitProgress(
 	now time.Time,
 	fingerprint string,
 	rolloutHighWater *codexRolloutScanProgress,
+	rolloutAccountBase string,
 ) {
 	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !emptyAuthoritative && rolloutHighWater == nil) {
 		return
@@ -1201,6 +1202,15 @@ func mergeCodexRateLimitCachePerLimitProgress(
 			_ = unlockFile(lockFile)
 			_ = lockFile.Close()
 		}()
+	}
+	// A rollout scan validates the active account before it starts, but auth can
+	// change while filesystem I/O is in progress. Revalidate after acquiring the
+	// cache transaction locks so a newly signed-in account's live capture cannot
+	// be cleared and replaced by the earlier account's rollout contributors.
+	// Live capture passes an empty base because its evidence is scoped at receive
+	// time and must remain able to initialize or replace the cache.
+	if rolloutAccountBase != "" && codexAccountFingerprintAtBase(rolloutAccountBase) != fingerprint {
+		return
 	}
 
 	snap := codexRateLimitSnapshot{
@@ -1521,7 +1531,7 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 	if ok || highWater != nil {
 		mergeCodexRateLimitCachePerLimitProgress(
 			codexRateLimitCachePath(), contribs, nil, false, nil, false,
-			now, currentFingerprint, highWater,
+			now, currentFingerprint, highWater, base,
 		)
 	}
 	return codexMetricsFromCache(now, currentFingerprint), limit, latestObservation
