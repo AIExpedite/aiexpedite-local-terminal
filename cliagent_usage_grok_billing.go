@@ -26,7 +26,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -47,12 +46,6 @@ const grokBillingMaxClockSkew = 5 * time.Minute
 // grokBillingLogMessage is the log `msg` that carries the credits config. Grok
 // writes it when the CLI fetches billing (session start / periodic refresh).
 const grokBillingLogMessage = "billing: fetched credits config"
-
-// grokLogUserIDRe extracts the account the CLI was acting as. The billing record
-// itself carries no identity, but the surrounding log lines do, and the log
-// survives `grok login` as a different user — so without this check a retained
-// record from a previous account would be published as the current one's.
-var grokLogUserIDRe = regexp.MustCompile(`"user_?[Ii]d"\s*:\s*"([^"]{1,128})"`)
 
 // grokBillingRecord mirrors the fields we consume from that line. Everything is
 // optional: an older CLI, a different plan shape, or a partially written line
@@ -84,6 +77,20 @@ type grokBillingRecord struct {
 type grokBillingNumber struct {
 	Value float64
 	Valid bool
+}
+
+// grokLogIdentityRecord is the complete allowlist for account evidence in a
+// unified-log line. Known Grok versions put the identity in ctx; top-level
+// fields are retained for older compatible envelopes. A typed envelope avoids
+// treating credentials, prompts, or tool results that merely contain a
+// user_id-looking string as proof of who fetched a billing record.
+type grokLogIdentityRecord struct {
+	UserID      *string `json:"user_id"`
+	UserIDCamel *string `json:"userId"`
+	Ctx         struct {
+		UserID      *string `json:"user_id"`
+		UserIDCamel *string `json:"userId"`
+	} `json:"ctx"`
 }
 
 func (n *grokBillingNumber) UnmarshalJSON(data []byte) error {
@@ -245,17 +252,17 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 	// identity, so allowing a lookalike user_id on the record to authenticate
 	// itself would defeat the cross-account boundary this scan enforces.
 	for i := lineIdx - 1; i >= 0; i-- {
-		match := grokLogUserIDRe.FindSubmatch(lines[i])
-		if match == nil {
+		identity, found, valid := grokLogIdentity(lines[i])
+		if !found {
 			continue
 		}
-		if len(wanted) == 0 {
+		if !valid || len(wanted) == 0 {
 			// The log names a producer but the credentials resolve to nothing we
-			// can compare. Refuse rather than guess: an unidentifiable local login
-			// is exactly the logged-out case this check exists for.
+			// can compare, or its newest identity envelope is malformed. Refuse
+			// rather than falling back to older account evidence.
 			return false
 		}
-		return wanted[strings.ToLower(string(match[1]))]
+		return wanted[strings.ToLower(identity)]
 	}
 	// Nothing identifies the producer anywhere before the record. That is
 	// not evidence it belongs to the current login: `unified.jsonl` is shared
@@ -264,6 +271,47 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 	// publish as its own. Refuse — the card falls back to "unobservable", which
 	// is what it showed before this source existed.
 	return false
+}
+
+// grokLogIdentity returns the account in an allowlisted identity envelope.
+// found distinguishes an invalid identity-shaped line from unrelated telemetry:
+// the former must block older identity evidence, while the latter is skipped.
+func grokLogIdentity(line []byte) (identity string, found bool, valid bool) {
+	if !bytes.Contains(line, []byte(`"user_id"`)) &&
+		!bytes.Contains(line, []byte(`"userId"`)) {
+		return "", false, false
+	}
+
+	var record grokLogIdentityRecord
+	if json.Unmarshal(line, &record) != nil {
+		return "", true, false
+	}
+
+	for _, candidate := range []*string{
+		record.Ctx.UserID,
+		record.Ctx.UserIDCamel,
+		record.UserID,
+		record.UserIDCamel,
+	} {
+		if candidate == nil {
+			continue
+		}
+		found = true
+		value := strings.TrimSpace(*candidate)
+		if value == "" || len(value) > 128 {
+			return "", true, false
+		}
+		if identity != "" && !strings.EqualFold(identity, value) {
+			return "", true, false
+		}
+		identity = value
+	}
+	if !found {
+		// The key appeared only below a non-allowlisted object such as a prompt
+		// or tool result; it is not account evidence.
+		return "", false, false
+	}
+	return identity, true, true
 }
 
 // grokBillingSnapshotFromRecord validates and allowlists one record. A missing

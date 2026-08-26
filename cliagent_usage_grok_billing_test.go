@@ -542,6 +542,65 @@ func TestReadGrokBillingSnapshot_MatchesAnyIdentityCandidate(t *testing.T) {
 	}
 }
 
+func TestReadGrokBillingSnapshot_AcceptsCamelCaseIdentityEnvelope(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"userId":"abc-123"}}`,
+		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
+	)
+
+	if _, ok := readGrokBillingSnapshot(base, []string{"abc-123"}); !ok {
+		t.Fatal("the observed camelCase identity field must bind the billing record")
+	}
+}
+
+func TestReadGrokBillingSnapshot_RejectsMalformedNewestIdentityEnvelope(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T16:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}`,
+		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
+	)
+
+	if _, ok := readGrokBillingSnapshot(base, []string{"acct-1"}); ok {
+		t.Fatal("a malformed newest identity envelope must not fall back to older identity evidence")
+	}
+}
+
+func TestReadGrokBillingSnapshot_RejectsConflictingIdentityFields(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","user_id":"acct-1","ctx":{"userId":"other-account"}}`,
+		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
+	)
+
+	for _, identity := range []string{"acct-1", "other-account"} {
+		if _, ok := readGrokBillingSnapshot(base, []string{identity}); ok {
+			t.Fatalf("conflicting identity fields must not authenticate %q", identity)
+		}
+	}
+}
+
+func TestReadGrokBillingSnapshot_IgnoresNestedIdentityLookalike(t *testing.T) {
+	base := t.TempDir()
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T16:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"tool result","ctx":{"toolResult":{"user_id":"other-account"}}}`,
+		grokBillingLine("2026-08-10T17:08:10Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-03T22:28:32Z", "2026-08-10T22:28:32Z"),
+	)
+
+	if _, ok := readGrokBillingSnapshot(base, []string{"acct-1"}); !ok {
+		t.Fatal("a non-allowlisted nested lookalike must not replace valid account evidence")
+	}
+	if _, ok := readGrokBillingSnapshot(base, []string{"other-account"}); ok {
+		t.Fatal("a nested tool-result value must not authenticate the billing record")
+	}
+}
+
 // A log that names an account while the local credentials resolve to nothing is
 // the signed-out case: refuse rather than publish somebody else's pool.
 func TestReadGrokBillingSnapshot_RejectsIdentifiedLogWithoutCredentials(t *testing.T) {
