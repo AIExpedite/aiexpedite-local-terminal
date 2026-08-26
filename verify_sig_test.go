@@ -310,3 +310,41 @@ func TestVerifySignatureWithArgs(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifySignatureAuthenticatesConversationID(t *testing.T) {
+	secret := "test-secret-for-unit-test"
+	payload := signaturePayload{
+		ID:             "antigravity-start-1",
+		Command:        "agy",
+		Args:           []string{},
+		Ts:             1234567890,
+		Type:           "antigravity_native_start",
+		SessionID:      "session-1",
+		ConversationID: "conversation-1",
+	}
+	canonical, err := nodeJSONStringify(payload)
+	if err != nil {
+		t.Fatalf("nodeJSONStringify failed: %v", err)
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(canonical)
+	cmd := commandMsg{
+		ID:             payload.ID,
+		Command:        payload.Command,
+		Args:           payload.Args,
+		Ts:             payload.Ts,
+		Type:           payload.Type,
+		SessionID:      payload.SessionID,
+		ConversationID: payload.ConversationID,
+		Signature:      hex.EncodeToString(mac.Sum(nil)),
+	}
+	if !verifySignature(cmd, secret) {
+		t.Fatal("verifySignature should accept the signed conversation id")
+	}
+
+	cmd.ConversationID = "conversation-2"
+	if verifySignature(cmd, secret) {
+		t.Fatal("verifySignature should reject a tampered conversation id")
+	}
+}

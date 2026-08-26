@@ -429,7 +429,8 @@ func isSigFailRateLimited() bool {
    -------------------------------------------------------------------------- */
 
 // signaturePayload matches the exact JSON structure used by Node.js signCommand()
-// Field order must match: id, command, args, ts, type, sessionID, input, signal, refreshId, cliAgentCatalog
+// Field order must match: id, command, args, ts, type, sessionID, input, signal,
+// refreshId, riskLevel, conversationId, cliAgentCatalog
 //
 // refreshId is signed so an adversary that can alter a signed
 // __cli_usage_refresh__ command cannot swap the correlation id without
@@ -460,7 +461,11 @@ type signaturePayload struct {
 	// upgrade window, exactly like refreshId. Only env-setup steps set it, and
 	// both ends include it. Signing it prevents a "destructive"→"" downgrade
 	// that would skip native approval.
-	RiskLevel       string          `json:"riskLevel,omitempty"`
+	RiskLevel string `json:"riskLevel,omitempty"`
+	// conversationId selects durable local chat context for Antigravity starts.
+	// It affects execution just like signed Args, so it must be authenticated.
+	// omitempty preserves the existing signature shape for every other command.
+	ConversationID  string          `json:"conversationId,omitempty"`
 	CliAgentCatalog json.RawMessage `json:"cliAgentCatalog,omitempty"`
 }
 
@@ -485,6 +490,7 @@ func verifySignature(cmd commandMsg, secret string) bool {
 		Signal:          cmd.Signal,
 		RefreshID:       cmd.RefreshID,
 		RiskLevel:       cmd.RiskLevel,
+		ConversationID:  cmd.ConversationID,
 		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
 	}
 
@@ -600,14 +606,8 @@ type commandMsg struct {
 	// Claude needs no equivalent field: its resume travels as an ordinary
 	// `--resume=<id>` entry in Args, which is already signed.
 	//
-	// UNSIGNED, deliberately, matching `Cwd` on the same session-start commands.
-	// The two are the same class of routing metadata and cwd is strictly the
-	// more powerful of the pair (it selects any directory on the device, while
-	// this selects among conversations agy already holds), so signing this one
-	// while cwd stays unsigned would be inconsistent rather than protective.
-	// If the session-start routing metadata is ever brought under the HMAC, both
-	// belong in that change together — see signaturePayload's notes on adding a
-	// field compatibly.
+	// SIGNED (see signaturePayload): changing it can select unrelated persisted
+	// chat context, so a tampered selector must invalidate the command HMAC.
 	ConversationID string `json:"conversationId,omitempty"`
 
 	// Tty opts an execute/session command into the PTY path (macOS/Linux only)
