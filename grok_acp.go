@@ -1910,16 +1910,22 @@ func lineMentionsGrokApprovalPin(lower string) bool {
 	return false
 }
 
-// setEnvVar returns env with the `KEY=value` entry for key replaced (case-
-// sensitive match on the key) or appended when absent. Used by Start to pin
-// GROK_HOME to the isolated dir, overriding any inherited GROK_HOME the env
-// sanitiser left in place.
+// setEnvVar returns env with the `KEY=value` entry for key replaced or appended
+// when absent. Windows environment keys are case-insensitive, so every casing
+// of key must be removed there; retaining a differently-cased inherited entry
+// would leave CreateProcess to choose between conflicting GROK_HOME or junction
+// values. Unix keeps its native case-sensitive semantics.
 func setEnvVar(env []string, key, value string) []string {
 	prefix := key + "="
 	out := make([]string, 0, len(env)+1)
 	replaced := false
 	for _, e := range env {
-		if strings.HasPrefix(e, prefix) {
+		separator := strings.IndexByte(e, '=')
+		matches := separator >= 0 && e[:separator] == key
+		if runtime.GOOS == "windows" && separator >= 0 {
+			matches = strings.EqualFold(e[:separator], key)
+		}
+		if matches {
 			if !replaced {
 				out = append(out, prefix+value)
 				replaced = true

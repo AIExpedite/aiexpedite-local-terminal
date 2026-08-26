@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -347,6 +348,26 @@ func TestSetEnvVar_ReplacesOrAppends(t *testing.T) {
 	appended := setEnvVar([]string{"PATH=/usr/bin"}, "GROK_HOME", "/iso/home")
 	if !grokArgsContain(appended, "GROK_HOME=/iso/home") {
 		t.Fatalf("expected GROK_HOME appended when absent; got %#v", appended)
+	}
+
+	mixedCase := setEnvVar([]string{
+		"PATH=/usr/bin",
+		"Grok_Home=/ambiguous/home",
+		"GROK_HOME=/old/.grok",
+	}, "GROK_HOME", "/iso/home")
+	if runtime.GOOS == "windows" {
+		count := 0
+		for _, entry := range mixedCase {
+			separator := strings.IndexByte(entry, '=')
+			if separator >= 0 && strings.EqualFold(entry[:separator], "GROK_HOME") {
+				count++
+			}
+		}
+		if count != 1 || !grokArgsContain(mixedCase, "GROK_HOME=/iso/home") {
+			t.Fatalf("Windows must retain one unambiguous GROK_HOME entry; got %#v", mixedCase)
+		}
+	} else if !grokArgsContain(mixedCase, "Grok_Home=/ambiguous/home") {
+		t.Fatalf("Unix environment replacement must remain case-sensitive; got %#v", mixedCase)
 	}
 }
 
