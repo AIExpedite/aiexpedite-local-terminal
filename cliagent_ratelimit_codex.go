@@ -1557,13 +1557,25 @@ func codexRolloutScanCursorForAccount(currentFingerprint string, now time.Time) 
 		return codexRolloutScanCursor{}
 	}
 	if snap.RolloutHighWaterMtimeNs > 0 {
+		// A completed cursor is filesystem progress, so it cannot legitimately
+		// remain ahead of the current clock. This can happen after a clock
+		// rollback or when upgrading a cache written before future mtimes were
+		// clamped. Resetting (rather than capping to now) keeps rollouts written
+		// between the rollback and this gather eligible for discovery.
+		if snap.RolloutHighWaterMtimeNs > now.UnixNano() {
+			return codexRolloutScanCursor{}
+		}
 		return codexRolloutScanCursor{
 			mtimeNs:             snap.RolloutHighWaterMtimeNs,
 			boundaryFingerprint: snap.RolloutHighWaterBoundaryFingerprint,
 		}
 	}
 	if snap.RolloutHighWaterMtimeMs > 0 {
-		return codexRolloutScanCursor{mtimeNs: time.UnixMilli(snap.RolloutHighWaterMtimeMs).UnixNano()}
+		mtimeNs := time.UnixMilli(snap.RolloutHighWaterMtimeMs).UnixNano()
+		if mtimeNs > now.UnixNano() {
+			return codexRolloutScanCursor{}
+		}
+		return codexRolloutScanCursor{mtimeNs: mtimeNs}
 	}
 	parts := codexPartitionByIdentity(codexContributorsForAccount(currentFingerprint))
 	oldest := int64(0)

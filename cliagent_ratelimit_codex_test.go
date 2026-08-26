@@ -2903,3 +2903,58 @@ func TestCodexRolloutFallbackBuckets_ClampsFutureMtimeHighWater(t *testing.T) {
 		t.Fatalf("highWater mtime=%s, want clamped to %s", time.Unix(0, highWater.mtimeNs), now)
 	}
 }
+
+func TestCodexRolloutScanCursorForAccount_ResetsPersistedFutureCursor(t *testing.T) {
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	fingerprint := "account-a"
+
+	for _, tc := range []struct {
+		name string
+		snap codexRateLimitSnapshot
+	}{
+		{
+			name: "nanosecond cursor",
+			snap: codexRateLimitSnapshot{
+				AccountFingerprint:                  fingerprint,
+				RolloutHighWaterMtimeNs:             now.Add(24 * time.Hour).UnixNano(),
+				RolloutHighWaterBoundaryFingerprint: "future-boundary",
+			},
+		},
+		{
+			name: "legacy millisecond cursor",
+			snap: codexRateLimitSnapshot{
+				AccountFingerprint:      fingerprint,
+				RolloutHighWaterMtimeMs: now.Add(24 * time.Hour).UnixMilli(),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+			t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+			helperWriteJSON(t, cache, tc.snap)
+
+			base := t.TempDir()
+			dir := filepath.Join(base, "sessions", "2026", "08", "26")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "rollout-after-clock-rollback.jsonl")
+			if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			mtime := now.Add(-time.Minute)
+			if err := os.Chtimes(path, mtime, mtime); err != nil {
+				t.Fatal(err)
+			}
+
+			cursor := codexRolloutScanCursorForAccount(fingerprint, now)
+			if cursor.mtimeNs != 0 || cursor.boundaryFingerprint != "" {
+				t.Fatalf("cursor=%+v, want reset after clock rollback", cursor)
+			}
+			candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+			if !complete || len(candidates) != 1 || candidates[0].path != path {
+				t.Fatalf("complete=%v candidates=%+v, want post-rollback rollout selected", complete, candidates)
+			}
+		})
+	}
+}
