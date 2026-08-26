@@ -35,6 +35,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 /* --------------------------------------------------------------------------
@@ -3101,6 +3102,37 @@ func TestReadOutputStream_ClaudeFailurePrecedesTurnComplete(t *testing.T) {
 	}
 	if errorSeq >= completeSeq {
 		t.Fatalf("failure stream Seq=%d must precede turn_complete Seq=%d", errorSeq, completeSeq)
+	}
+}
+
+func TestReadOutputStream_CodexCapturesFinalNumericTokenWithoutNewline(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", t.TempDir())
+	frame := `{"type":"token_count","rate_limits":{"primary":{"used_percent":36,"window_minutes":300,"resets_in_seconds":3600}}}`
+	session := &CLISession{
+		ID:             "codex-final-token",
+		Command:        "/opt/codex.cmd",
+		Stdout:         io.NopCloser(strings.NewReader(frame)),
+		Stderr:         io.NopCloser(strings.NewReader("")),
+		streamDone:     make(chan struct{}),
+		firstRealFrame: make(chan struct{}),
+	}
+	before := time.Now()
+	NewSessionManager(nil).readOutputStream(session, func(resultMsg) {})
+	after := time.Now()
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected final scanner token to populate Codex cache")
+	}
+	b := snap.Buckets[codexWindowPrimary]
+	if b.UsedPercentage != 36 {
+		t.Fatalf("bucket=%+v, want managed 36%% capture", b)
+	}
+	observed := time.UnixMilli(b.ObservedAtMs)
+	if observed.Before(before.Add(-time.Millisecond)) || observed.After(after.Add(time.Millisecond)) {
+		t.Fatalf("ObservedAt=%s, want receive time between %s and %s", observed, before, after)
 	}
 }
 

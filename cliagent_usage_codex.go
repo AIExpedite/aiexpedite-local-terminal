@@ -125,6 +125,10 @@ func codexAccountScope(auth codexAuth, claims codexIDTokenClaims) string {
 }
 
 func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
+	return p.ParseContext(context.Background(), home, detected, now)
+}
+
+func (p codexUsageParser) ParseContext(ctx context.Context, home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
 	base := firstNonEmpty(os.Getenv("CODEX_HOME"), expandHome(home, ".codex"))
 	if base == "" {
 		return nil, false
@@ -174,13 +178,28 @@ func (p codexUsageParser) Parse(home string, detected detectedCLIAgent, now time
 		}
 	}
 
-	// Live app-server telemetry first; for any window never captured live,
-	// fall back to Codex's own on-disk rollout logs so the card is observable
-	// even when Codex is only ever driven through its TUI.
+	// Reconcile terminal-managed cache evidence with direct-run rollout logs.
+	// The optional scan gets at most five seconds and always leaves two seconds
+	// on the parent gather for later providers. Child expiry is best-effort: any
+	// complete numeric objects already consumed are persisted and the valid cache
+	// remains publishable.
 	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
 	var usageLimit codexUsageLimitEvidence
 	var latestRolloutObservation time.Time
-	usage.Metrics, usageLimit, latestRolloutObservation = codexBackfillUnknownFromRollout(usage.Metrics, base, usage.AccountFingerprint, now)
+	scanBudget := 5 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 2*time.Second {
+			scanBudget = 0
+		} else if available := remaining - 2*time.Second; available < scanBudget {
+			scanBudget = available
+		}
+	}
+	if scanBudget > 0 && ctx.Err() == nil {
+		scanCtx, cancel := context.WithTimeout(ctx, scanBudget)
+		usage.Metrics, usageLimit, latestRolloutObservation = codexReconcileFromRollout(scanCtx, base, usage.AccountFingerprint, now)
+		cancel()
+	}
 	// An account that is OUT of quota reports no window at all — Codex nulls both
 	// `primary` and `secondary` on a refused turn — so the card fell back to
 	// "Usage unobservable", which reads as "we can't see it" when the truth is

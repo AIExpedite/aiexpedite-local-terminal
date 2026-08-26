@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -2245,5 +2249,104 @@ func TestCaptureCodexRateLimit_ResultMsgIsSparseNotFullSnapshot(t *testing.T) {
 	}
 	if metrics[0].Unknown || metrics[0].Kind != limitKindSession {
 		t.Errorf("session row=%+v, want known session from result.msg", metrics[0])
+	}
+}
+
+func TestCaptureCodexRateLimit_EqualPercentageAdvancesManagedObservation(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	first := time.Date(2026, 8, 26, 13, 47, 8, 0, time.UTC)
+	second := first.Add(90 * time.Second)
+	line := `{"type":"token_count","rate_limits":{"primary":{"used_percent":42,"window_minutes":300,"resets_in_seconds":3600}}}`
+
+	captureCodexRateLimitLine(line, first)
+	captureCodexRateLimitLine(line, second)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected managed capture cache")
+	}
+	if got := snap.Buckets[codexWindowPrimary].ObservedAtMs; got != second.UnixMilli() {
+		t.Fatalf("ObservedAtMs=%d, want repeated numeric evidence at %d", got, second.UnixMilli())
+	}
+}
+
+func TestCodexAcceptedObservationTime_FutureToleranceAndClamp(t *testing.T) {
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		at   time.Time
+		zero bool
+	}{
+		{"boundary accepted and clamped", now.Add(5 * time.Minute), false},
+		{"beyond boundary rejected", now.Add(5*time.Minute + time.Nanosecond), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := codexAcceptedObservationTime(map[string]interface{}{
+				"timestamp": tc.at.Format(time.RFC3339Nano),
+			}, now, false)
+			if tc.zero {
+				if !got.IsZero() {
+					t.Fatalf("got %s, want rejection", got)
+				}
+				return
+			}
+			if !got.Equal(now) {
+				t.Fatalf("got %s, want publication clamp %s", got, now)
+			}
+		})
+	}
+}
+
+func TestCodexBucketsFromRolloutFile_UntimestampedNumericLineDoesNotBlockLaterValidLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	missing := `{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":91,"window_minutes":300}}}}`
+	valid := `{"timestamp":"2026-08-26T14:01:02.123456789Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":17,"window_minutes":300}}}}`
+	if err := os.WriteFile(path, []byte(missing+"\n"+valid+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	buckets, _, _, handled, ok := codexBucketsFromRolloutFile(context.Background(), path, time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC))
+	if !handled || !ok {
+		t.Fatalf("handled=%v ok=%v, want valid later object", handled, ok)
+	}
+	b := buckets[codexWindowPrimary][codexLegacyLimitID]
+	if b.UsedPercentage != 17 || b.ObservedAtMs != time.Date(2026, 8, 26, 14, 1, 2, 123456789, time.UTC).UnixMilli() {
+		t.Fatalf("bucket=%+v, want only timestamped 17%% evidence", b)
+	}
+}
+
+func TestCodexRateLimitSnapshot_RedactsRawEnvelopeFields(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	lineMap := map[string]interface{}{
+		"type": "token_count",
+		"rate_limits": map[string]interface{}{
+			"primary": map[string]interface{}{"used_percent": 28.0, "window_minutes": 300.0},
+		},
+		"access_token": "credential-sentinel",
+		"raw_config":   "config-sentinel",
+		"source_path":  "/secret/rollout.jsonl",
+		"prompt":       "prompt-sentinel",
+		"response":     "response-sentinel",
+		"unknown":      "unknown-sentinel",
+	}
+	raw, err := json.Marshal(lineMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	captureCodexRateLimitLine(string(raw), time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC))
+	persisted, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sentinel := range []string{"credential-sentinel", "config-sentinel", "/secret/rollout.jsonl", "prompt-sentinel", "response-sentinel", "unknown-sentinel"} {
+		if strings.Contains(string(persisted), sentinel) {
+			t.Errorf("typed cache leaked %q: %s", sentinel, persisted)
+		}
+	}
+	if !strings.Contains(string(persisted), `"usedPercentage": 28`) {
+		t.Fatalf("normalized metric missing from cache: %s", persisted)
 	}
 }

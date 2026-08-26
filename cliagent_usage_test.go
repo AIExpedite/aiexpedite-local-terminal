@@ -1522,11 +1522,9 @@ func TestCodexUsageParser_RolledOverObservationNewerThanRefusalSuppressesNotice(
 	}
 }
 
-// A rollout reading can be newer than the refusal without being used for
-// backfill: the live cache remains authoritative for an observable row. Its
-// timestamp still proves that an older refusal is stale while another row
-// remains Unknown.
-func TestCodexUsageParser_SkippedRolloutObservationNewerThanRefusalSuppressesNotice(t *testing.T) {
+// A newer direct-run rollout reading reconciles over an older still-live cache
+// contributor and also proves that an older refusal is stale.
+func TestCodexUsageParser_NewerRolloutAdvancesStillLiveCache(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
 	codexHome := t.TempDir()
@@ -1552,14 +1550,14 @@ func TestCodexUsageParser_SkippedRolloutObservationNewerThanRefusalSuppressesNot
 		}})
 
 	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
-	if session := usage.Metrics[0]; session.Unknown || session.Consumed == nil || *session.Consumed != 42 {
-		t.Fatalf("session row=%+v, want authoritative cached 42%%", session)
+	if session := usage.Metrics[0]; session.Unknown || session.Consumed == nil || *session.Consumed != 73 || session.ObservedAt != "2026-06-19T11:30:00Z" {
+		t.Fatalf("session row=%+v, want reconciled rollout 73%% at 11:30", session)
 	}
 	if weekly := usage.Metrics[1]; !weekly.Unknown {
 		t.Fatalf("weekly row=%+v, want Unknown", weekly)
 	}
 	if usage.Notice != "" {
-		t.Errorf("notice=%q, want none — the newer skipped rollout observation supersedes the refusal", usage.Notice)
+		t.Errorf("notice=%q, want none — the newer rollout observation supersedes the refusal", usage.Notice)
 	}
 }
 
@@ -1630,9 +1628,9 @@ func TestCodexUsageParser_BackfillsFromRolloutLogs(t *testing.T) {
 	}
 }
 
-// A live captured bucket is authoritative: the rollout fallback must only fill
-// windows that came back Unknown, never override an observed live reading.
-func TestCodexUsageParser_RolloutOnlyFillsUnknownWindows(t *testing.T) {
+// A newer terminal-managed contributor stays authoritative while rollout
+// reconciliation fills a weekly contributor the managed frame never supplied.
+func TestCodexUsageParser_NewerManagedCaptureWinsWhileRolloutFillsSparseWindow(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
 	codexHome := t.TempDir()
@@ -2218,12 +2216,10 @@ func TestCodexUsageParser_RolloutUsageOnlyAfterExpiredResetDoesNotInheritStaleRe
 	}
 }
 
-// When sessions overlap — an older-started but still-active session next to a
-// newer-started but idle one — filename order alone would let the stale session
-// "win" and stop the scan before the live reading is consulted. Ranking by file
-// mtime lets the still-active session (the live source of truth) be considered
-// first.
-func TestCodexUsageParser_RolloutRanksByMtimeNotFilename(t *testing.T) {
+// File mtime controls bounded candidate selection, but provider event time
+// controls contributor reconciliation. A later event cannot be displaced by a
+// file that happened to be appended more recently.
+func TestCodexUsageParser_RolloutReconcilesByEventTimeNotMtime(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
@@ -2253,11 +2249,83 @@ func TestCodexUsageParser_RolloutRanksByMtimeNotFilename(t *testing.T) {
 		t.Fatalf("expected usage")
 	}
 	session, weekly := usage.Metrics[0], usage.Metrics[1]
-	if session.Consumed == nil || *session.Consumed != 30 {
-		t.Errorf("session Consumed=%v, want 30 from the still-active session (newer mtime), not 80 from the stale newer-filename session", session.Consumed)
+	if session.Consumed == nil || *session.Consumed != 80 {
+		t.Errorf("session Consumed=%v, want 80 from the newer provider event", session.Consumed)
 	}
-	if weekly.Consumed == nil || *weekly.Consumed != 12 {
-		t.Errorf("weekly Consumed=%v, want 12 from the still-active session (newer mtime), not 70 from the stale newer-filename session", weekly.Consumed)
+	if weekly.Consumed == nil || *weekly.Consumed != 70 {
+		t.Errorf("weekly Consumed=%v, want 70 from the newer provider event", weekly.Consumed)
+	}
+}
+
+func TestCodexUsageParser_DirectRunAdvancesAndPersistsAcrossRestart(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary:   {UsedPercentage: 13, ResetsAtMs: now.Add(time.Hour).UnixMilli(), WindowMinutes: 300, usageKnown: true, resetKnown: true},
+		codexWindowSecondary: {UsedPercentage: 9, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), WindowMinutes: 10080, usageKnown: true, resetKnown: true},
+	}, nil, now.Add(-2*time.Hour), fp)
+
+	helperWriteRolloutLogAt(t, codexHome, "26", "2026-08-26T13-55-00-smoke", "2026-08-26T13:55:00.123456789Z",
+		[]map[string]any{codexRateLimitFrame(27, 18, now)})
+	rolloutPath := filepath.Join(codexHome, "sessions", "2026", "06", "26", "rollout-2026-08-26T13-55-00-smoke.jsonl")
+	mtime := now.Add(-time.Minute)
+	if err := os.Chtimes(rolloutPath, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+
+	usage, ok := codexUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 27 || usage.Metrics[1].Consumed == nil || *usage.Metrics[1].Consumed != 18 {
+		t.Fatalf("reconciled metrics=%+v, want direct-run 27%%/18%%", usage.Metrics)
+	}
+	if usage.Metrics[0].ObservedAt != "2026-08-26T13:55:00.123Z" || usage.Metrics[1].ObservedAt != "2026-08-26T13:55:00.123Z" {
+		t.Fatalf("fresh observations not advanced: %+v", usage.Metrics)
+	}
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok || snap.RolloutHighWaterMtimeMs != mtime.UnixMilli() {
+		t.Fatalf("high-water=%d ok=%v, want %d", snap.RolloutHighWaterMtimeMs, ok, mtime.UnixMilli())
+	}
+
+	// Simulate an executable replacement/restart. The rollout file remains at
+	// the completed high-water but its raw contents are no longer parseable; a
+	// cache-only second parse must still publish the persisted normalized metric.
+	if err := os.WriteFile(rolloutPath, []byte(`{"credential":"must-not-be-read"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(rolloutPath, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	restarted, ok := codexUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Detected: true}, now.Add(time.Minute))
+	if !ok || restarted.Metrics[0].Consumed == nil || *restarted.Metrics[0].Consumed != 27 || restarted.Metrics[1].Consumed == nil || *restarted.Metrics[1].Consumed != 18 {
+		t.Fatalf("restart metrics=%+v, want persisted normalized values", restarted.Metrics)
+	}
+}
+
+func TestCodexUsageParser_ShortParentBudgetReturnsCacheWithoutError(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {UsedPercentage: 31, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
+	}, nil, now, fp)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	usage, errEntry := runProviderParseSafely(ctx, codexUsageParser{}, t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if errEntry != nil || usage == nil || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 31 {
+		t.Fatalf("usage=%+v err=%+v, want usable cache and no child-budget error", usage, errEntry)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("Codex exhausted parent context instead of reserving sibling budget: %v", ctx.Err())
 	}
 }
 
