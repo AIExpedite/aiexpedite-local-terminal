@@ -1,6 +1,9 @@
 // cliagent_ratelimit_grok.go — passively captures Grok Build's discrete
 // usage-limit signal off the streaming-json stdout we already scan in
-// session.go, and caches the latest state to disk.
+// session.go, and caches the latest state to disk. This path is notice-only:
+// neither direct stdout nor ACP tool-result content is accepted as numeric or
+// confirmed-unmetered telemetry; those states come only from Grok's bounded,
+// account-bound billing log reader.
 //
 // Why this exists (and why it is NOT a percentage cache like Codex's):
 //

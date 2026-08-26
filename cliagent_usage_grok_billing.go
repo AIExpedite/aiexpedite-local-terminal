@@ -14,7 +14,9 @@
 // We only READ what the CLI already wrote — no request is made to xAI. `ts` is
 // the provider observation time (the instant Grok fetched the figure), which is
 // why it maps onto ObservedAt rather than CollectedAt: a later gather that finds
-// no new line must not make an old percentage look current.
+// no new line must not make an old percentage look current. For Grok 1.0's
+// provider-confirmed unmetered records the same timestamp proves that billing
+// was freshly checked even though no numeric percentage was exposed.
 package main
 
 import (
@@ -35,6 +37,11 @@ import (
 // older than the tail window is indistinguishable from "never logged" — that is
 // the correct downgrade, since such a reading would be far too old to plot.
 const grokBillingLogTailBytes = 1 << 20 // 1 MiB
+
+// grokBillingMaxClockSkew is the largest future offset trusted as a provider
+// observation. A record beyond this bound is authoritative enough to block an
+// older record, but none of its timestamped values are safe to publish.
+const grokBillingMaxClockSkew = 5 * time.Minute
 
 // grokBillingLogMessage is the log `msg` that carries the credits config. Grok
 // writes it when the CLI fetches billing (session start / periodic refresh).
@@ -101,10 +108,25 @@ func grokBillingLogPath(base string) string {
 	return filepath.Join(base, "logs", "unified.jsonl")
 }
 
+// linkGrokBillingLogs exposes the real provider-owned log directory inside a
+// terminal-managed session's otherwise ephemeral GROK_HOME. Grok therefore
+// appends the same billing evidence for direct and ACP runs, while auth/config
+// isolation stays intact and no response or tool-result content is harvested.
+func linkGrokBillingLogs(isolatedHome, realHome string) error {
+	if isolatedHome == "" || realHome == "" {
+		return nil
+	}
+	logs := filepath.Join(realHome, "logs")
+	if err := os.MkdirAll(logs, 0o700); err != nil {
+		return err
+	}
+	return linkGrokDirectory(filepath.Join(isolatedHome, "logs"), logs, "billing logs")
+}
+
 // readGrokBillingSnapshot returns the NEWEST billing record in the log tail,
 // provided it can be tied to the CURRENT credentials.
 //
-// Lines are scanned back-to-front and the first well-formed billing record wins:
+// Lines are scanned back-to-front and the first decoded billing record wins:
 // the log is append-only, so the last such line is the most recent fetch. A
 // truncated first line (the tail almost always starts mid-record) simply fails
 // to unmarshal and is skipped like any other non-billing line.
@@ -155,7 +177,11 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 		}
 		snap, ok := grokBillingSnapshotFromRecord(rec)
 		if !ok {
-			continue
+			// The newest exact-message record supersedes every older response,
+			// even when one of its required fields is unusable. Continuing here
+			// would resurrect a stale pre-upgrade percentage after a malformed or
+			// timestamp-less current response.
+			return grokBillingSnapshot{}, false
 		}
 		// Stop at the newest usable record either way: an older one is even less
 		// likely to belong to the account signed in now.
@@ -204,9 +230,10 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 	return false
 }
 
-// grokBillingSnapshotFromRecord validates one record. A record with no usage
-// percentage or no observation time is rejected outright: the card's freshness
-// rules need both, and a percentage we cannot age is worse than none at all.
+// grokBillingSnapshotFromRecord validates and allowlists one record. A missing
+// percentage is valid because Grok 1.0 uses that shape for an unmetered period;
+// an observation time is still mandatory so the result can be distinguished
+// from the parser's inferred placeholder.
 func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, bool) {
 	observed, err := time.Parse(time.RFC3339, rec.TS)
 	if err != nil {
@@ -223,7 +250,7 @@ func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, 
 	// used. Treat that as "usable record, unobserved usage" rather than "not a
 	// record": rejecting it made the scanner walk further back and publish a
 	// PRE-UPGRADE reading, under a period that had since ended.
-	if pct := rec.Ctx.Config.CreditUsagePercent; pct != nil && !math.IsNaN(*pct) {
+	if pct := rec.Ctx.Config.CreditUsagePercent; pct != nil && isFinite(*pct) {
 		snap.UsedPercent = clampPercent(*pct)
 		snap.HasUsedPercent = true
 	}
@@ -233,19 +260,23 @@ func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, 
 	}
 	// On-demand is a separate, opt-in pool: only plot it when a cap exists, or
 	// the row would read as a hard 0-of-0 limit on every subscription account.
-	if cap := rec.Ctx.Config.OnDemandCap.Val; cap != nil && *cap > 0 && !math.IsNaN(*cap) {
+	if cap := rec.Ctx.Config.OnDemandCap.Val; cap != nil && *cap > 0 && isFinite(*cap) {
 		snap.HasOnDemand = true
 		snap.OnDemandCap = *cap
 		// A cap with no reported usage is a pool we know exists but have not
 		// observed. Leaving the zero default here would report it as completely
 		// unused — an assertion the record never made.
 		if used := rec.Ctx.Config.OnDemandUsed.Val; used != nil &&
-			!math.IsNaN(*used) && *used >= 0 {
+			isFinite(*used) && *used >= 0 && *used <= *cap {
 			snap.HasOnDemandUsed = true
 			snap.OnDemandUsed = *used
 		}
 	}
 	return snap, true
+}
+
+func isFinite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 // grokBillingPeriodKind maps Grok's period enum onto our limit kinds. An
@@ -271,6 +302,12 @@ func grokBillingPeriodKind(periodType string) (kind string, label string, ok boo
 // and assuming an empty pool would hide usage that may have happened on another
 // computer under the same account.
 func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsageMetric {
+	// A future record remains authoritative and blocks older records, but no
+	// value sharing its untrusted observation time may escape this gather.
+	if snap.ObservedAt.After(now.Add(grokBillingMaxClockSkew)) {
+		return []cliAgentUsageMetric{grokUnknownCreditsMetric()}
+	}
+
 	kind, label, ok := grokBillingPeriodKind(snap.PeriodType)
 	if !ok {
 		return nil
@@ -295,14 +332,17 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 			credits.ObservedAt = ""
 		}
 	case !snap.HasUsedPercent:
-		// A current period the CLI no longer meters (Grok 1.0+). Report the
-		// window — its reset is real and useful — but never a percentage, and no
-		// ObservedAt: usage was not observed, and saying otherwise is how a card
-		// ends up claiming a six-day-old reading for a live window.
+		// A current period the CLI no longer meters (Grok 1.0+). The record
+		// timestamp is proof that the provider freshly confirmed this unmetered
+		// period; retaining it is what distinguishes this from an inferred
+		// placeholder produced when no usable billing response exists.
 		credits.Unknown = true
-		credits.ObservedAt = ""
 		if snap.HasPeriodEnd {
 			credits.ResetAt = snap.PeriodEnd.UTC().Format(time.RFC3339)
+		} else {
+			// Without a parseable period end we cannot prove the unmetered period
+			// is current, so keep only the inferred unknown shape.
+			credits.ObservedAt = ""
 		}
 	default:
 		credits.Total = floatPtr(100)
@@ -323,12 +363,8 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 			ObservedAt: observedAt,
 		}
 		if snap.HasOnDemandUsed {
-			used := snap.OnDemandUsed
-			if used > snap.OnDemandCap {
-				used = snap.OnDemandCap
-			}
-			onDemand.Consumed = floatPtr(used)
-			onDemand.Remaining = floatPtr(snap.OnDemandCap - used)
+			onDemand.Consumed = floatPtr(snap.OnDemandUsed)
+			onDemand.Remaining = floatPtr(snap.OnDemandCap - snap.OnDemandUsed)
 		} else {
 			// The cap is configured but the record reported no usage against it.
 			// Show the pool as existing-but-unobserved rather than as untouched:
@@ -338,4 +374,13 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 		metrics = append(metrics, onDemand)
 	}
 	return metrics
+}
+
+func grokUnknownCreditsMetric() cliAgentUsageMetric {
+	return cliAgentUsageMetric{
+		Kind:    limitKindWeekly,
+		Label:   "Weekly credits",
+		Unit:    "%",
+		Unknown: true,
+	}
 }

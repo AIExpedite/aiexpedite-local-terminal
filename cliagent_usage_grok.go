@@ -145,14 +145,7 @@ func (p grokUsageParser) Parse(home string, detected detectedCLIAgent, now time.
 		// since the log rotated). Keep a placeholder row so the agent still
 		// appears on the card as "limit exists, value unobservable" rather than
 		// vanishing.
-		usage.Metrics = []cliAgentUsageMetric{
-			{
-				Kind:    limitKindWeekly,
-				Label:   "Weekly credits",
-				Unit:    "%",
-				Unknown: true,
-			},
-		}
+		usage.Metrics = []cliAgentUsageMetric{grokUnknownCreditsMetric()}
 	}
 
 	// Notice priority is by whether the condition blocks requests RIGHT NOW, not

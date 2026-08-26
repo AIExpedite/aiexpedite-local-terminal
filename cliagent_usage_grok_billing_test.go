@@ -1,13 +1,26 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func assertGrokMetricsJSON(t *testing.T, metrics []cliAgentUsageMetric, want string) {
+	t.Helper()
+	got, err := json.Marshal(metrics)
+	if err != nil {
+		t.Fatalf("marshal metrics: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("metrics JSON = %s\nwant         = %s", got, want)
+	}
+}
 
 func helperWriteGrokLog(t *testing.T, base string, lines ...string) {
 	t.Helper()
@@ -88,6 +101,21 @@ func TestReadGrokBillingSnapshot_RejectsRecordWithoutObservationTime(t *testing.
 
 	if _, ok := readGrokBillingSnapshot(base, nil); ok {
 		t.Errorf("a percentage with no ts must be rejected — it cannot be aged")
+	}
+}
+
+func TestReadGrokBillingSnapshot_NewestInvalidTimestampBlocksOlderPercentage(t *testing.T) {
+	base := t.TempDir()
+	newest := fmt.Sprintf(`{"ts":"not-a-time","msg":%q,"ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-17T22:28:32Z"}}}}`, grokBillingLogMessage)
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
+		grokBillingLine("2026-08-10T17:08:10Z", 33, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-10T22:28:32Z", "2026-08-17T22:28:32Z"),
+		newest,
+	)
+
+	if _, ok := readGrokBillingSnapshot(base, []string{"acct-1"}); ok {
+		t.Fatal("newest exact-message record must block an older percentage even when its ts is invalid")
 	}
 }
 
@@ -186,6 +214,135 @@ func TestGrokBillingMetrics_UnknownPeriodTypeIsNotGuessed(t *testing.T) {
 	}
 	if metrics := grokBillingMetrics(snap, time.Now()); metrics != nil {
 		t.Errorf("an unrecognized period must not be plotted under a guessed window: %+v", metrics)
+	}
+}
+
+func TestGrokBillingMetrics_FutureRecordFailsClosedBeforeEveryPool(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	metrics := grokBillingMetrics(grokBillingSnapshot{
+		UsedPercent:      33,
+		HasUsedPercent:   true,
+		ObservedAt:       now.Add(grokBillingMaxClockSkew + time.Second),
+		PeriodType:       "USAGE_PERIOD_TYPE_UNKNOWN",
+		PeriodEnd:        now.Add(7 * 24 * time.Hour),
+		HasPeriodEnd:     true,
+		HasOnDemand:      true,
+		HasOnDemandUsed:  true,
+		OnDemandCap:      50,
+		OnDemandUsed:     12,
+		SubscriptionTier: "secret-lookalike",
+	}, now)
+
+	assertGrokMetricsJSON(t, metrics,
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","unknown":true}]`)
+}
+
+func TestGrokUsageParser_FutureNewestRecordBlocksOlderPercentage(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("GROK_HOME", base)
+	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{"user_id": "acct-1"})
+	newest := `{"ts":"2026-08-19T12:05:01Z","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":80,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-08-24T22:28:32Z"},"onDemandCap":{"val":50},"onDemandUsed":{"val":12}}}}`
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
+		grokBillingLine("2026-08-13T15:49:37Z", 33, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-10T22:28:32Z", "2026-08-17T22:28:32Z"),
+		newest,
+	)
+
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("Parse failed")
+	}
+	assertGrokMetricsJSON(t, usage.Metrics,
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","unknown":true}]`)
+}
+
+func TestGrokBillingMetrics_CurrentUnmeteredPreservesFreshOnDemand(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	metrics := grokBillingMetrics(grokBillingSnapshot{
+		ObservedAt:      time.Date(2026, 8, 17, 23, 2, 12, 0, time.UTC),
+		PeriodType:      "USAGE_PERIOD_TYPE_WEEKLY",
+		PeriodEnd:       time.Date(2026, 8, 24, 22, 28, 32, 0, time.UTC),
+		HasPeriodEnd:    true,
+		HasOnDemand:     true,
+		HasOnDemandUsed: true,
+		OnDemandCap:     50,
+		OnDemandUsed:    12,
+	}, now)
+
+	assertGrokMetricsJSON(t, metrics,
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","resetAt":"2026-08-24T22:28:32Z","observedAt":"2026-08-17T23:02:12Z","unknown":true},{"kind":"tokens","label":"On-demand credits","unit":"credits","total":50,"remaining":38,"consumed":12,"observedAt":"2026-08-17T23:02:12Z"}]`)
+}
+
+func TestGrokBillingSnapshot_InvalidNumbersAreOmittedIndependently(t *testing.T) {
+	for _, invalid := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z", Msg: grokBillingLogMessage}
+		rec.Ctx.Config.CreditUsagePercent = &invalid
+		rec.Ctx.Config.CurrentPeriod.Type = "USAGE_PERIOD_TYPE_WEEKLY"
+		rec.Ctx.Config.CurrentPeriod.End = "2026-08-24T22:28:32Z"
+		cap, used := 50.0, 12.0
+		rec.Ctx.Config.OnDemandCap.Val = &cap
+		rec.Ctx.Config.OnDemandUsed.Val = &used
+
+		snap, ok := grokBillingSnapshotFromRecord(rec)
+		if !ok || snap.HasUsedPercent || !snap.HasOnDemandUsed {
+			t.Fatalf("invalid percentage %v must become unmetered without suppressing on-demand: %+v", invalid, snap)
+		}
+	}
+
+	for _, invalidUsed := range []float64{-1, 51, math.NaN(), math.Inf(1)} {
+		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z", Msg: grokBillingLogMessage}
+		cap := 50.0
+		rec.Ctx.Config.OnDemandCap.Val = &cap
+		rec.Ctx.Config.OnDemandUsed.Val = &invalidUsed
+		snap, ok := grokBillingSnapshotFromRecord(rec)
+		if !ok || !snap.HasOnDemand || snap.HasOnDemandUsed {
+			t.Fatalf("invalid on-demand usage %v must leave a capped unknown pool: %+v", invalidUsed, snap)
+		}
+	}
+}
+
+func TestGrokBillingSnapshot_PercentageBoundariesClampSafely(t *testing.T) {
+	for _, tc := range []struct {
+		in, want float64
+	}{{-1, 0}, {0, 0}, {100, 100}, {101, 100}} {
+		rec := grokBillingRecord{TS: "2026-08-17T23:02:12Z", Msg: grokBillingLogMessage}
+		rec.Ctx.Config.CreditUsagePercent = &tc.in
+		snap, ok := grokBillingSnapshotFromRecord(rec)
+		if !ok || !snap.HasUsedPercent || snap.UsedPercent != tc.want {
+			t.Fatalf("percentage %v normalized to %+v, want %v", tc.in, snap, tc.want)
+		}
+	}
+}
+
+func TestGrokUsageParser_UnknownNewestRecordBlocksOlderAndRedactsLookalikes(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("GROK_HOME", base)
+	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{"user_id": "acct-1"})
+	newest := `{"ts":"2026-08-17T23:02:12Z","msg":"billing: fetched credits config","access_token":"credential-sentinel","prompt":"prompt-sentinel","ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_NEW","end":"2026-08-24T22:28:32Z"},"nested":{"creditUsagePercent":91,"used":47},"rawConfig":"raw-config-sentinel"},"toolResult":{"credits":999}}}`
+	helperWriteGrokLog(t, base,
+		`{"ts":"2026-08-10T17:00:00Z","msg":"session start","ctx":{"user_id":"acct-1"}}`,
+		grokBillingLine("2026-08-13T15:49:37Z", 33, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-10T22:28:32Z", "2026-08-17T22:28:32Z"),
+		newest,
+	)
+
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("Parse failed")
+	}
+	assertGrokMetricsJSON(t, usage.Metrics,
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","unknown":true}]`)
+	out, err := json.Marshal(usage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"credential-sentinel", "prompt-sentinel", "raw-config-sentinel", "toolResult", "999", "91", "47"} {
+		if strings.Contains(string(out), secret) {
+			t.Fatalf("published usage leaked non-allowlisted log content %q: %s", secret, out)
+		}
 	}
 }
 

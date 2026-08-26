@@ -79,15 +79,19 @@ func linkGrokSessionStore(home string) error {
 	if err := os.MkdirAll(store, 0o700); err != nil {
 		return fmt.Errorf("create grok session store: %w", err)
 	}
+	return linkGrokDirectory(filepath.Join(home, "sessions"), store, "session store")
+}
 
-	link := filepath.Join(home, "sessions")
-	// The isolated home is freshly created, so `sessions` should not exist;
-	// clear a stray entry rather than failing the link. RemoveAll does not
-	// follow a junction/symlink — it unlinks it — so this can never reach
-	// through into the store's contents.
+// linkGrokDirectory creates a directory link on every supported platform.
+// Both the persistent conversation store and the provider-owned billing log
+// use this helper to stay available from a security-isolated GROK_HOME.
+func linkGrokDirectory(link, target, description string) error {
+	// The isolated home is freshly created, so the entry should not exist;
+	// clear a stray one rather than failing the link. RemoveAll does not follow
+	// a junction/symlink — it unlinks it — so this cannot reach the target.
 	if _, err := os.Lstat(link); err == nil {
 		if rerr := os.RemoveAll(link); rerr != nil {
-			return fmt.Errorf("clear stale sessions entry: %w", rerr)
+			return fmt.Errorf("clear stale %s entry: %w", description, rerr)
 		}
 	}
 
@@ -97,19 +101,19 @@ func linkGrokSessionStore(home string) error {
 		// Mode) and would therefore fail on an ordinary user's machine. Go
 		// has no junction API, so shell out to mklink. os.Symlink is kept as
 		// a fallback for the machines where the privilege IS held.
-		out, err := exec.Command("cmd", "/c", "mklink", "/J", link, store).CombinedOutput()
+		out, err := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput()
 		if err == nil {
 			return nil
 		}
-		if serr := os.Symlink(store, link); serr != nil {
-			return fmt.Errorf("junction grok session store (mklink: %v, output: %s): %w",
-				err, string(out), serr)
+		if serr := os.Symlink(target, link); serr != nil {
+			return fmt.Errorf("junction grok %s (mklink: %v, output: %s): %w",
+				description, err, string(out), serr)
 		}
 		return nil
 	}
 
-	if err := os.Symlink(store, link); err != nil {
-		return fmt.Errorf("symlink grok session store: %w", err)
+	if err := os.Symlink(target, link); err != nil {
+		return fmt.Errorf("symlink grok %s: %w", description, err)
 	}
 	return nil
 }

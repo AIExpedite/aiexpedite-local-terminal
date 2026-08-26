@@ -961,7 +961,10 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 					colorCyan, lineCount, session.ID, truncateString(trimmed, 200), colorReset)
 			}
 
-			// Grok usage-limit telemetry: the ACP transport is the primary path
+			// Grok notice telemetry: ACP frames are deliberately notice-only.
+			// Numeric and confirmed-unmetered usage comes from the account-bound
+			// billing log, never arbitrary response or tool-result fields. The ACP
+			// transport is the primary path
 			// for normal Grok sessions (`grok_acp_start`), and xAI surfaces the
 			// `usage_limit_reached` / `credit_limit_*` / `allow_access:false`
 			// signals as `session/update` notifications on this same stdout
@@ -1286,7 +1289,7 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
 }
 
 // setupIsolatedGrokHome creates a per-session temp dir to use as the child's
-// GROK_HOME and seeds it with exactly two things:
+// GROK_HOME and seeds it with the minimum persistent surfaces the CLI needs:
 //
 //   - a copy of the real `grok login` auth file, so cached-token auth keeps
 //     working without us inheriting anything else from the user's real
@@ -1295,6 +1298,8 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
 //     — `auto_update = false` suppresses the headless updater check, which can
 //     otherwise race `grok agent stdio` and emit non-JSON stdout that readStream
 //     would treat as a fatal `grok_acp_error`
+//   - directory links for conversations and provider-owned billing logs, so
+//     those two data sets survive the ephemeral home and CLI replacement
 //
 // This replaces the dead `--config <key>=` neutralizer machinery: grok 0.2.59
 // rejects `--config` outright, so we can no longer clear persisted config via
@@ -1390,6 +1395,10 @@ func setupIsolatedGrokHome(allowAPIKeyFallback bool, runtimeModel string) (strin
 	// ephemeral store still runs, it just cannot be reattached later.
 	if lerr := linkGrokSessionStore(dir); lerr != nil {
 		fmt.Printf("%s[grok-acp] conversation store not persisted (resume will cold-start): %v%s\n",
+			colorYellow, lerr, colorReset)
+	}
+	if lerr := linkGrokBillingLogs(dir, srcBase); lerr != nil {
+		fmt.Printf("%s[grok-acp] billing log not persisted (usage freshness may be unavailable): %v%s\n",
 			colorYellow, lerr, colorReset)
 	}
 	pruneGrokSessionStoreOnce()

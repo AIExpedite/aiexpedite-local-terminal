@@ -258,6 +258,21 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 	if strings.Contains(string(cfg), "api_key") || strings.Contains(string(cfg), "approve") {
 		t.Fatalf("clean config.toml must not carry api_key/approval knobs: %q", cfg)
 	}
+
+	// Billing logs are provider-owned telemetry, not user config. Managed runs
+	// must append them to the real GROK_HOME so the next bounded refresh can
+	// observe the same record after this isolated directory is removed.
+	const billingEvidence = `{"ts":"2026-08-17T23:02:12Z","msg":"billing: fetched credits config"}`
+	if err := os.WriteFile(filepath.Join(dir, "logs", "unified.jsonl"), []byte(billingEvidence), 0o600); err != nil {
+		t.Fatalf("write through isolated billing-log link: %v", err)
+	}
+	gotBilling, err := os.ReadFile(filepath.Join(realHome, "logs", "unified.jsonl"))
+	if err != nil {
+		t.Fatalf("real billing log not persisted: %v", err)
+	}
+	if string(gotBilling) != billingEvidence {
+		t.Fatalf("real billing log = %q, want %q", gotBilling, billingEvidence)
+	}
 }
 
 // TestSetupIsolatedGrokHome_MissingAuthTolerated pins that a missing real auth
