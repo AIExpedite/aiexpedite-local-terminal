@@ -155,6 +155,9 @@ type CodexAppServerSession struct {
 	// tombstone (see end_confirm.go): only probeProcessGone may convert it
 	// into the "not found" absence answer the server frees a device on.
 	killUnconfirmed bool
+	// terminalPublishState reserves this session's ID while its codex_appserver_ended
+	// frame is in flight — see end_confirm.go.
+	terminalPublishState
 }
 
 // Status returns the current lifecycle status under the session mutex so
@@ -418,7 +421,12 @@ func (m *CodexAppServerManager) End(id string) error {
 	// manufacturing absence evidence for a possibly-alive child).
 	if session.isKillUnconfirmed() {
 		if probeProcessGone(session.Process) {
-			m.removeSessionIfSame(id, session)
+			if !m.removeSessionIfSame(id, session) {
+				// The ID is not ours to free: a replacement owns it, or the
+				// terminal frame is still in flight under it. Either way this
+				// End cannot answer absence (end_confirm.go).
+				return fmt.Errorf("codex app-server session %s could not be released — a terminal frame is still in flight or the ID was re-taken: %w", id, errEndUnconfirmed)
+			}
 			return fmt.Errorf("codex app-server session %s not found", id)
 		}
 		// Still alive (or unverifiable): re-kill, give the watcher one more
@@ -562,16 +570,31 @@ func (m *CodexAppServerManager) removeSession(id string) {
 // its ID re-used by a new Start while the old wedged exit watcher is still
 // running — an unconditional removal from that watcher would then delete the
 // REPLACEMENT session and deregister its PID (Codex P2). Every path that
-// holds the session pointer removes through this.
-func (m *CodexAppServerManager) removeSessionIfSame(id string, s *CodexAppServerSession) {
+// holds the session pointer removes through this.//
+// It also refuses while a terminal frame is in flight for s: the frame is
+// already travelling under this ID, so freeing the ID now would let a
+// replacement Start receive it as its own shutdown evidence (Codex P2, round
+// 4). The publisher performs the removal itself once delivery completes.
+//
+// Returns whether id is free of s afterwards — false means either a
+// replacement already owns the ID or the release is deferred to the in-flight
+// publisher, and in both cases the caller must NOT report this session's
+// absence.
+func (m *CodexAppServerManager) removeSessionIfSame(id string, s *CodexAppServerSession) bool {
 	m.mu.Lock()
-	if cur, ok := m.sessions[id]; ok && cur == s {
-		if s.Process != nil && s.Process.Process != nil {
-			globalProcessRegistry.Deregister(s.Process.Process.Pid)
-		}
-		delete(m.sessions, id)
+	defer m.mu.Unlock()
+	cur, ok := m.sessions[id]
+	if !ok {
+		return true
 	}
-	m.mu.Unlock()
+	if cur != s || s.terminalPublishInFlight() {
+		return false
+	}
+	if s.Process != nil && s.Process.Process != nil {
+		globalProcessRegistry.Deregister(s.Process.Process.Pid)
+	}
+	delete(m.sessions, id)
+	return true
 }
 
 /* --------------------------------------------------------------------------
@@ -920,7 +943,7 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	// still running (Codex P2, round 3 — the identity guard covered only map
 	// removal). Publish it only while the ID is still THIS session's (or
 	// unclaimed), atomically against Start's registration.
-	if !publishTerminalIfCurrent(&m.mu, m.sessions, session.ID, session, publishFn, resultMsg{
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, session.ID, session, &session.terminalPublishState, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
 		UID:          session.UID,
@@ -934,7 +957,7 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 		Seq:          int(seq),
 		Files:        uploadedFiles,
 		UploadErrors: uploadErrors,
-	}) {
+	}, func() { m.removeSessionIfSame(session.ID, session) }) {
 		fmt.Printf("%s[codex-appserver] Suppressed stale codex_appserver_ended for %s — the ID now belongs to a replacement session%s\n",
 			colorYellow, session.ID, colorReset)
 	}
@@ -947,6 +970,8 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	fmt.Printf("%s[codex-appserver] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, exit, colorReset)
 
+	// No-op while the ended frame is still in flight — the publisher's release
+	// callback owns the removal in that case (end_confirm.go).
 	m.removeSessionIfSame(session.ID, session)
 }
 

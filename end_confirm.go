@@ -42,8 +42,10 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -57,6 +59,25 @@ import (
 // 2: the antigravity/opencode end handlers publish ended for EVERY End
 // error as idempotent teardown, and stale GC ignored the error entirely).
 var errEndUnconfirmed = errors.New("end unconfirmed")
+
+// errEndStaleSession marks an End whose session pointer was replaced under it:
+// a concurrent End removed the session and a new Start re-took the ID while
+// this End was still draining. The end itself succeeded — the session it
+// captured really is gone — but its caller MUST NOT publish the terminal
+// `*_ended` frame, because that frame is keyed only by session ID and would
+// now be read as shutdown evidence for the REPLACEMENT (Codex P2, round 4).
+// The antigravity/opencode handlers, which publish ended for ordinary End
+// errors as idempotent teardown, publish NOTHING at all for this one: every
+// frame they emit carries the session ID, so an error frame would be
+// misattributed to the live replacement just as an ended frame would.
+var errEndStaleSession = errors.New("end raced a replacement session")
+
+// staleEndError is the shared verdict for an End whose session pointer was
+// replaced under it, so both turn managers word it identically and neither can
+// forget the sentinel.
+func staleEndError(kind string, id string) error {
+	return fmt.Errorf("%s session %s was replaced by a new session before this end completed: %w", kind, id, errEndStaleSession)
+}
 
 // killConfirmTimeout is how long an End path waits, after issuing the final
 // force kill, for the exit watcher to confirm the process is gone (close of
@@ -144,9 +165,34 @@ func defaultProbeProcessGone(cmd *exec.Cmd) bool {
 	return processHandleGone(cmd.Process)
 }
 
+// terminalPublishState is embedded in every session struct whose exit watcher
+// owns the terminal `*_ended` frame. It records that a terminal publish has
+// been LAUNCHED but not yet DELIVERED, which is what reserves the session ID
+// for the duration of the Pub/Sub round-trip.
+//
+// Testing identity at launch time is not sufficient on its own: the launch only
+// spawns a goroutine, and publishFn can then sit in network I/O for ~30 s. A
+// replacement Start registering inside that window would receive the old frame
+// as its own shutdown evidence — the very race the identity test exists to
+// close (Codex P2, round 4). So the removals that would free the ID
+// (removeSessionIfSame) refuse while a publish is in flight, and the publisher
+// itself performs the release once publishFn returns.
+//
+// Retaining is the fail-safe direction: a publishFn that never returns leaves
+// the session in the map and the device fenced — visibly wedged — rather than
+// freeing an ID a frame is still travelling under.
+type terminalPublishState struct {
+	publishInFlight atomic.Bool
+}
+
+// terminalPublishInFlight reports whether a terminal frame has been launched
+// for this session and has not yet been delivered.
+func (t *terminalPublishState) terminalPublishInFlight() bool { return t.publishInFlight.Load() }
+
 // publishTerminalIfCurrent publishes a session's terminal (`*_ended`) frame
 // only while id still maps to THIS session — or to no session at all — and
-// reports whether it published.
+// reports whether it published. Once publishFn returns it runs release, which
+// is the ONLY thing that drops a session whose terminal publish is in flight.
 //
 // Why the guard exists: a tombstone that resolves through verified process
 // absence frees its ID for reuse while the wedged exit watcher may still be
@@ -156,27 +202,43 @@ func defaultProbeProcessGone(cmd *exec.Cmd) bool {
 // evidence terminal-service releases the device claim on, so emitting it under
 // a replacement's ID tears down a session that is still running.
 //
-// The identity test runs under the manager's own map lock, the same lock Start
-// takes to register a session, so the decision is atomic against registration:
-// once a replacement is registered, no stale terminal frame can be launched for
-// that ID. An UNCLAIMED id still publishes — that is the ordinary teardown
-// (End removes the session on the "ended" status fast-path while the watcher is
-// still finishing its artifact scan), and a late frame for a session the server
-// already considers gone is idempotent.
+// Both the identity test and the in-flight reservation are taken under the
+// manager's own map lock — the same lock Start takes to register a session — so
+// the ID is reserved atomically with the decision to publish. A replacement can
+// register neither between those two steps nor during delivery, because
+// removeSessionIfSame will not free a reserved ID (Codex P2, round 4). An
+// UNCLAIMED id still publishes: that is the ordinary teardown (End removes the
+// session on the "ended" status fast-path while the watcher is still finishing
+// its artifact scan), and a late frame for a session the server already
+// considers gone is idempotent.
 func publishTerminalIfCurrent[S comparable](
 	mu *sync.RWMutex,
 	sessions map[string]S,
 	id string,
 	s S,
+	state *terminalPublishState,
 	publishFn PublishFunc,
 	msg resultMsg,
+	release func(),
 ) bool {
 	mu.Lock()
-	defer mu.Unlock()
 	if cur, ok := sessions[id]; ok && cur != s {
+		mu.Unlock()
 		return false
 	}
-	// Cheap under the lock: this only spawns the publisher goroutine.
-	publishTerminalResultAsync(publishFn, msg)
+	state.publishInFlight.Store(true)
+	mu.Unlock()
+
+	// Cheap here: this only spawns the publisher goroutine. The ID stays
+	// reserved until that goroutine's publishFn returns.
+	publishTerminalResultAsync(func(m resultMsg) {
+		defer func() {
+			state.publishInFlight.Store(false)
+			if release != nil {
+				release()
+			}
+		}()
+		publishFn(m)
+	}, msg)
 	return true
 }

@@ -5408,6 +5408,16 @@ var errFileLimitReached = errors.New("file upload limit reached")
 // any matching media file under workDir — only used by tests; production
 // callers always pass a real start time.
 func detectOutputFilesSince(workDir string, sessionStart time.Time) []string {
+	return detectOutputFilesSinceCtx(context.Background(), workDir, sessionStart)
+}
+
+// detectOutputFilesSinceCtx is detectOutputFilesSince with a cancellable walk.
+// The post-session scan runs under a hard deadline (see
+// sessionArtifactCollectTimeout); when that deadline expires the caller stops
+// waiting, so the walk must stop too — otherwise an abandoned goroutine keeps
+// stat-ing a huge or network-mounted tree, and worse, goes on to upload
+// objects nobody will ever reference (Codex P2, round 4).
+func detectOutputFilesSinceCtx(ctx context.Context, workDir string, sessionStart time.Time) []string {
 	files := []string{}
 
 	if workDir == "" {
@@ -5441,6 +5451,10 @@ func detectOutputFilesSince(workDir string, sessionStart time.Time) []string {
 	}
 
 	walkErr := filepath.WalkDir(absBase, func(path string, d fs.DirEntry, err error) error {
+		// Stop the moment the caller has given up on us.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
 			// Permission and not-exist errors on individual subtrees (or on
 			// the root itself, when the workdir was removed between command
@@ -6454,6 +6468,16 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 				publishAntigravityNativeError(ctx, topic, cmd, fmt.Sprintf("end unconfirmed: %v", err))
 				return
 			}
+			// A STALE end (the session was replaced under us and the ID now
+			// belongs to a live replacement) publishes NOTHING: every frame we
+			// could emit carries cmd.SessionID, so an error frame would be
+			// misattributed to the replacement just as an ended frame would.
+			// The end itself succeeded — the session we captured is gone.
+			if errors.Is(err, errEndStaleSession) {
+				fmt.Printf("%s[antigravity-native] Withholding every frame for %s — %v%s\n",
+					colorYellow, cmd.SessionID, err, colorReset)
+				return
+			}
 			// Still publish ended so the cloud can release reservations even if
 			// the local session was already gone (idempotent teardown).
 			publishFn(resultMsg{
@@ -6664,6 +6688,16 @@ func handleOpenCodeNativeCommand(ctx context.Context, topic *pubsub.Publisher, c
 			// the fence and the next retried end re-probes (end_confirm.go).
 			if errors.Is(err, errEndUnconfirmed) {
 				publishOpenCodeNativeError(ctx, topic, cmd, fmt.Sprintf("end unconfirmed: %v", err))
+				return
+			}
+			// A STALE end (the session was replaced under us and the ID now
+			// belongs to a live replacement) publishes NOTHING: every frame we
+			// could emit carries cmd.SessionID, so an error frame would be
+			// misattributed to the replacement just as an ended frame would.
+			// The end itself succeeded — the session we captured is gone.
+			if errors.Is(err, errEndStaleSession) {
+				fmt.Printf("%s[opencode-native] Withholding every frame for %s — %v%s\n",
+					colorYellow, cmd.SessionID, err, colorReset)
 				return
 			}
 			// Still publish ended so the cloud can release reservations even if

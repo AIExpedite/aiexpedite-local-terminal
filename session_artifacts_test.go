@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -19,7 +20,7 @@ import (
 // than passing quietly.
 
 func TestCollectSessionArtifacts_NilConfigIsANoOp(t *testing.T) {
-	files, errs := collectSessionArtifacts(nil, "s1", "ws-1", t.TempDir(), time.Now())
+	files, errs := collectSessionArtifacts(context.Background(), nil, "s1", "ws-1", t.TempDir(), time.Now())
 	if files != nil || errs != nil {
 		t.Fatalf("expected no files/errors with a nil config, got %v / %v", files, errs)
 	}
@@ -27,7 +28,7 @@ func TestCollectSessionArtifacts_NilConfigIsANoOp(t *testing.T) {
 
 func TestCollectSessionArtifacts_UploadDisabledIsANoOp(t *testing.T) {
 	cfg := &Config{EnableFileUpload: false, StorageBucket: "b"}
-	files, errs := collectSessionArtifacts(cfg, "s1", "ws-1", t.TempDir(), time.Now())
+	files, errs := collectSessionArtifacts(context.Background(), cfg, "s1", "ws-1", t.TempDir(), time.Now())
 	if files != nil || errs != nil {
 		t.Fatalf("expected no files/errors when uploads are disabled, got %v / %v", files, errs)
 	}
@@ -37,7 +38,7 @@ func TestCollectSessionArtifacts_UploadDisabledIsANoOp(t *testing.T) {
 // under an empty workspace id would put media outside every tenant's namespace.
 func TestCollectSessionArtifacts_NoWorkspaceIsANoOp(t *testing.T) {
 	cfg := &Config{EnableFileUpload: true, StorageBucket: "b"}
-	files, errs := collectSessionArtifacts(cfg, "s1", "", t.TempDir(), time.Now())
+	files, errs := collectSessionArtifacts(context.Background(), cfg, "s1", "", t.TempDir(), time.Now())
 	if files != nil || errs != nil {
 		t.Fatalf("expected no files/errors without a workspace, got %v / %v", files, errs)
 	}
@@ -49,7 +50,7 @@ func TestCollectSessionArtifacts_NoWorkspaceIsANoOp(t *testing.T) {
 func TestCollectSessionArtifacts_NoWorkdirSkipsScan(t *testing.T) {
 	setTrackedCwd("")
 	cfg := &Config{EnableFileUpload: true, StorageBucket: "b"}
-	files, errs := collectSessionArtifacts(cfg, "s1", "ws-1", "", time.Now())
+	files, errs := collectSessionArtifacts(context.Background(), cfg, "s1", "ws-1", "", time.Now())
 	if files != nil || errs != nil {
 		t.Fatalf("expected no files/errors without a workdir, got %v / %v", files, errs)
 	}
@@ -63,7 +64,7 @@ func TestCollectSessionArtifacts_NoMediaProducedSkipsUpload(t *testing.T) {
 	writeFileAt(t, filepath.Join(dir, "notes.txt"), "not media", time.Now())
 	cfg := &Config{EnableFileUpload: true, StorageBucket: "b"}
 
-	files, errs := collectSessionArtifacts(cfg, "s1", "ws-1", dir, time.Now().Add(-time.Minute))
+	files, errs := collectSessionArtifacts(context.Background(), cfg, "s1", "ws-1", dir, time.Now().Add(-time.Minute))
 	if files != nil || errs != nil {
 		t.Fatalf("expected no files/errors when no media was written, got %v / %v", files, errs)
 	}

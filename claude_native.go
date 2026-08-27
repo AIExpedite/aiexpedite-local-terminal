@@ -113,6 +113,9 @@ type ClaudeNativeSession struct {
 	// tombstone (see end_confirm.go): only probeProcessGone may convert it
 	// into the "not found" absence answer the server frees a device on.
 	killUnconfirmed bool
+	// terminalPublishState reserves this session's ID while its claude_native_ended
+	// frame is in flight — see end_confirm.go.
+	terminalPublishState
 }
 
 // Status returns the current lifecycle status under the session mutex.
@@ -410,7 +413,10 @@ func (m *ClaudeNativeManager) End(id string) error {
 	// device on (Codex P1 — see end_confirm.go).
 	if session.isKillUnconfirmed() {
 		if probeProcessGone(session.Process) {
-			m.removeSessionIfSame(id, session)
+			if !m.removeSessionIfSame(id, session) {
+				// See CodexAppServerManager.End — the ID is not ours to free.
+				return fmt.Errorf("claude native session %s could not be released — a terminal frame is still in flight or the ID was re-taken: %w", id, errEndUnconfirmed)
+			}
 			return fmt.Errorf("claude native session %s not found", id)
 		}
 		if session.Process.Process != nil {
@@ -541,16 +547,31 @@ func (m *ClaudeNativeManager) removeSession(id string) {
 
 // removeSessionIfSame removes id only while it still maps to THIS session —
 // see CodexAppServerManager.removeSessionIfSame for the reused-ID watcher
-// race this prevents (Codex P2).
-func (m *ClaudeNativeManager) removeSessionIfSame(id string, s *ClaudeNativeSession) {
+// race this prevents (Codex P2).//
+// It also refuses while a terminal frame is in flight for s: the frame is
+// already travelling under this ID, so freeing the ID now would let a
+// replacement Start receive it as its own shutdown evidence (Codex P2, round
+// 4). The publisher performs the removal itself once delivery completes.
+//
+// Returns whether id is free of s afterwards — false means either a
+// replacement already owns the ID or the release is deferred to the in-flight
+// publisher, and in both cases the caller must NOT report this session's
+// absence.
+func (m *ClaudeNativeManager) removeSessionIfSame(id string, s *ClaudeNativeSession) bool {
 	m.mu.Lock()
-	if cur, ok := m.sessions[id]; ok && cur == s {
-		if s.Process != nil && s.Process.Process != nil {
-			globalProcessRegistry.Deregister(s.Process.Process.Pid)
-		}
-		delete(m.sessions, id)
+	defer m.mu.Unlock()
+	cur, ok := m.sessions[id]
+	if !ok {
+		return true
 	}
-	m.mu.Unlock()
+	if cur != s || s.terminalPublishInFlight() {
+		return false
+	}
+	if s.Process != nil && s.Process.Process != nil {
+		globalProcessRegistry.Deregister(s.Process.Process.Pid)
+	}
+	delete(m.sessions, id)
+	return true
 }
 
 /* --------------------------------------------------------------------------
@@ -822,7 +843,7 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 	// still running (Codex P2, round 3 — the identity guard covered only map
 	// removal). Publish it only while the ID is still THIS session's (or
 	// unclaimed), atomically against Start's registration.
-	if !publishTerminalIfCurrent(&m.mu, m.sessions, session.ID, session, publishFn, resultMsg{
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, session.ID, session, &session.terminalPublishState, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
 		UID:          session.UID,
@@ -836,7 +857,7 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 		Seq:          int(seq),
 		Files:        uploadedFiles,
 		UploadErrors: uploadErrors,
-	}) {
+	}, func() { m.removeSessionIfSame(session.ID, session) }) {
 		fmt.Printf("%s[claude-native] Suppressed stale claude_native_ended for %s — the ID now belongs to a replacement session%s\n",
 			colorYellow, session.ID, colorReset)
 	}
@@ -846,5 +867,7 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 	fmt.Printf("%s[claude-native] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, exit, colorReset)
 
+	// No-op while the ended frame is still in flight — the publisher's release
+	// callback owns the removal in that case (end_confirm.go).
 	m.removeSessionIfSame(session.ID, session)
 }

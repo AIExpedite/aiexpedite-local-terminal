@@ -207,6 +207,9 @@ type GrokACPSession struct {
 	// tombstone (see end_confirm.go): only probeProcessGone may convert it
 	// into the "not found" absence answer the server frees a device on.
 	killUnconfirmed bool
+	// terminalPublishState reserves this session's ID while its grok_acp_ended
+	// frame is in flight — see end_confirm.go.
+	terminalPublishState
 }
 
 // GrokStartOptions bundles the per-session policy knobs the dispatcher reads
@@ -728,7 +731,10 @@ func (m *GrokACPManager) End(id string) error {
 	// device on (Codex P1 — see end_confirm.go).
 	if session.isKillUnconfirmed() {
 		if probeProcessGone(session.Process) {
-			m.removeSessionIfSame(id, session)
+			if !m.removeSessionIfSame(id, session) {
+				// See CodexAppServerManager.End — the ID is not ours to free.
+				return fmt.Errorf("grok acp session %s could not be released — a terminal frame is still in flight or the ID was re-taken: %w", id, errEndUnconfirmed)
+			}
 			return fmt.Errorf("grok acp session %s not found", id)
 		}
 		if session.Process.Process != nil {
@@ -865,16 +871,31 @@ func (m *GrokACPManager) removeSession(id string) {
 
 // removeSessionIfSame removes id only while it still maps to THIS session —
 // see CodexAppServerManager.removeSessionIfSame for the reused-ID watcher
-// race this prevents (Codex P2).
-func (m *GrokACPManager) removeSessionIfSame(id string, s *GrokACPSession) {
+// race this prevents (Codex P2).//
+// It also refuses while a terminal frame is in flight for s: the frame is
+// already travelling under this ID, so freeing the ID now would let a
+// replacement Start receive it as its own shutdown evidence (Codex P2, round
+// 4). The publisher performs the removal itself once delivery completes.
+//
+// Returns whether id is free of s afterwards — false means either a
+// replacement already owns the ID or the release is deferred to the in-flight
+// publisher, and in both cases the caller must NOT report this session's
+// absence.
+func (m *GrokACPManager) removeSessionIfSame(id string, s *GrokACPSession) bool {
 	m.mu.Lock()
-	if cur, ok := m.sessions[id]; ok && cur == s {
-		if s.Process != nil && s.Process.Process != nil {
-			globalProcessRegistry.Deregister(s.Process.Process.Pid)
-		}
-		delete(m.sessions, id)
+	defer m.mu.Unlock()
+	cur, ok := m.sessions[id]
+	if !ok {
+		return true
 	}
-	m.mu.Unlock()
+	if cur != s || s.terminalPublishInFlight() {
+		return false
+	}
+	if s.Process != nil && s.Process.Process != nil {
+		globalProcessRegistry.Deregister(s.Process.Process.Pid)
+	}
+	delete(m.sessions, id)
+	return true
 }
 
 /* --------------------------------------------------------------------------
@@ -1215,7 +1236,7 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	// still running (Codex P2, round 3 — the identity guard covered only map
 	// removal). Publish it only while the ID is still THIS session's (or
 	// unclaimed), atomically against Start's registration.
-	if !publishTerminalIfCurrent(&m.mu, m.sessions, session.ID, session, publishFn, resultMsg{
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, session.ID, session, &session.terminalPublishState, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
 		UID:          session.UID,
@@ -1229,7 +1250,7 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 		Seq:          int(seq),
 		Files:        uploadedFiles,
 		UploadErrors: uploadErrors,
-	}) {
+	}, func() { m.removeSessionIfSame(session.ID, session) }) {
 		fmt.Printf("%s[grok-acp] Suppressed stale grok_acp_ended for %s — the ID now belongs to a replacement session%s\n",
 			colorYellow, session.ID, colorReset)
 	}
@@ -1249,6 +1270,8 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	fmt.Printf("%s[grok-acp] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, exit, colorReset)
 
+	// No-op while the ended frame is still in flight — the publisher's release
+	// callback owns the removal in that case (end_confirm.go).
 	m.removeSessionIfSame(session.ID, session)
 }
 

@@ -22,11 +22,17 @@ import (
 var sessionArtifactCollectTimeout = 2 * time.Minute
 
 // collectSessionArtifactsBounded runs collectSessionArtifacts with a hard
-// deadline. On expiry it returns (nil, nil, true) and abandons the scan
-// goroutine — the scan holds no locks and its uploads are best-effort, so an
-// abandoned one can only waste its own network round-trips. The `*_ended`
-// frame then ships without file metadata, which is strictly better than never
-// shipping at all.
+// deadline. On expiry it returns (nil, nil, true) and stops waiting; the
+// `*_ended` frame then ships without file metadata, which is strictly better
+// than never shipping at all.
+//
+// The abandoned work is CANCELLED, not merely orphaned (Codex P2, round 4).
+// The scan's own upload context used to be an independent five-minute one, so
+// an upload that completed at 2m01s still wrote objects to GCS and then handed
+// their metadata to a channel nobody was reading — permanent unreferenced
+// uploads billed to the workspace, invisible to the session that made them.
+// The deadline context is threaded through the walk and the upload, so both
+// unwind when the bound expires.
 func collectSessionArtifactsBounded(
 	cfg *Config,
 	sessionID string,
@@ -35,29 +41,34 @@ func collectSessionArtifactsBounded(
 	startedAt time.Time,
 	timeout time.Duration,
 ) ([]FileInfo, []UploadError, bool) {
-	return boundedArtifactCollect(func() ([]FileInfo, []UploadError) {
-		return collectSessionArtifacts(cfg, sessionID, workspaceID, workDir, startedAt)
+	return boundedArtifactCollect(func(ctx context.Context) ([]FileInfo, []UploadError) {
+		return collectSessionArtifacts(ctx, cfg, sessionID, workspaceID, workDir, startedAt)
 	}, timeout, sessionID)
 }
 
 // boundedArtifactCollect is the deadline mechanism behind
 // collectSessionArtifactsBounded, split out so tests can exercise the timeout
 // branch with a blocking collector.
-func boundedArtifactCollect(collect func() ([]FileInfo, []UploadError), timeout time.Duration, sessionID string) ([]FileInfo, []UploadError, bool) {
+func boundedArtifactCollect(collect func(context.Context) ([]FileInfo, []UploadError), timeout time.Duration, sessionID string) ([]FileInfo, []UploadError, bool) {
 	type artifactResult struct {
 		files []FileInfo
 		errs  []UploadError
 	}
+	// Cancelled on BOTH exits: on expiry it unwinds the abandoned scan/upload,
+	// and on the normal path it releases the timer.
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	resultCh := make(chan artifactResult, 1)
 	go func() {
-		files, errs := collect()
+		files, errs := collect(ctx)
 		resultCh <- artifactResult{files: files, errs: errs}
 	}()
 	select {
 	case r := <-resultCh:
 		return r.files, r.errs, false
-	case <-time.After(timeout):
-		fmt.Printf("%s[session-file-upload] Artifact collection timed out after %s for session %s — publishing ended without file metadata%s\n",
+	case <-ctx.Done():
+		fmt.Printf("%s[session-file-upload] Artifact collection timed out after %s for session %s — cancelling the scan and publishing ended without file metadata%s\n",
 			colorRed, timeout, sessionID, colorReset)
 		return nil, nil, true
 	}
@@ -96,6 +107,7 @@ func boundedArtifactCollect(collect func() ([]FileInfo, []UploadError), timeout 
 //	additional root — scanning it while another workspace's command wrote
 //	fresh media there would upload those files under THIS session's id.
 func collectSessionArtifacts(
+	ctx context.Context,
 	cfg *Config,
 	sessionID string,
 	workspaceID string,
@@ -119,7 +131,7 @@ func collectSessionArtifacts(
 		return nil, nil
 	}
 
-	files := detectOutputFilesSince(effectiveDir, startedAt)
+	files := detectOutputFilesSinceCtx(ctx, effectiveDir, startedAt)
 	// Always log the scan outcome (root + count), even on zero hits. A silent
 	// zero-file result is otherwise indistinguishable from "upload disabled" —
 	// this line is what turns a future `hasFiles:false` report into a one-grep
@@ -130,10 +142,20 @@ func collectSessionArtifacts(
 		return nil, nil
 	}
 
+	// A scan that only finished because it outran the caller's bound must not
+	// go on to write objects the ended frame will never reference.
+	if err := ctx.Err(); err != nil {
+		fmt.Printf("[session-file-upload] Session %s: skipping upload of %d file(s) — collection was cancelled (%v)\n",
+			sessionID, len(files), err)
+		return nil, nil
+	}
+
 	fmt.Printf("[session-file-upload] Detected %d output files, uploading to GCS (workspace: %s)...\n",
 		len(files), workspaceID)
 
-	uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Derived from ctx, not Background: the five minutes is an upper bound on a
+	// legitimate upload, never a licence to outlive the caller's deadline.
+	uploadCtx, uploadCancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer uploadCancel()
 
 	storageClient, storageErr := GetStorageClient(uploadCtx)

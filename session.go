@@ -119,6 +119,9 @@ type CLISession struct {
 	// into the "not found" absence answer the server frees a device on.
 	killUnconfirmed bool
 	streamDone      chan struct{} // closed when stdout/stderr and stream publishes finish
+	// terminalPublishState reserves this session's ID while its session_ended
+	// frame is in flight — see end_confirm.go.
+	terminalPublishState
 }
 
 // claudeFirstFrameTimeout bounds how long a freshly-started claude session may
@@ -587,7 +590,10 @@ func (sm *SessionManager) EndSession(id string) error {
 	// device on (Codex P1 — see end_confirm.go).
 	if unconfirmed {
 		if probeProcessGone(session.Process) {
-			sm.removeSessionIfSame(id, session)
+			if !sm.removeSessionIfSame(id, session) {
+				// See CodexAppServerManager.End — the ID is not ours to free.
+				return fmt.Errorf("session %s could not be released — a terminal frame is still in flight or the ID was re-taken: %w", id, errEndUnconfirmed)
+			}
 			return fmt.Errorf("session %s not found", id)
 		}
 		if session.Process.Process != nil {
@@ -709,16 +715,31 @@ func (sm *SessionManager) removeSession(id string) {
 
 // removeSessionIfSame removes id only while it still maps to THIS session —
 // see CodexAppServerManager.removeSessionIfSame for the reused-ID watcher
-// race this prevents (Codex P2).
-func (sm *SessionManager) removeSessionIfSame(id string, s *CLISession) {
+// race this prevents (Codex P2).//
+// It also refuses while a terminal frame is in flight for s: the frame is
+// already travelling under this ID, so freeing the ID now would let a
+// replacement Start receive it as its own shutdown evidence (Codex P2, round
+// 4). The publisher performs the removal itself once delivery completes.
+//
+// Returns whether id is free of s afterwards — false means either a
+// replacement already owns the ID or the release is deferred to the in-flight
+// publisher, and in both cases the caller must NOT report this session's
+// absence.
+func (sm *SessionManager) removeSessionIfSame(id string, s *CLISession) bool {
 	sm.mu.Lock()
-	if cur, ok := sm.sessions[id]; ok && cur == s {
-		if s.Process != nil && s.Process.Process != nil {
-			globalProcessRegistry.Deregister(s.Process.Process.Pid)
-		}
-		delete(sm.sessions, id)
+	defer sm.mu.Unlock()
+	cur, ok := sm.sessions[id]
+	if !ok {
+		return true
 	}
-	sm.mu.Unlock()
+	if cur != s || s.terminalPublishInFlight() {
+		return false
+	}
+	if s.Process != nil && s.Process.Process != nil {
+		globalProcessRegistry.Deregister(s.Process.Process.Pid)
+	}
+	delete(sm.sessions, id)
+	return true
 }
 
 // shouldCloseStdinAfterStart decides whether to close the child process's
@@ -1438,7 +1459,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// still running (Codex P2, round 3 — the identity guard covered only map
 	// removal). Publish it only while the ID is still THIS session's (or
 	// unclaimed), atomically against Start's registration.
-	if !publishTerminalIfCurrent(&sm.mu, sm.sessions, session.ID, session, publishFn, resultMsg{
+	if !publishTerminalIfCurrent(&sm.mu, sm.sessions, session.ID, session, &session.terminalPublishState, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
 		UID:          session.UID,
@@ -1452,7 +1473,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 		Seq:          int(seq),
 		Files:        uploadedFiles,
 		UploadErrors: uploadErrors,
-	}) {
+	}, func() { sm.removeSessionIfSame(session.ID, session) }) {
 		fmt.Printf("%s[session] Suppressed stale session_ended for %s — the ID now belongs to a replacement session%s\n",
 			colorYellow, session.ID, colorReset)
 	}
@@ -1460,7 +1481,8 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	fmt.Printf("%s[session] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, session.ExitCode, colorReset)
 
-	// Remove from session map
+	// Remove from session map. No-op while the ended frame is still in flight —
+	// the publisher's release callback owns the removal in that case.
 	sm.removeSessionIfSame(session.ID, session)
 }
 

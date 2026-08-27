@@ -836,7 +836,12 @@ func (m *AntigravityNativeManager) End(id string) error {
 		if !waitTurnBarrier(&session.turnMu, turnDrainConfirmTimeout) {
 			return m.retainOrResolveDrainTombstone(id, session)
 		}
-		m.removeSessionIfSame(id, session)
+		// A concurrent End can have removed this session and a replacement
+		// Start re-taken the ID while we were on the barrier; publishing ended
+		// for it would tear the replacement down (Codex P2, round 4).
+		if !m.removeSessionIfSame(id, session) {
+			return staleEndError("antigravity native", id)
+		}
 		return nil
 	}
 	session.status = "ended"
@@ -866,7 +871,9 @@ func (m *AntigravityNativeManager) End(id string) error {
 		return m.retainOrResolveDrainTombstone(id, session)
 	}
 
-	m.removeSessionIfSame(id, session)
+	if !m.removeSessionIfSame(id, session) {
+		return staleEndError("antigravity native", id)
+	}
 	fmt.Printf("%s[antigravity-native] Session %s ended%s\n", colorYellow, id, colorReset)
 	return nil
 }
@@ -916,7 +923,9 @@ func (m *AntigravityNativeManager) retainOrResolveDrainTombstone(id string, sess
 		return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session retained pending turn-drain verification: %w", id, turnDrainConfirmTimeout, errEndUnconfirmed)
 	}
 
-	m.removeSessionIfSame(id, session)
+	if !m.removeSessionIfSame(id, session) {
+		return staleEndError("antigravity native", id)
+	}
 	return fmt.Errorf("antigravity native session %s not found", id)
 }
 
@@ -1023,13 +1032,24 @@ func (m *AntigravityNativeManager) removeSession(id string) {
 
 // removeSessionIfSame removes id only while it still maps to THIS session —
 // see CodexAppServerManager.removeSessionIfSame for the reused-ID race this
-// prevents (Codex P2).
-func (m *AntigravityNativeManager) removeSessionIfSame(id string, s *AntigravityNativeSession) {
+// prevents (Codex P2).//
+// Returns whether id is free of s afterwards. FALSE means a replacement Start
+// already re-took the ID while this caller was draining — the caller's End
+// succeeded, but it must not let its handler publish the terminal frame,
+// because that frame is keyed only by session ID and the server would read it
+// as shutdown evidence for the live replacement (Codex P2, round 4).
+func (m *AntigravityNativeManager) removeSessionIfSame(id string, s *AntigravityNativeSession) bool {
 	m.mu.Lock()
-	if cur, ok := m.sessions[id]; ok && cur == s {
-		delete(m.sessions, id)
+	defer m.mu.Unlock()
+	cur, ok := m.sessions[id]
+	if !ok {
+		return true
 	}
-	m.mu.Unlock()
+	if cur != s {
+		return false
+	}
+	delete(m.sessions, id)
+	return true
 }
 
 func (m *AntigravityNativeManager) publishTurnError(session *AntigravityNativeSession, publishFn PublishFunc, msg string) error {

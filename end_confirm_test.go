@@ -14,6 +14,7 @@ package main
 // kills them — the red-then-green transition is the evidence (rule 23).
 
 import (
+	"context"
 	"errors"
 	"os/exec"
 	"runtime"
@@ -69,6 +70,15 @@ func liveTestProcess(t *testing.T) *exec.Cmd {
 		_, _ = cmd.Process.Wait()
 	})
 	return cmd
+}
+
+// lockTurn simulates a wedged in-flight turn holding the drain barrier and
+// returns an idempotent release, so a test can drain the barrier mid-way and
+// still defer the cleanup unconditionally.
+func lockTurn(mu *sync.Mutex) func() {
+	mu.Lock()
+	var once sync.Once
+	return func() { once.Do(mu.Unlock) }
 }
 
 func shortenEndConfirmTimeouts(t *testing.T) {
@@ -147,7 +157,7 @@ func TestDefaultProbeProcessGone(t *testing.T) {
 
 func TestBoundedArtifactCollect_TimesOutAndPassesThrough(t *testing.T) {
 	// Pass-through: a fast collector's results survive intact.
-	files, errs, timedOut := boundedArtifactCollect(func() ([]FileInfo, []UploadError) {
+	files, errs, timedOut := boundedArtifactCollect(func(context.Context) ([]FileInfo, []UploadError) {
 		return []FileInfo{{Name: "a.png"}}, []UploadError{{File: "b.png", Error: "x"}}
 	}, time.Second, "s1")
 	if timedOut || len(files) != 1 || len(errs) != 1 {
@@ -158,7 +168,7 @@ func TestBoundedArtifactCollect_TimesOutAndPassesThrough(t *testing.T) {
 	block := make(chan struct{})
 	defer close(block)
 	start := time.Now()
-	files, errs, timedOut = boundedArtifactCollect(func() ([]FileInfo, []UploadError) {
+	files, errs, timedOut = boundedArtifactCollect(func(context.Context) ([]FileInfo, []UploadError) {
 		<-block
 		return nil, nil
 	}, 100*time.Millisecond, "s2")
@@ -584,20 +594,20 @@ func TestPublishTerminalIfCurrent_SuppressesFrameForReplacedID(t *testing.T) {
 
 	// Still ours → published (the ordinary teardown).
 	m.sessions["s"] = old
-	if !publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, publishFn, frame) {
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, &old.terminalPublishState, publishFn, frame, nil) {
 		t.Fatalf("terminal frame must publish while the ID is still this session's")
 	}
 
 	// ID re-taken by a replacement → suppressed.
 	m.sessions["s"] = replacement
-	if publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, publishFn, frame) {
+	if publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, &old.terminalPublishState, publishFn, frame, nil) {
 		t.Fatalf("stale terminal frame published under a replacement session's ID")
 	}
 
 	// Unclaimed ID → still published; a late frame for a session the server
 	// already considers gone is idempotent.
 	delete(m.sessions, "s")
-	if !publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, publishFn, frame) {
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, &old.terminalPublishState, publishFn, frame, nil) {
 		t.Fatalf("terminal frame must publish when the ID is unclaimed")
 	}
 
@@ -608,5 +618,171 @@ func TestPublishTerminalIfCurrent_SuppressesFrameForReplacedID(t *testing.T) {
 	}
 	if got := publishedCount(); got != 2 {
 		t.Fatalf("expected exactly 2 published frames (current + unclaimed), got %d", got)
+	}
+}
+
+// Round 4 of the same finding: the identity test only guards the LAUNCH of the
+// publish. publishFn then sits in network I/O for up to ~30 s, and a
+// replacement Start registering inside that window would receive the old
+// frame. The ID must therefore stay reserved until delivery completes, and the
+// publisher — not the watcher — performs the release.
+func TestPublishTerminalIfCurrent_ReservesIDUntilDelivered(t *testing.T) {
+	m := NewCodexAppServerManager(nil)
+	session := &CodexAppServerSession{ID: "s", status: "ended", done: make(chan struct{})}
+	m.sessions["s"] = session
+
+	releasePublish := make(chan struct{})
+	publishFn := func(resultMsg) { <-releasePublish }
+
+	released := make(chan struct{})
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, "s", session, &session.terminalPublishState,
+		publishFn, resultMsg{SessionID: "s", Type: "codex_appserver_ended"},
+		func() {
+			m.removeSessionIfSame("s", session)
+			close(released)
+		}) {
+		t.Fatalf("terminal frame must publish while the ID is still this session's")
+	}
+
+	// While the frame is in flight the ID is NOT free — a removal must not
+	// hand it to a replacement Start.
+	if !session.terminalPublishInFlight() {
+		t.Fatalf("the publish reservation must be taken before the launch returns")
+	}
+	if m.removeSessionIfSame("s", session) {
+		t.Fatalf("removeSessionIfSame freed an ID whose terminal frame is still in flight")
+	}
+	if m.Get("s") != session {
+		t.Fatalf("session must be retained until its terminal frame is delivered")
+	}
+
+	// Delivery completes → the publisher releases the ID.
+	close(releasePublish)
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("publisher never released the session after delivery")
+	}
+	if m.Get("s") != nil {
+		t.Fatalf("session should be removed once its terminal frame was delivered")
+	}
+}
+
+// An End that resolves a tombstone while the terminal frame is still in flight
+// must not answer absence — the ID is not free, so the server would release
+// the fence for an ID a frame is still travelling under.
+func TestEnd_WithholdsAbsenceWhileTerminalFrameInFlight(t *testing.T) {
+	stubProbe(t, true)
+	m := NewCodexAppServerManager(nil)
+	session := &CodexAppServerSession{
+		ID:              "s",
+		StartedAt:       time.Now(),
+		status:          "running",
+		killUnconfirmed: true,
+		done:            make(chan struct{}),
+		Process:         exitedTestProcess(t),
+	}
+	session.publishInFlight.Store(true)
+	m.sessions["s"] = session
+
+	err := m.End("s")
+	if err == nil || strings.Contains(err.Error(), "not found") {
+		t.Fatalf("absence answered while a terminal frame is in flight: %v", err)
+	}
+	if !errorsIs(err, errEndUnconfirmed) {
+		t.Fatalf("expected the unconfirmed sentinel so the handler withholds ended, got %v", err)
+	}
+	if m.Get("s") != session {
+		t.Fatalf("session must be retained while its terminal frame is in flight")
+	}
+}
+
+// The turn managers publish their terminal frame from the END HANDLER, not
+// from a watcher, so their protection is the End RESULT: an End whose session
+// was replaced under it must report staleness rather than success, or the
+// handler publishes *_ended under the replacement's ID (Codex P2, round 4).
+// The barrier is the injection point — it is exactly where the real End sits
+// while the concurrent End + replacement Start land.
+func TestTurnManagerEnd_ReportsStaleWhenSessionReplaced(t *testing.T) {
+	t.Run("antigravity", func(t *testing.T) {
+		m := NewAntigravityNativeManager(nil)
+		old := &AntigravityNativeSession{ID: "s", StartedAt: time.Now(), status: "ended"}
+		replacement := &AntigravityNativeSession{ID: "s", StartedAt: time.Now(), status: "running"}
+		m.sessions["s"] = old
+
+		unlockTurn := lockTurn(&old.turnMu)
+		resultCh := make(chan error, 1)
+		go func() { resultCh <- m.End("s") }()
+
+		// End has captured `old` and is parked on the barrier; swap the ID to a
+		// replacement underneath it, then let the turn drain.
+		time.Sleep(100 * time.Millisecond)
+		m.mu.Lock()
+		m.sessions["s"] = replacement
+		m.mu.Unlock()
+		unlockTurn()
+
+		var err error
+		select {
+		case err = <-resultCh:
+		case <-time.After(30 * time.Second):
+			t.Fatalf("End never returned")
+		}
+		if !errorsIs(err, errEndStaleSession) {
+			t.Fatalf("expected the stale sentinel, got %v", err)
+		}
+		if m.Get("s") != replacement {
+			t.Fatalf("the replacement session must survive a stale End")
+		}
+	})
+
+	t.Run("opencode", func(t *testing.T) {
+		m := NewOpenCodeNativeManager()
+		old := &OpenCodeNativeSession{ID: "s", StartedAt: time.Now(), status: "ended"}
+		replacement := &OpenCodeNativeSession{ID: "s", StartedAt: time.Now(), status: "running"}
+		m.sessions["s"] = old
+
+		unlockTurn := lockTurn(&old.turnMu)
+		resultCh := make(chan error, 1)
+		go func() { resultCh <- m.End("s") }()
+
+		time.Sleep(100 * time.Millisecond)
+		m.mu.Lock()
+		m.sessions["s"] = replacement
+		m.mu.Unlock()
+		unlockTurn()
+
+		var err error
+		select {
+		case err = <-resultCh:
+		case <-time.After(30 * time.Second):
+			t.Fatalf("End never returned")
+		}
+		if !errorsIs(err, errEndStaleSession) {
+			t.Fatalf("expected the stale sentinel, got %v", err)
+		}
+		if m.Get("s") != replacement {
+			t.Fatalf("the replacement session must survive a stale End")
+		}
+	})
+}
+
+// The bounded collector must CANCEL the work it stops waiting for, so an
+// upload that would otherwise finish after the deadline never writes objects
+// the ended frame cannot reference (Codex P2, round 4).
+func TestBoundedArtifactCollect_CancelsAbandonedWork(t *testing.T) {
+	cancelled := make(chan struct{})
+	_, _, timedOut := boundedArtifactCollect(func(ctx context.Context) ([]FileInfo, []UploadError) {
+		<-ctx.Done()
+		close(cancelled)
+		return nil, nil
+	}, 50*time.Millisecond, "s-cancel")
+	if !timedOut {
+		t.Fatalf("expected the collect to time out")
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("abandoned collect was never cancelled")
 	}
 }
