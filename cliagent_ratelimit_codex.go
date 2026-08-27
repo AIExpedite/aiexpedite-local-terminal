@@ -2698,9 +2698,11 @@ func codexRolloutFutureCohortReserve(anchor time.Time, floorNs, ceilingNs int64)
 // and each group still finishes in bounded deterministic batches.
 // When retryEntries fill the ordinary selection, one slot is reserved for the
 // newest non-retry candidate so persistent failures cannot pin an older backlog.
-// When the remaining cohort is retry-only and larger than the cap, a matching
-// retry cursor rotates past the previous batch so a recovered older failure is
-// reopened instead of reselecting the same newest identities forever.
+// When the retry cohort is larger than the slots left for it, a matching retry
+// cursor rotates the retry subset past the previous batch so a recovered older
+// failure is reopened instead of reselecting the same newest identities forever.
+// The rotation covers mixed batches too — fresh files keep their slots, but they
+// no longer suppress rotation through the retries sharing the batch.
 func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexRolloutCandidate, now time.Time, capacity int, reserves []codexRolloutReserve, retryEntries map[string]struct{}, retryCursor, retryFingerprint string) ([]codexRolloutCandidate, bool) {
 	if capacity <= 0 {
 		return nil, true
@@ -2782,11 +2784,11 @@ func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexR
 			selected = codexInsertNewestRolloutCandidate(selected, newestNonRetry, now, capacity)
 		}
 	}
-	if !haveNonRetry && len(candidates) > capacity &&
+	if len(candidates) > capacity &&
 		retryCursor != "" && retryFingerprint != "" &&
 		codexRolloutRetryFingerprint(retryEntries) == retryFingerprint {
 		if cutoff, ok := codexRolloutCandidateByDigest(candidates, retryCursor); ok {
-			selected = codexRotateRetryOnlyRolloutCandidates(candidates, cutoff, now, capacity)
+			selected = codexRotateRetryRolloutCandidates(selected, candidates, cutoff, retryEntries, now, capacity)
 		}
 	}
 	return selected, true
@@ -2801,24 +2803,52 @@ func codexRolloutCandidateByDigest(candidates []codexRolloutCandidate, digest st
 	return codexRolloutCandidate{}, false
 }
 
-func codexRotateRetryOnlyRolloutCandidates(candidates []codexRolloutCandidate, cutoff codexRolloutCandidate, now time.Time, capacity int) []codexRolloutCandidate {
-	after := make([]codexRolloutCandidate, 0, capacity+1)
-	wrap := make([]codexRolloutCandidate, 0, capacity+1)
-	for _, candidate := range candidates {
-		if codexRolloutCandidateBefore(cutoff, candidate, now) {
-			after = codexInsertNewestRolloutCandidate(after, candidate, now, capacity)
+// codexRotateRetryRolloutCandidates refills the retry slots of an ordinary
+// selection from the retry cohort ranked after `cutoff`, wrapping back to the
+// newest retries once that tail is exhausted.
+//
+// Non-retry members keep their slots: fresh evidence and the newest-non-retry
+// reserve are not part of the retry rotation, and a batch that mixes both must
+// still rotate its retry subset. Otherwise a steady trickle of fresh rollouts —
+// one new session log per refresh, alongside a retry cohort larger than the
+// remaining slots — would reselect the same highest-ranked retries forever and a
+// recovered lower-ranked one would never be reopened.
+func codexRotateRetryRolloutCandidates(selected, candidates []codexRolloutCandidate, cutoff codexRolloutCandidate, retryEntries map[string]struct{}, now time.Time, capacity int) []codexRolloutCandidate {
+	kept := make([]codexRolloutCandidate, 0, capacity+1)
+	retrySlots := 0
+	for _, candidate := range selected {
+		if _, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]; retry {
+			retrySlots++
 			continue
 		}
-		wrap = codexInsertNewestRolloutCandidate(wrap, candidate, now, capacity)
+		kept = append(kept, candidate)
 	}
-	selected := after
+	if retrySlots == 0 {
+		return selected
+	}
+	after := make([]codexRolloutCandidate, 0, retrySlots+1)
+	wrap := make([]codexRolloutCandidate, 0, retrySlots+1)
+	for _, candidate := range candidates {
+		if _, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]; !retry {
+			continue
+		}
+		if codexRolloutCandidateBefore(cutoff, candidate, now) {
+			after = codexInsertNewestRolloutCandidate(after, candidate, now, retrySlots)
+			continue
+		}
+		wrap = codexInsertNewestRolloutCandidate(wrap, candidate, now, retrySlots)
+	}
+	rotated := after
 	for _, candidate := range wrap {
-		if len(selected) == capacity {
+		if len(rotated) == retrySlots {
 			break
 		}
-		selected = codexInsertNewestRolloutCandidate(selected, candidate, now, capacity)
+		rotated = codexInsertNewestRolloutCandidate(rotated, candidate, now, retrySlots)
 	}
-	return selected
+	for _, candidate := range rotated {
+		kept = codexInsertNewestRolloutCandidate(kept, candidate, now, capacity)
+	}
+	return kept
 }
 
 func codexRolloutRetryRotationProgress(eligible, attempted []codexRolloutCandidate, retryEntries map[string]struct{}) (string, string) {
@@ -2826,12 +2856,22 @@ func codexRolloutRetryRotationProgress(eligible, attempted []codexRolloutCandida
 		return "", ""
 	}
 	attemptedIDs := make(map[string]struct{}, len(attempted))
+	// `attempted` is in rollout rank order, so the last still-retryable member is
+	// the lowest-ranked retry this pass opened — where the next batch resumes.
+	// Non-retry members (fresh evidence, the newest-non-retry reserve) and retries
+	// this pass recovered are skipped rather than voiding the rotation: a batch
+	// that mixes fresh work with an overflowing retry cohort still has to record
+	// how far through that cohort it got.
+	cursor := ""
 	for _, candidate := range attempted {
 		digest := codexRolloutBacklogEntryDigest(candidate)
-		if _, retry := retryEntries[digest]; !retry {
-			return "", ""
-		}
 		attemptedIDs[digest] = struct{}{}
+		if _, retry := retryEntries[digest]; retry {
+			cursor = digest
+		}
+	}
+	if cursor == "" {
+		return "", ""
 	}
 	omitted := false
 	for _, candidate := range eligible {
@@ -2847,7 +2887,7 @@ func codexRolloutRetryRotationProgress(eligible, attempted []codexRolloutCandida
 	if !omitted {
 		return "", ""
 	}
-	return codexRolloutRetryFingerprint(retryEntries), codexRolloutBacklogEntryDigest(attempted[len(attempted)-1])
+	return codexRolloutRetryFingerprint(retryEntries), cursor
 }
 
 func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor codexRolloutScanCursor, now time.Time) []codexRolloutCandidate {

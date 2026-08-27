@@ -4111,6 +4111,83 @@ func TestCodexSelectNewestRolloutCandidates_RotatesRetryOnlyOverflow(t *testing.
 	}
 }
 
+func TestCodexSelectNewestRolloutCandidates_RotatesRetriesSharingBatchWithFreshFile(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	capacity := 3
+	retries := map[string]struct{}{}
+	backlog := make([]codexRolloutCandidate, 0, capacity+1)
+	for i := range capacity + 1 {
+		candidate := codexRolloutCandidate{
+			path:       fmt.Sprintf("retry-%02d", i),
+			boundaryID: fmt.Sprintf("retry-%02d.jsonl", i),
+			mtime:      now.Add(-time.Duration(capacity+1-i) * time.Minute),
+		}
+		backlog = append(backlog, candidate)
+		retries[codexRolloutBacklogEntryDigest(candidate)] = struct{}{}
+	}
+	// Each refresh discovers one brand-new session log alongside the unchanged
+	// retry cohort — the mixed batch the retry-only rotation used to skip.
+	freshFor := func(pass int) codexRolloutCandidate {
+		return codexRolloutCandidate{
+			path:       fmt.Sprintf("fresh-%02d", pass),
+			boundaryID: fmt.Sprintf("fresh-%02d.jsonl", pass),
+			mtime:      now,
+		}
+	}
+	candidatesFor := func(pass int) []codexRolloutCandidate {
+		return append([]codexRolloutCandidate{freshFor(pass)}, backlog...)
+	}
+
+	first := candidatesFor(1)
+	selected, complete := codexSelectNewestRolloutCandidates(
+		context.Background(), first, now, capacity, nil, retries, "", "",
+	)
+	if !complete || len(selected) != capacity {
+		t.Fatalf("complete=%v selected=%d, want a first mixed batch of %d", complete, len(selected), capacity)
+	}
+	if selected[0].path != freshFor(1).path {
+		t.Fatalf("first batch=%v, want the fresh rollout ranked first", rolloutCandidatePaths(selected))
+	}
+
+	fingerprint, cursor := codexRolloutRetryRotationProgress(first, selected, retries)
+	if fingerprint == "" || !codexRolloutRetryEntryValid(cursor) {
+		t.Fatalf("fingerprint=%q cursor=%q, want rotation progress recorded for a batch that also opened fresh work",
+			fingerprint, cursor)
+	}
+
+	second := candidatesFor(2)
+	rotated, complete := codexSelectNewestRolloutCandidates(
+		context.Background(), second, now, capacity, nil, retries, cursor, fingerprint,
+	)
+	if !complete || len(rotated) != capacity {
+		t.Fatalf("complete=%v selected=%d, want a rotated mixed batch of %d", complete, len(rotated), capacity)
+	}
+	got := rolloutCandidatePaths(rotated)
+	if rotated[0].path != freshFor(2).path {
+		t.Fatalf("rotated batch=%v, want the new fresh rollout kept in its slot", got)
+	}
+	for _, want := range []string{backlog[0].path, backlog[1].path} {
+		found := false
+		for _, candidate := range rotated {
+			if candidate.path == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("rotated batch=%v, want lower-ranked retry %q reopened past the cursor", got, want)
+		}
+	}
+}
+
+func rolloutCandidatePaths(candidates []codexRolloutCandidate) []string {
+	paths := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		paths = append(paths, candidate.path)
+	}
+	return paths
+}
+
 func TestCodexRolloutFallbackBuckets_ExhaustedBudgetDoesNotAdvanceHighWater(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "sessions", "2026", "08", "26")
