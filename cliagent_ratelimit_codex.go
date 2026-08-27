@@ -150,9 +150,12 @@ type codexRateLimitSnapshot struct {
 	RolloutHighWaterBoundaryCursor string `json:"rolloutHighWaterBoundaryCursor,omitempty"`
 	// A capped newest-first pass can leave older, distinct-mtime candidates above
 	// the completed high-water. Track the redacted cohort and last opened rank so
-	// later refreshes consume the rest before the main watermark advances.
+	// later refreshes consume the rest before the main watermark advances. The
+	// cohort ceiling lets an already-consumed active rollout become eligible again
+	// when an append advances its mtime, without restarting the older backlog.
 	RolloutBacklogFingerprint string `json:"rolloutBacklogFingerprint,omitempty"`
 	RolloutBacklogCursor      string `json:"rolloutBacklogCursor,omitempty"`
+	RolloutBacklogMtimeNs     int64  `json:"rolloutBacklogMtimeNs,omitempty"`
 	// Future-dated rollout mtimes are invalid normal progress: advancing the main
 	// watermark to them could hide normally timestamped files written after a
 	// clock rollback. Track their redacted membership and capped-batch position
@@ -1320,6 +1323,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutHighWaterBoundaryCursor = ""
 		snap.RolloutBacklogFingerprint = ""
 		snap.RolloutBacklogCursor = ""
+		snap.RolloutBacklogMtimeNs = 0
 		snap.RolloutFutureMtimeAnchorNs = 0
 		snap.RolloutFutureMtimeFingerprint = ""
 		snap.RolloutFutureMtimeCursor = ""
@@ -1472,6 +1476,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutHighWaterBoundaryCursor = ""
 		snap.RolloutBacklogFingerprint = ""
 		snap.RolloutBacklogCursor = ""
+		snap.RolloutBacklogMtimeNs = 0
 		snap.RolloutFutureMtimeAnchorNs = 0
 		snap.RolloutFutureMtimeFingerprint = ""
 		snap.RolloutFutureMtimeCursor = ""
@@ -1487,6 +1492,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutHighWaterBoundaryCursor = rolloutHighWater.boundaryCursor
 		snap.RolloutBacklogFingerprint = rolloutHighWater.backlogFingerprint
 		snap.RolloutBacklogCursor = rolloutHighWater.backlogCursor
+		snap.RolloutBacklogMtimeNs = rolloutHighWater.backlogMtimeNs
 		snap.RolloutFutureMtimeAnchorNs = rolloutHighWater.futureAnchorNs
 		snap.RolloutFutureMtimeFingerprint = rolloutHighWater.futureFingerprint
 		snap.RolloutFutureMtimeCursor = rolloutHighWater.futureCursor
@@ -1692,6 +1698,7 @@ type codexRolloutScanCursor struct {
 	boundaryCursor      string
 	backlogFingerprint  string
 	backlogCursor       string
+	backlogMtimeNs      int64
 	futureFingerprint   string
 	futureCursor        string
 	futureComplete      bool
@@ -1704,6 +1711,7 @@ type codexRolloutScanProgress struct {
 	boundaryCursor      string
 	backlogFingerprint  string
 	backlogCursor       string
+	backlogMtimeNs      int64
 	futureFingerprint   string
 	futureCursor        string
 	futureComplete      bool
@@ -1764,6 +1772,7 @@ func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.
 			boundaryCursor:      snap.RolloutHighWaterBoundaryCursor,
 			backlogFingerprint:  snap.RolloutBacklogFingerprint,
 			backlogCursor:       snap.RolloutBacklogCursor,
+			backlogMtimeNs:      snap.RolloutBacklogMtimeNs,
 			futureAnchorNs:      snap.RolloutFutureMtimeAnchorNs,
 			futureFingerprint:   snap.RolloutFutureMtimeFingerprint,
 			futureCursor:        snap.RolloutFutureMtimeCursor,
@@ -1840,16 +1849,28 @@ func codexRolloutFutureEntryDigest(candidate codexRolloutCandidate) string {
 	return fmt.Sprintf("%x", sum[:])
 }
 
+func codexRolloutBacklogEntryDigest(candidate codexRolloutCandidate) string {
+	identity := candidate.boundaryID
+	if identity == "" {
+		identity = candidate.path
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("%x", sum[:])
+}
+
 func codexRolloutBacklogFingerprint(candidates []codexRolloutCandidate, cursorMtimeNs int64, now time.Time) string {
+	// Hash stable redacted identities rather than mutable size/mtime state. An
+	// append to a consumed active rollout must not discard progress through the
+	// older tail; the separately persisted cohort ceiling re-offers that active
+	// rollout when its mtime advances. Membership changes still restart safely.
 	// Complete discovery walks the sorted date layout deterministically, so hash
-	// that order directly. This keeps a large backlog fingerprint O(n) and avoids
-	// an uncancellable full-cohort sort after bounded newest-candidate selection.
+	// that order directly and avoid an uncancellable full-cohort sort.
 	hash := sha256.New()
 	count := 0
 	for _, candidate := range candidates {
 		mtimeNs := candidate.mtime.UnixNano()
 		if mtimeNs > cursorMtimeNs && !candidate.mtime.After(now) {
-			_, _ = hash.Write([]byte(codexRolloutFutureEntryDigest(candidate)))
+			_, _ = hash.Write([]byte(codexRolloutBacklogEntryDigest(candidate)))
 			_, _ = hash.Write([]byte{'\n'})
 			count++
 		}
@@ -2323,14 +2344,14 @@ func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor
 		}
 	}
 
-	backlogMatches := cursor.backlogCursor != "" &&
+	backlogMatches := cursor.backlogCursor != "" && cursor.backlogMtimeNs > cursor.mtimeNs &&
 		codexRolloutBacklogFingerprint(candidates, cursor.mtimeNs, now) == cursor.backlogFingerprint
 	var backlogCutoff codexRolloutCandidate
 	backlogFound := false
 	if backlogMatches {
 		for _, candidate := range candidates {
 			if candidate.mtime.UnixNano() > cursor.mtimeNs && !candidate.mtime.After(now) &&
-				codexRolloutFutureEntryDigest(candidate) == cursor.backlogCursor {
+				codexRolloutBacklogEntryDigest(candidate) == cursor.backlogCursor {
 				backlogCutoff, backlogFound = candidate, true
 				break
 			}
@@ -2353,7 +2374,8 @@ func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor
 
 	eligible := make([]codexRolloutCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		if backlogFound && candidate.mtime.UnixNano() > cursor.mtimeNs && !candidate.mtime.After(now) &&
+		if backlogFound && candidate.mtime.UnixNano() > cursor.mtimeNs &&
+			candidate.mtime.UnixNano() <= cursor.backlogMtimeNs && !candidate.mtime.After(now) &&
 			!codexRolloutCandidateBefore(backlogCutoff, candidate, now) {
 			continue
 		}
@@ -2374,8 +2396,9 @@ func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor
 	return eligible
 }
 
-func codexRolloutBacklogProgress(candidates, eligible, selected []codexRolloutCandidate, now time.Time, cursor codexRolloutScanCursor) (string, string, bool) {
+func codexRolloutBacklogProgress(candidates, eligible, selected []codexRolloutCandidate, now time.Time, cursor codexRolloutScanCursor) (string, string, int64, bool) {
 	fingerprint := codexRolloutBacklogFingerprint(candidates, cursor.mtimeNs, now)
+	cohortMtimeNs := codexRolloutNewestNormalMtimeNs(candidates, cursor.mtimeNs, now)
 	selectedNormal := make(map[string]struct{}, len(selected))
 	var lastSelected codexRolloutCandidate
 	haveLast := false
@@ -2404,12 +2427,12 @@ func codexRolloutBacklogProgress(candidates, eligible, selected []codexRolloutCa
 				continue
 			}
 			if haveLast {
-				return fingerprint, codexRolloutFutureEntryDigest(lastSelected), false
+				return fingerprint, codexRolloutBacklogEntryDigest(lastSelected), cohortMtimeNs, false
 			}
-			return fingerprint, cursor.backlogCursor, false
+			return fingerprint, cursor.backlogCursor, cohortMtimeNs, false
 		}
 	}
-	return "", "", true
+	return "", "", 0, true
 }
 
 func codexRolloutNewestNormalMtimeNs(candidates []codexRolloutCandidate, cursorMtimeNs int64, now time.Time) int64 {
@@ -2739,7 +2762,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	}
 	var highWater *codexRolloutScanProgress
 	if allHandled {
-		backlogFingerprint, backlogCursor, backlogComplete :=
+		backlogFingerprint, backlogCursor, backlogMtimeNs, backlogComplete :=
 			codexRolloutBacklogProgress(candidates, eligibleCandidates, selected, now, cursor)
 		if !backlogComplete {
 			// Keep the completed high-water below every member of this stable
@@ -2817,6 +2840,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		progress.futureAnchorNs = futureAnchorNs
 		progress.backlogFingerprint = backlogFingerprint
 		progress.backlogCursor = backlogCursor
+		progress.backlogMtimeNs = backlogMtimeNs
 		progress.futureFingerprint = futureFingerprint
 		progress.futureCursor = futureCursor
 		progress.futureComplete = futureComplete
