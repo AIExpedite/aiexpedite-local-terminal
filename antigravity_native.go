@@ -825,9 +825,15 @@ func (m *AntigravityNativeManager) End(id string) error {
 		// on the same barrier here so this duplicate End does not return — letting
 		// its handler publish antigravity_native_ended — before the running turn
 		// has emitted its final stderr/error frames. Returns immediately when no
-		// turn is active.
-		session.turnMu.Lock()
-		session.turnMu.Unlock() //nolint:staticcheck // intentional drain barrier, not a guarded region
+		// turn is active. BOUNDED — see end_confirm.go for why blocking here
+		// indefinitely wedged an entire device (2026-08-27).
+		if !waitTurnBarrier(&session.turnMu, turnDrainConfirmTimeout) {
+			fmt.Printf("%s[antigravity-native] Turn drain unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
+				colorRed, id, turnDrainConfirmTimeout, colorReset)
+			m.removeSession(id)
+			// Deliberately NOT "session <id> not found" — see end_confirm.go.
+			return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session deregistered", id, turnDrainConfirmTimeout)
+		}
 		m.removeSession(id)
 		return nil
 	}
@@ -851,9 +857,16 @@ func (m *AntigravityNativeManager) End(id string) error {
 	// orders that terminal frame last (no post-ended stderr on stop/cancel),
 	// matching Claude/Codex/Grok which wait on process/stream completion before
 	// emitting ended. Returns immediately when no turn is active, and the
-	// cancel/kill above guarantees the running turn unwinds promptly.
-	session.turnMu.Lock()
-	session.turnMu.Unlock() //nolint:staticcheck // intentional drain barrier, not a guarded region
+	// cancel/kill above guarantees the running turn unwinds promptly. BOUNDED —
+	// see end_confirm.go for why blocking here indefinitely wedged an entire
+	// device (2026-08-27).
+	if !waitTurnBarrier(&session.turnMu, turnDrainConfirmTimeout) {
+		fmt.Printf("%s[antigravity-native] Turn drain unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
+			colorRed, id, turnDrainConfirmTimeout, colorReset)
+		m.removeSession(id)
+		// Deliberately NOT "session <id> not found" — see end_confirm.go.
+		return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session deregistered", id, turnDrainConfirmTimeout)
+	}
 
 	m.removeSession(id)
 	fmt.Printf("%s[antigravity-native] Session %s ended%s\n", colorYellow, id, colorReset)

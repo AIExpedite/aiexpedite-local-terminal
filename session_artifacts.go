@@ -8,6 +8,61 @@ import (
 	"time"
 )
 
+// sessionArtifactCollectTimeout bounds collectSessionArtifactsBounded. Every
+// resident manager's waitForExit collects artifacts BEFORE publishing its
+// `*_ended` frame and BEFORE closing session.done — so a scan/upload that
+// hangs (a stalled GCS upload, an unreachable network share in the workdir)
+// silently suppresses the ended frame terminal-service is waiting for, and
+// leaves End() callers blocked on session.done. That is one of the two wedge
+// shapes behind the 2026-08-27 HOMETHEATRE device outage (see end_confirm.go
+// for the other). Two minutes is generous for legitimate video uploads while
+// still guaranteeing the ended frame is published the same order of magnitude
+// as the server's 5-minute reaper cadence. Declared as a var so tests can
+// shorten it.
+var sessionArtifactCollectTimeout = 2 * time.Minute
+
+// collectSessionArtifactsBounded runs collectSessionArtifacts with a hard
+// deadline. On expiry it returns (nil, nil, true) and abandons the scan
+// goroutine — the scan holds no locks and its uploads are best-effort, so an
+// abandoned one can only waste its own network round-trips. The `*_ended`
+// frame then ships without file metadata, which is strictly better than never
+// shipping at all.
+func collectSessionArtifactsBounded(
+	cfg *Config,
+	sessionID string,
+	workspaceID string,
+	workDir string,
+	startedAt time.Time,
+	timeout time.Duration,
+) ([]FileInfo, []UploadError, bool) {
+	return boundedArtifactCollect(func() ([]FileInfo, []UploadError) {
+		return collectSessionArtifacts(cfg, sessionID, workspaceID, workDir, startedAt)
+	}, timeout, sessionID)
+}
+
+// boundedArtifactCollect is the deadline mechanism behind
+// collectSessionArtifactsBounded, split out so tests can exercise the timeout
+// branch with a blocking collector.
+func boundedArtifactCollect(collect func() ([]FileInfo, []UploadError), timeout time.Duration, sessionID string) ([]FileInfo, []UploadError, bool) {
+	type artifactResult struct {
+		files []FileInfo
+		errs  []UploadError
+	}
+	resultCh := make(chan artifactResult, 1)
+	go func() {
+		files, errs := collect()
+		resultCh <- artifactResult{files: files, errs: errs}
+	}()
+	select {
+	case r := <-resultCh:
+		return r.files, r.errs, false
+	case <-time.After(timeout):
+		fmt.Printf("%s[session-file-upload] Artifact collection timed out after %s for session %s — publishing ended without file metadata%s\n",
+			colorRed, timeout, sessionID, colorReset)
+		return nil, nil, true
+	}
+}
+
 // collectSessionArtifacts scans a finished CLI session's working directory for
 // media the session produced and uploads it to GCS, returning the metadata the
 // `*_ended` frame carries back to terminal-service.

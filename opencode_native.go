@@ -999,9 +999,16 @@ func (m *OpenCodeNativeManager) End(id string) error {
 		// "ended" but still be draining the in-flight Send on turnMu below.
 		// Block on the same barrier so this duplicate End does not return —
 		// letting its handler publish opencode_native_ended — before the running
-		// turn has emitted its final stderr/error frames.
-		session.turnMu.Lock()
-		session.turnMu.Unlock() //nolint:staticcheck // intentional drain barrier, not a guarded region
+		// turn has emitted its final stderr/error frames. BOUNDED — see
+		// end_confirm.go for why blocking here indefinitely wedged an entire
+		// device (2026-08-27).
+		if !waitTurnBarrier(&session.turnMu, turnDrainConfirmTimeout) {
+			fmt.Printf("%s[opencode-native] Turn drain unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
+				colorRed, id, turnDrainConfirmTimeout, colorReset)
+			m.removeSession(id)
+			// Deliberately NOT "session <id> not found" — see end_confirm.go.
+			return fmt.Errorf("opencode native session %s turn drain unconfirmed after %s; session deregistered", id, turnDrainConfirmTimeout)
+		}
 		m.removeSession(id)
 		return nil
 	}
@@ -1021,9 +1028,15 @@ func (m *OpenCodeNativeManager) End(id string) error {
 	// Wait for any in-flight Send to fully drain before returning, so the
 	// terminal opencode_native_ended frame the handler publishes after End
 	// returns is ordered last (no post-ended stderr on stop/cancel). Returns
-	// immediately when no turn is active.
-	session.turnMu.Lock()
-	session.turnMu.Unlock() //nolint:staticcheck // intentional drain barrier, not a guarded region
+	// immediately when no turn is active. BOUNDED — see end_confirm.go for
+	// why blocking here indefinitely wedged an entire device (2026-08-27).
+	if !waitTurnBarrier(&session.turnMu, turnDrainConfirmTimeout) {
+		fmt.Printf("%s[opencode-native] Turn drain unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
+			colorRed, id, turnDrainConfirmTimeout, colorReset)
+		m.removeSession(id)
+		// Deliberately NOT "session <id> not found" — see end_confirm.go.
+		return fmt.Errorf("opencode native session %s turn drain unconfirmed after %s; session deregistered", id, turnDrainConfirmTimeout)
+	}
 
 	m.removeSession(id)
 	fmt.Printf("%s[opencode-native] Session %s ended%s\n", colorYellow, id, colorReset)

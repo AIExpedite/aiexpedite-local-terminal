@@ -588,8 +588,20 @@ func (sm *SessionManager) EndSession(id string) error {
 		// Force kill after timeout
 		fmt.Printf("%s[session] Force killing session %s (graceful shutdown timed out)%s\n",
 			colorRed, id, colorReset)
-		_ = session.Process.Process.Kill()
-		<-session.done // Wait for exit after kill
+		if killErr := session.Process.Process.Kill(); killErr != nil {
+			fmt.Printf("%s[session] Kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
+		}
+		// BOUNDED wait for exit after kill — see end_confirm.go for why
+		// blocking here indefinitely wedged an entire device (2026-08-27).
+		if !waitDoneConfirm(session.done, killConfirmTimeout) {
+			fmt.Printf("%s[session] Kill unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
+				colorRed, id, killConfirmTimeout, colorReset)
+			sm.removeSession(id)
+			// Deliberately NOT "session <id> not found": the process may
+			// still be alive, and the server must keep the device fenced
+			// until absence is actually reported by a follow-up end.
+			return fmt.Errorf("session %s kill unconfirmed after %s; session deregistered", id, killConfirmTimeout)
+		}
 	}
 
 	sm.removeSession(id)
@@ -1359,12 +1371,15 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// Shared with every bundled-CLI manager (see session_artifacts.go): the
 	// scan used to live inline here, which is why only this PTY path ever
 	// uploaded anything.
-	uploadedFiles, uploadErrors := collectSessionArtifacts(
+	// BOUNDED: a hung scan/upload here would suppress the session_ended frame
+	// terminal-service is waiting for (see sessionArtifactCollectTimeout).
+	uploadedFiles, uploadErrors, _ := collectSessionArtifactsBounded(
 		sm.Config,
 		session.ID,
 		session.WorkspaceID,
 		session.Process.Dir,
 		session.StartedAt,
+		sessionArtifactCollectTimeout,
 	)
 
 	// Publish session_ended in a goroutine: publishFn blocks up to 30 s on

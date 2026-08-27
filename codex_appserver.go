@@ -411,9 +411,22 @@ func (m *CodexAppServerManager) End(id string) error {
 			fmt.Printf("%s[codex-appserver] Force killing session %s%s\n",
 				colorRed, id, colorReset)
 			if session.Process.Process != nil {
-				_ = session.Process.Process.Kill()
+				if killErr := session.Process.Process.Kill(); killErr != nil {
+					fmt.Printf("%s[codex-appserver] Kill failed for %s: %v%s\n",
+						colorRed, id, killErr, colorReset)
+				}
 			}
-			<-session.done
+			// BOUNDED wait — see end_confirm.go for why blocking here
+			// indefinitely wedged an entire device (2026-08-27).
+			if !waitDoneConfirm(session.done, killConfirmTimeout) {
+				fmt.Printf("%s[codex-appserver] Kill unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
+					colorRed, id, killConfirmTimeout, colorReset)
+				m.removeSession(id)
+				// Deliberately NOT "session <id> not found": the process may
+				// still be alive, and the server must keep the device fenced
+				// until absence is actually reported by a follow-up end.
+				return fmt.Errorf("codex app-server session %s kill unconfirmed after %s; session deregistered", id, killConfirmTimeout)
+			}
 		}
 	}
 
@@ -822,12 +835,16 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	// does on the PTY path's session_ended. Skipping this is what made every
 	// capture run through a bundled CLI report NO_MEDIA_UPLOADED while the
 	// recording sat on the device (prod 2026-08-20, video project vp_a72774c5).
-	uploadedFiles, uploadErrors := collectSessionArtifacts(
+	// BOUNDED: a hung scan/upload here used to suppress the ended frame and
+	// hold session.done forever — one of the two wedge shapes behind the
+	// 2026-08-27 device outage (see sessionArtifactCollectTimeout).
+	uploadedFiles, uploadErrors, _ := collectSessionArtifactsBounded(
 		m.Config,
 		session.ID,
 		session.WorkspaceID,
 		session.Process.Dir,
 		session.StartedAt,
+		sessionArtifactCollectTimeout,
 	)
 
 	seq := atomic.AddInt64(&session.seq, 1)
