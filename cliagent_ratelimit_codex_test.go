@@ -2856,6 +2856,36 @@ func TestCodexReadDirContext_CancelsWhileAnotherReadOwnsDirectory(t *testing.T) 
 	}
 }
 
+func TestCodexReadDirContext_ReusesCompletedListingForQueuedReader(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "rollout.jsonl"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &codexReadDirResumeState{
+		entries:  entries,
+		complete: true,
+		gate:     make(chan struct{}, 1),
+		usedAt:   time.Now(),
+	}
+	state.gate <- struct{}{}
+	codexReadDirResumeMu.Lock()
+	codexReadDirResumes[dir] = state
+	codexReadDirResumeMu.Unlock()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+
+	got, err := codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name() != "rollout.jsonl" {
+		t.Fatalf("completed listing = %v, want one rollout entry", got)
+	}
+}
+
 func TestCodexReadDirResume_EvictsAbandonedStreams(t *testing.T) {
 	dirs := make([]string, 0, codexReadDirResumeLimit+1)
 	for i := 0; i <= codexReadDirResumeLimit; i++ {

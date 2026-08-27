@@ -1687,11 +1687,12 @@ func codexRolloutBoundaryFingerprint(candidates []codexRolloutCandidate, mtimeNs
 }
 
 type codexReadDirResumeState struct {
-	f       *os.File
-	entries []os.DirEntry
-	gate    chan struct{}
-	refs    int
-	usedAt  time.Time
+	f        *os.File
+	entries  []os.DirEntry
+	complete bool
+	gate     chan struct{}
+	refs     int
+	usedAt   time.Time
 }
 
 const codexReadDirResumeLimit = 16
@@ -1743,6 +1744,13 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error)
 		state.gate <- struct{}{}
 		codexReadDirResumeRelease(dir, state, remove)
 	}()
+	// A reader that reached EOF can remain in the map while callers that were
+	// already queued still hold references to it. Reuse its complete listing;
+	// reopening here would append every directory entry a second time.
+	if state.complete {
+		remove = true
+		return append([]os.DirEntry(nil), state.entries...), nil
+	}
 	if state.f == nil {
 		f, err := os.Open(dir)
 		if err != nil {
@@ -1766,6 +1774,7 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error)
 		if readErr == io.EOF {
 			_ = state.f.Close()
 			state.f = nil
+			state.complete = true
 			remove = true
 			break
 		}
