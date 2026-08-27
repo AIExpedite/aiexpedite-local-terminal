@@ -3736,3 +3736,47 @@ func TestCodexRolloutFallbackBuckets_ExhaustedBudgetDoesNotAdvanceHighWater(t *t
 		t.Fatalf("highWater=%+v, want the unread rollout left eligible for retry", highWater)
 	}
 }
+
+func TestCodexRolloutFallbackBuckets_OverCapMtimeBoundaryStaysDiscoverable(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Every rollout shares one mtime, as a coarse-resolution filesystem or a
+	// timestamp-preserving batch restore produces, and there are more of them
+	// than a single pass will open.
+	shared := time.Date(2026, 8, 26, 14, 30, 0, 0, time.UTC)
+	total := codexRolloutScanFileCap + 1
+	for i := range total {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%05d.jsonl", i))
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`, 20+i) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, shared, shared); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	_, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || highWater == nil {
+		t.Fatalf("ok=%v highWater=%+v, want numeric evidence and completed-scan progress", ok, highWater)
+	}
+	if highWater.mtimeNs != shared.UnixNano() {
+		t.Fatalf("highWater=%+v, want the shared boundary mtime", highWater)
+	}
+
+	// Re-running with the recorded cursor must still see the boundary as changed,
+	// or the file the cap left unread would be excluded forever.
+	cursor := codexRolloutScanCursor{mtimeNs: highWater.mtimeNs, boundaryFingerprint: highWater.boundaryFingerprint}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want an uninterrupted rediscovery")
+	}
+	if len(candidates) != total {
+		t.Fatalf("candidates=%d, want all %d boundary rollouts re-offered while one is still unread", len(candidates), total)
+	}
+}

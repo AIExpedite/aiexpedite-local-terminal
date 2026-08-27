@@ -2251,9 +2251,19 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		if nowNs := now.UnixNano(); maxSelectedMtimeNs > nowNs {
 			maxSelectedMtimeNs = now.Add(-codexRolloutCoarseMtimeOverlap).UnixNano()
 		}
+		// Fingerprint only the boundary files this pass actually consumed. More
+		// files than the cap can share the newest mtime (a coarse-resolution
+		// filesystem, or a batch restore that stamped them alike), and a
+		// fingerprint covering the unread ones would match on the next refresh —
+		// making discovery treat the boundary as unchanged and hide a rollout that
+		// was never opened, along with any distinct contributor only it carries.
+		// Fingerprinting the consumed subset keeps that boundary looking changed
+		// until every file at it has been read; in the ordinary case where the
+		// whole boundary fits under the cap the two are identical, so unchanged
+		// refreshes stay cache-only.
 		highWater = &codexRolloutScanProgress{
 			mtimeNs:             maxSelectedMtimeNs,
-			boundaryFingerprint: codexRolloutBoundaryFingerprint(candidates, maxSelectedMtimeNs),
+			boundaryFingerprint: codexRolloutBoundaryFingerprint(selected, maxSelectedMtimeNs),
 		}
 	}
 	if len(winners) == 0 {
