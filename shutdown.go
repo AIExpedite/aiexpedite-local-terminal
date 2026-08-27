@@ -59,6 +59,7 @@ func gracefulShutdown(ctx context.Context, cfg *Config) {
 	}
 
 	fmt.Println("[shutdown] Starting graceful shutdown sequence")
+	shutdownBrowserIdentityServer()
 
 	// Stop the updater before any teardown can make a draining device appear
 	// idle. Otherwise an explicit Quit/SIGTERM could launch a replacement and
