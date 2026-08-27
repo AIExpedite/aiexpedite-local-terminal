@@ -2776,7 +2776,7 @@ func TestCodexReadDirContext_ChecksCancellationBetweenChunks(t *testing.T) {
 	}
 
 	ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
-	entries, err := codexReadDirContext(ctx, dir)
+	entries, _, err := codexReadDirContext(ctx, dir)
 	if err != context.Canceled {
 		t.Fatalf("err=%v, want context cancellation between directory chunks", err)
 	}
@@ -2796,14 +2796,20 @@ func TestCodexReadDirContext_ResumesAfterCancellation(t *testing.T) {
 	}
 
 	ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
-	entries, err := codexReadDirContext(ctx, dir)
+	entries, resumed, err := codexReadDirContext(ctx, dir)
 	if err != context.Canceled || len(entries) != codexRolloutReadDirChunkSize {
 		t.Fatalf("first read entries=%d err=%v, want one chunk and cancellation", len(entries), err)
 	}
+	if resumed {
+		t.Fatal("first directory read unexpectedly reported a resumed stream")
+	}
 
-	entries, err = codexReadDirContext(context.Background(), dir)
+	entries, resumed, err = codexReadDirContext(context.Background(), dir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !resumed {
+		t.Fatal("second directory read did not report the resumed stream")
 	}
 	if len(entries) != codexRolloutReadDirChunkSize*2 {
 		t.Fatalf("resumed entries=%d, want complete %d-entry listing", len(entries), codexRolloutReadDirChunkSize*2)
@@ -2821,13 +2827,13 @@ func TestCodexReadDirContext_RepeatedCancellationReturnsOnlyNewEntries(t *testin
 	}
 
 	firstCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
-	first, err := codexReadDirContext(firstCtx, dir)
+	first, _, err := codexReadDirContext(firstCtx, dir)
 	if err != context.Canceled || len(first) != codexRolloutReadDirChunkSize {
 		t.Fatalf("first read entries=%d err=%v, want one chunk and cancellation", len(first), err)
 	}
 
 	secondCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
-	second, err := codexReadDirContext(secondCtx, dir)
+	second, _, err := codexReadDirContext(secondCtx, dir)
 	if err != context.Canceled || len(second) != codexRolloutReadDirChunkSize {
 		t.Fatalf("second read entries=%d err=%v, want only the newly completed chunk", len(second), err)
 	}
@@ -2851,7 +2857,7 @@ func TestCodexReadDirContext_CancelsWhileAnotherReadOwnsDirectory(t *testing.T) 
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
+	if _, _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
 		t.Fatalf("err=%v, want cancellation while waiting for the per-directory gate", err)
 	}
 }
@@ -2877,9 +2883,12 @@ func TestCodexReadDirContext_ReusesCompletedListingForQueuedReader(t *testing.T)
 	codexReadDirResumeMu.Unlock()
 	t.Cleanup(func() { codexCloseReadDirResume(dir) })
 
-	got, err := codexReadDirContext(context.Background(), dir)
+	got, resumed, err := codexReadDirContext(context.Background(), dir)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !resumed {
+		t.Fatal("queued reader did not report reused completed listing")
 	}
 	if len(got) != 1 || got[0].Name() != "rollout.jsonl" {
 		t.Fatalf("completed listing = %v, want one rollout entry", got)
@@ -2897,7 +2906,7 @@ func TestCodexReadDirResume_EvictsAbandonedStreams(t *testing.T) {
 			}
 		}
 		ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
-		if _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
+		if _, _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
 			t.Fatalf("read %d err=%v, want interrupted resumable stream", i, err)
 		}
 	}
@@ -2942,6 +2951,54 @@ func TestCodexDiscoverRolloutCandidates_PreservesPartialLeafDirectoryResults(t *
 	}
 	if len(candidates) != codexRolloutReadDirChunkSize {
 		t.Fatalf("candidates=%d, want preserved %d-entry chunk", len(candidates), codexRolloutReadDirChunkSize)
+	}
+}
+
+func TestCodexDiscoverRolloutCandidates_ResumedCompletionRequiresFreshPass(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < codexRolloutReadDirChunkSize*2; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Leave the leaf directory stream paused after its first complete chunk.
+	// A rollout created in that already-consumed portion is not guaranteed to
+	// appear when the same OS stream resumes and eventually reaches EOF.
+	ctx := &cancelAfterChecksContext{after: 15, done: make(chan struct{})}
+	if _, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{}); complete {
+		t.Fatal("initial discovery complete=true, want a resumable partial listing")
+	}
+	missedPath := filepath.Join(dir, "rollout-0000-concurrent.jsonl")
+	if err := os.WriteFile(missedPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Even if the resumed stream happens to observe the new entry on this
+	// filesystem, its accumulated listing is not a verified fresh snapshot and
+	// therefore cannot authorize high-water advancement.
+	if _, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{}); complete {
+		t.Fatal("resumed discovery complete=true, want cursor advancement deferred until a fresh pass")
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{})
+	if !complete {
+		t.Fatal("fresh discovery incomplete after resumed stream reached EOF")
+	}
+	found := false
+	for _, candidate := range candidates {
+		if candidate.path == missedPath {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("fresh candidates omitted rollout created during resumed enumeration: %q", missedPath)
 	}
 }
 

@@ -1722,7 +1722,7 @@ func codexCloseReadDirResume(dir string) {
 	}
 }
 
-func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error) {
+func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, bool, error) {
 	// Keep an interrupted directory stream open so the next bounded refresh
 	// resumes after the last complete chunk instead of repeatedly enumerating
 	// the same prefix. Serialize access because os.File's directory offset and
@@ -1741,9 +1741,15 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error)
 	select {
 	case <-ctx.Done():
 		codexReadDirResumeRelease(dir, state, false)
-		return nil, ctx.Err()
+		return nil, false, ctx.Err()
 	case <-state.gate:
 	}
+	// An open stream, accumulated entries, or a completed listing means this
+	// invocation did not enumerate the directory from a fresh snapshot. The
+	// caller may consume its entries, but must require one fresh pass before
+	// advancing filesystem progress: a file created in an already-consumed
+	// prefix is not guaranteed to appear when the stream later reaches EOF.
+	resumed := state.f != nil || len(state.entries) > 0 || state.complete
 	remove := false
 	defer func() {
 		state.gate <- struct{}{}
@@ -1754,13 +1760,13 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error)
 	// reopening here would append every directory entry a second time.
 	if state.complete {
 		remove = true
-		return append([]os.DirEntry(nil), state.entries...), nil
+		return append([]os.DirEntry(nil), state.entries...), true, nil
 	}
 	if state.f == nil {
 		f, err := os.Open(dir)
 		if err != nil {
 			remove = true
-			return nil, err
+			return nil, resumed, err
 		}
 		state.f = f
 	}
@@ -1772,7 +1778,7 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error)
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return append([]os.DirEntry(nil), state.entries[firstNew:]...), err
+			return append([]os.DirEntry(nil), state.entries[firstNew:]...), resumed, err
 		}
 		batch, readErr := state.f.ReadDir(codexRolloutReadDirChunkSize)
 		state.entries = append(state.entries, batch...)
@@ -1788,14 +1794,14 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error)
 			_ = state.f.Close()
 			state.f = nil
 			remove = true
-			return entries, readErr
+			return entries, resumed, readErr
 		}
 	}
 	entries := state.entries
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name() < entries[j].Name()
 	})
-	return entries, nil
+	return entries, resumed, nil
 }
 
 func codexReadDirResumeRelease(dir string, state *codexReadDirResumeState, remove bool) {
@@ -1846,7 +1852,15 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 			complete = false
 			return
 		}
-		entries, err := codexReadDirContext(ctx, dir)
+		entries, resumed, err := codexReadDirContext(ctx, dir)
+		if resumed {
+			// Resumed directory streams are intentionally retained across bounded
+			// refreshes, but reaching EOF does not prove the accumulated listing
+			// includes files created in a prefix consumed by an earlier refresh.
+			// Consume and persist the discovered evidence, then require one fresh
+			// full enumeration before advancing the completed-scan cursor.
+			complete = false
+		}
 		if err != nil {
 			if depth == 0 && os.IsNotExist(err) {
 				return
