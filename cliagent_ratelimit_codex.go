@@ -177,10 +177,19 @@ type codexRateLimitSnapshot struct {
 	// clock rollback. Track their redacted membership and capped-batch position
 	// separately so unchanged anomalous files are not reopened on every refresh.
 	// The anchor fixes the cohort definition across wall-clock catch-up while an
-	// unfinished capped batch is resumed.
+	// unfinished capped batch is resumed, and the floor/ceiling close it around the
+	// members that existed when the anchor was saved: an ordinary rollout written
+	// afterwards is also newer than the anchor, so without those bounds it joins
+	// the cohort, changes its fingerprint and discards a cursor whose capped scan
+	// never finished. RolloutFutureMtimeCohortSize records how many members the
+	// fingerprint covered so one leaving the bounds reads as a removal rather than
+	// a membership change.
 	RolloutFutureMtimeAnchorNs    int64  `json:"rolloutFutureMtimeAnchorNs,omitempty"`
+	RolloutFutureMtimeFloorNs     int64  `json:"rolloutFutureMtimeFloorNs,omitempty"`
+	RolloutFutureMtimeCeilingNs   int64  `json:"rolloutFutureMtimeCeilingNs,omitempty"`
 	RolloutFutureMtimeFingerprint string `json:"rolloutFutureMtimeFingerprint,omitempty"`
 	RolloutFutureMtimeCursor      string `json:"rolloutFutureMtimeCursor,omitempty"`
+	RolloutFutureMtimeCohortSize  int    `json:"rolloutFutureMtimeCohortSize,omitempty"`
 	RolloutFutureMtimeComplete    bool   `json:"rolloutFutureMtimeComplete,omitempty"`
 	// RolloutRootFingerprint scopes filesystem progress to the CODEX_HOME tree
 	// that produced it. It is a hash of the normalized root, never the raw path.
@@ -1346,8 +1355,11 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutRetryCursor = ""
 		snap.RolloutRetryFingerprint = ""
 		snap.RolloutFutureMtimeAnchorNs = 0
+		snap.RolloutFutureMtimeFloorNs = 0
+		snap.RolloutFutureMtimeCeilingNs = 0
 		snap.RolloutFutureMtimeFingerprint = ""
 		snap.RolloutFutureMtimeCursor = ""
+		snap.RolloutFutureMtimeCohortSize = 0
 		snap.RolloutFutureMtimeComplete = false
 		snap.RolloutRootFingerprint = ""
 	}
@@ -1503,8 +1515,11 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutRetryCursor = ""
 		snap.RolloutRetryFingerprint = ""
 		snap.RolloutFutureMtimeAnchorNs = 0
+		snap.RolloutFutureMtimeFloorNs = 0
+		snap.RolloutFutureMtimeCeilingNs = 0
 		snap.RolloutFutureMtimeFingerprint = ""
 		snap.RolloutFutureMtimeCursor = ""
+		snap.RolloutFutureMtimeCohortSize = 0
 		snap.RolloutFutureMtimeComplete = false
 		snap.RolloutRootFingerprint = rolloutRootFingerprint
 	}
@@ -1523,8 +1538,11 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutRetryCursor = rolloutHighWater.retryCursor
 		snap.RolloutRetryFingerprint = rolloutHighWater.retryFingerprint
 		snap.RolloutFutureMtimeAnchorNs = rolloutHighWater.futureAnchorNs
+		snap.RolloutFutureMtimeFloorNs = rolloutHighWater.futureFloorNs
+		snap.RolloutFutureMtimeCeilingNs = rolloutHighWater.futureCeilingNs
 		snap.RolloutFutureMtimeFingerprint = rolloutHighWater.futureFingerprint
 		snap.RolloutFutureMtimeCursor = rolloutHighWater.futureCursor
+		snap.RolloutFutureMtimeCohortSize = rolloutHighWater.futureCohortSize
 		snap.RolloutFutureMtimeComplete = rolloutHighWater.futureComplete
 		snap.RolloutRootFingerprint = rolloutRootFingerprint
 	}
@@ -1741,6 +1759,9 @@ type codexRolloutScanCursor struct {
 	futureCursor        string
 	futureComplete      bool
 	futureAnchorNs      int64
+	futureFloorNs       int64
+	futureCeilingNs     int64
+	futureCohortSize    int
 }
 
 type codexRolloutScanProgress struct {
@@ -1758,6 +1779,9 @@ type codexRolloutScanProgress struct {
 	futureCursor        string
 	futureComplete      bool
 	futureAnchorNs      int64
+	futureFloorNs       int64
+	futureCeilingNs     int64
+	futureCohortSize    int
 }
 
 // codexRolloutRootFingerprint identifies a CODEX_HOME without persisting its
@@ -1820,8 +1844,11 @@ func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.
 			retryCursor:         snap.RolloutRetryCursor,
 			retryFingerprint:    snap.RolloutRetryFingerprint,
 			futureAnchorNs:      snap.RolloutFutureMtimeAnchorNs,
+			futureFloorNs:       snap.RolloutFutureMtimeFloorNs,
+			futureCeilingNs:     snap.RolloutFutureMtimeCeilingNs,
 			futureFingerprint:   snap.RolloutFutureMtimeFingerprint,
 			futureCursor:        snap.RolloutFutureMtimeCursor,
+			futureCohortSize:    snap.RolloutFutureMtimeCohortSize,
 			futureComplete:      snap.RolloutFutureMtimeComplete,
 		}
 	}
@@ -1833,8 +1860,11 @@ func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.
 		return codexRolloutScanCursor{
 			mtimeNs:           mtimeNs,
 			futureAnchorNs:    snap.RolloutFutureMtimeAnchorNs,
+			futureFloorNs:     snap.RolloutFutureMtimeFloorNs,
+			futureCeilingNs:   snap.RolloutFutureMtimeCeilingNs,
 			futureFingerprint: snap.RolloutFutureMtimeFingerprint,
 			futureCursor:      snap.RolloutFutureMtimeCursor,
+			futureCohortSize:  snap.RolloutFutureMtimeCohortSize,
 			futureComplete:    snap.RolloutFutureMtimeComplete,
 		}
 	}
@@ -2019,19 +2049,27 @@ func codexRolloutBacklogCutoff(candidates []codexRolloutCandidate, cursor codexR
 	return codexRolloutCandidate{}, false
 }
 
-func codexRolloutFutureFingerprint(candidates []codexRolloutCandidate, now time.Time) string {
+// codexRolloutFutureFingerprint identifies the anomalous-mtime cohort above
+// `anchor`. Positive bounds close that cohort around the members which existed
+// when the anchor was saved: without them every rollout created afterwards — an
+// ordinary current-time one on the next refresh included — is also newer than the
+// anchor, so it changes the fingerprint, discards an unfinished capped cursor and
+// restarts selection while older cohort members stay unread. Later arrivals are
+// scanned on their own, outside the cohort.
+func codexRolloutFutureFingerprint(candidates []codexRolloutCandidate, anchor time.Time, floorNs, ceilingNs int64) (string, int) {
 	entries := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
-		if candidate.mtime.After(now) {
-			entries = append(entries, codexRolloutFutureEntryDigest(candidate))
+		if !codexRolloutInFutureCohort(candidate, anchor, floorNs, ceilingNs) {
+			continue
 		}
+		entries = append(entries, codexRolloutFutureEntryDigest(candidate))
 	}
 	if len(entries) == 0 {
-		return ""
+		return "", 0
 	}
 	sort.Strings(entries)
 	sum := sha256.Sum256([]byte(strings.Join(entries, "\n")))
-	return fmt.Sprintf("%x", sum[:])
+	return fmt.Sprintf("%x", sum[:]), len(entries)
 }
 
 func codexRolloutFutureAnchor(cursor codexRolloutScanCursor, now time.Time) time.Time {
@@ -2039,6 +2077,70 @@ func codexRolloutFutureAnchor(cursor codexRolloutScanCursor, now time.Time) time
 		return time.Unix(0, cursor.futureAnchorNs)
 	}
 	return now
+}
+
+// codexRolloutInFutureCohort reports whether a candidate belongs to the cohort
+// bounded by [floorNs, ceilingNs] above the anchor. Unset bounds leave that side
+// open, which is how a cursor written before the bounds were persisted is read.
+func codexRolloutInFutureCohort(candidate codexRolloutCandidate, anchor time.Time, floorNs, ceilingNs int64) bool {
+	if !candidate.mtime.After(anchor) {
+		return false
+	}
+	mtimeNs := candidate.mtime.UnixNano()
+	if floorNs > 0 && mtimeNs < floorNs {
+		return false
+	}
+	return ceilingNs <= 0 || mtimeNs <= ceilingNs
+}
+
+// codexRolloutFutureCohortBounds are the oldest and newest mtimes above the
+// anchor at the moment the cohort is defined — exactly the open cohort at that
+// instant, so deriving them for a legacy cursor that predates the bounds
+// reproduces the membership that cursor was saved with. Afterwards they keep the
+// cohort fixed: a rollout written later lands at wall-clock time, below a cohort
+// whose members are ahead of the clock, and an appended member climbs above the
+// ceiling — either way it is scanned separately instead of redefining the cohort.
+//
+// Residual: an arrival whose mtime happens to fall inside the bounds is still
+// indistinguishable from a cohort member, so it restarts the cohort as before.
+func codexRolloutFutureCohortBounds(candidates []codexRolloutCandidate, anchor time.Time) (int64, int64) {
+	oldest, newest := int64(0), int64(0)
+	for _, candidate := range candidates {
+		if !candidate.mtime.After(anchor) {
+			continue
+		}
+		mtimeNs := candidate.mtime.UnixNano()
+		if oldest == 0 || mtimeNs < oldest {
+			oldest = mtimeNs
+		}
+		if mtimeNs > newest {
+			newest = mtimeNs
+		}
+	}
+	return oldest, newest
+}
+
+// codexRolloutFutureCohort resolves the saved anomalous-mtime cohort against the
+// current listing and reports whether its rank cursor still describes consumed
+// work. An exact scoped fingerprint match means nothing inside the cohort
+// changed; a strictly smaller cohort means members only left it — an append
+// carries a member above the ceiling, where it is re-offered anyway — which is
+// the same tolerance the backlog cohort uses. Residual: a pass that both loses a
+// member and gains a restored file with a preserved in-cohort mtime is accepted,
+// leaving that one file unread until the cohort completes.
+func codexRolloutFutureCohort(candidates []codexRolloutCandidate, cursor codexRolloutScanCursor, now time.Time) (time.Time, int64, int64, bool) {
+	anchor := codexRolloutFutureAnchor(cursor, now)
+	if cursor.futureFingerprint == "" {
+		return anchor, 0, 0, false
+	}
+	floorNs, ceilingNs := cursor.futureFloorNs, cursor.futureCeilingNs
+	if ceilingNs <= 0 {
+		floorNs, ceilingNs = codexRolloutFutureCohortBounds(candidates, anchor)
+	}
+	fingerprint, size := codexRolloutFutureFingerprint(candidates, anchor, floorNs, ceilingNs)
+	matches := fingerprint == cursor.futureFingerprint ||
+		(cursor.futureCohortSize > 0 && size < cursor.futureCohortSize)
+	return anchor, floorNs, ceilingNs, matches
 }
 
 type codexReadDirResumeState struct {
@@ -2648,14 +2750,13 @@ func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor
 
 	backlogCutoff, backlogFound := codexRolloutBacklogCutoff(candidates, cursor, now)
 
-	futureAnchor := codexRolloutFutureAnchor(cursor, now)
-	futureMatches := cursor.futureFingerprint != "" &&
-		codexRolloutFutureFingerprint(candidates, futureAnchor) == cursor.futureFingerprint
+	futureAnchor, futureFloorNs, futureCeilingNs, futureMatches := codexRolloutFutureCohort(candidates, cursor, now)
 	var futureCutoff codexRolloutCandidate
 	futureFound := false
 	if futureMatches && !cursor.futureComplete && cursor.futureCursor != "" {
 		for _, candidate := range candidates {
-			if candidate.mtime.After(futureAnchor) && codexRolloutFutureEntryDigest(candidate) == cursor.futureCursor {
+			if codexRolloutInFutureCohort(candidate, futureAnchor, futureFloorNs, futureCeilingNs) &&
+				codexRolloutFutureEntryDigest(candidate) == cursor.futureCursor {
 				futureCutoff, futureFound = candidate, true
 				break
 			}
@@ -2674,7 +2775,7 @@ func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor
 			!codexRolloutCandidateBefore(backlogCutoff, candidate, now) {
 			continue
 		}
-		if candidate.mtime.After(futureAnchor) && futureMatches {
+		if futureMatches && codexRolloutInFutureCohort(candidate, futureAnchor, futureFloorNs, futureCeilingNs) {
 			if cursor.futureComplete || (futureFound && !codexRolloutCandidateBefore(futureCutoff, candidate, now)) {
 				continue
 			}
@@ -2819,17 +2920,25 @@ func codexRolloutHasUnselectedBelowProgress(eligible, selected []codexRolloutCan
 	return false
 }
 
-func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCandidate, now time.Time, cursor codexRolloutScanCursor) (int64, string, string, bool) {
-	anchor := codexRolloutFutureAnchor(cursor, now)
-	fingerprint := codexRolloutFutureFingerprint(candidates, anchor)
+// codexRolloutFutureProgress carries the anchored cohort forward. A cohort that
+// still matches keeps its saved bounds, so rollouts written afterwards are
+// scanned as ordinary candidates without redefining — or restarting — a cohort
+// whose capped scan is still unfinished. A cohort that no longer matches is
+// redefined by the current listing.
+func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCandidate, now time.Time, cursor codexRolloutScanCursor) (int64, int64, int64, string, string, int, bool) {
+	anchor, floorNs, ceilingNs, matches := codexRolloutFutureCohort(candidates, cursor, now)
+	if !matches {
+		floorNs, ceilingNs = codexRolloutFutureCohortBounds(candidates, anchor)
+	}
+	fingerprint, cohortSize := codexRolloutFutureFingerprint(candidates, anchor, floorNs, ceilingNs)
 	if fingerprint == "" {
-		return 0, "", "", false
+		return 0, 0, 0, "", "", 0, false
 	}
 	selectedFuture := map[string]struct{}{}
 	var lastSelected codexRolloutCandidate
 	haveLast := false
 	for _, candidate := range selected {
-		if !candidate.mtime.After(anchor) {
+		if !codexRolloutInFutureCohort(candidate, anchor, floorNs, ceilingNs) {
 			continue
 		}
 		selectedFuture[codexRolloutFutureEntryDigest(candidate)] = struct{}{}
@@ -2839,7 +2948,7 @@ func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCan
 	}
 	remaining := false
 	for _, candidate := range eligible {
-		if !candidate.mtime.After(anchor) {
+		if !codexRolloutInFutureCohort(candidate, anchor, floorNs, ceilingNs) {
 			continue
 		}
 		if _, ok := selectedFuture[codexRolloutFutureEntryDigest(candidate)]; !ok {
@@ -2848,15 +2957,16 @@ func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCan
 		}
 	}
 	if !remaining {
-		return anchor.UnixNano(), fingerprint, "", true
+		return anchor.UnixNano(), floorNs, ceilingNs, fingerprint, "", cohortSize, true
 	}
 	if haveLast {
-		return anchor.UnixNano(), fingerprint, codexRolloutFutureEntryDigest(lastSelected), false
+		return anchor.UnixNano(), floorNs, ceilingNs, fingerprint,
+			codexRolloutFutureEntryDigest(lastSelected), cohortSize, false
 	}
-	if fingerprint == cursor.futureFingerprint {
-		return anchor.UnixNano(), fingerprint, cursor.futureCursor, false
+	if matches {
+		return anchor.UnixNano(), floorNs, ceilingNs, fingerprint, cursor.futureCursor, cohortSize, false
 	}
-	return anchor.UnixNano(), fingerprint, "", false
+	return anchor.UnixNano(), floorNs, ceilingNs, fingerprint, "", cohortSize, false
 }
 
 func codexRolloutFutureCohortCaughtUp(candidates []codexRolloutCandidate, now time.Time, fingerprint string, complete bool) bool {
@@ -2864,7 +2974,10 @@ func codexRolloutFutureCohortCaughtUp(candidates []codexRolloutCandidate, now ti
 	// mtime is no longer ahead of the clock, it is ordinary completed filesystem
 	// progress. Retaining the old anchor would make each later normal rollout
 	// change the historical cohort fingerprint and reopen the consumed files.
-	return complete && fingerprint != "" && codexRolloutFutureFingerprint(candidates, now) == ""
+	// The catch-up test is deliberately unscoped: any file still ahead of the
+	// clock — cohort member or later arrival — keeps anomalous handling on.
+	current, _ := codexRolloutFutureFingerprint(candidates, now, 0, 0)
+	return complete && fingerprint != "" && current == ""
 }
 
 // codexRolloutFallbackBuckets reads Codex's session rollout logs
@@ -2928,7 +3041,9 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// already-consumed file and preserve the anomalous-file completion state.
 		if discoveryComplete {
 			progress := codexRolloutBoundaryProgress(candidates, nil, nil, cursor.mtimeNs)
-			progress.futureAnchorNs, progress.futureFingerprint, progress.futureCursor, progress.futureComplete =
+			progress.futureAnchorNs, progress.futureFloorNs, progress.futureCeilingNs,
+				progress.futureFingerprint, progress.futureCursor,
+				progress.futureCohortSize, progress.futureComplete =
 				codexRolloutFutureProgress(candidates, nil, nil, now, cursor)
 			if codexRolloutFutureCohortCaughtUp(
 				candidates, now, progress.futureFingerprint, progress.futureComplete,
@@ -3155,7 +3270,8 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// same deterministic newest subset forever. Once the whole boundary is
 		// consumed, the cursor is cleared and its full fingerprint restores the
 		// ordinary cache-only unchanged-boundary fast path.
-		futureAnchorNs, futureFingerprint, futureCursor, futureComplete :=
+		futureAnchorNs, futureFloorNs, futureCeilingNs, futureFingerprint, futureCursor,
+			futureCohortSize, futureComplete :=
 			codexRolloutFutureProgress(candidates, eligibleCandidates, attempted, now, cursor)
 		if cursor.futureFingerprint != "" && futureFingerprint != "" && !futureComplete {
 			// A cohort that was future-dated when its capped scan started may be
@@ -3167,7 +3283,8 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 			codexRolloutFutureCohortCaughtUp(candidates, now, futureFingerprint, futureComplete)
 		if retireFutureCohort {
 			maxSelectedMtimeNs = codexRolloutNewestNormalMtimeNs(candidates, cursor.mtimeNs, now)
-			futureAnchorNs, futureFingerprint, futureCursor, futureComplete = 0, "", "", false
+			futureAnchorNs, futureFloorNs, futureCeilingNs, futureFingerprint, futureCursor,
+				futureCohortSize, futureComplete = 0, 0, 0, "", "", 0, false
 		}
 		progress := codexRolloutBoundaryProgress(candidates, eligibleCandidates, attempted, maxSelectedMtimeNs)
 		if unfinishedSavedBoundary && progress.boundaryCursor == "" &&
@@ -3178,6 +3295,8 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 			progress.boundaryCursor = cursor.boundaryCursor
 		}
 		progress.futureAnchorNs = futureAnchorNs
+		progress.futureFloorNs = futureFloorNs
+		progress.futureCeilingNs = futureCeilingNs
 		progress.backlogFingerprint = backlogFingerprint
 		progress.backlogCursor = backlogCursor
 		progress.backlogMtimeNs = backlogMtimeNs
@@ -3188,6 +3307,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		)
 		progress.futureFingerprint = futureFingerprint
 		progress.futureCursor = futureCursor
+		progress.futureCohortSize = futureCohortSize
 		progress.futureComplete = futureComplete
 		highWater = &progress
 	}

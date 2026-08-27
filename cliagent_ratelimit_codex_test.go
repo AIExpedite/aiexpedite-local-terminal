@@ -4936,6 +4936,109 @@ func TestTryMergeCodexRateLimitCachePerLimitProgress_DoesNotWaitForLocks(t *test
 	}
 }
 
+func TestCodexRolloutFallbackBuckets_LaterRolloutKeepsUnfinishedFutureCohort(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "future-cohort@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	futureMtime := now.Add(24 * time.Hour)
+	writeRollout := func(name string, percent int, mtime time.Time) {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(
+				`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`,
+				percent,
+			) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range codexRolloutScanFileCap + 1 {
+		writeRollout(fmt.Sprintf("rollout-future-%02d.jsonl", i), 41+i, futureMtime)
+	}
+
+	startingCursor := codexRolloutScanCursor{mtimeNs: now.Add(-time.Second).UnixNano()}
+	contributors, _, _, progress, ok := codexRolloutFallbackBuckets(context.Background(), base, now, startingCursor)
+	if !ok || progress == nil || progress.futureCursor == "" || progress.futureComplete {
+		t.Fatalf("ok=%v progress=%+v, want an unfinished capped future cohort", ok, progress)
+	}
+	if progress.futureFloorNs != futureMtime.UnixNano() || progress.futureCeilingNs != futureMtime.UnixNano() {
+		t.Fatalf("cohort bounds=[%d,%d], want both pinned to the cohort mtime %d",
+			progress.futureFloorNs, progress.futureCeilingNs, futureMtime.UnixNano())
+	}
+	if progress.futureCohortSize != codexRolloutScanFileCap+1 {
+		t.Fatalf("cohort size=%d, want %d", progress.futureCohortSize, codexRolloutScanFileCap+1)
+	}
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, progress, base,
+	)
+
+	// An ordinary rollout written after the anchor is newer than it, so before the
+	// cohort was bounded it changed the cohort fingerprint and restarted the capped
+	// scan — leaving the unread cohort member starved behind each new session.
+	later := now.Add(time.Minute)
+	writeRollout("rollout-later-normal.jsonl", 7, later)
+
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, later)
+	if cursor.futureCursor == "" || cursor.futureComplete ||
+		cursor.futureFloorNs != futureMtime.UnixNano() || cursor.futureCeilingNs != futureMtime.UnixNano() {
+		t.Fatalf("reloaded cursor=%+v, want the bounded unfinished cohort", cursor)
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery")
+	}
+	eligible := codexUnconsumedRolloutCandidates(candidates, cursor, later)
+	if len(eligible) != 2 {
+		t.Fatalf("eligible=%d, want the later rollout plus the one unread cohort member", len(eligible))
+	}
+	sawLater, futureLeft := false, 0
+	for _, candidate := range eligible {
+		if candidate.mtime.Equal(futureMtime) {
+			futureLeft++
+			continue
+		}
+		if filepath.Base(candidate.path) == "rollout-later-normal.jsonl" {
+			sawLater = true
+		}
+	}
+	if !sawLater || futureLeft != 1 {
+		t.Fatalf("eligible=%+v, want the later rollout and exactly one unconsumed cohort member", eligible)
+	}
+
+	lastContributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, later, cursor)
+	if !ok || completed == nil || !completed.futureComplete || completed.futureCursor != "" {
+		t.Fatalf("ok=%v progress=%+v, want the final cohort batch marked complete", ok, completed)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, lastContributors, nil, false, nil, false, later, fingerprint, completed, base,
+	)
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, later)
+	if !cursor.futureComplete {
+		t.Fatalf("reloaded cursor=%+v, want the completed cohort", cursor)
+	}
+	candidates, complete = codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery")
+	}
+	for _, candidate := range codexUnconsumedRolloutCandidates(candidates, cursor, later) {
+		if candidate.mtime.Equal(futureMtime) {
+			t.Fatalf("eligible=%+v, want every consumed cohort member excluded", candidate)
+		}
+	}
+}
+
 func TestCodexRolloutFallbackBuckets_RecordsFutureCandidatesSeparately(t *testing.T) {
 	base := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
