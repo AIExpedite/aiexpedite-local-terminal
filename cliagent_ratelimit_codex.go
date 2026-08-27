@@ -1960,6 +1960,18 @@ func codexRolloutRetryFingerprint(retries map[string]struct{}) string {
 // already-consumed rollout from restarting the cohort as well; when that append
 // carries the file's mtime above the ceiling the cohort simply shrinks, which
 // the size is there to distinguish from a substitution.
+//
+// Residual: on a filesystem whose mtime resolution is coarse enough that an
+// append leaves the timestamp unchanged, that append is invisible to this cohort
+// until a later write crosses a tick boundary and carries the file above the
+// ceiling, where it is re-offered and re-read whole (reconciliation is
+// newest-wins per identity and limit ID, so nothing earlier is lost by the
+// re-read). Folding size into the cohort digest is deliberately not the answer:
+// it cannot say which member changed, so the only available response is to drop
+// the rank cursor, and an actively appended file on such a filesystem would then
+// reset the cursor on every pass and starve the march toward older rollouts.
+// Appends at the completed watermark's own tick are already covered separately,
+// by the size-bearing boundary fingerprint.
 func codexRolloutBacklogFingerprint(candidates []codexRolloutCandidate, cursorMtimeNs, ceilingMtimeNs int64, now time.Time) (string, int) {
 	hash := sha256.New()
 	count := 0
