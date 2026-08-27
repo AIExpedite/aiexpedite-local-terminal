@@ -2684,6 +2684,26 @@ func codexRolloutFutureCohortReserve(anchor time.Time, floorNs, ceilingNs int64)
 	}
 }
 
+// codexRolloutBacklogReserve claims a share of the batch for the unread tail of
+// the normal-time cohort a saved rank cursor is resuming through: the eligible
+// members ranked after `cutoff` and at or below the cohort ceiling the cursor
+// was saved with.
+//
+// That cohort ceiling rises to the newest normal-time mtime on every completed
+// pass, so a sustained stream of cap-sized arrivals above it keeps the ordinary
+// newest-first selection full while codexRolloutBacklogProgress holds the saved
+// cutoff in place (it deliberately keeps the deeper of this pass's oldest pick
+// and the saved one). Without a reserve the tail is then never selected at all,
+// and a distinct metered limit only an older rollout restates stays
+// unreconciled for as long as the arrival rate holds.
+func codexRolloutBacklogReserve(cutoff codexRolloutCandidate, cursorMtimeNs, ceilingMtimeNs int64, now time.Time) codexRolloutReserve {
+	return func(candidate codexRolloutCandidate) bool {
+		mtimeNs := candidate.mtime.UnixNano()
+		return mtimeNs > cursorMtimeNs && mtimeNs <= ceilingMtimeNs &&
+			!candidate.mtime.After(now) && codexRolloutCandidateBefore(cutoff, candidate, now)
+	}
+}
+
 // codexSelectNewestRolloutCandidates returns the `capacity` highest-ranked
 // candidates in rank order without ordering the rest. A full sort of a large
 // backlog is both O(n log n) and uncancellable, so it can burn the read reserve
@@ -2697,12 +2717,13 @@ func codexRolloutFutureCohortReserve(anchor time.Time, floorNs, ceilingNs int64)
 //
 // Each entry in reserves claims a bounded share of the batch for a group whose
 // saved scan cursor can only advance when that group is opened — an unfinished
-// equal-mtime boundary, or an unfinished anchored future cohort that every
-// later future-dated arrival outranks. Without the reserve an ongoing stream of
-// newer files fills every slot on every refresh and the group is starved
-// permanently. The reserved share is capacity/(len(reserves)+1) each, so the
-// ordinary top-N selection always keeps the largest share for fresh evidence
-// and each group still finishes in bounded deterministic batches.
+// equal-mtime boundary, an unfinished anchored future cohort that every later
+// future-dated arrival outranks, or the unread tail of an unfinished normal-time
+// backlog whose ceiling every later arrival sits above. Without the reserve an
+// ongoing stream of newer files fills every slot on every refresh and the group
+// is starved permanently. The reserved share is capacity/(len(reserves)+1) each,
+// so the ordinary top-N selection always keeps at least an equal share for fresh
+// evidence and each group still finishes in bounded deterministic batches.
 // When retryEntries fill the ordinary selection, one slot is reserved for the
 // newest non-retry candidate so persistent failures cannot pin an older backlog.
 // When the retry cohort is larger than the slots left for it, a matching retry
@@ -2978,34 +2999,124 @@ func codexRolloutBacklogProgress(candidates, eligible, selected []codexRolloutCa
 			lastSelected, haveLast = candidate, true
 		}
 	}
+	// `remaining` decides whether the cohort is finished; `rankBound` is the
+	// newest thing this pass left unread and therefore bounds how deep a single
+	// positional cursor may claim. They differ by one rule: equal-mtime overflow
+	// at the newest selected boundary has its own boundary cursor, so it does not
+	// keep the cohort open, but a reserve can still evict such an entry and the
+	// backlog cursor must not be allowed to step over it.
+	remaining := false
+	var rankBound codexRolloutCandidate
+	haveRankBound := false
 	for _, candidate := range eligible {
 		if candidate.mtime.UnixNano() <= cursor.mtimeNs || candidate.mtime.After(now) {
 			continue
 		}
-		if _, ok := selectedNormal[codexRolloutFutureEntryDigest(candidate)]; !ok {
-			// Equal-mtime overflow at the newest selected boundary already has its
-			// own boundary cursor. This cursor is only for older distinct mtimes
-			// that the capped newest-first selection would otherwise jump over.
-			if candidate.mtime.UnixNano() >= newestSelectedMtimeNs {
-				continue
-			}
-			if haveLast {
-				// Selection ranks the eligible set newest-first, and the eligible set
-				// is exactly what the saved cutoff did not already cover, so the
-				// consumed region stays contiguous from the newest candidate. When a
-				// batch of rollouts created above the ceiling fills the cap, this
-				// pass's own oldest pick can still be newer than the saved cutoff;
-				// keeping the deeper of the two stops that from replaying the tail.
-				if saved, ok := codexRolloutBacklogCutoff(candidates, cursor, now); ok &&
-					codexRolloutCandidateBefore(lastSelected, saved, now) {
-					lastSelected = saved
-				}
-				return fingerprint, codexRolloutBacklogEntryDigest(lastSelected), cohortMtimeNs, cohortSize, false
-			}
-			return fingerprint, cursor.backlogCursor, cohortMtimeNs, cohortSize, false
+		if _, ok := selectedNormal[codexRolloutFutureEntryDigest(candidate)]; ok {
+			continue
+		}
+		if !haveRankBound || codexRolloutCandidateBefore(candidate, rankBound, now) {
+			rankBound, haveRankBound = candidate, true
+		}
+		if candidate.mtime.UnixNano() < newestSelectedMtimeNs {
+			remaining = true
 		}
 	}
-	return "", "", 0, 0, true
+	if !remaining {
+		return "", "", 0, 0, true
+	}
+	if !haveLast {
+		return fingerprint, cursor.backlogCursor, cohortMtimeNs, cohortSize, false
+	}
+	// Selection normally ranks the eligible set newest-first, so its picks are one
+	// run contiguous from the newest candidate and its oldest pick is the deepest
+	// safe cursor. A reserve breaks that: it can open members ranked below an
+	// entry it evicted, leaving two disjoint runs. Claim only the run contiguous
+	// with the newest, or the tail loses the evicted entry between them.
+	advance, haveAdvance := lastSelected, true
+	if haveRankBound && !codexRolloutCandidateBefore(advance, rankBound, now) {
+		advance, haveAdvance = codexRolloutDeepestBefore(selected, rankBound, cursor.mtimeNs, now)
+	}
+	saved, savedFound := codexRolloutBacklogCutoff(candidates, cursor, now)
+	if savedFound {
+		// When a batch of rollouts created above the ceiling fills the cap, this
+		// pass's own oldest pick can still be newer than the saved cutoff; keeping
+		// the deeper of the two stops that from replaying the tail. It cannot be
+		// taken past an unread entry, which a reserved batch can leave above it.
+		if haveAdvance && codexRolloutCandidateBefore(advance, saved, now) &&
+			(!haveRankBound || codexRolloutCandidateBefore(saved, rankBound, now)) {
+			advance = saved
+		}
+		// The reserved tail run is contiguous with the region the saved cutoff
+		// already covers, so it can be recorded even when unread newer files sit
+		// above it — as long as the ceiling stays where it was, leaving those files
+		// outside the cohort and still eligible. Prefer it only when it reaches
+		// deeper into the cohort than the advancing form would.
+		if tail, ok := codexRolloutBacklogTailRun(eligible, selectedNormal, saved, cursor, now); ok &&
+			(!haveAdvance || codexRolloutCandidateBefore(advance, tail, now)) {
+			pinnedFingerprint, pinnedSize :=
+				codexRolloutBacklogFingerprint(candidates, cursor.mtimeNs, cursor.backlogMtimeNs, now)
+			return pinnedFingerprint, codexRolloutBacklogEntryDigest(tail), cursor.backlogMtimeNs, pinnedSize, false
+		}
+	}
+	if !haveAdvance {
+		return fingerprint, cursor.backlogCursor, cohortMtimeNs, cohortSize, false
+	}
+	return fingerprint, codexRolloutBacklogEntryDigest(advance), cohortMtimeNs, cohortSize, false
+}
+
+// codexRolloutDeepestBefore returns the oldest-ranked normal-time member of
+// `selected` that still ranks ahead of `bound`.
+func codexRolloutDeepestBefore(selected []codexRolloutCandidate, bound codexRolloutCandidate, cursorMtimeNs int64, now time.Time) (codexRolloutCandidate, bool) {
+	var deepest codexRolloutCandidate
+	found := false
+	for _, candidate := range selected {
+		if candidate.mtime.UnixNano() <= cursorMtimeNs || candidate.mtime.After(now) ||
+			!codexRolloutCandidateBefore(candidate, bound, now) {
+			continue
+		}
+		if !found || codexRolloutCandidateBefore(deepest, candidate, now) {
+			deepest, found = candidate, true
+		}
+	}
+	return deepest, found
+}
+
+// codexRolloutBacklogTailRun reports how far into the saved cohort this pass
+// walked, starting at the saved cutoff and stopping at the first member it did
+// not open. The backlog cursor is one position and everything ranked ahead of it
+// is treated as consumed, so only a run that stays contiguous with the region
+// the cutoff already covers may be recorded.
+func codexRolloutBacklogTailRun(eligible []codexRolloutCandidate, opened map[string]struct{}, cutoff codexRolloutCandidate, cursor codexRolloutScanCursor, now time.Time) (codexRolloutCandidate, bool) {
+	inTail := func(candidate codexRolloutCandidate) bool {
+		mtimeNs := candidate.mtime.UnixNano()
+		return mtimeNs > cursor.mtimeNs && mtimeNs <= cursor.backlogMtimeNs &&
+			!candidate.mtime.After(now) && codexRolloutCandidateBefore(cutoff, candidate, now)
+	}
+	var blocker codexRolloutCandidate
+	haveBlocker := false
+	for _, candidate := range eligible {
+		if _, ok := opened[codexRolloutFutureEntryDigest(candidate)]; ok || !inTail(candidate) {
+			continue
+		}
+		if !haveBlocker || codexRolloutCandidateBefore(candidate, blocker, now) {
+			blocker, haveBlocker = candidate, true
+		}
+	}
+	var deepest codexRolloutCandidate
+	found := false
+	for _, candidate := range eligible {
+		if _, ok := opened[codexRolloutFutureEntryDigest(candidate)]; !ok || !inTail(candidate) {
+			continue
+		}
+		if haveBlocker && !codexRolloutCandidateBefore(candidate, blocker, now) {
+			continue
+		}
+		if !found || codexRolloutCandidateBefore(deepest, candidate, now) {
+			deepest, found = candidate, true
+		}
+	}
+	return deepest, found
 }
 
 func codexRolloutNewestNormalMtimeNs(candidates []codexRolloutCandidate, cursorMtimeNs int64, now time.Time) int64 {
@@ -3279,6 +3390,14 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		if anchor, floorNs, ceilingNs, matches := codexRolloutFutureCohort(candidates, cursor, now); matches {
 			reserves = append(reserves, codexRolloutFutureCohortReserve(anchor, floorNs, ceilingNs))
 		}
+	}
+	if backlogCutoff, resuming := codexRolloutBacklogCutoff(candidates, cursor, now); resuming {
+		// Same reasoning as the cohort above, resolved against the same listing:
+		// reserve the members this cursor still has to walk so a cap-sized batch of
+		// newer rollouts cannot take every slot on every refresh.
+		reserves = append(reserves, codexRolloutBacklogReserve(
+			backlogCutoff, cursor.mtimeNs, cursor.backlogMtimeNs, now,
+		))
 	}
 	selected, selectionComplete := codexSelectNewestRolloutCandidates(
 		orderingCtx, eligibleCandidates, now, codexRolloutScanFileCap, reserves,

@@ -5544,6 +5544,124 @@ func TestCodexSelectNewestRolloutCandidates_SplitsCapacityAcrossReserves(t *test
 	}
 }
 
+// A normal-time backlog cursor can only move forward by opening its own unread
+// members, and its cohort ceiling rises to the newest normal-time mtime on every
+// completed pass — so a cap-sized batch of rollouts created above that ceiling
+// takes every ordinary slot while the saved cutoff is deliberately held in
+// place. Repeat that per refresh and the unread tail is starved indefinitely,
+// stranding a metered limit no newer rollout restates.
+func TestCodexRolloutFallbackBuckets_NewerArrivalsCannotStarveBacklogTail(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "backlog-starvation@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	writeRollout := func(name, window string, mtime time.Time) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{%s}}`, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	// The tail this first pass cannot reach holds the only weekly reading; its
+	// newest unread member is where a reserved slot has to resume.
+	tailDepth := 12
+	oldestMtime := now.Add(-30 * time.Minute)
+	for i := range codexRolloutScanFileCap + tailDepth {
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == tailDepth-1 {
+			window = `"secondary":{"used_percent":73,"window_minutes":10080}`
+		}
+		writeRollout(
+			fmt.Sprintf("rollout-backlog-%05d.jsonl", i), window,
+			oldestMtime.Add(time.Duration(i)*time.Second),
+		)
+	}
+
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || first == nil || first.backlogCursor == "" || first.backlogMtimeNs == 0 {
+		t.Fatalf("ok=%v progress=%+v, want a capped first batch and resumable backlog progress", ok, first)
+	}
+	if len(firstContributors[codexWindowSecondary]) != 0 {
+		t.Fatal("first capped batch unexpectedly reached the unread tail's weekly rollout")
+	}
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, first, base,
+	)
+
+	// A whole capped batch of newer rollouts arrives above the saved ceiling, so
+	// every one of them outranks every unread member of the cohort.
+	arrivalMtime := now.Add(-10 * time.Minute)
+	arrivals := map[string]struct{}{}
+	for j := range codexRolloutScanFileCap {
+		arrivals[writeRollout(
+			fmt.Sprintf("rollout-arrival-%05d.jsonl", j),
+			fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 11+j),
+			arrivalMtime.Add(time.Duration(j)*time.Second),
+		)] = struct{}{}
+	}
+
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.backlogCursor == "" || cursor.backlogMtimeNs != first.backlogMtimeNs {
+		t.Fatalf("reloaded cursor=%+v, want the unfinished saved cohort", cursor)
+	}
+	contributors, _, _, resumed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || resumed == nil {
+		t.Fatalf("ok=%v progress=%+v, want a usable pass", ok, resumed)
+	}
+	weekly := float64(0)
+	for _, bucket := range contributors[codexWindowSecondary] {
+		weekly = bucket.UsedPercentage
+	}
+	if weekly != 73 {
+		t.Fatalf("weekly=%v, want the reserved backlog slots to reconcile the unread "+
+			"tail's 73%% weekly limit instead of yielding every slot to the arrivals", weekly)
+	}
+	if resumed.backlogCursor == "" || resumed.backlogCursor == cursor.backlogCursor {
+		t.Fatalf("progress=%+v, want the backlog cursor to march past the saved cutoff %q",
+			resumed, cursor.backlogCursor)
+	}
+	if resumed.backlogMtimeNs != cursor.backlogMtimeNs {
+		t.Fatalf("cohort ceiling=%d, want the saved ceiling %d held so the arrivals this "+
+			"batch had to give up stay outside the cohort", resumed.backlogMtimeNs, cursor.backlogMtimeNs)
+	}
+
+	// The reserve evicts newer candidates from the ordinary rank, so none of the
+	// arrivals may be recorded as consumed by the deeper cursor this pass saved.
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, resumed, base,
+	)
+	next := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	candidates, discovered := codexDiscoverRolloutCandidates(context.Background(), base, next)
+	if !discovered {
+		t.Fatal("discovery did not complete")
+	}
+	offered := 0
+	for _, candidate := range codexUnconsumedRolloutCandidates(candidates, next, now) {
+		if _, ok := arrivals[candidate.path]; ok {
+			offered++
+		}
+	}
+	if offered != codexRolloutScanFileCap {
+		t.Fatalf("eligible arrivals=%d, want all %d still offered after the reserved "+
+			"batch evicted some of them", offered, codexRolloutScanFileCap)
+	}
+}
+
 // A future-dated rollout that lands above an unfinished cohort's saved ceiling is
 // scanned outside that cohort and outranks every member of it. A full batch of
 // such arrivals must not leave the cohort's own cursor unchanged forever: its
