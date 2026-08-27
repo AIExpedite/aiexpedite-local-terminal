@@ -2630,7 +2630,7 @@ func TestCodexRolloutFallbackBuckets_OversizedHeaderCannotFakeSessionStart(t *te
 	}
 }
 
-func TestCodexRolloutFallbackBuckets_InvalidHeaderCannotFakeSessionStart(t *testing.T) {
+func TestCodexRolloutFallbackBuckets_InvalidHeaderAdvancesHighWaterAfterEOF(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "sessions", "2026", "08", "26")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -2657,8 +2657,8 @@ func TestCodexRolloutFallbackBuckets_InvalidHeaderCannotFakeSessionStart(t *test
 	if ok || len(contributors) != 0 {
 		t.Fatalf("contributors=%+v ok=%v, want unverified session withheld", contributors, ok)
 	}
-	if highWater != nil {
-		t.Fatalf("highWater=%+v, want rollout left eligible for retry", highWater)
+	if highWater == nil {
+		t.Fatal("highWater=nil, want fully read invalid-header rollout counted as handled")
 	}
 }
 
@@ -2704,7 +2704,7 @@ func TestCodexRolloutSessionMatchesAuth_RequiresVerifiedStart(t *testing.T) {
 		wantRetry    bool
 	}{
 		{name: "unverified partial read", wantAccept: false, wantRetry: true},
-		{name: "unverified complete legacy log", handled: true, wantAccept: false, wantRetry: true},
+		{name: "unverified complete legacy log", handled: true, wantAccept: false, wantRetry: false},
 		{name: "prior account", sessionStart: authMod.Add(-time.Minute), handled: true, wantAccept: false, wantRetry: false},
 		{name: "current account", sessionStart: authMod.Add(time.Minute), handled: true, wantAccept: true, wantRetry: false},
 	} {

@@ -2226,12 +2226,14 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	return acc, limit, latestObservation, highWater, true
 }
 
-func codexRolloutSessionMatchesAuth(sessionStart, authMod time.Time, _ bool) (accept, retry bool) {
+func codexRolloutSessionMatchesAuth(sessionStart, authMod time.Time, handled bool) (accept, retry bool) {
 	if sessionStart.IsZero() {
 		// An authenticated scan must prove which account produced the rollout.
-		// A complete legacy or malformed file is no safer than a partial tail when
-		// its first record's session start could not be verified.
-		return false, true
+		// Withhold unscoped evidence in either case, but only an interrupted read
+		// needs retrying. A fully consumed malformed/legacy file is deterministic;
+		// a later append changes its discovery fingerprint and makes it eligible
+		// again without holding back completed-scan progress indefinitely.
+		return false, !handled
 	}
 	return !sessionStart.Before(authMod), false
 }
