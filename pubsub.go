@@ -1084,7 +1084,7 @@ func makeCLIUsageRefreshFailureResult(cmd commandMsg, cfg *Config, message strin
 	if cfg != nil {
 		secret = cfg.CommandSecret
 	}
-	errs := []cliAgentUsageError{{Provider: "_dispatch", Message: message}}
+	errs := []cliAgentUsageError{{Provider: "_dispatch", ErrorCategory: cliUsageErrorInternal}}
 	receipt, agents, normalizedErrors, receiptErr := signCLIUsageRefreshReceipt(secret, cmd.RefreshID, cmd.Ts, false, nil, errs)
 	receiptVersion := 1
 	challengeTs := cmd.Ts

@@ -10,9 +10,20 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 const cliUsageReceiptDomain = "AIEXPEDITE_CLI_USAGE_REFRESH_RECEIPT\n"
+
+const (
+	cliUsageErrorProviderTimeout     = "provider_timeout"
+	cliUsageErrorProviderUnavailable = "provider_unavailable"
+	cliUsageErrorNotAuthenticated    = "not_authenticated"
+	cliUsageErrorParseFailed         = "parse_failed"
+	cliUsageErrorCollectionFailed    = "collection_failed"
+	cliUsageErrorReceiptBounds       = "receipt_bounds"
+	cliUsageErrorInternal            = "internal_error"
+)
 
 type cliUsageReceiptBody struct {
 	Version     int                         `json:"version"`
@@ -74,6 +85,33 @@ func canonicalFloat(value *float64) (*string, error) {
 }
 
 func bounded(value string, max int) bool { return len([]byte(value)) <= max }
+
+func safeCLIUsageErrorCategory(item cliAgentUsageError) string {
+	if item.ErrorCategory != "" {
+		switch item.ErrorCategory {
+		case cliUsageErrorProviderTimeout, cliUsageErrorProviderUnavailable,
+			cliUsageErrorNotAuthenticated, cliUsageErrorParseFailed,
+			cliUsageErrorCollectionFailed, cliUsageErrorReceiptBounds,
+			cliUsageErrorInternal:
+			return item.ErrorCategory
+		}
+	}
+	message := strings.ToLower(item.Message)
+	switch {
+	case strings.Contains(message, "timeout"), strings.Contains(message, "deadline"):
+		return cliUsageErrorProviderTimeout
+	case strings.Contains(message, "not authenticated"), strings.Contains(message, "not signed in"), strings.Contains(message, "login"):
+		return cliUsageErrorNotAuthenticated
+	case strings.Contains(message, "parse"), strings.Contains(message, "decode"), strings.Contains(message, "unmarshal"):
+		return cliUsageErrorParseFailed
+	case strings.Contains(message, "unavailable"), strings.Contains(message, "not found"):
+		return cliUsageErrorProviderUnavailable
+	case strings.Contains(message, "collect"), strings.Contains(message, "gather"):
+		return cliUsageErrorCollectionFailed
+	default:
+		return cliUsageErrorInternal
+	}
+}
 
 func canonicalProvider(agent cliAgentUsage) (canonicalCLIUsageProvider, error) {
 	short := []string{agent.CliAgentID, agent.Provider, agent.Name, agent.Version, agent.Plan, agent.Model, agent.CollectedAt, agent.DataSource, agent.AuthState, agent.LoginExpiresAt, agent.LoginExpirationState, agent.NoticeSeverity}
@@ -172,9 +210,12 @@ func canonicalCLIUsageRefreshReceipt(refreshID string, challengeTs int64, succes
 	if normalizedErrors == nil {
 		normalizedErrors = []cliAgentUsageError{}
 	}
-	for _, item := range normalizedErrors {
-		if !bounded(item.Provider, 256) || !bounded(item.Message, 512) {
+	for index, item := range normalizedErrors {
+		if !bounded(item.Provider, 256) {
 			return nil, nil, nil, errors.New("invalid receipt bounds")
+		}
+		normalizedErrors[index] = cliAgentUsageError{
+			Provider: item.Provider, ErrorCategory: safeCLIUsageErrorCategory(item),
 		}
 	}
 	var encoded bytes.Buffer

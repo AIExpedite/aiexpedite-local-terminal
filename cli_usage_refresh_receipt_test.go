@@ -40,6 +40,22 @@ func TestCLIUsageRefreshReceiptDomainSeparation(t *testing.T) {
 	}
 }
 
+func TestCLIUsageRefreshReceiptRedactsLocalErrorMessages(t *testing.T) {
+	canonical, _, normalized, err := canonicalCLIUsageRefreshReceipt("refresh-1", 1, false, nil, []cliAgentUsageError{{
+		Provider: "codex", Message: `parse failed at C:\\Users\\private\\credentials.json: token=secret`,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(normalized) != 1 || normalized[0].ErrorCategory != cliUsageErrorParseFailed || normalized[0].Message != "" {
+		t.Fatalf("unexpected normalized errors: %#v", normalized)
+	}
+	text := string(canonical)
+	if strings.Contains(text, "credentials") || strings.Contains(text, "secret") || strings.Contains(text, "message") {
+		t.Fatalf("canonical receipt leaked local error text: %s", text)
+	}
+}
+
 func TestCLIUsageRefreshReceiptFormatsMetricsAsDecimalStrings(t *testing.T) {
 	total := 1e-7
 	remaining := math.Copysign(0, -1)

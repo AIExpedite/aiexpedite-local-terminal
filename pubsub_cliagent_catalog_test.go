@@ -95,8 +95,8 @@ func TestMakeCLIUsageRefreshFailureResult_CarriesRefreshMetadata(t *testing.T) {
 	if res.Success == nil || *res.Success {
 		t.Fatalf("Success=%v, want false pointer", res.Success)
 	}
-	if len(res.Errors) != 1 || res.Errors[0].Provider != "_dispatch" || res.Errors[0].Message != "payload too large" {
-		t.Fatalf("Errors=%#v, want dispatch payload-too-large error", res.Errors)
+	if len(res.Errors) != 1 || res.Errors[0].Provider != "_dispatch" || res.Errors[0].ErrorCategory != cliUsageErrorInternal || res.Errors[0].Message != "" {
+		t.Fatalf("Errors=%#v, want categorized dispatch error", res.Errors)
 	}
 }
 
