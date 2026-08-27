@@ -3872,6 +3872,84 @@ func TestCodexRolloutFallbackBuckets_OverCapMtimeBoundaryStaysDiscoverable(t *te
 
 }
 
+func TestCodexRolloutFallbackBuckets_OverCapDistinctMtimesStayDiscoverable(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "backlog@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	oldestMtime := now.Add(-30 * time.Minute)
+	total := codexRolloutScanFileCap + 1
+	for i := range total {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%05d.jsonl", i))
+		event := time.Date(2026, 8, 26, 14, 0, i, 0, time.UTC).Format(time.RFC3339)
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":%q,"type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`, event, 20+i) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := oldestMtime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || first == nil {
+		t.Fatalf("ok=%v progress=%+v, want first capped batch and resumable progress", ok, first)
+	}
+	if first.mtimeNs != 0 || first.backlogCursor == "" || first.backlogFingerprint == "" {
+		t.Fatalf("progress=%+v, want high-water pinned below the distinct-mtime backlog", first)
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, first, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.mtimeNs != 0 || cursor.backlogCursor != first.backlogCursor {
+		t.Fatalf("cursor=%+v, want persisted distinct-mtime resume point", cursor)
+	}
+	encoded, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "rollout-") || strings.Contains(string(encoded), base) {
+		t.Fatalf("serialized backlog progress leaked a source filename: %s", encoded)
+	}
+
+	contributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || completed == nil {
+		t.Fatalf("ok=%v progress=%+v, want omitted oldest rollout consumed", ok, completed)
+	}
+	var consumed float64
+	for _, bucket := range contributors[codexWindowPrimary] {
+		consumed = bucket.UsedPercentage
+	}
+	if consumed != 20 {
+		t.Fatalf("consumed=%v, want the omitted oldest rollout's 20%%", consumed)
+	}
+	newestMtime := oldestMtime.Add(time.Duration(total-1) * time.Second)
+	if completed.mtimeNs != newestMtime.UnixNano() || completed.backlogCursor != "" {
+		t.Fatalf("completed progress=%+v, want full cohort high-water at %d", completed, newestMtime.UnixNano())
+	}
+
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, completed, base,
+	)
+	finishedCursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	unchanged, complete := codexDiscoverRolloutCandidates(context.Background(), base, finishedCursor)
+	if !complete || len(unchanged) != 0 {
+		t.Fatalf("complete=%v candidates=%d, want completed distinct-mtime cohort cache-only", complete, len(unchanged))
+	}
+}
+
 func TestCodexRolloutFallbackBuckets_NewerFileDoesNotSkipUnfinishedBoundary(t *testing.T) {
 	base := t.TempDir()
 	helperCodexAuthAt(t, base, "boundary-newer@example.com", codexTestLogin)
