@@ -1676,7 +1676,12 @@ func codexRolloutBoundaryFingerprint(candidates []codexRolloutCandidate, mtimeNs
 type codexReadDirResumeState struct {
 	f       *os.File
 	entries []os.DirEntry
+	gate    chan struct{}
+	refs    int
+	usedAt  time.Time
 }
+
+const codexReadDirResumeLimit = 16
 
 var (
 	codexReadDirResumeMu sync.Mutex
@@ -1684,11 +1689,17 @@ var (
 )
 
 func codexCloseReadDirResume(dir string) {
+	var f *os.File
 	codexReadDirResumeMu.Lock()
-	defer codexReadDirResumeMu.Unlock()
-	if state := codexReadDirResumes[dir]; state != nil {
-		_ = state.f.Close()
+	state := codexReadDirResumes[dir]
+	if state != nil && state.refs == 0 {
 		delete(codexReadDirResumes, dir)
+		f = state.f
+		state.f = nil
+	}
+	codexReadDirResumeMu.Unlock()
+	if f != nil {
+		_ = f.Close()
 	}
 }
 
@@ -1698,16 +1709,34 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error)
 	// the same prefix. Serialize access because os.File's directory offset and
 	// the accumulated listing form one cursor.
 	codexReadDirResumeMu.Lock()
-	defer codexReadDirResumeMu.Unlock()
-
 	state := codexReadDirResumes[dir]
 	if state == nil {
+		state = &codexReadDirResumeState{gate: make(chan struct{}, 1)}
+		state.gate <- struct{}{}
+		codexReadDirResumes[dir] = state
+	}
+	state.refs++
+	state.usedAt = time.Now()
+	codexReadDirResumeMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		codexReadDirResumeRelease(dir, state, false)
+		return nil, ctx.Err()
+	case <-state.gate:
+	}
+	remove := false
+	defer func() {
+		state.gate <- struct{}{}
+		codexReadDirResumeRelease(dir, state, remove)
+	}()
+	if state.f == nil {
 		f, err := os.Open(dir)
 		if err != nil {
+			remove = true
 			return nil, err
 		}
-		state = &codexReadDirResumeState{f: f}
-		codexReadDirResumes[dir] = state
+		state.f = f
 	}
 	// Entries accumulated before this invocation were already returned to the
 	// previous discovery pass. If this invocation is interrupted too, return
@@ -1723,13 +1752,15 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error)
 		state.entries = append(state.entries, batch...)
 		if readErr == io.EOF {
 			_ = state.f.Close()
-			delete(codexReadDirResumes, dir)
+			state.f = nil
+			remove = true
 			break
 		}
 		if readErr != nil {
 			entries := append([]os.DirEntry(nil), state.entries[firstNew:]...)
 			_ = state.f.Close()
-			delete(codexReadDirResumes, dir)
+			state.f = nil
+			remove = true
 			return entries, readErr
 		}
 	}
@@ -1738,6 +1769,36 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error)
 		return entries[i].Name() < entries[j].Name()
 	})
 	return entries, nil
+}
+
+func codexReadDirResumeRelease(dir string, state *codexReadDirResumeState, remove bool) {
+	var closeStates []*codexReadDirResumeState
+	codexReadDirResumeMu.Lock()
+	state.refs--
+	state.usedAt = time.Now()
+	if remove && state.refs == 0 && codexReadDirResumes[dir] == state {
+		delete(codexReadDirResumes, dir)
+	}
+	for len(codexReadDirResumes) > codexReadDirResumeLimit {
+		var oldestDir string
+		var oldest *codexReadDirResumeState
+		for candidateDir, candidate := range codexReadDirResumes {
+			if candidate.refs == 0 && (oldest == nil || candidate.usedAt.Before(oldest.usedAt)) {
+				oldestDir, oldest = candidateDir, candidate
+			}
+		}
+		if oldest == nil {
+			break
+		}
+		delete(codexReadDirResumes, oldestDir)
+		closeStates = append(closeStates, oldest)
+	}
+	codexReadDirResumeMu.Unlock()
+	for _, candidate := range closeStates {
+		if candidate.f != nil {
+			_ = candidate.f.Close()
+		}
+	}
 }
 
 // codexDiscoverRolloutCandidates walks the fixed YYYY/MM/DD rollout layout

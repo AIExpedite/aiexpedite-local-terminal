@@ -2760,6 +2760,59 @@ func TestCodexReadDirContext_RepeatedCancellationReturnsOnlyNewEntries(t *testin
 	}
 }
 
+func TestCodexReadDirContext_CancelsWhileAnotherReadOwnsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	state := &codexReadDirResumeState{gate: make(chan struct{}, 1), refs: 1, usedAt: time.Now()}
+	codexReadDirResumeMu.Lock()
+	codexReadDirResumes[dir] = state
+	codexReadDirResumeMu.Unlock()
+	t.Cleanup(func() {
+		codexReadDirResumeMu.Lock()
+		state.refs = 0
+		codexReadDirResumeMu.Unlock()
+		codexCloseReadDirResume(dir)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
+		t.Fatalf("err=%v, want cancellation while waiting for the per-directory gate", err)
+	}
+}
+
+func TestCodexReadDirResume_EvictsAbandonedStreams(t *testing.T) {
+	dirs := make([]string, 0, codexReadDirResumeLimit+1)
+	for i := 0; i <= codexReadDirResumeLimit; i++ {
+		dir := t.TempDir()
+		dirs = append(dirs, dir)
+		for j := 0; j < codexRolloutReadDirChunkSize*2; j++ {
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", j)), []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+		if _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
+			t.Fatalf("read %d err=%v, want interrupted resumable stream", i, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, dir := range dirs {
+			codexCloseReadDirResume(dir)
+		}
+	})
+
+	codexReadDirResumeMu.Lock()
+	count := len(codexReadDirResumes)
+	_, oldestRetained := codexReadDirResumes[dirs[0]]
+	codexReadDirResumeMu.Unlock()
+	if count > codexReadDirResumeLimit {
+		t.Fatalf("resume states=%d, want at most %d", count, codexReadDirResumeLimit)
+	}
+	if oldestRetained {
+		t.Fatal("oldest abandoned resume stream was not evicted")
+	}
+}
+
 func TestCodexDiscoverRolloutCandidates_PreservesPartialLeafDirectoryResults(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "sessions", "2026", "08", "26")
