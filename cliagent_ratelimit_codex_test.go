@@ -3833,3 +3833,176 @@ func TestCodexRolloutFallbackBuckets_OverCapMtimeBoundaryStaysDiscoverable(t *te
 	}
 
 }
+
+func TestCodexRolloutFallbackBuckets_NewerFileDoesNotSkipUnfinishedBoundary(t *testing.T) {
+	base := t.TempDir()
+	helperCodexAuthAt(t, base, "boundary-newer@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	shared := now.Add(-30 * time.Minute)
+	totalAtBoundary := codexRolloutScanFileCap*2 + 1
+	for i := range totalAtBoundary {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-boundary-%05d.jsonl", i))
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`, 20+i) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, shared, shared); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || first == nil || first.boundaryCursor == "" {
+		t.Fatalf("ok=%v progress=%+v, want a resumable first boundary batch", ok, first)
+	}
+	firstCursor := codexRolloutScanCursor{
+		mtimeNs:             first.mtimeNs,
+		boundaryFingerprint: first.boundaryFingerprint,
+		boundaryCursor:      first.boundaryCursor,
+	}
+
+	newerPath := filepath.Join(dir, "rollout-newer.jsonl")
+	newerContents := `{"timestamp":"2026-08-26T14:20:00Z","type":"session_meta"}` + "\n" +
+		`{"timestamp":"2026-08-26T14:25:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":75,"window_minutes":300}}}` + "\n"
+	if err := os.WriteFile(newerPath, []byte(newerContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newerMtime := now.Add(-time.Minute)
+	if err := os.Chtimes(newerPath, newerMtime, newerMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, _, second, ok := codexRolloutFallbackBuckets(context.Background(), base, now, firstCursor)
+	if !ok || second == nil {
+		t.Fatalf("ok=%v progress=%+v, want the mixed newer/boundary batch handled", ok, second)
+	}
+	if second.mtimeNs != shared.UnixNano() || second.boundaryCursor == "" {
+		t.Fatalf("progress=%+v, want high-water pinned to unfinished boundary %d", second, shared.UnixNano())
+	}
+	secondCursor := codexRolloutScanCursor{
+		mtimeNs:             second.mtimeNs,
+		boundaryFingerprint: second.boundaryFingerprint,
+		boundaryCursor:      second.boundaryCursor,
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, secondCursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery")
+	}
+	eligible := codexUnconsumedRolloutCandidates(candidates, secondCursor, now)
+	remainingAtBoundary := 0
+	for _, candidate := range eligible {
+		if candidate.mtime.Equal(shared) {
+			remainingAtBoundary++
+		}
+	}
+	if remainingAtBoundary != 2 {
+		t.Fatalf("remaining boundary candidates=%d, want 2 left for the next batch", remainingAtBoundary)
+	}
+
+	_, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, secondCursor)
+	if !ok || completed == nil || completed.mtimeNs != newerMtime.UnixNano() || completed.boundaryCursor != "" {
+		t.Fatalf("ok=%v progress=%+v, want final boundary batch to advance to newer rollout", ok, completed)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_RecordsFutureCandidatesSeparately(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "future-progress@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	futureMtime := now.Add(24 * time.Hour)
+	for i := range codexRolloutScanFileCap + 1 {
+		futurePath := filepath.Join(dir, fmt.Sprintf("rollout-future-secret-sentinel-%02d.jsonl", i))
+		futureContents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`, 41+i) + "\n"
+		if err := os.WriteFile(futurePath, []byte(futureContents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(futurePath, futureMtime, futureMtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	startingCursor := codexRolloutScanCursor{mtimeNs: now.Add(-time.Second).UnixNano()}
+	contributors, _, _, progress, ok := codexRolloutFallbackBuckets(context.Background(), base, now, startingCursor)
+	if !ok || progress == nil || progress.futureFingerprint == "" || progress.futureCursor == "" || progress.futureComplete {
+		t.Fatalf("ok=%v progress=%+v, want resumable redacted future-file progress", ok, progress)
+	}
+	if progress.mtimeNs != startingCursor.mtimeNs {
+		t.Fatalf("normal high-water=%d, want existing cursor %d preserved", progress.mtimeNs, startingCursor.mtimeNs)
+	}
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, progress, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.futureFingerprint == "" || cursor.futureCursor == "" || cursor.futureComplete {
+		t.Fatalf("reloaded cursor=%+v, want resumable future-file state", cursor)
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery")
+	}
+	eligible := codexUnconsumedRolloutCandidates(candidates, cursor, now)
+	if len(eligible) != 1 {
+		t.Fatalf("eligible=%d, want the one future rollout left beyond the first capped batch", len(eligible))
+	}
+	lastContributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || completed == nil || !completed.futureComplete || completed.futureCursor != "" {
+		t.Fatalf("ok=%v progress=%+v, want final future batch marked complete", ok, completed)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, lastContributors, nil, false, nil, false, now, fingerprint, completed, base,
+	)
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.futureFingerprint == "" || !cursor.futureComplete {
+		t.Fatalf("reloaded cursor=%+v, want completed future-file state", cursor)
+	}
+	encoded, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "future-secret-sentinel") || strings.Contains(string(encoded), base) {
+		t.Fatalf("serialized future progress leaked a source path: %s", encoded)
+	}
+	candidates, complete = codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery")
+	}
+	if eligible = codexUnconsumedRolloutCandidates(candidates, cursor, now); len(eligible) != 0 {
+		t.Fatalf("eligible=%+v, want unchanged future-dated rollouts recorded as consumed", eligible)
+	}
+
+	normalPath := filepath.Join(dir, "rollout-normal.jsonl")
+	normalContents := `{"timestamp":"2026-08-26T14:30:00Z","type":"session_meta"}` + "\n" +
+		`{"timestamp":"2026-08-26T14:40:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":64,"window_minutes":300}}}` + "\n"
+	if err := os.WriteFile(normalPath, []byte(normalContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	normalMtime := now.Add(-500 * time.Millisecond)
+	if err := os.Chtimes(normalPath, normalMtime, normalMtime); err != nil {
+		t.Fatal(err)
+	}
+	newContributors, _, _, next, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || next == nil {
+		t.Fatalf("ok=%v progress=%+v, want newly written normal-time rollout consumed", ok, next)
+	}
+	var consumed float64
+	for _, bucket := range newContributors[codexWindowPrimary] {
+		consumed = bucket.UsedPercentage
+	}
+	if consumed != 64 {
+		t.Fatalf("normal-time usage=%v, want 64%% while future rollout stays excluded", consumed)
+	}
+}
