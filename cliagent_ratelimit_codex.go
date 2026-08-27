@@ -152,6 +152,9 @@ type codexRateLimitSnapshot struct {
 	// watermark to them could hide normally timestamped files written after a
 	// clock rollback. Track their redacted membership and capped-batch position
 	// separately so unchanged anomalous files are not reopened on every refresh.
+	// The anchor fixes the cohort definition across wall-clock catch-up while an
+	// unfinished capped batch is resumed.
+	RolloutFutureMtimeAnchorNs    int64  `json:"rolloutFutureMtimeAnchorNs,omitempty"`
 	RolloutFutureMtimeFingerprint string `json:"rolloutFutureMtimeFingerprint,omitempty"`
 	RolloutFutureMtimeCursor      string `json:"rolloutFutureMtimeCursor,omitempty"`
 	RolloutFutureMtimeComplete    bool   `json:"rolloutFutureMtimeComplete,omitempty"`
@@ -1310,6 +1313,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutHighWaterMtimeNs = 0
 		snap.RolloutHighWaterBoundaryFingerprint = ""
 		snap.RolloutHighWaterBoundaryCursor = ""
+		snap.RolloutFutureMtimeAnchorNs = 0
 		snap.RolloutFutureMtimeFingerprint = ""
 		snap.RolloutFutureMtimeCursor = ""
 		snap.RolloutFutureMtimeComplete = false
@@ -1459,6 +1463,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutHighWaterMtimeNs = 0
 		snap.RolloutHighWaterBoundaryFingerprint = ""
 		snap.RolloutHighWaterBoundaryCursor = ""
+		snap.RolloutFutureMtimeAnchorNs = 0
 		snap.RolloutFutureMtimeFingerprint = ""
 		snap.RolloutFutureMtimeCursor = ""
 		snap.RolloutFutureMtimeComplete = false
@@ -1471,6 +1476,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutHighWaterMtimeMs = time.Unix(0, rolloutHighWater.mtimeNs).UnixMilli()
 		snap.RolloutHighWaterBoundaryFingerprint = rolloutHighWater.boundaryFingerprint
 		snap.RolloutHighWaterBoundaryCursor = rolloutHighWater.boundaryCursor
+		snap.RolloutFutureMtimeAnchorNs = rolloutHighWater.futureAnchorNs
 		snap.RolloutFutureMtimeFingerprint = rolloutHighWater.futureFingerprint
 		snap.RolloutFutureMtimeCursor = rolloutHighWater.futureCursor
 		snap.RolloutFutureMtimeComplete = rolloutHighWater.futureComplete
@@ -1676,6 +1682,7 @@ type codexRolloutScanCursor struct {
 	futureFingerprint   string
 	futureCursor        string
 	futureComplete      bool
+	futureAnchorNs      int64
 }
 
 type codexRolloutScanProgress struct {
@@ -1685,6 +1692,7 @@ type codexRolloutScanProgress struct {
 	futureFingerprint   string
 	futureCursor        string
 	futureComplete      bool
+	futureAnchorNs      int64
 }
 
 // codexRolloutRootFingerprint identifies a CODEX_HOME without persisting its
@@ -1737,6 +1745,7 @@ func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.
 			mtimeNs:             snap.RolloutHighWaterMtimeNs,
 			boundaryFingerprint: snap.RolloutHighWaterBoundaryFingerprint,
 			boundaryCursor:      snap.RolloutHighWaterBoundaryCursor,
+			futureAnchorNs:      snap.RolloutFutureMtimeAnchorNs,
 			futureFingerprint:   snap.RolloutFutureMtimeFingerprint,
 			futureCursor:        snap.RolloutFutureMtimeCursor,
 			futureComplete:      snap.RolloutFutureMtimeComplete,
@@ -1749,6 +1758,7 @@ func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.
 		}
 		return codexRolloutScanCursor{
 			mtimeNs:           mtimeNs,
+			futureAnchorNs:    snap.RolloutFutureMtimeAnchorNs,
 			futureFingerprint: snap.RolloutFutureMtimeFingerprint,
 			futureCursor:      snap.RolloutFutureMtimeCursor,
 			futureComplete:    snap.RolloutFutureMtimeComplete,
@@ -1824,6 +1834,13 @@ func codexRolloutFutureFingerprint(candidates []codexRolloutCandidate, now time.
 	sort.Strings(entries)
 	sum := sha256.Sum256([]byte(strings.Join(entries, "\n")))
 	return fmt.Sprintf("%x", sum[:])
+}
+
+func codexRolloutFutureAnchor(cursor codexRolloutScanCursor, now time.Time) time.Time {
+	if cursor.futureFingerprint != "" && cursor.futureAnchorNs > 0 {
+		return time.Unix(0, cursor.futureAnchorNs)
+	}
+	return now
 }
 
 type codexReadDirResumeState struct {
@@ -2267,13 +2284,14 @@ func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor
 		}
 	}
 
+	futureAnchor := codexRolloutFutureAnchor(cursor, now)
 	futureMatches := cursor.futureFingerprint != "" &&
-		codexRolloutFutureFingerprint(candidates, now) == cursor.futureFingerprint
+		codexRolloutFutureFingerprint(candidates, futureAnchor) == cursor.futureFingerprint
 	var futureCutoff codexRolloutCandidate
 	futureFound := false
 	if futureMatches && !cursor.futureComplete && cursor.futureCursor != "" {
 		for _, candidate := range candidates {
-			if candidate.mtime.After(now) && codexRolloutFutureEntryDigest(candidate) == cursor.futureCursor {
+			if candidate.mtime.After(futureAnchor) && codexRolloutFutureEntryDigest(candidate) == cursor.futureCursor {
 				futureCutoff, futureFound = candidate, true
 				break
 			}
@@ -2282,7 +2300,7 @@ func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor
 
 	eligible := make([]codexRolloutCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		if candidate.mtime.After(now) && futureMatches {
+		if candidate.mtime.After(futureAnchor) && futureMatches {
 			if cursor.futureComplete || (futureFound && !codexRolloutCandidateBefore(futureCutoff, candidate, now)) {
 				continue
 			}
@@ -2367,16 +2385,17 @@ func codexRolloutHasUnselectedBelowProgress(eligible, selected []codexRolloutCan
 	return false
 }
 
-func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCandidate, now time.Time, cursor codexRolloutScanCursor) (string, string, bool) {
-	fingerprint := codexRolloutFutureFingerprint(candidates, now)
+func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCandidate, now time.Time, cursor codexRolloutScanCursor) (int64, string, string, bool) {
+	anchor := codexRolloutFutureAnchor(cursor, now)
+	fingerprint := codexRolloutFutureFingerprint(candidates, anchor)
 	if fingerprint == "" {
-		return "", "", false
+		return 0, "", "", false
 	}
 	selectedFuture := map[string]struct{}{}
 	var lastSelected codexRolloutCandidate
 	haveLast := false
 	for _, candidate := range selected {
-		if !candidate.mtime.After(now) {
+		if !candidate.mtime.After(anchor) {
 			continue
 		}
 		selectedFuture[codexRolloutFutureEntryDigest(candidate)] = struct{}{}
@@ -2386,7 +2405,7 @@ func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCan
 	}
 	remaining := false
 	for _, candidate := range eligible {
-		if !candidate.mtime.After(now) {
+		if !candidate.mtime.After(anchor) {
 			continue
 		}
 		if _, ok := selectedFuture[codexRolloutFutureEntryDigest(candidate)]; !ok {
@@ -2395,15 +2414,15 @@ func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCan
 		}
 	}
 	if !remaining {
-		return fingerprint, "", true
+		return anchor.UnixNano(), fingerprint, "", true
 	}
 	if haveLast {
-		return fingerprint, codexRolloutFutureEntryDigest(lastSelected), false
+		return anchor.UnixNano(), fingerprint, codexRolloutFutureEntryDigest(lastSelected), false
 	}
 	if fingerprint == cursor.futureFingerprint {
-		return fingerprint, cursor.futureCursor, false
+		return anchor.UnixNano(), fingerprint, cursor.futureCursor, false
 	}
-	return fingerprint, "", false
+	return anchor.UnixNano(), fingerprint, "", false
 }
 
 // codexRolloutFallbackBuckets reads Codex's session rollout logs
@@ -2467,7 +2486,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// already-consumed file and preserve the anomalous-file completion state.
 		if discoveryComplete {
 			progress := codexRolloutBoundaryProgress(candidates, nil, nil, cursor.mtimeNs)
-			progress.futureFingerprint, progress.futureCursor, progress.futureComplete =
+			progress.futureAnchorNs, progress.futureFingerprint, progress.futureCursor, progress.futureComplete =
 				codexRolloutFutureProgress(candidates, nil, nil, now, cursor)
 			return nil, codexUsageLimitEvidence{}, time.Time{}, &progress, false
 		}
@@ -2638,6 +2657,14 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// same deterministic newest subset forever. Once the whole boundary is
 		// consumed, the cursor is cleared and its full fingerprint restores the
 		// ordinary cache-only unchanged-boundary fast path.
+		futureAnchorNs, futureFingerprint, futureCursor, futureComplete :=
+			codexRolloutFutureProgress(candidates, eligibleCandidates, selected, now, cursor)
+		if cursor.futureFingerprint != "" && futureFingerprint != "" && !futureComplete {
+			// A cohort that was future-dated when its capped scan started may be
+			// normal-time by the next refresh. Keep the main high-water below that
+			// unfinished cohort so its older unread entries cannot be skipped.
+			maxSelectedMtimeNs = cursor.mtimeNs
+		}
 		progress := codexRolloutBoundaryProgress(candidates, eligibleCandidates, selected, maxSelectedMtimeNs)
 		if unfinishedSavedBoundary && progress.boundaryCursor == "" &&
 			codexRolloutBoundaryFingerprint(candidates, cursor.mtimeNs) == cursor.boundaryFingerprint {
@@ -2646,8 +2673,10 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 			progress.boundaryFingerprint = cursor.boundaryFingerprint
 			progress.boundaryCursor = cursor.boundaryCursor
 		}
-		progress.futureFingerprint, progress.futureCursor, progress.futureComplete =
-			codexRolloutFutureProgress(candidates, eligibleCandidates, selected, now, cursor)
+		progress.futureAnchorNs = futureAnchorNs
+		progress.futureFingerprint = futureFingerprint
+		progress.futureCursor = futureCursor
+		progress.futureComplete = futureComplete
 		highWater = &progress
 	}
 	if len(winners) == 0 {

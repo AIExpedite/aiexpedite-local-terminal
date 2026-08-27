@@ -4205,3 +4205,80 @@ func TestCodexRolloutFallbackBuckets_RecordsFutureCandidatesSeparately(t *testin
 		t.Fatalf("normal-time usage=%v, want 64%% while future rollout stays excluded", consumed)
 	}
 }
+
+func TestCodexRolloutFallbackBuckets_ResumesFutureBatchAfterClockCatchUp(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "future-catch-up@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	total := codexRolloutScanFileCap + 1
+	for i := range total {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-future-catch-up-%02d.jsonl", i))
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == total-1 {
+			// This distinct contributor is deliberately the oldest future mtime,
+			// just beyond the first capped batch.
+			window = `"secondary":{"used_percent":73,"window_minutes":10080}`
+		}
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{%s}}`, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := now.Add(time.Duration(total-i) * time.Hour)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	startingCursor := codexRolloutScanCursor{mtimeNs: now.Add(-time.Second).UnixNano()}
+	firstContributors, _, _, firstProgress, ok := codexRolloutFallbackBuckets(context.Background(), base, now, startingCursor)
+	if !ok || firstProgress == nil || firstProgress.futureCursor == "" || firstProgress.futureComplete {
+		t.Fatalf("ok=%v progress=%+v, want unfinished first future batch", ok, firstProgress)
+	}
+	if firstProgress.futureAnchorNs != now.UnixNano() {
+		t.Fatalf("future anchor=%d, want initial gather time %d", firstProgress.futureAnchorNs, now.UnixNano())
+	}
+	if len(firstContributors[codexWindowSecondary]) != 0 {
+		t.Fatal("first capped batch unexpectedly consumed the oldest weekly rollout")
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, firstProgress, base,
+	)
+	caughtUp := now.Add(time.Duration(total+2) * time.Hour)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, caughtUp)
+	if cursor.futureAnchorNs != now.UnixNano() {
+		t.Fatalf("reloaded future anchor=%d, want %d", cursor.futureAnchorNs, now.UnixNano())
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery after clock catch-up")
+	}
+	eligible := codexUnconsumedRolloutCandidates(candidates, cursor, caughtUp)
+	if len(eligible) != 1 {
+		t.Fatalf("eligible=%d, want only the unread oldest rollout after clock catch-up", len(eligible))
+	}
+
+	lastContributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, caughtUp, cursor)
+	if !ok || completed == nil || !completed.futureComplete {
+		t.Fatalf("ok=%v progress=%+v, want caught-up future cohort completed", ok, completed)
+	}
+	foundWeekly := false
+	for _, bucket := range lastContributors[codexWindowSecondary] {
+		if bucket.UsedPercentage == 73 {
+			foundWeekly = true
+		}
+	}
+	if !foundWeekly {
+		t.Fatalf("contributors=%+v, want oldest rollout's distinct weekly metric", lastContributors)
+	}
+}
