@@ -139,10 +139,15 @@ type codexRateLimitSnapshot struct {
 	// snapshots written before same-millisecond appends were handled.
 	RolloutHighWaterMtimeNs int64 `json:"rolloutHighWaterMtimeNs,omitempty"`
 	// RolloutHighWaterBoundaryFingerprint identifies only the files and sizes at
-	// the completed mtime boundary. It lets a coarse-resolution filesystem expose
+	// the current mtime boundary. It lets a coarse-resolution filesystem expose
 	// an append whose mtime stayed exactly equal to the high-water without
 	// persisting rollout paths or reopening unchanged files.
 	RolloutHighWaterBoundaryFingerprint string `json:"rolloutHighWaterBoundaryFingerprint,omitempty"`
+	// RolloutHighWaterBoundaryCursor is the SHA-256 digest of the last boundary
+	// entry opened when more equal-mtime files exist than one capped pass can
+	// consume. The digest resumes deterministic ordering without persisting a
+	// rollout path; including file size makes an equal-mtime append reset safely.
+	RolloutHighWaterBoundaryCursor string `json:"rolloutHighWaterBoundaryCursor,omitempty"`
 	// RolloutRootFingerprint scopes filesystem progress to the CODEX_HOME tree
 	// that produced it. It is a hash of the normalized root, never the raw path.
 	RolloutRootFingerprint string `json:"rolloutRootFingerprint,omitempty"`
@@ -1242,6 +1247,7 @@ func mergeCodexRateLimitCachePerLimitProgress(
 		snap.RolloutHighWaterMtimeMs = 0
 		snap.RolloutHighWaterMtimeNs = 0
 		snap.RolloutHighWaterBoundaryFingerprint = ""
+		snap.RolloutHighWaterBoundaryCursor = ""
 		snap.RolloutRootFingerprint = ""
 	}
 	// Migrate legacy cache files written before Contributors existed: each
@@ -1387,16 +1393,16 @@ func mergeCodexRateLimitCachePerLimitProgress(
 		snap.RolloutHighWaterMtimeMs = 0
 		snap.RolloutHighWaterMtimeNs = 0
 		snap.RolloutHighWaterBoundaryFingerprint = ""
+		snap.RolloutHighWaterBoundaryCursor = ""
 		snap.RolloutRootFingerprint = rolloutRootFingerprint
 	}
 	storedRolloutCursorIsFuture := snap.RolloutHighWaterMtimeNs > now.UnixNano() ||
 		(snap.RolloutHighWaterMtimeNs == 0 && snap.RolloutHighWaterMtimeMs > now.UnixMilli())
-	if rolloutHighWater != nil && (storedRolloutCursorIsFuture || rolloutHighWater.mtimeNs > snap.RolloutHighWaterMtimeNs ||
-		(rolloutHighWater.mtimeNs == snap.RolloutHighWaterMtimeNs &&
-			rolloutHighWater.boundaryFingerprint != snap.RolloutHighWaterBoundaryFingerprint)) {
+	if rolloutHighWater != nil && (storedRolloutCursorIsFuture || rolloutHighWater.mtimeNs >= snap.RolloutHighWaterMtimeNs) {
 		snap.RolloutHighWaterMtimeNs = rolloutHighWater.mtimeNs
 		snap.RolloutHighWaterMtimeMs = time.Unix(0, rolloutHighWater.mtimeNs).UnixMilli()
 		snap.RolloutHighWaterBoundaryFingerprint = rolloutHighWater.boundaryFingerprint
+		snap.RolloutHighWaterBoundaryCursor = rolloutHighWater.boundaryCursor
 		snap.RolloutRootFingerprint = rolloutRootFingerprint
 	}
 
@@ -1593,11 +1599,13 @@ func codexLatestContributorObservation(contribs map[string]map[string]codexRateL
 type codexRolloutScanCursor struct {
 	mtimeNs             int64
 	boundaryFingerprint string
+	boundaryCursor      string
 }
 
 type codexRolloutScanProgress struct {
 	mtimeNs             int64
 	boundaryFingerprint string
+	boundaryCursor      string
 }
 
 // codexRolloutRootFingerprint identifies a CODEX_HOME without persisting its
@@ -1649,6 +1657,7 @@ func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.
 		return codexRolloutScanCursor{
 			mtimeNs:             snap.RolloutHighWaterMtimeNs,
 			boundaryFingerprint: snap.RolloutHighWaterBoundaryFingerprint,
+			boundaryCursor:      snap.RolloutHighWaterBoundaryCursor,
 		}
 	}
 	if snap.RolloutHighWaterMtimeMs > 0 {
@@ -1690,7 +1699,7 @@ func codexRolloutBoundaryFingerprint(candidates []codexRolloutCandidate, mtimeNs
 	entries := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
 		if candidate.mtime.UnixNano() == mtimeNs {
-			entries = append(entries, fmt.Sprintf("%s\x00%d", candidate.boundaryID, candidate.size))
+			entries = append(entries, codexRolloutBoundaryEntryDigest(candidate))
 		}
 	}
 	if len(entries) == 0 {
@@ -1698,6 +1707,11 @@ func codexRolloutBoundaryFingerprint(candidates []codexRolloutCandidate, mtimeNs
 	}
 	sort.Strings(entries)
 	sum := sha256.Sum256([]byte(strings.Join(entries, "\n")))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func codexRolloutBoundaryEntryDigest(candidate codexRolloutCandidate) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", candidate.boundaryID, candidate.size)))
 	return fmt.Sprintf("%x", sum[:])
 }
 
@@ -1936,7 +1950,7 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 	// rescan equality only when that boundary changed (or once for a legacy cache
 	// that predates fingerprints).
 	if len(boundaryCandidates) > 0 &&
-		(cursor.boundaryFingerprint == "" ||
+		(cursor.boundaryCursor != "" || cursor.boundaryFingerprint == "" ||
 			codexRolloutBoundaryFingerprint(boundaryCandidates, cursor.mtimeNs) != cursor.boundaryFingerprint) {
 		candidates = append(candidates, boundaryCandidates...)
 	}
@@ -2069,6 +2083,76 @@ func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexR
 	return selected, true
 }
 
+func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor codexRolloutScanCursor, now time.Time) []codexRolloutCandidate {
+	if cursor.mtimeNs == 0 || cursor.boundaryCursor == "" {
+		return candidates
+	}
+	// Any membership or size change invalidates the positional cursor. Restart
+	// this small boundary rather than letting a newly appended/created entry rank
+	// ahead of the saved cutoff and get mistaken for already-consumed evidence.
+	if codexRolloutBoundaryFingerprint(candidates, cursor.mtimeNs) != cursor.boundaryFingerprint {
+		return candidates
+	}
+	var cutoff codexRolloutCandidate
+	found := false
+	for _, candidate := range candidates {
+		if candidate.mtime.UnixNano() == cursor.mtimeNs &&
+			codexRolloutBoundaryEntryDigest(candidate) == cursor.boundaryCursor {
+			cutoff, found = candidate, true
+			break
+		}
+	}
+	if !found {
+		return candidates
+	}
+
+	eligible := make([]codexRolloutCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.mtime.UnixNano() == cursor.mtimeNs {
+			// Equal-mtime ties are deterministic. Everything ranked before or at the
+			// saved cutoff was opened by an earlier pass; resume strictly after it.
+			if !codexRolloutCandidateBefore(cutoff, candidate, now) {
+				continue
+			}
+		}
+		eligible = append(eligible, candidate)
+	}
+	return eligible
+}
+
+func codexRolloutBoundaryProgress(candidates, eligible, selected []codexRolloutCandidate, mtimeNs int64) codexRolloutScanProgress {
+	selectedAtBoundary := map[string]struct{}{}
+	var lastSelected codexRolloutCandidate
+	haveLast := false
+	for _, candidate := range selected {
+		if candidate.mtime.UnixNano() == mtimeNs {
+			selectedAtBoundary[codexRolloutBoundaryEntryDigest(candidate)] = struct{}{}
+			if !haveLast || codexRolloutCandidateBefore(lastSelected, candidate, time.Unix(0, mtimeNs)) {
+				lastSelected, haveLast = candidate, true
+			}
+		}
+	}
+	remaining := false
+	for _, candidate := range eligible {
+		if candidate.mtime.UnixNano() != mtimeNs {
+			continue
+		}
+		if _, ok := selectedAtBoundary[codexRolloutBoundaryEntryDigest(candidate)]; !ok {
+			remaining = true
+			break
+		}
+	}
+	boundaryCursor := ""
+	if remaining && haveLast {
+		boundaryCursor = codexRolloutBoundaryEntryDigest(lastSelected)
+	}
+	return codexRolloutScanProgress{
+		mtimeNs:             mtimeNs,
+		boundaryFingerprint: codexRolloutBoundaryFingerprint(candidates, mtimeNs),
+		boundaryCursor:      boundaryCursor,
+	}
+}
+
 // codexRolloutFallbackBuckets reads Codex's session rollout logs
 // (CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl) for the most recent populated
 // `rate_limits` frame and returns its per-(window, limit) contributors. The
@@ -2122,6 +2206,17 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	if len(candidates) == 0 {
 		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
 	}
+	eligibleCandidates := codexUnconsumedRolloutCandidates(candidates, cursor, now)
+	if len(eligibleCandidates) == 0 {
+		// The boundary changed only by removing entries after an earlier partial
+		// pass. With no unread entry left, finish that boundary without reopening
+		// an already-consumed file.
+		if discoveryComplete {
+			progress := codexRolloutBoundaryProgress(candidates, nil, nil, cursor.mtimeNs)
+			return nil, codexUsageLimitEvidence{}, time.Time{}, &progress, false
+		}
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
+	}
 	// Rank candidates by file mtime descending, NOT by filename (= session
 	// start time). When sessions overlap — e.g. an older still-active session
 	// runs alongside a newer-started but idle one, or a long-lived session is
@@ -2164,7 +2259,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		}
 	}
 	orderingCtx, cancelOrdering := codexRolloutCandidateOrderingContext(ctx)
-	selected, selectionComplete := codexSelectNewestRolloutCandidates(orderingCtx, candidates, now, codexRolloutScanFileCap)
+	selected, selectionComplete := codexSelectNewestRolloutCandidates(orderingCtx, eligibleCandidates, now, codexRolloutScanFileCap)
 	cancelOrdering()
 	allHandled := discoveryComplete && selectionComplete
 	maxSelectedMtimeNs := int64(0)
@@ -2251,20 +2346,14 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		if nowNs := now.UnixNano(); maxSelectedMtimeNs > nowNs {
 			maxSelectedMtimeNs = now.Add(-codexRolloutCoarseMtimeOverlap).UnixNano()
 		}
-		// Fingerprint only the boundary files this pass actually consumed. More
-		// files than the cap can share the newest mtime (a coarse-resolution
-		// filesystem, or a batch restore that stamped them alike), and a
-		// fingerprint covering the unread ones would match on the next refresh —
-		// making discovery treat the boundary as unchanged and hide a rollout that
-		// was never opened, along with any distinct contributor only it carries.
-		// Fingerprinting the consumed subset keeps that boundary looking changed
-		// until every file at it has been read; in the ordinary case where the
-		// whole boundary fits under the cap the two are identical, so unchanged
-		// refreshes stay cache-only.
-		highWater = &codexRolloutScanProgress{
-			mtimeNs:             maxSelectedMtimeNs,
-			boundaryFingerprint: codexRolloutBoundaryFingerprint(selected, maxSelectedMtimeNs),
-		}
+		// Record a redacted cursor for the equal-mtime entries this pass opened. A
+		// later pass resumes after it before applying the cap, so a large coarse-
+		// mtime boundary advances through distinct batches instead of selecting the
+		// same deterministic newest subset forever. Once the whole boundary is
+		// consumed, the cursor is cleared and its full fingerprint restores the
+		// ordinary cache-only unchanged-boundary fast path.
+		progress := codexRolloutBoundaryProgress(candidates, eligibleCandidates, selected, maxSelectedMtimeNs)
+		highWater = &progress
 	}
 	if len(winners) == 0 {
 		// No usable window anywhere in the scanned logs — but a quota refusal

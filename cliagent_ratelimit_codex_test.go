@@ -3739,6 +3739,10 @@ func TestCodexRolloutFallbackBuckets_ExhaustedBudgetDoesNotAdvanceHighWater(t *t
 
 func TestCodexRolloutFallbackBuckets_OverCapMtimeBoundaryStaysDiscoverable(t *testing.T) {
 	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "boundary@example.com", codexTestLogin)
 	dir := filepath.Join(base, "sessions", "2026", "08", "26")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -3761,17 +3765,38 @@ func TestCodexRolloutFallbackBuckets_OverCapMtimeBoundaryStaysDiscoverable(t *te
 	}
 
 	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
-	_, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	firstContributors, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
 	if !ok || highWater == nil {
 		t.Fatalf("ok=%v highWater=%+v, want numeric evidence and completed-scan progress", ok, highWater)
 	}
 	if highWater.mtimeNs != shared.UnixNano() {
 		t.Fatalf("highWater=%+v, want the shared boundary mtime", highWater)
 	}
+	if highWater.boundaryCursor == "" {
+		t.Fatal("boundary cursor empty, want first capped batch resume point")
+	}
 
-	// Re-running with the recorded cursor must still see the boundary as changed,
-	// or the file the cap left unread would be excluded forever.
-	cursor := codexRolloutScanCursor{mtimeNs: highWater.mtimeNs, boundaryFingerprint: highWater.boundaryFingerprint}
+	// Persist and reload the partial cursor just as consecutive signed refreshes
+	// do. Re-running must still see the boundary as changed, or the file the cap
+	// left unread would be excluded forever.
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, highWater, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.boundaryCursor != highWater.boundaryCursor {
+		t.Fatalf("reloaded boundary cursor=%q, want %q", cursor.boundaryCursor, highWater.boundaryCursor)
+	}
+	encoded, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), "rolloutHighWaterBoundaryCursor") {
+		t.Fatalf("partial cache omitted redacted boundary cursor: %s", encoded)
+	}
+	if strings.Contains(string(encoded), "rollout-") || strings.Contains(string(encoded), base) {
+		t.Fatalf("serialized boundary progress leaked a source filename: %s", encoded)
+	}
 	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
 	if !complete {
 		t.Fatal("complete=false, want an uninterrupted rediscovery")
@@ -3779,4 +3804,32 @@ func TestCodexRolloutFallbackBuckets_OverCapMtimeBoundaryStaysDiscoverable(t *te
 	if len(candidates) != total {
 		t.Fatalf("candidates=%d, want all %d boundary rollouts re-offered while one is still unread", len(candidates), total)
 	}
+
+	// The next capped pass must exclude the first batch before ranking, consume
+	// the one remaining rollout, and then collapse to the unchanged-boundary
+	// cache-only state. The lowest-ranked filename carries 20%, so observing it
+	// proves selection rotated instead of replaying the same 16 files.
+	contributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || completed == nil {
+		t.Fatalf("ok=%v completed=%+v, want remaining boundary rollout consumed", ok, completed)
+	}
+	var consumed float64
+	for _, bucket := range contributors[codexWindowPrimary] {
+		consumed = bucket.UsedPercentage
+	}
+	if consumed != 20 {
+		t.Fatalf("consumed=%v, want unread lowest-ranked rollout's 20%%", consumed)
+	}
+	if completed.boundaryCursor != "" {
+		t.Fatalf("completed boundary retained cursor %q, want compact cache-only state", completed.boundaryCursor)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, completed, base,
+	)
+	finishedCursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	unchanged, complete := codexDiscoverRolloutCandidates(context.Background(), base, finishedCursor)
+	if !complete || len(unchanged) != 0 {
+		t.Fatalf("complete=%v candidates=%d, want finished unchanged boundary skipped", complete, len(unchanged))
+	}
+
 }
