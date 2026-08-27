@@ -29,12 +29,43 @@ type codexUsageParser struct{}
 
 func (codexUsageParser) Provider() string { return "codex" }
 
-var codexAuthStatusProbe = func(path string) (bool, bool) {
+// Every optional Codex sub-operation is carved out of the SHARED
+// GatherCLIAgentUsageOnly deadline, so each one holds back the time the steps
+// after it still need. codexGatherSiblingReserve is what the later providers
+// in the catalog are owed once Codex is done; the login probe additionally
+// reserves its own machineInfoProbeTimeout out of the rollout scan's share,
+// because it runs after the scan and cannot be interrupted mid-`CombinedOutput`
+// by anything but its own deadline.
+const codexGatherSiblingReserve = 2 * time.Second
+
+// codexRolloutScanBudget is the most the optional direct-run rollout scan may
+// take when the parent gather is unconstrained.
+const codexRolloutScanBudget = 5 * time.Second
+
+// codexSubBudget is how long an optional step may run without consuming
+// holdBack of the parent gather's remaining time. Zero means "skip it".
+func codexSubBudget(ctx context.Context, want, holdBack time.Duration) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return want
+	}
+	available := time.Until(deadline) - holdBack
+	if available <= 0 {
+		return 0
+	}
+	if available < want {
+		return available
+	}
+	return want
+}
+
+// The caller passes a context already bounded to this probe's share of the
+// gather deadline: an unbounded background probe is exactly what let Codex
+// overrun the deadline it shares with the providers parsed after it.
+var codexAuthStatusProbe = func(ctx context.Context, path string) (bool, bool) {
 	if strings.TrimSpace(path) == "" {
 		return false, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
-	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "login", "status")
 	// Background probe: hide the console the child would otherwise pop up on
 	// Windows, where the agent itself runs windowless in the tray.
@@ -48,6 +79,15 @@ var codexAuthStatusProbe = func(path string) (bool, bool) {
 		return true, true
 	}
 	return false, false
+}
+
+// codexProbeLoginStatus skips the probe outright when its budget is gone; an
+// already-expired context would otherwise spawn a child process only to kill it.
+func codexProbeLoginStatus(ctx context.Context, path string) (bool, bool) {
+	if ctx.Err() != nil {
+		return false, false
+	}
+	return codexAuthStatusProbe(ctx, path)
 }
 
 type codexAuth struct {
@@ -179,22 +219,15 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 	}
 
 	// Reconcile terminal-managed cache evidence with direct-run rollout logs.
-	// The optional scan gets at most five seconds and always leaves two seconds
-	// on the parent gather for later providers. Child expiry is best-effort: any
+	// The optional scan gets at most five seconds and always leaves the sibling
+	// reserve PLUS the login probe's own budget on the parent gather, so the two
+	// bounded children below cannot sum past it. Child expiry is best-effort: any
 	// complete numeric objects already consumed are persisted and the valid cache
 	// remains publishable.
 	usage.Metrics = codexMetricsFromCache(now, usage.AccountFingerprint)
 	var usageLimit codexUsageLimitEvidence
 	var latestRolloutObservation time.Time
-	scanBudget := 5 * time.Second
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 2*time.Second {
-			scanBudget = 0
-		} else if available := remaining - 2*time.Second; available < scanBudget {
-			scanBudget = available
-		}
-	}
+	scanBudget := codexSubBudget(ctx, codexRolloutScanBudget, codexGatherSiblingReserve+machineInfoProbeTimeout)
 	if scanBudget > 0 && ctx.Err() == nil {
 		scanCtx, cancel := context.WithTimeout(ctx, scanBudget)
 		usage.Metrics, usageLimit, latestRolloutObservation = codexReconcileFromRollout(scanCtx, base, usage.AccountFingerprint, now)
@@ -211,7 +244,14 @@ func (p codexUsageParser) ParseContext(ctx context.Context, home string, detecte
 		usage.Notice = notice
 		usage.NoticeSeverity = "error"
 	}
-	if loggedIn, known := codexAuthStatusProbe(detected.Path); known {
+	// No time left to answer is inconclusive — the same verdict a timed-out
+	// probe already produced — so a squeezed gather degrades rather than
+	// borrowing from the providers still to be parsed.
+	probeCtx, cancelProbe := context.WithTimeout(
+		ctx, codexSubBudget(ctx, machineInfoProbeTimeout, codexGatherSiblingReserve))
+	loggedIn, known := codexProbeLoginStatus(probeCtx, detected.Path)
+	cancelProbe()
+	if known {
 		// `codex login status` describes persisted login state, not inherited
 		// OPENAI_API_KEY authentication. A definite persisted logout therefore
 		// cannot invalidate a credential mode the app-server will actually use.

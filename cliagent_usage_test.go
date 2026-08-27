@@ -920,7 +920,7 @@ func TestCodexUsageParser_DefiniteLoggedOutProbeMakesUsageUnobservable(t *testin
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, true }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
@@ -956,7 +956,7 @@ func TestCodexUsageParser_NoCredentialAndInconclusiveProbeMakesUsageUnobservable
 	}, nil, now, "")
 
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return false, false }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, false }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
@@ -997,7 +997,7 @@ func TestCodexUsageParser_EnvironmentAPIKeySurvivesPersistedLogoutProbe(t *testi
 	}, nil, now, "")
 
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, true }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
@@ -1032,7 +1032,7 @@ func TestCodexUsageParser_APIKeyFallbackDropsStaleOAuthExpiry(t *testing.T) {
 	})
 
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, true }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{
@@ -1063,7 +1063,7 @@ func TestCodexUsageParser_LoggedOutProbeDropsStaleOAuthExpiry(t *testing.T) {
 	})
 
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, true }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{
@@ -1095,7 +1095,7 @@ func TestCodexUsageParser_ReportsAccessTokenExpiryForActiveOAuthLogin(t *testing
 	})
 
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return true, true }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return true, true }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{
@@ -3665,5 +3665,82 @@ func TestCodexUsageParser_RolloutFillsRolledOverMigratedWeekly(t *testing.T) {
 	}
 	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 18 {
 		t.Errorf("weekly metric=%+v, want 18 refilled from rollout (stale rolled-over migrated weekly must not stick at 0%%)", weekly)
+	}
+}
+
+// The login probe runs AFTER the rollout scan and blocks in CombinedOutput, so
+// its budget has to be carved out of the same parent deadline rather than taken
+// from an independent background context — otherwise scan + probe together
+// overrun the gather and delay every provider parsed after Codex.
+func TestCodexSubBudget_HoldsBackLaterSteps(t *testing.T) {
+	tests := []struct {
+		name      string
+		remaining time.Duration
+		want      time.Duration
+		holdBack  time.Duration
+	}{
+		{"scan skipped when only the reserves remain", 5 * time.Second, 0, codexGatherSiblingReserve + machineInfoProbeTimeout},
+		{"scan trimmed to what the reserves leave", 7 * time.Second, 2 * time.Second, codexGatherSiblingReserve + machineInfoProbeTimeout},
+		{"scan capped at its own ceiling", 30 * time.Second, codexRolloutScanBudget, codexGatherSiblingReserve + machineInfoProbeTimeout},
+		{"probe trimmed to the sibling reserve", 4 * time.Second, 2 * time.Second, codexGatherSiblingReserve},
+		{"probe skipped once the sibling reserve is all that is left", 2 * time.Second, 0, codexGatherSiblingReserve},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			want := codexRolloutScanBudget
+			if tc.holdBack == codexGatherSiblingReserve {
+				want = machineInfoProbeTimeout
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), tc.remaining)
+			defer cancel()
+			got := codexSubBudget(ctx, want, tc.holdBack)
+			// time.Until loses a sliver between WithTimeout and the call.
+			if got < tc.want-50*time.Millisecond || got > tc.want {
+				t.Fatalf("codexSubBudget=%v, want ~%v", got, tc.want)
+			}
+		})
+	}
+	if got := codexSubBudget(context.Background(), codexRolloutScanBudget, time.Hour); got != codexRolloutScanBudget {
+		t.Fatalf("deadline-free parent budget=%v, want the full ceiling %v", got, codexRolloutScanBudget)
+	}
+}
+
+// End-to-end: the probe must be handed a context bounded by the parent gather,
+// still leaving the sibling reserve for the providers parsed after Codex.
+func TestCodexUsageParser_ProbeBoundedByParentGather(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {UsedPercentage: 31, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
+	}, nil, now, fingerprintAccount("codex", "carol@example.com"))
+
+	var probeSlack time.Duration
+	var probeBounded bool
+	original := codexAuthStatusProbe
+	codexAuthStatusProbe = func(ctx context.Context, _ string) (bool, bool) {
+		deadline, ok := ctx.Deadline()
+		probeBounded = ok
+		probeSlack = time.Until(deadline)
+		return true, true
+	}
+	t.Cleanup(func() { codexAuthStatusProbe = original })
+
+	parent, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	usage, errEntry := runProviderParseSafely(parent, codexUsageParser{}, t.TempDir(), detectedCLIAgent{Detected: true, Path: "codex"}, now)
+	if errEntry != nil || usage == nil {
+		t.Fatalf("usage=%+v err=%+v, want a usable Codex parse", usage, errEntry)
+	}
+	if !probeBounded {
+		t.Fatal("login probe ran on an unbounded context; it must inherit the gather deadline")
+	}
+	// 4s parent - 2s sibling reserve => at most 2s for the probe, well under its
+	// own 3s ceiling.
+	if probeSlack > 2*time.Second {
+		t.Fatalf("probe budget=%v, want <= %v so the sibling reserve survives", probeSlack, 2*time.Second)
 	}
 }
