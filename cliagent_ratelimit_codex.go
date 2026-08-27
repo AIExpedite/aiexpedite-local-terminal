@@ -1537,6 +1537,16 @@ const codexRolloutScanFileCap = 16
 // starvation on every refresh.
 const codexRolloutCandidateReadReserve = time.Second
 
+// Candidate ranking gets only the first half of the post-discovery reserve.
+// The remaining half is kept for opening and reading at least one selected
+// rollout even when a large candidate backlog makes ranking hit its deadline.
+const codexRolloutFileReadReserve = 500 * time.Millisecond
+
+// How often candidate ranking rechecks the optional scan budget. Frequent enough
+// that a huge backlog cannot hold the reserve for long, coarse enough that the
+// context check does not dominate the pass itself.
+const codexRolloutCandidateRankCheckInterval = 256
+
 // Directory enumeration is deliberately chunked so a large, slow, or
 // AV-monitored rollout directory cannot trap the optional scan inside one
 // uncancellable os.ReadDir call. The entries are sorted after collection to
@@ -1946,6 +1956,19 @@ func codexRolloutDiscoveryContext(ctx context.Context) (context.Context, context
 	return context.WithDeadline(ctx, deadline.Add(-reserve))
 }
 
+func codexRolloutCandidateOrderingContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return ctx, func() {}
+	}
+	remaining := time.Until(deadline)
+	reserve := codexRolloutFileReadReserve
+	if remaining <= reserve {
+		reserve = remaining / 2
+	}
+	return context.WithDeadline(ctx, deadline.Add(-reserve))
+}
+
 // codexUsageLimitNotice renders the card notice for a quota refusal, or "" when
 // none should be shown.
 //
@@ -1993,6 +2016,58 @@ func codexUsageLimitNotice(metrics []cliAgentUsageMetric, limit codexUsageLimitE
 // staying far short of the weekly one, so a cleared limit stops being announced
 // without waiting days for the truth to catch up.
 const codexUsageLimitNoticeMaxAge = 12 * time.Hour
+
+// codexRolloutCandidateBefore ranks rollout candidates newest-first: normal-time
+// files ahead of future-dated ones (invalid ordering evidence after a clock
+// rollback or a timestamp-preserving restore), then by mtime descending, then by
+// filename so files sharing an mtime break the tie deterministically.
+func codexRolloutCandidateBefore(a, b codexRolloutCandidate, now time.Time) bool {
+	aFuture := a.mtime.After(now)
+	bFuture := b.mtime.After(now)
+	if aFuture != bFuture {
+		return !aFuture
+	}
+	if !a.mtime.Equal(b.mtime) {
+		return a.mtime.After(b.mtime)
+	}
+	return a.path > b.path
+}
+
+// codexSelectNewestRolloutCandidates returns the `capacity` highest-ranked
+// candidates in rank order without ordering the rest. A full sort of a large
+// backlog is both O(n log n) and uncancellable, so it can burn the read reserve
+// that codexRolloutDiscoveryContext deliberately kept for opening the files it
+// just found. Selection instead makes one pass in which every candidate past the
+// first `capacity` usually costs a single comparison against the current worst
+// kept entry, and it observes ctx so an exhausted budget stops here with the
+// evidence gathered so far rather than mid-sort. complete is false when the pass
+// was cut short, which keeps the completed-scan cursor from advancing past
+// candidates that were never ranked.
+func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexRolloutCandidate, now time.Time, capacity int) ([]codexRolloutCandidate, bool) {
+	if capacity <= 0 {
+		return nil, true
+	}
+	selected := make([]codexRolloutCandidate, 0, capacity+1)
+	for i, candidate := range candidates {
+		if i%codexRolloutCandidateRankCheckInterval == 0 && ctx.Err() != nil {
+			return selected, false
+		}
+		if len(selected) == capacity &&
+			!codexRolloutCandidateBefore(candidate, selected[len(selected)-1], now) {
+			continue
+		}
+		pos := sort.Search(len(selected), func(j int) bool {
+			return codexRolloutCandidateBefore(candidate, selected[j], now)
+		})
+		selected = append(selected, candidate)
+		copy(selected[pos+1:], selected[pos:])
+		selected[pos] = candidate
+		if len(selected) > capacity {
+			selected = selected[:capacity]
+		}
+	}
+	return selected, true
+}
 
 // codexRolloutFallbackBuckets reads Codex's session rollout logs
 // (CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl) for the most recent populated
@@ -2059,17 +2134,13 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	// hide a newly completed normal-time rollout and then advance past it.
 	// Ties fall back to filename order so a deterministic chronological tiebreak
 	// applies when two files share an mtime.
-	sort.SliceStable(candidates, func(i, j int) bool {
-		iFuture := candidates[i].mtime.After(now)
-		jFuture := candidates[j].mtime.After(now)
-		if iFuture != jFuture {
-			return !iFuture
-		}
-		if !candidates[i].mtime.Equal(candidates[j].mtime) {
-			return candidates[i].mtime.After(candidates[j].mtime)
-		}
-		return candidates[i].path > candidates[j].path
-	})
+	//
+	// Ranking keeps only the capped newest candidates in one cancellable pass
+	// rather than ordering the whole backlog first: a sessions tree holding
+	// thousands of logs would otherwise spend the reserved candidate-read time
+	// inside an uninterruptible sort and reach the read loop with nothing left,
+	// repeating that same discovery-and-sort on every refresh without ever
+	// opening a rollout.
 	// Accumulate across files newest-first, keyed by (identity, limit id) — NOT by
 	// physical slot. Keying on the slot would let a newer log that only carried a
 	// migrated weekly contributor under `primary` block an older log's `primary`
@@ -2092,11 +2163,10 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 			latestObservation = observed
 		}
 	}
-	selected := candidates
-	if len(selected) > codexRolloutScanFileCap {
-		selected = selected[:codexRolloutScanFileCap]
-	}
-	allHandled := discoveryComplete
+	orderingCtx, cancelOrdering := codexRolloutCandidateOrderingContext(ctx)
+	selected, selectionComplete := codexSelectNewestRolloutCandidates(orderingCtx, candidates, now, codexRolloutScanFileCap)
+	cancelOrdering()
+	allHandled := discoveryComplete && selectionComplete
 	maxSelectedMtimeNs := int64(0)
 	for _, c := range selected {
 		if c.mtime.UnixNano() > maxSelectedMtimeNs {

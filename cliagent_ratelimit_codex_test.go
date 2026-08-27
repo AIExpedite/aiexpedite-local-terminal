@@ -3031,6 +3031,35 @@ func TestCodexRolloutDiscoveryContext_ReservesCandidateReadBudget(t *testing.T) 
 	}
 }
 
+func TestCodexRolloutCandidateOrderingContext_ReservesFileReadBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		budget    time.Duration
+		wantGap   time.Duration
+		tolerance time.Duration
+	}{
+		{name: "normal ordering", budget: time.Second, wantGap: 500 * time.Millisecond, tolerance: 100 * time.Millisecond},
+		{name: "short ordering", budget: 200 * time.Millisecond, wantGap: 100 * time.Millisecond, tolerance: 50 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent, cancelParent := context.WithTimeout(context.Background(), tc.budget)
+			defer cancelParent()
+			parentDeadline, _ := parent.Deadline()
+
+			ordering, cancelOrdering := codexRolloutCandidateOrderingContext(parent)
+			defer cancelOrdering()
+			orderingDeadline, ok := ordering.Deadline()
+			if !ok {
+				t.Fatal("ordering context has no deadline")
+			}
+			gap := parentDeadline.Sub(orderingDeadline)
+			if gap < tc.wantGap-tc.tolerance || gap > tc.wantGap+tc.tolerance {
+				t.Fatalf("file-read reserve=%v, want %v (+/-%v)", gap, tc.wantGap, tc.tolerance)
+			}
+		})
+	}
+}
+
 func TestCodexDiscoverRolloutCandidates_VisitsNewestDateBeforeCancellation(t *testing.T) {
 	base := t.TempDir()
 	var newestPath string
@@ -3633,5 +3662,77 @@ func TestCodexRolloutScanCursorForAccount_ResetsPersistedFutureCursor(t *testing
 					progress.mtimeNs, progress.boundaryFingerprint)
 			}
 		})
+	}
+}
+
+func TestCodexSelectNewestRolloutCandidates_KeepsCappedNewestInRankOrder(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	candidates := []codexRolloutCandidate{
+		{path: "old", mtime: now.Add(-3 * time.Hour)},
+		{path: "future", mtime: now.Add(time.Hour)},
+		{path: "newest", mtime: now.Add(-time.Minute)},
+		{path: "tie-a", mtime: now.Add(-time.Hour)},
+		{path: "tie-b", mtime: now.Add(-time.Hour)},
+	}
+
+	selected, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, 3)
+	if !complete {
+		t.Fatal("complete=false, want an uninterrupted ranking pass")
+	}
+	got := make([]string, 0, len(selected))
+	for _, c := range selected {
+		got = append(got, c.path)
+	}
+	// Newest normal-time file first, filename descending on an mtime tie, and the
+	// future-dated file ranked behind every normal-time candidate — so it never
+	// displaces a real one out of the cap.
+	if want := "newest,tie-b,tie-a"; strings.Join(got, ",") != want {
+		t.Fatalf("selected=%v, want %v", got, want)
+	}
+}
+
+func TestCodexSelectNewestRolloutCandidates_StopsWhenBudgetExpires(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	candidates := make([]codexRolloutCandidate, 0, codexRolloutCandidateRankCheckInterval*4)
+	for i := range cap(candidates) {
+		candidates = append(candidates, codexRolloutCandidate{
+			path:  fmt.Sprintf("rollout-%05d", i),
+			mtime: now.Add(-time.Duration(i) * time.Second),
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	selected, complete := codexSelectNewestRolloutCandidates(ctx, candidates, now, codexRolloutScanFileCap)
+	if complete {
+		t.Fatal("complete=true, want an exhausted budget reported as incomplete ranking")
+	}
+	if len(selected) != 0 {
+		t.Fatalf("selected=%d, want the pass to stop before ranking a backlog it has no budget to read", len(selected))
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_ExhaustedBudgetDoesNotAdvanceHighWater(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "rollout-budget.jsonl")
+	contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+		`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":73,"window_minutes":300}}}` + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(ctx, base, now, codexRolloutScanCursor{})
+	if ok || len(contributors) != 0 {
+		t.Fatalf("contributors=%+v ok=%v, want no evidence from a pass with no budget", contributors, ok)
+	}
+	if highWater != nil {
+		t.Fatalf("highWater=%+v, want the unread rollout left eligible for retry", highWater)
 	}
 }
