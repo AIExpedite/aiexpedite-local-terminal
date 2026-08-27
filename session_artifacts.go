@@ -21,10 +21,16 @@ import (
 // shorten it.
 var sessionArtifactCollectTimeout = 2 * time.Minute
 
+// Give context-aware collectors a short, bounded window to report uploads
+// that completed before cancellation. UploadFiles waits for its workers after
+// cancellation, so discarding that result immediately would orphan successful
+// objects from a partially completed batch.
+var sessionArtifactCancelDrainTimeout = time.Second
+
 // collectSessionArtifactsBounded runs collectSessionArtifacts with a hard
-// deadline. On expiry it returns (nil, nil, true) and stops waiting; the
-// `*_ended` frame then ships without file metadata, which is strictly better
-// than never shipping at all.
+// collection deadline plus a bounded cancellation-drain window. On expiry it
+// stops unfinished work but preserves metadata reported during that drain;
+// the `*_ended` frame then ships instead of waiting indefinitely.
 //
 // The abandoned work is CANCELLED, not merely orphaned (Codex P2, round 4).
 // The scan's own upload context used to be an independent five-minute one, so
@@ -68,9 +74,20 @@ func boundedArtifactCollect(collect func(context.Context) ([]FileInfo, []UploadE
 	case r := <-resultCh:
 		return r.files, r.errs, false
 	case <-ctx.Done():
-		fmt.Printf("%s[session-file-upload] Artifact collection timed out after %s for session %s — cancelling the scan and publishing ended without file metadata%s\n",
+		fmt.Printf("%s[session-file-upload] Artifact collection timed out after %s for session %s — cancelling unfinished work and draining completed metadata%s\n",
 			colorRed, timeout, sessionID, colorReset)
-		return nil, nil, true
+		// Cancellation stops unfinished uploads, but already-finalized objects
+		// cannot be undone. Briefly drain a cooperative collector so their
+		// metadata remains attached to the ended frame. A collector that ignores
+		// cancellation is still bounded by this second deadline.
+		drainTimer := time.NewTimer(sessionArtifactCancelDrainTimeout)
+		defer drainTimer.Stop()
+		select {
+		case r := <-resultCh:
+			return r.files, r.errs, true
+		case <-drainTimer.C:
+			return nil, nil, true
+		}
 	}
 }
 

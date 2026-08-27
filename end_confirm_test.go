@@ -918,13 +918,18 @@ func TestTurnManagerEnd_ReportsStaleWhenSessionReplaced(t *testing.T) {
 // the ended frame cannot reference (Codex P2, round 4).
 func TestBoundedArtifactCollect_CancelsAbandonedWork(t *testing.T) {
 	cancelled := make(chan struct{})
-	_, _, timedOut := boundedArtifactCollect(func(ctx context.Context) ([]FileInfo, []UploadError) {
+	files, _, timedOut := boundedArtifactCollect(func(ctx context.Context) ([]FileInfo, []UploadError) {
 		<-ctx.Done()
 		close(cancelled)
-		return nil, nil
+		// One upload finalized before a sibling stalled. Its metadata must not
+		// be discarded when cancellation unwinds the batch.
+		return []FileInfo{{Name: "completed.png"}}, nil
 	}, 50*time.Millisecond, "s-cancel")
 	if !timedOut {
 		t.Fatalf("expected the collect to time out")
+	}
+	if len(files) != 1 || files[0].Name != "completed.png" {
+		t.Fatalf("completed upload metadata was discarded: %#v", files)
 	}
 	select {
 	case <-cancelled:
