@@ -2101,6 +2101,25 @@ func codexRolloutCandidateBefore(a, b codexRolloutCandidate, now time.Time) bool
 	return a.path > b.path
 }
 
+// codexInsertNewestRolloutCandidate keeps a fixed-capacity slice in rollout
+// rank order without sorting candidates that cannot enter it.
+func codexInsertNewestRolloutCandidate(selected []codexRolloutCandidate, candidate codexRolloutCandidate, now time.Time, capacity int) []codexRolloutCandidate {
+	if capacity <= 0 || len(selected) == capacity &&
+		!codexRolloutCandidateBefore(candidate, selected[len(selected)-1], now) {
+		return selected
+	}
+	pos := sort.Search(len(selected), func(j int) bool {
+		return codexRolloutCandidateBefore(candidate, selected[j], now)
+	})
+	selected = append(selected, candidate)
+	copy(selected[pos+1:], selected[pos:])
+	selected[pos] = candidate
+	if len(selected) > capacity {
+		selected = selected[:capacity]
+	}
+	return selected
+}
+
 // codexSelectNewestRolloutCandidates returns the `capacity` highest-ranked
 // candidates in rank order without ordering the rest. A full sort of a large
 // backlog is both O(n log n) and uncancellable, so it can burn the read reserve
@@ -2111,28 +2130,64 @@ func codexRolloutCandidateBefore(a, b codexRolloutCandidate, now time.Time) bool
 // evidence gathered so far rather than mid-sort. complete is false when the pass
 // was cut short, which keeps the completed-scan cursor from advancing past
 // candidates that were never ranked.
-func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexRolloutCandidate, now time.Time, capacity int) ([]codexRolloutCandidate, bool) {
+//
+// When reservedBoundaryMtimeNs is non-zero, up to half the batch is reserved
+// for candidates at that unfinished equal-mtime boundary. This prevents an
+// ongoing stream of newer files from starving deterministic boundary progress.
+func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexRolloutCandidate, now time.Time, capacity int, reservedBoundaryMtimeNs int64) ([]codexRolloutCandidate, bool) {
 	if capacity <= 0 {
 		return nil, true
 	}
 	selected := make([]codexRolloutCandidate, 0, capacity+1)
+	boundaryCapacity := capacity / 2
+	if boundaryCapacity == 0 {
+		boundaryCapacity = 1
+	}
+	reservedBoundary := make([]codexRolloutCandidate, 0, boundaryCapacity+1)
 	for i, candidate := range candidates {
 		if i%codexRolloutCandidateRankCheckInterval == 0 && ctx.Err() != nil {
 			return selected, false
 		}
-		if len(selected) == capacity &&
-			!codexRolloutCandidateBefore(candidate, selected[len(selected)-1], now) {
+		selected = codexInsertNewestRolloutCandidate(selected, candidate, now, capacity)
+		if reservedBoundaryMtimeNs > 0 && candidate.mtime.UnixNano() == reservedBoundaryMtimeNs {
+			reservedBoundary = codexInsertNewestRolloutCandidate(reservedBoundary, candidate, now, boundaryCapacity)
+		}
+	}
+	// A saved equal-mtime boundary must keep making progress even when at least
+	// one full capped batch of newer rollouts exists. Reserve half the batch for
+	// its highest-ranked remaining entries; the other half still captures fresh
+	// evidence, and the boundary finishes in bounded deterministic batches.
+	reservedPaths := make(map[string]struct{}, len(reservedBoundary))
+	for _, boundary := range reservedBoundary {
+		reservedPaths[boundary.path] = struct{}{}
+	}
+	for _, boundary := range reservedBoundary {
+		alreadySelected := false
+		for _, candidate := range selected {
+			if candidate.path == boundary.path {
+				alreadySelected = true
+				break
+			}
+		}
+		if alreadySelected {
 			continue
 		}
-		pos := sort.Search(len(selected), func(j int) bool {
-			return codexRolloutCandidateBefore(candidate, selected[j], now)
-		})
-		selected = append(selected, candidate)
-		copy(selected[pos+1:], selected[pos:])
-		selected[pos] = candidate
-		if len(selected) > capacity {
-			selected = selected[:capacity]
+		if len(selected) == capacity {
+			// Evict the lowest-ranked non-reserved entry. Truncating the slice
+			// would discard a boundary entry already counted toward the reserve
+			// whenever the ordinary top-N selection included only part of it.
+			evict := len(selected) - 1
+			for ; evict >= 0; evict-- {
+				if _, reserved := reservedPaths[selected[evict].path]; !reserved {
+					break
+				}
+			}
+			if evict < 0 {
+				continue
+			}
+			selected = append(selected[:evict], selected[evict+1:]...)
 		}
+		selected = codexInsertNewestRolloutCandidate(selected, boundary, now, capacity)
 	}
 	return selected, true
 }
@@ -2386,7 +2441,13 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		}
 	}
 	orderingCtx, cancelOrdering := codexRolloutCandidateOrderingContext(ctx)
-	selected, selectionComplete := codexSelectNewestRolloutCandidates(orderingCtx, eligibleCandidates, now, codexRolloutScanFileCap)
+	reservedBoundaryMtimeNs := int64(0)
+	if cursor.boundaryCursor != "" {
+		reservedBoundaryMtimeNs = cursor.mtimeNs
+	}
+	selected, selectionComplete := codexSelectNewestRolloutCandidates(
+		orderingCtx, eligibleCandidates, now, codexRolloutScanFileCap, reservedBoundaryMtimeNs,
+	)
 	cancelOrdering()
 	allHandled := discoveryComplete && selectionComplete
 	maxSelectedMtimeNs := int64(0)
