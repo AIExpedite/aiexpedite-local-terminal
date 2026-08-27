@@ -1724,12 +1724,19 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 				return
 			}
 			complete = false
-			return
+			if len(entries) == 0 {
+				return
+			}
 		}
+		// A canceled leaf-directory read can still return a complete chunk of
+		// directory entries. Consume those bounded results so repeated refreshes
+		// can reach their rollout evidence, while keeping discovery incomplete so
+		// the completed-scan cursor does not advance.
+		consumePartialLeaf := err != nil && depth == 3
 		// os.ReadDir sorts by filename. Codex's zero-padded YYYY/MM/DD layout
 		// therefore becomes chronological when traversed in reverse.
 		for i := len(entries) - 1; i >= 0; i-- {
-			if ctx.Err() != nil {
+			if !consumePartialLeaf && ctx.Err() != nil {
 				complete = false
 				return
 			}

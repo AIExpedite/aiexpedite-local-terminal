@@ -2708,6 +2708,31 @@ func TestCodexReadDirContext_ChecksCancellationBetweenChunks(t *testing.T) {
 	}
 }
 
+func TestCodexDiscoverRolloutCandidates_PreservesPartialLeafDirectoryResults(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < codexRolloutReadDirChunkSize*2; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Cancellation fires when the leaf reader requests its second chunk. The
+	// first complete chunk must remain available for candidate reconciliation.
+	ctx := &cancelAfterChecksContext{after: 15, done: make(chan struct{})}
+	candidates, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{})
+	if complete {
+		t.Fatal("discovery complete=true, want partial leaf enumeration to preserve the high-water")
+	}
+	if len(candidates) != codexRolloutReadDirChunkSize {
+		t.Fatalf("candidates=%d, want preserved %d-entry chunk", len(candidates), codexRolloutReadDirChunkSize)
+	}
+}
+
 func TestCodexRolloutDiscoveryContext_ReservesCandidateReadBudget(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
