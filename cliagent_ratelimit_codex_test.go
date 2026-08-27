@@ -3315,8 +3315,40 @@ func TestCodexRolloutFallbackBuckets_ClampsFutureMtimeHighWater(t *testing.T) {
 	if !ok || highWater == nil {
 		t.Fatal("expected completed numeric rollout scan")
 	}
-	if highWater.mtimeNs != now.UnixNano() {
-		t.Fatalf("highWater mtime=%s, want clamped to %s", time.Unix(0, highWater.mtimeNs), now)
+	wantHighWater := now.Add(-codexRolloutCoarseMtimeOverlap)
+	if highWater.mtimeNs != wantHighWater.UnixNano() {
+		t.Fatalf("highWater mtime=%s, want overlap-clamped to %s", time.Unix(0, highWater.mtimeNs), wantHighWater)
+	}
+
+	// Model a rollout created concurrently after this leaf was enumerated on a
+	// filesystem that rounds mtimes down to a two-second boundary. It must stay
+	// above the retained overlap even though it is older than the gather's exact
+	// start time; clamping to now would permanently filter it out.
+	missedName := "rollout-2026-08-26T13-59-59-coarse.jsonl"
+	missedPath := filepath.Join(base, "sessions", "2026", "06", "26", missedName)
+	if err := os.WriteFile(missedPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write concurrently created rollout: %v", err)
+	}
+	missedMtime := now.Add(-time.Second)
+	if err := os.Chtimes(missedPath, missedMtime, missedMtime); err != nil {
+		t.Fatalf("set coarse rollout mtime: %v", err)
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{
+		mtimeNs:             highWater.mtimeNs,
+		boundaryFingerprint: highWater.boundaryFingerprint,
+	})
+	if !complete {
+		t.Fatal("follow-up discovery incomplete")
+	}
+	found := false
+	for _, candidate := range candidates {
+		if candidate.path == missedPath {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("candidates=%+v, want coarse-mtime rollout %q retained above cursor", candidates, missedPath)
 	}
 }
 

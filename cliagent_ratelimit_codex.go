@@ -50,6 +50,11 @@ const (
 	codexWindowPrimary                      = "primary"
 	codexWindowSecondary                    = "secondary"
 	codexProviderObservationFutureTolerance = 5 * time.Minute
+	// FAT-style filesystems can report modification times in two-second
+	// increments. When a selected rollout advances beyond the gather's start
+	// time, retain that full overlap so a concurrently created file whose mtime
+	// rounded down before discovery cannot fall permanently below the cursor.
+	codexRolloutCoarseMtimeOverlap = 2 * time.Second
 )
 
 // codexLegacyLimitID is the synthetic contributor id for buckets coming from
@@ -2155,8 +2160,12 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// Filesystem mtimes are progress hints, not provider observation times.
 		// Never let a restored/future-dated file move the cursor beyond the
 		// current clock and suppress normally timestamped rollouts written next.
+		// Retain the coarsest common mtime-resolution overlap: a rollout created
+		// after its directory was enumerated can otherwise round below now while
+		// an already-enumerated active rollout advances above now, causing the
+		// clamped cursor to skip the undiscovered file forever.
 		if nowNs := now.UnixNano(); maxSelectedMtimeNs > nowNs {
-			maxSelectedMtimeNs = nowNs
+			maxSelectedMtimeNs = now.Add(-codexRolloutCoarseMtimeOverlap).UnixNano()
 		}
 		highWater = &codexRolloutScanProgress{
 			mtimeNs:             maxSelectedMtimeNs,
