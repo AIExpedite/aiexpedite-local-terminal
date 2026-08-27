@@ -2437,6 +2437,7 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	lineBytes := make([]byte, 0, 64*1024)
 	oversized := false
 	firstRecordSeen := false
+	headerUnread := false
 	handled := true
 	for {
 		if ctx.Err() != nil {
@@ -2464,9 +2465,12 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 			// promote a later telemetry timestamp to the session start: an older
 			// account can keep emitting after a new login, and that later event
 			// would make its rollout appear to belong to the new account. Keep the
-			// start unverified so authenticated reconciliation withholds its
-			// evidence and leaves it above the progress cursor for retry.
+			// start unverified AND report the file as unhandled: unlike a malformed
+			// header, whose bytes were read and judged, this record was never
+			// decoded at all, so the scan cannot claim it as deterministic progress
+			// and the rollout stays above the cursor for retry.
 			firstRecordSeen = true
+			headerUnread = true
 		}
 		if !oversized && len(lineBytes) > 0 {
 			for len(lineBytes) > 0 && (lineBytes[len(lineBytes)-1] == '\n' || lineBytes[len(lineBytes)-1] == '\r') {
@@ -2489,7 +2493,7 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 			break
 		}
 	}
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || headerUnread {
 		handled = false
 	}
 	// Tail lines were already read as complete objects. Fold them even when the
