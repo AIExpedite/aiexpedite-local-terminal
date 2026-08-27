@@ -2977,6 +2977,9 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	}
 	winners := map[string]rolloutContribution{}
 	var limit codexUsageLimitEvidence
+	// Identity of the rollout that supplied `limit`, so a still-live refusal can
+	// be held eligible on its own rather than by voiding the whole pass.
+	var limitEntry string
 	var latestObservation time.Time
 	for _, observed := range priorObservations {
 		if observed.After(latestObservation) {
@@ -3050,6 +3053,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		}
 		if fileLimit.At.After(limit.At) {
 			limit = fileLimit
+			limitEntry = retryEntry
 		}
 		if !ok {
 			continue
@@ -3075,13 +3079,20 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// let newest-first (identity, limit) dedup keep the freshest reading per
 		// contributor.
 	}
-	if !limit.At.IsZero() && now.Sub(limit.At) <= codexUsageLimitNoticeMaxAge &&
+	if limitEntry != "" && !limit.At.IsZero() && now.Sub(limit.At) <= codexUsageLimitNoticeMaxAge &&
 		(latestObservation.IsZero() || latestObservation.Before(limit.At)) {
-		// A refusal has no normalized contributor to persist. Keep it above the
-		// completed-scan watermark only while it remains newer than every numeric
-		// observation in the selected set. Newer telemetry supersedes the refusal
-		// and is durable, so repeatedly rescanning that rollout adds no evidence.
-		progressComplete = false
+		// A refusal has no normalized contributor to persist, so its rollout must
+		// stay readable while the notice is still live and newer than every numeric
+		// observation in the selected set. Hold ONLY that identity above the
+		// completed-scan watermark instead of voiding the pass: forcing the scan
+		// incomplete discards the boundary/backlog/retry cursors too, so a backlog
+		// larger than the file cap would re-select the same newest batch on every
+		// refresh for the notice's full lifetime and never reach an older rollout
+		// holding a distinct session or weekly contributor. Retry identities bypass
+		// the watermark in both discovery and the eligibility filter, and this one
+		// is dropped again by the read loop on the first later pass where newer
+		// telemetry supersedes the refusal or it ages out.
+		retryEntries[limitEntry] = struct{}{}
 	}
 	var highWater *codexRolloutScanProgress
 	if progressComplete {

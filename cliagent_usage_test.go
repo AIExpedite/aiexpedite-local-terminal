@@ -1450,9 +1450,13 @@ func TestCodexUsageParser_UsageLimitRefusalExplainsUnobservableCard(t *testing.T
 	if regexp.MustCompile(`(?i)\b(login|signed in|authenticate)\b`).MatchString(usage.Notice) {
 		t.Errorf("quota notice must not read as a login failure: %q", usage.Notice)
 	}
+	// Scan progress still commits — holding it back would also discard the
+	// boundary/backlog cursors and stall an over-cap backlog for the notice's
+	// whole lifetime. The refusing rollout is instead kept eligible by identity,
+	// since a refusal has no normalized contributor to persist.
 	snap, cacheOK := loadCodexRateLimitSnapshot(cache)
-	if cacheOK && snap.RolloutHighWaterMtimeMs != 0 {
-		t.Fatalf("refusal-only rollout advanced high-water to %d; want retry while notice is live", snap.RolloutHighWaterMtimeMs)
+	if cacheOK && len(snap.RolloutRetryEntries) != 1 {
+		t.Fatalf("retry entries = %v; want the refusing rollout held eligible while the notice is live", snap.RolloutRetryEntries)
 	}
 
 	// The refusal is deliberately not persisted: the typed cache remains

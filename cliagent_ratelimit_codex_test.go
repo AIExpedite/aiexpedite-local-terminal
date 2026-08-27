@@ -3353,10 +3353,11 @@ func TestCodexRolloutFallbackBuckets_CanonicalizesEachFrameBeforeMerge(t *testin
 	}
 }
 
-func TestCodexRolloutFallbackBuckets_MixedRefusalPreventsHighWaterAdvance(t *testing.T) {
+func TestCodexRolloutFallbackBuckets_MixedRefusalHeldAsRetryIdentity(t *testing.T) {
 	base := t.TempDir()
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
-	helperWriteRolloutLimitLog(t, base, "19", "2026-06-19T11-00-00-mixed",
+	name := "2026-06-19T11-00-00-mixed"
+	helperWriteRolloutLimitLog(t, base, "19", name,
 		"2026-06-19T11:00:00.000Z", []map[string]any{{
 			"primary": map[string]any{
 				"used_percent": 31.0, "window_minutes": 300.0,
@@ -3371,8 +3372,119 @@ func TestCodexRolloutFallbackBuckets_MixedRefusalPreventsHighWaterAdvance(t *tes
 	if limit.At.IsZero() {
 		t.Fatal("expected live refusal evidence")
 	}
-	if highWater != nil {
-		t.Fatalf("highWater=%+v, want unchanged while mixed-file refusal is live", *highWater)
+	// The pass still completes — voiding it would also discard the boundary,
+	// backlog and retry cursors. Only the refusing rollout's identity is held
+	// above the watermark, and retry identities bypass it in both discovery and
+	// the eligibility filter, so it stays readable while the notice is live.
+	if highWater == nil {
+		t.Fatal("highWater=nil, want completed-scan progress committed alongside the live refusal")
+	}
+	wantEntry := helperCodexRolloutRetryDigest(name, "19")
+	if len(highWater.retryEntries) != 1 || highWater.retryEntries[0] != wantEntry {
+		t.Fatalf("retryEntries=%v, want only the refusing rollout %q", highWater.retryEntries, wantEntry)
+	}
+	cursor := codexRolloutScanCursor{mtimeNs: highWater.mtimeNs, retryEntries: highWater.retryEntries}
+	rediscovered, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete || len(rediscovered) != 1 {
+		t.Fatalf("complete=%v candidates=%d, want the refusing rollout re-offered above the watermark", complete, len(rediscovered))
+	}
+}
+
+// helperCodexRolloutRetryDigest is the redacted backlog identity the scan
+// persists for a rollout written by helperWriteRolloutLimitLog/RolloutLogAt.
+func helperCodexRolloutRetryDigest(name, day string) string {
+	return codexRolloutBacklogEntryDigest(codexRolloutCandidate{
+		boundaryID: filepath.Join("2026", "06", day, "rollout-"+name+".jsonl"),
+	})
+}
+
+// A live refusal used to force the whole pass incomplete, discarding the
+// backlog cursor with it. With more eligible rollouts than one pass can open,
+// every refresh then re-selected the same newest batch for the notice's full
+// 12-hour lifetime, so an older rollout holding a distinct contributor was never
+// reconciled. Progress must now commit for the candidates that were processed.
+func TestCodexRolloutFallbackBuckets_LiveRefusalStillAdvancesOverCapBacklog(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "backlog@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "06", "19")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// The oldest rollout is the only carrier of the weekly contributor, and it
+	// sits one past the file cap so it can only be reached once progress commits.
+	total := codexRolloutScanFileCap + 1
+	oldest := now.Add(-90 * time.Minute)
+	for i := range total {
+		name := fmt.Sprintf("2026-06-19T10-00-00-%05d", i)
+		frames := []map[string]any{{"primary": map[string]any{
+			"used_percent": 31.0, "window_minutes": 300.0,
+			"resets_at": float64(now.Add(time.Hour).Unix()),
+		}}}
+		if i == 0 {
+			frames = []map[string]any{{"secondary": map[string]any{
+				"used_percent": 47.0, "window_minutes": 10080.0,
+				"resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			}}}
+		}
+		helperWriteRolloutLogAt(t, base, "19", name, "2026-06-19T11:00:00.000Z", frames)
+		mtime := oldest.Add(time.Duration(i) * time.Minute)
+		if err := os.Chtimes(filepath.Join(dir, "rollout-"+name+".jsonl"), mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The newest rollout is a live refusal: newer than every numeric observation
+	// and well inside the notice age cap.
+	refusalName := "2026-06-19T11-00-00-refused"
+	helperWriteRolloutLimitLog(t, base, "19", refusalName, "2026-06-19T11:00:00.000Z", nil, "2026-06-19T11:45:00.000Z")
+	refusalMtime := now.Add(-5 * time.Minute)
+	if err := os.Chtimes(filepath.Join(dir, "rollout-"+refusalName+".jsonl"), refusalMtime, refusalMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	contributors, limit, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || len(contributors) == 0 {
+		t.Fatal("expected numeric evidence from the capped newest batch")
+	}
+	if limit.At.IsZero() {
+		t.Fatal("expected the live refusal to remain available for notice ranking")
+	}
+	if highWater == nil {
+		t.Fatal("highWater=nil, want backlog progress committed despite the live refusal")
+	}
+	if _, present := contributors[codexWindowSecondary]; present {
+		t.Fatal("first pass already reached the oldest rollout; the cap is not being exercised")
+	}
+	wantRetry := helperCodexRolloutRetryDigest(refusalName, "19")
+	if len(highWater.retryEntries) != 1 || highWater.retryEntries[0] != wantRetry {
+		t.Fatalf("retryEntries=%v, want only the refusing rollout %q", highWater.retryEntries, wantRetry)
+	}
+
+	// Persist and reload exactly as consecutive signed refreshes do. The saved
+	// cursor must let the second pass reach the omitted oldest rollout.
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, highWater, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	second, _, _, _, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok {
+		t.Fatal("second pass produced no contributors, want the omitted backlog rollout")
+	}
+	weekly, present := second[codexWindowSecondary]
+	if !present {
+		t.Fatalf("second pass contributors=%v, want the oldest rollout's weekly contributor", second)
+	}
+	var used float64
+	for _, bucket := range weekly {
+		used = bucket.UsedPercentage
+	}
+	if used != 47 {
+		t.Fatalf("weekly contributor=%v%%, want the omitted rollout's 47%%", used)
 	}
 }
 
@@ -3445,26 +3557,29 @@ func TestCodexRolloutFallbackBuckets_NewerCachedTelemetrySupersedesRefusal(t *te
 
 func TestCodexRolloutFallbackBuckets_ValidatesFutureRefusalTime(t *testing.T) {
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Progress commits either way; what an accepted live refusal changes is that
+	// its own rollout identity is held back as a retry entry.
 	for _, tc := range []struct {
 		name          string
 		refusedAt     time.Time
 		wantAt        time.Time
-		wantHighWater bool
+		wantRetryHeld bool
 	}{
 		{
-			name:      "five minute boundary clamps to now",
-			refusedAt: now.Add(codexProviderObservationFutureTolerance),
-			wantAt:    now,
+			name:          "five minute boundary clamps to now",
+			refusedAt:     now.Add(codexProviderObservationFutureTolerance),
+			wantAt:        now,
+			wantRetryHeld: true,
 		},
 		{
-			name:          "beyond tolerance is rejected",
-			refusedAt:     now.Add(codexProviderObservationFutureTolerance + time.Nanosecond),
-			wantHighWater: true,
+			name:      "beyond tolerance is rejected",
+			refusedAt: now.Add(codexProviderObservationFutureTolerance + time.Nanosecond),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base := t.TempDir()
-			helperWriteRolloutLimitLog(t, base, "19", "2026-06-19T11-00-00-future-refusal",
+			name := "2026-06-19T11-00-00-future-refusal"
+			helperWriteRolloutLimitLog(t, base, "19", name,
 				"2026-06-19T11:00:00.000Z", nil, tc.refusedAt.Format(time.RFC3339Nano))
 
 			_, limit, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
@@ -3474,8 +3589,13 @@ func TestCodexRolloutFallbackBuckets_ValidatesFutureRefusalTime(t *testing.T) {
 			if !limit.At.Equal(tc.wantAt) {
 				t.Fatalf("refusal time=%s, want %s", limit.At, tc.wantAt)
 			}
-			if (highWater != nil) != tc.wantHighWater {
-				t.Fatalf("highWater=%+v, want present=%v", highWater, tc.wantHighWater)
+			if highWater == nil {
+				t.Fatal("highWater=nil, want completed-scan progress committed")
+			}
+			held := len(highWater.retryEntries) == 1 &&
+				highWater.retryEntries[0] == helperCodexRolloutRetryDigest(name, "19")
+			if held != tc.wantRetryHeld {
+				t.Fatalf("retryEntries=%v, want refusal held=%v", highWater.retryEntries, tc.wantRetryHeld)
 			}
 		})
 	}
