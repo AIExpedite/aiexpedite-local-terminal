@@ -2964,7 +2964,15 @@ func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor
 			continue
 		}
 		if futureMatches && codexRolloutInFutureCohort(candidate, futureAnchor, futureFloorNs, futureCeilingNs) {
-			if cursor.futureComplete || (futureFound && !codexRolloutCandidateBefore(futureCutoff, candidate, now)) {
+			// Rank the cohort against its own anchor, never the moving clock: every
+			// member is above the anchor by definition, so the ahead-of-now tier in
+			// codexRolloutCandidateBefore collapses and the order stays the one the
+			// cursor was saved with. Ranking against `now` would reorder the cohort
+			// mid-catch-up as members cross the clock — an unread member that just
+			// became normal-time would outrank the still-future cutoff and be
+			// mistaken for consumed work.
+			if cursor.futureComplete ||
+				(futureFound && !codexRolloutCandidateBefore(futureCutoff, candidate, futureAnchor)) {
 				continue
 			}
 		}
@@ -3262,13 +3270,16 @@ func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCan
 		}
 		selectedFuture[codexRolloutFutureEntryDigest(candidate)] = struct{}{}
 		selectedList = append(selectedList, candidate)
-		if !haveLast || codexRolloutCandidateBefore(lastSelected, candidate, now) {
+		if !haveLast || codexRolloutCandidateBefore(lastSelected, candidate, anchor) {
 			lastSelected, haveLast = candidate, true
 		}
 	}
 	// `rankBound` is the newest cohort member this pass left unread. Retry
 	// rotation can evict an entry ranked above one it opens, so the picks are not
 	// necessarily contiguous and the cursor may not be taken past this bound.
+	// Every rank here is taken against the anchor for the same reason the resume
+	// filter is: a cursor written under clock-relative ordering would not mean the
+	// same thing once a member crosses `now`.
 	remaining := false
 	var rankBound codexRolloutCandidate
 	for _, candidate := range eligible {
@@ -3278,7 +3289,7 @@ func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCan
 		if _, ok := selectedFuture[codexRolloutFutureEntryDigest(candidate)]; ok {
 			continue
 		}
-		if !remaining || codexRolloutCandidateBefore(candidate, rankBound, now) {
+		if !remaining || codexRolloutCandidateBefore(candidate, rankBound, anchor) {
 			rankBound, remaining = candidate, true
 		}
 	}
@@ -3287,8 +3298,8 @@ func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCan
 	}
 	if haveLast {
 		advance, haveAdvance := lastSelected, true
-		if !codexRolloutCandidateBefore(advance, rankBound, now) {
-			advance, haveAdvance = codexRolloutDeepestContiguous(selectedList, rankBound, now)
+		if !codexRolloutCandidateBefore(advance, rankBound, anchor) {
+			advance, haveAdvance = codexRolloutDeepestContiguous(selectedList, rankBound, anchor)
 		}
 		// No pick ranks ahead of the gap: this pass claimed nothing contiguous with
 		// the cohort head, so fall through to the saved cursor rather than stepping

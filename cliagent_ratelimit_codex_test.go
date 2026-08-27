@@ -5855,3 +5855,67 @@ func TestCodexRolloutFutureProgress_StopsAtRotationGap(t *testing.T) {
 		}
 	}
 }
+
+// The anchored future cohort catches up member by member. Once the clock passes
+// an unread member's mtime, clock-relative ranking would lift it above the saved
+// still-future cutoff and the resume filter would read it as consumed work — the
+// cohort would then look empty, be marked complete, and its distinct evidence
+// would never be read. The cursor is anchored, so its ordering must be too.
+func TestCodexUnconsumedRolloutCandidates_FutureCursorSurvivesPartialCatchUp(t *testing.T) {
+	anchorTime := time.Now().Truncate(time.Second)
+	candidate := func(name string, ahead time.Duration) codexRolloutCandidate {
+		return codexRolloutCandidate{
+			path:       name,
+			boundaryID: name + ".jsonl",
+			mtime:      anchorTime.Add(ahead),
+			size:       256,
+		}
+	}
+	// Future-dated cohort, newest first: e, d, c, b, a.
+	all := []codexRolloutCandidate{
+		candidate("e", 50*time.Minute),
+		candidate("d", 40*time.Minute),
+		candidate("c", 30*time.Minute),
+		candidate("b", 20*time.Minute),
+		candidate("a", 10*time.Minute),
+	}
+	// A capped pass consumes the newest four contiguously; the oldest stays unread.
+	anchorNs, floorNs, ceilingNs, fingerprint, futureCursor, cohortSize, complete :=
+		codexRolloutFutureProgress(all, all, all[:4], anchorTime, codexRolloutScanCursor{})
+	if complete || futureCursor == "" {
+		t.Fatalf("complete=%v futureCursor=%q, want an unfinished cohort with %q unread",
+			complete, futureCursor, all[4].path)
+	}
+	if want := codexRolloutFutureEntryDigest(all[3]); futureCursor != want {
+		t.Fatalf("futureCursor=%q, want the deepest contiguous pick %q", futureCursor, want)
+	}
+	cursor := codexRolloutScanCursor{
+		futureAnchorNs:    anchorNs,
+		futureFloorNs:     floorNs,
+		futureCeilingNs:   ceilingNs,
+		futureFingerprint: fingerprint,
+		futureCursor:      futureCursor,
+		futureCohortSize:  cohortSize,
+	}
+
+	// The clock advances past the unread member only: "a" is now normal-time while
+	// the saved cutoff "b" and everything above it is still ahead of the clock.
+	later := anchorTime.Add(15 * time.Minute)
+	if !all[3].mtime.After(later) || all[4].mtime.After(later) {
+		t.Fatalf("test setup: want only %q to have crossed the clock", all[4].path)
+	}
+	eligible := codexUnconsumedRolloutCandidates(all, cursor, later)
+	if got := rolloutCandidatePaths(eligible); len(got) != 1 || got[0] != all[4].path {
+		t.Fatalf("eligible=%v, want only the unread cohort member %q — the caught-up "+
+			"member must not be ranked as consumed, and consumed members must not reopen",
+			got, all[4].path)
+	}
+
+	// Reading it finishes the cohort rather than retiring it with evidence unread.
+	_, _, _, _, nextCursor, _, nextComplete :=
+		codexRolloutFutureProgress(all, eligible, eligible, later, cursor)
+	if !nextComplete || nextCursor != "" {
+		t.Fatalf("complete=%v cursor=%q, want the cohort finished once %q is read",
+			nextComplete, nextCursor, all[4].path)
+	}
+}
