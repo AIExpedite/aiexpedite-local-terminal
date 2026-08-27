@@ -403,7 +403,8 @@ func (m *ClaudeNativeManager) End(id string) error {
 	}
 
 	if session.Status() == "ended" {
-		m.removeSessionIfSame(id, session)
+		// The watcher owns terminal publication and removal; retain the ID until
+		// it has established the in-flight publish reservation.
 		return nil
 	}
 

@@ -577,8 +577,8 @@ func (sm *SessionManager) EndSession(id string) error {
 	session.mu.Lock()
 	if session.Status == "ended" {
 		session.mu.Unlock()
-		// Already ended — just clean up from map
-		sm.removeSessionIfSame(id, session)
+		// The watcher owns terminal publication and removal; retain the ID until
+		// it has established the in-flight publish reservation.
 		return nil
 	}
 	unconfirmed := session.killUnconfirmed

@@ -208,6 +208,22 @@ func UploadFiles(
 	executionID string,
 	log *slog.Logger,
 ) UploadResult {
+	return uploadFilesWithProgress(ctx, client, bucketName, localPaths, workspaceID, executionID, log, nil)
+}
+
+// uploadFilesWithProgress reports each result as soon as its worker completes.
+// This lets bounded callers retain metadata for successful objects even when
+// another worker does not unwind promptly after cancellation.
+func uploadFilesWithProgress(
+	ctx context.Context,
+	client *storage.Client,
+	bucketName string,
+	localPaths []string,
+	workspaceID string,
+	executionID string,
+	log *slog.Logger,
+	onResult func(FileInfo, *UploadError),
+) UploadResult {
 	result := UploadResult{
 		Successful: make([]FileInfo, 0),
 		Failed:     make([]UploadError, 0),
@@ -238,8 +254,15 @@ func UploadFiles(
 			fileInfo, err := UploadFile(ctx, client, bucketName, path, workspaceID, executionID, log)
 			if err != nil {
 				log.Error("Upload failed", "file", path, "error", err.Error())
-				resultChan <- UploadError{File: path, Error: err.Error()}
+				uploadErr := UploadError{File: path, Error: err.Error()}
+				if onResult != nil {
+					onResult(FileInfo{}, &uploadErr)
+				}
+				resultChan <- uploadErr
 			} else {
+				if onResult != nil {
+					onResult(fileInfo, nil)
+				}
 				resultChan <- fileInfo
 			}
 		}(localPath)

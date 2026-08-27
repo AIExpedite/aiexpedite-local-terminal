@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -47,15 +48,23 @@ func collectSessionArtifactsBounded(
 	startedAt time.Time,
 	timeout time.Duration,
 ) ([]FileInfo, []UploadError, bool) {
-	return boundedArtifactCollect(func(ctx context.Context) ([]FileInfo, []UploadError) {
-		return collectSessionArtifacts(ctx, cfg, sessionID, workspaceID, workDir, startedAt)
+	return boundedArtifactCollectWithProgress(func(ctx context.Context, report artifactProgressFunc) ([]FileInfo, []UploadError) {
+		return collectSessionArtifactsWithProgress(ctx, cfg, sessionID, workspaceID, workDir, startedAt, report)
 	}, timeout, sessionID)
 }
+
+type artifactProgressFunc func(FileInfo, *UploadError)
 
 // boundedArtifactCollect is the deadline mechanism behind
 // collectSessionArtifactsBounded, split out so tests can exercise the timeout
 // branch with a blocking collector.
 func boundedArtifactCollect(collect func(context.Context) ([]FileInfo, []UploadError), timeout time.Duration, sessionID string) ([]FileInfo, []UploadError, bool) {
+	return boundedArtifactCollectWithProgress(func(ctx context.Context, _ artifactProgressFunc) ([]FileInfo, []UploadError) {
+		return collect(ctx)
+	}, timeout, sessionID)
+}
+
+func boundedArtifactCollectWithProgress(collect func(context.Context, artifactProgressFunc) ([]FileInfo, []UploadError), timeout time.Duration, sessionID string) ([]FileInfo, []UploadError, bool) {
 	type artifactResult struct {
 		files []FileInfo
 		errs  []UploadError
@@ -66,8 +75,18 @@ func boundedArtifactCollect(collect func(context.Context) ([]FileInfo, []UploadE
 	defer cancel()
 
 	resultCh := make(chan artifactResult, 1)
+	var progressMu sync.Mutex
+	var completed artifactResult
 	go func() {
-		files, errs := collect(ctx)
+		files, errs := collect(ctx, func(file FileInfo, uploadErr *UploadError) {
+			progressMu.Lock()
+			defer progressMu.Unlock()
+			if uploadErr != nil {
+				completed.errs = append(completed.errs, *uploadErr)
+			} else {
+				completed.files = append(completed.files, file)
+			}
+		})
 		resultCh <- artifactResult{files: files, errs: errs}
 	}()
 	select {
@@ -86,7 +105,9 @@ func boundedArtifactCollect(collect func(context.Context) ([]FileInfo, []UploadE
 		case r := <-resultCh:
 			return r.files, r.errs, true
 		case <-drainTimer.C:
-			return nil, nil, true
+			progressMu.Lock()
+			defer progressMu.Unlock()
+			return completed.files, completed.errs, true
 		}
 	}
 }
@@ -130,6 +151,18 @@ func collectSessionArtifacts(
 	workspaceID string,
 	workDir string,
 	startedAt time.Time,
+) ([]FileInfo, []UploadError) {
+	return collectSessionArtifactsWithProgress(ctx, cfg, sessionID, workspaceID, workDir, startedAt, nil)
+}
+
+func collectSessionArtifactsWithProgress(
+	ctx context.Context,
+	cfg *Config,
+	sessionID string,
+	workspaceID string,
+	workDir string,
+	startedAt time.Time,
+	report artifactProgressFunc,
 ) ([]FileInfo, []UploadError) {
 	if cfg == nil || !cfg.EnableFileUpload || workspaceID == "" {
 		return nil, nil
@@ -182,7 +215,7 @@ func collectSessionArtifacts(
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	uploadResult := UploadFiles(
+	uploadResult := uploadFilesWithProgress(
 		uploadCtx,
 		storageClient,
 		cfg.StorageBucket,
@@ -190,6 +223,7 @@ func collectSessionArtifacts(
 		workspaceID,
 		sessionID,
 		logger,
+		report,
 	)
 
 	fmt.Printf("[session-file-upload] Upload complete: %d successful, %d failed\n",

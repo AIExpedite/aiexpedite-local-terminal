@@ -814,6 +814,42 @@ func TestPublishTerminalIfCurrent_ReservesIDUntilDelivered(t *testing.T) {
 	}
 }
 
+// End must not free an ended session in the gap between the watcher marking
+// it ended and establishing the terminal-frame reservation. The watcher owns
+// both publication and removal.
+func TestProcessManagerEnd_RetainsEndedSessionForWatcher(t *testing.T) {
+	m := NewCodexAppServerManager(nil)
+	session := &CodexAppServerSession{ID: "s", status: "ended", done: make(chan struct{})}
+	m.sessions["s"] = session
+
+	if err := m.End("s"); err != nil {
+		t.Fatalf("End(ended session): %v", err)
+	}
+	if got := m.Get("s"); got != session {
+		t.Fatalf("End freed the ID before the watcher reserved its terminal publish")
+	}
+}
+
+func TestBoundedArtifactCollect_PreservesIncrementalResultsPastDrain(t *testing.T) {
+	oldDrain := sessionArtifactCancelDrainTimeout
+	sessionArtifactCancelDrainTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { sessionArtifactCancelDrainTimeout = oldDrain })
+
+	want := FileInfo{Name: "completed.png", Path: "gs://bucket/completed.png"}
+	files, _, timedOut := boundedArtifactCollectWithProgress(func(ctx context.Context, report artifactProgressFunc) ([]FileInfo, []UploadError) {
+		report(want, nil)
+		// Model a worker stuck in context-unaware local I/O beyond the drain.
+		select {}
+	}, 10*time.Millisecond, "partial-progress")
+
+	if !timedOut {
+		t.Fatalf("collector should have timed out")
+	}
+	if len(files) != 1 || files[0] != want {
+		t.Fatalf("completed upload metadata = %+v, want %+v", files, want)
+	}
+}
+
 // An End that resolves a tombstone while the terminal frame is still in flight
 // must not answer absence — the ID is not free, so the server would release
 // the fence for an ID a frame is still travelling under.
