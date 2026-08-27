@@ -423,6 +423,9 @@ func (m *ClaudeNativeManager) End(id string) error {
 	// device on (Codex P1 — see end_confirm.go).
 	if session.isKillUnconfirmed() {
 		if probeProcessGone(session.Process) {
+			if !streamDrainConfirmed(session.streamDone) {
+				return fmt.Errorf("claude native session %s process absence verified but old stream publishers have not drained; session retained: %w", id, errEndUnconfirmed)
+			}
 			if !m.removeSessionIfSame(id, session) {
 				// See CodexAppServerManager.End — the ID is not ours to free.
 				return fmt.Errorf("claude native session %s could not be released — a terminal frame is still in flight or the ID was re-taken: %w", id, errEndUnconfirmed)

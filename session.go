@@ -111,8 +111,12 @@ type CLISession struct {
 	// can publish the fail-fast error frame without threading it through.
 	publishFn PublishFunc
 
-	mu   sync.Mutex
-	done chan struct{} // closed when process exits
+	mu sync.Mutex
+	// processExited closes immediately after Process.Wait returns. done closes
+	// only after stream producers and their publishes drain; EndSession waits on
+	// the former while the watcher retains the ID through terminal publication.
+	processExited chan struct{}
+	done          chan struct{}
 	// killUnconfirmed marks a session whose EndSession escalated to Kill and
 	// then timed out waiting for the exit watcher. The session is RETAINED as
 	// a tombstone (see end_confirm.go): only probeProcessGone may convert it
@@ -350,6 +354,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
 		deferredStdinClose: stdinPromptFormat(command) == "plain" && stdinPrompt == "",
 		firstRealFrame:     make(chan struct{}),
+		processExited:      make(chan struct{}),
 		done:               make(chan struct{}),
 		streamDone:         make(chan struct{}),
 		publishFn:          publishFn,
@@ -573,6 +578,14 @@ func (sm *SessionManager) EndSession(id string) error {
 	if !exists {
 		return fmt.Errorf("session %s not found", id)
 	}
+	processExited := processExitSignal(session.processExited, session.done)
+	select {
+	case <-processExited:
+		// The watcher owns stream drain, artifact collection, terminal
+		// publication, and removal. Keep the ID reserved until it completes.
+		return nil
+	default:
+	}
 
 	session.mu.Lock()
 	if session.Status == "ended" {
@@ -590,6 +603,9 @@ func (sm *SessionManager) EndSession(id string) error {
 	// device on (Codex P1 — see end_confirm.go).
 	if unconfirmed {
 		if probeProcessGone(session.Process) {
+			if !streamDrainConfirmed(session.streamDone) {
+				return fmt.Errorf("session %s process absence verified but old stream publishers have not drained; session retained: %w", id, errEndUnconfirmed)
+			}
 			if !sm.removeSessionIfSame(id, session) {
 				// See CodexAppServerManager.End — the ID is not ours to free.
 				return fmt.Errorf("session %s could not be released — a terminal frame is still in flight or the ID was re-taken: %w", id, errEndUnconfirmed)
@@ -601,8 +617,7 @@ func (sm *SessionManager) EndSession(id string) error {
 				fmt.Printf("%s[session] Re-kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
 			}
 		}
-		if waitDoneConfirm(session.done, killConfirmTimeout) {
-			sm.removeSessionIfSame(id, session)
+		if waitDoneConfirm(processExited, killConfirmTimeout) {
 			return nil
 		}
 		return fmt.Errorf("session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
@@ -615,7 +630,7 @@ func (sm *SessionManager) EndSession(id string) error {
 
 	// Wait for exit or timeout
 	select {
-	case <-session.done:
+	case <-processExited:
 		// Process exited gracefully
 	case <-time.After(gracefulShutdownTimeout):
 		// Force kill after timeout
@@ -626,7 +641,7 @@ func (sm *SessionManager) EndSession(id string) error {
 		}
 		// BOUNDED wait for exit after kill — see end_confirm.go for why
 		// blocking here indefinitely wedged an entire device (2026-08-27).
-		if !waitDoneConfirm(session.done, killConfirmTimeout) {
+		if !waitDoneConfirm(processExited, killConfirmTimeout) {
 			fmt.Printf("%s[session] Kill unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
 				colorRed, id, killConfirmTimeout, colorReset)
 			session.mu.Lock()
@@ -639,7 +654,9 @@ func (sm *SessionManager) EndSession(id string) error {
 		}
 	}
 
-	sm.removeSessionIfSame(id, session)
+	// Process exit is only the first lifecycle boundary. The watcher retains
+	// ownership until stream drain, artifact collection, and session_ended
+	// delivery finish, then removes the session from its release callback.
 	return nil
 }
 
@@ -1365,6 +1382,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	}
 
 	err := session.Process.Wait()
+	closeProcessExited(session.processExited)
 
 	if timeoutTimer != nil {
 		timeoutTimer.Stop()

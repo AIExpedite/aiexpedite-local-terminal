@@ -147,6 +147,24 @@ func closeProcessExited(processExited chan struct{}) {
 	}
 }
 
+// streamDrainConfirmed reports whether every stream producer and its tracked
+// publishes have finished. A verified-dead process is not enough to release a
+// retained session ID: the old watcher may still have message/error frames in
+// flight under that ID, and a replacement would receive them as its own.
+// Production sessions always initialize streamDone; nil fails closed for old
+// tests/fixtures and partially initialized sessions.
+func streamDrainConfirmed(streamDone <-chan struct{}) bool {
+	if streamDone == nil {
+		return false
+	}
+	select {
+	case <-streamDone:
+		return true
+	default:
+		return false
+	}
+}
+
 // probeProcessGone reports whether cmd's child process is VERIFIABLY no
 // longer running. This is the only thing allowed to convert a
 // kill-unconfirmed tombstone into the "session not found" absence answer the

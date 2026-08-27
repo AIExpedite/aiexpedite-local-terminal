@@ -439,36 +439,36 @@ func TestGrokACPManager_StartClampsTimeoutAtMaxLifetime(t *testing.T) {
 	}
 }
 
-func TestGrokACPManager_EndStaleSessions_OldOnly(t *testing.T) {
+func TestGrokACPManager_EndStaleSessions_RetainsWatcherOwnedSession(t *testing.T) {
 	m := NewGrokACPManager(nil)
 
 	now := time.Now()
 	old := &GrokACPSession{
-		ID:         "old",
-		StartedAt:  now.Add(-2 * time.Hour),
-		status:     "ended",
-		done:       make(chan struct{}),
-		streamDone: make(chan struct{}),
+		ID:            "old",
+		StartedAt:     now.Add(-2 * time.Hour),
+		status:        "running",
+		processExited: make(chan struct{}),
+		done:          make(chan struct{}),
+		streamDone:    make(chan struct{}),
 	}
-	close(old.done)
-	close(old.streamDone)
+	close(old.processExited)
 	young := &GrokACPSession{
-		ID:         "young",
-		StartedAt:  now,
-		status:     "ended",
-		done:       make(chan struct{}),
-		streamDone: make(chan struct{}),
+		ID:            "young",
+		StartedAt:     now,
+		status:        "running",
+		processExited: make(chan struct{}),
+		done:          make(chan struct{}),
+		streamDone:    make(chan struct{}),
 	}
-	close(young.done)
-	close(young.streamDone)
+	close(young.processExited)
 
 	m.sessions["old"] = old
 	m.sessions["young"] = young
 
 	m.endStaleSessions(30 * time.Minute)
 
-	if _, ok := m.sessions["old"]; ok {
-		t.Errorf("stale session `old` should have been removed; still present")
+	if got := m.sessions["old"]; got != old {
+		t.Errorf("stale session `old` must remain reserved for its watcher")
 	}
 	if _, ok := m.sessions["young"]; !ok {
 		t.Errorf("fresh session `young` should still be present; was removed")

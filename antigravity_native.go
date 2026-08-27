@@ -282,9 +282,9 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid, resum
 	// error and desync Pub/Sub retry state from the manager.
 	m.mu.Lock()
 	if existing, exists := m.sessions[id]; exists {
-		ackExistingAntigravitySession(existing, id, publishFn, onStarted)
+		err := ackExistingAntigravitySession(existing, id, publishFn, onStarted)
 		m.mu.Unlock()
-		return nil
+		return err
 	}
 	m.mu.Unlock()
 
@@ -296,8 +296,7 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid, resum
 	defer m.mu.Unlock()
 	// Re-check after probe: a concurrent Start for the same id may have won.
 	if existing, exists := m.sessions[id]; exists {
-		ackExistingAntigravitySession(existing, id, publishFn, onStarted)
-		return nil
+		return ackExistingAntigravitySession(existing, id, publishFn, onStarted)
 	}
 
 	session := &AntigravityNativeSession{
@@ -330,22 +329,27 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid, resum
 
 // ackExistingAntigravitySession refreshes the publisher binding and re-acks
 // started for an already-registered logical session. Caller must hold m.mu.
-func ackExistingAntigravitySession(existing *AntigravityNativeSession, id string, publishFn PublishFunc, onStarted func()) {
+func ackExistingAntigravitySession(existing *AntigravityNativeSession, id string, publishFn PublishFunc, onStarted func()) error {
 	// Pub/Sub redelivery / terminal-service retry of the same start must
 	// re-ack started without ending the still-usable local session. Emitting
 	// antigravity_native_ended here would release the cloud reservation while
 	// the manager still holds the session, breaking later Sends.
 	// Refresh publishFn so a newer publisher binding still reaches GC.
-	if publishFn != nil {
-		existing.mu.Lock()
-		existing.publishFn = publishFn
+	existing.mu.Lock()
+	if existing.status == "ended" || existing.endDrainUnconfirmed {
 		existing.mu.Unlock()
+		return fmt.Errorf("antigravity native session %s is ending; retained tombstone cannot acknowledge start", id)
 	}
+	if publishFn != nil {
+		existing.publishFn = publishFn
+	}
+	existing.mu.Unlock()
 	fmt.Printf("%s[antigravity-native] Session %s already registered — idempotent start ack%s\n",
 		colorCyan, id, colorReset)
 	if onStarted != nil {
 		onStarted()
 	}
+	return nil
 }
 
 // Send runs one user turn: spawn `agy --print <prompt>` (with --conversation

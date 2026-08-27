@@ -256,14 +256,23 @@ func TestCodexAppServerEnd_KillUnconfirmed_TombstoneThenVerifiedAbsence(t *testi
 		t.Fatalf("session should be marked kill-unconfirmed")
 	}
 
-	// Follow-up End: the child is verifiably gone (exited + reaped), so the
-	// tombstone resolves into the true absence answer and the session drops.
+	// Process absence alone is not enough while an old stream publisher can
+	// still emit under this ID. The tombstone remains until streamDone proves
+	// every tracked publish has drained.
+	err = m.End("wedged")
+	if err == nil || !errorsIs(err, errEndUnconfirmed) {
+		t.Fatalf("follow-up End should retain for stream drain; got %v", err)
+	}
+	if m.Get("wedged") != session {
+		t.Fatalf("session must remain reserved while old stream publishers can act")
+	}
+	close(session.streamDone)
 	err = m.End("wedged")
 	if err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("follow-up End should report verified absence; got %v", err)
+		t.Fatalf("drained follow-up End should report verified absence; got %v", err)
 	}
 	if m.Get("wedged") != nil {
-		t.Fatalf("session should be removed once absence is verified")
+		t.Fatalf("session should be removed once absence and stream drain are verified")
 	}
 }
 
@@ -293,11 +302,13 @@ func TestSessionManagerEndSession_KillUnconfirmed_TombstoneThenVerifiedAbsence(t
 	shortenEndConfirmTimeouts(t)
 	sm := NewSessionManager(nil)
 	session := &CLISession{
-		ID:        "wedged-pty",
-		Process:   exitedTestProcess(t),
-		StartedAt: time.Now(),
-		Status:    "running",
-		done:      make(chan struct{}), // never closed
+		ID:            "wedged-pty",
+		Process:       exitedTestProcess(t),
+		StartedAt:     time.Now(),
+		Status:        "running",
+		processExited: make(chan struct{}), // wedged watcher never signals either boundary
+		done:          make(chan struct{}),
+		streamDone:    make(chan struct{}),
 	}
 	sm.mu.Lock()
 	sm.sessions["wedged-pty"] = session
@@ -319,10 +330,19 @@ func TestSessionManagerEndSession_KillUnconfirmed_TombstoneThenVerifiedAbsence(t
 		t.Fatalf("session must be retained as a tombstone after an unconfirmed kill")
 	}
 
-	// Verified absence on the follow-up end.
+	// Verified absence still retains the ID until every old stream publish has
+	// drained; then a later End may return the true absence answer.
+	err = sm.EndSession("wedged-pty")
+	if err == nil || !errorsIs(err, errEndUnconfirmed) {
+		t.Fatalf("follow-up EndSession should retain for stream drain; got %v", err)
+	}
+	if sm.GetSession("wedged-pty") != session {
+		t.Fatalf("PTY session must remain reserved while old stream publishers can act")
+	}
+	close(session.streamDone)
 	err = sm.EndSession("wedged-pty")
 	if err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("follow-up EndSession should report verified absence; got %v", err)
+		t.Fatalf("drained follow-up EndSession should report verified absence; got %v", err)
 	}
 	if sm.GetSession("wedged-pty") != nil {
 		t.Fatalf("session should be removed once absence is verified")
@@ -535,11 +555,13 @@ func TestUnconfirmedEndErrorsCarrySentinel(t *testing.T) {
 		t.Fatalf("antigravity drain-unconfirmed error must wrap errEndUnconfirmed: %v", err)
 	}
 
-	// The verified-absence answer must NOT carry it — that one is the real
-	// absence evidence and SHOULD flow into the idempotent ended publish.
+	// Verified absence plus a fully drained stream lifecycle must NOT carry it
+	// — together they are the complete evidence that this session can no longer
+	// act under the ID and SHOULD flow into the idempotent ended publish.
 	stubProbe(t, true)
+	close(cs.streamDone)
 	if err := cm.End("wedged"); err == nil || errorsIs(err, errEndUnconfirmed) {
-		t.Fatalf("verified absence must not carry the unconfirmed sentinel: %v", err)
+		t.Fatalf("verified absence after stream drain must not carry the unconfirmed sentinel: %v", err)
 	}
 }
 
@@ -835,6 +857,31 @@ func TestProcessManagerEnd_RetainsEndedSessionForWatcher(t *testing.T) {
 // after process exit; End must return on the first event without removing the
 // session that still reserves the eventual terminal frame's ID.
 func TestProcessManagerEnd_ProcessExitDoesNotWaitForWatcherDone(t *testing.T) {
+	t.Run("PTY", func(t *testing.T) {
+		m := NewSessionManager(nil)
+		session := &CLISession{
+			ID:            "s",
+			Status:        "running",
+			processExited: make(chan struct{}),
+			done:          make(chan struct{}),
+			streamDone:    make(chan struct{}),
+		}
+		m.sessions[session.ID] = session
+		close(session.processExited)
+
+		if err := m.EndSession(session.ID); err != nil {
+			t.Fatalf("EndSession after process exit: %v", err)
+		}
+		if got := m.GetSession(session.ID); got != session {
+			t.Fatalf("EndSession removed PTY before watcher terminal lifecycle finished")
+		}
+		select {
+		case <-session.done:
+			t.Fatalf("test requires watcher done to remain open")
+		default:
+		}
+	})
+
 	t.Run("codex app-server", func(t *testing.T) {
 		m := NewCodexAppServerManager(nil)
 		session := &CodexAppServerSession{
@@ -904,6 +951,104 @@ func TestProcessManagerEnd_ProcessExitDoesNotWaitForWatcherDone(t *testing.T) {
 		case <-session.done:
 			t.Fatalf("test requires watcher done to remain open")
 		default:
+		}
+	})
+}
+
+// Verified OS absence does not authorize reuse while an old stream producer
+// can still publish ordinary message/error frames. Each resident process
+// manager must retain its tombstone until streamDone closes.
+func TestResidentProcessTombstones_RetainUntilStreamPublishersDrain(t *testing.T) {
+	stubProbe(t, true)
+
+	t.Run("codex app-server", func(t *testing.T) {
+		m := NewCodexAppServerManager(nil)
+		drain := make(chan struct{})
+		s := &CodexAppServerSession{ID: "s", status: "running", killUnconfirmed: true, processExited: make(chan struct{}), done: make(chan struct{}), streamDone: drain}
+		m.sessions[s.ID] = s
+		if err := m.End(s.ID); err == nil || !errorsIs(err, errEndUnconfirmed) {
+			t.Fatalf("End before stream drain = %v, want unconfirmed", err)
+		}
+		if m.Get(s.ID) != s {
+			t.Fatal("tombstone released before stream drain")
+		}
+		close(drain)
+		if err := m.End(s.ID); err == nil || !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("End after stream drain = %v, want not found", err)
+		}
+	})
+
+	t.Run("claude native", func(t *testing.T) {
+		m := NewClaudeNativeManager(nil)
+		drain := make(chan struct{})
+		s := &ClaudeNativeSession{ID: "s", status: "running", killUnconfirmed: true, processExited: make(chan struct{}), done: make(chan struct{}), streamDone: drain}
+		m.sessions[s.ID] = s
+		if err := m.End(s.ID); err == nil || !errorsIs(err, errEndUnconfirmed) {
+			t.Fatalf("End before stream drain = %v, want unconfirmed", err)
+		}
+		if m.Get(s.ID) != s {
+			t.Fatal("tombstone released before stream drain")
+		}
+		close(drain)
+		if err := m.End(s.ID); err == nil || !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("End after stream drain = %v, want not found", err)
+		}
+	})
+
+	t.Run("grok ACP", func(t *testing.T) {
+		m := NewGrokACPManager(nil)
+		drain := make(chan struct{})
+		s := &GrokACPSession{ID: "s", status: "running", killUnconfirmed: true, processExited: make(chan struct{}), done: make(chan struct{}), streamDone: drain}
+		m.sessions[s.ID] = s
+		if err := m.End(s.ID); err == nil || !errorsIs(err, errEndUnconfirmed) {
+			t.Fatalf("End before stream drain = %v, want unconfirmed", err)
+		}
+		if m.Get(s.ID) != s {
+			t.Fatal("tombstone released before stream drain")
+		}
+		close(drain)
+		if err := m.End(s.ID); err == nil || !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("End after stream drain = %v, want not found", err)
+		}
+	})
+}
+
+// A duplicate start is idempotent only for a live logical session. Retained
+// turn-drain tombstones reject it and never emit *_started for an unusable ID.
+func TestTurnManagerStart_RejectsRetainedDrainTombstone(t *testing.T) {
+	cwd := t.TempDir()
+
+	t.Run("antigravity", func(t *testing.T) {
+		m := NewAntigravityNativeManager(nil)
+		s := &AntigravityNativeSession{ID: "s", status: "ended", endDrainUnconfirmed: true}
+		m.sessions[s.ID] = s
+		acks := 0
+		err := m.Start(s.ID, cwd, "ws", "uid", "", nil, func() { acks++ })
+		if err == nil || !strings.Contains(err.Error(), "retained tombstone") {
+			t.Fatalf("Start against tombstone = %v, want rejection", err)
+		}
+		if acks != 0 {
+			t.Fatalf("started ack count = %d, want 0", acks)
+		}
+		if m.Get(s.ID) != s {
+			t.Fatal("rejected start must retain the drain tombstone")
+		}
+	})
+
+	t.Run("opencode", func(t *testing.T) {
+		m := NewOpenCodeNativeManager()
+		s := &OpenCodeNativeSession{ID: "s", status: "ended", endDrainUnconfirmed: true}
+		m.sessions[s.ID] = s
+		acks := 0
+		err := m.Start(s.ID, cwd, "ws", "uid", nil, func() { acks++ })
+		if err == nil || !strings.Contains(err.Error(), "retained tombstone") {
+			t.Fatalf("Start against tombstone = %v, want rejection", err)
+		}
+		if acks != 0 {
+			t.Fatalf("started ack count = %d, want 0", acks)
+		}
+		if m.Get(s.ID) != s {
+			t.Fatal("rejected start must retain the drain tombstone")
 		}
 	})
 }

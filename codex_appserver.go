@@ -431,6 +431,9 @@ func (m *CodexAppServerManager) End(id string) error {
 	// manufacturing absence evidence for a possibly-alive child).
 	if session.isKillUnconfirmed() {
 		if probeProcessGone(session.Process) {
+			if !streamDrainConfirmed(session.streamDone) {
+				return fmt.Errorf("codex app-server session %s process absence verified but old stream publishers have not drained; session retained: %w", id, errEndUnconfirmed)
+			}
 			if !m.removeSessionIfSame(id, session) {
 				// The ID is not ours to free: a replacement owns it, or the
 				// terminal frame is still in flight under it. Either way this
