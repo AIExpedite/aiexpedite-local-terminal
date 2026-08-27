@@ -3895,7 +3895,7 @@ func TestCodexSelectNewestRolloutCandidates_KeepsCappedNewestInRankOrder(t *test
 		{path: "tie-b", mtime: now.Add(-time.Hour)},
 	}
 
-	selected, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, 3, 0, nil, "", "")
+	selected, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, 3, nil, nil, "", "")
 	if !complete {
 		t.Fatal("complete=false, want an uninterrupted ranking pass")
 	}
@@ -3929,7 +3929,8 @@ func TestCodexSelectNewestRolloutCandidates_ReservesUnfinishedBoundary(t *testin
 	}
 
 	selected, complete := codexSelectNewestRolloutCandidates(
-		context.Background(), candidates, now, codexRolloutScanFileCap, boundary.UnixNano(), nil, "", "",
+		context.Background(), candidates, now, codexRolloutScanFileCap,
+		[]codexRolloutReserve{codexRolloutBoundaryReserve(boundary.UnixNano())}, nil, "", "",
 	)
 	if !complete || len(selected) != codexRolloutScanFileCap {
 		t.Fatalf("complete=%v selected=%d, want a full uninterrupted batch", complete, len(selected))
@@ -3961,7 +3962,7 @@ func TestCodexSelectNewestRolloutCandidates_StopsWhenBudgetExpires(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	selected, complete := codexSelectNewestRolloutCandidates(ctx, candidates, now, codexRolloutScanFileCap, 0, nil, "", "")
+	selected, complete := codexSelectNewestRolloutCandidates(ctx, candidates, now, codexRolloutScanFileCap, nil, nil, "", "")
 	if complete {
 		t.Fatal("complete=true, want an exhausted budget reported as incomplete ranking")
 	}
@@ -3986,7 +3987,7 @@ func TestCodexSelectNewestRolloutCandidates_RotatesRetryOnlyOverflow(t *testing.
 	}
 	oldest := candidates[0]
 
-	first, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, capacity, 0, retries, "", "")
+	first, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, capacity, nil, retries, "", "")
 	if !complete || len(first) != capacity {
 		t.Fatalf("complete=%v selected=%d, want first retry-only batch of %d", complete, len(first), capacity)
 	}
@@ -4002,7 +4003,7 @@ func TestCodexSelectNewestRolloutCandidates_RotatesRetryOnlyOverflow(t *testing.
 	}
 
 	second, complete := codexSelectNewestRolloutCandidates(
-		context.Background(), candidates, now, capacity, 0, retries, cursor, fingerprint,
+		context.Background(), candidates, now, capacity, nil, retries, cursor, fingerprint,
 	)
 	if !complete || len(second) != capacity {
 		t.Fatalf("complete=%v selected=%d, want rotated retry-only batch of %d", complete, len(second), capacity)
@@ -5257,5 +5258,126 @@ func TestCodexRolloutFallbackBuckets_ResumesFutureBatchAfterClockCatchUp(t *test
 	eligible = codexUnconsumedRolloutCandidates(candidates, cursor, caughtUp)
 	if len(eligible) != 1 || eligible[0].path != nextPath {
 		t.Fatalf("eligible=%+v, want only the newly created normal rollout", eligible)
+	}
+}
+
+func TestCodexSelectNewestRolloutCandidates_SplitsCapacityAcrossReserves(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	boundary := now.Add(-time.Hour)
+	futureMtime := now.Add(24 * time.Hour)
+	candidates := make([]codexRolloutCandidate, 0, 3*codexRolloutScanFileCap)
+	for i := range codexRolloutScanFileCap {
+		candidates = append(candidates, codexRolloutCandidate{
+			path:  fmt.Sprintf("newer-%02d", i),
+			mtime: boundary.Add(time.Minute),
+		})
+		candidates = append(candidates, codexRolloutCandidate{
+			path:  fmt.Sprintf("boundary-%02d", i),
+			mtime: boundary,
+		})
+		candidates = append(candidates, codexRolloutCandidate{
+			path:  fmt.Sprintf("cohort-%02d", i),
+			mtime: futureMtime,
+		})
+	}
+
+	selected, complete := codexSelectNewestRolloutCandidates(
+		context.Background(), candidates, now, codexRolloutScanFileCap,
+		[]codexRolloutReserve{
+			codexRolloutBoundaryReserve(boundary.UnixNano()),
+			codexRolloutFutureCohortReserve(now, futureMtime.UnixNano(), futureMtime.UnixNano()),
+		}, nil, "", "",
+	)
+	if !complete || len(selected) != codexRolloutScanFileCap {
+		t.Fatalf("complete=%v selected=%d, want a full uninterrupted batch", complete, len(selected))
+	}
+	share := codexRolloutScanFileCap / 3
+	counts := map[string]int{}
+	for _, candidate := range selected {
+		switch {
+		case candidate.mtime.Equal(futureMtime):
+			counts["cohort"]++
+		case candidate.mtime.Equal(boundary):
+			counts["boundary"]++
+		default:
+			counts["ordinary"]++
+		}
+	}
+	if counts["boundary"] != share || counts["cohort"] != share {
+		t.Fatalf("counts=%v, want %d reserved slots for each starved group", counts, share)
+	}
+	if counts["ordinary"] <= share {
+		t.Fatalf("counts=%v, want the ordinary rank to keep the largest share for fresh evidence", counts)
+	}
+}
+
+// A future-dated rollout that lands above an unfinished cohort's saved ceiling is
+// scanned outside that cohort and outranks every member of it. A full batch of
+// such arrivals must not leave the cohort's own cursor unchanged forever: its
+// older members hold quota evidence no newer file restates.
+func TestCodexRolloutFallbackBuckets_NewerFutureArrivalsCannotStarveCohort(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "future-starvation@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	cohortMtime := now.Add(24 * time.Hour)
+	arrivalMtime := cohortMtime.Add(time.Hour)
+	writeRollout := func(name string, percent int, mtime time.Time) {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(
+				`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`,
+				percent,
+			) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range codexRolloutScanFileCap + 1 {
+		writeRollout(fmt.Sprintf("rollout-cohort-%02d.jsonl", i), 41+i, cohortMtime)
+	}
+
+	startingCursor := codexRolloutScanCursor{mtimeNs: now.Add(-time.Second).UnixNano()}
+	contributors, _, _, progress, ok := codexRolloutFallbackBuckets(context.Background(), base, now, startingCursor)
+	if !ok || progress == nil || progress.futureCursor == "" || progress.futureComplete {
+		t.Fatalf("ok=%v progress=%+v, want an unfinished capped future cohort", ok, progress)
+	}
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, progress, base,
+	)
+
+	// A whole capped batch of newer future-dated rollouts arrives above the saved
+	// ceiling, so every one of them outranks the single unread cohort member.
+	for i := range codexRolloutScanFileCap {
+		writeRollout(fmt.Sprintf("rollout-arrival-%02d.jsonl", i), 11+i, arrivalMtime)
+	}
+
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.futureCursor == "" || cursor.futureComplete ||
+		cursor.futureCeilingNs != cohortMtime.UnixNano() {
+		t.Fatalf("reloaded cursor=%+v, want the bounded unfinished cohort", cursor)
+	}
+	_, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || completed == nil {
+		t.Fatalf("ok=%v progress=%+v, want a usable pass", ok, completed)
+	}
+	if !completed.futureComplete || completed.futureCursor != "" {
+		t.Fatalf("progress=%+v, want the reserved cohort slot to finish the cohort "+
+			"instead of yielding every slot to the newer arrivals", completed)
+	}
+	if completed.futureCeilingNs != cohortMtime.UnixNano() {
+		t.Fatalf("cohort ceiling=%d, want the saved bounds preserved so the later "+
+			"arrivals are still scanned outside the cohort", completed.futureCeilingNs)
 	}
 }

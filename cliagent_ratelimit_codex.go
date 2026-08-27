@@ -2103,6 +2103,13 @@ func codexRolloutInFutureCohort(candidate codexRolloutCandidate, anchor time.Tim
 //
 // Residual: an arrival whose mtime happens to fall inside the bounds is still
 // indistinguishable from a cohort member, so it restarts the cohort as before.
+// Residual: an arrival above the ceiling has no cursor of its own — the main
+// high-water is clamped below the clock and the backlog cursor skips
+// future-dated files — so it is re-offered on every refresh until the clock
+// catches up and codexRolloutFutureCohortCaughtUp retires the anomaly. That
+// repeats a bounded read of the newest evidence rather than losing an older
+// one; codexRolloutFutureCohortReserve is what keeps those repeats from
+// starving the cohort underneath them.
 func codexRolloutFutureCohortBounds(candidates []codexRolloutCandidate, anchor time.Time) (int64, int64) {
 	oldest, newest := int64(0), int64(0)
 	for _, candidate := range candidates {
@@ -2566,6 +2573,32 @@ func codexInsertNewestRolloutCandidate(selected []codexRolloutCandidate, candida
 	return selected
 }
 
+// codexRolloutReserve reports whether a candidate belongs to a group that a
+// capped selection must keep making progress on. Groups are defined by a saved
+// scan cursor whose only way forward is to open its own members, so a group is
+// starved — not merely delayed — when newer arrivals can take every slot.
+type codexRolloutReserve func(codexRolloutCandidate) bool
+
+// codexRolloutBoundaryReserve claims a share of the batch for the unfinished
+// equal-mtime boundary a saved boundary cursor is resuming through.
+func codexRolloutBoundaryReserve(mtimeNs int64) codexRolloutReserve {
+	return func(candidate codexRolloutCandidate) bool {
+		return mtimeNs > 0 && candidate.mtime.UnixNano() == mtimeNs
+	}
+}
+
+// codexRolloutFutureCohortReserve claims a share of the batch for an unfinished
+// anchored future cohort. Every future-dated rollout that arrives above the
+// cohort's saved ceiling is scanned outside it (see codexRolloutFutureCohortBounds)
+// and outranks its members, so a full batch of such arrivals would otherwise
+// leave the cohort cursor unchanged on every refresh and its older members —
+// carrying quota evidence no other file restates — permanently unread.
+func codexRolloutFutureCohortReserve(anchor time.Time, floorNs, ceilingNs int64) codexRolloutReserve {
+	return func(candidate codexRolloutCandidate) bool {
+		return codexRolloutInFutureCohort(candidate, anchor, floorNs, ceilingNs)
+	}
+}
+
 // codexSelectNewestRolloutCandidates returns the `capacity` highest-ranked
 // candidates in rank order without ordering the rest. A full sort of a large
 // backlog is both O(n log n) and uncancellable, so it can burn the read reserve
@@ -2577,26 +2610,31 @@ func codexInsertNewestRolloutCandidate(selected []codexRolloutCandidate, candida
 // was cut short, which keeps the completed-scan cursor from advancing past
 // candidates that were never ranked.
 //
-// When reservedBoundaryMtimeNs is non-zero, up to half the batch is reserved
-// for candidates at that unfinished equal-mtime boundary. This prevents an
-// ongoing stream of newer files from starving deterministic boundary progress.
+// Each entry in reserves claims a bounded share of the batch for a group whose
+// saved scan cursor can only advance when that group is opened — an unfinished
+// equal-mtime boundary, or an unfinished anchored future cohort that every
+// later future-dated arrival outranks. Without the reserve an ongoing stream of
+// newer files fills every slot on every refresh and the group is starved
+// permanently. The reserved share is capacity/(len(reserves)+1) each, so the
+// ordinary top-N selection always keeps the largest share for fresh evidence
+// and each group still finishes in bounded deterministic batches.
 // When retryEntries fill the ordinary selection, one slot is reserved for the
 // newest non-retry candidate so persistent failures cannot pin an older backlog.
 // When the remaining cohort is retry-only and larger than the cap, a matching
 // retry cursor rotates past the previous batch so a recovered older failure is
 // reopened instead of reselecting the same newest identities forever.
-func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexRolloutCandidate, now time.Time, capacity int, reservedBoundaryMtimeNs int64, retryEntries map[string]struct{}, retryCursor, retryFingerprint string) ([]codexRolloutCandidate, bool) {
+func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexRolloutCandidate, now time.Time, capacity int, reserves []codexRolloutReserve, retryEntries map[string]struct{}, retryCursor, retryFingerprint string) ([]codexRolloutCandidate, bool) {
 	if capacity <= 0 {
 		return nil, true
 	}
 	selected := make([]codexRolloutCandidate, 0, capacity+1)
 	var newestNonRetry codexRolloutCandidate
 	haveNonRetry := false
-	boundaryCapacity := capacity / 2
-	if boundaryCapacity == 0 {
-		boundaryCapacity = 1
+	reserveCapacity := capacity / (len(reserves) + 1)
+	if reserveCapacity == 0 {
+		reserveCapacity = 1
 	}
-	reservedBoundary := make([]codexRolloutCandidate, 0, boundaryCapacity+1)
+	reserved := make([][]codexRolloutCandidate, len(reserves))
 	for i, candidate := range candidates {
 		if i%codexRolloutCandidateRankCheckInterval == 0 && ctx.Err() != nil {
 			return selected, false
@@ -2606,45 +2644,49 @@ func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexR
 			(!haveNonRetry || codexRolloutCandidateBefore(candidate, newestNonRetry, now)) {
 			newestNonRetry, haveNonRetry = candidate, true
 		}
-		if reservedBoundaryMtimeNs > 0 && candidate.mtime.UnixNano() == reservedBoundaryMtimeNs {
-			reservedBoundary = codexInsertNewestRolloutCandidate(reservedBoundary, candidate, now, boundaryCapacity)
-		}
-	}
-	// A saved equal-mtime boundary must keep making progress even when at least
-	// one full capped batch of newer rollouts exists. Reserve half the batch for
-	// its highest-ranked remaining entries; the other half still captures fresh
-	// evidence, and the boundary finishes in bounded deterministic batches.
-	reservedPaths := make(map[string]struct{}, len(reservedBoundary))
-	for _, boundary := range reservedBoundary {
-		reservedPaths[boundary.path] = struct{}{}
-	}
-	for _, boundary := range reservedBoundary {
-		alreadySelected := false
-		for _, candidate := range selected {
-			if candidate.path == boundary.path {
-				alreadySelected = true
-				break
+		for r, member := range reserves {
+			if member(candidate) {
+				reserved[r] = codexInsertNewestRolloutCandidate(reserved[r], candidate, now, reserveCapacity)
 			}
 		}
-		if alreadySelected {
-			continue
+	}
+	// Collect every reserved path before merging any of them: one group must not
+	// be able to evict an entry another group already counted toward its reserve.
+	reservedPaths := map[string]struct{}{}
+	for _, group := range reserved {
+		for _, entry := range group {
+			reservedPaths[entry.path] = struct{}{}
 		}
-		if len(selected) == capacity {
-			// Evict the lowest-ranked non-reserved entry. Truncating the slice
-			// would discard a boundary entry already counted toward the reserve
-			// whenever the ordinary top-N selection included only part of it.
-			evict := len(selected) - 1
-			for ; evict >= 0; evict-- {
-				if _, reserved := reservedPaths[selected[evict].path]; !reserved {
+	}
+	for _, group := range reserved {
+		for _, entry := range group {
+			alreadySelected := false
+			for _, candidate := range selected {
+				if candidate.path == entry.path {
+					alreadySelected = true
 					break
 				}
 			}
-			if evict < 0 {
+			if alreadySelected {
 				continue
 			}
-			selected = append(selected[:evict], selected[evict+1:]...)
+			if len(selected) == capacity {
+				// Evict the lowest-ranked non-reserved entry. Truncating the slice
+				// would discard a reserved entry already counted toward a group's
+				// share whenever the ordinary top-N selection included only part of it.
+				evict := len(selected) - 1
+				for ; evict >= 0; evict-- {
+					if _, isReserved := reservedPaths[selected[evict].path]; !isReserved {
+						break
+					}
+				}
+				if evict < 0 {
+					continue
+				}
+				selected = append(selected[:evict], selected[evict+1:]...)
+			}
+			selected = codexInsertNewestRolloutCandidate(selected, entry, now, capacity)
 		}
-		selected = codexInsertNewestRolloutCandidate(selected, boundary, now, capacity)
 	}
 	if haveNonRetry && len(selected) == capacity {
 		hasSelectedNonRetry := false
@@ -3102,12 +3144,19 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		}
 	}
 	orderingCtx, cancelOrdering := codexRolloutCandidateOrderingContext(ctx)
-	reservedBoundaryMtimeNs := int64(0)
-	if cursor.boundaryCursor != "" {
-		reservedBoundaryMtimeNs = cursor.mtimeNs
+	var reserves []codexRolloutReserve
+	if cursor.boundaryCursor != "" && cursor.mtimeNs > 0 {
+		reserves = append(reserves, codexRolloutBoundaryReserve(cursor.mtimeNs))
+	}
+	if cursor.futureFingerprint != "" && !cursor.futureComplete {
+		// Resolve the cohort against the same listing the eligibility filter used,
+		// so the reserve covers exactly the members that filter left unconsumed.
+		if anchor, floorNs, ceilingNs, matches := codexRolloutFutureCohort(candidates, cursor, now); matches {
+			reserves = append(reserves, codexRolloutFutureCohortReserve(anchor, floorNs, ceilingNs))
+		}
 	}
 	selected, selectionComplete := codexSelectNewestRolloutCandidates(
-		orderingCtx, eligibleCandidates, now, codexRolloutScanFileCap, reservedBoundaryMtimeNs,
+		orderingCtx, eligibleCandidates, now, codexRolloutScanFileCap, reserves,
 		codexRolloutRetrySet(cursor.retryEntries), cursor.retryCursor, cursor.retryFingerprint,
 	)
 	cancelOrdering()
