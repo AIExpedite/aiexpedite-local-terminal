@@ -2956,6 +2956,93 @@ func TestCodexDiscoverRolloutCandidates_PreservesPartialLeafDirectoryResults(t *
 	}
 }
 
+func TestCodexDiscoverRolloutCandidates_BoundsPartialLeafMetadataPass(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < codexRolloutReadDirChunkSize*2; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A grace that is already spent stands in for a stalled filesystem whose
+	// first os.Stat exhausts it. The cancelled chunk must not be walked to its
+	// end regardless: cancellation has already fired, so every further metadata
+	// call is drawn from the sibling providers' reserve.
+	originalGrace := codexRolloutPartialLeafGrace
+	defer func() { codexRolloutPartialLeafGrace = originalGrace }()
+	codexRolloutPartialLeafGrace = -time.Second
+
+	ctx := &cancelAfterChecksContext{after: 15, done: make(chan struct{})}
+	candidates, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{})
+	if complete {
+		t.Fatal("discovery complete=true, want partial leaf enumeration to preserve the high-water")
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("candidates=%d, want the post-cancellation metadata pass to stop once its grace expired", len(candidates))
+	}
+
+	// Nothing enumerated by the abandoned pass may be lost: the entries it was
+	// handed are preserved, so a following unbounded refresh still reports every
+	// rollout in the directory.
+	codexRolloutPartialLeafGrace = originalGrace
+	candidates, _ = codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{})
+	if len(candidates) != codexRolloutReadDirChunkSize*2 {
+		t.Fatalf("candidates=%d, want all %d rollouts after the bounded pass", len(candidates), codexRolloutReadDirChunkSize*2)
+	}
+}
+
+func TestCodexReadDirContext_ReplaysPendingEntriesAfterCancellation(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	for i := 0; i < codexRolloutReadDirChunkSize*3; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	first, _, _, err := codexReadDirContext(firstCtx, dir)
+	if err != context.Canceled || len(first) != codexRolloutReadDirChunkSize {
+		t.Fatalf("first read entries=%d err=%v, want one chunk and cancellation", len(first), err)
+	}
+	// The caller processed only the entry it starts from before running out of
+	// budget, and hands the rest back.
+	codexRecordReadDirPending(dir, first[:len(first)-1])
+
+	secondCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	second, start, _, err := codexReadDirContext(secondCtx, dir)
+	if err != context.Canceled {
+		t.Fatalf("second read err=%v, want cancellation", err)
+	}
+	want := codexRolloutReadDirChunkSize*2 - 1
+	if len(second) != want {
+		t.Fatalf("second read entries=%d, want %d replayed plus newly enumerated entries", len(second), want)
+	}
+	if start != len(second)-1 {
+		t.Fatalf("second read start=%d, want %d", start, len(second)-1)
+	}
+	// Callers walk the slice from its end, so the deferred entries must drain
+	// before the newly enumerated ones rather than being deferred again.
+	if second[len(second)-1].Name() != first[len(first)-2].Name() {
+		t.Fatalf("second read tail=%q, want replayed entry %q", second[len(second)-1].Name(), first[len(first)-2].Name())
+	}
+
+	third, _, _, err := codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(third) != codexRolloutReadDirChunkSize*3 {
+		t.Fatalf("completed listing entries=%d, want the %d-entry directory without replay duplicates", len(third), codexRolloutReadDirChunkSize*3)
+	}
+}
+
 func TestCodexDiscoverRolloutCandidates_ResumedCompletionRequiresFreshPass(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "sessions", "2026", "08", "26")

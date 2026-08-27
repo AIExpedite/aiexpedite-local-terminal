@@ -2161,10 +2161,24 @@ type codexReadDirResumeState struct {
 	// newest names forever and never reaching the directory's older entries.
 	traversal    int
 	traversalSet bool
-	gate         chan struct{}
-	refs         int
-	usedAt       time.Time
+	// A caller that runs out of budget part way through an interrupted (still
+	// incomplete) listing cannot record a traversal offset, because the entries
+	// it was handed are only ever returned once. pending holds the tail it could
+	// not process so the next bounded refresh replays those names instead of
+	// waiting for the stream to reach EOF to see them again.
+	pending []os.DirEntry
+	gate    chan struct{}
+	refs    int
+	usedAt  time.Time
 }
+
+// How long the metadata pass over an interrupted leaf listing may run after the
+// discovery context is already done. The chunk is bounded, so consuming it is
+// what lets a repeatedly cancelled refresh reach its rollout evidence at all;
+// this caps the overrun so a slow or stalled filesystem cannot spend the
+// parent's sibling reserve on os.Stat calls. Whatever the grace does not cover
+// is preserved for the next refresh rather than dropped. Overridden in tests.
+var codexRolloutPartialLeafGrace = 25 * time.Millisecond
 
 const codexReadDirResumeLimit = 16
 
@@ -2230,7 +2244,10 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, int, b
 	if state.complete {
 		// The retained listing is what carries the metadata-traversal position, so
 		// it is retired by codexRecordReadDirTraversal once a caller works through
-		// it rather than by the first reader that consumes it.
+		// it rather than by the first reader that consumes it. It already contains
+		// every name an interrupted hand-off left pending, so drop that replay
+		// queue rather than offering the same entries twice.
+		codexDropPendingReplay(state)
 		return append([]os.DirEntry(nil), state.entries...), codexReadDirTraversalStart(state), true, nil
 	}
 	if state.f == nil {
@@ -2249,7 +2266,7 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, int, b
 
 	for {
 		if err := ctx.Err(); err != nil {
-			partial := append([]os.DirEntry(nil), state.entries[firstNew:]...)
+			partial := codexTakePendingReplay(state, append([]os.DirEntry(nil), state.entries[firstNew:]...))
 			return partial, len(partial) - 1, resumed, err
 		}
 		batch, readErr := state.f.ReadDir(codexRolloutReadDirChunkSize)
@@ -2261,7 +2278,7 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, int, b
 			break
 		}
 		if readErr != nil {
-			entries := append([]os.DirEntry(nil), state.entries[firstNew:]...)
+			entries := codexTakePendingReplay(state, append([]os.DirEntry(nil), state.entries[firstNew:]...))
 			_ = state.f.Close()
 			state.f = nil
 			remove = true
@@ -2287,6 +2304,49 @@ func codexReadDirTraversalStart(state *codexReadDirResumeState) int {
 // the listing is exhausted, which retires the retained state so the following
 // refresh enumerates the directory from a fresh snapshot and can once again
 // authorize completed-scan progress.
+// codexTakePendingReplay appends the tail an earlier interrupted caller could
+// not process to the entries this invocation newly enumerated. Callers walk the
+// returned slice from its end, so replayed names go last and drain before the
+// newer ones rather than being deferred again.
+func codexTakePendingReplay(state *codexReadDirResumeState, fresh []os.DirEntry) []os.DirEntry {
+	codexReadDirResumeMu.Lock()
+	pending := state.pending
+	state.pending = nil
+	codexReadDirResumeMu.Unlock()
+	if len(pending) == 0 {
+		return fresh
+	}
+	return append(fresh, pending...)
+}
+
+func codexDropPendingReplay(state *codexReadDirResumeState) {
+	codexReadDirResumeMu.Lock()
+	state.pending = nil
+	codexReadDirResumeMu.Unlock()
+}
+
+// codexRecordReadDirPending preserves entries handed out by an interrupted
+// listing that their caller could not process within its budget. An incomplete
+// listing has no traversal offset to record — its entries are returned once and
+// then advance past firstNew — so without this they would only reappear once the
+// stream finally reached EOF.
+func codexRecordReadDirPending(dir string, remaining []os.DirEntry) {
+	if len(remaining) == 0 {
+		return
+	}
+	codexReadDirResumeMu.Lock()
+	defer codexReadDirResumeMu.Unlock()
+	state := codexReadDirResumes[dir]
+	if state == nil || state.complete {
+		// The listing was retired by a read failure, or has since reached EOF and
+		// retained the full enumeration. Either way the next refresh surfaces these
+		// names again on its own, so queuing them would only duplicate candidates.
+		return
+	}
+	state.usedAt = time.Now()
+	state.pending = append(state.pending, remaining...)
+}
+
 func codexRecordReadDirTraversal(dir string, next int) {
 	var closeFile *os.File
 	codexReadDirResumeMu.Lock()
@@ -2383,10 +2443,28 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 		// can reach their rollout evidence, while keeping discovery incomplete so
 		// the completed-scan cursor does not advance.
 		consumePartialLeaf := err != nil && depth == 3
+		// Cancellation is usually what produced that chunk, so re-checking ctx here
+		// would consume none of it and starve discovery again. Bound the pass by a
+		// short grace instead: it covers the whole chunk on a responsive filesystem
+		// and collapses to a couple of entries on a stalled one.
+		partialLeafDeadline := time.Time{}
+		if consumePartialLeaf {
+			partialLeafDeadline = time.Now().Add(codexRolloutPartialLeafGrace)
+		}
 		// os.ReadDir sorts by filename. Codex's zero-padded YYYY/MM/DD layout
 		// therefore becomes chronological when traversed in reverse.
 		for i := start; i >= 0; i-- {
-			if !consumePartialLeaf && ctx.Err() != nil {
+			if consumePartialLeaf {
+				if time.Now().After(partialLeafDeadline) {
+					// This listing is incomplete, so there is no traversal offset to
+					// record: these entries were handed out once and the stream has
+					// already advanced past them. Preserve the unprocessed tail so the
+					// next refresh replays it instead of waiting for EOF to see it again.
+					complete = false
+					codexRecordReadDirPending(dir, entries[:i+1])
+					return
+				}
+			} else if ctx.Err() != nil {
 				// Enumeration may already have reached EOF; only the metadata pass ran
 				// out of budget. Record where it stopped so the next refresh resumes
 				// below this prefix instead of re-walking it and stalling forever.
