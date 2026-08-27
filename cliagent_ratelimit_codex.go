@@ -2110,6 +2110,13 @@ func codexRolloutInFutureCohort(candidate codexRolloutCandidate, anchor time.Tim
 // repeats a bounded read of the newest evidence rather than losing an older
 // one; codexRolloutFutureCohortReserve is what keeps those repeats from
 // starving the cohort underneath them.
+//
+// Residual: more than codexRolloutScanFileCap arrivals above the same ceiling
+// fill the batch with the newest of them, so an older arrival stays unread
+// until the clock passes its mtime and the ordinary backlog cursor walks it —
+// delayed, never dropped. The cohort reserve does not cover that set at either
+// end of the cohort's life: its bounds stop at the ceiling, so an above-ceiling
+// arrival is outside the reserve whether or not the cohort is complete.
 func codexRolloutFutureCohortBounds(candidates []codexRolloutCandidate, anchor time.Time) (int64, int64) {
 	oldest, newest := int64(0), int64(0)
 	for _, candidate := range candidates {
