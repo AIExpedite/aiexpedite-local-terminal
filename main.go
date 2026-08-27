@@ -159,6 +159,11 @@ func main() {
 	// a losing Dock/LaunchAgent launcher must exit without deleting them.
 	recoverInterruptedInstall()
 
+	// The browser identity endpoint is deliberately independent from ttyd and
+	// non-fatal. A port collision or unsupported release environment must never
+	// prevent the terminal agent, registration flow, or tray from starting.
+	startBrowserIdentityServer(cfg)
+
 	// Register startup and uninstall metadata only after relocation and the
 	// singleton gate. Otherwise a stale Program Files shortcut could overwrite
 	// the authoritative per-user paths before discovering the relocated agent.
@@ -740,6 +745,7 @@ func onTrayExit() {
 	// channel panics, so guard via the shutdown helper if it has already
 	// run from a signal handler).
 	closeShutdownChanOnce()
+	shutdownBrowserIdentityServer()
 
 	// IMPORTANT: Launch update FIRST, before any cleanup that might kill processes.
 	// The update process needs to be started before we kill our process tree.
