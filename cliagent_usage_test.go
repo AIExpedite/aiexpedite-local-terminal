@@ -15,6 +15,17 @@ import (
 	"time"
 )
 
+type cancellationReturningUsageParser struct{}
+
+func (cancellationReturningUsageParser) Provider() string { return "cancel-test" }
+func (cancellationReturningUsageParser) Parse(string, detectedCLIAgent, time.Time) (*cliAgentUsage, bool) {
+	return nil, false
+}
+func (cancellationReturningUsageParser) ParseContext(ctx context.Context, _ string, _ detectedCLIAgent, now time.Time) (*cliAgentUsage, bool) {
+	<-ctx.Done()
+	return &cliAgentUsage{Provider: "cancel-test", CollectedAt: now.UTC().Format(time.RFC3339)}, true
+}
+
 func helperWriteJSON(t *testing.T, path string, payload any) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -910,7 +921,7 @@ func TestCodexUsageParser_DefiniteLoggedOutProbeMakesUsageUnobservable(t *testin
 	t.Setenv("OPENAI_API_KEY", "")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, true }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
@@ -946,7 +957,7 @@ func TestCodexUsageParser_NoCredentialAndInconclusiveProbeMakesUsageUnobservable
 	}, nil, now, "")
 
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return false, false }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, false }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
@@ -987,7 +998,7 @@ func TestCodexUsageParser_EnvironmentAPIKeySurvivesPersistedLogoutProbe(t *testi
 	}, nil, now, "")
 
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, true }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
@@ -1022,7 +1033,7 @@ func TestCodexUsageParser_APIKeyFallbackDropsStaleOAuthExpiry(t *testing.T) {
 	})
 
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, true }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{
@@ -1053,7 +1064,7 @@ func TestCodexUsageParser_LoggedOutProbeDropsStaleOAuthExpiry(t *testing.T) {
 	})
 
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, true }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{
@@ -1085,7 +1096,7 @@ func TestCodexUsageParser_ReportsAccessTokenExpiryForActiveOAuthLogin(t *testing
 	})
 
 	original := codexAuthStatusProbe
-	codexAuthStatusProbe = func(string) (bool, bool) { return true, true }
+	codexAuthStatusProbe = func(context.Context, string) (bool, bool) { return true, true }
 	t.Cleanup(func() { codexAuthStatusProbe = original })
 
 	usage, _ := codexUsageParser{}.Parse(home, detectedCLIAgent{
@@ -1301,6 +1312,7 @@ func helperWriteRolloutLogAt(t *testing.T, base, day, name, ts string, frames []
 		t.Fatalf("mkdir %s: %v", dir, err)
 	}
 	var b strings.Builder
+	b.WriteString(codexRolloutHeaderLine(t, ts))
 	for _, rl := range frames {
 		line, err := json.Marshal(map[string]any{
 			"timestamp": ts,
@@ -1347,6 +1359,22 @@ func helperCodexAuthAt(t *testing.T, codexHome, email string, loginAt time.Time)
 // suite runs (auth.json would otherwise carry the real wall-clock mtime).
 var codexTestLogin = time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC)
 
+// codexRolloutHeaderLine is the `session_meta` record Codex writes as a
+// rollout's FIRST line. Fixtures must emit it because that header — not the
+// first surviving telemetry record — is what scopes a log to an account.
+func codexRolloutHeaderLine(t *testing.T, ts string) string {
+	t.Helper()
+	line, err := json.Marshal(map[string]any{
+		"timestamp": ts,
+		"type":      codexRolloutSessionMetaType,
+		"payload":   map[string]any{"id": "sess-" + ts},
+	})
+	if err != nil {
+		t.Fatalf("marshal rollout header: %v", err)
+	}
+	return string(line) + "\n"
+}
+
 // helperWriteRolloutLimitLog writes a rollout log for a session whose turn was
 // refused for quota: the `token_count` frame Codex emits in that state carries
 // NO window (both `primary` and `secondary` are null), and the turn ends with a
@@ -1359,6 +1387,7 @@ func helperWriteRolloutLimitLog(t *testing.T, base, day, name, ts string, frames
 		t.Fatalf("mkdir %s: %v", dir, err)
 	}
 	var b strings.Builder
+	b.WriteString(codexRolloutHeaderLine(t, ts))
 	writeLine := func(v map[string]any) {
 		line, err := json.Marshal(v)
 		if err != nil {
@@ -1409,7 +1438,8 @@ func helperWriteRolloutLimitLog(t *testing.T, base, day, name, ts string, frames
 // as "we cannot see it" when the truth is "it is spent". The refusal must be
 // surfaced instead.
 func TestCodexUsageParser_UsageLimitRefusalExplainsUnobservableCard(t *testing.T) {
-	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
+	cache := filepath.Join(t.TempDir(), "absent.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
 	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
@@ -1438,6 +1468,22 @@ func TestCodexUsageParser_UsageLimitRefusalExplainsUnobservableCard(t *testing.T
 	// that, so the wording must stay clear of those words.
 	if regexp.MustCompile(`(?i)\b(login|signed in|authenticate)\b`).MatchString(usage.Notice) {
 		t.Errorf("quota notice must not read as a login failure: %q", usage.Notice)
+	}
+	// Scan progress still commits — holding it back would also discard the
+	// boundary/backlog cursors and stall an over-cap backlog for the notice's
+	// whole lifetime. The refusing rollout is instead kept eligible by identity,
+	// since a refusal has no normalized contributor to persist.
+	snap, cacheOK := loadCodexRateLimitSnapshot(cache)
+	if cacheOK && len(snap.RolloutRetryEntries) != 1 {
+		t.Fatalf("retry entries = %v; want the refusing rollout held eligible while the notice is live", snap.RolloutRetryEntries)
+	}
+
+	// The refusal is deliberately not persisted: the typed cache remains
+	// normalized-metrics-only. An unchanged second refresh must therefore keep
+	// the rollout eligible and reproduce the notice from bounded source evidence.
+	again, ok := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now.Add(time.Minute))
+	if !ok || again.NoticeSeverity != "error" || !strings.Contains(again.Notice, "usage limit was reached") {
+		t.Fatalf("second unchanged refresh = (%q, %q, ok=%v), want retained quota notice", again.Notice, again.NoticeSeverity, ok)
 	}
 }
 
@@ -1523,11 +1569,9 @@ func TestCodexUsageParser_RolledOverObservationNewerThanRefusalSuppressesNotice(
 	}
 }
 
-// A rollout reading can be newer than the refusal without being used for
-// backfill: the live cache remains authoritative for an observable row. Its
-// timestamp still proves that an older refusal is stale while another row
-// remains Unknown.
-func TestCodexUsageParser_SkippedRolloutObservationNewerThanRefusalSuppressesNotice(t *testing.T) {
+// A newer direct-run rollout reading reconciles over an older still-live cache
+// contributor and also proves that an older refusal is stale.
+func TestCodexUsageParser_NewerRolloutAdvancesStillLiveCache(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
 	codexHome := t.TempDir()
@@ -1553,14 +1597,14 @@ func TestCodexUsageParser_SkippedRolloutObservationNewerThanRefusalSuppressesNot
 		}})
 
 	usage, _ := codexUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
-	if session := usage.Metrics[0]; session.Unknown || session.Consumed == nil || *session.Consumed != 42 {
-		t.Fatalf("session row=%+v, want authoritative cached 42%%", session)
+	if session := usage.Metrics[0]; session.Unknown || session.Consumed == nil || *session.Consumed != 73 || session.ObservedAt != "2026-06-19T11:30:00Z" {
+		t.Fatalf("session row=%+v, want reconciled rollout 73%% at 11:30", session)
 	}
 	if weekly := usage.Metrics[1]; !weekly.Unknown {
 		t.Fatalf("weekly row=%+v, want Unknown", weekly)
 	}
 	if usage.Notice != "" {
-		t.Errorf("notice=%q, want none — the newer skipped rollout observation supersedes the refusal", usage.Notice)
+		t.Errorf("notice=%q, want none — the newer rollout observation supersedes the refusal", usage.Notice)
 	}
 }
 
@@ -1631,9 +1675,9 @@ func TestCodexUsageParser_BackfillsFromRolloutLogs(t *testing.T) {
 	}
 }
 
-// A live captured bucket is authoritative: the rollout fallback must only fill
-// windows that came back Unknown, never override an observed live reading.
-func TestCodexUsageParser_RolloutOnlyFillsUnknownWindows(t *testing.T) {
+// A newer terminal-managed contributor stays authoritative while rollout
+// reconciliation fills a weekly contributor the managed frame never supplied.
+func TestCodexUsageParser_NewerManagedCaptureWinsWhileRolloutFillsSparseWindow(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
 	codexHome := t.TempDir()
@@ -1755,7 +1799,8 @@ func helperWriteRolloutRawPayload(t *testing.T, base, day, name string, payload 
 	if err != nil {
 		t.Fatalf("marshal rollout line: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "rollout-"+name+".jsonl"), append(line, '\n'), 0o600); err != nil {
+	contents := append([]byte(codexRolloutHeaderLine(t, "2026-06-19T11:00:00.000Z")), line...)
+	if err := os.WriteFile(filepath.Join(dir, "rollout-"+name+".jsonl"), append(contents, '\n'), 0o600); err != nil {
 		t.Fatalf("write rollout log: %v", err)
 	}
 }
@@ -2008,7 +2053,8 @@ func TestCodexUsageParser_RolloutAcceptsCamelCaseFrames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "rollout-2026-06-19T11-00-00-camel.jsonl"), append(line, '\n'), 0o600); err != nil {
+	camel := append([]byte(codexRolloutHeaderLine(t, "2026-06-19T11:00:00.000Z")), line...)
+	if err := os.WriteFile(filepath.Join(dir, "rollout-2026-06-19T11-00-00-camel.jsonl"), append(camel, '\n'), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -2053,6 +2099,48 @@ func TestCodexUsageParser_RolloutAccumulatesAcrossFiles(t *testing.T) {
 	}
 	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 50 {
 		t.Errorf("weekly metric=%+v, want 50 from older log", weekly)
+	}
+}
+
+// A legacy cache has no rollout high-water. When only one identity is cached,
+// its observation time must not hide an older rollout that can populate the
+// missing identity.
+func TestCodexUsageParser_PartialLegacyCacheScansFromZero(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 18, ObservedAtMs: now.Add(-10 * time.Minute).UnixMilli(),
+			ResetsAtMs: now.Add(time.Hour).UnixMilli(), WindowMinutes: 300,
+			usageKnown: true, resetKnown: true,
+		},
+	}, nil, now.Add(-10*time.Minute), fp)
+
+	helperWriteRolloutLogAt(t, codexHome, "19", "2026-06-19T11-20-00-weekly", "2026-06-19T11:20:00Z",
+		[]map[string]any{{
+			"secondary": map[string]any{
+				"used_percent": 42.0, "window_minutes": 10080.0,
+				"resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			},
+		}})
+	rolloutPath := filepath.Join(codexHome, "sessions", "2026", "06", "19", "rollout-2026-06-19T11-20-00-weekly.jsonl")
+	olderMtime := now.Add(-20 * time.Minute)
+	if err := os.Chtimes(rolloutPath, olderMtime, olderMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	usage, ok := codexUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 18 {
+		t.Fatalf("session metric=%+v, want cached 18%%", usage.Metrics[0])
+	}
+	if usage.Metrics[1].Consumed == nil || *usage.Metrics[1].Consumed != 42 {
+		t.Fatalf("weekly metric=%+v, want older rollout 42%%", usage.Metrics[1])
 	}
 }
 
@@ -2186,6 +2274,7 @@ func TestCodexUsageParser_RolloutUsageOnlyAfterExpiredResetDoesNotInheritStaleRe
 		},
 	}
 	var buf strings.Builder
+	buf.WriteString(codexRolloutHeaderLine(t, "2026-06-19T10:00:00.000Z"))
 	for _, f := range frames {
 		line, err := json.Marshal(map[string]any{
 			"timestamp": f["timestamp"],
@@ -2219,12 +2308,10 @@ func TestCodexUsageParser_RolloutUsageOnlyAfterExpiredResetDoesNotInheritStaleRe
 	}
 }
 
-// When sessions overlap — an older-started but still-active session next to a
-// newer-started but idle one — filename order alone would let the stale session
-// "win" and stop the scan before the live reading is consulted. Ranking by file
-// mtime lets the still-active session (the live source of truth) be considered
-// first.
-func TestCodexUsageParser_RolloutRanksByMtimeNotFilename(t *testing.T) {
+// File mtime controls bounded candidate selection, but provider event time
+// controls contributor reconciliation. A later event cannot be displaced by a
+// file that happened to be appended more recently.
+func TestCodexUsageParser_RolloutReconcilesByEventTimeNotMtime(t *testing.T) {
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", filepath.Join(t.TempDir(), "absent.json"))
 	codexHome := t.TempDir()
 	t.Setenv("CODEX_HOME", codexHome)
@@ -2254,11 +2341,160 @@ func TestCodexUsageParser_RolloutRanksByMtimeNotFilename(t *testing.T) {
 		t.Fatalf("expected usage")
 	}
 	session, weekly := usage.Metrics[0], usage.Metrics[1]
-	if session.Consumed == nil || *session.Consumed != 30 {
-		t.Errorf("session Consumed=%v, want 30 from the still-active session (newer mtime), not 80 from the stale newer-filename session", session.Consumed)
+	if session.Consumed == nil || *session.Consumed != 80 {
+		t.Errorf("session Consumed=%v, want 80 from the newer provider event", session.Consumed)
 	}
-	if weekly.Consumed == nil || *weekly.Consumed != 12 {
-		t.Errorf("weekly Consumed=%v, want 12 from the still-active session (newer mtime), not 70 from the stale newer-filename session", weekly.Consumed)
+	if weekly.Consumed == nil || *weekly.Consumed != 70 {
+		t.Errorf("weekly Consumed=%v, want 70 from the newer provider event", weekly.Consumed)
+	}
+}
+
+func TestCodexUsageParser_DirectRunAdvancesAndPersistsAcrossRestart(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary:   {UsedPercentage: 13, ResetsAtMs: now.Add(time.Hour).UnixMilli(), WindowMinutes: 300, usageKnown: true, resetKnown: true},
+		codexWindowSecondary: {UsedPercentage: 9, ResetsAtMs: now.Add(72 * time.Hour).UnixMilli(), WindowMinutes: 10080, usageKnown: true, resetKnown: true},
+	}, nil, now.Add(-2*time.Hour), fp)
+
+	helperWriteRolloutLogAt(t, codexHome, "26", "2026-08-26T13-55-00-smoke", "2026-08-26T13:55:00.123456789Z",
+		[]map[string]any{codexRateLimitFrame(27, 18, now)})
+	rolloutPath := filepath.Join(codexHome, "sessions", "2026", "06", "26", "rollout-2026-08-26T13-55-00-smoke.jsonl")
+	mtime := now.Add(-time.Minute)
+	if err := os.Chtimes(rolloutPath, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+
+	usage, ok := codexUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 27 || usage.Metrics[1].Consumed == nil || *usage.Metrics[1].Consumed != 18 {
+		t.Fatalf("reconciled metrics=%+v, want direct-run 27%%/18%%", usage.Metrics)
+	}
+	if usage.Metrics[0].ObservedAt != "2026-08-26T13:55:00.123Z" || usage.Metrics[1].ObservedAt != "2026-08-26T13:55:00.123Z" {
+		t.Fatalf("fresh observations not advanced: %+v", usage.Metrics)
+	}
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok || snap.RolloutHighWaterMtimeMs != mtime.UnixMilli() {
+		t.Fatalf("high-water=%d ok=%v, want %d", snap.RolloutHighWaterMtimeMs, ok, mtime.UnixMilli())
+	}
+	if snap.RolloutHighWaterMtimeNs != mtime.UnixNano() {
+		t.Fatalf("nanosecond high-water=%d, want %d", snap.RolloutHighWaterMtimeNs, mtime.UnixNano())
+	}
+
+	// Simulate an executable replacement/restart. The rollout file remains at
+	// the completed high-water but its raw contents are no longer parseable; a
+	// cache-only second parse must still publish the persisted normalized metric.
+	if err := os.WriteFile(rolloutPath, []byte(`{"credential":"must-not-be-read"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(rolloutPath, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+	restarted, ok := codexUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Detected: true}, now.Add(time.Minute))
+	if !ok || restarted.Metrics[0].Consumed == nil || *restarted.Metrics[0].Consumed != 27 || restarted.Metrics[1].Consumed == nil || *restarted.Metrics[1].Consumed != 18 {
+		t.Fatalf("restart metrics=%+v, want persisted normalized values", restarted.Metrics)
+	}
+}
+
+func TestCodexUsageParser_DirectRunAppendAtExactHighWaterMtimeAdvances(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	helperWriteRolloutLogAt(t, codexHome, "26", "2026-08-26T13-50-00-coarse", "2026-08-26T13:50:00Z",
+		[]map[string]any{codexRateLimitFrame(12, 8, now)})
+	rolloutPath := filepath.Join(codexHome, "sessions", "2026", "06", "26", "rollout-2026-08-26T13-50-00-coarse.jsonl")
+	coarseMtime := now.Add(-time.Minute)
+	if err := os.Chtimes(rolloutPath, coarseMtime, coarseMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	initial, ok := codexUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !ok || initial.Metrics[0].Consumed == nil || *initial.Metrics[0].Consumed != 12 {
+		t.Fatalf("initial metrics=%+v, want session 12%%", initial.Metrics)
+	}
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok || snap.RolloutHighWaterBoundaryFingerprint == "" {
+		t.Fatalf("snapshot=%+v, want completed boundary fingerprint", snap)
+	}
+
+	line, err := json.Marshal(map[string]any{
+		"timestamp": "2026-08-26T13:59:00Z",
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type":        "token_count",
+			"info":        map[string]any{"total_token_usage": map[string]any{"total_tokens": 2}},
+			"rate_limits": codexRateLimitFrame(35, 24, now),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(rolloutPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a coarse filesystem where the append does not advance mtime.
+	if err := os.Chtimes(rolloutPath, coarseMtime, coarseMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, ok := codexUsageParser{}.ParseContext(context.Background(), t.TempDir(), detectedCLIAgent{Detected: true}, now.Add(time.Minute))
+	if !ok || updated.Metrics[0].Consumed == nil || *updated.Metrics[0].Consumed != 35 ||
+		updated.Metrics[1].Consumed == nil || *updated.Metrics[1].Consumed != 24 {
+		t.Fatalf("updated metrics=%+v, want equal-mtime append 35%%/24%%", updated.Metrics)
+	}
+	if updated.Metrics[0].ObservedAt != "2026-08-26T13:59:00Z" || updated.Metrics[1].ObservedAt != "2026-08-26T13:59:00Z" {
+		t.Fatalf("updated observations=%+v, want appended event timestamp", updated.Metrics)
+	}
+}
+
+func TestCodexUsageParser_ShortParentBudgetReturnsCacheWithoutError(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	fp := fingerprintAccount("codex", "carol@example.com")
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {UsedPercentage: 31, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
+	}, nil, now, fp)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	usage, errEntry := runProviderParseSafely(ctx, codexUsageParser{}, t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if errEntry != nil || usage == nil || usage.Metrics[0].Consumed == nil || *usage.Metrics[0].Consumed != 31 {
+		t.Fatalf("usage=%+v err=%+v, want usable cache and no child-budget error", usage, errEntry)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("Codex exhausted parent context instead of reserving sibling budget: %v", ctx.Err())
+	}
+}
+
+func TestRunProviderParseSafely_ReportsCancellationDuringContextParser(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	usage, errEntry := runProviderParseSafely(
+		ctx, cancellationReturningUsageParser{}, t.TempDir(), detectedCLIAgent{Detected: true}, time.Now(),
+	)
+	if usage != nil || errEntry == nil || errEntry.Provider != "cancel-test" || errEntry.Message != "gather context canceled" {
+		t.Fatalf("usage=%+v err=%+v, want explicit outer cancellation", usage, errEntry)
 	}
 }
 
@@ -3465,5 +3701,82 @@ func TestCodexUsageParser_RolloutFillsRolledOverMigratedWeekly(t *testing.T) {
 	}
 	if weekly.Unknown || weekly.Consumed == nil || *weekly.Consumed != 18 {
 		t.Errorf("weekly metric=%+v, want 18 refilled from rollout (stale rolled-over migrated weekly must not stick at 0%%)", weekly)
+	}
+}
+
+// The login probe runs AFTER the rollout scan and blocks in CombinedOutput, so
+// its budget has to be carved out of the same parent deadline rather than taken
+// from an independent background context — otherwise scan + probe together
+// overrun the gather and delay every provider parsed after Codex.
+func TestCodexSubBudget_HoldsBackLaterSteps(t *testing.T) {
+	tests := []struct {
+		name      string
+		remaining time.Duration
+		want      time.Duration
+		holdBack  time.Duration
+	}{
+		{"scan skipped when only the reserves remain", 5 * time.Second, 0, codexGatherSiblingReserve + machineInfoProbeTimeout},
+		{"scan trimmed to what the reserves leave", 7 * time.Second, 2 * time.Second, codexGatherSiblingReserve + machineInfoProbeTimeout},
+		{"scan capped at its own ceiling", 30 * time.Second, codexRolloutScanBudget, codexGatherSiblingReserve + machineInfoProbeTimeout},
+		{"probe trimmed to the sibling reserve", 4 * time.Second, 2 * time.Second, codexGatherSiblingReserve},
+		{"probe skipped once the sibling reserve is all that is left", 2 * time.Second, 0, codexGatherSiblingReserve},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			want := codexRolloutScanBudget
+			if tc.holdBack == codexGatherSiblingReserve {
+				want = machineInfoProbeTimeout
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), tc.remaining)
+			defer cancel()
+			got := codexSubBudget(ctx, want, tc.holdBack)
+			// time.Until loses a sliver between WithTimeout and the call.
+			if got < tc.want-50*time.Millisecond || got > tc.want {
+				t.Fatalf("codexSubBudget=%v, want ~%v", got, tc.want)
+			}
+		})
+	}
+	if got := codexSubBudget(context.Background(), codexRolloutScanBudget, time.Hour); got != codexRolloutScanBudget {
+		t.Fatalf("deadline-free parent budget=%v, want the full ceiling %v", got, codexRolloutScanBudget)
+	}
+}
+
+// End-to-end: the probe must be handed a context bounded by the parent gather,
+// still leaving the sibling reserve for the providers parsed after Codex.
+func TestCodexUsageParser_ProbeBoundedByParentGather(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	helperCodexAuthAt(t, codexHome, "carol@example.com", codexTestLogin)
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {UsedPercentage: 31, ResetsAtMs: now.Add(time.Hour).UnixMilli(), usageKnown: true, resetKnown: true},
+	}, nil, now, fingerprintAccount("codex", "carol@example.com"))
+
+	var probeSlack time.Duration
+	var probeBounded bool
+	original := codexAuthStatusProbe
+	codexAuthStatusProbe = func(ctx context.Context, _ string) (bool, bool) {
+		deadline, ok := ctx.Deadline()
+		probeBounded = ok
+		probeSlack = time.Until(deadline)
+		return true, true
+	}
+	t.Cleanup(func() { codexAuthStatusProbe = original })
+
+	parent, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	usage, errEntry := runProviderParseSafely(parent, codexUsageParser{}, t.TempDir(), detectedCLIAgent{Detected: true, Path: "codex"}, now)
+	if errEntry != nil || usage == nil {
+		t.Fatalf("usage=%+v err=%+v, want a usable Codex parse", usage, errEntry)
+	}
+	if !probeBounded {
+		t.Fatal("login probe ran on an unbounded context; it must inherit the gather deadline")
+	}
+	// 4s parent - 2s sibling reserve => at most 2s for the probe, well under its
+	// own 3s ceiling.
+	if probeSlack > 2*time.Second {
+		t.Fatalf("probe budget=%v, want <= %v so the sibling reserve survives", probeSlack, 2*time.Second)
 	}
 }

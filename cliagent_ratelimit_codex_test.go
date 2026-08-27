@@ -1,11 +1,38 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
+
+type cancelAfterChecksContext struct {
+	checks int
+	after  int
+	done   chan struct{}
+}
+
+func (c *cancelAfterChecksContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelAfterChecksContext) Done() <-chan struct{}       { return c.done }
+func (c *cancelAfterChecksContext) Value(any) any               { return nil }
+func (c *cancelAfterChecksContext) Err() error {
+	c.checks++
+	if c.checks >= c.after {
+		select {
+		case <-c.done:
+		default:
+			close(c.done)
+		}
+		return context.Canceled
+	}
+	return nil
+}
 
 func TestCurrentCodexAccountFingerprint_NamespacedChatGPTUserID(t *testing.T) {
 	codexHome := t.TempDir()
@@ -309,12 +336,16 @@ func TestCaptureCodexRateLimit_ClearOnlyFullReadDropsMigratedWeekly(t *testing.T
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 
-	// Seed a weekly-band reading that lives under the PRIMARY slot (bucket
-	// migration): identity is `weekly` even though it sits in `primary`.
-	captureCodexRateLimitLine(
-		`{"method":"token_count","params":{"rate_limits":{"primary":{"used_percent":90,"window_minutes":10080,"resets_in_seconds":604800}}}}`,
-		now,
-	)
+	// Seed the legacy on-disk placement directly: live capture now normalizes
+	// this weekly identity to secondary before merging, but an older cache may
+	// still contain it under primary and the clear path must handle that shape.
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			UsedPercentage: 90, WindowMinutes: 10080,
+			ResetsAtMs: now.Add(7 * 24 * time.Hour).UnixMilli(),
+			usageKnown: true, resetKnown: true,
+		},
+	}, nil, now, "")
 	if snap, ok := loadCodexRateLimitSnapshot(cache); !ok || snap.Buckets[codexWindowPrimary].UsedPercentage != 90 {
 		t.Fatalf("seed failed: %+v", snap.Buckets)
 	}
@@ -366,6 +397,47 @@ func TestCaptureCodexRateLimit_SparseUpdateNullDoesNotClear(t *testing.T) {
 	}
 	if p, ok := snap.Buckets[codexWindowPrimary]; !ok || p.UsedPercentage != 12 {
 		t.Errorf("primary update should still apply: %+v", snap.Buckets)
+	}
+}
+
+// A sparse live update can report the weekly identity under the physical
+// `primary` slot. When session and weekly share the legacy limit id, normalize
+// that update before the slot-keyed merge so it cannot overwrite the cached
+// session contributor before identity reconciliation runs.
+func TestCaptureCodexRateLimit_SparseMigratedWeeklyPreservesSessionWithSameLimitID(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{`+
+			`"primary":{"used_percent":25,"window_minutes":300,"resets_in_seconds":1800},`+
+			`"secondary":{"used_percent":60,"window_minutes":10080,"resets_in_seconds":604800}`+
+			`}}}`,
+		now,
+	)
+	captureCodexRateLimitLine(
+		`{"method":"token_count","params":{"rate_limits":{`+
+			`"primary":{"used_percent":70,"window_minutes":10080,"resets_in_seconds":604800}`+
+			`}}}`,
+		now.Add(time.Minute),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected cache")
+	}
+	if session, present := snap.Buckets[codexWindowPrimary]; !present || session.UsedPercentage != 25 {
+		t.Errorf("session bucket=%+v, present=%v; want preserved 25%% session", session, present)
+	}
+	if weekly, present := snap.Buckets[codexWindowSecondary]; !present || weekly.UsedPercentage != 70 {
+		t.Errorf("weekly bucket=%+v, present=%v; want refreshed 70%% weekly", weekly, present)
+	}
+	if _, present := snap.Contributors[codexWindowPrimary][codexLegacyLimitID]; !present {
+		t.Errorf("session contributor missing after migrated weekly update: %+v", snap.Contributors)
+	}
+	if _, present := snap.Contributors[codexWindowSecondary][codexLegacyLimitID]; !present {
+		t.Errorf("weekly contributor missing after migrated weekly update: %+v", snap.Contributors)
 	}
 }
 
@@ -1190,6 +1262,55 @@ func TestCaptureCodexRateLimit_DropsStaleSnapshotOnAccountSwitch(t *testing.T) {
 	}
 }
 
+func TestRolloutMerge_RevalidatesAccountInsideCacheTransaction(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	accountBase := t.TempDir()
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	fingerprintA := fingerprintAccount("codex", "workspace-A")
+	fingerprintB := fingerprintAccount("codex", "workspace-B")
+
+	// Account B has already signed in and populated the cache by the time an
+	// account-A rollout scan reaches its locked read-modify-write transaction.
+	helperWriteJSON(t, filepath.Join(accountBase, "auth.json"), map[string]any{
+		"tokens": map[string]any{"account_id": "workspace-B"},
+	})
+	mergeCodexRateLimitCache(cache, map[string]codexRateLimitBucket{
+		codexWindowSecondary: {
+			UsedPercentage: 12,
+			ObservedAtMs:   now.UnixMilli(),
+			usageKnown:     true,
+		},
+	}, nil, now, fingerprintB)
+
+	progress := &codexRolloutScanProgress{mtimeNs: now.UnixNano()}
+	mergeCodexRateLimitCachePerLimitProgress(cache, map[string]map[string]codexRateLimitBucket{
+		codexWindowPrimary: {
+			codexLegacyLimitID: {
+				UsedPercentage: 91,
+				ObservedAtMs:   now.Add(time.Minute).UnixMilli(),
+				usageKnown:     true,
+			},
+		},
+	}, nil, false, nil, false, now.Add(time.Minute), fingerprintA, progress, accountBase)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected account-B cache to remain readable")
+	}
+	if snap.AccountFingerprint != fingerprintB {
+		t.Fatalf("fingerprint=%q, want current account B %q", snap.AccountFingerprint, fingerprintB)
+	}
+	if _, present := snap.Buckets[codexWindowPrimary]; present {
+		t.Fatalf("old account-A rollout must not replace current cache: %+v", snap.Buckets)
+	}
+	if got := snap.Buckets[codexWindowSecondary].UsedPercentage; got != 12 {
+		t.Fatalf("account-B weekly usage=%v, want 12", got)
+	}
+	if snap.RolloutHighWaterMtimeNs != 0 {
+		t.Fatalf("old account-A rollout must not advance current account cursor: %d", snap.RolloutHighWaterMtimeNs)
+	}
+}
+
 func TestCodexMetricsFromCache_ObservedAndPastReset(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
@@ -1765,8 +1886,8 @@ func TestCaptureCodexRateLimit_MultiLimitWeeklyMostConstrained(t *testing.T) {
 	}
 }
 
-// AC3: a sparse frame that re-places a weekly reading under a new storage slot
-// must not leave the superseded slot's stale weekly lingering in the cache.
+// AC3: a sparse frame that reports a weekly reading under a different provider
+// slot must replace the stale reading while retaining the canonical cache slot.
 func TestCaptureCodexRateLimit_SameIdentitySupersessionAcrossSlots(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
@@ -1788,8 +1909,11 @@ func TestCaptureCodexRateLimit_SameIdentitySupersessionAcrossSlots(t *testing.T)
 	if !ok {
 		t.Fatalf("expected cache")
 	}
-	if contribs, present := snap.Contributors[codexWindowSecondary]; present && len(contribs) > 0 {
-		t.Errorf("superseded secondary weekly must be dropped, still present: %+v", contribs)
+	if weekly, present := snap.Contributors[codexWindowSecondary][codexLegacyLimitID]; !present || weekly.UsedPercentage != 30 {
+		t.Errorf("canonical weekly contributor=%+v, present=%v; want refreshed 30%%", weekly, present)
+	}
+	if contribs := snap.Contributors[codexWindowPrimary]; len(contribs) > 0 {
+		t.Errorf("provider primary placement must be normalized away: %+v", contribs)
 	}
 	metrics := codexMetricsFromCache(now.Add(30*time.Second), "")
 	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
@@ -1855,11 +1979,11 @@ func TestCodexMetricsFromCache_FingerprintMismatchHidesSnapshot(t *testing.T) {
 
 // Finding 2 (cross-shape migration): a weekly first observed via the aggregate
 // `rate_limits` view (limit id __legacy__ under secondary) then re-reported via
-// the per-limit `rateLimitsByLimitId` view under the primary slot (a NAMED limit
-// id) is the SAME weekly metric. Supersession keys on identity, not limit id, so
-// the stale secondary copy is dropped and the newest reading wins — even though
-// it reports a LOWER used %. Keying on (identity, limit id) would keep both and
-// let most-constrained folding resurrect the stale higher %.
+// the per-limit `rateLimitsByLimitId` view under the primary provider slot (a
+// NAMED limit id) is the SAME weekly metric. The stale aggregate is dropped and
+// the newest named reading wins in the canonical weekly cache slot — even though
+// it reports a LOWER used %. Keying only on (identity, limit id) without the
+// legacy-to-named supersession rule would keep both and resurrect the stale high %.
 func TestCaptureCodexRateLimit_CrossShapeWeeklyMigrationNewestWins(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
@@ -1884,8 +2008,15 @@ func TestCaptureCodexRateLimit_CrossShapeWeeklyMigrationNewestWins(t *testing.T)
 	if !ok {
 		t.Fatalf("expected cache")
 	}
-	if contribs, present := snap.Contributors[codexWindowSecondary]; present && len(contribs) > 0 {
-		t.Errorf("stale aggregate weekly under secondary must be dropped, still present: %+v", contribs)
+	weeklyContribs := snap.Contributors[codexWindowSecondary]
+	if _, present := weeklyContribs[codexLegacyLimitID]; present {
+		t.Errorf("stale aggregate weekly must be dropped, still present: %+v", weeklyContribs)
+	}
+	if named, present := weeklyContribs["codex_secondary"]; !present || named.UsedPercentage != 30 {
+		t.Errorf("named weekly contributor=%+v, present=%v; want refreshed 30%%", named, present)
+	}
+	if contribs := snap.Contributors[codexWindowPrimary]; len(contribs) > 0 {
+		t.Errorf("provider primary placement must be normalized away: %+v", contribs)
 	}
 	metrics := codexMetricsFromCache(now.Add(30*time.Second), "")
 	if metrics[1].Kind != limitKindWeekly || metrics[1].Unknown {
@@ -2065,9 +2196,9 @@ func TestCaptureCodexRateLimit_FullSnapshotUnparseableBucketPreservesCache(t *te
 }
 
 // Finding (sparse-safe concurrent limits): two weekly metered limits A@90% and
-// B@20% are cached under secondary; a later sparse frame restates ONLY B, moving
-// it to the primary slot at 30%. B's old secondary copy is superseded (newest
-// placement wins), but A — which the sparse frame never mentioned — must NOT be
+// B@20% are cached under secondary; a later sparse frame restates ONLY B under
+// the primary provider slot at 30%. B is refreshed in the canonical weekly
+// cache slot, but A — which the sparse frame never mentioned — must NOT be
 // retracted. Weekly must still display 90% (A most-constrains), not 30%.
 func TestCaptureCodexRateLimit_SparseMigrationKeepsUnmentionedConcurrentLimit(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
@@ -2099,12 +2230,12 @@ func TestCaptureCodexRateLimit_SparseMigrationKeepsUnmentionedConcurrentLimit(t 
 	if a, present := snap.Contributors[codexWindowSecondary]["codex_weekly_a"]; !present || a.UsedPercentage != 90 {
 		t.Errorf("unmentioned concurrent limit A must survive under secondary: %+v", snap.Contributors[codexWindowSecondary])
 	}
-	// B migrated: its secondary copy is superseded, the primary copy remains.
-	if _, present := snap.Contributors[codexWindowSecondary]["codex_weekly_b"]; present {
-		t.Errorf("migrated limit B must not keep its stale secondary copy: %+v", snap.Contributors[codexWindowSecondary])
+	// B is refreshed in the canonical weekly slot; no physical primary copy remains.
+	if b, present := snap.Contributors[codexWindowSecondary]["codex_weekly_b"]; !present || b.UsedPercentage != 30 {
+		t.Errorf("migrated limit B must refresh under secondary at 30%%: %+v", snap.Contributors[codexWindowSecondary])
 	}
-	if b, present := snap.Contributors[codexWindowPrimary]["codex_weekly_b"]; !present || b.UsedPercentage != 30 {
-		t.Errorf("migrated limit B must live under primary at 30%%: %+v", snap.Contributors[codexWindowPrimary])
+	if contribs := snap.Contributors[codexWindowPrimary]; len(contribs) > 0 {
+		t.Errorf("provider primary placement must be normalized away: %+v", contribs)
 	}
 
 	metrics := codexMetricsFromCache(now.Add(30*time.Second), "")
@@ -2245,5 +2376,3546 @@ func TestCaptureCodexRateLimit_ResultMsgIsSparseNotFullSnapshot(t *testing.T) {
 	}
 	if metrics[0].Unknown || metrics[0].Kind != limitKindSession {
 		t.Errorf("session row=%+v, want known session from result.msg", metrics[0])
+	}
+}
+
+func TestCaptureCodexRateLimit_EqualPercentageAdvancesManagedObservation(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	first := time.Date(2026, 8, 26, 13, 47, 8, 0, time.UTC)
+	second := first.Add(90 * time.Second)
+	line := `{"type":"token_count","rate_limits":{"primary":{"used_percent":42,"window_minutes":300,"resets_in_seconds":3600}}}`
+
+	captureCodexRateLimitLine(line, first)
+	captureCodexRateLimitLine(line, second)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected managed capture cache")
+	}
+	if got := snap.Buckets[codexWindowPrimary].ObservedAtMs; got != second.UnixMilli() {
+		t.Fatalf("ObservedAtMs=%d, want repeated numeric evidence at %d", got, second.UnixMilli())
+	}
+}
+
+func TestCodexObservationTimes_FutureToleranceAndClamp(t *testing.T) {
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		at   time.Time
+		zero bool
+	}{
+		{"boundary accepted and clamped", now.Add(5 * time.Minute), false},
+		{"beyond boundary rejected", now.Add(5*time.Minute + time.Nanosecond), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			anchor, got := codexObservationTimes(map[string]interface{}{
+				"timestamp": tc.at.Format(time.RFC3339Nano),
+			}, now, false)
+			if tc.zero {
+				if !anchor.IsZero() || !got.IsZero() {
+					t.Fatalf("anchor=%s observed=%s, want rejection", anchor, got)
+				}
+				return
+			}
+			if !anchor.Equal(tc.at) {
+				t.Fatalf("anchor=%s, want provider reset anchor %s", anchor, tc.at)
+			}
+			if !got.Equal(now) {
+				t.Fatalf("got %s, want publication clamp %s", got, now)
+			}
+		})
+	}
+}
+
+func TestCodexBucketsFromRolloutFile_UntimestampedNumericLineDoesNotBlockLaterValidLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	missing := `{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":91,"window_minutes":300}}}}`
+	valid := `{"timestamp":"2026-08-26T14:01:02.123456789Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":17,"window_minutes":300}}}}`
+	if err := os.WriteFile(path, []byte(missing+"\n"+valid+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	buckets, _, _, handled, ok := codexBucketsFromRolloutFile(context.Background(), path, time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC))
+	if !handled || !ok {
+		t.Fatalf("handled=%v ok=%v, want valid later object", handled, ok)
+	}
+	b := buckets[codexWindowPrimary][codexLegacyLimitID]
+	if b.UsedPercentage != 17 || b.ObservedAtMs != time.Date(2026, 8, 26, 14, 1, 2, 123456789, time.UTC).UnixMilli() {
+		t.Fatalf("bucket=%+v, want only timestamped 17%% evidence", b)
+	}
+}
+
+func TestCodexRolloutOpenFailureHandled_RetriesTransientErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"vanished file", &os.PathError{Op: "open", Path: "rollout.jsonl", Err: os.ErrNotExist}, true},
+		{"temporary permission failure", &os.PathError{Op: "open", Path: "rollout.jsonl", Err: os.ErrPermission}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codexRolloutOpenFailureHandled(tc.err); got != tc.want {
+				t.Fatalf("handled=%v, want %v for %v", got, tc.want, tc.err)
+			}
+		})
+	}
+}
+
+func TestCodexRateLimitSnapshot_RedactsRawEnvelopeFields(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	lineMap := map[string]interface{}{
+		"type": "token_count",
+		"rate_limits": map[string]interface{}{
+			"primary": map[string]interface{}{"used_percent": 28.0, "window_minutes": 300.0},
+		},
+		"access_token": "credential-sentinel",
+		"raw_config":   "config-sentinel",
+		"source_path":  "/secret/rollout.jsonl",
+		"prompt":       "prompt-sentinel",
+		"response":     "response-sentinel",
+		"unknown":      "unknown-sentinel",
+	}
+	raw, err := json.Marshal(lineMap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	captureCodexRateLimitLine(string(raw), time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC))
+	persisted, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sentinel := range []string{"credential-sentinel", "config-sentinel", "/secret/rollout.jsonl", "prompt-sentinel", "response-sentinel", "unknown-sentinel"} {
+		if strings.Contains(string(persisted), sentinel) {
+			t.Errorf("typed cache leaked %q: %s", sentinel, persisted)
+		}
+	}
+	if !strings.Contains(string(persisted), `"usedPercentage": 28`) {
+		t.Fatalf("normalized metric missing from cache: %s", persisted)
+	}
+}
+
+func TestCaptureCodexRateLimit_UnrecognizedEnvelopeCannotOverwriteCache(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	first := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	captureCodexRateLimitLine(
+		`{"type":"token_count","rate_limits":{"primary":{"used_percent":21,"window_minutes":300}}}`,
+		first,
+	)
+	captureCodexRateLimitLine(
+		`{"type":"tool_output","params":{"rateLimits":{"primary":{"usedPercent":99,"windowDurationMins":300}}}}`,
+		first.Add(time.Minute),
+	)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected seeded cache")
+	}
+	b := snap.Buckets[codexWindowPrimary]
+	if b.UsedPercentage != 21 || b.ObservedAtMs != first.UnixMilli() {
+		t.Fatalf("bucket=%+v, arbitrary params.rateLimits must fail closed", b)
+	}
+}
+
+func TestCaptureCodexRateLimit_FutureEventAnchorsResetButClampsObservation(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	providerAt := now.Add(5 * time.Minute)
+	line := fmt.Sprintf(
+		`{"timestamp":%q,"type":"token_count","rate_limits":{"primary":{"used_percent":32,"resets_in_seconds":60}}}`,
+		providerAt.Format(time.RFC3339Nano),
+	)
+	captureCodexRateLimitLine(line, now)
+
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected cache")
+	}
+	b := snap.Buckets[codexWindowPrimary]
+	if b.ObservedAtMs != now.UnixMilli() {
+		t.Fatalf("ObservedAtMs=%d, want receive-time clamp %d", b.ObservedAtMs, now.UnixMilli())
+	}
+	if b.ResetsAtMs != providerAt.Add(time.Minute).UnixMilli() {
+		t.Fatalf("ResetsAtMs=%d, want provider anchor %d", b.ResetsAtMs, providerAt.Add(time.Minute).UnixMilli())
+	}
+}
+
+func TestCodexBucketsFromRolloutFile_SkipsOversizedNonMetricLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := `{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":17,"window_minutes":300}}}`
+	later := `{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":29,"window_minutes":300}}}`
+	if _, err = fmt.Fprintln(f, first); err == nil {
+		_, err = fmt.Fprintln(f, strings.Repeat("x", codexAppServerMaxLineSize+1))
+	}
+	if err == nil {
+		_, err = fmt.Fprint(f, later) // final complete token intentionally has no newline
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	interruptCtx := &cancelAfterChecksContext{after: 3, done: make(chan struct{})}
+	partial, _, _, handled, ok := codexBucketsFromRolloutFile(interruptCtx, path, now)
+	if handled || !ok {
+		t.Fatalf("interrupted handled=%v ok=%v, want persisted complete evidence with retry required", handled, ok)
+	}
+	if b := partial[codexWindowPrimary][codexLegacyLimitID]; b.UsedPercentage != 29 {
+		t.Fatalf("partial bucket=%+v, want newest complete tail object despite forward interruption", b)
+	}
+
+	buckets, _, _, handled, ok := codexBucketsFromRolloutFile(context.Background(), path, now)
+	if !handled || !ok {
+		t.Fatalf("handled=%v ok=%v, want complete scan with numeric evidence", handled, ok)
+	}
+	b := buckets[codexWindowPrimary][codexLegacyLimitID]
+	if b.UsedPercentage != 29 || b.ObservedAtMs != time.Date(2026, 8, 26, 14, 10, 0, 0, time.UTC).UnixMilli() {
+		t.Fatalf("bucket=%+v, want later numeric object after oversized line", b)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_OversizedHeaderCannotFakeSessionStart(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	authMod := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	authPath := filepath.Join(base, "auth.json")
+	if err := os.WriteFile(authPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(authPath, authMod, authMod); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "rollout-oversized-header.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldHeader := `{"timestamp":"2026-08-26T13:00:00Z","type":"session_meta","padding":"` + strings.Repeat("x", codexAppServerMaxLineSize) + `"}`
+	newerTelemetry := `{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":73,"window_minutes":300}}}`
+	if _, err = fmt.Fprintln(f, oldHeader); err == nil {
+		_, err = fmt.Fprintln(f, newerTelemetry)
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(
+		context.Background(), base, now, codexRolloutScanCursor{},
+	)
+	if ok || len(contributors) != 0 {
+		t.Fatalf("contributors=%+v ok=%v, want oversized unverified session withheld", contributors, ok)
+	}
+	if highWater == nil || len(highWater.retryEntries) != 1 ||
+		!codexRolloutRetryEntryValid(highWater.retryEntries[0]) {
+		t.Fatalf("highWater=%+v, want progress with one redacted retry entry", highWater)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_InvalidHeaderAdvancesHighWaterAfterEOF(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	authMod := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	authPath := filepath.Join(base, "auth.json")
+	if err := os.WriteFile(authPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(authPath, authMod, authMod); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "rollout-invalid-header.jsonl")
+	contents := "{malformed header}\n" +
+		`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":73,"window_minutes":300}}}` + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if ok || len(contributors) != 0 {
+		t.Fatalf("contributors=%+v ok=%v, want unverified session withheld", contributors, ok)
+	}
+	if highWater == nil {
+		t.Fatal("highWater=nil, want fully read invalid-header rollout counted as handled")
+	}
+}
+
+// A truncated/rotated rollout whose first SURVIVING record is ordinary
+// telemetry proves nothing about which account produced it. A prior-account
+// process that keeps appending after a new login stamps those records AFTER the
+// auth watermark, so treating that time as the session start would let the old
+// account's quota be cached under the new fingerprint. Only the `session_meta`
+// header scopes a file.
+func TestCodexRolloutFallbackBuckets_HeaderlessLogWithPostLoginTelemetryWithheld(t *testing.T) {
+	authMod := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	telemetry := `{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":73,"window_minutes":300}}}`
+
+	for _, tc := range []struct {
+		name       string
+		first      string
+		wantScoped bool
+	}{
+		{
+			name:  "prior-account telemetry as first record",
+			first: `{"timestamp":"2026-08-26T14:05:00Z","type":"token_count","rate_limits":{"secondary":{"used_percent":41,"window_minutes":10080}}}`,
+		},
+		{
+			name:       "session_meta header",
+			first:      `{"timestamp":"2026-08-26T14:05:00Z","type":"session_meta","payload":{"id":"sess-1"}}`,
+			wantScoped: true,
+		},
+		{
+			// Rollouts predating the typed envelope open with a bare `id` header.
+			name:       "legacy untyped header",
+			first:      `{"timestamp":"2026-08-26T14:05:00Z","id":"sess-legacy","instructions":null}`,
+			wantScoped: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			dir := filepath.Join(base, "sessions", "2026", "08", "26")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			authPath := filepath.Join(base, "auth.json")
+			if err := os.WriteFile(authPath, []byte("{}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(authPath, authMod, authMod); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "rollout-headerless.jsonl")
+			if err := os.WriteFile(path, []byte(tc.first+"\n"+telemetry+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(
+				context.Background(), base, now, codexRolloutScanCursor{},
+			)
+			if tc.wantScoped {
+				if !ok || len(contributors) == 0 {
+					t.Fatalf("contributors=%+v ok=%v, want a header-scoped rollout accepted", contributors, ok)
+				}
+				return
+			}
+			if ok || len(contributors) != 0 {
+				t.Fatalf("contributors=%+v ok=%v, want unverified session withheld", contributors, ok)
+			}
+			if highWater == nil {
+				t.Fatal("highWater=nil, want the fully read headerless rollout counted as handled")
+			}
+		})
+	}
+}
+
+func TestCodexRecentRolloutLines_ContinuesPastSparseNumericFrame(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	stricter := `{"timestamp":"2026-08-26T13:50:00Z","jsonrpc":"2.0","result":{"rateLimitsByLimitId":{"codex_stricter":{"used_percent":88,"window_minutes":300}}},"id":1}`
+	weekly := `{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{"secondary":{"used_percent":41,"window_minutes":10080}}}`
+	primary := `{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":29,"window_minutes":300}}}`
+	padding := `{"padding":"` + strings.Repeat("x", codexRolloutTailReadChunkSize*2) + `"}`
+	if err := os.WriteFile(path, []byte(stricter+"\n"+padding+"\n"+weekly+"\n"+primary), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lines := codexRecentRolloutLines(context.Background(), f, info.Size(), time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC))
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, `"used_percent":29`) {
+		t.Fatal("tail probe did not retain the newest sparse session frame")
+	}
+	if !strings.Contains(joined, `"used_percent":41`) {
+		t.Fatal("tail probe stopped before the older sparse weekly frame")
+	}
+	if !strings.Contains(joined, `"codex_stricter"`) {
+		t.Fatal("tail probe stopped after finding both identities and missed a distinct limit")
+	}
+}
+
+func TestCodexRolloutSessionMatchesAuth_RequiresVerifiedStart(t *testing.T) {
+	authMod := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name         string
+		sessionStart time.Time
+		handled      bool
+		wantAccept   bool
+		wantRetry    bool
+	}{
+		{name: "unverified partial read", wantAccept: false, wantRetry: true},
+		{name: "unverified complete legacy log", handled: true, wantAccept: false, wantRetry: false},
+		{name: "prior account", sessionStart: authMod.Add(-time.Minute), handled: true, wantAccept: false, wantRetry: false},
+		{name: "current account", sessionStart: authMod.Add(time.Minute), handled: true, wantAccept: true, wantRetry: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			accept, retry := codexRolloutSessionMatchesAuth(tc.sessionStart, authMod, tc.handled)
+			if accept != tc.wantAccept || retry != tc.wantRetry {
+				t.Fatalf("accept=%v retry=%v, want accept=%v retry=%v", accept, retry, tc.wantAccept, tc.wantRetry)
+			}
+		})
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_StatFailurePreventsHighWaterAdvance(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	validPath := filepath.Join(dir, "rollout-valid.jsonl")
+	valid := `{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":17,"window_minutes":300}}}`
+	if err := os.WriteFile(validPath, []byte(valid+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "missing-target"), filepath.Join(dir, "rollout-broken.jsonl")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	_, _, _, highWater, ok := codexRolloutFallbackBuckets(
+		context.Background(), base, time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC), codexRolloutScanCursor{},
+	)
+	if !ok {
+		t.Fatal("expected valid sibling rollout evidence")
+	}
+	if highWater != nil {
+		t.Fatalf("highWater=%+v, want unchanged after incomplete metadata discovery", *highWater)
+	}
+}
+
+func TestCodexDiscoverRolloutCandidates_StopsWhenContextCancels(t *testing.T) {
+	base := t.TempDir()
+	for _, day := range []string{"24", "25", "26"} {
+		dir := filepath.Join(base, "sessions", "2026", "08", day)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "rollout-test.jsonl"), []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := &cancelAfterChecksContext{after: 5, done: make(chan struct{})}
+	_, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{})
+	if complete {
+		t.Fatal("discovery complete=true, want cancellation to stop traversal and preserve the high-water")
+	}
+	if ctx.checks > 8 {
+		t.Fatalf("context checked %d times, want traversal to stop promptly after cancellation", ctx.checks)
+	}
+}
+
+func TestCodexReadDirContext_ChecksCancellationBetweenChunks(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	for i := 0; i < codexRolloutReadDirChunkSize*2; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	entries, _, _, err := codexReadDirContext(ctx, dir)
+	if err != context.Canceled {
+		t.Fatalf("err=%v, want context cancellation between directory chunks", err)
+	}
+	if len(entries) != codexRolloutReadDirChunkSize {
+		t.Fatalf("entries=%d, want one %d-entry chunk before cancellation", len(entries), codexRolloutReadDirChunkSize)
+	}
+}
+
+func TestCodexReadDirContext_ResumesAfterCancellation(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	for i := 0; i < codexRolloutReadDirChunkSize*2; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	entries, _, resumed, err := codexReadDirContext(ctx, dir)
+	if err != context.Canceled || len(entries) != codexRolloutReadDirChunkSize {
+		t.Fatalf("first read entries=%d err=%v, want one chunk and cancellation", len(entries), err)
+	}
+	if resumed {
+		t.Fatal("first directory read unexpectedly reported a resumed stream")
+	}
+
+	entries, _, resumed, err = codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resumed {
+		t.Fatal("second directory read did not report the resumed stream")
+	}
+	if len(entries) != codexRolloutReadDirChunkSize*2 {
+		t.Fatalf("resumed entries=%d, want complete %d-entry listing", len(entries), codexRolloutReadDirChunkSize*2)
+	}
+}
+
+func TestCodexReadDirContext_RepeatedCancellationReturnsOnlyNewEntries(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	for i := 0; i < codexRolloutReadDirChunkSize*3; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	first, _, _, err := codexReadDirContext(firstCtx, dir)
+	if err != context.Canceled || len(first) != codexRolloutReadDirChunkSize {
+		t.Fatalf("first read entries=%d err=%v, want one chunk and cancellation", len(first), err)
+	}
+
+	secondCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	second, _, _, err := codexReadDirContext(secondCtx, dir)
+	if err != context.Canceled || len(second) != codexRolloutReadDirChunkSize {
+		t.Fatalf("second read entries=%d err=%v, want only the newly completed chunk", len(second), err)
+	}
+	if first[0].Name() == second[0].Name() {
+		t.Fatalf("second read replayed first chunk starting at %q", second[0].Name())
+	}
+}
+
+func TestCodexReadDirContext_CancelsWhileAnotherReadOwnsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	state := &codexReadDirResumeState{gate: make(chan struct{}, 1), refs: 1, usedAt: time.Now()}
+	codexReadDirResumeMu.Lock()
+	codexReadDirResumes[dir] = state
+	codexReadDirResumeMu.Unlock()
+	t.Cleanup(func() {
+		codexReadDirResumeMu.Lock()
+		state.refs = 0
+		codexReadDirResumeMu.Unlock()
+		codexCloseReadDirResume(dir)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
+		t.Fatalf("err=%v, want cancellation while waiting for the per-directory gate", err)
+	}
+}
+
+func TestCodexReadDirContext_ReusesCompletedListingForQueuedReader(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "rollout.jsonl"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &codexReadDirResumeState{
+		entries:  entries,
+		complete: true,
+		gate:     make(chan struct{}, 1),
+		usedAt:   time.Now(),
+	}
+	state.gate <- struct{}{}
+	codexReadDirResumeMu.Lock()
+	codexReadDirResumes[dir] = state
+	codexReadDirResumeMu.Unlock()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+
+	got, _, resumed, err := codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resumed {
+		t.Fatal("queued reader did not report reused completed listing")
+	}
+	if len(got) != 1 || got[0].Name() != "rollout.jsonl" {
+		t.Fatalf("completed listing = %v, want one rollout entry", got)
+	}
+}
+
+func TestCodexReadDirResume_EvictsAbandonedStreams(t *testing.T) {
+	dirs := make([]string, 0, codexReadDirResumeLimit+1)
+	for i := 0; i <= codexReadDirResumeLimit; i++ {
+		dir := t.TempDir()
+		dirs = append(dirs, dir)
+		for j := 0; j < codexRolloutReadDirChunkSize*2; j++ {
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", j)), []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+		if _, _, _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
+			t.Fatalf("read %d err=%v, want interrupted resumable stream", i, err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, dir := range dirs {
+			codexCloseReadDirResume(dir)
+		}
+	})
+
+	codexReadDirResumeMu.Lock()
+	count := len(codexReadDirResumes)
+	_, oldestRetained := codexReadDirResumes[dirs[0]]
+	codexReadDirResumeMu.Unlock()
+	if count > codexReadDirResumeLimit {
+		t.Fatalf("resume states=%d, want at most %d", count, codexReadDirResumeLimit)
+	}
+	if oldestRetained {
+		t.Fatal("oldest abandoned resume stream was not evicted")
+	}
+}
+
+func TestCodexDiscoverRolloutCandidates_PreservesPartialLeafDirectoryResults(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < codexRolloutReadDirChunkSize*2; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Cancellation fires when the leaf reader requests its second chunk. The
+	// first complete chunk must remain available for candidate reconciliation.
+	ctx := &cancelAfterChecksContext{after: 15, done: make(chan struct{})}
+	candidates, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{})
+	if complete {
+		t.Fatal("discovery complete=true, want partial leaf enumeration to preserve the high-water")
+	}
+	if len(candidates) != codexRolloutReadDirChunkSize {
+		t.Fatalf("candidates=%d, want preserved %d-entry chunk", len(candidates), codexRolloutReadDirChunkSize)
+	}
+}
+
+func TestCodexDiscoverRolloutCandidates_BoundsPartialLeafMetadataPass(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < codexRolloutReadDirChunkSize*2; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A grace that is already spent stands in for a stalled filesystem whose
+	// first os.Stat exhausts it. The cancelled chunk must not be walked to its
+	// end regardless: cancellation has already fired, so every further metadata
+	// call is drawn from the sibling providers' reserve.
+	originalGrace := codexRolloutPartialLeafGrace
+	defer func() { codexRolloutPartialLeafGrace = originalGrace }()
+	codexRolloutPartialLeafGrace = -time.Second
+
+	ctx := &cancelAfterChecksContext{after: 15, done: make(chan struct{})}
+	candidates, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{})
+	if complete {
+		t.Fatal("discovery complete=true, want partial leaf enumeration to preserve the high-water")
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("candidates=%d, want the post-cancellation metadata pass to stop once its grace expired", len(candidates))
+	}
+
+	// Nothing enumerated by the abandoned pass may be lost: the entries it was
+	// handed are preserved, so a following unbounded refresh still reports every
+	// rollout in the directory.
+	codexRolloutPartialLeafGrace = originalGrace
+	candidates, _ = codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{})
+	if len(candidates) != codexRolloutReadDirChunkSize*2 {
+		t.Fatalf("candidates=%d, want all %d rollouts after the bounded pass", len(candidates), codexRolloutReadDirChunkSize*2)
+	}
+}
+
+func TestCodexReadDirContext_ReplaysPendingEntriesAfterCancellation(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	for i := 0; i < codexRolloutReadDirChunkSize*3; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	first, _, _, err := codexReadDirContext(firstCtx, dir)
+	if err != context.Canceled || len(first) != codexRolloutReadDirChunkSize {
+		t.Fatalf("first read entries=%d err=%v, want one chunk and cancellation", len(first), err)
+	}
+	// The caller processed only the entry it starts from before running out of
+	// budget, and hands the rest back.
+	codexRecordReadDirPending(dir, first[:len(first)-1])
+
+	secondCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	second, start, _, err := codexReadDirContext(secondCtx, dir)
+	if err != context.Canceled {
+		t.Fatalf("second read err=%v, want cancellation", err)
+	}
+	want := codexRolloutReadDirChunkSize*2 - 1
+	if len(second) != want {
+		t.Fatalf("second read entries=%d, want %d replayed plus newly enumerated entries", len(second), want)
+	}
+	if start != len(second)-1 {
+		t.Fatalf("second read start=%d, want %d", start, len(second)-1)
+	}
+	// Callers walk the slice from its end, so the deferred entries must drain
+	// before the newly enumerated ones rather than being deferred again.
+	if second[len(second)-1].Name() != first[len(first)-2].Name() {
+		t.Fatalf("second read tail=%q, want replayed entry %q", second[len(second)-1].Name(), first[len(first)-2].Name())
+	}
+
+	third, _, _, err := codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(third) != codexRolloutReadDirChunkSize*3 {
+		t.Fatalf("completed listing entries=%d, want the %d-entry directory without replay duplicates", len(third), codexRolloutReadDirChunkSize*3)
+	}
+}
+
+func TestCodexDiscoverRolloutCandidates_ResumedCompletionRequiresFreshPass(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < codexRolloutReadDirChunkSize*2; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Leave the leaf directory stream paused after its first complete chunk.
+	// A rollout created in that already-consumed portion is not guaranteed to
+	// appear when the same OS stream resumes and eventually reaches EOF.
+	ctx := &cancelAfterChecksContext{after: 15, done: make(chan struct{})}
+	if _, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{}); complete {
+		t.Fatal("initial discovery complete=true, want a resumable partial listing")
+	}
+	missedPath := filepath.Join(dir, "rollout-0000-concurrent.jsonl")
+	if err := os.WriteFile(missedPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Even if the resumed stream happens to observe the new entry on this
+	// filesystem, its accumulated listing is not a verified fresh snapshot and
+	// therefore cannot authorize high-water advancement.
+	if _, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{}); complete {
+		t.Fatal("resumed discovery complete=true, want cursor advancement deferred until a fresh pass")
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{})
+	if !complete {
+		t.Fatal("fresh discovery incomplete after resumed stream reached EOF")
+	}
+	found := false
+	for _, candidate := range candidates {
+		if candidate.path == missedPath {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("fresh candidates omitted rollout created during resumed enumeration: %q", missedPath)
+	}
+}
+
+func TestCodexReadDirContext_ResumesMetadataTraversalAfterCompletedListing(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	const total = 4
+	for i := 0; i < total; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entries, start, resumed, err := codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed || start != total-1 || len(entries) != total {
+		t.Fatalf("fresh listing entries=%d start=%d resumed=%v, want a full listing traversed from the newest name", len(entries), start, resumed)
+	}
+
+	// The caller reached EOF but ran out of budget part way through its per-entry
+	// metadata pass. The retained listing must hand that position back.
+	codexRecordReadDirTraversal(dir, 1)
+	entries, start, resumed, err = codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resumed || start != 1 || len(entries) != total {
+		t.Fatalf("resumed listing entries=%d start=%d resumed=%v, want the recorded traversal position", len(entries), start, resumed)
+	}
+
+	// Exhausting the listing retires the retained state so the next refresh
+	// enumerates a fresh snapshot and can authorize completed-scan progress.
+	codexRecordReadDirTraversal(dir, -1)
+	entries, start, resumed, err = codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed || start != total-1 || len(entries) != total {
+		t.Fatalf("post-traversal listing entries=%d start=%d resumed=%v, want a fresh enumeration", len(entries), start, resumed)
+	}
+}
+
+func TestCodexDiscoverRolloutCandidates_ResumesMetadataTraversalAfterCancellation(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const total = 6
+	for i := 0; i < total; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Enumeration reaches EOF and the budget expires during the per-entry Stat
+	// pass. Both refreshes get the same budget, so without a metadata cursor the
+	// second one would re-walk the identical newest prefix and the leaf's older
+	// rollouts could never be discovered.
+	names := func(candidates []codexRolloutCandidate) []string {
+		got := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			got = append(got, filepath.Base(candidate.path))
+		}
+		return got
+	}
+	first, complete := codexDiscoverRolloutCandidates(
+		&cancelAfterChecksContext{after: 19, done: make(chan struct{})}, base, codexRolloutScanCursor{},
+	)
+	if complete {
+		t.Fatal("first discovery complete=true, want an interrupted metadata pass")
+	}
+	wantFirst := []string{"rollout-0005.jsonl", "rollout-0004.jsonl", "rollout-0003.jsonl"}
+	if !reflect.DeepEqual(names(first), wantFirst) {
+		t.Fatalf("first candidates=%v, want the newest prefix %v", names(first), wantFirst)
+	}
+
+	second, complete := codexDiscoverRolloutCandidates(
+		&cancelAfterChecksContext{after: 19, done: make(chan struct{})}, base, codexRolloutScanCursor{},
+	)
+	if complete {
+		t.Fatal("resumed discovery complete=true, want advancement deferred until a fresh pass")
+	}
+	wantSecond := []string{"rollout-0002.jsonl", "rollout-0001.jsonl", "rollout-0000.jsonl"}
+	if !reflect.DeepEqual(names(second), wantSecond) {
+		t.Fatalf("resumed candidates=%v, want the unreached remainder %v", names(second), wantSecond)
+	}
+
+	// The exhausted listing is retired, so an unbudgeted refresh enumerates the
+	// directory fresh and may once again advance completed-scan progress.
+	third, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{})
+	if !complete || len(third) != total {
+		t.Fatalf("fresh discovery complete=%v candidates=%d, want a full %d-entry pass", complete, len(third), total)
+	}
+}
+
+func TestCodexRolloutDiscoveryContext_ReservesCandidateReadBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		budget    time.Duration
+		wantGap   time.Duration
+		tolerance time.Duration
+	}{
+		{name: "normal scan", budget: 5 * time.Second, wantGap: time.Second, tolerance: 100 * time.Millisecond},
+		{name: "short scan", budget: 500 * time.Millisecond, wantGap: 250 * time.Millisecond, tolerance: 50 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent, cancelParent := context.WithTimeout(context.Background(), tc.budget)
+			defer cancelParent()
+			parentDeadline, _ := parent.Deadline()
+
+			discovery, cancelDiscovery := codexRolloutDiscoveryContext(parent)
+			defer cancelDiscovery()
+			discoveryDeadline, ok := discovery.Deadline()
+			if !ok {
+				t.Fatal("discovery context has no deadline")
+			}
+			gap := parentDeadline.Sub(discoveryDeadline)
+			if gap < tc.wantGap-tc.tolerance || gap > tc.wantGap+tc.tolerance {
+				t.Fatalf("candidate-read reserve=%v, want %v (+/-%v)", gap, tc.wantGap, tc.tolerance)
+			}
+		})
+	}
+}
+
+func TestCodexRolloutCandidateOrderingContext_ReservesFileReadBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		budget    time.Duration
+		wantGap   time.Duration
+		tolerance time.Duration
+	}{
+		{name: "normal ordering", budget: time.Second, wantGap: 500 * time.Millisecond, tolerance: 100 * time.Millisecond},
+		{name: "short ordering", budget: 200 * time.Millisecond, wantGap: 100 * time.Millisecond, tolerance: 50 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent, cancelParent := context.WithTimeout(context.Background(), tc.budget)
+			defer cancelParent()
+			parentDeadline, _ := parent.Deadline()
+
+			ordering, cancelOrdering := codexRolloutCandidateOrderingContext(parent)
+			defer cancelOrdering()
+			orderingDeadline, ok := ordering.Deadline()
+			if !ok {
+				t.Fatal("ordering context has no deadline")
+			}
+			gap := parentDeadline.Sub(orderingDeadline)
+			if gap < tc.wantGap-tc.tolerance || gap > tc.wantGap+tc.tolerance {
+				t.Fatalf("file-read reserve=%v, want %v (+/-%v)", gap, tc.wantGap, tc.tolerance)
+			}
+		})
+	}
+}
+
+func TestCodexDiscoverRolloutCandidates_VisitsNewestDateBeforeCancellation(t *testing.T) {
+	base := t.TempDir()
+	var newestPath string
+	for _, fixture := range []struct {
+		year, month, day string
+	}{
+		{year: "2024", month: "01", day: "01"},
+		{year: "2025", month: "12", day: "31"},
+		{year: "2026", month: "08", day: "26"},
+	} {
+		dir := filepath.Join(base, "sessions", fixture.year, fixture.month, fixture.day)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "rollout-test.jsonl")
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if fixture.year == "2026" {
+			newestPath = path
+		}
+	}
+
+	// Allow discovery to reach one rollout, then cancel before it can descend
+	// into the next date. Restarting an interrupted scan must always prioritize
+	// the newest direct-run evidence rather than replaying the oldest history.
+	ctx := &cancelAfterChecksContext{after: 17, done: make(chan struct{})}
+	candidates, complete := codexDiscoverRolloutCandidates(ctx, base, codexRolloutScanCursor{})
+	if complete {
+		t.Fatal("discovery complete=true, want cancellation after newest candidate")
+	}
+	if len(candidates) != 1 || candidates[0].path != newestPath {
+		t.Fatalf("candidates=%+v, want only newest date %q before cancellation", candidates, newestPath)
+	}
+}
+
+func TestCodexDiscoverRolloutCandidates_RetainsSameMillisecondUpdate(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "rollout-test.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first := time.Date(2026, 8, 26, 14, 0, 0, 100_000, time.UTC)
+	second := first.Add(700 * time.Microsecond)
+	if first.UnixMilli() != second.UnixMilli() {
+		t.Fatal("test fixture must remain within one millisecond")
+	}
+	if err := os.Chtimes(path, second, second); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ModTime().UnixNano() == info.ModTime().UnixMilli()*int64(time.Millisecond) {
+		t.Skip("filesystem does not preserve sub-millisecond mtimes")
+	}
+
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{mtimeNs: first.UnixNano()})
+	if !complete || len(candidates) != 1 || candidates[0].path != path {
+		t.Fatalf("complete=%v candidates=%+v, want same-millisecond append selected", complete, candidates)
+	}
+}
+
+func TestCodexDiscoverRolloutCandidates_RetainsExactMtimeAppend(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "rollout-test.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	coarseMtime := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(path, coarseMtime, coarseMtime); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mtimeNs := info.ModTime().UnixNano()
+	initial, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{})
+	if !complete || len(initial) != 1 {
+		t.Fatalf("complete=%v candidates=%+v, want initial rollout selected", complete, initial)
+	}
+	cursor := codexRolloutScanCursor{
+		mtimeNs:             mtimeNs,
+		boundaryFingerprint: codexRolloutBoundaryFingerprint(initial, mtimeNs),
+	}
+	unchanged, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete || len(unchanged) != 0 {
+		t.Fatalf("complete=%v candidates=%+v, want unchanged boundary skipped", complete, unchanged)
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("{\"type\":\"token_count\"}\n")); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Model a coarse filesystem: the append changes size but not mtime.
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete || len(changed) != 1 || changed[0].path != path {
+		t.Fatalf("complete=%v candidates=%+v, want equal-mtime append selected", complete, changed)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_CanonicalizesMixedIdentitySameLimit(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	helperWriteRolloutLogAt(t, base, "26", "2026-08-26T13-50-00-session", "2026-08-26T13:50:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 31.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}})
+	helperWriteRolloutLogAt(t, base, "26", "2026-08-26T13-55-00-weekly", "2026-08-26T13:55:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 47.0, "window_minutes": 10080.0,
+				"resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			},
+		}})
+
+	contributors, _, _, _, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok {
+		t.Fatal("expected mixed-identity rollout contributors")
+	}
+	if got := contributors[codexWindowPrimary][codexLegacyLimitID]; got.UsedPercentage != 31 {
+		t.Fatalf("primary legacy contributor=%+v, want canonical session 31%%", got)
+	}
+	if got := contributors[codexWindowSecondary][codexLegacyLimitID]; got.UsedPercentage != 47 {
+		t.Fatalf("secondary legacy contributor=%+v, want canonical weekly 47%%", got)
+	}
+	for slot, limits := range contributors {
+		for limitID := range limits {
+			if strings.ContainsRune(limitID, '\x00') {
+				t.Fatalf("slot %q contains synthetic limit id %q", slot, limitID)
+			}
+		}
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_CanonicalizesEachFrameBeforeMerge(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	helperWriteRolloutLogAt(t, base, "26", "2026-08-26T13-50-00-migrated", "2026-08-26T13:50:00Z",
+		[]map[string]any{
+			{
+				"primary": map[string]any{
+					"used_percent": 31.0, "window_minutes": 300.0,
+					"resets_at": float64(now.Add(time.Hour).Unix()),
+				},
+			},
+			{
+				"primary": map[string]any{
+					"used_percent": 47.0, "window_minutes": 10080.0,
+					"resets_at": float64(now.Add(72 * time.Hour).Unix()),
+				},
+			},
+		})
+
+	contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok {
+		t.Fatal("expected migrated rollout contributors")
+	}
+	if highWater == nil {
+		t.Fatal("expected completed rollout scan high-water")
+	}
+	if got := contributors[codexWindowPrimary][codexLegacyLimitID]; got.UsedPercentage != 31 {
+		t.Fatalf("primary legacy contributor=%+v, want preserved session 31%%", got)
+	}
+	if got := contributors[codexWindowSecondary][codexLegacyLimitID]; got.UsedPercentage != 47 {
+		t.Fatalf("secondary legacy contributor=%+v, want migrated weekly 47%%", got)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_MixedRefusalHeldAsRetryIdentity(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	name := "2026-06-19T11-00-00-mixed"
+	helperWriteRolloutLimitLog(t, base, "19", name,
+		"2026-06-19T11:00:00.000Z", []map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 31.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}}, "2026-06-19T11:30:00.000Z")
+
+	contributors, limit, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || len(contributors) == 0 {
+		t.Fatal("expected numeric evidence preceding the refusal")
+	}
+	if limit.At.IsZero() {
+		t.Fatal("expected live refusal evidence")
+	}
+	// The pass still completes — voiding it would also discard the boundary,
+	// backlog and retry cursors. Only the refusing rollout's identity is held
+	// above the watermark, and retry identities bypass it in both discovery and
+	// the eligibility filter, so it stays readable while the notice is live.
+	if highWater == nil {
+		t.Fatal("highWater=nil, want completed-scan progress committed alongside the live refusal")
+	}
+	wantEntry := helperCodexRolloutRetryDigest(name, "19")
+	if len(highWater.retryEntries) != 1 || highWater.retryEntries[0] != wantEntry {
+		t.Fatalf("retryEntries=%v, want only the refusing rollout %q", highWater.retryEntries, wantEntry)
+	}
+	cursor := codexRolloutScanCursor{mtimeNs: highWater.mtimeNs, retryEntries: highWater.retryEntries}
+	rediscovered, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete || len(rediscovered) != 1 {
+		t.Fatalf("complete=%v candidates=%d, want the refusing rollout re-offered above the watermark", complete, len(rediscovered))
+	}
+}
+
+// helperCodexRolloutRetryDigest is the redacted backlog identity the scan
+// persists for a rollout written by helperWriteRolloutLimitLog/RolloutLogAt.
+func helperCodexRolloutRetryDigest(name, day string) string {
+	return codexRolloutBacklogEntryDigest(codexRolloutCandidate{
+		boundaryID: filepath.Join("2026", "06", day, "rollout-"+name+".jsonl"),
+	})
+}
+
+// A live refusal used to force the whole pass incomplete, discarding the
+// backlog cursor with it. With more eligible rollouts than one pass can open,
+// every refresh then re-selected the same newest batch for the notice's full
+// 12-hour lifetime, so an older rollout holding a distinct contributor was never
+// reconciled. Progress must now commit for the candidates that were processed.
+func TestCodexRolloutFallbackBuckets_LiveRefusalStillAdvancesOverCapBacklog(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "backlog@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "06", "19")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// The oldest rollout is the only carrier of the weekly contributor, and it
+	// sits one past the file cap so it can only be reached once progress commits.
+	total := codexRolloutScanFileCap + 1
+	oldest := now.Add(-90 * time.Minute)
+	for i := range total {
+		name := fmt.Sprintf("2026-06-19T10-00-00-%05d", i)
+		frames := []map[string]any{{"primary": map[string]any{
+			"used_percent": 31.0, "window_minutes": 300.0,
+			"resets_at": float64(now.Add(time.Hour).Unix()),
+		}}}
+		if i == 0 {
+			frames = []map[string]any{{"secondary": map[string]any{
+				"used_percent": 47.0, "window_minutes": 10080.0,
+				"resets_at": float64(now.Add(72 * time.Hour).Unix()),
+			}}}
+		}
+		helperWriteRolloutLogAt(t, base, "19", name, "2026-06-19T11:00:00.000Z", frames)
+		mtime := oldest.Add(time.Duration(i) * time.Minute)
+		if err := os.Chtimes(filepath.Join(dir, "rollout-"+name+".jsonl"), mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The newest rollout is a live refusal: newer than every numeric observation
+	// and well inside the notice age cap.
+	refusalName := "2026-06-19T11-00-00-refused"
+	helperWriteRolloutLimitLog(t, base, "19", refusalName, "2026-06-19T11:00:00.000Z", nil, "2026-06-19T11:45:00.000Z")
+	refusalMtime := now.Add(-5 * time.Minute)
+	if err := os.Chtimes(filepath.Join(dir, "rollout-"+refusalName+".jsonl"), refusalMtime, refusalMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	contributors, limit, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || len(contributors) == 0 {
+		t.Fatal("expected numeric evidence from the capped newest batch")
+	}
+	if limit.At.IsZero() {
+		t.Fatal("expected the live refusal to remain available for notice ranking")
+	}
+	if highWater == nil {
+		t.Fatal("highWater=nil, want backlog progress committed despite the live refusal")
+	}
+	if _, present := contributors[codexWindowSecondary]; present {
+		t.Fatal("first pass already reached the oldest rollout; the cap is not being exercised")
+	}
+	wantRetry := helperCodexRolloutRetryDigest(refusalName, "19")
+	if len(highWater.retryEntries) != 1 || highWater.retryEntries[0] != wantRetry {
+		t.Fatalf("retryEntries=%v, want only the refusing rollout %q", highWater.retryEntries, wantRetry)
+	}
+
+	// Persist and reload exactly as consecutive signed refreshes do. The saved
+	// cursor must let the second pass reach the omitted oldest rollout.
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, highWater, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	second, _, _, _, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok {
+		t.Fatal("second pass produced no contributors, want the omitted backlog rollout")
+	}
+	weekly, present := second[codexWindowSecondary]
+	if !present {
+		t.Fatalf("second pass contributors=%v, want the oldest rollout's weekly contributor", second)
+	}
+	var used float64
+	for _, bucket := range weekly {
+		used = bucket.UsedPercentage
+	}
+	if used != 47 {
+		t.Fatalf("weekly contributor=%v%%, want the omitted rollout's 47%%", used)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_NewerTelemetrySupersedesMixedRefusal(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	name := "2026-06-19T11-00-00-refusal-then-telemetry"
+	helperWriteRolloutLimitLog(t, base, "19", name,
+		"2026-06-19T11:00:00.000Z", nil, "2026-06-19T11:15:00.000Z")
+
+	path := filepath.Join(base, "sessions", "2026", "06", "19", "rollout-"+name+".jsonl")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open rollout for append: %v", err)
+	}
+	line, err := json.Marshal(map[string]any{
+		"timestamp": "2026-06-19T11:30:00.000Z",
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type": "token_count",
+			"rate_limits": map[string]any{"primary": map[string]any{
+				"used_percent": 31.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			}},
+		},
+	})
+	if err != nil {
+		_ = f.Close()
+		t.Fatalf("marshal newer telemetry: %v", err)
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		_ = f.Close()
+		t.Fatalf("append newer telemetry: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close rollout: %v", err)
+	}
+
+	contributors, limit, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || len(contributors) == 0 {
+		t.Fatal("expected numeric evidence after the refusal")
+	}
+	if limit.At.IsZero() {
+		t.Fatal("expected refusal evidence to remain available for notice ranking")
+	}
+	if highWater == nil {
+		t.Fatal("expected newer numeric telemetry to allow completed-scan progress")
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_NewerCachedTelemetrySupersedesRefusal(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	helperWriteRolloutLimitLog(t, base, "19", "2026-06-19T11-00-00-refusal",
+		"2026-06-19T11:00:00.000Z", nil, "2026-06-19T11:15:00.000Z")
+
+	_, limit, latest, highWater, _ := codexRolloutFallbackBuckets(
+		context.Background(), base, now, codexRolloutScanCursor{}, time.Date(2026, 6, 19, 11, 30, 0, 0, time.UTC),
+	)
+	if limit.At.IsZero() {
+		t.Fatal("expected refusal evidence")
+	}
+	if !latest.After(limit.At) {
+		t.Fatalf("latest observation=%s, want newer than refusal %s", latest, limit.At)
+	}
+	if highWater == nil {
+		t.Fatal("expected newer durable cache telemetry to allow completed-scan progress")
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_ValidatesFutureRefusalTime(t *testing.T) {
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	// Progress commits either way; what an accepted live refusal changes is that
+	// its own rollout identity is held back as a retry entry.
+	for _, tc := range []struct {
+		name          string
+		refusedAt     time.Time
+		wantAt        time.Time
+		wantRetryHeld bool
+	}{
+		{
+			name:          "five minute boundary clamps to now",
+			refusedAt:     now.Add(codexProviderObservationFutureTolerance),
+			wantAt:        now,
+			wantRetryHeld: true,
+		},
+		{
+			name:      "beyond tolerance is rejected",
+			refusedAt: now.Add(codexProviderObservationFutureTolerance + time.Nanosecond),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			name := "2026-06-19T11-00-00-future-refusal"
+			helperWriteRolloutLimitLog(t, base, "19", name,
+				"2026-06-19T11:00:00.000Z", nil, tc.refusedAt.Format(time.RFC3339Nano))
+
+			_, limit, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+			if ok {
+				t.Fatal("refusal-only rollout unexpectedly produced numeric contributors")
+			}
+			if !limit.At.Equal(tc.wantAt) {
+				t.Fatalf("refusal time=%s, want %s", limit.At, tc.wantAt)
+			}
+			if highWater == nil {
+				t.Fatal("highWater=nil, want completed-scan progress committed")
+			}
+			held := len(highWater.retryEntries) == 1 &&
+				highWater.retryEntries[0] == helperCodexRolloutRetryDigest(name, "19")
+			if held != tc.wantRetryHeld {
+				t.Fatalf("retryEntries=%v, want refusal held=%v", highWater.retryEntries, tc.wantRetryHeld)
+			}
+		})
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_ClampsFutureMtimeHighWater(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	helperWriteRolloutLogAt(t, base, "26", "2026-08-26T13-50-00-future-mtime", "2026-08-26T13:50:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 31.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}})
+	rollout := filepath.Join(base, "sessions", "2026", "06", "26", "rollout-2026-08-26T13-50-00-future-mtime.jsonl")
+	future := now.Add(24 * time.Hour)
+	if err := os.Chtimes(rollout, future, future); err != nil {
+		t.Fatalf("chtimes rollout: %v", err)
+	}
+
+	_, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || highWater == nil {
+		t.Fatal("expected completed numeric rollout scan")
+	}
+	wantHighWater := now.Add(-codexRolloutCoarseMtimeOverlap)
+	if highWater.mtimeNs != wantHighWater.UnixNano() {
+		t.Fatalf("highWater mtime=%s, want overlap-clamped to %s", time.Unix(0, highWater.mtimeNs), wantHighWater)
+	}
+
+	// Model a rollout created concurrently after this leaf was enumerated on a
+	// filesystem that rounds mtimes down to a two-second boundary. It must stay
+	// above the retained overlap even though it is older than the gather's exact
+	// start time; clamping to now would permanently filter it out.
+	missedName := "rollout-2026-08-26T13-59-59-coarse.jsonl"
+	missedPath := filepath.Join(base, "sessions", "2026", "06", "26", missedName)
+	if err := os.WriteFile(missedPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("write concurrently created rollout: %v", err)
+	}
+	missedMtime := now.Add(-time.Second)
+	if err := os.Chtimes(missedPath, missedMtime, missedMtime); err != nil {
+		t.Fatalf("set coarse rollout mtime: %v", err)
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{
+		mtimeNs:             highWater.mtimeNs,
+		boundaryFingerprint: highWater.boundaryFingerprint,
+	})
+	if !complete {
+		t.Fatal("follow-up discovery incomplete")
+	}
+	found := false
+	for _, candidate := range candidates {
+		if candidate.path == missedPath {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("candidates=%+v, want coarse-mtime rollout %q retained above cursor", candidates, missedPath)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_FutureMtimesDoNotHideNormalCandidateBehindCap(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+
+	for i := 0; i < codexRolloutScanFileCap+1; i++ {
+		name := fmt.Sprintf("2026-08-26T12-%02d-00-future", i)
+		helperWriteRolloutLogAt(t, base, "26", name, "2026-08-26T12:00:00Z",
+			[]map[string]any{{
+				"secondary": map[string]any{
+					"used_percent": 20.0, "window_minutes": 10080.0,
+					"resets_at": float64(now.Add(72 * time.Hour).Unix()),
+				},
+			}})
+		path := filepath.Join(base, "sessions", "2026", "06", "26", "rollout-"+name+".jsonl")
+		future := now.Add(time.Duration(i+1) * time.Hour)
+		if err := os.Chtimes(path, future, future); err != nil {
+			t.Fatalf("chtimes future rollout %d: %v", i, err)
+		}
+	}
+	rolloutName := "2026-08-26T13-59-00-normal"
+	helperWriteRolloutLogAt(t, base, "26", rolloutName, "2026-08-26T13:59:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 73.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}})
+	normalPath := filepath.Join(base, "sessions", "2026", "06", "26", "rollout-"+rolloutName+".jsonl")
+	normalMtime := now.Add(-time.Minute)
+	if err := os.Chtimes(normalPath, normalMtime, normalMtime); err != nil {
+		t.Fatalf("chtimes normal rollout: %v", err)
+	}
+
+	contributors, _, _, _, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok {
+		t.Fatal("expected normal-time rollout contributor")
+	}
+	if got := contributors[codexWindowPrimary][codexLegacyLimitID]; got.UsedPercentage != 73 {
+		t.Fatalf("primary contributor=%+v, want normal-time rollout selected ahead of future mtimes", got)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_FutureAuthWatermarkLeavesProgressForRetry(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	authPath := filepath.Join(base, "auth.json")
+	if err := os.WriteFile(authPath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+	future := now.Add(time.Hour)
+	if err := os.Chtimes(authPath, future, future); err != nil {
+		t.Fatalf("chtimes future auth file: %v", err)
+	}
+	rolloutName := "2026-08-26T13-50-00-current"
+	helperWriteRolloutLogAt(t, base, "26", rolloutName, "2026-08-26T13:50:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 64.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}})
+
+	contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if ok || len(contributors) != 0 || highWater != nil {
+		t.Fatalf("future auth watermark produced contributors=%+v highWater=%+v ok=%v", contributors, highWater, ok)
+	}
+
+	corrected := now.Add(-time.Hour)
+	if err := os.Chtimes(authPath, corrected, corrected); err != nil {
+		t.Fatalf("correct auth file mtime: %v", err)
+	}
+	contributors, _, _, highWater, ok = codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || highWater == nil {
+		t.Fatalf("corrected auth watermark did not retry rollout: contributors=%+v highWater=%+v ok=%v", contributors, highWater, ok)
+	}
+	if got := contributors[codexWindowPrimary][codexLegacyLimitID]; got.UsedPercentage != 64 {
+		t.Fatalf("primary contributor=%+v, want retried current rollout", got)
+	}
+}
+
+func TestCodexReconcileFromRollout_ResetsCursorForDifferentCodexHome(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	root := t.TempDir()
+	firstBase := filepath.Join(root, "codex-home-one-secret")
+	secondBase := filepath.Join(root, "codex-home-two-secret")
+
+	helperWriteRolloutLogAt(t, firstBase, "26", "2026-08-26T13-40-00-first", "2026-08-26T13:40:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 31.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			},
+		}})
+	firstPath := filepath.Join(firstBase, "sessions", "2026", "06", "26", "rollout-2026-08-26T13-40-00-first.jsonl")
+	firstMtime := now.Add(-time.Minute)
+	if err := os.Chtimes(firstPath, firstMtime, firstMtime); err != nil {
+		t.Fatal(err)
+	}
+	metrics, _, _ := codexReconcileFromRollout(context.Background(), firstBase, "", now)
+	if got := metrics[0].Consumed; got == nil || *got != 31 {
+		t.Fatalf("first CODEX_HOME session usage=%v, want 31", got)
+	}
+	firstCursor := codexRolloutScanCursorForAccount(firstBase, "", now)
+	if firstCursor.mtimeNs == 0 {
+		t.Fatal("expected completed cursor for first CODEX_HOME")
+	}
+
+	helperWriteRolloutLogAt(t, secondBase, "26", "2026-08-26T13-55-00-second", "2026-08-26T13:55:00Z",
+		[]map[string]any{{
+			"primary": map[string]any{
+				"used_percent": 64.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(2 * time.Hour).Unix()),
+			},
+		}})
+	secondPath := filepath.Join(secondBase, "sessions", "2026", "06", "26", "rollout-2026-08-26T13-55-00-second.jsonl")
+	secondMtime := now.Add(-10 * time.Minute)
+	if err := os.Chtimes(secondPath, secondMtime, secondMtime); err != nil {
+		t.Fatal(err)
+	}
+	if cursor := codexRolloutScanCursorForAccount(secondBase, "", now); cursor.mtimeNs != 0 || cursor.boundaryFingerprint != "" {
+		t.Fatalf("different CODEX_HOME cursor=%+v, want reset before discovery", cursor)
+	}
+
+	metrics, _, _ = codexReconcileFromRollout(context.Background(), secondBase, "", now)
+	if got := metrics[0].Consumed; got == nil || *got != 64 {
+		t.Fatalf("second CODEX_HOME session usage=%v, want older-mtime rollout reconciled at 64", got)
+	}
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected reconciled snapshot")
+	}
+	if want := codexRolloutRootFingerprint(secondBase); snap.RolloutRootFingerprint != want {
+		t.Fatalf("rollout root fingerprint=%q, want %q", snap.RolloutRootFingerprint, want)
+	}
+	persisted, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rawPathSentinel := range []string{"codex-home-one-secret", "codex-home-two-secret"} {
+		if strings.Contains(string(persisted), rawPathSentinel) {
+			t.Fatalf("typed cache leaked CODEX_HOME path %q: %s", rawPathSentinel, persisted)
+		}
+	}
+}
+
+func TestCodexRolloutScanCursorForAccount_ResetsPersistedFutureCursor(t *testing.T) {
+	now := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	fingerprint := fingerprintAccount("codex", "workspace-a")
+
+	for _, tc := range []struct {
+		name string
+		snap codexRateLimitSnapshot
+	}{
+		{
+			name: "nanosecond cursor",
+			snap: codexRateLimitSnapshot{
+				AccountFingerprint:                  fingerprint,
+				RolloutHighWaterMtimeNs:             now.Add(24 * time.Hour).UnixNano(),
+				RolloutHighWaterBoundaryFingerprint: "future-boundary",
+			},
+		},
+		{
+			name: "legacy millisecond cursor",
+			snap: codexRateLimitSnapshot{
+				AccountFingerprint:      fingerprint,
+				RolloutHighWaterMtimeMs: now.Add(24 * time.Hour).UnixMilli(),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+			t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+
+			base := t.TempDir()
+			helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{
+				"tokens": map[string]any{"account_id": "workspace-a"},
+			})
+			authMtime := now.Add(-2 * time.Hour)
+			if err := os.Chtimes(filepath.Join(base, "auth.json"), authMtime, authMtime); err != nil {
+				t.Fatal(err)
+			}
+			tc.snap.RolloutRootFingerprint = codexRolloutRootFingerprint(base)
+			helperWriteJSON(t, cache, tc.snap)
+			dir := filepath.Join(base, "sessions", "2026", "08", "26")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "rollout-after-clock-rollback.jsonl")
+			if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			mtime := now.Add(-time.Minute)
+			if err := os.Chtimes(path, mtime, mtime); err != nil {
+				t.Fatal(err)
+			}
+
+			cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+			if cursor.mtimeNs != 0 || cursor.boundaryFingerprint != "" {
+				t.Fatalf("cursor=%+v, want reset after clock rollback", cursor)
+			}
+			candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+			if !complete || len(candidates) != 1 || candidates[0].path != path {
+				t.Fatalf("complete=%v candidates=%+v, want post-rollback rollout selected", complete, candidates)
+			}
+			_, _, _, progress, _ := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+			if progress == nil {
+				t.Fatal("expected completed post-rollback scan progress")
+			}
+			mergeCodexRateLimitCachePerLimitProgress(
+				cache, nil, nil, false, nil, false, now, fingerprint, progress, base,
+			)
+			persisted, ok := loadCodexRateLimitSnapshot(cache)
+			if !ok {
+				t.Fatal("expected updated cache")
+			}
+			if persisted.RolloutHighWaterMtimeNs != progress.mtimeNs ||
+				persisted.RolloutHighWaterBoundaryFingerprint != progress.boundaryFingerprint {
+				t.Fatalf("persisted cursor=(%d, %q), want completed lower cursor=(%d, %q)",
+					persisted.RolloutHighWaterMtimeNs, persisted.RolloutHighWaterBoundaryFingerprint,
+					progress.mtimeNs, progress.boundaryFingerprint)
+			}
+		})
+	}
+}
+
+func TestCodexSelectNewestRolloutCandidates_KeepsCappedNewestInRankOrder(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	candidates := []codexRolloutCandidate{
+		{path: "old", mtime: now.Add(-3 * time.Hour)},
+		{path: "future", mtime: now.Add(time.Hour)},
+		{path: "newest", mtime: now.Add(-time.Minute)},
+		{path: "tie-a", mtime: now.Add(-time.Hour)},
+		{path: "tie-b", mtime: now.Add(-time.Hour)},
+	}
+
+	selected, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, 3, nil, nil, "", "")
+	if !complete {
+		t.Fatal("complete=false, want an uninterrupted ranking pass")
+	}
+	got := make([]string, 0, len(selected))
+	for _, c := range selected {
+		got = append(got, c.path)
+	}
+	// Newest normal-time file first, filename descending on an mtime tie, and the
+	// future-dated file ranked behind every normal-time candidate — so it never
+	// displaces a real one out of the cap.
+	if want := "newest,tie-b,tie-a"; strings.Join(got, ",") != want {
+		t.Fatalf("selected=%v, want %v", got, want)
+	}
+}
+
+func TestCodexSelectNewestRolloutCandidates_ReservesUnfinishedBoundary(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	boundary := now.Add(-time.Hour)
+	candidates := make([]codexRolloutCandidate, 0, 24)
+	for i := range 12 {
+		candidates = append(candidates, codexRolloutCandidate{
+			path:  fmt.Sprintf("newer-%02d", i),
+			mtime: boundary.Add(time.Minute),
+		})
+	}
+	for i := range 12 {
+		candidates = append(candidates, codexRolloutCandidate{
+			path:  fmt.Sprintf("boundary-%02d", i),
+			mtime: boundary,
+		})
+	}
+
+	selected, complete := codexSelectNewestRolloutCandidates(
+		context.Background(), candidates, now, codexRolloutScanFileCap,
+		[]codexRolloutReserve{codexRolloutBoundaryReserve(boundary.UnixNano())}, nil, "", "",
+	)
+	if !complete || len(selected) != codexRolloutScanFileCap {
+		t.Fatalf("complete=%v selected=%d, want a full uninterrupted batch", complete, len(selected))
+	}
+	boundaryCount := 0
+	for i, candidate := range selected {
+		if candidate.mtime.Equal(boundary) {
+			boundaryCount++
+			continue
+		}
+		if boundaryCount > 0 {
+			t.Fatalf("candidate %q at index %d ranked after the reserved boundary", candidate.path, i)
+		}
+	}
+	if boundaryCount != codexRolloutScanFileCap/2 {
+		t.Fatalf("boundary candidates=%d, want half of capped batch reserved", boundaryCount)
+	}
+}
+
+func TestCodexSelectNewestRolloutCandidates_StopsWhenBudgetExpires(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	candidates := make([]codexRolloutCandidate, 0, codexRolloutCandidateRankCheckInterval*4)
+	for i := range cap(candidates) {
+		candidates = append(candidates, codexRolloutCandidate{
+			path:  fmt.Sprintf("rollout-%05d", i),
+			mtime: now.Add(-time.Duration(i) * time.Second),
+		})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	selected, complete := codexSelectNewestRolloutCandidates(ctx, candidates, now, codexRolloutScanFileCap, nil, nil, "", "")
+	if complete {
+		t.Fatal("complete=true, want an exhausted budget reported as incomplete ranking")
+	}
+	if len(selected) != 0 {
+		t.Fatalf("selected=%d, want the pass to stop before ranking a backlog it has no budget to read", len(selected))
+	}
+}
+
+func TestCodexSelectNewestRolloutCandidates_RotatesRetryOnlyOverflow(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	capacity := 3
+	candidates := make([]codexRolloutCandidate, 0, capacity+1)
+	retries := map[string]struct{}{}
+	for i := range capacity + 1 {
+		candidate := codexRolloutCandidate{
+			path:       fmt.Sprintf("retry-%02d", i),
+			boundaryID: fmt.Sprintf("retry-%02d.jsonl", i),
+			mtime:      now.Add(-time.Duration(capacity-i) * time.Minute),
+		}
+		candidates = append(candidates, candidate)
+		retries[codexRolloutBacklogEntryDigest(candidate)] = struct{}{}
+	}
+	oldest := candidates[0]
+
+	first, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, capacity, nil, retries, "", "")
+	if !complete || len(first) != capacity {
+		t.Fatalf("complete=%v selected=%d, want first retry-only batch of %d", complete, len(first), capacity)
+	}
+	for _, candidate := range first {
+		if candidate.path == oldest.path {
+			t.Fatalf("first batch unexpectedly included oldest retry %q", oldest.path)
+		}
+	}
+
+	fingerprint, cursor := codexRolloutRetryRotationProgress(candidates, first, retries)
+	if fingerprint == "" || !codexRolloutRetryEntryValid(cursor) {
+		t.Fatalf("fingerprint=%q cursor=%q, want a redacted retry rotation cursor", fingerprint, cursor)
+	}
+
+	second, complete := codexSelectNewestRolloutCandidates(
+		context.Background(), candidates, now, capacity, nil, retries, cursor, fingerprint,
+	)
+	if !complete || len(second) != capacity {
+		t.Fatalf("complete=%v selected=%d, want rotated retry-only batch of %d", complete, len(second), capacity)
+	}
+	foundOldest := false
+	for _, candidate := range second {
+		if candidate.path == oldest.path {
+			foundOldest = true
+			break
+		}
+	}
+	if !foundOldest {
+		got := make([]string, 0, len(second))
+		for _, candidate := range second {
+			got = append(got, candidate.path)
+		}
+		t.Fatalf("rotated batch=%v, want oldest recovered retry %q", got, oldest.path)
+	}
+}
+
+func TestCodexSelectNewestRolloutCandidates_RotatesRetriesSharingBatchWithFreshFile(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	capacity := 3
+	retries := map[string]struct{}{}
+	backlog := make([]codexRolloutCandidate, 0, capacity+1)
+	for i := range capacity + 1 {
+		candidate := codexRolloutCandidate{
+			path:       fmt.Sprintf("retry-%02d", i),
+			boundaryID: fmt.Sprintf("retry-%02d.jsonl", i),
+			mtime:      now.Add(-time.Duration(capacity+1-i) * time.Minute),
+		}
+		backlog = append(backlog, candidate)
+		retries[codexRolloutBacklogEntryDigest(candidate)] = struct{}{}
+	}
+	// Each refresh discovers one brand-new session log alongside the unchanged
+	// retry cohort — the mixed batch the retry-only rotation used to skip.
+	freshFor := func(pass int) codexRolloutCandidate {
+		return codexRolloutCandidate{
+			path:       fmt.Sprintf("fresh-%02d", pass),
+			boundaryID: fmt.Sprintf("fresh-%02d.jsonl", pass),
+			mtime:      now,
+		}
+	}
+	candidatesFor := func(pass int) []codexRolloutCandidate {
+		return append([]codexRolloutCandidate{freshFor(pass)}, backlog...)
+	}
+
+	first := candidatesFor(1)
+	selected, complete := codexSelectNewestRolloutCandidates(
+		context.Background(), first, now, capacity, nil, retries, "", "",
+	)
+	if !complete || len(selected) != capacity {
+		t.Fatalf("complete=%v selected=%d, want a first mixed batch of %d", complete, len(selected), capacity)
+	}
+	if selected[0].path != freshFor(1).path {
+		t.Fatalf("first batch=%v, want the fresh rollout ranked first", rolloutCandidatePaths(selected))
+	}
+
+	fingerprint, cursor := codexRolloutRetryRotationProgress(first, selected, retries)
+	if fingerprint == "" || !codexRolloutRetryEntryValid(cursor) {
+		t.Fatalf("fingerprint=%q cursor=%q, want rotation progress recorded for a batch that also opened fresh work",
+			fingerprint, cursor)
+	}
+
+	second := candidatesFor(2)
+	rotated, complete := codexSelectNewestRolloutCandidates(
+		context.Background(), second, now, capacity, nil, retries, cursor, fingerprint,
+	)
+	if !complete || len(rotated) != capacity {
+		t.Fatalf("complete=%v selected=%d, want a rotated mixed batch of %d", complete, len(rotated), capacity)
+	}
+	got := rolloutCandidatePaths(rotated)
+	if rotated[0].path != freshFor(2).path {
+		t.Fatalf("rotated batch=%v, want the new fresh rollout kept in its slot", got)
+	}
+	for _, want := range []string{backlog[0].path, backlog[1].path} {
+		found := false
+		for _, candidate := range rotated {
+			if candidate.path == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("rotated batch=%v, want lower-ranked retry %q reopened past the cursor", got, want)
+		}
+	}
+}
+
+func rolloutCandidatePaths(candidates []codexRolloutCandidate) []string {
+	paths := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		paths = append(paths, candidate.path)
+	}
+	return paths
+}
+
+func TestCodexRolloutFallbackBuckets_ExhaustedBudgetDoesNotAdvanceHighWater(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "rollout-budget.jsonl")
+	contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+		`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":73,"window_minutes":300}}}` + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(ctx, base, now, codexRolloutScanCursor{})
+	if ok || len(contributors) != 0 {
+		t.Fatalf("contributors=%+v ok=%v, want no evidence from a pass with no budget", contributors, ok)
+	}
+	if highWater != nil {
+		t.Fatalf("highWater=%+v, want the unread rollout left eligible for retry", highWater)
+	}
+}
+
+func TestCodexRolloutFileContext_ReservesTimeForLaterCandidates(t *testing.T) {
+	parentDeadline := time.Now().Add(2 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), parentDeadline)
+	defer cancel()
+
+	fileCtx, cancelFile := codexRolloutFileContext(ctx, 3)
+	defer cancelFile()
+	fileDeadline, ok := fileCtx.Deadline()
+	if !ok {
+		t.Fatal("file context has no deadline")
+	}
+	want := 3 * codexRolloutLaterFileReserve
+	if gap := parentDeadline.Sub(fileDeadline); gap != want {
+		t.Fatalf("later-file reserve=%v, want %v", gap, want)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_OverCapMtimeBoundaryStaysDiscoverable(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "boundary@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Every rollout shares one mtime, as a coarse-resolution filesystem or a
+	// timestamp-preserving batch restore produces, and there are more of them
+	// than a single pass will open.
+	shared := time.Date(2026, 8, 26, 14, 30, 0, 0, time.UTC)
+	total := codexRolloutScanFileCap + 1
+	for i := range total {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%05d.jsonl", i))
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`, 20+i) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, shared, shared); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	firstContributors, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || highWater == nil {
+		t.Fatalf("ok=%v highWater=%+v, want numeric evidence and completed-scan progress", ok, highWater)
+	}
+	if highWater.mtimeNs != shared.UnixNano() {
+		t.Fatalf("highWater=%+v, want the shared boundary mtime", highWater)
+	}
+	if highWater.boundaryCursor == "" {
+		t.Fatal("boundary cursor empty, want first capped batch resume point")
+	}
+
+	// Persist and reload the partial cursor just as consecutive signed refreshes
+	// do. Re-running must still see the boundary as changed, or the file the cap
+	// left unread would be excluded forever.
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, highWater, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.boundaryCursor != highWater.boundaryCursor {
+		t.Fatalf("reloaded boundary cursor=%q, want %q", cursor.boundaryCursor, highWater.boundaryCursor)
+	}
+	encoded, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), "rolloutHighWaterBoundaryCursor") {
+		t.Fatalf("partial cache omitted redacted boundary cursor: %s", encoded)
+	}
+	if strings.Contains(string(encoded), "rollout-") || strings.Contains(string(encoded), base) {
+		t.Fatalf("serialized boundary progress leaked a source filename: %s", encoded)
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want an uninterrupted rediscovery")
+	}
+	if len(candidates) != total {
+		t.Fatalf("candidates=%d, want all %d boundary rollouts re-offered while one is still unread", len(candidates), total)
+	}
+
+	// The next capped pass must exclude the first batch before ranking, consume
+	// the one remaining rollout, and then collapse to the unchanged-boundary
+	// cache-only state. The lowest-ranked filename carries 20%, so observing it
+	// proves selection rotated instead of replaying the same 16 files.
+	contributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || completed == nil {
+		t.Fatalf("ok=%v completed=%+v, want remaining boundary rollout consumed", ok, completed)
+	}
+	var consumed float64
+	for _, bucket := range contributors[codexWindowPrimary] {
+		consumed = bucket.UsedPercentage
+	}
+	if consumed != 20 {
+		t.Fatalf("consumed=%v, want unread lowest-ranked rollout's 20%%", consumed)
+	}
+	if completed.boundaryCursor != "" {
+		t.Fatalf("completed boundary retained cursor %q, want compact cache-only state", completed.boundaryCursor)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, completed, base,
+	)
+	finishedCursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	unchanged, complete := codexDiscoverRolloutCandidates(context.Background(), base, finishedCursor)
+	if !complete || len(unchanged) != 0 {
+		t.Fatalf("complete=%v candidates=%d, want finished unchanged boundary skipped", complete, len(unchanged))
+	}
+
+}
+
+func TestCodexRolloutFallbackBuckets_OverCapDistinctMtimesStayDiscoverable(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "backlog@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	oldestMtime := now.Add(-30 * time.Minute)
+	total := codexRolloutScanFileCap + 1
+	for i := range total {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%05d.jsonl", i))
+		event := time.Date(2026, 8, 26, 14, 0, i, 0, time.UTC).Format(time.RFC3339)
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":%q,"type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`, event, 20+i) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := oldestMtime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || first == nil {
+		t.Fatalf("ok=%v progress=%+v, want first capped batch and resumable progress", ok, first)
+	}
+	if first.mtimeNs != 0 || first.backlogCursor == "" || first.backlogFingerprint == "" {
+		t.Fatalf("progress=%+v, want high-water pinned below the distinct-mtime backlog", first)
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, first, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.mtimeNs != 0 || cursor.backlogCursor != first.backlogCursor {
+		t.Fatalf("cursor=%+v, want persisted distinct-mtime resume point", cursor)
+	}
+	encoded, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "rollout-") || strings.Contains(string(encoded), base) {
+		t.Fatalf("serialized backlog progress leaked a source filename: %s", encoded)
+	}
+
+	contributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || completed == nil {
+		t.Fatalf("ok=%v progress=%+v, want omitted oldest rollout consumed", ok, completed)
+	}
+	var consumed float64
+	for _, bucket := range contributors[codexWindowPrimary] {
+		consumed = bucket.UsedPercentage
+	}
+	if consumed != 20 {
+		t.Fatalf("consumed=%v, want the omitted oldest rollout's 20%%", consumed)
+	}
+	newestMtime := oldestMtime.Add(time.Duration(total-1) * time.Second)
+	if completed.mtimeNs != newestMtime.UnixNano() || completed.backlogCursor != "" {
+		t.Fatalf("completed progress=%+v, want full cohort high-water at %d", completed, newestMtime.UnixNano())
+	}
+
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, completed, base,
+	)
+	finishedCursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	unchanged, complete := codexDiscoverRolloutCandidates(context.Background(), base, finishedCursor)
+	if !complete || len(unchanged) != 0 {
+		t.Fatalf("complete=%v candidates=%d, want completed distinct-mtime cohort cache-only", complete, len(unchanged))
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_ActiveAppendPreservesBacklogProgress(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "active-backlog@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	oldestMtime := now.Add(-30 * time.Minute)
+	total := codexRolloutScanFileCap + 1
+	var activePath string
+	for i := range total {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-active-%05d.jsonl", i))
+		event := time.Date(2026, 8, 26, 14, 0, i, 0, time.UTC).Format(time.RFC3339)
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == 0 {
+			window = `"secondary":{"used_percent":73,"window_minutes":10080}`
+		}
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":%q,"type":"token_count","rate_limits":{%s}}`, event, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := oldestMtime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		if i == total-1 {
+			activePath = path
+		}
+	}
+
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || first == nil || first.backlogCursor == "" || first.backlogMtimeNs == 0 {
+		t.Fatalf("ok=%v progress=%+v, want first capped batch and resumable progress", ok, first)
+	}
+	if len(firstContributors[codexWindowSecondary]) != 0 {
+		t.Fatal("first capped batch unexpectedly consumed the oldest weekly rollout")
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, first, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.backlogMtimeNs != first.backlogMtimeNs {
+		t.Fatalf("cursor backlog ceiling=%d, want %d", cursor.backlogMtimeNs, first.backlogMtimeNs)
+	}
+
+	active, err := os.OpenFile(activePath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := active.WriteString(`{"timestamp":"2026-08-26T14:45:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":91,"window_minutes":300}}}` + "\n")
+	closeErr := active.Close()
+	if writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	appendedMtime := now.Add(-5 * time.Minute)
+	if err := os.Chtimes(activePath, appendedMtime, appendedMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	contributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || completed == nil {
+		t.Fatalf("ok=%v progress=%+v, want appended active rollout and unread tail consumed", ok, completed)
+	}
+	var primary, secondary float64
+	for _, bucket := range contributors[codexWindowPrimary] {
+		primary = bucket.UsedPercentage
+	}
+	for _, bucket := range contributors[codexWindowSecondary] {
+		secondary = bucket.UsedPercentage
+	}
+	if primary != 91 || secondary != 73 {
+		t.Fatalf("primary=%v secondary=%v, want appended 91%% and oldest unread 73%%", primary, secondary)
+	}
+	if completed.mtimeNs != appendedMtime.UnixNano() || completed.backlogCursor != "" || completed.backlogMtimeNs != 0 {
+		t.Fatalf("completed progress=%+v, want backlog complete at appended mtime %d", completed, appendedMtime.UnixNano())
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_NewRolloutPreservesBacklogProgress(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "new-backlog@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	oldestMtime := now.Add(-30 * time.Minute)
+	total := codexRolloutScanFileCap + 1
+	for i := range total {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-cohort-%05d.jsonl", i))
+		event := time.Date(2026, 8, 26, 14, 0, i, 0, time.UTC).Format(time.RFC3339)
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == 0 {
+			window = `"secondary":{"used_percent":73,"window_minutes":10080}`
+		}
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":%q,"type":"token_count","rate_limits":{%s}}`, event, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := oldestMtime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || first == nil || first.backlogCursor == "" || first.backlogMtimeNs == 0 {
+		t.Fatalf("ok=%v progress=%+v, want first capped batch and resumable progress", ok, first)
+	}
+	if first.backlogCohortSize != total {
+		t.Fatalf("cohort size=%d, want the %d saved identities", first.backlogCohortSize, total)
+	}
+	if len(firstContributors[codexWindowSecondary]) != 0 {
+		t.Fatal("first capped batch unexpectedly consumed the oldest weekly rollout")
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, first, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.backlogCohortSize != first.backlogCohortSize || cursor.backlogCursor != first.backlogCursor {
+		t.Fatalf("cursor=%+v, want the persisted cohort ceiling and rank", cursor)
+	}
+	encoded, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "rollout-") || strings.Contains(string(encoded), base) {
+		t.Fatalf("serialized backlog progress leaked a source filename: %s", encoded)
+	}
+
+	// A session started after the cohort was saved writes a brand new rollout
+	// above the persisted ceiling. It must join the scan without invalidating
+	// progress toward the one rollout the capped first pass never reached.
+	freshPath := filepath.Join(dir, "rollout-cohort-99999.jsonl")
+	freshContents := `{"timestamp":"2026-08-26T14:50:00Z","type":"session_meta"}` + "\n" +
+		`{"timestamp":"2026-08-26T14:55:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":88,"window_minutes":300}}}` + "\n"
+	if err := os.WriteFile(freshPath, []byte(freshContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	freshMtime := now.Add(-2 * time.Minute)
+	if err := os.Chtimes(freshPath, freshMtime, freshMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	contributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || completed == nil {
+		t.Fatalf("ok=%v progress=%+v, want the new rollout and the unread tail consumed", ok, completed)
+	}
+	var primary, secondary float64
+	for _, bucket := range contributors[codexWindowPrimary] {
+		primary = bucket.UsedPercentage
+	}
+	for _, bucket := range contributors[codexWindowSecondary] {
+		secondary = bucket.UsedPercentage
+	}
+	if primary != 88 || secondary != 73 {
+		t.Fatalf("primary=%v secondary=%v, want new 88%% and oldest unread 73%%", primary, secondary)
+	}
+	if completed.mtimeNs != freshMtime.UnixNano() || completed.backlogCursor != "" || completed.backlogCohortSize != 0 {
+		t.Fatalf("completed progress=%+v, want backlog complete at the new rollout's mtime %d", completed, freshMtime.UnixNano())
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_RetryableFailureDoesNotPinCappedBacklog(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "retry-backlog@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	oldestMtime := now.Add(-30 * time.Minute)
+	var failedPath string
+	for i := range codexRolloutScanFileCap + 1 {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-retry-%05d.jsonl", i))
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == 0 {
+			window = `"secondary":{"used_percent":88,"window_minutes":10080}`
+		}
+		contents := `{"timestamp":"2026-08-26T12:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{%s}}`, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := oldestMtime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		if i == codexRolloutScanFileCap {
+			failedPath = path
+		}
+	}
+
+	originalOpen := codexOpenRolloutFile
+	defer func() { codexOpenRolloutFile = originalOpen }()
+	failedOpens := 0
+	codexOpenRolloutFile = func(path string) (*os.File, error) {
+		if filepath.Clean(path) == filepath.Clean(failedPath) {
+			failedOpens++
+			return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}
+		}
+		return os.Open(path)
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || first == nil || first.backlogCursor == "" || len(first.retryEntries) != 1 {
+		t.Fatalf("ok=%v progress=%+v, want resumable backlog with one redacted retry", ok, first)
+	}
+	if len(firstContributors[codexWindowSecondary]) != 0 {
+		t.Fatal("first capped pass unexpectedly consumed the seventeenth weekly rollout")
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, first, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if len(cursor.retryEntries) != 1 || !codexRolloutRetryEntryValid(cursor.retryEntries[0]) ||
+		strings.Contains(cursor.retryEntries[0], filepath.Base(failedPath)) {
+		t.Fatalf("persisted retry entries=%q, want one path-free SHA-256 identity", cursor.retryEntries)
+	}
+
+	secondContributors, _, _, second, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || second == nil || len(second.retryEntries) != 1 {
+		t.Fatalf("ok=%v progress=%+v, want failed rollout retained while backlog advances", ok, second)
+	}
+	if got := secondContributors[codexWindowSecondary][codexLegacyLimitID].UsedPercentage; got != 88 {
+		t.Fatalf("weekly contributor=%v, want seventeenth rollout consumed despite persistent failure", got)
+	}
+	if failedOpens != 2 {
+		t.Fatalf("failed rollout opens=%d, want one retry per bounded pass", failedOpens)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, secondContributors, nil, false, nil, false, now, fingerprint, second, base,
+	)
+
+	codexOpenRolloutFile = originalOpen
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	resolvedContributors, _, _, resolved, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || resolved == nil || len(resolved.retryEntries) != 0 || len(resolvedContributors) == 0 {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want successful retry retired", ok, resolvedContributors, resolved)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, resolvedContributors, nil, false, nil, false, now, fingerprint, resolved, base,
+	)
+
+	opened := 0
+	codexOpenRolloutFile = func(path string) (*os.File, error) {
+		opened++
+		return os.Open(path)
+	}
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	_, _, _, _, _ = codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if opened != 0 {
+		t.Fatalf("unchanged completed refresh opened %d rollouts, want cache-only", opened)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_FullRetryBatchReservesBacklogSlot(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "full-retry-backlog@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	oldestMtime := now.Add(-30 * time.Minute)
+	failedPaths := map[string]struct{}{}
+	for i := range codexRolloutScanFileCap + 1 {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-full-retry-%05d.jsonl", i))
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == 0 {
+			window = `"secondary":{"used_percent":89,"window_minutes":10080}`
+		} else {
+			failedPaths[filepath.Clean(path)] = struct{}{}
+		}
+		contents := `{"timestamp":"2026-08-26T12:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{%s}}`, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := oldestMtime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	originalOpen := codexOpenRolloutFile
+	defer func() { codexOpenRolloutFile = originalOpen }()
+	failedOpens := 0
+	codexOpenRolloutFile = func(path string) (*os.File, error) {
+		if _, fail := failedPaths[filepath.Clean(path)]; fail {
+			failedOpens++
+			return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}
+		}
+		return os.Open(path)
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if ok || len(firstContributors) != 0 || first == nil || first.backlogCursor == "" ||
+		len(first.retryEntries) != codexRolloutScanFileCap {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want a full retry batch with resumable backlog", ok, firstContributors, first)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, first, base,
+	)
+
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	secondContributors, _, _, second, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || second == nil || len(second.retryEntries) != codexRolloutScanFileCap {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want backlog evidence with failures still queued", ok, secondContributors, second)
+	}
+	if got := secondContributors[codexWindowSecondary][codexLegacyLimitID].UsedPercentage; got != 89 {
+		t.Fatalf("weekly contributor=%v, want readable seventeenth rollout despite a full retry batch", got)
+	}
+	if failedOpens != codexRolloutScanFileCap*2-1 {
+		t.Fatalf("failed rollout opens=%d, want one retry slot reserved for backlog progress", failedOpens)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_RetryOnlyCohortRotatesPastFirstBatch(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "retry-only-rotate@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	oldestMtime := now.Add(-30 * time.Minute)
+	failedPaths := map[string]struct{}{}
+	var oldestPath string
+	for i := range codexRolloutScanFileCap + 1 {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-retry-only-%05d.jsonl", i))
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == 0 {
+			window = `"secondary":{"used_percent":91,"window_minutes":10080}`
+			oldestPath = path
+		}
+		failedPaths[filepath.Clean(path)] = struct{}{}
+		contents := `{"timestamp":"2026-08-26T12:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{%s}}`, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := oldestMtime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	originalOpen := codexOpenRolloutFile
+	defer func() { codexOpenRolloutFile = originalOpen }()
+	oldestOpens := 0
+	codexOpenRolloutFile = func(path string) (*os.File, error) {
+		if filepath.Clean(path) == filepath.Clean(oldestPath) {
+			oldestOpens++
+		}
+		if _, fail := failedPaths[filepath.Clean(path)]; fail {
+			return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}
+		}
+		return os.Open(path)
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	persist := func(contribs map[string]map[string]codexRateLimitBucket, progress *codexRolloutScanProgress) {
+		t.Helper()
+		mergeCodexRateLimitCachePerLimitProgress(
+			cache, contribs, nil, false, nil, false, now, fingerprint, progress, base,
+		)
+	}
+
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if ok || len(firstContributors) != 0 || first == nil || len(first.retryEntries) != codexRolloutScanFileCap {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want the first 16 retries queued", ok, firstContributors, first)
+	}
+	if oldestOpens != 0 {
+		t.Fatalf("oldest opens=%d after first batch, want the seventeenth file still unselected", oldestOpens)
+	}
+	persist(firstContributors, first)
+
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	secondContributors, _, _, second, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if ok || len(secondContributors) != 0 || second == nil ||
+		len(second.retryEntries) != codexRolloutScanFileCap+1 {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want every rollout queued for retry", ok, secondContributors, second)
+	}
+	if oldestOpens != 1 {
+		t.Fatalf("oldest opens=%d after reserved non-retry slot, want one failed attempt", oldestOpens)
+	}
+	persist(secondContributors, second)
+
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.retryCursor == "" || cursor.retryFingerprint == "" {
+		t.Fatalf("cursor=%+v, want a retry-only rotation cursor after the overflowing cohort", cursor)
+	}
+	thirdContributors, _, _, third, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if ok || len(thirdContributors) != 0 || third == nil ||
+		len(third.retryEntries) != codexRolloutScanFileCap+1 {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want retry-only rotation to persist", ok, thirdContributors, third)
+	}
+	persist(thirdContributors, third)
+
+	delete(failedPaths, filepath.Clean(oldestPath))
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.retryCursor == "" || cursor.retryFingerprint == "" {
+		t.Fatalf("cursor=%+v, want rotation state retained until the recovered file is selected", cursor)
+	}
+	rotatedContributors, _, _, rotated, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || rotated == nil {
+		t.Fatalf("ok=%v progress=%+v, want recovered oldest retry consumed", ok, rotated)
+	}
+	if got := rotatedContributors[codexWindowSecondary][codexLegacyLimitID].UsedPercentage; got != 91 {
+		t.Fatalf("weekly contributor=%v, want recovered seventeenth rollout after retry-only rotation", got)
+	}
+	if oldestOpens != 2 {
+		t.Fatalf("oldest opens=%d, want the recovered file reopened after rotation", oldestOpens)
+	}
+	persist(rotatedContributors, rotated)
+
+	encoded, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), filepath.Base(oldestPath)) ||
+		strings.Contains(string(encoded), dir) {
+		t.Fatalf("serialized retry rotation leaked a source path: %s", encoded)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_NewerFileDoesNotSkipUnfinishedBoundary(t *testing.T) {
+	base := t.TempDir()
+	helperCodexAuthAt(t, base, "boundary-newer@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	shared := now.Add(-30 * time.Minute)
+	totalAtBoundary := codexRolloutScanFileCap*2 + 1
+	for i := range totalAtBoundary {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-boundary-%05d.jsonl", i))
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`, 20+i) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, shared, shared); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || first == nil || first.boundaryCursor == "" {
+		t.Fatalf("ok=%v progress=%+v, want a resumable first boundary batch", ok, first)
+	}
+	firstCursor := codexRolloutScanCursor{
+		mtimeNs:             first.mtimeNs,
+		boundaryFingerprint: first.boundaryFingerprint,
+		boundaryCursor:      first.boundaryCursor,
+	}
+
+	newerMtime := now.Add(-time.Minute)
+	for i := range codexRolloutScanFileCap {
+		newerPath := filepath.Join(dir, fmt.Sprintf("rollout-newer-%05d.jsonl", i))
+		newerContents := `{"timestamp":"2026-08-26T14:20:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:25:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`, 70+i) + "\n"
+		if err := os.WriteFile(newerPath, []byte(newerContents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(newerPath, newerMtime, newerMtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, _, _, second, ok := codexRolloutFallbackBuckets(context.Background(), base, now, firstCursor)
+	if !ok || second == nil {
+		t.Fatalf("ok=%v progress=%+v, want the mixed newer/boundary batch handled", ok, second)
+	}
+	if second.mtimeNs != shared.UnixNano() || second.boundaryCursor == "" {
+		t.Fatalf("progress=%+v, want high-water pinned to unfinished boundary %d", second, shared.UnixNano())
+	}
+	secondCursor := codexRolloutScanCursor{
+		mtimeNs:             second.mtimeNs,
+		boundaryFingerprint: second.boundaryFingerprint,
+		boundaryCursor:      second.boundaryCursor,
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, secondCursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery")
+	}
+	eligible := codexUnconsumedRolloutCandidates(candidates, secondCursor, now)
+	remainingAtBoundary := 0
+	for _, candidate := range eligible {
+		if candidate.mtime.Equal(shared) {
+			remainingAtBoundary++
+		}
+	}
+	wantRemaining := totalAtBoundary - codexRolloutScanFileCap - codexRolloutScanFileCap/2
+	if remainingAtBoundary != wantRemaining {
+		t.Fatalf("remaining boundary candidates=%d, want %d after reserving half the capped batch", remainingAtBoundary, wantRemaining)
+	}
+
+	_, _, _, third, ok := codexRolloutFallbackBuckets(context.Background(), base, now, secondCursor)
+	if !ok || third == nil || third.mtimeNs != shared.UnixNano() || third.boundaryCursor == "" {
+		t.Fatalf("ok=%v progress=%+v, want the reserved boundary batch to keep advancing", ok, third)
+	}
+	thirdCursor := codexRolloutScanCursor{
+		mtimeNs:             third.mtimeNs,
+		boundaryFingerprint: third.boundaryFingerprint,
+		boundaryCursor:      third.boundaryCursor,
+	}
+
+	_, _, _, advanced, ok := codexRolloutFallbackBuckets(context.Background(), base, now, thirdCursor)
+	if !ok || advanced == nil || advanced.mtimeNs != newerMtime.UnixNano() || advanced.boundaryCursor == "" {
+		t.Fatalf("ok=%v progress=%+v, want completed old boundary to advance to the newer shared mtime", ok, advanced)
+	}
+	advancedCursor := codexRolloutScanCursor{
+		mtimeNs:             advanced.mtimeNs,
+		boundaryFingerprint: advanced.boundaryFingerprint,
+		boundaryCursor:      advanced.boundaryCursor,
+	}
+	_, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, advancedCursor)
+	if !ok || completed == nil || completed.mtimeNs != newerMtime.UnixNano() || completed.boundaryCursor != "" {
+		t.Fatalf("ok=%v progress=%+v, want the newer boundary to finish in compact cache-only state", ok, completed)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_FinalBoundaryBatchDoesNotSkipEvictedNewerFile(t *testing.T) {
+	base := t.TempDir()
+	helperCodexAuthAt(t, base, "boundary-eviction@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	boundary := now.Add(-2 * time.Hour)
+	for _, name := range []string{"a", "b"} {
+		path := filepath.Join(dir, "rollout-boundary-"+name+".jsonl")
+		contents := `{"timestamp":"2026-08-26T12:00:00Z","type":"session_meta"}` + "\n" +
+			`{"timestamp":"2026-08-26T13:00:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":10,"window_minutes":300}}}` + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, boundary, boundary); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sixteen distinct newer mtimes fill the ordinary batch. Reserving the one
+	// remaining old-boundary entry evicts newer-00; its deliberately freshest
+	// provider observation proves the following pass offers it again.
+	for i := range codexRolloutScanFileCap {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-newer-%02d.jsonl", i))
+		used := 20 + i
+		observed := "2026-08-26T14:00:00Z"
+		if i == 0 {
+			used = 99
+			observed = "2026-08-26T14:59:00Z"
+		}
+		contents := `{"timestamp":"2026-08-26T12:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":%q,"type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`, observed, used) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := boundary.Add(time.Duration(i+1) * time.Minute)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	all, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{})
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted initial discovery")
+	}
+	var consumedBoundary codexRolloutCandidate
+	for _, candidate := range all {
+		if candidate.mtime.Equal(boundary) && (consumedBoundary.path == "" || candidate.path > consumedBoundary.path) {
+			consumedBoundary = candidate
+		}
+	}
+	if consumedBoundary.path == "" {
+		t.Fatal("missing boundary candidate")
+	}
+	cursor := codexRolloutScanCursor{
+		mtimeNs:             boundary.UnixNano(),
+		boundaryFingerprint: codexRolloutBoundaryFingerprint(all, boundary.UnixNano()),
+		boundaryCursor:      codexRolloutBoundaryEntryDigest(consumedBoundary),
+	}
+
+	_, _, _, retained, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || retained == nil {
+		t.Fatalf("ok=%v progress=%+v, want final reserved-boundary batch handled", ok, retained)
+	}
+	if retained.mtimeNs != boundary.UnixNano() || retained.boundaryCursor != "" {
+		t.Fatalf("progress=%+v, want completed boundary retained for one unreserved newer pass", retained)
+	}
+
+	contributors, _, _, advanced, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{
+		mtimeNs:             retained.mtimeNs,
+		boundaryFingerprint: retained.boundaryFingerprint,
+		boundaryCursor:      retained.boundaryCursor,
+	})
+	if !ok || advanced == nil || advanced.mtimeNs != boundary.Add(codexRolloutScanFileCap*time.Minute).UnixNano() {
+		t.Fatalf("ok=%v progress=%+v, want unreserved newer batch to advance", ok, advanced)
+	}
+	if got := contributors[codexWindowPrimary][codexLegacyLimitID].UsedPercentage; got != 99 {
+		t.Fatalf("evicted newer contributor=%v, want freshest 99%% evidence recovered on retry", got)
+	}
+}
+
+func TestTryMergeCodexRateLimitCachePerLimitProgress_DoesNotWaitForLocks(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	base := t.TempDir()
+	helperCodexAuthAt(t, base, "nonblocking-merge@example.com", codexTestLogin)
+	fingerprint := codexAccountFingerprintAtBase(base)
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	progress := &codexRolloutScanProgress{mtimeNs: now.Add(-time.Minute).UnixNano()}
+	tryMerge := func() bool {
+		return tryMergeCodexRateLimitCachePerLimitProgress(
+			cache, nil, nil, false, nil, false, now, fingerprint, progress, base,
+		)
+	}
+
+	assertReturnsUnavailable := func(name string, hold func(), release func()) {
+		t.Helper()
+		hold()
+		result := make(chan bool, 1)
+		go func() { result <- tryMerge() }()
+		select {
+		case merged := <-result:
+			release()
+			if merged {
+				t.Fatalf("%s: merge succeeded while lock was held", name)
+			}
+		case <-time.After(time.Second):
+			release()
+			t.Fatalf("%s: optional rollout merge waited for lock", name)
+		}
+	}
+
+	assertReturnsUnavailable("process-local", codexRateLimitMu.Lock, codexRateLimitMu.Unlock)
+
+	if err := os.MkdirAll(filepath.Dir(cache), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var crossProcessLock *os.File
+	assertReturnsUnavailable("cross-process", func() {
+		var locked bool
+		crossProcessLock, locked = acquireCrossProcessCacheLock(cache)
+		if !locked {
+			t.Fatal("failed to acquire cross-process test lock")
+		}
+	}, func() {
+		_ = unlockFile(crossProcessLock)
+		_ = crossProcessLock.Close()
+	})
+
+	if !tryMerge() {
+		t.Fatal("merge did not succeed after both locks became available")
+	}
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok || snap.RolloutHighWaterMtimeNs != progress.mtimeNs {
+		t.Fatalf("snapshot=%+v ok=%v, want retry to persist rollout progress", snap, ok)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_LaterRolloutKeepsUnfinishedFutureCohort(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "future-cohort@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	futureMtime := now.Add(24 * time.Hour)
+	writeRollout := func(name string, percent int, mtime time.Time) {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(
+				`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`,
+				percent,
+			) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range codexRolloutScanFileCap + 1 {
+		writeRollout(fmt.Sprintf("rollout-future-%02d.jsonl", i), 41+i, futureMtime)
+	}
+
+	startingCursor := codexRolloutScanCursor{mtimeNs: now.Add(-time.Second).UnixNano()}
+	contributors, _, _, progress, ok := codexRolloutFallbackBuckets(context.Background(), base, now, startingCursor)
+	if !ok || progress == nil || progress.futureCursor == "" || progress.futureComplete {
+		t.Fatalf("ok=%v progress=%+v, want an unfinished capped future cohort", ok, progress)
+	}
+	if progress.futureFloorNs != futureMtime.UnixNano() || progress.futureCeilingNs != futureMtime.UnixNano() {
+		t.Fatalf("cohort bounds=[%d,%d], want both pinned to the cohort mtime %d",
+			progress.futureFloorNs, progress.futureCeilingNs, futureMtime.UnixNano())
+	}
+	if progress.futureCohortSize != codexRolloutScanFileCap+1 {
+		t.Fatalf("cohort size=%d, want %d", progress.futureCohortSize, codexRolloutScanFileCap+1)
+	}
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, progress, base,
+	)
+
+	// An ordinary rollout written after the anchor is newer than it, so before the
+	// cohort was bounded it changed the cohort fingerprint and restarted the capped
+	// scan — leaving the unread cohort member starved behind each new session.
+	later := now.Add(time.Minute)
+	writeRollout("rollout-later-normal.jsonl", 7, later)
+
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, later)
+	if cursor.futureCursor == "" || cursor.futureComplete ||
+		cursor.futureFloorNs != futureMtime.UnixNano() || cursor.futureCeilingNs != futureMtime.UnixNano() {
+		t.Fatalf("reloaded cursor=%+v, want the bounded unfinished cohort", cursor)
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery")
+	}
+	eligible := codexUnconsumedRolloutCandidates(candidates, cursor, later)
+	if len(eligible) != 2 {
+		t.Fatalf("eligible=%d, want the later rollout plus the one unread cohort member", len(eligible))
+	}
+	sawLater, futureLeft := false, 0
+	for _, candidate := range eligible {
+		if candidate.mtime.Equal(futureMtime) {
+			futureLeft++
+			continue
+		}
+		if filepath.Base(candidate.path) == "rollout-later-normal.jsonl" {
+			sawLater = true
+		}
+	}
+	if !sawLater || futureLeft != 1 {
+		t.Fatalf("eligible=%+v, want the later rollout and exactly one unconsumed cohort member", eligible)
+	}
+
+	lastContributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, later, cursor)
+	if !ok || completed == nil || !completed.futureComplete || completed.futureCursor != "" {
+		t.Fatalf("ok=%v progress=%+v, want the final cohort batch marked complete", ok, completed)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, lastContributors, nil, false, nil, false, later, fingerprint, completed, base,
+	)
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, later)
+	if !cursor.futureComplete {
+		t.Fatalf("reloaded cursor=%+v, want the completed cohort", cursor)
+	}
+	candidates, complete = codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery")
+	}
+	for _, candidate := range codexUnconsumedRolloutCandidates(candidates, cursor, later) {
+		if candidate.mtime.Equal(futureMtime) {
+			t.Fatalf("eligible=%+v, want every consumed cohort member excluded", candidate)
+		}
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_RecordsFutureCandidatesSeparately(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "future-progress@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	futureMtime := now.Add(24 * time.Hour)
+	for i := range codexRolloutScanFileCap + 1 {
+		futurePath := filepath.Join(dir, fmt.Sprintf("rollout-future-secret-sentinel-%02d.jsonl", i))
+		futureContents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`, 41+i) + "\n"
+		if err := os.WriteFile(futurePath, []byte(futureContents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(futurePath, futureMtime, futureMtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	startingCursor := codexRolloutScanCursor{mtimeNs: now.Add(-time.Second).UnixNano()}
+	contributors, _, _, progress, ok := codexRolloutFallbackBuckets(context.Background(), base, now, startingCursor)
+	if !ok || progress == nil || progress.futureFingerprint == "" || progress.futureCursor == "" || progress.futureComplete {
+		t.Fatalf("ok=%v progress=%+v, want resumable redacted future-file progress", ok, progress)
+	}
+	if progress.mtimeNs != startingCursor.mtimeNs {
+		t.Fatalf("normal high-water=%d, want existing cursor %d preserved", progress.mtimeNs, startingCursor.mtimeNs)
+	}
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, progress, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.futureFingerprint == "" || cursor.futureCursor == "" || cursor.futureComplete {
+		t.Fatalf("reloaded cursor=%+v, want resumable future-file state", cursor)
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery")
+	}
+	eligible := codexUnconsumedRolloutCandidates(candidates, cursor, now)
+	if len(eligible) != 1 {
+		t.Fatalf("eligible=%d, want the one future rollout left beyond the first capped batch", len(eligible))
+	}
+	lastContributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || completed == nil || !completed.futureComplete || completed.futureCursor != "" {
+		t.Fatalf("ok=%v progress=%+v, want final future batch marked complete", ok, completed)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, lastContributors, nil, false, nil, false, now, fingerprint, completed, base,
+	)
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.futureFingerprint == "" || !cursor.futureComplete {
+		t.Fatalf("reloaded cursor=%+v, want completed future-file state", cursor)
+	}
+	encoded, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "future-secret-sentinel") || strings.Contains(string(encoded), base) {
+		t.Fatalf("serialized future progress leaked a source path: %s", encoded)
+	}
+	candidates, complete = codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery")
+	}
+	if eligible = codexUnconsumedRolloutCandidates(candidates, cursor, now); len(eligible) != 0 {
+		t.Fatalf("eligible=%+v, want unchanged future-dated rollouts recorded as consumed", eligible)
+	}
+
+	normalPath := filepath.Join(dir, "rollout-normal.jsonl")
+	normalContents := `{"timestamp":"2026-08-26T14:30:00Z","type":"session_meta"}` + "\n" +
+		`{"timestamp":"2026-08-26T14:40:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":64,"window_minutes":300}}}` + "\n"
+	if err := os.WriteFile(normalPath, []byte(normalContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	normalMtime := now.Add(-500 * time.Millisecond)
+	if err := os.Chtimes(normalPath, normalMtime, normalMtime); err != nil {
+		t.Fatal(err)
+	}
+	newContributors, _, _, next, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || next == nil {
+		t.Fatalf("ok=%v progress=%+v, want newly written normal-time rollout consumed", ok, next)
+	}
+	var consumed float64
+	for _, bucket := range newContributors[codexWindowPrimary] {
+		consumed = bucket.UsedPercentage
+	}
+	if consumed != 64 {
+		t.Fatalf("normal-time usage=%v, want 64%% while future rollout stays excluded", consumed)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, newContributors, nil, false, nil, false, now, fingerprint, next, base,
+	)
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	caughtUp := futureMtime.Add(time.Second)
+	_, _, _, retired, ok := codexRolloutFallbackBuckets(context.Background(), base, caughtUp, cursor)
+	if ok || retired == nil {
+		t.Fatalf("ok=%v progress=%+v, want cache-only future cohort retirement", ok, retired)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, nil, nil, false, nil, false, caughtUp, fingerprint, retired, base,
+	)
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, caughtUp)
+	if cursor.mtimeNs != futureMtime.UnixNano() || cursor.futureFingerprint != "" || cursor.futureComplete {
+		t.Fatalf("cursor=%+v, want completed future cohort folded into normal progress", cursor)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_ResumesFutureBatchAfterClockCatchUp(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "future-catch-up@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	total := codexRolloutScanFileCap + 1
+	for i := range total {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-future-catch-up-%02d.jsonl", i))
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == total-1 {
+			// This distinct contributor is deliberately the oldest future mtime,
+			// just beyond the first capped batch.
+			window = `"secondary":{"used_percent":73,"window_minutes":10080}`
+		}
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{%s}}`, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := now.Add(time.Duration(total-i) * time.Hour)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	startingCursor := codexRolloutScanCursor{mtimeNs: now.Add(-time.Second).UnixNano()}
+	firstContributors, _, _, firstProgress, ok := codexRolloutFallbackBuckets(context.Background(), base, now, startingCursor)
+	if !ok || firstProgress == nil || firstProgress.futureCursor == "" || firstProgress.futureComplete {
+		t.Fatalf("ok=%v progress=%+v, want unfinished first future batch", ok, firstProgress)
+	}
+	if firstProgress.futureAnchorNs != now.UnixNano() {
+		t.Fatalf("future anchor=%d, want initial gather time %d", firstProgress.futureAnchorNs, now.UnixNano())
+	}
+	if len(firstContributors[codexWindowSecondary]) != 0 {
+		t.Fatal("first capped batch unexpectedly consumed the oldest weekly rollout")
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, firstProgress, base,
+	)
+	caughtUp := now.Add(time.Duration(total+2) * time.Hour)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, caughtUp)
+	if cursor.futureAnchorNs != now.UnixNano() {
+		t.Fatalf("reloaded future anchor=%d, want %d", cursor.futureAnchorNs, now.UnixNano())
+	}
+	candidates, complete := codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted rediscovery after clock catch-up")
+	}
+	eligible := codexUnconsumedRolloutCandidates(candidates, cursor, caughtUp)
+	if len(eligible) != 1 {
+		t.Fatalf("eligible=%d, want only the unread oldest rollout after clock catch-up", len(eligible))
+	}
+
+	lastContributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, caughtUp, cursor)
+	if !ok || completed == nil || completed.futureComplete || completed.futureFingerprint != "" {
+		t.Fatalf("ok=%v progress=%+v, want caught-up future cohort retired", ok, completed)
+	}
+	foundWeekly := false
+	for _, bucket := range lastContributors[codexWindowSecondary] {
+		if bucket.UsedPercentage == 73 {
+			foundWeekly = true
+		}
+	}
+	if !foundWeekly {
+		t.Fatalf("contributors=%+v, want oldest rollout's distinct weekly metric", lastContributors)
+	}
+
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, lastContributors, nil, false, nil, false, caughtUp, fingerprint, completed, base,
+	)
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, caughtUp)
+	newestCohortMtime := now.Add(time.Duration(total) * time.Hour)
+	if cursor.mtimeNs != newestCohortMtime.UnixNano() {
+		t.Fatalf("normal high-water=%d, want completed cohort mtime %d", cursor.mtimeNs, newestCohortMtime.UnixNano())
+	}
+	if cursor.futureAnchorNs != 0 || cursor.futureFingerprint != "" || cursor.futureCursor != "" || cursor.futureComplete {
+		t.Fatalf("cursor=%+v, want caught-up future cohort retired", cursor)
+	}
+
+	nextPath := filepath.Join(dir, "rollout-after-future-catch-up.jsonl")
+	nextContents := `{"timestamp":"2026-08-27T08:00:00Z","type":"session_meta"}` + "\n" +
+		`{"timestamp":"2026-08-27T08:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":88,"window_minutes":300}}}` + "\n"
+	if err := os.WriteFile(nextPath, []byte(nextContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nextMtime := caughtUp.Add(-time.Second)
+	if err := os.Chtimes(nextPath, nextMtime, nextMtime); err != nil {
+		t.Fatal(err)
+	}
+	candidates, complete = codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted discovery after future cohort retirement")
+	}
+	eligible = codexUnconsumedRolloutCandidates(candidates, cursor, caughtUp)
+	if len(eligible) != 1 || eligible[0].path != nextPath {
+		t.Fatalf("eligible=%+v, want only the newly created normal rollout", eligible)
+	}
+}
+
+func TestCodexSelectNewestRolloutCandidates_SplitsCapacityAcrossReserves(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	boundary := now.Add(-time.Hour)
+	futureMtime := now.Add(24 * time.Hour)
+	candidates := make([]codexRolloutCandidate, 0, 3*codexRolloutScanFileCap)
+	for i := range codexRolloutScanFileCap {
+		candidates = append(candidates, codexRolloutCandidate{
+			path:  fmt.Sprintf("newer-%02d", i),
+			mtime: boundary.Add(time.Minute),
+		})
+		candidates = append(candidates, codexRolloutCandidate{
+			path:  fmt.Sprintf("boundary-%02d", i),
+			mtime: boundary,
+		})
+		candidates = append(candidates, codexRolloutCandidate{
+			path:  fmt.Sprintf("cohort-%02d", i),
+			mtime: futureMtime,
+		})
+	}
+
+	selected, complete := codexSelectNewestRolloutCandidates(
+		context.Background(), candidates, now, codexRolloutScanFileCap,
+		[]codexRolloutReserve{
+			codexRolloutBoundaryReserve(boundary.UnixNano()),
+			codexRolloutFutureCohortReserve(now, futureMtime.UnixNano(), futureMtime.UnixNano()),
+		}, nil, "", "",
+	)
+	if !complete || len(selected) != codexRolloutScanFileCap {
+		t.Fatalf("complete=%v selected=%d, want a full uninterrupted batch", complete, len(selected))
+	}
+	share := codexRolloutScanFileCap / 3
+	counts := map[string]int{}
+	for _, candidate := range selected {
+		switch {
+		case candidate.mtime.Equal(futureMtime):
+			counts["cohort"]++
+		case candidate.mtime.Equal(boundary):
+			counts["boundary"]++
+		default:
+			counts["ordinary"]++
+		}
+	}
+	if counts["boundary"] != share || counts["cohort"] != share {
+		t.Fatalf("counts=%v, want %d reserved slots for each starved group", counts, share)
+	}
+	if counts["ordinary"] <= share {
+		t.Fatalf("counts=%v, want the ordinary rank to keep the largest share for fresh evidence", counts)
+	}
+}
+
+// A normal-time backlog cursor can only move forward by opening its own unread
+// members, and its cohort ceiling rises to the newest normal-time mtime on every
+// completed pass — so a cap-sized batch of rollouts created above that ceiling
+// takes every ordinary slot while the saved cutoff is deliberately held in
+// place. Repeat that per refresh and the unread tail is starved indefinitely,
+// stranding a metered limit no newer rollout restates.
+func TestCodexRolloutFallbackBuckets_NewerArrivalsCannotStarveBacklogTail(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "backlog-starvation@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	writeRollout := func(name, window string, mtime time.Time) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{%s}}`, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	// The tail this first pass cannot reach holds the only weekly reading; its
+	// newest unread member is where a reserved slot has to resume.
+	tailDepth := 12
+	oldestMtime := now.Add(-30 * time.Minute)
+	for i := range codexRolloutScanFileCap + tailDepth {
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == tailDepth-1 {
+			window = `"secondary":{"used_percent":73,"window_minutes":10080}`
+		}
+		writeRollout(
+			fmt.Sprintf("rollout-backlog-%05d.jsonl", i), window,
+			oldestMtime.Add(time.Duration(i)*time.Second),
+		)
+	}
+
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || first == nil || first.backlogCursor == "" || first.backlogMtimeNs == 0 {
+		t.Fatalf("ok=%v progress=%+v, want a capped first batch and resumable backlog progress", ok, first)
+	}
+	if len(firstContributors[codexWindowSecondary]) != 0 {
+		t.Fatal("first capped batch unexpectedly reached the unread tail's weekly rollout")
+	}
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, first, base,
+	)
+
+	// A whole capped batch of newer rollouts arrives above the saved ceiling, so
+	// every one of them outranks every unread member of the cohort.
+	arrivalMtime := now.Add(-10 * time.Minute)
+	arrivals := map[string]struct{}{}
+	for j := range codexRolloutScanFileCap {
+		arrivals[writeRollout(
+			fmt.Sprintf("rollout-arrival-%05d.jsonl", j),
+			fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 11+j),
+			arrivalMtime.Add(time.Duration(j)*time.Second),
+		)] = struct{}{}
+	}
+
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.backlogCursor == "" || cursor.backlogMtimeNs != first.backlogMtimeNs {
+		t.Fatalf("reloaded cursor=%+v, want the unfinished saved cohort", cursor)
+	}
+	contributors, _, _, resumed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || resumed == nil {
+		t.Fatalf("ok=%v progress=%+v, want a usable pass", ok, resumed)
+	}
+	weekly := float64(0)
+	for _, bucket := range contributors[codexWindowSecondary] {
+		weekly = bucket.UsedPercentage
+	}
+	if weekly != 73 {
+		t.Fatalf("weekly=%v, want the reserved backlog slots to reconcile the unread "+
+			"tail's 73%% weekly limit instead of yielding every slot to the arrivals", weekly)
+	}
+	if resumed.backlogCursor == "" || resumed.backlogCursor == cursor.backlogCursor {
+		t.Fatalf("progress=%+v, want the backlog cursor to march past the saved cutoff %q",
+			resumed, cursor.backlogCursor)
+	}
+	if resumed.backlogMtimeNs != cursor.backlogMtimeNs {
+		t.Fatalf("cohort ceiling=%d, want the saved ceiling %d held so the arrivals this "+
+			"batch had to give up stay outside the cohort", resumed.backlogMtimeNs, cursor.backlogMtimeNs)
+	}
+
+	// The reserve evicts newer candidates from the ordinary rank, so none of the
+	// arrivals may be recorded as consumed by the deeper cursor this pass saved.
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, resumed, base,
+	)
+	next := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	candidates, discovered := codexDiscoverRolloutCandidates(context.Background(), base, next)
+	if !discovered {
+		t.Fatal("discovery did not complete")
+	}
+	offered := 0
+	for _, candidate := range codexUnconsumedRolloutCandidates(candidates, next, now) {
+		if _, ok := arrivals[candidate.path]; ok {
+			offered++
+		}
+	}
+	if offered != codexRolloutScanFileCap {
+		t.Fatalf("eligible arrivals=%d, want all %d still offered after the reserved "+
+			"batch evicted some of them", offered, codexRolloutScanFileCap)
+	}
+}
+
+// A future-dated rollout that lands above an unfinished cohort's saved ceiling is
+// scanned outside that cohort and outranks every member of it. A full batch of
+// such arrivals must not leave the cohort's own cursor unchanged forever: its
+// older members hold quota evidence no newer file restates.
+func TestCodexRolloutFallbackBuckets_NewerFutureArrivalsCannotStarveCohort(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "future-starvation@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	cohortMtime := now.Add(24 * time.Hour)
+	arrivalMtime := cohortMtime.Add(time.Hour)
+	writeRollout := func(name string, percent int, mtime time.Time) {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(
+				`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`,
+				percent,
+			) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range codexRolloutScanFileCap + 1 {
+		writeRollout(fmt.Sprintf("rollout-cohort-%02d.jsonl", i), 41+i, cohortMtime)
+	}
+
+	startingCursor := codexRolloutScanCursor{mtimeNs: now.Add(-time.Second).UnixNano()}
+	contributors, _, _, progress, ok := codexRolloutFallbackBuckets(context.Background(), base, now, startingCursor)
+	if !ok || progress == nil || progress.futureCursor == "" || progress.futureComplete {
+		t.Fatalf("ok=%v progress=%+v, want an unfinished capped future cohort", ok, progress)
+	}
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, contributors, nil, false, nil, false, now, fingerprint, progress, base,
+	)
+
+	// A whole capped batch of newer future-dated rollouts arrives above the saved
+	// ceiling, so every one of them outranks the single unread cohort member.
+	for i := range codexRolloutScanFileCap {
+		writeRollout(fmt.Sprintf("rollout-arrival-%02d.jsonl", i), 11+i, arrivalMtime)
+	}
+
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.futureCursor == "" || cursor.futureComplete ||
+		cursor.futureCeilingNs != cohortMtime.UnixNano() {
+		t.Fatalf("reloaded cursor=%+v, want the bounded unfinished cohort", cursor)
+	}
+	_, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || completed == nil {
+		t.Fatalf("ok=%v progress=%+v, want a usable pass", ok, completed)
+	}
+	if !completed.futureComplete || completed.futureCursor != "" {
+		t.Fatalf("progress=%+v, want the reserved cohort slot to finish the cohort "+
+			"instead of yielding every slot to the newer arrivals", completed)
+	}
+	if completed.futureCeilingNs != cohortMtime.UnixNano() {
+		t.Fatalf("cohort ceiling=%d, want the saved bounds preserved so the later "+
+			"arrivals are still scanned outside the cohort", completed.futureCeilingNs)
+	}
+}
+
+// A retry rotation can open a cohort member ranked below one it evicted, so the
+// pass's picks are no longer one contiguous run from the cohort head. The
+// positional boundary cursor must stop at that gap: healthy entries do not
+// bypass it the way retry identities do, so recording the lowest selected member
+// would treat the intervening unread rollouts as consumed and their distinct
+// quota evidence would never be merged.
+func TestCodexRolloutBoundaryProgress_StopsAtRotationGap(t *testing.T) {
+	now := time.Now().Add(-time.Hour).Truncate(time.Second)
+	mtimeNs := now.UnixNano()
+	candidate := func(name string) codexRolloutCandidate {
+		return codexRolloutCandidate{
+			path:       name,
+			boundaryID: name + ".jsonl",
+			mtime:      now,
+			size:       128,
+		}
+	}
+	// Equal-mtime members rank by filename descending: e, d, c, b, a.
+	all := []codexRolloutCandidate{
+		candidate("e"), candidate("d"), candidate("c"), candidate("b"), candidate("a"),
+	}
+	// The rotation kept the highest-ranked retry and reopened the lowest one,
+	// leaving the healthy d/c/b unread between them.
+	selected := []codexRolloutCandidate{all[0], all[4]}
+	retries := map[string]struct{}{
+		codexRolloutBacklogEntryDigest(all[0]): {},
+		codexRolloutBacklogEntryDigest(all[4]): {},
+	}
+
+	progress := codexRolloutBoundaryProgress(all, all, selected, mtimeNs)
+	if progress.boundaryCursor == "" {
+		t.Fatalf("boundaryCursor is empty, want the contiguous prefix recorded")
+	}
+	if want := codexRolloutBoundaryEntryDigest(all[0]); progress.boundaryCursor != want {
+		t.Fatalf("boundaryCursor=%q, want the deepest contiguous pick %q (not the rotated-in tail)",
+			progress.boundaryCursor, want)
+	}
+
+	cursor := codexRolloutScanCursor{
+		mtimeNs:             progress.mtimeNs,
+		boundaryFingerprint: progress.boundaryFingerprint,
+		boundaryCursor:      progress.boundaryCursor,
+	}
+	eligible := codexUnconsumedRolloutCandidates(all, cursor, time.Now())
+	for _, want := range []string{"d", "c", "b"} {
+		found := false
+		for _, remaining := range eligible {
+			if remaining.path == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("eligible=%v, want unread healthy boundary member %q still scannable",
+				rolloutCandidatePaths(eligible), want)
+		}
+	}
+	// The retry identities stay eligible on their own rotation rules; the cursor
+	// itself must not be what keeps them alive.
+	if len(retries) != 2 {
+		t.Fatalf("retries=%d, want the two rotated retry identities", len(retries))
+	}
+}
+
+// Same defect on the anchored future cohort: its positional cursor is also
+// recorded from the pass's picks, so a rotation gap must bound it too.
+func TestCodexRolloutFutureProgress_StopsAtRotationGap(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	candidate := func(name string, ahead time.Duration) codexRolloutCandidate {
+		return codexRolloutCandidate{
+			path:       name,
+			boundaryID: name + ".jsonl",
+			mtime:      now.Add(ahead),
+			size:       256,
+		}
+	}
+	// Future-dated cohort, newest first: e, d, c, b, a.
+	all := []codexRolloutCandidate{
+		candidate("e", 50*time.Minute),
+		candidate("d", 40*time.Minute),
+		candidate("c", 30*time.Minute),
+		candidate("b", 20*time.Minute),
+		candidate("a", 10*time.Minute),
+	}
+	selected := []codexRolloutCandidate{all[0], all[4]}
+
+	anchorNs, floorNs, ceilingNs, fingerprint, futureCursor, cohortSize, complete :=
+		codexRolloutFutureProgress(all, all, selected, now, codexRolloutScanCursor{})
+	if complete {
+		t.Fatalf("complete=true, want an unfinished cohort with three members unread")
+	}
+	if fingerprint == "" || cohortSize != len(all) {
+		t.Fatalf("fingerprint=%q cohortSize=%d, want the full cohort anchored", fingerprint, cohortSize)
+	}
+	if want := codexRolloutFutureEntryDigest(all[0]); futureCursor != want {
+		t.Fatalf("futureCursor=%q, want the deepest contiguous pick %q (not the rotated-in tail)",
+			futureCursor, want)
+	}
+
+	cursor := codexRolloutScanCursor{
+		futureAnchorNs:    anchorNs,
+		futureFloorNs:     floorNs,
+		futureCeilingNs:   ceilingNs,
+		futureFingerprint: fingerprint,
+		futureCursor:      futureCursor,
+		futureCohortSize:  cohortSize,
+	}
+	eligible := codexUnconsumedRolloutCandidates(all, cursor, now)
+	for _, want := range []string{"d", "c", "b"} {
+		found := false
+		for _, remaining := range eligible {
+			if remaining.path == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("eligible=%v, want unread future-cohort member %q still scannable",
+				rolloutCandidatePaths(eligible), want)
+		}
+	}
+}
+
+// The anchored future cohort catches up member by member. Once the clock passes
+// an unread member's mtime, clock-relative ranking would lift it above the saved
+// still-future cutoff and the resume filter would read it as consumed work — the
+// cohort would then look empty, be marked complete, and its distinct evidence
+// would never be read. The cursor is anchored, so its ordering must be too.
+func TestCodexUnconsumedRolloutCandidates_FutureCursorSurvivesPartialCatchUp(t *testing.T) {
+	anchorTime := time.Now().Truncate(time.Second)
+	candidate := func(name string, ahead time.Duration) codexRolloutCandidate {
+		return codexRolloutCandidate{
+			path:       name,
+			boundaryID: name + ".jsonl",
+			mtime:      anchorTime.Add(ahead),
+			size:       256,
+		}
+	}
+	// Future-dated cohort, newest first: e, d, c, b, a.
+	all := []codexRolloutCandidate{
+		candidate("e", 50*time.Minute),
+		candidate("d", 40*time.Minute),
+		candidate("c", 30*time.Minute),
+		candidate("b", 20*time.Minute),
+		candidate("a", 10*time.Minute),
+	}
+	// A capped pass consumes the newest four contiguously; the oldest stays unread.
+	anchorNs, floorNs, ceilingNs, fingerprint, futureCursor, cohortSize, complete :=
+		codexRolloutFutureProgress(all, all, all[:4], anchorTime, codexRolloutScanCursor{})
+	if complete || futureCursor == "" {
+		t.Fatalf("complete=%v futureCursor=%q, want an unfinished cohort with %q unread",
+			complete, futureCursor, all[4].path)
+	}
+	if want := codexRolloutFutureEntryDigest(all[3]); futureCursor != want {
+		t.Fatalf("futureCursor=%q, want the deepest contiguous pick %q", futureCursor, want)
+	}
+	cursor := codexRolloutScanCursor{
+		futureAnchorNs:    anchorNs,
+		futureFloorNs:     floorNs,
+		futureCeilingNs:   ceilingNs,
+		futureFingerprint: fingerprint,
+		futureCursor:      futureCursor,
+		futureCohortSize:  cohortSize,
+	}
+
+	// The clock advances past the unread member only: "a" is now normal-time while
+	// the saved cutoff "b" and everything above it is still ahead of the clock.
+	later := anchorTime.Add(15 * time.Minute)
+	if !all[3].mtime.After(later) || all[4].mtime.After(later) {
+		t.Fatalf("test setup: want only %q to have crossed the clock", all[4].path)
+	}
+	eligible := codexUnconsumedRolloutCandidates(all, cursor, later)
+	if got := rolloutCandidatePaths(eligible); len(got) != 1 || got[0] != all[4].path {
+		t.Fatalf("eligible=%v, want only the unread cohort member %q — the caught-up "+
+			"member must not be ranked as consumed, and consumed members must not reopen",
+			got, all[4].path)
+	}
+
+	// Reading it finishes the cohort rather than retiring it with evidence unread.
+	_, _, _, _, nextCursor, _, nextComplete :=
+		codexRolloutFutureProgress(all, eligible, eligible, later, cursor)
+	if !nextComplete || nextCursor != "" {
+		t.Fatalf("complete=%v cursor=%q, want the cohort finished once %q is read",
+			nextComplete, nextCursor, all[4].path)
 	}
 }

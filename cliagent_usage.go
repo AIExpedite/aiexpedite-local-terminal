@@ -136,6 +136,13 @@ type cliAgentUsageParser interface {
 	Parse(home string, detected detectedCLIAgent, now time.Time) (*cliAgentUsage, bool)
 }
 
+// cliAgentUsageContextParser is implemented only by providers that perform
+// optional bounded I/O during refresh. Existing parsers keep the small Parse
+// contract unchanged.
+type cliAgentUsageContextParser interface {
+	ParseContext(context.Context, string, detectedCLIAgent, time.Time) (*cliAgentUsage, bool)
+}
+
 // cliAgentUsageError carries a per-provider failure record for the
 // terminal-results subscriber. The Go agent emits one entry per provider
 // that panicked, timed out, or couldn't gather. The backend's
@@ -362,7 +369,19 @@ func runProviderParseSafely(
 		}
 	default:
 	}
-	parsed, ok := parser.Parse(home, entry, now)
+	var parsed *cliAgentUsage
+	var ok bool
+	if contextParser, supportsContext := parser.(cliAgentUsageContextParser); supportsContext {
+		parsed, ok = contextParser.ParseContext(ctx, home, entry, now)
+	} else {
+		parsed, ok = parser.Parse(home, entry, now)
+	}
+	if ctx.Err() != nil {
+		return nil, &cliAgentUsageError{
+			Provider: parser.Provider(),
+			Message:  "gather context canceled",
+		}
+	}
 	if !ok || parsed == nil {
 		// Non-fatal "we couldn't enrich this provider" — caller will
 		// still emit the baseline entry. Don't surface as an error.

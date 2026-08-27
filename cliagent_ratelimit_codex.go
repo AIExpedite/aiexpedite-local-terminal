@@ -26,10 +26,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -41,8 +47,14 @@ import (
 // `7d`/`weekly`) onto these stable internal keys so cliagent_usage_codex.go
 // can lookup-by-id without re-implementing the alias table.
 const (
-	codexWindowPrimary   = "primary"
-	codexWindowSecondary = "secondary"
+	codexWindowPrimary                      = "primary"
+	codexWindowSecondary                    = "secondary"
+	codexProviderObservationFutureTolerance = 5 * time.Minute
+	// FAT-style filesystems can report modification times in two-second
+	// increments. When a selected rollout advances beyond the gather's start
+	// time, retain that full overlap so a concurrently created file whose mtime
+	// rounded down before discovery cannot fall permanently below the cursor.
+	codexRolloutCoarseMtimeOverlap = 2 * time.Second
 )
 
 // codexLegacyLimitID is the synthetic contributor id for buckets coming from
@@ -118,6 +130,70 @@ type codexRateLimitSnapshot struct {
 	AccountFingerprint string                                     `json:"accountFingerprint,omitempty"`
 	Buckets            map[string]codexRateLimitBucket            `json:"buckets"`
 	Contributors       map[string]map[string]codexRateLimitBucket `json:"contributors,omitempty"`
+	// RolloutHighWaterMtimeMs is filesystem scan progress, not provider
+	// observation time. It advances after every selected rollout file was either
+	// handled or recorded by redacted identity for retry, allowing completed
+	// siblings to rotate through a capped backlog.
+	RolloutHighWaterMtimeMs int64 `json:"rolloutHighWaterMtimeMs,omitempty"`
+	// RolloutHighWaterMtimeNs preserves the filesystem's full timestamp
+	// precision. The millisecond field remains for backwards compatibility with
+	// snapshots written before same-millisecond appends were handled.
+	RolloutHighWaterMtimeNs int64 `json:"rolloutHighWaterMtimeNs,omitempty"`
+	// RolloutHighWaterBoundaryFingerprint identifies only the files and sizes at
+	// the current mtime boundary. It lets a coarse-resolution filesystem expose
+	// an append whose mtime stayed exactly equal to the high-water without
+	// persisting rollout paths or reopening unchanged files.
+	RolloutHighWaterBoundaryFingerprint string `json:"rolloutHighWaterBoundaryFingerprint,omitempty"`
+	// RolloutHighWaterBoundaryCursor is the SHA-256 digest of the last boundary
+	// entry opened when more equal-mtime files exist than one capped pass can
+	// consume. The digest resumes deterministic ordering without persisting a
+	// rollout path; including file size makes an equal-mtime append reset safely.
+	RolloutHighWaterBoundaryCursor string `json:"rolloutHighWaterBoundaryCursor,omitempty"`
+	// A capped newest-first pass can leave older, distinct-mtime candidates above
+	// the completed high-water. Track the redacted cohort and last opened rank so
+	// later refreshes consume the rest before the main watermark advances. The
+	// cohort ceiling lets an already-consumed active rollout become eligible again
+	// when an append advances its mtime, without restarting the older backlog, and
+	// scopes the fingerprint so a rollout created above that ceiling joins the scan
+	// without discarding progress. RolloutBacklogCohortSize records how many
+	// identities the fingerprint covered so a member that left the cohort upward is
+	// recognised as a removal rather than a membership change.
+	RolloutBacklogFingerprint string `json:"rolloutBacklogFingerprint,omitempty"`
+	RolloutBacklogCursor      string `json:"rolloutBacklogCursor,omitempty"`
+	RolloutBacklogMtimeNs     int64  `json:"rolloutBacklogMtimeNs,omitempty"`
+	RolloutBacklogCohortSize  int    `json:"rolloutBacklogCohortSize,omitempty"`
+	// RolloutRetryEntries contains only SHA-256 identities for rollout files
+	// whose last read was retryable. Keeping these redacted identities separate
+	// lets completed siblings advance the capped backlog while failed files are
+	// re-offered without persisting paths or raw rollout contents.
+	RolloutRetryEntries []string `json:"rolloutRetryEntries,omitempty"`
+	// A retry-only overflow would otherwise reselect the same newest 16 identities
+	// every refresh. The redacted cursor/fingerprint rotate that cohort past the
+	// first capped batch so a recovered older failure can be reopened.
+	RolloutRetryCursor      string `json:"rolloutRetryCursor,omitempty"`
+	RolloutRetryFingerprint string `json:"rolloutRetryFingerprint,omitempty"`
+	// Future-dated rollout mtimes are invalid normal progress: advancing the main
+	// watermark to them could hide normally timestamped files written after a
+	// clock rollback. Track their redacted membership and capped-batch position
+	// separately so unchanged anomalous files are not reopened on every refresh.
+	// The anchor fixes the cohort definition across wall-clock catch-up while an
+	// unfinished capped batch is resumed, and the floor/ceiling close it around the
+	// members that existed when the anchor was saved: an ordinary rollout written
+	// afterwards is also newer than the anchor, so without those bounds it joins
+	// the cohort, changes its fingerprint and discards a cursor whose capped scan
+	// never finished. RolloutFutureMtimeCohortSize records how many members the
+	// fingerprint covered so one leaving the bounds reads as a removal rather than
+	// a membership change.
+	RolloutFutureMtimeAnchorNs    int64  `json:"rolloutFutureMtimeAnchorNs,omitempty"`
+	RolloutFutureMtimeFloorNs     int64  `json:"rolloutFutureMtimeFloorNs,omitempty"`
+	RolloutFutureMtimeCeilingNs   int64  `json:"rolloutFutureMtimeCeilingNs,omitempty"`
+	RolloutFutureMtimeFingerprint string `json:"rolloutFutureMtimeFingerprint,omitempty"`
+	RolloutFutureMtimeCursor      string `json:"rolloutFutureMtimeCursor,omitempty"`
+	RolloutFutureMtimeCohortSize  int    `json:"rolloutFutureMtimeCohortSize,omitempty"`
+	RolloutFutureMtimeComplete    bool   `json:"rolloutFutureMtimeComplete,omitempty"`
+	// RolloutRootFingerprint scopes filesystem progress to the CODEX_HOME tree
+	// that produced it. It is a hash of the normalized root, never the raw path.
+	RolloutRootFingerprint string `json:"rolloutRootFingerprint,omitempty"`
 }
 
 // codexRateLimitMu serialises the read-modify-write of the cache file
@@ -159,13 +235,13 @@ func codexBucketFromInfo(info map[string]interface{}, now time.Time) (codexRateL
 
 	usageObserved := false
 	if v, ok := pickField(info, "used_percent", "usedPercent", "used_percentage", "usedPercentage"); ok {
-		if f, ok := numAsFloat(v); ok {
-			b.UsedPercentage = clampPercent(f)
+		if f, ok := numAsFloat(v); ok && !math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0 && f <= 100 {
+			b.UsedPercentage = f
 			usageObserved = true
 		}
 	} else if v, ok := info["utilization"]; ok {
-		if f, ok := numAsFloat(v); ok {
-			b.UsedPercentage = clampPercent(f * 100)
+		if f, ok := numAsFloat(v); ok && !math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0 && f <= 1 {
+			b.UsedPercentage = f * 100
 			usageObserved = true
 		}
 	}
@@ -955,7 +1031,13 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
 		return
 	}
-	updates, clears, fullSnapshot, present, emptyAuthoritative := extractCodexRateLimitBucketsFull(raw, now)
+	if !isRecognizedCodexRateLimitEnvelope(raw) {
+		return
+	}
+	anchor, observedAt := codexObservationTimes(raw, now, true)
+	updates, clears, fullSnapshot, present, emptyAuthoritative := extractCodexRateLimitBucketsFull(raw, anchor)
+	codexStampContributorObservations(updates, observedAt)
+	updates = codexCanonicalizeContributors(updates)
 	// A full snapshot must be processed even when it carries no buckets and no
 	// explicit nulls IF it is authoritative-empty: an `account/rateLimits/read`
 	// response whose container is literally `{}` declares the account now has NO
@@ -970,6 +1052,128 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 	mergeCodexRateLimitCachePerLimit(codexRateLimitCachePath(), updates, clears, fullSnapshot, present, emptyAuthoritative, now, currentCodexAccountFingerprint())
 }
 
+// isRecognizedCodexRateLimitEnvelope fails closed before typed extraction.
+// Rate-limit-looking fields inside arbitrary tool output, prompts, or response
+// bodies must never become provider evidence.
+func isRecognizedCodexRateLimitEnvelope(raw map[string]interface{}) bool {
+	if method, _ := raw["method"].(string); method == "token_count" || strings.HasPrefix(method, "account/rateLimits/") {
+		return true
+	}
+	if eventType, _ := raw["type"].(string); eventType == "token_count" {
+		return true
+	}
+	for _, key := range []string{"msg", "payload"} {
+		if nested, ok := raw[key].(map[string]interface{}); ok {
+			if eventType, _ := nested["type"].(string); eventType == "token_count" {
+				return true
+			}
+		}
+	}
+	if params, ok := raw["params"].(map[string]interface{}); ok {
+		if msg, ok := params["msg"].(map[string]interface{}); ok {
+			if eventType, _ := msg["type"].(string); eventType == "token_count" {
+				return true
+			}
+		}
+	}
+	// A direct result container is the response shape for
+	// account/rateLimits/read. Requiring JSON-RPC framing prevents an arbitrary
+	// application object containing `result.rateLimits` from being trusted.
+	if raw["jsonrpc"] == "2.0" {
+		if result, ok := raw["result"].(map[string]interface{}); ok {
+			if _, ok := pickField(result, "rate_limits", "rateLimits", "rate_limits_by_limit_id", "rateLimitsByLimitId"); ok {
+				return true
+			}
+			if msg, ok := result["msg"].(map[string]interface{}); ok {
+				if eventType, _ := msg["type"].(string); eventType == "token_count" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// codexObservationTimes returns the event-time anchor used for relative reset
+// conversion and the safe publication timestamp. Live envelopes commonly omit
+// an event time, so allowFallback uses receive time. Rollout callers pass false:
+// numeric evidence without an enclosing event timestamp is unrankable and must
+// be discarded. Provider clocks up to five minutes ahead are accepted as reset
+// anchors while their published observation is clamped to receive time.
+func codexObservationTimes(raw map[string]interface{}, now time.Time, allowFallback bool) (time.Time, time.Time) {
+	ts, _ := raw["timestamp"].(string)
+	if ts == "" {
+		if allowFallback {
+			return now, now
+		}
+		return time.Time{}, time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil || parsed.After(now.Add(codexProviderObservationFutureTolerance)) {
+		if allowFallback {
+			return now, now
+		}
+		return time.Time{}, time.Time{}
+	}
+	if parsed.After(now) {
+		return parsed, now
+	}
+	return parsed, parsed
+}
+
+func codexStampContributorObservations(contributors map[string]map[string]codexRateLimitBucket, observedAt time.Time) {
+	if observedAt.IsZero() {
+		return
+	}
+	for window, limits := range contributors {
+		for limitID, bucket := range limits {
+			bucket.ObservedAtMs = observedAt.UnixMilli()
+			contributors[window][limitID] = bucket
+		}
+	}
+}
+
+// codexCanonicalizeContributors normalizes the two displayed identities
+// before the slot-keyed cache merge. Codex can report a weekly bucket under
+// `primary` (and vice versa); merging that physical key directly can overwrite a
+// cached session contributor with the same limit id before identity reconciliation
+// gets a chance to preserve both. Apply this to each live or rollout frame before
+// sparse merging so successive frames cannot collapse distinct identities first.
+func codexCanonicalizeContributors(contributors map[string]map[string]codexRateLimitBucket) map[string]map[string]codexRateLimitBucket {
+	type placement struct {
+		sourceSlot string
+		bucket     codexRateLimitBucket
+	}
+	placed := map[string]map[string]placement{}
+	for sourceSlot, limits := range contributors {
+		for limitID, bucket := range limits {
+			targetSlot := sourceSlot
+			switch codexWindowIdentity(bucket.WindowMinutes, sourceSlot) {
+			case codexIdentitySession:
+				targetSlot = codexWindowPrimary
+			case codexIdentityWeekly:
+				targetSlot = codexWindowSecondary
+			}
+			if placed[targetSlot] == nil {
+				placed[targetSlot] = map[string]placement{}
+			}
+			previous, exists := placed[targetSlot][limitID]
+			if !exists || codexPlacementBeats(bucket, sourceSlot, previous.bucket, previous.sourceSlot) {
+				placed[targetSlot][limitID] = placement{sourceSlot: sourceSlot, bucket: bucket}
+			}
+		}
+	}
+
+	out := make(map[string]map[string]codexRateLimitBucket, len(placed))
+	for slot, limits := range placed {
+		out[slot] = make(map[string]codexRateLimitBucket, len(limits))
+		for limitID, p := range limits {
+			out[slot][limitID] = p.bucket
+		}
+	}
+	return out
+}
+
 // mergeCodexRateLimitCache is the flat-shape entry point preserved for callers
 // (and tests) that already aggregated their updates by display window. Each
 // flat entry is recorded as a single contributor under codexLegacyLimitID so
@@ -981,6 +1185,9 @@ func mergeCodexRateLimitCache(path string, updates map[string]codexRateLimitBuck
 	}
 	perLimit := make(map[string]map[string]codexRateLimitBucket, len(updates))
 	for window, bucket := range updates {
+		if bucket.ObservedAtMs <= 0 {
+			bucket.ObservedAtMs = now.UnixMilli()
+		}
 		perLimit[window] = map[string]codexRateLimitBucket{codexLegacyLimitID: bucket}
 	}
 	// Flat callers are pre-aggregated sparse updates, never full snapshots, so
@@ -1019,21 +1226,104 @@ func mergeCodexRateLimitCachePerLimit(
 	now time.Time,
 	fingerprint string,
 ) {
-	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !emptyAuthoritative) {
-		return
+	mergeCodexRateLimitCachePerLimitProgress(path, perLimit, clears, fullSnapshot, present, emptyAuthoritative, now, fingerprint, nil, "")
+}
+
+// mergeCodexRateLimitCachePerLimitProgress is the shared live/rollout
+// reconciler. rolloutHighWater is nil for live capture, which deliberately
+// leaves filesystem progress untouched; a non-nil value is committed in the
+// same atomic write as newly reconciled rollout contributors.
+func mergeCodexRateLimitCachePerLimitProgress(
+	path string,
+	perLimit map[string]map[string]codexRateLimitBucket,
+	clears map[string]bool,
+	fullSnapshot bool,
+	present map[string]bool,
+	emptyAuthoritative bool,
+	now time.Time,
+	fingerprint string,
+	rolloutHighWater *codexRolloutScanProgress,
+	rolloutAccountBase string,
+) {
+	mergeCodexRateLimitCachePerLimitProgressWithLock(
+		path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
+		now, fingerprint, rolloutHighWater, rolloutAccountBase, true,
+	)
+}
+
+// tryMergeCodexRateLimitCachePerLimitProgress performs the rollout cache
+// transaction only when both its process-local and cross-process locks are
+// immediately available. Rollout scans are optional work under a bounded
+// gather; leaving the old cursor untouched is safe because the same normalized
+// evidence will be offered again on the next refresh.
+func tryMergeCodexRateLimitCachePerLimitProgress(
+	path string,
+	perLimit map[string]map[string]codexRateLimitBucket,
+	clears map[string]bool,
+	fullSnapshot bool,
+	present map[string]bool,
+	emptyAuthoritative bool,
+	now time.Time,
+	fingerprint string,
+	rolloutHighWater *codexRolloutScanProgress,
+	rolloutAccountBase string,
+) bool {
+	return mergeCodexRateLimitCachePerLimitProgressWithLock(
+		path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
+		now, fingerprint, rolloutHighWater, rolloutAccountBase, false,
+	)
+}
+
+func mergeCodexRateLimitCachePerLimitProgressWithLock(
+	path string,
+	perLimit map[string]map[string]codexRateLimitBucket,
+	clears map[string]bool,
+	fullSnapshot bool,
+	present map[string]bool,
+	emptyAuthoritative bool,
+	now time.Time,
+	fingerprint string,
+	rolloutHighWater *codexRolloutScanProgress,
+	rolloutAccountBase string,
+	waitForLocks bool,
+) bool {
+	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !emptyAuthoritative && rolloutHighWater == nil) {
+		return false
 	}
-	codexRateLimitMu.Lock()
+	if waitForLocks {
+		codexRateLimitMu.Lock()
+	} else if !codexRateLimitMu.TryLock() {
+		return false
+	}
 	defer codexRateLimitMu.Unlock()
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return
+		return false
 	}
-	lockFile, locked := acquireCrossProcessCacheLock(path)
+	var lockFile *os.File
+	var locked bool
+	if waitForLocks {
+		lockFile, locked = acquireCrossProcessCacheLock(path)
+	} else {
+		lockFile, locked = tryAcquireCrossProcessCacheLock(path)
+		if !locked {
+			return false
+		}
+	}
 	if locked {
 		defer func() {
 			_ = unlockFile(lockFile)
 			_ = lockFile.Close()
 		}()
+	}
+	// A rollout scan validates the active account before it starts, but auth can
+	// change while filesystem I/O is in progress. Revalidate after acquiring the
+	// cache transaction locks so a newly signed-in account's live capture cannot
+	// be cleared and replaced by the earlier account's rollout contributors.
+	// Live capture passes an empty base because its evidence is scoped at receive
+	// time and must remain able to initialize or replace the cache.
+	if rolloutAccountBase != "" && codexAccountFingerprintAtBase(rolloutAccountBase) != fingerprint {
+		return false
 	}
 
 	snap := codexRateLimitSnapshot{
@@ -1048,10 +1338,30 @@ func mergeCodexRateLimitCachePerLimit(
 		if snap.Contributors == nil {
 			snap.Contributors = map[string]map[string]codexRateLimitBucket{}
 		}
+		snap.RolloutRetryEntries = codexRolloutRetryList(codexRolloutRetrySet(snap.RolloutRetryEntries))
 	}
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]codexRateLimitBucket{}
 		snap.Contributors = map[string]map[string]codexRateLimitBucket{}
+		snap.RolloutHighWaterMtimeMs = 0
+		snap.RolloutHighWaterMtimeNs = 0
+		snap.RolloutHighWaterBoundaryFingerprint = ""
+		snap.RolloutHighWaterBoundaryCursor = ""
+		snap.RolloutBacklogFingerprint = ""
+		snap.RolloutBacklogCursor = ""
+		snap.RolloutBacklogMtimeNs = 0
+		snap.RolloutBacklogCohortSize = 0
+		snap.RolloutRetryEntries = nil
+		snap.RolloutRetryCursor = ""
+		snap.RolloutRetryFingerprint = ""
+		snap.RolloutFutureMtimeAnchorNs = 0
+		snap.RolloutFutureMtimeFloorNs = 0
+		snap.RolloutFutureMtimeCeilingNs = 0
+		snap.RolloutFutureMtimeFingerprint = ""
+		snap.RolloutFutureMtimeCursor = ""
+		snap.RolloutFutureMtimeCohortSize = 0
+		snap.RolloutFutureMtimeComplete = false
+		snap.RolloutRootFingerprint = ""
 	}
 	// Migrate legacy cache files written before Contributors existed: each
 	// pre-existing aggregated bucket becomes a single __legacy__ contributor
@@ -1105,6 +1415,13 @@ func mergeCodexRateLimitCachePerLimit(
 				if hadPrev {
 					prev = reflagPersistedCodexBucket(prev)
 				}
+			}
+			// Reprocessing after a partial scan is idempotent. Older provider
+			// evidence for the same contributor can never replace a newer cache
+			// observation, while equal-percentage evidence at a newer timestamp
+			// still advances freshness.
+			if hadPrev && bucket.ObservedAtMs < prev.ObservedAtMs {
+				continue
 			}
 			priorStillLive := hadPrev && prev.ResetsAtMs > nowMs
 			sameLiveWindow := priorStillLive && (!bucket.resetKnown || resetsWithinJitter(bucket.ResetsAtMs, prev.ResetsAtMs))
@@ -1181,18 +1498,68 @@ func mergeCodexRateLimitCachePerLimit(
 	snap.Buckets = aggregateCodexBuckets(snap.Contributors, now)
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
 	snap.AccountFingerprint = fingerprint
+	rolloutRootFingerprint := codexRolloutRootFingerprint(rolloutAccountBase)
+	if rolloutHighWater != nil && snap.RolloutRootFingerprint != rolloutRootFingerprint {
+		// A cursor from another CODEX_HOME is not meaningful in this sessions
+		// tree. Clear it before comparing mtimes so a lower-mtime rollout in the
+		// new root can establish its own completed progress.
+		snap.RolloutHighWaterMtimeMs = 0
+		snap.RolloutHighWaterMtimeNs = 0
+		snap.RolloutHighWaterBoundaryFingerprint = ""
+		snap.RolloutHighWaterBoundaryCursor = ""
+		snap.RolloutBacklogFingerprint = ""
+		snap.RolloutBacklogCursor = ""
+		snap.RolloutBacklogMtimeNs = 0
+		snap.RolloutBacklogCohortSize = 0
+		snap.RolloutRetryEntries = nil
+		snap.RolloutRetryCursor = ""
+		snap.RolloutRetryFingerprint = ""
+		snap.RolloutFutureMtimeAnchorNs = 0
+		snap.RolloutFutureMtimeFloorNs = 0
+		snap.RolloutFutureMtimeCeilingNs = 0
+		snap.RolloutFutureMtimeFingerprint = ""
+		snap.RolloutFutureMtimeCursor = ""
+		snap.RolloutFutureMtimeCohortSize = 0
+		snap.RolloutFutureMtimeComplete = false
+		snap.RolloutRootFingerprint = rolloutRootFingerprint
+	}
+	storedRolloutCursorIsFuture := snap.RolloutHighWaterMtimeNs > now.UnixNano() ||
+		(snap.RolloutHighWaterMtimeNs == 0 && snap.RolloutHighWaterMtimeMs > now.UnixMilli())
+	if rolloutHighWater != nil && (storedRolloutCursorIsFuture || rolloutHighWater.mtimeNs >= snap.RolloutHighWaterMtimeNs) {
+		snap.RolloutHighWaterMtimeNs = rolloutHighWater.mtimeNs
+		snap.RolloutHighWaterMtimeMs = time.Unix(0, rolloutHighWater.mtimeNs).UnixMilli()
+		snap.RolloutHighWaterBoundaryFingerprint = rolloutHighWater.boundaryFingerprint
+		snap.RolloutHighWaterBoundaryCursor = rolloutHighWater.boundaryCursor
+		snap.RolloutBacklogFingerprint = rolloutHighWater.backlogFingerprint
+		snap.RolloutBacklogCursor = rolloutHighWater.backlogCursor
+		snap.RolloutBacklogMtimeNs = rolloutHighWater.backlogMtimeNs
+		snap.RolloutBacklogCohortSize = rolloutHighWater.backlogCohortSize
+		snap.RolloutRetryEntries = append([]string(nil), rolloutHighWater.retryEntries...)
+		snap.RolloutRetryCursor = rolloutHighWater.retryCursor
+		snap.RolloutRetryFingerprint = rolloutHighWater.retryFingerprint
+		snap.RolloutFutureMtimeAnchorNs = rolloutHighWater.futureAnchorNs
+		snap.RolloutFutureMtimeFloorNs = rolloutHighWater.futureFloorNs
+		snap.RolloutFutureMtimeCeilingNs = rolloutHighWater.futureCeilingNs
+		snap.RolloutFutureMtimeFingerprint = rolloutHighWater.futureFingerprint
+		snap.RolloutFutureMtimeCursor = rolloutHighWater.futureCursor
+		snap.RolloutFutureMtimeCohortSize = rolloutHighWater.futureCohortSize
+		snap.RolloutFutureMtimeComplete = rolloutHighWater.futureComplete
+		snap.RolloutRootFingerprint = rolloutRootFingerprint
+	}
 
 	out, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return
+		return false
 	}
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return
+		return false
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		return false
 	}
+	return true
 }
 
 // reflagPersistedCodexBucket restores the usageKnown / resetKnown provenance
@@ -1235,6 +1602,10 @@ func loadCodexRateLimitSnapshot(path string) (codexRateLimitSnapshot, bool) {
 func currentCodexAccountFingerprint() string {
 	home, _ := os.UserHomeDir()
 	base := firstNonEmpty(os.Getenv("CODEX_HOME"), expandHome(home, ".codex"))
+	return codexAccountFingerprintAtBase(base)
+}
+
+func codexAccountFingerprintAtBase(base string) string {
 	if base == "" {
 		return ""
 	}
@@ -1309,112 +1680,899 @@ func codexMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentU
 // reading per contributor.
 const codexRolloutScanFileCap = 16
 
-// codexBackfillUnknownFromRollout fills any Unknown or rolled-over window in
-// `metrics` from Codex's own on-disk session rollout logs.
-//
-// Why this exists: our live cache (codex_rate_limits.json) is fed ONLY by the
-// passive app-server capture in codex_appserver.go, so it stays empty whenever
-// Codex is driven through its own TUI (which never streams through our
-// app-server). Codex persists the exact same `token_count.rate_limits`
-// telemetry to its rollout logs, so a window we never observed live can still
-// be reported from disk — the same source Codex's own `/status` reads.
-//
-// A live captured bucket with a still-future reset is authoritative: it wins
-// over any rollout reading. But when the cache row's reset has already passed,
-// codexMetricFromBucket marks it unobservable
-// — and without this fallback the card would remain unobservable indefinitely
-// for a user who once streamed through the app-server, let the window reset,
-// and then drove Codex only through the TUI (where the new window's usage is
-// only ever written to the rollout log, never back to our cache). So a stale
-// rolled-over cache row is treated as fillable too, identically to Unknown.
-// The rollout scan still runs at most once per call.
-func codexBackfillUnknownFromRollout(metrics []cliAgentUsageMetric, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence, time.Time) {
-	// Map a layout kind to the identity + fallback slot the display path selects
-	// it from — reused by both the rolled-over check below and the rollout fill.
-	identityForKind := func(kind string) (identity, fallbackSlot string, ok bool) {
-		switch kind {
-		case limitKindSession:
-			return codexIdentitySession, codexWindowPrimary, true
-		case limitKindWeekly:
-			return codexIdentityWeekly, codexWindowSecondary, true
-		}
-		return "", "", false
+// Keep part of the optional rollout budget for consuming candidates found by
+// discovery. Otherwise a slow sessions-tree walk can expire the shared child
+// context after finding today's rollout but before opening it, repeating that
+// starvation on every refresh.
+const codexRolloutCandidateReadReserve = time.Second
+
+// Candidate ranking gets only the first half of the post-discovery reserve.
+// The remaining half is kept for opening and reading at least one selected
+// rollout even when a large candidate backlog makes ranking hit its deadline.
+const codexRolloutFileReadReserve = 500 * time.Millisecond
+
+// A single slow rollout must leave a small slice for each later selected file.
+// Without this reserve, the first retryable file can consume the entire child
+// deadline and pin a capped batch forever.
+const codexRolloutLaterFileReserve = 25 * time.Millisecond
+
+// How often candidate ranking rechecks the optional scan budget. Frequent enough
+// that a huge backlog cannot hold the reserve for long, coarse enough that the
+// context check does not dominate the pass itself.
+const codexRolloutCandidateRankCheckInterval = 256
+
+// Directory enumeration is deliberately chunked so a large, slow, or
+// AV-monitored rollout directory cannot trap the optional scan inside one
+// uncancellable os.ReadDir call. The entries are sorted after collection to
+// preserve the newest-date-first traversal of Codex's YYYY/MM/DD layout.
+const codexRolloutReadDirChunkSize = 128
+
+// codexReconcileFromRollout merges direct-run rollout evidence into the same
+// normalized contributor cache populated by terminal-managed stdout. It is
+// intentionally not Unknown-only: a still-live cached percentage may be older
+// than a successful direct run. Newest evidence wins per metric identity and
+// limit id, then the existing most-constrained aggregate determines the row and
+// its observation timestamp.
+func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence, time.Time) {
+	cursor := codexRolloutScanCursorForAccount(base, currentFingerprint, now)
+	latestCachedObservation := codexLatestContributorObservation(codexContributorsForAccount(currentFingerprint))
+	contribs, limit, latestObservation, highWater, ok := codexRolloutFallbackBuckets(ctx, base, now, cursor, latestCachedObservation)
+	// Authentication can change while filesystem I/O is in progress. Never let
+	// an old-account scan clear or overwrite a live capture already scoped to the
+	// newly active account; the next refresh will reconcile under that account.
+	if codexAccountFingerprintAtBase(base) != currentFingerprint {
+		return codexMetricsFromCache(now, currentFingerprint), codexUsageLimitEvidence{}, time.Time{}
 	}
-	// Decide "rolled over → fillable" from the SAME identity-selected bucket the
-	// display path renders, not from a raw storage slot. After identity
-	// supersession a weekly reading can live under the `primary` slot (and a
-	// session under `secondary`), so a slot-keyed rolled-over check would miss the
-	// migrated window and leave a stale concrete 0% row on the card forever — the
-	// exact TUI-recovery case this backfill exists for.
-	cacheParts := codexPartitionByIdentity(codexContributorsForAccount(currentFingerprint))
-	nowMs := now.UnixMilli()
-	cacheRolledOver := func(kind string) bool {
-		identity, fallbackSlot, ok := identityForKind(kind)
-		if !ok {
+	if ok || highWater != nil {
+		tryMergeCodexRateLimitCachePerLimitProgress(
+			codexRateLimitCachePath(), contribs, nil, false, nil, false,
+			now, currentFingerprint, highWater, base,
+		)
+	}
+	return codexMetricsFromCache(now, currentFingerprint), limit, latestObservation
+}
+
+func codexLatestContributorObservation(contribs map[string]map[string]codexRateLimitBucket) time.Time {
+	var latest time.Time
+	for _, limits := range contribs {
+		for _, bucket := range limits {
+			if observed := time.UnixMilli(bucket.ObservedAtMs); bucket.ObservedAtMs > 0 && observed.After(latest) {
+				latest = observed
+			}
+		}
+	}
+	return latest
+}
+
+type codexRolloutScanCursor struct {
+	mtimeNs             int64
+	boundaryFingerprint string
+	boundaryCursor      string
+	backlogFingerprint  string
+	backlogCursor       string
+	backlogMtimeNs      int64
+	backlogCohortSize   int
+	retryEntries        []string
+	retryCursor         string
+	retryFingerprint    string
+	futureFingerprint   string
+	futureCursor        string
+	futureComplete      bool
+	futureAnchorNs      int64
+	futureFloorNs       int64
+	futureCeilingNs     int64
+	futureCohortSize    int
+}
+
+type codexRolloutScanProgress struct {
+	mtimeNs             int64
+	boundaryFingerprint string
+	boundaryCursor      string
+	backlogFingerprint  string
+	backlogCursor       string
+	backlogMtimeNs      int64
+	backlogCohortSize   int
+	retryEntries        []string
+	retryCursor         string
+	retryFingerprint    string
+	futureFingerprint   string
+	futureCursor        string
+	futureComplete      bool
+	futureAnchorNs      int64
+	futureFloorNs       int64
+	futureCeilingNs     int64
+	futureCohortSize    int
+}
+
+// codexRolloutRootFingerprint identifies a CODEX_HOME without persisting its
+// path. Absolute and symlink-resolved normalization prevents equivalent roots
+// from triggering avoidable rescans; Windows paths are case-insensitive.
+func codexRolloutRootFingerprint(base string) string {
+	if base == "" {
+		return ""
+	}
+	normalized, err := filepath.Abs(base)
+	if err != nil {
+		normalized = filepath.Clean(base)
+	}
+	if resolved, err := filepath.EvalSymlinks(normalized); err == nil {
+		normalized = resolved
+	}
+	normalized = filepath.Clean(normalized)
+	if runtime.GOOS == "windows" {
+		normalized = strings.ToLower(normalized)
+	}
+	sum := sha256.Sum256([]byte(normalized))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// codexRolloutScanCursorForAccount separates filesystem progress from provider
+// event time. Completed progress is reusable only for the same account and
+// CODEX_HOME. Legacy/unscoped cursors reset once, then the completed scan writes
+// the root fingerprint. Otherwise legacy caches fall back to the oldest
+// observable aggregate so a newer weekly-bearing file is not hidden by a
+// fresher session row; empty/all-Unknown caches scan from zero.
+func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.Time) codexRolloutScanCursor {
+	snap, ok := loadCodexRateLimitSnapshot(codexRateLimitCachePath())
+	if !ok || snap.AccountFingerprint != currentFingerprint {
+		return codexRolloutScanCursor{}
+	}
+	hasStoredProgress := snap.RolloutHighWaterMtimeNs > 0 || snap.RolloutHighWaterMtimeMs > 0 ||
+		snap.RolloutBacklogCursor != "" || len(snap.RolloutRetryEntries) > 0
+	if hasStoredProgress &&
+		snap.RolloutRootFingerprint != codexRolloutRootFingerprint(base) {
+		return codexRolloutScanCursor{}
+	}
+	if snap.RolloutHighWaterMtimeNs > 0 || snap.RolloutBacklogCursor != "" || len(snap.RolloutRetryEntries) > 0 {
+		// A completed cursor is filesystem progress, so it cannot legitimately
+		// remain ahead of the current clock. This can happen after a clock
+		// rollback or when upgrading a cache written before future mtimes were
+		// clamped. Resetting (rather than capping to now) keeps rollouts written
+		// between the rollback and this gather eligible for discovery.
+		if snap.RolloutHighWaterMtimeNs > now.UnixNano() {
+			return codexRolloutScanCursor{}
+		}
+		return codexRolloutScanCursor{
+			mtimeNs:             snap.RolloutHighWaterMtimeNs,
+			boundaryFingerprint: snap.RolloutHighWaterBoundaryFingerprint,
+			boundaryCursor:      snap.RolloutHighWaterBoundaryCursor,
+			backlogFingerprint:  snap.RolloutBacklogFingerprint,
+			backlogCursor:       snap.RolloutBacklogCursor,
+			backlogMtimeNs:      snap.RolloutBacklogMtimeNs,
+			backlogCohortSize:   snap.RolloutBacklogCohortSize,
+			retryEntries:        codexRolloutRetryList(codexRolloutRetrySet(snap.RolloutRetryEntries)),
+			retryCursor:         snap.RolloutRetryCursor,
+			retryFingerprint:    snap.RolloutRetryFingerprint,
+			futureAnchorNs:      snap.RolloutFutureMtimeAnchorNs,
+			futureFloorNs:       snap.RolloutFutureMtimeFloorNs,
+			futureCeilingNs:     snap.RolloutFutureMtimeCeilingNs,
+			futureFingerprint:   snap.RolloutFutureMtimeFingerprint,
+			futureCursor:        snap.RolloutFutureMtimeCursor,
+			futureCohortSize:    snap.RolloutFutureMtimeCohortSize,
+			futureComplete:      snap.RolloutFutureMtimeComplete,
+		}
+	}
+	if snap.RolloutHighWaterMtimeMs > 0 {
+		mtimeNs := time.UnixMilli(snap.RolloutHighWaterMtimeMs).UnixNano()
+		if mtimeNs > now.UnixNano() {
+			return codexRolloutScanCursor{}
+		}
+		return codexRolloutScanCursor{
+			mtimeNs:           mtimeNs,
+			futureAnchorNs:    snap.RolloutFutureMtimeAnchorNs,
+			futureFloorNs:     snap.RolloutFutureMtimeFloorNs,
+			futureCeilingNs:   snap.RolloutFutureMtimeCeilingNs,
+			futureFingerprint: snap.RolloutFutureMtimeFingerprint,
+			futureCursor:      snap.RolloutFutureMtimeCursor,
+			futureCohortSize:  snap.RolloutFutureMtimeCohortSize,
+			futureComplete:    snap.RolloutFutureMtimeComplete,
+		}
+	}
+	parts := codexPartitionByIdentity(codexContributorsForAccount(currentFingerprint))
+	oldest := int64(0)
+	for _, row := range []struct{ identity, slot string }{
+		{codexIdentitySession, codexWindowPrimary},
+		{codexIdentityWeekly, codexWindowSecondary},
+	} {
+		b, present := codexIdentityDisplayBucket(parts, row.identity, row.slot, now)
+		if !present || b.ObservedAtMs <= 0 || (b.ResetsAtMs > 0 && now.UnixMilli() >= b.ResetsAtMs) {
+			// A legacy snapshot has no completed-scan watermark. If either
+			// display row is absent, scanning from the populated row's timestamp
+			// could permanently hide an older rollout that supplies the missing
+			// identity. Start from zero until both rows are observable.
+			return codexRolloutScanCursor{}
+		}
+		if oldest == 0 || b.ObservedAtMs < oldest {
+			oldest = b.ObservedAtMs
+		}
+	}
+	return codexRolloutScanCursor{mtimeNs: time.UnixMilli(oldest).UnixNano()}
+}
+
+type codexRolloutCandidate struct {
+	path       string
+	boundaryID string
+	mtime      time.Time
+	size       int64
+}
+
+func codexRolloutBoundaryFingerprint(candidates []codexRolloutCandidate, mtimeNs int64) string {
+	entries := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.mtime.UnixNano() == mtimeNs {
+			entries = append(entries, codexRolloutBoundaryEntryDigest(candidate))
+		}
+	}
+	if len(entries) == 0 {
+		return ""
+	}
+	sort.Strings(entries)
+	sum := sha256.Sum256([]byte(strings.Join(entries, "\n")))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func codexRolloutBoundaryEntryDigest(candidate codexRolloutCandidate) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", candidate.boundaryID, candidate.size)))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func codexRolloutFutureEntryDigest(candidate codexRolloutCandidate) string {
+	identity := candidate.boundaryID
+	if identity == "" {
+		identity = candidate.path
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d", identity, candidate.size, candidate.mtime.UnixNano())))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func codexRolloutBacklogEntryDigest(candidate codexRolloutCandidate) string {
+	identity := candidate.boundaryID
+	if identity == "" {
+		identity = candidate.path
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func codexRolloutRetryEntryValid(entry string) bool {
+	if len(entry) != sha256.Size*2 {
+		return false
+	}
+	for _, c := range entry {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
-		b, present := codexIdentityDisplayBucket(cacheParts, identity, fallbackSlot, now)
-		return present && b.ResetsAtMs > 0 && nowMs >= b.ResetsAtMs
 	}
-	fillable := func(m cliAgentUsageMetric) bool {
-		if m.Unknown {
-			return true
-		}
-		return cacheRolledOver(m.Kind)
-	}
+	return true
+}
 
-	anyFillable := false
-	for _, m := range metrics {
-		if fillable(m) {
-			anyFillable = true
+func codexRolloutRetrySet(entries []string) map[string]struct{} {
+	retries := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if codexRolloutRetryEntryValid(entry) {
+			retries[entry] = struct{}{}
+		}
+	}
+	return retries
+}
+
+func codexRolloutRetryList(retries map[string]struct{}) []string {
+	entries := make([]string, 0, len(retries))
+	for entry := range retries {
+		if codexRolloutRetryEntryValid(entry) {
+			entries = append(entries, entry)
+		}
+	}
+	sort.Strings(entries)
+	return entries
+}
+
+func codexRolloutRetryFingerprint(retries map[string]struct{}) string {
+	entries := codexRolloutRetryList(retries)
+	if len(entries) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.Join(entries, "\n")))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// codexRolloutBacklogFingerprint hashes the redacted identities of one saved
+// cohort: the normal-time candidates above the completed watermark and at or
+// below the cohort ceiling, in deterministic discovery order. It also reports
+// how many identities it covered.
+//
+// Scoping to the ceiling is what lets the scan keep marching toward older
+// rollouts on a machine that keeps starting sessions: a rollout created after
+// the cohort was saved sits above the ceiling, is already eligible on its own
+// (the resume filter only suppresses entries at or below the ceiling), and must
+// not be read as a membership change that discards the saved rank cursor.
+// Hashing identities rather than mutable size/mtime state keeps an append to an
+// already-consumed rollout from restarting the cohort as well; when that append
+// carries the file's mtime above the ceiling the cohort simply shrinks, which
+// the size is there to distinguish from a substitution.
+//
+// Residual: on a filesystem whose mtime resolution is coarse enough that an
+// append leaves the timestamp unchanged, that append is invisible to this cohort
+// until a later write crosses a tick boundary and carries the file above the
+// ceiling, where it is re-offered and re-read whole (reconciliation is
+// newest-wins per identity and limit ID, so nothing earlier is lost by the
+// re-read). Folding size into the cohort digest is deliberately not the answer:
+// it cannot say which member changed, so the only available response is to drop
+// the rank cursor, and an actively appended file on such a filesystem would then
+// reset the cursor on every pass and starve the march toward older rollouts.
+// Appends at the completed watermark's own tick are already covered separately,
+// by the size-bearing boundary fingerprint.
+func codexRolloutBacklogFingerprint(candidates []codexRolloutCandidate, cursorMtimeNs, ceilingMtimeNs int64, now time.Time) (string, int) {
+	hash := sha256.New()
+	count := 0
+	for _, candidate := range candidates {
+		mtimeNs := candidate.mtime.UnixNano()
+		if mtimeNs <= cursorMtimeNs || candidate.mtime.After(now) {
+			continue
+		}
+		if ceilingMtimeNs > 0 && mtimeNs > ceilingMtimeNs {
+			continue
+		}
+		_, _ = hash.Write([]byte(codexRolloutBacklogEntryDigest(candidate)))
+		_, _ = hash.Write([]byte{'\n'})
+		count++
+	}
+	if count == 0 {
+		return "", 0
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), count
+}
+
+// codexRolloutBacklogCutoff resolves the saved rank cursor when the stored
+// cohort is still trustworthy. An exact fingerprint match means nothing inside
+// the cohort changed. A strictly smaller cohort means members only left it —
+// an append carries a rollout above the ceiling, where it is re-offered anyway —
+// so the rank cursor still describes consumed work. Residual: a pass that both
+// loses two members and gains one restored file with a preserved in-cohort mtime
+// is accepted, which can leave that one file unread until the cohort completes.
+func codexRolloutBacklogCutoff(candidates []codexRolloutCandidate, cursor codexRolloutScanCursor, now time.Time) (codexRolloutCandidate, bool) {
+	if cursor.backlogCursor == "" || cursor.backlogFingerprint == "" ||
+		cursor.backlogMtimeNs <= cursor.mtimeNs {
+		return codexRolloutCandidate{}, false
+	}
+	fingerprint, size := codexRolloutBacklogFingerprint(candidates, cursor.mtimeNs, cursor.backlogMtimeNs, now)
+	if fingerprint != cursor.backlogFingerprint &&
+		!(cursor.backlogCohortSize > 0 && size < cursor.backlogCohortSize) {
+		return codexRolloutCandidate{}, false
+	}
+	for _, candidate := range candidates {
+		if candidate.mtime.UnixNano() > cursor.mtimeNs && !candidate.mtime.After(now) &&
+			codexRolloutBacklogEntryDigest(candidate) == cursor.backlogCursor {
+			return candidate, true
+		}
+	}
+	return codexRolloutCandidate{}, false
+}
+
+// codexRolloutFutureFingerprint identifies the anomalous-mtime cohort above
+// `anchor`. Positive bounds close that cohort around the members which existed
+// when the anchor was saved: without them every rollout created afterwards — an
+// ordinary current-time one on the next refresh included — is also newer than the
+// anchor, so it changes the fingerprint, discards an unfinished capped cursor and
+// restarts selection while older cohort members stay unread. Later arrivals are
+// scanned on their own, outside the cohort.
+func codexRolloutFutureFingerprint(candidates []codexRolloutCandidate, anchor time.Time, floorNs, ceilingNs int64) (string, int) {
+	entries := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if !codexRolloutInFutureCohort(candidate, anchor, floorNs, ceilingNs) {
+			continue
+		}
+		entries = append(entries, codexRolloutFutureEntryDigest(candidate))
+	}
+	if len(entries) == 0 {
+		return "", 0
+	}
+	sort.Strings(entries)
+	sum := sha256.Sum256([]byte(strings.Join(entries, "\n")))
+	return fmt.Sprintf("%x", sum[:]), len(entries)
+}
+
+func codexRolloutFutureAnchor(cursor codexRolloutScanCursor, now time.Time) time.Time {
+	if cursor.futureFingerprint != "" && cursor.futureAnchorNs > 0 {
+		return time.Unix(0, cursor.futureAnchorNs)
+	}
+	return now
+}
+
+// codexRolloutInFutureCohort reports whether a candidate belongs to the cohort
+// bounded by [floorNs, ceilingNs] above the anchor. Unset bounds leave that side
+// open, which is how a cursor written before the bounds were persisted is read.
+func codexRolloutInFutureCohort(candidate codexRolloutCandidate, anchor time.Time, floorNs, ceilingNs int64) bool {
+	if !candidate.mtime.After(anchor) {
+		return false
+	}
+	mtimeNs := candidate.mtime.UnixNano()
+	if floorNs > 0 && mtimeNs < floorNs {
+		return false
+	}
+	return ceilingNs <= 0 || mtimeNs <= ceilingNs
+}
+
+// codexRolloutFutureCohortBounds are the oldest and newest mtimes above the
+// anchor at the moment the cohort is defined — exactly the open cohort at that
+// instant, so deriving them for a legacy cursor that predates the bounds
+// reproduces the membership that cursor was saved with. Afterwards they keep the
+// cohort fixed: a rollout written later lands at wall-clock time, below a cohort
+// whose members are ahead of the clock, and an appended member climbs above the
+// ceiling — either way it is scanned separately instead of redefining the cohort.
+//
+// Residual: an arrival whose mtime happens to fall inside the bounds is still
+// indistinguishable from a cohort member, so it restarts the cohort as before.
+// Residual: an arrival above the ceiling has no cursor of its own — the main
+// high-water is clamped below the clock and the backlog cursor skips
+// future-dated files — so it is re-offered on every refresh until the clock
+// catches up and codexRolloutFutureCohortCaughtUp retires the anomaly. That
+// repeats a bounded read of the newest evidence rather than losing an older
+// one; codexRolloutFutureCohortReserve is what keeps those repeats from
+// starving the cohort underneath them.
+//
+// Residual: more than codexRolloutScanFileCap arrivals above the same ceiling
+// fill the batch with the newest of them, so an older arrival stays unread
+// until the clock passes its mtime and the ordinary backlog cursor walks it —
+// delayed, never dropped. The cohort reserve does not cover that set at either
+// end of the cohort's life: its bounds stop at the ceiling, so an above-ceiling
+// arrival is outside the reserve whether or not the cohort is complete.
+func codexRolloutFutureCohortBounds(candidates []codexRolloutCandidate, anchor time.Time) (int64, int64) {
+	oldest, newest := int64(0), int64(0)
+	for _, candidate := range candidates {
+		if !candidate.mtime.After(anchor) {
+			continue
+		}
+		mtimeNs := candidate.mtime.UnixNano()
+		if oldest == 0 || mtimeNs < oldest {
+			oldest = mtimeNs
+		}
+		if mtimeNs > newest {
+			newest = mtimeNs
+		}
+	}
+	return oldest, newest
+}
+
+// codexRolloutFutureCohort resolves the saved anomalous-mtime cohort against the
+// current listing and reports whether its rank cursor still describes consumed
+// work. An exact scoped fingerprint match means nothing inside the cohort
+// changed; a strictly smaller cohort means members only left it — an append
+// carries a member above the ceiling, where it is re-offered anyway — which is
+// the same tolerance the backlog cohort uses. Residual: a pass that both loses a
+// member and gains a restored file with a preserved in-cohort mtime is accepted,
+// leaving that one file unread until the cohort completes.
+func codexRolloutFutureCohort(candidates []codexRolloutCandidate, cursor codexRolloutScanCursor, now time.Time) (time.Time, int64, int64, bool) {
+	anchor := codexRolloutFutureAnchor(cursor, now)
+	if cursor.futureFingerprint == "" {
+		return anchor, 0, 0, false
+	}
+	floorNs, ceilingNs := cursor.futureFloorNs, cursor.futureCeilingNs
+	if ceilingNs <= 0 {
+		floorNs, ceilingNs = codexRolloutFutureCohortBounds(candidates, anchor)
+	}
+	fingerprint, size := codexRolloutFutureFingerprint(candidates, anchor, floorNs, ceilingNs)
+	matches := fingerprint == cursor.futureFingerprint ||
+		(cursor.futureCohortSize > 0 && size < cursor.futureCohortSize)
+	return anchor, floorNs, ceilingNs, matches
+}
+
+type codexReadDirResumeState struct {
+	f        *os.File
+	entries  []os.DirEntry
+	complete bool
+	// Per-entry metadata work runs after enumeration reaches EOF, so a listing
+	// can be complete while the caller's budget expires part way through it.
+	// traversal remembers the reverse index still to be processed so the next
+	// bounded refresh continues past that prefix instead of re-Stat-ing the same
+	// newest names forever and never reaching the directory's older entries.
+	traversal    int
+	traversalSet bool
+	// A caller that runs out of budget part way through an interrupted (still
+	// incomplete) listing cannot record a traversal offset, because the entries
+	// it was handed are only ever returned once. pending holds the tail it could
+	// not process so the next bounded refresh replays those names instead of
+	// waiting for the stream to reach EOF to see them again.
+	pending []os.DirEntry
+	gate    chan struct{}
+	refs    int
+	usedAt  time.Time
+}
+
+// How long the metadata pass over an interrupted leaf listing may run after the
+// discovery context is already done. The chunk is bounded, so consuming it is
+// what lets a repeatedly cancelled refresh reach its rollout evidence at all;
+// this caps the overrun so a slow or stalled filesystem cannot spend the
+// parent's sibling reserve on os.Stat calls. Whatever the grace does not cover
+// is preserved for the next refresh rather than dropped. Overridden in tests.
+var codexRolloutPartialLeafGrace = 25 * time.Millisecond
+
+const codexReadDirResumeLimit = 16
+
+var (
+	codexReadDirResumeMu sync.Mutex
+	codexReadDirResumes  = map[string]*codexReadDirResumeState{}
+)
+
+func codexCloseReadDirResume(dir string) {
+	var f *os.File
+	codexReadDirResumeMu.Lock()
+	state := codexReadDirResumes[dir]
+	if state != nil && state.refs == 0 {
+		delete(codexReadDirResumes, dir)
+		f = state.f
+		state.f = nil
+	}
+	codexReadDirResumeMu.Unlock()
+	if f != nil {
+		_ = f.Close()
+	}
+}
+
+// codexReadDirContext returns the directory listing together with the reverse
+// index its caller should start from: len(entries)-1 for a fresh or partial
+// listing, or the position a previous interrupted metadata pass recorded.
+func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, int, bool, error) {
+	// Keep an interrupted directory stream open so the next bounded refresh
+	// resumes after the last complete chunk instead of repeatedly enumerating
+	// the same prefix. Serialize access because os.File's directory offset and
+	// the accumulated listing form one cursor.
+	codexReadDirResumeMu.Lock()
+	state := codexReadDirResumes[dir]
+	if state == nil {
+		state = &codexReadDirResumeState{gate: make(chan struct{}, 1)}
+		state.gate <- struct{}{}
+		codexReadDirResumes[dir] = state
+	}
+	state.refs++
+	state.usedAt = time.Now()
+	codexReadDirResumeMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		codexReadDirResumeRelease(dir, state, false)
+		return nil, 0, false, ctx.Err()
+	case <-state.gate:
+	}
+	// An open stream, accumulated entries, or a completed listing means this
+	// invocation did not enumerate the directory from a fresh snapshot. The
+	// caller may consume its entries, but must require one fresh pass before
+	// advancing filesystem progress: a file created in an already-consumed
+	// prefix is not guaranteed to appear when the stream later reaches EOF.
+	resumed := state.f != nil || len(state.entries) > 0 || state.complete
+	remove := false
+	defer func() {
+		state.gate <- struct{}{}
+		codexReadDirResumeRelease(dir, state, remove)
+	}()
+	// A reader that reached EOF can remain in the map while callers that were
+	// already queued still hold references to it. Reuse its complete listing;
+	// reopening here would append every directory entry a second time.
+	if state.complete {
+		// The retained listing is what carries the metadata-traversal position, so
+		// it is retired by codexRecordReadDirTraversal once a caller works through
+		// it rather than by the first reader that consumes it. It already contains
+		// every name an interrupted hand-off left pending, so drop that replay
+		// queue rather than offering the same entries twice.
+		codexDropPendingReplay(state)
+		return append([]os.DirEntry(nil), state.entries...), codexReadDirTraversalStart(state), true, nil
+	}
+	if state.f == nil {
+		f, err := os.Open(dir)
+		if err != nil {
+			remove = true
+			return nil, 0, resumed, err
+		}
+		state.f = f
+	}
+	// Entries accumulated before this invocation were already returned to the
+	// previous discovery pass. If this invocation is interrupted too, return
+	// only its newly completed chunks so cancellation cannot trigger an
+	// ever-growing replay of duplicate metadata work.
+	firstNew := len(state.entries)
+
+	for {
+		if err := ctx.Err(); err != nil {
+			partial := codexTakePendingReplay(state, append([]os.DirEntry(nil), state.entries[firstNew:]...))
+			return partial, len(partial) - 1, resumed, err
+		}
+		batch, readErr := state.f.ReadDir(codexRolloutReadDirChunkSize)
+		state.entries = append(state.entries, batch...)
+		if readErr == io.EOF {
+			_ = state.f.Close()
+			state.f = nil
+			state.complete = true
 			break
 		}
+		if readErr != nil {
+			entries := codexTakePendingReplay(state, append([]os.DirEntry(nil), state.entries[firstNew:]...))
+			_ = state.f.Close()
+			state.f = nil
+			remove = true
+			return entries, len(entries) - 1, resumed, readErr
+		}
 	}
-	if !anyFillable {
-		// Every window is already observable, so there is nothing to backfill and
-		// no reason to pay for the scan — and equally no reason to report an
-		// exhaustion that fresh usage numbers already supersede.
-		return metrics, codexUsageLimitEvidence{}, time.Time{}
-	}
+	entries := state.entries
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+	return entries, codexReadDirTraversalStart(state), resumed, nil
+}
 
-	contribs, limit, latestObservation, ok := codexRolloutFallbackBuckets(base, now)
+func codexReadDirTraversalStart(state *codexReadDirResumeState) int {
+	if state.traversalSet && state.traversal >= 0 && state.traversal < len(state.entries) {
+		return state.traversal
+	}
+	return len(state.entries) - 1
+}
+
+// codexRecordReadDirTraversal stores how far a caller processed a completed
+// listing. next is the reverse index still to be handled; a negative value means
+// the listing is exhausted, which retires the retained state so the following
+// refresh enumerates the directory from a fresh snapshot and can once again
+// authorize completed-scan progress.
+// codexTakePendingReplay appends the tail an earlier interrupted caller could
+// not process to the entries this invocation newly enumerated. Callers walk the
+// returned slice from its end, so replayed names go last and drain before the
+// newer ones rather than being deferred again.
+func codexTakePendingReplay(state *codexReadDirResumeState, fresh []os.DirEntry) []os.DirEntry {
+	codexReadDirResumeMu.Lock()
+	pending := state.pending
+	state.pending = nil
+	codexReadDirResumeMu.Unlock()
+	if len(pending) == 0 {
+		return fresh
+	}
+	return append(fresh, pending...)
+}
+
+func codexDropPendingReplay(state *codexReadDirResumeState) {
+	codexReadDirResumeMu.Lock()
+	state.pending = nil
+	codexReadDirResumeMu.Unlock()
+}
+
+// codexRecordReadDirPending preserves entries handed out by an interrupted
+// listing that their caller could not process within its budget. An incomplete
+// listing has no traversal offset to record — its entries are returned once and
+// then advance past firstNew — so without this they would only reappear once the
+// stream finally reached EOF.
+func codexRecordReadDirPending(dir string, remaining []os.DirEntry) {
+	if len(remaining) == 0 {
+		return
+	}
+	codexReadDirResumeMu.Lock()
+	defer codexReadDirResumeMu.Unlock()
+	state := codexReadDirResumes[dir]
+	if state == nil || state.complete {
+		// The listing was retired by a read failure, or has since reached EOF and
+		// retained the full enumeration. Either way the next refresh surfaces these
+		// names again on its own, so queuing them would only duplicate candidates.
+		return
+	}
+	state.usedAt = time.Now()
+	state.pending = append(state.pending, remaining...)
+}
+
+func codexRecordReadDirTraversal(dir string, next int) {
+	var closeFile *os.File
+	codexReadDirResumeMu.Lock()
+	if state := codexReadDirResumes[dir]; state != nil && state.complete {
+		state.usedAt = time.Now()
+		switch {
+		case next >= 0 && next < len(state.entries):
+			state.traversal, state.traversalSet = next, true
+		case state.refs == 0:
+			delete(codexReadDirResumes, dir)
+			closeFile, state.f = state.f, nil
+		default:
+			// Another reader still holds this listing. Drop the position rather
+			// than the state; that reader restarts from the newest entry, which is
+			// the behaviour a fresh enumeration would give it anyway.
+			state.traversal, state.traversalSet = 0, false
+		}
+	}
+	codexReadDirResumeMu.Unlock()
+	if closeFile != nil {
+		_ = closeFile.Close()
+	}
+}
+
+func codexReadDirResumeRelease(dir string, state *codexReadDirResumeState, remove bool) {
+	var closeStates []*codexReadDirResumeState
+	codexReadDirResumeMu.Lock()
+	state.refs--
+	state.usedAt = time.Now()
+	if remove && state.refs == 0 && codexReadDirResumes[dir] == state {
+		delete(codexReadDirResumes, dir)
+	}
+	for len(codexReadDirResumes) > codexReadDirResumeLimit {
+		var oldestDir string
+		var oldest *codexReadDirResumeState
+		for candidateDir, candidate := range codexReadDirResumes {
+			if candidate.refs == 0 && (oldest == nil || candidate.usedAt.Before(oldest.usedAt)) {
+				oldestDir, oldest = candidateDir, candidate
+			}
+		}
+		if oldest == nil {
+			break
+		}
+		delete(codexReadDirResumes, oldestDir)
+		closeStates = append(closeStates, oldest)
+	}
+	codexReadDirResumeMu.Unlock()
+	for _, candidate := range closeStates {
+		if candidate.f != nil {
+			_ = candidate.f.Close()
+		}
+	}
+}
+
+// codexDiscoverRolloutCandidates walks the fixed YYYY/MM/DD rollout layout
+// newest-first while checking the optional scan context between filesystem
+// entries. Starting with the newest date prevents a large history from starving
+// today's direct-run evidence when the Codex child budget expires. Unlike
+// filepath.Glob, discovery also stops promptly after cancellation. complete is
+// false when cancellation or a metadata error means scan progress must not
+// advance.
+func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor codexRolloutScanCursor) ([]codexRolloutCandidate, bool) {
+	root := filepath.Join(base, "sessions")
+	candidates := []codexRolloutCandidate{}
+	boundaryCandidates := []codexRolloutCandidate{}
+	retryEntries := codexRolloutRetrySet(cursor.retryEntries)
+	complete := true
+	var walkDateLayout func(string, int)
+	walkDateLayout = func(dir string, depth int) {
+		if ctx.Err() != nil {
+			complete = false
+			return
+		}
+		entries, start, resumed, err := codexReadDirContext(ctx, dir)
+		if resumed {
+			// Resumed directory streams are intentionally retained across bounded
+			// refreshes, but reaching EOF does not prove the accumulated listing
+			// includes files created in a prefix consumed by an earlier refresh.
+			// Consume and persist the discovered evidence, then require one fresh
+			// full enumeration before advancing the completed-scan cursor.
+			complete = false
+		}
+		if err != nil {
+			if depth == 0 && os.IsNotExist(err) {
+				return
+			}
+			complete = false
+			if len(entries) == 0 {
+				return
+			}
+		}
+		// A canceled leaf-directory read can still return a complete chunk of
+		// directory entries. Consume those bounded results so repeated refreshes
+		// can reach their rollout evidence, while keeping discovery incomplete so
+		// the completed-scan cursor does not advance.
+		consumePartialLeaf := err != nil && depth == 3
+		// Cancellation is usually what produced that chunk, so re-checking ctx here
+		// would consume none of it and starve discovery again. Bound the pass by a
+		// short grace instead: it covers the whole chunk on a responsive filesystem
+		// and collapses to a couple of entries on a stalled one.
+		partialLeafDeadline := time.Time{}
+		if consumePartialLeaf {
+			partialLeafDeadline = time.Now().Add(codexRolloutPartialLeafGrace)
+		}
+		// os.ReadDir sorts by filename. Codex's zero-padded YYYY/MM/DD layout
+		// therefore becomes chronological when traversed in reverse.
+		for i := start; i >= 0; i-- {
+			if consumePartialLeaf {
+				if time.Now().After(partialLeafDeadline) {
+					// This listing is incomplete, so there is no traversal offset to
+					// record: these entries were handed out once and the stream has
+					// already advanced past them. Preserve the unprocessed tail so the
+					// next refresh replays it instead of waiting for EOF to see it again.
+					complete = false
+					codexRecordReadDirPending(dir, entries[:i+1])
+					return
+				}
+			} else if ctx.Err() != nil {
+				// Enumeration may already have reached EOF; only the metadata pass ran
+				// out of budget. Record where it stopped so the next refresh resumes
+				// below this prefix instead of re-walking it and stalling forever.
+				complete = false
+				codexRecordReadDirTraversal(dir, i)
+				return
+			}
+			entry := entries[i]
+			path := filepath.Join(dir, entry.Name())
+			if depth < 3 {
+				if entry.IsDir() {
+					walkDateLayout(path, depth+1)
+				}
+				continue
+			}
+			if entry.IsDir() {
+				continue
+			}
+			matched, err := filepath.Match("rollout-*.jsonl", entry.Name())
+			if err != nil || !matched {
+				continue
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				// A transient metadata failure leaves this discovery pass incomplete.
+				// We may still consume other candidates, but must not advance progress
+				// past a file whose mtime could not be evaluated.
+				complete = false
+				continue
+			}
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				complete = false
+				continue
+			}
+			candidate := codexRolloutCandidate{path: path, boundaryID: rel, mtime: info.ModTime(), size: info.Size()}
+			_, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]
+			switch mtimeNs := info.ModTime().UnixNano(); {
+			case retry:
+				// Retry identities bypass the completed watermark, but still flow
+				// through the ordinary capped newest-first selection below.
+				candidates = append(candidates, candidate)
+			case mtimeNs > cursor.mtimeNs:
+				candidates = append(candidates, candidate)
+			case cursor.mtimeNs > 0 && mtimeNs == cursor.mtimeNs:
+				boundaryCandidates = append(boundaryCandidates, candidate)
+			}
+		}
+		codexRecordReadDirTraversal(dir, -1)
+	}
+	walkDateLayout(root, 0)
+	// Exact-mtime equality normally means the boundary is unchanged. On coarse
+	// filesystems, however, an append can increase a rollout's size without
+	// changing its reported mtime. Compare a redacted metadata fingerprint and
+	// rescan equality only when that boundary changed (or once for a legacy cache
+	// that predates fingerprints).
+	if len(boundaryCandidates) > 0 &&
+		(cursor.boundaryCursor != "" || cursor.boundaryFingerprint == "" ||
+			codexRolloutBoundaryFingerprint(boundaryCandidates, cursor.mtimeNs) != cursor.boundaryFingerprint) {
+		candidates = append(candidates, boundaryCandidates...)
+	}
+	return candidates, complete
+}
+
+func codexRolloutDiscoveryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
 	if !ok {
-		return metrics, limit, latestObservation
+		return ctx, func() {}
 	}
+	remaining := time.Until(deadline)
+	reserve := codexRolloutCandidateReadReserve
+	if remaining <= reserve {
+		reserve = remaining / 2
+	}
+	return context.WithDeadline(ctx, deadline.Add(-reserve))
+}
 
-	// Partition the rollout-derived per-limit contributors by metric identity,
-	// exactly as the cache display path does, so fill is identity-gated: the
-	// session row is only ever filled from a session-identity reading (including a
-	// duration-less primary), and a weekly-only rollout leaves the session row
-	// Unknown rather than promoting the weekly value into it (AC4). The
-	// contributors are kept per (window, limit) — NOT pre-aggregated per storage
-	// slot — so a rollout frame that carried both a session and a weekly limit
-	// under the same physical slot during bucket migration still surfaces both
-	// identities instead of collapsing into one slot bucket.
-	parts := codexPartitionByIdentity(contribs)
-	fillFor := func(kind string) (codexRateLimitBucket, bool) {
-		identity, fallbackSlot, ok := identityForKind(kind)
-		if !ok {
-			return codexRateLimitBucket{}, false
-		}
-		return codexIdentityDisplayBucket(parts, identity, fallbackSlot, now)
+func codexRolloutCandidateOrderingContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return ctx, func() {}
 	}
+	remaining := time.Until(deadline)
+	reserve := codexRolloutFileReadReserve
+	if remaining <= reserve {
+		reserve = remaining / 2
+	}
+	return context.WithDeadline(ctx, deadline.Add(-reserve))
+}
 
-	for i, m := range metrics {
-		if !fillable(m) {
-			continue
-		}
-		b, present := fillFor(m.Kind)
-		if !present {
-			continue
-		}
-		// Reuse the cache-path renderer so rollout-sourced metrics get the same
-		// window-label derivation and reset-passed → 0% rollover handling. The
-		// metric's existing label is the default Codex window label, which is
-		// the right fallback when the frame carried no window_minutes hint.
-		metrics[i] = codexMetricFromBucket(b, true, m.Kind, m.Label, now)
+func codexRolloutFileContext(ctx context.Context, filesAfter int) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok || filesAfter <= 0 {
+		return ctx, func() {}
 	}
-	return metrics, limit, latestObservation
+	reserve := time.Duration(filesAfter) * codexRolloutLaterFileReserve
+	remaining := time.Until(deadline)
+	if reserve >= remaining {
+		reserve = remaining / 2
+	}
+	return context.WithDeadline(ctx, deadline.Add(-reserve))
 }
 
 // codexUsageLimitNotice renders the card notice for a quota refusal, or "" when
@@ -1465,6 +2623,709 @@ func codexUsageLimitNotice(metrics []cliAgentUsageMetric, limit codexUsageLimitE
 // without waiting days for the truth to catch up.
 const codexUsageLimitNoticeMaxAge = 12 * time.Hour
 
+// codexRolloutCandidateBefore ranks rollout candidates newest-first: normal-time
+// files ahead of future-dated ones (invalid ordering evidence after a clock
+// rollback or a timestamp-preserving restore), then by mtime descending, then by
+// filename so files sharing an mtime break the tie deterministically.
+func codexRolloutCandidateBefore(a, b codexRolloutCandidate, now time.Time) bool {
+	aFuture := a.mtime.After(now)
+	bFuture := b.mtime.After(now)
+	if aFuture != bFuture {
+		return !aFuture
+	}
+	if !a.mtime.Equal(b.mtime) {
+		return a.mtime.After(b.mtime)
+	}
+	return a.path > b.path
+}
+
+// codexInsertNewestRolloutCandidate keeps a fixed-capacity slice in rollout
+// rank order without sorting candidates that cannot enter it.
+func codexInsertNewestRolloutCandidate(selected []codexRolloutCandidate, candidate codexRolloutCandidate, now time.Time, capacity int) []codexRolloutCandidate {
+	if capacity <= 0 || len(selected) == capacity &&
+		!codexRolloutCandidateBefore(candidate, selected[len(selected)-1], now) {
+		return selected
+	}
+	pos := sort.Search(len(selected), func(j int) bool {
+		return codexRolloutCandidateBefore(candidate, selected[j], now)
+	})
+	selected = append(selected, candidate)
+	copy(selected[pos+1:], selected[pos:])
+	selected[pos] = candidate
+	if len(selected) > capacity {
+		selected = selected[:capacity]
+	}
+	return selected
+}
+
+// codexRolloutReserve reports whether a candidate belongs to a group that a
+// capped selection must keep making progress on. Groups are defined by a saved
+// scan cursor whose only way forward is to open its own members, so a group is
+// starved — not merely delayed — when newer arrivals can take every slot.
+type codexRolloutReserve func(codexRolloutCandidate) bool
+
+// codexRolloutBoundaryReserve claims a share of the batch for the unfinished
+// equal-mtime boundary a saved boundary cursor is resuming through.
+func codexRolloutBoundaryReserve(mtimeNs int64) codexRolloutReserve {
+	return func(candidate codexRolloutCandidate) bool {
+		return mtimeNs > 0 && candidate.mtime.UnixNano() == mtimeNs
+	}
+}
+
+// codexRolloutFutureCohortReserve claims a share of the batch for an unfinished
+// anchored future cohort. Every future-dated rollout that arrives above the
+// cohort's saved ceiling is scanned outside it (see codexRolloutFutureCohortBounds)
+// and outranks its members, so a full batch of such arrivals would otherwise
+// leave the cohort cursor unchanged on every refresh and its older members —
+// carrying quota evidence no other file restates — permanently unread.
+func codexRolloutFutureCohortReserve(anchor time.Time, floorNs, ceilingNs int64) codexRolloutReserve {
+	return func(candidate codexRolloutCandidate) bool {
+		return codexRolloutInFutureCohort(candidate, anchor, floorNs, ceilingNs)
+	}
+}
+
+// codexRolloutBacklogReserve claims a share of the batch for the unread tail of
+// the normal-time cohort a saved rank cursor is resuming through: the eligible
+// members ranked after `cutoff` and at or below the cohort ceiling the cursor
+// was saved with.
+//
+// That cohort ceiling rises to the newest normal-time mtime on every completed
+// pass, so a sustained stream of cap-sized arrivals above it keeps the ordinary
+// newest-first selection full while codexRolloutBacklogProgress holds the saved
+// cutoff in place (it deliberately keeps the deeper of this pass's oldest pick
+// and the saved one). Without a reserve the tail is then never selected at all,
+// and a distinct metered limit only an older rollout restates stays
+// unreconciled for as long as the arrival rate holds.
+func codexRolloutBacklogReserve(cutoff codexRolloutCandidate, cursorMtimeNs, ceilingMtimeNs int64, now time.Time) codexRolloutReserve {
+	return func(candidate codexRolloutCandidate) bool {
+		mtimeNs := candidate.mtime.UnixNano()
+		return mtimeNs > cursorMtimeNs && mtimeNs <= ceilingMtimeNs &&
+			!candidate.mtime.After(now) && codexRolloutCandidateBefore(cutoff, candidate, now)
+	}
+}
+
+// codexSelectNewestRolloutCandidates returns the `capacity` highest-ranked
+// candidates in rank order without ordering the rest. A full sort of a large
+// backlog is both O(n log n) and uncancellable, so it can burn the read reserve
+// that codexRolloutDiscoveryContext deliberately kept for opening the files it
+// just found. Selection instead makes one pass in which every candidate past the
+// first `capacity` usually costs a single comparison against the current worst
+// kept entry, and it observes ctx so an exhausted budget stops here with the
+// evidence gathered so far rather than mid-sort. complete is false when the pass
+// was cut short, which keeps the completed-scan cursor from advancing past
+// candidates that were never ranked.
+//
+// Each entry in reserves claims a bounded share of the batch for a group whose
+// saved scan cursor can only advance when that group is opened — an unfinished
+// equal-mtime boundary, an unfinished anchored future cohort that every later
+// future-dated arrival outranks, or the unread tail of an unfinished normal-time
+// backlog whose ceiling every later arrival sits above. Without the reserve an
+// ongoing stream of newer files fills every slot on every refresh and the group
+// is starved permanently. The reserved share is capacity/(len(reserves)+1) each,
+// so the ordinary top-N selection always keeps at least an equal share for fresh
+// evidence and each group still finishes in bounded deterministic batches.
+// When retryEntries fill the ordinary selection, one slot is reserved for the
+// newest non-retry candidate so persistent failures cannot pin an older backlog.
+// When the retry cohort is larger than the slots left for it, a matching retry
+// cursor rotates the retry subset past the previous batch so a recovered older
+// failure is reopened instead of reselecting the same newest identities forever.
+// The rotation covers mixed batches too — fresh files keep their slots, but they
+// no longer suppress rotation through the retries sharing the batch.
+func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexRolloutCandidate, now time.Time, capacity int, reserves []codexRolloutReserve, retryEntries map[string]struct{}, retryCursor, retryFingerprint string) ([]codexRolloutCandidate, bool) {
+	if capacity <= 0 {
+		return nil, true
+	}
+	selected := make([]codexRolloutCandidate, 0, capacity+1)
+	var newestNonRetry codexRolloutCandidate
+	haveNonRetry := false
+	reserveCapacity := capacity / (len(reserves) + 1)
+	if reserveCapacity == 0 {
+		reserveCapacity = 1
+	}
+	reserved := make([][]codexRolloutCandidate, len(reserves))
+	for i, candidate := range candidates {
+		if i%codexRolloutCandidateRankCheckInterval == 0 && ctx.Err() != nil {
+			return selected, false
+		}
+		selected = codexInsertNewestRolloutCandidate(selected, candidate, now, capacity)
+		if _, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]; !retry &&
+			(!haveNonRetry || codexRolloutCandidateBefore(candidate, newestNonRetry, now)) {
+			newestNonRetry, haveNonRetry = candidate, true
+		}
+		for r, member := range reserves {
+			if member(candidate) {
+				reserved[r] = codexInsertNewestRolloutCandidate(reserved[r], candidate, now, reserveCapacity)
+			}
+		}
+	}
+	// Collect every reserved path before merging any of them: one group must not
+	// be able to evict an entry another group already counted toward its reserve.
+	reservedPaths := map[string]struct{}{}
+	for _, group := range reserved {
+		for _, entry := range group {
+			reservedPaths[entry.path] = struct{}{}
+		}
+	}
+	for _, group := range reserved {
+		for _, entry := range group {
+			alreadySelected := false
+			for _, candidate := range selected {
+				if candidate.path == entry.path {
+					alreadySelected = true
+					break
+				}
+			}
+			if alreadySelected {
+				continue
+			}
+			if len(selected) == capacity {
+				// Evict the lowest-ranked non-reserved entry. Truncating the slice
+				// would discard a reserved entry already counted toward a group's
+				// share whenever the ordinary top-N selection included only part of it.
+				evict := len(selected) - 1
+				for ; evict >= 0; evict-- {
+					if _, isReserved := reservedPaths[selected[evict].path]; !isReserved {
+						break
+					}
+				}
+				if evict < 0 {
+					continue
+				}
+				selected = append(selected[:evict], selected[evict+1:]...)
+			}
+			selected = codexInsertNewestRolloutCandidate(selected, entry, now, capacity)
+		}
+	}
+	if haveNonRetry && len(selected) == capacity {
+		hasSelectedNonRetry := false
+		for _, candidate := range selected {
+			if _, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]; !retry {
+				hasSelectedNonRetry = true
+				break
+			}
+		}
+		if !hasSelectedNonRetry {
+			// The ordinary rank is entirely retry work. Replace its lowest-ranked
+			// member; that identity remains in retryEntries and is re-offered on the
+			// next pass while the saved backlog cursor advances past fresh work.
+			selected = selected[:len(selected)-1]
+			selected = codexInsertNewestRolloutCandidate(selected, newestNonRetry, now, capacity)
+		}
+	}
+	if len(candidates) > capacity &&
+		retryCursor != "" && retryFingerprint != "" &&
+		codexRolloutRetryFingerprint(retryEntries) == retryFingerprint {
+		if cutoff, ok := codexRolloutCandidateByDigest(candidates, retryCursor); ok {
+			selected = codexRotateRetryRolloutCandidates(selected, candidates, cutoff, retryEntries, now, capacity)
+		}
+	}
+	return selected, true
+}
+
+func codexRolloutCandidateByDigest(candidates []codexRolloutCandidate, digest string) (codexRolloutCandidate, bool) {
+	for _, candidate := range candidates {
+		if codexRolloutBacklogEntryDigest(candidate) == digest {
+			return candidate, true
+		}
+	}
+	return codexRolloutCandidate{}, false
+}
+
+// codexRotateRetryRolloutCandidates refills the retry slots of an ordinary
+// selection from the retry cohort ranked after `cutoff`, wrapping back to the
+// newest retries once that tail is exhausted.
+//
+// Non-retry members keep their slots: fresh evidence and the newest-non-retry
+// reserve are not part of the retry rotation, and a batch that mixes both must
+// still rotate its retry subset. Otherwise a steady trickle of fresh rollouts —
+// one new session log per refresh, alongside a retry cohort larger than the
+// remaining slots — would reselect the same highest-ranked retries forever and a
+// recovered lower-ranked one would never be reopened.
+func codexRotateRetryRolloutCandidates(selected, candidates []codexRolloutCandidate, cutoff codexRolloutCandidate, retryEntries map[string]struct{}, now time.Time, capacity int) []codexRolloutCandidate {
+	kept := make([]codexRolloutCandidate, 0, capacity+1)
+	retrySlots := 0
+	for _, candidate := range selected {
+		if _, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]; retry {
+			retrySlots++
+			continue
+		}
+		kept = append(kept, candidate)
+	}
+	if retrySlots == 0 {
+		return selected
+	}
+	after := make([]codexRolloutCandidate, 0, retrySlots+1)
+	wrap := make([]codexRolloutCandidate, 0, retrySlots+1)
+	for _, candidate := range candidates {
+		if _, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]; !retry {
+			continue
+		}
+		if codexRolloutCandidateBefore(cutoff, candidate, now) {
+			after = codexInsertNewestRolloutCandidate(after, candidate, now, retrySlots)
+			continue
+		}
+		wrap = codexInsertNewestRolloutCandidate(wrap, candidate, now, retrySlots)
+	}
+	rotated := after
+	for _, candidate := range wrap {
+		if len(rotated) == retrySlots {
+			break
+		}
+		rotated = codexInsertNewestRolloutCandidate(rotated, candidate, now, retrySlots)
+	}
+	for _, candidate := range rotated {
+		kept = codexInsertNewestRolloutCandidate(kept, candidate, now, capacity)
+	}
+	return kept
+}
+
+func codexRolloutRetryRotationProgress(eligible, attempted []codexRolloutCandidate, retryEntries map[string]struct{}) (string, string) {
+	if len(attempted) == 0 || len(retryEntries) == 0 {
+		return "", ""
+	}
+	attemptedIDs := make(map[string]struct{}, len(attempted))
+	// `attempted` is in rollout rank order, so the last still-retryable member is
+	// the lowest-ranked retry this pass opened — where the next batch resumes.
+	// Non-retry members (fresh evidence, the newest-non-retry reserve) and retries
+	// this pass recovered are skipped rather than voiding the rotation: a batch
+	// that mixes fresh work with an overflowing retry cohort still has to record
+	// how far through that cohort it got.
+	cursor := ""
+	for _, candidate := range attempted {
+		digest := codexRolloutBacklogEntryDigest(candidate)
+		attemptedIDs[digest] = struct{}{}
+		if _, retry := retryEntries[digest]; retry {
+			cursor = digest
+		}
+	}
+	if cursor == "" {
+		return "", ""
+	}
+	omitted := false
+	for _, candidate := range eligible {
+		digest := codexRolloutBacklogEntryDigest(candidate)
+		if _, retry := retryEntries[digest]; !retry {
+			continue
+		}
+		if _, ok := attemptedIDs[digest]; !ok {
+			omitted = true
+			break
+		}
+	}
+	if !omitted {
+		return "", ""
+	}
+	return codexRolloutRetryFingerprint(retryEntries), cursor
+}
+
+func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor codexRolloutScanCursor, now time.Time) []codexRolloutCandidate {
+	// Any membership or size change invalidates a positional cursor. Restart the
+	// affected set rather than letting a newly appended/created entry rank ahead
+	// of the saved cutoff and get mistaken for already-consumed evidence.
+	boundaryMatches := cursor.mtimeNs > 0 && cursor.boundaryCursor != "" &&
+		codexRolloutBoundaryFingerprint(candidates, cursor.mtimeNs) == cursor.boundaryFingerprint
+	var boundaryCutoff codexRolloutCandidate
+	boundaryFound := false
+	if boundaryMatches {
+		for _, candidate := range candidates {
+			if candidate.mtime.UnixNano() == cursor.mtimeNs &&
+				codexRolloutBoundaryEntryDigest(candidate) == cursor.boundaryCursor {
+				boundaryCutoff, boundaryFound = candidate, true
+				break
+			}
+		}
+	}
+
+	backlogCutoff, backlogFound := codexRolloutBacklogCutoff(candidates, cursor, now)
+
+	futureAnchor, futureFloorNs, futureCeilingNs, futureMatches := codexRolloutFutureCohort(candidates, cursor, now)
+	var futureCutoff codexRolloutCandidate
+	futureFound := false
+	if futureMatches && !cursor.futureComplete && cursor.futureCursor != "" {
+		for _, candidate := range candidates {
+			if codexRolloutInFutureCohort(candidate, futureAnchor, futureFloorNs, futureCeilingNs) &&
+				codexRolloutFutureEntryDigest(candidate) == cursor.futureCursor {
+				futureCutoff, futureFound = candidate, true
+				break
+			}
+		}
+	}
+
+	retryEntries := codexRolloutRetrySet(cursor.retryEntries)
+	eligible := make([]codexRolloutCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]; retry {
+			eligible = append(eligible, candidate)
+			continue
+		}
+		if backlogFound && candidate.mtime.UnixNano() > cursor.mtimeNs &&
+			candidate.mtime.UnixNano() <= cursor.backlogMtimeNs && !candidate.mtime.After(now) &&
+			!codexRolloutCandidateBefore(backlogCutoff, candidate, now) {
+			continue
+		}
+		if futureMatches && codexRolloutInFutureCohort(candidate, futureAnchor, futureFloorNs, futureCeilingNs) {
+			// Rank the cohort against its own anchor, never the moving clock: every
+			// member is above the anchor by definition, so the ahead-of-now tier in
+			// codexRolloutCandidateBefore collapses and the order stays the one the
+			// cursor was saved with. Ranking against `now` would reorder the cohort
+			// mid-catch-up as members cross the clock — an unread member that just
+			// became normal-time would outrank the still-future cutoff and be
+			// mistaken for consumed work.
+			if cursor.futureComplete ||
+				(futureFound && !codexRolloutCandidateBefore(futureCutoff, candidate, futureAnchor)) {
+				continue
+			}
+		}
+		if boundaryFound && candidate.mtime.UnixNano() == cursor.mtimeNs {
+			// Equal-mtime ties are deterministic. Everything ranked before or at the
+			// saved cutoff was opened by an earlier pass; resume strictly after it.
+			if !codexRolloutCandidateBefore(boundaryCutoff, candidate, now) {
+				continue
+			}
+		}
+		eligible = append(eligible, candidate)
+	}
+	return eligible
+}
+
+func codexRolloutBacklogProgress(candidates, eligible, selected []codexRolloutCandidate, now time.Time, cursor codexRolloutScanCursor) (string, string, int64, int, bool) {
+	cohortMtimeNs := codexRolloutNewestNormalMtimeNs(candidates, cursor.mtimeNs, now)
+	fingerprint, cohortSize := codexRolloutBacklogFingerprint(candidates, cursor.mtimeNs, cohortMtimeNs, now)
+	selectedNormal := make(map[string]struct{}, len(selected))
+	var lastSelected codexRolloutCandidate
+	haveLast := false
+	newestSelectedMtimeNs := cursor.mtimeNs
+	for _, candidate := range selected {
+		if candidate.mtime.UnixNano() <= cursor.mtimeNs || candidate.mtime.After(now) {
+			continue
+		}
+		if candidate.mtime.UnixNano() > newestSelectedMtimeNs {
+			newestSelectedMtimeNs = candidate.mtime.UnixNano()
+		}
+		selectedNormal[codexRolloutFutureEntryDigest(candidate)] = struct{}{}
+		if !haveLast || codexRolloutCandidateBefore(lastSelected, candidate, now) {
+			lastSelected, haveLast = candidate, true
+		}
+	}
+	// `remaining` decides whether the cohort is finished; `rankBound` is the
+	// newest thing this pass left unread and therefore bounds how deep a single
+	// positional cursor may claim. They differ by one rule: equal-mtime overflow
+	// at the newest selected boundary has its own boundary cursor, so it does not
+	// keep the cohort open, but a reserve can still evict such an entry and the
+	// backlog cursor must not be allowed to step over it.
+	remaining := false
+	var rankBound codexRolloutCandidate
+	haveRankBound := false
+	for _, candidate := range eligible {
+		if candidate.mtime.UnixNano() <= cursor.mtimeNs || candidate.mtime.After(now) {
+			continue
+		}
+		if _, ok := selectedNormal[codexRolloutFutureEntryDigest(candidate)]; ok {
+			continue
+		}
+		if !haveRankBound || codexRolloutCandidateBefore(candidate, rankBound, now) {
+			rankBound, haveRankBound = candidate, true
+		}
+		if candidate.mtime.UnixNano() < newestSelectedMtimeNs {
+			remaining = true
+		}
+	}
+	if !remaining {
+		return "", "", 0, 0, true
+	}
+	if !haveLast {
+		return fingerprint, cursor.backlogCursor, cohortMtimeNs, cohortSize, false
+	}
+	// Selection normally ranks the eligible set newest-first, so its picks are one
+	// run contiguous from the newest candidate and its oldest pick is the deepest
+	// safe cursor. A reserve breaks that: it can open members ranked below an
+	// entry it evicted, leaving two disjoint runs. Claim only the run contiguous
+	// with the newest, or the tail loses the evicted entry between them.
+	advance, haveAdvance := lastSelected, true
+	if haveRankBound && !codexRolloutCandidateBefore(advance, rankBound, now) {
+		advance, haveAdvance = codexRolloutDeepestBefore(selected, rankBound, cursor.mtimeNs, now)
+	}
+	saved, savedFound := codexRolloutBacklogCutoff(candidates, cursor, now)
+	if savedFound {
+		// When a batch of rollouts created above the ceiling fills the cap, this
+		// pass's own oldest pick can still be newer than the saved cutoff; keeping
+		// the deeper of the two stops that from replaying the tail. It cannot be
+		// taken past an unread entry, which a reserved batch can leave above it.
+		if haveAdvance && codexRolloutCandidateBefore(advance, saved, now) &&
+			(!haveRankBound || codexRolloutCandidateBefore(saved, rankBound, now)) {
+			advance = saved
+		}
+		// The reserved tail run is contiguous with the region the saved cutoff
+		// already covers, so it can be recorded even when unread newer files sit
+		// above it — as long as the ceiling stays where it was, leaving those files
+		// outside the cohort and still eligible. Prefer it only when it reaches
+		// deeper into the cohort than the advancing form would.
+		if tail, ok := codexRolloutBacklogTailRun(eligible, selectedNormal, saved, cursor, now); ok &&
+			(!haveAdvance || codexRolloutCandidateBefore(advance, tail, now)) {
+			pinnedFingerprint, pinnedSize :=
+				codexRolloutBacklogFingerprint(candidates, cursor.mtimeNs, cursor.backlogMtimeNs, now)
+			return pinnedFingerprint, codexRolloutBacklogEntryDigest(tail), cursor.backlogMtimeNs, pinnedSize, false
+		}
+	}
+	if !haveAdvance {
+		return fingerprint, cursor.backlogCursor, cohortMtimeNs, cohortSize, false
+	}
+	return fingerprint, codexRolloutBacklogEntryDigest(advance), cohortMtimeNs, cohortSize, false
+}
+
+// codexRolloutDeepestBefore returns the oldest-ranked normal-time member of
+// `selected` that still ranks ahead of `bound`.
+func codexRolloutDeepestBefore(selected []codexRolloutCandidate, bound codexRolloutCandidate, cursorMtimeNs int64, now time.Time) (codexRolloutCandidate, bool) {
+	var deepest codexRolloutCandidate
+	found := false
+	for _, candidate := range selected {
+		if candidate.mtime.UnixNano() <= cursorMtimeNs || candidate.mtime.After(now) ||
+			!codexRolloutCandidateBefore(candidate, bound, now) {
+			continue
+		}
+		if !found || codexRolloutCandidateBefore(deepest, candidate, now) {
+			deepest, found = candidate, true
+		}
+	}
+	return deepest, found
+}
+
+// codexRolloutBacklogTailRun reports how far into the saved cohort this pass
+// walked, starting at the saved cutoff and stopping at the first member it did
+// not open. The backlog cursor is one position and everything ranked ahead of it
+// is treated as consumed, so only a run that stays contiguous with the region
+// the cutoff already covers may be recorded.
+func codexRolloutBacklogTailRun(eligible []codexRolloutCandidate, opened map[string]struct{}, cutoff codexRolloutCandidate, cursor codexRolloutScanCursor, now time.Time) (codexRolloutCandidate, bool) {
+	inTail := func(candidate codexRolloutCandidate) bool {
+		mtimeNs := candidate.mtime.UnixNano()
+		return mtimeNs > cursor.mtimeNs && mtimeNs <= cursor.backlogMtimeNs &&
+			!candidate.mtime.After(now) && codexRolloutCandidateBefore(cutoff, candidate, now)
+	}
+	var blocker codexRolloutCandidate
+	haveBlocker := false
+	for _, candidate := range eligible {
+		if _, ok := opened[codexRolloutFutureEntryDigest(candidate)]; ok || !inTail(candidate) {
+			continue
+		}
+		if !haveBlocker || codexRolloutCandidateBefore(candidate, blocker, now) {
+			blocker, haveBlocker = candidate, true
+		}
+	}
+	var deepest codexRolloutCandidate
+	found := false
+	for _, candidate := range eligible {
+		if _, ok := opened[codexRolloutFutureEntryDigest(candidate)]; !ok || !inTail(candidate) {
+			continue
+		}
+		if haveBlocker && !codexRolloutCandidateBefore(candidate, blocker, now) {
+			continue
+		}
+		if !found || codexRolloutCandidateBefore(deepest, candidate, now) {
+			deepest, found = candidate, true
+		}
+	}
+	return deepest, found
+}
+
+func codexRolloutNewestNormalMtimeNs(candidates []codexRolloutCandidate, cursorMtimeNs int64, now time.Time) int64 {
+	newest := cursorMtimeNs
+	for _, candidate := range candidates {
+		mtimeNs := candidate.mtime.UnixNano()
+		if mtimeNs > newest && !candidate.mtime.After(now) {
+			newest = mtimeNs
+		}
+	}
+	return newest
+}
+
+// codexRolloutDeepestContiguous returns the oldest-ranked member of `selected`
+// that still ranks ahead of `bound` — the deepest position a single positional
+// cursor may claim when the pass's picks are not one contiguous run.
+//
+// Retry rotation can open a cohort member ranked below one it evicted, leaving
+// an unselected healthy entry between two selected ones. Healthy entries do not
+// bypass a positional cursor the way retry identities do, so recording the
+// lowest selected member would treat that gap as consumed and the distinct
+// quota evidence behind it would never be read.
+func codexRolloutDeepestContiguous(selected []codexRolloutCandidate, bound codexRolloutCandidate, now time.Time) (codexRolloutCandidate, bool) {
+	var deepest codexRolloutCandidate
+	found := false
+	for _, candidate := range selected {
+		if !codexRolloutCandidateBefore(candidate, bound, now) {
+			continue
+		}
+		if !found || codexRolloutCandidateBefore(deepest, candidate, now) {
+			deepest, found = candidate, true
+		}
+	}
+	return deepest, found
+}
+
+func codexRolloutBoundaryProgress(candidates, eligible, selected []codexRolloutCandidate, mtimeNs int64) codexRolloutScanProgress {
+	// Every boundary member shares `mtimeNs`, so any instant at that mtime orders
+	// them identically.
+	ref := time.Unix(0, mtimeNs)
+	selectedAtBoundary := map[string]struct{}{}
+	selectedList := make([]codexRolloutCandidate, 0, len(selected))
+	var lastSelected codexRolloutCandidate
+	haveLast := false
+	for _, candidate := range selected {
+		if candidate.mtime.UnixNano() == mtimeNs {
+			selectedAtBoundary[codexRolloutBoundaryEntryDigest(candidate)] = struct{}{}
+			selectedList = append(selectedList, candidate)
+			if !haveLast || codexRolloutCandidateBefore(lastSelected, candidate, ref) {
+				lastSelected, haveLast = candidate, true
+			}
+		}
+	}
+	// `rankBound` is the newest boundary member this pass left unread. A retry
+	// rotation can evict an entry ranked above one it opens, so the picks are not
+	// necessarily contiguous and the cursor may not be taken past this bound.
+	remaining := false
+	var rankBound codexRolloutCandidate
+	for _, candidate := range eligible {
+		if candidate.mtime.UnixNano() != mtimeNs {
+			continue
+		}
+		if _, ok := selectedAtBoundary[codexRolloutBoundaryEntryDigest(candidate)]; ok {
+			continue
+		}
+		if !remaining || codexRolloutCandidateBefore(candidate, rankBound, ref) {
+			rankBound, remaining = candidate, true
+		}
+	}
+	boundaryCursor := ""
+	if remaining && haveLast {
+		advance, haveAdvance := lastSelected, true
+		if !codexRolloutCandidateBefore(advance, rankBound, ref) {
+			advance, haveAdvance = codexRolloutDeepestContiguous(selectedList, rankBound, ref)
+		}
+		if haveAdvance {
+			boundaryCursor = codexRolloutBoundaryEntryDigest(advance)
+		}
+	}
+	return codexRolloutScanProgress{
+		mtimeNs:             mtimeNs,
+		boundaryFingerprint: codexRolloutBoundaryFingerprint(candidates, mtimeNs),
+		boundaryCursor:      boundaryCursor,
+	}
+}
+
+func codexRolloutBoundaryHasUnselected(eligible, selected []codexRolloutCandidate, mtimeNs int64) bool {
+	selectedAtBoundary := map[string]struct{}{}
+	for _, candidate := range selected {
+		if candidate.mtime.UnixNano() == mtimeNs {
+			selectedAtBoundary[codexRolloutBoundaryEntryDigest(candidate)] = struct{}{}
+		}
+	}
+	for _, candidate := range eligible {
+		if candidate.mtime.UnixNano() != mtimeNs {
+			continue
+		}
+		if _, ok := selectedAtBoundary[codexRolloutBoundaryEntryDigest(candidate)]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+func codexRolloutHasUnselectedBelowProgress(eligible, selected []codexRolloutCandidate, cursorMtimeNs, progressMtimeNs int64) bool {
+	selectedEntries := make(map[string]struct{}, len(selected))
+	for _, candidate := range selected {
+		selectedEntries[codexRolloutBoundaryEntryDigest(candidate)] = struct{}{}
+	}
+	for _, candidate := range eligible {
+		mtimeNs := candidate.mtime.UnixNano()
+		if mtimeNs <= cursorMtimeNs || mtimeNs >= progressMtimeNs {
+			continue
+		}
+		if _, ok := selectedEntries[codexRolloutBoundaryEntryDigest(candidate)]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// codexRolloutFutureProgress carries the anchored cohort forward. A cohort that
+// still matches keeps its saved bounds, so rollouts written afterwards are
+// scanned as ordinary candidates without redefining — or restarting — a cohort
+// whose capped scan is still unfinished. A cohort that no longer matches is
+// redefined by the current listing.
+func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCandidate, now time.Time, cursor codexRolloutScanCursor) (int64, int64, int64, string, string, int, bool) {
+	anchor, floorNs, ceilingNs, matches := codexRolloutFutureCohort(candidates, cursor, now)
+	if !matches {
+		floorNs, ceilingNs = codexRolloutFutureCohortBounds(candidates, anchor)
+	}
+	fingerprint, cohortSize := codexRolloutFutureFingerprint(candidates, anchor, floorNs, ceilingNs)
+	if fingerprint == "" {
+		return 0, 0, 0, "", "", 0, false
+	}
+	selectedFuture := map[string]struct{}{}
+	selectedList := make([]codexRolloutCandidate, 0, len(selected))
+	var lastSelected codexRolloutCandidate
+	haveLast := false
+	for _, candidate := range selected {
+		if !codexRolloutInFutureCohort(candidate, anchor, floorNs, ceilingNs) {
+			continue
+		}
+		selectedFuture[codexRolloutFutureEntryDigest(candidate)] = struct{}{}
+		selectedList = append(selectedList, candidate)
+		if !haveLast || codexRolloutCandidateBefore(lastSelected, candidate, anchor) {
+			lastSelected, haveLast = candidate, true
+		}
+	}
+	// `rankBound` is the newest cohort member this pass left unread. Retry
+	// rotation can evict an entry ranked above one it opens, so the picks are not
+	// necessarily contiguous and the cursor may not be taken past this bound.
+	// Every rank here is taken against the anchor for the same reason the resume
+	// filter is: a cursor written under clock-relative ordering would not mean the
+	// same thing once a member crosses `now`.
+	remaining := false
+	var rankBound codexRolloutCandidate
+	for _, candidate := range eligible {
+		if !codexRolloutInFutureCohort(candidate, anchor, floorNs, ceilingNs) {
+			continue
+		}
+		if _, ok := selectedFuture[codexRolloutFutureEntryDigest(candidate)]; ok {
+			continue
+		}
+		if !remaining || codexRolloutCandidateBefore(candidate, rankBound, anchor) {
+			rankBound, remaining = candidate, true
+		}
+	}
+	if !remaining {
+		return anchor.UnixNano(), floorNs, ceilingNs, fingerprint, "", cohortSize, true
+	}
+	if haveLast {
+		advance, haveAdvance := lastSelected, true
+		if !codexRolloutCandidateBefore(advance, rankBound, anchor) {
+			advance, haveAdvance = codexRolloutDeepestContiguous(selectedList, rankBound, anchor)
+		}
+		// No pick ranks ahead of the gap: this pass claimed nothing contiguous with
+		// the cohort head, so fall through to the saved cursor rather than stepping
+		// the cohort over an unread member.
+		if haveAdvance {
+			return anchor.UnixNano(), floorNs, ceilingNs, fingerprint,
+				codexRolloutFutureEntryDigest(advance), cohortSize, false
+		}
+	}
+	if matches {
+		return anchor.UnixNano(), floorNs, ceilingNs, fingerprint, cursor.futureCursor, cohortSize, false
+	}
+	return anchor.UnixNano(), floorNs, ceilingNs, fingerprint, "", cohortSize, false
+}
+
+func codexRolloutFutureCohortCaughtUp(candidates []codexRolloutCandidate, now time.Time, fingerprint string, complete bool) bool {
+	// Once every member of the anchored future cohort has been consumed and its
+	// mtime is no longer ahead of the clock, it is ordinary completed filesystem
+	// progress. Retaining the old anchor would make each later normal rollout
+	// change the historical cohort fingerprint and reopen the consumed files.
+	// The catch-up test is deliberately unscoped: any file still ahead of the
+	// clock — cohort member or later arrival — keeps anomalous handling on.
+	current, _ := codexRolloutFutureFingerprint(candidates, now, 0, 0)
+	return complete && fingerprint != "" && current == ""
+}
+
 // codexRolloutFallbackBuckets reads Codex's session rollout logs
 // (CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl) for the most recent populated
 // `rate_limits` frame and returns its per-(window, limit) contributors. The
@@ -1483,9 +3344,9 @@ const codexUsageLimitNoticeMaxAge = 12 * time.Hour
 // is disabled, matching the best-effort unscoped behaviour the parser already
 // uses when the account is unknown. Best-effort: returns (nil, false) on any
 // problem.
-func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, bool) {
+func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time, cursor codexRolloutScanCursor, priorObservations ...time.Time) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, *codexRolloutScanProgress, bool) {
 	if base == "" {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, false
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
 	}
 	// auth.json mtime is the account-login watermark (zero = missing → guard
 	// off). A fresh `codex login` rewrites auth.json, so its mtime marks when
@@ -1503,10 +3364,44 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 	if info, err := os.Stat(expandHome(base, "auth.json")); err == nil {
 		authMod = info.ModTime()
 	}
+	// A future login watermark cannot safely separate the current account from
+	// earlier sessions. Treat the optional rollout source as unavailable for
+	// this pass instead of rejecting current evidence and then advancing past
+	// it; once the clock or file timestamp is corrected, the unchanged rollout
+	// remains eligible for a retry.
+	if authMod.After(now) {
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
+	}
 	// Date-nested layout: sessions/YYYY/MM/DD/rollout-<ISO-timestamp>-*.jsonl.
-	matches, err := filepath.Glob(filepath.Join(base, "sessions", "*", "*", "*", "rollout-*.jsonl"))
-	if err != nil || len(matches) == 0 {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, false
+	discoveryCtx, cancelDiscovery := codexRolloutDiscoveryContext(ctx)
+	candidates, discoveryComplete := codexDiscoverRolloutCandidates(discoveryCtx, base, cursor)
+	cancelDiscovery()
+	if len(candidates) == 0 {
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
+	}
+	eligibleCandidates := codexUnconsumedRolloutCandidates(candidates, cursor, now)
+	if len(eligibleCandidates) == 0 {
+		// The boundary changed only by removing entries after an earlier partial
+		// pass, or every unchanged future-dated entry was already consumed. With
+		// no unread entry left, finish the normal boundary without reopening an
+		// already-consumed file and preserve the anomalous-file completion state.
+		if discoveryComplete {
+			progress := codexRolloutBoundaryProgress(candidates, nil, nil, cursor.mtimeNs)
+			progress.futureAnchorNs, progress.futureFloorNs, progress.futureCeilingNs,
+				progress.futureFingerprint, progress.futureCursor,
+				progress.futureCohortSize, progress.futureComplete =
+				codexRolloutFutureProgress(candidates, nil, nil, now, cursor)
+			if codexRolloutFutureCohortCaughtUp(
+				candidates, now, progress.futureFingerprint, progress.futureComplete,
+			) {
+				progress = codexRolloutBoundaryProgress(
+					candidates, nil, nil,
+					codexRolloutNewestNormalMtimeNs(candidates, cursor.mtimeNs, now),
+				)
+			}
+			return nil, codexUsageLimitEvidence{}, time.Time{}, &progress, false
+		}
+		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
 	}
 	// Rank candidates by file mtime descending, NOT by filename (= session
 	// start time). When sessions overlap — e.g. an older still-active session
@@ -1514,29 +3409,19 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 	// resumed after newer files exist — filename order treats the stale session
 	// as the "newest" reading. mtime tracks the last append, so the file being
 	// written most recently (the live source of truth) is considered first.
+	// Future-dated mtimes are invalid ordering evidence after a clock rollback
+	// or timestamp-preserving restore, so rank them after every normal-time
+	// candidate. Otherwise more than one capped batch of anomalous files could
+	// hide a newly completed normal-time rollout and then advance past it.
 	// Ties fall back to filename order so a deterministic chronological tiebreak
 	// applies when two files share an mtime.
-	type rolloutCandidate struct {
-		path  string
-		mtime time.Time
-	}
-	candidates := make([]rolloutCandidate, 0, len(matches))
-	for _, m := range matches {
-		info, err := os.Stat(m)
-		if err != nil {
-			continue
-		}
-		candidates = append(candidates, rolloutCandidate{path: m, mtime: info.ModTime()})
-	}
-	if len(candidates) == 0 {
-		return nil, codexUsageLimitEvidence{}, time.Time{}, false
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if !candidates[i].mtime.Equal(candidates[j].mtime) {
-			return candidates[i].mtime.After(candidates[j].mtime)
-		}
-		return candidates[i].path > candidates[j].path
-	})
+	//
+	// Ranking keeps only the capped newest candidates in one cancellable pass
+	// rather than ordering the whole backlog first: a sessions tree holding
+	// thousands of logs would otherwise spend the reserved candidate-read time
+	// inside an uninterruptible sort and reach the read loop with nothing left,
+	// repeating that same discovery-and-sort on every refresh without ever
+	// opening a rollout.
 	// Accumulate across files newest-first, keyed by (identity, limit id) — NOT by
 	// physical slot. Keying on the slot would let a newer log that only carried a
 	// migrated weekly contributor under `primary` block an older log's `primary`
@@ -1553,22 +3438,98 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 	}
 	winners := map[string]rolloutContribution{}
 	var limit codexUsageLimitEvidence
+	// Identity of the rollout that supplied `limit`, so a still-live refusal can
+	// be held eligible on its own rather than by voiding the whole pass.
+	var limitEntry string
 	var latestObservation time.Time
-	for scanned, c := range candidates {
-		if scanned >= codexRolloutScanFileCap {
+	for _, observed := range priorObservations {
+		if observed.After(latestObservation) {
+			latestObservation = observed
+		}
+	}
+	orderingCtx, cancelOrdering := codexRolloutCandidateOrderingContext(ctx)
+	var reserves []codexRolloutReserve
+	if cursor.boundaryCursor != "" && cursor.mtimeNs > 0 {
+		reserves = append(reserves, codexRolloutBoundaryReserve(cursor.mtimeNs))
+	}
+	if cursor.futureFingerprint != "" && !cursor.futureComplete {
+		// Resolve the cohort against the same listing the eligibility filter used,
+		// so the reserve covers exactly the members that filter left unconsumed.
+		if anchor, floorNs, ceilingNs, matches := codexRolloutFutureCohort(candidates, cursor, now); matches {
+			reserves = append(reserves, codexRolloutFutureCohortReserve(anchor, floorNs, ceilingNs))
+		}
+	}
+	if backlogCutoff, resuming := codexRolloutBacklogCutoff(candidates, cursor, now); resuming {
+		// Same reasoning as the cohort above, resolved against the same listing:
+		// reserve the members this cursor still has to walk so a cap-sized batch of
+		// newer rollouts cannot take every slot on every refresh.
+		reserves = append(reserves, codexRolloutBacklogReserve(
+			backlogCutoff, cursor.mtimeNs, cursor.backlogMtimeNs, now,
+		))
+	}
+	selected, selectionComplete := codexSelectNewestRolloutCandidates(
+		orderingCtx, eligibleCandidates, now, codexRolloutScanFileCap, reserves,
+		codexRolloutRetrySet(cursor.retryEntries), cursor.retryCursor, cursor.retryFingerprint,
+	)
+	cancelOrdering()
+	progressComplete := discoveryComplete && selectionComplete
+	attempted := make([]codexRolloutCandidate, 0, len(selected))
+	retryEntries := codexRolloutRetrySet(cursor.retryEntries)
+	if discoveryComplete {
+		present := make(map[string]struct{}, len(candidates))
+		for _, candidate := range candidates {
+			present[codexRolloutBacklogEntryDigest(candidate)] = struct{}{}
+		}
+		for entry := range retryEntries {
+			if _, ok := present[entry]; !ok {
+				delete(retryEntries, entry)
+			}
+		}
+	}
+	for i, c := range selected {
+		if ctx.Err() != nil {
+			progressComplete = false
 			break
 		}
-		buckets, sessionStart, fileLimit, ok := codexBucketsFromRolloutFile(c.path, now)
+		attempted = append(attempted, c)
+		fileCtx, cancelFile := codexRolloutFileContext(ctx, len(selected)-i-1)
+		buckets, sessionStart, fileLimit, handled, ok := codexBucketsFromRolloutFile(fileCtx, c.path, now)
+		cancelFile()
+		retryEntry := codexRolloutBacklogEntryDigest(c)
+		retry := !handled
+		// A fully read file with neither numeric nor refusal evidence has nothing
+		// account-scoped to merge. It is safe to count as handled even when its
+		// first record does not provide a usable session timestamp.
+		if sessionStart.IsZero() && handled && !ok && fileLimit.At.IsZero() {
+			delete(retryEntries, retryEntry)
+			continue
+		}
 		// Reject logs whose session began before the current login (a possible
-		// prior account). A log with no parseable start time can't be scoped, so
-		// keep it (best-effort, matches the unscoped unknown-account path).
+		// prior account). When a login watermark exists, a log with no verified
+		// start time can't be scoped, so withhold its evidence and retry it. This
+		// matters when cancellation interrupts a large session_meta header: tail
+		// telemetry must not cross an account boundary without a verified start.
 		// Applied BEFORE the no-buckets skip so exhaustion evidence is scoped to
 		// the current account exactly as usage readings are.
-		if !authMod.IsZero() && !sessionStart.IsZero() && sessionStart.Before(authMod) {
-			continue
+		if !authMod.IsZero() {
+			accept, authRetry := codexRolloutSessionMatchesAuth(sessionStart, authMod, handled)
+			retry = retry || authRetry
+			if retry {
+				retryEntries[retryEntry] = struct{}{}
+			} else {
+				delete(retryEntries, retryEntry)
+			}
+			if !accept {
+				continue
+			}
+		} else if retry {
+			retryEntries[retryEntry] = struct{}{}
+		} else {
+			delete(retryEntries, retryEntry)
 		}
 		if fileLimit.At.After(limit.At) {
 			limit = fileLimit
+			limitEntry = retryEntry
 		}
 		if !ok {
 			continue
@@ -1579,7 +3540,7 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 					latestObservation = observed
 				}
 				key := codexWindowIdentity(b.WindowMinutes, w) + "\x00" + limitID
-				if _, exists := winners[key]; !exists {
+				if prev, exists := winners[key]; !exists || b.ObservedAtMs > prev.bucket.ObservedAtMs {
 					winners[key] = rolloutContribution{slot: w, limitID: limitID, bucket: b}
 				}
 			}
@@ -1594,34 +3555,173 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 		// let newest-first (identity, limit) dedup keep the freshest reading per
 		// contributor.
 	}
+	if limitEntry != "" && !limit.At.IsZero() && now.Sub(limit.At) <= codexUsageLimitNoticeMaxAge &&
+		(latestObservation.IsZero() || latestObservation.Before(limit.At)) {
+		// A refusal has no normalized contributor to persist, so its rollout must
+		// stay readable while the notice is still live and newer than every numeric
+		// observation in the selected set. Hold ONLY that identity above the
+		// completed-scan watermark instead of voiding the pass: forcing the scan
+		// incomplete discards the boundary/backlog/retry cursors too, so a backlog
+		// larger than the file cap would re-select the same newest batch on every
+		// refresh for the notice's full lifetime and never reach an older rollout
+		// holding a distinct session or weekly contributor. Retry identities bypass
+		// the watermark in both discovery and the eligibility filter, and this one
+		// is dropped again by the read loop on the first later pass where newer
+		// telemetry supersedes the refusal or it ages out.
+		retryEntries[limitEntry] = struct{}{}
+	}
+	var highWater *codexRolloutScanProgress
+	if progressComplete {
+		maxSelectedMtimeNs := int64(0)
+		for _, c := range attempted {
+			if c.mtime.UnixNano() > maxSelectedMtimeNs {
+				maxSelectedMtimeNs = c.mtime.UnixNano()
+			}
+		}
+		backlogFingerprint, backlogCursor, backlogMtimeNs, backlogCohortSize, backlogComplete :=
+			codexRolloutBacklogProgress(candidates, eligibleCandidates, attempted, now, cursor)
+		if !backlogComplete {
+			// Keep the completed high-water below every member of this stable
+			// cohort. The redacted rank cursor excludes this pass's newest files on
+			// the next refresh so older distinct-mtime candidates get their turn.
+			maxSelectedMtimeNs = cursor.mtimeNs
+		} else if cursor.backlogCursor != "" {
+			// The final batch may contain only the cohort's oldest file. Advance to
+			// the newest mtime from the full, unchanged cohort now that every member
+			// has been handled across passes.
+			maxSelectedMtimeNs = codexRolloutNewestNormalMtimeNs(candidates, cursor.mtimeNs, now)
+		}
+		// Filesystem mtimes are progress hints, not provider observation times.
+		// Never let a restored/future-dated file move the cursor beyond the
+		// current clock and suppress normally timestamped rollouts written next.
+		// Retain the coarsest common mtime-resolution overlap: a rollout created
+		// after its directory was enumerated can otherwise round below now while
+		// an already-enumerated active rollout advances above now, causing the
+		// clamped cursor to skip the undiscovered file forever.
+		if nowNs := now.UnixNano(); maxSelectedMtimeNs > nowNs {
+			maxSelectedMtimeNs = now.Add(-codexRolloutCoarseMtimeOverlap).UnixNano()
+		}
+		// Clamping a future-only batch must not move an already completed normal
+		// cursor backwards. Keeping its current value also lets the transaction
+		// persist the separate future-file state under the monotonic write guard.
+		if maxSelectedMtimeNs < cursor.mtimeNs {
+			maxSelectedMtimeNs = cursor.mtimeNs
+		}
+		// A saved equal-mtime boundary can share a capped pass with rollouts newer
+		// than that boundary. Do not let those newer files pull the main watermark
+		// past boundary entries that still did not fit: pin progress to the saved
+		// boundary until its remaining deterministic batches have been consumed.
+		hasSavedBoundary := cursor.boundaryCursor != "" && cursor.mtimeNs > 0
+		unfinishedSavedBoundary := hasSavedBoundary &&
+			codexRolloutBoundaryHasUnselected(eligibleCandidates, attempted, cursor.mtimeNs)
+		deferredNewerCandidate := hasSavedBoundary &&
+			codexRolloutHasUnselectedBelowProgress(
+				eligibleCandidates, attempted, cursor.mtimeNs, maxSelectedMtimeNs,
+			)
+		if unfinishedSavedBoundary || deferredNewerCandidate {
+			// The reserved boundary entries can evict newer candidates from the
+			// ordinary top-N selection. Even when this pass finishes the saved
+			// boundary, retain its high-water once so the next pass can consume the
+			// newer entries without a reservation before progress moves beyond them.
+			maxSelectedMtimeNs = cursor.mtimeNs
+		}
+		// Record a redacted cursor for the equal-mtime entries this pass opened. A
+		// later pass resumes after it before applying the cap, so a large coarse-
+		// mtime boundary advances through distinct batches instead of selecting the
+		// same deterministic newest subset forever. Once the whole boundary is
+		// consumed, the cursor is cleared and its full fingerprint restores the
+		// ordinary cache-only unchanged-boundary fast path.
+		futureAnchorNs, futureFloorNs, futureCeilingNs, futureFingerprint, futureCursor,
+			futureCohortSize, futureComplete :=
+			codexRolloutFutureProgress(candidates, eligibleCandidates, attempted, now, cursor)
+		if cursor.futureFingerprint != "" && futureFingerprint != "" && !futureComplete {
+			// A cohort that was future-dated when its capped scan started may be
+			// normal-time by the next refresh. Keep the main high-water below that
+			// unfinished cohort so its older unread entries cannot be skipped.
+			maxSelectedMtimeNs = cursor.mtimeNs
+		}
+		retireFutureCohort := backlogComplete && !unfinishedSavedBoundary && !deferredNewerCandidate &&
+			codexRolloutFutureCohortCaughtUp(candidates, now, futureFingerprint, futureComplete)
+		if retireFutureCohort {
+			maxSelectedMtimeNs = codexRolloutNewestNormalMtimeNs(candidates, cursor.mtimeNs, now)
+			futureAnchorNs, futureFloorNs, futureCeilingNs, futureFingerprint, futureCursor,
+				futureCohortSize, futureComplete = 0, 0, 0, "", "", 0, false
+		}
+		progress := codexRolloutBoundaryProgress(candidates, eligibleCandidates, attempted, maxSelectedMtimeNs)
+		if unfinishedSavedBoundary && progress.boundaryCursor == "" &&
+			codexRolloutBoundaryFingerprint(candidates, cursor.mtimeNs) == cursor.boundaryFingerprint {
+			// Newer files can fill the whole cap before this pass reaches the saved
+			// boundary. Keep its prior position rather than restarting or clearing it.
+			progress.boundaryFingerprint = cursor.boundaryFingerprint
+			progress.boundaryCursor = cursor.boundaryCursor
+		}
+		progress.futureAnchorNs = futureAnchorNs
+		progress.futureFloorNs = futureFloorNs
+		progress.futureCeilingNs = futureCeilingNs
+		progress.backlogFingerprint = backlogFingerprint
+		progress.backlogCursor = backlogCursor
+		progress.backlogMtimeNs = backlogMtimeNs
+		progress.backlogCohortSize = backlogCohortSize
+		progress.retryEntries = codexRolloutRetryList(retryEntries)
+		progress.retryFingerprint, progress.retryCursor = codexRolloutRetryRotationProgress(
+			eligibleCandidates, attempted, retryEntries,
+		)
+		progress.futureFingerprint = futureFingerprint
+		progress.futureCursor = futureCursor
+		progress.futureCohortSize = futureCohortSize
+		progress.futureComplete = futureComplete
+		highWater = &progress
+	}
 	if len(winners) == 0 {
 		// No usable window anywhere in the scanned logs — but a quota refusal
 		// found along the way still explains WHY, so it is reported even though
 		// there is nothing to backfill.
-		return nil, limit, latestObservation, false
+		return nil, limit, latestObservation, highWater, false
 	}
-	// Rebuild the slot-keyed contributor map downstream expects. Each winner is
-	// stored under its original slot (so a duration-less bucket keeps its
-	// slot-default identity) and its limit id. When two DIFFERENT identities
-	// collide on the same (slot, limit id) — a banded weekly and a banded session
-	// both observed under the `primary` slot as the same legacy limit — the second
-	// is stored under an identity-suffixed limit key so neither is lost. The suffix
-	// never changes identity (that derives from window minutes + slot), so it is
-	// invisible to downstream partitioning.
+	// Rebuild the slot-keyed contributor map downstream expects. Normalize the
+	// displayed identities onto their canonical cache slots while preserving the
+	// provider's real limit id. Codex can transiently emit both a session and
+	// weekly reading under `primary`; inventing a synthetic key for one would no
+	// longer match a later sparse update for the real limit, leaving stale evidence
+	// behind. Non-canonical durations retain their source slot so the display path
+	// can apply its slot-scoped fallback.
 	acc := map[string]map[string]codexRateLimitBucket{}
 	for _, c := range winners {
-		slotMap := acc[c.slot]
+		slot := c.slot
+		switch codexWindowIdentity(c.bucket.WindowMinutes, c.slot) {
+		case codexIdentitySession:
+			slot = codexWindowPrimary
+		case codexIdentityWeekly:
+			slot = codexWindowSecondary
+		}
+		slotMap := acc[slot]
 		if slotMap == nil {
 			slotMap = map[string]codexRateLimitBucket{}
-			acc[c.slot] = slotMap
+			acc[slot] = slotMap
 		}
 		limitKey := c.limitID
 		if _, taken := slotMap[limitKey]; taken {
-			limitKey = c.limitID + "\x00" + codexWindowIdentity(c.bucket.WindowMinutes, c.slot)
+			// Only non-canonical duration identities can still collide after the
+			// displayed rows were normalized above. Preserve both rather than
+			// silently dropping one; these plan-specific fallback rows have no
+			// stable canonical slot available.
+			limitKey += "\x00" + codexWindowIdentity(c.bucket.WindowMinutes, c.slot)
 		}
 		slotMap[limitKey] = c.bucket
 	}
-	return acc, limit, latestObservation, true
+	return acc, limit, latestObservation, highWater, true
+}
+
+func codexRolloutSessionMatchesAuth(sessionStart, authMod time.Time, handled bool) (accept, retry bool) {
+	if sessionStart.IsZero() {
+		// An authenticated scan must prove which account produced the rollout.
+		// Withhold unscoped evidence in either case, but only an interrupted read
+		// needs retrying. A fully consumed malformed/legacy file is deterministic;
+		// a later append changes its discovery fingerprint and makes it eligible
+		// again without holding back completed-scan progress indefinitely.
+		return false, !handled
+	}
+	return !sessionStart.Before(authMod), false
 }
 
 // codexBucketsFromRolloutFile returns the per-(window, limit) contributors from
@@ -1636,37 +3736,157 @@ func codexRolloutFallbackBuckets(base string, now time.Time) (map[string]map[str
 // Best-effort: returns ok=false when the file holds no usable frame or can't be
 // read; the returned start time is zero when no line carried a parseable
 // timestamp.
-func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool) {
-	f, err := os.Open(path)
+const (
+	codexRolloutTailReadChunkSize = 64 * 1024
+	codexRolloutTailProbeMaxBytes = 4 * 1024 * 1024
+)
+
+// codexRecentRolloutLines probes backwards from EOF up to a fixed byte ceiling.
+// The normal forward scan
+// still runs and remains authoritative for sparse carry-forward, session
+// scoping, and completed-scan progress. This small second view prevents a
+// repeatedly slow/large file from replaying only the same prefix forever while
+// ensuring a sparse newest frame does not hide the other identity immediately
+// before it.
+func codexRecentRolloutLines(ctx context.Context, f *os.File, size int64, now time.Time) []string {
+	if size <= 0 {
+		return nil
+	}
+	offset := size
+	remaining := int64(codexRolloutTailProbeMaxBytes)
+	var suffix []byte
+	var groups [][]string
+	for offset > 0 && remaining > 0 {
+		if ctx.Err() != nil {
+			break
+		}
+		readSize := int64(codexRolloutTailReadChunkSize)
+		if readSize > offset {
+			readSize = offset
+		}
+		if readSize > remaining {
+			readSize = remaining
+		}
+		offset -= readSize
+		remaining -= readSize
+		chunk := make([]byte, readSize)
+		n, err := f.ReadAt(chunk, offset)
+		if err != nil && err != io.EOF {
+			break
+		}
+		chunk = chunk[:n]
+		combined := make([]byte, 0, len(chunk)+len(suffix))
+		combined = append(combined, chunk...)
+		combined = append(combined, suffix...)
+		parts := bytes.Split(combined, []byte{'\n'})
+		complete := parts
+		if offset > 0 {
+			// The first fragment begins before this chunk. Retain it for the
+			// next backwards read; only newline-delimited suffixes are complete.
+			suffix = append(suffix[:0], parts[0]...)
+			complete = parts[1:]
+		} else {
+			suffix = nil
+		}
+		group := make([]string, 0, len(complete))
+		for _, rawLine := range complete {
+			rawLine = bytes.TrimSuffix(rawLine, []byte{'\r'})
+			if len(rawLine) == 0 {
+				continue
+			}
+			line := string(rawLine)
+			group = append(group, line)
+		}
+		if len(group) > 0 {
+			groups = append(groups, group)
+		}
+	}
+
+	// Groups were discovered newest-to-oldest; replay them chronologically so
+	// sparse frames retain the same semantics as the forward reader.
+	var lines []string
+	for i := len(groups) - 1; i >= 0; i-- {
+		lines = append(lines, groups[i]...)
+	}
+	return lines
+}
+
+// codexRolloutSessionMetaType is the `type` Codex stamps on the session header
+// it writes as a rollout's first record. Every telemetry record carries a
+// different type (`event_msg`, `response_item`, `turn_context`, `compacted`).
+const codexRolloutSessionMetaType = "session_meta"
+
+// codexRolloutSessionStartFromLine reads a rollout's session start from its
+// FIRST record, and only when that record is the session header.
+//
+// The start time is an ACCOUNT SCOPING claim, not merely a timestamp:
+// codexRolloutSessionMatchesAuth accepts a rollout whose start is at or after
+// the current login watermark. A prior-account process that keeps appending
+// after a new login writes telemetry stamped AFTER that watermark, so accepting
+// the first record of a truncated, rotated, or legacy log purely because it
+// parses would let that account's quota be cached under the new fingerprint.
+// Only the header proves whose session produced the file; anything else leaves
+// the start unverified, which the auth check already treats as "withhold this
+// file's evidence" rather than as permission to merge it.
+func codexRolloutSessionStartFromLine(line string) (time.Time, bool) {
+	var envelope struct {
+		Type *string          `json:"type"`
+		ID   *json.RawMessage `json:"id"`
+	}
+	if json.Unmarshal([]byte(line), &envelope) != nil {
+		return time.Time{}, false
+	}
+	if envelope.Type != nil {
+		if *envelope.Type != codexRolloutSessionMetaType {
+			return time.Time{}, false
+		}
+	} else if envelope.ID == nil {
+		// Rollouts predating the typed envelope open with a bare session header
+		// carrying the session `id` and no `type`. With neither marker the record
+		// is telemetry (or unrecognizable), so it cannot scope the file.
+		return time.Time{}, false
+	}
+	return codexRolloutLineTimestamp(line)
+}
+
+func codexRolloutSessionStartPrefix(f *os.File) time.Time {
+	buf := make([]byte, codexRolloutTailReadChunkSize)
+	n, err := f.ReadAt(buf, 0)
+	if err != nil && err != io.EOF {
+		return time.Time{}
+	}
+	line := buf[:n]
+	if newline := bytes.IndexByte(line, '\n'); newline >= 0 {
+		line = line[:newline]
+	}
+	if ts, ok := codexRolloutSessionStartFromLine(string(bytes.TrimSuffix(line, []byte{'\r'}))); ok {
+		return ts
+	}
+	return time.Time{}
+}
+
+var codexOpenRolloutFile = os.Open
+
+func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool) {
+	f, err := codexOpenRolloutFile(path)
 	if err != nil {
-		return nil, time.Time{}, codexUsageLimitEvidence{}, false
+		// Only a file that definitively vanished is handled progress. Permission
+		// failures, descriptor exhaustion, and other open errors can be transient;
+		// advancing the watermark past them would suppress a later successful read.
+		return nil, time.Time{}, codexUsageLimitEvidence{}, codexRolloutOpenFailureHandled(err), false
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	// Rollout lines embed full model turns and can be large; match the
-	// app-server's ceiling so a single big line doesn't abort the scan mid-file.
-	scanner.Buffer(make([]byte, 0, 64*1024), codexAppServerMaxLineSize)
-
-	var sessionStart time.Time
+	sessionStart := codexRolloutSessionStartPrefix(f)
 	var limit codexUsageLimitEvidence
 	acc := map[string]map[string]codexRateLimitBucket{}
-	for scanner.Scan() {
-		line := scanner.Text()
+	consumeLine := func(line string) {
 		// Exhaustion evidence is collected from the SAME pass, ahead of the
 		// rate-limit prefilter: a refused turn carries no window at all (Codex
 		// sends `primary: null, secondary: null` once the limit is reached), so
 		// these lines are exactly the ones the bucket scan discards.
-		if ev, ok := codexUsageLimitEvidenceFromLine(line); ok && ev.At.After(limit.At) {
+		if ev, ok := codexUsageLimitEvidenceFromLine(line, now); ok && ev.At.After(limit.At) {
 			limit = ev
-		}
-		// The first line carrying a timestamp is the session_meta header, i.e.
-		// when this session STARTED — recorded before any rate-limit frame, so
-		// it's captured ahead of the prefilter below.
-		if sessionStart.IsZero() {
-			if ts, ok := codexRolloutLineTimestamp(line); ok {
-				sessionStart = ts
-			}
 		}
 		// Cheap prefilter: only decode lines that could carry a window update.
 		// Mirror captureCodexRateLimitLine's gate exactly so camelCase frames
@@ -1675,11 +3895,14 @@ func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]map[str
 		if !strings.Contains(line, "token_count") &&
 			!strings.Contains(line, "rateLimits") &&
 			!strings.Contains(line, "rate_limit") {
-			continue
+			return
 		}
 		var raw map[string]interface{}
 		if json.Unmarshal([]byte(line), &raw) != nil {
-			continue
+			return
+		}
+		if !isRecognizedCodexRateLimitEnvelope(raw) {
+			return
 		}
 		// Anchor relative reset fields (`resets_in_seconds`) to the moment the
 		// line was EMITTED, not the usage-refresh time. A historical rollout
@@ -1688,11 +3911,11 @@ func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]map[str
 		// hour from now, masking a window that has long since rolled over.
 		// Absolute `resets_at` fields ignore this anchor, so the fallback is
 		// when the line carries no parseable timestamp.
-		eventTime := now
-		if ts, ok := raw["timestamp"].(string); ok {
-			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
-				eventTime = parsed
-			}
+		eventTime, observedAt := codexObservationTimes(raw, now, false)
+		if eventTime.IsZero() {
+			// Numeric rollout telemetry without an enclosing event time cannot
+			// advance freshness. Drop this object only and continue later lines.
+			return
 		}
 		// The rollout shape nests telemetry under `payload`
 		// ({"type":"event_msg","payload":{"type":"token_count","rate_limits":…}}),
@@ -1700,6 +3923,8 @@ func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]map[str
 		// false for that envelope, so null windows are ignored rather than
 		// treated as clears — exactly what we want when mining for live usage.
 		if updates, _ := extractCodexRateLimitBuckets(raw, eventTime); len(updates) > 0 {
+			codexStampContributorObservations(updates, observedAt)
+			updates = codexCanonicalizeContributors(updates)
 			// Merge, don't replace: token_count notifications are sparse, so a
 			// later frame restating only `primary` must not drop a `secondary`
 			// reading an earlier frame in this same file already captured.
@@ -1708,19 +3933,110 @@ func codexBucketsFromRolloutFile(path string, now time.Time) (map[string]map[str
 			mergeCodexRolloutFrame(acc, updates, eventTime)
 		}
 	}
+	var size int64
+	if info, statErr := f.Stat(); statErr == nil {
+		size = info.Size()
+	}
+	tailLines := codexRecentRolloutLines(ctx, f, size, now)
+	consumeTail := func() {
+		for _, line := range tailLines {
+			consumeLine(line)
+		}
+		tailLines = nil
+	}
+
+	// Scanner cannot recover after an oversized token and cannot be canceled
+	// while accumulating it. Read in bounded fragments instead: complete JSONL
+	// objects up to the existing 30 MB ceiling are consumed, oversized objects
+	// are discarded through their newline, and cancellation preserves earlier
+	// complete evidence while leaving the file unhandled for retry.
+	reader := bufio.NewReaderSize(f, 64*1024)
+	lineBytes := make([]byte, 0, 64*1024)
+	oversized := false
+	firstRecordSeen := false
+	headerUnread := false
+	handled := true
+	for {
+		if ctx.Err() != nil {
+			handled = false
+			break
+		}
+		fragment, readErr := reader.ReadSlice('\n')
+		if !oversized {
+			if len(lineBytes)+len(fragment) > codexAppServerMaxLineSize {
+				lineBytes = lineBytes[:0]
+				oversized = true
+			} else {
+				lineBytes = append(lineBytes, fragment...)
+			}
+		}
+		if readErr == bufio.ErrBufferFull {
+			continue
+		}
+		if readErr != nil && readErr != io.EOF {
+			handled = false
+			break
+		}
+		if oversized && !firstRecordSeen {
+			// The discarded object may have been the session_meta header. Do not
+			// promote a later telemetry timestamp to the session start: an older
+			// account can keep emitting after a new login, and that later event
+			// would make its rollout appear to belong to the new account. Keep the
+			// start unverified AND report the file as unhandled: unlike a malformed
+			// header, whose bytes were read and judged, this record was never
+			// decoded at all, so the scan cannot claim it as deterministic progress
+			// and the rollout stays above the cursor for retry.
+			firstRecordSeen = true
+			headerUnread = true
+		}
+		if !oversized && len(lineBytes) > 0 {
+			for len(lineBytes) > 0 && (lineBytes[len(lineBytes)-1] == '\n' || lineBytes[len(lineBytes)-1] == '\r') {
+				lineBytes = lineBytes[:len(lineBytes)-1]
+			}
+			if len(lineBytes) > 0 {
+				line := string(lineBytes)
+				if !firstRecordSeen {
+					firstRecordSeen = true
+					if ts, ok := codexRolloutSessionStartFromLine(line); ok {
+						sessionStart = ts
+					}
+				}
+				consumeLine(line)
+			}
+		}
+		lineBytes = lineBytes[:0]
+		oversized = false
+		if readErr == io.EOF {
+			break
+		}
+	}
+	if ctx.Err() != nil || headerUnread {
+		handled = false
+	}
+	// Tail lines were already read as complete objects. Fold them even when the
+	// forward pass was interrupted; their newer timestamps supersede any prefix
+	// evidence without treating an incomplete fragment as provider telemetry.
+	consumeTail()
+	if !handled {
+		return acc, sessionStart, limit, false, len(acc) > 0
+	}
 	if len(acc) == 0 {
 		// ok=false means "no usable window here", NOT "nothing here": a log whose
 		// every turn was refused for quota is precisely the case that produces no
 		// buckets AND the evidence the card needs, so the evidence is returned
 		// alongside the miss.
-		return nil, sessionStart, limit, false
+		return nil, sessionStart, limit, true, false
 	}
 	// Return the per-limit contributors un-collapsed. Rollover-to-0% for a window
 	// whose reset already passed as of `now` is applied by the display path
 	// (codexAggregateIdentity), so a stale relative reset anchored above still
 	// clears instead of showing old usage — without flattening two distinct
 	// identities that share a storage slot into one bucket here.
-	return acc, sessionStart, limit, true
+	return acc, sessionStart, limit, true, true
+}
+
+func codexRolloutOpenFailureHandled(err error) bool {
+	return os.IsNotExist(err)
 }
 
 // codexUsageLimitEvidence records that Codex refused a turn because the
@@ -1751,7 +4067,7 @@ const codexUsageLimitMessageMaxLen = 240
 //
 // The code — not the prose — is what we match on, so a reworded message keeps
 // working and a message merely MENTIONING a limit is never mistaken for one.
-func codexUsageLimitEvidenceFromLine(line string) (codexUsageLimitEvidence, bool) {
+func codexUsageLimitEvidenceFromLine(line string, now time.Time) (codexUsageLimitEvidence, bool) {
 	// Cheap prefilter: the code is a literal, so a line that doesn't contain it
 	// cannot be evidence and is never decoded.
 	if !strings.Contains(line, codexUsageLimitErrorCode) {
@@ -1761,10 +4077,12 @@ func codexUsageLimitEvidenceFromLine(line string) (codexUsageLimitEvidence, bool
 	if json.Unmarshal([]byte(line), &raw) != nil {
 		return codexUsageLimitEvidence{}, false
 	}
-	at, hasTime := codexRolloutLineTimestamp(line)
-	if !hasTime {
-		// Without a timestamp the evidence can't be ranked against a usage
-		// reading, and stale exhaustion must never outrank fresh telemetry.
+	_, observedAt := codexObservationTimes(raw, now, false)
+	if observedAt.IsZero() {
+		// Without a valid timestamp the evidence can't be ranked against a usage
+		// reading, and stale or excessively future-dated exhaustion must never
+		// outrank fresh telemetry. Accepted provider skew is clamped to now by the
+		// shared observation-time policy.
 		return codexUsageLimitEvidence{}, false
 	}
 	// The rollout envelope nests the event under `payload`; the app-server
@@ -1787,7 +4105,7 @@ func codexUsageLimitEvidenceFromLine(line string) (codexUsageLimitEvidence, bool
 		if len(message) > codexUsageLimitMessageMaxLen {
 			message = strings.TrimSpace(message[:codexUsageLimitMessageMaxLen])
 		}
-		return codexUsageLimitEvidence{At: at, Message: message}, true
+		return codexUsageLimitEvidence{At: observedAt, Message: message}, true
 	}
 	return codexUsageLimitEvidence{}, false
 }
