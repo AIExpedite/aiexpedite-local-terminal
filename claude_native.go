@@ -841,8 +841,8 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 	// terminal frame is shutdown evidence: delivered while the ID belongs to
 	// a replacement, it releases the server's fence for a session that is
 	// still running (Codex P2, round 3 — the identity guard covered only map
-	// removal). Publish it only while the ID is still THIS session's (or
-	// unclaimed), atomically against Start's registration.
+	// removal). Publish it only while the ID is still THIS session's, atomically
+	// re-reserving an already-unclaimed ID against Start's registration.
 	if !publishTerminalIfCurrent(&m.mu, m.sessions, session.ID, session, &session.terminalPublishState, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,

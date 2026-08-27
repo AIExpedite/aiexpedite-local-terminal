@@ -714,6 +714,13 @@ func TestPublishTerminalIfCurrent_SuppressesFrameForReplacedID(t *testing.T) {
 	if !publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, &old.terminalPublishState, publishFn, frame, nil) {
 		t.Fatalf("terminal frame must publish while the ID is still this session's")
 	}
+	deadline := time.Now().Add(2 * time.Second)
+	for (publishedCount() < 1 || old.terminalPublishInFlight()) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if publishedCount() != 1 || old.terminalPublishInFlight() {
+		t.Fatalf("initial terminal frame did not finish before the next scenario")
+	}
 
 	// ID re-taken by a replacement → suppressed.
 	m.sessions["s"] = replacement
@@ -721,20 +728,42 @@ func TestPublishTerminalIfCurrent_SuppressesFrameForReplacedID(t *testing.T) {
 		t.Fatalf("stale terminal frame published under a replacement session's ID")
 	}
 
-	// Unclaimed ID → still published; a late frame for a session the server
-	// already considers gone is idempotent.
+	// Unclaimed ID → published only after atomically restoring the old
+	// session as a delivery tombstone. Otherwise Start could reuse the ID while
+	// the frame is in flight because the state bit lives outside the map.
 	delete(m.sessions, "s")
-	if !publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, &old.terminalPublishState, publishFn, frame, nil) {
+	publishEntered := make(chan struct{})
+	releasePublish := make(chan struct{})
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, &old.terminalPublishState, func(msg resultMsg) {
+		publishFn(msg)
+		close(publishEntered)
+		<-releasePublish
+	}, frame, func() { m.removeSessionIfSame("s", old) }) {
 		t.Fatalf("terminal frame must publish when the ID is unclaimed")
 	}
+	<-publishEntered
+	if m.Get("s") != old {
+		t.Fatalf("unclaimed ID must be re-reserved until terminal delivery completes")
+	}
+	if m.removeSessionIfSame("s", old) {
+		t.Fatalf("delivery tombstone was freed while its terminal frame was in flight")
+	}
+	close(releasePublish)
 
 	// The publishes are async; wait for exactly the two allowed frames.
-	deadline := time.Now().Add(2 * time.Second)
+	deadline = time.Now().Add(2 * time.Second)
 	for publishedCount() < 2 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if got := publishedCount(); got != 2 {
 		t.Fatalf("expected exactly 2 published frames (current + unclaimed), got %d", got)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for m.Get("s") != nil && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if m.Get("s") != nil {
+		t.Fatalf("delivery tombstone was not released after terminal delivery")
 	}
 }
 

@@ -191,9 +191,10 @@ type terminalPublishState struct {
 func (t *terminalPublishState) terminalPublishInFlight() bool { return t.publishInFlight.Load() }
 
 // publishTerminalIfCurrent publishes a session's terminal (`*_ended`) frame
-// only while id still maps to THIS session — or to no session at all — and
-// reports whether it published. Once publishFn returns it runs release, which
-// is the ONLY thing that drops a session whose terminal publish is in flight.
+// only while id still maps to THIS session — or can be atomically re-reserved
+// for it — and reports whether it published. Once publishFn returns it runs
+// release, which is the ONLY thing that drops a session whose terminal publish
+// is in flight.
 //
 // Why the guard exists: a tombstone that resolves through verified process
 // absence frees its ID for reuse while the wedged exit watcher may still be
@@ -207,11 +208,12 @@ func (t *terminalPublishState) terminalPublishInFlight() bool { return t.publish
 // manager's own map lock — the same lock Start takes to register a session — so
 // the ID is reserved atomically with the decision to publish. A replacement can
 // register neither between those two steps nor during delivery, because
-// removeSessionIfSame will not free a reserved ID (Codex P2, round 4). An
-// UNCLAIMED id still publishes: that is the ordinary teardown (End removes the
-// session on the "ended" status fast-path while the watcher is still finishing
-// its artifact scan), and a late frame for a session the server already
-// considers gone is idempotent.
+// removeSessionIfSame will not free a reserved ID (Codex P2, round 4). If End
+// removed the session on its "ended" status fast-path while the watcher was
+// still finishing artifact collection, the helper puts this session back into
+// the map under the same lock before launching the frame. Otherwise an
+// unclaimed ID would be reusable during delivery despite the state bit living
+// only on an object outside the map (Codex P2, round 5).
 func publishTerminalIfCurrent[S comparable](
 	mu *sync.RWMutex,
 	sessions map[string]S,
@@ -223,9 +225,15 @@ func publishTerminalIfCurrent[S comparable](
 	release func(),
 ) bool {
 	mu.Lock()
-	if cur, ok := sessions[id]; ok && cur != s {
+	cur, ok := sessions[id]
+	if ok && cur != s {
 		mu.Unlock()
 		return false
+	}
+	if !ok {
+		// Reinsert a short-lived tombstone so Start observes the reservation.
+		// The publisher's release callback removes it after delivery.
+		sessions[id] = s
 	}
 	state.publishInFlight.Store(true)
 	mu.Unlock()
