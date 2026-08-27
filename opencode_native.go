@@ -1150,12 +1150,15 @@ func (m *OpenCodeNativeManager) endStaleSessions(maxAge time.Duration) {
 	for _, ss := range stale {
 		fmt.Printf("%s[opencode-native] Reaping stale session %s%s\n", colorYellow, ss.id, colorReset)
 		trackTerminalPublishStart()
-		if err := m.End(ss.id); errors.Is(err, errEndUnconfirmed) {
-			// Tombstone retained; the process may still be alive. Publishing
-			// ended here would hand the server shutdown evidence it does not
-			// have (see end_confirm.go). The next GC tick retries.
-			fmt.Printf("%s[opencode-native] Stale reap unconfirmed for %s — withholding ended frame%s\n",
-				colorRed, ss.id, colorReset)
+		// errEndStaleSession is withheld for the same reason the `*_end` handler
+		// withholds it: the reap raced a replacement Start, so the ID now names
+		// a LIVE session and this frame — keyed only by session ID — would be
+		// read as its shutdown evidence (Codex P2, round 4). errEndUnconfirmed
+		// is withheld because the tombstone was retained and the process may
+		// still be alive; the next GC tick retries that one.
+		if err := m.End(ss.id); errors.Is(err, errEndUnconfirmed) || errors.Is(err, errEndStaleSession) {
+			fmt.Printf("%s[opencode-native] Stale reap withheld ended frame for %s — %v%s\n",
+				colorRed, ss.id, err, colorReset)
 			trackTerminalPublishEnd()
 			continue
 		}

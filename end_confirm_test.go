@@ -547,6 +547,97 @@ func TestAntigravityStaleGC_WithholdsEndedWhileUnconfirmed(t *testing.T) {
 	}
 }
 
+// The same withholding on the GC path for a STALE reap: a reap that raced a
+// replacement Start must not publish ended either, because that frame is keyed
+// only by the session ID the replacement now owns (Codex P2, round 4 — the
+// `*_end` handler withheld it, the reaper still published).
+func TestTurnManagerStaleGC_WithholdsEndedForReplacedSession(t *testing.T) {
+	shortenEndConfirmTimeouts(t)
+
+	t.Run("antigravity", func(t *testing.T) {
+		m := NewAntigravityNativeManager(nil)
+		var mu sync.Mutex
+		var published []resultMsg
+		old := &AntigravityNativeSession{
+			ID:        "ag-gc",
+			StartedAt: time.Now().Add(-12 * time.Hour), // past any maxAge
+			status:    "ended",
+			publishFn: func(msg resultMsg) { mu.Lock(); published = append(published, msg); mu.Unlock() },
+		}
+		replacement := &AntigravityNativeSession{ID: "ag-gc", StartedAt: time.Now(), status: "running"}
+		m.sessions["ag-gc"] = old
+
+		unlockTurn := lockTurn(&old.turnMu)
+		done := make(chan struct{})
+		go func() { m.endStaleSessions(6 * time.Hour); close(done) }()
+
+		// The reap's End is parked on the barrier: swap the ID underneath it,
+		// then let the turn drain — exactly the window the handler-side test
+		// uses.
+		time.Sleep(100 * time.Millisecond)
+		m.mu.Lock()
+		m.sessions["ag-gc"] = replacement
+		m.mu.Unlock()
+		unlockTurn()
+
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatalf("stale GC never finished")
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		for _, msg := range published {
+			if msg.Type == "antigravity_native_ended" {
+				t.Fatalf("stale GC published ended under a replacement's ID: %+v", msg)
+			}
+		}
+		if m.Get("ag-gc") != replacement {
+			t.Fatalf("the replacement session must survive a stale reap")
+		}
+	})
+
+	t.Run("opencode", func(t *testing.T) {
+		m := NewOpenCodeNativeManager()
+		var mu sync.Mutex
+		var published []resultMsg
+		old := &OpenCodeNativeSession{
+			ID:        "oc-gc",
+			StartedAt: time.Now().Add(-12 * time.Hour),
+			status:    "ended",
+			publishFn: func(msg resultMsg) { mu.Lock(); published = append(published, msg); mu.Unlock() },
+		}
+		replacement := &OpenCodeNativeSession{ID: "oc-gc", StartedAt: time.Now(), status: "running"}
+		m.sessions["oc-gc"] = old
+
+		unlockTurn := lockTurn(&old.turnMu)
+		done := make(chan struct{})
+		go func() { m.endStaleSessions(6 * time.Hour); close(done) }()
+
+		time.Sleep(100 * time.Millisecond)
+		m.mu.Lock()
+		m.sessions["oc-gc"] = replacement
+		m.mu.Unlock()
+		unlockTurn()
+
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatalf("stale GC never finished")
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		for _, msg := range published {
+			if msg.Type == "opencode_native_ended" {
+				t.Fatalf("stale GC published ended under a replacement's ID: %+v", msg)
+			}
+		}
+		if m.Get("oc-gc") != replacement {
+			t.Fatalf("the replacement session must survive a stale reap")
+		}
+	})
+}
+
 // The reused-ID watcher race (Codex P2): once a tombstone resolves and its ID
 // is re-used by a new Start, the OLD wedged exit watcher must not delete the
 // replacement session when it eventually recovers.
