@@ -2588,10 +2588,11 @@ func TestCodexBucketsFromRolloutFile_SkipsOversizedNonMetricLine(t *testing.T) {
 
 func TestCodexRecentRolloutLines_ContinuesPastSparseNumericFrame(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	stricter := `{"timestamp":"2026-08-26T13:50:00Z","jsonrpc":"2.0","result":{"rateLimitsByLimitId":{"codex_stricter":{"used_percent":88,"window_minutes":300}}},"id":1}`
 	weekly := `{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{"secondary":{"used_percent":41,"window_minutes":10080}}}`
 	primary := `{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":29,"window_minutes":300}}}`
 	padding := `{"padding":"` + strings.Repeat("x", codexRolloutTailReadChunkSize*2) + `"}`
-	if err := os.WriteFile(path, []byte(weekly+"\n"+padding+"\n"+primary), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(stricter+"\n"+padding+"\n"+weekly+"\n"+primary), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	f, err := os.Open(path)
@@ -2611,6 +2612,32 @@ func TestCodexRecentRolloutLines_ContinuesPastSparseNumericFrame(t *testing.T) {
 	}
 	if !strings.Contains(joined, `"used_percent":41`) {
 		t.Fatal("tail probe stopped before the older sparse weekly frame")
+	}
+	if !strings.Contains(joined, `"codex_stricter"`) {
+		t.Fatal("tail probe stopped after finding both identities and missed a distinct limit")
+	}
+}
+
+func TestCodexRolloutSessionMatchesAuth_RequiresVerifiedStart(t *testing.T) {
+	authMod := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name         string
+		sessionStart time.Time
+		handled      bool
+		wantAccept   bool
+		wantRetry    bool
+	}{
+		{name: "unverified partial read", wantAccept: false, wantRetry: true},
+		{name: "unverified complete legacy log", handled: true, wantAccept: true, wantRetry: false},
+		{name: "prior account", sessionStart: authMod.Add(-time.Minute), handled: true, wantAccept: false, wantRetry: false},
+		{name: "current account", sessionStart: authMod.Add(time.Minute), handled: true, wantAccept: true, wantRetry: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			accept, retry := codexRolloutSessionMatchesAuth(tc.sessionStart, authMod, tc.handled)
+			if accept != tc.wantAccept || retry != tc.wantRetry {
+				t.Fatalf("accept=%v retry=%v, want accept=%v retry=%v", accept, retry, tc.wantAccept, tc.wantRetry)
+			}
+		})
 	}
 }
 

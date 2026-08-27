@@ -1959,12 +1959,20 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 			allHandled = false
 		}
 		// Reject logs whose session began before the current login (a possible
-		// prior account). A log with no parseable start time can't be scoped, so
-		// keep it (best-effort, matches the unscoped unknown-account path).
+		// prior account). When a login watermark exists, a log with no verified
+		// start time can't be scoped, so withhold its evidence and retry it. This
+		// matters when cancellation interrupts a large session_meta header: tail
+		// telemetry must not cross an account boundary without a verified start.
 		// Applied BEFORE the no-buckets skip so exhaustion evidence is scoped to
 		// the current account exactly as usage readings are.
-		if !authMod.IsZero() && !sessionStart.IsZero() && sessionStart.Before(authMod) {
-			continue
+		if !authMod.IsZero() {
+			accept, retry := codexRolloutSessionMatchesAuth(sessionStart, authMod, handled)
+			if retry {
+				allHandled = false
+			}
+			if !accept {
+				continue
+			}
 		}
 		if fileLimit.At.After(limit.At) {
 			limit = fileLimit
@@ -2054,6 +2062,16 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	return acc, limit, latestObservation, highWater, true
 }
 
+func codexRolloutSessionMatchesAuth(sessionStart, authMod time.Time, handled bool) (accept, retry bool) {
+	if sessionStart.IsZero() {
+		// Preserve the established best-effort behavior for a completely read
+		// legacy/no-header log. Only partial tail recovery is unsafe: it cannot
+		// prove which account produced the recovered telemetry.
+		return handled, !handled
+	}
+	return !sessionStart.Before(authMod), false
+}
+
 // codexBucketsFromRolloutFile returns the per-(window, limit) contributors from
 // the LAST populated `rate_limits` frame in a single rollout log, plus the
 // session's start time (the first line's `timestamp`). Codex emits
@@ -2071,8 +2089,8 @@ const (
 	codexRolloutTailProbeMaxBytes = 4 * 1024 * 1024
 )
 
-// codexRecentRolloutLines probes backwards from EOF until it reconstructs both
-// display identities (within a fixed byte ceiling). The normal forward scan
+// codexRecentRolloutLines probes backwards from EOF up to a fixed byte ceiling.
+// The normal forward scan
 // still runs and remains authoritative for sparse carry-forward, session
 // scoping, and completed-scan progress. This small second view prevents a
 // repeatedly slow/large file from replaying only the same prefix forever while
@@ -2086,8 +2104,7 @@ func codexRecentRolloutLines(ctx context.Context, f *os.File, size int64, now ti
 	remaining := int64(codexRolloutTailProbeMaxBytes)
 	var suffix []byte
 	var groups [][]string
-	var foundSession, foundWeekly bool
-	for offset > 0 && remaining > 0 && !(foundSession && foundWeekly) {
+	for offset > 0 && remaining > 0 {
 		if ctx.Err() != nil {
 			break
 		}
@@ -2127,9 +2144,6 @@ func codexRecentRolloutLines(ctx context.Context, f *os.File, size int64, now ti
 			}
 			line := string(rawLine)
 			group = append(group, line)
-			hasSession, hasWeekly := codexRolloutLineNumericIdentities(line, now)
-			foundSession = foundSession || hasSession
-			foundWeekly = foundWeekly || hasWeekly
 		}
 		if len(group) > 0 {
 			groups = append(groups, group)
@@ -2143,38 +2157,6 @@ func codexRecentRolloutLines(ctx context.Context, f *os.File, size int64, now ti
 		lines = append(lines, groups[i]...)
 	}
 	return lines
-}
-
-func codexRolloutLineNumericIdentities(line string, now time.Time) (bool, bool) {
-	if !strings.Contains(line, "token_count") &&
-		!strings.Contains(line, "rateLimits") &&
-		!strings.Contains(line, "rate_limit") {
-		return false, false
-	}
-	var raw map[string]interface{}
-	if json.Unmarshal([]byte(line), &raw) != nil || !isRecognizedCodexRateLimitEnvelope(raw) {
-		return false, false
-	}
-	eventTime, _ := codexObservationTimes(raw, now, false)
-	if eventTime.IsZero() {
-		return false, false
-	}
-	var hasSession, hasWeekly bool
-	updates, _ := extractCodexRateLimitBuckets(raw, eventTime)
-	for slot, limits := range updates {
-		for _, bucket := range limits {
-			if !bucket.usageKnown {
-				continue
-			}
-			switch codexWindowIdentity(bucket.WindowMinutes, slot) {
-			case codexIdentitySession:
-				hasSession = true
-			case codexIdentityWeekly:
-				hasWeekly = true
-			}
-		}
-	}
-	return hasSession, hasWeekly
 }
 
 func codexRolloutSessionStartPrefix(f *os.File) time.Time {
