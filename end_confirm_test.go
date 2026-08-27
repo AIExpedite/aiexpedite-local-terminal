@@ -36,7 +36,7 @@ func (nopWriteCloser) Close() error                { return nil }
 // exitedTestProcess starts and waits a real short-lived process, so End's
 // interrupt/kill escalation targets a process that has already finished
 // (interruptProcess and Kill both error and both errors are logged/ignored),
-// and defaultProbeProcessGone sees a reaped ProcessState.
+// and defaultProbeProcessGone sees OS-level absence.
 func exitedTestProcess(t *testing.T) *exec.Cmd {
 	t.Helper()
 	var cmd *exec.Cmd
@@ -145,13 +145,39 @@ func TestDefaultProbeProcessGone(t *testing.T) {
 	if !defaultProbeProcessGone(nil) || !defaultProbeProcessGone(&exec.Cmd{}) {
 		t.Fatalf("nil/unstarted cmd should probe gone")
 	}
-	// Exited and reaped (ProcessState set) → gone.
+	// Exited and reaped → gone.
 	if !defaultProbeProcessGone(exitedTestProcess(t)) {
 		t.Fatalf("exited+waited process should probe gone")
 	}
 	// Genuinely running, unreaped → alive (fail closed).
 	if defaultProbeProcessGone(liveTestProcess(t)) {
 		t.Fatalf("live process must NOT probe gone")
+	}
+}
+
+func TestDefaultProbeProcessGone_ConcurrentWait(t *testing.T) {
+	// Tombstone probing may race the exit watcher's Cmd.Wait. Keep probing
+	// while Wait assigns its internal ProcessState; under -race this catches
+	// any regression that reads exec.Cmd internals instead of os.Process.
+	cmd := liveTestProcess(t)
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("failed to kill helper process: %v", err)
+	}
+	for {
+		_ = defaultProbeProcessGone(cmd)
+		select {
+		case <-done:
+			if !defaultProbeProcessGone(cmd) {
+				t.Fatalf("waited process should probe gone")
+			}
+			return
+		default:
+		}
 	}
 }
 

@@ -135,10 +135,14 @@ func waitDoneConfirm(done <-chan struct{}, timeout time.Duration) bool {
 //
 // True when:
 //   - there is no process at all (never started), or
-//   - Process.Wait has completed (ProcessState is set — the child is reaped;
-//     only the session's own watcher calls Wait, so a set state is ours), or
 //   - the platform probe (processHandleGone) confirms the OS no longer runs
 //     it.
+//
+// Do not inspect exec.Cmd.ProcessState here. The exit watcher can be inside
+// Cmd.Wait while a follow-up End probes a retained tombstone, and Wait writes
+// ProcessState without synchronizing with this goroutine. os.Process methods
+// are safe for concurrent use, so the platform probe is the race-free source
+// of process-absence evidence.
 //
 // Known fail-closed cases, deliberately accepted: a killed-but-unreaped
 // child is a zombie on Unix and Signal(0) still reaches it, so the probe
@@ -157,9 +161,6 @@ var probeProcessGone = defaultProbeProcessGone
 
 func defaultProbeProcessGone(cmd *exec.Cmd) bool {
 	if cmd == nil || cmd.Process == nil {
-		return true
-	}
-	if cmd.ProcessState != nil {
 		return true
 	}
 	return processHandleGone(cmd.Process)
