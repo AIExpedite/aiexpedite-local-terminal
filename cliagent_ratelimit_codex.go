@@ -3617,13 +3617,42 @@ func codexRecentRolloutLines(ctx context.Context, f *os.File, size int64, now ti
 	return lines
 }
 
+// codexRolloutSessionMetaType is the `type` Codex stamps on the session header
+// it writes as a rollout's first record. Every telemetry record carries a
+// different type (`event_msg`, `response_item`, `turn_context`, `compacted`).
+const codexRolloutSessionMetaType = "session_meta"
+
+// codexRolloutSessionStartFromLine reads a rollout's session start from its
+// FIRST record, and only when that record is the session header.
+//
+// The start time is an ACCOUNT SCOPING claim, not merely a timestamp:
+// codexRolloutSessionMatchesAuth accepts a rollout whose start is at or after
+// the current login watermark. A prior-account process that keeps appending
+// after a new login writes telemetry stamped AFTER that watermark, so accepting
+// the first record of a truncated, rotated, or legacy log purely because it
+// parses would let that account's quota be cached under the new fingerprint.
+// Only the header proves whose session produced the file; anything else leaves
+// the start unverified, which the auth check already treats as "withhold this
+// file's evidence" rather than as permission to merge it.
 func codexRolloutSessionStartFromLine(line string) (time.Time, bool) {
-	var envelope map[string]interface{}
+	var envelope struct {
+		Type *string          `json:"type"`
+		ID   *json.RawMessage `json:"id"`
+	}
 	if json.Unmarshal([]byte(line), &envelope) != nil {
 		return time.Time{}, false
 	}
-	ts, ok := codexRolloutLineTimestamp(line)
-	return ts, ok
+	if envelope.Type != nil {
+		if *envelope.Type != codexRolloutSessionMetaType {
+			return time.Time{}, false
+		}
+	} else if envelope.ID == nil {
+		// Rollouts predating the typed envelope open with a bare session header
+		// carrying the session `id` and no `type`. With neither marker the record
+		// is telemetry (or unrecognizable), so it cannot scope the file.
+		return time.Time{}, false
+	}
+	return codexRolloutLineTimestamp(line)
 }
 
 func codexRolloutSessionStartPrefix(f *os.File) time.Time {

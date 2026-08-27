@@ -2664,6 +2664,75 @@ func TestCodexRolloutFallbackBuckets_InvalidHeaderAdvancesHighWaterAfterEOF(t *t
 	}
 }
 
+// A truncated/rotated rollout whose first SURVIVING record is ordinary
+// telemetry proves nothing about which account produced it. A prior-account
+// process that keeps appending after a new login stamps those records AFTER the
+// auth watermark, so treating that time as the session start would let the old
+// account's quota be cached under the new fingerprint. Only the `session_meta`
+// header scopes a file.
+func TestCodexRolloutFallbackBuckets_HeaderlessLogWithPostLoginTelemetryWithheld(t *testing.T) {
+	authMod := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	telemetry := `{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":73,"window_minutes":300}}}`
+
+	for _, tc := range []struct {
+		name       string
+		first      string
+		wantScoped bool
+	}{
+		{
+			name:  "prior-account telemetry as first record",
+			first: `{"timestamp":"2026-08-26T14:05:00Z","type":"token_count","rate_limits":{"secondary":{"used_percent":41,"window_minutes":10080}}}`,
+		},
+		{
+			name:       "session_meta header",
+			first:      `{"timestamp":"2026-08-26T14:05:00Z","type":"session_meta","payload":{"id":"sess-1"}}`,
+			wantScoped: true,
+		},
+		{
+			// Rollouts predating the typed envelope open with a bare `id` header.
+			name:       "legacy untyped header",
+			first:      `{"timestamp":"2026-08-26T14:05:00Z","id":"sess-legacy","instructions":null}`,
+			wantScoped: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			dir := filepath.Join(base, "sessions", "2026", "08", "26")
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			authPath := filepath.Join(base, "auth.json")
+			if err := os.WriteFile(authPath, []byte("{}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(authPath, authMod, authMod); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "rollout-headerless.jsonl")
+			if err := os.WriteFile(path, []byte(tc.first+"\n"+telemetry+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(
+				context.Background(), base, now, codexRolloutScanCursor{},
+			)
+			if tc.wantScoped {
+				if !ok || len(contributors) == 0 {
+					t.Fatalf("contributors=%+v ok=%v, want a header-scoped rollout accepted", contributors, ok)
+				}
+				return
+			}
+			if ok || len(contributors) != 0 {
+				t.Fatalf("contributors=%+v ok=%v, want unverified session withheld", contributors, ok)
+			}
+			if highWater == nil {
+				t.Fatal("highWater=nil, want the fully read headerless rollout counted as handled")
+			}
+		})
+	}
+}
+
 func TestCodexRecentRolloutLines_ContinuesPastSparseNumericFrame(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rollout.jsonl")
 	stricter := `{"timestamp":"2026-08-26T13:50:00Z","jsonrpc":"2.0","result":{"rateLimitsByLimitId":{"codex_stricter":{"used_percent":88,"window_minutes":300}}},"id":1}`

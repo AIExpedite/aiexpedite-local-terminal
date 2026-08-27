@@ -1311,6 +1311,7 @@ func helperWriteRolloutLogAt(t *testing.T, base, day, name, ts string, frames []
 		t.Fatalf("mkdir %s: %v", dir, err)
 	}
 	var b strings.Builder
+	b.WriteString(codexRolloutHeaderLine(t, ts))
 	for _, rl := range frames {
 		line, err := json.Marshal(map[string]any{
 			"timestamp": ts,
@@ -1357,6 +1358,22 @@ func helperCodexAuthAt(t *testing.T, codexHome, email string, loginAt time.Time)
 // suite runs (auth.json would otherwise carry the real wall-clock mtime).
 var codexTestLogin = time.Date(2026, 6, 19, 9, 0, 0, 0, time.UTC)
 
+// codexRolloutHeaderLine is the `session_meta` record Codex writes as a
+// rollout's FIRST line. Fixtures must emit it because that header — not the
+// first surviving telemetry record — is what scopes a log to an account.
+func codexRolloutHeaderLine(t *testing.T, ts string) string {
+	t.Helper()
+	line, err := json.Marshal(map[string]any{
+		"timestamp": ts,
+		"type":      codexRolloutSessionMetaType,
+		"payload":   map[string]any{"id": "sess-" + ts},
+	})
+	if err != nil {
+		t.Fatalf("marshal rollout header: %v", err)
+	}
+	return string(line) + "\n"
+}
+
 // helperWriteRolloutLimitLog writes a rollout log for a session whose turn was
 // refused for quota: the `token_count` frame Codex emits in that state carries
 // NO window (both `primary` and `secondary` are null), and the turn ends with a
@@ -1369,6 +1386,7 @@ func helperWriteRolloutLimitLog(t *testing.T, base, day, name, ts string, frames
 		t.Fatalf("mkdir %s: %v", dir, err)
 	}
 	var b strings.Builder
+	b.WriteString(codexRolloutHeaderLine(t, ts))
 	writeLine := func(v map[string]any) {
 		line, err := json.Marshal(v)
 		if err != nil {
@@ -1780,7 +1798,8 @@ func helperWriteRolloutRawPayload(t *testing.T, base, day, name string, payload 
 	if err != nil {
 		t.Fatalf("marshal rollout line: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "rollout-"+name+".jsonl"), append(line, '\n'), 0o600); err != nil {
+	contents := append([]byte(codexRolloutHeaderLine(t, "2026-06-19T11:00:00.000Z")), line...)
+	if err := os.WriteFile(filepath.Join(dir, "rollout-"+name+".jsonl"), append(contents, '\n'), 0o600); err != nil {
 		t.Fatalf("write rollout log: %v", err)
 	}
 }
@@ -2033,7 +2052,8 @@ func TestCodexUsageParser_RolloutAcceptsCamelCaseFrames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "rollout-2026-06-19T11-00-00-camel.jsonl"), append(line, '\n'), 0o600); err != nil {
+	camel := append([]byte(codexRolloutHeaderLine(t, "2026-06-19T11:00:00.000Z")), line...)
+	if err := os.WriteFile(filepath.Join(dir, "rollout-2026-06-19T11-00-00-camel.jsonl"), append(camel, '\n'), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
@@ -2253,6 +2273,7 @@ func TestCodexUsageParser_RolloutUsageOnlyAfterExpiredResetDoesNotInheritStaleRe
 		},
 	}
 	var buf strings.Builder
+	buf.WriteString(codexRolloutHeaderLine(t, "2026-06-19T10:00:00.000Z"))
 	for _, f := range frames {
 		line, err := json.Marshal(map[string]any{
 			"timestamp": f["timestamp"],
