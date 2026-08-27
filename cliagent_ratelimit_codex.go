@@ -2033,9 +2033,16 @@ type codexReadDirResumeState struct {
 	f        *os.File
 	entries  []os.DirEntry
 	complete bool
-	gate     chan struct{}
-	refs     int
-	usedAt   time.Time
+	// Per-entry metadata work runs after enumeration reaches EOF, so a listing
+	// can be complete while the caller's budget expires part way through it.
+	// traversal remembers the reverse index still to be processed so the next
+	// bounded refresh continues past that prefix instead of re-Stat-ing the same
+	// newest names forever and never reaching the directory's older entries.
+	traversal    int
+	traversalSet bool
+	gate         chan struct{}
+	refs         int
+	usedAt       time.Time
 }
 
 const codexReadDirResumeLimit = 16
@@ -2060,7 +2067,10 @@ func codexCloseReadDirResume(dir string) {
 	}
 }
 
-func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, bool, error) {
+// codexReadDirContext returns the directory listing together with the reverse
+// index its caller should start from: len(entries)-1 for a fresh or partial
+// listing, or the position a previous interrupted metadata pass recorded.
+func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, int, bool, error) {
 	// Keep an interrupted directory stream open so the next bounded refresh
 	// resumes after the last complete chunk instead of repeatedly enumerating
 	// the same prefix. Serialize access because os.File's directory offset and
@@ -2079,7 +2089,7 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, bool, 
 	select {
 	case <-ctx.Done():
 		codexReadDirResumeRelease(dir, state, false)
-		return nil, false, ctx.Err()
+		return nil, 0, false, ctx.Err()
 	case <-state.gate:
 	}
 	// An open stream, accumulated entries, or a completed listing means this
@@ -2097,14 +2107,16 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, bool, 
 	// already queued still hold references to it. Reuse its complete listing;
 	// reopening here would append every directory entry a second time.
 	if state.complete {
-		remove = true
-		return append([]os.DirEntry(nil), state.entries...), true, nil
+		// The retained listing is what carries the metadata-traversal position, so
+		// it is retired by codexRecordReadDirTraversal once a caller works through
+		// it rather than by the first reader that consumes it.
+		return append([]os.DirEntry(nil), state.entries...), codexReadDirTraversalStart(state), true, nil
 	}
 	if state.f == nil {
 		f, err := os.Open(dir)
 		if err != nil {
 			remove = true
-			return nil, resumed, err
+			return nil, 0, resumed, err
 		}
 		state.f = f
 	}
@@ -2116,7 +2128,8 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, bool, 
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return append([]os.DirEntry(nil), state.entries[firstNew:]...), resumed, err
+			partial := append([]os.DirEntry(nil), state.entries[firstNew:]...)
+			return partial, len(partial) - 1, resumed, err
 		}
 		batch, readErr := state.f.ReadDir(codexRolloutReadDirChunkSize)
 		state.entries = append(state.entries, batch...)
@@ -2124,7 +2137,6 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, bool, 
 			_ = state.f.Close()
 			state.f = nil
 			state.complete = true
-			remove = true
 			break
 		}
 		if readErr != nil {
@@ -2132,14 +2144,50 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, bool, 
 			_ = state.f.Close()
 			state.f = nil
 			remove = true
-			return entries, resumed, readErr
+			return entries, len(entries) - 1, resumed, readErr
 		}
 	}
 	entries := state.entries
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name() < entries[j].Name()
 	})
-	return entries, resumed, nil
+	return entries, codexReadDirTraversalStart(state), resumed, nil
+}
+
+func codexReadDirTraversalStart(state *codexReadDirResumeState) int {
+	if state.traversalSet && state.traversal >= 0 && state.traversal < len(state.entries) {
+		return state.traversal
+	}
+	return len(state.entries) - 1
+}
+
+// codexRecordReadDirTraversal stores how far a caller processed a completed
+// listing. next is the reverse index still to be handled; a negative value means
+// the listing is exhausted, which retires the retained state so the following
+// refresh enumerates the directory from a fresh snapshot and can once again
+// authorize completed-scan progress.
+func codexRecordReadDirTraversal(dir string, next int) {
+	var closeFile *os.File
+	codexReadDirResumeMu.Lock()
+	if state := codexReadDirResumes[dir]; state != nil && state.complete {
+		state.usedAt = time.Now()
+		switch {
+		case next >= 0 && next < len(state.entries):
+			state.traversal, state.traversalSet = next, true
+		case state.refs == 0:
+			delete(codexReadDirResumes, dir)
+			closeFile, state.f = state.f, nil
+		default:
+			// Another reader still holds this listing. Drop the position rather
+			// than the state; that reader restarts from the newest entry, which is
+			// the behaviour a fresh enumeration would give it anyway.
+			state.traversal, state.traversalSet = 0, false
+		}
+	}
+	codexReadDirResumeMu.Unlock()
+	if closeFile != nil {
+		_ = closeFile.Close()
+	}
 }
 
 func codexReadDirResumeRelease(dir string, state *codexReadDirResumeState, remove bool) {
@@ -2191,7 +2239,7 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 			complete = false
 			return
 		}
-		entries, resumed, err := codexReadDirContext(ctx, dir)
+		entries, start, resumed, err := codexReadDirContext(ctx, dir)
 		if resumed {
 			// Resumed directory streams are intentionally retained across bounded
 			// refreshes, but reaching EOF does not prove the accumulated listing
@@ -2216,9 +2264,13 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 		consumePartialLeaf := err != nil && depth == 3
 		// os.ReadDir sorts by filename. Codex's zero-padded YYYY/MM/DD layout
 		// therefore becomes chronological when traversed in reverse.
-		for i := len(entries) - 1; i >= 0; i-- {
+		for i := start; i >= 0; i-- {
 			if !consumePartialLeaf && ctx.Err() != nil {
+				// Enumeration may already have reached EOF; only the metadata pass ran
+				// out of budget. Record where it stopped so the next refresh resumes
+				// below this prefix instead of re-walking it and stalling forever.
 				complete = false
+				codexRecordReadDirTraversal(dir, i)
 				return
 			}
 			entry := entries[i]
@@ -2262,6 +2314,7 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 				boundaryCandidates = append(boundaryCandidates, candidate)
 			}
 		}
+		codexRecordReadDirTraversal(dir, -1)
 	}
 	walkDateLayout(root, 0)
 	// Exact-mtime equality normally means the boundary is unchanged. On coarse

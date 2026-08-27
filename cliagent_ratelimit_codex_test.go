@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -2777,7 +2778,7 @@ func TestCodexReadDirContext_ChecksCancellationBetweenChunks(t *testing.T) {
 	}
 
 	ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
-	entries, _, err := codexReadDirContext(ctx, dir)
+	entries, _, _, err := codexReadDirContext(ctx, dir)
 	if err != context.Canceled {
 		t.Fatalf("err=%v, want context cancellation between directory chunks", err)
 	}
@@ -2797,7 +2798,7 @@ func TestCodexReadDirContext_ResumesAfterCancellation(t *testing.T) {
 	}
 
 	ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
-	entries, resumed, err := codexReadDirContext(ctx, dir)
+	entries, _, resumed, err := codexReadDirContext(ctx, dir)
 	if err != context.Canceled || len(entries) != codexRolloutReadDirChunkSize {
 		t.Fatalf("first read entries=%d err=%v, want one chunk and cancellation", len(entries), err)
 	}
@@ -2805,7 +2806,7 @@ func TestCodexReadDirContext_ResumesAfterCancellation(t *testing.T) {
 		t.Fatal("first directory read unexpectedly reported a resumed stream")
 	}
 
-	entries, resumed, err = codexReadDirContext(context.Background(), dir)
+	entries, _, resumed, err = codexReadDirContext(context.Background(), dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2828,13 +2829,13 @@ func TestCodexReadDirContext_RepeatedCancellationReturnsOnlyNewEntries(t *testin
 	}
 
 	firstCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
-	first, _, err := codexReadDirContext(firstCtx, dir)
+	first, _, _, err := codexReadDirContext(firstCtx, dir)
 	if err != context.Canceled || len(first) != codexRolloutReadDirChunkSize {
 		t.Fatalf("first read entries=%d err=%v, want one chunk and cancellation", len(first), err)
 	}
 
 	secondCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
-	second, _, err := codexReadDirContext(secondCtx, dir)
+	second, _, _, err := codexReadDirContext(secondCtx, dir)
 	if err != context.Canceled || len(second) != codexRolloutReadDirChunkSize {
 		t.Fatalf("second read entries=%d err=%v, want only the newly completed chunk", len(second), err)
 	}
@@ -2858,7 +2859,7 @@ func TestCodexReadDirContext_CancelsWhileAnotherReadOwnsDirectory(t *testing.T) 
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
+	if _, _, _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
 		t.Fatalf("err=%v, want cancellation while waiting for the per-directory gate", err)
 	}
 }
@@ -2884,7 +2885,7 @@ func TestCodexReadDirContext_ReusesCompletedListingForQueuedReader(t *testing.T)
 	codexReadDirResumeMu.Unlock()
 	t.Cleanup(func() { codexCloseReadDirResume(dir) })
 
-	got, resumed, err := codexReadDirContext(context.Background(), dir)
+	got, _, resumed, err := codexReadDirContext(context.Background(), dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2907,7 +2908,7 @@ func TestCodexReadDirResume_EvictsAbandonedStreams(t *testing.T) {
 			}
 		}
 		ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
-		if _, _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
+		if _, _, _, err := codexReadDirContext(ctx, dir); err != context.Canceled {
 			t.Fatalf("read %d err=%v, want interrupted resumable stream", i, err)
 		}
 	}
@@ -3000,6 +3001,104 @@ func TestCodexDiscoverRolloutCandidates_ResumedCompletionRequiresFreshPass(t *te
 	}
 	if !found {
 		t.Fatalf("fresh candidates omitted rollout created during resumed enumeration: %q", missedPath)
+	}
+}
+
+func TestCodexReadDirContext_ResumesMetadataTraversalAfterCompletedListing(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	const total = 4
+	for i := 0; i < total; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entries, start, resumed, err := codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed || start != total-1 || len(entries) != total {
+		t.Fatalf("fresh listing entries=%d start=%d resumed=%v, want a full listing traversed from the newest name", len(entries), start, resumed)
+	}
+
+	// The caller reached EOF but ran out of budget part way through its per-entry
+	// metadata pass. The retained listing must hand that position back.
+	codexRecordReadDirTraversal(dir, 1)
+	entries, start, resumed, err = codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resumed || start != 1 || len(entries) != total {
+		t.Fatalf("resumed listing entries=%d start=%d resumed=%v, want the recorded traversal position", len(entries), start, resumed)
+	}
+
+	// Exhausting the listing retires the retained state so the next refresh
+	// enumerates a fresh snapshot and can authorize completed-scan progress.
+	codexRecordReadDirTraversal(dir, -1)
+	entries, start, resumed, err = codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed || start != total-1 || len(entries) != total {
+		t.Fatalf("post-traversal listing entries=%d start=%d resumed=%v, want a fresh enumeration", len(entries), start, resumed)
+	}
+}
+
+func TestCodexDiscoverRolloutCandidates_ResumesMetadataTraversalAfterCancellation(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const total = 6
+	for i := 0; i < total; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Enumeration reaches EOF and the budget expires during the per-entry Stat
+	// pass. Both refreshes get the same budget, so without a metadata cursor the
+	// second one would re-walk the identical newest prefix and the leaf's older
+	// rollouts could never be discovered.
+	names := func(candidates []codexRolloutCandidate) []string {
+		got := make([]string, 0, len(candidates))
+		for _, candidate := range candidates {
+			got = append(got, filepath.Base(candidate.path))
+		}
+		return got
+	}
+	first, complete := codexDiscoverRolloutCandidates(
+		&cancelAfterChecksContext{after: 19, done: make(chan struct{})}, base, codexRolloutScanCursor{},
+	)
+	if complete {
+		t.Fatal("first discovery complete=true, want an interrupted metadata pass")
+	}
+	wantFirst := []string{"rollout-0005.jsonl", "rollout-0004.jsonl", "rollout-0003.jsonl"}
+	if !reflect.DeepEqual(names(first), wantFirst) {
+		t.Fatalf("first candidates=%v, want the newest prefix %v", names(first), wantFirst)
+	}
+
+	second, complete := codexDiscoverRolloutCandidates(
+		&cancelAfterChecksContext{after: 19, done: make(chan struct{})}, base, codexRolloutScanCursor{},
+	)
+	if complete {
+		t.Fatal("resumed discovery complete=true, want advancement deferred until a fresh pass")
+	}
+	wantSecond := []string{"rollout-0002.jsonl", "rollout-0001.jsonl", "rollout-0000.jsonl"}
+	if !reflect.DeepEqual(names(second), wantSecond) {
+		t.Fatalf("resumed candidates=%v, want the unreached remainder %v", names(second), wantSecond)
+	}
+
+	// The exhausted listing is retired, so an unbudgeted refresh enumerates the
+	// directory fresh and may once again advance completed-scan progress.
+	third, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{})
+	if !complete || len(third) != total {
+		t.Fatalf("fresh discovery complete=%v candidates=%d, want a full %d-entry pass", complete, len(third), total)
 	}
 }
 
