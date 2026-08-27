@@ -111,9 +111,21 @@ type CLISession struct {
 	// can publish the fail-fast error frame without threading it through.
 	publishFn PublishFunc
 
-	mu         sync.Mutex
-	done       chan struct{} // closed when process exits
-	streamDone chan struct{} // closed when stdout/stderr and stream publishes finish
+	mu sync.Mutex
+	// processExited closes immediately after Process.Wait returns. done closes
+	// only after stream producers and their publishes drain; EndSession waits on
+	// the former while the watcher retains the ID through terminal publication.
+	processExited chan struct{}
+	done          chan struct{}
+	// killUnconfirmed marks a session whose EndSession escalated to Kill and
+	// then timed out waiting for the exit watcher. The session is RETAINED as
+	// a tombstone (see end_confirm.go): only probeProcessGone may convert it
+	// into the "not found" absence answer the server frees a device on.
+	killUnconfirmed bool
+	streamDone      chan struct{} // closed when stdout/stderr and stream publishes finish
+	// terminalPublishState reserves this session's ID while its session_ended
+	// frame is in flight — see end_confirm.go.
+	terminalPublishState
 }
 
 // claudeFirstFrameTimeout bounds how long a freshly-started claude session may
@@ -342,6 +354,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
 		deferredStdinClose: stdinPromptFormat(command) == "plain" && stdinPrompt == "",
 		firstRealFrame:     make(chan struct{}),
+		processExited:      make(chan struct{}),
 		done:               make(chan struct{}),
 		streamDone:         make(chan struct{}),
 		publishFn:          publishFn,
@@ -565,15 +578,50 @@ func (sm *SessionManager) EndSession(id string) error {
 	if !exists {
 		return fmt.Errorf("session %s not found", id)
 	}
+	processExited := processExitSignal(session.processExited, session.done)
+	select {
+	case <-processExited:
+		// The watcher owns stream drain, artifact collection, terminal
+		// publication, and removal. Keep the ID reserved until it completes.
+		return nil
+	default:
+	}
 
 	session.mu.Lock()
 	if session.Status == "ended" {
 		session.mu.Unlock()
-		// Already ended — just clean up from map
-		sm.removeSession(id)
+		// The watcher owns terminal publication and removal; retain the ID until
+		// it has established the in-flight publish reservation.
 		return nil
 	}
+	unconfirmed := session.killUnconfirmed
 	session.mu.Unlock()
+
+	// A prior EndSession already escalated to Kill and timed out on the exit
+	// watcher. The session is a retained tombstone: only VERIFIED OS-level
+	// process absence may become the "not found" answer the server frees the
+	// device on (Codex P1 — see end_confirm.go).
+	if unconfirmed {
+		if probeProcessGone(session.Process) {
+			if !streamDrainConfirmed(session.streamDone) {
+				return fmt.Errorf("session %s process absence verified but old stream publishers have not drained; session retained: %w", id, errEndUnconfirmed)
+			}
+			if !sm.removeSessionIfSame(id, session) {
+				// See CodexAppServerManager.End — the ID is not ours to free.
+				return fmt.Errorf("session %s could not be released — a terminal frame is still in flight or the ID was re-taken: %w", id, errEndUnconfirmed)
+			}
+			return fmt.Errorf("session %s not found", id)
+		}
+		if session.Process.Process != nil {
+			if killErr := session.Process.Process.Kill(); killErr != nil {
+				fmt.Printf("%s[session] Re-kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
+			}
+		}
+		if waitDoneConfirm(processExited, killConfirmTimeout) {
+			return nil
+		}
+		return fmt.Errorf("session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
+	}
 
 	fmt.Printf("%s[session] Ending session %s gracefully...%s\n", colorYellow, id, colorReset)
 
@@ -582,17 +630,33 @@ func (sm *SessionManager) EndSession(id string) error {
 
 	// Wait for exit or timeout
 	select {
-	case <-session.done:
+	case <-processExited:
 		// Process exited gracefully
 	case <-time.After(gracefulShutdownTimeout):
 		// Force kill after timeout
 		fmt.Printf("%s[session] Force killing session %s (graceful shutdown timed out)%s\n",
 			colorRed, id, colorReset)
-		_ = session.Process.Process.Kill()
-		<-session.done // Wait for exit after kill
+		if killErr := session.Process.Process.Kill(); killErr != nil {
+			fmt.Printf("%s[session] Kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
+		}
+		// BOUNDED wait for exit after kill — see end_confirm.go for why
+		// blocking here indefinitely wedged an entire device (2026-08-27).
+		if !waitDoneConfirm(processExited, killConfirmTimeout) {
+			fmt.Printf("%s[session] Kill unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
+				colorRed, id, killConfirmTimeout, colorReset)
+			session.mu.Lock()
+			session.killUnconfirmed = true
+			session.mu.Unlock()
+			// Deliberately NOT "session <id> not found": the process may
+			// still be alive, and the server must keep the device fenced
+			// until absence is VERIFIED (see the tombstone branch above).
+			return fmt.Errorf("session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
+		}
 	}
 
-	sm.removeSession(id)
+	// Process exit is only the first lifecycle boundary. The watcher retains
+	// ownership until stream drain, artifact collection, and session_ended
+	// delivery finish, then removes the session from its release callback.
 	return nil
 }
 
@@ -664,6 +728,35 @@ func (sm *SessionManager) removeSession(id string) {
 	}
 	delete(sm.sessions, id)
 	sm.mu.Unlock()
+}
+
+// removeSessionIfSame removes id only while it still maps to THIS session —
+// see CodexAppServerManager.removeSessionIfSame for the reused-ID watcher
+// race this prevents (Codex P2).//
+// It also refuses while a terminal frame is in flight for s: the frame is
+// already travelling under this ID, so freeing the ID now would let a
+// replacement Start receive it as its own shutdown evidence (Codex P2, round
+// 4). The publisher performs the removal itself once delivery completes.
+//
+// Returns whether id is free of s afterwards — false means either a
+// replacement already owns the ID or the release is deferred to the in-flight
+// publisher, and in both cases the caller must NOT report this session's
+// absence.
+func (sm *SessionManager) removeSessionIfSame(id string, s *CLISession) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	cur, ok := sm.sessions[id]
+	if !ok {
+		return true
+	}
+	if cur != s || s.terminalPublishInFlight() {
+		return false
+	}
+	if s.Process != nil && s.Process.Process != nil {
+		globalProcessRegistry.Deregister(s.Process.Process.Pid)
+	}
+	delete(sm.sessions, id)
+	return true
 }
 
 // shouldCloseStdinAfterStart decides whether to close the child process's
@@ -1289,6 +1382,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	}
 
 	err := session.Process.Wait()
+	closeProcessExited(session.processExited)
 
 	if timeoutTimer != nil {
 		timeoutTimer.Stop()
@@ -1359,13 +1453,13 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// Shared with every bundled-CLI manager (see session_artifacts.go): the
 	// scan used to live inline here, which is why only this PTY path ever
 	// uploaded anything.
-	uploadedFiles, uploadErrors := collectSessionArtifacts(
-		sm.Config,
-		session.ID,
-		session.WorkspaceID,
-		session.Process.Dir,
-		session.StartedAt,
-	)
+	// BOUNDED: a hung scan/upload here would suppress the session_ended frame
+	// terminal-service is waiting for (see sessionArtifactCollectTimeout).
+	var uploadedFiles []FileInfo
+	var uploadErrors []UploadError
+	if reserveSessionForTerminalWork(&sm.mu, sm.sessions, session.ID, session, &session.terminalPublishState) {
+		uploadedFiles, uploadErrors, _ = collectSessionArtifactsBounded(sm.Config, session.ID, session.WorkspaceID, session.Process.Dir, session.StartedAt, sessionArtifactCollectTimeout)
+	}
 
 	// Publish session_ended in a goroutine: publishFn blocks up to 30 s on
 	// Pub/Sub network I/O.  Calling it directly here would delay removeSession
@@ -1373,7 +1467,14 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// race the async stream publishes already in-flight from readOutputStream —
 	// the session_ended message could arrive at the client before the last
 	// streamed lines despite having a higher sequence number.
-	publishTerminalResultAsync(publishFn, resultMsg{
+	// A wedged watcher can reach this point long after a verified-absence
+	// End dropped the tombstone and a replacement Start re-took the ID. The
+	// terminal frame is shutdown evidence: delivered while the ID belongs to
+	// a replacement, it releases the server's fence for a session that is
+	// still running (Codex P2, round 3 — the identity guard covered only map
+	// removal). Publish it only while the ID is still THIS session's, atomically
+	// re-reserving an already-unclaimed ID against Start's registration.
+	if !publishTerminalIfCurrent(&sm.mu, sm.sessions, session.ID, session, &session.terminalPublishState, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
 		UID:          session.UID,
@@ -1387,13 +1488,17 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 		Seq:          int(seq),
 		Files:        uploadedFiles,
 		UploadErrors: uploadErrors,
-	})
+	}, func() { sm.removeSessionIfSame(session.ID, session) }) {
+		fmt.Printf("%s[session] Suppressed stale session_ended for %s — the ID now belongs to a replacement session%s\n",
+			colorYellow, session.ID, colorReset)
+	}
 
 	fmt.Printf("%s[session] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, session.ExitCode, colorReset)
 
-	// Remove from session map
-	sm.removeSession(session.ID)
+	// Remove from session map. No-op while the ended frame is still in flight —
+	// the publisher's release callback owns the removal in that case.
+	sm.removeSessionIfSame(session.ID, session)
 }
 
 /* --------------------------------------------------------------------------

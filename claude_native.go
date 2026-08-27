@@ -100,14 +100,23 @@ type ClaudeNativeSession struct {
 	WorkspaceID string
 	UID         string
 
-	mu         sync.Mutex
-	status     string // "running" | "ended"
-	exitCode   int
-	stdinMu    sync.Mutex
-	stdinClose sync.Once
-	done       chan struct{}
-	streamDone chan struct{}
-	seq        int64
+	mu            sync.Mutex
+	status        string // "running" | "ended"
+	exitCode      int
+	stdinMu       sync.Mutex
+	stdinClose    sync.Once
+	processExited chan struct{}
+	done          chan struct{}
+	streamDone    chan struct{}
+	seq           int64
+	// killUnconfirmed marks a session whose End escalated to Kill and then
+	// timed out waiting for the exit watcher. The session is RETAINED as a
+	// tombstone (see end_confirm.go): only probeProcessGone may convert it
+	// into the "not found" absence answer the server frees a device on.
+	killUnconfirmed bool
+	// terminalPublishState reserves this session's ID while its claude_native_ended
+	// frame is in flight — see end_confirm.go.
+	terminalPublishState
 }
 
 // Status returns the current lifecycle status under the session mutex.
@@ -122,6 +131,18 @@ func (s *ClaudeNativeSession) closeStdin() {
 	s.stdinClose.Do(func() {
 		_ = s.Stdin.Close()
 	})
+}
+
+func (s *ClaudeNativeSession) isKillUnconfirmed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.killUnconfirmed
+}
+
+func (s *ClaudeNativeSession) markKillUnconfirmed() {
+	s.mu.Lock()
+	s.killUnconfirmed = true
+	s.mu.Unlock()
 }
 
 // claudeUserEnvelope wraps a user turn's plain text in the NDJSON envelope
@@ -246,17 +267,18 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 	}
 
 	session := &ClaudeNativeSession{
-		ID:          id,
-		Process:     proc,
-		Stdin:       stdin,
-		Stdout:      stdout,
-		Stderr:      stderr,
-		StartedAt:   time.Now(),
-		WorkspaceID: workspaceID,
-		UID:         uid,
-		status:      "running",
-		done:        make(chan struct{}),
-		streamDone:  make(chan struct{}),
+		ID:            id,
+		Process:       proc,
+		Stdin:         stdin,
+		Stdout:        stdout,
+		Stderr:        stderr,
+		StartedAt:     time.Now(),
+		WorkspaceID:   workspaceID,
+		UID:           uid,
+		status:        "running",
+		done:          make(chan struct{}),
+		processExited: make(chan struct{}),
+		streamDone:    make(chan struct{}),
 	}
 
 	m.sessions[id] = session
@@ -381,10 +403,45 @@ func (m *ClaudeNativeManager) End(id string) error {
 	if session == nil {
 		return fmt.Errorf("claude native session %s not found", id)
 	}
+	processExited := processExitSignal(session.processExited, session.done)
+	select {
+	case <-processExited:
+		// The watcher owns artifact collection, terminal publication and removal.
+		return nil
+	default:
+	}
 
 	if session.Status() == "ended" {
-		m.removeSession(id)
+		// The watcher owns terminal publication and removal; retain the ID until
+		// it has established the in-flight publish reservation.
 		return nil
+	}
+
+	// A prior End already escalated to Kill and timed out on the exit
+	// watcher. The session is a retained tombstone: only VERIFIED OS-level
+	// process absence may become the "not found" answer the server frees the
+	// device on (Codex P1 — see end_confirm.go).
+	if session.isKillUnconfirmed() {
+		if probeProcessGone(session.Process) {
+			if !streamDrainConfirmed(session.streamDone) {
+				return fmt.Errorf("claude native session %s process absence verified but old stream publishers have not drained; session retained: %w", id, errEndUnconfirmed)
+			}
+			if !m.removeSessionIfSame(id, session) {
+				// See CodexAppServerManager.End — the ID is not ours to free.
+				return fmt.Errorf("claude native session %s could not be released — a terminal frame is still in flight or the ID was re-taken: %w", id, errEndUnconfirmed)
+			}
+			return fmt.Errorf("claude native session %s not found", id)
+		}
+		if session.Process.Process != nil {
+			if killErr := session.Process.Process.Kill(); killErr != nil {
+				fmt.Printf("%s[claude-native] Re-kill failed for %s: %v%s\n",
+					colorRed, id, killErr, colorReset)
+			}
+		}
+		if waitDoneConfirm(processExited, killConfirmTimeout) {
+			return nil
+		}
+		return fmt.Errorf("claude native session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
 	}
 
 	fmt.Printf("%s[claude-native] Ending session %s gracefully...%s\n",
@@ -393,24 +450,38 @@ func (m *ClaudeNativeManager) End(id string) error {
 	session.closeStdin()
 
 	select {
-	case <-session.done:
+	case <-processExited:
 	case <-time.After(claudeNativeGracefulShutdownTimeout):
 		fmt.Printf("%s[claude-native] Stdin close didn't exit %s — interrupting%s\n",
 			colorYellow, id, colorReset)
 		_ = interruptProcess(session.Process)
 		select {
-		case <-session.done:
+		case <-processExited:
 		case <-time.After(claudeNativeGracefulShutdownTimeout):
 			fmt.Printf("%s[claude-native] Force killing session %s%s\n",
 				colorRed, id, colorReset)
 			if session.Process.Process != nil {
-				_ = session.Process.Process.Kill()
+				if killErr := session.Process.Process.Kill(); killErr != nil {
+					fmt.Printf("%s[claude-native] Kill failed for %s: %v%s\n",
+						colorRed, id, killErr, colorReset)
+				}
 			}
-			<-session.done
+			// BOUNDED wait — see end_confirm.go for why blocking here
+			// indefinitely wedged an entire device (2026-08-27).
+			if !waitDoneConfirm(processExited, killConfirmTimeout) {
+				fmt.Printf("%s[claude-native] Kill unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
+					colorRed, id, killConfirmTimeout, colorReset)
+				session.markKillUnconfirmed()
+				// Deliberately NOT "session <id> not found": the process may
+				// still be alive, and the server must keep the device fenced
+				// until absence is VERIFIED (see the tombstone branch above).
+				return fmt.Errorf("claude native session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
+			}
 		}
 	}
 
-	m.removeSession(id)
+	// The watcher retains the exited session until terminal publication is
+	// reserved, so a replacement cannot steal the old frame's session ID.
 	return nil
 }
 
@@ -485,6 +556,35 @@ func (m *ClaudeNativeManager) removeSession(id string) {
 	}
 	delete(m.sessions, id)
 	m.mu.Unlock()
+}
+
+// removeSessionIfSame removes id only while it still maps to THIS session —
+// see CodexAppServerManager.removeSessionIfSame for the reused-ID watcher
+// race this prevents (Codex P2).//
+// It also refuses while a terminal frame is in flight for s: the frame is
+// already travelling under this ID, so freeing the ID now would let a
+// replacement Start receive it as its own shutdown evidence (Codex P2, round
+// 4). The publisher performs the removal itself once delivery completes.
+//
+// Returns whether id is free of s afterwards — false means either a
+// replacement already owns the ID or the release is deferred to the in-flight
+// publisher, and in both cases the caller must NOT report this session's
+// absence.
+func (m *ClaudeNativeManager) removeSessionIfSame(id string, s *ClaudeNativeSession) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.sessions[id]
+	if !ok {
+		return true
+	}
+	if cur != s || s.terminalPublishInFlight() {
+		return false
+	}
+	if s.Process != nil && s.Process.Process != nil {
+		globalProcessRegistry.Deregister(s.Process.Process.Pid)
+	}
+	delete(m.sessions, id)
+	return true
 }
 
 /* --------------------------------------------------------------------------
@@ -699,6 +799,7 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 	// from pipe cleanup (Close below, gated on streamDone) — same pattern as
 	// the Grok ACP manager.
 	state, _ := session.Process.Process.Wait()
+	closeProcessExited(session.processExited)
 
 	// Drain the scanner goroutines BEFORE closing pipes so they see EOF
 	// naturally on the OS pipe buffer, including the final frame. The child's
@@ -735,17 +836,25 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 	// does on the PTY path's session_ended. Skipping this is what made every
 	// capture run through a bundled CLI report NO_MEDIA_UPLOADED while the
 	// recording sat on the device (prod 2026-08-20, video project vp_a72774c5).
-	uploadedFiles, uploadErrors := collectSessionArtifacts(
-		m.Config,
-		session.ID,
-		session.WorkspaceID,
-		session.Process.Dir,
-		session.StartedAt,
-	)
+	// BOUNDED: a hung scan/upload here used to suppress the ended frame. End
+	// callers now unblock on processExited above, while session.done remains a
+	// later watcher/publication lifecycle signal.
+	var uploadedFiles []FileInfo
+	var uploadErrors []UploadError
+	if reserveSessionForTerminalWork(&m.mu, m.sessions, session.ID, session, &session.terminalPublishState) {
+		uploadedFiles, uploadErrors, _ = collectSessionArtifactsBounded(m.Config, session.ID, session.WorkspaceID, session.Process.Dir, session.StartedAt, sessionArtifactCollectTimeout)
+	}
 
 	seq := atomic.AddInt64(&session.seq, 1)
 
-	publishTerminalResultAsync(publishFn, resultMsg{
+	// A wedged watcher can reach this point long after a verified-absence
+	// End dropped the tombstone and a replacement Start re-took the ID. The
+	// terminal frame is shutdown evidence: delivered while the ID belongs to
+	// a replacement, it releases the server's fence for a session that is
+	// still running (Codex P2, round 3 — the identity guard covered only map
+	// removal). Publish it only while the ID is still THIS session's, atomically
+	// re-reserving an already-unclaimed ID against Start's registration.
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, session.ID, session, &session.terminalPublishState, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
 		UID:          session.UID,
@@ -759,12 +868,17 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 		Seq:          int(seq),
 		Files:        uploadedFiles,
 		UploadErrors: uploadErrors,
-	})
+	}, func() { m.removeSessionIfSame(session.ID, session) }) {
+		fmt.Printf("%s[claude-native] Suppressed stale claude_native_ended for %s — the ID now belongs to a replacement session%s\n",
+			colorYellow, session.ID, colorReset)
+	}
 
 	close(session.done)
 
 	fmt.Printf("%s[claude-native] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, exit, colorReset)
 
-	m.removeSession(session.ID)
+	// No-op while the ended frame is still in flight — the publisher's release
+	// callback owns the removal in that case (end_confirm.go).
+	m.removeSessionIfSame(session.ID, session)
 }

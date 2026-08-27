@@ -31,6 +31,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -108,6 +109,11 @@ type AntigravityNativeSession struct {
 	// turnMu serialises Send so two concurrent turns cannot race on the same
 	// native conversation or interleave transcript updates.
 	turnMu sync.Mutex
+	// endDrainUnconfirmed marks a session whose End cancelled/killed its turn
+	// and then timed out on the turnMu drain barrier. The session is RETAINED
+	// as a tombstone (see end_confirm.go): only a verified-absent turn process
+	// may convert it into the "not found" absence answer.
+	endDrainUnconfirmed bool
 }
 
 type antigravityTurn struct {
@@ -276,9 +282,9 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid, resum
 	// error and desync Pub/Sub retry state from the manager.
 	m.mu.Lock()
 	if existing, exists := m.sessions[id]; exists {
-		ackExistingAntigravitySession(existing, id, publishFn, onStarted)
+		err := ackExistingAntigravitySession(existing, id, publishFn, onStarted)
 		m.mu.Unlock()
-		return nil
+		return err
 	}
 	m.mu.Unlock()
 
@@ -290,8 +296,7 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid, resum
 	defer m.mu.Unlock()
 	// Re-check after probe: a concurrent Start for the same id may have won.
 	if existing, exists := m.sessions[id]; exists {
-		ackExistingAntigravitySession(existing, id, publishFn, onStarted)
-		return nil
+		return ackExistingAntigravitySession(existing, id, publishFn, onStarted)
 	}
 
 	session := &AntigravityNativeSession{
@@ -324,22 +329,27 @@ func (m *AntigravityNativeManager) Start(id, cwd string, workspaceID, uid, resum
 
 // ackExistingAntigravitySession refreshes the publisher binding and re-acks
 // started for an already-registered logical session. Caller must hold m.mu.
-func ackExistingAntigravitySession(existing *AntigravityNativeSession, id string, publishFn PublishFunc, onStarted func()) {
+func ackExistingAntigravitySession(existing *AntigravityNativeSession, id string, publishFn PublishFunc, onStarted func()) error {
 	// Pub/Sub redelivery / terminal-service retry of the same start must
 	// re-ack started without ending the still-usable local session. Emitting
 	// antigravity_native_ended here would release the cloud reservation while
 	// the manager still holds the session, breaking later Sends.
 	// Refresh publishFn so a newer publisher binding still reaches GC.
-	if publishFn != nil {
-		existing.mu.Lock()
-		existing.publishFn = publishFn
+	existing.mu.Lock()
+	if existing.status == "ended" || existing.endDrainUnconfirmed {
 		existing.mu.Unlock()
+		return fmt.Errorf("antigravity native session %s is ending; retained tombstone cannot acknowledge start", id)
 	}
+	if publishFn != nil {
+		existing.publishFn = publishFn
+	}
+	existing.mu.Unlock()
 	fmt.Printf("%s[antigravity-native] Session %s already registered — idempotent start ack%s\n",
 		colorCyan, id, colorReset)
 	if onStarted != nil {
 		onStarted()
 	}
+	return nil
 }
 
 // Send runs one user turn: spawn `agy --print <prompt>` (with --conversation
@@ -825,10 +835,17 @@ func (m *AntigravityNativeManager) End(id string) error {
 		// on the same barrier here so this duplicate End does not return — letting
 		// its handler publish antigravity_native_ended — before the running turn
 		// has emitted its final stderr/error frames. Returns immediately when no
-		// turn is active.
-		session.turnMu.Lock()
-		session.turnMu.Unlock() //nolint:staticcheck // intentional drain barrier, not a guarded region
-		m.removeSession(id)
+		// turn is active. BOUNDED — see end_confirm.go for why blocking here
+		// indefinitely wedged an entire device (2026-08-27).
+		if !waitTurnBarrier(&session.turnMu, turnDrainConfirmTimeout) {
+			return m.retainOrResolveDrainTombstone(id, session)
+		}
+		// A concurrent End can have removed this session and a replacement
+		// Start re-taken the ID while we were on the barrier; publishing ended
+		// for it would tear the replacement down (Codex P2, round 4).
+		if !m.removeSessionIfSame(id, session) {
+			return staleEndError("antigravity native", id)
+		}
 		return nil
 	}
 	session.status = "ended"
@@ -851,13 +868,69 @@ func (m *AntigravityNativeManager) End(id string) error {
 	// orders that terminal frame last (no post-ended stderr on stop/cancel),
 	// matching Claude/Codex/Grok which wait on process/stream completion before
 	// emitting ended. Returns immediately when no turn is active, and the
-	// cancel/kill above guarantees the running turn unwinds promptly.
-	session.turnMu.Lock()
-	session.turnMu.Unlock() //nolint:staticcheck // intentional drain barrier, not a guarded region
+	// cancel/kill above guarantees the running turn unwinds promptly. BOUNDED —
+	// see end_confirm.go for why blocking here indefinitely wedged an entire
+	// device (2026-08-27).
+	if !waitTurnBarrier(&session.turnMu, turnDrainConfirmTimeout) {
+		return m.retainOrResolveDrainTombstone(id, session)
+	}
 
-	m.removeSession(id)
+	if !m.removeSessionIfSame(id, session) {
+		return staleEndError("antigravity native", id)
+	}
 	fmt.Printf("%s[antigravity-native] Session %s ended%s\n", colorYellow, id, colorReset)
 	return nil
+}
+
+// retainOrResolveDrainTombstone is the shared verdict for a turn drain that
+// did not confirm within its bound. The wedged turn goroutine may still act
+// under this session, so the session is RETAINED as a tombstone rather than
+// deregistered — an immediate removal would manufacture the "not found"
+// absence answer the server frees the device on while the turn might still
+// be running (Codex P1; see end_confirm.go).
+//
+// Resolution needs BOTH halves of "this session can no longer act":
+//  1. the turn process is verifiably gone (no recorded process, or an
+//     OS-level probe confirming the recorded one is absent), and
+//  2. the turn barrier has actually drained.
+//
+// (2) is not implied by (1): the turn runner clears activeProcess and then
+// keeps holding turnMu while it publishes its final frames and finishes its
+// post-process bookkeeping. Resolving on process absence alone freed the ID
+// for a replacement Start while that goroutine was still live, letting it
+// publish and mutate conversation state under the replacement session (Codex
+// P2, round 3). The barrier re-test here is non-blocking — every caller has
+// already waited turnDrainConfirmTimeout on it — so this adds no delay.
+//
+// While either half is unmet the process is re-killed and the fence stays up
+// — visibly.
+func (m *AntigravityNativeManager) retainOrResolveDrainTombstone(id string, session *AntigravityNativeSession) error {
+	session.mu.Lock()
+	session.endDrainUnconfirmed = true
+	proc := session.activeProcess
+	session.mu.Unlock()
+
+	if proc != nil && !probeProcessGone(proc) {
+		killAntigravityProcessTree(proc)
+		fmt.Printf("%s[antigravity-native] Turn drain unconfirmed for %s after %s — turn process still alive; retaining tombstone%s\n",
+			colorRed, id, turnDrainConfirmTimeout, colorReset)
+		// Deliberately NOT "session <id> not found" — see end_confirm.go.
+		return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session retained pending process-absence verification: %w", id, turnDrainConfirmTimeout, errEndUnconfirmed)
+	}
+
+	// Process absent (or never recorded) is only half the evidence: a turn
+	// goroutine still holding turnMu can publish and mutate state under this
+	// ID. Non-blocking re-test — the caller already spent the full bound here.
+	if !waitTurnBarrier(&session.turnMu, 0) {
+		fmt.Printf("%s[antigravity-native] Turn drain unconfirmed for %s after %s — turn goroutine still holding the barrier; retaining tombstone%s\n",
+			colorRed, id, turnDrainConfirmTimeout, colorReset)
+		return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session retained pending turn-drain verification: %w", id, turnDrainConfirmTimeout, errEndUnconfirmed)
+	}
+
+	if !m.removeSessionIfSame(id, session) {
+		return staleEndError("antigravity native", id)
+	}
+	return fmt.Errorf("antigravity native session %s not found", id)
 }
 
 func (m *AntigravityNativeManager) Get(id string) *AntigravityNativeSession {
@@ -911,7 +984,18 @@ func (m *AntigravityNativeManager) endStaleSessions(maxAge time.Duration) {
 	for _, ss := range stale {
 		fmt.Printf("%s[antigravity-native] Reaping stale session %s%s\n", colorYellow, ss.id, colorReset)
 		trackTerminalPublishStart()
-		_ = m.End(ss.id)
+		// errEndStaleSession is withheld for the same reason the `*_end` handler
+		// withholds it: the reap raced a replacement Start, so the ID now names
+		// a LIVE session and this frame — keyed only by session ID — would be
+		// read as its shutdown evidence (Codex P2, round 4). errEndUnconfirmed
+		// is withheld because the tombstone was retained and the process may
+		// still be alive; the next GC tick retries that one.
+		if err := m.End(ss.id); errors.Is(err, errEndUnconfirmed) || errors.Is(err, errEndStaleSession) {
+			fmt.Printf("%s[antigravity-native] Stale reap withheld ended frame for %s — %v%s\n",
+				colorRed, ss.id, err, colorReset)
+			trackTerminalPublishEnd()
+			continue
+		}
 		if ss.publishFn == nil {
 			trackTerminalPublishEnd()
 			continue
@@ -951,6 +1035,28 @@ func (m *AntigravityNativeManager) removeSession(id string) {
 	m.mu.Lock()
 	delete(m.sessions, id)
 	m.mu.Unlock()
+}
+
+// removeSessionIfSame removes id only while it still maps to THIS session —
+// see CodexAppServerManager.removeSessionIfSame for the reused-ID race this
+// prevents (Codex P2).//
+// Returns whether id is free of s afterwards. FALSE means a replacement Start
+// already re-took the ID while this caller was draining — the caller's End
+// succeeded, but it must not let its handler publish the terminal frame,
+// because that frame is keyed only by session ID and the server would read it
+// as shutdown evidence for the live replacement (Codex P2, round 4).
+func (m *AntigravityNativeManager) removeSessionIfSame(id string, s *AntigravityNativeSession) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.sessions[id]
+	if !ok {
+		return true
+	}
+	if cur != s {
+		return false
+	}
+	delete(m.sessions, id)
+	return true
 }
 
 func (m *AntigravityNativeManager) publishTurnError(session *AntigravityNativeSession, publishFn PublishFunc, msg string) error {

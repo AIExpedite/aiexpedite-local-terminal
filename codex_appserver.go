@@ -142,14 +142,23 @@ type CodexAppServerSession struct {
 	WorkspaceID string
 	UID         string
 
-	mu         sync.Mutex
-	status     string // "running" | "ended"
-	exitCode   int
-	stdinMu    sync.Mutex
-	stdinClose sync.Once
-	done       chan struct{}
-	streamDone chan struct{}
-	seq        int64
+	mu            sync.Mutex
+	status        string // "running" | "ended"
+	exitCode      int
+	stdinMu       sync.Mutex
+	stdinClose    sync.Once
+	processExited chan struct{}
+	done          chan struct{}
+	streamDone    chan struct{}
+	seq           int64
+	// killUnconfirmed marks a session whose End escalated to Kill and then
+	// timed out waiting for the exit watcher. The session is RETAINED as a
+	// tombstone (see end_confirm.go): only probeProcessGone may convert it
+	// into the "not found" absence answer the server frees a device on.
+	killUnconfirmed bool
+	// terminalPublishState reserves this session's ID while its codex_appserver_ended
+	// frame is in flight — see end_confirm.go.
+	terminalPublishState
 }
 
 // Status returns the current lifecycle status under the session mutex so
@@ -167,6 +176,18 @@ func (s *CodexAppServerSession) closeStdin() {
 	s.stdinClose.Do(func() {
 		_ = s.Stdin.Close()
 	})
+}
+
+func (s *CodexAppServerSession) isKillUnconfirmed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.killUnconfirmed
+}
+
+func (s *CodexAppServerSession) markKillUnconfirmed() {
+	s.mu.Lock()
+	s.killUnconfirmed = true
+	s.mu.Unlock()
 }
 
 /* --------------------------------------------------------------------------
@@ -280,17 +301,18 @@ func (m *CodexAppServerManager) Start(id, cwd string, extraArgs []string, worksp
 	}
 
 	session := &CodexAppServerSession{
-		ID:          id,
-		Process:     proc,
-		Stdin:       stdin,
-		Stdout:      stdout,
-		Stderr:      stderr,
-		StartedAt:   time.Now(),
-		WorkspaceID: workspaceID,
-		UID:         uid,
-		status:      "running",
-		done:        make(chan struct{}),
-		streamDone:  make(chan struct{}),
+		ID:            id,
+		Process:       proc,
+		Stdin:         stdin,
+		Stdout:        stdout,
+		Stderr:        stderr,
+		StartedAt:     time.Now(),
+		WorkspaceID:   workspaceID,
+		UID:           uid,
+		status:        "running",
+		done:          make(chan struct{}),
+		processExited: make(chan struct{}),
+		streamDone:    make(chan struct{}),
 	}
 
 	m.sessions[id] = session
@@ -388,10 +410,50 @@ func (m *CodexAppServerManager) End(id string) error {
 	if session == nil {
 		return fmt.Errorf("codex app-server session %s not found", id)
 	}
+	processExited := processExitSignal(session.processExited, session.done)
+	select {
+	case <-processExited:
+		// The watcher owns artifact collection, terminal publication and removal.
+		return nil
+	default:
+	}
 
 	if session.Status() == "ended" {
-		m.removeSession(id)
+		// The watcher owns terminal publication and removal; retain the ID until
+		// it has established the in-flight publish reservation.
 		return nil
+	}
+
+	// A prior End already escalated to Kill and timed out on the exit
+	// watcher. The session is a retained tombstone: only VERIFIED OS-level
+	// process absence may become the "not found" answer the server frees the
+	// device on (Codex P1 — an earlier revision deregistered immediately,
+	// manufacturing absence evidence for a possibly-alive child).
+	if session.isKillUnconfirmed() {
+		if probeProcessGone(session.Process) {
+			if !streamDrainConfirmed(session.streamDone) {
+				return fmt.Errorf("codex app-server session %s process absence verified but old stream publishers have not drained; session retained: %w", id, errEndUnconfirmed)
+			}
+			if !m.removeSessionIfSame(id, session) {
+				// The ID is not ours to free: a replacement owns it, or the
+				// terminal frame is still in flight under it. Either way this
+				// End cannot answer absence (end_confirm.go).
+				return fmt.Errorf("codex app-server session %s could not be released — a terminal frame is still in flight or the ID was re-taken: %w", id, errEndUnconfirmed)
+			}
+			return fmt.Errorf("codex app-server session %s not found", id)
+		}
+		// Still alive (or unverifiable): re-kill, give the watcher one more
+		// bounded chance, and otherwise keep the fence up — visibly.
+		if session.Process.Process != nil {
+			if killErr := session.Process.Process.Kill(); killErr != nil {
+				fmt.Printf("%s[codex-appserver] Re-kill failed for %s: %v%s\n",
+					colorRed, id, killErr, colorReset)
+			}
+		}
+		if waitDoneConfirm(processExited, killConfirmTimeout) {
+			return nil
+		}
+		return fmt.Errorf("codex app-server session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
 	}
 
 	fmt.Printf("%s[codex-appserver] Ending session %s gracefully...%s\n",
@@ -400,24 +462,38 @@ func (m *CodexAppServerManager) End(id string) error {
 	session.closeStdin()
 
 	select {
-	case <-session.done:
+	case <-processExited:
 	case <-time.After(codexAppServerGracefulShutdownTimeout):
 		fmt.Printf("%s[codex-appserver] Stdin close didn't exit %s — interrupting%s\n",
 			colorYellow, id, colorReset)
 		_ = interruptProcess(session.Process)
 		select {
-		case <-session.done:
+		case <-processExited:
 		case <-time.After(codexAppServerGracefulShutdownTimeout):
 			fmt.Printf("%s[codex-appserver] Force killing session %s%s\n",
 				colorRed, id, colorReset)
 			if session.Process.Process != nil {
-				_ = session.Process.Process.Kill()
+				if killErr := session.Process.Process.Kill(); killErr != nil {
+					fmt.Printf("%s[codex-appserver] Kill failed for %s: %v%s\n",
+						colorRed, id, killErr, colorReset)
+				}
 			}
-			<-session.done
+			// BOUNDED wait — see end_confirm.go for why blocking here
+			// indefinitely wedged an entire device (2026-08-27).
+			if !waitDoneConfirm(processExited, killConfirmTimeout) {
+				fmt.Printf("%s[codex-appserver] Kill unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
+					colorRed, id, killConfirmTimeout, colorReset)
+				session.markKillUnconfirmed()
+				// Deliberately NOT "session <id> not found": the process may
+				// still be alive, and the server must keep the device fenced
+				// until absence is VERIFIED (see the tombstone branch above).
+				return fmt.Errorf("codex app-server session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
+			}
 		}
 	}
 
-	m.removeSession(id)
+	// The process has exited, but the watcher retains the session while it
+	// collects artifacts and reserves the terminal publish against ID reuse.
 	return nil
 }
 
@@ -500,6 +576,38 @@ func (m *CodexAppServerManager) removeSession(id string) {
 	}
 	delete(m.sessions, id)
 	m.mu.Unlock()
+}
+
+// removeSessionIfSame removes id only while it still maps to THIS session.
+// A kill-unconfirmed tombstone can be dropped (verified process absence) and
+// its ID re-used by a new Start while the old wedged exit watcher is still
+// running — an unconditional removal from that watcher would then delete the
+// REPLACEMENT session and deregister its PID (Codex P2). Every path that
+// holds the session pointer removes through this.//
+// It also refuses while a terminal frame is in flight for s: the frame is
+// already travelling under this ID, so freeing the ID now would let a
+// replacement Start receive it as its own shutdown evidence (Codex P2, round
+// 4). The publisher performs the removal itself once delivery completes.
+//
+// Returns whether id is free of s afterwards — false means either a
+// replacement already owns the ID or the release is deferred to the in-flight
+// publisher, and in both cases the caller must NOT report this session's
+// absence.
+func (m *CodexAppServerManager) removeSessionIfSame(id string, s *CodexAppServerSession) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.sessions[id]
+	if !ok {
+		return true
+	}
+	if cur != s || s.terminalPublishInFlight() {
+		return false
+	}
+	if s.Process != nil && s.Process.Process != nil {
+		globalProcessRegistry.Deregister(s.Process.Process.Pid)
+	}
+	delete(m.sessions, id)
+	return true
 }
 
 /* --------------------------------------------------------------------------
@@ -785,6 +893,7 @@ func (m *CodexAppServerManager) readStream(session *CodexAppServerSession, publi
 
 func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publishFn PublishFunc) {
 	err := session.Process.Wait()
+	closeProcessExited(session.processExited)
 
 	// Explicitly close pipes so the scanner goroutines receive EOF; mirrors
 	// session.go's behaviour where Windows pipe handles can otherwise linger
@@ -822,13 +931,14 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	// does on the PTY path's session_ended. Skipping this is what made every
 	// capture run through a bundled CLI report NO_MEDIA_UPLOADED while the
 	// recording sat on the device (prod 2026-08-20, video project vp_a72774c5).
-	uploadedFiles, uploadErrors := collectSessionArtifacts(
-		m.Config,
-		session.ID,
-		session.WorkspaceID,
-		session.Process.Dir,
-		session.StartedAt,
-	)
+	// BOUNDED: a hung scan/upload here used to suppress the ended frame. End
+	// callers now unblock on processExited above, while session.done remains a
+	// later watcher/publication lifecycle signal.
+	var uploadedFiles []FileInfo
+	var uploadErrors []UploadError
+	if reserveSessionForTerminalWork(&m.mu, m.sessions, session.ID, session, &session.terminalPublishState) {
+		uploadedFiles, uploadErrors, _ = collectSessionArtifactsBounded(m.Config, session.ID, session.WorkspaceID, session.Process.Dir, session.StartedAt, sessionArtifactCollectTimeout)
+	}
 
 	seq := atomic.AddInt64(&session.seq, 1)
 
@@ -837,7 +947,14 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	// session slot (delaying removeSession below) and slow EndSession-style
 	// callers waiting on session.done. Mirrors session.go's session_ended
 	// publish pattern.
-	publishTerminalResultAsync(publishFn, resultMsg{
+	// A wedged watcher can reach this point long after a verified-absence
+	// End dropped the tombstone and a replacement Start re-took the ID. The
+	// terminal frame is shutdown evidence: delivered while the ID belongs to
+	// a replacement, it releases the server's fence for a session that is
+	// still running (Codex P2, round 3 — the identity guard covered only map
+	// removal). Publish it only while the ID is still THIS session's, atomically
+	// re-reserving an already-unclaimed ID against Start's registration.
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, session.ID, session, &session.terminalPublishState, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
 		UID:          session.UID,
@@ -851,7 +968,10 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 		Seq:          int(seq),
 		Files:        uploadedFiles,
 		UploadErrors: uploadErrors,
-	})
+	}, func() { m.removeSessionIfSame(session.ID, session) }) {
+		fmt.Printf("%s[codex-appserver] Suppressed stale codex_appserver_ended for %s — the ID now belongs to a replacement session%s\n",
+			colorYellow, session.ID, colorReset)
+	}
 
 	// Closing `done` after the publish goroutine has been launched (but
 	// without waiting on it) means End() can unblock and the manager can
@@ -861,7 +981,9 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	fmt.Printf("%s[codex-appserver] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, exit, colorReset)
 
-	m.removeSession(session.ID)
+	// No-op while the ended frame is still in flight — the publisher's release
+	// callback owns the removal in that case (end_confirm.go).
+	m.removeSessionIfSame(session.ID, session)
 }
 
 /* --------------------------------------------------------------------------

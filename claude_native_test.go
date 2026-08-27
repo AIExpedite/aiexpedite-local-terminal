@@ -166,22 +166,22 @@ func TestClaudeNativeManager_StartRequiresValidCwd(t *testing.T) {
 	}
 }
 
-func TestClaudeNativeManager_EndStaleSessions_OldOnly(t *testing.T) {
+func TestClaudeNativeManager_EndStaleSessions_RetainsWatcherOwnedSession(t *testing.T) {
 	m := NewClaudeNativeManager(nil)
-	old := &ClaudeNativeSession{ID: "old", status: "running", StartedAt: time.Now().Add(-2 * time.Hour), done: make(chan struct{}), streamDone: make(chan struct{})}
-	fresh := &ClaudeNativeSession{ID: "fresh", status: "running", StartedAt: time.Now(), done: make(chan struct{}), streamDone: make(chan struct{})}
-	// Pre-close lifecycle channels + mark ended so End() short-circuits without
-	// touching a real process (both fixtures have Process == nil).
-	old.status, fresh.status = "ended", "ended"
-	close(old.done)
-	close(fresh.done)
+	old := &ClaudeNativeSession{ID: "old", status: "running", StartedAt: time.Now().Add(-2 * time.Hour), processExited: make(chan struct{}), done: make(chan struct{}), streamDone: make(chan struct{})}
+	fresh := &ClaudeNativeSession{ID: "fresh", status: "running", StartedAt: time.Now(), processExited: make(chan struct{}), done: make(chan struct{}), streamDone: make(chan struct{})}
+	// Model an exited process whose watcher is still draining streams/artifacts.
+	// Stale GC may request End, but only that watcher may eventually publish the
+	// terminal frame and release the ID.
+	close(old.processExited)
+	close(fresh.processExited)
 	m.sessions["old"] = old
 	m.sessions["fresh"] = fresh
 
 	m.endStaleSessions(1 * time.Hour)
 
-	if _, ok := m.sessions["old"]; ok {
-		t.Errorf("stale session should have been ended + removed")
+	if got := m.sessions["old"]; got != old {
+		t.Errorf("stale session must remain reserved for its watcher")
 	}
 	if _, ok := m.sessions["fresh"]; !ok {
 		t.Errorf("fresh session should survive")
