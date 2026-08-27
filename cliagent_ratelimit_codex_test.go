@@ -2734,6 +2734,32 @@ func TestCodexReadDirContext_ResumesAfterCancellation(t *testing.T) {
 	}
 }
 
+func TestCodexReadDirContext_RepeatedCancellationReturnsOnlyNewEntries(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	for i := 0; i < codexRolloutReadDirChunkSize*3; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	first, err := codexReadDirContext(firstCtx, dir)
+	if err != context.Canceled || len(first) != codexRolloutReadDirChunkSize {
+		t.Fatalf("first read entries=%d err=%v, want one chunk and cancellation", len(first), err)
+	}
+
+	secondCtx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	second, err := codexReadDirContext(secondCtx, dir)
+	if err != context.Canceled || len(second) != codexRolloutReadDirChunkSize {
+		t.Fatalf("second read entries=%d err=%v, want only the newly completed chunk", len(second), err)
+	}
+	if first[0].Name() == second[0].Name() {
+		t.Fatalf("second read replayed first chunk starting at %q", second[0].Name())
+	}
+}
+
 func TestCodexDiscoverRolloutCandidates_PreservesPartialLeafDirectoryResults(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "sessions", "2026", "08", "26")

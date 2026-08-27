@@ -1709,10 +1709,15 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error)
 		state = &codexReadDirResumeState{f: f}
 		codexReadDirResumes[dir] = state
 	}
+	// Entries accumulated before this invocation were already returned to the
+	// previous discovery pass. If this invocation is interrupted too, return
+	// only its newly completed chunks so cancellation cannot trigger an
+	// ever-growing replay of duplicate metadata work.
+	firstNew := len(state.entries)
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return append([]os.DirEntry(nil), state.entries...), err
+			return append([]os.DirEntry(nil), state.entries[firstNew:]...), err
 		}
 		batch, readErr := state.f.ReadDir(codexRolloutReadDirChunkSize)
 		state.entries = append(state.entries, batch...)
@@ -1722,7 +1727,7 @@ func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error)
 			break
 		}
 		if readErr != nil {
-			entries := append([]os.DirEntry(nil), state.entries...)
+			entries := append([]os.DirEntry(nil), state.entries[firstNew:]...)
 			_ = state.f.Close()
 			delete(codexReadDirResumes, dir)
 			return entries, readErr
