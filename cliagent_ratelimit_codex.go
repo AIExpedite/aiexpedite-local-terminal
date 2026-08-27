@@ -162,6 +162,11 @@ type codexRateLimitSnapshot struct {
 	// lets completed siblings advance the capped backlog while failed files are
 	// re-offered without persisting paths or raw rollout contents.
 	RolloutRetryEntries []string `json:"rolloutRetryEntries,omitempty"`
+	// A retry-only overflow would otherwise reselect the same newest 16 identities
+	// every refresh. The redacted cursor/fingerprint rotate that cohort past the
+	// first capped batch so a recovered older failure can be reopened.
+	RolloutRetryCursor      string `json:"rolloutRetryCursor,omitempty"`
+	RolloutRetryFingerprint string `json:"rolloutRetryFingerprint,omitempty"`
 	// Future-dated rollout mtimes are invalid normal progress: advancing the main
 	// watermark to them could hide normally timestamped files written after a
 	// clock rollback. Track their redacted membership and capped-batch position
@@ -1332,6 +1337,8 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutBacklogCursor = ""
 		snap.RolloutBacklogMtimeNs = 0
 		snap.RolloutRetryEntries = nil
+		snap.RolloutRetryCursor = ""
+		snap.RolloutRetryFingerprint = ""
 		snap.RolloutFutureMtimeAnchorNs = 0
 		snap.RolloutFutureMtimeFingerprint = ""
 		snap.RolloutFutureMtimeCursor = ""
@@ -1486,6 +1493,8 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutBacklogCursor = ""
 		snap.RolloutBacklogMtimeNs = 0
 		snap.RolloutRetryEntries = nil
+		snap.RolloutRetryCursor = ""
+		snap.RolloutRetryFingerprint = ""
 		snap.RolloutFutureMtimeAnchorNs = 0
 		snap.RolloutFutureMtimeFingerprint = ""
 		snap.RolloutFutureMtimeCursor = ""
@@ -1503,6 +1512,8 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutBacklogCursor = rolloutHighWater.backlogCursor
 		snap.RolloutBacklogMtimeNs = rolloutHighWater.backlogMtimeNs
 		snap.RolloutRetryEntries = append([]string(nil), rolloutHighWater.retryEntries...)
+		snap.RolloutRetryCursor = rolloutHighWater.retryCursor
+		snap.RolloutRetryFingerprint = rolloutHighWater.retryFingerprint
 		snap.RolloutFutureMtimeAnchorNs = rolloutHighWater.futureAnchorNs
 		snap.RolloutFutureMtimeFingerprint = rolloutHighWater.futureFingerprint
 		snap.RolloutFutureMtimeCursor = rolloutHighWater.futureCursor
@@ -1715,6 +1726,8 @@ type codexRolloutScanCursor struct {
 	backlogCursor       string
 	backlogMtimeNs      int64
 	retryEntries        []string
+	retryCursor         string
+	retryFingerprint    string
 	futureFingerprint   string
 	futureCursor        string
 	futureComplete      bool
@@ -1729,6 +1742,8 @@ type codexRolloutScanProgress struct {
 	backlogCursor       string
 	backlogMtimeNs      int64
 	retryEntries        []string
+	retryCursor         string
+	retryFingerprint    string
 	futureFingerprint   string
 	futureCursor        string
 	futureComplete      bool
@@ -1791,6 +1806,8 @@ func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.
 			backlogCursor:       snap.RolloutBacklogCursor,
 			backlogMtimeNs:      snap.RolloutBacklogMtimeNs,
 			retryEntries:        codexRolloutRetryList(codexRolloutRetrySet(snap.RolloutRetryEntries)),
+			retryCursor:         snap.RolloutRetryCursor,
+			retryFingerprint:    snap.RolloutRetryFingerprint,
 			futureAnchorNs:      snap.RolloutFutureMtimeAnchorNs,
 			futureFingerprint:   snap.RolloutFutureMtimeFingerprint,
 			futureCursor:        snap.RolloutFutureMtimeCursor,
@@ -1907,6 +1924,15 @@ func codexRolloutRetryList(retries map[string]struct{}) []string {
 	}
 	sort.Strings(entries)
 	return entries
+}
+
+func codexRolloutRetryFingerprint(retries map[string]struct{}) string {
+	entries := codexRolloutRetryList(retries)
+	if len(entries) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.Join(entries, "\n")))
+	return fmt.Sprintf("%x", sum[:])
 }
 
 func codexRolloutBacklogFingerprint(candidates []codexRolloutCandidate, cursorMtimeNs int64, now time.Time) string {
@@ -2340,7 +2366,10 @@ func codexInsertNewestRolloutCandidate(selected []codexRolloutCandidate, candida
 // ongoing stream of newer files from starving deterministic boundary progress.
 // When retryEntries fill the ordinary selection, one slot is reserved for the
 // newest non-retry candidate so persistent failures cannot pin an older backlog.
-func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexRolloutCandidate, now time.Time, capacity int, reservedBoundaryMtimeNs int64, retryEntries map[string]struct{}) ([]codexRolloutCandidate, bool) {
+// When the remaining cohort is retry-only and larger than the cap, a matching
+// retry cursor rotates past the previous batch so a recovered older failure is
+// reopened instead of reselecting the same newest identities forever.
+func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexRolloutCandidate, now time.Time, capacity int, reservedBoundaryMtimeNs int64, retryEntries map[string]struct{}, retryCursor, retryFingerprint string) ([]codexRolloutCandidate, bool) {
 	if capacity <= 0 {
 		return nil, true
 	}
@@ -2417,7 +2446,72 @@ func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexR
 			selected = codexInsertNewestRolloutCandidate(selected, newestNonRetry, now, capacity)
 		}
 	}
+	if !haveNonRetry && len(candidates) > capacity &&
+		retryCursor != "" && retryFingerprint != "" &&
+		codexRolloutRetryFingerprint(retryEntries) == retryFingerprint {
+		if cutoff, ok := codexRolloutCandidateByDigest(candidates, retryCursor); ok {
+			selected = codexRotateRetryOnlyRolloutCandidates(candidates, cutoff, now, capacity)
+		}
+	}
 	return selected, true
+}
+
+func codexRolloutCandidateByDigest(candidates []codexRolloutCandidate, digest string) (codexRolloutCandidate, bool) {
+	for _, candidate := range candidates {
+		if codexRolloutBacklogEntryDigest(candidate) == digest {
+			return candidate, true
+		}
+	}
+	return codexRolloutCandidate{}, false
+}
+
+func codexRotateRetryOnlyRolloutCandidates(candidates []codexRolloutCandidate, cutoff codexRolloutCandidate, now time.Time, capacity int) []codexRolloutCandidate {
+	after := make([]codexRolloutCandidate, 0, capacity+1)
+	wrap := make([]codexRolloutCandidate, 0, capacity+1)
+	for _, candidate := range candidates {
+		if codexRolloutCandidateBefore(cutoff, candidate, now) {
+			after = codexInsertNewestRolloutCandidate(after, candidate, now, capacity)
+			continue
+		}
+		wrap = codexInsertNewestRolloutCandidate(wrap, candidate, now, capacity)
+	}
+	selected := after
+	for _, candidate := range wrap {
+		if len(selected) == capacity {
+			break
+		}
+		selected = codexInsertNewestRolloutCandidate(selected, candidate, now, capacity)
+	}
+	return selected
+}
+
+func codexRolloutRetryRotationProgress(eligible, attempted []codexRolloutCandidate, retryEntries map[string]struct{}) (string, string) {
+	if len(attempted) == 0 || len(retryEntries) == 0 {
+		return "", ""
+	}
+	attemptedIDs := make(map[string]struct{}, len(attempted))
+	for _, candidate := range attempted {
+		digest := codexRolloutBacklogEntryDigest(candidate)
+		if _, retry := retryEntries[digest]; !retry {
+			return "", ""
+		}
+		attemptedIDs[digest] = struct{}{}
+	}
+	omitted := false
+	for _, candidate := range eligible {
+		digest := codexRolloutBacklogEntryDigest(candidate)
+		if _, retry := retryEntries[digest]; !retry {
+			continue
+		}
+		if _, ok := attemptedIDs[digest]; !ok {
+			omitted = true
+			break
+		}
+	}
+	if !omitted {
+		return "", ""
+	}
+	return codexRolloutRetryFingerprint(retryEntries), codexRolloutBacklogEntryDigest(attempted[len(attempted)-1])
 }
 
 func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor codexRolloutScanCursor, now time.Time) []codexRolloutCandidate {
@@ -2784,7 +2878,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	}
 	selected, selectionComplete := codexSelectNewestRolloutCandidates(
 		orderingCtx, eligibleCandidates, now, codexRolloutScanFileCap, reservedBoundaryMtimeNs,
-		codexRolloutRetrySet(cursor.retryEntries),
+		codexRolloutRetrySet(cursor.retryEntries), cursor.retryCursor, cursor.retryFingerprint,
 	)
 	cancelOrdering()
 	progressComplete := discoveryComplete && selectionComplete
@@ -2965,6 +3059,9 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		progress.backlogCursor = backlogCursor
 		progress.backlogMtimeNs = backlogMtimeNs
 		progress.retryEntries = codexRolloutRetryList(retryEntries)
+		progress.retryFingerprint, progress.retryCursor = codexRolloutRetryRotationProgress(
+			eligibleCandidates, attempted, retryEntries,
+		)
 		progress.futureFingerprint = futureFingerprint
 		progress.futureCursor = futureCursor
 		progress.futureComplete = futureComplete

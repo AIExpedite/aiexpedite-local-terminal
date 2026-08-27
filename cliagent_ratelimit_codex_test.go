@@ -3676,7 +3676,7 @@ func TestCodexSelectNewestRolloutCandidates_KeepsCappedNewestInRankOrder(t *test
 		{path: "tie-b", mtime: now.Add(-time.Hour)},
 	}
 
-	selected, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, 3, 0, nil)
+	selected, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, 3, 0, nil, "", "")
 	if !complete {
 		t.Fatal("complete=false, want an uninterrupted ranking pass")
 	}
@@ -3710,7 +3710,7 @@ func TestCodexSelectNewestRolloutCandidates_ReservesUnfinishedBoundary(t *testin
 	}
 
 	selected, complete := codexSelectNewestRolloutCandidates(
-		context.Background(), candidates, now, codexRolloutScanFileCap, boundary.UnixNano(), nil,
+		context.Background(), candidates, now, codexRolloutScanFileCap, boundary.UnixNano(), nil, "", "",
 	)
 	if !complete || len(selected) != codexRolloutScanFileCap {
 		t.Fatalf("complete=%v selected=%d, want a full uninterrupted batch", complete, len(selected))
@@ -3742,12 +3742,65 @@ func TestCodexSelectNewestRolloutCandidates_StopsWhenBudgetExpires(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	selected, complete := codexSelectNewestRolloutCandidates(ctx, candidates, now, codexRolloutScanFileCap, 0, nil)
+	selected, complete := codexSelectNewestRolloutCandidates(ctx, candidates, now, codexRolloutScanFileCap, 0, nil, "", "")
 	if complete {
 		t.Fatal("complete=true, want an exhausted budget reported as incomplete ranking")
 	}
 	if len(selected) != 0 {
 		t.Fatalf("selected=%d, want the pass to stop before ranking a backlog it has no budget to read", len(selected))
+	}
+}
+
+func TestCodexSelectNewestRolloutCandidates_RotatesRetryOnlyOverflow(t *testing.T) {
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	capacity := 3
+	candidates := make([]codexRolloutCandidate, 0, capacity+1)
+	retries := map[string]struct{}{}
+	for i := range capacity + 1 {
+		candidate := codexRolloutCandidate{
+			path:       fmt.Sprintf("retry-%02d", i),
+			boundaryID: fmt.Sprintf("retry-%02d.jsonl", i),
+			mtime:      now.Add(-time.Duration(capacity-i) * time.Minute),
+		}
+		candidates = append(candidates, candidate)
+		retries[codexRolloutBacklogEntryDigest(candidate)] = struct{}{}
+	}
+	oldest := candidates[0]
+
+	first, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, capacity, 0, retries, "", "")
+	if !complete || len(first) != capacity {
+		t.Fatalf("complete=%v selected=%d, want first retry-only batch of %d", complete, len(first), capacity)
+	}
+	for _, candidate := range first {
+		if candidate.path == oldest.path {
+			t.Fatalf("first batch unexpectedly included oldest retry %q", oldest.path)
+		}
+	}
+
+	fingerprint, cursor := codexRolloutRetryRotationProgress(candidates, first, retries)
+	if fingerprint == "" || !codexRolloutRetryEntryValid(cursor) {
+		t.Fatalf("fingerprint=%q cursor=%q, want a redacted retry rotation cursor", fingerprint, cursor)
+	}
+
+	second, complete := codexSelectNewestRolloutCandidates(
+		context.Background(), candidates, now, capacity, 0, retries, cursor, fingerprint,
+	)
+	if !complete || len(second) != capacity {
+		t.Fatalf("complete=%v selected=%d, want rotated retry-only batch of %d", complete, len(second), capacity)
+	}
+	foundOldest := false
+	for _, candidate := range second {
+		if candidate.path == oldest.path {
+			foundOldest = true
+			break
+		}
+	}
+	if !foundOldest {
+		got := make([]string, 0, len(second))
+		for _, candidate := range second {
+			got = append(got, candidate.path)
+		}
+		t.Fatalf("rotated batch=%v, want oldest recovered retry %q", got, oldest.path)
 	}
 }
 
@@ -4219,6 +4272,119 @@ func TestCodexRolloutFallbackBuckets_FullRetryBatchReservesBacklogSlot(t *testin
 	}
 	if failedOpens != codexRolloutScanFileCap*2-1 {
 		t.Fatalf("failed rollout opens=%d, want one retry slot reserved for backlog progress", failedOpens)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_RetryOnlyCohortRotatesPastFirstBatch(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "retry-only-rotate@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	oldestMtime := now.Add(-30 * time.Minute)
+	failedPaths := map[string]struct{}{}
+	var oldestPath string
+	for i := range codexRolloutScanFileCap + 1 {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-retry-only-%05d.jsonl", i))
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == 0 {
+			window = `"secondary":{"used_percent":91,"window_minutes":10080}`
+			oldestPath = path
+		}
+		failedPaths[filepath.Clean(path)] = struct{}{}
+		contents := `{"timestamp":"2026-08-26T12:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{%s}}`, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := oldestMtime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	originalOpen := codexOpenRolloutFile
+	defer func() { codexOpenRolloutFile = originalOpen }()
+	oldestOpens := 0
+	codexOpenRolloutFile = func(path string) (*os.File, error) {
+		if filepath.Clean(path) == filepath.Clean(oldestPath) {
+			oldestOpens++
+		}
+		if _, fail := failedPaths[filepath.Clean(path)]; fail {
+			return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}
+		}
+		return os.Open(path)
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	persist := func(contribs map[string]map[string]codexRateLimitBucket, progress *codexRolloutScanProgress) {
+		t.Helper()
+		mergeCodexRateLimitCachePerLimitProgress(
+			cache, contribs, nil, false, nil, false, now, fingerprint, progress, base,
+		)
+	}
+
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if ok || len(firstContributors) != 0 || first == nil || len(first.retryEntries) != codexRolloutScanFileCap {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want the first 16 retries queued", ok, firstContributors, first)
+	}
+	if oldestOpens != 0 {
+		t.Fatalf("oldest opens=%d after first batch, want the seventeenth file still unselected", oldestOpens)
+	}
+	persist(firstContributors, first)
+
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	secondContributors, _, _, second, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if ok || len(secondContributors) != 0 || second == nil ||
+		len(second.retryEntries) != codexRolloutScanFileCap+1 {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want every rollout queued for retry", ok, secondContributors, second)
+	}
+	if oldestOpens != 1 {
+		t.Fatalf("oldest opens=%d after reserved non-retry slot, want one failed attempt", oldestOpens)
+	}
+	persist(secondContributors, second)
+
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.retryCursor == "" || cursor.retryFingerprint == "" {
+		t.Fatalf("cursor=%+v, want a retry-only rotation cursor after the overflowing cohort", cursor)
+	}
+	thirdContributors, _, _, third, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if ok || len(thirdContributors) != 0 || third == nil ||
+		len(third.retryEntries) != codexRolloutScanFileCap+1 {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want retry-only rotation to persist", ok, thirdContributors, third)
+	}
+	persist(thirdContributors, third)
+
+	delete(failedPaths, filepath.Clean(oldestPath))
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.retryCursor == "" || cursor.retryFingerprint == "" {
+		t.Fatalf("cursor=%+v, want rotation state retained until the recovered file is selected", cursor)
+	}
+	rotatedContributors, _, _, rotated, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || rotated == nil {
+		t.Fatalf("ok=%v progress=%+v, want recovered oldest retry consumed", ok, rotated)
+	}
+	if got := rotatedContributors[codexWindowSecondary][codexLegacyLimitID].UsedPercentage; got != 91 {
+		t.Fatalf("weekly contributor=%v, want recovered seventeenth rollout after retry-only rotation", got)
+	}
+	if oldestOpens != 2 {
+		t.Fatalf("oldest opens=%d, want the recovered file reopened after rotation", oldestOpens)
+	}
+	persist(rotatedContributors, rotated)
+
+	encoded, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), filepath.Base(oldestPath)) ||
+		strings.Contains(string(encoded), dir) {
+		t.Fatalf("serialized retry rotation leaked a source path: %s", encoded)
 	}
 }
 
