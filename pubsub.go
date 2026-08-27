@@ -6445,6 +6445,15 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 		trackTerminalPublishStart()
 		defer trackTerminalPublishEnd()
 		if err := globalAntigravityNativeManager.End(cmd.SessionID); err != nil {
+			// An UNCONFIRMED end (kill/turn-drain timed out; tombstone
+			// retained; process may be alive) must NOT surface as ended —
+			// that frame is shutdown evidence and the server releases the
+			// device claim on it. Publish an error instead; the server keeps
+			// the fence and the next retried end re-probes (end_confirm.go).
+			if errors.Is(err, errEndUnconfirmed) {
+				publishAntigravityNativeError(ctx, topic, cmd, fmt.Sprintf("end unconfirmed: %v", err))
+				return
+			}
 			// Still publish ended so the cloud can release reservations even if
 			// the local session was already gone (idempotent teardown).
 			publishFn(resultMsg{
@@ -6648,6 +6657,15 @@ func handleOpenCodeNativeCommand(ctx context.Context, topic *pubsub.Publisher, c
 		trackTerminalPublishStart()
 		defer trackTerminalPublishEnd()
 		if err := globalOpenCodeNativeManager.End(cmd.SessionID); err != nil {
+			// An UNCONFIRMED end (kill/turn-drain timed out; tombstone
+			// retained; process may be alive) must NOT surface as ended —
+			// that frame is shutdown evidence and the server releases the
+			// device claim on it. Publish an error instead; the server keeps
+			// the fence and the next retried end re-probes (end_confirm.go).
+			if errors.Is(err, errEndUnconfirmed) {
+				publishOpenCodeNativeError(ctx, topic, cmd, fmt.Sprintf("end unconfirmed: %v", err))
+				return
+			}
 			// Still publish ended so the cloud can release reservations even if
 			// the local session was already gone (idempotent teardown).
 			publishFn(resultMsg{

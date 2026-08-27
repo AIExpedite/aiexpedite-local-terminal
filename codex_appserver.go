@@ -433,7 +433,7 @@ func (m *CodexAppServerManager) End(id string) error {
 			m.removeSessionIfSame(id, session)
 			return nil
 		}
-		return fmt.Errorf("codex app-server session %s kill unconfirmed after %s; session retained pending process-absence verification", id, killConfirmTimeout)
+		return fmt.Errorf("codex app-server session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
 	}
 
 	fmt.Printf("%s[codex-appserver] Ending session %s gracefully...%s\n",
@@ -467,7 +467,7 @@ func (m *CodexAppServerManager) End(id string) error {
 				// Deliberately NOT "session <id> not found": the process may
 				// still be alive, and the server must keep the device fenced
 				// until absence is VERIFIED (see the tombstone branch above).
-				return fmt.Errorf("codex app-server session %s kill unconfirmed after %s; session retained pending process-absence verification", id, killConfirmTimeout)
+				return fmt.Errorf("codex app-server session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
 			}
 		}
 	}

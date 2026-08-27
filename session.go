@@ -599,7 +599,7 @@ func (sm *SessionManager) EndSession(id string) error {
 			sm.removeSessionIfSame(id, session)
 			return nil
 		}
-		return fmt.Errorf("session %s kill unconfirmed after %s; session retained pending process-absence verification", id, killConfirmTimeout)
+		return fmt.Errorf("session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
 	}
 
 	fmt.Printf("%s[session] Ending session %s gracefully...%s\n", colorYellow, id, colorReset)
@@ -629,7 +629,7 @@ func (sm *SessionManager) EndSession(id string) error {
 			// Deliberately NOT "session <id> not found": the process may
 			// still be alive, and the server must keep the device fenced
 			// until absence is VERIFIED (see the tombstone branch above).
-			return fmt.Errorf("session %s kill unconfirmed after %s; session retained pending process-absence verification", id, killConfirmTimeout)
+			return fmt.Errorf("session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
 		}
 	}
 

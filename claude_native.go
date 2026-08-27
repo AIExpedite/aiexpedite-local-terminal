@@ -423,7 +423,7 @@ func (m *ClaudeNativeManager) End(id string) error {
 			m.removeSessionIfSame(id, session)
 			return nil
 		}
-		return fmt.Errorf("claude native session %s kill unconfirmed after %s; session retained pending process-absence verification", id, killConfirmTimeout)
+		return fmt.Errorf("claude native session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
 	}
 
 	fmt.Printf("%s[claude-native] Ending session %s gracefully...%s\n",
@@ -457,7 +457,7 @@ func (m *ClaudeNativeManager) End(id string) error {
 				// Deliberately NOT "session <id> not found": the process may
 				// still be alive, and the server must keep the device fenced
 				// until absence is VERIFIED (see the tombstone branch above).
-				return fmt.Errorf("claude native session %s kill unconfirmed after %s; session retained pending process-absence verification", id, killConfirmTimeout)
+				return fmt.Errorf("claude native session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
 			}
 		}
 	}

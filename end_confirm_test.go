@@ -14,6 +14,7 @@ package main
 // kills them — the red-then-green transition is the evidence (rule 23).
 
 import (
+	"errors"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -21,6 +22,9 @@ import (
 	"testing"
 	"time"
 )
+
+// errorsIs aliases errors.Is for brevity in assertions.
+var errorsIs = errors.Is
 
 // nopWriteCloser satisfies io.WriteCloser for fake session stdin pipes.
 type nopWriteCloser struct{}
@@ -388,6 +392,70 @@ func TestOpenCodeEnd_TurnDrainUnconfirmed_LiveProcessRetains(t *testing.T) {
 	}
 	if m.Get("wedged-oc") != nil {
 		t.Fatalf("session should be removed once resolved absent")
+	}
+}
+
+// Every unconfirmed-end error must carry the errEndUnconfirmed sentinel:
+// the antigravity/opencode end handlers publish `*_ended` for ordinary End
+// errors (idempotent teardown), and only errors.Is lets them withhold that
+// shutdown evidence for a possibly-alive process (Codex P1, round 2).
+func TestUnconfirmedEndErrorsCarrySentinel(t *testing.T) {
+	shortenEndConfirmTimeouts(t)
+	stubProbe(t, false)
+
+	// Process-manager shape (codex, via the tombstone retry branch).
+	cm, cs := newWedgedCodexSession(t)
+	cs.markKillUnconfirmed()
+	if err := cm.End("wedged"); !errorsIs(err, errEndUnconfirmed) {
+		t.Fatalf("codex kill-unconfirmed error must wrap errEndUnconfirmed: %v", err)
+	}
+
+	// Turn-manager shape (antigravity, drain barrier held + live process).
+	am := NewAntigravityNativeManager(nil)
+	as := &AntigravityNativeSession{ID: "ag", StartedAt: time.Now(), status: "ended"}
+	as.activeProcess = exitedTestProcess(t) // probe stub says alive anyway
+	as.turnMu.Lock()
+	defer as.turnMu.Unlock()
+	am.sessions["ag"] = as
+	if err := am.End("ag"); !errorsIs(err, errEndUnconfirmed) {
+		t.Fatalf("antigravity drain-unconfirmed error must wrap errEndUnconfirmed: %v", err)
+	}
+
+	// The verified-absence answer must NOT carry it — that one is the real
+	// absence evidence and SHOULD flow into the idempotent ended publish.
+	stubProbe(t, true)
+	if err := cm.End("wedged"); err == nil || errorsIs(err, errEndUnconfirmed) {
+		t.Fatalf("verified absence must not carry the unconfirmed sentinel: %v", err)
+	}
+}
+
+// Stale GC must withhold the `*_ended` frame while an end is unconfirmed —
+// publishing it would hand the server shutdown evidence it does not have.
+func TestAntigravityStaleGC_WithholdsEndedWhileUnconfirmed(t *testing.T) {
+	shortenEndConfirmTimeouts(t)
+	stubProbe(t, false)
+	m := NewAntigravityNativeManager(nil)
+	var published []resultMsg
+	session := &AntigravityNativeSession{
+		ID:        "ag-stale",
+		StartedAt: time.Now().Add(-12 * time.Hour), // past any maxAge
+		status:    "ended",
+		publishFn: func(msg resultMsg) { published = append(published, msg) },
+	}
+	session.activeProcess = exitedTestProcess(t) // probe stub says alive anyway
+	session.turnMu.Lock()
+	defer session.turnMu.Unlock()
+	m.sessions["ag-stale"] = session
+
+	m.endStaleSessions(6 * time.Hour)
+
+	for _, msg := range published {
+		if msg.Type == "antigravity_native_ended" {
+			t.Fatalf("stale GC published ended for an unconfirmed end: %+v", msg)
+		}
+	}
+	if m.Get("ag-stale") != session {
+		t.Fatalf("tombstone must be retained for the next GC tick")
 	}
 }
 

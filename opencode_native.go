@@ -48,6 +48,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1064,7 +1065,7 @@ func (m *OpenCodeNativeManager) retainOrResolveDrainTombstone(id string, session
 	fmt.Printf("%s[opencode-native] Turn drain unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
 		colorRed, id, turnDrainConfirmTimeout, colorReset)
 	// Deliberately NOT "session <id> not found" — see end_confirm.go.
-	return fmt.Errorf("opencode native session %s turn drain unconfirmed after %s; session retained pending process-absence verification", id, turnDrainConfirmTimeout)
+	return fmt.Errorf("opencode native session %s turn drain unconfirmed after %s; session retained pending process-absence verification: %w", id, turnDrainConfirmTimeout, errEndUnconfirmed)
 }
 
 func (m *OpenCodeNativeManager) Get(id string) *OpenCodeNativeSession {
@@ -1118,7 +1119,15 @@ func (m *OpenCodeNativeManager) endStaleSessions(maxAge time.Duration) {
 	for _, ss := range stale {
 		fmt.Printf("%s[opencode-native] Reaping stale session %s%s\n", colorYellow, ss.id, colorReset)
 		trackTerminalPublishStart()
-		_ = m.End(ss.id)
+		if err := m.End(ss.id); errors.Is(err, errEndUnconfirmed) {
+			// Tombstone retained; the process may still be alive. Publishing
+			// ended here would hand the server shutdown evidence it does not
+			// have (see end_confirm.go). The next GC tick retries.
+			fmt.Printf("%s[opencode-native] Stale reap unconfirmed for %s — withholding ended frame%s\n",
+				colorRed, ss.id, colorReset)
+			trackTerminalPublishEnd()
+			continue
+		}
 		if ss.publishFn == nil {
 			trackTerminalPublishEnd()
 			continue

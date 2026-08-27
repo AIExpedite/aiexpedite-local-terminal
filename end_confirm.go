@@ -41,10 +41,22 @@
 package main
 
 import (
+	"errors"
 	"os/exec"
 	"sync"
 	"time"
 )
+
+// errEndUnconfirmed marks an End that gave up within its bound while the
+// process may still be alive (kill or turn drain unconfirmed; session
+// retained as a tombstone). Callers that mirror End outcomes to the cloud
+// must check errors.Is against this and MUST NOT publish the `*_ended` frame
+// for it — that frame is shutdown evidence, and terminal-service releases
+// the device claim on it. Publishing it here would be the same manufactured
+// evidence the tombstone exists to prevent, one layer up (Codex P1, round
+// 2: the antigravity/opencode end handlers publish ended for EVERY End
+// error as idempotent teardown, and stale GC ignored the error entirely).
+var errEndUnconfirmed = errors.New("end unconfirmed")
 
 // killConfirmTimeout is how long an End path waits, after issuing the final
 // force kill, for the exit watcher to confirm the process is gone (close of

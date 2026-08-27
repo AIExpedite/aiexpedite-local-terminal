@@ -31,6 +31,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -894,7 +895,7 @@ func (m *AntigravityNativeManager) retainOrResolveDrainTombstone(id string, sess
 	fmt.Printf("%s[antigravity-native] Turn drain unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
 		colorRed, id, turnDrainConfirmTimeout, colorReset)
 	// Deliberately NOT "session <id> not found" — see end_confirm.go.
-	return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session retained pending process-absence verification", id, turnDrainConfirmTimeout)
+	return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session retained pending process-absence verification: %w", id, turnDrainConfirmTimeout, errEndUnconfirmed)
 }
 
 func (m *AntigravityNativeManager) Get(id string) *AntigravityNativeSession {
@@ -948,7 +949,15 @@ func (m *AntigravityNativeManager) endStaleSessions(maxAge time.Duration) {
 	for _, ss := range stale {
 		fmt.Printf("%s[antigravity-native] Reaping stale session %s%s\n", colorYellow, ss.id, colorReset)
 		trackTerminalPublishStart()
-		_ = m.End(ss.id)
+		if err := m.End(ss.id); errors.Is(err, errEndUnconfirmed) {
+			// Tombstone retained; the process may still be alive. Publishing
+			// ended here would hand the server shutdown evidence it does not
+			// have (see end_confirm.go). The next GC tick retries.
+			fmt.Printf("%s[antigravity-native] Stale reap unconfirmed for %s — withholding ended frame%s\n",
+				colorRed, ss.id, colorReset)
+			trackTerminalPublishEnd()
+			continue
+		}
 		if ss.publishFn == nil {
 			trackTerminalPublishEnd()
 			continue
