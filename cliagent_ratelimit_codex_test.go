@@ -5732,3 +5732,126 @@ func TestCodexRolloutFallbackBuckets_NewerFutureArrivalsCannotStarveCohort(t *te
 			"arrivals are still scanned outside the cohort", completed.futureCeilingNs)
 	}
 }
+
+// A retry rotation can open a cohort member ranked below one it evicted, so the
+// pass's picks are no longer one contiguous run from the cohort head. The
+// positional boundary cursor must stop at that gap: healthy entries do not
+// bypass it the way retry identities do, so recording the lowest selected member
+// would treat the intervening unread rollouts as consumed and their distinct
+// quota evidence would never be merged.
+func TestCodexRolloutBoundaryProgress_StopsAtRotationGap(t *testing.T) {
+	now := time.Now().Add(-time.Hour).Truncate(time.Second)
+	mtimeNs := now.UnixNano()
+	candidate := func(name string) codexRolloutCandidate {
+		return codexRolloutCandidate{
+			path:       name,
+			boundaryID: name + ".jsonl",
+			mtime:      now,
+			size:       128,
+		}
+	}
+	// Equal-mtime members rank by filename descending: e, d, c, b, a.
+	all := []codexRolloutCandidate{
+		candidate("e"), candidate("d"), candidate("c"), candidate("b"), candidate("a"),
+	}
+	// The rotation kept the highest-ranked retry and reopened the lowest one,
+	// leaving the healthy d/c/b unread between them.
+	selected := []codexRolloutCandidate{all[0], all[4]}
+	retries := map[string]struct{}{
+		codexRolloutBacklogEntryDigest(all[0]): {},
+		codexRolloutBacklogEntryDigest(all[4]): {},
+	}
+
+	progress := codexRolloutBoundaryProgress(all, all, selected, mtimeNs)
+	if progress.boundaryCursor == "" {
+		t.Fatalf("boundaryCursor is empty, want the contiguous prefix recorded")
+	}
+	if want := codexRolloutBoundaryEntryDigest(all[0]); progress.boundaryCursor != want {
+		t.Fatalf("boundaryCursor=%q, want the deepest contiguous pick %q (not the rotated-in tail)",
+			progress.boundaryCursor, want)
+	}
+
+	cursor := codexRolloutScanCursor{
+		mtimeNs:             progress.mtimeNs,
+		boundaryFingerprint: progress.boundaryFingerprint,
+		boundaryCursor:      progress.boundaryCursor,
+	}
+	eligible := codexUnconsumedRolloutCandidates(all, cursor, time.Now())
+	for _, want := range []string{"d", "c", "b"} {
+		found := false
+		for _, remaining := range eligible {
+			if remaining.path == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("eligible=%v, want unread healthy boundary member %q still scannable",
+				rolloutCandidatePaths(eligible), want)
+		}
+	}
+	// The retry identities stay eligible on their own rotation rules; the cursor
+	// itself must not be what keeps them alive.
+	if len(retries) != 2 {
+		t.Fatalf("retries=%d, want the two rotated retry identities", len(retries))
+	}
+}
+
+// Same defect on the anchored future cohort: its positional cursor is also
+// recorded from the pass's picks, so a rotation gap must bound it too.
+func TestCodexRolloutFutureProgress_StopsAtRotationGap(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	candidate := func(name string, ahead time.Duration) codexRolloutCandidate {
+		return codexRolloutCandidate{
+			path:       name,
+			boundaryID: name + ".jsonl",
+			mtime:      now.Add(ahead),
+			size:       256,
+		}
+	}
+	// Future-dated cohort, newest first: e, d, c, b, a.
+	all := []codexRolloutCandidate{
+		candidate("e", 50*time.Minute),
+		candidate("d", 40*time.Minute),
+		candidate("c", 30*time.Minute),
+		candidate("b", 20*time.Minute),
+		candidate("a", 10*time.Minute),
+	}
+	selected := []codexRolloutCandidate{all[0], all[4]}
+
+	anchorNs, floorNs, ceilingNs, fingerprint, futureCursor, cohortSize, complete :=
+		codexRolloutFutureProgress(all, all, selected, now, codexRolloutScanCursor{})
+	if complete {
+		t.Fatalf("complete=true, want an unfinished cohort with three members unread")
+	}
+	if fingerprint == "" || cohortSize != len(all) {
+		t.Fatalf("fingerprint=%q cohortSize=%d, want the full cohort anchored", fingerprint, cohortSize)
+	}
+	if want := codexRolloutFutureEntryDigest(all[0]); futureCursor != want {
+		t.Fatalf("futureCursor=%q, want the deepest contiguous pick %q (not the rotated-in tail)",
+			futureCursor, want)
+	}
+
+	cursor := codexRolloutScanCursor{
+		futureAnchorNs:    anchorNs,
+		futureFloorNs:     floorNs,
+		futureCeilingNs:   ceilingNs,
+		futureFingerprint: fingerprint,
+		futureCursor:      futureCursor,
+		futureCohortSize:  cohortSize,
+	}
+	eligible := codexUnconsumedRolloutCandidates(all, cursor, now)
+	for _, want := range []string{"d", "c", "b"} {
+		found := false
+		for _, remaining := range eligible {
+			if remaining.path == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("eligible=%v, want unread future-cohort member %q still scannable",
+				rolloutCandidatePaths(eligible), want)
+		}
+	}
+}

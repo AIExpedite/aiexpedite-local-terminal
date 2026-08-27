@@ -3130,31 +3130,71 @@ func codexRolloutNewestNormalMtimeNs(candidates []codexRolloutCandidate, cursorM
 	return newest
 }
 
+// codexRolloutDeepestContiguous returns the oldest-ranked member of `selected`
+// that still ranks ahead of `bound` — the deepest position a single positional
+// cursor may claim when the pass's picks are not one contiguous run.
+//
+// Retry rotation can open a cohort member ranked below one it evicted, leaving
+// an unselected healthy entry between two selected ones. Healthy entries do not
+// bypass a positional cursor the way retry identities do, so recording the
+// lowest selected member would treat that gap as consumed and the distinct
+// quota evidence behind it would never be read.
+func codexRolloutDeepestContiguous(selected []codexRolloutCandidate, bound codexRolloutCandidate, now time.Time) (codexRolloutCandidate, bool) {
+	var deepest codexRolloutCandidate
+	found := false
+	for _, candidate := range selected {
+		if !codexRolloutCandidateBefore(candidate, bound, now) {
+			continue
+		}
+		if !found || codexRolloutCandidateBefore(deepest, candidate, now) {
+			deepest, found = candidate, true
+		}
+	}
+	return deepest, found
+}
+
 func codexRolloutBoundaryProgress(candidates, eligible, selected []codexRolloutCandidate, mtimeNs int64) codexRolloutScanProgress {
+	// Every boundary member shares `mtimeNs`, so any instant at that mtime orders
+	// them identically.
+	ref := time.Unix(0, mtimeNs)
 	selectedAtBoundary := map[string]struct{}{}
+	selectedList := make([]codexRolloutCandidate, 0, len(selected))
 	var lastSelected codexRolloutCandidate
 	haveLast := false
 	for _, candidate := range selected {
 		if candidate.mtime.UnixNano() == mtimeNs {
 			selectedAtBoundary[codexRolloutBoundaryEntryDigest(candidate)] = struct{}{}
-			if !haveLast || codexRolloutCandidateBefore(lastSelected, candidate, time.Unix(0, mtimeNs)) {
+			selectedList = append(selectedList, candidate)
+			if !haveLast || codexRolloutCandidateBefore(lastSelected, candidate, ref) {
 				lastSelected, haveLast = candidate, true
 			}
 		}
 	}
+	// `rankBound` is the newest boundary member this pass left unread. A retry
+	// rotation can evict an entry ranked above one it opens, so the picks are not
+	// necessarily contiguous and the cursor may not be taken past this bound.
 	remaining := false
+	var rankBound codexRolloutCandidate
 	for _, candidate := range eligible {
 		if candidate.mtime.UnixNano() != mtimeNs {
 			continue
 		}
-		if _, ok := selectedAtBoundary[codexRolloutBoundaryEntryDigest(candidate)]; !ok {
-			remaining = true
-			break
+		if _, ok := selectedAtBoundary[codexRolloutBoundaryEntryDigest(candidate)]; ok {
+			continue
+		}
+		if !remaining || codexRolloutCandidateBefore(candidate, rankBound, ref) {
+			rankBound, remaining = candidate, true
 		}
 	}
 	boundaryCursor := ""
 	if remaining && haveLast {
-		boundaryCursor = codexRolloutBoundaryEntryDigest(lastSelected)
+		advance, haveAdvance := lastSelected, true
+		if !codexRolloutCandidateBefore(advance, rankBound, ref) {
+			advance, haveAdvance = codexRolloutDeepestContiguous(selectedList, rankBound, ref)
+		}
+		if haveAdvance {
+			boundaryCursor = codexRolloutBoundaryEntryDigest(advance)
+		}
 	}
 	return codexRolloutScanProgress{
 		mtimeNs:             mtimeNs,
@@ -3213,6 +3253,7 @@ func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCan
 		return 0, 0, 0, "", "", 0, false
 	}
 	selectedFuture := map[string]struct{}{}
+	selectedList := make([]codexRolloutCandidate, 0, len(selected))
 	var lastSelected codexRolloutCandidate
 	haveLast := false
 	for _, candidate := range selected {
@@ -3220,26 +3261,42 @@ func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCan
 			continue
 		}
 		selectedFuture[codexRolloutFutureEntryDigest(candidate)] = struct{}{}
+		selectedList = append(selectedList, candidate)
 		if !haveLast || codexRolloutCandidateBefore(lastSelected, candidate, now) {
 			lastSelected, haveLast = candidate, true
 		}
 	}
+	// `rankBound` is the newest cohort member this pass left unread. Retry
+	// rotation can evict an entry ranked above one it opens, so the picks are not
+	// necessarily contiguous and the cursor may not be taken past this bound.
 	remaining := false
+	var rankBound codexRolloutCandidate
 	for _, candidate := range eligible {
 		if !codexRolloutInFutureCohort(candidate, anchor, floorNs, ceilingNs) {
 			continue
 		}
-		if _, ok := selectedFuture[codexRolloutFutureEntryDigest(candidate)]; !ok {
-			remaining = true
-			break
+		if _, ok := selectedFuture[codexRolloutFutureEntryDigest(candidate)]; ok {
+			continue
+		}
+		if !remaining || codexRolloutCandidateBefore(candidate, rankBound, now) {
+			rankBound, remaining = candidate, true
 		}
 	}
 	if !remaining {
 		return anchor.UnixNano(), floorNs, ceilingNs, fingerprint, "", cohortSize, true
 	}
 	if haveLast {
-		return anchor.UnixNano(), floorNs, ceilingNs, fingerprint,
-			codexRolloutFutureEntryDigest(lastSelected), cohortSize, false
+		advance, haveAdvance := lastSelected, true
+		if !codexRolloutCandidateBefore(advance, rankBound, now) {
+			advance, haveAdvance = codexRolloutDeepestContiguous(selectedList, rankBound, now)
+		}
+		// No pick ranks ahead of the gap: this pass claimed nothing contiguous with
+		// the cohort head, so fall through to the saved cursor rather than stepping
+		// the cohort over an unread member.
+		if haveAdvance {
+			return anchor.UnixNano(), floorNs, ceilingNs, fingerprint,
+				codexRolloutFutureEntryDigest(advance), cohortSize, false
+		}
 	}
 	if matches {
 		return anchor.UnixNano(), floorNs, ceilingNs, fingerprint, cursor.futureCursor, cohortSize, false
