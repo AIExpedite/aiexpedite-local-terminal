@@ -131,8 +131,9 @@ type codexRateLimitSnapshot struct {
 	Buckets            map[string]codexRateLimitBucket            `json:"buckets"`
 	Contributors       map[string]map[string]codexRateLimitBucket `json:"contributors,omitempty"`
 	// RolloutHighWaterMtimeMs is filesystem scan progress, not provider
-	// observation time. It advances only after every selected rollout file was
-	// handled, allowing unchanged refreshes to remain cache-only.
+	// observation time. It advances after every selected rollout file was either
+	// handled or recorded by redacted identity for retry, allowing completed
+	// siblings to rotate through a capped backlog.
 	RolloutHighWaterMtimeMs int64 `json:"rolloutHighWaterMtimeMs,omitempty"`
 	// RolloutHighWaterMtimeNs preserves the filesystem's full timestamp
 	// precision. The millisecond field remains for backwards compatibility with
@@ -156,6 +157,11 @@ type codexRateLimitSnapshot struct {
 	RolloutBacklogFingerprint string `json:"rolloutBacklogFingerprint,omitempty"`
 	RolloutBacklogCursor      string `json:"rolloutBacklogCursor,omitempty"`
 	RolloutBacklogMtimeNs     int64  `json:"rolloutBacklogMtimeNs,omitempty"`
+	// RolloutRetryEntries contains only SHA-256 identities for rollout files
+	// whose last read was retryable. Keeping these redacted identities separate
+	// lets completed siblings advance the capped backlog while failed files are
+	// re-offered without persisting paths or raw rollout contents.
+	RolloutRetryEntries []string `json:"rolloutRetryEntries,omitempty"`
 	// Future-dated rollout mtimes are invalid normal progress: advancing the main
 	// watermark to them could hide normally timestamped files written after a
 	// clock rollback. Track their redacted membership and capped-batch position
@@ -1313,6 +1319,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		if snap.Contributors == nil {
 			snap.Contributors = map[string]map[string]codexRateLimitBucket{}
 		}
+		snap.RolloutRetryEntries = codexRolloutRetryList(codexRolloutRetrySet(snap.RolloutRetryEntries))
 	}
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]codexRateLimitBucket{}
@@ -1324,6 +1331,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutBacklogFingerprint = ""
 		snap.RolloutBacklogCursor = ""
 		snap.RolloutBacklogMtimeNs = 0
+		snap.RolloutRetryEntries = nil
 		snap.RolloutFutureMtimeAnchorNs = 0
 		snap.RolloutFutureMtimeFingerprint = ""
 		snap.RolloutFutureMtimeCursor = ""
@@ -1477,6 +1485,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutBacklogFingerprint = ""
 		snap.RolloutBacklogCursor = ""
 		snap.RolloutBacklogMtimeNs = 0
+		snap.RolloutRetryEntries = nil
 		snap.RolloutFutureMtimeAnchorNs = 0
 		snap.RolloutFutureMtimeFingerprint = ""
 		snap.RolloutFutureMtimeCursor = ""
@@ -1493,6 +1502,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		snap.RolloutBacklogFingerprint = rolloutHighWater.backlogFingerprint
 		snap.RolloutBacklogCursor = rolloutHighWater.backlogCursor
 		snap.RolloutBacklogMtimeNs = rolloutHighWater.backlogMtimeNs
+		snap.RolloutRetryEntries = append([]string(nil), rolloutHighWater.retryEntries...)
 		snap.RolloutFutureMtimeAnchorNs = rolloutHighWater.futureAnchorNs
 		snap.RolloutFutureMtimeFingerprint = rolloutHighWater.futureFingerprint
 		snap.RolloutFutureMtimeCursor = rolloutHighWater.futureCursor
@@ -1644,6 +1654,11 @@ const codexRolloutCandidateReadReserve = time.Second
 // rollout even when a large candidate backlog makes ranking hit its deadline.
 const codexRolloutFileReadReserve = 500 * time.Millisecond
 
+// A single slow rollout must leave a small slice for each later selected file.
+// Without this reserve, the first retryable file can consume the entire child
+// deadline and pin a capped batch forever.
+const codexRolloutLaterFileReserve = 25 * time.Millisecond
+
 // How often candidate ranking rechecks the optional scan budget. Frequent enough
 // that a huge backlog cannot hold the reserve for long, coarse enough that the
 // context check does not dominate the pass itself.
@@ -1699,6 +1714,7 @@ type codexRolloutScanCursor struct {
 	backlogFingerprint  string
 	backlogCursor       string
 	backlogMtimeNs      int64
+	retryEntries        []string
 	futureFingerprint   string
 	futureCursor        string
 	futureComplete      bool
@@ -1712,6 +1728,7 @@ type codexRolloutScanProgress struct {
 	backlogFingerprint  string
 	backlogCursor       string
 	backlogMtimeNs      int64
+	retryEntries        []string
 	futureFingerprint   string
 	futureCursor        string
 	futureComplete      bool
@@ -1752,12 +1769,12 @@ func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.
 		return codexRolloutScanCursor{}
 	}
 	hasStoredProgress := snap.RolloutHighWaterMtimeNs > 0 || snap.RolloutHighWaterMtimeMs > 0 ||
-		snap.RolloutBacklogCursor != ""
+		snap.RolloutBacklogCursor != "" || len(snap.RolloutRetryEntries) > 0
 	if hasStoredProgress &&
 		snap.RolloutRootFingerprint != codexRolloutRootFingerprint(base) {
 		return codexRolloutScanCursor{}
 	}
-	if snap.RolloutHighWaterMtimeNs > 0 || snap.RolloutBacklogCursor != "" {
+	if snap.RolloutHighWaterMtimeNs > 0 || snap.RolloutBacklogCursor != "" || len(snap.RolloutRetryEntries) > 0 {
 		// A completed cursor is filesystem progress, so it cannot legitimately
 		// remain ahead of the current clock. This can happen after a clock
 		// rollback or when upgrading a cache written before future mtimes were
@@ -1773,6 +1790,7 @@ func codexRolloutScanCursorForAccount(base, currentFingerprint string, now time.
 			backlogFingerprint:  snap.RolloutBacklogFingerprint,
 			backlogCursor:       snap.RolloutBacklogCursor,
 			backlogMtimeNs:      snap.RolloutBacklogMtimeNs,
+			retryEntries:        codexRolloutRetryList(codexRolloutRetrySet(snap.RolloutRetryEntries)),
 			futureAnchorNs:      snap.RolloutFutureMtimeAnchorNs,
 			futureFingerprint:   snap.RolloutFutureMtimeFingerprint,
 			futureCursor:        snap.RolloutFutureMtimeCursor,
@@ -1856,6 +1874,39 @@ func codexRolloutBacklogEntryDigest(candidate codexRolloutCandidate) string {
 	}
 	sum := sha256.Sum256([]byte(identity))
 	return fmt.Sprintf("%x", sum[:])
+}
+
+func codexRolloutRetryEntryValid(entry string) bool {
+	if len(entry) != sha256.Size*2 {
+		return false
+	}
+	for _, c := range entry {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func codexRolloutRetrySet(entries []string) map[string]struct{} {
+	retries := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if codexRolloutRetryEntryValid(entry) {
+			retries[entry] = struct{}{}
+		}
+	}
+	return retries
+}
+
+func codexRolloutRetryList(retries map[string]struct{}) []string {
+	entries := make([]string, 0, len(retries))
+	for entry := range retries {
+		if codexRolloutRetryEntryValid(entry) {
+			entries = append(entries, entry)
+		}
+	}
+	sort.Strings(entries)
+	return entries
 }
 
 func codexRolloutBacklogFingerprint(candidates []codexRolloutCandidate, cursorMtimeNs int64, now time.Time) string {
@@ -2057,6 +2108,7 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 	root := filepath.Join(base, "sessions")
 	candidates := []codexRolloutCandidate{}
 	boundaryCandidates := []codexRolloutCandidate{}
+	retryEntries := codexRolloutRetrySet(cursor.retryEntries)
 	complete := true
 	var walkDateLayout func(string, int)
 	walkDateLayout = func(dir string, depth int) {
@@ -2123,7 +2175,12 @@ func codexDiscoverRolloutCandidates(ctx context.Context, base string, cursor cod
 				continue
 			}
 			candidate := codexRolloutCandidate{path: path, boundaryID: rel, mtime: info.ModTime(), size: info.Size()}
+			_, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]
 			switch mtimeNs := info.ModTime().UnixNano(); {
+			case retry:
+				// Retry identities bypass the completed watermark, but still flow
+				// through the ordinary capped newest-first selection below.
+				candidates = append(candidates, candidate)
 			case mtimeNs > cursor.mtimeNs:
 				candidates = append(candidates, candidate)
 			case cursor.mtimeNs > 0 && mtimeNs == cursor.mtimeNs:
@@ -2166,6 +2223,19 @@ func codexRolloutCandidateOrderingContext(ctx context.Context) (context.Context,
 	remaining := time.Until(deadline)
 	reserve := codexRolloutFileReadReserve
 	if remaining <= reserve {
+		reserve = remaining / 2
+	}
+	return context.WithDeadline(ctx, deadline.Add(-reserve))
+}
+
+func codexRolloutFileContext(ctx context.Context, filesAfter int) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok || filesAfter <= 0 {
+		return ctx, func() {}
+	}
+	reserve := time.Duration(filesAfter) * codexRolloutLaterFileReserve
+	remaining := time.Until(deadline)
+	if reserve >= remaining {
 		reserve = remaining / 2
 	}
 	return context.WithDeadline(ctx, deadline.Add(-reserve))
@@ -2372,8 +2442,13 @@ func codexUnconsumedRolloutCandidates(candidates []codexRolloutCandidate, cursor
 		}
 	}
 
+	retryEntries := codexRolloutRetrySet(cursor.retryEntries)
 	eligible := make([]codexRolloutCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
+		if _, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]; retry {
+			eligible = append(eligible, candidate)
+			continue
+		}
 		if backlogFound && candidate.mtime.UnixNano() > cursor.mtimeNs &&
 			candidate.mtime.UnixNano() <= cursor.backlogMtimeNs && !candidate.mtime.After(now) &&
 			!codexRolloutCandidateBefore(backlogCutoff, candidate, now) {
@@ -2687,26 +2762,36 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		orderingCtx, eligibleCandidates, now, codexRolloutScanFileCap, reservedBoundaryMtimeNs,
 	)
 	cancelOrdering()
-	allHandled := discoveryComplete && selectionComplete
-	maxSelectedMtimeNs := int64(0)
-	for _, c := range selected {
-		if c.mtime.UnixNano() > maxSelectedMtimeNs {
-			maxSelectedMtimeNs = c.mtime.UnixNano()
+	progressComplete := discoveryComplete && selectionComplete
+	attempted := make([]codexRolloutCandidate, 0, len(selected))
+	retryEntries := codexRolloutRetrySet(cursor.retryEntries)
+	if discoveryComplete {
+		present := make(map[string]struct{}, len(candidates))
+		for _, candidate := range candidates {
+			present[codexRolloutBacklogEntryDigest(candidate)] = struct{}{}
+		}
+		for entry := range retryEntries {
+			if _, ok := present[entry]; !ok {
+				delete(retryEntries, entry)
+			}
 		}
 	}
-	for _, c := range selected {
+	for i, c := range selected {
 		if ctx.Err() != nil {
-			allHandled = false
+			progressComplete = false
 			break
 		}
-		buckets, sessionStart, fileLimit, handled, ok := codexBucketsFromRolloutFile(ctx, c.path, now)
-		if !handled {
-			allHandled = false
-		}
+		attempted = append(attempted, c)
+		fileCtx, cancelFile := codexRolloutFileContext(ctx, len(selected)-i-1)
+		buckets, sessionStart, fileLimit, handled, ok := codexBucketsFromRolloutFile(fileCtx, c.path, now)
+		cancelFile()
+		retryEntry := codexRolloutBacklogEntryDigest(c)
+		retry := !handled
 		// A fully read file with neither numeric nor refusal evidence has nothing
 		// account-scoped to merge. It is safe to count as handled even when its
 		// first record does not provide a usable session timestamp.
 		if sessionStart.IsZero() && handled && !ok && fileLimit.At.IsZero() {
+			delete(retryEntries, retryEntry)
 			continue
 		}
 		// Reject logs whose session began before the current login (a possible
@@ -2717,13 +2802,20 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// Applied BEFORE the no-buckets skip so exhaustion evidence is scoped to
 		// the current account exactly as usage readings are.
 		if !authMod.IsZero() {
-			accept, retry := codexRolloutSessionMatchesAuth(sessionStart, authMod, handled)
+			accept, authRetry := codexRolloutSessionMatchesAuth(sessionStart, authMod, handled)
+			retry = retry || authRetry
 			if retry {
-				allHandled = false
+				retryEntries[retryEntry] = struct{}{}
+			} else {
+				delete(retryEntries, retryEntry)
 			}
 			if !accept {
 				continue
 			}
+		} else if retry {
+			retryEntries[retryEntry] = struct{}{}
+		} else {
+			delete(retryEntries, retryEntry)
 		}
 		if fileLimit.At.After(limit.At) {
 			limit = fileLimit
@@ -2758,12 +2850,18 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// completed-scan watermark only while it remains newer than every numeric
 		// observation in the selected set. Newer telemetry supersedes the refusal
 		// and is durable, so repeatedly rescanning that rollout adds no evidence.
-		allHandled = false
+		progressComplete = false
 	}
 	var highWater *codexRolloutScanProgress
-	if allHandled {
+	if progressComplete {
+		maxSelectedMtimeNs := int64(0)
+		for _, c := range attempted {
+			if c.mtime.UnixNano() > maxSelectedMtimeNs {
+				maxSelectedMtimeNs = c.mtime.UnixNano()
+			}
+		}
 		backlogFingerprint, backlogCursor, backlogMtimeNs, backlogComplete :=
-			codexRolloutBacklogProgress(candidates, eligibleCandidates, selected, now, cursor)
+			codexRolloutBacklogProgress(candidates, eligibleCandidates, attempted, now, cursor)
 		if !backlogComplete {
 			// Keep the completed high-water below every member of this stable
 			// cohort. The redacted rank cursor excludes this pass's newest files on
@@ -2797,10 +2895,10 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// boundary until its remaining deterministic batches have been consumed.
 		hasSavedBoundary := cursor.boundaryCursor != "" && cursor.mtimeNs > 0
 		unfinishedSavedBoundary := hasSavedBoundary &&
-			codexRolloutBoundaryHasUnselected(eligibleCandidates, selected, cursor.mtimeNs)
+			codexRolloutBoundaryHasUnselected(eligibleCandidates, attempted, cursor.mtimeNs)
 		deferredNewerCandidate := hasSavedBoundary &&
 			codexRolloutHasUnselectedBelowProgress(
-				eligibleCandidates, selected, cursor.mtimeNs, maxSelectedMtimeNs,
+				eligibleCandidates, attempted, cursor.mtimeNs, maxSelectedMtimeNs,
 			)
 		if unfinishedSavedBoundary || deferredNewerCandidate {
 			// The reserved boundary entries can evict newer candidates from the
@@ -2816,7 +2914,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// consumed, the cursor is cleared and its full fingerprint restores the
 		// ordinary cache-only unchanged-boundary fast path.
 		futureAnchorNs, futureFingerprint, futureCursor, futureComplete :=
-			codexRolloutFutureProgress(candidates, eligibleCandidates, selected, now, cursor)
+			codexRolloutFutureProgress(candidates, eligibleCandidates, attempted, now, cursor)
 		if cursor.futureFingerprint != "" && futureFingerprint != "" && !futureComplete {
 			// A cohort that was future-dated when its capped scan started may be
 			// normal-time by the next refresh. Keep the main high-water below that
@@ -2829,7 +2927,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 			maxSelectedMtimeNs = codexRolloutNewestNormalMtimeNs(candidates, cursor.mtimeNs, now)
 			futureAnchorNs, futureFingerprint, futureCursor, futureComplete = 0, "", "", false
 		}
-		progress := codexRolloutBoundaryProgress(candidates, eligibleCandidates, selected, maxSelectedMtimeNs)
+		progress := codexRolloutBoundaryProgress(candidates, eligibleCandidates, attempted, maxSelectedMtimeNs)
 		if unfinishedSavedBoundary && progress.boundaryCursor == "" &&
 			codexRolloutBoundaryFingerprint(candidates, cursor.mtimeNs) == cursor.boundaryFingerprint {
 			// Newer files can fill the whole cap before this pass reaches the saved
@@ -2841,6 +2939,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		progress.backlogFingerprint = backlogFingerprint
 		progress.backlogCursor = backlogCursor
 		progress.backlogMtimeNs = backlogMtimeNs
+		progress.retryEntries = codexRolloutRetryList(retryEntries)
 		progress.futureFingerprint = futureFingerprint
 		progress.futureCursor = futureCursor
 		progress.futureComplete = futureComplete
@@ -3010,8 +3109,10 @@ func codexRolloutSessionStartPrefix(f *os.File) time.Time {
 	return time.Time{}
 }
 
+var codexOpenRolloutFile = os.Open
+
 func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time) (map[string]map[string]codexRateLimitBucket, time.Time, codexUsageLimitEvidence, bool, bool) {
-	f, err := os.Open(path)
+	f, err := codexOpenRolloutFile(path)
 	if err != nil {
 		// Only a file that definitively vanished is handled progress. Permission
 		// failures, descriptor exhaustion, and other open errors can be transient;

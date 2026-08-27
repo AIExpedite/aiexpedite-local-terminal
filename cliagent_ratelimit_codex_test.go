@@ -2625,8 +2625,9 @@ func TestCodexRolloutFallbackBuckets_OversizedHeaderCannotFakeSessionStart(t *te
 	if ok || len(contributors) != 0 {
 		t.Fatalf("contributors=%+v ok=%v, want oversized unverified session withheld", contributors, ok)
 	}
-	if highWater != nil {
-		t.Fatalf("highWater=%+v, want rollout left eligible for retry", highWater)
+	if highWater == nil || len(highWater.retryEntries) != 1 ||
+		!codexRolloutRetryEntryValid(highWater.retryEntries[0]) {
+		t.Fatalf("highWater=%+v, want progress with one redacted retry entry", highWater)
 	}
 }
 
@@ -3775,6 +3776,23 @@ func TestCodexRolloutFallbackBuckets_ExhaustedBudgetDoesNotAdvanceHighWater(t *t
 	}
 }
 
+func TestCodexRolloutFileContext_ReservesTimeForLaterCandidates(t *testing.T) {
+	parentDeadline := time.Now().Add(2 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), parentDeadline)
+	defer cancel()
+
+	fileCtx, cancelFile := codexRolloutFileContext(ctx, 3)
+	defer cancelFile()
+	fileDeadline, ok := fileCtx.Deadline()
+	if !ok {
+		t.Fatal("file context has no deadline")
+	}
+	want := 3 * codexRolloutLaterFileReserve
+	if gap := parentDeadline.Sub(fileDeadline); gap != want {
+		t.Fatalf("later-file reserve=%v, want %v", gap, want)
+	}
+}
+
 func TestCodexRolloutFallbackBuckets_OverCapMtimeBoundaryStaysDiscoverable(t *testing.T) {
 	base := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
@@ -4036,6 +4054,104 @@ func TestCodexRolloutFallbackBuckets_ActiveAppendPreservesBacklogProgress(t *tes
 	}
 	if completed.mtimeNs != appendedMtime.UnixNano() || completed.backlogCursor != "" || completed.backlogMtimeNs != 0 {
 		t.Fatalf("completed progress=%+v, want backlog complete at appended mtime %d", completed, appendedMtime.UnixNano())
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_RetryableFailureDoesNotPinCappedBacklog(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "retry-backlog@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	oldestMtime := now.Add(-30 * time.Minute)
+	var failedPath string
+	for i := range codexRolloutScanFileCap + 1 {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-retry-%05d.jsonl", i))
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == 0 {
+			window = `"secondary":{"used_percent":88,"window_minutes":10080}`
+		}
+		contents := `{"timestamp":"2026-08-26T12:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{%s}}`, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := oldestMtime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		if i == codexRolloutScanFileCap {
+			failedPath = path
+		}
+	}
+
+	originalOpen := codexOpenRolloutFile
+	defer func() { codexOpenRolloutFile = originalOpen }()
+	failedOpens := 0
+	codexOpenRolloutFile = func(path string) (*os.File, error) {
+		if filepath.Clean(path) == filepath.Clean(failedPath) {
+			failedOpens++
+			return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}
+		}
+		return os.Open(path)
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || first == nil || first.backlogCursor == "" || len(first.retryEntries) != 1 {
+		t.Fatalf("ok=%v progress=%+v, want resumable backlog with one redacted retry", ok, first)
+	}
+	if len(firstContributors[codexWindowSecondary]) != 0 {
+		t.Fatal("first capped pass unexpectedly consumed the seventeenth weekly rollout")
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, first, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if len(cursor.retryEntries) != 1 || !codexRolloutRetryEntryValid(cursor.retryEntries[0]) ||
+		strings.Contains(cursor.retryEntries[0], filepath.Base(failedPath)) {
+		t.Fatalf("persisted retry entries=%q, want one path-free SHA-256 identity", cursor.retryEntries)
+	}
+
+	secondContributors, _, _, second, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || second == nil || len(second.retryEntries) != 1 {
+		t.Fatalf("ok=%v progress=%+v, want failed rollout retained while backlog advances", ok, second)
+	}
+	if got := secondContributors[codexWindowSecondary][codexLegacyLimitID].UsedPercentage; got != 88 {
+		t.Fatalf("weekly contributor=%v, want seventeenth rollout consumed despite persistent failure", got)
+	}
+	if failedOpens != 2 {
+		t.Fatalf("failed rollout opens=%d, want one retry per bounded pass", failedOpens)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, secondContributors, nil, false, nil, false, now, fingerprint, second, base,
+	)
+
+	codexOpenRolloutFile = originalOpen
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	resolvedContributors, _, _, resolved, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || resolved == nil || len(resolved.retryEntries) != 0 || len(resolvedContributors) == 0 {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want successful retry retired", ok, resolvedContributors, resolved)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, resolvedContributors, nil, false, nil, false, now, fingerprint, resolved, base,
+	)
+
+	opened := 0
+	codexOpenRolloutFile = func(path string) (*os.File, error) {
+		opened++
+		return os.Open(path)
+	}
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	_, _, _, _, _ = codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if opened != 0 {
+		t.Fatalf("unchanged completed refresh opened %d rollouts, want cache-only", opened)
 	}
 }
 
