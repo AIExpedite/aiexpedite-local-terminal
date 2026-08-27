@@ -1455,14 +1455,11 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// uploaded anything.
 	// BOUNDED: a hung scan/upload here would suppress the session_ended frame
 	// terminal-service is waiting for (see sessionArtifactCollectTimeout).
-	uploadedFiles, uploadErrors, _ := collectSessionArtifactsBounded(
-		sm.Config,
-		session.ID,
-		session.WorkspaceID,
-		session.Process.Dir,
-		session.StartedAt,
-		sessionArtifactCollectTimeout,
-	)
+	var uploadedFiles []FileInfo
+	var uploadErrors []UploadError
+	if reserveSessionForTerminalWork(&sm.mu, sm.sessions, session.ID, session, &session.terminalPublishState) {
+		uploadedFiles, uploadErrors, _ = collectSessionArtifactsBounded(sm.Config, session.ID, session.WorkspaceID, session.Process.Dir, session.StartedAt, sessionArtifactCollectTimeout)
+	}
 
 	// Publish session_ended in a goroutine: publishFn blocks up to 30 s on
 	// Pub/Sub network I/O.  Calling it directly here would delay removeSession

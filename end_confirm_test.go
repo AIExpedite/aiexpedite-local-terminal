@@ -836,6 +836,26 @@ func TestPublishTerminalIfCurrent_ReservesIDUntilDelivered(t *testing.T) {
 	}
 }
 
+func TestReserveSessionForTerminalWork_ProtectsArtifactCollection(t *testing.T) {
+	m := NewCodexAppServerManager(nil)
+	old := &CodexAppServerSession{ID: "s"}
+	replacement := &CodexAppServerSession{ID: "s"}
+	m.sessions["s"] = old
+
+	if !reserveSessionForTerminalWork(&m.mu, m.sessions, "s", old, &old.terminalPublishState) {
+		t.Fatalf("current watcher must reserve its ID before artifact collection")
+	}
+	if m.removeSessionIfSame("s", old) {
+		t.Fatalf("artifact collection reservation must prevent ID reuse")
+	}
+
+	old.terminalPublishState.publishInFlight.Store(false)
+	m.sessions["s"] = replacement
+	if reserveSessionForTerminalWork(&m.mu, m.sessions, "s", old, &old.terminalPublishState) {
+		t.Fatalf("stale watcher must not collect artifacts under a replacement ID")
+	}
+}
+
 // End must not free an ended session in the gap between the watcher marking
 // it ended and establishing the terminal-frame reservation. The watcher owns
 // both publication and removal.

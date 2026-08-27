@@ -1232,14 +1232,11 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	// BOUNDED: a hung scan/upload here used to suppress the ended frame. End
 	// callers now unblock on processExited above, while session.done remains a
 	// later watcher/publication lifecycle signal.
-	uploadedFiles, uploadErrors, _ := collectSessionArtifactsBounded(
-		m.Config,
-		session.ID,
-		session.WorkspaceID,
-		session.Process.Dir,
-		session.StartedAt,
-		sessionArtifactCollectTimeout,
-	)
+	var uploadedFiles []FileInfo
+	var uploadErrors []UploadError
+	if reserveSessionForTerminalWork(&m.mu, m.sessions, session.ID, session, &session.terminalPublishState) {
+		uploadedFiles, uploadErrors, _ = collectSessionArtifactsBounded(m.Config, session.ID, session.WorkspaceID, session.Process.Dir, session.StartedAt, sessionArtifactCollectTimeout)
+	}
 
 	seq := atomic.AddInt64(&session.seq, 1)
 

@@ -230,6 +230,20 @@ type terminalPublishState struct {
 // for this session and has not yet been delivered.
 func (t *terminalPublishState) terminalPublishInFlight() bool { return t.publishInFlight.Load() }
 
+// reserveSessionForTerminalWork keeps id mapped to s while the exit watcher
+// collects artifacts and delivers the terminal frame. A stale watcher whose
+// ID has already been reused must skip both operations.
+func reserveSessionForTerminalWork[S comparable](mu *sync.RWMutex, sessions map[string]S, id string, s S, state *terminalPublishState) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	cur, ok := sessions[id]
+	if !ok || cur != s {
+		return false
+	}
+	state.publishInFlight.Store(true)
+	return true
+}
+
 // publishTerminalIfCurrent publishes a session's terminal (`*_ended`) frame
 // only while id still maps to THIS session — or can be atomically re-reserved
 // for it — and reports whether it published. Once publishFn returns it runs
