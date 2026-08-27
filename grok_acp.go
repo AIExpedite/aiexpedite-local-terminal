@@ -1208,7 +1208,14 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 
 	seq := atomic.AddInt64(&session.seq, 1)
 
-	publishTerminalResultAsync(publishFn, resultMsg{
+	// A wedged watcher can reach this point long after a verified-absence
+	// End dropped the tombstone and a replacement Start re-took the ID. The
+	// terminal frame is shutdown evidence: delivered while the ID belongs to
+	// a replacement, it releases the server's fence for a session that is
+	// still running (Codex P2, round 3 — the identity guard covered only map
+	// removal). Publish it only while the ID is still THIS session's (or
+	// unclaimed), atomically against Start's registration.
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, session.ID, session, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
 		UID:          session.UID,
@@ -1222,7 +1229,10 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 		Seq:          int(seq),
 		Files:        uploadedFiles,
 		UploadErrors: uploadErrors,
-	})
+	}) {
+		fmt.Printf("%s[grok-acp] Suppressed stale grok_acp_ended for %s — the ID now belongs to a replacement session%s\n",
+			colorYellow, session.ID, colorReset)
+	}
 
 	close(session.done)
 

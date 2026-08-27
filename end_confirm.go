@@ -143,3 +143,40 @@ func defaultProbeProcessGone(cmd *exec.Cmd) bool {
 	}
 	return processHandleGone(cmd.Process)
 }
+
+// publishTerminalIfCurrent publishes a session's terminal (`*_ended`) frame
+// only while id still maps to THIS session — or to no session at all — and
+// reports whether it published.
+//
+// Why the guard exists: a tombstone that resolves through verified process
+// absence frees its ID for reuse while the wedged exit watcher may still be
+// blocked in stream drain or artifact collection. removeSessionIfSame already
+// stops that watcher from DELETING the replacement, but its terminal publish
+// was unconditional (Codex P2, round 3) — and that frame is the shutdown
+// evidence terminal-service releases the device claim on, so emitting it under
+// a replacement's ID tears down a session that is still running.
+//
+// The identity test runs under the manager's own map lock, the same lock Start
+// takes to register a session, so the decision is atomic against registration:
+// once a replacement is registered, no stale terminal frame can be launched for
+// that ID. An UNCLAIMED id still publishes — that is the ordinary teardown
+// (End removes the session on the "ended" status fast-path while the watcher is
+// still finishing its artifact scan), and a late frame for a session the server
+// already considers gone is idempotent.
+func publishTerminalIfCurrent[S comparable](
+	mu *sync.RWMutex,
+	sessions map[string]S,
+	id string,
+	s S,
+	publishFn PublishFunc,
+	msg resultMsg,
+) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	if cur, ok := sessions[id]; ok && cur != s {
+		return false
+	}
+	// Cheap under the lock: this only spawns the publisher goroutine.
+	publishTerminalResultAsync(publishFn, msg)
+	return true
+}

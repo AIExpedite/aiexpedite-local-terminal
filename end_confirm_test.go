@@ -294,9 +294,13 @@ func TestSessionManagerEndSession_KillUnconfirmed_TombstoneThenVerifiedAbsence(t
 }
 
 // Turn-per-process managers: a drain barrier that never clears must not hold
-// the END handler hostage. With NO recorded turn process, nothing can be
-// writing to the checkout, so the tombstone resolves immediately.
-func TestAntigravityEnd_TurnDrainUnconfirmed_NoProcessResolvesAbsent(t *testing.T) {
+// the END handler hostage — but an absent turn PROCESS is not on its own
+// evidence that the session is inert. The turn runner clears activeProcess
+// and keeps holding turnMu while it publishes its final frames, so resolving
+// here would free the ID for a replacement Start the old goroutine could then
+// publish under (Codex P2, round 3). The tombstone must hold until the
+// barrier itself drains.
+func TestAntigravityEnd_TurnDrainUnconfirmed_NoProcessStillRetains(t *testing.T) {
 	shortenEndConfirmTimeouts(t)
 	m := NewAntigravityNativeManager(nil)
 	session := &AntigravityNativeSession{
@@ -304,8 +308,7 @@ func TestAntigravityEnd_TurnDrainUnconfirmed_NoProcessResolvesAbsent(t *testing.
 		StartedAt: time.Now(),
 		status:    "ended", // already-ended path still drains on turnMu
 	}
-	session.turnMu.Lock() // a wedged in-flight turn holds the barrier forever
-	defer session.turnMu.Unlock()
+	session.turnMu.Lock() // a wedged in-flight turn holds the barrier
 	m.sessions["wedged-ag"] = session
 
 	resultCh := make(chan error, 1)
@@ -315,13 +318,62 @@ func TestAntigravityEnd_TurnDrainUnconfirmed_NoProcessResolvesAbsent(t *testing.
 	select {
 	case err = <-resultCh:
 	case <-time.After(30 * time.Second):
+		session.turnMu.Unlock()
 		t.Fatalf("End never returned — the unbounded turn barrier is back")
 	}
-	if err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("no recorded turn process — expected verified-absent resolution, got %v", err)
+	if err == nil || !errorsIs(err, errEndUnconfirmed) {
+		session.turnMu.Unlock()
+		t.Fatalf("a held barrier must stay unconfirmed even with no turn process, got %v", err)
+	}
+	if strings.Contains(err.Error(), "not found") {
+		session.turnMu.Unlock()
+		t.Fatalf("absence answer manufactured while the turn goroutine still holds the barrier: %v", err)
+	}
+	if m.Get("wedged-ag") != session {
+		session.turnMu.Unlock()
+		t.Fatalf("tombstone must be retained until the barrier drains")
+	}
+
+	// The turn goroutine finally unwinds: the next End drains the barrier and
+	// the session is released.
+	session.turnMu.Unlock()
+	if err := m.End("wedged-ag"); err != nil {
+		t.Fatalf("drained barrier should end cleanly, got %v", err)
 	}
 	if m.Get("wedged-ag") != nil {
-		t.Fatalf("session should be removed once resolved absent")
+		t.Fatalf("session should be removed once the barrier drained")
+	}
+}
+
+// Same contract on the other turn manager — the branch Codex flagged exists
+// identically in OpenCodeNativeManager.
+func TestOpenCodeEnd_TurnDrainUnconfirmed_NoProcessStillRetains(t *testing.T) {
+	shortenEndConfirmTimeouts(t)
+	m := NewOpenCodeNativeManager()
+	session := &OpenCodeNativeSession{
+		ID:        "wedged-oc",
+		StartedAt: time.Now(),
+		status:    "ended",
+	}
+	session.turnMu.Lock()
+	m.sessions["wedged-oc"] = session
+
+	err := m.End("wedged-oc")
+	if err == nil || !errorsIs(err, errEndUnconfirmed) {
+		session.turnMu.Unlock()
+		t.Fatalf("a held barrier must stay unconfirmed even with no turn process, got %v", err)
+	}
+	if m.Get("wedged-oc") != session {
+		session.turnMu.Unlock()
+		t.Fatalf("tombstone must be retained until the barrier drains")
+	}
+
+	session.turnMu.Unlock()
+	if err := m.End("wedged-oc"); err != nil {
+		t.Fatalf("drained barrier should end cleanly, got %v", err)
+	}
+	if m.Get("wedged-oc") != nil {
+		t.Fatalf("session should be removed once the barrier drained")
 	}
 }
 
@@ -338,25 +390,39 @@ func TestAntigravityEnd_TurnDrainUnconfirmed_LiveProcessRetains(t *testing.T) {
 	}
 	session.activeProcess = exitedTestProcess(t) // probe stub says alive anyway
 	session.turnMu.Lock()
-	defer session.turnMu.Unlock()
 	m.sessions["wedged-ag"] = session
 
 	err := m.End("wedged-ag")
 	if err == nil || !strings.Contains(err.Error(), "turn drain unconfirmed") {
+		session.turnMu.Unlock()
 		t.Fatalf("expected turn-drain-unconfirmed error, got %v", err)
 	}
 	if strings.Contains(err.Error(), "not found") {
+		session.turnMu.Unlock()
 		t.Fatalf("absence answer manufactured while probe says alive: %v", err)
 	}
 	if m.Get("wedged-ag") != session {
+		session.turnMu.Unlock()
 		t.Fatalf("tombstone must be retained while the turn process is alive")
 	}
 
-	// Once the process is verifiably gone, the next End resolves.
+	// The process going away is NOT enough on its own: the turn goroutine
+	// still holds the barrier and can act under this ID (Codex P2, round 3).
 	stubProbe(t, true)
 	err = m.End("wedged-ag")
-	if err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("expected verified-absent resolution, got %v", err)
+	if err == nil || !errorsIs(err, errEndUnconfirmed) {
+		session.turnMu.Unlock()
+		t.Fatalf("held barrier must keep the end unconfirmed, got %v", err)
+	}
+	if m.Get("wedged-ag") != session {
+		session.turnMu.Unlock()
+		t.Fatalf("tombstone must be retained until the barrier drains")
+	}
+
+	// Process gone AND the barrier drained → the session is released.
+	session.turnMu.Unlock()
+	if err := m.End("wedged-ag"); err != nil {
+		t.Fatalf("drained barrier should end cleanly, got %v", err)
 	}
 	if m.Get("wedged-ag") != nil {
 		t.Fatalf("session should be removed once resolved absent")
@@ -374,21 +440,33 @@ func TestOpenCodeEnd_TurnDrainUnconfirmed_LiveProcessRetains(t *testing.T) {
 	}
 	session.activeProcess = exitedTestProcess(t)
 	session.turnMu.Lock()
-	defer session.turnMu.Unlock()
 	m.sessions["wedged-oc"] = session
 
 	err := m.End("wedged-oc")
 	if err == nil || !strings.Contains(err.Error(), "turn drain unconfirmed") {
+		session.turnMu.Unlock()
 		t.Fatalf("expected turn-drain-unconfirmed error, got %v", err)
 	}
 	if m.Get("wedged-oc") != session {
+		session.turnMu.Unlock()
 		t.Fatalf("tombstone must be retained while the turn process is alive")
 	}
 
+	// Process gone but the barrier still held → still unconfirmed.
 	stubProbe(t, true)
 	err = m.End("wedged-oc")
-	if err == nil || !strings.Contains(err.Error(), "not found") {
-		t.Fatalf("expected verified-absent resolution, got %v", err)
+	if err == nil || !errorsIs(err, errEndUnconfirmed) {
+		session.turnMu.Unlock()
+		t.Fatalf("held barrier must keep the end unconfirmed, got %v", err)
+	}
+	if m.Get("wedged-oc") != session {
+		session.turnMu.Unlock()
+		t.Fatalf("tombstone must be retained until the barrier drains")
+	}
+
+	session.turnMu.Unlock()
+	if err := m.End("wedged-oc"); err != nil {
+		t.Fatalf("drained barrier should end cleanly, got %v", err)
 	}
 	if m.Get("wedged-oc") != nil {
 		t.Fatalf("session should be removed once resolved absent")
@@ -477,5 +555,58 @@ func TestRemoveSessionIfSame_DoesNotDeleteReplacement(t *testing.T) {
 	m.removeSessionIfSame("s", replacement)
 	if m.Get("s") != nil {
 		t.Fatalf("identity-matched removal should remove the session")
+	}
+}
+
+// The stale terminal frame half of the reused-ID race (Codex P2, round 3):
+// removeSessionIfSame stops a recovering watcher from DELETING a replacement,
+// but its `*_ended` publish was unconditional — and that frame is the
+// shutdown evidence terminal-service releases the device claim on, so under a
+// replacement's ID it tears down a session that is still running.
+func TestPublishTerminalIfCurrent_SuppressesFrameForReplacedID(t *testing.T) {
+	m := NewCodexAppServerManager(nil)
+	old := &CodexAppServerSession{ID: "s", status: "ended", done: make(chan struct{})}
+	replacement := &CodexAppServerSession{ID: "s", status: "running", done: make(chan struct{})}
+
+	var mu sync.Mutex
+	var published []resultMsg
+	publishFn := func(msg resultMsg) {
+		mu.Lock()
+		published = append(published, msg)
+		mu.Unlock()
+	}
+	frame := resultMsg{ID: "s", SessionID: "s", Type: "codex_appserver_ended"}
+	publishedCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(published)
+	}
+
+	// Still ours → published (the ordinary teardown).
+	m.sessions["s"] = old
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, publishFn, frame) {
+		t.Fatalf("terminal frame must publish while the ID is still this session's")
+	}
+
+	// ID re-taken by a replacement → suppressed.
+	m.sessions["s"] = replacement
+	if publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, publishFn, frame) {
+		t.Fatalf("stale terminal frame published under a replacement session's ID")
+	}
+
+	// Unclaimed ID → still published; a late frame for a session the server
+	// already considers gone is idempotent.
+	delete(m.sessions, "s")
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, "s", old, publishFn, frame) {
+		t.Fatalf("terminal frame must publish when the ID is unclaimed")
+	}
+
+	// The publishes are async; wait for exactly the two allowed frames.
+	deadline := time.Now().Add(2 * time.Second)
+	for publishedCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := publishedCount(); got != 2 {
+		t.Fatalf("expected exactly 2 published frames (current + unclaimed), got %d", got)
 	}
 }

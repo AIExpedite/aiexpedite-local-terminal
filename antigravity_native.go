@@ -875,27 +875,49 @@ func (m *AntigravityNativeManager) End(id string) error {
 // did not confirm within its bound. The wedged turn goroutine may still act
 // under this session, so the session is RETAINED as a tombstone rather than
 // deregistered — an immediate removal would manufacture the "not found"
-// absence answer the server frees the device on while the turn process might
-// still be alive (Codex P1; see end_confirm.go). Only a VERIFIED-absent turn
-// process resolves the tombstone: no recorded active process (the turn
-// runner clears it on completion, and cancel/kill already ran), or an
-// OS-level probe confirming the recorded one is gone. While the process is
-// verifiably alive it is re-killed and the fence stays up — visibly.
+// absence answer the server frees the device on while the turn might still
+// be running (Codex P1; see end_confirm.go).
+//
+// Resolution needs BOTH halves of "this session can no longer act":
+//  1. the turn process is verifiably gone (no recorded process, or an
+//     OS-level probe confirming the recorded one is absent), and
+//  2. the turn barrier has actually drained.
+//
+// (2) is not implied by (1): the turn runner clears activeProcess and then
+// keeps holding turnMu while it publishes its final frames and finishes its
+// post-process bookkeeping. Resolving on process absence alone freed the ID
+// for a replacement Start while that goroutine was still live, letting it
+// publish and mutate conversation state under the replacement session (Codex
+// P2, round 3). The barrier re-test here is non-blocking — every caller has
+// already waited turnDrainConfirmTimeout on it — so this adds no delay.
+//
+// While either half is unmet the process is re-killed and the fence stays up
+// — visibly.
 func (m *AntigravityNativeManager) retainOrResolveDrainTombstone(id string, session *AntigravityNativeSession) error {
 	session.mu.Lock()
 	session.endDrainUnconfirmed = true
 	proc := session.activeProcess
 	session.mu.Unlock()
 
-	if proc == nil || probeProcessGone(proc) {
-		m.removeSessionIfSame(id, session)
-		return fmt.Errorf("antigravity native session %s not found", id)
+	if proc != nil && !probeProcessGone(proc) {
+		killAntigravityProcessTree(proc)
+		fmt.Printf("%s[antigravity-native] Turn drain unconfirmed for %s after %s — turn process still alive; retaining tombstone%s\n",
+			colorRed, id, turnDrainConfirmTimeout, colorReset)
+		// Deliberately NOT "session <id> not found" — see end_confirm.go.
+		return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session retained pending process-absence verification: %w", id, turnDrainConfirmTimeout, errEndUnconfirmed)
 	}
-	killAntigravityProcessTree(proc)
-	fmt.Printf("%s[antigravity-native] Turn drain unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
-		colorRed, id, turnDrainConfirmTimeout, colorReset)
-	// Deliberately NOT "session <id> not found" — see end_confirm.go.
-	return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session retained pending process-absence verification: %w", id, turnDrainConfirmTimeout, errEndUnconfirmed)
+
+	// Process absent (or never recorded) is only half the evidence: a turn
+	// goroutine still holding turnMu can publish and mutate state under this
+	// ID. Non-blocking re-test — the caller already spent the full bound here.
+	if !waitTurnBarrier(&session.turnMu, 0) {
+		fmt.Printf("%s[antigravity-native] Turn drain unconfirmed for %s after %s — turn goroutine still holding the barrier; retaining tombstone%s\n",
+			colorRed, id, turnDrainConfirmTimeout, colorReset)
+		return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session retained pending turn-drain verification: %w", id, turnDrainConfirmTimeout, errEndUnconfirmed)
+	}
+
+	m.removeSessionIfSame(id, session)
+	return fmt.Errorf("antigravity native session %s not found", id)
 }
 
 func (m *AntigravityNativeManager) Get(id string) *AntigravityNativeSession {

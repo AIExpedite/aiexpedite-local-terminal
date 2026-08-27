@@ -913,7 +913,14 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 	// session slot (delaying removeSession below) and slow EndSession-style
 	// callers waiting on session.done. Mirrors session.go's session_ended
 	// publish pattern.
-	publishTerminalResultAsync(publishFn, resultMsg{
+	// A wedged watcher can reach this point long after a verified-absence
+	// End dropped the tombstone and a replacement Start re-took the ID. The
+	// terminal frame is shutdown evidence: delivered while the ID belongs to
+	// a replacement, it releases the server's fence for a session that is
+	// still running (Codex P2, round 3 — the identity guard covered only map
+	// removal). Publish it only while the ID is still THIS session's (or
+	// unclaimed), atomically against Start's registration.
+	if !publishTerminalIfCurrent(&m.mu, m.sessions, session.ID, session, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
 		UID:          session.UID,
@@ -927,7 +934,10 @@ func (m *CodexAppServerManager) waitForExit(session *CodexAppServerSession, publ
 		Seq:          int(seq),
 		Files:        uploadedFiles,
 		UploadErrors: uploadErrors,
-	})
+	}) {
+		fmt.Printf("%s[codex-appserver] Suppressed stale codex_appserver_ended for %s — the ID now belongs to a replacement session%s\n",
+			colorYellow, session.ID, colorReset)
+	}
 
 	// Closing `done` after the publish goroutine has been launched (but
 	// without waiting on it) means End() can unblock and the manager can

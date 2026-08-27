@@ -1431,7 +1431,14 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// race the async stream publishes already in-flight from readOutputStream —
 	// the session_ended message could arrive at the client before the last
 	// streamed lines despite having a higher sequence number.
-	publishTerminalResultAsync(publishFn, resultMsg{
+	// A wedged watcher can reach this point long after a verified-absence
+	// End dropped the tombstone and a replacement Start re-took the ID. The
+	// terminal frame is shutdown evidence: delivered while the ID belongs to
+	// a replacement, it releases the server's fence for a session that is
+	// still running (Codex P2, round 3 — the identity guard covered only map
+	// removal). Publish it only while the ID is still THIS session's (or
+	// unclaimed), atomically against Start's registration.
+	if !publishTerminalIfCurrent(&sm.mu, sm.sessions, session.ID, session, publishFn, resultMsg{
 		ID:           session.ID,
 		WorkspaceID:  session.WorkspaceID,
 		UID:          session.UID,
@@ -1445,7 +1452,10 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 		Seq:          int(seq),
 		Files:        uploadedFiles,
 		UploadErrors: uploadErrors,
-	})
+	}) {
+		fmt.Printf("%s[session] Suppressed stale session_ended for %s — the ID now belongs to a replacement session%s\n",
+			colorYellow, session.ID, colorReset)
+	}
 
 	fmt.Printf("%s[session] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, session.ExitCode, colorReset)
