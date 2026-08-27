@@ -187,15 +187,16 @@ type GrokACPSession struct {
 	// snapshot here; the child never receives this path as its log directory.
 	PersistentHome string
 
-	mu           sync.Mutex
-	status       string // "running" | "ended"
-	exitCode     int
-	stdinMu      sync.Mutex
-	stdinClose   sync.Once
-	done         chan struct{}
-	streamDone   chan struct{}
-	seq          int64
-	timeoutTimer *time.Timer // armed only when TimeoutMs > 0
+	mu            sync.Mutex
+	status        string // "running" | "ended"
+	exitCode      int
+	stdinMu       sync.Mutex
+	stdinClose    sync.Once
+	processExited chan struct{}
+	done          chan struct{}
+	streamDone    chan struct{}
+	seq           int64
+	timeoutTimer  *time.Timer // armed only when TimeoutMs > 0
 	// firstFrame is closed (exactly once, via firstFrameOnce) the moment the
 	// stdout reader sees grok's first frame. The first-frame watchdog
 	// (watchFirstFrame) selects on it to disarm itself the instant grok
@@ -527,6 +528,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		PersistentHome: persistentHome,
 		status:         "running",
 		done:           make(chan struct{}),
+		processExited:  make(chan struct{}),
 		streamDone:     make(chan struct{}),
 		firstFrame:     make(chan struct{}),
 	}
@@ -719,6 +721,13 @@ func (m *GrokACPManager) End(id string) error {
 	if session == nil {
 		return fmt.Errorf("grok acp session %s not found", id)
 	}
+	processExited := processExitSignal(session.processExited, session.done)
+	select {
+	case <-processExited:
+		// The watcher owns artifact collection, terminal publication and removal.
+		return nil
+	default:
+	}
 
 	if session.Status() == "ended" {
 		// The watcher owns terminal publication and removal; retain the ID until
@@ -744,8 +753,7 @@ func (m *GrokACPManager) End(id string) error {
 					colorRed, id, killErr, colorReset)
 			}
 		}
-		if waitDoneConfirm(session.done, killConfirmTimeout) {
-			m.removeSessionIfSame(id, session)
+		if waitDoneConfirm(processExited, killConfirmTimeout) {
 			return nil
 		}
 		return fmt.Errorf("grok acp session %s kill unconfirmed after %s; session retained pending process-absence verification: %w", id, killConfirmTimeout, errEndUnconfirmed)
@@ -757,13 +765,13 @@ func (m *GrokACPManager) End(id string) error {
 	session.closeStdin()
 
 	select {
-	case <-session.done:
+	case <-processExited:
 	case <-time.After(grokACPGracefulShutdownTimeout):
 		fmt.Printf("%s[grok-acp] Stdin close didn't exit %s — interrupting%s\n",
 			colorYellow, id, colorReset)
 		_ = interruptProcess(session.Process)
 		select {
-		case <-session.done:
+		case <-processExited:
 		case <-time.After(grokACPGracefulShutdownTimeout):
 			fmt.Printf("%s[grok-acp] Force killing session %s%s\n",
 				colorRed, id, colorReset)
@@ -775,7 +783,7 @@ func (m *GrokACPManager) End(id string) error {
 			}
 			// BOUNDED wait — see end_confirm.go for why blocking here
 			// indefinitely wedged an entire device (2026-08-27).
-			if !waitDoneConfirm(session.done, killConfirmTimeout) {
+			if !waitDoneConfirm(processExited, killConfirmTimeout) {
 				fmt.Printf("%s[grok-acp] Kill unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
 					colorRed, id, killConfirmTimeout, colorReset)
 				session.markKillUnconfirmed()
@@ -787,7 +795,8 @@ func (m *GrokACPManager) End(id string) error {
 		}
 	}
 
-	m.removeSessionIfSame(id, session)
+	// The watcher retains the exited session until terminal publication is
+	// reserved, so a replacement cannot steal the old frame's session ID.
 	return nil
 }
 
@@ -1149,6 +1158,7 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	// gated on streamDone) preserves the final frame while keeping the
 	// status-flip race fix intact.
 	state, _ := session.Process.Process.Wait()
+	closeProcessExited(session.processExited)
 
 	// Flip status to "ended" and record exitCode BEFORE the stream-drain wait.
 	// The deadline timer's AfterFunc gates its publish+Kill on
@@ -1216,9 +1226,9 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	// does on the PTY path's session_ended. Skipping this is what made every
 	// capture run through a bundled CLI report NO_MEDIA_UPLOADED while the
 	// recording sat on the device (prod 2026-08-20, video project vp_a72774c5).
-	// BOUNDED: a hung scan/upload here used to suppress the ended frame and
-	// hold session.done forever — one of the two wedge shapes behind the
-	// 2026-08-27 device outage (see sessionArtifactCollectTimeout).
+	// BOUNDED: a hung scan/upload here used to suppress the ended frame. End
+	// callers now unblock on processExited above, while session.done remains a
+	// later watcher/publication lifecycle signal.
 	uploadedFiles, uploadErrors, _ := collectSessionArtifactsBounded(
 		m.Config,
 		session.ID,

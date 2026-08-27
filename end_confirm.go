@@ -80,10 +80,12 @@ func staleEndError(kind string, id string) error {
 }
 
 // killConfirmTimeout is how long an End path waits, after issuing the final
-// force kill, for the exit watcher to confirm the process is gone (close of
-// session.done). A killed process normally exits within milliseconds; this
-// bound only matters when the watcher itself is wedged. Declared as a var so
-// tests can shorten it.
+// force kill, for the exit watcher to confirm the process is gone. Resident
+// process managers use a dedicated processExited signal because their broader
+// session.done signal deliberately stays open through artifact collection and
+// terminal-publish reservation. A killed process normally exits within
+// milliseconds; this bound only matters when the watcher itself is wedged.
+// Declared as a var so tests can shorten it.
 var killConfirmTimeout = 30 * time.Second
 
 // turnDrainConfirmTimeout bounds the turnMu drain barrier used by the
@@ -122,6 +124,26 @@ func waitDoneConfirm(done <-chan struct{}, timeout time.Duration) bool {
 		return true
 	case <-time.After(timeout):
 		return false
+	}
+}
+
+// processExitSignal returns the process-only exit signal when a resident
+// manager has one. The watcherDone fallback keeps manually constructed test
+// fixtures (and any pre-existing internal callers) on the legacy lifecycle
+// signal; production sessions always initialize processExited.
+func processExitSignal(processExited, watcherDone <-chan struct{}) <-chan struct{} {
+	if processExited != nil {
+		return processExited
+	}
+	return watcherDone
+}
+
+// closeProcessExited signals only that the OS child has been reaped. It must
+// happen before artifact collection, while session.done remains open until the
+// watcher has reserved the terminal frame against session-ID reuse.
+func closeProcessExited(processExited chan struct{}) {
+	if processExited != nil {
+		close(processExited)
 	}
 }
 

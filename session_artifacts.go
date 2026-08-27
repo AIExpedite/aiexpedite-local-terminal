@@ -13,13 +13,13 @@ import (
 // resident manager's waitForExit collects artifacts BEFORE publishing its
 // `*_ended` frame and BEFORE closing session.done — so a scan/upload that
 // hangs (a stalled GCS upload, an unreachable network share in the workdir)
-// silently suppresses the ended frame terminal-service is waiting for, and
-// leaves End() callers blocked on session.done. That is one of the two wedge
-// shapes behind the 2026-08-27 HOMETHEATRE device outage (see end_confirm.go
-// for the other). Two minutes is generous for legitimate video uploads while
-// still guaranteeing the ended frame is published the same order of magnitude
-// as the server's 5-minute reaper cadence. Declared as a var so tests can
-// shorten it.
+// silently suppresses the ended frame terminal-service is waiting for.
+// Process managers separately close processExited as soon as the OS child is
+// reaped, so End callers do not mistake slow artifact work for a live process.
+// Two minutes is generous for legitimate video uploads while still
+// guaranteeing the ended frame is published the same order of magnitude as
+// the server's 5-minute reaper cadence. Declared as a var so tests can shorten
+// it.
 var sessionArtifactCollectTimeout = 2 * time.Minute
 
 // Give context-aware collectors a short, bounded window to report uploads

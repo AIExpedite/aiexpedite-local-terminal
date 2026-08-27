@@ -830,6 +830,84 @@ func TestProcessManagerEnd_RetainsEndedSessionForWatcher(t *testing.T) {
 	}
 }
 
+// Reaping the OS child and finishing the watcher's terminal lifecycle are two
+// different events. Artifact collection may legitimately continue for minutes
+// after process exit; End must return on the first event without removing the
+// session that still reserves the eventual terminal frame's ID.
+func TestProcessManagerEnd_ProcessExitDoesNotWaitForWatcherDone(t *testing.T) {
+	t.Run("codex app-server", func(t *testing.T) {
+		m := NewCodexAppServerManager(nil)
+		session := &CodexAppServerSession{
+			ID:            "s",
+			status:        "running",
+			processExited: make(chan struct{}),
+			done:          make(chan struct{}),
+		}
+		m.sessions[session.ID] = session
+		close(session.processExited)
+
+		if err := m.End(session.ID); err != nil {
+			t.Fatalf("End after process exit: %v", err)
+		}
+		if got := m.Get(session.ID); got != session {
+			t.Fatalf("End removed session before watcher terminal lifecycle finished")
+		}
+		select {
+		case <-session.done:
+			t.Fatalf("test requires watcher done to remain open")
+		default:
+		}
+	})
+
+	t.Run("claude native", func(t *testing.T) {
+		m := NewClaudeNativeManager(nil)
+		session := &ClaudeNativeSession{
+			ID:            "s",
+			status:        "running",
+			processExited: make(chan struct{}),
+			done:          make(chan struct{}),
+		}
+		m.sessions[session.ID] = session
+		close(session.processExited)
+
+		if err := m.End(session.ID); err != nil {
+			t.Fatalf("End after process exit: %v", err)
+		}
+		if got := m.Get(session.ID); got != session {
+			t.Fatalf("End removed session before watcher terminal lifecycle finished")
+		}
+		select {
+		case <-session.done:
+			t.Fatalf("test requires watcher done to remain open")
+		default:
+		}
+	})
+
+	t.Run("grok ACP", func(t *testing.T) {
+		m := NewGrokACPManager(nil)
+		session := &GrokACPSession{
+			ID:            "s",
+			status:        "running",
+			processExited: make(chan struct{}),
+			done:          make(chan struct{}),
+		}
+		m.sessions[session.ID] = session
+		close(session.processExited)
+
+		if err := m.End(session.ID); err != nil {
+			t.Fatalf("End after process exit: %v", err)
+		}
+		if got := m.Get(session.ID); got != session {
+			t.Fatalf("End removed session before watcher terminal lifecycle finished")
+		}
+		select {
+		case <-session.done:
+			t.Fatalf("test requires watcher done to remain open")
+		default:
+		}
+	})
+}
+
 func TestBoundedArtifactCollect_PreservesIncrementalResultsPastDrain(t *testing.T) {
 	oldDrain := sessionArtifactCancelDrainTimeout
 	sessionArtifactCancelDrainTimeout = 20 * time.Millisecond
