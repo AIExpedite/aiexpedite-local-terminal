@@ -111,9 +111,14 @@ type CLISession struct {
 	// can publish the fail-fast error frame without threading it through.
 	publishFn PublishFunc
 
-	mu         sync.Mutex
-	done       chan struct{} // closed when process exits
-	streamDone chan struct{} // closed when stdout/stderr and stream publishes finish
+	mu   sync.Mutex
+	done chan struct{} // closed when process exits
+	// killUnconfirmed marks a session whose EndSession escalated to Kill and
+	// then timed out waiting for the exit watcher. The session is RETAINED as
+	// a tombstone (see end_confirm.go): only probeProcessGone may convert it
+	// into the "not found" absence answer the server frees a device on.
+	killUnconfirmed bool
+	streamDone      chan struct{} // closed when stdout/stderr and stream publishes finish
 }
 
 // claudeFirstFrameTimeout bounds how long a freshly-started claude session may
@@ -570,10 +575,32 @@ func (sm *SessionManager) EndSession(id string) error {
 	if session.Status == "ended" {
 		session.mu.Unlock()
 		// Already ended — just clean up from map
-		sm.removeSession(id)
+		sm.removeSessionIfSame(id, session)
 		return nil
 	}
+	unconfirmed := session.killUnconfirmed
 	session.mu.Unlock()
+
+	// A prior EndSession already escalated to Kill and timed out on the exit
+	// watcher. The session is a retained tombstone: only VERIFIED OS-level
+	// process absence may become the "not found" answer the server frees the
+	// device on (Codex P1 — see end_confirm.go).
+	if unconfirmed {
+		if probeProcessGone(session.Process) {
+			sm.removeSessionIfSame(id, session)
+			return fmt.Errorf("session %s not found", id)
+		}
+		if session.Process.Process != nil {
+			if killErr := session.Process.Process.Kill(); killErr != nil {
+				fmt.Printf("%s[session] Re-kill failed for %s: %v%s\n", colorRed, id, killErr, colorReset)
+			}
+		}
+		if waitDoneConfirm(session.done, killConfirmTimeout) {
+			sm.removeSessionIfSame(id, session)
+			return nil
+		}
+		return fmt.Errorf("session %s kill unconfirmed after %s; session retained pending process-absence verification", id, killConfirmTimeout)
+	}
 
 	fmt.Printf("%s[session] Ending session %s gracefully...%s\n", colorYellow, id, colorReset)
 
@@ -594,17 +621,19 @@ func (sm *SessionManager) EndSession(id string) error {
 		// BOUNDED wait for exit after kill — see end_confirm.go for why
 		// blocking here indefinitely wedged an entire device (2026-08-27).
 		if !waitDoneConfirm(session.done, killConfirmTimeout) {
-			fmt.Printf("%s[session] Kill unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
+			fmt.Printf("%s[session] Kill unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
 				colorRed, id, killConfirmTimeout, colorReset)
-			sm.removeSession(id)
+			session.mu.Lock()
+			session.killUnconfirmed = true
+			session.mu.Unlock()
 			// Deliberately NOT "session <id> not found": the process may
 			// still be alive, and the server must keep the device fenced
-			// until absence is actually reported by a follow-up end.
-			return fmt.Errorf("session %s kill unconfirmed after %s; session deregistered", id, killConfirmTimeout)
+			// until absence is VERIFIED (see the tombstone branch above).
+			return fmt.Errorf("session %s kill unconfirmed after %s; session retained pending process-absence verification", id, killConfirmTimeout)
 		}
 	}
 
-	sm.removeSession(id)
+	sm.removeSessionIfSame(id, session)
 	return nil
 }
 
@@ -675,6 +704,20 @@ func (sm *SessionManager) removeSession(id string) {
 		globalProcessRegistry.Deregister(s.Process.Process.Pid)
 	}
 	delete(sm.sessions, id)
+	sm.mu.Unlock()
+}
+
+// removeSessionIfSame removes id only while it still maps to THIS session —
+// see CodexAppServerManager.removeSessionIfSame for the reused-ID watcher
+// race this prevents (Codex P2).
+func (sm *SessionManager) removeSessionIfSame(id string, s *CLISession) {
+	sm.mu.Lock()
+	if cur, ok := sm.sessions[id]; ok && cur == s {
+		if s.Process != nil && s.Process.Process != nil {
+			globalProcessRegistry.Deregister(s.Process.Process.Pid)
+		}
+		delete(sm.sessions, id)
+	}
 	sm.mu.Unlock()
 }
 
@@ -1408,7 +1451,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 		colorYellow, session.ID, session.ExitCode, colorReset)
 
 	// Remove from session map
-	sm.removeSession(session.ID)
+	sm.removeSessionIfSame(session.ID, session)
 }
 
 /* --------------------------------------------------------------------------

@@ -17,23 +17,31 @@
 // online. One wedged session took the whole device out for 11+ hours.
 //
 // The contract these helpers enforce: an End path may block only for a
-// BOUNDED time after it has issued its final kill. On expiry the caller must
-//   1. deregister the session from its manager (removeSession — which also
-//      drops the PID from the process registry, so the orphan scanner can
-//      reap a truly unkillable survivor), and
-//   2. return an error that does NOT read "session <id> not found".
-// The next retried END then finds no session and answers with the real
-// "not found" message, which terminal-service accepts as shutdown evidence
-// under its guarded rules (finalizeAbsentDeviceSession). That two-step
-// convergence keeps the server's evidence protocol intact: at the instant
-// the bound expires the process may still be alive, so the device must stay
-// fenced until absence is actually reported — the error message wording is
-// load-bearing.
+// BOUNDED time after it has issued its final kill. On expiry the caller
+//   1. RETAINS the session as a kill-unconfirmed TOMBSTONE — the map entry
+//      (and its PID registration) stays, so the session ID cannot be reused
+//      while the wedged exit watcher might still act under it, and
+//   2. returns an error that does NOT read "session <id> not found". The
+//      server treats that exact answer as shutdown evidence and releases the
+//      device fence; at the instant the bound expires the process may still
+//      be alive (a failed Kill, an unkillable child), so manufacturing the
+//      absence answer here would invite two agents into one working tree —
+//      the very hazard the fence exists to prevent (Codex P1 on the first
+//      revision of this fix, which deregistered immediately).
+// A LATER End on the tombstone probes OS-level process absence
+// (probeProcessGone): only once the child is VERIFIABLY gone does the
+// manager drop the session and report the true absence answer, which
+// terminal-service accepts under its existing guarded rules
+// (finalizeAbsentDeviceSession). While the probe cannot confirm absence, the
+// End keeps re-killing and re-reporting kill-unconfirmed — the device stays
+// fenced and VISIBLY wedged (the server escalates TERMINAL_REAPING_WEDGED),
+// never silently freed.
 // -----------------------------------------------------------------------------
 
 package main
 
 import (
+	"os/exec"
 	"sync"
 	"time"
 )
@@ -82,4 +90,44 @@ func waitDoneConfirm(done <-chan struct{}, timeout time.Duration) bool {
 	case <-time.After(timeout):
 		return false
 	}
+}
+
+// probeProcessGone reports whether cmd's child process is VERIFIABLY no
+// longer running. This is the only thing allowed to convert a
+// kill-unconfirmed tombstone into the "session not found" absence answer the
+// server releases a device fence on, so it must FAIL CLOSED: any state it
+// cannot interpret reads as "still alive", which keeps the fence up and the
+// wedge visible rather than silently freeing a checkout a live process may
+// still be writing to.
+//
+// True when:
+//   - there is no process at all (never started), or
+//   - Process.Wait has completed (ProcessState is set — the child is reaped;
+//     only the session's own watcher calls Wait, so a set state is ours), or
+//   - the platform probe (processHandleGone) confirms the OS no longer runs
+//     it.
+//
+// Known fail-closed cases, deliberately accepted: a killed-but-unreaped
+// child is a zombie on Unix and Signal(0) still reaches it, so the probe
+// says "alive" until the wedged watcher's Wait eventually reaps it; a PID
+// recycled to an unrelated process reads "alive" on Unix. Both keep the
+// fence up — the visible failure — and resolve through the watcher
+// recovering, the agent restarting (shuttingDown evidence), or ops action.
+// On Windows the check runs against the process OBJECT (kept alive by the
+// os.Process handle), so PID recycling cannot fool it and a terminated
+// child reads gone even while unreaped.
+//
+// Declared as a var so tests can pin the verdict and exercise both tombstone
+// outcomes deterministically; defaultProbeProcessGone has its own tests
+// against real processes.
+var probeProcessGone = defaultProbeProcessGone
+
+func defaultProbeProcessGone(cmd *exec.Cmd) bool {
+	if cmd == nil || cmd.Process == nil {
+		return true
+	}
+	if cmd.ProcessState != nil {
+		return true
+	}
+	return processHandleGone(cmd.Process)
 }

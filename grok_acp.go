@@ -202,6 +202,11 @@ type GrokACPSession struct {
 	// proves it is alive and producing output.
 	firstFrame     chan struct{}
 	firstFrameOnce sync.Once
+	// killUnconfirmed marks a session whose End escalated to Kill and then
+	// timed out waiting for the exit watcher. The session is RETAINED as a
+	// tombstone (see end_confirm.go): only probeProcessGone may convert it
+	// into the "not found" absence answer the server frees a device on.
+	killUnconfirmed bool
 }
 
 // GrokStartOptions bundles the per-session policy knobs the dispatcher reads
@@ -251,6 +256,18 @@ func (s *GrokACPSession) closeStdin() {
 	s.stdinClose.Do(func() {
 		_ = s.Stdin.Close()
 	})
+}
+
+func (s *GrokACPSession) isKillUnconfirmed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.killUnconfirmed
+}
+
+func (s *GrokACPSession) markKillUnconfirmed() {
+	s.mu.Lock()
+	s.killUnconfirmed = true
+	s.mu.Unlock()
 }
 
 // signalFirstFrame records that grok has emitted its first stdout frame. It is
@@ -701,8 +718,30 @@ func (m *GrokACPManager) End(id string) error {
 	}
 
 	if session.Status() == "ended" {
-		m.removeSession(id)
+		m.removeSessionIfSame(id, session)
 		return nil
+	}
+
+	// A prior End already escalated to Kill and timed out on the exit
+	// watcher. The session is a retained tombstone: only VERIFIED OS-level
+	// process absence may become the "not found" answer the server frees the
+	// device on (Codex P1 — see end_confirm.go).
+	if session.isKillUnconfirmed() {
+		if probeProcessGone(session.Process) {
+			m.removeSessionIfSame(id, session)
+			return fmt.Errorf("grok acp session %s not found", id)
+		}
+		if session.Process.Process != nil {
+			if killErr := session.Process.Process.Kill(); killErr != nil {
+				fmt.Printf("%s[grok-acp] Re-kill failed for %s: %v%s\n",
+					colorRed, id, killErr, colorReset)
+			}
+		}
+		if waitDoneConfirm(session.done, killConfirmTimeout) {
+			m.removeSessionIfSame(id, session)
+			return nil
+		}
+		return fmt.Errorf("grok acp session %s kill unconfirmed after %s; session retained pending process-absence verification", id, killConfirmTimeout)
 	}
 
 	fmt.Printf("%s[grok-acp] Ending session %s gracefully...%s\n",
@@ -730,18 +769,18 @@ func (m *GrokACPManager) End(id string) error {
 			// BOUNDED wait — see end_confirm.go for why blocking here
 			// indefinitely wedged an entire device (2026-08-27).
 			if !waitDoneConfirm(session.done, killConfirmTimeout) {
-				fmt.Printf("%s[grok-acp] Kill unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
+				fmt.Printf("%s[grok-acp] Kill unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
 					colorRed, id, killConfirmTimeout, colorReset)
-				m.removeSession(id)
+				session.markKillUnconfirmed()
 				// Deliberately NOT "session <id> not found": the process may
 				// still be alive, and the server must keep the device fenced
-				// until absence is actually reported by a follow-up end.
-				return fmt.Errorf("grok acp session %s kill unconfirmed after %s; session deregistered", id, killConfirmTimeout)
+				// until absence is VERIFIED (see the tombstone branch above).
+				return fmt.Errorf("grok acp session %s kill unconfirmed after %s; session retained pending process-absence verification", id, killConfirmTimeout)
 			}
 		}
 	}
 
-	m.removeSession(id)
+	m.removeSessionIfSame(id, session)
 	return nil
 }
 
@@ -821,6 +860,20 @@ func (m *GrokACPManager) removeSession(id string) {
 		globalProcessRegistry.Deregister(s.Process.Process.Pid)
 	}
 	delete(m.sessions, id)
+	m.mu.Unlock()
+}
+
+// removeSessionIfSame removes id only while it still maps to THIS session —
+// see CodexAppServerManager.removeSessionIfSame for the reused-ID watcher
+// race this prevents (Codex P2).
+func (m *GrokACPManager) removeSessionIfSame(id string, s *GrokACPSession) {
+	m.mu.Lock()
+	if cur, ok := m.sessions[id]; ok && cur == s {
+		if s.Process != nil && s.Process.Process != nil {
+			globalProcessRegistry.Deregister(s.Process.Process.Pid)
+		}
+		delete(m.sessions, id)
+	}
 	m.mu.Unlock()
 }
 
@@ -1186,7 +1239,7 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	fmt.Printf("%s[grok-acp] Session %s ended (exit code: %d)%s\n",
 		colorYellow, session.ID, exit, colorReset)
 
-	m.removeSession(session.ID)
+	m.removeSessionIfSame(session.ID, session)
 }
 
 // watchFirstFrame fails a session fast when grok spawns but never produces any

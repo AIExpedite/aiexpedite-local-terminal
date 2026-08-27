@@ -108,6 +108,11 @@ type AntigravityNativeSession struct {
 	// turnMu serialises Send so two concurrent turns cannot race on the same
 	// native conversation or interleave transcript updates.
 	turnMu sync.Mutex
+	// endDrainUnconfirmed marks a session whose End cancelled/killed its turn
+	// and then timed out on the turnMu drain barrier. The session is RETAINED
+	// as a tombstone (see end_confirm.go): only a verified-absent turn process
+	// may convert it into the "not found" absence answer.
+	endDrainUnconfirmed bool
 }
 
 type antigravityTurn struct {
@@ -828,13 +833,9 @@ func (m *AntigravityNativeManager) End(id string) error {
 		// turn is active. BOUNDED — see end_confirm.go for why blocking here
 		// indefinitely wedged an entire device (2026-08-27).
 		if !waitTurnBarrier(&session.turnMu, turnDrainConfirmTimeout) {
-			fmt.Printf("%s[antigravity-native] Turn drain unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
-				colorRed, id, turnDrainConfirmTimeout, colorReset)
-			m.removeSession(id)
-			// Deliberately NOT "session <id> not found" — see end_confirm.go.
-			return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session deregistered", id, turnDrainConfirmTimeout)
+			return m.retainOrResolveDrainTombstone(id, session)
 		}
-		m.removeSession(id)
+		m.removeSessionIfSame(id, session)
 		return nil
 	}
 	session.status = "ended"
@@ -861,16 +862,39 @@ func (m *AntigravityNativeManager) End(id string) error {
 	// see end_confirm.go for why blocking here indefinitely wedged an entire
 	// device (2026-08-27).
 	if !waitTurnBarrier(&session.turnMu, turnDrainConfirmTimeout) {
-		fmt.Printf("%s[antigravity-native] Turn drain unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
-			colorRed, id, turnDrainConfirmTimeout, colorReset)
-		m.removeSession(id)
-		// Deliberately NOT "session <id> not found" — see end_confirm.go.
-		return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session deregistered", id, turnDrainConfirmTimeout)
+		return m.retainOrResolveDrainTombstone(id, session)
 	}
 
-	m.removeSession(id)
+	m.removeSessionIfSame(id, session)
 	fmt.Printf("%s[antigravity-native] Session %s ended%s\n", colorYellow, id, colorReset)
 	return nil
+}
+
+// retainOrResolveDrainTombstone is the shared verdict for a turn drain that
+// did not confirm within its bound. The wedged turn goroutine may still act
+// under this session, so the session is RETAINED as a tombstone rather than
+// deregistered — an immediate removal would manufacture the "not found"
+// absence answer the server frees the device on while the turn process might
+// still be alive (Codex P1; see end_confirm.go). Only a VERIFIED-absent turn
+// process resolves the tombstone: no recorded active process (the turn
+// runner clears it on completion, and cancel/kill already ran), or an
+// OS-level probe confirming the recorded one is gone. While the process is
+// verifiably alive it is re-killed and the fence stays up — visibly.
+func (m *AntigravityNativeManager) retainOrResolveDrainTombstone(id string, session *AntigravityNativeSession) error {
+	session.mu.Lock()
+	session.endDrainUnconfirmed = true
+	proc := session.activeProcess
+	session.mu.Unlock()
+
+	if proc == nil || probeProcessGone(proc) {
+		m.removeSessionIfSame(id, session)
+		return fmt.Errorf("antigravity native session %s not found", id)
+	}
+	killAntigravityProcessTree(proc)
+	fmt.Printf("%s[antigravity-native] Turn drain unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
+		colorRed, id, turnDrainConfirmTimeout, colorReset)
+	// Deliberately NOT "session <id> not found" — see end_confirm.go.
+	return fmt.Errorf("antigravity native session %s turn drain unconfirmed after %s; session retained pending process-absence verification", id, turnDrainConfirmTimeout)
 }
 
 func (m *AntigravityNativeManager) Get(id string) *AntigravityNativeSession {
@@ -963,6 +987,17 @@ func (m *AntigravityNativeManager) ShutdownAll() {
 func (m *AntigravityNativeManager) removeSession(id string) {
 	m.mu.Lock()
 	delete(m.sessions, id)
+	m.mu.Unlock()
+}
+
+// removeSessionIfSame removes id only while it still maps to THIS session —
+// see CodexAppServerManager.removeSessionIfSame for the reused-ID race this
+// prevents (Codex P2).
+func (m *AntigravityNativeManager) removeSessionIfSame(id string, s *AntigravityNativeSession) {
+	m.mu.Lock()
+	if cur, ok := m.sessions[id]; ok && cur == s {
+		delete(m.sessions, id)
+	}
 	m.mu.Unlock()
 }
 

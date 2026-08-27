@@ -132,6 +132,11 @@ type OpenCodeNativeSession struct {
 	// turnMu serialises Send so two concurrent turns cannot race on the same
 	// native session or interleave transcript updates.
 	turnMu sync.Mutex
+	// endDrainUnconfirmed marks a session whose End cancelled/killed its turn
+	// and then timed out on the turnMu drain barrier. The session is RETAINED
+	// as a tombstone (see end_confirm.go): only a verified-absent turn process
+	// may convert it into the "not found" absence answer.
+	endDrainUnconfirmed bool
 }
 
 type openCodeTurn struct {
@@ -1003,13 +1008,9 @@ func (m *OpenCodeNativeManager) End(id string) error {
 		// end_confirm.go for why blocking here indefinitely wedged an entire
 		// device (2026-08-27).
 		if !waitTurnBarrier(&session.turnMu, turnDrainConfirmTimeout) {
-			fmt.Printf("%s[opencode-native] Turn drain unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
-				colorRed, id, turnDrainConfirmTimeout, colorReset)
-			m.removeSession(id)
-			// Deliberately NOT "session <id> not found" — see end_confirm.go.
-			return fmt.Errorf("opencode native session %s turn drain unconfirmed after %s; session deregistered", id, turnDrainConfirmTimeout)
+			return m.retainOrResolveDrainTombstone(id, session)
 		}
-		m.removeSession(id)
+		m.removeSessionIfSame(id, session)
 		return nil
 	}
 	session.status = "ended"
@@ -1031,16 +1032,39 @@ func (m *OpenCodeNativeManager) End(id string) error {
 	// immediately when no turn is active. BOUNDED — see end_confirm.go for
 	// why blocking here indefinitely wedged an entire device (2026-08-27).
 	if !waitTurnBarrier(&session.turnMu, turnDrainConfirmTimeout) {
-		fmt.Printf("%s[opencode-native] Turn drain unconfirmed for %s after %s — deregistering session; next end will report absence%s\n",
-			colorRed, id, turnDrainConfirmTimeout, colorReset)
-		m.removeSession(id)
-		// Deliberately NOT "session <id> not found" — see end_confirm.go.
-		return fmt.Errorf("opencode native session %s turn drain unconfirmed after %s; session deregistered", id, turnDrainConfirmTimeout)
+		return m.retainOrResolveDrainTombstone(id, session)
 	}
 
-	m.removeSession(id)
+	m.removeSessionIfSame(id, session)
 	fmt.Printf("%s[opencode-native] Session %s ended%s\n", colorYellow, id, colorReset)
 	return nil
+}
+
+// retainOrResolveDrainTombstone is the shared verdict for a turn drain that
+// did not confirm within its bound. The wedged turn goroutine may still act
+// under this session, so the session is RETAINED as a tombstone rather than
+// deregistered — an immediate removal would manufacture the "not found"
+// absence answer the server frees the device on while the turn process might
+// still be alive (Codex P1; see end_confirm.go). Only a VERIFIED-absent turn
+// process resolves the tombstone: no recorded active process (the turn
+// runner clears it on completion, and cancel/kill already ran), or an
+// OS-level probe confirming the recorded one is gone. While the process is
+// verifiably alive it is re-killed and the fence stays up — visibly.
+func (m *OpenCodeNativeManager) retainOrResolveDrainTombstone(id string, session *OpenCodeNativeSession) error {
+	session.mu.Lock()
+	session.endDrainUnconfirmed = true
+	proc := session.activeProcess
+	session.mu.Unlock()
+
+	if proc == nil || probeProcessGone(proc) {
+		m.removeSessionIfSame(id, session)
+		return fmt.Errorf("opencode native session %s not found", id)
+	}
+	killOpenCodeProcessTree(proc)
+	fmt.Printf("%s[opencode-native] Turn drain unconfirmed for %s after %s — retaining tombstone; a later end verifies process absence%s\n",
+		colorRed, id, turnDrainConfirmTimeout, colorReset)
+	// Deliberately NOT "session <id> not found" — see end_confirm.go.
+	return fmt.Errorf("opencode native session %s turn drain unconfirmed after %s; session retained pending process-absence verification", id, turnDrainConfirmTimeout)
 }
 
 func (m *OpenCodeNativeManager) Get(id string) *OpenCodeNativeSession {
@@ -1130,6 +1154,17 @@ func (m *OpenCodeNativeManager) ShutdownAll() {
 func (m *OpenCodeNativeManager) removeSession(id string) {
 	m.mu.Lock()
 	delete(m.sessions, id)
+	m.mu.Unlock()
+}
+
+// removeSessionIfSame removes id only while it still maps to THIS session —
+// see CodexAppServerManager.removeSessionIfSame for the reused-ID race this
+// prevents (Codex P2).
+func (m *OpenCodeNativeManager) removeSessionIfSame(id string, s *OpenCodeNativeSession) {
+	m.mu.Lock()
+	if cur, ok := m.sessions[id]; ok && cur == s {
+		delete(m.sessions, id)
+	}
 	m.mu.Unlock()
 }
 
