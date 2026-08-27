@@ -121,7 +121,7 @@ func TestBrowserIdentityServerConfiguration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if server.ReadHeaderTimeout != 2*time.Second || server.ReadTimeout != 3*time.Second || server.WriteTimeout != 3*time.Second || server.IdleTimeout != 30*time.Second {
+		if server.ReadHeaderTimeout != 2*time.Second || server.ReadTimeout != 3*time.Second || server.WriteTimeout != 3*time.Second || server.IdleTimeout != 30*time.Second || server.MaxHeaderBytes != identityMaxHeaderBytes {
 			t.Fatalf("unexpected timeouts: %#v", server)
 		}
 	}

@@ -20,6 +20,7 @@ const (
 	defaultTtydPort         = 7681
 	identityChallengeMinLen = 16
 	identityChallengeMaxLen = 128
+	identityMaxHeaderBytes  = 8 << 10
 )
 
 var identityPorts = map[string]int{
@@ -91,6 +92,7 @@ func browserIdentityServer(cfg *Config, environment string) (*http.Server, error
 		ReadTimeout:       3 * time.Second,
 		WriteTimeout:      3 * time.Second,
 		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    identityMaxHeaderBytes,
 	}, nil
 }
 
