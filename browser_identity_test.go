@@ -5,13 +5,27 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+type notifyingListener struct {
+	net.Listener
+	once      sync.Once
+	accepting chan struct{}
+}
+
+func (listener *notifyingListener) Accept() (net.Conn, error) {
+	listener.once.Do(func() { close(listener.accepting) })
+	return listener.Listener.Accept()
+}
 
 func TestBrowserIdentityHandlerSignsOriginBoundProof(t *testing.T) {
 	cfg := &Config{AgentID: "agent-123", CommandSecret: "secret-value"}
@@ -116,6 +130,80 @@ func TestBrowserIdentityServerConfiguration(t *testing.T) {
 	}
 	if resolvedTtydPort(0) != 7681 {
 		t.Fatal("zero ttyd port must normalize to 7681")
+	}
+}
+
+func TestBrowserIdentityHandlerSnapshotsConcurrentRegistration(t *testing.T) {
+	cfg := &Config{AgentID: "agent-a", CommandSecret: "secret-a"}
+	pairs := []struct{ agentID, secret string }{{"agent-a", "secret-a"}, {"agent-b", "secret-b"}}
+	problems := make(chan error, 200)
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func(index int) {
+			defer wg.Done()
+			pair := pairs[index%len(pairs)]
+			cfg.WithPersistenceLock(func() {
+				cfg.AgentID = pair.agentID
+				cfg.CommandSecret = pair.secret
+			})
+		}(i)
+		go func() {
+			defer wg.Done()
+			request := httptest.NewRequest(http.MethodGet, "/v1/browser-identity?challenge=0123456789abcdef", nil)
+			request.Header.Set("Origin", "https://aiexpedite.com")
+			response := httptest.NewRecorder()
+			browserIdentityHandler(cfg, "prod").ServeHTTP(response, request)
+			if response.Code != http.StatusOK {
+				problems <- fmt.Errorf("status = %d", response.Code)
+				return
+			}
+			var proof browserIdentityProof
+			if err := json.Unmarshal(response.Body.Bytes(), &proof); err != nil {
+				problems <- err
+				return
+			}
+			secret := map[string]string{"agent-a": "secret-a", "agent-b": "secret-b"}[proof.AgentID]
+			message := fmt.Sprintf("%s:%d:%s:%s:%s", proof.AgentID, proof.Timestamp, proof.Challenge, proof.Origin, proof.Environment)
+			mac := hmac.New(sha256.New, []byte(secret))
+			_, _ = mac.Write([]byte(message))
+			if proof.Signature != hex.EncodeToString(mac.Sum(nil)) {
+				problems <- fmt.Errorf("proof combined credentials from different registration snapshots")
+			}
+		}()
+	}
+	wg.Wait()
+	close(problems)
+	for err := range problems {
+		t.Fatal(err)
+	}
+}
+
+func TestShutdownBrowserIdentityServerIsIdempotent(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyListener := &notifyingListener{Listener: listener, accepting: make(chan struct{})}
+	server := &http.Server{Handler: http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.WriteHeader(http.StatusNoContent)
+	})}
+	serveDone := make(chan struct{})
+	go func() {
+		_ = server.Serve(readyListener)
+		close(serveDone)
+	}()
+	<-readyListener.accepting
+
+	browserIdentityState.Lock()
+	browserIdentityState.server = server
+	browserIdentityState.Unlock()
+	shutdownBrowserIdentityServer()
+	shutdownBrowserIdentityServer()
+	select {
+	case <-serveDone:
+	case <-time.After(time.Second):
+		t.Fatal("identity server did not stop")
 	}
 }
 
