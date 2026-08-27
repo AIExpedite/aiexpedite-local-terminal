@@ -3970,6 +3970,145 @@ func TestCodexRolloutFallbackBuckets_NewerFileDoesNotSkipUnfinishedBoundary(t *t
 	}
 }
 
+func TestCodexRolloutFallbackBuckets_FinalBoundaryBatchDoesNotSkipEvictedNewerFile(t *testing.T) {
+	base := t.TempDir()
+	helperCodexAuthAt(t, base, "boundary-eviction@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	boundary := now.Add(-2 * time.Hour)
+	for _, name := range []string{"a", "b"} {
+		path := filepath.Join(dir, "rollout-boundary-"+name+".jsonl")
+		contents := `{"timestamp":"2026-08-26T12:00:00Z","type":"session_meta"}` + "\n" +
+			`{"timestamp":"2026-08-26T13:00:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":10,"window_minutes":300}}}` + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, boundary, boundary); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sixteen distinct newer mtimes fill the ordinary batch. Reserving the one
+	// remaining old-boundary entry evicts newer-00; its deliberately freshest
+	// provider observation proves the following pass offers it again.
+	for i := range codexRolloutScanFileCap {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-newer-%02d.jsonl", i))
+		used := 20 + i
+		observed := "2026-08-26T14:00:00Z"
+		if i == 0 {
+			used = 99
+			observed = "2026-08-26T14:59:00Z"
+		}
+		contents := `{"timestamp":"2026-08-26T12:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":%q,"type":"token_count","rate_limits":{"primary":{"used_percent":%d,"window_minutes":300}}}`, observed, used) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := boundary.Add(time.Duration(i+1) * time.Minute)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	all, complete := codexDiscoverRolloutCandidates(context.Background(), base, codexRolloutScanCursor{})
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted initial discovery")
+	}
+	var consumedBoundary codexRolloutCandidate
+	for _, candidate := range all {
+		if candidate.mtime.Equal(boundary) && (consumedBoundary.path == "" || candidate.path > consumedBoundary.path) {
+			consumedBoundary = candidate
+		}
+	}
+	if consumedBoundary.path == "" {
+		t.Fatal("missing boundary candidate")
+	}
+	cursor := codexRolloutScanCursor{
+		mtimeNs:             boundary.UnixNano(),
+		boundaryFingerprint: codexRolloutBoundaryFingerprint(all, boundary.UnixNano()),
+		boundaryCursor:      codexRolloutBoundaryEntryDigest(consumedBoundary),
+	}
+
+	_, _, _, retained, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || retained == nil {
+		t.Fatalf("ok=%v progress=%+v, want final reserved-boundary batch handled", ok, retained)
+	}
+	if retained.mtimeNs != boundary.UnixNano() || retained.boundaryCursor != "" {
+		t.Fatalf("progress=%+v, want completed boundary retained for one unreserved newer pass", retained)
+	}
+
+	contributors, _, _, advanced, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{
+		mtimeNs:             retained.mtimeNs,
+		boundaryFingerprint: retained.boundaryFingerprint,
+		boundaryCursor:      retained.boundaryCursor,
+	})
+	if !ok || advanced == nil || advanced.mtimeNs != boundary.Add(codexRolloutScanFileCap*time.Minute).UnixNano() {
+		t.Fatalf("ok=%v progress=%+v, want unreserved newer batch to advance", ok, advanced)
+	}
+	if got := contributors[codexWindowPrimary][codexLegacyLimitID].UsedPercentage; got != 99 {
+		t.Fatalf("evicted newer contributor=%v, want freshest 99%% evidence recovered on retry", got)
+	}
+}
+
+func TestTryMergeCodexRateLimitCachePerLimitProgress_DoesNotWaitForLocks(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	base := t.TempDir()
+	helperCodexAuthAt(t, base, "nonblocking-merge@example.com", codexTestLogin)
+	fingerprint := codexAccountFingerprintAtBase(base)
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	progress := &codexRolloutScanProgress{mtimeNs: now.Add(-time.Minute).UnixNano()}
+	tryMerge := func() bool {
+		return tryMergeCodexRateLimitCachePerLimitProgress(
+			cache, nil, nil, false, nil, false, now, fingerprint, progress, base,
+		)
+	}
+
+	assertReturnsUnavailable := func(name string, hold func(), release func()) {
+		t.Helper()
+		hold()
+		result := make(chan bool, 1)
+		go func() { result <- tryMerge() }()
+		select {
+		case merged := <-result:
+			release()
+			if merged {
+				t.Fatalf("%s: merge succeeded while lock was held", name)
+			}
+		case <-time.After(time.Second):
+			release()
+			t.Fatalf("%s: optional rollout merge waited for lock", name)
+		}
+	}
+
+	assertReturnsUnavailable("process-local", codexRateLimitMu.Lock, codexRateLimitMu.Unlock)
+
+	if err := os.MkdirAll(filepath.Dir(cache), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var crossProcessLock *os.File
+	assertReturnsUnavailable("cross-process", func() {
+		var locked bool
+		crossProcessLock, locked = acquireCrossProcessCacheLock(cache)
+		if !locked {
+			t.Fatal("failed to acquire cross-process test lock")
+		}
+	}, func() {
+		_ = unlockFile(crossProcessLock)
+		_ = crossProcessLock.Close()
+	})
+
+	if !tryMerge() {
+		t.Fatal("merge did not succeed after both locks became available")
+	}
+	snap, ok := loadCodexRateLimitSnapshot(cache)
+	if !ok || snap.RolloutHighWaterMtimeNs != progress.mtimeNs {
+		t.Fatalf("snapshot=%+v ok=%v, want retry to persist rollout progress", snap, ok)
+	}
+}
+
 func TestCodexRolloutFallbackBuckets_RecordsFutureCandidatesSeparately(t *testing.T) {
 	base := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")

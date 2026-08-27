@@ -500,6 +500,24 @@ func acquireCrossProcessCacheLock(cachePath string) (*os.File, bool) {
 	return f, true
 }
 
+// tryAcquireCrossProcessCacheLock acquires the same sibling lock without
+// waiting. Optional/background persistence uses this path so lock contention
+// cannot consume the caller's remaining deadline; the unchanged cache cursor
+// makes the evidence eligible for retry on the next refresh.
+func tryAcquireCrossProcessCacheLock(cachePath string) (*os.File, bool) {
+	lockPath := cachePath + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, false
+	}
+	locked, err := tryLockFileExclusive(f)
+	if err != nil || !locked {
+		_ = f.Close()
+		return nil, false
+	}
+	return f, true
+}
+
 // loadClaudeRateLimitSnapshot reads the cache. Returns (zero, false) when the
 // file is absent or unreadable — the normal "no telemetry observed yet" state.
 func loadClaudeRateLimitSnapshot(path string) (claudeRateLimitSnapshot, bool) {

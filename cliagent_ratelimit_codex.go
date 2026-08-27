@@ -1209,16 +1209,71 @@ func mergeCodexRateLimitCachePerLimitProgress(
 	rolloutHighWater *codexRolloutScanProgress,
 	rolloutAccountBase string,
 ) {
+	mergeCodexRateLimitCachePerLimitProgressWithLock(
+		path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
+		now, fingerprint, rolloutHighWater, rolloutAccountBase, true,
+	)
+}
+
+// tryMergeCodexRateLimitCachePerLimitProgress performs the rollout cache
+// transaction only when both its process-local and cross-process locks are
+// immediately available. Rollout scans are optional work under a bounded
+// gather; leaving the old cursor untouched is safe because the same normalized
+// evidence will be offered again on the next refresh.
+func tryMergeCodexRateLimitCachePerLimitProgress(
+	path string,
+	perLimit map[string]map[string]codexRateLimitBucket,
+	clears map[string]bool,
+	fullSnapshot bool,
+	present map[string]bool,
+	emptyAuthoritative bool,
+	now time.Time,
+	fingerprint string,
+	rolloutHighWater *codexRolloutScanProgress,
+	rolloutAccountBase string,
+) bool {
+	return mergeCodexRateLimitCachePerLimitProgressWithLock(
+		path, perLimit, clears, fullSnapshot, present, emptyAuthoritative,
+		now, fingerprint, rolloutHighWater, rolloutAccountBase, false,
+	)
+}
+
+func mergeCodexRateLimitCachePerLimitProgressWithLock(
+	path string,
+	perLimit map[string]map[string]codexRateLimitBucket,
+	clears map[string]bool,
+	fullSnapshot bool,
+	present map[string]bool,
+	emptyAuthoritative bool,
+	now time.Time,
+	fingerprint string,
+	rolloutHighWater *codexRolloutScanProgress,
+	rolloutAccountBase string,
+	waitForLocks bool,
+) bool {
 	if path == "" || (len(perLimit) == 0 && len(clears) == 0 && !emptyAuthoritative && rolloutHighWater == nil) {
-		return
+		return false
 	}
-	codexRateLimitMu.Lock()
+	if waitForLocks {
+		codexRateLimitMu.Lock()
+	} else if !codexRateLimitMu.TryLock() {
+		return false
+	}
 	defer codexRateLimitMu.Unlock()
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return
+		return false
 	}
-	lockFile, locked := acquireCrossProcessCacheLock(path)
+	var lockFile *os.File
+	var locked bool
+	if waitForLocks {
+		lockFile, locked = acquireCrossProcessCacheLock(path)
+	} else {
+		lockFile, locked = tryAcquireCrossProcessCacheLock(path)
+		if !locked {
+			return false
+		}
+	}
 	if locked {
 		defer func() {
 			_ = unlockFile(lockFile)
@@ -1232,7 +1287,7 @@ func mergeCodexRateLimitCachePerLimitProgress(
 	// Live capture passes an empty base because its evidence is scoped at receive
 	// time and must remain able to initialize or replace the cache.
 	if rolloutAccountBase != "" && codexAccountFingerprintAtBase(rolloutAccountBase) != fingerprint {
-		return
+		return false
 	}
 
 	snap := codexRateLimitSnapshot{
@@ -1424,15 +1479,17 @@ func mergeCodexRateLimitCachePerLimitProgress(
 
 	out, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return
+		return false
 	}
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return
+		return false
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		return false
 	}
+	return true
 }
 
 // reflagPersistedCodexBucket restores the usageKnown / resetKnown provenance
@@ -1592,7 +1649,7 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 		return codexMetricsFromCache(now, currentFingerprint), codexUsageLimitEvidence{}, time.Time{}
 	}
 	if ok || highWater != nil {
-		mergeCodexRateLimitCachePerLimitProgress(
+		tryMergeCodexRateLimitCachePerLimitProgress(
 			codexRateLimitCachePath(), contribs, nil, false, nil, false,
 			now, currentFingerprint, highWater, base,
 		)
@@ -2293,6 +2350,23 @@ func codexRolloutBoundaryHasUnselected(eligible, selected []codexRolloutCandidat
 	return false
 }
 
+func codexRolloutHasUnselectedBelowProgress(eligible, selected []codexRolloutCandidate, cursorMtimeNs, progressMtimeNs int64) bool {
+	selectedEntries := make(map[string]struct{}, len(selected))
+	for _, candidate := range selected {
+		selectedEntries[codexRolloutBoundaryEntryDigest(candidate)] = struct{}{}
+	}
+	for _, candidate := range eligible {
+		mtimeNs := candidate.mtime.UnixNano()
+		if mtimeNs <= cursorMtimeNs || mtimeNs >= progressMtimeNs {
+			continue
+		}
+		if _, ok := selectedEntries[codexRolloutBoundaryEntryDigest(candidate)]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
 func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCandidate, now time.Time, cursor codexRolloutScanCursor) (string, string, bool) {
 	fingerprint := codexRolloutFutureFingerprint(candidates, now)
 	if fingerprint == "" {
@@ -2544,9 +2618,18 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// than that boundary. Do not let those newer files pull the main watermark
 		// past boundary entries that still did not fit: pin progress to the saved
 		// boundary until its remaining deterministic batches have been consumed.
-		unfinishedSavedBoundary := cursor.boundaryCursor != "" && cursor.mtimeNs > 0 &&
+		hasSavedBoundary := cursor.boundaryCursor != "" && cursor.mtimeNs > 0
+		unfinishedSavedBoundary := hasSavedBoundary &&
 			codexRolloutBoundaryHasUnselected(eligibleCandidates, selected, cursor.mtimeNs)
-		if unfinishedSavedBoundary {
+		deferredNewerCandidate := hasSavedBoundary &&
+			codexRolloutHasUnselectedBelowProgress(
+				eligibleCandidates, selected, cursor.mtimeNs, maxSelectedMtimeNs,
+			)
+		if unfinishedSavedBoundary || deferredNewerCandidate {
+			// The reserved boundary entries can evict newer candidates from the
+			// ordinary top-N selection. Even when this pass finishes the saved
+			// boundary, retain its high-water once so the next pass can consume the
+			// newer entries without a reservation before progress moves beyond them.
 			maxSelectedMtimeNs = cursor.mtimeNs
 		}
 		// Record a redacted cursor for the equal-mtime entries this pass opened. A
