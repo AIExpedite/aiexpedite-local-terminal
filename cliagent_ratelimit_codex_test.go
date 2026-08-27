@@ -2630,6 +2630,38 @@ func TestCodexRolloutFallbackBuckets_OversizedHeaderCannotFakeSessionStart(t *te
 	}
 }
 
+func TestCodexRolloutFallbackBuckets_InvalidHeaderCannotFakeSessionStart(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	authMod := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	authPath := filepath.Join(base, "auth.json")
+	if err := os.WriteFile(authPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(authPath, authMod, authMod); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "rollout-invalid-header.jsonl")
+	contents := "{malformed header}\n" +
+		`{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":73,"window_minutes":300}}}` + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if ok || len(contributors) != 0 {
+		t.Fatalf("contributors=%+v ok=%v, want unverified session withheld", contributors, ok)
+	}
+	if highWater != nil {
+		t.Fatalf("highWater=%+v, want rollout left eligible for retry", highWater)
+	}
+}
+
 func TestCodexRecentRolloutLines_ContinuesPastSparseNumericFrame(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rollout.jsonl")
 	stricter := `{"timestamp":"2026-08-26T13:50:00Z","jsonrpc":"2.0","result":{"rateLimitsByLimitId":{"codex_stricter":{"used_percent":88,"window_minutes":300}}},"id":1}`
@@ -2672,7 +2704,7 @@ func TestCodexRolloutSessionMatchesAuth_RequiresVerifiedStart(t *testing.T) {
 		wantRetry    bool
 	}{
 		{name: "unverified partial read", wantAccept: false, wantRetry: true},
-		{name: "unverified complete legacy log", handled: true, wantAccept: true, wantRetry: false},
+		{name: "unverified complete legacy log", handled: true, wantAccept: false, wantRetry: true},
 		{name: "prior account", sessionStart: authMod.Add(-time.Minute), handled: true, wantAccept: false, wantRetry: false},
 		{name: "current account", sessionStart: authMod.Add(time.Minute), handled: true, wantAccept: true, wantRetry: false},
 	} {
@@ -3172,6 +3204,26 @@ func TestCodexRolloutFallbackBuckets_NewerTelemetrySupersedesMixedRefusal(t *tes
 	}
 	if highWater == nil {
 		t.Fatal("expected newer numeric telemetry to allow completed-scan progress")
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_NewerCachedTelemetrySupersedesRefusal(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	helperWriteRolloutLimitLog(t, base, "19", "2026-06-19T11-00-00-refusal",
+		"2026-06-19T11:00:00.000Z", nil, "2026-06-19T11:15:00.000Z")
+
+	_, limit, latest, highWater, _ := codexRolloutFallbackBuckets(
+		context.Background(), base, now, codexRolloutScanCursor{}, time.Date(2026, 6, 19, 11, 30, 0, 0, time.UTC),
+	)
+	if limit.At.IsZero() {
+		t.Fatal("expected refusal evidence")
+	}
+	if !latest.After(limit.At) {
+		t.Fatalf("latest observation=%s, want newer than refusal %s", latest, limit.At)
+	}
+	if highWater == nil {
+		t.Fatal("expected newer durable cache telemetry to allow completed-scan progress")
 	}
 }
 

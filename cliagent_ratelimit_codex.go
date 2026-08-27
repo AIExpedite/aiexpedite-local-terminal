@@ -1546,7 +1546,8 @@ const codexRolloutReadDirChunkSize = 128
 // its observation timestamp.
 func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint string, now time.Time) ([]cliAgentUsageMetric, codexUsageLimitEvidence, time.Time) {
 	cursor := codexRolloutScanCursorForAccount(base, currentFingerprint, now)
-	contribs, limit, latestObservation, highWater, ok := codexRolloutFallbackBuckets(ctx, base, now, cursor)
+	latestCachedObservation := codexLatestContributorObservation(codexContributorsForAccount(currentFingerprint))
+	contribs, limit, latestObservation, highWater, ok := codexRolloutFallbackBuckets(ctx, base, now, cursor, latestCachedObservation)
 	// Authentication can change while filesystem I/O is in progress. Never let
 	// an old-account scan clear or overwrite a live capture already scoped to the
 	// newly active account; the next refresh will reconcile under that account.
@@ -1560,6 +1561,18 @@ func codexReconcileFromRollout(ctx context.Context, base, currentFingerprint str
 		)
 	}
 	return codexMetricsFromCache(now, currentFingerprint), limit, latestObservation
+}
+
+func codexLatestContributorObservation(contribs map[string]map[string]codexRateLimitBucket) time.Time {
+	var latest time.Time
+	for _, limits := range contribs {
+		for _, bucket := range limits {
+			if observed := time.UnixMilli(bucket.ObservedAtMs); bucket.ObservedAtMs > 0 && observed.After(latest) {
+				latest = observed
+			}
+		}
+	}
+	return latest
 }
 
 type codexRolloutScanCursor struct {
@@ -1971,7 +1984,7 @@ const codexUsageLimitNoticeMaxAge = 12 * time.Hour
 // is disabled, matching the best-effort unscoped behaviour the parser already
 // uses when the account is unknown. Best-effort: returns (nil, false) on any
 // problem.
-func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time, cursor codexRolloutScanCursor) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, *codexRolloutScanProgress, bool) {
+func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time, cursor codexRolloutScanCursor, priorObservations ...time.Time) (map[string]map[string]codexRateLimitBucket, codexUsageLimitEvidence, time.Time, *codexRolloutScanProgress, bool) {
 	if base == "" {
 		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
 	}
@@ -2046,6 +2059,11 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	winners := map[string]rolloutContribution{}
 	var limit codexUsageLimitEvidence
 	var latestObservation time.Time
+	for _, observed := range priorObservations {
+		if observed.After(latestObservation) {
+			latestObservation = observed
+		}
+	}
 	selected := candidates
 	if len(selected) > codexRolloutScanFileCap {
 		selected = selected[:codexRolloutScanFileCap]
@@ -2065,6 +2083,12 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		buckets, sessionStart, fileLimit, handled, ok := codexBucketsFromRolloutFile(ctx, c.path, now)
 		if !handled {
 			allHandled = false
+		}
+		// A fully read file with neither numeric nor refusal evidence has nothing
+		// account-scoped to merge. It is safe to count as handled even when its
+		// first record does not provide a usable session timestamp.
+		if sessionStart.IsZero() && handled && !ok && fileLimit.At.IsZero() {
+			continue
 		}
 		// Reject logs whose session began before the current login (a possible
 		// prior account). When a login watermark exists, a log with no verified
@@ -2170,12 +2194,12 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	return acc, limit, latestObservation, highWater, true
 }
 
-func codexRolloutSessionMatchesAuth(sessionStart, authMod time.Time, handled bool) (accept, retry bool) {
+func codexRolloutSessionMatchesAuth(sessionStart, authMod time.Time, _ bool) (accept, retry bool) {
 	if sessionStart.IsZero() {
-		// Preserve the established best-effort behavior for a completely read
-		// legacy/no-header log. Only partial tail recovery is unsafe: it cannot
-		// prove which account produced the recovered telemetry.
-		return handled, !handled
+		// An authenticated scan must prove which account produced the rollout.
+		// A complete legacy or malformed file is no safer than a partial tail when
+		// its first record's session start could not be verified.
+		return false, true
 	}
 	return !sessionStart.Before(authMod), false
 }
@@ -2267,6 +2291,15 @@ func codexRecentRolloutLines(ctx context.Context, f *os.File, size int64, now ti
 	return lines
 }
 
+func codexRolloutSessionStartFromLine(line string) (time.Time, bool) {
+	var envelope map[string]interface{}
+	if json.Unmarshal([]byte(line), &envelope) != nil {
+		return time.Time{}, false
+	}
+	ts, ok := codexRolloutLineTimestamp(line)
+	return ts, ok
+}
+
 func codexRolloutSessionStartPrefix(f *os.File) time.Time {
 	buf := make([]byte, codexRolloutTailReadChunkSize)
 	n, err := f.ReadAt(buf, 0)
@@ -2277,7 +2310,7 @@ func codexRolloutSessionStartPrefix(f *os.File) time.Time {
 	if newline := bytes.IndexByte(line, '\n'); newline >= 0 {
 		line = line[:newline]
 	}
-	if ts, ok := codexRolloutLineTimestamp(string(bytes.TrimSuffix(line, []byte{'\r'}))); ok {
+	if ts, ok := codexRolloutSessionStartFromLine(string(bytes.TrimSuffix(line, []byte{'\r'}))); ok {
 		return ts
 	}
 	return time.Time{}
@@ -2296,21 +2329,13 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	sessionStart := codexRolloutSessionStartPrefix(f)
 	var limit codexUsageLimitEvidence
 	acc := map[string]map[string]codexRateLimitBucket{}
-	consumeLine := func(line string, captureSessionStart bool) {
+	consumeLine := func(line string) {
 		// Exhaustion evidence is collected from the SAME pass, ahead of the
 		// rate-limit prefilter: a refused turn carries no window at all (Codex
 		// sends `primary: null, secondary: null` once the limit is reached), so
 		// these lines are exactly the ones the bucket scan discards.
 		if ev, ok := codexUsageLimitEvidenceFromLine(line, now); ok && ev.At.After(limit.At) {
 			limit = ev
-		}
-		// The first line carrying a timestamp is the session_meta header, i.e.
-		// when this session STARTED — recorded before any rate-limit frame, so
-		// it's captured ahead of the prefilter below.
-		if captureSessionStart && sessionStart.IsZero() {
-			if ts, ok := codexRolloutLineTimestamp(line); ok {
-				sessionStart = ts
-			}
 		}
 		// Cheap prefilter: only decode lines that could carry a window update.
 		// Mirror captureCodexRateLimitLine's gate exactly so camelCase frames
@@ -2364,7 +2389,7 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	tailLines := codexRecentRolloutLines(ctx, f, size, now)
 	consumeTail := func() {
 		for _, line := range tailLines {
-			consumeLine(line, false)
+			consumeLine(line)
 		}
 		tailLines = nil
 	}
@@ -2377,7 +2402,7 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	reader := bufio.NewReaderSize(f, 64*1024)
 	lineBytes := make([]byte, 0, 64*1024)
 	oversized := false
-	sessionStartDiscarded := false
+	firstRecordSeen := false
 	handled := true
 	for {
 		if ctx.Err() != nil {
@@ -2400,21 +2425,28 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 			handled = false
 			break
 		}
-		if oversized && sessionStart.IsZero() {
+		if oversized && !firstRecordSeen {
 			// The discarded object may have been the session_meta header. Do not
 			// promote a later telemetry timestamp to the session start: an older
 			// account can keep emitting after a new login, and that later event
-			// would make its rollout appear to belong to the new account. Mark the
-			// file incomplete so authenticated reconciliation withholds its
+			// would make its rollout appear to belong to the new account. Keep the
+			// start unverified so authenticated reconciliation withholds its
 			// evidence and leaves it above the progress cursor for retry.
-			sessionStartDiscarded = true
+			firstRecordSeen = true
 		}
 		if !oversized && len(lineBytes) > 0 {
 			for len(lineBytes) > 0 && (lineBytes[len(lineBytes)-1] == '\n' || lineBytes[len(lineBytes)-1] == '\r') {
 				lineBytes = lineBytes[:len(lineBytes)-1]
 			}
 			if len(lineBytes) > 0 {
-				consumeLine(string(lineBytes), !sessionStartDiscarded)
+				line := string(lineBytes)
+				if !firstRecordSeen {
+					firstRecordSeen = true
+					if ts, ok := codexRolloutSessionStartFromLine(line); ok {
+						sessionStart = ts
+					}
+				}
+				consumeLine(line)
 			}
 		}
 		lineBytes = lineBytes[:0]
@@ -2424,9 +2456,6 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		}
 	}
 	if ctx.Err() != nil {
-		handled = false
-	}
-	if sessionStartDiscarded {
 		handled = false
 	}
 	// Tail lines were already read as complete objects. Fold them even when the
