@@ -1673,27 +1673,62 @@ func codexRolloutBoundaryFingerprint(candidates []codexRolloutCandidate, mtimeNs
 	return fmt.Sprintf("%x", sum[:])
 }
 
-func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error) {
-	f, err := os.Open(dir)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
+type codexReadDirResumeState struct {
+	f       *os.File
+	entries []os.DirEntry
+}
 
-	var entries []os.DirEntry
+var (
+	codexReadDirResumeMu sync.Mutex
+	codexReadDirResumes  = map[string]*codexReadDirResumeState{}
+)
+
+func codexCloseReadDirResume(dir string) {
+	codexReadDirResumeMu.Lock()
+	defer codexReadDirResumeMu.Unlock()
+	if state := codexReadDirResumes[dir]; state != nil {
+		_ = state.f.Close()
+		delete(codexReadDirResumes, dir)
+	}
+}
+
+func codexReadDirContext(ctx context.Context, dir string) ([]os.DirEntry, error) {
+	// Keep an interrupted directory stream open so the next bounded refresh
+	// resumes after the last complete chunk instead of repeatedly enumerating
+	// the same prefix. Serialize access because os.File's directory offset and
+	// the accumulated listing form one cursor.
+	codexReadDirResumeMu.Lock()
+	defer codexReadDirResumeMu.Unlock()
+
+	state := codexReadDirResumes[dir]
+	if state == nil {
+		f, err := os.Open(dir)
+		if err != nil {
+			return nil, err
+		}
+		state = &codexReadDirResumeState{f: f}
+		codexReadDirResumes[dir] = state
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
-			return entries, err
+			return append([]os.DirEntry(nil), state.entries...), err
 		}
-		batch, readErr := f.ReadDir(codexRolloutReadDirChunkSize)
-		entries = append(entries, batch...)
+		batch, readErr := state.f.ReadDir(codexRolloutReadDirChunkSize)
+		state.entries = append(state.entries, batch...)
 		if readErr == io.EOF {
+			_ = state.f.Close()
+			delete(codexReadDirResumes, dir)
 			break
 		}
 		if readErr != nil {
+			entries := append([]os.DirEntry(nil), state.entries...)
+			_ = state.f.Close()
+			delete(codexReadDirResumes, dir)
 			return entries, readErr
 		}
 	}
+	entries := state.entries
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name() < entries[j].Name()
 	})

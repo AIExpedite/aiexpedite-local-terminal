@@ -2691,6 +2691,7 @@ func TestCodexDiscoverRolloutCandidates_StopsWhenContextCancels(t *testing.T) {
 
 func TestCodexReadDirContext_ChecksCancellationBetweenChunks(t *testing.T) {
 	dir := t.TempDir()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
 	for i := 0; i < codexRolloutReadDirChunkSize*2; i++ {
 		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
 		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
@@ -2708,9 +2709,35 @@ func TestCodexReadDirContext_ChecksCancellationBetweenChunks(t *testing.T) {
 	}
 }
 
+func TestCodexReadDirContext_ResumesAfterCancellation(t *testing.T) {
+	dir := t.TempDir()
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
+	for i := 0; i < codexRolloutReadDirChunkSize*2; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-%04d.jsonl", i))
+		if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := &cancelAfterChecksContext{after: 2, done: make(chan struct{})}
+	entries, err := codexReadDirContext(ctx, dir)
+	if err != context.Canceled || len(entries) != codexRolloutReadDirChunkSize {
+		t.Fatalf("first read entries=%d err=%v, want one chunk and cancellation", len(entries), err)
+	}
+
+	entries, err = codexReadDirContext(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != codexRolloutReadDirChunkSize*2 {
+		t.Fatalf("resumed entries=%d, want complete %d-entry listing", len(entries), codexRolloutReadDirChunkSize*2)
+	}
+}
+
 func TestCodexDiscoverRolloutCandidates_PreservesPartialLeafDirectoryResults(t *testing.T) {
 	base := t.TempDir()
 	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	t.Cleanup(func() { codexCloseReadDirResume(dir) })
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
