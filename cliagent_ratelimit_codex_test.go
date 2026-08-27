@@ -2586,6 +2586,50 @@ func TestCodexBucketsFromRolloutFile_SkipsOversizedNonMetricLine(t *testing.T) {
 	}
 }
 
+func TestCodexRolloutFallbackBuckets_OversizedHeaderCannotFakeSessionStart(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	authMod := time.Date(2026, 8, 26, 14, 0, 0, 0, time.UTC)
+	authPath := filepath.Join(base, "auth.json")
+	if err := os.WriteFile(authPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(authPath, authMod, authMod); err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "rollout-oversized-header.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldHeader := `{"timestamp":"2026-08-26T13:00:00Z","type":"session_meta","padding":"` + strings.Repeat("x", codexAppServerMaxLineSize) + `"}`
+	newerTelemetry := `{"timestamp":"2026-08-26T14:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":73,"window_minutes":300}}}`
+	if _, err = fmt.Fprintln(f, oldHeader); err == nil {
+		_, err = fmt.Fprintln(f, newerTelemetry)
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	contributors, _, _, highWater, ok := codexRolloutFallbackBuckets(
+		context.Background(), base, now, codexRolloutScanCursor{},
+	)
+	if ok || len(contributors) != 0 {
+		t.Fatalf("contributors=%+v ok=%v, want oversized unverified session withheld", contributors, ok)
+	}
+	if highWater != nil {
+		t.Fatalf("highWater=%+v, want rollout left eligible for retry", highWater)
+	}
+}
+
 func TestCodexRecentRolloutLines_ContinuesPastSparseNumericFrame(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rollout.jsonl")
 	stricter := `{"timestamp":"2026-08-26T13:50:00Z","jsonrpc":"2.0","result":{"rateLimitsByLimitId":{"codex_stricter":{"used_percent":88,"window_minutes":300}}},"id":1}`

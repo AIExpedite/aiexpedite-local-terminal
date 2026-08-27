@@ -2377,6 +2377,7 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 	reader := bufio.NewReaderSize(f, 64*1024)
 	lineBytes := make([]byte, 0, 64*1024)
 	oversized := false
+	sessionStartDiscarded := false
 	handled := true
 	for {
 		if ctx.Err() != nil {
@@ -2399,12 +2400,21 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 			handled = false
 			break
 		}
+		if oversized && sessionStart.IsZero() {
+			// The discarded object may have been the session_meta header. Do not
+			// promote a later telemetry timestamp to the session start: an older
+			// account can keep emitting after a new login, and that later event
+			// would make its rollout appear to belong to the new account. Mark the
+			// file incomplete so authenticated reconciliation withholds its
+			// evidence and leaves it above the progress cursor for retry.
+			sessionStartDiscarded = true
+		}
 		if !oversized && len(lineBytes) > 0 {
 			for len(lineBytes) > 0 && (lineBytes[len(lineBytes)-1] == '\n' || lineBytes[len(lineBytes)-1] == '\r') {
 				lineBytes = lineBytes[:len(lineBytes)-1]
 			}
 			if len(lineBytes) > 0 {
-				consumeLine(string(lineBytes), true)
+				consumeLine(string(lineBytes), !sessionStartDiscarded)
 			}
 		}
 		lineBytes = lineBytes[:0]
@@ -2414,6 +2424,9 @@ func codexBucketsFromRolloutFile(ctx context.Context, path string, now time.Time
 		}
 	}
 	if ctx.Err() != nil {
+		handled = false
+	}
+	if sessionStartDiscarded {
 		handled = false
 	}
 	// Tail lines were already read as complete objects. Fold them even when the
