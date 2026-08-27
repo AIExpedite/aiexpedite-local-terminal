@@ -4110,6 +4110,98 @@ func TestCodexRolloutFallbackBuckets_ActiveAppendPreservesBacklogProgress(t *tes
 	}
 }
 
+func TestCodexRolloutFallbackBuckets_NewRolloutPreservesBacklogProgress(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "new-backlog@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	oldestMtime := now.Add(-30 * time.Minute)
+	total := codexRolloutScanFileCap + 1
+	for i := range total {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-cohort-%05d.jsonl", i))
+		event := time.Date(2026, 8, 26, 14, 0, i, 0, time.UTC).Format(time.RFC3339)
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == 0 {
+			window = `"secondary":{"used_percent":73,"window_minutes":10080}`
+		}
+		contents := `{"timestamp":"2026-08-26T14:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":%q,"type":"token_count","rate_limits":{%s}}`, event, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := oldestMtime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || first == nil || first.backlogCursor == "" || first.backlogMtimeNs == 0 {
+		t.Fatalf("ok=%v progress=%+v, want first capped batch and resumable progress", ok, first)
+	}
+	if first.backlogCohortSize != total {
+		t.Fatalf("cohort size=%d, want the %d saved identities", first.backlogCohortSize, total)
+	}
+	if len(firstContributors[codexWindowSecondary]) != 0 {
+		t.Fatal("first capped batch unexpectedly consumed the oldest weekly rollout")
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, first, base,
+	)
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	if cursor.backlogCohortSize != first.backlogCohortSize || cursor.backlogCursor != first.backlogCursor {
+		t.Fatalf("cursor=%+v, want the persisted cohort ceiling and rank", cursor)
+	}
+	encoded, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "rollout-") || strings.Contains(string(encoded), base) {
+		t.Fatalf("serialized backlog progress leaked a source filename: %s", encoded)
+	}
+
+	// A session started after the cohort was saved writes a brand new rollout
+	// above the persisted ceiling. It must join the scan without invalidating
+	// progress toward the one rollout the capped first pass never reached.
+	freshPath := filepath.Join(dir, "rollout-cohort-99999.jsonl")
+	freshContents := `{"timestamp":"2026-08-26T14:50:00Z","type":"session_meta"}` + "\n" +
+		`{"timestamp":"2026-08-26T14:55:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":88,"window_minutes":300}}}` + "\n"
+	if err := os.WriteFile(freshPath, []byte(freshContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	freshMtime := now.Add(-2 * time.Minute)
+	if err := os.Chtimes(freshPath, freshMtime, freshMtime); err != nil {
+		t.Fatal(err)
+	}
+
+	contributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || completed == nil {
+		t.Fatalf("ok=%v progress=%+v, want the new rollout and the unread tail consumed", ok, completed)
+	}
+	var primary, secondary float64
+	for _, bucket := range contributors[codexWindowPrimary] {
+		primary = bucket.UsedPercentage
+	}
+	for _, bucket := range contributors[codexWindowSecondary] {
+		secondary = bucket.UsedPercentage
+	}
+	if primary != 88 || secondary != 73 {
+		t.Fatalf("primary=%v secondary=%v, want new 88%% and oldest unread 73%%", primary, secondary)
+	}
+	if completed.mtimeNs != freshMtime.UnixNano() || completed.backlogCursor != "" || completed.backlogCohortSize != 0 {
+		t.Fatalf("completed progress=%+v, want backlog complete at the new rollout's mtime %d", completed, freshMtime.UnixNano())
+	}
+}
+
 func TestCodexRolloutFallbackBuckets_RetryableFailureDoesNotPinCappedBacklog(t *testing.T) {
 	base := t.TempDir()
 	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
