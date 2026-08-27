@@ -3676,7 +3676,7 @@ func TestCodexSelectNewestRolloutCandidates_KeepsCappedNewestInRankOrder(t *test
 		{path: "tie-b", mtime: now.Add(-time.Hour)},
 	}
 
-	selected, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, 3, 0)
+	selected, complete := codexSelectNewestRolloutCandidates(context.Background(), candidates, now, 3, 0, nil)
 	if !complete {
 		t.Fatal("complete=false, want an uninterrupted ranking pass")
 	}
@@ -3710,7 +3710,7 @@ func TestCodexSelectNewestRolloutCandidates_ReservesUnfinishedBoundary(t *testin
 	}
 
 	selected, complete := codexSelectNewestRolloutCandidates(
-		context.Background(), candidates, now, codexRolloutScanFileCap, boundary.UnixNano(),
+		context.Background(), candidates, now, codexRolloutScanFileCap, boundary.UnixNano(), nil,
 	)
 	if !complete || len(selected) != codexRolloutScanFileCap {
 		t.Fatalf("complete=%v selected=%d, want a full uninterrupted batch", complete, len(selected))
@@ -3742,7 +3742,7 @@ func TestCodexSelectNewestRolloutCandidates_StopsWhenBudgetExpires(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	selected, complete := codexSelectNewestRolloutCandidates(ctx, candidates, now, codexRolloutScanFileCap, 0)
+	selected, complete := codexSelectNewestRolloutCandidates(ctx, candidates, now, codexRolloutScanFileCap, 0, nil)
 	if complete {
 		t.Fatal("complete=true, want an exhausted budget reported as incomplete ranking")
 	}
@@ -4152,6 +4152,73 @@ func TestCodexRolloutFallbackBuckets_RetryableFailureDoesNotPinCappedBacklog(t *
 	_, _, _, _, _ = codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
 	if opened != 0 {
 		t.Fatalf("unchanged completed refresh opened %d rollouts, want cache-only", opened)
+	}
+}
+
+func TestCodexRolloutFallbackBuckets_FullRetryBatchReservesBacklogSlot(t *testing.T) {
+	base := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "codex-rate-limits.json")
+	t.Setenv("AIEXPEDITE_CODEX_RL_CACHE", cache)
+	t.Setenv("CODEX_HOME", base)
+	helperCodexAuthAt(t, base, "full-retry-backlog@example.com", codexTestLogin)
+	dir := filepath.Join(base, "sessions", "2026", "08", "26")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 26, 15, 0, 0, 0, time.UTC)
+	oldestMtime := now.Add(-30 * time.Minute)
+	failedPaths := map[string]struct{}{}
+	for i := range codexRolloutScanFileCap + 1 {
+		path := filepath.Join(dir, fmt.Sprintf("rollout-full-retry-%05d.jsonl", i))
+		window := fmt.Sprintf(`"primary":{"used_percent":%d,"window_minutes":300}`, 20+i)
+		if i == 0 {
+			window = `"secondary":{"used_percent":89,"window_minutes":10080}`
+		} else {
+			failedPaths[filepath.Clean(path)] = struct{}{}
+		}
+		contents := `{"timestamp":"2026-08-26T12:00:00Z","type":"session_meta"}` + "\n" +
+			fmt.Sprintf(`{"timestamp":"2026-08-26T14:00:00Z","type":"token_count","rate_limits":{%s}}`, window) + "\n"
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mtime := oldestMtime.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	originalOpen := codexOpenRolloutFile
+	defer func() { codexOpenRolloutFile = originalOpen }()
+	failedOpens := 0
+	codexOpenRolloutFile = func(path string) (*os.File, error) {
+		if _, fail := failedPaths[filepath.Clean(path)]; fail {
+			failedOpens++
+			return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrPermission}
+		}
+		return os.Open(path)
+	}
+
+	fingerprint := codexAccountFingerprintAtBase(base)
+	firstContributors, _, _, first, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if ok || len(firstContributors) != 0 || first == nil || first.backlogCursor == "" ||
+		len(first.retryEntries) != codexRolloutScanFileCap {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want a full retry batch with resumable backlog", ok, firstContributors, first)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, firstContributors, nil, false, nil, false, now, fingerprint, first, base,
+	)
+
+	cursor := codexRolloutScanCursorForAccount(base, fingerprint, now)
+	secondContributors, _, _, second, ok := codexRolloutFallbackBuckets(context.Background(), base, now, cursor)
+	if !ok || second == nil || len(second.retryEntries) != codexRolloutScanFileCap {
+		t.Fatalf("ok=%v contributors=%+v progress=%+v, want backlog evidence with failures still queued", ok, secondContributors, second)
+	}
+	if got := secondContributors[codexWindowSecondary][codexLegacyLimitID].UsedPercentage; got != 89 {
+		t.Fatalf("weekly contributor=%v, want readable seventeenth rollout despite a full retry batch", got)
+	}
+	if failedOpens != codexRolloutScanFileCap*2-1 {
+		t.Fatalf("failed rollout opens=%d, want one retry slot reserved for backlog progress", failedOpens)
 	}
 }
 

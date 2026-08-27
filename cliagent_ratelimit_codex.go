@@ -2338,11 +2338,15 @@ func codexInsertNewestRolloutCandidate(selected []codexRolloutCandidate, candida
 // When reservedBoundaryMtimeNs is non-zero, up to half the batch is reserved
 // for candidates at that unfinished equal-mtime boundary. This prevents an
 // ongoing stream of newer files from starving deterministic boundary progress.
-func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexRolloutCandidate, now time.Time, capacity int, reservedBoundaryMtimeNs int64) ([]codexRolloutCandidate, bool) {
+// When retryEntries fill the ordinary selection, one slot is reserved for the
+// newest non-retry candidate so persistent failures cannot pin an older backlog.
+func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexRolloutCandidate, now time.Time, capacity int, reservedBoundaryMtimeNs int64, retryEntries map[string]struct{}) ([]codexRolloutCandidate, bool) {
 	if capacity <= 0 {
 		return nil, true
 	}
 	selected := make([]codexRolloutCandidate, 0, capacity+1)
+	var newestNonRetry codexRolloutCandidate
+	haveNonRetry := false
 	boundaryCapacity := capacity / 2
 	if boundaryCapacity == 0 {
 		boundaryCapacity = 1
@@ -2353,6 +2357,10 @@ func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexR
 			return selected, false
 		}
 		selected = codexInsertNewestRolloutCandidate(selected, candidate, now, capacity)
+		if _, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]; !retry &&
+			(!haveNonRetry || codexRolloutCandidateBefore(candidate, newestNonRetry, now)) {
+			newestNonRetry, haveNonRetry = candidate, true
+		}
 		if reservedBoundaryMtimeNs > 0 && candidate.mtime.UnixNano() == reservedBoundaryMtimeNs {
 			reservedBoundary = codexInsertNewestRolloutCandidate(reservedBoundary, candidate, now, boundaryCapacity)
 		}
@@ -2392,6 +2400,22 @@ func codexSelectNewestRolloutCandidates(ctx context.Context, candidates []codexR
 			selected = append(selected[:evict], selected[evict+1:]...)
 		}
 		selected = codexInsertNewestRolloutCandidate(selected, boundary, now, capacity)
+	}
+	if haveNonRetry && len(selected) == capacity {
+		hasSelectedNonRetry := false
+		for _, candidate := range selected {
+			if _, retry := retryEntries[codexRolloutBacklogEntryDigest(candidate)]; !retry {
+				hasSelectedNonRetry = true
+				break
+			}
+		}
+		if !hasSelectedNonRetry {
+			// The ordinary rank is entirely retry work. Replace its lowest-ranked
+			// member; that identity remains in retryEntries and is re-offered on the
+			// next pass while the saved backlog cursor advances past fresh work.
+			selected = selected[:len(selected)-1]
+			selected = codexInsertNewestRolloutCandidate(selected, newestNonRetry, now, capacity)
+		}
 	}
 	return selected, true
 }
@@ -2760,6 +2784,7 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 	}
 	selected, selectionComplete := codexSelectNewestRolloutCandidates(
 		orderingCtx, eligibleCandidates, now, codexRolloutScanFileCap, reservedBoundaryMtimeNs,
+		codexRolloutRetrySet(cursor.retryEntries),
 	)
 	cancelOrdering()
 	progressComplete := discoveryComplete && selectionComplete
