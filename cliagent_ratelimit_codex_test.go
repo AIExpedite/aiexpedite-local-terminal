@@ -2926,6 +2926,53 @@ func TestCodexRolloutFallbackBuckets_MixedRefusalPreventsHighWaterAdvance(t *tes
 	}
 }
 
+func TestCodexRolloutFallbackBuckets_NewerTelemetrySupersedesMixedRefusal(t *testing.T) {
+	base := t.TempDir()
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	name := "2026-06-19T11-00-00-refusal-then-telemetry"
+	helperWriteRolloutLimitLog(t, base, "19", name,
+		"2026-06-19T11:00:00.000Z", nil, "2026-06-19T11:15:00.000Z")
+
+	path := filepath.Join(base, "sessions", "2026", "06", "19", "rollout-"+name+".jsonl")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open rollout for append: %v", err)
+	}
+	line, err := json.Marshal(map[string]any{
+		"timestamp": "2026-06-19T11:30:00.000Z",
+		"type":      "event_msg",
+		"payload": map[string]any{
+			"type": "token_count",
+			"rate_limits": map[string]any{"primary": map[string]any{
+				"used_percent": 31.0, "window_minutes": 300.0,
+				"resets_at": float64(now.Add(time.Hour).Unix()),
+			}},
+		},
+	})
+	if err != nil {
+		_ = f.Close()
+		t.Fatalf("marshal newer telemetry: %v", err)
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		_ = f.Close()
+		t.Fatalf("append newer telemetry: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close rollout: %v", err)
+	}
+
+	contributors, limit, _, highWater, ok := codexRolloutFallbackBuckets(context.Background(), base, now, codexRolloutScanCursor{})
+	if !ok || len(contributors) == 0 {
+		t.Fatal("expected numeric evidence after the refusal")
+	}
+	if limit.At.IsZero() {
+		t.Fatal("expected refusal evidence to remain available for notice ranking")
+	}
+	if highWater == nil {
+		t.Fatal("expected newer numeric telemetry to allow completed-scan progress")
+	}
+}
+
 func TestCodexRolloutFallbackBuckets_ValidatesFutureRefusalTime(t *testing.T) {
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {

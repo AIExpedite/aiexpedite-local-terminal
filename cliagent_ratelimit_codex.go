@@ -1969,14 +1969,6 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		if fileLimit.At.After(limit.At) {
 			limit = fileLimit
 		}
-		if !fileLimit.At.IsZero() && now.Sub(fileLimit.At) <= codexUsageLimitNoticeMaxAge {
-			// A refusal has no normalized contributor to persist. Keep
-			// it above the completed-scan watermark while its notice is live so
-			// an unchanged refresh re-reads the bounded rollout set instead of
-			// losing the explanation for otherwise-Unknown usage rows. This also
-			// applies when an earlier frame in the same file supplied a bucket.
-			allHandled = false
-		}
 		if !ok {
 			continue
 		}
@@ -2000,6 +1992,14 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 		// bounded by codexRolloutScanFileCap, so keep folding every in-cap log and
 		// let newest-first (identity, limit) dedup keep the freshest reading per
 		// contributor.
+	}
+	if !limit.At.IsZero() && now.Sub(limit.At) <= codexUsageLimitNoticeMaxAge &&
+		(latestObservation.IsZero() || latestObservation.Before(limit.At)) {
+		// A refusal has no normalized contributor to persist. Keep it above the
+		// completed-scan watermark only while it remains newer than every numeric
+		// observation in the selected set. Newer telemetry supersedes the refusal
+		// and is durable, so repeatedly rescanning that rollout adds no evidence.
+		allHandled = false
 	}
 	var highWater *codexRolloutScanProgress
 	if allHandled {
