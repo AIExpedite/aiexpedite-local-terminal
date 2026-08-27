@@ -2531,6 +2531,14 @@ func codexRolloutFutureProgress(candidates, eligible, selected []codexRolloutCan
 	return anchor.UnixNano(), fingerprint, "", false
 }
 
+func codexRolloutFutureCohortCaughtUp(candidates []codexRolloutCandidate, now time.Time, fingerprint string, complete bool) bool {
+	// Once every member of the anchored future cohort has been consumed and its
+	// mtime is no longer ahead of the clock, it is ordinary completed filesystem
+	// progress. Retaining the old anchor would make each later normal rollout
+	// change the historical cohort fingerprint and reopen the consumed files.
+	return complete && fingerprint != "" && codexRolloutFutureFingerprint(candidates, now) == ""
+}
+
 // codexRolloutFallbackBuckets reads Codex's session rollout logs
 // (CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl) for the most recent populated
 // `rate_limits` frame and returns its per-(window, limit) contributors. The
@@ -2594,6 +2602,14 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 			progress := codexRolloutBoundaryProgress(candidates, nil, nil, cursor.mtimeNs)
 			progress.futureAnchorNs, progress.futureFingerprint, progress.futureCursor, progress.futureComplete =
 				codexRolloutFutureProgress(candidates, nil, nil, now, cursor)
+			if codexRolloutFutureCohortCaughtUp(
+				candidates, now, progress.futureFingerprint, progress.futureComplete,
+			) {
+				progress = codexRolloutBoundaryProgress(
+					candidates, nil, nil,
+					codexRolloutNewestNormalMtimeNs(candidates, cursor.mtimeNs, now),
+				)
+			}
 			return nil, codexUsageLimitEvidence{}, time.Time{}, &progress, false
 		}
 		return nil, codexUsageLimitEvidence{}, time.Time{}, nil, false
@@ -2783,6 +2799,12 @@ func codexRolloutFallbackBuckets(ctx context.Context, base string, now time.Time
 			// normal-time by the next refresh. Keep the main high-water below that
 			// unfinished cohort so its older unread entries cannot be skipped.
 			maxSelectedMtimeNs = cursor.mtimeNs
+		}
+		retireFutureCohort := backlogComplete && !unfinishedSavedBoundary && !deferredNewerCandidate &&
+			codexRolloutFutureCohortCaughtUp(candidates, now, futureFingerprint, futureComplete)
+		if retireFutureCohort {
+			maxSelectedMtimeNs = codexRolloutNewestNormalMtimeNs(candidates, cursor.mtimeNs, now)
+			futureAnchorNs, futureFingerprint, futureCursor, futureComplete = 0, "", "", false
 		}
 		progress := codexRolloutBoundaryProgress(candidates, eligibleCandidates, selected, maxSelectedMtimeNs)
 		if unfinishedSavedBoundary && progress.boundaryCursor == "" &&

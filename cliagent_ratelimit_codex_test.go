@@ -4282,6 +4282,22 @@ func TestCodexRolloutFallbackBuckets_RecordsFutureCandidatesSeparately(t *testin
 	if consumed != 64 {
 		t.Fatalf("normal-time usage=%v, want 64%% while future rollout stays excluded", consumed)
 	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, newContributors, nil, false, nil, false, now, fingerprint, next, base,
+	)
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, now)
+	caughtUp := futureMtime.Add(time.Second)
+	_, _, _, retired, ok := codexRolloutFallbackBuckets(context.Background(), base, caughtUp, cursor)
+	if ok || retired == nil {
+		t.Fatalf("ok=%v progress=%+v, want cache-only future cohort retirement", ok, retired)
+	}
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, nil, nil, false, nil, false, caughtUp, fingerprint, retired, base,
+	)
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, caughtUp)
+	if cursor.mtimeNs != futureMtime.UnixNano() || cursor.futureFingerprint != "" || cursor.futureComplete {
+		t.Fatalf("cursor=%+v, want completed future cohort folded into normal progress", cursor)
+	}
 }
 
 func TestCodexRolloutFallbackBuckets_ResumesFutureBatchAfterClockCatchUp(t *testing.T) {
@@ -4347,8 +4363,8 @@ func TestCodexRolloutFallbackBuckets_ResumesFutureBatchAfterClockCatchUp(t *test
 	}
 
 	lastContributors, _, _, completed, ok := codexRolloutFallbackBuckets(context.Background(), base, caughtUp, cursor)
-	if !ok || completed == nil || !completed.futureComplete {
-		t.Fatalf("ok=%v progress=%+v, want caught-up future cohort completed", ok, completed)
+	if !ok || completed == nil || completed.futureComplete || completed.futureFingerprint != "" {
+		t.Fatalf("ok=%v progress=%+v, want caught-up future cohort retired", ok, completed)
 	}
 	foundWeekly := false
 	for _, bucket := range lastContributors[codexWindowSecondary] {
@@ -4358,5 +4374,36 @@ func TestCodexRolloutFallbackBuckets_ResumesFutureBatchAfterClockCatchUp(t *test
 	}
 	if !foundWeekly {
 		t.Fatalf("contributors=%+v, want oldest rollout's distinct weekly metric", lastContributors)
+	}
+
+	mergeCodexRateLimitCachePerLimitProgress(
+		cache, lastContributors, nil, false, nil, false, caughtUp, fingerprint, completed, base,
+	)
+	cursor = codexRolloutScanCursorForAccount(base, fingerprint, caughtUp)
+	newestCohortMtime := now.Add(time.Duration(total) * time.Hour)
+	if cursor.mtimeNs != newestCohortMtime.UnixNano() {
+		t.Fatalf("normal high-water=%d, want completed cohort mtime %d", cursor.mtimeNs, newestCohortMtime.UnixNano())
+	}
+	if cursor.futureAnchorNs != 0 || cursor.futureFingerprint != "" || cursor.futureCursor != "" || cursor.futureComplete {
+		t.Fatalf("cursor=%+v, want caught-up future cohort retired", cursor)
+	}
+
+	nextPath := filepath.Join(dir, "rollout-after-future-catch-up.jsonl")
+	nextContents := `{"timestamp":"2026-08-27T08:00:00Z","type":"session_meta"}` + "\n" +
+		`{"timestamp":"2026-08-27T08:10:00Z","type":"token_count","rate_limits":{"primary":{"used_percent":88,"window_minutes":300}}}` + "\n"
+	if err := os.WriteFile(nextPath, []byte(nextContents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nextMtime := caughtUp.Add(-time.Second)
+	if err := os.Chtimes(nextPath, nextMtime, nextMtime); err != nil {
+		t.Fatal(err)
+	}
+	candidates, complete = codexDiscoverRolloutCandidates(context.Background(), base, cursor)
+	if !complete {
+		t.Fatal("complete=false, want uninterrupted discovery after future cohort retirement")
+	}
+	eligible = codexUnconsumedRolloutCandidates(candidates, cursor, caughtUp)
+	if len(eligible) != 1 || eligible[0].path != nextPath {
+		t.Fatalf("eligible=%+v, want only the newly created normal rollout", eligible)
 	}
 }
