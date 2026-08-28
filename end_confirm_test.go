@@ -1060,7 +1060,7 @@ func TestTurnManagerStart_RejectsRetainedDrainTombstone(t *testing.T) {
 		s := &OpenCodeNativeSession{ID: "s", status: "ended", endDrainUnconfirmed: true}
 		m.sessions[s.ID] = s
 		acks := 0
-		err := m.Start(s.ID, cwd, "ws", "uid", nil, func() { acks++ })
+		err := m.Start(s.ID, cwd, "ws", "uid", "", nil, func() { acks++ })
 		if err == nil || !strings.Contains(err.Error(), "retained tombstone") {
 			t.Fatalf("Start against tombstone = %v, want rejection", err)
 		}
