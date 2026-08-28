@@ -912,7 +912,8 @@ func TestOpenCodeNativeManager_BelowMinVersionSkipsSessionAndReplays(t *testing.
 		{Role: "assistant", Content: "earlier answer"},
 	}
 
-	if err := m.Send(id, "follow up", func(resultMsg) {}, 60*time.Second); err != nil {
+	var frames []resultMsg
+	if err := m.Send(id, "follow up", func(res resultMsg) { frames = append(frames, res) }, 60*time.Second); err != nil {
 		t.Fatalf("Send failed: %v", err)
 	}
 
@@ -925,6 +926,14 @@ func TestOpenCodeNativeManager_BelowMinVersionSkipsSessionAndReplays(t *testing.
 	for _, want := range []string{"earlier question", "earlier answer", "User: follow up"} {
 		if !strings.Contains(string(sent), want) {
 			t.Fatalf("replay prompt missing %q:\n%s", want, string(sent))
+		}
+	}
+	if sess.NativeSessionID != "" {
+		t.Fatalf("a below-floor binary must discard the unusable native session id, got %q", sess.NativeSessionID)
+	}
+	for _, frame := range frames {
+		if frame.ConversationID != "" {
+			t.Fatalf("a below-floor binary must not publish the seeded conversation id, got %q", frame.ConversationID)
 		}
 	}
 }

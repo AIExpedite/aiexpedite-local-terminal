@@ -398,6 +398,7 @@ func (m *OpenCodeNativeManager) Send(id, text string, publishFn PublishFunc, tur
 	nativeID := session.NativeSessionID
 	if !resumeSupported {
 		nativeID = ""
+		session.NativeSessionID = ""
 	}
 	useNativeResume := nativeID != ""
 	usedReplay := false
