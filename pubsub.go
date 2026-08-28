@@ -462,6 +462,25 @@ type signaturePayload struct {
 	// both ends include it. Signing it prevents a "destructive"→"" downgrade
 	// that would skip native approval.
 	RiskLevel string `json:"riskLevel,omitempty"`
+	// cwd is signed ONLY for env-setup dispatches (riskLevel-bearing commands),
+	// mirroring the Node signer's riskLevel-gated branch in hmac.util.js. An
+	// env-setup clone/destructive step whose target is a relative path resolves
+	// against cwd on this device, so an unsigned cwd would let a tampered or
+	// replayed command keep a valid signature while redirecting an approved,
+	// disk-gated step onto a different directory than the user approved.
+	//
+	// THIS FIELD WAS MISSING and that absence was a live outage, not a latent
+	// one: terminal-service has signed {riskLevel, cwd} since env-setup shipped
+	// (its PR #87), while this struct signed only riskLevel — so every env-setup
+	// step that carried BOTH fields computed a different canonical on the two
+	// sides and was rejected here as a bad signature. Steps without a cwd
+	// matched by accident of omitempty.
+	//
+	// Populate it ONLY when RiskLevel is set (see verifySignature): ordinary
+	// execute/session commands carry a cwd too, and the Node signer does not
+	// sign cwd for those — including it unconditionally would break every
+	// signed command that has a working directory.
+	Cwd string `json:"cwd,omitempty"`
 	// conversationId selects durable local chat context for Antigravity starts.
 	// It affects execution just like signed Args, so it must be authenticated.
 	// omitempty preserves the existing signature shape for every other command.
@@ -480,16 +499,18 @@ func verifySignature(cmd commandMsg, secret string) bool {
 	}
 
 	payload := signaturePayload{
-		ID:              cmd.ID,
-		Command:         cmd.Command,
-		Args:            args,
-		Ts:              cmd.Ts,
-		Type:            cmd.Type,
-		SessionID:       cmd.SessionID,
-		Input:           cmd.Input,
-		Signal:          cmd.Signal,
-		RefreshID:       cmd.RefreshID,
-		RiskLevel:       cmd.RiskLevel,
+		ID:        cmd.ID,
+		Command:   cmd.Command,
+		Args:      args,
+		Ts:        cmd.Ts,
+		Type:      cmd.Type,
+		SessionID: cmd.SessionID,
+		Input:     cmd.Input,
+		Signal:    cmd.Signal,
+		RefreshID: cmd.RefreshID,
+		RiskLevel: cmd.RiskLevel,
+		// riskLevel-gated to match the Node signer — see the field comment.
+		Cwd:             riskGatedSignatureCwd(cmd),
 		ConversationID:  cmd.ConversationID,
 		CliAgentCatalog: cliAgentCatalogSignatureJSON(cmd),
 	}
@@ -513,6 +534,17 @@ func verifySignature(cmd commandMsg, secret string) bool {
 
 	// Constant-time comparison to prevent timing attacks
 	return hmac.Equal([]byte(expectedSig), []byte(cmd.Signature))
+}
+
+// riskGatedSignatureCwd returns the cwd to include in the signature canonical:
+// the command's cwd for env-setup (riskLevel-bearing) commands, empty for
+// everything else. Node's signCommand adds `canonical.cwd` only inside its
+// riskLevel branch, so the gate must be identical on both sides.
+func riskGatedSignatureCwd(cmd commandMsg) string {
+	if cmd.RiskLevel == "" {
+		return ""
+	}
+	return cmd.Cwd
 }
 
 func cliAgentCatalogSignatureJSON(cmd commandMsg) json.RawMessage {

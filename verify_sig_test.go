@@ -348,3 +348,83 @@ func TestVerifySignatureAuthenticatesConversationID(t *testing.T) {
 		t.Fatal("verifySignature should reject a tampered conversation id")
 	}
 }
+
+// Node's signCommand has signed {riskLevel, cwd} together since env-setup
+// shipped (terminal-service #87); this struct signed only riskLevel, so every
+// env-setup step carrying BOTH was rejected as a bad signature. These tests pin
+// the repaired contract from the Node side of the wire: the canonical is built
+// exactly as hmac.util.js builds it, then verified here.
+func TestVerifySignatureAcceptsEnvSetupCwd(t *testing.T) {
+	secret := "test-secret-for-unit-test"
+	payload := signaturePayload{
+		ID:        "env-setup-step-1",
+		Command:   "git",
+		Args:      []string{"clone", "https://example.com/repo.git"},
+		Ts:        1234567890,
+		Type:      "execute",
+		RiskLevel: "external_write",
+		Cwd:       "C:/Users/dev/projects",
+	}
+	canonical, err := nodeJSONStringify(payload)
+	if err != nil {
+		t.Fatalf("nodeJSONStringify failed: %v", err)
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(canonical)
+	cmd := commandMsg{
+		ID:        payload.ID,
+		Command:   payload.Command,
+		Args:      payload.Args,
+		Ts:        payload.Ts,
+		Type:      payload.Type,
+		RiskLevel: payload.RiskLevel,
+		Cwd:       payload.Cwd,
+		Signature: hex.EncodeToString(mac.Sum(nil)),
+	}
+	if !verifySignature(cmd, secret) {
+		t.Fatal("verifySignature should accept an env-setup command whose cwd was signed")
+	}
+
+	// A redirected cwd is the attack the signature exists to stop: an approved,
+	// disk-gated step re-pointed at a different directory or volume.
+	cmd.Cwd = "D:/somewhere/else"
+	if verifySignature(cmd, secret) {
+		t.Fatal("verifySignature should reject a tampered env-setup cwd")
+	}
+}
+
+// The gate must stay riskLevel-scoped: ordinary execute/session commands carry
+// a cwd the Node signer does NOT sign, so including it unconditionally would
+// break every signed command that has a working directory. This is the test
+// that fails if riskGatedSignatureCwd is ever inlined away.
+func TestVerifySignatureIgnoresCwdWithoutRiskLevel(t *testing.T) {
+	secret := "test-secret-for-unit-test"
+	// Node canonical for an ordinary command: no riskLevel, no cwd.
+	payload := signaturePayload{
+		ID:      "ordinary-cmd-1",
+		Command: "git",
+		Args:    []string{"status"},
+		Ts:      1234567890,
+		Type:    "execute",
+	}
+	canonical, err := nodeJSONStringify(payload)
+	if err != nil {
+		t.Fatalf("nodeJSONStringify failed: %v", err)
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(canonical)
+	cmd := commandMsg{
+		ID:        payload.ID,
+		Command:   payload.Command,
+		Args:      payload.Args,
+		Ts:        payload.Ts,
+		Type:      payload.Type,
+		Cwd:       "C:/Users/dev/projects", // present on the wire, absent from the canonical
+		Signature: hex.EncodeToString(mac.Sum(nil)),
+	}
+	if !verifySignature(cmd, secret) {
+		t.Fatal("a cwd on an ordinary (riskLevel-less) command must not enter the canonical")
+	}
+}
