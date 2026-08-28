@@ -217,7 +217,17 @@ func NewOpenCodeNativeManager() *OpenCodeNativeManager {
 // cloud never sends opencode_native_end (idle expiry / dropped end command).
 // onStarted is invoked after the session is registered so callers can publish
 // opencode_native_started before any later frames.
-func (m *OpenCodeNativeManager) Start(id, cwd string, workspaceID, uid string, publishFn PublishFunc, onStarted func()) error {
+// resumeSessionID seeds NativeSessionID so the FIRST turn of a NEW terminal
+// session continues an EXISTING OpenCode session (`--session <id>`), which is
+// what makes conversation-scoped resume possible after the previous terminal
+// session's device claim was reclaimed: the cloud reads the id off the durable
+// pointer it committed from a prior completion frame and hands it back here.
+// Empty means "start a fresh session" — the pre-existing behaviour.
+//
+// Not validated against the local store: a stale id is recoverable at turn
+// time (Send's looksLikeMissingSession → bounded transcript replay), which is a
+// better answer than refusing the start. Same contract as Antigravity's seed.
+func (m *OpenCodeNativeManager) Start(id, cwd string, workspaceID, uid, resumeSessionID string, publishFn PublishFunc, onStarted func()) error {
 	if id == "" {
 		return fmt.Errorf("sessionID is required")
 	}
@@ -272,6 +282,10 @@ func (m *OpenCodeNativeManager) Start(id, cwd string, workspaceID, uid string, p
 		StartedAt:     time.Now(),
 		status:        "idle",
 		publishFn:     publishFn,
+		// Seeded in the literal, before registration, so a Send racing the tail
+		// of Start cannot observe a startable session not yet told which
+		// conversation it continues (that window silently starts fresh).
+		NativeSessionID: resumeSessionID,
 	}
 	m.sessions[id] = session
 
@@ -521,6 +535,13 @@ func (m *OpenCodeNativeManager) Send(id, text string, publishFn PublishFunc, tur
 		SessionID:   session.ID,
 		Seq:         seq,
 		ExitCode:    result.exitCode,
+		// Durable conversation id for conversation-scoped resume, published on
+		// the completion frame only — after the success gate and after the
+		// capture block adopted it — so the cloud never commits an id whose
+		// latest turn did not land in the transcript. Empty when capture failed
+		// or the binary is below the resume floor; omitempty drops it and the
+		// cloud leaves any previously committed pointer intact.
+		ConversationID: session.NativeSessionID,
 	}
 	// Preflight marshaled size: JSON escaping can push an under-cap payload over
 	// Pub/Sub's 10 MB limit, and newSessionPublishFn only LOGS publish failures.

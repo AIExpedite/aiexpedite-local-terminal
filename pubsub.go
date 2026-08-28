@@ -632,8 +632,8 @@ type commandMsg struct {
 	StepID    string `json:"stepId,omitempty"`    // env-setup step id (audit correlation)
 
 	// Durable CLI conversation id to RESUME on a session start whose kind keeps
-	// its conversation on this device's filesystem (antigravity_native_start
-	// today). Empty = start a fresh conversation.
+	// its conversation on this device's filesystem (antigravity_native_start,
+	// opencode_native_start). Empty = start a fresh conversation.
 	//
 	// Claude needs no equivalent field: its resume travels as an ordinary
 	// `--resume=<id>` entry in Args, which is already signed.
@@ -6634,6 +6634,7 @@ func handleOpenCodeNativeCommand(ctx context.Context, topic *pubsub.Publisher, c
 			cmd.Cwd,
 			cmd.WorkspaceID,
 			cmd.UID,
+			cmd.ConversationID,
 			publishFn,
 			onStarted,
 		)

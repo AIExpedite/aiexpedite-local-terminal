@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -578,17 +579,17 @@ func injectOpenCodeSession(t *testing.T, m *OpenCodeNativeManager, id, cwd strin
 
 func TestOpenCodeNativeManager_StartRejectsBadCwd(t *testing.T) {
 	m := NewOpenCodeNativeManager()
-	if err := m.Start("", "/tmp", "ws", "uid", nil, nil); err == nil {
+	if err := m.Start("", "/tmp", "ws", "uid", "", nil, nil); err == nil {
 		t.Fatal("expected an empty session id to be refused")
 	}
-	if err := m.Start("s1", "", "ws", "uid", nil, nil); err == nil {
+	if err := m.Start("s1", "", "ws", "uid", "", nil, nil); err == nil {
 		t.Fatal("expected an empty cwd to be refused")
 	}
-	if err := m.Start("s1", "relative/path", "ws", "uid", nil, nil); err == nil {
+	if err := m.Start("s1", "relative/path", "ws", "uid", "", nil, nil); err == nil {
 		t.Fatal("expected a relative cwd to be refused")
 	}
 	missing := filepath.Join(t.TempDir(), "does-not-exist")
-	if err := m.Start("s1", missing, "ws", "uid", nil, nil); err == nil {
+	if err := m.Start("s1", missing, "ws", "uid", "", nil, nil); err == nil {
 		t.Fatal("expected a missing cwd to be refused")
 	}
 	// A file is not a working directory.
@@ -596,7 +597,7 @@ func TestOpenCodeNativeManager_StartRejectsBadCwd(t *testing.T) {
 	if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := m.Start("s1", f, "ws", "uid", nil, nil); err == nil {
+	if err := m.Start("s1", f, "ws", "uid", "", nil, nil); err == nil {
 		t.Fatal("expected a file cwd to be refused")
 	}
 }
@@ -729,7 +730,7 @@ func TestOpenCodeNativeManager_IdempotentStartAck(t *testing.T) {
 	injectOpenCodeSession(t, m, id, t.TempDir())
 
 	acks := 0
-	if err := m.Start(id, t.TempDir(), "ws", "uid", func(resultMsg) {}, func() { acks++ }); err != nil {
+	if err := m.Start(id, t.TempDir(), "ws", "uid", "", func(resultMsg) {}, func() { acks++ }); err != nil {
 		t.Fatalf("redelivered start should ack, got %v", err)
 	}
 	if acks != 1 {
@@ -1252,5 +1253,122 @@ func TestOpenCodeNativeManager_PublishedFramesCarryNoSecrets(t *testing.T) {
 	}
 	if !sawStderr {
 		t.Fatal("expected an opencode_native_stderr frame for the warning")
+	}
+}
+
+// primeOpenCodeCapability marks the `opencode --version` probe satisfied (with
+// native resume available) for one test, and restores the cache afterwards.
+// The surrounding Start tests skip when opencode is absent, which means CI —
+// the only machine that gates merges, and one where it is never installed —
+// exercises none of them. Start's seeding and the completion-frame id are pure
+// registration/publish logic with no dependency on the binary.
+func primeOpenCodeCapability(t *testing.T) {
+	t.Helper()
+	openCodeCapabilityMu.Lock()
+	prevOK, prevChecked, prevErr, prevResume := openCodeCapabilityOK, openCodeCapabilityChecked, openCodeCapabilityErr, openCodeCapabilityResumeOK
+	openCodeCapabilityOK, openCodeCapabilityChecked, openCodeCapabilityErr, openCodeCapabilityResumeOK = true, time.Now(), nil, true
+	openCodeCapabilityMu.Unlock()
+	t.Cleanup(func() {
+		openCodeCapabilityMu.Lock()
+		openCodeCapabilityOK, openCodeCapabilityChecked, openCodeCapabilityErr, openCodeCapabilityResumeOK = prevOK, prevChecked, prevErr, prevResume
+		openCodeCapabilityMu.Unlock()
+	})
+}
+
+// The cloud can only make an OpenCode session conversation-resumable if the
+// device tells it the native session id, and only continue one if Start can be
+// seeded with it. These pin the two halves of that wire contract — the same
+// contract Antigravity carries on antigravity_native_message / _start.
+func TestOpenCodeNativeSend_PublishesConversationIDOnSuccess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim for fake opencode is unix-oriented")
+	}
+	primeOpenCodeCapability(t)
+	binDir := t.TempDir()
+	script := "#!/bin/sh\ncat >/dev/null\necho '{\"type\":\"text\",\"text\":\"done\",\"sessionID\":\"ses-abc\"}'\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(binDir, "opencode"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake opencode: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewOpenCodeNativeManager()
+	id := "sess-oc-convid-success"
+	m.mu.Lock()
+	m.sessions[id] = &OpenCodeNativeSession{
+		ID: id, Cwd: t.TempDir(), WorkspaceID: "ws", UID: "uid", StartedAt: time.Now(), status: "idle",
+		NativeSessionID: "ses-abc",
+	}
+	m.mu.Unlock()
+
+	var frames []resultMsg
+	if err := m.Send(id, "hello", func(res resultMsg) { frames = append(frames, res) }, 10*time.Second); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	var found bool
+	for _, f := range frames {
+		if f.Type != "opencode_native_message" || f.Status != "success" || !strings.Contains(f.Output, "aiexpedite.turn_complete") {
+			continue
+		}
+		found = true
+		if f.ConversationID != "ses-abc" {
+			t.Fatalf("completion frame must carry the native session id, got %q", f.ConversationID)
+		}
+	}
+	if !found {
+		t.Fatalf("expected a completion frame, got %#v", frames)
+	}
+}
+
+func TestOpenCodeNativeSend_NoConversationIDOnFailedTurn(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim for fake opencode is unix-oriented")
+	}
+	primeOpenCodeCapability(t)
+	binDir := t.TempDir()
+	script := "#!/bin/sh\ncat >/dev/null\necho 'Error: boom'\nexit 3\n"
+	if err := os.WriteFile(filepath.Join(binDir, "opencode"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake opencode: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := NewOpenCodeNativeManager()
+	id := "sess-oc-convid-failure"
+	m.mu.Lock()
+	m.sessions[id] = &OpenCodeNativeSession{
+		ID: id, Cwd: t.TempDir(), WorkspaceID: "ws", UID: "uid", StartedAt: time.Now(), status: "idle",
+		NativeSessionID: "ses-should-not-leak",
+	}
+	m.mu.Unlock()
+
+	var frames []resultMsg
+	if err := m.Send(id, "hello", func(res resultMsg) { frames = append(frames, res) }, 10*time.Second); err == nil {
+		t.Fatal("expected Send to fail on non-zero opencode exit")
+	}
+	for _, f := range frames {
+		if f.ConversationID != "" {
+			t.Fatalf("failed turn must not publish a conversation id, frame %q carried %q", f.Type, f.ConversationID)
+		}
+	}
+}
+
+func TestOpenCodeNativeStart_SeedsResumeSessionID(t *testing.T) {
+	primeOpenCodeCapability(t)
+	m := NewOpenCodeNativeManager()
+	if err := m.Start("sess-oc-seeded", t.TempDir(), "ws", "uid", "ses-seed-1", nil, nil); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if got := m.Get("sess-oc-seeded").NativeSessionID; got != "ses-seed-1" {
+		t.Fatalf("Start must seed NativeSessionID, got %q", got)
+	}
+}
+
+func TestOpenCodeNativeStart_EmptySeedStartsFreshSession(t *testing.T) {
+	primeOpenCodeCapability(t)
+	m := NewOpenCodeNativeManager()
+	if err := m.Start("sess-oc-fresh", t.TempDir(), "ws", "uid", "", nil, nil); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if got := m.Get("sess-oc-fresh").NativeSessionID; got != "" {
+		t.Fatalf("empty seed must leave the session unset, got %q", got)
 	}
 }
