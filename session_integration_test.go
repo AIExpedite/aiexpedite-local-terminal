@@ -1359,13 +1359,19 @@ func TestManagedClaudeSession_TerminalResultAdvancesUtilization(t *testing.T) {
 			time.Now().Add(3*time.Hour).Unix())
 	})
 	seeded := seedStaleClaudeObservation(t, cache)
+	// A managed run has TWO trigger points — the terminal `result` frame and the
+	// session-end sweep — and collapsing them into one request is the minimum
+	// interval's job. armClaudeUsageProbe zeroes that interval so the throttle
+	// stays out of the way of the other tests, which would leave this assertion
+	// depending on whether the two probes happened to overlap enough for the
+	// single-flight latch to catch the second. Restore a production-shaped
+	// interval so the mechanism under test is actually the one running.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
 
 	sm, id := startManagedClaudeSession(t, "claude-heartbeat-result")
 	t.Cleanup(func() { _ = sm.EndSession(id) })
 
 	waitForClaudeObservationAfter(t, cache, seeded)
-	// The result frame and the session-end sweep both attempt a probe; the
-	// single-flight plus the minimum interval must collapse them into one call.
 	if got := atomic.LoadInt64(calls); got != 1 {
 		t.Errorf("probe request count=%d, want exactly 1 for a single managed run", got)
 	}

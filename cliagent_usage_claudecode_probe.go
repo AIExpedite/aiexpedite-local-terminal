@@ -20,17 +20,21 @@
 //
 // Boundaries:
 //
-//   - Single-flight per process, with a hard minimum interval between attempts
-//     (claudeUsageProbeMinInterval). A user-initiated __cli_usage_refresh__ may
-//     bypass the interval via SetClaudeUsageForceProbe, never the single-flight.
-//   - 3s timeout, no proxy inheritance, HTTPS-only (a loopback override is
-//     accepted so tests can point at an httptest server), 32 KB body cap.
+//   - Single-flight per process, with a minimum interval between attempts that
+//     DOUBLES per consecutive failure up to claudeUsageProbeMaxInterval. A
+//     user-initiated __cli_usage_refresh__ bypasses the interval via
+//     SetClaudeUsageForceProbe; nothing bypasses the single-flight.
+//   - 3s timeout, no proxy inheritance, redirects refused, and the endpoint is
+//     the pinned HTTPS constant — the env override is accepted ONLY for loopback
+//     (see claudeUsageProbeURL). 32 KB body cap.
 //   - Decoded into a typed, allow-listed struct — never map[string]interface{} —
 //     so unknown vendor fields (tokens, raw config, prose) are discarded by
 //     encoding/json rather than carried into the cache or the signed receipt.
-//   - Skipped entirely when the user opted out (disable_claude_usage_probe), when
-//     an env credential outranks the stored /login (claudeEnvAuthActive — that
-//     account has no card here), or when no stored access token exists.
+//   - Skipped entirely when the process never armed it (SetClaudeUsageProbeDisabled
+//     is called only by StartAgent), when the user opted out
+//     (disable_claude_usage_probe), when the agent is offline, when an env
+//     credential outranks the stored /login (claudeEnvAuthActive — that account
+//     has no card here), or when no stored access token exists.
 //   - On any failure the cache is left byte-identical, preserving
 //     terminal-service's payload-hash delta-skip.
 package main
@@ -52,12 +56,19 @@ import (
 
 const (
 	// claudeUsageProbeEndpoint is the OAuth usage endpoint Claude Code's own
-	// /usage panel reads. AIEXPEDITE_CLAUDE_USAGE_PROBE_URL overrides it, the
-	// same env-pinning convention AIEXPEDITE_CLAUDE_RL_CACHE uses for the cache
-	// (tests isolate from the real endpoint; ops can point at a proxy).
+	// /usage panel reads, and the ONLY non-loopback host this probe may reach.
+	//
+	// AIEXPEDITE_CLAUDE_USAGE_PROBE_URL can redirect it to a LOOPBACK address
+	// only — it is a test seam, deliberately NOT an ops knob for pointing at a
+	// proxy. This request carries the user's subscription bearer token, so an
+	// override that accepted arbitrary hosts would be a credential-exfiltration
+	// primitive for anything able to influence the agent's environment. Do not
+	// relax claudeUsageProbeURL to restore proxy support without replacing that
+	// protection with something equivalent.
 	claudeUsageProbeEndpoint = "https://api.anthropic.com/api/oauth/usage"
-	// claudeUsageProbeEndpointEnv / claudeUsageProbeMinIntervalEnv are the test +
-	// ops overrides for the two values worth pinning.
+	// claudeUsageProbeEndpointEnv / claudeUsageProbeMinIntervalEnv are the two
+	// pinnable values. The endpoint override is loopback-only (see above); the
+	// interval override is a plain operator knob.
 	claudeUsageProbeEndpointEnv    = "AIEXPEDITE_CLAUDE_USAGE_PROBE_URL"
 	claudeUsageProbeMinIntervalEnv = "AIEXPEDITE_CLAUDE_USAGE_PROBE_MIN_INTERVAL_MS"
 
@@ -68,8 +79,10 @@ const (
 	// claudeUsageProbeMaxBody bounds the decode. The real payload is ~1 KB.
 	claudeUsageProbeMaxBody = 32 * 1024
 	// claudeUsageProbeMinInterval is the floor between two attempts on this
-	// device. Worst case is therefore ~60 requests/hour per device — a per-device
-	// call, not a fan-out, so it scales with active devices rather than runs.
+	// device while the probe is HEALTHY: ~60 requests/hour per device worst case
+	// — a per-device call, not a fan-out, so it scales with active devices rather
+	// than with runs. A repeatedly failing probe settles at a far lower rate as
+	// its interval doubles (see interval).
 	claudeUsageProbeMinInterval = 60 * time.Second
 	// claudeUsageProbeMaxInterval caps the consecutive-failure backoff, so a
 	// persistently broken endpoint settles at ~2 requests/hour/device instead of
@@ -301,9 +314,10 @@ func (g *claudeUsageProbeGate) forced() bool {
 	return g.force
 }
 
-// armedForProbe reports whether a probe could run at all in this process. Used
-// to skip the staleness read on a gather that could never probe anyway — that
-// check costs a cache load per provider scan.
+// armedForProbe reports whether a probe could run at all in this process.
+// Its one caller is triggerClaudeUsageProbeAfterRun, which fires once per
+// completed turn on every Claude session and should not pay for a goroutine
+// that begin() would immediately refuse.
 func (g *claudeUsageProbeGate) armedForProbe() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()

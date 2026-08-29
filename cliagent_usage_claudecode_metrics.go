@@ -4,9 +4,10 @@
 // Split out of cliagent_usage_claudecode.go, which now keeps only the
 // credential / auth-state concerns. Everything here moved VERBATIM apart from
 // latestClaudeObservation, which is new: it is the single place "how old is the
-// freshest reading we hold" is computed, shared by the usage parser's
-// stale-gather trigger and the bounded utilization probe's gate
-// (cliagent_usage_claudecode_probe.go).
+// freshest reading we hold" is computed. The parser calls it on the buckets it
+// has already loaded and hands the result to refreshClaudeUsageIfStale
+// (cliagent_usage_claudecode_probe.go), so the probe decides staleness without
+// reading the cache a second time.
 //
 // The writers that fill this cache live in cliagent_ratelimit.go (stream
 // capture), statusline_hook.go (interactive renders) and the probe.
