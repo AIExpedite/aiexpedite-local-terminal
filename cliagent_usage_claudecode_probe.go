@@ -262,20 +262,6 @@ func (g *claudeUsageProbeGate) armedForProbe() bool {
 	return g.armed
 }
 
-// wouldThrottle reports whether begin() would refuse right now for a reason the
-// caller can determine without touching the disk. Lets the routine-gather path
-// skip the staleness cache load (which also parses Claude's settings.json to
-// find the pinned hook cache) when the answer cannot change the outcome.
-func (g *claudeUsageProbeGate) wouldThrottle(now time.Time) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.force {
-		return false
-	}
-	return g.inFlight ||
-		(!g.lastAttempt.IsZero() && now.Sub(g.lastAttempt) < claudeUsageProbeMinIntervalValue())
-}
-
 // claudeUsageProbeAccessToken returns the stored subscription access token, or
 // "" when the probe must not run: an env credential outranks the stored /login
 // (its account has no card here, so its usage must not be merged into one), no
@@ -549,18 +535,20 @@ func claudeUsageProbeStatus(raw string) string {
 }
 
 // refreshClaudeUsageIfStale is the ROUTINE-gather trigger: it probes only when a
-// refresh forced it, or when the freshest reading the cache holds is older than
-// claudeUsageProbeStaleAfter. Returns whether the cache was refreshed; the
-// caller reads the cache after it either way.
-func refreshClaudeUsageIfStale(ctx context.Context, now time.Time, fingerprint string) bool {
-	if !claudeUsageProbe.armedForProbe() || claudeUsageProbe.wouldThrottle(now) {
+// refresh forced it, or when `latest` — the freshest observation the caller
+// already read out of the cache — has aged past claudeUsageProbeStaleAfter.
+// A zero `latest` means nothing has ever been observed, which is stale by
+// definition.
+//
+// Takes the observation rather than the fingerprint so the caller's cache read
+// is reused; every remaining gate (armed, opt-out, offline, single-flight,
+// minimum interval) belongs to the probe's own begin() and is not restated here.
+//
+// Returns whether the cache was refreshed, so the caller knows whether it must
+// re-read before shaping the metrics.
+func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time) bool {
+	if !claudeUsageProbe.forced() && !latest.IsZero() && now.Sub(latest) < claudeUsageProbeStaleAfter {
 		return false
-	}
-	if !claudeUsageProbe.forced() {
-		latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets(fingerprint))
-		if !latest.IsZero() && now.Sub(latest) < claudeUsageProbeStaleAfter {
-			return false
-		}
 	}
 	refreshed, probeErr := runClaudeUsageProbe(ctx, now)
 	logClaudeUsageProbeFailure(probeErr)

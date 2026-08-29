@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -506,5 +508,82 @@ func TestEnsureClaudeStatusLineHookIfStale_UnarmedProcessDoesNothing(t *testing.
 	}
 	if strings.Contains(string(raw), "statusLine") {
 		t.Errorf("unarmed process must not touch settings.json:\n%s", raw)
+	}
+}
+
+// Concurrent Claude starts must produce exactly ONE reconcile. This is not
+// theoretical: ClaudeNativeManager.Start runs the reconcile outside its manager
+// mutex (deliberately — it must not hold that lock over disk I/O) and
+// SessionManager.StartSession runs it under a different lock entirely, so
+// nothing upstream serializes the two. Without an atomic claim, both would
+// observe an un-throttled state and both would drive ensureClaudeStatusLineHook's
+// read-modify-write of the user's settings.json at once: one write is lost, and
+// the loser can stash the winner's in-flight statusLine as the "previous
+// third-party" command — permanently hiding it behind a hook -> hook chain.
+func TestEnsureClaudeStatusLineHookIfStale_ConcurrentStartsReconcileOnce(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	if err := os.WriteFile(settingsPath,
+		[]byte(`{"theme":"dark","statusLine":{"type":"command","command":"/opt/claude/vendor-line.sh"}}`),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const starts = 12
+	var wg sync.WaitGroup
+	changedCount := int64(0)
+	errCount := int64(0)
+	for i := 0; i < starts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			changed, err := ensureClaudeStatusLineHookIfStale(home)
+			if err != nil {
+				atomic.AddInt64(&errCount, 1)
+				return
+			}
+			if changed {
+				atomic.AddInt64(&changedCount, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt64(&errCount); got != 0 {
+		t.Errorf("%d concurrent reconciles errored", got)
+	}
+	if got := atomic.LoadInt64(&changedCount); got != 1 {
+		t.Errorf("reconciles that wrote=%d, want exactly 1 across %d concurrent starts", got, starts)
+	}
+
+	// The single winner's write must be intact and complete: our hook installed,
+	// the user's other settings preserved, and the foreign command stashed
+	// exactly once so opt-out can still restore it.
+	var settings struct {
+		Theme      string `json:"theme"`
+		StatusLine struct {
+			Command string `json:"command"`
+		} `json:"statusLine"`
+	}
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatalf("settings.json is not valid JSON after concurrent reconciles: %v\n%s", err, raw)
+	}
+	if !isOurStatusLineCommand(settings.StatusLine.Command) {
+		t.Errorf("statusLine=%q, want our hook", settings.StatusLine.Command)
+	}
+	if settings.Theme != "dark" {
+		t.Errorf("theme=%q, want the user's other settings preserved", settings.Theme)
+	}
+	// The stash must hold the USER's command, never one of ours — a lost update
+	// would have stashed our own hook and buried the vendor line for good.
+	prev := loadPrevStatusLineCommand()
+	if prev != "/opt/claude/vendor-line.sh" {
+		t.Errorf("stashed command=%q, want the foreign one exactly once", prev)
+	}
+	if isOurStatusLineCommand(prev) {
+		t.Errorf("our own hook was stashed as the previous command: %q", prev)
 	}
 }

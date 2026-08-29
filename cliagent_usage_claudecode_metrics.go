@@ -111,9 +111,21 @@ func loadMergedClaudeRateLimitBuckets(currentFingerprint string) map[string]clau
 // the current account cannot be identified: otherwise `gatherCLIAgentUsage`
 // would attribute a previous user's reset windows to the device-scoped
 // fallback entry after the local credentials were removed.
+//
+// This is the load-then-shape convenience form. The parser itself takes the
+// split path (claudeCodeMetricsFromBuckets) because it has already read the
+// cache to decide whether to spend a utilization probe.
 func claudeCodeMetricsFromCache(now time.Time, currentFingerprint string) []cliAgentUsageMetric {
-	buckets := loadMergedClaudeRateLimitBuckets(currentFingerprint)
+	return claudeCodeMetricsFromBuckets(loadMergedClaudeRateLimitBuckets(currentFingerprint), now)
+}
 
+// claudeCodeMetricsFromBuckets shapes already-loaded buckets into the metric
+// rows. Split from the loading half so a caller that has just read the cache for
+// another reason — the parser's staleness check, which must know the freshest
+// observation before deciding whether to probe — does not read it a second time.
+// Each load also re-parses Claude's settings.json to locate the pinned hook
+// cache, so the duplicate was not free.
+func claudeCodeMetricsFromBuckets(buckets map[string]claudeRateLimitBucket, now time.Time) []cliAgentUsageMetric {
 	session := observedMetricOrUnknown(
 		buckets, []string{claudeWindowFiveHour}, limitKindSession, "5-hour session window", now)
 	// Weekly is reported under seven_day; some plans split it per-model. When

@@ -404,9 +404,12 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// never renders Claude's interactive status line would report the same
 	// `latestObservedAt` forever. Spend one bounded probe when the freshest
 	// reading has aged past the staleness TTL (or when a user-initiated refresh
-	// forced it), then re-read the cache once.
-	refreshClaudeUsageIfStale(ctx, now, usage.AccountFingerprint)
-	usage.Metrics = claudeCodeMetricsFromCache(now, usage.AccountFingerprint)
+	// forced it), and re-read ONLY when it actually wrote something.
+	buckets := loadMergedClaudeRateLimitBuckets(usage.AccountFingerprint)
+	if refreshClaudeUsageIfStale(ctx, now, latestClaudeObservation(buckets)) {
+		buckets = loadMergedClaudeRateLimitBuckets(usage.AccountFingerprint)
+	}
+	usage.Metrics = claudeCodeMetricsFromBuckets(buckets, now)
 	// `claude auth status --json` is the only authoritative signal, so it decides
 	// in BOTH directions. It previously could not clear a credential-derived
 	// "expired" (`else if usage.AuthState != "expired"`), which is exactly the

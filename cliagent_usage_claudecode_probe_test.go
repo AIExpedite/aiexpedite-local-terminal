@@ -538,20 +538,9 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 		fmt.Fprintf(w, `{"five_hour":{"used_percentage":33,"resets_at":%d}}`, reset.Unix())
 	}
 
-	seed := func(t *testing.T, cache string, observed time.Time) {
-		t.Helper()
-		mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
-			claudeWindowFiveHour: {
-				UsedPercentage: 5, ResetsAtMs: reset.UnixMilli(),
-				ObservedAtMs: observed.UnixMilli(), Status: "allowed", usageKnown: true,
-			},
-		}, observed, "")
-	}
-
-	t.Run("fresh cache is not probed", func(t *testing.T) {
-		cache, calls := armClaudeUsageProbe(t, body)
-		seed(t, cache, now.Add(-time.Minute))
-		if refreshClaudeUsageIfStale(context.Background(), now, "") {
+	t.Run("fresh observation is not probed", func(t *testing.T) {
+		_, calls := armClaudeUsageProbe(t, body)
+		if refreshClaudeUsageIfStale(context.Background(), now, now.Add(-time.Minute)) {
 			t.Error("a reading a minute old must not spend a probe")
 		}
 		if got := atomic.LoadInt64(calls); got != 0 {
@@ -559,10 +548,9 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 		}
 	})
 
-	t.Run("stale cache is probed", func(t *testing.T) {
-		cache, calls := armClaudeUsageProbe(t, body)
-		seed(t, cache, now.Add(-claudeUsageProbeStaleAfter-time.Minute))
-		if !refreshClaudeUsageIfStale(context.Background(), now, "") {
+	t.Run("stale observation is probed", func(t *testing.T) {
+		_, calls := armClaudeUsageProbe(t, body)
+		if !refreshClaudeUsageIfStale(context.Background(), now, now.Add(-claudeUsageProbeStaleAfter-time.Minute)) {
 			t.Error("a reading older than the staleness TTL must be refreshed")
 		}
 		if got := atomic.LoadInt64(calls); got != 1 {
@@ -570,39 +558,60 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 		}
 	})
 
-	// Inside the minimum interval the probe would be refused anyway, so the
-	// gather must not pay for the staleness read (a cache load plus a parse of
-	// Claude's settings.json to locate the pinned hook cache) to learn that.
-	t.Run("a throttled gather skips the staleness read", func(t *testing.T) {
-		cache, calls := armClaudeUsageProbe(t, body)
-		t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
-		seed(t, cache, now.Add(-claudeUsageProbeStaleAfter-time.Minute))
-
-		if !refreshClaudeUsageIfStale(context.Background(), now, "") {
-			t.Fatal("the first stale gather should probe")
-		}
-		// Make the cache unreadable: a second staleness read would now be
-		// observable as a changed outcome, and there must not be one.
-		if err := os.Remove(cache); err != nil {
-			t.Fatal(err)
-		}
-		if refreshClaudeUsageIfStale(context.Background(), now.Add(time.Second), "") {
-			t.Error("a gather inside the minimum interval must not probe")
+	// A cache that has never held a real reading — the state a fresh install or
+	// an env-authenticated device is in — is stale by definition.
+	t.Run("never-observed cache is probed", func(t *testing.T) {
+		_, calls := armClaudeUsageProbe(t, body)
+		if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}) {
+			t.Error("a cache with no observation at all must be refreshed")
 		}
 		if got := atomic.LoadInt64(calls); got != 1 {
 			t.Errorf("request count=%d, want 1", got)
 		}
 	})
 
-	t.Run("a forced refresh probes a fresh cache", func(t *testing.T) {
-		cache, calls := armClaudeUsageProbe(t, body)
-		seed(t, cache, now.Add(-time.Minute))
+	// The minimum interval belongs to the probe's own gate, not to this helper —
+	// a stale observation on every gather must still yield one request per
+	// interval, not one per gather.
+	t.Run("repeated stale gathers collapse onto the minimum interval", func(t *testing.T) {
+		_, calls := armClaudeUsageProbe(t, body)
+		t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+		stale := now.Add(-claudeUsageProbeStaleAfter - time.Minute)
+
+		if !refreshClaudeUsageIfStale(context.Background(), now, stale) {
+			t.Fatal("the first stale gather should probe")
+		}
+		for i := 0; i < 3; i++ {
+			if refreshClaudeUsageIfStale(context.Background(), now.Add(time.Duration(i+1)*time.Second), stale) {
+				t.Errorf("gather %d inside the minimum interval must not probe", i)
+			}
+		}
+		if got := atomic.LoadInt64(calls); got != 1 {
+			t.Errorf("request count=%d, want 1", got)
+		}
+	})
+
+	t.Run("a forced refresh probes a fresh observation", func(t *testing.T) {
+		_, calls := armClaudeUsageProbe(t, body)
 		SetClaudeUsageForceProbe(true)
-		if !refreshClaudeUsageIfStale(context.Background(), now, "") {
+		if !refreshClaudeUsageIfStale(context.Background(), now, now.Add(-time.Minute)) {
 			t.Error("a user-initiated refresh must probe regardless of age")
 		}
 		if got := atomic.LoadInt64(calls); got != 1 {
 			t.Errorf("request count=%d, want 1", got)
+		}
+	})
+
+	// Every remaining gate lives in the probe's begin(); this helper must not
+	// re-derive them and must not probe when they refuse.
+	t.Run("an opted-out agent is never probed", func(t *testing.T) {
+		_, calls := armClaudeUsageProbe(t, body)
+		SetClaudeUsageProbeDisabled(true)
+		if refreshClaudeUsageIfStale(context.Background(), now, time.Time{}) {
+			t.Error("opt-out must hold even for a never-observed cache")
+		}
+		if got := atomic.LoadInt64(calls); got != 0 {
+			t.Errorf("request count=%d, want 0", got)
 		}
 	})
 }

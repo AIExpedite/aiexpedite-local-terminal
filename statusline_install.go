@@ -506,8 +506,16 @@ var claudeStatusLineReconcile struct {
 	// config; every other entry point (one-shot CLI verbs, the statusline-hook
 	// subcommand itself) therefore never rewrites Claude's settings.json as a
 	// side effect of starting a session.
-	armed     bool
-	optOut    bool
+	armed  bool
+	optOut bool
+	// running single-flights the reconcile. ClaudeNativeManager.Start runs it
+	// OUTSIDE its manager mutex (deliberately — it must not hold that lock over
+	// disk I/O) and SessionManager.StartSession runs it under a different lock
+	// entirely, so two concurrent Claude starts would otherwise both pass the
+	// throttle and both drive ensureClaudeStatusLineHook's read-modify-write of
+	// the user's settings.json at once: one write is lost, and the loser can
+	// stash the winner's in-flight statusLine as the "previous third-party" one.
+	running   bool
 	lastCheck time.Time
 	// seen is false until a reconcile has recorded a settings.json stamp; the
 	// first call therefore always verifies rather than trusting a zero value.
@@ -533,6 +541,7 @@ func resetClaudeStatusLineReconcile() {
 	claudeStatusLineReconcile.mu.Lock()
 	claudeStatusLineReconcile.armed = false
 	claudeStatusLineReconcile.optOut = false
+	claudeStatusLineReconcile.running = false
 	claudeStatusLineReconcile.lastCheck = time.Time{}
 	claudeStatusLineReconcile.seen = false
 	claudeStatusLineReconcile.mtime = time.Time{}
@@ -557,18 +566,33 @@ func resetClaudeStatusLineReconcile() {
 //
 // Best-effort: every failure is returned for logging but is never fatal to a run.
 func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
+	// Claim the slot ATOMICALLY with the gate check. Reading the throttle, then
+	// stamping it after the Stat, would let two concurrent starts both observe an
+	// un-throttled state and both proceed — which is exactly the storm the
+	// interval exists to prevent, and a concurrent write to a user file besides.
 	claudeStatusLineReconcile.mu.Lock()
-	skip := !claudeStatusLineReconcile.armed || claudeStatusLineReconcile.optOut
-	throttled := !claudeStatusLineReconcile.lastCheck.IsZero() &&
-		time.Since(claudeStatusLineReconcile.lastCheck) < claudeStatusLineRecheckInterval
+	skip := !claudeStatusLineReconcile.armed ||
+		claudeStatusLineReconcile.optOut ||
+		claudeStatusLineReconcile.running ||
+		(!claudeStatusLineReconcile.lastCheck.IsZero() &&
+			time.Since(claudeStatusLineReconcile.lastCheck) < claudeStatusLineRecheckInterval)
 	seen := claudeStatusLineReconcile.seen
 	prevMtime := claudeStatusLineReconcile.mtime
 	prevSize := claudeStatusLineReconcile.size
+	if !skip {
+		claudeStatusLineReconcile.running = true
+		claudeStatusLineReconcile.lastCheck = time.Now()
+	}
 	claudeStatusLineReconcile.mu.Unlock()
 
-	if skip || throttled {
+	if skip {
 		return false, nil
 	}
+	defer func() {
+		claudeStatusLineReconcile.mu.Lock()
+		claudeStatusLineReconcile.running = false
+		claudeStatusLineReconcile.mu.Unlock()
+	}()
 
 	base := claudeConfigDir(home)
 	if base == "" {
@@ -576,10 +600,6 @@ func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
 	}
 	settingsPath := filepath.Join(base, "settings.json")
 	st, statErr := os.Stat(settingsPath)
-
-	claudeStatusLineReconcile.mu.Lock()
-	claudeStatusLineReconcile.lastCheck = time.Now()
-	claudeStatusLineReconcile.mu.Unlock()
 
 	// An absent settings.json is still worth one ensure pass — that is the shape
 	// a fresh Claude install (or an update that reset the file) presents, and
