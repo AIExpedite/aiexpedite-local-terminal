@@ -340,6 +340,13 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// expiry. Only that notice may be withdrawn by a definite signed-in probe —
 	// a notice from any other source is not this block's to clear.
 	authNoticeApplied := false
+	// The utilization probe needs the same access token this block already
+	// decoded. Carrying it forward is not a micro-optimization: on macOS
+	// readClaudeCredentialsRaw shells out to `security` under a 3s timeout, and
+	// the providers in GatherCLIAgentUsageOnly share ONE 10s context serially —
+	// a second spawn here could push this parser past the whole budget and drop
+	// every provider ordered after it from the signed refresh.
+	oauthAccessToken := ""
 	if raw, ok := readClaudeCredentialsRaw(base); ok {
 		credentialFound = true
 		creds := claudeOAuthCredentials{}
@@ -347,6 +354,7 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 			credentialUsable = applyClaudeAuthState(usage, creds, now)
 			usage.Account = creds.claudeCredentialAccount()
 			usage.Plan = creds.ClaudeAiOauth.SubscriptionType
+			oauthAccessToken = creds.ClaudeAiOauth.AccessToken
 
 			// Auth notice for a credential that cannot renew itself. Chat-direct
 			// Claude spawns `claude --output-format stream-json` with env
@@ -406,7 +414,7 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// reading has aged past the staleness TTL (or when a user-initiated refresh
 	// forced it), and re-read ONLY when it actually wrote something.
 	buckets := loadMergedClaudeRateLimitBuckets(usage.AccountFingerprint)
-	if refreshClaudeUsageIfStale(ctx, now, latestClaudeObservation(buckets)) {
+	if refreshClaudeUsageIfStale(ctx, now, latestClaudeObservation(buckets), oauthAccessToken) {
 		buckets = loadMergedClaudeRateLimitBuckets(usage.AccountFingerprint)
 	}
 	usage.Metrics = claudeCodeMetricsFromBuckets(buckets, now)

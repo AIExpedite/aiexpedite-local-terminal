@@ -20,6 +20,10 @@ import (
 	"time"
 )
 
+// probeTestToken is the access token the credential fixture carries, so the
+// handler can assert the Authorization header the probe actually sends.
+const probeTestToken = "sk-ant-oat-test-token"
+
 // armClaudeUsageProbe isolates the probe for one test: a private cache, a
 // private Claude config dir holding a stored OAuth credential, no throttle, and
 // the endpoint pinned at the given handler. Returns the cache path and a counter
@@ -32,7 +36,7 @@ func armClaudeUsageProbe(t *testing.T, handler http.HandlerFunc) (string, *int64
 
 	configDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", configDir)
-	writeClaudeProbeCredential(t, configDir, "sk-ant-oat-test-token")
+	writeClaudeProbeCredential(t, configDir, probeTestToken)
 
 	// A non-default CLAUDE_CONFIG_DIR also keeps readClaudeCredentialsRaw off the
 	// macOS Keychain, so this test reads only the fixture it just wrote.
@@ -77,7 +81,7 @@ func TestClaudeUsageProbe_WritesFreshBuckets(t *testing.T) {
 	weekReset := now.Add(96 * time.Hour)
 
 	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer sk-ant-oat-test-token" {
+		if got := r.Header.Get("Authorization"); got != "Bearer "+probeTestToken {
 			t.Errorf("Authorization=%q, want the stored access token", got)
 		}
 		fmt.Fprint(w, probeUsageJSON(map[string]string{
@@ -540,7 +544,7 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 
 	t.Run("fresh observation is not probed", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, body)
-		if refreshClaudeUsageIfStale(context.Background(), now, now.Add(-time.Minute)) {
+		if refreshClaudeUsageIfStale(context.Background(), now, now.Add(-time.Minute), probeTestToken) {
 			t.Error("a reading a minute old must not spend a probe")
 		}
 		if got := atomic.LoadInt64(calls); got != 0 {
@@ -550,7 +554,7 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 
 	t.Run("stale observation is probed", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, body)
-		if !refreshClaudeUsageIfStale(context.Background(), now, now.Add(-claudeUsageProbeStaleAfter-time.Minute)) {
+		if !refreshClaudeUsageIfStale(context.Background(), now, now.Add(-claudeUsageProbeStaleAfter-time.Minute), probeTestToken) {
 			t.Error("a reading older than the staleness TTL must be refreshed")
 		}
 		if got := atomic.LoadInt64(calls); got != 1 {
@@ -562,7 +566,7 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 	// an env-authenticated device is in — is stale by definition.
 	t.Run("never-observed cache is probed", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, body)
-		if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}) {
+		if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken) {
 			t.Error("a cache with no observation at all must be refreshed")
 		}
 		if got := atomic.LoadInt64(calls); got != 1 {
@@ -578,11 +582,11 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 		t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
 		stale := now.Add(-claudeUsageProbeStaleAfter - time.Minute)
 
-		if !refreshClaudeUsageIfStale(context.Background(), now, stale) {
+		if !refreshClaudeUsageIfStale(context.Background(), now, stale, probeTestToken) {
 			t.Fatal("the first stale gather should probe")
 		}
 		for i := 0; i < 3; i++ {
-			if refreshClaudeUsageIfStale(context.Background(), now.Add(time.Duration(i+1)*time.Second), stale) {
+			if refreshClaudeUsageIfStale(context.Background(), now.Add(time.Duration(i+1)*time.Second), stale, probeTestToken) {
 				t.Errorf("gather %d inside the minimum interval must not probe", i)
 			}
 		}
@@ -594,7 +598,7 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 	t.Run("a forced refresh probes a fresh observation", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, body)
 		SetClaudeUsageForceProbe(true)
-		if !refreshClaudeUsageIfStale(context.Background(), now, now.Add(-time.Minute)) {
+		if !refreshClaudeUsageIfStale(context.Background(), now, now.Add(-time.Minute), probeTestToken) {
 			t.Error("a user-initiated refresh must probe regardless of age")
 		}
 		if got := atomic.LoadInt64(calls); got != 1 {
@@ -607,7 +611,7 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 	t.Run("an opted-out agent is never probed", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, body)
 		SetClaudeUsageProbeDisabled(true)
-		if refreshClaudeUsageIfStale(context.Background(), now, time.Time{}) {
+		if refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken) {
 			t.Error("opt-out must hold even for a never-observed cache")
 		}
 		if got := atomic.LoadInt64(calls); got != 0 {
@@ -674,5 +678,82 @@ func TestCLIUsageRefreshReceipt_CarriesProbeObservationWithoutProbeFields(t *tes
 		if strings.Contains(string(canonical), forbidden) {
 			t.Errorf("canonical receipt leaked %q:\n%s", forbidden, canonical)
 		}
+	}
+}
+
+// The gather path must reuse the credential the parser already decoded rather
+// than reading the credential store a second time. This is not cosmetic: on
+// macOS readClaudeCredentialsRaw shells out to `security` under a 3s timeout,
+// and GatherCLIAgentUsageOnly runs every provider SERIALLY under one shared 10s
+// context — a second spawn could push the Claude parser past the whole budget
+// and drop every provider ordered after it from the signed refresh.
+//
+// Asserted by deleting the on-disk credential first: a probe that still succeeds
+// can only have used the token it was handed.
+func TestRefreshClaudeUsageIfStale_UsesTheCallersCredential(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+
+	var seenAuth string
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		fmt.Fprintf(w, `{"five_hour":{"used_percentage":48,"resets_at":%d}}`, now.Add(time.Hour).Unix())
+	})
+	if err := os.Remove(filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, "handed-in-token") {
+		t.Fatal("the probe must run from the caller-supplied credential, with no second read")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want 1", got)
+	}
+	if seenAuth != "Bearer handed-in-token" {
+		t.Errorf("Authorization=%q, want the caller-supplied token", seenAuth)
+	}
+	if snap, ok := loadClaudeRateLimitSnapshot(cache); !ok || snap.Buckets[claudeWindowFiveHour].UsedPercentage != 48 {
+		t.Errorf("probe reading did not land: ok=%v buckets=%+v", ok, snap.Buckets)
+	}
+
+	// The env-auth guard still applies to the caller-supplied path — a token in
+	// hand must not bypass the rule that env-account usage has no card here.
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
+	if refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, "handed-in-token") {
+		t.Error("env credentials outrank the stored login even when a token was passed in")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want still 1", got)
+	}
+}
+
+// An already-cancelled gather must not burn the throttle slot: the next caller
+// would otherwise be refused for a full minute because of a probe that never
+// left the process. The shared 10s budget makes this reachable — Claude is one
+// of several providers parsed serially under it.
+func TestClaudeUsageProbe_CancelledContextDoesNotBurnTheThrottle(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"used_percentage":51,"resets_at":%d}}`, now.Add(time.Hour).Unix())
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	if refreshClaudeUsageIfStale(dead, now, time.Time{}, probeTestToken) {
+		t.Fatal("a cancelled gather must not probe")
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Fatalf("request count=%d, want 0", got)
+	}
+
+	// The slot was never claimed, so a live caller one second later still runs
+	// even though the minimum interval is a full minute.
+	if !refreshClaudeUsageIfStale(context.Background(), now.Add(time.Second), time.Time{}, probeTestToken) {
+		t.Error("the cancelled attempt must not have consumed the throttle slot")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1", got)
 	}
 }

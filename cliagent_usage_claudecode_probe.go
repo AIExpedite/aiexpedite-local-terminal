@@ -262,17 +262,17 @@ func (g *claudeUsageProbeGate) armedForProbe() bool {
 	return g.armed
 }
 
-// claudeUsageProbeAccessToken returns the stored subscription access token, or
-// "" when the probe must not run: an env credential outranks the stored /login
-// (its account has no card here, so its usage must not be merged into one), no
-// credential exists, or the credential carries no access token.
+// claudeUsageProbeAccessToken reads the stored subscription access token from
+// disk (or the macOS Keychain), or "" when there is none.
+//
+// Called only by the post-run path, which has no credential in hand. The gather
+// path passes the token it already decoded instead — on macOS this read shells
+// out to `security` under a 3s timeout, and a second spawn inside the shared 10s
+// gather budget could starve the providers ordered after Claude.
 //
 // The token is returned to a LOCAL only — never written to the cache, never
 // included in a log or error string.
 func claudeUsageProbeAccessToken() string {
-	if claudeEnvAuthActive() {
-		return ""
-	}
 	home, _ := os.UserHomeDir()
 	base := claudeConfigDir(home)
 	if base == "" {
@@ -355,15 +355,33 @@ func claudeUsageProbeURL() string {
 // input everywhere else in this file's neighbourhood, and here it is
 // deliberately never populated from the response body or the credential.
 func runClaudeUsageProbe(ctx context.Context, now time.Time) (bool, *cliAgentUsageError) {
+	return probeClaudeUsage(ctx, now, claudeUsageProbeAccessToken)
+}
+
+// probeClaudeUsage is runClaudeUsageProbe with the credential supplied by the
+// caller. resolveToken is invoked ONLY once the gate has admitted the probe, so
+// a throttled or opted-out call never touches the credential store at all.
+func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() string) (bool, *cliAgentUsageError) {
+	// An already-cancelled gather must not burn the throttle slot on a request
+	// that cannot complete: the next caller would then be refused for a minute
+	// because of a probe that never left the process.
+	if ctx.Err() != nil {
+		return false, nil
+	}
 	if !claudeUsageProbe.begin(now) {
 		return false, nil
 	}
 	defer claudeUsageProbe.end()
 
-	token := claudeUsageProbeAccessToken()
+	// An env credential outranks the stored /login, and its account has no card
+	// here — merging its usage into the stored-login card would misattribute it.
+	// Checked in ONE place so both entry points share the rule.
+	if claudeEnvAuthActive() {
+		return false, nil
+	}
+	token := resolveToken()
 	if token == "" {
-		// Not an error: an env-authenticated or signed-out device simply has
-		// nothing for this probe to read.
+		// Not an error: a signed-out device simply has nothing for this probe.
 		return false, nil
 	}
 	endpoint := claudeUsageProbeURL()
@@ -540,17 +558,19 @@ func claudeUsageProbeStatus(raw string) string {
 // A zero `latest` means nothing has ever been observed, which is stale by
 // definition.
 //
-// Takes the observation rather than the fingerprint so the caller's cache read
-// is reused; every remaining gate (armed, opt-out, offline, single-flight,
-// minimum interval) belongs to the probe's own begin() and is not restated here.
+// Takes the observation rather than the fingerprint, and the accessToken the
+// caller already decoded rather than re-reading it, so neither the cache nor the
+// credential store is touched twice per gather; every remaining gate (armed,
+// opt-out, offline, env-auth, single-flight, minimum interval) belongs to the
+// probe itself and is not restated here.
 //
 // Returns whether the cache was refreshed, so the caller knows whether it must
 // re-read before shaping the metrics.
-func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time) bool {
+func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, accessToken string) bool {
 	if !claudeUsageProbe.forced() && !latest.IsZero() && now.Sub(latest) < claudeUsageProbeStaleAfter {
 		return false
 	}
-	refreshed, probeErr := runClaudeUsageProbe(ctx, now)
+	refreshed, probeErr := probeClaudeUsage(ctx, now, func() string { return accessToken })
 	logClaudeUsageProbeFailure(probeErr)
 	return refreshed
 }
