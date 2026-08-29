@@ -71,13 +71,17 @@ const (
 	// device. Worst case is therefore ~60 requests/hour per device — a per-device
 	// call, not a fan-out, so it scales with active devices rather than runs.
 	claudeUsageProbeMinInterval = 60 * time.Second
+	// claudeUsageProbeMaxInterval caps the consecutive-failure backoff, so a
+	// persistently broken endpoint settles at ~2 requests/hour/device instead of
+	// retrying at the floor forever.
+	claudeUsageProbeMaxInterval = 30 * time.Minute
+	// claudeUsageProbeMaxFailureStreak bounds the counter so it cannot grow
+	// without limit; the backoff has already saturated well before this.
+	claudeUsageProbeMaxFailureStreak = 16
 	// claudeUsageProbeStaleAfter is how old the freshest cached reading must be
 	// before a ROUTINE gather (as opposed to a run-completion or a user-initiated
 	// refresh) is allowed to spend a probe on it.
 	claudeUsageProbeStaleAfter = 10 * time.Minute
-	// claudeUsageProbeMaxStatusLen bounds the one free-form string we read back,
-	// before it is normalized to a known value.
-	claudeUsageProbeMaxStatusLen = 64
 )
 
 // claudeUsageProbeWindow is the ONLY shape decoded from the response. Every
@@ -164,6 +168,9 @@ type claudeUsageProbeGate struct {
 	lastAttempt time.Time
 	force       bool
 	armed       bool
+	// failures counts CONSECUTIVE failed probes and drives the backoff in
+	// interval(). Cleared by any success or early skip.
+	failures int
 }
 
 var claudeUsageProbe claudeUsageProbeGate
@@ -197,6 +204,7 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.lastAttempt = time.Time{}
 	claudeUsageProbe.force = false
 	claudeUsageProbe.armed = false
+	claudeUsageProbe.failures = 0
 	claudeUsageProbe.mu.Unlock()
 	claudeUsageProbeLog.mu.Lock()
 	claudeUsageProbeLog.category = ""
@@ -230,7 +238,7 @@ func (g *claudeUsageProbeGate) begin(now time.Time) bool {
 	if IsOffline() {
 		return false
 	}
-	if !g.force && !g.lastAttempt.IsZero() && now.Sub(g.lastAttempt) < claudeUsageProbeMinIntervalValue() {
+	if !g.force && !g.lastAttempt.IsZero() && now.Sub(g.lastAttempt) < g.interval() {
 		return false
 	}
 	g.force = false
@@ -239,9 +247,49 @@ func (g *claudeUsageProbeGate) begin(now time.Time) bool {
 	return true
 }
 
-func (g *claudeUsageProbeGate) end() {
+// interval is the effective floor between attempts: the minimum, doubled per
+// consecutive failure, capped at claudeUsageProbeMaxInterval. Caller holds g.mu.
+//
+// Why a backoff rather than the flat minimum: a TRANSIENT failure (a minute
+// offline, a 500) clears on the next attempt, but a PERSISTENT one does not —
+// and the persistent case is reachable. A cache that never receives a reading
+// never produces an observation, so the staleness check reports stale on EVERY
+// gather; if the endpoint's shape ever drifts away from the allow-list decode,
+// that pairing is an un-self-healing ~60 request/hour/device loop for as long as
+// the drift lasts. Backing off settles it at ~2/hour while still retrying the
+// first failure promptly, and a user-initiated refresh bypasses it entirely.
+func (g *claudeUsageProbeGate) interval() time.Duration {
+	base := claudeUsageProbeMinIntervalValue()
+	backoff := base
+	// Doubling starts on the SECOND consecutive failure, so a single transient
+	// blip — one 500, a moment of packet loss — is retried at the flat minimum.
+	// Only a failure that repeats is treated as persistent.
+	for i := 1; i < g.failures && backoff < claudeUsageProbeMaxInterval; i++ {
+		backoff *= 2
+	}
+	if backoff > claudeUsageProbeMaxInterval {
+		backoff = claudeUsageProbeMaxInterval
+	}
+	if backoff < base {
+		// A base pinned above the cap (or zeroed in tests) must never yield an
+		// interval SHORTER than the one the operator asked for.
+		backoff = base
+	}
+	return backoff
+}
+
+// finish releases the single-flight slot and records the outcome. A probe that
+// refreshed the cache — or that skipped before issuing a request — clears the
+// failure streak; only a real failure extends the backoff.
+func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError) {
 	g.mu.Lock()
 	g.inFlight = false
+	switch {
+	case probeErr == nil:
+		g.failures = 0
+	case g.failures < claudeUsageProbeMaxFailureStreak:
+		g.failures++
+	}
 	g.mu.Unlock()
 }
 
@@ -361,7 +409,7 @@ func runClaudeUsageProbe(ctx context.Context, now time.Time) (bool, *cliAgentUsa
 // probeClaudeUsage is runClaudeUsageProbe with the credential supplied by the
 // caller. resolveToken is invoked ONLY once the gate has admitted the probe, so
 // a throttled or opted-out call never touches the credential store at all.
-func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() string) (bool, *cliAgentUsageError) {
+func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() string) (refreshed bool, probeErr *cliAgentUsageError) {
 	// An already-cancelled gather must not burn the throttle slot on a request
 	// that cannot complete: the next caller would then be refused for a minute
 	// because of a probe that never left the process.
@@ -371,7 +419,9 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 	if !claudeUsageProbe.begin(now) {
 		return false, nil
 	}
-	defer claudeUsageProbe.end()
+	// Named returns so the deferred finish records whatever this call returned:
+	// a failure extends the backoff, a success or an early skip clears it.
+	defer func() { claudeUsageProbe.finish(probeErr) }()
 
 	// An env credential outranks the stored /login, and its account has no card
 	// here — merging its usage into the stored-login card would misattribute it.
@@ -386,20 +436,14 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 	}
 	endpoint := claudeUsageProbeURL()
 	if endpoint == "" {
-		return false, &cliAgentUsageError{
-			Provider:      claudeCodeUsageParser{}.Provider(),
-			ErrorCategory: cliUsageErrorProviderUnavailable,
-		}
+		return false, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, claudeUsageProbeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return false, &cliAgentUsageError{
-			Provider:      claudeCodeUsageParser{}.Provider(),
-			ErrorCategory: cliUsageErrorInternal,
-		}
+		return false, claudeUsageProbeFailure(cliUsageErrorInternal)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/json")
@@ -418,10 +462,7 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 		if reqCtx.Err() != nil {
 			category = cliUsageErrorProviderTimeout
 		}
-		return false, &cliAgentUsageError{
-			Provider:      claudeCodeUsageParser{}.Provider(),
-			ErrorCategory: category,
-		}
+		return false, claudeUsageProbeFailure(category)
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, claudeUsageProbeMaxBody))
@@ -429,16 +470,10 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 	}()
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return false, &cliAgentUsageError{
-			Provider:      claudeCodeUsageParser{}.Provider(),
-			ErrorCategory: cliUsageErrorNotAuthenticated,
-		}
+		return false, claudeUsageProbeFailure(cliUsageErrorNotAuthenticated)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return false, &cliAgentUsageError{
-			Provider:      claudeCodeUsageParser{}.Provider(),
-			ErrorCategory: cliUsageErrorProviderUnavailable,
-		}
+		return false, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 
 	// Read at most the cap + 1 byte so an oversized body is DETECTED rather than
@@ -446,18 +481,12 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 	// be treated as a partial observation.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, claudeUsageProbeMaxBody+1))
 	if err != nil || len(body) > claudeUsageProbeMaxBody {
-		return false, &cliAgentUsageError{
-			Provider:      claudeCodeUsageParser{}.Provider(),
-			ErrorCategory: cliUsageErrorProviderUnavailable,
-		}
+		return false, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 
 	var decoded claudeUsageProbeResponse
 	if json.Unmarshal(body, &decoded) != nil {
-		return false, &cliAgentUsageError{
-			Provider:      claudeCodeUsageParser{}.Provider(),
-			ErrorCategory: cliUsageErrorParseFailed,
-		}
+		return false, claudeUsageProbeFailure(cliUsageErrorParseFailed)
 	}
 
 	updates := claudeUsageProbeBuckets(decoded, now)
@@ -465,10 +494,7 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 		// A response we cannot plot is not an observation. Returning here leaves
 		// the cache byte-identical rather than stamping a fresh ObservedAt on
 		// nothing.
-		return false, &cliAgentUsageError{
-			Provider:      claudeCodeUsageParser{}.Provider(),
-			ErrorCategory: cliUsageErrorParseFailed,
-		}
+		return false, claudeUsageProbeFailure(cliUsageErrorParseFailed)
 	}
 	mergeClaudeRateLimitCacheFromSource(claudeRateLimitCachePath(), updates, now,
 		currentClaudeAccountFingerprint(), claudeRateLimitSourceProbe)
@@ -537,10 +563,13 @@ func claudeUsageProbeBucket(w claudeUsageProbeWindow, nowMs int64) (claudeRateLi
 	return bucket, true
 }
 
-// claudeUsageProbeStatus bounds and normalizes the one free-form string we read.
-// Only the documented "rejected" value survives; any other non-empty value —
-// including server prose long enough to be a payload of its own — collapses to
-// "allowed", so vendor text can never reach the cache or the signed receipt.
+// claudeUsageProbeStatus normalizes the one free-form string we read into a
+// CLOSED set: "", "rejected", or "allowed". The input is never returned, so
+// server prose — however long — cannot reach the cache or the signed receipt no
+// matter what the endpoint sends. That closed output set is the whole guarantee;
+// an input length cap would add nothing (an earlier one here was inert, and
+// invited the reader to believe a truncated, possibly rune-split value could be
+// persisted).
 //
 // An ABSENT status stays empty rather than becoming "allowed": bucketFromInfo
 // leaves it empty for a stream event that omits it, and inventing a value the
@@ -550,9 +579,6 @@ func claudeUsageProbeStatus(raw string) string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return ""
-	}
-	if len(trimmed) > claudeUsageProbeMaxStatusLen {
-		trimmed = trimmed[:claudeUsageProbeMaxStatusLen]
 	}
 	if strings.EqualFold(trimmed, claudeRateLimitStatusRejected) {
 		return claudeRateLimitStatusRejected
@@ -602,6 +628,17 @@ func triggerClaudeUsageProbeAfterRun() {
 		_, probeErr := runClaudeUsageProbe(ctx, time.Now())
 		logClaudeUsageProbeFailure(probeErr)
 	}()
+}
+
+// claudeUsageProbeFailure builds the redacted failure record. The category is
+// the ONLY thing that escapes: never the response body, the endpoint, or the
+// credential. Every failure path in this file goes through here so no future
+// branch can start attaching a message.
+func claudeUsageProbeFailure(category string) *cliAgentUsageError {
+	return &cliAgentUsageError{
+		Provider:      claudeCodeUsageParser{}.Provider(),
+		ErrorCategory: category,
+	}
 }
 
 // claudeUsageProbeLog throttles the failure notice. A persistently unreachable

@@ -809,7 +809,8 @@ func TestClaudeUsageProbeStatus_Normalization(t *testing.T) {
 		{"REJECTED", claudeRateLimitStatusRejected},
 		{"  rejected  ", claudeRateLimitStatusRejected},
 		{"allowed, but here is a long free-form vendor explanation nobody asked for", "allowed"},
-		{strings.Repeat("x", claudeUsageProbeMaxStatusLen*4), "allowed"},
+		{strings.Repeat("x", 4096), "allowed"},
+		{"réjeté — accentué, multi-byte, and long enough to have been truncated mid-rune", "allowed"},
 	}
 	for _, tc := range cases {
 		if got := claudeUsageProbeStatus(tc.in); got != tc.want {
@@ -841,4 +842,138 @@ func TestClaudeUsageProbe_AbsentStatusIsNotPersisted(t *testing.T) {
 	if got := snap.Buckets[claudeWindowFiveHour]; got.Status != "" || got.UsedPercentage != 37 {
 		t.Errorf("bucket=%+v, want the reading with an empty status", got)
 	}
+}
+
+// A PERSISTENT failure must back off. A transient one clears on the next
+// attempt, but a persistent one does not — and it is reachable: a cache that
+// never receives a reading never produces an observation, so the staleness check
+// reports stale on EVERY gather. Paired with a flat minimum interval, an
+// endpoint whose shape drifted away from the allow-list decode would be retried
+// ~60 times/hour/device forever. The doubling settles that at the cap.
+func TestClaudeUsageProbe_PersistentFailureBacksOff(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		// The un-self-healing shape: a 200 whose body the allow-list cannot plot.
+		fmt.Fprint(w, `{"unknown_window":{"utilization":0.5}}`)
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "1000") // 1s base
+
+	// First failure: retried after the flat minimum.
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now); probeErr == nil {
+		t.Fatal("an unplottable body must be reported as a failure")
+	}
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(1500*time.Millisecond)); probeErr == nil {
+		t.Fatal("the first retry should still happen at the flat minimum")
+	}
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Fatalf("request count=%d, want 2", got)
+	}
+
+	// Two failures in: the interval has doubled, so the same 1.5s gap is refused.
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(3*time.Second)); probeErr != nil {
+		t.Errorf("probe inside the backed-off interval should be a silent skip, got %+v", probeErr)
+	}
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Errorf("request count=%d, want still 2 — the backoff must hold", got)
+	}
+
+	// Past the doubled interval it retries again.
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(6*time.Second)); probeErr == nil {
+		t.Error("the probe must still retry once the backed-off interval elapses")
+	}
+	if got := atomic.LoadInt64(calls); got != 3 {
+		t.Errorf("request count=%d, want 3", got)
+	}
+}
+
+// A user-initiated refresh must cut through the backoff — the whole point of the
+// force flag is that someone is watching the card right now.
+func TestClaudeUsageProbe_ForceBypassesTheBackoff(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	for i := 0; i < 3; i++ {
+		SetClaudeUsageForceProbe(true)
+		if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(time.Duration(i)*time.Second)); probeErr == nil {
+			t.Fatalf("probe %d should have failed", i)
+		}
+	}
+	if got := atomic.LoadInt64(calls); got != 3 {
+		t.Errorf("request count=%d, want 3 — a forced refresh must bypass the backoff", got)
+	}
+}
+
+// A success clears the streak, so one bad stretch cannot leave a healthy agent
+// throttled at the cap.
+func TestClaudeUsageProbe_SuccessClearsTheBackoff(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	var healthy atomic.Bool
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		if !healthy.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, `{"five_hour":{"used_percentage":22,"resets_at":%d}}`, now.Add(time.Hour).Unix())
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "1000")
+
+	// Two failures, so the interval is now 4s.
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now); probeErr == nil {
+		t.Fatal("expected the first failure")
+	}
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(2*time.Second)); probeErr == nil {
+		t.Fatal("expected the second failure")
+	}
+
+	healthy.Store(true)
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now.Add(10*time.Second)); !refreshed || probeErr != nil {
+		t.Fatalf("recovery probe: refreshed=%v err=%+v", refreshed, probeErr)
+	}
+	if got := atomic.LoadInt64(calls); got != 3 {
+		t.Fatalf("request count=%d, want 3", got)
+	}
+
+	// Streak cleared: the flat 1s minimum applies again, not the backed-off one.
+	if refreshed, _ := runClaudeUsageProbe(context.Background(), now.Add(12*time.Second)); !refreshed {
+		t.Error("a success must clear the failure streak and restore the flat minimum")
+	}
+	if got := atomic.LoadInt64(calls); got != 4 {
+		t.Errorf("request count=%d, want 4", got)
+	}
+}
+
+// The backoff is bounded, and never shorter than the operator's configured
+// minimum even when that minimum exceeds the cap.
+func TestClaudeUsageProbeGate_IntervalBounds(t *testing.T) {
+	t.Run("saturates at the cap", func(t *testing.T) {
+		g := &claudeUsageProbeGate{failures: claudeUsageProbeMaxFailureStreak}
+		if got := g.interval(); got != claudeUsageProbeMaxInterval {
+			t.Errorf("interval=%v, want the %v cap", got, claudeUsageProbeMaxInterval)
+		}
+	})
+	t.Run("no failures means the flat minimum", func(t *testing.T) {
+		g := &claudeUsageProbeGate{}
+		if got := g.interval(); got != claudeUsageProbeMinInterval {
+			t.Errorf("interval=%v, want %v", got, claudeUsageProbeMinInterval)
+		}
+	})
+	t.Run("a configured minimum above the cap is never shortened", func(t *testing.T) {
+		t.Setenv(claudeUsageProbeMinIntervalEnv, "7200000") // 2h, above the 30m cap
+		g := &claudeUsageProbeGate{failures: 8}
+		if got := g.interval(); got != 2*time.Hour {
+			t.Errorf("interval=%v, want the operator's 2h — the cap must not shorten it", got)
+		}
+	})
+	t.Run("streak counter is bounded", func(t *testing.T) {
+		g := &claudeUsageProbeGate{}
+		for i := 0; i < claudeUsageProbeMaxFailureStreak*4; i++ {
+			g.finish(claudeUsageProbeFailure(cliUsageErrorParseFailed))
+		}
+		if g.failures > claudeUsageProbeMaxFailureStreak {
+			t.Errorf("failures=%d, want it capped at %d", g.failures, claudeUsageProbeMaxFailureStreak)
+		}
+	})
 }
