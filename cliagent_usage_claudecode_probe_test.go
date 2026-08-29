@@ -1764,7 +1764,7 @@ func TestRefreshClaudeUsageIfStale_PaysAnOutstandingPostRunDebt(t *testing.T) {
 
 	// Record a debt for a run that finished after that reading.
 	runCompleted := now
-	claudeUsageProbe.oweObservation(runCompleted)
+	claudeUsageProbe.recordOwed(runCompleted)
 
 	if !refreshClaudeUsageIfStale(context.Background(), now.Add(time.Second),
 		latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")), probeTestToken, "") {
@@ -1820,4 +1820,178 @@ func waitForObservationAfter(t *testing.T, baseline time.Time, within time.Durat
 		time.Sleep(25 * time.Millisecond)
 	}
 	t.Fatalf("%s (baseline %s)", msg, baseline.UTC().Format(time.RFC3339Nano))
+}
+
+/* -------------------------------------------------------------------------- */
+/* Debt survives failure; timer slot is never leaked; one credential read      */
+/* -------------------------------------------------------------------------- */
+
+// countClaudeCredentialReads forces the Keychain path and counts reads of the
+// credential store, returning the counter. On a default macOS config each read
+// spawns `security` under a 3s timeout, inside a 10s budget shared serially by
+// every provider — so the count is a real cost, not bookkeeping.
+func countClaudeCredentialReads(t *testing.T) *int64 {
+	t.Helper()
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	var reads int64
+	original := claudeKeychainReader
+	claudeKeychainReader = func() ([]byte, bool) {
+		atomic.AddInt64(&reads, 1)
+		return []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q}}`, probeTestToken)), true
+	}
+	t.Cleanup(func() { claudeKeychainReader = original })
+	return &reads
+}
+
+// The post-run wrapper must not resolve credentials during per-run preflight.
+// A burst that coalesces its HTTP requests but still pays a Keychain spawn per
+// run has only moved the cost.
+func TestClaudeUsageProbeAfterRun_ReadsCredentialsOncePerActualProbe(t *testing.T) {
+	base := time.Now()
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":39,"resets_at":%d}]}`,
+			base.Add(time.Hour).Unix())
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "500")
+	reads := countClaudeCredentialReads(t)
+
+	// One run probes immediately; nine more land inside the throttle window and
+	// must coalesce onto a single trailing probe.
+	var last time.Time
+	for i := 0; i < 10; i++ {
+		last = time.Now()
+		claudeUsageProbeAfterRunAsyncForTest(last)
+		time.Sleep(3 * time.Millisecond)
+	}
+	waitForObservationAfter(t, last, 8*time.Second, "the coalesced trailing probe never landed")
+
+	if got := atomic.LoadInt64(calls); got > 2 {
+		t.Errorf("request count=%d, want <= 2 (immediate + one trailing)", got)
+	}
+	// One read per probe that actually happened — never one per run.
+	if got := atomic.LoadInt64(reads); got > 2 {
+		t.Errorf("credential store read %d times across 10 runs, want <= 2 — the per-run "+
+			"preflight must not resolve credentials", got)
+	}
+}
+
+// A debt must be recorded BEFORE the attempt, so a probe that is refused
+// (offline) or that fails (network/decode/cache) still leaves the run's refresh
+// owed. Otherwise a recent pre-run reading suppresses routine recovery for the
+// whole staleness TTL.
+func TestClaudeUsageProbeAfterRun_DebtSurvivesRefusalAndFailure(t *testing.T) {
+	now := time.Now()
+
+	t.Run("offline refusal keeps the debt", func(t *testing.T) {
+		_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, `{"limits":[{"kind":"session","percent":10}]}`)
+		})
+		SetOffline(true)
+		t.Cleanup(func() { SetOffline(false) })
+
+		completed := time.Now()
+		claudeUsageProbeAfterRun(completed)
+		if got := atomic.LoadInt64(calls); got != 0 {
+			t.Fatalf("request count=%d, want 0 while offline", got)
+		}
+		owed := claudeUsageProbe.owedObservation()
+		if owed.IsZero() || owed.Before(completed) {
+			t.Errorf("owed=%v, want the run completion retained across an offline refusal", owed)
+		}
+	})
+
+	t.Run("transient failure keeps the debt, and a later gather pays it", func(t *testing.T) {
+		var healthy atomic.Bool
+		cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+			if !healthy.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":66,"resets_at":%d}]}`,
+				now.Add(time.Hour).Unix())
+		})
+		t.Setenv(claudeUsageProbeMinIntervalEnv, "0")
+
+		// A fresh pre-run reading: an unaware gather would trust it for 10 minutes.
+		preRun := time.Now().Add(-time.Second)
+		mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {
+				UsedPercentage: 30, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+				ObservedAtMs: preRun.UnixMilli(), usageKnown: true,
+			},
+		}, preRun, "", claudeRateLimitSourceProbe)
+
+		completed := time.Now()
+		claudeUsageProbeAfterRun(completed) // 500s, fails
+		if got := atomic.LoadInt64(calls); got == 0 {
+			t.Fatal("expected the post-run probe to be attempted")
+		}
+		if owed := claudeUsageProbe.owedObservation(); owed.IsZero() {
+			t.Fatal("a failed probe must leave the debt standing")
+		}
+
+		// The endpoint recovers; the next routine gather must pay the debt rather
+		// than trusting the recent pre-run reading.
+		healthy.Store(true)
+		latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets(""))
+		if !refreshClaudeUsageIfStale(context.Background(), time.Now(), latest, probeTestToken, "") {
+			t.Fatal("the gather must pay the outstanding debt despite a recent pre-run reading")
+		}
+		if got := latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")); !got.After(completed) {
+			t.Errorf("observation %v did not advance past the run %v", got, completed)
+		}
+		if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+			t.Errorf("debt %v still outstanding after a successful probe", owed)
+		}
+	})
+}
+
+// A long-wait debt records without reserving the timer. Reserving a slot that no
+// timer will ever release would permanently disable trailing probes: every later
+// run would see the slot held and decline to schedule.
+func TestClaudeUsageProbeAfterRun_LongWaitDoesNotLeakTheTimerSlot(t *testing.T) {
+	base := time.Now()
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":48,"resets_at":%d}]}`,
+			base.Add(time.Hour).Unix())
+	})
+
+	// An interval far beyond the trailing-wait cap, so the debt is recorded but
+	// no timer is created.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "3600000") // 1h
+	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
+		t.Fatal("precondition: the first probe should run")
+	}
+	claudeUsageProbeAfterRun(time.Now()) // wait ~1h > cap: record only
+
+	if claudeUsageProbe.trailingScheduled {
+		t.Error("the long-wait path must not reserve a timer slot it will never release")
+	}
+
+	// A gather pays the long-wait debt.
+	SetClaudeUsageForceProbe(true)
+	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
+		t.Fatal("a forced gather should pay the long-wait debt")
+	}
+
+	// Now a normal throttled run must still be able to schedule a trailing probe.
+	// With the slot leaked, this never fires.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "400")
+	last := time.Now()
+	claudeUsageProbeAfterRunAsyncForTest(last)
+	waitForObservationAfter(t, last, 8*time.Second,
+		"no trailing probe was scheduled after a long-wait debt — the timer slot leaked")
+	if got := atomic.LoadInt64(calls); got > 4 {
+		t.Errorf("request count=%d, want a small bounded number", got)
+	}
+}
+
+// claudeUsageProbeAfterRunAsyncForTest mirrors what triggerClaudeUsageProbeAfterRun
+// does in production — run the post-run path on its own goroutine — without the
+// armed-gate precheck the tests set up explicitly.
+func claudeUsageProbeAfterRunAsyncForTest(completedAt time.Time) {
+	go func() {
+		defer func() { _ = recover() }()
+		claudeUsageProbeAfterRun(completedAt)
+	}()
 }
