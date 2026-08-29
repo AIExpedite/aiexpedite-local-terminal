@@ -977,3 +977,90 @@ func TestClaudeUsageProbeGate_IntervalBounds(t *testing.T) {
 		}
 	})
 }
+
+// resetClaudeUsageProbeGate must not return while a probe is still in flight.
+//
+// This is what keeps `go test` off the network. triggerClaudeUsageProbeAfterRun
+// runs the probe on a goroutine, and probeClaudeUsage resolves the endpoint
+// AFTER claiming the gate — so a goroutine descheduled between those two points
+// outlives its test, resumes once t.Setenv has restored
+// AIEXPEDITE_CLAUDE_USAGE_PROBE_URL, resolves the REAL endpoint, and sends the
+// fixture token to api.anthropic.com. Draining in the reset seam closes that
+// window, because cleanup runs it before the env restore.
+func TestResetClaudeUsageProbeGate_DrainsInFlightProbe(t *testing.T) {
+	release := make(chan struct{})
+	served := make(chan struct{})
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		close(served)
+		<-release
+		fmt.Fprint(w, `{"five_hour":{"used_percentage":9,"resets_at":0}}`)
+	})
+	// Release the handler however this test exits. Without it a t.Fatal below
+	// leaves the handler blocked, httptest's Close waits for it, and the FAILURE
+	// path hangs instead of reporting — a hanging test in CI is worse than a
+	// failing one. Registered after armClaudeUsageProbe so t.Cleanup's LIFO order
+	// runs this before that helper's srv.Close.
+	var releaseOnce sync.Once
+	releaseHandler := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseHandler)
+
+	go func() {
+		_, _ = runClaudeUsageProbe(context.Background(), time.Now())
+	}()
+
+	// Wait until the probe is genuinely mid-request, which is exactly the state
+	// the drain has to cover.
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("probe never reached the handler")
+	}
+
+	resetReturned := make(chan struct{})
+	go func() {
+		resetClaudeUsageProbeGate()
+		close(resetReturned)
+	}()
+
+	select {
+	case <-resetReturned:
+		t.Fatal("resetClaudeUsageProbeGate returned while a probe was still in flight — " +
+			"an escaping goroutine would resolve the real endpoint after cleanup restores the env")
+	case <-time.After(150 * time.Millisecond):
+		// Still blocked, as required.
+	}
+
+	releaseHandler()
+	select {
+	case <-resetReturned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("resetClaudeUsageProbeGate did not return after the probe finished")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1", got)
+	}
+}
+
+// The drain must be bounded: a probe that never releases the latch cannot be
+// allowed to hang the whole suite in a cleanup.
+func TestResetClaudeUsageProbeGate_DrainIsBounded(t *testing.T) {
+	claudeUsageProbe.mu.Lock()
+	claudeUsageProbe.inFlight = true
+	claudeUsageProbe.mu.Unlock()
+	t.Cleanup(func() {
+		claudeUsageProbe.mu.Lock()
+		claudeUsageProbe.inFlight = false
+		claudeUsageProbe.mu.Unlock()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		resetClaudeUsageProbeGate()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("resetClaudeUsageProbeGate never gave up on a wedged probe")
+	}
+}

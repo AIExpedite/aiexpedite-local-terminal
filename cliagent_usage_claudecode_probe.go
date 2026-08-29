@@ -209,9 +209,31 @@ func SetClaudeUsageProbeDisabled(disabled bool) {
 	claudeUsageProbe.mu.Unlock()
 }
 
-// resetClaudeUsageProbeGate clears the throttle/latch. Test-only seam, mirroring
-// resetOpenCodeReadinessCache.
+// resetClaudeUsageProbeGate drains any in-flight probe, then clears the
+// throttle/latch. Test-only seam, mirroring resetOpenCodeReadinessCache.
+//
+// The drain is load-bearing, not tidiness. triggerClaudeUsageProbeAfterRun runs
+// the probe on a goroutine, and probeClaudeUsage resolves the endpoint AFTER
+// claiming the gate. A goroutine descheduled between those two points outlives
+// its test: cleanup disarms the gate and t.Setenv restores
+// AIEXPEDITE_CLAUDE_USAGE_PROBE_URL, and the goroutine then resumes and resolves
+// the REAL endpoint — sending the fixture token to api.anthropic.com from `go
+// test`. Cleanup order already puts this before the env restore (t.Cleanup is
+// LIFO and the t.Setenv calls register first), so waiting here closes the window.
+//
+// Bounded so a wedged probe cannot hang the suite; the probe's own 3s timeout
+// means a live one drains far inside this.
 func resetClaudeUsageProbeGate() {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		claudeUsageProbe.mu.Lock()
+		inFlight := claudeUsageProbe.inFlight
+		claudeUsageProbe.mu.Unlock()
+		if !inFlight {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	claudeUsageProbe.mu.Lock()
 	claudeUsageProbe.inFlight = false
 	claudeUsageProbe.lastAttempt = time.Time{}
