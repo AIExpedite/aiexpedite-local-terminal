@@ -1397,3 +1397,65 @@ func TestManagedClaudeSession_KilledRunStillProbesOnSessionEnd(t *testing.T) {
 
 	waitForClaudeObservationAfter(t, cache, seeded)
 }
+
+// Acceptance criterion against the shared-cache dedupe, on the DIRECT path.
+// A status-line render moments before the run leaves a recent observation in the
+// cache; an interval-based dedupe would swallow the post-run probe and
+// latestObservedAt would not advance — the reported defect, reintroduced by the
+// deduplication rather than by the heartbeat rule.
+func TestClaudeNativeLifecycle_RecentPreRunObservationStillAdvances(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":81,"resets_at":%d}]}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	// A fresh pre-run reading, well inside the 60s interval.
+	preRun := time.Now().Add(-3 * time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ResetsAtMs: time.Now().Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: preRun.UnixMilli(), usageKnown: true,
+		},
+	}, preRun, "", claudeRateLimitSourceStatusLine)
+
+	tmpDir := installMockClaude(t, "claude-heartbeat-result")
+	m := NewClaudeNativeManager(nil)
+	id := fmt.Sprintf("claude-prerun-%d", time.Now().UnixNano())
+	if err := m.Start(id, tmpDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.End(id) })
+
+	waitForClaudeObservationAfter(t, cache, preRun)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want 1 — a pre-run reading must not suppress the post-run probe", got)
+	}
+}
+
+// Same criterion on the MANAGED path.
+func TestManagedClaudeSession_RecentPreRunObservationStillAdvances(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":55,"resets_at":%d}]}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	preRun := time.Now().Add(-3 * time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ResetsAtMs: time.Now().Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: preRun.UnixMilli(), usageKnown: true,
+		},
+	}, preRun, "", claudeRateLimitSourceStatusLine)
+
+	sm, id := startManagedClaudeSession(t, "claude-heartbeat-result")
+	t.Cleanup(func() { _ = sm.EndSession(id) })
+
+	waitForClaudeObservationAfter(t, cache, preRun)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want 1", got)
+	}
+}

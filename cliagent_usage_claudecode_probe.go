@@ -169,15 +169,72 @@ type claudeUsageProbeResponse struct {
 // Percent is the reading under this shape; utilization / used_percentage are
 // accepted too because this service has used all three names for the same
 // 0..100 number across revisions, and taking whichever is present costs nothing.
+//
+// `kind` is the discriminator the service actually sends; `type` is kept as an
+// alias so an older or rolled-back revision still decodes. The scope is an
+// OBJECT (`{"scope":{"model":{"display_name":"Fable"}}}`), which is why it uses
+// the tolerant claudeUsageProbeLabel below rather than a plain string: a string
+// field facing an object makes encoding/json reject the WHOLE response, so one
+// mis-modelled field would take every window down with it — the probe would
+// report parse_failed forever and the card would stay exactly as stale as the
+// defect this file exists to fix.
 type claudeUsageProbeLimit struct {
-	Type           string             `json:"type"`
-	Model          string             `json:"model"`
-	Scope          string             `json:"scope"`
-	Percent        *float64           `json:"percent"`
-	Utilization    *float64           `json:"utilization"`
-	UsedPercentage *float64           `json:"used_percentage"`
-	ResetsAt       claudeUsageProbeTs `json:"resets_at"`
-	Status         string             `json:"status"`
+	Kind           string                `json:"kind"`
+	Type           string                `json:"type"`
+	Model          claudeUsageProbeLabel `json:"model"`
+	Scope          claudeUsageProbeLabel `json:"scope"`
+	Percent        *float64              `json:"percent"`
+	Utilization    *float64              `json:"utilization"`
+	UsedPercentage *float64              `json:"used_percentage"`
+	ResetsAt       claudeUsageProbeTs    `json:"resets_at"`
+	Status         string                `json:"status"`
+}
+
+// claudeUsageProbeLabel flattens a field that names a model to a single string,
+// accepting every shape this payload has used: a bare string, an object with a
+// display name, or an object nesting the model
+// (`{"model":{"display_name":"Fable"}}`).
+//
+// It NEVER returns an error. A field we cannot interpret must degrade to "no
+// label" — dropping one entry — instead of failing the enclosing Unmarshal and
+// discarding every window in the response. Guessing wrong about a shape should
+// cost one row, not the whole feature.
+type claudeUsageProbeLabel struct {
+	Label string
+}
+
+func (l *claudeUsageProbeLabel) UnmarshalJSON(b []byte) error {
+	trimmed := strings.TrimSpace(string(b))
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	if trimmed[0] == '"' {
+		var str string
+		if json.Unmarshal(b, &str) == nil {
+			l.Label = str
+		}
+		return nil
+	}
+	if trimmed[0] != '{' {
+		return nil
+	}
+	var obj struct {
+		Model       json.RawMessage `json:"model"`
+		DisplayName string          `json:"display_name"`
+		Name        string          `json:"name"`
+		ID          string          `json:"id"`
+	}
+	if json.Unmarshal(b, &obj) != nil {
+		return nil
+	}
+	nested := ""
+	if len(obj.Model) > 0 {
+		var inner claudeUsageProbeLabel
+		_ = inner.UnmarshalJSON(obj.Model)
+		nested = inner.Label
+	}
+	l.Label = firstNonEmpty(nested, obj.DisplayName, obj.Name, obj.ID)
+	return nil
 }
 
 // window converts a limits[] entry into the window-shaped value the rest of the
@@ -202,13 +259,13 @@ func (l claudeUsageProbeLimit) window() claudeUsageProbeWindow {
 // for, is dropped: surfacing it would either invent a row or file one model
 // usage under a different model meter.
 func (l claudeUsageProbeLimit) cacheWindow() string {
-	switch strings.ToLower(strings.TrimSpace(l.Type)) {
+	switch strings.ToLower(strings.TrimSpace(firstNonEmpty(l.Kind, l.Type))) {
 	case "session":
 		return claudeWindowFiveHour
 	case "weekly_all":
 		return claudeWindowSevenDay
 	case "weekly_scoped":
-		scope := strings.ToLower(strings.TrimSpace(firstNonEmpty(l.Model, l.Scope)))
+		scope := strings.ToLower(strings.TrimSpace(firstNonEmpty(l.Scope.Label, l.Model.Label)))
 		switch {
 		case strings.Contains(scope, "opus"):
 			return claudeWindowSevenDayOpus
@@ -484,57 +541,80 @@ func (g *claudeUsageProbeGate) armedForProbe() bool {
 	return g.armed
 }
 
-// claudeUsageProbeRecentlyObserved reports whether the SHARED cache already
-// holds an observation newer than the current probe interval — i.e. whether some
-// other writer on this machine (a second agent channel, an overlapping restart,
-// the status-line hook) has already refreshed the account within the window this
-// probe would otherwise ask about again.
+// claudeUsageProbeObservedSince reports whether the SHARED cache already holds a
+// numeric observation strictly newer than `baseline` — i.e. whether some other
+// writer on this machine (a second agent channel, an overlapping restart, the
+// status-line hook) has already answered the question this probe is about to ask.
 //
-// This is what makes the request bound roughly per-DEVICE rather than merely
-// per-process. It cannot be exact — two processes can still race between the
-// check and the write — but it collapses the steady-state duplication, which is
-// what actually matters for an account-scoped endpoint shared with Claude own
-// pollers.
-func claudeUsageProbeRecentlyObserved(now time.Time) bool {
-	claudeUsageProbe.mu.Lock()
-	window := claudeUsageProbe.interval()
-	claudeUsageProbe.mu.Unlock()
-	if window <= 0 {
+// The BASELINE is the whole design, and getting it wrong breaks the feature.
+// Suppressing on "any observation younger than the interval" would mean a
+// status-line render shortly BEFORE a headless run cancels the probe that run
+// needs: the run consumed quota, the reading predates it, and latestObservedAt
+// would not advance. So each caller supplies the instant its own answer must be
+// newer than:
+//
+//   - post-run: the moment the run finished. Only an observation recorded AFTER
+//     the run can stand in for the probe that run earned.
+//   - routine gather: now minus the current interval, the steady-state dedupe
+//     that keeps two agent channels from doubling the request rate.
+//   - user-initiated refresh: none. Somebody is looking at the card.
+//
+// A zero baseline therefore means "never suppress". This cannot be exact — two
+// processes can still race between the check and the write — but it collapses
+// the steady-state duplication on an account-scoped endpoint without ever
+// swallowing a probe that a real run made necessary.
+func claudeUsageProbeObservedSince(fingerprint string, baseline time.Time) bool {
+	if baseline.IsZero() {
 		return false
 	}
-	latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets(currentClaudeAccountFingerprint()))
-	return !latest.IsZero() && now.Sub(latest) < window
+	latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets(fingerprint))
+	return !latest.IsZero() && latest.After(baseline)
 }
 
-// claudeUsageProbeAccessToken reads the stored subscription access token from
-// disk (or the macOS Keychain), or "" when there is none.
+// claudeUsageProbeIdentity is everything a probe needs from the stored
+// credential: the bearer token, and the fingerprint the cache is scoped by.
+//
+// They travel TOGETHER because they come from the same file. Deriving the
+// fingerprint separately (via currentClaudeAccountFingerprint) costs an extra
+// credential read, and on a default macOS config that read shells out to
+// `security` under a 3s timeout — inside a 10s budget shared serially by every
+// provider, two or three of those around one network call is enough to starve
+// the providers ordered after Claude out of the refresh entirely.
+type claudeUsageProbeIdentity struct {
+	token       string
+	fingerprint string
+}
+
+// claudeUsageProbeStoredIdentity reads the stored subscription credential ONCE
+// and derives both values from it.
 //
 // No claudeEnvAuthActive() check: see the file header. The daemon environment
 // says nothing about which credential a spawned Claude used, because both launch
 // paths strip the env credentials before spawning it.
 //
 // Called only by the post-run path, which has no credential in hand. The gather
-// path passes the token it already decoded instead — on macOS this read shells
-// out to `security` under a 3s timeout, and a second spawn inside the shared 10s
-// gather budget could starve the providers ordered after Claude.
+// path passes what it already decoded instead.
 //
 // The token is returned to a LOCAL only — never written to the cache, never
 // included in a log or error string.
-func claudeUsageProbeAccessToken() string {
+func claudeUsageProbeStoredIdentity() claudeUsageProbeIdentity {
 	home, _ := os.UserHomeDir()
 	base := claudeConfigDir(home)
 	if base == "" {
-		return ""
+		return claudeUsageProbeIdentity{}
 	}
 	raw, ok := readClaudeCredentialsRaw(base)
 	if !ok {
-		return ""
+		return claudeUsageProbeIdentity{}
 	}
 	creds := claudeOAuthCredentials{}
 	if json.Unmarshal(raw, &creds) != nil {
-		return ""
+		return claudeUsageProbeIdentity{}
 	}
-	return creds.ClaudeAiOauth.AccessToken
+	return claudeUsageProbeIdentity{
+		token:       creds.ClaudeAiOauth.AccessToken,
+		fingerprint: fingerprintAccount(claudeCodeUsageParser{}.Provider(), creds.claudeCredentialAccount()),
+	}
 }
 
 // claudeUsageProbeClient is the bounded HTTP client. Proxy inheritance is off
@@ -602,14 +682,22 @@ func claudeUsageProbeURL() string {
 // record carries only a category — the message field is local-only diagnostic
 // input everywhere else in this file's neighbourhood, and here it is
 // deliberately never populated from the response body or the credential.
+// runClaudeUsageProbe is the POST-RUN entry point: a Claude run has just
+// finished and consumed quota, so only an observation recorded after `now` can
+// substitute for this probe.
 func runClaudeUsageProbe(ctx context.Context, now time.Time) (bool, *cliAgentUsageError) {
-	return probeClaudeUsage(ctx, now, claudeUsageProbeAccessToken)
+	return probeClaudeUsage(ctx, now, claudeUsageProbeStoredIdentity, now)
 }
 
 // probeClaudeUsage is runClaudeUsageProbe with the credential supplied by the
 // caller. resolveToken is invoked ONLY once the gate has admitted the probe, so
 // a throttled or opted-out call never touches the credential store at all.
-func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() string) (refreshed bool, probeErr *cliAgentUsageError) {
+func probeClaudeUsage(
+	ctx context.Context,
+	now time.Time,
+	resolveIdentity func() claudeUsageProbeIdentity,
+	dedupeBaseline time.Time,
+) (refreshed bool, probeErr *cliAgentUsageError) {
 	// An already-cancelled gather must not burn the throttle slot on a request
 	// that cannot complete: the next caller would then be refused for a minute
 	// because of a probe that never left the process.
@@ -619,27 +707,25 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 	if !claudeUsageProbe.begin(now) {
 		return false, nil
 	}
-	// Cross-process coordination. The gate above is per PROCESS, but this
-	// endpoint is per ACCOUNT: a release and a dev agent on one machine, a
-	// restarted agent overlapping its predecessor, or the status-line hook firing
-	// on an interactive render, all hit the same account-scoped limit while
-	// sharing nothing but the on-disk cache. Consult that shared cache before
-	// spending a request — if somebody already recorded an observation inside the
-	// current interval, this probe would only be re-asking a question that has
-	// just been answered.
-	//
-	// Deliberately after begin() so the throttle stamp is still claimed: a
-	// duplicate suppressed here should hold this process off for the interval too.
-	if claudeUsageProbeRecentlyObserved(now) {
-		return false, nil
-	}
-	// Named returns so the deferred finish records whatever this call returned:
+	// Release the single-flight latch on EVERY path out of here. begin() has
+	// already set inFlight, so an early return that skipped this would leave the
+	// latch stuck and every future probe in this process rejected — a permanent
+	// wedge, not a missed sample. It must therefore be the first statement after
+	// begin(), ahead of any other exit. Named returns let it record the outcome:
 	// a failure extends the backoff, a success or an early skip clears it.
 	defer func() { claudeUsageProbe.finish(probeErr) }()
 
-	token := resolveToken()
-	if token == "" {
+	// One credential read for both the bearer token and the cache fingerprint —
+	// see claudeUsageProbeIdentity for why they must not be resolved separately.
+	identity := resolveIdentity()
+	if identity.token == "" {
 		// Not an error: a signed-out device simply has nothing for this probe.
+		return false, nil
+	}
+
+	// Cross-process coordination on an ACCOUNT-scoped endpoint: has another
+	// writer on this machine already answered what this probe would ask?
+	if claudeUsageProbeObservedSince(identity.fingerprint, dedupeBaseline) {
 		return false, nil
 	}
 	endpoint := claudeUsageProbeURL()
@@ -653,7 +739,7 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 	if err != nil {
 		return false, claudeUsageProbeFailure(cliUsageErrorInternal)
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "Bearer "+identity.token)
 	req.Header.Set("Accept", "application/json")
 	// The OAuth surface is beta-gated; Claude Code sends the same opt-in.
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
@@ -719,7 +805,7 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 	// backoff, and throttle the retry, while a SIGNED refresh receipt went out
 	// carrying an observation that was never persisted.
 	if err := mergeClaudeRateLimitCacheChecked(claudeRateLimitCachePath(), updates, now,
-		currentClaudeAccountFingerprint(), claudeRateLimitSourceProbe); err != nil {
+		identity.fingerprint, claudeRateLimitSourceProbe); err != nil {
 		return false, claudeUsageProbeFailure(cliUsageErrorCollectionFailed)
 	}
 	return true, nil
@@ -833,19 +919,34 @@ func claudeUsageProbeStatus(raw string) string {
 // A zero `latest` means nothing has ever been observed, which is stale by
 // definition.
 //
-// Takes the observation rather than the fingerprint, and the accessToken the
-// caller already decoded rather than re-reading it, so neither the cache nor the
-// credential store is touched twice per gather; every remaining gate (armed,
-// opt-out, offline, env-auth, single-flight, minimum interval) belongs to the
-// probe itself and is not restated here.
+// Takes the observation, and the accessToken AND fingerprint the caller already
+// decoded from ONE credential read, so neither the cache nor the credential
+// store is touched twice per gather; every remaining gate (armed, opt-out,
+// offline, single-flight, minimum interval, 429 hold) belongs to the probe
+// itself and is not restated here.
 //
 // Returns whether the cache was refreshed, so the caller knows whether it must
 // re-read before shaping the metrics.
-func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, accessToken string) bool {
-	if !claudeUsageProbe.forced() && !latest.IsZero() && now.Sub(latest) < claudeUsageProbeStaleAfter {
+func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, accessToken, fingerprint string) bool {
+	forced := claudeUsageProbe.forced()
+	if !forced && !latest.IsZero() && now.Sub(latest) < claudeUsageProbeStaleAfter {
 		return false
 	}
-	refreshed, probeErr := probeClaudeUsage(ctx, now, func() string { return accessToken })
+	// A user-initiated refresh is never deduped against the shared cache —
+	// somebody is looking at the card and asked for a reading now. A routine
+	// gather is, against the current interval.
+	baseline := time.Time{}
+	if !forced {
+		claudeUsageProbe.mu.Lock()
+		window := claudeUsageProbe.interval()
+		claudeUsageProbe.mu.Unlock()
+		if window > 0 {
+			baseline = now.Add(-window)
+		}
+	}
+	identity := claudeUsageProbeIdentity{token: accessToken, fingerprint: fingerprint}
+	refreshed, probeErr := probeClaudeUsage(ctx, now,
+		func() claudeUsageProbeIdentity { return identity }, baseline)
 	logClaudeUsageProbeFailure(probeErr)
 	return refreshed
 }

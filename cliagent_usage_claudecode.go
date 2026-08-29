@@ -423,7 +423,7 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// reading has aged past the staleness TTL (or when a user-initiated refresh
 	// forced it), and re-read ONLY when it actually wrote something.
 	buckets := loadMergedClaudeRateLimitBuckets(usage.AccountFingerprint)
-	if refreshClaudeUsageIfStale(ctx, now, latestClaudeObservation(buckets), oauthAccessToken) {
+	if refreshClaudeUsageIfStale(ctx, now, latestClaudeObservation(buckets), oauthAccessToken, usage.AccountFingerprint) {
 		buckets = loadMergedClaudeRateLimitBuckets(usage.AccountFingerprint)
 	}
 	usage.Metrics = claudeCodeMetricsFromBuckets(buckets, now)
