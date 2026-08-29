@@ -15,6 +15,8 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 )
 
 // findGitBash mirrors how Claude Code decides the Windows status-line shell:
@@ -487,6 +489,123 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// claudeStatusLineRecheckInterval is the process-level floor between two
+// stale-settings reconciles. A burst of session starts must not storm Claude's
+// settings.json with a Stat per start.
+const claudeStatusLineRecheckInterval = 60 * time.Second
+
+// claudeStatusLineReconcile remembers what settings.json looked like the last
+// time we verified the hook, so an unchanged file short-circuits before any
+// parse or write. Guarded by its own mutex: session starts are concurrent.
+var claudeStatusLineReconcile struct {
+	mu sync.Mutex
+	// armed is false until SetClaudeStatusLineHookDisabled has been called, so
+	// the run-start reconcile is opt-IN per process. StartAgent arms it from the
+	// config; every other entry point (one-shot CLI verbs, the statusline-hook
+	// subcommand itself) therefore never rewrites Claude's settings.json as a
+	// side effect of starting a session.
+	armed     bool
+	optOut    bool
+	lastCheck time.Time
+	// seen is false until a reconcile has recorded a settings.json stamp; the
+	// first call therefore always verifies rather than trusting a zero value.
+	seen  bool
+	mtime time.Time
+	size  int64
+}
+
+// SetClaudeStatusLineHookDisabled applies the `disable_claude_status_line_hook`
+// opt-out to the run-start reconcile AND arms it for this process. StartAgent
+// already installs/removes the hook per that flag at boot; this keeps the
+// per-run repair from reinstalling what the user just opted out of.
+func SetClaudeStatusLineHookDisabled(disabled bool) {
+	claudeStatusLineReconcile.mu.Lock()
+	claudeStatusLineReconcile.armed = true
+	claudeStatusLineReconcile.optOut = disabled
+	claudeStatusLineReconcile.mu.Unlock()
+}
+
+// resetClaudeStatusLineReconcile clears the throttle + recorded stamp.
+// Test-only seam, mirroring resetOpenCodeReadinessCache.
+func resetClaudeStatusLineReconcile() {
+	claudeStatusLineReconcile.mu.Lock()
+	claudeStatusLineReconcile.armed = false
+	claudeStatusLineReconcile.optOut = false
+	claudeStatusLineReconcile.lastCheck = time.Time{}
+	claudeStatusLineReconcile.seen = false
+	claudeStatusLineReconcile.mtime = time.Time{}
+	claudeStatusLineReconcile.size = 0
+	claudeStatusLineReconcile.mu.Unlock()
+}
+
+// ensureClaudeStatusLineHookIfStale re-verifies the installed hook when Claude's
+// settings.json has changed since we last looked, and repairs it if a Claude
+// Code update (or anything else) replaced our `statusLine`.
+//
+// Why a run-start reconcile exists at all: ensureClaudeStatusLineHook runs ONCE,
+// from StartAgent. Claude Code rewrites settings.json on update, and when that
+// drops our statusLine the numeric side-channel silently stops writing — with no
+// symptom until someone notices the card frozen — until the agent restarts.
+//
+// Cost is one Stat in the common case: the mtime + size recorded at the last
+// verify are compared first, and a process-level interval bounds how often even
+// that runs. The actual write is delegated to ensureClaudeStatusLineHook
+// unchanged, so chaining, third-party stashing, pinned-path migration and
+// opt-out semantics are exactly the boot-time ones.
+//
+// Best-effort: every failure is returned for logging but is never fatal to a run.
+func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
+	claudeStatusLineReconcile.mu.Lock()
+	skip := !claudeStatusLineReconcile.armed || claudeStatusLineReconcile.optOut
+	throttled := !claudeStatusLineReconcile.lastCheck.IsZero() &&
+		time.Since(claudeStatusLineReconcile.lastCheck) < claudeStatusLineRecheckInterval
+	seen := claudeStatusLineReconcile.seen
+	prevMtime := claudeStatusLineReconcile.mtime
+	prevSize := claudeStatusLineReconcile.size
+	claudeStatusLineReconcile.mu.Unlock()
+
+	if skip || throttled {
+		return false, nil
+	}
+
+	base := claudeConfigDir(home)
+	if base == "" {
+		return false, nil
+	}
+	settingsPath := filepath.Join(base, "settings.json")
+	st, statErr := os.Stat(settingsPath)
+
+	claudeStatusLineReconcile.mu.Lock()
+	claudeStatusLineReconcile.lastCheck = time.Now()
+	claudeStatusLineReconcile.mu.Unlock()
+
+	// An absent settings.json is still worth one ensure pass — that is the shape
+	// a fresh Claude install (or an update that reset the file) presents, and
+	// ensureClaudeStatusLineHook itself declines when Claude isn't present.
+	if statErr == nil && seen && st.ModTime().Equal(prevMtime) && st.Size() == prevSize {
+		return false, nil
+	}
+
+	changed, err := ensureClaudeStatusLineHook(home)
+	if err != nil {
+		// Don't record a stamp for a file we failed to reconcile: the next start
+		// (after the throttle) must try again rather than treat the bad state as
+		// verified.
+		return false, err
+	}
+	// Re-Stat AFTER the write so the recorded stamp describes the file as it now
+	// stands — otherwise our own write would look like a foreign change and every
+	// subsequent reconcile would rewrite settings.json.
+	if st, err := os.Stat(settingsPath); err == nil {
+		claudeStatusLineReconcile.mu.Lock()
+		claudeStatusLineReconcile.seen = true
+		claudeStatusLineReconcile.mtime = st.ModTime()
+		claudeStatusLineReconcile.size = st.Size()
+		claudeStatusLineReconcile.mu.Unlock()
+	}
+	return changed, nil
 }
 
 // removeClaudeStatusLineHook reverses ensureClaudeStatusLineHook so the opt-out

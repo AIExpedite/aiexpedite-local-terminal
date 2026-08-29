@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -308,5 +309,202 @@ func TestMergeClaudeRateLimitCache_CreatesLockFile(t *testing.T) {
 		if leftover, _ := filepath.Glob(cache + ".tmp"); len(leftover) > 0 {
 			t.Errorf("legacy fixed `.tmp` file should not be produced: %v", leftover)
 		}
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* Post-update hook repair (ensureClaudeStatusLineHookIfStale)                 */
+/* -------------------------------------------------------------------------- */
+
+// armStatusLineReconcile isolates the run-start reconcile for one test: a
+// private Claude config dir with a settings.json, a private prev-stash path, and
+// an armed, unthrottled reconcile state. Returns the home dir and the
+// settings.json path inside it.
+func armStatusLineReconcile(t *testing.T) (home, settingsPath string) {
+	t.Helper()
+	home = t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", filepath.Join(t.TempDir(), "prev.json"))
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+
+	resetClaudeStatusLineReconcile()
+	SetClaudeStatusLineHookDisabled(false)
+	t.Cleanup(resetClaudeStatusLineReconcile)
+
+	return home, filepath.Join(claudeDir, "settings.json")
+}
+
+// clearStatusLineReconcileThrottle drops only the interval gate, so a test can
+// exercise two consecutive reconciles without also forgetting the mtime stamp
+// the second one is supposed to compare against.
+func clearStatusLineReconcileThrottle() {
+	claudeStatusLineReconcile.mu.Lock()
+	claudeStatusLineReconcile.lastCheck = time.Time{}
+	claudeStatusLineReconcile.mu.Unlock()
+}
+
+// A Claude Code update rewrites settings.json and can replace our statusLine
+// with its own. Nothing re-verified that until the agent restarted, so the
+// numeric side-channel silently stopped writing and the utilization card froze.
+// The run-start reconcile must restore our command and stash the foreign one.
+func TestEnsureClaudeStatusLineHookIfStale_RepairsAfterClaudeUpdate(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Boot-time install, exactly as StartAgent performs it.
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+		t.Fatalf("initial reconcile: changed=%v err=%v", changed, err)
+	}
+
+	// Simulate the update: Claude rewrites settings.json with a foreign
+	// statusLine, dropping ours.
+	if err := os.WriteFile(settingsPath,
+		[]byte(`{"theme":"dark","statusLine":{"type":"command","command":"/opt/claude/vendor-line.sh"}}`),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+	clearStatusLineReconcileThrottle()
+
+	changed, err := ensureClaudeStatusLineHookIfStale(home)
+	if err != nil {
+		t.Fatalf("reconcile after update: %v", err)
+	}
+	if !changed {
+		t.Fatal("a settings.json rewritten by a Claude Code update must be repaired")
+	}
+
+	var settings struct {
+		Theme      string `json:"theme"`
+		StatusLine struct {
+			Command string `json:"command"`
+		} `json:"statusLine"`
+	}
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if !isOurStatusLineCommand(settings.StatusLine.Command) {
+		t.Errorf("statusLine=%q, want our hook restored", settings.StatusLine.Command)
+	}
+	if settings.Theme != "dark" {
+		t.Errorf("theme=%q, want the user's other settings preserved", settings.Theme)
+	}
+	if prev := loadPrevStatusLineCommand(); prev != "/opt/claude/vendor-line.sh" {
+		t.Errorf("stashed previous command=%q, want the foreign one preserved for chaining", prev)
+	}
+}
+
+// An unchanged settings.json must cost nothing: no write, and the file's mtime
+// must survive so a backup/sync tool doesn't see churn on every session start.
+func TestEnsureClaudeStatusLineHookIfStale_NoOpWhenSettingsUnchanged(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+		t.Fatalf("initial reconcile: changed=%v err=%v", changed, err)
+	}
+	installed, err := os.Stat(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clearStatusLineReconcileThrottle()
+	changed, err := ensureClaudeStatusLineHookIfStale(home)
+	if err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if changed {
+		t.Error("an unchanged settings.json must not be rewritten")
+	}
+	after, err := os.Stat(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(installed.ModTime()) || after.Size() != installed.Size() {
+		t.Errorf("settings.json was touched: mtime %v -> %v, size %d -> %d",
+			installed.ModTime(), after.ModTime(), installed.Size(), after.Size())
+	}
+}
+
+// A burst of session starts must not storm the file: inside the throttle window
+// at most one reconcile happens, however many runs begin.
+func TestEnsureClaudeStatusLineHookIfStale_ThrottlesRepeatedStarts(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+		t.Fatalf("initial reconcile: changed=%v err=%v", changed, err)
+	}
+
+	// Break the hook again, then start several sessions without clearing the
+	// throttle — none of them may reconcile.
+	if err := os.WriteFile(settingsPath,
+		[]byte(`{"statusLine":{"type":"command","command":"/opt/claude/vendor-line.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || changed {
+			t.Fatalf("reconcile %d inside the throttle window: changed=%v err=%v", i, changed, err)
+		}
+	}
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), statusLineHookArg) {
+		t.Errorf("throttled reconcile still wrote the hook:\n%s", raw)
+	}
+}
+
+// The opt-out must hold for the run-start reconcile too — otherwise a user who
+// disabled the hook would have it reinstalled by their next Claude session.
+func TestEnsureClaudeStatusLineHookIfStale_RespectsOptOut(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	SetClaudeStatusLineHookDisabled(true)
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || changed {
+		t.Fatalf("opt-out reconcile: changed=%v err=%v", changed, err)
+	}
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "statusLine") {
+		t.Errorf("opt-out must not install the hook:\n%s", raw)
+	}
+}
+
+// A process that never armed the reconcile (a one-shot CLI verb, the
+// statusline-hook subcommand) must never rewrite Claude's settings.json as a
+// side effect of starting a session.
+func TestEnsureClaudeStatusLineHookIfStale_UnarmedProcessDoesNothing(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetClaudeStatusLineReconcile() // leaves the reconcile unarmed
+
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || changed {
+		t.Fatalf("unarmed reconcile: changed=%v err=%v", changed, err)
+	}
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "statusLine") {
+		t.Errorf("unarmed process must not touch settings.json:\n%s", raw)
 	}
 }

@@ -68,6 +68,20 @@ const (
 // window's limit is exhausted and further requests are blocked.
 const claudeRateLimitStatusRejected = "rejected"
 
+// Provenance values for claudeRateLimitBucket.Source — which writer produced a
+// bucket's reading. Recorded so an operator reading the cache (or a test) can
+// tell an interactive status-line render from a stream capture from the
+// bounded usage probe, all three of which write the same windows.
+//
+// Diagnostic only: no read path branches on it, and it is deliberately absent
+// from the signed refresh receipt (canonicalCLIUsageMetric carries no such
+// field), so adding it cannot change what the backend sees.
+const (
+	claudeRateLimitSourceStream     = "stream"
+	claudeRateLimitSourceStatusLine = "statusline"
+	claudeRateLimitSourceProbe      = "probe"
+)
+
 // claudeRateLimitBucket is one window's observed state. UsedPercentage is
 // normalised to 0..100 regardless of source shape (utilization 0..1 vs
 // used_percentage 0..100). ResetsAtMs is unix epoch milliseconds (0 = unknown).
@@ -94,6 +108,10 @@ type claudeRateLimitBucket struct {
 	// observed UsedPercentage. Per-event and not persisted; UsageObserved is
 	// the durable form of the same fact.
 	usageKnown bool `json:"-"`
+	// Source names the writer that produced this bucket (see the
+	// claudeRateLimitSource* constants). Omitted when empty so a cache written
+	// before this field existed round-trips byte-identically.
+	Source string `json:"source,omitempty"`
 }
 
 // hasObservedUsage reports whether UsedPercentage came from an actual reading.
@@ -297,7 +315,8 @@ func captureClaudeRateLimitLine(line string, now time.Time) *claudeRateLimitBuck
 	nowMs := now.UnixMilli()
 	updates := extractClaudeRateLimitBuckets(raw, nowMs)
 	if len(updates) > 0 {
-		mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint())
+		mergeClaudeRateLimitCacheFromSource(claudeRateLimitCachePath(), updates, now,
+			currentClaudeAccountFingerprint(), claudeRateLimitSourceStream)
 	}
 
 	// Surface the rejected window with the LATEST reset time. When multiple
@@ -366,6 +385,16 @@ func windowlessRejectedBucket(raw map[string]interface{}, nowMs int64) (claudeRa
 // unique suffix so even if the lock is unavailable (some odd filesystem) two
 // writers can't clobber each other's intermediate state.
 func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint string) {
+	mergeClaudeRateLimitCacheFromSource(path, updates, now, fingerprint, "")
+}
+
+// mergeClaudeRateLimitCacheFromSource is mergeClaudeRateLimitCache with the
+// writer's provenance stamped onto every bucket it persists (see the
+// claudeRateLimitSource* constants). A carried-forward heartbeat keeps the
+// source of the reading it carries — the heartbeat observed the reset, not the
+// percentage, so claiming its own provenance for a percentage it did not
+// measure would be wrong.
+func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) {
 	if path == "" || len(updates) == 0 {
 		return
 	}
@@ -432,6 +461,7 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 				// indefinitely.
 				bucket.ObservedAtMs = prev.ObservedAtMs
 				bucket.UsageObserved = usageObservedPtr(prev.hasObservedUsage())
+				bucket.Source = prev.Source
 				snap.Buckets[window] = bucket
 				continue
 			}
@@ -457,10 +487,12 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 			}
 			bucket.UsedPercentage = 0
 			bucket.UsageObserved = usageObservedPtr(false)
+			bucket.Source = source
 			snap.Buckets[window] = bucket
 			continue
 		}
 		bucket.UsageObserved = usageObservedPtr(true)
+		bucket.Source = source
 		snap.Buckets[window] = bucket
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)

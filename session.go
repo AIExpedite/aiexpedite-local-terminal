@@ -339,6 +339,24 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		return sm.startPTYSession(id, command, ptyArgs, cwd, workspaceID, uid, timeoutMs, publishFn)
 	}
 
+	// Re-verify Claude's status-line hook before launching a claude session. A
+	// Claude Code update rewrites settings.json and can drop our `statusLine`,
+	// silently stopping the only writer that carries numeric utilization on
+	// interactive renders — invisible until someone notices the card frozen.
+	// Throttled and mtime-gated (see ensureClaudeStatusLineHookIfStale), so the
+	// common case is one Stat. Best-effort: never blocks the session.
+	if isClaudeCommand(command) {
+		if hookHome, err := os.UserHomeDir(); err == nil {
+			if changed, err := ensureClaudeStatusLineHookIfStale(hookHome); err != nil {
+				fmt.Printf("%s[session] Could not reconcile Claude status-line hook: %v%s\n",
+					colorYellow, err, colorReset)
+			} else if changed {
+				fmt.Printf("%s[session] Repaired Claude status-line hook after a settings.json change%s\n",
+					colorGreen, colorReset)
+			}
+		}
+	}
+
 	// grok's headless mode takes its prompt on argv (`-p <prompt>`) and does NOT
 	// read a piped stdin, so — unlike claude/codex, which route a long
 	// prompt through stdinPrompt — a long review brief would blow past the
@@ -1325,6 +1343,18 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					session.signalFirstRealFrame()
 				}
 
+				// A completed turn is when the account's real percentages have
+				// just moved — and when the stream has told us nothing numeric,
+				// because an under-quota run emits only usage-less heartbeats
+				// that mergeClaudeRateLimitCache (correctly) refuses to treat as
+				// fresh. Kick the bounded utilization probe here so the CLI
+				// Agents card advances after a managed run. Asynchronous,
+				// single-flight and throttled, so a chatty session issues one
+				// request and the streaming path is never delayed.
+				if isClaudeTerminalResultLine(line.text) {
+					triggerClaudeUsageProbeAfterRun()
+				}
+
 				// Fail fast when Claude Code reports it cannot authenticate. The
 				// driver strips env-based credentials for claude to force the
 				// user's `/login` subscription, so an expired/absent login here
@@ -1669,6 +1699,16 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	session.mu.Unlock()
 
 	close(session.done)
+
+	// Final utilization attempt for a claude session that never reached a
+	// terminal `result` frame — killed, timed out, or exited mid-turn. Those
+	// runs still consumed quota, so the card must not stay pinned to a
+	// pre-run observation just because the turn ended abnormally. No-op for
+	// non-claude sessions, and collapsed by the probe's single-flight when the
+	// result frame already fired it moments ago.
+	if isClaudeCommand(session.Command) {
+		triggerClaudeUsageProbeAfterRun()
+	}
 
 	seq := atomic.AddInt64(&session.Seq, 1)
 

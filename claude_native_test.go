@@ -9,11 +9,13 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -418,4 +420,118 @@ func TestClaudeNativeLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected Start to fail when `claude` is not on PATH")
 	}
+}
+
+// seedStaleClaudeObservation writes one real-but-old five-hour reading into the
+// probe-isolated cache and returns its observation time. This is the "card is
+// frozen" starting state the feature exists to unstick.
+func seedStaleClaudeObservation(t *testing.T, cache string) time.Time {
+	t.Helper()
+	seeded := time.Now().Add(-4 * time.Hour)
+	mergeClaudeRateLimitCache(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 21, ResetsAtMs: time.Now().Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: seeded.UnixMilli(), Status: "allowed", usageKnown: true,
+		},
+	}, seeded, "")
+	return seeded
+}
+
+// waitForClaudeObservationAfter polls the cache until the five-hour window
+// carries a PROBE reading observed after `after`. The probe is deliberately
+// asynchronous (it must never delay frame ordering or waitForExit), so polling
+// is the only honest way to assert it ran.
+//
+// Both conditions matter. A heartbeat that names a reset the cache has not seen
+// before also writes a bucket with a current ObservedAtMs — but with
+// usageObserved=false, so it reports as "unobservable, resets <date>" and moves
+// no percentage. Only a real reading unsticks the card, which is exactly the
+// distinction the reported bug turned on.
+func waitForClaudeObservationAfter(t *testing.T, cache string, after time.Time) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if snap, ok := loadClaudeRateLimitSnapshot(cache); ok {
+			b := snap.Buckets[claudeWindowFiveHour]
+			if b.Source == claudeRateLimitSourceProbe && b.hasObservedUsage() && b.ObservedAtMs > after.UnixMilli() {
+				return
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	snap, _ := loadClaudeRateLimitSnapshot(cache)
+	t.Fatalf("no probe reading landed after %s; cache=%+v", after.UTC().Format(time.RFC3339Nano), snap.Buckets)
+}
+
+// Direct (chat-native) run: a heartbeat-only session that ends with a terminal
+// `result` frame must leave the cache with a NEWER observation than it started
+// with. Without the probe this is exactly the reported bug — the run succeeds,
+// the smokes pass, and latestObservedAt never moves.
+func TestClaudeNativeLifecycle_TerminalResultAdvancesUtilization(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":0.37,"resets_at":%d,"status":"allowed"}}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	seeded := seedStaleClaudeObservation(t, cache)
+	tmpDir := installMockClaude(t, "claude-heartbeat-result")
+
+	m := NewClaudeNativeManager(nil)
+	id := fmt.Sprintf("claude-freshness-%d", time.Now().UnixNano())
+	if err := m.Start(id, tmpDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.End(id) })
+
+	waitForClaudeObservationAfter(t, cache, seeded)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want exactly 1 for a single run", got)
+	}
+
+	metric := claudeCodeMetricsFromCache(time.Now(), "")[0]
+	if metric.Consumed == nil || *metric.Consumed < 36.9 || *metric.Consumed > 37.1 {
+		t.Errorf("five-hour Consumed=%v, want ~37 from the probe reading", metric.Consumed)
+	}
+}
+
+// The rate-limit rejection path must be untouched by the probe wiring: a
+// rejected run still publishes the `claude_native_ratelimit` frame that
+// agent-orchestrator-service's detectRateLimit defers and auto-resumes on.
+func TestClaudeNativeLifecycle_RejectionFrameSurvivesProbeWiring(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	_, _ = armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":1.0,"resets_at":%d,"status":"rejected"}}`,
+			time.Now().Add(45*time.Minute).Unix())
+	})
+	tmpDir := installMockClaude(t, "claude-native-ratelimit")
+
+	m := NewClaudeNativeManager(nil)
+	id := fmt.Sprintf("claude-reject-probe-%d", time.Now().UnixNano())
+
+	var mu sync.Mutex
+	var captured []resultMsg
+	if err := m.Start(id, tmpDir, nil, "trigger", "ws", "uid", func(res resultMsg) {
+		mu.Lock()
+		defer mu.Unlock()
+		captured = append(captured, res)
+	}, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.End(id) })
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		for _, msg := range captured {
+			if msg.Type == "claude_native_ratelimit" &&
+				strings.Contains(msg.Output, "usage limit") &&
+				strings.Contains(msg.Output, "resets at") {
+				mu.Unlock()
+				return
+			}
+		}
+		mu.Unlock()
+		time.Sleep(30 * time.Millisecond)
+	}
+	t.Fatal("expected the claude_native_ratelimit frame to still publish unchanged")
 }

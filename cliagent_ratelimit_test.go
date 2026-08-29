@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -727,5 +728,136 @@ func TestClaudeCodeMetricsFromCache_IgnoresForeignStatusLineCommand(t *testing.T
 
 	if session := claudeCodeMetricsFromCache(now, "")[0]; !session.Unknown {
 		t.Errorf("5-hour window should stay unobserved, got %+v", session)
+	}
+}
+
+// A probe reading arrives with usageKnown=true, so it takes the fresh-reading
+// path: it overwrites the percentage a same-window heartbeat carried forward AND
+// advances ObservedAtMs. This is the whole mechanism by which a successful,
+// under-quota run makes latestObservedAt move.
+func TestMergeClaudeRateLimitCache_ProbeBucketOverridesCarriedHeartbeat(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(2 * time.Hour)
+
+	// A real reading from the stream, four hours ago.
+	seeded := now.Add(-4 * time.Hour)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 30, ResetsAtMs: reset.UnixMilli(),
+			ObservedAtMs: seeded.UnixMilli(), Status: "allowed", usageKnown: true,
+		},
+	}, seeded, "", claudeRateLimitSourceStream)
+
+	// A usage-less heartbeat on the same live window: carries the percentage AND
+	// its original observation time forward, deliberately.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {ResetsAtMs: reset.UnixMilli(), Status: "allowed"},
+	}, now.Add(-time.Minute), "", claudeRateLimitSourceStream)
+
+	carried, _ := loadClaudeRateLimitSnapshot(cache)
+	if got := carried.Buckets[claudeWindowFiveHour]; got.ObservedAtMs != seeded.UnixMilli() {
+		t.Fatalf("precondition: heartbeat advanced ObservedAtMs to %d, want the carried %d",
+			got.ObservedAtMs, seeded.UnixMilli())
+	}
+
+	// The probe's reading must win on both counts.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 71, ResetsAtMs: reset.UnixMilli(),
+			ObservedAtMs: now.UnixMilli(), Status: "allowed", usageKnown: true,
+		},
+	}, now, "", claudeRateLimitSourceProbe)
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected a cache write")
+	}
+	got := snap.Buckets[claudeWindowFiveHour]
+	if got.UsedPercentage != 71 {
+		t.Errorf("UsedPercentage=%v, want 71 from the probe", got.UsedPercentage)
+	}
+	if got.ObservedAtMs != now.UnixMilli() {
+		t.Errorf("ObservedAtMs=%d, want the probe's %d", got.ObservedAtMs, now.UnixMilli())
+	}
+	if got.Source != claudeRateLimitSourceProbe {
+		t.Errorf("Source=%q, want %q", got.Source, claudeRateLimitSourceProbe)
+	}
+}
+
+// A heartbeat that carries a prior reading forward must also carry that
+// reading's provenance: it observed the reset, not the percentage, so claiming
+// its own source for a number it did not measure would misreport where the
+// value came from.
+func TestMergeClaudeRateLimitCache_HeartbeatKeepsCarriedSource(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(2 * time.Hour)
+
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 44, ResetsAtMs: reset.UnixMilli(),
+			ObservedAtMs: now.Add(-time.Hour).UnixMilli(), Status: "allowed", usageKnown: true,
+		},
+	}, now.Add(-time.Hour), "", claudeRateLimitSourceProbe)
+
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {ResetsAtMs: reset.UnixMilli(), Status: "allowed"},
+	}, now, "", claudeRateLimitSourceStream)
+
+	snap, _ := loadClaudeRateLimitSnapshot(cache)
+	if got := snap.Buckets[claudeWindowFiveHour].Source; got != claudeRateLimitSourceProbe {
+		t.Errorf("Source=%q, want the carried %q", got, claudeRateLimitSourceProbe)
+	}
+}
+
+// Source round-trips through the on-disk snapshot, and a legacy cache written
+// before the field existed still loads with its existing semantics (no source,
+// and — per the nil UsageObserved rule — still an observed reading).
+func TestClaudeRateLimitBucketSource_RoundTripsAndLegacyCacheLoads(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDay: {
+			UsedPercentage: 12, ResetsAtMs: now.Add(96 * time.Hour).UnixMilli(),
+			ObservedAtMs: now.UnixMilli(), usageKnown: true,
+		},
+	}, now, "", claudeRateLimitSourceStatusLine)
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected a cache write")
+	}
+	if got := snap.Buckets[claudeWindowSevenDay].Source; got != claudeRateLimitSourceStatusLine {
+		t.Errorf("Source=%q, want %q after a disk round-trip", got, claudeRateLimitSourceStatusLine)
+	}
+
+	// A snapshot with no `source` key — every cache written before this change.
+	legacy := filepath.Join(t.TempDir(), "legacy.json")
+	body := `{"updatedAt":"2026-08-29T08:00:06Z","buckets":{"five_hour":{` +
+		`"usedPercentage":63,"resetsAtMs":` + itoa(now.Add(time.Hour).UnixMilli()) +
+		`,"observedAtMs":` + itoa(now.Add(-time.Hour).UnixMilli()) + `,"status":"allowed"}}}`
+	if err := os.WriteFile(legacy, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, ok := loadClaudeRateLimitSnapshot(legacy)
+	if !ok {
+		t.Fatal("a legacy cache with no source key must still load")
+	}
+	bucket := loaded.Buckets[claudeWindowFiveHour]
+	if bucket.Source != "" {
+		t.Errorf("Source=%q, want empty for a legacy bucket", bucket.Source)
+	}
+	if !bucket.hasObservedUsage() || bucket.UsedPercentage != 63 {
+		t.Errorf("legacy bucket semantics changed: %+v", bucket)
 	}
 }

@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +36,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -290,6 +292,27 @@ func runMockCLI(mode string) {
 		fmt.Printf(`{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","utilization":1.0,"resets_at":%d}}`+"\n", reset)
 		// Stay alive so End() drives the teardown, matching the real CLI's
 		// behavior of holding stdin open across turns.
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		os.Exit(0)
+
+	case "claude-heartbeat-result":
+		// The shape that froze the utilization card: a usage-less "allowed"
+		// heartbeat (which mergeClaudeRateLimitCache deliberately refuses to treat
+		// as a fresh observation) followed by a normal terminal `result` frame.
+		// Nothing numeric reaches the cache, so only the utilization probe can
+		// advance latestObservedAt. Used by the direct- and managed-run freshness
+		// tests.
+		reset := time.Now().Add(3 * time.Hour).Unix()
+		fmt.Printf(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","resets_at":%d}}`+"\n", reset)
+		fmt.Println(`{"type":"result","subtype":"success","result":"done"}`)
+		os.Exit(0)
+
+	case "claude-heartbeat-hang":
+		// Same heartbeat, but no terminal frame — the run is killed or times out
+		// mid-turn. It still consumed quota, so the session-end path must make its
+		// own probe attempt.
+		reset := time.Now().Add(3 * time.Hour).Unix()
+		fmt.Printf(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","resets_at":%d}}`+"\n", reset)
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		os.Exit(0)
 
@@ -1299,3 +1322,72 @@ func concatStreamOutput(messages []resultMsg) string {
 // quietExec is used to silence go vet when an exec.Command result is unused
 // in test setup paths.
 var _ = exec.Command
+
+/* -------------------------------------------------------------------------- */
+/* Terminal-managed run: utilization freshness                                */
+/* -------------------------------------------------------------------------- */
+
+// startManagedClaudeSession drives a real SessionManager against the mock
+// `claude` binary in the given mode and returns the manager + session id.
+func startManagedClaudeSession(t *testing.T, mode string) (*SessionManager, string) {
+	t.Helper()
+	tmpDir := installMockClaude(t, mode)
+
+	sm := NewSessionManager(nil)
+	id := fmt.Sprintf("claude-managed-%d", time.Now().UnixNano())
+	var startErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		startErr = sm.StartSession(id, "claude", []string{"hello"}, tmpDir, "ws", "uid", 30000, false, func(resultMsg) {})
+		if startErr == nil || !strings.Contains(startErr.Error(), "text file busy") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if startErr != nil {
+		t.Fatalf("StartSession: %v", startErr)
+	}
+	return sm, id
+}
+
+// Terminal-managed run: session start → heartbeat lines → terminal `result`
+// frame → the probe fires → latestObservedAt advances. Mirrors the direct-run
+// assertion; both execution paths must unstick the card, not just the one.
+func TestManagedClaudeSession_TerminalResultAdvancesUtilization(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":0.58,"resets_at":%d,"status":"allowed"}}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	seeded := seedStaleClaudeObservation(t, cache)
+
+	sm, id := startManagedClaudeSession(t, "claude-heartbeat-result")
+	t.Cleanup(func() { _ = sm.EndSession(id) })
+
+	waitForClaudeObservationAfter(t, cache, seeded)
+	// The result frame and the session-end sweep both attempt a probe; the
+	// single-flight plus the minimum interval must collapse them into one call.
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want exactly 1 for a single managed run", got)
+	}
+}
+
+// A killed / timed-out run consumed quota just as a completed one did, and it
+// never emits a terminal `result` frame — so the session-end path must make its
+// own attempt or those runs stay permanently stale.
+func TestManagedClaudeSession_KilledRunStillProbesOnSessionEnd(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":0.66,"resets_at":%d,"status":"allowed"}}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	seeded := seedStaleClaudeObservation(t, cache)
+
+	sm, id := startManagedClaudeSession(t, "claude-heartbeat-hang")
+	// Give the heartbeat time to land, then kill the run mid-turn.
+	time.Sleep(200 * time.Millisecond)
+	if err := sm.EndSession(id); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+
+	waitForClaudeObservationAfter(t, cache, seeded)
+}

@@ -65,6 +65,29 @@ func isClaudeRateLimitEventLine(line string) bool {
 	return t == "rate_limit_event"
 }
 
+// isClaudeTerminalResultLine reports whether a line is Claude's terminal
+// `result` frame — the one it emits when a turn is complete, carrying the final
+// text and the run's summary. Used to fire the bounded utilization probe at the
+// exact moment a run finished, which is when the account's real percentages have
+// just moved and the card most needs a fresh numeric reading.
+func isClaudeTerminalResultLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	// Cheap prefilter before the decode: this runs on every stdout line of every
+	// Claude session.
+	if !strings.Contains(trimmed, `"result"`) {
+		return false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return false
+	}
+	t, _ := raw["type"].(string)
+	return t == "result"
+}
+
 // extractDisplayText parses a single stdout line from a CLI agent and returns
 // the human-readable text to display. Returns empty string if the line should
 // be skipped (internal events, metadata, etc.).

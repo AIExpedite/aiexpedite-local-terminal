@@ -156,6 +156,17 @@ type Config struct {
 	// hook installs on startup, preserving any existing status line by chaining.
 	DisableClaudeStatusLineHook bool `json:"disable_claude_status_line_hook,omitempty"`
 
+	/* ─── Claude Code utilization probe ──────────────── */
+	// DisableClaudeUsageProbe opts out of the bounded utilization probe that
+	// reads the account's real 5-hour / weekly percentages after a Claude run
+	// (cliagent_usage_claudecode_probe.go). Off by default — without it a device
+	// that only runs headless Claude sessions never records a fresh numeric
+	// reading, because the stream emits usage-less heartbeats and the status-line
+	// hook fires only on interactive renders. Set it when the outbound call to
+	// Anthropic's OAuth usage endpoint is unwanted; the card then falls back to
+	// whatever the stream / status-line capture last observed.
+	DisableClaudeUsageProbe bool `json:"disable_claude_usage_probe,omitempty"`
+
 	/* ─── CLI-agent catalog ───────────────────────────── */
 	// CliAgentCatalog is the backend-provided projection of the Firestore
 	// cliAgent collection. When present it replaces the built-in fallback list

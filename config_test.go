@@ -221,3 +221,49 @@ func TestUpdateCLIAgentCatalog_CanMarshalConcurrently(t *testing.T) {
 		}
 	}
 }
+
+// disable_claude_usage_probe must default to false (the probe is what keeps the
+// Claude utilization card advancing after a headless run) and round-trip through
+// a config save/load so an operator's opt-out survives a restart.
+func TestConfig_DisableClaudeUsageProbeRoundTrips(t *testing.T) {
+	if DefaultConfig().DisableClaudeUsageProbe {
+		t.Error("disable_claude_usage_probe must default to false")
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg := DefaultConfig()
+	if err := cfg.MutateAndSave(path, func() {
+		cfg.DisableClaudeUsageProbe = true
+	}); err != nil {
+		t.Fatalf("MutateAndSave: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"disable_claude_usage_probe": true`)) {
+		t.Errorf("saved config should carry the flag under its documented key:\n%s", raw)
+	}
+
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !loaded.DisableClaudeUsageProbe {
+		t.Error("disable_claude_usage_probe did not survive a save/load round-trip")
+	}
+
+	// Absent from an older config file: the default (probe enabled) applies.
+	legacy := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(legacy, []byte(`{"agentId":"a1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	older, err := LoadConfig(legacy)
+	if err != nil {
+		t.Fatalf("LoadConfig(legacy): %v", err)
+	}
+	if older.DisableClaudeUsageProbe {
+		t.Error("a config written before the flag existed must not read as opted out")
+	}
+}

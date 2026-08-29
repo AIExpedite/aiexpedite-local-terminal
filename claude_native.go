@@ -215,6 +215,22 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 		return fmt.Errorf("cwd %q is not a directory", cwd)
 	}
 
+	// Re-verify Claude's status-line hook before launching. A Claude Code update
+	// rewrites settings.json and can drop our `statusLine`, which silently stops
+	// the only writer that carries numbers on interactive renders — with no
+	// symptom until someone notices the utilization card frozen. Throttled and
+	// mtime-gated (see ensureClaudeStatusLineHookIfStale), so the common case is
+	// one Stat. Best-effort: never blocks a run.
+	if hookHome, err := os.UserHomeDir(); err == nil {
+		if changed, err := ensureClaudeStatusLineHookIfStale(hookHome); err != nil {
+			fmt.Printf("%s[claude-native] Could not reconcile Claude status-line hook: %v%s\n",
+				colorYellow, err, colorReset)
+		} else if changed {
+			fmt.Printf("%s[claude-native] Repaired Claude status-line hook after a settings.json change%s\n",
+				colorGreen, colorReset)
+		}
+	}
+
 	// Hold the manager mutex across the spawn so two concurrent Start calls for
 	// the same id can't double-spawn (TOCTOU).
 	m.mu.Lock()
@@ -737,6 +753,14 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 				Seq:         int(seq),
 			}, "claude_native_message") {
 				return
+			}
+			// A completed turn is when the account's real percentages have just
+			// moved — and when the stream has told us nothing numeric, because an
+			// under-quota run emits only usage-less heartbeats. Kick the bounded
+			// probe AFTER the frame is published so it can never reorder frames or
+			// delay waitForExit; it is asynchronous, single-flight and throttled.
+			if isClaudeTerminalResultLine(trimmed) {
+				triggerClaudeUsageProbeAfterRun()
 			}
 		}
 		if err := scanner.Err(); err != nil {
