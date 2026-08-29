@@ -1673,3 +1673,151 @@ func TestRefreshClaudeUsageIfStale_MakesNoCredentialRead(t *testing.T) {
 		t.Errorf("credential store read %d times on the gather path, want 0 — the parser already read it", got)
 	}
 }
+
+/* -------------------------------------------------------------------------- */
+/* The throttle may DELAY a post-run probe, never discard it                  */
+/* -------------------------------------------------------------------------- */
+
+// A probe shortly BEFORE a run must not make that run's refresh vanish.
+// begin() checks the process-wide minimum interval before any baseline is
+// consulted, so a routine gather thirty seconds earlier would otherwise drop the
+// post-run probe outright — and the gather path then treats that pre-run reading
+// as fresh for the whole staleness TTL, leaving latestObservedAt behind the run
+// for minutes. That is the reported defect, reintroduced by the rate bound.
+func TestClaudeUsageProbe_ThrottledPostRunProbeStillLands(t *testing.T) {
+	base := time.Now()
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":77,"resets_at":%d}]}`,
+			base.Add(time.Hour).Unix())
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "400")
+
+	// A routine gather probes successfully just before the run.
+	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
+		t.Fatal("precondition: the pre-run gather should probe")
+	}
+	if latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")).IsZero() {
+		t.Fatal("precondition: expected a pre-run observation")
+	}
+
+	// The run completes INSIDE the throttle window.
+	runCompleted := time.Now()
+	triggerClaudeUsageProbeAfterRun()
+
+	waitForObservationAfter(t, runCompleted, 8*time.Second,
+		"latestObservedAt never advanced past the run — the throttle discarded the post-run probe")
+	if got := atomic.LoadInt64(calls); got > 3 {
+		t.Errorf("request count=%d, want a small bounded number", got)
+	}
+}
+
+// A burst of runs inside one throttle window is one DEBT, not one probe each:
+// the newest baseline subsumes the older ones and only one trailing timer runs.
+func TestClaudeUsageProbe_TrailingProbesCoalesceAcrossRuns(t *testing.T) {
+	base := time.Now()
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":61,"resets_at":%d}]}`,
+			base.Add(time.Hour).Unix())
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "600")
+
+	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
+		t.Fatal("precondition: the first probe should run")
+	}
+
+	// Eight runs finish inside the window.
+	last := time.Now()
+	for i := 0; i < 8; i++ {
+		last = time.Now()
+		triggerClaudeUsageProbeAfterRun()
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	waitForObservationAfter(t, last, 8*time.Second, "the coalesced trailing probe never landed")
+	// One pre-run probe plus one trailing probe. Anything near eight means the
+	// runs each bought their own request.
+	if got := atomic.LoadInt64(calls); got > 3 {
+		t.Errorf("request count=%d, want <= 3 — a burst of runs must coalesce onto one trailing probe", got)
+	}
+}
+
+// When the trailing probe is too far out to hold a timer for — a deep backoff or
+// a long Retry-After — the debt is still recorded, and the next routine gather
+// pays it instead of honoring the staleness TTL.
+func TestRefreshClaudeUsageIfStale_PaysAnOutstandingPostRunDebt(t *testing.T) {
+	now := time.Now()
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":52,"resets_at":%d}]}`,
+			now.Add(time.Hour).Unix())
+	})
+
+	// A reading from just now: comfortably inside the staleness TTL, so an
+	// unaware gather would stand down.
+	preRun := now.Add(-time.Second)
+	mergeClaudeRateLimitCacheFromSource(os.Getenv("AIEXPEDITE_CLAUDE_RL_CACHE"),
+		map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {
+				UsedPercentage: 30, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+				ObservedAtMs: preRun.UnixMilli(), usageKnown: true,
+			},
+		}, preRun, "", claudeRateLimitSourceProbe)
+
+	// Record a debt for a run that finished after that reading.
+	runCompleted := now
+	claudeUsageProbe.oweObservation(runCompleted)
+
+	if !refreshClaudeUsageIfStale(context.Background(), now.Add(time.Second),
+		latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")), probeTestToken, "") {
+		t.Fatal("a gather must pay an outstanding post-run debt rather than trusting the staleness TTL")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1", got)
+	}
+	if latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")); !latest.After(runCompleted) {
+		t.Errorf("observation %v did not advance past the run %v", latest, runCompleted)
+	}
+	// Debt paid: the next gather goes back to the ordinary TTL.
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Errorf("debt still outstanding (%v) after a successful probe", owed)
+	}
+}
+
+// An observation that arrives from another writer between the run and the
+// trailing probe settles the debt without spending a request.
+func TestClaudeUsageProbe_DebtSettledByAnotherWriterSkipsTheTrailingProbe(t *testing.T) {
+	now := time.Now()
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":12,"resets_at":%d}]}`,
+			now.Add(time.Hour).Unix())
+	})
+
+	runCompleted := now
+	// The status-line hook records a reading after the run finished.
+	after := runCompleted.Add(50 * time.Millisecond)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 45, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: after.UnixMilli(), usageKnown: true,
+		},
+	}, after, "", claudeRateLimitSourceStatusLine)
+
+	claudeUsageProbeAfterRun(runCompleted)
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Errorf("request count=%d, want 0 — another writer already answered for this run", got)
+	}
+}
+
+// waitForObservationAfter polls the merged cache until an observation newer than
+// `baseline` appears. The trailing probe is asynchronous by design, so polling
+// is the only honest way to assert it ran.
+func waitForObservationAfter(t *testing.T, baseline time.Time, within time.Duration, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")); latest.After(baseline) {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("%s (baseline %s)", msg, baseline.UTC().Format(time.RFC3339Nano))
+}

@@ -122,6 +122,14 @@ const (
 	// probe. Long enough to be a real reprieve for the service, short enough that
 	// a malformed or hostile header cannot disable utilization for days.
 	claudeUsageProbeMaxRetryAfter = 2 * time.Hour
+	// claudeUsageProbeMaxTrailingWait bounds how long a deferred post-run probe
+	// will hold a timer. Beyond this the debt is recorded but not scheduled, and
+	// the next routine gather pays it — a 30-minute backoff or a two-hour
+	// Retry-After is not a state to park a goroutine through.
+	claudeUsageProbeMaxTrailingWait = 5 * time.Minute
+	// claudeUsageProbeTrailingSlack pads the wake-up past the eligibility instant
+	// so a timer that fires a hair early is not refused and rescheduled.
+	claudeUsageProbeTrailingSlack = 50 * time.Millisecond
 )
 
 // claudeUsageProbeWindow is the ONLY shape decoded from the response. Every
@@ -354,6 +362,19 @@ type claudeUsageProbeGate struct {
 	// local backoff it is NOT bypassable by a user refresh: the service has told
 	// us to stop, and a Refresh button is not a reason to ignore it.
 	heldUntil time.Time
+	// owedBaseline is the newest run completion for which we still owe an
+	// observation, and trailingScheduled marks that a timer is already waiting to
+	// pay it. See oweObservation: the throttle must be able to DELAY a post-run
+	// probe, never to discard it.
+	owedBaseline      time.Time
+	trailingScheduled bool
+	// cancelTrailing is closed by resetClaudeUsageProbeGate to abandon any timer
+	// that is currently sleeping. A trailing probe resolves the endpoint and the
+	// cache path when it WAKES, so one that outlives its test would read whatever
+	// environment is live by then — another test's server, or once the env is
+	// restored, the real endpoint with a fixture token. Same escape the in-flight
+	// drain closes, one timer removed.
+	cancelTrailing chan struct{}
 }
 
 var claudeUsageProbe claudeUsageProbeGate
@@ -386,8 +407,9 @@ func SetClaudeUsageProbeDisabled(disabled bool) {
 // asserting one boolean.
 var claudeUsageProbeDrainTimeout = 5 * time.Second
 
-// resetClaudeUsageProbeGate drains any in-flight probe, then clears the
-// throttle/latch. Test-only seam, mirroring resetOpenCodeReadinessCache.
+// resetClaudeUsageProbeGate drains any in-flight probe, cancels any sleeping
+// trailing probe, then clears the throttle/latch. Test-only seam, mirroring
+// resetOpenCodeReadinessCache.
 //
 // The drain is load-bearing, not tidiness. triggerClaudeUsageProbeAfterRun runs
 // the probe on a goroutine, and probeClaudeUsage resolves the endpoint AFTER
@@ -418,6 +440,14 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.armed = false
 	claudeUsageProbe.failures = 0
 	claudeUsageProbe.heldUntil = time.Time{}
+	claudeUsageProbe.owedBaseline = time.Time{}
+	claudeUsageProbe.trailingScheduled = false
+	// Abandon any sleeping trailing timer before the caller restores the
+	// environment it would otherwise wake into.
+	if claudeUsageProbe.cancelTrailing != nil {
+		close(claudeUsageProbe.cancelTrailing)
+	}
+	claudeUsageProbe.cancelTrailing = make(chan struct{})
 	claudeUsageProbe.mu.Unlock()
 	claudeUsageProbeLog.mu.Lock()
 	claudeUsageProbeLog.category = ""
@@ -498,6 +528,81 @@ func (g *claudeUsageProbeGate) interval() time.Duration {
 // finish releases the single-flight slot and records the outcome. A probe that
 // refreshed the cache — or that skipped before issuing a request — clears the
 // failure streak; only a real failure extends the backoff.
+// nextEligible reports when begin() would next admit a probe, and whether it
+// ever will. Caller must NOT hold g.mu.
+func (g *claudeUsageProbeGate) nextEligible(now time.Time) (time.Time, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.armed {
+		return time.Time{}, false
+	}
+	at := now
+	if !g.heldUntil.IsZero() && g.heldUntil.After(at) {
+		at = g.heldUntil
+	}
+	if !g.lastAttempt.IsZero() {
+		if ready := g.lastAttempt.Add(g.interval()); ready.After(at) {
+			at = ready
+		}
+	}
+	return at, true
+}
+
+// oweObservation records that a run completed at `baseline` and still needs an
+// observation newer than it, and reports whether THIS caller should start the
+// trailing timer.
+//
+// Coalescing is the point: many runs can finish inside one throttle window, and
+// they collectively need exactly one probe — the newest baseline subsumes the
+// older ones, and only the first caller gets the timer.
+func (g *claudeUsageProbeGate) oweObservation(baseline time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if baseline.After(g.owedBaseline) {
+		g.owedBaseline = baseline
+	}
+	if g.trailingScheduled {
+		return false
+	}
+	g.trailingScheduled = true
+	return true
+}
+
+// trailingCancelCh returns the channel a sleeping trailing probe should abandon
+// on. Lazily created so the zero-value gate is usable.
+func (g *claudeUsageProbeGate) trailingCancelCh() <-chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.cancelTrailing == nil {
+		g.cancelTrailing = make(chan struct{})
+	}
+	return g.cancelTrailing
+}
+
+// takeOwed releases the trailing-timer slot and returns the baseline to satisfy.
+func (g *claudeUsageProbeGate) takeOwed() time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.trailingScheduled = false
+	return g.owedBaseline
+}
+
+// settleOwed clears the debt once an observation at or after `baseline` exists.
+func (g *claudeUsageProbeGate) settleOwed(baseline time.Time) {
+	g.mu.Lock()
+	if !baseline.Before(g.owedBaseline) {
+		g.owedBaseline = time.Time{}
+	}
+	g.mu.Unlock()
+}
+
+// owedObservation returns the outstanding post-run baseline, if any.
+func (g *claudeUsageProbeGate) owedObservation() time.Time {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.owedBaseline
+}
+
 // holdUntil records a server-imposed floor on the next attempt. Ignored when the
 // deadline is zero (no usable Retry-After).
 func (g *claudeUsageProbeGate) holdUntil(deadline time.Time) {
@@ -929,14 +1034,26 @@ func claudeUsageProbeStatus(raw string) string {
 // re-read before shaping the metrics.
 func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, accessToken, fingerprint string) bool {
 	forced := claudeUsageProbe.forced()
-	if !forced && !latest.IsZero() && now.Sub(latest) < claudeUsageProbeStaleAfter {
+	// An outstanding post-run debt overrides the staleness TTL: a reading taken
+	// BEFORE the run is not "fresh enough" just because it is recent, and this is
+	// the backstop for a trailing probe that was too far out to schedule or that
+	// failed.
+	owed := claudeUsageProbe.owedObservation()
+	owing := !owed.IsZero() && (latest.IsZero() || !latest.After(owed))
+	if !forced && !owing && !latest.IsZero() && now.Sub(latest) < claudeUsageProbeStaleAfter {
 		return false
 	}
 	// A user-initiated refresh is never deduped against the shared cache —
 	// somebody is looking at the card and asked for a reading now. A routine
 	// gather is, against the current interval.
 	baseline := time.Time{}
-	if !forced {
+	switch {
+	case forced:
+		// Never deduped — somebody is looking at the card.
+	case owing:
+		// Must beat the run, not merely the interval.
+		baseline = owed
+	default:
 		claudeUsageProbe.mu.Lock()
 		window := claudeUsageProbe.interval()
 		claudeUsageProbe.mu.Unlock()
@@ -948,6 +1065,9 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 	refreshed, probeErr := probeClaudeUsage(ctx, now,
 		func() claudeUsageProbeIdentity { return identity }, baseline)
 	logClaudeUsageProbeFailure(probeErr)
+	if refreshed && owing {
+		claudeUsageProbe.settleOwed(owed)
+	}
 	return refreshed
 }
 
@@ -963,13 +1083,86 @@ func triggerClaudeUsageProbeAfterRun() {
 	if !claudeUsageProbe.armedForProbe() {
 		return
 	}
+	completedAt := time.Now()
 	go func() {
 		defer func() { _ = recover() }()
-		ctx, cancel := context.WithTimeout(context.Background(), claudeUsageProbeTimeout)
-		defer cancel()
-		_, probeErr := runClaudeUsageProbe(ctx, time.Now())
-		logClaudeUsageProbeFailure(probeErr)
+		claudeUsageProbeAfterRun(completedAt)
 	}()
+}
+
+// claudeUsageProbeAfterRun refreshes utilization for a run that finished at
+// `completedAt`, DEFERRING rather than dropping the probe when the gate is not
+// ready yet.
+//
+// Why deferring matters: the minimum interval is checked in begin() before any
+// baseline is consulted, so a routine gather (or another run) that probed thirty
+// seconds ago would otherwise make this run's refresh vanish — and the gather
+// path then treats that pre-run reading as fresh for the whole staleness TTL, so
+// latestObservedAt stays behind the run for minutes. The throttle exists to bound
+// the request RATE, not to decide which runs get reported; delaying to the end of
+// the window satisfies both.
+//
+// Bounded: the debt is a single coalesced baseline with at most one timer, so a
+// burst of runs inside one window costs one trailing probe, not one per run.
+func claudeUsageProbeAfterRun(completedAt time.Time) {
+	if claudeUsageProbeSettledSince(completedAt) {
+		return
+	}
+	eligibleAt, ever := claudeUsageProbe.nextEligible(time.Now())
+	if !ever {
+		return
+	}
+	if wait := time.Until(eligibleAt); wait > 0 {
+		if wait > claudeUsageProbeMaxTrailingWait {
+			// Too far out to hold a timer for — under a long Retry-After or a deep
+			// failure backoff, both states where we should not be pressing anyway.
+			// The debt is still recorded, and refreshClaudeUsageIfStale honors it on
+			// the next gather.
+			claudeUsageProbe.oweObservation(completedAt)
+			return
+		}
+		if !claudeUsageProbe.oweObservation(completedAt) {
+			return // another run already scheduled the trailing probe
+		}
+		cancel := claudeUsageProbe.trailingCancelCh()
+		select {
+		case <-time.After(wait + claudeUsageProbeTrailingSlack):
+		case <-shutdownChan:
+			claudeUsageProbe.takeOwed()
+			return
+		case <-cancel:
+			// The gate was reset under us; the environment this probe would read
+			// on waking is no longer the one it was scheduled against.
+			claudeUsageProbe.takeOwed()
+			return
+		}
+		completedAt = claudeUsageProbe.takeOwed()
+		if completedAt.IsZero() || claudeUsageProbeSettledSince(completedAt) {
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), claudeUsageProbeTimeout)
+	defer cancel()
+	refreshed, probeErr := probeClaudeUsage(ctx, time.Now(), claudeUsageProbeStoredIdentity, completedAt)
+	logClaudeUsageProbeFailure(probeErr)
+	if refreshed {
+		claudeUsageProbe.settleOwed(completedAt)
+	}
+}
+
+// claudeUsageProbeSettledSince reports whether the shared cache already holds an
+// observation newer than `baseline`, clearing any debt it satisfies.
+func claudeUsageProbeSettledSince(baseline time.Time) bool {
+	identity := claudeUsageProbeStoredIdentity()
+	if identity.token == "" {
+		return true // nothing this probe could ever read
+	}
+	if claudeUsageProbeObservedSince(identity.fingerprint, baseline) {
+		claudeUsageProbe.settleOwed(baseline)
+		return true
+	}
+	return false
 }
 
 // retryAfterDeadline turns a Retry-After header into an absolute instant, or the
