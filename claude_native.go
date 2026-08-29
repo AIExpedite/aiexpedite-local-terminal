@@ -759,7 +759,10 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 			// under-quota run emits only usage-less heartbeats. Kick the bounded
 			// probe AFTER the frame is published so it can never reorder frames or
 			// delay waitForExit; it is asynchronous, single-flight and throttled.
-			if isClaudeTerminalResultLine(trimmed) {
+			// detectResultEvent is the same terminal-frame decision session.go
+			// makes for the managed path — one definition, so the two execution
+			// paths can never disagree about what "the run finished" means.
+			if detectResultEvent("claude", trimmed) {
 				triggerClaudeUsageProbeAfterRun()
 			}
 		}

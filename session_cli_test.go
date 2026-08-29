@@ -3075,6 +3075,20 @@ func TestDetectResultEvent_ClaudeResultEvent(t *testing.T) {
 			line: `{"type":42}`,
 			want: false,
 		},
+		// The two cases below pin the cheap `"result"` substring prefilter that
+		// guards the decode. It runs on every stdout line of every Claude session
+		// (claude_native.go tolerates multi-megabyte frames), so it must reject
+		// the common non-result frames without a false negative on a real one.
+		{
+			name: "tool_result frame must not match the prefilter",
+			line: `{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}`,
+			want: false,
+		},
+		{
+			name: "whitespace between key and value still matches",
+			line: `{"subtype": "success", "type": "result"}`,
+			want: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

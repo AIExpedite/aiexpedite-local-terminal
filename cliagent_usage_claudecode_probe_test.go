@@ -262,6 +262,43 @@ func TestClaudeUsageProbe_FailuresLeaveCacheByteIdentical(t *testing.T) {
 	}
 }
 
+// A redirect must NOT be followed: the pinned-URL check vetted one location, and
+// re-issuing the request would carry the subscription bearer token somewhere it
+// never approved. The 3xx surfaces as an ordinary non-2xx failure instead.
+func TestClaudeUsageProbe_DoesNotFollowRedirects(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+
+	var leaked int64
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			atomic.AddInt64(&leaked, 1)
+		}
+		fmt.Fprint(w, `{"five_hour":{"used_percentage":99}}`)
+	}))
+	t.Cleanup(sink.Close)
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, sink.URL, http.StatusFound)
+	})
+
+	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
+	if refreshed {
+		t.Error("a redirect must not be treated as a reading")
+	}
+	if probeErr == nil || probeErr.ErrorCategory != cliUsageErrorProviderUnavailable {
+		t.Errorf("probeErr=%+v, want %q", probeErr, cliUsageErrorProviderUnavailable)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("origin request count=%d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&leaked); got != 0 {
+		t.Errorf("the redirect target received %d authorized request(s); the token must never follow a 3xx", got)
+	}
+	if _, err := os.Stat(cache); !os.IsNotExist(err) {
+		t.Errorf("no cache should have been written; stat err=%v", err)
+	}
+}
+
 // A connection the probe cannot open is a failure like any other: no cache
 // write, and a category that names the transport rather than the endpoint.
 func TestClaudeUsageProbe_ConnectionRefusedLeavesCacheAlone(t *testing.T) {
@@ -392,18 +429,40 @@ func TestClaudeUsageProbe_SkipConditions(t *testing.T) {
 		}
 	})
 
-	t.Run("plain-http endpoint off loopback is refused", func(t *testing.T) {
-		_, calls := armClaudeUsageProbe(t, ok)
-		t.Setenv(claudeUsageProbeEndpointEnv, "http://usage.example.com/api/oauth/usage")
-		refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
-		if refreshed {
-			t.Error("a bearer token must never be sent in the clear to a remote host")
-		}
-		if probeErr == nil || probeErr.ErrorCategory != cliUsageErrorProviderUnavailable {
-			t.Errorf("probeErr=%+v, want %q", probeErr, cliUsageErrorProviderUnavailable)
-		}
-		if got := atomic.LoadInt64(calls); got != 0 {
-			t.Errorf("request count=%d, want 0", got)
+	// The endpoint override is a test seam, not a redirect knob: the request
+	// carries the user's subscription bearer token, so anything able to set the
+	// env var must not be able to aim it at a host of its choosing. Every
+	// non-loopback override — http OR https — is refused outright rather than
+	// falling back to the real endpoint, so an ignored override fails visibly.
+	for _, override := range []string{
+		"http://usage.example.com/api/oauth/usage",
+		"https://usage.example.com/api/oauth/usage",
+		"https://api.anthropic.com.evil.test/api/oauth/usage",
+		"file:///etc/passwd",
+		"://nonsense",
+	} {
+		t.Run("non-loopback override refused: "+override, func(t *testing.T) {
+			_, calls := armClaudeUsageProbe(t, ok)
+			t.Setenv(claudeUsageProbeEndpointEnv, override)
+			refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
+			if refreshed {
+				t.Error("the bearer token must never be sent to an overridden remote host")
+			}
+			if probeErr == nil || probeErr.ErrorCategory != cliUsageErrorProviderUnavailable {
+				t.Errorf("probeErr=%+v, want %q", probeErr, cliUsageErrorProviderUnavailable)
+			}
+			if got := atomic.LoadInt64(calls); got != 0 {
+				t.Errorf("request count=%d, want 0", got)
+			}
+		})
+	}
+
+	// An unset override resolves to the real, hard-coded HTTPS endpoint — the
+	// only host this probe may ever reach in production.
+	t.Run("unset override resolves to the pinned endpoint", func(t *testing.T) {
+		t.Setenv(claudeUsageProbeEndpointEnv, "")
+		if got := claudeUsageProbeURL(); got != claudeUsageProbeEndpoint {
+			t.Errorf("claudeUsageProbeURL()=%q, want %q", got, claudeUsageProbeEndpoint)
 		}
 	})
 }
@@ -505,6 +564,30 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 		seed(t, cache, now.Add(-claudeUsageProbeStaleAfter-time.Minute))
 		if !refreshClaudeUsageIfStale(context.Background(), now, "") {
 			t.Error("a reading older than the staleness TTL must be refreshed")
+		}
+		if got := atomic.LoadInt64(calls); got != 1 {
+			t.Errorf("request count=%d, want 1", got)
+		}
+	})
+
+	// Inside the minimum interval the probe would be refused anyway, so the
+	// gather must not pay for the staleness read (a cache load plus a parse of
+	// Claude's settings.json to locate the pinned hook cache) to learn that.
+	t.Run("a throttled gather skips the staleness read", func(t *testing.T) {
+		cache, calls := armClaudeUsageProbe(t, body)
+		t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+		seed(t, cache, now.Add(-claudeUsageProbeStaleAfter-time.Minute))
+
+		if !refreshClaudeUsageIfStale(context.Background(), now, "") {
+			t.Fatal("the first stale gather should probe")
+		}
+		// Make the cache unreadable: a second staleness read would now be
+		// observable as a changed outcome, and there must not be one.
+		if err := os.Remove(cache); err != nil {
+			t.Fatal(err)
+		}
+		if refreshClaudeUsageIfStale(context.Background(), now.Add(time.Second), "") {
+			t.Error("a gather inside the minimum interval must not probe")
 		}
 		if got := atomic.LoadInt64(calls); got != 1 {
 			t.Errorf("request count=%d, want 1", got)

@@ -1343,18 +1343,6 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					session.signalFirstRealFrame()
 				}
 
-				// A completed turn is when the account's real percentages have
-				// just moved — and when the stream has told us nothing numeric,
-				// because an under-quota run emits only usage-less heartbeats
-				// that mergeClaudeRateLimitCache (correctly) refuses to treat as
-				// fresh. Kick the bounded utilization probe here so the CLI
-				// Agents card advances after a managed run. Asynchronous,
-				// single-flight and throttled, so a chatty session issues one
-				// request and the streaming path is never delayed.
-				if isClaudeTerminalResultLine(line.text) {
-					triggerClaudeUsageProbeAfterRun()
-				}
-
 				// Fail fast when Claude Code reports it cannot authenticate. The
 				// driver strips env-based credentials for claude to force the
 				// user's `/login` subscription, so an expired/absent login here
@@ -1479,6 +1467,16 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				// no-output watchdog so it doesn't later publish a misleading
 				// /login error and kill a session that already completed.
 				session.signalFirstRealFrame()
+
+				// A completed turn is when the account's real percentages have
+				// just moved — and when the stream has told us nothing numeric,
+				// because an under-quota run emits only usage-less heartbeats
+				// that mergeClaudeRateLimitCache (correctly) refuses to treat as
+				// fresh. Kick the bounded utilization probe so the CLI Agents
+				// card advances after a managed run. Asynchronous, single-flight
+				// and throttled, so a chatty multi-turn session issues one
+				// request and the streaming path is never delayed.
+				triggerClaudeUsageProbeAfterRun()
 			}
 
 			// Try to parse as JSON event for structured detection
@@ -3858,6 +3856,14 @@ func detectResultEvent(command, line string) bool {
 	}
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	// Cheap prefilter before the decode, mirroring isClaudeRateLimitEventLine.
+	// A frame whose `type` is "result" necessarily contains the quoted literal,
+	// and this runs on every stdout line of every Claude session — including the
+	// multi-megabyte assistant frames claude_native.go tolerates, where an
+	// unconditional map decode is the expensive part.
+	if !strings.Contains(trimmed, `"result"`) {
 		return false
 	}
 	var event map[string]interface{}

@@ -140,7 +140,10 @@ func (t *claudeUsageProbeTs) UnmarshalJSON(b []byte) error {
 	}
 	var f float64
 	if err := json.Unmarshal(b, &f); err != nil {
-		return err
+		// Same tolerance as the unparseable-string case: a reset stamp we cannot
+		// read must not discard the percentage alongside it, which is the actual
+		// reading this probe exists to obtain.
+		return nil
 	}
 	t.Ms = normalizeResetMs(f)
 	return nil
@@ -195,6 +198,10 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.force = false
 	claudeUsageProbe.armed = false
 	claudeUsageProbe.mu.Unlock()
+	claudeUsageProbeLog.mu.Lock()
+	claudeUsageProbeLog.category = ""
+	claudeUsageProbeLog.at = time.Time{}
+	claudeUsageProbeLog.mu.Unlock()
 }
 
 // claudeUsageProbeMinIntervalValue is the effective throttle floor, honoring the
@@ -255,6 +262,20 @@ func (g *claudeUsageProbeGate) armedForProbe() bool {
 	return g.armed
 }
 
+// wouldThrottle reports whether begin() would refuse right now for a reason the
+// caller can determine without touching the disk. Lets the routine-gather path
+// skip the staleness cache load (which also parses Claude's settings.json to
+// find the pinned hook cache) when the answer cannot change the outcome.
+func (g *claudeUsageProbeGate) wouldThrottle(now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.force {
+		return false
+	}
+	return g.inFlight ||
+		(!g.lastAttempt.IsZero() && now.Sub(g.lastAttempt) < claudeUsageProbeMinIntervalValue())
+}
+
 // claudeUsageProbeAccessToken returns the stored subscription access token, or
 // "" when the probe must not run: an env credential outranks the stored /login
 // (its account has no card here, so its usage must not be merged into one), no
@@ -289,6 +310,15 @@ func claudeUsageProbeAccessToken() string {
 func claudeUsageProbeClient() *http.Client {
 	return &http.Client{
 		Timeout: claudeUsageProbeTimeout,
+		// Refuse redirects outright. This is a single fixed endpoint, so a 3xx is
+		// not an expected response — and following one would re-issue a request
+		// carrying the subscription bearer token to a location the pinned-URL
+		// check never vetted. Go strips Authorization across domains, but
+		// "mostly safe" is the wrong bar for a credential; surfacing the 3xx as a
+		// non-2xx failure loses nothing real.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 		Transport: &http.Transport{
 			Proxy:       nil,
 			DialContext: (&net.Dialer{Timeout: claudeUsageProbeTimeout}).DialContext,
@@ -296,28 +326,37 @@ func claudeUsageProbeClient() *http.Client {
 	}
 }
 
-// claudeUsageProbeURL resolves the endpoint and enforces the transport rule:
-// HTTPS, or plain HTTP only to loopback (which is what the httptest override in
-// the tests is). Returns "" when the override is unusable, which skips the probe
-// rather than sending a bearer token in the clear to an arbitrary host.
+// claudeUsageProbeURL resolves the endpoint the probe may call.
+//
+// The override is deliberately restricted to LOOPBACK. It exists so tests can
+// point at an httptest server; it is not a redirect knob. This request carries
+// the user's subscription bearer token, so an env var that could aim it at an
+// arbitrary host would be a credential-exfiltration primitive for anything able
+// to influence the agent's environment — a much sharper edge than the path-only
+// AIEXPEDITE_CLAUDE_RL_CACHE override this convention otherwise follows.
+//
+// A non-loopback or unparseable override returns "" (probe skipped) rather than
+// silently falling back to the real endpoint: an override that was set and then
+// ignored should fail visibly, not send the token somewhere the operator did not
+// just ask for.
 func claudeUsageProbeURL() string {
-	raw := firstNonEmpty(os.Getenv(claudeUsageProbeEndpointEnv), claudeUsageProbeEndpoint)
-	parsed, err := url.Parse(raw)
+	override := strings.TrimSpace(os.Getenv(claudeUsageProbeEndpointEnv))
+	if override == "" {
+		return claudeUsageProbeEndpoint
+	}
+	parsed, err := url.Parse(override)
 	if err != nil || parsed.Host == "" {
 		return ""
 	}
-	if parsed.Scheme == "https" {
-		return raw
-	}
-	if parsed.Scheme != "http" {
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return ""
 	}
 	host := parsed.Hostname()
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-		return raw
+		return override
 	}
 	if strings.EqualFold(host, "localhost") {
-		return raw
+		return override
 	}
 	return ""
 }
@@ -363,7 +402,13 @@ func runClaudeUsageProbe(ctx context.Context, now time.Time) (bool, *cliAgentUsa
 	// The OAuth surface is beta-gated; Claude Code sends the same opt-in.
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 
-	resp, err := claudeUsageProbeClient().Do(req)
+	client := claudeUsageProbeClient()
+	// The transport is built per call (matching the antigravity quota probe), so
+	// its keep-alive connections have no later owner. Release them explicitly
+	// instead of leaving one idle TLS connection per probe until the runtime
+	// finalizes the transport.
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
 	if err != nil {
 		category := cliUsageErrorProviderUnavailable
 		if reqCtx.Err() != nil {
@@ -508,7 +553,7 @@ func claudeUsageProbeStatus(raw string) string {
 // claudeUsageProbeStaleAfter. Returns whether the cache was refreshed; the
 // caller reads the cache after it either way.
 func refreshClaudeUsageIfStale(ctx context.Context, now time.Time, fingerprint string) bool {
-	if !claudeUsageProbe.armedForProbe() {
+	if !claudeUsageProbe.armedForProbe() || claudeUsageProbe.wouldThrottle(now) {
 		return false
 	}
 	if !claudeUsageProbe.forced() {
@@ -528,6 +573,12 @@ func refreshClaudeUsageIfStale(ctx context.Context, now time.Time, fingerprint s
 // and collapsed by its single-flight, so a burst of finishing sessions issues
 // one request.
 func triggerClaudeUsageProbeAfterRun() {
+	// Cheap synchronous gate before spawning anything. This fires once per
+	// completed turn on every Claude session, and a process that can never probe
+	// (unarmed, or the user opted out) should not pay a goroutine for it.
+	if !claudeUsageProbe.armedForProbe() {
+		return
+	}
 	go func() {
 		defer func() { _ = recover() }()
 		ctx, cancel := context.WithTimeout(context.Background(), claudeUsageProbeTimeout)
@@ -537,11 +588,35 @@ func triggerClaudeUsageProbeAfterRun() {
 	}()
 }
 
+// claudeUsageProbeLog throttles the failure notice. A persistently unreachable
+// endpoint (laptop off the network, endpoint 500ing) would otherwise print once
+// per minute forever in the tray app's console, drowning the messages an
+// operator is actually reading. One line per category per interval keeps the
+// signal — the failure stays visible — without the flood.
+var claudeUsageProbeLog struct {
+	mu       sync.Mutex
+	category string
+	at       time.Time
+}
+
+const claudeUsageProbeLogInterval = 15 * time.Minute
+
 // logClaudeUsageProbeFailure prints the failure CATEGORY only. The response
 // body, the endpoint's query, and the credential are never logged — the whole
 // point of returning a typed record instead of an error string.
 func logClaudeUsageProbeFailure(probeErr *cliAgentUsageError) {
 	if probeErr == nil {
+		return
+	}
+	claudeUsageProbeLog.mu.Lock()
+	repeat := claudeUsageProbeLog.category == probeErr.ErrorCategory &&
+		time.Since(claudeUsageProbeLog.at) < claudeUsageProbeLogInterval
+	if !repeat {
+		claudeUsageProbeLog.category = probeErr.ErrorCategory
+		claudeUsageProbeLog.at = time.Now()
+	}
+	claudeUsageProbeLog.mu.Unlock()
+	if repeat {
 		return
 	}
 	fmt.Printf("%s[claude-usage] utilization probe unavailable (%s) — falling back to stream/status-line capture%s\n",
