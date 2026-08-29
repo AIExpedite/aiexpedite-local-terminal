@@ -85,7 +85,7 @@ func TestClaudeUsageProbe_WritesFreshBuckets(t *testing.T) {
 			t.Errorf("Authorization=%q, want the stored access token", got)
 		}
 		fmt.Fprint(w, probeUsageJSON(map[string]string{
-			claudeWindowFiveHour: fmt.Sprintf(`{"utilization":0.42,"resets_at":%q,"status":"allowed"}`,
+			claudeWindowFiveHour: fmt.Sprintf(`{"utilization":42,"resets_at":%q,"status":"allowed"}`,
 				fiveReset.Format(time.RFC3339)),
 			claudeWindowSevenDay: fmt.Sprintf(`{"used_percentage":77.5,"resets_at":%d,"status":"allowed"}`,
 				weekReset.Unix()),
@@ -106,7 +106,7 @@ func TestClaudeUsageProbe_WritesFreshBuckets(t *testing.T) {
 	}
 	five := snap.Buckets[claudeWindowFiveHour]
 	if five.UsedPercentage < 41.9 || five.UsedPercentage > 42.1 {
-		t.Errorf("five_hour UsedPercentage=%v, want ~42 (utilization 0.42)", five.UsedPercentage)
+		t.Errorf("five_hour UsedPercentage=%v, want ~42 (utilization is 0..100 here)", five.UsedPercentage)
 	}
 	if !five.hasObservedUsage() {
 		t.Error("five_hour must be recorded as an observed reading, not a heartbeat row")
@@ -141,7 +141,7 @@ func TestClaudeUsageProbe_AdvancesObservedAtAfterHeartbeatOnlyRun(t *testing.T) 
 
 	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, probeUsageJSON(map[string]string{
-			claudeWindowFiveHour: fmt.Sprintf(`{"utilization":0.6,"resets_at":%d,"status":"allowed"}`, reset.Unix()),
+			claudeWindowFiveHour: fmt.Sprintf(`{"utilization":60,"resets_at":%d,"status":"allowed"}`, reset.Unix()),
 		}))
 	})
 
@@ -387,17 +387,6 @@ func TestClaudeUsageProbe_SkipConditions(t *testing.T) {
 		fmt.Fprint(w, `{"five_hour":{"used_percentage":10,"resets_at":0}}`)
 	}
 
-	t.Run("env credential outranks the stored login", func(t *testing.T) {
-		_, calls := armClaudeUsageProbe(t, ok)
-		t.Setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
-		if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); refreshed || probeErr != nil {
-			t.Errorf("refreshed=%v err=%+v, want a silent skip", refreshed, probeErr)
-		}
-		if got := atomic.LoadInt64(calls); got != 0 {
-			t.Errorf("request count=%d, want 0 — env-account usage has no card here", got)
-		}
-	})
-
 	t.Run("disable_claude_usage_probe", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, ok)
 		SetClaudeUsageProbeDisabled(true)
@@ -493,13 +482,16 @@ func TestClaudeUsageProbe_ThrottleAndSingleFlight(t *testing.T) {
 			t.Errorf("request count=%d, want 1", got)
 		}
 
-		// A user-initiated refresh bypasses the interval — exactly once.
+		// A user-initiated refresh bypasses the LOCAL timer. It cannot bypass the
+		// shared-cache check, so clear the observation the first probe wrote —
+		// otherwise this would be asserting the dedupe away rather than the timer.
+		// (TestClaudeUsageProbe_SharedObservationSuppressesDuplicate covers that.)
+		if err := os.Remove(os.Getenv("AIEXPEDITE_CLAUDE_RL_CACHE")); err != nil {
+			t.Fatal(err)
+		}
 		SetClaudeUsageForceProbe(true)
 		if refreshed, _ := runClaudeUsageProbe(context.Background(), now.Add(2*time.Second)); !refreshed {
 			t.Error("a forced probe must bypass the minimum interval")
-		}
-		if refreshed, _ := runClaudeUsageProbe(context.Background(), now.Add(3*time.Second)); refreshed {
-			t.Error("the force flag must be consumed by one probe")
 		}
 		if got := atomic.LoadInt64(calls); got != 2 {
 			t.Errorf("request count=%d, want 2", got)
@@ -715,17 +707,6 @@ func TestRefreshClaudeUsageIfStale_UsesTheCallersCredential(t *testing.T) {
 		t.Errorf("probe reading did not land: ok=%v buckets=%+v", ok, snap.Buckets)
 	}
 
-	// The env-auth guard still applies to the caller-supplied path — a token in
-	// hand must not bypass the rule that env-account usage has no card here.
-	resetClaudeUsageProbeGate()
-	SetClaudeUsageProbeDisabled(false)
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
-	if refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, "handed-in-token") {
-		t.Error("env credentials outrank the stored login even when a token was passed in")
-	}
-	if got := atomic.LoadInt64(calls); got != 1 {
-		t.Errorf("request count=%d, want still 1", got)
-	}
 }
 
 // An already-cancelled gather must not burn the throttle slot: the next caller
@@ -1080,5 +1061,358 @@ func TestResetClaudeUsageProbeGate_DrainIsBounded(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < claudeUsageProbeDrainTimeout {
 		t.Errorf("gave up after %v, before the %v deadline — the drain did not run",
 			elapsed, claudeUsageProbeDrainTimeout)
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* Response-shape coverage: the limits[] representation                       */
+/* -------------------------------------------------------------------------- */
+
+// The current payload carries windows in a `limits[]` array, not as top-level
+// objects. Decoding only the legacy shape is how this probe silently becomes a
+// no-op — it would return "no plottable window" forever while the endpoint
+// answered perfectly well, leaving latestObservedAt exactly as stale as the bug
+// this branch exists to fix.
+func TestClaudeUsageProbe_DecodesLimitsArray(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	fiveReset := now.Add(2 * time.Hour)
+	weekReset := now.Add(72 * time.Hour)
+
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{
+			"limits": [
+				{"type":"session","percent":31.5,"resets_at":%q,"status":"allowed"},
+				{"type":"weekly_all","percent":64,"resets_at":%q,"status":"allowed"},
+				{"type":"weekly_scoped","model":"claude-opus-4","percent":88,"resets_at":%q},
+				{"type":"weekly_scoped","model":"claude-sonnet-4","percent":12,"resets_at":%q},
+				{"type":"weekly_scoped","model":"fable-5","percent":7,"resets_at":%q},
+				{"type":"some_future_meter","percent":99,"resets_at":%q},
+				{"type":"weekly_scoped","model":"an-unmodelled-model","percent":50,"resets_at":%q}
+			]
+		}`,
+			fiveReset.Format(time.RFC3339), weekReset.Format(time.RFC3339),
+			weekReset.Format(time.RFC3339), weekReset.Format(time.RFC3339),
+			weekReset.Format(time.RFC3339), weekReset.Format(time.RFC3339),
+			weekReset.Format(time.RFC3339))
+	})
+
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+		t.Fatalf("runClaudeUsageProbe: refreshed=%v err=%+v", refreshed, probeErr)
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected a cache write")
+	}
+
+	for _, tc := range []struct {
+		window string
+		want   float64
+	}{
+		{claudeWindowFiveHour, 31.5},
+		{claudeWindowSevenDay, 64},
+		{claudeWindowSevenDayOpus, 88},
+		{claudeWindowSevenDaySonnet, 12},
+		{claudeWindowSevenDayFable, 7},
+	} {
+		got, present := snap.Buckets[tc.window]
+		if !present {
+			t.Errorf("%s missing from the cache; got %+v", tc.window, snap.Buckets)
+			continue
+		}
+		if got.UsedPercentage != tc.want {
+			t.Errorf("%s UsedPercentage=%v, want %v", tc.window, got.UsedPercentage, tc.want)
+		}
+		if got.ResetsAtMs == 0 {
+			t.Errorf("%s lost its reset stamp", tc.window)
+		}
+	}
+	// Unmodelled entries are dropped, not guessed into a row.
+	if len(snap.Buckets) != 5 {
+		t.Errorf("cache holds %d windows, want 5 — unrecognized limits[] entries must be dropped: %+v",
+			len(snap.Buckets), snap.Buckets)
+	}
+
+	// The Fable row is reachable ONLY through weekly_scoped on this shape, which
+	// is the specific row a legacy-only decoder would leave permanently blank.
+	fable := claudeCodeMetricsFromCache(now, "")[2]
+	if fable.Unknown || fable.Consumed == nil || *fable.Consumed != 7 {
+		t.Errorf("weekly Fable row=%+v, want an observed 7%%", fable)
+	}
+}
+
+// Legacy top-level windows remain a fallback, so a rollback (or an account still
+// served the old shape) keeps working.
+func TestClaudeUsageProbe_FallsBackToLegacyWindows(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(2 * time.Hour)
+
+	t.Run("limits absent", func(t *testing.T) {
+		cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, `{"five_hour":{"used_percentage":25,"resets_at":%d}}`, reset.Unix())
+		})
+		if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+			t.Fatalf("refreshed=%v err=%+v", refreshed, probeErr)
+		}
+		snap, _ := loadClaudeRateLimitSnapshot(cache)
+		if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 25 {
+			t.Errorf("five_hour=%v, want 25 from the legacy field", got)
+		}
+	})
+
+	t.Run("limits null and legacy windows null", func(t *testing.T) {
+		_, _ = armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, `{"limits":null,"five_hour":null,"seven_day":null}`)
+		})
+		refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
+		if refreshed {
+			t.Error("an all-null payload is not an observation")
+		}
+		if probeErr == nil || probeErr.ErrorCategory != cliUsageErrorParseFailed {
+			t.Errorf("probeErr=%+v, want %q", probeErr, cliUsageErrorParseFailed)
+		}
+	})
+
+	t.Run("limits wins where both describe a window", func(t *testing.T) {
+		cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, `{
+				"limits":[{"type":"session","percent":70,"resets_at":%d}],
+				"five_hour":{"used_percentage":10,"resets_at":%d}
+			}`, reset.Unix(), reset.Unix())
+		})
+		if refreshed, _ := runClaudeUsageProbe(context.Background(), now); !refreshed {
+			t.Fatal("expected a reading")
+		}
+		snap, _ := loadClaudeRateLimitSnapshot(cache)
+		if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 70 {
+			t.Errorf("five_hour=%v, want 70 — the maintained shape wins", got)
+		}
+	})
+}
+
+/* -------------------------------------------------------------------------- */
+/* Percentage scale                                                           */
+/* -------------------------------------------------------------------------- */
+
+// The OAuth usage endpoint reports percentages, NOT the stream's 0..1 fraction.
+// Scaling a small value by 100 would turn a genuine 0.5% reading just after a
+// reset into 50%, and 1% into 100% — reporting a nearly-empty quota as half or
+// fully consumed.
+func TestClaudeUsageProbeBucket_UtilizationIsAPercentage(t *testing.T) {
+	for _, tc := range []struct {
+		raw  float64
+		want float64
+	}{
+		{0, 0},
+		{0.5, 0.5},
+		{1, 1},
+		{42, 42},
+		{99.9, 99.9},
+		{100, 100},
+		{140, 100}, // clamped
+		{-5, 0},    // clamped
+	} {
+		util := tc.raw
+		bucket, ok := claudeUsageProbeBucket(claudeUsageProbeWindow{Utilization: &util}, 0)
+		if !ok {
+			t.Errorf("utilization %v produced no reading", tc.raw)
+			continue
+		}
+		if bucket.UsedPercentage != tc.want {
+			t.Errorf("utilization %v -> %v, want %v", tc.raw, bucket.UsedPercentage, tc.want)
+		}
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* Daemon environment must not suppress the probe                             */
+/* -------------------------------------------------------------------------- */
+
+// Both launch paths strip CLAUDE_* and ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
+// before spawning Claude, so a spawned run burns the STORED subscription login
+// no matter what the daemon inherited. Skipping the probe on the daemon's own
+// environment would leave a tray agent started from a shell that exports those
+// vars running Claude against the stored account and never refreshing it.
+func TestClaudeUsageProbe_InheritedEnvCredentialsDoNotSuppressTheProbe(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+
+	for _, envVar := range []string{
+		"ANTHROPIC_AUTH_TOKEN",
+		"CLAUDE_CODE_OAUTH_TOKEN",
+		"CLAUDE_CODE_USE_BEDROCK",
+	} {
+		t.Run(envVar, func(t *testing.T) {
+			cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprintf(w, `{"limits":[{"type":"session","percent":44,"resets_at":%d}]}`,
+					now.Add(time.Hour).Unix())
+			})
+			t.Setenv(envVar, "inherited-from-the-developer-shell")
+
+			if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+				t.Fatalf("refreshed=%v err=%+v — the daemon environment says nothing about "+
+					"which credential the spawned Claude used", refreshed, probeErr)
+			}
+			if got := atomic.LoadInt64(calls); got != 1 {
+				t.Errorf("request count=%d, want 1", got)
+			}
+			snap, _ := loadClaudeRateLimitSnapshot(cache)
+			if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 44 {
+				t.Errorf("five_hour=%v, want the stored account reading", got)
+			}
+		})
+	}
+
+	// The stripping this relies on is real, not assumed.
+	t.Run("the launch paths do strip those vars", func(t *testing.T) {
+		env := []string{
+			"ANTHROPIC_API_KEY=sk-secret",
+			"ANTHROPIC_AUTH_TOKEN=tok",
+			"CLAUDE_CODE_OAUTH_TOKEN=oauth",
+			"CLAUDE_CODE_USE_BEDROCK=1",
+			"PATH=/usr/bin",
+		}
+		filtered, _ := prepareClaudeChildEnv("claude", env)
+		for _, e := range filtered {
+			upper := strings.ToUpper(e)
+			if strings.HasPrefix(upper, "ANTHROPIC_API_KEY=") ||
+				strings.HasPrefix(upper, "ANTHROPIC_AUTH_TOKEN=") ||
+				strings.HasPrefix(upper, "CLAUDE_CODE_OAUTH_TOKEN=") ||
+				strings.HasPrefix(upper, "CLAUDE_CODE_USE_BEDROCK=") {
+				t.Errorf("env credential survived into the child: %q", e)
+			}
+		}
+	})
+}
+
+/* -------------------------------------------------------------------------- */
+/* Persistence failures, rate-limit backpressure, cross-process dedupe        */
+/* -------------------------------------------------------------------------- */
+
+// A cache the probe cannot write is NOT a refresh. Reporting success would tell
+// the caller to re-read unchanged data, clear the failure backoff, throttle the
+// retry, and sign a receipt claiming an observation that was never persisted.
+func TestClaudeUsageProbe_UnwritableCacheIsNotARefresh(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"type":"session","percent":33,"resets_at":%d}]}`,
+			now.Add(time.Hour).Unix())
+	})
+
+	// Point the cache at a path that cannot be created: an existing REGULAR file
+	// standing where the parent directory would have to be.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(blocker, "sub", "rl.json"))
+
+	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
+	if refreshed {
+		t.Error("an unwritable cache must not be reported as a refresh")
+	}
+	if probeErr == nil || probeErr.ErrorCategory != cliUsageErrorCollectionFailed {
+		t.Errorf("probeErr=%+v, want %q", probeErr, cliUsageErrorCollectionFailed)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1", got)
+	}
+}
+
+// A 429 must be honored, not merely counted as a failure. This endpoint is
+// account-scoped and shared with every other poller on the account, so pressing
+// on through explicit backpressure is how a fleet degrades it for everyone —
+// including Claude's own /usage panel.
+func TestClaudeUsageProbe_HonorsRetryAfter(t *testing.T) {
+	now := time.Now()
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "120")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now); probeErr == nil {
+		t.Fatal("a 429 must be reported as a failure")
+	}
+	// Even a user-initiated refresh must respect an explicit hold.
+	SetClaudeUsageForceProbe(true)
+	if refreshed, _ := runClaudeUsageProbe(context.Background(), now.Add(30*time.Second)); refreshed {
+		t.Error("probed again inside the Retry-After window")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1 — Retry-After was ignored", got)
+	}
+
+	// Past the hold it resumes.
+	SetClaudeUsageForceProbe(true)
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(3*time.Minute)); probeErr == nil {
+		t.Error("expected the probe to resume after the Retry-After window")
+	}
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Errorf("request count=%d, want 2", got)
+	}
+}
+
+func TestRetryAfterDeadline(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	if got := retryAfterDeadline("", now); !got.IsZero() {
+		t.Errorf("empty header -> %v, want zero", got)
+	}
+	if got := retryAfterDeadline("not-a-value", now); !got.IsZero() {
+		t.Errorf("garbage header -> %v, want zero", got)
+	}
+	if got := retryAfterDeadline("0", now); !got.IsZero() {
+		t.Errorf("zero delta -> %v, want zero", got)
+	}
+	if got := retryAfterDeadline("90", now); !got.Equal(now.Add(90 * time.Second)) {
+		t.Errorf("delta-seconds -> %v, want %v", got, now.Add(90*time.Second))
+	}
+	httpDate := now.Add(5 * time.Minute).UTC().Format(http.TimeFormat)
+	if got := retryAfterDeadline(httpDate, now); got.IsZero() || got.Before(now) {
+		t.Errorf("HTTP-date -> %v, want a future instant", got)
+	}
+	// A hostile value cannot park the probe for days.
+	if got := retryAfterDeadline("999999999", now); !got.Equal(now.Add(claudeUsageProbeMaxRetryAfter)) {
+		t.Errorf("oversized delta -> %v, want the %v cap", got, claudeUsageProbeMaxRetryAfter)
+	}
+	// A past date is not a hold.
+	past := now.Add(-time.Hour).UTC().Format(http.TimeFormat)
+	if got := retryAfterDeadline(past, now); !got.IsZero() {
+		t.Errorf("past date -> %v, want zero", got)
+	}
+}
+
+// The per-process gate cannot bound an ACCOUNT-scoped endpoint on its own: a
+// release and a dev agent, or an agent overlapping its own restart, share only
+// the on-disk cache. Consulting that shared cache before spending a request is
+// what keeps the bound roughly per-device.
+func TestClaudeUsageProbe_SharedObservationSuppressesDuplicate(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"type":"session","percent":50,"resets_at":%d}]}`,
+			now.Add(time.Hour).Unix())
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	// Stand in for the other process: a fresh observation already in the cache.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 21, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: now.Add(-10 * time.Second).UnixMilli(), usageKnown: true,
+		},
+	}, now.Add(-10*time.Second), "", claudeRateLimitSourceProbe)
+
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); refreshed || probeErr != nil {
+		t.Errorf("refreshed=%v err=%+v, want a silent skip — another writer just observed", refreshed, probeErr)
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Errorf("request count=%d, want 0 — the shared cache already held a fresh reading", got)
+	}
+
+	// Once that shared observation ages past the interval, the probe runs again.
+	resetClaudeUsageProbeGate()
+	SetClaudeUsageProbeDisabled(false)
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now.Add(5*time.Minute)); !refreshed || probeErr != nil {
+		t.Errorf("refreshed=%v err=%+v, want a probe once the shared reading aged out", refreshed, probeErr)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1", got)
 	}
 }

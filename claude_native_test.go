@@ -470,7 +470,7 @@ func waitForClaudeObservationAfter(t *testing.T, cache string, after time.Time) 
 func TestClaudeNativeLifecycle_TerminalResultAdvancesUtilization(t *testing.T) {
 	skipIfUnsupportedOS(t)
 	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"five_hour":{"utilization":0.37,"resets_at":%d,"status":"allowed"}}`,
+		fmt.Fprintf(w, `{"five_hour":{"utilization":37,"resets_at":%d,"status":"allowed"}}`,
 			time.Now().Add(3*time.Hour).Unix())
 	})
 	seeded := seedStaleClaudeObservation(t, cache)

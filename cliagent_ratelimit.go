@@ -395,14 +395,29 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 // percentage, so claiming its own provenance for a percentage it did not
 // measure would be wrong.
 func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) {
+	_ = mergeClaudeRateLimitCacheChecked(path, updates, now, fingerprint, source)
+}
+
+// mergeClaudeRateLimitCacheChecked is the same merge, but REPORTS whether the
+// snapshot actually reached disk.
+//
+// The fire-and-forget wrappers above are right for the stream and status-line
+// writers: they run in hot paths, fire constantly, and a dropped write is
+// corrected by the next event moments later. The utilization probe is not like
+// that. It runs at most once per interval, and its caller's return value feeds a
+// SIGNED refresh receipt — so silently absorbing an unwritable cache dir, a
+// transient Windows sharing violation, or a failed rename would let the probe
+// report a fresh observation it never persisted, clear its failure backoff, and
+// throttle the retry that would have fixed it.
+func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) error {
 	if path == "" || len(updates) == 0 {
-		return
+		return fmt.Errorf("claude rate-limit cache: nothing to merge")
 	}
 	claudeRateLimitMu.Lock()
 	defer claudeRateLimitMu.Unlock()
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return
+		return err
 	}
 	// Cross-process exclusive lock. Best-effort: if the lock file can't be
 	// created (read-only data dir) we still proceed — the in-process mutex
@@ -500,7 +515,7 @@ func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeR
 
 	out, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 	// Write-then-rename so a concurrent loadClaudeRateLimitSnapshot reader never
 	// observes a half-written file. The PID + nanosecond suffix keeps two
@@ -508,11 +523,13 @@ func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeR
 	// colliding on the intermediate file even outside the lock.
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return
+		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		return err
 	}
+	return nil
 }
 
 // acquireCrossProcessCacheLock opens (and exclusively locks) a sibling file of

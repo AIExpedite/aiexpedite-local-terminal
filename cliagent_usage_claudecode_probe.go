@@ -22,8 +22,18 @@
 //
 //   - Single-flight per process, with a minimum interval between attempts that
 //     DOUBLES per consecutive failure up to claudeUsageProbeMaxInterval. A
-//     user-initiated __cli_usage_refresh__ bypasses the interval via
-//     SetClaudeUsageForceProbe; nothing bypasses the single-flight.
+//     user-initiated __cli_usage_refresh__ bypasses that local timer via
+//     SetClaudeUsageForceProbe; nothing bypasses the single-flight, the shared
+//     cache check, or a 429 hold.
+//   - The endpoint is ACCOUNT-scoped, so a per-process gate cannot bound it on
+//     its own: a release and a dev agent, an agent overlapping its own restart,
+//     and the status-line hook all consume the same limit while sharing nothing
+//     but the on-disk cache. Before spending a request the probe therefore asks
+//     that shared cache whether someone already observed inside the current
+//     interval (claudeUsageProbeRecentlyObserved), and it honors Retry-After on
+//     a 429. Neither is exact — two processes can still race between the check
+//     and the write — but together they collapse the steady-state duplication,
+//     which is what matters for a limit shared with Claude own pollers.
 //   - 3s timeout, no proxy inheritance, redirects refused, and the endpoint is
 //     the pinned HTTPS constant — the env override is accepted ONLY for loopback
 //     (see claudeUsageProbeURL). 32 KB body cap.
@@ -32,9 +42,19 @@
 //     encoding/json rather than carried into the cache or the signed receipt.
 //   - Skipped entirely when the process never armed it (SetClaudeUsageProbeDisabled
 //     is called only by StartAgent), when the user opted out
-//     (disable_claude_usage_probe), when the agent is offline, when an env
-//     credential outranks the stored /login (claudeEnvAuthActive — that account
-//     has no card here), or when no stored access token exists.
+//     (disable_claude_usage_probe), when the agent is offline, or when no stored
+//     access token exists.
+//   - Deliberately NOT gated on claudeEnvAuthActive(). That guard belongs to the
+//     status-line hook, whose environment IS the Claude session it reports for.
+//     This probe runs in the DAEMON, and both launch paths strip CLAUDE_* and
+//     ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN before spawning Claude
+//     (claudeAlwaysStripped / claudeBillingStripped), so a spawned run always
+//     burns the stored subscription login no matter what the daemon inherited.
+//     Skipping on the daemon environment would leave a tray agent started from a
+//     shell that happens to export ANTHROPIC_API_KEY running Claude against the
+//     stored account and never refreshing it — the exact staleness this file
+//     exists to fix. The probe reads the STORED credential and asks about the
+//     STORED account, so there is no env-account usage to misattribute.
 //   - On any failure the cache is left byte-identical, preserving
 //     terminal-service's payload-hash delta-skip.
 package main
@@ -78,11 +98,14 @@ const (
 	claudeUsageProbeTimeout = 3 * time.Second
 	// claudeUsageProbeMaxBody bounds the decode. The real payload is ~1 KB.
 	claudeUsageProbeMaxBody = 32 * 1024
-	// claudeUsageProbeMinInterval is the floor between two attempts on this
-	// device while the probe is HEALTHY: ~60 requests/hour per device worst case
-	// — a per-device call, not a fan-out, so it scales with active devices rather
-	// than with runs. A repeatedly failing probe settles at a far lower rate as
-	// its interval doubles (see interval).
+	// claudeUsageProbeMinInterval is the floor between two attempts while the
+	// probe is HEALTHY, giving ~60 requests/hour as an upper bound. That bound is
+	// enforced per PROCESS by the gate and approximately per DEVICE by the shared
+	// cache check in claudeUsageProbeRecentlyObserved — a second agent channel on
+	// the same machine reads the same cache and stands down rather than doubling
+	// the rate. It is a per-account call, not a fan-out, so it scales with active
+	// accounts rather than with runs. A repeatedly failing probe settles far
+	// below the bound as its interval doubles (see interval).
 	claudeUsageProbeMinInterval = 60 * time.Second
 	// claudeUsageProbeMaxInterval caps the consecutive-failure backoff, so a
 	// persistently broken endpoint settles at ~2 requests/hour/device instead of
@@ -95,6 +118,10 @@ const (
 	// before a ROUTINE gather (as opposed to a run-completion or a user-initiated
 	// refresh) is allowed to spend a probe on it.
 	claudeUsageProbeStaleAfter = 10 * time.Minute
+	// claudeUsageProbeMaxRetryAfter caps how long a 429 Retry-After may park the
+	// probe. Long enough to be a real reprieve for the service, short enough that
+	// a malformed or hostile header cannot disable utilization for days.
+	claudeUsageProbeMaxRetryAfter = 2 * time.Hour
 )
 
 // claudeUsageProbeWindow is the ONLY shape decoded from the response. Every
@@ -109,17 +136,99 @@ type claudeUsageProbeWindow struct {
 	Status         string             `json:"status"`
 }
 
-// claudeUsageProbeResponse enumerates the windows we accept, by the exact ids
-// the cache and claudeFableWindowIDs already know. A window id we do not model
-// here is not persisted — a new upstream meter must be added deliberately
-// rather than landing on the card as an unlabelled row.
+// claudeUsageProbeResponse accepts BOTH shapes this endpoint is known to use,
+// because reading only one of them is how this probe silently becomes a no-op.
+//
+//  1. `limits[]` — the current representation: a list of entries typed
+//     `session`, `weekly_all` or `weekly_scoped`, the last carrying the model
+//     the scope applies to. On this shape the Fable meter may exist ONLY as a
+//     weekly_scoped entry, so a decoder ignoring the list would leave that row
+//     permanently unobservable.
+//  2. Legacy top-level window objects, kept as a fallback so a rollback (or an
+//     account still served the previous shape) keeps working.
+//
+// Both are allow-lists: an entry we do not model is dropped rather than landing
+// on the card as an unlabelled row. When both are present the list wins, since
+// it is the shape the service actively maintains; the legacy fields fill only
+// windows the list did not supply.
 type claudeUsageProbeResponse struct {
+	Limits []claudeUsageProbeLimit `json:"limits"`
+
 	FiveHour                *claudeUsageProbeWindow `json:"five_hour"`
 	SevenDay                *claudeUsageProbeWindow `json:"seven_day"`
 	SevenDaySonnet          *claudeUsageProbeWindow `json:"seven_day_sonnet"`
 	SevenDayOpus            *claudeUsageProbeWindow `json:"seven_day_opus"`
 	SevenDayFable           *claudeUsageProbeWindow `json:"seven_day_fable"`
 	SevenDayOverageIncluded *claudeUsageProbeWindow `json:"seven_day_overage_included"`
+}
+
+// claudeUsageProbeLimit is one entry of the `limits[]` representation. Same
+// allow-list discipline as claudeUsageProbeWindow: metric fields only, decoded
+// into a typed struct so anything else the server sends is discarded.
+//
+// Percent is the reading under this shape; utilization / used_percentage are
+// accepted too because this service has used all three names for the same
+// 0..100 number across revisions, and taking whichever is present costs nothing.
+type claudeUsageProbeLimit struct {
+	Type           string             `json:"type"`
+	Model          string             `json:"model"`
+	Scope          string             `json:"scope"`
+	Percent        *float64           `json:"percent"`
+	Utilization    *float64           `json:"utilization"`
+	UsedPercentage *float64           `json:"used_percentage"`
+	ResetsAt       claudeUsageProbeTs `json:"resets_at"`
+	Status         string             `json:"status"`
+}
+
+// window converts a limits[] entry into the window-shaped value the rest of the
+// probe already understands.
+func (l claudeUsageProbeLimit) window() claudeUsageProbeWindow {
+	return claudeUsageProbeWindow{
+		Utilization:    l.Utilization,
+		UsedPercentage: firstNonNilFloat(l.Percent, l.UsedPercentage),
+		ResetsAt:       l.ResetsAt,
+		Status:         l.Status,
+	}
+}
+
+// cacheWindow maps a limits[] entry onto a cache window id, or "" when the entry
+// is not one we model.
+//
+//	session       -> five_hour
+//	weekly_all    -> seven_day
+//	weekly_scoped -> seven_day_<model>, for the models the card has rows for
+//
+// An unrecognized type, or a weekly_scoped entry naming a model we have no row
+// for, is dropped: surfacing it would either invent a row or file one model
+// usage under a different model meter.
+func (l claudeUsageProbeLimit) cacheWindow() string {
+	switch strings.ToLower(strings.TrimSpace(l.Type)) {
+	case "session":
+		return claudeWindowFiveHour
+	case "weekly_all":
+		return claudeWindowSevenDay
+	case "weekly_scoped":
+		scope := strings.ToLower(strings.TrimSpace(firstNonEmpty(l.Model, l.Scope)))
+		switch {
+		case strings.Contains(scope, "opus"):
+			return claudeWindowSevenDayOpus
+		case strings.Contains(scope, "sonnet"):
+			return claudeWindowSevenDaySonnet
+		case strings.Contains(scope, "fable"):
+			return claudeWindowSevenDayFable
+		}
+	}
+	return ""
+}
+
+// firstNonNilFloat returns the first non-nil pointer, or nil.
+func firstNonNilFloat(values ...*float64) *float64 {
+	for _, v := range values {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
 }
 
 // claudeUsageProbeTs accepts a reset stamp as either a number (epoch seconds or
@@ -184,6 +293,10 @@ type claudeUsageProbeGate struct {
 	// failures counts CONSECUTIVE failed probes and drives the backoff in
 	// interval(). Cleared by any success or early skip.
 	failures int
+	// heldUntil is a server-imposed floor from a 429 Retry-After. Unlike the
+	// local backoff it is NOT bypassable by a user refresh: the service has told
+	// us to stop, and a Refresh button is not a reason to ignore it.
+	heldUntil time.Time
 }
 
 var claudeUsageProbe claudeUsageProbeGate
@@ -247,6 +360,7 @@ func resetClaudeUsageProbeGate() {
 	claudeUsageProbe.force = false
 	claudeUsageProbe.armed = false
 	claudeUsageProbe.failures = 0
+	claudeUsageProbe.heldUntil = time.Time{}
 	claudeUsageProbe.mu.Unlock()
 	claudeUsageProbeLog.mu.Lock()
 	claudeUsageProbeLog.category = ""
@@ -273,6 +387,10 @@ func (g *claudeUsageProbeGate) begin(now time.Time) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !g.armed || g.inFlight {
+		return false
+	}
+	// A server-imposed hold outranks everything below, including force.
+	if !g.heldUntil.IsZero() && now.Before(g.heldUntil) {
 		return false
 	}
 	// An explicitly disconnected agent must not make outbound calls; the cached
@@ -323,6 +441,19 @@ func (g *claudeUsageProbeGate) interval() time.Duration {
 // finish releases the single-flight slot and records the outcome. A probe that
 // refreshed the cache — or that skipped before issuing a request — clears the
 // failure streak; only a real failure extends the backoff.
+// holdUntil records a server-imposed floor on the next attempt. Ignored when the
+// deadline is zero (no usable Retry-After).
+func (g *claudeUsageProbeGate) holdUntil(deadline time.Time) {
+	if deadline.IsZero() {
+		return
+	}
+	g.mu.Lock()
+	if deadline.After(g.heldUntil) {
+		g.heldUntil = deadline
+	}
+	g.mu.Unlock()
+}
+
 func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError) {
 	g.mu.Lock()
 	g.inFlight = false
@@ -353,8 +484,34 @@ func (g *claudeUsageProbeGate) armedForProbe() bool {
 	return g.armed
 }
 
+// claudeUsageProbeRecentlyObserved reports whether the SHARED cache already
+// holds an observation newer than the current probe interval — i.e. whether some
+// other writer on this machine (a second agent channel, an overlapping restart,
+// the status-line hook) has already refreshed the account within the window this
+// probe would otherwise ask about again.
+//
+// This is what makes the request bound roughly per-DEVICE rather than merely
+// per-process. It cannot be exact — two processes can still race between the
+// check and the write — but it collapses the steady-state duplication, which is
+// what actually matters for an account-scoped endpoint shared with Claude own
+// pollers.
+func claudeUsageProbeRecentlyObserved(now time.Time) bool {
+	claudeUsageProbe.mu.Lock()
+	window := claudeUsageProbe.interval()
+	claudeUsageProbe.mu.Unlock()
+	if window <= 0 {
+		return false
+	}
+	latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets(currentClaudeAccountFingerprint()))
+	return !latest.IsZero() && now.Sub(latest) < window
+}
+
 // claudeUsageProbeAccessToken reads the stored subscription access token from
 // disk (or the macOS Keychain), or "" when there is none.
+//
+// No claudeEnvAuthActive() check: see the file header. The daemon environment
+// says nothing about which credential a spawned Claude used, because both launch
+// paths strip the env credentials before spawning it.
 //
 // Called only by the post-run path, which has no credential in hand. The gather
 // path passes the token it already decoded instead — on macOS this read shells
@@ -462,16 +619,24 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 	if !claudeUsageProbe.begin(now) {
 		return false, nil
 	}
+	// Cross-process coordination. The gate above is per PROCESS, but this
+	// endpoint is per ACCOUNT: a release and a dev agent on one machine, a
+	// restarted agent overlapping its predecessor, or the status-line hook firing
+	// on an interactive render, all hit the same account-scoped limit while
+	// sharing nothing but the on-disk cache. Consult that shared cache before
+	// spending a request — if somebody already recorded an observation inside the
+	// current interval, this probe would only be re-asking a question that has
+	// just been answered.
+	//
+	// Deliberately after begin() so the throttle stamp is still claimed: a
+	// duplicate suppressed here should hold this process off for the interval too.
+	if claudeUsageProbeRecentlyObserved(now) {
+		return false, nil
+	}
 	// Named returns so the deferred finish records whatever this call returned:
 	// a failure extends the backoff, a success or an early skip clears it.
 	defer func() { claudeUsageProbe.finish(probeErr) }()
 
-	// An env credential outranks the stored /login, and its account has no card
-	// here — merging its usage into the stored-login card would misattribute it.
-	// Checked in ONE place so both entry points share the rule.
-	if claudeEnvAuthActive() {
-		return false, nil
-	}
 	token := resolveToken()
 	if token == "" {
 		// Not an error: a signed-out device simply has nothing for this probe.
@@ -515,6 +680,14 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return false, claudeUsageProbeFailure(cliUsageErrorNotAuthenticated)
 	}
+	if resp.StatusCode == http.StatusTooManyRequests {
+		// Honor the service backpressure rather than only our own timer. This
+		// endpoint is account-scoped and shared with every other poller on the
+		// account — Claude own /usage panel included — so ignoring Retry-After
+		// would keep pressing exactly when we have been asked to stop.
+		claudeUsageProbe.holdUntil(retryAfterDeadline(resp.Header.Get("Retry-After"), time.Now()))
+		return false, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return false, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
@@ -539,8 +712,16 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 		// nothing.
 		return false, claudeUsageProbeFailure(cliUsageErrorParseFailed)
 	}
-	mergeClaudeRateLimitCacheFromSource(claudeRateLimitCachePath(), updates, now,
-		currentClaudeAccountFingerprint(), claudeRateLimitSourceProbe)
+	// Report success only if the snapshot actually reached disk. The
+	// fire-and-forget merge swallows an unwritable data dir, a Windows sharing
+	// violation, and a failed rename alike — returning true on any of those would
+	// tell the caller to re-read a cache that never changed, clear the failure
+	// backoff, and throttle the retry, while a SIGNED refresh receipt went out
+	// carrying an observation that was never persisted.
+	if err := mergeClaudeRateLimitCacheChecked(claudeRateLimitCachePath(), updates, now,
+		currentClaudeAccountFingerprint(), claudeRateLimitSourceProbe); err != nil {
+		return false, claudeUsageProbeFailure(cliUsageErrorCollectionFailed)
+	}
 	return true, nil
 }
 
@@ -550,22 +731,35 @@ func probeClaudeUsage(ctx context.Context, now time.Time, resolveToken func() st
 func claudeUsageProbeBuckets(decoded claudeUsageProbeResponse, now time.Time) map[string]claudeRateLimitBucket {
 	nowMs := now.UnixMilli()
 	out := map[string]claudeRateLimitBucket{}
-	add := func(window string, w *claudeUsageProbeWindow) {
-		if w == nil {
-			return
-		}
-		bucket, ok := claudeUsageProbeBucket(*w, nowMs)
+	add := func(window string, w claudeUsageProbeWindow) {
+		bucket, ok := claudeUsageProbeBucket(w, nowMs)
 		if !ok {
 			return
 		}
 		out[window] = bucket
 	}
-	add(claudeWindowFiveHour, decoded.FiveHour)
-	add(claudeWindowSevenDay, decoded.SevenDay)
-	add(claudeWindowSevenDaySonnet, decoded.SevenDaySonnet)
-	add(claudeWindowSevenDayOpus, decoded.SevenDayOpus)
-	add(claudeWindowSevenDayFable, decoded.SevenDayFable)
-	add(claudeWindowSevenDayOverageIncluded, decoded.SevenDayOverageIncluded)
+	// limits[] first — it is the representation the service actively maintains,
+	// so where both shapes describe a window the list is the one to trust.
+	for _, limit := range decoded.Limits {
+		window := limit.cacheWindow()
+		if window == "" {
+			continue
+		}
+		add(window, limit.window())
+	}
+	// Legacy top-level windows fill only what the list did not supply.
+	addLegacy := func(window string, w *claudeUsageProbeWindow) {
+		if _, taken := out[window]; taken || w == nil {
+			return
+		}
+		add(window, *w)
+	}
+	addLegacy(claudeWindowFiveHour, decoded.FiveHour)
+	addLegacy(claudeWindowSevenDay, decoded.SevenDay)
+	addLegacy(claudeWindowSevenDaySonnet, decoded.SevenDaySonnet)
+	addLegacy(claudeWindowSevenDayOpus, decoded.SevenDayOpus)
+	addLegacy(claudeWindowSevenDayFable, decoded.SevenDayFable)
+	addLegacy(claudeWindowSevenDayOverageIncluded, decoded.SevenDayOverageIncluded)
 	return out
 }
 
@@ -583,16 +777,20 @@ func claudeUsageProbeBucket(w claudeUsageProbeWindow, nowMs int64) (claudeRateLi
 		bucket.UsedPercentage = clampPercent(*w.UsedPercentage)
 		bucket.usageKnown = true
 	case w.Utilization != nil:
-		// Both scales are in the wild: the SDK's RateLimitInfo reports 0..1 while
-		// the /usage surface reports 0..100. They only disagree below 1, and
-		// bucketFromInfo already resolves that the same way (utilization 1.0 is
-		// "fully consumed"), so keep the two readers identical.
-		util := *w.Utilization
-		if util > 1 {
-			bucket.UsedPercentage = clampPercent(util)
-		} else {
-			bucket.UsedPercentage = clampPercent(util * 100)
-		}
+		// 0..100, NOT the SDK stream 0..1 fraction.
+		//
+		// This deliberately does NOT mirror bucketFromInfo. That reader parses
+		// Claude stream-json RateLimitInfo, where `utilization` is a fraction;
+		// this reads the OAuth usage endpoint, which reports percentages — the
+		// same payload used_percentage / percent fields are plainly 0..100, and a
+		// response mixing both conventions in one object would be perverse.
+		//
+		// Guessing a fraction here is actively harmful rather than merely
+		// conservative: a genuine 0.5% reading just after a window reset would be
+		// stored as 50%, and 1% as 100%, so the card would report a fresh,
+		// nearly-empty quota as half or fully consumed. Matching each source own
+		// convention is what keeps both readers correct, not matching each other.
+		bucket.UsedPercentage = clampPercent(*w.Utilization)
 		bucket.usageKnown = true
 	case bucket.Status == claudeRateLimitStatusRejected:
 		// A rejected window may omit the percentage; it is exhausted by
@@ -671,6 +869,38 @@ func triggerClaudeUsageProbeAfterRun() {
 		_, probeErr := runClaudeUsageProbe(ctx, time.Now())
 		logClaudeUsageProbeFailure(probeErr)
 	}()
+}
+
+// retryAfterDeadline turns a Retry-After header into an absolute instant, or the
+// zero time when the header is absent or unusable.
+//
+// Both documented forms are accepted (RFC 9110): delta-seconds, and an HTTP
+// date. The result is clamped to claudeUsageProbeMaxRetryAfter so a malformed or
+// hostile value cannot park the probe for days — a bound, not a rejection, since
+// the honest response to "slow down" is to slow down.
+func retryAfterDeadline(header string, now time.Time) time.Time {
+	value := strings.TrimSpace(header)
+	if value == "" {
+		return time.Time{}
+	}
+	var deadline time.Time
+	if secs, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if secs <= 0 {
+			return time.Time{}
+		}
+		deadline = now.Add(time.Duration(secs) * time.Second)
+	} else if at, err := http.ParseTime(value); err == nil {
+		deadline = at
+	} else {
+		return time.Time{}
+	}
+	if !deadline.After(now) {
+		return time.Time{}
+	}
+	if max := now.Add(claudeUsageProbeMaxRetryAfter); deadline.After(max) {
+		deadline = max
+	}
+	return deadline
 }
 
 // claudeUsageProbeFailure builds the redacted failure record. The category is

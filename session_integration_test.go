@@ -1355,7 +1355,7 @@ func startManagedClaudeSession(t *testing.T, mode string) (*SessionManager, stri
 func TestManagedClaudeSession_TerminalResultAdvancesUtilization(t *testing.T) {
 	skipIfUnsupportedOS(t)
 	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"five_hour":{"utilization":0.58,"resets_at":%d,"status":"allowed"}}`,
+		fmt.Fprintf(w, `{"five_hour":{"utilization":58,"resets_at":%d,"status":"allowed"}}`,
 			time.Now().Add(3*time.Hour).Unix())
 	})
 	seeded := seedStaleClaudeObservation(t, cache)
@@ -1383,7 +1383,7 @@ func TestManagedClaudeSession_TerminalResultAdvancesUtilization(t *testing.T) {
 func TestManagedClaudeSession_KilledRunStillProbesOnSessionEnd(t *testing.T) {
 	skipIfUnsupportedOS(t)
 	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"five_hour":{"utilization":0.66,"resets_at":%d,"status":"allowed"}}`,
+		fmt.Fprintf(w, `{"five_hour":{"utilization":66,"resets_at":%d,"status":"allowed"}}`,
 			time.Now().Add(3*time.Hour).Unix())
 	})
 	seeded := seedStaleClaudeObservation(t, cache)
