@@ -538,11 +538,19 @@ func claudeUsageProbeBucket(w claudeUsageProbeWindow, nowMs int64) (claudeRateLi
 }
 
 // claudeUsageProbeStatus bounds and normalizes the one free-form string we read.
-// Only the documented "rejected" value survives; anything else — including
-// server prose long enough to be a payload of its own — becomes "allowed", so
-// vendor text can never reach the cache or the signed receipt.
+// Only the documented "rejected" value survives; any other non-empty value —
+// including server prose long enough to be a payload of its own — collapses to
+// "allowed", so vendor text can never reach the cache or the signed receipt.
+//
+// An ABSENT status stays empty rather than becoming "allowed": bucketFromInfo
+// leaves it empty for a stream event that omits it, and inventing a value the
+// server never sent would make the same window read differently depending on
+// which writer happened to observe it last.
 func claudeUsageProbeStatus(raw string) string {
 	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
 	if len(trimmed) > claudeUsageProbeMaxStatusLen {
 		trimmed = trimmed[:claudeUsageProbeMaxStatusLen]
 	}

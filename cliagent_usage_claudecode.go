@@ -36,6 +36,15 @@ import (
 
 type claudeCodeUsageParser struct{}
 
+// Compile-time proof that what cliAgentUsageRegistry actually stores — a
+// *claudeCodeUsageParser — still satisfies the context parser interface.
+// runProviderParseSafely selects ParseContext through a TYPE ASSERTION, which
+// fails SILENTLY: drop ParseContext or change its signature and the gather
+// quietly falls back to Parse, whose context.Background() ignores the 10s budget
+// every provider shares serially, leaving the utilization probe free to spend
+// its full timeout after that budget is gone.
+var _ cliAgentUsageContextParser = (*claudeCodeUsageParser)(nil)
+
 func (claudeCodeUsageParser) Provider() string { return "claudeCode" }
 
 var claudeAuthStatusProbe = func(path string) (bool, bool) {

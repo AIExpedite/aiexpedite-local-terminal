@@ -757,3 +757,88 @@ func TestClaudeUsageProbe_CancelledContextDoesNotBurnTheThrottle(t *testing.T) {
 		t.Errorf("request count=%d, want 1", got)
 	}
 }
+
+// The gather selects ParseContext through a TYPE ASSERTION on the value held in
+// the parser registry, and a failed assertion is silent — the gather would fall
+// back to Parse, whose context.Background() ignores the 10s budget every
+// provider shares serially, letting the probe spend its full timeout after that
+// budget is gone. Assert on the REGISTRY entry, not the concrete type: the
+// registry value is what actually flows through runProviderParseSafely.
+func TestClaudeCodeParser_RegistryEntryHonorsTheGatherDeadline(t *testing.T) {
+	parser, ok := cliAgentUsageParserIndex()["claudeCode"]
+	if !ok {
+		t.Fatal("claudeCode parser is not registered")
+	}
+	contextParser, ok := parser.(cliAgentUsageContextParser)
+	if !ok {
+		t.Fatal("the registered claudeCode parser no longer satisfies cliAgentUsageContextParser — " +
+			"the gather would silently fall back to Parse and stop honoring its deadline")
+	}
+	// Deliberately asserted on the registry entry rather than on a literal: the
+	// registry stores POINTERS (&claudeCodeUsageParser{}), so a value-type
+	// assertion would pass while proving nothing about what actually flows
+	// through runProviderParseSafely.
+
+	// And prove the deadline actually reaches the probe: with an already-expired
+	// context, ParseContext must not issue a request.
+	now := time.Now()
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"used_percentage":12,"resets_at":%d}}`, now.Add(time.Hour).Unix())
+	})
+	stubClaudeProbes(t, true, true)
+
+	expired, cancel := context.WithDeadline(context.Background(), now.Add(-time.Minute))
+	defer cancel()
+	if _, ok := contextParser.ParseContext(expired, t.TempDir(), detectedCLIAgent{Detected: true}, now); !ok {
+		t.Fatal("ParseContext should still produce a usage entry on an expired context")
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Errorf("probe request count=%d on an expired gather context, want 0", got)
+	}
+}
+
+// An absent status must stay absent. bucketFromInfo leaves it empty for a stream
+// event that omits it, so inventing "allowed" here would make the same window
+// read differently depending on which writer observed it last.
+func TestClaudeUsageProbeStatus_Normalization(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"   ", ""},
+		{"allowed", "allowed"},
+		{"rejected", claudeRateLimitStatusRejected},
+		{"REJECTED", claudeRateLimitStatusRejected},
+		{"  rejected  ", claudeRateLimitStatusRejected},
+		{"allowed, but here is a long free-form vendor explanation nobody asked for", "allowed"},
+		{strings.Repeat("x", claudeUsageProbeMaxStatusLen*4), "allowed"},
+	}
+	for _, tc := range cases {
+		if got := claudeUsageProbeStatus(tc.in); got != tc.want {
+			t.Errorf("claudeUsageProbeStatus(%q)=%q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// A probe window carrying no status writes the same shape a stream capture would
+// for the same window — asserted on the serialized cache, where an invented
+// "allowed" would show up as a `status` key the stream writer never emits.
+func TestClaudeUsageProbe_AbsentStatusIsNotPersisted(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"used_percentage":37,"resets_at":%d}}`, now.Add(time.Hour).Unix())
+	})
+
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+		t.Fatalf("runClaudeUsageProbe: refreshed=%v err=%+v", refreshed, probeErr)
+	}
+	raw, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"status"`) {
+		t.Errorf("a window with no status must not gain one:\n%s", raw)
+	}
+	snap, _ := loadClaudeRateLimitSnapshot(cache)
+	if got := snap.Buckets[claudeWindowFiveHour]; got.Status != "" || got.UsedPercentage != 37 {
+		t.Errorf("bucket=%+v, want the reading with an empty status", got)
+	}
+}
