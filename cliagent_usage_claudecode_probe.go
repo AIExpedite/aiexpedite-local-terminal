@@ -209,6 +209,13 @@ func SetClaudeUsageProbeDisabled(disabled bool) {
 	claudeUsageProbe.mu.Unlock()
 }
 
+// claudeUsageProbeDrainTimeout bounds resetClaudeUsageProbeGate's wait for an
+// in-flight probe. A var rather than a const so the test that asserts the
+// give-up behaviour can pin it small: CI runs this package under `go test -race
+// -timeout 5m`, where a hard-coded five-second sleep is pure wall-clock spent
+// asserting one boolean.
+var claudeUsageProbeDrainTimeout = 5 * time.Second
+
 // resetClaudeUsageProbeGate drains any in-flight probe, then clears the
 // throttle/latch. Test-only seam, mirroring resetOpenCodeReadinessCache.
 //
@@ -221,10 +228,10 @@ func SetClaudeUsageProbeDisabled(disabled bool) {
 // test`. Cleanup order already puts this before the env restore (t.Cleanup is
 // LIFO and the t.Setenv calls register first), so waiting here closes the window.
 //
-// Bounded so a wedged probe cannot hang the suite; the probe's own 3s timeout
-// means a live one drains far inside this.
+// Bounded by claudeUsageProbeDrainTimeout so a wedged probe cannot hang the
+// suite; the probe's own 3s timeout means a live one drains far inside it.
 func resetClaudeUsageProbeGate() {
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(claudeUsageProbeDrainTimeout)
 	for time.Now().Before(deadline) {
 		claudeUsageProbe.mu.Lock()
 		inFlight := claudeUsageProbe.inFlight

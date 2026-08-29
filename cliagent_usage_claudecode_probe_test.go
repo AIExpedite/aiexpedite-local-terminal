@@ -1043,7 +1043,17 @@ func TestResetClaudeUsageProbeGate_DrainsInFlightProbe(t *testing.T) {
 
 // The drain must be bounded: a probe that never releases the latch cannot be
 // allowed to hang the whole suite in a cleanup.
+//
+// The real deadline is shortened here rather than waited out. CI runs this
+// package under `go test -race -timeout 5m`, and sleeping the production five
+// seconds to assert one boolean is wall-clock the whole suite has to pay for.
+// Saving and restoring the package var is the same seam stubClaudeProbes uses.
 func TestResetClaudeUsageProbeGate_DrainIsBounded(t *testing.T) {
+	originalTimeout := claudeUsageProbeDrainTimeout
+	claudeUsageProbeDrainTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { claudeUsageProbeDrainTimeout = originalTimeout })
+
+	// A latch nothing will ever release — the wedged-probe case.
 	claudeUsageProbe.mu.Lock()
 	claudeUsageProbe.inFlight = true
 	claudeUsageProbe.mu.Unlock()
@@ -1053,6 +1063,7 @@ func TestResetClaudeUsageProbeGate_DrainIsBounded(t *testing.T) {
 		claudeUsageProbe.mu.Unlock()
 	})
 
+	start := time.Now()
 	done := make(chan struct{})
 	go func() {
 		resetClaudeUsageProbeGate()
@@ -1060,7 +1071,14 @@ func TestResetClaudeUsageProbeGate_DrainIsBounded(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(30 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("resetClaudeUsageProbeGate never gave up on a wedged probe")
+	}
+	// Pin that the bound is the configured deadline, not some unrelated path
+	// returning early — otherwise this test would still pass if the drain loop
+	// were deleted entirely.
+	if elapsed := time.Since(start); elapsed < claudeUsageProbeDrainTimeout {
+		t.Errorf("gave up after %v, before the %v deadline — the drain did not run",
+			elapsed, claudeUsageProbeDrainTimeout)
 	}
 }
