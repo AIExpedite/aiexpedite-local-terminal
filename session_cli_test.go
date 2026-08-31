@@ -3285,6 +3285,23 @@ func TestReadOutputStream_AntigravityConcatenatesAdjacentTextDeltas(t *testing.T
 	}
 }
 
+func TestReadOutputStream_AntigravityCompletesTruncatedDeltaStream(t *testing.T) {
+	output := strings.Join([]string{
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"partial"}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"partial response"}}`,
+	}, "\n") + "\n"
+	session := &CLISession{ID: "antigravity-truncated-deltas", Command: "agy", Stdout: io.NopCloser(strings.NewReader(output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{})}
+	var streams []string
+	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
+		if msg.Type == "stream" {
+			streams = append(streams, msg.Output)
+		}
+	})
+	if got := strings.Join(streams, ""); got != "partial response" {
+		t.Fatalf("Antigravity reconciled output = %q, want %q", got, "partial response")
+	}
+}
+
 func TestReadOutputStream_AntigravityErrorResultPublishesFailure(t *testing.T) {
 	session := &CLISession{
 		ID:             "antigravity-error-result",

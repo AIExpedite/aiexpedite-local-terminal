@@ -1069,18 +1069,19 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	appendDisplayText := func(lineText string) {
 		isAntigravityDelta := isAntigravityCommand(session.Command) && isAntigravityAgentResponseDelta(lineText)
 		displayText := extractDisplayTextWithAccumulated(session.Command, lineText, antigravityDeltas.String())
+		isAntigravityContinuation := displayText != "" && antigravityDeltas.Len() > 0 && isAntigravityCommand(session.Command) && isAntigravitySuccessResult(lineText)
 		if isAntigravityDelta {
 			antigravityDeltas.WriteString(displayText)
 		}
 		if displayText == "" {
 			return
 		}
-		if isAntigravityDelta && lastBatchEntryWasAntigravityDelta && len(batch) > 0 {
+		if (isAntigravityDelta || isAntigravityContinuation) && lastBatchEntryWasAntigravityDelta && len(batch) > 0 {
 			batch[len(batch)-1] += displayText
 		} else {
 			batch = append(batch, displayText)
 		}
-		lastBatchEntryWasAntigravityDelta = isAntigravityDelta
+		lastBatchEntryWasAntigravityDelta = isAntigravityDelta || isAntigravityContinuation
 		// Genuine assistant output (text/thinking delta or tool_use)
 		// — the session is alive and producing, so disarm the claude
 		// no-output watchdog. No-op for non-claude sessions (they
