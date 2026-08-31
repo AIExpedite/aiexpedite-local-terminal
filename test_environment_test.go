@@ -46,10 +46,10 @@ var (
 	realConfigDirAtStartup string
 )
 
-// sandboxTestConfigDir redirects the process-wide config/data directory (and
-// the environment it is derived from) into a fresh temp directory. It returns
-// a cleanup func; TestMain must call it explicitly because os.Exit skips
-// deferred calls.
+// sandboxTestConfigDir redirects the process-wide config/data and temp
+// directories (and the environment they are derived from) into a fresh
+// sandbox. It returns a cleanup func; TestMain must call it explicitly because
+// os.Exit skips deferred calls.
 func sandboxTestConfigDir() func() {
 	realHomeAtStartup = os.Getenv("HOME")
 	realConfigDirAtStartup = baseDir
@@ -75,10 +75,18 @@ func sandboxTestConfigDir() func() {
 	// no matter what this process set baseDir to.
 	appData := filepath.Join(dir, "AppData", "Roaming")
 	xdgConfigHome := filepath.Join(dir, ".config")
+	tempDir := filepath.Join(dir, "tmp")
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "sandboxTestConfigDir: cannot create %s: %v\n", tempDir, err)
+		os.Exit(1)
+	}
 	setEnvOrDie("HOME", dir)
 	setEnvOrDie("USERPROFILE", dir) // os.UserHomeDir on Windows
 	setEnvOrDie("APPDATA", appData)
 	setEnvOrDie("XDG_CONFIG_HOME", xdgConfigHome)
+	setEnvOrDie("TMPDIR", tempDir)
+	setEnvOrDie("TEMP", tempDir)
+	setEnvOrDie("TMP", tempDir)
 
 	baseDir = resolveBaseDir(runtime.GOOS, EnvConfigSuffix, dir, appData, xdgConfigHome)
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {

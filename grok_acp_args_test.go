@@ -245,7 +245,7 @@ func TestSetupIsolatedGrokHome_CopiesAuthAndWritesCleanConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = removeIsolatedGrokHome(dir) })
 
 	if dir == realHome {
 		t.Fatalf("isolated home must differ from real GROK_HOME")
@@ -314,7 +314,7 @@ func TestSetupIsolatedGrokHome_MissingAuthTolerated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome must tolerate missing auth: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = removeIsolatedGrokHome(dir) })
 
 	if _, err := os.Stat(filepath.Join(dir, "auth.json")); !os.IsNotExist(err) {
 		t.Fatalf("expected no auth.json when source missing; stat err = %v", err)
@@ -355,7 +355,7 @@ func TestPersistGrokManagedBillingSnapshot_BindsCopiedAccountAcrossLoginChange(t
 	if err != nil {
 		t.Fatalf("setup isolated home: %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(isolatedHome) })
+	t.Cleanup(func() { _ = removeIsolatedGrokHome(isolatedHome) })
 
 	now := time.Now().UTC()
 	billing := fmt.Sprintf(`{"ts":%q,"msg":%q,"credential":"credential-sentinel","prompt":"prompt-sentinel","ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":%q},"rawConfig":"raw-config-sentinel"},"subscriptionTier":"SuperGrok"}}`+"\n",
@@ -519,7 +519,7 @@ func TestSetupIsolatedGrokHome_PreservesPersistedAPIKeyWhenFallbackEnabled(t *te
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome(true): %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(on) })
+	t.Cleanup(func() { _ = removeIsolatedGrokHome(on) })
 	cfgOn, err := os.ReadFile(filepath.Join(on, "config.toml"))
 	if err != nil {
 		t.Fatalf("isolated config.toml not written: %v", err)
@@ -535,7 +535,7 @@ func TestSetupIsolatedGrokHome_PreservesPersistedAPIKeyWhenFallbackEnabled(t *te
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome(false): %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(off) })
+	t.Cleanup(func() { _ = removeIsolatedGrokHome(off) })
 	cfgOff, err := os.ReadFile(filepath.Join(off, "config.toml"))
 	if err != nil {
 		t.Fatalf("isolated config.toml not written: %v", err)
@@ -568,7 +568,7 @@ func TestSetupIsolatedGrokHome_PreservesPerModelAPIKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome(true, grok-build): %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(on) })
+	t.Cleanup(func() { _ = removeIsolatedGrokHome(on) })
 	cfgOn, err := os.ReadFile(filepath.Join(on, "config.toml"))
 	if err != nil {
 		t.Fatalf("isolated config.toml not written: %v", err)
@@ -602,7 +602,7 @@ func TestSetupIsolatedGrokHome_PreservesRootAPIKeyWhenNoPerModelMatch(t *testing
 	if err != nil {
 		t.Fatalf("setupIsolatedGrokHome(true, grok-build): %v", err)
 	}
-	t.Cleanup(func() { os.RemoveAll(on) })
+	t.Cleanup(func() { _ = removeIsolatedGrokHome(on) })
 	cfgOn, err := os.ReadFile(filepath.Join(on, "config.toml"))
 	if err != nil {
 		t.Fatalf("isolated config.toml not written: %v", err)

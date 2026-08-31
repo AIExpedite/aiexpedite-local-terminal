@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,7 +14,10 @@ import (
 const (
 	grokJunctionLinkEnv   = "AIEXPEDITE_GROK_JUNCTION_LINK"
 	grokJunctionTargetEnv = "AIEXPEDITE_GROK_JUNCTION_TARGET"
+	grokSessionsDirName   = "sessions"
 )
+
+var errGrokStoreNotLinked = errors.New("grok session store was never linked")
 
 // Grok persists every conversation to disk under
 // `$GROK_HOME/sessions/<url-encoded-cwd>/<session-uuid>/`, and ACP
@@ -84,7 +88,7 @@ func linkGrokSessionStore(home string) error {
 	if err := os.MkdirAll(store, 0o700); err != nil {
 		return fmt.Errorf("create grok session store: %w", err)
 	}
-	return linkGrokDirectory(filepath.Join(home, "sessions"), store, "session store")
+	return linkGrokDirectory(filepath.Join(home, grokSessionsDirName), store, "session store")
 }
 
 // linkGrokDirectory creates a directory link on every supported platform. The
@@ -92,12 +96,16 @@ func linkGrokSessionStore(home string) error {
 // security-isolated GROK_HOME; billing logs deliberately remain session-local
 // until an account-bound normalized snapshot is persisted after process exit.
 func linkGrokDirectory(link, target, description string) error {
-	// The isolated home is freshly created, so the entry should not exist;
-	// clear a stray one rather than failing the link. RemoveAll does not follow
-	// a junction/symlink — it unlinks it — so this cannot reach the target.
-	if _, err := os.Lstat(link); err == nil {
-		if rerr := os.RemoveAll(link); rerr != nil {
-			return fmt.Errorf("clear stale %s entry: %w", description, rerr)
+	// The isolated home is freshly created, so the entry should not exist.
+	// Clear a stray one through the same junction-aware primitive used during
+	// teardown; a plain directory is safe to remove recursively because it is
+	// not connected to the persistent store.
+	if err := unlinkGrokDirectory(link); err != nil {
+		if !errors.Is(err, errGrokStoreNotLinked) {
+			return fmt.Errorf("clear stale %s entry: %w", description, err)
+		}
+		if err := os.RemoveAll(link); err != nil {
+			return fmt.Errorf("clear stale %s directory: %w", description, err)
 		}
 	}
 
@@ -124,18 +132,83 @@ func linkGrokDirectory(link, target, description string) error {
 	return nil
 }
 
+// unlinkGrokDirectory removes a directory symlink or Windows junction without
+// traversing its target. A plain directory is reported separately so callers
+// can decide whether recursive deletion is safe for their lifecycle.
+func unlinkGrokDirectory(link string) error {
+	info, err := os.Lstat(link)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect grok directory link: %w", err)
+	}
+
+	// A Windows junction reports both ModeDir and ModeIrregular. A real
+	// directory has no type bits once ModeDir is excluded; do not pass it to
+	// os.Remove here because callers need to know the store was never linked.
+	if info.IsDir() && info.Mode().Type()&^os.ModeDir == 0 {
+		return errGrokStoreNotLinked
+	}
+
+	removeErr := os.Remove(link)
+	var fallbackErr error
+	var fallbackOutput []byte
+	if removeErr != nil && runtime.GOOS == "windows" {
+		fallbackOutput, fallbackErr = grokWindowsRemoveJunctionCommand(link).CombinedOutput()
+	}
+
+	_, statErr := os.Lstat(link)
+	if os.IsNotExist(statErr) {
+		return nil
+	}
+	if statErr != nil {
+		return fmt.Errorf("verify grok directory link removal: %w", statErr)
+	}
+	if fallbackErr != nil {
+		return fmt.Errorf("unlink grok directory (remove: %v; rmdir: %v, output: %s)",
+			removeErr, fallbackErr, string(fallbackOutput))
+	}
+	if removeErr != nil {
+		return fmt.Errorf("unlink grok directory: %w", removeErr)
+	}
+	return fmt.Errorf("verify grok directory link removal: entry still exists")
+}
+
 // grokWindowsJunctionCommand keeps filesystem paths out of cmd.exe's command
 // tokens. GROK_HOME is user-controlled and valid Windows paths may contain
 // metacharacters such as `&`; interpolating one into `cmd /c mklink` could run
 // unintended commands. Environment expansion inside quotes makes those paths
 // data, while /d and /v:off disable AutoRun and delayed `!` expansion.
 func grokWindowsJunctionCommand(link, target string) *exec.Cmd {
-	cmd := exec.Command(
-		"cmd", "/d", "/v:off", "/c",
-		`mklink /J "%`+grokJunctionLinkEnv+`%" "%`+grokJunctionTargetEnv+`%"`,
+	cmd := grokWindowsCommand(
+		`mklink /J "%` + grokJunctionLinkEnv + `%" "%` + grokJunctionTargetEnv + `%"`,
 	)
 	env := setEnvVar(os.Environ(), grokJunctionLinkEnv, link)
 	cmd.Env = setEnvVar(env, grokJunctionTargetEnv, target)
+	return cmd
+}
+
+// grokWindowsRemoveJunctionCommand uses cmd.exe's rmdir built-in as a fallback
+// for Go versions that cannot unlink a junction with os.Remove. The path stays
+// in an environment variable so cmd metacharacters are never command tokens.
+func grokWindowsRemoveJunctionCommand(link string) *exec.Cmd {
+	cmd := grokWindowsCommand(`rmdir "%` + grokJunctionLinkEnv + `%"`)
+	cmd.Env = setEnvVar(os.Environ(), grokJunctionLinkEnv, link)
+	return cmd
+}
+
+func grokWindowsCommand(script string) *exec.Cmd {
+	executable := os.Getenv("ComSpec")
+	if executable == "" {
+		if systemRoot := os.Getenv("SystemRoot"); systemRoot != "" {
+			executable = filepath.Join(systemRoot, "System32", "cmd.exe")
+		} else {
+			executable = "cmd"
+		}
+	}
+	cmd := exec.Command(executable, "/d", "/v:off", "/c", script)
+	configureGrokWindowsCommandLine(cmd, script)
 	return cmd
 }
 
