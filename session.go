@@ -2975,10 +2975,17 @@ func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []str
 		"-m": true, "--model": true,
 		"--effort": true, "--reasoning-effort": true,
 		"--max-turns": true, "--agent": true, "--agents": true,
+		// Grok 1.0.13's headless-only tool filters take a comma-separated
+		// value. In particular, the maintenance smoke passes an explicit empty
+		// --tools value to request a tool-free turn. If the empty token is
+		// mistaken for prompt text, --tools consumes the later managed -p flag
+		// and Grok exits before returning the marker.
+		"--tools": true, "--disallowed-tools": true,
 		"--cwd": true, "--permission-mode": true, "--sandbox": true,
 		"--compaction-mode": true, "--compaction-detail": true,
 		"--rules": true, "--system-prompt-override": true,
 		"--leader-socket": true, "--debug-file": true,
+		"--json-schema": true, "--worktree-ref": true, "--ref": true,
 		// Plugin discovery: xAI's plugin docs list `--plugin-dir <PATH>` as a
 		// separate-value flag. Without this entry, `grok --plugin-dir /tmp/p
 		// fix bug` would land "/tmp/p" in promptParts and the bare `--plugin-dir`

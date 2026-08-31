@@ -133,6 +133,8 @@ func TestBuildGrokACPArgs_StripsIncompatibleFlags(t *testing.T) {
 		{"auto_approve_alias_equals_form", []string{"--auto-approve=true"}},
 		{"end_of_options_delimiter", []string{"--", "--config", "model.api_key=x"}},
 		{"duplicate_entry_tokens", []string{"agent", "stdio", "chat", "tui", "run"}},
+		{"root_no_tools_smoke", []string{"--tools", "", "--disable-web-search", "--no-subagents", "--max-turns", "1", "--output-format", "plain", "--verbatim", "-p", "marker"}},
+		{"root_no_tools_equals", []string{"--tools=", "--max-turns=1", "--output-format=plain", "--single=marker"}},
 	}
 	want := []string{"agent", "--model", "grok-build", "stdio"}
 	for _, c := range cases {

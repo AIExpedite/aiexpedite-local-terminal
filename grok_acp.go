@@ -2084,8 +2084,9 @@ func setEnvVar(env []string, key, value string) []string {
 //     fallback opt-in flows through XAI_API_KEY env and the persisted
 //     `[model] api_key` config.toml line instead), the `--cwd*` containment
 //     side-door, `--always-approve` / `--auto-approve` (owned by buildGrokACPArgs), the
-//     duplicate entry tokens (`agent`/`stdio`/`chat`/`tui`/`run`), and the
-//     POSIX `--` end-of-options delimiter. `--allow <pattern>` / `--allow=…`
+//     duplicate entry tokens (`agent`/`stdio`/`chat`/`tui`/`run`), root-only
+//     one-shot flags (`--tools`, `--max-turns`, prompt/output selectors, etc.),
+//     and the POSIX `--` end-of-options delimiter. `--allow <pattern>` / `--allow=…`
 //     are xAI's documented pre-prompt allow rules (matching tools auto-approve
 //     BEFORE the per-tool prompt runs) — stripped when allowAlwaysApprove is
 //     false, mirroring the raw `session_start` path's stripGrokAllowRulePairs
@@ -2152,6 +2153,43 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwa
 			continue
 		}
 		if lower == "--no-auto-update" || lower == "--auto-update" {
+			continue
+		}
+
+		// Root-command headless flags are valid for `grok -p ...`, including
+		// the maintenance smoke's no-tools contract, but `grok agent` rejects
+		// them before the ACP handshake. Consume values for the value-taking
+		// forms so an empty --tools operand or a prompt cannot be reinterpreted
+		// as another agent flag.
+		switch lower {
+		case "--tools", "--disallowed-tools", "--max-turns", "--agent", "--agents",
+			"--output-format", "--json-schema", "--prompt-file", "--prompt-json",
+			"--rules", "--system-prompt-override", "--sandbox", "--worktree-ref", "--ref",
+			"-p", "--single":
+			if i+1 < len(extraArgs) {
+				skipNext = true
+			}
+			continue
+		case "--disable-web-search", "--no-subagents", "--no-plan", "--verbatim",
+			"--include-partial-messages", "--fork-session", "--restore-code":
+			continue
+		}
+		if strings.HasPrefix(lower, "--tools=") ||
+			strings.HasPrefix(lower, "--disallowed-tools=") ||
+			strings.HasPrefix(lower, "--max-turns=") ||
+			strings.HasPrefix(lower, "--agent=") ||
+			strings.HasPrefix(lower, "--agents=") ||
+			strings.HasPrefix(lower, "--output-format=") ||
+			strings.HasPrefix(lower, "--json-schema=") ||
+			strings.HasPrefix(lower, "--prompt-file=") ||
+			strings.HasPrefix(lower, "--prompt-json=") ||
+			strings.HasPrefix(lower, "--rules=") ||
+			strings.HasPrefix(lower, "--system-prompt-override=") ||
+			strings.HasPrefix(lower, "--sandbox=") ||
+			strings.HasPrefix(lower, "--worktree-ref=") ||
+			strings.HasPrefix(lower, "--ref=") ||
+			strings.HasPrefix(lower, "-p=") ||
+			strings.HasPrefix(lower, "--single=") {
 			continue
 		}
 

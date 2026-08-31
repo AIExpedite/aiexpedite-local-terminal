@@ -24,6 +24,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,6 +40,8 @@ import (
 )
 
 const mockCLIEnvVar = "TEST_MOCK_CLI_MODE"
+
+const grokMaintenanceSmokeMarker = "AIEXPEDITE_GROK_SMOKE_MARKER_7F3C2A"
 
 // TestMain dispatches into the mock CLI when the env var is set; otherwise
 // runs the test suite normally. This is the standard "test binary as helper
@@ -337,6 +340,9 @@ func runMockCLI(mode string) {
 		fmt.Println("grok 1.1.0")
 		os.Exit(0)
 
+	case "grok-maintenance-smoke-v1", "grok-maintenance-smoke-v2":
+		runMockGrokMaintenanceSmoke(mode)
+
 	case "grok-acp-usage-limit":
 		// Emit a single ACP `session/update` notification that carries a
 		// usage_limit_reached signal under params.update.sessionUpdate, then
@@ -395,6 +401,69 @@ func runMockCLI(mode string) {
 		fmt.Fprintf(os.Stderr, "unknown TEST_MOCK_CLI_MODE: %s\n", mode)
 		os.Exit(1)
 	}
+}
+
+// runMockGrokMaintenanceSmoke enforces the Grok 1.0.13 no-tools, one-shot
+// argv contract at the process boundary. It deliberately emits the legacy
+// `text` payload before the simulated update and 1.0.13's `data` payload after
+// it so the same SessionManager lifecycle proves protocol compatibility across
+// replacement. Failures expose only a generic protocol error, never argv,
+// prompt-file contents, or billing-log data.
+func runMockGrokMaintenanceSmoke(mode string) {
+	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		if mode == "grok-maintenance-smoke-v1" {
+			fmt.Println("grok 1.0.5")
+		} else {
+			fmt.Println("grok 1.0.13")
+		}
+		os.Exit(0)
+	}
+
+	args := os.Args[1:]
+	tools, hasTools := mockArgValue(args, "--tools")
+	maxTurns, hasMaxTurns := mockArgValue(args, "--max-turns")
+	outputFormat, hasOutputFormat := mockArgValue(args, "--output-format")
+	promptPath, hasPromptFile := mockArgValue(args, "--prompt-file")
+	prompt, promptErr := os.ReadFile(promptPath)
+	if !hasTools || tools != "" || !hasMaxTurns || maxTurns != "1" ||
+		!hasOutputFormat || outputFormat != "streaming-json" ||
+		!mockHasArg(args, "--disable-web-search") || !mockHasArg(args, "--no-subagents") ||
+		!mockHasArg(args, "--verbatim") || !hasPromptFile || promptErr != nil ||
+		string(prompt) != "Return exactly this marker and nothing else: "+grokMaintenanceSmokeMarker {
+		fmt.Fprintln(os.Stderr, "protocol error")
+		os.Exit(1)
+	}
+	if err := writeMockGrokBillingEvidence(); err != nil {
+		fmt.Fprintln(os.Stderr, "usage capture failed")
+		os.Exit(1)
+	}
+	if mode == "grok-maintenance-smoke-v1" {
+		encoded, _ := json.Marshal(map[string]string{"type": "text", "text": grokMaintenanceSmokeMarker})
+		fmt.Println(string(encoded))
+	} else {
+		encoded, _ := json.Marshal(map[string]string{"type": "text", "data": grokMaintenanceSmokeMarker})
+		fmt.Println(string(encoded))
+	}
+	fmt.Println(`{"type":"end","stopReason":"end_turn"}`)
+	os.Exit(0)
+}
+
+func mockArgValue(args []string, name string) (string, bool) {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == name {
+			return args[i+1], true
+		}
+	}
+	return "", false
+}
+
+func mockHasArg(args []string, name string) bool {
+	for _, arg := range args {
+		if arg == name {
+			return true
+		}
+	}
+	return false
 }
 
 // writeMockGrokBillingEvidence mirrors the exact allowlisted shape Grok 1.0
@@ -667,6 +736,77 @@ func TestSessionLifecycle_GrokDirectPublishesFreshRedactedBilling(t *testing.T) 
 		if strings.Contains(string(out), secret) {
 			t.Fatalf("direct usage leaked %q: %s", secret, out)
 		}
+	}
+}
+
+func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *testing.T) {
+	realHome := t.TempDir()
+	seedGrokHomeWithLogin(t, realHome)
+	t.Setenv("GROK_HOME", realHome)
+	t.Setenv("XAI_API_KEY", "")
+	SetCLIAgentCatalog([]cliAgentCatalogEntry{{
+		ID: "grok", DisplayName: "Grok Build", Command: "grok",
+	}})
+	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
+	resetVersionProbeCache()
+	t.Cleanup(resetVersionProbeCache)
+
+	smokeArgs := []string{
+		"--tools", "", "--disable-web-search", "--no-subagents", "--max-turns", "1", "--verbatim",
+		"Return exactly this marker and nothing else: " + grokMaintenanceSmokeMarker,
+	}
+	run := func(mode string) cliAgentUsage {
+		t.Helper()
+		_, messages, err := captureSession(t, mode, "grok", smokeArgs, "")
+		if err != nil {
+			t.Fatalf("%s session: %v", mode, err)
+		}
+		assertLifecycleOrdering(t, messages)
+		if got := concatStreamOutput(messages); got != grokMaintenanceSmokeMarker {
+			t.Fatalf("%s output = %q, want exact marker %q", mode, got, grokMaintenanceSmokeMarker)
+		}
+		for _, message := range messages {
+			if message.Type == "session_ended" && message.ExitCode != 0 {
+				t.Fatalf("%s exit code = %d, want 0", mode, message.ExitCode)
+			}
+		}
+
+		resetVersionProbeCache()
+		usage, errs := GatherCLIAgentUsageOnly(context.Background())
+		if len(errs) != 0 || len(usage) != 1 || len(usage[0].Metrics) != 1 {
+			t.Fatalf("%s usage = %+v errors=%+v", mode, usage, errs)
+		}
+		receipt, normalized, normalizedErrs, err := prepareCLIUsageRefreshResult(
+			"signed-refresh-secret", mode, time.Now().UnixMilli(), true, usage, errs)
+		if err != nil || receipt == "" || len(normalizedErrs) != 0 || len(normalized) != 1 || len(normalized[0].Metrics) != 1 {
+			t.Fatalf("%s signed refresh: receipt=%q usage=%+v errors=%+v err=%v", mode, receipt, normalized, normalizedErrs, err)
+		}
+		encoded, err := json.Marshal(normalized[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{"credential-sentinel", "prompt-sentinel", "raw-config-sentinel"} {
+			if strings.Contains(string(encoded), secret) {
+				t.Fatalf("%s signed refresh leaked %q: %s", mode, secret, encoded)
+			}
+		}
+		return normalized[0]
+	}
+
+	pre := run("grok-maintenance-smoke-v1")
+	// Signed usage timestamps use RFC3339 second precision. Cross a second
+	// boundary so the freshness assertion observes the post-update billing
+	// fetch rather than two distinct nanosecond observations rendered alike.
+	time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second + 10*time.Millisecond)))
+	post := run("grok-maintenance-smoke-v2")
+	if pre.Version == post.Version || !strings.Contains(pre.Version, "1.0.5") || !strings.Contains(post.Version, "1.0.13") {
+		t.Fatalf("test did not exercise the 1.0.5 -> 1.0.13 replacement: pre=%q post=%q", pre.Version, post.Version)
+	}
+	preObserved, preErr := time.Parse(time.RFC3339Nano, pre.Metrics[0].ObservedAt)
+	postObserved, postErr := time.Parse(time.RFC3339Nano, post.Metrics[0].ObservedAt)
+	if preErr != nil || postErr != nil || !postObserved.After(preObserved) {
+		t.Fatalf("post-update usage freshness did not advance: pre=%q (%v) post=%q (%v)",
+			pre.Metrics[0].ObservedAt, preErr, post.Metrics[0].ObservedAt, postErr)
 	}
 }
 

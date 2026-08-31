@@ -3584,10 +3584,14 @@ func TestExtractDisplayText_Codex_SkipsLifecycleEvents(t *testing.T) {
    ------------------------------------------------------------------------ */
 
 func TestExtractDisplayText_Grok_TextFrameReturnsText(t *testing.T) {
-	line := `{"type":"text","text":"hello from grok"}`
-	got := extractDisplayText("grok", line)
-	if got != "hello from grok" {
-		t.Errorf("got %q, want %q", got, "hello from grok")
+	for _, line := range []string{
+		`{"type":"text","text":"hello from grok"}`,
+		`{"type":"text","data":"hello from grok"}`,
+	} {
+		got := extractDisplayText("grok", line)
+		if got != "hello from grok" {
+			t.Errorf("extractDisplayText(%s) = %q, want %q", line, got, "hello from grok")
+		}
 	}
 }
 

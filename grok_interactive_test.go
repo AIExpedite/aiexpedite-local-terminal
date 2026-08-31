@@ -34,6 +34,25 @@ func TestBuildGrokInteractiveArgs_StripsManagedFlagsAndPassesModel(t *testing.T)
 	}
 }
 
+// Grok 1.0.13 uses an explicit empty --tools value for the maintenance
+// no-tools smoke. The empty argv token must remain attached to --tools; if the
+// builder treats it as prompt text, Grok consumes the managed -p as the tool
+// list and exits with a protocol error before emitting the marker.
+func TestBuildGrokInteractiveArgs_PreservesNoToolsSmokeContract(t *testing.T) {
+	got := buildGrokInteractiveArgs([]string{
+		"--tools", "", "--disable-web-search", "--no-subagents",
+		"--max-turns", "1", "--verbatim", "return the marker",
+	}, false)
+	want := []string{
+		"--output-format", "streaming-json", "--no-auto-update",
+		"--tools", "", "--disable-web-search", "--no-subagents",
+		"--max-turns", "1", "--verbatim", "-p", "return the marker",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("no-tools smoke argv = %#v, want %#v", got, want)
+	}
+}
+
 func TestBuildGrokInteractiveArgs_InlinePromptFlagValue(t *testing.T) {
 	got := buildGrokInteractiveArgs([]string{"--single=hello there"}, true)
 	want := []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "hello there"}

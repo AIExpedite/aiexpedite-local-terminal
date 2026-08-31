@@ -3624,13 +3624,33 @@ func TestGatherCLIAgentUsageOnly_GrokMetricSurvivesCLIUpdate(t *testing.T) {
 		t.Fatalf("test did not exercise a detected CLI update: first=%s %s second=%s %s",
 			first[0].Path, first[0].Version, second[0].Path, second[0].Version)
 	}
-	out, err := json.Marshal(second[0])
+	receipt, normalized, normalizedErrs, err := prepareCLIUsageRefreshResult(
+		"signed-refresh-secret", "grok-post-update", time.Now().UnixMilli(), true, second, errs)
+	if err != nil {
+		t.Fatalf("sign post-update Grok refresh: %v", err)
+	}
+	if receipt == "" || len(normalizedErrs) != 0 || len(normalized) != 1 || len(normalized[0].Metrics) != 1 {
+		t.Fatalf("signed post-update refresh lost Grok usage: receipt=%q usage=%+v errors=%+v", receipt, normalized, normalizedErrs)
+	}
+	gotSignedMetric, err := json.Marshal(normalized[0].Metrics[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotSignedMetric) != string(wantMetric) {
+		t.Fatalf("signed refresh changed Grok metric:\nwant %s\ngot  %s", wantMetric, gotSignedMetric)
+	}
+	canonical, _, _, err := canonicalCLIUsageRefreshReceipt(
+		"grok-post-update", time.Now().UnixMilli(), true, normalized, normalizedErrs)
+	if err != nil {
+		t.Fatalf("canonicalize post-update Grok refresh: %v", err)
+	}
+	out, err := json.Marshal(normalized[0])
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, secret := range []string{"credential-sentinel", "prompt-sentinel", "raw-config-sentinel"} {
-		if strings.Contains(string(out), secret) {
-			t.Fatalf("refresh output leaked %q: %s", secret, out)
+		if strings.Contains(string(out), secret) || strings.Contains(string(canonical), secret) {
+			t.Fatalf("signed refresh output leaked %q: provider=%s canonical=%s", secret, out, canonical)
 		}
 	}
 }
