@@ -36,7 +36,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 )
 
 /* --------------------------------------------------------------------------
@@ -3617,18 +3616,18 @@ func TestExtractDisplayText_Antigravity_StreamEvents(t *testing.T) {
 	if got := extractDisplayTextWithAccumulated("agy", resultLine, "thinking through problem..."); got != "" {
 		t.Fatalf("mismatched draft deltas should not cause full response to concatenate, got %q", got)
 	}
-	// When deltas share common prefix with response, only non-overlapping suffix is emitted
-	if got := extractDisplayTextWithAccumulated("agy", resultLine, "fixed it but different end"); got != "completely" {
-		t.Fatalf("partial overlap should emit non-overlapping suffix, got %q", got)
+	// When deltas diverge after a partial prefix, recap is suppressed to avoid appending a garbled suffix
+	if got := extractDisplayTextWithAccumulated("agy", resultLine, "fixed it but different end"); got != "" {
+		t.Fatalf("divergent deltas should suppress recap, got %q", got)
 	}
-	// Non-ASCII UTF-8 multibyte characters that share a leading byte (e.g. ê vs é)
-	// must reconcile cleanly on rune boundaries without creating invalid UTF-8.
+	// Multibyte mismatch (e.g. Café vs Cafê draft) also suppresses recap
 	utf8Result := `{"event":"result","result":{"status":"SUCCESS","response":"Café au lait"}}`
-	if got := extractDisplayTextWithAccumulated("agy", utf8Result, "Cafê draft"); got != "é au lait" {
-		t.Fatalf("UTF-8 multibyte mismatch should reconcile on rune boundary, got %q (valid=%v)", got, utf8.ValidString(got))
+	if got := extractDisplayTextWithAccumulated("agy", utf8Result, "Cafê draft"); got != "" {
+		t.Fatalf("UTF-8 multibyte divergence should suppress recap, got %q", got)
 	}
-	if !utf8.ValidString(extractDisplayTextWithAccumulated("agy", utf8Result, "Cafê draft")) {
-		t.Fatalf("UTF-8 multibyte reconciliation must return valid UTF-8")
+	// Exact UTF-8 prefix missing suffix is emitted cleanly
+	if got := extractDisplayTextWithAccumulated("agy", utf8Result, "Café "); got != "au lait" {
+		t.Fatalf("UTF-8 multibyte prefix should emit remaining suffix, got %q", got)
 	}
 	errorLine := `{"event":"result","result":{"status":"ERROR","error":"quota exhausted"}}`
 	if got := extractDisplayText("agy", errorLine); !strings.Contains(got, "quota exhausted") {

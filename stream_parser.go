@@ -242,40 +242,17 @@ func extractAntigravityDisplayTextWithAccumulated(raw map[string]interface{}, ac
 // reconcileAntigravityTerminalResponse computes the missing text that should be
 // emitted from the terminal SUCCESS result event given the streaming deltas
 // accumulated so far. If no deltas were emitted, the entire response is returned;
-// if all deltas were emitted or the response was already covered, nothing is returned;
-// if partial deltas were emitted, only the non-overlapping suffix is returned to
-// prevent duplicate or concatenated output.
+// if the accumulated deltas form a prefix of the terminal response (e.g. deltas
+// stopped early or completed), only the missing suffix is returned; if deltas
+// diverged or already covered the response, the recap is suppressed to avoid
+// garbled or duplicated output.
 func reconcileAntigravityTerminalResponse(resp, accumulatedDeltas string) string {
 	if accumulatedDeltas == "" {
 		return resp
 	}
-	if resp == "" || resp == accumulatedDeltas {
-		return ""
-	}
 	if strings.HasPrefix(resp, accumulatedDeltas) {
-		return resp[len(accumulatedDeltas):]
+		return strings.TrimPrefix(resp, accumulatedDeltas)
 	}
-	if strings.HasPrefix(accumulatedDeltas, resp) {
-		return ""
-	}
-	// Rune-based overlap check: compare rune-by-rune so we only split on valid
-	// UTF-8 character boundaries and never cut through multibyte encodings.
-	respRunes := []rune(resp)
-	deltasRunes := []rune(accumulatedDeltas)
-	overlap := 0
-	maxLen := len(respRunes)
-	if len(deltasRunes) < maxLen {
-		maxLen = len(deltasRunes)
-	}
-	for overlap < maxLen && respRunes[overlap] == deltasRunes[overlap] {
-		overlap++
-	}
-	if overlap > 0 {
-		return string(respRunes[overlap:])
-	}
-	// If accumulated deltas were already published and do not share a common prefix
-	// with the final recap (e.g. pre-tool draft vs final recap), suppress the duplicate
-	// recap rather than blindly concatenating the full response.
 	return ""
 }
 
