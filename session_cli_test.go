@@ -3322,6 +3322,9 @@ func TestReadOutputStream_AntigravityAbruptTerminationFlushesBufferedDeltas(t *t
 	if got := strings.Join(streams, ""); got != "partial work in progress" {
 		t.Fatalf("Antigravity abrupt EOF output = %q, want %q", got, "partial work in progress")
 	}
+	if session.ExitCode == 0 {
+		t.Fatal("Antigravity abrupt termination without result event must set a non-zero exit code")
+	}
 }
 
 func TestReadOutputStream_AntigravityErrorResultPublishesFailure(t *testing.T) {
