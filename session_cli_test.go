@@ -3281,6 +3281,39 @@ func TestReadOutputStream_AntigravityConcatenatesAdjacentTextDeltas(t *testing.T
 	}
 }
 
+func TestReadOutputStream_AntigravityErrorResultPublishesFailure(t *testing.T) {
+	session := &CLISession{
+		ID:             "antigravity-error-result",
+		Command:        "agy",
+		Stdout:         io.NopCloser(strings.NewReader(`{"event":"result","result":{"status":"ERROR","error":"quota exceeded"}}` + "\n")),
+		Stderr:         io.NopCloser(strings.NewReader("")),
+		streamDone:     make(chan struct{}),
+		firstRealFrame: make(chan struct{}),
+	}
+	var published []resultMsg
+
+	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
+		published = append(published, msg)
+	})
+
+	var sawError bool
+	for _, msg := range published {
+		if msg.Type != "stream" || !strings.Contains(msg.Output, "quota exceeded") {
+			continue
+		}
+		sawError = true
+		if msg.Status != "error" {
+			t.Fatalf("Antigravity failure stream status = %q, want error", msg.Status)
+		}
+	}
+	if !sawError {
+		t.Fatalf("expected Antigravity failure stream, got %#v", published)
+	}
+	if session.ExitCode == 0 {
+		t.Fatal("Antigravity ERROR result must force a non-zero terminal exit code")
+	}
+}
+
 /* --------------------------------------------------------------------------
    extractDisplayText — Claude
    ------------------------------------------------------------------------ */
