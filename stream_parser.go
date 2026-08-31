@@ -226,16 +226,7 @@ func extractAntigravityDisplayTextWithAccumulated(raw map[string]interface{}, ac
 		status, _ := result["status"].(string)
 		if strings.EqualFold(status, "SUCCESS") {
 			resp, _ := result["response"].(string)
-			if accumulatedDeltas == "" {
-				return resp
-			}
-			if strings.HasPrefix(resp, accumulatedDeltas) {
-				return resp[len(accumulatedDeltas):]
-			}
-			if resp == accumulatedDeltas {
-				return ""
-			}
-			return resp
+			return reconcileAntigravityTerminalResponse(resp, accumulatedDeltas)
 		}
 		errText, _ := result["error"].(string)
 		if errText == "" {
@@ -245,6 +236,44 @@ func extractAntigravityDisplayTextWithAccumulated(raw map[string]interface{}, ac
 	case "init":
 		return ""
 	}
+	return ""
+}
+
+// reconcileAntigravityTerminalResponse computes the missing text that should be
+// emitted from the terminal SUCCESS result event given the streaming deltas
+// accumulated so far. If no deltas were emitted, the entire response is returned;
+// if all deltas were emitted or the response was already covered, nothing is returned;
+// if partial deltas were emitted, only the non-overlapping suffix is returned to
+// prevent duplicate or concatenated output.
+func reconcileAntigravityTerminalResponse(resp, accumulatedDeltas string) string {
+	if accumulatedDeltas == "" {
+		return resp
+	}
+	if resp == "" || resp == accumulatedDeltas {
+		return ""
+	}
+	if strings.HasPrefix(resp, accumulatedDeltas) {
+		return resp[len(accumulatedDeltas):]
+	}
+	if strings.HasPrefix(accumulatedDeltas, resp) {
+		return ""
+	}
+	// Overlap check: find the longest common prefix between resp and accumulatedDeltas
+	// so that minor whitespace variations or partial overlaps only emit the missing remainder.
+	overlap := 0
+	maxLen := len(resp)
+	if len(accumulatedDeltas) < maxLen {
+		maxLen = len(accumulatedDeltas)
+	}
+	for overlap < maxLen && resp[overlap] == accumulatedDeltas[overlap] {
+		overlap++
+	}
+	if overlap > 0 {
+		return resp[overlap:]
+	}
+	// If accumulated deltas were already published and do not share a common prefix
+	// with the final recap (e.g. pre-tool draft vs final recap), suppress the duplicate
+	// recap rather than blindly concatenating the full response.
 	return ""
 }
 

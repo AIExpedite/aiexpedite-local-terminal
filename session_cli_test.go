@@ -3608,6 +3608,18 @@ func TestExtractDisplayText_Antigravity_StreamEvents(t *testing.T) {
 	if got := extractDisplayTextWithAccumulated("agy", resultLine, ""); got != "fixed it completely" {
 		t.Fatalf("successful result response should be retained when no deltas seen, got %q", got)
 	}
+	// When deltas had trailing newline/punctuation, duplicate text is suppressed
+	if got := extractDisplayTextWithAccumulated("agy", resultLine, "fixed it completely\n"); got != "" {
+		t.Fatalf("trailing newline in deltas should not cause recap to re-emit, got %q", got)
+	}
+	// When deltas were mismatched draft text, duplicate recap is suppressed
+	if got := extractDisplayTextWithAccumulated("agy", resultLine, "thinking through problem..."); got != "" {
+		t.Fatalf("mismatched draft deltas should not cause full response to concatenate, got %q", got)
+	}
+	// When deltas share common prefix with response, only non-overlapping suffix is emitted
+	if got := extractDisplayTextWithAccumulated("agy", resultLine, "fixed it but different end"); got != "completely" {
+		t.Fatalf("partial overlap should emit non-overlapping suffix, got %q", got)
+	}
 	errorLine := `{"event":"result","result":{"status":"ERROR","error":"quota exhausted"}}`
 	if got := extractDisplayText("agy", errorLine); !strings.Contains(got, "quota exhausted") {
 		t.Fatalf("Antigravity result error = %q", got)
