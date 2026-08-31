@@ -708,6 +708,14 @@ func TestAntigravityStreamResultText(t *testing.T) {
 	if got != "complete answer" {
 		t.Fatalf("result text = %q, want complete answer", got)
 	}
+
+	errOutput := strings.Join([]string{
+		`{"event":"result","result":{"status":"ERROR","error":"quota exhausted"}}`,
+	}, "\n")
+	_, err = antigravityStreamResultText(errOutput)
+	if err == nil || !strings.Contains(err.Error(), "quota exhausted") {
+		t.Fatalf("expected quota exhausted error, got %v", err)
+	}
 }
 
 func TestAntigravityNativeRunOneShot_LongPromptUsesStdin(t *testing.T) {

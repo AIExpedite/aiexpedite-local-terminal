@@ -1160,14 +1160,15 @@ func antigravityStreamUserMessage(prompt string) string {
 // antigravityStreamResultText extracts the complete current-turn response from
 // agy's terminal result event. Step updates are deliberately ignored here: the
 // native manager publishes one complete response, matching its prior text-mode
-// contract. On an ERROR result the CLI's error text is returned so existing
-// missing-conversation recovery and diagnostics continue to work.
+// contract. On an ERROR result the CLI's error is returned as an error so
+// runOneShot and Send fail the turn rather than publishing success.
 func antigravityStreamResultText(output string) (string, error) {
 	if strings.TrimSpace(output) == "" {
 		return "", fmt.Errorf("Antigravity stream ended without a result event")
 	}
 
 	var resultText string
+	var resultErr error
 	found := false
 	for lineNo, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
@@ -1177,6 +1178,7 @@ func antigravityStreamResultText(output string) (string, error) {
 		var event struct {
 			Event  string `json:"event"`
 			Result *struct {
+				Status   string `json:"status"`
 				Response string `json:"response"`
 				Error    string `json:"error"`
 			} `json:"result"`
@@ -1188,13 +1190,23 @@ func antigravityStreamResultText(output string) (string, error) {
 			continue
 		}
 		found = true
-		resultText = event.Result.Response
-		if resultText == "" {
-			resultText = event.Result.Error
+		if strings.EqualFold(event.Result.Status, "ERROR") {
+			errMsg := strings.TrimSpace(event.Result.Error)
+			if errMsg == "" {
+				errMsg = "Antigravity turn failed"
+			}
+			resultErr = fmt.Errorf("%s", errMsg)
+			resultText = errMsg
+		} else {
+			resultText = event.Result.Response
+			resultErr = nil
 		}
 	}
 	if !found {
 		return "", fmt.Errorf("Antigravity stream ended without a result event")
+	}
+	if resultErr != nil {
+		return resultText, resultErr
 	}
 	return strings.TrimSpace(resultText), nil
 }
