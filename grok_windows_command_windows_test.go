@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,5 +54,40 @@ func TestGrokWindowsJunctionCommands_HandleMetacharacterPaths(t *testing.T) {
 	}
 	if body, err := os.ReadFile(persisted); err != nil || string(body) != "synthetic" {
 		t.Fatalf("target after junction removal = %q, err=%v", body, err)
+	}
+}
+
+func TestRemoveIsolatedGrokHome_KeepsCaseVariantStoreWhenUnlinkFails(t *testing.T) {
+	store := withTempGrokSessionStore(t)
+	t.Setenv("GROK_HOME", t.TempDir())
+	home, err := setupIsolatedGrokHome(false, grokACPDefaultModel)
+	if err != nil {
+		t.Fatalf("setupIsolatedGrokHome: %v", err)
+	}
+
+	lowercaseLink := filepath.Join(home, grokSessionsDirName)
+	caseVariantLink := filepath.Join(home, "Sessions")
+	temporaryLink := filepath.Join(home, "sessions-case-rename")
+	if err := os.Rename(lowercaseLink, temporaryLink); err != nil {
+		t.Fatalf("temporarily rename sessions junction: %v", err)
+	}
+	if err := os.Rename(temporaryLink, caseVariantLink); err != nil {
+		t.Fatalf("case-rename sessions junction: %v", err)
+	}
+	persisted := writeTestGrokTranscript(t, store)
+
+	syntheticErr := errors.New("synthetic unlink failure")
+	err = removeIsolatedGrokHomeWithUnlink(home, func(string) error { return syntheticErr })
+	if !errors.Is(err, syntheticErr) {
+		t.Fatalf("removeIsolatedGrokHome error = %v, want synthetic unlink failure", err)
+	}
+	if _, err := os.Lstat(caseVariantLink); err != nil {
+		t.Fatalf("case-variant sessions junction should remain: %v", err)
+	}
+	if body, err := os.ReadFile(persisted); err != nil || string(body) != testGrokTranscript {
+		t.Fatalf("persistent transcript after partial cleanup = %q, err=%v", body, err)
+	}
+	if err := removeIsolatedGrokHome(home); err != nil {
+		t.Fatalf("final isolated home cleanup: %v", err)
 	}
 }

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 )
 
 // setupIsolatedGrokHome creates a per-session temp dir to use as the child's
@@ -185,7 +187,11 @@ func removeIsolatedGrokHomeSiblings(home string) error {
 
 	var cleanupErrs []error
 	for _, entry := range entries {
-		if entry.Name() == grokSessionsDirName {
+		isSessionsEntry := entry.Name() == grokSessionsDirName
+		if runtime.GOOS == "windows" {
+			isSessionsEntry = strings.EqualFold(entry.Name(), grokSessionsDirName)
+		}
+		if isSessionsEntry {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(home, entry.Name())); err != nil {
