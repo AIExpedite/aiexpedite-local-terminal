@@ -3312,7 +3312,7 @@ func TestReadOutputStream_AntigravityAbruptTerminationFlushesBufferedDeltas(t *t
 	output := strings.Join([]string{
 		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"partial work in progress"}}`,
 	}, "\n") + "\n"
-	session := &CLISession{ID: "antigravity-abrupt-eof", Command: "agy", Stdout: io.NopCloser(strings.NewReader(output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{})}
+	session := &CLISession{ID: "antigravity-abrupt-eof", Command: "agy", Stdout: io.NopCloser(strings.NewReader(output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{}), antigravityManagedStream: true}
 	var streams []string
 	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
 		if msg.Type == "stream" {
@@ -3339,7 +3339,7 @@ func TestReadOutputStream_AntigravityEmptyOrInitStreamWithoutResultSetsNonZeroEx
 		}, "\n") + "\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			session := &CLISession{ID: "antigravity-no-result", Command: "agy", Stdout: io.NopCloser(strings.NewReader(tc.output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{})}
+			session := &CLISession{ID: "antigravity-no-result", Command: "agy", Stdout: io.NopCloser(strings.NewReader(tc.output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{}), antigravityManagedStream: true}
 			NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {})
 			if session.ExitCode == 0 {
 				t.Fatalf("%s: Antigravity stream ending without result must set session.ExitCode != 0", tc.name)

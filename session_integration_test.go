@@ -161,6 +161,10 @@ func runMockCLI(mode string) {
 		fmt.Printf(`{"event":"result","result":{"status":"SUCCESS","response":%s}}`+"\n", encodedMarker)
 		os.Exit(0)
 
+	case "antigravity-diagnostic":
+		fmt.Println("agy version 1.2.3")
+		os.Exit(0)
+
 	case "stream-burst":
 		// Emit many lines quickly to stress the async publish path. Used to
 		// verify no stream chunks get dropped under load.
@@ -613,6 +617,23 @@ func TestSessionLifecycle_AntigravityExplicitEmptyPrompt(t *testing.T) {
 	want := "antigravity received 0 bytes"
 	if streamText := concatStreamOutput(messages); !strings.Contains(streamText, want) {
 		t.Fatalf("empty prompt did not arrive intact over Antigravity stdin: got %q, want %q", streamText, want)
+	}
+}
+
+func TestSessionLifecycle_AntigravityDiagnosticWithoutResultStaysSuccessful(t *testing.T) {
+	_, messages, err := captureSession(t, "antigravity-diagnostic", "agy", []string{"--version"}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+
+	assertLifecycleOrdering(t, messages)
+	if streamText := concatStreamOutput(messages); !strings.Contains(streamText, "agy version 1.2.3") {
+		t.Fatalf("diagnostic output missing: got %q", streamText)
+	}
+	for _, message := range messages {
+		if message.Type == "session_ended" && message.ExitCode != 0 {
+			t.Fatalf("successful Antigravity diagnostic exit code = %d, want 0", message.ExitCode)
+		}
 	}
 }
 

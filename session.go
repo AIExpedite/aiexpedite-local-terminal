@@ -79,6 +79,12 @@ type CLISession struct {
 	// Removed exactly once after the process exits (see waitForExit).
 	promptFile string
 
+	// antigravityManagedStream is true only when StartSession shaped this
+	// invocation into agy's managed stream-json protocol. Raw diagnostics such
+	// as `agy --version` also use the pipe reader, but legitimately exit without
+	// a terminal result event and must retain their process exit code.
+	antigravityManagedStream bool
+
 	// deferredStdinClose marks a one-shot, stdin-fed CLI (codex) that
 	// was started with NO prompt — the chat-direct flow opens the session
 	// eagerly and delivers the first message later via SendInput. Stdin is left
@@ -184,6 +190,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// Build the CLI command with appropriate flags for structured streaming.
 	// stdinPrompt is non-empty when the target CLI transports its prompt outside
 	// argv (Claude/Antigravity NDJSON, Codex plain stdin).
+	antigravityManagedStream := isAntigravityCommand(command) && shouldUseAntigravityManagedStream(args)
 	enableGrokAlwaysApprove := sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
 	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
 
@@ -345,18 +352,19 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	stderrW.Close()
 
 	session := &CLISession{
-		ID:          id,
-		Command:     command,
-		Process:     proc,
-		Stdin:       stdin,
-		Stdout:      stdout,
-		Stderr:      stderr,
-		StartedAt:   time.Now(),
-		Status:      "running",
-		WorkspaceID: workspaceID,
-		UID:         uid,
-		TimeoutMs:   timeoutMs,
-		promptFile:  promptFile,
+		ID:                       id,
+		Command:                  command,
+		Process:                  proc,
+		Stdin:                    stdin,
+		Stdout:                   stdout,
+		Stderr:                   stderr,
+		StartedAt:                time.Now(),
+		Status:                   "running",
+		WorkspaceID:              workspaceID,
+		UID:                      uid,
+		TimeoutMs:                timeoutMs,
+		promptFile:               promptFile,
+		antigravityManagedStream: antigravityManagedStream,
 		// A stdin-fed one-shot CLI (codex) started without a prompt keeps
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
@@ -1113,7 +1121,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				// If this was an Antigravity stream that ended abruptly without a terminal result event,
 				// flush the buffered incremental deltas if present so partial output before termination is not lost,
 				// and mark session.ExitCode = 1 so automated callers do not mistake an incomplete stream for a successful turn.
-				if isAntigravityCommand(session.Command) && !antigravityResultSeen {
+				if session.antigravityManagedStream && !antigravityResultSeen {
 					if antigravityDeltas.Len() > 0 {
 						batch = append(batch, antigravityDeltas.String())
 					}
@@ -2164,10 +2172,7 @@ func buildAntigravityStreamingArgs(args []string) ([]string, *string) {
 	// Preserve diagnostics and malformed invocations verbatim: turning one into
 	// a managed stream could start a permission-skipping model run the caller
 	// never requested.
-	if isAntigravityDiagnosticInvocation(args) {
-		return args, nil
-	}
-	if barePrint, invalidBool, diagnostic, danglingManaged := scanAntigravityCallerArgs(args); barePrint || invalidBool || diagnostic || danglingManaged {
+	if !shouldUseAntigravityManagedStream(args) {
 		return args, nil
 	}
 
@@ -2184,6 +2189,18 @@ func buildAntigravityStreamingArgs(args []string) ([]string, *string) {
 		return result, nil
 	}
 	return result, &prompt
+}
+
+// shouldUseAntigravityManagedStream is the shared decision for both argv
+// shaping and result-event enforcement. Keeping the decision in one place
+// prevents raw diagnostics and malformed invocations from being mistaken for
+// managed turns merely because their command name is agy/antigravity.
+func shouldUseAntigravityManagedStream(args []string) bool {
+	if isAntigravityDiagnosticInvocation(args) {
+		return false
+	}
+	barePrint, invalidBool, diagnostic, danglingManaged := scanAntigravityCallerArgs(args)
+	return !barePrint && !invalidBool && !diagnostic && !danglingManaged
 }
 
 // stripAntigravityManagedStreamFlags removes caller overrides for the two
