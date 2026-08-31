@@ -2975,6 +2975,10 @@ func TestBuildAntigravityStreamingArgs_PreservesDanglingManagedFormatFlag(t *tes
 		{"--output-format", "--dangerously-skip-permissions", "review"},
 		{"--output-format=--", "review"},
 		{"--output-format", "--", "review"},
+		{"--output-format=", "review"},
+		{"--output-format", "", "review"},
+		{"--input-format=", "review"},
+		{"--input-format", "", "review"},
 	} {
 		args, prompt := buildAntigravityStreamingArgs(in)
 		if !reflect.DeepEqual(args, in) || prompt != nil {

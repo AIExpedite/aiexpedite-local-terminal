@@ -488,9 +488,6 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	outText, errText, exitCode, timedOut, truncated, runErr := m.runOneShot(
 		session, runDir, executable, promptToSend, nativeID, turnTimeout, "antigravity-native:"+id,
 	)
-	if runErr != nil {
-		return m.publishTurnError(session, publishFn, runErr.Error())
-	}
 	m.publishStderrIfAny(session, publishFn, errText)
 	if truncated {
 		// Requirements: oversize output must not be silently dropped/truncated
@@ -508,10 +505,13 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	}
 
 	// Exact-ID resume failed with a recognized missing/stale conversation.
-	// Require a non-zero exit so ordinary assistant text that mentions
-	// "conversation not found" cannot trigger a costly false-positive replay.
-	// At most one replay recovery for this turn.
-	if useNativeResume && exitCode != 0 && looksLikeMissingConversation(outText, errText) {
+	// Can happen either via non-zero process exit or a stream-json ERROR result
+	// (runErr != nil). Require an explicit error signal (exitCode != 0 or runErr != nil)
+	// so ordinary assistant text that mentions "conversation not found" cannot trigger
+	// a costly false-positive replay. At most one replay recovery for this turn.
+	isMissingConv := useNativeResume && (exitCode != 0 || runErr != nil) &&
+		(looksLikeMissingConversation(outText, errText) || (runErr != nil && looksLikeMissingConversation(runErr.Error(), errText)))
+	if isMissingConv {
 		fmt.Printf("%s[antigravity-native] Native resume failed for %s — replaying bounded transcript%s\n",
 			colorYellow, id, colorReset)
 		session.NativeConversationID = ""
@@ -541,10 +541,13 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 				"Antigravity replay output exceeded the maximum capture size")
 		}
 		outText, errText, exitCode = out2, err2, exit2
+		runErr = nil
 		usedReplay = true
 		needCapture = true
 		// Non-zero exit after replay is handled by the unified exit-code gate
 		// below (including stdout-bearing diagnostics such as auth/quota).
+	} else if runErr != nil {
+		return m.publishTurnError(session, publishFn, runErr.Error())
 	}
 
 	// After missing-conversation replay is handled, remaining non-zero exits
@@ -810,7 +813,7 @@ func (m *AntigravityNativeManager) runOneShot(
 					// exiting non-zero. Preserve it for the normal exit-code error
 					// path; successful runs must honor the stream-json contract.
 					if exitCode == 0 {
-						return "", "", exitCode, false, false, parseErr
+						return parsed, "", exitCode, false, false, parseErr
 					}
 					out = rawOut
 				} else {

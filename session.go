@@ -2676,6 +2676,10 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 			}
 			if antigravityValuedFlags[name] || antigravityBoolFlags[name] {
 				if name == "--input-format" || name == "--output-format" {
+					if val == "" {
+						danglingManaged = true
+						return barePrint, invalidBool, diagnostic, danglingManaged
+					}
 					valFlag := canonicalAntigravityFlag(val)
 					if isAntigravityPrintFlag(valFlag) || antigravityBoolFlags[valFlag] || antigravityValuedFlags[valFlag] || antigravityDiagnosticTokens[valFlag] || strings.HasPrefix(valFlag, "-") {
 						danglingManaged = true
@@ -2708,6 +2712,10 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 				return barePrint, invalidBool, diagnostic, danglingManaged // other dangling flags are handled by the partitioner
 			}
 			if a == "--input-format" || a == "--output-format" {
+				if args[i+1] == "" {
+					danglingManaged = true
+					return barePrint, invalidBool, diagnostic, danglingManaged
+				}
 				next := canonicalAntigravityFlag(args[i+1])
 				if isAntigravityPrintFlag(next) || antigravityBoolFlags[next] || antigravityValuedFlags[next] || antigravityDiagnosticTokens[next] || strings.HasPrefix(next, "-") {
 					danglingManaged = true
