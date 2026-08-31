@@ -1064,13 +1064,13 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		lastBatchEntryWasAntigravityDelta = false
 	}
 
-	var sawAntigravityDelta bool
+	var antigravityDeltas strings.Builder
 
 	appendDisplayText := func(lineText string) {
 		isAntigravityDelta := isAntigravityCommand(session.Command) && isAntigravityAgentResponseDelta(lineText)
-		displayText := extractDisplayTextWithContext(session.Command, lineText, sawAntigravityDelta)
+		displayText := extractDisplayTextWithAccumulated(session.Command, lineText, antigravityDeltas.String())
 		if isAntigravityDelta {
-			sawAntigravityDelta = true
+			antigravityDeltas.WriteString(displayText)
 		}
 		if displayText == "" {
 			return
@@ -2662,6 +2662,13 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 				continue
 			}
 			if antigravityValuedFlags[name] || antigravityBoolFlags[name] {
+				if name == "--input-format" || name == "--output-format" {
+					valFlag := canonicalAntigravityFlag(val)
+					if isAntigravityPrintFlag(valFlag) || antigravityBoolFlags[valFlag] || antigravityValuedFlags[valFlag] || antigravityDiagnosticTokens[valFlag] || (strings.HasPrefix(valFlag, "-") && valFlag != antigravityFlagTerminator) {
+						danglingManaged = true
+						return barePrint, invalidBool, diagnostic, danglingManaged
+					}
+				}
 				if stripped(name) {
 					if _, err := strconv.ParseBool(val); err != nil {
 						invalidBool = true
@@ -2686,6 +2693,13 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 			if i+1 >= len(args) {
 				danglingManaged = a == "--input-format" || a == "--output-format"
 				return barePrint, invalidBool, diagnostic, danglingManaged // other dangling flags are handled by the partitioner
+			}
+			if a == "--input-format" || a == "--output-format" {
+				next := canonicalAntigravityFlag(args[i+1])
+				if isAntigravityPrintFlag(next) || antigravityBoolFlags[next] || antigravityValuedFlags[next] || antigravityDiagnosticTokens[next] || (strings.HasPrefix(next, "-") && next != antigravityFlagTerminator) {
+					danglingManaged = true
+					return barePrint, invalidBool, diagnostic, danglingManaged
+				}
 			}
 			i++
 			continue

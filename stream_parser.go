@@ -71,12 +71,12 @@ func isClaudeRateLimitEventLine(line string) bool {
 //
 // For non-JSON lines (plain text, errors), returns the line as-is (passthrough).
 func extractDisplayText(command, line string) string {
-	return extractDisplayTextWithContext(command, line, false)
+	return extractDisplayTextWithAccumulated(command, line, "")
 }
 
-// extractDisplayTextWithContext parses a single stdout line with context about
-// whether incremental streaming deltas have already been emitted for this turn.
-func extractDisplayTextWithContext(command, line string, sawAntigravityDelta bool) string {
+// extractDisplayTextWithAccumulated parses a single stdout line with context about
+// incremental streaming deltas accumulated so far for this turn.
+func extractDisplayTextWithAccumulated(command, line string, accumulatedDeltas string) string {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
 		return ""
@@ -108,7 +108,7 @@ func extractDisplayTextWithContext(command, line string, sawAntigravityDelta boo
 	case strings.HasPrefix(base, "grok"):
 		return extractGrokDisplayText(raw, line)
 	case isAntigravityCommand(command):
-		return extractAntigravityDisplayTextWithDeltas(raw, sawAntigravityDelta)
+		return extractAntigravityDisplayTextWithAccumulated(raw, accumulatedDeltas)
 	default:
 		return line // passthrough unknown CLI agents
 	}
@@ -178,15 +178,15 @@ func detectAntigravityErrorResult(command, line string) (string, bool) {
 // step_update events and suppresses the terminal SUCCESS recap to avoid
 // duplicate output. A terminal error is surfaced because it may be the only
 // extractAntigravityDisplayText emits incremental assistant text from
-// step_update events and suppresses the terminal SUCCESS recap to avoid
-// duplicate output when deltas were seen, or falls back to the complete
-// terminal response if no deltas were emitted. A terminal error is surfaced
-// because it may be the only human-readable failure detail in the stream.
+// step_update events and reconciles the terminal SUCCESS recap to ensure the
+// complete answer is surfaced without duplicating text already emitted via
+// streaming deltas. A terminal error is surfaced because it may be the only
+// human-readable failure detail in the stream.
 func extractAntigravityDisplayText(raw map[string]interface{}) string {
-	return extractAntigravityDisplayTextWithDeltas(raw, false)
+	return extractAntigravityDisplayTextWithAccumulated(raw, "")
 }
 
-func extractAntigravityDisplayTextWithDeltas(raw map[string]interface{}, sawDeltas bool) string {
+func extractAntigravityDisplayTextWithAccumulated(raw map[string]interface{}, accumulatedDeltas string) string {
 	eventType, _ := raw["event"].(string)
 	switch eventType {
 	case "step_update":
@@ -213,10 +213,16 @@ func extractAntigravityDisplayTextWithDeltas(raw map[string]interface{}, sawDelt
 		}
 		status, _ := result["status"].(string)
 		if strings.EqualFold(status, "SUCCESS") {
-			if sawDeltas {
+			resp, _ := result["response"].(string)
+			if accumulatedDeltas == "" {
+				return resp
+			}
+			if strings.HasPrefix(resp, accumulatedDeltas) {
+				return resp[len(accumulatedDeltas):]
+			}
+			if resp == accumulatedDeltas {
 				return ""
 			}
-			resp, _ := result["response"].(string)
 			return resp
 		}
 		errText, _ := result["error"].(string)

@@ -2969,6 +2969,10 @@ func TestBuildAntigravityStreamingArgs_PreservesDanglingManagedFormatFlag(t *tes
 		{"--output-format"},
 		{"--print", "review", "--output-format"},
 		{"--print", "review", "--input-format"},
+		{"--output-format", "--print", "review"},
+		{"--input-format", "-p", "review"},
+		{"--output-format=--print", "review"},
+		{"--output-format", "--dangerously-skip-permissions", "review"},
 	} {
 		args, prompt := buildAntigravityStreamingArgs(in)
 		if !reflect.DeepEqual(args, in) || prompt != nil {
@@ -3574,13 +3578,17 @@ func TestExtractDisplayText_Antigravity_StreamEvents(t *testing.T) {
 	if got := extractDisplayText("antigravity", toolLine); !strings.Contains(got, "run_command") {
 		t.Fatalf("Antigravity tool event = %q", got)
 	}
-	resultLine := `{"event":"result","result":{"status":"SUCCESS","response":"fixed it"}}`
-	// When deltas were seen, SUCCESS recap is suppressed to avoid duplicate text
-	if got := extractDisplayTextWithContext("agy", resultLine, true); got != "" {
-		t.Fatalf("successful result recap should be skipped when deltas seen, got %q", got)
+	resultLine := `{"event":"result","result":{"status":"SUCCESS","response":"fixed it completely"}}`
+	// When all deltas were seen, SUCCESS recap is suppressed to avoid duplicate text
+	if got := extractDisplayTextWithAccumulated("agy", resultLine, "fixed it completely"); got != "" {
+		t.Fatalf("successful result recap should be skipped when full deltas seen, got %q", got)
 	}
-	// When NO deltas were seen, SUCCESS response is retained as complete output
-	if got := extractDisplayTextWithContext("agy", resultLine, false); got != "fixed it" {
+	// When partial deltas were seen, missing suffix is retained
+	if got := extractDisplayTextWithAccumulated("agy", resultLine, "fixed it "); got != "completely" {
+		t.Fatalf("missing suffix should be emitted when partial deltas seen, got %q", got)
+	}
+	// When NO deltas were seen, full SUCCESS response is retained as complete output
+	if got := extractDisplayTextWithAccumulated("agy", resultLine, ""); got != "fixed it completely" {
 		t.Fatalf("successful result response should be retained when no deltas seen, got %q", got)
 	}
 	errorLine := `{"event":"result","result":{"status":"ERROR","error":"quota exhausted"}}`
