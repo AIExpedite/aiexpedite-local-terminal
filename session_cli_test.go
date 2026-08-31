@@ -2905,6 +2905,20 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 			}
 		}
 	})
+	t.Run("flag-only-invocations-have-nil-stdin-prompt", func(t *testing.T) {
+		_, codexPrompt := buildInteractiveCLIArgs("codex", []string{"--model", "o3"}, false)
+		if codexPrompt != nil {
+			t.Errorf("codex flag-only invocation should have nil stdinPrompt, got %v", codexPrompt)
+		}
+		_, claudePrompt := buildInteractiveCLIArgs("claude", []string{"--model", "sonnet"}, false)
+		if claudePrompt != nil {
+			t.Errorf("claude flag-only invocation should have nil stdinPrompt, got %v", claudePrompt)
+		}
+		_, agyPrompt := buildInteractiveCLIArgs("agy", []string{"--model", "gemini"}, false)
+		if agyPrompt != nil {
+			t.Errorf("agy flag-only invocation should have nil stdinPrompt, got %v", agyPrompt)
+		}
+	})
 	t.Run("unknown-command-passes-through", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("git", []string{"status"}, false)
 		if prompt != nil {

@@ -1807,13 +1807,13 @@ func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysAppr
 	switch {
 	case strings.HasPrefix(base, "claude"):
 		cliArgs, prompt := buildClaudeInteractiveArgs(args)
-		if prompt == "" && len(args) == 0 {
+		if prompt == "" {
 			return cliArgs, nil
 		}
 		return cliArgs, &prompt
 	case strings.HasPrefix(base, "codex"):
 		cliArgs, prompt := buildCodexInteractiveArgs(args)
-		if prompt == "" && len(args) == 0 {
+		if prompt == "" {
 			return cliArgs, nil
 		}
 		return cliArgs, &prompt
