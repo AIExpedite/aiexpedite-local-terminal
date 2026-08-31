@@ -1224,10 +1224,12 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			}
 
 			// Antigravity result error: agy can emit result.status: "ERROR" on a protocol/quota/tool
-			// failure while the process exits with status 0. Flush any preceding deltas, publish an
-			// explicit error stream frame with Status: "error", and mark session.ExitCode = 1 so the
-			// terminal session_ended message and automated callers recognize the failure.
+			// failure while the process exits with status 0. Discard any buffered draft deltas, flush
+			// preceding tool events, publish an explicit error stream frame with Status: "error", and
+			// mark session.ExitCode = 1 so the terminal session_ended message and automated callers recognize the failure.
 			if errMsg, isErr := detectAntigravityErrorResult(session.Command, line.text); isErr {
+				antigravityResultSeen = true
+				antigravityDeltas.Reset()
 				flushBatch()
 				session.mu.Lock()
 				session.ExitCode = 1

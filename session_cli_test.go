@@ -3321,10 +3321,14 @@ func TestReadOutputStream_AntigravityAbruptTerminationFlushesBufferedDeltas(t *t
 }
 
 func TestReadOutputStream_AntigravityErrorResultPublishesFailure(t *testing.T) {
+	output := strings.Join([]string{
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"draft before failure"}}`,
+		`{"event":"result","result":{"status":"ERROR","error":"quota exceeded"}}`,
+	}, "\n") + "\n"
 	session := &CLISession{
 		ID:             "antigravity-error-result",
 		Command:        "agy",
-		Stdout:         io.NopCloser(strings.NewReader(`{"event":"result","result":{"status":"ERROR","error":"quota exceeded"}}` + "\n")),
+		Stdout:         io.NopCloser(strings.NewReader(output)),
 		Stderr:         io.NopCloser(strings.NewReader("")),
 		streamDone:     make(chan struct{}),
 		firstRealFrame: make(chan struct{}),
@@ -3337,6 +3341,9 @@ func TestReadOutputStream_AntigravityErrorResultPublishesFailure(t *testing.T) {
 
 	var sawError bool
 	for _, msg := range published {
+		if strings.Contains(msg.Output, "draft before failure") {
+			t.Fatalf("buffered draft deltas should be discarded on error, but got message: %#v", msg)
+		}
 		if msg.Type != "stream" || !strings.Contains(msg.Output, "quota exceeded") {
 			continue
 		}
