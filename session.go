@@ -1111,10 +1111,12 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		case line, ok := <-lines:
 			if !ok {
 				// If this was an Antigravity stream that ended abruptly without a terminal result event,
-				// flush the buffered incremental deltas so partial output before termination is not lost,
-				// and mark session.ExitCode = 1 so automated callers do not mistake an incomplete draft for a successful turn.
-				if isAntigravityCommand(session.Command) && !antigravityResultSeen && antigravityDeltas.Len() > 0 {
-					batch = append(batch, antigravityDeltas.String())
+				// flush the buffered incremental deltas if present so partial output before termination is not lost,
+				// and mark session.ExitCode = 1 so automated callers do not mistake an incomplete stream for a successful turn.
+				if isAntigravityCommand(session.Command) && !antigravityResultSeen {
+					if antigravityDeltas.Len() > 0 {
+						batch = append(batch, antigravityDeltas.String())
+					}
 					session.mu.Lock()
 					session.ExitCode = 1
 					session.mu.Unlock()

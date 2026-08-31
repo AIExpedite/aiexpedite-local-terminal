@@ -3327,6 +3327,27 @@ func TestReadOutputStream_AntigravityAbruptTerminationFlushesBufferedDeltas(t *t
 	}
 }
 
+func TestReadOutputStream_AntigravityEmptyOrInitStreamWithoutResultSetsNonZeroExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+	}{
+		{"empty output", ""},
+		{"init and tool only", strings.Join([]string{
+			`{"event":"init","conversation_id":"ag-123"}`,
+			`{"event":"step_update","step_update":{"step_type":"tool","tool_name":"read_file"}}`,
+		}, "\n") + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := &CLISession{ID: "antigravity-no-result", Command: "agy", Stdout: io.NopCloser(strings.NewReader(tc.output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{})}
+			NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {})
+			if session.ExitCode == 0 {
+				t.Fatalf("%s: Antigravity stream ending without result must set session.ExitCode != 0", tc.name)
+			}
+		})
+	}
+}
+
 func TestReadOutputStream_AntigravityErrorResultPublishesFailure(t *testing.T) {
 	output := strings.Join([]string{
 		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"draft before failure"}}`,
