@@ -36,6 +36,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 /* --------------------------------------------------------------------------
@@ -3619,6 +3620,15 @@ func TestExtractDisplayText_Antigravity_StreamEvents(t *testing.T) {
 	// When deltas share common prefix with response, only non-overlapping suffix is emitted
 	if got := extractDisplayTextWithAccumulated("agy", resultLine, "fixed it but different end"); got != "completely" {
 		t.Fatalf("partial overlap should emit non-overlapping suffix, got %q", got)
+	}
+	// Non-ASCII UTF-8 multibyte characters that share a leading byte (e.g. ê vs é)
+	// must reconcile cleanly on rune boundaries without creating invalid UTF-8.
+	utf8Result := `{"event":"result","result":{"status":"SUCCESS","response":"Café au lait"}}`
+	if got := extractDisplayTextWithAccumulated("agy", utf8Result, "Cafê draft"); got != "é au lait" {
+		t.Fatalf("UTF-8 multibyte mismatch should reconcile on rune boundary, got %q (valid=%v)", got, utf8.ValidString(got))
+	}
+	if !utf8.ValidString(extractDisplayTextWithAccumulated("agy", utf8Result, "Cafê draft")) {
+		t.Fatalf("UTF-8 multibyte reconciliation must return valid UTF-8")
 	}
 	errorLine := `{"event":"result","result":{"status":"ERROR","error":"quota exhausted"}}`
 	if got := extractDisplayText("agy", errorLine); !strings.Contains(got, "quota exhausted") {

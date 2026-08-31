@@ -258,18 +258,20 @@ func reconcileAntigravityTerminalResponse(resp, accumulatedDeltas string) string
 	if strings.HasPrefix(accumulatedDeltas, resp) {
 		return ""
 	}
-	// Overlap check: find the longest common prefix between resp and accumulatedDeltas
-	// so that minor whitespace variations or partial overlaps only emit the missing remainder.
+	// Rune-based overlap check: compare rune-by-rune so we only split on valid
+	// UTF-8 character boundaries and never cut through multibyte encodings.
+	respRunes := []rune(resp)
+	deltasRunes := []rune(accumulatedDeltas)
 	overlap := 0
-	maxLen := len(resp)
-	if len(accumulatedDeltas) < maxLen {
-		maxLen = len(accumulatedDeltas)
+	maxLen := len(respRunes)
+	if len(deltasRunes) < maxLen {
+		maxLen = len(deltasRunes)
 	}
-	for overlap < maxLen && resp[overlap] == accumulatedDeltas[overlap] {
+	for overlap < maxLen && respRunes[overlap] == deltasRunes[overlap] {
 		overlap++
 	}
 	if overlap > 0 {
-		return resp[overlap:]
+		return string(respRunes[overlap:])
 	}
 	// If accumulated deltas were already published and do not share a common prefix
 	// with the final recap (e.g. pre-tool draft vs final recap), suppress the duplicate
