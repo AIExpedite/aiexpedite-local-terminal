@@ -1036,7 +1036,6 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	}
 
 	var batch []string
-	lastBatchEntryWasAntigravityDelta := false
 	batchTimer := time.NewTicker(streamBatchInterval)
 	defer batchTimer.Stop()
 
@@ -1061,27 +1060,33 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		})
 
 		batch = batch[:0]
-		lastBatchEntryWasAntigravityDelta = false
 	}
 
 	var antigravityDeltas strings.Builder
+	var antigravityResultSeen bool
 
 	appendDisplayText := func(lineText string) {
-		isAntigravityDelta := isAntigravityCommand(session.Command) && isAntigravityAgentResponseDelta(lineText)
-		displayText := extractDisplayTextWithAccumulated(session.Command, lineText, antigravityDeltas.String())
-		isAntigravityContinuation := displayText != "" && antigravityDeltas.Len() > 0 && isAntigravityCommand(session.Command) && isAntigravitySuccessResult(lineText)
-		if isAntigravityDelta {
-			antigravityDeltas.WriteString(displayText)
+		if isAntigravityCommand(session.Command) {
+			if isAntigravityAgentResponseDelta(lineText) {
+				var raw map[string]interface{}
+				if err := json.Unmarshal([]byte(strings.TrimSpace(lineText)), &raw); err == nil {
+					if update, ok := raw["step_update"].(map[string]interface{}); ok {
+						if text, ok := update["text_delta"].(string); ok {
+							antigravityDeltas.WriteString(text)
+						}
+					}
+				}
+				return
+			}
+			if isAntigravitySuccessResult(lineText) {
+				antigravityResultSeen = true
+			}
 		}
+		displayText := extractDisplayText(session.Command, lineText)
 		if displayText == "" {
 			return
 		}
-		if (isAntigravityDelta || isAntigravityContinuation) && lastBatchEntryWasAntigravityDelta && len(batch) > 0 {
-			batch[len(batch)-1] += displayText
-		} else {
-			batch = append(batch, displayText)
-		}
-		lastBatchEntryWasAntigravityDelta = isAntigravityDelta || isAntigravityContinuation
+		batch = append(batch, displayText)
 		// Genuine assistant output (text/thinking delta or tool_use)
 		// — the session is alive and producing, so disarm the claude
 		// no-output watchdog. No-op for non-claude sessions (they
@@ -1105,6 +1110,11 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		select {
 		case line, ok := <-lines:
 			if !ok {
+				// If this was an Antigravity stream that ended abruptly without a terminal result event,
+				// flush the buffered incremental deltas so partial output before termination is not lost.
+				if isAntigravityCommand(session.Command) && !antigravityResultSeen && antigravityDeltas.Len() > 0 {
+					batch = append(batch, antigravityDeltas.String())
+				}
 				// All readers done — flush remaining
 				flushBatch()
 				return

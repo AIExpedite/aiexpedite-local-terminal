@@ -3287,20 +3287,36 @@ func TestReadOutputStream_AntigravityConcatenatesAdjacentTextDeltas(t *testing.T
 	}
 }
 
-func TestReadOutputStream_AntigravityCompletesTruncatedDeltaStream(t *testing.T) {
+func TestReadOutputStream_AntigravityDivergentDeltasUsesAuthoritativeResult(t *testing.T) {
 	output := strings.Join([]string{
-		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"partial"}}`,
-		`{"event":"result","result":{"status":"SUCCESS","response":"partial response"}}`,
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"early draft..."}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"authoritative final answer"}}`,
 	}, "\n") + "\n"
-	session := &CLISession{ID: "antigravity-truncated-deltas", Command: "agy", Stdout: io.NopCloser(strings.NewReader(output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{})}
+	session := &CLISession{ID: "antigravity-divergent-deltas", Command: "agy", Stdout: io.NopCloser(strings.NewReader(output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{})}
 	var streams []string
 	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
 		if msg.Type == "stream" {
 			streams = append(streams, msg.Output)
 		}
 	})
-	if got := strings.Join(streams, ""); got != "partial response" {
-		t.Fatalf("Antigravity reconciled output = %q, want %q", got, "partial response")
+	if got := strings.Join(streams, ""); got != "authoritative final answer" {
+		t.Fatalf("Antigravity output = %q, want %q", got, "authoritative final answer")
+	}
+}
+
+func TestReadOutputStream_AntigravityAbruptTerminationFlushesBufferedDeltas(t *testing.T) {
+	output := strings.Join([]string{
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"partial work in progress"}}`,
+	}, "\n") + "\n"
+	session := &CLISession{ID: "antigravity-abrupt-eof", Command: "agy", Stdout: io.NopCloser(strings.NewReader(output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{})}
+	var streams []string
+	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
+		if msg.Type == "stream" {
+			streams = append(streams, msg.Output)
+		}
+	})
+	if got := strings.Join(streams, ""); got != "partial work in progress" {
+		t.Fatalf("Antigravity abrupt EOF output = %q, want %q", got, "partial work in progress")
 	}
 }
 
@@ -3590,46 +3606,16 @@ func TestExtractDisplayText_Grok_NonJsonPassthrough(t *testing.T) {
 
 func TestExtractDisplayText_Antigravity_StreamEvents(t *testing.T) {
 	textLine := `{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"fixed it"}}`
-	if got := extractDisplayText("agy.exe", textLine); got != "fixed it" {
-		t.Fatalf("Antigravity text delta = %q", got)
+	if got := extractDisplayText("agy.exe", textLine); got != "" {
+		t.Fatalf("Antigravity text delta should be buffered by readOutputStream, got %q", got)
 	}
 	toolLine := `{"event":"step_update","step_update":{"step_type":"tool","tool_name":"run_command"}}`
 	if got := extractDisplayText("antigravity", toolLine); !strings.Contains(got, "run_command") {
 		t.Fatalf("Antigravity tool event = %q", got)
 	}
 	resultLine := `{"event":"result","result":{"status":"SUCCESS","response":"fixed it completely"}}`
-	// When all deltas were seen, SUCCESS recap is suppressed to avoid duplicate text
-	if got := extractDisplayTextWithAccumulated("agy", resultLine, "fixed it completely"); got != "" {
-		t.Fatalf("successful result recap should be skipped when full deltas seen, got %q", got)
-	}
-	// When partial deltas were seen, missing suffix is retained
-	if got := extractDisplayTextWithAccumulated("agy", resultLine, "fixed it "); got != "completely" {
-		t.Fatalf("missing suffix should be emitted when partial deltas seen, got %q", got)
-	}
-	// When NO deltas were seen, full SUCCESS response is retained as complete output
-	if got := extractDisplayTextWithAccumulated("agy", resultLine, ""); got != "fixed it completely" {
-		t.Fatalf("successful result response should be retained when no deltas seen, got %q", got)
-	}
-	// When deltas had trailing newline/punctuation, duplicate text is suppressed
-	if got := extractDisplayTextWithAccumulated("agy", resultLine, "fixed it completely\n"); got != "" {
-		t.Fatalf("trailing newline in deltas should not cause recap to re-emit, got %q", got)
-	}
-	// When deltas were mismatched draft text, duplicate recap is suppressed
-	if got := extractDisplayTextWithAccumulated("agy", resultLine, "thinking through problem..."); got != "" {
-		t.Fatalf("mismatched draft deltas should not cause full response to concatenate, got %q", got)
-	}
-	// When deltas diverge after a partial prefix, recap is suppressed to avoid appending a garbled suffix
-	if got := extractDisplayTextWithAccumulated("agy", resultLine, "fixed it but different end"); got != "" {
-		t.Fatalf("divergent deltas should suppress recap, got %q", got)
-	}
-	// Multibyte mismatch (e.g. Café vs Cafê draft) also suppresses recap
-	utf8Result := `{"event":"result","result":{"status":"SUCCESS","response":"Café au lait"}}`
-	if got := extractDisplayTextWithAccumulated("agy", utf8Result, "Cafê draft"); got != "" {
-		t.Fatalf("UTF-8 multibyte divergence should suppress recap, got %q", got)
-	}
-	// Exact UTF-8 prefix missing suffix is emitted cleanly
-	if got := extractDisplayTextWithAccumulated("agy", utf8Result, "Café "); got != "au lait" {
-		t.Fatalf("UTF-8 multibyte prefix should emit remaining suffix, got %q", got)
+	if got := extractDisplayText("agy", resultLine); got != "fixed it completely" {
+		t.Fatalf("successful result response = %q, want %q", got, "fixed it completely")
 	}
 	errorLine := `{"event":"result","result":{"status":"ERROR","error":"quota exhausted"}}`
 	if got := extractDisplayText("agy", errorLine); !strings.Contains(got, "quota exhausted") {

@@ -71,12 +71,6 @@ func isClaudeRateLimitEventLine(line string) bool {
 //
 // For non-JSON lines (plain text, errors), returns the line as-is (passthrough).
 func extractDisplayText(command, line string) string {
-	return extractDisplayTextWithAccumulated(command, line, "")
-}
-
-// extractDisplayTextWithAccumulated parses a single stdout line with context about
-// incremental streaming deltas accumulated so far for this turn.
-func extractDisplayTextWithAccumulated(command, line string, accumulatedDeltas string) string {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
 		return ""
@@ -108,7 +102,7 @@ func extractDisplayTextWithAccumulated(command, line string, accumulatedDeltas s
 	case strings.HasPrefix(base, "grok"):
 		return extractGrokDisplayText(raw, line)
 	case isAntigravityCommand(command):
-		return extractAntigravityDisplayTextWithAccumulated(raw, accumulatedDeltas)
+		return extractAntigravityDisplayText(raw)
 	default:
 		return line // passthrough unknown CLI agents
 	}
@@ -186,19 +180,11 @@ func detectAntigravityErrorResult(command, line string) (string, bool) {
    Google Antigravity parser
    -------------------------------------------------------------------------- */
 
-// extractAntigravityDisplayText emits incremental assistant text from
-// step_update events and suppresses the terminal SUCCESS recap to avoid
-// duplicate output. A terminal error is surfaced because it may be the only
-// extractAntigravityDisplayText emits incremental assistant text from
-// step_update events and reconciles the terminal SUCCESS recap to ensure the
-// complete answer is surfaced without duplicating text already emitted via
-// streaming deltas. A terminal error is surfaced because it may be the only
-// human-readable failure detail in the stream.
+// extractAntigravityDisplayText extracts display text from an Antigravity stream-json event.
+// Tool activity is surfaced as it executes during step_update events, and the authoritative
+// full response is emitted on the terminal SUCCESS result event. Terminal errors are surfaced
+// because they are the authoritative record of why the turn failed.
 func extractAntigravityDisplayText(raw map[string]interface{}) string {
-	return extractAntigravityDisplayTextWithAccumulated(raw, "")
-}
-
-func extractAntigravityDisplayTextWithAccumulated(raw map[string]interface{}, accumulatedDeltas string) string {
 	eventType, _ := raw["event"].(string)
 	switch eventType {
 	case "step_update":
@@ -207,10 +193,6 @@ func extractAntigravityDisplayTextWithAccumulated(raw map[string]interface{}, ac
 			return ""
 		}
 		stepType, _ := update["step_type"].(string)
-		if stepType == "agent_response" {
-			text, _ := update["text_delta"].(string)
-			return text
-		}
 		if stepType == "tool" {
 			name, _ := update["tool_name"].(string)
 			if name != "" {
@@ -226,7 +208,7 @@ func extractAntigravityDisplayTextWithAccumulated(raw map[string]interface{}, ac
 		status, _ := result["status"].(string)
 		if strings.EqualFold(status, "SUCCESS") {
 			resp, _ := result["response"].(string)
-			return reconcileAntigravityTerminalResponse(resp, accumulatedDeltas)
+			return resp
 		}
 		errText, _ := result["error"].(string)
 		if errText == "" {
@@ -235,23 +217,6 @@ func extractAntigravityDisplayTextWithAccumulated(raw map[string]interface{}, ac
 		return fmt.Sprintf("\n[Antigravity turn failed: %s]\n", errText)
 	case "init":
 		return ""
-	}
-	return ""
-}
-
-// reconcileAntigravityTerminalResponse computes the missing text that should be
-// emitted from the terminal SUCCESS result event given the streaming deltas
-// accumulated so far. If no deltas were emitted, the entire response is returned;
-// if the accumulated deltas form a prefix of the terminal response (e.g. deltas
-// stopped early or completed), only the missing suffix is returned; if deltas
-// diverged or already covered the response, the recap is suppressed to avoid
-// garbled or duplicated output.
-func reconcileAntigravityTerminalResponse(resp, accumulatedDeltas string) string {
-	if accumulatedDeltas == "" {
-		return resp
-	}
-	if strings.HasPrefix(resp, accumulatedDeltas) {
-		return strings.TrimPrefix(resp, accumulatedDeltas)
 	}
 	return ""
 }
