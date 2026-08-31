@@ -603,6 +603,19 @@ func TestSessionLifecycle_AntigravityLongPromptViaStdin(t *testing.T) {
 	}
 }
 
+func TestSessionLifecycle_AntigravityExplicitEmptyPrompt(t *testing.T) {
+	_, messages, err := captureSession(t, "antigravity-stream-stdin", "agy", []string{"--print="}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+
+	assertLifecycleOrdering(t, messages)
+	want := "antigravity received 0 bytes"
+	if streamText := concatStreamOutput(messages); !strings.Contains(streamText, want) {
+		t.Fatalf("empty prompt did not arrive intact over Antigravity stdin: got %q, want %q", streamText, want)
+	}
+}
+
 func TestSessionLifecycle_GrokDirectPublishesFreshRedactedBilling(t *testing.T) {
 	realHome := t.TempDir()
 	seedGrokHomeWithLogin(t, realHome)

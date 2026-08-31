@@ -360,7 +360,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		// A stdin-fed one-shot CLI (codex) started without a prompt keeps
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
-		deferredStdinClose: isOneShotStdinPromptFormat(stdinPromptFormat(command)) && stdinPrompt == "",
+		deferredStdinClose: isOneShotStdinPromptFormat(stdinPromptFormat(command)) && stdinPrompt == nil,
 		firstRealFrame:     make(chan struct{}),
 		processExited:      make(chan struct{}),
 		done:               make(chan struct{}),
@@ -412,28 +412,28 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	//              right after the write via shouldCloseStdinAfterStart.
 	//   ""       — no stdin prompt (positional argv path, or no prompt
 	//              expected at all).
-	if stdinPrompt != "" {
+	if stdinPrompt != nil {
 		var line string
 		switch stdinPromptFormat(command) {
 		case "ndjson":
 			line = fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%s},"session_id":"%s","parent_tool_use_id":null}`,
-				jsonEscapeString(stdinPrompt), id)
+				jsonEscapeString(*stdinPrompt), id)
 		case "antigravity_ndjson":
-			line = antigravityStreamUserMessage(stdinPrompt)
+			line = antigravityStreamUserMessage(*stdinPrompt)
 		case "plain":
-			line = stdinPrompt
+			line = *stdinPrompt
 		default:
 			// Defensive: a CLI router returned a stdinPrompt for a command
 			// with no documented stdin format. Treat as plain text rather
 			// than dropping the prompt silently.
-			line = stdinPrompt
+			line = *stdinPrompt
 		}
 		if _, err := fmt.Fprintln(session.Stdin, line); err != nil {
 			fmt.Printf("%s[session] Failed to send initial prompt to %s: %v%s\n",
 				colorRed, id, err, colorReset)
 		} else {
 			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars, format=%s)%s\n",
-				colorGreen, id, len(stdinPrompt), stdinPromptFormat(command), colorReset)
+				colorGreen, id, len(*stdinPrompt), stdinPromptFormat(command), colorReset)
 			// Prompt delivered — arm the claude no-output watchdog now.
 			sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
 		}
@@ -810,12 +810,13 @@ func (sm *SessionManager) removeSessionIfSame(id string, s *CLISession) bool {
 //
 //   - All non-CLI commands keep the pre-existing rule: close stdin iff no
 //     stdinPrompt was queued.
-func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
+func shouldCloseStdinAfterStart(command string, stdinPrompt *string) bool {
 	// Route through commandBaseName so absolute/relative paths like
 	// `/opt/bin/codex` follow the same stdin policy as bare names — otherwise
 	// the argv builder would shape them as stdin-fed codex sessions while this
 	// function left the pipe open, hanging the child waiting for EOF.
 	base := commandBaseName(command)
+	hasPrompt := stdinPrompt != nil
 	switch {
 	case strings.HasPrefix(base, "claude"):
 		return false
@@ -836,11 +837,11 @@ func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
 		// provided via stdin." before the user's first message ever arrives.
 		// Keep stdin open in that case; SendInput closes it after writing the
 		// first (and only) prompt. See deferredStdinClose.
-		return stdinPrompt != ""
+		return hasPrompt
 	case isAntigravityCommand(command):
-		return stdinPrompt != ""
+		return hasPrompt
 	}
-	return stdinPrompt == ""
+	return !hasPrompt
 }
 
 func waitForStreamCompletion(session *CLISession, timeout time.Duration) {
@@ -1800,22 +1801,30 @@ func isResidentAgentSessionCommand(command string) bool {
 //
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
 // the stdinPrompt before writing it to the process stdin.
-func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysApprove bool) ([]string, string) {
+func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysApprove bool) ([]string, *string) {
 	base := commandBaseName(command)
 
 	switch {
 	case strings.HasPrefix(base, "claude"):
-		return buildClaudeInteractiveArgs(args)
+		cliArgs, prompt := buildClaudeInteractiveArgs(args)
+		if prompt == "" && len(args) == 0 {
+			return cliArgs, nil
+		}
+		return cliArgs, &prompt
 	case strings.HasPrefix(base, "codex"):
-		return buildCodexInteractiveArgs(args)
+		cliArgs, prompt := buildCodexInteractiveArgs(args)
+		if prompt == "" && len(args) == 0 {
+			return cliArgs, nil
+		}
+		return cliArgs, &prompt
 	case isAntigravityCommand(command):
 		return buildAntigravityStreamingArgs(args)
 	case isOpenCodeCommand(command):
-		return buildOpenCodeInteractiveArgs(args), ""
+		return buildOpenCodeInteractiveArgs(args), nil
 	case strings.HasPrefix(base, "grok"):
-		return buildGrokInteractiveArgs(args, enableGrokAlwaysApprove), ""
+		return buildGrokInteractiveArgs(args, enableGrokAlwaysApprove), nil
 	default:
-		return args, ""
+		return args, nil
 	}
 }
 
@@ -2102,15 +2111,15 @@ func sanitizeCodexExecArgs(args []string) []string {
 // so the returned prompt is never placed on argv. This is the Antigravity
 // equivalent of Claude/Codex's long-prompt transport and avoids Windows'
 // CreateProcess command-line ceiling.
-func buildAntigravityStreamingArgs(args []string) ([]string, string) {
+func buildAntigravityStreamingArgs(args []string) ([]string, *string) {
 	// Preserve diagnostics and malformed invocations verbatim: turning one into
 	// a managed stream could start a permission-skipping model run the caller
 	// never requested.
 	if isAntigravityDiagnosticInvocation(args) {
-		return args, ""
+		return args, nil
 	}
 	if barePrint, invalidBool, diagnostic, danglingManaged := scanAntigravityCallerArgs(args); barePrint || invalidBool || diagnostic || danglingManaged {
-		return args, ""
+		return args, nil
 	}
 
 	cleaned := stripAntigravityManagedStreamFlags(args)
@@ -2123,9 +2132,9 @@ func buildAntigravityStreamingArgs(args []string) ([]string, string) {
 	result = append(result, flags...)
 	result = append(result, trailing...)
 	if !hasPrompt {
-		return result, ""
+		return result, nil
 	}
-	return result, prompt
+	return result, &prompt
 }
 
 // stripAntigravityManagedStreamFlags removes caller overrides for the two

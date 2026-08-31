@@ -2849,14 +2849,14 @@ func TestStdinPromptFormat(t *testing.T) {
 func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 	t.Run("claude", func(t *testing.T) {
 		_, prompt := buildInteractiveCLIArgs("claude", []string{"hello"}, false)
-		if prompt != "hello" {
-			t.Errorf("claude prompt = %q, want %q", prompt, "hello")
+		if prompt == nil || *prompt != "hello" {
+			t.Errorf("claude prompt = %v, want %q", prompt, "hello")
 		}
 	})
 	t.Run("codex", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("codex", []string{"hello"}, false)
-		if prompt != "hello" {
-			t.Errorf("codex stdinPrompt = %q, want %q", prompt, "hello")
+		if prompt == nil || *prompt != "hello" {
+			t.Errorf("codex stdinPrompt = %v, want %q", prompt, "hello")
 		}
 		if len(args) == 0 || args[len(args)-1] != "-" {
 			t.Errorf("codex args must end with `-` placeholder, got %v", args)
@@ -2864,8 +2864,8 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 	})
 	t.Run("antigravity", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("agy", []string{"hello"}, false)
-		if prompt != "hello" {
-			t.Errorf("agy stdinPrompt = %q, want hello", prompt)
+		if prompt == nil || *prompt != "hello" {
+			t.Errorf("agy stdinPrompt = %v, want hello", prompt)
 		}
 		mustContain(t, args, "--input-format", "--output-format", "stream-json", "--dangerously-skip-permissions")
 		if strings.Contains(strings.Join(args, " "), "hello") {
@@ -2876,7 +2876,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 		// The router checks command.ToLower() exactly + startswith — make sure
 		// "Claude" / "CODEX" still route correctly.
 		_, p1 := buildInteractiveCLIArgs("Claude", []string{"hi"}, false)
-		if p1 == "" {
+		if p1 == nil || *p1 == "" {
 			t.Errorf("Claude (mixed case) should still route to claude builder, got empty prompt")
 		}
 		args, _ := buildInteractiveCLIArgs("CODEX", []string{"hi"}, false)
@@ -2897,7 +2897,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 			"claude-edge",
 		} {
 			_, prompt := buildInteractiveCLIArgs(cmd, []string{"hi"}, false)
-			if prompt == "" {
+			if prompt == nil || *prompt == "" {
 				t.Errorf("buildInteractiveCLIArgs(%q) did not route to claude (empty stdinPrompt)", cmd)
 			}
 			if !isClaudeCommand(cmd) {
@@ -2907,8 +2907,8 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 	})
 	t.Run("unknown-command-passes-through", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("git", []string{"status"}, false)
-		if prompt != "" {
-			t.Errorf("unknown command should have empty stdinPrompt, got %q", prompt)
+		if prompt != nil {
+			t.Errorf("unknown command should have nil stdinPrompt, got %v", prompt)
 		}
 		if !reflect.DeepEqual(args, []string{"status"}) {
 			t.Errorf("unknown command should pass args through verbatim, got %v", args)
@@ -2919,7 +2919,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 func TestBuildAntigravityStreamingArgs_LongPromptNeverTouchesArgv(t *testing.T) {
 	prompt := strings.Repeat("large review brief with \\\"quotes\\\" and paths C:\\\\repo\\n", 4000)
 	args, stdinPrompt := buildAntigravityStreamingArgs([]string{"--model", "gemini", prompt})
-	if stdinPrompt != prompt {
+	if stdinPrompt == nil || *stdinPrompt != prompt {
 		t.Fatal("Antigravity stdin prompt changed")
 	}
 	joined := strings.Join(args, " ")
@@ -2937,8 +2937,8 @@ func TestBuildAntigravityStreamingArgs_OwnsFormatFlags(t *testing.T) {
 		"--output-format", "text",
 		"--conversation", "abc",
 	})
-	if prompt != "review" {
-		t.Fatalf("prompt = %q, want review", prompt)
+	if prompt == nil || *prompt != "review" {
+		t.Fatalf("prompt = %v, want review", prompt)
 	}
 	joined := strings.Join(args, " ")
 	if strings.Contains(joined, " text") || strings.Contains(joined, "=json") || strings.Contains(joined, "--print") {
@@ -2957,10 +2957,34 @@ func TestBuildAntigravityStreamingArgs_PreservesDanglingManagedFormatFlag(t *tes
 		{"--print", "review", "--input-format"},
 	} {
 		args, prompt := buildAntigravityStreamingArgs(in)
-		if !reflect.DeepEqual(args, in) || prompt != "" {
-			t.Errorf("buildAntigravityStreamingArgs(%#v) = (%#v, %q), want unchanged argv and empty prompt", in, args, prompt)
+		if !reflect.DeepEqual(args, in) || prompt != nil {
+			t.Errorf("buildAntigravityStreamingArgs(%#v) = (%#v, %v), want unchanged argv and nil prompt", in, args, prompt)
 		}
 	}
+}
+
+func TestBuildAntigravityStreamingArgs_ExplicitEmptyPromptPreserved(t *testing.T) {
+	for _, in := range [][]string{
+		{"--print="},
+		{"--print", ""},
+		{""},
+	} {
+		args, prompt := buildAntigravityStreamingArgs(in)
+		if prompt == nil {
+			t.Fatalf("buildAntigravityStreamingArgs(%#v) returned nil prompt, want non-nil empty prompt", in)
+		}
+		if *prompt != "" {
+			t.Fatalf("buildAntigravityStreamingArgs(%#v) prompt = %q, want empty string", in, *prompt)
+		}
+		mustContain(t, args, "--input-format", "stream-json", "--output-format", "stream-json", "--dangerously-skip-permissions")
+	}
+
+	// Invocations with NO prompt must return nil prompt
+	args, prompt := buildAntigravityStreamingArgs([]string{"--model", "gemini"})
+	if prompt != nil {
+		t.Fatalf("buildAntigravityStreamingArgs without prompt returned %v, want nil", prompt)
+	}
+	mustContain(t, args, "--input-format", "stream-json")
 }
 
 /* --------------------------------------------------------------------------
@@ -3649,18 +3673,18 @@ func TestDetectPromptFromJSON_NonPromptEventsReturnNil(t *testing.T) {
 func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *testing.T) {
 	cases := []struct {
 		cmd         string
-		stdinPrompt string
+		stdinPrompt *string
 		want        bool // want close?
 	}{
 		// Claude — always open regardless of prompt (multi-turn stream-json
 		// keeps stdin open between SendInput calls).
-		{cmd: "claude", stdinPrompt: "", want: false},
-		{cmd: "claude", stdinPrompt: "hello", want: false},
-		{cmd: "claude", stdinPrompt: " ", want: false},
-		{cmd: "claude", stdinPrompt: "\n", want: false},
+		{cmd: "claude", stdinPrompt: nil, want: false},
+		{cmd: "claude", stdinPrompt: strPtr("hello"), want: false},
+		{cmd: "claude", stdinPrompt: strPtr(" "), want: false},
+		{cmd: "claude", stdinPrompt: strPtr("\n"), want: false},
 		// Normalize: claude.exe, claude.cmd, claude.ps1 should match too.
-		{cmd: "claude.exe", stdinPrompt: "", want: false},
-		{cmd: "Claude", stdinPrompt: "", want: false},
+		{cmd: "claude.exe", stdinPrompt: nil, want: false},
+		{cmd: "Claude", stdinPrompt: nil, want: false},
 		// Codex — close after the write when a prompt was queued at start; codex
 		// exec reads stdin to completion before inference, so leaving it open
 		// hangs the child waiting for EOF. But with an EMPTY prompt (chat-direct
@@ -3668,30 +3692,31 @@ func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *test
 		// SendInput), DEFER: closing here hands codex an immediate EOF with no
 		// prompt and v0.140+ exits 1 with "No prompt provided via stdin."
 		// SendInput closes the pipe after writing the first prompt instead.
-		{cmd: "codex", stdinPrompt: "", want: false},
-		{cmd: "codex", stdinPrompt: "review the diff", want: true},
-		{cmd: "codex.cmd", stdinPrompt: "review", want: true},
-		{cmd: "CODEX", stdinPrompt: "review", want: true},
-		{cmd: "agy", stdinPrompt: "", want: false},
-		{cmd: "agy", stdinPrompt: "review", want: true},
-		{cmd: "agy.exe", stdinPrompt: "review", want: true},
+		{cmd: "codex", stdinPrompt: nil, want: false},
+		{cmd: "codex", stdinPrompt: strPtr("review the diff"), want: true},
+		{cmd: "codex.cmd", stdinPrompt: strPtr("review"), want: true},
+		{cmd: "CODEX", stdinPrompt: strPtr("review"), want: true},
+		{cmd: "agy", stdinPrompt: nil, want: false},
+		{cmd: "agy", stdinPrompt: strPtr("review"), want: true},
+		{cmd: "agy", stdinPrompt: strPtr(""), want: true},
+		{cmd: "agy.exe", stdinPrompt: strPtr("review"), want: true},
 		// Path-routed claude/codex — same policy must apply when the
 		// caller supplied an absolute or relative path. Otherwise the argv
 		// builder shapes a stdin-fed codex session but stdin is left
 		// open and the child hangs waiting for EOF.
-		{cmd: "/opt/claude-nightly/claude", stdinPrompt: "", want: false},
-		{cmd: `C:\tools\claude.cmd`, stdinPrompt: "hi", want: false},
-		{cmd: "/opt/bin/codex", stdinPrompt: "review", want: true},
-		{cmd: "./codex", stdinPrompt: "", want: false},
+		{cmd: "/opt/claude-nightly/claude", stdinPrompt: nil, want: false},
+		{cmd: `C:\tools\claude.cmd`, stdinPrompt: strPtr("hi"), want: false},
+		{cmd: "/opt/bin/codex", stdinPrompt: strPtr("review"), want: true},
+		{cmd: "./codex", stdinPrompt: nil, want: false},
 		// Shells / non-CLI: legacy rule — close iff empty prompt.
-		{cmd: "powershell", stdinPrompt: "", want: true},
-		{cmd: "git", stdinPrompt: "", want: true},
-		{cmd: "", stdinPrompt: "", want: true},
+		{cmd: "powershell", stdinPrompt: nil, want: true},
+		{cmd: "git", stdinPrompt: nil, want: true},
+		{cmd: "", stdinPrompt: nil, want: true},
 	}
 	for _, tc := range cases {
 		got := shouldCloseStdinAfterStart(tc.cmd, tc.stdinPrompt)
 		if got != tc.want {
-			t.Errorf("shouldCloseStdinAfterStart(%q, %q) = %v, want %v",
+			t.Errorf("shouldCloseStdinAfterStart(%q, %v) = %v, want %v",
 				tc.cmd, tc.stdinPrompt, got, tc.want)
 		}
 	}
@@ -3730,4 +3755,8 @@ func mustContain(t *testing.T, args []string, expected ...string) {
 			t.Errorf("args missing %q (got %v)", want, args)
 		}
 	}
+}
+
+func strPtr(s string) *string {
+	return &s
 }

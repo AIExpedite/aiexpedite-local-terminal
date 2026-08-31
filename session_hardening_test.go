@@ -105,8 +105,8 @@ func TestIsResidentAgentSessionCommand(t *testing.T) {
 func TestBuildInteractiveCLIArgs_AntigravityAlias(t *testing.T) {
 	for _, cmd := range []string{"agy", "antigravity", "/usr/local/bin/antigravity", "antigravity.exe"} {
 		got, stdinPrompt := buildInteractiveCLIArgs(cmd, []string{"do the thing"}, false)
-		if stdinPrompt != "do the thing" {
-			t.Errorf("%s: stdin prompt = %q, want %q", cmd, stdinPrompt, "do the thing")
+		if stdinPrompt == nil || *stdinPrompt != "do the thing" {
+			t.Errorf("%s: stdin prompt = %v, want %q", cmd, stdinPrompt, "do the thing")
 		}
 		joined := strings.Join(got, " ")
 		if !strings.Contains(joined, "--input-format stream-json") ||
