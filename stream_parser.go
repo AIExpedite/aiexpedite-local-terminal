@@ -131,6 +131,39 @@ func isAntigravityAgentResponseDelta(line string) bool {
 	return stepType == "agent_response"
 }
 
+// detectAntigravityErrorResult reports whether line is an Antigravity terminal
+// result event with status: "ERROR", returning the error detail if present.
+func detectAntigravityErrorResult(command, line string) (string, bool) {
+	if !isAntigravityCommand(command) {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return "", false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return "", false
+	}
+	if eventType, _ := raw["event"].(string); eventType != "result" {
+		return "", false
+	}
+	result, _ := raw["result"].(map[string]interface{})
+	if result == nil {
+		return "", false
+	}
+	status, _ := result["status"].(string)
+	if !strings.EqualFold(status, "ERROR") {
+		return "", false
+	}
+	errText, _ := result["error"].(string)
+	if errText == "" {
+		errText = "no error detail"
+	}
+	return errText, true
+}
+
+
 /* --------------------------------------------------------------------------
    Google Antigravity parser
    -------------------------------------------------------------------------- */

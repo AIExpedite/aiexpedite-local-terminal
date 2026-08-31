@@ -3143,6 +3143,23 @@ func TestDetectCLITerminalEvent_Antigravity(t *testing.T) {
 	}
 }
 
+func TestDetectAntigravityErrorResult(t *testing.T) {
+	errText, isErr := detectAntigravityErrorResult("agy", `{"event":"result","result":{"status":"ERROR","error":"quota exceeded"}}`)
+	if !isErr || errText != "quota exceeded" {
+		t.Fatalf("expected error result 'quota exceeded', got isErr=%v errText=%q", isErr, errText)
+	}
+
+	_, isErr = detectAntigravityErrorResult("agy", `{"event":"result","result":{"status":"SUCCESS","response":"ok"}}`)
+	if isErr {
+		t.Fatal("SUCCESS result should not be detected as error result")
+	}
+
+	_, isErr = detectAntigravityErrorResult("claude", `{"event":"result","result":{"status":"ERROR","error":"quota exceeded"}}`)
+	if isErr {
+		t.Fatal("non-antigravity command should return false")
+	}
+}
+
 func TestDetectCLITerminalEvent_NonJsonAndMalformedReturnFalse(t *testing.T) {
 	// We must NEVER flushBatch on a plain-text line by mistake — that would
 	// cause double flushes and could publish empty batches.

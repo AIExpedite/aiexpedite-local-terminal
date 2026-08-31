@@ -1207,6 +1207,31 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				}
 			}
 
+			// Antigravity result error: agy can emit result.status: "ERROR" on a protocol/quota/tool
+			// failure while the process exits with status 0. Flush any preceding deltas, publish an
+			// explicit error stream frame with Status: "error", and mark session.ExitCode = 1 so the
+			// terminal session_ended message and automated callers recognize the failure.
+			if errMsg, isErr := detectAntigravityErrorResult(session.Command, line.text); isErr {
+				flushBatch()
+				session.mu.Lock()
+				session.ExitCode = 1
+				session.mu.Unlock()
+				seq := atomic.AddInt64(&session.Seq, 1)
+				asyncPublish(resultMsg{
+					ID:          session.ID,
+					WorkspaceID: session.WorkspaceID,
+					UID:         session.UID,
+					Output:      fmt.Sprintf("\n[Antigravity turn failed: %s]\n", errMsg),
+					Status:      "error",
+					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
+					Type:        "stream",
+					SessionID:   session.ID,
+					Seq:         int(seq),
+				})
+				continue
+			}
+
 			// Detect CLI-terminal events (Claude "result", Codex
 			// "thread.completed"/"turn.completed"). When we see
 			// one we flush any buffered text BEFORE the CLI process exits — the
