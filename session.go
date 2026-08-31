@@ -2665,7 +2665,7 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 			if antigravityValuedFlags[name] || antigravityBoolFlags[name] {
 				if name == "--input-format" || name == "--output-format" {
 					valFlag := canonicalAntigravityFlag(val)
-					if isAntigravityPrintFlag(valFlag) || antigravityBoolFlags[valFlag] || antigravityValuedFlags[valFlag] || antigravityDiagnosticTokens[valFlag] || (strings.HasPrefix(valFlag, "-") && valFlag != antigravityFlagTerminator) {
+					if isAntigravityPrintFlag(valFlag) || antigravityBoolFlags[valFlag] || antigravityValuedFlags[valFlag] || antigravityDiagnosticTokens[valFlag] || strings.HasPrefix(valFlag, "-") {
 						danglingManaged = true
 						return barePrint, invalidBool, diagnostic, danglingManaged
 					}
@@ -2697,7 +2697,7 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 			}
 			if a == "--input-format" || a == "--output-format" {
 				next := canonicalAntigravityFlag(args[i+1])
-				if isAntigravityPrintFlag(next) || antigravityBoolFlags[next] || antigravityValuedFlags[next] || antigravityDiagnosticTokens[next] || (strings.HasPrefix(next, "-") && next != antigravityFlagTerminator) {
+				if isAntigravityPrintFlag(next) || antigravityBoolFlags[next] || antigravityValuedFlags[next] || antigravityDiagnosticTokens[next] || strings.HasPrefix(next, "-") {
 					danglingManaged = true
 					return barePrint, invalidBool, diagnostic, danglingManaged
 				}
