@@ -100,6 +100,8 @@ func TestShouldCloseStdinAfterStart(t *testing.T) {
 		// first prompt instead (see deferredStdinClose).
 		{name: "codex_with_prompt_closes", command: "codex", stdinPrompt: "do work", want: true},
 		{name: "codex_without_prompt_defers", command: "codex", want: false},
+		{name: "antigravity_with_prompt_closes", command: "agy", stdinPrompt: "do work", want: true},
+		{name: "antigravity_without_prompt_defers", command: "agy", want: false},
 		{name: "powershell_closes", command: "powershell", want: true},
 	}
 

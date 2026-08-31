@@ -342,7 +342,8 @@ Antigravity native chat is documented in full in
 
 Summary:
 
-- **Process model:** one-shot `agy --print` per turn (no long-lived stdin).
+- **Process model:** one-shot `agy` stream-json process per native turn; prompt
+  is sent as an NDJSON user event on stdin and stdin is then closed.
 - **Resume:** exact `--conversation <uuid>` only — never `--continue`.
 - **Native ID capture:** after first turn, from
   `~/.gemini/antigravity-cli/cache/last_conversations.json` (cwd key) with a
@@ -350,10 +351,8 @@ Summary:
 - **Manager:** [`AntigravityNativeManager`](antigravity_native.go).
 - **Pub/Sub:** `antigravity_native_{start,send,end}` →
   `antigravity_native_{started,message,stderr,error,ended}`.
-- **Minimum version:** agy ≥ 1.1.1.
-- **Permissions:** `--dangerously-skip-permissions` on native-chat and on the
-  session_start / PTY one-shot path (remote users cannot answer local prompts).
-  Threat model + safeguards are in the doc above. Both paths use
-  `--dangerously-skip-permissions --print <prompt>` (print takes the prompt as
-  its flag value on agy ≥ 1.1.x).
-
+- **Minimum version:** agy ≥ 1.1.15 (stream-json stdin support).
+- **Permissions:** `--dangerously-skip-permissions` on native-chat and all
+  session paths (remote users cannot answer local prompts). Native chat and the
+  normal pipe-based session path use stream-json stdin; only the Unix PTY
+  compatibility path retains `--print <prompt>` argv delivery.

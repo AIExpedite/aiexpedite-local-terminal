@@ -2783,9 +2783,9 @@ func TestShapeShellWrappedPTYArgs_SessionStartPath(t *testing.T) {
 		t.Errorf("session_start shell-wrapped agy = %v, want -c %q", ptyArgs, want)
 	}
 
-	// Direct agy: buildInteractiveCLIArgs already shaped it; shapeShellWrappedPTYArgs
+	// Direct PTY agy uses the legacy argv builder; shapeShellWrappedPTYArgs
 	// must leave it untouched (no duplicate --print/--dangerously-skip-permissions).
-	directArgs, _ := buildInteractiveCLIArgs("agy", []string{"fix the bug"}, false)
+	directArgs := buildAntigravityInteractiveArgs([]string{"fix the bug"})
 	got := shapeShellWrappedPTYArgs("agy", directArgs)
 	if strings.Join(got, " ") != strings.Join(directArgs, " ") {
 		t.Errorf("shapeShellWrappedPTYArgs double-shaped direct agy: %v -> %v", directArgs, got)
@@ -2823,8 +2823,8 @@ func TestStdinPromptFormat(t *testing.T) {
 		{"codex", "plain"},
 		{"codex.cmd", "plain"},
 		{"CODEX", "plain"},
-		{"agy", ""},     // antigravity keeps argv (it ignores piped stdin); no stdin prompt
-		{"agy.exe", ""}, // native agy.exe — still positional, no stdin prompt
+		{"agy", "antigravity_ndjson"},
+		{"agy.exe", "antigravity_ndjson"},
 		{"powershell", ""},
 		{"", ""},
 	}
@@ -2842,7 +2842,7 @@ func TestStdinPromptFormat(t *testing.T) {
    Each CLI has its own stdinPrompt contract:
      - claude: prompt goes via NDJSON on stdin
      - codex:  prompt goes via raw stdin (`-` placeholder)
-     - agy:    prompt stays positional (agy ignores piped stdin)
+     - agy:    prompt goes via Antigravity NDJSON on stdin
      - other:  passes through verbatim
    ------------------------------------------------------------------------ */
 
@@ -2864,10 +2864,13 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 	})
 	t.Run("antigravity", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("agy", []string{"hello"}, false)
-		if prompt != "" {
-			t.Errorf("agy stdinPrompt MUST be empty (agy ignores piped stdin; prompt goes on argv): %q", prompt)
+		if prompt != "hello" {
+			t.Errorf("agy stdinPrompt = %q, want hello", prompt)
 		}
-		mustContain(t, args, "--print", "--dangerously-skip-permissions", "hello")
+		mustContain(t, args, "--input-format", "--output-format", "stream-json", "--dangerously-skip-permissions")
+		if strings.Contains(strings.Join(args, " "), "hello") {
+			t.Fatalf("agy prompt leaked onto argv: %#v", args)
+		}
 	})
 	t.Run("case-insensitive", func(t *testing.T) {
 		// The router checks command.ToLower() exactly + startswith — make sure
@@ -2911,6 +2914,40 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 			t.Errorf("unknown command should pass args through verbatim, got %v", args)
 		}
 	})
+}
+
+func TestBuildAntigravityStreamingArgs_LongPromptNeverTouchesArgv(t *testing.T) {
+	prompt := strings.Repeat("large review brief with \\\"quotes\\\" and paths C:\\\\repo\\n", 4000)
+	args, stdinPrompt := buildAntigravityStreamingArgs([]string{"--model", "gemini", prompt})
+	if stdinPrompt != prompt {
+		t.Fatal("Antigravity stdin prompt changed")
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, prompt[:100]) || strings.Contains(joined, "--print") {
+		t.Fatalf("large prompt leaked onto argv: %.200q", joined)
+	}
+	mustContain(t, args, "--model", "gemini", "--input-format", "--output-format", "stream-json")
+}
+
+func TestBuildAntigravityStreamingArgs_OwnsFormatFlags(t *testing.T) {
+	args, prompt := buildAntigravityStreamingArgs([]string{
+		"--input-format", "text",
+		"--output-format=json",
+		"--print", "review",
+		"--output-format", "text",
+		"--conversation", "abc",
+	})
+	if prompt != "review" {
+		t.Fatalf("prompt = %q, want review", prompt)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, " text") || strings.Contains(joined, "=json") || strings.Contains(joined, "--print") {
+		t.Fatalf("caller format/print flags survived: %#v", args)
+	}
+	if strings.Count(joined, "--input-format") != 1 || strings.Count(joined, "--output-format") != 1 {
+		t.Fatalf("managed format flags not unique: %#v", args)
+	}
+	mustContain(t, args, "--conversation", "abc")
 }
 
 /* --------------------------------------------------------------------------
@@ -3046,6 +3083,15 @@ func TestDetectCLITerminalEvent_Codex(t *testing.T) {
 	}
 }
 
+func TestDetectCLITerminalEvent_Antigravity(t *testing.T) {
+	if !detectCLITerminalEvent("agy.exe", `{"event":"result","result":{"status":"SUCCESS"}}`) {
+		t.Error("Antigravity result must be a terminal event")
+	}
+	if detectCLITerminalEvent("antigravity", `{"event":"step_update"}`) {
+		t.Error("Antigravity step_update is not a terminal event")
+	}
+}
+
 func TestDetectCLITerminalEvent_NonJsonAndMalformedReturnFalse(t *testing.T) {
 	// We must NEVER flushBatch on a plain-text line by mistake — that would
 	// cause double flushes and could publish empty batches.
@@ -3056,7 +3102,7 @@ func TestDetectCLITerminalEvent_NonJsonAndMalformedReturnFalse(t *testing.T) {
 		`{"type":"result"`, // malformed JSON
 	}
 	for _, line := range cases {
-		for _, cmd := range []string{"claude", "codex"} {
+		for _, cmd := range []string{"claude", "codex", "agy"} {
 			if detectCLITerminalEvent(cmd, line) {
 				t.Errorf("detectCLITerminalEvent(%q, %q) returned true; expected false", cmd, line)
 			}
@@ -3387,6 +3433,25 @@ func TestExtractDisplayText_Grok_NonJsonPassthrough(t *testing.T) {
 	}
 }
 
+func TestExtractDisplayText_Antigravity_StreamEvents(t *testing.T) {
+	textLine := `{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"fixed it"}}`
+	if got := extractDisplayText("agy.exe", textLine); got != "fixed it" {
+		t.Fatalf("Antigravity text delta = %q", got)
+	}
+	toolLine := `{"event":"step_update","step_update":{"step_type":"tool","tool_name":"run_command"}}`
+	if got := extractDisplayText("antigravity", toolLine); !strings.Contains(got, "run_command") {
+		t.Fatalf("Antigravity tool event = %q", got)
+	}
+	resultLine := `{"event":"result","result":{"status":"SUCCESS","response":"fixed it"}}`
+	if got := extractDisplayText("agy", resultLine); got != "" {
+		t.Fatalf("successful result recap should be skipped, got %q", got)
+	}
+	errorLine := `{"event":"result","result":{"status":"ERROR","error":"quota exhausted"}}`
+	if got := extractDisplayText("agy", errorLine); !strings.Contains(got, "quota exhausted") {
+		t.Fatalf("Antigravity result error = %q", got)
+	}
+}
+
 // TestExtractDisplayText_Grok_SubcommandJSONPassthrough guards that JSON
 // output from a carved-out Grok subcommand — which bypasses the managed
 // `--output-format streaming-json -p` headless path and runs verbatim
@@ -3532,6 +3597,7 @@ func TestDetectPromptFromJSON_NonPromptEventsReturnNil(t *testing.T) {
    - Codex: close after the write when a prompt was queued at start — codex
      exec reads the stdin-piped prompt to EOF before inference, so leaving
      stdin open hangs it.
+   - Antigravity: same one-shot close/defer policy as Codex, using NDJSON.
    - Everything else (powershell, git, ...): close stdin when stdinPrompt is
      empty.
    ------------------------------------------------------------------------ */
@@ -3562,6 +3628,9 @@ func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *test
 		{cmd: "codex", stdinPrompt: "review the diff", want: true},
 		{cmd: "codex.cmd", stdinPrompt: "review", want: true},
 		{cmd: "CODEX", stdinPrompt: "review", want: true},
+		{cmd: "agy", stdinPrompt: "", want: false},
+		{cmd: "agy", stdinPrompt: "review", want: true},
+		{cmd: "agy.exe", stdinPrompt: "review", want: true},
 		// Path-routed claude/codex — same policy must apply when the
 		// caller supplied an absolute or relative path. Otherwise the argv
 		// builder shapes a stdin-fed codex session but stdin is left

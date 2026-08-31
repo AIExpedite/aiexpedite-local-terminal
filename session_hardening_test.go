@@ -99,22 +99,23 @@ func TestIsResidentAgentSessionCommand(t *testing.T) {
 	}
 }
 
-// finding 4: `antigravity` (the alias for the `agy` TUI) must get the same
-// one-shot `--print --dangerously-skip-permissions` shaping as `agy`, since the
-// PTY allowlist admits both — otherwise a tty=true antigravity session starts
-// under a PTY with no prompt flag and hangs.
+// `antigravity` aliases must route through the same managed stream-json stdin
+// transport as `agy`; otherwise the alias would retain the long prompt on argv
+// and reproduce the Windows CreateProcess failure.
 func TestBuildInteractiveCLIArgs_AntigravityAlias(t *testing.T) {
 	for _, cmd := range []string{"agy", "antigravity", "/usr/local/bin/antigravity", "antigravity.exe"} {
 		got, stdinPrompt := buildInteractiveCLIArgs(cmd, []string{"do the thing"}, false)
-		if stdinPrompt != "" {
-			t.Errorf("%s: expected empty stdinPrompt (argv path), got %q", cmd, stdinPrompt)
+		if stdinPrompt != "do the thing" {
+			t.Errorf("%s: stdin prompt = %q, want %q", cmd, stdinPrompt, "do the thing")
 		}
 		joined := strings.Join(got, " ")
-		if !strings.Contains(joined, "--print") || !strings.Contains(joined, "--dangerously-skip-permissions") {
-			t.Errorf("%s: args %q missing antigravity one-shot flags", cmd, joined)
+		if !strings.Contains(joined, "--input-format stream-json") ||
+			!strings.Contains(joined, "--output-format stream-json") ||
+			!strings.Contains(joined, "--dangerously-skip-permissions") {
+			t.Errorf("%s: args %q missing Antigravity stream flags", cmd, joined)
 		}
-		if got[len(got)-1] != "do the thing" {
-			t.Errorf("%s: prompt not preserved as positional argv: %q", cmd, joined)
+		if strings.Contains(joined, "do the thing") || strings.Contains(joined, "--print") {
+			t.Errorf("%s: prompt leaked onto argv: %q", cmd, joined)
 		}
 	}
 }

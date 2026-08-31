@@ -273,8 +273,8 @@ func StartAgent(cfg *Config) {
 	go globalClaudeNativeManager.CleanupStale(claudeNativeMaxLifetime)
 	fmt.Println("[aiexpedite] Claude native manager ready")
 
-	/* 3b4. Initialize Antigravity native manager (one-shot --print + resume) */
-	// Drives agy --print with exact --conversation <id> resume for
+	/* 3b4. Initialize Antigravity native manager (stream-json + resume) ------ */
+	// Drives agy stream-json stdin with exact --conversation <id> resume for
 	// Antigravity Chat. Logical sessions persist between one-shot processes;
 	// never uses ambiguous --continue.
 

@@ -1,6 +1,6 @@
 // File: stream_parser.go
 // -----------------------------------------------------------------------------
-// Parses structured JSON streaming output from CLI agents (Claude, Codex)
+// Parses structured JSON streaming output from CLI agents
 // and extracts human-readable display text. This allows the frontend
 // to show clean text instead of raw JSON events.
 //
@@ -8,6 +8,7 @@
 //   - Claude: --output-format stream-json     (Anthropic API streaming events)
 //   - Codex:  --json                          (JSONL events)
 //   - Grok:   --output-format streaming-json  (NDJSON: text / thought / end frames)
+//   - Antigravity: --output-format stream-json (NDJSON: step_update / result)
 // -----------------------------------------------------------------------------
 
 package main
@@ -100,9 +101,59 @@ func extractDisplayText(command, line string) string {
 		return extractCodexDisplayText(raw)
 	case strings.HasPrefix(base, "grok"):
 		return extractGrokDisplayText(raw, line)
+	case isAntigravityCommand(command):
+		return extractAntigravityDisplayText(raw)
 	default:
 		return line // passthrough unknown CLI agents
 	}
+}
+
+/* --------------------------------------------------------------------------
+   Google Antigravity parser
+   -------------------------------------------------------------------------- */
+
+// extractAntigravityDisplayText emits incremental assistant text from
+// step_update events and suppresses the terminal SUCCESS recap to avoid
+// duplicate output. A terminal error is surfaced because it may be the only
+// human-readable failure detail in the stream.
+func extractAntigravityDisplayText(raw map[string]interface{}) string {
+	eventType, _ := raw["event"].(string)
+	switch eventType {
+	case "step_update":
+		update, _ := raw["step_update"].(map[string]interface{})
+		if update == nil {
+			return ""
+		}
+		stepType, _ := update["step_type"].(string)
+		if stepType == "agent_response" {
+			text, _ := update["text_delta"].(string)
+			return text
+		}
+		if stepType == "tool" {
+			name, _ := update["tool_name"].(string)
+			if name != "" {
+				return fmt.Sprintf("\n[Using tool: %s]\n", name)
+			}
+		}
+		return ""
+	case "result":
+		result, _ := raw["result"].(map[string]interface{})
+		if result == nil {
+			return ""
+		}
+		status, _ := result["status"].(string)
+		if strings.EqualFold(status, "SUCCESS") {
+			return ""
+		}
+		errText, _ := result["error"].(string)
+		if errText == "" {
+			errText = "no error detail"
+		}
+		return fmt.Sprintf("\n[Antigravity turn failed: %s]\n", errText)
+	case "init":
+		return ""
+	}
+	return ""
 }
 
 /* --------------------------------------------------------------------------
