@@ -2950,6 +2950,19 @@ func TestBuildAntigravityStreamingArgs_OwnsFormatFlags(t *testing.T) {
 	mustContain(t, args, "--conversation", "abc")
 }
 
+func TestBuildAntigravityStreamingArgs_PreservesDanglingManagedFormatFlag(t *testing.T) {
+	for _, in := range [][]string{
+		{"--output-format"},
+		{"--print", "review", "--output-format"},
+		{"--print", "review", "--input-format"},
+	} {
+		args, prompt := buildAntigravityStreamingArgs(in)
+		if !reflect.DeepEqual(args, in) || prompt != "" {
+			t.Errorf("buildAntigravityStreamingArgs(%#v) = (%#v, %q), want unchanged argv and empty prompt", in, args, prompt)
+		}
+	}
+}
+
 /* --------------------------------------------------------------------------
    detectResultEvent — Claude only
    --------------------------------------------------------------------------
@@ -3179,6 +3192,37 @@ func TestReadOutputStream_CodexCapturesFinalNumericTokenWithoutNewline(t *testin
 	observed := time.UnixMilli(b.ObservedAtMs)
 	if observed.Before(before.Add(-time.Millisecond)) || observed.After(after.Add(time.Millisecond)) {
 		t.Fatalf("ObservedAt=%s, want receive time between %s and %s", observed, before, after)
+	}
+}
+
+func TestReadOutputStream_AntigravityConcatenatesAdjacentTextDeltas(t *testing.T) {
+	output := strings.Join([]string{
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"first"}}`,
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"second"}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"firstsecond"}}`,
+	}, "\n") + "\n"
+	session := &CLISession{
+		ID:             "antigravity-adjacent-deltas",
+		Command:        "agy",
+		Stdout:         io.NopCloser(strings.NewReader(output)),
+		Stderr:         io.NopCloser(strings.NewReader("")),
+		streamDone:     make(chan struct{}),
+		firstRealFrame: make(chan struct{}),
+	}
+	var published []resultMsg
+
+	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
+		published = append(published, msg)
+	})
+
+	var streams []string
+	for _, msg := range published {
+		if msg.Type == "stream" {
+			streams = append(streams, msg.Output)
+		}
+	}
+	if got := strings.Join(streams, ""); got != "firstsecond" {
+		t.Fatalf("Antigravity stream output = %q, want %q", got, "firstsecond")
 	}
 }
 

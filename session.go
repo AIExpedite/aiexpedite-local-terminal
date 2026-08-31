@@ -1035,6 +1035,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 	}
 
 	var batch []string
+	lastBatchEntryWasAntigravityDelta := false
 	batchTimer := time.NewTicker(streamBatchInterval)
 	defer batchTimer.Stop()
 
@@ -1059,6 +1060,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		})
 
 		batch = batch[:0]
+		lastBatchEntryWasAntigravityDelta = false
 	}
 
 	appendDisplayText := func(lineText string) {
@@ -1066,7 +1068,13 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		if displayText == "" {
 			return
 		}
-		batch = append(batch, displayText)
+		isAntigravityDelta := isAntigravityCommand(session.Command) && isAntigravityAgentResponseDelta(lineText)
+		if isAntigravityDelta && lastBatchEntryWasAntigravityDelta && len(batch) > 0 {
+			batch[len(batch)-1] += displayText
+		} else {
+			batch = append(batch, displayText)
+		}
+		lastBatchEntryWasAntigravityDelta = isAntigravityDelta
 		// Genuine assistant output (text/thinking delta or tool_use)
 		// — the session is alive and producing, so disarm the claude
 		// no-output watchdog. No-op for non-claude sessions (they
@@ -2101,7 +2109,7 @@ func buildAntigravityStreamingArgs(args []string) ([]string, string) {
 	if isAntigravityDiagnosticInvocation(args) {
 		return args, ""
 	}
-	if barePrint, invalidBool, diagnostic := scanAntigravityCallerArgs(args); barePrint || invalidBool || diagnostic {
+	if barePrint, invalidBool, diagnostic, danglingManaged := scanAntigravityCallerArgs(args); barePrint || invalidBool || diagnostic || danglingManaged {
 		return args, ""
 	}
 
@@ -2211,7 +2219,7 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	if isAntigravityDiagnosticInvocation(args) {
 		return args
 	}
-	if barePrint, invalidBool, diagnostic := scanAntigravityCallerArgs(args); barePrint || invalidBool || diagnostic {
+	if barePrint, invalidBool, diagnostic, _ := scanAntigravityCallerArgs(args); barePrint || invalidBool || diagnostic {
 		return args
 	}
 	result := make([]string, 0, len(args)+3)
@@ -2567,8 +2575,8 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 
 // scanAntigravityCallerArgs walks the caller's tokens the same way the
 // partitioner does — consuming each recognized flag's operand and stopping at
-// the first token that starts the prompt — and reports two invocations that
-// must reach agy untouched instead of being reshaped.
+// the first token that starts the prompt — and reports invocations that must
+// reach agy untouched instead of being reshaped.
 //
 // barePrint: a `--print` / `-p` / `--prompt` that runs out of argv before its
 // operand. agy's string flag then has no value and the CLI exits with `flag
@@ -2584,17 +2592,21 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 // prompt the caller never got. Flags we forward rather than strip need no check
 // — they reach agy and produce their own error.
 //
+// danglingManaged: an input/output format flag without an operand. The stream
+// builder normally replaces these flags, but replacing a malformed one would
+// turn a native CLI error into a model run.
+//
 // Both stop at the prompt boundary: in `agy review --continue=maybe` the flag
 // text is prompt material (Go's flag parsing already stopped at `review`), so
 // it must not block the reshape.
-func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnostic bool) {
+func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnostic, danglingManaged bool) {
 	stripped := func(name string) bool {
 		return name == "--dangerously-skip-permissions" || name == "--continue" || name == "-c"
 	}
 	for i := 0; i < len(args); i++ {
 		a := canonicalAntigravityFlag(args[i])
 		if a == antigravityFlagTerminator {
-			return barePrint, invalidBool, diagnostic // `--` ends flag parsing
+			return barePrint, invalidBool, diagnostic, danglingManaged // `--` ends flag parsing
 		}
 		if name, val, ok := splitAntigravityEqualsFlag(a); ok {
 			name = canonicalAntigravityFlag(name)
@@ -2604,7 +2616,7 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 			// value would start a model run the caller never got.
 			if antigravityDiagnosticTokens[name] {
 				diagnostic = true
-				return barePrint, invalidBool, diagnostic
+				return barePrint, invalidBool, diagnostic, danglingManaged
 			}
 			// `--print=` carries a value (possibly empty).
 			if isAntigravityPrintFlag(name) {
@@ -2618,12 +2630,12 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 				}
 				continue
 			}
-			return barePrint, invalidBool, diagnostic // unknown token: the prompt starts here
+			return barePrint, invalidBool, diagnostic, danglingManaged // unknown token: the prompt starts here
 		}
 		if isAntigravityPrintFlag(a) {
 			if i+1 >= len(args) {
 				barePrint = true
-				return barePrint, invalidBool, diagnostic
+				return barePrint, invalidBool, diagnostic, danglingManaged
 			}
 			i++ // the next token is this flag's value, whatever it looks like
 			continue
@@ -2633,7 +2645,8 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 		}
 		if antigravityValuedFlags[a] {
 			if i+1 >= len(args) {
-				return barePrint, invalidBool, diagnostic // dangling flag: handled by the partitioner
+				danglingManaged = a == "--input-format" || a == "--output-format"
+				return barePrint, invalidBool, diagnostic, danglingManaged // other dangling flags are handled by the partitioner
 			}
 			i++
 			continue
@@ -2646,11 +2659,11 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 		// ordinary prompt text.)
 		if strings.HasPrefix(a, "-") && antigravityDiagnosticTokens[a] {
 			diagnostic = true
-			return barePrint, invalidBool, diagnostic
+			return barePrint, invalidBool, diagnostic, danglingManaged
 		}
-		return barePrint, invalidBool, diagnostic // first non-flag token: the prompt starts here
+		return barePrint, invalidBool, diagnostic, danglingManaged // first non-flag token: the prompt starts here
 	}
-	return barePrint, invalidBool, diagnostic
+	return barePrint, invalidBool, diagnostic, danglingManaged
 }
 
 // canonicalAntigravityFlag normalizes a single-dash long flag to its double-dash

@@ -108,6 +108,29 @@ func extractDisplayText(command, line string) string {
 	}
 }
 
+// isAntigravityAgentResponseDelta reports whether line is an incremental
+// assistant text frame. readOutputStream uses this to concatenate adjacent
+// deltas without inserting the newline used between ordinary output lines.
+func isAntigravityAgentResponseDelta(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return false
+	}
+	if eventType, _ := raw["event"].(string); eventType != "step_update" {
+		return false
+	}
+	update, _ := raw["step_update"].(map[string]interface{})
+	if update == nil {
+		return false
+	}
+	stepType, _ := update["step_type"].(string)
+	return stepType == "agent_response"
+}
+
 /* --------------------------------------------------------------------------
    Google Antigravity parser
    -------------------------------------------------------------------------- */

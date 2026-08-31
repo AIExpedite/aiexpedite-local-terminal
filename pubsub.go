@@ -2532,7 +2532,7 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 	// run. Same for an equals-form safety flag whose value is not a Go boolean:
 	// agy rejects `--continue=maybe` outright, so stripping it would run a
 	// prompt the caller never got.
-	if barePrint, invalidBool, diagnostic := scanAntigravityCallerArgs(callerValues); barePrint || invalidBool || diagnostic {
+	if barePrint, invalidBool, diagnostic, _ := scanAntigravityCallerArgs(callerValues); barePrint || invalidBool || diagnostic {
 		return "", false
 	}
 	flags, promptFrags, trailing, hasPrompt, ok := partitionAntigravityCallerShellWords(words[1:], zshEquals)
