@@ -71,6 +71,12 @@ func isClaudeRateLimitEventLine(line string) bool {
 //
 // For non-JSON lines (plain text, errors), returns the line as-is (passthrough).
 func extractDisplayText(command, line string) string {
+	return extractDisplayTextWithContext(command, line, false)
+}
+
+// extractDisplayTextWithContext parses a single stdout line with context about
+// whether incremental streaming deltas have already been emitted for this turn.
+func extractDisplayTextWithContext(command, line string, sawAntigravityDelta bool) string {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
 		return ""
@@ -102,7 +108,7 @@ func extractDisplayText(command, line string) string {
 	case strings.HasPrefix(base, "grok"):
 		return extractGrokDisplayText(raw, line)
 	case isAntigravityCommand(command):
-		return extractAntigravityDisplayText(raw)
+		return extractAntigravityDisplayTextWithDeltas(raw, sawAntigravityDelta)
 	default:
 		return line // passthrough unknown CLI agents
 	}
@@ -171,8 +177,16 @@ func detectAntigravityErrorResult(command, line string) (string, bool) {
 // extractAntigravityDisplayText emits incremental assistant text from
 // step_update events and suppresses the terminal SUCCESS recap to avoid
 // duplicate output. A terminal error is surfaced because it may be the only
-// human-readable failure detail in the stream.
+// extractAntigravityDisplayText emits incremental assistant text from
+// step_update events and suppresses the terminal SUCCESS recap to avoid
+// duplicate output when deltas were seen, or falls back to the complete
+// terminal response if no deltas were emitted. A terminal error is surfaced
+// because it may be the only human-readable failure detail in the stream.
 func extractAntigravityDisplayText(raw map[string]interface{}) string {
+	return extractAntigravityDisplayTextWithDeltas(raw, false)
+}
+
+func extractAntigravityDisplayTextWithDeltas(raw map[string]interface{}, sawDeltas bool) string {
 	eventType, _ := raw["event"].(string)
 	switch eventType {
 	case "step_update":
@@ -199,7 +213,11 @@ func extractAntigravityDisplayText(raw map[string]interface{}) string {
 		}
 		status, _ := result["status"].(string)
 		if strings.EqualFold(status, "SUCCESS") {
-			return ""
+			if sawDeltas {
+				return ""
+			}
+			resp, _ := result["response"].(string)
+			return resp
 		}
 		errText, _ := result["error"].(string)
 		if errText == "" {

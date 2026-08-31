@@ -3575,8 +3575,13 @@ func TestExtractDisplayText_Antigravity_StreamEvents(t *testing.T) {
 		t.Fatalf("Antigravity tool event = %q", got)
 	}
 	resultLine := `{"event":"result","result":{"status":"SUCCESS","response":"fixed it"}}`
-	if got := extractDisplayText("agy", resultLine); got != "" {
-		t.Fatalf("successful result recap should be skipped, got %q", got)
+	// When deltas were seen, SUCCESS recap is suppressed to avoid duplicate text
+	if got := extractDisplayTextWithContext("agy", resultLine, true); got != "" {
+		t.Fatalf("successful result recap should be skipped when deltas seen, got %q", got)
+	}
+	// When NO deltas were seen, SUCCESS response is retained as complete output
+	if got := extractDisplayTextWithContext("agy", resultLine, false); got != "fixed it" {
+		t.Fatalf("successful result response should be retained when no deltas seen, got %q", got)
 	}
 	errorLine := `{"event":"result","result":{"status":"ERROR","error":"quota exhausted"}}`
 	if got := extractDisplayText("agy", errorLine); !strings.Contains(got, "quota exhausted") {

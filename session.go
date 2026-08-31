@@ -1064,12 +1064,17 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		lastBatchEntryWasAntigravityDelta = false
 	}
 
+	var sawAntigravityDelta bool
+
 	appendDisplayText := func(lineText string) {
-		displayText := extractDisplayText(session.Command, lineText)
+		isAntigravityDelta := isAntigravityCommand(session.Command) && isAntigravityAgentResponseDelta(lineText)
+		displayText := extractDisplayTextWithContext(session.Command, lineText, sawAntigravityDelta)
+		if isAntigravityDelta {
+			sawAntigravityDelta = true
+		}
 		if displayText == "" {
 			return
 		}
-		isAntigravityDelta := isAntigravityCommand(session.Command) && isAntigravityAgentResponseDelta(lineText)
 		if isAntigravityDelta && lastBatchEntryWasAntigravityDelta && len(batch) > 0 {
 			batch[len(batch)-1] += displayText
 		} else {
