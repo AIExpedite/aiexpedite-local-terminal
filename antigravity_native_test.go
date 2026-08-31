@@ -28,20 +28,22 @@ func TestIsAntigravityNativeCommand(t *testing.T) {
 	}
 }
 
-func TestBuildAntigravityNativeArgs_PrintTakesPromptValue(t *testing.T) {
-	args := buildAntigravityNativeArgs("hello world", "")
-	// --print must take the prompt as its value (agy 1.1.x contract).
-	if len(args) < 2 || args[0] != "--print" || args[1] != "hello world" {
-		t.Fatalf("expected --print <prompt>, got %#v", args)
-	}
+func TestBuildAntigravityNativeArgs_UsesStreamJSONWithoutPromptArgv(t *testing.T) {
+	args := buildAntigravityNativeArgs("")
 	joined := strings.Join(args, " ")
+	if joined != "--input-format stream-json --output-format stream-json" {
+		t.Fatalf("unexpected stream-json argv: %#v", args)
+	}
+	if strings.Contains(joined, "hello world") || strings.Contains(joined, "--print") {
+		t.Fatalf("prompt/print flag must not appear on argv: %q", joined)
+	}
 	if strings.Contains(joined, "--continue") {
 		t.Fatalf("--continue must never appear: %q", joined)
 	}
 }
 
 func TestBuildAntigravityNativeArgs_ExactConversationResume(t *testing.T) {
-	args := buildAntigravityNativeArgs("follow up", "abc-123-def")
+	args := buildAntigravityNativeArgs("abc-123-def")
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--conversation") {
 		t.Fatalf("expected --conversation, got %q", joined)
@@ -62,16 +64,11 @@ func TestBuildAntigravityNativeArgs_ExactConversationResume(t *testing.T) {
 }
 
 func TestBuildAntigravityNativeArgs_NeverContinueFlag(t *testing.T) {
-	// Prompt text may literally contain "--continue"; that is the --print
-	// value, not a CLI flag. The builder must never emit a free-standing
-	// --continue / -c flag token (only --conversation for resume).
-	args := buildAntigravityNativeArgs("please --continue later", "id-1")
-	for i, a := range args {
+	// Prompt text is transported separately on stdin. The argv builder must
+	// never emit --continue / -c (only --conversation for exact resume).
+	args := buildAntigravityNativeArgs("id-1")
+	for _, a := range args {
 		if a == "--continue" || a == "-c" {
-			// Only allowed as the value of --print (index 1).
-			if i == 1 && args[0] == "--print" {
-				continue
-			}
 			t.Fatalf("argv must not include --continue as a flag: %#v", args)
 		}
 	}
@@ -123,12 +120,11 @@ func TestBuildAntigravityReplayPrompt_RetainsCurrentUserTurn(t *testing.T) {
 	}
 }
 
-// A replay built from a large history must fit the SEND limit (24KB), not the
-// larger 48KB transcript bound — otherwise Send rejects it and recovery fails
-// for histories between the two limits. The final user turn must survive.
+// A replay built from a large history must fit the configured SEND limit. The
+// final user turn must survive even when old history needs to be dropped.
 func TestBuildAntigravityReplayPrompt_FitsSendLimit(t *testing.T) {
 	var tr []antigravityTurn
-	// ~40KB of prior history: over the 24KB send limit, under the 48KB bound.
+	// ~40KB of prior history exercises the shared replay-history bound.
 	for i := 0; i < 20; i++ {
 		tr = append(tr,
 			antigravityTurn{Role: "user", Content: strings.Repeat("u", 1000), At: time.Now()},
@@ -152,7 +148,7 @@ func TestBuildAntigravityReplayPrompt_FitsSendLimit(t *testing.T) {
 	}
 }
 
-// When the current user prompt is near the 24KB send limit, prior history must
+// When the current user prompt is near the send limit, prior history must
 // be dropped whole-turn (or the prompt must fail closed oversized) — never
 // byte-slice into the middle of the current "User: ..." turn.
 func TestBuildAntigravityReplayPrompt_NeverTruncatesCurrentTurn(t *testing.T) {
@@ -212,8 +208,7 @@ func TestBuildAntigravityReplayPrompt_NeverTruncatesCurrentTurn(t *testing.T) {
 
 // The approval gate must display/allow the same argv runOneShot executes,
 // including the leading --dangerously-skip-permissions, so a narrowed allowlist
-// (e.g. `agy --print *`) cannot approve a command that silently runs with
-// auto-approved tool permissions.
+// cannot approve a command that silently runs with auto-approved permissions.
 func TestAntigravityNativeGateArgs_MatchExecutedShape(t *testing.T) {
 	gate := buildAntigravityNativeGateArgs()
 	if len(gate) == 0 || gate[0] != "--dangerously-skip-permissions" {
@@ -221,7 +216,7 @@ func TestAntigravityNativeGateArgs_MatchExecutedShape(t *testing.T) {
 	}
 	// Gate must equal the first-turn launch shape (dangerous flags + native args
 	// with the prompt placeholder, no --conversation).
-	want := append(antigravityDangerousFlags(), buildAntigravityNativeArgs("<prompt>", "")...)
+	want := append(antigravityDangerousFlags(), buildAntigravityNativeArgs("")...)
 	if strings.Join(gate, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("gate argv %#v drifted from executed shape %#v", gate, want)
 	}
@@ -608,9 +603,10 @@ func TestLooksLikeMissingConversation(t *testing.T) {
 }
 
 func TestBuildAntigravityNativeArgs_RejectsOversizedPromptAtSend(t *testing.T) {
-	// Size gate is in Send; ensure constant is sane relative to CreateProcess budget.
-	if antigravityNativeMaxPromptBytes <= 0 || antigravityNativeMaxPromptBytes >= 32*1024 {
-		t.Fatalf("max prompt bytes should be positive and under 32KB, got %d", antigravityNativeMaxPromptBytes)
+	// Size gate is now a memory/transcript bound, not an argv bound: stdin
+	// transport must allow prompts beyond Windows' ~32KB command-line ceiling.
+	if antigravityNativeMaxPromptBytes <= 32*1024 || antigravityNativeMaxPromptBytes >= antigravityNativeMaxPublishSize {
+		t.Fatalf("max prompt bytes should exceed argv limits but stay below Pub/Sub ceiling, got %d", antigravityNativeMaxPromptBytes)
 	}
 }
 
@@ -679,23 +675,103 @@ func TestRedactAntigravitySecrets_PreservesShortDiagnostics(t *testing.T) {
 	}
 }
 
-// Session one-shot builder must match the native-chat --print VALUE contract
-// (agy ≥ 1.1.x). Previously this test froze the broken order
-// (`--print --dangerously-skip-permissions <prompt>`), which made agy treat
-// the permission flag as the prompt.
-func TestBuildAntigravityInteractiveArgs_MatchesNativePrintContract(t *testing.T) {
-	args := buildAntigravityInteractiveArgs([]string{"do the task"})
-	if len(args) != 3 ||
-		args[0] != "--dangerously-skip-permissions" ||
-		args[1] != "--print" ||
-		args[2] != "do the task" {
-		t.Fatalf("want [skip --print do the task], got %#v", args)
+func TestAntigravityStreamUserMessage_PreservesLongPrompt(t *testing.T) {
+	prompt := strings.Repeat("quoted \\\"line\\\"\n", 5000)
+	line := antigravityStreamUserMessage(prompt)
+	if strings.Contains(line, "\nquoted") {
+		t.Fatal("NDJSON message contains an unescaped newline")
 	}
-	// Native path uses the same --print <prompt> adjacency (dangerous flags
-	// prepended separately in runOneShot).
-	native := append(antigravityDangerousFlags(), buildAntigravityNativeArgs("do the task", "")...)
-	if strings.Join(args, "\x00") != strings.Join(native, "\x00") {
-		t.Fatalf("interactive one-shot %#v must match native first-turn %#v", args, native)
+	var decoded struct {
+		Event   string `json:"event"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(line), &decoded); err != nil {
+		t.Fatalf("invalid NDJSON: %v", err)
+	}
+	if decoded.Event != "user" || decoded.Message.Content != prompt {
+		t.Fatalf("prompt changed during NDJSON transport")
+	}
+}
+
+func TestAntigravityStreamResultText(t *testing.T) {
+	output := strings.Join([]string{
+		`{"event":"init","conversation_id":"abc"}`,
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"partial"}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"complete answer\n"}}`,
+	}, "\n")
+	got, err := antigravityStreamResultText(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "complete answer" {
+		t.Fatalf("result text = %q, want complete answer", got)
+	}
+
+	errOutput := strings.Join([]string{
+		`{"event":"result","result":{"status":"ERROR","error":"quota exhausted"}}`,
+	}, "\n")
+	_, err = antigravityStreamResultText(errOutput)
+	if err == nil || !strings.Contains(err.Error(), "quota exhausted") {
+		t.Fatalf("expected quota exhausted error, got %v", err)
+	}
+}
+
+func TestAntigravityNativeRunOneShot_LongPromptUsesStdin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim is unix-oriented; argv shape and NDJSON encoding are platform-independent")
+	}
+
+	dir := t.TempDir()
+	argsLog := filepath.Join(dir, "args.log")
+	stdinLog := filepath.Join(dir, "stdin.log")
+	fakeAgy := filepath.Join(dir, "agy")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > '%s'\ncat > '%s'\necho '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"done\"}}'\n", argsLog, stdinLog)
+	if err := os.WriteFile(fakeAgy, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	prompt := strings.Repeat("long \\\"quoted\\\" line with C:\\\\repo\\n", 5000)
+	session := &AntigravityNativeSession{ID: "long-stdin", status: "idle"}
+	out, stderr, exitCode, timedOut, truncated, err := NewAntigravityNativeManager(nil).runOneShot(
+		session, dir, fakeAgy, prompt, "", 10*time.Second, "test:antigravity-long-stdin",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "done" || stderr != "" || exitCode != 0 || timedOut || truncated {
+		t.Fatalf("unexpected result: out=%q stderr=%q exit=%d timeout=%v truncated=%v", out, stderr, exitCode, timedOut, truncated)
+	}
+
+	argv, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(argv), prompt[:100]) || strings.Contains(string(argv), "--print") {
+		t.Fatalf("prompt leaked onto argv: %.300q", argv)
+	}
+	for _, want := range []string{"--input-format\nstream-json", "--output-format\nstream-json"} {
+		if !strings.Contains(string(argv), want) {
+			t.Fatalf("argv missing %q: %q", want, argv)
+		}
+	}
+
+	stdinBytes, err := os.ReadFile(stdinLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Event   string `json:"event"`
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(stdinBytes))), &decoded); err != nil {
+		t.Fatalf("stdin is not valid Antigravity NDJSON: %v", err)
+	}
+	if decoded.Event != "user" || decoded.Message.Content != prompt {
+		t.Fatal("long prompt changed during stdin transport")
 	}
 }
 
@@ -1046,7 +1122,7 @@ func TestAntigravityNativeManager_SendNonzeroExitWithStdoutIsError(t *testing.T)
 	binDir := t.TempDir()
 	fakeAgy := filepath.Join(binDir, "agy")
 	// Always fail with stdout diagnostic so PATH lookup of "agy" is deterministic.
-	script := "#!/bin/sh\necho 'Error: authentication required — please run agy login'\nexit 2\n"
+	script := "#!/bin/sh\necho '{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"error\":\"authentication required — please run agy login\"}}'\nexit 2\n"
 	if err := os.WriteFile(fakeAgy, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake agy: %v", err)
 	}
@@ -1361,7 +1437,7 @@ func TestAntigravityNativeSend_PublishesConversationIDOnSuccess(t *testing.T) {
 
 	binDir := t.TempDir()
 	fakeAgy := filepath.Join(binDir, "agy")
-	script := "#!/bin/sh\necho 'done'\nexit 0\n"
+	script := "#!/bin/sh\necho '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"done\"}}'\nexit 0\n"
 	if err := os.WriteFile(fakeAgy, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake agy: %v", err)
 	}
@@ -1414,7 +1490,7 @@ func TestAntigravityNativeSend_NoConversationIDOnFailedTurn(t *testing.T) {
 
 	binDir := t.TempDir()
 	fakeAgy := filepath.Join(binDir, "agy")
-	script := "#!/bin/sh\necho 'Error: boom'\nexit 3\n"
+	script := "#!/bin/sh\necho '{\"event\":\"result\",\"result\":{\"status\":\"ERROR\",\"error\":\"boom\"}}'\nexit 3\n"
 	if err := os.WriteFile(fakeAgy, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake agy: %v", err)
 	}

@@ -2532,7 +2532,7 @@ func shapeAntigravityShellPayload(shellCmd string, wrapper shellWrapperFlags, pa
 	// run. Same for an equals-form safety flag whose value is not a Go boolean:
 	// agy rejects `--continue=maybe` outright, so stripping it would run a
 	// prompt the caller never got.
-	if barePrint, invalidBool, diagnostic := scanAntigravityCallerArgs(callerValues); barePrint || invalidBool || diagnostic {
+	if barePrint, invalidBool, diagnostic, _ := scanAntigravityCallerArgs(callerValues); barePrint || invalidBool || diagnostic {
 		return "", false
 	}
 	flags, promptFrags, trailing, hasPrompt, ok := partitionAntigravityCallerShellWords(words[1:], zshEquals)
@@ -5630,8 +5630,8 @@ var globalGrokACPManager *GrokACPManager
 var globalClaudeNativeManager *ClaudeNativeManager
 
 // globalAntigravityNativeManager is the package-level AntigravityNativeManager
-// instance, initialized in StartAgent (agent.go). Sessions use one-shot
-// `agy --print` with exact `--conversation <id>` resume and publish
+// instance, initialized in StartAgent (agent.go). Sessions use one-shot agy
+// stream-json stdin with exact `--conversation <id>` resume and publish
 // antigravity_native_* chunks for the frontend native chat path.
 var globalAntigravityNativeManager *AntigravityNativeManager
 
@@ -6351,12 +6351,12 @@ func publishClaudeNativeError(ctx context.Context, topic *pubsub.Publisher, cmd 
 }
 
 /* --------------------------------------------------------------------------
-   Antigravity native (one-shot --print + --conversation resume) routing
+   Antigravity native (stream-json + --conversation resume) routing
    -------------------------------------------------------------------------- */
 
 // handleAntigravityNativeCommand dispatches antigravity_native_* commands to
 // the AntigravityNativeManager. Start registers a logical session (no process);
-// Send runs one-shot agy --print with exact --conversation resume; End cancels
+// Send runs one-shot agy stream-json with exact --conversation resume; End cancels
 // any in-flight turn and drops the logical session.
 func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) {
 	if globalAntigravityNativeManager == nil {

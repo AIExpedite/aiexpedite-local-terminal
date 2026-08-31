@@ -80,7 +80,7 @@ func TestShouldCloseStdinAfterStart(t *testing.T) {
 	cases := []struct {
 		name        string
 		command     string
-		stdinPrompt string
+		stdinPrompt *string
 		want        bool
 	}{
 		// Claude in --input-format stream-json mode reads NDJSON from stdin
@@ -88,7 +88,7 @@ func TestShouldCloseStdinAfterStart(t *testing.T) {
 		// orchestrator can SendInput follow-ups (whether or not an initial
 		// prompt was queued via args). Closing stdin = claude EOFs and exits
 		// in ~3s, which is the prod failure mode we're patching here.
-		{name: "claude_with_stdin_prompt_stays_open", command: "claude", stdinPrompt: "do work", want: false},
+		{name: "claude_with_stdin_prompt_stays_open", command: "claude", stdinPrompt: strPtr("do work"), want: false},
 		{name: "claude_without_prompt_stays_open", command: "claude", want: false},
 		// Codex is one-shot by design and reads the stdin-piped prompt
 		// to EOF. When a prompt was queued at start (delegate path), close stdin
@@ -98,8 +98,11 @@ func TestShouldCloseStdinAfterStart(t *testing.T) {
 		// child an immediate EOF with no prompt and codex v0.140+ exits 1 with
 		// "No prompt provided via stdin." SendInput closes the pipe after the
 		// first prompt instead (see deferredStdinClose).
-		{name: "codex_with_prompt_closes", command: "codex", stdinPrompt: "do work", want: true},
+		{name: "codex_with_prompt_closes", command: "codex", stdinPrompt: strPtr("do work"), want: true},
 		{name: "codex_without_prompt_defers", command: "codex", want: false},
+		{name: "antigravity_with_prompt_closes", command: "agy", stdinPrompt: strPtr("do work"), want: true},
+		{name: "antigravity_with_explicit_empty_prompt_closes", command: "agy", stdinPrompt: strPtr(""), want: true},
+		{name: "antigravity_without_prompt_defers", command: "agy", want: false},
 		{name: "powershell_closes", command: "powershell", want: true},
 	}
 
@@ -107,7 +110,7 @@ func TestShouldCloseStdinAfterStart(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			got := shouldCloseStdinAfterStart(tc.command, tc.stdinPrompt)
 			if got != tc.want {
-				t.Fatalf("shouldCloseStdinAfterStart(%q, %q) = %v, want %v",
+				t.Fatalf("shouldCloseStdinAfterStart(%q, %v) = %v, want %v",
 					tc.command, tc.stdinPrompt, got, tc.want)
 			}
 		})

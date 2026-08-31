@@ -79,6 +79,12 @@ type CLISession struct {
 	// Removed exactly once after the process exits (see waitForExit).
 	promptFile string
 
+	// antigravityManagedStream is true only when StartSession shaped this
+	// invocation into agy's managed stream-json protocol. Raw diagnostics such
+	// as `agy --version` also use the pipe reader, but legitimately exit without
+	// a terminal result event and must retain their process exit code.
+	antigravityManagedStream bool
+
 	// deferredStdinClose marks a one-shot, stdin-fed CLI (codex) that
 	// was started with NO prompt — the chat-direct flow opens the session
 	// eagerly and delivers the first message later via SendInput. Stdin is left
@@ -182,7 +188,9 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	}
 
 	// Build the CLI command with appropriate flags for structured streaming.
-	// stdinPrompt is non-empty for Claude — the prompt is sent as NDJSON on stdin.
+	// stdinPrompt is non-empty when the target CLI transports its prompt outside
+	// argv (Claude/Antigravity NDJSON, Codex plain stdin).
+	antigravityManagedStream := isAntigravityCommand(command) && shouldUseAntigravityManagedStream(args)
 	enableGrokAlwaysApprove := sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
 	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
 
@@ -210,8 +218,15 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// stay on the pipe path below, so tty is a no-op for anything not on the
 	// allowlist. See EXECUTION_LIVENESS_REDESIGN.md → PTY mode.
 	if tty && isPTYEligibleCommand(command, args) {
-		// buildInteractiveCLIArgs shapes a DIRECT agy/antigravity invocation into
-		// its one-shot `--print --dangerously-skip-permissions <prompt>` form, but
+		// Antigravity's PTY path predates its stream-json stdin protocol and
+		// startPTYSession has no separate initial-prompt channel. Keep the legacy
+		// --print argv shaping for this Unix-only operator path. The normal pipe
+		// path (including Windows feature-agent kicks) uses stdin below.
+		if isAntigravityCommand(command) {
+			cliArgs = buildAntigravityInteractiveArgs(args)
+		}
+		// The direct-command branch above shapes agy/antigravity into its legacy
+		// one-shot `--print --dangerously-skip-permissions <prompt>` form, but
 		// a shell-wrapped single-agent payload (`bash -c "agy …"`, how
 		// terminal-service ships operator-joined commands) falls through its
 		// default branch unshaped — the base command is the shell, not agy. Apply
@@ -337,22 +352,23 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	stderrW.Close()
 
 	session := &CLISession{
-		ID:          id,
-		Command:     command,
-		Process:     proc,
-		Stdin:       stdin,
-		Stdout:      stdout,
-		Stderr:      stderr,
-		StartedAt:   time.Now(),
-		Status:      "running",
-		WorkspaceID: workspaceID,
-		UID:         uid,
-		TimeoutMs:   timeoutMs,
-		promptFile:  promptFile,
+		ID:                       id,
+		Command:                  command,
+		Process:                  proc,
+		Stdin:                    stdin,
+		Stdout:                   stdout,
+		Stderr:                   stderr,
+		StartedAt:                time.Now(),
+		Status:                   "running",
+		WorkspaceID:              workspaceID,
+		UID:                      uid,
+		TimeoutMs:                timeoutMs,
+		promptFile:               promptFile,
+		antigravityManagedStream: antigravityManagedStream,
 		// A stdin-fed one-shot CLI (codex) started without a prompt keeps
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
-		deferredStdinClose: stdinPromptFormat(command) == "plain" && stdinPrompt == "",
+		deferredStdinClose: isOneShotStdinPromptFormat(stdinPromptFormat(command)) && stdinPrompt == nil,
 		firstRealFrame:     make(chan struct{}),
 		processExited:      make(chan struct{}),
 		done:               make(chan struct{}),
@@ -395,6 +411,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	//              stdin open so the orchestrator can send follow-up turns
 	//              via SendInput. Stdin closes when claude emits a "result"
 	//              event (detected in readOutputStream).
+	//   "antigravity_ndjson" — agy's one-shot stream-json protocol. Wrap as an
+	//              Antigravity user event; stdin closes after the write.
 	//   "plain"  — codex exec's stdin protocol (also used via the `-`
 	//              positional placeholder). Write the prompt verbatim plus
 	//              a trailing newline. codex reads stdin to completion
@@ -402,26 +420,28 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	//              right after the write via shouldCloseStdinAfterStart.
 	//   ""       — no stdin prompt (positional argv path, or no prompt
 	//              expected at all).
-	if stdinPrompt != "" {
+	if stdinPrompt != nil {
 		var line string
 		switch stdinPromptFormat(command) {
 		case "ndjson":
 			line = fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%s},"session_id":"%s","parent_tool_use_id":null}`,
-				jsonEscapeString(stdinPrompt), id)
+				jsonEscapeString(*stdinPrompt), id)
+		case "antigravity_ndjson":
+			line = antigravityStreamUserMessage(*stdinPrompt)
 		case "plain":
-			line = stdinPrompt
+			line = *stdinPrompt
 		default:
 			// Defensive: a CLI router returned a stdinPrompt for a command
 			// with no documented stdin format. Treat as plain text rather
 			// than dropping the prompt silently.
-			line = stdinPrompt
+			line = *stdinPrompt
 		}
 		if _, err := fmt.Fprintln(session.Stdin, line); err != nil {
 			fmt.Printf("%s[session] Failed to send initial prompt to %s: %v%s\n",
 				colorRed, id, err, colorReset)
 		} else {
 			fmt.Printf("%s[session] Sent initial prompt to %s (%d chars, format=%s)%s\n",
-				colorGreen, id, len(stdinPrompt), stdinPromptFormat(command), colorReset)
+				colorGreen, id, len(*stdinPrompt), stdinPromptFormat(command), colorReset)
 			// Prompt delivered — arm the claude no-output watchdog now.
 			sm.armClaudeFirstFrameWatchdog(session, claudeFirstFrameTimeout)
 		}
@@ -450,8 +470,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
    -------------------------------------------------------------------------- */
 
 // SendInput writes text to the stdin of the specified session.
-// For Claude sessions using --input-format stream-json, the text is wrapped
-// in an NDJSON user message envelope.  For other CLIs it is sent as raw text.
+// For Claude and Antigravity stream-json sessions, the text is wrapped in the
+// CLI's NDJSON user-message envelope. For other CLIs it is sent as raw text.
 func (sm *SessionManager) SendInput(id, text string) error {
 	sm.mu.RLock()
 	session, exists := sm.sessions[id]
@@ -468,11 +488,13 @@ func (sm *SessionManager) SendInput(id, text string) error {
 		return fmt.Errorf("session %s has ended", id)
 	}
 
-	// For Claude sessions, wrap input in NDJSON user message envelope
+	// Structured-stdin agents each use a different NDJSON envelope.
 	payload := text
 	if isClaudeCommand(session.Command) {
 		payload = fmt.Sprintf(`{"type":"user","message":{"role":"user","content":%s},"session_id":"%s","parent_tool_use_id":null}`,
 			jsonEscapeString(text), id)
+	} else if isAntigravityCommand(session.Command) {
+		payload = antigravityStreamUserMessage(text)
 	}
 
 	// Write input with timeout to prevent deadlock if the CLI process's
@@ -789,15 +811,20 @@ func (sm *SessionManager) removeSessionIfSame(id string, s *CLISession) bool {
 //     inference, so we ALWAYS close stdin after the prompt write — leaving it
 //     open hangs the process indefinitely waiting for EOF.
 //
-//   - agy and all non-CLI commands (powershell, bash, git, ...) keep the
-//     pre-existing rule: close stdin iff no stdinPrompt was queued. agy gets
-//     its prompt on argv (it ignores piped stdin), so stdinPrompt is empty.
-func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
+//   - Antigravity is one-shot on this generic session path and, since agy
+//     1.1.15, receives its prompt as stream-json on stdin. Like Codex, close
+//     stdin after the first prompt so the process exits after the turn; when
+//     opened without a prompt, defer that close until SendInput.
+//
+//   - All non-CLI commands keep the pre-existing rule: close stdin iff no
+//     stdinPrompt was queued.
+func shouldCloseStdinAfterStart(command string, stdinPrompt *string) bool {
 	// Route through commandBaseName so absolute/relative paths like
 	// `/opt/bin/codex` follow the same stdin policy as bare names — otherwise
 	// the argv builder would shape them as stdin-fed codex sessions while this
 	// function left the pipe open, hanging the child waiting for EOF.
 	base := commandBaseName(command)
+	hasPrompt := stdinPrompt != nil
 	switch {
 	case strings.HasPrefix(base, "claude"):
 		return false
@@ -818,9 +845,11 @@ func shouldCloseStdinAfterStart(command string, stdinPrompt string) bool {
 		// provided via stdin." before the user's first message ever arrives.
 		// Keep stdin open in that case; SendInput closes it after writing the
 		// first (and only) prompt. See deferredStdinClose.
-		return stdinPrompt != ""
+		return hasPrompt
+	case isAntigravityCommand(command):
+		return hasPrompt
 	}
-	return stdinPrompt == ""
+	return !hasPrompt
 }
 
 func waitForStreamCompletion(session *CLISession, timeout time.Duration) {
@@ -856,12 +885,16 @@ func detectCLITerminalEvent(command, line string) bool {
 	if err := json.Unmarshal([]byte(trimmed), &event); err != nil {
 		return false
 	}
+	base := commandBaseName(command)
+	if isAntigravityCommand(command) {
+		eventType, _ := event["event"].(string)
+		return eventType == "result"
+	}
+
 	eventType, _ := event["type"].(string)
 	if eventType == "" {
 		return false
 	}
-
-	base := commandBaseName(command)
 	switch {
 	case strings.HasPrefix(base, "claude"):
 		return eventType == "result"
@@ -1037,7 +1070,26 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		batch = batch[:0]
 	}
 
+	var antigravityDeltas strings.Builder
+	var antigravityResultSeen bool
+
 	appendDisplayText := func(lineText string) {
+		if isAntigravityCommand(session.Command) {
+			if isAntigravityAgentResponseDelta(lineText) {
+				var raw map[string]interface{}
+				if err := json.Unmarshal([]byte(strings.TrimSpace(lineText)), &raw); err == nil {
+					if update, ok := raw["step_update"].(map[string]interface{}); ok {
+						if text, ok := update["text_delta"].(string); ok {
+							antigravityDeltas.WriteString(text)
+						}
+					}
+				}
+				return
+			}
+			if isAntigravitySuccessResult(lineText) {
+				antigravityResultSeen = true
+			}
+		}
 		displayText := extractDisplayText(session.Command, lineText)
 		if displayText == "" {
 			return
@@ -1066,6 +1118,17 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		select {
 		case line, ok := <-lines:
 			if !ok {
+				// If this was an Antigravity stream that ended abruptly without a terminal result event,
+				// flush the buffered incremental deltas if present so partial output before termination is not lost,
+				// and mark session.ExitCode = 1 so automated callers do not mistake an incomplete stream for a successful turn.
+				if session.antigravityManagedStream && !antigravityResultSeen {
+					if antigravityDeltas.Len() > 0 {
+						batch = append(batch, antigravityDeltas.String())
+					}
+					session.mu.Lock()
+					session.ExitCode = 1
+					session.mu.Unlock()
+				}
 				// All readers done — flush remaining
 				flushBatch()
 				return
@@ -1172,6 +1235,33 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 					}
 					continue
 				}
+			}
+
+			// Antigravity result error: agy can emit result.status: "ERROR" on a protocol/quota/tool
+			// failure while the process exits with status 0. Discard any buffered draft deltas, flush
+			// preceding tool events, publish an explicit error stream frame with Status: "error", and
+			// mark session.ExitCode = 1 so the terminal session_ended message and automated callers recognize the failure.
+			if errMsg, isErr := detectAntigravityErrorResult(session.Command, line.text); isErr {
+				antigravityResultSeen = true
+				antigravityDeltas.Reset()
+				flushBatch()
+				session.mu.Lock()
+				session.ExitCode = 1
+				session.mu.Unlock()
+				seq := atomic.AddInt64(&session.Seq, 1)
+				asyncPublish(resultMsg{
+					ID:          session.ID,
+					WorkspaceID: session.WorkspaceID,
+					UID:         session.UID,
+					Output:      fmt.Sprintf("\n[Antigravity turn failed: %s]\n", errMsg),
+					Status:      "error",
+					Ts:          time.Now().UnixMilli(),
+					Version:     Version,
+					Type:        "stream",
+					SessionID:   session.ID,
+					Seq:         int(seq),
+				})
+				continue
 			}
 
 			// Detect CLI-terminal events (Claude "result", Codex
@@ -1753,14 +1843,9 @@ func isResidentAgentSessionCommand(command string) bool {
 //   - codex:       stdinPrompt is the prompt, written as raw text; codex exec
 //     reads stdin to completion (`-` positional placeholder)
 //     then exits; one-shot per process
-//   - antigravity: prompt as the VALUE of `--print` (agy ≥ 1.1.x; verified
-//     1.1.2 / 1.1.11). Order is `--dangerously-skip-permissions --print
-//     <prompt>` — a bare `--print` followed by another flag makes agy treat
-//     that flag as the prompt. agy does NOT read piped stdin (verified
-//     against agy 1.0.4: ignored in both interactive and --print modes —
-//     it needs a real TTY), so the prompt must stay on argv. agy resolves
-//     to a native `agy.exe` (NOT a cmd.exe shim), so the relevant cap is
-//     the 32KB CreateProcess limit, not an 8191-char cmd.exe cap.
+//   - antigravity: prompt is sent as an Antigravity NDJSON user event via
+//     stdin using the stream-json input/output modes added in agy 1.1.15.
+//     The prompt never appears on argv, avoiding Windows CreateProcess limits.
 //   - opencode:    forced `run --format json` with the prompt as a trailing
 //     positional. `opencode run` is one-shot and does not
 //     hold a stdin protocol open, so stdinPrompt is "" and
@@ -1773,22 +1858,30 @@ func isResidentAgentSessionCommand(command string) bool {
 //
 // The caller (StartSession) uses stdinPromptFormat() to decide how to wrap
 // the stdinPrompt before writing it to the process stdin.
-func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysApprove bool) ([]string, string) {
+func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysApprove bool) ([]string, *string) {
 	base := commandBaseName(command)
 
 	switch {
 	case strings.HasPrefix(base, "claude"):
-		return buildClaudeInteractiveArgs(args)
+		cliArgs, prompt := buildClaudeInteractiveArgs(args)
+		if prompt == "" {
+			return cliArgs, nil
+		}
+		return cliArgs, &prompt
 	case strings.HasPrefix(base, "codex"):
-		return buildCodexInteractiveArgs(args)
+		cliArgs, prompt := buildCodexInteractiveArgs(args)
+		if prompt == "" {
+			return cliArgs, nil
+		}
+		return cliArgs, &prompt
 	case isAntigravityCommand(command):
-		return buildAntigravityInteractiveArgs(args), ""
+		return buildAntigravityStreamingArgs(args)
 	case isOpenCodeCommand(command):
-		return buildOpenCodeInteractiveArgs(args), ""
+		return buildOpenCodeInteractiveArgs(args), nil
 	case strings.HasPrefix(base, "grok"):
-		return buildGrokInteractiveArgs(args, enableGrokAlwaysApprove), ""
+		return buildGrokInteractiveArgs(args, enableGrokAlwaysApprove), nil
 	default:
-		return args, ""
+		return args, nil
 	}
 }
 
@@ -1798,6 +1891,7 @@ func buildInteractiveCLIArgs(command string, args []string, enableGrokAlwaysAppr
 //
 //	"ndjson" — wrap as `{"type":"user","message":{...}}` for claude's
 //	           --input-format stream-json mode
+//	"antigravity_ndjson" — wrap as agy's {event:"user",message:{content:...}}
 //	"plain"  — write the prompt text verbatim followed by a newline
 //	"" (default) — no stdin prompt; nothing to write
 //
@@ -1810,8 +1904,14 @@ func stdinPromptFormat(command string) string {
 		return "ndjson"
 	case strings.HasPrefix(base, "codex"):
 		return "plain"
+	case isAntigravityCommand(command):
+		return "antigravity_ndjson"
 	}
 	return ""
+}
+
+func isOneShotStdinPromptFormat(format string) bool {
+	return format == "plain" || format == "antigravity_ndjson"
 }
 
 // buildClaudeInteractiveArgs builds Claude Code CLI args for bidirectional
@@ -2063,33 +2163,129 @@ func sanitizeCodexExecArgs(args []string) []string {
 	return cleaned
 }
 
-// buildAntigravityInteractiveArgs builds Antigravity CLI (`agy`) args for
-// one-shot prompt execution.
+// buildAntigravityStreamingArgs builds the normal pipe-based Antigravity
+// session shape. agy 1.1.15+ reads user events from stdin in stream-json mode,
+// so the returned prompt is never placed on argv. This is the Antigravity
+// equivalent of Claude/Codex's long-prompt transport and avoids Windows'
+// CreateProcess command-line ceiling.
+func buildAntigravityStreamingArgs(args []string) ([]string, *string) {
+	// Preserve diagnostics and malformed invocations verbatim: turning one into
+	// a managed stream could start a permission-skipping model run the caller
+	// never requested.
+	if !shouldUseAntigravityManagedStream(args) {
+		return args, nil
+	}
+
+	cleaned := stripAntigravityManagedStreamFlags(args)
+	flags, prompt, trailing, hasPrompt := partitionAntigravityCallerArgs(cleaned)
+	result := []string{
+		"--dangerously-skip-permissions",
+		"--input-format", "stream-json",
+		"--output-format", "stream-json",
+	}
+	result = append(result, flags...)
+	result = append(result, trailing...)
+	if !hasPrompt {
+		return result, nil
+	}
+	return result, &prompt
+}
+
+// shouldUseAntigravityManagedStream is the shared decision for both argv
+// shaping and result-event enforcement. Keeping the decision in one place
+// prevents raw diagnostics and malformed invocations from being mistaken for
+// managed turns merely because their command name is agy/antigravity.
+func shouldUseAntigravityManagedStream(args []string) bool {
+	if isAntigravityDiagnosticInvocation(args) {
+		return false
+	}
+	barePrint, invalidBool, diagnostic, danglingManaged := scanAntigravityCallerArgs(args)
+	return !barePrint && !invalidBool && !diagnostic && !danglingManaged
+}
+
+// stripAntigravityManagedStreamFlags removes caller overrides for the two
+// format flags owned by buildAntigravityStreamingArgs. It only walks agy's
+// recognized flag regions; prompt text after the first unknown/positional token
+// is left byte-for-byte intact.
+func stripAntigravityManagedStreamFlags(args []string) []string {
+	managed := func(name string) bool {
+		return name == "--input-format" || name == "--output-format"
+	}
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); {
+		raw := args[i]
+		a := canonicalAntigravityFlag(raw)
+		if a == antigravityFlagTerminator {
+			out = append(out, args[i:]...)
+			break
+		}
+		if name, _, ok := splitAntigravityEqualsFlag(a); ok {
+			name = canonicalAntigravityFlag(name)
+			if managed(name) {
+				i++
+				continue
+			}
+			out = append(out, raw)
+			i++
+			if isAntigravityPrintFlag(name) || antigravityValuedFlags[name] || antigravityBoolFlags[name] {
+				continue
+			}
+			out = append(out, args[i:]...)
+			break
+		}
+		if isAntigravityPrintFlag(a) {
+			out = append(out, raw)
+			i++
+			if i < len(args) {
+				out = append(out, args[i])
+				i++
+			}
+			continue
+		}
+		if antigravityBoolFlags[a] {
+			out = append(out, raw)
+			i++
+			continue
+		}
+		if antigravityValuedFlags[a] {
+			i++
+			if managed(a) {
+				if i < len(args) {
+					i++
+				}
+				continue
+			}
+			out = append(out, raw)
+			if i < len(args) {
+				out = append(out, args[i])
+				i++
+			}
+			continue
+		}
+		out = append(out, args[i:]...)
+		break
+	}
+	return out
+}
+
+// buildAntigravityInteractiveArgs builds legacy PTY Antigravity CLI (`agy`)
+// args for one-shot prompt execution. Pipe-based sessions use
+// buildAntigravityStreamingArgs instead; this argv path remains only because
+// startPTYSession does not have a separate initial-prompt input channel.
 //
 // agy ≥ 1.1.x: `--print` / `-p` / `--prompt` takes the prompt as its FLAG
 // VALUE (not a trailing positional). Verified against agy 1.1.2 and 1.1.11.
-// The native-chat path (buildAntigravityNativeArgs) already uses this contract;
-// the session_start / PTY one-shot path must match or tertiary Review kickoffs
-// (and any other terminalWithFeatureDetails agy role) answer a question about
-// `--dangerously-skip-permissions` and ignore the real brief:
+// This legacy PTY one-shot path must keep that ordering or operator-launched
+// turns answer a question about `--dangerously-skip-permissions` and ignore the
+// real brief:
 //
 //	WRONG: agy --print --dangerously-skip-permissions <brief>
 //	       → --print's value is "--dangerously-skip-permissions"
 //	RIGHT: agy --dangerously-skip-permissions --print <brief>
 //
-// agy ships claude-code-shaped flags but does NOT expose stream-json input, so
-// we cannot drive it as a multi-turn streaming session like claude. We run a
-// one-shot `--print` per session_start.
-//
-// WHY NOT STDIN (unlike codex): agy does NOT read a piped stdin —
-// verified live against agy 1.0.4, piped input is ignored in BOTH interactive
-// and --print modes (agy appears to require a real TTY for interactive input),
-// so the prompt MUST be passed on argv. agy also resolves to a NATIVE `agy.exe`
-// (not an npm cmd.exe/.ps1 shim), so it is launched directly via CreateProcess —
-// the relevant ceiling is the ~32KB CreateProcess command-line cap, NOT an
-// 8191-char cmd.exe cap. So agy does NOT have the "command line is too long."
-// failure for normal (≤ ~32KB) briefs; only briefs approaching 32KB would risk
-// it, which would need a TTY/ACP-style redesign rather than the stdin trick.
+// agy 1.1.15 added stream-json stdin support, but this PTY compatibility path
+// still carries the prompt on argv. It is Unix-only in the current terminal
+// client; Windows feature-agent kicks use the pipe-based streaming path above.
 func buildAntigravityInteractiveArgs(args []string) []string {
 	// Diagnostic invocations are not prompts: `agy --version` prints 1.1.11 and
 	// is exactly how probeAntigravityNativeCapabilityUncached queries the CLI,
@@ -2098,7 +2294,7 @@ func buildAntigravityInteractiveArgs(args []string) []string {
 	if isAntigravityDiagnosticInvocation(args) {
 		return args
 	}
-	if barePrint, invalidBool, diagnostic := scanAntigravityCallerArgs(args); barePrint || invalidBool || diagnostic {
+	if barePrint, invalidBool, diagnostic, _ := scanAntigravityCallerArgs(args); barePrint || invalidBool || diagnostic {
 		return args
 	}
 	result := make([]string, 0, len(args)+3)
@@ -2299,7 +2495,7 @@ func isAntigravityDiagnosticInvocation(args []string) bool {
 var antigravityValuedFlags = map[string]bool{
 	"--add-dir": true, "--agent": true, "--conversation": true,
 	"--effort": true, "--json-schema": true, "--log-file": true,
-	"--mode": true, "--model": true, "--output-format": true,
+	"--input-format": true, "--mode": true, "--model": true, "--output-format": true,
 	"--print-timeout": true, "--project": true,
 	"--prompt-interactive": true, "-i": true,
 }
@@ -2454,8 +2650,8 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 
 // scanAntigravityCallerArgs walks the caller's tokens the same way the
 // partitioner does — consuming each recognized flag's operand and stopping at
-// the first token that starts the prompt — and reports two invocations that
-// must reach agy untouched instead of being reshaped.
+// the first token that starts the prompt — and reports invocations that must
+// reach agy untouched instead of being reshaped.
 //
 // barePrint: a `--print` / `-p` / `--prompt` that runs out of argv before its
 // operand. agy's string flag then has no value and the CLI exits with `flag
@@ -2471,17 +2667,21 @@ func partitionAntigravityCallerArgs(args []string) (flags []string, prompt strin
 // prompt the caller never got. Flags we forward rather than strip need no check
 // — they reach agy and produce their own error.
 //
+// danglingManaged: an input/output format flag without an operand. The stream
+// builder normally replaces these flags, but replacing a malformed one would
+// turn a native CLI error into a model run.
+//
 // Both stop at the prompt boundary: in `agy review --continue=maybe` the flag
 // text is prompt material (Go's flag parsing already stopped at `review`), so
 // it must not block the reshape.
-func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnostic bool) {
+func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnostic, danglingManaged bool) {
 	stripped := func(name string) bool {
 		return name == "--dangerously-skip-permissions" || name == "--continue" || name == "-c"
 	}
 	for i := 0; i < len(args); i++ {
 		a := canonicalAntigravityFlag(args[i])
 		if a == antigravityFlagTerminator {
-			return barePrint, invalidBool, diagnostic // `--` ends flag parsing
+			return barePrint, invalidBool, diagnostic, danglingManaged // `--` ends flag parsing
 		}
 		if name, val, ok := splitAntigravityEqualsFlag(a); ok {
 			name = canonicalAntigravityFlag(name)
@@ -2491,13 +2691,24 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 			// value would start a model run the caller never got.
 			if antigravityDiagnosticTokens[name] {
 				diagnostic = true
-				return barePrint, invalidBool, diagnostic
+				return barePrint, invalidBool, diagnostic, danglingManaged
 			}
 			// `--print=` carries a value (possibly empty).
 			if isAntigravityPrintFlag(name) {
 				continue
 			}
 			if antigravityValuedFlags[name] || antigravityBoolFlags[name] {
+				if name == "--input-format" || name == "--output-format" {
+					if val == "" {
+						danglingManaged = true
+						return barePrint, invalidBool, diagnostic, danglingManaged
+					}
+					valFlag := canonicalAntigravityFlag(val)
+					if isAntigravityPrintFlag(valFlag) || antigravityBoolFlags[valFlag] || antigravityValuedFlags[valFlag] || antigravityDiagnosticTokens[valFlag] || strings.HasPrefix(valFlag, "-") {
+						danglingManaged = true
+						return barePrint, invalidBool, diagnostic, danglingManaged
+					}
+				}
 				if stripped(name) {
 					if _, err := strconv.ParseBool(val); err != nil {
 						invalidBool = true
@@ -2505,12 +2716,12 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 				}
 				continue
 			}
-			return barePrint, invalidBool, diagnostic // unknown token: the prompt starts here
+			return barePrint, invalidBool, diagnostic, danglingManaged // unknown token: the prompt starts here
 		}
 		if isAntigravityPrintFlag(a) {
 			if i+1 >= len(args) {
 				barePrint = true
-				return barePrint, invalidBool, diagnostic
+				return barePrint, invalidBool, diagnostic, danglingManaged
 			}
 			i++ // the next token is this flag's value, whatever it looks like
 			continue
@@ -2520,7 +2731,19 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 		}
 		if antigravityValuedFlags[a] {
 			if i+1 >= len(args) {
-				return barePrint, invalidBool, diagnostic // dangling flag: handled by the partitioner
+				danglingManaged = a == "--input-format" || a == "--output-format"
+				return barePrint, invalidBool, diagnostic, danglingManaged // other dangling flags are handled by the partitioner
+			}
+			if a == "--input-format" || a == "--output-format" {
+				if args[i+1] == "" {
+					danglingManaged = true
+					return barePrint, invalidBool, diagnostic, danglingManaged
+				}
+				next := canonicalAntigravityFlag(args[i+1])
+				if isAntigravityPrintFlag(next) || antigravityBoolFlags[next] || antigravityValuedFlags[next] || antigravityDiagnosticTokens[next] || strings.HasPrefix(next, "-") {
+					danglingManaged = true
+					return barePrint, invalidBool, diagnostic, danglingManaged
+				}
 			}
 			i++
 			continue
@@ -2533,11 +2756,11 @@ func scanAntigravityCallerArgs(args []string) (barePrint, invalidBool, diagnosti
 		// ordinary prompt text.)
 		if strings.HasPrefix(a, "-") && antigravityDiagnosticTokens[a] {
 			diagnostic = true
-			return barePrint, invalidBool, diagnostic
+			return barePrint, invalidBool, diagnostic, danglingManaged
 		}
-		return barePrint, invalidBool, diagnostic // first non-flag token: the prompt starts here
+		return barePrint, invalidBool, diagnostic, danglingManaged // first non-flag token: the prompt starts here
 	}
-	return barePrint, invalidBool, diagnostic
+	return barePrint, invalidBool, diagnostic, danglingManaged
 }
 
 // canonicalAntigravityFlag normalizes a single-dash long flag to its double-dash

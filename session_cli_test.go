@@ -2783,9 +2783,9 @@ func TestShapeShellWrappedPTYArgs_SessionStartPath(t *testing.T) {
 		t.Errorf("session_start shell-wrapped agy = %v, want -c %q", ptyArgs, want)
 	}
 
-	// Direct agy: buildInteractiveCLIArgs already shaped it; shapeShellWrappedPTYArgs
+	// Direct PTY agy uses the legacy argv builder; shapeShellWrappedPTYArgs
 	// must leave it untouched (no duplicate --print/--dangerously-skip-permissions).
-	directArgs, _ := buildInteractiveCLIArgs("agy", []string{"fix the bug"}, false)
+	directArgs := buildAntigravityInteractiveArgs([]string{"fix the bug"})
 	got := shapeShellWrappedPTYArgs("agy", directArgs)
 	if strings.Join(got, " ") != strings.Join(directArgs, " ") {
 		t.Errorf("shapeShellWrappedPTYArgs double-shaped direct agy: %v -> %v", directArgs, got)
@@ -2823,8 +2823,8 @@ func TestStdinPromptFormat(t *testing.T) {
 		{"codex", "plain"},
 		{"codex.cmd", "plain"},
 		{"CODEX", "plain"},
-		{"agy", ""},     // antigravity keeps argv (it ignores piped stdin); no stdin prompt
-		{"agy.exe", ""}, // native agy.exe — still positional, no stdin prompt
+		{"agy", "antigravity_ndjson"},
+		{"agy.exe", "antigravity_ndjson"},
 		{"powershell", ""},
 		{"", ""},
 	}
@@ -2842,21 +2842,21 @@ func TestStdinPromptFormat(t *testing.T) {
    Each CLI has its own stdinPrompt contract:
      - claude: prompt goes via NDJSON on stdin
      - codex:  prompt goes via raw stdin (`-` placeholder)
-     - agy:    prompt stays positional (agy ignores piped stdin)
+     - agy:    prompt goes via Antigravity NDJSON on stdin
      - other:  passes through verbatim
    ------------------------------------------------------------------------ */
 
 func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 	t.Run("claude", func(t *testing.T) {
 		_, prompt := buildInteractiveCLIArgs("claude", []string{"hello"}, false)
-		if prompt != "hello" {
-			t.Errorf("claude prompt = %q, want %q", prompt, "hello")
+		if prompt == nil || *prompt != "hello" {
+			t.Errorf("claude prompt = %v, want %q", prompt, "hello")
 		}
 	})
 	t.Run("codex", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("codex", []string{"hello"}, false)
-		if prompt != "hello" {
-			t.Errorf("codex stdinPrompt = %q, want %q", prompt, "hello")
+		if prompt == nil || *prompt != "hello" {
+			t.Errorf("codex stdinPrompt = %v, want %q", prompt, "hello")
 		}
 		if len(args) == 0 || args[len(args)-1] != "-" {
 			t.Errorf("codex args must end with `-` placeholder, got %v", args)
@@ -2864,16 +2864,19 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 	})
 	t.Run("antigravity", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("agy", []string{"hello"}, false)
-		if prompt != "" {
-			t.Errorf("agy stdinPrompt MUST be empty (agy ignores piped stdin; prompt goes on argv): %q", prompt)
+		if prompt == nil || *prompt != "hello" {
+			t.Errorf("agy stdinPrompt = %v, want hello", prompt)
 		}
-		mustContain(t, args, "--print", "--dangerously-skip-permissions", "hello")
+		mustContain(t, args, "--input-format", "--output-format", "stream-json", "--dangerously-skip-permissions")
+		if strings.Contains(strings.Join(args, " "), "hello") {
+			t.Fatalf("agy prompt leaked onto argv: %#v", args)
+		}
 	})
 	t.Run("case-insensitive", func(t *testing.T) {
 		// The router checks command.ToLower() exactly + startswith — make sure
 		// "Claude" / "CODEX" still route correctly.
 		_, p1 := buildInteractiveCLIArgs("Claude", []string{"hi"}, false)
-		if p1 == "" {
+		if p1 == nil || *p1 == "" {
 			t.Errorf("Claude (mixed case) should still route to claude builder, got empty prompt")
 		}
 		args, _ := buildInteractiveCLIArgs("CODEX", []string{"hi"}, false)
@@ -2894,7 +2897,7 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 			"claude-edge",
 		} {
 			_, prompt := buildInteractiveCLIArgs(cmd, []string{"hi"}, false)
-			if prompt == "" {
+			if prompt == nil || *prompt == "" {
 				t.Errorf("buildInteractiveCLIArgs(%q) did not route to claude (empty stdinPrompt)", cmd)
 			}
 			if !isClaudeCommand(cmd) {
@@ -2902,15 +2905,110 @@ func TestBuildInteractiveCLIArgs_RoutesByCommand(t *testing.T) {
 			}
 		}
 	})
+	t.Run("flag-only-invocations-have-nil-stdin-prompt", func(t *testing.T) {
+		_, codexPrompt := buildInteractiveCLIArgs("codex", []string{"--model", "o3"}, false)
+		if codexPrompt != nil {
+			t.Errorf("codex flag-only invocation should have nil stdinPrompt, got %v", codexPrompt)
+		}
+		_, claudePrompt := buildInteractiveCLIArgs("claude", []string{"--model", "sonnet"}, false)
+		if claudePrompt != nil {
+			t.Errorf("claude flag-only invocation should have nil stdinPrompt, got %v", claudePrompt)
+		}
+		_, agyPrompt := buildInteractiveCLIArgs("agy", []string{"--model", "gemini"}, false)
+		if agyPrompt != nil {
+			t.Errorf("agy flag-only invocation should have nil stdinPrompt, got %v", agyPrompt)
+		}
+	})
 	t.Run("unknown-command-passes-through", func(t *testing.T) {
 		args, prompt := buildInteractiveCLIArgs("git", []string{"status"}, false)
-		if prompt != "" {
-			t.Errorf("unknown command should have empty stdinPrompt, got %q", prompt)
+		if prompt != nil {
+			t.Errorf("unknown command should have nil stdinPrompt, got %v", prompt)
 		}
 		if !reflect.DeepEqual(args, []string{"status"}) {
 			t.Errorf("unknown command should pass args through verbatim, got %v", args)
 		}
 	})
+}
+
+func TestBuildAntigravityStreamingArgs_LongPromptNeverTouchesArgv(t *testing.T) {
+	prompt := strings.Repeat("large review brief with \\\"quotes\\\" and paths C:\\\\repo\\n", 4000)
+	args, stdinPrompt := buildAntigravityStreamingArgs([]string{"--model", "gemini", prompt})
+	if stdinPrompt == nil || *stdinPrompt != prompt {
+		t.Fatal("Antigravity stdin prompt changed")
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, prompt[:100]) || strings.Contains(joined, "--print") {
+		t.Fatalf("large prompt leaked onto argv: %.200q", joined)
+	}
+	mustContain(t, args, "--model", "gemini", "--input-format", "--output-format", "stream-json")
+}
+
+func TestBuildAntigravityStreamingArgs_OwnsFormatFlags(t *testing.T) {
+	args, prompt := buildAntigravityStreamingArgs([]string{
+		"--input-format", "text",
+		"--output-format=json",
+		"--print", "review",
+		"--output-format", "text",
+		"--conversation", "abc",
+	})
+	if prompt == nil || *prompt != "review" {
+		t.Fatalf("prompt = %v, want review", prompt)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, " text") || strings.Contains(joined, "=json") || strings.Contains(joined, "--print") {
+		t.Fatalf("caller format/print flags survived: %#v", args)
+	}
+	if strings.Count(joined, "--input-format") != 1 || strings.Count(joined, "--output-format") != 1 {
+		t.Fatalf("managed format flags not unique: %#v", args)
+	}
+	mustContain(t, args, "--conversation", "abc")
+}
+
+func TestBuildAntigravityStreamingArgs_PreservesDanglingManagedFormatFlag(t *testing.T) {
+	for _, in := range [][]string{
+		{"--output-format"},
+		{"--print", "review", "--output-format"},
+		{"--print", "review", "--input-format"},
+		{"--output-format", "--print", "review"},
+		{"--input-format", "-p", "review"},
+		{"--output-format=--print", "review"},
+		{"--output-format", "--dangerously-skip-permissions", "review"},
+		{"--output-format=--", "review"},
+		{"--output-format", "--", "review"},
+		{"--output-format=", "review"},
+		{"--output-format", "", "review"},
+		{"--input-format=", "review"},
+		{"--input-format", "", "review"},
+	} {
+		args, prompt := buildAntigravityStreamingArgs(in)
+		if !reflect.DeepEqual(args, in) || prompt != nil {
+			t.Errorf("buildAntigravityStreamingArgs(%#v) = (%#v, %v), want unchanged argv and nil prompt", in, args, prompt)
+		}
+	}
+}
+
+func TestBuildAntigravityStreamingArgs_ExplicitEmptyPromptPreserved(t *testing.T) {
+	for _, in := range [][]string{
+		{"--print="},
+		{"--print", ""},
+		{""},
+	} {
+		args, prompt := buildAntigravityStreamingArgs(in)
+		if prompt == nil {
+			t.Fatalf("buildAntigravityStreamingArgs(%#v) returned nil prompt, want non-nil empty prompt", in)
+		}
+		if *prompt != "" {
+			t.Fatalf("buildAntigravityStreamingArgs(%#v) prompt = %q, want empty string", in, *prompt)
+		}
+		mustContain(t, args, "--input-format", "stream-json", "--output-format", "stream-json", "--dangerously-skip-permissions")
+	}
+
+	// Invocations with NO prompt must return nil prompt
+	args, prompt := buildAntigravityStreamingArgs([]string{"--model", "gemini"})
+	if prompt != nil {
+		t.Fatalf("buildAntigravityStreamingArgs without prompt returned %v, want nil", prompt)
+	}
+	mustContain(t, args, "--input-format", "stream-json")
 }
 
 /* --------------------------------------------------------------------------
@@ -3046,6 +3144,32 @@ func TestDetectCLITerminalEvent_Codex(t *testing.T) {
 	}
 }
 
+func TestDetectCLITerminalEvent_Antigravity(t *testing.T) {
+	if !detectCLITerminalEvent("agy.exe", `{"event":"result","result":{"status":"SUCCESS"}}`) {
+		t.Error("Antigravity result must be a terminal event")
+	}
+	if detectCLITerminalEvent("antigravity", `{"event":"step_update"}`) {
+		t.Error("Antigravity step_update is not a terminal event")
+	}
+}
+
+func TestDetectAntigravityErrorResult(t *testing.T) {
+	errText, isErr := detectAntigravityErrorResult("agy", `{"event":"result","result":{"status":"ERROR","error":"quota exceeded"}}`)
+	if !isErr || errText != "quota exceeded" {
+		t.Fatalf("expected error result 'quota exceeded', got isErr=%v errText=%q", isErr, errText)
+	}
+
+	_, isErr = detectAntigravityErrorResult("agy", `{"event":"result","result":{"status":"SUCCESS","response":"ok"}}`)
+	if isErr {
+		t.Fatal("SUCCESS result should not be detected as error result")
+	}
+
+	_, isErr = detectAntigravityErrorResult("claude", `{"event":"result","result":{"status":"ERROR","error":"quota exceeded"}}`)
+	if isErr {
+		t.Fatal("non-antigravity command should return false")
+	}
+}
+
 func TestDetectCLITerminalEvent_NonJsonAndMalformedReturnFalse(t *testing.T) {
 	// We must NEVER flushBatch on a plain-text line by mistake — that would
 	// cause double flushes and could publish empty batches.
@@ -3056,7 +3180,7 @@ func TestDetectCLITerminalEvent_NonJsonAndMalformedReturnFalse(t *testing.T) {
 		`{"type":"result"`, // malformed JSON
 	}
 	for _, line := range cases {
-		for _, cmd := range []string{"claude", "codex"} {
+		for _, cmd := range []string{"claude", "codex", "agy"} {
 			if detectCLITerminalEvent(cmd, line) {
 				t.Errorf("detectCLITerminalEvent(%q, %q) returned true; expected false", cmd, line)
 			}
@@ -3133,6 +3257,134 @@ func TestReadOutputStream_CodexCapturesFinalNumericTokenWithoutNewline(t *testin
 	observed := time.UnixMilli(b.ObservedAtMs)
 	if observed.Before(before.Add(-time.Millisecond)) || observed.After(after.Add(time.Millisecond)) {
 		t.Fatalf("ObservedAt=%s, want receive time between %s and %s", observed, before, after)
+	}
+}
+
+func TestReadOutputStream_AntigravityConcatenatesAdjacentTextDeltas(t *testing.T) {
+	output := strings.Join([]string{
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"first"}}`,
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"second"}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"firstsecond"}}`,
+	}, "\n") + "\n"
+	session := &CLISession{
+		ID:             "antigravity-adjacent-deltas",
+		Command:        "agy",
+		Stdout:         io.NopCloser(strings.NewReader(output)),
+		Stderr:         io.NopCloser(strings.NewReader("")),
+		streamDone:     make(chan struct{}),
+		firstRealFrame: make(chan struct{}),
+	}
+	var published []resultMsg
+
+	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
+		published = append(published, msg)
+	})
+
+	var streams []string
+	for _, msg := range published {
+		if msg.Type == "stream" {
+			streams = append(streams, msg.Output)
+		}
+	}
+	if got := strings.Join(streams, ""); got != "firstsecond" {
+		t.Fatalf("Antigravity stream output = %q, want %q", got, "firstsecond")
+	}
+}
+
+func TestReadOutputStream_AntigravityDivergentDeltasUsesAuthoritativeResult(t *testing.T) {
+	output := strings.Join([]string{
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"early draft..."}}`,
+		`{"event":"result","result":{"status":"SUCCESS","response":"authoritative final answer"}}`,
+	}, "\n") + "\n"
+	session := &CLISession{ID: "antigravity-divergent-deltas", Command: "agy", Stdout: io.NopCloser(strings.NewReader(output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{})}
+	var streams []string
+	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
+		if msg.Type == "stream" {
+			streams = append(streams, msg.Output)
+		}
+	})
+	if got := strings.Join(streams, ""); got != "authoritative final answer" {
+		t.Fatalf("Antigravity output = %q, want %q", got, "authoritative final answer")
+	}
+}
+
+func TestReadOutputStream_AntigravityAbruptTerminationFlushesBufferedDeltas(t *testing.T) {
+	output := strings.Join([]string{
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"partial work in progress"}}`,
+	}, "\n") + "\n"
+	session := &CLISession{ID: "antigravity-abrupt-eof", Command: "agy", Stdout: io.NopCloser(strings.NewReader(output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{}), antigravityManagedStream: true}
+	var streams []string
+	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
+		if msg.Type == "stream" {
+			streams = append(streams, msg.Output)
+		}
+	})
+	if got := strings.Join(streams, ""); got != "partial work in progress" {
+		t.Fatalf("Antigravity abrupt EOF output = %q, want %q", got, "partial work in progress")
+	}
+	if session.ExitCode == 0 {
+		t.Fatal("Antigravity abrupt termination without result event must set a non-zero exit code")
+	}
+}
+
+func TestReadOutputStream_AntigravityEmptyOrInitStreamWithoutResultSetsNonZeroExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		output string
+	}{
+		{"empty output", ""},
+		{"init and tool only", strings.Join([]string{
+			`{"event":"init","conversation_id":"ag-123"}`,
+			`{"event":"step_update","step_update":{"step_type":"tool","tool_name":"read_file"}}`,
+		}, "\n") + "\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := &CLISession{ID: "antigravity-no-result", Command: "agy", Stdout: io.NopCloser(strings.NewReader(tc.output)), Stderr: io.NopCloser(strings.NewReader("")), streamDone: make(chan struct{}), firstRealFrame: make(chan struct{}), antigravityManagedStream: true}
+			NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {})
+			if session.ExitCode == 0 {
+				t.Fatalf("%s: Antigravity stream ending without result must set session.ExitCode != 0", tc.name)
+			}
+		})
+	}
+}
+
+func TestReadOutputStream_AntigravityErrorResultPublishesFailure(t *testing.T) {
+	output := strings.Join([]string{
+		`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"draft before failure"}}`,
+		`{"event":"result","result":{"status":"ERROR","error":"quota exceeded"}}`,
+	}, "\n") + "\n"
+	session := &CLISession{
+		ID:             "antigravity-error-result",
+		Command:        "agy",
+		Stdout:         io.NopCloser(strings.NewReader(output)),
+		Stderr:         io.NopCloser(strings.NewReader("")),
+		streamDone:     make(chan struct{}),
+		firstRealFrame: make(chan struct{}),
+	}
+	var published []resultMsg
+
+	NewSessionManager(nil).readOutputStream(session, func(msg resultMsg) {
+		published = append(published, msg)
+	})
+
+	var sawError bool
+	for _, msg := range published {
+		if strings.Contains(msg.Output, "draft before failure") {
+			t.Fatalf("buffered draft deltas should be discarded on error, but got message: %#v", msg)
+		}
+		if msg.Type != "stream" || !strings.Contains(msg.Output, "quota exceeded") {
+			continue
+		}
+		sawError = true
+		if msg.Status != "error" {
+			t.Fatalf("Antigravity failure stream status = %q, want error", msg.Status)
+		}
+	}
+	if !sawError {
+		t.Fatalf("expected Antigravity failure stream, got %#v", published)
+	}
+	if session.ExitCode == 0 {
+		t.Fatal("Antigravity ERROR result must force a non-zero terminal exit code")
 	}
 }
 
@@ -3387,6 +3639,25 @@ func TestExtractDisplayText_Grok_NonJsonPassthrough(t *testing.T) {
 	}
 }
 
+func TestExtractDisplayText_Antigravity_StreamEvents(t *testing.T) {
+	textLine := `{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"fixed it"}}`
+	if got := extractDisplayText("agy.exe", textLine); got != "" {
+		t.Fatalf("Antigravity text delta should be buffered by readOutputStream, got %q", got)
+	}
+	toolLine := `{"event":"step_update","step_update":{"step_type":"tool","tool_name":"run_command"}}`
+	if got := extractDisplayText("antigravity", toolLine); !strings.Contains(got, "run_command") {
+		t.Fatalf("Antigravity tool event = %q", got)
+	}
+	resultLine := `{"event":"result","result":{"status":"SUCCESS","response":"fixed it completely"}}`
+	if got := extractDisplayText("agy", resultLine); got != "fixed it completely" {
+		t.Fatalf("successful result response = %q, want %q", got, "fixed it completely")
+	}
+	errorLine := `{"event":"result","result":{"status":"ERROR","error":"quota exhausted"}}`
+	if got := extractDisplayText("agy", errorLine); !strings.Contains(got, "quota exhausted") {
+		t.Fatalf("Antigravity result error = %q", got)
+	}
+}
+
 // TestExtractDisplayText_Grok_SubcommandJSONPassthrough guards that JSON
 // output from a carved-out Grok subcommand — which bypasses the managed
 // `--output-format streaming-json -p` headless path and runs verbatim
@@ -3532,6 +3803,7 @@ func TestDetectPromptFromJSON_NonPromptEventsReturnNil(t *testing.T) {
    - Codex: close after the write when a prompt was queued at start — codex
      exec reads the stdin-piped prompt to EOF before inference, so leaving
      stdin open hangs it.
+   - Antigravity: same one-shot close/defer policy as Codex, using NDJSON.
    - Everything else (powershell, git, ...): close stdin when stdinPrompt is
      empty.
    ------------------------------------------------------------------------ */
@@ -3539,18 +3811,18 @@ func TestDetectPromptFromJSON_NonPromptEventsReturnNil(t *testing.T) {
 func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *testing.T) {
 	cases := []struct {
 		cmd         string
-		stdinPrompt string
+		stdinPrompt *string
 		want        bool // want close?
 	}{
 		// Claude — always open regardless of prompt (multi-turn stream-json
 		// keeps stdin open between SendInput calls).
-		{cmd: "claude", stdinPrompt: "", want: false},
-		{cmd: "claude", stdinPrompt: "hello", want: false},
-		{cmd: "claude", stdinPrompt: " ", want: false},
-		{cmd: "claude", stdinPrompt: "\n", want: false},
+		{cmd: "claude", stdinPrompt: nil, want: false},
+		{cmd: "claude", stdinPrompt: strPtr("hello"), want: false},
+		{cmd: "claude", stdinPrompt: strPtr(" "), want: false},
+		{cmd: "claude", stdinPrompt: strPtr("\n"), want: false},
 		// Normalize: claude.exe, claude.cmd, claude.ps1 should match too.
-		{cmd: "claude.exe", stdinPrompt: "", want: false},
-		{cmd: "Claude", stdinPrompt: "", want: false},
+		{cmd: "claude.exe", stdinPrompt: nil, want: false},
+		{cmd: "Claude", stdinPrompt: nil, want: false},
 		// Codex — close after the write when a prompt was queued at start; codex
 		// exec reads stdin to completion before inference, so leaving it open
 		// hangs the child waiting for EOF. But with an EMPTY prompt (chat-direct
@@ -3558,27 +3830,31 @@ func TestShouldCloseStdinAfterStart_ClaudeAlwaysOpen_OthersGatedByPrompt(t *test
 		// SendInput), DEFER: closing here hands codex an immediate EOF with no
 		// prompt and v0.140+ exits 1 with "No prompt provided via stdin."
 		// SendInput closes the pipe after writing the first prompt instead.
-		{cmd: "codex", stdinPrompt: "", want: false},
-		{cmd: "codex", stdinPrompt: "review the diff", want: true},
-		{cmd: "codex.cmd", stdinPrompt: "review", want: true},
-		{cmd: "CODEX", stdinPrompt: "review", want: true},
+		{cmd: "codex", stdinPrompt: nil, want: false},
+		{cmd: "codex", stdinPrompt: strPtr("review the diff"), want: true},
+		{cmd: "codex.cmd", stdinPrompt: strPtr("review"), want: true},
+		{cmd: "CODEX", stdinPrompt: strPtr("review"), want: true},
+		{cmd: "agy", stdinPrompt: nil, want: false},
+		{cmd: "agy", stdinPrompt: strPtr("review"), want: true},
+		{cmd: "agy", stdinPrompt: strPtr(""), want: true},
+		{cmd: "agy.exe", stdinPrompt: strPtr("review"), want: true},
 		// Path-routed claude/codex — same policy must apply when the
 		// caller supplied an absolute or relative path. Otherwise the argv
 		// builder shapes a stdin-fed codex session but stdin is left
 		// open and the child hangs waiting for EOF.
-		{cmd: "/opt/claude-nightly/claude", stdinPrompt: "", want: false},
-		{cmd: `C:\tools\claude.cmd`, stdinPrompt: "hi", want: false},
-		{cmd: "/opt/bin/codex", stdinPrompt: "review", want: true},
-		{cmd: "./codex", stdinPrompt: "", want: false},
+		{cmd: "/opt/claude-nightly/claude", stdinPrompt: nil, want: false},
+		{cmd: `C:\tools\claude.cmd`, stdinPrompt: strPtr("hi"), want: false},
+		{cmd: "/opt/bin/codex", stdinPrompt: strPtr("review"), want: true},
+		{cmd: "./codex", stdinPrompt: nil, want: false},
 		// Shells / non-CLI: legacy rule — close iff empty prompt.
-		{cmd: "powershell", stdinPrompt: "", want: true},
-		{cmd: "git", stdinPrompt: "", want: true},
-		{cmd: "", stdinPrompt: "", want: true},
+		{cmd: "powershell", stdinPrompt: nil, want: true},
+		{cmd: "git", stdinPrompt: nil, want: true},
+		{cmd: "", stdinPrompt: nil, want: true},
 	}
 	for _, tc := range cases {
 		got := shouldCloseStdinAfterStart(tc.cmd, tc.stdinPrompt)
 		if got != tc.want {
-			t.Errorf("shouldCloseStdinAfterStart(%q, %q) = %v, want %v",
+			t.Errorf("shouldCloseStdinAfterStart(%q, %v) = %v, want %v",
 				tc.cmd, tc.stdinPrompt, got, tc.want)
 		}
 	}
@@ -3617,4 +3893,8 @@ func mustContain(t *testing.T, args []string, expected ...string) {
 			t.Errorf("args missing %q (got %v)", want, args)
 		}
 	}
+}
+
+func strPtr(s string) *string {
+	return &s
 }

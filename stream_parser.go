@@ -1,6 +1,6 @@
 // File: stream_parser.go
 // -----------------------------------------------------------------------------
-// Parses structured JSON streaming output from CLI agents (Claude, Codex)
+// Parses structured JSON streaming output from CLI agents
 // and extracts human-readable display text. This allows the frontend
 // to show clean text instead of raw JSON events.
 //
@@ -8,6 +8,7 @@
 //   - Claude: --output-format stream-json     (Anthropic API streaming events)
 //   - Codex:  --json                          (JSONL events)
 //   - Grok:   --output-format streaming-json  (NDJSON: text / thought / end frames)
+//   - Antigravity: --output-format stream-json (NDJSON: step_update / result)
 // -----------------------------------------------------------------------------
 
 package main
@@ -100,9 +101,124 @@ func extractDisplayText(command, line string) string {
 		return extractCodexDisplayText(raw)
 	case strings.HasPrefix(base, "grok"):
 		return extractGrokDisplayText(raw, line)
+	case isAntigravityCommand(command):
+		return extractAntigravityDisplayText(raw)
 	default:
 		return line // passthrough unknown CLI agents
 	}
+}
+
+// isAntigravityAgentResponseDelta reports whether line is an incremental
+// assistant text frame. readOutputStream uses this to concatenate adjacent
+// deltas without inserting the newline used between ordinary output lines.
+func isAntigravityAgentResponseDelta(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return false
+	}
+	if eventType, _ := raw["event"].(string); eventType != "step_update" {
+		return false
+	}
+	update, _ := raw["step_update"].(map[string]interface{})
+	if update == nil {
+		return false
+	}
+	stepType, _ := update["step_type"].(string)
+	return stepType == "agent_response"
+}
+
+func isAntigravitySuccessResult(line string) bool {
+	var raw struct {
+		Event  string `json:"event"`
+		Result struct {
+			Status string `json:"status"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &raw); err != nil {
+		return false
+	}
+	return raw.Event == "result" && strings.EqualFold(raw.Result.Status, "SUCCESS")
+}
+
+// detectAntigravityErrorResult reports whether line is an Antigravity terminal
+// result event with status: "ERROR", returning the error detail if present.
+func detectAntigravityErrorResult(command, line string) (string, bool) {
+	if !isAntigravityCommand(command) {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "{") {
+		return "", false
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		return "", false
+	}
+	if eventType, _ := raw["event"].(string); eventType != "result" {
+		return "", false
+	}
+	result, _ := raw["result"].(map[string]interface{})
+	if result == nil {
+		return "", false
+	}
+	status, _ := result["status"].(string)
+	if !strings.EqualFold(status, "ERROR") {
+		return "", false
+	}
+	errText, _ := result["error"].(string)
+	if errText == "" {
+		errText = "no error detail"
+	}
+	return errText, true
+}
+
+/* --------------------------------------------------------------------------
+   Google Antigravity parser
+   -------------------------------------------------------------------------- */
+
+// extractAntigravityDisplayText extracts display text from an Antigravity stream-json event.
+// Tool activity is surfaced as it executes during step_update events, and the authoritative
+// full response is emitted on the terminal SUCCESS result event. Terminal errors are surfaced
+// because they are the authoritative record of why the turn failed.
+func extractAntigravityDisplayText(raw map[string]interface{}) string {
+	eventType, _ := raw["event"].(string)
+	switch eventType {
+	case "step_update":
+		update, _ := raw["step_update"].(map[string]interface{})
+		if update == nil {
+			return ""
+		}
+		stepType, _ := update["step_type"].(string)
+		if stepType == "tool" {
+			name, _ := update["tool_name"].(string)
+			if name != "" {
+				return fmt.Sprintf("\n[Using tool: %s]\n", name)
+			}
+		}
+		return ""
+	case "result":
+		result, _ := raw["result"].(map[string]interface{})
+		if result == nil {
+			return ""
+		}
+		status, _ := result["status"].(string)
+		if strings.EqualFold(status, "SUCCESS") {
+			resp, _ := result["response"].(string)
+			return resp
+		}
+		errText, _ := result["error"].(string)
+		if errText == "" {
+			errText = "no error detail"
+		}
+		return fmt.Sprintf("\n[Antigravity turn failed: %s]\n", errText)
+	case "init":
+		return ""
+	}
+	return ""
 }
 
 /* --------------------------------------------------------------------------

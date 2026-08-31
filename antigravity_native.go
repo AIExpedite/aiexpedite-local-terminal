@@ -1,11 +1,14 @@
 package main
 
 // AntigravityNativeManager — logical multi-turn chat sessions backed by
-// one-shot `agy --print` processes with exact native resume via
+// one-shot `agy` stream-json processes with exact native resume via
 // `--conversation <id>`.
 //
-// Capability research (agy 1.1.1 / 1.1.2):
-//   - `-p` / `--print` takes the prompt as the flag value (not positional).
+// Capability research (agy 1.1.15+):
+//   - `--input-format stream-json` accepts NDJSON user events on stdin, keeping
+//     prompts off argv and avoiding Windows' CreateProcess command-line limit.
+//   - Stream input requires `--output-format stream-json`; the terminal result
+//     event contains the complete response for the turn.
 //   - `--conversation <uuid>` resumes the exact prior conversation.
 //   - `--continue` resumes the most recent conversation globally and is
 //     NEVER used (cross-chat contamination risk).
@@ -26,8 +29,9 @@ package main
 //   (3) parent orchestration approval for terminal access, (4) working-directory
 //   scope on Start, (5) process registration + orphan cleanup limited to
 //   AIExpedite-owned PIDs, (6) redacted telemetry (no prompts/secrets).
-//   One-shot buildAntigravityInteractiveArgs (session_start / PTY) uses the
-//   same permission flag and the same --print <prompt> VALUE contract.
+//   The legacy PTY-only buildAntigravityInteractiveArgs path still uses
+//   --print <prompt>; pipe-based session_start uses the same stdin stream
+//   protocol as this native manager.
 
 import (
 	"encoding/json"
@@ -56,11 +60,13 @@ const (
 	antigravityReplayMaxMessages = 24
 	antigravityReplayMaxChars    = 48_000
 	// Minimum supported version for native chat (semver major.minor.patch).
-	antigravityNativeMinVersion = "1.1.1"
-	// Prompt is passed as `--print` flag value. Keep well under CreateProcess
-	// ~32KB argv ceiling (flags + path also consume budget). Fail closed —
-	// never silently truncate user input.
-	antigravityNativeMaxPromptBytes = 24 * 1024
+	// 1.1.15 introduced --input-format stream-json, which is required to keep
+	// large prompts off argv on Windows.
+	antigravityNativeMinVersion = "1.1.15"
+	// Bound retained for memory/transcript safety, not argv transport. Prompts
+	// are delivered on stdin, so this can safely exceed CreateProcess' ~32KB
+	// command-line ceiling without truncating user input.
+	antigravityNativeMaxPromptBytes = 1 * 1024 * 1024
 	// Cache capability probes so Start does not spawn `agy --version` on every
 	// chat open. Invalidated after this TTL or when a probe fails.
 	antigravityCapabilityCacheTTL = 5 * time.Minute
@@ -76,7 +82,7 @@ const (
 
 // AntigravityNativeSession is a logical multi-turn conversation. Unlike
 // Claude/Grok/Codex managers, there is usually no resident process between
-// turns — each Send spawns a one-shot `agy --print` and waits for completion.
+// turns — each Send spawns a one-shot stream-json `agy` and waits for completion.
 type AntigravityNativeSession struct {
 	ID                   string
 	NativeConversationID string
@@ -352,11 +358,11 @@ func ackExistingAntigravitySession(existing *AntigravityNativeSession, id string
 	return nil
 }
 
-// Send runs one user turn: spawn `agy --print <prompt>` (with --conversation
-// when a native ID is known), capture complete-only stdout as the assistant
-// message, update the native conversation ID, and append to the bounded
-// transcript. publishFn receives message / stderr / error frames; the logical
-// session stays open (idle) after a successful turn so the user can retry.
+// Send runs one user turn: spawn agy in stream-json mode, write the prompt on
+// stdin (with --conversation when a native ID is known), capture the terminal
+// result as the assistant message, update the native conversation ID, and
+// append to the bounded transcript. publishFn receives message / stderr / error
+// frames; the logical session stays open (idle) after a successful turn.
 //
 // Replay recovery runs only when native resume is active AND the CLI reports a
 // recognized missing/stale conversation — never on generic non-zero exits
@@ -482,9 +488,6 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	outText, errText, exitCode, timedOut, truncated, runErr := m.runOneShot(
 		session, runDir, executable, promptToSend, nativeID, turnTimeout, "antigravity-native:"+id,
 	)
-	if runErr != nil {
-		return m.publishTurnError(session, publishFn, runErr.Error())
-	}
 	m.publishStderrIfAny(session, publishFn, errText)
 	if truncated {
 		// Requirements: oversize output must not be silently dropped/truncated
@@ -502,10 +505,13 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 	}
 
 	// Exact-ID resume failed with a recognized missing/stale conversation.
-	// Require a non-zero exit so ordinary assistant text that mentions
-	// "conversation not found" cannot trigger a costly false-positive replay.
-	// At most one replay recovery for this turn.
-	if useNativeResume && exitCode != 0 && looksLikeMissingConversation(outText, errText) {
+	// Can happen either via non-zero process exit or a stream-json ERROR result
+	// (runErr != nil). Require an explicit error signal (exitCode != 0 or runErr != nil)
+	// so ordinary assistant text that mentions "conversation not found" cannot trigger
+	// a costly false-positive replay. At most one replay recovery for this turn.
+	isMissingConv := useNativeResume && (exitCode != 0 || runErr != nil) &&
+		(looksLikeMissingConversation(outText, errText) || (runErr != nil && looksLikeMissingConversation(runErr.Error(), errText)))
+	if isMissingConv {
 		fmt.Printf("%s[antigravity-native] Native resume failed for %s — replaying bounded transcript%s\n",
 			colorYellow, id, colorReset)
 		session.NativeConversationID = ""
@@ -535,10 +541,13 @@ func (m *AntigravityNativeManager) Send(id, text string, publishFn PublishFunc, 
 				"Antigravity replay output exceeded the maximum capture size")
 		}
 		outText, errText, exitCode = out2, err2, exit2
+		runErr = nil
 		usedReplay = true
 		needCapture = true
 		// Non-zero exit after replay is handled by the unified exit-code gate
 		// below (including stdout-bearing diagnostics such as auth/quota).
+	} else if runErr != nil {
+		return m.publishTurnError(session, publishFn, runErr.Error())
 	}
 
 	// After missing-conversation replay is handled, remaining non-zero exits
@@ -655,7 +664,7 @@ func killAntigravityProcessTree(cmd *exec.Cmd) {
 	_ = killProcessGroup(pid)
 }
 
-// runOneShot spawns one `agy --print` process, drains stdout/stderr concurrently
+// runOneShot spawns one stream-json `agy` process, drains stdout/stderr concurrently
 // (required to avoid pipe deadlock), and waits for exit. Does not publish frames.
 // containedCwd resolves symlinks on cwd and, when workspaceRoot is set,
 // verifies the resolved cwd stays inside the resolved root, returning the real
@@ -697,9 +706,14 @@ func (m *AntigravityNativeManager) runOneShot(
 	// Unattended remote chat cannot answer local permission prompts — see
 	// package threat-model comment. Same prefix the approval gate displays
 	// (buildAntigravityNativeGateArgs) so the two never drift.
-	args := append(antigravityDangerousFlags(), buildAntigravityNativeArgs(prompt, nativeID)...)
+	args := append(antigravityDangerousFlags(), buildAntigravityNativeArgs(nativeID)...)
 
 	cmd := exec.Command(executable, args...)
+	stdinLine := antigravityStreamUserMessage(prompt)
+	// cmd.Stdin is copied through an OS pipe by os/exec after Start. The prompt
+	// never appears in argv or process listings, and strings.Reader lets the
+	// exec package close the child pipe at EOF so this remains a one-shot turn.
+	cmd.Stdin = strings.NewReader(stdinLine + "\n")
 	// Setsid on unix (hides the console window on Windows) so agy becomes its own
 	// process-group leader. A tool `agy` spawns can outlive it and keep the stdout/
 	// stderr pipes open past the timeout; because the unix orphan scanner is a
@@ -787,7 +801,28 @@ func (m *AntigravityNativeManager) runOneShot(
 	// partial stderr is still published (redacted) for diagnostics.
 	out := ""
 	if stdoutBuf != nil {
-		out = strings.TrimSpace(stdoutBuf.b.String())
+		rawOut := strings.TrimSpace(stdoutBuf.b.String())
+		if !stdoutBuf.trunc && !timedOutFlag.Load() {
+			if rawOut == "" && exitCode == 0 {
+				return "", "", exitCode, false, false, fmt.Errorf("Antigravity stream ended without a result event")
+			}
+			if rawOut != "" {
+				parsed, parseErr := antigravityStreamResultText(rawOut)
+				if parseErr != nil {
+					// A failed/older CLI may print a plain-text diagnostic before
+					// exiting non-zero. Preserve it for the normal exit-code error
+					// path; successful runs must honor the stream-json contract.
+					if exitCode == 0 {
+						return parsed, "", exitCode, false, false, parseErr
+					}
+					out = rawOut
+				} else {
+					out = parsed
+				}
+			}
+		} else {
+			out = rawOut
+		}
 	}
 	errOut := ""
 	if stderrBuf != nil {
@@ -1096,16 +1131,12 @@ func antigravityNativeEnvelopePublishable(msg resultMsg) error {
    Arg / env builders
    -------------------------------------------------------------------------- */
 
-// buildAntigravityNativeArgs builds argv for one native-chat turn.
-// Prompt is always the value of --print (agy 1.1.x). Native ID, when set,
-// is passed via --conversation. --continue is never emitted.
-//
-// Session one-shot (buildAntigravityInteractiveArgs) uses the same
-// --print <prompt> adjacency for generic terminal / feature-agent kicks.
-func buildAntigravityNativeArgs(prompt, nativeConversationID string) []string {
-	args := make([]string, 0, 6)
-	// --print takes the prompt as its value (verified agy 1.1.2).
-	args = append(args, "--print", prompt)
+// buildAntigravityNativeArgs builds argv for one native-chat turn. The prompt
+// is intentionally absent: agy 1.1.15+ reads it as an NDJSON user event from
+// stdin. Native ID, when set, is passed via --conversation; --continue is never
+// emitted because it can resume an unrelated local conversation.
+func buildAntigravityNativeArgs(nativeConversationID string) []string {
+	args := []string{"--input-format", "stream-json", "--output-format", "stream-json"}
 	if nativeConversationID != "" {
 		// Exact-ID resume only — never --continue.
 		args = append(args, "--conversation", nativeConversationID)
@@ -1115,11 +1146,72 @@ func buildAntigravityNativeArgs(prompt, nativeConversationID string) []string {
 
 // buildAntigravityNativeGateArgs returns the argv shape the approval dialog and
 // allowlist gate should match: exactly what runOneShot spawns for a first turn
-// (--dangerously-skip-permissions prepended, prompt placeholder). Kept here so
+// (--dangerously-skip-permissions prepended; prompt is on stdin). Kept here so
 // the gate and the real launch never drift — a narrowed allowlist must approve
 // the permission-skipping flag it will actually run with.
 func buildAntigravityNativeGateArgs() []string {
-	return append(antigravityDangerousFlags(), buildAntigravityNativeArgs("<prompt>", "")...)
+	return append(antigravityDangerousFlags(), buildAntigravityNativeArgs("")...)
+}
+
+// antigravityStreamUserMessage returns one protocol-compliant NDJSON input
+// line. jsonEscapeString preserves the prompt after JSON decoding while safely
+// escaping newlines, quotes, and backslashes.
+func antigravityStreamUserMessage(prompt string) string {
+	return fmt.Sprintf(`{"event":"user","message":{"content":%s}}`, jsonEscapeString(prompt))
+}
+
+// antigravityStreamResultText extracts the complete current-turn response from
+// agy's terminal result event. Step updates are deliberately ignored here: the
+// native manager publishes one complete response, matching its prior text-mode
+// contract. On an ERROR result the CLI's error is returned as an error so
+// runOneShot and Send fail the turn rather than publishing success.
+func antigravityStreamResultText(output string) (string, error) {
+	if strings.TrimSpace(output) == "" {
+		return "", fmt.Errorf("Antigravity stream ended without a result event")
+	}
+
+	var resultText string
+	var resultErr error
+	found := false
+	for lineNo, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var event struct {
+			Event  string `json:"event"`
+			Result *struct {
+				Status   string `json:"status"`
+				Response string `json:"response"`
+				Error    string `json:"error"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			return "", fmt.Errorf("invalid Antigravity stream-json on line %d: %w", lineNo+1, err)
+		}
+		if event.Event != "result" || event.Result == nil {
+			continue
+		}
+		found = true
+		if strings.EqualFold(event.Result.Status, "ERROR") {
+			errMsg := strings.TrimSpace(event.Result.Error)
+			if errMsg == "" {
+				errMsg = "Antigravity turn failed"
+			}
+			resultErr = fmt.Errorf("%s", errMsg)
+			resultText = errMsg
+		} else {
+			resultText = event.Result.Response
+			resultErr = nil
+		}
+	}
+	if !found {
+		return "", fmt.Errorf("Antigravity stream ended without a result event")
+	}
+	if resultErr != nil {
+		return resultText, resultErr
+	}
+	return strings.TrimSpace(resultText), nil
 }
 
 // antigravityDangerousFlags is the prefix runOneShot prepends before the
@@ -1461,8 +1553,8 @@ func buildAntigravityReplayPrompt(transcript []antigravityTurn, newUserText stri
 
 	// If preamble + current turn alone cannot fit the send limit, return that
 	// oversized prompt so Send / recovery fail closed instead of rewriting the
-	// user request. (Raw Send already rejects bare prompts > 24KB; preamble
-	// overhead can still push a near-limit prompt over.)
+	// user request. (Raw Send already rejects bare prompts at the configured
+	// memory bound; preamble overhead can still push a near-limit prompt over.)
 	if len(final) > budget {
 		return preamble + final
 	}
@@ -1501,8 +1593,8 @@ type limitedBuffer struct {
 
 func captureLimited(r io.Reader, limit int) *limitedBuffer {
 	lb := &limitedBuffer{limit: limit}
-	// Byte-oriented read (not line Scanner): agy --print is complete-only text
-	// and may emit long lines; Scanner would reject oversized tokens.
+	// Byte-oriented read (not line Scanner): stream-json events may contain long
+	// lines; Scanner would reject oversized tokens.
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := r.Read(buf)

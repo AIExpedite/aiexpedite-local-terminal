@@ -1,8 +1,8 @@
 // session_integration_test.go
 // -----------------------------------------------------------------------------
-// End-to-end lifecycle tests for SessionManager + the 3 CLI flows
-// (claude / codex). Uses the test binary itself as a mock CLI so we
-// don't need claude / codex installed on the test host and so we get
+// End-to-end lifecycle tests for SessionManager CLI flows. Uses the test binary
+// itself as a mock CLI so we don't need the agents installed on the test host
+// and so we get
 // deterministic timing.
 //
 // The mock CLI is dispatched by the TEST_MOCK_CLI_MODE env var inside TestMain.
@@ -73,9 +73,10 @@ func TestMain(m *testing.M) {
 //
 //   - claude: read NDJSON on stdin, emit stream_event content_block_deltas,
 //     then a final result event. Exit when stdin closes.
-//   - codex:  print streaming events including item.completed,
-//     thread.completed, then exit. Prompt is in argv (we don't actually use
-//     it — the mock has fixed output).
+//   - codex:  read the raw prompt from stdin, print streaming events including
+//     item.completed / thread.completed, then exit.
+//   - antigravity: read an NDJSON user event from stdin, emit step_update and
+//     terminal result events, then exit.
 //   - sleep-then-emit: emit the events AFTER a delay so we can test stream
 //     completion ordering under load.
 func runMockCLI(mode string) {
@@ -140,6 +141,28 @@ func runMockCLI(mode string) {
 		fmt.Println(`{"type":"turn.started","turn_id":"r-1"}`)
 		fmt.Printf(`{"type":"item.completed","item":{"type":"agent_message","text":"echo: %s"}}`+"\n", prompt)
 		fmt.Println(`{"type":"turn.completed"}`)
+		os.Exit(0)
+
+	case "antigravity-stream-stdin":
+		data, _ := io.ReadAll(os.Stdin)
+		var input struct {
+			Event   string `json:"event"`
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal(bytes.TrimSpace(data), &input); err != nil || input.Event != "user" {
+			fmt.Println(`{"event":"result","result":{"status":"ERROR","error":"invalid stdin envelope"}}`)
+			os.Exit(1)
+		}
+		marker := fmt.Sprintf("antigravity received %d bytes", len(input.Message.Content))
+		encodedMarker, _ := json.Marshal(marker)
+		fmt.Printf(`{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":%s}}`+"\n", encodedMarker)
+		fmt.Printf(`{"event":"result","result":{"status":"SUCCESS","response":%s}}`+"\n", encodedMarker)
+		os.Exit(0)
+
+	case "antigravity-diagnostic":
+		fmt.Println("agy version 1.2.3")
 		os.Exit(0)
 
 	case "stream-burst":
@@ -567,6 +590,50 @@ func TestSessionLifecycle_Codex(t *testing.T) {
 	streamText := concatStreamOutput(messages)
 	if !strings.Contains(streamText, "hello from codex") {
 		t.Errorf("expected stream output to contain agent_message text; got %q", streamText)
+	}
+}
+
+func TestSessionLifecycle_AntigravityLongPromptViaStdin(t *testing.T) {
+	prompt := strings.Repeat("review \\\"quoted\\\" path C:\\\\repo\\n", 5000)
+	_, messages, err := captureSession(t, "antigravity-stream-stdin", "agy", []string{prompt}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+
+	assertLifecycleOrdering(t, messages)
+	want := fmt.Sprintf("antigravity received %d bytes", len(prompt))
+	if streamText := concatStreamOutput(messages); !strings.Contains(streamText, want) {
+		t.Fatalf("long prompt did not arrive intact over Antigravity stdin: got %q, want %q", streamText, want)
+	}
+}
+
+func TestSessionLifecycle_AntigravityExplicitEmptyPrompt(t *testing.T) {
+	_, messages, err := captureSession(t, "antigravity-stream-stdin", "agy", []string{"--print="}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+
+	assertLifecycleOrdering(t, messages)
+	want := "antigravity received 0 bytes"
+	if streamText := concatStreamOutput(messages); !strings.Contains(streamText, want) {
+		t.Fatalf("empty prompt did not arrive intact over Antigravity stdin: got %q, want %q", streamText, want)
+	}
+}
+
+func TestSessionLifecycle_AntigravityDiagnosticWithoutResultStaysSuccessful(t *testing.T) {
+	_, messages, err := captureSession(t, "antigravity-diagnostic", "agy", []string{"--version"}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+
+	assertLifecycleOrdering(t, messages)
+	if streamText := concatStreamOutput(messages); !strings.Contains(streamText, "agy version 1.2.3") {
+		t.Fatalf("diagnostic output missing: got %q", streamText)
+	}
+	for _, message := range messages {
+		if message.Type == "session_ended" && message.ExitCode != 0 {
+			t.Fatalf("successful Antigravity diagnostic exit code = %d, want 0", message.ExitCode)
+		}
 	}
 }
 
