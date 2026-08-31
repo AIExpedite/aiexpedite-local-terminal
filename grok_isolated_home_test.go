@@ -168,12 +168,8 @@ func TestRemoveIsolatedGrokHome_KeepsStoreWhenUnlinkFails(t *testing.T) {
 	persisted := writeTestGrokTranscript(t, store)
 	sibling := filepath.Join(home, "config.toml")
 
-	originalUnlink := grokUnlinkDir
-	t.Cleanup(func() { grokUnlinkDir = originalUnlink })
 	syntheticErr := errors.New("synthetic unlink failure")
-	grokUnlinkDir = func(string) error { return syntheticErr }
-	err = removeIsolatedGrokHome(home)
-	grokUnlinkDir = originalUnlink
+	err = removeIsolatedGrokHomeWithUnlink(home, func(string) error { return syntheticErr })
 
 	if !errors.Is(err, syntheticErr) {
 		t.Fatalf("removeIsolatedGrokHome error = %v, want synthetic unlink failure", err)

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -107,11 +108,11 @@ func TestUnlinkGrokDirectory_RemovesSymlinkWithoutDeletingTarget(t *testing.T) {
 	}
 }
 
-func commandEnvValue(cmd interface{ Environ() []string }, key string) string {
-	prefix := key + "="
-	for _, value := range cmd.Environ() {
-		if strings.EqualFold(value[:min(len(value), len(prefix))], prefix) {
-			return strings.TrimPrefix(value, value[:len(prefix)])
+func commandEnvValue(cmd *exec.Cmd, key string) string {
+	for _, entry := range cmd.Env {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok && strings.EqualFold(name, key) {
+			return value
 		}
 	}
 	return ""

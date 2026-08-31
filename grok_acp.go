@@ -451,7 +451,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// browser OAuth or the first-frame watchdog for a missing login.
 	authAssessment := assessIsolatedGrokLaunch(isolatedHome, time.Now(), opts.AllowAPIKeyFallback, resolvedModel)
 	if !authAssessment.Authenticated {
-		_ = removeIsolatedGrokHome(isolatedHome)
+		cleanupIsolatedGrokHome(isolatedHome, id)
 		reason := authAssessment.Reason
 		if reason == "" {
 			reason = "Grok is not signed in on this computer — run `grok login` on the terminal computer to authenticate."
@@ -473,30 +473,30 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	env = setEnvVar(env, "GROK_HOME", isolatedHome)
 	proc.Env = env
 
-	// cleanupIsolatedHome removes the per-session temp dir on any pre-spawn
+	// cleanupFailedStart removes the per-session temp dir on any pre-spawn
 	// failure path. Once the child is successfully started, ownership of the
 	// dir transfers to waitForExit (which removes it after the process exits),
 	// so we must NOT call this after a successful proc.Start().
-	cleanupIsolatedHome := func() {
-		_ = removeIsolatedGrokHome(isolatedHome)
+	cleanupFailedStart := func() {
+		cleanupIsolatedGrokHome(isolatedHome, id)
 	}
 
 	stdin, err := proc.StdinPipe()
 	if err != nil {
-		cleanupIsolatedHome()
+		cleanupFailedStart()
 		return fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
 	stdout, err := proc.StdoutPipe()
 	if err != nil {
 		stdin.Close()
-		cleanupIsolatedHome()
+		cleanupFailedStart()
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 	stderr, err := proc.StderrPipe()
 	if err != nil {
 		stdin.Close()
 		stdout.Close()
-		cleanupIsolatedHome()
+		cleanupFailedStart()
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
@@ -504,7 +504,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		stdin.Close()
 		stdout.Close()
 		stderr.Close()
-		cleanupIsolatedHome()
+		cleanupFailedStart()
 		return fmt.Errorf("failed to start grok agent stdio (is `grok` on PATH or in ~/.grok/bin? run `grok login` to authenticate): %w", err)
 	}
 
@@ -1282,10 +1282,7 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	// session because waitForExit fires exactly once. Best-effort: a leftover
 	// temp dir is harmless and the OS temp reaper will eventually collect it.
 	if session.IsolatedHome != "" {
-		if err := removeIsolatedGrokHome(session.IsolatedHome); err != nil {
-			fmt.Printf("%s[grok-acp] isolated home cleanup failed for %s: %v%s\n",
-				colorYellow, session.ID, err, colorReset)
-		}
+		cleanupIsolatedGrokHome(session.IsolatedHome, session.ID)
 	}
 
 	fmt.Printf("%s[grok-acp] Session %s ended (exit code: %d)%s\n",

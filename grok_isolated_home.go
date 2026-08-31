@@ -7,10 +7,6 @@ import (
 	"path/filepath"
 )
 
-// grokUnlinkDir is a test seam for the one destructive boundary in isolated
-// home teardown. Production always uses the verified, junction-aware unlink.
-var grokUnlinkDir = unlinkGrokDirectory
-
 // setupIsolatedGrokHome creates a per-session temp dir to use as the child's
 // GROK_HOME and seeds it with the minimum surfaces the CLI needs:
 //
@@ -83,8 +79,8 @@ func setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback bool, runtimeMode
 				continue
 			}
 			if werr := os.WriteFile(filepath.Join(dir, name), data, 0o600); werr != nil {
-				_ = removeIsolatedGrokHome(dir)
-				return "", fmt.Errorf("copy grok auth file %s: %w", name, werr)
+				cleanupErr := removeIsolatedGrokHome(dir)
+				return "", errors.Join(fmt.Errorf("copy grok auth file %s: %w", name, werr), cleanupErr)
 			}
 		}
 	}
@@ -120,8 +116,8 @@ func setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback bool, runtimeMode
 		}
 	}
 	if werr := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cfg), 0o600); werr != nil {
-		_ = removeIsolatedGrokHome(dir)
-		return "", fmt.Errorf("write isolated config.toml: %w", werr)
+		cleanupErr := removeIsolatedGrokHome(dir)
+		return "", errors.Join(fmt.Errorf("write isolated config.toml: %w", werr), cleanupErr)
 	}
 
 	if linkSessionStore {
@@ -145,12 +141,16 @@ func setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback bool, runtimeMode
 // it leaves the home and sessions entry in place and removes only siblings;
 // leaking a small temp directory is safer than risking persistent transcripts.
 func removeIsolatedGrokHome(home string) error {
+	return removeIsolatedGrokHomeWithUnlink(home, unlinkGrokDirectory)
+}
+
+func removeIsolatedGrokHomeWithUnlink(home string, unlink func(string) error) error {
 	if home == "" {
 		return nil
 	}
 
 	link := filepath.Join(home, grokSessionsDirName)
-	if err := grokUnlinkDir(link); err != nil {
+	if err := unlink(link); err != nil {
 		if errors.Is(err, errGrokStoreNotLinked) {
 			fmt.Printf("%s[grok-acp] conversation store was never linked; resume will cold-start%s\n",
 				colorYellow, colorReset)
@@ -162,6 +162,16 @@ func removeIsolatedGrokHome(home string) error {
 	}
 
 	return os.RemoveAll(home)
+}
+
+// cleanupIsolatedGrokHome is the non-fatal lifecycle wrapper used once a
+// caller already has a primary result to return or publish. It keeps cleanup
+// failures observable without changing session/auth error semantics.
+func cleanupIsolatedGrokHome(home, sessionID string) {
+	if err := removeIsolatedGrokHome(home); err != nil {
+		fmt.Printf("%s[grok-acp] isolated home cleanup failed for %s: %v%s\n",
+			colorYellow, sessionID, err, colorReset)
+	}
 }
 
 func removeIsolatedGrokHomeSiblings(home string) error {
