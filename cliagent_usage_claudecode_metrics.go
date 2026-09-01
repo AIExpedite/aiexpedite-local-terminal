@@ -460,9 +460,10 @@ func latestClaudeObservation(buckets map[string]claudeRateLimitBucket) time.Time
 }
 
 // stalestClaudeRowObservation returns the age of the snapshot as the DISPLAYED
-// CARD sees it: the oldest "freshest reading" across the three rows
-// claudeCodeMetricsFromBuckets emits, rather than the newest reading anywhere in
-// the cache.
+// CARD sees it: the oldest of the observations the three rows
+// claudeCodeMetricsFromBuckets emits actually SHOW, rather than the newest
+// reading anywhere in the cache. Per row it asks claudeRowObservationsMs, which
+// reads the emitted metric rather than re-deriving which bucket the row picked.
 //
 // Why not latestClaudeObservation: the writers cover different windows. Claude's
 // status-line payload carries only `five_hour` and `seven_day` (see
@@ -494,25 +495,18 @@ func latestClaudeObservation(buckets map[string]claudeRateLimitBucket) time.Time
 //
 // A zero return means "nothing observed" — the same "probe if you can" answer
 // latestClaudeObservation gives for an empty cache.
-func stalestClaudeRowObservation(view claudeRateLimitView) time.Time {
-	buckets := view.buckets
+func stalestClaudeRowObservation(view claudeRateLimitView, now time.Time) time.Time {
 	probedAt := view.probeObservedAtMs()
-	rows := [][]string{
-		{claudeWindowFiveHour},
-		claudeWeeklyWindowIDs(),
-		claudeFableWindowIDs(buckets),
-	}
 	stalest := int64(0)
-	for _, ids := range rows {
-		freshest := freshestClaudeRowObservation(buckets, ids)
-		if freshest <= 0 {
+	for _, displayed := range claudeRowObservationsMs(view.buckets, now) {
+		if displayed <= 0 {
 			continue // never observed — see the doc comment
 		}
-		if probedAt > 0 && freshest < probedAt {
+		if probedAt > 0 && displayed < probedAt {
 			continue // our own probe cannot supply this row
 		}
-		if stalest == 0 || freshest < stalest {
-			stalest = freshest
+		if stalest == 0 || displayed < stalest {
+			stalest = displayed
 		}
 	}
 	if stalest <= 0 {
@@ -521,23 +515,42 @@ func stalestClaudeRowObservation(view claudeRateLimitView) time.Time {
 	return time.UnixMilli(stalest).UTC()
 }
 
-// freshestClaudeRowObservation returns the newest observed reading among one
-// row's candidate windows, in epoch ms, or 0 when the row holds none.
-// Heartbeat-only buckets are skipped for the same reason latestClaudeObservation
-// skips them: their ObservedAtMs records when a reset was seen, not when a
-// percentage was measured.
-func freshestClaudeRowObservation(buckets map[string]claudeRateLimitBucket, windowIDs []string) int64 {
-	newest := int64(0)
-	for _, id := range windowIDs {
-		b, ok := buckets[id]
-		if !ok || !b.hasObservedUsage() {
-			continue
-		}
-		if b.ObservedAtMs > newest {
-			newest = b.ObservedAtMs
-		}
+// claudeRowObservationsMs returns, for each row the card shows, the instant that
+// row's DISPLAYED reading was taken, in epoch ms — 0 for a row showing none.
+//
+// It reads the emitted metrics rather than recomputing a per-row "newest
+// observed candidate", because WHICH bucket a row displays is a decision
+// aggregateWeeklyMetric and observedMetricOrUnknown make, and a second copy of
+// that decision here would drift from it. It already had: the weekly row shows
+// the CONSTRAINING bucket — the worst percentage, and ITS ObservedAt — so a
+// per-model Opus reading stuck at 90% is what the card displays even while
+// status-line renders keep the unified seven_day bucket fresh at 20%. A
+// newest-across-candidates freshness check called that row fresh on every
+// gather, suppressed the probe for the full staleness TTL, and left the visible
+// value hours old indefinitely. Freshness has to follow the bucket that actually
+// determines the row.
+func claudeRowObservationsMs(buckets map[string]claudeRateLimitBucket, now time.Time) []int64 {
+	metrics := claudeCodeMetricsFromBuckets(buckets, now)
+	out := make([]int64, 0, len(metrics))
+	for _, m := range metrics {
+		out = append(out, observedAtMsFromRFC3339(m.ObservedAt))
 	}
-	return newest
+	return out
+}
+
+// observedAtMsFromRFC3339 is observedAtRFC3339's inverse: it recovers the epoch
+// ms behind a metric's ObservedAt, or 0 when the row carries none. Both halves
+// use RFC3339Nano, so a stamp written by observedAtRFC3339 round-trips exactly —
+// including the millisecond precision the freshness comparisons depend on.
+func observedAtMsFromRFC3339(observedAt string) int64 {
+	if observedAt == "" {
+		return 0
+	}
+	t, err := time.Parse(time.RFC3339Nano, observedAt)
+	if err != nil {
+		return 0
+	}
+	return t.UnixMilli()
 }
 
 // latestClaudeProbeObservation returns the newest reading the PROBE itself still

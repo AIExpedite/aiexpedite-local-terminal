@@ -431,7 +431,7 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// has already shown it cannot supply, are excluded there so this can never
 	// become a per-gather probe loop.
 	view := loadMergedClaudeRateLimitView(usage.AccountFingerprint)
-	if refreshClaudeUsageIfStale(ctx, now, claudeSnapshotFreshness(view), oauthAccessToken, usage.AccountFingerprint) {
+	if refreshClaudeUsageIfStale(ctx, now, claudeSnapshotFreshness(view, now), oauthAccessToken, usage.AccountFingerprint) {
 		view = loadMergedClaudeRateLimitView(usage.AccountFingerprint)
 	}
 	usage.Metrics = claudeCodeMetricsFromBuckets(view.buckets, now)

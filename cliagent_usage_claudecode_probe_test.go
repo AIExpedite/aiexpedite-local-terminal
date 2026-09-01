@@ -661,8 +661,48 @@ func TestStalestClaudeRowObservation_FreshRowCannotMaskAStaleOne(t *testing.T) {
 	if got := latestClaudeObservation(buckets); !got.Equal(fresh.UTC()) {
 		t.Fatalf("precondition: latestClaudeObservation=%v, want the fresh row %v", got, fresh.UTC())
 	}
-	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: buckets}); !got.Equal(stale.UTC()) {
+	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: buckets}, now); !got.Equal(stale.UTC()) {
 		t.Errorf("stalestClaudeRowObservation=%v, want the stale weekly row %v", got, stale.UTC())
+	}
+}
+
+// Freshness has to follow the bucket the row actually DISPLAYS, not the newest
+// bucket the row could have drawn from. aggregateWeeklyMetric shows the
+// CONSTRAINING weekly window — the worst percentage, and its ObservedAt — so a
+// per-model Opus reading stuck at 90% is what the card renders even while
+// status-line updates keep the unified seven_day bucket fresh at 20%. Ranking
+// the row by its newest candidate declared that row fresh on every gather,
+// suppressed the probe, and left the visible value hours old indefinitely.
+func TestStalestClaudeRowObservation_FollowsTheConstrainingWeeklyBucket(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	fresh := now.Add(-10 * time.Second)
+	stale := now.Add(-6 * time.Hour)
+	weeklyReset := now.Add(96 * time.Hour).UnixMilli()
+	buckets := map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			ObservedAtMs: fresh.UnixMilli(), UsageObserved: usageObservedPtr(true),
+		},
+		// What the status line keeps refreshing.
+		claudeWindowSevenDay: {
+			UsedPercentage: 20, ResetsAtMs: weeklyReset,
+			ObservedAtMs: fresh.UnixMilli(), UsageObserved: usageObservedPtr(true),
+		},
+		// What the card actually shows for the weekly row, hours old.
+		claudeWindowSevenDayOpus: {
+			UsedPercentage: 90, ResetsAtMs: weeklyReset,
+			ObservedAtMs: stale.UnixMilli(), UsageObserved: usageObservedPtr(true),
+		},
+	}
+
+	weekly := aggregateWeeklyMetric(buckets, now)
+	if weekly.ObservedAt != observedAtRFC3339(stale.UnixMilli()) {
+		t.Fatalf("precondition: weekly row displays ObservedAt=%q, want the constraining Opus reading %q",
+			weekly.ObservedAt, observedAtRFC3339(stale.UnixMilli()))
+	}
+	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: buckets}, now); !got.Equal(stale.UTC()) {
+		t.Errorf("stalestClaudeRowObservation=%v, want the displayed weekly reading %v — a fresher unified bucket the row does not show must not pass for it",
+			got, stale.UTC())
 	}
 }
 
@@ -687,11 +727,11 @@ func TestStalestClaudeRowObservation_UnobservedRowIsNotStale(t *testing.T) {
 			ObservedAtMs: now.UnixMilli(), UsageObserved: usageObservedPtr(false),
 		},
 	}
-	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: buckets}); !got.Equal(observed.UTC()) {
+	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: buckets}, now); !got.Equal(observed.UTC()) {
 		t.Errorf("stalestClaudeRowObservation=%v, want %v (an unobserved row must not pin the snapshot stale)",
 			got, observed.UTC())
 	}
-	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: map[string]claudeRateLimitBucket{}}); !got.IsZero() {
+	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: map[string]claudeRateLimitBucket{}}, now); !got.IsZero() {
 		t.Errorf("empty cache should report the zero time, got %v", got)
 	}
 }
@@ -719,7 +759,7 @@ func TestStalestClaudeRowObservation_ExcludesRowsTheProbeCannotSupply(t *testing
 		},
 		claudeWindowSevenDayFable: orphan,
 	}
-	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: probed}); !got.Equal(probedAt.UTC()) {
+	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: probed}, probedAt); !got.Equal(probedAt.UTC()) {
 		t.Errorf("stalestClaudeRowObservation=%v, want the probe's own instant %v", got, probedAt.UTC())
 	}
 
@@ -732,7 +772,7 @@ func TestStalestClaudeRowObservation_ExcludesRowsTheProbeCannotSupply(t *testing
 		},
 		claudeWindowSevenDayFable: orphan,
 	}
-	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: never}); !got.Equal(old.UTC()) {
+	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: never}, probedAt); !got.Equal(old.UTC()) {
 		t.Errorf("stalestClaudeRowObservation=%v, want the 48h-old row %v while no probe is on record", got, old.UTC())
 	}
 }
@@ -776,7 +816,7 @@ func TestStalestClaudeRowObservation_ProbeEvidenceSurvivesStatusLineOverwrite(t 
 	if view.probedAtMs != probedAt.UnixMilli() {
 		t.Fatalf("precondition: view.probedAtMs=%d, want the probe instant %d", view.probedAtMs, probedAt.UnixMilli())
 	}
-	if got := stalestClaudeRowObservation(view); !got.Equal(probedAt.UTC()) {
+	if got := stalestClaudeRowObservation(view, now); !got.Equal(probedAt.UTC()) {
 		t.Fatalf("precondition: stalestClaudeRowObservation=%v, want the probe instant %v (Fable excluded)", got, probedAt.UTC())
 	}
 
@@ -799,7 +839,7 @@ func TestStalestClaudeRowObservation_ProbeEvidenceSurvivesStatusLineOverwrite(t 
 	if view.probedAtMs != probedAt.UnixMilli() {
 		t.Errorf("view.probedAtMs=%d, want the probe instant %d preserved across the render", view.probedAtMs, probedAt.UnixMilli())
 	}
-	if got := stalestClaudeRowObservation(view); !got.Equal(now.UTC()) {
+	if got := stalestClaudeRowObservation(view, now); !got.Equal(now.UTC()) {
 		t.Errorf("stalestClaudeRowObservation=%v, want %v — the 48h Fable row is one the probe already showed it cannot supply, so it must not make the snapshot stale again",
 			got, now.UTC())
 	}
@@ -863,7 +903,7 @@ func TestClaudeUsageProbeObservedSince_StatusLineRenderCannotCoverAStaleWeeklyRo
 		},
 	}, stale, "", claudeRateLimitSourceStream)
 
-	if claudeUsageProbeObservedSince("", now.Add(-time.Minute)) {
+	if claudeUsageProbeObservedSince("", now.Add(-time.Minute), now) {
 		t.Error("a status-line render must not stand in for the weekly row it cannot refresh")
 	}
 }
