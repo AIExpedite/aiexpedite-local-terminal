@@ -1970,26 +1970,67 @@ func normalizeGrokSemanticKey(key string) string {
 }
 
 func walkGrokSystemConfigSemantic(value any, path []string, finding *grokSystemSemanticFinding) {
+	walkGrokSystemConfigSemanticScoped(value, path, false, finding)
+}
+
+// walkGrokSystemConfigSemanticScoped carries whether the current node lives
+// underneath an explicitly disabled definition. Grok keeps a disabled server or
+// plugin's full body in place — `[mcp_servers.foo]` with `enabled = false` still
+// declares its command/args/env — so descending without that context makes every
+// retained leaf look like a live tool and refuses maintenance smokes on hosts
+// where nothing can actually load. Only the tool-category classification is
+// suppressed; credential, provider, approval, and telemetry findings still fail
+// closed inside a disabled block because those values remain readable.
+func walkGrokSystemConfigSemanticScoped(value any, path []string, withinDisabled bool, finding *grokSystemSemanticFinding) {
 	switch node := value.(type) {
 	case map[string]any:
 		for rawKey, child := range node {
 			key := normalizeGrokSemanticKey(rawKey)
 			childPath := append(append([]string(nil), path...), key)
-			classifyGrokSystemSemanticValue(childPath, child, finding)
-			walkGrokSystemConfigSemantic(child, childPath, finding)
+			classifyGrokSystemSemanticValue(childPath, child, withinDisabled, finding)
+			walkGrokSystemConfigSemanticScoped(child, childPath, withinDisabled || grokSemanticDefinitionDisabled(child), finding)
 		}
 	case []map[string]any:
 		for _, child := range node {
-			walkGrokSystemConfigSemantic(child, path, finding)
+			walkGrokSystemConfigSemanticScoped(child, path, withinDisabled || grokSemanticDefinitionDisabled(child), finding)
 		}
 	case []any:
 		for _, child := range node {
-			walkGrokSystemConfigSemantic(child, path, finding)
+			walkGrokSystemConfigSemanticScoped(child, path, withinDisabled || grokSemanticDefinitionDisabled(child), finding)
 		}
 	}
 }
 
-func classifyGrokSystemSemanticValue(path []string, value any, finding *grokSystemSemanticFinding) {
+// grokSemanticDefinitionDisabled reports whether a configuration table carries an
+// explicit boolean disablement (`enabled = false` / `disabled = true`). Only a
+// literal boolean counts: Grok's managed layers support environment expansion, so
+// `enabled = "$FLAG"` cannot be proven disabled lexically and must keep failing
+// closed.
+func grokSemanticDefinitionDisabled(value any) bool {
+	node, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	for rawKey, child := range node {
+		flag, isBool := child.(bool)
+		if !isBool {
+			continue
+		}
+		switch normalizeGrokSemanticKey(rawKey) {
+		case "enabled":
+			if !flag {
+				return true
+			}
+		case "disabled":
+			if flag {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func classifyGrokSystemSemanticValue(path []string, value any, withinDisabled bool, finding *grokSystemSemanticFinding) {
 	if len(path) == 0 {
 		return
 	}
@@ -2043,6 +2084,12 @@ func classifyGrokSystemSemanticValue(path []string, value any, finding *grokSyst
 	}
 	if grokSemanticPermissionRulesPath(path) && semanticGrokPermissionRulesHasAllow(value) {
 		finding.permissiveApproval = true
+	}
+
+	if withinDisabled {
+		// Everything below decides whether a tool can load, and an ancestor has
+		// already answered that with an explicit disablement.
+		return
 	}
 
 	if grokSemanticVendorMCPPath(path) {
@@ -2242,6 +2289,11 @@ func semanticGrokToolEnabled(value any) bool {
 		return false
 	case map[string]any:
 		if len(node) == 0 {
+			return false
+		}
+		if grokSemanticDefinitionDisabled(node) {
+			// A retained definition body (command/args/env/path) does not make a
+			// disabled entry loadable; the explicit flag outranks its siblings.
 			return false
 		}
 		hasExplicitEnablement := false

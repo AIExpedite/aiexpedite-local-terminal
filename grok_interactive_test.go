@@ -503,6 +503,14 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 		{"empty plugins enabled array inline", "plugins = { enabled = [] }\n"},
 		{"empty plugins enabled array section", "[plugins]\nenabled = []\n"},
 		{"disabled plugins section", "[plugins]\nenabled = false\n"},
+		// A disabled entry keeps its full body in the managed layer; the flag,
+		// not the retained command/args/env/path, decides whether it can load.
+		{"disabled mcp server with retained command", "[mcp_servers.customer-secret-name]\nenabled = false\ncommand = 'raw-config-sentinel'\n"},
+		{"disabled mcp server with retained args", "[mcp_servers.customer-secret-name]\ndisabled = true\ncommand = 'raw-config-sentinel'\nargs = ['raw-config-sentinel']\n"},
+		{"inline disabled mcp server with retained command", `mcp_servers = { "customer-secret-name" = { enabled = false, command = "raw-config-sentinel" } }` + "\n"},
+		{"disabled mcp array entry with retained command", `mcps = [{ enabled = false, command = "raw-config-sentinel" }]` + "\n"},
+		{"disabled plugin with retained path", "[plugins.customer-secret-name]\nenabled = false\npath = 'raw-config-sentinel'\n"},
+		{"disabled vendor mcp parent", "[compat.cursor]\nenabled = false\nmcps = true\n"},
 	} {
 		t.Run(emptyConfig.name, func(t *testing.T) {
 			if err := os.WriteFile(managedPath, []byte(emptyConfig.body), 0o600); err != nil {
@@ -510,6 +518,57 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 			}
 			if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
 				t.Fatalf("empty/disabled tool configuration %q was unexpectedly rejected: %v", emptyConfig.body, err)
+			}
+		})
+	}
+
+	// Suppressing a disabled definition must not suppress its siblings, and an
+	// enablement that cannot be proven false lexically (environment expansion)
+	// must keep failing closed.
+	for _, live := range []struct {
+		name         string
+		body         string
+		wantCategory string
+	}{
+		{"enabled sibling of disabled mcp server", "[mcp_servers.disabled-one]\nenabled = false\ncommand = 'raw-config-sentinel'\n\n[mcp_servers.customer-secret-name]\ncommand = 'raw-config-sentinel'\n", "mcp"},
+		{"expanded mcp enablement", "[mcp_servers.customer-secret-name]\nenabled = '$MCP_ENABLE_SENTINEL'\ncommand = 'raw-config-sentinel'\n", "mcp"},
+		{"enabled plugin sibling of disabled plugin", "[plugins.disabled-one]\nenabled = false\npath = 'raw-config-sentinel'\n\n[plugins.customer-secret-name]\nenabled = true\npath = 'raw-config-sentinel'\n", "plugin"},
+	} {
+		t.Run(live.name, func(t *testing.T) {
+			if err := os.WriteFile(managedPath, []byte(live.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13")
+			if err == nil {
+				t.Fatalf("live tool configuration was accepted: %s", live.body)
+			}
+			if !strings.Contains(err.Error(), `"`+live.wantCategory+`"`) {
+				t.Fatalf("refusal %q omitted fixed category %q", err, live.wantCategory)
+			}
+			for _, secret := range []string{"raw-config-sentinel", "customer-secret-name", "customer_secret_name", "MCP_ENABLE_SENTINEL"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("refusal leaked %q: %v", secret, err)
+				}
+			}
+		})
+	}
+
+	// A disabled block still exposes readable credentials and provider
+	// overrides, so those findings keep failing closed independently of whether
+	// the definition can load a tool.
+	for _, sensitive := range []struct {
+		name string
+		body string
+	}{
+		{"credential inside disabled mcp server", "[mcp_servers.customer-secret-name]\nenabled = false\napi_key = 'credential-sentinel'\n"},
+		{"provider override inside disabled mcp server", "[mcp_servers.customer-secret-name]\nenabled = false\nbase_url = 'https://provider-sentinel.invalid'\n"},
+	} {
+		t.Run(sensitive.name, func(t *testing.T) {
+			if err := os.WriteFile(managedPath, []byte(sensitive.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err == nil {
+				t.Fatalf("sensitive value inside a disabled definition was accepted: %s", sensitive.body)
 			}
 		})
 	}
