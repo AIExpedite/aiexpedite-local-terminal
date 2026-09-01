@@ -372,6 +372,10 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return fmt.Errorf("cwd %q symlink resolution failed: %w", cwd, err)
 	}
 	resolvedRoot := resolvedCwd
+	args, err := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove)
+	if err != nil {
+		return err
+	}
 
 	// Hold the manager mutex across the entire spawn so two concurrent Start
 	// calls for the same id can't both pass the existence check and double-
@@ -408,7 +412,6 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return err
 	}
 
-	args := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove)
 	// args is `{"agent", "--model", <model>, ...}` by buildGrokACPArgs's
 	// validated contract (see grokACPDefaultModel block); pull args[2] so
 	// setupIsolatedGrokHome carries over the matching per-model api_key when
@@ -1405,8 +1408,11 @@ const grokACPDefaultModel = "grok-build"
 // supported channels instead: XAI_API_KEY env (preserved by sanitizeGrokACPEnv
 // when AllowAPIKeyFallback=true) and the persisted `[model] api_key` line that
 // setupIsolatedGrokHome copies into the isolated config.toml on the same gate.
-func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
-	model, sanitized := sanitizeGrokACPExtraArgs(extraArgs, grokACPDefaultModel, allowAlwaysApprove)
+func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) ([]string, error) {
+	model, sanitized, err := sanitizeGrokACPExtraArgs(extraArgs, grokACPDefaultModel, allowAlwaysApprove)
+	if err != nil {
+		return nil, err
+	}
 
 	args := []string{"agent", "--model", model}
 	if allowAlwaysApprove {
@@ -1417,7 +1423,7 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
 	// subcommand (constraint #2 above).
 	args = append(args, sanitized...)
 	args = append(args, "stdio")
-	return args
+	return args, nil
 }
 
 // setupIsolatedGrokHome creates a per-session temp dir to use as the child's
@@ -1463,6 +1469,18 @@ func setupIsolatedGrokHome(allowAPIKeyFallback bool, runtimeModel string) (strin
 }
 
 func setupIsolatedGrokHomeFrom(allowAPIKeyFallback bool, runtimeModel, srcBase string) (string, error) {
+	return setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback, runtimeModel, srcBase, true)
+}
+
+// setupIsolatedGrokSmokeHomeFrom creates the same auth-only, MCP-disabled home
+// as the ACP path without linking the user's persistent conversation store.
+// A one-shot maintenance smoke never resumes a conversation, so exposing that
+// store would add filesystem surface without serving the smoke contract.
+func setupIsolatedGrokSmokeHomeFrom(srcBase string) (string, error) {
+	return setupIsolatedGrokHomeWithSessionStore(false, "", srcBase, false)
+}
+
+func setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback bool, runtimeModel, srcBase string, linkSessionStore bool) (string, error) {
 	dir, err := os.MkdirTemp("", "grok-acp-home-")
 	if err != nil {
 		return "", fmt.Errorf("create isolated grok home: %w", err)
@@ -1520,16 +1538,18 @@ func setupIsolatedGrokHomeFrom(allowAPIKeyFallback bool, runtimeModel, srcBase s
 		return "", fmt.Errorf("write isolated config.toml: %w", werr)
 	}
 
-	// Point `sessions` at the persistent per-device conversation store. Grok
-	// keys transcripts by GROK_HOME, so without this the store dies with the
-	// temp dir and every cross-session `session/load` fails FS_NOT_FOUND (see
-	// grok_session_store.go). Non-fatal by design: a session with an
-	// ephemeral store still runs, it just cannot be reattached later.
-	if lerr := linkGrokSessionStore(dir); lerr != nil {
-		fmt.Printf("%s[grok-acp] conversation store not persisted (resume will cold-start): %v%s\n",
-			colorYellow, lerr, colorReset)
+	if linkSessionStore {
+		// Point `sessions` at the persistent per-device conversation store. Grok
+		// keys transcripts by GROK_HOME, so without this the store dies with the
+		// temp dir and every cross-session `session/load` fails FS_NOT_FOUND (see
+		// grok_session_store.go). Non-fatal by design: a session with an
+		// ephemeral store still runs, it just cannot be reattached later.
+		if lerr := linkGrokSessionStore(dir); lerr != nil {
+			fmt.Printf("%s[grok-acp] conversation store not persisted (resume will cold-start): %v%s\n",
+				colorYellow, lerr, colorReset)
+		}
+		pruneGrokSessionStoreOnce()
 	}
-	pruneGrokSessionStoreOnce()
 
 	return dir, nil
 }
@@ -2084,16 +2104,24 @@ func setEnvVar(env []string, key, value string) []string {
 //     fallback opt-in flows through XAI_API_KEY env and the persisted
 //     `[model] api_key` config.toml line instead), the `--cwd*` containment
 //     side-door, `--always-approve` / `--auto-approve` (owned by buildGrokACPArgs), the
-//     duplicate entry tokens (`agent`/`stdio`/`chat`/`tui`/`run`), root-only
-//     one-shot flags (`--tools`, `--max-turns`, prompt/output selectors, etc.),
-//     and the POSIX `--` end-of-options delimiter. `--allow <pattern>` / `--allow=…`
+//     duplicate entry tokens (`agent`/`stdio`/`chat`/`tui`/`run`) and the POSIX
+//     `--` end-of-options delimiter. Root-only one-shot flags (`--tools`,
+//     `--max-turns`, prompt/output selectors, etc.) are rejected rather than
+//     stripped: silently dropping `--tools ""` would turn a requested no-tools
+//     smoke into a fully tooled ACP session. `--allow <pattern>` / `--allow=…`
 //     are xAI's documented pre-prompt allow rules (matching tools auto-approve
 //     BEFORE the per-tool prompt runs) — stripped when allowAlwaysApprove is
 //     false, mirroring the raw `session_start` path's stripGrokAllowRulePairs
 //     sweep so a signed grok_acp_start cannot route around the per-tool prompt
 //     by handing `--allow Bash(*)` through extras. `--deny` is policy-tightening
 //     and is preserved on both sides of the gate.
-func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwaysApprove bool) (string, []string) {
+func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwaysApprove bool) (string, []string, error) {
+	if arg, ok := grokACPRootOnlyArg(extraArgs); ok {
+		return defaultModel, nil, fmt.Errorf(
+			"grok agent stdio does not support root-only option %q; use session_start for grok -p/no-tools smoke invocations",
+			arg,
+		)
+	}
 	model := defaultModel
 	cleaned := make([]string, 0, len(extraArgs))
 	skipNext := false
@@ -2153,43 +2181,6 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwa
 			continue
 		}
 		if lower == "--no-auto-update" || lower == "--auto-update" {
-			continue
-		}
-
-		// Root-command headless flags are valid for `grok -p ...`, including
-		// the maintenance smoke's no-tools contract, but `grok agent` rejects
-		// them before the ACP handshake. Consume values for the value-taking
-		// forms so an empty --tools operand or a prompt cannot be reinterpreted
-		// as another agent flag.
-		switch lower {
-		case "--tools", "--disallowed-tools", "--max-turns", "--agent", "--agents",
-			"--output-format", "--json-schema", "--prompt-file", "--prompt-json",
-			"--rules", "--system-prompt-override", "--sandbox", "--worktree-ref", "--ref",
-			"-p", "--single":
-			if i+1 < len(extraArgs) {
-				skipNext = true
-			}
-			continue
-		case "--disable-web-search", "--no-subagents", "--no-plan", "--verbatim",
-			"--include-partial-messages", "--fork-session", "--restore-code":
-			continue
-		}
-		if strings.HasPrefix(lower, "--tools=") ||
-			strings.HasPrefix(lower, "--disallowed-tools=") ||
-			strings.HasPrefix(lower, "--max-turns=") ||
-			strings.HasPrefix(lower, "--agent=") ||
-			strings.HasPrefix(lower, "--agents=") ||
-			strings.HasPrefix(lower, "--output-format=") ||
-			strings.HasPrefix(lower, "--json-schema=") ||
-			strings.HasPrefix(lower, "--prompt-file=") ||
-			strings.HasPrefix(lower, "--prompt-json=") ||
-			strings.HasPrefix(lower, "--rules=") ||
-			strings.HasPrefix(lower, "--system-prompt-override=") ||
-			strings.HasPrefix(lower, "--sandbox=") ||
-			strings.HasPrefix(lower, "--worktree-ref=") ||
-			strings.HasPrefix(lower, "--ref=") ||
-			strings.HasPrefix(lower, "-p=") ||
-			strings.HasPrefix(lower, "--single=") {
 			continue
 		}
 
@@ -2260,7 +2251,36 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwa
 
 		cleaned = append(cleaned, a)
 	}
-	return model, cleaned
+	return model, cleaned, nil
+}
+
+// grokACPRootOnlyArg reports the first root-command option that cannot be
+// represented by `grok agent stdio`. These options must fail closed instead of
+// being silently discarded, especially `--tools ""`: discarding that operand
+// changes a tool-free smoke into an ordinary ACP session with built-in tools.
+func grokACPRootOnlyArg(args []string) (string, bool) {
+	valueFlags := map[string]bool{
+		"--tools": true, "--disallowed-tools": true, "--max-turns": true,
+		"--agent": true, "--agents": true, "--output-format": true,
+		"--json-schema": true, "--prompt-file": true, "--prompt-json": true,
+		"--rules": true, "--system-prompt-override": true, "--sandbox": true,
+		"--worktree-ref": true, "--ref": true, "-p": true, "--single": true,
+	}
+	boolFlags := map[string]bool{
+		"--disable-web-search": true, "--no-subagents": true, "--no-plan": true,
+		"--verbatim": true, "--include-partial-messages": true,
+		"--fork-session": true, "--restore-code": true,
+	}
+	for _, arg := range args {
+		lower := strings.ToLower(arg)
+		if valueFlags[lower] || boolFlags[lower] {
+			return arg, true
+		}
+		if eq := strings.IndexByte(lower, '='); eq > 0 && valueFlags[lower[:eq]] {
+			return arg[:eq], true
+		}
+	}
+	return "", false
 }
 
 // redactGrokACPArgsForLog masks credential-bearing values before the startup

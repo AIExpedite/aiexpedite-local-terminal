@@ -21,12 +21,21 @@ import (
 	"time"
 )
 
+func requireBuildGrokACPArgs(t *testing.T, args []string, allowAlwaysApprove bool) []string {
+	t.Helper()
+	got, err := buildGrokACPArgs(args, allowAlwaysApprove)
+	if err != nil {
+		t.Fatalf("buildGrokACPArgs(%#v, %t): %v", args, allowAlwaysApprove, err)
+	}
+	return got
+}
+
 // TestBuildGrokACPArgs_DefaultContract pins the validated grok 0.2.59 shape:
 // `agent --model grok-build stdio` with NO --config / --permission-mode /
 // --no-auto-update, flags BEFORE the `stdio` subcommand, and --always-approve
 // omitted by default.
 func TestBuildGrokACPArgs_DefaultContract(t *testing.T) {
-	got := buildGrokACPArgs(nil, false)
+	got := requireBuildGrokACPArgs(t, nil, false)
 	want := []string{"agent", "--model", "grok-build", "stdio"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs(nil, false) = %#v, want %#v", got, want)
@@ -37,12 +46,12 @@ func TestBuildGrokACPArgs_DefaultContract(t *testing.T) {
 // appears (between --model grok-build and stdio) ONLY when allowAlwaysApprove
 // is true.
 func TestBuildGrokACPArgs_AlwaysApproveOnlyWhenEnabled(t *testing.T) {
-	off := buildGrokACPArgs(nil, false)
+	off := requireBuildGrokACPArgs(t, nil, false)
 	if grokArgsContain(off, "--always-approve") {
 		t.Fatalf("--always-approve must be absent when disabled; got %#v", off)
 	}
 
-	on := buildGrokACPArgs(nil, true)
+	on := requireBuildGrokACPArgs(t, nil, true)
 	want := []string{"agent", "--model", "grok-build", "--always-approve", "stdio"}
 	if !reflect.DeepEqual(on, want) {
 		t.Fatalf("buildGrokACPArgs(nil, true) = %#v, want %#v", on, want)
@@ -99,7 +108,7 @@ func TestBuildGrokACPArgs_CallerModelOverridesDefault(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false)
+			got := requireBuildGrokACPArgs(t, c.args, false)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("buildGrokACPArgs(%#v) = %#v, want %#v", c.args, got, c.want)
 			}
@@ -133,13 +142,11 @@ func TestBuildGrokACPArgs_StripsIncompatibleFlags(t *testing.T) {
 		{"auto_approve_alias_equals_form", []string{"--auto-approve=true"}},
 		{"end_of_options_delimiter", []string{"--", "--config", "model.api_key=x"}},
 		{"duplicate_entry_tokens", []string{"agent", "stdio", "chat", "tui", "run"}},
-		{"root_no_tools_smoke", []string{"--tools", "", "--disable-web-search", "--no-subagents", "--max-turns", "1", "--output-format", "plain", "--verbatim", "-p", "marker"}},
-		{"root_no_tools_equals", []string{"--tools=", "--max-turns=1", "--output-format=plain", "--single=marker"}},
 	}
 	want := []string{"agent", "--model", "grok-build", "stdio"}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false)
+			got := requireBuildGrokACPArgs(t, c.args, false)
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("buildGrokACPArgs(%#v) = %#v, want %#v (incompatible flag leaked)", c.args, got, want)
 			}
@@ -147,11 +154,28 @@ func TestBuildGrokACPArgs_StripsIncompatibleFlags(t *testing.T) {
 	}
 }
 
+func TestBuildGrokACPArgs_RejectsRootOnlyNoToolsSmoke(t *testing.T) {
+	cases := [][]string{
+		{"--tools", "", "--disable-web-search", "--no-subagents", "--max-turns", "1", "--verbatim", "-p", "marker"},
+		{"--tools=", "--max-turns=1", "--output-format=plain", "--single=marker"},
+	}
+	for _, args := range cases {
+		got, err := buildGrokACPArgs(args, false)
+		if err == nil || got != nil {
+			t.Fatalf("buildGrokACPArgs(%#v) = %#v, %v; want explicit rejection", args, got, err)
+		}
+		if !strings.Contains(err.Error(), "does not support root-only option") ||
+			!strings.Contains(err.Error(), "session_start") {
+			t.Fatalf("rejection is not actionable: %v", err)
+		}
+	}
+}
+
 // TestBuildGrokACPArgs_PreservesUnknownGrokAgentFlags pins that flags we don't
 // special-case (valid `grok agent` knobs the orchestrator may pass) flow
 // through verbatim and stay BEFORE the stdio subcommand.
 func TestBuildGrokACPArgs_PreservesUnknownGrokAgentFlags(t *testing.T) {
-	got := buildGrokACPArgs([]string{"--reasoning-effort", "high", "--model", "grok-4"}, false)
+	got := requireBuildGrokACPArgs(t, []string{"--reasoning-effort", "high", "--model", "grok-4"}, false)
 	want := []string{"agent", "--model", "grok-4", "--reasoning-effort", "high", "stdio"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildGrokACPArgs preserved unknown flags wrong: got %#v, want %#v", got, want)
@@ -188,7 +212,10 @@ func TestSanitizeGrokACPExtraArgs_ExtractsModelAndStripsDangerousFlags(t *testin
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			model, cleaned := sanitizeGrokACPExtraArgs(c.args, "grok-build", false)
+			model, cleaned, err := sanitizeGrokACPExtraArgs(c.args, "grok-build", false)
+			if err != nil {
+				t.Fatalf("sanitizeGrokACPExtraArgs(%#v): %v", c.args, err)
+			}
 			if model != c.wantModel {
 				t.Fatalf("model = %q, want %q", model, c.wantModel)
 			}
@@ -460,11 +487,11 @@ func TestBuildGrokACPArgs_StripsAPIKeyArgsUnconditionally(t *testing.T) {
 	defaultContract := []string{"agent", "--model", "grok-build", "stdio"}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false)
+			got := requireBuildGrokACPArgs(t, c.args, false)
 			if !reflect.DeepEqual(got, defaultContract) {
 				t.Fatalf("buildGrokACPArgs(%#v, false) = %#v, want %#v — api-key arg leaked into argv", c.args, got, defaultContract)
 			}
-			gotApprove := buildGrokACPArgs(c.args, true)
+			gotApprove := requireBuildGrokACPArgs(t, c.args, true)
 			wantApprove := []string{"agent", "--model", "grok-build", "--always-approve", "stdio"}
 			if !reflect.DeepEqual(gotApprove, wantApprove) {
 				t.Fatalf("buildGrokACPArgs(%#v, true) = %#v, want %#v — api-key arg leaked under always-approve gate", c.args, gotApprove, wantApprove)
@@ -970,7 +997,7 @@ func TestBuildGrokACPArgs_StripsCallerAllowRuleUnderGateOff(t *testing.T) {
 	defaultContract := []string{"agent", "--model", "grok-build", "stdio"}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, false)
+			got := requireBuildGrokACPArgs(t, c.args, false)
 			if !reflect.DeepEqual(got, defaultContract) {
 				t.Fatalf("buildGrokACPArgs(%#v, false, false) = %#v, want %#v — caller --allow leaked past gate", c.args, got, defaultContract)
 			}
@@ -1002,7 +1029,7 @@ func TestBuildGrokACPArgs_PreservesCallerAllowRuleUnderGateOn(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := buildGrokACPArgs(c.args, true)
+			got := requireBuildGrokACPArgs(t, c.args, true)
 			if !reflect.DeepEqual(got, c.want) {
 				t.Fatalf("buildGrokACPArgs(%#v, true, false) = %#v, want %#v", c.args, got, c.want)
 			}
@@ -1011,11 +1038,11 @@ func TestBuildGrokACPArgs_PreservesCallerAllowRuleUnderGateOn(t *testing.T) {
 
 	denyArgs := []string{"--deny", "Bash(rm -rf *)"}
 	wantOn := []string{"agent", "--model", "grok-build", "--always-approve", "--deny", "Bash(rm -rf *)", "stdio"}
-	if got := buildGrokACPArgs(denyArgs, true); !reflect.DeepEqual(got, wantOn) {
+	if got := requireBuildGrokACPArgs(t, denyArgs, true); !reflect.DeepEqual(got, wantOn) {
 		t.Fatalf("--deny stripped under gate-on: got %#v, want %#v", got, wantOn)
 	}
 	wantOff := []string{"agent", "--model", "grok-build", "--deny", "Bash(rm -rf *)", "stdio"}
-	if got := buildGrokACPArgs(denyArgs, false); !reflect.DeepEqual(got, wantOff) {
+	if got := requireBuildGrokACPArgs(t, denyArgs, false); !reflect.DeepEqual(got, wantOff) {
 		t.Fatalf("--deny stripped under gate-off: got %#v, want %#v", got, wantOff)
 	}
 }

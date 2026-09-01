@@ -29,6 +29,33 @@ import (
 	"time"
 )
 
+// A root `--tools ""` smoke cannot be represented by grok agent stdio. The
+// ACP manager must reject it before registration/spawn rather than silently
+// starting a fully tooled session and accepting the caller's prompt afterward.
+func TestGrokACPManager_NoToolsSmokeRejectedBeforePrompt(t *testing.T) {
+	m := NewGrokACPManager(nil)
+	var captured []resultMsg
+	err := m.Start(
+		"grok-no-tools-acp",
+		t.TempDir(),
+		[]string{"--tools", "", "--disable-web-search", "--no-subagents", "--max-turns", "1", "-p", "marker"},
+		"ws-test",
+		"uid-test",
+		GrokStartOptions{},
+		func(msg resultMsg) { captured = append(captured, msg) },
+	)
+	if err == nil || !strings.Contains(err.Error(), "use session_start") {
+		t.Fatalf("Start no-tools ACP error = %v, want actionable root-protocol rejection", err)
+	}
+	if m.ActiveCount() != 0 || len(captured) != 0 {
+		t.Fatalf("rejected no-tools ACP registered/published: active=%d messages=%+v", m.ActiveCount(), captured)
+	}
+	prompt := `{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"grok-no-tools-acp","prompt":[{"type":"text","text":"return marker"}]}}`
+	if sendErr := m.Send("grok-no-tools-acp", prompt); sendErr == nil || !strings.Contains(sendErr.Error(), "not found") {
+		t.Fatalf("prompt reached rejected no-tools ACP session: %v", sendErr)
+	}
+}
+
 /* --------------------------------------------------------------------------
    test helpers
    -------------------------------------------------------------------------- */

@@ -40,6 +40,8 @@ import (
 )
 
 const mockCLIEnvVar = "TEST_MOCK_CLI_MODE"
+const mockGrokPersistentHomeEnv = "TEST_MOCK_GROK_PERSISTENT_HOME"
+const mockGrokVendorHomeEnv = "TEST_MOCK_GROK_VENDOR_HOME"
 
 const grokMaintenanceSmokeMarker = "AIEXPEDITE_GROK_SMOKE_MARKER_7F3C2A"
 
@@ -420,12 +422,33 @@ func runMockGrokMaintenanceSmoke(mode string) {
 	}
 
 	args := os.Args[1:]
+	isolatedHome := os.Getenv("GROK_HOME")
+	persistentHome := os.Getenv(mockGrokPersistentHomeEnv)
+	vendorHome := os.Getenv(mockGrokVendorHomeEnv)
+	isolatedConfig, configErr := os.ReadFile(filepath.Join(isolatedHome, "config.toml"))
+	_, isolatedPluginErr := os.Stat(filepath.Join(isolatedHome, "plugins", "host-plugin"))
+	_, isolatedMCPErr := os.Stat(filepath.Join(isolatedHome, "mcp.json"))
+	_, isolatedSessionsErr := os.Lstat(filepath.Join(isolatedHome, "sessions"))
+	_, copiedAuthErr := os.Stat(filepath.Join(isolatedHome, "auth.json"))
+	_, hostPluginErr := os.Stat(filepath.Join(persistentHome, "plugins", "host-plugin"))
+	_, hostMCPErr := os.Stat(filepath.Join(persistentHome, "mcp.json"))
+	_, cursorMCPErr := os.Stat(filepath.Join(vendorHome, ".cursor", "mcp.json"))
 	tools, hasTools := mockArgValue(args, "--tools")
 	maxTurns, hasMaxTurns := mockArgValue(args, "--max-turns")
 	outputFormat, hasOutputFormat := mockArgValue(args, "--output-format")
 	promptPath, hasPromptFile := mockArgValue(args, "--prompt-file")
 	prompt, promptErr := os.ReadFile(promptPath)
-	if !hasTools || tools != "" || !hasMaxTurns || maxTurns != "1" ||
+	_, hasExternalLoader := grokNoToolsExternalLoaderArg(args)
+	if isolatedHome == "" || persistentHome == "" || isolatedHome == persistentHome ||
+		configErr != nil || copiedAuthErr != nil || hostPluginErr != nil || hostMCPErr != nil || cursorMCPErr != nil ||
+		!os.IsNotExist(isolatedPluginErr) || !os.IsNotExist(isolatedMCPErr) || !os.IsNotExist(isolatedSessionsErr) ||
+		!strings.Contains(string(isolatedConfig), "[compat.cursor]") ||
+		!strings.Contains(string(isolatedConfig), "[compat.claude]") ||
+		strings.Count(string(isolatedConfig), "mcps = false") != 2 ||
+		strings.Contains(string(isolatedConfig), "host-plugin") ||
+		strings.Contains(string(isolatedConfig), "host-mcp") ||
+		os.Getenv("XAI_API_KEY") != "" || hasExternalLoader ||
+		!hasTools || tools != "" || !hasMaxTurns || maxTurns != "1" ||
 		!hasOutputFormat || outputFormat != "streaming-json" ||
 		!mockHasArg(args, "--disable-web-search") || !mockHasArg(args, "--no-subagents") ||
 		!mockHasArg(args, "--verbatim") || !hasPromptFile || promptErr != nil ||
@@ -741,9 +764,34 @@ func TestSessionLifecycle_GrokDirectPublishesFreshRedactedBilling(t *testing.T) 
 
 func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *testing.T) {
 	realHome := t.TempDir()
+	vendorHome := t.TempDir()
 	seedGrokHomeWithLogin(t, realHome)
+	if err := os.WriteFile(filepath.Join(realHome, "config.toml"), []byte(
+		"[plugins]\nenabled = [\"host-plugin\"]\n[mcp_servers.host-mcp]\ncommand = \"raw-config-sentinel\"\n",
+	), 0o600); err != nil {
+		t.Fatalf("seed host Grok config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(realHome, "plugins", "host-plugin"), 0o700); err != nil {
+		t.Fatalf("seed host Grok plugin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realHome, "plugins", "host-plugin", "plugin.json"), []byte(`{"name":"host-plugin"}`), 0o600); err != nil {
+		t.Fatalf("seed host Grok plugin manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realHome, "mcp.json"), []byte(`{"host-mcp":{"command":"raw-config-sentinel"}}`), 0o600); err != nil {
+		t.Fatalf("seed host Grok MCP config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(vendorHome, ".cursor"), 0o700); err != nil {
+		t.Fatalf("seed Cursor MCP directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(vendorHome, ".cursor", "mcp.json"), []byte(`{"mcpServers":{"host-mcp":{"command":"raw-config-sentinel"}}}`), 0o600); err != nil {
+		t.Fatalf("seed Cursor MCP config: %v", err)
+	}
 	t.Setenv("GROK_HOME", realHome)
-	t.Setenv("XAI_API_KEY", "")
+	t.Setenv("HOME", vendorHome)
+	t.Setenv("USERPROFILE", vendorHome)
+	t.Setenv("XAI_API_KEY", "credential-sentinel-api-key")
+	t.Setenv(mockGrokPersistentHomeEnv, realHome)
+	t.Setenv(mockGrokVendorHomeEnv, vendorHome)
 	SetCLIAgentCatalog([]cliAgentCatalogEntry{{
 		ID: "grok", DisplayName: "Grok Build", Command: "grok",
 	}})

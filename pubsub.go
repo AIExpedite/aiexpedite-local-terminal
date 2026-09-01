@@ -5857,7 +5857,15 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 			return true
 		}
 		allowCommand = "grok"
-		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAlwaysApprove)
+		var buildErr error
+		allowArgs, buildErr = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAlwaysApprove)
+		if buildErr != nil {
+			// The manager will publish the authoritative start refusal before
+			// spawn. Do not render the rejected raw argv in an approval dialog:
+			// it may contain prompt/config-file operands and no executable action
+			// remains for the user to approve.
+			return true
+		}
 		dialogArgs = redactGrokACPArgsForLog(allowArgs)
 		denyOutput = "grok ACP session denied by user: not in allow list"
 		// NEVER persist an allow-list entry for a Grok ACP session. Both paths

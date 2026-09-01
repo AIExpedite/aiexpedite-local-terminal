@@ -53,6 +53,40 @@ func TestBuildGrokInteractiveArgs_PreservesNoToolsSmokeContract(t *testing.T) {
 	}
 }
 
+func TestGrokArgsRequestNoTools_RequiresExplicitEmptyValue(t *testing.T) {
+	tests := []struct {
+		args []string
+		want bool
+	}{
+		{buildGrokInteractiveArgs([]string{"--tools", "", "marker"}, false), true},
+		{buildGrokInteractiveArgs([]string{"--tools=", "marker"}, false), true},
+		{buildGrokInteractiveArgs([]string{"--tools", "Bash", "marker"}, false), false},
+		{buildGrokInteractiveArgs([]string{"--disable-web-search", "marker"}, false), false},
+		{[]string{"--tools", "", "models"}, false},
+	}
+	for _, tc := range tests {
+		if got := grokArgsRequestNoTools(tc.args); got != tc.want {
+			t.Errorf("grokArgsRequestNoTools(%#v) = %t, want %t", tc.args, got, tc.want)
+		}
+	}
+}
+
+func TestStartSession_GrokNoToolsRejectsExternalLoaders(t *testing.T) {
+	tests := [][]string{
+		{"--tools", "", "--plugin-dir", t.TempDir(), "marker"},
+		{"--tools=", "--config=plugins.enabled=['host-plugin']", "marker"},
+		{"--tools", "", "--agent", "agent-with-tools", "marker"},
+		{"--tools", "", `--agents={"worker":{"tools":["Bash"]}}`, "marker"},
+	}
+	for i, args := range tests {
+		sm := NewSessionManager(nil)
+		err := sm.StartSession("grok-no-tools-loader", "grok", args, t.TempDir(), "ws", "uid", 1000, false, func(resultMsg) {})
+		if err == nil || !strings.Contains(err.Error(), "cannot load external") {
+			t.Errorf("case %d StartSession(%#v) error = %v, want external-loader rejection", i, args, err)
+		}
+	}
+}
+
 func TestBuildGrokInteractiveArgs_InlinePromptFlagValue(t *testing.T) {
 	got := buildGrokInteractiveArgs([]string{"--single=hello there"}, true)
 	want := []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "hello there"}
