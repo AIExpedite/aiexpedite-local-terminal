@@ -354,6 +354,54 @@ func copyPrevStatusLine(src, dst string) error {
 	return os.WriteFile(dst, b, 0o600)
 }
 
+// migratePrevStatusLine moves the pinned status-line stash from the path an
+// earlier install baked into the command to the path this boot resolves (e.g.
+// GetConfigDir() landed somewhere else). It must run BEFORE the refreshed
+// command is written: the new command pins newPrev, so a stash left behind at
+// oldPrev would be invisible to both the hook's chain lookup and opt-out.
+//
+// "Nothing to migrate" is not a failure — an unset/unchanged oldPrev, a stash
+// already present at newPrev, or an absent oldPrev all return nil. Every other
+// outcome IS a failure and is returned, because silently continuing is what
+// loses the user's third-party status line.
+func migratePrevStatusLine(oldPrev, newPrev string) error {
+	if oldPrev == "" || oldPrev == newPrev {
+		return nil
+	}
+	if _, err := os.Stat(newPrev); err == nil {
+		return nil // already migrated (or a fresh stash lives there)
+	} else if !os.IsNotExist(err) {
+		// Can't tell whether the new stash exists — proceeding would pin the
+		// command to a path we were unable to verify.
+		return err
+	}
+	if _, err := os.Stat(oldPrev); err != nil {
+		if os.IsNotExist(err) {
+			return nil // no stash to carry over; the chain target never existed
+		}
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(newPrev), 0o755); err != nil {
+		return err
+	}
+	// os.Rename returns EXDEV when oldPrev and newPrev sit on different
+	// filesystems (e.g. XDG_CONFIG_HOME moved from the home disk to a mounted
+	// drive). Fall back to a private-mode copy-and-remove so the migration
+	// still happens across volumes — do NOT use the binary `copyFile` helper
+	// here: it chmods to 0o755, which would leave the stash world-readable on
+	// Unix and expose the previously chained command (potentially including
+	// inline env vars / tokens) to other local users.
+	if err := os.Rename(oldPrev, newPrev); err != nil {
+		if copyErr := copyPrevStatusLine(oldPrev, newPrev); copyErr != nil {
+			return copyErr
+		}
+		// The stash is safely at newPrev now; a failed cleanup of the old copy
+		// is cosmetic, not a migration failure.
+		_ = os.Remove(oldPrev)
+	}
+	return nil
+}
+
 // ensureClaudeStatusLineHook installs (or refreshes) the status-line hook in
 // Claude's settings.json. It is best-effort and idempotent:
 //   - Skips entirely when Claude isn't present (no config dir).
@@ -429,30 +477,15 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 		// only at the old one, silently dropping the chain target.
 		oldPrev := extractInstalledPinnedPath(existing.Command, "STATUSLINE_PREV")
 		newPrev := prevStatusLinePath()
-		if oldPrev != "" && oldPrev != newPrev {
-			if _, err := os.Stat(newPrev); os.IsNotExist(err) {
-				if _, err := os.Stat(oldPrev); err == nil {
-					if mkErr := os.MkdirAll(filepath.Dir(newPrev), 0o755); mkErr == nil {
-						// os.Rename returns EXDEV when oldPrev and newPrev sit on
-						// different filesystems (e.g. XDG_CONFIG_HOME moved from
-						// the home disk to a mounted drive). Ignoring it would
-						// leave the stash at oldPrev while the hook + opt-out
-						// look at newPrev, silently dropping the chained
-						// third-party command. Fall back to a private-mode
-						// copy-and-remove so the migration still happens
-						// across volumes — do NOT use the binary `copyFile`
-						// helper here: it chmods to 0o755, which would leave
-						// the stash world-readable on Unix and expose the
-						// previously chained command (potentially including
-						// inline env vars / tokens) to other local users.
-						if err := os.Rename(oldPrev, newPrev); err != nil {
-							if copyErr := copyPrevStatusLine(oldPrev, newPrev); copyErr == nil {
-								_ = os.Remove(oldPrev)
-							}
-						}
-					}
-				}
-			}
+		if err := migratePrevStatusLine(oldPrev, newPrev); err != nil {
+			// Abort for the same reason the savePrevStatusLine branch above
+			// does: writing the refreshed command would pin the hook (and
+			// opt-out) to newPrev while the user's chained third-party status
+			// line is still stashed only at oldPrev, so the chain target is
+			// silently dropped. Returning here leaves settings.json untouched,
+			// so the previously installed command — which is still pinned to
+			// oldPrev, where the stash actually is — keeps resolving.
+			return false, err
 		}
 	} else if existing.Command == "" {
 		// Installing over an empty/absent statusLine: there's no third-party

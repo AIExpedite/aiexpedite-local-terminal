@@ -631,3 +631,113 @@ func TestReconcileClaudeStatusLineHookBoundedReturnsWhileRepairStalls(t *testing
 	claudeStatusLineReconcile.optOut = true
 	claudeStatusLineReconcile.mu.Unlock()
 }
+
+// A pinned-path migration that CANNOT complete must abort the refresh instead
+// of installing a command pinned to the new stash path. Writing that command
+// would point both the hook's chain lookup and opt-out at newPrev while the
+// user's third-party status line is still stashed only at oldPrev — the chain
+// target disappears even though its stash is right there on disk. Aborting
+// leaves settings.json untouched, so the previously installed command (still
+// pinned to oldPrev, where the stash actually is) keeps resolving.
+func TestEnsureClaudeStatusLineHook_AbortsWhenPinnedStashCannotMigrate(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	oldPrev := filepath.Join(t.TempDir(), "old-prev.json")
+	stashBody := []byte(`{"statusLine":{"type":"command","command":"third-party.sh"}}`)
+	if err := os.WriteFile(oldPrev, stashBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", oldPrev)
+
+	// Resolve the new pinned stash underneath a REGULAR FILE, so both the
+	// MkdirAll and any rename/copy fallback are guaranteed to fail on every OS.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newPrev := filepath.Join(blocker, "sub", "new-prev.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	settings := `{"theme":"dark","statusLine":{"type":"command","command":` +
+		mustJSONString(t, oldCmd) + `}}`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := ensureClaudeStatusLineHook(home)
+	if err == nil {
+		t.Fatalf("install must surface the failed stash migration; changed=%v", changed)
+	}
+	if changed {
+		t.Errorf("install must not report a change when the migration aborted")
+	}
+
+	// settings.json is byte-identical: the old command still pins oldPrev.
+	got, readErr := os.ReadFile(settingsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != settings {
+		t.Errorf("settings.json must be untouched after an aborted migration:\ngot  %s\nwant %s", got, settings)
+	}
+
+	// The stash is still where the surviving installed command points.
+	stash, readErr := os.ReadFile(oldPrev)
+	if readErr != nil {
+		t.Fatalf("old stash must survive an aborted migration: %v", readErr)
+	}
+	if string(stash) != string(stashBody) {
+		t.Errorf("old stash body mismatch: got %s want %s", stash, stashBody)
+	}
+
+	// Opt-out still restores the third-party command from the pinned path.
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(settingsPath)
+	if !strings.Contains(string(raw), "third-party.sh") {
+		t.Errorf("opt-out lost the chained third-party command: %s", raw)
+	}
+}
+
+// "Nothing to migrate" is not a migration failure: an unset or unchanged
+// pinned path, a stash already sitting at the new path, and an absent old
+// stash must all leave the refresh free to proceed.
+func TestMigratePrevStatusLine_NoOpCasesSucceed(t *testing.T) {
+	dir := t.TempDir()
+	newPrev := filepath.Join(dir, "new-prev.json")
+
+	if err := migratePrevStatusLine("", newPrev); err != nil {
+		t.Errorf("unset old path must be a no-op, got %v", err)
+	}
+	if err := migratePrevStatusLine(newPrev, newPrev); err != nil {
+		t.Errorf("unchanged path must be a no-op, got %v", err)
+	}
+	if err := migratePrevStatusLine(filepath.Join(dir, "absent.json"), newPrev); err != nil {
+		t.Errorf("absent old stash must be a no-op, got %v", err)
+	}
+	if _, err := os.Stat(newPrev); !os.IsNotExist(err) {
+		t.Errorf("no-op migration must not create the new stash; err=%v", err)
+	}
+
+	// A stash already at newPrev wins: the old one is left alone, not copied over.
+	if err := os.WriteFile(newPrev, []byte(`{"new":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldPrev := filepath.Join(dir, "old-prev.json")
+	if err := os.WriteFile(oldPrev, []byte(`{"old":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := migratePrevStatusLine(oldPrev, newPrev); err != nil {
+		t.Errorf("pre-existing new stash must be a no-op, got %v", err)
+	}
+	if got, _ := os.ReadFile(newPrev); string(got) != `{"new":true}` {
+		t.Errorf("existing new stash must not be overwritten, got %s", got)
+	}
+}
