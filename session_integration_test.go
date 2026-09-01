@@ -492,7 +492,10 @@ func runMockGrokMaintenanceSmoke(mode string) {
 		strings.Contains(string(isolatedConfig), "host-plugin") ||
 		strings.Contains(string(isolatedConfig), "host-mcp") ||
 		os.Getenv("XAI_API_KEY") != "" || os.Getenv("GROK_CODE_XAI_API_KEY") != "" ||
-		os.Getenv("GROK_AUTH_PROVIDER_ACCESS_TOKEN") != "" || os.Getenv("GROK_AGENT") != "" || !compatibilityDisabled ||
+		os.Getenv("GROK_AUTH_PROVIDER_ACCESS_TOKEN") != "" || os.Getenv("GROK_AGENT") != "" ||
+		os.Getenv("GROK_DEFAULT_MODEL") != "" || os.Getenv("GROK_MODELS_BASE_URL") != "" ||
+		os.Getenv("GROK_MODELS_LIST_URL") != "" || os.Getenv("GROK_XAI_API_BASE_URL") != "" ||
+		mockHasArg(args, "--always-approve") || mockHasArg(args, "--auto-approve") || !compatibilityDisabled ||
 		hasExternalLoader ||
 		mockHasArg(args, grokMaintenanceSmokeControlArg) ||
 		!hasTools || tools != "" || !hasMaxTurns || maxTurns != "1" ||
@@ -507,11 +510,15 @@ func runMockGrokMaintenanceSmoke(mode string) {
 		fmt.Fprintln(os.Stderr, "usage capture failed")
 		os.Exit(1)
 	}
-	if mode == "grok-maintenance-smoke-v1" {
-		encoded, _ := json.Marshal(map[string]string{"type": "text", "text": grokMaintenanceSmokeMarker})
-		fmt.Println(string(encoded))
-	} else {
-		encoded, _ := json.Marshal(map[string]string{"type": "text", "data": grokMaintenanceSmokeMarker})
+	field := "text"
+	if mode != "grok-maintenance-smoke-v1" {
+		field = "data"
+	}
+	// Real streaming-json output may split one assistant message across
+	// multiple incremental frames. Emit every marker in three same-batch
+	// deltas so the lifecycle regression catches injected frame newlines.
+	for _, delta := range []string{"AIEXPEDITE_GROK_", "SMOKE_MARKER_", "7F3C2A"} {
+		encoded, _ := json.Marshal(map[string]string{"type": "text", field: delta})
 		fmt.Println(string(encoded))
 	}
 	fmt.Println(`{"type":"end","stopReason":"end_turn"}`)
@@ -590,6 +597,10 @@ func writeMockGrokBillingEvidence() error {
 // the literal "claude" string. That makes proc.Start() fail. Instead, the
 // tests below use a "shim" name and validate the lifecycle, not the argv.
 func captureSession(t *testing.T, mockMode string, sessionCmd string, args []string, sendInitialStdinPrompt string) (sessionID string, messages []resultMsg, finalErr error) {
+	return captureSessionWithConfig(t, mockMode, sessionCmd, args, sendInitialStdinPrompt, nil)
+}
+
+func captureSessionWithConfig(t *testing.T, mockMode string, sessionCmd string, args []string, sendInitialStdinPrompt string, cfg *Config) (sessionID string, messages []resultMsg, finalErr error) {
 	t.Helper()
 
 	// Locate the test binary and copy it into a tempdir with the desired
@@ -614,7 +625,7 @@ func captureSession(t *testing.T, mockMode string, sessionCmd string, args []str
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+origPath)
 	t.Setenv(mockCLIEnvVar, mockMode)
 
-	sm := NewSessionManager(nil)
+	sm := NewSessionManager(cfg)
 	id := fmt.Sprintf("test-session-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -862,6 +873,10 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 	t.Setenv("GROK_CODE_XAI_API_KEY", "alternate-credential-sentinel")
 	t.Setenv("GROK_AUTH_PROVIDER_ACCESS_TOKEN", "provider-credential-sentinel")
 	t.Setenv("GROK_AGENT", "agent-path-sentinel")
+	t.Setenv("GROK_DEFAULT_MODEL", "model-sentinel")
+	t.Setenv("GROK_MODELS_BASE_URL", "https://models-base-sentinel.invalid")
+	t.Setenv("GROK_MODELS_LIST_URL", "https://models-list-sentinel.invalid")
+	t.Setenv("GROK_XAI_API_BASE_URL", "https://xai-base-sentinel.invalid")
 	t.Setenv("GROK_CURSOR_MCPS_ENABLED", "1")
 	t.Setenv("GROK_CLAUDE_MCPS_ENABLED", "1")
 	t.Setenv("GROK_CODEX_MCPS_ENABLED", "1")
@@ -892,7 +907,9 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 	}
 	run := func(mode string) cliAgentUsage {
 		t.Helper()
-		_, messages, err := captureSession(t, mode, "grok", dispatchedSmokeArgs, projectCwd)
+		_, messages, err := captureSessionWithConfig(t, mode, "grok", dispatchedSmokeArgs, projectCwd, &Config{
+			EnableGrokAlwaysApprove: true,
+		})
 		if err != nil {
 			t.Fatalf("%s session: %v", mode, err)
 		}
@@ -923,6 +940,7 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 		for _, secret := range []string{
 			"credential-sentinel", "prompt-sentinel", "raw-config-sentinel", "agent-path-sentinel",
 			"project-plugin", "config-path-sentinel", "plugin-path-sentinel", "workspace-path-sentinel",
+			"model-sentinel", "models-base-sentinel", "models-list-sentinel", "xai-base-sentinel",
 		} {
 			if strings.Contains(string(encoded), secret) {
 				t.Fatalf("%s signed refresh leaked %q: %s", mode, secret, encoded)

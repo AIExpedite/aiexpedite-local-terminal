@@ -1742,8 +1742,8 @@ func detectGrokMaintenanceSmokeSystemConfig() error {
 		if !ok {
 			continue
 		}
-		if finding.credential || finding.permissiveApproval {
-			return fmt.Errorf("grok system configuration pins credentials or a permissive approval policy; refusing no-tools maintenance smoke")
+		if finding.credential || finding.externalProvider || finding.permissiveApproval {
+			return fmt.Errorf("grok system configuration pins credentials, external provider routing, or a permissive approval policy; refusing no-tools maintenance smoke")
 		}
 		if finding.toolCategory != "" {
 			return fmt.Errorf("grok system configuration contains disallowed %q settings; refusing no-tools maintenance smoke", finding.toolCategory)
@@ -1761,6 +1761,7 @@ func detectGrokMaintenanceSmokeSystemConfig() error {
 
 type grokSystemSemanticFinding struct {
 	credential         bool
+	externalProvider   bool
 	permissiveApproval bool
 	toolCategory       string
 }
@@ -1837,6 +1838,24 @@ func classifyGrokSystemSemanticValue(path []string, value any, finding *grokSyst
 	if last == "api_key" || last == "env_key" {
 		if strings.TrimSpace(fmt.Sprint(value)) != "" {
 			finding.credential = true
+		}
+	}
+	// The maintenance smoke must use the copied xAI subscription login and
+	// xAI's default provider. System requirements outrank the isolated home, so
+	// any external auth command, endpoint/header override, or default-model pin
+	// must fail closed even when it contains no literal api_key/env_key field.
+	if semanticGrokValueNonEmpty(value) {
+		switch {
+		case last == "auth_provider_command":
+			finding.externalProvider = true
+		case last == "base_url" || last == "api_base_url" || last == "models_base_url" || last == "models_list_url":
+			finding.externalProvider = true
+		case last == "extra_headers":
+			finding.externalProvider = true
+		case last == "default_model":
+			finding.externalProvider = true
+		case last == "default" && len(path) >= 2 && path[len(path)-2] == "models":
+			finding.externalProvider = true
 		}
 	}
 	if (last == "always_approve" || last == "auto_approve" || last == "yolo") && semanticGrokBool(value) {

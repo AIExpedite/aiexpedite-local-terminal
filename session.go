@@ -79,8 +79,8 @@ type CLISession struct {
 	// Removed exactly once after the process exits (see waitForExit).
 	promptFile string
 
-	// isolatedGrokHome is set only for an explicit `--tools ""` one-shot.
-	// That maintenance-smoke path runs with copied login state plus a minimal
+	// isolatedGrokHome is set only for the authenticated maintenance-smoke
+	// control path. It runs with copied login state plus a minimal
 	// MCP-disabled config rather than inheriting plugins/MCPs from the user's
 	// real GROK_HOME. waitForExit persists only the normalized billing snapshot
 	// to persistentGrokHome, then removes the isolated directory.
@@ -204,12 +204,27 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	if isGrokCommand(command) {
 		args, grokMaintenanceSmoke = extractGrokMaintenanceSmokeControl(args)
 	}
+	if grokMaintenanceSmoke {
+		// Validate the signed wire contract before the general Grok builder can
+		// strip permission-bypass flags or otherwise normalize unrecognised
+		// options. The loader check stays first so its published error can name
+		// only the canonical option while redacting every caller-supplied value.
+		if arg, ok := grokNoToolsExternalLoaderArg(args); ok {
+			return fmt.Errorf("grok maintenance smoke cannot use external-loader or workspace/session option %q", arg)
+		}
+		if contractErr := validateGrokMaintenanceSmokeRequestArgs(args); contractErr != nil {
+			return contractErr
+		}
+	}
 
 	// Build the CLI command with appropriate flags for structured streaming.
 	// stdinPrompt is non-empty when the target CLI transports its prompt outside
 	// argv (Claude/Antigravity NDJSON, Codex plain stdin).
 	antigravityManagedStream := isAntigravityCommand(command) && shouldUseAntigravityManagedStream(args)
-	enableGrokAlwaysApprove := sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
+	// A maintenance smoke is always fail-closed, regardless of the workspace's
+	// ordinary Grok approval preference. This also prevents the builder from
+	// injecting --always-approve before the strict child-argv validation below.
+	enableGrokAlwaysApprove := !grokMaintenanceSmoke && sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
 	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
 
 	// Grok's `--tools` selector filters built-in tools only. An explicitly
@@ -219,12 +234,6 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// gain access to unrelated transcripts.
 	var isolatedGrokHome, isolatedGrokCwd, persistentGrokHome string
 	if grokMaintenanceSmoke {
-		if !grokArgsRequestNoTools(cliArgs) {
-			return fmt.Errorf("grok maintenance smoke requires an explicit empty --tools value")
-		}
-		if arg, ok := grokNoToolsExternalLoaderArg(cliArgs); ok {
-			return fmt.Errorf("grok maintenance smoke cannot use external-loader or workspace/session option %q", arg)
-		}
 		if contractErr := validateGrokMaintenanceSmokeContract(cliArgs); contractErr != nil {
 			return contractErr
 		}
@@ -1128,7 +1137,14 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		if len(batch) == 0 {
 			return
 		}
-		output := strings.Join(batch, "\n")
+		separator := "\n"
+		if isGrokCommand(session.Command) && session.isolatedGrokHome != "" {
+			// Grok's streaming-json text/data frames are incremental deltas. A
+			// newline inserted at an internal frame boundary corrupts the exact
+			// maintenance marker; any intended whitespace is already in the delta.
+			separator = ""
+		}
+		output := strings.Join(batch, separator)
 		seq := atomic.AddInt64(&session.Seq, 1)
 
 		asyncPublish(resultMsg{
@@ -3053,27 +3069,46 @@ func extractGrokMaintenanceSmokeControl(args []string) ([]string, bool) {
 	return cleaned, requested
 }
 
-// grokMaintenanceSmokeRequest recognises the complete maintenance request the
-// updater already sends over session_start. Args are part of commandMsg's HMAC
-// payload, so deriving the private control bit here keeps it authenticated
-// without adding a new wire field that older publishers cannot sign. The exact
-// prompt prefix plus the full safety contract distinguishes this from an
-// ordinary caller that merely chooses `--tools ""`.
+// grokMaintenanceSmokeRequest recognises the updater's reserved marker prompt
+// envelope. Args are part of commandMsg's HMAC payload, so deriving the private
+// control bit here keeps it authenticated without adding a new wire field that
+// older publishers cannot sign. StartSession then validates the exact canonical
+// request before spawning; malformed marker requests are promoted specifically
+// so they fail closed instead of falling through as ordinary Grok sessions.
 func grokMaintenanceSmokeRequest(args []string) bool {
 	cleaned, _ := extractGrokMaintenanceSmokeControl(args)
 	shaped := buildGrokInteractiveArgs(cleaned, false)
-	if !grokArgsRequestNoTools(shaped) || validateGrokMaintenanceSmokeContract(shaped) != nil {
-		return false
-	}
 	for i, arg := range shaped {
 		if arg != "-p" || i+1 >= len(shaped) {
 			continue
 		}
-		prompt := shaped[i+1]
-		marker := strings.TrimPrefix(prompt, grokMaintenanceSmokePromptPrefix)
-		return marker != prompt && strings.TrimSpace(marker) != "" && !strings.ContainsAny(marker, "\r\n")
+		return validGrokMaintenanceSmokePrompt(shaped[i+1])
 	}
 	return false
+}
+
+func validGrokMaintenanceSmokePrompt(prompt string) bool {
+	marker := strings.TrimPrefix(prompt, grokMaintenanceSmokePromptPrefix)
+	return marker != prompt && strings.TrimSpace(marker) != "" && !strings.ContainsAny(marker, "\r\n")
+}
+
+// validateGrokMaintenanceSmokeRequestArgs accepts only the updater's canonical
+// signed wire argv. In particular, permission, model/provider, system-prompt,
+// schema, sandbox, rules, and debug-output options are rejected before the
+// general builder can strip or normalize them. The error is deliberately fixed
+// text so an option value containing credentials or a private path is never
+// reflected into a published session error.
+func validateGrokMaintenanceSmokeRequestArgs(args []string) error {
+	if len(args) != 8 ||
+		args[0] != "--tools" || args[1] != "" ||
+		args[2] != "--disable-web-search" ||
+		args[3] != "--no-subagents" ||
+		args[4] != "--max-turns" || args[5] != "1" ||
+		args[6] != "--verbatim" ||
+		!validGrokMaintenanceSmokePrompt(args[7]) {
+		return fmt.Errorf("grok maintenance smoke must use the exact no-tools single-turn contract")
+	}
+	return nil
 }
 
 // grokArgsRequestNoTools validates the smoke's explicit empty built-in-tool
@@ -3113,44 +3148,21 @@ func grokArgsRequestNoTools(args []string) bool {
 	return count == 1
 }
 
-// validateGrokMaintenanceSmokeContract requires every root-level control that
-// makes the signed smoke deterministic and tool-free. The internal signal by
-// itself never relaxes this contract: malformed maintenance requests fail
-// before auth is copied or a child is spawned.
+// validateGrokMaintenanceSmokeContract verifies the final child argv after the
+// general Grok builder has injected its protocol controls. Keeping this exact
+// prevents future builder changes from silently adding an approval, provider,
+// filesystem, or response-shaping option to the maintenance child.
 func validateGrokMaintenanceSmokeContract(args []string) error {
-	requiredFlags := []string{"--disable-web-search", "--no-subagents", "--verbatim"}
-	for _, required := range requiredFlags {
-		count := 0
-		for _, arg := range args {
-			if arg == required {
-				count++
-			}
-		}
-		if count != 1 {
-			return fmt.Errorf("grok maintenance smoke requires %s", required)
-		}
-	}
-
-	maxTurnsCount := 0
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if arg == "--max-turns" {
-			maxTurnsCount++
-			if i+1 >= len(args) || args[i+1] != "1" {
-				return fmt.Errorf("grok maintenance smoke requires --max-turns 1")
-			}
-			i++
-			continue
-		}
-		if value, ok := strings.CutPrefix(arg, "--max-turns="); ok {
-			maxTurnsCount++
-			if value != "1" {
-				return fmt.Errorf("grok maintenance smoke requires --max-turns 1")
-			}
-		}
-	}
-	if maxTurnsCount != 1 {
-		return fmt.Errorf("grok maintenance smoke requires --max-turns 1")
+	if len(args) != 12 ||
+		args[0] != "--output-format" || args[1] != "streaming-json" ||
+		args[2] != "--no-auto-update" ||
+		args[3] != "--tools" || args[4] != "" ||
+		args[5] != "--disable-web-search" ||
+		args[6] != "--no-subagents" ||
+		args[7] != "--max-turns" || args[8] != "1" ||
+		args[9] != "--verbatim" || args[10] != "-p" ||
+		!validGrokMaintenanceSmokePrompt(args[11]) {
+		return fmt.Errorf("grok maintenance smoke child argv violates the exact no-tools single-turn contract")
 	}
 	return nil
 }
@@ -3192,9 +3204,16 @@ func sanitizeGrokMaintenanceSmokeEnv(env []string) []string {
 		"GROK_AGENT":            true,
 		"GROK_AUTH":             true,
 		"GROK_CODE_XAI_API_KEY": true,
+		"GROK_DEFAULT_MODEL":    true,
 		"GROK_DEPLOYMENT_KEY":   true,
 		"GROK_LOCAL_AUTH":       true,
 		"GROK_LOGIN_ENV":        true,
+		"GROK_MODEL":            true,
+		"GROK_MODELS_BASE_URL":  true,
+		"GROK_MODELS_LIST_URL":  true,
+		"GROK_XAI_API_BASE_URL": true,
+		"GROK_API_BASE_URL":     true,
+		"XAI_API_BASE_URL":      true,
 		"GROK_WORKSPACE":        true,
 		"GROK_WORKFLOWS":        true,
 		"GROK_SUBAGENTS":        true,
@@ -3209,6 +3228,7 @@ func sanitizeGrokMaintenanceSmokeEnv(env []string) []string {
 		upper := strings.ToUpper(name)
 		if blocked[upper] || strings.HasPrefix(upper, "GROK_AUTH_PROVIDER_") ||
 			strings.HasPrefix(upper, "GROK_CONFIG") || strings.HasPrefix(upper, "GROK_MANAGED_") ||
+			strings.HasPrefix(upper, "GROK_MODEL_") || strings.HasPrefix(upper, "GROK_MODELS_") ||
 			strings.HasPrefix(upper, "GROK_PLUGIN_") || strings.HasPrefix(upper, "GROK_WORKSPACE_") ||
 			strings.HasPrefix(upper, "GROK_CURSOR_") || strings.HasPrefix(upper, "GROK_CLAUDE_") ||
 			strings.HasPrefix(upper, "GROK_CODEX_") {

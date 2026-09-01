@@ -127,8 +127,13 @@ func TestSessionStartArgsForCommand_PromotesSerializedMaintenanceSmoke(t *testin
 
 	conflicting := cmd
 	conflicting.Args = append(append([]string(nil), cmd.Args...), "--tools", "Bash")
-	if _, promoted := extractGrokMaintenanceSmokeControl(sessionStartArgsForCommand(conflicting)); promoted {
-		t.Fatalf("conflicting serialized smoke was promoted: %#v", conflicting.Args)
+	dispatchedConflicting := sessionStartArgsForCommand(conflicting)
+	cleanedConflicting, promoted := extractGrokMaintenanceSmokeControl(dispatchedConflicting)
+	if !promoted {
+		t.Fatalf("malformed reserved smoke was not promoted for fail-closed validation: %#v", conflicting.Args)
+	}
+	if err := validateGrokMaintenanceSmokeRequestArgs(cleanedConflicting); err == nil {
+		t.Fatalf("conflicting serialized smoke contract was accepted: %#v", cleanedConflicting)
 	}
 }
 
@@ -153,9 +158,10 @@ func TestGrokArgsRequestNoTools_RequiresExplicitEmptyValue(t *testing.T) {
 }
 
 func TestValidateGrokMaintenanceSmokeContract_RequiresAllSafetyControls(t *testing.T) {
+	prompt := grokMaintenanceSmokePromptPrefix + "TEST_MARKER"
 	valid := buildGrokInteractiveArgs([]string{
 		"--tools", "", "--disable-web-search", "--no-subagents",
-		"--max-turns", "1", "--verbatim", "marker",
+		"--max-turns", "1", "--verbatim", prompt,
 	}, false)
 	if err := validateGrokMaintenanceSmokeContract(valid); err != nil {
 		t.Fatalf("valid maintenance contract rejected: %v", err)
@@ -198,6 +204,48 @@ func TestValidateGrokMaintenanceSmokeContract_RequiresAllSafetyControls(t *testi
 	}
 }
 
+func TestValidateGrokMaintenanceSmokeRequestArgs_RejectsEveryExtraOption(t *testing.T) {
+	prompt := grokMaintenanceSmokePromptPrefix + "TEST_MARKER"
+	valid := []string{
+		"--tools", "", "--disable-web-search", "--no-subagents",
+		"--max-turns", "1", "--verbatim", prompt,
+	}
+	if err := validateGrokMaintenanceSmokeRequestArgs(valid); err != nil {
+		t.Fatalf("canonical request rejected: %v", err)
+	}
+
+	tests := [][]string{
+		{"--json-schema", `{"type":"string","secret":"schema-sentinel"}`},
+		{"--system-prompt-override", "system-prompt-sentinel"},
+		{"--rules", "rules-sentinel"},
+		{"--model", "provider-sentinel"},
+		{"--sandbox", "sandbox-sentinel"},
+		{"--debug-file", filepath.Join(t.TempDir(), "debug-path-sentinel")},
+		{"--always-approve"},
+		{"--auto-approve"},
+		{"--permission-mode", "bypassPermissions"},
+		{"--allow", "MCPTool(*)"},
+	}
+	for _, extra := range tests {
+		candidate := append([]string(nil), valid[:len(valid)-1]...)
+		candidate = append(candidate, extra...)
+		candidate = append(candidate, prompt)
+		err := validateGrokMaintenanceSmokeRequestArgs(candidate)
+		if err == nil {
+			t.Errorf("maintenance request with extra option was accepted: %#v", extra)
+			continue
+		}
+		for _, sentinel := range []string{
+			"schema-sentinel", "system-prompt-sentinel", "rules-sentinel", "provider-sentinel",
+			"sandbox-sentinel", "debug-path-sentinel", "bypassPermissions", "MCPTool",
+		} {
+			if strings.Contains(err.Error(), sentinel) {
+				t.Errorf("maintenance rejection leaked %q: %v", sentinel, err)
+			}
+		}
+	}
+}
+
 func TestStartSession_GrokNoToolsRejectsExternalLoaders(t *testing.T) {
 	tests := []struct {
 		args       []string
@@ -236,6 +284,13 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 		"GROK_CODE_XAI_API_KEY=alternate-credential-sentinel",
 		"GROK_AUTH_PROVIDER_ACCESS_TOKEN=provider-credential-sentinel",
 		"GROK_AGENT=agent-path-sentinel",
+		"GROK_DEFAULT_MODEL=model-sentinel",
+		"GROK_MODEL=alternate-model-sentinel",
+		"GROK_MODELS_BASE_URL=https://models-base-sentinel.invalid",
+		"GROK_MODELS_LIST_URL=https://models-list-sentinel.invalid",
+		"GROK_XAI_API_BASE_URL=https://xai-base-sentinel.invalid",
+		"GROK_API_BASE_URL=https://api-base-sentinel.invalid",
+		"XAI_API_BASE_URL=https://alternate-xai-base-sentinel.invalid",
 		"GROK_CURSOR_MCPS_ENABLED=1",
 		"GROK_CLAUDE_MCPS_ENABLED=1",
 		"GROK_CURSOR_AGENTS_ENABLED=1",
@@ -266,6 +321,8 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 		"GROK_AGENT", "GROK_SUBAGENTS", "GROK_WEB_FETCH",
 		"GROK_MEMORY", "GROK_LSP_TOOLS", "GROK_CONFIG_PATH", "GROK_PLUGIN_ROOT",
 		"GROK_MANAGED_CONFIG_URL", "GROK_WORKSPACE_ROOT", "GROK_WORKSPACE_SERVER_SKILLS_DIR",
+		"GROK_DEFAULT_MODEL", "GROK_MODELS_BASE_URL", "GROK_MODELS_LIST_URL",
+		"GROK_MODEL", "GROK_XAI_API_BASE_URL", "GROK_API_BASE_URL", "XAI_API_BASE_URL",
 	} {
 		if _, ok := values[stripped]; ok {
 			t.Errorf("maintenance environment retained %s: %#v", stripped, got)
@@ -289,7 +346,8 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 	for _, secret := range []string{
 		"credential-sentinel", "alternate-credential-sentinel", "provider-credential-sentinel",
 		"agent-path-sentinel", "config-path-sentinel", "managed-config-sentinel", "plugin-path-sentinel",
-		"workspace-path-sentinel", "skills-path-sentinel",
+		"workspace-path-sentinel", "skills-path-sentinel", "model-sentinel", "alternate-model-sentinel", "models-base-sentinel",
+		"models-list-sentinel", "xai-base-sentinel", "api-base-sentinel", "alternate-xai-base-sentinel",
 	} {
 		if strings.Contains(encoded, secret) {
 			t.Errorf("maintenance environment retained %q: %s", secret, encoded)
@@ -321,6 +379,10 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 		wantCategory string
 	}{
 		{"system API key", "[model]\napi_key = 'credential-sentinel'\n", ""},
+		{"table auth provider command", "[auth]\nauth_provider_command = 'credential-sentinel'\n", ""},
+		{"dotted custom model endpoint", `models.custom.base_url = "https://raw-config-sentinel.invalid"` + "\n", ""},
+		{"inline provider headers", `models = { custom = { extra_headers = { Authorization = "credential-sentinel" } } }` + "\n", ""},
+		{"quoted default model", `"models" = { "default" = "customer-secret-name" }` + "\n", ""},
 		{"system plugin", "[plugins]\nenabled = ['private-plugin']\n", "plugin"},
 		{"system MCP", "[mcp_servers.customer-secret-name]\ncommand = 'raw-config-sentinel'\n", "mcp"},
 		{"vendor MCP override", "[compat.cursor]\nmcps = true\n", "vendor-mcp"},
@@ -409,7 +471,7 @@ func TestStartSession_GrokMaintenanceSmokeRunsSystemPreflight(t *testing.T) {
 	sm := NewSessionManager(nil)
 	err := sm.StartSession("grok-system-tools", "grok", []string{
 		grokMaintenanceSmokeControlArg, "--tools", "", "--disable-web-search",
-		"--no-subagents", "--max-turns", "1", "--verbatim", "marker",
+		"--no-subagents", "--max-turns", "1", "--verbatim", grokMaintenanceSmokePromptPrefix + "TEST_MARKER",
 	}, t.TempDir(), "ws", "uid", 1000, false, func(resultMsg) {})
 	if err == nil || !strings.Contains(err.Error(), "system-config preflight") {
 		t.Fatalf("StartSession system-tool config error = %v, want preflight refusal", err)

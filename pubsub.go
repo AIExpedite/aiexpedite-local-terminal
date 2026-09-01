@@ -6089,10 +6089,11 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 	}
 }
 
-// sessionStartArgsForCommand promotes the updater's exact, signed Grok smoke
-// contract into the private in-process control consumed by SessionManager.
-// Ordinary no-tools requests are returned unchanged. Keeping this at the
-// command-dispatch boundary ensures production and tests follow the same path.
+// sessionStartArgsForCommand promotes the updater's reserved, signed Grok smoke
+// prompt envelope into the private in-process control consumed by
+// SessionManager. StartSession validates the exact argv contract; promoting a
+// malformed reserved request makes it fail closed rather than run as an
+// ordinary session. Unrelated no-tools requests remain unchanged.
 func sessionStartArgsForCommand(cmd commandMsg) []string {
 	if !isGrokCommand(cmd.Command) {
 		return cmd.Args
