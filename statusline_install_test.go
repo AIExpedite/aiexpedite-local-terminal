@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -713,14 +714,14 @@ func TestMigratePrevStatusLine_NoOpCasesSucceed(t *testing.T) {
 	dir := t.TempDir()
 	newPrev := filepath.Join(dir, "new-prev.json")
 
-	if err := migratePrevStatusLine("", newPrev); err != nil {
-		t.Errorf("unset old path must be a no-op, got %v", err)
+	if stale, err := migratePrevStatusLine("", newPrev); err != nil || stale != "" {
+		t.Errorf("unset old path must be a no-op, got stale=%q err=%v", stale, err)
 	}
-	if err := migratePrevStatusLine(newPrev, newPrev); err != nil {
-		t.Errorf("unchanged path must be a no-op, got %v", err)
+	if stale, err := migratePrevStatusLine(newPrev, newPrev); err != nil || stale != "" {
+		t.Errorf("unchanged path must be a no-op, got stale=%q err=%v", stale, err)
 	}
-	if err := migratePrevStatusLine(filepath.Join(dir, "absent.json"), newPrev); err != nil {
-		t.Errorf("absent old stash must be a no-op, got %v", err)
+	if stale, err := migratePrevStatusLine(filepath.Join(dir, "absent.json"), newPrev); err != nil || stale != "" {
+		t.Errorf("absent old stash must be a no-op, got stale=%q err=%v", stale, err)
 	}
 	if _, err := os.Stat(newPrev); !os.IsNotExist(err) {
 		t.Errorf("no-op migration must not create the new stash; err=%v", err)
@@ -734,10 +735,90 @@ func TestMigratePrevStatusLine_NoOpCasesSucceed(t *testing.T) {
 	if err := os.WriteFile(oldPrev, []byte(`{"old":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := migratePrevStatusLine(oldPrev, newPrev); err != nil {
-		t.Errorf("pre-existing new stash must be a no-op, got %v", err)
+	stale, err := migratePrevStatusLine(oldPrev, newPrev)
+	if err != nil {
+		t.Errorf("pre-existing new stash must not be a failure, got %v", err)
 	}
 	if got, _ := os.ReadFile(newPrev); string(got) != `{"new":true}` {
 		t.Errorf("existing new stash must not be overwritten, got %s", got)
+	}
+	// The old copy is reported for post-commit cleanup, not removed here: the
+	// command settings.json still holds is the one pinned to oldPrev.
+	if stale != oldPrev {
+		t.Errorf("staleCopy=%q, want %q", stale, oldPrev)
+	}
+	if _, err := os.Stat(oldPrev); err != nil {
+		t.Errorf("old stash must survive until the settings write commits: %v", err)
+	}
+}
+
+// The stash migration must be non-destructive until settings.json commits.
+// Between the two, the command Claude actually holds is still the OLD one,
+// pinned to oldPrev — so moving the file there strands the chain the moment the
+// write fails (a Windows sharing violation, a locked config dir), leaving the
+// user's third-party status line silently unreachable while the refresh reports
+// an error. Copy first, delete after.
+func TestEnsureClaudeStatusLineHook_KeepsOldStashWhenSettingsWriteFails(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	oldPrev := filepath.Join(t.TempDir(), "old-prev.json")
+	stashBody := []byte(`{"statusLine":{"type":"command","command":"third-party.sh"}}`)
+	if err := os.WriteFile(oldPrev, stashBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", oldPrev)
+
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	settings := `{"theme":"dark","statusLine":{"type":"command","command":` +
+		mustJSONString(t, oldCmd) + `}}`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	prevWrite := statusLineWriteFile
+	statusLineWriteFile = func(string, []byte, os.FileMode) error {
+		return errors.New("sharing violation")
+	}
+	changed, err := ensureClaudeStatusLineHook(home)
+	statusLineWriteFile = prevWrite
+	if err == nil {
+		t.Fatalf("install must surface the failed settings write; changed=%v", changed)
+	}
+	if changed {
+		t.Errorf("install must not report a change when the settings write failed")
+	}
+
+	// settings.json is untouched, so the command in force still pins oldPrev…
+	got, readErr := os.ReadFile(settingsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != settings {
+		t.Errorf("settings.json must be untouched after a failed write:\ngot  %s\nwant %s", got, settings)
+	}
+	// …and the stash it points at must still be there.
+	stash, readErr := os.ReadFile(oldPrev)
+	if readErr != nil {
+		t.Fatalf("old stash must survive a failed settings write: %v", readErr)
+	}
+	if string(stash) != string(stashBody) {
+		t.Errorf("old stash body mismatch: got %s want %s", stash, stashBody)
+	}
+
+	// The chain is genuinely intact: opt-out restores the third-party command.
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(settingsPath)
+	if !strings.Contains(string(raw), "third-party.sh") {
+		t.Errorf("opt-out lost the chained third-party command: %s", raw)
 	}
 }

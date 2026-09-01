@@ -28,6 +28,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -450,7 +451,7 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 // percentage, so claiming its own provenance for a percentage it did not
 // measure would be wrong.
 func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) {
-	_, _ = mergeClaudeRateLimitCacheInto(path, updates, now, fingerprint, source, false)
+	_, _ = mergeClaudeRateLimitCacheInto(context.Background(), path, updates, now, fingerprint, source, false)
 }
 
 // mergeClaudeRateLimitCacheChecked is the same merge, but REPORTS whether the
@@ -489,10 +490,12 @@ func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeR
 // heartbeat, or never persisted at all — collapses the result to zero. There is
 // no instant at which that row was measured, so no debt can be paid with it.
 //
-// It is also the only merge that is BOUNDED end to end and that treats an
-// unserialized write as a failure — see mergeClaudeRateLimitCacheInto.
-func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) (time.Time, error) {
-	return mergeClaudeRateLimitCacheInto(path, updates, now, fingerprint, source, true)
+// It is also the only merge that is BOUNDED end to end — by its own persist
+// budget AND by the caller's ctx, so it cannot outlive the gather that asked for
+// it — and that treats an unserialized write as a failure. See
+// mergeClaudeRateLimitCacheInto.
+func mergeClaudeRateLimitCacheChecked(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) (time.Time, error) {
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true)
 }
 
 // mergeClaudeRateLimitCacheInto is the shared implementation. `verified` selects
@@ -509,20 +512,28 @@ func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRate
 //     under no deadline of its own, but runs inside a Claude stdout scanner, so
 //     it waits claudeRateLimitBestEffortGateWait for the gate and then DROPS the
 //     merge rather than stall the scanner behind an abandoned, unkillable write.
-//   - Lock contention. A best-effort writer proceeds unlocked — losing one
-//     window update that the next event rewrites moments later beats losing the
-//     reading outright. A verified one REFUSES, because an unlocked
-//     read-modify-rename is not a persisted write: a holder that paused after
-//     reading the old snapshot will rename its stale copy over ours the moment
-//     it resumes, and by then the probe has already reported success, settled
-//     the post-run debt, and signed a receipt for an observation the cache no
-//     longer holds. A refusal costs one retry; a false success costs the feature.
+//   - What a refusal COSTS. Both modes refuse a CONFIRMED holder (see below);
+//     they differ in what the caller is told. A best-effort writer drops the
+//     merge silently — the next rate-limit line rewrites the same windows
+//     moments later. A verified one returns the failure, so the probe backs off,
+//     retries, and signs nothing in the meantime.
+//
+// Confirmed contention refuses in BOTH modes, and that is a correctness rule,
+// not a politeness one. An unlocked read-modify-rename behind a holder is not
+// "one lost window update": the best-effort writer reads the snapshot the holder
+// has not replaced yet, and renames that stale copy over the holder's committed
+// result — deleting probe-only windows and LastProbeObservedAtMs AFTER the probe
+// reported success, settled the post-run debt, and signed a receipt for them.
+// The status-line hook runs in its own process on exactly this path, so the
+// window is real whenever a verified merge outlives claudeRateLimitCacheLockWait.
+// A dropped best-effort merge costs one reading; a resurrected stale snapshot
+// costs the feature.
 //
 // A lock we could not even OPEN is a different fact and keeps the degraded path
 // in both modes: there is no evidence of a competing holder, only of a
 // filesystem that will not give us the lock file (a read-only data dir fails the
 // write below anyway, which the verified caller does see).
-func mergeClaudeRateLimitCacheInto(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, verified bool) (time.Time, error) {
+func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, verified bool) (time.Time, error) {
 	if path == "" || len(updates) == 0 {
 		return time.Time{}, fmt.Errorf("claude rate-limit cache: nothing to merge")
 	}
@@ -542,7 +553,8 @@ func mergeClaudeRateLimitCacheInto(path string, updates map[string]claudeRateLim
 	// prevent, one step further down.
 	//
 	// So the serialized merge runs on its own goroutine and the caller waits for
-	// it only until the budget expires. Abandoning it is safe in both directions:
+	// it only until the budget expires — or until ctx ends, whichever comes
+	// first, so this write can never push the gather past its own deadline. Abandoning it is safe in both directions:
 	// the result channel is buffered, so a late answer is dropped rather than
 	// parking that goroutine forever; the goroutine keeps BOTH locks until its
 	// syscall returns, so no other writer can interleave a read-modify-rename
@@ -571,6 +583,16 @@ func mergeClaudeRateLimitCacheInto(path string, updates map[string]claudeRateLim
 	select {
 	case res := <-done:
 		return res.observed, res.err
+	case <-ctx.Done():
+		// The caller's own deadline is the tighter one. A verified merge is
+		// reached at the END of a probe that already spent its request timeout
+		// (and possibly a join wait) inside the SHARED gather budget, so a
+		// persist budget measured from time.Now() can outlive the gather that
+		// asked for it — delaying every provider queued behind Claude and the
+		// refresh result itself. Stop waiting here; the goroutine keeps its full
+		// budget and its locks, so the reading still lands for the next gather.
+		return time.Time{}, fmt.Errorf("claude rate-limit cache: persist abandoned before the %s budget: %w",
+			claudeRateLimitVerifiedPersistBudget, ctx.Err())
 	case <-timer.C:
 		return time.Time{}, fmt.Errorf("claude rate-limit cache: persist exceeded the %s budget",
 			claudeRateLimitVerifiedPersistBudget)
@@ -579,10 +601,10 @@ func mergeClaudeRateLimitCacheInto(path string, updates map[string]claudeRateLim
 
 // mergeClaudeRateLimitCacheSerialized runs the read-merge-rename under the
 // in-process gate and the cross-process file lock. A zero budgetDeadline selects
-// the best-effort contract (block for the gate however long it takes, proceed
-// unlocked when the cross-process lock is contended); a non-zero one selects the
-// verified contract, clamping both waits to what is left of the caller's budget
-// and refusing an unlocked write.
+// the best-effort contract (wait claudeRateLimitBestEffortGateWait for the gate,
+// then drop the merge); a non-zero one selects the verified contract, clamping
+// both waits to what is left of the caller's budget and reporting the failure
+// rather than dropping it. Neither contract writes behind a confirmed holder.
 func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time) (time.Time, error) {
 	verified := !budgetDeadline.IsZero()
 	if verified {
@@ -626,9 +648,11 @@ func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeR
 			_ = lockFile.Close()
 		}()
 	case claudeRateLimitLockContended:
-		if verified {
-			return time.Time{}, fmt.Errorf("claude rate-limit cache: held by another writer")
-		}
+		// Confirmed contention refuses in BOTH modes. See the contract note on
+		// mergeClaudeRateLimitCacheInto: an unlocked read-modify-rename here is
+		// not "one lost window update", it is a stale snapshot renamed over a
+		// verified writer's committed result.
+		return time.Time{}, fmt.Errorf("claude rate-limit cache: held by another writer")
 	}
 
 	snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
@@ -871,8 +895,8 @@ var claudeRateLimitCacheWriteFile = os.WriteFile
 // can end up not held, because they are not the same fact. "Another writer has
 // it" says a competing read-modify-rename is in flight and ours may be undone by
 // it; "we could not open the lock file at all" says only that this filesystem
-// will not give us one, with no evidence of a competitor. The verified merge
-// refuses the first and tolerates the second.
+// will not give us one, with no evidence of a competitor. Every merge refuses
+// the first and tolerates the second.
 type claudeRateLimitLockOutcome int
 
 const (
@@ -884,12 +908,11 @@ const (
 // acquireClaudeRateLimitCacheLock takes the sibling `.lock` file, waiting until
 // `deadline` for a contending holder to release it.
 //
-// A non-acquired return drops the best-effort callers to the same degraded path
-// an uncreatable lock file already took: the merge proceeds under the in-process
-// gate alone. That is a deliberate trade — a bounded risk of losing one
-// concurrent window update (which the next event rewrites) in exchange for never
-// wedging a caller that is under a deadline. Callers MUST unlock + close on
-// claudeRateLimitLockAcquired, and skip otherwise.
+// Only claudeRateLimitLockUnavailable takes the degraded unlocked path, and only
+// because it carries no evidence of a competitor. claudeRateLimitLockContended
+// does, so every caller refuses it: proceeding would rename a snapshot read
+// while the holder was mid-write over whatever the holder went on to commit.
+// Callers MUST unlock + close on claudeRateLimitLockAcquired, and skip otherwise.
 func acquireClaudeRateLimitCacheLock(cachePath string, deadline time.Time) (*os.File, claudeRateLimitLockOutcome) {
 	lockPath := cachePath + ".lock"
 	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)

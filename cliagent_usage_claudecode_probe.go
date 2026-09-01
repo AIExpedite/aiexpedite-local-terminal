@@ -1130,7 +1130,13 @@ func probeClaudeUsage(
 	// tell the caller to re-read a cache that never changed, clear the failure
 	// backoff, and throttle the retry, while a SIGNED refresh receipt went out
 	// carrying an observation that was never persisted.
-	persisted, err := mergeClaudeRateLimitCacheChecked(claudeRateLimitCachePath(), updates, now,
+	//
+	// ctx, not context.Background(): the merge has its own persist budget, but
+	// this call is reached at the very end of the gather's shared deadline, so
+	// that budget must be clamped by whatever is left of it rather than added to
+	// it. An abandoned merge still finishes on its own goroutine — the reading
+	// lands for the next gather; this probe just does not claim it.
+	persisted, err := mergeClaudeRateLimitCacheChecked(ctx, claudeRateLimitCachePath(), updates, now,
 		identity.fingerprint, claudeRateLimitSourceProbe)
 	if err != nil {
 		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorCollectionFailed)

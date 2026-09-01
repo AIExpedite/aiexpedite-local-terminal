@@ -354,52 +354,59 @@ func copyPrevStatusLine(src, dst string) error {
 	return os.WriteFile(dst, b, 0o600)
 }
 
-// migratePrevStatusLine moves the pinned status-line stash from the path an
+// migratePrevStatusLine COPIES the pinned status-line stash from the path an
 // earlier install baked into the command to the path this boot resolves (e.g.
 // GetConfigDir() landed somewhere else). It must run BEFORE the refreshed
 // command is written: the new command pins newPrev, so a stash left behind at
 // oldPrev would be invisible to both the hook's chain lookup and opt-out.
 //
-// "Nothing to migrate" is not a failure — an unset/unchanged oldPrev, a stash
-// already present at newPrev, or an absent oldPrev all return nil. Every other
-// outcome IS a failure and is returned, because silently continuing is what
-// loses the user's third-party status line.
-func migratePrevStatusLine(oldPrev, newPrev string) error {
+// It returns the old path for the caller to delete ONCE the settings write has
+// committed — never deleting it here. Between this call and that write the stash
+// has to satisfy BOTH commands: settings.json still holds the previously
+// installed one, pinned to oldPrev, and it keeps resolving for as long as the
+// write can still fail (a sharing violation on Windows, a permission error, a
+// full disk). Moving the file would leave that live command chaining to a path
+// nothing occupies — the user's third-party status line silently gone while the
+// refresh reports an error. Copying leaves both paths valid, and the duplicate
+// costs one small JSON file until the caller retires oldPrev.
+//
+// "Nothing to migrate" is not a failure — an unset/unchanged oldPrev or an
+// absent oldPrev return an empty path and nil. Every other outcome IS a failure
+// and is returned, because silently continuing is what loses the user's
+// third-party status line.
+func migratePrevStatusLine(oldPrev, newPrev string) (staleCopy string, err error) {
 	if oldPrev == "" || oldPrev == newPrev {
-		return nil
+		return "", nil
 	}
 	if _, err := os.Stat(newPrev); err == nil {
-		return nil // already migrated (or a fresh stash lives there)
+		// Already migrated (or a fresh stash lives there). Nothing to copy, but
+		// oldPrev is still a duplicate the committed command will no longer
+		// name, so it is retired on the same terms as one we just wrote — after
+		// the write, not before it.
+		return oldPrev, nil
 	} else if !os.IsNotExist(err) {
 		// Can't tell whether the new stash exists — proceeding would pin the
 		// command to a path we were unable to verify.
-		return err
+		return "", err
 	}
 	if _, err := os.Stat(oldPrev); err != nil {
 		if os.IsNotExist(err) {
-			return nil // no stash to carry over; the chain target never existed
+			return "", nil // no stash to carry over; the chain target never existed
 		}
-		return err
+		return "", err
 	}
 	if err := os.MkdirAll(filepath.Dir(newPrev), 0o755); err != nil {
-		return err
+		return "", err
 	}
-	// os.Rename returns EXDEV when oldPrev and newPrev sit on different
-	// filesystems (e.g. XDG_CONFIG_HOME moved from the home disk to a mounted
-	// drive). Fall back to a private-mode copy-and-remove so the migration
-	// still happens across volumes — do NOT use the binary `copyFile` helper
-	// here: it chmods to 0o755, which would leave the stash world-readable on
-	// Unix and expose the previously chained command (potentially including
-	// inline env vars / tokens) to other local users.
-	if err := os.Rename(oldPrev, newPrev); err != nil {
-		if copyErr := copyPrevStatusLine(oldPrev, newPrev); copyErr != nil {
-			return copyErr
-		}
-		// The stash is safely at newPrev now; a failed cleanup of the old copy
-		// is cosmetic, not a migration failure.
-		_ = os.Remove(oldPrev)
+	// A private-mode copy, and NOT the binary `copyFile` helper: that one chmods
+	// to 0o755, which would leave the stash world-readable on Unix and expose the
+	// previously chained command (potentially including inline env vars / tokens)
+	// to other local users. Copying also crosses filesystems, which os.Rename
+	// cannot (EXDEV) when e.g. XDG_CONFIG_HOME moved to a mounted drive.
+	if err := copyPrevStatusLine(oldPrev, newPrev); err != nil {
+		return "", err
 	}
-	return nil
+	return oldPrev, nil
 }
 
 // ensureClaudeStatusLineHook installs (or refreshes) the status-line hook in
@@ -456,6 +463,10 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 		return false, nil // already installed, exact match
 	}
 
+	// staleStash is the pre-migration copy of the pinned stash, retired only
+	// after settings.json commits — see migratePrevStatusLine.
+	staleStash := ""
+
 	// A different command that isn't one of ours is a real user/third-party
 	// status line — stash the FULL object so the hook can chain to its command
 	// AND opt-out can restore its other options. (A command that IS ours but
@@ -477,7 +488,8 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 		// only at the old one, silently dropping the chain target.
 		oldPrev := extractInstalledPinnedPath(existing.Command, "STATUSLINE_PREV")
 		newPrev := prevStatusLinePath()
-		if err := migratePrevStatusLine(oldPrev, newPrev); err != nil {
+		migrated, err := migratePrevStatusLine(oldPrev, newPrev)
+		if err != nil {
 			// Abort for the same reason the savePrevStatusLine branch above
 			// does: writing the refreshed command would pin the hook (and
 			// opt-out) to newPrev while the user's chained third-party status
@@ -487,6 +499,9 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 			// oldPrev, where the stash actually is — keeps resolving.
 			return false, err
 		}
+		// Retire the old copy only after the settings write below commits: until
+		// then the installed command still names oldPrev.
+		staleStash = migrated
 	} else if existing.Command == "" {
 		// Installing over an empty/absent statusLine: there's no third-party
 		// command to chain to, but a stale `claude_statusline_prev.json` from an
@@ -521,6 +536,12 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 	}
 	if err := writeSettingsAtomic(settingsPath, out); err != nil {
 		return false, err
+	}
+	// The refreshed command is committed and names newPrev, so the pre-migration
+	// copy is finally unreachable. A failed cleanup is cosmetic — the stash the
+	// installed command resolves is already in place.
+	if staleStash != "" {
+		_ = os.Remove(staleStash)
 	}
 	return true, nil
 }
@@ -792,6 +813,13 @@ func removeClaudeStatusLineHook(home string) (bool, error) {
 	return true, nil
 }
 
+// statusLineWriteFile is os.WriteFile behind a seam, so a test can fail the
+// settings commit the way a Windows sharing violation or a locked config dir
+// does. That is the failure the stash migration has to survive with the user's
+// chained status line intact, and it is not reproducible on demand through the
+// filesystem on every OS the agent ships to.
+var statusLineWriteFile = os.WriteFile
+
 // writeSettingsAtomic writes settings.json via a temp file + rename so a crash
 // mid-write can't leave Claude with a half-written config.
 func writeSettingsAtomic(settingsPath string, out []byte) error {
@@ -799,7 +827,7 @@ func writeSettingsAtomic(settingsPath string, out []byte) error {
 		return err
 	}
 	tmp := settingsPath + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+	if err := statusLineWriteFile(tmp, out, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, settingsPath); err != nil {
