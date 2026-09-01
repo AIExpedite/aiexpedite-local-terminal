@@ -195,11 +195,11 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		return fmt.Errorf("session %s already exists", id)
 	}
 
-	// Maintenance smokes carry an explicit AI Expedite control token inside the
-	// signed args array. Consume it before building Grok's argv so it can never
-	// reach the child. An empty --tools value on its own remains an ordinary
-	// caller request; it must not silently opt into the smoke's auth/config
-	// isolation policy.
+	// The session_start dispatcher derives an explicit AI Expedite control token
+	// from the complete signed maintenance contract. Consume it before building
+	// Grok's argv so it can never reach the child. An empty --tools value on its
+	// own remains an ordinary caller request; it must not silently opt into the
+	// smoke's auth/config isolation policy.
 	grokMaintenanceSmoke := false
 	if isGrokCommand(command) {
 		args, grokMaintenanceSmoke = extractGrokMaintenanceSmokeControl(args)
@@ -3012,10 +3012,12 @@ func rewriteGrokPromptToFile(cliArgs []string) (newArgs []string, cleanupPath st
 	return rewritten, tempPath
 }
 
-// grokMaintenanceSmokeControlArg is an AI Expedite-only control token carried
-// in the signed session_start args. It is consumed before Grok argv shaping and
-// must never be forwarded to the CLI.
+// grokMaintenanceSmokeControlArg is an AI Expedite-only in-process control
+// derived from the signed session_start contract. It is consumed before Grok
+// argv shaping and must never be forwarded to the CLI.
 const grokMaintenanceSmokeControlArg = "--aiexpedite-maintenance-smoke"
+
+const grokMaintenanceSmokePromptPrefix = "Return exactly this marker and nothing else: "
 
 // extractGrokMaintenanceSmokeControl removes the internal maintenance-smoke
 // token and reports whether it was present. Keeping the signal separate from
@@ -3032,6 +3034,29 @@ func extractGrokMaintenanceSmokeControl(args []string) ([]string, bool) {
 		cleaned = append(cleaned, arg)
 	}
 	return cleaned, requested
+}
+
+// grokMaintenanceSmokeRequest recognises the complete maintenance request the
+// updater already sends over session_start. Args are part of commandMsg's HMAC
+// payload, so deriving the private control bit here keeps it authenticated
+// without adding a new wire field that older publishers cannot sign. The exact
+// prompt prefix plus the full safety contract distinguishes this from an
+// ordinary caller that merely chooses `--tools ""`.
+func grokMaintenanceSmokeRequest(args []string) bool {
+	cleaned, _ := extractGrokMaintenanceSmokeControl(args)
+	shaped := buildGrokInteractiveArgs(cleaned, false)
+	if !grokArgsRequestNoTools(shaped) || validateGrokMaintenanceSmokeContract(shaped) != nil {
+		return false
+	}
+	for i, arg := range shaped {
+		if arg != "-p" || i+1 >= len(shaped) {
+			continue
+		}
+		prompt := shaped[i+1]
+		marker := strings.TrimPrefix(prompt, grokMaintenanceSmokePromptPrefix)
+		return marker != prompt && strings.TrimSpace(marker) != "" && !strings.ContainsAny(marker, "\r\n")
+	}
+	return false
 }
 
 // grokArgsRequestNoTools validates the smoke's explicit empty built-in-tool
@@ -3051,15 +3076,24 @@ func grokArgsRequestNoTools(args []string) bool {
 	if !hasManagedPrompt {
 		return false
 	}
-	for i, arg := range args {
+	count := 0
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 		switch {
-		case arg == "--tools=":
-			return true
+		case strings.HasPrefix(arg, "--tools="):
+			count++
+			if arg != "--tools=" {
+				return false
+			}
 		case arg == "--tools":
-			return i+1 < len(args) && args[i+1] == ""
+			count++
+			if i+1 >= len(args) || args[i+1] != "" {
+				return false
+			}
+			i++
 		}
 	}
-	return false
+	return count == 1
 }
 
 // validateGrokMaintenanceSmokeContract requires every root-level control that
@@ -3069,30 +3103,36 @@ func grokArgsRequestNoTools(args []string) bool {
 func validateGrokMaintenanceSmokeContract(args []string) error {
 	requiredFlags := []string{"--disable-web-search", "--no-subagents", "--verbatim"}
 	for _, required := range requiredFlags {
-		found := false
+		count := 0
 		for _, arg := range args {
 			if arg == required {
-				found = true
-				break
+				count++
 			}
 		}
-		if !found {
+		if count != 1 {
 			return fmt.Errorf("grok maintenance smoke requires %s", required)
 		}
 	}
 
-	maxTurns := ""
-	for i, arg := range args {
-		if arg == "--max-turns" && i+1 < len(args) {
-			maxTurns = args[i+1]
-			break
+	maxTurnsCount := 0
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--max-turns" {
+			maxTurnsCount++
+			if i+1 >= len(args) || args[i+1] != "1" {
+				return fmt.Errorf("grok maintenance smoke requires --max-turns 1")
+			}
+			i++
+			continue
 		}
 		if value, ok := strings.CutPrefix(arg, "--max-turns="); ok {
-			maxTurns = value
-			break
+			maxTurnsCount++
+			if value != "1" {
+				return fmt.Errorf("grok maintenance smoke requires --max-turns 1")
+			}
 		}
 	}
-	if maxTurns != "1" {
+	if maxTurnsCount != 1 {
 		return fmt.Errorf("grok maintenance smoke requires --max-turns 1")
 	}
 	return nil

@@ -73,6 +73,65 @@ func TestExtractGrokMaintenanceSmokeControl_IsExplicitAndNeverForwarded(t *testi
 	}
 }
 
+func TestSessionStartArgsForCommand_PromotesSerializedMaintenanceSmoke(t *testing.T) {
+	const payload = `{
+		"id":"maintenance-smoke-1",
+		"type":"session_start",
+		"sessionID":"grok-smoke-session",
+		"command":"grok",
+		"args":["--tools","","--disable-web-search","--no-subagents","--max-turns","1","--verbatim","Return exactly this marker and nothing else: AIEXPEDITE_GROK_SMOKE_MARKER_7F3C2A"],
+		"ts":1770000000000
+	}`
+	var cmd commandMsg
+	if err := json.Unmarshal([]byte(payload), &cmd); err != nil {
+		t.Fatalf("unmarshal serialized maintenance command: %v", err)
+	}
+	const commandSecret = "maintenance-dispatch-secret"
+	signedPayload, err := json.Marshal(signaturePayload{
+		ID: cmd.ID, Command: cmd.Command, Args: cmd.Args, Ts: cmd.Ts,
+		Type: cmd.Type, SessionID: cmd.SessionID,
+	})
+	if err != nil {
+		t.Fatalf("marshal signed maintenance payload: %v", err)
+	}
+	cmd.Signature = generateHMAC(string(signedPayload), commandSecret)
+	wirePayload, err := json.Marshal(cmd)
+	if err != nil {
+		t.Fatalf("marshal wire maintenance command: %v", err)
+	}
+	var received commandMsg
+	if err := json.Unmarshal(wirePayload, &received); err != nil {
+		t.Fatalf("unmarshal wire maintenance command: %v", err)
+	}
+	if !verifySignature(received, commandSecret) {
+		t.Fatal("serialized maintenance args were not covered by the command signature")
+	}
+	cmd = received
+	original := append([]string(nil), cmd.Args...)
+	dispatched := sessionStartArgsForCommand(cmd)
+	cleaned, promoted := extractGrokMaintenanceSmokeControl(dispatched)
+	if !promoted {
+		t.Fatalf("serialized production smoke was not promoted: %#v", dispatched)
+	}
+	if !reflect.DeepEqual(cleaned, original) {
+		t.Fatalf("promotion changed signed smoke args: got %#v, want %#v", cleaned, original)
+	}
+	if !reflect.DeepEqual(cmd.Args, original) {
+		t.Fatalf("dispatch mutated the deserialized signed args: got %#v, want %#v", cmd.Args, original)
+	}
+
+	ordinary := commandMsg{Command: "grok", Args: []string{"--tools", "", "ordinary no-tools prompt"}}
+	if got := sessionStartArgsForCommand(ordinary); !reflect.DeepEqual(got, ordinary.Args) {
+		t.Fatalf("ordinary no-tools request was promoted: %#v", got)
+	}
+
+	conflicting := cmd
+	conflicting.Args = append(append([]string(nil), cmd.Args...), "--tools", "Bash")
+	if _, promoted := extractGrokMaintenanceSmokeControl(sessionStartArgsForCommand(conflicting)); promoted {
+		t.Fatalf("conflicting serialized smoke was promoted: %#v", conflicting.Args)
+	}
+}
+
 func TestGrokArgsRequestNoTools_RequiresExplicitEmptyValue(t *testing.T) {
 	tests := []struct {
 		args []string
@@ -81,6 +140,8 @@ func TestGrokArgsRequestNoTools_RequiresExplicitEmptyValue(t *testing.T) {
 		{buildGrokInteractiveArgs([]string{"--tools", "", "marker"}, false), true},
 		{buildGrokInteractiveArgs([]string{"--tools=", "marker"}, false), true},
 		{buildGrokInteractiveArgs([]string{"--tools", "Bash", "marker"}, false), false},
+		{buildGrokInteractiveArgs([]string{"--tools", "", "--tools", "Bash", "marker"}, false), false},
+		{buildGrokInteractiveArgs([]string{"--tools=", "--tools", "", "marker"}, false), false},
 		{buildGrokInteractiveArgs([]string{"--disable-web-search", "marker"}, false), false},
 		{[]string{"--tools", "", "models"}, false},
 	}
@@ -117,6 +178,23 @@ func TestValidateGrokMaintenanceSmokeContract_RequiresAllSafetyControls(t *testi
 		if err := validateGrokMaintenanceSmokeContract(trimmed); err == nil {
 			t.Errorf("contract missing %s was accepted: %#v", missing, trimmed)
 		}
+	}
+
+	for _, duplicate := range [][]string{
+		{"--max-turns", "1"},
+		{"--max-turns=5"},
+		{"--disable-web-search"},
+		{"--no-subagents"},
+		{"--verbatim"},
+	} {
+		conflicting := append(append([]string(nil), valid...), duplicate...)
+		if err := validateGrokMaintenanceSmokeContract(conflicting); err == nil {
+			t.Errorf("contract with duplicate/conflicting controls was accepted: %#v", conflicting)
+		}
+	}
+	dangling := append(append([]string(nil), valid...), "--max-turns")
+	if err := validateGrokMaintenanceSmokeContract(dangling); err == nil {
+		t.Errorf("contract with dangling --max-turns was accepted: %#v", dangling)
 	}
 }
 
@@ -167,13 +245,18 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 	}
 
 	tests := []struct {
-		name string
-		body string
+		name         string
+		body         string
+		wantCategory string
 	}{
-		{"system API key", "[model]\napi_key = 'credential-sentinel'\n"},
-		{"system plugin", "[plugins]\nenabled = ['private-plugin']\n"},
-		{"system MCP", "[mcp_servers.private]\ncommand = 'raw-config-sentinel'\n"},
-		{"vendor MCP override", "[compat.cursor]\nmcps = true\n"},
+		{"system API key", "[model]\napi_key = 'credential-sentinel'\n", ""},
+		{"system plugin", "[plugins]\nenabled = ['private-plugin']\n", "plugin"},
+		{"system MCP", "[mcp_servers.customer-secret-name]\ncommand = 'raw-config-sentinel'\n", "mcp"},
+		{"vendor MCP override", "[compat.cursor]\nmcps = true\n", "vendor-mcp"},
+		{"inline vendor MCP", "compat = { cursor = { mcps = true } }\n", "vendor-mcp"},
+		{"inline approval", `approval = { mode = "always" }` + "\n", ""},
+		{"inline plugin", `plugins = { enabled = ["customer-secret-name"] }` + "\n", "plugin"},
+		{"inline MCP", `mcp_servers = { "customer-secret-name" = { command = "raw-config-sentinel" } }` + "\n", "mcp"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -184,7 +267,10 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 			if err == nil {
 				t.Fatalf("system config was accepted: %s", tc.body)
 			}
-			for _, secret := range []string{"credential-sentinel", "private-plugin", "raw-config-sentinel"} {
+			if tc.wantCategory != "" && !strings.Contains(err.Error(), `"`+tc.wantCategory+`"`) {
+				t.Fatalf("system-config refusal %q omitted fixed category %q", err, tc.wantCategory)
+			}
+			for _, secret := range []string{"credential-sentinel", "private-plugin", "raw-config-sentinel", "customer-secret-name", "customer_secret_name"} {
 				if strings.Contains(err.Error(), secret) {
 					t.Fatalf("system-config refusal leaked %q: %v", secret, err)
 				}
@@ -200,6 +286,12 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 	}
 	if err := detectGrokMaintenanceSmokeSystemConfig(); err != nil {
 		t.Fatalf("explicit system vendor-MCP disables must remain valid: %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("compat = { cursor = { mcps = false }, claude = { mcps = false } }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := detectGrokMaintenanceSmokeSystemConfig(); err != nil {
+		t.Fatalf("inline system vendor-MCP disables must remain valid: %v", err)
 	}
 
 	if err := os.WriteFile(managedPath, []byte(strings.Repeat("#", (1<<20)+1)), 0o600); err != nil {

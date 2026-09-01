@@ -815,13 +815,18 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 	t.Cleanup(resetVersionProbeCache)
 
 	smokeArgs := []string{
-		grokMaintenanceSmokeControlArg,
 		"--tools", "", "--disable-web-search", "--no-subagents", "--max-turns", "1", "--verbatim",
 		"Return exactly this marker and nothing else: " + grokMaintenanceSmokeMarker,
 	}
+	dispatchedSmokeArgs := sessionStartArgsForCommand(commandMsg{
+		Type: "session_start", Command: "grok", Args: smokeArgs,
+	})
+	if _, promoted := extractGrokMaintenanceSmokeControl(dispatchedSmokeArgs); !promoted {
+		t.Fatalf("production session_start dispatch did not promote maintenance smoke: %#v", dispatchedSmokeArgs)
+	}
 	run := func(mode string) cliAgentUsage {
 		t.Helper()
-		_, messages, err := captureSession(t, mode, "grok", smokeArgs, "")
+		_, messages, err := captureSession(t, mode, "grok", dispatchedSmokeArgs, "")
 		if err != nil {
 			t.Fatalf("%s session: %v", mode, err)
 		}

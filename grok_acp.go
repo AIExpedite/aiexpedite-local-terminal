@@ -1743,15 +1743,16 @@ func detectGrokMaintenanceSmokeSystemConfig() error {
 			return err
 		}
 		if ok {
-			return fmt.Errorf("grok system configuration enables external tools via %q; refusing no-tools maintenance smoke", setting)
+			return fmt.Errorf("grok system configuration contains disallowed %q settings; refusing no-tools maintenance smoke", setting)
 		}
 	}
 	return nil
 }
 
-// grokSystemExternalToolSetting returns a normalized TOML key/section name,
-// never its value. System config may contain credentials, commands, or private
-// paths, so refusal errors must not echo raw file data.
+// grokSystemExternalToolSetting returns only a fixed tool category, never a
+// caller-controlled TOML key, section, or value. System config may contain
+// credentials, commands, private paths, and sensitive server identifiers, so
+// refusal errors must not echo raw file data.
 func grokSystemExternalToolSetting(path string) (string, bool, error) {
 	if path == "" {
 		return "", false, nil
@@ -1783,8 +1784,8 @@ func grokSystemExternalToolSetting(path string) (string, bool, error) {
 			// Trim both scalar-table and array-of-table brackets so
 			// [[mcp_servers]] cannot evade the namespace check.
 			section = normalizeGrokSystemToolKey(strings.Trim(line, "[] \t"))
-			if grokSystemToolNamespace(section) {
-				return section, true, nil
+			if category := grokSystemToolCategory(section); category != "" {
+				return category, true, nil
 			}
 			continue
 		}
@@ -1800,12 +1801,15 @@ func grokSystemExternalToolSetting(path string) (string, bool, error) {
 		value := strings.ToLower(strings.TrimSpace(line[eq+1:]))
 		if qualified == "compat.cursor.mcps" || qualified == "compat.claude.mcps" {
 			if value != "false" {
-				return qualified, true, nil
+				return "vendor-mcp", true, nil
 			}
 			continue
 		}
-		if grokSystemToolNamespace(qualified) {
-			return qualified, true, nil
+		if category := grokSystemToolCategory(qualified); category != "" {
+			return category, true, nil
+		}
+		if category := grokSystemInlineToolCategory(qualified, line[eq+1:]); category != "" {
+			return category, true, nil
 		}
 	}
 	if scanner.Err() != nil {
@@ -1820,17 +1824,53 @@ func normalizeGrokSystemToolKey(value string) string {
 	return value
 }
 
-func grokSystemToolNamespace(value string) bool {
+func grokSystemToolCategory(value string) string {
 	for _, component := range strings.Split(value, ".") {
 		component = strings.Trim(component, " \t\"'")
 		if component == "mcp" || component == "mcps" || component == "mcpservers" ||
-			strings.HasPrefix(component, "mcp_") || strings.HasPrefix(component, "mcpserver") ||
-			component == "plugin" || component == "plugins" ||
+			strings.HasPrefix(component, "mcp_") || strings.HasPrefix(component, "mcpserver") {
+			return "mcp"
+		}
+		if component == "plugin" || component == "plugins" ||
 			strings.HasPrefix(component, "plugin_") || strings.HasPrefix(component, "installed_plugin") {
-			return true
+			return "plugin"
 		}
 	}
-	return false
+	return ""
+}
+
+// grokSystemInlineToolCategory handles TOML's semantically equivalent inline
+// table form, e.g. `compat = { cursor = { mcps = true } }`. The system files
+// are operator-controlled and this is a fail-closed preflight, so conservative
+// keyword recognition is preferable to silently accepting a nested loader.
+func grokSystemInlineToolCategory(key, rawValue string) string {
+	compact := strings.ToLower(rawValue)
+	compact = strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "", "-", "_").Replace(compact)
+	if (key == "compat" || strings.HasSuffix(key, ".compat")) &&
+		(strings.Contains(compact, "cursor") || strings.Contains(compact, "claude")) &&
+		strings.Contains(compact, "mcps=") {
+		if strings.Contains(compact, "mcps=true") || strings.Contains(compact, `mcps="true"`) || strings.Contains(compact, "mcps='true'") {
+			return "vendor-mcp"
+		}
+		// An inline table that explicitly disables every named vendor MCP
+		// source is equivalent to the safe section form written by isolation.
+		// Remove only those safe assignments, then continue scanning in case
+		// the same inline table also declares a separate plugin/MCP loader.
+		compact = strings.NewReplacer(
+			"mcps=false", "",
+			`mcps="false"`, "",
+			"mcps='false'", "",
+		).Replace(compact)
+	}
+	if strings.Contains(compact, "mcp=") || strings.Contains(compact, "mcps=") ||
+		strings.Contains(compact, "mcp_servers=") || strings.Contains(compact, "mcpservers=") {
+		return "mcp"
+	}
+	if strings.Contains(compact, "plugin=") || strings.Contains(compact, "plugins=") ||
+		strings.Contains(compact, "plugin_dir=") || strings.Contains(compact, "installed_plugins=") {
+		return "plugin"
+	}
+	return ""
 }
 
 // detectPinnedSystemGrokRequirementsFile is the per-path scanner that backs
@@ -2135,6 +2175,15 @@ func lineMentionsGrokApprovalPin(lower string) bool {
 	}
 	key := strings.TrimSpace(lower[:eq])
 	val := trimGrokTOMLStringQuotes(strings.TrimSpace(lower[eq+1:]))
+	if (key == "approval" || strings.HasSuffix(key, ".approval")) && strings.HasPrefix(strings.TrimSpace(val), "{") {
+		compact := strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "", "-", "_").Replace(val)
+		for _, bypass := range []string{`mode="always"`, `mode='always'`, `mode="auto"`, `mode='auto'`,
+			`mode="always_approve"`, `mode='always_approve'`, `mode="auto_approve"`, `mode='auto_approve'`} {
+			if strings.Contains(compact, bypass) {
+				return true
+			}
+		}
+	}
 	switch {
 	case (strings.Contains(key, "always_approve") || strings.Contains(key, "auto_approve") || key == "yolo") && val == "true":
 		return true

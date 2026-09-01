@@ -6016,7 +6016,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		err := globalSessionManager.StartSession(
 			cmd.SessionID,
 			cmd.Command,
-			cmd.Args,
+			sessionStartArgsForCommand(cmd),
 			cmd.Cwd,
 			cmd.WorkspaceID,
 			cmd.UID,
@@ -6087,6 +6087,26 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 	default:
 		publishSessionError(ctx, topic, cmd, fmt.Sprintf("unknown session command type: %s", cmd.Type))
 	}
+}
+
+// sessionStartArgsForCommand promotes the updater's exact, signed Grok smoke
+// contract into the private in-process control consumed by SessionManager.
+// Ordinary no-tools requests are returned unchanged. Keeping this at the
+// command-dispatch boundary ensures production and tests follow the same path.
+func sessionStartArgsForCommand(cmd commandMsg) []string {
+	if !isGrokCommand(cmd.Command) {
+		return cmd.Args
+	}
+	if _, explicit := extractGrokMaintenanceSmokeControl(cmd.Args); explicit {
+		return cmd.Args
+	}
+	if !grokMaintenanceSmokeRequest(cmd.Args) {
+		return cmd.Args
+	}
+	out := make([]string, 0, len(cmd.Args)+1)
+	out = append(out, grokMaintenanceSmokeControlArg)
+	out = append(out, cmd.Args...)
+	return out
 }
 
 // publishSessionError publishes an error result for a session command.
