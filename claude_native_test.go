@@ -494,6 +494,34 @@ func TestClaudeNativeLifecycle_TerminalResultAdvancesUtilization(t *testing.T) {
 	}
 }
 
+// A direct run that never reaches a terminal `result` frame — killed, timed out,
+// a stream failure, or an exit mid-turn — still consumed quota, so the exit path
+// must make its own attempt. Mirrors
+// TestManagedClaudeSession_KilledRunStillProbesOnSessionEnd: both execution
+// paths have to cover the abnormal exit, not just the managed one.
+func TestClaudeNativeLifecycle_KilledRunStillProbesOnExit(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":72,"resets_at":%d,"status":"allowed"}}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	seeded := seedStaleClaudeObservation(t, cache)
+	tmpDir := installMockClaude(t, "claude-heartbeat-hang")
+
+	m := NewClaudeNativeManager(nil)
+	id := fmt.Sprintf("claude-killed-%d", time.Now().UnixNano())
+	if err := m.Start(id, tmpDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Let the usage-less heartbeat land, then kill the run mid-turn.
+	time.Sleep(200 * time.Millisecond)
+	if err := m.End(id); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+
+	waitForClaudeObservationAfter(t, cache, seeded)
+}
+
 // The rate-limit rejection path must be untouched by the probe wiring: a
 // rejected run still publishes the `claude_native_ratelimit` frame that
 // agent-orchestrator-service's detectRateLimit defers and auto-resumes on.

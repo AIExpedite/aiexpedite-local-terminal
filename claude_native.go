@@ -858,6 +858,15 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 	exit := session.exitCode
 	session.mu.Unlock()
 
+	// Final utilization attempt for a run that never reached a terminal `result`
+	// frame — killed, timed out, a stream failure, or an exit mid-turn. Those runs
+	// still consumed quota, so the card must not stay pinned to a pre-run
+	// observation just because the turn ended abnormally. This mirrors the managed
+	// path's session-end attempt (session.go), and is collapsed by the probe's
+	// single-flight when readStream's result frame already fired it moments ago;
+	// every session here is a Claude one, so no command check is needed.
+	triggerClaudeUsageProbeAfterRun()
+
 	// Scan for and upload whatever media this session wrote before announcing
 	// the end, so the metadata rides along on the ended frame exactly as it
 	// does on the PTY path's session_ended. Skipping this is what made every

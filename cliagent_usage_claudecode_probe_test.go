@@ -952,7 +952,7 @@ func TestClaudeUsageProbeGate_IntervalBounds(t *testing.T) {
 	t.Run("streak counter is bounded", func(t *testing.T) {
 		g := &claudeUsageProbeGate{}
 		for i := 0; i < claudeUsageProbeMaxFailureStreak*4; i++ {
-			g.finish(claudeUsageProbeFailure(cliUsageErrorParseFailed), false)
+			g.finish(claudeUsageProbeFailure(cliUsageErrorParseFailed), false, time.Time{})
 		}
 		if g.failures > claudeUsageProbeMaxFailureStreak {
 			t.Errorf("failures=%d, want it capped at %d", g.failures, claudeUsageProbeMaxFailureStreak)
@@ -2080,6 +2080,109 @@ func TestClaudeUsageProbe_ForcedRefreshRetriesAfterFailedInFlightProbe(t *testin
 	snap, _ := loadClaudeRateLimitSnapshot(cache)
 	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 61 {
 		t.Errorf("UsedPercentage=%v, want the forced probe's 61", got)
+	}
+}
+
+// A joined probe that started BEFORE the run does not pay the run's debt. It
+// persisted a reading, but a PRE-run one: settling with it would sign the
+// pre-run observation into the receipt and leave the already-scheduled trailing
+// probe to exit finding nothing owed — the freeze the feature exists to fix,
+// reintroduced by the join.
+func TestClaudeUsageProbe_ForcedRefreshDoesNotSettleRunDebtWithPreRunJoin(t *testing.T) {
+	runAt := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	preRun := runAt.Add(-30 * time.Second) // the in-flight probe's observation
+	postRun := runAt.Add(2 * time.Second)  // our own, after the join is refused
+
+	var entered sync.Once
+	inFlight := make(chan struct{})
+	release := make(chan struct{})
+	var seen int64
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt64(&seen, 1) == 1 { // the pre-run probe, still on the wire
+			entered.Do(func() { close(inFlight) })
+			<-release
+			fmt.Fprint(w, probeUsageJSON(map[string]string{
+				claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":21,"resets_at":%d,"status":"allowed"}`,
+					runAt.Add(3*time.Hour).Unix()),
+			}))
+			return
+		}
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":73,"resets_at":%d,"status":"allowed"}`,
+				runAt.Add(3*time.Hour).Unix()),
+		}))
+	})
+
+	// A probe that was already in flight when the run finished.
+	go func() { _, _ = runClaudeUsageProbe(context.Background(), preRun) }()
+	<-inFlight
+
+	// The run completes, then the user presses Refresh mid-flight.
+	claudeUsageProbe.recordOwed(runAt)
+	SetClaudeUsageForceProbe(true)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		close(release)
+	}()
+	if !refreshClaudeUsageIfStale(context.Background(), postRun, time.Time{}, probeTestToken, "") {
+		t.Fatal("the forced refresh must still produce a reading of its own")
+	}
+
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Errorf("request count=%d, want 2 — a pre-run reading cannot answer a post-run refresh", got)
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("no snapshot on disk")
+	}
+	if got := snap.Buckets[claudeWindowFiveHour].ObservedAtMs; got != postRun.UnixMilli() {
+		t.Errorf("ObservedAtMs=%d, want the post-run %d", got, postRun.UnixMilli())
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("owedObservation=%s, want the debt settled by the post-run reading", got)
+	}
+}
+
+// The converse, so the guard above is a check on the OBSERVATION and not a
+// blanket refusal to join while a debt is outstanding: a probe whose reading is
+// newer than the run pays it, with one request.
+func TestClaudeUsageProbe_ForcedRefreshSettlesRunDebtWithPostRunJoin(t *testing.T) {
+	runAt := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	postRun := runAt.Add(time.Second)
+
+	var entered sync.Once
+	inFlight := make(chan struct{})
+	release := make(chan struct{})
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		entered.Do(func() { close(inFlight) })
+		<-release
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":49,"resets_at":%d,"status":"allowed"}`,
+				runAt.Add(3*time.Hour).Unix()),
+		}))
+	})
+
+	claudeUsageProbe.recordOwed(runAt)
+	go func() { _, _ = runClaudeUsageProbe(context.Background(), postRun) }()
+	<-inFlight
+
+	SetClaudeUsageForceProbe(true)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		close(release)
+	}()
+	if !refreshClaudeUsageIfStale(context.Background(), postRun, time.Time{}, probeTestToken, "") {
+		t.Fatal("a post-run reading already on the wire must answer the refresh")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1 — the joined reading covers the debt", got)
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("owedObservation=%s, want the debt settled by the joined reading", got)
+	}
+	snap, _ := loadClaudeRateLimitSnapshot(cache)
+	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 49 {
+		t.Errorf("UsedPercentage=%v, want the joined probe's 49", got)
 	}
 }
 

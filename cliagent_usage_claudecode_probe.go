@@ -375,8 +375,17 @@ type claudeUsageProbeGate struct {
 	// refreshes counts probes that actually persisted a reading. A joiner
 	// compares the value it sampled before waiting against the value after: an
 	// advance means the cache it is about to re-read is newer than the one it
-	// loaded, which is the only thing the joiner needs to know.
-	refreshes uint64
+	// loaded.
+	//
+	// lastRefreshAt is the observation instant that advance carries — the `now`
+	// the persisting probe stamped on its buckets. "Something was written" is not
+	// enough for a joiner holding a post-run debt: a probe that STARTED before the
+	// run persists a PRE-run reading, and settling the debt with it would sign the
+	// pre-run timestamp and cancel the trailing probe that would have paid it.
+	// Only meaningful when paired with an advance of `refreshes`, which is why the
+	// two are read together under one lock.
+	refreshes     uint64
+	lastRefreshAt time.Time
 	// cancelTrailing is closed by resetClaudeUsageProbeGate to abandon any timer
 	// that is currently sleeping. A trailing probe resolves the endpoint and the
 	// cache path when it WAKES, so one that outlives its test would read whatever
@@ -450,9 +459,9 @@ func resetClaudeUsageProbeGate() {
 		close(claudeUsageProbe.doneCh)
 		claudeUsageProbe.doneCh = nil
 	}
-	// refreshes is deliberately NOT reset: it is a monotonic counter compared
-	// only against a value the joiner sampled itself, so zeroing it here would
-	// make a stale sample look like an advance.
+	// refreshes (and the lastRefreshAt it carries) is deliberately NOT reset: it
+	// is a monotonic counter compared only against a value the joiner sampled
+	// itself, so zeroing it here would make a stale sample look like an advance.
 	claudeUsageProbe.lastAttempt = time.Time{}
 	claudeUsageProbe.force = false
 	claudeUsageProbe.armed = false
@@ -520,7 +529,9 @@ func (g *claudeUsageProbeGate) begin(now time.Time) bool {
 var claudeUsageProbeJoinTimeout = claudeUsageProbeTimeout + time.Second
 
 // joinInFlight waits for a probe that already holds the single-flight slot,
-// reporting whether there was one to join and whether it persisted a reading.
+// reporting whether there was one to join and, when it persisted a reading, the
+// instant that reading observes. A zero `observedAt` means the joined probe
+// wrote nothing — the caller must issue its own request.
 //
 // This is what makes a user-initiated refresh honest. The post-run probe fires
 // on a goroutine, so pressing Refresh moments after a run lands squarely on an
@@ -532,12 +543,12 @@ var claudeUsageProbeJoinTimeout = claudeUsageProbeTimeout + time.Second
 //
 // Only the forced path joins: a routine gather that finds a probe in flight has
 // nothing to gain by blocking, since its next tick reads the same cache.
-func (g *claudeUsageProbeGate) joinInFlight(ctx context.Context) (joined, refreshed bool) {
+func (g *claudeUsageProbeGate) joinInFlight(ctx context.Context) (joined bool, observedAt time.Time) {
 	g.mu.Lock()
 	done, before := g.doneCh, g.refreshes
 	g.mu.Unlock()
 	if done == nil {
-		return false, false
+		return false, time.Time{}
 	}
 	timer := time.NewTimer(claudeUsageProbeJoinTimeout)
 	defer timer.Stop()
@@ -545,15 +556,18 @@ func (g *claudeUsageProbeGate) joinInFlight(ctx context.Context) (joined, refres
 	case <-done:
 	case <-ctx.Done():
 		// The gather is over; whatever the probe writes belongs to the next read.
-		return false, false
+		return false, time.Time{}
 	case <-timer.C:
 		// A probe outliving its own deadline is a wedge, not a slow answer.
-		return false, false
+		return false, time.Time{}
 	}
 	g.mu.Lock()
-	after := g.refreshes
+	after, at := g.refreshes, g.lastRefreshAt
 	g.mu.Unlock()
-	return true, after != before
+	if after == before {
+		return true, time.Time{}
+	}
+	return true, at
 }
 
 // interval is the effective floor between attempts: the minimum, doubled per
@@ -692,11 +706,16 @@ func (g *claudeUsageProbeGate) holdUntil(deadline time.Time) {
 	g.mu.Unlock()
 }
 
-func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError, refreshed bool) {
+// finish releases the single-flight slot. `observedAt` is the instant the probe
+// stamped on the buckets it persisted, recorded only alongside a refresh so a
+// joiner can tell WHEN the reading it is inheriting was taken, not merely that
+// there was one.
+func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError, refreshed bool, observedAt time.Time) {
 	g.mu.Lock()
 	g.inFlight = false
 	if refreshed {
 		g.refreshes++
+		g.lastRefreshAt = observedAt
 	}
 	switch {
 	case probeErr == nil:
@@ -903,7 +922,7 @@ func probeClaudeUsage(
 	// wedge, not a missed sample. It must therefore be the first statement after
 	// begin(), ahead of any other exit. Named returns let it record the outcome:
 	// a failure extends the backoff, a success or an early skip clears it.
-	defer func() { claudeUsageProbe.finish(probeErr, refreshed) }()
+	defer func() { claudeUsageProbe.finish(probeErr, refreshed, now) }()
 
 	// One credential read for both the bearer token and the cache fingerprint —
 	// see claudeUsageProbeIdentity for why they must not be resolved separately.
@@ -1152,7 +1171,15 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 	// wrote nothing we fall through and issue the request ourselves, the slot now
 	// being free and `force` still pending.
 	if forced {
-		if joined, joinRefreshed := claudeUsageProbe.joinInFlight(ctx); joined && joinRefreshed {
+		// A joined reading answers the refresh only when it is at least as new as
+		// what we owe. A probe that started BEFORE the run persists a PRE-run
+		// observation: accepting it would settle the run's debt with a timestamp
+		// that predates the run, sign that timestamp into the receipt, and leave
+		// the already-scheduled trailing probe to exit finding nothing owed. When
+		// it does not cover the debt we fall through and ask ourselves, the slot
+		// now free and `force` still pending.
+		if joined, joinedAt := claudeUsageProbe.joinInFlight(ctx); joined &&
+			!joinedAt.IsZero() && (!owing || !joinedAt.Before(owed)) {
 			if owing {
 				claudeUsageProbe.settleOwed(owed)
 			}
