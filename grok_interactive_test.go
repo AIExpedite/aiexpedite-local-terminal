@@ -533,6 +533,9 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 		{"enabled sibling of disabled mcp server", "[mcp_servers.disabled-one]\nenabled = false\ncommand = 'raw-config-sentinel'\n\n[mcp_servers.customer-secret-name]\ncommand = 'raw-config-sentinel'\n", "mcp"},
 		{"expanded mcp enablement", "[mcp_servers.customer-secret-name]\nenabled = '$MCP_ENABLE_SENTINEL'\ncommand = 'raw-config-sentinel'\n", "mcp"},
 		{"enabled plugin sibling of disabled plugin", "[plugins.disabled-one]\nenabled = false\npath = 'raw-config-sentinel'\n\n[plugins.customer-secret-name]\nenabled = true\npath = 'raw-config-sentinel'\n", "plugin"},
+		{"contradictory mcp enablement pair", "[mcp_servers.customer-secret-name]\nenabled = false\ndisabled = false\ncommand = 'raw-config-sentinel'\n", "mcp"},
+		{"contradictory mcp disablement pair", "[mcp_servers.customer-secret-name]\nenabled = true\ndisabled = true\ncommand = 'raw-config-sentinel'\n", "mcp"},
+		{"expanded enablement beside explicit disable", "[mcp_servers.customer-secret-name]\nenabled = '$MCP_ENABLE_SENTINEL'\ndisabled = true\ncommand = 'raw-config-sentinel'\n", "mcp"},
 	} {
 		t.Run(live.name, func(t *testing.T) {
 			if err := os.WriteFile(managedPath, []byte(live.body), 0o600); err != nil {

@@ -2005,29 +2005,34 @@ func walkGrokSystemConfigSemanticScoped(value any, path []string, withinDisabled
 // explicit boolean disablement (`enabled = false` / `disabled = true`). Only a
 // literal boolean counts: Grok's managed layers support environment expansion, so
 // `enabled = "$FLAG"` cannot be proven disabled lexically and must keep failing
-// closed.
+// closed. Every enablement key present has to agree, so a contradictory pair
+// (`enabled = false` next to `disabled = false`, or both true) is undecidable
+// rather than off — and the verdict does not depend on map iteration order.
 func grokSemanticDefinitionDisabled(value any) bool {
 	node, ok := value.(map[string]any)
 	if !ok {
 		return false
 	}
+	disabled := false
 	for rawKey, child := range node {
 		flag, isBool := child.(bool)
-		if !isBool {
-			continue
-		}
 		switch normalizeGrokSemanticKey(rawKey) {
 		case "enabled":
-			if !flag {
-				return true
+			// Any enablement key that is not a literal `false` leaves the
+			// definition unproven — an expanded string, or a contradicting
+			// `enabled = true`, must not be read as switched off.
+			if !isBool || flag {
+				return false
 			}
+			disabled = true
 		case "disabled":
-			if flag {
-				return true
+			if !isBool || !flag {
+				return false
 			}
+			disabled = true
 		}
 	}
-	return false
+	return disabled
 }
 
 func classifyGrokSystemSemanticValue(path []string, value any, withinDisabled bool, finding *grokSystemSemanticFinding) {
