@@ -338,7 +338,9 @@ func savePrevStatusLine(raw json.RawMessage) error {
 	if err := os.MkdirAll(filepath.Dir(prevStatusLinePath()), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(prevStatusLinePath(), b, 0o600)
+	// Through the shared writer: re-stashing over an existing file must not
+	// inherit that file's mode, for the reason documented on the helper.
+	return writePrevStatusLineBytes(prevStatusLinePath(), b)
 }
 
 // copyPrevStatusLine copies the stash file across filesystems with the same
@@ -355,10 +357,39 @@ func copyPrevStatusLine(src, dst string) error {
 	return writePrevStatusLineBytes(dst, b)
 }
 
-// writePrevStatusLineBytes is the single writer for a stash copy, so the
-// owner-only mode above cannot drift between the two callers that produce one.
+// writePrevStatusLineBytes is the single writer for the stash, so the owner-only
+// mode above cannot drift between the callers that produce one.
+//
+// It stages through os.CreateTemp rather than writing dst directly because
+// os.WriteFile applies its mode only when it CREATES the file: over an existing
+// dst it truncates and keeps whatever mode that file already carries. A leftover
+// stash at the destination of a migration (or a stash a previous run wrote under
+// a laxer regime) could therefore stay group/world-readable while this helper
+// reports success, exposing the chained command — which can carry inline env
+// vars / tokens — to other local users. os.CreateTemp always creates 0o600, and
+// the rename carries that mode onto dst, so the contract holds for a fresh
+// destination and a pre-existing one alike. Same temp-plus-rename shape as
+// writeSettingsAtomic, which also makes the replacement atomic.
 func writePrevStatusLineBytes(dst string, b []byte) error {
-	return os.WriteFile(dst, b, 0o600)
+	f, err := os.CreateTemp(filepath.Dir(dst), ".statusline-prev-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // migratePrevStatusLine COPIES the pinned status-line stash from the path an

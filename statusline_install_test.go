@@ -234,6 +234,77 @@ func TestCopyPrevStatusLine_PreservesPrivateMode(t *testing.T) {
 	}
 }
 
+// os.WriteFile honours its mode argument only when it CREATES the file, so
+// writing over a leftover stash left it at whatever mode that file already had.
+// Both stash writers must land owner-only even when the destination already
+// exists group/world-readable — the stashed command can carry inline env vars
+// and tokens.
+func TestPrevStatusLineWriters_ForcePrivateModeOverPermissiveFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes are not meaningful on Windows")
+	}
+	live := []byte(`{"statusLine":{"type":"command","command":"third-party --token=secret"}}`)
+
+	t.Run("migrate", func(t *testing.T) {
+		dir := t.TempDir()
+		oldPrev := filepath.Join(dir, "old-prev.json")
+		newPrev := filepath.Join(dir, "new-prev.json")
+		if err := os.WriteFile(oldPrev, live, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// A leftover at the destination that some earlier cycle left readable.
+		if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"superseded.sh"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(newPrev, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := migratePrevStatusLine(oldPrev, newPrev); err != nil {
+			t.Fatalf("migratePrevStatusLine: %v", err)
+		}
+		assertPrivateStash(t, newPrev, live)
+	})
+
+	t.Run("save", func(t *testing.T) {
+		t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", filepath.Join(t.TempDir(), "prev.json"))
+		if err := savePrevStatusLine(json.RawMessage(`{"type":"command","command":"first.sh"}`)); err != nil {
+			t.Fatalf("savePrevStatusLine: %v", err)
+		}
+		if err := os.Chmod(prevStatusLinePath(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		raw := json.RawMessage(`{"type":"command","command":"third-party --token=secret"}`)
+		if err := savePrevStatusLine(raw); err != nil {
+			t.Fatalf("savePrevStatusLine (rewrite): %v", err)
+		}
+		st, err := os.Stat(prevStatusLinePath())
+		if err != nil {
+			t.Fatalf("stat stash: %v", err)
+		}
+		if mode := st.Mode().Perm(); mode != 0o600 {
+			t.Errorf("rewritten stash must be owner-only (0o600), got %o", mode)
+		}
+		if got := loadPrevStatusLineCommand(); got != "third-party --token=secret" {
+			t.Errorf("stash content lost: %q", got)
+		}
+	})
+}
+
+// assertPrivateStash checks a stash landed owner-only with the expected bytes.
+func assertPrivateStash(t *testing.T, path string, want []byte) {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if mode := st.Mode().Perm(); mode != 0o600 {
+		t.Errorf("stash must be owner-only (0o600), got %o", mode)
+	}
+	if got, _ := os.ReadFile(path); string(got) != string(want) {
+		t.Errorf("stash content = %s, want %s", got, want)
+	}
+}
+
 // When opt-out runs after the data dir moved (e.g. XDG_CONFIG_HOME changed),
 // the current prevStatusLinePath() resolves to a fresh empty location, but the
 // stash is still sitting at the path the installed command itself pinned.
