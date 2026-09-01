@@ -1304,9 +1304,20 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// completing the step empty.
 			// The child is producing again, so any earlier `result` no longer
 			// describes the end of the run — a new turn is under way. Cleared for
-			// every line, including the rate-limit and prompt frames below that
-			// never reach the result branch.
-			session.turnSettled.Store(false)
+			// every stdout line, including the rate-limit and prompt frames below
+			// that never reach the result branch.
+			//
+			// STDOUT ONLY. `lines` merges two independently scanned pipes, so a
+			// diagnostic written to stderr — possibly before the `result` frame
+			// and merely delivered after it, since the two scanner goroutines
+			// impose no ordering between them — would otherwise reopen a turn that
+			// is genuinely over. waitForExit would then record a second post-run
+			// debt and spend another OAuth probe on a turn the result branch has
+			// already reported. Only Claude's own stdout frames, or an accepted
+			// follow-up turn (SendInput), reopen a settled turn.
+			if line.source == "stdout" {
+				session.turnSettled.Store(false)
+			}
 
 			// Codex rate-limit telemetry: token_count frames from `codex exec
 			// --json` carry the same primary/secondary rate_limits payload as

@@ -319,6 +319,22 @@ func runMockCLI(mode string) {
 		time.Sleep(500 * time.Millisecond)
 		os.Exit(0)
 
+	case "claude-result-stderr-trailer":
+		// A settled turn whose LAST delivered line is a stderr diagnostic. The
+		// merged `lines` channel imposes no ordering between the two scanner
+		// goroutines, so a stderr write — even one produced before the result —
+		// can arrive after it. Nothing about that reopens the turn, and treating
+		// it as new output makes waitForExit record a second post-run debt for a
+		// turn the result branch already reported.
+		reset := time.Now().Add(3 * time.Hour).Unix()
+		fmt.Printf(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","resets_at":%d}}`+"\n", reset)
+		fmt.Println(`{"type":"result","subtype":"success","result":"done"}`)
+		_ = os.Stdout.Sync()
+		time.Sleep(150 * time.Millisecond)
+		fmt.Fprintln(os.Stderr, "[mock-claude] post-result diagnostic")
+		time.Sleep(500 * time.Millisecond)
+		os.Exit(0)
+
 	case "claude-heartbeat-hang":
 		// Same heartbeat, but no terminal frame — the run is killed or times out
 		// mid-turn. It still consumed quota, so the session-end path must make its
@@ -1502,6 +1518,32 @@ func waitForNoOutstandingClaudeUsageDebt(t *testing.T, settleWithin, holdFor tim
 				owed.UTC().Format(time.RFC3339Nano))
 		}
 		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// A stderr diagnostic delivered after the terminal `result` frame must NOT
+// reopen the turn. `lines` merges two independently scanned pipes, so any stderr
+// write can land after the result — the ordering is not the child's to control.
+// Clearing turnSettled for it made waitForExit fire the abnormal-exit fallback
+// on a turn that ended perfectly normally, recording a debt strictly newer than
+// the one the result probe was already sampling and buying a second OAuth
+// request for a turn nothing else happened on.
+func TestManagedClaudeSession_StderrAfterResultDoesNotReopenTheTurn(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":58,"resets_at":%d,"status":"allowed"}}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	seeded := seedStaleClaudeObservation(t, cache)
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	sm, id := startManagedClaudeSession(t, "claude-result-stderr-trailer")
+	t.Cleanup(func() { _ = sm.EndSession(id) })
+
+	waitForClaudeObservationAfter(t, cache, seeded)
+	waitForNoOutstandingClaudeUsageDebt(t, 5*time.Second, 1500*time.Millisecond)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want exactly 1 — a trailing stderr line must not reopen a settled turn", got)
 	}
 }
 

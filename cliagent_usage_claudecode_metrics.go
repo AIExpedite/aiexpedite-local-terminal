@@ -79,26 +79,59 @@ func installedClaudeRateLimitCachePath(home string) string {
 // skipped entirely — see claudeCodeMetricsFromCache for why that scoping is
 // exact rather than best-effort.
 func loadMergedClaudeRateLimitBuckets(currentFingerprint string) map[string]claudeRateLimitBucket {
+	return loadMergedClaudeRateLimitView(currentFingerprint).buckets
+}
+
+// claudeRateLimitView is the merged cache as the freshness rules need to read
+// it: the per-window buckets, plus the snapshot-level facts that belong to no
+// single window and therefore cannot be recovered from the buckets once another
+// writer has overwritten them.
+type claudeRateLimitView struct {
+	buckets map[string]claudeRateLimitBucket
+	// probedAtMs is the newest instant the utilization probe persisted a reading
+	// at, carried across from claudeRateLimitSnapshot.LastProbeObservedAtMs.
+	probedAtMs int64
+}
+
+// probeObservedAtMs is the newest instant a PROBE reading is on record for this
+// account. The snapshot-level record is authoritative; the per-bucket
+// provenance is consulted only as the floor for a cache written before that
+// field existed, where the surviving `source: "probe"` buckets are the only
+// evidence there is.
+func (v claudeRateLimitView) probeObservedAtMs() int64 {
+	if fromBuckets := latestClaudeProbeObservation(v.buckets); fromBuckets > v.probedAtMs {
+		return fromBuckets
+	}
+	return v.probedAtMs
+}
+
+// loadMergedClaudeRateLimitView is loadMergedClaudeRateLimitBuckets plus the
+// snapshot-level probe evidence, read in the SAME pass so the two cannot
+// describe different reads of the cache.
+func loadMergedClaudeRateLimitView(currentFingerprint string) claudeRateLimitView {
 	home, _ := os.UserHomeDir()
 	paths := []string{claudeRateLimitCachePath()}
 	if pinned := installedClaudeRateLimitCachePath(home); pinned != "" && pinned != paths[0] {
 		paths = append(paths, pinned)
 	}
 
-	merged := map[string]claudeRateLimitBucket{}
+	view := claudeRateLimitView{buckets: map[string]claudeRateLimitBucket{}}
 	for _, path := range paths {
 		snap, ok := loadClaudeRateLimitSnapshot(path)
 		if !ok || snap.AccountFingerprint != currentFingerprint {
 			continue
 		}
+		if snap.LastProbeObservedAtMs > view.probedAtMs {
+			view.probedAtMs = snap.LastProbeObservedAtMs
+		}
 		for window, bucket := range snap.Buckets {
-			prev, seen := merged[window]
+			prev, seen := view.buckets[window]
 			if !seen || bucket.ObservedAtMs > prev.ObservedAtMs {
-				merged[window] = bucket
+				view.buckets[window] = bucket
 			}
 		}
 	}
-	return merged
+	return view
 }
 
 // claudeCodeMetricsFromCache builds the metric rows from the rate-limit cache,
@@ -447,19 +480,23 @@ func latestClaudeObservation(buckets map[string]claudeRateLimitBucket) time.Time
 //     infinitely stale. "Unobserved" and "stale" are indistinguishable from here,
 //     and a comfortably-unused Fable quota legitimately never reports — counting
 //     it would make every gather on every ordinary account probe forever.
-//   - A row whose freshest reading predates the newest PROBE-sourced reading in
-//     the cache is skipped too. A probe stamps every window it read with one
-//     instant, so a row still older than that is one the endpoint demonstrably
-//     does not supply; probing again cannot move it, and counting it would pin
-//     the snapshot stale forever. Strictly-before, so the rows that probe DID
-//     write (stamped exactly at that instant) keep counting and a fresh probe
-//     reads as fresh. Derived from the cache rather than from process state so it
-//     survives a restart and is shared with every other writer on the device.
+//   - A row whose freshest reading predates the newest PROBE reading on record is
+//     skipped too. A probe stamps every window it read with one instant, so a row
+//     still older than that is one the endpoint demonstrably does not supply;
+//     probing again cannot move it, and counting it would pin the snapshot stale
+//     forever. Strictly-before, so the rows that probe DID write (stamped exactly
+//     at that instant) keep counting and a fresh probe reads as fresh. Read from
+//     the snapshot-level record rather than from process state so it survives a
+//     restart and is shared with every other writer on the device — and rather
+//     than from the surviving probe-sourced buckets, so one interactive
+//     status-line render taking over five_hour/seven_day cannot erase the proof
+//     that the endpoint has nothing to say about some other row.
 //
 // A zero return means "nothing observed" — the same "probe if you can" answer
 // latestClaudeObservation gives for an empty cache.
-func stalestClaudeRowObservation(buckets map[string]claudeRateLimitBucket) time.Time {
-	probedAt := latestClaudeProbeObservation(buckets)
+func stalestClaudeRowObservation(view claudeRateLimitView) time.Time {
+	buckets := view.buckets
+	probedAt := view.probeObservedAtMs()
 	rows := [][]string{
 		{claudeWindowFiveHour},
 		claudeWeeklyWindowIDs(),
@@ -503,10 +540,11 @@ func freshestClaudeRowObservation(buckets map[string]claudeRateLimitBucket, wind
 	return newest
 }
 
-// latestClaudeProbeObservation returns the newest reading the PROBE itself
-// wrote, in epoch ms, or 0 when the cache holds none (a legacy snapshot with no
-// `source`, or a device that has never probed). This is the floor
-// stalestClaudeRowObservation excludes rows against — see its doc comment.
+// latestClaudeProbeObservation returns the newest reading the PROBE itself still
+// owns a window for, in epoch ms, or 0 when the cache holds none. Superseded by
+// claudeRateLimitSnapshot.LastProbeObservedAtMs, which no other writer can
+// overwrite; this remains the fallback floor for a cache written before that
+// field existed (see claudeRateLimitView.probeObservedAtMs).
 func latestClaudeProbeObservation(buckets map[string]claudeRateLimitBucket) int64 {
 	newest := int64(0)
 	for _, b := range buckets {

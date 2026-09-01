@@ -661,7 +661,7 @@ func TestStalestClaudeRowObservation_FreshRowCannotMaskAStaleOne(t *testing.T) {
 	if got := latestClaudeObservation(buckets); !got.Equal(fresh.UTC()) {
 		t.Fatalf("precondition: latestClaudeObservation=%v, want the fresh row %v", got, fresh.UTC())
 	}
-	if got := stalestClaudeRowObservation(buckets); !got.Equal(stale.UTC()) {
+	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: buckets}); !got.Equal(stale.UTC()) {
 		t.Errorf("stalestClaudeRowObservation=%v, want the stale weekly row %v", got, stale.UTC())
 	}
 }
@@ -687,11 +687,11 @@ func TestStalestClaudeRowObservation_UnobservedRowIsNotStale(t *testing.T) {
 			ObservedAtMs: now.UnixMilli(), UsageObserved: usageObservedPtr(false),
 		},
 	}
-	if got := stalestClaudeRowObservation(buckets); !got.Equal(observed.UTC()) {
+	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: buckets}); !got.Equal(observed.UTC()) {
 		t.Errorf("stalestClaudeRowObservation=%v, want %v (an unobserved row must not pin the snapshot stale)",
 			got, observed.UTC())
 	}
-	if got := stalestClaudeRowObservation(map[string]claudeRateLimitBucket{}); !got.IsZero() {
+	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: map[string]claudeRateLimitBucket{}}); !got.IsZero() {
 		t.Errorf("empty cache should report the zero time, got %v", got)
 	}
 }
@@ -719,7 +719,7 @@ func TestStalestClaudeRowObservation_ExcludesRowsTheProbeCannotSupply(t *testing
 		},
 		claudeWindowSevenDayFable: orphan,
 	}
-	if got := stalestClaudeRowObservation(probed); !got.Equal(probedAt.UTC()) {
+	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: probed}); !got.Equal(probedAt.UTC()) {
 		t.Errorf("stalestClaudeRowObservation=%v, want the probe's own instant %v", got, probedAt.UTC())
 	}
 
@@ -732,8 +732,107 @@ func TestStalestClaudeRowObservation_ExcludesRowsTheProbeCannotSupply(t *testing
 		},
 		claudeWindowSevenDayFable: orphan,
 	}
-	if got := stalestClaudeRowObservation(never); !got.Equal(old.UTC()) {
+	if got := stalestClaudeRowObservation(claudeRateLimitView{buckets: never}); !got.Equal(old.UTC()) {
 		t.Errorf("stalestClaudeRowObservation=%v, want the 48h-old row %v while no probe is on record", got, old.UTC())
+	}
+}
+
+// Probe evidence must survive another writer taking over the windows the probe
+// wrote. Per-window provenance records who wrote a window LAST, so one
+// interactive status-line render replaces five_hour/seven_day with
+// `source: "statusline"` and erases every trace that a probe ever ran — taking
+// with it the proof that the endpoint does not supply some OTHER row. That row
+// then reads stale again on the very next gather and the routine probe pays for
+// the same answer forever. The fact is "a probe sampled this account at T", so
+// it is recorded on the snapshot, not on whichever window keeps the byline.
+func TestStalestClaudeRowObservation_ProbeEvidenceSurvivesStatusLineOverwrite(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Now().Truncate(time.Millisecond)
+	old := now.Add(-48 * time.Hour)
+	probedAt := now.Add(-2 * time.Minute)
+
+	// A days-old stream reading for a window the endpoint never returns.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDayFable: {
+			UsedPercentage: 5, ResetsAtMs: now.Add(96 * time.Hour).UnixMilli(),
+			ObservedAtMs: old.UnixMilli(), usageKnown: true,
+		},
+	}, old, "", claudeRateLimitSourceStream)
+	// The probe answers the two rows it can, and says nothing about Fable.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: probedAt.UnixMilli(), usageKnown: true,
+		},
+		claudeWindowSevenDay: {
+			UsedPercentage: 12, ResetsAtMs: now.Add(96 * time.Hour).UnixMilli(),
+			ObservedAtMs: probedAt.UnixMilli(), usageKnown: true,
+		},
+	}, probedAt, "", claudeRateLimitSourceProbe)
+
+	view := loadMergedClaudeRateLimitView("")
+	if view.probedAtMs != probedAt.UnixMilli() {
+		t.Fatalf("precondition: view.probedAtMs=%d, want the probe instant %d", view.probedAtMs, probedAt.UnixMilli())
+	}
+	if got := stalestClaudeRowObservation(view); !got.Equal(probedAt.UTC()) {
+		t.Fatalf("precondition: stalestClaudeRowObservation=%v, want the probe instant %v (Fable excluded)", got, probedAt.UTC())
+	}
+
+	// An interactive render now owns both windows the probe wrote.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 41, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: now.UnixMilli(), usageKnown: true,
+		},
+		claudeWindowSevenDay: {
+			UsedPercentage: 13, ResetsAtMs: now.Add(96 * time.Hour).UnixMilli(),
+			ObservedAtMs: now.UnixMilli(), usageKnown: true,
+		},
+	}, now, "", claudeRateLimitSourceStatusLine)
+
+	view = loadMergedClaudeRateLimitView("")
+	if latestClaudeProbeObservation(view.buckets) != 0 {
+		t.Fatal("precondition: the render should have taken every probe byline — otherwise this test proves nothing")
+	}
+	if view.probedAtMs != probedAt.UnixMilli() {
+		t.Errorf("view.probedAtMs=%d, want the probe instant %d preserved across the render", view.probedAtMs, probedAt.UnixMilli())
+	}
+	if got := stalestClaudeRowObservation(view); !got.Equal(now.UTC()) {
+		t.Errorf("stalestClaudeRowObservation=%v, want %v — the 48h Fable row is one the probe already showed it cannot supply, so it must not make the snapshot stale again",
+			got, now.UTC())
+	}
+}
+
+// Probe evidence is an observation about ONE account's quota. A credential
+// change drops the buckets, and it has to drop this with them — otherwise the
+// previous account's probe instant would keep excluding the new account's rows
+// from the freshness question.
+func TestLoadMergedClaudeRateLimitView_ProbeEvidenceClearedOnAccountChange(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+
+	now := time.Now().Truncate(time.Millisecond)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: now.UnixMilli(), usageKnown: true,
+		},
+	}, now, "acct-a", claudeRateLimitSourceProbe)
+	if view := loadMergedClaudeRateLimitView("acct-a"); view.probedAtMs != now.UnixMilli() {
+		t.Fatalf("precondition: probedAtMs=%d, want %d", view.probedAtMs, now.UnixMilli())
+	}
+
+	// A stream capture under a different account rewrites the snapshot.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 7, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: now.UnixMilli(), usageKnown: true,
+		},
+	}, now, "acct-b", claudeRateLimitSourceStream)
+	if view := loadMergedClaudeRateLimitView("acct-b"); view.probedAtMs != 0 {
+		t.Errorf("probedAtMs=%d after an account change, want 0", view.probedAtMs)
 	}
 }
 
@@ -2086,7 +2185,12 @@ func TestClaudeUsageProbeAfterRun_DebtSurvivesRefusalAndFailure(t *testing.T) {
 		if !refreshClaudeUsageIfStale(context.Background(), time.Now(), latest, probeTestToken, "") {
 			t.Fatal("the gather must pay the outstanding debt despite a recent pre-run reading")
 		}
-		if got := latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")); !got.After(completed) {
+		// Truncated: the cache stores ObservedAtMs, so a probe that lands in the
+		// same millisecond the run completed in reads as equal, not after. The
+		// claim under test is "the reading is not from before the run" — a
+		// strict After() on a sub-millisecond `completed` fails on a fast machine
+		// for no reason.
+		if got := latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")); got.Before(completed.Truncate(time.Millisecond)) {
 			t.Errorf("observation %v did not advance past the run %v", got, completed)
 		}
 		if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {

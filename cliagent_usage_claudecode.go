@@ -430,11 +430,11 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// an hours-old reading. Rows that were never observed, and rows our own probe
 	// has already shown it cannot supply, are excluded there so this can never
 	// become a per-gather probe loop.
-	buckets := loadMergedClaudeRateLimitBuckets(usage.AccountFingerprint)
-	if refreshClaudeUsageIfStale(ctx, now, claudeSnapshotFreshness(buckets), oauthAccessToken, usage.AccountFingerprint) {
-		buckets = loadMergedClaudeRateLimitBuckets(usage.AccountFingerprint)
+	view := loadMergedClaudeRateLimitView(usage.AccountFingerprint)
+	if refreshClaudeUsageIfStale(ctx, now, claudeSnapshotFreshness(view), oauthAccessToken, usage.AccountFingerprint) {
+		view = loadMergedClaudeRateLimitView(usage.AccountFingerprint)
 	}
-	usage.Metrics = claudeCodeMetricsFromBuckets(buckets, now)
+	usage.Metrics = claudeCodeMetricsFromBuckets(view.buckets, now)
 	// `claude auth status --json` is the only authoritative signal, so it decides
 	// in BOTH directions. It previously could not clear a credential-derived
 	// "expired" (`else if usage.AuthState != "expired"`), which is exactly the

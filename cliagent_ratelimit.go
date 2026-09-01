@@ -132,6 +132,24 @@ type claudeRateLimitSnapshot struct {
 	UpdatedAt          string                           `json:"updatedAt"`
 	AccountFingerprint string                           `json:"accountFingerprint,omitempty"`
 	Buckets            map[string]claudeRateLimitBucket `json:"buckets"`
+	// LastProbeObservedAtMs is the newest observation instant the utilization
+	// PROBE has persisted a reading at, for this account. Monotonic within an
+	// account and cleared with the buckets on a fingerprint change.
+	//
+	// Recorded at the SNAPSHOT level, deliberately, rather than being derived
+	// from the surviving `source: "probe"` buckets. Per-window provenance says
+	// who wrote a window LAST, so a single interactive status-line render
+	// overwrites five_hour/seven_day with `source: "statusline"` and erases every
+	// trace that a probe ever ran — taking with it the evidence that the endpoint
+	// does not supply some other row (an unsupported Fable window, say). That row
+	// would then read as stale again on the next gather, and the routine probe
+	// would pay for the same answer forever. The fact being recorded is "a probe
+	// sampled the account at T", which belongs to the snapshot, not to whichever
+	// window happens to still carry the probe's byline.
+	//
+	// Omitted when zero so a cache written before this field existed round-trips
+	// byte-identically; readers fall back to the per-bucket provenance for those.
+	LastProbeObservedAtMs int64 `json:"lastProbeObservedAtMs,omitempty"`
 }
 
 // claudeRateLimitMu serialises the read-modify-write of the cache file
@@ -454,6 +472,9 @@ func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRate
 	// reset windows on the CLI Agents tab.
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]claudeRateLimitBucket{}
+		// Probe evidence is an observation about ONE account's quota, so it
+		// crosses an account boundary no more than a bucket does.
+		snap.LastProbeObservedAtMs = 0
 	}
 	nowMs := now.UnixMilli()
 	for window, bucket := range updates {
@@ -534,6 +555,18 @@ func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRate
 		bucket.UsageObserved = usageObservedPtr(true)
 		bucket.Source = source
 		snap.Buckets[window] = bucket
+	}
+	// Record that the probe sampled this account, independently of which writer
+	// ends up owning each window (see LastProbeObservedAtMs). Only readings
+	// count: a probe response we could not plot is not an observation. Monotonic
+	// — a probe stamping an older instant than one already on record cannot walk
+	// the evidence backwards.
+	if source == claudeRateLimitSourceProbe {
+		for _, bucket := range updates {
+			if bucket.usageKnown && bucket.ObservedAtMs > snap.LastProbeObservedAtMs {
+				snap.LastProbeObservedAtMs = bucket.ObservedAtMs
+			}
+		}
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
 	snap.AccountFingerprint = fingerprint

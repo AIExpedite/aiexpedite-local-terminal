@@ -794,7 +794,7 @@ func claudeUsageProbeObservedSince(fingerprint string, baseline time.Time) bool 
 	// answered" would let interactive renders suppress the probe the weekly-split
 	// and Fable rows depend on. A probe writes every window the endpoint supplies,
 	// so the cross-process dedupe this exists for still collapses cleanly.
-	latest := claudeSnapshotFreshness(loadMergedClaudeRateLimitBuckets(fingerprint))
+	latest := claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint))
 	return !latest.IsZero() && latest.After(baseline)
 }
 
@@ -803,8 +803,8 @@ func claudeUsageProbeObservedSince(fingerprint string, baseline time.Time) bool 
 // it cannot supply. Every freshness decision in this file goes through it, so
 // the TTL check, the cross-process dedupe and the post-run debt cannot disagree
 // about what "fresh" means.
-func claudeSnapshotFreshness(buckets map[string]claudeRateLimitBucket) time.Time {
-	return stalestClaudeRowObservation(buckets)
+func claudeSnapshotFreshness(view claudeRateLimitView) time.Time {
+	return stalestClaudeRowObservation(view)
 }
 
 // claudeUsageProbeIdentity is everything a probe needs from the stored
