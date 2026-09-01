@@ -523,24 +523,23 @@ func (g *claudeUsageProbeGate) begin(now time.Time) bool {
 	return true
 }
 
-// claudeUsageProbeCachePersistBudget is the worst case the merge that FOLLOWS a
-// successful request can take: our own wait for the cross-process cache lock,
-// plus one queued in-process writer already spending that same wait while
-// holding the shared mutex (stream capture merges on every rate-limit line).
-// Neither of those is context-bounded, so the join deadline has to make room for
-// them rather than assume the write is instant.
-var claudeUsageProbeCachePersistBudget = 2*claudeRateLimitCacheLockWait + 500*time.Millisecond
-
 // claudeUsageProbeJoinTimeout bounds how long a forced refresh waits for a probe
 // that is already in flight. It must cover the WHOLE probe, not just its
 // request: a probe that spends its full HTTP timeout and then contends for the
 // cache lock persists a reading AFTER the request deadline, and a join that gave
 // up at the request deadline would report "nothing written", fall through, be
 // refused by the still-held single-flight slot, and sign the pre-probe cache
-// milliseconds before the fresh one lands. Derived from the same two bounds the
-// probe itself obeys so the deadline cannot drift away from them. A var so the
-// tests can pin it small.
-var claudeUsageProbeJoinTimeout = claudeUsageProbeTimeout + claudeUsageProbeCachePersistBudget
+// milliseconds before the fresh one lands.
+//
+// Derived from the two bounds the probe itself OBSERVES — the request timeout
+// and the ceiling the verified merge enforces on its own persist step — so the
+// deadline cannot drift away from them. It matters that the second one is
+// enforced rather than estimated: the in-process cache gate has no queue bound,
+// so a budget computed as "our wait plus one other writer's" would be exceeded
+// by any device running two Claude sessions at once, and the joiner would then
+// give up on a probe that was still going to succeed. A var so the tests can pin
+// it small.
+var claudeUsageProbeJoinTimeout = claudeUsageProbeTimeout + claudeRateLimitVerifiedPersistBudget
 
 // joinInFlight waits for a probe that already holds the single-flight slot,
 // reporting whether there was one to join and, when it persisted a reading, the

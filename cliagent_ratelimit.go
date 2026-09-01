@@ -33,7 +33,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -152,12 +151,46 @@ type claudeRateLimitSnapshot struct {
 	LastProbeObservedAtMs int64 `json:"lastProbeObservedAtMs,omitempty"`
 }
 
-// claudeRateLimitMu serialises the read-modify-write of the cache file
+// claudeRateLimitGate serialises the read-modify-write of the cache file
 // in-process. Cross-process serialization is handled separately by an advisory
 // file lock — Claude Code can render the status line from multiple windows in
 // parallel, each spawning its own `aiexpedite statusline-hook` process, and a
 // process-local mutex doesn't help across those boundaries.
-var claudeRateLimitMu sync.Mutex
+//
+// A one-slot channel rather than a sync.Mutex because the VERIFIED merge has to
+// bound its own wait, and a mutex offers no deadline. The queue behind this gate
+// has no depth limit: every rate-limit line a Claude session prints merges here,
+// and each writer may spend the full cross-process lock wait while holding it.
+// So "one queued writer" is not a bound — with several concurrent sessions the
+// probe's persist step would drift arbitrarily far past the deadline its caller
+// (and the joiner waiting on it) was promised. See
+// claudeRateLimitVerifiedPersistBudget.
+var claudeRateLimitGate = make(chan struct{}, 1)
+
+// lockClaudeRateLimitCache takes the in-process gate, waiting as long as it
+// takes. The fire-and-forget writers use this: they are not under a deadline,
+// and dropping their write would lose the reading outright.
+func lockClaudeRateLimitCache() { claudeRateLimitGate <- struct{}{} }
+
+// lockClaudeRateLimitCacheUntil takes the gate with a deadline, reporting
+// whether it was acquired. Nothing is held on a false return.
+func lockClaudeRateLimitCacheUntil(deadline time.Time) bool {
+	select {
+	case claudeRateLimitGate <- struct{}{}:
+		return true
+	default:
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case claudeRateLimitGate <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func unlockClaudeRateLimitCache() { <-claudeRateLimitGate }
 
 // claudeRateLimitCachePath is the cache location inside the agent's data dir.
 // AIEXPEDITE_CLAUDE_RL_CACHE overrides it (tests isolate from the real machine
@@ -413,7 +446,7 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 // percentage, so claiming its own provenance for a percentage it did not
 // measure would be wrong.
 func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) {
-	_, _ = mergeClaudeRateLimitCacheChecked(path, updates, now, fingerprint, source)
+	_, _ = mergeClaudeRateLimitCacheInto(path, updates, now, fingerprint, source, false)
 }
 
 // mergeClaudeRateLimitCacheChecked is the same merge, but REPORTS whether the
@@ -436,12 +469,50 @@ func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeR
 // least as new as the run that earned this write": a caller settling a post-run
 // debt needs the second one, and every window of an update can legitimately be
 // refused as older while the merge still returns success.
+//
+// It is also the only merge that is BOUNDED end to end and that treats an
+// unserialized write as a failure — see mergeClaudeRateLimitCacheInto.
 func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) (time.Time, error) {
+	return mergeClaudeRateLimitCacheInto(path, updates, now, fingerprint, source, true)
+}
+
+// mergeClaudeRateLimitCacheInto is the shared implementation. `verified` selects
+// between the two contracts the callers need, and they differ in exactly two
+// places:
+//
+//   - The wait. A best-effort writer blocks for the in-process gate however long
+//     that takes; a verified one gives up after
+//     claudeRateLimitVerifiedPersistBudget, which covers the gate AND the
+//     cross-process lock, so its total cost is a constant its caller's join
+//     deadline can be derived from rather than a function of how many other
+//     writers happen to be queued.
+//   - Lock contention. A best-effort writer proceeds unlocked — losing one
+//     window update that the next event rewrites moments later beats losing the
+//     reading outright. A verified one REFUSES, because an unlocked
+//     read-modify-rename is not a persisted write: a holder that paused after
+//     reading the old snapshot will rename its stale copy over ours the moment
+//     it resumes, and by then the probe has already reported success, settled
+//     the post-run debt, and signed a receipt for an observation the cache no
+//     longer holds. A refusal costs one retry; a false success costs the feature.
+//
+// A lock we could not even OPEN is a different fact and keeps the degraded path
+// in both modes: there is no evidence of a competing holder, only of a
+// filesystem that will not give us the lock file (a read-only data dir fails the
+// write below anyway, which the verified caller does see).
+func mergeClaudeRateLimitCacheInto(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, verified bool) (time.Time, error) {
 	if path == "" || len(updates) == 0 {
 		return time.Time{}, fmt.Errorf("claude rate-limit cache: nothing to merge")
 	}
-	claudeRateLimitMu.Lock()
-	defer claudeRateLimitMu.Unlock()
+	var budgetDeadline time.Time
+	if verified {
+		budgetDeadline = time.Now().Add(claudeRateLimitVerifiedPersistBudget)
+		if !lockClaudeRateLimitCacheUntil(budgetDeadline) {
+			return time.Time{}, fmt.Errorf("claude rate-limit cache: busy")
+		}
+	} else {
+		lockClaudeRateLimitCache()
+	}
+	defer unlockClaudeRateLimitCache()
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return time.Time{}, err
@@ -456,15 +527,27 @@ func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRate
 	// nested in the gather's own). A blocking flock observes neither, so one
 	// wedged `statusline-hook` process — a stalled cache filesystem is enough —
 	// would hang the signed refresh handler and pin the probe's single-flight
-	// latch indefinitely. The wait also bounds claudeRateLimitMu, which is held
+	// latch indefinitely. The wait also bounds the in-process gate, which is held
 	// only here: without it a probe could queue behind an in-process writer that
 	// is itself blocked on the file lock, wedging one level removed.
-	lockFile, locked := acquireClaudeRateLimitCacheLock(path)
-	if locked {
+	//
+	// A verified merge additionally clamps the wait to whatever is left of its
+	// own budget, so the gate wait and the lock wait cannot sum past it.
+	lockDeadline := time.Now().Add(claudeRateLimitCacheLockWait)
+	if verified && budgetDeadline.Before(lockDeadline) {
+		lockDeadline = budgetDeadline
+	}
+	lockFile, lockOutcome := acquireClaudeRateLimitCacheLock(path, lockDeadline)
+	switch lockOutcome {
+	case claudeRateLimitLockAcquired:
 		defer func() {
 			_ = unlockFile(lockFile)
 			_ = lockFile.Close()
 		}()
+	case claudeRateLimitLockContended:
+		if verified {
+			return time.Time{}, fmt.Errorf("claude rate-limit cache: held by another writer")
+		}
 	}
 
 	snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
@@ -645,33 +728,59 @@ var (
 	claudeRateLimitCacheLockPoll = 10 * time.Millisecond
 )
 
-// acquireClaudeRateLimitCacheLock takes the sibling `.lock` file, waiting at
-// most claudeRateLimitCacheLockWait for a contending holder to release it.
+// claudeRateLimitVerifiedPersistBudget is the ENFORCED ceiling on a verified
+// merge, end to end: the wait for the in-process gate plus the wait for the
+// cross-process file lock. It is a ceiling the merge itself observes, not an
+// estimate of how long the merge is likely to take — the queue on the gate is
+// unbounded, so anything derived from "our wait plus one other writer's" would
+// understate it the moment two Claude sessions print rate-limit lines at once.
 //
-// Returning (nil, false) drops to the SAME degraded path an uncreatable lock
-// file already takes: the merge proceeds under the in-process mutex alone. That
-// is a deliberate trade — a bounded risk of losing one concurrent window update
-// (which the next event rewrites) in exchange for never wedging a caller that
-// is under a deadline. Callers MUST unlock + close when true, and skip when false.
-func acquireClaudeRateLimitCacheLock(cachePath string) (*os.File, bool) {
+// Two lock waits plus a margin: enough for one holder to be waited out and the
+// gate to be handed over, without letting a caller's join deadline (which is
+// derived from this) grow into something a user waiting on Refresh would notice.
+var claudeRateLimitVerifiedPersistBudget = 2*claudeRateLimitCacheLockWait + 500*time.Millisecond
+
+// claudeRateLimitLockOutcome distinguishes the two ways the cross-process lock
+// can end up not held, because they are not the same fact. "Another writer has
+// it" says a competing read-modify-rename is in flight and ours may be undone by
+// it; "we could not open the lock file at all" says only that this filesystem
+// will not give us one, with no evidence of a competitor. The verified merge
+// refuses the first and tolerates the second.
+type claudeRateLimitLockOutcome int
+
+const (
+	claudeRateLimitLockAcquired claudeRateLimitLockOutcome = iota
+	claudeRateLimitLockUnavailable
+	claudeRateLimitLockContended
+)
+
+// acquireClaudeRateLimitCacheLock takes the sibling `.lock` file, waiting until
+// `deadline` for a contending holder to release it.
+//
+// A non-acquired return drops the best-effort callers to the same degraded path
+// an uncreatable lock file already took: the merge proceeds under the in-process
+// gate alone. That is a deliberate trade — a bounded risk of losing one
+// concurrent window update (which the next event rewrites) in exchange for never
+// wedging a caller that is under a deadline. Callers MUST unlock + close on
+// claudeRateLimitLockAcquired, and skip otherwise.
+func acquireClaudeRateLimitCacheLock(cachePath string, deadline time.Time) (*os.File, claudeRateLimitLockOutcome) {
 	lockPath := cachePath + ".lock"
 	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return nil, false
+		return nil, claudeRateLimitLockUnavailable
 	}
-	deadline := time.Now().Add(claudeRateLimitCacheLockWait)
 	for {
 		locked, err := tryLockFileExclusive(f)
 		if err != nil {
 			_ = f.Close()
-			return nil, false
+			return nil, claudeRateLimitLockUnavailable
 		}
 		if locked {
-			return f, true
+			return f, claudeRateLimitLockAcquired
 		}
 		if !time.Now().Before(deadline) {
 			_ = f.Close()
-			return nil, false
+			return nil, claudeRateLimitLockContended
 		}
 		time.Sleep(claudeRateLimitCacheLockPoll)
 	}

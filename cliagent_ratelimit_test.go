@@ -930,6 +930,10 @@ func TestMergeClaudeRateLimitCache_SameInstantReadingStillApplies(t *testing.T) 
 // The merge is reachable from the probe, whose caller runs under a deadline, so
 // lock acquisition must be bounded: one wedged status-line process must not hang
 // the signed refresh handler or pin the probe's single-flight latch forever.
+//
+// Bounded means "gives up", and what a writer does after giving up depends on
+// what it promised. A best-effort writer proceeds unlocked — it has no caller to
+// mislead and the next event rewrites the window anyway.
 func TestMergeClaudeRateLimitCache_BoundedByHeldCrossProcessLock(t *testing.T) {
 	cache := filepath.Join(t.TempDir(), "rl.json")
 	held, ok := acquireCrossProcessCacheLock(cache)
@@ -946,12 +950,129 @@ func TestMergeClaudeRateLimitCache_BoundedByHeldCrossProcessLock(t *testing.T) {
 	t.Cleanup(func() { claudeRateLimitCacheLockWait = prevWait })
 
 	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {
+				ObservedAtMs: now.UnixMilli(), ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+				UsedPercentage: 12, Status: "allowed", usageKnown: true,
+			},
+		}, now, "", claudeRateLimitSourceStream)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("merge wedged behind a held cross-process lock instead of giving up on it")
+	}
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok || snap.Buckets[claudeWindowFiveHour].UsedPercentage != 12 {
+		t.Error("the best-effort merge must still persist its reading on the degraded path")
+	}
+}
+
+// ...but a VERIFIED merge must not. Its return value settles a post-run debt and
+// feeds a signed receipt, and an unlocked read-modify-rename is not a persisted
+// write: the holder we gave up on may have read the old snapshot before pausing,
+// and renames its stale copy over ours the moment it resumes. Reporting success
+// there would clear the failure backoff, throttle the retry that would have
+// fixed it, and sign for an observation the cache no longer holds.
+func TestMergeClaudeRateLimitCacheChecked_RefusesWhenTheCrossProcessLockIsHeld(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	seeded := map[string]claudeRateLimitBucket{claudeWindowFiveHour: {
+		ObservedAtMs: now.UnixMilli(), ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+		UsedPercentage: 12, Status: "allowed", usageKnown: true,
+	}}
+	mergeClaudeRateLimitCacheFromSource(cache, seeded, now, "", claudeRateLimitSourceStream)
+	before, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	held, ok := acquireCrossProcessCacheLock(cache)
+	if !ok {
+		t.Skip("advisory locking unavailable on this filesystem")
+	}
+	defer func() {
+		_ = unlockFile(held)
+		_ = held.Close()
+	}()
+
+	prevWait := claudeRateLimitCacheLockWait
+	claudeRateLimitCacheLockWait = 50 * time.Millisecond
+	t.Cleanup(func() { claudeRateLimitCacheLockWait = prevWait })
+
+	later := now.Add(time.Minute)
+	type result struct {
+		observed time.Time
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		observed, err := mergeClaudeRateLimitCacheChecked(cache, map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {
+				ObservedAtMs: later.UnixMilli(), ResetsAtMs: later.Add(time.Hour).UnixMilli(),
+				UsedPercentage: 44, Status: "allowed", usageKnown: true,
+			},
+		}, later, "", claudeRateLimitSourceProbe)
+		done <- result{observed, err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err == nil {
+			t.Fatal("checked merge reported success while another writer held the lock")
+		}
+		if !got.observed.IsZero() {
+			t.Errorf("observed=%s, want zero — nothing was persisted", got.observed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("checked merge wedged behind a held cross-process lock")
+	}
+
+	after, err := os.ReadFile(cache)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Error("a refused merge must leave the cache byte-identical")
+	}
+}
+
+// The in-process gate has no queue bound: every rate-limit line a Claude session
+// prints merges through it, and each writer may hold it for its own full
+// cross-process lock wait. A verified merge therefore cannot assume it is behind
+// at most one of them — it must enforce its own end-to-end ceiling, or the join
+// deadline derived from that ceiling stops covering the probe it is waiting on.
+func TestMergeClaudeRateLimitCacheChecked_BoundedByQueuedInProcessWriters(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+
+	prevBudget := claudeRateLimitVerifiedPersistBudget
+	claudeRateLimitVerifiedPersistBudget = 100 * time.Millisecond
+	t.Cleanup(func() { claudeRateLimitVerifiedPersistBudget = prevBudget })
+
+	// Stand in for the queued stream-capture writers by holding the gate itself:
+	// what the probe sees is the same either way, and this pins the wait instead
+	// of racing a real writer.
+	lockClaudeRateLimitCache()
+	released := false
+	defer func() {
+		if !released {
+			unlockClaudeRateLimitCache()
+		}
+	}()
+
 	done := make(chan error, 1)
+	started := time.Now()
 	go func() {
 		_, err := mergeClaudeRateLimitCacheChecked(cache, map[string]claudeRateLimitBucket{
 			claudeWindowFiveHour: {
 				ObservedAtMs: now.UnixMilli(), ResetsAtMs: now.Add(time.Hour).UnixMilli(),
-				UsedPercentage: 12, Status: "allowed", usageKnown: true,
+				UsedPercentage: 44, Status: "allowed", usageKnown: true,
 			},
 		}, now, "", claudeRateLimitSourceProbe)
 		done <- err
@@ -959,16 +1080,32 @@ func TestMergeClaudeRateLimitCache_BoundedByHeldCrossProcessLock(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Fatalf("merge returned %v, want it to proceed unlocked rather than fail", err)
+		if err == nil {
+			t.Fatal("checked merge reported success without ever holding the cache gate")
+		}
+		if waited := time.Since(started); waited > 5*time.Second {
+			t.Errorf("waited %s, want the merge to give up near its %s budget",
+				waited, claudeRateLimitVerifiedPersistBudget)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("merge wedged behind a held cross-process lock instead of giving up on it")
+		t.Fatal("checked merge queued behind the gate with no deadline of its own")
 	}
 
-	snap, ok := loadClaudeRateLimitSnapshot(cache)
-	if !ok || snap.Buckets[claudeWindowFiveHour].UsedPercentage != 12 {
-		t.Error("the bounded merge must still persist its reading on the degraded path")
+	if _, ok := loadClaudeRateLimitSnapshot(cache); ok {
+		t.Error("a merge that never held the gate must not have written the cache")
+	}
+
+	// Once the gate frees up the same merge lands, so the refusal above is a
+	// bounded wait and not a permanently closed door.
+	unlockClaudeRateLimitCache()
+	released = true
+	if _, err := mergeClaudeRateLimitCacheChecked(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			ObservedAtMs: now.UnixMilli(), ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			UsedPercentage: 44, Status: "allowed", usageKnown: true,
+		},
+	}, now, "", claudeRateLimitSourceProbe); err != nil {
+		t.Fatalf("merge after the gate was released: %v", err)
 	}
 }
 
