@@ -55,6 +55,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 const (
@@ -1728,149 +1730,266 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 // detectGrokMaintenanceSmokeSystemConfig applies the stricter system-layer
 // posture required by the subscription-only, no-tools maintenance smoke.
 // GROK_HOME isolation cannot hide xAI's system requirements/managed-config
-// layers, so first reuse the ACP credential/approval preflight and then refuse
-// external-tool definitions or settings that re-enable vendor MCP discovery.
+// layers, so decode their TOML semantics and refuse pinned credentials,
+// permissive approval, external-tool definitions, or settings that re-enable
+// vendor MCP discovery.
 func detectGrokMaintenanceSmokeSystemConfig() error {
-	if err := detectPinnedSystemGrokRequirements(false, false); err != nil {
-		// The shared ACP diagnostic names the source path for operator repair.
-		// Maintenance-smoke results are externally published and have a stricter
-		// redaction contract, so retain only the classification here.
-		return fmt.Errorf("grok system configuration pins credentials or a permissive approval policy; refusing no-tools maintenance smoke")
-	}
 	for _, path := range grokSystemConfigPathsFn() {
-		setting, ok, err := grokSystemExternalToolSetting(path)
+		finding, ok, err := inspectGrokSystemConfigSemantic(path)
 		if err != nil {
 			return err
 		}
-		if ok {
-			return fmt.Errorf("grok system configuration contains disallowed %q settings; refusing no-tools maintenance smoke", setting)
+		if !ok {
+			continue
+		}
+		if finding.credential || finding.permissiveApproval {
+			return fmt.Errorf("grok system configuration pins credentials or a permissive approval policy; refusing no-tools maintenance smoke")
+		}
+		if finding.toolCategory != "" {
+			return fmt.Errorf("grok system configuration contains disallowed %q settings; refusing no-tools maintenance smoke", finding.toolCategory)
+		}
+	}
+	// Claude's managed-settings compatibility layer is JSON rather than TOML,
+	// so keep its dedicated semantic reader alongside the TOML traversal.
+	for _, path := range claudeManagedSettingsPathsFn() {
+		if _, ok := detectClaudeManagedSettingsAllowRule(path); ok {
+			return fmt.Errorf("grok system configuration pins credentials or a permissive approval policy; refusing no-tools maintenance smoke")
 		}
 	}
 	return nil
 }
 
-// grokSystemExternalToolSetting returns only a fixed tool category, never a
-// caller-controlled TOML key, section, or value. System config may contain
-// credentials, commands, private paths, and sensitive server identifiers, so
-// refusal errors must not echo raw file data.
-func grokSystemExternalToolSetting(path string) (string, bool, error) {
+type grokSystemSemanticFinding struct {
+	credential         bool
+	permissiveApproval bool
+	toolCategory       string
+}
+
+// inspectGrokSystemConfigSemantic parses one system TOML layer and walks its
+// decoded key tree. Inline tables, quoted keys, dotted keys, and table syntax
+// therefore share the same normalized semantic paths instead of relying on
+// lexical spellings. No caller-controlled key, section, value, or path is ever
+// returned: maintenance refusals publish only fixed classifications.
+func inspectGrokSystemConfigSemantic(path string) (grokSystemSemanticFinding, bool, error) {
+	var finding grokSystemSemanticFinding
 	if path == "" {
-		return "", false, nil
+		return finding, false, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", false, nil
+			return finding, false, nil
 		}
-		return "", false, fmt.Errorf("grok system configuration is unreadable; refusing no-tools maintenance smoke")
+		return finding, false, fmt.Errorf("grok system configuration is unreadable; refusing no-tools maintenance smoke")
 	}
 	defer f.Close()
 
 	const maxBytes = 1 << 20
 	if info, statErr := f.Stat(); statErr != nil {
-		return "", false, fmt.Errorf("grok system configuration cannot be inspected; refusing no-tools maintenance smoke")
+		return finding, false, fmt.Errorf("grok system configuration cannot be inspected; refusing no-tools maintenance smoke")
 	} else if info.Size() > maxBytes {
-		return "", false, fmt.Errorf("grok system configuration exceeds the inspection limit; refusing no-tools maintenance smoke")
+		return finding, false, fmt.Errorf("grok system configuration exceeds the inspection limit; refusing no-tools maintenance smoke")
 	}
-	scanner := bufio.NewScanner(io.LimitReader(f, maxBytes))
-	scanner.Buffer(make([]byte, 64*1024), 256*1024)
-	var section string
-	for scanner.Scan() {
-		line := grokTOMLStripInlineComment(strings.TrimSpace(scanner.Text()))
-		if line == "" {
-			continue
+	data, readErr := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if readErr != nil {
+		return finding, false, fmt.Errorf("grok system configuration cannot be inspected; refusing no-tools maintenance smoke")
+	}
+	if len(data) > maxBytes {
+		return finding, false, fmt.Errorf("grok system configuration exceeds the inspection limit; refusing no-tools maintenance smoke")
+	}
+	var decoded map[string]any
+	if _, decodeErr := toml.Decode(string(data), &decoded); decodeErr != nil {
+		return finding, false, fmt.Errorf("grok system configuration cannot be parsed safely; refusing no-tools maintenance smoke")
+	}
+	walkGrokSystemConfigSemantic(decoded, nil, &finding)
+	return finding, true, nil
+}
+
+func normalizeGrokSemanticKey(key string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(key)), "-", "_")
+}
+
+func walkGrokSystemConfigSemantic(value any, path []string, finding *grokSystemSemanticFinding) {
+	switch node := value.(type) {
+	case map[string]any:
+		for rawKey, child := range node {
+			key := normalizeGrokSemanticKey(rawKey)
+			childPath := append(append([]string(nil), path...), key)
+			classifyGrokSystemSemanticValue(childPath, child, finding)
+			walkGrokSystemConfigSemantic(child, childPath, finding)
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			// Trim both scalar-table and array-of-table brackets so
-			// [[mcp_servers]] cannot evade the namespace check.
-			section = normalizeGrokSystemToolKey(strings.Trim(line, "[] \t"))
-			if category := grokSystemToolCategory(section); category != "" {
-				return category, true, nil
+	case []map[string]any:
+		for _, child := range node {
+			walkGrokSystemConfigSemantic(child, path, finding)
+		}
+	case []any:
+		for _, child := range node {
+			walkGrokSystemConfigSemantic(child, path, finding)
+		}
+	}
+}
+
+func classifyGrokSystemSemanticValue(path []string, value any, finding *grokSystemSemanticFinding) {
+	if len(path) == 0 {
+		return
+	}
+	last := path[len(path)-1]
+	if last == "api_key" || last == "env_key" {
+		if strings.TrimSpace(fmt.Sprint(value)) != "" {
+			finding.credential = true
+		}
+	}
+	if (last == "always_approve" || last == "auto_approve" || last == "yolo") && semanticGrokBool(value) {
+		finding.permissiveApproval = true
+	}
+	if last == "permission_mode" || last == "approval_mode" || last == "approval" ||
+		(last == "mode" && (len(path) == 1 || grokSemanticPathContains(path, "approval"))) {
+		if isGrokPermissionModeBypassValue(fmt.Sprint(value)) {
+			finding.permissiveApproval = true
+		}
+	}
+	if grokSemanticAllowPath(path) && semanticGrokValueNonEmpty(value) {
+		finding.permissiveApproval = true
+	}
+	if grokSemanticPermissionRulesPath(path) && semanticGrokPermissionRulesHasAllow(value) {
+		finding.permissiveApproval = true
+	}
+
+	if grokSemanticVendorMCPPath(path) {
+		if enabled, ok := value.(bool); !ok || enabled {
+			finding.toolCategory = "vendor-mcp"
+		}
+		return
+	}
+	for _, component := range path {
+		switch {
+		case component == "mcp" || component == "mcps" || component == "mcpservers" ||
+			strings.HasPrefix(component, "mcp_") || strings.HasPrefix(component, "mcpserver"):
+			if finding.toolCategory == "" {
+				finding.toolCategory = "mcp"
 			}
-			continue
-		}
-		eq := strings.IndexByte(line, '=')
-		if eq <= 0 {
-			continue
-		}
-		key := normalizeGrokSystemToolKey(strings.TrimSpace(line[:eq]))
-		qualified := key
-		if section != "" && !strings.Contains(key, ".") {
-			qualified = section + "." + key
-		}
-		value := strings.ToLower(strings.TrimSpace(line[eq+1:]))
-		if qualified == "compat.cursor.mcps" || qualified == "compat.claude.mcps" {
-			if value != "false" {
-				return "vendor-mcp", true, nil
+		case component == "plugin" || component == "plugins" ||
+			strings.HasPrefix(component, "plugin_") || strings.HasPrefix(component, "installed_plugin"):
+			if finding.toolCategory == "" {
+				finding.toolCategory = "plugin"
 			}
-			continue
-		}
-		if category := grokSystemToolCategory(qualified); category != "" {
-			return category, true, nil
-		}
-		if category := grokSystemInlineToolCategory(qualified, line[eq+1:]); category != "" {
-			return category, true, nil
 		}
 	}
-	if scanner.Err() != nil {
-		return "", false, fmt.Errorf("grok system configuration cannot be parsed safely; refusing no-tools maintenance smoke")
-	}
-	return "", false, nil
 }
 
-func normalizeGrokSystemToolKey(value string) string {
-	value = strings.ToLower(strings.Trim(value, " \t\"'"))
-	value = strings.ReplaceAll(value, "-", "_")
-	return value
+func grokSemanticPathContains(path []string, want string) bool {
+	for _, component := range path {
+		if component == want {
+			return true
+		}
+	}
+	return false
 }
 
-func grokSystemToolCategory(value string) string {
-	for _, component := range strings.Split(value, ".") {
-		component = strings.Trim(component, " \t\"'")
-		if component == "mcp" || component == "mcps" || component == "mcpservers" ||
-			strings.HasPrefix(component, "mcp_") || strings.HasPrefix(component, "mcpserver") {
-			return "mcp"
-		}
-		if component == "plugin" || component == "plugins" ||
-			strings.HasPrefix(component, "plugin_") || strings.HasPrefix(component, "installed_plugin") {
-			return "plugin"
-		}
-	}
-	return ""
+func grokSemanticVendorMCPPath(path []string) bool {
+	n := len(path)
+	return n >= 3 && path[n-3] == "compat" &&
+		(path[n-2] == "cursor" || path[n-2] == "claude") && path[n-1] == "mcps"
 }
 
-// grokSystemInlineToolCategory handles TOML's semantically equivalent inline
-// table form, e.g. `compat = { cursor = { mcps = true } }`. The system files
-// are operator-controlled and this is a fail-closed preflight, so conservative
-// keyword recognition is preferable to silently accepting a nested loader.
-func grokSystemInlineToolCategory(key, rawValue string) string {
-	compact := strings.ToLower(rawValue)
-	compact = strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "", "-", "_").Replace(compact)
-	if (key == "compat" || strings.HasSuffix(key, ".compat")) &&
-		(strings.Contains(compact, "cursor") || strings.Contains(compact, "claude")) &&
-		strings.Contains(compact, "mcps=") {
-		if strings.Contains(compact, "mcps=true") || strings.Contains(compact, `mcps="true"`) || strings.Contains(compact, "mcps='true'") {
-			return "vendor-mcp"
+func grokSemanticAllowPath(path []string) bool {
+	if len(path) == 0 {
+		return false
+	}
+	last := path[len(path)-1]
+	if last == "allow_rules" || last == "allowlist" {
+		return true
+	}
+	if last != "allow" || grokSemanticPathWithinPermissionRules(path) {
+		return false
+	}
+	// A key literally named `allow` at any ordinary configuration scope is an
+	// allow list. The exception is a field nested inside permission_rules: in
+	// that structured grammar the rule's `action` decides allow vs deny, and a
+	// matcher field must not turn a deny-only policy into a false positive.
+	return true
+}
+
+func grokSemanticPathWithinPermissionRules(path []string) bool {
+	for i, component := range path {
+		if component == "permission_rules" {
+			return true
 		}
-		// An inline table that explicitly disables every named vendor MCP
-		// source is equivalent to the safe section form written by isolation.
-		// Remove only those safe assignments, then continue scanning in case
-		// the same inline table also declares a separate plugin/MCP loader.
-		compact = strings.NewReplacer(
-			"mcps=false", "",
-			`mcps="false"`, "",
-			"mcps='false'", "",
-		).Replace(compact)
+		if component == "rules" && i > 0 && path[i-1] == "permission" {
+			return true
+		}
 	}
-	if strings.Contains(compact, "mcp=") || strings.Contains(compact, "mcps=") ||
-		strings.Contains(compact, "mcp_servers=") || strings.Contains(compact, "mcpservers=") {
-		return "mcp"
+	return false
+}
+
+func grokSemanticPermissionRulesPath(path []string) bool {
+	if len(path) == 0 {
+		return false
 	}
-	if strings.Contains(compact, "plugin=") || strings.Contains(compact, "plugins=") ||
-		strings.Contains(compact, "plugin_dir=") || strings.Contains(compact, "installed_plugins=") {
-		return "plugin"
+	if path[len(path)-1] == "permission_rules" {
+		return true
 	}
-	return ""
+	return len(path) >= 2 && path[len(path)-2] == "permission" && path[len(path)-1] == "rules"
+}
+
+func semanticGrokPermissionRulesHasAllow(value any) bool {
+	switch node := value.(type) {
+	case map[string]any:
+		for rawKey, child := range node {
+			if normalizeGrokSemanticKey(rawKey) == "action" && strings.EqualFold(strings.TrimSpace(fmt.Sprint(child)), "allow") {
+				return true
+			}
+			// A string nested inside a structured rule is commonly a tool or
+			// pattern value, including on deny-only rules. Only recurse into
+			// additional containers here; bare strings are legacy allow rules
+			// only when they are direct entries in the rules value/array.
+			switch child.(type) {
+			case map[string]any, []map[string]any, []any:
+				if semanticGrokPermissionRulesHasAllow(child) {
+					return true
+				}
+			}
+		}
+	case []map[string]any:
+		for _, child := range node {
+			if semanticGrokPermissionRulesHasAllow(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range node {
+			if semanticGrokPermissionRulesHasAllow(child) {
+				return true
+			}
+		}
+	case string:
+		// Legacy string permission_rules entries are allow rules; structured
+		// deny rules use an explicit action field and are handled above.
+		return strings.TrimSpace(node) != ""
+	}
+	return false
+}
+
+func semanticGrokValueNonEmpty(value any) bool {
+	switch node := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(node) != ""
+	case []any:
+		return len(node) > 0
+	case []map[string]any:
+		return len(node) > 0
+	case map[string]any:
+		return len(node) > 0
+	default:
+		return true
+	}
+}
+
+func semanticGrokBool(value any) bool {
+	enabled, ok := value.(bool)
+	return ok && enabled
 }
 
 // detectPinnedSystemGrokRequirementsFile is the per-path scanner that backs
@@ -1880,6 +1999,19 @@ func grokSystemInlineToolCategory(key, rawValue string) string {
 func detectPinnedSystemGrokRequirementsFile(path string, allowAPIKey, allowAlwaysApprove bool) error {
 	if path == "" {
 		return nil
+	}
+	// Decode semantic paths first so valid inline tables and quoted keys are
+	// classified identically to their section/dotted-key equivalents. Preserve
+	// this ACP preflight's historical best-effort behavior on unreadable or
+	// malformed files; the stricter maintenance smoke calls the same inspector
+	// directly and fails closed on those errors.
+	if finding, ok, semanticErr := inspectGrokSystemConfigSemantic(path); semanticErr == nil && ok {
+		if !allowAPIKey && finding.credential {
+			return fmt.Errorf("grok requirements pin API-key auth in %s; refusing to spawn — set Config.EnableGrokAPIKeyFallback=true to opt in, or remove the pinned credential", path)
+		}
+		if !allowAlwaysApprove && finding.permissiveApproval {
+			return fmt.Errorf("grok requirements pin a permissive approval policy in %s; refusing to spawn — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the pinned policy", path)
+		}
 	}
 	f, err := os.Open(path)
 	if err != nil {

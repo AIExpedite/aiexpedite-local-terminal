@@ -208,12 +208,15 @@ func TestStartSession_GrokNoToolsRejectsExternalLoaders(t *testing.T) {
 		{[]string{"--tools=", "--config=model.api_key='credential-sentinel'", "marker"}, "--config", "credential-sentinel"},
 		{[]string{"--tools", "", "--agent=private-agent-path", "marker"}, "--agent", "private-agent-path"},
 		{[]string{"--tools", "", `--agents={"worker":{"token":"credential-sentinel"}}`, "marker"}, "--agents", "credential-sentinel"},
+		{[]string{"--tools", "", "--cwd=" + filepath.Join(t.TempDir(), "project-path-sentinel"), "marker"}, "--cwd", "project-path-sentinel"},
+		{[]string{"--tools", "", "--resume=session-path-sentinel", "marker"}, "--resume", "session-path-sentinel"},
+		{[]string{"--tools", "", "--worktree=project-path-sentinel", "marker"}, "--worktree", "project-path-sentinel"},
 	}
 	for i, tc := range tests {
 		sm := NewSessionManager(nil)
 		args := append([]string{grokMaintenanceSmokeControlArg}, tc.args...)
 		err := sm.StartSession("grok-no-tools-loader", "grok", args, t.TempDir(), "ws", "uid", 1000, false, func(resultMsg) {})
-		if err == nil || !strings.Contains(err.Error(), "cannot load external") {
+		if err == nil || !strings.Contains(err.Error(), "cannot use external-loader or workspace/session") {
 			t.Errorf("case %d StartSession(%#v) error = %v, want external-loader rejection", i, args, err)
 			continue
 		}
@@ -222,6 +225,74 @@ func TestStartSession_GrokNoToolsRejectsExternalLoaders(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), tc.secretText) || strings.Contains(err.Error(), "model.api_key") || strings.Contains(err.Error(), `"worker"`) {
 			t.Errorf("case %d rejection leaked loader value: %q", i, err)
+		}
+	}
+}
+
+func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) {
+	got := sanitizeGrokMaintenanceSmokeEnv([]string{
+		"PATH=keep-me",
+		"XAI_API_KEY=credential-sentinel",
+		"GROK_CODE_XAI_API_KEY=alternate-credential-sentinel",
+		"GROK_AUTH_PROVIDER_ACCESS_TOKEN=provider-credential-sentinel",
+		"GROK_AGENT=agent-path-sentinel",
+		"GROK_CURSOR_MCPS_ENABLED=1",
+		"GROK_CLAUDE_MCPS_ENABLED=1",
+		"GROK_CURSOR_AGENTS_ENABLED=1",
+		"GROK_CLAUDE_HOOKS_ENABLED=1",
+		"GROK_CODEX_MCPS_ENABLED=1",
+		"GROK_MANAGED_MCPS_ENABLED=1",
+		"GROK_WORKSPACE_TOOL_DEFS_ENABLED=1",
+		"GROK_CONFIG_PATH=config-path-sentinel",
+		"GROK_MANAGED_CONFIG_URL=managed-config-sentinel",
+		"GROK_PLUGIN_ROOT=plugin-path-sentinel",
+		"GROK_WORKSPACE_ROOT=workspace-path-sentinel",
+		"GROK_WORKSPACE_SERVER_SKILLS_DIR=skills-path-sentinel",
+		"GROK_SUBAGENTS=1",
+		"GROK_WEB_FETCH=1",
+		"GROK_MEMORY=1",
+		"GROK_LSP_TOOLS=1",
+	})
+	values := make(map[string]string, len(got))
+	for _, entry := range got {
+		name, value, _ := strings.Cut(entry, "=")
+		values[strings.ToUpper(name)] = value
+	}
+	if values["PATH"] != "keep-me" {
+		t.Fatalf("safe environment was not preserved: %#v", got)
+	}
+	for _, stripped := range []string{
+		"XAI_API_KEY", "GROK_CODE_XAI_API_KEY", "GROK_AUTH_PROVIDER_ACCESS_TOKEN",
+		"GROK_AGENT", "GROK_SUBAGENTS", "GROK_WEB_FETCH",
+		"GROK_MEMORY", "GROK_LSP_TOOLS", "GROK_CONFIG_PATH", "GROK_PLUGIN_ROOT",
+		"GROK_MANAGED_CONFIG_URL", "GROK_WORKSPACE_ROOT", "GROK_WORKSPACE_SERVER_SKILLS_DIR",
+	} {
+		if _, ok := values[stripped]; ok {
+			t.Errorf("maintenance environment retained %s: %#v", stripped, got)
+		}
+	}
+	for _, pinned := range []string{
+		"GROK_CURSOR_SKILLS_ENABLED", "GROK_CURSOR_RULES_ENABLED", "GROK_CURSOR_AGENTS_ENABLED",
+		"GROK_CURSOR_MCPS_ENABLED", "GROK_CURSOR_HOOKS_ENABLED", "GROK_CURSOR_SESSIONS_ENABLED",
+		"GROK_CLAUDE_SKILLS_ENABLED", "GROK_CLAUDE_RULES_ENABLED", "GROK_CLAUDE_AGENTS_ENABLED",
+		"GROK_CLAUDE_MCPS_ENABLED", "GROK_CLAUDE_HOOKS_ENABLED", "GROK_CLAUDE_SESSIONS_ENABLED",
+		"GROK_CODEX_SKILLS_ENABLED", "GROK_CODEX_RULES_ENABLED", "GROK_CODEX_AGENTS_ENABLED",
+		"GROK_CODEX_MCPS_ENABLED", "GROK_CODEX_HOOKS_ENABLED", "GROK_CODEX_SESSIONS_ENABLED",
+		"GROK_MANAGED_MCPS_ENABLED", "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
+		"GROK_WORKSPACE_TOOL_DEFS_ENABLED", "GROK_WORKSPACE_TOOL_STATE_ENABLED",
+	} {
+		if values[pinned] != "0" {
+			t.Errorf("maintenance environment %s = %q, want 0", pinned, values[pinned])
+		}
+	}
+	encoded := strings.Join(got, "\n")
+	for _, secret := range []string{
+		"credential-sentinel", "alternate-credential-sentinel", "provider-credential-sentinel",
+		"agent-path-sentinel", "config-path-sentinel", "managed-config-sentinel", "plugin-path-sentinel",
+		"workspace-path-sentinel", "skills-path-sentinel",
+	} {
+		if strings.Contains(encoded, secret) {
+			t.Errorf("maintenance environment retained %q: %s", secret, encoded)
 		}
 	}
 }
@@ -255,6 +326,12 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 		{"vendor MCP override", "[compat.cursor]\nmcps = true\n", "vendor-mcp"},
 		{"inline vendor MCP", "compat = { cursor = { mcps = true } }\n", "vendor-mcp"},
 		{"inline approval", `approval = { mode = "always" }` + "\n", ""},
+		{"inline documented UI approval", `ui = { permission_mode = "always-approve" }` + "\n", ""},
+		{"inline documented permission allow", `permission = { rules = [{ action = "allow", tool = "MCPTool" }] }` + "\n", ""},
+		{"top-level allow list", `allow = ["MCPTool(*)"]` + "\n", ""},
+		{"quoted inline UI approval", `"ui" = { "permission_mode" = "acceptEdits" }` + "\n", ""},
+		{"quoted inline permission allow", `"permission" = { "rules" = [{ "action" = "allow", "tool" = "MCPTool" }] }` + "\n", ""},
+		{"quoted inline vendor MCP", `"compat" = { "cursor" = { "mcps" = true } }` + "\n", "vendor-mcp"},
 		{"inline plugin", `plugins = { enabled = ["customer-secret-name"] }` + "\n", "plugin"},
 		{"inline MCP", `mcp_servers = { "customer-secret-name" = { command = "raw-config-sentinel" } }` + "\n", "mcp"},
 	}
@@ -292,6 +369,12 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 	}
 	if err := detectGrokMaintenanceSmokeSystemConfig(); err != nil {
 		t.Fatalf("inline system vendor-MCP disables must remain valid: %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte(`permission = { rules = [{ action = "deny", tool = "MCPTool", allow = "matcher-only" }] }`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := detectGrokMaintenanceSmokeSystemConfig(); err != nil {
+		t.Fatalf("inline deny-only permission rules must remain valid: %v", err)
 	}
 
 	if err := os.WriteFile(managedPath, []byte(strings.Repeat("#", (1<<20)+1)), 0o600); err != nil {

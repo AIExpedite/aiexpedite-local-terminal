@@ -217,13 +217,13 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// plugins and MCP discovery. Reuse the ACP auth-only home, but omit its
 	// persistent conversation-store link: this is a one-shot smoke and must not
 	// gain access to unrelated transcripts.
-	var isolatedGrokHome, persistentGrokHome string
+	var isolatedGrokHome, isolatedGrokCwd, persistentGrokHome string
 	if grokMaintenanceSmoke {
 		if !grokArgsRequestNoTools(cliArgs) {
 			return fmt.Errorf("grok maintenance smoke requires an explicit empty --tools value")
 		}
 		if arg, ok := grokNoToolsExternalLoaderArg(cliArgs); ok {
-			return fmt.Errorf("grok no-tools invocation cannot load external agent/plugin/config option %q", arg)
+			return fmt.Errorf("grok maintenance smoke cannot use external-loader or workspace/session option %q", arg)
 		}
 		if contractErr := validateGrokMaintenanceSmokeContract(cliArgs); contractErr != nil {
 			return contractErr
@@ -236,6 +236,16 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		isolatedGrokHome, isolationErr = setupIsolatedGrokSmokeHomeFrom(persistentGrokHome)
 		if isolationErr != nil {
 			return fmt.Errorf("grok no-tools isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", isolationErr)
+		}
+		// Grok also discovers project `.grok/config.toml`, `.mcp.json`, plugins,
+		// hooks, rules, and agent files by walking upward from cwd. Keep the
+		// maintenance probe in a fresh empty directory under the isolated home so
+		// none of the caller's repository-scoped extensions can participate.
+		isolatedGrokCwd = filepath.Join(isolatedGrokHome, "workspace")
+		if mkdirErr := os.Mkdir(isolatedGrokCwd, 0o700); mkdirErr != nil {
+			_ = os.RemoveAll(isolatedGrokHome)
+			isolatedGrokHome = ""
+			return fmt.Errorf("grok no-tools working-directory isolation failed; refusing to spawn in caller workspace")
 		}
 	}
 	isolationOwnedBySession := false
@@ -321,16 +331,23 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	proc := exec.Command(executable, cliArgs...)
 	hideWindow(proc)
-	if cwd != "" {
+	if isolatedGrokCwd != "" {
+		proc.Dir = isolatedGrokCwd
+	} else if cwd != "" {
 		proc.Dir = cwd
 	}
 
 	filtered, strippedVars := prepareClaudeChildEnv(command, os.Environ())
 	if isolatedGrokHome != "" {
 		// Subscription-only smoke: do not let an inherited API key replace the
-		// copied login, and point Grok exclusively at the clean temporary home.
-		filtered = sanitizeGrokACPEnv(filtered, false)
+		// copied login. HOME/USERPROFILE are isolated too because Grok's Claude,
+		// Cursor, and Agents compatibility loaders discover sources outside
+		// GROK_HOME under the OS user home.
+		filtered = sanitizeGrokMaintenanceSmokeEnv(filtered)
 		filtered = setEnvVar(filtered, "GROK_HOME", isolatedGrokHome)
+		filtered = setEnvVar(filtered, "HOME", isolatedGrokHome)
+		filtered = setEnvVar(filtered, "USERPROFILE", isolatedGrokHome)
+		filtered = setEnvVar(filtered, "PWD", isolatedGrokCwd)
 	}
 	proc.Env = filtered
 	if len(strippedVars) > 0 {
@@ -3146,13 +3163,72 @@ func validateGrokMaintenanceSmokeContract(args []string) error {
 func grokNoToolsExternalLoaderArg(args []string) (string, bool) {
 	for _, arg := range args {
 		lower := strings.ToLower(arg)
-		for _, name := range []string{"--plugin-dir", "--config", "--agent", "--agents"} {
+		for _, name := range []string{
+			"--plugin-dir", "--config", "--agent", "--agents",
+			"--cwd", "-w", "--worktree", "--worktree-ref", "--ref",
+			"-r", "--resume", "-c", "--continue", "-s", "--session-id",
+			"--fork-session", "--restore-code", "--leader-socket",
+		} {
 			if lower == name || strings.HasPrefix(lower, name+"=") {
 				return name, true
 			}
 		}
 	}
 	return "", false
+}
+
+// sanitizeGrokMaintenanceSmokeEnv is stricter than the reusable ACP sanitizer:
+// maintenance smokes must not inherit environment-level extension discovery or
+// agent selection. Grok documents the compatibility scanner variables as
+// session overrides, so merely writing `compat.*.mcps = false` in the isolated
+// config is insufficient. Strip every Cursor/Claude/Codex compatibility
+// override and other config, plugin, workspace, or tool-enabling selector,
+// then pin every documented compatibility and managed-tool scanner off
+// explicitly so each default-on loader remains disabled.
+func sanitizeGrokMaintenanceSmokeEnv(env []string) []string {
+	base := sanitizeGrokACPEnv(env, false)
+	filtered := make([]string, 0, len(base)+2)
+	blocked := map[string]bool{
+		"GROK_AGENT":            true,
+		"GROK_AUTH":             true,
+		"GROK_CODE_XAI_API_KEY": true,
+		"GROK_DEPLOYMENT_KEY":   true,
+		"GROK_LOCAL_AUTH":       true,
+		"GROK_LOGIN_ENV":        true,
+		"GROK_WORKSPACE":        true,
+		"GROK_WORKFLOWS":        true,
+		"GROK_SUBAGENTS":        true,
+		"GROK_WEB_FETCH":        true,
+		"GROK_MEMORY":           true,
+		"GROK_TOOL_SEARCH":      true,
+		"GROK_LSP_TOOLS":        true,
+		"GROK_WRITE_FILE":       true,
+	}
+	for _, entry := range base {
+		name, _, _ := strings.Cut(entry, "=")
+		upper := strings.ToUpper(name)
+		if blocked[upper] || strings.HasPrefix(upper, "GROK_AUTH_PROVIDER_") ||
+			strings.HasPrefix(upper, "GROK_CONFIG") || strings.HasPrefix(upper, "GROK_MANAGED_") ||
+			strings.HasPrefix(upper, "GROK_PLUGIN_") || strings.HasPrefix(upper, "GROK_WORKSPACE_") ||
+			strings.HasPrefix(upper, "GROK_CURSOR_") || strings.HasPrefix(upper, "GROK_CLAUDE_") ||
+			strings.HasPrefix(upper, "GROK_CODEX_") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	for _, name := range []string{
+		"GROK_CURSOR_SKILLS_ENABLED", "GROK_CURSOR_RULES_ENABLED", "GROK_CURSOR_AGENTS_ENABLED",
+		"GROK_CURSOR_MCPS_ENABLED", "GROK_CURSOR_HOOKS_ENABLED", "GROK_CURSOR_SESSIONS_ENABLED",
+		"GROK_CLAUDE_SKILLS_ENABLED", "GROK_CLAUDE_RULES_ENABLED", "GROK_CLAUDE_AGENTS_ENABLED",
+		"GROK_CLAUDE_MCPS_ENABLED", "GROK_CLAUDE_HOOKS_ENABLED", "GROK_CLAUDE_SESSIONS_ENABLED",
+		"GROK_CODEX_SKILLS_ENABLED", "GROK_CODEX_RULES_ENABLED", "GROK_CODEX_AGENTS_ENABLED",
+		"GROK_CODEX_MCPS_ENABLED", "GROK_CODEX_HOOKS_ENABLED", "GROK_CODEX_SESSIONS_ENABLED",
+		"GROK_MANAGED_MCPS_ENABLED", "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
+		"GROK_WORKSPACE_TOOL_DEFS_ENABLED", "GROK_WORKSPACE_TOOL_STATE_ENABLED",
+	} {
+		filtered = setEnvVar(filtered, name, "0")
+	}
+	return filtered
 }
 
 // buildGrokInteractiveArgs builds Grok Build CLI (`grok`) args for a one-shot

@@ -42,6 +42,7 @@ import (
 const mockCLIEnvVar = "TEST_MOCK_CLI_MODE"
 const mockGrokPersistentHomeEnv = "TEST_MOCK_GROK_PERSISTENT_HOME"
 const mockGrokVendorHomeEnv = "TEST_MOCK_GROK_VENDOR_HOME"
+const mockGrokProjectRootEnv = "TEST_MOCK_GROK_PROJECT_ROOT"
 
 const grokMaintenanceSmokeMarker = "AIEXPEDITE_GROK_SMOKE_MARKER_7F3C2A"
 
@@ -438,6 +439,8 @@ func runMockGrokMaintenanceSmoke(mode string) {
 	isolatedHome := os.Getenv("GROK_HOME")
 	persistentHome := os.Getenv(mockGrokPersistentHomeEnv)
 	vendorHome := os.Getenv(mockGrokVendorHomeEnv)
+	projectRoot := os.Getenv(mockGrokProjectRootEnv)
+	workingDir, workingDirErr := os.Getwd()
 	isolatedConfig, configErr := os.ReadFile(filepath.Join(isolatedHome, "config.toml"))
 	_, isolatedPluginErr := os.Stat(filepath.Join(isolatedHome, "plugins", "host-plugin"))
 	_, isolatedMCPErr := os.Stat(filepath.Join(isolatedHome, "mcp.json"))
@@ -446,21 +449,51 @@ func runMockGrokMaintenanceSmoke(mode string) {
 	_, hostPluginErr := os.Stat(filepath.Join(persistentHome, "plugins", "host-plugin"))
 	_, hostMCPErr := os.Stat(filepath.Join(persistentHome, "mcp.json"))
 	_, cursorMCPErr := os.Stat(filepath.Join(vendorHome, ".cursor", "mcp.json"))
+	_, projectConfigErr := os.Stat(filepath.Join(projectRoot, ".grok", "config.toml"))
+	_, projectPluginErr := os.Stat(filepath.Join(projectRoot, ".grok", "plugins", "project-plugin", "plugin.json"))
+	_, projectMCPErr := os.Stat(filepath.Join(projectRoot, ".mcp.json"))
+	_, isolatedProjectConfigErr := os.Stat(filepath.Join(workingDir, ".grok", "config.toml"))
+	_, isolatedProjectPluginErr := os.Stat(filepath.Join(workingDir, ".grok", "plugins"))
+	_, isolatedProjectMCPErr := os.Stat(filepath.Join(workingDir, ".mcp.json"))
 	tools, hasTools := mockArgValue(args, "--tools")
 	maxTurns, hasMaxTurns := mockArgValue(args, "--max-turns")
 	outputFormat, hasOutputFormat := mockArgValue(args, "--output-format")
 	promptPath, hasPromptFile := mockArgValue(args, "--prompt-file")
 	prompt, promptErr := os.ReadFile(promptPath)
 	_, hasExternalLoader := grokNoToolsExternalLoaderArg(args)
-	if isolatedHome == "" || persistentHome == "" || isolatedHome == persistentHome ||
+	compatibilityDisabled := true
+	for _, name := range []string{
+		"GROK_CURSOR_SKILLS_ENABLED", "GROK_CURSOR_RULES_ENABLED", "GROK_CURSOR_AGENTS_ENABLED",
+		"GROK_CURSOR_MCPS_ENABLED", "GROK_CURSOR_HOOKS_ENABLED", "GROK_CURSOR_SESSIONS_ENABLED",
+		"GROK_CLAUDE_SKILLS_ENABLED", "GROK_CLAUDE_RULES_ENABLED", "GROK_CLAUDE_AGENTS_ENABLED",
+		"GROK_CLAUDE_MCPS_ENABLED", "GROK_CLAUDE_HOOKS_ENABLED", "GROK_CLAUDE_SESSIONS_ENABLED",
+		"GROK_CODEX_SKILLS_ENABLED", "GROK_CODEX_RULES_ENABLED", "GROK_CODEX_AGENTS_ENABLED",
+		"GROK_CODEX_MCPS_ENABLED", "GROK_CODEX_HOOKS_ENABLED", "GROK_CODEX_SESSIONS_ENABLED",
+		"GROK_MANAGED_MCPS_ENABLED", "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
+		"GROK_WORKSPACE_TOOL_DEFS_ENABLED", "GROK_WORKSPACE_TOOL_STATE_ENABLED",
+	} {
+		if os.Getenv(name) != "0" {
+			compatibilityDisabled = false
+			break
+		}
+	}
+	if isolatedHome == "" || persistentHome == "" || projectRoot == "" || isolatedHome == persistentHome ||
+		workingDirErr != nil || filepath.Clean(workingDir) != filepath.Join(filepath.Clean(isolatedHome), "workspace") ||
+		filepath.Clean(os.Getenv("HOME")) != filepath.Clean(isolatedHome) ||
+		filepath.Clean(os.Getenv("USERPROFILE")) != filepath.Clean(isolatedHome) ||
+		filepath.Clean(os.Getenv("PWD")) != filepath.Clean(workingDir) ||
 		configErr != nil || copiedAuthErr != nil || hostPluginErr != nil || hostMCPErr != nil || cursorMCPErr != nil ||
+		projectConfigErr != nil || projectPluginErr != nil || projectMCPErr != nil ||
 		!os.IsNotExist(isolatedPluginErr) || !os.IsNotExist(isolatedMCPErr) || !os.IsNotExist(isolatedSessionsErr) ||
+		!os.IsNotExist(isolatedProjectConfigErr) || !os.IsNotExist(isolatedProjectPluginErr) || !os.IsNotExist(isolatedProjectMCPErr) ||
 		!strings.Contains(string(isolatedConfig), "[compat.cursor]") ||
 		!strings.Contains(string(isolatedConfig), "[compat.claude]") ||
 		strings.Count(string(isolatedConfig), "mcps = false") != 2 ||
 		strings.Contains(string(isolatedConfig), "host-plugin") ||
 		strings.Contains(string(isolatedConfig), "host-mcp") ||
-		os.Getenv("XAI_API_KEY") != "" || hasExternalLoader ||
+		os.Getenv("XAI_API_KEY") != "" || os.Getenv("GROK_CODE_XAI_API_KEY") != "" ||
+		os.Getenv("GROK_AUTH_PROVIDER_ACCESS_TOKEN") != "" || os.Getenv("GROK_AGENT") != "" || !compatibilityDisabled ||
+		hasExternalLoader ||
 		mockHasArg(args, grokMaintenanceSmokeControlArg) ||
 		!hasTools || tools != "" || !hasMaxTurns || maxTurns != "1" ||
 		!hasOutputFormat || outputFormat != "streaming-json" ||
@@ -779,6 +812,8 @@ func TestSessionLifecycle_GrokDirectPublishesFreshRedactedBilling(t *testing.T) 
 func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *testing.T) {
 	realHome := t.TempDir()
 	vendorHome := t.TempDir()
+	projectRoot := t.TempDir()
+	projectCwd := filepath.Join(projectRoot, "workspace")
 	seedGrokHomeWithLogin(t, realHome)
 	if err := os.WriteFile(filepath.Join(realHome, "config.toml"), []byte(
 		"[plugins]\nenabled = [\"host-plugin\"]\n[mcp_servers.host-mcp]\ncommand = \"raw-config-sentinel\"\n",
@@ -800,12 +835,43 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 	if err := os.WriteFile(filepath.Join(vendorHome, ".cursor", "mcp.json"), []byte(`{"mcpServers":{"host-mcp":{"command":"raw-config-sentinel"}}}`), 0o600); err != nil {
 		t.Fatalf("seed Cursor MCP config: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".grok", "plugins", "project-plugin"), 0o700); err != nil {
+		t.Fatalf("seed project Grok plugin directory: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".git"), 0o700); err != nil {
+		t.Fatalf("seed project root marker: %v", err)
+	}
+	if err := os.MkdirAll(projectCwd, 0o700); err != nil {
+		t.Fatalf("seed project working directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, ".grok", "config.toml"), []byte(
+		"[mcp_servers.project-mcp]\ncommand = \"raw-config-sentinel\"\n[plugins]\npaths = [\"project-plugin\"]\n",
+	), 0o600); err != nil {
+		t.Fatalf("seed project Grok config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, ".grok", "plugins", "project-plugin", "plugin.json"), []byte(`{"name":"project-plugin"}`), 0o600); err != nil {
+		t.Fatalf("seed project Grok plugin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, ".mcp.json"), []byte(`{"mcpServers":{"project-mcp":{"command":"raw-config-sentinel"}}}`), 0o600); err != nil {
+		t.Fatalf("seed project MCP config: %v", err)
+	}
 	t.Setenv("GROK_HOME", realHome)
 	t.Setenv("HOME", vendorHome)
 	t.Setenv("USERPROFILE", vendorHome)
 	t.Setenv("XAI_API_KEY", "credential-sentinel-api-key")
+	t.Setenv("GROK_CODE_XAI_API_KEY", "alternate-credential-sentinel")
+	t.Setenv("GROK_AUTH_PROVIDER_ACCESS_TOKEN", "provider-credential-sentinel")
+	t.Setenv("GROK_AGENT", "agent-path-sentinel")
+	t.Setenv("GROK_CURSOR_MCPS_ENABLED", "1")
+	t.Setenv("GROK_CLAUDE_MCPS_ENABLED", "1")
+	t.Setenv("GROK_CODEX_MCPS_ENABLED", "1")
+	t.Setenv("GROK_MANAGED_MCPS_ENABLED", "1")
+	t.Setenv("GROK_CONFIG_PATH", "config-path-sentinel")
+	t.Setenv("GROK_PLUGIN_ROOT", "plugin-path-sentinel")
+	t.Setenv("GROK_WORKSPACE_ROOT", "workspace-path-sentinel")
 	t.Setenv(mockGrokPersistentHomeEnv, realHome)
 	t.Setenv(mockGrokVendorHomeEnv, vendorHome)
+	t.Setenv(mockGrokProjectRootEnv, projectRoot)
 	configureTestGrokSystemLayers(t, "[compat.cursor]\nmcps = false\n[compat.claude]\nmcps = false\n")
 	SetCLIAgentCatalog([]cliAgentCatalogEntry{{
 		ID: "grok", DisplayName: "Grok Build", Command: "grok",
@@ -826,7 +892,7 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 	}
 	run := func(mode string) cliAgentUsage {
 		t.Helper()
-		_, messages, err := captureSession(t, mode, "grok", dispatchedSmokeArgs, "")
+		_, messages, err := captureSession(t, mode, "grok", dispatchedSmokeArgs, projectCwd)
 		if err != nil {
 			t.Fatalf("%s session: %v", mode, err)
 		}
@@ -854,7 +920,10 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, secret := range []string{"credential-sentinel", "prompt-sentinel", "raw-config-sentinel"} {
+		for _, secret := range []string{
+			"credential-sentinel", "prompt-sentinel", "raw-config-sentinel", "agent-path-sentinel",
+			"project-plugin", "config-path-sentinel", "plugin-path-sentinel", "workspace-path-sentinel",
+		} {
 			if strings.Contains(string(encoded), secret) {
 				t.Fatalf("%s signed refresh leaked %q: %s", mode, secret, encoded)
 			}
