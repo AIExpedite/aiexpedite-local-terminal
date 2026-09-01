@@ -861,3 +861,112 @@ func TestClaudeRateLimitBucketSource_RoundTripsAndLegacyCacheLoads(t *testing.T)
 		t.Errorf("legacy bucket semantics changed: %+v", bucket)
 	}
 }
+
+// A reading may only ever replace an OLDER one. The utilization probe stamps the
+// instant its gather started and then spends up to three seconds on the wire, so
+// a status-line render that lands mid-flight is genuinely newer — persisting the
+// probe's answer over it would move latestObservedAt BACKWARDS and swap a fresh
+// percentage for a stale one, which is the exact staleness this feature removes.
+func TestMergeClaudeRateLimitCache_OlderReadingCannotOverwriteNewer(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	newer := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	older := newer.Add(-time.Minute) // the probe's pre-request `now`
+	reset := newer.Add(2 * time.Hour)
+
+	// The status-line hook writes while the probe's request is still in flight.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			ObservedAtMs: newer.UnixMilli(), ResetsAtMs: reset.UnixMilli(),
+			UsedPercentage: 80, Status: "allowed", usageKnown: true,
+		},
+	}, newer, "", claudeRateLimitSourceStatusLine)
+
+	// The probe's response then arrives carrying the older observation time.
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			ObservedAtMs: older.UnixMilli(), ResetsAtMs: reset.UnixMilli(),
+			UsedPercentage: 40, Status: "allowed", usageKnown: true,
+		},
+	}, older, "", claudeRateLimitSourceProbe)
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("expected a cache snapshot")
+	}
+	five := snap.Buckets[claudeWindowFiveHour]
+	if five.ObservedAtMs != newer.UnixMilli() {
+		t.Errorf("ObservedAtMs=%d, want the newer %d — freshness must never regress",
+			five.ObservedAtMs, newer.UnixMilli())
+	}
+	if five.UsedPercentage != 80 {
+		t.Errorf("UsedPercentage=%v, want the newer reading's 80", five.UsedPercentage)
+	}
+	if five.Source != claudeRateLimitSourceStatusLine {
+		t.Errorf("Source=%q, want the newer writer's %q", five.Source, claudeRateLimitSourceStatusLine)
+	}
+}
+
+// A same-instant rewrite still lands: equal timestamps carry no ordering, and
+// refusing them would make re-merging one observation depend on arrival order.
+func TestMergeClaudeRateLimitCache_SameInstantReadingStillApplies(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(2 * time.Hour)
+	bucket := func(pct float64) map[string]claudeRateLimitBucket {
+		return map[string]claudeRateLimitBucket{claudeWindowFiveHour: {
+			ObservedAtMs: now.UnixMilli(), ResetsAtMs: reset.UnixMilli(),
+			UsedPercentage: pct, Status: "allowed", usageKnown: true,
+		}}
+	}
+	mergeClaudeRateLimitCacheFromSource(cache, bucket(40), now, "", claudeRateLimitSourceStatusLine)
+	mergeClaudeRateLimitCacheFromSource(cache, bucket(55), now, "", claudeRateLimitSourceProbe)
+
+	snap, _ := loadClaudeRateLimitSnapshot(cache)
+	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 55 {
+		t.Errorf("UsedPercentage=%v, want 55 — an equal timestamp must not block the write", got)
+	}
+}
+
+// The merge is reachable from the probe, whose caller runs under a deadline, so
+// lock acquisition must be bounded: one wedged status-line process must not hang
+// the signed refresh handler or pin the probe's single-flight latch forever.
+func TestMergeClaudeRateLimitCache_BoundedByHeldCrossProcessLock(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	held, ok := acquireCrossProcessCacheLock(cache)
+	if !ok {
+		t.Skip("advisory locking unavailable on this filesystem")
+	}
+	defer func() {
+		_ = unlockFile(held)
+		_ = held.Close()
+	}()
+
+	prevWait := claudeRateLimitCacheLockWait
+	claudeRateLimitCacheLockWait = 50 * time.Millisecond
+	t.Cleanup(func() { claudeRateLimitCacheLockWait = prevWait })
+
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	done := make(chan error, 1)
+	go func() {
+		done <- mergeClaudeRateLimitCacheChecked(cache, map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {
+				ObservedAtMs: now.UnixMilli(), ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+				UsedPercentage: 12, Status: "allowed", usageKnown: true,
+			},
+		}, now, "", claudeRateLimitSourceProbe)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("merge returned %v, want it to proceed unlocked rather than fail", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("merge wedged behind a held cross-process lock instead of giving up on it")
+	}
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok || snap.Buckets[claudeWindowFiveHour].UsedPercentage != 12 {
+		t.Error("the bounded merge must still persist its reading on the degraded path")
+	}
+}

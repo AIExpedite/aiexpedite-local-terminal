@@ -423,7 +423,16 @@ func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRate
 	// created (read-only data dir) we still proceed — the in-process mutex
 	// keeps THIS process consistent, and a single-Claude-window install never
 	// hits the cross-process race anyway.
-	lockFile, locked := acquireCrossProcessCacheLock(path)
+	//
+	// BOUNDED rather than blocking, because this write is now reachable from the
+	// utilization probe, whose caller runs under a deadline (the 3s probe timeout
+	// nested in the gather's own). A blocking flock observes neither, so one
+	// wedged `statusline-hook` process — a stalled cache filesystem is enough —
+	// would hang the signed refresh handler and pin the probe's single-flight
+	// latch indefinitely. The wait also bounds claudeRateLimitMu, which is held
+	// only here: without it a probe could queue behind an in-process writer that
+	// is itself blocked on the file lock, wedging one level removed.
+	lockFile, locked := acquireClaudeRateLimitCacheLock(path)
 	if locked {
 		defer func() {
 			_ = unlockFile(lockFile)
@@ -506,6 +515,22 @@ func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRate
 			snap.Buckets[window] = bucket
 			continue
 		}
+		// A reading may only ever REPLACE an older one. `now` is captured by the
+		// caller before its work, so a writer that took time to produce its
+		// answer can arrive holding a timestamp that another writer has already
+		// passed: the utilization probe stamps the instant the gather started and
+		// then spends up to 3s in flight, while the status-line hook writes the
+		// moment Claude renders. Overwriting there would move latestObservedAt
+		// BACKWARDS and swap a newer percentage for an older one — the exact
+		// staleness this feature exists to remove, reintroduced by a race.
+		//
+		// Strictly-newer, so a same-instant rewrite still lands: equal timestamps
+		// carry no ordering, and refusing them would make a re-merge of the same
+		// observation depend on which writer got there first.
+		if prev, ok := snap.Buckets[window]; ok &&
+			prev.hasObservedUsage() && prev.ObservedAtMs > bucket.ObservedAtMs {
+			continue
+		}
 		bucket.UsageObserved = usageObservedPtr(true)
 		bucket.Source = source
 		snap.Buckets[window] = bucket
@@ -547,6 +572,53 @@ func acquireCrossProcessCacheLock(cachePath string) (*os.File, bool) {
 		return nil, false
 	}
 	return f, true
+}
+
+// claudeRateLimitCacheLockWait bounds how long a Claude cache writer waits for
+// the cross-process lock before proceeding without it, and
+// claudeRateLimitCacheLockPoll is the retry cadence inside that wait. Vars so
+// the contention test can pin them small — the suite runs under `go test -race`
+// and must not spend seconds of wall clock asserting one fallback.
+//
+// Two seconds is generous for a read-merge-rename of a few KB of JSON: an
+// ordinary contending writer is gone in milliseconds, so the wait only expires
+// when the holder is genuinely wedged — which is precisely when giving up is
+// the right move.
+var (
+	claudeRateLimitCacheLockWait = 2 * time.Second
+	claudeRateLimitCacheLockPoll = 10 * time.Millisecond
+)
+
+// acquireClaudeRateLimitCacheLock takes the sibling `.lock` file, waiting at
+// most claudeRateLimitCacheLockWait for a contending holder to release it.
+//
+// Returning (nil, false) drops to the SAME degraded path an uncreatable lock
+// file already takes: the merge proceeds under the in-process mutex alone. That
+// is a deliberate trade — a bounded risk of losing one concurrent window update
+// (which the next event rewrites) in exchange for never wedging a caller that
+// is under a deadline. Callers MUST unlock + close when true, and skip when false.
+func acquireClaudeRateLimitCacheLock(cachePath string) (*os.File, bool) {
+	lockPath := cachePath + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, false
+	}
+	deadline := time.Now().Add(claudeRateLimitCacheLockWait)
+	for {
+		locked, err := tryLockFileExclusive(f)
+		if err != nil {
+			_ = f.Close()
+			return nil, false
+		}
+		if locked {
+			return f, true
+		}
+		if !time.Now().Before(deadline) {
+			_ = f.Close()
+			return nil, false
+		}
+		time.Sleep(claudeRateLimitCacheLockPoll)
+	}
 }
 
 // tryAcquireCrossProcessCacheLock acquires the same sibling lock without

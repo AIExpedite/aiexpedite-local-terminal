@@ -952,7 +952,7 @@ func TestClaudeUsageProbeGate_IntervalBounds(t *testing.T) {
 	t.Run("streak counter is bounded", func(t *testing.T) {
 		g := &claudeUsageProbeGate{}
 		for i := 0; i < claudeUsageProbeMaxFailureStreak*4; i++ {
-			g.finish(claudeUsageProbeFailure(cliUsageErrorParseFailed))
+			g.finish(claudeUsageProbeFailure(cliUsageErrorParseFailed), false)
 		}
 		if g.failures > claudeUsageProbeMaxFailureStreak {
 			t.Errorf("failures=%d, want it capped at %d", g.failures, claudeUsageProbeMaxFailureStreak)
@@ -1994,4 +1994,123 @@ func claudeUsageProbeAfterRunAsyncForTest(completedAt time.Time) {
 		defer func() { _ = recover() }()
 		claudeUsageProbeAfterRun(completedAt)
 	}()
+}
+
+// A user-initiated refresh that lands while a post-run probe is already on the
+// wire must JOIN it, not be turned away by the single-flight latch. Being turned
+// away is what let the Refresh button sign a receipt from the buckets loaded
+// before the answer arrived — reporting the pre-run observation while the fresh
+// one landed milliseconds later.
+func TestClaudeUsageProbe_ForcedRefreshJoinsInFlightProbe(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	var entered sync.Once
+	inFlight := make(chan struct{})
+	release := make(chan struct{})
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		entered.Do(func() { close(inFlight) })
+		<-release
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":33,"resets_at":%d,"status":"allowed"}`,
+				now.Add(3*time.Hour).Unix()),
+		}))
+	})
+
+	// The post-run probe, still awaiting its response.
+	go func() { _, _ = runClaudeUsageProbe(context.Background(), now) }()
+	<-inFlight
+
+	// The user presses Refresh mid-flight.
+	SetClaudeUsageForceProbe(true)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		close(release)
+	}()
+	if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "") {
+		t.Fatal("a forced refresh must join the in-flight probe and report the fresh reading")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1 — the forced refresh must join, not duplicate", got)
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok || snap.Buckets[claudeWindowFiveHour].ObservedAtMs != now.UnixMilli() {
+		t.Error("the joined probe's reading must be on disk before the refresh reports success")
+	}
+	if claudeUsageProbe.forced() {
+		t.Error("the join must consume the force flag, not leave a bypass pending")
+	}
+}
+
+// Joining is not blind deference: an in-flight probe that writes nothing leaves
+// the forced refresh to issue its own request, the slot now free.
+func TestClaudeUsageProbe_ForcedRefreshRetriesAfterFailedInFlightProbe(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	var entered sync.Once
+	inFlight := make(chan struct{})
+	release := make(chan struct{})
+
+	var seen int64
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt64(&seen, 1) == 1 { // the in-flight probe: fail it
+			entered.Do(func() { close(inFlight) })
+			<-release
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":61,"resets_at":%d,"status":"allowed"}`,
+				now.Add(3*time.Hour).Unix()),
+		}))
+	})
+
+	go func() { _, _ = runClaudeUsageProbe(context.Background(), now) }()
+	<-inFlight
+
+	SetClaudeUsageForceProbe(true)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		close(release)
+	}()
+	if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "") {
+		t.Fatal("a forced refresh must fall through to its own probe when the joined one wrote nothing")
+	}
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Errorf("request count=%d, want 2 — the failed probe must not stand in for the refresh", got)
+	}
+	snap, _ := loadClaudeRateLimitSnapshot(cache)
+	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 61 {
+		t.Errorf("UsedPercentage=%v, want the forced probe's 61", got)
+	}
+}
+
+// The join is bounded by the caller's context: a cancelled gather must not sit
+// waiting on a probe whose answer belongs to the next read.
+func TestClaudeUsageProbe_ForcedRefreshJoinHonorsContext(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	var entered sync.Once
+	inFlight := make(chan struct{})
+	release := make(chan struct{})
+	// A plain defer, NOT t.Cleanup: cleanups run AFTER the test body returns and
+	// LIFO, so armClaudeUsageProbe's httptest shutdown would go first and block
+	// forever on the handler still parked here.
+	defer close(release)
+
+	_, _ = armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		entered.Do(func() { close(inFlight) })
+		<-release
+	})
+
+	go func() { _, _ = runClaudeUsageProbe(context.Background(), now) }()
+	<-inFlight
+
+	SetClaudeUsageForceProbe(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if refreshClaudeUsageIfStale(ctx, now, time.Time{}, probeTestToken, "") {
+		t.Error("a cancelled gather must not report a refresh")
+	}
+	if elapsed := time.Since(start); elapsed > claudeUsageProbeJoinTimeout {
+		t.Errorf("join took %v, want it abandoned as soon as the context was done", elapsed)
+	}
 }

@@ -368,6 +368,15 @@ type claudeUsageProbeGate struct {
 	// probe, never to discard it.
 	owedBaseline      time.Time
 	trailingScheduled bool
+	// doneCh is created by begin() and closed by finish(), so a caller that was
+	// refused the single-flight slot can WAIT for the probe already holding it
+	// instead of reporting a stale reading. Nil whenever inFlight is false.
+	doneCh chan struct{}
+	// refreshes counts probes that actually persisted a reading. A joiner
+	// compares the value it sampled before waiting against the value after: an
+	// advance means the cache it is about to re-read is newer than the one it
+	// loaded, which is the only thing the joiner needs to know.
+	refreshes uint64
 	// cancelTrailing is closed by resetClaudeUsageProbeGate to abandon any timer
 	// that is currently sleeping. A trailing probe resolves the endpoint and the
 	// cache path when it WAKES, so one that outlives its test would read whatever
@@ -435,6 +444,15 @@ func resetClaudeUsageProbeGate() {
 	}
 	claudeUsageProbe.mu.Lock()
 	claudeUsageProbe.inFlight = false
+	// Release any joiner the drain gave up on, so it cannot outlive the reset
+	// blocked on a channel nothing will ever close.
+	if claudeUsageProbe.doneCh != nil {
+		close(claudeUsageProbe.doneCh)
+		claudeUsageProbe.doneCh = nil
+	}
+	// refreshes is deliberately NOT reset: it is a monotonic counter compared
+	// only against a value the joiner sampled itself, so zeroing it here would
+	// make a stale sample look like an advance.
 	claudeUsageProbe.lastAttempt = time.Time{}
 	claudeUsageProbe.force = false
 	claudeUsageProbe.armed = false
@@ -491,7 +509,51 @@ func (g *claudeUsageProbeGate) begin(now time.Time) bool {
 	g.force = false
 	g.inFlight = true
 	g.lastAttempt = now
+	g.doneCh = make(chan struct{})
 	return true
+}
+
+// claudeUsageProbeJoinTimeout bounds how long a forced refresh waits for a probe
+// that is already in flight. The probe's own timeout is the natural ceiling —
+// past it the in-flight request is being torn down anyway — plus a little slack
+// for the cache write that follows. A var so the tests can pin it small.
+var claudeUsageProbeJoinTimeout = claudeUsageProbeTimeout + time.Second
+
+// joinInFlight waits for a probe that already holds the single-flight slot,
+// reporting whether there was one to join and whether it persisted a reading.
+//
+// This is what makes a user-initiated refresh honest. The post-run probe fires
+// on a goroutine, so pressing Refresh moments after a run lands squarely on an
+// in-flight request; begin() refuses the slot, refreshClaudeUsageIfStale would
+// report "not refreshed", and ParseContext would sign the receipt from the
+// buckets it loaded BEFORE the answer arrived — the card showing the pre-run
+// observation while the fresh one lands milliseconds later. Waiting costs at
+// most the probe's own deadline and yields the reading the user asked for.
+//
+// Only the forced path joins: a routine gather that finds a probe in flight has
+// nothing to gain by blocking, since its next tick reads the same cache.
+func (g *claudeUsageProbeGate) joinInFlight(ctx context.Context) (joined, refreshed bool) {
+	g.mu.Lock()
+	done, before := g.doneCh, g.refreshes
+	g.mu.Unlock()
+	if done == nil {
+		return false, false
+	}
+	timer := time.NewTimer(claudeUsageProbeJoinTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// The gather is over; whatever the probe writes belongs to the next read.
+		return false, false
+	case <-timer.C:
+		// A probe outliving its own deadline is a wedge, not a slow answer.
+		return false, false
+	}
+	g.mu.Lock()
+	after := g.refreshes
+	g.mu.Unlock()
+	return true, after != before
 }
 
 // interval is the effective floor between attempts: the minimum, doubled per
@@ -630,14 +692,23 @@ func (g *claudeUsageProbeGate) holdUntil(deadline time.Time) {
 	g.mu.Unlock()
 }
 
-func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError) {
+func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError, refreshed bool) {
 	g.mu.Lock()
 	g.inFlight = false
+	if refreshed {
+		g.refreshes++
+	}
 	switch {
 	case probeErr == nil:
 		g.failures = 0
 	case g.failures < claudeUsageProbeMaxFailureStreak:
 		g.failures++
+	}
+	// Release every joiner AFTER the outcome is recorded, so a waiter that wakes
+	// and re-samples refreshes cannot observe the pre-probe count.
+	if g.doneCh != nil {
+		close(g.doneCh)
+		g.doneCh = nil
 	}
 	g.mu.Unlock()
 }
@@ -832,7 +903,7 @@ func probeClaudeUsage(
 	// wedge, not a missed sample. It must therefore be the first statement after
 	// begin(), ahead of any other exit. Named returns let it record the outcome:
 	// a failure extends the backoff, a success or an early skip clears it.
-	defer func() { claudeUsageProbe.finish(probeErr) }()
+	defer func() { claudeUsageProbe.finish(probeErr, refreshed) }()
 
 	// One credential read for both the bearer token and the cache fingerprint —
 	// see claudeUsageProbeIdentity for why they must not be resolved separately.
@@ -1073,6 +1144,23 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 		claudeUsageProbe.mu.Unlock()
 		if window > 0 {
 			baseline = now.Add(-window)
+		}
+	}
+	// A forced refresh joins a probe that already holds the single-flight slot
+	// rather than being turned away by it — see joinInFlight. Done BEFORE our own
+	// attempt so the answer already on the wire is the one the user gets; if it
+	// wrote nothing we fall through and issue the request ourselves, the slot now
+	// being free and `force` still pending.
+	if forced {
+		if joined, joinRefreshed := claudeUsageProbe.joinInFlight(ctx); joined && joinRefreshed {
+			if owing {
+				claudeUsageProbe.settleOwed(owed)
+			}
+			// Consume the force the joined probe effectively served, so the next
+			// routine gather is throttled normally instead of inheriting a bypass
+			// nobody asked for.
+			SetClaudeUsageForceProbe(false)
+			return true
 		}
 	}
 	identity := claudeUsageProbeIdentity{token: accessToken, fingerprint: fingerprint}
