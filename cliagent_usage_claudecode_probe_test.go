@@ -591,8 +591,8 @@ func TestRefreshClaudeUsageIfStale_Gating(t *testing.T) {
 
 	t.Run("a forced refresh probes a fresh observation", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, body)
-		SetClaudeUsageForceProbe(true)
-		if !refreshClaudeUsageIfStale(context.Background(), now, now.Add(-time.Minute), probeTestToken, "") {
+		forceCtx := WithClaudeUsageForceProbe(context.Background())
+		if !refreshClaudeUsageIfStale(forceCtx, now, now.Add(-time.Minute), probeTestToken, "") {
 			t.Error("a user-initiated refresh must probe regardless of age")
 		}
 		if got := atomic.LoadInt64(calls); got != 1 {
@@ -1176,11 +1176,11 @@ func TestClaudeUsageProbe_ForceBypassesTheBackoff(t *testing.T) {
 	}
 }
 
-// The bypass belongs to the refresh that set it, and CLAIMING it is what makes
-// that true. While begin() consumed the flag itself, a post-run or routine probe
-// reaching the gate in the window between SetClaudeUsageForceProbe(true) and the
-// refresh's own read spent the refresh's bypass: the refresh then saw
-// force == false, skipped the join that exists for exactly this case, was
+// The bypass belongs to the refresh that asked for it, and carrying it on that
+// refresh's CONTEXT is what makes that true. While it was a package-level flag,
+// a post-run or routine probe reaching the gate in the window between arming and
+// the refresh's own read spent the refresh's bypass: the refresh then saw
+// forced == false, skipped the join that exists for exactly this case, was
 // refused by the throttle its own bypass covered, and reported no refresh — so
 // the receipt carried the cache loaded before the fresh reading landed. That is
 // the staleness this file exists to fix, reintroduced by its own throttle.
@@ -1195,26 +1195,26 @@ func TestClaudeUsageProbe_BackgroundProbeCannotSpendTheRefreshBypass(t *testing.
 	// Wide enough that only a bypass gets a second request through it.
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "600000")
 
-	// The refresh handler arms the bypass...
-	SetClaudeUsageForceProbe(true)
+	// The refresh handler arms the bypass on its own gather context...
+	forceCtx := WithClaudeUsageForceProbe(context.Background())
 	// ...and a post-run probe reaches the gate before the refresh reads it.
 	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 		t.Fatalf("post-run probe: refreshed=%v err=%+v", refreshed, probeErr)
 	}
-	if !claudeUsageProbe.forced() {
+	if !claudeUsageForceProbePending(forceCtx) {
 		t.Fatal("a background probe consumed the refresh's bypass")
 	}
 
 	// The refresh now arrives well inside the minimum interval. It must still
 	// issue its own request rather than report the pre-refresh reading.
-	if !refreshClaudeUsageIfStale(context.Background(), now.Add(time.Second), now, probeTestToken, "") {
+	if !refreshClaudeUsageIfStale(forceCtx, now.Add(time.Second), now, probeTestToken, "") {
 		t.Error("the forced refresh was throttled by a window its own bypass covers")
 	}
 	if got := atomic.LoadInt64(calls); got != 2 {
 		t.Errorf("request count=%d, want 2 — the refresh must issue its own request", got)
 	}
-	if claudeUsageProbe.forced() {
-		t.Error("the refresh must claim the bypass, not leave one pending for the next gather")
+	if claudeUsageForceProbePending(forceCtx) {
+		t.Error("the refresh must claim the bypass, not leave one pending for a later gather")
 	}
 	snap, ok := loadClaudeRateLimitSnapshot(cache)
 	if !ok {
@@ -1222,6 +1222,92 @@ func TestClaudeUsageProbe_BackgroundProbeCannotSpendTheRefreshBypass(t *testing.
 	}
 	if got, want := snap.Buckets[claudeWindowFiveHour].ObservedAtMs, now.Add(time.Second).UnixMilli(); got != want {
 		t.Errorf("ObservedAtMs=%d, want the refresh's own observation %d", got, want)
+	}
+}
+
+// refreshClaudeUsageIfStale is in the COMMON parser path: gatherMachineInfo ->
+// Parse -> ParseContext reaches it on startup and on every six-hour gather, not
+// only from the refresh handler. With the bypass in a package variable, such a
+// gather overlapping a refresh CLAIMED it — and the requested gather, finding a
+// cache that still looks fresh, then returned at the TTL check and signed the
+// pre-refresh snapshot. The routine gather carries no ticket, so it must be
+// unable to take one.
+func TestClaudeUsageProbe_RoutineGatherCannotClaimTheRefreshBypass(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":37,"resets_at":%d,"status":"allowed"}`,
+				now.Add(3*time.Hour).Unix()),
+		}))
+	})
+	// Wide enough that only a bypass gets a request through it.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "600000")
+	// One probe so the interval is live for everything that follows.
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
+		t.Fatalf("seed probe: refreshed=%v err=%+v", refreshed, probeErr)
+	}
+
+	// The refresh handler arms the bypass, then a routine machine-info gather —
+	// a plain context, a cache young enough to pass the TTL — runs first.
+	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	if refreshClaudeUsageIfStale(context.Background(), now.Add(time.Second), now, probeTestToken, "") {
+		t.Error("a routine gather must stand down on a fresh cache, not spend the refresh's bypass")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Fatalf("request count=%d, want 1 — the routine gather must not have probed", got)
+	}
+	if !claudeUsageForceProbePending(forceCtx) {
+		t.Fatal("a routine gather claimed the bypass armed for the refresh")
+	}
+
+	// The refresh's own gather still holds its bypass, so it probes despite both
+	// the minimum interval and a cache the TTL calls fresh.
+	if !refreshClaudeUsageIfStale(forceCtx, now.Add(2*time.Second), now, probeTestToken, "") {
+		t.Error("the refresh lost the bypass it armed to a concurrent routine gather")
+	}
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Errorf("request count=%d, want 2 — the refresh must issue its own request", got)
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("no snapshot on disk")
+	}
+	if got, want := snap.Buckets[claudeWindowFiveHour].ObservedAtMs, now.Add(2*time.Second).UnixMilli(); got != want {
+		t.Errorf("ObservedAtMs=%d, want the refresh's own observation %d", got, want)
+	}
+}
+
+// A bypass is spent at most once, and only a context that carries one has it.
+func TestClaudeUsageForceProbeTicket_ClaimedOnceAndOnlyWhenCarried(t *testing.T) {
+	if claimClaudeUsageForceProbe(context.Background()) {
+		t.Error("a context with no ticket must never report a bypass")
+	}
+	if claudeUsageForceProbePending(context.Background()) {
+		t.Error("a context with no ticket has nothing pending")
+	}
+
+	ctx := WithClaudeUsageForceProbe(context.Background())
+	// A derived context inherits its parent's ticket — the gather wraps the
+	// handler's context in a timeout before the parser ever sees it.
+	derived, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if !claudeUsageForceProbePending(derived) {
+		t.Fatal("a derived context must still carry the refresh's bypass")
+	}
+	if !claimClaudeUsageForceProbe(derived) {
+		t.Fatal("the first claim must take the bypass")
+	}
+	if claimClaudeUsageForceProbe(ctx) {
+		t.Error("the bypass must be spent at most once, on either end of the derivation")
+	}
+	if claudeUsageForceProbePending(ctx) {
+		t.Error("a claimed bypass is no longer pending")
+	}
+
+	// Two refreshes overlapping in one process own one ticket each.
+	other := WithClaudeUsageForceProbe(context.Background())
+	if !claimClaudeUsageForceProbe(other) {
+		t.Error("a second refresh must own its own bypass, not inherit the spent one")
 	}
 }
 
@@ -1832,8 +1918,8 @@ func TestRefreshClaudeUsageIfStale_DedupesAgainstAnotherWriter(t *testing.T) {
 	}
 
 	// A user-initiated refresh is not deduped — somebody is looking at the card.
-	SetClaudeUsageForceProbe(true)
-	if !refreshClaudeUsageIfStale(context.Background(), now.Add(time.Second), time.Time{}, probeTestToken, "") {
+	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	if !refreshClaudeUsageIfStale(forceCtx, now.Add(time.Second), time.Time{}, probeTestToken, "") {
 		t.Error("a forced refresh must not be suppressed by the shared-cache check")
 	}
 	if got := atomic.LoadInt64(calls); got != 1 {
@@ -2309,8 +2395,8 @@ func TestClaudeUsageProbeAfterRun_LongWaitDoesNotLeakTheTimerSlot(t *testing.T) 
 	}
 
 	// A gather pays the long-wait debt.
-	SetClaudeUsageForceProbe(true)
-	if !refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "") {
+	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	if !refreshClaudeUsageIfStale(forceCtx, time.Now(), time.Time{}, probeTestToken, "") {
 		t.Fatal("a forced gather should pay the long-wait debt")
 	}
 
@@ -2361,12 +2447,12 @@ func TestClaudeUsageProbe_ForcedRefreshJoinsInFlightProbe(t *testing.T) {
 	<-inFlight
 
 	// The user presses Refresh mid-flight.
-	SetClaudeUsageForceProbe(true)
+	forceCtx := WithClaudeUsageForceProbe(context.Background())
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		close(release)
 	}()
-	if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "") {
+	if !refreshClaudeUsageIfStale(forceCtx, now, time.Time{}, probeTestToken, "") {
 		t.Fatal("a forced refresh must join the in-flight probe and report the fresh reading")
 	}
 	if got := atomic.LoadInt64(calls); got != 1 {
@@ -2376,8 +2462,8 @@ func TestClaudeUsageProbe_ForcedRefreshJoinsInFlightProbe(t *testing.T) {
 	if !ok || snap.Buckets[claudeWindowFiveHour].ObservedAtMs != now.UnixMilli() {
 		t.Error("the joined probe's reading must be on disk before the refresh reports success")
 	}
-	if claudeUsageProbe.forced() {
-		t.Error("the join must consume the force flag, not leave a bypass pending")
+	if claudeUsageForceProbePending(forceCtx) {
+		t.Error("the join must consume the force bypass, not leave one pending")
 	}
 }
 
@@ -2406,12 +2492,12 @@ func TestClaudeUsageProbe_ForcedRefreshRetriesAfterFailedInFlightProbe(t *testin
 	go func() { _, _ = runClaudeUsageProbe(context.Background(), now, false) }()
 	<-inFlight
 
-	SetClaudeUsageForceProbe(true)
+	forceCtx := WithClaudeUsageForceProbe(context.Background())
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		close(release)
 	}()
-	if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "") {
+	if !refreshClaudeUsageIfStale(forceCtx, now, time.Time{}, probeTestToken, "") {
 		t.Fatal("a forced refresh must fall through to its own probe when the joined one wrote nothing")
 	}
 	if got := atomic.LoadInt64(calls); got != 2 {
@@ -2459,12 +2545,12 @@ func TestClaudeUsageProbe_ForcedRefreshDoesNotSettleRunDebtWithPreRunJoin(t *tes
 
 	// The run completes, then the user presses Refresh mid-flight.
 	claudeUsageProbe.recordOwed(runAt)
-	SetClaudeUsageForceProbe(true)
+	forceCtx := WithClaudeUsageForceProbe(context.Background())
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		close(release)
 	}()
-	if !refreshClaudeUsageIfStale(context.Background(), postRun, time.Time{}, probeTestToken, "") {
+	if !refreshClaudeUsageIfStale(forceCtx, postRun, time.Time{}, probeTestToken, "") {
 		t.Fatal("the forced refresh must still produce a reading of its own")
 	}
 
@@ -2506,12 +2592,12 @@ func TestClaudeUsageProbe_ForcedRefreshSettlesRunDebtWithPostRunJoin(t *testing.
 	go func() { _, _ = runClaudeUsageProbe(context.Background(), postRun, false) }()
 	<-inFlight
 
-	SetClaudeUsageForceProbe(true)
+	forceCtx := WithClaudeUsageForceProbe(context.Background())
 	go func() {
 		time.Sleep(20 * time.Millisecond)
 		close(release)
 	}()
-	if !refreshClaudeUsageIfStale(context.Background(), postRun, time.Time{}, probeTestToken, "") {
+	if !refreshClaudeUsageIfStale(forceCtx, postRun, time.Time{}, probeTestToken, "") {
 		t.Fatal("a post-run reading already on the wire must answer the refresh")
 	}
 	if got := atomic.LoadInt64(calls); got != 1 {
@@ -2546,8 +2632,7 @@ func TestClaudeUsageProbe_ForcedRefreshJoinHonorsContext(t *testing.T) {
 	go func() { _, _ = runClaudeUsageProbe(context.Background(), now, false) }()
 	<-inFlight
 
-	SetClaudeUsageForceProbe(true)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(WithClaudeUsageForceProbe(context.Background()))
 	cancel()
 	start := time.Now()
 	if refreshClaudeUsageIfStale(ctx, now, time.Time{}, probeTestToken, "") {

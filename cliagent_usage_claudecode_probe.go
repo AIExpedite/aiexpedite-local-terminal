@@ -71,6 +71,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -341,7 +342,7 @@ func (t *claudeUsageProbeTs) UnmarshalJSON(b []byte) error {
 }
 
 // claudeUsageProbeGate holds the single-flight latch, the last-attempt stamp,
-// the one-shot force flag, and the arm state. Package-level because the bound is
+// and the arm state. Package-level because the bound is
 // per PROCESS: two concurrent runs finishing at once must issue one request.
 //
 // `armed` is false until SetClaudeUsageProbeDisabled has been called, so the
@@ -353,19 +354,9 @@ type claudeUsageProbeGate struct {
 	mu          sync.Mutex
 	inFlight    bool
 	lastAttempt time.Time
-	// force is a bypass RESERVED for the refresh that set it. It is handed to a
-	// caller only by claimForce, which reads and clears it under one lock, and
-	// begin() never touches it — begin takes the bypass as an argument instead.
-	//
-	// That ownership is the whole point. When begin() consumed the flag itself,
-	// a post-run or routine probe reaching begin() in the window between
-	// SetClaudeUsageForceProbe(true) and the refresh's own read would spend the
-	// refresh's bypass: the refresh then saw force == false, skipped the join
-	// that exists for exactly this case, was refused by the single-flight slot
-	// that background probe still held, and signed the receipt from the cache it
-	// had loaded before that request landed — the stale latestObservedAt this
-	// file exists to fix, reintroduced by the mechanism meant to prevent it.
-	force bool
+	// NOTE: the refresh bypass is deliberately NOT a field here. It belongs to
+	// one gather, and a package-level gate cannot express that — see
+	// claudeUsageForceProbeTicket, which carries it on the refresh's context.
 	armed bool
 	// failures counts CONSECUTIVE failed probes and drives the backoff in
 	// interval(). Cleared by any success or early skip.
@@ -410,19 +401,79 @@ type claudeUsageProbeGate struct {
 
 var claudeUsageProbe claudeUsageProbeGate
 
-// SetClaudeUsageForceProbe makes the next probe bypass the minimum interval.
-// Called by the __cli_usage_refresh__ handler alongside
-// SetOpenCodeReadinessForceProbe: a user who just pressed Refresh must not be
-// served a reading held back by a throttle they cannot see. Single-flight still
-// applies — a forced probe joins an in-flight one rather than duplicating it.
+// claudeUsageForceProbeTicket is a one-shot bypass of the minimum interval,
+// OWNED BY THE GATHER THAT ASKED FOR IT. It rides on the refresh's context
+// rather than sitting on the gate, and that ownership is the whole point.
 //
-// The bypass belongs to the refresh that set it: only claimForce takes it, and
-// only refreshClaudeUsageIfStale calls claimForce. A post-run or routine probe
-// racing the refresh cannot spend it — see the `force` field.
-func SetClaudeUsageForceProbe(force bool) {
-	claudeUsageProbe.mu.Lock()
-	claudeUsageProbe.force = force
-	claudeUsageProbe.mu.Unlock()
+// A process-global flag cannot express it. refreshClaudeUsageIfStale sits in the
+// COMMON parser path — gatherMachineInfo -> Parse -> ParseContext reaches it on
+// every startup and every six-hour machine-info gather, not only from the
+// refresh handler. With the bypass in a package variable, a routine gather
+// overlapping the window after handleCLIUsageRefreshCommand armed it would claim
+// it, and the REQUESTED gather would then see forced == false: on a cache that
+// still looks fresh it returns at the TTL check without joining the probe now in
+// flight, and signs the receipt from the snapshot it loaded before that reading
+// landed — the stale latestObservedAt this file exists to fix, reintroduced by
+// the mechanism meant to prevent it.
+//
+// Carried on the context, the bypass reaches exactly the gather the user asked
+// for: a routine parse holds no ticket and can claim nothing, two concurrent
+// refreshes hold one each, and nothing is left standing in the process for a
+// later gather to inherit. claudeCodeUsageParser.Parse hands ParseContext a
+// context.Background(), so the non-context entry point is unforced by
+// construction.
+type claudeUsageForceProbeTicket struct {
+	claimed atomic.Bool
+}
+
+// claudeUsageForceProbeKey is an unexported struct{} type, so nothing outside
+// this package can collide with it on a context or forge a bypass onto one.
+type claudeUsageForceProbeKey struct{}
+
+// WithClaudeUsageForceProbe marks ctx as a user-initiated refresh whose probe
+// bypasses the minimum interval. Called by the __cli_usage_refresh__ handler
+// alongside SetOpenCodeReadinessForceProbe: a user who just pressed Refresh must
+// not be served a reading held back by a throttle they cannot see.
+//
+// The bypass covers the INTERVAL only. Single flight still applies — a forced
+// probe joins an in-flight one rather than duplicating it — and a 429 hold
+// outranks it, because the service has told us to stop and a Refresh button is
+// not a reason to ignore that.
+func WithClaudeUsageForceProbe(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, claudeUsageForceProbeKey{}, &claudeUsageForceProbeTicket{})
+}
+
+// claimClaudeUsageForceProbe takes ownership of ctx's bypass: it reports whether
+// one was outstanding and consumes it in the same atomic step, so a given
+// WithClaudeUsageForceProbe is spent at most once.
+//
+// Its only caller is refreshClaudeUsageIfStale, the one path a user-initiated
+// refresh takes. Once claimed the bypass travels as an explicit argument down
+// through probeClaudeUsage to begin(), which never reads it from anywhere else —
+// so a concurrent post-run or routine probe can neither consume it nor be
+// accelerated by it.
+func claimClaudeUsageForceProbe(ctx context.Context) bool {
+	ticket := claudeUsageForceProbeTicketFrom(ctx)
+	return ticket != nil && ticket.claimed.CompareAndSwap(false, true)
+}
+
+// claudeUsageForceProbePending reports whether ctx still carries an UNCLAIMED
+// bypass, without consuming it. Diagnostic/assertion use only — a caller that
+// intends to SPEND the bypass must use claimClaudeUsageForceProbe.
+func claudeUsageForceProbePending(ctx context.Context) bool {
+	ticket := claudeUsageForceProbeTicketFrom(ctx)
+	return ticket != nil && !ticket.claimed.Load()
+}
+
+func claudeUsageForceProbeTicketFrom(ctx context.Context) *claudeUsageForceProbeTicket {
+	if ctx == nil {
+		return nil
+	}
+	ticket, _ := ctx.Value(claudeUsageForceProbeKey{}).(*claudeUsageForceProbeTicket)
+	return ticket
 }
 
 // SetClaudeUsageProbeDisabled applies the `disable_claude_usage_probe` opt-out
@@ -480,7 +531,6 @@ func resetClaudeUsageProbeGate() {
 	// is a monotonic counter compared only against a value the joiner sampled
 	// itself, so zeroing it here would make a stale sample look like an advance.
 	claudeUsageProbe.lastAttempt = time.Time{}
-	claudeUsageProbe.force = false
 	claudeUsageProbe.armed = false
 	claudeUsageProbe.failures = 0
 	claudeUsageProbe.heldUntil = time.Time{}
@@ -514,11 +564,11 @@ func claudeUsageProbeMinIntervalValue() time.Duration {
 // begin reserves the single-flight slot, returning false when another probe is
 // running or the minimum interval has not elapsed.
 //
-// `forced` is the bypass the CALLER already claimed from the gate, never the
-// pending flag: begin must not consume a bypass on behalf of a caller that did
-// not ask for one, or a background probe silently spends the refresh's (see the
-// `force` field). Everything above the interval check — arm state, single
-// flight, a 429 hold, offline — outranks it.
+// `forced` is the bypass the CALLER already claimed from its own context, never
+// a flag begin reads for itself: begin must not consume a bypass on behalf of a
+// caller that did not ask for one, or a background probe silently spends the
+// refresh's (see claudeUsageForceProbeTicket). Everything above the interval
+// check — arm state, single flight, a 429 hold, offline — outranks it.
 func (g *claudeUsageProbeGate) begin(now time.Time, forced bool) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -779,32 +829,6 @@ func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError, refreshed bo
 		g.doneCh = nil
 	}
 	g.mu.Unlock()
-}
-
-// forced reports whether a refresh has asked for the next probe to bypass the
-// interval, without consuming the flag. Diagnostic/assertion use only — a caller
-// that intends to SPEND the bypass must use claimForce, or it leaves the flag
-// standing for whichever probe reaches the gate next.
-func (g *claudeUsageProbeGate) forced() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.force
-}
-
-// claimForce takes ownership of a pending refresh bypass: it reports whether one
-// was outstanding and clears it in the same critical section, so exactly one
-// caller can spend a given SetClaudeUsageForceProbe(true).
-//
-// Its only caller is refreshClaudeUsageIfStale, which is the only path a
-// user-initiated refresh takes. Once claimed, the bypass travels as an explicit
-// argument down through probeClaudeUsage to begin(), so a concurrent post-run or
-// routine probe can neither consume it nor be accelerated by it.
-func (g *claudeUsageProbeGate) claimForce() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	claimed := g.force
-	g.force = false
-	return claimed
 }
 
 // armedForProbe reports whether a probe could run at all in this process.
@@ -1237,11 +1261,12 @@ func claudeUsageProbeStatus(raw string) string {
 // Returns whether the cache was refreshed, so the caller knows whether it must
 // re-read before shaping the metrics.
 func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, accessToken, fingerprint string) bool {
-	// CLAIM the bypass rather than peeking at it: this is the only path a
-	// user-initiated refresh takes, so taking ownership here is what stops a
-	// concurrent post-run or routine probe from spending it in begin() and
-	// leaving this refresh to sign the cache it loaded before that probe landed.
-	forced := claudeUsageProbe.claimForce()
+	// CLAIM the bypass off THIS gather's context rather than a process-global
+	// flag: this function is in the common parser path, so a routine machine-info
+	// gather overlapping a refresh would otherwise spend the refresh's bypass and
+	// leave it to sign the cache it loaded before the probe landed. The ticket is
+	// on the refresh's own context, so only the requested gather can take it.
+	forced := claimClaudeUsageForceProbe(ctx)
 	// An outstanding post-run debt overrides the staleness TTL: a reading taken
 	// BEFORE the run is not "fresh enough" just because it is recent, and this is
 	// the backstop for a trailing probe that was too far out to schedule or that
