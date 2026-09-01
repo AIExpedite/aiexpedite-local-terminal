@@ -1375,7 +1375,7 @@ func TestClaudeUsageProbeGate_IntervalBounds(t *testing.T) {
 	t.Run("streak counter is bounded", func(t *testing.T) {
 		g := &claudeUsageProbeGate{}
 		for i := 0; i < claudeUsageProbeMaxFailureStreak*4; i++ {
-			g.finish(claudeUsageProbeFailure(cliUsageErrorParseFailed), false, time.Time{})
+			g.finish(claudeUsageProbeFailure(cliUsageErrorParseFailed), false, time.Time{}, "")
 		}
 		if g.failures > claudeUsageProbeMaxFailureStreak {
 			t.Errorf("failures=%d, want it capped at %d", g.failures, claudeUsageProbeMaxFailureStreak)
@@ -2609,6 +2609,67 @@ func TestClaudeUsageProbe_ForcedRefreshSettlesRunDebtWithPostRunJoin(t *testing.
 	snap, _ := loadClaudeRateLimitSnapshot(cache)
 	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 49 {
 		t.Errorf("UsedPercentage=%v, want the joined probe's 49", got)
+	}
+}
+
+// Joining is scoped to the ACCOUNT, not just to the clock. Credentials can
+// switch while a probe is on the wire (a re-login between the post-run probe and
+// the Refresh press), and the merge scopes every snapshot to its fingerprint —
+// so a reading persisted for the previous account is dropped by this gather's
+// own cache read. Accepting it would end the refresh reporting success with no
+// utilization at all for the account being signed, having spent the join that
+// would have gone and fetched it.
+func TestClaudeUsageProbe_ForcedRefreshRejectsAJoinFromAnotherAccount(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+
+	var entered sync.Once
+	inFlight := make(chan struct{})
+	release := make(chan struct{})
+	var seen int64
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt64(&seen, 1) == 1 { // the other account's probe, still on the wire
+			entered.Do(func() { close(inFlight) })
+			<-release
+			fmt.Fprint(w, probeUsageJSON(map[string]string{
+				claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":11,"resets_at":%d,"status":"allowed"}`,
+					now.Add(3*time.Hour).Unix()),
+			}))
+			return
+		}
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":64,"resets_at":%d,"status":"allowed"}`,
+				now.Add(3*time.Hour).Unix()),
+		}))
+	})
+
+	signedOut := claudeUsageProbeIdentity{token: probeTestToken, fingerprint: "account-a"}
+	go func() {
+		_, _, _ = probeClaudeUsage(context.Background(), now,
+			func() claudeUsageProbeIdentity { return signedOut }, time.Time{}, false)
+	}()
+	<-inFlight
+
+	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		close(release)
+	}()
+	if !refreshClaudeUsageIfStale(forceCtx, now, time.Time{}, probeTestToken, "account-b") {
+		t.Fatal("the forced refresh must still produce a reading for its own account")
+	}
+
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Errorf("request count=%d, want 2 — another account's reading cannot answer this refresh", got)
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("no snapshot on disk")
+	}
+	if snap.AccountFingerprint != "account-b" {
+		t.Errorf("AccountFingerprint=%q, want the gather's account-b", snap.AccountFingerprint)
+	}
+	if got := snap.Buckets[claudeWindowFiveHour].UsedPercentage; got != 64 {
+		t.Errorf("UsedPercentage=%v, want this account's own 64", got)
 	}
 }
 

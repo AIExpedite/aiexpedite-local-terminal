@@ -388,8 +388,16 @@ type claudeUsageProbeGate struct {
 	// pre-run timestamp and cancel the trailing probe that would have paid it.
 	// Only meaningful when paired with an advance of `refreshes`, which is why the
 	// two are read together under one lock.
-	refreshes     uint64
-	lastRefreshAt time.Time
+	//
+	// lastRefreshFingerprint is the ACCOUNT that reading belongs to. A joiner
+	// cannot use a reading persisted for a different account: the merge scopes
+	// every snapshot to its fingerprint and drops the buckets on a transition, so
+	// the gather that inherited it would re-read the cache, find nothing for its
+	// own account, and sign a receipt with no fresh utilization — having already
+	// spent the join that would have probed for it.
+	refreshes              uint64
+	lastRefreshAt          time.Time
+	lastRefreshFingerprint string
 	// cancelTrailing is closed by resetClaudeUsageProbeGate to abandon any timer
 	// that is currently sleeping. A trailing probe resolves the endpoint and the
 	// cache path when it WAKES, so one that outlives its test would read whatever
@@ -527,7 +535,8 @@ func resetClaudeUsageProbeGate() {
 		close(claudeUsageProbe.doneCh)
 		claudeUsageProbe.doneCh = nil
 	}
-	// refreshes (and the lastRefreshAt it carries) is deliberately NOT reset: it
+	// refreshes (and the lastRefreshAt / lastRefreshFingerprint it carries) is
+	// deliberately NOT reset: it
 	// is a monotonic counter compared only against a value the joiner sampled
 	// itself, so zeroing it here would make a stale sample look like an advance.
 	claudeUsageProbe.lastAttempt = time.Time{}
@@ -626,7 +635,14 @@ var claudeUsageProbeJoinTimeout = claudeUsageProbeTimeout + claudeRateLimitVerif
 //
 // Only the forced path joins: a routine gather that finds a probe in flight has
 // nothing to gain by blocking, since its next tick reads the same cache.
-func (g *claudeUsageProbeGate) joinInFlight(ctx context.Context) (joined bool, observedAt time.Time) {
+//
+// `fingerprint` is the account the CALLER is gathering for. A reading persisted
+// under a different one is reported as "joined, nothing usable" (a zero
+// observedAt) rather than as an answer: the caller's own cache read is scoped to
+// its fingerprint and would drop those buckets, so accepting it would end the
+// refresh with no fresh utilization for the account actually being signed. The
+// caller then falls through and issues the request itself, the slot now free.
+func (g *claudeUsageProbeGate) joinInFlight(ctx context.Context, fingerprint string) (joined bool, observedAt time.Time) {
 	g.mu.Lock()
 	done, before := g.doneCh, g.refreshes
 	g.mu.Unlock()
@@ -645,9 +661,9 @@ func (g *claudeUsageProbeGate) joinInFlight(ctx context.Context) (joined bool, o
 		return false, time.Time{}
 	}
 	g.mu.Lock()
-	after, at := g.refreshes, g.lastRefreshAt
+	after, at, forAccount := g.refreshes, g.lastRefreshAt, g.lastRefreshFingerprint
 	g.mu.Unlock()
-	if after == before {
+	if after == before || forAccount != fingerprint {
 		return true, time.Time{}
 	}
 	return true, at
@@ -806,15 +822,17 @@ func (g *claudeUsageProbeGate) holdUntil(deadline time.Time) {
 }
 
 // finish releases the single-flight slot. `observedAt` is the observation the
-// cache holds for the windows the probe wrote, recorded only alongside a refresh
-// so a joiner can tell WHEN the reading it is inheriting was taken, not merely
-// that there was one.
-func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError, refreshed bool, observedAt time.Time) {
+// cache holds for the windows the probe wrote and `fingerprint` the account it
+// wrote them under, both recorded only alongside a refresh so a joiner can tell
+// WHEN the reading it is inheriting was taken and WHOSE it is, not merely that
+// there was one.
+func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError, refreshed bool, observedAt time.Time, fingerprint string) {
 	g.mu.Lock()
 	g.inFlight = false
 	if refreshed {
 		g.refreshes++
 		g.lastRefreshAt = observedAt
+		g.lastRefreshFingerprint = fingerprint
 	}
 	switch {
 	case probeErr == nil:
@@ -1039,11 +1057,18 @@ func probeClaudeUsage(
 	// wedge, not a missed sample. It must therefore be the first statement after
 	// begin(), ahead of any other exit. Named returns let it record the outcome:
 	// a failure extends the backoff, a success or an early skip clears it.
-	defer func() { claudeUsageProbe.finish(probeErr, refreshed, observedAt) }()
+	//
+	// persistedFor is the account any reading is written under, resolved below
+	// and read by the deferred call so a joiner can reject a reading that belongs
+	// to a different one. It stays empty on every path that exits before the
+	// credential is read, which is also every path that persists nothing.
+	persistedFor := ""
+	defer func() { claudeUsageProbe.finish(probeErr, refreshed, observedAt, persistedFor) }()
 
 	// One credential read for both the bearer token and the cache fingerprint —
 	// see claudeUsageProbeIdentity for why they must not be resolved separately.
 	identity := resolveIdentity()
+	persistedFor = identity.fingerprint
 	if identity.token == "" {
 		// Not an error: a signed-out device simply has nothing for this probe.
 		return false, time.Time{}, nil
@@ -1317,12 +1342,13 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 	// itself bounded by the gather context and claudeUsageProbeJoinTimeout.
 	if forced {
 		for pass := 0; pass < 2; pass++ {
-			// A joined reading answers the refresh only when it is at least as new
-			// as what we owe. A probe that started BEFORE the run persists a PRE-run
-			// observation: accepting it would settle the run's debt with a timestamp
-			// that predates the run, sign that timestamp into the receipt, and leave
-			// the already-scheduled trailing probe to exit finding nothing owed.
-			joined, joinedAt := claudeUsageProbe.joinInFlight(ctx)
+			// A joined reading answers the refresh only when it is for THIS account
+			// (enforced inside joinInFlight) and at least as new as what we owe. A
+			// probe that started BEFORE the run persists a PRE-run observation:
+			// accepting it would settle the run's debt with a timestamp that
+			// predates the run, sign that timestamp into the receipt, and leave the
+			// already-scheduled trailing probe to exit finding nothing owed.
+			joined, joinedAt := claudeUsageProbe.joinInFlight(ctx, fingerprint)
 			if joined && !joinedAt.IsZero() && (!owing || claudeUsageObservationCovers(joinedAt, owed)) {
 				if owing {
 					claudeUsageProbe.settleOwed(owed)
