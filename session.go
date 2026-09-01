@@ -3229,6 +3229,7 @@ func sanitizeGrokMaintenanceSmokeEnv(env []string) []string {
 		if blocked[upper] || strings.HasPrefix(upper, "GROK_AUTH_PROVIDER_") ||
 			strings.HasPrefix(upper, "GROK_CONFIG") || strings.HasPrefix(upper, "GROK_MANAGED_") ||
 			strings.HasPrefix(upper, "GROK_MODEL_") || strings.HasPrefix(upper, "GROK_MODELS_") ||
+			strings.HasPrefix(upper, "GROK_OIDC_") ||
 			strings.HasPrefix(upper, "GROK_PLUGIN_") || strings.HasPrefix(upper, "GROK_WORKSPACE_") ||
 			strings.HasPrefix(upper, "GROK_CURSOR_") || strings.HasPrefix(upper, "GROK_CLAUDE_") ||
 			strings.HasPrefix(upper, "GROK_CODEX_") {

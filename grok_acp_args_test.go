@@ -1174,3 +1174,93 @@ func TestDetectPinnedSystemGrokRequirements_PassesOnEmptyClaudeAllowList(t *test
 		})
 	}
 }
+
+func TestClaudeManagedSettingsPathsForOS_UsesCurrentSystemLocations(t *testing.T) {
+	tests := []struct {
+		name string
+		goos string
+		env  map[string]string
+		want string
+	}{
+		{"windows Program Files", "windows", map[string]string{"ProgramFiles": `D:\Managed Programs`}, filepath.Join(`D:\Managed Programs`, "ClaudeCode", "managed-settings.json")},
+		{"windows fallback", "windows", nil, filepath.Join(`C:\Program Files`, "ClaudeCode", "managed-settings.json")},
+		{"macOS", "darwin", nil, "/Library/Application Support/ClaudeCode/managed-settings.json"},
+		{"linux", "linux", nil, "/etc/claude-code/managed-settings.json"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := claudeManagedSettingsPathsForOS(tc.goos, func(name string) string { return tc.env[name] })
+			if !reflect.DeepEqual(got, []string{tc.want}) {
+				t.Fatalf("paths = %#v, want %#v", got, []string{tc.want})
+			}
+			for _, path := range got {
+				if strings.Contains(strings.ToLower(path), "programdata") {
+					t.Fatalf("paths retained retired ProgramData location: %#v", got)
+				}
+			}
+		})
+	}
+}
+
+func TestInspectClaudeManagedSettingsAllowRule_FailsClosedOnUnsafeFiles(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, path string)
+	}{
+		{
+			name: "malformed",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte(`{"permissions":{"allow":["credential-sentinel"]}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "oversized valid JSON",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				body := `{"padding":"` + strings.Repeat("x", 1<<20) + `","permissions":{"allow":["credential-sentinel"]}}`
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unreadable source",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "managed-settings.json")
+			tc.setup(t, path)
+			origSystemPaths := grokSystemConfigPathsFn
+			origClaudePaths := claudeManagedSettingsPathsFn
+			grokSystemConfigPathsFn = func() []string { return nil }
+			claudeManagedSettingsPathsFn = func() []string { return []string{path} }
+			t.Cleanup(func() {
+				grokSystemConfigPathsFn = origSystemPaths
+				claudeManagedSettingsPathsFn = origClaudePaths
+			})
+
+			err := detectGrokMaintenanceSmokeSystemConfig()
+			if err == nil {
+				t.Fatal("unsafe managed settings were accepted")
+			}
+			const wantError = "grok system configuration cannot be inspected safely; refusing no-tools maintenance smoke"
+			if err.Error() != wantError {
+				t.Fatalf("inspection error = %q, want generic rejection %q", err, wantError)
+			}
+			if strings.Contains(err.Error(), path) || strings.Contains(err.Error(), "credential-sentinel") {
+				t.Fatalf("inspection error leaked managed path or contents: %v", err)
+			}
+		})
+	}
+}

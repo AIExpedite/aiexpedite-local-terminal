@@ -283,6 +283,9 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 		"XAI_API_KEY=credential-sentinel",
 		"GROK_CODE_XAI_API_KEY=alternate-credential-sentinel",
 		"GROK_AUTH_PROVIDER_ACCESS_TOKEN=provider-credential-sentinel",
+		"GROK_OIDC_ISSUER=https://oidc-issuer-sentinel.invalid",
+		"GROK_OIDC_CLIENT_ID=oidc-client-sentinel",
+		"GROK_OIDC_AUDIENCE=oidc-audience-sentinel",
 		"GROK_AGENT=agent-path-sentinel",
 		"GROK_DEFAULT_MODEL=model-sentinel",
 		"GROK_MODEL=alternate-model-sentinel",
@@ -318,6 +321,7 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 	}
 	for _, stripped := range []string{
 		"XAI_API_KEY", "GROK_CODE_XAI_API_KEY", "GROK_AUTH_PROVIDER_ACCESS_TOKEN",
+		"GROK_OIDC_ISSUER", "GROK_OIDC_CLIENT_ID", "GROK_OIDC_AUDIENCE",
 		"GROK_AGENT", "GROK_SUBAGENTS", "GROK_WEB_FETCH",
 		"GROK_MEMORY", "GROK_LSP_TOOLS", "GROK_CONFIG_PATH", "GROK_PLUGIN_ROOT",
 		"GROK_MANAGED_CONFIG_URL", "GROK_WORKSPACE_ROOT", "GROK_WORKSPACE_SERVER_SKILLS_DIR",
@@ -345,6 +349,7 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 	encoded := strings.Join(got, "\n")
 	for _, secret := range []string{
 		"credential-sentinel", "alternate-credential-sentinel", "provider-credential-sentinel",
+		"oidc-issuer-sentinel", "oidc-client-sentinel", "oidc-audience-sentinel",
 		"agent-path-sentinel", "config-path-sentinel", "managed-config-sentinel", "plugin-path-sentinel",
 		"workspace-path-sentinel", "skills-path-sentinel", "model-sentinel", "alternate-model-sentinel", "models-base-sentinel",
 		"models-list-sentinel", "xai-base-sentinel", "api-base-sentinel", "alternate-xai-base-sentinel",
@@ -380,6 +385,10 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 	}{
 		{"system API key", "[model]\napi_key = 'credential-sentinel'\n", ""},
 		{"table auth provider command", "[auth]\nauth_provider_command = 'credential-sentinel'\n", ""},
+		{"table OIDC issuer", "[auth.oidc]\nissuer = 'https://oidc-issuer-sentinel.invalid'\n", ""},
+		{"dotted OIDC client", `auth.oidc.client_id = "oidc-client-sentinel"` + "\n", ""},
+		{"inline OIDC issuer", `auth = { oidc = { issuer = "https://oidc-inline-sentinel.invalid" } }` + "\n", ""},
+		{"quoted OIDC client", `"auth"."oidc"."client_id" = "oidc-quoted-sentinel"` + "\n", ""},
 		{"dotted custom model endpoint", `models.custom.base_url = "https://raw-config-sentinel.invalid"` + "\n", ""},
 		{"inline provider headers", `models = { custom = { extra_headers = { Authorization = "credential-sentinel" } } }` + "\n", ""},
 		{"quoted default model", `"models" = { "default" = "customer-secret-name" }` + "\n", ""},
@@ -409,7 +418,7 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 			if tc.wantCategory != "" && !strings.Contains(err.Error(), `"`+tc.wantCategory+`"`) {
 				t.Fatalf("system-config refusal %q omitted fixed category %q", err, tc.wantCategory)
 			}
-			for _, secret := range []string{"credential-sentinel", "private-plugin", "raw-config-sentinel", "customer-secret-name", "customer_secret_name"} {
+			for _, secret := range []string{"credential-sentinel", "private-plugin", "raw-config-sentinel", "customer-secret-name", "customer_secret_name", "oidc-issuer-sentinel", "oidc-client-sentinel", "oidc-inline-sentinel", "oidc-quoted-sentinel"} {
 				if strings.Contains(err.Error(), secret) {
 					t.Fatalf("system-config refusal leaked %q: %v", secret, err)
 				}

@@ -1699,8 +1699,9 @@ func grokSystemPinnedAPIKey(runtimeModel string) bool {
 // level keyword sweep, not a TOML parser — because the only goal here is to
 // catch the dangerous markers the argv-strip surface in
 // sanitizeGrokACPExtraArgs / sanitizeGrokACPEnv already neutralises at the
-// per-process layer. Missing/unreadable files ⇒ skipped (best-effort by
-// design; matches setupIsolatedGrokHome's tolerance for missing inputs).
+// per-process layer. Missing TOML files are skipped; the shared Claude JSON
+// inspector separately fails closed when an existing managed file cannot be
+// read completely or parsed safely.
 func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) error {
 	if allowAPIKey && allowAlwaysApprove {
 		return nil
@@ -1719,8 +1720,12 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 		// closed when an MDM policy has set one and the workspace has not
 		// opted into EnableGrokAlwaysApprove.
 		for _, p := range claudeManagedSettingsPathsFn() {
-			if hit, ok := detectClaudeManagedSettingsAllowRule(p); ok {
-				return fmt.Errorf("grok imports Claude Code's managed-settings.json permission rules and %s contains a `permissions.allow` entry; the per-session isolated GROK_HOME cannot override an imported Claude allow rule — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the imported allow rule", hit)
+			ok, err := inspectClaudeManagedSettingsAllowRule(p)
+			if err != nil {
+				return fmt.Errorf("grok cannot safely inspect Claude managed settings; refusing to spawn")
+			}
+			if ok {
+				return fmt.Errorf("grok imports Claude Code's managed-settings.json permission rules and the managed policy contains a `permissions.allow` entry; the per-session isolated GROK_HOME cannot override an imported Claude allow rule — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the imported allow rule")
 			}
 		}
 	}
@@ -1752,7 +1757,11 @@ func detectGrokMaintenanceSmokeSystemConfig() error {
 	// Claude's managed-settings compatibility layer is JSON rather than TOML,
 	// so keep its dedicated semantic reader alongside the TOML traversal.
 	for _, path := range claudeManagedSettingsPathsFn() {
-		if _, ok := detectClaudeManagedSettingsAllowRule(path); ok {
+		ok, err := inspectClaudeManagedSettingsAllowRule(path)
+		if err != nil {
+			return fmt.Errorf("grok system configuration cannot be inspected safely; refusing no-tools maintenance smoke")
+		}
+		if ok {
 			return fmt.Errorf("grok system configuration pins credentials or a permissive approval policy; refusing no-tools maintenance smoke")
 		}
 	}
@@ -1847,6 +1856,9 @@ func classifyGrokSystemSemanticValue(path []string, value any, finding *grokSyst
 	if semanticGrokValueNonEmpty(value) {
 		switch {
 		case last == "auth_provider_command":
+			finding.externalProvider = true
+		case (last == "issuer" || last == "client_id") && len(path) >= 3 &&
+			path[len(path)-2] == "oidc" && path[len(path)-3] == "auth":
 			finding.externalProvider = true
 		case last == "base_url" || last == "api_base_url" || last == "models_base_url" || last == "models_list_url":
 			finding.externalProvider = true
@@ -2126,41 +2138,55 @@ func detectPinnedSystemGrokRequirementsFile(path string, allowAPIKey, allowAlway
 // `managed-settings.json` locations. See claudeManagedSettingsPathsFn for the
 // rationale on which paths are scanned and which are deliberately omitted.
 func claudeManagedSettingsPaths() []string {
-	paths := make([]string, 0, 2)
-	switch runtime.GOOS {
+	return claudeManagedSettingsPathsForOS(runtime.GOOS, os.Getenv)
+}
+
+// claudeManagedSettingsPathsForOS keeps the production path mapping directly
+// testable. Claude Code's current Windows managed-policy directory is under
+// Program Files; the retired ProgramData location is deliberately excluded
+// because current Claude releases no longer read it.
+func claudeManagedSettingsPathsForOS(goos string, getenv func(string) string) []string {
+	paths := make([]string, 0, 1)
+	switch goos {
 	case "darwin":
 		paths = append(paths, "/Library/Application Support/ClaudeCode/managed-settings.json")
 	case "windows":
-		programData := os.Getenv("ProgramData")
-		if programData == "" {
-			programData = `C:\ProgramData`
+		programFiles := strings.TrimSpace(getenv("ProgramFiles"))
+		if programFiles == "" {
+			programFiles = `C:\Program Files`
 		}
-		paths = append(paths, filepath.Join(programData, "ClaudeCode", "managed-settings.json"))
+		paths = append(paths, filepath.Join(programFiles, "ClaudeCode", "managed-settings.json"))
 	default:
 		paths = append(paths, "/etc/claude-code/managed-settings.json")
 	}
 	return paths
 }
 
-// detectClaudeManagedSettingsAllowRule reports whether the Claude
+// inspectClaudeManagedSettingsAllowRule reports whether the Claude
 // `managed-settings.json` at `path` contains a non-empty `permissions.allow`
-// array. Returns the path on hit so the error message can point the operator
-// at the exact file. Missing/unreadable/malformed/empty files yield false —
-// best-effort by design, matching detectPinnedSystemGrokRequirementsFile's
-// tolerance for missing inputs.
-func detectClaudeManagedSettingsAllowRule(path string) (string, bool) {
+// array. A missing path is benign, but an existing file that cannot be read in
+// full or decoded must fail closed: Grok may still consume a policy that this
+// preflight otherwise skipped. Errors are fixed strings and never include the
+// managed path or file contents.
+func inspectClaudeManagedSettingsAllowRule(path string) (bool, error) {
 	if path == "" {
-		return "", false
+		return false, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return "", false
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("claude managed settings cannot be read safely")
 	}
 	defer f.Close()
 	const maxBytes = 1 << 20
-	data, err := io.ReadAll(io.LimitReader(f, maxBytes))
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
 	if err != nil {
-		return "", false
+		return false, fmt.Errorf("claude managed settings cannot be read safely")
+	}
+	if len(data) > maxBytes {
+		return false, fmt.Errorf("claude managed settings exceed the inspection limit")
 	}
 	var parsed struct {
 		Permissions struct {
@@ -2168,14 +2194,14 @@ func detectClaudeManagedSettingsAllowRule(path string) (string, bool) {
 		} `json:"permissions"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", false
+		return false, fmt.Errorf("claude managed settings cannot be parsed safely")
 	}
 	for _, rule := range parsed.Permissions.Allow {
 		if strings.TrimSpace(rule) != "" {
-			return path, true
+			return true, nil
 		}
 	}
-	return "", false
+	return false, nil
 }
 
 // grokTOMLStripInlineComment removes a trailing `# ...` comment from a TOML
