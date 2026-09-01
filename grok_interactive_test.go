@@ -317,6 +317,16 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 		"RUST_LOG=xai_grok=debug-stderr-sentinel",
 		"RUST_BACKTRACE=1",
 		"RUST_LIB_BACKTRACE=1",
+		"OTEL_LOGS_EXPORTER=console-output-sentinel",
+		"OTEL_METRICS_EXPORTER=otlp",
+		"OTEL_EXPORTER_OTLP_ENDPOINT=https://otel-endpoint-sentinel.invalid",
+		"OTEL_EXPORTER_OTLP_HEADERS=Authorization=otel-credential-sentinel",
+		"OTEL_EXPORTER_OTLP_CERTIFICATE=otel-ca-path-sentinel",
+		"OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=otel-client-cert-path-sentinel",
+		"OTEL_EXPORTER_OTLP_CLIENT_KEY=otel-client-key-path-sentinel",
+		"OTEL_LOG_USER_PROMPTS=1",
+		"OTEL_LOG_TOOL_DETAILS=1",
+		"OTEL_FUTURE_EXPORT_OVERRIDE=future-otel-sentinel",
 	})
 	values := make(map[string]string, len(got))
 	for _, entry := range got {
@@ -336,6 +346,10 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 		"GROK_MODEL", "GROK_XAI_API_BASE_URL", "GROK_API_BASE_URL", "XAI_API_BASE_URL",
 		"GROK_SANDBOX", "GROK_SANDBOX_AUTO_ALLOW_BASH", "GROK_LOG_FILE",
 		"GROK_FUTURE_EXECUTION_OVERRIDE", "RUST_LOG", "RUST_BACKTRACE", "RUST_LIB_BACKTRACE",
+		"OTEL_LOGS_EXPORTER", "OTEL_METRICS_EXPORTER", "OTEL_EXPORTER_OTLP_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_CERTIFICATE",
+		"OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+		"OTEL_LOG_USER_PROMPTS", "OTEL_LOG_TOOL_DETAILS", "OTEL_FUTURE_EXPORT_OVERRIDE",
 	} {
 		if _, ok := values[stripped]; ok {
 			t.Errorf("maintenance environment retained %s: %#v", stripped, got)
@@ -363,6 +377,8 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 		"workspace-path-sentinel", "skills-path-sentinel", "model-sentinel", "alternate-model-sentinel", "models-base-sentinel",
 		"models-list-sentinel", "xai-base-sentinel", "api-base-sentinel", "alternate-xai-base-sentinel",
 		"host-sandbox-sentinel", "external-log-path-sentinel", "future-override-sentinel", "debug-stderr-sentinel",
+		"console-output-sentinel", "otel-endpoint-sentinel", "otel-credential-sentinel", "otel-ca-path-sentinel",
+		"otel-client-cert-path-sentinel", "otel-client-key-path-sentinel", "future-otel-sentinel",
 	} {
 		if strings.Contains(encoded, secret) {
 			t.Errorf("maintenance environment retained %q: %s", secret, encoded)
@@ -415,6 +431,15 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 		{"quoted inline vendor MCP", `"compat" = { "cursor" = { "mcps" = true } }` + "\n", "vendor-mcp"},
 		{"inline plugin", `plugins = { enabled = ["customer-secret-name"] }` + "\n", "plugin"},
 		{"inline MCP", `mcp_servers = { "customer-secret-name" = { command = "raw-config-sentinel" } }` + "\n", "mcp"},
+		{"table external telemetry", "[telemetry]\notel_enabled = true\n", "telemetry"},
+		{"dotted console telemetry", `telemetry.otel_logs_exporter = "console-output-sentinel"` + "\n", "telemetry"},
+		{"inline OTLP telemetry", `telemetry = { otel_metrics_exporter = "otlp", otel_endpoint = "https://otel-endpoint-sentinel.invalid" }` + "\n", "telemetry"},
+		{"inline prompt telemetry", `telemetry = { otel_log_user_prompts = true }` + "\n", "telemetry"},
+		{"inline tool-detail telemetry", `telemetry = { otel_log_tool_details = true }` + "\n", "telemetry"},
+		{"expanded telemetry enable", "[telemetry]\notel_enabled = '$OTEL_ENABLE_SENTINEL'\n", "telemetry"},
+		{"quoted telemetry certificate", `"telemetry"."otel_certificate" = "otel-ca-path-sentinel"` + "\n", "telemetry"},
+		{"quoted telemetry client certificate", `"telemetry"."otel_client_certificate" = "otel-client-cert-path-sentinel"` + "\n", "telemetry"},
+		{"quoted telemetry client key", `"telemetry"."otel_client_key" = "otel-client-key-path-sentinel"` + "\n", "telemetry"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -428,7 +453,7 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 			if tc.wantCategory != "" && !strings.Contains(err.Error(), `"`+tc.wantCategory+`"`) {
 				t.Fatalf("system-config refusal %q omitted fixed category %q", err, tc.wantCategory)
 			}
-			for _, secret := range []string{"credential-sentinel", "private-plugin", "raw-config-sentinel", "customer-secret-name", "customer_secret_name", "oidc-issuer-sentinel", "oidc-client-sentinel", "oidc-inline-sentinel", "oidc-quoted-sentinel"} {
+			for _, secret := range []string{"credential-sentinel", "private-plugin", "raw-config-sentinel", "customer-secret-name", "customer_secret_name", "oidc-issuer-sentinel", "oidc-client-sentinel", "oidc-inline-sentinel", "oidc-quoted-sentinel", "console-output-sentinel", "otel-endpoint-sentinel", "otel-ca-path-sentinel", "otel-client-cert-path-sentinel", "otel-client-key-path-sentinel", "OTEL_ENABLE_SENTINEL"} {
 				if strings.Contains(err.Error(), secret) {
 					t.Fatalf("system-config refusal leaked %q: %v", secret, err)
 				}
@@ -456,6 +481,12 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 	}
 	if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
 		t.Fatalf("inline deny-only permission rules must remain valid: %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("[telemetry]\notel_enabled = false\notel_metrics_exporter = 'none'\notel_logs_exporter = 'none'\notel_log_user_prompts = false\notel_log_tool_details = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
+		t.Fatalf("explicitly disabled external telemetry must remain valid: %v", err)
 	}
 
 	if err := os.WriteFile(managedPath, []byte(strings.Repeat("#", (1<<20)+1)), 0o600); err != nil {
@@ -536,6 +567,35 @@ func TestInspectGrokSystemConfigSemantic_AppliesOnlyMatchingVersionOverrides(t *
 			}
 			if _, _, err := inspectGrokSystemConfigSemantic(path, "grok 1.0.13"); err == nil || !strings.Contains(err.Error(), "cannot be evaluated safely") {
 				t.Fatalf("unsafe selector was not rejected generically: %v", err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name           string
+		runtimeVersion string
+		minimum        string
+		maximum        string
+		wantTelemetry  bool
+	}{
+		{"1.0.5 active telemetry", "grok 1.0.5", "1.0.0", "1.0.9", true},
+		{"1.0.5 future inactive telemetry", "grok 1.0.5", "1.0.6", "1.0.20", false},
+		{"1.0.13 historical inactive telemetry", "grok 1.0.13", "1.0.0", "1.0.12", false},
+		{"1.0.13 active telemetry", "grok 1.0.13", "1.0.10", "1.0.20", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `version_overrides = [{ minimum_version = "` + tc.minimum +
+				`", maximum_version = "` + tc.maximum +
+				`", telemetry = { otel_enabled = true, otel_logs_exporter = "console" } }]` + "\n"
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			finding, ok, err := inspectGrokSystemConfigSemantic(path, tc.runtimeVersion)
+			if err != nil || !ok {
+				t.Fatalf("inspect telemetry override: ok=%v finding=%+v err=%v", ok, finding, err)
+			}
+			if got := finding.toolCategory == "telemetry"; got != tc.wantTelemetry {
+				t.Fatalf("telemetry finding = %+v, want telemetry=%v", finding, tc.wantTelemetry)
 			}
 		})
 	}

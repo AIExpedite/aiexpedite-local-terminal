@@ -435,6 +435,15 @@ func runMockGrokMaintenanceSmoke(mode string) {
 	if logPath := os.Getenv("GROK_LOG_FILE"); logPath != "" {
 		_ = os.WriteFile(logPath, []byte("external-log-sentinel"), 0o600)
 	}
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(strings.ToUpper(name), "OTEL_") {
+			// A leaked console exporter models non-protocol output; an OTLP
+			// exporter models the external marker/identity disclosure path.
+			fmt.Fprintln(os.Stderr, "otel-output-contamination-sentinel")
+			break
+		}
+	}
 	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		if mode == "grok-maintenance-smoke-v1" {
 			fmt.Println("grok 1.0.5")
@@ -507,6 +516,7 @@ func runMockGrokMaintenanceSmoke(mode string) {
 		os.Getenv("GROK_SANDBOX") != "" || os.Getenv("GROK_SANDBOX_AUTO_ALLOW_BASH") != "" ||
 		os.Getenv("GROK_LOG_FILE") != "" || os.Getenv("GROK_FUTURE_EXECUTION_OVERRIDE") != "" ||
 		os.Getenv("RUST_LOG") != "" || os.Getenv("RUST_BACKTRACE") != "" || os.Getenv("RUST_LIB_BACKTRACE") != "" ||
+		mockEnvironmentHasPrefix("OTEL_") ||
 		mockHasArg(args, "--always-approve") || mockHasArg(args, "--auto-approve") || !compatibilityDisabled ||
 		hasExternalLoader ||
 		mockHasArg(args, grokMaintenanceSmokeControlArg) ||
@@ -549,6 +559,17 @@ func mockArgValue(args []string, name string) (string, bool) {
 func mockHasArg(args []string, name string) bool {
 	for _, arg := range args {
 		if arg == name {
+			return true
+		}
+	}
+	return false
+}
+
+func mockEnvironmentHasPrefix(prefix string) bool {
+	prefix = strings.ToUpper(prefix)
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(strings.ToUpper(name), prefix) {
 			return true
 		}
 	}
@@ -904,6 +925,16 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 	t.Setenv("RUST_LOG", "xai_grok=debug-stderr-sentinel")
 	t.Setenv("RUST_BACKTRACE", "1")
 	t.Setenv("RUST_LIB_BACKTRACE", "1")
+	t.Setenv("OTEL_LOGS_EXPORTER", "console")
+	t.Setenv("OTEL_METRICS_EXPORTER", "otlp")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://otel-endpoint-sentinel.invalid")
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=otel-credential-sentinel")
+	t.Setenv("OTEL_EXPORTER_OTLP_CERTIFICATE", "otel-ca-path-sentinel")
+	t.Setenv("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "otel-client-cert-path-sentinel")
+	t.Setenv("OTEL_EXPORTER_OTLP_CLIENT_KEY", "otel-client-key-path-sentinel")
+	t.Setenv("OTEL_LOG_USER_PROMPTS", "1")
+	t.Setenv("OTEL_LOG_TOOL_DETAILS", "1")
+	t.Setenv("OTEL_FUTURE_EXPORT_OVERRIDE", "future-otel-sentinel")
 	t.Setenv(mockGrokPersistentHomeEnv, realHome)
 	t.Setenv(mockGrokVendorHomeEnv, vendorHome)
 	t.Setenv(mockGrokProjectRootEnv, projectRoot)
@@ -971,6 +1002,8 @@ mcps = false
 			"credential-sentinel", "prompt-sentinel", "raw-config-sentinel", "agent-path-sentinel",
 			"project-plugin", "config-path-sentinel", "plugin-path-sentinel", "workspace-path-sentinel",
 			"model-sentinel", "models-base-sentinel", "models-list-sentinel", "xai-base-sentinel",
+			"otel-endpoint-sentinel", "otel-credential-sentinel", "otel-ca-path-sentinel",
+			"otel-client-cert-path-sentinel", "otel-client-key-path-sentinel", "future-otel-sentinel",
 		} {
 			if strings.Contains(string(encoded), secret) {
 				t.Fatalf("%s signed refresh leaked %q: %s", mode, secret, encoded)

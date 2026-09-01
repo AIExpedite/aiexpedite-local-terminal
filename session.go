@@ -3203,11 +3203,15 @@ func grokNoToolsExternalLoaderArg(args []string) (string, bool) {
 // sanitizeGrokMaintenanceSmokeEnv is stricter than the reusable ACP sanitizer:
 // maintenance smokes must not inherit any Grok execution, routing, logging, or
 // extension-discovery override. Grok's environment surface grows independently
-// of this agent, so a denylist is unsafe here: strip every inherited GROK_*
-// variable, plus related xAI endpoint and Rust diagnostic controls, then add
-// back only fixed-off compatibility/tool-scanner controls. This also prevents
+// of this agent, so a denylist is unsafe here: strip every inherited GROK_* and
+// OTEL_* variable, plus related xAI endpoint and Rust diagnostic controls, then
+// add back only fixed-off compatibility/tool-scanner controls. OTEL_* must be
+// removed even though GROK_EXTERNAL_OTEL is also stripped: a system managed
+// `[telemetry] otel_enabled = true` survives GROK_HOME isolation and otherwise
+// turns inherited exporter/content controls back on. This also prevents
 // GROK_LOG_FILE from persisting raw diagnostics outside the isolated home and
-// RUST_LOG/RUST_BACKTRACE from adding non-protocol stderr to the exact marker.
+// RUST_LOG/RUST_BACKTRACE or an OTEL console exporter from adding non-protocol
+// output to the exact marker.
 var grokMaintenanceSmokeVersionProbeFn = func(executable string) string {
 	return probeVersionArgsWithEnv(executable, sanitizeGrokMaintenanceSmokeEnv(os.Environ()), "--version")
 }
@@ -3218,7 +3222,7 @@ func sanitizeGrokMaintenanceSmokeEnv(env []string) []string {
 	for _, entry := range base {
 		name, _, _ := strings.Cut(entry, "=")
 		upper := strings.ToUpper(name)
-		if strings.HasPrefix(upper, "GROK_") || upper == "XAI_API_BASE_URL" ||
+		if strings.HasPrefix(upper, "GROK_") || strings.HasPrefix(upper, "OTEL_") || upper == "XAI_API_BASE_URL" ||
 			upper == "RUST_LOG" || upper == "RUST_BACKTRACE" || upper == "RUST_LIB_BACKTRACE" {
 			continue
 		}

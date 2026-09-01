@@ -1994,6 +1994,15 @@ func classifyGrokSystemSemanticValue(path []string, value any, finding *grokSyst
 		return
 	}
 	last := path[len(path)-1]
+	if grokSemanticExternalTelemetryEnabled(path, value) {
+		// Grok's external OTEL stream is independent of product telemetry and can
+		// be enabled from managed/requirements layers that GROK_HOME isolation
+		// cannot hide. Reject with a fixed category: exporter endpoints,
+		// certificate paths, and content gates can contain private values that must
+		// never be reflected in a published maintenance error.
+		finding.toolCategory = "telemetry"
+		return
+	}
 	if last == "api_key" || last == "env_key" {
 		if strings.TrimSpace(fmt.Sprint(value)) != "" {
 			finding.credential = true
@@ -2055,6 +2064,35 @@ func classifyGrokSystemSemanticValue(path []string, value any, finding *grokSyst
 				finding.toolCategory = "plugin"
 			}
 		}
+	}
+}
+
+// grokSemanticExternalTelemetryEnabled recognizes the external OpenTelemetry
+// controls Grok 1.0.13 accepts under [telemetry]. Explicitly disabled values
+// remain valid; anything that activates an exporter/content gate or supplies an
+// external endpoint/certificate/key path fails closed. Non-boolean/non-string
+// values are rejected because Grok's managed layers support environment
+// expansion and their effective meaning cannot be proven safe lexically.
+func grokSemanticExternalTelemetryEnabled(path []string, value any) bool {
+	if len(path) < 2 || path[len(path)-2] != "telemetry" {
+		return false
+	}
+	last := path[len(path)-1]
+	switch last {
+	case "otel_enabled", "otel_log_user_prompts", "otel_log_tool_details":
+		enabled, ok := value.(bool)
+		return !ok || enabled
+	case "otel_metrics_exporter", "otel_logs_exporter":
+		exporter, ok := value.(string)
+		if !ok {
+			return true
+		}
+		exporter = strings.TrimSpace(exporter)
+		return exporter != "" && !strings.EqualFold(exporter, "none")
+	case "otel_endpoint", "otel_certificate", "otel_client_certificate", "otel_client_key":
+		return semanticGrokValueNonEmpty(value)
+	default:
+		return false
 	}
 }
 
