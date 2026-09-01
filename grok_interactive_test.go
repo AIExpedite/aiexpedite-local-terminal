@@ -310,6 +310,13 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 		"GROK_WEB_FETCH=1",
 		"GROK_MEMORY=1",
 		"GROK_LSP_TOOLS=1",
+		"GROK_SANDBOX=host-sandbox-sentinel",
+		"GROK_SANDBOX_AUTO_ALLOW_BASH=1",
+		"GROK_LOG_FILE=external-log-path-sentinel",
+		"GROK_FUTURE_EXECUTION_OVERRIDE=future-override-sentinel",
+		"RUST_LOG=xai_grok=debug-stderr-sentinel",
+		"RUST_BACKTRACE=1",
+		"RUST_LIB_BACKTRACE=1",
 	})
 	values := make(map[string]string, len(got))
 	for _, entry := range got {
@@ -327,6 +334,8 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 		"GROK_MANAGED_CONFIG_URL", "GROK_WORKSPACE_ROOT", "GROK_WORKSPACE_SERVER_SKILLS_DIR",
 		"GROK_DEFAULT_MODEL", "GROK_MODELS_BASE_URL", "GROK_MODELS_LIST_URL",
 		"GROK_MODEL", "GROK_XAI_API_BASE_URL", "GROK_API_BASE_URL", "XAI_API_BASE_URL",
+		"GROK_SANDBOX", "GROK_SANDBOX_AUTO_ALLOW_BASH", "GROK_LOG_FILE",
+		"GROK_FUTURE_EXECUTION_OVERRIDE", "RUST_LOG", "RUST_BACKTRACE", "RUST_LIB_BACKTRACE",
 	} {
 		if _, ok := values[stripped]; ok {
 			t.Errorf("maintenance environment retained %s: %#v", stripped, got)
@@ -353,6 +362,7 @@ func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) 
 		"agent-path-sentinel", "config-path-sentinel", "managed-config-sentinel", "plugin-path-sentinel",
 		"workspace-path-sentinel", "skills-path-sentinel", "model-sentinel", "alternate-model-sentinel", "models-base-sentinel",
 		"models-list-sentinel", "xai-base-sentinel", "api-base-sentinel", "alternate-xai-base-sentinel",
+		"host-sandbox-sentinel", "external-log-path-sentinel", "future-override-sentinel", "debug-stderr-sentinel",
 	} {
 		if strings.Contains(encoded, secret) {
 			t.Errorf("maintenance environment retained %q: %s", secret, encoded)
@@ -411,7 +421,7 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 			if err := os.WriteFile(managedPath, []byte(tc.body), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			err := detectGrokMaintenanceSmokeSystemConfig()
+			err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13")
 			if err == nil {
 				t.Fatalf("system config was accepted: %s", tc.body)
 			}
@@ -432,27 +442,102 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 	if err := os.WriteFile(managedPath, []byte("[compat.cursor]\nmcps = false\n[compat.claude]\nmcps = false\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := detectGrokMaintenanceSmokeSystemConfig(); err != nil {
+	if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
 		t.Fatalf("explicit system vendor-MCP disables must remain valid: %v", err)
 	}
 	if err := os.WriteFile(managedPath, []byte("compat = { cursor = { mcps = false }, claude = { mcps = false } }\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := detectGrokMaintenanceSmokeSystemConfig(); err != nil {
+	if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
 		t.Fatalf("inline system vendor-MCP disables must remain valid: %v", err)
 	}
 	if err := os.WriteFile(managedPath, []byte(`permission = { rules = [{ action = "deny", tool = "MCPTool", allow = "matcher-only" }] }`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := detectGrokMaintenanceSmokeSystemConfig(); err != nil {
+	if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
 		t.Fatalf("inline deny-only permission rules must remain valid: %v", err)
 	}
 
 	if err := os.WriteFile(managedPath, []byte(strings.Repeat("#", (1<<20)+1)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := detectGrokMaintenanceSmokeSystemConfig(); err == nil || !strings.Contains(err.Error(), "inspection limit") {
+	if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err == nil || !strings.Contains(err.Error(), "inspection limit") {
 		t.Fatalf("oversized system config must fail closed, got %v", err)
+	}
+}
+
+func TestInspectGrokSystemConfigSemantic_AppliesOnlyMatchingVersionOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "managed_config.toml")
+	tests := []struct {
+		name           string
+		runtimeVersion string
+		minimum        string
+		maximum        string
+		wantTool       bool
+	}{
+		{"1.0.5 active", "grok 1.0.5", "1.0.0", "1.0.9", true},
+		{"1.0.5 historical inactive", "grok 1.0.5", "0.9.0", "1.0.4", false},
+		{"1.0.5 future inactive", "grok 1.0.5", "1.0.6", "1.0.12", false},
+		{"1.0.13 active", "grok 1.0.13", "1.0.10", "1.0.20", true},
+		{"1.0.13 historical inactive", "grok 1.0.13", "1.0.0", "1.0.12", false},
+		{"1.0.13 future inactive", "grok 1.0.13", "1.0.14", "2.0.0", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `version_overrides = [{ minimum_version = "` + tc.minimum +
+				`", maximum_version = "` + tc.maximum +
+				`", mcp_servers = { "sentinel-server" = { command = "raw-config-sentinel" } } }]` + "\n"
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			finding, ok, err := inspectGrokSystemConfigSemantic(path, tc.runtimeVersion)
+			if err != nil || !ok {
+				t.Fatalf("inspect override: ok=%v finding=%+v err=%v", ok, finding, err)
+			}
+			if got := finding.toolCategory != ""; got != tc.wantTool {
+				t.Fatalf("tool finding = %+v, want tool=%v", finding, tc.wantTool)
+			}
+		})
+	}
+
+	// Matching patches replace their base-layer value before classification;
+	// walking both the base and patch independently would reject this safe pin.
+	if err := os.WriteFile(path, []byte(
+		`compat = { cursor = { mcps = true } }`+"\n"+
+			`version_overrides = [{ minimum_version = "1.0.10", maximum_version = "1.0.20", compat = { cursor = { mcps = false } } }]`+"\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	finding, ok, err := inspectGrokSystemConfigSemantic(path, "grok 1.0.13")
+	if err != nil || !ok || finding.toolCategory != "" {
+		t.Fatalf("effective override did not replace base value: ok=%v finding=%+v err=%v", ok, finding, err)
+	}
+	if err := os.WriteFile(path, []byte(
+		`compat = { cursor = { mcps = true } }`+"\n"+
+			`version_overrides = [{ minimum_version = "1.0.10", maximum_version = "1.0.20", Compat = { cursor = { mcps = false } } }]`+"\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	finding, ok, err = inspectGrokSystemConfigSemantic(path, "grok 1.0.13")
+	if err != nil || !ok || finding.toolCategory != "vendor-mcp" {
+		t.Fatalf("lookalike override hid the effective base setting: ok=%v finding=%+v err=%v", ok, finding, err)
+	}
+
+	for name, body := range map[string]string{
+		"missing maximum": `version_overrides = [{ minimum_version = "1.0.0", mcp_servers = {} }]`,
+		"invalid minimum": `version_overrides = [{ minimum_version = "not-semver", maximum_version = "2.0.0", mcp_servers = {} }]`,
+		"reversed range":  `version_overrides = [{ minimum_version = "2.0.0", maximum_version = "1.0.0", mcp_servers = {} }]`,
+		"ambiguous minimum": `version_overrides = [{ minimum_version = "1.0.0", minimum-version = "1.0.1", ` +
+			`maximum_version = "2.0.0", mcp_servers = {} }]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(body+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := inspectGrokSystemConfigSemantic(path, "grok 1.0.13"); err == nil || !strings.Contains(err.Error(), "cannot be evaluated safely") {
+				t.Fatalf("unsafe selector was not rejected generically: %v", err)
+			}
+		})
 	}
 }
 
@@ -468,13 +553,16 @@ func TestStartSession_GrokMaintenanceSmokeRunsSystemPreflight(t *testing.T) {
 	origRequirementsPath := grokSystemRequirementsPath
 	origManagedPath := grokSystemManagedConfigPath
 	origClaudePaths := claudeManagedSettingsPathsFn
+	origVersionProbe := grokMaintenanceSmokeVersionProbeFn
 	grokSystemRequirementsPath = requirementsPath
 	grokSystemManagedConfigPath = managedPath
 	claudeManagedSettingsPathsFn = func() []string { return nil }
+	grokMaintenanceSmokeVersionProbeFn = func(string) string { return "grok 1.0.13" }
 	t.Cleanup(func() {
 		grokSystemRequirementsPath = origRequirementsPath
 		grokSystemManagedConfigPath = origManagedPath
 		claudeManagedSettingsPathsFn = origClaudePaths
+		grokMaintenanceSmokeVersionProbeFn = origVersionProbe
 	})
 
 	sm := NewSessionManager(nil)

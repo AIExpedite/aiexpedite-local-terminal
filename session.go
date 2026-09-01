@@ -232,12 +232,21 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// plugins and MCP discovery. Reuse the ACP auth-only home, but omit its
 	// persistent conversation-store link: this is a one-shot smoke and must not
 	// gain access to unrelated transcripts.
-	var isolatedGrokHome, isolatedGrokCwd, persistentGrokHome string
+	var isolatedGrokHome, isolatedGrokCwd, persistentGrokHome, executable string
 	if grokMaintenanceSmoke {
 		if contractErr := validateGrokMaintenanceSmokeContract(cliArgs); contractErr != nil {
 			return contractErr
 		}
-		if preflightErr := detectGrokMaintenanceSmokeSystemConfig(); preflightErr != nil {
+		// Version overrides are part of every managed Grok config layer. Probe the
+		// exact binary that will be spawned, under the same maintenance-only env
+		// policy, so pre/post-update smokes evaluate only the patch applicable to
+		// their installed version. A missing or ambiguous version fails closed.
+		executable = resolveExecutable(command)
+		grokVersion := grokMaintenanceSmokeVersionProbeFn(executable)
+		if normalizeGrokConfigVersion(grokVersion) == "" {
+			return fmt.Errorf("grok maintenance smoke cannot safely determine the installed Grok version")
+		}
+		if preflightErr := detectGrokMaintenanceSmokeSystemConfig(grokVersion); preflightErr != nil {
 			return fmt.Errorf("grok maintenance smoke system-config preflight failed: %w", preflightErr)
 		}
 		persistentGrokHome = grokPersistentHome()
@@ -333,7 +342,9 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	}()
 
 	// Resolve executable path
-	executable := resolveExecutable(command)
+	if executable == "" {
+		executable = resolveExecutable(command)
+	}
 
 	fmt.Printf("%s[session] Starting %s session %s: %s %s%s\n",
 		colorCyan, command, id, executable, strings.Join(cliArgs, " "), colorReset)
@@ -3190,49 +3201,25 @@ func grokNoToolsExternalLoaderArg(args []string) (string, bool) {
 }
 
 // sanitizeGrokMaintenanceSmokeEnv is stricter than the reusable ACP sanitizer:
-// maintenance smokes must not inherit environment-level extension discovery or
-// agent selection. Grok documents the compatibility scanner variables as
-// session overrides, so merely writing `compat.*.mcps = false` in the isolated
-// config is insufficient. Strip every Cursor/Claude/Codex compatibility
-// override and other config, plugin, workspace, or tool-enabling selector,
-// then pin every documented compatibility and managed-tool scanner off
-// explicitly so each default-on loader remains disabled.
+// maintenance smokes must not inherit any Grok execution, routing, logging, or
+// extension-discovery override. Grok's environment surface grows independently
+// of this agent, so a denylist is unsafe here: strip every inherited GROK_*
+// variable, plus related xAI endpoint and Rust diagnostic controls, then add
+// back only fixed-off compatibility/tool-scanner controls. This also prevents
+// GROK_LOG_FILE from persisting raw diagnostics outside the isolated home and
+// RUST_LOG/RUST_BACKTRACE from adding non-protocol stderr to the exact marker.
+var grokMaintenanceSmokeVersionProbeFn = func(executable string) string {
+	return probeVersionArgsWithEnv(executable, sanitizeGrokMaintenanceSmokeEnv(os.Environ()), "--version")
+}
+
 func sanitizeGrokMaintenanceSmokeEnv(env []string) []string {
 	base := sanitizeGrokACPEnv(env, false)
 	filtered := make([]string, 0, len(base)+2)
-	blocked := map[string]bool{
-		"GROK_AGENT":            true,
-		"GROK_AUTH":             true,
-		"GROK_CODE_XAI_API_KEY": true,
-		"GROK_DEFAULT_MODEL":    true,
-		"GROK_DEPLOYMENT_KEY":   true,
-		"GROK_LOCAL_AUTH":       true,
-		"GROK_LOGIN_ENV":        true,
-		"GROK_MODEL":            true,
-		"GROK_MODELS_BASE_URL":  true,
-		"GROK_MODELS_LIST_URL":  true,
-		"GROK_XAI_API_BASE_URL": true,
-		"GROK_API_BASE_URL":     true,
-		"XAI_API_BASE_URL":      true,
-		"GROK_WORKSPACE":        true,
-		"GROK_WORKFLOWS":        true,
-		"GROK_SUBAGENTS":        true,
-		"GROK_WEB_FETCH":        true,
-		"GROK_MEMORY":           true,
-		"GROK_TOOL_SEARCH":      true,
-		"GROK_LSP_TOOLS":        true,
-		"GROK_WRITE_FILE":       true,
-	}
 	for _, entry := range base {
 		name, _, _ := strings.Cut(entry, "=")
 		upper := strings.ToUpper(name)
-		if blocked[upper] || strings.HasPrefix(upper, "GROK_AUTH_PROVIDER_") ||
-			strings.HasPrefix(upper, "GROK_CONFIG") || strings.HasPrefix(upper, "GROK_MANAGED_") ||
-			strings.HasPrefix(upper, "GROK_MODEL_") || strings.HasPrefix(upper, "GROK_MODELS_") ||
-			strings.HasPrefix(upper, "GROK_OIDC_") ||
-			strings.HasPrefix(upper, "GROK_PLUGIN_") || strings.HasPrefix(upper, "GROK_WORKSPACE_") ||
-			strings.HasPrefix(upper, "GROK_CURSOR_") || strings.HasPrefix(upper, "GROK_CLAUDE_") ||
-			strings.HasPrefix(upper, "GROK_CODEX_") {
+		if strings.HasPrefix(upper, "GROK_") || upper == "XAI_API_BASE_URL" ||
+			upper == "RUST_LOG" || upper == "RUST_BACKTRACE" || upper == "RUST_LIB_BACKTRACE" {
 			continue
 		}
 		filtered = append(filtered, entry)

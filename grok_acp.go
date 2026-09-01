@@ -57,6 +57,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"golang.org/x/mod/semver"
 )
 
 const (
@@ -1738,9 +1739,9 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 // layers, so decode their TOML semantics and refuse pinned credentials,
 // permissive approval, external-tool definitions, or settings that re-enable
 // vendor MCP discovery.
-func detectGrokMaintenanceSmokeSystemConfig() error {
+func detectGrokMaintenanceSmokeSystemConfig(grokVersion string) error {
 	for _, path := range grokSystemConfigPathsFn() {
-		finding, ok, err := inspectGrokSystemConfigSemantic(path)
+		finding, ok, err := inspectGrokSystemConfigSemantic(path, grokVersion)
 		if err != nil {
 			return err
 		}
@@ -1780,7 +1781,7 @@ type grokSystemSemanticFinding struct {
 // therefore share the same normalized semantic paths instead of relying on
 // lexical spellings. No caller-controlled key, section, value, or path is ever
 // returned: maintenance refusals publish only fixed classifications.
-func inspectGrokSystemConfigSemantic(path string) (grokSystemSemanticFinding, bool, error) {
+func inspectGrokSystemConfigSemantic(path, grokVersion string) (grokSystemSemanticFinding, bool, error) {
 	var finding grokSystemSemanticFinding
 	if path == "" {
 		return finding, false, nil
@@ -1811,8 +1812,157 @@ func inspectGrokSystemConfigSemantic(path string) (grokSystemSemanticFinding, bo
 	if _, decodeErr := toml.Decode(string(data), &decoded); decodeErr != nil {
 		return finding, false, fmt.Errorf("grok system configuration cannot be parsed safely; refusing no-tools maintenance smoke")
 	}
-	walkGrokSystemConfigSemantic(decoded, nil, &finding)
+	effective, effectiveErr := effectiveGrokSystemConfigForVersion(decoded, grokVersion)
+	if effectiveErr != nil {
+		return finding, false, fmt.Errorf("grok system configuration version overrides cannot be evaluated safely; refusing no-tools maintenance smoke")
+	}
+	walkGrokSystemConfigSemantic(effective, nil, &finding)
 	return finding, true, nil
+}
+
+// normalizeGrokConfigVersion extracts the semver reported by `grok --version`
+// and normalizes it for x/mod comparisons. Grok's output is prefixed (for
+// example, "grok 1.0.13"), while semver expects a leading v.
+func normalizeGrokConfigVersion(raw string) string {
+	match := semverRe.FindString(strings.TrimSpace(raw))
+	if match == "" {
+		return ""
+	}
+	version := "v" + match
+	if !semver.IsValid(version) {
+		return ""
+	}
+	return version
+}
+
+func normalizeGrokOverrideBound(value any) string {
+	raw, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "v")
+	if raw == "" {
+		return ""
+	}
+	version := "v" + raw
+	if !semver.IsValid(version) {
+		return ""
+	}
+	return version
+}
+
+// effectiveGrokSystemConfigForVersion applies Grok's documented inclusive
+// [[version_overrides]] patches before semantic classification. Each entry has
+// required minimum_version/maximum_version selectors and carries its patch keys
+// directly. Inactive historical/future entries are deliberately not walked;
+// malformed selectors fail closed because their applicability is unknowable.
+func effectiveGrokSystemConfigForVersion(decoded map[string]any, grokVersion string) (map[string]any, error) {
+	effective := cloneGrokSemanticTable(decoded)
+	var rawOverrides any
+	overrideKeys := 0
+	for rawKey, value := range effective {
+		if normalizeGrokSemanticKey(rawKey) == "version_overrides" {
+			rawOverrides = value
+			delete(effective, rawKey)
+			overrideKeys++
+		}
+	}
+	if overrideKeys == 0 {
+		return effective, nil
+	}
+	if overrideKeys != 1 {
+		return nil, fmt.Errorf("ambiguous version overrides")
+	}
+	runtimeVersion := normalizeGrokConfigVersion(grokVersion)
+	if runtimeVersion == "" {
+		// The ACP policy preflight historically scans every entry conservatively
+		// and does not know its CLI version. Preserve that behavior; maintenance
+		// smokes always supply the probed installed version above.
+		return decoded, nil
+	}
+	overrides, ok := grokVersionOverrideTables(rawOverrides)
+	if !ok {
+		return nil, fmt.Errorf("invalid version overrides")
+	}
+	for _, override := range overrides {
+		var minimum, maximum string
+		minimumKeys, maximumKeys := 0, 0
+		patch := make(map[string]any, len(override))
+		for rawKey, value := range override {
+			switch normalizeGrokSemanticKey(rawKey) {
+			case "minimum_version":
+				minimumKeys++
+				minimum = normalizeGrokOverrideBound(value)
+			case "maximum_version":
+				maximumKeys++
+				maximum = normalizeGrokOverrideBound(value)
+			default:
+				patch[rawKey] = value
+			}
+		}
+		if minimumKeys != 1 || maximumKeys != 1 || minimum == "" || maximum == "" || semver.Compare(minimum, maximum) > 0 {
+			return nil, fmt.Errorf("invalid version override bounds")
+		}
+		if semver.Compare(runtimeVersion, minimum) < 0 || semver.Compare(runtimeVersion, maximum) > 0 {
+			continue
+		}
+		mergeGrokSemanticTable(effective, patch)
+	}
+	return effective, nil
+}
+
+func grokVersionOverrideTables(value any) ([]map[string]any, bool) {
+	switch entries := value.(type) {
+	case []map[string]any:
+		return entries, true
+	case []any:
+		out := make([]map[string]any, 0, len(entries))
+		for _, entry := range entries {
+			table, ok := entry.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, table)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func cloneGrokSemanticTable(source map[string]any) map[string]any {
+	clone := make(map[string]any, len(source))
+	for key, value := range source {
+		if table, ok := value.(map[string]any); ok {
+			clone[key] = cloneGrokSemanticTable(table)
+		} else {
+			clone[key] = value
+		}
+	}
+	return clone
+}
+
+// mergeGrokSemanticTable follows Grok's recursive config-patch behavior. TOML
+// keys remain case-sensitive during the merge; the later classifier still
+// normalizes every surviving spelling conservatively. Treating differently
+// cased keys as the same merge target could let an ignored lookalike overwrite
+// the real effective security setting before classification.
+func mergeGrokSemanticTable(destination, patch map[string]any) {
+	for patchKey, patchValue := range patch {
+		destinationKey := patchKey
+		patchTable, patchIsTable := patchValue.(map[string]any)
+		destinationTable, destinationIsTable := destination[destinationKey].(map[string]any)
+		if patchIsTable && destinationIsTable {
+			mergeGrokSemanticTable(destinationTable, patchTable)
+			continue
+		}
+		if patchIsTable {
+			destination[destinationKey] = cloneGrokSemanticTable(patchTable)
+		} else {
+			destination[destinationKey] = patchValue
+		}
+	}
 }
 
 func normalizeGrokSemanticKey(key string) string {
@@ -2036,7 +2186,7 @@ func detectPinnedSystemGrokRequirementsFile(path string, allowAPIKey, allowAlway
 	// this ACP preflight's historical best-effort behavior on unreadable or
 	// malformed files; the stricter maintenance smoke calls the same inspector
 	// directly and fails closed on those errors.
-	if finding, ok, semanticErr := inspectGrokSystemConfigSemantic(path); semanticErr == nil && ok {
+	if finding, ok, semanticErr := inspectGrokSystemConfigSemantic(path, ""); semanticErr == nil && ok {
 		if !allowAPIKey && finding.credential {
 			return fmt.Errorf("grok requirements pin API-key auth in %s; refusing to spawn — set Config.EnableGrokAPIKeyFallback=true to opt in, or remove the pinned credential", path)
 		}

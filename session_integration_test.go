@@ -426,6 +426,15 @@ func runMockCLI(mode string) {
 // replacement. Failures expose only a generic protocol error, never argv,
 // prompt-file contents, or billing-log data.
 func runMockGrokMaintenanceSmoke(mode string) {
+	// Model Grok's documented diagnostics for both `--version` and the smoke:
+	// if the parent leaks either override, the probe/output is contaminated and
+	// GROK_LOG_FILE persists raw output outside the isolated home.
+	if os.Getenv("RUST_LOG") != "" {
+		fmt.Fprintln(os.Stderr, "debug-stderr-contamination-sentinel")
+	}
+	if logPath := os.Getenv("GROK_LOG_FILE"); logPath != "" {
+		_ = os.WriteFile(logPath, []byte("external-log-sentinel"), 0o600)
+	}
 	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		if mode == "grok-maintenance-smoke-v1" {
 			fmt.Println("grok 1.0.5")
@@ -495,6 +504,9 @@ func runMockGrokMaintenanceSmoke(mode string) {
 		os.Getenv("GROK_AUTH_PROVIDER_ACCESS_TOKEN") != "" || os.Getenv("GROK_AGENT") != "" ||
 		os.Getenv("GROK_DEFAULT_MODEL") != "" || os.Getenv("GROK_MODELS_BASE_URL") != "" ||
 		os.Getenv("GROK_MODELS_LIST_URL") != "" || os.Getenv("GROK_XAI_API_BASE_URL") != "" ||
+		os.Getenv("GROK_SANDBOX") != "" || os.Getenv("GROK_SANDBOX_AUTO_ALLOW_BASH") != "" ||
+		os.Getenv("GROK_LOG_FILE") != "" || os.Getenv("GROK_FUTURE_EXECUTION_OVERRIDE") != "" ||
+		os.Getenv("RUST_LOG") != "" || os.Getenv("RUST_BACKTRACE") != "" || os.Getenv("RUST_LIB_BACKTRACE") != "" ||
 		mockHasArg(args, "--always-approve") || mockHasArg(args, "--auto-approve") || !compatibilityDisabled ||
 		hasExternalLoader ||
 		mockHasArg(args, grokMaintenanceSmokeControlArg) ||
@@ -825,6 +837,7 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 	vendorHome := t.TempDir()
 	projectRoot := t.TempDir()
 	projectCwd := filepath.Join(projectRoot, "workspace")
+	externalLogPath := filepath.Join(t.TempDir(), "raw-grok-diagnostics.log")
 	seedGrokHomeWithLogin(t, realHome)
 	if err := os.WriteFile(filepath.Join(realHome, "config.toml"), []byte(
 		"[plugins]\nenabled = [\"host-plugin\"]\n[mcp_servers.host-mcp]\ncommand = \"raw-config-sentinel\"\n",
@@ -884,10 +897,27 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 	t.Setenv("GROK_CONFIG_PATH", "config-path-sentinel")
 	t.Setenv("GROK_PLUGIN_ROOT", "plugin-path-sentinel")
 	t.Setenv("GROK_WORKSPACE_ROOT", "workspace-path-sentinel")
+	t.Setenv("GROK_SANDBOX", "sandbox-profile-sentinel")
+	t.Setenv("GROK_SANDBOX_AUTO_ALLOW_BASH", "1")
+	t.Setenv("GROK_LOG_FILE", externalLogPath)
+	t.Setenv("GROK_FUTURE_EXECUTION_OVERRIDE", "future-execution-sentinel")
+	t.Setenv("RUST_LOG", "xai_grok=debug-stderr-sentinel")
+	t.Setenv("RUST_BACKTRACE", "1")
+	t.Setenv("RUST_LIB_BACKTRACE", "1")
 	t.Setenv(mockGrokPersistentHomeEnv, realHome)
 	t.Setenv(mockGrokVendorHomeEnv, vendorHome)
 	t.Setenv(mockGrokProjectRootEnv, projectRoot)
-	configureTestGrokSystemLayers(t, "[compat.cursor]\nmcps = false\n[compat.claude]\nmcps = false\n")
+	configureTestGrokSystemLayers(t, `version_overrides = [
+  { minimum_version = "0.9.0", maximum_version = "1.0.4", mcp_servers = { historical-sentinel = { command = "must-stay-inactive" } } },
+  { minimum_version = "1.0.0", maximum_version = "1.0.9", compat = { cursor = { mcps = false } } },
+  { minimum_version = "1.0.10", maximum_version = "1.0.20", compat = { claude = { mcps = false } } },
+  { minimum_version = "1.0.14", maximum_version = "2.0.0", plugins = { enabled = ["future-sentinel"] } },
+]
+[compat.cursor]
+mcps = false
+[compat.claude]
+mcps = false
+`)
 	SetCLIAgentCatalog([]cliAgentCatalogEntry{{
 		ID: "grok", DisplayName: "Grok Build", Command: "grok",
 	}})
@@ -955,6 +985,9 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 	// fetch rather than two distinct nanosecond observations rendered alike.
 	time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second + 10*time.Millisecond)))
 	post := run("grok-maintenance-smoke-v2")
+	if _, err := os.Stat(externalLogPath); !os.IsNotExist(err) {
+		t.Fatalf("maintenance smoke created external diagnostics log %q: %v", externalLogPath, err)
+	}
 	if pre.Version == post.Version || !strings.Contains(pre.Version, "1.0.5") || !strings.Contains(post.Version, "1.0.13") {
 		t.Fatalf("test did not exercise the 1.0.5 -> 1.0.13 replacement: pre=%q post=%q", pre.Version, post.Version)
 	}

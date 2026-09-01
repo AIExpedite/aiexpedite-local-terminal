@@ -1250,7 +1250,7 @@ func TestInspectClaudeManagedSettingsAllowRule_FailsClosedOnUnsafeFiles(t *testi
 				claudeManagedSettingsPathsFn = origClaudePaths
 			})
 
-			err := detectGrokMaintenanceSmokeSystemConfig()
+			err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13")
 			if err == nil {
 				t.Fatal("unsafe managed settings were accepted")
 			}
