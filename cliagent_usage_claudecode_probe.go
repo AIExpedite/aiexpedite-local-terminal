@@ -353,8 +353,20 @@ type claudeUsageProbeGate struct {
 	mu          sync.Mutex
 	inFlight    bool
 	lastAttempt time.Time
-	force       bool
-	armed       bool
+	// force is a bypass RESERVED for the refresh that set it. It is handed to a
+	// caller only by claimForce, which reads and clears it under one lock, and
+	// begin() never touches it — begin takes the bypass as an argument instead.
+	//
+	// That ownership is the whole point. When begin() consumed the flag itself,
+	// a post-run or routine probe reaching begin() in the window between
+	// SetClaudeUsageForceProbe(true) and the refresh's own read would spend the
+	// refresh's bypass: the refresh then saw force == false, skipped the join
+	// that exists for exactly this case, was refused by the single-flight slot
+	// that background probe still held, and signed the receipt from the cache it
+	// had loaded before that request landed — the stale latestObservedAt this
+	// file exists to fix, reintroduced by the mechanism meant to prevent it.
+	force bool
+	armed bool
 	// failures counts CONSECUTIVE failed probes and drives the backoff in
 	// interval(). Cleared by any success or early skip.
 	failures int
@@ -403,6 +415,10 @@ var claudeUsageProbe claudeUsageProbeGate
 // SetOpenCodeReadinessForceProbe: a user who just pressed Refresh must not be
 // served a reading held back by a throttle they cannot see. Single-flight still
 // applies — a forced probe joins an in-flight one rather than duplicating it.
+//
+// The bypass belongs to the refresh that set it: only claimForce takes it, and
+// only refreshClaudeUsageIfStale calls claimForce. A post-run or routine probe
+// racing the refresh cannot spend it — see the `force` field.
 func SetClaudeUsageForceProbe(force bool) {
 	claudeUsageProbe.mu.Lock()
 	claudeUsageProbe.force = force
@@ -496,9 +512,14 @@ func claudeUsageProbeMinIntervalValue() time.Duration {
 }
 
 // begin reserves the single-flight slot, returning false when another probe is
-// running or the minimum interval has not elapsed. A pending force consumes
-// itself here so exactly one probe per refresh bypasses the interval.
-func (g *claudeUsageProbeGate) begin(now time.Time) bool {
+// running or the minimum interval has not elapsed.
+//
+// `forced` is the bypass the CALLER already claimed from the gate, never the
+// pending flag: begin must not consume a bypass on behalf of a caller that did
+// not ask for one, or a background probe silently spends the refresh's (see the
+// `force` field). Everything above the interval check — arm state, single
+// flight, a 429 hold, offline — outranks it.
+func (g *claudeUsageProbeGate) begin(now time.Time, forced bool) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !g.armed || g.inFlight {
@@ -513,10 +534,9 @@ func (g *claudeUsageProbeGate) begin(now time.Time) bool {
 	if IsOffline() {
 		return false
 	}
-	if !g.force && !g.lastAttempt.IsZero() && now.Sub(g.lastAttempt) < g.interval() {
+	if !forced && !g.lastAttempt.IsZero() && now.Sub(g.lastAttempt) < g.interval() {
 		return false
 	}
-	g.force = false
 	g.inFlight = true
 	g.lastAttempt = now
 	g.doneCh = make(chan struct{})
@@ -762,11 +782,29 @@ func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError, refreshed bo
 }
 
 // forced reports whether a refresh has asked for the next probe to bypass the
-// interval, without consuming the flag.
+// interval, without consuming the flag. Diagnostic/assertion use only — a caller
+// that intends to SPEND the bypass must use claimForce, or it leaves the flag
+// standing for whichever probe reaches the gate next.
 func (g *claudeUsageProbeGate) forced() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.force
+}
+
+// claimForce takes ownership of a pending refresh bypass: it reports whether one
+// was outstanding and clears it in the same critical section, so exactly one
+// caller can spend a given SetClaudeUsageForceProbe(true).
+//
+// Its only caller is refreshClaudeUsageIfStale, which is the only path a
+// user-initiated refresh takes. Once claimed, the bypass travels as an explicit
+// argument down through probeClaudeUsage to begin(), so a concurrent post-run or
+// routine probe can neither consume it nor be accelerated by it.
+func (g *claudeUsageProbeGate) claimForce() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	claimed := g.force
+	g.force = false
+	return claimed
 }
 
 // armedForProbe reports whether a probe could run at all in this process.
@@ -937,8 +975,11 @@ func claudeUsageProbeURL() string {
 // runClaudeUsageProbe is the POST-RUN entry point: a Claude run has just
 // finished and consumed quota, so only an observation recorded after `now` can
 // substitute for this probe.
-func runClaudeUsageProbe(ctx context.Context, now time.Time) (bool, *cliAgentUsageError) {
-	refreshed, _, probeErr := probeClaudeUsage(ctx, now, claudeUsageProbeStoredIdentity, now)
+//
+// `forced` must be a bypass the caller CLAIMED (claimForce); it is never read
+// from the gate here, so a post-run probe cannot spend a refresh's bypass.
+func runClaudeUsageProbe(ctx context.Context, now time.Time, forced bool) (bool, *cliAgentUsageError) {
+	refreshed, _, probeErr := probeClaudeUsage(ctx, now, claudeUsageProbeStoredIdentity, now, forced)
 	return refreshed, probeErr
 }
 
@@ -957,6 +998,7 @@ func probeClaudeUsage(
 	now time.Time,
 	resolveIdentity func() claudeUsageProbeIdentity,
 	dedupeBaseline time.Time,
+	forced bool,
 ) (refreshed bool, observedAt time.Time, probeErr *cliAgentUsageError) {
 	// An already-cancelled gather must not burn the throttle slot on a request
 	// that cannot complete: the next caller would then be refused for a minute
@@ -964,7 +1006,7 @@ func probeClaudeUsage(
 	if ctx.Err() != nil {
 		return false, time.Time{}, nil
 	}
-	if !claudeUsageProbe.begin(now) {
+	if !claudeUsageProbe.begin(now, forced) {
 		return false, time.Time{}, nil
 	}
 	// Release the single-flight latch on EVERY path out of here. begin() has
@@ -1195,7 +1237,11 @@ func claudeUsageProbeStatus(raw string) string {
 // Returns whether the cache was refreshed, so the caller knows whether it must
 // re-read before shaping the metrics.
 func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, accessToken, fingerprint string) bool {
-	forced := claudeUsageProbe.forced()
+	// CLAIM the bypass rather than peeking at it: this is the only path a
+	// user-initiated refresh takes, so taking ownership here is what stops a
+	// concurrent post-run or routine probe from spending it in begin() and
+	// leaving this refresh to sign the cache it loaded before that probe landed.
+	forced := claudeUsageProbe.claimForce()
 	// An outstanding post-run debt overrides the staleness TTL: a reading taken
 	// BEFORE the run is not "fresh enough" just because it is recent, and this is
 	// the backstop for a trailing probe that was too far out to schedule or that
@@ -1223,34 +1269,55 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 			baseline = now.Add(-window)
 		}
 	}
+	identity := claudeUsageProbeIdentity{token: accessToken, fingerprint: fingerprint}
+	resolveIdentity := func() claudeUsageProbeIdentity { return identity }
 	// A forced refresh joins a probe that already holds the single-flight slot
 	// rather than being turned away by it — see joinInFlight. Done BEFORE our own
 	// attempt so the answer already on the wire is the one the user gets; if it
 	// wrote nothing we fall through and issue the request ourselves, the slot now
-	// being free and `force` still pending.
+	// being free and the bypass ours to spend.
+	//
+	// Two passes, because "in flight" is not a state we sampled once. The first
+	// join covers a probe already on the wire when the refresh arrived; the
+	// second covers one that claimed the slot in the gap between that join and
+	// our own begin(), which would otherwise refuse us and leave the refresh
+	// reporting the pre-probe cache. Bounded at two — a third would be an
+	// unbounded wait on a queue this process does not control — and each join is
+	// itself bounded by the gather context and claudeUsageProbeJoinTimeout.
 	if forced {
-		// A joined reading answers the refresh only when it is at least as new as
-		// what we owe. A probe that started BEFORE the run persists a PRE-run
-		// observation: accepting it would settle the run's debt with a timestamp
-		// that predates the run, sign that timestamp into the receipt, and leave
-		// the already-scheduled trailing probe to exit finding nothing owed. When
-		// it does not cover the debt we fall through and ask ourselves, the slot
-		// now free and `force` still pending.
-		if joined, joinedAt := claudeUsageProbe.joinInFlight(ctx); joined &&
-			!joinedAt.IsZero() && (!owing || claudeUsageObservationCovers(joinedAt, owed)) {
-			if owing {
-				claudeUsageProbe.settleOwed(owed)
+		for pass := 0; pass < 2; pass++ {
+			// A joined reading answers the refresh only when it is at least as new
+			// as what we owe. A probe that started BEFORE the run persists a PRE-run
+			// observation: accepting it would settle the run's debt with a timestamp
+			// that predates the run, sign that timestamp into the receipt, and leave
+			// the already-scheduled trailing probe to exit finding nothing owed.
+			joined, joinedAt := claudeUsageProbe.joinInFlight(ctx)
+			if joined && !joinedAt.IsZero() && (!owing || claudeUsageObservationCovers(joinedAt, owed)) {
+				if owing {
+					claudeUsageProbe.settleOwed(owed)
+				}
+				// The bypass was claimed above, so nothing is left pending for a
+				// later routine gather to inherit.
+				return true
 			}
-			// Consume the force the joined probe effectively served, so the next
-			// routine gather is throttled normally instead of inheriting a bypass
-			// nobody asked for.
-			SetClaudeUsageForceProbe(false)
-			return true
+			if pass > 0 {
+				break // the second join was the retry; do not loop on the slot
+			}
+			refreshed, observedAt, probeErr := probeClaudeUsage(ctx, now, resolveIdentity, baseline, true)
+			logClaudeUsageProbeFailure(probeErr)
+			if refreshed {
+				// Same settle rule as the routine path below.
+				if owing && claudeUsageObservationCovers(observedAt, owed) {
+					claudeUsageProbe.settleOwed(owed)
+				}
+				return true
+			}
+			// Refused or failed. If the slot was taken while we were asking, the
+			// next pass joins that probe instead of reporting a stale reading.
 		}
+		return false
 	}
-	identity := claudeUsageProbeIdentity{token: accessToken, fingerprint: fingerprint}
-	refreshed, observedAt, probeErr := probeClaudeUsage(ctx, now,
-		func() claudeUsageProbeIdentity { return identity }, baseline)
+	refreshed, observedAt, probeErr := probeClaudeUsage(ctx, now, resolveIdentity, baseline, false)
 	logClaudeUsageProbeFailure(probeErr)
 	// Settle only on an observation that actually covers the run — the same test
 	// the join above applies, for the same reason. `now` is ParseContext's gather
@@ -1349,7 +1416,10 @@ func claudeUsageProbeAfterRun(completedAt time.Time) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), claudeUsageProbeTimeout)
 	defer cancel()
-	refreshed, observedAt, probeErr := probeClaudeUsage(ctx, time.Now(), claudeUsageProbeStoredIdentity, baseline)
+	// forced=false: this is the background trailing probe. It must never spend a
+	// bypass a concurrent refresh is holding — that theft is what leaves the
+	// refresh signing a pre-probe cache.
+	refreshed, observedAt, probeErr := probeClaudeUsage(ctx, time.Now(), claudeUsageProbeStoredIdentity, baseline, false)
 	logClaudeUsageProbeFailure(probeErr)
 	// Same rule as the gather path: a write that left the run's window owned by
 	// an older reading has not paid this debt, even though it succeeded.

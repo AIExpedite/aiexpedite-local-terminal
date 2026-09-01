@@ -93,7 +93,7 @@ func TestClaudeUsageProbe_WritesFreshBuckets(t *testing.T) {
 		}))
 	})
 
-	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
+	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false)
 	if !refreshed || probeErr != nil {
 		t.Fatalf("runClaudeUsageProbe: refreshed=%v err=%+v", refreshed, probeErr)
 	}
@@ -168,7 +168,7 @@ func TestClaudeUsageProbe_AdvancesObservedAtAfterHeartbeatOnlyRun(t *testing.T) 
 			before, observedAtRFC3339(seeded.UnixMilli()))
 	}
 
-	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 		t.Fatalf("runClaudeUsageProbe: refreshed=%v err=%+v", refreshed, probeErr)
 	}
 
@@ -249,7 +249,7 @@ func TestClaudeUsageProbe_FailuresLeaveCacheByteIdentical(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
+			refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false)
 			if refreshed {
 				t.Error("a failed probe must not report the cache as refreshed")
 			}
@@ -286,7 +286,7 @@ func TestClaudeUsageProbe_DoesNotFollowRedirects(t *testing.T) {
 		http.Redirect(w, r, sink.URL, http.StatusFound)
 	})
 
-	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
+	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false)
 	if refreshed {
 		t.Error("a redirect must not be treated as a reading")
 	}
@@ -317,7 +317,7 @@ func TestClaudeUsageProbe_ConnectionRefusedLeavesCacheAlone(t *testing.T) {
 	dead.Close()
 	t.Setenv(claudeUsageProbeEndpointEnv, url)
 
-	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
+	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false)
 	if refreshed {
 		t.Error("a refused connection must not report a refresh")
 	}
@@ -354,7 +354,7 @@ func TestClaudeUsageProbe_PersistsNoNonMetricFields(t *testing.T) {
 		}`, now.Add(time.Hour).Unix())
 	})
 
-	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 		t.Fatalf("runClaudeUsageProbe: refreshed=%v err=%+v", refreshed, probeErr)
 	}
 
@@ -391,7 +391,7 @@ func TestClaudeUsageProbe_SkipConditions(t *testing.T) {
 	t.Run("disable_claude_usage_probe", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, ok)
 		SetClaudeUsageProbeDisabled(true)
-		if refreshed, _ := runClaudeUsageProbe(context.Background(), now); refreshed {
+		if refreshed, _ := runClaudeUsageProbe(context.Background(), now, false); refreshed {
 			t.Error("opt-out must skip the probe")
 		}
 		if got := atomic.LoadInt64(calls); got != 0 {
@@ -404,7 +404,7 @@ func TestClaudeUsageProbe_SkipConditions(t *testing.T) {
 		if err := os.Remove(filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")); err != nil {
 			t.Fatal(err)
 		}
-		if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); refreshed || probeErr != nil {
+		if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); refreshed || probeErr != nil {
 			t.Errorf("refreshed=%v err=%+v, want a silent skip", refreshed, probeErr)
 		}
 		if got := atomic.LoadInt64(calls); got != 0 {
@@ -415,7 +415,7 @@ func TestClaudeUsageProbe_SkipConditions(t *testing.T) {
 	t.Run("unarmed process makes no call", func(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, ok)
 		resetClaudeUsageProbeGate() // leaves the gate unarmed
-		if refreshed, _ := runClaudeUsageProbe(context.Background(), now); refreshed {
+		if refreshed, _ := runClaudeUsageProbe(context.Background(), now, false); refreshed {
 			t.Error("an unarmed process must not probe")
 		}
 		if got := atomic.LoadInt64(calls); got != 0 {
@@ -438,7 +438,7 @@ func TestClaudeUsageProbe_SkipConditions(t *testing.T) {
 		t.Run("non-loopback override refused: "+override, func(t *testing.T) {
 			_, calls := armClaudeUsageProbe(t, ok)
 			t.Setenv(claudeUsageProbeEndpointEnv, override)
-			refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
+			refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false)
 			if refreshed {
 				t.Error("the bearer token must never be sent to an overridden remote host")
 			}
@@ -473,10 +473,10 @@ func TestClaudeUsageProbe_ThrottleAndSingleFlight(t *testing.T) {
 		_, calls := armClaudeUsageProbe(t, body)
 		t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
 
-		if refreshed, _ := runClaudeUsageProbe(context.Background(), now); !refreshed {
+		if refreshed, _ := runClaudeUsageProbe(context.Background(), now, false); !refreshed {
 			t.Fatal("first probe should run")
 		}
-		if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now.Add(time.Second)); refreshed || probeErr != nil {
+		if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now.Add(time.Second), false); refreshed || probeErr != nil {
 			t.Errorf("second probe inside the interval: refreshed=%v err=%+v, want a silent skip", refreshed, probeErr)
 		}
 		if got := atomic.LoadInt64(calls); got != 1 {
@@ -490,8 +490,9 @@ func TestClaudeUsageProbe_ThrottleAndSingleFlight(t *testing.T) {
 		if err := os.Remove(os.Getenv("AIEXPEDITE_CLAUDE_RL_CACHE")); err != nil {
 			t.Fatal(err)
 		}
-		SetClaudeUsageForceProbe(true)
-		if refreshed, _ := runClaudeUsageProbe(context.Background(), now.Add(2*time.Second)); !refreshed {
+		// The bypass is passed in, not read from the gate: only the refresh path
+		// claims it (see TestClaudeUsageProbe_BackgroundProbeCannotSpendTheRefreshBypass).
+		if refreshed, _ := runClaudeUsageProbe(context.Background(), now.Add(2*time.Second), true); !refreshed {
 			t.Error("a forced probe must bypass the minimum interval")
 		}
 		if got := atomic.LoadInt64(calls); got != 2 {
@@ -511,7 +512,7 @@ func TestClaudeUsageProbe_ThrottleAndSingleFlight(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, _ = runClaudeUsageProbe(context.Background(), now)
+				_, _ = runClaudeUsageProbe(context.Background(), now, false)
 			}()
 		}
 		// Give the losers time to hit the latch and return before the winner's
@@ -934,7 +935,7 @@ func TestCLIUsageRefreshReceipt_CarriesProbeObservationWithoutProbeFields(t *tes
 		fmt.Fprintf(w, `{"five_hour":{"used_percentage":64,"resets_at":%d,"status":"allowed"}}`,
 			now.Add(time.Hour).Unix())
 	})
-	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 		t.Fatalf("runClaudeUsageProbe: refreshed=%v err=%+v", refreshed, probeErr)
 	}
 	if _, err := os.Stat(cache); err != nil {
@@ -1098,7 +1099,7 @@ func TestClaudeUsageProbe_AbsentStatusIsNotPersisted(t *testing.T) {
 		fmt.Fprintf(w, `{"five_hour":{"used_percentage":37,"resets_at":%d}}`, now.Add(time.Hour).Unix())
 	})
 
-	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 		t.Fatalf("runClaudeUsageProbe: refreshed=%v err=%+v", refreshed, probeErr)
 	}
 	raw, err := os.ReadFile(cache)
@@ -1129,10 +1130,10 @@ func TestClaudeUsageProbe_PersistentFailureBacksOff(t *testing.T) {
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "1000") // 1s base
 
 	// First failure: retried after the flat minimum.
-	if _, probeErr := runClaudeUsageProbe(context.Background(), now); probeErr == nil {
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now, false); probeErr == nil {
 		t.Fatal("an unplottable body must be reported as a failure")
 	}
-	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(1500*time.Millisecond)); probeErr == nil {
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(1500*time.Millisecond), false); probeErr == nil {
 		t.Fatal("the first retry should still happen at the flat minimum")
 	}
 	if got := atomic.LoadInt64(calls); got != 2 {
@@ -1140,7 +1141,7 @@ func TestClaudeUsageProbe_PersistentFailureBacksOff(t *testing.T) {
 	}
 
 	// Two failures in: the interval has doubled, so the same 1.5s gap is refused.
-	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(3*time.Second)); probeErr != nil {
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(3*time.Second), false); probeErr != nil {
 		t.Errorf("probe inside the backed-off interval should be a silent skip, got %+v", probeErr)
 	}
 	if got := atomic.LoadInt64(calls); got != 2 {
@@ -1148,7 +1149,7 @@ func TestClaudeUsageProbe_PersistentFailureBacksOff(t *testing.T) {
 	}
 
 	// Past the doubled interval it retries again.
-	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(6*time.Second)); probeErr == nil {
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(6*time.Second), false); probeErr == nil {
 		t.Error("the probe must still retry once the backed-off interval elapses")
 	}
 	if got := atomic.LoadInt64(calls); got != 3 {
@@ -1166,13 +1167,61 @@ func TestClaudeUsageProbe_ForceBypassesTheBackoff(t *testing.T) {
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
 
 	for i := 0; i < 3; i++ {
-		SetClaudeUsageForceProbe(true)
-		if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(time.Duration(i)*time.Second)); probeErr == nil {
+		if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(time.Duration(i)*time.Second), true); probeErr == nil {
 			t.Fatalf("probe %d should have failed", i)
 		}
 	}
 	if got := atomic.LoadInt64(calls); got != 3 {
 		t.Errorf("request count=%d, want 3 — a forced refresh must bypass the backoff", got)
+	}
+}
+
+// The bypass belongs to the refresh that set it, and CLAIMING it is what makes
+// that true. While begin() consumed the flag itself, a post-run or routine probe
+// reaching the gate in the window between SetClaudeUsageForceProbe(true) and the
+// refresh's own read spent the refresh's bypass: the refresh then saw
+// force == false, skipped the join that exists for exactly this case, was
+// refused by the throttle its own bypass covered, and reported no refresh — so
+// the receipt carried the cache loaded before the fresh reading landed. That is
+// the staleness this file exists to fix, reintroduced by its own throttle.
+func TestClaudeUsageProbe_BackgroundProbeCannotSpendTheRefreshBypass(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":41,"resets_at":%d,"status":"allowed"}`,
+				now.Add(3*time.Hour).Unix()),
+		}))
+	})
+	// Wide enough that only a bypass gets a second request through it.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "600000")
+
+	// The refresh handler arms the bypass...
+	SetClaudeUsageForceProbe(true)
+	// ...and a post-run probe reaches the gate before the refresh reads it.
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
+		t.Fatalf("post-run probe: refreshed=%v err=%+v", refreshed, probeErr)
+	}
+	if !claudeUsageProbe.forced() {
+		t.Fatal("a background probe consumed the refresh's bypass")
+	}
+
+	// The refresh now arrives well inside the minimum interval. It must still
+	// issue its own request rather than report the pre-refresh reading.
+	if !refreshClaudeUsageIfStale(context.Background(), now.Add(time.Second), now, probeTestToken, "") {
+		t.Error("the forced refresh was throttled by a window its own bypass covers")
+	}
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Errorf("request count=%d, want 2 — the refresh must issue its own request", got)
+	}
+	if claudeUsageProbe.forced() {
+		t.Error("the refresh must claim the bypass, not leave one pending for the next gather")
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("no snapshot on disk")
+	}
+	if got, want := snap.Buckets[claudeWindowFiveHour].ObservedAtMs, now.Add(time.Second).UnixMilli(); got != want {
+		t.Errorf("ObservedAtMs=%d, want the refresh's own observation %d", got, want)
 	}
 }
 
@@ -1191,15 +1240,15 @@ func TestClaudeUsageProbe_SuccessClearsTheBackoff(t *testing.T) {
 	t.Setenv(claudeUsageProbeMinIntervalEnv, "1000")
 
 	// Two failures, so the interval is now 4s.
-	if _, probeErr := runClaudeUsageProbe(context.Background(), now); probeErr == nil {
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now, false); probeErr == nil {
 		t.Fatal("expected the first failure")
 	}
-	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(2*time.Second)); probeErr == nil {
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(2*time.Second), false); probeErr == nil {
 		t.Fatal("expected the second failure")
 	}
 
 	healthy.Store(true)
-	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now.Add(10*time.Second)); !refreshed || probeErr != nil {
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now.Add(10*time.Second), false); !refreshed || probeErr != nil {
 		t.Fatalf("recovery probe: refreshed=%v err=%+v", refreshed, probeErr)
 	}
 	if got := atomic.LoadInt64(calls); got != 3 {
@@ -1207,7 +1256,7 @@ func TestClaudeUsageProbe_SuccessClearsTheBackoff(t *testing.T) {
 	}
 
 	// Streak cleared: the flat 1s minimum applies again, not the backed-off one.
-	if refreshed, _ := runClaudeUsageProbe(context.Background(), now.Add(12*time.Second)); !refreshed {
+	if refreshed, _ := runClaudeUsageProbe(context.Background(), now.Add(12*time.Second), false); !refreshed {
 		t.Error("a success must clear the failure streak and restore the flat minimum")
 	}
 	if got := atomic.LoadInt64(calls); got != 4 {
@@ -1275,7 +1324,7 @@ func TestResetClaudeUsageProbeGate_DrainsInFlightProbe(t *testing.T) {
 	t.Cleanup(releaseHandler)
 
 	go func() {
-		_, _ = runClaudeUsageProbe(context.Background(), time.Now())
+		_, _ = runClaudeUsageProbe(context.Background(), time.Now(), false)
 	}()
 
 	// Wait until the probe is genuinely mid-request, which is exactly the state
@@ -1385,7 +1434,7 @@ func TestClaudeUsageProbe_DecodesLimitsArray(t *testing.T) {
 			weekReset.Format(time.RFC3339))
 	})
 
-	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 		t.Fatalf("runClaudeUsageProbe: refreshed=%v err=%+v", refreshed, probeErr)
 	}
 	snap, ok := loadClaudeRateLimitSnapshot(cache)
@@ -1439,7 +1488,7 @@ func TestClaudeUsageProbe_FallsBackToLegacyWindows(t *testing.T) {
 		cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, `{"five_hour":{"used_percentage":25,"resets_at":%d}}`, reset.Unix())
 		})
-		if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+		if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 			t.Fatalf("refreshed=%v err=%+v", refreshed, probeErr)
 		}
 		snap, _ := loadClaudeRateLimitSnapshot(cache)
@@ -1452,7 +1501,7 @@ func TestClaudeUsageProbe_FallsBackToLegacyWindows(t *testing.T) {
 		_, _ = armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, `{"limits":null,"five_hour":null,"seven_day":null}`)
 		})
-		refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
+		refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false)
 		if refreshed {
 			t.Error("an all-null payload is not an observation")
 		}
@@ -1468,7 +1517,7 @@ func TestClaudeUsageProbe_FallsBackToLegacyWindows(t *testing.T) {
 				"five_hour":{"used_percentage":10,"resets_at":%d}
 			}`, reset.Unix(), reset.Unix())
 		})
-		if refreshed, _ := runClaudeUsageProbe(context.Background(), now); !refreshed {
+		if refreshed, _ := runClaudeUsageProbe(context.Background(), now, false); !refreshed {
 			t.Fatal("expected a reading")
 		}
 		snap, _ := loadClaudeRateLimitSnapshot(cache)
@@ -1536,7 +1585,7 @@ func TestClaudeUsageProbe_InheritedEnvCredentialsDoNotSuppressTheProbe(t *testin
 			})
 			t.Setenv(envVar, "inherited-from-the-developer-shell")
 
-			if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+			if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 				t.Fatalf("refreshed=%v err=%+v — the daemon environment says nothing about "+
 					"which credential the spawned Claude used", refreshed, probeErr)
 			}
@@ -1594,7 +1643,7 @@ func TestClaudeUsageProbe_UnwritableCacheIsNotARefresh(t *testing.T) {
 	}
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(blocker, "sub", "rl.json"))
 
-	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now)
+	refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false)
 	if refreshed {
 		t.Error("an unwritable cache must not be reported as a refresh")
 	}
@@ -1617,12 +1666,11 @@ func TestClaudeUsageProbe_HonorsRetryAfter(t *testing.T) {
 		w.WriteHeader(http.StatusTooManyRequests)
 	})
 
-	if _, probeErr := runClaudeUsageProbe(context.Background(), now); probeErr == nil {
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now, false); probeErr == nil {
 		t.Fatal("a 429 must be reported as a failure")
 	}
 	// Even a user-initiated refresh must respect an explicit hold.
-	SetClaudeUsageForceProbe(true)
-	if refreshed, _ := runClaudeUsageProbe(context.Background(), now.Add(30*time.Second)); refreshed {
+	if refreshed, _ := runClaudeUsageProbe(context.Background(), now.Add(30*time.Second), true); refreshed {
 		t.Error("probed again inside the Retry-After window")
 	}
 	if got := atomic.LoadInt64(calls); got != 1 {
@@ -1630,8 +1678,7 @@ func TestClaudeUsageProbe_HonorsRetryAfter(t *testing.T) {
 	}
 
 	// Past the hold it resumes.
-	SetClaudeUsageForceProbe(true)
-	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(3*time.Minute)); probeErr == nil {
+	if _, probeErr := runClaudeUsageProbe(context.Background(), now.Add(3*time.Minute), true); probeErr == nil {
 		t.Error("expected the probe to resume after the Retry-After window")
 	}
 	if got := atomic.LoadInt64(calls); got != 2 {
@@ -1697,7 +1744,7 @@ func TestClaudeUsageProbe_SuppressedDuplicateDoesNotWedgeTheGate(t *testing.T) {
 		},
 	}, now.Add(2*time.Second), "", claudeRateLimitSourceProbe)
 
-	if refreshed, _ := runClaudeUsageProbe(context.Background(), now); refreshed {
+	if refreshed, _ := runClaudeUsageProbe(context.Background(), now, false); refreshed {
 		t.Fatal("precondition: an observation newer than the run should suppress the probe")
 	}
 	if got := atomic.LoadInt64(calls); got != 0 {
@@ -1707,7 +1754,7 @@ func TestClaudeUsageProbe_SuppressedDuplicateDoesNotWedgeTheGate(t *testing.T) {
 	// A later run must still be able to probe. Without the latch released on the
 	// suppressed path, this is rejected forever.
 	later := now.Add(10 * time.Minute)
-	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), later); !refreshed {
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), later, false); !refreshed {
 		t.Fatalf("gate is wedged: the suppressed duplicate left inFlight set, so no probe can run "+
 			"again in this process (refreshed=%v err=%+v)", refreshed, probeErr)
 	}
@@ -1740,7 +1787,7 @@ func TestClaudeUsageProbe_RecentPreRunObservationDoesNotSuppressPostRunProbe(t *
 		},
 	}, preRun, "", claudeRateLimitSourceStatusLine)
 
-	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 		t.Fatalf("refreshed=%v err=%+v — a reading taken BEFORE the run cannot substitute "+
 			"for the probe that run earned", refreshed, probeErr)
 	}
@@ -1823,7 +1870,7 @@ func TestClaudeUsageProbe_DecodesLiveLimitsShape(t *testing.T) {
 			reset.Format(time.RFC3339))
 	})
 
-	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 		t.Fatalf("runClaudeUsageProbe: refreshed=%v err=%+v", refreshed, probeErr)
 	}
 	snap, ok := loadClaudeRateLimitSnapshot(cache)
@@ -1922,7 +1969,7 @@ func TestClaudeUsageProbe_ReadsTheCredentialStoreOnce(t *testing.T) {
 	}
 	t.Cleanup(func() { claudeKeychainReader = original })
 
-	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now); !refreshed || probeErr != nil {
+	if refreshed, probeErr := runClaudeUsageProbe(context.Background(), now, false); !refreshed || probeErr != nil {
 		t.Fatalf("refreshed=%v err=%+v", refreshed, probeErr)
 	}
 	if got := atomic.LoadInt64(calls); got != 1 {
@@ -2310,7 +2357,7 @@ func TestClaudeUsageProbe_ForcedRefreshJoinsInFlightProbe(t *testing.T) {
 	})
 
 	// The post-run probe, still awaiting its response.
-	go func() { _, _ = runClaudeUsageProbe(context.Background(), now) }()
+	go func() { _, _ = runClaudeUsageProbe(context.Background(), now, false) }()
 	<-inFlight
 
 	// The user presses Refresh mid-flight.
@@ -2356,7 +2403,7 @@ func TestClaudeUsageProbe_ForcedRefreshRetriesAfterFailedInFlightProbe(t *testin
 		}))
 	})
 
-	go func() { _, _ = runClaudeUsageProbe(context.Background(), now) }()
+	go func() { _, _ = runClaudeUsageProbe(context.Background(), now, false) }()
 	<-inFlight
 
 	SetClaudeUsageForceProbe(true)
@@ -2407,7 +2454,7 @@ func TestClaudeUsageProbe_ForcedRefreshDoesNotSettleRunDebtWithPreRunJoin(t *tes
 	})
 
 	// A probe that was already in flight when the run finished.
-	go func() { _, _ = runClaudeUsageProbe(context.Background(), preRun) }()
+	go func() { _, _ = runClaudeUsageProbe(context.Background(), preRun, false) }()
 	<-inFlight
 
 	// The run completes, then the user presses Refresh mid-flight.
@@ -2456,7 +2503,7 @@ func TestClaudeUsageProbe_ForcedRefreshSettlesRunDebtWithPostRunJoin(t *testing.
 	})
 
 	claudeUsageProbe.recordOwed(runAt)
-	go func() { _, _ = runClaudeUsageProbe(context.Background(), postRun) }()
+	go func() { _, _ = runClaudeUsageProbe(context.Background(), postRun, false) }()
 	<-inFlight
 
 	SetClaudeUsageForceProbe(true)
@@ -2496,7 +2543,7 @@ func TestClaudeUsageProbe_ForcedRefreshJoinHonorsContext(t *testing.T) {
 		<-release
 	})
 
-	go func() { _, _ = runClaudeUsageProbe(context.Background(), now) }()
+	go func() { _, _ = runClaudeUsageProbe(context.Background(), now, false) }()
 	<-inFlight
 
 	SetClaudeUsageForceProbe(true)
