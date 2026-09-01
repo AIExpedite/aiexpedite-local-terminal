@@ -8,6 +8,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -351,6 +352,12 @@ func copyPrevStatusLine(src, dst string) error {
 	if err != nil {
 		return err
 	}
+	return writePrevStatusLineBytes(dst, b)
+}
+
+// writePrevStatusLineBytes is the single writer for a stash copy, so the
+// owner-only mode above cannot drift between the two callers that produce one.
+func writePrevStatusLineBytes(dst string, b []byte) error {
 	return os.WriteFile(dst, b, 0o600)
 }
 
@@ -370,6 +377,17 @@ func copyPrevStatusLine(src, dst string) error {
 // refresh reports an error. Copying leaves both paths valid, and the duplicate
 // costs one small JSON file until the caller retires oldPrev.
 //
+// The stash at oldPrev is the AUTHORITY whenever it exists, including when
+// newPrev is already occupied. oldPrev is the path the command settings.json
+// currently holds is pinned to, so it is the chain target Claude resolves right
+// now; anything sitting at newPrev is a leftover from an earlier cycle under
+// that config dir (a migration whose settings write failed, a stash written
+// before the dir last moved, or a truncated file from a crashed write). Retiring
+// oldPrev because the destination merely EXISTS would hand the refreshed command
+// that leftover — the hook would chain to a status line the user has since
+// replaced, and opt-out would restore the wrong object or none at all. So the
+// destination is compared and replaced unless it already matches byte for byte.
+//
 // "Nothing to migrate" is not a failure — an unset/unchanged oldPrev or an
 // absent oldPrev return an empty path and nil. Every other outcome IS a failure
 // and is returned, because silently continuing is what loses the user's
@@ -378,22 +396,23 @@ func migratePrevStatusLine(oldPrev, newPrev string) (staleCopy string, err error
 	if oldPrev == "" || oldPrev == newPrev {
 		return "", nil
 	}
-	if _, err := os.Stat(newPrev); err == nil {
-		// Already migrated (or a fresh stash lives there). Nothing to copy, but
-		// oldPrev is still a duplicate the committed command will no longer
-		// name, so it is retired on the same terms as one we just wrote — after
-		// the write, not before it.
-		return oldPrev, nil
-	} else if !os.IsNotExist(err) {
-		// Can't tell whether the new stash exists — proceeding would pin the
-		// command to a path we were unable to verify.
-		return "", err
-	}
-	if _, err := os.Stat(oldPrev); err != nil {
+	src, err := os.ReadFile(oldPrev)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil // no stash to carry over; the chain target never existed
 		}
 		return "", err
+	}
+	switch dst, dstErr := os.ReadFile(newPrev); {
+	case dstErr == nil && bytes.Equal(dst, src):
+		// Already migrated. Nothing to write — but oldPrev is still a duplicate
+		// the committed command will no longer name, so it is retired on the
+		// same terms as one we just wrote: after the write, not before it.
+		return oldPrev, nil
+	case dstErr != nil && !os.IsNotExist(dstErr):
+		// Can't tell what the new stash holds — proceeding would pin the command
+		// to a path we were unable to verify.
+		return "", dstErr
 	}
 	if err := os.MkdirAll(filepath.Dir(newPrev), 0o755); err != nil {
 		return "", err
@@ -403,7 +422,7 @@ func migratePrevStatusLine(oldPrev, newPrev string) (staleCopy string, err error
 	// previously chained command (potentially including inline env vars / tokens)
 	// to other local users. Copying also crosses filesystems, which os.Rename
 	// cannot (EXDEV) when e.g. XDG_CONFIG_HOME moved to a mounted drive.
-	if err := copyPrevStatusLine(oldPrev, newPrev); err != nil {
+	if err := writePrevStatusLineBytes(newPrev, src); err != nil {
 		return "", err
 	}
 	return oldPrev, nil

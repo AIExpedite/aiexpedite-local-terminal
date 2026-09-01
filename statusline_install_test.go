@@ -727,20 +727,22 @@ func TestMigratePrevStatusLine_NoOpCasesSucceed(t *testing.T) {
 		t.Errorf("no-op migration must not create the new stash; err=%v", err)
 	}
 
-	// A stash already at newPrev wins: the old one is left alone, not copied over.
-	if err := os.WriteFile(newPrev, []byte(`{"new":true}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// An identical stash already at newPrev is the already-migrated case: no
+	// write, and the old copy is still reported for post-commit cleanup.
 	oldPrev := filepath.Join(dir, "old-prev.json")
 	if err := os.WriteFile(oldPrev, []byte(`{"old":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(newPrev, []byte(`{"old":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeMtime := statModTime(t, newPrev)
 	stale, err := migratePrevStatusLine(oldPrev, newPrev)
 	if err != nil {
-		t.Errorf("pre-existing new stash must not be a failure, got %v", err)
+		t.Errorf("pre-existing identical stash must not be a failure, got %v", err)
 	}
-	if got, _ := os.ReadFile(newPrev); string(got) != `{"new":true}` {
-		t.Errorf("existing new stash must not be overwritten, got %s", got)
+	if got := statModTime(t, newPrev); !got.Equal(beforeMtime) {
+		t.Errorf("an identical destination must not be rewritten; mtime %v -> %v", beforeMtime, got)
 	}
 	// The old copy is reported for post-commit cleanup, not removed here: the
 	// command settings.json still holds is the one pinned to oldPrev.
@@ -749,6 +751,59 @@ func TestMigratePrevStatusLine_NoOpCasesSucceed(t *testing.T) {
 	}
 	if _, err := os.Stat(oldPrev); err != nil {
 		t.Errorf("old stash must survive until the settings write commits: %v", err)
+	}
+}
+
+func statModTime(t *testing.T, path string) time.Time {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return st.ModTime()
+}
+
+// A stash sitting at newPrev is NOT automatically the one to keep. It can be a
+// leftover from an earlier cycle under that config dir — a migration whose
+// settings write failed, a stash written before the dir last moved, or a file
+// truncated by a crashed write — while oldPrev holds the command settings.json
+// is pinned to right now. Retiring oldPrev in favour of that leftover hands the
+// refreshed hook a status line the user has already replaced, and leaves opt-out
+// restoring the wrong object. The live stash must win.
+func TestMigratePrevStatusLine_ReplacesADivergentDestination(t *testing.T) {
+	dir := t.TempDir()
+	oldPrev := filepath.Join(dir, "old-prev.json")
+	newPrev := filepath.Join(dir, "moved", "new-prev.json")
+
+	live := []byte(`{"statusLine":{"type":"command","command":"current-third-party.sh"}}`)
+	if err := os.WriteFile(oldPrev, live, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(newPrev), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Two ways the destination can be wrong: superseded content, and a half
+	// written file. Both must lose to the stash the installed command names.
+	for _, leftover := range []string{
+		`{"statusLine":{"type":"command","command":"superseded.sh"}}`,
+		`{"statusLine":{"type":"comm`,
+	} {
+		if err := os.WriteFile(newPrev, []byte(leftover), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stale, err := migratePrevStatusLine(oldPrev, newPrev)
+		if err != nil {
+			t.Fatalf("migratePrevStatusLine(%q): %v", leftover, err)
+		}
+		if got, _ := os.ReadFile(newPrev); string(got) != string(live) {
+			t.Errorf("destination must be replaced by the live stash, got %s", got)
+		}
+		if stale != oldPrev {
+			t.Errorf("staleCopy=%q, want %q", stale, oldPrev)
+		}
+		if _, err := os.Stat(oldPrev); err != nil {
+			t.Errorf("old stash must survive until the settings write commits: %v", err)
+		}
 	}
 }
 
