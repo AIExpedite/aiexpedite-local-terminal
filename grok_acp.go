@@ -2055,12 +2055,12 @@ func classifyGrokSystemSemanticValue(path []string, value any, finding *grokSyst
 		switch {
 		case component == "mcp" || component == "mcps" || component == "mcpservers" ||
 			strings.HasPrefix(component, "mcp_") || strings.HasPrefix(component, "mcpserver"):
-			if finding.toolCategory == "" {
+			if finding.toolCategory == "" && semanticGrokToolEnabled(value) {
 				finding.toolCategory = "mcp"
 			}
 		case component == "plugin" || component == "plugins" ||
 			strings.HasPrefix(component, "plugin_") || strings.HasPrefix(component, "installed_plugin"):
-			if finding.toolCategory == "" {
+			if finding.toolCategory == "" && semanticGrokToolEnabled(value) {
 				finding.toolCategory = "plugin"
 			}
 		}
@@ -2209,6 +2209,76 @@ func semanticGrokValueNonEmpty(value any) bool {
 func semanticGrokBool(value any) bool {
 	enabled, ok := value.(bool)
 	return ok && enabled
+}
+
+func semanticGrokToolEnabled(value any) bool {
+	switch node := value.(type) {
+	case nil:
+		return false
+	case bool:
+		return node
+	case string:
+		return strings.TrimSpace(node) != ""
+	case []any:
+		for _, child := range node {
+			if semanticGrokToolEnabled(child) {
+				return true
+			}
+		}
+		return false
+	case []map[string]any:
+		for _, child := range node {
+			if semanticGrokToolEnabled(child) {
+				return true
+			}
+		}
+		return false
+	case []string:
+		for _, child := range node {
+			if strings.TrimSpace(child) != "" {
+				return true
+			}
+		}
+		return false
+	case map[string]any:
+		if len(node) == 0 {
+			return false
+		}
+		hasExplicitEnablement := false
+		isEnabled := false
+		hasOtherDefinitions := false
+		for rawKey, child := range node {
+			key := normalizeGrokSemanticKey(rawKey)
+			switch key {
+			case "enabled":
+				hasExplicitEnablement = true
+				if b, ok := child.(bool); ok {
+					if b {
+						isEnabled = true
+					}
+				} else if semanticGrokToolEnabled(child) {
+					isEnabled = true
+				}
+			case "disabled":
+				hasExplicitEnablement = true
+				if b, ok := child.(bool); ok {
+					if !b {
+						isEnabled = true
+					}
+				}
+			default:
+				if semanticGrokToolEnabled(child) {
+					hasOtherDefinitions = true
+				}
+			}
+		}
+		if hasExplicitEnablement && !isEnabled && !hasOtherDefinitions {
+			return false
+		}
+		return isEnabled || hasOtherDefinitions
+	default:
+		return true
+	}
 }
 
 // detectPinnedSystemGrokRequirementsFile is the per-path scanner that backs

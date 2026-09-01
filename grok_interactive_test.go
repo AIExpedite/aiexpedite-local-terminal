@@ -489,6 +489,31 @@ func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools
 		t.Fatalf("explicitly disabled external telemetry must remain valid: %v", err)
 	}
 
+	for _, emptyConfig := range []struct {
+		name string
+		body string
+	}{
+		{"empty mcp_servers table", "mcp_servers = {}\n"},
+		{"empty mcp_servers section", "[mcp_servers]\n"},
+		{"empty mcps array", "mcps = []\n"},
+		{"empty mcpservers section", "[mcpservers]\n"},
+		{"disabled mcp_servers section", "[mcp_servers]\nenabled = false\n"},
+		{"empty plugins table", "plugins = {}\n"},
+		{"empty plugins section", "[plugins]\n"},
+		{"empty plugins enabled array inline", "plugins = { enabled = [] }\n"},
+		{"empty plugins enabled array section", "[plugins]\nenabled = []\n"},
+		{"disabled plugins section", "[plugins]\nenabled = false\n"},
+	} {
+		t.Run(emptyConfig.name, func(t *testing.T) {
+			if err := os.WriteFile(managedPath, []byte(emptyConfig.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
+				t.Fatalf("empty/disabled tool configuration %q was unexpectedly rejected: %v", emptyConfig.body, err)
+			}
+		})
+	}
+
 	if err := os.WriteFile(managedPath, []byte(strings.Repeat("#", (1<<20)+1)), 0o600); err != nil {
 		t.Fatal(err)
 	}
