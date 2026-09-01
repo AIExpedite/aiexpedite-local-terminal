@@ -116,3 +116,32 @@ func TestShouldCloseStdinAfterStart(t *testing.T) {
 		})
 	}
 }
+
+// Managed-path twin of TestClaudeNativeWriteUserTurnClearsSettledTurn: a
+// follow-up delivered through SendInput reopens the utilization debt, so a
+// session killed after accepting it — but before its next stdout line clears
+// the flag — still takes waitForExit's abnormal-exit probe.
+func TestSendInputClearsSettledTurn(t *testing.T) {
+	sm := NewSessionManager(nil)
+	session := &CLISession{
+		ID:            "followup-turn",
+		Command:       "claude",
+		Status:        "running",
+		Stdin:         nopWriteCloser{},
+		processExited: make(chan struct{}),
+		done:          make(chan struct{}),
+		streamDone:    make(chan struct{}),
+	}
+	session.turnSettled.Store(true)
+	sm.mu.Lock()
+	sm.sessions[session.ID] = session
+	sm.mu.Unlock()
+
+	if err := sm.SendInput(session.ID, "one more thing"); err != nil {
+		t.Fatalf("SendInput: %v", err)
+	}
+	if session.turnSettled.Load() {
+		t.Fatal("turnSettled must be cleared when a follow-up turn is accepted, " +
+			"otherwise an abnormal exit before the next frame skips the utilization probe")
+	}
+}

@@ -9,6 +9,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -626,6 +627,54 @@ func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
 		claudeStatusLineReconcile.mu.Unlock()
 	}
 	return changed, nil
+}
+
+// claudeStatusLineReconcileWait bounds how long a run start will wait on the
+// reconcile above. The check is one Stat in the common case, but Claude's config
+// directory is user-pointed (CLAUDE_CONFIG_DIR) and can sit on a slow or
+// unreachable network filesystem, where os.Stat/ReadFile/WriteFile honour no
+// deadline of ours — the caller would block for the OS mount timeout. Starting a
+// run must never pay that: this is a best-effort repair for the NEXT interactive
+// render, not a precondition for the run about to launch.
+const claudeStatusLineReconcileWait = 1500 * time.Millisecond
+
+// reconcileClaudeStatusLineHookBounded runs ensureClaudeStatusLineHookIfStale on
+// its own goroutine and waits at most claudeStatusLineReconcileWait for it,
+// logging the outcome under the caller's label.
+//
+// On timeout the reconcile is LEFT RUNNING — abandoning it is what keeps the
+// start unblocked — and that is bounded too: the gate's single-flight `running`
+// latch means a wedged filesystem parks exactly ONE goroutine, and every later
+// start short-circuits on that same latch. The degraded state is "no reconcile
+// until the filesystem answers", never a goroutine or settings.json storm.
+//
+// Callers must invoke this OUTSIDE any lock other operations need. A stalled
+// best-effort repair that holds a manager mutex stops being best-effort: it
+// blocks every unrelated session operation with it.
+func reconcileClaudeStatusLineHookBounded(label string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		changed, err := ensureClaudeStatusLineHookIfStale(home)
+		switch {
+		case err != nil:
+			fmt.Printf("%s[%s] Could not reconcile Claude status-line hook: %v%s\n",
+				colorYellow, label, err, colorReset)
+		case changed:
+			fmt.Printf("%s[%s] Repaired Claude status-line hook after a settings.json change%s\n",
+				colorGreen, label, colorReset)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(claudeStatusLineReconcileWait):
+		fmt.Printf("%s[%s] Claude status-line hook reconcile is slow; continuing without it%s\n",
+			colorYellow, label, colorReset)
+	}
 }
 
 // removeClaudeStatusLineHook reverses ensureClaudeStatusLineHook so the opt-out

@@ -594,3 +594,31 @@ func TestClaudeNativeLifecycle_RejectionFrameSurvivesProbeWiring(t *testing.T) {
 	}
 	t.Fatal("expected the claude_native_ratelimit frame to still publish unchanged")
 }
+
+// A follow-up turn on a live session must reopen the utilization debt. The
+// stdout scanner is the only other writer of turnSettled and it clears the flag
+// per line — so a session that emitted `result`, accepted a follow-up, and was
+// then killed before producing its next frame still looked "settled" to
+// waitForExit, which skipped the abnormal-exit probe and dropped that turn's
+// quota from the card.
+func TestClaudeNativeWriteUserTurnClearsSettledTurn(t *testing.T) {
+	m := NewClaudeNativeManager(nil)
+	session := &ClaudeNativeSession{
+		ID:            "followup-turn",
+		status:        "running",
+		Stdin:         nopWriteCloser{},
+		processExited: make(chan struct{}),
+		done:          make(chan struct{}),
+		streamDone:    make(chan struct{}),
+	}
+	// The prior turn ended on its `result` frame, exactly as readStream leaves it.
+	session.turnSettled.Store(true)
+
+	if err := m.writeUserTurn(session, "one more thing"); err != nil {
+		t.Fatalf("writeUserTurn: %v", err)
+	}
+	if session.turnSettled.Load() {
+		t.Fatal("turnSettled must be cleared when a follow-up turn is accepted, " +
+			"otherwise an abnormal exit before the next frame skips the utilization probe")
+	}
+}

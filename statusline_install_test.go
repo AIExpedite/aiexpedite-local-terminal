@@ -587,3 +587,47 @@ func TestEnsureClaudeStatusLineHookIfStale_ConcurrentStartsReconcileOnce(t *test
 		t.Errorf("our own hook was stashed as the previous command: %q", prev)
 	}
 }
+
+// The run-start reconcile is best-effort, but Claude's config dir is user-pointed
+// (CLAUDE_CONFIG_DIR) and can sit on a slow or unreachable filesystem where
+// Stat/ReadFile/WriteFile honour no deadline of ours. A start must never inherit
+// that wait — in the managed path it used to run under sm.mu, so one stalled
+// repair would have blocked every unrelated session operation with it.
+//
+// The stall is modelled by holding the reconcile gate's own mutex, which is the
+// first thing ensureClaudeStatusLineHookIfStale takes: the helper's goroutine
+// parks there exactly as it would inside a hung syscall, and the caller must
+// still come back within its bound.
+func TestReconcileClaudeStatusLineHookBoundedReturnsWhileRepairStalls(t *testing.T) {
+	home, _ := armStatusLineReconcile(t)
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	claudeStatusLineReconcile.mu.Lock()
+
+	returned := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		reconcileClaudeStatusLineHookBounded("test")
+		returned <- time.Since(start)
+	}()
+
+	select {
+	case elapsed := <-returned:
+		if elapsed < claudeStatusLineReconcileWait {
+			// It must have WAITED for the repair, not skipped it: the common case
+			// is one Stat and the ordering (repair before the child launches) is
+			// the whole point of the run-start reconcile.
+			t.Fatalf("returned after %v, before the %v bound — the reconcile was not awaited",
+				elapsed, claudeStatusLineReconcileWait)
+		}
+	case <-time.After(claudeStatusLineReconcileWait + 10*time.Second):
+		claudeStatusLineReconcile.mu.Unlock()
+		t.Fatal("reconcileClaudeStatusLineHookBounded blocked on a stalled repair")
+	}
+
+	// Release the parked goroutine into a no-op rather than a real reconcile, so
+	// it cannot outlive the test and race this test's temp dirs.
+	claudeStatusLineReconcile.optOut = true
+	claudeStatusLineReconcile.mu.Unlock()
+}

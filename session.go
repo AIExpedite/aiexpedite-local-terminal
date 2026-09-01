@@ -197,6 +197,21 @@ type PublishFunc func(res resultMsg)
 // StartSession creates and starts a new interactive CLI session. The process
 // is spawned with stdin/stdout/stderr pipes and output is streamed via publishFn.
 func (sm *SessionManager) StartSession(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, tty bool, publishFn PublishFunc) error {
+	// Re-verify Claude's status-line hook before launching a claude session. A
+	// Claude Code update rewrites settings.json and can drop our `statusLine`,
+	// silently stopping the only writer that carries numeric utilization on
+	// interactive renders — invisible until someone notices the card frozen.
+	// Throttled and mtime-gated (see ensureClaudeStatusLineHookIfStale), so the
+	// common case is one Stat.
+	//
+	// Deliberately OUTSIDE sm.mu, and bounded: Claude's config dir can live on a
+	// slow or unreachable filesystem, and a best-effort repair that stalls while
+	// holding the manager lock would block every unrelated session operation
+	// with it, not just this launch. Same placement as ClaudeNativeManager.Start.
+	if isClaudeCommand(command) {
+		reconcileClaudeStatusLineHookBounded("session")
+	}
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -346,24 +361,6 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		// through unchanged (shellDashCPayload only matches a shell -c wrapper).
 		ptyArgs := shapeShellWrappedPTYArgs(command, cliArgs)
 		return sm.startPTYSession(id, command, ptyArgs, cwd, workspaceID, uid, timeoutMs, publishFn)
-	}
-
-	// Re-verify Claude's status-line hook before launching a claude session. A
-	// Claude Code update rewrites settings.json and can drop our `statusLine`,
-	// silently stopping the only writer that carries numeric utilization on
-	// interactive renders — invisible until someone notices the card frozen.
-	// Throttled and mtime-gated (see ensureClaudeStatusLineHookIfStale), so the
-	// common case is one Stat. Best-effort: never blocks the session.
-	if isClaudeCommand(command) {
-		if hookHome, err := os.UserHomeDir(); err == nil {
-			if changed, err := ensureClaudeStatusLineHookIfStale(hookHome); err != nil {
-				fmt.Printf("%s[session] Could not reconcile Claude status-line hook: %v%s\n",
-					colorYellow, err, colorReset)
-			} else if changed {
-				fmt.Printf("%s[session] Repaired Claude status-line hook after a settings.json change%s\n",
-					colorGreen, colorReset)
-			}
-		}
 	}
 
 	// grok's headless mode takes its prompt on argv (`-p <prompt>`) and does NOT
@@ -641,6 +638,16 @@ func (sm *SessionManager) SendInput(id, text string) error {
 	} else if isAntigravityCommand(session.Command) {
 		payload = antigravityStreamUserMessage(text)
 	}
+
+	// A follow-up turn is being delivered, so an earlier terminal `result` no
+	// longer describes the end of this run — the quota this turn spends has not
+	// been probed for. Cleared BEFORE the write, and unconditionally: the stdout
+	// scanner clears it per line, but a session killed (or exited) after the turn
+	// is accepted and before it produces its next line would otherwise still look
+	// settled to waitForExit and skip the abnormal-exit probe. Clearing early can
+	// at worst schedule one extra throttled probe for a write that then failed;
+	// the opposite error silently drops a turn's usage.
+	session.turnSettled.Store(false)
 
 	// Write input with timeout to prevent deadlock if the CLI process's
 	// stdin pipe buffer is full (e.g., process is stalled or blocked).

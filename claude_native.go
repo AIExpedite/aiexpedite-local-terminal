@@ -227,16 +227,10 @@ func (m *ClaudeNativeManager) Start(id, cwd string, extraArgs []string, initialP
 	// the only writer that carries numbers on interactive renders — with no
 	// symptom until someone notices the utilization card frozen. Throttled and
 	// mtime-gated (see ensureClaudeStatusLineHookIfStale), so the common case is
-	// one Stat. Best-effort: never blocks a run.
-	if hookHome, err := os.UserHomeDir(); err == nil {
-		if changed, err := ensureClaudeStatusLineHookIfStale(hookHome); err != nil {
-			fmt.Printf("%s[claude-native] Could not reconcile Claude status-line hook: %v%s\n",
-				colorYellow, err, colorReset)
-		} else if changed {
-			fmt.Printf("%s[claude-native] Repaired Claude status-line hook after a settings.json change%s\n",
-				colorGreen, colorReset)
-		}
-	}
+	// one Stat. Best-effort and time-bounded: a Claude config dir on a stalled
+	// filesystem can never hold up the spawn, and this runs before m.mu is taken
+	// so it cannot hold up the manager either.
+	reconcileClaudeStatusLineHookBounded("claude-native")
 
 	// Hold the manager mutex across the spawn so two concurrent Start calls for
 	// the same id can't double-spawn (TOCTOU).
@@ -392,6 +386,15 @@ func (m *ClaudeNativeManager) writeUserTurn(session *ClaudeNativeSession, text s
 	if session.Status() == "ended" {
 		return fmt.Errorf("claude native session %s has ended", session.ID)
 	}
+
+	// A follow-up turn is being delivered, so an earlier terminal `result` no
+	// longer describes the end of this run. Cleared BEFORE the write for the same
+	// reason as the managed path (session.go SendInput): readStream clears it per
+	// line, but a session killed — including by this function's own write-timeout
+	// escalation below — after the turn was accepted and before its next frame
+	// would still look settled to waitForExit and skip the abnormal-exit probe,
+	// dropping that turn's usage.
+	session.turnSettled.Store(false)
 
 	writeDone := make(chan error, 1)
 	go func() {
