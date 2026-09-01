@@ -1703,7 +1703,7 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 	if allowAPIKey && allowAlwaysApprove {
 		return nil
 	}
-	for _, p := range []string{grokSystemRequirementsPath, grokSystemManagedConfigPath} {
+	for _, p := range grokSystemConfigPathsFn() {
 		if err := detectPinnedSystemGrokRequirementsFile(p, allowAPIKey, allowAlwaysApprove); err != nil {
 			return err
 		}
@@ -1723,6 +1723,114 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 		}
 	}
 	return nil
+}
+
+// detectGrokMaintenanceSmokeSystemConfig applies the stricter system-layer
+// posture required by the subscription-only, no-tools maintenance smoke.
+// GROK_HOME isolation cannot hide xAI's system requirements/managed-config
+// layers, so first reuse the ACP credential/approval preflight and then refuse
+// external-tool definitions or settings that re-enable vendor MCP discovery.
+func detectGrokMaintenanceSmokeSystemConfig() error {
+	if err := detectPinnedSystemGrokRequirements(false, false); err != nil {
+		// The shared ACP diagnostic names the source path for operator repair.
+		// Maintenance-smoke results are externally published and have a stricter
+		// redaction contract, so retain only the classification here.
+		return fmt.Errorf("grok system configuration pins credentials or a permissive approval policy; refusing no-tools maintenance smoke")
+	}
+	for _, path := range grokSystemConfigPathsFn() {
+		setting, ok, err := grokSystemExternalToolSetting(path)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return fmt.Errorf("grok system configuration enables external tools via %q; refusing no-tools maintenance smoke", setting)
+		}
+	}
+	return nil
+}
+
+// grokSystemExternalToolSetting returns a normalized TOML key/section name,
+// never its value. System config may contain credentials, commands, or private
+// paths, so refusal errors must not echo raw file data.
+func grokSystemExternalToolSetting(path string) (string, bool, error) {
+	if path == "" {
+		return "", false, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("grok system configuration is unreadable; refusing no-tools maintenance smoke")
+	}
+	defer f.Close()
+
+	const maxBytes = 1 << 20
+	if info, statErr := f.Stat(); statErr != nil {
+		return "", false, fmt.Errorf("grok system configuration cannot be inspected; refusing no-tools maintenance smoke")
+	} else if info.Size() > maxBytes {
+		return "", false, fmt.Errorf("grok system configuration exceeds the inspection limit; refusing no-tools maintenance smoke")
+	}
+	scanner := bufio.NewScanner(io.LimitReader(f, maxBytes))
+	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+	var section string
+	for scanner.Scan() {
+		line := grokTOMLStripInlineComment(strings.TrimSpace(scanner.Text()))
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			// Trim both scalar-table and array-of-table brackets so
+			// [[mcp_servers]] cannot evade the namespace check.
+			section = normalizeGrokSystemToolKey(strings.Trim(line, "[] \t"))
+			if grokSystemToolNamespace(section) {
+				return section, true, nil
+			}
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := normalizeGrokSystemToolKey(strings.TrimSpace(line[:eq]))
+		qualified := key
+		if section != "" && !strings.Contains(key, ".") {
+			qualified = section + "." + key
+		}
+		value := strings.ToLower(strings.TrimSpace(line[eq+1:]))
+		if qualified == "compat.cursor.mcps" || qualified == "compat.claude.mcps" {
+			if value != "false" {
+				return qualified, true, nil
+			}
+			continue
+		}
+		if grokSystemToolNamespace(qualified) {
+			return qualified, true, nil
+		}
+	}
+	if scanner.Err() != nil {
+		return "", false, fmt.Errorf("grok system configuration cannot be parsed safely; refusing no-tools maintenance smoke")
+	}
+	return "", false, nil
+}
+
+func normalizeGrokSystemToolKey(value string) string {
+	value = strings.ToLower(strings.Trim(value, " \t\"'"))
+	value = strings.ReplaceAll(value, "-", "_")
+	return value
+}
+
+func grokSystemToolNamespace(value string) bool {
+	for _, component := range strings.Split(value, ".") {
+		component = strings.Trim(component, " \t\"'")
+		if component == "mcp" || component == "mcps" || component == "mcpservers" ||
+			strings.HasPrefix(component, "mcp_") || strings.HasPrefix(component, "mcpserver") ||
+			component == "plugin" || component == "plugins" ||
+			strings.HasPrefix(component, "plugin_") || strings.HasPrefix(component, "installed_plugin") {
+			return true
+		}
+	}
+	return false
 }
 
 // detectPinnedSystemGrokRequirementsFile is the per-path scanner that backs

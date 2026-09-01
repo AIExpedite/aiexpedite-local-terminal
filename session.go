@@ -195,6 +195,16 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		return fmt.Errorf("session %s already exists", id)
 	}
 
+	// Maintenance smokes carry an explicit AI Expedite control token inside the
+	// signed args array. Consume it before building Grok's argv so it can never
+	// reach the child. An empty --tools value on its own remains an ordinary
+	// caller request; it must not silently opt into the smoke's auth/config
+	// isolation policy.
+	grokMaintenanceSmoke := false
+	if isGrokCommand(command) {
+		args, grokMaintenanceSmoke = extractGrokMaintenanceSmokeControl(args)
+	}
+
 	// Build the CLI command with appropriate flags for structured streaming.
 	// stdinPrompt is non-empty when the target CLI transports its prompt outside
 	// argv (Claude/Antigravity NDJSON, Codex plain stdin).
@@ -202,15 +212,24 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	enableGrokAlwaysApprove := sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
 	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
 
-	// Grok's `--tools` selector filters built-in tools only. An explicit empty
-	// value is the maintenance smoke's no-tools contract, so the process must
-	// also be isolated from user-installed plugins and MCP discovery. Reuse the
-	// ACP auth-only home, but omit its persistent conversation-store link: this
-	// is a one-shot smoke and must not gain access to unrelated transcripts.
+	// Grok's `--tools` selector filters built-in tools only. An explicitly
+	// identified maintenance smoke must also be isolated from user-installed
+	// plugins and MCP discovery. Reuse the ACP auth-only home, but omit its
+	// persistent conversation-store link: this is a one-shot smoke and must not
+	// gain access to unrelated transcripts.
 	var isolatedGrokHome, persistentGrokHome string
-	if isGrokCommand(command) && grokArgsRequestNoTools(cliArgs) {
+	if grokMaintenanceSmoke {
+		if !grokArgsRequestNoTools(cliArgs) {
+			return fmt.Errorf("grok maintenance smoke requires an explicit empty --tools value")
+		}
 		if arg, ok := grokNoToolsExternalLoaderArg(cliArgs); ok {
 			return fmt.Errorf("grok no-tools invocation cannot load external agent/plugin/config option %q", arg)
+		}
+		if contractErr := validateGrokMaintenanceSmokeContract(cliArgs); contractErr != nil {
+			return contractErr
+		}
+		if preflightErr := detectGrokMaintenanceSmokeSystemConfig(); preflightErr != nil {
+			return fmt.Errorf("grok maintenance smoke system-config preflight failed: %w", preflightErr)
 		}
 		persistentGrokHome = grokPersistentHome()
 		var isolationErr error
@@ -2993,9 +3012,31 @@ func rewriteGrokPromptToFile(cliArgs []string) (newArgs []string, cleanupPath st
 	return rewritten, tempPath
 }
 
-// grokArgsRequestNoTools recognises the explicit empty built-in-tool filter
-// used by maintenance smokes. A missing --tools flag is not equivalent: it
-// leaves Grok's normal built-in tool set enabled.
+// grokMaintenanceSmokeControlArg is an AI Expedite-only control token carried
+// in the signed session_start args. It is consumed before Grok argv shaping and
+// must never be forwarded to the CLI.
+const grokMaintenanceSmokeControlArg = "--aiexpedite-maintenance-smoke"
+
+// extractGrokMaintenanceSmokeControl removes the internal maintenance-smoke
+// token and reports whether it was present. Keeping the signal separate from
+// --tools preserves ordinary no-tools invocations and their normal auth/config
+// behavior.
+func extractGrokMaintenanceSmokeControl(args []string) ([]string, bool) {
+	requested := false
+	cleaned := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == grokMaintenanceSmokeControlArg {
+			requested = true
+			continue
+		}
+		cleaned = append(cleaned, arg)
+	}
+	return cleaned, requested
+}
+
+// grokArgsRequestNoTools validates the smoke's explicit empty built-in-tool
+// filter. It is not itself a maintenance-smoke classifier; the separate signed
+// control token above selects that behavior.
 func grokArgsRequestNoTools(args []string) bool {
 	if len(args) < 5 || args[0] != "--output-format" || args[1] != "streaming-json" || args[2] != "--no-auto-update" {
 		return false
@@ -3021,15 +3062,53 @@ func grokArgsRequestNoTools(args []string) bool {
 	return false
 }
 
+// validateGrokMaintenanceSmokeContract requires every root-level control that
+// makes the signed smoke deterministic and tool-free. The internal signal by
+// itself never relaxes this contract: malformed maintenance requests fail
+// before auth is copied or a child is spawned.
+func validateGrokMaintenanceSmokeContract(args []string) error {
+	requiredFlags := []string{"--disable-web-search", "--no-subagents", "--verbatim"}
+	for _, required := range requiredFlags {
+		found := false
+		for _, arg := range args {
+			if arg == required {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("grok maintenance smoke requires %s", required)
+		}
+	}
+
+	maxTurns := ""
+	for i, arg := range args {
+		if arg == "--max-turns" && i+1 < len(args) {
+			maxTurns = args[i+1]
+			break
+		}
+		if value, ok := strings.CutPrefix(arg, "--max-turns="); ok {
+			maxTurns = value
+			break
+		}
+	}
+	if maxTurns != "1" {
+		return fmt.Errorf("grok maintenance smoke requires --max-turns 1")
+	}
+	return nil
+}
+
 // grokNoToolsExternalLoaderArg rejects caller-controlled loader surfaces that
-// would defeat the isolated no-tools home. The ordinary Grok path still
-// supports these flags; only the explicit `--tools ""` contract fails closed.
+// would defeat the isolated no-tools home. It returns only the canonical flag
+// name, never an equals-form value: those values can contain credentials, raw
+// agent JSON, or private file paths and are interpolated into a published start
+// error by StartSession.
 func grokNoToolsExternalLoaderArg(args []string) (string, bool) {
 	for _, arg := range args {
 		lower := strings.ToLower(arg)
 		for _, name := range []string{"--plugin-dir", "--config", "--agent", "--agents"} {
 			if lower == name || strings.HasPrefix(lower, name+"=") {
-				return arg, true
+				return name, true
 			}
 		}
 	}
@@ -3064,6 +3143,12 @@ func grokNoToolsExternalLoaderArg(args []string) (string, bool) {
 // Returns cliArgs only — there is no stdin prompt (stdinPromptFormat returns ""
 // for grok), the prompt is the value of `-p`.
 func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []string {
+	// gateSessionEntryCommand also invokes the argv builder before StartSession.
+	// Strip the internal signed control there as defence in depth; StartSession
+	// consumes it separately before calling this builder so it retains the
+	// explicit boolean that selects isolation.
+	args, _ = extractGrokMaintenanceSmokeControl(args)
+
 	// Grok flags that consume the NEXT token as their value — without this,
 	// e.g. `--model grok-4` would treat "grok-4" as a prompt word. The
 	// `--flag=value` form is one token and needs no entry here.

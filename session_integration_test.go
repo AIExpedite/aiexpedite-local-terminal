@@ -345,6 +345,19 @@ func runMockCLI(mode string) {
 	case "grok-maintenance-smoke-v1", "grok-maintenance-smoke-v2":
 		runMockGrokMaintenanceSmoke(mode)
 
+	case "grok-ordinary-no-tools":
+		args := os.Args[1:]
+		tools, hasTools := mockArgValue(args, "--tools")
+		if os.Getenv("GROK_HOME") != os.Getenv(mockGrokPersistentHomeEnv) ||
+			os.Getenv("XAI_API_KEY") != "credential-sentinel-api-key" ||
+			!hasTools || tools != "" || mockHasArg(args, grokMaintenanceSmokeControlArg) {
+			fmt.Fprintln(os.Stderr, "ordinary no-tools contract changed")
+			os.Exit(1)
+		}
+		fmt.Println(`{"type":"text","data":"ordinary-no-tools-ok"}`)
+		fmt.Println(`{"type":"end","stopReason":"end_turn"}`)
+		os.Exit(0)
+
 	case "grok-acp-usage-limit":
 		// Emit a single ACP `session/update` notification that carries a
 		// usage_limit_reached signal under params.update.sessionUpdate, then
@@ -448,6 +461,7 @@ func runMockGrokMaintenanceSmoke(mode string) {
 		strings.Contains(string(isolatedConfig), "host-plugin") ||
 		strings.Contains(string(isolatedConfig), "host-mcp") ||
 		os.Getenv("XAI_API_KEY") != "" || hasExternalLoader ||
+		mockHasArg(args, grokMaintenanceSmokeControlArg) ||
 		!hasTools || tools != "" || !hasMaxTurns || maxTurns != "1" ||
 		!hasOutputFormat || outputFormat != "streaming-json" ||
 		!mockHasArg(args, "--disable-web-search") || !mockHasArg(args, "--no-subagents") ||
@@ -792,6 +806,7 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 	t.Setenv("XAI_API_KEY", "credential-sentinel-api-key")
 	t.Setenv(mockGrokPersistentHomeEnv, realHome)
 	t.Setenv(mockGrokVendorHomeEnv, vendorHome)
+	configureTestGrokSystemLayers(t, "[compat.cursor]\nmcps = false\n[compat.claude]\nmcps = false\n")
 	SetCLIAgentCatalog([]cliAgentCatalogEntry{{
 		ID: "grok", DisplayName: "Grok Build", Command: "grok",
 	}})
@@ -800,6 +815,7 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 	t.Cleanup(resetVersionProbeCache)
 
 	smokeArgs := []string{
+		grokMaintenanceSmokeControlArg,
 		"--tools", "", "--disable-web-search", "--no-subagents", "--max-turns", "1", "--verbatim",
 		"Return exactly this marker and nothing else: " + grokMaintenanceSmokeMarker,
 	}
@@ -856,6 +872,45 @@ func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *test
 		t.Fatalf("post-update usage freshness did not advance: pre=%q (%v) post=%q (%v)",
 			pre.Metrics[0].ObservedAt, preErr, post.Metrics[0].ObservedAt, postErr)
 	}
+}
+
+func TestSessionLifecycle_GrokOrdinaryNoToolsPreservesNormalAuthAndHome(t *testing.T) {
+	realHome := t.TempDir()
+	t.Setenv("GROK_HOME", realHome)
+	t.Setenv("XAI_API_KEY", "credential-sentinel-api-key")
+	t.Setenv(mockGrokPersistentHomeEnv, realHome)
+
+	_, messages, err := captureSession(t, "grok-ordinary-no-tools", "grok", []string{"--tools", "", "ordinary prompt"}, "")
+	if err != nil {
+		t.Fatalf("ordinary no-tools session: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+	if got := concatStreamOutput(messages); got != "ordinary-no-tools-ok" {
+		t.Fatalf("ordinary no-tools output = %q, want %q", got, "ordinary-no-tools-ok")
+	}
+}
+
+func configureTestGrokSystemLayers(t *testing.T, managedBody string) {
+	t.Helper()
+	requirementsPath := filepath.Join(t.TempDir(), "requirements.toml")
+	managedPath := filepath.Join(t.TempDir(), "managed_config.toml")
+	if err := os.WriteFile(requirementsPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(managedPath, []byte(managedBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origRequirementsPath := grokSystemRequirementsPath
+	origManagedPath := grokSystemManagedConfigPath
+	origClaudePaths := claudeManagedSettingsPathsFn
+	grokSystemRequirementsPath = requirementsPath
+	grokSystemManagedConfigPath = managedPath
+	claudeManagedSettingsPathsFn = func() []string { return nil }
+	t.Cleanup(func() {
+		grokSystemRequirementsPath = origRequirementsPath
+		grokSystemManagedConfigPath = origManagedPath
+		claudeManagedSettingsPathsFn = origClaudePaths
+	})
 }
 
 // TestSessionLifecycle_CodexDeferredStdinPrompt covers the chat-direct flow

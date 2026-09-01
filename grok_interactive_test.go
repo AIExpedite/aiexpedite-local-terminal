@@ -40,6 +40,7 @@ func TestBuildGrokInteractiveArgs_StripsManagedFlagsAndPassesModel(t *testing.T)
 // list and exits with a protocol error before emitting the marker.
 func TestBuildGrokInteractiveArgs_PreservesNoToolsSmokeContract(t *testing.T) {
 	got := buildGrokInteractiveArgs([]string{
+		grokMaintenanceSmokeControlArg,
 		"--tools", "", "--disable-web-search", "--no-subagents",
 		"--max-turns", "1", "--verbatim", "return the marker",
 	}, false)
@@ -50,6 +51,25 @@ func TestBuildGrokInteractiveArgs_PreservesNoToolsSmokeContract(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("no-tools smoke argv = %#v, want %#v", got, want)
+	}
+}
+
+func TestExtractGrokMaintenanceSmokeControl_IsExplicitAndNeverForwarded(t *testing.T) {
+	ordinary := []string{"--tools", "", "marker"}
+	cleaned, requested := extractGrokMaintenanceSmokeControl(ordinary)
+	if requested || !reflect.DeepEqual(cleaned, ordinary) {
+		t.Fatalf("ordinary no-tools request became maintenance smoke: requested=%t cleaned=%#v", requested, cleaned)
+	}
+
+	controlled := []string{grokMaintenanceSmokeControlArg, "--tools", "", "marker"}
+	cleaned, requested = extractGrokMaintenanceSmokeControl(controlled)
+	if !requested || !reflect.DeepEqual(cleaned, ordinary) {
+		t.Fatalf("explicit maintenance control not consumed: requested=%t cleaned=%#v", requested, cleaned)
+	}
+	for _, arg := range buildGrokInteractiveArgs(controlled, false) {
+		if arg == grokMaintenanceSmokeControlArg {
+			t.Fatalf("internal maintenance control reached Grok argv")
+		}
 	}
 }
 
@@ -71,19 +91,156 @@ func TestGrokArgsRequestNoTools_RequiresExplicitEmptyValue(t *testing.T) {
 	}
 }
 
-func TestStartSession_GrokNoToolsRejectsExternalLoaders(t *testing.T) {
-	tests := [][]string{
-		{"--tools", "", "--plugin-dir", t.TempDir(), "marker"},
-		{"--tools=", "--config=plugins.enabled=['host-plugin']", "marker"},
-		{"--tools", "", "--agent", "agent-with-tools", "marker"},
-		{"--tools", "", `--agents={"worker":{"tools":["Bash"]}}`, "marker"},
+func TestValidateGrokMaintenanceSmokeContract_RequiresAllSafetyControls(t *testing.T) {
+	valid := buildGrokInteractiveArgs([]string{
+		"--tools", "", "--disable-web-search", "--no-subagents",
+		"--max-turns", "1", "--verbatim", "marker",
+	}, false)
+	if err := validateGrokMaintenanceSmokeContract(valid); err != nil {
+		t.Fatalf("valid maintenance contract rejected: %v", err)
 	}
-	for i, args := range tests {
+
+	for _, missing := range []string{"--disable-web-search", "--no-subagents", "--verbatim", "--max-turns"} {
+		trimmed := make([]string, 0, len(valid))
+		dropValue := false
+		for _, arg := range valid {
+			if dropValue {
+				dropValue = false
+				continue
+			}
+			if arg == missing {
+				dropValue = missing == "--max-turns"
+				continue
+			}
+			trimmed = append(trimmed, arg)
+		}
+		if err := validateGrokMaintenanceSmokeContract(trimmed); err == nil {
+			t.Errorf("contract missing %s was accepted: %#v", missing, trimmed)
+		}
+	}
+}
+
+func TestStartSession_GrokNoToolsRejectsExternalLoaders(t *testing.T) {
+	tests := []struct {
+		args       []string
+		wantFlag   string
+		secretText string
+	}{
+		{[]string{"--tools", "", "--plugin-dir=" + filepath.Join(t.TempDir(), "private-plugin"), "marker"}, "--plugin-dir", "private-plugin"},
+		{[]string{"--tools=", "--config=model.api_key='credential-sentinel'", "marker"}, "--config", "credential-sentinel"},
+		{[]string{"--tools", "", "--agent=private-agent-path", "marker"}, "--agent", "private-agent-path"},
+		{[]string{"--tools", "", `--agents={"worker":{"token":"credential-sentinel"}}`, "marker"}, "--agents", "credential-sentinel"},
+	}
+	for i, tc := range tests {
 		sm := NewSessionManager(nil)
+		args := append([]string{grokMaintenanceSmokeControlArg}, tc.args...)
 		err := sm.StartSession("grok-no-tools-loader", "grok", args, t.TempDir(), "ws", "uid", 1000, false, func(resultMsg) {})
 		if err == nil || !strings.Contains(err.Error(), "cannot load external") {
 			t.Errorf("case %d StartSession(%#v) error = %v, want external-loader rejection", i, args, err)
+			continue
 		}
+		if !strings.Contains(err.Error(), tc.wantFlag) {
+			t.Errorf("case %d error %q does not identify canonical flag %q", i, err, tc.wantFlag)
+		}
+		if strings.Contains(err.Error(), tc.secretText) || strings.Contains(err.Error(), "model.api_key") || strings.Contains(err.Error(), `"worker"`) {
+			t.Errorf("case %d rejection leaked loader value: %q", i, err)
+		}
+	}
+}
+
+func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools(t *testing.T) {
+	requirementsPath := filepath.Join(t.TempDir(), "requirements.toml")
+	managedPath := filepath.Join(t.TempDir(), "managed_config.toml")
+	origRequirementsPath := grokSystemRequirementsPath
+	origManagedPath := grokSystemManagedConfigPath
+	origClaudePaths := claudeManagedSettingsPathsFn
+	grokSystemRequirementsPath = requirementsPath
+	grokSystemManagedConfigPath = managedPath
+	claudeManagedSettingsPathsFn = func() []string { return nil }
+	t.Cleanup(func() {
+		grokSystemRequirementsPath = origRequirementsPath
+		grokSystemManagedConfigPath = origManagedPath
+		claudeManagedSettingsPathsFn = origClaudePaths
+	})
+	if err := os.WriteFile(requirementsPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name string
+		body string
+	}{
+		{"system API key", "[model]\napi_key = 'credential-sentinel'\n"},
+		{"system plugin", "[plugins]\nenabled = ['private-plugin']\n"},
+		{"system MCP", "[mcp_servers.private]\ncommand = 'raw-config-sentinel'\n"},
+		{"vendor MCP override", "[compat.cursor]\nmcps = true\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(managedPath, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := detectGrokMaintenanceSmokeSystemConfig()
+			if err == nil {
+				t.Fatalf("system config was accepted: %s", tc.body)
+			}
+			for _, secret := range []string{"credential-sentinel", "private-plugin", "raw-config-sentinel"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("system-config refusal leaked %q: %v", secret, err)
+				}
+			}
+			if strings.Contains(err.Error(), requirementsPath) || strings.Contains(err.Error(), managedPath) {
+				t.Fatalf("system-config refusal leaked a source path: %v", err)
+			}
+		})
+	}
+
+	if err := os.WriteFile(managedPath, []byte("[compat.cursor]\nmcps = false\n[compat.claude]\nmcps = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := detectGrokMaintenanceSmokeSystemConfig(); err != nil {
+		t.Fatalf("explicit system vendor-MCP disables must remain valid: %v", err)
+	}
+
+	if err := os.WriteFile(managedPath, []byte(strings.Repeat("#", (1<<20)+1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := detectGrokMaintenanceSmokeSystemConfig(); err == nil || !strings.Contains(err.Error(), "inspection limit") {
+		t.Fatalf("oversized system config must fail closed, got %v", err)
+	}
+}
+
+func TestStartSession_GrokMaintenanceSmokeRunsSystemPreflight(t *testing.T) {
+	requirementsPath := filepath.Join(t.TempDir(), "requirements.toml")
+	managedPath := filepath.Join(t.TempDir(), "managed_config.toml")
+	if err := os.WriteFile(requirementsPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(managedPath, []byte("[mcp_servers.private]\ncommand = 'raw-config-sentinel'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origRequirementsPath := grokSystemRequirementsPath
+	origManagedPath := grokSystemManagedConfigPath
+	origClaudePaths := claudeManagedSettingsPathsFn
+	grokSystemRequirementsPath = requirementsPath
+	grokSystemManagedConfigPath = managedPath
+	claudeManagedSettingsPathsFn = func() []string { return nil }
+	t.Cleanup(func() {
+		grokSystemRequirementsPath = origRequirementsPath
+		grokSystemManagedConfigPath = origManagedPath
+		claudeManagedSettingsPathsFn = origClaudePaths
+	})
+
+	sm := NewSessionManager(nil)
+	err := sm.StartSession("grok-system-tools", "grok", []string{
+		grokMaintenanceSmokeControlArg, "--tools", "", "--disable-web-search",
+		"--no-subagents", "--max-turns", "1", "--verbatim", "marker",
+	}, t.TempDir(), "ws", "uid", 1000, false, func(resultMsg) {})
+	if err == nil || !strings.Contains(err.Error(), "system-config preflight") {
+		t.Fatalf("StartSession system-tool config error = %v, want preflight refusal", err)
+	}
+	if strings.Contains(err.Error(), "raw-config-sentinel") {
+		t.Fatalf("StartSession system-tool refusal leaked raw config: %v", err)
 	}
 }
 
