@@ -6025,7 +6025,12 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			publishFn,
 		)
 		if err != nil {
-			publishSessionError(ctx, topic, cmd, fmt.Sprintf("failed to start session: %v", err))
+			msg := fmt.Sprintf("failed to start session: %v", err)
+			if typed := grokAuthErrorFrom(err); typed != nil {
+				publishSessionErrorWithCode(ctx, topic, cmd, msg, typed.Code)
+				return
+			}
+			publishSessionError(ctx, topic, cmd, msg)
 			return
 		}
 
@@ -6112,6 +6117,13 @@ func sessionStartArgsForCommand(cmd commandMsg) []string {
 
 // publishSessionError publishes an error result for a session command.
 func publishSessionError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
+	publishSessionErrorWithCode(ctx, topic, cmd, errMsg, "")
+}
+
+// publishSessionErrorWithCode is the session_start counterpart of
+// publishGrokACPError: keep GROK_NOT_AUTHENTICATED on errorCode so consumers
+// never have to infer it from free-form Output text.
+func publishSessionErrorWithCode(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg, errorCode string) {
 	fmt.Printf("%s[session] Error: %s%s\n", colorRed, errMsg, colorReset)
 
 	res := resultMsg{
@@ -6124,6 +6136,9 @@ func publishSessionError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 		Version:     Version,
 		Type:        "session_error",
 		SessionID:   cmd.SessionID,
+	}
+	if errorCode != "" {
+		res.ErrorCode = errorCode
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[session] Failed to publish error: %v%s\n", colorRed, err, colorReset)

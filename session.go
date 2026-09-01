@@ -241,7 +241,10 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		// exact binary that will be spawned, under the same maintenance-only env
 		// policy, so pre/post-update smokes evaluate only the patch applicable to
 		// their installed version. A missing or ambiguous version fails closed.
-		executable = resolveExecutable(command)
+		// Relative explicit paths must be absolutized against the caller's cwd
+		// here: this path later sets proc.Dir to the isolated workspace, so
+		// leaving "./grok" relative would probe and exec a different binary.
+		executable = resolveGrokMaintenanceSmokeExecutable(command, cwd)
 		grokVersion := grokMaintenanceSmokeVersionProbeFn(executable)
 		if normalizeGrokConfigVersion(grokVersion) == "" {
 			return fmt.Errorf("grok maintenance smoke cannot safely determine the installed Grok version")
@@ -272,6 +275,24 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 			_ = os.RemoveAll(isolatedGrokHome)
 		}
 	}()
+
+	if grokMaintenanceSmoke {
+		// Subscription-only preflight against the isolated home the child will
+		// inherit. Copying auth.json is best-effort, so isolation success is not
+		// proof of a usable login. Refuse before spawn so a missing credential
+		// reports GROK_NOT_AUTHENTICATED instead of hanging on browser OAuth or
+		// collapsing into a protocol/timeout failure.
+		authAssessment := assessIsolatedGrokLaunch(isolatedGrokHome, time.Now(), false, "")
+		if !authAssessment.Authenticated {
+			reason := authAssessment.Reason
+			if reason == "" {
+				reason = "Grok is not signed in on this computer — run `grok login` on the terminal computer to authenticate."
+			}
+			fmt.Printf("%s[session] Refusing grok maintenance smoke %s: %s (source=%s state=%s)%s\n",
+				colorYellow, id, reason, authAssessment.Source, authAssessment.AuthState, colorReset)
+			return newGrokAuthError(reason)
+		}
+	}
 
 	// OpenCode's LEGACY session_start / PTY path carries its prompt as a
 	// trailing positional (the resident chat path in opencode_native.go writes
@@ -3214,6 +3235,31 @@ func grokNoToolsExternalLoaderArg(args []string) (string, bool) {
 // output to the exact marker.
 var grokMaintenanceSmokeVersionProbeFn = func(executable string) string {
 	return probeVersionArgsWithEnv(executable, sanitizeGrokMaintenanceSmokeEnv(os.Environ()), "--version")
+}
+
+// resolveGrokMaintenanceSmokeExecutable returns the binary the maintenance
+// smoke will exec. Relative explicit paths (./grok, bin/grok) are resolved
+// against the caller's cwd before the child working directory is switched to
+// the isolated workspace; otherwise the version probe and the spawn would
+// look in different places.
+func resolveGrokMaintenanceSmokeExecutable(command, cwd string) string {
+	executable := resolveExecutable(command)
+	if !isRelativeExplicitPath(executable) {
+		return executable
+	}
+	base := strings.TrimSpace(cwd)
+	if base == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return executable
+		}
+		base = wd
+	}
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return filepath.Clean(filepath.Join(base, executable))
+	}
+	return filepath.Clean(filepath.Join(absBase, executable))
 }
 
 func sanitizeGrokMaintenanceSmokeEnv(env []string) []string {

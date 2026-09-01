@@ -638,6 +638,109 @@ func TestStartSession_GrokMaintenanceSmokeRunsSystemPreflight(t *testing.T) {
 	}
 }
 
+func stubGrokMaintenanceSmokePreflight(t *testing.T) {
+	t.Helper()
+	origRequirementsPath := grokSystemRequirementsPath
+	origManagedPath := grokSystemManagedConfigPath
+	origClaudePaths := claudeManagedSettingsPathsFn
+	origVersionProbe := grokMaintenanceSmokeVersionProbeFn
+	grokSystemRequirementsPath = filepath.Join(t.TempDir(), "requirements.toml")
+	grokSystemManagedConfigPath = filepath.Join(t.TempDir(), "managed_config.toml")
+	claudeManagedSettingsPathsFn = func() []string { return nil }
+	grokMaintenanceSmokeVersionProbeFn = func(string) string { return "grok 1.0.13" }
+	t.Cleanup(func() {
+		grokSystemRequirementsPath = origRequirementsPath
+		grokSystemManagedConfigPath = origManagedPath
+		claudeManagedSettingsPathsFn = origClaudePaths
+		grokMaintenanceSmokeVersionProbeFn = origVersionProbe
+	})
+}
+
+func grokMaintenanceSmokeStartArgs() []string {
+	return []string{
+		grokMaintenanceSmokeControlArg, "--tools", "", "--disable-web-search",
+		"--no-subagents", "--max-turns", "1", "--verbatim", grokMaintenanceSmokePromptPrefix + "TEST_MARKER",
+	}
+}
+
+func TestStartSession_GrokMaintenanceSmokeRefusesUnauthenticatedHome(t *testing.T) {
+	stubGrokMaintenanceSmokePreflight(t)
+	emptyHome := t.TempDir()
+	t.Setenv("GROK_HOME", emptyHome)
+	t.Setenv("XAI_API_KEY", "credential-sentinel-api-key")
+
+	sm := NewSessionManager(nil)
+	err := sm.StartSession("grok-smoke-no-auth", "grok", grokMaintenanceSmokeStartArgs(), t.TempDir(), "ws", "uid", 1000, false, func(resultMsg) {})
+	typed := grokAuthErrorFrom(err)
+	if typed == nil || typed.Code != grokNotAuthenticatedCode {
+		t.Fatalf("StartSession unauthenticated smoke error = %v, want GROK_NOT_AUTHENTICATED", err)
+	}
+	if strings.Contains(err.Error(), "credential-sentinel") || strings.Contains(err.Error(), emptyHome) {
+		t.Fatalf("unauthenticated smoke refusal leaked secret or path: %v", err)
+	}
+	if _, exists := sm.sessions["grok-smoke-no-auth"]; exists {
+		t.Fatal("unauthenticated smoke must not register a session")
+	}
+}
+
+func TestResolveGrokMaintenanceSmokeExecutable_AbsolutizesRelativePath(t *testing.T) {
+	cwd := t.TempDir()
+	for _, rel := range []string{"./grok", filepath.Join("bin", "grok")} {
+		got := resolveGrokMaintenanceSmokeExecutable(rel, cwd)
+		want, err := filepath.Abs(filepath.Join(cwd, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("relative smoke executable %q = %q, want %q", rel, got, want)
+		}
+	}
+
+	abs := filepath.Join(cwd, "installed", "grok")
+	if got := resolveGrokMaintenanceSmokeExecutable(abs, t.TempDir()); got != abs {
+		t.Fatalf("absolute smoke executable = %q, want unchanged %q", got, abs)
+	}
+}
+
+func TestStartSession_GrokMaintenanceSmokeProbesRelativeBinaryAgainstCallerCwd(t *testing.T) {
+	stubGrokMaintenanceSmokePreflight(t)
+	callerCwd := t.TempDir()
+	var probed string
+	grokMaintenanceSmokeVersionProbeFn = func(executable string) string {
+		probed = executable
+		return "grok 1.0.13"
+	}
+	t.Setenv("GROK_HOME", t.TempDir())
+	t.Setenv("XAI_API_KEY", "")
+
+	sm := NewSessionManager(nil)
+	_ = sm.StartSession("grok-smoke-relpath", "./grok", grokMaintenanceSmokeStartArgs(), callerCwd, "ws", "uid", 1000, false, func(resultMsg) {})
+	want, err := filepath.Abs(filepath.Join(callerCwd, "grok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probed != want {
+		t.Fatalf("version probe executable = %q, want caller-cwd absolute %q", probed, want)
+	}
+}
+
+func TestStartSession_GrokMaintenanceSmokeAuthenticatedHomeDoesNotReturnAuthError(t *testing.T) {
+	stubGrokMaintenanceSmokePreflight(t)
+	enableTestGrokLogin(t)
+
+	sm := NewSessionManager(nil)
+	err := sm.StartSession("grok-smoke-auth", "./grok", grokMaintenanceSmokeStartArgs(), t.TempDir(), "ws", "uid", 1000, false, func(resultMsg) {})
+	if grokAuthErrorFrom(err) != nil {
+		t.Fatalf("authenticated smoke returned GROK_NOT_AUTHENTICATED: %v", err)
+	}
+	if err == nil {
+		t.Fatal("expected StartSession to fail when the relative grok binary is missing")
+	}
+	if _, exists := sm.sessions["grok-smoke-auth"]; exists {
+		t.Fatal("missing executable must not register a session")
+	}
+}
+
 func TestBuildGrokInteractiveArgs_InlinePromptFlagValue(t *testing.T) {
 	got := buildGrokInteractiveArgs([]string{"--single=hello there"}, true)
 	want := []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "hello there"}
