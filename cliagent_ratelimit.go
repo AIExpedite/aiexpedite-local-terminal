@@ -477,15 +477,16 @@ func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRate
 }
 
 // mergeClaudeRateLimitCacheInto is the shared implementation. `verified` selects
-// between the two contracts the callers need, and they differ in exactly two
+// between the two contracts the callers need, and they differ in exactly three
 // places:
 //
 //   - The wait. A best-effort writer blocks for the in-process gate however long
 //     that takes; a verified one gives up after
-//     claudeRateLimitVerifiedPersistBudget, which covers the gate AND the
-//     cross-process lock, so its total cost is a constant its caller's join
-//     deadline can be derived from rather than a function of how many other
-//     writers happen to be queued.
+//     claudeRateLimitVerifiedPersistBudget, which covers the gate, the
+//     cross-process lock AND the filesystem work those two protect, so its total
+//     cost is a constant its caller's join deadline can be derived from rather
+//     than a function of how many other writers happen to be queued — or of how
+//     long the mount holding the cache takes to answer.
 //   - Lock contention. A best-effort writer proceeds unlocked — losing one
 //     window update that the next event rewrites moments later beats losing the
 //     reading outright. A verified one REFUSES, because an unlocked
@@ -503,9 +504,60 @@ func mergeClaudeRateLimitCacheInto(path string, updates map[string]claudeRateLim
 	if path == "" || len(updates) == 0 {
 		return time.Time{}, fmt.Errorf("claude rate-limit cache: nothing to merge")
 	}
-	var budgetDeadline time.Time
+	if !verified {
+		return mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, time.Time{})
+	}
+	// A verified merge is bounded END TO END, not merely across its two lock
+	// waits. Everything past them — MkdirAll, ReadFile, WriteFile, Rename — is a
+	// filesystem syscall, and Go offers no way to cancel one: on a wedged mount
+	// (an unreachable SMB share, a hung network drive, a disk that stopped
+	// answering) they block for as long as the kernel takes, observing neither
+	// context nor deadline. Waiting on them in the CALLER's goroutine would let a
+	// single stalled write outlive the probe timeout, the gather deadline, and
+	// the join deadline derived from this very budget — pinning the probe's
+	// single-flight slot and the signed refresh handler behind a filesystem that
+	// may never answer, which is the wedge the bounded lock waits were added to
+	// prevent, one step further down.
+	//
+	// So the serialized merge runs on its own goroutine and the caller waits for
+	// it only until the budget expires. Abandoning it is safe in both directions:
+	// the result channel is buffered, so a late answer is dropped rather than
+	// parking that goroutine forever; the goroutine keeps BOTH locks until its
+	// syscall returns, so no other writer can interleave a read-modify-rename
+	// with the one still in flight; and the caller reports a persist FAILURE, so
+	// the probe backs off and signs nothing. A write that lands after we gave up
+	// on it is just a reading the next gather picks up — never a receipt claiming
+	// an observation the cache did not hold.
+	deadline := time.Now().Add(claudeRateLimitVerifiedPersistBudget)
+	type persistResult struct {
+		observed time.Time
+		err      error
+	}
+	done := make(chan persistResult, 1)
+	go func() {
+		observed, err := mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, deadline)
+		done <- persistResult{observed: observed, err: err}
+	}()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		return res.observed, res.err
+	case <-timer.C:
+		return time.Time{}, fmt.Errorf("claude rate-limit cache: persist exceeded the %s budget",
+			claudeRateLimitVerifiedPersistBudget)
+	}
+}
+
+// mergeClaudeRateLimitCacheSerialized runs the read-merge-rename under the
+// in-process gate and the cross-process file lock. A zero budgetDeadline selects
+// the best-effort contract (block for the gate however long it takes, proceed
+// unlocked when the cross-process lock is contended); a non-zero one selects the
+// verified contract, clamping both waits to what is left of the caller's budget
+// and refusing an unlocked write.
+func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time) (time.Time, error) {
+	verified := !budgetDeadline.IsZero()
 	if verified {
-		budgetDeadline = time.Now().Add(claudeRateLimitVerifiedPersistBudget)
 		if !lockClaudeRateLimitCacheUntil(budgetDeadline) {
 			return time.Time{}, fmt.Errorf("claude rate-limit cache: busy")
 		}
@@ -686,7 +738,7 @@ func mergeClaudeRateLimitCacheInto(path string, updates map[string]claudeRateLim
 	// concurrent writers (or a stale tmp from a crashed prior run) from
 	// colliding on the intermediate file even outside the lock.
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+	if err := claudeRateLimitCacheWriteFile(tmp, out, 0o600); err != nil {
 		return time.Time{}, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -729,16 +781,26 @@ var (
 )
 
 // claudeRateLimitVerifiedPersistBudget is the ENFORCED ceiling on a verified
-// merge, end to end: the wait for the in-process gate plus the wait for the
-// cross-process file lock. It is a ceiling the merge itself observes, not an
-// estimate of how long the merge is likely to take — the queue on the gate is
-// unbounded, so anything derived from "our wait plus one other writer's" would
-// understate it the moment two Claude sessions print rate-limit lines at once.
+// merge, end to end: the wait for the in-process gate, the wait for the
+// cross-process file lock, AND the filesystem work those two protect. It is a
+// ceiling the merge itself observes, not an estimate of how long the merge is
+// likely to take — the queue on the gate is unbounded, so anything derived from
+// "our wait plus one other writer's" would understate it the moment two Claude
+// sessions print rate-limit lines at once, and a syscall on a wedged mount has
+// no upper bound to estimate at all.
 //
 // Two lock waits plus a margin: enough for one holder to be waited out and the
 // gate to be handed over, without letting a caller's join deadline (which is
 // derived from this) grow into something a user waiting on Refresh would notice.
+// The margin also covers the read-merge-rename itself, which on a healthy
+// filesystem is a few KB of JSON — microseconds, not milliseconds.
 var claudeRateLimitVerifiedPersistBudget = 2*claudeRateLimitCacheLockWait + 500*time.Millisecond
+
+// claudeRateLimitCacheWriteFile is os.WriteFile behind a seam, so a test can
+// stall the snapshot write the way an unreachable network mount does. That is
+// the failure mode the budget above exists to survive, and the one no portable
+// filesystem can be made to reproduce on demand.
+var claudeRateLimitCacheWriteFile = os.WriteFile
 
 // claudeRateLimitLockOutcome distinguishes the two ways the cross-process lock
 // can end up not held, because they are not the same fact. "Another writer has

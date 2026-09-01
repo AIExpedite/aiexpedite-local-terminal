@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1151,5 +1152,92 @@ func TestMergeClaudeRateLimitCacheChecked_ReportsTheObservationTheCacheHolds(t *
 	snap, ok := loadClaudeRateLimitSnapshot(cache)
 	if !ok || snap.Buckets[claudeWindowFiveHour].UsedPercentage != 40 {
 		t.Error("the newer reading must survive the older merge")
+	}
+}
+
+// The verified merge's budget has to cover the FILESYSTEM work, not just the two
+// lock waits it starts with. Go cannot cancel a syscall: on a wedged mount an
+// unreachable share, a hung network drive, a disk that stopped answering the
+// write blocks for as long as the kernel takes, observing neither context nor
+// deadline. That matters here because the join deadline a signed refresh waits
+// on is DERIVED from this budget, so a merge that outlives it strands the
+// refresh handler and the probe's single-flight slot behind a filesystem that
+// may never answer.
+func TestMergeClaudeRateLimitCacheChecked_BoundedByStalledFilesystem(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+
+	prevBudget := claudeRateLimitVerifiedPersistBudget
+	claudeRateLimitVerifiedPersistBudget = 100 * time.Millisecond
+	t.Cleanup(func() { claudeRateLimitVerifiedPersistBudget = prevBudget })
+
+	// Stall the snapshot write the way an unreachable mount does: enter, then
+	// block indefinitely with no deadline of its own.
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unstall := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unstall)
+
+	prevWrite := claudeRateLimitCacheWriteFile
+	t.Cleanup(func() { claudeRateLimitCacheWriteFile = prevWrite })
+	claudeRateLimitCacheWriteFile = func(name string, data []byte, perm os.FileMode) error {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		return prevWrite(name, data, perm)
+	}
+
+	updates := map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			ObservedAtMs: now.UnixMilli(), ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+			UsedPercentage: 44, Status: "allowed", usageKnown: true,
+		},
+	}
+
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		_, err := mergeClaudeRateLimitCacheChecked(cache, updates, now, "", claudeRateLimitSourceProbe)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("checked merge reported success while its write was still stalled")
+		}
+		if waited := time.Since(started); waited > 5*time.Second {
+			t.Errorf("waited %s, want the merge to give up near its %s budget",
+				waited, claudeRateLimitVerifiedPersistBudget)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("checked merge blocked in a filesystem call with no deadline of its own")
+	}
+
+	select {
+	case <-entered:
+	default:
+		t.Fatal("the merge never reached the stalled write, so this test proved nothing")
+	}
+	if _, ok := loadClaudeRateLimitSnapshot(cache); ok {
+		t.Error("a merge abandoned mid-write must not have published a snapshot yet")
+	}
+
+	// Abandoning the write is safe rather than lossy: the caller reported a
+	// failure and signed nothing, and the write itself completes once the
+	// filesystem answers, leaving the reading for the next gather. Waiting on the
+	// gate is also the sync point that proves the abandoned merge released both
+	// locks instead of stranding every later writer behind it.
+	unstall()
+	if !lockClaudeRateLimitCacheUntil(time.Now().Add(10 * time.Second)) {
+		t.Fatal("the abandoned merge never released the cache gate")
+	}
+	unlockClaudeRateLimitCache()
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok || snap.Buckets[claudeWindowFiveHour].UsedPercentage != 44 {
+		t.Error("the abandoned write must still land once the filesystem recovers")
 	}
 }
