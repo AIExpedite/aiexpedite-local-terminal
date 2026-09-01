@@ -419,11 +419,19 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// A run that stayed under quota leaves only usage-less heartbeats behind, and
 	// those deliberately cannot advance the cached observation — so a device that
 	// never renders Claude's interactive status line would report the same
-	// `latestObservedAt` forever. Spend one bounded probe when the freshest
-	// reading has aged past the staleness TTL (or when a user-initiated refresh
-	// forced it), and re-read ONLY when it actually wrote something.
+	// `latestObservedAt` forever. Spend one bounded probe when the reading has
+	// aged past the staleness TTL (or when a user-initiated refresh forced it),
+	// and re-read ONLY when it actually wrote something.
+	//
+	// Freshness is asked PER DISPLAYED ROW (stalestClaudeRowObservation), not as
+	// "the newest reading anywhere": the status-line hook refreshes only
+	// five_hour/seven_day, so a scalar newest-anything lets frequent interactive
+	// renders report the card as fresh while the weekly-split or Fable row sits at
+	// an hours-old reading. Rows that were never observed, and rows our own probe
+	// has already shown it cannot supply, are excluded there so this can never
+	// become a per-gather probe loop.
 	buckets := loadMergedClaudeRateLimitBuckets(usage.AccountFingerprint)
-	if refreshClaudeUsageIfStale(ctx, now, latestClaudeObservation(buckets), oauthAccessToken, usage.AccountFingerprint) {
+	if refreshClaudeUsageIfStale(ctx, now, claudeSnapshotFreshness(buckets), oauthAccessToken, usage.AccountFingerprint) {
 		buckets = loadMergedClaudeRateLimitBuckets(usage.AccountFingerprint)
 	}
 	usage.Metrics = claudeCodeMetricsFromBuckets(buckets, now)

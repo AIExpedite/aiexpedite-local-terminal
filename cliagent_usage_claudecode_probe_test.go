@@ -637,6 +637,155 @@ func TestLatestClaudeObservation_IgnoresHeartbeatOnlyRows(t *testing.T) {
 	}
 }
 
+// Freshness is a PER-ROW question. The status-line hook refreshes only
+// five_hour/seven_day, so a scalar "newest reading anywhere" lets frequent
+// interactive renders report the whole card as fresh while another displayed row
+// sits at an hours-old reading — the probe is then suppressed for the full
+// staleness TTL and that row never advances.
+func TestStalestClaudeRowObservation_FreshRowCannotMaskAStaleOne(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	fresh := now.Add(-10 * time.Second)
+	stale := now.Add(-6 * time.Hour)
+	buckets := map[string]claudeRateLimitBucket{
+		// What a status-line render leaves behind.
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ObservedAtMs: fresh.UnixMilli(),
+			UsageObserved: usageObservedPtr(true),
+		},
+		// The weekly row it cannot refresh.
+		claudeWindowSevenDayOpus: {
+			UsedPercentage: 88, ObservedAtMs: stale.UnixMilli(),
+			UsageObserved: usageObservedPtr(true),
+		},
+	}
+	if got := latestClaudeObservation(buckets); !got.Equal(fresh.UTC()) {
+		t.Fatalf("precondition: latestClaudeObservation=%v, want the fresh row %v", got, fresh.UTC())
+	}
+	if got := stalestClaudeRowObservation(buckets); !got.Equal(stale.UTC()) {
+		t.Errorf("stalestClaudeRowObservation=%v, want the stale weekly row %v", got, stale.UTC())
+	}
+}
+
+// A row that was never observed is NOT infinitely stale. "Unobserved" and
+// "stale" are indistinguishable from the cache, and a comfortably-unused Fable
+// quota legitimately never reports — counting it would make every gather on
+// every ordinary account probe forever.
+func TestStalestClaudeRowObservation_UnobservedRowIsNotStale(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	observed := now.Add(-time.Minute)
+	buckets := map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ObservedAtMs: observed.UnixMilli(),
+			UsageObserved: usageObservedPtr(true),
+		},
+		claudeWindowSevenDay: {
+			UsedPercentage: 12, ObservedAtMs: observed.UnixMilli(),
+			UsageObserved: usageObservedPtr(true),
+		},
+		// Fable: present as a heartbeat row only — a reset was seen, no percentage.
+		claudeWindowSevenDayFable: {
+			ObservedAtMs: now.UnixMilli(), UsageObserved: usageObservedPtr(false),
+		},
+	}
+	if got := stalestClaudeRowObservation(buckets); !got.Equal(observed.UTC()) {
+		t.Errorf("stalestClaudeRowObservation=%v, want %v (an unobserved row must not pin the snapshot stale)",
+			got, observed.UTC())
+	}
+	if got := stalestClaudeRowObservation(map[string]claudeRateLimitBucket{}); !got.IsZero() {
+		t.Errorf("empty cache should report the zero time, got %v", got)
+	}
+}
+
+// A row still older than the newest PROBE-sourced reading in the cache is one
+// the endpoint demonstrably does not supply — probing again cannot move it, so
+// it must stop counting or the snapshot reads stale on every gather forever.
+// Rows that probe DID write are stamped exactly at its instant and keep counting.
+func TestStalestClaudeRowObservation_ExcludesRowsTheProbeCannotSupply(t *testing.T) {
+	probedAt := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	old := probedAt.Add(-48 * time.Hour)
+	// A stream event from days ago naming a window the endpoint never returns.
+	orphan := claudeRateLimitBucket{
+		UsedPercentage: 5, ObservedAtMs: old.UnixMilli(),
+		UsageObserved: usageObservedPtr(true), Source: claudeRateLimitSourceStream,
+	}
+	probed := map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ObservedAtMs: probedAt.UnixMilli(),
+			UsageObserved: usageObservedPtr(true), Source: claudeRateLimitSourceProbe,
+		},
+		claudeWindowSevenDay: {
+			UsedPercentage: 12, ObservedAtMs: probedAt.UnixMilli(),
+			UsageObserved: usageObservedPtr(true), Source: claudeRateLimitSourceProbe,
+		},
+		claudeWindowSevenDayFable: orphan,
+	}
+	if got := stalestClaudeRowObservation(probed); !got.Equal(probedAt.UTC()) {
+		t.Errorf("stalestClaudeRowObservation=%v, want the probe's own instant %v", got, probedAt.UTC())
+	}
+
+	// With no probe-sourced reading on record nothing is excluded — a legacy
+	// cache, or a device that has never probed, must still report itself stale.
+	never := map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ObservedAtMs: probedAt.UnixMilli(),
+			UsageObserved: usageObservedPtr(true), Source: claudeRateLimitSourceStatusLine,
+		},
+		claudeWindowSevenDayFable: orphan,
+	}
+	if got := stalestClaudeRowObservation(never); !got.Equal(old.UTC()) {
+		t.Errorf("stalestClaudeRowObservation=%v, want the 48h-old row %v while no probe is on record", got, old.UTC())
+	}
+}
+
+// The cross-process dedupe has to answer the same per-row question the staleness
+// TTL does. A status-line render answers only five_hour/seven_day, so treating it
+// as "someone already observed" would let interactive renders suppress the probe
+// the weekly-split row depends on — the reported staleness, reintroduced through
+// the dedupe.
+func TestClaudeUsageProbeObservedSince_StatusLineRenderCannotCoverAStaleWeeklyRow(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", cache)
+	resetClaudeUsageProbeGate()
+	t.Cleanup(resetClaudeUsageProbeGate)
+
+	now := time.Now()
+	fresh := now.Add(-2 * time.Second)
+	stale := now.Add(-6 * time.Hour)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: fresh.UnixMilli(), usageKnown: true,
+		},
+	}, fresh, "", claudeRateLimitSourceStatusLine)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowSevenDayOpus: {
+			UsedPercentage: 91, ResetsAtMs: now.Add(96 * time.Hour).UnixMilli(),
+			ObservedAtMs: stale.UnixMilli(), usageKnown: true,
+		},
+	}, stale, "", claudeRateLimitSourceStream)
+
+	if claudeUsageProbeObservedSince("", now.Add(-time.Minute)) {
+		t.Error("a status-line render must not stand in for the weekly row it cannot refresh")
+	}
+}
+
+// The forced-refresh join has to outlast the WHOLE probe, not just its request.
+// A probe that spends its full HTTP timeout and then contends for the cache lock
+// persists after the request deadline; a join that gave up there would fall
+// through, be refused by the still-held single-flight slot, and sign the
+// pre-probe cache milliseconds before the fresh reading lands.
+//
+// Pinned as an invariant rather than driven behaviourally: reproducing lock
+// contention needs a second PROCESS holding the sibling .lock file, which no
+// unit test here spawns.
+func TestClaudeUsageProbeJoinTimeoutCoversPersistence(t *testing.T) {
+	want := claudeUsageProbeTimeout + 2*claudeRateLimitCacheLockWait
+	if claudeUsageProbeJoinTimeout < want {
+		t.Errorf("claudeUsageProbeJoinTimeout=%v, want at least %v (request timeout + the cache-lock waits the merge can spend)",
+			claudeUsageProbeJoinTimeout, want)
+	}
+}
+
 // A probe reading must not leak any probe-only field into the signed receipt:
 // canonicalCLIUsageRefreshReceipt carries observedAt and the numbers, nothing
 // else the probe touched.

@@ -522,11 +522,24 @@ func (g *claudeUsageProbeGate) begin(now time.Time) bool {
 	return true
 }
 
+// claudeUsageProbeCachePersistBudget is the worst case the merge that FOLLOWS a
+// successful request can take: our own wait for the cross-process cache lock,
+// plus one queued in-process writer already spending that same wait while
+// holding the shared mutex (stream capture merges on every rate-limit line).
+// Neither of those is context-bounded, so the join deadline has to make room for
+// them rather than assume the write is instant.
+var claudeUsageProbeCachePersistBudget = 2*claudeRateLimitCacheLockWait + 500*time.Millisecond
+
 // claudeUsageProbeJoinTimeout bounds how long a forced refresh waits for a probe
-// that is already in flight. The probe's own timeout is the natural ceiling —
-// past it the in-flight request is being torn down anyway — plus a little slack
-// for the cache write that follows. A var so the tests can pin it small.
-var claudeUsageProbeJoinTimeout = claudeUsageProbeTimeout + time.Second
+// that is already in flight. It must cover the WHOLE probe, not just its
+// request: a probe that spends its full HTTP timeout and then contends for the
+// cache lock persists a reading AFTER the request deadline, and a join that gave
+// up at the request deadline would report "nothing written", fall through, be
+// refused by the still-held single-flight slot, and sign the pre-probe cache
+// milliseconds before the fresh one lands. Derived from the same two bounds the
+// probe itself obeys so the deadline cannot drift away from them. A var so the
+// tests can pin it small.
+var claudeUsageProbeJoinTimeout = claudeUsageProbeTimeout + claudeUsageProbeCachePersistBudget
 
 // joinInFlight waits for a probe that already holds the single-flight slot,
 // reporting whether there was one to join and, when it persisted a reading, the
@@ -776,8 +789,22 @@ func claudeUsageProbeObservedSince(fingerprint string, baseline time.Time) bool 
 	if baseline.IsZero() {
 		return false
 	}
-	latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets(fingerprint))
+	// Row-aware for the same reason the staleness TTL is: a status-line render
+	// answers only five_hour/seven_day, so accepting it as "someone already
+	// answered" would let interactive renders suppress the probe the weekly-split
+	// and Fable rows depend on. A probe writes every window the endpoint supplies,
+	// so the cross-process dedupe this exists for still collapses cleanly.
+	latest := claudeSnapshotFreshness(loadMergedClaudeRateLimitBuckets(fingerprint))
 	return !latest.IsZero() && latest.After(baseline)
+}
+
+// claudeSnapshotFreshness is how old the DISPLAYED snapshot is — the stalest of
+// the rows the card shows, excluding the rows this process's own probe has shown
+// it cannot supply. Every freshness decision in this file goes through it, so
+// the TTL check, the cross-process dedupe and the post-run debt cannot disagree
+// about what "fresh" means.
+func claudeSnapshotFreshness(buckets map[string]claudeRateLimitBucket) time.Time {
+	return stalestClaudeRowObservation(buckets)
 }
 
 // claudeUsageProbeIdentity is everything a probe needs from the stored

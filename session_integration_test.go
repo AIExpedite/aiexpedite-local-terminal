@@ -307,6 +307,18 @@ func runMockCLI(mode string) {
 		fmt.Println(`{"type":"result","subtype":"success","result":"done"}`)
 		os.Exit(0)
 
+	case "claude-heartbeat-result-linger":
+		// The same settled turn, but the child lingers briefly before exiting so
+		// the result frame's probe is reliably ALREADY in flight when the exit
+		// path runs. That ordering is what the trailing-debt regression turns on:
+		// an exit trigger firing after the in-flight probe sampled its baseline
+		// records a NEWER debt that the probe's settleOwed cannot clear.
+		reset := time.Now().Add(3 * time.Hour).Unix()
+		fmt.Printf(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","resets_at":%d}}`+"\n", reset)
+		fmt.Println(`{"type":"result","subtype":"success","result":"done"}`)
+		time.Sleep(500 * time.Millisecond)
+		os.Exit(0)
+
 	case "claude-heartbeat-hang":
 		// Same heartbeat, but no terminal frame — the run is killed or times out
 		// mid-turn. It still consumed quota, so the session-end path must make its
@@ -1457,5 +1469,61 @@ func TestManagedClaudeSession_RecentPreRunObservationStillAdvances(t *testing.T)
 	waitForClaudeObservationAfter(t, cache, preRun)
 	if got := atomic.LoadInt64(calls); got != 1 {
 		t.Errorf("probe request count=%d, want 1", got)
+	}
+}
+
+// waitForNoOutstandingClaudeUsageDebt waits for the post-run debt recorded by the
+// result frame to be SETTLED by the probe it fired, then holds still to prove no
+// later trigger recorded a fresh one.
+//
+// The regression: a run that ends ON its terminal `result` frame is already
+// covered by the probe that frame fired, but an unconditional session-end trigger
+// records a baseline strictly NEWER than the one that probe is sampling. Its
+// settleOwed then cannot clear the newer debt — single-flight collapses
+// overlapping REQUESTS, not debts — so a second OAuth request is scheduled once
+// the minimum interval elapses, for a run nothing else happened on.
+func waitForNoOutstandingClaudeUsageDebt(t *testing.T, settleWithin, holdFor time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(settleWithin)
+	for {
+		if claudeUsageProbe.owedObservation().IsZero() {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("post-run debt %s still outstanding %s after the probe landed — a later trigger recorded a baseline the in-flight probe could not settle",
+				claudeUsageProbe.owedObservation().UTC().Format(time.RFC3339Nano), settleWithin)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	hold := time.Now().Add(holdFor)
+	for time.Now().Before(hold) {
+		if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+			t.Fatalf("a trailing trigger recorded a new debt (%s) after the turn was already reported",
+				owed.UTC().Format(time.RFC3339Nano))
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// Managed run that ends on its terminal `result` frame: exactly one request, and
+// no debt left behind for the throttle to pay later.
+func TestManagedClaudeSession_SettledTurnLeavesNoTrailingDebt(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":58,"resets_at":%d,"status":"allowed"}}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	seeded := seedStaleClaudeObservation(t, cache)
+	// A production-shaped interval, so a debt left outstanding stays outstanding
+	// rather than being paid instantly by a zero-interval retry.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	sm, id := startManagedClaudeSession(t, "claude-heartbeat-result-linger")
+	t.Cleanup(func() { _ = sm.EndSession(id) })
+
+	waitForClaudeObservationAfter(t, cache, seeded)
+	waitForNoOutstandingClaudeUsageDebt(t, 5*time.Second, 1500*time.Millisecond)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want exactly 1 for a single settled turn", got)
 	}
 }

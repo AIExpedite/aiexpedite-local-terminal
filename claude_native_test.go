@@ -522,6 +522,37 @@ func TestClaudeNativeLifecycle_KilledRunStillProbesOnExit(t *testing.T) {
 	waitForClaudeObservationAfter(t, cache, seeded)
 }
 
+// Direct run that ends on its terminal `result` frame: exactly one request, and
+// no post-run debt left behind. See waitForNoOutstandingClaudeUsageDebt for what
+// an unconditional exit trigger costs — single-flight collapses overlapping
+// requests, never the debt, so a second OAuth call gets scheduled a minute later
+// for a run nothing else happened on.
+func TestClaudeNativeLifecycle_SettledTurnLeavesNoTrailingDebt(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":37,"resets_at":%d,"status":"allowed"}}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	seeded := seedStaleClaudeObservation(t, cache)
+	// A production-shaped interval, so a debt left outstanding stays outstanding
+	// rather than being paid instantly by a zero-interval retry.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+	tmpDir := installMockClaude(t, "claude-heartbeat-result-linger")
+
+	m := NewClaudeNativeManager(nil)
+	id := fmt.Sprintf("claude-settled-%d", time.Now().UnixNano())
+	if err := m.Start(id, tmpDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.End(id) })
+
+	waitForClaudeObservationAfter(t, cache, seeded)
+	waitForNoOutstandingClaudeUsageDebt(t, 5*time.Second, 1500*time.Millisecond)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want exactly 1 for a single settled turn", got)
+	}
+}
+
 // The rate-limit rejection path must be untouched by the probe wiring: a
 // rejected run still publishes the `claude_native_ratelimit` frame that
 // agent-orchestrator-service's detectRateLimit defers and auto-resumes on.

@@ -102,6 +102,15 @@ type CLISession struct {
 	// pipe is closed so a second SendInput doesn't double-close.
 	deferredStdinClose bool
 
+	// turnSettled is true only while the LAST stream line this session produced
+	// was a terminal claude `result`. Set at the result branch in
+	// readOutputStream and cleared by the next line, so waitForExit can tell "the
+	// turn completed and the child then exited" — already covered by the
+	// utilization probe the result branch fired — from "the child died mid-turn",
+	// where nothing has probed for the quota that turn spent. Atomic because the
+	// stream reader writes it and waitForExit reads it.
+	turnSettled atomic.Bool
+
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
 	// a claude session emits its first genuine assistant output — a stream-json
 	// text/thinking delta or a tool_use. The claude no-output watchdog
@@ -1286,6 +1295,12 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// rate_limit_event gives us an unambiguous epoch. This is what lets
 			// agent-orchestrator-service auto-defer + resume instead of
 			// completing the step empty.
+			// The child is producing again, so any earlier `result` no longer
+			// describes the end of the run — a new turn is under way. Cleared for
+			// every line, including the rate-limit and prompt frames below that
+			// never reach the result branch.
+			session.turnSettled.Store(false)
+
 			// Codex rate-limit telemetry: token_count frames from `codex exec
 			// --json` carry the same primary/secondary rate_limits payload as
 			// the app-server stream. Without this hook, normal terminal Codex
@@ -1476,6 +1491,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				// card advances after a managed run. Asynchronous, single-flight
 				// and throttled, so a chatty multi-turn session issues one
 				// request and the streaming path is never delayed.
+				session.turnSettled.Store(true)
 				triggerClaudeUsageProbeAfterRun()
 			}
 
@@ -1702,9 +1718,14 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// terminal `result` frame — killed, timed out, or exited mid-turn. Those
 	// runs still consumed quota, so the card must not stay pinned to a
 	// pre-run observation just because the turn ended abnormally. No-op for
-	// non-claude sessions, and collapsed by the probe's single-flight when the
-	// result frame already fired it moments ago.
-	if isClaudeCommand(session.Command) {
+	// non-claude sessions.
+	//
+	// Skipped when the session ENDED on its result frame. Single-flight collapses
+	// only overlapping requests; it cannot collapse the debt, and this trigger
+	// records a baseline strictly NEWER than the one the result probe is already
+	// sampling, so that probe's settleOwed cannot clear it and a second OAuth
+	// request gets scheduled for a turn that was already reported.
+	if isClaudeCommand(session.Command) && !session.turnSettled.Load() {
 		triggerClaudeUsageProbeAfterRun()
 	}
 

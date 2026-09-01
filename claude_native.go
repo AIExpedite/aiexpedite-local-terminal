@@ -109,6 +109,13 @@ type ClaudeNativeSession struct {
 	done          chan struct{}
 	streamDone    chan struct{}
 	seq           int64
+	// turnSettled is true only while the LAST stdout frame this session produced
+	// was a terminal `result`. readStream sets it there and clears it on the next
+	// line, so waitForExit can tell "the run finished cleanly and the child then
+	// exited" (the utilization probe readStream already fired covers it) from
+	// "the child died mid-turn" (nothing has probed for the quota it just spent).
+	// Atomic because the stdout scanner writes it and waitForExit reads it.
+	turnSettled atomic.Bool
 	// killUnconfirmed marks a session whose End escalated to Kill and then
 	// timed out waiting for the exit watcher. The session is RETAINED as a
 	// tombstone (see end_confirm.go): only probeProcessGone may convert it
@@ -697,6 +704,11 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 			if trimmed == "" {
 				continue
 			}
+			// The child is producing again, so any earlier `result` no longer
+			// describes the end of the run — a new turn is under way. Cleared here
+			// rather than at the result site so every frame counts, including the
+			// rate-limit and error lines that never reach the publish below.
+			session.turnSettled.Store(false)
 			if len(trimmed) > claudeNativeMaxFrameSize {
 				failSessionFatally(
 					fmt.Sprintf(
@@ -763,6 +775,7 @@ func (m *ClaudeNativeManager) readStream(session *ClaudeNativeSession, publishFn
 			// makes for the managed path — one definition, so the two execution
 			// paths can never disagree about what "the run finished" means.
 			if detectResultEvent("claude", trimmed) {
+				session.turnSettled.Store(true)
 				triggerClaudeUsageProbeAfterRun()
 			}
 		}
@@ -862,10 +875,18 @@ func (m *ClaudeNativeManager) waitForExit(session *ClaudeNativeSession, publishF
 	// frame — killed, timed out, a stream failure, or an exit mid-turn. Those runs
 	// still consumed quota, so the card must not stay pinned to a pre-run
 	// observation just because the turn ended abnormally. This mirrors the managed
-	// path's session-end attempt (session.go), and is collapsed by the probe's
-	// single-flight when readStream's result frame already fired it moments ago;
-	// every session here is a Claude one, so no command check is needed.
-	triggerClaudeUsageProbeAfterRun()
+	// path's session-end attempt (session.go); every session here is a Claude one,
+	// so no command check is needed.
+	//
+	// Skipped when the run ENDED on its result frame, which is the ordinary
+	// one-shot shape. Single-flight would collapse the two requests only if they
+	// overlapped: what it cannot collapse is the debt, and an exit trigger records
+	// a baseline strictly NEWER than the one the result probe is already sampling,
+	// so that probe's settleOwed cannot clear it and a second OAuth request is
+	// scheduled a minute later for a run nothing else happened on.
+	if !session.turnSettled.Load() {
+		triggerClaudeUsageProbeAfterRun()
+	}
 
 	// Scan for and upload whatever media this session wrote before announcing
 	// the end, so the metadata rides along on the ended frame exactly as it

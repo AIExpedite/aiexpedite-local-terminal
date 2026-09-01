@@ -193,13 +193,20 @@ func claudeFableWindowIDs(buckets map[string]claudeRateLimitBucket) []string {
 	return append([]string{claudeWindowSevenDayFable, claudeWindowSevenDayOverageIncluded}, variants...)
 }
 
+// claudeWeeklyWindowIDs are the cache keys the aggregated weekly row is built
+// from. One definition, so the staleness check below and the metric shaping
+// above cannot disagree about which buckets that row depends on.
+func claudeWeeklyWindowIDs() []string {
+	return []string{claudeWindowSevenDay, claudeWindowSevenDaySonnet, claudeWindowSevenDayOpus}
+}
+
 // aggregateWeeklyMetric reports the worst observed seven-day window: the
 // highest used percentage and the soonest reset across the unified `seven_day`
 // bucket and any per-model split (`seven_day_sonnet`, `seven_day_opus`). This
 // prevents a healthy Sonnet bucket from masking a depleted Opus bucket on
 // plans that emit them separately.
 func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Time) cliAgentUsageMetric {
-	windowIDs := []string{claudeWindowSevenDay, claudeWindowSevenDaySonnet, claudeWindowSevenDayOpus}
+	windowIDs := claudeWeeklyWindowIDs()
 	var (
 		observed      bool
 		worstUsed     float64
@@ -417,4 +424,98 @@ func latestClaudeObservation(buckets map[string]claudeRateLimitBucket) time.Time
 		return time.Time{}
 	}
 	return time.UnixMilli(newest).UTC()
+}
+
+// stalestClaudeRowObservation returns the age of the snapshot as the DISPLAYED
+// CARD sees it: the oldest "freshest reading" across the three rows
+// claudeCodeMetricsFromBuckets emits, rather than the newest reading anywhere in
+// the cache.
+//
+// Why not latestClaudeObservation: the writers cover different windows. Claude's
+// status-line payload carries only `five_hour` and `seven_day` (see
+// claudeFableWindowIDs), and a stream `rate_limit_event` often names a single
+// window. A scalar "newest anything" therefore lets one frequently-refreshed row
+// report the whole snapshot as fresh while another displayed row sits at an hours-
+// old reading — the probe is suppressed for the full staleness TTL and the stale
+// row never advances. Asking per row is what makes the freshness claim match what
+// the card actually shows.
+//
+// Two exclusions keep this from becoming an unbounded probe loop, and both are
+// load-bearing:
+//
+//   - A row with NO observed reading at all is skipped, never treated as
+//     infinitely stale. "Unobserved" and "stale" are indistinguishable from here,
+//     and a comfortably-unused Fable quota legitimately never reports — counting
+//     it would make every gather on every ordinary account probe forever.
+//   - A row whose freshest reading predates the newest PROBE-sourced reading in
+//     the cache is skipped too. A probe stamps every window it read with one
+//     instant, so a row still older than that is one the endpoint demonstrably
+//     does not supply; probing again cannot move it, and counting it would pin
+//     the snapshot stale forever. Strictly-before, so the rows that probe DID
+//     write (stamped exactly at that instant) keep counting and a fresh probe
+//     reads as fresh. Derived from the cache rather than from process state so it
+//     survives a restart and is shared with every other writer on the device.
+//
+// A zero return means "nothing observed" — the same "probe if you can" answer
+// latestClaudeObservation gives for an empty cache.
+func stalestClaudeRowObservation(buckets map[string]claudeRateLimitBucket) time.Time {
+	probedAt := latestClaudeProbeObservation(buckets)
+	rows := [][]string{
+		{claudeWindowFiveHour},
+		claudeWeeklyWindowIDs(),
+		claudeFableWindowIDs(buckets),
+	}
+	stalest := int64(0)
+	for _, ids := range rows {
+		freshest := freshestClaudeRowObservation(buckets, ids)
+		if freshest <= 0 {
+			continue // never observed — see the doc comment
+		}
+		if probedAt > 0 && freshest < probedAt {
+			continue // our own probe cannot supply this row
+		}
+		if stalest == 0 || freshest < stalest {
+			stalest = freshest
+		}
+	}
+	if stalest <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(stalest).UTC()
+}
+
+// freshestClaudeRowObservation returns the newest observed reading among one
+// row's candidate windows, in epoch ms, or 0 when the row holds none.
+// Heartbeat-only buckets are skipped for the same reason latestClaudeObservation
+// skips them: their ObservedAtMs records when a reset was seen, not when a
+// percentage was measured.
+func freshestClaudeRowObservation(buckets map[string]claudeRateLimitBucket, windowIDs []string) int64 {
+	newest := int64(0)
+	for _, id := range windowIDs {
+		b, ok := buckets[id]
+		if !ok || !b.hasObservedUsage() {
+			continue
+		}
+		if b.ObservedAtMs > newest {
+			newest = b.ObservedAtMs
+		}
+	}
+	return newest
+}
+
+// latestClaudeProbeObservation returns the newest reading the PROBE itself
+// wrote, in epoch ms, or 0 when the cache holds none (a legacy snapshot with no
+// `source`, or a device that has never probed). This is the floor
+// stalestClaudeRowObservation excludes rows against — see its doc comment.
+func latestClaudeProbeObservation(buckets map[string]claudeRateLimitBucket) int64 {
+	newest := int64(0)
+	for _, b := range buckets {
+		if b.Source != claudeRateLimitSourceProbe || !b.hasObservedUsage() {
+			continue
+		}
+		if b.ObservedAtMs > newest {
+			newest = b.ObservedAtMs
+		}
+	}
+	return newest
 }
