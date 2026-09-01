@@ -34,6 +34,800 @@ func TestBuildGrokInteractiveArgs_StripsManagedFlagsAndPassesModel(t *testing.T)
 	}
 }
 
+// Grok 1.0.13 uses an explicit empty --tools value for the maintenance
+// no-tools smoke. The empty argv token must remain attached to --tools; if the
+// builder treats it as prompt text, Grok consumes the managed -p as the tool
+// list and exits with a protocol error before emitting the marker.
+func TestBuildGrokInteractiveArgs_PreservesNoToolsSmokeContract(t *testing.T) {
+	got := buildGrokInteractiveArgs([]string{
+		grokMaintenanceSmokeControlArg,
+		"--tools", "", "--disable-web-search", "--no-subagents",
+		"--max-turns", "1", "--verbatim", "return the marker",
+	}, false)
+	want := []string{
+		"--output-format", "streaming-json", "--no-auto-update",
+		"--tools", "", "--disable-web-search", "--no-subagents",
+		"--max-turns", "1", "--verbatim", "-p", "return the marker",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("no-tools smoke argv = %#v, want %#v", got, want)
+	}
+}
+
+func TestExtractGrokMaintenanceSmokeControl_IsExplicitAndNeverForwarded(t *testing.T) {
+	ordinary := []string{"--tools", "", "marker"}
+	cleaned, requested := extractGrokMaintenanceSmokeControl(ordinary)
+	if requested || !reflect.DeepEqual(cleaned, ordinary) {
+		t.Fatalf("ordinary no-tools request became maintenance smoke: requested=%t cleaned=%#v", requested, cleaned)
+	}
+
+	controlled := []string{grokMaintenanceSmokeControlArg, "--tools", "", "marker"}
+	cleaned, requested = extractGrokMaintenanceSmokeControl(controlled)
+	if !requested || !reflect.DeepEqual(cleaned, ordinary) {
+		t.Fatalf("explicit maintenance control not consumed: requested=%t cleaned=%#v", requested, cleaned)
+	}
+	for _, arg := range buildGrokInteractiveArgs(controlled, false) {
+		if arg == grokMaintenanceSmokeControlArg {
+			t.Fatalf("internal maintenance control reached Grok argv")
+		}
+	}
+}
+
+func TestSessionStartArgsForCommand_PromotesSerializedMaintenanceSmoke(t *testing.T) {
+	const payload = `{
+		"id":"maintenance-smoke-1",
+		"type":"session_start",
+		"sessionID":"grok-smoke-session",
+		"command":"grok",
+		"args":["--tools","","--disable-web-search","--no-subagents","--max-turns","1","--verbatim","Return exactly this marker and nothing else: AIEXPEDITE_GROK_SMOKE_MARKER_7F3C2A"],
+		"ts":1770000000000
+	}`
+	var cmd commandMsg
+	if err := json.Unmarshal([]byte(payload), &cmd); err != nil {
+		t.Fatalf("unmarshal serialized maintenance command: %v", err)
+	}
+	const commandSecret = "maintenance-dispatch-secret"
+	signedPayload, err := json.Marshal(signaturePayload{
+		ID: cmd.ID, Command: cmd.Command, Args: cmd.Args, Ts: cmd.Ts,
+		Type: cmd.Type, SessionID: cmd.SessionID,
+	})
+	if err != nil {
+		t.Fatalf("marshal signed maintenance payload: %v", err)
+	}
+	cmd.Signature = generateHMAC(string(signedPayload), commandSecret)
+	wirePayload, err := json.Marshal(cmd)
+	if err != nil {
+		t.Fatalf("marshal wire maintenance command: %v", err)
+	}
+	var received commandMsg
+	if err := json.Unmarshal(wirePayload, &received); err != nil {
+		t.Fatalf("unmarshal wire maintenance command: %v", err)
+	}
+	if !verifySignature(received, commandSecret) {
+		t.Fatal("serialized maintenance args were not covered by the command signature")
+	}
+	cmd = received
+	original := append([]string(nil), cmd.Args...)
+	dispatched := sessionStartArgsForCommand(cmd)
+	cleaned, promoted := extractGrokMaintenanceSmokeControl(dispatched)
+	if !promoted {
+		t.Fatalf("serialized production smoke was not promoted: %#v", dispatched)
+	}
+	if !reflect.DeepEqual(cleaned, original) {
+		t.Fatalf("promotion changed signed smoke args: got %#v, want %#v", cleaned, original)
+	}
+	if !reflect.DeepEqual(cmd.Args, original) {
+		t.Fatalf("dispatch mutated the deserialized signed args: got %#v, want %#v", cmd.Args, original)
+	}
+
+	ordinary := commandMsg{Command: "grok", Args: []string{"--tools", "", "ordinary no-tools prompt"}}
+	if got := sessionStartArgsForCommand(ordinary); !reflect.DeepEqual(got, ordinary.Args) {
+		t.Fatalf("ordinary no-tools request was promoted: %#v", got)
+	}
+
+	conflicting := cmd
+	conflicting.Args = append(append([]string(nil), cmd.Args...), "--tools", "Bash")
+	dispatchedConflicting := sessionStartArgsForCommand(conflicting)
+	cleanedConflicting, promoted := extractGrokMaintenanceSmokeControl(dispatchedConflicting)
+	if !promoted {
+		t.Fatalf("malformed reserved smoke was not promoted for fail-closed validation: %#v", conflicting.Args)
+	}
+	if err := validateGrokMaintenanceSmokeRequestArgs(cleanedConflicting); err == nil {
+		t.Fatalf("conflicting serialized smoke contract was accepted: %#v", cleanedConflicting)
+	}
+}
+
+func TestGrokArgsRequestNoTools_RequiresExplicitEmptyValue(t *testing.T) {
+	tests := []struct {
+		args []string
+		want bool
+	}{
+		{buildGrokInteractiveArgs([]string{"--tools", "", "marker"}, false), true},
+		{buildGrokInteractiveArgs([]string{"--tools=", "marker"}, false), true},
+		{buildGrokInteractiveArgs([]string{"--tools", "Bash", "marker"}, false), false},
+		{buildGrokInteractiveArgs([]string{"--tools", "", "--tools", "Bash", "marker"}, false), false},
+		{buildGrokInteractiveArgs([]string{"--tools=", "--tools", "", "marker"}, false), false},
+		{buildGrokInteractiveArgs([]string{"--disable-web-search", "marker"}, false), false},
+		{[]string{"--tools", "", "models"}, false},
+	}
+	for _, tc := range tests {
+		if got := grokArgsRequestNoTools(tc.args); got != tc.want {
+			t.Errorf("grokArgsRequestNoTools(%#v) = %t, want %t", tc.args, got, tc.want)
+		}
+	}
+}
+
+func TestValidateGrokMaintenanceSmokeContract_RequiresAllSafetyControls(t *testing.T) {
+	prompt := grokMaintenanceSmokePromptPrefix + "TEST_MARKER"
+	valid := buildGrokInteractiveArgs([]string{
+		"--tools", "", "--disable-web-search", "--no-subagents",
+		"--max-turns", "1", "--verbatim", prompt,
+	}, false)
+	if err := validateGrokMaintenanceSmokeContract(valid); err != nil {
+		t.Fatalf("valid maintenance contract rejected: %v", err)
+	}
+
+	for _, missing := range []string{"--disable-web-search", "--no-subagents", "--verbatim", "--max-turns"} {
+		trimmed := make([]string, 0, len(valid))
+		dropValue := false
+		for _, arg := range valid {
+			if dropValue {
+				dropValue = false
+				continue
+			}
+			if arg == missing {
+				dropValue = missing == "--max-turns"
+				continue
+			}
+			trimmed = append(trimmed, arg)
+		}
+		if err := validateGrokMaintenanceSmokeContract(trimmed); err == nil {
+			t.Errorf("contract missing %s was accepted: %#v", missing, trimmed)
+		}
+	}
+
+	for _, duplicate := range [][]string{
+		{"--max-turns", "1"},
+		{"--max-turns=5"},
+		{"--disable-web-search"},
+		{"--no-subagents"},
+		{"--verbatim"},
+	} {
+		conflicting := append(append([]string(nil), valid...), duplicate...)
+		if err := validateGrokMaintenanceSmokeContract(conflicting); err == nil {
+			t.Errorf("contract with duplicate/conflicting controls was accepted: %#v", conflicting)
+		}
+	}
+	dangling := append(append([]string(nil), valid...), "--max-turns")
+	if err := validateGrokMaintenanceSmokeContract(dangling); err == nil {
+		t.Errorf("contract with dangling --max-turns was accepted: %#v", dangling)
+	}
+}
+
+func TestValidateGrokMaintenanceSmokeRequestArgs_RejectsEveryExtraOption(t *testing.T) {
+	prompt := grokMaintenanceSmokePromptPrefix + "TEST_MARKER"
+	valid := []string{
+		"--tools", "", "--disable-web-search", "--no-subagents",
+		"--max-turns", "1", "--verbatim", prompt,
+	}
+	if err := validateGrokMaintenanceSmokeRequestArgs(valid); err != nil {
+		t.Fatalf("canonical request rejected: %v", err)
+	}
+
+	tests := [][]string{
+		{"--json-schema", `{"type":"string","secret":"schema-sentinel"}`},
+		{"--system-prompt-override", "system-prompt-sentinel"},
+		{"--rules", "rules-sentinel"},
+		{"--model", "provider-sentinel"},
+		{"--sandbox", "sandbox-sentinel"},
+		{"--debug-file", filepath.Join(t.TempDir(), "debug-path-sentinel")},
+		{"--always-approve"},
+		{"--auto-approve"},
+		{"--permission-mode", "bypassPermissions"},
+		{"--allow", "MCPTool(*)"},
+	}
+	for _, extra := range tests {
+		candidate := append([]string(nil), valid[:len(valid)-1]...)
+		candidate = append(candidate, extra...)
+		candidate = append(candidate, prompt)
+		err := validateGrokMaintenanceSmokeRequestArgs(candidate)
+		if err == nil {
+			t.Errorf("maintenance request with extra option was accepted: %#v", extra)
+			continue
+		}
+		for _, sentinel := range []string{
+			"schema-sentinel", "system-prompt-sentinel", "rules-sentinel", "provider-sentinel",
+			"sandbox-sentinel", "debug-path-sentinel", "bypassPermissions", "MCPTool",
+		} {
+			if strings.Contains(err.Error(), sentinel) {
+				t.Errorf("maintenance rejection leaked %q: %v", sentinel, err)
+			}
+		}
+	}
+}
+
+func TestStartSession_GrokNoToolsRejectsExternalLoaders(t *testing.T) {
+	tests := []struct {
+		args       []string
+		wantFlag   string
+		secretText string
+	}{
+		{[]string{"--tools", "", "--plugin-dir=" + filepath.Join(t.TempDir(), "private-plugin"), "marker"}, "--plugin-dir", "private-plugin"},
+		{[]string{"--tools=", "--config=model.api_key='credential-sentinel'", "marker"}, "--config", "credential-sentinel"},
+		{[]string{"--tools", "", "--agent=private-agent-path", "marker"}, "--agent", "private-agent-path"},
+		{[]string{"--tools", "", `--agents={"worker":{"token":"credential-sentinel"}}`, "marker"}, "--agents", "credential-sentinel"},
+		{[]string{"--tools", "", "--cwd=" + filepath.Join(t.TempDir(), "project-path-sentinel"), "marker"}, "--cwd", "project-path-sentinel"},
+		{[]string{"--tools", "", "--resume=session-path-sentinel", "marker"}, "--resume", "session-path-sentinel"},
+		{[]string{"--tools", "", "--worktree=project-path-sentinel", "marker"}, "--worktree", "project-path-sentinel"},
+	}
+	for i, tc := range tests {
+		sm := NewSessionManager(nil)
+		args := append([]string{grokMaintenanceSmokeControlArg}, tc.args...)
+		err := sm.StartSession("grok-no-tools-loader", "grok", args, t.TempDir(), "ws", "uid", 1000, false, func(resultMsg) {})
+		if err == nil || !strings.Contains(err.Error(), "cannot use external-loader or workspace/session") {
+			t.Errorf("case %d StartSession(%#v) error = %v, want external-loader rejection", i, args, err)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.wantFlag) {
+			t.Errorf("case %d error %q does not identify canonical flag %q", i, err, tc.wantFlag)
+		}
+		if strings.Contains(err.Error(), tc.secretText) || strings.Contains(err.Error(), "model.api_key") || strings.Contains(err.Error(), `"worker"`) {
+			t.Errorf("case %d rejection leaked loader value: %q", i, err)
+		}
+	}
+}
+
+func TestSanitizeGrokMaintenanceSmokeEnv_StripsExtensionOverrides(t *testing.T) {
+	got := sanitizeGrokMaintenanceSmokeEnv([]string{
+		"PATH=keep-me",
+		"XAI_API_KEY=credential-sentinel",
+		"GROK_CODE_XAI_API_KEY=alternate-credential-sentinel",
+		"GROK_AUTH_PROVIDER_ACCESS_TOKEN=provider-credential-sentinel",
+		"GROK_OIDC_ISSUER=https://oidc-issuer-sentinel.invalid",
+		"GROK_OIDC_CLIENT_ID=oidc-client-sentinel",
+		"GROK_OIDC_AUDIENCE=oidc-audience-sentinel",
+		"GROK_AGENT=agent-path-sentinel",
+		"GROK_DEFAULT_MODEL=model-sentinel",
+		"GROK_MODEL=alternate-model-sentinel",
+		"GROK_MODELS_BASE_URL=https://models-base-sentinel.invalid",
+		"GROK_MODELS_LIST_URL=https://models-list-sentinel.invalid",
+		"GROK_XAI_API_BASE_URL=https://xai-base-sentinel.invalid",
+		"GROK_API_BASE_URL=https://api-base-sentinel.invalid",
+		"XAI_API_BASE_URL=https://alternate-xai-base-sentinel.invalid",
+		"GROK_CURSOR_MCPS_ENABLED=1",
+		"GROK_CLAUDE_MCPS_ENABLED=1",
+		"GROK_CURSOR_AGENTS_ENABLED=1",
+		"GROK_CLAUDE_HOOKS_ENABLED=1",
+		"GROK_CODEX_MCPS_ENABLED=1",
+		"GROK_MANAGED_MCPS_ENABLED=1",
+		"GROK_WORKSPACE_TOOL_DEFS_ENABLED=1",
+		"GROK_CONFIG_PATH=config-path-sentinel",
+		"GROK_MANAGED_CONFIG_URL=managed-config-sentinel",
+		"GROK_PLUGIN_ROOT=plugin-path-sentinel",
+		"GROK_WORKSPACE_ROOT=workspace-path-sentinel",
+		"GROK_WORKSPACE_SERVER_SKILLS_DIR=skills-path-sentinel",
+		"GROK_SUBAGENTS=1",
+		"GROK_WEB_FETCH=1",
+		"GROK_MEMORY=1",
+		"GROK_LSP_TOOLS=1",
+		"GROK_SANDBOX=host-sandbox-sentinel",
+		"GROK_SANDBOX_AUTO_ALLOW_BASH=1",
+		"GROK_LOG_FILE=external-log-path-sentinel",
+		"GROK_FUTURE_EXECUTION_OVERRIDE=future-override-sentinel",
+		"RUST_LOG=xai_grok=debug-stderr-sentinel",
+		"RUST_BACKTRACE=1",
+		"RUST_LIB_BACKTRACE=1",
+		"OTEL_LOGS_EXPORTER=console-output-sentinel",
+		"OTEL_METRICS_EXPORTER=otlp",
+		"OTEL_EXPORTER_OTLP_ENDPOINT=https://otel-endpoint-sentinel.invalid",
+		"OTEL_EXPORTER_OTLP_HEADERS=Authorization=otel-credential-sentinel",
+		"OTEL_EXPORTER_OTLP_CERTIFICATE=otel-ca-path-sentinel",
+		"OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE=otel-client-cert-path-sentinel",
+		"OTEL_EXPORTER_OTLP_CLIENT_KEY=otel-client-key-path-sentinel",
+		"OTEL_LOG_USER_PROMPTS=1",
+		"OTEL_LOG_TOOL_DETAILS=1",
+		"OTEL_FUTURE_EXPORT_OVERRIDE=future-otel-sentinel",
+	})
+	values := make(map[string]string, len(got))
+	for _, entry := range got {
+		name, value, _ := strings.Cut(entry, "=")
+		values[strings.ToUpper(name)] = value
+	}
+	if values["PATH"] != "keep-me" {
+		t.Fatalf("safe environment was not preserved: %#v", got)
+	}
+	for _, stripped := range []string{
+		"XAI_API_KEY", "GROK_CODE_XAI_API_KEY", "GROK_AUTH_PROVIDER_ACCESS_TOKEN",
+		"GROK_OIDC_ISSUER", "GROK_OIDC_CLIENT_ID", "GROK_OIDC_AUDIENCE",
+		"GROK_AGENT", "GROK_SUBAGENTS", "GROK_WEB_FETCH",
+		"GROK_MEMORY", "GROK_LSP_TOOLS", "GROK_CONFIG_PATH", "GROK_PLUGIN_ROOT",
+		"GROK_MANAGED_CONFIG_URL", "GROK_WORKSPACE_ROOT", "GROK_WORKSPACE_SERVER_SKILLS_DIR",
+		"GROK_DEFAULT_MODEL", "GROK_MODELS_BASE_URL", "GROK_MODELS_LIST_URL",
+		"GROK_MODEL", "GROK_XAI_API_BASE_URL", "GROK_API_BASE_URL", "XAI_API_BASE_URL",
+		"GROK_SANDBOX", "GROK_SANDBOX_AUTO_ALLOW_BASH", "GROK_LOG_FILE",
+		"GROK_FUTURE_EXECUTION_OVERRIDE", "RUST_LOG", "RUST_BACKTRACE", "RUST_LIB_BACKTRACE",
+		"OTEL_LOGS_EXPORTER", "OTEL_METRICS_EXPORTER", "OTEL_EXPORTER_OTLP_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_CERTIFICATE",
+		"OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+		"OTEL_LOG_USER_PROMPTS", "OTEL_LOG_TOOL_DETAILS", "OTEL_FUTURE_EXPORT_OVERRIDE",
+	} {
+		if _, ok := values[stripped]; ok {
+			t.Errorf("maintenance environment retained %s: %#v", stripped, got)
+		}
+	}
+	for _, pinned := range []string{
+		"GROK_CURSOR_SKILLS_ENABLED", "GROK_CURSOR_RULES_ENABLED", "GROK_CURSOR_AGENTS_ENABLED",
+		"GROK_CURSOR_MCPS_ENABLED", "GROK_CURSOR_HOOKS_ENABLED", "GROK_CURSOR_SESSIONS_ENABLED",
+		"GROK_CLAUDE_SKILLS_ENABLED", "GROK_CLAUDE_RULES_ENABLED", "GROK_CLAUDE_AGENTS_ENABLED",
+		"GROK_CLAUDE_MCPS_ENABLED", "GROK_CLAUDE_HOOKS_ENABLED", "GROK_CLAUDE_SESSIONS_ENABLED",
+		"GROK_CODEX_SKILLS_ENABLED", "GROK_CODEX_RULES_ENABLED", "GROK_CODEX_AGENTS_ENABLED",
+		"GROK_CODEX_MCPS_ENABLED", "GROK_CODEX_HOOKS_ENABLED", "GROK_CODEX_SESSIONS_ENABLED",
+		"GROK_MANAGED_MCPS_ENABLED", "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
+		"GROK_WORKSPACE_TOOL_DEFS_ENABLED", "GROK_WORKSPACE_TOOL_STATE_ENABLED",
+	} {
+		if values[pinned] != "0" {
+			t.Errorf("maintenance environment %s = %q, want 0", pinned, values[pinned])
+		}
+	}
+	encoded := strings.Join(got, "\n")
+	for _, secret := range []string{
+		"credential-sentinel", "alternate-credential-sentinel", "provider-credential-sentinel",
+		"oidc-issuer-sentinel", "oidc-client-sentinel", "oidc-audience-sentinel",
+		"agent-path-sentinel", "config-path-sentinel", "managed-config-sentinel", "plugin-path-sentinel",
+		"workspace-path-sentinel", "skills-path-sentinel", "model-sentinel", "alternate-model-sentinel", "models-base-sentinel",
+		"models-list-sentinel", "xai-base-sentinel", "api-base-sentinel", "alternate-xai-base-sentinel",
+		"host-sandbox-sentinel", "external-log-path-sentinel", "future-override-sentinel", "debug-stderr-sentinel",
+		"console-output-sentinel", "otel-endpoint-sentinel", "otel-credential-sentinel", "otel-ca-path-sentinel",
+		"otel-client-cert-path-sentinel", "otel-client-key-path-sentinel", "future-otel-sentinel",
+	} {
+		if strings.Contains(encoded, secret) {
+			t.Errorf("maintenance environment retained %q: %s", secret, encoded)
+		}
+	}
+}
+
+func TestDetectGrokMaintenanceSmokeSystemConfig_FailsClosedOnCredentialsAndTools(t *testing.T) {
+	requirementsPath := filepath.Join(t.TempDir(), "requirements.toml")
+	managedPath := filepath.Join(t.TempDir(), "managed_config.toml")
+	origRequirementsPath := grokSystemRequirementsPath
+	origManagedPath := grokSystemManagedConfigPath
+	origClaudePaths := claudeManagedSettingsPathsFn
+	grokSystemRequirementsPath = requirementsPath
+	grokSystemManagedConfigPath = managedPath
+	claudeManagedSettingsPathsFn = func() []string { return nil }
+	t.Cleanup(func() {
+		grokSystemRequirementsPath = origRequirementsPath
+		grokSystemManagedConfigPath = origManagedPath
+		claudeManagedSettingsPathsFn = origClaudePaths
+	})
+	if err := os.WriteFile(requirementsPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name         string
+		body         string
+		wantCategory string
+	}{
+		{"system API key", "[model]\napi_key = 'credential-sentinel'\n", ""},
+		{"table auth provider command", "[auth]\nauth_provider_command = 'credential-sentinel'\n", ""},
+		{"table OIDC issuer", "[auth.oidc]\nissuer = 'https://oidc-issuer-sentinel.invalid'\n", ""},
+		{"dotted OIDC client", `auth.oidc.client_id = "oidc-client-sentinel"` + "\n", ""},
+		{"inline OIDC issuer", `auth = { oidc = { issuer = "https://oidc-inline-sentinel.invalid" } }` + "\n", ""},
+		{"quoted OIDC client", `"auth"."oidc"."client_id" = "oidc-quoted-sentinel"` + "\n", ""},
+		{"dotted custom model endpoint", `models.custom.base_url = "https://raw-config-sentinel.invalid"` + "\n", ""},
+		{"inline provider headers", `models = { custom = { extra_headers = { Authorization = "credential-sentinel" } } }` + "\n", ""},
+		{"quoted default model", `"models" = { "default" = "customer-secret-name" }` + "\n", ""},
+		{"system plugin", "[plugins]\nenabled = ['private-plugin']\n", "plugin"},
+		{"system MCP", "[mcp_servers.customer-secret-name]\ncommand = 'raw-config-sentinel'\n", "mcp"},
+		{"vendor MCP override", "[compat.cursor]\nmcps = true\n", "vendor-mcp"},
+		{"inline vendor MCP", "compat = { cursor = { mcps = true } }\n", "vendor-mcp"},
+		{"inline approval", `approval = { mode = "always" }` + "\n", ""},
+		{"inline documented UI approval", `ui = { permission_mode = "always-approve" }` + "\n", ""},
+		{"inline documented permission allow", `permission = { rules = [{ action = "allow", tool = "MCPTool" }] }` + "\n", ""},
+		{"top-level allow list", `allow = ["MCPTool(*)"]` + "\n", ""},
+		{"quoted inline UI approval", `"ui" = { "permission_mode" = "acceptEdits" }` + "\n", ""},
+		{"quoted inline permission allow", `"permission" = { "rules" = [{ "action" = "allow", "tool" = "MCPTool" }] }` + "\n", ""},
+		{"quoted inline vendor MCP", `"compat" = { "cursor" = { "mcps" = true } }` + "\n", "vendor-mcp"},
+		{"inline plugin", `plugins = { enabled = ["customer-secret-name"] }` + "\n", "plugin"},
+		{"inline MCP", `mcp_servers = { "customer-secret-name" = { command = "raw-config-sentinel" } }` + "\n", "mcp"},
+		{"table external telemetry", "[telemetry]\notel_enabled = true\n", "telemetry"},
+		{"dotted console telemetry", `telemetry.otel_logs_exporter = "console-output-sentinel"` + "\n", "telemetry"},
+		{"inline OTLP telemetry", `telemetry = { otel_metrics_exporter = "otlp", otel_endpoint = "https://otel-endpoint-sentinel.invalid" }` + "\n", "telemetry"},
+		{"inline prompt telemetry", `telemetry = { otel_log_user_prompts = true }` + "\n", "telemetry"},
+		{"inline tool-detail telemetry", `telemetry = { otel_log_tool_details = true }` + "\n", "telemetry"},
+		{"expanded telemetry enable", "[telemetry]\notel_enabled = '$OTEL_ENABLE_SENTINEL'\n", "telemetry"},
+		{"quoted telemetry certificate", `"telemetry"."otel_certificate" = "otel-ca-path-sentinel"` + "\n", "telemetry"},
+		{"quoted telemetry client certificate", `"telemetry"."otel_client_certificate" = "otel-client-cert-path-sentinel"` + "\n", "telemetry"},
+		{"quoted telemetry client key", `"telemetry"."otel_client_key" = "otel-client-key-path-sentinel"` + "\n", "telemetry"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(managedPath, []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13")
+			if err == nil {
+				t.Fatalf("system config was accepted: %s", tc.body)
+			}
+			if tc.wantCategory != "" && !strings.Contains(err.Error(), `"`+tc.wantCategory+`"`) {
+				t.Fatalf("system-config refusal %q omitted fixed category %q", err, tc.wantCategory)
+			}
+			for _, secret := range []string{"credential-sentinel", "private-plugin", "raw-config-sentinel", "customer-secret-name", "customer_secret_name", "oidc-issuer-sentinel", "oidc-client-sentinel", "oidc-inline-sentinel", "oidc-quoted-sentinel", "console-output-sentinel", "otel-endpoint-sentinel", "otel-ca-path-sentinel", "otel-client-cert-path-sentinel", "otel-client-key-path-sentinel", "OTEL_ENABLE_SENTINEL"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("system-config refusal leaked %q: %v", secret, err)
+				}
+			}
+			if strings.Contains(err.Error(), requirementsPath) || strings.Contains(err.Error(), managedPath) {
+				t.Fatalf("system-config refusal leaked a source path: %v", err)
+			}
+		})
+	}
+
+	if err := os.WriteFile(managedPath, []byte("[compat.cursor]\nmcps = false\n[compat.claude]\nmcps = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
+		t.Fatalf("explicit system vendor-MCP disables must remain valid: %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("compat = { cursor = { mcps = false }, claude = { mcps = false } }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
+		t.Fatalf("inline system vendor-MCP disables must remain valid: %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte(`permission = { rules = [{ action = "deny", tool = "MCPTool", allow = "matcher-only" }] }`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
+		t.Fatalf("inline deny-only permission rules must remain valid: %v", err)
+	}
+	if err := os.WriteFile(managedPath, []byte("[telemetry]\notel_enabled = false\notel_metrics_exporter = 'none'\notel_logs_exporter = 'none'\notel_log_user_prompts = false\notel_log_tool_details = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
+		t.Fatalf("explicitly disabled external telemetry must remain valid: %v", err)
+	}
+
+	for _, emptyConfig := range []struct {
+		name string
+		body string
+	}{
+		{"empty mcp_servers table", "mcp_servers = {}\n"},
+		{"empty mcp_servers section", "[mcp_servers]\n"},
+		{"empty mcps array", "mcps = []\n"},
+		{"empty mcpservers section", "[mcpservers]\n"},
+		{"disabled mcp_servers section", "[mcp_servers]\nenabled = false\n"},
+		{"empty plugins table", "plugins = {}\n"},
+		{"empty plugins section", "[plugins]\n"},
+		{"empty plugins enabled array inline", "plugins = { enabled = [] }\n"},
+		{"empty plugins enabled array section", "[plugins]\nenabled = []\n"},
+		{"disabled plugins section", "[plugins]\nenabled = false\n"},
+		// A disabled entry keeps its full body in the managed layer; the flag,
+		// not the retained command/args/env/path, decides whether it can load.
+		{"disabled mcp server with retained command", "[mcp_servers.customer-secret-name]\nenabled = false\ncommand = 'raw-config-sentinel'\n"},
+		{"disabled mcp server with retained args", "[mcp_servers.customer-secret-name]\ndisabled = true\ncommand = 'raw-config-sentinel'\nargs = ['raw-config-sentinel']\n"},
+		{"inline disabled mcp server with retained command", `mcp_servers = { "customer-secret-name" = { enabled = false, command = "raw-config-sentinel" } }` + "\n"},
+		{"disabled mcp array entry with retained command", `mcps = [{ enabled = false, command = "raw-config-sentinel" }]` + "\n"},
+		{"disabled plugin with retained path", "[plugins.customer-secret-name]\nenabled = false\npath = 'raw-config-sentinel'\n"},
+		{"disabled vendor mcp parent", "[compat.cursor]\nenabled = false\nmcps = true\n"},
+	} {
+		t.Run(emptyConfig.name, func(t *testing.T) {
+			if err := os.WriteFile(managedPath, []byte(emptyConfig.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err != nil {
+				t.Fatalf("empty/disabled tool configuration %q was unexpectedly rejected: %v", emptyConfig.body, err)
+			}
+		})
+	}
+
+	// Suppressing a disabled definition must not suppress its siblings, and an
+	// enablement that cannot be proven false lexically (environment expansion)
+	// must keep failing closed.
+	for _, live := range []struct {
+		name         string
+		body         string
+		wantCategory string
+	}{
+		{"enabled sibling of disabled mcp server", "[mcp_servers.disabled-one]\nenabled = false\ncommand = 'raw-config-sentinel'\n\n[mcp_servers.customer-secret-name]\ncommand = 'raw-config-sentinel'\n", "mcp"},
+		{"expanded mcp enablement", "[mcp_servers.customer-secret-name]\nenabled = '$MCP_ENABLE_SENTINEL'\ncommand = 'raw-config-sentinel'\n", "mcp"},
+		{"enabled plugin sibling of disabled plugin", "[plugins.disabled-one]\nenabled = false\npath = 'raw-config-sentinel'\n\n[plugins.customer-secret-name]\nenabled = true\npath = 'raw-config-sentinel'\n", "plugin"},
+		{"contradictory mcp enablement pair", "[mcp_servers.customer-secret-name]\nenabled = false\ndisabled = false\ncommand = 'raw-config-sentinel'\n", "mcp"},
+		{"contradictory mcp disablement pair", "[mcp_servers.customer-secret-name]\nenabled = true\ndisabled = true\ncommand = 'raw-config-sentinel'\n", "mcp"},
+		{"expanded enablement beside explicit disable", "[mcp_servers.customer-secret-name]\nenabled = '$MCP_ENABLE_SENTINEL'\ndisabled = true\ncommand = 'raw-config-sentinel'\n", "mcp"},
+	} {
+		t.Run(live.name, func(t *testing.T) {
+			if err := os.WriteFile(managedPath, []byte(live.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13")
+			if err == nil {
+				t.Fatalf("live tool configuration was accepted: %s", live.body)
+			}
+			if !strings.Contains(err.Error(), `"`+live.wantCategory+`"`) {
+				t.Fatalf("refusal %q omitted fixed category %q", err, live.wantCategory)
+			}
+			for _, secret := range []string{"raw-config-sentinel", "customer-secret-name", "customer_secret_name", "MCP_ENABLE_SENTINEL"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("refusal leaked %q: %v", secret, err)
+				}
+			}
+		})
+	}
+
+	// A disabled block still exposes readable credentials and provider
+	// overrides, so those findings keep failing closed independently of whether
+	// the definition can load a tool.
+	for _, sensitive := range []struct {
+		name string
+		body string
+	}{
+		{"credential inside disabled mcp server", "[mcp_servers.customer-secret-name]\nenabled = false\napi_key = 'credential-sentinel'\n"},
+		{"provider override inside disabled mcp server", "[mcp_servers.customer-secret-name]\nenabled = false\nbase_url = 'https://provider-sentinel.invalid'\n"},
+	} {
+		t.Run(sensitive.name, func(t *testing.T) {
+			if err := os.WriteFile(managedPath, []byte(sensitive.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err == nil {
+				t.Fatalf("sensitive value inside a disabled definition was accepted: %s", sensitive.body)
+			}
+		})
+	}
+
+	if err := os.WriteFile(managedPath, []byte(strings.Repeat("#", (1<<20)+1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := detectGrokMaintenanceSmokeSystemConfig("grok 1.0.13"); err == nil || !strings.Contains(err.Error(), "inspection limit") {
+		t.Fatalf("oversized system config must fail closed, got %v", err)
+	}
+}
+
+func TestInspectGrokSystemConfigSemantic_AppliesOnlyMatchingVersionOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "managed_config.toml")
+	tests := []struct {
+		name           string
+		runtimeVersion string
+		minimum        string
+		maximum        string
+		wantTool       bool
+	}{
+		{"1.0.5 active", "grok 1.0.5", "1.0.0", "1.0.9", true},
+		{"1.0.5 historical inactive", "grok 1.0.5", "0.9.0", "1.0.4", false},
+		{"1.0.5 future inactive", "grok 1.0.5", "1.0.6", "1.0.12", false},
+		{"1.0.13 active", "grok 1.0.13", "1.0.10", "1.0.20", true},
+		{"1.0.13 historical inactive", "grok 1.0.13", "1.0.0", "1.0.12", false},
+		{"1.0.13 future inactive", "grok 1.0.13", "1.0.14", "2.0.0", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `version_overrides = [{ minimum_version = "` + tc.minimum +
+				`", maximum_version = "` + tc.maximum +
+				`", mcp_servers = { "sentinel-server" = { command = "raw-config-sentinel" } } }]` + "\n"
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			finding, ok, err := inspectGrokSystemConfigSemantic(path, tc.runtimeVersion)
+			if err != nil || !ok {
+				t.Fatalf("inspect override: ok=%v finding=%+v err=%v", ok, finding, err)
+			}
+			if got := finding.toolCategory != ""; got != tc.wantTool {
+				t.Fatalf("tool finding = %+v, want tool=%v", finding, tc.wantTool)
+			}
+		})
+	}
+
+	// Matching patches replace their base-layer value before classification;
+	// walking both the base and patch independently would reject this safe pin.
+	if err := os.WriteFile(path, []byte(
+		`compat = { cursor = { mcps = true } }`+"\n"+
+			`version_overrides = [{ minimum_version = "1.0.10", maximum_version = "1.0.20", compat = { cursor = { mcps = false } } }]`+"\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	finding, ok, err := inspectGrokSystemConfigSemantic(path, "grok 1.0.13")
+	if err != nil || !ok || finding.toolCategory != "" {
+		t.Fatalf("effective override did not replace base value: ok=%v finding=%+v err=%v", ok, finding, err)
+	}
+	if err := os.WriteFile(path, []byte(
+		`compat = { cursor = { mcps = true } }`+"\n"+
+			`version_overrides = [{ minimum_version = "1.0.10", maximum_version = "1.0.20", Compat = { cursor = { mcps = false } } }]`+"\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	finding, ok, err = inspectGrokSystemConfigSemantic(path, "grok 1.0.13")
+	if err != nil || !ok || finding.toolCategory != "vendor-mcp" {
+		t.Fatalf("lookalike override hid the effective base setting: ok=%v finding=%+v err=%v", ok, finding, err)
+	}
+
+	for name, body := range map[string]string{
+		"missing maximum": `version_overrides = [{ minimum_version = "1.0.0", mcp_servers = {} }]`,
+		"invalid minimum": `version_overrides = [{ minimum_version = "not-semver", maximum_version = "2.0.0", mcp_servers = {} }]`,
+		"reversed range":  `version_overrides = [{ minimum_version = "2.0.0", maximum_version = "1.0.0", mcp_servers = {} }]`,
+		"ambiguous minimum": `version_overrides = [{ minimum_version = "1.0.0", minimum-version = "1.0.1", ` +
+			`maximum_version = "2.0.0", mcp_servers = {} }]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(body+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := inspectGrokSystemConfigSemantic(path, "grok 1.0.13"); err == nil || !strings.Contains(err.Error(), "cannot be evaluated safely") {
+				t.Fatalf("unsafe selector was not rejected generically: %v", err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name           string
+		runtimeVersion string
+		minimum        string
+		maximum        string
+		wantTelemetry  bool
+	}{
+		{"1.0.5 active telemetry", "grok 1.0.5", "1.0.0", "1.0.9", true},
+		{"1.0.5 future inactive telemetry", "grok 1.0.5", "1.0.6", "1.0.20", false},
+		{"1.0.13 historical inactive telemetry", "grok 1.0.13", "1.0.0", "1.0.12", false},
+		{"1.0.13 active telemetry", "grok 1.0.13", "1.0.10", "1.0.20", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `version_overrides = [{ minimum_version = "` + tc.minimum +
+				`", maximum_version = "` + tc.maximum +
+				`", telemetry = { otel_enabled = true, otel_logs_exporter = "console" } }]` + "\n"
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			finding, ok, err := inspectGrokSystemConfigSemantic(path, tc.runtimeVersion)
+			if err != nil || !ok {
+				t.Fatalf("inspect telemetry override: ok=%v finding=%+v err=%v", ok, finding, err)
+			}
+			if got := finding.toolCategory == "telemetry"; got != tc.wantTelemetry {
+				t.Fatalf("telemetry finding = %+v, want telemetry=%v", finding, tc.wantTelemetry)
+			}
+		})
+	}
+}
+
+func TestStartSession_GrokMaintenanceSmokeRunsSystemPreflight(t *testing.T) {
+	requirementsPath := filepath.Join(t.TempDir(), "requirements.toml")
+	managedPath := filepath.Join(t.TempDir(), "managed_config.toml")
+	if err := os.WriteFile(requirementsPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(managedPath, []byte("[mcp_servers.private]\ncommand = 'raw-config-sentinel'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origRequirementsPath := grokSystemRequirementsPath
+	origManagedPath := grokSystemManagedConfigPath
+	origClaudePaths := claudeManagedSettingsPathsFn
+	origVersionProbe := grokMaintenanceSmokeVersionProbeFn
+	grokSystemRequirementsPath = requirementsPath
+	grokSystemManagedConfigPath = managedPath
+	claudeManagedSettingsPathsFn = func() []string { return nil }
+	grokMaintenanceSmokeVersionProbeFn = func(string) string { return "grok 1.0.13" }
+	t.Cleanup(func() {
+		grokSystemRequirementsPath = origRequirementsPath
+		grokSystemManagedConfigPath = origManagedPath
+		claudeManagedSettingsPathsFn = origClaudePaths
+		grokMaintenanceSmokeVersionProbeFn = origVersionProbe
+	})
+
+	sm := NewSessionManager(nil)
+	err := sm.StartSession("grok-system-tools", "grok", []string{
+		grokMaintenanceSmokeControlArg, "--tools", "", "--disable-web-search",
+		"--no-subagents", "--max-turns", "1", "--verbatim", grokMaintenanceSmokePromptPrefix + "TEST_MARKER",
+	}, t.TempDir(), "ws", "uid", 1000, false, func(resultMsg) {})
+	if err == nil || !strings.Contains(err.Error(), "system-config preflight") {
+		t.Fatalf("StartSession system-tool config error = %v, want preflight refusal", err)
+	}
+	if strings.Contains(err.Error(), "raw-config-sentinel") {
+		t.Fatalf("StartSession system-tool refusal leaked raw config: %v", err)
+	}
+}
+
+func stubGrokMaintenanceSmokePreflight(t *testing.T) {
+	t.Helper()
+	origRequirementsPath := grokSystemRequirementsPath
+	origManagedPath := grokSystemManagedConfigPath
+	origClaudePaths := claudeManagedSettingsPathsFn
+	origVersionProbe := grokMaintenanceSmokeVersionProbeFn
+	grokSystemRequirementsPath = filepath.Join(t.TempDir(), "requirements.toml")
+	grokSystemManagedConfigPath = filepath.Join(t.TempDir(), "managed_config.toml")
+	claudeManagedSettingsPathsFn = func() []string { return nil }
+	grokMaintenanceSmokeVersionProbeFn = func(string) string { return "grok 1.0.13" }
+	t.Cleanup(func() {
+		grokSystemRequirementsPath = origRequirementsPath
+		grokSystemManagedConfigPath = origManagedPath
+		claudeManagedSettingsPathsFn = origClaudePaths
+		grokMaintenanceSmokeVersionProbeFn = origVersionProbe
+	})
+}
+
+func grokMaintenanceSmokeStartArgs() []string {
+	return []string{
+		grokMaintenanceSmokeControlArg, "--tools", "", "--disable-web-search",
+		"--no-subagents", "--max-turns", "1", "--verbatim", grokMaintenanceSmokePromptPrefix + "TEST_MARKER",
+	}
+}
+
+func TestStartSession_GrokMaintenanceSmokeRefusesUnauthenticatedHome(t *testing.T) {
+	stubGrokMaintenanceSmokePreflight(t)
+	emptyHome := t.TempDir()
+	t.Setenv("GROK_HOME", emptyHome)
+	t.Setenv("XAI_API_KEY", "credential-sentinel-api-key")
+
+	sm := NewSessionManager(nil)
+	err := sm.StartSession("grok-smoke-no-auth", "grok", grokMaintenanceSmokeStartArgs(), t.TempDir(), "ws", "uid", 1000, false, func(resultMsg) {})
+	typed := grokAuthErrorFrom(err)
+	if typed == nil || typed.Code != grokNotAuthenticatedCode {
+		t.Fatalf("StartSession unauthenticated smoke error = %v, want GROK_NOT_AUTHENTICATED", err)
+	}
+	if strings.Contains(err.Error(), "credential-sentinel") || strings.Contains(err.Error(), emptyHome) {
+		t.Fatalf("unauthenticated smoke refusal leaked secret or path: %v", err)
+	}
+	if _, exists := sm.sessions["grok-smoke-no-auth"]; exists {
+		t.Fatal("unauthenticated smoke must not register a session")
+	}
+}
+
+func TestResolveGrokMaintenanceSmokeExecutable_AbsolutizesRelativePath(t *testing.T) {
+	cwd := t.TempDir()
+	for _, rel := range []string{"./grok", filepath.Join("bin", "grok")} {
+		got := resolveGrokMaintenanceSmokeExecutable(rel, cwd)
+		want, err := filepath.Abs(filepath.Join(cwd, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("relative smoke executable %q = %q, want %q", rel, got, want)
+		}
+	}
+
+	abs := filepath.Join(cwd, "installed", "grok")
+	if got := resolveGrokMaintenanceSmokeExecutable(abs, t.TempDir()); got != abs {
+		t.Fatalf("absolute smoke executable = %q, want unchanged %q", got, abs)
+	}
+}
+
+func TestStartSession_GrokMaintenanceSmokeProbesRelativeBinaryAgainstCallerCwd(t *testing.T) {
+	stubGrokMaintenanceSmokePreflight(t)
+	callerCwd := t.TempDir()
+	var probed string
+	grokMaintenanceSmokeVersionProbeFn = func(executable string) string {
+		probed = executable
+		return "grok 1.0.13"
+	}
+	t.Setenv("GROK_HOME", t.TempDir())
+	t.Setenv("XAI_API_KEY", "")
+
+	sm := NewSessionManager(nil)
+	_ = sm.StartSession("grok-smoke-relpath", "./grok", grokMaintenanceSmokeStartArgs(), callerCwd, "ws", "uid", 1000, false, func(resultMsg) {})
+	want, err := filepath.Abs(filepath.Join(callerCwd, "grok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probed != want {
+		t.Fatalf("version probe executable = %q, want caller-cwd absolute %q", probed, want)
+	}
+}
+
+func TestStartSession_GrokMaintenanceSmokeAuthenticatedHomeDoesNotReturnAuthError(t *testing.T) {
+	stubGrokMaintenanceSmokePreflight(t)
+	enableTestGrokLogin(t)
+
+	sm := NewSessionManager(nil)
+	err := sm.StartSession("grok-smoke-auth", "./grok", grokMaintenanceSmokeStartArgs(), t.TempDir(), "ws", "uid", 1000, false, func(resultMsg) {})
+	if grokAuthErrorFrom(err) != nil {
+		t.Fatalf("authenticated smoke returned GROK_NOT_AUTHENTICATED: %v", err)
+	}
+	if err == nil {
+		t.Fatal("expected StartSession to fail when the relative grok binary is missing")
+	}
+	if _, exists := sm.sessions["grok-smoke-auth"]; exists {
+		t.Fatal("missing executable must not register a session")
+	}
+}
+
 func TestBuildGrokInteractiveArgs_InlinePromptFlagValue(t *testing.T) {
 	got := buildGrokInteractiveArgs([]string{"--single=hello there"}, true)
 	want := []string{"--output-format", "streaming-json", "--no-auto-update", "--always-approve", "-p", "hello there"}

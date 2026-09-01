@@ -79,6 +79,14 @@ type CLISession struct {
 	// Removed exactly once after the process exits (see waitForExit).
 	promptFile string
 
+	// isolatedGrokHome is set only for the authenticated maintenance-smoke
+	// control path. It runs with copied login state plus a minimal
+	// MCP-disabled config rather than inheriting plugins/MCPs from the user's
+	// real GROK_HOME. waitForExit persists only the normalized billing snapshot
+	// to persistentGrokHome, then removes the isolated directory.
+	isolatedGrokHome   string
+	persistentGrokHome string
+
 	// antigravityManagedStream is true only when StartSession shaped this
 	// invocation into agy's managed stream-json protocol. Raw diagnostics such
 	// as `agy --version` also use the pipe reader, but legitimately exit without
@@ -187,12 +195,104 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		return fmt.Errorf("session %s already exists", id)
 	}
 
+	// The session_start dispatcher derives an explicit AI Expedite control token
+	// from the complete signed maintenance contract. Consume it before building
+	// Grok's argv so it can never reach the child. An empty --tools value on its
+	// own remains an ordinary caller request; it must not silently opt into the
+	// smoke's auth/config isolation policy.
+	grokMaintenanceSmoke := false
+	if isGrokCommand(command) {
+		args, grokMaintenanceSmoke = extractGrokMaintenanceSmokeControl(args)
+	}
+	if grokMaintenanceSmoke {
+		// Validate the signed wire contract before the general Grok builder can
+		// strip permission-bypass flags or otherwise normalize unrecognised
+		// options. The loader check stays first so its published error can name
+		// only the canonical option while redacting every caller-supplied value.
+		if arg, ok := grokNoToolsExternalLoaderArg(args); ok {
+			return fmt.Errorf("grok maintenance smoke cannot use external-loader or workspace/session option %q", arg)
+		}
+		if contractErr := validateGrokMaintenanceSmokeRequestArgs(args); contractErr != nil {
+			return contractErr
+		}
+	}
+
 	// Build the CLI command with appropriate flags for structured streaming.
 	// stdinPrompt is non-empty when the target CLI transports its prompt outside
 	// argv (Claude/Antigravity NDJSON, Codex plain stdin).
 	antigravityManagedStream := isAntigravityCommand(command) && shouldUseAntigravityManagedStream(args)
-	enableGrokAlwaysApprove := sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
+	// A maintenance smoke is always fail-closed, regardless of the workspace's
+	// ordinary Grok approval preference. This also prevents the builder from
+	// injecting --always-approve before the strict child-argv validation below.
+	enableGrokAlwaysApprove := !grokMaintenanceSmoke && sm.Config != nil && sm.Config.EnableGrokAlwaysApprove
 	cliArgs, stdinPrompt := buildInteractiveCLIArgs(command, args, enableGrokAlwaysApprove)
+
+	// Grok's `--tools` selector filters built-in tools only. An explicitly
+	// identified maintenance smoke must also be isolated from user-installed
+	// plugins and MCP discovery. Reuse the ACP auth-only home, but omit its
+	// persistent conversation-store link: this is a one-shot smoke and must not
+	// gain access to unrelated transcripts.
+	var isolatedGrokHome, isolatedGrokCwd, persistentGrokHome, executable string
+	if grokMaintenanceSmoke {
+		if contractErr := validateGrokMaintenanceSmokeContract(cliArgs); contractErr != nil {
+			return contractErr
+		}
+		// Version overrides are part of every managed Grok config layer. Probe the
+		// exact binary that will be spawned, under the same maintenance-only env
+		// policy, so pre/post-update smokes evaluate only the patch applicable to
+		// their installed version. A missing or ambiguous version fails closed.
+		// Relative explicit paths must be absolutized against the caller's cwd
+		// here: this path later sets proc.Dir to the isolated workspace, so
+		// leaving "./grok" relative would probe and exec a different binary.
+		executable = resolveGrokMaintenanceSmokeExecutable(command, cwd)
+		grokVersion := grokMaintenanceSmokeVersionProbeFn(executable)
+		if normalizeGrokConfigVersion(grokVersion) == "" {
+			return fmt.Errorf("grok maintenance smoke cannot safely determine the installed Grok version")
+		}
+		if preflightErr := detectGrokMaintenanceSmokeSystemConfig(grokVersion); preflightErr != nil {
+			return fmt.Errorf("grok maintenance smoke system-config preflight failed: %w", preflightErr)
+		}
+		persistentGrokHome = grokPersistentHome()
+		var isolationErr error
+		isolatedGrokHome, isolationErr = setupIsolatedGrokSmokeHomeFrom(persistentGrokHome)
+		if isolationErr != nil {
+			return fmt.Errorf("grok no-tools isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", isolationErr)
+		}
+		// Grok also discovers project `.grok/config.toml`, `.mcp.json`, plugins,
+		// hooks, rules, and agent files by walking upward from cwd. Keep the
+		// maintenance probe in a fresh empty directory under the isolated home so
+		// none of the caller's repository-scoped extensions can participate.
+		isolatedGrokCwd = filepath.Join(isolatedGrokHome, "workspace")
+		if mkdirErr := os.Mkdir(isolatedGrokCwd, 0o700); mkdirErr != nil {
+			_ = os.RemoveAll(isolatedGrokHome)
+			isolatedGrokHome = ""
+			return fmt.Errorf("grok no-tools working-directory isolation failed; refusing to spawn in caller workspace")
+		}
+	}
+	isolationOwnedBySession := false
+	defer func() {
+		if isolatedGrokHome != "" && !isolationOwnedBySession {
+			_ = os.RemoveAll(isolatedGrokHome)
+		}
+	}()
+
+	if grokMaintenanceSmoke {
+		// Subscription-only preflight against the isolated home the child will
+		// inherit. Copying auth.json is best-effort, so isolation success is not
+		// proof of a usable login. Refuse before spawn so a missing credential
+		// reports GROK_NOT_AUTHENTICATED instead of hanging on browser OAuth or
+		// collapsing into a protocol/timeout failure.
+		authAssessment := assessIsolatedGrokLaunch(isolatedGrokHome, time.Now(), false, "")
+		if !authAssessment.Authenticated {
+			reason := authAssessment.Reason
+			if reason == "" {
+				reason = "Grok is not signed in on this computer — run `grok login` on the terminal computer to authenticate."
+			}
+			fmt.Printf("%s[session] Refusing grok maintenance smoke %s: %s (source=%s state=%s)%s\n",
+				colorYellow, id, reason, authAssessment.Source, authAssessment.AuthState, colorReset)
+			return newGrokAuthError(reason)
+		}
+	}
 
 	// OpenCode's LEGACY session_start / PTY path carries its prompt as a
 	// trailing positional (the resident chat path in opencode_native.go writes
@@ -263,18 +363,33 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	}()
 
 	// Resolve executable path
-	executable := resolveExecutable(command)
+	if executable == "" {
+		executable = resolveExecutable(command)
+	}
 
 	fmt.Printf("%s[session] Starting %s session %s: %s %s%s\n",
 		colorCyan, command, id, executable, strings.Join(cliArgs, " "), colorReset)
 
 	proc := exec.Command(executable, cliArgs...)
 	hideWindow(proc)
-	if cwd != "" {
+	if isolatedGrokCwd != "" {
+		proc.Dir = isolatedGrokCwd
+	} else if cwd != "" {
 		proc.Dir = cwd
 	}
 
 	filtered, strippedVars := prepareClaudeChildEnv(command, os.Environ())
+	if isolatedGrokHome != "" {
+		// Subscription-only smoke: do not let an inherited API key replace the
+		// copied login. HOME/USERPROFILE are isolated too because Grok's Claude,
+		// Cursor, and Agents compatibility loaders discover sources outside
+		// GROK_HOME under the OS user home.
+		filtered = sanitizeGrokMaintenanceSmokeEnv(filtered)
+		filtered = setEnvVar(filtered, "GROK_HOME", isolatedGrokHome)
+		filtered = setEnvVar(filtered, "HOME", isolatedGrokHome)
+		filtered = setEnvVar(filtered, "USERPROFILE", isolatedGrokHome)
+		filtered = setEnvVar(filtered, "PWD", isolatedGrokCwd)
+	}
 	proc.Env = filtered
 	if len(strippedVars) > 0 {
 		fmt.Printf("%s[session] Stripped env vars from session %s: %s%s\n",
@@ -364,6 +479,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		UID:                      uid,
 		TimeoutMs:                timeoutMs,
 		promptFile:               promptFile,
+		isolatedGrokHome:         isolatedGrokHome,
+		persistentGrokHome:       persistentGrokHome,
 		antigravityManagedStream: antigravityManagedStream,
 		// A stdin-fed one-shot CLI (codex) started without a prompt keeps
 		// its stdin open so the first SendInput can deliver the prompt; that
@@ -400,6 +517,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// waitForExit is now responsible for removing promptFile after the process
 	// exits — disarm the early-return cleanup defer above.
 	sessionOwnsPromptFile = true
+	isolationOwnedBySession = true
 
 	fmt.Printf("%s[session] Session %s started (PID: %d)%s\n",
 		colorGreen, id, proc.Process.Pid, colorReset)
@@ -1051,7 +1169,14 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 		if len(batch) == 0 {
 			return
 		}
-		output := strings.Join(batch, "\n")
+		separator := "\n"
+		if isGrokCommand(session.Command) && session.isolatedGrokHome != "" {
+			// Grok's streaming-json text/data frames are incremental deltas. A
+			// newline inserted at an internal frame boundary corrupts the exact
+			// maintenance marker; any intended whitespace is already in the delta.
+			separator = ""
+		}
+		output := strings.Join(batch, separator)
 		seq := atomic.AddInt64(&session.Seq, 1)
 
 		asyncPublish(resultMsg{
@@ -1509,6 +1634,18 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// carve-outs, so this is a no-op there. Runs exactly once per session.
 	if session.promptFile != "" {
 		_ = os.Remove(session.promptFile)
+	}
+
+	// A no-tools Grok smoke writes billing evidence only inside its isolated
+	// home. Preserve the same account-bound, allowlisted snapshot as the ACP
+	// lifecycle before announcing session_ended, then remove all copied auth and
+	// private logs. Never copy the raw log or config into the persistent home.
+	if session.isolatedGrokHome != "" {
+		if persistErr := persistGrokManagedBillingSnapshot(session.isolatedGrokHome, session.persistentGrokHome); persistErr != nil {
+			fmt.Printf("%s[session] Grok no-tools billing snapshot not persisted: %v%s\n",
+				colorYellow, persistErr, colorReset)
+		}
+		_ = os.RemoveAll(session.isolatedGrokHome)
 	}
 
 	// 120s rather than 45s — publishFn can block up to 30s per pubsub.Publish
@@ -2940,6 +3077,218 @@ func rewriteGrokPromptToFile(cliArgs []string) (newArgs []string, cleanupPath st
 	return rewritten, tempPath
 }
 
+// grokMaintenanceSmokeControlArg is an AI Expedite-only in-process control
+// derived from the signed session_start contract. It is consumed before Grok
+// argv shaping and must never be forwarded to the CLI.
+const grokMaintenanceSmokeControlArg = "--aiexpedite-maintenance-smoke"
+
+const grokMaintenanceSmokePromptPrefix = "Return exactly this marker and nothing else: "
+
+// extractGrokMaintenanceSmokeControl removes the internal maintenance-smoke
+// token and reports whether it was present. Keeping the signal separate from
+// --tools preserves ordinary no-tools invocations and their normal auth/config
+// behavior.
+func extractGrokMaintenanceSmokeControl(args []string) ([]string, bool) {
+	requested := false
+	cleaned := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == grokMaintenanceSmokeControlArg {
+			requested = true
+			continue
+		}
+		cleaned = append(cleaned, arg)
+	}
+	return cleaned, requested
+}
+
+// grokMaintenanceSmokeRequest recognises the updater's reserved marker prompt
+// envelope. Args are part of commandMsg's HMAC payload, so deriving the private
+// control bit here keeps it authenticated without adding a new wire field that
+// older publishers cannot sign. StartSession then validates the exact canonical
+// request before spawning; malformed marker requests are promoted specifically
+// so they fail closed instead of falling through as ordinary Grok sessions.
+func grokMaintenanceSmokeRequest(args []string) bool {
+	cleaned, _ := extractGrokMaintenanceSmokeControl(args)
+	shaped := buildGrokInteractiveArgs(cleaned, false)
+	for i, arg := range shaped {
+		if arg != "-p" || i+1 >= len(shaped) {
+			continue
+		}
+		return validGrokMaintenanceSmokePrompt(shaped[i+1])
+	}
+	return false
+}
+
+func validGrokMaintenanceSmokePrompt(prompt string) bool {
+	marker := strings.TrimPrefix(prompt, grokMaintenanceSmokePromptPrefix)
+	return marker != prompt && strings.TrimSpace(marker) != "" && !strings.ContainsAny(marker, "\r\n")
+}
+
+// validateGrokMaintenanceSmokeRequestArgs accepts only the updater's canonical
+// signed wire argv. In particular, permission, model/provider, system-prompt,
+// schema, sandbox, rules, and debug-output options are rejected before the
+// general builder can strip or normalize them. The error is deliberately fixed
+// text so an option value containing credentials or a private path is never
+// reflected into a published session error.
+func validateGrokMaintenanceSmokeRequestArgs(args []string) error {
+	if len(args) != 8 ||
+		args[0] != "--tools" || args[1] != "" ||
+		args[2] != "--disable-web-search" ||
+		args[3] != "--no-subagents" ||
+		args[4] != "--max-turns" || args[5] != "1" ||
+		args[6] != "--verbatim" ||
+		!validGrokMaintenanceSmokePrompt(args[7]) {
+		return fmt.Errorf("grok maintenance smoke must use the exact no-tools single-turn contract")
+	}
+	return nil
+}
+
+// grokArgsRequestNoTools validates the smoke's explicit empty built-in-tool
+// filter. It is not itself a maintenance-smoke classifier; the separate signed
+// control token above selects that behavior.
+func grokArgsRequestNoTools(args []string) bool {
+	if len(args) < 5 || args[0] != "--output-format" || args[1] != "streaming-json" || args[2] != "--no-auto-update" {
+		return false
+	}
+	hasManagedPrompt := false
+	for i := 3; i < len(args); i++ {
+		if args[i] == "-p" && i+1 < len(args) {
+			hasManagedPrompt = true
+			break
+		}
+	}
+	if !hasManagedPrompt {
+		return false
+	}
+	count := 0
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case strings.HasPrefix(arg, "--tools="):
+			count++
+			if arg != "--tools=" {
+				return false
+			}
+		case arg == "--tools":
+			count++
+			if i+1 >= len(args) || args[i+1] != "" {
+				return false
+			}
+			i++
+		}
+	}
+	return count == 1
+}
+
+// validateGrokMaintenanceSmokeContract verifies the final child argv after the
+// general Grok builder has injected its protocol controls. Keeping this exact
+// prevents future builder changes from silently adding an approval, provider,
+// filesystem, or response-shaping option to the maintenance child.
+func validateGrokMaintenanceSmokeContract(args []string) error {
+	if len(args) != 12 ||
+		args[0] != "--output-format" || args[1] != "streaming-json" ||
+		args[2] != "--no-auto-update" ||
+		args[3] != "--tools" || args[4] != "" ||
+		args[5] != "--disable-web-search" ||
+		args[6] != "--no-subagents" ||
+		args[7] != "--max-turns" || args[8] != "1" ||
+		args[9] != "--verbatim" || args[10] != "-p" ||
+		!validGrokMaintenanceSmokePrompt(args[11]) {
+		return fmt.Errorf("grok maintenance smoke child argv violates the exact no-tools single-turn contract")
+	}
+	return nil
+}
+
+// grokNoToolsExternalLoaderArg rejects caller-controlled loader surfaces that
+// would defeat the isolated no-tools home. It returns only the canonical flag
+// name, never an equals-form value: those values can contain credentials, raw
+// agent JSON, or private file paths and are interpolated into a published start
+// error by StartSession.
+func grokNoToolsExternalLoaderArg(args []string) (string, bool) {
+	for _, arg := range args {
+		lower := strings.ToLower(arg)
+		for _, name := range []string{
+			"--plugin-dir", "--config", "--agent", "--agents",
+			"--cwd", "-w", "--worktree", "--worktree-ref", "--ref",
+			"-r", "--resume", "-c", "--continue", "-s", "--session-id",
+			"--fork-session", "--restore-code", "--leader-socket",
+		} {
+			if lower == name || strings.HasPrefix(lower, name+"=") {
+				return name, true
+			}
+		}
+	}
+	return "", false
+}
+
+// sanitizeGrokMaintenanceSmokeEnv is stricter than the reusable ACP sanitizer:
+// maintenance smokes must not inherit any Grok execution, routing, logging, or
+// extension-discovery override. Grok's environment surface grows independently
+// of this agent, so a denylist is unsafe here: strip every inherited GROK_* and
+// OTEL_* variable, plus related xAI endpoint and Rust diagnostic controls, then
+// add back only fixed-off compatibility/tool-scanner controls. OTEL_* must be
+// removed even though GROK_EXTERNAL_OTEL is also stripped: a system managed
+// `[telemetry] otel_enabled = true` survives GROK_HOME isolation and otherwise
+// turns inherited exporter/content controls back on. This also prevents
+// GROK_LOG_FILE from persisting raw diagnostics outside the isolated home and
+// RUST_LOG/RUST_BACKTRACE or an OTEL console exporter from adding non-protocol
+// output to the exact marker.
+var grokMaintenanceSmokeVersionProbeFn = func(executable string) string {
+	return probeVersionArgsWithEnv(executable, sanitizeGrokMaintenanceSmokeEnv(os.Environ()), "--version")
+}
+
+// resolveGrokMaintenanceSmokeExecutable returns the binary the maintenance
+// smoke will exec. Relative explicit paths (./grok, bin/grok) are resolved
+// against the caller's cwd before the child working directory is switched to
+// the isolated workspace; otherwise the version probe and the spawn would
+// look in different places.
+func resolveGrokMaintenanceSmokeExecutable(command, cwd string) string {
+	executable := resolveExecutable(command)
+	if !isRelativeExplicitPath(executable) {
+		return executable
+	}
+	base := strings.TrimSpace(cwd)
+	if base == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return executable
+		}
+		base = wd
+	}
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return filepath.Clean(filepath.Join(base, executable))
+	}
+	return filepath.Clean(filepath.Join(absBase, executable))
+}
+
+func sanitizeGrokMaintenanceSmokeEnv(env []string) []string {
+	base := sanitizeGrokACPEnv(env, false)
+	filtered := make([]string, 0, len(base)+2)
+	for _, entry := range base {
+		name, _, _ := strings.Cut(entry, "=")
+		upper := strings.ToUpper(name)
+		if strings.HasPrefix(upper, "GROK_") || strings.HasPrefix(upper, "OTEL_") || upper == "XAI_API_BASE_URL" ||
+			upper == "RUST_LOG" || upper == "RUST_BACKTRACE" || upper == "RUST_LIB_BACKTRACE" {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	for _, name := range []string{
+		"GROK_CURSOR_SKILLS_ENABLED", "GROK_CURSOR_RULES_ENABLED", "GROK_CURSOR_AGENTS_ENABLED",
+		"GROK_CURSOR_MCPS_ENABLED", "GROK_CURSOR_HOOKS_ENABLED", "GROK_CURSOR_SESSIONS_ENABLED",
+		"GROK_CLAUDE_SKILLS_ENABLED", "GROK_CLAUDE_RULES_ENABLED", "GROK_CLAUDE_AGENTS_ENABLED",
+		"GROK_CLAUDE_MCPS_ENABLED", "GROK_CLAUDE_HOOKS_ENABLED", "GROK_CLAUDE_SESSIONS_ENABLED",
+		"GROK_CODEX_SKILLS_ENABLED", "GROK_CODEX_RULES_ENABLED", "GROK_CODEX_AGENTS_ENABLED",
+		"GROK_CODEX_MCPS_ENABLED", "GROK_CODEX_HOOKS_ENABLED", "GROK_CODEX_SESSIONS_ENABLED",
+		"GROK_MANAGED_MCPS_ENABLED", "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
+		"GROK_WORKSPACE_TOOL_DEFS_ENABLED", "GROK_WORKSPACE_TOOL_STATE_ENABLED",
+	} {
+		filtered = setEnvVar(filtered, name, "0")
+	}
+	return filtered
+}
+
 // buildGrokInteractiveArgs builds Grok Build CLI (`grok`) args for a one-shot
 // headless turn streamed as JSON.
 //
@@ -2968,6 +3317,12 @@ func rewriteGrokPromptToFile(cliArgs []string) (newArgs []string, cleanupPath st
 // Returns cliArgs only — there is no stdin prompt (stdinPromptFormat returns ""
 // for grok), the prompt is the value of `-p`.
 func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []string {
+	// gateSessionEntryCommand also invokes the argv builder before StartSession.
+	// Strip the internal signed control there as defence in depth; StartSession
+	// consumes it separately before calling this builder so it retains the
+	// explicit boolean that selects isolation.
+	args, _ = extractGrokMaintenanceSmokeControl(args)
+
 	// Grok flags that consume the NEXT token as their value — without this,
 	// e.g. `--model grok-4` would treat "grok-4" as a prompt word. The
 	// `--flag=value` form is one token and needs no entry here.
@@ -2975,10 +3330,17 @@ func buildGrokInteractiveArgs(args []string, enableGrokAlwaysApprove bool) []str
 		"-m": true, "--model": true,
 		"--effort": true, "--reasoning-effort": true,
 		"--max-turns": true, "--agent": true, "--agents": true,
+		// Grok 1.0.13's headless-only tool filters take a comma-separated
+		// value. In particular, the maintenance smoke passes an explicit empty
+		// --tools value to request a tool-free turn. If the empty token is
+		// mistaken for prompt text, --tools consumes the later managed -p flag
+		// and Grok exits before returning the marker.
+		"--tools": true, "--disallowed-tools": true,
 		"--cwd": true, "--permission-mode": true, "--sandbox": true,
 		"--compaction-mode": true, "--compaction-detail": true,
 		"--rules": true, "--system-prompt-override": true,
 		"--leader-socket": true, "--debug-file": true,
+		"--json-schema": true, "--worktree-ref": true, "--ref": true,
 		// Plugin discovery: xAI's plugin docs list `--plugin-dir <PATH>` as a
 		// separate-value flag. Without this entry, `grok --plugin-dir /tmp/p
 		// fix bug` would land "/tmp/p" in promptParts and the bare `--plugin-dir`

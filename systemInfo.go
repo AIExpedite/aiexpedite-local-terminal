@@ -416,6 +416,14 @@ func probeVersion(cmd, flag string) string {
 }
 
 func probeVersionArgs(cmd string, args ...string) string {
+	return probeVersionArgsWithEnv(cmd, nil, args...)
+}
+
+// probeVersionArgsWithEnv is the environment-controlled variant used by
+// callers that must not let a diagnostic probe inherit agent-specific routing,
+// logging, or extension-discovery overrides. A nil env preserves the ordinary
+// os.Environ inheritance used by machine-info probes.
+func probeVersionArgsWithEnv(cmd string, env []string, args ...string) string {
 	if _, err := exec.LookPath(cmd); err != nil {
 		return ""
 	}
@@ -423,6 +431,9 @@ func probeVersionArgs(cmd string, args ...string) string {
 	defer cancel()
 	c := exec.CommandContext(ctx, cmd, args...)
 	hideWindow(c) // prevent console flash on Windows
+	if env != nil {
+		c.Env = env
+	}
 	out, err := c.CombinedOutput()
 	if err != nil {
 		return ""
@@ -501,8 +512,18 @@ func gatherCLIAgents() map[string]detectedCLIAgent {
 		// Probe via the resolved absolute path so fallback-located binaries
 		// (e.g. grok in ~/.grok/bin) still report a version; probeVersionArgs
 		// runs `exec.LookPath` internally and that accepts absolute paths.
-		if v := cachedProbeVersion(path); v != "" {
-			entry.Version = v
+		var version string
+		if a.ID == "grok" {
+			// A maintenance cycle refreshes usage immediately after its smoke.
+			// Keep that Grok --version child on the same deny-by-default env policy
+			// so inherited RUST_LOG/GROK_LOG_FILE cannot add raw diagnostics or
+			// persist them while the signed usage result is being assembled.
+			version = cachedProbeVersionWithEnv(path, sanitizeGrokMaintenanceSmokeEnv(os.Environ()))
+		} else {
+			version = cachedProbeVersion(path)
+		}
+		if version != "" {
+			entry.Version = version
 		}
 		agents[a.ID] = entry
 	}
@@ -622,9 +643,13 @@ var (
 // when the binary is unchanged by (path, mtime, size). Falls through to an
 // uncached probe when the binary cannot be stat'ed.
 func cachedProbeVersion(path string) string {
+	return cachedProbeVersionWithEnv(path, nil)
+}
+
+func cachedProbeVersionWithEnv(path string, env []string) string {
 	info, err := os.Stat(path)
 	if err != nil {
-		return probeVersionArgs(path, "--version")
+		return probeVersionArgsWithEnv(path, env, "--version")
 	}
 	key := versionProbeKey{Path: path, ModUnix: info.ModTime().UnixNano(), Size: info.Size()}
 
@@ -635,7 +660,7 @@ func cachedProbeVersion(path string) string {
 		return cached
 	}
 
-	v := probeVersionArgs(path, "--version")
+	v := probeVersionArgsWithEnv(path, env, "--version")
 	versionProbeMu.Lock()
 	// Cache negatives too: a binary that reliably fails --version would
 	// otherwise re-spawn a doomed child on every single gather, which is the

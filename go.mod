@@ -5,6 +5,7 @@ go 1.25.8
 require (
 	cloud.google.com/go/pubsub/v2 v2.7.0 // direct
 	cloud.google.com/go/storage v1.66.0 // direct
+	github.com/BurntSushi/toml v1.6.0 // direct
 	github.com/getlantern/systray v1.2.2 // direct
 	golang.org/x/mod v0.40.0 // semver‑compare helper
 	golang.org/x/sys v0.47.0 // direct

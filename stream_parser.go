@@ -480,6 +480,12 @@ func extractGrokDisplayText(raw map[string]interface{}, line string) string {
 	switch eventType {
 	case "text":
 		text, _ := raw["text"].(string)
+		if text == "" {
+			// Grok 1.0.13 renamed the streaming-json text payload from
+			// `text` to `data`. Keep the legacy field first so older installed
+			// versions remain compatible across a maintenance update.
+			text, _ = raw["data"].(string)
+		}
 		return text
 
 	case "tool_use":

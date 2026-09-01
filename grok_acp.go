@@ -55,6 +55,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/BurntSushi/toml"
+	"golang.org/x/mod/semver"
 )
 
 const (
@@ -372,6 +375,10 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return fmt.Errorf("cwd %q symlink resolution failed: %w", cwd, err)
 	}
 	resolvedRoot := resolvedCwd
+	args, err := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove)
+	if err != nil {
+		return err
+	}
 
 	// Hold the manager mutex across the entire spawn so two concurrent Start
 	// calls for the same id can't both pass the existence check and double-
@@ -408,7 +415,6 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		return err
 	}
 
-	args := buildGrokACPArgs(extraArgs, opts.AllowAlwaysApprove)
 	// args is `{"agent", "--model", <model>, ...}` by buildGrokACPArgs's
 	// validated contract (see grokACPDefaultModel block); pull args[2] so
 	// setupIsolatedGrokHome carries over the matching per-model api_key when
@@ -1405,8 +1411,11 @@ const grokACPDefaultModel = "grok-build"
 // supported channels instead: XAI_API_KEY env (preserved by sanitizeGrokACPEnv
 // when AllowAPIKeyFallback=true) and the persisted `[model] api_key` line that
 // setupIsolatedGrokHome copies into the isolated config.toml on the same gate.
-func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
-	model, sanitized := sanitizeGrokACPExtraArgs(extraArgs, grokACPDefaultModel, allowAlwaysApprove)
+func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) ([]string, error) {
+	model, sanitized, err := sanitizeGrokACPExtraArgs(extraArgs, grokACPDefaultModel, allowAlwaysApprove)
+	if err != nil {
+		return nil, err
+	}
 
 	args := []string{"agent", "--model", model}
 	if allowAlwaysApprove {
@@ -1417,7 +1426,7 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) []string {
 	// subcommand (constraint #2 above).
 	args = append(args, sanitized...)
 	args = append(args, "stdio")
-	return args
+	return args, nil
 }
 
 // setupIsolatedGrokHome creates a per-session temp dir to use as the child's
@@ -1463,6 +1472,18 @@ func setupIsolatedGrokHome(allowAPIKeyFallback bool, runtimeModel string) (strin
 }
 
 func setupIsolatedGrokHomeFrom(allowAPIKeyFallback bool, runtimeModel, srcBase string) (string, error) {
+	return setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback, runtimeModel, srcBase, true)
+}
+
+// setupIsolatedGrokSmokeHomeFrom creates the same auth-only, MCP-disabled home
+// as the ACP path without linking the user's persistent conversation store.
+// A one-shot maintenance smoke never resumes a conversation, so exposing that
+// store would add filesystem surface without serving the smoke contract.
+func setupIsolatedGrokSmokeHomeFrom(srcBase string) (string, error) {
+	return setupIsolatedGrokHomeWithSessionStore(false, "", srcBase, false)
+}
+
+func setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback bool, runtimeModel, srcBase string, linkSessionStore bool) (string, error) {
 	dir, err := os.MkdirTemp("", "grok-acp-home-")
 	if err != nil {
 		return "", fmt.Errorf("create isolated grok home: %w", err)
@@ -1520,16 +1541,18 @@ func setupIsolatedGrokHomeFrom(allowAPIKeyFallback bool, runtimeModel, srcBase s
 		return "", fmt.Errorf("write isolated config.toml: %w", werr)
 	}
 
-	// Point `sessions` at the persistent per-device conversation store. Grok
-	// keys transcripts by GROK_HOME, so without this the store dies with the
-	// temp dir and every cross-session `session/load` fails FS_NOT_FOUND (see
-	// grok_session_store.go). Non-fatal by design: a session with an
-	// ephemeral store still runs, it just cannot be reattached later.
-	if lerr := linkGrokSessionStore(dir); lerr != nil {
-		fmt.Printf("%s[grok-acp] conversation store not persisted (resume will cold-start): %v%s\n",
-			colorYellow, lerr, colorReset)
+	if linkSessionStore {
+		// Point `sessions` at the persistent per-device conversation store. Grok
+		// keys transcripts by GROK_HOME, so without this the store dies with the
+		// temp dir and every cross-session `session/load` fails FS_NOT_FOUND (see
+		// grok_session_store.go). Non-fatal by design: a session with an
+		// ephemeral store still runs, it just cannot be reattached later.
+		if lerr := linkGrokSessionStore(dir); lerr != nil {
+			fmt.Printf("%s[grok-acp] conversation store not persisted (resume will cold-start): %v%s\n",
+				colorYellow, lerr, colorReset)
+		}
+		pruneGrokSessionStoreOnce()
 	}
-	pruneGrokSessionStoreOnce()
 
 	return dir, nil
 }
@@ -1677,13 +1700,14 @@ func grokSystemPinnedAPIKey(runtimeModel string) bool {
 // level keyword sweep, not a TOML parser — because the only goal here is to
 // catch the dangerous markers the argv-strip surface in
 // sanitizeGrokACPExtraArgs / sanitizeGrokACPEnv already neutralises at the
-// per-process layer. Missing/unreadable files ⇒ skipped (best-effort by
-// design; matches setupIsolatedGrokHome's tolerance for missing inputs).
+// per-process layer. Missing TOML files are skipped; the shared Claude JSON
+// inspector separately fails closed when an existing managed file cannot be
+// read completely or parsed safely.
 func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) error {
 	if allowAPIKey && allowAlwaysApprove {
 		return nil
 	}
-	for _, p := range []string{grokSystemRequirementsPath, grokSystemManagedConfigPath} {
+	for _, p := range grokSystemConfigPathsFn() {
 		if err := detectPinnedSystemGrokRequirementsFile(p, allowAPIKey, allowAlwaysApprove); err != nil {
 			return err
 		}
@@ -1697,12 +1721,621 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 		// closed when an MDM policy has set one and the workspace has not
 		// opted into EnableGrokAlwaysApprove.
 		for _, p := range claudeManagedSettingsPathsFn() {
-			if hit, ok := detectClaudeManagedSettingsAllowRule(p); ok {
-				return fmt.Errorf("grok imports Claude Code's managed-settings.json permission rules and %s contains a `permissions.allow` entry; the per-session isolated GROK_HOME cannot override an imported Claude allow rule — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the imported allow rule", hit)
+			ok, err := inspectClaudeManagedSettingsAllowRule(p)
+			if err != nil {
+				return fmt.Errorf("grok cannot safely inspect Claude managed settings; refusing to spawn")
+			}
+			if ok {
+				return fmt.Errorf("grok imports Claude Code's managed-settings.json permission rules and the managed policy contains a `permissions.allow` entry; the per-session isolated GROK_HOME cannot override an imported Claude allow rule — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the imported allow rule")
 			}
 		}
 	}
 	return nil
+}
+
+// detectGrokMaintenanceSmokeSystemConfig applies the stricter system-layer
+// posture required by the subscription-only, no-tools maintenance smoke.
+// GROK_HOME isolation cannot hide xAI's system requirements/managed-config
+// layers, so decode their TOML semantics and refuse pinned credentials,
+// permissive approval, external-tool definitions, or settings that re-enable
+// vendor MCP discovery.
+func detectGrokMaintenanceSmokeSystemConfig(grokVersion string) error {
+	for _, path := range grokSystemConfigPathsFn() {
+		finding, ok, err := inspectGrokSystemConfigSemantic(path, grokVersion)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if finding.credential || finding.externalProvider || finding.permissiveApproval {
+			return fmt.Errorf("grok system configuration pins credentials, external provider routing, or a permissive approval policy; refusing no-tools maintenance smoke")
+		}
+		if finding.toolCategory != "" {
+			return fmt.Errorf("grok system configuration contains disallowed %q settings; refusing no-tools maintenance smoke", finding.toolCategory)
+		}
+	}
+	// Claude's managed-settings compatibility layer is JSON rather than TOML,
+	// so keep its dedicated semantic reader alongside the TOML traversal.
+	for _, path := range claudeManagedSettingsPathsFn() {
+		ok, err := inspectClaudeManagedSettingsAllowRule(path)
+		if err != nil {
+			return fmt.Errorf("grok system configuration cannot be inspected safely; refusing no-tools maintenance smoke")
+		}
+		if ok {
+			return fmt.Errorf("grok system configuration pins credentials or a permissive approval policy; refusing no-tools maintenance smoke")
+		}
+	}
+	return nil
+}
+
+type grokSystemSemanticFinding struct {
+	credential         bool
+	externalProvider   bool
+	permissiveApproval bool
+	toolCategory       string
+}
+
+// inspectGrokSystemConfigSemantic parses one system TOML layer and walks its
+// decoded key tree. Inline tables, quoted keys, dotted keys, and table syntax
+// therefore share the same normalized semantic paths instead of relying on
+// lexical spellings. No caller-controlled key, section, value, or path is ever
+// returned: maintenance refusals publish only fixed classifications.
+func inspectGrokSystemConfigSemantic(path, grokVersion string) (grokSystemSemanticFinding, bool, error) {
+	var finding grokSystemSemanticFinding
+	if path == "" {
+		return finding, false, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return finding, false, nil
+		}
+		return finding, false, fmt.Errorf("grok system configuration is unreadable; refusing no-tools maintenance smoke")
+	}
+	defer f.Close()
+
+	const maxBytes = 1 << 20
+	if info, statErr := f.Stat(); statErr != nil {
+		return finding, false, fmt.Errorf("grok system configuration cannot be inspected; refusing no-tools maintenance smoke")
+	} else if info.Size() > maxBytes {
+		return finding, false, fmt.Errorf("grok system configuration exceeds the inspection limit; refusing no-tools maintenance smoke")
+	}
+	data, readErr := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if readErr != nil {
+		return finding, false, fmt.Errorf("grok system configuration cannot be inspected; refusing no-tools maintenance smoke")
+	}
+	if len(data) > maxBytes {
+		return finding, false, fmt.Errorf("grok system configuration exceeds the inspection limit; refusing no-tools maintenance smoke")
+	}
+	var decoded map[string]any
+	if _, decodeErr := toml.Decode(string(data), &decoded); decodeErr != nil {
+		return finding, false, fmt.Errorf("grok system configuration cannot be parsed safely; refusing no-tools maintenance smoke")
+	}
+	effective, effectiveErr := effectiveGrokSystemConfigForVersion(decoded, grokVersion)
+	if effectiveErr != nil {
+		return finding, false, fmt.Errorf("grok system configuration version overrides cannot be evaluated safely; refusing no-tools maintenance smoke")
+	}
+	walkGrokSystemConfigSemantic(effective, nil, &finding)
+	return finding, true, nil
+}
+
+// normalizeGrokConfigVersion extracts the semver reported by `grok --version`
+// and normalizes it for x/mod comparisons. Grok's output is prefixed (for
+// example, "grok 1.0.13"), while semver expects a leading v.
+func normalizeGrokConfigVersion(raw string) string {
+	match := semverRe.FindString(strings.TrimSpace(raw))
+	if match == "" {
+		return ""
+	}
+	version := "v" + match
+	if !semver.IsValid(version) {
+		return ""
+	}
+	return version
+}
+
+func normalizeGrokOverrideBound(value any) string {
+	raw, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "v")
+	if raw == "" {
+		return ""
+	}
+	version := "v" + raw
+	if !semver.IsValid(version) {
+		return ""
+	}
+	return version
+}
+
+// effectiveGrokSystemConfigForVersion applies Grok's documented inclusive
+// [[version_overrides]] patches before semantic classification. Each entry has
+// required minimum_version/maximum_version selectors and carries its patch keys
+// directly. Inactive historical/future entries are deliberately not walked;
+// malformed selectors fail closed because their applicability is unknowable.
+func effectiveGrokSystemConfigForVersion(decoded map[string]any, grokVersion string) (map[string]any, error) {
+	effective := cloneGrokSemanticTable(decoded)
+	var rawOverrides any
+	overrideKeys := 0
+	for rawKey, value := range effective {
+		if normalizeGrokSemanticKey(rawKey) == "version_overrides" {
+			rawOverrides = value
+			delete(effective, rawKey)
+			overrideKeys++
+		}
+	}
+	if overrideKeys == 0 {
+		return effective, nil
+	}
+	if overrideKeys != 1 {
+		return nil, fmt.Errorf("ambiguous version overrides")
+	}
+	runtimeVersion := normalizeGrokConfigVersion(grokVersion)
+	if runtimeVersion == "" {
+		// The ACP policy preflight historically scans every entry conservatively
+		// and does not know its CLI version. Preserve that behavior; maintenance
+		// smokes always supply the probed installed version above.
+		return decoded, nil
+	}
+	overrides, ok := grokVersionOverrideTables(rawOverrides)
+	if !ok {
+		return nil, fmt.Errorf("invalid version overrides")
+	}
+	for _, override := range overrides {
+		var minimum, maximum string
+		minimumKeys, maximumKeys := 0, 0
+		patch := make(map[string]any, len(override))
+		for rawKey, value := range override {
+			switch normalizeGrokSemanticKey(rawKey) {
+			case "minimum_version":
+				minimumKeys++
+				minimum = normalizeGrokOverrideBound(value)
+			case "maximum_version":
+				maximumKeys++
+				maximum = normalizeGrokOverrideBound(value)
+			default:
+				patch[rawKey] = value
+			}
+		}
+		if minimumKeys != 1 || maximumKeys != 1 || minimum == "" || maximum == "" || semver.Compare(minimum, maximum) > 0 {
+			return nil, fmt.Errorf("invalid version override bounds")
+		}
+		if semver.Compare(runtimeVersion, minimum) < 0 || semver.Compare(runtimeVersion, maximum) > 0 {
+			continue
+		}
+		mergeGrokSemanticTable(effective, patch)
+	}
+	return effective, nil
+}
+
+func grokVersionOverrideTables(value any) ([]map[string]any, bool) {
+	switch entries := value.(type) {
+	case []map[string]any:
+		return entries, true
+	case []any:
+		out := make([]map[string]any, 0, len(entries))
+		for _, entry := range entries {
+			table, ok := entry.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, table)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func cloneGrokSemanticTable(source map[string]any) map[string]any {
+	clone := make(map[string]any, len(source))
+	for key, value := range source {
+		if table, ok := value.(map[string]any); ok {
+			clone[key] = cloneGrokSemanticTable(table)
+		} else {
+			clone[key] = value
+		}
+	}
+	return clone
+}
+
+// mergeGrokSemanticTable follows Grok's recursive config-patch behavior. TOML
+// keys remain case-sensitive during the merge; the later classifier still
+// normalizes every surviving spelling conservatively. Treating differently
+// cased keys as the same merge target could let an ignored lookalike overwrite
+// the real effective security setting before classification.
+func mergeGrokSemanticTable(destination, patch map[string]any) {
+	for patchKey, patchValue := range patch {
+		destinationKey := patchKey
+		patchTable, patchIsTable := patchValue.(map[string]any)
+		destinationTable, destinationIsTable := destination[destinationKey].(map[string]any)
+		if patchIsTable && destinationIsTable {
+			mergeGrokSemanticTable(destinationTable, patchTable)
+			continue
+		}
+		if patchIsTable {
+			destination[destinationKey] = cloneGrokSemanticTable(patchTable)
+		} else {
+			destination[destinationKey] = patchValue
+		}
+	}
+}
+
+func normalizeGrokSemanticKey(key string) string {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(key)), "-", "_")
+}
+
+func walkGrokSystemConfigSemantic(value any, path []string, finding *grokSystemSemanticFinding) {
+	walkGrokSystemConfigSemanticScoped(value, path, false, finding)
+}
+
+// walkGrokSystemConfigSemanticScoped carries whether the current node lives
+// underneath an explicitly disabled definition. Grok keeps a disabled server or
+// plugin's full body in place — `[mcp_servers.foo]` with `enabled = false` still
+// declares its command/args/env — so descending without that context makes every
+// retained leaf look like a live tool and refuses maintenance smokes on hosts
+// where nothing can actually load. Only the tool-category classification is
+// suppressed; credential, provider, approval, and telemetry findings still fail
+// closed inside a disabled block because those values remain readable.
+func walkGrokSystemConfigSemanticScoped(value any, path []string, withinDisabled bool, finding *grokSystemSemanticFinding) {
+	switch node := value.(type) {
+	case map[string]any:
+		for rawKey, child := range node {
+			key := normalizeGrokSemanticKey(rawKey)
+			childPath := append(append([]string(nil), path...), key)
+			classifyGrokSystemSemanticValue(childPath, child, withinDisabled, finding)
+			walkGrokSystemConfigSemanticScoped(child, childPath, withinDisabled || grokSemanticDefinitionDisabled(child), finding)
+		}
+	case []map[string]any:
+		for _, child := range node {
+			walkGrokSystemConfigSemanticScoped(child, path, withinDisabled || grokSemanticDefinitionDisabled(child), finding)
+		}
+	case []any:
+		for _, child := range node {
+			walkGrokSystemConfigSemanticScoped(child, path, withinDisabled || grokSemanticDefinitionDisabled(child), finding)
+		}
+	}
+}
+
+// grokSemanticDefinitionDisabled reports whether a configuration table carries an
+// explicit boolean disablement (`enabled = false` / `disabled = true`). Only a
+// literal boolean counts: Grok's managed layers support environment expansion, so
+// `enabled = "$FLAG"` cannot be proven disabled lexically and must keep failing
+// closed. Every enablement key present has to agree, so a contradictory pair
+// (`enabled = false` next to `disabled = false`, or both true) is undecidable
+// rather than off — and the verdict does not depend on map iteration order.
+func grokSemanticDefinitionDisabled(value any) bool {
+	node, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	disabled := false
+	for rawKey, child := range node {
+		flag, isBool := child.(bool)
+		switch normalizeGrokSemanticKey(rawKey) {
+		case "enabled":
+			// Any enablement key that is not a literal `false` leaves the
+			// definition unproven — an expanded string, or a contradicting
+			// `enabled = true`, must not be read as switched off.
+			if !isBool || flag {
+				return false
+			}
+			disabled = true
+		case "disabled":
+			if !isBool || !flag {
+				return false
+			}
+			disabled = true
+		}
+	}
+	return disabled
+}
+
+func classifyGrokSystemSemanticValue(path []string, value any, withinDisabled bool, finding *grokSystemSemanticFinding) {
+	if len(path) == 0 {
+		return
+	}
+	last := path[len(path)-1]
+	if grokSemanticExternalTelemetryEnabled(path, value) {
+		// Grok's external OTEL stream is independent of product telemetry and can
+		// be enabled from managed/requirements layers that GROK_HOME isolation
+		// cannot hide. Reject with a fixed category: exporter endpoints,
+		// certificate paths, and content gates can contain private values that must
+		// never be reflected in a published maintenance error.
+		finding.toolCategory = "telemetry"
+		return
+	}
+	if last == "api_key" || last == "env_key" {
+		if strings.TrimSpace(fmt.Sprint(value)) != "" {
+			finding.credential = true
+		}
+	}
+	// The maintenance smoke must use the copied xAI subscription login and
+	// xAI's default provider. System requirements outrank the isolated home, so
+	// any external auth command, endpoint/header override, or default-model pin
+	// must fail closed even when it contains no literal api_key/env_key field.
+	if semanticGrokValueNonEmpty(value) {
+		switch {
+		case last == "auth_provider_command":
+			finding.externalProvider = true
+		case (last == "issuer" || last == "client_id") && len(path) >= 3 &&
+			path[len(path)-2] == "oidc" && path[len(path)-3] == "auth":
+			finding.externalProvider = true
+		case last == "base_url" || last == "api_base_url" || last == "models_base_url" || last == "models_list_url":
+			finding.externalProvider = true
+		case last == "extra_headers":
+			finding.externalProvider = true
+		case last == "default_model":
+			finding.externalProvider = true
+		case last == "default" && len(path) >= 2 && path[len(path)-2] == "models":
+			finding.externalProvider = true
+		}
+	}
+	if (last == "always_approve" || last == "auto_approve" || last == "yolo") && semanticGrokBool(value) {
+		finding.permissiveApproval = true
+	}
+	if last == "permission_mode" || last == "approval_mode" || last == "approval" ||
+		(last == "mode" && (len(path) == 1 || grokSemanticPathContains(path, "approval"))) {
+		if isGrokPermissionModeBypassValue(fmt.Sprint(value)) {
+			finding.permissiveApproval = true
+		}
+	}
+	if grokSemanticAllowPath(path) && semanticGrokValueNonEmpty(value) {
+		finding.permissiveApproval = true
+	}
+	if grokSemanticPermissionRulesPath(path) && semanticGrokPermissionRulesHasAllow(value) {
+		finding.permissiveApproval = true
+	}
+
+	if withinDisabled {
+		// Everything below decides whether a tool can load, and an ancestor has
+		// already answered that with an explicit disablement.
+		return
+	}
+
+	if grokSemanticVendorMCPPath(path) {
+		if enabled, ok := value.(bool); !ok || enabled {
+			finding.toolCategory = "vendor-mcp"
+		}
+		return
+	}
+	for _, component := range path {
+		switch {
+		case component == "mcp" || component == "mcps" || component == "mcpservers" ||
+			strings.HasPrefix(component, "mcp_") || strings.HasPrefix(component, "mcpserver"):
+			if finding.toolCategory == "" && semanticGrokToolEnabled(value) {
+				finding.toolCategory = "mcp"
+			}
+		case component == "plugin" || component == "plugins" ||
+			strings.HasPrefix(component, "plugin_") || strings.HasPrefix(component, "installed_plugin"):
+			if finding.toolCategory == "" && semanticGrokToolEnabled(value) {
+				finding.toolCategory = "plugin"
+			}
+		}
+	}
+}
+
+// grokSemanticExternalTelemetryEnabled recognizes the external OpenTelemetry
+// controls Grok 1.0.13 accepts under [telemetry]. Explicitly disabled values
+// remain valid; anything that activates an exporter/content gate or supplies an
+// external endpoint/certificate/key path fails closed. Non-boolean/non-string
+// values are rejected because Grok's managed layers support environment
+// expansion and their effective meaning cannot be proven safe lexically.
+func grokSemanticExternalTelemetryEnabled(path []string, value any) bool {
+	if len(path) < 2 || path[len(path)-2] != "telemetry" {
+		return false
+	}
+	last := path[len(path)-1]
+	switch last {
+	case "otel_enabled", "otel_log_user_prompts", "otel_log_tool_details":
+		enabled, ok := value.(bool)
+		return !ok || enabled
+	case "otel_metrics_exporter", "otel_logs_exporter":
+		exporter, ok := value.(string)
+		if !ok {
+			return true
+		}
+		exporter = strings.TrimSpace(exporter)
+		return exporter != "" && !strings.EqualFold(exporter, "none")
+	case "otel_endpoint", "otel_certificate", "otel_client_certificate", "otel_client_key":
+		return semanticGrokValueNonEmpty(value)
+	default:
+		return false
+	}
+}
+
+func grokSemanticPathContains(path []string, want string) bool {
+	for _, component := range path {
+		if component == want {
+			return true
+		}
+	}
+	return false
+}
+
+func grokSemanticVendorMCPPath(path []string) bool {
+	n := len(path)
+	return n >= 3 && path[n-3] == "compat" &&
+		(path[n-2] == "cursor" || path[n-2] == "claude") && path[n-1] == "mcps"
+}
+
+func grokSemanticAllowPath(path []string) bool {
+	if len(path) == 0 {
+		return false
+	}
+	last := path[len(path)-1]
+	if last == "allow_rules" || last == "allowlist" {
+		return true
+	}
+	if last != "allow" || grokSemanticPathWithinPermissionRules(path) {
+		return false
+	}
+	// A key literally named `allow` at any ordinary configuration scope is an
+	// allow list. The exception is a field nested inside permission_rules: in
+	// that structured grammar the rule's `action` decides allow vs deny, and a
+	// matcher field must not turn a deny-only policy into a false positive.
+	return true
+}
+
+func grokSemanticPathWithinPermissionRules(path []string) bool {
+	for i, component := range path {
+		if component == "permission_rules" {
+			return true
+		}
+		if component == "rules" && i > 0 && path[i-1] == "permission" {
+			return true
+		}
+	}
+	return false
+}
+
+func grokSemanticPermissionRulesPath(path []string) bool {
+	if len(path) == 0 {
+		return false
+	}
+	if path[len(path)-1] == "permission_rules" {
+		return true
+	}
+	return len(path) >= 2 && path[len(path)-2] == "permission" && path[len(path)-1] == "rules"
+}
+
+func semanticGrokPermissionRulesHasAllow(value any) bool {
+	switch node := value.(type) {
+	case map[string]any:
+		for rawKey, child := range node {
+			if normalizeGrokSemanticKey(rawKey) == "action" && strings.EqualFold(strings.TrimSpace(fmt.Sprint(child)), "allow") {
+				return true
+			}
+			// A string nested inside a structured rule is commonly a tool or
+			// pattern value, including on deny-only rules. Only recurse into
+			// additional containers here; bare strings are legacy allow rules
+			// only when they are direct entries in the rules value/array.
+			switch child.(type) {
+			case map[string]any, []map[string]any, []any:
+				if semanticGrokPermissionRulesHasAllow(child) {
+					return true
+				}
+			}
+		}
+	case []map[string]any:
+		for _, child := range node {
+			if semanticGrokPermissionRulesHasAllow(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range node {
+			if semanticGrokPermissionRulesHasAllow(child) {
+				return true
+			}
+		}
+	case string:
+		// Legacy string permission_rules entries are allow rules; structured
+		// deny rules use an explicit action field and are handled above.
+		return strings.TrimSpace(node) != ""
+	}
+	return false
+}
+
+func semanticGrokValueNonEmpty(value any) bool {
+	switch node := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(node) != ""
+	case []any:
+		return len(node) > 0
+	case []map[string]any:
+		return len(node) > 0
+	case map[string]any:
+		return len(node) > 0
+	default:
+		return true
+	}
+}
+
+func semanticGrokBool(value any) bool {
+	enabled, ok := value.(bool)
+	return ok && enabled
+}
+
+func semanticGrokToolEnabled(value any) bool {
+	switch node := value.(type) {
+	case nil:
+		return false
+	case bool:
+		return node
+	case string:
+		return strings.TrimSpace(node) != ""
+	case []any:
+		for _, child := range node {
+			if semanticGrokToolEnabled(child) {
+				return true
+			}
+		}
+		return false
+	case []map[string]any:
+		for _, child := range node {
+			if semanticGrokToolEnabled(child) {
+				return true
+			}
+		}
+		return false
+	case []string:
+		for _, child := range node {
+			if strings.TrimSpace(child) != "" {
+				return true
+			}
+		}
+		return false
+	case map[string]any:
+		if len(node) == 0 {
+			return false
+		}
+		if grokSemanticDefinitionDisabled(node) {
+			// A retained definition body (command/args/env/path) does not make a
+			// disabled entry loadable; the explicit flag outranks its siblings.
+			return false
+		}
+		hasExplicitEnablement := false
+		isEnabled := false
+		hasOtherDefinitions := false
+		for rawKey, child := range node {
+			key := normalizeGrokSemanticKey(rawKey)
+			switch key {
+			case "enabled":
+				hasExplicitEnablement = true
+				if b, ok := child.(bool); ok {
+					if b {
+						isEnabled = true
+					}
+				} else if semanticGrokToolEnabled(child) {
+					isEnabled = true
+				}
+			case "disabled":
+				hasExplicitEnablement = true
+				if b, ok := child.(bool); ok {
+					if !b {
+						isEnabled = true
+					}
+				}
+			default:
+				if semanticGrokToolEnabled(child) {
+					hasOtherDefinitions = true
+				}
+			}
+		}
+		if hasExplicitEnablement && !isEnabled && !hasOtherDefinitions {
+			return false
+		}
+		return isEnabled || hasOtherDefinitions
+	default:
+		return true
+	}
 }
 
 // detectPinnedSystemGrokRequirementsFile is the per-path scanner that backs
@@ -1712,6 +2345,19 @@ func detectPinnedSystemGrokRequirements(allowAPIKey, allowAlwaysApprove bool) er
 func detectPinnedSystemGrokRequirementsFile(path string, allowAPIKey, allowAlwaysApprove bool) error {
 	if path == "" {
 		return nil
+	}
+	// Decode semantic paths first so valid inline tables and quoted keys are
+	// classified identically to their section/dotted-key equivalents. Preserve
+	// this ACP preflight's historical best-effort behavior on unreadable or
+	// malformed files; the stricter maintenance smoke calls the same inspector
+	// directly and fails closed on those errors.
+	if finding, ok, semanticErr := inspectGrokSystemConfigSemantic(path, ""); semanticErr == nil && ok {
+		if !allowAPIKey && finding.credential {
+			return fmt.Errorf("grok requirements pin API-key auth in %s; refusing to spawn — set Config.EnableGrokAPIKeyFallback=true to opt in, or remove the pinned credential", path)
+		}
+		if !allowAlwaysApprove && finding.permissiveApproval {
+			return fmt.Errorf("grok requirements pin a permissive approval policy in %s; refusing to spawn — set Config.EnableGrokAlwaysApprove=true to opt in, or remove the pinned policy", path)
+		}
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -1807,41 +2453,55 @@ func detectPinnedSystemGrokRequirementsFile(path string, allowAPIKey, allowAlway
 // `managed-settings.json` locations. See claudeManagedSettingsPathsFn for the
 // rationale on which paths are scanned and which are deliberately omitted.
 func claudeManagedSettingsPaths() []string {
-	paths := make([]string, 0, 2)
-	switch runtime.GOOS {
+	return claudeManagedSettingsPathsForOS(runtime.GOOS, os.Getenv)
+}
+
+// claudeManagedSettingsPathsForOS keeps the production path mapping directly
+// testable. Claude Code's current Windows managed-policy directory is under
+// Program Files; the retired ProgramData location is deliberately excluded
+// because current Claude releases no longer read it.
+func claudeManagedSettingsPathsForOS(goos string, getenv func(string) string) []string {
+	paths := make([]string, 0, 1)
+	switch goos {
 	case "darwin":
 		paths = append(paths, "/Library/Application Support/ClaudeCode/managed-settings.json")
 	case "windows":
-		programData := os.Getenv("ProgramData")
-		if programData == "" {
-			programData = `C:\ProgramData`
+		programFiles := strings.TrimSpace(getenv("ProgramFiles"))
+		if programFiles == "" {
+			programFiles = `C:\Program Files`
 		}
-		paths = append(paths, filepath.Join(programData, "ClaudeCode", "managed-settings.json"))
+		paths = append(paths, filepath.Join(programFiles, "ClaudeCode", "managed-settings.json"))
 	default:
 		paths = append(paths, "/etc/claude-code/managed-settings.json")
 	}
 	return paths
 }
 
-// detectClaudeManagedSettingsAllowRule reports whether the Claude
+// inspectClaudeManagedSettingsAllowRule reports whether the Claude
 // `managed-settings.json` at `path` contains a non-empty `permissions.allow`
-// array. Returns the path on hit so the error message can point the operator
-// at the exact file. Missing/unreadable/malformed/empty files yield false —
-// best-effort by design, matching detectPinnedSystemGrokRequirementsFile's
-// tolerance for missing inputs.
-func detectClaudeManagedSettingsAllowRule(path string) (string, bool) {
+// array. A missing path is benign, but an existing file that cannot be read in
+// full or decoded must fail closed: Grok may still consume a policy that this
+// preflight otherwise skipped. Errors are fixed strings and never include the
+// managed path or file contents.
+func inspectClaudeManagedSettingsAllowRule(path string) (bool, error) {
 	if path == "" {
-		return "", false
+		return false, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return "", false
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("claude managed settings cannot be read safely")
 	}
 	defer f.Close()
 	const maxBytes = 1 << 20
-	data, err := io.ReadAll(io.LimitReader(f, maxBytes))
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
 	if err != nil {
-		return "", false
+		return false, fmt.Errorf("claude managed settings cannot be read safely")
+	}
+	if len(data) > maxBytes {
+		return false, fmt.Errorf("claude managed settings exceed the inspection limit")
 	}
 	var parsed struct {
 		Permissions struct {
@@ -1849,14 +2509,14 @@ func detectClaudeManagedSettingsAllowRule(path string) (string, bool) {
 		} `json:"permissions"`
 	}
 	if err := json.Unmarshal(data, &parsed); err != nil {
-		return "", false
+		return false, fmt.Errorf("claude managed settings cannot be parsed safely")
 	}
 	for _, rule := range parsed.Permissions.Allow {
 		if strings.TrimSpace(rule) != "" {
-			return path, true
+			return true, nil
 		}
 	}
-	return "", false
+	return false, nil
 }
 
 // grokTOMLStripInlineComment removes a trailing `# ...` comment from a TOML
@@ -2007,6 +2667,15 @@ func lineMentionsGrokApprovalPin(lower string) bool {
 	}
 	key := strings.TrimSpace(lower[:eq])
 	val := trimGrokTOMLStringQuotes(strings.TrimSpace(lower[eq+1:]))
+	if (key == "approval" || strings.HasSuffix(key, ".approval")) && strings.HasPrefix(strings.TrimSpace(val), "{") {
+		compact := strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "", "-", "_").Replace(val)
+		for _, bypass := range []string{`mode="always"`, `mode='always'`, `mode="auto"`, `mode='auto'`,
+			`mode="always_approve"`, `mode='always_approve'`, `mode="auto_approve"`, `mode='auto_approve'`} {
+			if strings.Contains(compact, bypass) {
+				return true
+			}
+		}
+	}
 	switch {
 	case (strings.Contains(key, "always_approve") || strings.Contains(key, "auto_approve") || key == "yolo") && val == "true":
 		return true
@@ -2084,15 +2753,24 @@ func setEnvVar(env []string, key, value string) []string {
 //     fallback opt-in flows through XAI_API_KEY env and the persisted
 //     `[model] api_key` config.toml line instead), the `--cwd*` containment
 //     side-door, `--always-approve` / `--auto-approve` (owned by buildGrokACPArgs), the
-//     duplicate entry tokens (`agent`/`stdio`/`chat`/`tui`/`run`), and the
-//     POSIX `--` end-of-options delimiter. `--allow <pattern>` / `--allow=…`
+//     duplicate entry tokens (`agent`/`stdio`/`chat`/`tui`/`run`) and the POSIX
+//     `--` end-of-options delimiter. Root-only one-shot flags (`--tools`,
+//     `--max-turns`, prompt/output selectors, etc.) are rejected rather than
+//     stripped: silently dropping `--tools ""` would turn a requested no-tools
+//     smoke into a fully tooled ACP session. `--allow <pattern>` / `--allow=…`
 //     are xAI's documented pre-prompt allow rules (matching tools auto-approve
 //     BEFORE the per-tool prompt runs) — stripped when allowAlwaysApprove is
 //     false, mirroring the raw `session_start` path's stripGrokAllowRulePairs
 //     sweep so a signed grok_acp_start cannot route around the per-tool prompt
 //     by handing `--allow Bash(*)` through extras. `--deny` is policy-tightening
 //     and is preserved on both sides of the gate.
-func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwaysApprove bool) (string, []string) {
+func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwaysApprove bool) (string, []string, error) {
+	if arg, ok := grokACPRootOnlyArg(extraArgs); ok {
+		return defaultModel, nil, fmt.Errorf(
+			"grok agent stdio does not support root-only option %q; use session_start for grok -p/no-tools smoke invocations",
+			arg,
+		)
+	}
 	model := defaultModel
 	cleaned := make([]string, 0, len(extraArgs))
 	skipNext := false
@@ -2222,7 +2900,36 @@ func sanitizeGrokACPExtraArgs(extraArgs []string, defaultModel string, allowAlwa
 
 		cleaned = append(cleaned, a)
 	}
-	return model, cleaned
+	return model, cleaned, nil
+}
+
+// grokACPRootOnlyArg reports the first root-command option that cannot be
+// represented by `grok agent stdio`. These options must fail closed instead of
+// being silently discarded, especially `--tools ""`: discarding that operand
+// changes a tool-free smoke into an ordinary ACP session with built-in tools.
+func grokACPRootOnlyArg(args []string) (string, bool) {
+	valueFlags := map[string]bool{
+		"--tools": true, "--disallowed-tools": true, "--max-turns": true,
+		"--agent": true, "--agents": true, "--output-format": true,
+		"--json-schema": true, "--prompt-file": true, "--prompt-json": true,
+		"--rules": true, "--system-prompt-override": true, "--sandbox": true,
+		"--worktree-ref": true, "--ref": true, "-p": true, "--single": true,
+	}
+	boolFlags := map[string]bool{
+		"--disable-web-search": true, "--no-subagents": true, "--no-plan": true,
+		"--verbatim": true, "--include-partial-messages": true,
+		"--fork-session": true, "--restore-code": true,
+	}
+	for _, arg := range args {
+		lower := strings.ToLower(arg)
+		if valueFlags[lower] || boolFlags[lower] {
+			return arg, true
+		}
+		if eq := strings.IndexByte(lower, '='); eq > 0 && valueFlags[lower[:eq]] {
+			return arg[:eq], true
+		}
+	}
+	return "", false
 }
 
 // redactGrokACPArgsForLog masks credential-bearing values before the startup

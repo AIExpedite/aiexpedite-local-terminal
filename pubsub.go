@@ -5857,7 +5857,15 @@ func gateSessionEntryCommand(ctx context.Context, topic *pubsub.Publisher, m *pu
 			return true
 		}
 		allowCommand = "grok"
-		allowArgs = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAlwaysApprove)
+		var buildErr error
+		allowArgs, buildErr = buildGrokACPArgs(cmd.Args, cfg.EnableGrokAlwaysApprove)
+		if buildErr != nil {
+			// The manager will publish the authoritative start refusal before
+			// spawn. Do not render the rejected raw argv in an approval dialog:
+			// it may contain prompt/config-file operands and no executable action
+			// remains for the user to approve.
+			return true
+		}
 		dialogArgs = redactGrokACPArgsForLog(allowArgs)
 		denyOutput = "grok ACP session denied by user: not in allow list"
 		// NEVER persist an allow-list entry for a Grok ACP session. Both paths
@@ -6008,7 +6016,7 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 		err := globalSessionManager.StartSession(
 			cmd.SessionID,
 			cmd.Command,
-			cmd.Args,
+			sessionStartArgsForCommand(cmd),
 			cmd.Cwd,
 			cmd.WorkspaceID,
 			cmd.UID,
@@ -6017,7 +6025,12 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 			publishFn,
 		)
 		if err != nil {
-			publishSessionError(ctx, topic, cmd, fmt.Sprintf("failed to start session: %v", err))
+			msg := fmt.Sprintf("failed to start session: %v", err)
+			if typed := grokAuthErrorFrom(err); typed != nil {
+				publishSessionErrorWithCode(ctx, topic, cmd, msg, typed.Code)
+				return
+			}
+			publishSessionError(ctx, topic, cmd, msg)
 			return
 		}
 
@@ -6081,8 +6094,36 @@ func handleSessionCommand(ctx context.Context, topic *pubsub.Publisher, cmd comm
 	}
 }
 
+// sessionStartArgsForCommand promotes the updater's reserved, signed Grok smoke
+// prompt envelope into the private in-process control consumed by
+// SessionManager. StartSession validates the exact argv contract; promoting a
+// malformed reserved request makes it fail closed rather than run as an
+// ordinary session. Unrelated no-tools requests remain unchanged.
+func sessionStartArgsForCommand(cmd commandMsg) []string {
+	if !isGrokCommand(cmd.Command) {
+		return cmd.Args
+	}
+	if _, explicit := extractGrokMaintenanceSmokeControl(cmd.Args); explicit {
+		return cmd.Args
+	}
+	if !grokMaintenanceSmokeRequest(cmd.Args) {
+		return cmd.Args
+	}
+	out := make([]string, 0, len(cmd.Args)+1)
+	out = append(out, grokMaintenanceSmokeControlArg)
+	out = append(out, cmd.Args...)
+	return out
+}
+
 // publishSessionError publishes an error result for a session command.
 func publishSessionError(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg string) {
+	publishSessionErrorWithCode(ctx, topic, cmd, errMsg, "")
+}
+
+// publishSessionErrorWithCode is the session_start counterpart of
+// publishGrokACPError: keep GROK_NOT_AUTHENTICATED on errorCode so consumers
+// never have to infer it from free-form Output text.
+func publishSessionErrorWithCode(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, errMsg, errorCode string) {
 	fmt.Printf("%s[session] Error: %s%s\n", colorRed, errMsg, colorReset)
 
 	res := resultMsg{
@@ -6095,6 +6136,9 @@ func publishSessionError(ctx context.Context, topic *pubsub.Publisher, cmd comma
 		Version:     Version,
 		Type:        "session_error",
 		SessionID:   cmd.SessionID,
+	}
+	if errorCode != "" {
+		res.ErrorCode = errorCode
 	}
 	if err := publishMsg(ctx, topic, res); err != nil {
 		fmt.Printf("%s[session] Failed to publish error: %v%s\n", colorRed, err, colorReset)

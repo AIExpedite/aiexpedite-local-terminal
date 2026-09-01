@@ -24,6 +24,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,6 +40,11 @@ import (
 )
 
 const mockCLIEnvVar = "TEST_MOCK_CLI_MODE"
+const mockGrokPersistentHomeEnv = "TEST_MOCK_GROK_PERSISTENT_HOME"
+const mockGrokVendorHomeEnv = "TEST_MOCK_GROK_VENDOR_HOME"
+const mockGrokProjectRootEnv = "TEST_MOCK_GROK_PROJECT_ROOT"
+
+const grokMaintenanceSmokeMarker = "AIEXPEDITE_GROK_SMOKE_MARKER_7F3C2A"
 
 // TestMain dispatches into the mock CLI when the env var is set; otherwise
 // runs the test suite normally. This is the standard "test binary as helper
@@ -337,6 +343,22 @@ func runMockCLI(mode string) {
 		fmt.Println("grok 1.1.0")
 		os.Exit(0)
 
+	case "grok-maintenance-smoke-v1", "grok-maintenance-smoke-v2":
+		runMockGrokMaintenanceSmoke(mode)
+
+	case "grok-ordinary-no-tools":
+		args := os.Args[1:]
+		tools, hasTools := mockArgValue(args, "--tools")
+		if os.Getenv("GROK_HOME") != os.Getenv(mockGrokPersistentHomeEnv) ||
+			os.Getenv("XAI_API_KEY") != "credential-sentinel-api-key" ||
+			!hasTools || tools != "" || mockHasArg(args, grokMaintenanceSmokeControlArg) {
+			fmt.Fprintln(os.Stderr, "ordinary no-tools contract changed")
+			os.Exit(1)
+		}
+		fmt.Println(`{"type":"text","data":"ordinary-no-tools-ok"}`)
+		fmt.Println(`{"type":"end","stopReason":"end_turn"}`)
+		os.Exit(0)
+
 	case "grok-acp-usage-limit":
 		// Emit a single ACP `session/update` notification that carries a
 		// usage_limit_reached signal under params.update.sessionUpdate, then
@@ -397,6 +419,163 @@ func runMockCLI(mode string) {
 	}
 }
 
+// runMockGrokMaintenanceSmoke enforces the Grok 1.0.13 no-tools, one-shot
+// argv contract at the process boundary. It deliberately emits the legacy
+// `text` payload before the simulated update and 1.0.13's `data` payload after
+// it so the same SessionManager lifecycle proves protocol compatibility across
+// replacement. Failures expose only a generic protocol error, never argv,
+// prompt-file contents, or billing-log data.
+func runMockGrokMaintenanceSmoke(mode string) {
+	// Model Grok's documented diagnostics for both `--version` and the smoke:
+	// if the parent leaks either override, the probe/output is contaminated and
+	// GROK_LOG_FILE persists raw output outside the isolated home.
+	if os.Getenv("RUST_LOG") != "" {
+		fmt.Fprintln(os.Stderr, "debug-stderr-contamination-sentinel")
+	}
+	if logPath := os.Getenv("GROK_LOG_FILE"); logPath != "" {
+		_ = os.WriteFile(logPath, []byte("external-log-sentinel"), 0o600)
+	}
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(strings.ToUpper(name), "OTEL_") {
+			// A leaked console exporter models non-protocol output; an OTLP
+			// exporter models the external marker/identity disclosure path.
+			fmt.Fprintln(os.Stderr, "otel-output-contamination-sentinel")
+			break
+		}
+	}
+	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		if mode == "grok-maintenance-smoke-v1" {
+			fmt.Println("grok 1.0.5")
+		} else {
+			fmt.Println("grok 1.0.13")
+		}
+		os.Exit(0)
+	}
+
+	args := os.Args[1:]
+	isolatedHome := os.Getenv("GROK_HOME")
+	persistentHome := os.Getenv(mockGrokPersistentHomeEnv)
+	vendorHome := os.Getenv(mockGrokVendorHomeEnv)
+	projectRoot := os.Getenv(mockGrokProjectRootEnv)
+	workingDir, workingDirErr := os.Getwd()
+	isolatedConfig, configErr := os.ReadFile(filepath.Join(isolatedHome, "config.toml"))
+	_, isolatedPluginErr := os.Stat(filepath.Join(isolatedHome, "plugins", "host-plugin"))
+	_, isolatedMCPErr := os.Stat(filepath.Join(isolatedHome, "mcp.json"))
+	_, isolatedSessionsErr := os.Lstat(filepath.Join(isolatedHome, "sessions"))
+	_, copiedAuthErr := os.Stat(filepath.Join(isolatedHome, "auth.json"))
+	_, hostPluginErr := os.Stat(filepath.Join(persistentHome, "plugins", "host-plugin"))
+	_, hostMCPErr := os.Stat(filepath.Join(persistentHome, "mcp.json"))
+	_, cursorMCPErr := os.Stat(filepath.Join(vendorHome, ".cursor", "mcp.json"))
+	_, projectConfigErr := os.Stat(filepath.Join(projectRoot, ".grok", "config.toml"))
+	_, projectPluginErr := os.Stat(filepath.Join(projectRoot, ".grok", "plugins", "project-plugin", "plugin.json"))
+	_, projectMCPErr := os.Stat(filepath.Join(projectRoot, ".mcp.json"))
+	_, isolatedProjectConfigErr := os.Stat(filepath.Join(workingDir, ".grok", "config.toml"))
+	_, isolatedProjectPluginErr := os.Stat(filepath.Join(workingDir, ".grok", "plugins"))
+	_, isolatedProjectMCPErr := os.Stat(filepath.Join(workingDir, ".mcp.json"))
+	tools, hasTools := mockArgValue(args, "--tools")
+	maxTurns, hasMaxTurns := mockArgValue(args, "--max-turns")
+	outputFormat, hasOutputFormat := mockArgValue(args, "--output-format")
+	promptPath, hasPromptFile := mockArgValue(args, "--prompt-file")
+	prompt, promptErr := os.ReadFile(promptPath)
+	_, hasExternalLoader := grokNoToolsExternalLoaderArg(args)
+	compatibilityDisabled := true
+	for _, name := range []string{
+		"GROK_CURSOR_SKILLS_ENABLED", "GROK_CURSOR_RULES_ENABLED", "GROK_CURSOR_AGENTS_ENABLED",
+		"GROK_CURSOR_MCPS_ENABLED", "GROK_CURSOR_HOOKS_ENABLED", "GROK_CURSOR_SESSIONS_ENABLED",
+		"GROK_CLAUDE_SKILLS_ENABLED", "GROK_CLAUDE_RULES_ENABLED", "GROK_CLAUDE_AGENTS_ENABLED",
+		"GROK_CLAUDE_MCPS_ENABLED", "GROK_CLAUDE_HOOKS_ENABLED", "GROK_CLAUDE_SESSIONS_ENABLED",
+		"GROK_CODEX_SKILLS_ENABLED", "GROK_CODEX_RULES_ENABLED", "GROK_CODEX_AGENTS_ENABLED",
+		"GROK_CODEX_MCPS_ENABLED", "GROK_CODEX_HOOKS_ENABLED", "GROK_CODEX_SESSIONS_ENABLED",
+		"GROK_MANAGED_MCPS_ENABLED", "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
+		"GROK_WORKSPACE_TOOL_DEFS_ENABLED", "GROK_WORKSPACE_TOOL_STATE_ENABLED",
+	} {
+		if os.Getenv(name) != "0" {
+			compatibilityDisabled = false
+			break
+		}
+	}
+	if isolatedHome == "" || persistentHome == "" || projectRoot == "" || isolatedHome == persistentHome ||
+		workingDirErr != nil || filepath.Clean(workingDir) != filepath.Join(filepath.Clean(isolatedHome), "workspace") ||
+		filepath.Clean(os.Getenv("HOME")) != filepath.Clean(isolatedHome) ||
+		filepath.Clean(os.Getenv("USERPROFILE")) != filepath.Clean(isolatedHome) ||
+		filepath.Clean(os.Getenv("PWD")) != filepath.Clean(workingDir) ||
+		configErr != nil || copiedAuthErr != nil || hostPluginErr != nil || hostMCPErr != nil || cursorMCPErr != nil ||
+		projectConfigErr != nil || projectPluginErr != nil || projectMCPErr != nil ||
+		!os.IsNotExist(isolatedPluginErr) || !os.IsNotExist(isolatedMCPErr) || !os.IsNotExist(isolatedSessionsErr) ||
+		!os.IsNotExist(isolatedProjectConfigErr) || !os.IsNotExist(isolatedProjectPluginErr) || !os.IsNotExist(isolatedProjectMCPErr) ||
+		!strings.Contains(string(isolatedConfig), "[compat.cursor]") ||
+		!strings.Contains(string(isolatedConfig), "[compat.claude]") ||
+		strings.Count(string(isolatedConfig), "mcps = false") != 2 ||
+		strings.Contains(string(isolatedConfig), "host-plugin") ||
+		strings.Contains(string(isolatedConfig), "host-mcp") ||
+		os.Getenv("XAI_API_KEY") != "" || os.Getenv("GROK_CODE_XAI_API_KEY") != "" ||
+		os.Getenv("GROK_AUTH_PROVIDER_ACCESS_TOKEN") != "" || os.Getenv("GROK_AGENT") != "" ||
+		os.Getenv("GROK_DEFAULT_MODEL") != "" || os.Getenv("GROK_MODELS_BASE_URL") != "" ||
+		os.Getenv("GROK_MODELS_LIST_URL") != "" || os.Getenv("GROK_XAI_API_BASE_URL") != "" ||
+		os.Getenv("GROK_SANDBOX") != "" || os.Getenv("GROK_SANDBOX_AUTO_ALLOW_BASH") != "" ||
+		os.Getenv("GROK_LOG_FILE") != "" || os.Getenv("GROK_FUTURE_EXECUTION_OVERRIDE") != "" ||
+		os.Getenv("RUST_LOG") != "" || os.Getenv("RUST_BACKTRACE") != "" || os.Getenv("RUST_LIB_BACKTRACE") != "" ||
+		mockEnvironmentHasPrefix("OTEL_") ||
+		mockHasArg(args, "--always-approve") || mockHasArg(args, "--auto-approve") || !compatibilityDisabled ||
+		hasExternalLoader ||
+		mockHasArg(args, grokMaintenanceSmokeControlArg) ||
+		!hasTools || tools != "" || !hasMaxTurns || maxTurns != "1" ||
+		!hasOutputFormat || outputFormat != "streaming-json" ||
+		!mockHasArg(args, "--disable-web-search") || !mockHasArg(args, "--no-subagents") ||
+		!mockHasArg(args, "--verbatim") || !hasPromptFile || promptErr != nil ||
+		string(prompt) != "Return exactly this marker and nothing else: "+grokMaintenanceSmokeMarker {
+		fmt.Fprintln(os.Stderr, "protocol error")
+		os.Exit(1)
+	}
+	if err := writeMockGrokBillingEvidence(); err != nil {
+		fmt.Fprintln(os.Stderr, "usage capture failed")
+		os.Exit(1)
+	}
+	field := "text"
+	if mode != "grok-maintenance-smoke-v1" {
+		field = "data"
+	}
+	// Real streaming-json output may split one assistant message across
+	// multiple incremental frames. Emit every marker in three same-batch
+	// deltas so the lifecycle regression catches injected frame newlines.
+	for _, delta := range []string{"AIEXPEDITE_GROK_", "SMOKE_MARKER_", "7F3C2A"} {
+		encoded, _ := json.Marshal(map[string]string{"type": "text", field: delta})
+		fmt.Println(string(encoded))
+	}
+	fmt.Println(`{"type":"end","stopReason":"end_turn"}`)
+	os.Exit(0)
+}
+
+func mockArgValue(args []string, name string) (string, bool) {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == name {
+			return args[i+1], true
+		}
+	}
+	return "", false
+}
+
+func mockHasArg(args []string, name string) bool {
+	for _, arg := range args {
+		if arg == name {
+			return true
+		}
+	}
+	return false
+}
+
+func mockEnvironmentHasPrefix(prefix string) bool {
+	prefix = strings.ToUpper(prefix)
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(strings.ToUpper(name), prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // writeMockGrokBillingEvidence mirrors the exact allowlisted shape Grok 1.0
 // appends after fetching its current period. It intentionally includes secret
 // and raw-config sentinels so lifecycle tests prove the parser never republishes
@@ -451,6 +630,10 @@ func writeMockGrokBillingEvidence() error {
 // the literal "claude" string. That makes proc.Start() fail. Instead, the
 // tests below use a "shim" name and validate the lifecycle, not the argv.
 func captureSession(t *testing.T, mockMode string, sessionCmd string, args []string, sendInitialStdinPrompt string) (sessionID string, messages []resultMsg, finalErr error) {
+	return captureSessionWithConfig(t, mockMode, sessionCmd, args, sendInitialStdinPrompt, nil)
+}
+
+func captureSessionWithConfig(t *testing.T, mockMode string, sessionCmd string, args []string, sendInitialStdinPrompt string, cfg *Config) (sessionID string, messages []resultMsg, finalErr error) {
 	t.Helper()
 
 	// Locate the test binary and copy it into a tempdir with the desired
@@ -475,7 +658,7 @@ func captureSession(t *testing.T, mockMode string, sessionCmd string, args []str
 	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+origPath)
 	t.Setenv(mockCLIEnvVar, mockMode)
 
-	sm := NewSessionManager(nil)
+	sm := NewSessionManager(cfg)
 	id := fmt.Sprintf("test-session-%d", time.Now().UnixNano())
 
 	var mu sync.Mutex
@@ -668,6 +851,224 @@ func TestSessionLifecycle_GrokDirectPublishesFreshRedactedBilling(t *testing.T) 
 			t.Fatalf("direct usage leaked %q: %s", secret, out)
 		}
 	}
+}
+
+func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *testing.T) {
+	realHome := t.TempDir()
+	vendorHome := t.TempDir()
+	projectRoot := t.TempDir()
+	projectCwd := filepath.Join(projectRoot, "workspace")
+	externalLogPath := filepath.Join(t.TempDir(), "raw-grok-diagnostics.log")
+	seedGrokHomeWithLogin(t, realHome)
+	if err := os.WriteFile(filepath.Join(realHome, "config.toml"), []byte(
+		"[plugins]\nenabled = [\"host-plugin\"]\n[mcp_servers.host-mcp]\ncommand = \"raw-config-sentinel\"\n",
+	), 0o600); err != nil {
+		t.Fatalf("seed host Grok config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(realHome, "plugins", "host-plugin"), 0o700); err != nil {
+		t.Fatalf("seed host Grok plugin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realHome, "plugins", "host-plugin", "plugin.json"), []byte(`{"name":"host-plugin"}`), 0o600); err != nil {
+		t.Fatalf("seed host Grok plugin manifest: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realHome, "mcp.json"), []byte(`{"host-mcp":{"command":"raw-config-sentinel"}}`), 0o600); err != nil {
+		t.Fatalf("seed host Grok MCP config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(vendorHome, ".cursor"), 0o700); err != nil {
+		t.Fatalf("seed Cursor MCP directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(vendorHome, ".cursor", "mcp.json"), []byte(`{"mcpServers":{"host-mcp":{"command":"raw-config-sentinel"}}}`), 0o600); err != nil {
+		t.Fatalf("seed Cursor MCP config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".grok", "plugins", "project-plugin"), 0o700); err != nil {
+		t.Fatalf("seed project Grok plugin directory: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".git"), 0o700); err != nil {
+		t.Fatalf("seed project root marker: %v", err)
+	}
+	if err := os.MkdirAll(projectCwd, 0o700); err != nil {
+		t.Fatalf("seed project working directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, ".grok", "config.toml"), []byte(
+		"[mcp_servers.project-mcp]\ncommand = \"raw-config-sentinel\"\n[plugins]\npaths = [\"project-plugin\"]\n",
+	), 0o600); err != nil {
+		t.Fatalf("seed project Grok config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, ".grok", "plugins", "project-plugin", "plugin.json"), []byte(`{"name":"project-plugin"}`), 0o600); err != nil {
+		t.Fatalf("seed project Grok plugin: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(projectRoot, ".mcp.json"), []byte(`{"mcpServers":{"project-mcp":{"command":"raw-config-sentinel"}}}`), 0o600); err != nil {
+		t.Fatalf("seed project MCP config: %v", err)
+	}
+	t.Setenv("GROK_HOME", realHome)
+	t.Setenv("HOME", vendorHome)
+	t.Setenv("USERPROFILE", vendorHome)
+	t.Setenv("XAI_API_KEY", "credential-sentinel-api-key")
+	t.Setenv("GROK_CODE_XAI_API_KEY", "alternate-credential-sentinel")
+	t.Setenv("GROK_AUTH_PROVIDER_ACCESS_TOKEN", "provider-credential-sentinel")
+	t.Setenv("GROK_AGENT", "agent-path-sentinel")
+	t.Setenv("GROK_DEFAULT_MODEL", "model-sentinel")
+	t.Setenv("GROK_MODELS_BASE_URL", "https://models-base-sentinel.invalid")
+	t.Setenv("GROK_MODELS_LIST_URL", "https://models-list-sentinel.invalid")
+	t.Setenv("GROK_XAI_API_BASE_URL", "https://xai-base-sentinel.invalid")
+	t.Setenv("GROK_CURSOR_MCPS_ENABLED", "1")
+	t.Setenv("GROK_CLAUDE_MCPS_ENABLED", "1")
+	t.Setenv("GROK_CODEX_MCPS_ENABLED", "1")
+	t.Setenv("GROK_MANAGED_MCPS_ENABLED", "1")
+	t.Setenv("GROK_CONFIG_PATH", "config-path-sentinel")
+	t.Setenv("GROK_PLUGIN_ROOT", "plugin-path-sentinel")
+	t.Setenv("GROK_WORKSPACE_ROOT", "workspace-path-sentinel")
+	t.Setenv("GROK_SANDBOX", "sandbox-profile-sentinel")
+	t.Setenv("GROK_SANDBOX_AUTO_ALLOW_BASH", "1")
+	t.Setenv("GROK_LOG_FILE", externalLogPath)
+	t.Setenv("GROK_FUTURE_EXECUTION_OVERRIDE", "future-execution-sentinel")
+	t.Setenv("RUST_LOG", "xai_grok=debug-stderr-sentinel")
+	t.Setenv("RUST_BACKTRACE", "1")
+	t.Setenv("RUST_LIB_BACKTRACE", "1")
+	t.Setenv("OTEL_LOGS_EXPORTER", "console")
+	t.Setenv("OTEL_METRICS_EXPORTER", "otlp")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://otel-endpoint-sentinel.invalid")
+	t.Setenv("OTEL_EXPORTER_OTLP_HEADERS", "Authorization=otel-credential-sentinel")
+	t.Setenv("OTEL_EXPORTER_OTLP_CERTIFICATE", "otel-ca-path-sentinel")
+	t.Setenv("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE", "otel-client-cert-path-sentinel")
+	t.Setenv("OTEL_EXPORTER_OTLP_CLIENT_KEY", "otel-client-key-path-sentinel")
+	t.Setenv("OTEL_LOG_USER_PROMPTS", "1")
+	t.Setenv("OTEL_LOG_TOOL_DETAILS", "1")
+	t.Setenv("OTEL_FUTURE_EXPORT_OVERRIDE", "future-otel-sentinel")
+	t.Setenv(mockGrokPersistentHomeEnv, realHome)
+	t.Setenv(mockGrokVendorHomeEnv, vendorHome)
+	t.Setenv(mockGrokProjectRootEnv, projectRoot)
+	configureTestGrokSystemLayers(t, `version_overrides = [
+  { minimum_version = "0.9.0", maximum_version = "1.0.4", mcp_servers = { historical-sentinel = { command = "must-stay-inactive" } } },
+  { minimum_version = "1.0.0", maximum_version = "1.0.9", compat = { cursor = { mcps = false } } },
+  { minimum_version = "1.0.10", maximum_version = "1.0.20", compat = { claude = { mcps = false } } },
+  { minimum_version = "1.0.14", maximum_version = "2.0.0", plugins = { enabled = ["future-sentinel"] } },
+]
+[compat.cursor]
+mcps = false
+[compat.claude]
+mcps = false
+`)
+	SetCLIAgentCatalog([]cliAgentCatalogEntry{{
+		ID: "grok", DisplayName: "Grok Build", Command: "grok",
+	}})
+	t.Cleanup(func() { SetCLIAgentCatalog(nil) })
+	resetVersionProbeCache()
+	t.Cleanup(resetVersionProbeCache)
+
+	smokeArgs := []string{
+		"--tools", "", "--disable-web-search", "--no-subagents", "--max-turns", "1", "--verbatim",
+		"Return exactly this marker and nothing else: " + grokMaintenanceSmokeMarker,
+	}
+	dispatchedSmokeArgs := sessionStartArgsForCommand(commandMsg{
+		Type: "session_start", Command: "grok", Args: smokeArgs,
+	})
+	if _, promoted := extractGrokMaintenanceSmokeControl(dispatchedSmokeArgs); !promoted {
+		t.Fatalf("production session_start dispatch did not promote maintenance smoke: %#v", dispatchedSmokeArgs)
+	}
+	run := func(mode string) cliAgentUsage {
+		t.Helper()
+		_, messages, err := captureSessionWithConfig(t, mode, "grok", dispatchedSmokeArgs, projectCwd, &Config{
+			EnableGrokAlwaysApprove: true,
+		})
+		if err != nil {
+			t.Fatalf("%s session: %v", mode, err)
+		}
+		assertLifecycleOrdering(t, messages)
+		if got := concatStreamOutput(messages); got != grokMaintenanceSmokeMarker {
+			t.Fatalf("%s output = %q, want exact marker %q", mode, got, grokMaintenanceSmokeMarker)
+		}
+		for _, message := range messages {
+			if message.Type == "session_ended" && message.ExitCode != 0 {
+				t.Fatalf("%s exit code = %d, want 0", mode, message.ExitCode)
+			}
+		}
+
+		resetVersionProbeCache()
+		usage, errs := GatherCLIAgentUsageOnly(context.Background())
+		if len(errs) != 0 || len(usage) != 1 || len(usage[0].Metrics) != 1 {
+			t.Fatalf("%s usage = %+v errors=%+v", mode, usage, errs)
+		}
+		receipt, normalized, normalizedErrs, err := prepareCLIUsageRefreshResult(
+			"signed-refresh-secret", mode, time.Now().UnixMilli(), true, usage, errs)
+		if err != nil || receipt == "" || len(normalizedErrs) != 0 || len(normalized) != 1 || len(normalized[0].Metrics) != 1 {
+			t.Fatalf("%s signed refresh: receipt=%q usage=%+v errors=%+v err=%v", mode, receipt, normalized, normalizedErrs, err)
+		}
+		encoded, err := json.Marshal(normalized[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{
+			"credential-sentinel", "prompt-sentinel", "raw-config-sentinel", "agent-path-sentinel",
+			"project-plugin", "config-path-sentinel", "plugin-path-sentinel", "workspace-path-sentinel",
+			"model-sentinel", "models-base-sentinel", "models-list-sentinel", "xai-base-sentinel",
+			"otel-endpoint-sentinel", "otel-credential-sentinel", "otel-ca-path-sentinel",
+			"otel-client-cert-path-sentinel", "otel-client-key-path-sentinel", "future-otel-sentinel",
+		} {
+			if strings.Contains(string(encoded), secret) {
+				t.Fatalf("%s signed refresh leaked %q: %s", mode, secret, encoded)
+			}
+		}
+		return normalized[0]
+	}
+
+	pre := run("grok-maintenance-smoke-v1")
+	// Signed usage timestamps use RFC3339 second precision. Cross a second
+	// boundary so the freshness assertion observes the post-update billing
+	// fetch rather than two distinct nanosecond observations rendered alike.
+	time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second + 10*time.Millisecond)))
+	post := run("grok-maintenance-smoke-v2")
+	if _, err := os.Stat(externalLogPath); !os.IsNotExist(err) {
+		t.Fatalf("maintenance smoke created external diagnostics log %q: %v", externalLogPath, err)
+	}
+	if pre.Version == post.Version || !strings.Contains(pre.Version, "1.0.5") || !strings.Contains(post.Version, "1.0.13") {
+		t.Fatalf("test did not exercise the 1.0.5 -> 1.0.13 replacement: pre=%q post=%q", pre.Version, post.Version)
+	}
+	preObserved, preErr := time.Parse(time.RFC3339Nano, pre.Metrics[0].ObservedAt)
+	postObserved, postErr := time.Parse(time.RFC3339Nano, post.Metrics[0].ObservedAt)
+	if preErr != nil || postErr != nil || !postObserved.After(preObserved) {
+		t.Fatalf("post-update usage freshness did not advance: pre=%q (%v) post=%q (%v)",
+			pre.Metrics[0].ObservedAt, preErr, post.Metrics[0].ObservedAt, postErr)
+	}
+}
+
+func TestSessionLifecycle_GrokOrdinaryNoToolsPreservesNormalAuthAndHome(t *testing.T) {
+	realHome := t.TempDir()
+	t.Setenv("GROK_HOME", realHome)
+	t.Setenv("XAI_API_KEY", "credential-sentinel-api-key")
+	t.Setenv(mockGrokPersistentHomeEnv, realHome)
+
+	_, messages, err := captureSession(t, "grok-ordinary-no-tools", "grok", []string{"--tools", "", "ordinary prompt"}, "")
+	if err != nil {
+		t.Fatalf("ordinary no-tools session: %v", err)
+	}
+	assertLifecycleOrdering(t, messages)
+	if got := concatStreamOutput(messages); got != "ordinary-no-tools-ok" {
+		t.Fatalf("ordinary no-tools output = %q, want %q", got, "ordinary-no-tools-ok")
+	}
+}
+
+func configureTestGrokSystemLayers(t *testing.T, managedBody string) {
+	t.Helper()
+	requirementsPath := filepath.Join(t.TempDir(), "requirements.toml")
+	managedPath := filepath.Join(t.TempDir(), "managed_config.toml")
+	if err := os.WriteFile(requirementsPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(managedPath, []byte(managedBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origRequirementsPath := grokSystemRequirementsPath
+	origManagedPath := grokSystemManagedConfigPath
+	origClaudePaths := claudeManagedSettingsPathsFn
+	grokSystemRequirementsPath = requirementsPath
+	grokSystemManagedConfigPath = managedPath
+	claudeManagedSettingsPathsFn = func() []string { return nil }
+	t.Cleanup(func() {
+		grokSystemRequirementsPath = origRequirementsPath
+		grokSystemManagedConfigPath = origManagedPath
+		claudeManagedSettingsPathsFn = origClaudePaths
+	})
 }
 
 // TestSessionLifecycle_CodexDeferredStdinPrompt covers the chat-direct flow
