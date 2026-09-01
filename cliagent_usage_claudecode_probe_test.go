@@ -2470,3 +2470,109 @@ func TestClaudeUsageProbe_ForcedRefreshJoinHonorsContext(t *testing.T) {
 		t.Errorf("join took %v, want it abandoned as soon as the context was done", elapsed)
 	}
 }
+
+/* -------------------------------------------------------------------------- */
+/* A debt is settled by the OBSERVATION, not by the write succeeding           */
+/* -------------------------------------------------------------------------- */
+
+// The gather's `now` is captured by ParseContext before it assembles anything,
+// so a turn that finishes while the gather is running leaves a debt NEWER than
+// the instant the probe will stamp. The write succeeds and the cache does move
+// forward — but not past the run — so settling the debt here would sign the
+// pre-run timestamp into the receipt and let the trailing probe that would have
+// corrected it exit finding nothing owed.
+func TestRefreshClaudeUsageIfStale_KeepsDebtNewerThanTheGatherStamp(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	runAt := now.Add(2 * time.Second) // the turn finished mid-gather
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":61,"resets_at":%d,"status":"allowed"}`,
+				now.Add(3*time.Hour).Unix()),
+		}))
+	})
+
+	claudeUsageProbe.recordOwed(runAt)
+	if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "") {
+		t.Fatal("the probe still wrote a reading, so the caller must re-read the cache")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1", got)
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok || snap.Buckets[claudeWindowFiveHour].ObservedAtMs != now.UnixMilli() {
+		t.Fatal("the probe's reading must be on disk, stamped with the gather instant")
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.Equal(runAt) {
+		t.Errorf("owedObservation=%s, want the debt still standing at %s — a reading stamped "+
+			"before the run does not pay for it", got, runAt)
+	}
+}
+
+// The same rule, reached the other way: the merge refuses a bucket older than
+// the reading already in that window, so a status-line render landing while the
+// request is in flight can leave a SUCCESSFUL probe having changed nothing the
+// debt-holder cares about. "The write succeeded" is not "the run was observed".
+func TestRefreshClaudeUsageIfStale_KeepsDebtWhenMergeKeepsANewerReading(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	rendered := now.Add(time.Second)  // an interactive render, newer than our stamp
+	runAt := now.Add(5 * time.Second) // ... but still older than the run we owe
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":61,"resets_at":%d,"status":"allowed"}`,
+				now.Add(3*time.Hour).Unix()),
+		}))
+	})
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 44, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: rendered.UnixMilli(), usageKnown: true,
+		},
+	}, rendered, "", claudeRateLimitSourceStatusLine)
+
+	claudeUsageProbe.recordOwed(runAt)
+	refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "")
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1", got)
+	}
+
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok {
+		t.Fatal("no snapshot on disk")
+	}
+	if got := snap.Buckets[claudeWindowFiveHour]; got.ObservedAtMs != rendered.UnixMilli() {
+		t.Fatalf("ObservedAtMs=%d, want the newer render %d kept by the merge",
+			got.ObservedAtMs, rendered.UnixMilli())
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.Equal(runAt) {
+		t.Errorf("owedObservation=%s, want the debt still standing at %s — every window of "+
+			"this probe was refused as older, so nothing it wrote observes the run", got, runAt)
+	}
+}
+
+// The converse, so the guard above is a check on the observation rather than a
+// refusal to ever settle from the gather path: a probe stamped after the run
+// clears the debt and leaves nothing for a trailing probe to pay.
+func TestRefreshClaudeUsageIfStale_SettlesDebtOlderThanTheGatherStamp(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	runAt := now.Add(-2 * time.Second) // the turn finished before the gather began
+
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":61,"resets_at":%d,"status":"allowed"}`,
+				now.Add(3*time.Hour).Unix()),
+		}))
+	})
+
+	claudeUsageProbe.recordOwed(runAt)
+	if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "") {
+		t.Fatal("the probe must report the reading it persisted")
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1", got)
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("owedObservation=%s, want the debt settled by a post-run reading", got)
+	}
+}

@@ -948,12 +948,13 @@ func TestMergeClaudeRateLimitCache_BoundedByHeldCrossProcessLock(t *testing.T) {
 	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
 	done := make(chan error, 1)
 	go func() {
-		done <- mergeClaudeRateLimitCacheChecked(cache, map[string]claudeRateLimitBucket{
+		_, err := mergeClaudeRateLimitCacheChecked(cache, map[string]claudeRateLimitBucket{
 			claudeWindowFiveHour: {
 				ObservedAtMs: now.UnixMilli(), ResetsAtMs: now.Add(time.Hour).UnixMilli(),
 				UsedPercentage: 12, Status: "allowed", usageKnown: true,
 			},
 		}, now, "", claudeRateLimitSourceProbe)
+		done <- err
 	}()
 
 	select {
@@ -968,5 +969,50 @@ func TestMergeClaudeRateLimitCache_BoundedByHeldCrossProcessLock(t *testing.T) {
 	snap, ok := loadClaudeRateLimitSnapshot(cache)
 	if !ok || snap.Buckets[claudeWindowFiveHour].UsedPercentage != 12 {
 		t.Error("the bounded merge must still persist its reading on the degraded path")
+	}
+}
+
+// The checked merge answers two different questions, and the second one is what
+// a post-run debt-holder needs: "did the write land" is not "what observation
+// does the cache now hold for these windows". A writer whose stamp is refused by
+// the newer-wins guard succeeds having changed nothing it can claim credit for,
+// so it must be told the incumbent's instant, not its own.
+func TestMergeClaudeRateLimitCacheChecked_ReportsTheObservationTheCacheHolds(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "rl.json")
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	newer := now.Add(30 * time.Second)
+
+	bucket := func(at time.Time, pct float64) map[string]claudeRateLimitBucket {
+		return map[string]claudeRateLimitBucket{
+			claudeWindowFiveHour: {
+				ObservedAtMs: at.UnixMilli(), ResetsAtMs: now.Add(time.Hour).UnixMilli(),
+				UsedPercentage: pct, Status: "allowed", usageKnown: true,
+			},
+		}
+	}
+
+	// A reading that lands reports its own stamp.
+	observed, err := mergeClaudeRateLimitCacheChecked(cache, bucket(newer, 40), newer, "",
+		claudeRateLimitSourceStatusLine)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !observed.Equal(newer) {
+		t.Errorf("observed=%s, want the reading it wrote at %s", observed, newer)
+	}
+
+	// One that is refused as older reports the incumbent it lost to, so its
+	// caller cannot mistake a successful write for a fresh observation.
+	observed, err = mergeClaudeRateLimitCacheChecked(cache, bucket(now, 61), now, "",
+		claudeRateLimitSourceProbe)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !observed.Equal(newer) {
+		t.Errorf("observed=%s, want the newer incumbent %s that the merge kept", observed, newer)
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok || snap.Buckets[claudeWindowFiveHour].UsedPercentage != 40 {
+		t.Error("the newer reading must survive the older merge")
 	}
 }

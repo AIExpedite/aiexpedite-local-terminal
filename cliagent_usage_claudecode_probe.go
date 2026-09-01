@@ -377,8 +377,9 @@ type claudeUsageProbeGate struct {
 	// advance means the cache it is about to re-read is newer than the one it
 	// loaded.
 	//
-	// lastRefreshAt is the observation instant that advance carries — the `now`
-	// the persisting probe stamped on its buckets. "Something was written" is not
+	// lastRefreshAt is the observation instant that advance carries — the reading
+	// the CACHE holds for the windows the persisting probe wrote, which is its own
+	// stamp only where the merge accepted it. "Something was written" is not
 	// enough for a joiner holding a post-run debt: a probe that STARTED before the
 	// run persists a PRE-run reading, and settling the debt with it would sign the
 	// pre-run timestamp and cancel the trailing probe that would have paid it.
@@ -699,6 +700,22 @@ func (g *claudeUsageProbeGate) settleOwed(baseline time.Time) {
 	g.mu.Unlock()
 }
 
+// claudeUsageObservationCovers reports whether `observed` is new enough to pay a
+// debt recorded at `baseline` — i.e. whether it can have seen the run.
+//
+// Compared at MILLISECOND resolution because that is the cache's: ObservedAtMs
+// truncates, so a reading taken microseconds after a run comes back reading a
+// fraction of a millisecond BEFORE it, and a strict comparison would refuse the
+// very observation that run earned. A probe fires immediately off the terminal
+// `result` frame, so same-millisecond is the NORMAL case on a fast machine, not
+// an edge one — refusing it would leave a debt no probe could ever settle.
+//
+// A zero observation is never a cover: it means the merge left no reading in any
+// window this writer touched.
+func claudeUsageObservationCovers(observed, baseline time.Time) bool {
+	return !observed.IsZero() && !observed.Before(baseline.Truncate(time.Millisecond))
+}
+
 // owedObservation returns the outstanding post-run baseline, if any.
 func (g *claudeUsageProbeGate) owedObservation() time.Time {
 	g.mu.Lock()
@@ -719,10 +736,10 @@ func (g *claudeUsageProbeGate) holdUntil(deadline time.Time) {
 	g.mu.Unlock()
 }
 
-// finish releases the single-flight slot. `observedAt` is the instant the probe
-// stamped on the buckets it persisted, recorded only alongside a refresh so a
-// joiner can tell WHEN the reading it is inheriting was taken, not merely that
-// there was one.
+// finish releases the single-flight slot. `observedAt` is the observation the
+// cache holds for the windows the probe wrote, recorded only alongside a refresh
+// so a joiner can tell WHEN the reading it is inheriting was taken, not merely
+// that there was one.
 func (g *claudeUsageProbeGate) finish(probeErr *cliAgentUsageError, refreshed bool, observedAt time.Time) {
 	g.mu.Lock()
 	g.inFlight = false
@@ -922,26 +939,34 @@ func claudeUsageProbeURL() string {
 // finished and consumed quota, so only an observation recorded after `now` can
 // substitute for this probe.
 func runClaudeUsageProbe(ctx context.Context, now time.Time) (bool, *cliAgentUsageError) {
-	return probeClaudeUsage(ctx, now, claudeUsageProbeStoredIdentity, now)
+	refreshed, _, probeErr := probeClaudeUsage(ctx, now, claudeUsageProbeStoredIdentity, now)
+	return refreshed, probeErr
 }
 
 // probeClaudeUsage is runClaudeUsageProbe with the credential supplied by the
 // caller. resolveToken is invoked ONLY once the gate has admitted the probe, so
 // a throttled or opted-out call never touches the credential store at all.
+//
+// `observedAt` is the observation the CACHE ends up holding for the windows this
+// probe wrote, which is not always the `now` it stamped: `now` is captured by
+// the caller before the request, so a status-line render landing while the
+// request is in flight legitimately keeps its newer reading and this probe's
+// bucket is refused as older. A caller settling a post-run debt must judge that
+// instant, not the bare `refreshed` — see refreshClaudeUsageIfStale.
 func probeClaudeUsage(
 	ctx context.Context,
 	now time.Time,
 	resolveIdentity func() claudeUsageProbeIdentity,
 	dedupeBaseline time.Time,
-) (refreshed bool, probeErr *cliAgentUsageError) {
+) (refreshed bool, observedAt time.Time, probeErr *cliAgentUsageError) {
 	// An already-cancelled gather must not burn the throttle slot on a request
 	// that cannot complete: the next caller would then be refused for a minute
 	// because of a probe that never left the process.
 	if ctx.Err() != nil {
-		return false, nil
+		return false, time.Time{}, nil
 	}
 	if !claudeUsageProbe.begin(now) {
-		return false, nil
+		return false, time.Time{}, nil
 	}
 	// Release the single-flight latch on EVERY path out of here. begin() has
 	// already set inFlight, so an early return that skipped this would leave the
@@ -949,31 +974,31 @@ func probeClaudeUsage(
 	// wedge, not a missed sample. It must therefore be the first statement after
 	// begin(), ahead of any other exit. Named returns let it record the outcome:
 	// a failure extends the backoff, a success or an early skip clears it.
-	defer func() { claudeUsageProbe.finish(probeErr, refreshed, now) }()
+	defer func() { claudeUsageProbe.finish(probeErr, refreshed, observedAt) }()
 
 	// One credential read for both the bearer token and the cache fingerprint —
 	// see claudeUsageProbeIdentity for why they must not be resolved separately.
 	identity := resolveIdentity()
 	if identity.token == "" {
 		// Not an error: a signed-out device simply has nothing for this probe.
-		return false, nil
+		return false, time.Time{}, nil
 	}
 
 	// Cross-process coordination on an ACCOUNT-scoped endpoint: has another
 	// writer on this machine already answered what this probe would ask?
 	if claudeUsageProbeObservedSince(identity.fingerprint, dedupeBaseline) {
-		return false, nil
+		return false, time.Time{}, nil
 	}
 	endpoint := claudeUsageProbeURL()
 	if endpoint == "" {
-		return false, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
+		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, claudeUsageProbeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return false, claudeUsageProbeFailure(cliUsageErrorInternal)
+		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorInternal)
 	}
 	req.Header.Set("Authorization", "Bearer "+identity.token)
 	req.Header.Set("Accept", "application/json")
@@ -992,7 +1017,7 @@ func probeClaudeUsage(
 		if reqCtx.Err() != nil {
 			category = cliUsageErrorProviderTimeout
 		}
-		return false, claudeUsageProbeFailure(category)
+		return false, time.Time{}, claudeUsageProbeFailure(category)
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, claudeUsageProbeMaxBody))
@@ -1000,7 +1025,7 @@ func probeClaudeUsage(
 	}()
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return false, claudeUsageProbeFailure(cliUsageErrorNotAuthenticated)
+		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorNotAuthenticated)
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		// Honor the service backpressure rather than only our own timer. This
@@ -1008,10 +1033,10 @@ func probeClaudeUsage(
 		// account — Claude own /usage panel included — so ignoring Retry-After
 		// would keep pressing exactly when we have been asked to stop.
 		claudeUsageProbe.holdUntil(retryAfterDeadline(resp.Header.Get("Retry-After"), time.Now()))
-		return false, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
+		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return false, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
+		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 
 	// Read at most the cap + 1 byte so an oversized body is DETECTED rather than
@@ -1019,12 +1044,12 @@ func probeClaudeUsage(
 	// be treated as a partial observation.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, claudeUsageProbeMaxBody+1))
 	if err != nil || len(body) > claudeUsageProbeMaxBody {
-		return false, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
+		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorProviderUnavailable)
 	}
 
 	var decoded claudeUsageProbeResponse
 	if json.Unmarshal(body, &decoded) != nil {
-		return false, claudeUsageProbeFailure(cliUsageErrorParseFailed)
+		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorParseFailed)
 	}
 
 	updates := claudeUsageProbeBuckets(decoded, now)
@@ -1032,7 +1057,7 @@ func probeClaudeUsage(
 		// A response we cannot plot is not an observation. Returning here leaves
 		// the cache byte-identical rather than stamping a fresh ObservedAt on
 		// nothing.
-		return false, claudeUsageProbeFailure(cliUsageErrorParseFailed)
+		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorParseFailed)
 	}
 	// Report success only if the snapshot actually reached disk. The
 	// fire-and-forget merge swallows an unwritable data dir, a Windows sharing
@@ -1040,11 +1065,18 @@ func probeClaudeUsage(
 	// tell the caller to re-read a cache that never changed, clear the failure
 	// backoff, and throttle the retry, while a SIGNED refresh receipt went out
 	// carrying an observation that was never persisted.
-	if err := mergeClaudeRateLimitCacheChecked(claudeRateLimitCachePath(), updates, now,
-		identity.fingerprint, claudeRateLimitSourceProbe); err != nil {
-		return false, claudeUsageProbeFailure(cliUsageErrorCollectionFailed)
+	persisted, err := mergeClaudeRateLimitCacheChecked(claudeRateLimitCachePath(), updates, now,
+		identity.fingerprint, claudeRateLimitSourceProbe)
+	if err != nil {
+		return false, time.Time{}, claudeUsageProbeFailure(cliUsageErrorCollectionFailed)
 	}
-	return true, nil
+	// `persisted`, not `now`: the merge refuses a bucket whose stamp is older
+	// than the reading already standing in that window, so a probe holding the
+	// gather's pre-request `now` can succeed having changed nothing a debt-holder
+	// cares about. Reporting what the cache HOLDS lets the caller decide whether
+	// this covers the run it owes, instead of inferring it from "the write
+	// succeeded".
+	return true, persisted, nil
 }
 
 // claudeUsageProbeBuckets converts the allow-listed response into cache buckets.
@@ -1206,7 +1238,7 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 		// it does not cover the debt we fall through and ask ourselves, the slot
 		// now free and `force` still pending.
 		if joined, joinedAt := claudeUsageProbe.joinInFlight(ctx); joined &&
-			!joinedAt.IsZero() && (!owing || !joinedAt.Before(owed)) {
+			!joinedAt.IsZero() && (!owing || claudeUsageObservationCovers(joinedAt, owed)) {
 			if owing {
 				claudeUsageProbe.settleOwed(owed)
 			}
@@ -1218,10 +1250,18 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 		}
 	}
 	identity := claudeUsageProbeIdentity{token: accessToken, fingerprint: fingerprint}
-	refreshed, probeErr := probeClaudeUsage(ctx, now,
+	refreshed, observedAt, probeErr := probeClaudeUsage(ctx, now,
 		func() claudeUsageProbeIdentity { return identity }, baseline)
 	logClaudeUsageProbeFailure(probeErr)
-	if refreshed && owing {
+	// Settle only on an observation that actually covers the run — the same test
+	// the join above applies, for the same reason. `now` is ParseContext's gather
+	// instant, so it can PREDATE the debt (a turn that finished while the gather
+	// was assembling), and the merge can also keep a newer incumbent and leave
+	// our stamp unwritten; in both cases the write succeeded while the reading
+	// the receipt would carry still predates the run. Leaving the debt standing
+	// costs one throttled trailing probe, whereas clearing it here would sign the
+	// pre-run timestamp AND cancel the probe that would have corrected it.
+	if refreshed && owing && claudeUsageObservationCovers(observedAt, owed) {
 		claudeUsageProbe.settleOwed(owed)
 	}
 	return refreshed
@@ -1310,9 +1350,11 @@ func claudeUsageProbeAfterRun(completedAt time.Time) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), claudeUsageProbeTimeout)
 	defer cancel()
-	refreshed, probeErr := probeClaudeUsage(ctx, time.Now(), claudeUsageProbeStoredIdentity, baseline)
+	refreshed, observedAt, probeErr := probeClaudeUsage(ctx, time.Now(), claudeUsageProbeStoredIdentity, baseline)
 	logClaudeUsageProbeFailure(probeErr)
-	if refreshed {
+	// Same rule as the gather path: a write that left the run's window owned by
+	// an older reading has not paid this debt, even though it succeeded.
+	if refreshed && claudeUsageObservationCovers(observedAt, baseline) {
 		claudeUsageProbe.settleOwed(baseline)
 	}
 	// A refusal or failure deliberately leaves the debt standing: the next

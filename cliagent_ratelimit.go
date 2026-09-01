@@ -413,11 +413,12 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 // percentage, so claiming its own provenance for a percentage it did not
 // measure would be wrong.
 func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) {
-	_ = mergeClaudeRateLimitCacheChecked(path, updates, now, fingerprint, source)
+	_, _ = mergeClaudeRateLimitCacheChecked(path, updates, now, fingerprint, source)
 }
 
 // mergeClaudeRateLimitCacheChecked is the same merge, but REPORTS whether the
-// snapshot actually reached disk.
+// snapshot actually reached disk, and WHICH observation the cache ends up
+// holding for the windows it was asked to write.
 //
 // The fire-and-forget wrappers above are right for the stream and status-line
 // writers: they run in hot paths, fire constantly, and a dropped write is
@@ -427,15 +428,23 @@ func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeR
 // transient Windows sharing violation, or a failed rename would let the probe
 // report a fresh observation it never persisted, clear its failure backoff, and
 // throttle the retry that would have fixed it.
-func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) error {
+//
+// The returned instant is the newest OBSERVED reading standing in the merged
+// snapshot for the update's own windows — this writer's stamp where it landed,
+// and the incumbent's where the newer-wins guard below kept it instead. "The
+// write succeeded" is not the same question as "the cache now holds a reading at
+// least as new as the run that earned this write": a caller settling a post-run
+// debt needs the second one, and every window of an update can legitimately be
+// refused as older while the merge still returns success.
+func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) (time.Time, error) {
 	if path == "" || len(updates) == 0 {
-		return fmt.Errorf("claude rate-limit cache: nothing to merge")
+		return time.Time{}, fmt.Errorf("claude rate-limit cache: nothing to merge")
 	}
 	claudeRateLimitMu.Lock()
 	defer claudeRateLimitMu.Unlock()
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	// Cross-process exclusive lock. Best-effort: if the lock file can't be
 	// created (read-only data dir) we still proceed — the in-process mutex
@@ -571,9 +580,23 @@ func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRate
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
 	snap.AccountFingerprint = fingerprint
 
+	// What the cache HOLDS for these windows once the merge has run — which is
+	// this writer's stamp only where it actually won. Read from snap.Buckets
+	// rather than from `updates` so a window the newer-wins guard refused
+	// reports the incumbent observation that beat it, not the one we tried to
+	// write; and only from observed readings, so a heartbeat row recorded
+	// without usage cannot pass for one.
+	observed := time.Time{}
+	for window := range updates {
+		if b, ok := snap.Buckets[window]; ok && b.hasObservedUsage() &&
+			(observed.IsZero() || b.ObservedAtMs > observed.UnixMilli()) {
+			observed = time.UnixMilli(b.ObservedAtMs)
+		}
+	}
+
 	out, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	// Write-then-rename so a concurrent loadClaudeRateLimitSnapshot reader never
 	// observes a half-written file. The PID + nanosecond suffix keeps two
@@ -581,13 +604,13 @@ func mergeClaudeRateLimitCacheChecked(path string, updates map[string]claudeRate
 	// colliding on the intermediate file even outside the lock.
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
-		return err
+		return time.Time{}, err
 	}
-	return nil
+	return observed, nil
 }
 
 // acquireCrossProcessCacheLock opens (and exclusively locks) a sibling file of
