@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // helperAntigravityServer stands up a loopback stub answering the two RPCs the
@@ -643,5 +644,272 @@ func TestAntigravityUsageParser_DiscoversQuotaWithoutASettingsFile(t *testing.T)
 	}
 	if len(usage.Metrics) != 3 {
 		t.Fatalf("expected live rows without a settings file, got %+v", usage.Metrics)
+	}
+}
+
+// A capture poller and a concurrent gather both write this file. Whichever
+// started first must not be able to age the card backwards by finishing last.
+func TestSaveAntigravityQuotaSnapshotIfNewer_RefusesAnOlderReadingForTheSameAccount(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+
+	fingerprint := fingerprintAccount("antigravity", "ada@example.com")
+	newer := antigravityQuotaSnapshot{
+		ObservedAt:         "2026-08-28T06:00:00Z",
+		AccountFingerprint: fingerprint,
+		Account:            "ada@example.com",
+		Buckets: []antigravityQuotaBucket{
+			{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.4, ResetTime: "2126-08-14T00:00:00Z"},
+		},
+	}
+	if !saveAntigravityQuotaSnapshotIfNewer(newer) {
+		t.Fatalf("the first write must land")
+	}
+
+	older := newer
+	older.ObservedAt = "2026-08-28T05:13:22Z"
+	older.Buckets = []antigravityQuotaBucket{
+		{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.9, ResetTime: "2126-08-14T00:00:00Z"},
+	}
+	if saveAntigravityQuotaSnapshotIfNewer(older) {
+		t.Errorf("an older reading for the same account must not replace a newer one")
+	}
+	// An equal timestamp is not strictly newer either.
+	same := newer
+	same.Buckets = []antigravityQuotaBucket{
+		{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.1, ResetTime: "2126-08-14T00:00:00Z"},
+	}
+	if saveAntigravityQuotaSnapshotIfNewer(same) {
+		t.Errorf("an equal observedAt is not strictly newer")
+	}
+
+	var persisted antigravityQuotaSnapshot
+	if !readJSONFile(cache, &persisted) {
+		t.Fatalf("cache unreadable")
+	}
+	if persisted.ObservedAt != "2026-08-28T06:00:00Z" || persisted.Buckets[0].RemainingFraction != 0.4 {
+		t.Errorf("persisted=%+v, want the newer reading intact", persisted)
+	}
+}
+
+// An account switch is not a stale reading — it is a different pool, and the
+// newly signed-in account's figure must land regardless of timestamps.
+func TestSaveAntigravityQuotaSnapshotIfNewer_AlwaysAcceptsADifferentAccount(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+
+	saveAntigravityQuotaSnapshot(antigravityQuotaSnapshot{
+		ObservedAt:         "2026-08-28T06:00:00Z",
+		AccountFingerprint: fingerprintAccount("antigravity", "ada@example.com"),
+		Account:            "ada@example.com",
+		Buckets: []antigravityQuotaBucket{
+			{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.4, ResetTime: "2126-08-14T00:00:00Z"},
+		},
+	})
+
+	switched := antigravityQuotaSnapshot{
+		// Deliberately OLDER than what is cached.
+		ObservedAt:         "2026-08-28T05:13:22Z",
+		AccountFingerprint: fingerprintAccount("antigravity", "grace@example.com"),
+		Account:            "grace@example.com",
+		Buckets: []antigravityQuotaBucket{
+			{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.2, ResetTime: "2126-08-14T00:00:00Z"},
+		},
+	}
+	if !saveAntigravityQuotaSnapshotIfNewer(switched) {
+		t.Fatalf("an account switch must always be written")
+	}
+	var persisted antigravityQuotaSnapshot
+	if !readJSONFile(cache, &persisted) {
+		t.Fatalf("cache unreadable")
+	}
+	if persisted.Account != "grace@example.com" {
+		t.Errorf("account=%q, want the newly signed-in one", persisted.Account)
+	}
+}
+
+// The per-port probe is what lets the capture poller reuse a known-good port
+// without re-scanning the CLI logs: it must succeed with no log directory at
+// all, and fail without hanging when nothing answers.
+func TestFetchAntigravityQuotaOnPort_NeedsNoLogDirectory(t *testing.T) {
+	base := t.TempDir()
+	srv := helperAntigravityServer(t, base, helperQuotaJSON, helperStatusJSON)
+	_, portStr, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split host port: %v", err)
+	}
+	port := 0
+	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
+		t.Fatalf("parse port: %v", err)
+	}
+	// Discovery is now impossible; only the known port can answer.
+	if err := os.RemoveAll(antigravityLogDir(base)); err != nil {
+		t.Fatalf("remove log dir: %v", err)
+	}
+
+	now := time.Date(2026, 8, 28, 6, 0, 0, 0, time.UTC)
+	client := antigravityLoopbackClient()
+	snap, ok := fetchAntigravityQuotaOnPort(context.Background(), client, port, now)
+	if !ok {
+		t.Fatalf("expected a snapshot from the known port")
+	}
+	if snap.Account != "ada@example.com" || len(snap.Buckets) != 3 {
+		t.Errorf("snapshot=%+v, want the live reading", snap)
+	}
+
+	srv.Close()
+	if _, ok := fetchAntigravityQuotaOnPort(context.Background(), client, port, now); ok {
+		t.Errorf("a dead port must not yield a snapshot — that is what clears the memo")
+	}
+}
+
+// An `agy` update that reworks the log line must not silently kill capture, but
+// tolerating a new spelling may never widen the match onto the TLS listener.
+func TestDiscoverAntigravityHTTPPorts_AcceptsTheToleratedPortSpelling(t *testing.T) {
+	base := t.TempDir()
+	helperWriteAntigravityLog(t, base, "cli-updated.log",
+		"server.go:576] Language server listening on random port at 22221 for HTTPS (gRPC)\n"+
+			"server.go:584] Language server listening on port 55551 for HTTP\n")
+
+	ports := discoverAntigravityHTTPPorts(base)
+	if len(ports) != 1 || ports[0] != 55551 {
+		t.Fatalf("ports=%v, want just the post-update HTTP port 55551", ports)
+	}
+}
+
+// Every tolerated spelling names HTTP explicitly: a log that only advertises the
+// TLS/gRPC listener must yield nothing rather than being probed in the clear.
+func TestDiscoverAntigravityHTTPPorts_IgnoresAnHTTPSOnlyLog(t *testing.T) {
+	base := t.TempDir()
+	helperWriteAntigravityLog(t, base, "cli-tls-only.log",
+		"server.go:576] Language server listening on random port at 22221 for HTTPS (gRPC)\n"+
+			"server.go:577] Language server listening on port 22222 for HTTPS (gRPC)\n")
+
+	if ports := discoverAntigravityHTTPPorts(base); len(ports) != 0 {
+		t.Errorf("ports=%v, want none — no plain-HTTP listener was advertised", ports)
+	}
+}
+
+// Ordering across spellings follows position in the file, not pattern order: a
+// later line is a later restart and owns the live port.
+func TestAntigravityPortsInLog_OrdersByPositionNotPattern(t *testing.T) {
+	body := []byte(
+		"server.go:584] Language server listening on random port at 11111 for HTTP\n" +
+			"server.go:584] Language server listening on port 22222 for HTTP\n")
+	if ports := antigravityPortsInLog(body); len(ports) != 2 || ports[0] != 22222 || ports[1] != 11111 {
+		t.Errorf("ports=%v, want [22222 11111]", ports)
+	}
+}
+
+// A cache written by a NEWER agent build must stay readable after a rollback:
+// the version is diagnostic metadata, never a gate.
+func TestReadAntigravityQuotaCache_AcceptsAnUnknownSchemaVersion(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+	body := `{"schemaVersion":99,"observedAt":"2026-08-28T06:00:00Z",
+	  "accountFingerprint":"` + fingerprintAccount("antigravity", "ada@example.com") + `",
+	  "account":"ada@example.com","plan":"Pro","somethingNewer":{"x":1},
+	  "buckets":[{"group":"Gemini Models","window":"weekly","remainingFraction":0.4,"resetTime":"2126-08-14T00:00:00Z"}]}`
+	if err := os.WriteFile(cache, []byte(body), 0o600); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	snap, ok := loadAntigravityQuotaSnapshotByProducer()
+	if !ok {
+		t.Fatalf("an unknown schemaVersion must not make the cache unreadable")
+	}
+	if snap.SchemaVersion != 99 || snap.Account != "ada@example.com" || len(snap.Buckets) != 1 {
+		t.Errorf("snapshot=%+v, want the forward-compatible read", snap)
+	}
+}
+
+// The persist layer is the redaction boundary: unplottable rows are dropped,
+// the bucket list is capped, and every string is length-bounded so a hostile
+// payload can neither bloat the cache nor overflow the receipt field bounds.
+func TestSanitizeAntigravityQuotaSnapshot_DropsUnplottableRowsAndClampsStrings(t *testing.T) {
+	snap := antigravityQuotaSnapshot{
+		ObservedAt:         "2026-08-28T06:00:00Z",
+		AccountFingerprint: fingerprintAccount("antigravity", "ada@example.com"),
+		Account:            strings.Repeat("é", 400),
+		Plan:               "  Pro  ",
+		Buckets: []antigravityQuotaBucket{
+			{Group: "Gemini Models", Window: "fortnightly", RemainingFraction: 0.5},
+			{Group: strings.Repeat("G", 500), Window: "weekly", RemainingFraction: 0.4, ResetTime: "2126-08-14T00:00:00Z"},
+		},
+	}
+	for i := 0; i < cliUsageMaxMetricsPerProvider+5; i++ {
+		snap.Buckets = append(snap.Buckets, antigravityQuotaBucket{
+			Group: fmt.Sprintf("Group %02d", i), Window: "5h", RemainingFraction: 0.9,
+		})
+	}
+
+	out := sanitizeAntigravityQuotaSnapshot(snap)
+	if out.SchemaVersion != antigravityQuotaSchemaVersion {
+		t.Errorf("schemaVersion=%d, want %d", out.SchemaVersion, antigravityQuotaSchemaVersion)
+	}
+	if out.Plan != "Pro" {
+		t.Errorf("Plan=%q, want it trimmed", out.Plan)
+	}
+	if len(out.Account) > antigravityQuotaMaxFieldBytes {
+		t.Errorf("Account is %d bytes, want at most %d", len(out.Account), antigravityQuotaMaxFieldBytes)
+	}
+	if !utf8.ValidString(out.Account) {
+		t.Errorf("clamping split a UTF-8 rune: %q", out.Account)
+	}
+	if len(out.Buckets) != cliUsageMaxMetricsPerProvider {
+		t.Fatalf("buckets=%d, want the cap %d", len(out.Buckets), cliUsageMaxMetricsPerProvider)
+	}
+	for _, bucket := range out.Buckets {
+		if bucket.Window == "fortnightly" {
+			t.Errorf("an unplottable window must not be persisted: %+v", bucket)
+		}
+		if len(bucket.Group) > antigravityQuotaMaxBucketFieldBytes {
+			t.Errorf("bucket group is %d bytes, want at most %d", len(bucket.Group), antigravityQuotaMaxBucketFieldBytes)
+		}
+	}
+}
+
+// A reading whose every window is unrecognized sanitizes to nothing. Writing it
+// would destroy a good previous reading for no gain.
+func TestSaveAntigravityQuotaSnapshot_RefusesASnapshotWithNoPlottableBucket(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "agyq.json")
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", cache)
+
+	saveAntigravityQuotaSnapshot(antigravityQuotaSnapshot{
+		ObservedAt:         "2026-08-28T06:00:00Z",
+		AccountFingerprint: fingerprintAccount("antigravity", "ada@example.com"),
+		Account:            "ada@example.com",
+		Buckets: []antigravityQuotaBucket{
+			{Group: "Gemini Models", Window: "fortnightly", RemainingFraction: 0.5},
+		},
+	})
+	if _, err := os.Stat(cache); err == nil {
+		t.Errorf("a snapshot with nothing plottable must not be written")
+	}
+}
+
+// Both install trees are probed, and the legacy one leads only when it is the
+// one holding config. Single-sourcing this is what keeps the capture poller and
+// the gather parser reading the same logs.
+func TestAntigravityQuotaBases_OrdersByWhichInstallHoldsConfig(t *testing.T) {
+	modernFirst := t.TempDir()
+	helperWriteJSON(t, filepath.Join(modernFirst, ".gemini", "antigravity-cli", "settings.json"),
+		map[string]any{"email": "ada@example.com"})
+	helperWriteJSON(t, filepath.Join(modernFirst, ".agy", "config.json"), map[string]any{})
+	bases := antigravityQuotaBases(modernFirst)
+	if len(bases) != 2 || bases[0] != filepath.Join(modernFirst, ".gemini", "antigravity-cli") {
+		t.Errorf("bases=%v, want the modern tree first", bases)
+	}
+
+	legacyFirst := t.TempDir()
+	helperWriteJSON(t, filepath.Join(legacyFirst, ".agy", "config.json"), map[string]any{})
+	bases = antigravityQuotaBases(legacyFirst)
+	if len(bases) != 2 || bases[0] != filepath.Join(legacyFirst, ".agy") {
+		t.Errorf("bases=%v, want the legacy tree first", bases)
+	}
+
+	// No home resolves to no bases at all, rather than a path rooted at "/".
+	if bases := antigravityQuotaBases(""); len(bases) != 0 {
+		t.Errorf("bases=%v, want none without a home", bases)
 	}
 }

@@ -66,6 +66,17 @@ func runPTYCommand(cmd string, args []string, workDir string, env []string,
 		defer globalProcessRegistry.Deregister(c.Process.Pid)
 	}
 
+	// agy's quota is only readable while an agy process is alive, so arm the
+	// run-scoped capture poller for the life of this child. Covers both the PTY
+	// session path (startPTYSession) and the `execute` path in pubsub.go, and
+	// both direct `agy …` argv and shell-wrapped `bash -c "agy …"` payloads. The
+	// defer releases it on EVERY exit route — normal exit, overall timeout and
+	// prompt-abort. See cliagent_usage_antigravity_capture.go.
+	if commandRunsAntigravity(cmd, args) {
+		finishQuotaCapture := startAntigravityQuotaCapture("PTY session")
+		defer finishQuotaCapture()
+	}
+
 	norm := NewPTYNormalizer(DefaultRedrawInterval)
 	var sb strings.Builder
 	emitLine := func(s string) {

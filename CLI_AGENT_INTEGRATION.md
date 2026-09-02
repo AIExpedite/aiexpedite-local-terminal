@@ -356,3 +356,54 @@ Summary:
   session paths (remote users cannot answer local prompts). Native chat and the
   normal pipe-based session path use stream-json stdin; only the Unix PTY
   compatibility path retains `--print <prompt>` argv delivery.
+
+## Antigravity quota capture (why `agy` needs an active poller)
+
+Claude and Codex leak their usage numbers passively — Claude prints a rate-limit
+line on stdout that [`captureClaudeRateLimitLine`](cliagent_ratelimit.go) merges
+into a fingerprint-scoped cache, Codex and Grok write files that outlive the run.
+`agy` does neither. Its quota is served **only** by the language server each CLI
+run starts on a random loopback port, and that server dies with the process.
+
+The consequence: the `__cli_usage_refresh__` gather runs when nothing is
+executing, so it never finds a port, replays the cached snapshot with its
+*original* `observedAt`, and the CLI Agents card ages a day-old pool no matter
+how many runs succeed. That is the `observed_stale` /
+`latestObservedAt = 2026-08-28T05:13:22Z` symptom.
+
+[`cliagent_usage_antigravity_capture.go`](cliagent_usage_antigravity_capture.go)
+closes that gap by reading the server **while it exists**:
+
+- **Armed at every spawn.** `startAntigravityQuotaCapture(label)` is called from
+  [`runOneShot`](antigravity_native.go) (native chat),
+  [`runPTYCommand`](pty_session_unix.go) (PTY session + the `execute` path) and
+  [`StartSession`](session.go) (pipe path, released in `waitForExit`). The PTY
+  and pipe paths gate on `commandRunsAntigravity`, which also sees through the
+  `bash -c "agy …"` wrapper terminal-service ships. Windows has no PTY path, so
+  capture there comes from native chat and the pipe path only.
+- **One shared, refcounted poller.** Concurrent `agy` runs join the same
+  goroutine; it stops when the last one releases it.
+- **Bounded.** `antigravityCapturePollInterval = 3s`,
+  `antigravityCaptureMaxAttempts = 200`,
+  `antigravityCaptureMaxDuration = 15m` bound the polling loop, plus one
+  unconditional attempt `antigravityCaptureExitGrace = 1.5s` after the process is
+  reaped (the socket can still answer for a beat). Past the caps, a long run's
+  last mid-run reading can be up to 15 minutes old until that final attempt.
+- **Cheap.** The expensive part of a probe is log scanning (4 files ×
+  2×128 KB), not the RPC, so the winning port is memoized for the life of the run
+  and rediscovered only after an RPC failure. Install bases are re-resolved every
+  attempt, so an `agy` self-update that migrates `~/.agy` →
+  `~/.gemini/antigravity-cli` mid-flight is picked up without a restart.
+- **Monotonic writes.** `saveAntigravityQuotaSnapshotIfNewer` never lets a
+  slower in-flight probe age the card backwards for the same account; an account
+  switch always wins regardless of timestamps.
+- **Redaction allowlist.** Only `observedAt`, `accountFingerprint`, `account`,
+  `plan` and the numeric buckets are persisted
+  (`sanitizeAntigravityQuotaSnapshot`, which also drops unplottable windows and
+  length-clamps every string). Discovered ports, log text, argv, prompts and
+  `settings.json` contents are never written to the cache and never logged. A
+  reading the server could not attribute (`GetUserStatus` failed) is retried on
+  the next tick rather than cached under a settings-file account.
+- **Test seam.** `AIEXPEDITE_AGY_CAPTURE_INTERVAL` shortens the tick (mirrors
+  `AIEXPEDITE_AGY_QUOTA_CACHE`); a non-positive or unparseable value falls back
+  to the shipped constant.

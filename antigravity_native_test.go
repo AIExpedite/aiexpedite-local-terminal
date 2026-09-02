@@ -1579,3 +1579,40 @@ func TestAntigravityNativeStart_EmptySeedStartsFreshConversation(t *testing.T) {
 		t.Fatalf("empty seed must leave the conversation unset, got %q", sess.NativeConversationID)
 	}
 }
+
+// Every turn arms exactly one quota capture and releases it exactly once —
+// including the turn-timeout path, where the process is interrupted and killed
+// rather than exiting on its own. A leaked arm would keep the poller running
+// (and the loopback probes flowing) for the rest of the agent's life.
+func TestAntigravityNativeRunOneShot_ReleasesQuotaCaptureOnTimeout(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "20ms")
+	_, executable := helperMockAgyOnPath(t, "antigravity-stream-stdin-slow")
+
+	session := &AntigravityNativeSession{ID: "capture-timeout", status: "idle"}
+	// The mock sleeps 600ms before answering; a 100ms turn budget forces the
+	// timeout/kill path.
+	_, _, _, timedOut, _, err := NewAntigravityNativeManager(nil).runOneShot(
+		session, t.TempDir(), executable, "hello", "", 100*time.Millisecond, "test:antigravity-capture-timeout")
+	if err != nil {
+		t.Fatalf("runOneShot: %v", err)
+	}
+	if !timedOut {
+		t.Fatalf("expected the turn to time out")
+	}
+
+	stopped := antigravityCaptureStopped()
+	if stopped == nil {
+		t.Fatal("the turn never armed a quota capture")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(30 * time.Second):
+		t.Fatal("a timed-out turn leaked its quota capture")
+	}
+	if got := antigravityCaptureArms.Load(); got != 1 {
+		t.Errorf("arms=%d, want exactly one per turn", got)
+	}
+	if got := antigravityCaptureFinishes.Load(); got != 1 {
+		t.Errorf("finishes=%d, want exactly one per turn", got)
+	}
+}

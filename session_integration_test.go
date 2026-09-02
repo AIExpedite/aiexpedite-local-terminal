@@ -169,6 +169,23 @@ func runMockCLI(mode string) {
 		fmt.Printf(`{"event":"result","result":{"status":"SUCCESS","response":%s}}`+"\n", encodedMarker)
 		os.Exit(0)
 
+	case "antigravity-stream-stdin-slow":
+		// Same contract as antigravity-stream-stdin, but the turn lasts long
+		// enough for the run-scoped quota capture to complete at least one poll
+		// while this process is alive — which is the only window in which a real
+		// agy language server is readable.
+		data, _ := io.ReadAll(os.Stdin)
+		var input struct {
+			Event string `json:"event"`
+		}
+		if err := json.Unmarshal(bytes.TrimSpace(data), &input); err != nil || input.Event != "user" {
+			fmt.Println(`{"event":"result","result":{"status":"ERROR","error":"invalid stdin envelope"}}`)
+			os.Exit(1)
+		}
+		time.Sleep(600 * time.Millisecond)
+		fmt.Println(`{"event":"result","result":{"status":"SUCCESS","response":"slow antigravity turn done"}}`)
+		os.Exit(0)
+
 	case "antigravity-diagnostic":
 		fmt.Println("agy version 1.2.3")
 		os.Exit(0)

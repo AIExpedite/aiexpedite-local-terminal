@@ -750,6 +750,16 @@ func (m *AntigravityNativeManager) runOneShot(
 		defer globalProcessRegistry.Deregister(cmd.Process.Pid)
 	}
 
+	// This process is the only window in which agy's quota is readable: its
+	// language server lives and dies with it, so the post-run usage refresh can
+	// never see one. Arm the run-scoped poller here — after Register, so a turn
+	// killed by End/timeout still releases exactly once — and release it on
+	// every return path, including the timeout and transcript-replay retries.
+	// Never fails and never blocks; a missed capture costs freshness, not the
+	// turn. See cliagent_usage_antigravity_capture.go.
+	finishQuotaCapture := startAntigravityQuotaCapture("native turn")
+	defer finishQuotaCapture()
+
 	var timedOutFlag atomic.Bool
 	timer := time.AfterFunc(turnTimeout, func() {
 		timedOutFlag.Store(true)

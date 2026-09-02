@@ -40,12 +40,9 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 	}
 
 	legacyBase := expandHome(home, ".agy")
-	// Quota discovery reads the CLI's logs, which live under whichever install
-	// is actually in use. Probe the configured one first and the other second:
-	// selecting only the config-bearing tree would miss a running server whose
-	// install has no config file yet, and probing only the modern tree would
-	// never find a legacy install's `~/.agy/log`.
-	quotaBases := []string{base, legacyBase}
+	// Probe order is single-sourced with the run-scoped capture poller so the two
+	// can never disagree about which install tree holds the live server's logs.
+	quotaBases := antigravityQuotaBases(home)
 
 	cfg := antigravityConfig{}
 	if readJSONFile(expandHome(base, "settings.json"), &cfg) {
@@ -55,7 +52,6 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 		usage.DataSource = "~/.agy"
 		usage.Account = firstNonEmpty(cfg.Email, cfg.Account)
 		usage.Plan = firstNonEmpty(cfg.Plan, cfg.Tier)
-		quotaBases = []string{legacyBase, base}
 	}
 	// Antigravity keeps its renewable session in the OS keyring and does not
 	// publish a durable session deadline. Do not reinterpret an access token or
@@ -70,9 +66,6 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 	var fresh antigravityQuotaSnapshot
 	var gotFresh bool
 	for _, quotaBase := range quotaBases {
-		if quotaBase == "" {
-			continue
-		}
 		if fresh, gotFresh = fetchAntigravityQuota(ctx, quotaBase, now); gotFresh {
 			break
 		}
@@ -97,8 +90,12 @@ func (p antigravityUsageParser) Parse(home string, detected detectedCLIAgent, no
 		// An unattributable reading is still worth DISPLAYING — it came from the
 		// server about to run the work — but caching it would let an unscoped
 		// snapshot be replayed under a later account.
+		//
+		// IfNewer, not the plain save: a capture poller may be mid-flight against
+		// the same live server, and whichever of the two started first must not
+		// be able to age the card backwards by finishing last.
 		if usage.AccountFingerprint != "" {
-			saveAntigravityQuotaSnapshot(snap)
+			saveAntigravityQuotaSnapshotIfNewer(snap)
 		}
 	} else if cached, ok := loadAntigravityQuotaSnapshot(usage.AccountFingerprint); ok {
 		// No `agy` running right now. Replay the last reading with its ORIGINAL

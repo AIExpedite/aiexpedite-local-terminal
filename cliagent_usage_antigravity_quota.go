@@ -20,7 +20,10 @@
 //
 // The server only exists while `agy` is running, so a successful read is cached.
 // Between runs the card shows the last observation with its true age rather than
-// claiming the quota is unknowable.
+// claiming the quota is unknowable. Because a gather almost never coincides with
+// a live run, the freshness of that cache comes from the run-scoped poller in
+// cliagent_usage_antigravity_capture.go, which reads this server WHILE the agent
+// has `agy` up.
 package main
 
 import (
@@ -39,6 +42,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -64,16 +68,39 @@ const (
 
 	antigravityQuotaRPC  = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
 	antigravityStatusRPC = "/exa.language_server_pb.LanguageServerService/GetUserStatus"
+
+	// antigravityQuotaSchemaVersion stamps every snapshot this build writes.
+	// Readers deliberately do NOT reject an unknown value: after a rollback the
+	// older agent must still be able to replay a cache a newer one wrote, and
+	// every field it does not understand is simply absent from its struct. The
+	// version is diagnostic metadata, not a gate.
+	antigravityQuotaSchemaVersion = 1
+	// Per-string byte caps applied before the cache is written. The top-level
+	// cap matches canonicalCLIUsageMetric's 256-byte bound so a value that
+	// survives the cache also survives the signed refresh. Bucket fields are
+	// held tighter because antigravityQuotaMetrics composes them into a metric
+	// Label ("<group> — <window>") that is itself bounded at 256.
+	antigravityQuotaMaxFieldBytes       = 256
+	antigravityQuotaMaxBucketFieldBytes = 96
 )
 
-// antigravityHTTPPortRe matches the port line the language server logs at
-// startup. Only the plain-HTTP listener is matched: the sibling HTTPS/gRPC port
-// serves the same RPCs behind a self-signed certificate, and trusting an
-// unverifiable certificate to reach a service already reachable in the clear on
-// loopback would be a downgrade, not an upgrade.
-// The trailing \b is load-bearing: without it "for HTTPS (gRPC)" also matches
-// (HTTP is a prefix of HTTPS) and the TLS port gets probed in the clear.
-var antigravityHTTPPortRe = regexp.MustCompile(`listening on random port at (\d{2,5}) for HTTP\b`)
+// antigravityHTTPPortPatterns matches the port lines the language server logs at
+// startup, in the order they are tried. Only plain-HTTP listeners are matched:
+// the sibling HTTPS/gRPC port serves the same RPCs behind a self-signed
+// certificate, and trusting an unverifiable certificate to reach a service
+// already reachable in the clear on loopback would be a downgrade, not an
+// upgrade. Every pattern must therefore name HTTP explicitly, and the trailing
+// \b is load-bearing: without it "for HTTPS (gRPC)" also matches (HTTP is a
+// prefix of HTTPS) and the TLS port gets probed in the clear.
+//
+// The second spelling exists for post-update resilience: an `agy` self-update
+// that drops "random" from the line keeps capture working. A build that renames
+// the line entirely degrades to today's behavior (no port, stale reading) rather
+// than falling back to the TLS port.
+var antigravityHTTPPortPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`listening on random port at (\d{2,5}) for HTTP\b`),
+	regexp.MustCompile(`listening on port (\d{2,5}) for HTTP\b`),
+}
 
 // antigravityQuotaBucket is one row of the provider's quota panel.
 type antigravityQuotaBucket struct {
@@ -85,8 +112,14 @@ type antigravityQuotaBucket struct {
 	ResetTime         string  `json:"resetTime"`
 }
 
-// antigravityQuotaSnapshot is what we cache between `agy` runs.
+// antigravityQuotaSnapshot is what we cache between `agy` runs. The persisted
+// shape is an allowlist, not a dump: observation time, the account it belongs
+// to, the plan name, and the numeric buckets. Discovered ports, log excerpts,
+// argv, prompts and settings.json contents are deliberately absent.
 type antigravityQuotaSnapshot struct {
+	// SchemaVersion is written but never enforced on read — see
+	// antigravityQuotaSchemaVersion.
+	SchemaVersion      int                      `json:"schemaVersion,omitempty"`
 	ObservedAt         string                   `json:"observedAt"`
 	AccountFingerprint string                   `json:"accountFingerprint"`
 	Account            string                   `json:"account"`
@@ -106,6 +139,42 @@ func antigravityQuotaCachePath() string {
 		return p
 	}
 	return filepath.Join(GetConfigDir(), "antigravity_quota.json")
+}
+
+// antigravityQuotaBases returns the install trees to probe for a live language
+// server, most likely first. Quota discovery reads the CLI's logs, which live
+// under whichever install is actually in use: probing only the config-bearing
+// tree would miss a running server whose install has no config file yet, and
+// probing only the modern tree would never find a legacy install's `~/.agy/log`.
+//
+// Single-sourced so the gather-time parser and the run-scoped capture poller can
+// never diverge on which tree they read, and re-resolved on every call rather
+// than memoized so an `agy` self-update that migrates ~/.agy →
+// ~/.gemini/antigravity-cli mid-flight is picked up without restarting.
+func antigravityQuotaBases(home string) []string {
+	modern := expandHome(home, filepath.Join(".gemini", "antigravity-cli"))
+	legacy := expandHome(home, ".agy")
+	// The legacy tree leads only when it is the one holding config AND the
+	// modern tree holds none — exactly the ordering antigravityUsageParser.Parse
+	// derives from the same two files.
+	var cfg antigravityConfig
+	if !readJSONFile(expandHome(modern, "settings.json"), &cfg) &&
+		readJSONFile(expandHome(legacy, "config.json"), &cfg) {
+		return nonEmptyPaths(legacy, modern)
+	}
+	return nonEmptyPaths(modern, legacy)
+}
+
+// nonEmptyPaths drops the "" entries expandHome returns for an unresolvable
+// home, so callers never probe a path rooted at the filesystem root.
+func nonEmptyPaths(paths ...string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // antigravityLogDir resolves the CLI's log directory under an already-resolved
@@ -156,14 +225,8 @@ func discoverAntigravityHTTPPorts(base string) []int {
 		if err != nil {
 			continue
 		}
-		matches := antigravityHTTPPortRe.FindAllSubmatch(body, -1)
-		// Later lines are later restarts within the same run — prefer them.
-		for i := len(matches) - 1; i >= 0; i-- {
-			port := 0
-			if _, err := fmt.Sscanf(string(matches[i][1]), "%d", &port); err != nil {
-				continue
-			}
-			if port <= 0 || port > 65535 || seen[port] {
+		for _, port := range antigravityPortsInLog(body) {
+			if seen[port] {
 				continue
 			}
 			seen[port] = true
@@ -172,6 +235,34 @@ func discoverAntigravityHTTPPorts(base string) []int {
 				return ports
 			}
 		}
+	}
+	return ports
+}
+
+// antigravityPortsInLog extracts every plain-HTTP listener port from one log
+// body, newest first. Matches from ALL tolerated spellings are ordered by their
+// position in the file rather than by pattern, because a later line is a later
+// restart within the same run and must be probed first regardless of which
+// spelling that build happens to use.
+func antigravityPortsInLog(body []byte) []int {
+	type portMatch struct{ at, port int }
+	found := make([]portMatch, 0, 4)
+	for _, re := range antigravityHTTPPortPatterns {
+		for _, loc := range re.FindAllSubmatchIndex(body, -1) {
+			port := 0
+			if _, err := fmt.Sscanf(string(body[loc[2]:loc[3]]), "%d", &port); err != nil {
+				continue
+			}
+			if port <= 0 || port > 65535 {
+				continue
+			}
+			found = append(found, portMatch{at: loc[0], port: port})
+		}
+	}
+	sort.SliceStable(found, func(i, j int) bool { return found[i].at > found[j].at })
+	ports := make([]int, 0, len(found))
+	for _, m := range found {
+		ports = append(ports, m.port)
 	}
 	return ports
 }
@@ -269,81 +360,91 @@ func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (ant
 		return antigravityQuotaSnapshot{}, false
 	}
 	client := antigravityLoopbackClient()
-
 	for _, port := range ports {
-		var quota struct {
-			Response struct {
-				Groups []struct {
-					DisplayName string `json:"displayName"`
-					Buckets     []struct {
-						BucketID    string `json:"bucketId"`
-						DisplayName string `json:"displayName"`
-						Window      string `json:"window"`
-						// Pointer so an absent or null fraction is distinguishable
-						// from a real 0 — decoded into a plain float64 it would
-						// silently become "100% consumed".
-						RemainingFraction *float64 `json:"remainingFraction"`
-						ResetTime         string   `json:"resetTime"`
-					} `json:"buckets"`
-				} `json:"groups"`
-			} `json:"response"`
+		if snap, ok := fetchAntigravityQuotaOnPort(ctx, client, port, now); ok {
+			return snap, true
 		}
-		if !antigravityPostJSON(ctx, client, port, antigravityQuotaRPC, &quota) {
-			continue
-		}
-		snap := antigravityQuotaSnapshot{ObservedAt: now.UTC().Format(time.RFC3339)}
-		plottable := 0
-		for _, group := range quota.Response.Groups {
-			for _, bucket := range group.Buckets {
-				// A bucket with no usable fraction is not a reading. Keeping it
-				// would both render as 100% consumed and let a malformed payload
-				// count as an observation that replaces a good cached one.
-				if bucket.RemainingFraction == nil ||
-					math.IsNaN(*bucket.RemainingFraction) ||
-					*bucket.RemainingFraction < 0 || *bucket.RemainingFraction > 1 {
-					continue
-				}
-				snap.Buckets = append(snap.Buckets, antigravityQuotaBucket{
-					BucketID:          bucket.BucketID,
-					Group:             group.DisplayName,
-					DisplayName:       bucket.DisplayName,
-					Window:            bucket.Window,
-					RemainingFraction: *bucket.RemainingFraction,
-					ResetTime:         bucket.ResetTime,
-				})
-				if _, _, ok := antigravityWindowKind(bucket.Window); ok {
-					plottable++
-				}
-			}
-		}
-		// A response we cannot plot is not an observation. Counting raw buckets
-		// here would let a schema addition — every window renamed, say — pass as
-		// success and overwrite the last usable cached reading with rows that
-		// all render Unknown.
-		if plottable == 0 {
-			continue
-		}
-		// Identity comes from the same server, on the same port, in the same
-		// probe — so the quota and the account it belongs to can never be
-		// stitched together from two different signed-in sessions.
-		var status struct {
-			UserStatus struct {
-				Name       string `json:"name"`
-				Email      string `json:"email"`
-				PlanStatus struct {
-					PlanInfo struct {
-						PlanName string `json:"planName"`
-					} `json:"planInfo"`
-				} `json:"planStatus"`
-			} `json:"userStatus"`
-		}
-		if antigravityPostJSON(ctx, client, port, antigravityStatusRPC, &status) {
-			snap.Account = firstNonEmpty(status.UserStatus.Email, status.UserStatus.Name)
-			snap.Plan = status.UserStatus.PlanStatus.PlanInfo.PlanName
-		}
-		return snap, true
 	}
 	return antigravityQuotaSnapshot{}, false
+}
+
+// fetchAntigravityQuotaOnPort runs the quota + identity RPC pair against ONE
+// already-known loopback port. Split out from the discovery wrapper so the
+// run-scoped capture poller can retry a memoized port without re-scanning the
+// CLI's logs — log scanning, not the RPC, is what makes a probe expensive
+// (antigravityQuotaMaxLogs files × 2×antigravityLogScanBytes per attempt).
+func fetchAntigravityQuotaOnPort(ctx context.Context, client *http.Client, port int, now time.Time) (antigravityQuotaSnapshot, bool) {
+	var quota struct {
+		Response struct {
+			Groups []struct {
+				DisplayName string `json:"displayName"`
+				Buckets     []struct {
+					BucketID    string `json:"bucketId"`
+					DisplayName string `json:"displayName"`
+					Window      string `json:"window"`
+					// Pointer so an absent or null fraction is distinguishable
+					// from a real 0 — decoded into a plain float64 it would
+					// silently become "100% consumed".
+					RemainingFraction *float64 `json:"remainingFraction"`
+					ResetTime         string   `json:"resetTime"`
+				} `json:"buckets"`
+			} `json:"groups"`
+		} `json:"response"`
+	}
+	if !antigravityPostJSON(ctx, client, port, antigravityQuotaRPC, &quota) {
+		return antigravityQuotaSnapshot{}, false
+	}
+	snap := antigravityQuotaSnapshot{ObservedAt: now.UTC().Format(time.RFC3339)}
+	plottable := 0
+	for _, group := range quota.Response.Groups {
+		for _, bucket := range group.Buckets {
+			// A bucket with no usable fraction is not a reading. Keeping it
+			// would both render as 100% consumed and let a malformed payload
+			// count as an observation that replaces a good cached one.
+			if bucket.RemainingFraction == nil ||
+				math.IsNaN(*bucket.RemainingFraction) ||
+				*bucket.RemainingFraction < 0 || *bucket.RemainingFraction > 1 {
+				continue
+			}
+			snap.Buckets = append(snap.Buckets, antigravityQuotaBucket{
+				BucketID:          bucket.BucketID,
+				Group:             group.DisplayName,
+				DisplayName:       bucket.DisplayName,
+				Window:            bucket.Window,
+				RemainingFraction: *bucket.RemainingFraction,
+				ResetTime:         bucket.ResetTime,
+			})
+			if _, _, ok := antigravityWindowKind(bucket.Window); ok {
+				plottable++
+			}
+		}
+	}
+	// A response we cannot plot is not an observation. Counting raw buckets
+	// here would let a schema addition — every window renamed, say — pass as
+	// success and overwrite the last usable cached reading with rows that
+	// all render Unknown.
+	if plottable == 0 {
+		return antigravityQuotaSnapshot{}, false
+	}
+	// Identity comes from the same server, on the same port, in the same
+	// probe — so the quota and the account it belongs to can never be
+	// stitched together from two different signed-in sessions.
+	var status struct {
+		UserStatus struct {
+			Name       string `json:"name"`
+			Email      string `json:"email"`
+			PlanStatus struct {
+				PlanInfo struct {
+					PlanName string `json:"planName"`
+				} `json:"planInfo"`
+			} `json:"planStatus"`
+		} `json:"userStatus"`
+	}
+	if antigravityPostJSON(ctx, client, port, antigravityStatusRPC, &status) {
+		snap.Account = firstNonEmpty(status.UserStatus.Email, status.UserStatus.Name)
+		snap.Plan = status.UserStatus.PlanStatus.PlanInfo.PlanName
+	}
+	return snap, true
 }
 
 // loadAntigravityQuotaSnapshot reads the cached snapshot, scoped to the current
@@ -395,44 +496,141 @@ func readAntigravityQuotaCache() (antigravityQuotaSnapshot, bool) {
 	return snap, true
 }
 
-// saveAntigravityQuotaSnapshot persists a fresh reading. Write-then-rename so a
-// concurrent gather never observes a half-written file. Best-effort: a read-only
-// data dir costs us the between-runs display, not the live one.
+// saveAntigravityQuotaSnapshot persists a fresh reading unconditionally.
 func saveAntigravityQuotaSnapshot(snap antigravityQuotaSnapshot) {
+	// The periodic machine-info gather, a demand-driven refresh and the
+	// run-scoped capture poller can all save here at once IN THE SAME PROCESS.
+	antigravityQuotaCacheMu.Lock()
+	defer antigravityQuotaCacheMu.Unlock()
+	_ = writeAntigravityQuotaSnapshotLocked(snap)
+}
+
+// saveAntigravityQuotaSnapshotIfNewer persists a reading only when it is not
+// older than what is already cached FOR THE SAME ACCOUNT. The run-scoped capture
+// poller and a concurrent gather both write this file; without the guard a
+// probe that started earlier but finished later would age the card backwards.
+// A fingerprint change always writes: an account switch is not a stale reading,
+// it is a different pool, and the newly signed-in account's real figure must
+// replace the previous account's regardless of timestamps.
+// Returns whether the cache now holds this reading.
+func saveAntigravityQuotaSnapshotIfNewer(snap antigravityQuotaSnapshot) bool {
+	antigravityQuotaCacheMu.Lock()
+	defer antigravityQuotaCacheMu.Unlock()
+
+	if existing, ok := readAntigravityQuotaCache(); ok &&
+		existing.AccountFingerprint == snap.AccountFingerprint &&
+		!antigravityQuotaObservedAfter(snap.ObservedAt, existing.ObservedAt) {
+		return false
+	}
+	return writeAntigravityQuotaSnapshotLocked(snap)
+}
+
+// antigravityQuotaObservedAfter reports whether observation time a is strictly
+// later than b. An unparseable a never wins (we cannot prove it is newer); an
+// unparseable b always loses (any real timestamp beats a corrupt one).
+func antigravityQuotaObservedAfter(a, b string) bool {
+	at, err := time.Parse(time.RFC3339, a)
+	if err != nil {
+		return false
+	}
+	bt, err := time.Parse(time.RFC3339, b)
+	if err != nil {
+		return true
+	}
+	return at.After(bt)
+}
+
+// writeAntigravityQuotaSnapshotLocked sanitizes and atomically replaces the
+// cache. Write-then-rename so a concurrent gather never observes a half-written
+// file. Best-effort: a read-only data dir costs us the between-runs display, not
+// the live one. Callers MUST hold antigravityQuotaCacheMu. Returns whether the
+// cache file was actually replaced.
+func writeAntigravityQuotaSnapshotLocked(snap antigravityQuotaSnapshot) bool {
 	// Persist ONLY a reading whose account the server itself named. If
 	// GetUserStatus failed, the fingerprint would fall back to settings.json —
 	// usually empty — and an empty scope matches any later unidentified
 	// account, which is exactly how one account's quota would end up displayed
 	// under another. Losing the between-runs display is the safe failure.
 	if snap.AccountFingerprint == "" {
-		return
+		return false
+	}
+	snap = sanitizeAntigravityQuotaSnapshot(snap)
+	// Sanitizing can empty a snapshot whose every window was unrecognized; such
+	// a file is unreadable anyway (readAntigravityQuotaCache rejects it) and
+	// writing it would only destroy a good previous reading.
+	if len(snap.Buckets) == 0 {
+		return false
 	}
 	path := antigravityQuotaCachePath()
 	if path == "" {
-		return
+		return false
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return
+		return false
 	}
 	out, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return
+		return false
 	}
-	// The periodic machine-info gather and a demand-driven refresh can both save
-	// here at once IN THE SAME PROCESS. The mutex serializes them, and the
-	// nanosecond suffix keeps two writers (or a stale temp from a crashed run)
-	// off the same intermediate file — a shared temp name would let one writer
-	// truncate the bytes another is about to rename into place.
-	antigravityQuotaCacheMu.Lock()
-	defer antigravityQuotaCacheMu.Unlock()
-
+	// The nanosecond suffix keeps two writers (or a stale temp from a crashed
+	// run) off the same intermediate file — a shared temp name would let one
+	// writer truncate the bytes another is about to rename into place.
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), time.Now().UnixNano())
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return
+		return false
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		return false
 	}
+	return true
+}
+
+// sanitizeAntigravityQuotaSnapshot reduces a reading to exactly what may be
+// persisted: observation time, the account it belongs to, the plan name, and the
+// plottable numeric buckets. Unrecognized windows are dropped (they can never
+// render, and keeping them would let a renamed window bloat the cache), bucket
+// count is capped at the signed-refresh metric cap, and every string is
+// length-clamped so a hostile or malformed server payload cannot grow the file
+// or overflow the receipt's per-field bounds.
+func sanitizeAntigravityQuotaSnapshot(snap antigravityQuotaSnapshot) antigravityQuotaSnapshot {
+	out := antigravityQuotaSnapshot{
+		SchemaVersion:      antigravityQuotaSchemaVersion,
+		ObservedAt:         clampAntigravityQuotaField(snap.ObservedAt, antigravityQuotaMaxFieldBytes),
+		AccountFingerprint: clampAntigravityQuotaField(snap.AccountFingerprint, antigravityQuotaMaxFieldBytes),
+		Account:            clampAntigravityQuotaField(snap.Account, antigravityQuotaMaxFieldBytes),
+		Plan:               clampAntigravityQuotaField(snap.Plan, antigravityQuotaMaxFieldBytes),
+	}
+	for _, bucket := range snap.Buckets {
+		if _, _, ok := antigravityWindowKind(bucket.Window); !ok {
+			continue
+		}
+		out.Buckets = append(out.Buckets, antigravityQuotaBucket{
+			BucketID:          clampAntigravityQuotaField(bucket.BucketID, antigravityQuotaMaxBucketFieldBytes),
+			Group:             clampAntigravityQuotaField(bucket.Group, antigravityQuotaMaxBucketFieldBytes),
+			DisplayName:       clampAntigravityQuotaField(bucket.DisplayName, antigravityQuotaMaxBucketFieldBytes),
+			Window:            clampAntigravityQuotaField(bucket.Window, antigravityQuotaMaxBucketFieldBytes),
+			RemainingFraction: bucket.RemainingFraction,
+			ResetTime:         clampAntigravityQuotaField(bucket.ResetTime, antigravityQuotaMaxBucketFieldBytes),
+		})
+		if len(out.Buckets) >= cliUsageMaxMetricsPerProvider {
+			break
+		}
+	}
+	return out
+}
+
+// clampAntigravityQuotaField trims and bounds a persisted string to max BYTES
+// (the unit the receipt's `bounded` check uses) without splitting a UTF-8 rune.
+func clampAntigravityQuotaField(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
 }
 
 // antigravityWindowKind maps the provider's window onto our limit kinds. An
