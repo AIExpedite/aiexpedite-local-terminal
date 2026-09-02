@@ -301,9 +301,23 @@ func isOurStatusLineCommand(command string) bool {
 		(strings.HasPrefix(prefix, `'`) && strings.HasSuffix(prefix, `'`))
 }
 
-// loadPrevStatusLine returns the full original statusLine object we stashed.
+// loadPrevStatusLine returns the full original statusLine object we stashed at
+// the path THIS boot resolves.
 func loadPrevStatusLine() (json.RawMessage, bool) {
-	b, err := os.ReadFile(prevStatusLinePath())
+	return loadPrevStatusLineAt(prevStatusLinePath())
+}
+
+// loadPrevStatusLineAt is loadPrevStatusLine against an explicit path, so a
+// caller holding the path an installed command PINNED can read that stash
+// without re-implementing the decode. A stash file that is absent, unreadable,
+// malformed or empty is reported as "no stash" rather than as an error: every
+// caller's fallback is the same, and a half-decoded object must never be
+// restored into settings.json.
+func loadPrevStatusLineAt(path string) (json.RawMessage, bool) {
+	if path == "" {
+		return nil, false
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, false
 	}
@@ -855,23 +869,27 @@ func removeClaudeStatusLineHook(home string) (bool, error) {
 		return false, nil
 	}
 
-	prev, ok := loadPrevStatusLine()
-	pinnedPrev := ""
-	if !ok {
-		// Fall back to the path the installed command itself pinned. The data
-		// dir may have moved since install (e.g. XDG_CONFIG_HOME changed), so
-		// the current prevStatusLinePath() resolves to a different file than
-		// the one we wrote at install time — but the stash is still sitting at
-		// the old pinned path. Without this fallback we'd delete statusLine
-		// and lose the user's original chained command.
-		if pinned := extractInstalledPinnedPath(existing.Command, "STATUSLINE_PREV"); pinned != "" && pinned != prevStatusLinePath() {
-			if b, err := os.ReadFile(pinned); err == nil {
-				var p prevStatusLine
-				if json.Unmarshal(b, &p) == nil && len(p.StatusLine) > 0 {
-					prev, ok, pinnedPrev = p.StatusLine, true, pinned
-				}
-			}
+	// The stash the INSTALLED command pins is the AUTHORITY whenever it differs
+	// from the path this boot resolves — the same rule migratePrevStatusLine
+	// applies, and for the same reason: the pinned path is the chain target the
+	// command in settings.json resolves right now, while anything at the current
+	// prevStatusLinePath() is a leftover from an earlier cycle under this config
+	// dir (a migration whose settings write failed, a stash written before the
+	// data dir last moved). Reading the current path FIRST would restore that
+	// leftover — a third-party status line the user has since replaced — delete
+	// it, and strand the live stash at the pinned path with nothing left naming
+	// it. The paths differ only when the data dir moved since install (e.g.
+	// XDG_CONFIG_HOME changed), so the common case still reads one file.
+	prev, ok, pinnedPrev := json.RawMessage(nil), false, ""
+	if pinned := extractInstalledPinnedPath(existing.Command, "STATUSLINE_PREV"); pinned != "" && pinned != prevStatusLinePath() {
+		if raw, found := loadPrevStatusLineAt(pinned); found {
+			// Recorded so the retire below drops BOTH copies: opt-out consumes the
+			// stash, and one left behind is what a later re-enable would resurrect.
+			prev, ok, pinnedPrev = raw, true, pinned
 		}
+	}
+	if !ok {
+		prev, ok = loadPrevStatusLine()
 	}
 	if ok {
 		// Restore the user's full original statusLine object verbatim —

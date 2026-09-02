@@ -351,6 +351,59 @@ func TestRemoveClaudeStatusLineHook_RestoresFromPinnedPathWhenCurrentMissing(t *
 	}
 }
 
+// Same move, but the current prevStatusLinePath() is OCCUPIED by a leftover
+// from an earlier cycle under this config dir. The pinned path is the chain
+// target the installed command resolves right now, so opt-out must restore THAT
+// one — restoring the leftover would put back a status line the user has since
+// replaced, delete it, and strand the live stash with nothing naming it.
+func TestRemoveClaudeStatusLineHook_PrefersPinnedStashOverStaleCurrent(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	// The stash the installed command pins — the live chain target.
+	pinnedPrev := filepath.Join(t.TempDir(), "pinned-prev.json")
+	if err := os.WriteFile(pinnedPrev, []byte(`{"statusLine":{"type":"command","command":"live.sh","padding":2}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+
+	// This boot resolves elsewhere, and that path already holds a stale stash.
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"stale.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settings := `{"theme":"dark","statusLine":{"type":"command","command":` +
+		mustJSONString(t, installedCmd) + `}}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	if !strings.Contains(string(raw), `"live.sh"`) || !strings.Contains(string(raw), `"padding": 2`) {
+		t.Errorf("opt-out should restore the pinned stash verbatim, got: %s", raw)
+	}
+	if strings.Contains(string(raw), `"stale.sh"`) {
+		t.Errorf("opt-out restored the stale leftover at the current path: %s", raw)
+	}
+	// Both copies are consumed: one left behind is what a later re-enable would
+	// resurrect as a chain target.
+	if _, err := os.Stat(pinnedPrev); !os.IsNotExist(err) {
+		t.Errorf("pinned stash should be consumed after restore; err=%v", err)
+	}
+	if _, err := os.Stat(newPrev); !os.IsNotExist(err) {
+		t.Errorf("stale stash at the current path should be dropped; err=%v", err)
+	}
+}
+
 func mustJSONString(t *testing.T, s string) string {
 	t.Helper()
 	// Minimal JSON string escaper for test fixtures — only need `"` and `\`.
