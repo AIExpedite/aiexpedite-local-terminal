@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -22,21 +24,98 @@ func TestGrokWindowsJunctionCommand_DoesNotInterpolatePaths(t *testing.T) {
 		}
 	}
 
-	lookup := func(key string) string {
-		prefix := key + "="
-		for _, value := range cmd.Env {
-			if strings.HasPrefix(value, prefix) {
-				return strings.TrimPrefix(value, prefix)
-			}
-		}
-		return ""
-	}
-	if got := lookup(grokJunctionLinkEnv); got != link {
+	if got := commandEnvValue(cmd, grokJunctionLinkEnv); got != link {
 		t.Fatalf("junction link env = %q, want %q", got, link)
 	}
-	if got := lookup(grokJunctionTargetEnv); got != target {
+	if got := commandEnvValue(cmd, grokJunctionTargetEnv); got != target {
 		t.Fatalf("junction target env = %q, want %q", got, target)
 	}
+}
+
+func TestGrokWindowsRemoveJunctionCommand_DoesNotInterpolatePaths(t *testing.T) {
+	link := `C:\temp\grok&(link)`
+	cmd := grokWindowsRemoveJunctionCommand(link)
+	commandLine := strings.Join(cmd.Args, " ")
+	if strings.Contains(commandLine, link) {
+		t.Fatalf("junction path leaked into cmd.exe tokens: %q", commandLine)
+	}
+	for _, want := range []string{"/d", "/v:off", "rmdir", `%` + grokJunctionLinkEnv + `%`} {
+		if !strings.Contains(commandLine, want) {
+			t.Fatalf("junction removal command %q missing %q", commandLine, want)
+		}
+	}
+	if got := commandEnvValue(cmd, grokJunctionLinkEnv); got != link {
+		t.Fatalf("junction link env = %q, want %q", got, link)
+	}
+}
+
+func TestGrokWindowsCommands_UseComSpec(t *testing.T) {
+	comSpec := filepath.Join(t.TempDir(), "sentinel-cmd.exe")
+	t.Setenv("ComSpec", comSpec)
+	t.Setenv("SystemRoot", filepath.Join(t.TempDir(), "ignored-system-root"))
+	if got := grokWindowsJunctionCommand("link", "target").Path; got != comSpec {
+		t.Fatalf("junction command path = %q, want ComSpec %q", got, comSpec)
+	}
+	if got := grokWindowsRemoveJunctionCommand("link").Path; got != comSpec {
+		t.Fatalf("remove command path = %q, want ComSpec %q", got, comSpec)
+	}
+
+	systemRoot := t.TempDir()
+	t.Setenv("ComSpec", "")
+	t.Setenv("SystemRoot", systemRoot)
+	wantFallback := filepath.Join(systemRoot, "System32", "cmd.exe")
+	if got := grokWindowsJunctionCommand("link", "target").Path; got != wantFallback {
+		t.Fatalf("junction fallback path = %q, want %q", got, wantFallback)
+	}
+	if got := grokWindowsRemoveJunctionCommand("link").Path; got != wantFallback {
+		t.Fatalf("remove fallback path = %q, want %q", got, wantFallback)
+	}
+}
+
+func TestUnlinkGrokDirectory_PlainDirReturnsNotLinkedSentinel(t *testing.T) {
+	plainDir := t.TempDir()
+	if err := unlinkGrokDirectory(plainDir); !errors.Is(err, errGrokStoreNotLinked) {
+		t.Fatalf("unlinkGrokDirectory error = %v, want errGrokStoreNotLinked", err)
+	}
+	if _, err := os.Stat(plainDir); err != nil {
+		t.Fatalf("plain directory should remain: %v", err)
+	}
+}
+
+func TestUnlinkGrokDirectory_MissingIsNoOp(t *testing.T) {
+	if err := unlinkGrokDirectory(filepath.Join(t.TempDir(), "missing")); err != nil {
+		t.Fatalf("missing directory link should be a no-op: %v", err)
+	}
+}
+
+func TestUnlinkGrokDirectory_RemovesSymlinkWithoutDeletingTarget(t *testing.T) {
+	target := t.TempDir()
+	if err := os.WriteFile(filepath.Join(target, "transcript.jsonl"), []byte("synthetic"), 0o600); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	link := filepath.Join(t.TempDir(), "sessions-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("directory symlink unavailable: %v", err)
+	}
+	if err := unlinkGrokDirectory(link); err != nil {
+		t.Fatalf("unlinkGrokDirectory: %v", err)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatalf("directory link still exists (lstat err = %v)", err)
+	}
+	if body, err := os.ReadFile(filepath.Join(target, "transcript.jsonl")); err != nil || string(body) != "synthetic" {
+		t.Fatalf("target content after unlink = %q, err=%v", body, err)
+	}
+}
+
+func commandEnvValue(cmd *exec.Cmd, key string) string {
+	for _, entry := range cmd.Env {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok && strings.EqualFold(name, key) {
+			return value
+		}
+	}
+	return ""
 }
 
 // withTempGrokSessionStore redirects the persistent conversation store into a
@@ -48,83 +127,6 @@ func withTempGrokSessionStore(t *testing.T) string {
 	grokSessionStoreRoot = root
 	t.Cleanup(func() { grokSessionStoreRoot = prev })
 	return filepath.Join(root, "grok-sessions")
-}
-
-// TestSetupIsolatedGrokHome_SessionStoreSurvivesHomeRemoval is the regression
-// test for the defect that made grok resume impossible: the isolated GROK_HOME
-// is deleted when the child exits, and grok keeps its conversation transcripts
-// under GROK_HOME, so the next process found an empty store and every
-// `session/load` failed with -32603 / FS_NOT_FOUND. Writing through the linked
-// `sessions` entry and then removing the home must leave the transcript intact.
-func TestSetupIsolatedGrokHome_SessionStoreSurvivesHomeRemoval(t *testing.T) {
-	store := withTempGrokSessionStore(t)
-	t.Setenv("GROK_HOME", t.TempDir())
-
-	dir, err := setupIsolatedGrokHome(false, grokACPDefaultModel)
-	if err != nil {
-		t.Fatalf("setupIsolatedGrokHome: %v", err)
-	}
-
-	// Stand in for grok writing `sessions/<url-encoded-cwd>/<uuid>/updates.jsonl`.
-	sessionDir := filepath.Join(dir, "sessions", "C%3A%5Crepo", "session-uuid")
-	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
-		t.Fatalf("write through linked sessions dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(sessionDir, "updates.jsonl"), []byte("turn"), 0o600); err != nil {
-		t.Fatalf("write transcript: %v", err)
-	}
-
-	// waitForExit's teardown.
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatalf("remove isolated home: %v", err)
-	}
-
-	persisted := filepath.Join(store, "C%3A%5Crepo", "session-uuid", "updates.jsonl")
-	body, err := os.ReadFile(persisted)
-	if err != nil {
-		t.Fatalf("transcript did not survive the isolated home: %v", err)
-	}
-	if string(body) != "turn" {
-		t.Fatalf("persisted transcript = %q, want %q", body, "turn")
-	}
-}
-
-// TestSetupIsolatedGrokHome_StillOmitsPersistedConfig pins the other half of
-// the contract: persisting the transcript store must not start persisting
-// anything ELSE across sessions. A plugin/hook/skill dropped into the isolated
-// home by one session must be gone once that home is removed, so the next
-// session cannot inherit it.
-func TestSetupIsolatedGrokHome_StillOmitsPersistedConfig(t *testing.T) {
-	store := withTempGrokSessionStore(t)
-	t.Setenv("GROK_HOME", t.TempDir())
-
-	first, err := setupIsolatedGrokHome(false, grokACPDefaultModel)
-	if err != nil {
-		t.Fatalf("setupIsolatedGrokHome: %v", err)
-	}
-	hookDir := filepath.Join(first, "installed-plugins")
-	if err := os.MkdirAll(hookDir, 0o700); err != nil {
-		t.Fatalf("seed plugin dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(hookDir, "evil.json"), []byte("{}"), 0o600); err != nil {
-		t.Fatalf("seed plugin: %v", err)
-	}
-	if err := os.RemoveAll(first); err != nil {
-		t.Fatalf("remove first home: %v", err)
-	}
-
-	second, err := setupIsolatedGrokHome(false, grokACPDefaultModel)
-	if err != nil {
-		t.Fatalf("setupIsolatedGrokHome (second): %v", err)
-	}
-	t.Cleanup(func() { os.RemoveAll(second) })
-
-	if _, err := os.Stat(filepath.Join(second, "installed-plugins", "evil.json")); !os.IsNotExist(err) {
-		t.Fatalf("persisted config leaked into a later session (stat err = %v)", err)
-	}
-	if _, err := os.Stat(store); err != nil {
-		t.Fatalf("session store should still exist: %v", err)
-	}
 }
 
 func TestPruneGrokSessionStore_RemovesExpiredKeepsFresh(t *testing.T) {

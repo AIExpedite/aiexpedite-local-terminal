@@ -608,6 +608,7 @@ func TestGrokACPLifecycle_StartSendEnd(t *testing.T) {
 		t.Skip("integration test only runs on win/linux/darwin")
 	}
 	enableTestGrokLogin(t)
+	store := withTempGrokSessionStore(t)
 
 	testExe, err := os.Executable()
 	if err != nil {
@@ -640,6 +641,10 @@ func TestGrokACPLifecycle_StartSendEnd(t *testing.T) {
 	if err := m.Start(id, tmpDir, nil, "ws", "uid", GrokStartOptions{}, publishFn); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	m.mu.RLock()
+	isolatedHome := m.sessions[id].IsolatedHome
+	m.mu.RUnlock()
+	writeTestGrokTranscript(t, filepath.Join(isolatedHome, grokSessionsDirName))
 
 	// The feature brief mandates that the orchestrator picks `cached_token`
 	// when the initialize response offers it. Drive the full handshake here so
@@ -759,7 +764,8 @@ func TestGrokACPLifecycle_StartSendEnd(t *testing.T) {
 			lastType = captured[len(captured)-1].Type
 		}
 		mu.Unlock()
-		return lastType == "grok_acp_ended" && m.ActiveCount() == 0
+		_, homeErr := os.Stat(isolatedHome)
+		return lastType == "grok_acp_ended" && m.ActiveCount() == 0 && os.IsNotExist(homeErr)
 	})
 
 	// Read ActiveCount before taking the capture mutex: publishFn takes `mu`,
@@ -767,6 +773,13 @@ func TestGrokACPLifecycle_StartSendEnd(t *testing.T) {
 	// would introduce a second lock order between the two.
 	if active := m.ActiveCount(); active != 0 {
 		t.Errorf("expected 0 active sessions after End; got %d", active)
+	}
+	if _, err := os.Stat(isolatedHome); !os.IsNotExist(err) {
+		t.Errorf("isolated home still exists after End (stat err = %v)", err)
+	}
+	persisted := filepath.Join(store, testGrokEncodedCWD, testGrokSessionID, "updates.jsonl")
+	if body, err := os.ReadFile(persisted); err != nil || string(body) != testGrokTranscript {
+		t.Errorf("persistent transcript after End = %q, err=%v", body, err)
 	}
 
 	mu.Lock()

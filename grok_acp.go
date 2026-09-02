@@ -180,10 +180,11 @@ type GrokACPSession struct {
 	WorkspaceRoot string
 	// IsolatedHome is the per-session temp dir Start points the child's
 	// GROK_HOME at: copied auth, a minimal clean config, a persistent sessions
-	// link, and a session-private billing log. It is removed best-effort exactly
-	// once after the child exits, so copied auth is never deleted from under a
-	// running process. Always set on a successfully started session because
-	// Start fails closed when isolation cannot be built.
+	// link, and a session-private billing log. It is removed through
+	// removeIsolatedGrokHome exactly once after the child exits, which unlinks
+	// the persistent store before deleting the ephemeral remainder. Always set
+	// on a successfully started session because Start fails closed when
+	// isolation cannot be built.
 	IsolatedHome string
 	// PersistentHome is the real Grok home captured alongside the auth copy.
 	// waitForExit merges only the session's normalized account-bound billing
@@ -450,7 +451,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// browser OAuth or the first-frame watchdog for a missing login.
 	authAssessment := assessIsolatedGrokLaunch(isolatedHome, time.Now(), opts.AllowAPIKeyFallback, resolvedModel)
 	if !authAssessment.Authenticated {
-		_ = os.RemoveAll(isolatedHome)
+		cleanupIsolatedGrokHome(isolatedHome, id)
 		reason := authAssessment.Reason
 		if reason == "" {
 			reason = "Grok is not signed in on this computer — run `grok login` on the terminal computer to authenticate."
@@ -472,30 +473,30 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	env = setEnvVar(env, "GROK_HOME", isolatedHome)
 	proc.Env = env
 
-	// cleanupIsolatedHome removes the per-session temp dir on any pre-spawn
+	// cleanupFailedStart removes the per-session temp dir on any pre-spawn
 	// failure path. Once the child is successfully started, ownership of the
 	// dir transfers to waitForExit (which removes it after the process exits),
 	// so we must NOT call this after a successful proc.Start().
-	cleanupIsolatedHome := func() {
-		_ = os.RemoveAll(isolatedHome)
+	cleanupFailedStart := func() {
+		cleanupIsolatedGrokHome(isolatedHome, id)
 	}
 
 	stdin, err := proc.StdinPipe()
 	if err != nil {
-		cleanupIsolatedHome()
+		cleanupFailedStart()
 		return fmt.Errorf("failed to create stdin pipe: %w", err)
 	}
 	stdout, err := proc.StdoutPipe()
 	if err != nil {
 		stdin.Close()
-		cleanupIsolatedHome()
+		cleanupFailedStart()
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 	stderr, err := proc.StderrPipe()
 	if err != nil {
 		stdin.Close()
 		stdout.Close()
-		cleanupIsolatedHome()
+		cleanupFailedStart()
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
@@ -503,7 +504,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		stdin.Close()
 		stdout.Close()
 		stderr.Close()
-		cleanupIsolatedHome()
+		cleanupFailedStart()
 		return fmt.Errorf("failed to start grok agent stdio (is `grok` on PATH or in ~/.grok/bin? run `grok login` to authenticate): %w", err)
 	}
 
@@ -1281,7 +1282,7 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	// session because waitForExit fires exactly once. Best-effort: a leftover
 	// temp dir is harmless and the OS temp reaper will eventually collect it.
 	if session.IsolatedHome != "" {
-		_ = os.RemoveAll(session.IsolatedHome)
+		cleanupIsolatedGrokHome(session.IsolatedHome, session.ID)
 	}
 
 	fmt.Printf("%s[grok-acp] Session %s ended (exit code: %d)%s\n",
@@ -1427,134 +1428,6 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) ([]string, er
 	args = append(args, sanitized...)
 	args = append(args, "stdio")
 	return args, nil
-}
-
-// setupIsolatedGrokHome creates a per-session temp dir to use as the child's
-// GROK_HOME and seeds it with the minimum surfaces the CLI needs:
-//
-//   - a copy of the real `grok login` auth file, so cached-token auth keeps
-//     working without us inheriting anything else from the user's real
-//     ~/.grok (api_key, auto-approve, pinned requirements.toml, …)
-//   - a minimal clean config.toml (`[cli]\ninstaller = "internal"\nauto_update = false\n`)
-//     — `auto_update = false` suppresses the headless updater check, which can
-//     otherwise race `grok agent stdio` and emit non-JSON stdout that readStream
-//     would treat as a fatal `grok_acp_error`
-//   - a directory link for conversations so transcripts survive the ephemeral
-//     home, plus a private billing log seeded with the copied account identity;
-//     waitForExit later persists only its normalized allowlisted snapshot
-//
-// This replaces the dead `--config <key>=` neutralizer machinery: grok 0.2.59
-// rejects `--config` outright, so we can no longer clear persisted config via
-// argv. Pointing GROK_HOME at an isolated dir that simply OMITS the dangerous
-// persisted files neutralises every persisted-config vector by construction.
-//
-// Source auth file: `$GROK_HOME/auth.json` when GROK_HOME is set, else
-// `~/.grok/auth.json`; `cached_token.json` is tried as a fallback name. A
-// missing auth file is NOT fatal — we proceed with just the clean config.toml
-// and let grok surface any auth error through the normal ACP handshake.
-//
-// allowAPIKeyFallback opts in to preserving the user's persistent
-// `api_key = "..."` entry from the source `config.toml` into the isolated
-// config. Without this, users who opted into API-key fallback but keep their
-// key in `~/.grok/config.toml` (xAI's documented persistent form) and do NOT
-// export XAI_API_KEY would silently lose API-key auth in the isolated session.
-// Both the root `[model] api_key` form AND the documented per-model
-// `[model.<runtimeModel>] api_key` form are carried over (the per-model match
-// for the resolved runtime model wins when both exist — mirroring grok's own
-// precedence in the un-isolated config). All other persisted config
-// (approval/permission knobs, other model.* fields, other tables) stays
-// excluded by design.
-//
-// Returns the temp dir path. The caller (Start) owns its lifecycle and removes
-// it after the child exits (waitForExit) or on any pre-spawn failure.
-func setupIsolatedGrokHome(allowAPIKeyFallback bool, runtimeModel string) (string, error) {
-	return setupIsolatedGrokHomeFrom(allowAPIKeyFallback, runtimeModel, grokPersistentHome())
-}
-
-func setupIsolatedGrokHomeFrom(allowAPIKeyFallback bool, runtimeModel, srcBase string) (string, error) {
-	return setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback, runtimeModel, srcBase, true)
-}
-
-// setupIsolatedGrokSmokeHomeFrom creates the same auth-only, MCP-disabled home
-// as the ACP path without linking the user's persistent conversation store.
-// A one-shot maintenance smoke never resumes a conversation, so exposing that
-// store would add filesystem surface without serving the smoke contract.
-func setupIsolatedGrokSmokeHomeFrom(srcBase string) (string, error) {
-	return setupIsolatedGrokHomeWithSessionStore(false, "", srcBase, false)
-}
-
-func setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback bool, runtimeModel, srcBase string, linkSessionStore bool) (string, error) {
-	dir, err := os.MkdirTemp("", "grok-acp-home-")
-	if err != nil {
-		return "", fmt.Errorf("create isolated grok home: %w", err)
-	}
-
-	// Copy the auth file under the first name that exists. Best-effort: a
-	// missing/unreadable source is tolerated (grok surfaces the auth error
-	// through the normal ACP flow).
-	if srcBase != "" {
-		for _, name := range []string{"auth.json", "cached_token.json"} {
-			src := filepath.Join(srcBase, name)
-			data, rerr := os.ReadFile(src)
-			if rerr != nil {
-				continue
-			}
-			if werr := os.WriteFile(filepath.Join(dir, name), data, 0o600); werr != nil {
-				_ = os.RemoveAll(dir)
-				return "", fmt.Errorf("copy grok auth file %s: %w", name, werr)
-			}
-		}
-	}
-	if lerr := seedGrokManagedBillingIdentity(dir); lerr != nil {
-		fmt.Printf("%s[grok-acp] managed billing identity not seeded (usage freshness may be unavailable): %v%s\n",
-			colorYellow, lerr, colorReset)
-	}
-
-	// Minimal clean config.toml — deliberately carries no approval/permission
-	// knobs, so none of the user's real persisted policy leaks into the
-	// isolated session. When allowAPIKeyFallback is true and the source
-	// `config.toml` contains either `[model] api_key = "..."` OR the
-	// per-model `[model.<runtimeModel>] api_key = "..."` form, that single
-	// line is carried over (under the same section header it came from) so
-	// the opt-in fallback also works for users whose key lives in xAI's
-	// documented persistent form (not just `XAI_API_KEY`).
-	// `auto_update = false` matches xAI's documented headless/scripting guidance:
-	// without it, an updater check can race `grok agent stdio` and dump non-JSON
-	// stdout that readStream treats as a fatal `grok_acp_error`.
-	//
-	// `[compat.cursor] mcps = false` + `[compat.claude] mcps = false` suppress
-	// grok's vendor-MCP scan of the HOST's `~/.cursor/mcp.json` and
-	// `~/.claude.json` — those files live outside $GROK_HOME so the isolated
-	// dir alone can't hide them, and a slow vendor MCP (e.g. a `visualization`
-	// proxy) otherwise blocks `session/new` ~10s before the ACP turn times out.
-	cfg := "[cli]\ninstaller = \"internal\"\nauto_update = false\n" +
-		"\n[compat.cursor]\nmcps = false\n" +
-		"\n[compat.claude]\nmcps = false\n"
-	if allowAPIKeyFallback && srcBase != "" {
-		section, apiKey := readGrokPersistedAPIKey(filepath.Join(srcBase, "config.toml"), runtimeModel)
-		if apiKey != "" {
-			cfg += "\n[" + section + "]\napi_key = " + apiKey + "\n"
-		}
-	}
-	if werr := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cfg), 0o600); werr != nil {
-		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("write isolated config.toml: %w", werr)
-	}
-
-	if linkSessionStore {
-		// Point `sessions` at the persistent per-device conversation store. Grok
-		// keys transcripts by GROK_HOME, so without this the store dies with the
-		// temp dir and every cross-session `session/load` fails FS_NOT_FOUND (see
-		// grok_session_store.go). Non-fatal by design: a session with an
-		// ephemeral store still runs, it just cannot be reattached later.
-		if lerr := linkGrokSessionStore(dir); lerr != nil {
-			fmt.Printf("%s[grok-acp] conversation store not persisted (resume will cold-start): %v%s\n",
-				colorYellow, lerr, colorReset)
-		}
-		pruneGrokSessionStoreOnce()
-	}
-
-	return dir, nil
 }
 
 // readGrokPersistedAPIKey returns the raw TOML value (quoted or literal, as

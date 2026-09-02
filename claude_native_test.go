@@ -200,13 +200,48 @@ func skipIfUnsupportedOS(t *testing.T) {
 	}
 }
 
+// newMockClaudeDir returns a throwaway directory to install the mock `claude`
+// binary into. It deliberately does NOT use t.TempDir(): that cleanup FAILS the
+// test when RemoveAll cannot delete the directory, and on Windows deleting a
+// running image is illegal (unix happily unlinks one). The background
+// credential probe spawns the resolved `claude` path (`auth status --json`), so
+// a probe still in flight when the test's assertions finish holds the mock
+// .exe open for a moment longer — which failed
+// TestManagedClaudeSession_StderrAfterResultDoesNotReopenTheTurn on
+// windows-latest with "Access is denied" on a test that had otherwise passed.
+// Retry briefly, then leave the directory to the suite-wide sandbox teardown
+// (TMPDIR/TEMP/TMP point inside it, see sandboxTestConfigDir) rather than
+// failing a green test over a transient lock.
+func newMockClaudeDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "aix-mock-claude-")
+	if err != nil {
+		t.Fatalf("create mock claude dir: %v", err)
+	}
+	t.Cleanup(func() {
+		deadline := time.Now().Add(5 * time.Second)
+		var rmErr error
+		for {
+			if rmErr = os.RemoveAll(dir); rmErr == nil {
+				return
+			}
+			if time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Logf("mock claude dir %s still locked (%v); left for the sandbox teardown", dir, rmErr)
+	})
+	return dir
+}
+
 func installMockClaude(t *testing.T, mode string) string {
 	t.Helper()
 	testExe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	tmpDir := t.TempDir()
+	tmpDir := newMockClaudeDir(t)
 	mockName := "claude"
 	if runtime.GOOS == "windows" {
 		mockName += ".exe"
