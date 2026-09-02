@@ -860,6 +860,24 @@ func claudeUsageObservationCovers(observed, baseline time.Time) bool {
 	return !observed.IsZero() && !observed.Before(baseline.Truncate(time.Millisecond))
 }
 
+// settleOwedIfCovered clears an outstanding post-run debt when `observed` — a
+// reading another writer already put in the SHARED cache — is new enough to
+// have seen the run that debt was recorded for.
+//
+// Separate from settleOwed because the caller here has an OBSERVATION, not the
+// baseline it is paying: the cross-process dedupe suppresses on "someone
+// answered since `dedupeBaseline`", and on a routine gather that baseline is the
+// throttle window rather than the run. Re-reading the debt under the lock and
+// testing it with the same claudeUsageObservationCovers rule the probe paths use
+// is what keeps a reading that predates the run from clearing it.
+func (g *claudeUsageProbeGate) settleOwedIfCovered(observed time.Time) {
+	g.mu.Lock()
+	if !g.owedBaseline.IsZero() && claudeUsageObservationCovers(observed, g.owedBaseline) {
+		g.owedBaseline = time.Time{}
+	}
+	g.mu.Unlock()
+}
+
 // owedObservation returns the outstanding post-run baseline, if any.
 func (g *claudeUsageProbeGate) owedObservation() time.Time {
 	g.mu.Lock()
@@ -940,9 +958,13 @@ func (g *claudeUsageProbeGate) armedForProbe() bool {
 // processes can still race between the check and the write — but it collapses
 // the steady-state duplication on an account-scoped endpoint without ever
 // swallowing a probe that a real run made necessary.
-func claudeUsageProbeObservedSince(fingerprint string, baseline, now time.Time) bool {
+//
+// Returns the shared observation alongside the verdict so a suppressed caller
+// can settle a post-run debt that observation already covers, instead of leaving
+// a debt recorded that no probe will ever be issued to pay.
+func claudeUsageProbeObservedSince(fingerprint string, baseline, now time.Time) (time.Time, bool) {
 	if baseline.IsZero() {
-		return false
+		return time.Time{}, false
 	}
 	// Row-aware for the same reason the staleness TTL is: a status-line render
 	// answers only five_hour/seven_day, so accepting it as "someone already
@@ -950,7 +972,7 @@ func claudeUsageProbeObservedSince(fingerprint string, baseline, now time.Time) 
 	// and Fable rows depend on. A probe writes every window the endpoint supplies,
 	// so the cross-process dedupe this exists for still collapses cleanly.
 	latest := claudeSnapshotFreshness(loadMergedClaudeRateLimitView(fingerprint), now)
-	return !latest.IsZero() && latest.After(baseline)
+	return latest, !latest.IsZero() && latest.After(baseline)
 }
 
 // claudeSnapshotFreshness is how old the DISPLAYED snapshot is — the stalest of
@@ -1135,7 +1157,15 @@ func probeClaudeUsage(
 
 	// Cross-process coordination on an ACCOUNT-scoped endpoint: has another
 	// writer on this machine already answered what this probe would ask?
-	if claudeUsageProbeObservedSince(identity.fingerprint, dedupeBaseline, now) {
+	if sharedAt, answered := claudeUsageProbeObservedSince(identity.fingerprint, dedupeBaseline, now); answered {
+		// Somebody else already paid for this reading. If it is also new enough to
+		// have seen the run we owe an observation for, that debt is SETTLED — by
+		// another writer rather than by us. Leaving it recorded would keep a debt
+		// standing that no probe is ever going to be issued to pay, since every
+		// later attempt re-takes this same branch against the same reading.
+		// settleOwedIfCovered re-checks coverage against the CURRENT debt under the
+		// gate lock, so a run that finished after this reading keeps its debt.
+		claudeUsageProbe.settleOwedIfCovered(sharedAt)
 		return false, time.Time{}, nil
 	}
 	endpoint := claudeUsageProbeURL()

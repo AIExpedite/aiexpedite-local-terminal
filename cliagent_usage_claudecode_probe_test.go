@@ -904,7 +904,7 @@ func TestClaudeUsageProbeObservedSince_StatusLineRenderCannotCoverAStaleWeeklyRo
 		},
 	}, stale, "", claudeRateLimitSourceStream)
 
-	if claudeUsageProbeObservedSince("", now.Add(-time.Minute), now) {
+	if _, answered := claudeUsageProbeObservedSince("", now.Add(-time.Minute), now); answered {
 		t.Error("a status-line render must not stand in for the weekly row it cannot refresh")
 	}
 }
@@ -2781,6 +2781,66 @@ func TestRefreshClaudeUsageIfStale_KeepsDebtWhenMergeKeepsANewerReading(t *testi
 	if got := claudeUsageProbe.owedObservation(); !got.Equal(runAt) {
 		t.Errorf("owedObservation=%s, want the debt still standing at %s — every window of "+
 			"this probe was refused as older, so nothing it wrote observes the run", got, runAt)
+	}
+}
+
+// The cross-process dedupe is a way to PAY a post-run debt, not merely a way to
+// skip a request. When another writer on this machine (a second agent channel,
+// an overlapping restart, the status-line hook) has already recorded a reading
+// newer than the run, the branch that suppresses the duplicate HTTP call must
+// also clear the debt that reading covers. Leaving it recorded keeps a debt
+// standing that no probe will ever be issued to pay, because every later attempt
+// re-takes this same branch against the same reading.
+func TestRefreshClaudeUsageIfStale_SharedObservationSettlesTheRunDebt(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	runAt := now.Add(-2 * time.Second)    // the turn finished before this gather
+	sharedAt := now.Add(-1 * time.Second) // ... and another writer answered after it
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":61,"resets_at":%d,"status":"allowed"}`,
+				now.Add(3*time.Hour).Unix()),
+		}))
+	})
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 44, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: sharedAt.UnixMilli(), usageKnown: true,
+		},
+	}, sharedAt, "", claudeRateLimitSourceStatusLine)
+
+	claudeUsageProbe.recordOwed(runAt)
+	if refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "") {
+		t.Error("a suppressed probe wrote nothing of its own, so it must not report a refresh")
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Errorf("request count=%d, want 0 — another writer already answered this question", got)
+	}
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("owedObservation=%s, want the debt settled by the shared reading at %s", got, sharedAt)
+	}
+}
+
+// ... and the guard that keeps that from becoming a way to settle a debt with a
+// PRE-run reading. The routine gather dedupes against the throttle window rather
+// than the run, so a suppressing observation is not automatically one that saw
+// the run; settleOwedIfCovered re-tests it against the current debt.
+func TestSettleOwedIfCovered_KeepsDebtNewerThanTheSharedReading(t *testing.T) {
+	armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {})
+
+	runAt := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	claudeUsageProbe.recordOwed(runAt)
+
+	claudeUsageProbe.settleOwedIfCovered(runAt.Add(-time.Millisecond))
+	if got := claudeUsageProbe.owedObservation(); !got.Equal(runAt) {
+		t.Errorf("owedObservation=%s, want the debt still standing at %s — a reading taken "+
+			"before the run cannot stand in for the observation that run earned", got, runAt)
+	}
+
+	claudeUsageProbe.settleOwedIfCovered(runAt)
+	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
+		t.Errorf("owedObservation=%s, want a same-millisecond reading to settle the debt, "+
+			"matching claudeUsageObservationCovers", got)
 	}
 }
 
