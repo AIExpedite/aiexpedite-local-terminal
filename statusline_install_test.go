@@ -404,6 +404,155 @@ func TestRemoveClaudeStatusLineHook_PrefersPinnedStashOverStaleCurrent(t *testin
 	}
 }
 
+// A distinct pinned path that holds NOTHING is still the authority. The current
+// prevStatusLinePath() is not named by the installed command, so whatever sits
+// there is a leftover from an earlier cycle — restoring it on a pinned miss
+// would resurrect a third-party command the user has since replaced. Opt-out
+// must drop statusLine instead.
+func TestRemoveClaudeStatusLineHook_PinnedMissDoesNotFallBackToCurrent(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	// The command pins a stash path that does not exist (already consumed).
+	pinnedPrev := filepath.Join(t.TempDir(), "pinned-prev.json")
+	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+
+	// This boot resolves elsewhere, and that path holds a stale leftover.
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"stale.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settings := `{"theme":"dark","statusLine":{"type":"command","command":` +
+		mustJSONString(t, installedCmd) + `}}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	if strings.Contains(string(raw), "statusLine") {
+		t.Errorf("pinned miss must drop statusLine, not restore the current-path leftover: %s", raw)
+	}
+	if strings.Contains(string(raw), `"stale.sh"`) {
+		t.Errorf("opt-out restored the stale leftover at the current path: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"theme": "dark"`) {
+		t.Errorf("unrelated settings must survive: %s", raw)
+	}
+	if _, err := os.Stat(newPrev); !os.IsNotExist(err) {
+		t.Errorf("leftover stash at the current path should be dropped; err=%v", err)
+	}
+}
+
+// A MALFORMED pinned stash is the same answer as an absent one — there is
+// nothing restorable — so opt-out drops statusLine rather than reaching for the
+// current path.
+func TestRemoveClaudeStatusLineHook_MalformedPinnedStashDoesNotFallBack(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	pinnedPrev := filepath.Join(t.TempDir(), "pinned-prev.json")
+	if err := os.WriteFile(pinnedPrev, []byte(`{"statusLine":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"stale.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settings := `{"statusLine":{"type":"command","command":` +
+		mustJSONString(t, installedCmd) + `}}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	if strings.Contains(string(raw), `"stale.sh"`) {
+		t.Errorf("malformed pinned stash must not promote the current path: %s", raw)
+	}
+}
+
+// An UNREADABLE pinned stash is not an answer at all: it may still hold the
+// user's chained command. Opt-out must abort rather than delete statusLine (or
+// restore the unrelated current-path leftover), leaving settings.json untouched
+// so a later attempt can still restore the chain.
+func TestRemoveClaudeStatusLineHook_UnreadablePinnedStashAborts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permissions do not block reads the same way on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the unreadable-directory permission")
+	}
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	// The pinned stash exists but sits in a directory we cannot traverse, so the
+	// read fails with something other than IsNotExist.
+	lockedDir := filepath.Join(t.TempDir(), "locked")
+	if err := os.MkdirAll(lockedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pinnedPrev := filepath.Join(lockedDir, "pinned-prev.json")
+	if err := os.WriteFile(pinnedPrev, []byte(`{"statusLine":{"type":"command","command":"live.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(lockedDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(lockedDir, 0o755) })
+
+	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"stale.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	settings := `{"statusLine":{"type":"command","command":` +
+		mustJSONString(t, installedCmd) + `}}`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := removeClaudeStatusLineHook(home)
+	if err == nil {
+		t.Fatalf("an unreadable pinned stash must surface as an error, got changed=%v", changed)
+	}
+	if changed {
+		t.Errorf("aborted removal must report changed=false")
+	}
+	raw, _ := os.ReadFile(settingsPath)
+	if string(raw) != settings {
+		t.Errorf("settings.json must be left untouched on abort: got %s, want %s", raw, settings)
+	}
+	if _, err := os.Stat(newPrev); err != nil {
+		t.Errorf("no stash may be retired when the removal aborted; err=%v", err)
+	}
+}
+
 func mustJSONString(t *testing.T, s string) string {
 	t.Helper()
 	// Minimal JSON string escaper for test fixtures — only need `"` and `\`.

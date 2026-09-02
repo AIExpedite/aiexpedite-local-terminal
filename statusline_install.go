@@ -314,18 +314,35 @@ func loadPrevStatusLine() (json.RawMessage, bool) {
 // caller's fallback is the same, and a half-decoded object must never be
 // restored into settings.json.
 func loadPrevStatusLineAt(path string) (json.RawMessage, bool) {
+	raw, ok, _ := loadPrevStatusLineAtChecked(path)
+	return raw, ok
+}
+
+// loadPrevStatusLineAtChecked is loadPrevStatusLineAt for the one caller that
+// must tell "there is no stash here" apart from "this stash could not be read":
+// opt-out treats a distinct PINNED path as the sole authority, so a miss there
+// decides whether settings.json loses statusLine entirely. Absent, malformed or
+// empty is a real answer — there is nothing restorable — and is reported as
+// (nil, false, nil). A read error that is not IsNotExist is NOT an answer: the
+// file may hold the user's chained command, so it surfaces as an error and the
+// caller leaves settings.json alone, the same rule migratePrevStatusLine
+// applies to an unverifiable destination stash.
+func loadPrevStatusLineAtChecked(path string) (json.RawMessage, bool, error) {
 	if path == "" {
-		return nil, false
+		return nil, false, nil
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, false
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
 	}
 	var p prevStatusLine
 	if json.Unmarshal(b, &p) != nil || len(p.StatusLine) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
-	return p.StatusLine, true
+	return p.StatusLine, true, nil
 }
 
 // loadPrevStatusLineCommand extracts just the command from the stashed object
@@ -880,15 +897,30 @@ func removeClaudeStatusLineHook(home string) (bool, error) {
 	// it, and strand the live stash at the pinned path with nothing left naming
 	// it. The paths differ only when the data dir moved since install (e.g.
 	// XDG_CONFIG_HOME changed), so the common case still reads one file.
+	//
+	// Authority is EXCLUSIVE, not just preferred: once a distinct pinned path
+	// exists, a miss there means "the chain target this command names holds
+	// nothing restorable", never "consult the other file". Falling back would
+	// restore exactly the leftover the paragraph above rejects — and it would do
+	// so in the case where it is most likely to be wrong, since the pinned stash
+	// being gone is what a completed earlier opt-out looks like.
 	prev, ok, pinnedPrev := json.RawMessage(nil), false, ""
-	if pinned := extractInstalledPinnedPath(existing.Command, "STATUSLINE_PREV"); pinned != "" && pinned != prevStatusLinePath() {
-		if raw, found := loadPrevStatusLineAt(pinned); found {
+	pinned := extractInstalledPinnedPath(existing.Command, "STATUSLINE_PREV")
+	if pinned != "" && pinned != prevStatusLinePath() {
+		raw, found, err := loadPrevStatusLineAtChecked(pinned)
+		if err != nil {
+			// Unreadable is not "absent": the file may still hold the user's
+			// chained command, and dropping statusLine here would destroy it with
+			// no copy left. Abort so the caller can warn and the next opt-out can
+			// retry.
+			return false, err
+		}
+		if found {
 			// Recorded so the retire below drops BOTH copies: opt-out consumes the
 			// stash, and one left behind is what a later re-enable would resurrect.
 			prev, ok, pinnedPrev = raw, true, pinned
 		}
-	}
-	if !ok {
+	} else {
 		prev, ok = loadPrevStatusLine()
 	}
 	if ok {
