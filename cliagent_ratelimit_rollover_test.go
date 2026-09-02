@@ -303,6 +303,30 @@ func TestWeeklyAggregateStillReportsAnObservedSubWindow(t *testing.T) {
 	}
 }
 
+// Equal worst-case percentages are all constraining. A fresh unified reading
+// must not make a tied stale per-model limit look fresh, or routine status-line
+// writes can suppress the probe that would update that model indefinitely.
+func TestWeeklyAggregateUsesOldestObservationAcrossTiedConstraints(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	fresh := now.Add(-time.Minute)
+	stale := now.Add(-20 * time.Minute)
+	reset := now.Add(60 * time.Hour).UnixMilli()
+	buckets := map[string]claudeRateLimitBucket{
+		claudeWindowSevenDay: {
+			UsedPercentage: 90, ResetsAtMs: reset, ObservedAtMs: fresh.UnixMilli(),
+		},
+		claudeWindowSevenDayOpus: {
+			UsedPercentage: 90, ResetsAtMs: reset, ObservedAtMs: stale.UnixMilli(),
+		},
+	}
+
+	metric := aggregateWeeklyMetric(buckets, now)
+	if metric.ObservedAt != observedAtRFC3339(stale.UnixMilli()) {
+		t.Fatalf("ObservedAt=%q, want oldest tied constraint %q",
+			metric.ObservedAt, observedAtRFC3339(stale.UnixMilli()))
+	}
+}
+
 /* ─────────────────────────────── helpers ────────────────────────────────── */
 
 func claudeCodeMetricsFromCacheAt(t *testing.T, path string, now time.Time) []cliAgentUsageMetric {

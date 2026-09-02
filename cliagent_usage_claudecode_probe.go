@@ -609,20 +609,22 @@ func (g *claudeUsageProbeGate) begin(now time.Time, forced bool) bool {
 	return true
 }
 
-// claudeUsageProbeWholeTimeout bounds ONE complete probe: the request AND the
-// verified persist that follows it. claudeUsageProbeTimeout covers the request
-// alone, so anything that must outlast the whole sequence — a caller's root
-// deadline, a joiner's wait — is derived from here rather than from the request
-// bound, which would expire while the reading was still being written.
+// claudeUsageProbeWholeTimeout bounds ONE complete post-run probe: credential
+// lookup, the request, AND the verified persist that follows it.
+// claudeUsageProbeTimeout covers the request alone, while
+// machineInfoProbeTimeout bounds the macOS Keychain lookup. Anything that must
+// outlast the whole sequence — a caller's root deadline, a joiner's wait — is
+// derived from here rather than from the request bound, which would expire
+// while the reading was still being resolved or written.
 //
-// Derived from the two bounds the probe itself OBSERVES — the request timeout
-// and the ceiling the verified merge enforces on its own persist step — so it
-// cannot drift away from them. It matters that the second one is enforced
+// Derived from the three bounds the probe itself OBSERVES — credential lookup,
+// request, and the ceiling the verified merge enforces on its own persist step
+// — so it cannot drift away from them. It matters that the last one is enforced
 // rather than estimated: the in-process cache gate has no queue bound, so a
 // budget computed as "our wait plus one other writer's" would be exceeded by
 // any device running two Claude sessions at once. A var so the tests can pin it
 // small.
-var claudeUsageProbeWholeTimeout = claudeUsageProbeTimeout + claudeRateLimitVerifiedPersistBudget
+var claudeUsageProbeWholeTimeout = machineInfoProbeTimeout + claudeUsageProbeTimeout + claudeRateLimitVerifiedPersistBudget
 
 // claudeUsageProbeJoinTimeout bounds how long a forced refresh waits for a probe
 // that is already in flight. It must cover the WHOLE probe, not just its
@@ -632,6 +634,10 @@ var claudeUsageProbeWholeTimeout = claudeUsageProbeTimeout + claudeRateLimitVeri
 // refused by the still-held single-flight slot, and sign the pre-probe cache
 // milliseconds before the fresh one lands.
 var claudeUsageProbeJoinTimeout = claudeUsageProbeWholeTimeout
+
+// claudeUsageProbeBeforeForcedAttempt is an observation point for deterministic
+// gate-race tests. Production leaves it as a no-op.
+var claudeUsageProbeBeforeForcedAttempt = func(int) {}
 
 // joinInFlight waits for a probe that already holds the single-flight slot,
 // reporting whether there was one to join and, when it persisted a reading, the
@@ -657,9 +663,9 @@ var claudeUsageProbeJoinTimeout = claudeUsageProbeWholeTimeout
 // caller then falls through and issues the request itself, the slot now free.
 func (g *claudeUsageProbeGate) joinInFlight(ctx context.Context, fingerprint string) (joined bool, observedAt time.Time) {
 	g.mu.Lock()
-	done, before := g.doneCh, g.refreshes
+	done, before, inFlight := g.doneCh, g.refreshes, g.inFlight
 	g.mu.Unlock()
-	if done == nil {
+	if !inFlight || done == nil {
 		return false, time.Time{}
 	}
 	timer := time.NewTimer(claudeUsageProbeJoinTimeout)
@@ -1442,7 +1448,9 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 	// join covers a probe already on the wire when the refresh arrived; the
 	// second covers one that claimed the slot in the gap between that join and
 	// our own begin(), which would otherwise refuse us and leave the refresh
-	// reporting the pre-probe cache. Bounded at two — a third would be an
+	// reporting the pre-probe cache. When that second joined probe produces no
+	// usable reading, the refresh gets one final attempt of its own after the slot
+	// is released. Bounded at two joins and two attempts — a third join would be an
 	// unbounded wait on a queue this process does not control — and each join is
 	// itself bounded by the gather context and claudeUsageProbeJoinTimeout.
 	if forced {
@@ -1462,9 +1470,13 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 				// later routine gather to inherit.
 				return true
 			}
-			if pass > 0 {
-				break // the second join was the retry; do not loop on the slot
+			if pass > 0 && !joined {
+				// Our first attempt was admitted and failed rather than losing the
+				// slot to another probe. Do not turn one provider failure into an
+				// immediate duplicate request merely because this is forced.
+				break
 			}
+			claudeUsageProbeBeforeForcedAttempt(pass)
 			refreshed, observedAt, probeErr := probeClaudeUsage(ctx, now, resolveIdentity, baseline, true)
 			logClaudeUsageProbeFailure(probeErr)
 			if refreshed {
@@ -1475,7 +1487,9 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 				return true
 			}
 			// Refused or failed. If the slot was taken while we were asking, the
-			// next pass joins that probe instead of reporting a stale reading.
+			// next pass joins that probe instead of reporting a stale reading. If
+			// that second join is unusable, pass two makes one final request after
+			// the joined holder has released the slot.
 		}
 		return false
 	}

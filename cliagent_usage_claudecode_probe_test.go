@@ -2512,6 +2512,67 @@ func TestClaudeUsageProbe_ForcedRefreshRetriesAfterFailedInFlightProbe(t *testin
 	}
 }
 
+// The slot can change hands after the refresh's initial join reports "nothing
+// in flight" but before its own begin(). If that racing probe then writes
+// nothing, the second join has only waited for a failure; the forced refresh
+// must take one final turn of its own instead of signing the cache it loaded
+// before the race.
+func TestClaudeUsageProbe_ForcedRefreshRetriesAfterUnusableSecondJoin(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	racerStarted := make(chan struct{})
+	releaseRacer := make(chan struct{})
+	racerDone := make(chan struct{})
+	var served int64
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt64(&served, 1) == 1 {
+			close(racerStarted)
+			<-releaseRacer
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprint(w, probeUsageJSON(map[string]string{
+			claudeWindowFiveHour: fmt.Sprintf(`{"used_percentage":72,"resets_at":%d,"status":"allowed"}`,
+				now.Add(3*time.Hour).Unix()),
+		}))
+	})
+
+	realHook := claudeUsageProbeBeforeForcedAttempt
+	var startOnce sync.Once
+	claudeUsageProbeBeforeForcedAttempt = func(pass int) {
+		if pass != 0 {
+			return
+		}
+		startOnce.Do(func() {
+			go func() {
+				defer close(racerDone)
+				_, _ = runClaudeUsageProbe(context.Background(), now, false)
+			}()
+			<-racerStarted
+			// Keep the racing probe in flight until our first attempt has been
+			// refused and the second join is waiting on it.
+			go func() {
+				time.Sleep(20 * time.Millisecond)
+				close(releaseRacer)
+			}()
+		})
+	}
+	t.Cleanup(func() { claudeUsageProbeBeforeForcedAttempt = realHook })
+
+	forceCtx := WithClaudeUsageForceProbe(context.Background())
+	if !refreshClaudeUsageIfStale(forceCtx, now, time.Time{}, probeTestToken, "") {
+		t.Fatal("a failed second join must leave the forced refresh one attempt of its own")
+	}
+	<-racerDone
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Errorf("request count=%d, want the failed racer plus one forced retry", got)
+	}
+	snap, ok := loadClaudeRateLimitSnapshot(cache)
+	if !ok || snap.Buckets[claudeWindowFiveHour].UsedPercentage != 72 {
+		t.Errorf("snapshot=%+v, want the forced retry's 72%% reading", snap)
+	}
+}
+
 // A joined probe that started BEFORE the run does not pay the run's debt. It
 // persisted a reading, but a PRE-run one: settling with it would sign the
 // pre-run observation into the receipt and leave the already-scheduled trailing
@@ -3034,5 +3095,20 @@ func TestClaudeUsageProbeAfterRun_PersistenceGetsItsOwnBudget(t *testing.T) {
 	}
 	if got := atomic.LoadInt64(calls); got != 1 {
 		t.Errorf("request count=%d, want 1 (the reading was paid for once)", got)
+	}
+}
+
+// A post-run probe resolves the stored credential only after it owns the gate.
+// On macOS that phase has its own bounded Keychain command, so the root deadline
+// and every joiner must leave room for it in addition to request and persist.
+func TestClaudeUsageProbeWholeTimeoutIncludesCredentialLookup(t *testing.T) {
+	want := machineInfoProbeTimeout + claudeUsageProbeTimeout + claudeRateLimitVerifiedPersistBudget
+	if claudeUsageProbeWholeTimeout != want {
+		t.Fatalf("whole timeout=%v, want credential + request + persist = %v",
+			claudeUsageProbeWholeTimeout, want)
+	}
+	if claudeUsageProbeJoinTimeout != claudeUsageProbeWholeTimeout {
+		t.Fatalf("join timeout=%v, want the complete probe timeout %v",
+			claudeUsageProbeJoinTimeout, claudeUsageProbeWholeTimeout)
 	}
 }

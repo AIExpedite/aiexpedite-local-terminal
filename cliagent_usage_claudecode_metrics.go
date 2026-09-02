@@ -288,7 +288,11 @@ func aggregateWeeklyMetric(buckets map[string]claudeRateLimitBucket, now time.Ti
 			}
 		case used == worstUsed:
 			wasCurrent := worstCurrent
-			if current && (!worstCurrent || b.ObservedAtMs > worstObserved) {
+			// Every live bucket tied at the worst percentage constrains the row.
+			// Its freshness is therefore the OLDEST of those observations: using
+			// the newest lets a frequently updated unified bucket mask a stale
+			// per-model constraint at the same percentage and suppress its probe.
+			if current && (!worstCurrent || b.ObservedAtMs < worstObserved) {
 				worstObserved = b.ObservedAtMs
 			}
 			worstCurrent = worstCurrent || current
