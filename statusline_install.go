@@ -392,6 +392,30 @@ func writePrevStatusLineBytes(dst string, b []byte) error {
 	return nil
 }
 
+// ensurePrevStatusLinePrivate narrows an EXISTING stash to owner-only, for the
+// one migration outcome that keeps a file writePrevStatusLineBytes did not
+// create. A chmod rather than a rewrite: the bytes are already correct, and
+// replacing them would churn a file whose mtime other checks read.
+//
+// Windows is skipped deliberately — the mode Stat reports there is synthesized
+// from the read-only attribute rather than a real ACL, so 0o644 is what every
+// writable file looks like and a chmod would be a no-op that only risks
+// toggling that attribute. Confidentiality on Windows comes from the per-user
+// profile ACL on the config dir.
+func ensurePrevStatusLinePrivate(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if st.Mode().Perm()&0o077 == 0 {
+		return nil
+	}
+	return os.Chmod(path, 0o600)
+}
+
 // migratePrevStatusLine COPIES the pinned status-line stash from the path an
 // earlier install baked into the command to the path this boot resolves (e.g.
 // GetConfigDir() landed somewhere else). It must run BEFORE the refreshed
@@ -436,9 +460,20 @@ func migratePrevStatusLine(oldPrev, newPrev string) (staleCopy string, err error
 	}
 	switch dst, dstErr := os.ReadFile(newPrev); {
 	case dstErr == nil && bytes.Equal(dst, src):
-		// Already migrated. Nothing to write — but oldPrev is still a duplicate
-		// the committed command will no longer name, so it is retired on the
-		// same terms as one we just wrote: after the write, not before it.
+		// Already migrated, so there is nothing to WRITE — but matching bytes say
+		// nothing about the MODE those bytes sit under. A stash an older build
+		// (or a laxer umask) left at newPrev keeps its own permissions, and this
+		// branch is the one path to a committed migration that never goes
+		// through writePrevStatusLineBytes. Returning straight from here would
+		// retire the owner-only copy at oldPrev and leave the chained command —
+		// which can carry inline env vars / tokens — group/world-readable.
+		// Narrow it in place rather than rewriting identical bytes.
+		if err := ensurePrevStatusLinePrivate(newPrev); err != nil {
+			return "", err
+		}
+		// oldPrev is still a duplicate the committed command will no longer
+		// name, so it is retired on the same terms as one we just wrote: after
+		// the write, not before it.
 		return oldPrev, nil
 	case dstErr != nil && !os.IsNotExist(dstErr):
 		// Can't tell what the new stash holds — proceeding would pin the command

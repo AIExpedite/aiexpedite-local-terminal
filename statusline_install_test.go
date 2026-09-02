@@ -948,3 +948,43 @@ func TestEnsureClaudeStatusLineHook_KeepsOldStashWhenSettingsWriteFails(t *testi
 		t.Errorf("opt-out lost the chained third-party command: %s", raw)
 	}
 }
+
+// An already-migrated destination is the one committed migration path that
+// never runs through writePrevStatusLineBytes, so a stash an older build left
+// at newPrev keeps whatever mode that build gave it. Matching bytes must not
+// buy a permissive file a pass: the old owner-only copy is retired right after
+// this, and the surviving stash carries the chained command, which can include
+// inline env vars / tokens.
+func TestMigratePrevStatusLine_TightensAnIdenticalPermissiveDestination(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	oldPrev := filepath.Join(dir, "old-prev.json")
+	newPrev := filepath.Join(dir, "new-prev.json")
+	live := []byte(`{"statusLine":{"type":"command","command":"third-party --token=secret"}}`)
+
+	if err := os.WriteFile(oldPrev, live, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPrev, live, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(newPrev, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	beforeMtime := statModTime(t, newPrev)
+
+	stale, err := migratePrevStatusLine(oldPrev, newPrev)
+	if err != nil {
+		t.Fatalf("migratePrevStatusLine: %v", err)
+	}
+	// Tightened in place: same bytes, same mtime, private mode.
+	assertPrivateStash(t, newPrev, live)
+	if got := statModTime(t, newPrev); !got.Equal(beforeMtime) {
+		t.Errorf("an identical destination must be chmodded, not rewritten; mtime %v -> %v", beforeMtime, got)
+	}
+	if stale != oldPrev {
+		t.Errorf("staleCopy=%q, want %q", stale, oldPrev)
+	}
+}
