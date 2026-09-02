@@ -67,8 +67,9 @@ scripts/sign/out/
 
 # PowerShell drops its module-analysis cache under $LOCALAPPDATA; a test that
 # actually spawns powershell.exe with a stripped environment can resolve that
-# relative to the repo root. Regenerable, never ours to commit.
-Microsoft/
+# relative to the repo root. Regenerable, never ours to commit. Anchored: only
+# the one at the repo root is an artifact, not any directory of that name.
+/Microsoft/
 
 # ───── Documentation to Keep ───────────────────────────────────────────────
 # Core files that WILL be checked in:
