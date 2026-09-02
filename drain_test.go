@@ -134,7 +134,7 @@ func TestSealDrainForInstallRefusesNewDemandCommands(t *testing.T) {
 	if !sealDrainForInstall() {
 		t.Fatal("idle drain should be sealed for install")
 	}
-	for _, command := range []string{"__cli_usage_refresh__", "__env_inspect__"} {
+	for _, command := range []string{"__cli_usage_refresh__", "__env_inspect__", cliSmokeCommand} {
 		admitted, release := admitWork(commandMsg{Command: command})
 		if admitted || release != nil {
 			t.Fatalf("demand command %q entered after install seal", command)
@@ -179,7 +179,7 @@ func TestAdmitWork_TracksDemandCommandsDuringDrain(t *testing.T) {
 	closeAdmission("attempt-demand")
 	t.Cleanup(func() { resetDrainState(t) })
 
-	for _, command := range []string{"__cli_usage_refresh__", "__env_inspect__"} {
+	for _, command := range []string{"__cli_usage_refresh__", "__env_inspect__", cliSmokeCommand} {
 		t.Run(command, func(t *testing.T) {
 			admitted, release := admitWork(commandMsg{Command: command})
 			if !admitted || release == nil {
@@ -288,6 +288,7 @@ func TestAdmitWork_WhileDraining(t *testing.T) {
 		{"ping", commandMsg{Command: "__ping__"}, true},
 		{"cli usage refresh", commandMsg{Command: "__cli_usage_refresh__"}, true},
 		{"env inspect", commandMsg{Command: "__env_inspect__"}, true},
+		{"cli smoke", commandMsg{Command: cliSmokeCommand}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -443,7 +444,7 @@ func TestIsWorkStartCommand(t *testing.T) {
 	}
 	notStarts := []commandMsg{
 		{Command: "__ping__"}, {Command: "__cli_usage_refresh__"},
-		{Command: "__env_inspect__"}, {Type: "session_input"},
+		{Command: "__env_inspect__"}, {Command: cliSmokeCommand}, {Type: "session_input"},
 		{Type: "codex_appserver_send"},
 	}
 	for _, c := range notStarts {

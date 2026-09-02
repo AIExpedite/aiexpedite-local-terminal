@@ -987,6 +987,16 @@ func (sm *SessionManager) removeSessionIfSame(id string, s *CLISession) bool {
 //     stdin after the first prompt so the process exits after the turn; when
 //     opened without a prompt, defer that close until SendInput.
 //
+//   - The non-interactive Claude PRINT path (the CLI-maintenance smoke in
+//     cliagent_smoke_claudecode.go) deliberately does NOT route through this
+//     function, or through StartSession at all. It writes its prompt to a
+//     strings.Reader stdin that EOFs on its own, because `--print` with the
+//     default text input format wants the prompt-then-EOF shape — the very
+//     shape this function's first bullet describes as WRONG for sessions.
+//     Keeping the two paths apart is the point: closing stdin on a session-
+//     shaped claude (stream-json input, no NDJSON envelope written) is what
+//     produced the exit-1 protocol failures the smoke used to report.
+//
 //   - All non-CLI commands keep the pre-existing rule: close stdin iff no
 //     stdinPrompt was queued.
 func shouldCloseStdinAfterStart(command string, stdinPrompt *string) bool {
@@ -2173,89 +2183,6 @@ func stdinPromptFormat(command string) string {
 
 func isOneShotStdinPromptFormat(format string) bool {
 	return format == "plain" || format == "antigravity_ndjson"
-}
-
-// buildClaudeInteractiveArgs builds Claude Code CLI args for bidirectional
-// stream-json mode.  The prompt is NOT passed as a CLI arg — it is returned
-// separately so the caller can send it as an NDJSON message on stdin.
-// Returns (cliArgs, promptText).
-//
-// IMPORTANT: this path is for INTERACTIVE multi-turn sessions. We never add
-// `-p` / `--print` — that flag puts claude in one-shot mode and exits after
-// the first response, killing the session before a follow-up `session.sendInput`
-// can land. Any user-supplied `-p`/`--print` is stripped for the same reason.
-// Callers that want one-shot claude must use the non-session execute.runAndWait
-// path (which builds its own argv outside this function).
-func buildClaudeInteractiveArgs(args []string) ([]string, string) {
-	result := []string{
-		"--output-format", "stream-json",
-		"--input-format", "stream-json",
-		"--verbose",
-		"--include-partial-messages",
-		"--dangerously-skip-permissions",
-	}
-
-	// Claude flags that consume the next argument as their value.
-	// Without this, "--model sonnet" would treat "sonnet" as a prompt word.
-	valuedFlags := map[string]bool{
-		"--model": true, "--system-prompt": true, "--append-system-prompt": true,
-		"--permission-mode": true, "--max-budget-usd": true, "--effort": true,
-		"--agent": true, "--agents": true, "--session-id": true,
-		"--mcp-config": true, "--settings": true, "--json-schema": true,
-		"--fallback-model": true, "--debug-file": true, "--setting-sources": true,
-	}
-
-	// Separate user-provided flags from prompt words.
-	// -p / --print (and the equals-form variants -p=... / --print=...) are
-	// stripped — we never want claude in print/one-shot mode on this path; it
-	// would exit after the first turn and break cross-step session.sendInput.
-	// Keeping the interactive launch shape is also load-bearing for billing:
-	// starting 2026-06-15 Anthropic routes `claude -p` / Agent SDK usage on
-	// Pro/Max/Team subscriptions through a separate Agent SDK credit pool,
-	// while plain interactive Claude Code keeps drawing from the normal
-	// subscription allowance. See CLI_AGENT_INTEGRATION.md.
-	var flags []string
-	var promptParts []string
-	skipNext := false
-	for i, a := range args {
-		if skipNext {
-			skipNext = false
-			flags = append(flags, a)
-			continue
-		}
-		if a == "-p" || a == "--print" {
-			continue
-		}
-		// Equals-form: strip the print/one-shot mode flag but keep the inline
-		// prompt text (e.g. `claude --print=hello` → prompt "hello") so the
-		// interactive launch still answers the caller's query instead of
-		// hanging on empty stdin.
-		if strings.HasPrefix(a, "-p=") {
-			if v := strings.TrimPrefix(a, "-p="); v != "" {
-				promptParts = append(promptParts, v)
-			}
-			continue
-		}
-		if strings.HasPrefix(a, "--print=") {
-			if v := strings.TrimPrefix(a, "--print="); v != "" {
-				promptParts = append(promptParts, v)
-			}
-			continue
-		}
-		if strings.HasPrefix(a, "-") {
-			flags = append(flags, a)
-			// If this flag expects a value and there's a next arg, consume it too
-			if valuedFlags[a] && i+1 < len(args) {
-				skipNext = true
-			}
-			continue
-		}
-		promptParts = append(promptParts, a)
-	}
-
-	result = append(result, flags...)
-
-	return result, strings.Join(promptParts, " ")
 }
 
 // buildCodexInteractiveArgs builds Codex CLI args for JSONL streaming.

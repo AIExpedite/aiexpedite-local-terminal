@@ -428,3 +428,37 @@ func TestVerifySignatureIgnoresCwdWithoutRiskLevel(t *testing.T) {
 		t.Fatal("a cwd on an ordinary (riskLevel-less) command must not enter the canonical")
 	}
 }
+
+func TestSignatureMatchForCLISmokeCommand(t *testing.T) {
+	// __cli_smoke__ adds no new signed field: the target CLI travels in the
+	// already-signed Args, so a tampered cliId invalidates the HMAC and the
+	// canonical shape stays byte-identical to any other argv-carrying command
+	// (a __ping__ with the same args would produce the same ordering). A
+	// command with no refreshId must omit the field entirely — that omission
+	// is what keeps old/new producers signature-compatible.
+	secret := "test-secret-for-unit-test"
+	canonical := `{"id":"cmd-smoke","command":"__cli_smoke__","args":["claudeCode"],"ts":1771714908831,"type":"","sessionID":"","input":"","signal":""}`
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(canonical))
+	signature := hex.EncodeToString(mac.Sum(nil))
+
+	cmd := commandMsg{
+		ID:        "cmd-smoke",
+		Command:   cliSmokeCommand,
+		Args:      []string{"claudeCode"},
+		Ts:        1771714908831,
+		Signature: signature,
+	}
+	if !verifySignature(cmd, secret) {
+		t.Fatal("__cli_smoke__ must verify against the ping-shaped canonical JSON")
+	}
+
+	// Swapping the target CLI must break the signature — otherwise an
+	// attacker could redirect the probe at another provider.
+	tampered := cmd
+	tampered.Args = []string{"someOtherCLI"}
+	if verifySignature(tampered, secret) {
+		t.Fatal("cliId is inside the signed payload; tampering must invalidate it")
+	}
+}

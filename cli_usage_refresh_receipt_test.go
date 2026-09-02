@@ -73,8 +73,8 @@ func TestCLIUsageRefreshReceiptFormatsMetricsAsDecimalStrings(t *testing.T) {
 	if err := json.Unmarshal(data, &vectors); err != nil {
 		t.Fatal(err)
 	}
-	if len(vectors.Vectors) != 2 {
-		t.Fatal("expected two shared vectors")
+	if len(vectors.Vectors) != 3 {
+		t.Fatal("expected three shared vectors")
 	}
 	if string(canonical) != vectors.Vectors[0].Canonical {
 		t.Fatalf("unexpected canonical bytes: %s", canonical)
@@ -114,5 +114,82 @@ func TestCLIUsageRefreshResultAlwaysIncludesErrorsArray(t *testing.T) {
 	}
 	if !strings.Contains(string(payload), `"errors":[]`) {
 		t.Fatalf("successful receipt omitted errors array: %s", payload)
+	}
+}
+
+func TestSafeCLIUsageErrorCategoryAcceptsClosedEnum(t *testing.T) {
+	// Every member of the closed enum must survive canonicalization unchanged.
+	// `protocol` is the newest member: before it existed, a device reporting a
+	// broken CLI invocation contract had its category collapsed to
+	// internal_error, which is why the smoke failure was indistinguishable
+	// from a crash in our own collector.
+	for _, category := range []string{
+		cliUsageErrorProviderTimeout, cliUsageErrorProviderUnavailable,
+		cliUsageErrorNotAuthenticated, cliUsageErrorParseFailed,
+		cliUsageErrorCollectionFailed, cliUsageErrorReceiptBounds,
+		cliUsageErrorProtocol, cliUsageErrorInternal,
+	} {
+		got := safeCLIUsageErrorCategory(cliAgentUsageError{Provider: "claudeCode", ErrorCategory: category})
+		if got != category {
+			t.Errorf("safeCLIUsageErrorCategory(%q) = %q, want it preserved", category, got)
+		}
+	}
+	if got := safeCLIUsageErrorCategory(cliAgentUsageError{ErrorCategory: "made_up"}); got != cliUsageErrorInternal {
+		t.Errorf("unknown category = %q, want internal_error", got)
+	}
+}
+
+func TestSafeCLIUsageErrorCategoryInfersProtocolFromLegacyText(t *testing.T) {
+	// A producer that predates the closed enum only sends free text. These are
+	// the exact phrasings Claude 2.1.x uses when it rejects the invocation.
+	for _, message := range []string{
+		"Error: --input-format=stream-json requires output-format=stream-json.",
+		"claude exited 1 with a protocol violation",
+		"unknown option '--input-format'",
+	} {
+		if got := safeCLIUsageErrorCategory(cliAgentUsageError{Provider: "claudeCode", Message: message}); got != cliUsageErrorProtocol {
+			t.Errorf("safeCLIUsageErrorCategory(%q) = %q, want protocol", message, got)
+		}
+	}
+}
+
+func TestCLIUsageRefreshReceiptProtocolErrorCarriesNoMessage(t *testing.T) {
+	canonical, _, normalized, err := canonicalCLIUsageRefreshReceipt("r3", 3, false, nil,
+		[]cliAgentUsageError{{
+			Provider:      "claudeCode",
+			ErrorCategory: cliUsageErrorProtocol,
+			Message:       "Error: --input-format=stream-json requires output-format=stream-json.",
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(normalized) != 1 || normalized[0].ErrorCategory != cliUsageErrorProtocol || normalized[0].Message != "" {
+		t.Fatalf("unexpected normalized errors: %#v", normalized)
+	}
+	text := string(canonical)
+	if strings.Contains(text, "stream-json") || strings.Contains(text, "message") {
+		t.Fatalf("canonical receipt leaked the vendor diagnostic: %s", text)
+	}
+
+	data, err := os.ReadFile("testdata/cli_usage_refresh_receipt_vectors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vectors struct {
+		Vectors []struct{ Canonical, Signature string } `json:"vectors"`
+	}
+	if err := json.Unmarshal(data, &vectors); err != nil {
+		t.Fatal(err)
+	}
+	if len(vectors.Vectors) != 3 {
+		t.Fatal("expected three shared vectors")
+	}
+	if text != vectors.Vectors[2].Canonical {
+		t.Fatalf("unexpected protocol canonical bytes: %s", text)
+	}
+	signature, _, _, err := signCLIUsageRefreshReceipt("secret", "r3", 3, false, nil,
+		[]cliAgentUsageError{{Provider: "claudeCode", ErrorCategory: cliUsageErrorProtocol}})
+	if err != nil || signature != vectors.Vectors[2].Signature {
+		t.Fatalf("unexpected protocol shared-vector signature: %s (%v)", signature, err)
 	}
 }

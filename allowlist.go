@@ -577,6 +577,7 @@ emacs *
 
 # --- Internal Commands ---
 __ping__
+__cli_smoke__
 
 # --- Misc Dev Tools ---
 jq *

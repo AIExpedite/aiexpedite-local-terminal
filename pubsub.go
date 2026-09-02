@@ -576,6 +576,16 @@ func argsToJSON(args []string) string {
 	return string(bytes)
 }
 
+// cliSmokeCommand / cliSmokeResultType are the operational command the
+// CLI-maintenance flow dispatches around a CLI upgrade and its correlated
+// result. Registered in allowlist.go's Internal Commands block next to
+// __ping__, admitted as demand traffic by isInternalDemandCommand, and
+// answered by handleCLISmokeCommand.
+const (
+	cliSmokeCommand    = "__cli_smoke__"
+	cliSmokeResultType = "__cli_smoke_result__"
+)
+
 func pubSubMessageSizeLimit(cmd commandMsg) int {
 	if cmd.Command == "__cli_usage_refresh__" {
 		return maxPubSubCatalogMessageBytes
@@ -584,12 +594,13 @@ func pubSubMessageSizeLimit(cmd commandMsg) int {
 }
 
 // isInternalDemandCommand reports whether cmd is a server-internal, read-only
-// demand command (CLI-usage refresh or environment inspection). These are
-// exempt from staleness and rate-limiting because they are dispatched by the
-// backend's own state machines (not the LLM) and MUST always run so the
-// correlated result clears the backend's in-flight / pending marker.
+// demand command (CLI-usage refresh, environment inspection, or a CLI smoke
+// probe). These are exempt from staleness and rate-limiting because they are
+// dispatched by the backend's own state machines (not the LLM) and MUST always
+// run so the correlated result clears the backend's in-flight / pending marker.
 func isInternalDemandCommand(command string) bool {
-	return command == "__cli_usage_refresh__" || command == "__env_inspect__"
+	return command == "__cli_usage_refresh__" || command == "__env_inspect__" ||
+		command == cliSmokeCommand
 }
 
 func commandPayloadTooLargeMessage(sizeBytes, limitBytes int) string {
@@ -735,6 +746,28 @@ type resultMsg struct {
 	// Environment Setup capability. Echoes RefreshID so terminal-service can
 	// correlate the response with its pending inspection request.
 	Readiness *ReadinessReport `json:"readiness,omitempty"`
+
+	// __cli_smoke_result__ payload — populated only when
+	// Type == cliSmokeResultType. Metric-only BY CONSTRUCTION: status, a
+	// closed-enum errorCategory, the marker verdict, a duration, the fixed argv
+	// SHAPE ID, and `diagnostic` — a value from the closed cliSmokeDiagnostic*
+	// set in cliagent_smoke_claudecode.go. Read that block for the members
+	// rather than trusting a list here: a transcribed copy is how a closed set
+	// and its documentation drift apart.
+	//
+	// NO text the CLI authored is published — or retained anywhere. The child's
+	// stdout and stderr are read only to choose between those constants and are
+	// then discarded; they are not logged either (see the retention note in
+	// cliagent_smoke_claudecode.go: the agent log is uploadable, and a denylist
+	// redactor cannot see a raw config fragment, a private path, a short
+	// password, or an unfamiliar credential format). An early revision carried a
+	// capped + redacted `stderrTail` here; it was removed for exactly that
+	// reason and must not come back. The prompt, the marker nonce, the resolved
+	// argv values and any config content are likewise never present.
+	//
+	// Echoes RefreshID so the maintenance flow can correlate the response with
+	// its pending request.
+	Smoke *cliSmokeResult `json:"smoke,omitempty"`
 
 	// Structured terminal error code. Kept separate from Output so consumers
 	// never infer GROK_NOT_AUTHENTICATED from free-form CLI text.
@@ -1064,6 +1097,85 @@ func prepareCLIUsageRefreshResult(secret, refreshID string, challengeTs int64, s
 	return receipt, normalizedUsage, normalizedErrors, err
 }
 
+// handleCLISmokeCommand fulfils the signed `__cli_smoke__` operational command
+// the CLI-maintenance flow runs on both sides of a CLI upgrade. It runs the
+// no-tools, non-interactive probe (cliagent_smoke_claudecode.go) and publishes
+// exactly one correlated `__cli_smoke_result__`.
+//
+// Which CLI to smoke travels as the FIRST ARG rather than a new top-level
+// field: Args are already inside the HMAC payload, so the target cannot be
+// swapped without invalidating the signature, and the canonical signing shape
+// stays byte-identical to every other argv-carrying command. An unknown (or
+// missing) cliId resolves to provider_unavailable inside runCLISmoke and never
+// falls through to generic execute.
+//
+// Modeled on handleCLIUsageRefreshCommand: always publishes a result — even on
+// panic — so the backend's pending marker is never orphaned, and returns
+// non-nil only when the publish itself failed (caller nacks so Pub/Sub
+// redelivers).
+func handleCLISmokeCommand(ctx context.Context, topic *pubsub.Publisher, cmd commandMsg, cfg *Config) (publishErr error) {
+	cliID := ""
+	if len(cmd.Args) > 0 {
+		cliID = cmd.Args[0]
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("%s[pubsub] panic in CLI smoke handler: %v%s\n", colorRed, r, colorReset)
+			res := makeCLISmokeResult(cmd, cfg, cliSmokeResult{
+				CliID:         cliID,
+				Status:        cliSmokeStatusFailed,
+				ErrorCategory: cliUsageErrorInternal,
+			})
+			if err := publishMsg(ctx, topic, res); err != nil {
+				publishErr = err
+			}
+		}
+	}()
+
+	result, replayed := runCLISmoke(ctx, cliID)
+	if replayed {
+		// No second inference turn was spent on the user's own subscription
+		// window: this call either replayed the cooldown's verdict or shared a
+		// concurrent run's. Log it so a harness that retries too aggressively
+		// is visible on the device.
+		fmt.Printf("%s[pubsub] CLI smoke for %q answered without spending a turn (%s)%s\n",
+			colorYellow, cliID, result.Status, colorReset)
+	}
+	res := makeCLISmokeResult(cmd, cfg, result)
+	if err := publishMsg(ctx, topic, res); err != nil {
+		fmt.Printf("%s[pubsub] Failed to publish CLI smoke result: %v%s\n", colorRed, err, colorReset)
+		return err
+	}
+	return nil
+}
+
+// makeCLISmokeResult builds the published payload. Status mirrors the probe's
+// own verdict; everything descriptive lives in the metric-only Smoke object,
+// and Output stays EMPTY — no CLI stdout, prompt, marker or argv ever rides
+// out on this message.
+func makeCLISmokeResult(cmd commandMsg, cfg *Config, smoke cliSmokeResult) resultMsg {
+	agentID := cmd.AgentID
+	if cfg != nil && cfg.AgentID != "" {
+		agentID = cfg.AgentID
+	}
+	status := "error"
+	if smoke.Status == cliSmokeStatusSuccess {
+		status = "success"
+	}
+	return resultMsg{
+		ID:          cmd.ID,
+		WorkspaceID: cmd.WorkspaceID,
+		UID:         cmd.UID,
+		AgentID:     agentID,
+		Ts:          time.Now().UnixMilli(),
+		Version:     Version,
+		Type:        cliSmokeResultType,
+		RefreshID:   cmd.RefreshID,
+		Status:      status,
+		Smoke:       &smoke,
+	}
+}
+
 // handleEnvInspectCommand fulfils a read-only __env_inspect__ demand command
 // from terminal-service's Environment Setup flow. It gathers full machine info,
 // derives a friendly readiness report, and publishes an __env_inspect_result__
@@ -1164,7 +1276,11 @@ func canPublishSignedCLIUsageFailure(cmd commandMsg, cfg *Config) bool {
 
 // publishMsg marshals res and publishes it on topic using ctx.
 // Logs and returns any error so callers can decide whether to ack or nack.
-func publishMsg(ctx context.Context, topic *pubsub.Publisher, res resultMsg) error {
+// publishMsg is a var, not a plain func, so tests can observe what a handler
+// published without standing up a real Pub/Sub topic (a nil topic silently
+// succeeds, which would make "published exactly one correlated result"
+// unassertable). Same seam style as runClaudeAuthStatusCommand.
+var publishMsg = func(ctx context.Context, topic *pubsub.Publisher, res resultMsg) error {
 	if topic == nil {
 		return nil
 	}
@@ -1641,6 +1757,22 @@ func runPubSubConnection(cfg *Config) error {
 			// leave the backend's cliUsageInFlightSince stuck and the
 			// next scheduler tick blocked behind the in-flight guard.
 			if err := handleCLIUsageRefreshCommand(ctx, topic, cmd, cfg); err != nil {
+				m.Nack()
+			} else {
+				m.Ack()
+			}
+			return
+		}
+
+		if cmd.Command == cliSmokeCommand {
+			// CLI-maintenance smoke probe (pre/post CLI upgrade). Spends at
+			// most one inference turn — the per-CLI cooldown inside
+			// runCLISmoke replays the last verdict for a caller that asks
+			// again too soon, so a retry storm cannot drain the user's own
+			// subscription quota. Like the other demand commands it always
+			// publishes a correlated result; nack on publish failure so
+			// Pub/Sub redelivers rather than orphaning the pending marker.
+			if err := handleCLISmokeCommand(ctx, topic, cmd, cfg); err != nil {
 				m.Nack()
 			} else {
 				m.Ack()
@@ -5143,21 +5275,62 @@ func getFallbackPSExe() string {
 	return fallbackPSExe
 }
 
-// claudePathCache caches the resolved Claude executable path so that the
-// PATH lookup and filesystem scan in resolveClaudePath are only done once
-// rather than on every Claude command invocation.
+// claudePathCache caches the resolved Claude executable path so that the PATH
+// lookup and filesystem scan in resolveClaudePath are not repeated on every
+// Claude command invocation.
+//
+// Guarded by a mutex rather than a sync.Once because the memo must be
+// REFRESHABLE. This agent outlives a Claude Code upgrade — the update runs as
+// an ordinary command inside a session, nothing restarts us — and an upgrade
+// can move the binary: the Windows layout is literally version-scoped
+// (%APPDATA%\Claude\claude-code\<version>\claude.exe), so 2.1.237 -> 2.1.251
+// is a different path. A once-only memo pinned the pre-upgrade path for the
+// rest of the process's life, which made the post-update smoke validate the
+// OLD install (or report it missing) instead of the newly installed one — the
+// exact thing that smoke exists to check. See refreshCachedClaudePath.
 var (
+	claudePathMu     sync.Mutex
 	claudePathCached string
-	claudePathOnce   sync.Once
+	claudePathKnown  bool
 )
 
-// cachedResolveClaudePath returns the Claude executable path, resolving it
-// once on first call and reusing the result for all subsequent calls.
+// cachedResolveClaudePath returns the Claude executable path, resolving it on
+// first call and reusing the result until something explicitly refreshes it.
 func cachedResolveClaudePath() string {
-	claudePathOnce.Do(func() {
+	claudePathMu.Lock()
+	defer claudePathMu.Unlock()
+	if !claudePathKnown {
 		claudePathCached = resolveClaudePath()
-	})
+		claudePathKnown = true
+	}
 	return claudePathCached
+}
+
+// refreshCachedClaudePath re-runs resolution, replaces the memo and returns the
+// fresh path.
+//
+// Called from the CLI-maintenance smoke, which runs at most once per cooldown
+// window (15 minutes), so the memo still absorbs the per-command lookups it
+// exists for. The fresh answer is written back into the SHARED memo rather than
+// kept private to the smoke on purpose: a smoke that just validated the newly
+// installed binary must not leave interactive sessions launching the
+// pre-upgrade one.
+func refreshCachedClaudePath() string {
+	resolved := resolveClaudePath()
+	claudePathMu.Lock()
+	claudePathCached = resolved
+	claudePathKnown = true
+	claudePathMu.Unlock()
+	return resolved
+}
+
+// resetCachedClaudePath drops the memo so the next caller re-resolves.
+// Test-only seam.
+func resetCachedClaudePath() {
+	claudePathMu.Lock()
+	claudePathCached = ""
+	claudePathKnown = false
+	claudePathMu.Unlock()
 }
 
 // buildFallbackProbeCommand wraps a user command line for the one-shot fallback
@@ -6489,7 +6662,7 @@ func handleAntigravityNativeCommand(ctx context.Context, topic *pubsub.Publisher
 					ID:          cmd.ID,
 					WorkspaceID: cmd.WorkspaceID,
 					UID:         cmd.UID,
-					Output:      redactAntigravitySecrets(fmt.Sprintf("start failed: %v", err)),
+					Output:      redactAgentSecrets(fmt.Sprintf("start failed: %v", err)),
 					Status:      "error",
 					Ts:          time.Now().UnixMilli(),
 					Version:     Version,
@@ -6613,7 +6786,7 @@ func publishAntigravityNativeError(ctx context.Context, topic *pubsub.Publisher,
 		ID:          cmd.ID,
 		WorkspaceID: cmd.WorkspaceID,
 		UID:         cmd.UID,
-		Output:      redactAntigravitySecrets(errMsg),
+		Output:      redactAgentSecrets(errMsg),
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
@@ -6710,7 +6883,7 @@ func handleOpenCodeNativeCommand(ctx context.Context, topic *pubsub.Publisher, c
 					ID:          cmd.ID,
 					WorkspaceID: cmd.WorkspaceID,
 					UID:         cmd.UID,
-					Output:      redactOpenCodeSecrets(fmt.Sprintf("start failed: %v", err)),
+					Output:      redactAgentSecrets(fmt.Sprintf("start failed: %v", err)),
 					Status:      "error",
 					Ts:          time.Now().UnixMilli(),
 					Version:     Version,
@@ -6836,7 +7009,7 @@ func publishOpenCodeNativeError(ctx context.Context, topic *pubsub.Publisher, cm
 		ID:          cmd.ID,
 		WorkspaceID: cmd.WorkspaceID,
 		UID:         cmd.UID,
-		Output:      redactOpenCodeSecrets(errMsg),
+		Output:      redactAgentSecrets(errMsg),
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,

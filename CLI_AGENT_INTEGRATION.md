@@ -25,7 +25,7 @@ before changing anything here.**
 entry point. For Claude it:
 
 1. Resolves `claude` (or the platform shim) via `resolveExecutable`.
-2. Builds argv via `buildClaudeInteractiveArgs`, which always sets:
+2. Builds argv via `buildClaudeInteractiveArgs` ([claude_argv.go](claude_argv.go)), which always sets:
    ```
    --output-format stream-json
    --input-format  stream-json
@@ -65,12 +65,139 @@ Starting **2026-06-15**, the choice also becomes a billing concern:
 Reintroducing `claude -p` here would silently move every session this
 driver runs onto the Agent SDK credit pool — a real money leak with no UI
 signal. The print-flag strip and the supporting tests in
-[session_cli_test.go](session_cli_test.go) exist to make this regression
+[claude_argv_test.go](claude_argv_test.go) exist to make this regression
 impossible to ship.
 
 **Do not reintroduce `claude -p` for Claude Code agent sessions.** If you
-need a one-shot Claude call, use a non-session execute path that builds its
-own argv outside `buildClaudeInteractiveArgs`.
+need a one-shot Claude call, use `buildClaudeNonInteractivePrintArgs` — the
+sanctioned, tested shape described in the next section — never this builder.
+
+## The sanctioned non-interactive shape (CLI-maintenance smoke)
+
+The paragraph above says "use a non-session execute path that builds its own
+argv" — that path now **exists, is tested, and is the only sanctioned one**:
+`buildClaudeNonInteractivePrintArgs` in [claude_argv.go](claude_argv.go),
+driven by `runClaudeCodeSmoke` in
+[cliagent_smoke_claudecode.go](cliagent_smoke_claudecode.go).
+
+Why it had to exist: while `buildClaudeInteractiveArgs` was the only Claude
+argv builder, a print-mode probe pushed through it **lost its `--print`**,
+inherited `--input-format stream-json`, and then had stdin closed with no
+NDJSON envelope written. Claude 2.1.x rejects that combination before any
+assistant turn —
+
+```
+Error: --input-format=stream-json requires output-format=stream-json.
+```
+
+— exits 1, and no marker can ever come back. That is the `errorCategory:
+protocol` failure the CLI-maintenance smoke reported on **both** sides of an
+upgrade.
+
+**`-p` / `--print` is stripped ONLY on the session path.** The rule is about
+sessions and billing, not about the flag itself: an interactive multi-turn
+session must never be one-shot, and (see above) `claude -p` bills against the
+Agent SDK credit pool. A single, bounded probe that spends one turn to prove
+the binary still works is a deliberate, accounted-for exception — not a
+loophole to route agent work through.
+
+Resolved 2.1.x flag set (verified against **2.1.247**):
+
+```
+--print
+--output-format json          # ONE terminal {"type":"result",…} envelope
+--tools ""                    # claude's documented "disable all tools"
+--max-turns 1
+--strict-mcp-config           # preferred shape only …
+--mcp-config {"mcpServers":{}}   # … so user MCP config cannot inject a server
+```
+
+- `--input-format` is left at its default (`text`) — pairing `stream-json`
+  input with anything but `stream-json` output is the framing violation above.
+- `--verbose` / `--include-partial-messages` apply only to `stream-json`
+  output and are omitted.
+- `--dangerously-skip-permissions` is **not** passed: it is refused outright in
+  some sandbox/root contexts (a protocol-shaped exit 1 of its own) and is
+  meaningless when no tool can run.
+- The prompt (and the `AIEXPEDITE_CLI_SMOKE_OK_<8 hex>` marker nonce it
+  carries) goes on **stdin as plain text**, closed immediately — never on argv,
+  which would put it in a process listing and under the Windows
+  `CreateProcess` ceiling.
+- Two shapes are tried in order and the winner is cached per
+  `(binary path, mtime, size)` — the same key `cachedProbeVersion` uses. The
+  second rung is attempted **only** when the CLI positively rejected a flag the
+  fallback drops (`unknown option '--strict-mcp-config'`), because option
+  parsing precedes inference and is therefore the one failure a retry cannot
+  double-charge for. Any other failure — malformed output, an undocumented
+  error envelope, a timeout — stops after the first attempt, since a turn may
+  already have been spent. The retryable-flag list is derived from the shapes
+  themselves (`claudeRetryableArgvFlags`), never hand-listed.
+- The per-attempt deadline is read from the **attempt's own context**, not the
+  parent's. `exec.CommandContext` kills the child and then reports an
+  `*exec.ExitError` ("signal: killed"), NOT an error wrapping
+  `context.DeadlineExceeded`, so judging by the parent context read a timeout
+  as `protocol` and sent the ladder off to burn a second full timeout.
+
+Exit classification, mapped onto the closed `errorCategory` enum in
+[cli_usage_refresh_receipt.go](cli_usage_refresh_receipt.go):
+
+| Observation | `errorCategory` | `diagnostic` |
+| --- | --- | --- |
+| Binary absent, `--version` non-zero | `provider_unavailable` | `binary_missing` |
+| `auth status --json` reports logged out | `not_authenticated` | `not_logged_in` |
+| Result envelope carries an auth error | `not_authenticated` | `auth_error` |
+| Provider refused the turn (API error status, overloaded, usage limit) | `provider_unavailable` | `provider_error` |
+| The attempt's deadline killed the child | `provider_timeout` | `timeout` |
+| CLI rejected one of our optional flags | `protocol` | `flag_rejected` |
+| CLI rejected the input/output framing | `protocol` | `framing_rejected` |
+| Exit non-zero with no `result` envelope, or unparseable JSON | `protocol` | `no_envelope` |
+| Valid `result` envelope whose text is not exactly the marker | `parse_failed` | `marker_mismatch` |
+
+The last two rows are the important distinction: a chatty model ("Sure! …") is
+a **healthy** CLI answering unexpectedly (`parse_failed`), while a broken
+invocation contract is ours to fix (`protocol`). Collapsing them would have
+hidden this very regression.
+
+Cost and privacy posture:
+
+- One real inference turn per smoke, against the user's own subscription
+  window. `--version` and `auth status --json` pre-checks short-circuit
+  **before** a turn is spent; the ladder retries only on a pre-inference flag
+  rejection; and a 15-minute per-CLI cooldown replays the last verdict —
+  invalidated by a binary change, so the post-upgrade smoke is never answered
+  from the pre-upgrade cache.
+- The published `__cli_smoke_result__` carries
+  `{cliId, version, status, errorCategory, markerMatched, durationMs,
+  argvShapeId, diagnostic}` and nothing else. **No text the CLI authored is
+  published — or retained anywhere.** `diagnostic` is a value from a closed set
+  we define (`cliSmokeDiagnostic*`); the child's stdout and stderr are read only
+  to choose between those constants and are then discarded.
+- **The device's own log is not an exception.** Two earlier revisions got this
+  wrong in the same way: the first published a 400-byte redacted stderr tail,
+  the second merely moved that tail into the agent log. Neither is sound. The
+  agent log rotates to disk and can be uploaded on request, and a denylist
+  redactor only removes the secret shapes it anticipates — it does not catch
+  `{"password":"…"}`, a raw settings fragment, a private path with no
+  credential marker, or an unfamiliar key format. "Local" is not a safety
+  property; not retaining the bytes is. The failure log line is rendered by
+  `claudeSmokeFailureLogLine`, which takes the stderr **length** rather than the
+  bytes — a function that cannot receive vendor text cannot leak it however a
+  future caller wires it up — and emits only `shape=`, `category=`,
+  `diagnostic=` and `stderrBytes=`.
+- The marker, the prompt, the resolved argv, `~/.claude.json`, `settings.json`
+  and any credential material are never published or logged at any severity.
+
+## Usage capture across a CLI upgrade
+
+A Claude upgrade rewrites `~/.claude/settings.json` and can drop our
+`statusLine` command with it. That is handled independently of the smoke:
+`ensureClaudeStatusLineHookIfStale` ([statusline_install.go](statusline_install.go))
+re-verifies the hook at every run start (throttled, opt-out aware), and the
+bounded utilization probe ([cliagent_usage_claudecode_probe.go](cliagent_usage_claudecode_probe.go))
+refreshes a reading that has aged past the staleness TTL. The smoke only
+contributes `claudeBinaryStamp` (path, mtime, size, version), which keys its own
+cooldown so a verdict cached before an upgrade is never served for the
+post-upgrade binary.
 
 ## Environment policy
 
@@ -128,17 +255,27 @@ claude-specific: codex / gemini / shells never receive it.
 
 ## Enforcement points
 
-- [`session.go` — `buildClaudeInteractiveArgs`](session.go) — strips
+- [`claude_argv.go` — `buildClaudeInteractiveArgs`](claude_argv.go) — strips
   `-p` / `--print` / `-p=` / `--print=` and forces the `stream-json`
-  flag set.
+  flag set. (Moved out of `session.go`, unchanged, so the two Claude argv
+  shapes share one print-flag classifier and cannot drift.)
+- [`claude_argv.go` — `buildClaudeNonInteractivePrintArgs`](claude_argv.go) —
+  the ONLY sanctioned one-shot shape: keeps `--print`, never requests
+  `stream-json` framing, runs with no tools.
 - [`session.go` — `sanitizeClaudeChildEnv`](session.go) — strips the env
   prefixes above.
 - [`session.go` — `prepareClaudeChildEnv`](session.go) — wraps the sanitiser
   and pins `CLAUDE_CODE_ENTRYPOINT=cli` for claude commands.
 - [`session.go` — `shouldCloseStdinAfterStart`](session.go) — returns
-  `false` for `claude` so multi-turn `SendInput` works.
-- [`session_cli_test.go`](session_cli_test.go) — pins the print-flag strip
-  behaviour (incl. equals-form variants).
+  `false` for `claude` so multi-turn `SendInput` works. The print path
+  deliberately does not route through it.
+- [`claude_argv_test.go`](claude_argv_test.go) — pins BOTH shapes: the
+  print-flag strip (incl. equals-form variants) on the session path, and
+  `--print` presence / no-stream-json / no-tools on the probe path.
+- [`cliagent_smoke_claudecode_test.go`](cliagent_smoke_claudecode_test.go) —
+  pins the exit classification, the pre-checks that spend no quota, the
+  one-turn retry bound, the cooldown, and the fact that neither the published
+  result nor the device log carries any text the CLI authored.
 - [`session_env_test.go`](session_env_test.go) — pins the env strip
   behaviour (billing vars, always-vars, non-claude carve-out, log payload).
 

@@ -249,9 +249,9 @@ func TestAntigravityTurnPrompt_ReplaysWhenNoNativeIDButHistory(t *testing.T) {
 	}
 }
 
-func TestRedactAntigravitySecrets(t *testing.T) {
+func TestRedactAgentSecrets(t *testing.T) {
 	in := "Authorization: Bearer supersecrettoken12345 and api_key=abcdefghijklmnop"
-	out := redactAntigravitySecrets(in)
+	out := redactAgentSecrets(in)
 	if strings.Contains(out, "supersecrettoken12345") {
 		t.Fatalf("token not redacted: %q", out)
 	}
@@ -260,6 +260,14 @@ func TestRedactAntigravitySecrets(t *testing.T) {
 	}
 	if !strings.Contains(out, "REDACTED") {
 		t.Fatalf("expected REDACTED marker: %q", out)
+	}
+
+	// Credential FILE paths are masked too: a CLI that fails while reading one
+	// routinely quotes surrounding content on the same line, and the shared
+	// redactor is what the Claude smoke tail relies on for that.
+	credPath := redactAgentSecrets(`failed reading C:\Users\dkupi\.claude\.credentials.json`)
+	if strings.Contains(credPath, ".credentials.json") {
+		t.Fatalf("credential path not redacted: %q", credPath)
 	}
 }
 
@@ -662,14 +670,14 @@ func TestLooksLikeMissingConversation_DoesNotMatchGenericErrors(t *testing.T) {
 	// Send-path exitCode != 0 gate (not this helper alone).
 }
 
-func TestRedactAntigravitySecrets_PreservesShortDiagnostics(t *testing.T) {
+func TestRedactAgentSecrets_PreservesShortDiagnostics(t *testing.T) {
 	uuid := "11111111-2222-3333-4444-555555555555"
-	out := redactAntigravitySecrets("session " + uuid + " failed")
+	out := redactAgentSecrets("session " + uuid + " failed")
 	if !strings.Contains(out, uuid) {
 		t.Fatalf("UUID-length diagnostics should not be redacted: %q", out)
 	}
 	token := "Authorization: Bearer " + strings.Repeat("a", 40)
-	out2 := redactAntigravitySecrets(token)
+	out2 := redactAgentSecrets(token)
 	if strings.Contains(out2, strings.Repeat("a", 40)) {
 		t.Fatalf("bearer token should be redacted: %q", out2)
 	}

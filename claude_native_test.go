@@ -255,12 +255,8 @@ func installMockClaude(t *testing.T, mode string) string {
 	// reset the once/cache to this test's PATH and restore it afterwards —
 	// otherwise a second integration test reuses the first test's (now-deleted)
 	// tempdir path and fork/exec fails with ENOENT.
-	claudePathOnce = sync.Once{}
-	claudePathCached = ""
-	t.Cleanup(func() {
-		claudePathOnce = sync.Once{}
-		claudePathCached = ""
-	})
+	resetCachedClaudePath()
+	t.Cleanup(resetCachedClaudePath)
 	return tmpDir
 }
 
@@ -443,12 +439,8 @@ func TestClaudeNativeLifecycle_StartFailsWhenBinaryMissing(t *testing.T) {
 	tmpDir := t.TempDir()
 	isolateTestUserHome(t, tmpDir)
 	t.Setenv("PATH", tmpDir)
-	claudePathOnce = sync.Once{}
-	claudePathCached = ""
-	t.Cleanup(func() {
-		claudePathOnce = sync.Once{}
-		claudePathCached = ""
-	})
+	resetCachedClaudePath()
+	t.Cleanup(resetCachedClaudePath)
 
 	m := NewClaudeNativeManager(nil)
 	err := m.Start("nobin", t.TempDir(), nil, "hi", "ws", "uid", func(resultMsg) {}, nil)
