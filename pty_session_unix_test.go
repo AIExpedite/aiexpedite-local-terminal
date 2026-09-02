@@ -117,3 +117,55 @@ func TestRunPTYCommand_SeedsTERMWhenParentHasNone(t *testing.T) {
 		t.Fatalf("PTY child did not see seeded TERM; output=%q", out)
 	}
 }
+
+// `agy` run under a PTY — directly or wrapped as `bash -c "agy …"`, which is how
+// terminal-service ships operator-joined commands — is the only window in which
+// its quota is readable, so the spawn must arm the run-scoped capture and
+// release it when the child is reaped.
+func TestRunPTYCommand_ArmsQuotaCaptureForShellWrappedAntigravity(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "20ms")
+
+	// Use an intentionally missing agy-prefixed name: commandRunsAntigravity
+	// classifies it exactly like the real binary, without making the test depend
+	// on whether the developer machine happens to have `agy` installed. The
+	// `sleep` keeps the child alive long enough to be a realistic run.
+	_, aborted, msg, err := runPTYCommand("sh",
+		[]string{"-c", "agy__aiexpedite_test_missing__ --print hi 2>/dev/null; sleep 0.2"},
+		"", nil, 10*time.Second, DefaultPTYPromptTimeout, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if aborted {
+		t.Fatalf("unexpected abort: %s", msg)
+	}
+
+	if got := antigravityCaptureArms.Load(); got != 1 {
+		t.Fatalf("arms=%d, want exactly one for a shell-wrapped agy PTY run", got)
+	}
+	stopped := antigravityCaptureStopped()
+	if stopped == nil {
+		t.Fatal("no capture poller was started")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the PTY run leaked its quota capture")
+	}
+	if got := antigravityCaptureFinishes.Load(); got != 1 {
+		t.Errorf("finishes=%d, want exactly one", got)
+	}
+}
+
+// Capture is scoped to runs that actually start an Antigravity language server:
+// an ordinary PTY command must not pay for loopback probes.
+func TestRunPTYCommand_DoesNotArmQuotaCaptureForOtherCommands(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "20ms")
+
+	if _, _, _, err := runPTYCommand("sh", []string{"-c", "echo hi"},
+		"", nil, 10*time.Second, DefaultPTYPromptTimeout, nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := antigravityCaptureArms.Load(); got != 0 {
+		t.Errorf("arms=%d, want 0 for a non-agy PTY command", got)
+	}
+}

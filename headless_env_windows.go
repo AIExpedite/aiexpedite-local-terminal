@@ -23,3 +23,8 @@ func detachControllingTTY(c *exec.Cmd) {
 func killProcessGroup(pid int) error {
 	return nil
 }
+
+// configureCommandCancellation deliberately preserves exec.CommandContext's
+// default Process.Kill callback. killProcessGroup is a no-op on Windows, so
+// replacing Cancel with it would leave a timed-out process running forever.
+func configureCommandCancellation(c *exec.Cmd) {}
