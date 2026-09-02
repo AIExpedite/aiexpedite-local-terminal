@@ -825,7 +825,7 @@ func (m *OpenCodeNativeManager) publishEventFrame(session *OpenCodeNativeSession
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,
-		Output:      redactOpenCodeSecrets(line),
+		Output:      redactAgentSecrets(line),
 		Status:      "success",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
@@ -980,7 +980,7 @@ func (m *OpenCodeNativeManager) publishStderrIfAny(session *OpenCodeNativeSessio
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,
-		Output:      redactOpenCodeSecrets(errText),
+		Output:      redactAgentSecrets(errText),
 		// "success" matches the documented resultMsg status enum and every
 		// sibling *_stderr frame — a diagnostic stderr line is a valid
 		// (non-error) frame, and consumers switching on the known status values
@@ -1001,7 +1001,7 @@ func (m *OpenCodeNativeManager) publishTurnError(session *OpenCodeNativeSession,
 			ID:          session.ID,
 			WorkspaceID: session.WorkspaceID,
 			UID:         session.UID,
-			Output:      redactOpenCodeSecrets(msg),
+			Output:      redactAgentSecrets(msg),
 			Status:      "error",
 			Ts:          time.Now().UnixMilli(),
 			Version:     Version,
@@ -1747,18 +1747,6 @@ func buildOpenCodeReplayPrompt(transcript []openCodeTurn, newUserText string) st
 	}
 	body.WriteString(final)
 	return preamble + body.String()
-}
-
-/* --------------------------------------------------------------------------
-   Redaction + dispatch predicate
-   -------------------------------------------------------------------------- */
-
-// redactOpenCodeSecrets reuses the Antigravity redaction patterns — bearer
-// headers, `api_key=` pairs, long opaque blobs and OAuth URLs are
-// provider-agnostic shapes, and duplicating the pattern list would let the two
-// drift so one agent's frames leak what the other's mask.
-func redactOpenCodeSecrets(s string) string {
-	return redactAntigravitySecrets(s)
 }
 
 // isOpenCodeNativeCommand reports whether a Pub/Sub command Type belongs to the

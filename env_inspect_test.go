@@ -12,6 +12,7 @@ func TestIsInternalDemandCommand(t *testing.T) {
 	cases := map[string]bool{
 		"__cli_usage_refresh__": true,
 		"__env_inspect__":       true,
+		"__cli_smoke__":         true,
 		"echo hi":               false,
 		"":                      false,
 		"__ping__":              false,

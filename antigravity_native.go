@@ -841,7 +841,7 @@ func (m *AntigravityNativeManager) publishStderrIfAny(session *AntigravityNative
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,
-		Output:      redactAntigravitySecrets(errText),
+		Output:      redactAgentSecrets(errText),
 		// "success" matches the documented resultMsg status enum and the
 		// claude_native_stderr / codex_appserver_stderr / grok_acp_stderr
 		// frames — a diagnostic stderr line is a valid (non-error) frame, and
@@ -1100,7 +1100,7 @@ func (m *AntigravityNativeManager) publishTurnError(session *AntigravityNativeSe
 		ID:          session.ID,
 		WorkspaceID: session.WorkspaceID,
 		UID:         session.UID,
-		Output:      redactAntigravitySecrets(msg),
+		Output:      redactAgentSecrets(msg),
 		Status:      "error",
 		Ts:          time.Now().UnixMilli(),
 		Version:     Version,
@@ -1623,27 +1623,6 @@ func captureLimited(r io.Reader, limit int) *limitedBuffer {
 		}
 	}
 	return lb
-}
-
-var antigravitySecretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)(authorization:\s*bearer\s+)\S+`),
-	regexp.MustCompile(`(?i)(api[_-]?key\s*[=:]\s*)\S+`),
-	regexp.MustCompile(`(?i)(token\s*[=:]\s*)[A-Za-z0-9._\-]{16,}`),
-	regexp.MustCompile(`https://accounts\.google\.com/[^\s]+`),
-	regexp.MustCompile(`https://[^\s]*oauth[^\s]*`),
-}
-
-func redactAntigravitySecrets(s string) string {
-	out := s
-	for _, re := range antigravitySecretPatterns {
-		out = re.ReplaceAllString(out, "${1}[REDACTED]")
-	}
-	// Only redact very long opaque blobs (likely tokens/JWTs), not ordinary
-	// UUIDs (~36 chars) or short hashes that appear in diagnostics.
-	out = regexp.MustCompile(`[A-Za-z0-9_-]{80,}`).ReplaceAllStringFunc(out, func(m string) string {
-		return m[:8] + "…[REDACTED]"
-	})
-	return out
 }
 
 func isAntigravityNativeCommand(t string) bool {

@@ -16,6 +16,14 @@
       "challengeTs": 2,
       "canonical": "AIEXPEDITE_CLI_USAGE_REFRESH_RECEIPT\n{\"version\":1,\"refreshId\":\"r2\",\"challengeTs\":2,\"success\":true,\"cliAgents\":[{\"provider\":\"codex\",\"collectedAt\":\"now\",\"notice\":\"line\\u2028separator\",\"noticeSeverity\":\"warning\",\"noticeUrl\":\"https://example.test\"}],\"errors\":[]}",
       "signature": "91765c4e2398a4bed3aa6b58be599c590b693ca9fd6ee35f0f14c9274d26699b"
+    },
+    {
+      "name": "protocol-error-category-without-message",
+      "secret": "secret",
+      "refreshId": "r3",
+      "challengeTs": 3,
+      "canonical": "AIEXPEDITE_CLI_USAGE_REFRESH_RECEIPT\n{\"version\":1,\"refreshId\":\"r3\",\"challengeTs\":3,\"success\":false,\"cliAgents\":[],\"errors\":[{\"provider\":\"claudeCode\",\"errorCategory\":\"protocol\"}]}",
+      "signature": "4e53a24c238e6b461a6d68cb3a61ce39981f861a0b051e201e072c4f357ff0dd"
     }
   ]
 }

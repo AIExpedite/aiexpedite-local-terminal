@@ -16,8 +16,9 @@ package main
 // no structured data is lost. The launch shape is identical to the generic
 // Claude path (no `-p`, stdin kept open, CLAUDE_CODE_ENTRYPOINT=cli) — that
 // shape is load-bearing for multi-turn SendInput and for billing (interactive
-// vs Agent SDK credit pool), so we reuse buildClaudeInteractiveArgs and
-// prepareClaudeChildEnv unchanged and only swap the output forwarding.
+// vs Agent SDK credit pool), so we reuse buildClaudeInteractiveArgs
+// (claude_argv.go) and prepareClaudeChildEnv unchanged and only swap the
+// output forwarding.
 //
 // Protocol on stdin: NDJSON user-message envelopes
 //   {"type":"user","message":{"role":"user","content":"…"},"session_id":"…","parent_tool_use_id":null}
@@ -184,9 +185,10 @@ func NewClaudeNativeManager(cfg *Config) *ClaudeNativeManager {
 }
 
 // Start launches `claude … stream-json` in cwd. extraArgs are threaded through
-// buildClaudeInteractiveArgs (which forces the stream-json flag set and strips
-// -p/--print). initialPrompt, when non-empty, is delivered as the first NDJSON
-// user turn on stdin; stdin is kept open for follow-up Send turns.
+// buildClaudeInteractiveArgs in claude_argv.go (which forces the stream-json
+// flag set and strips -p/--print). initialPrompt, when non-empty, is delivered
+// as the first NDJSON user turn on stdin; stdin is kept open for follow-up
+// Send turns.
 //
 // publishFn receives:
 //   - claude_native_message for every stdout stream-json line (verbatim)

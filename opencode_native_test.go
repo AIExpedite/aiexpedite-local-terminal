@@ -1236,6 +1236,8 @@ func TestOpenCodeNativeManager_ChildDoesNotInheritOtherAgentsSecrets(t *testing.
 }
 
 func TestOpenCodeNativeManager_PublishedFramesCarryNoSecrets(t *testing.T) {
+	// Frames go through the shared redactAgentSecrets pass (formerly reached
+	// via a redactOpenCodeSecrets alias) — one pattern list for every provider.
 	installOpenCodeStub(t)
 	t.Setenv("OPENCODE_STUB_STDOUT", `{"type":"text","text":"ok"}`+"\\n")
 	t.Setenv("OPENCODE_STUB_STDERR", "warning: api_key=sk-super-secret-value-here\\n")

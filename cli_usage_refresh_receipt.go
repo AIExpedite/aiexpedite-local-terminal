@@ -22,7 +22,15 @@ const (
 	cliUsageErrorParseFailed         = "parse_failed"
 	cliUsageErrorCollectionFailed    = "collection_failed"
 	cliUsageErrorReceiptBounds       = "receipt_bounds"
-	cliUsageErrorInternal            = "internal_error"
+	// cliUsageErrorProtocol marks a CLI that ran but violated its own invocation
+	// contract — an unknown or rejected flag, or a framing mismatch such as Claude
+	// 2.1.x's `--input-format=stream-json requires output-format=stream-json`.
+	// Deliberately distinct from parse_failed: a protocol failure is OURS to fix in
+	// the argv shape, while a parse failure means the CLI answered and its output
+	// shape changed under us. Collapsing the two hid the smoke regression this
+	// category exists to report.
+	cliUsageErrorProtocol = "protocol"
+	cliUsageErrorInternal = "internal_error"
 )
 
 type cliUsageReceiptBody struct {
@@ -92,7 +100,7 @@ func safeCLIUsageErrorCategory(item cliAgentUsageError) string {
 		case cliUsageErrorProviderTimeout, cliUsageErrorProviderUnavailable,
 			cliUsageErrorNotAuthenticated, cliUsageErrorParseFailed,
 			cliUsageErrorCollectionFailed, cliUsageErrorReceiptBounds,
-			cliUsageErrorInternal:
+			cliUsageErrorProtocol, cliUsageErrorInternal:
 			return item.ErrorCategory
 		}
 	}
@@ -108,6 +116,13 @@ func safeCLIUsageErrorCategory(item cliAgentUsageError) string {
 		return cliUsageErrorProviderUnavailable
 	case strings.Contains(message, "collect"), strings.Contains(message, "gather"):
 		return cliUsageErrorCollectionFailed
+	case strings.Contains(message, "protocol"), strings.Contains(message, "stream-json"),
+		strings.Contains(message, "input-format"):
+		// Legacy free-text callers (and any producer predating the closed enum)
+		// describe the Claude framing failure in these words; without this arm they
+		// collapse to internal_error and the maintenance flow loses the one signal
+		// that says "the invocation shape is wrong".
+		return cliUsageErrorProtocol
 	default:
 		return cliUsageErrorInternal
 	}
