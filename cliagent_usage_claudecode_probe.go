@@ -609,6 +609,21 @@ func (g *claudeUsageProbeGate) begin(now time.Time, forced bool) bool {
 	return true
 }
 
+// claudeUsageProbeWholeTimeout bounds ONE complete probe: the request AND the
+// verified persist that follows it. claudeUsageProbeTimeout covers the request
+// alone, so anything that must outlast the whole sequence — a caller's root
+// deadline, a joiner's wait — is derived from here rather than from the request
+// bound, which would expire while the reading was still being written.
+//
+// Derived from the two bounds the probe itself OBSERVES — the request timeout
+// and the ceiling the verified merge enforces on its own persist step — so it
+// cannot drift away from them. It matters that the second one is enforced
+// rather than estimated: the in-process cache gate has no queue bound, so a
+// budget computed as "our wait plus one other writer's" would be exceeded by
+// any device running two Claude sessions at once. A var so the tests can pin it
+// small.
+var claudeUsageProbeWholeTimeout = claudeUsageProbeTimeout + claudeRateLimitVerifiedPersistBudget
+
 // claudeUsageProbeJoinTimeout bounds how long a forced refresh waits for a probe
 // that is already in flight. It must cover the WHOLE probe, not just its
 // request: a probe that spends its full HTTP timeout and then contends for the
@@ -616,16 +631,7 @@ func (g *claudeUsageProbeGate) begin(now time.Time, forced bool) bool {
 // up at the request deadline would report "nothing written", fall through, be
 // refused by the still-held single-flight slot, and sign the pre-probe cache
 // milliseconds before the fresh one lands.
-//
-// Derived from the two bounds the probe itself OBSERVES — the request timeout
-// and the ceiling the verified merge enforces on its own persist step — so the
-// deadline cannot drift away from them. It matters that the second one is
-// enforced rather than estimated: the in-process cache gate has no queue bound,
-// so a budget computed as "our wait plus one other writer's" would be exceeded
-// by any device running two Claude sessions at once, and the joiner would then
-// give up on a probe that was still going to succeed. A var so the tests can pin
-// it small.
-var claudeUsageProbeJoinTimeout = claudeUsageProbeTimeout + claudeRateLimitVerifiedPersistBudget
+var claudeUsageProbeJoinTimeout = claudeUsageProbeWholeTimeout
 
 // joinInFlight waits for a probe that already holds the single-flight slot,
 // reporting whether there was one to join and, when it persisted a reading, the
@@ -1568,7 +1574,17 @@ func claudeUsageProbeAwaitEligible() bool {
 // the next gather or run under the existing bounds. False means the attempt was
 // never admitted, so the debt has not had its turn yet.
 func claudeUsageProbeAttempt(baseline time.Time) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), claudeUsageProbeTimeout)
+	// The WHOLE-probe bound, not the request bound. This context is a root the
+	// trailing probe fabricates for itself — there is no gather deadline above it
+	// to respect — and probeClaudeUsage derives BOTH its request timeout and its
+	// persist deadline from it. Sized at claudeUsageProbeTimeout, a response that
+	// used a real part of the request budget would leave the verified merge only
+	// the remainder of it, so ordinary cache-lock contention would abandon a
+	// persist that was going to succeed: the attempt reports refreshed == false,
+	// the run's debt and the failure backoff both stay outstanding, and the
+	// reading we already paid a request for goes unclaimed. Request timeout plus
+	// the merge's enforced persist budget gives each phase its own room.
+	ctx, cancel := context.WithTimeout(context.Background(), claudeUsageProbeWholeTimeout)
 	defer cancel()
 
 	attemptAt := time.Now()

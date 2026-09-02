@@ -2887,3 +2887,51 @@ func waitForClaudeProbeInFlight(t *testing.T) {
 	}
 	t.Fatal("no probe took the single-flight slot")
 }
+
+// The trailing post-run probe fabricates its OWN root context — there is no
+// gather deadline above it — so that context has to cover the request AND the
+// verified persist that follows it. Sized at the request timeout alone, a
+// response that spent a real part of the request budget left the merge only the
+// remainder, and ordinary cache contention then abandoned a write that was going
+// to succeed: the attempt reports no refresh, the run's debt stays outstanding,
+// and the failure backoff widens over a reading we had already paid a request
+// for.
+//
+// Driven behaviourally rather than pinned as a constant, because the defect was
+// in which bound the caller passed, not in the bound's value: the response and
+// the stalled write together cost more than claudeUsageProbeTimeout, and stay
+// well inside claudeUsageProbeWholeTimeout.
+func TestClaudeUsageProbeAfterRun_PersistenceGetsItsOwnBudget(t *testing.T) {
+	base := time.Now()
+	const respondAfter = 2 * time.Second
+	const writeStall = 1500 * time.Millisecond
+
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(respondAfter)
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":37,"resets_at":%d}]}`,
+			base.Add(time.Hour).Unix())
+	})
+
+	// Stall the snapshot write the way a contended cache does. Well inside
+	// claudeRateLimitVerifiedPersistBudget, so the merge itself never gives up —
+	// only a caller holding too tight a deadline would.
+	realWrite := claudeRateLimitCacheWriteFile
+	claudeRateLimitCacheWriteFile = func(name string, data []byte, perm os.FileMode) error {
+		time.Sleep(writeStall)
+		return realWrite(name, data, perm)
+	}
+	t.Cleanup(func() { claudeRateLimitCacheWriteFile = realWrite })
+
+	completed := time.Now()
+	claudeUsageProbeAfterRun(completed)
+
+	// The debt is the assertion, not the cache: an abandoned merge still lands on
+	// its own goroutine, so the file eventually holds the reading either way. What
+	// the old bound lost was the CALLER's knowledge of it.
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Errorf("debt %v still outstanding: the persist was abandoned inside the request timeout", owed)
+	}
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("request count=%d, want 1 (the reading was paid for once)", got)
+	}
+}
