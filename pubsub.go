@@ -2327,14 +2327,10 @@ func runLocalCommandUnix(cmd string, args []string, workDir string, timeout time
 	// env, EOF stdin, and detachment from any controlling terminal so git/ssh/
 	// credential helpers fail fast instead of prompting on /dev/tty and hanging.
 	hardenNonAgentCommand(c, effectiveCommandLine(cmd, args))
-	// On timeout, reap the whole detached process group (git spawns ssh /
-	// credential-helper descendants that must not survive the parent). Swallow
-	// the kill error (e.g. ESRCH if the group already exited) and return nil so
-	// os/exec still reports the natural context-deadline result from Wait.
-	c.Cancel = func() error {
-		_ = killProcessGroup(c.Process.Pid)
-		return nil
-	}
+	// Unix reaps the whole detached process group on timeout. Windows must keep
+	// exec.CommandContext's default Process.Kill callback; its process-group
+	// helper is intentionally a no-op.
+	configureCommandCancellation(c)
 
 	var combined bytes.Buffer
 	c.Stdout = &combined

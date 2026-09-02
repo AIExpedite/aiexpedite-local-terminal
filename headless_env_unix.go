@@ -31,3 +31,13 @@ func killProcessGroup(pid int) error {
 	}
 	return syscall.Kill(-pid, syscall.SIGKILL)
 }
+
+// configureCommandCancellation replaces CommandContext's single-process kill
+// with whole-process-group cleanup on Unix. Swallowing ESRCH preserves the
+// natural context cancellation error returned by Cmd.Wait.
+func configureCommandCancellation(c *exec.Cmd) {
+	c.Cancel = func() error {
+		_ = killProcessGroup(c.Process.Pid)
+		return nil
+	}
+}
