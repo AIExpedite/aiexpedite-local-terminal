@@ -367,6 +367,33 @@ func runMockCLI(mode string) {
 		_, _ = os.Stdout.WriteString(`"}]}}` + "\n")
 		select {}
 
+	case "claude-smoke-flood":
+		// A broken/half-upgraded CLI that spews far more than the smoke's
+		// capture caps on BOTH pipes and then fails. Used by
+		// TestClaudeSmokeCapturedOutputIsBounded to prove the probe retains a
+		// bounded prefix and still drains the rest, so the child never wedges
+		// on a full pipe.
+		flood := func(w *os.File, total int) {
+			buf := make([]byte, 64*1024)
+			for i := range buf {
+				buf[i] = 'A'
+			}
+			for emitted := 0; emitted < total; {
+				n := len(buf)
+				if total-emitted < n {
+					n = total - emitted
+				}
+				written, err := w.Write(buf[:n])
+				if err != nil {
+					return
+				}
+				emitted += written
+			}
+		}
+		flood(os.Stdout, 4*1024*1024)
+		flood(os.Stderr, 4*1024*1024)
+		os.Exit(1)
+
 	case "grok-acp-echo":
 		runMockGrokACPServer()
 

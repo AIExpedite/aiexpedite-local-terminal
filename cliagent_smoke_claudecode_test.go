@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -923,5 +924,126 @@ func TestRunCLISmoke_CachedSuccessIsNotReplayedAfterLogout(t *testing.T) {
 	}
 	if *calls != 2 {
 		t.Fatalf("inconclusive-auth replay spent %d turns total, want 2", *calls)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Post-upgrade binary resolution
+   -------------------------------------------------------------------------- */
+
+// TestRunCLISmoke_ResolvesClaudeAfreshAfterUpgrade pins the reason the smoke
+// re-resolves instead of reading the process-wide memo.
+//
+// The agent outlives a Claude Code upgrade — the update runs as an ordinary
+// command inside a session, nothing restarts us — so a memo populated by the
+// first Claude command of the day would otherwise decide which binary the
+// POST-update smoke validates. On Windows that memo is not merely stale but
+// dangling: the install path is version-scoped, so an upgrade relocates the
+// binary and deletes the directory the memo points at, which would report a
+// perfectly healthy new install as `binary_missing`.
+func TestRunCLISmoke_ResolvesClaudeAfreshAfterUpgrade(t *testing.T) {
+	isolateTestUserHome(t, t.TempDir())
+	resetCachedClaudePath()
+	t.Cleanup(resetCachedClaudePath)
+
+	name := "claude"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	// Never executed — only resolved. exec.LookPath needs the exec bit on unix
+	// and a PATHEXT extension on Windows; content is irrelevant to both.
+	install := func(dir string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("stub"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	oldDir, newDir := t.TempDir(), t.TempDir()
+	oldPath := install(oldDir)
+	t.Setenv("PATH", oldDir)
+	if got := cachedResolveClaudePath(); got != oldPath {
+		t.Fatalf("pre-upgrade resolve = %q, want %q", got, oldPath)
+	}
+
+	// The upgrade: the binary moves, and the location the memo holds is gone.
+	newPath := install(newDir)
+	if err := os.Remove(oldPath); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", newDir)
+
+	if got := resolveClaudeSmokePath(); got != newPath {
+		t.Fatalf("smoke resolved %q after the upgrade, want the new install %q", got, newPath)
+	}
+	// The fresh answer replaces the SHARED memo, so interactive sessions stop
+	// launching the binary the upgrade removed rather than disagreeing with
+	// the smoke that just declared the CLI healthy.
+	if got := cachedResolveClaudePath(); got != newPath {
+		t.Fatalf("shared memo = %q after the smoke resolved, want %q", got, newPath)
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Bounded capture
+   -------------------------------------------------------------------------- */
+
+// TestClaudeSmokeCapturedOutputIsBounded drives the REAL exec seam against a
+// child that spews megabytes on both pipes and then fails.
+//
+// A health check must not be the thing that kills the agent: an unbounded
+// bytes.Buffer would follow a broken CLI until the tray process was
+// OOM-killed, losing the failure report the smoke exists to publish. The
+// second half of the contract matters just as much — the excess is DRAINED,
+// not refused, because os/exec abandons its pipe-copy goroutine on a writer
+// error and the child would then block on a full pipe until the deadline
+// killed it, turning "noisy CLI" into "every smoke times out".
+func TestClaudeSmokeCapturedOutputIsBounded(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	env := append(os.Environ(), mockCLIEnvVar+"=claude-smoke-flood")
+	stdout, stderr, err := runClaudeSmokeCommand(ctx, os.Args[0], nil, env, "prompt")
+
+	if err == nil {
+		t.Fatal("flooding child exited 0, want the non-zero exit it reports")
+	}
+	if ctx.Err() != nil {
+		t.Fatal("the probe hit its deadline — the child wedged on a full pipe instead of being drained")
+	}
+	if len(stdout) != claudeSmokeMaxStdout {
+		t.Fatalf("retained %d stdout bytes, want the %d-byte cap", len(stdout), claudeSmokeMaxStdout)
+	}
+	if len(stderr) != claudeSmokeMaxStderr {
+		t.Fatalf("retained %d stderr bytes, want the %d-byte cap", len(stderr), claudeSmokeMaxStderr)
+	}
+}
+
+// TestBoundedBufferRetainsPrefixAndDrainsExcess covers the writer itself: the
+// caps hold across many small writes and one oversized write, and no write is
+// ever reported short — a short write is what makes os/exec stop draining.
+func TestBoundedBufferRetainsPrefixAndDrainsExcess(t *testing.T) {
+	b := &boundedBuffer{limit: 8}
+	for _, chunk := range []string{"abc", "de", "fghij", "klmno"} {
+		n, err := b.Write([]byte(chunk))
+		if err != nil {
+			t.Fatalf("Write(%q) error = %v, want nil so the drain continues", chunk, err)
+		}
+		if n != len(chunk) {
+			t.Fatalf("Write(%q) = %d, want the full %d — a short write stops os/exec draining", chunk, n, len(chunk))
+		}
+	}
+	if got := string(b.Bytes()); got != "abcdefgh" {
+		t.Fatalf("retained %q, want the first 8 bytes %q", got, "abcdefgh")
+	}
+
+	// A single write larger than the whole limit is truncated, not dropped.
+	b = &boundedBuffer{limit: 4}
+	if n, _ := b.Write([]byte("abcdefghij")); n != 10 {
+		t.Fatalf("oversized Write = %d, want 10", n)
+	}
+	if got := string(b.Bytes()); got != "abcd" {
+		t.Fatalf("retained %q, want %q", got, "abcd")
 	}
 }

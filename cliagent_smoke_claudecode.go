@@ -160,9 +160,10 @@ var runClaudeSmokeCommand = func(ctx context.Context, path string, args []string
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Env = env
 	cmd.Stdin = strings.NewReader(prompt)
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
+	outBuf := &boundedBuffer{limit: claudeSmokeMaxStdout}
+	errBuf := &boundedBuffer{limit: claudeSmokeMaxStderr}
+	cmd.Stdout = outBuf
+	cmd.Stderr = errBuf
 	// Background probe on a tray app with no console of its own — without this
 	// a console window flashes on the user's desktop. Same treatment as every
 	// other silent probe.
@@ -170,6 +171,49 @@ var runClaudeSmokeCommand = func(ctx context.Context, path string, args []string
 	err = cmd.Run()
 	return outBuf.Bytes(), errBuf.Bytes(), err
 }
+
+// claudeSmokeMaxStdout / claudeSmokeMaxStderr bound what one probe attempt
+// RETAINS in memory.
+//
+// A health check must not be the thing that kills the agent: a broken or
+// half-upgraded Claude can spew for the full claudeSmokeTimeout (60s), and an
+// unbounded bytes.Buffer would follow it until the tray process is OOM-killed —
+// losing the very failure report the smoke exists to publish. Neither cap can
+// truncate a healthy run: stdout carries one `result` envelope (a marker echo
+// is well under a kilobyte, and the ladder only needs to find the object), and
+// stderr is read solely to pick between three constants in
+// claudeSmokeNoEnvelopeDiagnostic, which match on text a CLI emits in its first
+// line, not its millionth.
+const (
+	claudeSmokeMaxStdout = 1 << 20  // 1 MiB
+	claudeSmokeMaxStderr = 64 << 10 // 64 KiB
+)
+
+// boundedBuffer keeps at most `limit` bytes and DISCARDS the rest while still
+// reporting a successful short-circuit-free write.
+//
+// Returning (len(p), nil) unconditionally is the load-bearing half: os/exec
+// copies the child's pipes on its own goroutines and abandons the copy on a
+// writer error, which would leave the child blocked on a full pipe until the
+// deadline killed it — turning "noisy CLI" into "every smoke times out". So the
+// excess is drained and dropped rather than refused.
+type boundedBuffer struct {
+	limit int
+	buf   bytes.Buffer
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if room := b.limit - b.buf.Len(); room > 0 {
+		if len(p) > room {
+			b.buf.Write(p[:room])
+		} else {
+			b.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (b *boundedBuffer) Bytes() []byte { return b.buf.Bytes() }
 
 // claudeBinaryStamp identifies a specific Claude Code binary: its path, its
 // (mtime, size), and the version it reports. The same triple systemInfo.go's
@@ -284,11 +328,23 @@ var (
 	cliSmokeCooldownCache = map[string]cliSmokeCooldownEntry{}
 )
 
-// resolveClaudeSmokePath resolves the binary the smoke will probe, through the
-// same cached resolver every other Claude path in this process uses. A var so
-// tests can point it at a stub without inheriting the process-wide
-// sync.Once-cached real install.
-var resolveClaudeSmokePath = func() string { return resolveExecutable("claude") }
+// resolveClaudeSmokePath resolves the binary the smoke will probe.
+//
+// It RE-RESOLVES rather than reading the process-wide memo, because the whole
+// point of the post-update smoke is to validate a binary that has just been
+// replaced. The memo is populated on the agent's first Claude command and the
+// agent outlives the upgrade, so reusing it would probe the pre-upgrade
+// install — and on Windows, where the install path is version-scoped
+// (%APPDATA%\Claude\claude-code\<version>\claude.exe), that path may not
+// even exist any more, turning a healthy new install into `binary_missing`.
+//
+// refreshCachedClaudePath writes the fresh answer back into the shared memo, so
+// the rest of the process stops launching the old binary too. It is only
+// reached once per cooldown window, so the memo still absorbs the per-command
+// lookups it exists for.
+//
+// A var so tests can point it at a stub without touching the real install.
+var resolveClaudeSmokePath = func() string { return refreshCachedClaudePath() }
 
 // cliSmokeGroup collapses concurrent smokes for the same CLI into ONE
 // execution. The cooldown alone cannot do that: Pub/Sub delivers several
@@ -522,6 +578,10 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 // wires it up. Every other argument is a value this package defines. Returned
 // as a string (rather than printed inline) so a test can assert the exact
 // vocabulary that reaches the log.
+//
+// The count is the number of bytes RETAINED, so it saturates at
+// claudeSmokeMaxStderr — a line reporting that cap means "at least this much",
+// which is all the signal a byte count was ever carrying.
 func claudeSmokeFailureLogLine(shapeID, category, diagnostic string, stderrBytes int) string {
 	return fmt.Sprintf("%s[cli-smoke] claudeCode shape=%s category=%s diagnostic=%s stderrBytes=%d%s\n",
 		colorYellow, shapeID, category, diagnostic, stderrBytes, colorReset)

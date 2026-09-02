@@ -5270,21 +5270,62 @@ func getFallbackPSExe() string {
 	return fallbackPSExe
 }
 
-// claudePathCache caches the resolved Claude executable path so that the
-// PATH lookup and filesystem scan in resolveClaudePath are only done once
-// rather than on every Claude command invocation.
+// claudePathCache caches the resolved Claude executable path so that the PATH
+// lookup and filesystem scan in resolveClaudePath are not repeated on every
+// Claude command invocation.
+//
+// Guarded by a mutex rather than a sync.Once because the memo must be
+// REFRESHABLE. This agent outlives a Claude Code upgrade — the update runs as
+// an ordinary command inside a session, nothing restarts us — and an upgrade
+// can move the binary: the Windows layout is literally version-scoped
+// (%APPDATA%\Claude\claude-code\<version>\claude.exe), so 2.1.237 -> 2.1.251
+// is a different path. A once-only memo pinned the pre-upgrade path for the
+// rest of the process's life, which made the post-update smoke validate the
+// OLD install (or report it missing) instead of the newly installed one — the
+// exact thing that smoke exists to check. See refreshCachedClaudePath.
 var (
+	claudePathMu     sync.Mutex
 	claudePathCached string
-	claudePathOnce   sync.Once
+	claudePathKnown  bool
 )
 
-// cachedResolveClaudePath returns the Claude executable path, resolving it
-// once on first call and reusing the result for all subsequent calls.
+// cachedResolveClaudePath returns the Claude executable path, resolving it on
+// first call and reusing the result until something explicitly refreshes it.
 func cachedResolveClaudePath() string {
-	claudePathOnce.Do(func() {
+	claudePathMu.Lock()
+	defer claudePathMu.Unlock()
+	if !claudePathKnown {
 		claudePathCached = resolveClaudePath()
-	})
+		claudePathKnown = true
+	}
 	return claudePathCached
+}
+
+// refreshCachedClaudePath re-runs resolution, replaces the memo and returns the
+// fresh path.
+//
+// Called from the CLI-maintenance smoke, which runs at most once per cooldown
+// window (15 minutes), so the memo still absorbs the per-command lookups it
+// exists for. The fresh answer is written back into the SHARED memo rather than
+// kept private to the smoke on purpose: a smoke that just validated the newly
+// installed binary must not leave interactive sessions launching the
+// pre-upgrade one.
+func refreshCachedClaudePath() string {
+	resolved := resolveClaudePath()
+	claudePathMu.Lock()
+	claudePathCached = resolved
+	claudePathKnown = true
+	claudePathMu.Unlock()
+	return resolved
+}
+
+// resetCachedClaudePath drops the memo so the next caller re-resolves.
+// Test-only seam.
+func resetCachedClaudePath() {
+	claudePathMu.Lock()
+	claudePathCached = ""
+	claudePathKnown = false
+	claudePathMu.Unlock()
 }
 
 // buildFallbackProbeCommand wraps a user command line for the one-shot fallback
