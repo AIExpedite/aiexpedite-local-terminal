@@ -188,25 +188,50 @@ func TestAntigravityQuotaCapture_SingleFlightUntilLastFinish(t *testing.T) {
 	}
 }
 
-// The acceptance signal ("latestObservedAt advances after run") is carried by
-// the exit-grace read for any run too short to tick: the socket can still answer
-// for a beat after the process is reaped.
-func TestAntigravityQuotaCapture_ExitGraceTakesTheFinalReading(t *testing.T) {
-	// An hour-long tick guarantees the polling loop never fires, so the only
-	// attempt that can produce this snapshot is the exit-grace one.
+// The first probe must happen at ARM time, not one interval later. The quota
+// server belongs to the child, so a turn that finishes inside a single tick has
+// no post-exit second chance — waiting for the first tick is what left
+// latestObservedAt stale for fast successful runs.
+func TestAntigravityQuotaCapture_ProbesImmediatelyOnArm(t *testing.T) {
+	// An hour-long tick guarantees the polling loop never fires, and the
+	// assertion runs while the capture is still armed, so the only attempt that
+	// can have produced this snapshot is the one taken at arm time.
 	home, cache := helperIsolateAntigravityCapture(t, "1h")
 	helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"),
 		helperQuotaJSON, helperStatusJSON)
 
-	finish := startAntigravityQuotaCapture("short run")
+	finish := startAntigravityQuotaCapture("immediate run")
+	snap := helperAwaitSnapshot(t, cache, time.Time{}, "the arm-time probe")
+	if snap.AccountFingerprint == "" {
+		t.Errorf("arm-time snapshot is not attributable: %+v", snap)
+	}
+	helperStopCapture(t, finish)
+}
+
+// The final probe runs the instant completion is signalled — with no grace
+// delay, because the child already owns (and has closed) the socket, so any
+// wait only widens the gap. A server that only became discoverable after arming
+// must still be read by that final probe.
+func TestAntigravityQuotaCapture_TakesAFinalProbeWhenTheRunEnds(t *testing.T) {
+	// Hour-long tick again: neither the arm probe (nothing listening yet) nor
+	// any tick can produce this snapshot, so it can only come from the final one.
+	home, cache := helperIsolateAntigravityCapture(t, "1h")
+
+	finish := startAntigravityQuotaCapture("late-server run")
+	helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"),
+		helperQuotaJSON, helperStatusJSON)
+	if _, err := os.Stat(cache); err == nil {
+		t.Fatal("nothing was listening at arm time; no snapshot should exist yet")
+	}
+
 	helperStopCapture(t, finish)
 
 	var snap antigravityQuotaSnapshot
 	if !readJSONFile(cache, &snap) {
-		t.Fatal("the exit-grace attempt produced no snapshot")
+		t.Fatal("the final probe produced no snapshot")
 	}
 	if snap.ObservedAt == "" || snap.AccountFingerprint == "" {
-		t.Errorf("exit-grace snapshot is not attributable: %+v", snap)
+		t.Errorf("final snapshot is not attributable: %+v", snap)
 	}
 }
 

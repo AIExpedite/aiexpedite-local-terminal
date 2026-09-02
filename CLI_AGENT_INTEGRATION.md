@@ -376,19 +376,31 @@ closes that gap by reading the server **while it exists**:
 
 - **Armed at every spawn.** `startAntigravityQuotaCapture(label)` is called from
   [`runOneShot`](antigravity_native.go) (native chat),
-  [`runPTYCommand`](pty_session_unix.go) (PTY session + the `execute` path) and
-  [`StartSession`](session.go) (pipe path, released in `waitForExit`). The PTY
-  and pipe paths gate on `commandRunsAntigravity`, which also sees through the
+  [`runPTYCommand`](pty_session_unix.go) (tty=true session + `execute`),
+  [`StartSession`](session.go) (pipe session path, released in `waitForExit`) and
+  [`runLocalCommand`](pubsub.go) (tty=false `execute` — covers
+  `runLocalCommandUnix` and every Windows route: persistent PowerShell, the
+  dedicated CLI-agent process, `runViaShell`, the one-shot fallback). All but
+  native chat gate on `commandRunsAntigravity`, which also sees through the
   `bash -c "agy …"` wrapper terminal-service ships. Windows has no PTY path, so
-  capture there comes from native chat and the pipe path only.
+  capture there comes from native chat, the pipe path and `execute`.
+  **Known gap:** a command that arrives already wrapped as
+  `powershell -EncodedCommand <base64>` is opaque at this layer and is not
+  classified; decoding caller-supplied base64 to sniff for a program name is a
+  worse trade than losing freshness on that one route.
 - **One shared, refcounted poller.** Concurrent `agy` runs join the same
   goroutine; it stops when the last one releases it.
-- **Bounded.** `antigravityCapturePollInterval = 3s`,
-  `antigravityCaptureMaxAttempts = 200`,
-  `antigravityCaptureMaxDuration = 15m` bound the polling loop, plus one
-  unconditional attempt `antigravityCaptureExitGrace = 1.5s` after the process is
-  reaped (the socket can still answer for a beat). Past the caps, a long run's
-  last mid-run reading can be up to 15 minutes old until that final attempt.
+- **Timing is everything.** The server dies *with* the child, so a post-exit
+  probe cannot be relied on to find anything. The poller therefore probes
+  **immediately at arm**, then ramps
+  (`antigravityCaptureInitialPollInterval = 250ms` ×
+  `antigravityCaptureInitialPolls = 12`, covering server bind time and short
+  turns) down to `antigravityCapturePollInterval = 3s`, and takes one final
+  probe **immediately** when the run signals completion — no grace delay.
+- **Bounded.** `antigravityCaptureMaxAttempts = 200` and
+  `antigravityCaptureMaxDuration = 15m` bound the polling loop; the final probe
+  sits outside them. Past the caps, a long run's last mid-run reading can be up
+  to 15 minutes old until that final probe.
 - **Cheap.** The expensive part of a probe is log scanning (4 files ×
   2×128 KB), not the RPC, so the winning port is memoized for the life of the run
   and rediscovered only after an RPC failure. Install bases are re-resolved every

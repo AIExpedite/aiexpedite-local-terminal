@@ -81,12 +81,20 @@ func helperParsedObservedAt(t *testing.T, home string, now time.Time) (*cliAgent
 // Direct path: a native `agy` turn must leave behind a reading the NEXT usage
 // refresh can publish, even though that refresh runs with no server up. This is
 // the regression the whole change exists for.
+//
+// The quota server is owned by the SPAWNED PROCESS (mock mode
+// antigravity-quota-server), not by the test, so it vanishes when the turn ends
+// exactly as a real agy language server does. A capture that only probed after
+// the child was reaped — or that waited a full steady tick before its first
+// probe — finds nothing here and this test fails.
 func TestAntigravityFreshness_NativeTurnAdvancesObservedAt(t *testing.T) {
-	home, cache := helperIsolateAntigravityCapture(t, "20ms")
+	// No interval override: this asserts the SHIPPED capture cadence samples a
+	// turn shorter than antigravityCapturePollInterval.
+	home, cache := helperIsolateAntigravityCapture(t, "")
 	helperSeedStaleAntigravityCache(t, cache)
-	server := helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"),
-		helperQuotaJSON, helperStatusJSON)
-	_, executable := helperMockAgyOnPath(t, "antigravity-stream-stdin-slow")
+	base := filepath.Join(home, ".gemini", "antigravity-cli")
+	t.Setenv(mockAgyQuotaBaseEnv, base)
+	_, executable := helperMockAgyOnPath(t, "antigravity-quota-server")
 
 	stale, err := time.Parse(time.RFC3339, helperStaleObservedAt)
 	if err != nil {
@@ -100,7 +108,7 @@ func TestAntigravityFreshness_NativeTurnAdvancesObservedAt(t *testing.T) {
 		t.Fatalf("stub turn failed: out=%q exit=%d timedOut=%v err=%v", out, exitCode, timedOut, runErr)
 	}
 
-	// runOneShot released the capture on return; wait for the exit-grace read.
+	// runOneShot released the capture on return; wait for the final probe.
 	if stopped := antigravityCaptureStopped(); stopped != nil {
 		select {
 		case <-stopped:
@@ -117,9 +125,8 @@ func TestAntigravityFreshness_NativeTurnAdvancesObservedAt(t *testing.T) {
 		t.Errorf("finishes=%d, want exactly one per turn", got)
 	}
 
-	// The refresh always runs after the process is gone: take the server down so
-	// Parse can only replay what capture persisted.
-	server.srv.Close()
+	// Nothing is listening any more — the child took its server with it — so
+	// Parse can only replay what capture persisted DURING the run.
 	usage, observed := helperParsedObservedAt(t, home, time.Now())
 	if !observed.After(stale) {
 		t.Fatalf("observedAt=%s did not advance past the stale %s", observed, stale)
@@ -131,19 +138,19 @@ func TestAntigravityFreshness_NativeTurnAdvancesObservedAt(t *testing.T) {
 
 // Terminal-managed path: the same guarantee for an `agy` session started through
 // SessionManager (session_start / terminal.execute.command), whose capture is
-// armed at spawn and released in waitForExit.
+// armed at spawn and released in waitForExit. Same child-owned quota server, so
+// the reading can only have been taken while the session's process was alive.
 func TestAntigravityFreshness_TerminalManagedSessionAdvancesObservedAt(t *testing.T) {
-	home, cache := helperIsolateAntigravityCapture(t, "20ms")
+	home, cache := helperIsolateAntigravityCapture(t, "")
 	helperSeedStaleAntigravityCache(t, cache)
-	server := helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"),
-		helperQuotaJSON, helperStatusJSON)
+	t.Setenv(mockAgyQuotaBaseEnv, filepath.Join(home, ".gemini", "antigravity-cli"))
 
 	stale, err := time.Parse(time.RFC3339, helperStaleObservedAt)
 	if err != nil {
 		t.Fatalf("parse seed: %v", err)
 	}
 
-	if _, _, err := captureSession(t, "antigravity-stream-stdin-slow", "agy", []string{"do the thing"}, ""); err != nil {
+	if _, _, err := captureSession(t, "antigravity-quota-server", "agy", []string{"do the thing"}, ""); err != nil {
 		t.Fatalf("captureSession: %v", err)
 	}
 	if stopped := antigravityCaptureStopped(); stopped != nil {
@@ -159,9 +166,86 @@ func TestAntigravityFreshness_TerminalManagedSessionAdvancesObservedAt(t *testin
 		t.Errorf("arms=%d, want exactly one per session", got)
 	}
 
-	server.srv.Close()
 	if _, observed := helperParsedObservedAt(t, home, time.Now()); !observed.After(stale) {
 		t.Fatalf("observedAt=%s did not advance past the stale %s", observed, stale)
+	}
+}
+
+// Non-PTY `execute` path: a tty=false terminal.execute of `agy --print …` runs
+// through runLocalCommand (runLocalCommandUnix on macOS/Linux; persistent
+// PowerShell, the dedicated CLI-agent process or the one-shot fallback on
+// Windows), none of which touch the PTY or session hooks. It is a real
+// Antigravity run and must refresh the quota just the same.
+func TestAntigravityFreshness_NonTTYExecuteAdvancesObservedAt(t *testing.T) {
+	home, cache := helperIsolateAntigravityCapture(t, "")
+	helperSeedStaleAntigravityCache(t, cache)
+	t.Setenv(mockAgyQuotaBaseEnv, filepath.Join(home, ".gemini", "antigravity-cli"))
+	_, executable := helperMockAgyOnPath(t, "antigravity-quota-server")
+
+	stale, err := time.Parse(time.RFC3339, helperStaleObservedAt)
+	if err != nil {
+		t.Fatalf("parse seed: %v", err)
+	}
+
+	out, execErr := executeTerminalCommand(nil, commandMsg{
+		Command:   executable,
+		Args:      []string{"--print", "hello"},
+		Cwd:       t.TempDir(),
+		TimeoutMs: 30000,
+		Tty:       false,
+	})
+	if execErr != nil {
+		t.Fatalf("execute failed: %v (output=%q)", execErr, out)
+	}
+	if !strings.Contains(out, "quota-server turn done") {
+		t.Fatalf("mock agy did not run to completion: %q", out)
+	}
+
+	if stopped := antigravityCaptureStopped(); stopped != nil {
+		select {
+		case <-stopped:
+		case <-time.After(30 * time.Second):
+			t.Fatal("capture poller did not stop after the execute returned")
+		}
+	} else {
+		t.Fatal("a tty=false execute of agy never armed a quota capture")
+	}
+	if got := antigravityCaptureArms.Load(); got != 1 {
+		t.Errorf("arms=%d, want exactly one per execute", got)
+	}
+	if got := antigravityCaptureFinishes.Load(); got != 1 {
+		t.Errorf("finishes=%d, want exactly one per execute", got)
+	}
+
+	if _, observed := helperParsedObservedAt(t, home, time.Now()); !observed.After(stale) {
+		t.Fatalf("observedAt=%s did not advance past the stale %s", observed, stale)
+	}
+}
+
+// The negative for the execute path: an ordinary tty=false command must not pay
+// for loopback probes.
+func TestAntigravityFreshness_NonTTYExecuteOfOtherCommandArmsNothing(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "")
+	_, executable := helperMockAgyOnPath(t, "no-prompt-immediate-exit")
+	// Same binary, renamed so the classifier sees a non-Antigravity program.
+	other := filepath.Join(filepath.Dir(executable), "notagy")
+	if runtime.GOOS == "windows" {
+		other += ".exe"
+	}
+	if err := copyTestBinary(executable, other); err != nil {
+		t.Fatalf("copy mock: %v", err)
+	}
+
+	if _, err := executeTerminalCommand(nil, commandMsg{
+		Command:   other,
+		Args:      []string{"--version"},
+		Cwd:       t.TempDir(),
+		TimeoutMs: 30000,
+	}); err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	if got := antigravityCaptureArms.Load(); got != 0 {
+		t.Errorf("arms=%d, want 0 for a non-agy execute", got)
 	}
 }
 

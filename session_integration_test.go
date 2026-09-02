@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -45,6 +46,18 @@ const mockCLIEnvVar = "TEST_MOCK_CLI_MODE"
 const mockGrokPersistentHomeEnv = "TEST_MOCK_GROK_PERSISTENT_HOME"
 const mockGrokVendorHomeEnv = "TEST_MOCK_GROK_VENDOR_HOME"
 const mockGrokProjectRootEnv = "TEST_MOCK_GROK_PROJECT_ROOT"
+
+// mockAgyQuotaBaseEnv names the Antigravity install base whose `log/` directory
+// the antigravity-quota-server mock advertises its port in. The server is owned
+// by the MOCK PROCESS, so it disappears the moment that process exits — which is
+// the property the capture regression depends on and a parent-owned httptest
+// server cannot reproduce.
+const mockAgyQuotaBaseEnv = "TEST_MOCK_AGY_QUOTA_BASE"
+
+// mockAgyQuotaLifetime is how long the quota-server mock stays alive after
+// answering stdin. Kept short so the test proves the SHIPPED capture cadence
+// samples a fast turn, rather than relying on a shrunken test interval.
+const mockAgyQuotaLifetime = 1500 * time.Millisecond
 
 const grokMaintenanceSmokeMarker = "AIEXPEDITE_GROK_SMOKE_MARKER_7F3C2A"
 
@@ -184,6 +197,51 @@ func runMockCLI(mode string) {
 		}
 		time.Sleep(600 * time.Millisecond)
 		fmt.Println(`{"event":"result","result":{"status":"SUCCESS","response":"slow antigravity turn done"}}`)
+		os.Exit(0)
+
+	case "antigravity-quota-server":
+		// The closest thing to a real `agy` run this suite can produce: THIS
+		// process binds the loopback quota server, advertises the port in the
+		// CLI log the agent scans, serves for a short turn, and exits — taking
+		// the listening socket with it. Nothing in the parent keeps the server
+		// alive, so a capture that only probed after the child was reaped would
+		// find nothing and the test would fail.
+		base := os.Getenv(mockAgyQuotaBaseEnv)
+		ln, lnErr := net.Listen("tcp", "127.0.0.1:0")
+		if lnErr != nil {
+			fmt.Println(`{"event":"result","result":{"status":"ERROR","error":"listen failed"}}`)
+			os.Exit(1)
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc(antigravityQuotaRPC, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(helperQuotaJSON))
+		})
+		mux.HandleFunc(antigravityStatusRPC, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(helperStatusJSON))
+		})
+		go func() { _ = (&http.Server{Handler: mux}).Serve(ln) }()
+
+		logDir := antigravityLogDir(base)
+		if err := os.MkdirAll(logDir, 0o755); err != nil {
+			fmt.Println(`{"event":"result","result":{"status":"ERROR","error":"mkdir failed"}}`)
+			os.Exit(1)
+		}
+		line := fmt.Sprintf(
+			"I0811 12:00:00.000000 42 server.go:584] Language server listening on random port at %d for HTTP\n",
+			ln.Addr().(*net.TCPAddr).Port)
+		if err := os.WriteFile(filepath.Join(logDir, "cli-child.log"), []byte(line), 0o600); err != nil {
+			fmt.Println(`{"event":"result","result":{"status":"ERROR","error":"log write failed"}}`)
+			os.Exit(1)
+		}
+
+		// Drain stdin in the background rather than requiring an envelope: this
+		// mode is reused by the `execute` path, which hands the child no NDJSON
+		// prompt at all, and a blocking read there would hang the turn.
+		go func() { _, _ = io.Copy(io.Discard, os.Stdin) }()
+		time.Sleep(mockAgyQuotaLifetime)
+		fmt.Println(`{"event":"result","result":{"status":"SUCCESS","response":"quota-server turn done"}}`)
 		os.Exit(0)
 
 	case "antigravity-diagnostic":

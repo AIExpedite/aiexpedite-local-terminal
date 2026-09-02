@@ -4987,6 +4987,24 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	timeout := resolveExecTimeout(timeoutMs)
 	workDir := resolveWorkDir(cfg, cwd)
 
+	// A tty=false `execute` of `agy --print …` is a real Antigravity run: it
+	// starts a language server that holds the only readable copy of the quota
+	// and tears it down on exit, exactly like the PTY and session paths. Arm
+	// here rather than in each branch below so every Windows route (persistent
+	// PowerShell, the dedicated CLI-agent process, runViaShell, the one-shot
+	// fallback) and runLocalCommandUnix are covered by one hook; the deferred
+	// release fires when the command has completed on any of them.
+	//
+	// Known gap, deliberate: a command that reaches us already wrapped as
+	// `powershell -EncodedCommand <base64>` is opaque at this layer, so an agy
+	// invocation hidden inside one is not classified. Decoding caller-supplied
+	// base64 to sniff for a program name would be a worse trade than losing
+	// freshness on that route.
+	if commandRunsAntigravity(cmd, args) {
+		finishQuotaCapture := startAntigravityQuotaCapture("local execute")
+		defer finishQuotaCapture()
+	}
+
 	// Unix (macOS/Linux): exec the command directly. The terminal-service
 	// already wraps shell-bound commands (built-ins, &&/||, pipes) in
 	// `bash -c "..."` before dispatch, so here we just run cmd + args with
