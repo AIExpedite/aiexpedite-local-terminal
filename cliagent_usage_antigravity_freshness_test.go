@@ -108,7 +108,7 @@ func TestAntigravityFreshness_NativeTurnAdvancesObservedAt(t *testing.T) {
 		t.Fatalf("stub turn failed: out=%q exit=%d timedOut=%v err=%v", out, exitCode, timedOut, runErr)
 	}
 
-	// runOneShot released the capture on return; wait for the final probe.
+	// runOneShot released the capture on return; wait for poller shutdown.
 	if stopped := antigravityCaptureStopped(); stopped != nil {
 		select {
 		case <-stopped:
@@ -246,6 +246,29 @@ func TestAntigravityFreshness_NonTTYExecuteOfOtherCommandArmsNothing(t *testing.
 	}
 	if got := antigravityCaptureArms.Load(); got != 0 {
 		t.Errorf("arms=%d, want 0 for a non-agy execute", got)
+	}
+}
+
+// Capture belongs to a live child, not merely an argv that looks like agy. A
+// failed Start must leave no poller behind and must not perform the immediate
+// pre-spawn probe that previously raced short successful executions.
+func TestAntigravityFreshness_NonTTYExecuteStartFailureArmsNothing(t *testing.T) {
+	helperIsolateAntigravityCapture(t, "20ms")
+	missing := filepath.Join(t.TempDir(), "agy-missing")
+	if runtime.GOOS == "windows" {
+		missing += ".exe"
+	}
+
+	if _, err := executeTerminalCommand(nil, commandMsg{
+		Command:   missing,
+		Args:      []string{"--print", "hello"},
+		Cwd:       t.TempDir(),
+		TimeoutMs: 30000,
+	}); err == nil {
+		t.Fatal("execute unexpectedly started the missing agy binary")
+	}
+	if got := antigravityCaptureArms.Load(); got != 0 {
+		t.Errorf("arms=%d, want 0 when the child never started", got)
 	}
 }
 

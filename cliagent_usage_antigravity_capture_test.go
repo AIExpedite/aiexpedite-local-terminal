@@ -22,6 +22,7 @@ type helperCaptureServer struct {
 	srv          *httptest.Server
 	quotaHits    atomic.Int64
 	statusHits   atomic.Int64
+	connections  atomic.Int64
 	identityDown atomic.Bool
 	port         string
 }
@@ -44,7 +45,13 @@ func helperStartCaptureServer(t *testing.T, base, quotaJSON, statusJSON string) 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(statusJSON))
 	})
-	cs.srv = httptest.NewServer(mux)
+	cs.srv = httptest.NewUnstartedServer(mux)
+	cs.srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			cs.connections.Add(1)
+		}
+	}
+	cs.srv.Start()
 	t.Cleanup(cs.srv.Close)
 
 	_, port, err := net.SplitHostPort(strings.TrimPrefix(cs.srv.URL, "http://"))
@@ -83,8 +90,8 @@ func helperIsolateAntigravityCapture(t *testing.T, interval string) (home, cache
 	return home, cache
 }
 
-// helperStopCapture releases a capture and waits for the poller — including its
-// exit-grace attempt — to finish, so no goroutine outlives the test.
+// helperStopCapture releases a capture and waits for the poller to finish, so
+// no goroutine outlives the test.
 func helperStopCapture(t *testing.T, finish func()) {
 	t.Helper()
 	stopped := antigravityCaptureStopped()
@@ -208,14 +215,11 @@ func TestAntigravityQuotaCapture_ProbesImmediatelyOnArm(t *testing.T) {
 	helperStopCapture(t, finish)
 }
 
-// The final probe runs the instant completion is signalled — with no grace
-// delay, because the child already owns (and has closed) the socket, so any
-// wait only widens the gap. A server that only became discoverable after arming
-// must still be read by that final probe.
-func TestAntigravityQuotaCapture_TakesAFinalProbeWhenTheRunEnds(t *testing.T) {
-	// Hour-long tick again: neither the arm probe (nothing listening yet) nor
-	// any tick can produce this snapshot, so it can only come from the final one.
-	home, cache := helperIsolateAntigravityCapture(t, "1h")
+// A server that binds after the capture is armed must be discovered on a live
+// polling tick. finish() normally runs after Wait, when the in-process server is
+// already gone, so correctness must never depend on a post-exit final probe.
+func TestAntigravityQuotaCapture_DiscoversServerThatBindsAfterArm(t *testing.T) {
+	home, cache := helperIsolateAntigravityCapture(t, "20ms")
 
 	finish := startAntigravityQuotaCapture("late-server run")
 	helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"),
@@ -224,15 +228,11 @@ func TestAntigravityQuotaCapture_TakesAFinalProbeWhenTheRunEnds(t *testing.T) {
 		t.Fatal("nothing was listening at arm time; no snapshot should exist yet")
 	}
 
-	helperStopCapture(t, finish)
-
-	var snap antigravityQuotaSnapshot
-	if !readJSONFile(cache, &snap) {
-		t.Fatal("the final probe produced no snapshot")
-	}
+	snap := helperAwaitSnapshot(t, cache, time.Time{}, "a live probe after the server bound")
 	if snap.ObservedAt == "" || snap.AccountFingerprint == "" {
-		t.Errorf("final snapshot is not attributable: %+v", snap)
+		t.Errorf("live snapshot is not attributable: %+v", snap)
 	}
+	helperStopCapture(t, finish)
 }
 
 // A GetUserStatus blip must cost one tick of freshness, not the whole run's: the
@@ -291,6 +291,9 @@ func TestAntigravityQuotaCapture_MemoizesThePortAcrossAttempts(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if got := server.connections.Load(); got != 1 {
+		t.Errorf("poller opened %d TCP connections across repeated probes, want one reused transport", got)
+	}
 }
 
 // An RPC failure on the memoized port must force re-discovery, which is how a
@@ -326,40 +329,32 @@ func TestAntigravityQuotaCapture_RediscoversAfterTheMemoizedPortDies(t *testing.
 	}
 }
 
-// The polling loop is hard-capped so a very long run cannot turn into unbounded
-// background work on the user's machine. The exit-grace attempt is deliberately
-// outside the cap, so at most one further probe may land.
-func TestAntigravityQuotaCapture_StopsAtTheAttemptCap(t *testing.T) {
+// Log discovery is hard-capped, but a known-good port must keep receiving cheap
+// reads until the run ends. Otherwise the last observation for a run longer
+// than the discovery window could be hours stale when the child exits.
+func TestAntigravityQuotaCapture_KeepsPollingMemoizedPortAfterDiscoveryCap(t *testing.T) {
 	home, _ := helperIsolateAntigravityCapture(t, "1ms")
 	server := helperStartCaptureServer(t, filepath.Join(home, ".gemini", "antigravity-cli"),
 		helperQuotaJSON, helperStatusJSON)
 
 	finish := startAntigravityQuotaCapture("capped run")
 
-	// Wait for the probe count to go quiet — that is the cap taking effect. The
-	// quota RPC is issued exactly once per attempt (the port is memoized after
-	// the first success), so hits and attempts are the same number.
+	// The quota RPC is issued once per tick. Reaching beyond the discovery cap
+	// proves the memoized-port tail loop did not park with the process alive.
 	deadline := time.Now().Add(90 * time.Second)
-	var settled int64
-	for {
-		before := server.quotaHits.Load()
-		time.Sleep(500 * time.Millisecond)
-		settled = server.quotaHits.Load()
-		if settled == before && settled > 0 {
-			break
-		}
+	for server.quotaHits.Load() <= antigravityCaptureMaxAttempts+5 {
 		if time.Now().After(deadline) {
-			t.Fatal("polling never settled — the attempt cap is not enforced")
+			t.Fatalf("polling stopped at %d hits; want reads beyond discovery cap %d",
+				server.quotaHits.Load(), antigravityCaptureMaxAttempts)
 		}
-	}
-	if settled > antigravityCaptureMaxAttempts {
-		t.Errorf("%d probes, want at most the cap %d", settled, antigravityCaptureMaxAttempts)
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	helperStopCapture(t, finish)
-	if got := server.quotaHits.Load(); got > antigravityCaptureMaxAttempts+1 {
-		t.Errorf("%d probes after the exit-grace read, want at most cap+1 (%d)",
-			got, antigravityCaptureMaxAttempts+1)
+	stoppedAt := server.quotaHits.Load()
+	time.Sleep(20 * time.Millisecond)
+	if got := server.quotaHits.Load(); got != stoppedAt {
+		t.Errorf("polling continued after finish: hits %d → %d", stoppedAt, got)
 	}
 }
 

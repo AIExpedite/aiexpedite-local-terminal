@@ -125,11 +125,12 @@ func TestRunPTYCommand_SeedsTERMWhenParentHasNone(t *testing.T) {
 func TestRunPTYCommand_ArmsQuotaCaptureForShellWrappedAntigravity(t *testing.T) {
 	helperIsolateAntigravityCapture(t, "20ms")
 
-	// The inner `agy` is not installed here; what matters is that the spawn was
-	// classified as an Antigravity run. The `sleep` keeps the child alive long
-	// enough to be a realistic run.
+	// Use an intentionally missing agy-prefixed name: commandRunsAntigravity
+	// classifies it exactly like the real binary, without making the test depend
+	// on whether the developer machine happens to have `agy` installed. The
+	// `sleep` keeps the child alive long enough to be a realistic run.
 	_, aborted, msg, err := runPTYCommand("sh",
-		[]string{"-c", "agy --print hi 2>/dev/null; sleep 0.2"},
+		[]string{"-c", "agy__aiexpedite_test_missing__ --print hi 2>/dev/null; sleep 0.2"},
 		"", nil, 10*time.Second, DefaultPTYPromptTimeout, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

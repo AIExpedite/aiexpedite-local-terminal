@@ -2318,6 +2318,7 @@ func runLocalCommandUnix(cmd string, args []string, workDir string, timeout time
 	defer cancel()
 
 	c := exec.CommandContext(ctx, cmd, args...)
+	hideWindow(c)
 	if workDir != "" {
 		c.Dir = workDir
 	}
@@ -2345,6 +2346,13 @@ func runLocalCommandUnix(cmd string, args []string, workDir string, timeout time
 	if c.Process != nil {
 		globalProcessRegistry.Register(c.Process.Pid, "pubsub:unix")
 		defer globalProcessRegistry.Deregister(c.Process.Pid)
+	}
+	// Do not arm until Start succeeds. Arming in runLocalCommand made the
+	// immediate probe race ahead of the child and also created a capture for a
+	// command that never spawned at all.
+	if commandRunsAntigravity(cmd, args) {
+		finishQuotaCapture := startAntigravityQuotaCapture("local execute")
+		defer finishQuotaCapture()
 	}
 	err := c.Wait()
 	return combined.String(), err
@@ -4986,24 +4994,7 @@ func replaceDashCPayload(args []string, payload string) []string {
 func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeoutMs int64) (string, error) {
 	timeout := resolveExecTimeout(timeoutMs)
 	workDir := resolveWorkDir(cfg, cwd)
-
-	// A tty=false `execute` of `agy --print …` is a real Antigravity run: it
-	// starts a language server that holds the only readable copy of the quota
-	// and tears it down on exit, exactly like the PTY and session paths. Arm
-	// here rather than in each branch below so every Windows route (persistent
-	// PowerShell, the dedicated CLI-agent process, runViaShell, the one-shot
-	// fallback) and runLocalCommandUnix are covered by one hook; the deferred
-	// release fires when the command has completed on any of them.
-	//
-	// Known gap, deliberate: a command that reaches us already wrapped as
-	// `powershell -EncodedCommand <base64>` is opaque at this layer, so an agy
-	// invocation hidden inside one is not classified. Decoding caller-supplied
-	// base64 to sniff for a program name would be a worse trade than losing
-	// freshness on that route.
-	if commandRunsAntigravity(cmd, args) {
-		finishQuotaCapture := startAntigravityQuotaCapture("local execute")
-		defer finishQuotaCapture()
-	}
+	runsAntigravity := commandRunsAntigravity(cmd, args)
 
 	// Unix (macOS/Linux): exec the command directly. The terminal-service
 	// already wraps shell-bound commands (built-ins, &&/||, pipes) in
@@ -5011,7 +5002,7 @@ func runLocalCommand(cfg *Config, cmd string, args []string, cwd string, timeout
 	// no PowerShell/cmd.exe involvement. Without this branch, Unix agents
 	// fall through to the Windows fallback path and try to exec
 	// powershell.exe, which doesn't exist on macOS/Linux.
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS != "windows" || runsAntigravity {
 		return runLocalCommandUnix(cmd, args, workDir, timeout)
 	}
 

@@ -360,6 +360,7 @@ func fetchAntigravityQuota(ctx context.Context, base string, now time.Time) (ant
 		return antigravityQuotaSnapshot{}, false
 	}
 	client := antigravityLoopbackClient()
+	defer client.CloseIdleConnections()
 	for _, port := range ports {
 		if snap, ok := fetchAntigravityQuotaOnPort(ctx, client, port, now); ok {
 			return snap, true

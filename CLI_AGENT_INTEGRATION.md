@@ -378,9 +378,8 @@ closes that gap by reading the server **while it exists**:
   [`runOneShot`](antigravity_native.go) (native chat),
   [`runPTYCommand`](pty_session_unix.go) (tty=true session + `execute`),
   [`StartSession`](session.go) (pipe session path, released in `waitForExit`) and
-  [`runLocalCommand`](pubsub.go) (tty=false `execute` — covers
-  `runLocalCommandUnix` and every Windows route: persistent PowerShell, the
-  dedicated CLI-agent process, `runViaShell`, the one-shot fallback). All but
+  [`runLocalCommand`](pubsub.go) (tty=false `execute` — direct spawn on Unix and
+  a dedicated one-shot process on Windows). All but
   native chat gate on `commandRunsAntigravity`, which also sees through the
   `bash -c "agy …"` wrapper terminal-service ships. Windows has no PTY path, so
   capture there comes from native chat, the pipe path and `execute`.
@@ -395,16 +394,20 @@ closes that gap by reading the server **while it exists**:
   **immediately at arm**, then ramps
   (`antigravityCaptureInitialPollInterval = 250ms` ×
   `antigravityCaptureInitialPolls = 12`, covering server bind time and short
-  turns) down to `antigravityCapturePollInterval = 3s`, and takes one final
-  probe **immediately** when the run signals completion — no grace delay.
-- **Bounded.** `antigravityCaptureMaxAttempts = 200` and
-  `antigravityCaptureMaxDuration = 15m` bound the polling loop; the final probe
-  sits outside them. Past the caps, a long run's last mid-run reading can be up
-  to 15 minutes old until that final probe.
+  turns) down to `antigravityCapturePollInterval = 3s`. Capture is armed only
+  after the child successfully starts, so the immediate probe cannot run before
+  the process exists.
+- **Bounded discovery, continuous live-port reads.**
+  `antigravityCaptureMaxAttempts = 200` and
+  `antigravityCaptureMaxDuration = 15m` bound attempts that may scan logs. Once
+  either cap is reached, a memoized live port continues receiving cheap 3s
+  loopback reads until the run ends; no further log scans occur. If no port was
+  found, the poller parks until release.
 - **Cheap.** The expensive part of a probe is log scanning (4 files ×
   2×128 KB), not the RPC, so the winning port is memoized for the life of the run
-  and rediscovered only after an RPC failure. Install bases are re-resolved every
-  attempt, so an `agy` self-update that migrates `~/.agy` →
+  and rediscovered only after an RPC failure. One HTTP client/transport is reused
+  for the poller's lifetime and its idle connections are closed on shutdown.
+  Install bases are re-resolved on each discovery attempt, so an `agy` self-update that migrates `~/.agy` →
   `~/.gemini/antigravity-cli` mid-flight is picked up without a restart.
 - **Monotonic writes.** `saveAntigravityQuotaSnapshotIfNewer` never lets a
   slower in-flight probe age the card backwards for the same account; an account

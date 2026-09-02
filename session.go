@@ -500,8 +500,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 
 	// agy's quota lives only in the language server this child starts, so the
 	// post-run usage refresh can never read it. Arm the run-scoped capture
-	// poller now that the process exists; waitForExit releases it in the exit
-	// window. Nil for every other command. See
+	// poller now that the process exists; waitForExit releases it as soon as the
+	// process ends. Nil for every other command. See
 	// cliagent_usage_antigravity_capture.go.
 	var finishQuotaCapture func()
 	if commandRunsAntigravity(command, cliArgs) {
@@ -1680,11 +1680,10 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	err := session.Process.Wait()
 	closeProcessExited(session.processExited)
 
-	// Release the Antigravity quota poller the moment the child is reaped, not
-	// after the stream drain below: the poller's final read is worth taking
-	// while the language server's loopback socket may still answer, and the
-	// drain can legitimately take seconds. Non-blocking, and a no-op for every
-	// non-agy session.
+	// Release the Antigravity quota poller the moment the child is reaped rather
+	// than after the stream drain below. Every useful read has to happen while
+	// the process is alive; stopping promptly also frees its idle loopback
+	// connection. Non-blocking, and a no-op for every non-agy session.
 	if session.finishQuotaCapture != nil {
 		session.finishQuotaCapture()
 	}
