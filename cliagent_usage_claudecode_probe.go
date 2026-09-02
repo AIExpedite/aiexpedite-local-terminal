@@ -131,6 +131,13 @@ const (
 	// claudeUsageProbeTrailingSlack pads the wake-up past the eligibility instant
 	// so a timer that fires a hair early is not refused and rescheduled.
 	claudeUsageProbeTrailingSlack = 50 * time.Millisecond
+	// claudeUsageProbeAfterRunMaxAttempts bounds how many times one finished run
+	// re-enters the eligibility wait after the single-flight latch turned it away.
+	// Two: the attempt it was scheduled for, plus one retry behind the probe that
+	// beat it to the slot. More would let a busy device queue a goroutine per run
+	// on a latch they all keep losing; fewer is the bug this bounds — a run whose
+	// refresh is dropped because a probe started microseconds earlier.
+	claudeUsageProbeAfterRunMaxAttempts = 2
 )
 
 // claudeUsageProbeWindow is the ONLY shape decoded from the response. Every
@@ -721,6 +728,52 @@ func (g *claudeUsageProbeGate) nextEligible(now time.Time) (time.Time, bool) {
 		}
 	}
 	return at, true
+}
+
+// awaitInFlight blocks until the probe currently holding the single-flight slot
+// releases it, reporting whether waiting is over on the gate's terms — false
+// only when the process is shutting down or the holder outlived the join
+// deadline, both states where a retry is pointless. Nothing in flight is
+// reported as true: there is simply nothing to wait for.
+//
+// This is what makes a retry after a latch refusal terminate. Eligibility does
+// not model the slot (begin() checks inFlight before the interval), so a caller
+// that recomputed eligibility and immediately retried would spin against the
+// holder for the whole of its request rather than take its turn behind it.
+func (g *claudeUsageProbeGate) awaitInFlight() bool {
+	g.mu.Lock()
+	done, inFlight := g.doneCh, g.inFlight
+	g.mu.Unlock()
+	if !inFlight || done == nil {
+		return true
+	}
+	timer := time.NewTimer(claudeUsageProbeJoinTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-shutdownChan:
+		return false
+	case <-timer.C:
+		// A probe outliving its own deadline is a wedge, not a slow answer.
+		return false
+	}
+}
+
+// admittedAt reports whether the attempt this gate last admitted is the one that
+// began at `at` — i.e. whether the caller that passed `at` to probeClaudeUsage
+// got the single-flight slot.
+//
+// begin() records the admitted attempt's own `now`, so an exact match is the
+// only reading that identifies OUR attempt: a probe refused by the latch leaves
+// lastAttempt belonging to whoever holds it, whose instant may be either side of
+// ours. Ambiguity is impossible in practice (two goroutines do not read the same
+// wall instant) and resolves to "admitted" if it ever happened, which merely
+// declines a retry rather than issuing a spurious one.
+func (g *claudeUsageProbeGate) admittedAt(at time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.lastAttempt.Equal(at)
 }
 
 // recordOwed notes that a run completed at `baseline` and still needs an
@@ -1430,61 +1483,109 @@ func claudeUsageProbeAfterRun(completedAt time.Time) {
 	// refresh is silently lost.
 	claudeUsageProbe.recordOwed(completedAt)
 
-	// No credential or cache read in this preflight. Resolving the identity here
-	// would cost a `security` spawn PER RUN on macOS even when the burst
-	// coalesces to one request; the single probe below resolves it once and uses
-	// it for both the shared-cache check and the HTTP call.
+	for attempt := 0; attempt < claudeUsageProbeAfterRunMaxAttempts; attempt++ {
+		// No credential or cache read in this preflight. Resolving the identity
+		// here would cost a `security` spawn PER RUN on macOS even when the burst
+		// coalesces to one request; the single probe below resolves it once and
+		// uses it for both the shared-cache check and the HTTP call.
+		if !claudeUsageProbeAwaitEligible() {
+			return
+		}
+
+		// Satisfy the NEWEST outstanding debt, which may have advanced past this
+		// run while we slept.
+		baseline := claudeUsageProbe.owedObservation()
+		if baseline.IsZero() {
+			return // already settled by another writer, a gather, or the probe that beat us
+		}
+
+		if claudeUsageProbeAttempt(baseline) {
+			return
+		}
+		// Refused by the single-flight latch: eligibility said "now", but another
+		// probe took the slot between the check and the call. That probe answers
+		// for ITS baseline, which can predate this run, so returning here is how a
+		// finished run's refresh goes missing until some later gather happens to
+		// retry it. Take our turn behind the holder instead, then re-derive
+		// eligibility — the debt is re-read next round, so a holder whose reading
+		// did cover this run ends the loop without a second request.
+		if !claudeUsageProbe.awaitInFlight() {
+			return
+		}
+	}
+}
+
+// claudeUsageProbeAwaitEligible blocks until the gate would admit a probe,
+// reporting false when it never will, when the wait is too long to hold a timer
+// for, when another run already owns the trailing timer, or when the process is
+// shutting down.
+//
+// Waiting rather than dropping is the point: the minimum interval is checked in
+// begin() before any baseline is consulted, so a routine gather (or another run)
+// that probed thirty seconds ago would otherwise make this run's refresh vanish
+// — and the gather path then treats that pre-run reading as fresh for the whole
+// staleness TTL, so latestObservedAt stays behind the run for minutes. The
+// throttle exists to bound the request RATE, not to decide which runs get
+// reported; delaying to the end of the window satisfies both.
+func claudeUsageProbeAwaitEligible() bool {
 	eligibleAt, ever := claudeUsageProbe.nextEligible(time.Now())
 	if !ever {
-		return
+		return false
 	}
-	if wait := time.Until(eligibleAt); wait > 0 {
-		if wait > claudeUsageProbeMaxTrailingWait {
-			// Too far out to hold a timer for — a deep failure backoff or a long
-			// Retry-After, both states where we should not be pressing anyway. The
-			// debt stays recorded and refreshClaudeUsageIfStale pays it on the next
-			// gather. Deliberately does NOT reserve the timer slot: reserving one
-			// without creating a timer would leave it held forever.
-			return
-		}
-		if !claudeUsageProbe.reserveTrailing() {
-			return // another run already owns the trailing timer
-		}
-		// Release on EVERY path out, including the cancel and shutdown branches.
-		defer claudeUsageProbe.releaseTrailing()
-
-		select {
-		case <-time.After(wait + claudeUsageProbeTrailingSlack):
-		case <-shutdownChan:
-			return
-		case <-claudeUsageProbe.trailingCancelCh():
-			// The gate was reset under us; the environment this probe would read on
-			// waking is no longer the one it was scheduled against.
-			return
-		}
+	wait := time.Until(eligibleAt)
+	if wait <= 0 {
+		return true
 	}
-
-	// Satisfy the NEWEST outstanding debt, which may have advanced past this
-	// run while we slept.
-	baseline := claudeUsageProbe.owedObservation()
-	if baseline.IsZero() {
-		return // already settled by another writer or a gather
+	if wait > claudeUsageProbeMaxTrailingWait {
+		// Too far out to hold a timer for — a deep failure backoff or a long
+		// Retry-After, both states where we should not be pressing anyway. The
+		// debt stays recorded and refreshClaudeUsageIfStale pays it on the next
+		// gather. Deliberately does NOT reserve the timer slot: reserving one
+		// without creating a timer would leave it held forever.
+		return false
 	}
+	if !claudeUsageProbe.reserveTrailing() {
+		return false // another run already owns the trailing timer
+	}
+	// Release on EVERY path out, including the cancel and shutdown branches.
+	defer claudeUsageProbe.releaseTrailing()
 
+	select {
+	case <-time.After(wait + claudeUsageProbeTrailingSlack):
+		return true
+	case <-shutdownChan:
+		return false
+	case <-claudeUsageProbe.trailingCancelCh():
+		// The gate was reset under us; the environment this probe would read on
+		// waking is no longer the one it was scheduled against.
+		return false
+	}
+}
+
+// claudeUsageProbeAttempt issues one trailing probe for an outstanding debt and
+// reports whether the caller is DONE — either the debt is settled, or the gate
+// admitted the attempt and it skipped/failed, which leaves the debt standing for
+// the next gather or run under the existing bounds. False means the attempt was
+// never admitted, so the debt has not had its turn yet.
+func claudeUsageProbeAttempt(baseline time.Time) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), claudeUsageProbeTimeout)
 	defer cancel()
+
+	attemptAt := time.Now()
 	// forced=false: this is the background trailing probe. It must never spend a
 	// bypass a concurrent refresh is holding — that theft is what leaves the
 	// refresh signing a pre-probe cache.
-	refreshed, observedAt, probeErr := probeClaudeUsage(ctx, time.Now(), claudeUsageProbeStoredIdentity, baseline, false)
+	refreshed, observedAt, probeErr := probeClaudeUsage(ctx, attemptAt, claudeUsageProbeStoredIdentity, baseline, false)
 	logClaudeUsageProbeFailure(probeErr)
 	// Same rule as the gather path: a write that left the run's window owned by
 	// an older reading has not paid this debt, even though it succeeded.
 	if refreshed && claudeUsageObservationCovers(observedAt, baseline) {
 		claudeUsageProbe.settleOwed(baseline)
+		return true
 	}
 	// A refusal or failure deliberately leaves the debt standing: the next
 	// gather, reconnect, or run retries it under the same bounds.
+	return claudeUsageProbe.admittedAt(attemptAt)
 }
 
 // retryAfterDeadline turns a Retry-After header into an absolute instant, or the

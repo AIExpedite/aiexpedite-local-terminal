@@ -2809,3 +2809,81 @@ func TestRefreshClaudeUsageIfStale_SettlesDebtOlderThanTheGatherStamp(t *testing
 		t.Errorf("owedObservation=%s, want the debt settled by a post-run reading", got)
 	}
 }
+
+// A post-run probe that loses the single-flight race must take its turn behind
+// the winner instead of dropping the run's debt. The winner answers for ITS own
+// baseline — here a request that was already on the wire before the run
+// finished — so treating the refusal as "handled" leaves utilization pinned to a
+// pre-run reading until some later gather happens to retry.
+func TestClaudeUsageProbeAfterRun_RetriesAfterSingleFlightRefusal(t *testing.T) {
+	base := time.Now()
+	release := make(chan struct{})
+	var served int64
+	_, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		// The first (winning) request holds the latch for as long as the test needs
+		// the race to be observable, then fails — the case the retry exists for:
+		// the winner persists nothing, so the run's utilization stays pre-run
+		// unless the refused post-run probe takes its own turn.
+		if atomic.AddInt64(&served, 1) == 1 {
+			<-release
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":51,"resets_at":%d}]}`,
+			base.Add(time.Hour).Unix())
+	})
+
+	// The winner: a routine gather already on the wire, holding the slot.
+	winnerDone := make(chan struct{})
+	go func() {
+		defer close(winnerDone)
+		refreshClaudeUsageIfStale(context.Background(), time.Now(), time.Time{}, probeTestToken, "")
+	}()
+	waitForClaudeProbeInFlight(t)
+
+	// The run finishes AFTER the winner's request left, so the winner's reading
+	// cannot cover it.
+	completed := time.Now()
+	afterRunDone := make(chan struct{})
+	go func() {
+		defer close(afterRunDone)
+		claudeUsageProbeAfterRun(completed)
+	}()
+
+	// Give the post-run probe time to be refused, then let the winner finish.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	<-winnerDone
+	select {
+	case <-afterRunDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the post-run probe never returned")
+	}
+
+	if latest := latestClaudeObservation(loadMergedClaudeRateLimitBuckets("")); latest.Before(completed.Truncate(time.Millisecond)) {
+		t.Errorf("observation %v did not advance past the run %v — the refused post-run probe was dropped", latest, completed)
+	}
+	if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+		t.Errorf("debt %v still outstanding after the retry", owed)
+	}
+	if got := atomic.LoadInt64(calls); got != 2 {
+		t.Errorf("request count=%d, want 2 (the winner plus one retry)", got)
+	}
+}
+
+// waitForClaudeProbeInFlight blocks until a probe holds the single-flight slot,
+// so a test can stage the refusal deterministically instead of sleeping.
+func waitForClaudeProbeInFlight(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		claudeUsageProbe.mu.Lock()
+		inFlight := claudeUsageProbe.inFlight
+		claudeUsageProbe.mu.Unlock()
+		if inFlight {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("no probe took the single-flight slot")
+}
