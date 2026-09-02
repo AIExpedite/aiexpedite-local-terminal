@@ -1132,12 +1132,13 @@ func handleCLISmokeCommand(ctx context.Context, topic *pubsub.Publisher, cmd com
 		}
 	}()
 
-	result, cached := runCLISmoke(ctx, cliID)
-	if cached {
-		// The cooldown replayed a verdict rather than spending a second
-		// inference turn on the user's own subscription window. Log it so a
-		// harness that retries too aggressively is visible on the device.
-		fmt.Printf("%s[pubsub] CLI smoke for %q served from cooldown (%s)%s\n",
+	result, replayed := runCLISmoke(ctx, cliID)
+	if replayed {
+		// No second inference turn was spent on the user's own subscription
+		// window: this call either replayed the cooldown's verdict or shared a
+		// concurrent run's. Log it so a harness that retries too aggressively
+		// is visible on the device.
+		fmt.Printf("%s[pubsub] CLI smoke for %q answered without spending a turn (%s)%s\n",
 			colorYellow, cliID, result.Status, colorReset)
 	}
 	res := makeCLISmokeResult(cmd, cfg, result)

@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -755,5 +756,172 @@ func TestClaudeSmokeFailureLogLine_CarriesOnlyClosedValues(t *testing.T) {
 		default:
 			t.Errorf("unexpected token %q in the device log line: %q", field, line)
 		}
+	}
+}
+
+/* --------------------------------------------------------------------------
+   Quota guards: concurrency and cache admission
+   --------------------------------------------------------------------------
+   The cooldown alone only bounds SEQUENTIAL callers. Pub/Sub hands the agent
+   several outstanding messages at once, so these cases pin the two properties
+   that make "one inference turn per smoke" true under a real retry burst.
+   ------------------------------------------------------------------------ */
+
+// stubConcurrentSmokeExec is the race-safe sibling of stubSmokeExec: it counts
+// under a mutex and blocks the first caller on a gate so a burst is genuinely
+// in flight at the same moment rather than accidentally serialising.
+func stubConcurrentSmokeExec(t *testing.T, gate <-chan struct{}) func() int {
+	t.Helper()
+	var mu sync.Mutex
+	calls := 0
+	original := runClaudeSmokeCommand
+	runClaudeSmokeCommand = func(ctx context.Context, path string, args []string, env []string, prompt string) ([]byte, []byte, error) {
+		mu.Lock()
+		calls++
+		first := calls == 1
+		mu.Unlock()
+		if first && gate != nil {
+			<-gate
+		}
+		return successEnvelope(markerFromPrompt(prompt)), nil, nil
+	}
+	t.Cleanup(func() { runClaudeSmokeCommand = original })
+	return func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls
+	}
+}
+
+func TestRunCLISmoke_ConcurrentCallersShareOneInferenceTurn(t *testing.T) {
+	smokeEnv(t)
+	path := stubClaudeBinary(t)
+	stubAuthProbe(t, true, true)
+	stubSmokePath(t, path)
+	seedProbeVersion(t, path, "2.1.251 (Claude Code)")
+
+	// The leader parks inside the exec seam until every follower has had time
+	// to reach runCLISmoke, which is the exact interleaving the cooldown alone
+	// cannot survive: without the singleflight each of these observes the same
+	// cache miss and spends its own turn on the user's subscription window.
+	gate := make(chan struct{})
+	callCount := stubConcurrentSmokeExec(t, gate)
+
+	const callers = 8
+	results := make([]cliSmokeResult, callers)
+	replayed := make([]bool, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], replayed[i] = runCLISmoke(context.Background(), "claudeCode")
+		}(i)
+	}
+	// Let the burst pile up behind the leader before releasing it.
+	time.Sleep(50 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+
+	if got := callCount(); got != 1 {
+		t.Fatalf("%d concurrent smokes spent %d inference turns, want 1 — this is the user's own quota", callers, got)
+	}
+	spent := 0
+	for i, r := range results {
+		if r.Status != cliSmokeStatusSuccess {
+			t.Fatalf("caller %d got %+v, want the leader's success verdict", i, r)
+		}
+		if !replayed[i] {
+			spent++
+		}
+	}
+	if spent != 1 {
+		t.Fatalf("%d callers reported spending a turn, want exactly 1", spent)
+	}
+}
+
+func TestRunCLISmoke_FreePrecheckVerdictsAreNotPinnedByTheCooldown(t *testing.T) {
+	smokeEnv(t)
+	path := stubClaudeBinary(t)
+	stubSmokePath(t, path)
+	seedProbeVersion(t, path, "2.1.251 (Claude Code)")
+
+	authLoggedIn := false
+	original := claudeAuthStatusProbe
+	claudeAuthStatusProbe = func(string) (bool, bool) { return authLoggedIn, true }
+	t.Cleanup(func() { claudeAuthStatusProbe = original })
+
+	calls := stubSmokeExec(t, func(ctx context.Context, args []string, prompt string) ([]byte, []byte, error) {
+		return successEnvelope(markerFromPrompt(prompt)), nil, nil
+	})
+
+	// A logged-out device costs no turn, so pinning that verdict for the whole
+	// cooldown would buy no quota and only keep reporting a broken CLI.
+	result, _ := runCLISmoke(context.Background(), "claudeCode")
+	if result.ErrorCategory != cliUsageErrorNotAuthenticated || result.Diagnostic != cliSmokeDiagnosticNotLoggedIn {
+		t.Fatalf("logged-out smoke = %+v, want not_authenticated/not_logged_in", result)
+	}
+	if *calls != 0 {
+		t.Fatalf("logged-out pre-check spent %d turns, want 0", *calls)
+	}
+
+	// The user signs in seconds later. The very next smoke must see it.
+	authLoggedIn = true
+	result, replayed := runCLISmoke(context.Background(), "claudeCode")
+	if replayed || result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("after signing in, smoke = %+v (replayed=%v), want a fresh success", result, replayed)
+	}
+	if *calls != 1 {
+		t.Fatalf("post-login smoke made %d execs, want 1", *calls)
+	}
+}
+
+func TestRunCLISmoke_CachedSuccessIsNotReplayedAfterLogout(t *testing.T) {
+	smokeEnv(t)
+	path := stubClaudeBinary(t)
+	stubSmokePath(t, path)
+	seedProbeVersion(t, path, "2.1.251 (Claude Code)")
+
+	authLoggedIn := true
+	original := claudeAuthStatusProbe
+	claudeAuthStatusProbe = func(string) (bool, bool) { return authLoggedIn, true }
+	t.Cleanup(func() { claudeAuthStatusProbe = original })
+
+	calls := stubSmokeExec(t, func(ctx context.Context, args []string, prompt string) ([]byte, []byte, error) {
+		return successEnvelope(markerFromPrompt(prompt)), nil, nil
+	})
+
+	if result, replayed := runCLISmoke(context.Background(), "claudeCode"); replayed || result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("first smoke = %+v (replayed=%v), want a fresh success", result, replayed)
+	}
+
+	// Auth is NOT part of the binary stamp, so a logout inside the cooldown
+	// window would otherwise keep replaying "healthy" for a CLI that can no
+	// longer complete a turn.
+	authLoggedIn = false
+	result, replayed := runCLISmoke(context.Background(), "claudeCode")
+	if replayed {
+		t.Fatal("a logged-out CLI must not be answered from a cached success")
+	}
+	if result.ErrorCategory != cliUsageErrorNotAuthenticated {
+		t.Fatalf("post-logout smoke = %+v, want not_authenticated", result)
+	}
+	// Re-deciding it cost a pre-check, not a turn.
+	if *calls != 1 {
+		t.Fatalf("post-logout smoke spent %d turns total, want 1 (the pre-logout one)", *calls)
+	}
+
+	// An inconclusive probe (a working env-credential login looks exactly like
+	// this) must still replay, mirroring the "inconclusive proceeds" rule in
+	// the probe itself: refusing there would re-spend a turn on every poll.
+	claudeAuthStatusProbe = func(string) (bool, bool) { return false, false }
+	if result, replayed := runCLISmoke(context.Background(), "claudeCode"); replayed || result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("inconclusive auth = %+v (replayed=%v), want a fresh success to seed the cooldown", result, replayed)
+	}
+	if result, replayed := runCLISmoke(context.Background(), "claudeCode"); !replayed || result.Status != cliSmokeStatusSuccess {
+		t.Fatalf("inconclusive auth = %+v (replayed=%v), want the cached verdict replayed", result, replayed)
+	}
+	if *calls != 2 {
+		t.Fatalf("inconclusive-auth replay spent %d turns total, want 2", *calls)
 	}
 }

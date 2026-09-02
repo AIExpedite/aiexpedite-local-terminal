@@ -18,10 +18,18 @@
 //   - `--version` and `auth status --json` pre-checks short-circuit to
 //     provider_unavailable / not_authenticated BEFORE a turn is spent.
 //   - A per-CLI cooldown serves the previous verdict to any caller that asks
-//     again too soon, so a retry storm cannot drain the user's quota.
+//     again too soon, so a sequential retry storm cannot drain the user's quota.
+//   - A per-CLI singleflight collapses CONCURRENT callers onto one run. The
+//     cooldown cannot do that on its own: Pub/Sub delivers several outstanding
+//     messages at a time, so a burst would otherwise have every callback miss
+//     the same empty cache and spend its own turn.
 //   - The cooldown is INVALIDATED by a binary change (path/mtime/size/version),
 //     because that is exactly the post-upgrade smoke the harness must not be
-//     served a stale pre-upgrade answer for.
+//     served a stale pre-upgrade answer for — and by a logout, which changes
+//     the answer without changing the binary.
+//   - Only verdicts that actually SPENT a turn are cached. A free pre-check
+//     verdict (no binary, not logged in) buys no quota by being pinned and
+//     would keep reporting a broken CLI for 15 minutes after the user fixed it.
 //
 // Retention discipline — the child's stdout and stderr are read to derive a
 // verdict and are then DISCARDED. They are not published, and they are not
@@ -49,6 +57,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -280,8 +290,19 @@ var (
 // sync.Once-cached real install.
 var resolveClaudeSmokePath = func() string { return resolveExecutable("claude") }
 
+// cliSmokeGroup collapses concurrent smokes for the same CLI into ONE
+// execution. The cooldown alone cannot do that: Pub/Sub delivers several
+// outstanding messages in parallel, so a retry burst could have every callback
+// observe the same cache miss and independently spawn a quota-spending probe —
+// N inference turns against the user's own subscription window despite a
+// cooldown that promises one. Followers block on the leader and are handed its
+// verdict. Same singleflight the token refresh in auth.go uses.
+var cliSmokeGroup singleflight.Group
+
 // runCLISmoke is the entry point the `__cli_smoke__` handler calls. It resolves
-// the CLI, applies the cooldown, and returns (result, servedFromCooldown).
+// the CLI, applies the cooldown, and returns (result, servedWithoutSpendingATurn)
+// — true both for a cooldown replay and for a caller that shared a concurrent
+// leader's run.
 //
 // An unrecognised cliId returns provider_unavailable WITHOUT spawning anything
 // — it must never fall through to a generic execute.
@@ -302,19 +323,90 @@ func runCLISmoke(ctx context.Context, cliID string) (cliSmokeResult, bool) {
 	}
 	stamp := claudeBinaryStamp(path, version)
 
+	// `executed` is written only by the closure below, and singleflight runs
+	// that closure synchronously in the LEADER's own goroutine — a follower's
+	// closure never runs, so its copy stays false. That makes "did this call
+	// spend a turn?" answerable without racing, which singleflight's own
+	// `shared` flag cannot do (it reports true for the leader too whenever
+	// anyone waited on it).
+	executed := false
+	// The cooldown lookup lives INSIDE the group so a burst collapses onto one
+	// lookup — including its auth re-check, which spawns a child of its own.
+	v, _, _ := cliSmokeGroup.Do(cliID, func() (any, error) {
+		if replay, ok := replayableCLISmokeVerdict(cliID, stamp, path); ok {
+			return replay, nil
+		}
+		executed = true
+		result := runClaudeCodeSmoke(ctx, path, version)
+		rememberCLISmokeVerdict(cliID, stamp, result)
+		return result, nil
+	})
+	result, _ := v.(cliSmokeResult)
+	return result, !executed
+}
+
+// replayableCLISmokeVerdict reports the cached verdict when it may still stand
+// in for a fresh probe.
+//
+// Beyond the binary stamp and the cooldown window it re-runs the auth
+// pre-check, because AUTHENTICATION IS NOT PART OF THE STAMP and changes
+// without the binary changing: replaying a cached success for a CLI the user
+// has since logged out of would report a healthy CLI that cannot complete a
+// turn. The probe is a local, non-quota child bounded by machineInfoProbeTimeout
+// (the same one runClaudeCodeSmoke uses), and an INCONCLUSIVE answer replays —
+// mirroring the "inconclusive proceeds" rule in the probe itself, since that is
+// what a working env-credential login looks like.
+//
+// The opposite direction — a user who logs IN after a failure — needs no check
+// here: a not_authenticated verdict is never cached at all (see
+// cliSmokeVerdictSpentTurn).
+func replayableCLISmokeVerdict(cliID, stamp, path string) (cliSmokeResult, bool) {
 	cliSmokeCooldownMu.Lock()
 	entry, seen := cliSmokeCooldownCache[cliID]
 	cliSmokeCooldownMu.Unlock()
-	if seen && entry.Stamp == stamp && time.Since(entry.At) < cliSmokeCooldown {
-		return entry.Result, true
+	if !seen || entry.Stamp != stamp || time.Since(entry.At) >= cliSmokeCooldown {
+		return cliSmokeResult{}, false
 	}
+	if loggedIn, known := claudeAuthStatusProbe(path); known && !loggedIn {
+		// Drop it rather than keep re-probing: the caller falls through to a
+		// real run, whose own pre-check returns not_authenticated for free.
+		cliSmokeCooldownMu.Lock()
+		delete(cliSmokeCooldownCache, cliID)
+		cliSmokeCooldownMu.Unlock()
+		return cliSmokeResult{}, false
+	}
+	return entry.Result, true
+}
 
-	result := runClaudeCodeSmoke(ctx, path, version)
-
+// rememberCLISmokeVerdict stores a verdict for replay — but only one that
+// actually cost the user an inference turn. See cliSmokeVerdictSpentTurn.
+func rememberCLISmokeVerdict(cliID, stamp string, result cliSmokeResult) {
+	if !cliSmokeVerdictSpentTurn(result) {
+		return
+	}
 	cliSmokeCooldownMu.Lock()
 	cliSmokeCooldownCache[cliID] = cliSmokeCooldownEntry{At: time.Now(), Stamp: stamp, Result: result}
 	cliSmokeCooldownMu.Unlock()
-	return result, false
+}
+
+// cliSmokeVerdictSpentTurn reports whether a verdict was reached by actually
+// running the CLI, as opposed to being decided by a pre-check that returned
+// before the ladder spawned anything.
+//
+// The cooldown exists to protect the user's inference quota, so it should hold
+// exactly the verdicts that consumed some. Caching a free pre-check verdict
+// buys no quota and costs recovery time: a `not_logged_in` result pinned for 15
+// minutes keeps reporting a broken CLI for a user who signed in ten seconds
+// after the probe, and a transient `internal` (marker RNG) failure would stick
+// just as long.
+func cliSmokeVerdictSpentTurn(result cliSmokeResult) bool {
+	switch result.Diagnostic {
+	case cliSmokeDiagnosticBinaryMissing,
+		cliSmokeDiagnosticNotLoggedIn,
+		cliSmokeDiagnosticInternal:
+		return false
+	}
+	return true
 }
 
 /* --------------------------------------------------------------------------
