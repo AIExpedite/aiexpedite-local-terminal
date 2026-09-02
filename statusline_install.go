@@ -8,13 +8,17 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 )
 
 // findGitBash mirrors how Claude Code decides the Windows status-line shell:
@@ -297,17 +301,48 @@ func isOurStatusLineCommand(command string) bool {
 		(strings.HasPrefix(prefix, `'`) && strings.HasSuffix(prefix, `'`))
 }
 
-// loadPrevStatusLine returns the full original statusLine object we stashed.
+// loadPrevStatusLine returns the full original statusLine object we stashed at
+// the path THIS boot resolves.
 func loadPrevStatusLine() (json.RawMessage, bool) {
-	b, err := os.ReadFile(prevStatusLinePath())
+	return loadPrevStatusLineAt(prevStatusLinePath())
+}
+
+// loadPrevStatusLineAt is loadPrevStatusLine against an explicit path, so a
+// caller holding the path an installed command PINNED can read that stash
+// without re-implementing the decode. A stash file that is absent, unreadable,
+// malformed or empty is reported as "no stash" rather than as an error: every
+// caller's fallback is the same, and a half-decoded object must never be
+// restored into settings.json.
+func loadPrevStatusLineAt(path string) (json.RawMessage, bool) {
+	raw, ok, _ := loadPrevStatusLineAtChecked(path)
+	return raw, ok
+}
+
+// loadPrevStatusLineAtChecked is loadPrevStatusLineAt for the one caller that
+// must tell "there is no stash here" apart from "this stash could not be read":
+// opt-out treats a distinct PINNED path as the sole authority, so a miss there
+// decides whether settings.json loses statusLine entirely. Absent, malformed or
+// empty is a real answer — there is nothing restorable — and is reported as
+// (nil, false, nil). A read error that is not IsNotExist is NOT an answer: the
+// file may hold the user's chained command, so it surfaces as an error and the
+// caller leaves settings.json alone, the same rule migratePrevStatusLine
+// applies to an unverifiable destination stash.
+func loadPrevStatusLineAtChecked(path string) (json.RawMessage, bool, error) {
+	if path == "" {
+		return nil, false, nil
+	}
+	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, false
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
 	}
 	var p prevStatusLine
 	if json.Unmarshal(b, &p) != nil || len(p.StatusLine) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
-	return p.StatusLine, true
+	return p.StatusLine, true, nil
 }
 
 // loadPrevStatusLineCommand extracts just the command from the stashed object
@@ -334,7 +369,9 @@ func savePrevStatusLine(raw json.RawMessage) error {
 	if err := os.MkdirAll(filepath.Dir(prevStatusLinePath()), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(prevStatusLinePath(), b, 0o600)
+	// Through the shared writer: re-stashing over an existing file must not
+	// inherit that file's mode, for the reason documented on the helper.
+	return writePrevStatusLineBytes(prevStatusLinePath(), b)
 }
 
 // copyPrevStatusLine copies the stash file across filesystems with the same
@@ -348,7 +385,144 @@ func copyPrevStatusLine(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(dst, b, 0o600)
+	return writePrevStatusLineBytes(dst, b)
+}
+
+// writePrevStatusLineBytes is the single writer for the stash, so the owner-only
+// mode above cannot drift between the callers that produce one.
+//
+// It stages through os.CreateTemp rather than writing dst directly because
+// os.WriteFile applies its mode only when it CREATES the file: over an existing
+// dst it truncates and keeps whatever mode that file already carries. A leftover
+// stash at the destination of a migration (or a stash a previous run wrote under
+// a laxer regime) could therefore stay group/world-readable while this helper
+// reports success, exposing the chained command — which can carry inline env
+// vars / tokens — to other local users. os.CreateTemp always creates 0o600, and
+// the rename carries that mode onto dst, so the contract holds for a fresh
+// destination and a pre-existing one alike. Same temp-plus-rename shape as
+// writeSettingsAtomic, which also makes the replacement atomic.
+func writePrevStatusLineBytes(dst string, b []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(dst), ".statusline-prev-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// ensurePrevStatusLinePrivate narrows an EXISTING stash to owner-only, for the
+// one migration outcome that keeps a file writePrevStatusLineBytes did not
+// create. A chmod rather than a rewrite: the bytes are already correct, and
+// replacing them would churn a file whose mtime other checks read.
+//
+// Windows is skipped deliberately — the mode Stat reports there is synthesized
+// from the read-only attribute rather than a real ACL, so 0o644 is what every
+// writable file looks like and a chmod would be a no-op that only risks
+// toggling that attribute. Confidentiality on Windows comes from the per-user
+// profile ACL on the config dir.
+func ensurePrevStatusLinePrivate(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if st.Mode().Perm()&0o077 == 0 {
+		return nil
+	}
+	return os.Chmod(path, 0o600)
+}
+
+// migratePrevStatusLine COPIES the pinned status-line stash from the path an
+// earlier install baked into the command to the path this boot resolves (e.g.
+// GetConfigDir() landed somewhere else). It must run BEFORE the refreshed
+// command is written: the new command pins newPrev, so a stash left behind at
+// oldPrev would be invisible to both the hook's chain lookup and opt-out.
+//
+// It returns the old path for the caller to delete ONCE the settings write has
+// committed — never deleting it here. Between this call and that write the stash
+// has to satisfy BOTH commands: settings.json still holds the previously
+// installed one, pinned to oldPrev, and it keeps resolving for as long as the
+// write can still fail (a sharing violation on Windows, a permission error, a
+// full disk). Moving the file would leave that live command chaining to a path
+// nothing occupies — the user's third-party status line silently gone while the
+// refresh reports an error. Copying leaves both paths valid, and the duplicate
+// costs one small JSON file until the caller retires oldPrev.
+//
+// The stash at oldPrev is the AUTHORITY whenever it exists, including when
+// newPrev is already occupied. oldPrev is the path the command settings.json
+// currently holds is pinned to, so it is the chain target Claude resolves right
+// now; anything sitting at newPrev is a leftover from an earlier cycle under
+// that config dir (a migration whose settings write failed, a stash written
+// before the dir last moved, or a truncated file from a crashed write). Retiring
+// oldPrev because the destination merely EXISTS would hand the refreshed command
+// that leftover — the hook would chain to a status line the user has since
+// replaced, and opt-out would restore the wrong object or none at all. So the
+// destination is compared and replaced unless it already matches byte for byte.
+//
+// "Nothing to migrate" is not a failure — an unset/unchanged oldPrev or an
+// absent oldPrev return an empty path and nil. Every other outcome IS a failure
+// and is returned, because silently continuing is what loses the user's
+// third-party status line.
+func migratePrevStatusLine(oldPrev, newPrev string) (staleCopy string, err error) {
+	if oldPrev == "" || oldPrev == newPrev {
+		return "", nil
+	}
+	src, err := os.ReadFile(oldPrev)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil // no stash to carry over; the chain target never existed
+		}
+		return "", err
+	}
+	switch dst, dstErr := os.ReadFile(newPrev); {
+	case dstErr == nil && bytes.Equal(dst, src):
+		// Already migrated, so there is nothing to WRITE — but matching bytes say
+		// nothing about the MODE those bytes sit under. A stash an older build
+		// (or a laxer umask) left at newPrev keeps its own permissions, and this
+		// branch is the one path to a committed migration that never goes
+		// through writePrevStatusLineBytes. Returning straight from here would
+		// retire the owner-only copy at oldPrev and leave the chained command —
+		// which can carry inline env vars / tokens — group/world-readable.
+		// Narrow it in place rather than rewriting identical bytes.
+		if err := ensurePrevStatusLinePrivate(newPrev); err != nil {
+			return "", err
+		}
+		// oldPrev is still a duplicate the committed command will no longer
+		// name, so it is retired on the same terms as one we just wrote: after
+		// the write, not before it.
+		return oldPrev, nil
+	case dstErr != nil && !os.IsNotExist(dstErr):
+		// Can't tell what the new stash holds — proceeding would pin the command
+		// to a path we were unable to verify.
+		return "", dstErr
+	}
+	if err := os.MkdirAll(filepath.Dir(newPrev), 0o755); err != nil {
+		return "", err
+	}
+	// A private-mode copy, and NOT the binary `copyFile` helper: that one chmods
+	// to 0o755, which would leave the stash world-readable on Unix and expose the
+	// previously chained command (potentially including inline env vars / tokens)
+	// to other local users. Copying also crosses filesystems, which os.Rename
+	// cannot (EXDEV) when e.g. XDG_CONFIG_HOME moved to a mounted drive.
+	if err := writePrevStatusLineBytes(newPrev, src); err != nil {
+		return "", err
+	}
+	return oldPrev, nil
 }
 
 // ensureClaudeStatusLineHook installs (or refreshes) the status-line hook in
@@ -405,6 +579,10 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 		return false, nil // already installed, exact match
 	}
 
+	// staleStash is the pre-migration copy of the pinned stash, retired only
+	// after settings.json commits — see migratePrevStatusLine.
+	staleStash := ""
+
 	// A different command that isn't one of ours is a real user/third-party
 	// status line — stash the FULL object so the hook can chain to its command
 	// AND opt-out can restore its other options. (A command that IS ours but
@@ -426,31 +604,20 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 		// only at the old one, silently dropping the chain target.
 		oldPrev := extractInstalledPinnedPath(existing.Command, "STATUSLINE_PREV")
 		newPrev := prevStatusLinePath()
-		if oldPrev != "" && oldPrev != newPrev {
-			if _, err := os.Stat(newPrev); os.IsNotExist(err) {
-				if _, err := os.Stat(oldPrev); err == nil {
-					if mkErr := os.MkdirAll(filepath.Dir(newPrev), 0o755); mkErr == nil {
-						// os.Rename returns EXDEV when oldPrev and newPrev sit on
-						// different filesystems (e.g. XDG_CONFIG_HOME moved from
-						// the home disk to a mounted drive). Ignoring it would
-						// leave the stash at oldPrev while the hook + opt-out
-						// look at newPrev, silently dropping the chained
-						// third-party command. Fall back to a private-mode
-						// copy-and-remove so the migration still happens
-						// across volumes — do NOT use the binary `copyFile`
-						// helper here: it chmods to 0o755, which would leave
-						// the stash world-readable on Unix and expose the
-						// previously chained command (potentially including
-						// inline env vars / tokens) to other local users.
-						if err := os.Rename(oldPrev, newPrev); err != nil {
-							if copyErr := copyPrevStatusLine(oldPrev, newPrev); copyErr == nil {
-								_ = os.Remove(oldPrev)
-							}
-						}
-					}
-				}
-			}
+		migrated, err := migratePrevStatusLine(oldPrev, newPrev)
+		if err != nil {
+			// Abort for the same reason the savePrevStatusLine branch above
+			// does: writing the refreshed command would pin the hook (and
+			// opt-out) to newPrev while the user's chained third-party status
+			// line is still stashed only at oldPrev, so the chain target is
+			// silently dropped. Returning here leaves settings.json untouched,
+			// so the previously installed command — which is still pinned to
+			// oldPrev, where the stash actually is — keeps resolving.
+			return false, err
 		}
+		// Retire the old copy only after the settings write below commits: until
+		// then the installed command still names oldPrev.
+		staleStash = migrated
 	} else if existing.Command == "" {
 		// Installing over an empty/absent statusLine: there's no third-party
 		// command to chain to, but a stale `claude_statusline_prev.json` from an
@@ -486,7 +653,198 @@ func ensureClaudeStatusLineHook(home string) (bool, error) {
 	if err := writeSettingsAtomic(settingsPath, out); err != nil {
 		return false, err
 	}
+	// The refreshed command is committed and names newPrev, so the pre-migration
+	// copy is finally unreachable. A failed cleanup is cosmetic — the stash the
+	// installed command resolves is already in place.
+	if staleStash != "" {
+		_ = os.Remove(staleStash)
+	}
 	return true, nil
+}
+
+// claudeStatusLineRecheckInterval is the process-level floor between two
+// stale-settings reconciles. A burst of session starts must not storm Claude's
+// settings.json with a Stat per start.
+const claudeStatusLineRecheckInterval = 60 * time.Second
+
+// claudeStatusLineReconcile remembers what settings.json looked like the last
+// time we verified the hook, so an unchanged file short-circuits before any
+// parse or write. Guarded by its own mutex: session starts are concurrent.
+var claudeStatusLineReconcile struct {
+	mu sync.Mutex
+	// armed is false until SetClaudeStatusLineHookDisabled has been called, so
+	// the run-start reconcile is opt-IN per process. StartAgent arms it from the
+	// config; every other entry point (one-shot CLI verbs, the statusline-hook
+	// subcommand itself) therefore never rewrites Claude's settings.json as a
+	// side effect of starting a session.
+	armed  bool
+	optOut bool
+	// running single-flights the reconcile. ClaudeNativeManager.Start runs it
+	// OUTSIDE its manager mutex (deliberately — it must not hold that lock over
+	// disk I/O) and SessionManager.StartSession runs it under a different lock
+	// entirely, so two concurrent Claude starts would otherwise both pass the
+	// throttle and both drive ensureClaudeStatusLineHook's read-modify-write of
+	// the user's settings.json at once: one write is lost, and the loser can
+	// stash the winner's in-flight statusLine as the "previous third-party" one.
+	running   bool
+	lastCheck time.Time
+	// seen is false until a reconcile has recorded a settings.json stamp; the
+	// first call therefore always verifies rather than trusting a zero value.
+	seen  bool
+	mtime time.Time
+	size  int64
+}
+
+// SetClaudeStatusLineHookDisabled applies the `disable_claude_status_line_hook`
+// opt-out to the run-start reconcile AND arms it for this process. StartAgent
+// already installs/removes the hook per that flag at boot; this keeps the
+// per-run repair from reinstalling what the user just opted out of.
+func SetClaudeStatusLineHookDisabled(disabled bool) {
+	claudeStatusLineReconcile.mu.Lock()
+	claudeStatusLineReconcile.armed = true
+	claudeStatusLineReconcile.optOut = disabled
+	claudeStatusLineReconcile.mu.Unlock()
+}
+
+// resetClaudeStatusLineReconcile clears the throttle + recorded stamp.
+// Test-only seam, mirroring resetOpenCodeReadinessCache.
+func resetClaudeStatusLineReconcile() {
+	claudeStatusLineReconcile.mu.Lock()
+	claudeStatusLineReconcile.armed = false
+	claudeStatusLineReconcile.optOut = false
+	claudeStatusLineReconcile.running = false
+	claudeStatusLineReconcile.lastCheck = time.Time{}
+	claudeStatusLineReconcile.seen = false
+	claudeStatusLineReconcile.mtime = time.Time{}
+	claudeStatusLineReconcile.size = 0
+	claudeStatusLineReconcile.mu.Unlock()
+}
+
+// ensureClaudeStatusLineHookIfStale re-verifies the installed hook when Claude's
+// settings.json has changed since we last looked, and repairs it if a Claude
+// Code update (or anything else) replaced our `statusLine`.
+//
+// Why a run-start reconcile exists at all: ensureClaudeStatusLineHook runs ONCE,
+// from StartAgent. Claude Code rewrites settings.json on update, and when that
+// drops our statusLine the numeric side-channel silently stops writing — with no
+// symptom until someone notices the card frozen — until the agent restarts.
+//
+// Cost is one Stat in the common case: the mtime + size recorded at the last
+// verify are compared first, and a process-level interval bounds how often even
+// that runs. The actual write is delegated to ensureClaudeStatusLineHook
+// unchanged, so chaining, third-party stashing, pinned-path migration and
+// opt-out semantics are exactly the boot-time ones.
+//
+// Best-effort: every failure is returned for logging but is never fatal to a run.
+func ensureClaudeStatusLineHookIfStale(home string) (bool, error) {
+	// Claim the slot ATOMICALLY with the gate check. Reading the throttle, then
+	// stamping it after the Stat, would let two concurrent starts both observe an
+	// un-throttled state and both proceed — which is exactly the storm the
+	// interval exists to prevent, and a concurrent write to a user file besides.
+	claudeStatusLineReconcile.mu.Lock()
+	skip := !claudeStatusLineReconcile.armed ||
+		claudeStatusLineReconcile.optOut ||
+		claudeStatusLineReconcile.running ||
+		(!claudeStatusLineReconcile.lastCheck.IsZero() &&
+			time.Since(claudeStatusLineReconcile.lastCheck) < claudeStatusLineRecheckInterval)
+	seen := claudeStatusLineReconcile.seen
+	prevMtime := claudeStatusLineReconcile.mtime
+	prevSize := claudeStatusLineReconcile.size
+	if !skip {
+		claudeStatusLineReconcile.running = true
+		claudeStatusLineReconcile.lastCheck = time.Now()
+	}
+	claudeStatusLineReconcile.mu.Unlock()
+
+	if skip {
+		return false, nil
+	}
+	defer func() {
+		claudeStatusLineReconcile.mu.Lock()
+		claudeStatusLineReconcile.running = false
+		claudeStatusLineReconcile.mu.Unlock()
+	}()
+
+	base := claudeConfigDir(home)
+	if base == "" {
+		return false, nil
+	}
+	settingsPath := filepath.Join(base, "settings.json")
+	st, statErr := os.Stat(settingsPath)
+
+	// An absent settings.json is still worth one ensure pass — that is the shape
+	// a fresh Claude install (or an update that reset the file) presents, and
+	// ensureClaudeStatusLineHook itself declines when Claude isn't present.
+	if statErr == nil && seen && st.ModTime().Equal(prevMtime) && st.Size() == prevSize {
+		return false, nil
+	}
+
+	changed, err := ensureClaudeStatusLineHook(home)
+	if err != nil {
+		// Don't record a stamp for a file we failed to reconcile: the next start
+		// (after the throttle) must try again rather than treat the bad state as
+		// verified.
+		return false, err
+	}
+	// Re-Stat AFTER the write so the recorded stamp describes the file as it now
+	// stands — otherwise our own write would look like a foreign change and every
+	// subsequent reconcile would rewrite settings.json.
+	if st, err := os.Stat(settingsPath); err == nil {
+		claudeStatusLineReconcile.mu.Lock()
+		claudeStatusLineReconcile.seen = true
+		claudeStatusLineReconcile.mtime = st.ModTime()
+		claudeStatusLineReconcile.size = st.Size()
+		claudeStatusLineReconcile.mu.Unlock()
+	}
+	return changed, nil
+}
+
+// claudeStatusLineReconcileWait bounds how long a run start will wait on the
+// reconcile above. The check is one Stat in the common case, but Claude's config
+// directory is user-pointed (CLAUDE_CONFIG_DIR) and can sit on a slow or
+// unreachable network filesystem, where os.Stat/ReadFile/WriteFile honour no
+// deadline of ours — the caller would block for the OS mount timeout. Starting a
+// run must never pay that: this is a best-effort repair for the NEXT interactive
+// render, not a precondition for the run about to launch.
+const claudeStatusLineReconcileWait = 1500 * time.Millisecond
+
+// reconcileClaudeStatusLineHookBounded runs ensureClaudeStatusLineHookIfStale on
+// its own goroutine and waits at most claudeStatusLineReconcileWait for it,
+// logging the outcome under the caller's label.
+//
+// On timeout the reconcile is LEFT RUNNING — abandoning it is what keeps the
+// start unblocked — and that is bounded too: the gate's single-flight `running`
+// latch means a wedged filesystem parks exactly ONE goroutine, and every later
+// start short-circuits on that same latch. The degraded state is "no reconcile
+// until the filesystem answers", never a goroutine or settings.json storm.
+//
+// Callers must invoke this OUTSIDE any lock other operations need. A stalled
+// best-effort repair that holds a manager mutex stops being best-effort: it
+// blocks every unrelated session operation with it.
+func reconcileClaudeStatusLineHookBounded(label string) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		changed, err := ensureClaudeStatusLineHookIfStale(home)
+		switch {
+		case err != nil:
+			fmt.Printf("%s[%s] Could not reconcile Claude status-line hook: %v%s\n",
+				colorYellow, label, err, colorReset)
+		case changed:
+			fmt.Printf("%s[%s] Repaired Claude status-line hook after a settings.json change%s\n",
+				colorGreen, label, colorReset)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(claudeStatusLineReconcileWait):
+		fmt.Printf("%s[%s] Claude status-line hook reconcile is slow; continuing without it%s\n",
+			colorYellow, label, colorReset)
+	}
 }
 
 // removeClaudeStatusLineHook reverses ensureClaudeStatusLineHook so the opt-out
@@ -528,23 +886,42 @@ func removeClaudeStatusLineHook(home string) (bool, error) {
 		return false, nil
 	}
 
-	prev, ok := loadPrevStatusLine()
-	pinnedPrev := ""
-	if !ok {
-		// Fall back to the path the installed command itself pinned. The data
-		// dir may have moved since install (e.g. XDG_CONFIG_HOME changed), so
-		// the current prevStatusLinePath() resolves to a different file than
-		// the one we wrote at install time — but the stash is still sitting at
-		// the old pinned path. Without this fallback we'd delete statusLine
-		// and lose the user's original chained command.
-		if pinned := extractInstalledPinnedPath(existing.Command, "STATUSLINE_PREV"); pinned != "" && pinned != prevStatusLinePath() {
-			if b, err := os.ReadFile(pinned); err == nil {
-				var p prevStatusLine
-				if json.Unmarshal(b, &p) == nil && len(p.StatusLine) > 0 {
-					prev, ok, pinnedPrev = p.StatusLine, true, pinned
-				}
-			}
+	// The stash the INSTALLED command pins is the AUTHORITY whenever it differs
+	// from the path this boot resolves — the same rule migratePrevStatusLine
+	// applies, and for the same reason: the pinned path is the chain target the
+	// command in settings.json resolves right now, while anything at the current
+	// prevStatusLinePath() is a leftover from an earlier cycle under this config
+	// dir (a migration whose settings write failed, a stash written before the
+	// data dir last moved). Reading the current path FIRST would restore that
+	// leftover — a third-party status line the user has since replaced — delete
+	// it, and strand the live stash at the pinned path with nothing left naming
+	// it. The paths differ only when the data dir moved since install (e.g.
+	// XDG_CONFIG_HOME changed), so the common case still reads one file.
+	//
+	// Authority is EXCLUSIVE, not just preferred: once a distinct pinned path
+	// exists, a miss there means "the chain target this command names holds
+	// nothing restorable", never "consult the other file". Falling back would
+	// restore exactly the leftover the paragraph above rejects — and it would do
+	// so in the case where it is most likely to be wrong, since the pinned stash
+	// being gone is what a completed earlier opt-out looks like.
+	prev, ok, pinnedPrev := json.RawMessage(nil), false, ""
+	pinned := extractInstalledPinnedPath(existing.Command, "STATUSLINE_PREV")
+	if pinned != "" && pinned != prevStatusLinePath() {
+		raw, found, err := loadPrevStatusLineAtChecked(pinned)
+		if err != nil {
+			// Unreadable is not "absent": the file may still hold the user's
+			// chained command, and dropping statusLine here would destroy it with
+			// no copy left. Abort so the caller can warn and the next opt-out can
+			// retry.
+			return false, err
 		}
+		if found {
+			// Recorded so the retire below drops BOTH copies: opt-out consumes the
+			// stash, and one left behind is what a later re-enable would resurrect.
+			prev, ok, pinnedPrev = raw, true, pinned
+		}
+	} else {
+		prev, ok = loadPrevStatusLine()
 	}
 	if ok {
 		// Restore the user's full original statusLine object verbatim —
@@ -571,6 +948,13 @@ func removeClaudeStatusLineHook(home string) (bool, error) {
 	return true, nil
 }
 
+// statusLineWriteFile is os.WriteFile behind a seam, so a test can fail the
+// settings commit the way a Windows sharing violation or a locked config dir
+// does. That is the failure the stash migration has to survive with the user's
+// chained status line intact, and it is not reproducible on demand through the
+// filesystem on every OS the agent ships to.
+var statusLineWriteFile = os.WriteFile
+
 // writeSettingsAtomic writes settings.json via a temp file + rename so a crash
 // mid-write can't leave Claude with a half-written config.
 func writeSettingsAtomic(settingsPath string, out []byte) error {
@@ -578,7 +962,7 @@ func writeSettingsAtomic(settingsPath string, out []byte) error {
 		return err
 	}
 	tmp := settingsPath + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+	if err := statusLineWriteFile(tmp, out, 0o600); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, settingsPath); err != nil {

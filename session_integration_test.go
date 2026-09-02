@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +36,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -290,6 +292,55 @@ func runMockCLI(mode string) {
 		fmt.Printf(`{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","utilization":1.0,"resets_at":%d}}`+"\n", reset)
 		// Stay alive so End() drives the teardown, matching the real CLI's
 		// behavior of holding stdin open across turns.
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		os.Exit(0)
+
+	case "claude-heartbeat-result":
+		// The shape that froze the utilization card: a usage-less "allowed"
+		// heartbeat (which mergeClaudeRateLimitCache deliberately refuses to treat
+		// as a fresh observation) followed by a normal terminal `result` frame.
+		// Nothing numeric reaches the cache, so only the utilization probe can
+		// advance latestObservedAt. Used by the direct- and managed-run freshness
+		// tests.
+		reset := time.Now().Add(3 * time.Hour).Unix()
+		fmt.Printf(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","resets_at":%d}}`+"\n", reset)
+		fmt.Println(`{"type":"result","subtype":"success","result":"done"}`)
+		os.Exit(0)
+
+	case "claude-heartbeat-result-linger":
+		// The same settled turn, but the child lingers briefly before exiting so
+		// the result frame's probe is reliably ALREADY in flight when the exit
+		// path runs. That ordering is what the trailing-debt regression turns on:
+		// an exit trigger firing after the in-flight probe sampled its baseline
+		// records a NEWER debt that the probe's settleOwed cannot clear.
+		reset := time.Now().Add(3 * time.Hour).Unix()
+		fmt.Printf(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","resets_at":%d}}`+"\n", reset)
+		fmt.Println(`{"type":"result","subtype":"success","result":"done"}`)
+		time.Sleep(500 * time.Millisecond)
+		os.Exit(0)
+
+	case "claude-result-stderr-trailer":
+		// A settled turn whose LAST delivered line is a stderr diagnostic. The
+		// merged `lines` channel imposes no ordering between the two scanner
+		// goroutines, so a stderr write — even one produced before the result —
+		// can arrive after it. Nothing about that reopens the turn, and treating
+		// it as new output makes waitForExit record a second post-run debt for a
+		// turn the result branch already reported.
+		reset := time.Now().Add(3 * time.Hour).Unix()
+		fmt.Printf(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","resets_at":%d}}`+"\n", reset)
+		fmt.Println(`{"type":"result","subtype":"success","result":"done"}`)
+		_ = os.Stdout.Sync()
+		time.Sleep(150 * time.Millisecond)
+		fmt.Fprintln(os.Stderr, "[mock-claude] post-result diagnostic")
+		time.Sleep(500 * time.Millisecond)
+		os.Exit(0)
+
+	case "claude-heartbeat-hang":
+		// Same heartbeat, but no terminal frame — the run is killed or times out
+		// mid-turn. It still consumed quota, so the session-end path must make its
+		// own probe attempt.
+		reset := time.Now().Add(3 * time.Hour).Unix()
+		fmt.Printf(`{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rate_limit_type":"five_hour","resets_at":%d}}`+"\n", reset)
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		os.Exit(0)
 
@@ -1299,3 +1350,222 @@ func concatStreamOutput(messages []resultMsg) string {
 // quietExec is used to silence go vet when an exec.Command result is unused
 // in test setup paths.
 var _ = exec.Command
+
+/* -------------------------------------------------------------------------- */
+/* Terminal-managed run: utilization freshness                                */
+/* -------------------------------------------------------------------------- */
+
+// startManagedClaudeSession drives a real SessionManager against the mock
+// `claude` binary in the given mode and returns the manager + session id.
+func startManagedClaudeSession(t *testing.T, mode string) (*SessionManager, string) {
+	t.Helper()
+	tmpDir := installMockClaude(t, mode)
+
+	sm := NewSessionManager(nil)
+	id := fmt.Sprintf("claude-managed-%d", time.Now().UnixNano())
+	var startErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		startErr = sm.StartSession(id, "claude", []string{"hello"}, tmpDir, "ws", "uid", 30000, false, func(resultMsg) {})
+		if startErr == nil || !strings.Contains(startErr.Error(), "text file busy") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if startErr != nil {
+		t.Fatalf("StartSession: %v", startErr)
+	}
+	return sm, id
+}
+
+// Terminal-managed run: session start → heartbeat lines → terminal `result`
+// frame → the probe fires → latestObservedAt advances. Mirrors the direct-run
+// assertion; both execution paths must unstick the card, not just the one.
+func TestManagedClaudeSession_TerminalResultAdvancesUtilization(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":58,"resets_at":%d,"status":"allowed"}}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	seeded := seedStaleClaudeObservation(t, cache)
+	// A managed run has TWO trigger points — the terminal `result` frame and the
+	// session-end sweep — and collapsing them into one request is the minimum
+	// interval's job. armClaudeUsageProbe zeroes that interval so the throttle
+	// stays out of the way of the other tests, which would leave this assertion
+	// depending on whether the two probes happened to overlap enough for the
+	// single-flight latch to catch the second. Restore a production-shaped
+	// interval so the mechanism under test is actually the one running.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	sm, id := startManagedClaudeSession(t, "claude-heartbeat-result")
+	t.Cleanup(func() { _ = sm.EndSession(id) })
+
+	waitForClaudeObservationAfter(t, cache, seeded)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want exactly 1 for a single managed run", got)
+	}
+}
+
+// A killed / timed-out run consumed quota just as a completed one did, and it
+// never emits a terminal `result` frame — so the session-end path must make its
+// own attempt or those runs stay permanently stale.
+func TestManagedClaudeSession_KilledRunStillProbesOnSessionEnd(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, _ := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":66,"resets_at":%d,"status":"allowed"}}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	seeded := seedStaleClaudeObservation(t, cache)
+
+	sm, id := startManagedClaudeSession(t, "claude-heartbeat-hang")
+	// Give the heartbeat time to land, then kill the run mid-turn.
+	time.Sleep(200 * time.Millisecond)
+	if err := sm.EndSession(id); err != nil {
+		t.Fatalf("EndSession: %v", err)
+	}
+
+	waitForClaudeObservationAfter(t, cache, seeded)
+}
+
+// Acceptance criterion against the shared-cache dedupe, on the DIRECT path.
+// A status-line render moments before the run leaves a recent observation in the
+// cache; an interval-based dedupe would swallow the post-run probe and
+// latestObservedAt would not advance — the reported defect, reintroduced by the
+// deduplication rather than by the heartbeat rule.
+func TestClaudeNativeLifecycle_RecentPreRunObservationStillAdvances(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":81,"resets_at":%d}]}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	// A fresh pre-run reading, well inside the 60s interval.
+	preRun := time.Now().Add(-3 * time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ResetsAtMs: time.Now().Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: preRun.UnixMilli(), usageKnown: true,
+		},
+	}, preRun, "", claudeRateLimitSourceStatusLine)
+
+	tmpDir := installMockClaude(t, "claude-heartbeat-result")
+	m := NewClaudeNativeManager(nil)
+	id := fmt.Sprintf("claude-prerun-%d", time.Now().UnixNano())
+	if err := m.Start(id, tmpDir, nil, "hello", "ws", "uid", func(resultMsg) {}, nil); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = m.End(id) })
+
+	waitForClaudeObservationAfter(t, cache, preRun)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want 1 — a pre-run reading must not suppress the post-run probe", got)
+	}
+}
+
+// Same criterion on the MANAGED path.
+func TestManagedClaudeSession_RecentPreRunObservationStillAdvances(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"limits":[{"kind":"session","percent":55,"resets_at":%d}]}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	preRun := time.Now().Add(-3 * time.Second)
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 40, ResetsAtMs: time.Now().Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: preRun.UnixMilli(), usageKnown: true,
+		},
+	}, preRun, "", claudeRateLimitSourceStatusLine)
+
+	sm, id := startManagedClaudeSession(t, "claude-heartbeat-result")
+	t.Cleanup(func() { _ = sm.EndSession(id) })
+
+	waitForClaudeObservationAfter(t, cache, preRun)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want 1", got)
+	}
+}
+
+// waitForNoOutstandingClaudeUsageDebt waits for the post-run debt recorded by the
+// result frame to be SETTLED by the probe it fired, then holds still to prove no
+// later trigger recorded a fresh one.
+//
+// The regression: a run that ends ON its terminal `result` frame is already
+// covered by the probe that frame fired, but an unconditional session-end trigger
+// records a baseline strictly NEWER than the one that probe is sampling. Its
+// settleOwed then cannot clear the newer debt — single-flight collapses
+// overlapping REQUESTS, not debts — so a second OAuth request is scheduled once
+// the minimum interval elapses, for a run nothing else happened on.
+func waitForNoOutstandingClaudeUsageDebt(t *testing.T, settleWithin, holdFor time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(settleWithin)
+	for {
+		if claudeUsageProbe.owedObservation().IsZero() {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("post-run debt %s still outstanding %s after the probe landed — a later trigger recorded a baseline the in-flight probe could not settle",
+				claudeUsageProbe.owedObservation().UTC().Format(time.RFC3339Nano), settleWithin)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	hold := time.Now().Add(holdFor)
+	for time.Now().Before(hold) {
+		if owed := claudeUsageProbe.owedObservation(); !owed.IsZero() {
+			t.Fatalf("a trailing trigger recorded a new debt (%s) after the turn was already reported",
+				owed.UTC().Format(time.RFC3339Nano))
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// A stderr diagnostic delivered after the terminal `result` frame must NOT
+// reopen the turn. `lines` merges two independently scanned pipes, so any stderr
+// write can land after the result — the ordering is not the child's to control.
+// Clearing turnSettled for it made waitForExit fire the abnormal-exit fallback
+// on a turn that ended perfectly normally, recording a debt strictly newer than
+// the one the result probe was already sampling and buying a second OAuth
+// request for a turn nothing else happened on.
+func TestManagedClaudeSession_StderrAfterResultDoesNotReopenTheTurn(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":58,"resets_at":%d,"status":"allowed"}}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	seeded := seedStaleClaudeObservation(t, cache)
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	sm, id := startManagedClaudeSession(t, "claude-result-stderr-trailer")
+	t.Cleanup(func() { _ = sm.EndSession(id) })
+
+	waitForClaudeObservationAfter(t, cache, seeded)
+	waitForNoOutstandingClaudeUsageDebt(t, 5*time.Second, 1500*time.Millisecond)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want exactly 1 — a trailing stderr line must not reopen a settled turn", got)
+	}
+}
+
+// Managed run that ends on its terminal `result` frame: exactly one request, and
+// no debt left behind for the throttle to pay later.
+func TestManagedClaudeSession_SettledTurnLeavesNoTrailingDebt(t *testing.T) {
+	skipIfUnsupportedOS(t)
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"five_hour":{"utilization":58,"resets_at":%d,"status":"allowed"}}`,
+			time.Now().Add(3*time.Hour).Unix())
+	})
+	seeded := seedStaleClaudeObservation(t, cache)
+	// A production-shaped interval, so a debt left outstanding stays outstanding
+	// rather than being paid instantly by a zero-interval retry.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "60000")
+
+	sm, id := startManagedClaudeSession(t, "claude-heartbeat-result-linger")
+	t.Cleanup(func() { _ = sm.EndSession(id) })
+
+	waitForClaudeObservationAfter(t, cache, seeded)
+	waitForNoOutstandingClaudeUsageDebt(t, 5*time.Second, 1500*time.Millisecond)
+	if got := atomic.LoadInt64(calls); got != 1 {
+		t.Errorf("probe request count=%d, want exactly 1 for a single settled turn", got)
+	}
+}

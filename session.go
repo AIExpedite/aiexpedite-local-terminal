@@ -102,6 +102,15 @@ type CLISession struct {
 	// pipe is closed so a second SendInput doesn't double-close.
 	deferredStdinClose bool
 
+	// turnSettled is true only while the LAST stream line this session produced
+	// was a terminal claude `result`. Set at the result branch in
+	// readOutputStream and cleared by the next line, so waitForExit can tell "the
+	// turn completed and the child then exited" — already covered by the
+	// utilization probe the result branch fired — from "the child died mid-turn",
+	// where nothing has probed for the quota that turn spent. Atomic because the
+	// stream reader writes it and waitForExit reads it.
+	turnSettled atomic.Bool
+
 	// firstRealFrame is closed exactly once (via firstRealFrameOnce) the moment
 	// a claude session emits its first genuine assistant output — a stream-json
 	// text/thinking delta or a tool_use. The claude no-output watchdog
@@ -188,6 +197,21 @@ type PublishFunc func(res resultMsg)
 // StartSession creates and starts a new interactive CLI session. The process
 // is spawned with stdin/stdout/stderr pipes and output is streamed via publishFn.
 func (sm *SessionManager) StartSession(id, command string, args []string, cwd, workspaceID, uid string, timeoutMs int64, tty bool, publishFn PublishFunc) error {
+	// Re-verify Claude's status-line hook before launching a claude session. A
+	// Claude Code update rewrites settings.json and can drop our `statusLine`,
+	// silently stopping the only writer that carries numeric utilization on
+	// interactive renders — invisible until someone notices the card frozen.
+	// Throttled and mtime-gated (see ensureClaudeStatusLineHookIfStale), so the
+	// common case is one Stat.
+	//
+	// Deliberately OUTSIDE sm.mu, and bounded: Claude's config dir can live on a
+	// slow or unreachable filesystem, and a best-effort repair that stalls while
+	// holding the manager lock would block every unrelated session operation
+	// with it, not just this launch. Same placement as ClaudeNativeManager.Start.
+	if isClaudeCommand(command) {
+		reconcileClaudeStatusLineHookBounded("session")
+	}
+
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
@@ -614,6 +638,16 @@ func (sm *SessionManager) SendInput(id, text string) error {
 	} else if isAntigravityCommand(session.Command) {
 		payload = antigravityStreamUserMessage(text)
 	}
+
+	// A follow-up turn is being delivered, so an earlier terminal `result` no
+	// longer describes the end of this run — the quota this turn spends has not
+	// been probed for. Cleared BEFORE the write, and unconditionally: the stdout
+	// scanner clears it per line, but a session killed (or exited) after the turn
+	// is accepted and before it produces its next line would otherwise still look
+	// settled to waitForExit and skip the abnormal-exit probe. Clearing early can
+	// at worst schedule one extra throttled probe for a write that then failed;
+	// the opposite error silently drops a turn's usage.
+	session.turnSettled.Store(false)
 
 	// Write input with timeout to prevent deadlock if the CLI process's
 	// stdin pipe buffer is full (e.g., process is stalled or blocked).
@@ -1268,6 +1302,23 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// rate_limit_event gives us an unambiguous epoch. This is what lets
 			// agent-orchestrator-service auto-defer + resume instead of
 			// completing the step empty.
+			// The child is producing again, so any earlier `result` no longer
+			// describes the end of the run — a new turn is under way. Cleared for
+			// every stdout line, including the rate-limit and prompt frames below
+			// that never reach the result branch.
+			//
+			// STDOUT ONLY. `lines` merges two independently scanned pipes, so a
+			// diagnostic written to stderr — possibly before the `result` frame
+			// and merely delivered after it, since the two scanner goroutines
+			// impose no ordering between them — would otherwise reopen a turn that
+			// is genuinely over. waitForExit would then record a second post-run
+			// debt and spend another OAuth probe on a turn the result branch has
+			// already reported. Only Claude's own stdout frames, or an accepted
+			// follow-up turn (SendInput), reopen a settled turn.
+			if line.source == "stdout" {
+				session.turnSettled.Store(false)
+			}
+
 			// Codex rate-limit telemetry: token_count frames from `codex exec
 			// --json` carry the same primary/secondary rate_limits payload as
 			// the app-server stream. Without this hook, normal terminal Codex
@@ -1449,6 +1500,17 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 				// no-output watchdog so it doesn't later publish a misleading
 				// /login error and kill a session that already completed.
 				session.signalFirstRealFrame()
+
+				// A completed turn is when the account's real percentages have
+				// just moved — and when the stream has told us nothing numeric,
+				// because an under-quota run emits only usage-less heartbeats
+				// that mergeClaudeRateLimitCache (correctly) refuses to treat as
+				// fresh. Kick the bounded utilization probe so the CLI Agents
+				// card advances after a managed run. Asynchronous, single-flight
+				// and throttled, so a chatty multi-turn session issues one
+				// request and the streaming path is never delayed.
+				session.turnSettled.Store(true)
+				triggerClaudeUsageProbeAfterRun()
 			}
 
 			// Try to parse as JSON event for structured detection
@@ -1669,6 +1731,21 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	session.mu.Unlock()
 
 	close(session.done)
+
+	// Final utilization attempt for a claude session that never reached a
+	// terminal `result` frame — killed, timed out, or exited mid-turn. Those
+	// runs still consumed quota, so the card must not stay pinned to a
+	// pre-run observation just because the turn ended abnormally. No-op for
+	// non-claude sessions.
+	//
+	// Skipped when the session ENDED on its result frame. Single-flight collapses
+	// only overlapping requests; it cannot collapse the debt, and this trigger
+	// records a baseline strictly NEWER than the one the result probe is already
+	// sampling, so that probe's settleOwed cannot clear it and a second OAuth
+	// request gets scheduled for a turn that was already reported.
+	if isClaudeCommand(session.Command) && !session.turnSettled.Load() {
+		triggerClaudeUsageProbeAfterRun()
+	}
 
 	seq := atomic.AddInt64(&session.Seq, 1)
 
@@ -3818,6 +3895,14 @@ func detectResultEvent(command, line string) bool {
 	}
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	// Cheap prefilter before the decode, mirroring isClaudeRateLimitEventLine.
+	// A frame whose `type` is "result" necessarily contains the quoted literal,
+	// and this runs on every stdout line of every Claude session — including the
+	// multi-megabyte assistant frames claude_native.go tolerates, where an
+	// unconditional map decode is the expensive part.
+	if !strings.Contains(trimmed, `"result"`) {
 		return false
 	}
 	var event map[string]interface{}

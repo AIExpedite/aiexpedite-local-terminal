@@ -1001,7 +1001,18 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	// computer" failure. Version probes stay cached: they are keyed on the
 	// binary, which a login does not change.
 	SetOpenCodeReadinessForceProbe(true)
-	usage, errs := GatherCLIAgentUsageOnly(ctx)
+	// Same reasoning for Claude's utilization probe: its minimum interval exists
+	// to bound background traffic, not to hold back a reading the user just
+	// asked for. Without this the receipt can be signed from a cache whose
+	// newest observation predates the run that prompted the refresh.
+	//
+	// The bypass rides on THIS gather's context rather than a process-global
+	// flag. Claude's parser reaches the same code from the routine six-hour
+	// machine-info gather, and a package-level flag lets that gather claim the
+	// bypass we just armed — leaving this refresh unforced, skipping the join
+	// that covers an in-flight probe, and signing the pre-refresh snapshot.
+	usageCtx := WithClaudeUsageForceProbe(ctx)
+	usage, errs := GatherCLIAgentUsageOnly(usageCtx)
 	// success is "we polled successfully", NOT "we found something". An
 	// agent with zero providers installed (or zero providers that
 	// matched our parsers) is a legitimate empty poll — the backend

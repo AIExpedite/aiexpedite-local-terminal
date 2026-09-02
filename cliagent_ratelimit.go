@@ -28,12 +28,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -68,6 +68,20 @@ const (
 // window's limit is exhausted and further requests are blocked.
 const claudeRateLimitStatusRejected = "rejected"
 
+// Provenance values for claudeRateLimitBucket.Source — which writer produced a
+// bucket's reading. Recorded so an operator reading the cache (or a test) can
+// tell an interactive status-line render from a stream capture from the
+// bounded usage probe, all three of which write the same windows.
+//
+// Diagnostic only: no read path branches on it, and it is deliberately absent
+// from the signed refresh receipt (canonicalCLIUsageMetric carries no such
+// field), so adding it cannot change what the backend sees.
+const (
+	claudeRateLimitSourceStream     = "stream"
+	claudeRateLimitSourceStatusLine = "statusline"
+	claudeRateLimitSourceProbe      = "probe"
+)
+
 // claudeRateLimitBucket is one window's observed state. UsedPercentage is
 // normalised to 0..100 regardless of source shape (utilization 0..1 vs
 // used_percentage 0..100). ResetsAtMs is unix epoch milliseconds (0 = unknown).
@@ -94,6 +108,10 @@ type claudeRateLimitBucket struct {
 	// observed UsedPercentage. Per-event and not persisted; UsageObserved is
 	// the durable form of the same fact.
 	usageKnown bool `json:"-"`
+	// Source names the writer that produced this bucket (see the
+	// claudeRateLimitSource* constants). Omitted when empty so a cache written
+	// before this field existed round-trips byte-identically.
+	Source string `json:"source,omitempty"`
 }
 
 // hasObservedUsage reports whether UsedPercentage came from an actual reading.
@@ -114,14 +132,70 @@ type claudeRateLimitSnapshot struct {
 	UpdatedAt          string                           `json:"updatedAt"`
 	AccountFingerprint string                           `json:"accountFingerprint,omitempty"`
 	Buckets            map[string]claudeRateLimitBucket `json:"buckets"`
+	// LastProbeObservedAtMs is the newest observation instant the utilization
+	// PROBE has persisted a reading at, for this account. Monotonic within an
+	// account and cleared with the buckets on a fingerprint change.
+	//
+	// Recorded at the SNAPSHOT level, deliberately, rather than being derived
+	// from the surviving `source: "probe"` buckets. Per-window provenance says
+	// who wrote a window LAST, so a single interactive status-line render
+	// overwrites five_hour/seven_day with `source: "statusline"` and erases every
+	// trace that a probe ever ran — taking with it the evidence that the endpoint
+	// does not supply some other row (an unsupported Fable window, say). That row
+	// would then read as stale again on the next gather, and the routine probe
+	// would pay for the same answer forever. The fact being recorded is "a probe
+	// sampled the account at T", which belongs to the snapshot, not to whichever
+	// window happens to still carry the probe's byline.
+	//
+	// Omitted when zero so a cache written before this field existed round-trips
+	// byte-identically; readers fall back to the per-bucket provenance for those.
+	LastProbeObservedAtMs int64 `json:"lastProbeObservedAtMs,omitempty"`
 }
 
-// claudeRateLimitMu serialises the read-modify-write of the cache file
+// claudeRateLimitGate serialises the read-modify-write of the cache file
 // in-process. Cross-process serialization is handled separately by an advisory
 // file lock — Claude Code can render the status line from multiple windows in
 // parallel, each spawning its own `aiexpedite statusline-hook` process, and a
 // process-local mutex doesn't help across those boundaries.
-var claudeRateLimitMu sync.Mutex
+//
+// A one-slot channel rather than a sync.Mutex because the VERIFIED merge has to
+// bound its own wait, and a mutex offers no deadline. The queue behind this gate
+// has no depth limit: every rate-limit line a Claude session prints merges here,
+// and each writer may spend the full cross-process lock wait while holding it.
+// So "one queued writer" is not a bound — with several concurrent sessions the
+// probe's persist step would drift arbitrarily far past the deadline its caller
+// (and the joiner waiting on it) was promised. See
+// claudeRateLimitVerifiedPersistBudget.
+var claudeRateLimitGate = make(chan struct{}, 1)
+
+// lockClaudeRateLimitCache takes the in-process gate, waiting as long as it
+// takes.
+//
+// NOTHING in the merge path uses this any more — every writer, best-effort
+// included, now bounds its wait (see claudeRateLimitBestEffortGateWait). It
+// remains as the tests' way to pin the gate held, which is the only place an
+// unbounded acquisition is safe.
+func lockClaudeRateLimitCache() { claudeRateLimitGate <- struct{}{} }
+
+// lockClaudeRateLimitCacheUntil takes the gate with a deadline, reporting
+// whether it was acquired. Nothing is held on a false return.
+func lockClaudeRateLimitCacheUntil(deadline time.Time) bool {
+	select {
+	case claudeRateLimitGate <- struct{}{}:
+		return true
+	default:
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case claudeRateLimitGate <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func unlockClaudeRateLimitCache() { <-claudeRateLimitGate }
 
 // claudeRateLimitCachePath is the cache location inside the agent's data dir.
 // AIEXPEDITE_CLAUDE_RL_CACHE overrides it (tests isolate from the real machine
@@ -297,7 +371,8 @@ func captureClaudeRateLimitLine(line string, now time.Time) *claudeRateLimitBuck
 	nowMs := now.UnixMilli()
 	updates := extractClaudeRateLimitBuckets(raw, nowMs)
 	if len(updates) > 0 {
-		mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint())
+		mergeClaudeRateLimitCacheFromSource(claudeRateLimitCachePath(), updates, now,
+			currentClaudeAccountFingerprint(), claudeRateLimitSourceStream)
 	}
 
 	// Surface the rejected window with the LATEST reset time. When multiple
@@ -366,25 +441,218 @@ func windowlessRejectedBucket(raw map[string]interface{}, nowMs int64) (claudeRa
 // unique suffix so even if the lock is unavailable (some odd filesystem) two
 // writers can't clobber each other's intermediate state.
 func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint string) {
+	mergeClaudeRateLimitCacheFromSource(path, updates, now, fingerprint, "")
+}
+
+// mergeClaudeRateLimitCacheFromSource is mergeClaudeRateLimitCache with the
+// writer's provenance stamped onto every bucket it persists (see the
+// claudeRateLimitSource* constants). A carried-forward heartbeat keeps the
+// source of the reading it carries — the heartbeat observed the reset, not the
+// percentage, so claiming its own provenance for a percentage it did not
+// measure would be wrong.
+func mergeClaudeRateLimitCacheFromSource(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) {
+	_, _ = mergeClaudeRateLimitCacheInto(context.Background(), path, updates, now, fingerprint, source, false)
+}
+
+// mergeClaudeRateLimitCacheChecked is the same merge, but REPORTS whether the
+// snapshot actually reached disk, and WHICH observation the cache ends up
+// holding for the windows it was asked to write.
+//
+// The fire-and-forget wrappers above are right for the stream and status-line
+// writers: they run in hot paths, fire constantly, and a dropped write is
+// corrected by the next event moments later. The utilization probe is not like
+// that. It runs at most once per interval, and its caller's return value feeds a
+// SIGNED refresh receipt — so silently absorbing an unwritable cache dir, a
+// transient Windows sharing violation, or a failed rename would let the probe
+// report a fresh observation it never persisted, clear its failure backoff, and
+// throttle the retry that would have fixed it.
+//
+// The returned instant is the OLDEST observed reading standing in the merged
+// snapshot across the update's own windows — this writer's stamp where it
+// landed, and the incumbent's where the newer-wins guard below kept it instead.
+// "The write succeeded" is not the same question as "the cache now holds a
+// reading at least as new as the run that earned this write": a caller settling
+// a post-run debt needs the second one, and every window of an update can
+// legitimately be refused as older while the merge still returns success.
+//
+// The oldest rather than the newest, because a debt is a claim about EVERY row
+// this write covers, and a maximum settles it on the strength of one. A
+// status-line render landing while the probe is in flight legitimately keeps its
+// newer five_hour reading, so the merge returns success with five_hour at a
+// post-run instant and seven_day (plus any per-model weekly window) still
+// carrying the probe's pre-request stamp. Reporting the newest would clear the
+// debt on the one window that did not need it and leave the others displaying a
+// pre-run observation for the whole staleness TTL — the exact staleness the
+// probe exists to remove. Reporting the constraining window makes the answer
+// true of every row the write touched, and costs at most one extra probe.
+//
+// A window the merged snapshot holds no observed reading for — refused as a
+// heartbeat, or never persisted at all — collapses the result to zero. There is
+// no instant at which that row was measured, so no debt can be paid with it.
+//
+// It is also the only merge that is BOUNDED end to end — by its own persist
+// budget AND by the caller's ctx, so it cannot outlive the gather that asked for
+// it — and that treats an unserialized write as a failure. See
+// mergeClaudeRateLimitCacheInto.
+func mergeClaudeRateLimitCacheChecked(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string) (time.Time, error) {
+	return mergeClaudeRateLimitCacheInto(ctx, path, updates, now, fingerprint, source, true)
+}
+
+// mergeClaudeRateLimitCacheInto is the shared implementation. `verified` selects
+// between the two contracts the callers need, and they differ in exactly three
+// places:
+//
+//   - The wait. Both are bounded, but by different clocks and for different
+//     reasons. A verified writer gives up after
+//     claudeRateLimitVerifiedPersistBudget, which covers the gate, the
+//     cross-process lock AND the filesystem work those two protect, so its total
+//     cost is a constant its caller's join deadline can be derived from rather
+//     than a function of how many other writers happen to be queued — or of how
+//     long the mount holding the cache takes to answer. A best-effort writer is
+//     under no deadline of its own, but runs inside a Claude stdout scanner, so
+//     it waits claudeRateLimitBestEffortGateWait for the gate and then DROPS the
+//     merge rather than stall the scanner behind an abandoned, unkillable write.
+//   - What a refusal COSTS. Both modes refuse a CONFIRMED holder (see below);
+//     they differ in what the caller is told. A best-effort writer drops the
+//     merge silently — the next rate-limit line rewrites the same windows
+//     moments later. A verified one returns the failure, so the probe backs off,
+//     retries, and signs nothing in the meantime.
+//
+// Confirmed contention refuses in BOTH modes, and that is a correctness rule,
+// not a politeness one. An unlocked read-modify-rename behind a holder is not
+// "one lost window update": the best-effort writer reads the snapshot the holder
+// has not replaced yet, and renames that stale copy over the holder's committed
+// result — deleting probe-only windows and LastProbeObservedAtMs AFTER the probe
+// reported success, settled the post-run debt, and signed a receipt for them.
+// The status-line hook runs in its own process on exactly this path, so the
+// window is real whenever a verified merge outlives claudeRateLimitCacheLockWait.
+// A dropped best-effort merge costs one reading; a resurrected stale snapshot
+// costs the feature.
+//
+// A lock we could not even OPEN is a different fact and keeps the degraded path
+// in both modes: there is no evidence of a competing holder, only of a
+// filesystem that will not give us the lock file (a read-only data dir fails the
+// write below anyway, which the verified caller does see).
+func mergeClaudeRateLimitCacheInto(ctx context.Context, path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, verified bool) (time.Time, error) {
 	if path == "" || len(updates) == 0 {
-		return
+		return time.Time{}, fmt.Errorf("claude rate-limit cache: nothing to merge")
 	}
-	claudeRateLimitMu.Lock()
-	defer claudeRateLimitMu.Unlock()
+	if !verified {
+		return mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, time.Time{})
+	}
+	// A verified merge is bounded END TO END, not merely across its two lock
+	// waits. Everything past them — MkdirAll, ReadFile, WriteFile, Rename — is a
+	// filesystem syscall, and Go offers no way to cancel one: on a wedged mount
+	// (an unreachable SMB share, a hung network drive, a disk that stopped
+	// answering) they block for as long as the kernel takes, observing neither
+	// context nor deadline. Waiting on them in the CALLER's goroutine would let a
+	// single stalled write outlive the probe timeout, the gather deadline, and
+	// the join deadline derived from this very budget — pinning the probe's
+	// single-flight slot and the signed refresh handler behind a filesystem that
+	// may never answer, which is the wedge the bounded lock waits were added to
+	// prevent, one step further down.
+	//
+	// So the serialized merge runs on its own goroutine and the caller waits for
+	// it only until the budget expires — or until ctx ends, whichever comes
+	// first, so this write can never push the gather past its own deadline. Abandoning it is safe in both directions:
+	// the result channel is buffered, so a late answer is dropped rather than
+	// parking that goroutine forever; the goroutine keeps BOTH locks until its
+	// syscall returns, so no other writer can interleave a read-modify-rename
+	// with the one still in flight; and the caller reports a persist FAILURE, so
+	// the probe backs off and signs nothing. A write that lands after we gave up
+	// on it is just a reading the next gather picks up — never a receipt claiming
+	// an observation the cache did not hold.
+	//
+	// What abandoning it does NOT do is release the gate, and that is precisely
+	// why every other writer bounds its own wait for it. A stalled holder we
+	// cannot interrupt would otherwise be free to stop the Claude stdout scanners
+	// that merge synchronously on this path — see
+	// claudeRateLimitBestEffortGateWait.
+	deadline := time.Now().Add(claudeRateLimitVerifiedPersistBudget)
+	type persistResult struct {
+		observed time.Time
+		err      error
+	}
+	done := make(chan persistResult, 1)
+	go func() {
+		observed, err := mergeClaudeRateLimitCacheSerialized(path, updates, now, fingerprint, source, deadline)
+		done <- persistResult{observed: observed, err: err}
+	}()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		return res.observed, res.err
+	case <-ctx.Done():
+		// The caller's own deadline is the tighter one. A verified merge is
+		// reached at the END of a probe that already spent its request timeout
+		// (and possibly a join wait) inside the SHARED gather budget, so a
+		// persist budget measured from time.Now() can outlive the gather that
+		// asked for it — delaying every provider queued behind Claude and the
+		// refresh result itself. Stop waiting here; the goroutine keeps its full
+		// budget and its locks, so the reading still lands for the next gather.
+		return time.Time{}, fmt.Errorf("claude rate-limit cache: persist abandoned before the %s budget: %w",
+			claudeRateLimitVerifiedPersistBudget, ctx.Err())
+	case <-timer.C:
+		return time.Time{}, fmt.Errorf("claude rate-limit cache: persist exceeded the %s budget",
+			claudeRateLimitVerifiedPersistBudget)
+	}
+}
+
+// mergeClaudeRateLimitCacheSerialized runs the read-merge-rename under the
+// in-process gate and the cross-process file lock. A zero budgetDeadline selects
+// the best-effort contract (wait claudeRateLimitBestEffortGateWait for the gate,
+// then drop the merge); a non-zero one selects the verified contract, clamping
+// both waits to what is left of the caller's budget and reporting the failure
+// rather than dropping it. Neither contract writes behind a confirmed holder.
+func mergeClaudeRateLimitCacheSerialized(path string, updates map[string]claudeRateLimitBucket, now time.Time, fingerprint, source string, budgetDeadline time.Time) (time.Time, error) {
+	verified := !budgetDeadline.IsZero()
+	if verified {
+		if !lockClaudeRateLimitCacheUntil(budgetDeadline) {
+			return time.Time{}, fmt.Errorf("claude rate-limit cache: busy")
+		}
+	} else if !lockClaudeRateLimitCacheUntil(time.Now().Add(claudeRateLimitBestEffortGateWait)) {
+		return time.Time{}, fmt.Errorf("claude rate-limit cache: gate held past %s, merge dropped",
+			claudeRateLimitBestEffortGateWait)
+	}
+	defer unlockClaudeRateLimitCache()
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return
+		return time.Time{}, err
 	}
 	// Cross-process exclusive lock. Best-effort: if the lock file can't be
 	// created (read-only data dir) we still proceed — the in-process mutex
 	// keeps THIS process consistent, and a single-Claude-window install never
 	// hits the cross-process race anyway.
-	lockFile, locked := acquireCrossProcessCacheLock(path)
-	if locked {
+	//
+	// BOUNDED rather than blocking, because this write is now reachable from the
+	// utilization probe, whose caller runs under a deadline (the 3s probe timeout
+	// nested in the gather's own). A blocking flock observes neither, so one
+	// wedged `statusline-hook` process — a stalled cache filesystem is enough —
+	// would hang the signed refresh handler and pin the probe's single-flight
+	// latch indefinitely. The wait also bounds the in-process gate, which is held
+	// only here: without it a probe could queue behind an in-process writer that
+	// is itself blocked on the file lock, wedging one level removed.
+	//
+	// A verified merge additionally clamps the wait to whatever is left of its
+	// own budget, so the gate wait and the lock wait cannot sum past it.
+	lockDeadline := time.Now().Add(claudeRateLimitCacheLockWait)
+	if verified && budgetDeadline.Before(lockDeadline) {
+		lockDeadline = budgetDeadline
+	}
+	lockFile, lockOutcome := acquireClaudeRateLimitCacheLock(path, lockDeadline)
+	switch lockOutcome {
+	case claudeRateLimitLockAcquired:
 		defer func() {
 			_ = unlockFile(lockFile)
 			_ = lockFile.Close()
 		}()
+	case claudeRateLimitLockContended:
+		// Confirmed contention refuses in BOTH modes. See the contract note on
+		// mergeClaudeRateLimitCacheInto: an unlocked read-modify-rename here is
+		// not "one lost window update", it is a stale snapshot renamed over a
+		// verified writer's committed result.
+		return time.Time{}, fmt.Errorf("claude rate-limit cache: held by another writer")
 	}
 
 	snap := claudeRateLimitSnapshot{Buckets: map[string]claudeRateLimitBucket{}}
@@ -401,6 +669,9 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 	// reset windows on the CLI Agents tab.
 	if snap.AccountFingerprint != fingerprint {
 		snap.Buckets = map[string]claudeRateLimitBucket{}
+		// Probe evidence is an observation about ONE account's quota, so it
+		// crosses an account boundary no more than a bucket does.
+		snap.LastProbeObservedAtMs = 0
 	}
 	nowMs := now.UnixMilli()
 	for window, bucket := range updates {
@@ -432,6 +703,7 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 				// indefinitely.
 				bucket.ObservedAtMs = prev.ObservedAtMs
 				bucket.UsageObserved = usageObservedPtr(prev.hasObservedUsage())
+				bucket.Source = prev.Source
 				snap.Buckets[window] = bucket
 				continue
 			}
@@ -457,30 +729,86 @@ func mergeClaudeRateLimitCache(path string, updates map[string]claudeRateLimitBu
 			}
 			bucket.UsedPercentage = 0
 			bucket.UsageObserved = usageObservedPtr(false)
+			bucket.Source = source
 			snap.Buckets[window] = bucket
 			continue
 		}
+		// A reading may only ever REPLACE an older one. `now` is captured by the
+		// caller before its work, so a writer that took time to produce its
+		// answer can arrive holding a timestamp that another writer has already
+		// passed: the utilization probe stamps the instant the gather started and
+		// then spends up to 3s in flight, while the status-line hook writes the
+		// moment Claude renders. Overwriting there would move latestObservedAt
+		// BACKWARDS and swap a newer percentage for an older one — the exact
+		// staleness this feature exists to remove, reintroduced by a race.
+		//
+		// Strictly-newer, so a same-instant rewrite still lands: equal timestamps
+		// carry no ordering, and refusing them would make a re-merge of the same
+		// observation depend on which writer got there first.
+		if prev, ok := snap.Buckets[window]; ok &&
+			prev.hasObservedUsage() && prev.ObservedAtMs > bucket.ObservedAtMs {
+			continue
+		}
 		bucket.UsageObserved = usageObservedPtr(true)
+		bucket.Source = source
 		snap.Buckets[window] = bucket
+	}
+	// Record that the probe sampled this account, independently of which writer
+	// ends up owning each window (see LastProbeObservedAtMs). Only readings
+	// count: a probe response we could not plot is not an observation. Monotonic
+	// — a probe stamping an older instant than one already on record cannot walk
+	// the evidence backwards.
+	if source == claudeRateLimitSourceProbe {
+		for _, bucket := range updates {
+			if bucket.usageKnown && bucket.ObservedAtMs > snap.LastProbeObservedAtMs {
+				snap.LastProbeObservedAtMs = bucket.ObservedAtMs
+			}
+		}
 	}
 	snap.UpdatedAt = now.UTC().Format(time.RFC3339)
 	snap.AccountFingerprint = fingerprint
 
+	// What the cache HOLDS for these windows once the merge has run — which is
+	// this writer's stamp only where it actually won. Read from snap.Buckets
+	// rather than from `updates` so a window the newer-wins guard refused
+	// reports the incumbent observation that beat it, not the one we tried to
+	// write; and only from observed readings, so a heartbeat row recorded
+	// without usage cannot pass for one.
+	//
+	// Aggregated as a MINIMUM: the caller asks whether the cache now holds a
+	// recent enough reading for every window this write covers, and one window
+	// left behind is the whole answer. See mergeClaudeRateLimitCacheChecked.
+	observed := time.Time{}
+	for window := range updates {
+		b, ok := snap.Buckets[window]
+		if !ok || !b.hasObservedUsage() {
+			// A window carrying no reading at all cannot cover anything, and it
+			// cannot be averaged away by the windows that do.
+			observed = time.Time{}
+			break
+		}
+		if observed.IsZero() || b.ObservedAtMs < observed.UnixMilli() {
+			observed = time.UnixMilli(b.ObservedAtMs)
+		}
+	}
+
 	out, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return
+		return time.Time{}, err
 	}
 	// Write-then-rename so a concurrent loadClaudeRateLimitSnapshot reader never
 	// observes a half-written file. The PID + nanosecond suffix keeps two
 	// concurrent writers (or a stale tmp from a crashed prior run) from
 	// colliding on the intermediate file even outside the lock.
 	tmp := fmt.Sprintf("%s.tmp.%d.%d", path, os.Getpid(), now.UnixNano())
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return
+	if err := claudeRateLimitCacheWriteFile(tmp, out, 0o600); err != nil {
+		return time.Time{}, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		return time.Time{}, err
 	}
+	return observed, nil
 }
 
 // acquireCrossProcessCacheLock opens (and exclusively locks) a sibling file of
@@ -498,6 +826,114 @@ func acquireCrossProcessCacheLock(cachePath string) (*os.File, bool) {
 		return nil, false
 	}
 	return f, true
+}
+
+// claudeRateLimitCacheLockWait bounds how long a Claude cache writer waits for
+// the cross-process lock before proceeding without it, and
+// claudeRateLimitCacheLockPoll is the retry cadence inside that wait. Vars so
+// the contention test can pin them small — the suite runs under `go test -race`
+// and must not spend seconds of wall clock asserting one fallback.
+//
+// Two seconds is generous for a read-merge-rename of a few KB of JSON: an
+// ordinary contending writer is gone in milliseconds, so the wait only expires
+// when the holder is genuinely wedged — which is precisely when giving up is
+// the right move.
+var (
+	claudeRateLimitCacheLockWait = 2 * time.Second
+	claudeRateLimitCacheLockPoll = 10 * time.Millisecond
+)
+
+// claudeRateLimitVerifiedPersistBudget is the ENFORCED ceiling on a verified
+// merge, end to end: the wait for the in-process gate, the wait for the
+// cross-process file lock, AND the filesystem work those two protect. It is a
+// ceiling the merge itself observes, not an estimate of how long the merge is
+// likely to take — the queue on the gate is unbounded, so anything derived from
+// "our wait plus one other writer's" would understate it the moment two Claude
+// sessions print rate-limit lines at once, and a syscall on a wedged mount has
+// no upper bound to estimate at all.
+//
+// Two lock waits plus a margin: enough for one holder to be waited out and the
+// gate to be handed over, without letting a caller's join deadline (which is
+// derived from this) grow into something a user waiting on Refresh would notice.
+// The margin also covers the read-merge-rename itself, which on a healthy
+// filesystem is a few KB of JSON — microseconds, not milliseconds.
+var claudeRateLimitVerifiedPersistBudget = 2*claudeRateLimitCacheLockWait + 500*time.Millisecond
+
+// claudeRateLimitBestEffortGateWait bounds how long a fire-and-forget writer
+// (stream capture, status-line hook) waits for the in-process gate before
+// DROPPING its merge.
+//
+// Waiting forever there was a session-level hazard, not merely an untidy one.
+// Go cannot cancel a filesystem syscall, so a verified merge whose write stalls
+// on a wedged mount is abandoned by its caller while its goroutine keeps the
+// gate until the kernel answers — possibly never. captureClaudeRateLimitLine
+// merges SYNCHRONOUSLY inside both Claude stdout scanners (claude_native.go's
+// readStream and session.go's readOutputStream), so an unbounded wait there
+// stops output publication, fills the child's pipe and hangs sessions that have
+// nothing to do with the cache. Bounding the waiters is the only lever we have:
+// the stalled holder itself cannot be interrupted.
+//
+// Dropping is the right trade for these writers and only for them. They fire on
+// every rate-limit line, the next event rewrites the same windows moments later,
+// and the rejection captureClaudeRateLimitLine returns is derived from the
+// parsed event rather than from the cache — so a dropped merge costs one
+// reading, never a missed rate-limit rejection. The verified merge keeps its own
+// stricter contract and reports the failure instead.
+//
+// The bound is the verified merge's whole persist budget: that is the longest a
+// HEALTHY holder can legitimately keep the gate, so a wait that long only ever
+// expires behind one that is genuinely wedged.
+var claudeRateLimitBestEffortGateWait = claudeRateLimitVerifiedPersistBudget
+
+// claudeRateLimitCacheWriteFile is os.WriteFile behind a seam, so a test can
+// stall the snapshot write the way an unreachable network mount does. That is
+// the failure mode the budget above exists to survive, and the one no portable
+// filesystem can be made to reproduce on demand.
+var claudeRateLimitCacheWriteFile = os.WriteFile
+
+// claudeRateLimitLockOutcome distinguishes the two ways the cross-process lock
+// can end up not held, because they are not the same fact. "Another writer has
+// it" says a competing read-modify-rename is in flight and ours may be undone by
+// it; "we could not open the lock file at all" says only that this filesystem
+// will not give us one, with no evidence of a competitor. Every merge refuses
+// the first and tolerates the second.
+type claudeRateLimitLockOutcome int
+
+const (
+	claudeRateLimitLockAcquired claudeRateLimitLockOutcome = iota
+	claudeRateLimitLockUnavailable
+	claudeRateLimitLockContended
+)
+
+// acquireClaudeRateLimitCacheLock takes the sibling `.lock` file, waiting until
+// `deadline` for a contending holder to release it.
+//
+// Only claudeRateLimitLockUnavailable takes the degraded unlocked path, and only
+// because it carries no evidence of a competitor. claudeRateLimitLockContended
+// does, so every caller refuses it: proceeding would rename a snapshot read
+// while the holder was mid-write over whatever the holder went on to commit.
+// Callers MUST unlock + close on claudeRateLimitLockAcquired, and skip otherwise.
+func acquireClaudeRateLimitCacheLock(cachePath string, deadline time.Time) (*os.File, claudeRateLimitLockOutcome) {
+	lockPath := cachePath + ".lock"
+	f, err := os.OpenFile(lockPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, claudeRateLimitLockUnavailable
+	}
+	for {
+		locked, err := tryLockFileExclusive(f)
+		if err != nil {
+			_ = f.Close()
+			return nil, claudeRateLimitLockUnavailable
+		}
+		if locked {
+			return f, claudeRateLimitLockAcquired
+		}
+		if !time.Now().Before(deadline) {
+			_ = f.Close()
+			return nil, claudeRateLimitLockContended
+		}
+		time.Sleep(claudeRateLimitCacheLockPoll)
+	}
 }
 
 // tryAcquireCrossProcessCacheLock acquires the same sibling lock without

@@ -30,7 +30,7 @@ import (
 // inlined at compile time). The default value here is what nonprod builds
 // ship with; bump it before pushing to main when you want nonprod's
 // `--version` and the auto-update comparison to reflect the new release.
-var Version = "v1.0.12"
+var Version = "v1.0.13"
 
 var (
 	ttydCmd      *exec.Cmd // ttyd process (killed on exit)
@@ -146,6 +146,11 @@ func StartAgent(cfg *Config) {
 	// the user opts out, undo any prior install (restore the stashed third-
 	// party command, or drop the key) so the toggle actually takes effect.
 	hookHome, _ := os.UserHomeDir()
+	// Publish both Claude opt-outs to the per-run paths that cannot reach the
+	// config: the status-line reconcile that repairs the hook after a Claude
+	// Code update, and the bounded utilization probe.
+	SetClaudeStatusLineHookDisabled(cfg.DisableClaudeStatusLineHook)
+	SetClaudeUsageProbeDisabled(cfg.DisableClaudeUsageProbe)
 	if cfg.DisableClaudeStatusLineHook {
 		if changed, err := removeClaudeStatusLineHook(hookHome); err != nil {
 			fmt.Printf("%s[statusline] Could not remove Claude status-line hook: %v%s\n",

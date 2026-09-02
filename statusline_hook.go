@@ -76,7 +76,8 @@ func captureClaudeRateLimitsFromStatusline(raw []byte, now time.Time) {
 	if claudeEnvAuthActive() {
 		return
 	}
-	mergeClaudeRateLimitCache(claudeRateLimitCachePath(), updates, now, currentClaudeAccountFingerprint())
+	mergeClaudeRateLimitCacheFromSource(claudeRateLimitCachePath(), updates, now,
+		currentClaudeAccountFingerprint(), claudeRateLimitSourceStatusLine)
 }
 
 // renderStatusLine forwards to the user's previous status-line command when we

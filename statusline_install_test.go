@@ -1,10 +1,14 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -230,6 +234,77 @@ func TestCopyPrevStatusLine_PreservesPrivateMode(t *testing.T) {
 	}
 }
 
+// os.WriteFile honours its mode argument only when it CREATES the file, so
+// writing over a leftover stash left it at whatever mode that file already had.
+// Both stash writers must land owner-only even when the destination already
+// exists group/world-readable — the stashed command can carry inline env vars
+// and tokens.
+func TestPrevStatusLineWriters_ForcePrivateModeOverPermissiveFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes are not meaningful on Windows")
+	}
+	live := []byte(`{"statusLine":{"type":"command","command":"third-party --token=secret"}}`)
+
+	t.Run("migrate", func(t *testing.T) {
+		dir := t.TempDir()
+		oldPrev := filepath.Join(dir, "old-prev.json")
+		newPrev := filepath.Join(dir, "new-prev.json")
+		if err := os.WriteFile(oldPrev, live, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// A leftover at the destination that some earlier cycle left readable.
+		if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"superseded.sh"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(newPrev, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := migratePrevStatusLine(oldPrev, newPrev); err != nil {
+			t.Fatalf("migratePrevStatusLine: %v", err)
+		}
+		assertPrivateStash(t, newPrev, live)
+	})
+
+	t.Run("save", func(t *testing.T) {
+		t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", filepath.Join(t.TempDir(), "prev.json"))
+		if err := savePrevStatusLine(json.RawMessage(`{"type":"command","command":"first.sh"}`)); err != nil {
+			t.Fatalf("savePrevStatusLine: %v", err)
+		}
+		if err := os.Chmod(prevStatusLinePath(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		raw := json.RawMessage(`{"type":"command","command":"third-party --token=secret"}`)
+		if err := savePrevStatusLine(raw); err != nil {
+			t.Fatalf("savePrevStatusLine (rewrite): %v", err)
+		}
+		st, err := os.Stat(prevStatusLinePath())
+		if err != nil {
+			t.Fatalf("stat stash: %v", err)
+		}
+		if mode := st.Mode().Perm(); mode != 0o600 {
+			t.Errorf("rewritten stash must be owner-only (0o600), got %o", mode)
+		}
+		if got := loadPrevStatusLineCommand(); got != "third-party --token=secret" {
+			t.Errorf("stash content lost: %q", got)
+		}
+	})
+}
+
+// assertPrivateStash checks a stash landed owner-only with the expected bytes.
+func assertPrivateStash(t *testing.T, path string, want []byte) {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if mode := st.Mode().Perm(); mode != 0o600 {
+		t.Errorf("stash must be owner-only (0o600), got %o", mode)
+	}
+	if got, _ := os.ReadFile(path); string(got) != string(want) {
+		t.Errorf("stash content = %s, want %s", got, want)
+	}
+}
+
 // When opt-out runs after the data dir moved (e.g. XDG_CONFIG_HOME changed),
 // the current prevStatusLinePath() resolves to a fresh empty location, but the
 // stash is still sitting at the path the installed command itself pinned.
@@ -276,6 +351,208 @@ func TestRemoveClaudeStatusLineHook_RestoresFromPinnedPathWhenCurrentMissing(t *
 	}
 }
 
+// Same move, but the current prevStatusLinePath() is OCCUPIED by a leftover
+// from an earlier cycle under this config dir. The pinned path is the chain
+// target the installed command resolves right now, so opt-out must restore THAT
+// one — restoring the leftover would put back a status line the user has since
+// replaced, delete it, and strand the live stash with nothing naming it.
+func TestRemoveClaudeStatusLineHook_PrefersPinnedStashOverStaleCurrent(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	// The stash the installed command pins — the live chain target.
+	pinnedPrev := filepath.Join(t.TempDir(), "pinned-prev.json")
+	if err := os.WriteFile(pinnedPrev, []byte(`{"statusLine":{"type":"command","command":"live.sh","padding":2}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+
+	// This boot resolves elsewhere, and that path already holds a stale stash.
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"stale.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settings := `{"theme":"dark","statusLine":{"type":"command","command":` +
+		mustJSONString(t, installedCmd) + `}}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	if !strings.Contains(string(raw), `"live.sh"`) || !strings.Contains(string(raw), `"padding": 2`) {
+		t.Errorf("opt-out should restore the pinned stash verbatim, got: %s", raw)
+	}
+	if strings.Contains(string(raw), `"stale.sh"`) {
+		t.Errorf("opt-out restored the stale leftover at the current path: %s", raw)
+	}
+	// Both copies are consumed: one left behind is what a later re-enable would
+	// resurrect as a chain target.
+	if _, err := os.Stat(pinnedPrev); !os.IsNotExist(err) {
+		t.Errorf("pinned stash should be consumed after restore; err=%v", err)
+	}
+	if _, err := os.Stat(newPrev); !os.IsNotExist(err) {
+		t.Errorf("stale stash at the current path should be dropped; err=%v", err)
+	}
+}
+
+// A distinct pinned path that holds NOTHING is still the authority. The current
+// prevStatusLinePath() is not named by the installed command, so whatever sits
+// there is a leftover from an earlier cycle — restoring it on a pinned miss
+// would resurrect a third-party command the user has since replaced. Opt-out
+// must drop statusLine instead.
+func TestRemoveClaudeStatusLineHook_PinnedMissDoesNotFallBackToCurrent(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	// The command pins a stash path that does not exist (already consumed).
+	pinnedPrev := filepath.Join(t.TempDir(), "pinned-prev.json")
+	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+
+	// This boot resolves elsewhere, and that path holds a stale leftover.
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"stale.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settings := `{"theme":"dark","statusLine":{"type":"command","command":` +
+		mustJSONString(t, installedCmd) + `}}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	if strings.Contains(string(raw), "statusLine") {
+		t.Errorf("pinned miss must drop statusLine, not restore the current-path leftover: %s", raw)
+	}
+	if strings.Contains(string(raw), `"stale.sh"`) {
+		t.Errorf("opt-out restored the stale leftover at the current path: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"theme": "dark"`) {
+		t.Errorf("unrelated settings must survive: %s", raw)
+	}
+	if _, err := os.Stat(newPrev); !os.IsNotExist(err) {
+		t.Errorf("leftover stash at the current path should be dropped; err=%v", err)
+	}
+}
+
+// A MALFORMED pinned stash is the same answer as an absent one — there is
+// nothing restorable — so opt-out drops statusLine rather than reaching for the
+// current path.
+func TestRemoveClaudeStatusLineHook_MalformedPinnedStashDoesNotFallBack(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	pinnedPrev := filepath.Join(t.TempDir(), "pinned-prev.json")
+	if err := os.WriteFile(pinnedPrev, []byte(`{"statusLine":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"stale.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settings := `{"statusLine":{"type":"command","command":` +
+		mustJSONString(t, installedCmd) + `}}`
+	if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(claudeDir, "settings.json"))
+	if strings.Contains(string(raw), `"stale.sh"`) {
+		t.Errorf("malformed pinned stash must not promote the current path: %s", raw)
+	}
+}
+
+// An UNREADABLE pinned stash is not an answer at all: it may still hold the
+// user's chained command. Opt-out must abort rather than delete statusLine (or
+// restore the unrelated current-path leftover), leaving settings.json untouched
+// so a later attempt can still restore the chain.
+func TestRemoveClaudeStatusLineHook_UnreadablePinnedStashAborts(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permissions do not block reads the same way on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the unreadable-directory permission")
+	}
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	// The pinned stash exists but sits in a directory we cannot traverse, so the
+	// read fails with something other than IsNotExist.
+	lockedDir := filepath.Join(t.TempDir(), "locked")
+	if err := os.MkdirAll(lockedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pinnedPrev := filepath.Join(lockedDir, "pinned-prev.json")
+	if err := os.WriteFile(pinnedPrev, []byte(`{"statusLine":{"type":"command","command":"live.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(lockedDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(lockedDir, 0o755) })
+
+	installedCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", pinnedPrev)
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	if err := os.WriteFile(newPrev, []byte(`{"statusLine":{"type":"command","command":"stale.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	settings := `{"statusLine":{"type":"command","command":` +
+		mustJSONString(t, installedCmd) + `}}`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := removeClaudeStatusLineHook(home)
+	if err == nil {
+		t.Fatalf("an unreadable pinned stash must surface as an error, got changed=%v", changed)
+	}
+	if changed {
+		t.Errorf("aborted removal must report changed=false")
+	}
+	raw, _ := os.ReadFile(settingsPath)
+	if string(raw) != settings {
+		t.Errorf("settings.json must be left untouched on abort: got %s, want %s", raw, settings)
+	}
+	if _, err := os.Stat(newPrev); err != nil {
+		t.Errorf("no stash may be retired when the removal aborted; err=%v", err)
+	}
+}
+
 func mustJSONString(t *testing.T, s string) string {
 	t.Helper()
 	// Minimal JSON string escaper for test fixtures — only need `"` and `\`.
@@ -308,5 +585,608 @@ func TestMergeClaudeRateLimitCache_CreatesLockFile(t *testing.T) {
 		if leftover, _ := filepath.Glob(cache + ".tmp"); len(leftover) > 0 {
 			t.Errorf("legacy fixed `.tmp` file should not be produced: %v", leftover)
 		}
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+/* Post-update hook repair (ensureClaudeStatusLineHookIfStale)                 */
+/* -------------------------------------------------------------------------- */
+
+// armStatusLineReconcile isolates the run-start reconcile for one test: a
+// private Claude config dir with a settings.json, a private prev-stash path, and
+// an armed, unthrottled reconcile state. Returns the home dir and the
+// settings.json path inside it.
+func armStatusLineReconcile(t *testing.T) (home, settingsPath string) {
+	t.Helper()
+	home = t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", filepath.Join(t.TempDir(), "prev.json"))
+	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
+
+	resetClaudeStatusLineReconcile()
+	SetClaudeStatusLineHookDisabled(false)
+	t.Cleanup(resetClaudeStatusLineReconcile)
+
+	return home, filepath.Join(claudeDir, "settings.json")
+}
+
+// clearStatusLineReconcileThrottle drops only the interval gate, so a test can
+// exercise two consecutive reconciles without also forgetting the mtime stamp
+// the second one is supposed to compare against.
+func clearStatusLineReconcileThrottle() {
+	claudeStatusLineReconcile.mu.Lock()
+	claudeStatusLineReconcile.lastCheck = time.Time{}
+	claudeStatusLineReconcile.mu.Unlock()
+}
+
+// A Claude Code update rewrites settings.json and can replace our statusLine
+// with its own. Nothing re-verified that until the agent restarted, so the
+// numeric side-channel silently stopped writing and the utilization card froze.
+// The run-start reconcile must restore our command and stash the foreign one.
+func TestEnsureClaudeStatusLineHookIfStale_RepairsAfterClaudeUpdate(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Boot-time install, exactly as StartAgent performs it.
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+		t.Fatalf("initial reconcile: changed=%v err=%v", changed, err)
+	}
+
+	// Simulate the update: Claude rewrites settings.json with a foreign
+	// statusLine, dropping ours.
+	if err := os.WriteFile(settingsPath,
+		[]byte(`{"theme":"dark","statusLine":{"type":"command","command":"/opt/claude/vendor-line.sh"}}`),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+	clearStatusLineReconcileThrottle()
+
+	changed, err := ensureClaudeStatusLineHookIfStale(home)
+	if err != nil {
+		t.Fatalf("reconcile after update: %v", err)
+	}
+	if !changed {
+		t.Fatal("a settings.json rewritten by a Claude Code update must be repaired")
+	}
+
+	var settings struct {
+		Theme      string `json:"theme"`
+		StatusLine struct {
+			Command string `json:"command"`
+		} `json:"statusLine"`
+	}
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if !isOurStatusLineCommand(settings.StatusLine.Command) {
+		t.Errorf("statusLine=%q, want our hook restored", settings.StatusLine.Command)
+	}
+	if settings.Theme != "dark" {
+		t.Errorf("theme=%q, want the user's other settings preserved", settings.Theme)
+	}
+	if prev := loadPrevStatusLineCommand(); prev != "/opt/claude/vendor-line.sh" {
+		t.Errorf("stashed previous command=%q, want the foreign one preserved for chaining", prev)
+	}
+}
+
+// An unchanged settings.json must cost nothing: no write, and the file's mtime
+// must survive so a backup/sync tool doesn't see churn on every session start.
+func TestEnsureClaudeStatusLineHookIfStale_NoOpWhenSettingsUnchanged(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+		t.Fatalf("initial reconcile: changed=%v err=%v", changed, err)
+	}
+	installed, err := os.Stat(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clearStatusLineReconcileThrottle()
+	changed, err := ensureClaudeStatusLineHookIfStale(home)
+	if err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if changed {
+		t.Error("an unchanged settings.json must not be rewritten")
+	}
+	after, err := os.Stat(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(installed.ModTime()) || after.Size() != installed.Size() {
+		t.Errorf("settings.json was touched: mtime %v -> %v, size %d -> %d",
+			installed.ModTime(), after.ModTime(), installed.Size(), after.Size())
+	}
+}
+
+// A burst of session starts must not storm the file: inside the throttle window
+// at most one reconcile happens, however many runs begin.
+func TestEnsureClaudeStatusLineHookIfStale_ThrottlesRepeatedStarts(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || !changed {
+		t.Fatalf("initial reconcile: changed=%v err=%v", changed, err)
+	}
+
+	// Break the hook again, then start several sessions without clearing the
+	// throttle — none of them may reconcile.
+	if err := os.WriteFile(settingsPath,
+		[]byte(`{"statusLine":{"type":"command","command":"/opt/claude/vendor-line.sh"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || changed {
+			t.Fatalf("reconcile %d inside the throttle window: changed=%v err=%v", i, changed, err)
+		}
+	}
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), statusLineHookArg) {
+		t.Errorf("throttled reconcile still wrote the hook:\n%s", raw)
+	}
+}
+
+// The opt-out must hold for the run-start reconcile too — otherwise a user who
+// disabled the hook would have it reinstalled by their next Claude session.
+func TestEnsureClaudeStatusLineHookIfStale_RespectsOptOut(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	SetClaudeStatusLineHookDisabled(true)
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || changed {
+		t.Fatalf("opt-out reconcile: changed=%v err=%v", changed, err)
+	}
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "statusLine") {
+		t.Errorf("opt-out must not install the hook:\n%s", raw)
+	}
+}
+
+// A process that never armed the reconcile (a one-shot CLI verb, the
+// statusline-hook subcommand) must never rewrite Claude's settings.json as a
+// side effect of starting a session.
+func TestEnsureClaudeStatusLineHookIfStale_UnarmedProcessDoesNothing(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetClaudeStatusLineReconcile() // leaves the reconcile unarmed
+
+	if changed, err := ensureClaudeStatusLineHookIfStale(home); err != nil || changed {
+		t.Fatalf("unarmed reconcile: changed=%v err=%v", changed, err)
+	}
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "statusLine") {
+		t.Errorf("unarmed process must not touch settings.json:\n%s", raw)
+	}
+}
+
+// Concurrent Claude starts must produce exactly ONE reconcile. This is not
+// theoretical: ClaudeNativeManager.Start runs the reconcile outside its manager
+// mutex (deliberately — it must not hold that lock over disk I/O) and
+// SessionManager.StartSession runs it under a different lock entirely, so
+// nothing upstream serializes the two. Without an atomic claim, both would
+// observe an un-throttled state and both would drive ensureClaudeStatusLineHook's
+// read-modify-write of the user's settings.json at once: one write is lost, and
+// the loser can stash the winner's in-flight statusLine as the "previous
+// third-party" command — permanently hiding it behind a hook -> hook chain.
+func TestEnsureClaudeStatusLineHookIfStale_ConcurrentStartsReconcileOnce(t *testing.T) {
+	home, settingsPath := armStatusLineReconcile(t)
+	if err := os.WriteFile(settingsPath,
+		[]byte(`{"theme":"dark","statusLine":{"type":"command","command":"/opt/claude/vendor-line.sh"}}`),
+		0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const starts = 12
+	var wg sync.WaitGroup
+	changedCount := int64(0)
+	errCount := int64(0)
+	for i := 0; i < starts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			changed, err := ensureClaudeStatusLineHookIfStale(home)
+			if err != nil {
+				atomic.AddInt64(&errCount, 1)
+				return
+			}
+			if changed {
+				atomic.AddInt64(&changedCount, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := atomic.LoadInt64(&errCount); got != 0 {
+		t.Errorf("%d concurrent reconciles errored", got)
+	}
+	if got := atomic.LoadInt64(&changedCount); got != 1 {
+		t.Errorf("reconciles that wrote=%d, want exactly 1 across %d concurrent starts", got, starts)
+	}
+
+	// The single winner's write must be intact and complete: our hook installed,
+	// the user's other settings preserved, and the foreign command stashed
+	// exactly once so opt-out can still restore it.
+	var settings struct {
+		Theme      string `json:"theme"`
+		StatusLine struct {
+			Command string `json:"command"`
+		} `json:"statusLine"`
+	}
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		t.Fatalf("settings.json is not valid JSON after concurrent reconciles: %v\n%s", err, raw)
+	}
+	if !isOurStatusLineCommand(settings.StatusLine.Command) {
+		t.Errorf("statusLine=%q, want our hook", settings.StatusLine.Command)
+	}
+	if settings.Theme != "dark" {
+		t.Errorf("theme=%q, want the user's other settings preserved", settings.Theme)
+	}
+	// The stash must hold the USER's command, never one of ours — a lost update
+	// would have stashed our own hook and buried the vendor line for good.
+	prev := loadPrevStatusLineCommand()
+	if prev != "/opt/claude/vendor-line.sh" {
+		t.Errorf("stashed command=%q, want the foreign one exactly once", prev)
+	}
+	if isOurStatusLineCommand(prev) {
+		t.Errorf("our own hook was stashed as the previous command: %q", prev)
+	}
+}
+
+// The run-start reconcile is best-effort, but Claude's config dir is user-pointed
+// (CLAUDE_CONFIG_DIR) and can sit on a slow or unreachable filesystem where
+// Stat/ReadFile/WriteFile honour no deadline of ours. A start must never inherit
+// that wait — in the managed path it used to run under sm.mu, so one stalled
+// repair would have blocked every unrelated session operation with it.
+//
+// The stall is modelled by holding the reconcile gate's own mutex, which is the
+// first thing ensureClaudeStatusLineHookIfStale takes: the helper's goroutine
+// parks there exactly as it would inside a hung syscall, and the caller must
+// still come back within its bound.
+func TestReconcileClaudeStatusLineHookBoundedReturnsWhileRepairStalls(t *testing.T) {
+	home, _ := armStatusLineReconcile(t)
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	claudeStatusLineReconcile.mu.Lock()
+
+	returned := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		reconcileClaudeStatusLineHookBounded("test")
+		returned <- time.Since(start)
+	}()
+
+	select {
+	case elapsed := <-returned:
+		if elapsed < claudeStatusLineReconcileWait {
+			// It must have WAITED for the repair, not skipped it: the common case
+			// is one Stat and the ordering (repair before the child launches) is
+			// the whole point of the run-start reconcile.
+			t.Fatalf("returned after %v, before the %v bound — the reconcile was not awaited",
+				elapsed, claudeStatusLineReconcileWait)
+		}
+	case <-time.After(claudeStatusLineReconcileWait + 10*time.Second):
+		claudeStatusLineReconcile.mu.Unlock()
+		t.Fatal("reconcileClaudeStatusLineHookBounded blocked on a stalled repair")
+	}
+
+	// Release the parked goroutine into a no-op rather than a real reconcile, so
+	// it cannot outlive the test and race this test's temp dirs.
+	claudeStatusLineReconcile.optOut = true
+	claudeStatusLineReconcile.mu.Unlock()
+}
+
+// A pinned-path migration that CANNOT complete must abort the refresh instead
+// of installing a command pinned to the new stash path. Writing that command
+// would point both the hook's chain lookup and opt-out at newPrev while the
+// user's third-party status line is still stashed only at oldPrev — the chain
+// target disappears even though its stash is right there on disk. Aborting
+// leaves settings.json untouched, so the previously installed command (still
+// pinned to oldPrev, where the stash actually is) keeps resolving.
+func TestEnsureClaudeStatusLineHook_AbortsWhenPinnedStashCannotMigrate(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	oldPrev := filepath.Join(t.TempDir(), "old-prev.json")
+	stashBody := []byte(`{"statusLine":{"type":"command","command":"third-party.sh"}}`)
+	if err := os.WriteFile(oldPrev, stashBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", oldPrev)
+
+	// Resolve the new pinned stash underneath a REGULAR FILE, so both the
+	// MkdirAll and any rename/copy fallback are guaranteed to fail on every OS.
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newPrev := filepath.Join(blocker, "sub", "new-prev.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	settings := `{"theme":"dark","statusLine":{"type":"command","command":` +
+		mustJSONString(t, oldCmd) + `}}`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changed, err := ensureClaudeStatusLineHook(home)
+	if err == nil {
+		t.Fatalf("install must surface the failed stash migration; changed=%v", changed)
+	}
+	if changed {
+		t.Errorf("install must not report a change when the migration aborted")
+	}
+
+	// settings.json is byte-identical: the old command still pins oldPrev.
+	got, readErr := os.ReadFile(settingsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != settings {
+		t.Errorf("settings.json must be untouched after an aborted migration:\ngot  %s\nwant %s", got, settings)
+	}
+
+	// The stash is still where the surviving installed command points.
+	stash, readErr := os.ReadFile(oldPrev)
+	if readErr != nil {
+		t.Fatalf("old stash must survive an aborted migration: %v", readErr)
+	}
+	if string(stash) != string(stashBody) {
+		t.Errorf("old stash body mismatch: got %s want %s", stash, stashBody)
+	}
+
+	// Opt-out still restores the third-party command from the pinned path.
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(settingsPath)
+	if !strings.Contains(string(raw), "third-party.sh") {
+		t.Errorf("opt-out lost the chained third-party command: %s", raw)
+	}
+}
+
+// "Nothing to migrate" is not a migration failure: an unset or unchanged
+// pinned path, a stash already sitting at the new path, and an absent old
+// stash must all leave the refresh free to proceed.
+func TestMigratePrevStatusLine_NoOpCasesSucceed(t *testing.T) {
+	dir := t.TempDir()
+	newPrev := filepath.Join(dir, "new-prev.json")
+
+	if stale, err := migratePrevStatusLine("", newPrev); err != nil || stale != "" {
+		t.Errorf("unset old path must be a no-op, got stale=%q err=%v", stale, err)
+	}
+	if stale, err := migratePrevStatusLine(newPrev, newPrev); err != nil || stale != "" {
+		t.Errorf("unchanged path must be a no-op, got stale=%q err=%v", stale, err)
+	}
+	if stale, err := migratePrevStatusLine(filepath.Join(dir, "absent.json"), newPrev); err != nil || stale != "" {
+		t.Errorf("absent old stash must be a no-op, got stale=%q err=%v", stale, err)
+	}
+	if _, err := os.Stat(newPrev); !os.IsNotExist(err) {
+		t.Errorf("no-op migration must not create the new stash; err=%v", err)
+	}
+
+	// An identical stash already at newPrev is the already-migrated case: no
+	// write, and the old copy is still reported for post-commit cleanup.
+	oldPrev := filepath.Join(dir, "old-prev.json")
+	if err := os.WriteFile(oldPrev, []byte(`{"old":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPrev, []byte(`{"old":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeMtime := statModTime(t, newPrev)
+	stale, err := migratePrevStatusLine(oldPrev, newPrev)
+	if err != nil {
+		t.Errorf("pre-existing identical stash must not be a failure, got %v", err)
+	}
+	if got := statModTime(t, newPrev); !got.Equal(beforeMtime) {
+		t.Errorf("an identical destination must not be rewritten; mtime %v -> %v", beforeMtime, got)
+	}
+	// The old copy is reported for post-commit cleanup, not removed here: the
+	// command settings.json still holds is the one pinned to oldPrev.
+	if stale != oldPrev {
+		t.Errorf("staleCopy=%q, want %q", stale, oldPrev)
+	}
+	if _, err := os.Stat(oldPrev); err != nil {
+		t.Errorf("old stash must survive until the settings write commits: %v", err)
+	}
+}
+
+func statModTime(t *testing.T, path string) time.Time {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return st.ModTime()
+}
+
+// A stash sitting at newPrev is NOT automatically the one to keep. It can be a
+// leftover from an earlier cycle under that config dir — a migration whose
+// settings write failed, a stash written before the dir last moved, or a file
+// truncated by a crashed write — while oldPrev holds the command settings.json
+// is pinned to right now. Retiring oldPrev in favour of that leftover hands the
+// refreshed hook a status line the user has already replaced, and leaves opt-out
+// restoring the wrong object. The live stash must win.
+func TestMigratePrevStatusLine_ReplacesADivergentDestination(t *testing.T) {
+	dir := t.TempDir()
+	oldPrev := filepath.Join(dir, "old-prev.json")
+	newPrev := filepath.Join(dir, "moved", "new-prev.json")
+
+	live := []byte(`{"statusLine":{"type":"command","command":"current-third-party.sh"}}`)
+	if err := os.WriteFile(oldPrev, live, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(newPrev), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Two ways the destination can be wrong: superseded content, and a half
+	// written file. Both must lose to the stash the installed command names.
+	for _, leftover := range []string{
+		`{"statusLine":{"type":"command","command":"superseded.sh"}}`,
+		`{"statusLine":{"type":"comm`,
+	} {
+		if err := os.WriteFile(newPrev, []byte(leftover), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		stale, err := migratePrevStatusLine(oldPrev, newPrev)
+		if err != nil {
+			t.Fatalf("migratePrevStatusLine(%q): %v", leftover, err)
+		}
+		if got, _ := os.ReadFile(newPrev); string(got) != string(live) {
+			t.Errorf("destination must be replaced by the live stash, got %s", got)
+		}
+		if stale != oldPrev {
+			t.Errorf("staleCopy=%q, want %q", stale, oldPrev)
+		}
+		if _, err := os.Stat(oldPrev); err != nil {
+			t.Errorf("old stash must survive until the settings write commits: %v", err)
+		}
+	}
+}
+
+// The stash migration must be non-destructive until settings.json commits.
+// Between the two, the command Claude actually holds is still the OLD one,
+// pinned to oldPrev — so moving the file there strands the chain the moment the
+// write fails (a Windows sharing violation, a locked config dir), leaving the
+// user's third-party status line silently unreachable while the refresh reports
+// an error. Copy first, delete after.
+func TestEnsureClaudeStatusLineHook_KeepsOldStashWhenSettingsWriteFails(t *testing.T) {
+	home := t.TempDir()
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+
+	oldPrev := filepath.Join(t.TempDir(), "old-prev.json")
+	stashBody := []byte(`{"statusLine":{"type":"command","command":"third-party.sh"}}`)
+	if err := os.WriteFile(oldPrev, stashBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldCmd := statusLinePosixCommand("/old/path/aiexpedite", "/old/cache.json", oldPrev)
+
+	newPrev := filepath.Join(t.TempDir(), "new-prev.json")
+	t.Setenv("AIEXPEDITE_CLAUDE_STATUSLINE_PREV", newPrev)
+
+	settingsPath := filepath.Join(claudeDir, "settings.json")
+	settings := `{"theme":"dark","statusLine":{"type":"command","command":` +
+		mustJSONString(t, oldCmd) + `}}`
+	if err := os.WriteFile(settingsPath, []byte(settings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	prevWrite := statusLineWriteFile
+	statusLineWriteFile = func(string, []byte, os.FileMode) error {
+		return errors.New("sharing violation")
+	}
+	changed, err := ensureClaudeStatusLineHook(home)
+	statusLineWriteFile = prevWrite
+	if err == nil {
+		t.Fatalf("install must surface the failed settings write; changed=%v", changed)
+	}
+	if changed {
+		t.Errorf("install must not report a change when the settings write failed")
+	}
+
+	// settings.json is untouched, so the command in force still pins oldPrev…
+	got, readErr := os.ReadFile(settingsPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != settings {
+		t.Errorf("settings.json must be untouched after a failed write:\ngot  %s\nwant %s", got, settings)
+	}
+	// …and the stash it points at must still be there.
+	stash, readErr := os.ReadFile(oldPrev)
+	if readErr != nil {
+		t.Fatalf("old stash must survive a failed settings write: %v", readErr)
+	}
+	if string(stash) != string(stashBody) {
+		t.Errorf("old stash body mismatch: got %s want %s", stash, stashBody)
+	}
+
+	// The chain is genuinely intact: opt-out restores the third-party command.
+	if changed, err := removeClaudeStatusLineHook(home); err != nil || !changed {
+		t.Fatalf("remove: changed=%v err=%v", changed, err)
+	}
+	raw, _ := os.ReadFile(settingsPath)
+	if !strings.Contains(string(raw), "third-party.sh") {
+		t.Errorf("opt-out lost the chained third-party command: %s", raw)
+	}
+}
+
+// An already-migrated destination is the one committed migration path that
+// never runs through writePrevStatusLineBytes, so a stash an older build left
+// at newPrev keeps whatever mode that build gave it. Matching bytes must not
+// buy a permissive file a pass: the old owner-only copy is retired right after
+// this, and the surviving stash carries the chained command, which can include
+// inline env vars / tokens.
+func TestMigratePrevStatusLine_TightensAnIdenticalPermissiveDestination(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+	oldPrev := filepath.Join(dir, "old-prev.json")
+	newPrev := filepath.Join(dir, "new-prev.json")
+	live := []byte(`{"statusLine":{"type":"command","command":"third-party --token=secret"}}`)
+
+	if err := os.WriteFile(oldPrev, live, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPrev, live, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(newPrev, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	beforeMtime := statModTime(t, newPrev)
+
+	stale, err := migratePrevStatusLine(oldPrev, newPrev)
+	if err != nil {
+		t.Fatalf("migratePrevStatusLine: %v", err)
+	}
+	// Tightened in place: same bytes, same mtime, private mode.
+	assertPrivateStash(t, newPrev, live)
+	if got := statModTime(t, newPrev); !got.Equal(beforeMtime) {
+		t.Errorf("an identical destination must be chmodded, not rewritten; mtime %v -> %v", beforeMtime, got)
+	}
+	if stale != oldPrev {
+		t.Errorf("staleCopy=%q, want %q", stale, oldPrev)
 	}
 }
