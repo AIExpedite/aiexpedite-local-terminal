@@ -1909,12 +1909,15 @@ func TestRefreshClaudeUsageIfStale_DedupesAgainstAnotherWriter(t *testing.T) {
 	}, now.Add(-10*time.Second), "", claudeRateLimitSourceProbe)
 
 	// A stale-looking gather (latest passed as zero) still stands down, because
-	// the SHARED cache says the account was just measured.
-	if refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "") {
-		t.Error("a routine gather must stand down when another writer just observed")
+	// the SHARED cache says the account was just measured. The dedupe is the
+	// REQUEST count; the return value is the caller's re-read signal, and here it
+	// is true because the reading that suppressed the request is newer than the
+	// (empty) view the caller passed in.
+	if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "") {
+		t.Error("the suppressing reading is newer than the caller's view, so it must re-read")
 	}
 	if got := atomic.LoadInt64(calls); got != 0 {
-		t.Errorf("request count=%d, want 0", got)
+		t.Errorf("request count=%d, want 0 — a routine gather must stand down when another writer just observed", got)
 	}
 
 	// A user-initiated refresh is not deduped — somebody is looking at the card.
@@ -2810,14 +2813,52 @@ func TestRefreshClaudeUsageIfStale_SharedObservationSettlesTheRunDebt(t *testing
 	}, sharedAt, "", claudeRateLimitSourceStatusLine)
 
 	claudeUsageProbe.recordOwed(runAt)
-	if refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "") {
-		t.Error("a suppressed probe wrote nothing of its own, so it must not report a refresh")
+	// True even though this process issued no request: the caller loaded its view
+	// with nothing observed, the shared cache now holds `sharedAt`, and the debt
+	// that would have brought a trailing probe back for it is settled below. A
+	// false here would sign the pre-write metrics and leave the backend stale.
+	if !refreshClaudeUsageIfStale(context.Background(), now, time.Time{}, probeTestToken, "") {
+		t.Error("a probe suppressed by a reading NEWER than the caller's must still ask it to re-read")
 	}
 	if got := atomic.LoadInt64(calls); got != 0 {
 		t.Errorf("request count=%d, want 0 — another writer already answered this question", got)
 	}
 	if got := claudeUsageProbe.owedObservation(); !got.IsZero() {
 		t.Errorf("owedObservation=%s, want the debt settled by the shared reading at %s", got, sharedAt)
+	}
+}
+
+// ... and the other half of that signal: the suppressing reading is very often
+// the one the caller ALREADY loaded (a second gather inside the same throttle
+// window suppresses against the same bucket it just read). Re-reading then buys
+// nothing, so the reload signal has to be "the shared snapshot advanced past
+// what you hold", not the bare fact that the dedupe fired.
+func TestRefreshClaudeUsageIfStale_SuppressedByTheCallersOwnReadingDoesNotAskForAReload(t *testing.T) {
+	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
+	observed := now.Add(-claudeUsageProbeStaleAfter - time.Minute) // stale, so the TTL gate opens
+
+	cache, calls := armClaudeUsageProbe(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Error("the shared-cache dedupe should have suppressed this request")
+	})
+	// An interval wide enough that the caller's own (TTL-stale) reading is still
+	// newer than the dedupe baseline — the state where the branch suppresses on
+	// the very bucket the caller is holding.
+	t.Setenv(claudeUsageProbeMinIntervalEnv, "3600000")
+	mergeClaudeRateLimitCacheFromSource(cache, map[string]claudeRateLimitBucket{
+		claudeWindowFiveHour: {
+			UsedPercentage: 44, ResetsAtMs: now.Add(3 * time.Hour).UnixMilli(),
+			ObservedAtMs: observed.UnixMilli(), usageKnown: true,
+		},
+	}, observed, "", claudeRateLimitSourceStatusLine)
+
+	// The dedupe baseline for a routine gather is `now - interval`, which the
+	// caller's own reading is newer than — so the branch fires on the very bucket
+	// the caller passed in as `latest`.
+	if refreshClaudeUsageIfStale(context.Background(), now, observed, probeTestToken, "") {
+		t.Error("the shared cache holds exactly what the caller already read; a re-read is wasted work")
+	}
+	if got := atomic.LoadInt64(calls); got != 0 {
+		t.Errorf("request count=%d, want 0", got)
 	}
 }
 

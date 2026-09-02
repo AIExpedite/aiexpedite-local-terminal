@@ -1116,6 +1116,13 @@ func runClaudeUsageProbe(ctx context.Context, now time.Time, forced bool) (bool,
 // request is in flight legitimately keeps its newer reading and this probe's
 // bucket is refused as older. A caller settling a post-run debt must judge that
 // instant, not the bare `refreshed` — see refreshClaudeUsageIfStale.
+//
+// It is ALSO populated, with `refreshed` false, when the cross-process dedupe
+// suppressed the request because another writer had already recorded a reading:
+// that reading is in the shared cache now, so a caller that loaded its view
+// earlier must still re-read. Every other non-refreshing path — opted out, no
+// credential, throttled, failed — returns a zero instant, so "non-zero"
+// unambiguously means the shared cache holds this observation.
 func probeClaudeUsage(
 	ctx context.Context,
 	now time.Time,
@@ -1166,7 +1173,14 @@ func probeClaudeUsage(
 		// settleOwedIfCovered re-checks coverage against the CURRENT debt under the
 		// gate lock, so a run that finished after this reading keeps its debt.
 		claudeUsageProbe.settleOwedIfCovered(sharedAt)
-		return false, time.Time{}, nil
+		// Report the shared reading even though this process issued no request.
+		// `refreshed` stays false — nothing here wrote, and finish() must not
+		// record a refresh a joiner could inherit as ours — but the caller still
+		// has to know the SHARED cache moved: it loaded its view before this
+		// check, so without the instant it would shape metrics from the pre-write
+		// buckets while the debt (and the trailing retry that would have
+		// corrected it) is already settled. See refreshClaudeUsageIfStale.
+		return false, sharedAt, nil
 	}
 	endpoint := claudeUsageProbeURL()
 	if endpoint == "" {
@@ -1378,8 +1392,10 @@ func claudeUsageProbeStatus(raw string) string {
 // offline, single-flight, minimum interval, 429 hold) belongs to the probe
 // itself and is not restated here.
 //
-// Returns whether the cache was refreshed, so the caller knows whether it must
-// re-read before shaping the metrics.
+// Returns whether the caller must re-read the cache before shaping the metrics.
+// That is USUALLY "this probe refreshed it", but it also covers the case where
+// no request went out because another writer on this machine had already
+// recorded a reading newer than the `latest` the caller passed in.
 func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, accessToken, fingerprint string) bool {
 	// CLAIM the bypass off THIS gather's context rather than a process-global
 	// flag: this function is in the common parser path, so a routine machine-info
@@ -1476,7 +1492,19 @@ func refreshClaudeUsageIfStale(ctx context.Context, now, latest time.Time, acces
 	if refreshed && owing && claudeUsageObservationCovers(observedAt, owed) {
 		claudeUsageProbe.settleOwed(owed)
 	}
-	return refreshed
+	if refreshed {
+		return true
+	}
+	// No request went out, but the cross-process dedupe may have suppressed it
+	// precisely BECAUSE another writer — a second agent channel, the status-line
+	// hook — recorded a reading after the caller loaded `latest`. That reading is
+	// on disk now and the debt it covers has just been settled, so the trailing
+	// retry will not come back for it: reporting "not refreshed" here would
+	// publish the pre-write metrics and leave the backend stale until some later
+	// poll. Both instants come from claudeSnapshotFreshness, so a strictly newer
+	// one means the DISPLAYED snapshot advanced and re-reading is worth a load;
+	// an equal one is the same reading the caller already holds.
+	return !observedAt.IsZero() && observedAt.After(latest)
 }
 
 // triggerClaudeUsageProbeAfterRun fires the probe off the hot path once a Claude
