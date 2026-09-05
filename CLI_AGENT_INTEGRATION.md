@@ -347,7 +347,9 @@ Codex build, or one missing the configured model, is reported non-exhaustive —
 two Codex clients share that file); Antigravity from `agy models`, folding the
 effort-suffixed slugs (`gemini-3.8-flash-high`) into one family with a scale
 and marking unsuffixed slugs `noEffort` (`agy` refuses `--effort` for them);
-Grok from `grok models` (default marked, any levels named on the line); Claude
+Grok from `grok models` (order and default) enriched from `~/.grok/models_cache.json`,
+which listing refreshes when signed in and which carries the per-model
+`reasoning_efforts` menu the TUI's `/model` picker shows; Claude
 Code as its alias set with the scale from `claude --help`, non-exhaustive;
 OpenCode re-shaped from its readiness probe. A user-initiated usage refresh
 resets the cache. The signed refresh receipt canonicalises both fields
