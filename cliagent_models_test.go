@@ -119,16 +119,78 @@ func TestDiscoverCodexModelsReadsCodexHome(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "models_cache.json"), []byte(`{"models":[{"slug":"gpt-6-astra","supported_reasoning_levels":[{"effort":"high"}]}]}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "models_cache.json"), []byte(`{"client_version":"0.153.4","models":[{"slug":"gpt-6-astra","supported_reasoning_levels":[{"effort":"high"}]}]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("CODEX_HOME", "")
-	got, ok := discoverCodexModels(home)
-	if !ok || len(got.Models) != 1 || got.Models[0].ID != "gpt-6-astra" {
+	got, ok := discoverCodexModels(home, "codex-cli 0.153.4")
+	if !ok || len(got.Models) != 1 || got.Models[0].ID != "gpt-6-astra" || !got.Exhaustive {
 		t.Fatalf("got ok=%v %#v", ok, got)
 	}
-	if _, ok := discoverCodexModels(t.TempDir()); ok {
+	if _, ok := discoverCodexModels(t.TempDir(), "codex-cli 0.153.4"); ok {
 		t.Fatal("a missing cache is inconclusive, not empty")
+	}
+}
+
+// 2026-09-05: Codex 0.148.0 → 0.153.4. The old build's cache listed eight
+// models without gpt-6-astra — the new build's default and the model in
+// config.toml — until the first run rewrote it. An exhaustive list in that
+// window would have vetoed every gpt-6-astra pin.
+func TestDiscoverCodexModelsSurvivesAStaleCacheAfterAnUpgrade(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cache := `{"client_version":"0.148.0","models":[{"slug":"gpt-5.6-sol","visibility":"list","priority":6,"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]}]}`
+	if err := os.WriteFile(filepath.Join(dir, "models_cache.json"), []byte(cache), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte("model = \"gpt-6-astra\"\nmodel_reasoning_effort = \"medium\"\n\n[profiles.fast]\nmodel = \"gpt-5.4-mini\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", "")
+	got, ok := discoverCodexModels(home, "codex-cli 0.153.4")
+	if !ok {
+		t.Fatal("expected a conclusive parse")
+	}
+	if got.Exhaustive {
+		t.Fatal("a cache from another build, missing the configured model, is not exhaustive")
+	}
+	if got.DefaultModel != "gpt-6-astra" {
+		t.Fatalf("default = %q", got.DefaultModel)
+	}
+	if len(got.Models) != 2 || got.Models[0].ID != "gpt-6-astra" || got.Models[1].ID != "gpt-5.6-sol" {
+		t.Fatalf("models = %#v", got.Models)
+	}
+	if got.Models[0].Efforts != nil || got.Models[0].NoEffort {
+		t.Fatal("the configured model's scale is unknown, not empty")
+	}
+}
+
+func TestCodexCacheMatchesInstalled(t *testing.T) {
+	cases := []struct {
+		cache, installed string
+		want             bool
+	}{
+		{"0.153.4", "codex-cli 0.153.4", true},
+		{"0.148.0", "codex-cli 0.153.4", false},
+		{"", "codex-cli 0.153.4", true},
+		{"0.153.4", "", true},
+		{"v0.153.4", "0.153.4", true},
+	}
+	for _, tc := range cases {
+		if got := codexCacheMatchesInstalled(tc.cache, tc.installed); got != tc.want {
+			t.Fatalf("cache %q installed %q: got %v", tc.cache, tc.installed, got)
+		}
+	}
+}
+
+func TestReconcileCodexDiscoveryKeepsAListedConfiguredModelExhaustive(t *testing.T) {
+	in := cliAgentModelDiscovery{Exhaustive: true, Models: []cliAgentModelDetail{{ID: "gpt-6-astra", Efforts: []string{"low", "high"}}}}
+	got := reconcileCodexDiscovery(in, "0.153.4", "codex-cli 0.153.4", "gpt-6-astra")
+	if !got.Exhaustive || got.DefaultModel != "gpt-6-astra" || len(got.Models) != 1 {
+		t.Fatalf("got %#v", got)
 	}
 }
 
