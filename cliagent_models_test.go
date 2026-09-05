@@ -178,6 +178,8 @@ func TestCodexCacheMatchesInstalled(t *testing.T) {
 		{"", "codex-cli 0.153.4", true},
 		{"0.153.4", "", true},
 		{"v0.153.4", "0.153.4", true},
+		{"1.0.13", "grok 1.0.13 (5e9a58528b76) [stable]", true},
+		{"1.0.12", "grok 1.0.13 (5e9a58528b76) [stable]", false},
 	}
 	for _, tc := range cases {
 		if got := codexCacheMatchesInstalled(tc.cache, tc.installed); got != tc.want {
@@ -336,5 +338,64 @@ func TestCLIUsageReceiptCarriesModelDetails(t *testing.T) {
 	long.ModelDetails = []cliAgentModelDetail{{ID: "x", Efforts: make([]string, cliUsageMaxEffortsPerModel+1)}}
 	if _, _, _, err := canonicalCLIUsageRefreshReceipt("r4", 4, true, []cliAgentUsage{long}, nil); err == nil {
 		t.Fatal("an over-long scale must be rejected")
+	}
+}
+
+// Trimmed from the real ~/.grok/models_cache.json written by Grok Build 1.0.13
+// on 2026-09-05 after `grok models` ran signed in.
+const realGrokModelsCache = `{"fetched_at":"2026-09-05T23:48:04Z","grok_version":"1.0.13","models":{
+ "grok-4.6":{"info":{"id":"grok-4.6","name":"Grok 4.6","hidden":false,"reasoning_effort":"high","supports_reasoning_effort":true,
+   "reasoning_efforts":[{"id":"xhigh","value":"xhigh","label":"Extra High Effort","default":false},{"id":"high","value":"high","label":"High Effort","default":true},{"id":"medium","value":"medium","label":"Medium Effort","default":false},{"id":"low","value":"low","label":"Low Effort","default":false}]}},
+ "grok-4.5":{"info":{"id":"grok-4.5","name":"Grok 4.5","hidden":false,"reasoning_effort":"high","supports_reasoning_effort":true,
+   "reasoning_efforts":[{"id":"high","value":"high","default":true},{"id":"low","value":"low","default":false},{"id":"deep","value":"deep","label":"Deep","default":false}]}},
+ "grok-secret":{"info":{"id":"grok-secret","name":"Secret","hidden":true,"supports_reasoning_effort":false,"reasoning_efforts":[]}},
+ "grok-lite":{"info":{"id":"grok-lite","name":"Grok Lite","hidden":false,"supports_reasoning_effort":false,"reasoning_efforts":[]}}
+}}`
+
+func TestDiscoverGrokModelsMergesTheListWithTheCache(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".grok"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".grok", "models_cache.json"), []byte(realGrokModelsCache), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROK_HOME", "")
+	prev := cliAgentModelProbeRunner
+	cliAgentModelProbeRunner = func(string, []string, ...string) (string, bool) { return realGrokModelsLoggedOut, true }
+	t.Cleanup(func() { cliAgentModelProbeRunner = prev })
+
+	got, ok := discoverGrokModels(detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.0.13"}, home)
+	if !ok || !got.Exhaustive || got.DefaultModel != "grok-4.6" {
+		t.Fatalf("got ok=%v %#v", ok, got)
+	}
+	want := []cliAgentModelDetail{
+		{ID: "grok-4.6", Label: "Grok 4.6", Efforts: []string{"low", "medium", "high", "xhigh"}, DefaultEffort: "high"},
+		// `deep` is a per-model menu id outside the shared union and is dropped.
+		{ID: "grok-4.5", Label: "Grok 4.5", Efforts: []string{"low", "high"}, DefaultEffort: "high"},
+		// Cache-only, visible, refuses the flag; the hidden one never appears.
+		{ID: "grok-lite", Label: "Grok Lite", NoEffort: true},
+	}
+	if !reflect.DeepEqual(got.Models, want) {
+		t.Fatalf("models = %#v\nwant %#v", got.Models, want)
+	}
+
+	// A cache from another Grok build is not the whole story.
+	stale, _ := discoverGrokModels(detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.1.0"}, home)
+	if stale.Exhaustive {
+		t.Fatal("cache from another build must be non-exhaustive")
+	}
+
+	// No cache: the list alone, scales unknown.
+	bare, ok := discoverGrokModels(detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.0.13"}, t.TempDir())
+	if !ok || len(bare.Models) != 2 || bare.Models[0].Efforts != nil {
+		t.Fatalf("bare = %#v", bare)
+	}
+
+	// No list either: the cache's visible models, alphabetical.
+	cliAgentModelProbeRunner = func(string, []string, ...string) (string, bool) { return "", false }
+	cacheOnly, ok := discoverGrokModels(detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.0.13"}, home)
+	if !ok || len(cacheOnly.Models) != 3 || cacheOnly.Models[0].ID != "grok-4.5" {
+		t.Fatalf("cacheOnly = %#v", cacheOnly)
 	}
 }
