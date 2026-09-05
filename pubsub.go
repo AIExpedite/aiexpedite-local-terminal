@@ -1034,6 +1034,9 @@ func handleCLIUsageRefreshCommand(ctx context.Context, topic *pubsub.Publisher, 
 	// computer" failure. Version probes stay cached: they are keyed on the
 	// binary, which a login does not change.
 	SetOpenCodeReadinessForceProbe(true)
+	// And for the model/effort discovery probes (Ship B5): a user who just
+	// logged a CLI in, or updated it, wants its current model list now.
+	resetCLIAgentModelProbeCache()
 	// Same reasoning for Claude's utilization probe: its minimum interval exists
 	// to bound background traffic, not to hold back a reading the user just
 	// asked for. Without this the receipt can be signed from a cache whose

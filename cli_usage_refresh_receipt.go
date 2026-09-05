@@ -55,27 +55,37 @@ type canonicalCLIUsageMetric struct {
 	Unknown    bool    `json:"unknown,omitempty"`
 }
 
+type canonicalCLIUsageModelDetail struct {
+	ID            string   `json:"id"`
+	Label         string   `json:"label,omitempty"`
+	Efforts       []string `json:"efforts,omitempty"`
+	DefaultEffort string   `json:"defaultEffort,omitempty"`
+	NoEffort      bool     `json:"noEffort,omitempty"`
+}
+
 type canonicalCLIUsageProvider struct {
-	CliAgentID           string                    `json:"cliAgentId,omitempty"`
-	Provider             string                    `json:"provider"`
-	Name                 string                    `json:"name,omitempty"`
-	Version              string                    `json:"version,omitempty"`
-	Path                 string                    `json:"path,omitempty"`
-	Account              string                    `json:"account,omitempty"`
-	Plan                 string                    `json:"plan,omitempty"`
-	Model                string                    `json:"model,omitempty"`
-	Models               []string                  `json:"models,omitempty"`
-	AccountFingerprint   string                    `json:"accountFingerprint,omitempty"`
-	Metrics              []canonicalCLIUsageMetric `json:"metrics,omitempty"`
-	CollectedAt          string                    `json:"collectedAt"`
-	DataSource           string                    `json:"dataSource,omitempty"`
-	Authenticated        *bool                     `json:"authenticated,omitempty"`
-	AuthState            string                    `json:"authState,omitempty"`
-	LoginExpiresAt       string                    `json:"loginExpiresAt,omitempty"`
-	LoginExpirationState string                    `json:"loginExpirationState,omitempty"`
-	Notice               string                    `json:"notice,omitempty"`
-	NoticeSeverity       string                    `json:"noticeSeverity,omitempty"`
-	NoticeURL            string                    `json:"noticeUrl,omitempty"`
+	CliAgentID           string                         `json:"cliAgentId,omitempty"`
+	Provider             string                         `json:"provider"`
+	Name                 string                         `json:"name,omitempty"`
+	Version              string                         `json:"version,omitempty"`
+	Path                 string                         `json:"path,omitempty"`
+	Account              string                         `json:"account,omitempty"`
+	Plan                 string                         `json:"plan,omitempty"`
+	Model                string                         `json:"model,omitempty"`
+	Models               []string                       `json:"models,omitempty"`
+	ModelDetails         []canonicalCLIUsageModelDetail `json:"modelDetails,omitempty"`
+	ModelsExhaustive     *bool                          `json:"modelsExhaustive,omitempty"`
+	AccountFingerprint   string                         `json:"accountFingerprint,omitempty"`
+	Metrics              []canonicalCLIUsageMetric      `json:"metrics,omitempty"`
+	CollectedAt          string                         `json:"collectedAt"`
+	DataSource           string                         `json:"dataSource,omitempty"`
+	Authenticated        *bool                          `json:"authenticated,omitempty"`
+	AuthState            string                         `json:"authState,omitempty"`
+	LoginExpiresAt       string                         `json:"loginExpiresAt,omitempty"`
+	LoginExpirationState string                         `json:"loginExpirationState,omitempty"`
+	Notice               string                         `json:"notice,omitempty"`
+	NoticeSeverity       string                         `json:"noticeSeverity,omitempty"`
+	NoticeURL            string                         `json:"noticeUrl,omitempty"`
 }
 
 func canonicalFloat(value *float64) (*string, error) {
@@ -148,6 +158,32 @@ func canonicalProvider(agent cliAgentUsage) (canonicalCLIUsageProvider, error) {
 			return canonicalCLIUsageProvider{}, errors.New("invalid receipt bounds")
 		}
 	}
+	if len(agent.ModelDetails) > cliUsageMaxModelsPerProvider {
+		return canonicalCLIUsageProvider{}, errors.New("invalid receipt bounds")
+	}
+	var modelDetails []canonicalCLIUsageModelDetail
+	modelIDs := map[string]struct{}{}
+	for _, detail := range agent.ModelDetails {
+		if detail.ID == "" || !bounded(detail.ID, 256) || !bounded(detail.Label, 256) || !bounded(detail.DefaultEffort, cliUsageMaxEffortLength) {
+			return canonicalCLIUsageProvider{}, errors.New("invalid receipt bounds")
+		}
+		if _, duplicate := modelIDs[detail.ID]; duplicate {
+			return canonicalCLIUsageProvider{}, errors.New("duplicate model identity")
+		}
+		modelIDs[detail.ID] = struct{}{}
+		if len(detail.Efforts) > cliUsageMaxEffortsPerModel {
+			return canonicalCLIUsageProvider{}, errors.New("invalid receipt bounds")
+		}
+		for _, effort := range detail.Efforts {
+			if effort == "" || !bounded(effort, cliUsageMaxEffortLength) {
+				return canonicalCLIUsageProvider{}, errors.New("invalid receipt bounds")
+			}
+		}
+		modelDetails = append(modelDetails, canonicalCLIUsageModelDetail{
+			ID: detail.ID, Label: detail.Label, Efforts: detail.Efforts,
+			DefaultEffort: detail.DefaultEffort, NoEffort: detail.NoEffort,
+		})
+	}
 	metrics := make([]canonicalCLIUsageMetric, 0, len(agent.Metrics))
 	metricIDs := map[string]struct{}{}
 	for _, metric := range agent.Metrics {
@@ -178,7 +214,8 @@ func canonicalProvider(agent cliAgentUsage) (canonicalCLIUsageProvider, error) {
 	return canonicalCLIUsageProvider{
 		CliAgentID: agent.CliAgentID, Provider: agent.Provider, Name: agent.Name,
 		Version: agent.Version, Path: agent.Path, Account: agent.Account, Plan: agent.Plan,
-		Model: agent.Model, Models: agent.Models, AccountFingerprint: agent.AccountFingerprint,
+		Model: agent.Model, Models: agent.Models, ModelDetails: modelDetails,
+		ModelsExhaustive: agent.ModelsExhaustive, AccountFingerprint: agent.AccountFingerprint,
 		Metrics: metrics, CollectedAt: agent.CollectedAt, DataSource: agent.DataSource,
 		Authenticated: agent.Authenticated, AuthState: agent.AuthState,
 		LoginExpiresAt: agent.LoginExpiresAt, LoginExpirationState: agent.LoginExpirationState,
