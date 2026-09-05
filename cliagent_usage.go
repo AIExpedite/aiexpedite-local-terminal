@@ -88,7 +88,13 @@ type cliAgentUsage struct {
 	// providers the user configured and exposes no quota of its own, so the list
 	// of reachable models IS the useful content of its card. Additive, like
 	// Model — parsers that cannot enumerate simply leave it nil.
-	Models             []string              `json:"models,omitempty"`
+	Models []string `json:"models,omitempty"`
+	// ModelDetails is what the CLI itself says about each model — label, the
+	// effort scale it accepts, its default level — and ModelsExhaustive says
+	// whether that list is everything the CLI will run (Ship B5,
+	// cliagent_models.go). Additive like Models: an older backend ignores both.
+	ModelDetails       []cliAgentModelDetail `json:"modelDetails,omitempty"`
+	ModelsExhaustive   *bool                 `json:"modelsExhaustive,omitempty"`
 	AccountFingerprint string                `json:"accountFingerprint,omitempty"`
 	Metrics            []cliAgentUsageMetric `json:"metrics,omitempty"`
 	CollectedAt        string                `json:"collectedAt"`
@@ -210,6 +216,7 @@ func gatherCLIAgentUsage(detected map[string]detectedCLIAgent, now time.Time) []
 		if usage.CliAgentID == "" {
 			usage.CliAgentID = agent.ID
 		}
+		attachCLIAgentModelDiscovery(agent.ID, entry, usage, home, now)
 		if usage.AccountFingerprint == "" {
 			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}
@@ -328,6 +335,7 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 		if usage.CliAgentID == "" {
 			usage.CliAgentID = agent.ID
 		}
+		attachCLIAgentModelDiscovery(agent.ID, entry, usage, home, now)
 		if usage.AccountFingerprint == "" {
 			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}

@@ -24,6 +24,14 @@
       "challengeTs": 3,
       "canonical": "AIEXPEDITE_CLI_USAGE_REFRESH_RECEIPT\n{\"version\":1,\"refreshId\":\"r3\",\"challengeTs\":3,\"success\":false,\"cliAgents\":[],\"errors\":[{\"provider\":\"claudeCode\",\"errorCategory\":\"protocol\"}]}",
       "signature": "4e53a24c238e6b461a6d68cb3a61ce39981f861a0b051e201e072c4f357ff0dd"
+    },
+    {
+      "name": "model-details-and-exhaustive-flag",
+      "secret": "secret",
+      "refreshId": "r4",
+      "challengeTs": 4,
+      "canonical": "AIEXPEDITE_CLI_USAGE_REFRESH_RECEIPT\n{\"version\":1,\"refreshId\":\"r4\",\"challengeTs\":4,\"success\":true,\"cliAgents\":[{\"provider\":\"antigravity\",\"models\":[\"gemini-3.8-flash\",\"claude-sonnet-4-6\"],\"modelDetails\":[{\"id\":\"gemini-3.8-flash\",\"label\":\"Gemini 3.8 Flash\",\"efforts\":[\"low\",\"medium\",\"high\"],\"defaultEffort\":\"medium\"},{\"id\":\"claude-sonnet-4-6\",\"noEffort\":true}],\"modelsExhaustive\":true,\"collectedAt\":\"now\"}],\"errors\":[]}",
+      "signature": "252302db9ca5049ffb607db91cc90504fc69ab5c2e4bb72a5dcd50359050abfd"
     }
   ]
 }
