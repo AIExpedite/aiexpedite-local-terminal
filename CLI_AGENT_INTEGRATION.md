@@ -336,6 +336,26 @@ Agents tab reads from `cliAgents[]` (see
 `grok login`, the entry still appears with empty account + dashed capacity
 gauges so the user sees they need to authenticate.
 
+## Model and effort discovery (Ship B5)
+
+Every provider snapshot in `cliAgents[]` also carries what the CLI itself says
+about its models — `modelDetails[{id, label, efforts, defaultEffort, noEffort}]`
+and `modelsExhaustive` — probed once per binary and cached for 30 minutes
+([cliagent_models.go](cliagent_models.go)): Codex from `~/.codex/models_cache.json`
+plus the top-level `model` in `config.toml` (a cache written by a different
+Codex build, or one missing the configured model, is reported non-exhaustive —
+two Codex clients share that file); Antigravity from `agy models`, folding the
+effort-suffixed slugs (`gemini-3.8-flash-high`) into one family with a scale
+and marking unsuffixed slugs `noEffort` (`agy` refuses `--effort` for them);
+Grok from `grok models` (default marked, any levels named on the line); Claude
+Code as its alias set with the scale from `claude --help`, non-exhaustive;
+OpenCode re-shaped from its readiness probe. A user-initiated usage refresh
+resets the cache. The signed refresh receipt canonicalises both fields
+(`testdata/cli_usage_refresh_receipt_vectors.json`, vector 4, mirrored in
+terminal-service), so **terminal-service must deploy first**.
+`AIX_B5_HARNESS_OUT=<file> go test -run TestB5ModelDiscoveryHarness -v` runs the
+real probes on this machine and writes the snapshot.
+
 ## Why ACP, not TUI scraping
 
 `grok` (no subcommand) launches an interactive TUI built around terminal
