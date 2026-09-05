@@ -17,8 +17,10 @@
 //     (`claude-sonnet-4-6`). So the suffixed slugs fold into one family with an
 //     effort scale, and an unsuffixed slug is reported as taking no effort.
 //   - Grok prints `grok models` as a bulleted list (`* grok-4.6 (default)`,
-//     `- grok-4.5`), logged in or not; any effort levels it names on a line are
-//     read from the same line.
+//     `- grok-4.5`) with no levels, but listing while signed in refreshes
+//     `~/.grok/models_cache.json`, whose per-model `reasoning_efforts` menu is
+//     what the TUI's `/model` picker shows. The list gives the order and the
+//     default, the cache gives label, scale and default level.
 //   - Claude Code has no list command (`claude model list` starts a session).
 //     Its aliases are what a device can report, and the scale comes from the
 //     `--effort <level>` line of `claude --help`. The list is NOT exhaustive —
@@ -190,11 +192,7 @@ func discoverCLIAgentModels(agentID string, detected detectedCLIAgent, home stri
 		}
 		return parseAntigravityModelList(out)
 	case "grok":
-		out, ok := cliAgentModelProbeRunner(detected.Path, sanitizeGrokMaintenanceSmokeEnv(os.Environ()), "models")
-		if !ok {
-			return cliAgentModelDiscovery{}, false
-		}
-		return parseGrokModelList(out)
+		return discoverGrokModels(detected, home)
 	case "claudecode":
 		out, ok := cliAgentModelProbeRunner(detected.Path, os.Environ(), "--help")
 		if !ok {
@@ -292,19 +290,27 @@ func reconcileCodexDiscovery(out cliAgentModelDiscovery, cacheVersion, installed
 	return out
 }
 
-// codexCacheMatchesInstalled compares the cache's client_version with the
-// installed binary's `--version` output ("codex-cli 0.153.4"). An unknown
-// version on either side is treated as a match: the cache is then only as
-// trustworthy as before, and the configured-model rule still applies.
+// codexCacheMatchesInstalled compares a cache's writer version with the
+// installed binary's `--version` output ("codex-cli 0.153.4", "grok 1.0.13
+// (…) [stable]"); Grok's cache reuses it. An unknown version on either side is
+// treated as a match: the cache is then only as trustworthy as before, and the
+// configured-model rule still applies.
 func codexCacheMatchesInstalled(cacheVersion, installedVersion string) bool {
-	cacheVersion = strings.TrimSpace(cacheVersion)
-	installed := strings.TrimSpace(installedVersion)
-	if cacheVersion == "" || installed == "" {
+	cacheToken := versionToken(cacheVersion)
+	installedToken := versionToken(installedVersion)
+	if cacheToken == "" || installedToken == "" {
 		return true
 	}
-	fields := strings.Fields(installed)
-	installed = fields[len(fields)-1]
-	return strings.TrimPrefix(installed, "v") == strings.TrimPrefix(cacheVersion, "v")
+	return cacheToken == installedToken
+}
+
+var versionTokenPattern = regexp.MustCompile(`\d+\.\d+(?:\.\d+)?`)
+
+// versionToken extracts the first version-shaped token from a `--version`
+// line or a cache field: "codex-cli 0.153.4", "grok 1.0.13 (5e9a…) [stable]"
+// and "v0.153.4" all yield the bare number.
+func versionToken(value string) string {
+	return versionTokenPattern.FindString(value)
 }
 
 // codexConfigModelLine matches a top-level `model = "…"` in config.toml.
@@ -465,8 +471,127 @@ func splitEffortSuffix(slug string) (string, string) {
 }
 
 /* --------------------------------------------------------------------------
-   Grok — `grok models`
+   Grok — `grok models` + ~/.grok/models_cache.json
    -------------------------------------------------------------------------- */
+
+// grokModelsCacheFile is the model catalog Grok fetches from its backend when
+// it lists models while signed in (`origin: …/v1/models`). It is the source of
+// the per-model effort menu the TUI's `/model` picker shows — `grok models`
+// itself prints ids only — so the list command is run first (it refreshes the
+// cache) and the cache is read second.
+type grokModelsCacheFile struct {
+	GrokVersion string `json:"grok_version"`
+	Models      map[string]struct {
+		Info struct {
+			ID                      string `json:"id"`
+			Name                    string `json:"name"`
+			Hidden                  bool   `json:"hidden"`
+			ReasoningEffort         string `json:"reasoning_effort"`
+			SupportsReasoningEffort *bool  `json:"supports_reasoning_effort"`
+			ReasoningEfforts        []struct {
+				ID      string `json:"id"`
+				Value   string `json:"value"`
+				Default bool   `json:"default"`
+			} `json:"reasoning_efforts"`
+		} `json:"info"`
+	} `json:"models"`
+}
+
+func grokModelsCachePath(home string) string {
+	base := firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
+	if base == "" {
+		return ""
+	}
+	return expandHome(base, "models_cache.json")
+}
+
+// discoverGrokModels lists through the CLI (which refreshes the cache when
+// signed in) and enriches every listed model from the cache. A missing cache
+// leaves the list without scales; a missing list falls back to the cache's
+// visible models.
+func discoverGrokModels(detected detectedCLIAgent, home string) (cliAgentModelDiscovery, bool) {
+	var listed cliAgentModelDiscovery
+	listedOK := false
+	if out, ok := cliAgentModelProbeRunner(detected.Path, sanitizeGrokMaintenanceSmokeEnv(os.Environ()), "models"); ok {
+		listed, listedOK = parseGrokModelList(out)
+	}
+	var cache grokModelsCacheFile
+	cacheOK := false
+	if path := grokModelsCachePath(home); path != "" {
+		cacheOK = readJSONFile(path, &cache)
+	}
+	if !listedOK && !cacheOK {
+		return cliAgentModelDiscovery{}, false
+	}
+	return mergeGrokDiscovery(listed, listedOK, cache, cacheOK, detected.Version), true
+}
+
+// mergeGrokDiscovery keeps the list command's order (its default first) and
+// takes each model's label, scale and default level from the cache. Cache-only
+// models that are not hidden are appended; a cache written by another Grok
+// build than the one installed marks the result non-exhaustive, as for Codex.
+func mergeGrokDiscovery(listed cliAgentModelDiscovery, listedOK bool, cache grokModelsCacheFile, cacheOK bool, installedVersion string) cliAgentModelDiscovery {
+	out := cliAgentModelDiscovery{Exhaustive: true, DefaultModel: listed.DefaultModel}
+	seen := map[string]bool{}
+	enrich := func(detail cliAgentModelDetail) cliAgentModelDetail {
+		if !cacheOK {
+			return detail
+		}
+		entry, ok := cache.Models[detail.ID]
+		if !ok {
+			return detail
+		}
+		if detail.Label == "" {
+			detail.Label = strings.TrimSpace(entry.Info.Name)
+		}
+		if len(detail.Efforts) == 0 {
+			for _, level := range entry.Info.ReasoningEfforts {
+				if effort, ok := normalizeEffortToken(firstNonEmpty(level.Value, level.ID)); ok {
+					detail.Efforts = appendEffort(detail.Efforts, effort)
+					if level.Default && detail.DefaultEffort == "" {
+						detail.DefaultEffort = effort
+					}
+				}
+			}
+			if detail.DefaultEffort == "" {
+				if effort, ok := normalizeEffortToken(entry.Info.ReasoningEffort); ok && containsString(detail.Efforts, effort) {
+					detail.DefaultEffort = effort
+				}
+			}
+			if len(detail.Efforts) == 0 && entry.Info.SupportsReasoningEffort != nil && !*entry.Info.SupportsReasoningEffort {
+				detail.NoEffort = true
+			}
+		}
+		return boundedModelDetail(detail)
+	}
+	if listedOK {
+		for _, detail := range listed.Models {
+			if seen[detail.ID] {
+				continue
+			}
+			seen[detail.ID] = true
+			out.Models = append(out.Models, enrich(detail))
+		}
+	}
+	if cacheOK {
+		ids := make([]string, 0, len(cache.Models))
+		for id := range cache.Models {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			if seen[id] || cache.Models[id].Info.Hidden || strings.TrimSpace(id) == "" {
+				continue
+			}
+			seen[id] = true
+			out.Models = append(out.Models, enrich(cliAgentModelDetail{ID: id}))
+		}
+		if !codexCacheMatchesInstalled(cache.GrokVersion, installedVersion) {
+			out.Exhaustive = false
+		}
+	}
+	return out
+}
 
 var grokModelLine = regexp.MustCompile(`^\s*[*\-•]\s+(\S+)(.*)$`)
 
