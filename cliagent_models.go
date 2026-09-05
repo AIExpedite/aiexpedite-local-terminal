@@ -182,7 +182,7 @@ func cachedCLIAgentModelDiscovery(agentID string, detected detectedCLIAgent, hom
 func discoverCLIAgentModels(agentID string, detected detectedCLIAgent, home string) (cliAgentModelDiscovery, bool) {
 	switch strings.ToLower(strings.TrimSpace(agentID)) {
 	case "codex":
-		return discoverCodexModels(home)
+		return discoverCodexModels(home, detected.Version)
 	case "antigravity":
 		out, ok := cliAgentModelProbeRunner(detected.Path, sanitizeAntigravityEnv(os.Environ()), "models")
 		if !ok {
@@ -229,7 +229,14 @@ func runCLIAgentModelProbe(executable string, env []string, args ...string) (str
    -------------------------------------------------------------------------- */
 
 type codexModelsCacheFile struct {
-	Models []struct {
+	// ClientVersion is the Codex build that fetched the cache. After an
+	// upgrade the file still describes the OLD build's lineup until the new
+	// binary's first run rewrites it (observed 2026-09-05: 0.148.0's cache
+	// lacked gpt-6-astra, 0.153.4's default, for the minute between the
+	// install and the first `codex exec`), so a cache from another build is
+	// reported as non-exhaustive rather than letting it veto a pin.
+	ClientVersion string `json:"client_version"`
+	Models        []struct {
 		Slug                     string `json:"slug"`
 		DisplayName              string `json:"display_name"`
 		SupportedReasoningLevels []struct {
@@ -249,7 +256,7 @@ func codexModelsCachePath(home string) string {
 	return expandHome(base, "models_cache.json")
 }
 
-func discoverCodexModels(home string) (cliAgentModelDiscovery, bool) {
+func discoverCodexModels(home, installedVersion string) (cliAgentModelDiscovery, bool) {
 	path := codexModelsCachePath(home)
 	if path == "" {
 		return cliAgentModelDiscovery{}, false
@@ -258,7 +265,82 @@ func discoverCodexModels(home string) (cliAgentModelDiscovery, bool) {
 	if !readJSONFile(path, &cache) {
 		return cliAgentModelDiscovery{}, false
 	}
-	return parseCodexModelsCache(cache)
+	out, ok := parseCodexModelsCache(cache)
+	if !ok {
+		return out, false
+	}
+	return reconcileCodexDiscovery(out, cache.ClientVersion, installedVersion, readCodexConfiguredModel(home)), true
+}
+
+// reconcileCodexDiscovery applies the two facts the cache alone cannot carry:
+// the model the user configured in config.toml is offered whether or not the
+// cache lists it (it is what `codex` runs by default on this machine), and a
+// cache written by a different Codex build than the one installed is not the
+// whole story, so the list is marked non-exhaustive. Either way a stale cache
+// can no longer empty a routing slot.
+func reconcileCodexDiscovery(out cliAgentModelDiscovery, cacheVersion, installedVersion, configuredModel string) cliAgentModelDiscovery {
+	if configuredModel != "" {
+		out.DefaultModel = configuredModel
+		if !containsModelID(out.Models, configuredModel) {
+			out.Models = append([]cliAgentModelDetail{{ID: configuredModel}}, out.Models...)
+			out.Exhaustive = false
+		}
+	}
+	if !codexCacheMatchesInstalled(cacheVersion, installedVersion) {
+		out.Exhaustive = false
+	}
+	return out
+}
+
+// codexCacheMatchesInstalled compares the cache's client_version with the
+// installed binary's `--version` output ("codex-cli 0.153.4"). An unknown
+// version on either side is treated as a match: the cache is then only as
+// trustworthy as before, and the configured-model rule still applies.
+func codexCacheMatchesInstalled(cacheVersion, installedVersion string) bool {
+	cacheVersion = strings.TrimSpace(cacheVersion)
+	installed := strings.TrimSpace(installedVersion)
+	if cacheVersion == "" || installed == "" {
+		return true
+	}
+	fields := strings.Fields(installed)
+	installed = fields[len(fields)-1]
+	return strings.TrimPrefix(installed, "v") == strings.TrimPrefix(cacheVersion, "v")
+}
+
+// codexConfigModelLine matches a top-level `model = "…"` in config.toml.
+var codexConfigModelLine = regexp.MustCompile(`(?m)^\s*model\s*=\s*"([^"]+)"`)
+
+// readCodexConfiguredModel returns the top-level `model` from
+// CODEX_HOME/config.toml, or "" when there is none.
+func readCodexConfiguredModel(home string) string {
+	base := firstNonEmpty(os.Getenv("CODEX_HOME"), expandHome(home, ".codex"))
+	if base == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(expandHome(base, "config.toml"))
+	if err != nil {
+		return ""
+	}
+	// Only the top-level table: a `[profiles.x]` section's model is not the
+	// default this machine runs. Stop reading at the first table header.
+	text := string(raw)
+	if header := strings.Index(text, "\n["); header >= 0 {
+		text = text[:header]
+	}
+	match := codexConfigModelLine.FindStringSubmatch(text)
+	if match == nil {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
+}
+
+func containsModelID(models []cliAgentModelDetail, id string) bool {
+	for _, model := range models {
+		if model.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // parseCodexModelsCache keeps the models Codex itself lists (`visibility:
