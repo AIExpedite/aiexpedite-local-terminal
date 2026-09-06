@@ -419,11 +419,14 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign --display --verbose=4 "$APP"
 
-      # Beta supports silent bundle replacement, so the app inside its DMG
-      # must itself carry a notarization ticket. dev/stg deliberately use the
-      # browser/manual-install fallback and remain signed but unnotarized.
-      - name: Notarize and staple app bundle before packaging (beta)
-        if: matrix.env == 'beta'
+      # Every channel's app bundle is notarized and stapled before packaging.
+      # Beta needs it for silent bundle replacement; dev/stg need it because
+      # macOS Sequoia's Gatekeeper refuses a signed-but-unnotarized app outright
+      # ("Not Opened", no Open button — 2026-09-05, a dev install on a Mac
+      # could not proceed at all). The ticket rides on the .app, so the
+      # manual-install DMG opens without a warning; only beta additionally
+      # notarizes the DMG itself (below) for its silent-update path.
+      - name: Notarize and staple app bundle before packaging
         env:
           APPLE_ID: ${{ secrets.MACOS_NOTARIZATION_APPLE_ID }}
           TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
@@ -521,9 +524,10 @@ jobs:
             --sign "$SIGNING_IDENTITY" \
             "${{ steps.package_dmg.outputs.dmg_path }}"
 
-      # dev/stg are internal-only — Developer ID signed but not notarized.
-      # Internal testers can right-click → Open to bypass Gatekeeper.
-      # Only beta is notarized (so external Beta testers don't see warnings).
+      # dev/stg DMGs are Developer ID signed and carry a notarized, stapled
+      # app bundle (above), which is what Gatekeeper evaluates on launch. Only
+      # beta also notarizes the DMG container, through the finalize job, for
+      # its silent bundle-replacement path.
       - name: Submit DMG for notarization (beta only, no wait)
         if: matrix.env == 'beta'
         id: notarize_submit
@@ -573,7 +577,7 @@ jobs:
         run: |
           security delete-keychain $RUNNER_TEMP/build.keychain || true
 
-      # dev/stg: signed DMG is the final artifact (no notarization).
+      # dev/stg: signed DMG with the notarized app inside is the final artifact.
       - name: Upload artifacts (dev/stg final)
         if: matrix.env != 'beta'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

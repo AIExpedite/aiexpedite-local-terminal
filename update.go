@@ -381,10 +381,12 @@ func downloadAndVerifyUpdate(info *UpdateInfo) (string, error) {
 // downloadAndVerifyUpdate and applyVerifiedUpdate separately with a drain in
 // between.
 func downloadAndApplyUpdate(info *UpdateInfo) error {
-	// Non-capable macOS channels publish signed but intentionally unnotarized
-	// DMGs. Their check-and-offer UI must not feed those artifacts into the
-	// silent bundle-replacement Gatekeeper path; the user's click opens the
-	// release asset in the browser for the ordinary manual installation flow.
+	// Non-capable macOS channels (dev/stg) publish a signed DMG whose app
+	// bundle is notarized, but the DMG container itself is not, and those
+	// channels deliberately do not silently replace the bundle. Their
+	// check-and-offer UI must not feed those artifacts into the silent
+	// bundle-replacement Gatekeeper path; the user's click opens the release
+	// asset in the browser for the ordinary manual installation flow.
 	if !silentUpdateCapable() {
 		if info == nil || info.AssetURL == "" {
 			return errors.New("no update release available to open")
