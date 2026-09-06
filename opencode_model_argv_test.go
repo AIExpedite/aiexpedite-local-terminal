@@ -72,6 +72,11 @@ func TestBuildOpenCodeInteractiveArgs_ForwardsModel(t *testing.T) {
 			want: []string{"run", "--format", "json", "--model", openCodeTestModel, "implement", "the", "feature"},
 		},
 		{
+			name: "--variant (reasoning effort) keeps its value beside --model",
+			in:   []string{"--model", openCodeTestModel, "--variant", "high", "implement the feature"},
+			want: []string{"run", "--format", "json", "--model", openCodeTestModel, "--variant", "high", "implement the feature"},
+		},
+		{
 			name: "no model pins OpenCode's own default",
 			in:   []string{"implement the feature"},
 			want: []string{"run", "--format", "json", "implement the feature"},

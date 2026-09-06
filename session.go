@@ -2566,9 +2566,14 @@ func buildOpenCodeInteractiveArgs(args []string) []string {
 var openCodeForwardedValuedFlags = map[string]bool{
 	"--model": true,
 	"-m":      true,
-	"--agent": true,
-	"--port":  true,
-	"--host":  true,
+	// `opencode run --variant <level>` is the provider-specific reasoning
+	// effort; the orchestrator composes it beside --model (shared-constants
+	// CLI_AGENT_EFFORT_FLAG_BY_ID). Without this entry the level would be read
+	// as prompt text and the run would silently use the default effort.
+	"--variant": true,
+	"--agent":   true,
+	"--port":    true,
+	"--host":    true,
 }
 
 // openCodeDiagnosticTokens are invocations that ask OpenCode for information
