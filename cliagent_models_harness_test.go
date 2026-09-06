@@ -24,6 +24,9 @@ func TestB5ModelDiscoveryHarness(t *testing.T) {
 	if realHomeAtStartup != "" {
 		t.Setenv("HOME", realHomeAtStartup)
 		t.Setenv("USERPROFILE", realHomeAtStartup)
+		if realAppDataAtStartup != "" {
+			t.Setenv("APPDATA", realAppDataAtStartup)
+		}
 		// OpenCode reads its provider config from XDG_CONFIG_HOME, which the
 		// sandbox also redirects; a sandboxed value hides every local provider.
 		if strings.HasPrefix(os.Getenv("XDG_CONFIG_HOME"), testSandboxDir) {

@@ -153,8 +153,25 @@ func TestSandboxIsNotTheRealAgentInstall(t *testing.T) {
 	if isPathSafeUnder(ConfigPath(), realConfigDirAtStartup) || ConfigPath() == filepath.Join(realConfigDirAtStartup, "config.json") {
 		t.Fatalf("ConfigPath() = %q is inside the real agent directory %q", ConfigPath(), realConfigDirAtStartup)
 	}
-	if realHomeAtStartup != "" && isPathSafeUnder(testSandboxDir, realHomeAtStartup) {
+	// On Windows the OS temp dir lives inside the profile
+	// (%LOCALAPPDATA%\Temp), so a sandbox under the real temp root is the
+	// expected placement there, not a leak into the home's dotfiles.
+	underRealTemp := runtime.GOOS == "windows" && realTempAtStartup != "" && isPathSafeUnder(testSandboxDir, realTempAtStartup)
+	if realHomeAtStartup != "" && !underRealTemp && isPathSafeUnder(testSandboxDir, realHomeAtStartup) {
 		t.Fatalf("sandbox %q is inside the developer's real home %q", testSandboxDir, realHomeAtStartup)
+	}
+}
+
+// The real home must be KNOWN, whatever shell launched the suite: the
+// real-binary harness restores it to find the CLIs' caches and logins, and an
+// empty record silently turns that into an empty sandbox (Windows PowerShell
+// has no $HOME — the profile is %USERPROFILE%).
+func TestRealHomeIsRecordedBeforeTheSandbox(t *testing.T) {
+	if realHomeAtStartup == "" {
+		t.Fatal("realHomeAtStartup is empty — sandboxTestConfigDir must record os.UserHomeDir() before redirecting it")
+	}
+	if isPathSafeUnder(realHomeAtStartup, testSandboxDir) || realHomeAtStartup == testSandboxDir {
+		t.Fatalf("recorded home %q is the sandbox %q, not the developer's", realHomeAtStartup, testSandboxDir)
 	}
 }
 

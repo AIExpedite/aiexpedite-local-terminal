@@ -399,3 +399,48 @@ func TestDiscoverGrokModelsMergesTheListWithTheCache(t *testing.T) {
 		t.Fatalf("cacheOnly = %#v", cacheOnly)
 	}
 }
+
+// Windows verification (2026-09-06, Daniel's dev box, dev channel). The three
+// text probes parsed byte-for-byte the same as on macOS, but a console child
+// may still hand back CRLF on Windows, so every parser must read the same
+// verdict from a CRLF copy of its real fixture as from the LF one.
+func TestModelDiscoveryParsersTolerateCRLF(t *testing.T) {
+	crlf := func(s string) string { return strings.ReplaceAll(s, "\n", "\r\n") }
+
+	agyLF, _ := parseAntigravityModelList(realAntigravityModels)
+	agyCRLF, ok := parseAntigravityModelList(crlf(realAntigravityModels))
+	if !ok || !reflect.DeepEqual(agyLF, agyCRLF) {
+		t.Fatalf("agy models: CRLF parse %#v differs from LF %#v", agyCRLF, agyLF)
+	}
+
+	grokLF, _ := parseGrokModelList(realGrokModelsLoggedOut)
+	grokCRLF, ok := parseGrokModelList(crlf(realGrokModelsLoggedOut))
+	if !ok || !reflect.DeepEqual(grokLF, grokCRLF) {
+		t.Fatalf("grok models: CRLF parse %#v differs from LF %#v", grokCRLF, grokLF)
+	}
+
+	claudeLF := claudeModelDiscovery(realClaudeHelp)
+	claudeCRLF := claudeModelDiscovery(crlf(realClaudeHelp))
+	if !reflect.DeepEqual(claudeLF, claudeCRLF) {
+		t.Fatalf("claude --help: CRLF parse %#v differs from LF %#v", claudeCRLF, claudeLF)
+	}
+}
+
+// On the Windows box the shared Codex cache was written by a NEWER client
+// (0.153.0, the desktop app) than the installed CLI (codex-cli 0.150.1) — the
+// opposite direction from the macOS observation. Either way the two builds
+// differ, so the list is non-exhaustive while the configured model stays
+// offered and stays the default.
+func TestReconcileCodexDiscoveryCacheNewerThanCLIIsNonExhaustive(t *testing.T) {
+	listed := cliAgentModelDiscovery{Exhaustive: true, Models: []cliAgentModelDetail{
+		{ID: "gpt-6-astra", Efforts: []string{"low", "medium", "high", "xhigh", "max", "ultra"}, DefaultEffort: "medium"},
+		{ID: "gpt-5.6-sol", Efforts: []string{"low", "medium", "high", "xhigh", "max", "ultra"}, DefaultEffort: "low"},
+	}}
+	got := reconcileCodexDiscovery(listed, "0.153.0", "codex-cli 0.150.1", "gpt-5.6-sol")
+	if got.Exhaustive {
+		t.Fatal("a cache from a newer Codex build than the installed CLI is not the whole story")
+	}
+	if got.DefaultModel != "gpt-5.6-sol" || len(got.Models) != 2 || got.Models[0].ID != "gpt-6-astra" {
+		t.Fatalf("configured model must stay the default without being prepended twice: %#v", got)
+	}
+}
