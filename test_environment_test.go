@@ -44,6 +44,13 @@ var (
 	// the suite is nowhere near them.
 	realHomeAtStartup      string
 	realConfigDirAtStartup string
+	// realTempAtStartup / realAppDataAtStartup: on Windows os.MkdirTemp lands
+	// under %LOCALAPPDATA%\Temp, which is INSIDE the profile by design, so the
+	// guard needs the real temp root to tell "under the home" from "under the
+	// home's temp"; the real-binary harness restores APPDATA for the CLIs
+	// that keep state there.
+	realTempAtStartup    string
+	realAppDataAtStartup string
 )
 
 // sandboxTestConfigDir redirects the process-wide config/data and temp
@@ -51,7 +58,16 @@ var (
 // sandbox. It returns a cleanup func; TestMain must call it explicitly because
 // os.Exit skips deferred calls.
 func sandboxTestConfigDir() func() {
-	realHomeAtStartup = os.Getenv("HOME")
+	// os.UserHomeDir, not $HOME: on Windows the home is %USERPROFILE% and HOME
+	// is unset outside Git Bash, which left this empty from PowerShell — so the
+	// harness never restored the real profile and Codex reported no models.
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		realHomeAtStartup = home
+	} else {
+		realHomeAtStartup = os.Getenv("HOME")
+	}
+	realTempAtStartup = os.TempDir()
+	realAppDataAtStartup = os.Getenv("APPDATA")
 	realConfigDirAtStartup = baseDir
 
 	dir, err := os.MkdirTemp("", "aix-agent-test-home-")
