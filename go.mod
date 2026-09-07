@@ -1,10 +1,10 @@
 module github.com/AIExpedite/aiexpedite-local-terminal
 
-go 1.25.8
+go 1.26.0
 
 require (
 	cloud.google.com/go/pubsub/v2 v2.7.0 // direct
-	cloud.google.com/go/storage v1.66.0 // direct
+	cloud.google.com/go/storage v1.67.0 // direct
 	github.com/BurntSushi/toml v1.6.0 // direct
 	github.com/getlantern/systray v1.2.2 // direct
 	golang.org/x/mod v0.40.0 // semver‑compare helper
@@ -13,11 +13,11 @@ require (
 
 require (
 	github.com/creack/pty v1.1.24
-	github.com/shirou/gopsutil/v4 v4.26.7
+	github.com/shirou/gopsutil/v4 v4.26.8
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/time v0.15.0
-	google.golang.org/api v0.294.0
+	google.golang.org/api v0.297.0
 )
 
 require (
