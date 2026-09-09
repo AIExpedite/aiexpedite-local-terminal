@@ -1466,12 +1466,51 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) ([]string, er
 // detectPinnedSystemGrokRequirementsFile, with inline `#` strip and the same
 // array-of-tables guard.
 func readGrokPersistedAPIKey(path, runtimeModel string) (string, string) {
+	var rootSection, rootValue string
+	var perModelSection, perModelValue string
+	perModelMatch := ""
+	if runtimeModel != "" {
+		perModelMatch = "model." + strings.ToLower(runtimeModel) + ".api_key"
+	}
+	walkGrokTOMLAssignments(path, func(key, value string) bool {
+		if key == "model.api_key" && rootValue == "" {
+			rootSection = "model"
+			rootValue = value
+			return true
+		}
+		if perModelMatch != "" && key == perModelMatch && perModelValue == "" {
+			perModelSection = "model." + strings.ToLower(runtimeModel)
+			perModelValue = value
+		}
+		return true
+	})
+	if perModelValue != "" {
+		return perModelSection, perModelValue
+	}
+	return rootSection, rootValue
+}
+
+// walkGrokTOMLAssignments runs `visit` for every `key = value` assignment in a
+// Grok TOML config, with the active section folded into a dotted key
+// (`model.api_key`, `model.grok-build.api_key`) and the raw right-hand side
+// preserved exactly as written. Returning false from `visit` stops the sweep.
+//
+// Single-sourced so readGrokPersistedAPIKey (which wants ONE key for ONE model)
+// and grokConfigHasModelAPIKey (which wants "is any key pinned at all") cannot
+// disagree about what counts as an assignment — a config whose per-model key
+// one of them parses and the other misses would either carry a credential over
+// silently or leave a credential override undetected by the billing-attribution
+// guard. Missing/unreadable files are skipped, matching every other reader of
+// these optional layers. Same line-oriented sweep as
+// detectPinnedSystemGrokRequirementsFile: inline `#` strip and the same
+// array-of-tables guard, not a TOML parser.
+func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) {
 	if path == "" {
-		return "", ""
+		return
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return "", ""
+		return
 	}
 	defer f.Close()
 
@@ -1479,12 +1518,6 @@ func readGrokPersistedAPIKey(path, runtimeModel string) (string, string) {
 	scanner := bufio.NewScanner(io.LimitReader(f, maxBytes))
 	scanner.Buffer(make([]byte, 64*1024), 256*1024)
 	var currentSection string
-	var rootSection, rootValue string
-	var perModelSection, perModelValue string
-	perModelMatch := ""
-	if runtimeModel != "" {
-		perModelMatch = "model." + strings.ToLower(runtimeModel) + ".api_key"
-	}
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -1507,20 +1540,48 @@ func readGrokPersistedAPIKey(path, runtimeModel string) (string, string) {
 		if currentSection != "" && !strings.Contains(bareKey, ".") {
 			key = currentSection + "." + bareKey
 		}
-		if key == "model.api_key" && rootValue == "" {
-			rootSection = "model"
-			rootValue = strings.TrimSpace(line[eq+1:])
-			continue
-		}
-		if perModelMatch != "" && key == perModelMatch && perModelValue == "" {
-			perModelSection = "model." + strings.ToLower(runtimeModel)
-			perModelValue = strings.TrimSpace(line[eq+1:])
+		if !visit(key, strings.TrimSpace(line[eq+1:])) {
+			return
 		}
 	}
-	if perModelValue != "" {
-		return perModelSection, perModelValue
+}
+
+// grokConfigHasModelAPIKey reports whether a Grok TOML config pins an API key
+// for ANY model, not just the one a given session runs under.
+//
+// readGrokPersistedAPIKey answers "which key would this model use", which needs
+// a runtime model. A DIRECT (PTY) run has no resolved model — the user picks it
+// inside the CLI — so the attribution guard has to assume any pinned key could
+// be the credential that ends up billed, and a per-model key it could not see
+// would be exactly the misattribution the guard exists to prevent.
+func grokConfigHasModelAPIKey(path string) bool {
+	found := false
+	walkGrokTOMLAssignments(path, func(key, value string) bool {
+		if key != "model.api_key" &&
+			!(strings.HasPrefix(key, "model.") && strings.HasSuffix(key, ".api_key")) {
+			return true
+		}
+		if strings.TrimSpace(strings.Trim(value, `"'`)) == "" {
+			return true
+		}
+		found = true
+		return false
+	})
+	return found
+}
+
+// grokAnyPinnedAPIKey reports whether an API-key credential is pinned for the
+// home `base` or by a system config layer that GROK_HOME cannot redirect.
+func grokAnyPinnedAPIKey(base string) bool {
+	for _, p := range grokSystemConfigPathsFn() {
+		if grokConfigHasModelAPIKey(p) {
+			return true
+		}
 	}
-	return rootSection, rootValue
+	if base == "" {
+		return false
+	}
+	return grokConfigHasModelAPIKey(filepath.Join(base, "config.toml"))
 }
 
 // grokSystemRequirementsPath is the documented system-level pinned-config

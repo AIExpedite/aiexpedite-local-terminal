@@ -91,7 +91,7 @@ func TestEnsureGrokBillingAttribution_MakesADirectRunRecordObservable(t *testing
 	t.Setenv("GROK_HOME", base)
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want exactly 1", got)
 	}
@@ -121,16 +121,16 @@ func TestEnsureGrokBillingAttribution_IsIdempotentAndReArmsOnAccountChange(t *te
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
 
-	ensureGrokBillingAttribution()
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(nil)
 	// Our line is still the newest identity in the log: verify, do not write.
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want 1 — the guard appended on an unchanged log", got)
 	}
 
 	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{"user_id": "acct-2"})
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	if got := grokIdentityLineCount(t, base); got != 2 {
 		t.Fatalf("identity lines = %d, want 2 after an account change", got)
 	}
@@ -153,7 +153,7 @@ func TestEnsureGrokBillingAttribution_ReArmsAfterLogRotation(t *testing.T) {
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	// Grok rotates the log out from under us.
 	if err := os.WriteFile(grokBillingLogPath(base), []byte(`{"msg":"log rotated"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("rotate log: %v", err)
@@ -165,7 +165,7 @@ func TestEnsureGrokBillingAttribution_ReArmsAfterLogRotation(t *testing.T) {
 	// The very next session start notices the rotation and self-heals. There is
 	// no grace window: a direct run inside one would write records nothing in
 	// the log identifies, and those are refused outright.
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want attribution restored on the next session start", got)
 	}
@@ -263,7 +263,7 @@ func TestEnsureGrokBillingAttribution_DoesNotAdoptAnotherAccountsRecord(t *testi
 	t.Setenv("GROK_HOME", base)
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	// A different account's session logs its own identity and fetches billing.
 	helperAppendGrokLogLine(t, base, `{"ts":"2026-08-19T12:01:00Z","msg":"session start","ctx":{"user_id":"acct-9"}}`)
 	helperAppendGrokLogLine(t, base,
@@ -299,7 +299,7 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityDisplacesOurs(t *t
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want 1", got)
 	}
@@ -314,7 +314,7 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityDisplacesOurs(t *t
 		t.Fatal("acct-1 must not read as the newest identity once acct-2 logged one")
 	}
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	if got := grokIdentityLineCount(t, base); got != 3 {
 		t.Fatalf("identity lines = %d, want 3 — the displaced account was not re-attributed", got)
 	}
@@ -341,7 +341,7 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityIsUndecodable(t *t
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want 1", got)
 	}
@@ -352,7 +352,7 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityIsUndecodable(t *t
 		t.Fatal("an undecodable newer identity line must not leave acct-1 reading as newest")
 	}
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	if got := grokIdentityLineCount(t, base); got != 2 {
 		t.Fatalf("identity lines = %d, want 2 — the corrective append was suppressed", got)
 	}
@@ -623,5 +623,120 @@ func TestPersistGrokManagedBillingSnapshot_AForeignRecordDoesNotBlockAFreshMerge
 	snap, ok := readGrokBillingSnapshot(persistent, grokIdentityCandidates(persistent))
 	if !ok || !snap.HasUsedPercent || snap.UsedPercent != 31 {
 		t.Fatalf("the merged observation must be published: %+v ok=%v", snap, ok)
+	}
+}
+
+// helperNoGrokSystemConfigLayers pins the system TOML layers to empty so a real
+// /etc/grok on the build host cannot decide these tests either way.
+func helperNoGrokSystemConfigLayers(t *testing.T) {
+	t.Helper()
+	prev := grokSystemConfigPathsFn
+	grokSystemConfigPathsFn = func() []string { return nil }
+	t.Cleanup(func() { grokSystemConfigPathsFn = prev })
+}
+
+// A direct session inherits the user's shell, so an exported XAI_API_KEY reaches
+// the child and may be the credential it bills — while the identity we can
+// resolve comes from the cached login, a DIFFERENT account. Naming that login
+// would publish the key holder's spend as the login's, so the cached login must
+// be withheld and the record left unattributable.
+func TestEnsureGrokBillingAttribution_WithholdsTheLoginWhenAnAPIKeyOverrideIsActive(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	helperNoGrokSystemConfigLayers(t)
+	base := helperGrokHomeWithAccount(t, "acct-login")
+	t.Setenv("GROK_HOME", base)
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+
+	childEnv := []string{"PATH=/usr/bin", "XAI_API_KEY=xai-credential-sentinel"}
+	if got := grokDirectRunBillingIdentity(childEnv, base); got != grokContestedBillingIdentity {
+		t.Fatalf("identity = %q, want the contested sentinel", got)
+	}
+	ensureGrokBillingAttribution(childEnv)
+
+	// The key's account — not the cached login's — then fetches billing.
+	helperAppendGrokLogLine(t, base,
+		grokUnmeteredLine("2026-08-19T11:59:00Z", grokBillingLogMessage))
+
+	if snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base)); ok {
+		t.Fatalf("an API-key run's record must not bind to the cached login: %+v", snap)
+	}
+	usage, parsed := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, now)
+	if !parsed {
+		t.Fatal("Parse failed")
+	}
+	if len(usage.Metrics) != 1 || !usage.Metrics[0].Unknown || usage.Metrics[0].ObservedAt != "" {
+		t.Fatalf("want the inferred placeholder with no observation time, got %+v", usage.Metrics)
+	}
+
+	// And the marker itself never carries credential material.
+	raw, err := os.ReadFile(grokBillingLogPath(base))
+	if err != nil {
+		t.Fatalf("read unified.jsonl: %v", err)
+	}
+	if strings.Contains(string(raw), "xai-credential-sentinel") {
+		t.Fatal("the API key leaked into the provider log")
+	}
+	if !strings.Contains(string(raw), grokContestedBillingIdentity) {
+		t.Fatalf("the contested marker was not written: %s", raw)
+	}
+}
+
+// The override need not be in the environment: a direct child reads the user's
+// REAL config.toml (the ACP path neutralises it, this one cannot), and a
+// per-model `api_key` there is just as much a credential the cached login did
+// not pay for. A direct run has no resolved model, so ANY pinned key counts.
+func TestGrokDirectRunBillingIdentity_ContestsAPersistedConfigKey(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	helperNoGrokSystemConfigLayers(t)
+	base := helperGrokHomeWithAccount(t, "acct-login")
+
+	if got := grokDirectRunBillingIdentity(nil, base); got != "acct-login" {
+		t.Fatalf("identity = %q, want the cached login when nothing overrides it", got)
+	}
+
+	if err := os.WriteFile(filepath.Join(base, "config.toml"),
+		[]byte("[model.grok-4-fast]\napi_key = \"xai-persisted-sentinel\"\n"), 0o600); err != nil {
+		t.Fatalf("write config.toml: %v", err)
+	}
+	if got := grokDirectRunBillingIdentity(nil, base); got != grokContestedBillingIdentity {
+		t.Fatalf("identity = %q, want the contested sentinel for a pinned per-model key", got)
+	}
+
+	// An empty value is not a credential — it must not cost a honest run its
+	// observability.
+	if err := os.WriteFile(filepath.Join(base, "config.toml"),
+		[]byte("[model]\napi_key = \"\"\n"), 0o600); err != nil {
+		t.Fatalf("rewrite config.toml: %v", err)
+	}
+	if got := grokDirectRunBillingIdentity(nil, base); got != "acct-login" {
+		t.Fatalf("identity = %q, want the cached login for an empty api_key", got)
+	}
+}
+
+// An override run ARMS the sentinel, not just writes it once. That is what makes
+// a concurrent honest run contested too — otherwise the honest run's marker
+// would stand as the newest one and the override run's next record would bind
+// to it, which is the same misattribution by a longer route.
+func TestEnsureGrokBillingAttribution_AnArmedOverrideRunContestsAConcurrentRun(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	helperNoGrokSystemConfigLayers(t)
+	base := helperGrokHomeWithAccount(t, "acct-login")
+	t.Setenv("GROK_HOME", base)
+
+	release := startGrokBillingAttributionKeeper(grokContestedBillingIdentity)
+	defer release()
+
+	// A second, credential-clean direct run starts for the signed-in account.
+	ensureGrokBillingAttribution(nil)
+
+	raw, err := os.ReadFile(grokBillingLogPath(base))
+	if err != nil {
+		t.Fatalf("read unified.jsonl: %v", err)
+	}
+	if strings.Contains(string(raw), "acct-login") {
+		t.Fatalf("the honest account was named while an override run was live: %s", raw)
+	}
+	if !strings.Contains(string(raw), grokContestedBillingIdentity) {
+		t.Fatalf("the contested marker was not written: %s", raw)
 	}
 }

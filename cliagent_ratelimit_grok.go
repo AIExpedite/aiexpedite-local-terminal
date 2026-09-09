@@ -142,16 +142,48 @@ var grokBillingAttributionSerialize sync.Mutex
 // attribution self-heals after a rotation, an account change, or a displacing
 // marker, while staying at most one small append per displacement.
 // Best-effort and silent on failure, matching this file's hot-path contract.
-func ensureGrokBillingAttribution() {
+// childEnv is the environment the direct child is spawned with; it decides
+// whether the cached login can be named at all (grokDirectRunBillingIdentity).
+// Pass nil when there is no child — the caller is then asserting the cached
+// login with no credential override in play.
+func ensureGrokBillingAttribution(childEnv []string) {
 	base := grokPersistentHome()
 	if base == "" {
 		return
 	}
-	identity, ok := grokResolvedBillingIdentity(base)
-	if !ok {
+	identity := grokDirectRunBillingIdentity(childEnv, base)
+	if identity == "" {
 		return
 	}
 	ensureGrokBillingIdentityNamed(base, identity)
+}
+
+// grokDirectRunBillingIdentity returns the producer identity a DIRECT (PTY)
+// run's billing records can honestly be attributed to, or "" when there is
+// nothing to name.
+//
+// Normally that is the cached login in `base`. When the child carries a
+// credential override — an inherited API key / provider token, or a key pinned
+// in the user's own config.toml or a system layer — it is the contested
+// sentinel instead: the child may bill an account we cannot resolve, and naming
+// the cached login above records it did not pay for would publish one account's
+// spend as another's. The sentinel matches no account, so those records are
+// refused and the card falls back to "unobservable" — the state that shipped
+// before direct attribution existed, and the one a two-account disagreement
+// already produces.
+//
+// The SINGLE decision point for a direct arm: the keeper must be armed with the
+// same value this names, or a re-assertion would reinstate the identity the
+// override just ruled out.
+func grokDirectRunBillingIdentity(childEnv []string, base string) string {
+	if grokDirectRunCredentialOverride(childEnv, base) {
+		return grokContestedBillingIdentity
+	}
+	identity, ok := grokResolvedBillingIdentity(base)
+	if !ok {
+		return ""
+	}
+	return identity
 }
 
 // ensureGrokBillingIdentityNamed is the same guard for a CAPTURED account

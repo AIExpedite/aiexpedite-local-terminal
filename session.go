@@ -532,9 +532,20 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		// with, so re-reading the shared home later — after a `grok login` to
 		// another account — would name the new account above this run's records and
 		// publish one account's utilization as another's.
-		directIdentity, _ := grokResolvedBillingIdentity(grokPersistentHome())
+		//
+		// grokDirectRunBillingIdentity also withholds the cached login entirely
+		// when this child carries a credential override (an inherited
+		// XAI_API_KEY / provider token, or a key pinned in the user's real
+		// config.toml — a direct session strips neither, unlike the ACP and
+		// maintenance-smoke paths): the records would then be billed to an
+		// account we cannot resolve, and naming the login above them publishes
+		// one account's spend as another's. It captures the contested sentinel
+		// instead, which ARMS as well as writes, so a concurrent honest run is
+		// made contested too and the override run's records cannot bind to the
+		// marker that run asserts.
+		directIdentity := grokDirectRunBillingIdentity(filtered, grokPersistentHome())
 		finishGrokAttribution = startGrokBillingAttributionKeeper(directIdentity)
-		ensureGrokBillingAttribution()
+		ensureGrokBillingAttribution(filtered)
 	}
 
 	// Start the process

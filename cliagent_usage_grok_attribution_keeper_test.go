@@ -66,7 +66,7 @@ func TestGrokBillingAttributionKeeper_RepairsDisplacementDuringALiveSession(t *t
 	t.Setenv("GROK_HOME", base)
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "10ms")
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d after session start, want 1", got)
 	}
@@ -104,7 +104,7 @@ func TestGrokBillingAttributionKeeper_WritesNothingWhileAttributionHolds(t *test
 	t.Setenv("GROK_HOME", base)
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "5ms")
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	finish := startGrokBillingAttributionKeeper("acct-1")
 	time.Sleep(120 * time.Millisecond) // many ticks
 	finish()
@@ -157,7 +157,7 @@ func TestGrokBillingAttributionKeeper_ReassertsTheAccountTheRunStartedUnder(t *t
 	t.Setenv("GROK_HOME", base)
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "10ms")
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	finish := startGrokBillingAttributionKeeper("acct-1")
 	defer finish()
 
@@ -192,13 +192,13 @@ func TestEnsureGrokBillingAttribution_ContestsInsteadOfNamingANewAccountOverALiv
 	// never leaves the wrong marker standing in the first place.
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	finish := startGrokBillingAttributionKeeper("acct-1")
 	defer finish()
 
 	// The user signs in as someone else and any second session starts.
 	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{"user_id": "acct-2"})
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 
 	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, grokContestedBillingIdentity) {
 		t.Fatalf("session start named %q above a live acct-1 run — it must write the "+
@@ -229,7 +229,7 @@ func TestGrokBillingAttributionKeeper_MarksTheLogContestedWhenArmedRunsDisagree(
 	t.Setenv("GROK_HOME", base)
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "5ms")
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	first := startGrokBillingAttributionKeeper("acct-1")
 	defer first()
 	second := startGrokBillingAttributionKeeper("acct-2")
@@ -378,7 +378,7 @@ func TestPersistGrokManagedBillingSnapshot_RepairsAnArmedDirectRunImmediately(t 
 	// An interval far longer than the test: nothing here may depend on a tick.
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	finish := startGrokBillingAttributionKeeper("acct-1")
 	defer finish()
 
@@ -439,7 +439,7 @@ func TestPersistGrokManagedBillingSnapshot_RepairsInTheSameAtomicWrite(t *testin
 	t.Setenv("GROK_HOME", persistent)
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 	finish := startGrokBillingAttributionKeeper("acct-1")
 	defer finish()
 
@@ -517,7 +517,7 @@ func TestPersistGrokManagedBillingSnapshot_ArmDuringTheWriteStillRepairs(t *test
 	t.Setenv("GROK_HOME", persistent)
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
 
-	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution(nil)
 
 	isolated := helperGrokHomeWithAccount(t, "acct-managed")
 	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-managed"))
