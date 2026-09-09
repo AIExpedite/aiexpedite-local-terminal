@@ -173,25 +173,21 @@ func StartAgent(cfg *Config) {
 
 	/* 1. Ensure prerequisites (tmux + ttyd) exist ------------------------- */
 
-	useTmux := true
-	if err := ensureTmux(); err != nil {
-		if runtime.GOOS == "windows" {
-			// Windows users may not have tmux – gracefully fall back
-			useTmux = false
-			fmt.Println("Warning:", err, "- running without tmux.")
-		} else {
-			fmt.Println("Fatal:", err)
-			return
-		}
-	}
-
 	// The local web terminal (tmux + ttyd) is a convenience; the cloud
 	// connection below is the job. Nothing in this section may abort
 	// StartAgent: an early return here happens AFTER the previous instance
 	// told the backend it was shutting down and BEFORE this one says it is
 	// back, so the tray stays up while the device shows Disconnected — the
 	// 2026-09-09 prod outage, when a tmux name collision with the dev agent
-	// did exactly that for four hours.
+	// did exactly that for four hours. A missing tmux is the same class of
+	// abort on Unix (where it used to be fatal) as it is on Windows, so it
+	// degrades to a plain shell on every platform.
+	useTmux := true
+	if err := ensureTmux(); err != nil {
+		useTmux = false
+		fmt.Println("Warning:", err, "- running the local terminal without tmux.")
+	}
+
 	localTerminal := true
 	if err := ensureTtyd(); err != nil {
 		localTerminal = false
@@ -416,20 +412,27 @@ func StartAgent(cfg *Config) {
 
 	/* 5. Display connection instructions ---------------------------------- */
 
-	showConnectionInstructions(cfg, port)
+	showConnectionInstructions(cfg, port, localTerminal)
 
 	// Note: Auto-update is now handled in main.go with proactive dialog
 }
 
 /*──────────────────────────  showConnectionInstructions  ──────────────────────────*/
 
-// showConnectionInstructions displays how to connect to the terminal
-func showConnectionInstructions(cfg *Config, port int) {
+// showConnectionInstructions displays how to connect to the terminal.
+// localTerminal is false when ttyd was disabled during startup (missing
+// binary, busy port, failed spawn) — nothing is listening on port, so
+// printing the URL would send the user to a connection-refused page.
+func showConnectionInstructions(cfg *Config, port int, localTerminal bool) {
 	fmt.Println("")
 	fmt.Println("╔════════════════════════════════════════════════════════════╗")
 	fmt.Println("║                    Ready to Connect!                       ║")
 	fmt.Println("╠════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║  Local Terminal:  http://127.0.0.1:%-24d║\n", port)
+	if localTerminal {
+		fmt.Printf("║  Local Terminal:  http://127.0.0.1:%-24d║\n", port)
+	} else {
+		fmt.Println("║  Local Terminal:  Unavailable (see warnings above)         ║")
+	}
 	fmt.Println("║                                                            ║")
 
 	if cfg.ProjectID == "" {
@@ -446,7 +449,9 @@ func showConnectionInstructions(cfg *Config, port int) {
 	}
 
 	fmt.Println("║                                                            ║")
-	fmt.Println("║  Tip: Right-click tray icon → Open Terminal                ║")
+	if localTerminal {
+		fmt.Println("║  Tip: Right-click tray icon → Open Terminal                ║")
+	}
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 	fmt.Println("")
 }

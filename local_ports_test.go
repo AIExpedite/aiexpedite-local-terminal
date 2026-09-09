@@ -6,8 +6,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -169,5 +171,38 @@ func TestTmuxDuplicateSessionDetection(t *testing.T) {
 	}
 	if tmuxDuplicateSession("error connecting to /tmp/tmux-501/default (No such file or directory)\n") {
 		t.Fatal("unrelated tmux errors must not read as a lost race")
+	}
+}
+
+// When ttyd was disabled during startup (missing binary, busy port, failed
+// spawn) nothing is listening, so the "Ready to Connect" box must not send the
+// user to a loopback URL that will refuse the connection — nor to the tray's
+// Open Terminal item, which opens the same dead URL.
+func TestShowConnectionInstructionsHidesDeadLocalURL(t *testing.T) {
+	cfg := &Config{ProjectID: "aix-test"}
+	port := defaultTtydPortFor("prod")
+	url := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	up := captureStdout(t, func() { showConnectionInstructions(cfg, port, true) })
+	if !strings.Contains(up, url) {
+		t.Fatalf("a live local terminal must advertise %s, got:\n%s", url, up)
+	}
+	if !strings.Contains(up, "Open Terminal") {
+		t.Fatalf("a live local terminal must keep the tray tip, got:\n%s", up)
+	}
+
+	down := captureStdout(t, func() { showConnectionInstructions(cfg, port, false) })
+	if strings.Contains(down, url) {
+		t.Fatalf("a disabled local terminal must not advertise %s, got:\n%s", url, down)
+	}
+	if strings.Contains(down, "Open Terminal") {
+		t.Fatalf("a disabled local terminal must not offer the tray tip, got:\n%s", down)
+	}
+	if !strings.Contains(down, "Unavailable") {
+		t.Fatalf("a disabled local terminal must say so, got:\n%s", down)
+	}
+	// Remote access is independent of the local terminal and must survive.
+	if !strings.Contains(down, "Enabled (Pub/Sub)") {
+		t.Fatalf("remote access must still be reported, got:\n%s", down)
 	}
 }
