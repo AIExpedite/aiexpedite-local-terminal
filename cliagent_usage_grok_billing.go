@@ -276,6 +276,22 @@ func grokDirectChildHomeOverride(env string) string {
 
 const grokManagedBillingIdentityMessage = "aiexpedite: managed billing producer"
 
+// grokContestedBillingIdentity is the producer identity written when the log
+// cannot honestly name ONE account: two live direct (PTY) runs were started
+// under different accounts, so a record appended next could have been written
+// by either of them.
+//
+// unified.jsonl is a single shared file and a record binds to the NEAREST
+// identity above it, so there is no marker that is correct for both runs.
+// Naming either one publishes the other run's utilization as that account's —
+// a billing lie. Leaving whichever marker happens to be newest standing is the
+// same failure with an arbitrary victim. This value can never equal a resolved
+// account (grokRecordBelongsToCurrentAccount also refuses it explicitly), so
+// every record written while the runs overlap is UNATTRIBUTABLE: the card falls
+// back to "unobservable", which is recoverable, and the next assertion after
+// the conflicting run releases repairs attribution for the survivor.
+const grokContestedBillingIdentity = "aiexpedite:contested"
+
 // grokResolvedBillingIdentity returns the single account value written as the
 // producer identity for a home. Prefer the last candidate (normally the opaque
 // JWT subject) over an email while retaining compatibility with older auth
@@ -557,12 +573,14 @@ func appendGrokBillingPair(
 		return true, false, nil
 	}
 
-	directIdentity, armed := grokArmedDirectIdentity()
+	directIdentity, armed := grokDirectAttributionAssertion()
 	switch {
 	case !armed:
-		// No live direct run, or two armed on different accounts: naming
-		// either would be a guess about whose records follow, so nothing
-		// extra is written into a provider-owned file.
+		// No live direct run, so nothing extra is written into a
+		// provider-owned file. When two runs disagree the assertion is the
+		// contested sentinel, not silence: leaving OUR managed identity
+		// standing as the newest marker would bind both of their records to
+		// the managed account.
 	case strings.EqualFold(directIdentity, identity):
 		// Already named by the pair above.
 	default:
@@ -779,6 +797,13 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 			// The log names a producer but the credentials resolve to nothing we
 			// can compare, or its newest identity envelope is malformed. Refuse
 			// rather than falling back to older account evidence.
+			return false
+		}
+		if strings.EqualFold(identity, grokContestedBillingIdentity) {
+			// Overlapping direct runs on different accounts were live when this
+			// marker was written, so nothing below it can be attributed to
+			// either. Refuse explicitly rather than relying on the sentinel
+			// merely failing to match a real account id.
 			return false
 		}
 		return wanted[strings.ToLower(identity)]

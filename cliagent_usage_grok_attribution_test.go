@@ -22,12 +22,24 @@ import (
 // clean state so each test starts from a cold agent.
 func resetGrokBillingAttribution(t *testing.T) {
 	t.Helper()
-	// Deliberately a no-op body: the guard keeps NO in-process state, because
-	// any cached "already attributed" answer is a window in which a newer
-	// identity can displace ours unnoticed. The provider log is the only state,
-	// and each test builds its own. Kept as the call site every attribution test
-	// starts from, so re-introducing process state has one place to reset.
-	_ = t
+	// The guard itself keeps NO in-process state, because any cached "already
+	// attributed" answer is a window in which a newer identity can displace ours
+	// unnoticed. The provider log is the only state, and each test builds its own.
+	//
+	// The attribution KEEPER does keep state: live direct runs are arm-counted per
+	// account, and a leaked arm (a test that fails before releasing) makes every
+	// LATER test look like two accounts overlapping, so they all write the
+	// contested marker instead of a real one. Clear it here rather than debugging
+	// that cascade again.
+	grokAttributionKeeperMu.Lock()
+	grokAttributionKeeperRefs = 0
+	grokAttributionKeeperAccounts = map[string]int{}
+	stop := grokAttributionKeeperStop
+	grokAttributionKeeperStop = nil
+	grokAttributionKeeperMu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
 }
 
 // grokIdentityLineCount counts our producer markers in a home's unified log.

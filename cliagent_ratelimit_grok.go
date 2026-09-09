@@ -172,6 +172,15 @@ func ensureGrokBillingIdentityNamed(base, identity string) {
 		return
 	}
 
+	// A live direct run under a DIFFERENT account makes this marker a claim we
+	// cannot support: the next record in the shared log could be that run's,
+	// and it would bind here. Name the contested sentinel instead, so records
+	// written while the accounts overlap are refused rather than published as
+	// the wrong account's utilization.
+	if grokArmedDirectAccountsDisagreeWith(identity) {
+		identity = grokContestedBillingIdentity
+	}
+
 	grokBillingAttributionSerialize.Lock()
 	defer grokBillingAttributionSerialize.Unlock()
 
@@ -437,9 +446,28 @@ func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 	}
 }
 
-// grokArmedDirectIdentity returns the account EVERY live direct (PTY) Grok run
-// was started under, or ("", false) when none is armed or two armed runs
-// disagree.
+// grokArmedDirectAccountsDisagreeWith reports whether any live direct run was
+// started under an account other than `identity`. It is what turns an honest
+// marker into a contested one: the writer knows who it wants to name, and this
+// answers whether anyone else's records could bind to that name.
+func grokArmedDirectAccountsDisagreeWith(identity string) bool {
+	identity = strings.TrimSpace(identity)
+	if identity == "" || strings.EqualFold(identity, grokContestedBillingIdentity) {
+		return false
+	}
+	grokAttributionKeeperMu.Lock()
+	defer grokAttributionKeeperMu.Unlock()
+	for armed := range grokAttributionKeeperAccounts {
+		if !strings.EqualFold(armed, identity) {
+			return true
+		}
+	}
+	return false
+}
+
+// grokDirectAttributionAssertion returns the identity that should stand as the
+// newest marker for the live direct runs: the single account they were all
+// started under, or grokContestedBillingIdentity when they disagree.
 //
 // It exists so a displacement WE cause — persistGrokManagedBillingSnapshot
 // merging another session's paired identity/record lines — can be repaired the
@@ -449,28 +477,30 @@ func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 // writes its billing line and exits inside a single interval. The periodic tick
 // still covers the out-of-process case (`grok login` outside the agent).
 //
-// Two armed runs on DIFFERENT accounts report no armed identity rather than one
-// of them: there is a single log and a record binds to the nearest identity
-// above it, so naming one account would attribute the other run's records to
-// it. An unattributable record is recoverable — a misattributed one is a
-// billing lie.
-func grokArmedDirectIdentity() (string, bool) {
+// Asserting NOTHING on a disagreement is not neutral. Whatever marker is newest
+// stays newest — a managed merge's identity, or the first run's account — and
+// the reader binds every following record to it under credentials that may now
+// match, so one run's usage is published as the other's. The sentinel is the
+// only assertion that is true for both.
+func grokDirectAttributionAssertion() (string, bool) {
 	grokAttributionKeeperMu.Lock()
 	defer grokAttributionKeeperMu.Unlock()
-	if len(grokAttributionKeeperAccounts) != 1 {
+	switch len(grokAttributionKeeperAccounts) {
+	case 0:
 		return "", false
+	case 1:
+		for identity := range grokAttributionKeeperAccounts {
+			return identity, true
+		}
 	}
-	for identity := range grokAttributionKeeperAccounts {
-		return identity, true
-	}
-	return "", false
+	return grokContestedBillingIdentity, true
 }
 
 // reassertGrokDirectAttribution re-names the account the live direct runs were
 // SPAWNED under — never the currently signed-in one, see
 // ensureGrokBillingIdentityNamed.
 func reassertGrokDirectAttribution() {
-	identity, ok := grokArmedDirectIdentity()
+	identity, ok := grokDirectAttributionAssertion()
 	if !ok {
 		return
 	}

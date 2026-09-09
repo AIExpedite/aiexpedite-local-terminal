@@ -441,12 +441,15 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// argv has no neutralizers, so launching with the inherited (potentially
 	// unsafe) GROK_HOME would silently bypass the workspace's opt-in gates.
 	persistentHome := grokPersistentHome()
-	// Mirror the direct path's session-start attribution so a managed-only
-	// device still has an attributable persistent log: the merged record is
-	// written with its own identity line, but a later direct `grok` run on the
-	// same machine relies on this one. Best-effort, under the credentials this
-	// session is about to copy.
-	ensureGrokBillingAttribution()
+	// No persistent-home attribution is written here. A managed session needs
+	// none: persistGrokManagedBillingSnapshot merges its identity and its
+	// record as one atomic pair, so the merged record binds to the identity
+	// directly above it whatever else is in the log. The append this replaced
+	// only helped a LATER direct run — which names its own account at its own
+	// session start anyway — while naming, at ACP-start time, an account that
+	// may not be the one a live direct run is writing records under. That made
+	// starting an ACP session after a `grok login` enough to publish the live
+	// direct run's utilization as the newly signed-in account's.
 	isolatedHome, err := setupIsolatedGrokHomeFrom(opts.AllowAPIKeyFallback, resolvedModel, persistentHome)
 	if err != nil {
 		return fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)

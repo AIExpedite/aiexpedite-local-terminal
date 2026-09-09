@@ -30,6 +30,19 @@ func helperGrokIdentityLine(t *testing.T, account string) string {
 	return string(line)
 }
 
+// helperGrokLastLogLine returns the newest line in a home's unified log. The
+// marker that matters is always the last one written: a record binds to the
+// nearest identity above it.
+func helperGrokLastLogLine(t *testing.T, base string) string {
+	t.Helper()
+	raw, err := os.ReadFile(grokBillingLogPath(base))
+	if err != nil {
+		t.Fatalf("read unified.jsonl: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	return lines[len(lines)-1]
+}
+
 // helperWaitForIdentityLines polls until the log holds want markers, so the test
 // asserts on the keeper's observable effect rather than on goroutine timing.
 func helperWaitForIdentityLines(t *testing.T, base string, want int) {
@@ -166,11 +179,51 @@ func TestGrokBillingAttributionKeeper_ReassertsTheAccountTheRunStartedUnder(t *t
 	}
 }
 
+// A live direct run under account A must not be re-labelled by ANY later
+// session-start attribution for account B — the direct child keeps writing
+// records under A's credentials, and a B marker above them publishes A's usage
+// as B's. This is the session-start half of the contested rule: the writer that
+// resolves the live credentials is the one that has to notice the conflict.
+func TestEnsureGrokBillingAttribution_ContestsInsteadOfNamingANewAccountOverALiveRun(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	// A tick would repair this on its own; the point is that the SESSION START
+	// never leaves the wrong marker standing in the first place.
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	ensureGrokBillingAttribution()
+	finish := startGrokBillingAttributionKeeper("acct-1")
+	defer finish()
+
+	// The user signs in as someone else and any second session starts.
+	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{"user_id": "acct-2"})
+	ensureGrokBillingAttribution()
+
+	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("session start named %q above a live acct-1 run — it must write the "+
+			"contested marker so neither account claims the other's records", last)
+	}
+
+	// The acct-1 child's next record is unattributable rather than published as
+	// acct-2's, which is the boundary this rule exists to hold.
+	helperAppendGrokLogLine(t, base,
+		grokUnmeteredLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
+	for _, account := range []string{"acct-1", "acct-2"} {
+		if _, ok := readGrokBillingSnapshot(base, []string{account}); ok {
+			t.Fatalf("a record under the contested marker was attributed to %s", account)
+		}
+	}
+}
+
 // Two live direct runs on DIFFERENT accounts share one log, and a record binds
-// to the nearest identity above it, so naming either account would attribute
-// the other run's records to it. Nothing is asserted: an unattributable record
-// is recoverable, a misattributed one is a billing lie.
-func TestGrokBillingAttributionKeeper_AssertsNothingWhenArmedRunsDisagree(t *testing.T) {
+// to the nearest identity above it, so naming either account would attribute the
+// other run's records to it. The keeper asserts the CONTESTED sentinel: every
+// record written while they overlap is refused by the reader, which is
+// recoverable, where a misattributed one is a billing lie. Asserting nothing is
+// not neutral — whatever marker happens to be newest would keep binding both
+// runs' records to it.
+func TestGrokBillingAttributionKeeper_MarksTheLogContestedWhenArmedRunsDisagree(t *testing.T) {
 	resetGrokBillingAttribution(t)
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
@@ -180,18 +233,41 @@ func TestGrokBillingAttributionKeeper_AssertsNothingWhenArmedRunsDisagree(t *tes
 	first := startGrokBillingAttributionKeeper("acct-1")
 	defer first()
 	second := startGrokBillingAttributionKeeper("acct-2")
+	released := false
+	defer func() {
+		if !released {
+			second()
+		}
+	}()
 
+	// Someone else's marker becomes newest while the two runs overlap.
 	helperAppendGrokLogLine(t, base, helperGrokIdentityLine(t, "acct-other"))
-	time.Sleep(120 * time.Millisecond) // many ticks
-	if got := grokIdentityLineCount(t, base); got != 2 {
-		t.Fatalf("identity lines = %d, want 2 — the keeper picked a side between two "+
-			"armed accounts", got)
+	helperWaitForIdentityLines(t, base, 3)
+
+	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("keeper asserted %q — with two accounts armed it must name the "+
+			"contested sentinel, never one of them", last)
+	}
+
+	// A record written under the contested marker is refused for BOTH accounts.
+	helperAppendGrokLogLine(t, base,
+		grokUnmeteredLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
+	for _, account := range []string{"acct-1", "acct-2"} {
+		if _, ok := readGrokBillingSnapshot(base, []string{account}); ok {
+			t.Fatalf("a record under the contested marker was attributed to %s", account)
+		}
 	}
 
 	// The ambiguity is the second run's doing: once it releases, the surviving
 	// run's account is unambiguous again and attribution self-heals.
 	second()
-	helperWaitForIdentityLines(t, base, 3)
+	released = true
+	helperWaitForIdentityLines(t, base, 4)
+	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, "acct-1") ||
+		strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("re-asserted %q — the surviving run's account must be named again "+
+			"once the conflicting run releases", last)
+	}
 }
 
 // The managed merge must not be able to land between the direct path's "am I
