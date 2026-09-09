@@ -348,8 +348,8 @@ func appendGrokBillingIdentity(base string) error {
 // discards our line; this is how the direct-run guard notices the rotation and
 // re-appends instead of leaving every later record unattributable.
 //
-// It stops at the first valid identity it finds rather than searching the whole
-// tail for a match, because grokRecordBelongsToCurrentAccount binds a record to
+// It stops at the first identity-shaped line it finds rather than searching the
+// whole tail for a match, because grokRecordBelongsToCurrentAccount binds a record to
 // the NEAREST identity preceding it. A newer conflicting marker — e.g. a
 // managed session for account B persisting its identity after the user switched
 // back to account A — would otherwise leave the older A marker "still logged",
@@ -366,8 +366,18 @@ func grokBillingIdentityIsNewest(base, identity string) bool {
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		logged, found, valid := grokLogIdentity(lines[i])
-		if !found || !valid {
+		if !found {
 			continue
+		}
+		if !valid {
+			// A newer identity-shaped line we cannot decode (malformed, or a
+			// partially written one). grokRecordBelongsToCurrentAccount stops
+			// and REFUSES on exactly this line rather than falling back to
+			// older evidence, so treating it as "not ours" and re-appending is
+			// what keeps the following direct records observable. Skipping it
+			// would let an older matching marker read as newest and suppress
+			// the corrective append.
+			return false
 		}
 		return strings.EqualFold(logged, wanted)
 	}

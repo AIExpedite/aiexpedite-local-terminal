@@ -446,7 +446,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// written with its own identity line, but a later direct `grok` run on the
 	// same machine relies on this one. Best-effort, under the credentials this
 	// session is about to copy.
-	ensureGrokBillingAttribution(time.Now())
+	ensureGrokBillingAttribution()
 	isolatedHome, err := setupIsolatedGrokHomeFrom(opts.AllowAPIKeyFallback, resolvedModel, persistentHome)
 	if err != nil {
 		return fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)

@@ -112,29 +112,20 @@ func captureGrokUsageLimitLine(line string, now time.Time) {
 	writeGrokUsageLimitState(grokUsageLimitCachePath(), state, currentGrokAccountFingerprint())
 }
 
-// grokBillingAttributionRecheck bounds how often ensureGrokBillingAttribution
-// re-verifies that our producer identity is still present in the provider log.
-// The check reads the bounded log tail, so it is session-scoped work, not
-// per-line work.
+// grokBillingAttributionSerialize serializes the read-then-append below so two
+// Grok sessions starting at once cannot both see a missing identity and both
+// append one. It is a lock, NOT a cache: the log is re-read on every call.
 //
-// Deliberately a SEPARATE constant from grokBillingObservationTTL: they answer
-// different questions (how often to re-verify attribution vs. how long an
-// observation stays trustworthy), and sharing one value would make a freshness
-// tuning change silently retune how often we write into a provider-owned file.
-const grokBillingAttributionRecheck = time.Hour
-
-// grokBillingAttributionState re-arms the append guard. A plain sync.Once is
-// wrong here: Grok rotates unified.jsonl, which discards our identity line, and
-// a once-per-process guard would leave every post-rotation record
-// unattributable for the life of a long-running agent.
-// Keyed by (home, identity): the guard must not suppress an append into a
-// DIFFERENT log just because the same account was already attributed elsewhere.
-var grokBillingAttribution struct {
-	mu           sync.Mutex
-	base         string
-	identity     string
-	lastVerified time.Time
-}
+// A time-bounded "already verified recently" memo was tried and removed. Any
+// window at all is a window in which someone else's identity can become the
+// newest one in the log — a managed session for another account persisting its
+// marker on exit, or a `grok` run outside the agent — and
+// grokRecordBelongsToCurrentAccount binds a record to the NEAREST identity
+// preceding it, so every direct record written during that window would be
+// attributed to the wrong account and refused. The check is one bounded tail
+// read per SESSION START, next to spawning a CLI process; it is not on the
+// per-line streaming path.
+var grokBillingAttributionSerialize sync.Mutex
 
 // ensureGrokBillingAttribution names the signed-in account in the provider-owned
 // log so the billing records a DIRECT (PTY) Grok run writes afterwards can be
@@ -142,16 +133,16 @@ var grokBillingAttribution struct {
 // grokRecordBelongsToCurrentAccount refuses it and a direct run can never
 // produce an observable metric.
 //
-// Session-scoped, NOT per stdout line: the rotation check reads the log, and
-// doing that per line on the streaming hot path would cost a file read per
-// output line. captureGrokUsageLimitLine's per-line contract is untouched, and
-// this path infers no telemetry from stdout — it only records who is signed in.
+// Session-scoped, NOT per stdout line: it reads the log, and doing that per line
+// on the streaming hot path would cost a file read per output line.
+// captureGrokUsageLimitLine's per-line contract is untouched, and this path
+// infers no telemetry from stdout — it only records who is signed in.
 //
-// Re-arms on an account change AND when the log no longer carries our identity
-// (rotation), so attribution self-heals while staying at most one small append
-// per rotation. Best-effort and silent on failure, matching this file's
-// hot-path contract.
-func ensureGrokBillingAttribution(now time.Time) {
+// Appends only when our identity is not already the NEWEST one in the log, so
+// attribution self-heals after a rotation, an account change, or a displacing
+// marker, while staying at most one small append per displacement.
+// Best-effort and silent on failure, matching this file's hot-path contract.
+func ensureGrokBillingAttribution() {
 	base := grokPersistentHome()
 	if base == "" {
 		return
@@ -161,24 +152,13 @@ func ensureGrokBillingAttribution(now time.Time) {
 		return
 	}
 
-	grokBillingAttribution.mu.Lock()
-	defer grokBillingAttribution.mu.Unlock()
+	grokBillingAttributionSerialize.Lock()
+	defer grokBillingAttributionSerialize.Unlock()
 
-	if grokBillingAttribution.base == base && grokBillingAttribution.identity == identity {
-		if now.Sub(grokBillingAttribution.lastVerified) < grokBillingAttributionRecheck {
-			return
-		}
-		if grokBillingIdentityIsNewest(base, identity) {
-			grokBillingAttribution.lastVerified = now
-			return
-		}
-	}
-	if err := appendGrokBillingIdentity(base); err != nil {
+	if grokBillingIdentityIsNewest(base, identity) {
 		return
 	}
-	grokBillingAttribution.base = base
-	grokBillingAttribution.identity = identity
-	grokBillingAttribution.lastVerified = now
+	_ = appendGrokBillingIdentity(base)
 }
 
 // grokLimitStateFromFrame walks a decoded Grok frame for a usage-limit signal.

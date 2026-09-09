@@ -18,19 +18,16 @@ import (
 	"time"
 )
 
-// resetGrokBillingAttribution clears the process-wide append guard so each test
-// starts from a cold agent.
+// resetGrokBillingAttribution puts the process-wide append guard back into a
+// clean state so each test starts from a cold agent.
 func resetGrokBillingAttribution(t *testing.T) {
 	t.Helper()
-	clear := func() {
-		grokBillingAttribution.mu.Lock()
-		grokBillingAttribution.base = ""
-		grokBillingAttribution.identity = ""
-		grokBillingAttribution.lastVerified = time.Time{}
-		grokBillingAttribution.mu.Unlock()
-	}
-	clear()
-	t.Cleanup(clear)
+	// Deliberately a no-op body: the guard keeps NO in-process state, because
+	// any cached "already attributed" answer is a window in which a newer
+	// identity can displace ours unnoticed. The provider log is the only state,
+	// and each test builds its own. Kept as the call site every attribution test
+	// starts from, so re-introducing process state has one place to reset.
+	_ = t
 }
 
 // grokIdentityLineCount counts our producer markers in a home's unified log.
@@ -82,7 +79,7 @@ func TestEnsureGrokBillingAttribution_MakesADirectRunRecordObservable(t *testing
 	t.Setenv("GROK_HOME", base)
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
-	ensureGrokBillingAttribution(now)
+	ensureGrokBillingAttribution()
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want exactly 1", got)
 	}
@@ -111,18 +108,17 @@ func TestEnsureGrokBillingAttribution_IsIdempotentAndReArmsOnAccountChange(t *te
 	resetGrokBillingAttribution(t)
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
-	start := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
-	ensureGrokBillingAttribution(start)
-	ensureGrokBillingAttribution(start.Add(time.Minute))
-	// Past the recheck window, with our line still present: verify, do not write.
-	ensureGrokBillingAttribution(start.Add(grokBillingAttributionRecheck + time.Minute))
+	ensureGrokBillingAttribution()
+	ensureGrokBillingAttribution()
+	// Our line is still the newest identity in the log: verify, do not write.
+	ensureGrokBillingAttribution()
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want 1 — the guard appended on an unchanged log", got)
 	}
 
 	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{"user_id": "acct-2"})
-	ensureGrokBillingAttribution(start.Add(2 * time.Minute))
+	ensureGrokBillingAttribution()
 	if got := grokIdentityLineCount(t, base); got != 2 {
 		t.Fatalf("identity lines = %d, want 2 after an account change", got)
 	}
@@ -144,9 +140,8 @@ func TestEnsureGrokBillingAttribution_ReArmsAfterLogRotation(t *testing.T) {
 	resetGrokBillingAttribution(t)
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
-	start := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
-	ensureGrokBillingAttribution(start)
+	ensureGrokBillingAttribution()
 	// Grok rotates the log out from under us.
 	if err := os.WriteFile(grokBillingLogPath(base), []byte(`{"msg":"log rotated"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("rotate log: %v", err)
@@ -155,15 +150,12 @@ func TestEnsureGrokBillingAttribution_ReArmsAfterLogRotation(t *testing.T) {
 		t.Fatalf("identity lines = %d after rotation, want 0", got)
 	}
 
-	// A recheck inside the window is deliberately cheap and does nothing; the
-	// next one past it notices the rotation and self-heals.
-	ensureGrokBillingAttribution(start.Add(time.Minute))
-	if got := grokIdentityLineCount(t, base); got != 0 {
-		t.Fatalf("identity lines = %d, want no read/write inside the recheck window", got)
-	}
-	ensureGrokBillingAttribution(start.Add(grokBillingAttributionRecheck + time.Minute))
+	// The very next session start notices the rotation and self-heals. There is
+	// no grace window: a direct run inside one would write records nothing in
+	// the log identifies, and those are refused outright.
+	ensureGrokBillingAttribution()
 	if got := grokIdentityLineCount(t, base); got != 1 {
-		t.Fatalf("identity lines = %d, want attribution restored after rotation", got)
+		t.Fatalf("identity lines = %d, want attribution restored on the next session start", got)
 	}
 
 	helperAppendGrokLogLine(t, base,
@@ -259,7 +251,7 @@ func TestEnsureGrokBillingAttribution_DoesNotAdoptAnotherAccountsRecord(t *testi
 	t.Setenv("GROK_HOME", base)
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
-	ensureGrokBillingAttribution(now)
+	ensureGrokBillingAttribution()
 	// A different account's session logs its own identity and fetches billing.
 	helperAppendGrokLogLine(t, base, `{"ts":"2026-08-19T12:01:00Z","msg":"session start","ctx":{"user_id":"acct-9"}}`)
 	helperAppendGrokLogLine(t, base,
@@ -286,14 +278,16 @@ func TestEnsureGrokBillingAttribution_DoesNotAdoptAnotherAccountsRecord(t *testi
 // to, so the guard must re-append rather than settle for our older marker still
 // being somewhere in the tail — otherwise every subsequent direct record for the
 // signed-in account is attributed to the other one until the stale marker ages
-// out of the 1 MiB tail.
+// out of the 1 MiB tail. The displacing marker lands moments after our own, so
+// this also pins that there is no "recently verified" grace window in which a
+// direct session skips the check — such a window is precisely how a managed
+// account-B exit made the next direct account-A run unobservable.
 func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityDisplacesOurs(t *testing.T) {
 	resetGrokBillingAttribution(t)
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
-	start := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
-	ensureGrokBillingAttribution(start)
+	ensureGrokBillingAttribution()
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want 1", got)
 	}
@@ -308,7 +302,7 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityDisplacesOurs(t *t
 		t.Fatal("acct-1 must not read as the newest identity once acct-2 logged one")
 	}
 
-	ensureGrokBillingAttribution(start.Add(grokBillingAttributionRecheck + time.Minute))
+	ensureGrokBillingAttribution()
 	if got := grokIdentityLineCount(t, base); got != 3 {
 		t.Fatalf("identity lines = %d, want 3 — the displaced account was not re-attributed", got)
 	}
@@ -318,6 +312,44 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityDisplacesOurs(t *t
 	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
 	if !ok {
 		t.Fatal("the direct record written after the re-append must be attributable to acct-1")
+	}
+	if got := snap.ObservedAt.UTC().Format(time.RFC3339); got != "2026-08-19T13:05:00Z" {
+		t.Fatalf("ObservedAt = %s, want the newest record", got)
+	}
+}
+
+// A newer identity-shaped line the reader cannot decode (malformed, or a
+// partially written one) is DISPLACEMENT, not noise: grokRecordBelongsToCurrentAccount
+// stops and refuses on it rather than falling back to older evidence, so an
+// older matching marker sitting behind it does not keep later records
+// attributable. The guard must re-append instead of reading the log as
+// still-ours.
+func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityIsUndecodable(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+
+	ensureGrokBillingAttribution()
+	if got := grokIdentityLineCount(t, base); got != 1 {
+		t.Fatalf("identity lines = %d, want 1", got)
+	}
+
+	// A truncated write leaves an identity-shaped line that is not valid JSON.
+	helperAppendGrokLogLine(t, base, `{"msg":"session start","ctx":{"user_id":"acct-`)
+	if grokBillingIdentityIsNewest(base, "acct-1") {
+		t.Fatal("an undecodable newer identity line must not leave acct-1 reading as newest")
+	}
+
+	ensureGrokBillingAttribution()
+	if got := grokIdentityLineCount(t, base); got != 2 {
+		t.Fatalf("identity lines = %d, want 2 — the corrective append was suppressed", got)
+	}
+
+	helperAppendGrokLogLine(t, base,
+		grokUnmeteredLine("2026-08-19T13:05:00Z", grokBillingLogMessage))
+	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
+	if !ok {
+		t.Fatal("the record written after the re-append must be attributable to acct-1")
 	}
 	if got := snap.ObservedAt.UTC().Format(time.RFC3339); got != "2026-08-19T13:05:00Z" {
 		t.Fatalf("ObservedAt = %s, want the newest record", got)

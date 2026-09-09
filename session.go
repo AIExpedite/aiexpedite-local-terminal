@@ -497,7 +497,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// restore — dependent on that race. Mirrors grok_acp.go, which likewise
 	// attributes before it spawns.
 	if isGrokCommand(command) && isolatedGrokHome == "" {
-		ensureGrokBillingAttribution(time.Now())
+		ensureGrokBillingAttribution()
 	}
 
 	// Start the process
