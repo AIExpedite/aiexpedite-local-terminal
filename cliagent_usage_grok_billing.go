@@ -407,9 +407,10 @@ func grokBillingIdentityIsNewest(base, identity string) bool {
 
 // persistGrokManagedBillingSnapshot copies one session's newest verified
 // billing observation into the provider-owned log after the managed process
-// exits. The source is bound to the auth copy frozen at session start. The two
-// destination lines are written in one O_APPEND call so a direct Grok process
-// cannot interleave a different account identity between them.
+// exits. The source is bound to the auth copy frozen at session start. The
+// destination lines — our identity, our record, and (when a direct run is armed)
+// the direct account's identity again — are written in one O_APPEND call so a
+// direct Grok process cannot interleave a record between them.
 //
 // Only normalized allowlisted fields are persisted. Prompts, credentials, raw
 // config, tool results, and unrelated log fields never leave the isolated home.
@@ -465,34 +466,62 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 	payload = append(payload, billingLine...)
 	payload = append(payload, '\n')
 
+	// Our identity line above becomes the newest one in the log, and a record
+	// binds to the NEAREST identity preceding it — so from this write on, every
+	// record a still-live DIRECT run writes would bind to the managed account
+	// and be refused. Repairing that with a SECOND append after this one is too
+	// late: the mutex below serializes this process's helpers, not the direct
+	// child, which can land its only billing record in the gap between the two
+	// writes. So when a direct run is armed, the repair marker rides in the SAME
+	// atomic payload, after our record. Our record still binds to the identity
+	// immediately above it, and the very next byte of the log already names the
+	// direct account again — there is no window at all.
+	//
+	// Skipped when the two accounts are the same (the pair already names the
+	// direct account) and when the device has no armed direct run, so a
+	// managed-only device writes nothing extra into a provider-owned file.
+	repairAfterWrite := false
+	if grokDirectAttributionArmed() {
+		switch directIdentity, ok := grokResolvedBillingIdentity(persistentHome); {
+		case !ok:
+			// Nothing resolvable to re-assert; the keeper's tick is the only
+			// remaining cover.
+		case strings.EqualFold(strings.TrimSpace(directIdentity), identity):
+			// Already named by the pair above.
+		default:
+			directLine, lineErr := grokBillingIdentityLine(directIdentity)
+			if lineErr != nil {
+				// Fall back to the post-write repair rather than dropping the
+				// merge: a narrowed window beats an unattributed direct run.
+				repairAfterWrite = true
+				break
+			}
+			payload = append(payload, directLine...)
+			payload = append(payload, '\n')
+		}
+	}
+
 	// Serialize against ensureGrokBillingAttribution's read-then-append. Without
 	// this, that check can observe our identity as the newest, then have this
 	// paired append land before it returns — leaving the direct session
 	// believing it is attributed while every record it writes next binds to the
-	// identity merged here. The pairing below keeps THIS record correct either
+	// identity merged here. The pairing above keeps THIS record correct either
 	// way; the lock is what keeps the direct path's decision from going stale
 	// between its read and its write.
 	if err := appendGrokBillingPair(persistentHome, payload); err != nil {
 		return grokManagedBillingFailed, err
 	}
 
-	// Our own append just made THIS session's identity the newest one in the
-	// log. Any direct run still live would have every record it writes from
-	// here on bound to it and refused, and the periodic keeper would not notice
-	// for up to a full tick — long enough for a short one-shot run to write its
-	// only billing record and exit unattributed. Repair immediately, outside
-	// the write lock (ensureGrokBillingAttribution takes it itself), and only
-	// when a direct run is actually armed so a managed-only device writes
-	// nothing extra.
-	if grokDirectAttributionArmed() {
+	if repairAfterWrite {
+		// Outside the write lock — ensureGrokBillingAttribution takes it itself.
 		ensureGrokBillingAttribution()
 	}
 	return grokManagedBillingPersisted, nil
 }
 
-// appendGrokBillingPair writes the identity + record pair in one O_APPEND call.
+// appendGrokBillingPair writes the caller's whole payload in one O_APPEND call.
 //
-// Split out so the write lock is released before the direct-run repair above:
+// Split out so the write lock is released before the fallback repair above:
 // holding grokBillingAttributionSerialize across ensureGrokBillingAttribution's
 // own read-then-append would deadlock.
 func appendGrokBillingPair(persistentHome string, payload []byte) error {

@@ -517,10 +517,18 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// it. The keeper armed below re-asserts on a bounded tick until the child is
 	// reaped, so displacement costs at most one interval instead of the rest of
 	// the session.
+	//
+	// ARM FIRST, then check. persistGrokManagedBillingSnapshot only carries its
+	// repair marker when it can see an armed direct run, so a managed exit
+	// landing between a check and a later arm would displace us with no repair
+	// and no tick due — and this run's only billing record would be refused.
+	// Arming first makes that gap unreachable: a managed merge either sees the
+	// arm and re-names us in its own payload, or lands before it and is
+	// corrected by the check below (both serialize on the same write lock).
 	var finishGrokAttribution func()
 	if isGrokCommand(command) && isolatedGrokHome == "" {
-		ensureGrokBillingAttribution()
 		finishGrokAttribution = startGrokBillingAttributionKeeper()
+		ensureGrokBillingAttribution()
 	}
 
 	// Start the process

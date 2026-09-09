@@ -15,6 +15,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -287,5 +288,78 @@ func TestPersistGrokManagedBillingSnapshot_DoesNotRepairWhenNoDirectRunIsArmed(t
 	}
 	if got := grokIdentityLineCount(t, persistent); got != 1 {
 		t.Fatalf("identity lines = %d, want 1 — the merge repaired attribution with no direct run armed", got)
+	}
+}
+
+// The repair must ride in the merge's OWN write, not a follow-up append: the
+// write lock serializes this process's helpers, not the direct Grok child, so a
+// record landing between two appends would bind to the managed account and be
+// refused. Pinned by asserting the merged log already ends with the direct
+// account's marker the moment persist returns.
+func TestPersistGrokManagedBillingSnapshot_RepairsInTheSameAtomicWrite(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	ensureGrokBillingAttribution()
+	finish := startGrokBillingAttributionKeeper()
+	defer finish()
+
+	isolated := helperGrokHomeWithAccount(t, "acct-managed")
+	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-managed"))
+	helperAppendGrokLogLine(t, isolated,
+		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+
+	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil ||
+		outcome != grokManagedBillingPersisted {
+		t.Fatalf("persist → %v, %v; want persisted", outcome, err)
+	}
+
+	raw, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read unified.jsonl: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	last := lines[len(lines)-1]
+	if !strings.Contains(last, grokManagedBillingIdentityMessage) ||
+		!strings.Contains(last, "acct-1") {
+		t.Fatalf("merged log ends with %q — want the direct account's marker as "+
+			"the last line, so no record can land unattributed after the merge", last)
+	}
+	// The managed record must still bind to the managed identity ABOVE it: the
+	// repair marker only names the direct account for what comes NEXT.
+	if len(lines) < 4 ||
+		!strings.Contains(lines[len(lines)-3], grokManagedBillingIdentityMessage) ||
+		!strings.Contains(lines[len(lines)-3], "acct-managed") ||
+		!strings.Contains(lines[len(lines)-2], grokBillingLogMessage) {
+		t.Fatalf("merged pair ordering broke: %q", lines)
+	}
+}
+
+// The repair marker is for a DIFFERENT account. When the managed session ran as
+// the same account the direct run uses, the merged pair already names it, and a
+// second identical marker would be a standing extra write into a provider-owned
+// file for no gain.
+func TestPersistGrokManagedBillingSnapshot_SkipsRepairForTheSameAccount(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	finish := startGrokBillingAttributionKeeper()
+	defer finish()
+
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-1"))
+	helperAppendGrokLogLine(t, isolated,
+		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+
+	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil ||
+		outcome != grokManagedBillingPersisted {
+		t.Fatalf("persist → %v, %v; want persisted", outcome, err)
+	}
+	if got := grokIdentityLineCount(t, persistent); got != 1 {
+		t.Fatalf("identity lines = %d, want 1 — the merge repaired an account that was already newest", got)
 	}
 }
