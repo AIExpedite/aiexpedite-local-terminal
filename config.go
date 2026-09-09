@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -38,7 +39,7 @@ type Config struct {
 	CAFile   string `json:"ca_file,omitempty"`
 
 	/* ─── Local ttyd ────────────────────────────────── */
-	LocalTtydPort int `json:"local_ttyd_port,omitempty"` // 0 = 7681
+	LocalTtydPort int `json:"local_ttyd_port,omitempty"` // 0 = this channel's default (local_ports.go)
 
 	// AutoUpdate is the "Automatically update" tray preference. It is a
 	// *bool (not a plain bool) tagged WITHOUT omitempty so the value is
@@ -254,6 +255,20 @@ func LoadConfig(path string) (*Config, error) {
 		}
 	}
 	cfg.autoUpdateRuntime.Store(*cfg.AutoUpdate)
+
+	// A non-prod config still on the old shared ttyd port was written by an
+	// older DefaultConfig(), not chosen by the user; move it to the channel's
+	// own port so it stops fighting the prod agent for 7681. Persist so the
+	// tray's Open Terminal link and the next load agree; a failed save only
+	// costs a repeat migration next start.
+	if port, migrated := migrateLegacyTtydPort(EnvName, cfg.LocalTtydPort); migrated {
+		fmt.Printf("[config] local_ttyd_port %d is the shared legacy default; using %d for the %s channel\n",
+			cfg.LocalTtydPort, port, EnvName)
+		cfg.LocalTtydPort = port
+		if err := cfg.Save(path); err != nil {
+			_ = err
+		}
+	}
 	return cfg, nil
 }
 
@@ -429,7 +444,7 @@ func DefaultConfig() *Config {
 		CommandsSubscription: "terminal-commands-sub",
 		ResultsTopic:         "terminal-results",
 
-		LocalTtydPort: 7681,
+		LocalTtydPort: defaultTtydPortFor(EnvName),
 		AutoUpdate:    &autoUpdateDefault, // "Automatically update" is enabled by default
 
 		// File upload defaults

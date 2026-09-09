@@ -1,13 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
 )
 
-var tmuxSessionName = "agent"
+// tmuxSessionName is the session this channel owns. It is per channel
+// (local_ports.go) because the prod and dev agents run side by side on one
+// machine: a shared name made them race for one session at startup and kill
+// each other's session at shutdown.
+var tmuxSessionName = tmuxSessionNameFor(EnvName)
 
 // ensureTmux returns nil when tmux is available (installed automatically when
 // possible) or an error explaining why it cannot be used.
@@ -52,8 +58,25 @@ func startTmuxSession() error {
 	}
 
 	// Create a new detached session.
-	if err := exec.Command("tmux", "new-session", "-d", "-s", tmuxSessionName).Run(); err != nil {
-		return fmt.Errorf("failed to start tmux session: %w", err)
+	var stderr bytes.Buffer
+	create := exec.Command("tmux", "new-session", "-d", "-s", tmuxSessionName)
+	create.Stderr = &stderr
+	if err := create.Run(); err != nil {
+		// Lost a create race (another agent instance of THIS channel, or a
+		// relaunch overlapping its predecessor's teardown): the session we
+		// wanted now exists, which is the outcome we were after.
+		if tmuxDuplicateSession(stderr.String()) &&
+			exec.Command("tmux", "has-session", "-t", tmuxSessionName).Run() == nil {
+			return nil
+		}
+		return fmt.Errorf("failed to start tmux session %q: %w (%s)",
+			tmuxSessionName, err, bytes.TrimSpace(stderr.Bytes()))
 	}
 	return nil
+}
+
+// tmuxDuplicateSession reports whether tmux refused new-session because the
+// name is already taken (`duplicate session: <name>`).
+func tmuxDuplicateSession(stderr string) bool {
+	return strings.Contains(stderr, "duplicate session")
 }

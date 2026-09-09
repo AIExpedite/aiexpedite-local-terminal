@@ -11,9 +11,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -183,9 +185,17 @@ func StartAgent(cfg *Config) {
 		}
 	}
 
+	// The local web terminal (tmux + ttyd) is a convenience; the cloud
+	// connection below is the job. Nothing in this section may abort
+	// StartAgent: an early return here happens AFTER the previous instance
+	// told the backend it was shutting down and BEFORE this one says it is
+	// back, so the tray stays up while the device shows Disconnected — the
+	// 2026-09-09 prod outage, when a tmux name collision with the dev agent
+	// did exactly that for four hours.
+	localTerminal := true
 	if err := ensureTtyd(); err != nil {
-		fmt.Println("Fatal:", err)
-		return
+		localTerminal = false
+		fmt.Println("Warning:", err, "- local web terminal disabled; cloud connection continues.")
 	}
 
 	// Git is a warning-level dependency (see readiness.go): offer to install it
@@ -194,8 +204,8 @@ func StartAgent(cfg *Config) {
 
 	if useTmux {
 		if err := startTmuxSession(); err != nil {
-			fmt.Println("Fatal:", err)
-			return
+			useTmux = false
+			fmt.Println("Warning:", err, "- running the local terminal without tmux.")
 		}
 	}
 
@@ -216,19 +226,31 @@ func StartAgent(cfg *Config) {
 		shellCmd = []string{sh}
 	}
 
-	port := cfg.LocalTtydPort
-	if port == 0 {
-		port = 7681
+	port := resolvedTtydPort(cfg.LocalTtydPort)
+	if localTerminal {
+		// ttyd reports a busy port only on its own stderr, after Start() has
+		// already succeeded, so probe the bind ourselves and say which port
+		// and why — the usual cause is another channel's agent on this
+		// machine with `local_ttyd_port` overridden onto the same number.
+		if probe, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port))); err != nil {
+			localTerminal = false
+			fmt.Printf("Warning: local terminal port %d is already in use (%v) - local web terminal disabled; "+
+				"set a different local_ttyd_port in %s. Cloud connection continues.\n", port, err, ConfigPath())
+		} else {
+			_ = probe.Close()
+		}
 	}
-	args := append([]string{"-p", fmt.Sprintf("%d", port), "-i", "127.0.0.1"}, shellCmd...)
-
-	ttydCmd = exec.Command("ttyd", args...)
-	hideWindow(ttydCmd)
-	if err := ttydCmd.Start(); err != nil {
-		fmt.Println("Fatal: cannot start ttyd –", err)
-		return
+	if localTerminal {
+		args := append([]string{"-p", strconv.Itoa(port), "-i", "127.0.0.1"}, shellCmd...)
+		ttydCmd = exec.Command("ttyd", args...)
+		hideWindow(ttydCmd)
+		if err := ttydCmd.Start(); err != nil {
+			ttydCmd = nil
+			fmt.Println("Warning: cannot start ttyd –", err, "- local web terminal disabled; cloud connection continues.")
+		} else {
+			fmt.Printf("→ ttyd listening on http://127.0.0.1:%d\n", port)
+		}
 	}
-	fmt.Printf("→ ttyd listening on http://127.0.0.1:%d\n", port)
 
 	/* 3. Pre-warm persistent PowerShell (Windows only) -------------------- */
 

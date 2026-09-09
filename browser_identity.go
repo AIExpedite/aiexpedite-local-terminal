@@ -17,18 +17,10 @@ import (
 )
 
 const (
-	defaultTtydPort         = 7681
 	identityChallengeMinLen = 16
 	identityChallengeMaxLen = 128
 	identityMaxHeaderBytes  = 8 << 10
 )
-
-var identityPorts = map[string]int{
-	"prod": 7682,
-	"dev":  7683,
-	"stg":  7684,
-	"beta": 7685,
-}
 
 var identityOrigins = map[string]map[string]struct{}{
 	"prod": {"https://aiexpedite.com": {}},
@@ -57,18 +49,6 @@ type browserIdentityError struct {
 var browserIdentityState struct {
 	sync.Mutex
 	server *http.Server
-}
-
-func browserIdentityPort(environment string) (int, bool) {
-	port, ok := identityPorts[environment]
-	return port, ok
-}
-
-func resolvedTtydPort(configured int) int {
-	if configured == 0 {
-		return defaultTtydPort
-	}
-	return configured
 }
 
 func browserIdentityServer(cfg *Config, environment string) (*http.Server, error) {
