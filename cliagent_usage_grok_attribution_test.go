@@ -22,16 +22,15 @@ import (
 // starts from a cold agent.
 func resetGrokBillingAttribution(t *testing.T) {
 	t.Helper()
-	grokBillingAttribution.mu.Lock()
-	grokBillingAttribution.identity = ""
-	grokBillingAttribution.lastVerified = time.Time{}
-	grokBillingAttribution.mu.Unlock()
-	t.Cleanup(func() {
+	clear := func() {
 		grokBillingAttribution.mu.Lock()
+		grokBillingAttribution.base = ""
 		grokBillingAttribution.identity = ""
 		grokBillingAttribution.lastVerified = time.Time{}
 		grokBillingAttribution.mu.Unlock()
-	})
+	}
+	clear()
+	t.Cleanup(clear)
 }
 
 // grokIdentityLineCount counts our producer markers in a home's unified log.

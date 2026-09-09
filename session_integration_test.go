@@ -480,6 +480,17 @@ func runMockCLI(mode string) {
 		fmt.Println(`{"type":"result","result":"billing refreshed"}`)
 		os.Exit(0)
 
+	case "grok-direct-billing-no-identity":
+		// What the REAL Grok CLI does: it logs the billing record and NO
+		// producer identity. The record is only attributable because the agent
+		// appended one at session start.
+		if err := writeMockGrokBillingRecordOnly(); err != nil {
+			fmt.Fprintf(os.Stderr, "write mock Grok billing record: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(`{"type":"result","result":"billing refreshed"}`)
+		os.Exit(0)
+
 	case "grok-acp-billing":
 		if err := writeMockGrokBillingEvidence(); err != nil {
 			fmt.Fprintf(os.Stderr, "write mock Grok billing evidence: %v\n", err)
@@ -761,6 +772,37 @@ func writeMockGrokBillingEvidence() error {
 	return nil
 }
 
+// writeMockGrokBillingRecordOnly appends the same allowlisted billing record as
+// writeMockGrokBillingEvidence but WITHOUT the `session start` identity line —
+// the shape the real Grok CLI writes. A record with no producer identity logged
+// before it is refused outright, so this only becomes observable when the agent
+// has appended its own identity line at session start.
+func writeMockGrokBillingRecordOnly() error {
+	base := os.Getenv("GROK_HOME")
+	if base == "" {
+		return fmt.Errorf("GROK_HOME is empty")
+	}
+	dir := filepath.Join(base, "logs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create logs directory: %w", err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "unified.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open unified log: %w", err)
+	}
+	now := time.Now().UTC()
+	body := fmt.Sprintf(`{"ts":%q,"msg":"billing: fetched credits config","credential":"credential-sentinel","prompt":"prompt-sentinel","ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":%q,"end":%q},"rawConfig":"raw-config-sentinel"},"subscriptionTier":"SuperGrok"}}`+"\n",
+		now.Format(time.RFC3339Nano), now.Add(-time.Hour).Format(time.RFC3339Nano), now.Add(7*24*time.Hour).Format(time.RFC3339Nano))
+	if _, err := f.WriteString(body); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write billing log: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close unified log: %w", err)
+	}
+	return nil
+}
+
 // captureSession runs a SessionManager session against the test binary
 // configured as a mock CLI in the given mode. It returns the captured
 // publishFn messages in the order they were published, plus the session ID.
@@ -994,6 +1036,47 @@ func TestSessionLifecycle_GrokDirectPublishesFreshRedactedBilling(t *testing.T) 
 	metric := usage.Metrics[0]
 	if !metric.Unknown || metric.ObservedAt == "" || metric.ResetAt == "" {
 		t.Fatalf("direct run must produce a fresh confirmed-unmetered metric: %+v", metric)
+	}
+	out, err := json.Marshal(usage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"credential-sentinel", "prompt-sentinel", "raw-config-sentinel"} {
+		if strings.Contains(string(out), secret) {
+			t.Fatalf("direct usage leaked %q: %s", secret, out)
+		}
+	}
+}
+
+// The direct-run acceptance, end to end through StartSession: the real Grok CLI
+// logs no producer identity, so before this the account gate refused every
+// record a direct run wrote and the card could never show an observation.
+func TestSessionLifecycle_GrokDirectRunAttributesARecordTheCLIDidNotIdentify(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	realHome := t.TempDir()
+	seedGrokHomeWithLogin(t, realHome)
+	t.Setenv("GROK_HOME", realHome)
+	t.Setenv("XAI_API_KEY", "")
+
+	_, messages, err := captureSession(t, "grok-direct-billing-no-identity", "grok",
+		[]string{"refresh billing"}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	if len(messages) == 0 || messages[len(messages)-1].Type != "session_ended" {
+		t.Fatalf("direct Grok lifecycle did not complete: %+v", messages)
+	}
+
+	if got := grokIdentityLineCount(t, realHome); got != 1 {
+		t.Fatalf("identity lines = %d, want exactly 1 appended at session start", got)
+	}
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || len(usage.Metrics) != 1 {
+		t.Fatalf("direct billing parse failed: %+v", usage)
+	}
+	metric := usage.Metrics[0]
+	if !metric.Unknown || metric.ObservedAt == "" {
+		t.Fatalf("a direct run must leave a confirmed-unmetered record: %+v", metric)
 	}
 	out, err := json.Marshal(usage)
 	if err != nil {

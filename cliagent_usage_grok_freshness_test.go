@@ -139,6 +139,25 @@ func TestGrokBillingDecodesSnakeCaseFieldAliases(t *testing.T) {
 	}
 }
 
+// An unrecognized credits window must not suppress the on-demand pool: that is a
+// separate pool with its own numbers, and dropping it was part of why a run
+// could report observableMetricCount 0 while real figures sat in the record.
+func TestGrokUnrecognizedPeriodStillPublishesTheOnDemandPool(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	metrics := grokBillingMetrics(grokBillingSnapshot{
+		ObservedAt:      now.Add(-time.Hour),
+		PeriodType:      "USAGE_PERIOD_TYPE_SOMETHING_NEW",
+		HasOnDemand:     true,
+		HasOnDemandUsed: true,
+		OnDemandCap:     50,
+		OnDemandUsed:    12,
+	}, now)
+
+	assertGrokMetricsJSON(t, metrics,
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","observedAt":"2026-08-19T11:00:00Z","unknown":true},`+
+			`{"kind":"tokens","label":"On-demand credits","unit":"credits","total":50,"remaining":38,"consumed":12,"observedAt":"2026-08-19T11:00:00Z"}]`)
+}
+
 // The regression the EXACT-string match exists to prevent: the reader fails
 // closed on a newest record it cannot decode, so an unrelated high-frequency
 // `billing:` line must never be mistaken for a credits-config record — it would

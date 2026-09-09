@@ -127,8 +127,11 @@ const grokBillingAttributionRecheck = time.Hour
 // wrong here: Grok rotates unified.jsonl, which discards our identity line, and
 // a once-per-process guard would leave every post-rotation record
 // unattributable for the life of a long-running agent.
+// Keyed by (home, identity): the guard must not suppress an append into a
+// DIFFERENT log just because the same account was already attributed elsewhere.
 var grokBillingAttribution struct {
 	mu           sync.Mutex
+	base         string
 	identity     string
 	lastVerified time.Time
 }
@@ -161,7 +164,7 @@ func ensureGrokBillingAttribution(now time.Time) {
 	grokBillingAttribution.mu.Lock()
 	defer grokBillingAttribution.mu.Unlock()
 
-	if grokBillingAttribution.identity == identity {
+	if grokBillingAttribution.base == base && grokBillingAttribution.identity == identity {
 		if now.Sub(grokBillingAttribution.lastVerified) < grokBillingAttributionRecheck {
 			return
 		}
@@ -173,6 +176,7 @@ func ensureGrokBillingAttribution(now time.Time) {
 	if err := appendGrokBillingIdentity(base); err != nil {
 		return
 	}
+	grokBillingAttribution.base = base
 	grokBillingAttribution.identity = identity
 	grokBillingAttribution.lastVerified = now
 }
