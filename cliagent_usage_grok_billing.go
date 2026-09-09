@@ -338,12 +338,22 @@ func seedGrokManagedBillingIdentity(isolatedHome string) error {
 // credentials, so the line is never a claim about an account we are not
 // currently signed in as.
 func appendGrokBillingIdentity(base string) error {
+	identity, ok := grokResolvedBillingIdentity(base)
+	if !ok {
+		return nil
+	}
+	return appendGrokBillingIdentityValue(base, identity)
+}
+
+// appendGrokBillingIdentityValue writes a CAPTURED account rather than the one
+// the credentials resolve to now. Re-assertions during a live run must name the
+// account the running CLI was spawned under — see ensureGrokBillingIdentityNamed.
+func appendGrokBillingIdentityValue(base, identity string) error {
 	path := grokBillingLogPath(base)
 	if path == "" {
 		return nil
 	}
-	identity, ok := grokResolvedBillingIdentity(base)
-	if !ok {
+	if strings.TrimSpace(identity) == "" {
 		return nil
 	}
 	line, err := grokBillingIdentityLine(identity)
@@ -475,8 +485,11 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 	}
 
 	if repairAfterWrite {
-		// Outside the write lock — ensureGrokBillingAttribution takes it itself.
-		ensureGrokBillingAttribution()
+		// Outside the write lock — the re-assertion takes it itself. It names
+		// the armed run's CAPTURED account, never the live credentials, so a
+		// concurrent login in the shared home cannot turn the repair into a
+		// misattribution.
+		reassertGrokDirectAttribution()
 	}
 	return grokManagedBillingPersisted, nil
 }
@@ -531,29 +544,37 @@ func appendGrokBillingPair(
 	// belonging to anyone else (or one we cannot decode) is not evidence about
 	// this account, and readGrokBillingSnapshot reports it as no snapshot, so
 	// the merge proceeds.
+	//
+	// A record dated beyond grokBillingMaxClockSkew is skipped rather than
+	// honored. grokBillingMetrics refuses to PUBLISH such a record, so letting
+	// it supersede would leave managed usage Unknown until wall-clock caught up
+	// with it — after a clock correction, potentially for the rest of the
+	// period. The read path's distrust and this one have to agree: a timestamp
+	// too far ahead to publish is too far ahead to protect.
 	if existing, ok := readGrokBillingSnapshot(persistentHome, identities); ok &&
+		!existing.ObservedAt.After(time.Now().Add(grokBillingMaxClockSkew)) &&
 		!existing.ObservedAt.Before(observedAt) {
 		return true, false, nil
 	}
 
-	if grokDirectAttributionArmed() {
-		switch directIdentity, ok := grokResolvedBillingIdentity(persistentHome); {
-		case !ok:
-			// Nothing resolvable to re-assert; the keeper's tick is the only
-			// remaining cover.
-		case strings.EqualFold(strings.TrimSpace(directIdentity), identity):
-			// Already named by the pair above.
-		default:
-			directLine, lineErr := grokBillingIdentityLine(directIdentity)
-			if lineErr != nil {
-				// Fall back to the post-write repair rather than dropping the
-				// merge: a narrowed window beats an unattributed direct run.
-				repairAfterWrite = true
-				break
-			}
-			payload = append(payload, directLine...)
-			payload = append(payload, '\n')
+	directIdentity, armed := grokArmedDirectIdentity()
+	switch {
+	case !armed:
+		// No live direct run, or two armed on different accounts: naming
+		// either would be a guess about whose records follow, so nothing
+		// extra is written into a provider-owned file.
+	case strings.EqualFold(directIdentity, identity):
+		// Already named by the pair above.
+	default:
+		directLine, lineErr := grokBillingIdentityLine(directIdentity)
+		if lineErr != nil {
+			// Fall back to the post-write repair rather than dropping the
+			// merge: a narrowed window beats an unattributed direct run.
+			repairAfterWrite = true
+			break
 		}
+		payload = append(payload, directLine...)
+		payload = append(payload, '\n')
 	}
 
 	return false, repairAfterWrite, writeGrokBillingPayload(persistentHome, payload)

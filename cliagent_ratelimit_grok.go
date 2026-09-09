@@ -151,6 +151,26 @@ func ensureGrokBillingAttribution() {
 	if !ok {
 		return
 	}
+	ensureGrokBillingIdentityNamed(base, identity)
+}
+
+// ensureGrokBillingIdentityNamed is the same guard for a CAPTURED account
+// rather than whichever one the credentials resolve to right now.
+//
+// The distinction is the account boundary. A direct run keeps writing billing
+// records under the credentials it was SPAWNED with, while a `grok login` in the
+// shared home changes only who a LATER process would be. Re-reading the auth
+// file on every re-assertion would name the new account above the old process's
+// records and publish one account's utilization as another's — worse than the
+// unattributable record the re-assertion exists to prevent. So the keeper and
+// the managed merge both re-assert a CAPTURED identity, and reading the live
+// credentials stays confined to session start, where the two are the same thing
+// by construction.
+func ensureGrokBillingIdentityNamed(base, identity string) {
+	identity = strings.TrimSpace(identity)
+	if base == "" || identity == "" {
+		return
+	}
 
 	grokBillingAttributionSerialize.Lock()
 	defer grokBillingAttributionSerialize.Unlock()
@@ -158,7 +178,7 @@ func ensureGrokBillingAttribution() {
 	if grokBillingIdentityIsNewest(base, identity) {
 		return
 	}
-	_ = appendGrokBillingIdentity(base)
+	_ = appendGrokBillingIdentityValue(base, identity)
 }
 
 // grokLimitStateFromFrame walks a decoded Grok frame for a usage-limit signal.
@@ -360,9 +380,15 @@ func grokBillingAttributionKeeperIntervalValue() time.Duration {
 }
 
 var (
-	grokAttributionKeeperMu   sync.Mutex
+	grokAttributionKeeperMu sync.Mutex
+	// grokAttributionKeeperRefs counts live direct runs; the shared keeper
+	// goroutine runs while it is above zero.
 	grokAttributionKeeperRefs int
-	grokAttributionKeeperStop chan struct{}
+	// grokAttributionKeeperAccounts counts those runs PER captured account, so
+	// a re-assertion names the account its runs were started under rather than
+	// whatever the shared home resolves to now.
+	grokAttributionKeeperAccounts = map[string]int{}
+	grokAttributionKeeperStop     chan struct{}
 )
 
 // startGrokBillingAttributionKeeper holds attribution for the LIFETIME of a
@@ -373,9 +399,13 @@ var (
 // share one provider-owned log, so per-session pollers would only duplicate the
 // same read). Mirrors startAntigravityQuotaCapture's run-scoped, ref-counted
 // arm/release shape.
-func startGrokBillingAttributionKeeper() (finish func()) {
+func startGrokBillingAttributionKeeper(identity string) (finish func()) {
+	identity = strings.TrimSpace(identity)
 	grokAttributionKeeperMu.Lock()
 	grokAttributionKeeperRefs++
+	if identity != "" {
+		grokAttributionKeeperAccounts[identity]++
+	}
 	if grokAttributionKeeperRefs == 1 {
 		grokAttributionKeeperStop = make(chan struct{})
 		go runGrokBillingAttributionKeeper(grokAttributionKeeperStop)
@@ -388,6 +418,13 @@ func startGrokBillingAttributionKeeper() (finish func()) {
 			grokAttributionKeeperMu.Lock()
 			var stop chan struct{}
 			grokAttributionKeeperRefs--
+			if identity != "" {
+				if grokAttributionKeeperAccounts[identity] <= 1 {
+					delete(grokAttributionKeeperAccounts, identity)
+				} else {
+					grokAttributionKeeperAccounts[identity]--
+				}
+			}
 			if grokAttributionKeeperRefs <= 0 {
 				grokAttributionKeeperRefs = 0
 				stop, grokAttributionKeeperStop = grokAttributionKeeperStop, nil
@@ -400,8 +437,9 @@ func startGrokBillingAttributionKeeper() (finish func()) {
 	}
 }
 
-// grokDirectAttributionArmed reports whether at least one direct (PTY) Grok run
-// is currently relying on our identity being the newest one in the log.
+// grokArmedDirectIdentity returns the account EVERY live direct (PTY) Grok run
+// was started under, or ("", false) when none is armed or two armed runs
+// disagree.
 //
 // It exists so a displacement WE cause — persistGrokManagedBillingSnapshot
 // merging another session's paired identity/record lines — can be repaired the
@@ -410,10 +448,33 @@ func startGrokBillingAttributionKeeper() (finish func()) {
 // otherwise loses every record of a short direct run that starts, is displaced,
 // writes its billing line and exits inside a single interval. The periodic tick
 // still covers the out-of-process case (`grok login` outside the agent).
-func grokDirectAttributionArmed() bool {
+//
+// Two armed runs on DIFFERENT accounts report no armed identity rather than one
+// of them: there is a single log and a record binds to the nearest identity
+// above it, so naming one account would attribute the other run's records to
+// it. An unattributable record is recoverable — a misattributed one is a
+// billing lie.
+func grokArmedDirectIdentity() (string, bool) {
 	grokAttributionKeeperMu.Lock()
 	defer grokAttributionKeeperMu.Unlock()
-	return grokAttributionKeeperRefs > 0
+	if len(grokAttributionKeeperAccounts) != 1 {
+		return "", false
+	}
+	for identity := range grokAttributionKeeperAccounts {
+		return identity, true
+	}
+	return "", false
+}
+
+// reassertGrokDirectAttribution re-names the account the live direct runs were
+// SPAWNED under — never the currently signed-in one, see
+// ensureGrokBillingIdentityNamed.
+func reassertGrokDirectAttribution() {
+	identity, ok := grokArmedDirectIdentity()
+	if !ok {
+		return
+	}
+	ensureGrokBillingIdentityNamed(grokPersistentHome(), identity)
 }
 
 // runGrokBillingAttributionKeeper re-asserts attribution until the last armed
@@ -426,7 +487,7 @@ func runGrokBillingAttributionKeeper(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			ensureGrokBillingAttribution()
+			reassertGrokDirectAttribution()
 		}
 	}
 }

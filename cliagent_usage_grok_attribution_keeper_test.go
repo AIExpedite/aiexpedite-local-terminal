@@ -58,7 +58,7 @@ func TestGrokBillingAttributionKeeper_RepairsDisplacementDuringALiveSession(t *t
 		t.Fatalf("identity lines = %d after session start, want 1", got)
 	}
 
-	finish := startGrokBillingAttributionKeeper()
+	finish := startGrokBillingAttributionKeeper("acct-1")
 	defer finish()
 
 	// Someone else's identity becomes the newest one — the exact displacement a
@@ -92,7 +92,7 @@ func TestGrokBillingAttributionKeeper_WritesNothingWhileAttributionHolds(t *test
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "5ms")
 
 	ensureGrokBillingAttribution()
-	finish := startGrokBillingAttributionKeeper()
+	finish := startGrokBillingAttributionKeeper("acct-1")
 	time.Sleep(120 * time.Millisecond) // many ticks
 	finish()
 
@@ -110,8 +110,8 @@ func TestGrokBillingAttributionKeeper_IsRefCountedAndReleaseIsIdempotent(t *test
 	t.Setenv("GROK_HOME", base)
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "5ms")
 
-	first := startGrokBillingAttributionKeeper()
-	second := startGrokBillingAttributionKeeper()
+	first := startGrokBillingAttributionKeeper("acct-1")
+	second := startGrokBillingAttributionKeeper("acct-1")
 	first()
 	first() // idempotent
 
@@ -131,6 +131,67 @@ func TestGrokBillingAttributionKeeper_IsRefCountedAndReleaseIsIdempotent(t *test
 		t.Fatalf("refs = %d running = %v — the last release did not stop the keeper",
 			refs, running)
 	}
+}
+
+// The account boundary. A direct run keeps writing records under the
+// credentials it was SPAWNED with, so a re-assertion that re-read the shared
+// home would name a later sign-in above those records and publish one
+// account's utilization as another's — strictly worse than the unattributable
+// record the keeper exists to prevent.
+func TestGrokBillingAttributionKeeper_ReassertsTheAccountTheRunStartedUnder(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "10ms")
+
+	ensureGrokBillingAttribution()
+	finish := startGrokBillingAttributionKeeper("acct-1")
+	defer finish()
+
+	// The user signs in as someone else mid-run. The acct-1 CLI is still live.
+	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{"user_id": "acct-2"})
+	helperAppendGrokLogLine(t, base, helperGrokIdentityLine(t, "acct-2"))
+
+	helperWaitForIdentityLines(t, base, 3)
+
+	raw, err := os.ReadFile(grokBillingLogPath(base))
+	if err != nil {
+		t.Fatalf("read unified.jsonl: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	last := lines[len(lines)-1]
+	if !strings.Contains(last, "acct-1") || strings.Contains(last, "acct-2") {
+		t.Fatalf("keeper re-asserted %q — it must name the account the live run was "+
+			"started under, never whoever is signed in now", last)
+	}
+}
+
+// Two live direct runs on DIFFERENT accounts share one log, and a record binds
+// to the nearest identity above it, so naming either account would attribute
+// the other run's records to it. Nothing is asserted: an unattributable record
+// is recoverable, a misattributed one is a billing lie.
+func TestGrokBillingAttributionKeeper_AssertsNothingWhenArmedRunsDisagree(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "5ms")
+
+	ensureGrokBillingAttribution()
+	first := startGrokBillingAttributionKeeper("acct-1")
+	defer first()
+	second := startGrokBillingAttributionKeeper("acct-2")
+
+	helperAppendGrokLogLine(t, base, helperGrokIdentityLine(t, "acct-other"))
+	time.Sleep(120 * time.Millisecond) // many ticks
+	if got := grokIdentityLineCount(t, base); got != 2 {
+		t.Fatalf("identity lines = %d, want 2 — the keeper picked a side between two "+
+			"armed accounts", got)
+	}
+
+	// The ambiguity is the second run's doing: once it releases, the surviving
+	// run's account is unambiguous again and attribution self-heals.
+	second()
+	helperWaitForIdentityLines(t, base, 3)
 }
 
 // The managed merge must not be able to land between the direct path's "am I
@@ -242,7 +303,7 @@ func TestPersistGrokManagedBillingSnapshot_RepairsAnArmedDirectRunImmediately(t 
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
 
 	ensureGrokBillingAttribution()
-	finish := startGrokBillingAttributionKeeper()
+	finish := startGrokBillingAttributionKeeper("acct-1")
 	defer finish()
 
 	isolated := helperGrokHomeWithAccount(t, "acct-managed")
@@ -303,7 +364,7 @@ func TestPersistGrokManagedBillingSnapshot_RepairsInTheSameAtomicWrite(t *testin
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
 
 	ensureGrokBillingAttribution()
-	finish := startGrokBillingAttributionKeeper()
+	finish := startGrokBillingAttributionKeeper("acct-1")
 	defer finish()
 
 	isolated := helperGrokHomeWithAccount(t, "acct-managed")
@@ -347,7 +408,7 @@ func TestPersistGrokManagedBillingSnapshot_SkipsRepairForTheSameAccount(t *testi
 	t.Setenv("GROK_HOME", persistent)
 	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
 
-	finish := startGrokBillingAttributionKeeper()
+	finish := startGrokBillingAttributionKeeper("acct-1")
 	defer finish()
 
 	isolated := helperGrokHomeWithAccount(t, "acct-1")
@@ -396,7 +457,7 @@ func TestPersistGrokManagedBillingSnapshot_ArmDuringTheWriteStillRepairs(t *test
 	// Give the merge time to reach the lock it is now blocked on, so the arm
 	// below genuinely races the write rather than preceding it.
 	time.Sleep(50 * time.Millisecond)
-	finish := startGrokBillingAttributionKeeper()
+	finish := startGrokBillingAttributionKeeper("acct-1")
 	defer finish()
 	grokBillingAttributionSerialize.Unlock()
 

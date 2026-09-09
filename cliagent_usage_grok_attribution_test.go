@@ -356,6 +356,53 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityIsUndecodable(t *t
 	}
 }
 
+// A record dated beyond grokBillingMaxClockSkew — a clock correction, a bad
+// container clock — is refused by the READ path, so it can never be published.
+// Letting it block merges too would freeze managed usage at Unknown until
+// wall-clock caught up with the bogus timestamp. The two paths have to distrust
+// the same records.
+func TestPersistGrokManagedBillingSnapshot_MergesPastAnUntrustedFutureRecord(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+
+	if err := appendGrokBillingIdentity(persistent); err != nil {
+		t.Fatalf("seed persistent identity: %v", err)
+	}
+	future := time.Now().Add(48 * time.Hour).UTC().Format(time.RFC3339)
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine(future, 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	// A perfectly good fresh managed fetch, dated now.
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	observed := time.Now().UTC().Format(time.RFC3339)
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine(observed, 12, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if outcome != grokManagedBillingPersisted {
+		t.Fatalf("outcome = %s, want %s — an unpublishable future record blocked a "+
+			"fresh managed observation, leaving the card Unknown until that time arrives",
+			outcome, grokManagedBillingPersisted)
+	}
+
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, time.Now())
+	if !ok {
+		t.Fatal("Parse failed")
+	}
+	if len(usage.Metrics) != 1 || usage.Metrics[0].ObservedAt != observed {
+		t.Fatalf("want the merged observation published, got %+v", usage.Metrics)
+	}
+}
+
 // A managed session can fetch credits early and exit long after a direct run has
 // written a NEWER observation. readGrokBillingSnapshot takes the last billing
 // line by FILE ORDER, so appending the older managed receipt last would replace

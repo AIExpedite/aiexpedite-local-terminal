@@ -527,7 +527,13 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// corrected by the check below (both serialize on the same write lock).
 	var finishGrokAttribution func()
 	if isGrokCommand(command) && isolatedGrokHome == "" {
-		finishGrokAttribution = startGrokBillingAttributionKeeper()
+		// The identity is CAPTURED here and re-asserted as-is for the life of the
+		// run. The child keeps writing records under the credentials it is spawned
+		// with, so re-reading the shared home later — after a `grok login` to
+		// another account — would name the new account above this run's records and
+		// publish one account's utilization as another's.
+		directIdentity, _ := grokResolvedBillingIdentity(grokPersistentHome())
+		finishGrokAttribution = startGrokBillingAttributionKeeper(directIdentity)
 		ensureGrokBillingAttribution()
 	}
 
