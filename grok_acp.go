@@ -441,6 +441,12 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// argv has no neutralizers, so launching with the inherited (potentially
 	// unsafe) GROK_HOME would silently bypass the workspace's opt-in gates.
 	persistentHome := grokPersistentHome()
+	// Mirror the direct path's session-start attribution so a managed-only
+	// device still has an attributable persistent log: the merged record is
+	// written with its own identity line, but a later direct `grok` run on the
+	// same machine relies on this one. Best-effort, under the credentials this
+	// session is about to copy.
+	ensureGrokBillingAttribution(time.Now())
 	isolatedHome, err := setupIsolatedGrokHomeFrom(opts.AllowAPIKeyFallback, resolvedModel, persistentHome)
 	if err != nil {
 		return fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)
@@ -1226,9 +1232,14 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	// login` can change the real home's account but cannot relabel this record:
 	// persistGrokManagedBillingSnapshot writes the copied producer identity and
 	// billing record together.
-	if err := persistGrokManagedBillingSnapshot(session.IsolatedHome, session.PersistentHome); err != nil {
-		fmt.Printf("%s[grok-acp] managed billing snapshot not persisted: %v%s\n",
-			colorYellow, err, colorReset)
+	if outcome, err := persistGrokManagedBillingSnapshot(session.IsolatedHome, session.PersistentHome); err != nil {
+		fmt.Printf("%s[grok-acp] managed billing snapshot not persisted (%s): %v%s\n",
+			colorYellow, outcome, err, colorReset)
+	} else {
+		// Report the typed outcome: a session whose child never fetched credits
+		// must not read as a successful merge in the logs.
+		fmt.Printf("%s[grok-acp] managed billing snapshot: %s%s\n",
+			colorCyan, outcome, colorReset)
 	}
 
 	// Scan for and upload whatever media this session wrote before announcing

@@ -261,16 +261,21 @@ func TestGrokBillingMetrics_RolledOverUnmeteredPeriodHasNoObservationTime(t *tes
 	}
 }
 
+// An unrecognized period must not be plotted under a guessed window — but the
+// record was still read, so its freshness must survive. Discarding the whole
+// observation is what produced observableMetricCount 0 with no latestObservedAt.
 func TestGrokBillingMetrics_UnknownPeriodTypeIsNotGuessed(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 	snap := grokBillingSnapshot{
 		UsedPercent:    52,
 		HasUsedPercent: true,
-		ObservedAt:     time.Now(),
+		ObservedAt:     now.Add(-time.Hour),
 		PeriodType:     "USAGE_PERIOD_TYPE_SOMETHING_NEW",
+		PeriodEnd:      now.Add(48 * time.Hour),
+		HasPeriodEnd:   true,
 	}
-	if metrics := grokBillingMetrics(snap, time.Now()); metrics != nil {
-		t.Errorf("an unrecognized period must not be plotted under a guessed window: %+v", metrics)
-	}
+	assertGrokMetricsJSON(t, grokBillingMetrics(snap, now),
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","observedAt":"2026-08-19T11:00:00Z","unknown":true}]`)
 }
 
 func TestGrokBillingMetrics_FutureRecordFailsClosedBeforeEveryPool(t *testing.T) {
@@ -415,8 +420,10 @@ func TestGrokUsageParser_UnknownNewestRecordBlocksOlderAndRedactsLookalikes(t *t
 	if !ok {
 		t.Fatal("Parse failed")
 	}
+	// Unknown window, no guessed reset, no scraped number — but the record was
+	// read, so the confirmed observation time is published.
 	assertGrokMetricsJSON(t, usage.Metrics,
-		`[{"kind":"weekly","label":"Weekly credits","unit":"%","unknown":true}]`)
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","observedAt":"2026-08-17T23:02:12Z","unknown":true}]`)
 	out, err := json.Marshal(usage)
 	if err != nil {
 		t.Fatal(err)
@@ -501,6 +508,12 @@ func TestGrokUsageParser_KeepsPlaceholderRowWithoutBillingLog(t *testing.T) {
 	}
 	if len(usage.Metrics) != 1 || !usage.Metrics[0].Unknown {
 		t.Errorf("want a single unobservable placeholder row, got %+v", usage.Metrics)
+	}
+	// The inferred placeholder must stay timestamp-less: a populated ObservedAt
+	// on an Unknown row is what distinguishes a CONFIRMED-unmetered reading from
+	// "we have never read a usable record", so this must not acquire one.
+	if usage.Metrics[0].ObservedAt != "" {
+		t.Errorf("ObservedAt = %q, want empty on the no-record placeholder", usage.Metrics[0].ObservedAt)
 	}
 }
 

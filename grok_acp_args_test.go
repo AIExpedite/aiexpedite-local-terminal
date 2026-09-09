@@ -385,8 +385,12 @@ func TestPersistGrokManagedBillingSnapshot_BindsCopiedAccountAcrossLoginChange(t
 	if err := os.WriteFile(grokBillingLogPath(realHome), []byte(`{"msg":"session start","ctx":{"user_id":"user-2"}}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := persistGrokManagedBillingSnapshot(isolatedHome, realHome); err != nil {
+	outcome, err := persistGrokManagedBillingSnapshot(isolatedHome, realHome)
+	if err != nil {
 		t.Fatalf("persist managed billing: %v", err)
+	}
+	if outcome != grokManagedBillingPersisted {
+		t.Fatalf("outcome = %s, want %s", outcome, grokManagedBillingPersisted)
 	}
 
 	if _, ok := readGrokBillingSnapshot(realHome, grokIdentityCandidates(realHome)); ok {

@@ -47,27 +47,129 @@ const grokBillingMaxClockSkew = 5 * time.Minute
 // writes it when the CLI fetches billing (session start / periodic refresh).
 const grokBillingLogMessage = "billing: fetched credits config"
 
+// grokBillingObservationTTL bounds how long a CONFIRMED-UNMETERED observation
+// stays trustworthy. Grok 1.0 publishes no percentage, so the record timestamp
+// is the only thing separating "the provider confirmed this period a moment
+// ago" from "we have never read a usable record" — and a timestamp that never
+// ages would present a week-old confirmation as current. Three days spans a
+// long weekend of not running Grok while staying well inside a weekly window.
+//
+// Deliberately NOT grokLimitNoticeTTL: that one bounds the discrete limit
+// banner, this one bounds capacity freshness. Sharing a value would make a
+// banner tuning change silently retune what the capacity bar claims to know.
+const grokBillingObservationTTL = 72 * time.Hour
+
+// grokBillingLogMessages is the CLOSED set of `msg` values accepted as a
+// credits-config record. Matching is EXACT — never a `billing:` prefix or
+// substring: the reader fails closed on a newest record it cannot decode, so
+// letting an unrelated high-frequency `billing:` line become the newest
+// "billing record" would permanently block a good older percentage. The extra
+// spellings tolerate a Grok release that renames the message without changing
+// its payload; anything outside this set degrades to unobservable.
+var grokBillingLogMessages = []string{
+	grokBillingLogMessage,
+	"billing: fetched credit config",
+	"billing: fetched credits",
+	"billing: credits config fetched",
+}
+
+// grokBillingMessageRecognized reports whether msg is one of the allowlisted
+// credits-config messages.
+func grokBillingMessageRecognized(msg string) bool {
+	for _, candidate := range grokBillingLogMessages {
+		if msg == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+// grokLineMentionsBillingMessage is the cheap pre-filter before the JSON
+// decode: the vast majority of lines in this log are chat/tool telemetry, and
+// unmarshalling every one of them would dominate the gather. A hit here is only
+// a candidate — grokBillingMessageRecognized still checks the decoded `msg`.
+func grokLineMentionsBillingMessage(line []byte) bool {
+	for _, candidate := range grokBillingLogMessages {
+		if bytes.Contains(line, []byte(candidate)) {
+			return true
+		}
+	}
+	return false
+}
+
 // grokBillingRecord mirrors the fields we consume from that line. Everything is
 // optional: an older CLI, a different plan shape, or a partially written line
 // must degrade to "unobservable", never to a wrong number.
 type grokBillingRecord struct {
 	TS  string `json:"ts"`
 	Ctx struct {
-		Config struct {
-			CreditUsagePercent grokBillingNumber `json:"creditUsagePercent"`
-			CurrentPeriod      struct {
-				Type string `json:"type"`
-				End  string `json:"end"`
-			} `json:"currentPeriod"`
-			OnDemandCap struct {
-				Val grokBillingNumber `json:"val"`
-			} `json:"onDemandCap"`
-			OnDemandUsed struct {
-				Val grokBillingNumber `json:"val"`
-			} `json:"onDemandUsed"`
-		} `json:"config"`
-		SubscriptionTier string `json:"subscriptionTier"`
+		Config grokBillingConfig `json:"config"`
+		// Both spellings of the tier are decoded for the same reason the config
+		// fields below are: the allowlist stays closed, but a Grok release that
+		// switches the envelope to snake_case must not blank the plan.
+		SubscriptionTier      string `json:"subscriptionTier"`
+		SubscriptionTierSnake string `json:"subscription_tier"`
 	} `json:"ctx"`
+}
+
+// grokBillingPeriodFields is the billing window as the record states it.
+type grokBillingPeriodFields struct {
+	Type string `json:"type"`
+	End  string `json:"end"`
+}
+
+// grokBillingAmount is one credit pool leaf (`{"val": <number>}`).
+type grokBillingAmount struct {
+	Val grokBillingNumber `json:"val"`
+}
+
+// grokBillingConfig decodes the credits config under both the camelCase keys
+// current Grok writes and their snake_case aliases. The allowlist is still
+// CLOSED — every accepted key is named here, nothing is scraped — but a field
+// rename across a CLI update degrades gracefully instead of silently zeroing
+// the only source of Grok capacity we have. camelCase wins any disagreement:
+// it is the shape observed on real machines.
+type grokBillingConfig struct {
+	CreditUsagePercent      grokBillingNumber       `json:"creditUsagePercent"`
+	CreditUsagePercentSnake grokBillingNumber       `json:"credit_usage_percent"`
+	CurrentPeriod           grokBillingPeriodFields `json:"currentPeriod"`
+	CurrentPeriodSnake      grokBillingPeriodFields `json:"current_period"`
+	OnDemandCap             grokBillingAmount       `json:"onDemandCap"`
+	OnDemandCapSnake        grokBillingAmount       `json:"on_demand_cap"`
+	OnDemandUsed            grokBillingAmount       `json:"onDemandUsed"`
+	OnDemandUsedSnake       grokBillingAmount       `json:"on_demand_used"`
+}
+
+func (c grokBillingConfig) creditUsagePercent() grokBillingNumber {
+	if c.CreditUsagePercent.Valid {
+		return c.CreditUsagePercent
+	}
+	return c.CreditUsagePercentSnake
+}
+
+func (c grokBillingConfig) currentPeriod() grokBillingPeriodFields {
+	period := c.CurrentPeriod
+	if strings.TrimSpace(period.Type) == "" {
+		period.Type = c.CurrentPeriodSnake.Type
+	}
+	if strings.TrimSpace(period.End) == "" {
+		period.End = c.CurrentPeriodSnake.End
+	}
+	return period
+}
+
+func (c grokBillingConfig) onDemandCap() grokBillingNumber {
+	if c.OnDemandCap.Val.Valid {
+		return c.OnDemandCap.Val
+	}
+	return c.OnDemandCapSnake.Val
+}
+
+func (c grokBillingConfig) onDemandUsed() grokBillingNumber {
+	if c.OnDemandUsed.Val.Valid {
+		return c.OnDemandUsed.Val
+	}
+	return c.OnDemandUsedSnake.Val
 }
 
 // grokBillingNumber decodes one allowlisted numeric leaf without rejecting the
@@ -153,32 +255,117 @@ func grokPersistentHome() string {
 
 const grokManagedBillingIdentityMessage = "aiexpedite: managed billing producer"
 
+// grokResolvedBillingIdentity returns the single account value written as the
+// producer identity for a home. Prefer the last candidate (normally the opaque
+// JWT subject) over an email while retaining compatibility with older auth
+// layouts. Shared by every writer so the seed, the direct-run append, and the
+// managed persist can never disagree about who produced a record.
+func grokResolvedBillingIdentity(base string) (string, bool) {
+	identities := grokIdentityCandidates(base)
+	if len(identities) == 0 {
+		return "", false
+	}
+	identity := strings.TrimSpace(identities[len(identities)-1])
+	if identity == "" {
+		return "", false
+	}
+	return identity, true
+}
+
+// grokBillingIdentityLine renders the one allowlisted producer-identity line.
+// Only the account value crosses into a log — never a token, config, or prompt.
+func grokBillingIdentityLine(identity string) ([]byte, error) {
+	return json.Marshal(map[string]any{
+		"msg": grokManagedBillingIdentityMessage,
+		"ctx": map[string]any{"user_id": identity},
+	})
+}
+
 // seedGrokManagedBillingIdentity records the account copied into an isolated
 // ACP home before the child starts. The isolated log is private to that one
 // process, so this marker cannot be displaced by a concurrent `grok login` in
-// the real home. Prefer the last candidate (normally the opaque JWT subject)
-// over an email while retaining compatibility with older auth layouts.
+// the real home. The write TRUNCATES on purpose: the isolated log must start
+// clean so the only records in it are this session's.
 func seedGrokManagedBillingIdentity(isolatedHome string) error {
 	path := grokBillingLogPath(isolatedHome)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	identities := grokIdentityCandidates(isolatedHome)
-	if len(identities) == 0 {
+	identity, ok := grokResolvedBillingIdentity(isolatedHome)
+	if !ok {
 		return nil
 	}
-	identity := strings.TrimSpace(identities[len(identities)-1])
-	if identity == "" {
-		return nil
-	}
-	line, err := json.Marshal(map[string]any{
-		"msg": grokManagedBillingIdentityMessage,
-		"ctx": map[string]any{"user_id": identity},
-	})
+	line, err := grokBillingIdentityLine(identity)
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(path, append(line, '\n'), 0o600)
+}
+
+// appendGrokBillingIdentity names the signed-in account in the PROVIDER-owned
+// log so the records a direct (PTY) Grok run writes afterwards are attributable.
+//
+// grokRecordBelongsToCurrentAccount refuses any record with no producer
+// identity logged before it, and the Grok CLI itself logs none — so without
+// this line a direct run can never yield an observable metric, however many
+// billing records it writes.
+//
+// One O_APPEND write of one complete line, matching
+// persistGrokManagedBillingSnapshot's atomicity contract: it cannot interleave
+// with a concurrent managed persist or with Grok's own writer and split a
+// record. Callers append only at session start, under that session's
+// credentials, so the line is never a claim about an account we are not
+// currently signed in as.
+func appendGrokBillingIdentity(base string) error {
+	path := grokBillingLogPath(base)
+	if path == "" {
+		return nil
+	}
+	identity, ok := grokResolvedBillingIdentity(base)
+	if !ok {
+		return nil
+	}
+	line, err := grokBillingIdentityLine(identity)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// grokBillingIdentityLogged reports whether `identity` still appears as a
+// producer identity inside the bounded log tail. Grok rotates unified.jsonl,
+// which discards our line; this is how the direct-run guard notices the
+// rotation and re-appends instead of leaving every later record unattributable.
+func grokBillingIdentityLogged(base, identity string) bool {
+	wanted := strings.TrimSpace(identity)
+	if wanted == "" {
+		return false
+	}
+	lines, ok := readGrokBillingLogTail(base)
+	if !ok {
+		return false
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		logged, found, valid := grokLogIdentity(lines[i])
+		if !found || !valid {
+			continue
+		}
+		if strings.EqualFold(logged, wanted) {
+			return true
+		}
+	}
+	return false
 }
 
 // persistGrokManagedBillingSnapshot copies one session's newest verified
@@ -189,21 +376,21 @@ func seedGrokManagedBillingIdentity(isolatedHome string) error {
 //
 // Only normalized allowlisted fields are persisted. Prompts, credentials, raw
 // config, tool results, and unrelated log fields never leave the isolated home.
-func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) error {
+func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (grokManagedBillingOutcome, error) {
 	if isolatedHome == "" || persistentHome == "" {
-		return nil
+		return grokManagedBillingNotApplicable, nil
 	}
 	identities := grokIdentityCandidates(isolatedHome)
 	if len(identities) == 0 {
-		return nil
+		return grokManagedBillingNoIdentity, nil
 	}
 	snap, ok := readGrokBillingSnapshot(isolatedHome, identities)
 	if !ok {
-		return nil
+		return grokManagedBillingNoRecord, nil
 	}
 	identity := strings.TrimSpace(identities[len(identities)-1])
 	if identity == "" {
-		return nil
+		return grokManagedBillingNoIdentity, nil
 	}
 
 	period := map[string]any{"type": snap.PeriodType}
@@ -220,12 +407,9 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) erro
 			config["onDemandUsed"] = map[string]any{"val": snap.OnDemandUsed}
 		}
 	}
-	identityLine, err := json.Marshal(map[string]any{
-		"msg": grokManagedBillingIdentityMessage,
-		"ctx": map[string]any{"user_id": identity},
-	})
+	identityLine, err := grokBillingIdentityLine(identity)
 	if err != nil {
-		return err
+		return grokManagedBillingFailed, err
 	}
 	billingLine, err := json.Marshal(map[string]any{
 		"ts":  snap.ObservedAt.UTC().Format(time.RFC3339Nano),
@@ -236,7 +420,7 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) erro
 		},
 	})
 	if err != nil {
-		return err
+		return grokManagedBillingFailed, err
 	}
 	payload := make([]byte, 0, len(identityLine)+len(billingLine)+2)
 	payload = append(payload, identityLine...)
@@ -246,17 +430,104 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) erro
 
 	path := grokBillingLogPath(persistentHome)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+		return grokManagedBillingFailed, err
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return grokManagedBillingFailed, err
 	}
 	if _, err := f.Write(payload); err != nil {
 		_ = f.Close()
-		return err
+		return grokManagedBillingFailed, err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return grokManagedBillingFailed, err
+	}
+	return grokManagedBillingPersisted, nil
+}
+
+// grokManagedBillingOutcome names what a managed run left behind. A bare error
+// made "the child never fetched credits" indistinguishable from "we merged a
+// fresh observation", so a silent regression in the managed path looked exactly
+// like success in the logs of both callers.
+type grokManagedBillingOutcome int
+
+const (
+	// grokManagedBillingNotApplicable — the session ran no isolated home.
+	grokManagedBillingNotApplicable grokManagedBillingOutcome = iota
+	// grokManagedBillingNoIdentity — no account could be resolved from the
+	// copied auth, so nothing may be attributed.
+	grokManagedBillingNoIdentity
+	// grokManagedBillingNoRecord — the child logged no usable billing record.
+	// The persistent log keeps whatever it already had; a managed run that
+	// never fetched credits must not downgrade a good existing reading.
+	grokManagedBillingNoRecord
+	// grokManagedBillingPersisted — one normalized record was merged.
+	grokManagedBillingPersisted
+	// grokManagedBillingFailed — the merge was attempted and errored.
+	grokManagedBillingFailed
+)
+
+func (o grokManagedBillingOutcome) String() string {
+	switch o {
+	case grokManagedBillingNotApplicable:
+		return "not-applicable"
+	case grokManagedBillingNoIdentity:
+		return "no-identity"
+	case grokManagedBillingNoRecord:
+		return "no-record"
+	case grokManagedBillingPersisted:
+		return "persisted"
+	case grokManagedBillingFailed:
+		return "failed"
+	}
+	return "unknown"
+}
+
+// readGrokBillingLogTail returns the bounded tail of the unified log split into
+// lines, newest last. Shared by the billing scan and the direct-run attribution
+// guard so both observe the same 1 MiB bound and the same failure modes.
+func readGrokBillingLogTail(base string) ([][]byte, bool) {
+	lines, _ := readGrokBillingLogTailWithOffset(base)
+	return lines, lines != nil
+}
+
+// readGrokBillingLogTailWithOffset also reports whether the tail started at a
+// non-zero offset, i.e. whether the FIRST line may legitimately be a truncated
+// fragment of an older record rather than a partially written new one.
+func readGrokBillingLogTailWithOffset(base string) (lines [][]byte, truncatedFirstLine bool) {
+	path := grokBillingLogPath(base)
+	if path == "" {
+		return nil, false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, false
+	}
+	offset := int64(0)
+	if info.Size() > grokBillingLogTailBytes {
+		offset = info.Size() - grokBillingLogTailBytes
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return nil, false
+	}
+	// Read exactly the tail length captured by Stat. An unbounded ReadAll after
+	// seeking can consume more than 1 MiB when Grok appends quickly enough to
+	// keep extending the file, defeating this gather's memory/work bound and
+	// mixing records from different filesystem snapshots.
+	tail := make([]byte, info.Size()-offset)
+	if _, err := io.ReadFull(f, tail); err != nil {
+		// The log was truncated or replaced between Stat and ReadFull. Fail
+		// closed and let the next bounded refresh gather a coherent snapshot.
+		return nil, false
+	}
+	return bytes.Split(tail, []byte("\n")), offset > 0
 }
 
 // readGrokBillingSnapshot returns the NEWEST billing record in the log tail,
@@ -272,45 +543,13 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) erro
 // previous account must not be attributed to the one signed in now — see
 // grokRecordBelongsToCurrentAccount for how a record is tied to its producer.
 func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnapshot, bool) {
-	path := grokBillingLogPath(base)
-	if path == "" {
+	lines, truncatedFirstLine := readGrokBillingLogTailWithOffset(base)
+	if lines == nil {
 		return grokBillingSnapshot{}, false
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return grokBillingSnapshot{}, false
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return grokBillingSnapshot{}, false
-	}
-	offset := int64(0)
-	if info.Size() > grokBillingLogTailBytes {
-		offset = info.Size() - grokBillingLogTailBytes
-	}
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return grokBillingSnapshot{}, false
-	}
-	// Read exactly the tail length captured by Stat. An unbounded ReadAll after
-	// seeking can consume more than 1 MiB when Grok appends quickly enough to
-	// keep extending the file, defeating this gather's memory/work bound and
-	// mixing records from different filesystem snapshots.
-	tail := make([]byte, info.Size()-offset)
-	if _, err := io.ReadFull(f, tail); err != nil {
-		// The log was truncated or replaced between Stat and ReadFull. Fail
-		// closed and let the next bounded refresh gather a coherent snapshot.
-		return grokBillingSnapshot{}, false
-	}
-
-	lines := bytes.Split(tail, []byte("\n"))
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
-		// Cheap pre-filter before the JSON decode: the vast majority of lines in
-		// this log are chat/tool telemetry, and unmarshalling every one of them
-		// would dominate the gather.
-		if len(line) == 0 || !bytes.Contains(line, []byte(grokBillingLogMessage)) {
+		if len(line) == 0 || !grokLineMentionsBillingMessage(line) {
 			continue
 		}
 		// Decode the envelope first so an exact-message record with a malformed
@@ -325,12 +564,12 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 			// Any later candidate can be the newest billing append observed while it
 			// was still being written. Fail closed so that transient partial record
 			// cannot resurrect an older percentage.
-			if i == 0 && offset > 0 {
+			if i == 0 && truncatedFirstLine {
 				continue
 			}
 			return grokBillingSnapshot{}, false
 		}
-		if envelope.Msg != grokBillingLogMessage {
+		if !grokBillingMessageRecognized(envelope.Msg) {
 			continue
 		}
 		var rec grokBillingRecord
@@ -445,10 +684,12 @@ func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, 
 	if err != nil {
 		return grokBillingSnapshot{}, false
 	}
+	config := rec.Ctx.Config
+	period := config.currentPeriod()
 	snap := grokBillingSnapshot{
 		ObservedAt:       observed,
-		PeriodType:       rec.Ctx.Config.CurrentPeriod.Type,
-		SubscriptionTier: rec.Ctx.SubscriptionTier,
+		PeriodType:       period.Type,
+		SubscriptionTier: firstNonEmpty(rec.Ctx.SubscriptionTier, rec.Ctx.SubscriptionTierSnake),
 	}
 	// Grok 1.0 stopped emitting creditUsagePercent. Every other field of the
 	// record is unchanged, so the record is still the authoritative statement of
@@ -456,23 +697,23 @@ func grokBillingSnapshotFromRecord(rec grokBillingRecord) (grokBillingSnapshot, 
 	// used. Treat that as "usable record, unobserved usage" rather than "not a
 	// record": rejecting it made the scanner walk further back and publish a
 	// PRE-UPGRADE reading, under a period that had since ended.
-	if pct := rec.Ctx.Config.CreditUsagePercent; pct.Valid && grokFiniteNumber(pct.Value) {
+	if pct := config.creditUsagePercent(); pct.Valid && grokFiniteNumber(pct.Value) {
 		snap.UsedPercent = clampPercent(pct.Value)
 		snap.HasUsedPercent = true
 	}
-	if end, err := time.Parse(time.RFC3339, rec.Ctx.Config.CurrentPeriod.End); err == nil {
+	if end, err := time.Parse(time.RFC3339, period.End); err == nil {
 		snap.PeriodEnd = end
 		snap.HasPeriodEnd = true
 	}
 	// On-demand is a separate, opt-in pool: only plot it when a cap exists, or
 	// the row would read as a hard 0-of-0 limit on every subscription account.
-	if cap := rec.Ctx.Config.OnDemandCap.Val; cap.Valid && cap.Value > 0 && grokFiniteNumber(cap.Value) {
+	if cap := config.onDemandCap(); cap.Valid && cap.Value > 0 && grokFiniteNumber(cap.Value) {
 		snap.HasOnDemand = true
 		snap.OnDemandCap = cap.Value
 		// A cap with no reported usage is a pool we know exists but have not
 		// observed. Leaving the zero default here would report it as completely
 		// unused — an assertion the record never made.
-		if used := rec.Ctx.Config.OnDemandUsed.Val; used.Valid &&
+		if used := config.onDemandUsed(); used.Valid &&
 			grokFiniteNumber(used.Value) && used.Value >= 0 && used.Value <= cap.Value {
 			snap.HasOnDemandUsed = true
 			snap.OnDemandUsed = used.Value
@@ -503,63 +744,91 @@ func grokBillingPeriodKind(periodType string) (kind string, label string, ok boo
 
 // grokBillingMetrics turns a snapshot into the card's capacity rows.
 //
+// Three distinct states leave this function, and downstream freshness checks
+// tell them apart with no wire-shape change:
+//
+//   - NUMERIC — total/consumed/remaining populated, ObservedAt = the record ts.
+//   - CONFIRMED UNMETERED — Unknown WITH ObservedAt: proof that xAI's billing
+//     endpoint was checked at that instant and reported a period carrying no
+//     usage figure (the Grok 1.0 shape, and any period enum we do not
+//     recognize). Renders as today's dashed Unknown bar plus "Last observed".
+//   - INFERRED PLACEHOLDER — Unknown with NO ObservedAt: no usable record
+//     exists, or the observation aged past grokBillingObservationTTL.
+//
 // A metered period whose end has passed is reported Unknown WITH its historical
 // observation time rather than as 0% used. An ended unmetered period has no
 // current confirmation and drops the timestamp. In both cases, assuming an
 // empty pool could hide usage from another computer on the same account.
 func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsageMetric {
 	// A future record remains authoritative and blocks older records, but no
-	// value sharing its untrusted observation time may escape this gather.
+	// value sharing its untrusted observation time may escape this gather. This
+	// runs FIRST so no retention path below can publish a future ObservedAt.
 	if snap.ObservedAt.After(now.Add(grokBillingMaxClockSkew)) {
 		return []cliAgentUsageMetric{grokUnknownCreditsMetric()}
 	}
 
+	observedAt := snap.ObservedAt.UTC().Format(time.RFC3339)
+	// Retention bound for an UNKNOWN row only. A numeric reading keeps its
+	// existing lifecycle (bounded by the period end), so no shipped percentage
+	// behaviour changes here.
+	retained := observedAt
+	if snap.ObservedAt.Before(now.Add(-grokBillingObservationTTL)) {
+		retained = ""
+	}
+
+	var credits cliAgentUsageMetric
 	kind, label, ok := grokBillingPeriodKind(snap.PeriodType)
 	if !ok {
-		return nil
-	}
-	observedAt := snap.ObservedAt.UTC().Format(time.RFC3339)
-	credits := cliAgentUsageMetric{
-		Kind:       kind,
-		Label:      label,
-		Unit:       "%",
-		ObservedAt: observedAt,
-	}
-	switch {
-	case snap.HasPeriodEnd && !now.Before(snap.PeriodEnd):
-		// The period we observed has ended; whatever it read no longer describes
-		// the live one.
-		credits.Unknown = true
-		if !snap.HasUsedPercent {
-			// Grok 1.0+ never metered this period, so there is no observation to
-			// date-stamp. Keeping ObservedAt would show a stale "Last observed"
-			// for a value we never read — the same misleading state the unmetered
-			// case below removes for a still-live window.
-			credits.ObservedAt = ""
+		// An unrecognized (or absent) period is deliberately NOT guessed — the
+		// frontend derives a window length from the kind. Discarding the whole
+		// observation was wrong too: it threw away the proof that billing was
+		// freshly read. Keep the placeholder's unguessed shape, plus freshness.
+		// ResetAt is never set here: we do not know when this window ends.
+		credits = grokUnknownCreditsMetricAt(retained)
+	} else {
+		credits = cliAgentUsageMetric{
+			Kind:       kind,
+			Label:      label,
+			Unit:       "%",
+			ObservedAt: observedAt,
 		}
-	case !snap.HasUsedPercent:
-		// A current period the CLI no longer meters (Grok 1.0+). The record
-		// timestamp is proof that the provider freshly confirmed this unmetered
-		// period; retaining it is what distinguishes this from an inferred
-		// placeholder produced when no usable billing response exists.
-		credits.Unknown = true
-		if snap.HasPeriodEnd {
-			credits.ResetAt = snap.PeriodEnd.UTC().Format(time.RFC3339)
-		} else {
-			// Without a parseable period end we cannot prove the unmetered period
-			// is current, so keep only the inferred unknown shape.
-			credits.ObservedAt = ""
-		}
-	default:
-		credits.Total = floatPtr(100)
-		credits.Consumed = floatPtr(snap.UsedPercent)
-		credits.Remaining = floatPtr(100 - snap.UsedPercent)
-		if snap.HasPeriodEnd {
-			credits.ResetAt = snap.PeriodEnd.UTC().Format(time.RFC3339)
+		switch {
+		case snap.HasPeriodEnd && !now.Before(snap.PeriodEnd):
+			// The period we observed has ended; whatever it read no longer describes
+			// the live one.
+			credits.Unknown = true
+			if !snap.HasUsedPercent {
+				// Grok 1.0+ never metered this period, so there is no observation to
+				// date-stamp. Keeping ObservedAt would show a stale "Last observed"
+				// for a value we never read — the same misleading state the unmetered
+				// case below removes for a still-live window.
+				credits.ObservedAt = ""
+			}
+		case !snap.HasUsedPercent:
+			// A CURRENT period the CLI no longer meters (Grok 1.0+). The record
+			// timestamp is proof that the provider freshly confirmed this unmetered
+			// period; retaining it is what distinguishes this from an inferred
+			// placeholder produced when no usable billing response exists. An
+			// unparseable period end costs us only ResetAt — freshness does not
+			// depend on knowing when the window closes.
+			credits.Unknown = true
+			credits.ObservedAt = retained
+			if snap.HasPeriodEnd {
+				credits.ResetAt = snap.PeriodEnd.UTC().Format(time.RFC3339)
+			}
+		default:
+			credits.Total = floatPtr(100)
+			credits.Consumed = floatPtr(snap.UsedPercent)
+			credits.Remaining = floatPtr(100 - snap.UsedPercent)
+			if snap.HasPeriodEnd {
+				credits.ResetAt = snap.PeriodEnd.UTC().Format(time.RFC3339)
+			}
 		}
 	}
 	metrics := []cliAgentUsageMetric{credits}
 
+	// On-demand is a separate pool with its own numbers, so an unmetered — or
+	// unrecognized — credits window must not suppress it.
 	if snap.HasOnDemand {
 		onDemand := cliAgentUsageMetric{
 			Kind:       limitKindTokens,
@@ -582,11 +851,26 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 	return metrics
 }
 
+// grokUnknownCreditsMetric is the inferred placeholder: a limit exists, but no
+// usable record has ever been read for it.
 func grokUnknownCreditsMetric() cliAgentUsageMetric {
+	return grokUnknownCreditsMetricAt("")
+}
+
+// grokUnknownCreditsMetricAt is the same row with an optional provider
+// observation time. A populated observedAt makes it a CONFIRMED-UNMETERED row;
+// an empty one leaves it the inferred placeholder. One construction point so
+// the two states can never drift apart in kind, label or unit.
+//
+// The label stays "Weekly credits" even when the period is unrecognized: it is
+// the shipped placeholder copy, and the row carries no values and no ResetAt,
+// so nothing is plotted under the guess.
+func grokUnknownCreditsMetricAt(observedAt string) cliAgentUsageMetric {
 	return cliAgentUsageMetric{
-		Kind:    limitKindWeekly,
-		Label:   "Weekly credits",
-		Unit:    "%",
-		Unknown: true,
+		Kind:       limitKindWeekly,
+		Label:      "Weekly credits",
+		Unit:       "%",
+		Unknown:    true,
+		ObservedAt: observedAt,
 	}
 }

@@ -22,6 +22,11 @@
 //     card-level notice (warning / error banner) shown on the CLI Agents tab,
 //     while the capacity bars stay Unknown (no numeric quota exists).
 //
+// ensureGrokBillingAttribution is the session-scoped sibling of the per-line
+// capture: same best-effort contract, different trigger. It records WHO is
+// signed in so the billing log reader can attribute a direct run's records —
+// it never infers a number from stdout either.
+//
 // Best-effort throughout: every failure is silent (this runs in the hot
 // streaming path and must never break a session).
 package main
@@ -105,6 +110,71 @@ func captureGrokUsageLimitLine(line string, now time.Time) {
 		return
 	}
 	writeGrokUsageLimitState(grokUsageLimitCachePath(), state, currentGrokAccountFingerprint())
+}
+
+// grokBillingAttributionRecheck bounds how often ensureGrokBillingAttribution
+// re-verifies that our producer identity is still present in the provider log.
+// The check reads the bounded log tail, so it is session-scoped work, not
+// per-line work.
+//
+// Deliberately a SEPARATE constant from grokBillingObservationTTL: they answer
+// different questions (how often to re-verify attribution vs. how long an
+// observation stays trustworthy), and sharing one value would make a freshness
+// tuning change silently retune how often we write into a provider-owned file.
+const grokBillingAttributionRecheck = time.Hour
+
+// grokBillingAttributionState re-arms the append guard. A plain sync.Once is
+// wrong here: Grok rotates unified.jsonl, which discards our identity line, and
+// a once-per-process guard would leave every post-rotation record
+// unattributable for the life of a long-running agent.
+var grokBillingAttribution struct {
+	mu           sync.Mutex
+	identity     string
+	lastVerified time.Time
+}
+
+// ensureGrokBillingAttribution names the signed-in account in the provider-owned
+// log so the billing records a DIRECT (PTY) Grok run writes afterwards can be
+// tied to it. Without a producer identity logged before a record,
+// grokRecordBelongsToCurrentAccount refuses it and a direct run can never
+// produce an observable metric.
+//
+// Session-scoped, NOT per stdout line: the rotation check reads the log, and
+// doing that per line on the streaming hot path would cost a file read per
+// output line. captureGrokUsageLimitLine's per-line contract is untouched, and
+// this path infers no telemetry from stdout — it only records who is signed in.
+//
+// Re-arms on an account change AND when the log no longer carries our identity
+// (rotation), so attribution self-heals while staying at most one small append
+// per rotation. Best-effort and silent on failure, matching this file's
+// hot-path contract.
+func ensureGrokBillingAttribution(now time.Time) {
+	base := grokPersistentHome()
+	if base == "" {
+		return
+	}
+	identity, ok := grokResolvedBillingIdentity(base)
+	if !ok {
+		return
+	}
+
+	grokBillingAttribution.mu.Lock()
+	defer grokBillingAttribution.mu.Unlock()
+
+	if grokBillingAttribution.identity == identity {
+		if now.Sub(grokBillingAttribution.lastVerified) < grokBillingAttributionRecheck {
+			return
+		}
+		if grokBillingIdentityLogged(base, identity) {
+			grokBillingAttribution.lastVerified = now
+			return
+		}
+	}
+	if err := appendGrokBillingIdentity(base); err != nil {
+		return
+	}
+	grokBillingAttribution.identity = identity
+	grokBillingAttribution.lastVerified = now
 }
 
 // grokLimitStateFromFrame walks a decoded Grok frame for a usage-limit signal.

@@ -544,6 +544,17 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		globalProcessRegistry.Register(proc.Process.Pid, "session:"+id)
 	}
 
+	// A DIRECT Grok run writes its billing records into the user's own
+	// ~/.grok/logs/unified.jsonl, where the CLI logs no producer identity — so
+	// without this the account gate refuses every one of them and the card can
+	// never show a fresh observation. Session-scoped and best-effort; no work is
+	// added to the per-line streaming path. A maintenance smoke is excluded: its
+	// child writes into the isolated home, whose identity is seeded there and
+	// merged by persistGrokManagedBillingSnapshot on exit.
+	if isGrokCommand(command) && isolatedGrokHome == "" {
+		ensureGrokBillingAttribution(time.Now())
+	}
+
 	// Start output reader goroutines
 	go sm.readOutputStream(session, publishFn)
 
@@ -1740,9 +1751,15 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// lifecycle before announcing session_ended, then remove all copied auth and
 	// private logs. Never copy the raw log or config into the persistent home.
 	if session.isolatedGrokHome != "" {
-		if persistErr := persistGrokManagedBillingSnapshot(session.isolatedGrokHome, session.persistentGrokHome); persistErr != nil {
-			fmt.Printf("%s[session] Grok no-tools billing snapshot not persisted: %v%s\n",
-				colorYellow, persistErr, colorReset)
+		outcome, persistErr := persistGrokManagedBillingSnapshot(session.isolatedGrokHome, session.persistentGrokHome)
+		if persistErr != nil {
+			fmt.Printf("%s[session] Grok no-tools billing snapshot not persisted (%s): %v%s\n",
+				colorYellow, outcome, persistErr, colorReset)
+		} else {
+			// A smoke that never fetched credits is a real outcome, not success:
+			// logging only errors made it indistinguishable from a merged record.
+			fmt.Printf("%s[session] Grok no-tools billing snapshot: %s%s\n",
+				colorCyan, outcome, colorReset)
 		}
 		_ = os.RemoveAll(session.isolatedGrokHome)
 	}
