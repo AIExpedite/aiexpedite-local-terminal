@@ -168,7 +168,7 @@ func ensureGrokBillingAttribution(now time.Time) {
 		if now.Sub(grokBillingAttribution.lastVerified) < grokBillingAttributionRecheck {
 			return
 		}
-		if grokBillingIdentityLogged(base, identity) {
+		if grokBillingIdentityIsNewest(base, identity) {
 			grokBillingAttribution.lastVerified = now
 			return
 		}

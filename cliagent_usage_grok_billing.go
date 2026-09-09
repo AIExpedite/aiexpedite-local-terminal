@@ -343,11 +343,19 @@ func appendGrokBillingIdentity(base string) error {
 	return f.Close()
 }
 
-// grokBillingIdentityLogged reports whether `identity` still appears as a
-// producer identity inside the bounded log tail. Grok rotates unified.jsonl,
-// which discards our line; this is how the direct-run guard notices the
-// rotation and re-appends instead of leaving every later record unattributable.
-func grokBillingIdentityLogged(base, identity string) bool {
+// grokBillingIdentityIsNewest reports whether `identity` is the NEWEST valid
+// producer identity in the bounded log tail. Grok rotates unified.jsonl, which
+// discards our line; this is how the direct-run guard notices the rotation and
+// re-appends instead of leaving every later record unattributable.
+//
+// It stops at the first valid identity it finds rather than searching the whole
+// tail for a match, because grokRecordBelongsToCurrentAccount binds a record to
+// the NEAREST identity preceding it. A newer conflicting marker — e.g. a
+// managed session for account B persisting its identity after the user switched
+// back to account A — would otherwise leave the older A marker "still logged",
+// suppress the re-append, and bind every later direct-A record to B until the
+// stale marker aged out of the tail.
+func grokBillingIdentityIsNewest(base, identity string) bool {
 	wanted := strings.TrimSpace(identity)
 	if wanted == "" {
 		return false
@@ -361,9 +369,7 @@ func grokBillingIdentityLogged(base, identity string) bool {
 		if !found || !valid {
 			continue
 		}
-		if strings.EqualFold(logged, wanted) {
-			return true
-		}
+		return strings.EqualFold(logged, wanted)
 	}
 	return false
 }

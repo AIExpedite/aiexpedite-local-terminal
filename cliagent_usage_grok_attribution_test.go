@@ -280,3 +280,46 @@ func TestEnsureGrokBillingAttribution_DoesNotAdoptAnotherAccountsRecord(t *testi
 			got, linesBefore)
 	}
 }
+
+// A managed session for another account persists ITS identity after ours. That
+// newer marker is the one grokRecordBelongsToCurrentAccount binds later records
+// to, so the guard must re-append rather than settle for our older marker still
+// being somewhere in the tail — otherwise every subsequent direct record for the
+// signed-in account is attributed to the other one until the stale marker ages
+// out of the 1 MiB tail.
+func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityDisplacesOurs(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	start := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+
+	ensureGrokBillingAttribution(start)
+	if got := grokIdentityLineCount(t, base); got != 1 {
+		t.Fatalf("identity lines = %d, want 1", got)
+	}
+
+	// A managed acct-2 session exits and persists its own producer identity.
+	foreign, err := grokBillingIdentityLine("acct-2")
+	if err != nil {
+		t.Fatalf("build foreign identity line: %v", err)
+	}
+	helperAppendGrokLogLine(t, base, string(foreign))
+	if grokBillingIdentityIsNewest(base, "acct-1") {
+		t.Fatal("acct-1 must not read as the newest identity once acct-2 logged one")
+	}
+
+	ensureGrokBillingAttribution(start.Add(grokBillingAttributionRecheck + time.Minute))
+	if got := grokIdentityLineCount(t, base); got != 3 {
+		t.Fatalf("identity lines = %d, want 3 — the displaced account was not re-attributed", got)
+	}
+
+	helperAppendGrokLogLine(t, base,
+		grokUnmeteredLine("2026-08-19T13:05:00Z", grokBillingLogMessage))
+	snap, ok := readGrokBillingSnapshot(base, grokIdentityCandidates(base))
+	if !ok {
+		t.Fatal("the direct record written after the re-append must be attributable to acct-1")
+	}
+	if got := snap.ObservedAt.UTC().Format(time.RFC3339); got != "2026-08-19T13:05:00Z" {
+		t.Fatalf("ObservedAt = %s, want the newest record", got)
+	}
+}
