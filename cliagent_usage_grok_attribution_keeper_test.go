@@ -363,3 +363,56 @@ func TestPersistGrokManagedBillingSnapshot_SkipsRepairForTheSameAccount(t *testi
 		t.Fatalf("identity lines = %d, want 1 — the merge repaired an account that was already newest", got)
 	}
 }
+
+// The armed CHECK must be taken UNDER the write lock, not by the caller before
+// it. A direct session arms BEFORE its ensureGrokBillingAttribution reaches the
+// lock, so a check taken outside can observe "not armed", let the direct
+// session's own append land first, and then append the managed identity last —
+// the direct child then runs under the wrong newest identity and can lose its
+// only billing record before the keeper ticks.
+//
+// Pinned by arming while the lock is held with the merge already in flight
+// behind it: the merge cannot have read the arm state before the arm happened,
+// so the marker can only be present if the check is inside the lock.
+func TestPersistGrokManagedBillingSnapshot_ArmDuringTheWriteStillRepairs(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	ensureGrokBillingAttribution()
+
+	isolated := helperGrokHomeWithAccount(t, "acct-managed")
+	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-managed"))
+	helperAppendGrokLogLine(t, isolated,
+		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+
+	grokBillingAttributionSerialize.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+		done <- err
+	}()
+	// Give the merge time to reach the lock it is now blocked on, so the arm
+	// below genuinely races the write rather than preceding it.
+	time.Sleep(50 * time.Millisecond)
+	finish := startGrokBillingAttributionKeeper()
+	defer finish()
+	grokBillingAttributionSerialize.Unlock()
+
+	if err := <-done; err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	raw, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read unified.jsonl: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	last := lines[len(lines)-1]
+	if !strings.Contains(last, grokManagedBillingIdentityMessage) ||
+		!strings.Contains(last, "acct-1") {
+		t.Fatalf("merged log ends with %q — a session armed before the merge took "+
+			"the lock must still get its repair marker in that same write", last)
+	}
+}

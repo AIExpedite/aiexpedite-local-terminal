@@ -466,21 +466,48 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 	payload = append(payload, billingLine...)
 	payload = append(payload, '\n')
 
-	// Our identity line above becomes the newest one in the log, and a record
-	// binds to the NEAREST identity preceding it — so from this write on, every
-	// record a still-live DIRECT run writes would bind to the managed account
-	// and be refused. Repairing that with a SECOND append after this one is too
-	// late: the mutex below serializes this process's helpers, not the direct
-	// child, which can land its only billing record in the gap between the two
-	// writes. So when a direct run is armed, the repair marker rides in the SAME
-	// atomic payload, after our record. Our record still binds to the identity
-	// immediately above it, and the very next byte of the log already names the
-	// direct account again — there is no window at all.
-	//
-	// Skipped when the two accounts are the same (the pair already names the
-	// direct account) and when the device has no armed direct run, so a
-	// managed-only device writes nothing extra into a provider-owned file.
-	repairAfterWrite := false
+	repairAfterWrite, err := appendGrokBillingPair(persistentHome, payload, identity)
+	if err != nil {
+		return grokManagedBillingFailed, err
+	}
+
+	if repairAfterWrite {
+		// Outside the write lock — ensureGrokBillingAttribution takes it itself.
+		ensureGrokBillingAttribution()
+	}
+	return grokManagedBillingPersisted, nil
+}
+
+// appendGrokBillingPair appends the managed identity/record payload — plus, when
+// a direct run is armed, that run's identity again — in one O_APPEND call.
+//
+// Our identity line becomes the newest one in the log, and a record binds to the
+// NEAREST identity preceding it, so from this write on every record a still-live
+// DIRECT run writes would bind to the managed account and be refused. Repairing
+// that with a SECOND append is too late: the lock serializes this process's
+// helpers, not the direct child, which can land its only billing record in the
+// gap between the two writes. So the repair marker rides in the SAME atomic
+// payload, after our record — our record still binds to the identity immediately
+// above it, and the very next byte of the log already names the direct account.
+//
+// The armed CHECK and the payload it produces are taken UNDER the lock, not by
+// the caller before it. A direct session arms before it calls
+// ensureGrokBillingAttribution, and that call takes this same lock, so deciding
+// here makes the two orderings the only ones possible: either we observe the arm
+// and carry its marker, or the direct session has not yet reached the lock and
+// its own append lands after ours. Checking outside left a third ordering — arm
+// after our check, ensure before our append — in which the direct child ran under
+// the managed identity until the next keeper tick.
+//
+// Skipped when the two accounts are the same (the pair already names the direct
+// account) and when no direct run is armed, so a managed-only device writes
+// nothing extra into a provider-owned file. Returns true when the caller must
+// fall back to a post-write ensureGrokBillingAttribution, which takes this lock
+// itself and so cannot run while it is held.
+func appendGrokBillingPair(persistentHome string, payload []byte, identity string) (repairAfterWrite bool, err error) {
+	grokBillingAttributionSerialize.Lock()
+	defer grokBillingAttributionSerialize.Unlock()
+
 	if grokDirectAttributionArmed() {
 		switch directIdentity, ok := grokResolvedBillingIdentity(persistentHome); {
 		case !ok:
@@ -501,33 +528,12 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 		}
 	}
 
-	// Serialize against ensureGrokBillingAttribution's read-then-append. Without
-	// this, that check can observe our identity as the newest, then have this
-	// paired append land before it returns — leaving the direct session
-	// believing it is attributed while every record it writes next binds to the
-	// identity merged here. The pairing above keeps THIS record correct either
-	// way; the lock is what keeps the direct path's decision from going stale
-	// between its read and its write.
-	if err := appendGrokBillingPair(persistentHome, payload); err != nil {
-		return grokManagedBillingFailed, err
-	}
-
-	if repairAfterWrite {
-		// Outside the write lock — ensureGrokBillingAttribution takes it itself.
-		ensureGrokBillingAttribution()
-	}
-	return grokManagedBillingPersisted, nil
+	return repairAfterWrite, writeGrokBillingPayload(persistentHome, payload)
 }
 
-// appendGrokBillingPair writes the caller's whole payload in one O_APPEND call.
-//
-// Split out so the write lock is released before the fallback repair above:
-// holding grokBillingAttributionSerialize across ensureGrokBillingAttribution's
-// own read-then-append would deadlock.
-func appendGrokBillingPair(persistentHome string, payload []byte) error {
-	grokBillingAttributionSerialize.Lock()
-	defer grokBillingAttributionSerialize.Unlock()
-
+// writeGrokBillingPayload writes the caller's whole payload in one O_APPEND call.
+// Callers must hold grokBillingAttributionSerialize.
+func writeGrokBillingPayload(persistentHome string, payload []byte) error {
 	path := grokBillingLogPath(persistentHome)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -910,7 +916,19 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 		// observation was wrong too: it threw away the proof that billing was
 		// freshly read. Keep the placeholder's unguessed shape, plus freshness.
 		// ResetAt is never set here: we do not know when this window ends.
-		credits = grokUnknownCreditsMetricAt(retainedWithin(0))
+		//
+		// A record that NAMES its end and whose end has passed is a definitive
+		// rollover, and it outranks the TTL exactly as it does in the recognized
+		// branch below: the record describes a window that is over, so it is no
+		// longer a confirmation of the live one. Falling back to the timestamp-
+		// less placeholder is the same downgrade an ended recognized unmetered
+		// period takes.
+		switch {
+		case snap.HasPeriodEnd && !now.Before(snap.PeriodEnd):
+			credits = grokUnknownCreditsMetric()
+		default:
+			credits = grokUnknownCreditsMetricAt(retainedWithin(0))
+		}
 	} else {
 		credits = cliAgentUsageMetric{
 			Kind:       kind,

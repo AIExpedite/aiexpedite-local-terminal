@@ -773,3 +773,46 @@ func TestReadGrokBillingSnapshot_NullOnDemandUsedIsNotZero(t *testing.T) {
 		t.Errorf("a null onDemandUsed must not count as an observed 0")
 	}
 }
+
+// An unrecognized period that NAMES an end already in the past is a definitive
+// rollover, and it outranks grokBillingObservationTTL: the record describes a
+// window that is over, so date-stamping the Unknown row would present it as a
+// confirmed reading of the LIVE window for up to the whole TTL. Mirrors the
+// downgrade TestGrokBillingMetrics_RolledOverUnmeteredPeriodHasNoObservationTime
+// pins for a recognized period.
+func TestGrokBillingMetrics_EndedUnknownPeriodDropsFreshness(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	base := grokBillingSnapshot{
+		ObservedAt:   now.Add(-time.Hour),
+		PeriodType:   "USAGE_PERIOD_TYPE_SOMETHING_NEW",
+		PeriodEnd:    now.Add(-time.Minute),
+		HasPeriodEnd: true,
+	}
+	metered := base
+	metered.UsedPercent = 52
+	metered.HasUsedPercent = true
+
+	for name, snap := range map[string]grokBillingSnapshot{
+		"unmetered": base,
+		"metered":   metered,
+	} {
+		t.Run(name, func(t *testing.T) {
+			assertGrokMetricsJSON(t, grokBillingMetrics(snap, now),
+				`[{"kind":"weekly","label":"Weekly credits","unit":"%","unknown":true}]`)
+		})
+	}
+}
+
+// The same record with an end still in the FUTURE keeps its freshness — the
+// rollover check above must not swallow the confirmed-unmetered state this
+// feature exists to produce.
+func TestGrokBillingMetrics_LiveUnknownPeriodKeepsFreshness(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	assertGrokMetricsJSON(t, grokBillingMetrics(grokBillingSnapshot{
+		ObservedAt:   now.Add(-time.Hour),
+		PeriodType:   "USAGE_PERIOD_TYPE_SOMETHING_NEW",
+		PeriodEnd:    now.Add(time.Hour),
+		HasPeriodEnd: true,
+	}, now),
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","observedAt":"2026-08-19T11:00:00Z","unknown":true}]`)
+}
