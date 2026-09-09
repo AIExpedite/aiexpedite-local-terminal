@@ -355,3 +355,120 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityIsUndecodable(t *t
 		t.Fatalf("ObservedAt = %s, want the newest record", got)
 	}
 }
+
+// A managed session can fetch credits early and exit long after a direct run has
+// written a NEWER observation. readGrokBillingSnapshot takes the last billing
+// line by FILE ORDER, so appending the older managed receipt last would replace
+// the newer direct percentage with a stale one until the next fetch.
+func TestPersistGrokManagedBillingSnapshot_DoesNotSupersedeANewerObservation(t *testing.T) {
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+
+	// A direct run's fresh percentage is already the newest thing in the log.
+	if err := appendGrokBillingIdentity(persistent); err != nil {
+		t.Fatalf("seed persistent identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine("2026-08-19T12:00:00Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	before, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read persistent log: %v", err)
+	}
+
+	// The managed child fetched an HOUR EARLIER but only exits now.
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine("2026-08-19T11:00:00Z", 12, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if outcome != grokManagedBillingSuperseded {
+		t.Fatalf("outcome = %s, want %s", outcome, grokManagedBillingSuperseded)
+	}
+
+	after, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read persistent log: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("an older managed receipt rewrote the log:\nbefore=%s\nafter=%s", before, after)
+	}
+	snap, ok := readGrokBillingSnapshot(persistent, grokIdentityCandidates(persistent))
+	if !ok || !snap.HasUsedPercent || snap.UsedPercent != 52 {
+		t.Fatalf("the newer direct observation must survive the merge: %+v ok=%v", snap, ok)
+	}
+}
+
+// The guard is a staleness check, not a blanket refusal: a managed receipt that
+// is genuinely newer than everything in the persistent log still merges.
+func TestPersistGrokManagedBillingSnapshot_MergesANewerObservation(t *testing.T) {
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+
+	if err := appendGrokBillingIdentity(persistent); err != nil {
+		t.Fatalf("seed persistent identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine("2026-08-19T11:00:00Z", 12, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine("2026-08-19T12:00:00Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if outcome != grokManagedBillingPersisted {
+		t.Fatalf("outcome = %s, want %s", outcome, grokManagedBillingPersisted)
+	}
+	snap, ok := readGrokBillingSnapshot(persistent, grokIdentityCandidates(persistent))
+	if !ok || !snap.HasUsedPercent || snap.UsedPercent != 52 {
+		t.Fatalf("the newer managed observation must win: %+v ok=%v", snap, ok)
+	}
+}
+
+// Re-persisting the same session's snapshot writes nothing the second time: an
+// EQUAL timestamp counts as superseded, so a retried merge is idempotent and
+// cannot pile duplicate records into a provider-owned log.
+func TestPersistGrokManagedBillingSnapshot_IsIdempotentForTheSameRecord(t *testing.T) {
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, isolated,
+		grokUnmeteredLine("2026-08-19T11:58:00Z", grokBillingLogMessage))
+
+	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil ||
+		outcome != grokManagedBillingPersisted {
+		t.Fatalf("first persist: outcome=%s err=%v", outcome, err)
+	}
+	first, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read persistent log: %v", err)
+	}
+
+	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil ||
+		outcome != grokManagedBillingSuperseded {
+		t.Fatalf("second persist: outcome=%s err=%v, want %s", outcome, err, grokManagedBillingSuperseded)
+	}
+	second, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read persistent log: %v", err)
+	}
+	if string(first) != string(second) {
+		t.Fatalf("a repeated merge duplicated the record:\nfirst=%s\nsecond=%s", first, second)
+	}
+}

@@ -466,9 +466,12 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 	payload = append(payload, billingLine...)
 	payload = append(payload, '\n')
 
-	repairAfterWrite, err := appendGrokBillingPair(persistentHome, payload, identity)
+	superseded, repairAfterWrite, err := appendGrokBillingPair(persistentHome, payload, identity, identities, snap.ObservedAt)
 	if err != nil {
 		return grokManagedBillingFailed, err
+	}
+	if superseded {
+		return grokManagedBillingSuperseded, nil
 	}
 
 	if repairAfterWrite {
@@ -501,12 +504,37 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 //
 // Skipped when the two accounts are the same (the pair already names the direct
 // account) and when no direct run is armed, so a managed-only device writes
-// nothing extra into a provider-owned file. Returns true when the caller must
-// fall back to a post-write ensureGrokBillingAttribution, which takes this lock
-// itself and so cannot run while it is held.
-func appendGrokBillingPair(persistentHome string, payload []byte, identity string) (repairAfterWrite bool, err error) {
+// nothing extra into a provider-owned file. Returns repairAfterWrite when the
+// caller must fall back to a post-write ensureGrokBillingAttribution, which takes
+// this lock itself and so cannot run while it is held.
+//
+// The whole merge is ABANDONED when the persistent log already holds a record
+// for this same account that is at least as new as the one we carry. A managed
+// session can sit open long after it fetched credits, and readGrokBillingSnapshot
+// picks the LAST billing line by FILE ORDER, not by timestamp — so appending an
+// older receipt last would replace a newer direct-run observation with a stale
+// percentage until the next fetch. The comparison is taken under the same lock,
+// immediately before the write, so no merge of ours can pass it and then be
+// overtaken by another. An equal timestamp is treated as superseded too, which
+// makes re-persisting one session's snapshot idempotent.
+func appendGrokBillingPair(
+	persistentHome string,
+	payload []byte,
+	identity string,
+	identities []string,
+	observedAt time.Time,
+) (superseded bool, repairAfterWrite bool, err error) {
 	grokBillingAttributionSerialize.Lock()
 	defer grokBillingAttributionSerialize.Unlock()
+
+	// Read with the MANAGED account's identities: a newest persistent record
+	// belonging to anyone else (or one we cannot decode) is not evidence about
+	// this account, and readGrokBillingSnapshot reports it as no snapshot, so
+	// the merge proceeds.
+	if existing, ok := readGrokBillingSnapshot(persistentHome, identities); ok &&
+		!existing.ObservedAt.Before(observedAt) {
+		return true, false, nil
+	}
 
 	if grokDirectAttributionArmed() {
 		switch directIdentity, ok := grokResolvedBillingIdentity(persistentHome); {
@@ -528,7 +556,7 @@ func appendGrokBillingPair(persistentHome string, payload []byte, identity strin
 		}
 	}
 
-	return repairAfterWrite, writeGrokBillingPayload(persistentHome, payload)
+	return false, repairAfterWrite, writeGrokBillingPayload(persistentHome, payload)
 }
 
 // writeGrokBillingPayload writes the caller's whole payload in one O_APPEND call.
@@ -565,6 +593,10 @@ const (
 	// The persistent log keeps whatever it already had; a managed run that
 	// never fetched credits must not downgrade a good existing reading.
 	grokManagedBillingNoRecord
+	// grokManagedBillingSuperseded — the persistent log already held a record
+	// for this account at least as new as ours, so merging would have replaced
+	// a newer observation with an older one. Nothing was written.
+	grokManagedBillingSuperseded
 	// grokManagedBillingPersisted — one normalized record was merged.
 	grokManagedBillingPersisted
 	// grokManagedBillingFailed — the merge was attempted and errored.
@@ -579,6 +611,8 @@ func (o grokManagedBillingOutcome) String() string {
 		return "no-identity"
 	case grokManagedBillingNoRecord:
 		return "no-record"
+	case grokManagedBillingSuperseded:
+		return "superseded"
 	case grokManagedBillingPersisted:
 		return "persisted"
 	case grokManagedBillingFailed:
