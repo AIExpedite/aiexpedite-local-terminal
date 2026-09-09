@@ -172,17 +172,24 @@ func ensureGrokBillingIdentityNamed(base, identity string) {
 		return
 	}
 
+	grokBillingAttributionSerialize.Lock()
+	defer grokBillingAttributionSerialize.Unlock()
+
 	// A live direct run under a DIFFERENT account makes this marker a claim we
 	// cannot support: the next record in the shared log could be that run's,
 	// and it would bind here. Name the contested sentinel instead, so records
 	// written while the accounts overlap are refused rather than published as
 	// the wrong account's utilization.
+	//
+	// Taken UNDER the append lock, never before it. Deciding outside left an
+	// ordering in which A reads "no conflict", B arms and appends the contested
+	// marker, and A then appends a plain A marker LAST — leaving the log falsely
+	// naming A while both accounts are live. Holding the lock across the check
+	// and the append makes the two runs' decisions serial, so whoever appends
+	// second has already observed the other's arm.
 	if grokArmedDirectAccountsDisagreeWith(identity) {
 		identity = grokContestedBillingIdentity
 	}
-
-	grokBillingAttributionSerialize.Lock()
-	defer grokBillingAttributionSerialize.Unlock()
 
 	if grokBillingIdentityIsNewest(base, identity) {
 		return
@@ -441,7 +448,22 @@ func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 			grokAttributionKeeperMu.Unlock()
 			if stop != nil {
 				close(stop)
+				return
 			}
+			// Runs remain, and this release may have RESOLVED a disagreement:
+			// the log still carries the contested sentinel that the departing
+			// account forced, so every record the survivor writes from here on
+			// binds to a name no account matches and is refused. Waiting for the
+			// next keeper tick makes that a known 30s hole — and a failed second
+			// spawn opens it immediately after its pre-spawn contested marker.
+			// Re-assert now; the guard appends nothing when the newest marker
+			// already names the surviving account, so the common
+			// same-account/one-run release stays one bounded tail read.
+			//
+			// Deliberately AFTER the unlock above: the re-assertion re-takes
+			// this mutex (under the append lock), so calling it while held
+			// would deadlock.
+			reassertGrokDirectAttribution()
 		})
 	}
 }

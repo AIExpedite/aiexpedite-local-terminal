@@ -553,3 +553,98 @@ func TestPersistGrokManagedBillingSnapshot_ArmDuringTheWriteStillRepairs(t *test
 			"the lock must still get its repair marker in that same write", last)
 	}
 }
+
+// The disagreement check and the append have to be ONE serialized decision.
+// When account A tested for a conflict before B armed but appended after B's
+// contested marker, the log ended up naming A while both accounts were live —
+// so B's records were either refused or published as A's utilization. The
+// invariant this pins: once a second account is armed, the newest marker is the
+// contested sentinel, whatever order the two writers interleave in.
+func TestGrokBillingAttribution_ContestedCheckIsTakenUnderTheAppendLock(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+
+	release := startGrokBillingAttributionKeeper("acct-1")
+	defer release()
+
+	// Hold the append lock so acct-1's assertion is parked at exactly the point
+	// the ordering hinges on. Whether it has ALREADY decided what to name is the
+	// whole question: a check taken before the lock is frozen against a world in
+	// which acct-2 does not exist yet.
+	grokBillingAttributionSerialize.Lock()
+
+	asserted := make(chan struct{})
+	go func() {
+		defer close(asserted)
+		ensureGrokBillingIdentityNamed(base, "acct-1")
+	}()
+
+	// Give the goroutine time to reach the lock. Both the correct and the broken
+	// orderings block here, so this only sequences the test — it does not decide
+	// the outcome.
+	time.Sleep(100 * time.Millisecond)
+
+	// acct-2 arms WHILE acct-1 is blocked: the second live account appears after
+	// acct-1 would have tested for a conflict, but before it writes.
+	conflicting := startGrokBillingAttributionKeeper("acct-2")
+	defer conflicting()
+
+	grokBillingAttributionSerialize.Unlock()
+	<-asserted
+
+	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("newest marker = %s, want the contested sentinel — acct-1's marker "+
+			"outlived the arming of acct-2, so every record either account writes "+
+			"from here binds to acct-1", last)
+	}
+}
+
+// Releasing one of two disagreeing runs RESOLVES the disagreement, so the
+// contested sentinel it forced has to come down immediately. Leaving it for the
+// next keeper tick is a known window in which every record the surviving child
+// writes binds to a name no account matches and is permanently refused.
+func TestGrokBillingAttributionKeeper_ReassertsTheSurvivorWhenAConflictingRunExits(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	// A tick long enough that only the synchronous repair can satisfy the
+	// assertion below.
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	survivor := startGrokBillingAttributionKeeper("acct-1")
+	defer survivor()
+	conflicting := startGrokBillingAttributionKeeper("acct-2")
+
+	ensureGrokBillingIdentityNamed(base, "acct-1")
+	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("newest marker = %s, want the contested sentinel while both runs are live", last)
+	}
+
+	conflicting()
+
+	last := helperGrokLastLogLine(t, base)
+	if strings.Contains(last, grokContestedBillingIdentity) || !strings.Contains(last, "acct-1") {
+		t.Fatalf("newest marker = %s, want acct-1 — the survivor's records stay "+
+			"unattributable until the next keeper tick", last)
+	}
+}
+
+// The release repair must stay quiet in the ordinary case: a lone run exiting
+// asserts nothing (no live run to attribute), and it must not pile a marker into
+// a provider-owned log on every child reap.
+func TestGrokBillingAttributionKeeper_LastReleaseWritesNothing(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	finish := startGrokBillingAttributionKeeper("acct-1")
+	ensureGrokBillingIdentityNamed(base, "acct-1")
+	before := grokIdentityLineCount(t, base)
+
+	finish()
+
+	if got := grokIdentityLineCount(t, base); got != before {
+		t.Fatalf("identity lines = %d after the last release, want %d", got, before)
+	}
+}

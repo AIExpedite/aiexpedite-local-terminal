@@ -531,3 +531,97 @@ func TestPersistGrokManagedBillingSnapshot_IsIdempotentForTheSameRecord(t *testi
 		t.Fatalf("a repeated merge duplicated the record:\nfirst=%s\nsecond=%s", first, second)
 	}
 }
+
+// The supersession guard has to find the newest record belonging to THIS
+// account, not the newest record in the log. When another account's record sits
+// on top of ours, a global latest-only read reports "this account has nothing"
+// and the guard lets an hour-old managed receipt be appended last — after which
+// every gather for this account publishes the stale percentage.
+func TestPersistGrokManagedBillingSnapshot_LooksPastAnInterveningAccountsRecord(t *testing.T) {
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+
+	// Our fresh observation...
+	if err := appendGrokBillingIdentity(persistent); err != nil {
+		t.Fatalf("seed persistent identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine("2026-08-19T12:00:00Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	// ...buried under a DIFFERENT account's later one.
+	if err := appendGrokBillingIdentityValue(persistent, "acct-2"); err != nil {
+		t.Fatalf("seed foreign identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine("2026-08-19T12:30:00Z", 7, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	before, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read persistent log: %v", err)
+	}
+
+	// A managed acct-1 session that fetched credits an hour before ours exits now.
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine("2026-08-19T11:00:00Z", 12, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if outcome != grokManagedBillingSuperseded {
+		t.Fatalf("outcome = %s, want %s — an intervening account's record hid our "+
+			"newer observation from the staleness guard", outcome, grokManagedBillingSuperseded)
+	}
+	after, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read persistent log: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("an older managed receipt rewrote the log:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// The scoped scan must not turn the guard into a blanket refusal: another
+// account's record is not evidence about ours, so a managed receipt newer than
+// anything WE have still merges even when a foreign line is the log's newest.
+func TestPersistGrokManagedBillingSnapshot_AForeignRecordDoesNotBlockAFreshMerge(t *testing.T) {
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+
+	if err := appendGrokBillingIdentity(persistent); err != nil {
+		t.Fatalf("seed persistent identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine("2026-08-19T10:00:00Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	if err := appendGrokBillingIdentityValue(persistent, "acct-2"); err != nil {
+		t.Fatalf("seed foreign identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine("2026-08-19T23:00:00Z", 7, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine("2026-08-19T12:00:00Z", 31, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if outcome != grokManagedBillingPersisted {
+		t.Fatalf("outcome = %s, want %s — a foreign account's newer record must not "+
+			"block our own fresher observation", outcome, grokManagedBillingPersisted)
+	}
+	snap, ok := readGrokBillingSnapshot(persistent, grokIdentityCandidates(persistent))
+	if !ok || !snap.HasUsedPercent || snap.UsedPercent != 31 {
+		t.Fatalf("the merged observation must be published: %+v ok=%v", snap, ok)
+	}
+}

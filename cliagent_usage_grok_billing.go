@@ -556,10 +556,15 @@ func appendGrokBillingPair(
 	grokBillingAttributionSerialize.Lock()
 	defer grokBillingAttributionSerialize.Unlock()
 
-	// Read with the MANAGED account's identities: a newest persistent record
-	// belonging to anyone else (or one we cannot decode) is not evidence about
-	// this account, and readGrokBillingSnapshot reports it as no snapshot, so
-	// the merge proceeds.
+	// Scanned with the MANAGED account's identities, and NOT via
+	// readGrokBillingSnapshot: that reader answers "what should we publish",
+	// so it stops at the globally newest record and reports nothing when that
+	// record belongs to someone else. This guard asks a different question —
+	// "does this account already have a fresher receipt in here" — and an
+	// intervening account-B line must not hide account A's newer record behind
+	// it, or we would append A's older receipt last and republish stale A
+	// utilization. So the scan walks PAST foreign and undecodable records to
+	// the newest one that is genuinely A's.
 	//
 	// A record dated beyond grokBillingMaxClockSkew is skipped rather than
 	// honored. grokBillingMetrics refuses to PUBLISH such a record, so letting
@@ -567,9 +572,9 @@ func appendGrokBillingPair(
 	// with it — after a clock correction, potentially for the rest of the
 	// period. The read path's distrust and this one have to agree: a timestamp
 	// too far ahead to publish is too far ahead to protect.
-	if existing, ok := readGrokBillingSnapshot(persistentHome, identities); ok &&
-		!existing.ObservedAt.After(time.Now().Add(grokBillingMaxClockSkew)) &&
-		!existing.ObservedAt.Before(observedAt) {
+	if existing, ok := newestGrokBillingObservationFor(persistentHome, identities); ok &&
+		!existing.After(time.Now().Add(grokBillingMaxClockSkew)) &&
+		!existing.Before(observedAt) {
 		return true, false, nil
 	}
 
@@ -704,6 +709,54 @@ func readGrokBillingLogTailWithOffset(base string) (lines [][]byte, truncatedFir
 		return nil, false
 	}
 	return bytes.Split(tail, []byte("\n")), offset > 0
+}
+
+// newestGrokBillingObservationFor returns the observation time of the newest
+// billing record in the log tail that belongs to `identities`, ignoring records
+// produced by any other account.
+//
+// It is the supersession guard's reader, deliberately separate from
+// readGrokBillingSnapshot. That one is the PUBLISH path: it stops at the newest
+// billing line and fails closed on anything it cannot decode or attribute,
+// because reviving an older percentage there would show the user a stale number.
+// Here the same stop would be the bug — a single interleaved account-B record is
+// not evidence about account A, and treating it as "A has nothing" is what lets
+// an older A receipt be appended over a newer one.
+//
+// Undecodable and unrecognized lines are likewise skipped rather than
+// terminating the scan: this guard only ever decides whether to SKIP a write, so
+// the conservative reading of "we cannot tell whose this is" is to keep looking
+// for a record we can attribute, and to merge when we find none.
+func newestGrokBillingObservationFor(base string, identities []string) (time.Time, bool) {
+	lines, _ := readGrokBillingLogTailWithOffset(base)
+	if lines == nil {
+		return time.Time{}, false
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := bytes.TrimSpace(lines[i])
+		if len(line) == 0 || !grokLineMentionsBillingMessage(line) {
+			continue
+		}
+		var envelope struct {
+			Msg string `json:"msg"`
+		}
+		if json.Unmarshal(line, &envelope) != nil || !grokBillingMessageRecognized(envelope.Msg) {
+			continue
+		}
+		var rec grokBillingRecord
+		if json.Unmarshal(line, &rec) != nil {
+			continue
+		}
+		snap, ok := grokBillingSnapshotFromRecord(rec)
+		if !ok {
+			continue
+		}
+		if !grokRecordBelongsToCurrentAccount(lines, i, identities) {
+			continue
+		}
+		return snap.ObservedAt, true
+	}
+	return time.Time{}, false
 }
 
 // readGrokBillingSnapshot returns the NEWEST billing record in the log tail,
