@@ -242,6 +242,10 @@ func StartAgent(cfg *Config) {
 		hideWindow(ttydCmd)
 		if err := ttydCmd.Start(); err != nil {
 			ttydCmd = nil
+			// The flag is what showConnectionInstructions reads, so clearing
+			// only ttydCmd would still advertise a loopback URL nothing is
+			// listening on.
+			localTerminal = false
 			fmt.Println("Warning: cannot start ttyd –", err, "- local web terminal disabled; cloud connection continues.")
 		} else {
 			fmt.Printf("→ ttyd listening on http://127.0.0.1:%d\n", port)
