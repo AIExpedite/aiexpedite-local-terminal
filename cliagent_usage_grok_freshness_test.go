@@ -190,3 +190,62 @@ func TestGrokUndecodableNewestRecordBlocksOlderPercentage(t *testing.T) {
 		t.Fatalf("an undecodable newest record must fail closed, got %+v", snap)
 	}
 }
+
+// A recognized DAILY window with no parseable end cannot present itself as
+// current for the full three-day TTL — that period has certainly rolled over,
+// and downstream would read Unknown + ObservedAt as current billing evidence.
+func TestGrokConfirmedUnmeteredExpiresWithinItsOwnPeriodWhenTheEndIsUnparseable(t *testing.T) {
+	observed := time.Date(2026, 8, 17, 23, 2, 12, 0, time.UTC)
+	snap := grokBillingSnapshot{
+		ObservedAt: observed,
+		PeriodType: "USAGE_PERIOD_TYPE_DAILY",
+		// No HasPeriodEnd: the record's end was missing or malformed.
+	}
+
+	within := grokBillingMetrics(snap, observed.Add(23*time.Hour))
+	if len(within) != 1 || !within[0].Unknown || within[0].ObservedAt != "2026-08-17T23:02:12Z" {
+		t.Fatalf("inside the daily window the observation must stand: %+v", within)
+	}
+
+	rolled := grokBillingMetrics(snap, observed.Add(25*time.Hour))
+	if len(rolled) != 1 || !rolled[0].Unknown {
+		t.Fatalf("want a single unknown row, got %+v", rolled)
+	}
+	if rolled[0].ObservedAt != "" {
+		t.Fatalf("ObservedAt = %q — a rolled-over daily period must not read as confirmed",
+			rolled[0].ObservedAt)
+	}
+	if rolled[0].ResetAt != "" {
+		t.Fatalf("ResetAt = %q — a nominal length is not an observed boundary", rolled[0].ResetAt)
+	}
+}
+
+// The narrower bound applies ONLY where we can name the window. A weekly or
+// monthly period is longer than the TTL, and an unrecognized one gives us no
+// length at all, so both keep the global TTL as their only bound.
+func TestGrokConfirmedUnmeteredKeepsTheGlobalTTLForLongerAndUnnamedWindows(t *testing.T) {
+	observed := time.Date(2026, 8, 17, 23, 2, 12, 0, time.UTC)
+	for _, periodType := range []string{"USAGE_PERIOD_TYPE_WEEKLY", "USAGE_PERIOD_TYPE_MONTHLY", "USAGE_PERIOD_TYPE_UNSPECIFIED"} {
+		snap := grokBillingSnapshot{ObservedAt: observed, PeriodType: periodType}
+		metrics := grokBillingMetrics(snap, observed.Add(grokBillingObservationTTL-time.Minute))
+		if len(metrics) != 1 || metrics[0].ObservedAt != "2026-08-17T23:02:12Z" {
+			t.Fatalf("%s: want the observation retained to the TTL, got %+v", periodType, metrics)
+		}
+	}
+}
+
+// A window whose end IS parseable and still ahead keeps the shipped lifecycle —
+// the period-length bound must not clip a window the record itself dated.
+func TestGrokConfirmedUnmeteredWithAParseableEndIsNotClippedByThePeriodLength(t *testing.T) {
+	observed := time.Date(2026, 8, 17, 23, 2, 12, 0, time.UTC)
+	now := observed.Add(30 * time.Hour)
+	metrics := grokBillingMetrics(grokBillingSnapshot{
+		ObservedAt:   observed,
+		PeriodType:   "USAGE_PERIOD_TYPE_DAILY",
+		PeriodEnd:    now.Add(time.Hour),
+		HasPeriodEnd: true,
+	}, now)
+	if len(metrics) != 1 || !metrics[0].Unknown || metrics[0].ObservedAt != "2026-08-17T23:02:12Z" {
+		t.Fatalf("a dated, still-open window must keep its observation: %+v", metrics)
+	}
+}

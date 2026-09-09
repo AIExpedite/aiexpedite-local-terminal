@@ -400,6 +400,22 @@ func startGrokBillingAttributionKeeper() (finish func()) {
 	}
 }
 
+// grokDirectAttributionArmed reports whether at least one direct (PTY) Grok run
+// is currently relying on our identity being the newest one in the log.
+//
+// It exists so a displacement WE cause — persistGrokManagedBillingSnapshot
+// merging another session's paired identity/record lines — can be repaired the
+// instant it happens instead of waiting up to one keeper tick. That is the only
+// displacer this process can observe synchronously, and it is the one that
+// otherwise loses every record of a short direct run that starts, is displaced,
+// writes its billing line and exits inside a single interval. The periodic tick
+// still covers the out-of-process case (`grok login` outside the agent).
+func grokDirectAttributionArmed() bool {
+	grokAttributionKeeperMu.Lock()
+	defer grokAttributionKeeperMu.Unlock()
+	return grokAttributionKeeperRefs > 0
+}
+
 // runGrokBillingAttributionKeeper re-asserts attribution until the last armed
 // session releases. Best-effort and silent, like every other path in this file.
 func runGrokBillingAttributionKeeper(stop <-chan struct{}) {

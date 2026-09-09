@@ -472,25 +472,46 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 	// identity merged here. The pairing below keeps THIS record correct either
 	// way; the lock is what keeps the direct path's decision from going stale
 	// between its read and its write.
+	if err := appendGrokBillingPair(persistentHome, payload); err != nil {
+		return grokManagedBillingFailed, err
+	}
+
+	// Our own append just made THIS session's identity the newest one in the
+	// log. Any direct run still live would have every record it writes from
+	// here on bound to it and refused, and the periodic keeper would not notice
+	// for up to a full tick — long enough for a short one-shot run to write its
+	// only billing record and exit unattributed. Repair immediately, outside
+	// the write lock (ensureGrokBillingAttribution takes it itself), and only
+	// when a direct run is actually armed so a managed-only device writes
+	// nothing extra.
+	if grokDirectAttributionArmed() {
+		ensureGrokBillingAttribution()
+	}
+	return grokManagedBillingPersisted, nil
+}
+
+// appendGrokBillingPair writes the identity + record pair in one O_APPEND call.
+//
+// Split out so the write lock is released before the direct-run repair above:
+// holding grokBillingAttributionSerialize across ensureGrokBillingAttribution's
+// own read-then-append would deadlock.
+func appendGrokBillingPair(persistentHome string, payload []byte) error {
 	grokBillingAttributionSerialize.Lock()
 	defer grokBillingAttributionSerialize.Unlock()
 
 	path := grokBillingLogPath(persistentHome)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return grokManagedBillingFailed, err
+		return err
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return grokManagedBillingFailed, err
+		return err
 	}
 	if _, err := f.Write(payload); err != nil {
 		_ = f.Close()
-		return grokManagedBillingFailed, err
+		return err
 	}
-	if err := f.Close(); err != nil {
-		return grokManagedBillingFailed, err
-	}
-	return grokManagedBillingPersisted, nil
+	return f.Close()
 }
 
 // grokManagedBillingOutcome names what a managed run left behind. A bare error
@@ -789,6 +810,23 @@ func grokBillingPeriodKind(periodType string) (kind string, label string, ok boo
 	return "", "", false
 }
 
+// grokBillingPeriodLength is the nominal length of a recognized billing window,
+// used ONLY to bound how long an unmetered observation whose period end we could
+// not parse may keep presenting itself as current. It is never used to derive a
+// ResetAt: a nominal length is not an observed boundary. An unrecognized kind
+// returns 0, which leaves grokBillingObservationTTL as the only bound.
+func grokBillingPeriodLength(kind string) time.Duration {
+	switch kind {
+	case limitKindDaily:
+		return 24 * time.Hour
+	case limitKindWeekly:
+		return 7 * 24 * time.Hour
+	case limitKindMonthly:
+		return 31 * 24 * time.Hour
+	}
+	return 0
+}
+
 // grokBillingMetrics turns a snapshot into the card's capacity rows.
 //
 // Three distinct states leave this function, and downstream freshness checks
@@ -818,9 +856,21 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 	// Retention bound for an UNKNOWN row only. A numeric reading keeps its
 	// existing lifecycle (bounded by the period end), so no shipped percentage
 	// behaviour changes here.
-	retained := observedAt
-	if snap.ObservedAt.Before(now.Add(-grokBillingObservationTTL)) {
-		retained = ""
+	//
+	// `window` narrows the global TTL when the record names a period we DO
+	// recognize but gives us no parseable end: a daily window has certainly
+	// rolled over long before 72h, and publishing its ObservedAt would let a
+	// freshness check read a rolled-over period as current billing evidence.
+	// A window of 0 (or one longer than the TTL) means the TTL is the only
+	// bound we can justify.
+	retainedWithin := func(window time.Duration) string {
+		if window <= 0 || window > grokBillingObservationTTL {
+			window = grokBillingObservationTTL
+		}
+		if snap.ObservedAt.Before(now.Add(-window)) {
+			return ""
+		}
+		return observedAt
 	}
 
 	var credits cliAgentUsageMetric
@@ -831,7 +881,7 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 		// observation was wrong too: it threw away the proof that billing was
 		// freshly read. Keep the placeholder's unguessed shape, plus freshness.
 		// ResetAt is never set here: we do not know when this window ends.
-		credits = grokUnknownCreditsMetricAt(retained)
+		credits = grokUnknownCreditsMetricAt(retainedWithin(0))
 	} else {
 		credits = cliAgentUsageMetric{
 			Kind:       kind,
@@ -857,11 +907,15 @@ func grokBillingMetrics(snap grokBillingSnapshot, now time.Time) []cliAgentUsage
 			// period; retaining it is what distinguishes this from an inferred
 			// placeholder produced when no usable billing response exists. An
 			// unparseable period end costs us only ResetAt — freshness does not
-			// depend on knowing when the window closes.
+			// depend on knowing when the window closes, but WITHOUT an end we
+			// cannot see the rollover either, so retention falls back to the
+			// period's own nominal length.
 			credits.Unknown = true
-			credits.ObservedAt = retained
 			if snap.HasPeriodEnd {
+				credits.ObservedAt = retainedWithin(0)
 				credits.ResetAt = snap.PeriodEnd.UTC().Format(time.RFC3339)
+			} else {
+				credits.ObservedAt = retainedWithin(grokBillingPeriodLength(kind))
 			}
 		default:
 			credits.Total = floatPtr(100)

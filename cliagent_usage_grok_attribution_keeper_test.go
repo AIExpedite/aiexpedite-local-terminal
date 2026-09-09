@@ -228,3 +228,64 @@ func TestGrokDirectChildHomeOverride_LeavesAbsoluteAndUnsetHomesAlone(t *testing
 		t.Fatalf("unset GROK_HOME introduced as %q — want no override", got)
 	}
 }
+
+// The keeper's first tick is a full interval away, so a displacement WE cause
+// must be repaired synchronously: a short direct run that is displaced, writes
+// its only billing record and exits inside one interval would otherwise lose
+// that record entirely.
+func TestPersistGrokManagedBillingSnapshot_RepairsAnArmedDirectRunImmediately(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+	// An interval far longer than the test: nothing here may depend on a tick.
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	ensureGrokBillingAttribution()
+	finish := startGrokBillingAttributionKeeper()
+	defer finish()
+
+	isolated := helperGrokHomeWithAccount(t, "acct-managed")
+	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-managed"))
+	helperAppendGrokLogLine(t, isolated,
+		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+
+	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil ||
+		outcome != grokManagedBillingPersisted {
+		t.Fatalf("persist → %v, %v; want persisted", outcome, err)
+	}
+
+	// A record the still-running direct CLI writes right after the merge is
+	// ours again — with no keeper tick in between.
+	helperAppendGrokLogLine(t, persistent,
+		grokUnmeteredLine("2026-08-19T12:21:00Z", grokBillingLogMessage))
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 19, 12, 22, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("Parse failed")
+	}
+	if len(usage.Metrics) != 1 || usage.Metrics[0].ObservedAt != "2026-08-19T12:21:00Z" {
+		t.Fatalf("want the post-merge record attributed to the live direct run, got %+v",
+			usage.Metrics)
+	}
+}
+
+// With no direct run armed, a managed merge must write nothing beyond its own
+// pair — the repair is for live sessions only, not a standing extra append into
+// a provider-owned file.
+func TestPersistGrokManagedBillingSnapshot_DoesNotRepairWhenNoDirectRunIsArmed(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+
+	isolated := helperGrokHomeWithAccount(t, "acct-managed")
+	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-managed"))
+	helperAppendGrokLogLine(t, isolated,
+		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+
+	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if got := grokIdentityLineCount(t, persistent); got != 1 {
+		t.Fatalf("identity lines = %d, want 1 — the merge repaired attribution with no direct run armed", got)
+	}
+}
