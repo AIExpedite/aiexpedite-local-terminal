@@ -209,7 +209,7 @@ func StartAgent(cfg *Config) {
 
 	var shellCmd []string
 	if useTmux {
-		shellCmd = []string{"tmux", "attach", "-t", tmuxSessionName}
+		shellCmd = []string{"tmux", "attach", "-t", tmuxTarget()}
 	} else {
 		sh := os.Getenv("SHELL")
 		if sh == "" {
