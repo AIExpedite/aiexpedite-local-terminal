@@ -481,6 +481,25 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	stdout := stdoutR
 	stderr := stderrR
 
+	// A DIRECT Grok run writes its billing records into the user's own
+	// ~/.grok/logs/unified.jsonl, where the CLI logs no producer identity — so
+	// without this the account gate refuses every one of them and the card can
+	// never show a fresh observation. Session-scoped and best-effort; no work is
+	// added to the per-line streaming path. A maintenance smoke is excluded: its
+	// child writes into the isolated home, whose identity is seeded there and
+	// merged by persistGrokManagedBillingSnapshot on exit.
+	//
+	// Must run BEFORE proc.Start(): grokRecordBelongsToCurrentAccount only
+	// accepts an identity logged EARLIER in the log than the billing record, and
+	// a fast child can write its startup `billing: fetched credits config` line
+	// before the parent gets scheduled again. Appending after the spawn would
+	// leave attribution — and therefore the whole capture this exists to
+	// restore — dependent on that race. Mirrors grok_acp.go, which likewise
+	// attributes before it spawns.
+	if isGrokCommand(command) && isolatedGrokHome == "" {
+		ensureGrokBillingAttribution(time.Now())
+	}
+
 	// Start the process
 	if err := proc.Start(); err != nil {
 		stdin.Close()
@@ -542,17 +561,6 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// an active session. removeSession() deregisters it on exit.
 	if proc.Process != nil {
 		globalProcessRegistry.Register(proc.Process.Pid, "session:"+id)
-	}
-
-	// A DIRECT Grok run writes its billing records into the user's own
-	// ~/.grok/logs/unified.jsonl, where the CLI logs no producer identity — so
-	// without this the account gate refuses every one of them and the card can
-	// never show a fresh observation. Session-scoped and best-effort; no work is
-	// added to the per-line streaming path. A maintenance smoke is excluded: its
-	// child writes into the isolated home, whose identity is seeded there and
-	// merged by persistGrokManagedBillingSnapshot on exit.
-	if isGrokCommand(command) && isolatedGrokHome == "" {
-		ensureGrokBillingAttribution(time.Now())
 	}
 
 	// Start output reader goroutines
