@@ -253,6 +253,27 @@ func grokPersistentHome() string {
 	return base
 }
 
+// grokDirectChildHomeOverride returns the absolute GROK_HOME a DIRECT Grok
+// child must be given, or "" when the inherited environment already resolves to
+// the same place on both sides.
+//
+// A relative GROK_HOME is resolved against the process cwd. StartSession sets
+// the child's cwd to the caller's requested directory, while grokPersistentHome
+// — the path the attribution marker is written to and the billing reader reads
+// back — absolutizes against the DAEMON's cwd. Left alone, the CLI would log
+// into a different tree than the one carrying our identity line, and the direct
+// record would be unattributable no matter how correctly it was seeded.
+//
+// Absolute and unset values already resolve identically for parent and child,
+// so only the relative case is rewritten: this never introduces a GROK_HOME the
+// operator did not set.
+func grokDirectChildHomeOverride(env string) string {
+	if env == "" || filepath.IsAbs(env) {
+		return ""
+	}
+	return grokPersistentHome()
+}
+
 const grokManagedBillingIdentityMessage = "aiexpedite: managed billing producer"
 
 // grokResolvedBillingIdentity returns the single account value written as the
@@ -443,6 +464,16 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 	payload = append(payload, '\n')
 	payload = append(payload, billingLine...)
 	payload = append(payload, '\n')
+
+	// Serialize against ensureGrokBillingAttribution's read-then-append. Without
+	// this, that check can observe our identity as the newest, then have this
+	// paired append land before it returns — leaving the direct session
+	// believing it is attributed while every record it writes next binds to the
+	// identity merged here. The pairing below keeps THIS record correct either
+	// way; the lock is what keeps the direct path's decision from going stale
+	// between its read and its write.
+	grokBillingAttributionSerialize.Lock()
+	defer grokBillingAttributionSerialize.Unlock()
 
 	path := grokBillingLogPath(persistentHome)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

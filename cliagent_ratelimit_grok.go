@@ -328,3 +328,89 @@ func loadGrokUsageLimitState(currentFingerprint string, now time.Time) (grokUsag
 	}
 	return state, true
 }
+
+// grokBillingAttributionKeeperInterval bounds how long a DISPLACED marker can
+// go unrepaired while a direct Grok session is still running. Session start is
+// not enough on its own: the CLI keeps fetching credits for the whole life of
+// the session, and any identity appended after ours — a managed session for
+// another account merging its paired lines on exit, or a `grok login` plus
+// activity outside the agent — becomes the nearest preceding identity for every
+// record the live session writes from that moment on. Those records are then
+// refused, so a long session silently stops producing the observations this
+// whole path exists to capture.
+//
+// 30s trades a small bounded loss window against writes into a provider-owned
+// file. Each tick is one bounded tail read and appends only when our identity
+// is no longer the newest, so a session that is never displaced writes nothing
+// after its first line.
+const grokBillingAttributionKeeperInterval = 30 * time.Second
+
+// grokBillingAttributionKeeperIntervalEnv is the test seam for the tick.
+const grokBillingAttributionKeeperIntervalEnv = "AIX_GROK_ATTRIBUTION_KEEPER_INTERVAL"
+
+// grokBillingAttributionKeeperIntervalValue resolves the tick, honoring the
+// test seam.
+func grokBillingAttributionKeeperIntervalValue() time.Duration {
+	if raw := os.Getenv(grokBillingAttributionKeeperIntervalEnv); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	return grokBillingAttributionKeeperInterval
+}
+
+var (
+	grokAttributionKeeperMu   sync.Mutex
+	grokAttributionKeeperRefs int
+	grokAttributionKeeperStop chan struct{}
+)
+
+// startGrokBillingAttributionKeeper holds attribution for the LIFETIME of a
+// direct Grok run rather than only at its start, and returns the release the
+// caller must invoke when the child is reaped.
+//
+// One shared goroutine serves every concurrently live direct session (they all
+// share one provider-owned log, so per-session pollers would only duplicate the
+// same read). Mirrors startAntigravityQuotaCapture's run-scoped, ref-counted
+// arm/release shape.
+func startGrokBillingAttributionKeeper() (finish func()) {
+	grokAttributionKeeperMu.Lock()
+	grokAttributionKeeperRefs++
+	if grokAttributionKeeperRefs == 1 {
+		grokAttributionKeeperStop = make(chan struct{})
+		go runGrokBillingAttributionKeeper(grokAttributionKeeperStop)
+	}
+	grokAttributionKeeperMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			grokAttributionKeeperMu.Lock()
+			var stop chan struct{}
+			grokAttributionKeeperRefs--
+			if grokAttributionKeeperRefs <= 0 {
+				grokAttributionKeeperRefs = 0
+				stop, grokAttributionKeeperStop = grokAttributionKeeperStop, nil
+			}
+			grokAttributionKeeperMu.Unlock()
+			if stop != nil {
+				close(stop)
+			}
+		})
+	}
+}
+
+// runGrokBillingAttributionKeeper re-asserts attribution until the last armed
+// session releases. Best-effort and silent, like every other path in this file.
+func runGrokBillingAttributionKeeper(stop <-chan struct{}) {
+	ticker := time.NewTicker(grokBillingAttributionKeeperIntervalValue())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			ensureGrokBillingAttribution()
+		}
+	}
+}

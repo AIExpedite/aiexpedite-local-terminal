@@ -101,6 +101,14 @@ type CLISession struct {
 	// server's loopback socket may answer.
 	finishQuotaCapture func()
 
+	// finishGrokBillingAttribution releases the run-scoped Grok attribution
+	// keeper armed at spawn (cliagent_ratelimit_grok.go). Set only for a DIRECT
+	// Grok run; nil for a maintenance smoke (its child logs into the isolated
+	// home) and for every other command. waitForExit calls it exactly once, once
+	// the process is reaped — after that the run writes no further records, so
+	// there is nothing left to keep attributed.
+	finishGrokBillingAttribution func()
+
 	// deferredStdinClose marks a one-shot, stdin-fed CLI (codex) that
 	// was started with NO prompt — the chat-direct flow opens the session
 	// eagerly and delivers the first message later via SendInput. Stdin is left
@@ -421,6 +429,12 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		filtered = setEnvVar(filtered, "HOME", isolatedGrokHome)
 		filtered = setEnvVar(filtered, "USERPROFILE", isolatedGrokHome)
 		filtered = setEnvVar(filtered, "PWD", isolatedGrokCwd)
+	} else if isGrokCommand(command) {
+		// Pin a relative GROK_HOME to the same absolute path the attribution
+		// marker and the billing reader use; see grokDirectChildHomeOverride.
+		if resolved := grokDirectChildHomeOverride(os.Getenv("GROK_HOME")); resolved != "" {
+			filtered = setEnvVar(filtered, "GROK_HOME", resolved)
+		}
 	}
 	proc.Env = filtered
 	if len(strippedVars) > 0 {
@@ -496,12 +510,26 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// leave attribution — and therefore the whole capture this exists to
 	// restore — dependent on that race. Mirrors grok_acp.go, which likewise
 	// attributes before it spawns.
+	//
+	// Session start alone does not hold attribution: the CLI fetches credits for
+	// the whole life of the run, and a later identity from a managed exit or an
+	// out-of-process `grok login` displaces ours for every record written after
+	// it. The keeper armed below re-asserts on a bounded tick until the child is
+	// reaped, so displacement costs at most one interval instead of the rest of
+	// the session.
+	var finishGrokAttribution func()
 	if isGrokCommand(command) && isolatedGrokHome == "" {
 		ensureGrokBillingAttribution()
+		finishGrokAttribution = startGrokBillingAttributionKeeper()
 	}
 
 	// Start the process
 	if err := proc.Start(); err != nil {
+		if finishGrokAttribution != nil {
+			// No child will ever write a record for this arm; release now so a
+			// failed spawn cannot leave the shared keeper running forever.
+			finishGrokAttribution()
+		}
 		stdin.Close()
 		stdoutR.Close()
 		stdoutW.Close()
@@ -528,22 +556,23 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	}
 
 	session := &CLISession{
-		ID:                       id,
-		Command:                  command,
-		Process:                  proc,
-		Stdin:                    stdin,
-		Stdout:                   stdout,
-		Stderr:                   stderr,
-		StartedAt:                time.Now(),
-		Status:                   "running",
-		WorkspaceID:              workspaceID,
-		UID:                      uid,
-		TimeoutMs:                timeoutMs,
-		promptFile:               promptFile,
-		isolatedGrokHome:         isolatedGrokHome,
-		persistentGrokHome:       persistentGrokHome,
-		antigravityManagedStream: antigravityManagedStream,
-		finishQuotaCapture:       finishQuotaCapture,
+		ID:                           id,
+		Command:                      command,
+		Process:                      proc,
+		Stdin:                        stdin,
+		Stdout:                       stdout,
+		Stderr:                       stderr,
+		StartedAt:                    time.Now(),
+		Status:                       "running",
+		WorkspaceID:                  workspaceID,
+		UID:                          uid,
+		TimeoutMs:                    timeoutMs,
+		promptFile:                   promptFile,
+		isolatedGrokHome:             isolatedGrokHome,
+		persistentGrokHome:           persistentGrokHome,
+		antigravityManagedStream:     antigravityManagedStream,
+		finishQuotaCapture:           finishQuotaCapture,
+		finishGrokBillingAttribution: finishGrokAttribution,
 		// A stdin-fed one-shot CLI (codex) started without a prompt keeps
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
@@ -1715,6 +1744,13 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// connection. Non-blocking, and a no-op for every non-agy session.
 	if session.finishQuotaCapture != nil {
 		session.finishQuotaCapture()
+	}
+
+	// Same timing for the Grok attribution keeper: the reaped child writes no
+	// further billing records, so holding the marker past this point would only
+	// keep writing into a provider-owned log for a run that has ended.
+	if session.finishGrokBillingAttribution != nil {
+		session.finishGrokBillingAttribution()
 	}
 
 	if timeoutTimer != nil {
