@@ -185,10 +185,31 @@ var grokCredentialOverrideEnvVars = []string{
 	"GROK_AUTH_PROVIDER_ACCESS_TOKEN",
 }
 
+// grokDirectRunLaunch is the whole credential surface a DIRECT (PTY) Grok child
+// is launched with. Held as one value because every field is a place the child
+// can pick up a credential of its own, and the attribution decision has to see
+// all of them at once: a detector handed only the environment silently answers
+// "cached login" for a child billing an API-key account pinned in argv or in the
+// repository it runs in.
+//
+// Env is the environment the child is spawned with, Cwd the directory it starts
+// in (Grok discovers `.grok/config.toml` by walking upward from there), and Args
+// the argv it is spawned with (`--config model.api_key=...` is a documented
+// per-process override that buildGrokInteractiveArgs forwards verbatim).
+//
+// The zero value means "no child": the caller is asserting the cached login with
+// no credential override in play.
+type grokDirectRunLaunch struct {
+	Env  []string
+	Cwd  string
+	Args []string
+}
+
 // grokDirectRunCredentialOverride reports whether a DIRECT (PTY) Grok child
-// spawned with `env` could bill an account OTHER than the cached login in
-// `base` — an inherited API key / provider token, or a key pinned in the user's
-// own config.toml or a system config layer.
+// launched as `launch` could bill an account OTHER than the cached login in
+// `base` — an inherited API key / provider token, or a key pinned in argv, in
+// the repository the child runs in, in the user's own config.toml, or in a
+// system config layer.
 //
 // A direct session deliberately inherits the user's shell environment (unlike
 // the ACP and maintenance-smoke paths, which strip XAI_API_KEY unless the
@@ -203,8 +224,8 @@ var grokCredentialOverrideEnvVars = []string{
 // Conservative by construction: it reports true whenever a credential override
 // is merely AVAILABLE, because which one the CLI resolves is its decision, made
 // per turn inside a process we do not observe.
-func grokDirectRunCredentialOverride(env []string, base string) bool {
-	for _, entry := range env {
+func grokDirectRunCredentialOverride(launch grokDirectRunLaunch, base string) bool {
+	for _, entry := range launch.Env {
 		name, value, _ := strings.Cut(entry, "=")
 		if strings.TrimSpace(value) == "" {
 			continue
@@ -216,5 +237,100 @@ func grokDirectRunCredentialOverride(env []string, base string) bool {
 			}
 		}
 	}
+	if grokArgsPinAPIKey(launch.Args) {
+		return true
+	}
+	if grokProjectPinnedAPIKey(launch.Cwd) {
+		return true
+	}
 	return grokAnyPinnedAPIKey(base)
+}
+
+// grokArgsPinAPIKey reports whether the argv a direct child is spawned with
+// hands it an API key of its own. xAI documents `-c|--config <key>=value` as the
+// per-process config-override surface and buildGrokInteractiveArgs forwards it
+// verbatim, so `--config model.api_key=sk-...` is a credential neither the
+// environment nor any config file on this machine ever sees.
+//
+// Every token is inspected rather than only the ones following a recognized
+// flag: the same override is spelled `--config k=v`, `--config=k=v` and `-c k=v`
+// across Grok releases, and over-reporting costs one session's observability
+// while under-reporting publishes one account's spend as another's.
+func grokArgsPinAPIKey(args []string) bool {
+	for _, arg := range args {
+		if grokArgPinsAPIKey(arg) {
+			return true
+		}
+	}
+	return false
+}
+
+// grokArgPinsAPIKey reports whether ONE argv token assigns a non-empty API key.
+// The flag form nests the assignment inside the flag's own value
+// (`--config=model.api_key=sk-...`), so a key that is not itself an API-key path
+// is retried against the value once the outer `flag=` has been peeled off.
+func grokArgPinsAPIKey(arg string) bool {
+	key, value, ok := strings.Cut(arg, "=")
+	if !ok {
+		return false
+	}
+	if grokAPIKeyConfigKey(key) {
+		return strings.TrimSpace(strings.Trim(value, `"'`)) != ""
+	}
+	return grokArgPinsAPIKey(value)
+}
+
+// grokAPIKeyConfigKey reports whether a config key path names an API key, in any
+// of the spellings a flag can carry it (`model.api_key`, `model.grok-4.apiKey`,
+// `--api-key`). Separator- and case-insensitive, so a rename across a CLI update
+// does not silently reopen the misattribution this guard closes.
+func grokAPIKeyConfigKey(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	key = strings.TrimLeft(key, "-")
+	key = strings.NewReplacer("_", "", "-", "").Replace(key)
+	return strings.HasSuffix(key, "apikey")
+}
+
+// grokProjectConfigMaxDepth bounds the upward `.grok/config.toml` walk. Deep
+// enough for any real checkout, finite so a pathological path cannot turn a
+// session start into an unbounded stat loop.
+const grokProjectConfigMaxDepth = 64
+
+// grokProjectPinnedAPIKey reports whether a repository-scoped
+// `.grok/config.toml` at or above the child's working directory pins an API key.
+//
+// Grok discovers project config by walking UPWARD from cwd — the same discovery
+// the maintenance smoke isolates itself from by running in an empty directory —
+// so a workspace that pins `model.api_key` bills its own account from a session
+// whose environment and home both name the cached login. StartSession honours
+// the caller's requested cwd, so that directory, not the daemon's, is what the
+// child actually walks.
+//
+// An empty cwd walks NOTHING rather than falling back to the daemon's working
+// directory: the caller knows which directory its child is really started in
+// (StartSession resolves the inherited case at the spawn site), and reading the
+// process-wide cwd here would make this decision depend on ambient state the
+// caller never named.
+//
+// One bounded stat walk per direct session start, never on the streaming path.
+func grokProjectPinnedAPIKey(cwd string) bool {
+	dir := strings.TrimSpace(cwd)
+	if dir == "" {
+		return false
+	}
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	for depth := 0; depth < grokProjectConfigMaxDepth; depth++ {
+		if grokConfigHasModelAPIKey(filepath.Join(dir, ".grok", "config.toml")) {
+			return true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return false
+		}
+		dir = parent
+	}
+	return false
 }

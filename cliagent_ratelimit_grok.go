@@ -142,16 +142,17 @@ var grokBillingAttributionSerialize sync.Mutex
 // attribution self-heals after a rotation, an account change, or a displacing
 // marker, while staying at most one small append per displacement.
 // Best-effort and silent on failure, matching this file's hot-path contract.
-// childEnv is the environment the direct child is spawned with; it decides
-// whether the cached login can be named at all (grokDirectRunBillingIdentity).
-// Pass nil when there is no child — the caller is then asserting the cached
-// login with no credential override in play.
-func ensureGrokBillingAttribution(childEnv []string) {
+// launch is the credential surface the direct child is spawned with — its
+// environment, working directory and argv — and it decides whether the cached
+// login can be named at all (grokDirectRunBillingIdentity). Pass the zero value
+// when there is no child: the caller is then asserting the cached login with no
+// credential override in play.
+func ensureGrokBillingAttribution(launch grokDirectRunLaunch) {
 	base := grokPersistentHome()
 	if base == "" {
 		return
 	}
-	identity := grokDirectRunBillingIdentity(childEnv, base)
+	identity := grokDirectRunBillingIdentity(launch, base)
 	if identity == "" {
 		return
 	}
@@ -163,8 +164,9 @@ func ensureGrokBillingAttribution(childEnv []string) {
 // nothing to name.
 //
 // Normally that is the cached login in `base`. When the child carries a
-// credential override — an inherited API key / provider token, or a key pinned
-// in the user's own config.toml or a system layer — it is the contested
+// credential override — an inherited API key / provider token, a key pinned in
+// its own argv (`--config model.api_key=...`), or one pinned in the repository
+// it runs in, the user's own config.toml or a system layer — it is the contested
 // sentinel instead: the child may bill an account we cannot resolve, and naming
 // the cached login above records it did not pay for would publish one account's
 // spend as another's. The sentinel matches no account, so those records are
@@ -175,8 +177,8 @@ func ensureGrokBillingAttribution(childEnv []string) {
 // The SINGLE decision point for a direct arm: the keeper must be armed with the
 // same value this names, or a re-assertion would reinstate the identity the
 // override just ruled out.
-func grokDirectRunBillingIdentity(childEnv []string, base string) string {
-	if grokDirectRunCredentialOverride(childEnv, base) {
+func grokDirectRunBillingIdentity(launch grokDirectRunLaunch, base string) string {
+	if grokDirectRunCredentialOverride(launch, base) {
 		return grokContestedBillingIdentity
 	}
 	identity, ok := grokResolvedBillingIdentity(base)

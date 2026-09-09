@@ -457,6 +457,18 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 		return grokManagedBillingNoIdentity, nil
 	}
 
+	// The INCOMING timestamp is checked with the same bound the supersession
+	// guard applies to the records already in the log. A clock correction
+	// between the child's credits fetch and its exit leaves us carrying a
+	// future-dated observation; appending it puts a record grokBillingMetrics
+	// refuses to publish at the end of the log, and readGrokBillingSnapshot
+	// picks the LAST billing line by FILE ORDER — so the merge would blank a
+	// valid reading and keep it blank until wall-clock caught up. Refusing the
+	// merge costs this one session's observation; making it costs the card.
+	if snap.ObservedAt.After(time.Now().Add(grokBillingMaxClockSkew)) {
+		return grokManagedBillingUntrusted, nil
+	}
+
 	period := map[string]any{"type": snap.PeriodType}
 	if snap.HasPeriodEnd {
 		period["end"] = snap.PeriodEnd.UTC().Format(time.RFC3339Nano)
@@ -572,8 +584,17 @@ func appendGrokBillingPair(
 	// with it — after a clock correction, potentially for the rest of the
 	// period. The read path's distrust and this one have to agree: a timestamp
 	// too far ahead to publish is too far ahead to protect.
-	if existing, ok := newestGrokBillingObservationFor(persistentHome, identities); ok &&
-		!existing.After(time.Now().Add(grokBillingMaxClockSkew)) &&
+	//
+	// The bound is passed INTO the scan, not applied to its result. Filtering
+	// afterwards asked the wrong question: the helper had already stopped at the
+	// newest same-account record, so one untrusted future record made the guard
+	// read "this account has nothing here" and hid an EARLIER trusted record
+	// that is genuinely newer than our snapshot — which we would then append
+	// last, replacing a newer valid observation with a stale one. Skipping the
+	// untrusted record inside the scan keeps looking for the newest record this
+	// account has that we would also be willing to publish.
+	trustedThrough := time.Now().Add(grokBillingMaxClockSkew)
+	if existing, ok := newestTrustedGrokBillingObservationFor(persistentHome, identities, trustedThrough); ok &&
 		!existing.Before(observedAt) {
 		return true, false, nil
 	}
@@ -641,6 +662,14 @@ const (
 	// for this account at least as new as ours, so merging would have replaced
 	// a newer observation with an older one. Nothing was written.
 	grokManagedBillingSuperseded
+	// grokManagedBillingUntrusted — the record we carry is dated further ahead
+	// than grokBillingMaxClockSkew allows, so nothing was written. The clock can
+	// move backwards between the child's fetch and its exit, and merging then
+	// makes an unpublishable record the globally newest line in the log —
+	// grokBillingMetrics refuses it and the card reads Unknown until wall-clock
+	// catches up. Leaving the log alone keeps whatever valid observation it
+	// already had.
+	grokManagedBillingUntrusted
 	// grokManagedBillingPersisted — one normalized record was merged.
 	grokManagedBillingPersisted
 	// grokManagedBillingFailed — the merge was attempted and errored.
@@ -657,6 +686,8 @@ func (o grokManagedBillingOutcome) String() string {
 		return "no-record"
 	case grokManagedBillingSuperseded:
 		return "superseded"
+	case grokManagedBillingUntrusted:
+		return "untrusted-timestamp"
 	case grokManagedBillingPersisted:
 		return "persisted"
 	case grokManagedBillingFailed:
@@ -711,9 +742,9 @@ func readGrokBillingLogTailWithOffset(base string) (lines [][]byte, truncatedFir
 	return bytes.Split(tail, []byte("\n")), offset > 0
 }
 
-// newestGrokBillingObservationFor returns the observation time of the newest
-// billing record in the log tail that belongs to `identities`, ignoring records
-// produced by any other account.
+// newestTrustedGrokBillingObservationFor returns the observation time of the
+// newest billing record in the log tail that belongs to `identities` and is not
+// dated after `trustedThrough`, ignoring records produced by any other account.
 //
 // It is the supersession guard's reader, deliberately separate from
 // readGrokBillingSnapshot. That one is the PUBLISH path: it stops at the newest
@@ -727,7 +758,14 @@ func readGrokBillingLogTailWithOffset(base string) (lines [][]byte, truncatedFir
 // terminating the scan: this guard only ever decides whether to SKIP a write, so
 // the conservative reading of "we cannot tell whose this is" is to keep looking
 // for a record we can attribute, and to merge when we find none.
-func newestGrokBillingObservationFor(base string, identities []string) (time.Time, bool) {
+//
+// A record dated after `trustedThrough` is skipped for the same reason and by
+// the same rule the caller applies: the publish path refuses it, so it is no
+// evidence that this account already has a fresher receipt. The scan CONTINUES
+// past it to the newest same-account record we would be willing to publish —
+// stopping there would report "nothing" and let a stale merge land on top of a
+// perfectly good older-but-trusted observation.
+func newestTrustedGrokBillingObservationFor(base string, identities []string, trustedThrough time.Time) (time.Time, bool) {
 	lines, _ := readGrokBillingLogTailWithOffset(base)
 	if lines == nil {
 		return time.Time{}, false
@@ -749,6 +787,9 @@ func newestGrokBillingObservationFor(base string, identities []string) (time.Tim
 		}
 		snap, ok := grokBillingSnapshotFromRecord(rec)
 		if !ok {
+			continue
+		}
+		if snap.ObservedAt.After(trustedThrough) {
 			continue
 		}
 		if !grokRecordBelongsToCurrentAccount(lines, i, identities) {

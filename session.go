@@ -535,17 +535,34 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		//
 		// grokDirectRunBillingIdentity also withholds the cached login entirely
 		// when this child carries a credential override (an inherited
-		// XAI_API_KEY / provider token, or a key pinned in the user's real
-		// config.toml — a direct session strips neither, unlike the ACP and
+		// XAI_API_KEY / provider token, a key pinned in its own argv, or one
+		// pinned in the workspace it runs in or the user's real config.toml — a
+		// direct session strips none of them, unlike the ACP and
 		// maintenance-smoke paths): the records would then be billed to an
 		// account we cannot resolve, and naming the login above them publishes
 		// one account's spend as another's. It captures the contested sentinel
 		// instead, which ARMS as well as writes, so a concurrent honest run is
 		// made contested too and the override run's records cannot bind to the
 		// marker that run asserts.
-		directIdentity := grokDirectRunBillingIdentity(filtered, grokPersistentHome())
+		//
+		// All three credential sources are handed over together: the child is
+		// spawned with `filtered`, starts in the caller's `cwd` (which is what
+		// Grok walks upward from for a project `.grok/config.toml`) and runs
+		// `cliArgs`, which forwards `--config <key>=value` verbatim.
+		//
+		// proc.Dir is left empty when the caller named no cwd, and the child
+		// then inherits the daemon's — so resolve that here rather than inside
+		// the detector, which must never read ambient process state of its own.
+		grokChildCwd := cwd
+		if grokChildCwd == "" {
+			if wd, err := os.Getwd(); err == nil {
+				grokChildCwd = wd
+			}
+		}
+		grokLaunch := grokDirectRunLaunch{Env: filtered, Cwd: grokChildCwd, Args: cliArgs}
+		directIdentity := grokDirectRunBillingIdentity(grokLaunch, grokPersistentHome())
 		finishGrokAttribution = startGrokBillingAttributionKeeper(directIdentity)
-		ensureGrokBillingAttribution(filtered)
+		ensureGrokBillingAttribution(grokLaunch)
 	}
 
 	// Start the process

@@ -91,7 +91,7 @@ func TestEnsureGrokBillingAttribution_MakesADirectRunRecordObservable(t *testing
 	t.Setenv("GROK_HOME", base)
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want exactly 1", got)
 	}
@@ -121,16 +121,16 @@ func TestEnsureGrokBillingAttribution_IsIdempotentAndReArmsOnAccountChange(t *te
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
 
-	ensureGrokBillingAttribution(nil)
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	// Our line is still the newest identity in the log: verify, do not write.
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want 1 — the guard appended on an unchanged log", got)
 	}
 
 	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{"user_id": "acct-2"})
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	if got := grokIdentityLineCount(t, base); got != 2 {
 		t.Fatalf("identity lines = %d, want 2 after an account change", got)
 	}
@@ -153,7 +153,7 @@ func TestEnsureGrokBillingAttribution_ReArmsAfterLogRotation(t *testing.T) {
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
 
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	// Grok rotates the log out from under us.
 	if err := os.WriteFile(grokBillingLogPath(base), []byte(`{"msg":"log rotated"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("rotate log: %v", err)
@@ -165,7 +165,7 @@ func TestEnsureGrokBillingAttribution_ReArmsAfterLogRotation(t *testing.T) {
 	// The very next session start notices the rotation and self-heals. There is
 	// no grace window: a direct run inside one would write records nothing in
 	// the log identifies, and those are refused outright.
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want attribution restored on the next session start", got)
 	}
@@ -263,7 +263,7 @@ func TestEnsureGrokBillingAttribution_DoesNotAdoptAnotherAccountsRecord(t *testi
 	t.Setenv("GROK_HOME", base)
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	// A different account's session logs its own identity and fetches billing.
 	helperAppendGrokLogLine(t, base, `{"ts":"2026-08-19T12:01:00Z","msg":"session start","ctx":{"user_id":"acct-9"}}`)
 	helperAppendGrokLogLine(t, base,
@@ -299,7 +299,7 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityDisplacesOurs(t *t
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
 
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want 1", got)
 	}
@@ -314,7 +314,7 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityDisplacesOurs(t *t
 		t.Fatal("acct-1 must not read as the newest identity once acct-2 logged one")
 	}
 
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	if got := grokIdentityLineCount(t, base); got != 3 {
 		t.Fatalf("identity lines = %d, want 3 — the displaced account was not re-attributed", got)
 	}
@@ -341,7 +341,7 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityIsUndecodable(t *t
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
 
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want 1", got)
 	}
@@ -352,7 +352,7 @@ func TestEnsureGrokBillingAttribution_ReArmsWhenANewerIdentityIsUndecodable(t *t
 		t.Fatal("an undecodable newer identity line must not leave acct-1 reading as newest")
 	}
 
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	if got := grokIdentityLineCount(t, base); got != 2 {
 		t.Fatalf("identity lines = %d, want 2 — the corrective append was suppressed", got)
 	}
@@ -648,10 +648,10 @@ func TestEnsureGrokBillingAttribution_WithholdsTheLoginWhenAnAPIKeyOverrideIsAct
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 
 	childEnv := []string{"PATH=/usr/bin", "XAI_API_KEY=xai-credential-sentinel"}
-	if got := grokDirectRunBillingIdentity(childEnv, base); got != grokContestedBillingIdentity {
+	if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{Env: childEnv}, base); got != grokContestedBillingIdentity {
 		t.Fatalf("identity = %q, want the contested sentinel", got)
 	}
-	ensureGrokBillingAttribution(childEnv)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{Env: childEnv})
 
 	// The key's account — not the cached login's — then fetches billing.
 	helperAppendGrokLogLine(t, base,
@@ -690,7 +690,7 @@ func TestGrokDirectRunBillingIdentity_ContestsAPersistedConfigKey(t *testing.T) 
 	helperNoGrokSystemConfigLayers(t)
 	base := helperGrokHomeWithAccount(t, "acct-login")
 
-	if got := grokDirectRunBillingIdentity(nil, base); got != "acct-login" {
+	if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{}, base); got != "acct-login" {
 		t.Fatalf("identity = %q, want the cached login when nothing overrides it", got)
 	}
 
@@ -698,7 +698,7 @@ func TestGrokDirectRunBillingIdentity_ContestsAPersistedConfigKey(t *testing.T) 
 		[]byte("[model.grok-4-fast]\napi_key = \"xai-persisted-sentinel\"\n"), 0o600); err != nil {
 		t.Fatalf("write config.toml: %v", err)
 	}
-	if got := grokDirectRunBillingIdentity(nil, base); got != grokContestedBillingIdentity {
+	if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{}, base); got != grokContestedBillingIdentity {
 		t.Fatalf("identity = %q, want the contested sentinel for a pinned per-model key", got)
 	}
 
@@ -708,7 +708,7 @@ func TestGrokDirectRunBillingIdentity_ContestsAPersistedConfigKey(t *testing.T) 
 		[]byte("[model]\napi_key = \"\"\n"), 0o600); err != nil {
 		t.Fatalf("rewrite config.toml: %v", err)
 	}
-	if got := grokDirectRunBillingIdentity(nil, base); got != "acct-login" {
+	if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{}, base); got != "acct-login" {
 		t.Fatalf("identity = %q, want the cached login for an empty api_key", got)
 	}
 }
@@ -727,7 +727,7 @@ func TestEnsureGrokBillingAttribution_AnArmedOverrideRunContestsAConcurrentRun(t
 	defer release()
 
 	// A second, credential-clean direct run starts for the signed-in account.
-	ensureGrokBillingAttribution(nil)
+	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 
 	raw, err := os.ReadFile(grokBillingLogPath(base))
 	if err != nil {
