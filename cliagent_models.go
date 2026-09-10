@@ -316,6 +316,10 @@ func versionToken(value string) string {
 // codexConfigModelLine matches a top-level `model = "…"` in config.toml.
 var codexConfigModelLine = regexp.MustCompile(`(?m)^\s*model\s*=\s*"([^"]+)"`)
 
+// codexConfigTableHeader matches the first TOML table header (`[profiles.x]`,
+// `[[array]]`), on any line including the first.
+var codexConfigTableHeader = regexp.MustCompile(`(?m)^\s*\[`)
+
 // readCodexConfiguredModel returns the top-level `model` from
 // CODEX_HOME/config.toml, or "" when there is none.
 func readCodexConfiguredModel(home string) string {
@@ -328,10 +332,12 @@ func readCodexConfiguredModel(home string) string {
 		return ""
 	}
 	// Only the top-level table: a `[profiles.x]` section's model is not the
-	// default this machine runs. Stop reading at the first table header.
+	// default this machine runs. Stop reading at the first table header —
+	// including one on the very first line, which a `\n[` search would miss
+	// and so read a profile's model as the default.
 	text := string(raw)
-	if header := strings.Index(text, "\n["); header >= 0 {
-		text = text[:header]
+	if header := codexConfigTableHeader.FindStringIndex(text); header != nil {
+		text = text[:header[0]]
 	}
 	match := codexConfigModelLine.FindStringSubmatch(text)
 	if match == nil {
