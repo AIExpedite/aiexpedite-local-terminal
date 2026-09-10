@@ -844,6 +844,14 @@ func grokDirectBillingPairToPreserve(
 	persistentHome, directIdentity, mergedIdentity string,
 	observedAt time.Time,
 ) ([]byte, bool) {
+	// Same boundary the armed-reader repair honours, for the same reason: the
+	// supersession scan walks PAST a recognized response it cannot decode to an
+	// older record, while the publish path stops dead at it. Preserving that
+	// older record would put it last and publish a reading the reader had
+	// deliberately refused, so the run falls back to the bare marker instead.
+	if grokNewestBillingResponseIsUnusable(persistentHome) {
+		return nil, false
+	}
 	newest, ok := newestTrustedGrokBillingRecordFor(
 		persistentHome, []string{directIdentity}, time.Now().Add(grokBillingMaxClockSkew))
 	if !ok {
@@ -922,7 +930,17 @@ func restoreGrokBillingRecordForArmedReaderLocked(base, identity string) bool {
 		if !ok {
 			return repaired
 		}
-		if published, ok := readGrokBillingSnapshot(base, identities); ok &&
+		published, outcome := readGrokBillingSnapshotOutcome(base, identities)
+		if outcome == grokBillingReadUnusable {
+			// The newest recognized response is one the publish path REFUSES to
+			// render, and that refusal is the point: it supersedes every older
+			// record, ours included. Re-appending an older one under it would
+			// hand the next gather a stale percentage the reader had already
+			// failed closed on. Only a FOREIGN newest record leaves this
+			// account stranded — an undecodable one leaves it correctly blind.
+			return repaired
+		}
+		if outcome == grokBillingReadOK &&
 			!published.ObservedAt.Before(newest.ObservedAt) {
 			// The account already publishes its own newest observation, so
 			// nothing is stranded and no duplicate line is written.
@@ -1212,6 +1230,31 @@ func newestTrustedGrokBillingRecordFor(base string, identities []string, trusted
 	return newest, found
 }
 
+// grokBillingReadOutcome says WHY the publish reader produced no snapshot.
+//
+// The bare boolean was ambiguous at exactly the place it mattered. The repairs
+// that may re-append an OLDER record read the log first, and two of its refusals
+// call for opposite answers: a FOREIGN newest record is the case they exist to
+// fix (the record it displaces is unreadable on this device regardless), while a
+// recognized response the reader cannot render is the fail-closed behaviour
+// itself — appending an older record under it publishes exactly the stale
+// utilization that refusal suppresses.
+type grokBillingReadOutcome int
+
+const (
+	// grokBillingReadOK — a usable, attributable snapshot was returned.
+	grokBillingReadOK grokBillingReadOutcome = iota
+	// grokBillingReadNone — the tail holds no billing record for anyone.
+	grokBillingReadNone
+	// grokBillingReadForeign — the newest usable record belongs to another
+	// account. Nothing about THIS account's records is implied.
+	grokBillingReadForeign
+	// grokBillingReadUnusable — the newest recognized billing response cannot be
+	// decoded or rendered. It is authoritative all the same: it is the provider's
+	// latest answer, so every older record is superseded whoever produced it.
+	grokBillingReadUnusable
+)
+
 // readGrokBillingSnapshot returns the NEWEST billing record in the log tail,
 // provided it can be tied to the CURRENT credentials.
 //
@@ -1225,9 +1268,27 @@ func newestTrustedGrokBillingRecordFor(base string, identities []string, trusted
 // previous account must not be attributed to the one signed in now — see
 // grokRecordBelongsToCurrentAccount for how a record is tied to its producer.
 func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnapshot, bool) {
+	snap, outcome := readGrokBillingSnapshotOutcome(base, identities)
+	return snap, outcome == grokBillingReadOK
+}
+
+// grokNewestBillingResponseIsUnusable reports whether the log's newest
+// recognized billing response is one readGrokBillingSnapshot refuses because it
+// cannot be decoded or rendered — as opposed to one it refuses as foreign.
+//
+// Identity-independent by construction: the reader classifies the line before it
+// ever asks whose it is, so the answer cannot depend on the identities passed.
+func grokNewestBillingResponseIsUnusable(base string) bool {
+	_, outcome := readGrokBillingSnapshotOutcome(base, nil)
+	return outcome == grokBillingReadUnusable
+}
+
+// readGrokBillingSnapshotOutcome is readGrokBillingSnapshot with its refusal
+// reason preserved. Every decision below is the reader's own, unchanged.
+func readGrokBillingSnapshotOutcome(base string, identities []string) (grokBillingSnapshot, grokBillingReadOutcome) {
 	lines, truncatedFirstLine := readGrokBillingLogTailWithOffset(base)
 	if lines == nil {
-		return grokBillingSnapshot{}, false
+		return grokBillingSnapshot{}, grokBillingReadNone
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
@@ -1249,14 +1310,14 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 			if i == 0 && truncatedFirstLine {
 				continue
 			}
-			return grokBillingSnapshot{}, false
+			return grokBillingSnapshot{}, grokBillingReadUnusable
 		}
 		if !grokBillingMessageRecognized(envelope.Msg) {
 			continue
 		}
 		var rec grokBillingRecord
 		if json.Unmarshal(line, &rec) != nil {
-			return grokBillingSnapshot{}, false
+			return grokBillingSnapshot{}, grokBillingReadUnusable
 		}
 		snap, ok := grokBillingSnapshotFromRecord(rec)
 		if !ok {
@@ -1264,16 +1325,16 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 			// even when one of its required fields is unusable. Continuing here
 			// would resurrect a stale pre-upgrade percentage after a malformed or
 			// timestamp-less current response.
-			return grokBillingSnapshot{}, false
+			return grokBillingSnapshot{}, grokBillingReadUnusable
 		}
 		// Stop at the newest usable record either way: an older one is even less
 		// likely to belong to the account signed in now.
 		if !grokRecordBelongsToCurrentAccount(lines, i, identities) {
-			return grokBillingSnapshot{}, false
+			return grokBillingSnapshot{}, grokBillingReadForeign
 		}
-		return snap, true
+		return snap, grokBillingReadOK
 	}
-	return grokBillingSnapshot{}, false
+	return grokBillingSnapshot{}, grokBillingReadNone
 }
 
 // grokRecordBelongsToCurrentAccount reports whether the billing record at

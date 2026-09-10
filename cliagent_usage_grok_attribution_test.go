@@ -858,3 +858,107 @@ func TestReassertGrokDirectAttribution_LeavesTheLogAloneWhileTheMergedAccountRea
 		t.Fatalf("the repair displaced a readable account's newer record:\nbefore=%s\nafter=%s", before, after)
 	}
 }
+
+// grokMalformedBillingLine is a RECOGNIZED billing response the publish reader
+// cannot render — here an unparseable `ts`. It is the provider's newest answer
+// all the same, so readGrokBillingSnapshot fails closed on it rather than
+// reviving an older percentage, and the repairs below must respect that.
+func grokMalformedBillingLine() string {
+	return grokBillingLine("not-a-timestamp", 77, "USAGE_PERIOD_TYPE_WEEKLY",
+		"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z")
+}
+
+// The supersession scan walks PAST a response it cannot decode to an older
+// record; the publish reader stops dead at it. The re-assertion sits between
+// them, so a bare "the reader published nothing" was ambiguous: it is the repair
+// signal for a FOREIGN newest record and a fail-closed refusal for an
+// undecodable one. Re-appending the older record here would put it last and hand
+// the next gather the stale percentage the reader had just refused.
+func TestReassertGrokDirectAttribution_LeavesAMalformedNewestResponseStanding(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-2")
+	t.Setenv("GROK_HOME", base)
+
+	if err := appendGrokBillingIdentityValue(base, "acct-2"); err != nil {
+		t.Fatalf("seed direct identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, base,
+		grokBillingLine("2026-08-19T10:00:00Z", 41, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	if err := appendGrokBillingIdentityValue(base, "acct-2"); err != nil {
+		t.Fatalf("seed identity for the malformed response: %v", err)
+	}
+	helperAppendGrokLogLine(t, base, grokMalformedBillingLine())
+
+	candidates := grokIdentityCandidates(base)
+	if _, ok := readGrokBillingSnapshot(base, candidates); ok {
+		t.Fatal("precondition: the malformed newest response should make the reader fail closed")
+	}
+	if _, ok := newestTrustedGrokBillingRecordFor(
+		base, candidates, time.Now().Add(grokBillingMaxClockSkew)); !ok {
+		t.Fatal("precondition: the supersession scan should still see the older record — the fixture no longer reproduces the defect")
+	}
+
+	before, err := os.ReadFile(grokBillingLogPath(base))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+
+	finish := startGrokBillingAttributionKeeper("acct-2")
+	defer finish()
+	reassertGrokDirectAttribution()
+
+	after, err := os.ReadFile(grokBillingLogPath(base))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("the repair revived a record the newest response had superseded:\nbefore=%s\nafter=%s", before, after)
+	}
+	if _, ok := readGrokBillingSnapshot(base, candidates); ok {
+		t.Fatal("a stale percentage became publishable again after the repair")
+	}
+}
+
+// The merge-time twin of the case above: preserving the armed direct account's
+// own newest record is right when its owner is the one reading here, but not
+// when a recognized response it cannot decode already supersedes it. The run
+// falls back to the bare marker so the NEXT direct record is still attributable.
+func TestGrokDirectBillingPairToPreserve_DeclinesUnderAMalformedNewestResponse(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-2")
+	t.Setenv("GROK_HOME", base)
+
+	if err := appendGrokBillingIdentityValue(base, "acct-2"); err != nil {
+		t.Fatalf("seed direct identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, base,
+		grokBillingLine("2026-08-19T10:00:00Z", 41, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	merged, err := time.Parse(time.RFC3339, "2026-08-19T11:00:00Z")
+	if err != nil {
+		t.Fatalf("parse merged time: %v", err)
+	}
+
+	// Without the malformed response the direct account owns the reader, so its
+	// older record IS preserved — the arm this test then has to see declined.
+	grokBillingAttributionSerialize.Lock()
+	_, ok := grokDirectBillingPairToPreserve(base, "acct-2", "acct-1", merged)
+	grokBillingAttributionSerialize.Unlock()
+	if !ok {
+		t.Fatal("precondition: the reader's own record should be preserved while nothing supersedes it")
+	}
+
+	if err := appendGrokBillingIdentityValue(base, "acct-2"); err != nil {
+		t.Fatalf("seed identity for the malformed response: %v", err)
+	}
+	helperAppendGrokLogLine(t, base, grokMalformedBillingLine())
+
+	grokBillingAttributionSerialize.Lock()
+	_, ok = grokDirectBillingPairToPreserve(base, "acct-2", "acct-1", merged)
+	grokBillingAttributionSerialize.Unlock()
+	if ok {
+		t.Fatal("an older record was preserved over a newest response the reader refuses to render")
+	}
+}
