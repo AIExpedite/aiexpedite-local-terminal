@@ -150,9 +150,9 @@ func TestPersistGrokManagedBillingSnapshot_KeepsATrustedRecordBehindAFutureOne(t
 	if string(before) != string(after) {
 		t.Fatalf("a stale managed receipt rewrote the log:\nbefore=%s\nafter=%s", before, after)
 	}
-	got, ok := newestTrustedGrokBillingObservationFor(persistent,
+	got, ok := newestTrustedGrokBillingRecordFor(persistent,
 		grokIdentityCandidates(persistent), time.Now().Add(grokBillingMaxClockSkew))
-	if !ok || got.UTC().Format(time.RFC3339) != trusted {
+	if !ok || got.ObservedAt.UTC().Format(time.RFC3339) != trusted {
 		t.Fatalf("newest trusted observation = %v ok=%v, want %s", got, ok, trusted)
 	}
 }
@@ -428,9 +428,9 @@ func TestPersistGrokManagedBillingSnapshot_KeepsTheGreatestOutOfOrderObservation
 		grokBillingLine(time.Now().Add(-61*time.Minute).UTC().Format(time.RFC3339), 40,
 			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	got, ok := newestTrustedGrokBillingObservationFor(persistent,
+	got, ok := newestTrustedGrokBillingRecordFor(persistent,
 		grokIdentityCandidates(persistent), time.Now().Add(grokBillingMaxClockSkew))
-	if !ok || got.UTC().Format(time.RFC3339) != newest {
+	if !ok || got.ObservedAt.UTC().Format(time.RFC3339) != newest {
 		t.Fatalf("newest trusted observation = %v ok=%v, want %s — the scan must "+
 			"take the GREATEST attributable time, not the last one appended", got, ok, newest)
 	}

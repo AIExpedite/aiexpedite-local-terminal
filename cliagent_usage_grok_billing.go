@@ -59,6 +59,21 @@ const grokBillingLogMessage = "billing: fetched credits config"
 // banner tuning change silently retune what the capacity bar claims to know.
 const grokBillingObservationTTL = 72 * time.Hour
 
+// grokBillingRaceRepairAttempts bounds how many times a managed merge re-appends
+// a newer record that a concurrent DIRECT run displaced. The direct child is an
+// external writer that never takes our mutex, so the repair is a retry against
+// something we cannot serialize with — one quiet pass settles it, and a child
+// appending faster than we can restore does not need us: its own next record is
+// the newest one anyway.
+const grokBillingRaceRepairAttempts = 3
+
+// grokBillingPreWriteBarrier is the seam where an EXTERNAL writer's append can
+// land: after the supersession scan has taken its file snapshot and before the
+// managed payload is written. A no-op in production — the direct Grok child
+// simply writes whenever it likes — it exists so the repair below can be tested
+// deterministically rather than by racing a goroutine.
+var grokBillingPreWriteBarrier = func() {}
+
 // grokBillingLogMessages is the CLOSED set of `msg` values accepted as a
 // credits-config record. Matching is EXACT — never a `billing:` prefix or
 // substring: the reader fails closed on a newest record it cannot decode, so
@@ -469,6 +484,37 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 		return grokManagedBillingUntrusted, nil
 	}
 
+	payload, err := grokManagedBillingPayload(identity, snap)
+	if err != nil {
+		return grokManagedBillingFailed, err
+	}
+
+	outcome, repairAfterWrite, err := appendGrokBillingPair(persistentHome, payload, identity, identities, snap.ObservedAt)
+	if err != nil {
+		return grokManagedBillingFailed, err
+	}
+	if outcome != grokManagedBillingPersisted && outcome != grokManagedBillingRaced {
+		return outcome, nil
+	}
+
+	if repairAfterWrite {
+		// Outside the write lock — the re-assertion takes it itself. It names
+		// the armed run's CAPTURED account, never the live credentials, so a
+		// concurrent login in the shared home cannot turn the repair into a
+		// misattribution.
+		reassertGrokDirectAttribution()
+	}
+	return outcome, nil
+}
+
+// grokManagedBillingPayload renders one identity + billing line pair for the
+// provider-owned log. Only normalized allowlisted fields are rendered — prompts,
+// credentials, raw config, tool results and unrelated log keys never reach it.
+//
+// Shared by the managed merge and by the race repair below, so a record we
+// re-append to restore timestamp order is byte-identical in shape to the one the
+// merge writes and passes the same reader.
+func grokManagedBillingPayload(identity string, snap grokBillingSnapshot) ([]byte, error) {
 	period := map[string]any{"type": snap.PeriodType}
 	if snap.HasPeriodEnd {
 		period["end"] = snap.PeriodEnd.UTC().Format(time.RFC3339Nano)
@@ -485,7 +531,7 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 	}
 	identityLine, err := grokBillingIdentityLine(identity)
 	if err != nil {
-		return grokManagedBillingFailed, err
+		return nil, err
 	}
 	billingLine, err := json.Marshal(map[string]any{
 		"ts":  snap.ObservedAt.UTC().Format(time.RFC3339Nano),
@@ -496,30 +542,14 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 		},
 	})
 	if err != nil {
-		return grokManagedBillingFailed, err
+		return nil, err
 	}
 	payload := make([]byte, 0, len(identityLine)+len(billingLine)+2)
 	payload = append(payload, identityLine...)
 	payload = append(payload, '\n')
 	payload = append(payload, billingLine...)
 	payload = append(payload, '\n')
-
-	superseded, repairAfterWrite, err := appendGrokBillingPair(persistentHome, payload, identity, identities, snap.ObservedAt)
-	if err != nil {
-		return grokManagedBillingFailed, err
-	}
-	if superseded {
-		return grokManagedBillingSuperseded, nil
-	}
-
-	if repairAfterWrite {
-		// Outside the write lock — the re-assertion takes it itself. It names
-		// the armed run's CAPTURED account, never the live credentials, so a
-		// concurrent login in the shared home cannot turn the repair into a
-		// misattribution.
-		reassertGrokDirectAttribution()
-	}
-	return grokManagedBillingPersisted, nil
+	return payload, nil
 }
 
 // appendGrokBillingPair appends the managed identity/record payload — plus, when
@@ -558,13 +588,22 @@ func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (gro
 // immediately before the write, so no merge of ours can pass it and then be
 // overtaken by another. An equal timestamp is treated as superseded too, which
 // makes re-persisting one session's snapshot idempotent.
+//
+// The supersession check is a READ of a file an EXTERNAL writer also appends to:
+// a same-account direct Grok child never takes this mutex, so holding it does not
+// make the scan-and-append atomic with the writer that matters. A direct record
+// that lands between the scan and the write leaves our older receipt last, and
+// readGrokBillingSnapshot publishes by FILE ORDER — the stale reading the guard
+// exists to prevent, arriving through the one door the guard cannot close. So the
+// decision is re-tested AFTER the write (restoreGrokBillingRecordDisplacedByRace)
+// and a displaced newer record is put back on top.
 func appendGrokBillingPair(
 	persistentHome string,
 	payload []byte,
 	identity string,
 	identities []string,
 	observedAt time.Time,
-) (superseded bool, repairAfterWrite bool, err error) {
+) (outcome grokManagedBillingOutcome, repairAfterWrite bool, err error) {
 	grokBillingAttributionSerialize.Lock()
 	defer grokBillingAttributionSerialize.Unlock()
 
@@ -594,11 +633,38 @@ func appendGrokBillingPair(
 	// untrusted record inside the scan keeps looking for the newest record this
 	// account has that we would also be willing to publish.
 	trustedThrough := time.Now().Add(grokBillingMaxClockSkew)
-	if existing, ok := newestTrustedGrokBillingObservationFor(persistentHome, identities, trustedThrough); ok &&
-		!existing.Before(observedAt) {
-		return true, false, nil
+	if existing, ok := newestTrustedGrokBillingRecordFor(persistentHome, identities, trustedThrough); ok &&
+		!existing.ObservedAt.Before(observedAt) {
+		return grokManagedBillingSuperseded, false, nil
 	}
 
+	payload, repairAfterWrite = grokBillingPayloadWithDirectMarker(payload, identity)
+	grokBillingPreWriteBarrier()
+	if err := writeGrokBillingPayload(persistentHome, payload); err != nil {
+		return grokManagedBillingFailed, repairAfterWrite, err
+	}
+
+	raced, err := restoreGrokBillingRecordDisplacedByRace(persistentHome, identity, identities)
+	if err != nil {
+		return grokManagedBillingFailed, repairAfterWrite, err
+	}
+	if raced {
+		return grokManagedBillingRaced, repairAfterWrite, nil
+	}
+	return grokManagedBillingPersisted, repairAfterWrite, nil
+}
+
+// grokBillingPayloadWithDirectMarker appends the armed direct run's identity
+// after the caller's pair so a still-live direct child keeps writing records that
+// bind to ITS account rather than to the managed one we just named.
+//
+// Callers must hold grokBillingAttributionSerialize: the armed CHECK and the
+// payload it produces are taken UNDER the lock, not before it (see the ordering
+// argument on appendGrokBillingPair).
+//
+// Returns repairAfterWrite when the marker could not be rendered and the caller
+// must fall back to a post-write ensureGrokBillingAttribution.
+func grokBillingPayloadWithDirectMarker(payload []byte, identity string) ([]byte, bool) {
 	directIdentity, armed := grokDirectAttributionAssertion()
 	switch {
 	case !armed:
@@ -614,14 +680,66 @@ func appendGrokBillingPair(
 		if lineErr != nil {
 			// Fall back to the post-write repair rather than dropping the
 			// merge: a narrowed window beats an unattributed direct run.
-			repairAfterWrite = true
-			break
+			return payload, true
 		}
 		payload = append(payload, directLine...)
 		payload = append(payload, '\n')
 	}
+	return payload, false
+}
 
-	return false, repairAfterWrite, writeGrokBillingPayload(persistentHome, payload)
+// restoreGrokBillingRecordDisplacedByRace re-appends this account's newest
+// trusted observation when the record that would now be PUBLISHED is older than
+// one the log already holds.
+//
+// The supersession guard reads the log; a same-account direct Grok child appends
+// to it without ever taking our mutex. A record it writes between that read and
+// our O_APPEND is invisible to the guard, and because readGrokBillingSnapshot
+// takes the last billing line by FILE ORDER rather than by timestamp, our older
+// receipt then becomes the published one — exactly the stale reading the guard
+// exists to prevent. The window is small but it is a real external writer, so it
+// is closed after the fact instead of pretended away.
+//
+// The test is deliberately the PUBLISH reader against the supersession reader,
+// not a byte-offset comparison: it asks the only question that matters ("is the
+// record we would show older than one we hold?"), so it is false when the racer
+// landed AFTER our write and is already last — no duplicate line is written for
+// a race that did no harm — and it stays correct on every platform without
+// relying on the file offset an O_APPEND write leaves behind.
+//
+// Nothing is written when the publish reader declines (a foreign or undecodable
+// newest record). That is a cross-account boundary, not a displacement: putting
+// our record on top of another account's newest line would republish OUR usage
+// over theirs, which is worse than the staleness this repairs.
+//
+// Callers must hold grokBillingAttributionSerialize.
+func restoreGrokBillingRecordDisplacedByRace(persistentHome, identity string, identities []string) (bool, error) {
+	repaired := false
+	// Bounded: each pass re-appends the newest record it can see, so a quiet log
+	// settles on the first. A child appending faster than we can restore is not
+	// a loop worth spinning in — its own next record is the newest anyway, and
+	// the following gather reads it.
+	for attempt := 0; attempt < grokBillingRaceRepairAttempts; attempt++ {
+		published, publishedOK := readGrokBillingSnapshot(persistentHome, identities)
+		if !publishedOK {
+			return repaired, nil
+		}
+		newest, newestOK := newestTrustedGrokBillingRecordFor(
+			persistentHome, identities, time.Now().Add(grokBillingMaxClockSkew))
+		if !newestOK || !published.ObservedAt.Before(newest.ObservedAt) {
+			return repaired, nil
+		}
+		payload, err := grokManagedBillingPayload(identity, newest)
+		if err != nil {
+			return repaired, err
+		}
+		payload, _ = grokBillingPayloadWithDirectMarker(payload, identity)
+		if err := writeGrokBillingPayload(persistentHome, payload); err != nil {
+			return repaired, err
+		}
+		repaired = true
+	}
+	return repaired, nil
 }
 
 // writeGrokBillingPayload writes the caller's whole payload in one O_APPEND call.
@@ -672,6 +790,14 @@ const (
 	grokManagedBillingUntrusted
 	// grokManagedBillingPersisted — one normalized record was merged.
 	grokManagedBillingPersisted
+	// grokManagedBillingRaced — the record was merged, but a same-account direct
+	// run appended a NEWER one between the supersession scan and the write, so
+	// ours landed last and would have been published as the current reading.
+	// The newer record was re-appended to restore timestamp order. Named
+	// separately from "persisted" because a device seeing this repeatedly is
+	// telling us a direct run and a managed session are competing for the same
+	// log, which is worth reading in the agent output.
+	grokManagedBillingRaced
 	// grokManagedBillingFailed — the merge was attempted and errored.
 	grokManagedBillingFailed
 )
@@ -690,6 +816,8 @@ func (o grokManagedBillingOutcome) String() string {
 		return "untrusted-timestamp"
 	case grokManagedBillingPersisted:
 		return "persisted"
+	case grokManagedBillingRaced:
+		return "persisted-after-race-repair"
 	case grokManagedBillingFailed:
 		return "failed"
 	}
@@ -742,9 +870,10 @@ func readGrokBillingLogTailWithOffset(base string) (lines [][]byte, truncatedFir
 	return bytes.Split(tail, []byte("\n")), offset > 0
 }
 
-// newestTrustedGrokBillingObservationFor returns the observation time of the
-// newest billing record in the log tail that belongs to `identities` and is not
-// dated after `trustedThrough`, ignoring records produced by any other account.
+// newestTrustedGrokBillingRecordFor returns the newest billing OBSERVATION (the
+// whole normalized snapshot, so the race repair can re-append it) in the log
+// tail that belongs to `identities` and is not dated after `trustedThrough`,
+// ignoring records produced by any other account.
 //
 // It is the supersession guard's reader, deliberately separate from
 // readGrokBillingSnapshot. That one is the PUBLISH path: it stops at the newest
@@ -774,12 +903,12 @@ func readGrokBillingLogTailWithOffset(base string) (lines [][]byte, truncatedFir
 // older time and let a merge append over the newer observation this guard exists
 // to protect. The scan already walked the whole tail whenever nothing was
 // attributable, so always finishing it adds no new worst case.
-func newestTrustedGrokBillingObservationFor(base string, identities []string, trustedThrough time.Time) (time.Time, bool) {
+func newestTrustedGrokBillingRecordFor(base string, identities []string, trustedThrough time.Time) (grokBillingSnapshot, bool) {
 	lines, _ := readGrokBillingLogTailWithOffset(base)
 	if lines == nil {
-		return time.Time{}, false
+		return grokBillingSnapshot{}, false
 	}
-	var newest time.Time
+	var newest grokBillingSnapshot
 	found := false
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
@@ -806,8 +935,8 @@ func newestTrustedGrokBillingObservationFor(base string, identities []string, tr
 		if !grokRecordBelongsToCurrentAccount(lines, i, identities) {
 			continue
 		}
-		if !found || snap.ObservedAt.After(newest) {
-			newest = snap.ObservedAt
+		if !found || snap.ObservedAt.After(newest.ObservedAt) {
+			newest = snap
 			found = true
 		}
 	}
