@@ -1559,7 +1559,38 @@ func startManagedClaudeSession(t *testing.T, mode string) (*SessionManager, stri
 	if startErr != nil {
 		t.Fatalf("StartSession: %v", startErr)
 	}
+	// Registered FIRST, so LIFO cleanup runs it AFTER each test's own
+	// EndSession and BEFORE armClaudeUsageProbe's resetClaudeUsageProbeGate:
+	// end the run, wait for its exit path to finish, then clear the gate.
+	t.Cleanup(func() {
+		_ = sm.EndSession(id)
+		waitForManagedSessionDrained(t, sm, id)
+	})
 	return sm, id
+}
+
+// waitForManagedSessionDrained blocks until waitForExit has run to completion
+// for id. Removal from the manager is its LAST act — after the post-run
+// utilization trigger — so an absent session proves nothing further can be
+// recorded for this run.
+//
+// The barrier is load-bearing, not tidiness. A run killed mid-turn
+// (`claude-heartbeat-hang`) leaves turnSettled false, so its exit path calls
+// triggerClaudeUsageProbeAfterRun — and that path first waits out the stream
+// drain, up to sessionStreamDrainTimeout when a scanner is slow to reach EOF on
+// a loaded Windows runner. Without this wait the trigger lands inside a LATER
+// test, which sees a debt recorded after its own turn was already reported and
+// fails as `a trailing trigger recorded a new debt` — the flake this fixes.
+func waitForManagedSessionDrained(t *testing.T, sm *SessionManager, id string) {
+	t.Helper()
+	deadline := time.Now().Add(sessionStreamDrainTimeout + 30*time.Second)
+	for time.Now().Before(deadline) {
+		if sm.GetSession(id) == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("managed session %s never drained — its exit path can still record a post-run debt inside a later test", id)
 }
 
 // Terminal-managed run: session start → heartbeat lines → terminal `result`
