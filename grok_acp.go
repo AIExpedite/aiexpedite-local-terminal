@@ -1548,16 +1548,6 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 	// pinned credential, which is exactly the misattribution this sweep exists
 	// to prevent.
 	var openMultiline string
-	// openComposite is the unclosed bracket depth of a value that runs past its
-	// own line — a multi-line array, or an array of inline tables. Those
-	// continuation lines are VALUE BODY, not configuration, and a body line like
-	// `[1, 2]` satisfies the section-header test below exactly: it re-scoped
-	// every following assignment under a table that does not exist, so a root
-	// `model.api_key` read as `1,2.model.api_key` and the attribution guard saw
-	// no pinned credential for a run grok's own parser bills by API key. Depth
-	// is counted quote-aware by grokTOMLBracketDepth, so a `"Bash[*]"` literal
-	// inside the array cannot unbalance it.
-	openComposite := 0
 	for scanner.Scan() {
 		raw := scanner.Text()
 		if openMultiline != "" {
@@ -1565,13 +1555,6 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 				// TOML permits nothing but a comment after a closing
 				// delimiter, so the rest of this line carries no assignment.
 				openMultiline = ""
-			}
-			continue
-		}
-		if openComposite > 0 {
-			openComposite += grokTOMLBracketDepth(grokTOMLStripInlineComment(strings.TrimSpace(raw)))
-			if openComposite < 0 {
-				openComposite = 0
 			}
 			continue
 		}
@@ -1603,12 +1586,38 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 		value := strings.TrimSpace(line[eq+1:])
 		openMultiline = grokTOMLMultilineOpener(value)
 		if openMultiline == "" {
-			// Only when the value is not itself an open multiline STRING: that
-			// body is skipped verbatim, and counting brackets inside its text
-			// would leave a phantom composite open for the rest of the file.
-			openComposite = grokTOMLBracketDepth(value)
-			if openComposite < 0 {
-				openComposite = 0
+			// A COMPOSITE value (a multi-line array, or an array of inline
+			// tables) is READ, not skipped. Its continuation lines are value
+			// body, so the sweep must not read them as configuration — a body
+			// line like `[1, 2]` satisfies the section-header test above
+			// exactly — but skipping them also hid every credential written
+			// inside one: a documented `version_overrides = [\n { model = {
+			// api_key = "..." } }\n]` patch is applied by grok's own parser
+			// before it bills, while this sweep reported no pinned credential
+			// and named the cached login. Joining the body into one logical
+			// value keeps the section tracking correct AND lets the callers'
+			// inline-table descent see what is in there.
+			//
+			// A composite can OPEN a multiline string on its own first line
+			// (`tools = [ """`), which grokTOMLMultilineOpener does not see
+			// because the value does not START with the delimiter. Both states
+			// come out of the same scan so the accumulation inherits them.
+			depth, running := grokTOMLCompositeLineDepth(value, "")
+			switch {
+			case depth > 0:
+				joined, ok := accumulateGrokTOMLCompositeValue(scanner, value, depth, running)
+				if !ok {
+					// An unterminated or oversized composite is a scan this
+					// process could not finish over content the child's parser
+					// still loads — the incomplete case callers fail closed on.
+					return false
+				}
+				value = joined
+			case running != "":
+				// A string body opened without any bracket to close: nothing
+				// left on this line is configuration, so it is skipped like any
+				// other multiline value.
+				openMultiline = running
 			}
 		}
 		if !visit(key, value) {
@@ -1619,10 +1628,11 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 	}
 	// A line longer than the scanner's buffer, or a read error, ends the sweep
 	// with content still unread; so does hitting the tail bound. So does a
-	// multiline string — or a composite value — that never closes: everything
-	// after its opener was skipped as body, so an assignment the child's parser
-	// still applies may sit in the part this sweep never classified.
-	return scanner.Err() == nil && counted.n <= maxBytes && openMultiline == "" && openComposite == 0
+	// multiline string that never closes: everything after its opener was
+	// skipped as body, so an assignment the child's parser still applies may sit
+	// in the part this sweep never classified. An unterminated COMPOSITE value
+	// returns false from the accumulation above, at the point it gives up.
+	return scanner.Err() == nil && counted.n <= maxBytes && openMultiline == ""
 }
 
 // countingReader counts the bytes it has handed on, so walkGrokTOMLAssignments
@@ -1853,13 +1863,69 @@ func grokConfigPinsCredential(path string) bool {
 			found = true
 			return false
 		}
-		if grokModelScopedTOMLKey(key) && grokInlineTablePinsCredential(value) {
+		if grokTOMLKeyNamesExternalAuthProvider(key) {
+			// Not a key we could read, but a key the child authenticates with
+			// INSTEAD of the cached login. classifyGrokSystemSemanticValue
+			// already refuses these layers as external providers; the
+			// attribution guard has to agree, or a run billed through an OIDC
+			// or `auth_provider_command` account is published under the cached
+			// subscription. A multiline opener reads as empty here and is
+			// contested for the same reason the credential arm contests it.
+			if grokTOMLValueOpensMultiline(value) || strings.TrimSpace(strings.Trim(value, `"'`)) != "" {
+				found = true
+				return false
+			}
+			return true
+		}
+		if (grokModelScopedTOMLKey(key) || grokVersionOverrideTOMLKey(key)) &&
+			grokInlineTablePinsCredential(value) {
 			found = true
 			return false
 		}
 		return true
 	})
 	return found || !complete
+}
+
+// grokVersionOverrideTOMLKey reports whether a dotted key names Grok's
+// documented `version_overrides` array of version-selected config patches.
+//
+// Those patches carry ordinary config keys — including `model = { api_key =
+// "..." }` — and effectiveGrokSystemConfigForVersion merges them into the
+// effective config BEFORE anything classifies it, so a credential written there
+// is a credential the child bills with. The walk only ever exposes the OUTER
+// `version_overrides` assignment, which is not model-scoped, so without this the
+// descent below never looked inside and the run was attributed to the cached
+// login.
+//
+// Applicability is deliberately NOT resolved here: which entries apply depends
+// on the child's own version, and this guard is conservative by construction —
+// over-reporting costs one session's observability, under-reporting publishes
+// one account's spend as another's.
+func grokVersionOverrideTOMLKey(key string) bool {
+	segments := strings.Split(key, ".")
+	return segments[len(segments)-1] == "version_overrides"
+}
+
+// grokTOMLKeyNamesExternalAuthProvider reports whether a dotted key names one of
+// the settings that make a Grok child authenticate through a provider of its
+// own rather than the cached `$GROK_HOME` login. Kept to the same shapes
+// classifyGrokSystemSemanticValue treats as external providers
+// (`auth_provider_command`, and the `[auth.oidc]` issuer/client pair), so the
+// semantic classifier and the billing-attribution guard cannot disagree about
+// which layers take the child off the cached account.
+func grokTOMLKeyNamesExternalAuthProvider(key string) bool {
+	segments := strings.Split(key, ".")
+	last := segments[len(segments)-1]
+	if last == "auth_provider_command" {
+		return true
+	}
+	if last != "issuer" && last != "client_id" {
+		return false
+	}
+	return len(segments) >= 3 &&
+		segments[len(segments)-2] == "oidc" &&
+		segments[len(segments)-3] == "auth"
 }
 
 // grokModelScopedTOMLKey reports whether a dotted key from
@@ -1897,6 +1963,19 @@ func grokInlineTablePinsCredentialAt(value string, depth int) bool {
 		return true
 	}
 	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		// An ARRAY of inline tables is the documented shape of
+		// `version_overrides`, and a `[model] grok-4 = [{ api_key = ... }]` is
+		// valid TOML too. Its elements are descended into with the same
+		// quote/nesting-aware splitter; an array of plain scalars simply has no
+		// element that is an inline table and reports false.
+		for _, element := range splitGrokInlineTableFields(value[1 : len(value)-1]) {
+			if grokInlineTablePinsCredentialAt(element, depth+1) {
+				return true
+			}
+		}
+		return false
+	}
 	if !strings.HasPrefix(value, "{") || !strings.HasSuffix(value, "}") {
 		return false
 	}
@@ -2977,6 +3056,123 @@ func grokTOMLBracketDepth(s string) int {
 		}
 	}
 	return depth
+}
+
+// grokTOMLCompositeLineDepth counts the net bracket depth one line contributes
+// to a composite value (a multi-line array, or an array of inline tables) while
+// carrying multiline STRING state across lines, and returns the delimiter of a
+// string body still running at the end of the line ("" when none is).
+//
+// grokTOMLBracketDepth alone is not enough for a composite BODY. A multiline
+// string nested inside an array is valid TOML, and its body is text: a `]` in it
+// is not the array's close, and a following section-shaped line like `[other]`
+// is not a table. Counting the string's `]` ended the composite early, so that
+// body line re-scoped every FOLLOWING assignment — a root `model.api_key` read
+// as `other.model.api_key`, which the attribution guard sees as no pinned
+// credential for a run grok's own parser bills by API key.
+//
+// `openMultiline` is the delimiter already running when the line starts; the
+// scan resumes after its close and only then reads the rest of the line as
+// value syntax.
+func grokTOMLCompositeLineDepth(s, openMultiline string) (int, string) {
+	i := 0
+	if openMultiline != "" {
+		idx := strings.Index(s, openMultiline)
+		if idx < 0 {
+			// The whole line is still string body.
+			return 0, openMultiline
+		}
+		i = idx + len(openMultiline)
+		openMultiline = ""
+	}
+	depth := 0
+	inDouble := false
+	inSingle := false
+	for ; i < len(s); i++ {
+		c := s[i]
+		if inDouble {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			delim := strings.Repeat(string(c), 3)
+			if strings.HasPrefix(s[i:], delim) {
+				rest := s[i+len(delim):]
+				closed := strings.Index(rest, delim)
+				if closed < 0 {
+					// Everything after this opener is body, on this line and
+					// on the ones that follow.
+					return depth, delim
+				}
+				// Resume at the first byte after the closing delimiter; the
+				// loop's own i++ carries it there.
+				i += len(delim) + closed + len(delim) - 1
+				continue
+			}
+			if c == '"' {
+				inDouble = true
+			} else {
+				inSingle = true
+			}
+		case '[':
+			depth++
+		case ']':
+			depth--
+		}
+	}
+	return depth, ""
+}
+
+// grokTOMLCompositeMaxContinuationLines bounds how far walkGrokTOMLAssignments
+// will follow one composite value. Generous for anything a human writes, finite
+// so a corrupted file with no closing `]` cannot make one assignment consume the
+// whole scan. Past the bound the sweep reports INCOMPLETE rather than resuming
+// mid-body, because resuming would read value body as configuration — the
+// re-scoping bug this accumulation exists to avoid.
+const grokTOMLCompositeMaxContinuationLines = 256
+
+// accumulateGrokTOMLCompositeValue joins the continuation lines of a composite
+// value into one logical right-hand side, carrying both the bracket depth and
+// any multiline STRING body across lines. Reports false when the value neither
+// closes within grokTOMLCompositeMaxContinuationLines nor before EOF.
+func accumulateGrokTOMLCompositeValue(
+	scanner *bufio.Scanner,
+	initial string,
+	depth int,
+	openMultiline string,
+) (string, bool) {
+	parts := []string{initial}
+	for i := 0; i < grokTOMLCompositeMaxContinuationLines && scanner.Scan(); i++ {
+		raw := scanner.Text()
+		line := raw
+		if openMultiline == "" {
+			// Comments are stripped only OUTSIDE a string body: inside one a
+			// `#` is content, and truncating there could hide the closing
+			// delimiter and leave the rest of the file read as configuration.
+			line = grokTOMLStripInlineComment(strings.TrimSpace(raw))
+		}
+		var delta int
+		delta, openMultiline = grokTOMLCompositeLineDepth(line, openMultiline)
+		depth += delta
+		parts = append(parts, line)
+		if depth <= 0 && openMultiline == "" {
+			return strings.Join(parts, " "), true
+		}
+	}
+	return "", false
 }
 
 // accumulateGrokTOMLArrayContinuation reads continuation lines from scanner

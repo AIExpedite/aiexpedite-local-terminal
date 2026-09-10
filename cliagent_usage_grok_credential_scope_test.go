@@ -1076,3 +1076,135 @@ func TestGrokDirectRunBillingIdentity_ContestsWhenTheProjectWalkHitsItsDepthCap(
 		t.Fatalf("identity = %q, want the cached login for a walk that reaches the root", got)
 	}
 }
+
+// A multiline STRING nested inside a composite value is body twice over. Its
+// `]` is not the array's close and the `[other]` line under it is not a table,
+// but composite mode tracked only bracket depth: the string's `]` ended the
+// array early, `[other]` was read as a real section, and the root credential
+// after it was classified as `other.model.api_key` — no pinned credential for a
+// run grok's own parser bills by API key.
+func TestGrokConfigPinsCredential_TracksMultilineStringsInsideCompositeValues(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `notes = [
+  """
+  closing bracket in prose ]
+  [other]
+  """,
+]
+[model]
+api_key = "xai-composite-multiline-sentinel"
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	keys := map[string]string{}
+	if complete := walkGrokTOMLAssignments(path, func(key, value string) bool {
+		keys[key] = value
+		return true
+	}); !complete {
+		t.Fatal("sweep reported incomplete for a composite whose nested multiline string closes")
+	}
+	if _, ok := keys["model.api_key"]; !ok {
+		t.Fatalf("keys = %v, want model.api_key — a section line inside a nested "+
+			"multiline string re-scoped the credential that follows it", keys)
+	}
+	for key := range keys {
+		if strings.HasPrefix(key, "other.") {
+			t.Fatalf("key %q was scoped under a section header that lives inside string body", key)
+		}
+	}
+	if !grokConfigPinsCredential(path) {
+		t.Fatal("pinned credential missed behind a multiline string nested in a composite value")
+	}
+}
+
+// Grok applies `version_overrides` patches to the effective config before
+// anything classifies it (effectiveGrokSystemConfigForVersion), so a credential
+// written inside one is a credential the child bills with. The sweep only ever
+// exposes the OUTER assignment, which is not model-scoped, so the descent has to
+// be keyed on the override array itself — in both the single-line and the
+// hand-formatted multi-line spelling operators actually write.
+func TestGrokConfigPinsCredential_InspectsCredentialsInVersionOverrides(t *testing.T) {
+	cases := map[string]struct {
+		body string
+		want bool
+	}{
+		"inline override pins a key": {
+			body: `version_overrides = [{ minimum_version = "1.0.0", maximum_version = "2.0.0", ` +
+				`model = { api_key = "xai-version-override-sentinel" } }]` + "\n",
+			want: true,
+		},
+		"multi-line override pins a key": {
+			body: `version_overrides = [
+  { minimum_version = "1.0.0", maximum_version = "2.0.0",
+    model = { api_key = "xai-version-override-sentinel" } },
+]
+`,
+			want: true,
+		},
+		"override without a credential is not contested": {
+			body: `version_overrides = [
+  { minimum_version = "1.0.0", maximum_version = "2.0.0", compat = { cursor = { mcps = false } } },
+]
+`,
+			want: false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if got := grokConfigPinsCredential(path); got != tc.want {
+				t.Fatalf("grokConfigPinsCredential = %v, want %v for:\n%s", got, tc.want, tc.body)
+			}
+		})
+	}
+}
+
+// An alternate auth provider takes the child OFF the cached login entirely, so
+// it contests attribution for the same reason a pinned api_key does — the
+// account that gets billed is not the one grokResolvedBillingIdentity names.
+// classifyGrokSystemSemanticValue already refuses these layers; the two must
+// agree about which settings count.
+func TestGrokConfigPinsCredential_ContestsAlternateAuthProviders(t *testing.T) {
+	cases := map[string]struct {
+		body string
+		want bool
+	}{
+		"auth provider command": {
+			body: "[auth]\nauth_provider_command = \"/usr/local/bin/mint-token\"\n",
+			want: true,
+		},
+		"oidc issuer": {
+			body: "[auth.oidc]\nissuer = \"https://idp.example.invalid\"\n",
+			want: true,
+		},
+		"oidc client id": {
+			body: "[auth.oidc]\nclient_id = \"grok-enterprise\"\n",
+			want: true,
+		},
+		"empty provider command is not a provider": {
+			body: "[auth]\nauth_provider_command = \"\"\n",
+			want: false,
+		},
+		"an unrelated issuer is not an auth provider": {
+			body: "[telemetry.oidc]\nissuer = \"https://idp.example.invalid\"\n",
+			want: false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if got := grokConfigPinsCredential(path); got != tc.want {
+				t.Fatalf("grokConfigPinsCredential = %v, want %v for:\n%s", got, tc.want, tc.body)
+			}
+		})
+	}
+}

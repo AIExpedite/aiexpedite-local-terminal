@@ -648,10 +648,81 @@ func appendGrokBillingPair(
 	if err != nil {
 		return grokManagedBillingFailed, repairAfterWrite, err
 	}
-	if raced {
+
+	directRaced, err := restoreArmedDirectBillingRecordDisplacedByRace(persistentHome, identity, identities)
+	if err != nil {
+		return grokManagedBillingFailed, repairAfterWrite, err
+	}
+
+	if raced || directRaced {
 		return grokManagedBillingRaced, repairAfterWrite, nil
 	}
 	return grokManagedBillingPersisted, repairAfterWrite, nil
+}
+
+// restoreArmedDirectBillingRecordDisplacedByRace is the armed DIRECT account's
+// half of the post-write repair, and it exists for the same reason its managed
+// twin does: grokDirectBillingPairToPreserve is a scan taken BEFORE the write,
+// against a writer that never takes our mutex.
+//
+// When the direct child lands its newest record in the gap between that scan and
+// writeGrokBillingPayload, our payload settles on top of it carrying either a
+// bare direct marker or a preserved but now-OLDER direct pair. Neither leaves the
+// direct account readable: a trailing marker cannot authenticate the record above
+// it, so the direct account's next gather stops at OUR managed record, refuses it
+// as foreign and publishes nothing — and a preserved older pair publishes a stale
+// reading instead. restoreGrokBillingRecordDisplacedByRace cannot see any of this
+// because it scans only the MANAGED account's identities.
+//
+// The tiebreak is the same one grokBillingPayloadWithDirectMarker already
+// applies: the genuinely NEWEST trusted observation is the one that gets to be
+// last, whichever account produced it. A direct record no newer than the managed
+// record we just wrote is left exactly where it is, because the reader publishes
+// by FILE ORDER and moving it last would republish a stale reading.
+//
+// Writes nothing in the common case: when the merge already left the direct
+// account's newest record readable, the publish reader confirms it and this pass
+// is a read. Callers must hold grokBillingAttributionSerialize.
+func restoreArmedDirectBillingRecordDisplacedByRace(
+	persistentHome, identity string,
+	identities []string,
+) (bool, error) {
+	directIdentity, armed := grokDirectAttributionAssertion()
+	if !armed || strings.EqualFold(directIdentity, identity) {
+		// No live direct run, or the pair we wrote already names it — the
+		// managed repair above covers that account on its own.
+		return false, nil
+	}
+	directIdentities := []string{directIdentity}
+	trustedThrough := time.Now().Add(grokBillingMaxClockSkew)
+
+	newest, found := newestTrustedGrokBillingRecordFor(persistentHome, directIdentities, trustedThrough)
+	if !found {
+		return false, nil
+	}
+	if published, ok := readGrokBillingSnapshot(persistentHome, directIdentities); ok &&
+		!published.ObservedAt.Before(newest.ObservedAt) {
+		// The direct account already publishes its own newest observation, so
+		// the race — if there was one — did no harm and no duplicate line is
+		// written for it.
+		return false, nil
+	}
+
+	// Compared against the managed account's newest TRUSTED record rather than
+	// the snapshot we set out to merge: the repair above may have re-appended a
+	// newer managed record since, and displacing that one would undo it.
+	var managedObservedAt time.Time
+	if managedNewest, ok := newestTrustedGrokBillingRecordFor(persistentHome, identities, trustedThrough); ok {
+		managedObservedAt = managedNewest.ObservedAt
+	}
+	pair, ok := grokDirectBillingPairToPreserve(persistentHome, directIdentity, managedObservedAt)
+	if !ok {
+		return false, nil
+	}
+	if err := writeGrokBillingPayload(persistentHome, pair); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // grokBillingPayloadWithDirectMarker appends the armed direct run's identity

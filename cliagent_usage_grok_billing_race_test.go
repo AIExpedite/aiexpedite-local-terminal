@@ -336,3 +336,103 @@ func TestPersistGrokManagedBillingSnapshot_DoesNotPromoteAnOlderDirectRecord(t *
 			"duplicated it into a provider-owned log", got)
 	}
 }
+
+// The regression codex found after the preservation fix landed: the scan that
+// decides what to carry forward for an armed DIRECT account is taken BEFORE the
+// write, against a child that never takes our mutex. When account B lands its
+// newest record inside that window, the merge carries only B's trailing marker —
+// which cannot authenticate a record ABOVE it — and account A's older record
+// ends up last. B's gather then stops at A's record, refuses it as foreign, and
+// publishes nothing, while restoreGrokBillingRecordDisplacedByRace cannot see
+// any of it because it scans only A's identities.
+func TestPersistGrokManagedBillingSnapshot_RestoresAnArmedDirectRecordRacedAfterThePreserveScan(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+
+	// A live direct run on account B that has NOT fetched credits yet, so the
+	// pre-write preservation scan finds nothing to carry forward.
+	finish := startGrokBillingAttributionKeeper("acct-2")
+	defer finish()
+	helperAppendGrokLogLine(t, persistent,
+		`{"ts":"2026-08-19T12:00:00Z","msg":"session start","ctx":{"user_id":"acct-2"}}`)
+
+	// The managed account-A session exits carrying an older receipt.
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine(time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339), 12,
+			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	// B fetches inside the scan/write window.
+	raced := time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
+	helperGrokRaceBarrier(t, func() {
+		helperAppendGrokLogLine(t, persistent,
+			grokBillingLine(raced, 77, "USAGE_PERIOD_TYPE_WEEKLY",
+				"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	})
+
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if outcome != grokManagedBillingRaced {
+		t.Fatalf("outcome = %s, want %s — a displaced direct record must be reported, "+
+			"not read as a clean merge", outcome, grokManagedBillingRaced)
+	}
+
+	published, ok := readGrokBillingSnapshot(persistent, []string{"acct-2"})
+	if !ok {
+		t.Fatal("the armed direct account cannot read the record it wrote mid-merge: " +
+			"the managed pair landed on top of it and only a trailing marker followed")
+	}
+	if published.UsedPercent != 77 {
+		t.Fatalf("published percent = %v, want 77", published.UsedPercent)
+	}
+	if published.ObservedAt.UTC().Format(time.RFC3339) != raced {
+		t.Fatalf("published observation = %s, want the raced %s",
+			published.ObservedAt.UTC().Format(time.RFC3339), raced)
+	}
+}
+
+// The post-write direct repair must stay a READ in the ordinary case. A merge
+// that overlaps a direct run whose record is already readable — the preserved
+// pair the pre-write scan carried forward — must not append that record a second
+// time into a provider-owned log on every managed exit.
+func TestPersistGrokManagedBillingSnapshot_DirectRepairWritesNothingWhenNothingWasDisplaced(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+
+	finish := startGrokBillingAttributionKeeper("acct-2")
+	defer finish()
+	helperAppendGrokLogLine(t, persistent,
+		`{"ts":"2026-08-19T12:00:00Z","msg":"session start","ctx":{"user_id":"acct-2"}}`)
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine(time.Now().Add(-1*time.Minute).UTC().Format(time.RFC3339), 77,
+			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine(time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339), 12,
+			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	raw, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read persistent log: %v", err)
+	}
+	// Once as the child's own line, once as the pair the merge carried forward.
+	if got := strings.Count(string(raw), `"creditUsagePercent":77`); got != 2 {
+		t.Fatalf("the direct account's record appears %d times, want 2 — the "+
+			"post-write repair re-appended a record that was never displaced", got)
+	}
+}
