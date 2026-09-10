@@ -1566,8 +1566,24 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") && !strings.HasPrefix(line, "[[") {
-			currentSection = strings.Join(splitGrokTOMLKeyPath(line[1:len(line)-1]), ".")
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			// An ARRAY-OF-TABLES header (`[[version_overrides]]`) opens a
+			// section exactly as `[name]` does. Skipping it left the entry's
+			// keys attributed to the PREVIOUS table, which both invented a
+			// prefix that is not in the file and hid the documented
+			// `[[version_overrides]]` + `[version_overrides.model]` spelling of
+			// a pinned credential — effectiveGrokSystemConfigForVersion applies
+			// that patch, so the child bills the API-key account while
+			// attribution named the cached login.
+			body := line[1 : len(line)-1]
+			if strings.HasPrefix(line, "[[") {
+				if !strings.HasSuffix(line, "]]") {
+					// Not a header at all; nothing here to scope by.
+					continue
+				}
+				body = line[2 : len(line)-2]
+			}
+			currentSection = strings.Join(splitGrokTOMLKeyPath(body), ".")
 			continue
 		}
 		eq := strings.IndexByte(line, '=')
@@ -1847,38 +1863,17 @@ var grokModelCredentialKeySuffixes = []string{"api_key", "env_key"}
 func grokConfigPinsCredential(path string) bool {
 	found := false
 	complete := walkGrokTOMLAssignments(path, func(key, value string) bool {
-		if grokModelCredentialTOMLKey(key) {
-			// A multiline assignment (`env_key = """` + the value on the NEXT
-			// line) exposes only its opening delimiter to this line-oriented
-			// sweep, which reads as empty. Grok's own parser resolves the whole
-			// value and bills the account it names, so an empty-looking opener
-			// is CONTESTED rather than dismissed.
-			if grokTOMLValueOpensMultiline(value) {
-				found = true
-				return false
-			}
-			if strings.TrimSpace(strings.Trim(value, `"'`)) == "" {
-				return true
-			}
+		if grokAssignmentPinsAccount(key, value) {
 			found = true
 			return false
 		}
-		if grokTOMLKeyNamesExternalAuthProvider(key) {
-			// Not a key we could read, but a key the child authenticates with
-			// INSTEAD of the cached login. classifyGrokSystemSemanticValue
-			// already refuses these layers as external providers; the
-			// attribution guard has to agree, or a run billed through an OIDC
-			// or `auth_provider_command` account is published under the cached
-			// subscription. A multiline opener reads as empty here and is
-			// contested for the same reason the credential arm contests it.
-			if grokTOMLValueOpensMultiline(value) || strings.TrimSpace(strings.Trim(value, `"'`)) != "" {
-				found = true
-				return false
-			}
-			return true
-		}
-		if (grokModelScopedTOMLKey(key) || grokVersionOverrideTOMLKey(key)) &&
-			grokInlineTablePinsCredential(value) {
+		// The sweep is line-oriented, so an INLINE table exposes only its outer
+		// key: `model = { api_key = "..." }` and
+		// `auth = { oidc = { issuer = "..." } }` both hide the assignment that
+		// matters inside the value. Descending with the outer key as the prefix
+		// lets one set of key rules decide both spellings, so the dotted and
+		// the inline form of the same setting cannot disagree.
+		if grokInlineTableMatches(key, value, grokAssignmentPinsAccount) {
 			found = true
 			return false
 		}
@@ -1887,24 +1882,65 @@ func grokConfigPinsCredential(path string) bool {
 	return found || !complete
 }
 
-// grokVersionOverrideTOMLKey reports whether a dotted key names Grok's
-// documented `version_overrides` array of version-selected config patches.
+// grokAssignmentPinsAccount reports whether ONE resolved assignment takes the
+// child off the cached `$GROK_HOME` login — a pinned model credential, or a
+// setting that authenticates through a provider of its own.
 //
-// Those patches carry ordinary config keys — including `model = { api_key =
-// "..." }` — and effectiveGrokSystemConfigForVersion merges them into the
+// A multiline opener reads as empty to this line-oriented sweep while grok's
+// own parser resolves the whole value and bills the account it names, so it is
+// CONTESTED rather than dismissed. An empty value is not a pin and must not
+// cost an honest run its observability.
+func grokAssignmentPinsAccount(key, value string) bool {
+	if !grokAttributionKeyLeavesCachedLogin(key) {
+		return false
+	}
+	return grokTOMLValueOpensMultiline(value) ||
+		strings.TrimSpace(strings.Trim(value, `"'`)) != ""
+}
+
+// grokAttributionKeyLeavesCachedLogin reports whether a dotted key names a
+// model credential or an external auth provider, in the file's own scope or
+// inside a `version_overrides` patch.
+//
+// Grok applies those patches (effectiveGrokSystemConfigForVersion) into the
 // effective config BEFORE anything classifies it, so a credential written there
-// is a credential the child bills with. The walk only ever exposes the OUTER
-// `version_overrides` assignment, which is not model-scoped, so without this the
-// descent below never looked inside and the run was attributed to the cached
-// login.
-//
-// Applicability is deliberately NOT resolved here: which entries apply depends
-// on the child's own version, and this guard is conservative by construction —
-// over-reporting costs one session's observability, under-reporting publishes
-// one account's spend as another's.
-func grokVersionOverrideTOMLKey(key string) bool {
+// is a credential the child bills with — in the inline
+// `version_overrides = [{ model = { api_key = "..." } }]` spelling AND in the
+// documented `[[version_overrides]]` + `[version_overrides.model]` one, which
+// reaches this function as `version_overrides.model.api_key`. Applicability is
+// deliberately NOT resolved: which entries apply depends on the child's own
+// version, and this guard is conservative by construction — over-reporting
+// costs one session's observability, under-reporting publishes one account's
+// spend as another's.
+func grokAttributionKeyLeavesCachedLogin(key string) bool {
+	if grokModelCredentialTOMLKey(key) || grokTOMLKeyNamesExternalAuthProvider(key) {
+		return true
+	}
+	relative, ok := grokVersionOverrideRelativeKey(key)
+	if !ok {
+		return false
+	}
+	// Inside an override entry the credential may be written without the
+	// `model.` scope the root config needs, so the looser inline-table spelling
+	// counts here too.
+	return grokModelCredentialTOMLKey(relative) ||
+		grokInlineTableCredentialKey(relative) ||
+		grokTOMLKeyNamesExternalAuthProvider(relative)
+}
+
+// grokVersionOverrideRelativeKey returns the part of a dotted key that sits
+// INSIDE a `version_overrides` entry, and whether the key is inside one at all.
+// The array index has no spelling in either form — an inline element keeps the
+// outer key, an `[[version_overrides]]` header names the table — so the
+// remainder after the segment is the key as the patched config would read it.
+func grokVersionOverrideRelativeKey(key string) (string, bool) {
 	segments := strings.Split(key, ".")
-	return segments[len(segments)-1] == "version_overrides"
+	for i, segment := range segments {
+		if segment == "version_overrides" && i+1 < len(segments) {
+			return strings.Join(segments[i+1:], "."), true
+		}
+	}
+	return "", false
 }
 
 // grokTOMLKeyNamesExternalAuthProvider reports whether a dotted key names one of
@@ -1928,34 +1964,29 @@ func grokTOMLKeyNamesExternalAuthProvider(key string) bool {
 		segments[len(segments)-3] == "auth"
 }
 
-// grokModelScopedTOMLKey reports whether a dotted key from
-// walkGrokTOMLAssignments sits anywhere under `[model]` — the table itself
-// (`model`) or a per-model child (`model.grok-4`). Only these values are worth
-// descending into: a credential-shaped assignment under an unrelated table is
-// not a credential grok would bill with.
-func grokModelScopedTOMLKey(key string) bool {
-	return key == "model" || strings.HasPrefix(key, "model.")
-}
-
 // grokInlineTableMaxDepth bounds the descent into nested inline tables. Deep
 // enough for any config a human writes, finite so a pathological or hostile
 // value cannot turn a session start into unbounded recursion.
 const grokInlineTableMaxDepth = 8
 
-// grokInlineTablePinsCredential reports whether a TOML inline-table value
-// assigns a non-empty credential to one of grokModelCredentialKeySuffixes, at
-// this level or in a nested inline table.
+// grokInlineTableMatches reports whether any assignment nested inside an inline
+// TOML value satisfies `match`, which is handed the assignment's FULL dotted
+// key — the outer key this value was assigned to, plus the path inside the
+// table — and its raw value.
 //
-// A value that is not an inline table (a bare string, number or array) is never
-// a credential assignment on its own — the key already decided that — so it
-// reports false. Quoted strings are skipped over while splitting so a `,`, `{`
-// or `}` inside a key value cannot desynchronise the scan and hide the
-// assignment that follows it.
-func grokInlineTablePinsCredential(value string) bool {
-	return grokInlineTablePinsCredentialAt(value, 0)
+// Composing the full key is what lets the dotted and the inline spelling of the
+// same setting share one set of key rules: `[auth] auth_provider_command = ...`
+// and `auth = { auth_provider_command = ... }` both reach `match` as
+// `auth.auth_provider_command`. A value that is not an inline table (a bare
+// string, number or scalar array) has nothing nested in it and reports false —
+// the caller has already judged the assignment itself. Quoted strings are
+// skipped over while splitting so a `,`, `{` or `}` inside a value cannot
+// desynchronise the scan and hide the assignment that follows it.
+func grokInlineTableMatches(key, value string, match func(key, value string) bool) bool {
+	return grokInlineTableMatchesAt(key, value, match, 0)
 }
 
-func grokInlineTablePinsCredentialAt(value string, depth int) bool {
+func grokInlineTableMatchesAt(key, value string, match func(key, value string) bool, depth int) bool {
 	if depth >= grokInlineTableMaxDepth {
 		// Deeper than any real config nests. Fail CLOSED: we cannot rule the
 		// credential out, and over-reporting costs one session's observability
@@ -1966,11 +1997,11 @@ func grokInlineTablePinsCredentialAt(value string, depth int) bool {
 	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
 		// An ARRAY of inline tables is the documented shape of
 		// `version_overrides`, and a `[model] grok-4 = [{ api_key = ... }]` is
-		// valid TOML too. Its elements are descended into with the same
-		// quote/nesting-aware splitter; an array of plain scalars simply has no
-		// element that is an inline table and reports false.
+		// valid TOML too. An array index has no key of its own, so elements
+		// keep the outer key; an array of plain scalars simply has no element
+		// that is an inline table and reports false.
 		for _, element := range splitGrokInlineTableFields(value[1 : len(value)-1]) {
-			if grokInlineTablePinsCredentialAt(element, depth+1) {
+			if grokInlineTableMatchesAt(key, element, match, depth+1) {
 				return true
 			}
 		}
@@ -1984,15 +2015,15 @@ func grokInlineTablePinsCredentialAt(value string, depth int) bool {
 		if eq <= 0 {
 			continue
 		}
-		key := strings.Join(splitGrokTOMLKeyPath(field[:eq]), ".")
-		inner := strings.TrimSpace(field[eq+1:])
-		if grokInlineTableCredentialKey(key) {
-			if strings.TrimSpace(strings.Trim(inner, `"'`)) != "" {
-				return true
-			}
-			continue
+		fieldKey := strings.Join(splitGrokTOMLKeyPath(field[:eq]), ".")
+		if key != "" {
+			fieldKey = key + "." + fieldKey
 		}
-		if grokInlineTablePinsCredentialAt(inner, depth+1) {
+		inner := strings.TrimSpace(field[eq+1:])
+		if match(fieldKey, inner) {
+			return true
+		}
+		if grokInlineTableMatchesAt(fieldKey, inner, match, depth+1) {
 			return true
 		}
 	}

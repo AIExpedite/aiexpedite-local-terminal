@@ -1144,6 +1144,32 @@ func TestGrokConfigPinsCredential_InspectsCredentialsInVersionOverrides(t *testi
 `,
 			want: true,
 		},
+		// The documented array-of-tables spelling of the same patch. Dropping
+		// the `[[version_overrides]]` header left the later credential
+		// attributed to whatever table preceded it, so the guard never saw the
+		// override's own key.
+		"array-of-tables override pins a key": {
+			body: "[[version_overrides]]\nminimum_version = \"1.0.0\"\nmaximum_version = \"2.0.0\"\n" +
+				"[version_overrides.model]\napi_key = \"xai-array-table-sentinel\"\n",
+			want: true,
+		},
+		"array-of-tables override pins a per-model env key": {
+			body: "[[version_overrides]]\nminimum_version = \"1.0.0\"\n" +
+				"[version_overrides.model.\"grok-4\"]\nenv_key = \"OTHER_ACCOUNT_KEY\"\n",
+			want: true,
+		},
+		"array-of-tables override without a credential is not contested": {
+			body: "[[version_overrides]]\nminimum_version = \"1.0.0\"\nmaximum_version = \"2.0.0\"\n" +
+				"[version_overrides.compat.cursor]\nmcps = false\n",
+			want: false,
+		},
+		// The other side of the same header fix: an array-of-tables entry opens
+		// its OWN scope, so a credential-shaped key inside it must not inherit
+		// the `[model]` table that happened to precede it.
+		"an array-of-tables header does not inherit the previous table": {
+			body: "[model]\nbase_url = \"https://x\"\n[[unrelated]]\napi_key = \"xai-not-a-model-key\"\n",
+			want: false,
+		},
 		"override without a credential is not contested": {
 			body: `version_overrides = [
   { minimum_version = "1.0.0", maximum_version = "2.0.0", compat = { cursor = { mcps = false } } },
@@ -1186,6 +1212,30 @@ func TestGrokConfigPinsCredential_ContestsAlternateAuthProviders(t *testing.T) {
 		"oidc client id": {
 			body: "[auth.oidc]\nclient_id = \"grok-enterprise\"\n",
 			want: true,
+		},
+		// The INLINE spelling of the same settings. The line-oriented sweep
+		// exposes only the outer `auth` key, so without descending into the
+		// value the child authenticates through its own provider while
+		// attribution still names the cached login.
+		"inline auth provider command": {
+			body: "auth = { auth_provider_command = \"/usr/local/bin/mint-token\" }\n",
+			want: true,
+		},
+		"nested inline oidc issuer": {
+			body: "auth = { oidc = { issuer = \"https://idp.example.invalid\" } }\n",
+			want: true,
+		},
+		"inline oidc table under an auth section": {
+			body: "[auth]\noidc = { client_id = \"grok-enterprise\" }\n",
+			want: true,
+		},
+		"empty inline provider command is not a provider": {
+			body: "auth = { auth_provider_command = \"\" }\n",
+			want: false,
+		},
+		"an unrelated inline oidc table is not an auth provider": {
+			body: "telemetry = { oidc = { issuer = \"https://idp.example.invalid\" } }\n",
+			want: false,
 		},
 		"empty provider command is not a provider": {
 			body: "[auth]\nauth_provider_command = \"\"\n",
