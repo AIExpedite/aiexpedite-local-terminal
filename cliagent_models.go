@@ -149,13 +149,23 @@ func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected 
 		// The legacy `models` list has its own receipt bound (2048 bytes per
 		// id); an id past it is dropped from BOTH lists rather than left to
 		// fail the whole provider in canonicalProvider.
+		// Deduplicated as the plain-text parser already does — OpenCode's
+		// JSON output can repeat an id, and canonicalProvider rejects a
+		// duplicate model identity.
 		legacy := make([]string, 0, len(usage.Models))
+		seen := map[string]bool{}
+		dropped := false
 		for _, id := range usage.Models {
-			if id != "" && bounded(id, cliUsageMaxLegacyModelIDLength) {
-				legacy = append(legacy, id)
+			if seen[id] {
+				continue // a repeat is not a lost model
 			}
+			if id == "" || !bounded(id, cliUsageMaxLegacyModelIDLength) {
+				dropped = true // a listed model the receipt cannot carry IS
+				continue
+			}
+			seen[id] = true
+			legacy = append(legacy, id)
 		}
-		dropped := len(legacy) < len(usage.Models)
 		usage.Models = legacy
 		details := make([]cliAgentModelDetail, 0, len(usage.Models))
 		for _, id := range usage.Models {
@@ -677,7 +687,13 @@ func discoverGrokModels(ctx context.Context, detected detectedCLIAgent, home str
 	// authenticate the list, and the catalog of THAT account could veto the
 	// models the cached-token sessions actually run.
 	realBase := grokModelsHomeBase(home)
-	isolated, err := setupIsolatedGrokHomeFrom(grokAPIKeyFallbackOptedIn(), "", realBase)
+	// Seeded with the ACP default runtime model so a key kept in the
+	// per-model `[model.<runtime>] api_key` form is carried over under the
+	// opt-in exactly as a session's home carries it. A key under ANOTHER
+	// model's table cannot be reproduced by one list run, so when the real
+	// config holds per-model keys the result is a floor (see below).
+	optedIn := grokAPIKeyFallbackOptedIn()
+	isolated, err := setupIsolatedGrokHomeFrom(optedIn, grokACPDefaultModel, realBase)
 	if err == nil {
 		defer func() { _ = removeIsolatedGrokHome(isolated) }()
 		env := setEnvVar(sanitizeGrokModelListEnv(os.Environ()), "GROK_HOME", isolated)
@@ -708,13 +724,51 @@ func discoverGrokModels(ctx context.Context, detected detectedCLIAgent, home str
 	if !listedOK && !cacheOK {
 		return cliAgentModelDiscovery{}, false
 	}
-	return mergeGrokDiscovery(listed, listedOK, cache, cacheOK, detected.Version), true
+	out := mergeGrokDiscovery(listed, listedOK, cache, cacheOK, detected.Version)
+	if optedIn && grokConfigHasPerModelAPIKey(expandHome(realBase, "config.toml")) {
+		// The list ran with (at most) the default runtime model's key; a
+		// session for a model whose key lives under its own `[model.<id>]`
+		// table authenticates differently and may see more. One list run
+		// cannot reproduce per-model authentication, so this catalog is a
+		// floor, never a veto.
+		out.Exhaustive = false
+	}
+	return out, true
 }
 
 // grokModelsHomeBase is the real Grok state directory the isolated list home
 // is seeded from: $GROK_HOME, else ~/.grok.
 func grokModelsHomeBase(home string) string {
 	return firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
+}
+
+var grokConfigTableHeader = regexp.MustCompile(`(?m)^\s*\[([^\]]+)\]\s*$`)
+var grokConfigAPIKeyLine = regexp.MustCompile(`(?m)^\s*api_key\s*=`)
+
+// grokConfigHasPerModelAPIKey reports whether config.toml keeps an api_key
+// under any per-model table (`[model.<id>]`, quoted or not) — the persistent
+// form xAI documents beside the plain `[model] api_key`.
+func grokConfigHasPerModelAPIKey(path string) bool {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	text := string(raw)
+	headers := grokConfigTableHeader.FindAllStringSubmatchIndex(text, -1)
+	for i, header := range headers {
+		name := strings.TrimSpace(text[header[2]:header[3]])
+		if !strings.HasPrefix(name, "model.") {
+			continue
+		}
+		end := len(text)
+		if i+1 < len(headers) {
+			end = headers[i+1][0]
+		}
+		if grokConfigAPIKeyLine.MatchString(text[header[1]:end]) {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeGrokDiscovery keeps the list command's order (its default first) and

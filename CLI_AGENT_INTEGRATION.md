@@ -389,10 +389,18 @@ Three rules keep a probe from doing damage on the way:
   list just refreshed there is read first, the real home's cache is the
   fallback. If the isolated home cannot be built the list is NOT run against
   the real home — it fails closed like a managed session, and the cache alone
-  answers (non-exhaustive by rule). A backend catalog entry with its own id
-  reaches discovery through its `capabilities.utilization.parserKey`, as the
-  usage parser does; and OpenCode's legacy `models` list drops an id past its
-  own 2048-byte receipt bound, as the detail rows drop one past 256.
+  answers (non-exhaustive by rule). The isolated home is seeded with the ACP
+  default runtime model (`grokACPDefaultModel`) so a key kept in the
+  per-model `[model.<runtime>] api_key` form rides along under the opt-in as
+  it does for a session; and because one list run cannot reproduce
+  per-model authentication, a config that keeps any per-model key makes the
+  catalog a floor (`grokConfigHasPerModelAPIKey`). A backend catalog entry
+  with its own id reaches discovery through its
+  `capabilities.utilization.parserKey`, as the usage parser does; OpenCode's
+  legacy `models` list drops an id past its own 2048-byte receipt bound (as
+  the detail rows drop one past 256) and collapses repeated ids, which the
+  receipt rejects as duplicate identities — a repeat is not a lost model, so
+  it does not lower exhaustiveness.
 - **Codex without a models cache still reports its configured model.** A fresh
   install or a cleared cache reports the top-level `model` from `config.toml`
   (basic `"…"` or literal `'…'` string) as a one-model, non-exhaustive floor,
