@@ -508,6 +508,20 @@ func grokFoldRune(r rune) rune {
 // arm/release shape.
 func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		// An arm whose identity could not be RESOLVED is not an arm with no
+		// opinion — it is a live run whose records we cannot honestly name.
+		// Excluding it from the account map made it invisible to disagreement
+		// detection, so a second run under account A would see itself as the
+		// only armed account, name A, and every record the unresolved run went
+		// on to write would bind to A and be published as A's utilization.
+		//
+		// The contested sentinel is exactly that statement ("someone is live
+		// that nobody may be named for"), and it is already what a credential
+		// override arms with, so one representation covers both unnameable
+		// cases. It matches no account, so the records are refused instead.
+		identity = grokContestedBillingIdentity
+	}
 	grokAttributionKeeperMu.Lock()
 	grokAttributionKeeperRefs++
 	if identity != "" {

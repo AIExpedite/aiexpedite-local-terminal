@@ -1618,7 +1618,9 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 			// (`tools = [ """`), which grokTOMLMultilineOpener does not see
 			// because the value does not START with the delimiter. Both states
 			// come out of the same scan so the accumulation inherits them.
-			depth, running := grokTOMLCompositeLineDepth(value, "")
+			// The line was comment-stripped before the split, so the scan's
+			// own stripped text is `value` verbatim here.
+			_, depth, running := grokTOMLCompositeLineDepth(value, "")
 			switch {
 			case depth > 0:
 				joined, ok := accumulateGrokTOMLCompositeValue(scanner, value, depth, running)
@@ -3175,13 +3177,13 @@ func grokTOMLBracketDepth(s string) int {
 // `openMultiline` is the delimiter already running when the line starts; the
 // scan resumes after its close and only then reads the rest of the line as
 // value syntax.
-func grokTOMLCompositeLineDepth(s, openMultiline string) (int, string) {
+func grokTOMLCompositeLineDepth(s, openMultiline string) (string, int, string) {
 	i := 0
 	if openMultiline != "" {
 		idx := grokTOMLMultilineCloserIndex(s, openMultiline)
 		if idx < 0 {
 			// The whole line is still string body.
-			return 0, openMultiline
+			return s, 0, openMultiline
 		}
 		i = idx + len(openMultiline)
 		openMultiline = ""
@@ -3216,7 +3218,7 @@ func grokTOMLCompositeLineDepth(s, openMultiline string) (int, string) {
 				if closed < 0 {
 					// Everything after this opener is body, on this line and
 					// on the ones that follow.
-					return depth, delim
+					return s, depth, delim
 				}
 				// Resume at the first byte after the closing delimiter; the
 				// loop's own i++ carries it there.
@@ -3228,13 +3230,23 @@ func grokTOMLCompositeLineDepth(s, openMultiline string) (int, string) {
 			} else {
 				inSingle = true
 			}
+		case '#':
+			// Outside every string body a `#` starts a comment, and the rest
+			// of the line is not value syntax. Stripping it HERE rather than
+			// before the scan is what makes a comment on the line that CLOSES
+			// a multiline string count as a comment: the caller cannot strip
+			// that line up front (a `#` before the closing delimiter is body),
+			// and leaving it unstripped let a trailing `# ]` close the
+			// composite early, so the next element line was read as a table
+			// header and every following root key was re-scoped.
+			return strings.TrimRight(s[:i], " \t"), depth, ""
 		case '[':
 			depth++
 		case ']':
 			depth--
 		}
 	}
-	return depth, ""
+	return s, depth, ""
 }
 
 // grokTOMLCompositeMaxContinuationLines bounds how far walkGrokTOMLAssignments
@@ -3257,16 +3269,16 @@ func accumulateGrokTOMLCompositeValue(
 ) (string, bool) {
 	parts := []string{initial}
 	for i := 0; i < grokTOMLCompositeMaxContinuationLines && scanner.Scan(); i++ {
-		raw := scanner.Text()
-		line := raw
-		if openMultiline == "" {
-			// Comments are stripped only OUTSIDE a string body: inside one a
-			// `#` is content, and truncating there could hide the closing
-			// delimiter and leave the rest of the file read as configuration.
-			line = grokTOMLStripInlineComment(strings.TrimSpace(raw))
-		}
+		// Comment stripping is left to grokTOMLCompositeLineDepth, the only
+		// scan that knows where the value syntax on this line actually starts.
+		// Pre-stripping was wrong inside a string body (a `#` there is
+		// content), and skipping the strip for the WHOLE line whenever it
+		// began in one was wrong once the delimiter closed mid-line: a
+		// trailing `# ]` after the close was then counted as the composite's
+		// bracket.
+		line := strings.TrimSpace(scanner.Text())
 		var delta int
-		delta, openMultiline = grokTOMLCompositeLineDepth(line, openMultiline)
+		line, delta, openMultiline = grokTOMLCompositeLineDepth(line, openMultiline)
 		depth += delta
 		parts = append(parts, line)
 		if depth <= 0 && openMultiline == "" {

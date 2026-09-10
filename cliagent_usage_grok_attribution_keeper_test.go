@@ -848,3 +848,47 @@ func TestGrokRecordBelongsToCurrentAccount_FoldsIdentitiesLikeEqualFold(t *testi
 			"same account — the two folds disagree")
 	}
 }
+
+// A direct run whose identity could not be RESOLVED is still a live producer.
+// Omitting it from the arm map made it invisible to disagreement detection, so
+// a second run under a nameable account saw itself as the only armed one and
+// named that account — and every record the unresolved run went on to write
+// bound to it and was published as that account's utilization.
+func TestGrokBillingAttributionKeeper_ContestsAnUnresolvedArm(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	unresolved := startGrokBillingAttributionKeeper("")
+	defer unresolved()
+
+	if identity, ok := grokDirectAttributionAssertion(); !ok ||
+		identity != grokContestedBillingIdentity {
+		t.Fatalf("assertion = (%q, %v), want the contested sentinel for a live "+
+			"run nobody can be named for", identity, ok)
+	}
+	if !grokArmedDirectAccountsDisagreeWith("acct-1") {
+		t.Fatal("an unresolved live arm must disagree with every nameable account")
+	}
+
+	// A nameable run joining it must not be able to name itself.
+	named := startGrokBillingAttributionKeeper("acct-1")
+	defer named()
+	if identity, ok := grokDirectAttributionAssertion(); !ok ||
+		identity != grokContestedBillingIdentity {
+		t.Fatalf("assertion = (%q, %v), want the contested sentinel while an "+
+			"unresolved run overlaps a nameable one", identity, ok)
+	}
+
+	ensureGrokBillingIdentityNamed(base, "acct-1")
+	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("marker = %q — an account may not be named over an unresolved "+
+			"live run", last)
+	}
+	helperAppendGrokLogLine(t, base,
+		grokUnmeteredLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
+	if _, ok := readGrokBillingSnapshot(base, []string{"acct-1"}); ok {
+		t.Fatal("a record written while an unresolved run was live was attributed to acct-1")
+	}
+}

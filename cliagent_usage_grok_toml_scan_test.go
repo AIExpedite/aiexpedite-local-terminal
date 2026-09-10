@@ -142,3 +142,69 @@ api_key = "xai-literal-close-sentinel"
 		t.Fatalf("keys = %v, want the credential that follows a closed literal string", keys)
 	}
 }
+
+// A multiline string inside a composite can CLOSE mid-line, and TOML permits a
+// comment after it. Skipping comment stripping for the whole line just because
+// it began in string body let a trailing `# ]` be counted as the composite's
+// closing bracket, so the array ended early, its next element line was read as
+// a table header, and every LATER root key was re-scoped — a root
+// `model.api_key` read as `other.model.api_key`, which the attribution guard
+// sees as no pinned credential for a run grok's own parser bills by API key.
+func TestGrokTOMLWalk_StripsCommentsAfterAMultilineStringCloses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	body := `tools = [
+  """
+body line
+""", # ]
+  [other]
+]
+model.api_key = "xai-closing-comment-sentinel"
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	keys := map[string]string{}
+	if complete := walkGrokTOMLAssignments(path, func(key, value string) bool {
+		keys[key] = value
+		return true
+	}); !complete {
+		t.Fatal("sweep reported incomplete for a config it read to the end")
+	}
+	if _, ok := keys["other.model.api_key"]; ok {
+		t.Fatalf("keys = %v, want no key re-scoped by a composite that closed on a comment's bracket", keys)
+	}
+	if _, ok := keys["model.api_key"]; !ok {
+		t.Fatalf("keys = %v, want the root credential at its own scope", keys)
+	}
+	if !grokConfigPinsCredential(path) {
+		t.Fatal("pinned credential missed: the trailing comment's `]` closed the composite early")
+	}
+}
+
+// The comment itself is not value body either: joining it into the logical
+// right-hand side would let commented-out text reach the callers that descend
+// into inline tables.
+func TestGrokTOMLCompositeLineDepth_DropsACommentAfterTheClose(t *testing.T) {
+	code, depth, running := grokTOMLCompositeLineDepth(`""", # ]`, `"""`)
+	if running != "" {
+		t.Fatalf("running = %q, want the string body closed on this line", running)
+	}
+	if depth != 0 {
+		t.Fatalf("depth = %d, want 0 — the bracket lives in a comment", depth)
+	}
+	if strings.Contains(code, "#") || strings.Contains(code, "]") {
+		t.Fatalf("code = %q, want the trailing comment dropped", code)
+	}
+}
+
+// A `#` BEFORE the closing delimiter is string content, not a comment.
+func TestGrokTOMLCompositeLineDepth_KeepsAHashInsideTheStringBody(t *testing.T) {
+	code, _, running := grokTOMLCompositeLineDepth(`still # body`, `"""`)
+	if running != `"""` {
+		t.Fatalf("running = %q, want the string body still open", running)
+	}
+	if !strings.Contains(code, "# body") {
+		t.Fatalf("code = %q, want the `#` kept as string content", code)
+	}
+}
