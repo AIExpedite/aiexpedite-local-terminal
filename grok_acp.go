@@ -1521,18 +1521,23 @@ func readGrokPersistedAPIKey(path, runtimeModel string) (string, string) {
 // these optional layers. Same line-oriented sweep as
 // detectPinnedSystemGrokRequirementsFile: inline `#` strip and the same
 // array-of-tables guard, not a TOML parser.
-func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) {
+func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (complete bool) {
 	if path == "" {
-		return
+		return true
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return
+		// A layer that is simply ABSENT is nothing to read, so the sweep saw
+		// all of it. A file that exists and cannot be opened is a scan this
+		// process could not perform over content the child's parser may still
+		// load, which is the incomplete case callers must fail closed on.
+		return os.IsNotExist(err)
 	}
 	defer f.Close()
 
 	const maxBytes = 1 << 20
-	scanner := bufio.NewScanner(io.LimitReader(f, maxBytes))
+	counted := &countingReader{r: io.LimitReader(f, maxBytes+1)}
+	scanner := bufio.NewScanner(counted)
 	scanner.Buffer(make([]byte, 64*1024), 256*1024)
 	var currentSection string
 	for scanner.Scan() {
@@ -1562,9 +1567,29 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) {
 			key = currentSection + "." + key
 		}
 		if !visit(key, strings.TrimSpace(line[eq+1:])) {
-			return
+			// A caller that stops early has the answer it came for, so the
+			// unread remainder is not a gap in what it decided.
+			return true
 		}
 	}
+	// A line longer than the scanner's buffer, or a read error, ends the sweep
+	// with content still unread; so does hitting the tail bound.
+	return scanner.Err() == nil && counted.n <= maxBytes
+}
+
+// countingReader counts the bytes it has handed on, so walkGrokTOMLAssignments
+// can tell "the whole file fitted in the tail bound" from "the bound cut it
+// off" — the difference between a credential that is absent and one this
+// process merely never saw.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // splitGrokTOMLKeyPath splits a TOML key path — a section header's body or the
@@ -1746,9 +1771,15 @@ var grokModelCredentialKeySuffixes = []string{"api_key", "env_key"}
 // `model.grok-4`), so the credential lives entirely inside the value. Descending
 // into the braces is what keeps a config written in that shape from silently
 // attributing an API-key run to the cached login.
+// A scan this process could not COMPLETE — an oversized config truncated at the
+// tail bound, a line past the scanner's buffer, an unreadable file — reports
+// pinned as well. The child's own parser reads the whole layer regardless, so a
+// credential past the boundary would be billed to the API-key account while
+// direct attribution named the cached login. Contesting costs that session its
+// observability; the alternative publishes one subscription's spend as another's.
 func grokConfigPinsCredential(path string) bool {
 	found := false
-	walkGrokTOMLAssignments(path, func(key, value string) bool {
+	complete := walkGrokTOMLAssignments(path, func(key, value string) bool {
 		if grokModelCredentialTOMLKey(key) {
 			// A multiline assignment (`env_key = """` + the value on the NEXT
 			// line) exposes only its opening delimiter to this line-oriented
@@ -1771,7 +1802,7 @@ func grokConfigPinsCredential(path string) bool {
 		}
 		return true
 	})
-	return found
+	return found || !complete
 }
 
 // grokModelScopedTOMLKey reports whether a dotted key from

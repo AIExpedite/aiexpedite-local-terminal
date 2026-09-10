@@ -17,6 +17,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -727,5 +728,66 @@ func TestGrokDirectRunBillingIdentity_ContestsAConfigLoaderOverride(t *testing.T
 				t.Fatalf("identity = %q, want %q for env %v", got, tc.want, tc.env)
 			}
 		})
+	}
+}
+
+// TestGrokConfigPinsCredential_ContestsATruncatedScan pins that a config the
+// sweep cannot read to the end CONTESTS attribution instead of reporting "no
+// pinned credential". The child's parser reads the whole file, so a
+// `model.api_key` past the 1 MiB tail bound (or past the scanner's line buffer)
+// would bill the API-key account while direct attribution named the cached
+// login — one subscription's spend published as another's.
+func TestGrokConfigPinsCredential_ContestsATruncatedScan(t *testing.T) {
+	filler := strings.Repeat("# padding to push the credential past the bound\n", (1<<20)/48+64)
+
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "credential beyond the tail bound",
+			body: "[model]\n" + filler + "api_key = \"xai-beyond-the-bound\"\n",
+			want: true,
+		},
+		{
+			name: "no credential but the file is truncated anyway",
+			body: "[other]\n" + filler + "note = \"nothing here\"\n",
+			want: true,
+		},
+		{
+			name: "line longer than the scanner buffer",
+			body: "[model]\nnote = \"" + strings.Repeat("x", 512*1024) + "\"\napi_key = \"xai-after-a-huge-line\"\n",
+			want: true,
+		},
+		{
+			name: "complete file with no credential still reports none",
+			body: "[model]\nnote = \"nothing here\"\n",
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if got := grokConfigPinsCredential(path); got != tc.want {
+				t.Fatalf("grokConfigPinsCredential = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGrokConfigPinsCredential_AbsentLayerIsNotContested pins the other side of
+// the same boundary: an optional layer that simply does not exist is nothing to
+// read, not an incomplete scan. Failing closed there would contest every run on
+// every device that never wrote a project or system config.
+func TestGrokConfigPinsCredential_AbsentLayerIsNotContested(t *testing.T) {
+	if grokConfigPinsCredential(filepath.Join(t.TempDir(), "missing.toml")) {
+		t.Fatal("an absent config layer must not contest attribution")
+	}
+	if grokConfigPinsCredential("") {
+		t.Fatal("an empty path must not contest attribution")
 	}
 }
