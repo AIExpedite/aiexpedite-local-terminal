@@ -374,7 +374,7 @@ func TestDiscoverGrokModelsMergesTheListWithTheCache(t *testing.T) {
 	t.Cleanup(func() { cliAgentModelProbeRunner = prev })
 
 	got, ok := discoverGrokModels(context.Background(), detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.0.13"}, home)
-	if !ok || !got.Exhaustive || got.DefaultModel != "grok-4.6" {
+	if !ok || got.Exhaustive || got.DefaultModel != "grok-4.6" {
 		t.Fatalf("got ok=%v %#v", ok, got)
 	}
 	want := []cliAgentModelDetail{

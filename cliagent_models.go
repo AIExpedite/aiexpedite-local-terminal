@@ -78,6 +78,12 @@ const (
 	// cliAgentModelProbeTimeout caps one list command. `agy models` fetches
 	// its list from the network; the others answer from disk or a socket.
 	cliAgentModelProbeTimeout = 20 * time.Second
+	// cliAgentModelProbeGatherBudget caps one probe when the gather it runs
+	// in is itself bounded (GatherCLIAgentUsageOnly: every provider under
+	// one 10s deadline). Small enough that the slowest provider's list can
+	// never starve the providers behind it; a probe that runs out is
+	// inconclusive and uncached, so the next periodic gather asks again.
+	cliAgentModelProbeGatherBudget = 2 * time.Second
 	// cliUsageMaxEffortsPerModel is the receipt bound on one model's scale.
 	cliUsageMaxEffortsPerModel = 16
 	// cliUsageMaxEffortLength bounds one effort token in the receipt.
@@ -140,6 +146,20 @@ func resetCLIAgentModelProbeCache() {
 func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected detectedCLIAgent, usage *cliAgentUsage, home string, now time.Time) {
 	if usage == nil {
 		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Discovery is optional; the gather it rides on is not. Under a bounded
+	// gather (the demand-driven refresh runs every provider serially under
+	// ONE deadline) a slow network-backed list such as `agy models` must not
+	// spend the whole budget and leave every later provider to fail on an
+	// already-expired context, so each probe gets its own slice of it. The
+	// periodic gather passes no deadline and keeps the probe's full timeout.
+	if _, bounded := ctx.Deadline(); bounded {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cliAgentModelProbeGatherBudget)
+		defer cancel()
 	}
 	if strings.EqualFold(agentID, "opencode") {
 		// OpenCode enumerated through its readiness probe; re-shape only.
@@ -724,24 +744,10 @@ func discoverGrokModels(ctx context.Context, detected detectedCLIAgent, home str
 	if !listedOK && !cacheOK {
 		return cliAgentModelDiscovery{}, false
 	}
-	out := mergeGrokDiscovery(listed, listedOK, cache, cacheOK, detected.Version)
-	if optedIn && grokConfigHasPerModelAPIKey(expandHome(realBase, "config.toml")) {
-		// The list ran with (at most) the default runtime model's key; a
-		// session for a model whose key lives under its own `[model.<id>]`
-		// table authenticates differently and may see more. One list run
-		// cannot reproduce per-model authentication, so this catalog is a
-		// floor, never a veto.
-		out.Exhaustive = false
-	}
-	if os.Getenv("GROK_CONFIG_PATH") != "" {
-		// An external config is the session's, not the isolated home's: it
-		// may carry per-model credentials the list cannot reproduce, and a
-		// RELATIVE path resolves against each session's cwd while the probe
-		// has none. Either way the probe cannot prove it saw what a session
-		// sees, so its catalog is a floor.
-		out.Exhaustive = false
-	}
-	return out, true
+	// Always a floor — see mergeGrokDiscovery: per-model keys, an external
+	// GROK_CONFIG_PATH and a project's upward `.grok/config.toml` all pick
+	// the account per SESSION, which this device-level probe cannot reproduce.
+	return mergeGrokDiscovery(listed, listedOK, cache, cacheOK, detected.Version), true
 }
 
 // grokModelsHomeBase is the real Grok state directory the isolated list home
@@ -750,31 +756,20 @@ func grokModelsHomeBase(home string) string {
 	return firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
 }
 
-// grokConfigHasPerModelAPIKey reports whether config.toml keeps an api_key
-// under any per-model table (`[model.<id>]`, quoted or not) — the persistent
-// form xAI documents beside the plain `[model] api_key`. It reads through the
-// same line-oriented sweep readGrokPersistedAPIKey uses
-// (walkGrokTOMLAssignments: inline `#` comments stripped, array-of-tables
-// guarded), so the detector and the copier cannot disagree about a header
-// such as `[model.grok-build] # API credential`.
-func grokConfigHasPerModelAPIKey(path string) bool {
-	found := false
-	walkGrokTOMLAssignments(path, func(key, _ string) bool {
-		if strings.HasPrefix(key, "model.") && strings.HasSuffix(key, ".api_key") && key != "model.api_key" {
-			found = true
-			return false
-		}
-		return true
-	})
-	return found
-}
-
 // mergeGrokDiscovery keeps the list command's order (its default first) and
 // takes each model's label, scale and default level from the cache. Cache-only
 // models that are not hidden are appended; a cache written by another Grok
 // build than the one installed marks the result non-exhaustive, as for Codex.
 func mergeGrokDiscovery(listed cliAgentModelDiscovery, listedOK bool, cache grokModelsCacheFile, cacheOK bool, installedVersion string) cliAgentModelDiscovery {
-	out := cliAgentModelDiscovery{Exhaustive: true, DefaultModel: listed.DefaultModel}
+	// A floor, never the whole list. Which account a Grok session runs as is
+	// decided per session — the opt-in key, a per-model persisted key, an
+	// external GROK_CONFIG_PATH, and the project's own `.grok/config.toml`
+	// found upward from the session's cwd — and a device-level probe has no
+	// session cwd, so it cannot prove it listed the catalog a given session
+	// will see. An exhaustive claim here would let routing veto a model that
+	// session accepts. (Cache-only and other-build cases stay non-exhaustive
+	// for their own reasons; nothing below can raise the flag.)
+	out := cliAgentModelDiscovery{Exhaustive: false, DefaultModel: listed.DefaultModel}
 	seen := map[string]bool{}
 	enrich := func(detail cliAgentModelDetail) cliAgentModelDetail {
 		if !cacheOK {

@@ -76,42 +76,8 @@ func TestDiscoverGrokModelsSeedsTheDefaultRuntimeModelKeyAndFloorsOnOthers(t *te
 	}
 	shutdownConfig = &Config{EnableGrokAPIKeyFallback: true}
 	plain, ok := discoverGrokModels(context.Background(), detected, home)
-	if !ok || !plain.Exhaustive {
-		t.Fatalf("a plain key reproduces the session's auth, so the list stays exhaustive: ok=%v %#v", ok, plain)
-	}
-}
-
-func TestGrokConfigHasPerModelAPIKey(t *testing.T) {
-	dir := t.TempDir()
-	write := func(body string) string {
-		p := filepath.Join(dir, "config.toml")
-		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return p
-	}
-	cases := []struct {
-		body string
-		want bool
-	}{
-		{"[model]\napi_key = \"k\"\n", false},
-		{"[model.grok-build]\napi_key = \"k\"\n", true},
-		{"[model.\"grok.4\"]\n  api_key = \"k\"\n", true},
-		// Inline comments on the header and the assignment, as the copier
-		// (walkGrokTOMLAssignments) already accepts them.
-		{"[model.grok-build] # API credential\napi_key = \"k\" # for this model\n", true},
-		{"# [model.grok-build]\n# api_key = \"k\"\n", false},
-		{"[model.grok-build]\nname = \"x\"\n\n[cli]\napi_key = \"not a model\"\n", false},
-		{"[cli]\ninstaller = \"internal\"\n", false},
-		{"", false},
-	}
-	for _, tc := range cases {
-		if got := grokConfigHasPerModelAPIKey(write(tc.body)); got != tc.want {
-			t.Fatalf("%q → %v, want %v", tc.body, got, tc.want)
-		}
-	}
-	if grokConfigHasPerModelAPIKey(filepath.Join(dir, "missing.toml")) {
-		t.Fatal("a missing file has no per-model key")
+	if !ok || plain.Exhaustive {
+		t.Fatalf("Grok discovery is a floor even with a plain key (per-session config decides the account): ok=%v %#v", ok, plain)
 	}
 }
 

@@ -231,7 +231,7 @@ func TestMergeGrokDiscoveryFallsBackToTheModelLevelDefault(t *testing.T) {
 	if !reflect.DeepEqual(got.Models, want) {
 		t.Fatalf("models = %#v\nwant %#v", got.Models, want)
 	}
-	if !got.Exhaustive || got.DefaultModel != "grok-a" {
+	if got.Exhaustive || got.DefaultModel != "grok-a" {
 		t.Fatalf("got exhaustive=%v default=%q", got.Exhaustive, got.DefaultModel)
 	}
 	// A scale the list itself named is never overwritten by the cache.

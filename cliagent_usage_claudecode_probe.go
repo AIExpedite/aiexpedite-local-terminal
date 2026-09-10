@@ -1534,6 +1534,14 @@ func triggerClaudeUsageProbeAfterRun() {
 		return
 	}
 	completedAt := time.Now()
+	// The debt is recorded HERE, synchronously, before the goroutine exists:
+	// the caller's exit path (and the test harness that waits for it to
+	// finish) must be able to rely on "the trigger has fired" meaning "the
+	// debt is on the gate" — a debt recorded a scheduler tick later inside
+	// the goroutine landed in the NEXT test's settled-turn hold window on the
+	// CI runners. claudeUsageProbeAfterRun records it again for its own
+	// callers; recordOwed keeps the newest baseline, so the repeat is a no-op.
+	claudeUsageProbe.recordOwed(completedAt)
 	go func() {
 		defer func() { _ = recover() }()
 		claudeUsageProbeAfterRun(completedAt)
