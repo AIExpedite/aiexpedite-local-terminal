@@ -1528,22 +1528,71 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) {
 			continue
 		}
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") && !strings.HasPrefix(line, "[[") {
-			currentSection = strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
+			currentSection = strings.Join(splitGrokTOMLKeyPath(line[1:len(line)-1]), ".")
 			continue
 		}
 		eq := strings.IndexByte(line, '=')
 		if eq <= 0 {
 			continue
 		}
-		bareKey := strings.ToLower(strings.TrimSpace(line[:eq]))
-		key := bareKey
-		if currentSection != "" && !strings.Contains(bareKey, ".") {
-			key = currentSection + "." + bareKey
+		keySegments := splitGrokTOMLKeyPath(line[:eq])
+		key := strings.Join(keySegments, ".")
+		if currentSection != "" && len(keySegments) == 1 {
+			key = currentSection + "." + key
 		}
 		if !visit(key, strings.TrimSpace(line[eq+1:])) {
 			return
 		}
 	}
+}
+
+// splitGrokTOMLKeyPath splits a TOML key path — a section header's body or the
+// left-hand side of an assignment — into its lower-cased segments, honouring
+// TOML's quoted keys.
+//
+// `[model]` / `"api_key" = "xai-..."`, `"model" = { api_key = "xai-..." }` and
+// `model."grok-4".env_key` are all valid configs grok's own parser applies. The
+// previous raw-lowercase normalization kept the quote characters in the key, so
+// none of them matched grokModelCredentialTOMLKey / grokModelScopedTOMLKey and
+// the billing-attribution guard reported "no pinned credential" for a run the
+// API-key account is actually billed for — publishing one subscription's spend
+// under another's. A dot INSIDE quotes is part of the segment, not a separator,
+// so `"model.api_key" = 1` stays the single unrelated key it is rather than
+// impersonating the credential.
+func splitGrokTOMLKeyPath(raw string) []string {
+	var segments []string
+	var cur strings.Builder
+	var quote byte
+	flush := func() {
+		segments = append(segments, strings.ToLower(strings.TrimSpace(cur.String())))
+		cur.Reset()
+	}
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if quote != 0 {
+			if c == '\\' && quote == '"' && i+1 < len(raw) {
+				i++
+				cur.WriteByte(raw[i])
+				continue
+			}
+			if c == quote {
+				quote = 0
+				continue
+			}
+			cur.WriteByte(c)
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			quote = c
+		case '.':
+			flush()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	flush()
+	return segments
 }
 
 // grokModelCredentialKeySuffixes are the `[model]` assignments that hand a Grok
@@ -1636,7 +1685,7 @@ func grokInlineTablePinsCredentialAt(value string, depth int) bool {
 		if eq <= 0 {
 			continue
 		}
-		key := strings.ToLower(strings.TrimSpace(strings.Trim(strings.TrimSpace(field[:eq]), `"'`)))
+		key := strings.Join(splitGrokTOMLKeyPath(field[:eq]), ".")
 		inner := strings.TrimSpace(field[eq+1:])
 		if grokInlineTableCredentialKey(key) {
 			if strings.TrimSpace(strings.Trim(inner, `"'`)) != "" {

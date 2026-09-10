@@ -332,6 +332,15 @@ const grokProjectConfigMaxDepth = 64
 // process-wide cwd here would make this decision depend on ambient state the
 // caller never named.
 //
+// BOTH the lexical chain and the symlink-RESOLVED chain are walked when they
+// differ. A cwd that is a symlink into a checkout keeps its alias through
+// filepath.Abs, but once exec.Cmd chdirs the child, the kernel's view of its
+// working directory is the physical target — so grok's upward discovery reads
+// the PHYSICAL repository's `.grok/config.toml`, which a lexical-only walk
+// never stats. Walking the lexical chain too keeps platforms that preserve the
+// alias in the process cwd covered; the guard is conservative by construction,
+// so scanning a superset of what the child could load is the safe direction.
+//
 // One bounded stat walk per direct session start, never on the streaming path.
 func grokProjectPinnedCredential(cwd string) bool {
 	dir := strings.TrimSpace(cwd)
@@ -342,6 +351,21 @@ func grokProjectPinnedCredential(cwd string) bool {
 	if err != nil {
 		return false
 	}
+	starts := []string{dir}
+	if resolved, err := resolveCwdForContainment(dir); err == nil && resolved != dir {
+		starts = append(starts, resolved)
+	}
+	for _, start := range starts {
+		if grokProjectPinnedCredentialFrom(start) {
+			return true
+		}
+	}
+	return false
+}
+
+// grokProjectPinnedCredentialFrom walks one absolute chain upward, stopping at
+// the volume root or grokProjectConfigMaxDepth.
+func grokProjectPinnedCredentialFrom(dir string) bool {
 	for depth := 0; depth < grokProjectConfigMaxDepth; depth++ {
 		if grokConfigPinsCredential(filepath.Join(dir, ".grok", "config.toml")) {
 			return true

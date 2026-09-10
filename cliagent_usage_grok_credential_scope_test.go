@@ -462,3 +462,75 @@ func TestPersistGrokManagedBillingSnapshot_KeepsTheGreatestOutOfOrderObservation
 		t.Fatalf("a stale managed receipt rewrote the log:\nbefore=%s\nafter=%s", before, after)
 	}
 }
+
+// TestGrokConfigPinsCredential_QuotedTOMLKeys pins that TOML's quoted-key
+// spellings are recognized as credentials. Grok's own parser applies
+// `"api_key" = "xai-..."` and `"model" = { api_key = "..." }`, so a guard that
+// only matched the bare spelling reported "no pinned credential" for a run the
+// API-key account is billed for.
+func TestGrokConfigPinsCredential_QuotedTOMLKeys(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"bare root", "[model]\napi_key = \"xai-abc\"\n", true},
+		{"quoted key", "[model]\n\"api_key\" = \"xai-abc\"\n", true},
+		{"single-quoted key", "[model]\n'api_key' = \"xai-abc\"\n", true},
+		{"quoted section", "[\"model\"]\napi_key = \"xai-abc\"\n", true},
+		{"quoted section and key", "['model']\n'env_key' = \"XAI_KEY\"\n", true},
+		{"quoted inline table key", "\"model\" = { api_key = \"xai-abc\" }\n", true},
+		{"quoted per-model section", "[model.\"grok-4\"]\n\"api_key\" = \"xai-abc\"\n", true},
+		{"quoted key inside inline table", "model = { \"api_key\" = \"xai-abc\" }\n", true},
+		{"empty quoted credential", "[model]\n\"api_key\" = \"\"\n", false},
+		{"dot inside quotes is one segment", "[other]\n\"model.api_key\" = \"xai-abc\"\n", false},
+		{"unrelated quoted key", "[model]\n\"base_url\" = \"https://x\"\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if got := grokConfigPinsCredential(path); got != tc.want {
+				t.Fatalf("grokConfigPinsCredential(%q) = %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestGrokProjectPinnedCredential_ResolvesSymlinkedCwd pins that a cwd reached
+// through a symlink still sees the PHYSICAL repository's `.grok/config.toml`.
+// The child's process cwd resolves through the link after exec.Cmd chdirs, so a
+// lexical-only walk would miss the config grok itself loads.
+func TestGrokProjectPinnedCredential_ResolvesSymlinkedCwd(t *testing.T) {
+	root := t.TempDir()
+	physical := filepath.Join(root, "physical")
+	work := filepath.Join(physical, "sub")
+	if err := os.MkdirAll(filepath.Join(physical, ".grok"), 0o700); err != nil {
+		t.Fatalf("mkdir physical: %v", err)
+	}
+	if err := os.MkdirAll(work, 0o700); err != nil {
+		t.Fatalf("mkdir work: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(physical, ".grok", "config.toml"),
+		[]byte("[model]\napi_key = \"xai-physical\"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(physical, alias); err != nil {
+		t.Skipf("symlinks unavailable on this platform/account: %v", err)
+	}
+
+	if !grokProjectPinnedCredential(filepath.Join(alias, "sub")) {
+		t.Fatal("expected the pinned credential on the symlink's physical ancestor to be detected")
+	}
+	if !grokProjectPinnedCredential(work) {
+		t.Fatal("expected the pinned credential on the direct physical path to be detected")
+	}
+	if grokProjectPinnedCredential(filepath.Join(root, "unrelated")) {
+		t.Fatal("did not expect a credential for a directory outside the pinned tree")
+	}
+}
