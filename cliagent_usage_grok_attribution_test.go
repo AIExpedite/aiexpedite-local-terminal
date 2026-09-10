@@ -962,3 +962,91 @@ func TestGrokDirectBillingPairToPreserve_DeclinesUnderAMalformedNewestResponse(t
 		t.Fatal("an older record was preserved over a newest response the reader refuses to render")
 	}
 }
+
+// The producer boundary the two tests above stop at: an undecodable response is
+// only authoritative over the account that FETCHED it. When account B's response
+// is the newest recognized line but our armed account A has a good record of its
+// own below it, refusing to restore A's record leaves A blind for no reason —
+// the same file layout with a USABLE foreign record is repaired over already.
+func TestReassertGrokDirectAttribution_RepairsUnderAForeignMalformedResponse(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-2")
+	t.Setenv("GROK_HOME", base)
+
+	if err := appendGrokBillingIdentityValue(base, "acct-2"); err != nil {
+		t.Fatalf("seed direct identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, base,
+		grokBillingLine("2026-08-19T10:00:00Z", 41, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	// Another account then fetched billing here and its response is unreadable.
+	if err := appendGrokBillingIdentityValue(base, "acct-9"); err != nil {
+		t.Fatalf("seed the foreign producer: %v", err)
+	}
+	helperAppendGrokLogLine(t, base, grokMalformedBillingLine())
+
+	candidates := grokIdentityCandidates(base)
+	if _, ok := readGrokBillingSnapshot(base, candidates); ok {
+		t.Fatal("precondition: the reader stops at the foreign newest response")
+	}
+
+	finish := startGrokBillingAttributionKeeper("acct-2")
+	defer finish()
+	reassertGrokDirectAttribution()
+
+	snap, ok := readGrokBillingSnapshot(base, candidates)
+	if !ok {
+		t.Fatal("the armed account's own record stayed unpublishable under ANOTHER account's unreadable response")
+	}
+	if got := snap.ObservedAt.UTC().Format(time.RFC3339); got != "2026-08-19T10:00:00Z" {
+		t.Fatalf("ObservedAt = %s, want the armed account's own newest observation", got)
+	}
+}
+
+// The merge-time twin: the same foreign unreadable response must not veto
+// preserving the armed direct account's record either.
+func TestGrokDirectBillingPairToPreserve_IgnoresAForeignMalformedResponse(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-2")
+	t.Setenv("GROK_HOME", base)
+
+	if err := appendGrokBillingIdentityValue(base, "acct-2"); err != nil {
+		t.Fatalf("seed direct identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, base,
+		grokBillingLine("2026-08-19T10:00:00Z", 41, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	if err := appendGrokBillingIdentityValue(base, "acct-9"); err != nil {
+		t.Fatalf("seed the foreign producer: %v", err)
+	}
+	helperAppendGrokLogLine(t, base, grokMalformedBillingLine())
+
+	merged, err := time.Parse(time.RFC3339, "2026-08-19T11:00:00Z")
+	if err != nil {
+		t.Fatalf("parse merged time: %v", err)
+	}
+
+	grokBillingAttributionSerialize.Lock()
+	_, ok := grokDirectBillingPairToPreserve(base, "acct-2", "acct-1", merged)
+	grokBillingAttributionSerialize.Unlock()
+	if !ok {
+		t.Fatal("a response ANOTHER account could not have produced for us vetoed preserving our own record")
+	}
+}
+
+// An unattributable unreadable response — no producer marker above it at all —
+// stays authoritative. The scoping is a proof of foreign production, never an
+// absence of proof.
+func TestGrokUnusableOutcome_UnattributableResponseStillSupersedes(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-2")
+	t.Setenv("GROK_HOME", base)
+
+	// No identity line anywhere above it, so nothing says whose fetch it was —
+	// the shape a CLI old enough never to log a producer leaves behind.
+	helperAppendGrokLogLine(t, base, grokMalformedBillingLine())
+
+	if !grokNewestBillingResponseIsUnusableFor(base, "acct-2") {
+		t.Fatal("an unattributable unreadable response must keep superseding older records")
+	}
+}

@@ -849,7 +849,9 @@ func grokDirectBillingPairToPreserve(
 	// older record, while the publish path stops dead at it. Preserving that
 	// older record would put it last and publish a reading the reader had
 	// deliberately refused, so the run falls back to the bare marker instead.
-	if grokNewestBillingResponseIsUnusable(persistentHome) {
+	// Scoped to the direct account: a response another account produced never
+	// supersedes this one's own observation.
+	if grokNewestBillingResponseIsUnusableFor(persistentHome, directIdentity) {
 		return nil, false
 	}
 	newest, ok := newestTrustedGrokBillingRecordFor(
@@ -937,7 +939,9 @@ func restoreGrokBillingRecordForArmedReaderLocked(base, identity string) bool {
 			// record, ours included. Re-appending an older one under it would
 			// hand the next gather a stale percentage the reader had already
 			// failed closed on. Only a FOREIGN newest record leaves this
-			// account stranded — an undecodable one leaves it correctly blind.
+			// account stranded — an undecodable one THIS account produced
+			// leaves it correctly blind. One produced by another account is
+			// classified foreign by the reader and repaired over below.
 			return repaired
 		}
 		if outcome == grokBillingReadOK &&
@@ -1272,14 +1276,24 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 	return snap, outcome == grokBillingReadOK
 }
 
-// grokNewestBillingResponseIsUnusable reports whether the log's newest
+// grokNewestBillingResponseIsUnusableFor reports whether the log's newest
 // recognized billing response is one readGrokBillingSnapshot refuses because it
 // cannot be decoded or rendered — as opposed to one it refuses as foreign.
 //
-// Identity-independent by construction: the reader classifies the line before it
-// ever asks whose it is, so the answer cannot depend on the identities passed.
-func grokNewestBillingResponseIsUnusable(base string) bool {
-	_, outcome := readGrokBillingSnapshotOutcome(base, nil)
+// Scoped to the account being restored, exactly as the armed-reader repair is.
+// An undecodable response supersedes the older records of the account that
+// PRODUCED it, because it is that account's latest answer from the provider; it
+// says nothing about a different account's credits, which is why a response
+// provably produced by someone else is classified foreign instead (see
+// grokUnusableResponseIsForeign). Passing no identity keeps the strict reading:
+// with nobody to compare the producer against, the response is treated as
+// possibly ours and still supersedes.
+func grokNewestBillingResponseIsUnusableFor(base, identity string) bool {
+	var identities []string
+	if identity = strings.TrimSpace(identity); identity != "" {
+		identities = []string{identity}
+	}
+	_, outcome := readGrokBillingSnapshotOutcome(base, identities)
 	return outcome == grokBillingReadUnusable
 }
 
@@ -1310,22 +1324,22 @@ func readGrokBillingSnapshotOutcome(base string, identities []string) (grokBilli
 			if i == 0 && truncatedFirstLine {
 				continue
 			}
-			return grokBillingSnapshot{}, grokBillingReadUnusable
+			return grokBillingSnapshot{}, grokUnusableOutcome(lines, i, identities)
 		}
 		if !grokBillingMessageRecognized(envelope.Msg) {
 			continue
 		}
 		var rec grokBillingRecord
 		if json.Unmarshal(line, &rec) != nil {
-			return grokBillingSnapshot{}, grokBillingReadUnusable
+			return grokBillingSnapshot{}, grokUnusableOutcome(lines, i, identities)
 		}
 		snap, ok := grokBillingSnapshotFromRecord(rec)
 		if !ok {
-			// The newest exact-message record supersedes every older response,
-			// even when one of its required fields is unusable. Continuing here
-			// would resurrect a stale pre-upgrade percentage after a malformed or
-			// timestamp-less current response.
-			return grokBillingSnapshot{}, grokBillingReadUnusable
+			// The newest exact-message record supersedes every older response of
+			// the account that produced it, even when one of its required fields
+			// is unusable. Continuing here would resurrect a stale pre-upgrade
+			// percentage after a malformed or timestamp-less current response.
+			return grokBillingSnapshot{}, grokUnusableOutcome(lines, i, identities)
 		}
 		// Stop at the newest usable record either way: an older one is even less
 		// likely to belong to the account signed in now.
@@ -1346,6 +1360,10 @@ func readGrokBillingSnapshotOutcome(base string, identities []string) (grokBilli
 // instead would accept account B's older record as soon as account A logged in
 // and had not fetched billing yet.
 func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities []string) bool {
+	producer, resolved := grokRecordProducerIdentity(lines, lineIdx)
+	if !resolved {
+		return false
+	}
 	// Keyed with grokIdentityFoldKey, NOT strings.ToLower: every other identity
 	// comparison in this package is strings.EqualFold, and lowercasing is not
 	// that relation. Unicode simple folding puts several lowercase runes in one
@@ -1353,12 +1371,16 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 	// as already-present — it folds with EqualFold — could lose this lookup and
 	// leave the record beneath it permanently unattributable. Both sides fold
 	// the same way or the gate and the keeper disagree about one account.
-	wanted := make(map[string]bool, len(identities))
-	for _, identity := range identities {
-		if key := grokIdentityFoldKey(identity); key != "" {
-			wanted[key] = true
-		}
-	}
+	return grokIdentityFoldedAmong(identities, producer)
+}
+
+// grokRecordProducerIdentity resolves WHO logged the line at lineIdx, from the
+// newest identity marker above it. resolved is false when the producer cannot be
+// established at all: no marker, a malformed one, or the contested sentinel.
+//
+// Identity-only, so both the attribution gate and the unusable-response
+// classifier below ask the same question of the same evidence and cannot drift.
+func grokRecordProducerIdentity(lines [][]byte, lineIdx int) (string, bool) {
 	// Start before the billing line. The observed billing envelope carries no
 	// identity, so allowing a lookalike user_id on the record to authenticate
 	// itself would defeat the cross-account boundary this scan enforces.
@@ -1367,20 +1389,20 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 		if !found {
 			continue
 		}
-		if !valid || len(wanted) == 0 {
-			// The log names a producer but the credentials resolve to nothing we
-			// can compare, or its newest identity envelope is malformed. Refuse
-			// rather than falling back to older account evidence.
-			return false
+		if !valid {
+			// The log names a producer but its newest identity envelope is
+			// malformed. Refuse rather than falling back to older account
+			// evidence.
+			return "", false
 		}
 		if strings.EqualFold(identity, grokContestedBillingIdentity) {
 			// Overlapping direct runs on different accounts were live when this
 			// marker was written, so nothing below it can be attributed to
 			// either. Refuse explicitly rather than relying on the sentinel
 			// merely failing to match a real account id.
-			return false
+			return "", false
 		}
-		return wanted[grokIdentityFoldKey(identity)]
+		return identity, true
 	}
 	// Nothing identifies the producer anywhere before the record. That is
 	// not evidence it belongs to the current login: `unified.jsonl` is shared
@@ -1388,7 +1410,48 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 	// previous account's credits sitting in the same file for the next one to
 	// publish as its own. Refuse — the card falls back to "unobservable", which
 	// is what it showed before this source existed.
+	return "", false
+}
+
+// grokIdentityFoldedAmong reports whether identity is one of the candidates,
+// under the same fold key grokRecordBelongsToCurrentAccount uses. An empty
+// candidate list matches nothing: credentials that resolve to nothing we can
+// compare are not evidence of ownership.
+func grokIdentityFoldedAmong(identities []string, identity string) bool {
+	key := grokIdentityFoldKey(identity)
+	if key == "" {
+		return false
+	}
+	for _, candidate := range identities {
+		if grokIdentityFoldKey(candidate) == key {
+			return true
+		}
+	}
 	return false
+}
+
+// grokUnusableOutcome classifies a recognized billing response the reader cannot
+// decode or render.
+//
+// Such a response is the provider's latest answer to whoever fetched it, so it
+// supersedes that account's older records — reviving one under it would publish
+// a reading the reader had deliberately failed closed on. It says nothing about
+// a DIFFERENT account's credits, though, and the producer is available from the
+// preceding marker even when the response payload itself is undecodable. When
+// the marker proves another account produced it, report it as foreign: identical
+// to a usable foreign record, which already leaves this account's own newest
+// observation free to be restored. Anything less certain — no marker, a
+// malformed one, the contested sentinel, or no identity to compare against —
+// stays unusable, so the strict reading is the default.
+func grokUnusableOutcome(lines [][]byte, lineIdx int, identities []string) grokBillingReadOutcome {
+	if len(identities) == 0 {
+		return grokBillingReadUnusable
+	}
+	producer, resolved := grokRecordProducerIdentity(lines, lineIdx)
+	if !resolved || grokIdentityFoldedAmong(identities, producer) {
+		return grokBillingReadUnusable
+	}
+	return grokBillingReadForeign
 }
 
 // grokLogIdentity returns the account in an allowlisted identity envelope.
