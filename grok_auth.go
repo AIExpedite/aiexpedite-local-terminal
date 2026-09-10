@@ -185,6 +185,46 @@ var grokCredentialOverrideEnvVars = []string{
 	"GROK_AUTH_PROVIDER_ACCESS_TOKEN",
 }
 
+// grokExternalAuthProviderEnvVars are the environment spellings of the
+// `[auth.oidc]` issuer/client pair. They carry no credential themselves, which
+// is why they are not in grokCredentialOverrideEnvVars — they select WHICH
+// identity provider the child authenticates against, and the auth cache is
+// keyed `"<issuer>::<client_id>"` (see grokExactOIDCScope). A child pointed at
+// another provider therefore mints and bills a token under a scope key our
+// reader never resolves, while grokResolvedBillingIdentity keeps naming the
+// cached xAI login — one account's spend published as another's.
+//
+// The config spellings of these exact settings are already treated as external
+// authentication by grokTOMLKeyNamesExternalAuthProvider (and by
+// classifyGrokSystemSemanticValue on the managed layer), and the maintenance
+// sanitizer strips them with the rest of GROK_*. A DIRECT (PTY) run
+// deliberately inherits the user's shell environment, so the attribution guard
+// has to account for them itself. Either half contests on its own: a
+// half-configured provider is still not the cached login.
+var grokExternalAuthProviderEnvVars = []string{
+	"GROK_OIDC_ISSUER",
+	"GROK_OIDC_CLIENT_ID",
+}
+
+// grokEnvNameOverridesBillingAccount reports whether an inherited variable NAME
+// takes a direct child off the cached login on presence alone — either by
+// handing it a credential of its own or by selecting an external identity
+// provider. Both lists are consulted in one place so a caller cannot check one
+// and forget the other.
+func grokEnvNameOverridesBillingAccount(name string) bool {
+	for _, candidate := range grokCredentialOverrideEnvVars {
+		if name == candidate {
+			return true
+		}
+	}
+	for _, candidate := range grokExternalAuthProviderEnvVars {
+		if name == candidate {
+			return true
+		}
+	}
+	return false
+}
+
 // grokDirectRunLaunch is the whole credential surface a DIRECT (PTY) Grok child
 // is launched with. Held as one value because every field is a place the child
 // can pick up a credential of its own, and the attribution decision has to see
@@ -207,7 +247,8 @@ type grokDirectRunLaunch struct {
 
 // grokDirectRunCredentialOverride reports whether a DIRECT (PTY) Grok child
 // launched as `launch` could bill an account OTHER than the cached login in
-// `base` — an inherited API key / provider token, or a key pinned in argv, in
+// `base` — an inherited API key / provider token, an environment-selected
+// external identity provider, or a key pinned in argv, in
 // the repository the child runs in, in the user's own config.toml, or in a
 // system config layer.
 //
@@ -231,10 +272,8 @@ func grokDirectRunCredentialOverride(launch grokDirectRunLaunch, base string) bo
 			continue
 		}
 		name = strings.ToUpper(strings.TrimSpace(name))
-		for _, candidate := range grokCredentialOverrideEnvVars {
-			if name == candidate {
-				return true
-			}
+		if grokEnvNameOverridesBillingAccount(name) {
+			return true
 		}
 		if grokConfigLoaderEnvContests(name, value, launch.Cwd) {
 			return true

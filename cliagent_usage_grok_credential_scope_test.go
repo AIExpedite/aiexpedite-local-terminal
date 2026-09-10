@@ -1334,3 +1334,80 @@ func TestGrokDirectRunBillingIdentity_ContestsAnArgvAlternateAuthProvider(t *tes
 		})
 	}
 }
+
+// An environment-selected OIDC provider takes the child off the cached xAI
+// login without carrying a credential of its own: the auth cache is keyed
+// "<issuer>::<client_id>", so a child pointed at another provider bills a token
+// under a scope key our reader never resolves while grokResolvedBillingIdentity
+// keeps naming the cached subscription. The config spellings of these exact
+// settings already contest; a DIRECT run inherits the shell environment, so the
+// environment spellings must contest too.
+func TestGrokDirectRunBillingIdentity_ContestsAnOIDCProviderOverride(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	helperNoGrokSystemConfigLayers(t)
+	base := helperGrokHomeWithAccount(t, "acct-login")
+
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"issuer alone", []string{"GROK_OIDC_ISSUER=https://idp-sentinel.invalid"}, grokContestedBillingIdentity},
+		{"client id alone", []string{"GROK_OIDC_CLIENT_ID=client-sentinel"}, grokContestedBillingIdentity},
+		{
+			"both halves",
+			[]string{"GROK_OIDC_ISSUER=https://idp-sentinel.invalid", "GROK_OIDC_CLIENT_ID=client-sentinel"},
+			grokContestedBillingIdentity,
+		},
+		{"lowercase spelling is still recognised", []string{"grok_oidc_issuer=https://idp-sentinel.invalid"}, grokContestedBillingIdentity},
+		// An honest session keeps its observability: an inherited-but-empty
+		// variable selects no provider at all.
+		{"empty issuer", []string{"GROK_OIDC_ISSUER="}, "acct-login"},
+		{"empty client id", []string{"GROK_OIDC_CLIENT_ID=   "}, "acct-login"},
+		{"unrelated oidc-shaped variable", []string{"GROK_OIDC_SCOPE_HINT=whatever"}, "acct-login"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := grokDirectRunBillingIdentity(grokDirectRunLaunch{Env: tc.env}, base)
+			if got != tc.want {
+				t.Fatalf("identity = %q, want %q for env %v", got, tc.want, tc.env)
+			}
+		})
+	}
+}
+
+// Contract pin: every environment variable the direct guard contests as an
+// external identity provider has a config spelling the TOML classifier already
+// recognises. If a Grok update renames one side, this fails here rather than
+// letting the environment and config layers disagree about which settings leave
+// the cached account.
+func TestGrokExternalAuthProviderEnvVars_MatchTheConfigClassification(t *testing.T) {
+	configKeys := map[string]string{
+		"GROK_OIDC_ISSUER":    "auth.oidc.issuer",
+		"GROK_OIDC_CLIENT_ID": "auth.oidc.client_id",
+	}
+	if len(configKeys) != len(grokExternalAuthProviderEnvVars) {
+		t.Fatalf("grokExternalAuthProviderEnvVars has %d entries, this pin covers %d",
+			len(grokExternalAuthProviderEnvVars), len(configKeys))
+	}
+	for _, name := range grokExternalAuthProviderEnvVars {
+		key, ok := configKeys[name]
+		if !ok {
+			t.Fatalf("no config spelling pinned for %q", name)
+		}
+		if !grokTOMLKeyNamesExternalAuthProvider(key) {
+			t.Fatalf("%q (config %q) is not classified as external authentication", name, key)
+		}
+		if !grokEnvNameOverridesBillingAccount(name) {
+			t.Fatalf("%q does not override the billing account", name)
+		}
+	}
+	// The credential list stays a distinct answer to a distinct question.
+	for _, name := range grokCredentialOverrideEnvVars {
+		if !grokEnvNameOverridesBillingAccount(name) {
+			t.Fatalf("%q does not override the billing account", name)
+		}
+		if _, clash := configKeys[name]; clash {
+			t.Fatalf("%q is listed as both a credential and an external provider", name)
+		}
+	}
+}
