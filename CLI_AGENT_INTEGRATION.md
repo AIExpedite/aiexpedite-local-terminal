@@ -387,11 +387,14 @@ whole. Three more bounds follow from the same rule (Codex round 2 on #147):
   allows 2048) or an empty id is filtered by `boundedModelDetails` before the
   cap, so a user-configured OpenCode provider id or a long vendor slug cannot
   turn the whole refresh into `usage result rejected`.
-- **A capped or filtered OpenCode list is not exhaustive.** The readiness
-  probe stops reading AT the cap, so a list of exactly that length may be
-  truncated, and an id dropped from the details was still listed by OpenCode;
-  in either case `modelsExhaustive` is false, or routing would veto a model
-  OpenCode runs.
+- **A capped or filtered list is not exhaustive — for any CLI.** OpenCode's
+  readiness probe stops reading AT the cap, so a list of exactly that length
+  may be truncated, and an id dropped from the details was still listed; for
+  Codex / Antigravity / Grok the generic branch compares the bounded details
+  against what the probe returned. In every such case `modelsExhaustive` is
+  false, or routing would veto a model the CLI runs. The same bound guards
+  `model`: a configured or reported default past 256 bytes is left unset
+  rather than copied into a field `canonicalProvider` would reject.
 - **A reset invalidates probes already in flight.** The cache carries a
   generation that every reset advances; a probe stores its answer only under
   the generation it started in. Otherwise the six-hour gather mid-probe when a

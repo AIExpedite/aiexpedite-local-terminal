@@ -166,7 +166,10 @@ func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected 
 	}
 	details := boundedModelDetails(discovery.Models)
 	usage.ModelDetails = details
-	usage.ModelsExhaustive = authBoolPtr(discovery.Exhaustive)
+	// Bounding that changed the catalog — a row past the cap or an id the
+	// detail row cannot carry — means the published list is not everything
+	// the CLI reported, so it cannot claim to be everything the CLI accepts.
+	usage.ModelsExhaustive = authBoolPtr(discovery.Exhaustive && len(details) == len(discovery.Models))
 	if len(usage.Models) == 0 {
 		// From the BOUNDED details, not the raw discovery: canonicalProvider
 		// rejects the whole provider when `models` exceeds the same cap, so a
@@ -178,7 +181,10 @@ func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected 
 		}
 		usage.Models = ids
 	}
-	if usage.Model == "" && discovery.DefaultModel != "" {
+	// The receipt bounds `model` at 256 bytes like a detail id; a configured
+	// or reported default past that is left unset rather than copied into a
+	// field that would fail the whole provider in canonicalProvider.
+	if usage.Model == "" && discovery.DefaultModel != "" && bounded(discovery.DefaultModel, cliUsageMaxModelDetailIDLength) {
 		usage.Model = discovery.DefaultModel
 	}
 }
