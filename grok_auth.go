@@ -422,15 +422,56 @@ func grokArgsPinCredential(args []string) bool {
 // The flag form nests the assignment inside the flag's own value
 // (`--config=model.api_key=sk-...`), so a key that is not itself an API-key path
 // is retried against the value once the outer `flag=` has been peeled off.
+//
+// A key that takes the child off the cached login WITHOUT carrying a key of its
+// own counts too (`--config auth.auth_provider_command=/path`,
+// `--config auth.oidc.issuer=...`): the child then authenticates through an
+// external provider whose account we cannot resolve, which is the same
+// misattribution as an inline key. That classification is the file scanner's
+// (grokAttributionKeyLeavesCachedLogin), reused rather than restated so the
+// argv layer and the config layers cannot disagree about which settings leave
+// the cached account.
 func grokArgPinsCredential(arg string) bool {
 	key, value, ok := strings.Cut(arg, "=")
 	if !ok {
 		return false
 	}
-	if grokCredentialConfigKey(key) {
-		return strings.TrimSpace(strings.Trim(value, `"'`)) != ""
+	if grokCredentialConfigKey(key) || grokAttributionKeyLeavesCachedLogin(grokArgConfigKey(key)) {
+		return grokArgAssignsAValue(value)
+	}
+	// `--config auth={ auth_provider_command = "..." }` assigns the same setting
+	// with the table spelling, where the leaving key is nested inside the value
+	// rather than being the key itself.
+	if grokInlineTableMatches(grokArgConfigKey(key), value, grokArgAssignmentLeavesCachedLogin) {
+		return true
 	}
 	return grokArgPinsCredential(value)
+}
+
+// grokArgAssignmentLeavesCachedLogin is grokArgPinsCredential's rule for ONE
+// assignment nested inside an argv-supplied inline table.
+func grokArgAssignmentLeavesCachedLogin(key, value string) bool {
+	return grokAttributionKeyLeavesCachedLogin(grokArgConfigKey(key)) && grokArgAssignsAValue(value)
+}
+
+// grokArgAssignsAValue reports whether an argv assignment carries a value at
+// all. An empty one pins nothing and must not cost an honest run its
+// observability.
+func grokArgAssignsAValue(value string) bool {
+	return strings.TrimSpace(strings.Trim(strings.TrimSpace(value), `"'`)) != ""
+}
+
+// grokArgConfigKey normalises an argv config key into the dotted spelling the
+// TOML key classifiers expect: the flag's leading dashes and any quoting are
+// stripped, case is folded, and `-` is read as `_` so a hyphenated spelling of
+// a documented snake_case setting still classifies. Deliberately keeps the
+// separators grokCredentialConfigKey discards — `auth.auth_provider_command` is
+// recognised by its exact segments, not by a suffix.
+func grokArgConfigKey(key string) string {
+	key = strings.ToLower(strings.TrimSpace(key))
+	key = strings.TrimLeft(key, "-")
+	key = strings.Trim(key, `"'`)
+	return strings.ReplaceAll(key, "-", "_")
 }
 
 // grokCredentialConfigKey reports whether a config key path names a credential,

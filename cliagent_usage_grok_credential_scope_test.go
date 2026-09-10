@@ -1258,3 +1258,46 @@ func TestGrokConfigPinsCredential_ContestsAlternateAuthProviders(t *testing.T) {
 		})
 	}
 }
+
+// An alternate auth PROVIDER carries no key of its own, so the credential-key
+// suffix rule never sees it — but `--config auth.auth_provider_command=/path`
+// and `--config auth.oidc.issuer=...` still take the child off the cached login
+// and bill an account we cannot resolve. The config-file scanner already
+// classifies those settings; the argv layer has to agree with it, or the same
+// override contests when it is written to disk and passes silently when it is
+// spelled on the command line.
+func TestGrokDirectRunBillingIdentity_ContestsAnArgvAlternateAuthProvider(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	helperNoGrokSystemConfigLayers(t)
+	base := helperGrokHomeWithAccount(t, "acct-login")
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"provider command", []string{"--config", "auth.auth_provider_command=/usr/local/bin/tok"}, grokContestedBillingIdentity},
+		{"joined flag", []string{"--config=auth.auth_provider_command=/usr/local/bin/tok"}, grokContestedBillingIdentity},
+		{"short form", []string{"-c", "auth.auth_provider_command=/usr/local/bin/tok"}, grokContestedBillingIdentity},
+		{"oidc issuer", []string{"--config", "auth.oidc.issuer=https://idp.example.com"}, grokContestedBillingIdentity},
+		{"oidc client id", []string{"--config", "auth.oidc.client_id=aix-client"}, grokContestedBillingIdentity},
+		{"quoted value", []string{"--config", `auth.auth_provider_command="/usr/local/bin/tok"`}, grokContestedBillingIdentity},
+		{"hyphenated spelling", []string{"--config", "auth.auth-provider-command=/usr/local/bin/tok"}, grokContestedBillingIdentity},
+		{"inline table", []string{"--config", `auth={ auth_provider_command = "/usr/local/bin/tok" }`}, grokContestedBillingIdentity},
+		{"nested inline table", []string{"--config", `auth={ oidc = { issuer = "https://idp.example.com" } }`}, grokContestedBillingIdentity},
+		{"version override entry", []string{"--config", `version_overrides=[{ auth = { auth_provider_command = "/usr/local/bin/tok" } }]`}, grokContestedBillingIdentity},
+		// An empty assignment pins no provider, and `issuer` outside the
+		// `[auth.oidc]` pair is an unrelated setting. Neither may cost an honest
+		// run its observability.
+		{"empty value", []string{"--config", "auth.auth_provider_command="}, "acct-login"},
+		{"unrelated issuer", []string{"--config", "telemetry.issuer=https://example.com"}, "acct-login"},
+		{"unrelated override", []string{"--config", "auth.timeout_ms=5000"}, "acct-login"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := grokDirectRunBillingIdentity(grokDirectRunLaunch{Args: tc.args}, base)
+			if got != tc.want {
+				t.Fatalf("identity = %q, want %q for args %v", got, tc.want, tc.args)
+			}
+		})
+	}
+}
