@@ -2094,7 +2094,14 @@ func grokInlineTableMatchesAt(key, value string, match func(key, value string) b
 		// valid TOML too. An array index has no key of its own, so elements
 		// keep the outer key; an array of plain scalars simply has no element
 		// that is an inline table and reports false.
-		for _, element := range splitGrokInlineTableFields(value[1 : len(value)-1]) {
+		elements, split := splitGrokInlineTableFields(value[1 : len(value)-1])
+		if !split {
+			// The body ends inside a string or bracket, so the fragments are
+			// not the elements grok's own parser sees. Same fail-CLOSED reason
+			// as the depth bound above.
+			return true
+		}
+		for _, element := range elements {
 			if grokInlineTableMatchesAt(key, element, match, depth+1) {
 				return true
 			}
@@ -2104,7 +2111,11 @@ func grokInlineTableMatchesAt(key, value string, match func(key, value string) b
 	if !strings.HasPrefix(value, "{") || !strings.HasSuffix(value, "}") {
 		return false
 	}
-	for _, field := range splitGrokInlineTableFields(value[1 : len(value)-1]) {
+	fields, split := splitGrokInlineTableFields(value[1 : len(value)-1])
+	if !split {
+		return true
+	}
+	for _, field := range fields {
 		eq := grokTOMLAssignmentIndex(field)
 		if eq <= 0 {
 			continue
@@ -2139,7 +2150,16 @@ func grokInlineTableCredentialKey(key string) bool {
 // splitGrokInlineTableFields splits the BODY of an inline table on its
 // top-level commas, ignoring commas inside quoted strings or nested
 // inline tables / arrays so a nested value cannot swallow the field after it.
-func splitGrokInlineTableFields(body string) []string {
+//
+// Multiline (triple-quoted) strings are tracked with the SAME closer rules the
+// line sweep uses, because the body handed here is a composite value the sweep
+// already JOINED across lines: `note = ”'it's, text”', model = { api_key =
+// "xai-..." }` is one field plus another, and reading the apostrophe in `it's`
+// as a terminator split it mid-string, left `model.api_key` inside a falsely
+// open quote and lost the pin. The second result reports whether every string
+// and bracket closed; a body that ends inside one cannot be split faithfully,
+// and the caller fails CLOSED rather than trusting the fragments.
+func splitGrokInlineTableFields(body string) ([]string, bool) {
 	var fields []string
 	depth := 0
 	var quote byte
@@ -2158,6 +2178,16 @@ func splitGrokInlineTableFields(body string) []string {
 		}
 		switch c {
 		case '"', '\'':
+			if delim := grokTOMLMultilineDelimiterAt(body[i:]); delim != "" {
+				closer := grokTOMLMultilineCloserIndex(body[i+len(delim):], delim)
+				if closer < 0 {
+					// Never closes: the rest of the body is string content, so
+					// no further field boundary is knowable.
+					return append(fields, body[start:]), false
+				}
+				i += len(delim) + closer + len(delim) - 1
+				continue
+			}
 			quote = c
 		case '{', '[':
 			depth++
@@ -2172,7 +2202,18 @@ func splitGrokInlineTableFields(body string) []string {
 			}
 		}
 	}
-	return append(fields, body[start:])
+	return append(fields, body[start:]), quote == 0 && depth == 0
+}
+
+// grokTOMLMultilineDelimiterAt returns the triple-quote delimiter `s` opens
+// with, or "" when it opens with a single-quote of either kind (or nothing).
+func grokTOMLMultilineDelimiterAt(s string) string {
+	for _, delim := range []string{`"""`, "'''"} {
+		if strings.HasPrefix(s, delim) {
+			return delim
+		}
+	}
+	return ""
 }
 
 // grokModelCredentialTOMLKey reports whether a dotted TOML key from
