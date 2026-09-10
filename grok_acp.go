@@ -1551,7 +1551,7 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 	for scanner.Scan() {
 		raw := scanner.Text()
 		if openMultiline != "" {
-			if strings.Contains(raw, openMultiline) {
+			if grokTOMLMultilineCloserIndex(raw, openMultiline) >= 0 {
 				// TOML permits nothing but a comment after a closing
 				// delimiter, so the rest of this line carries no assignment.
 				openMultiline = ""
@@ -1586,7 +1586,7 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 			currentSection = strings.Join(splitGrokTOMLKeyPath(body), ".")
 			continue
 		}
-		eq := strings.IndexByte(line, '=')
+		eq := grokTOMLAssignmentIndex(line)
 		if eq <= 0 {
 			continue
 		}
@@ -1768,11 +1768,81 @@ func grokTOMLValueOpensMultiline(value string) bool {
 func grokTOMLMultilineOpener(value string) string {
 	v := strings.TrimSpace(value)
 	for _, delim := range []string{`"""`, "'''"} {
-		if strings.HasPrefix(v, delim) && !strings.Contains(v[len(delim):], delim) {
+		if strings.HasPrefix(v, delim) && grokTOMLMultilineCloserIndex(v[len(delim):], delim) < 0 {
 			return delim
 		}
 	}
 	return ""
+}
+
+// grokTOMLMultilineCloserIndex returns the index at which `s` closes an already
+// OPEN multiline string delimited by `delim`, or -1 when the delimiter never
+// appears unescaped.
+//
+// A basic (three-double-quote) multiline string still honours backslash
+// escapes, so a `\"""` in its body decodes to a literal quote followed by two
+// content quotes — never the terminator. Reading it as one ended the string
+// early, and the body lines that followed were then read as configuration: a
+// section-shaped body line re-scoped every LATER assignment, so a root
+// `model.api_key` surfaced as `other.model.api_key` and the attribution guard
+// reported no pinned credential for a run grok's own parser bills by API key. A
+// literal (three-single-quote) multiline string defines no escapes, so a
+// backslash in one is ordinary content.
+//
+// Only the FIRST unescaped occurrence is reported. TOML lets up to two extra
+// quotes sit against a closing delimiter (`foo""""`), which shifts the true
+// terminator by a byte or two; every caller here asks only WHETHER the string
+// closes within the text it was handed, so the earlier index answers the same
+// question.
+func grokTOMLMultilineCloserIndex(s, delim string) int {
+	escapes := delim == `"""`
+	for i := 0; i < len(s); i++ {
+		if escapes && s[i] == '\\' {
+			i++
+			continue
+		}
+		if strings.HasPrefix(s[i:], delim) {
+			return i
+		}
+	}
+	return -1
+}
+
+// grokTOMLAssignmentIndex returns the index of the `=` separating a TOML
+// assignment's key path from its value, or -1 when the text carries no
+// assignment separator outside its quoted key segments.
+//
+// A QUOTED key segment may contain an `=` of its own: under `[model]`,
+// `"foo=bar".api_key = "xai-..."` is a valid pin grok's own parser applies.
+// Taking the first `=` in the line split that key as `model.foo`, so the
+// credential never matched grokModelCredentialTOMLKey and an API-key-billed run
+// was attributed to the cached login. Quote handling matches
+// splitGrokTOMLKeyPath — backslash escapes inside a basic-quoted segment, none
+// inside a literal one — so the two cannot disagree about where a key ends. An
+// unterminated quote has no separator at this level and reports -1, which every
+// caller skips.
+func grokTOMLAssignmentIndex(s string) int {
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == '\\' && quote == '"' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			quote = c
+		case '=':
+			return i
+		}
+	}
+	return -1
 }
 
 // decodeGrokTOMLEscape decodes ONE escape sequence from the body of a TOML
@@ -2011,7 +2081,7 @@ func grokInlineTableMatchesAt(key, value string, match func(key, value string) b
 		return false
 	}
 	for _, field := range splitGrokInlineTableFields(value[1 : len(value)-1]) {
-		eq := strings.IndexByte(field, '=')
+		eq := grokTOMLAssignmentIndex(field)
 		if eq <= 0 {
 			continue
 		}
@@ -3108,7 +3178,7 @@ func grokTOMLBracketDepth(s string) int {
 func grokTOMLCompositeLineDepth(s, openMultiline string) (int, string) {
 	i := 0
 	if openMultiline != "" {
-		idx := strings.Index(s, openMultiline)
+		idx := grokTOMLMultilineCloserIndex(s, openMultiline)
 		if idx < 0 {
 			// The whole line is still string body.
 			return 0, openMultiline
@@ -3142,7 +3212,7 @@ func grokTOMLCompositeLineDepth(s, openMultiline string) (int, string) {
 			delim := strings.Repeat(string(c), 3)
 			if strings.HasPrefix(s[i:], delim) {
 				rest := s[i+len(delim):]
-				closed := strings.Index(rest, delim)
+				closed := grokTOMLMultilineCloserIndex(rest, delim)
 				if closed < 0 {
 					// Everything after this opener is body, on this line and
 					// on the ones that follow.
