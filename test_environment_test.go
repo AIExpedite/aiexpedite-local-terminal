@@ -66,7 +66,14 @@ func sandboxTestConfigDir() func() {
 	} else {
 		realHomeAtStartup = os.Getenv("HOME")
 	}
+	// Resolved like the sandbox below: on the Windows CI runners %TEMP% is
+	// the 8.3 form (C:\Users\RUNNER~1\AppData\Local\Temp) while the sandbox
+	// is created in the long form, and the containment check would otherwise
+	// miss that the sandbox IS under the real temp root.
 	realTempAtStartup = os.TempDir()
+	if resolved, err := filepath.EvalSymlinks(realTempAtStartup); err == nil {
+		realTempAtStartup = resolved
+	}
 	realAppDataAtStartup = os.Getenv("APPDATA")
 	realConfigDirAtStartup = baseDir
 

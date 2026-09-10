@@ -128,7 +128,7 @@ func resetCLIAgentModelProbeCache() {
 // parser ran, so it enriches whatever the parser produced (including the
 // baseline entry for a parser-less agent) and never replaces a list the parser
 // already established.
-func attachCLIAgentModelDiscovery(agentID string, detected detectedCLIAgent, usage *cliAgentUsage, home string, now time.Time) {
+func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected detectedCLIAgent, usage *cliAgentUsage, home string, now time.Time) {
 	if usage == nil {
 		return
 	}
@@ -145,15 +145,20 @@ func attachCLIAgentModelDiscovery(agentID string, detected detectedCLIAgent, usa
 		usage.ModelsExhaustive = authBoolPtr(true)
 		return
 	}
-	discovery, ok := cachedCLIAgentModelDiscovery(agentID, detected, home, now)
+	discovery, ok := cachedCLIAgentModelDiscovery(ctx, agentID, detected, home, now)
 	if !ok || len(discovery.Models) == 0 {
 		return
 	}
-	usage.ModelDetails = boundedModelDetails(discovery.Models)
+	details := boundedModelDetails(discovery.Models)
+	usage.ModelDetails = details
 	usage.ModelsExhaustive = authBoolPtr(discovery.Exhaustive)
 	if len(usage.Models) == 0 {
-		ids := make([]string, 0, len(discovery.Models))
-		for _, model := range discovery.Models {
+		// From the BOUNDED details, not the raw discovery: canonicalProvider
+		// rejects the whole provider when `models` exceeds the same cap, so a
+		// vendor answering with more than the cap would fail the entire refresh
+		// instead of publishing the first cliUsageMaxModelsPerProvider entries.
+		ids := make([]string, 0, len(details))
+		for _, model := range details {
 			ids = append(ids, model.ID)
 		}
 		usage.Models = ids
@@ -163,7 +168,7 @@ func attachCLIAgentModelDiscovery(agentID string, detected detectedCLIAgent, usa
 	}
 }
 
-func cachedCLIAgentModelDiscovery(agentID string, detected detectedCLIAgent, home string, now time.Time) (cliAgentModelDiscovery, bool) {
+func cachedCLIAgentModelDiscovery(ctx context.Context, agentID string, detected detectedCLIAgent, home string, now time.Time) (cliAgentModelDiscovery, bool) {
 	key := strings.ToLower(agentID) + "\x00" + detected.Path + "\x00" + detected.Version
 	cliAgentModelProbeMu.Lock()
 	entry, cached := cliAgentModelProbeCache[key]
@@ -171,7 +176,14 @@ func cachedCLIAgentModelDiscovery(agentID string, detected detectedCLIAgent, hom
 	if cached && now.Sub(entry.At) < cliAgentModelProbeTTL {
 		return entry.Result, entry.OK
 	}
-	result, ok := discoverCLIAgentModels(agentID, detected, home)
+	result, ok := discoverCLIAgentModels(ctx, agentID, detected, home)
+	if !ok && ctx != nil && ctx.Err() != nil {
+		// The probe lost its deadline rather than answering. Caching that miss
+		// would hide this agent's models for the full TTL because one refresh
+		// happened to run out of time, so leave the slot empty and let the
+		// next gather ask again.
+		return result, ok
+	}
 	cliAgentModelProbeMu.Lock()
 	cliAgentModelProbeCache[key] = cliAgentModelProbeEntry{At: now, Result: result, OK: ok}
 	cliAgentModelProbeMu.Unlock()
@@ -181,20 +193,20 @@ func cachedCLIAgentModelDiscovery(agentID string, detected detectedCLIAgent, hom
 // discoverCLIAgentModels runs the one probe this agent supports. ok=false means
 // the probe was inconclusive (no file, timeout, unrecognised output) and the
 // caller must report nothing rather than an empty list.
-func discoverCLIAgentModels(agentID string, detected detectedCLIAgent, home string) (cliAgentModelDiscovery, bool) {
+func discoverCLIAgentModels(ctx context.Context, agentID string, detected detectedCLIAgent, home string) (cliAgentModelDiscovery, bool) {
 	switch strings.ToLower(strings.TrimSpace(agentID)) {
 	case "codex":
 		return discoverCodexModels(home, detected.Version)
 	case "antigravity":
-		out, ok := cliAgentModelProbeRunner(detected.Path, sanitizeAntigravityEnv(os.Environ()), "models")
+		out, ok := cliAgentModelProbeRunner(ctx, detected.Path, sanitizeAntigravityEnv(os.Environ()), "models")
 		if !ok {
 			return cliAgentModelDiscovery{}, false
 		}
 		return parseAntigravityModelList(out)
 	case "grok":
-		return discoverGrokModels(detected, home)
+		return discoverGrokModels(ctx, detected, home)
 	case "claudecode":
-		out, ok := cliAgentModelProbeRunner(detected.Path, os.Environ(), "--help")
+		out, ok := cliAgentModelProbeRunner(ctx, detected.Path, os.Environ(), "--help")
 		if !ok {
 			return cliAgentModelDiscovery{}, false
 		}
@@ -206,13 +218,23 @@ func discoverCLIAgentModels(agentID string, detected detectedCLIAgent, home stri
 // runCLIAgentModelProbe runs `<executable> <args…>` with a short timeout and
 // returns its combined output. ok=false means INCONCLUSIVE (timeout, non-zero
 // exit, spawn failure); the caller must not read a verdict into that.
-func runCLIAgentModelProbe(executable string, env []string, args ...string) (string, bool) {
+//
+// The timeout DERIVES from the caller's gather context rather than starting a
+// fresh one: GatherCLIAgentUsageOnly runs every provider serially under a
+// single 10s deadline, so a probe on its own 20s clock would keep running past
+// the deadline the refresh handler documents. context.WithTimeout takes the
+// EARLIER of the two, so this caps a probe at 20s on the 6-hour gather path
+// and at whatever the refresh has left on the demand-driven one.
+func runCLIAgentModelProbe(ctx context.Context, executable string, env []string, args ...string) (string, bool) {
 	if strings.TrimSpace(executable) == "" {
 		return "", false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cliAgentModelProbeTimeout)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, cliAgentModelProbeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, executable, args...)
+	cmd := exec.CommandContext(probeCtx, executable, args...)
 	hideWindow(cmd)
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
@@ -503,6 +525,25 @@ type grokModelsCacheFile struct {
 	} `json:"models"`
 }
 
+// sanitizeGrokModelListEnv is sanitizeGrokMaintenanceSmokeEnv with Grok's
+// state-directory configuration put back. The smoke sanitizer drops every
+// GROK_* variable so a probe cannot inherit workspace integrations — but
+// GROK_HOME chooses which login and cache the CLI uses, and grokModelsCachePath
+// reads that SAME override right after. Dropping it would list one home's
+// models and merge another home's cache, so the snapshot would describe an
+// account this device never runs.
+func sanitizeGrokModelListEnv(env []string) []string {
+	filtered := sanitizeGrokMaintenanceSmokeEnv(env)
+	for _, entry := range env {
+		name, value, found := strings.Cut(entry, "=")
+		if !found || !strings.EqualFold(strings.TrimSpace(name), "GROK_HOME") {
+			continue
+		}
+		filtered = setEnvVar(filtered, "GROK_HOME", value)
+	}
+	return filtered
+}
+
 func grokModelsCachePath(home string) string {
 	base := firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
 	if base == "" {
@@ -515,10 +556,10 @@ func grokModelsCachePath(home string) string {
 // signed in) and enriches every listed model from the cache. A missing cache
 // leaves the list without scales; a missing list falls back to the cache's
 // visible models.
-func discoverGrokModels(detected detectedCLIAgent, home string) (cliAgentModelDiscovery, bool) {
+func discoverGrokModels(ctx context.Context, detected detectedCLIAgent, home string) (cliAgentModelDiscovery, bool) {
 	var listed cliAgentModelDiscovery
 	listedOK := false
-	if out, ok := cliAgentModelProbeRunner(detected.Path, sanitizeGrokMaintenanceSmokeEnv(os.Environ()), "models"); ok {
+	if out, ok := cliAgentModelProbeRunner(ctx, detected.Path, sanitizeGrokModelListEnv(os.Environ()), "models"); ok {
 		listed, listedOK = parseGrokModelList(out)
 	}
 	var cache grokModelsCacheFile
@@ -595,6 +636,14 @@ func mergeGrokDiscovery(listed cliAgentModelDiscovery, listedOK bool, cache grok
 		if !codexCacheMatchesInstalled(cache.GrokVersion, installedVersion) {
 			out.Exhaustive = false
 		}
+	}
+	// Without the list command there is nothing that proves the cache is
+	// current: Grok fetches this catalog from its backend, so it can gain a
+	// model with no binary upgrade and the version comparison above would
+	// still match. Claiming exhaustive there would let routing veto a model
+	// the CLI accepts, so a cache-only answer is always a floor.
+	if !listedOK {
+		out.Exhaustive = false
 	}
 	return out
 }

@@ -358,6 +358,30 @@ terminal-service), so **terminal-service must deploy first**.
 `AIX_B5_HARNESS_OUT=<file> go test -run TestB5ModelDiscoveryHarness -v` runs the
 real probes on this machine and writes the snapshot.
 
+Three rules keep a probe from doing damage on the way:
+
+- **A probe's deadline is derived, never fresh.** `runCLIAgentModelProbe` takes
+  the caller's gather context and layers its own 20s cap on top, so
+  `GatherCLIAgentUsageOnly` — which runs every provider serially under one 10s
+  deadline — can never be held past that by a slow `agy models`. An
+  inconclusive probe whose context expired is NOT cached, or one refresh that
+  ran out of time would hide the agent's models for the whole 30-minute TTL.
+- **`grok models` runs against the same home the cache is read from.**
+  `sanitizeGrokModelListEnv` is the maintenance-smoke sanitizer with `GROK_HOME`
+  put back: the smoke sanitizer drops every `GROK_*` var, but that override
+  chooses the login and cache directory, so dropping it would list one account's
+  models and merge another account's cache.
+- **Cache-only Grok discovery is a floor.** When the list command fails but the
+  cache reads, `modelsExhaustive` is false regardless of the build-version
+  match — Grok fetches this catalog from its backend, so it can gain a model
+  with no binary upgrade and an exhaustive claim would let routing veto a model
+  the CLI accepts.
+
+Both `modelDetails` and the legacy `models` list are truncated to
+`cliUsageMaxModelsPerProvider`; the receipt rejects a provider that exceeds it
+on either field, so an over-cap vendor answer must never reach `canonicalProvider`
+whole.
+
 ## Why ACP, not TUI scraping
 
 `grok` (no subcommand) launches an interactive TUI built around terminal

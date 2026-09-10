@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -242,11 +244,11 @@ func TestAttachCLIAgentModelDiscoveryNeverOverwritesTheParsersOwnModelFields(t *
 	resetCLIAgentModelProbeCache()
 	t.Cleanup(resetCLIAgentModelProbeCache)
 	prev := cliAgentModelProbeRunner
-	cliAgentModelProbeRunner = func(string, []string, ...string) (string, bool) { return realAntigravityModels, true }
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) { return realAntigravityModels, true }
 	t.Cleanup(func() { cliAgentModelProbeRunner = prev })
 
 	usage := &cliAgentUsage{Provider: "antigravity", Model: "gemini-3.1-pro", Models: []string{"gemini-3.1-pro"}}
-	attachCLIAgentModelDiscovery("antigravity", detectedCLIAgent{Detected: true, Path: "/bin/agy", Version: "1.1.27"}, usage, "", time.Now())
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", detectedCLIAgent{Detected: true, Path: "/bin/agy", Version: "1.1.27"}, usage, "", time.Now())
 	if usage.Model != "gemini-3.1-pro" || !reflect.DeepEqual(usage.Models, []string{"gemini-3.1-pro"}) {
 		t.Fatalf("the parser's model and list must survive enrichment: %#v", usage)
 	}
@@ -254,9 +256,9 @@ func TestAttachCLIAgentModelDiscoveryNeverOverwritesTheParsersOwnModelFields(t *
 		t.Fatalf("details still attached: %#v", usage)
 	}
 	// A nil snapshot and an OpenCode snapshot without models are no-ops.
-	attachCLIAgentModelDiscovery("antigravity", detectedCLIAgent{Detected: true}, nil, "", time.Now())
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", detectedCLIAgent{Detected: true}, nil, "", time.Now())
 	empty := &cliAgentUsage{Provider: "opencode"}
-	attachCLIAgentModelDiscovery("opencode", detectedCLIAgent{Detected: true}, empty, "", time.Now())
+	attachCLIAgentModelDiscovery(context.Background(), "opencode", detectedCLIAgent{Detected: true}, empty, "", time.Now())
 	if empty.ModelDetails != nil || empty.ModelsExhaustive != nil {
 		t.Fatalf("OpenCode with no enumerated models must stay untouched: %#v", empty)
 	}
@@ -267,7 +269,7 @@ func TestModelDiscoveryCacheIsKeyedByBinaryAndReset(t *testing.T) {
 	t.Cleanup(resetCLIAgentModelProbeCache)
 	calls := 0
 	prev := cliAgentModelProbeRunner
-	cliAgentModelProbeRunner = func(string, []string, ...string) (string, bool) {
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) {
 		calls++
 		return realAntigravityModels, true
 	}
@@ -275,28 +277,28 @@ func TestModelDiscoveryCacheIsKeyedByBinaryAndReset(t *testing.T) {
 	now := time.Now()
 	old := detectedCLIAgent{Detected: true, Path: "/bin/agy", Version: "1.1.27"}
 	upgraded := detectedCLIAgent{Detected: true, Path: "/bin/agy", Version: "1.1.28"}
-	attachCLIAgentModelDiscovery("antigravity", old, &cliAgentUsage{}, "", now)
-	attachCLIAgentModelDiscovery("antigravity", old, &cliAgentUsage{}, "", now)
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", old, &cliAgentUsage{}, "", now)
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", old, &cliAgentUsage{}, "", now)
 	if calls != 1 {
 		t.Fatalf("same binary inside the TTL probed %d times", calls)
 	}
 	// A new version (or path) is a different binary: its list is asked for.
-	attachCLIAgentModelDiscovery("antigravity", upgraded, &cliAgentUsage{}, "", now)
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", upgraded, &cliAgentUsage{}, "", now)
 	if calls != 2 {
 		t.Fatalf("an upgraded binary must be re-probed (%d)", calls)
 	}
 	// A forced usage refresh empties the cache so a fresh login is seen now.
 	resetCLIAgentModelProbeCache()
-	attachCLIAgentModelDiscovery("antigravity", upgraded, &cliAgentUsage{}, "", now)
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", upgraded, &cliAgentUsage{}, "", now)
 	if calls != 3 {
 		t.Fatalf("reset must force a re-probe (%d)", calls)
 	}
 	// An inconclusive answer is cached too, so a broken CLI is not spawned
 	// every gather cycle.
-	cliAgentModelProbeRunner = func(string, []string, ...string) (string, bool) { calls++; return "", false }
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) { calls++; return "", false }
 	resetCLIAgentModelProbeCache()
-	attachCLIAgentModelDiscovery("antigravity", old, &cliAgentUsage{}, "", now)
-	attachCLIAgentModelDiscovery("antigravity", old, &cliAgentUsage{}, "", now.Add(time.Minute))
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", old, &cliAgentUsage{}, "", now)
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", old, &cliAgentUsage{}, "", now.Add(time.Minute))
 	if calls != 4 {
 		t.Fatalf("an inconclusive probe must be cached for the TTL (%d)", calls)
 	}
@@ -314,7 +316,125 @@ func TestClaudeModelDiscoveryScaleIsPerAliasCopy(t *testing.T) {
 }
 
 func TestRunCLIAgentModelProbeRejectsAnEmptyExecutable(t *testing.T) {
-	if out, ok := runCLIAgentModelProbe("   ", nil, "models"); ok || out != "" {
+	if out, ok := runCLIAgentModelProbe(context.Background(), "   ", nil, "models"); ok || out != "" {
 		t.Fatal("an empty executable is inconclusive")
+	}
+	// A nil context is the zero value a future caller could pass; it must not
+	// panic, it must behave as an unbounded parent under the probe's own cap.
+	if out, ok := runCLIAgentModelProbe(nil, "   ", nil, "models"); ok || out != "" { //nolint:staticcheck // nil ctx is the case under test
+		t.Fatal("an empty executable is inconclusive with a nil context")
+	}
+}
+
+// A probe whose parent deadline already expired is inconclusive AND must not
+// be cached: the 30-minute TTL would otherwise hide every model until it
+// lapsed, because one refresh happened to run out of time.
+func TestModelDiscoveryDoesNotCacheADeadlineExpiredProbe(t *testing.T) {
+	resetCLIAgentModelProbeCache()
+	prev := cliAgentModelProbeRunner
+	calls := 0
+	cliAgentModelProbeRunner = func(ctx context.Context, _ string, _ []string, _ ...string) (string, bool) {
+		calls++
+		if ctx.Err() != nil {
+			return "", false
+		}
+		return realAntigravityModels, true
+	}
+	t.Cleanup(func() { cliAgentModelProbeRunner = prev })
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+	detected := detectedCLIAgent{Detected: true, Path: "/bin/agy", Version: "1.1.27"}
+	now := time.Now()
+
+	starved := &cliAgentUsage{}
+	attachCLIAgentModelDiscovery(expired, "antigravity", detected, starved, "", now)
+	if len(starved.ModelDetails) != 0 {
+		t.Fatalf("an expired probe reported %d models, want none", len(starved.ModelDetails))
+	}
+
+	// Same TTL window, live context: the next gather must re-probe, not serve
+	// the inconclusive answer from the cache.
+	recovered := &cliAgentUsage{}
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", detected, recovered, "", now)
+	if len(recovered.ModelDetails) == 0 {
+		t.Fatal("a live probe inside the TTL must re-run rather than serve the expired miss")
+	}
+	if calls != 2 {
+		t.Fatalf("probe ran %d times, want 2 (the expired attempt must not be cached)", calls)
+	}
+}
+
+// canonicalProvider rejects a provider whose `models` list exceeds the same cap
+// it applies to `modelDetails`, so an over-cap vendor answer must be truncated
+// on BOTH fields — otherwise one large list fails the whole user refresh
+// instead of publishing the first cliUsageMaxModelsPerProvider entries.
+func TestModelDiscoveryCapsTheLegacyModelListToo(t *testing.T) {
+	resetCLIAgentModelProbeCache()
+	var lines strings.Builder
+	for i := 0; i < cliUsageMaxModelsPerProvider+7; i++ {
+		fmt.Fprintf(&lines, "vendor-model-%03d\tVendor Model %03d\n", i, i)
+	}
+	prev := cliAgentModelProbeRunner
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) {
+		return lines.String(), true
+	}
+	t.Cleanup(func() { cliAgentModelProbeRunner = prev })
+
+	usage := &cliAgentUsage{CliAgentID: "antigravity", Provider: "antigravity"}
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity",
+		detectedCLIAgent{Detected: true, Path: "/bin/agy", Version: "1.1.27"}, usage, "", time.Now())
+
+	if len(usage.ModelDetails) != cliUsageMaxModelsPerProvider {
+		t.Fatalf("modelDetails = %d, want the cap %d", len(usage.ModelDetails), cliUsageMaxModelsPerProvider)
+	}
+	if len(usage.Models) != cliUsageMaxModelsPerProvider {
+		t.Fatalf("models = %d, want the cap %d", len(usage.Models), cliUsageMaxModelsPerProvider)
+	}
+	if usage.Models[0] != "vendor-model-000" {
+		t.Fatalf("first retained model = %q, want the CLI order preserved", usage.Models[0])
+	}
+	// The receipt is what actually rejects an over-cap list; prove it accepts.
+	if _, err := canonicalProvider(*usage); err != nil {
+		t.Fatalf("canonicalProvider rejected a capped snapshot: %v", err)
+	}
+}
+
+// GROK_HOME chooses the login and cache directory the CLI uses, and
+// grokModelsCachePath reads that same override. The maintenance-smoke
+// sanitizer drops every GROK_* variable, so the model list needs its own
+// sanitizer that puts the state directory back — otherwise the listed models
+// and the merged cache describe two different accounts.
+func TestGrokModelListEnvKeepsTheStateDirectory(t *testing.T) {
+	env := []string{
+		"PATH=/usr/bin",
+		"GROK_HOME=/custom/grok/home",
+		"GROK_CURSOR_SKILLS_ENABLED=1",
+		"OTEL_EXPORTER_OTLP_ENDPOINT=http://collector",
+	}
+	got := sanitizeGrokModelListEnv(env)
+
+	var grokHome string
+	for _, entry := range got {
+		if name, value, found := strings.Cut(entry, "="); found && name == "GROK_HOME" {
+			grokHome = value
+		}
+		if strings.HasPrefix(entry, "OTEL_") {
+			t.Fatalf("telemetry variable survived: %q", entry)
+		}
+	}
+	if grokHome != "/custom/grok/home" {
+		t.Fatalf("GROK_HOME = %q, want the caller's override preserved", grokHome)
+	}
+	// The integration switches the smoke sanitizer forces off must stay off.
+	if !containsString(got, "GROK_CURSOR_SKILLS_ENABLED=0") {
+		t.Fatalf("workspace integration was not disabled: %#v", got)
+	}
+
+	// An environment with no override must not invent one.
+	for _, entry := range sanitizeGrokModelListEnv([]string{"PATH=/usr/bin"}) {
+		if strings.HasPrefix(entry, "GROK_HOME=") {
+			t.Fatalf("GROK_HOME invented from an environment that had none: %q", entry)
+		}
 	}
 }

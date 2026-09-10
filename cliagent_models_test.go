@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -222,7 +223,7 @@ func TestAttachCLIAgentModelDiscoveryEnrichesAndCaches(t *testing.T) {
 	t.Cleanup(resetCLIAgentModelProbeCache)
 	calls := 0
 	prev := cliAgentModelProbeRunner
-	cliAgentModelProbeRunner = func(executable string, env []string, args ...string) (string, bool) {
+	cliAgentModelProbeRunner = func(_ context.Context, executable string, env []string, args ...string) (string, bool) {
 		calls++
 		if !strings.HasSuffix(executable, "agy") || len(args) != 1 || args[0] != "models" {
 			t.Fatalf("unexpected probe %s %v", executable, args)
@@ -234,7 +235,7 @@ func TestAttachCLIAgentModelDiscoveryEnrichesAndCaches(t *testing.T) {
 	detected := detectedCLIAgent{Detected: true, Path: "/usr/local/bin/agy", Version: "1.1.27"}
 	now := time.Now()
 	usage := &cliAgentUsage{Provider: "antigravity"}
-	attachCLIAgentModelDiscovery("antigravity", detected, usage, "", now)
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", detected, usage, "", now)
 	if len(usage.ModelDetails) != 5 || usage.ModelsExhaustive == nil || !*usage.ModelsExhaustive {
 		t.Fatalf("snapshot not enriched: %#v", usage)
 	}
@@ -242,11 +243,11 @@ func TestAttachCLIAgentModelDiscoveryEnrichesAndCaches(t *testing.T) {
 		t.Fatalf("models = %v", usage.Models)
 	}
 	again := &cliAgentUsage{Provider: "antigravity"}
-	attachCLIAgentModelDiscovery("antigravity", detected, again, "", now.Add(time.Minute))
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", detected, again, "", now.Add(time.Minute))
 	if calls != 1 {
 		t.Fatalf("probe ran %d times inside the TTL", calls)
 	}
-	attachCLIAgentModelDiscovery("antigravity", detected, again, "", now.Add(cliAgentModelProbeTTL+time.Second))
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", detected, again, "", now.Add(cliAgentModelProbeTTL+time.Second))
 	if calls != 2 {
 		t.Fatalf("probe did not re-run after the TTL (%d)", calls)
 	}
@@ -256,13 +257,13 @@ func TestAttachCLIAgentModelDiscoveryLeavesUnknownAgentsAlone(t *testing.T) {
 	resetCLIAgentModelProbeCache()
 	t.Cleanup(resetCLIAgentModelProbeCache)
 	prev := cliAgentModelProbeRunner
-	cliAgentModelProbeRunner = func(string, []string, ...string) (string, bool) {
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) {
 		t.Fatal("no probe exists for this agent")
 		return "", false
 	}
 	t.Cleanup(func() { cliAgentModelProbeRunner = prev })
 	usage := &cliAgentUsage{Provider: "somethingElse"}
-	attachCLIAgentModelDiscovery("somethingElse", detectedCLIAgent{Detected: true, Path: "/bin/x"}, usage, "", time.Now())
+	attachCLIAgentModelDiscovery(context.Background(), "somethingElse", detectedCLIAgent{Detected: true, Path: "/bin/x"}, usage, "", time.Now())
 	if usage.ModelDetails != nil || usage.ModelsExhaustive != nil {
 		t.Fatalf("unexpected enrichment: %#v", usage)
 	}
@@ -270,7 +271,7 @@ func TestAttachCLIAgentModelDiscoveryLeavesUnknownAgentsAlone(t *testing.T) {
 
 func TestAttachCLIAgentModelDiscoveryReshapesOpenCode(t *testing.T) {
 	usage := &cliAgentUsage{Provider: "opencode", Models: []string{"ollama/qwen3-coder:30b", "opencode/big-pickle"}}
-	attachCLIAgentModelDiscovery("opencode", detectedCLIAgent{Detected: true}, usage, "", time.Now())
+	attachCLIAgentModelDiscovery(context.Background(), "opencode", detectedCLIAgent{Detected: true}, usage, "", time.Now())
 	want := []cliAgentModelDetail{{ID: "ollama/qwen3-coder:30b"}, {ID: "opencode/big-pickle"}}
 	if !reflect.DeepEqual(usage.ModelDetails, want) || usage.ModelsExhaustive == nil || !*usage.ModelsExhaustive {
 		t.Fatalf("got %#v", usage)
@@ -281,10 +282,10 @@ func TestAttachCLIAgentModelDiscoveryInconclusiveProbeReportsNothing(t *testing.
 	resetCLIAgentModelProbeCache()
 	t.Cleanup(resetCLIAgentModelProbeCache)
 	prev := cliAgentModelProbeRunner
-	cliAgentModelProbeRunner = func(string, []string, ...string) (string, bool) { return "", false }
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) { return "", false }
 	t.Cleanup(func() { cliAgentModelProbeRunner = prev })
 	usage := &cliAgentUsage{Provider: "grok"}
-	attachCLIAgentModelDiscovery("grok", detectedCLIAgent{Detected: true, Path: "/bin/grok"}, usage, "", time.Now())
+	attachCLIAgentModelDiscovery(context.Background(), "grok", detectedCLIAgent{Detected: true, Path: "/bin/grok"}, usage, "", time.Now())
 	if usage.ModelDetails != nil || usage.Models != nil || usage.ModelsExhaustive != nil {
 		t.Fatalf("an inconclusive probe must leave the snapshot untouched: %#v", usage)
 	}
@@ -362,10 +363,12 @@ func TestDiscoverGrokModelsMergesTheListWithTheCache(t *testing.T) {
 	}
 	t.Setenv("GROK_HOME", "")
 	prev := cliAgentModelProbeRunner
-	cliAgentModelProbeRunner = func(string, []string, ...string) (string, bool) { return realGrokModelsLoggedOut, true }
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) {
+		return realGrokModelsLoggedOut, true
+	}
 	t.Cleanup(func() { cliAgentModelProbeRunner = prev })
 
-	got, ok := discoverGrokModels(detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.0.13"}, home)
+	got, ok := discoverGrokModels(context.Background(), detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.0.13"}, home)
 	if !ok || !got.Exhaustive || got.DefaultModel != "grok-4.6" {
 		t.Fatalf("got ok=%v %#v", ok, got)
 	}
@@ -381,22 +384,28 @@ func TestDiscoverGrokModelsMergesTheListWithTheCache(t *testing.T) {
 	}
 
 	// A cache from another Grok build is not the whole story.
-	stale, _ := discoverGrokModels(detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.1.0"}, home)
+	stale, _ := discoverGrokModels(context.Background(), detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.1.0"}, home)
 	if stale.Exhaustive {
 		t.Fatal("cache from another build must be non-exhaustive")
 	}
 
 	// No cache: the list alone, scales unknown.
-	bare, ok := discoverGrokModels(detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.0.13"}, t.TempDir())
+	bare, ok := discoverGrokModels(context.Background(), detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.0.13"}, t.TempDir())
 	if !ok || len(bare.Models) != 2 || bare.Models[0].Efforts != nil {
 		t.Fatalf("bare = %#v", bare)
 	}
 
 	// No list either: the cache's visible models, alphabetical.
-	cliAgentModelProbeRunner = func(string, []string, ...string) (string, bool) { return "", false }
-	cacheOnly, ok := discoverGrokModels(detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.0.13"}, home)
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) { return "", false }
+	cacheOnly, ok := discoverGrokModels(context.Background(), detectedCLIAgent{Detected: true, Path: "/x/grok", Version: "grok 1.0.13"}, home)
 	if !ok || len(cacheOnly.Models) != 3 || cacheOnly.Models[0].ID != "grok-4.5" {
 		t.Fatalf("cacheOnly = %#v", cacheOnly)
+	}
+	// Grok fetches this catalog from its backend, so a matching build version
+	// does not make a cache current. Without the list command to confirm it,
+	// the answer is a floor and must never veto a model the CLI accepts.
+	if cacheOnly.Exhaustive {
+		t.Fatal("a cache-only answer must be non-exhaustive even when the build version matches")
 	}
 }
 

@@ -216,7 +216,7 @@ func gatherCLIAgentUsage(detected map[string]detectedCLIAgent, now time.Time) []
 		if usage.CliAgentID == "" {
 			usage.CliAgentID = agent.ID
 		}
-		attachCLIAgentModelDiscovery(agent.ID, entry, usage, home, now)
+		attachCLIAgentModelDiscovery(context.Background(), agent.ID, entry, usage, home, now)
 		if usage.AccountFingerprint == "" {
 			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}
@@ -335,7 +335,7 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 		if usage.CliAgentID == "" {
 			usage.CliAgentID = agent.ID
 		}
-		attachCLIAgentModelDiscovery(agent.ID, entry, usage, home, now)
+		attachCLIAgentModelDiscovery(gatherCtx, agent.ID, entry, usage, home, now)
 		if usage.AccountFingerprint == "" {
 			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}
