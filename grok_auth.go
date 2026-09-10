@@ -506,6 +506,14 @@ func grokProjectPinnedCredential(cwd string) bool {
 
 // grokProjectPinnedCredentialFrom walks one absolute chain upward, stopping at
 // the volume root or grokProjectConfigMaxDepth.
+//
+// Reaching the DEPTH bound before the root CONTESTS, like every other
+// incomplete credential scan here: grok's own upward discovery is not bounded
+// by our cap, so an ancestor above it can still pin `model.api_key` for the
+// child. Exhausting the cap means "we could not finish looking", which is not
+// "there is nothing there" — reporting the cached-login identity for a run that
+// may bill a pinned API-key account is a billing lie, while contesting costs
+// only that session's observability.
 func grokProjectPinnedCredentialFrom(dir string) bool {
 	for depth := 0; depth < grokProjectConfigMaxDepth; depth++ {
 		if grokConfigPinsCredential(filepath.Join(dir, ".grok", "config.toml")) {
@@ -517,5 +525,5 @@ func grokProjectPinnedCredentialFrom(dir string) bool {
 		}
 		dir = parent
 	}
-	return false
+	return true
 }

@@ -910,3 +910,81 @@ func TestGrokDirectRunBillingIdentity_ResolvesARelativeConfigPathAgainstTheChild
 		})
 	}
 }
+
+// A multiline TOML string whose BODY contains a section-like line is content,
+// not configuration — grok's own parser never opens a table for it. Reading it
+// as a header re-scoped every following assignment under a table that does not
+// exist, so a root `model.api_key` was classified as `other.model.api_key`,
+// looked like no pinned credential, and the run was published under the cached
+// login while the CLI billed the pinned API-key account.
+func TestGrokConfigPinsCredential_IgnoresSectionLinesInsideMultilineStrings(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := "notes = \"\"\"\n[other]\nnot an assignment = 1\n\"\"\"\n[model]\napi_key = \"xai-multiline-shadowed-sentinel\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if !grokConfigPinsCredential(path) {
+		t.Fatal("pinned credential missed: a `[other]` line inside a multiline string body was read as a section header")
+	}
+
+	keys := map[string]string{}
+	if complete := walkGrokTOMLAssignments(path, func(key, value string) bool {
+		keys[key] = value
+		return true
+	}); !complete {
+		t.Fatal("sweep reported incomplete for a config whose multiline string closes")
+	}
+	if _, ok := keys["model.api_key"]; !ok {
+		t.Fatalf("keys = %v, want the root-scoped model.api_key", keys)
+	}
+	for key := range keys {
+		if strings.HasPrefix(key, "other.") {
+			t.Fatalf("key %q was scoped under a table that only exists inside a string body", key)
+		}
+	}
+}
+
+// A multiline string that never closes leaves everything after its opener
+// unclassified, so the sweep reports INCOMPLETE and its callers contest rather
+// than reporting a credential they simply never scanned.
+func TestGrokConfigPinsCredential_ContestsAnUnterminatedMultilineString(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte("notes = \"\"\"\nstill open\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if complete := walkGrokTOMLAssignments(path, func(string, string) bool { return true }); complete {
+		t.Fatal("sweep reported complete over a multiline string that never closes")
+	}
+	if !grokConfigPinsCredential(path) {
+		t.Fatal("an unterminated multiline string must CONTEST — the unread remainder may pin a credential")
+	}
+}
+
+// Grok's upward `.grok/config.toml` discovery is not bounded by our depth cap,
+// so exhausting the cap before the filesystem root means "we could not finish
+// looking", not "there is nothing there". Naming the cached login for a run
+// that may bill a pinned API-key account is a billing lie; contesting costs
+// only that session's observability.
+func TestGrokDirectRunBillingIdentity_ContestsWhenTheProjectWalkHitsItsDepthCap(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	helperNoGrokSystemConfigLayers(t)
+	base := helperGrokHomeWithAccount(t, "acct-login")
+
+	root := t.TempDir()
+	deep := root
+	for i := 0; i < grokProjectConfigMaxDepth+2; i++ {
+		deep = filepath.Join(deep, "d")
+	}
+	if err := os.MkdirAll(deep, 0o700); err != nil {
+		t.Skipf("cannot build a %d-level path on this platform: %v", grokProjectConfigMaxDepth+2, err)
+	}
+	if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{Cwd: deep}, base); got != grokContestedBillingIdentity {
+		t.Fatalf("identity = %q, want the contested sentinel when the upward walk exhausts its depth cap", got)
+	}
+	// A shallow launch under the same clean root still completes its walk.
+	if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{Cwd: root}, base); got != "acct-login" {
+		t.Fatalf("identity = %q, want the cached login for a walk that reaches the root", got)
+	}
+}

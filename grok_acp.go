@@ -1540,8 +1540,25 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 	scanner := bufio.NewScanner(counted)
 	scanner.Buffer(make([]byte, 64*1024), 256*1024)
 	var currentSection string
+	// openMultiline holds the delimiter of a multiline string whose body is
+	// still running. Those lines are CONTENT, not configuration: a `[other]`
+	// inside one is text grok's own parser never applies, and reading it
+	// re-scoped every FOLLOWING assignment under a table that does not exist —
+	// a root `model.api_key` classified as `other.model.api_key` reads as no
+	// pinned credential, which is exactly the misattribution this sweep exists
+	// to prevent.
+	var openMultiline string
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		raw := scanner.Text()
+		if openMultiline != "" {
+			if strings.Contains(raw, openMultiline) {
+				// TOML permits nothing but a comment after a closing
+				// delimiter, so the rest of this line carries no assignment.
+				openMultiline = ""
+			}
+			continue
+		}
+		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -1566,15 +1583,20 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 			// named the cached login for an API-key-billed run.
 			key = currentSection + "." + key
 		}
-		if !visit(key, strings.TrimSpace(line[eq+1:])) {
+		value := strings.TrimSpace(line[eq+1:])
+		openMultiline = grokTOMLMultilineOpener(value)
+		if !visit(key, value) {
 			// A caller that stops early has the answer it came for, so the
 			// unread remainder is not a gap in what it decided.
 			return true
 		}
 	}
 	// A line longer than the scanner's buffer, or a read error, ends the sweep
-	// with content still unread; so does hitting the tail bound.
-	return scanner.Err() == nil && counted.n <= maxBytes
+	// with content still unread; so does hitting the tail bound. So does a
+	// multiline string that never closes: everything after its opener was
+	// skipped as body, so an assignment the child's parser still applies may
+	// sit in the part this sweep never classified.
+	return scanner.Err() == nil && counted.n <= maxBytes && openMultiline == ""
 }
 
 // countingReader counts the bytes it has handed on, so walkGrokTOMLAssignments
@@ -1683,13 +1705,22 @@ func encodeGrokTOMLKeySegment(seg string) string {
 // line — the one value shape this line-oriented sweep cannot read, because the
 // rest of it lives on lines the sweep sees as unrelated.
 func grokTOMLValueOpensMultiline(value string) bool {
+	return grokTOMLMultilineOpener(value) != ""
+}
+
+// grokTOMLMultilineOpener returns the delimiter of the multiline string a raw
+// right-hand side OPENS without closing, or "" when the value is complete on
+// its own line. Single-sourced with grokTOMLValueOpensMultiline so the sweep's
+// "skip this body" decision and the callers' "contest this value" decision
+// cannot disagree about which values run past their line.
+func grokTOMLMultilineOpener(value string) string {
 	v := strings.TrimSpace(value)
 	for _, delim := range []string{`"""`, "'''"} {
 		if strings.HasPrefix(v, delim) && !strings.Contains(v[len(delim):], delim) {
-			return true
+			return delim
 		}
 	}
-	return false
+	return ""
 }
 
 // decodeGrokTOMLEscape decodes ONE escape sequence from the body of a TOML
