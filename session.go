@@ -87,6 +87,12 @@ type CLISession struct {
 	isolatedGrokHome   string
 	persistentGrokHome string
 
+	// grokLimitNoticeScope is the account this session's Grok limit notices may
+	// be cached under, frozen at spawn. Zero value for every non-Grok command
+	// and for a Grok run whose producer is contested — captureGrokUsageLimitLine
+	// then caches nothing rather than filing one account's limit under another's.
+	grokLimitNoticeScope grokLimitNoticeScope
+
 	// antigravityManagedStream is true only when StartSession shaped this
 	// invocation into agy's managed stream-json protocol. Raw diagnostics such
 	// as `agy --version` also use the pipe reader, but legitimately exit without
@@ -526,6 +532,14 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// arm and re-names us in its own payload, or lands before it and is
 	// corrected by the check below (both serialize on the same write lock).
 	var finishGrokAttribution func()
+	// Frozen here, next to the arm, for the same reason the arm is: the child
+	// bills the credentials it is SPAWNED with. A maintenance smoke bills the
+	// login copied into its isolated home; a direct run bills the persistent
+	// home unless an override contests it.
+	var grokLimitScope grokLimitNoticeScope
+	if isGrokCommand(command) && isolatedGrokHome != "" {
+		grokLimitScope = grokAccountLimitNoticeScope(isolatedGrokHome)
+	}
 	if isGrokCommand(command) && isolatedGrokHome == "" {
 		// The identity is CAPTURED here and re-asserted as-is for the life of the
 		// run. The child keeps writing records under the credentials it is spawned
@@ -575,6 +589,8 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		// that disagreed with the arm would be reasserted back to the stale
 		// account on the keeper's next tick. One decision, used twice.
 		ensureGrokBillingIdentityNamed(grokBase, directIdentity)
+		// Same single decision, third use: a contested arm caches no notice.
+		grokLimitScope = grokDirectRunLimitNoticeScope(directIdentity, grokBase)
 	}
 
 	// Start the process
@@ -624,6 +640,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		promptFile:                   promptFile,
 		isolatedGrokHome:             isolatedGrokHome,
 		persistentGrokHome:           persistentGrokHome,
+		grokLimitNoticeScope:         grokLimitScope,
 		antigravityManagedStream:     antigravityManagedStream,
 		finishQuotaCapture:           finishQuotaCapture,
 		finishGrokBillingAttribution: finishGrokAttribution,
@@ -1468,7 +1485,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// the cap. Capture it (best-effort) so the CLI Agents card can show a
 			// warning instead of a permanently-Unknown bar.
 			if isGrokCommand(session.Command) {
-				captureGrokUsageLimitLine(line.text, time.Now())
+				captureGrokUsageLimitLine(line.text, time.Now(), session.grokLimitNoticeScope)
 			}
 
 			if isClaudeCommand(session.Command) {

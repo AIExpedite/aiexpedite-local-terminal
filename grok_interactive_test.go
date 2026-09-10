@@ -1770,7 +1770,7 @@ func TestCaptureGrokUsageLimitLine_RemainsNoticeOnly(t *testing.T) {
 		`{"ts":"2026-08-17T23:02:12Z","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":33}}}`,
 		`{"type":"tool_result","credit_limit_percent":42,"used":12,"credits":50,"credential":"secret"}`,
 	} {
-		captureGrokUsageLimitLine(line, now)
+		captureGrokUsageLimitLine(line, now, grokLimitNoticeScope{fingerprint: "account-fingerprint", cacheable: true})
 	}
 	if _, err := os.Stat(cache); !os.IsNotExist(err) {
 		t.Fatalf("billing-shaped and generic numeric ACP frames must not write the notice cache: %v", err)

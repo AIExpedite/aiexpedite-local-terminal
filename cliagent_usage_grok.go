@@ -691,7 +691,15 @@ func grokIdentityCandidates(base string) []string {
 // Returns "" when no auth is readable (best-effort, matches the codex analog).
 func currentGrokAccountFingerprint() string {
 	home, _ := os.UserHomeDir()
-	base := firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
+	return grokAccountFingerprintFor(firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok")))
+}
+
+// grokAccountFingerprintFor is the same fingerprint for an EXPLICIT Grok home
+// rather than the ambient one. The limit-notice capture path scopes its cache
+// to the home the producing child actually ran under — an isolated ACP/smoke
+// home, or the persistent home a direct run was spawned against — which is not
+// necessarily the home this process resolves at the moment a frame arrives.
+func grokAccountFingerprintFor(base string) string {
 	if base == "" {
 		return ""
 	}

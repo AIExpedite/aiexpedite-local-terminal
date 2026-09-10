@@ -81,10 +81,61 @@ func grokUsageLimitCachePath() string {
 	return filepath.Join(GetConfigDir(), "grok_usage_limit.json")
 }
 
+// grokLimitNoticeScope is the account ONE running Grok session's limit notices
+// may be cached under, frozen at session start.
+//
+// The cache is keyed by account fingerprint so a stale limit cannot bleed onto
+// a different account. Re-reading that fingerprint per frame — off whatever
+// login the ambient Grok home holds at that instant — answers the wrong
+// question twice. A direct child spawned with a credential override bills an
+// account the cached login does not name (the disagreement
+// grokDirectRunBillingIdentity already contests), and a managed ACP/smoke child
+// keeps billing its own isolated login even after a `grok login` re-points the
+// persistent home mid-session. Either way the notice is filed under an account
+// that did not produce it and shows there for grokLimitNoticeTTL.
+//
+// cacheable is false when nobody may be named for the producer — the contested
+// case. It is deliberately NOT "cache under some other key": a write with a
+// different fingerprint discards the prior state outright, so caching a
+// contested notice would also drop a still-live reached state belonging to the
+// account that legitimately earned it. Dropping the notice matches what the
+// billing path does for the same producer (falls back to unobservable).
+type grokLimitNoticeScope struct {
+	fingerprint string
+	cacheable   bool
+}
+
+// grokAccountLimitNoticeScope freezes the scope for a session whose child runs
+// under the login in `base` — an isolated ACP/smoke home, or the persistent
+// home of an uncontested direct run.
+func grokAccountLimitNoticeScope(base string) grokLimitNoticeScope {
+	if base == "" {
+		return grokLimitNoticeScope{}
+	}
+	return grokLimitNoticeScope{fingerprint: grokAccountFingerprintFor(base), cacheable: true}
+}
+
+// grokDirectRunLimitNoticeScope freezes the scope for a DIRECT (PTY) run.
+//
+// identity is the value the attribution keeper was ARMED with — the single
+// direct-arm decision — so this refuses the cache for exactly the producers the
+// billing log refuses to name, and never re-resolves credentials that may have
+// changed since the arm.
+func grokDirectRunLimitNoticeScope(identity, base string) grokLimitNoticeScope {
+	if identity == "" || strings.EqualFold(identity, grokContestedBillingIdentity) {
+		return grokLimitNoticeScope{}
+	}
+	return grokAccountLimitNoticeScope(base)
+}
+
 // captureGrokUsageLimitLine parses one stdout line from a Grok streaming-json
 // session and, if it carries a usage-limit / credit-limit / access-gate signal,
-// records it in the on-disk cache. Best-effort; silent on every failure.
-func captureGrokUsageLimitLine(line string, now time.Time) {
+// records it in the on-disk cache under the session-frozen `scope`.
+// Best-effort; silent on every failure.
+func captureGrokUsageLimitLine(line string, now time.Time, scope grokLimitNoticeScope) {
+	if !scope.cacheable {
+		return
+	}
 	trimmed := strings.TrimSpace(line)
 	if !strings.HasPrefix(trimmed, "{") {
 		return
@@ -110,7 +161,7 @@ func captureGrokUsageLimitLine(line string, now time.Time) {
 	if !ok {
 		return
 	}
-	writeGrokUsageLimitState(grokUsageLimitCachePath(), state, currentGrokAccountFingerprint())
+	writeGrokUsageLimitState(grokUsageLimitCachePath(), state, scope.fingerprint)
 }
 
 // grokBillingAttributionSerialize serializes the read-then-append below so two

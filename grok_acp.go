@@ -192,6 +192,12 @@ type GrokACPSession struct {
 	// waitForExit merges only the session's normalized account-bound billing
 	// snapshot here; the child never receives this path as its log directory.
 	PersistentHome string
+	// limitNoticeScope is the account this session's limit notices may be
+	// cached under, read ONCE from IsolatedHome at Start. The child bills the
+	// login copied into that home for its whole life, so a `grok login` against
+	// PersistentHome mid-session must not re-file this session's notices under
+	// the new account.
+	limitNoticeScope grokLimitNoticeScope
 
 	mu            sync.Mutex
 	status        string // "running" | "ended"
@@ -532,23 +538,24 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	}
 
 	session := &GrokACPSession{
-		ID:             id,
-		Process:        proc,
-		Stdin:          stdin,
-		Stdout:         stdout,
-		Stderr:         stderr,
-		StartedAt:      time.Now(),
-		WorkspaceID:    workspaceID,
-		UID:            uid,
-		TimeoutMs:      timeoutMs,
-		WorkspaceRoot:  resolvedRoot,
-		IsolatedHome:   isolatedHome,
-		PersistentHome: persistentHome,
-		status:         "running",
-		done:           make(chan struct{}),
-		processExited:  make(chan struct{}),
-		streamDone:     make(chan struct{}),
-		firstFrame:     make(chan struct{}),
+		ID:               id,
+		Process:          proc,
+		Stdin:            stdin,
+		Stdout:           stdout,
+		Stderr:           stderr,
+		StartedAt:        time.Now(),
+		WorkspaceID:      workspaceID,
+		UID:              uid,
+		TimeoutMs:        timeoutMs,
+		WorkspaceRoot:    resolvedRoot,
+		IsolatedHome:     isolatedHome,
+		PersistentHome:   persistentHome,
+		limitNoticeScope: grokAccountLimitNoticeScope(isolatedHome),
+		status:           "running",
+		done:             make(chan struct{}),
+		processExited:    make(chan struct{}),
+		streamDone:       make(chan struct{}),
+		firstFrame:       make(chan struct{}),
 	}
 
 	m.sessions[id] = session
@@ -1096,7 +1103,7 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 			// stream. The raw `session_start` path in session.go already calls
 			// captureGrokUsageLimitLine; without mirroring it here, the CLI
 			// Agents card stays Unknown for the primary Grok flow.
-			captureGrokUsageLimitLine(trimmed, time.Now())
+			captureGrokUsageLimitLine(trimmed, time.Now(), session.limitNoticeScope)
 
 			if !publishOrFail(resultMsg{
 				ID:          session.ID,
