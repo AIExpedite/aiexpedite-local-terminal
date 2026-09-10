@@ -189,6 +189,31 @@ func grokDirectRunBillingIdentity(launch grokDirectRunLaunch, base string) strin
 	return identity
 }
 
+// grokArmableBillingIdentity is the ONE normalization a live direct arm goes
+// through before it is either armed on the keeper or written as a marker.
+//
+// An arm whose identity could not be RESOLVED is not an arm with no opinion —
+// it is a live run whose records we cannot honestly name. The contested
+// sentinel is exactly that statement ("someone is live that nobody may be
+// named for"), it is already what a credential override arms with, and it
+// matches no account, so those records are refused rather than bound to
+// whichever account the log happens to end under.
+//
+// It is a helper rather than logic buried inside the keeper because the caller
+// must apply it to BOTH calls: normalizing only inside the keeper left the
+// pre-spawn marker holding the original empty value, and
+// ensureGrokBillingIdentityNamed no-ops on empty — so an unresolved arm wrote
+// no marker at all, and the child's first identity-less billing record bound to
+// whatever earlier account marker the log still ended under and was published
+// as that account's utilization.
+func grokArmableBillingIdentity(identity string) string {
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return grokContestedBillingIdentity
+	}
+	return identity
+}
+
 // ensureGrokBillingIdentityNamed is the same guard for a CAPTURED account
 // rather than whichever one the credentials resolve to right now.
 //
@@ -507,21 +532,11 @@ func grokFoldRune(r rune) rune {
 // same read). Mirrors startAntigravityQuotaCapture's run-scoped, ref-counted
 // arm/release shape.
 func startGrokBillingAttributionKeeper(identity string) (finish func()) {
-	identity = strings.TrimSpace(identity)
-	if identity == "" {
-		// An arm whose identity could not be RESOLVED is not an arm with no
-		// opinion — it is a live run whose records we cannot honestly name.
-		// Excluding it from the account map made it invisible to disagreement
-		// detection, so a second run under account A would see itself as the
-		// only armed account, name A, and every record the unresolved run went
-		// on to write would bind to A and be published as A's utilization.
-		//
-		// The contested sentinel is exactly that statement ("someone is live
-		// that nobody may be named for"), and it is already what a credential
-		// override arms with, so one representation covers both unnameable
-		// cases. It matches no account, so the records are refused instead.
-		identity = grokContestedBillingIdentity
-	}
+	// Idempotent: StartSession normalizes BEFORE arming so its pre-spawn marker
+	// carries the same value, and re-applying here keeps every other caller —
+	// and the invariant that an unresolved arm is never invisible to
+	// disagreement detection — independent of that.
+	identity = grokArmableBillingIdentity(identity)
 	grokAttributionKeeperMu.Lock()
 	grokAttributionKeeperRefs++
 	if identity != "" {

@@ -561,7 +561,13 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		}
 		grokLaunch := grokDirectRunLaunch{Env: filtered, Cwd: grokChildCwd, Args: cliArgs}
 		grokBase := grokPersistentHome()
-		directIdentity := grokDirectRunBillingIdentity(grokLaunch, grokBase)
+		// Normalized HERE, before either use. An unresolved resolution is still
+		// a live run whose records nobody may be named for, and the keeper's own
+		// normalization only reached the keeper: the marker call below no-ops on
+		// an empty identity, so the log kept ending under an EARLIER account's
+		// marker and this child's first identity-less billing record bound to
+		// it. One value, armed and written.
+		directIdentity := grokArmableBillingIdentity(grokDirectRunBillingIdentity(grokLaunch, grokBase))
 		finishGrokAttribution = startGrokBillingAttributionKeeper(directIdentity)
 		// Names the identity the keeper was ARMED with, never a re-resolution of
 		// the same credentials: the sources it reads (the auth cache, config

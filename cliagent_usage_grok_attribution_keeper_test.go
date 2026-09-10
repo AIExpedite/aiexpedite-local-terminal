@@ -899,3 +899,56 @@ func TestGrokBillingAttributionKeeper_ContestsAnUnresolvedArm(t *testing.T) {
 		t.Fatal("a record written while an unresolved run was live was attributed to acct-1")
 	}
 }
+
+// StartSession's pre-spawn MARKER — not just the keeper's arm map — has to
+// carry the unresolved arm's contested value. The keeper normalized "" to the
+// sentinel internally, but the marker call still received the original empty
+// string and ensureGrokBillingIdentityNamed no-ops on empty, so a log that
+// already ended under an earlier account's marker kept naming that account:
+// the unresolved child's first identity-less billing record bound to it and was
+// published as that account's utilization. Mirrors StartSession's exact
+// sequence (normalize once, arm, then name).
+func TestGrokBillingAttribution_UnresolvedArmContestsAnEarlierAccountMarker(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	// The log already ends under an earlier run's honest acct-1 marker.
+	helperAppendGrokLogLine(t, base, helperGrokIdentityLine(t, "acct-1"))
+
+	directIdentity := grokArmableBillingIdentity("")
+	release := startGrokBillingAttributionKeeper(directIdentity)
+	defer release()
+	ensureGrokBillingIdentityNamed(base, directIdentity)
+
+	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("marker = %q — an unresolved arm must displace the earlier "+
+			"account marker rather than leave the log vouching for it", last)
+	}
+
+	helperAppendGrokLogLine(t, base,
+		grokUnmeteredLine(time.Now().UTC().Format(time.RFC3339), grokBillingLogMessage))
+	if _, ok := readGrokBillingSnapshot(base, []string{"acct-1"}); ok {
+		t.Fatal("a record written by an unresolved direct run was attributed to acct-1")
+	}
+}
+
+// The normalization must happen ONCE, before both uses — a caller that hands
+// the raw resolution to the marker gets no marker at all, which is the whole
+// defect. Pins that grokArmableBillingIdentity is what StartSession arms and
+// names with.
+func TestGrokArmableBillingIdentity_ContestsOnlyTheUnresolvedValue(t *testing.T) {
+	if got := grokArmableBillingIdentity(""); got != grokContestedBillingIdentity {
+		t.Fatalf("grokArmableBillingIdentity(\"\") = %q, want the contested sentinel", got)
+	}
+	if got := grokArmableBillingIdentity("   "); got != grokContestedBillingIdentity {
+		t.Fatalf("grokArmableBillingIdentity(blank) = %q, want the contested sentinel", got)
+	}
+	if got := grokArmableBillingIdentity(" acct-1 "); got != "acct-1" {
+		t.Fatalf("grokArmableBillingIdentity(padded) = %q, want the trimmed account", got)
+	}
+	if got := grokArmableBillingIdentity(grokContestedBillingIdentity); got != grokContestedBillingIdentity {
+		t.Fatalf("grokArmableBillingIdentity(sentinel) = %q, want it unchanged", got)
+	}
+}
