@@ -366,14 +366,22 @@ Three rules keep a probe from doing damage on the way:
   deadline — can never be held past that by a slow `agy models`. An
   inconclusive probe whose context expired is NOT cached, or one refresh that
   ran out of time would hide the agent's models for the whole 30-minute TTL.
-- **`grok models` runs under the same credential surface as an ACP session.**
-  `sanitizeGrokModelListEnv` is the maintenance-smoke sanitizer with `GROK_HOME`
-  put back (the smoke sanitizer drops every `GROK_*` var, but that override
-  chooses the login and cache directory, so dropping it would list one account's
-  models and merge another account's cache) and with `XAI_API_KEY` put back ONLY
-  when `Config.EnableGrokAPIKeyFallback` is on — the same opt-in the ACP launch
-  honours — so a key-authenticated host does not list logged-out and publish
-  that as the catalog.
+- **`grok models` describes the same service, config and login as an ACP
+  session.** `sanitizeGrokModelListEnv` starts from the maintenance-smoke
+  sanitizer (every `GROK_*` stripped, telemetry / Rust noise dropped, the
+  `grokNeutralisedIntegrationSwitches` pinned to 0) and restores an explicit
+  allowlist — `grokModelListRoutingEnv`: `GROK_HOME` (the login and cache
+  directory the merged cache is read from), `GROK_CONFIG_PATH`, the endpoint
+  overrides (`GROK_API_BASE_URL`, `GROK_MODELS_BASE_URL`,
+  `GROK_MODELS_LIST_URL`, `XAI_API_BASE_URL`) — plus `XAI_API_KEY` ONLY when
+  `Config.EnableGrokAPIKeyFallback` is on, the same opt-in the ACP launch
+  honours. Not the whole `GROK_*` family: `GROK_LOG_FILE` and
+  `GROK_FUTURE_EXECUTION_OVERRIDE` change what a headless child DOES (a raw
+  diagnostics sink outside the isolated home, a swapped execution path) and
+  the smoke suite pins that no such sink is ever written. Listing with the
+  routing vars stripped would ask the default service for a catalog the
+  configured sessions never use, or list logged-out on a key-authenticated
+  host, and publish that as exhaustive.
 - **Codex without a models cache still reports its configured model.** A fresh
   install or a cleared cache reports the top-level `model` from `config.toml`
   (basic `"…"` or literal `'…'` string) as a one-model, non-exhaustive floor,

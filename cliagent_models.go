@@ -582,29 +582,56 @@ type grokModelsCacheFile struct {
 // models and merge another home's cache, so the snapshot would describe an
 // account this device never runs.
 func sanitizeGrokModelListEnv(env []string) []string {
+	// The read-only list must describe the SAME service, config and login as
+	// the ACP sessions it stands for: GROK_HOME (the login and cache directory
+	// the merged cache is read from), the endpoint overrides
+	// (GROK_MODELS_LIST_URL, GROK_MODELS_BASE_URL, GROK_API_BASE_URL,
+	// XAI_API_BASE_URL), GROK_CONFIG_PATH — and XAI_API_KEY only when the user
+	// opted into Config.EnableGrokAPIKeyFallback, the opt-in sanitizeGrokACPEnv
+	// honours. Listing with all of those stripped would ask the default
+	// service for a catalog the configured sessions never use (or list
+	// logged-out on a key-authenticated host) and publish it as exhaustive.
+	//
+	// But NOT every GROK_* var: the maintenance smoke strips the family
+	// wholesale because some of it changes what a non-interactive child DOES
+	// (GROK_LOG_FILE writes raw diagnostics outside the isolated home,
+	// GROK_FUTURE_EXECUTION_OVERRIDE swaps the execution path), and the smoke
+	// suite pins that no such sink is ever written. So the probe starts from
+	// the smoke sanitizer and restores an explicit allowlist: the variables
+	// that decide WHICH service, config and login the session talks to.
 	filtered := sanitizeGrokMaintenanceSmokeEnv(env)
-	// The read-only list must run under the SAME credential surface as the
-	// ACP sessions it describes: GROK_HOME (the login and cache directory the
-	// merged cache is read from) always, and XAI_API_KEY only when the user
-	// opted into Config.EnableGrokAPIKeyFallback — exactly what
-	// sanitizeGrokACPEnv keeps for a session. Otherwise a key-authenticated
-	// host would list logged-out (or nothing) and publish that as exhaustive.
 	allowAPIKey := grokAPIKeyFallbackOptedIn()
 	for _, entry := range env {
 		name, value, found := strings.Cut(entry, "=")
 		if !found {
 			continue
 		}
-		switch strings.ToUpper(strings.TrimSpace(name)) {
-		case "GROK_HOME":
-			filtered = setEnvVar(filtered, "GROK_HOME", value)
-		case "XAI_API_KEY":
+		upper := strings.ToUpper(strings.TrimSpace(name))
+		if upper == "XAI_API_KEY" {
 			if allowAPIKey {
 				filtered = setEnvVar(filtered, "XAI_API_KEY", value)
 			}
+			continue
+		}
+		if containsString(grokModelListRoutingEnv, upper) {
+			filtered = setEnvVar(filtered, upper, value)
 		}
 	}
 	return filtered
+}
+
+// grokModelListRoutingEnv is the configuration an ACP session inherits that
+// decides which service, config file and login `grok models` must describe —
+// restored on top of the maintenance-smoke sanitizer, which strips them with
+// the rest of GROK_*. Nothing here changes what the child does, only where it
+// looks.
+var grokModelListRoutingEnv = []string{
+	"GROK_HOME",
+	"GROK_CONFIG_PATH",
+	"GROK_API_BASE_URL",
+	"GROK_MODELS_BASE_URL",
+	"GROK_MODELS_LIST_URL",
+	"XAI_API_BASE_URL",
 }
 
 // grokAPIKeyFallbackOptedIn reads the live config's API-key opt-in — the same
