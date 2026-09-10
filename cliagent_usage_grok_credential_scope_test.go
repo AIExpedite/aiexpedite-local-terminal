@@ -962,6 +962,94 @@ func TestGrokConfigPinsCredential_ContestsAnUnterminatedMultilineString(t *testi
 	}
 }
 
+// A multi-line ARRAY body is value content too, and its nested `[1, 2]` line
+// satisfies the same section-header test a `[other]` header does. Reading it as
+// a header re-scoped every following assignment under a table that does not
+// exist (`1,2.model.api_key`), so the root credential looked unpinned and the
+// attribution guard named the cached login for a run grok bills by API key.
+func TestGrokConfigPinsCredential_IgnoresSectionLinesInsideMultilineArrays(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `x = [
+[1, 2],
+]
+[model]
+api_key = "xai-array-shadowed-sentinel"
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if !grokConfigPinsCredential(path) {
+		t.Fatal("pinned credential missed: an array body line was read as a section header")
+	}
+
+	keys := map[string]string{}
+	if complete := walkGrokTOMLAssignments(path, func(key, value string) bool {
+		keys[key] = value
+		return true
+	}); !complete {
+		t.Fatal("sweep reported incomplete for a config whose multi-line array closes")
+	}
+	if _, ok := keys["model.api_key"]; !ok {
+		t.Fatalf("keys = %v, want the model-scoped model.api_key", keys)
+	}
+	for key := range keys {
+		if strings.Contains(key, "1,2") {
+			t.Fatalf("key %q was scoped under an array body line read as a table", key)
+		}
+	}
+}
+
+// An array of inline tables is the shape operators actually hand-format across
+// lines, and each `{action = "allow"}` body line carries an `=`. Those are not
+// assignments in the enclosing table, so the sweep must not hand them to visit.
+func TestGrokTOMLWalk_SkipsInlineTableBodiesInsideMultilineArrays(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := `permission_rules = [
+{action = "allow", tool = "Bash"},
+]
+[model]
+api_key = "xai-inline-table-sentinel"
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	keys := map[string]string{}
+	if complete := walkGrokTOMLAssignments(path, func(key, value string) bool {
+		keys[key] = value
+		return true
+	}); !complete {
+		t.Fatalf("sweep reported incomplete for a closed array of inline tables")
+	}
+	if _, ok := keys["action"]; ok {
+		t.Fatalf("keys = %v, want no assignment lifted out of an inline-table array body", keys)
+	}
+	if _, ok := keys["model.api_key"]; !ok {
+		t.Fatalf("keys = %v, want the credential that follows the array", keys)
+	}
+}
+
+// A composite value that never closes leaves the remainder unclassified, so the
+// sweep reports INCOMPLETE and its callers contest rather than reporting a
+// credential they never scanned — the same contract an unterminated multiline
+// string already has.
+func TestGrokConfigPinsCredential_ContestsAnUnterminatedMultilineArray(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(`x = [
+1,
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if complete := walkGrokTOMLAssignments(path, func(string, string) bool { return true }); complete {
+		t.Fatal("sweep reported complete over an array that never closes")
+	}
+	if !grokConfigPinsCredential(path) {
+		t.Fatal("an unterminated array must CONTEST — the unread remainder may pin a credential")
+	}
+}
+
 // Grok's upward `.grok/config.toml` discovery is not bounded by our depth cap,
 // so exhausting the cap before the filesystem root means "we could not finish
 // looking", not "there is nothing there". Naming the cached login for a run

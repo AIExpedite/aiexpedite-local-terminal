@@ -1548,6 +1548,16 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 	// pinned credential, which is exactly the misattribution this sweep exists
 	// to prevent.
 	var openMultiline string
+	// openComposite is the unclosed bracket depth of a value that runs past its
+	// own line — a multi-line array, or an array of inline tables. Those
+	// continuation lines are VALUE BODY, not configuration, and a body line like
+	// `[1, 2]` satisfies the section-header test below exactly: it re-scoped
+	// every following assignment under a table that does not exist, so a root
+	// `model.api_key` read as `1,2.model.api_key` and the attribution guard saw
+	// no pinned credential for a run grok's own parser bills by API key. Depth
+	// is counted quote-aware by grokTOMLBracketDepth, so a `"Bash[*]"` literal
+	// inside the array cannot unbalance it.
+	openComposite := 0
 	for scanner.Scan() {
 		raw := scanner.Text()
 		if openMultiline != "" {
@@ -1555,6 +1565,13 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 				// TOML permits nothing but a comment after a closing
 				// delimiter, so the rest of this line carries no assignment.
 				openMultiline = ""
+			}
+			continue
+		}
+		if openComposite > 0 {
+			openComposite += grokTOMLBracketDepth(grokTOMLStripInlineComment(strings.TrimSpace(raw)))
+			if openComposite < 0 {
+				openComposite = 0
 			}
 			continue
 		}
@@ -1585,6 +1602,15 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 		}
 		value := strings.TrimSpace(line[eq+1:])
 		openMultiline = grokTOMLMultilineOpener(value)
+		if openMultiline == "" {
+			// Only when the value is not itself an open multiline STRING: that
+			// body is skipped verbatim, and counting brackets inside its text
+			// would leave a phantom composite open for the rest of the file.
+			openComposite = grokTOMLBracketDepth(value)
+			if openComposite < 0 {
+				openComposite = 0
+			}
+		}
 		if !visit(key, value) {
 			// A caller that stops early has the answer it came for, so the
 			// unread remainder is not a gap in what it decided.
@@ -1593,10 +1619,10 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 	}
 	// A line longer than the scanner's buffer, or a read error, ends the sweep
 	// with content still unread; so does hitting the tail bound. So does a
-	// multiline string that never closes: everything after its opener was
-	// skipped as body, so an assignment the child's parser still applies may
-	// sit in the part this sweep never classified.
-	return scanner.Err() == nil && counted.n <= maxBytes && openMultiline == ""
+	// multiline string — or a composite value — that never closes: everything
+	// after its opener was skipped as body, so an assignment the child's parser
+	// still applies may sit in the part this sweep never classified.
+	return scanner.Err() == nil && counted.n <= maxBytes && openMultiline == "" && openComposite == 0
 }
 
 // countingReader counts the bytes it has handed on, so walkGrokTOMLAssignments

@@ -236,3 +236,103 @@ func TestRestoreGrokBillingRecordDisplacedByRace_WritesOnlyNormalizedFields(t *t
 		t.Fatalf("the repair copied non-metric log content:\n%s", raw)
 	}
 }
+
+// A managed account-A session can exit while a live DIRECT account-B run has
+// already written a NEWER billing record and writes no further one. Appending
+// only B's identity after A's identity/record pair leaves A's older record as
+// the log's last billing line, and a trailing marker cannot authenticate a
+// record that PRECEDES it — so B's gather stops at A's record, refuses it as
+// foreign, and reports nothing at all. The merge must carry B's own record
+// forward with its marker.
+func TestPersistGrokManagedBillingSnapshot_PreservesAnArmedDirectAccountsNewerRecord(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+
+	// A live direct run on account B, which already fetched credits.
+	finish := startGrokBillingAttributionKeeper("acct-2")
+	defer finish()
+	helperAppendGrokLogLine(t, persistent,
+		`{"ts":"2026-08-19T12:00:00Z","msg":"session start","ctx":{"user_id":"acct-2"}}`)
+	direct := time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine(direct, 77, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	// The managed account-A session exits carrying an OLDER receipt.
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine(time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339), 12,
+			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	published, ok := readGrokBillingSnapshot(persistent, []string{"acct-2"})
+	if !ok {
+		t.Fatal("the armed direct account can no longer read its own fresher record: " +
+			"the merge displaced it behind the managed account's older one")
+	}
+	if published.UsedPercent != 77 {
+		t.Fatalf("published percent = %v, want 77 — the direct account is reading "+
+			"something other than its own newest record", published.UsedPercent)
+	}
+	if published.ObservedAt.UTC().Format(time.RFC3339) != direct {
+		t.Fatalf("published observation = %s, want %s",
+			published.ObservedAt.UTC().Format(time.RFC3339), direct)
+	}
+}
+
+// The direct account's record is only carried forward when it is NEWER than the
+// one being merged. An OLDER one must stay where it is: the reader publishes by
+// FILE ORDER, so moving it last would republish a stale reading — and it would
+// also write a duplicate record into a provider-owned log on every merge that
+// overlapped a direct run.
+func TestPersistGrokManagedBillingSnapshot_DoesNotPromoteAnOlderDirectRecord(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+
+	finish := startGrokBillingAttributionKeeper("acct-2")
+	defer finish()
+	helperAppendGrokLogLine(t, persistent,
+		`{"ts":"2026-08-19T12:00:00Z","msg":"session start","ctx":{"user_id":"acct-2"}}`)
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine(time.Now().Add(-3*time.Hour).UTC().Format(time.RFC3339), 77,
+			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	merged := time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine(merged, 12, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	published, ok := readGrokBillingSnapshot(persistent, grokIdentityCandidates(persistent))
+	if !ok {
+		t.Fatal("the managed account lost its own freshly merged record")
+	}
+	if published.ObservedAt.UTC().Format(time.RFC3339) != merged {
+		t.Fatalf("published observation = %s, want the freshly merged %s — an older "+
+			"direct record was promoted over it",
+			published.ObservedAt.UTC().Format(time.RFC3339), merged)
+	}
+	raw, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read persistent log: %v", err)
+	}
+	if got := strings.Count(string(raw), `"creditUsagePercent":77`); got != 1 {
+		t.Fatalf("the direct account's older record appears %d times — the merge "+
+			"duplicated it into a provider-owned log", got)
+	}
+}

@@ -459,9 +459,17 @@ type grokAttributionKeeperAccount struct {
 	Refs     int
 }
 
-// grokAttributionKeeperAccountKey folds one identity to its bucket key. Must
-// stay the same fold the surrounding EqualFold comparisons use, or the map
-// splits an account the reader treats as one.
+// grokIdentityFoldKey folds one identity to the canonical key every
+// EqualFold-equal spelling of it shares. Must stay the same fold the
+// surrounding EqualFold comparisons use, or a map keyed on it splits an account
+// those comparisons treat as one.
+//
+// Used by the keeper's account buckets AND by the publish gate in
+// grokRecordBelongsToCurrentAccount: the gate compares a logged marker against
+// the credentials' candidate identities, and the keeper decides whether a
+// marker already in the log may stand. Two different folds there let the keeper
+// accept an existing marker while the gate refuses the record beneath it, which
+// is an account whose billing is permanently unpublishable.
 //
 // strings.ToLower is NOT that fold. strings.EqualFold compares rune by rune
 // under Unicode simple folding, whose orbits can hold several lowercase runes:
@@ -472,7 +480,7 @@ type grokAttributionKeeperAccount struct {
 // observations. Mapping each rune to the SMALLEST rune in its simple-fold
 // orbit reproduces EqualFold's equivalence exactly, because that orbit is the
 // relation EqualFold itself walks.
-func grokAttributionKeeperAccountKey(identity string) string {
+func grokIdentityFoldKey(identity string) string {
 	return strings.Map(grokFoldRune, strings.TrimSpace(identity))
 }
 
@@ -503,7 +511,7 @@ func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 	grokAttributionKeeperMu.Lock()
 	grokAttributionKeeperRefs++
 	if identity != "" {
-		key := grokAttributionKeeperAccountKey(identity)
+		key := grokIdentityFoldKey(identity)
 		entry := grokAttributionKeeperAccounts[key]
 		if entry.Refs == 0 {
 			entry.Identity = identity
@@ -524,7 +532,7 @@ func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 			var stop chan struct{}
 			grokAttributionKeeperRefs--
 			if identity != "" {
-				key := grokAttributionKeeperAccountKey(identity)
+				key := grokIdentityFoldKey(identity)
 				if entry, ok := grokAttributionKeeperAccounts[key]; !ok || entry.Refs <= 1 {
 					delete(grokAttributionKeeperAccounts, key)
 				} else {
@@ -570,7 +578,7 @@ func grokArmedDirectAccountsDisagreeWith(identity string) bool {
 	}
 	grokAttributionKeeperMu.Lock()
 	defer grokAttributionKeeperMu.Unlock()
-	key := grokAttributionKeeperAccountKey(identity)
+	key := grokIdentityFoldKey(identity)
 	for armed := range grokAttributionKeeperAccounts {
 		if armed != key {
 			return true

@@ -638,7 +638,7 @@ func appendGrokBillingPair(
 		return grokManagedBillingSuperseded, false, nil
 	}
 
-	payload, repairAfterWrite = grokBillingPayloadWithDirectMarker(payload, identity)
+	payload, repairAfterWrite = grokBillingPayloadWithDirectMarker(persistentHome, payload, identity, observedAt)
 	grokBillingPreWriteBarrier()
 	if err := writeGrokBillingPayload(persistentHome, payload); err != nil {
 		return grokManagedBillingFailed, repairAfterWrite, err
@@ -658,13 +658,33 @@ func appendGrokBillingPair(
 // after the caller's pair so a still-live direct child keeps writing records that
 // bind to ITS account rather than to the managed one we just named.
 //
+// When that direct account ALREADY holds a record in the log newer than the one
+// we are merging, its marker alone is not enough: a trailing identity line
+// cannot authenticate a record that PRECEDES it, so the direct account's next
+// gather would stop at OUR newest managed record, refuse it as foreign, and
+// report nothing — losing an observation that is both fresher and attributable.
+// So that account's own newest record is re-appended WITH its marker, as a
+// complete pair, and the log ends with the genuinely newest reading. It is
+// re-rendered through grokManagedBillingPayload, so it carries only the same
+// normalized allowlisted fields the merge itself writes.
+//
+// Only when it is NEWER than ours. A direct record OLDER than the one we are
+// merging must stay where it is: the reader publishes by FILE ORDER, so moving
+// it last would republish a stale reading — the very failure the supersession
+// guard and the race repair exist to prevent.
+//
 // Callers must hold grokBillingAttributionSerialize: the armed CHECK and the
 // payload it produces are taken UNDER the lock, not before it (see the ordering
 // argument on appendGrokBillingPair).
 //
 // Returns repairAfterWrite when the marker could not be rendered and the caller
 // must fall back to a post-write ensureGrokBillingAttribution.
-func grokBillingPayloadWithDirectMarker(payload []byte, identity string) ([]byte, bool) {
+func grokBillingPayloadWithDirectMarker(
+	persistentHome string,
+	payload []byte,
+	identity string,
+	observedAt time.Time,
+) ([]byte, bool) {
 	directIdentity, armed := grokDirectAttributionAssertion()
 	switch {
 	case !armed:
@@ -682,10 +702,43 @@ func grokBillingPayloadWithDirectMarker(payload []byte, identity string) ([]byte
 			// merge: a narrowed window beats an unattributed direct run.
 			return payload, true
 		}
+		if pair, ok := grokDirectBillingPairToPreserve(persistentHome, directIdentity, observedAt); ok {
+			return append(payload, pair...), false
+		}
 		payload = append(payload, directLine...)
 		payload = append(payload, '\n')
 	}
 	return payload, false
+}
+
+// grokDirectBillingPairToPreserve renders the armed direct account's newest
+// trusted record as a fresh identity/record pair, when that record is newer than
+// the record the caller is about to leave as the log's last line.
+//
+// Scanned under the DIRECT account's identity alone: this asks "does that
+// account hold something newer here", the same question the supersession guard
+// asks for the managed account, so it uses the same clock-skew bound — a record
+// too far ahead to publish is too far ahead to preserve.
+//
+// A record that cannot be re-rendered is reported as nothing to preserve, so the
+// caller falls back to the bare marker: attribution for the direct run's NEXT
+// record still beats writing nothing for it.
+//
+// Callers must hold grokBillingAttributionSerialize.
+func grokDirectBillingPairToPreserve(
+	persistentHome, directIdentity string,
+	observedAt time.Time,
+) ([]byte, bool) {
+	newest, ok := newestTrustedGrokBillingRecordFor(
+		persistentHome, []string{directIdentity}, time.Now().Add(grokBillingMaxClockSkew))
+	if !ok || !newest.ObservedAt.After(observedAt) {
+		return nil, false
+	}
+	pair, err := grokManagedBillingPayload(directIdentity, newest)
+	if err != nil {
+		return nil, false
+	}
+	return pair, true
 }
 
 // restoreGrokBillingRecordDisplacedByRace re-appends this account's newest
@@ -733,7 +786,7 @@ func restoreGrokBillingRecordDisplacedByRace(persistentHome, identity string, id
 		if err != nil {
 			return repaired, err
 		}
-		payload, _ = grokBillingPayloadWithDirectMarker(payload, identity)
+		payload, _ = grokBillingPayloadWithDirectMarker(persistentHome, payload, identity, newest.ObservedAt)
 		if err := writeGrokBillingPayload(persistentHome, payload); err != nil {
 			return repaired, err
 		}
@@ -1016,10 +1069,17 @@ func readGrokBillingSnapshot(base string, identities []string) (grokBillingSnaps
 // instead would accept account B's older record as soon as account A logged in
 // and had not fetched billing yet.
 func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities []string) bool {
+	// Keyed with grokIdentityFoldKey, NOT strings.ToLower: every other identity
+	// comparison in this package is strings.EqualFold, and lowercasing is not
+	// that relation. Unicode simple folding puts several lowercase runes in one
+	// orbit (`Σ`, `σ` and final `ς`), so a marker the attribution keeper accepts
+	// as already-present — it folds with EqualFold — could lose this lookup and
+	// leave the record beneath it permanently unattributable. Both sides fold
+	// the same way or the gate and the keeper disagree about one account.
 	wanted := make(map[string]bool, len(identities))
 	for _, identity := range identities {
-		if trimmed := strings.ToLower(strings.TrimSpace(identity)); trimmed != "" {
-			wanted[trimmed] = true
+		if key := grokIdentityFoldKey(identity); key != "" {
+			wanted[key] = true
 		}
 	}
 	// Start before the billing line. The observed billing envelope carries no
@@ -1043,7 +1103,7 @@ func grokRecordBelongsToCurrentAccount(lines [][]byte, lineIdx int, identities [
 			// merely failing to match a real account id.
 			return false
 		}
-		return wanted[strings.ToLower(identity)]
+		return wanted[grokIdentityFoldKey(identity)]
 	}
 	// Nothing identifies the producer anywhere before the record. That is
 	// not evidence it belongs to the current login: `unified.jsonl` is shared

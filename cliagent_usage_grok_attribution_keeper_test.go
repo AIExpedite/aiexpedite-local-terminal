@@ -769,3 +769,30 @@ func TestGrokFoldRune_MatchesEqualFold(t *testing.T) {
 		}
 	}
 }
+
+// The publish gate and the attribution keeper must fold identities the SAME way.
+// EqualFold puts capital sigma, small sigma and FINAL small sigma in one orbit,
+// while strings.ToLower maps `Σ` to `σ` and leaves `ς` alone — so a
+// keeper that accepts an existing `ς` marker as already naming this account
+// paired with a gate that lower-cases both sides refuses every record beneath
+// it, and the account's billing is permanently unpublishable.
+func TestGrokRecordBelongsToCurrentAccount_FoldsIdentitiesLikeEqualFold(t *testing.T) {
+	logged := "acct-ς"
+	credentials := "acct-Σ"
+	if !strings.EqualFold(logged, credentials) {
+		t.Fatalf("fixture is not EqualFold-equal: %q vs %q", logged, credentials)
+	}
+	if grokIdentityFoldKey(logged) != grokIdentityFoldKey(credentials) {
+		t.Fatalf("fold key split an EqualFold-equal pair: %q vs %q", logged, credentials)
+	}
+
+	lines := [][]byte{
+		[]byte(`{"ts":"2026-08-19T12:00:00Z","msg":"session start","ctx":{"user_id":"` + logged + `"}}`),
+		[]byte(grokBillingLine("2026-08-19T12:01:00Z", 40, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z")),
+	}
+	if !grokRecordBelongsToCurrentAccount(lines, 1, []string{credentials}) {
+		t.Fatal("the gate refused a record whose marker the keeper treats as this " +
+			"same account — the two folds disagree")
+	}
+}
