@@ -164,7 +164,7 @@ func canonicalProvider(agent cliAgentUsage) (canonicalCLIUsageProvider, error) {
 	var modelDetails []canonicalCLIUsageModelDetail
 	modelIDs := map[string]struct{}{}
 	for _, detail := range agent.ModelDetails {
-		if detail.ID == "" || !bounded(detail.ID, 256) || !bounded(detail.Label, 256) || !bounded(detail.DefaultEffort, cliUsageMaxEffortLength) {
+		if detail.ID == "" || !bounded(detail.ID, cliUsageMaxModelDetailIDLength) || !bounded(detail.Label, 256) || !bounded(detail.DefaultEffort, cliUsageMaxEffortLength) {
 			return canonicalCLIUsageProvider{}, errors.New("invalid receipt bounds")
 		}
 		if _, duplicate := modelIDs[detail.ID]; duplicate {

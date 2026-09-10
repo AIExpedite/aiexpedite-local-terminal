@@ -380,7 +380,23 @@ Three rules keep a probe from doing damage on the way:
 Both `modelDetails` and the legacy `models` list are truncated to
 `cliUsageMaxModelsPerProvider`; the receipt rejects a provider that exceeds it
 on either field, so an over-cap vendor answer must never reach `canonicalProvider`
-whole.
+whole. Three more bounds follow from the same rule (Codex round 2 on #147):
+
+- **A detail row the receipt would reject is dropped, not carried.** A model id
+  over 256 bytes (the `modelDetails[].id` bound — the legacy `models` list
+  allows 2048) or an empty id is filtered by `boundedModelDetails` before the
+  cap, so a user-configured OpenCode provider id or a long vendor slug cannot
+  turn the whole refresh into `usage result rejected`.
+- **A capped or filtered OpenCode list is not exhaustive.** The readiness
+  probe stops reading AT the cap, so a list of exactly that length may be
+  truncated, and an id dropped from the details was still listed by OpenCode;
+  in either case `modelsExhaustive` is false, or routing would veto a model
+  OpenCode runs.
+- **A reset invalidates probes already in flight.** The cache carries a
+  generation that every reset advances; a probe stores its answer only under
+  the generation it started in. Otherwise the six-hour gather mid-probe when a
+  user forces a refresh would repopulate the cache with its pre-reset list and
+  the refresh would read that for the whole TTL.
 
 ## Why ACP, not TUI scraping
 

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -436,5 +437,109 @@ func TestGrokModelListEnvKeepsTheStateDirectory(t *testing.T) {
 		if strings.HasPrefix(entry, "GROK_HOME=") {
 			t.Fatalf("GROK_HOME invented from an environment that had none: %q", entry)
 		}
+	}
+}
+
+// A probe already in flight when a forced refresh clears the cache carries a
+// PRE-reset answer. Storing it would repopulate the map the refresh just
+// emptied, and the refresh — whose whole point is to see a fresh login or a
+// CLI update — would read that stale list for the full TTL.
+func TestModelDiscoveryProbeStartedBeforeAResetDoesNotRepopulateTheCache(t *testing.T) {
+	resetCLIAgentModelProbeCache()
+	t.Cleanup(resetCLIAgentModelProbeCache)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls int32
+	prev := cliAgentModelProbeRunner
+	cliAgentModelProbeRunner = func(context.Context, string, []string, ...string) (string, bool) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			close(started)
+			<-release
+		}
+		return realAntigravityModels, true
+	}
+	t.Cleanup(func() { cliAgentModelProbeRunner = prev })
+
+	detected := detectedCLIAgent{Detected: true, Path: "/bin/agy", Version: "1.1.27"}
+	now := time.Now()
+
+	inFlight := &cliAgentUsage{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		attachCLIAgentModelDiscovery(context.Background(), "antigravity", detected, inFlight, "", now)
+	}()
+	<-started
+	// The user forces a refresh while the six-hour gather is mid-probe.
+	resetCLIAgentModelProbeCache()
+	close(release)
+	<-done
+
+	// The in-flight probe still answers ITS own caller — only the cache write
+	// is dropped.
+	if len(inFlight.ModelDetails) == 0 {
+		t.Fatal("the in-flight gather must still get the answer it probed for")
+	}
+	forced := &cliAgentUsage{}
+	attachCLIAgentModelDiscovery(context.Background(), "antigravity", detected, forced, "", now)
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("probe ran %d times, want 2 — the pre-reset answer must not satisfy the forced gather", got)
+	}
+}
+
+// canonicalProvider refuses a `modelDetails` row whose id exceeds 256 bytes,
+// and `models` allows 2048, so an id between the two bounds would sail through
+// collection and then reject the ENTIRE user refresh. Drop it at collection
+// time instead.
+func TestModelDiscoveryDropsAModelIDTheReceiptWouldReject(t *testing.T) {
+	overlong := strings.Repeat("m", cliUsageMaxModelDetailIDLength+1)
+	kept := boundedModelDetails([]cliAgentModelDetail{
+		{ID: "vendor-ok"},
+		{ID: overlong, Label: "Too Long"},
+		{ID: ""},
+		{ID: "vendor-also-ok"},
+	})
+	if len(kept) != 2 || kept[0].ID != "vendor-ok" || kept[1].ID != "vendor-also-ok" {
+		t.Fatalf("kept %v — the unusable ids go, the order of the rest survives", kept)
+	}
+	ids := make([]string, 0, len(kept))
+	for _, detail := range kept {
+		ids = append(ids, detail.ID)
+	}
+	agent := cliAgentUsage{Provider: "antigravity", CollectedAt: "now", ModelDetails: kept, Models: ids}
+	if _, _, _, err := canonicalCLIUsageRefreshReceipt("r", 1, true, []cliAgentUsage{agent}, nil); err != nil {
+		t.Fatalf("a filtered list must canonicalize rather than fail the refresh: %v", err)
+	}
+}
+
+// OpenCode's list is truncated at the receipt cap by its readiness parser, and
+// an id the detail row cannot carry is listed but not reported. Either way the
+// reported set is not everything OpenCode accepts, so claiming it is exhaustive
+// would let routing veto a pin to a model OpenCode really runs.
+func TestOpenCodeModelsAreNonExhaustiveWhenTheListWasCutDown(t *testing.T) {
+	exhaustiveFor := func(ids []string) bool {
+		usage := &cliAgentUsage{Models: ids}
+		attachCLIAgentModelDiscovery(context.Background(), "opencode", detectedCLIAgent{Detected: true}, usage, "", time.Now())
+		if usage.ModelsExhaustive == nil {
+			t.Fatal("opencode always reports the flag")
+		}
+		return *usage.ModelsExhaustive
+	}
+
+	if !exhaustiveFor([]string{"anthropic/claude-opus-5", "openai/gpt-5.4"}) {
+		t.Fatal("a short, fully-reportable list IS the whole catalog")
+	}
+
+	atCap := make([]string, cliUsageMaxModelsPerProvider)
+	for i := range atCap {
+		atCap[i] = fmt.Sprintf("vendor/model-%03d", i)
+	}
+	if exhaustiveFor(atCap) {
+		t.Fatal("a list AT the parser's cap may have been truncated — it is not exhaustive")
+	}
+
+	if exhaustiveFor([]string{"vendor/ok", "vendor/" + strings.Repeat("x", cliUsageMaxModelDetailIDLength)}) {
+		t.Fatal("a listed model dropped for an unreportable id makes the set non-exhaustive")
 	}
 }

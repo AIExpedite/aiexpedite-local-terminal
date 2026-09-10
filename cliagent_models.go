@@ -110,16 +110,24 @@ type cliAgentModelProbeEntry struct {
 var (
 	cliAgentModelProbeMu    sync.Mutex
 	cliAgentModelProbeCache = map[string]cliAgentModelProbeEntry{}
+	// cliAgentModelProbeGeneration advances on every reset. A probe records
+	// the generation it started under and stores its answer only if no reset
+	// happened meanwhile — otherwise a six-hour gather already in flight when
+	// a user forced a refresh would repopulate the cache with its pre-reset
+	// answer, and the refresh would read that stale entry for the whole TTL.
+	cliAgentModelProbeGeneration uint64
 	// cliAgentModelProbeRunner is swapped by tests so a probe never spawns the
 	// real CLI; production runs the bounded command below.
 	cliAgentModelProbeRunner = runCLIAgentModelProbe
 )
 
 // resetCLIAgentModelProbeCache empties the cache (tests, and a forced usage
-// refresh, which wants the CLI's current answer rather than a half-hour-old one).
+// refresh, which wants the CLI's current answer rather than a half-hour-old one)
+// and invalidates every probe still in flight.
 func resetCLIAgentModelProbeCache() {
 	cliAgentModelProbeMu.Lock()
 	cliAgentModelProbeCache = map[string]cliAgentModelProbeEntry{}
+	cliAgentModelProbeGeneration++
 	cliAgentModelProbeMu.Unlock()
 }
 
@@ -142,7 +150,14 @@ func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected 
 			details = append(details, cliAgentModelDetail{ID: id})
 		}
 		usage.ModelDetails = boundedModelDetails(details)
-		usage.ModelsExhaustive = authBoolPtr(true)
+		// The readiness probe stops reading at the receipt cap, so a list AT
+		// the cap may be a truncated catalog; and a provider id the detail row
+		// cannot carry (over its id bound) was listed but is not reported.
+		// Either way the details are not everything OpenCode accepts, and an
+		// exhaustive flag there would let routing veto a model OpenCode runs.
+		capped := len(usage.Models) >= cliUsageMaxModelsPerProvider
+		dropped := len(usage.ModelDetails) < len(usage.Models)
+		usage.ModelsExhaustive = authBoolPtr(!capped && !dropped)
 		return
 	}
 	discovery, ok := cachedCLIAgentModelDiscovery(ctx, agentID, detected, home, now)
@@ -172,6 +187,7 @@ func cachedCLIAgentModelDiscovery(ctx context.Context, agentID string, detected 
 	key := strings.ToLower(agentID) + "\x00" + detected.Path + "\x00" + detected.Version
 	cliAgentModelProbeMu.Lock()
 	entry, cached := cliAgentModelProbeCache[key]
+	generation := cliAgentModelProbeGeneration
 	cliAgentModelProbeMu.Unlock()
 	if cached && now.Sub(entry.At) < cliAgentModelProbeTTL {
 		return entry.Result, entry.OK
@@ -185,7 +201,12 @@ func cachedCLIAgentModelDiscovery(ctx context.Context, agentID string, detected 
 		return result, ok
 	}
 	cliAgentModelProbeMu.Lock()
-	cliAgentModelProbeCache[key] = cliAgentModelProbeEntry{At: now, Result: result, OK: ok}
+	// A reset while this probe ran means a forced refresh wants a FRESH
+	// answer: this one is returned to its own caller but never stored, so the
+	// refresh cannot find it and reuse a pre-reset list for the whole TTL.
+	if generation == cliAgentModelProbeGeneration {
+		cliAgentModelProbeCache[key] = cliAgentModelProbeEntry{At: now, Result: result, OK: ok}
+	}
 	cliAgentModelProbeMu.Unlock()
 	return result, ok
 }
@@ -761,11 +782,26 @@ func boundedModelDetail(detail cliAgentModelDetail) cliAgentModelDetail {
 	return detail
 }
 
-// boundedModelDetails truncates a list to the receipt cap, keeping the CLI's
-// order so the first (newest / highest-priority) entries survive.
+// cliUsageMaxModelDetailIDLength is the receipt bound on one model id in
+// `modelDetails` (the legacy `models` list allows 2048; the detail row is the
+// one the verifier rejects at 256).
+const cliUsageMaxModelDetailIDLength = 256
+
+// boundedModelDetails drops the rows the receipt would reject — an empty id or
+// one over the id bound — and truncates the rest to the receipt cap, keeping
+// the CLI's order so the first (newest / highest-priority) entries survive.
+// Applied at collection time so one pathological CLI answer can never turn
+// the whole refresh into `usage result rejected`.
 func boundedModelDetails(details []cliAgentModelDetail) []cliAgentModelDetail {
-	if len(details) > cliUsageMaxModelsPerProvider {
-		return details[:cliUsageMaxModelsPerProvider]
+	kept := make([]cliAgentModelDetail, 0, len(details))
+	for _, detail := range details {
+		if detail.ID == "" || !bounded(detail.ID, cliUsageMaxModelDetailIDLength) {
+			continue
+		}
+		kept = append(kept, detail)
+		if len(kept) == cliUsageMaxModelsPerProvider {
+			break
+		}
 	}
-	return details
+	return kept
 }
