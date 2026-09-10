@@ -216,7 +216,11 @@ func gatherCLIAgentUsage(detected map[string]detectedCLIAgent, now time.Time) []
 		if usage.CliAgentID == "" {
 			usage.CliAgentID = agent.ID
 		}
-		attachCLIAgentModelDiscovery(context.Background(), agent.ID, entry, usage, home, now)
+		// The PARSER key, as for the usage parser above: a backend catalog
+		// entry may carry its own id while naming a built-in parser through
+		// capabilities.utilization.parserKey, and discovery recognises the
+		// built-in keys only.
+		attachCLIAgentModelDiscovery(context.Background(), cliAgentCatalogParserKey(agent), entry, usage, home, now)
 		if usage.AccountFingerprint == "" {
 			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}
@@ -335,7 +339,7 @@ func GatherCLIAgentUsageOnly(ctx context.Context) ([]cliAgentUsage, []cliAgentUs
 		if usage.CliAgentID == "" {
 			usage.CliAgentID = agent.ID
 		}
-		attachCLIAgentModelDiscovery(gatherCtx, agent.ID, entry, usage, home, now)
+		attachCLIAgentModelDiscovery(gatherCtx, cliAgentCatalogParserKey(agent), entry, usage, home, now)
 		if usage.AccountFingerprint == "" {
 			usage.AccountFingerprint = fallbackUnknownAccountFingerprint(usage.Provider, host, entry)
 		}

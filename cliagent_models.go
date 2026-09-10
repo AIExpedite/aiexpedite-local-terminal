@@ -657,18 +657,46 @@ func grokModelsCachePath(home string) string {
 func discoverGrokModels(ctx context.Context, detected detectedCLIAgent, home string) (cliAgentModelDiscovery, bool) {
 	var listed cliAgentModelDiscovery
 	listedOK := false
-	if out, ok := cliAgentModelProbeRunner(ctx, detected.Path, sanitizeGrokModelListEnv(os.Environ()), "models"); ok {
+	// The list runs against an ISOLATED home built exactly as a managed
+	// session's is (setupIsolatedGrokHomeFrom): the cached login is copied
+	// in, the persisted `[model] api_key` only under the same
+	// Config.EnableGrokAPIKeyFallback opt-in. Pointing `grok models` at the
+	// real home would let a persisted key the user never opted into
+	// authenticate the list, and the catalog of THAT account could veto the
+	// models the cached-token sessions actually run.
+	realBase := grokModelsHomeBase(home)
+	env := sanitizeGrokModelListEnv(os.Environ())
+	isolated, err := setupIsolatedGrokHomeFrom(grokAPIKeyFallbackOptedIn(), "", realBase)
+	if err == nil {
+		env = setEnvVar(env, "GROK_HOME", isolated)
+		defer func() { _ = removeIsolatedGrokHome(isolated) }()
+	}
+	if out, ok := cliAgentModelProbeRunner(ctx, detected.Path, env, "models"); ok {
 		listed, listedOK = parseGrokModelList(out)
 	}
+	// Listing while signed in refreshes the cache under the home the child
+	// ran with — the isolated one — so that copy is read first; the real
+	// home's cache is the fallback (a logged-out list writes none).
 	var cache grokModelsCacheFile
 	cacheOK := false
-	if path := grokModelsCachePath(home); path != "" {
-		cacheOK = readJSONFile(path, &cache)
+	if isolated != "" {
+		cacheOK = readJSONFile(expandHome(isolated, "models_cache.json"), &cache)
+	}
+	if !cacheOK {
+		if path := grokModelsCachePath(home); path != "" {
+			cacheOK = readJSONFile(path, &cache)
+		}
 	}
 	if !listedOK && !cacheOK {
 		return cliAgentModelDiscovery{}, false
 	}
 	return mergeGrokDiscovery(listed, listedOK, cache, cacheOK, detected.Version), true
+}
+
+// grokModelsHomeBase is the real Grok state directory the isolated list home
+// is seeded from: $GROK_HOME, else ~/.grok.
+func grokModelsHomeBase(home string) string {
+	return firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
 }
 
 // mergeGrokDiscovery keeps the list command's order (its default first) and

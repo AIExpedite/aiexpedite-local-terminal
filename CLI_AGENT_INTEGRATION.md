@@ -381,7 +381,14 @@ Three rules keep a probe from doing damage on the way:
   the smoke suite pins that no such sink is ever written. Listing with the
   routing vars stripped would ask the default service for a catalog the
   configured sessions never use, or list logged-out on a key-authenticated
-  host, and publish that as exhaustive.
+  host, and publish that as exhaustive. And the list runs against an
+  ISOLATED home built by `setupIsolatedGrokHomeFrom` exactly as a managed
+  session's is — cached login copied in, the persisted `[model] api_key` only
+  under the same opt-in — so a key the user never opted into cannot
+  authenticate the list and publish another account's catalog; the cache the
+  list just refreshed there is read first, the real home's cache is the
+  fallback. A backend catalog entry with its own id reaches discovery through
+  its `capabilities.utilization.parserKey`, as the usage parser does.
 - **Codex without a models cache still reports its configured model.** A fresh
   install or a cleared cache reports the top-level `model` from `config.toml`
   (basic `"…"` or literal `'…'` string) as a one-model, non-exhaustive floor,
