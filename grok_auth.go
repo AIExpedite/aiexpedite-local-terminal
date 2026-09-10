@@ -446,11 +446,13 @@ func grokLoaderConfigContests(path, cwd string) bool {
 // normalises to `apikeyenv`, which is a suffix of neither `api_key` nor
 // `env_key`, so the config-key rule below can never recognise it.
 //
-// The ONE token exempted from that sweep is the PROMPT: the value a
-// prompt-delivery flag consumes is prose the child never parses as
-// configuration, so `grok -p "explain model.api_key=..."` is a question about a
-// setting, not an override of one. Without the carve-out an ordinary prompt
-// that quotes a config key would arm the contested identity and cost an honest
+// The tokens exempted from that sweep are the CONTENT ones: the value a
+// content-delivery flag consumes is prose or a document the child never parses
+// as configuration, so `grok -p "explain model.api_key=..."` is a question
+// about a setting, not an override of one, and the same is true of the rules,
+// system-prompt and output-schema text buildGrokInteractiveArgs forwards
+// verbatim. Without the carve-out an ordinary prompt or system prompt that
+// quotes a config key would arm the contested identity and cost an honest
 // cached-login run its billing record — the managed path usually relocates the
 // prompt into `--prompt-file` (rewriteGrokPromptToFile), but that rewrite is
 // best-effort and falls back to `-p <prompt>` on argv. Exempting a value the
@@ -464,11 +466,11 @@ func grokArgsPinCredential(args []string) bool {
 			continue
 		}
 		lower := strings.ToLower(strings.TrimSpace(arg))
-		if grokPromptDeliveryFlags[lower] {
+		if grokContentDeliveryFlags[lower] {
 			skipNext = true
 			continue
 		}
-		if grokPromptDeliveryFlagAssignment(lower) {
+		if grokContentDeliveryFlagAssignment(lower) {
 			continue
 		}
 		if isGrokAuthOverrideArg(lower) {
@@ -481,25 +483,35 @@ func grokArgsPinCredential(args []string) bool {
 	return false
 }
 
-// grokPromptDeliveryFlags are the flags whose NEXT token grok consumes as the
-// prompt (or as the file the prompt was relocated into). Kept to the spellings
-// buildGrokInteractiveArgs / rewriteGrokPromptToFile actually emit, plus grok's
-// own `--single` alias, rather than every flag that takes a value: the sweep's
-// value is that it inspects tokens after flags we do NOT recognise, and each
-// name added here is one more place an override could hide.
-var grokPromptDeliveryFlags = map[string]bool{
-	"-p":            true,
-	"--single":      true,
-	"--prompt-file": true,
-	"--prompt_file": true,
+// grokContentDeliveryFlags are the flags whose NEXT token grok consumes as
+// CONTENT rather than configuration — the prompt (or the file it was relocated
+// into), the permission-rule text, the system-prompt override and the output
+// schema. Every name here is one buildGrokInteractiveArgs forwards verbatim
+// from a caller, so each is a place ordinary prose that happens to quote
+// `model.api_key=...` would otherwise arm the contested identity.
+//
+// Kept to that closed set rather than every flag that takes a value: the
+// sweep's value is that it inspects tokens after flags we do NOT recognise, and
+// each name added here is one more place an override could hide. A flag belongs
+// here only when grok reads its value as text it never interprets as config.
+var grokContentDeliveryFlags = map[string]bool{
+	"-p":                       true,
+	"--single":                 true,
+	"--prompt-file":            true,
+	"--prompt_file":            true,
+	"--rules":                  true,
+	"--system-prompt-override": true,
+	"--system_prompt_override": true,
+	"--json-schema":            true,
+	"--json_schema":            true,
 }
 
-// grokPromptDeliveryFlagAssignment reports whether ONE token is the joined
-// `--flag=value` spelling of a prompt-delivery flag, whose value is the same
+// grokContentDeliveryFlagAssignment reports whether ONE token is the joined
+// `--flag=value` spelling of a content-delivery flag, whose value is the same
 // prose the separate-value form carries.
-func grokPromptDeliveryFlagAssignment(arg string) bool {
+func grokContentDeliveryFlagAssignment(arg string) bool {
 	name, _, ok := strings.Cut(arg, "=")
-	return ok && grokPromptDeliveryFlags[strings.TrimSpace(name)]
+	return ok && grokContentDeliveryFlags[strings.TrimSpace(name)]
 }
 
 // grokArgPinsCredential reports whether ONE argv token assigns a non-empty credential.

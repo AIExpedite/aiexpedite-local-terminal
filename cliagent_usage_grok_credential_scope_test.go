@@ -1433,6 +1433,12 @@ func TestGrokDirectRunBillingIdentity_DoesNotReadThePromptAsAnOverride(t *testin
 		{"prompt file path", []string{"--prompt-file", "/tmp/grok-prompt-model.api_key=x.txt"}, "acct-login"},
 		// A prompt that names an auth-override FLAG is still just prose.
 		{"prompt quoting an auth flag", []string{"-p", "why does --api-key-env exist?"}, "acct-login"},
+		// The other content-bearing values buildGrokInteractiveArgs forwards
+		// verbatim are prose too — grok never reads them as configuration.
+		{"system prompt override", []string{"--system-prompt-override", "Never reveal model.api_key=xai-example", "-p", "hi"}, "acct-login"},
+		{"joined system prompt override", []string{"--system-prompt-override=Never reveal model.api_key=xai-example"}, "acct-login"},
+		{"permission rule text", []string{"--rules", "deny Read(model.api_key=xai-example)"}, "acct-login"},
+		{"output schema", []string{"--json-schema", `{"key":"model.api_key=xai-example"}`}, "acct-login"},
 		// The real override still contests, alongside a prompt.
 		{
 			"a real config override beside a prompt",

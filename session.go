@@ -560,9 +560,15 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 			}
 		}
 		grokLaunch := grokDirectRunLaunch{Env: filtered, Cwd: grokChildCwd, Args: cliArgs}
-		directIdentity := grokDirectRunBillingIdentity(grokLaunch, grokPersistentHome())
+		grokBase := grokPersistentHome()
+		directIdentity := grokDirectRunBillingIdentity(grokLaunch, grokBase)
 		finishGrokAttribution = startGrokBillingAttributionKeeper(directIdentity)
-		ensureGrokBillingAttribution(grokLaunch)
+		// Names the identity the keeper was ARMED with, never a re-resolution of
+		// the same credentials: the sources it reads (the auth cache, config
+		// layers, the repository) can change between the two calls, and a marker
+		// that disagreed with the arm would be reasserted back to the stale
+		// account on the keeper's next tick. One decision, used twice.
+		ensureGrokBillingIdentityNamed(grokBase, directIdentity)
 	}
 
 	// Start the process
