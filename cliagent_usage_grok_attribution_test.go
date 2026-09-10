@@ -33,7 +33,7 @@ func resetGrokBillingAttribution(t *testing.T) {
 	// that cascade again.
 	grokAttributionKeeperMu.Lock()
 	grokAttributionKeeperRefs = 0
-	grokAttributionKeeperAccounts = map[string]int{}
+	grokAttributionKeeperAccounts = map[string]grokAttributionKeeperAccount{}
 	stop := grokAttributionKeeperStop
 	grokAttributionKeeperStop = nil
 	grokAttributionKeeperMu.Unlock()

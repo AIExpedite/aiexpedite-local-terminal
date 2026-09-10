@@ -246,7 +246,73 @@ func grokDirectRunCredentialOverride(launch grokDirectRunLaunch, base string) bo
 	if grokProjectPinnedCredential(launch.Cwd) {
 		return true
 	}
+	for _, dir := range grokArgSelectedCwds(launch.Args, launch.Cwd) {
+		if dir == grokUnresolvableArgCwd || grokProjectPinnedCredential(dir) {
+			return true
+		}
+	}
 	return grokAnyPinnedCredential(base)
+}
+
+// grokArgCwdFlag is the one argv flag that changes WHICH directory a direct
+// child starts in, and therefore which workspace `.grok/config.toml` chain
+// Grok walks upward from. buildGrokInteractiveArgs forwards it verbatim (it is
+// in that builder's valuedFlags map, so both the `--cwd <dir>` and `--cwd=<dir>`
+// spellings survive to the child), which means a credential-pinning workspace
+// can be selected in argv alone while launch.Cwd stays clean.
+//
+// Deliberately just `--cwd`: `-w`/`--worktree`/`--ref` also move the child, but
+// their values are refs rather than directories on the releases we have seen,
+// and guessing a directory out of a ref would scan an unrelated path rather
+// than the one the child loads. The ACP path needs no equivalent — it strips
+// `--cwd*` outright (sanitizeGrokACPExtraArgs).
+const grokArgCwdFlag = "--cwd"
+
+// grokUnresolvableArgCwd is the sentinel grokArgSelectedCwds returns for a
+// RELATIVE `--cwd` it cannot anchor, because the launch named no starting
+// directory. Reading the daemon's own cwd to anchor it would make this
+// decision depend on ambient state the caller never named (the same reason
+// grokProjectPinnedCredential walks nothing for an empty cwd), so the caller
+// contests instead: "we could not look" is not "there is nothing there".
+const grokUnresolvableArgCwd = "\x00grok-unresolvable-arg-cwd"
+
+// grokArgSelectedCwds returns the absolute directories a direct child's argv
+// selects with `--cwd`, anchored on `cwd` when the value is relative (that is
+// the directory the child starts in before it applies the flag). Every
+// occurrence is returned, not just the last: which one a given Grok release
+// wins with is its decision, and this guard is conservative by construction.
+func grokArgSelectedCwds(args []string, cwd string) []string {
+	var out []string
+	add := func(raw string) {
+		raw = strings.TrimSpace(strings.Trim(strings.TrimSpace(raw), `"'`))
+		if raw == "" {
+			return
+		}
+		if filepath.IsAbs(raw) {
+			out = append(out, raw)
+			return
+		}
+		base := strings.TrimSpace(cwd)
+		if base == "" {
+			out = append(out, grokUnresolvableArgCwd)
+			return
+		}
+		out = append(out, filepath.Join(base, raw))
+	}
+	for i := 0; i < len(args); i++ {
+		lower := strings.ToLower(strings.TrimSpace(args[i]))
+		if lower == grokArgCwdFlag {
+			if i+1 < len(args) {
+				add(args[i+1])
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(lower, grokArgCwdFlag+"=") {
+			add(args[i][len(grokArgCwdFlag)+1:])
+		}
+	}
+	return out
 }
 
 // grokConfigPathEnvVar / grokManagedConfigURLEnvVar are the two environment

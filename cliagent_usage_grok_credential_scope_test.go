@@ -791,3 +791,75 @@ func TestGrokConfigPinsCredential_AbsentLayerIsNotContested(t *testing.T) {
 		t.Fatal("an empty path must not contest attribution")
 	}
 }
+
+// `--cwd` moves the directory Grok walks upward from for project config, and
+// buildGrokInteractiveArgs forwards it verbatim. A detector that only reads
+// launch.Cwd therefore misses a credential-pinning workspace selected in argv
+// alone and publishes that API key account's spend as the cached login's.
+func TestGrokDirectRunBillingIdentity_ContestsAnArgvSelectedWorkspace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args func(pinned string) []string
+	}{
+		{"separate value", func(pinned string) []string { return []string{"--cwd", pinned, "fix", "bug"} }},
+		{"equals form", func(pinned string) []string { return []string{"--cwd=" + pinned} }},
+		{"uppercase flag", func(pinned string) []string { return []string{"--CWD", pinned} }},
+		{"quoted value", func(pinned string) []string { return []string{"--cwd=\"" + pinned + "\""} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetGrokBillingAttribution(t)
+			helperNoGrokSystemConfigLayers(t)
+			base := helperGrokHomeWithAccount(t, "acct-login")
+
+			pinned := t.TempDir()
+			clean := t.TempDir()
+			// The child STARTS in a clean directory; only the argument-selected
+			// one pins a key, so nothing but the argv scan can catch it.
+			if got := grokDirectRunBillingIdentity(
+				grokDirectRunLaunch{Cwd: clean, Args: tc.args(pinned)}, base); got != "acct-login" {
+				t.Fatalf("identity = %q, want the cached login before the argv-selected workspace pins a key", got)
+			}
+			helperWriteGrokProjectConfig(t, pinned, "[model]\napi_key = \"xai-argv-cwd-sentinel\"\n")
+			if got := grokDirectRunBillingIdentity(
+				grokDirectRunLaunch{Cwd: clean, Args: tc.args(pinned)}, base); got != grokContestedBillingIdentity {
+				t.Fatalf("identity = %q, want the contested sentinel for an argv-selected pinned workspace", got)
+			}
+		})
+	}
+}
+
+// A RELATIVE `--cwd` is anchored on the directory the child starts in, and
+// contests when the launch named none — anchoring it on the daemon's own cwd
+// would decide on ambient state the caller never named.
+func TestGrokDirectRunBillingIdentity_AnchorsARelativeArgvCwd(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	helperNoGrokSystemConfigLayers(t)
+	base := helperGrokHomeWithAccount(t, "acct-login")
+
+	root := t.TempDir()
+	repo := filepath.Join(root, "checkout")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	helperWriteGrokProjectConfig(t, repo, "[model]\napi_key = \"xai-relative-cwd-sentinel\"\n")
+
+	if got := grokDirectRunBillingIdentity(
+		grokDirectRunLaunch{Cwd: root, Args: []string{"--cwd", "checkout"}}, base); got != grokContestedBillingIdentity {
+		t.Fatalf("identity = %q, want the contested sentinel for a relative argv cwd inside a pinned checkout", got)
+	}
+	// Same relative value, anchored somewhere with no pin: unaffected.
+	if got := grokDirectRunBillingIdentity(
+		grokDirectRunLaunch{Cwd: t.TempDir(), Args: []string{"--cwd", "checkout"}}, base); got != "acct-login" {
+		t.Fatalf("identity = %q, want the cached login when the relative cwd anchors outside the pin", got)
+	}
+	// Unanchorable: fail closed rather than reading the process cwd.
+	if got := grokDirectRunBillingIdentity(
+		grokDirectRunLaunch{Args: []string{"--cwd", "checkout"}}, base); got != grokContestedBillingIdentity {
+		t.Fatalf("identity = %q, want the contested sentinel for a relative argv cwd with no anchor", got)
+	}
+	// An empty value selects no directory at all.
+	if got := grokDirectRunBillingIdentity(
+		grokDirectRunLaunch{Cwd: root, Args: []string{"--cwd="}}, base); got != "acct-login" {
+		t.Fatalf("identity = %q, want the cached login for an empty --cwd value", got)
+	}
+}

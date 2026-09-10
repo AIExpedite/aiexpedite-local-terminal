@@ -648,3 +648,52 @@ func TestGrokBillingAttributionKeeper_LastReleaseWritesNothing(t *testing.T) {
 		t.Fatalf("identity lines = %d after the last release, want %d", got, before)
 	}
 }
+
+// Every attribution check around the keeper compares identities with EqualFold,
+// so two live runs whose cached identity differs only in casing are ONE account
+// to the reader. Keying the arm map case-sensitively would split them, make the
+// assertion see a disagreement that does not exist, and leave both runs' billing
+// records bound to the contested sentinel until one exits.
+func TestGrokAttributionKeeper_CoalescesCaseEquivalentIdentities(t *testing.T) {
+	resetGrokBillingAttribution(t)
+
+	firstDone := startGrokBillingAttributionKeeper("User@example.com")
+	secondDone := startGrokBillingAttributionKeeper("user@example.com")
+	t.Cleanup(func() {
+		secondDone()
+		firstDone()
+	})
+
+	if grokArmedDirectAccountsDisagreeWith("USER@EXAMPLE.COM") {
+		t.Fatal("case-equivalent arms reported as a disagreement")
+	}
+	identity, ok := grokDirectAttributionAssertion()
+	if !ok {
+		t.Fatal("no assertion with two live arms")
+	}
+	if identity == grokContestedBillingIdentity {
+		t.Fatal("assertion = contested sentinel; case-equivalent arms are one account")
+	}
+	// The FIRST arm's spelling stands, so the marker is an identity the reader
+	// recognises verbatim rather than a folded one it has never seen.
+	if identity != "User@example.com" {
+		t.Fatalf("assertion = %q, want the first arm's spelling", identity)
+	}
+
+	// Releasing one leaves the other armed and still uncontested — a
+	// case-folded key must not be deleted out from under its sibling.
+	secondDone()
+	if identity, ok := grokDirectAttributionAssertion(); !ok || identity != "User@example.com" {
+		t.Fatalf("assertion after one release = %q/%v, want the surviving arm's account", identity, ok)
+	}
+
+	// A genuinely different account still contests.
+	otherDone := startGrokBillingAttributionKeeper("other@example.com")
+	defer otherDone()
+	if !grokArmedDirectAccountsDisagreeWith("User@example.com") {
+		t.Fatal("a second account was not reported as a disagreement")
+	}
+	if identity, ok := grokDirectAttributionAssertion(); !ok || identity != grokContestedBillingIdentity {
+		t.Fatalf("assertion = %q/%v, want the contested sentinel across two accounts", identity, ok)
+	}
+}

@@ -437,9 +437,33 @@ var (
 	// grokAttributionKeeperAccounts counts those runs PER captured account, so
 	// a re-assertion names the account its runs were started under rather than
 	// whatever the shared home resolves to now.
-	grokAttributionKeeperAccounts = map[string]int{}
+	//
+	// KEYED CASE-INSENSITIVELY, because every attribution check around it
+	// compares identities with EqualFold. A cached identity that is rewritten
+	// in casing only between two same-account runs (`User@example.com` ->
+	// `user@example.com`) is ONE account to the reader, so keying it as two
+	// would make grokDirectAttributionAssertion see a disagreement that does
+	// not exist and name the contested sentinel — leaving both runs''' records
+	// unattributable until one exits. The first arm'''s spelling is retained as
+	// the display form so a re-assertion still writes an identity the reader
+	// recognises verbatim.
+	grokAttributionKeeperAccounts = map[string]grokAttributionKeeperAccount{}
 	grokAttributionKeeperStop     chan struct{}
 )
+
+// grokAttributionKeeperAccount is one case-folded account bucket: how many live
+// direct runs were armed under it, and the spelling to assert for them.
+type grokAttributionKeeperAccount struct {
+	Identity string
+	Refs     int
+}
+
+// grokAttributionKeeperAccountKey folds one identity to its bucket key. Must
+// stay the same fold the surrounding EqualFold comparisons use, or the map
+// splits an account the reader treats as one.
+func grokAttributionKeeperAccountKey(identity string) string {
+	return strings.ToLower(strings.TrimSpace(identity))
+}
 
 // startGrokBillingAttributionKeeper holds attribution for the LIFETIME of a
 // direct Grok run rather than only at its start, and returns the release the
@@ -454,7 +478,13 @@ func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 	grokAttributionKeeperMu.Lock()
 	grokAttributionKeeperRefs++
 	if identity != "" {
-		grokAttributionKeeperAccounts[identity]++
+		key := grokAttributionKeeperAccountKey(identity)
+		entry := grokAttributionKeeperAccounts[key]
+		if entry.Refs == 0 {
+			entry.Identity = identity
+		}
+		entry.Refs++
+		grokAttributionKeeperAccounts[key] = entry
 	}
 	if grokAttributionKeeperRefs == 1 {
 		grokAttributionKeeperStop = make(chan struct{})
@@ -469,10 +499,12 @@ func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 			var stop chan struct{}
 			grokAttributionKeeperRefs--
 			if identity != "" {
-				if grokAttributionKeeperAccounts[identity] <= 1 {
-					delete(grokAttributionKeeperAccounts, identity)
+				key := grokAttributionKeeperAccountKey(identity)
+				if entry, ok := grokAttributionKeeperAccounts[key]; !ok || entry.Refs <= 1 {
+					delete(grokAttributionKeeperAccounts, key)
 				} else {
-					grokAttributionKeeperAccounts[identity]--
+					entry.Refs--
+					grokAttributionKeeperAccounts[key] = entry
 				}
 			}
 			if grokAttributionKeeperRefs <= 0 {
@@ -513,8 +545,9 @@ func grokArmedDirectAccountsDisagreeWith(identity string) bool {
 	}
 	grokAttributionKeeperMu.Lock()
 	defer grokAttributionKeeperMu.Unlock()
+	key := grokAttributionKeeperAccountKey(identity)
 	for armed := range grokAttributionKeeperAccounts {
-		if !strings.EqualFold(armed, identity) {
+		if armed != key {
 			return true
 		}
 	}
@@ -545,8 +578,8 @@ func grokDirectAttributionAssertion() (string, bool) {
 	case 0:
 		return "", false
 	case 1:
-		for identity := range grokAttributionKeeperAccounts {
-			return identity, true
+		for _, entry := range grokAttributionKeeperAccounts {
+			return entry.Identity, true
 		}
 	}
 	return grokContestedBillingIdentity, true
