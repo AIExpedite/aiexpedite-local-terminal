@@ -79,32 +79,33 @@ func ttydDependencySpec() DependencySpec {
 // installTtydWindows installs ttyd on Windows through the shared dependency
 // runner, so an installer-launch failure gets the same guided recovery
 // (retry / manual / troubleshoot) and diagnostics as every other package
-// install. ttyd is required, so any opt-out or unrecovered failure stops
-// startup.
+// install. ttyd powers only the local web terminal, which is a convenience —
+// so every outcome, opt-outs included, is RETURNED to ensureTtyd's caller,
+// which disables that terminal and keeps the cloud connection running.
+// Nothing here may exit the process: an exit lands in the same window as the
+// early returns StartAgent no longer takes, after the previous instance told
+// the backend it was shutting down, leaving the device Disconnected.
 func installTtydWindows() error {
 	err := runDependencyInstall(ttydDependencySpec())
 	if err == nil {
 		return nil
 	}
 	// Cancel at the permission prompt means cancel only — no browser, no
-	// install, and no follow-up dialog. ttyd is required, so the app still
-	// can't start; it just exits quietly instead of explaining itself.
-	if errors.Is(err, errInstallCancelled) {
-		os.Exit(0)
-	}
-	// The other opt-outs are "No" (the download page was opened for them) and
-	// Skip at the guided recovery dialog after an install actually failed. ttyd
-	// can't run without being installed, so tell the user how to finish and
-	// exit cleanly (matching prior behavior); any other error is surfaced to
-	// the caller as fatal.
-	if errors.Is(err, errInstallDeclined) || errors.Is(err, errInstallManual) {
-		ShowInfoDialog(
-			"Setup Incomplete",
-			"ttyd is required to run AI Expedite.\n\n"+
-				"Install it and restart the app:\n"+
+	// install, and no follow-up dialog (errInstallCancelled wraps
+	// errInstallDeclined, so it must be excluded explicitly). The other
+	// opt-outs are "No" (the download page was opened for them) and Skip at
+	// the guided recovery dialog after an install actually failed; tell the
+	// user how to get the local terminal back without implying the app is
+	// about to stop.
+	if !errors.Is(err, errInstallCancelled) &&
+		(errors.Is(err, errInstallDeclined) || errors.Is(err, errInstallManual)) {
+		installShowInfo(
+			"Local Terminal Unavailable",
+			"ttyd powers the local web terminal.\n\n"+
+				"AI Expedite keeps running and stays connected to the cloud. "+
+				"To re-enable the local terminal, install ttyd and restart the app:\n"+
 				"  winget install tsl0922.ttyd",
 		)
-		os.Exit(0)
 	}
 	return err
 }

@@ -192,7 +192,7 @@ func tearDownSubprocesses() {
 	}
 
 	// Kill the tmux session (ignore error if it never existed).
-	_ = exec.Command("tmux", "kill-session", "-t", tmuxSessionName).Run()
+	_ = exec.Command("tmux", "kill-session", "-t", tmuxTarget()).Run()
 }
 
 // IsShutdownInProgress is exposed for tests and for the receive loop's

@@ -11,9 +11,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -171,21 +173,25 @@ func StartAgent(cfg *Config) {
 
 	/* 1. Ensure prerequisites (tmux + ttyd) exist ------------------------- */
 
+	// The local web terminal (tmux + ttyd) is a convenience; the cloud
+	// connection below is the job. Nothing in this section may abort
+	// StartAgent: an early return here happens AFTER the previous instance
+	// told the backend it was shutting down and BEFORE this one says it is
+	// back, so the tray stays up while the device shows Disconnected — the
+	// 2026-09-09 prod outage, when a tmux name collision with the dev agent
+	// did exactly that for four hours. A missing tmux is the same class of
+	// abort on Unix (where it used to be fatal) as it is on Windows, so it
+	// degrades to a plain shell on every platform.
 	useTmux := true
 	if err := ensureTmux(); err != nil {
-		if runtime.GOOS == "windows" {
-			// Windows users may not have tmux – gracefully fall back
-			useTmux = false
-			fmt.Println("Warning:", err, "- running without tmux.")
-		} else {
-			fmt.Println("Fatal:", err)
-			return
-		}
+		useTmux = false
+		fmt.Println("Warning:", err, "- running the local terminal without tmux.")
 	}
 
+	localTerminal := true
 	if err := ensureTtyd(); err != nil {
-		fmt.Println("Fatal:", err)
-		return
+		localTerminal = false
+		fmt.Println("Warning:", err, "- local web terminal disabled; cloud connection continues.")
 	}
 
 	// Git is a warning-level dependency (see readiness.go): offer to install it
@@ -194,8 +200,8 @@ func StartAgent(cfg *Config) {
 
 	if useTmux {
 		if err := startTmuxSession(); err != nil {
-			fmt.Println("Fatal:", err)
-			return
+			useTmux = false
+			fmt.Println("Warning:", err, "- running the local terminal without tmux.")
 		}
 	}
 
@@ -203,7 +209,7 @@ func StartAgent(cfg *Config) {
 
 	var shellCmd []string
 	if useTmux {
-		shellCmd = []string{"tmux", "attach", "-t", tmuxSessionName}
+		shellCmd = []string{"tmux", "attach", "-t", tmuxTarget()}
 	} else {
 		sh := os.Getenv("SHELL")
 		if sh == "" {
@@ -216,19 +222,35 @@ func StartAgent(cfg *Config) {
 		shellCmd = []string{sh}
 	}
 
-	port := cfg.LocalTtydPort
-	if port == 0 {
-		port = 7681
+	port := resolvedTtydPort(cfg.LocalTtydPort)
+	if localTerminal {
+		// ttyd reports a busy port only on its own stderr, after Start() has
+		// already succeeded, so probe the bind ourselves and say which port
+		// and why — the usual cause is another channel's agent on this
+		// machine with `local_ttyd_port` overridden onto the same number.
+		if probe, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port))); err != nil {
+			localTerminal = false
+			fmt.Printf("Warning: local terminal port %d is already in use (%v) - local web terminal disabled; "+
+				"set a different local_ttyd_port in %s. Cloud connection continues.\n", port, err, ConfigPath())
+		} else {
+			_ = probe.Close()
+		}
 	}
-	args := append([]string{"-p", fmt.Sprintf("%d", port), "-i", "127.0.0.1"}, shellCmd...)
-
-	ttydCmd = exec.Command("ttyd", args...)
-	hideWindow(ttydCmd)
-	if err := ttydCmd.Start(); err != nil {
-		fmt.Println("Fatal: cannot start ttyd –", err)
-		return
+	if localTerminal {
+		args := append([]string{"-p", strconv.Itoa(port), "-i", "127.0.0.1"}, shellCmd...)
+		ttydCmd = exec.Command("ttyd", args...)
+		hideWindow(ttydCmd)
+		if err := ttydCmd.Start(); err != nil {
+			ttydCmd = nil
+			// The flag is what showConnectionInstructions reads, so clearing
+			// only ttydCmd would still advertise a loopback URL nothing is
+			// listening on.
+			localTerminal = false
+			fmt.Println("Warning: cannot start ttyd –", err, "- local web terminal disabled; cloud connection continues.")
+		} else {
+			fmt.Printf("→ ttyd listening on http://127.0.0.1:%d\n", port)
+		}
 	}
-	fmt.Printf("→ ttyd listening on http://127.0.0.1:%d\n", port)
 
 	/* 3. Pre-warm persistent PowerShell (Windows only) -------------------- */
 
@@ -394,20 +416,27 @@ func StartAgent(cfg *Config) {
 
 	/* 5. Display connection instructions ---------------------------------- */
 
-	showConnectionInstructions(cfg, port)
+	showConnectionInstructions(cfg, port, localTerminal)
 
 	// Note: Auto-update is now handled in main.go with proactive dialog
 }
 
 /*──────────────────────────  showConnectionInstructions  ──────────────────────────*/
 
-// showConnectionInstructions displays how to connect to the terminal
-func showConnectionInstructions(cfg *Config, port int) {
+// showConnectionInstructions displays how to connect to the terminal.
+// localTerminal is false when ttyd was disabled during startup (missing
+// binary, busy port, failed spawn) — nothing is listening on port, so
+// printing the URL would send the user to a connection-refused page.
+func showConnectionInstructions(cfg *Config, port int, localTerminal bool) {
 	fmt.Println("")
 	fmt.Println("╔════════════════════════════════════════════════════════════╗")
 	fmt.Println("║                    Ready to Connect!                       ║")
 	fmt.Println("╠════════════════════════════════════════════════════════════╣")
-	fmt.Printf("║  Local Terminal:  http://127.0.0.1:%-24d║\n", port)
+	if localTerminal {
+		fmt.Printf("║  Local Terminal:  http://127.0.0.1:%-24d║\n", port)
+	} else {
+		fmt.Println("║  Local Terminal:  Unavailable (see warnings above)         ║")
+	}
 	fmt.Println("║                                                            ║")
 
 	if cfg.ProjectID == "" {
@@ -424,7 +453,9 @@ func showConnectionInstructions(cfg *Config, port int) {
 	}
 
 	fmt.Println("║                                                            ║")
-	fmt.Println("║  Tip: Right-click tray icon → Open Terminal                ║")
+	if localTerminal {
+		fmt.Println("║  Tip: Right-click tray icon → Open Terminal                ║")
+	}
 	fmt.Println("╚════════════════════════════════════════════════════════════╝")
 	fmt.Println("")
 }
