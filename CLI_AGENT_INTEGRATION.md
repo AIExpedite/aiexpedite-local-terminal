@@ -394,7 +394,10 @@ Three rules keep a probe from doing damage on the way:
   per-model `[model.<runtime>] api_key` form rides along under the opt-in as
   it does for a session; and because one list run cannot reproduce
   per-model authentication, a config that keeps any per-model key makes the
-  catalog a floor (`grokConfigHasPerModelAPIKey`). A backend catalog entry
+  catalog a floor (`grokConfigHasPerModelAPIKey`) — and so does any
+  `GROK_CONFIG_PATH` at all: an external config may keep per-model keys the
+  probe cannot reproduce, and a relative path resolves against each session's
+  cwd while the probe has none. A backend catalog entry
   with its own id reaches discovery through its
   `capabilities.utilization.parserKey`, as the usage parser does; OpenCode's
   legacy `models` list drops an id past its own 2048-byte receipt bound (as

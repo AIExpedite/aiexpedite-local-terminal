@@ -733,6 +733,14 @@ func discoverGrokModels(ctx context.Context, detected detectedCLIAgent, home str
 		// floor, never a veto.
 		out.Exhaustive = false
 	}
+	if os.Getenv("GROK_CONFIG_PATH") != "" {
+		// An external config is the session's, not the isolated home's: it
+		// may carry per-model credentials the list cannot reproduce, and a
+		// RELATIVE path resolves against each session's cwd while the probe
+		// has none. Either way the probe cannot prove it saw what a session
+		// sees, so its catalog is a floor.
+		out.Exhaustive = false
+	}
 	return out, true
 }
 
