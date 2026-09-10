@@ -545,3 +545,41 @@ func TestGrokProjectPinnedCredential_ResolvesSymlinkedCwd(t *testing.T) {
 		t.Fatal("did not expect a credential for a directory outside the pinned tree")
 	}
 }
+
+// TestGrokDirectRunBillingIdentity_ContestsAUserLayerPinnedKey pins that EVERY
+// user-level TOML layer inside GROK_HOME is scanned before a direct run is
+// attributed, not just `config.toml`. `managed_config.toml` and
+// `requirements.toml` are redirected by GROK_HOME — which is exactly why the
+// managed path can neutralise them — but a DIRECT (PTY) run reads the user's
+// REAL home, so a key pinned in either is a credential the child can bill. A
+// config.toml-only scan named the cached login above that spend.
+func TestGrokDirectRunBillingIdentity_ContestsAUserLayerPinnedKey(t *testing.T) {
+	for _, name := range grokUserConfigFileNames {
+		t.Run(name, func(t *testing.T) {
+			resetGrokBillingAttribution(t)
+			helperNoGrokSystemConfigLayers(t)
+			base := helperGrokHomeWithAccount(t, "acct-login")
+
+			if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{}, base); got != "acct-login" {
+				t.Fatalf("identity = %q, want the cached login before any user layer pins a key", got)
+			}
+
+			path := filepath.Join(base, name)
+			if err := os.WriteFile(path, []byte("[model]\napi_key = \"xai-user-layer\"\n"), 0o600); err != nil {
+				t.Fatalf("write %s: %v", name, err)
+			}
+			if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{}, base); got != grokContestedBillingIdentity {
+				t.Fatalf("identity = %q, want the contested sentinel once %s pins a credential", got, name)
+			}
+
+			// An empty pin is not a credential and must not cost an honest run
+			// its observability.
+			if err := os.WriteFile(path, []byte("[model]\napi_key = \"\"\n"), 0o600); err != nil {
+				t.Fatalf("rewrite %s: %v", name, err)
+			}
+			if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{}, base); got != "acct-login" {
+				t.Fatalf("identity = %q, want the cached login for an empty pin in %s", got, name)
+			}
+		})
+	}
+}

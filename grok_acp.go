@@ -1828,8 +1828,21 @@ func grokModelCredentialTOMLKey(key string) bool {
 	return false
 }
 
-// grokAnyPinnedCredential reports whether a credential is pinned for the home
-// `base` or by a system config layer that GROK_HOME cannot redirect.
+// grokUserConfigFileNames are the TOML layers xAI's loader reads out of
+// GROK_HOME. All three are user-level — GROK_HOME redirects them, which is what
+// setupIsolatedGrokHome relies on to neutralise them for MANAGED sessions — but
+// a DIRECT (PTY) run reads the user's REAL home, so a credential pinned in any
+// of them is a credential the child can bill. Scanning only `config.toml` would
+// attribute a `managed_config.toml`/`requirements.toml` API-key run to the
+// cached login and publish that spend under the wrong subscription.
+//
+// The system-level twins (`/etc/grok/...`) are a separate list because they are
+// NOT redirected by GROK_HOME and so apply to managed sessions too.
+var grokUserConfigFileNames = []string{"config.toml", "managed_config.toml", "requirements.toml"}
+
+// grokAnyPinnedCredential reports whether a credential is pinned by any user
+// config layer in the home `base`, or by a system config layer that GROK_HOME
+// cannot redirect.
 func grokAnyPinnedCredential(base string) bool {
 	for _, p := range grokSystemConfigPathsFn() {
 		if grokConfigPinsCredential(p) {
@@ -1839,7 +1852,12 @@ func grokAnyPinnedCredential(base string) bool {
 	if base == "" {
 		return false
 	}
-	return grokConfigPinsCredential(filepath.Join(base, "config.toml"))
+	for _, name := range grokUserConfigFileNames {
+		if grokConfigPinsCredential(filepath.Join(base, name)) {
+			return true
+		}
+	}
+	return false
 }
 
 // grokSystemRequirementsPath is the documented system-level pinned-config
