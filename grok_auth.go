@@ -236,7 +236,7 @@ func grokDirectRunCredentialOverride(launch grokDirectRunLaunch, base string) bo
 				return true
 			}
 		}
-		if grokConfigLoaderEnvContests(name, value) {
+		if grokConfigLoaderEnvContests(name, value, launch.Cwd) {
 			return true
 		}
 	}
@@ -343,12 +343,17 @@ const (
 // is not "there is nothing there", and this guard is conservative by
 // construction (over-reporting costs one session's observability,
 // under-reporting publishes one account's spend as another's).
-func grokConfigLoaderEnvContests(name, value string) bool {
+//
+// cwd is the directory the child is spawned in, and it is load-bearing: a
+// RELATIVE GROK_CONFIG_PATH is resolved by the child against ITS cwd, not
+// ours, so inspecting the raw value would stat a daemon-relative path that can
+// be an unrelated clean file while the child's own path pins a credential.
+func grokConfigLoaderEnvContests(name, value, cwd string) bool {
 	switch name {
 	case grokManagedConfigURLEnvVar:
 		return true
 	case grokConfigPathEnvVar:
-		return grokLoaderConfigContests(value)
+		return grokLoaderConfigContests(value, cwd)
 	}
 	return false
 }
@@ -358,10 +363,23 @@ func grokConfigLoaderEnvContests(name, value string) bool {
 // the two dismissible cases from each other: a file that is absent or
 // unreadable to US may still be loaded by the child (a race, a permission
 // difference, a path only the child's namespace resolves), so it fails closed.
-func grokLoaderConfigContests(path string) bool {
+//
+// A relative path is anchored on the child's cwd. When the launch named no cwd
+// there is nothing to anchor it to, and reading the daemon's own working
+// directory would make the decision depend on ambient state the caller never
+// named — the same reason grokArgSelectedCwds returns grokUnresolvableArgCwd —
+// so it contests instead of inspecting a path the child never loads.
+func grokLoaderConfigContests(path, cwd string) bool {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return false
+	}
+	if !filepath.IsAbs(path) {
+		base := strings.TrimSpace(cwd)
+		if base == "" {
+			return true
+		}
+		path = filepath.Join(base, path)
 	}
 	if _, err := os.Stat(path); err != nil {
 		return true

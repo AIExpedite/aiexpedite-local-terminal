@@ -39,6 +39,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // Grok usage-limit severities, mirrored by cliagent_usage_grok.go onto the
@@ -461,8 +462,32 @@ type grokAttributionKeeperAccount struct {
 // grokAttributionKeeperAccountKey folds one identity to its bucket key. Must
 // stay the same fold the surrounding EqualFold comparisons use, or the map
 // splits an account the reader treats as one.
+//
+// strings.ToLower is NOT that fold. strings.EqualFold compares rune by rune
+// under Unicode simple folding, whose orbits can hold several lowercase runes:
+// capital sigma, small sigma and FINAL small sigma are one orbit, so `Σ` and
+// `ς` are EqualFold-equal while lowercasing them yields `σ` and `ς` — two keys
+// for one account, which makes the keeper see a disagreement that does not
+// exist and install the contested sentinel, discarding both runs' billing
+// observations. Mapping each rune to the SMALLEST rune in its simple-fold
+// orbit reproduces EqualFold's equivalence exactly, because that orbit is the
+// relation EqualFold itself walks.
 func grokAttributionKeeperAccountKey(identity string) string {
-	return strings.ToLower(strings.TrimSpace(identity))
+	return strings.Map(grokFoldRune, strings.TrimSpace(identity))
+}
+
+// grokFoldRune returns the canonical representative of r's Unicode simple-fold
+// orbit: the smallest rune reachable by walking unicode.SimpleFold from r back
+// around to itself. Two runes share a representative exactly when
+// strings.EqualFold considers them equal.
+func grokFoldRune(r rune) rune {
+	min := r
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f < min {
+			min = f
+		}
+	}
+	return min
 }
 
 // startGrokBillingAttributionKeeper holds attribution for the LIFETIME of a

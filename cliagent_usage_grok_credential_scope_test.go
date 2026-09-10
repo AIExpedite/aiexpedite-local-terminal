@@ -863,3 +863,50 @@ func TestGrokDirectRunBillingIdentity_AnchorsARelativeArgvCwd(t *testing.T) {
 		t.Fatalf("identity = %q, want the cached login for an empty --cwd value", got)
 	}
 }
+
+// TestGrokDirectRunBillingIdentity_ResolvesARelativeConfigPathAgainstTheChildCwd
+// pins that a RELATIVE GROK_CONFIG_PATH is anchored on the directory the CHILD
+// starts in, not on the daemon's. The child resolves it against its own cwd, so
+// inspecting the raw value would stat a daemon-relative path — which can be an
+// unrelated clean file (or nothing at all) while the path the child actually
+// loads pins `model.api_key`, publishing the API-key account's spend as the
+// cached login's.
+func TestGrokDirectRunBillingIdentity_ResolvesARelativeConfigPathAgainstTheChildCwd(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	helperNoGrokSystemConfigLayers(t)
+	base := helperGrokHomeWithAccount(t, "acct-login")
+
+	child := t.TempDir()
+	if err := os.WriteFile(filepath.Join(child, "loader.toml"),
+		[]byte("[model]\napi_key = \"xai-child-relative-sentinel\"\n"), 0o600); err != nil {
+		t.Fatalf("write child loader config: %v", err)
+	}
+	clean := t.TempDir()
+	if err := os.WriteFile(filepath.Join(clean, "loader.toml"),
+		[]byte("[model]\ndefault = \"grok-4\"\n"), 0o600); err != nil {
+		t.Fatalf("write clean loader config: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		cwd  string
+		want string
+	}{
+		{"child cwd holds the pinning config", child, grokContestedBillingIdentity},
+		{"child cwd holds an ordinary config", clean, "acct-login"},
+		// Nothing to anchor the value to, and reading the daemon's own working
+		// directory would decide on ambient state the caller never named — so
+		// "we could not look" fails closed, as it does for a relative --cwd.
+		{"no cwd named", "", grokContestedBillingIdentity},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := grokDirectRunBillingIdentity(grokDirectRunLaunch{
+				Env: []string{"GROK_CONFIG_PATH=loader.toml"},
+				Cwd: tc.cwd,
+			}, base)
+			if got != tc.want {
+				t.Fatalf("identity = %q, want %q for cwd %q", got, tc.want, tc.cwd)
+			}
+		})
+	}
+}

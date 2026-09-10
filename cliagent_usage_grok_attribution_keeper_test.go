@@ -697,3 +697,75 @@ func TestGrokAttributionKeeper_CoalescesCaseEquivalentIdentities(t *testing.T) {
 		t.Fatalf("assertion = %q/%v, want the contested sentinel across two accounts", identity, ok)
 	}
 }
+
+// strings.ToLower is not the equivalence strings.EqualFold implements: a
+// Unicode simple-fold orbit can hold several lowercase runes, so `Σ` and final
+// sigma `ς` are EqualFold-equal yet lowercase to two different runes. Keying
+// the arm map by the lowercase form would split one account the reader treats
+// as one, install the contested sentinel, and discard both runs' observations.
+func TestGrokAttributionKeeper_CoalescesUnicodeFoldEquivalentIdentities(t *testing.T) {
+	resetGrokBillingAttribution(t)
+
+	const upper = "ΣIGMA@example.com"
+	const finalForm = "ςigma@example.com"
+	if !strings.EqualFold(upper, finalForm) {
+		t.Fatalf("fixture is not EqualFold-equivalent: %q vs %q", upper, finalForm)
+	}
+	if strings.ToLower(upper) == strings.ToLower(finalForm) {
+		t.Fatalf("fixture no longer exercises the ToLower gap: %q", strings.ToLower(upper))
+	}
+
+	firstDone := startGrokBillingAttributionKeeper(upper)
+	secondDone := startGrokBillingAttributionKeeper(finalForm)
+	t.Cleanup(func() {
+		secondDone()
+		firstDone()
+	})
+
+	if grokArmedDirectAccountsDisagreeWith(finalForm) {
+		t.Fatal("fold-equivalent arms reported as a disagreement")
+	}
+	identity, ok := grokDirectAttributionAssertion()
+	if !ok {
+		t.Fatal("no assertion with two live arms")
+	}
+	if identity != upper {
+		t.Fatalf("assertion = %q, want the first arm's spelling %q", identity, upper)
+	}
+
+	// A genuinely different account must still contest — the fold must not
+	// collapse accounts the reader keeps apart.
+	otherDone := startGrokBillingAttributionKeeper("other@example.com")
+	defer otherDone()
+	if !grokArmedDirectAccountsDisagreeWith(upper) {
+		t.Fatal("a second account was not reported as a disagreement")
+	}
+}
+
+// grokFoldRune must reproduce EqualFold's rune equivalence exactly: two runes
+// share a key when EqualFold considers them equal, and never otherwise.
+func TestGrokFoldRune_MatchesEqualFold(t *testing.T) {
+	for _, tc := range []struct {
+		a, b rune
+	}{
+		{'A', 'a'},
+		{'Σ', 'ς'},
+		{'σ', 'ς'},
+		{'K', 'K'}, // U+212A KELVIN SIGN folds onto ASCII k
+		{'İ', 'İ'},
+	} {
+		if got, want := grokFoldRune(tc.a) == grokFoldRune(tc.b), strings.EqualFold(string(tc.a), string(tc.b)); got != want {
+			t.Fatalf("fold(%q)==fold(%q) is %v, EqualFold says %v", tc.a, tc.b, got, want)
+		}
+	}
+	for _, tc := range []struct {
+		a, b rune
+	}{
+		{'a', 'b'},
+		{'σ', 'ρ'},
+	} {
+		if grokFoldRune(tc.a) == grokFoldRune(tc.b) {
+			t.Fatalf("fold collapsed distinct runes %q and %q", tc.a, tc.b)
+		}
+	}
+}
