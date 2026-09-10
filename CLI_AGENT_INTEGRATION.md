@@ -366,11 +366,18 @@ Three rules keep a probe from doing damage on the way:
   deadline — can never be held past that by a slow `agy models`. An
   inconclusive probe whose context expired is NOT cached, or one refresh that
   ran out of time would hide the agent's models for the whole 30-minute TTL.
-- **`grok models` runs against the same home the cache is read from.**
+- **`grok models` runs under the same credential surface as an ACP session.**
   `sanitizeGrokModelListEnv` is the maintenance-smoke sanitizer with `GROK_HOME`
-  put back: the smoke sanitizer drops every `GROK_*` var, but that override
+  put back (the smoke sanitizer drops every `GROK_*` var, but that override
   chooses the login and cache directory, so dropping it would list one account's
-  models and merge another account's cache.
+  models and merge another account's cache) and with `XAI_API_KEY` put back ONLY
+  when `Config.EnableGrokAPIKeyFallback` is on — the same opt-in the ACP launch
+  honours — so a key-authenticated host does not list logged-out and publish
+  that as the catalog.
+- **Codex without a models cache still reports its configured model.** A fresh
+  install or a cleared cache reports the top-level `model` from `config.toml`
+  (basic `"…"` or literal `'…'` string) as a one-model, non-exhaustive floor,
+  not nothing.
 - **Cache-only Grok discovery is a floor.** When the list command fails but the
   cache reads, `modelsExhaustive` is false regardless of the build-version
   match — Grok fetches this catalog from its backend, so it can gain a model

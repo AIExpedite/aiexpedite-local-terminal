@@ -308,15 +308,25 @@ func discoverCodexModels(home, installedVersion string) (cliAgentModelDiscovery,
 	if path == "" {
 		return cliAgentModelDiscovery{}, false
 	}
+	configured := readCodexConfiguredModel(home)
 	var cache codexModelsCacheFile
 	if !readJSONFile(path, &cache) {
-		return cliAgentModelDiscovery{}, false
+		// No cache yet (fresh install, cleared cache): the configured model
+		// is still what `codex` runs on this machine, so report it as a
+		// one-model, non-exhaustive floor rather than nothing at all.
+		if configured == "" {
+			return cliAgentModelDiscovery{}, false
+		}
+		return reconcileCodexDiscovery(cliAgentModelDiscovery{}, "", installedVersion, configured), true
 	}
 	out, ok := parseCodexModelsCache(cache)
 	if !ok {
-		return out, false
+		if configured == "" {
+			return out, false
+		}
+		return reconcileCodexDiscovery(cliAgentModelDiscovery{}, cache.ClientVersion, installedVersion, configured), true
 	}
-	return reconcileCodexDiscovery(out, cache.ClientVersion, installedVersion, readCodexConfiguredModel(home)), true
+	return reconcileCodexDiscovery(out, cache.ClientVersion, installedVersion, configured), true
 }
 
 // reconcileCodexDiscovery applies the two facts the cache alone cannot carry:
@@ -362,8 +372,9 @@ func versionToken(value string) string {
 	return versionTokenPattern.FindString(value)
 }
 
-// codexConfigModelLine matches a top-level `model = "…"` in config.toml.
-var codexConfigModelLine = regexp.MustCompile(`(?m)^\s*model\s*=\s*"([^"]+)"`)
+// codexConfigModelLine matches a top-level `model = "…"` or `model = '…'` in
+// config.toml — TOML's basic and literal string forms are both valid there.
+var codexConfigModelLine = regexp.MustCompile(`(?m)^\s*model\s*=\s*(?:"([^"]+)"|'([^']+)')`)
 
 // codexConfigTableHeader matches the first TOML table header (`[profiles.x]`,
 // `[[array]]`), on any line including the first.
@@ -392,7 +403,7 @@ func readCodexConfiguredModel(home string) string {
 	if match == nil {
 		return ""
 	}
-	return strings.TrimSpace(match[1])
+	return strings.TrimSpace(firstNonEmpty(match[1], match[2]))
 }
 
 func containsModelID(models []cliAgentModelDetail, id string) bool {
@@ -561,14 +572,36 @@ type grokModelsCacheFile struct {
 // account this device never runs.
 func sanitizeGrokModelListEnv(env []string) []string {
 	filtered := sanitizeGrokMaintenanceSmokeEnv(env)
+	// The read-only list must run under the SAME credential surface as the
+	// ACP sessions it describes: GROK_HOME (the login and cache directory the
+	// merged cache is read from) always, and XAI_API_KEY only when the user
+	// opted into Config.EnableGrokAPIKeyFallback — exactly what
+	// sanitizeGrokACPEnv keeps for a session. Otherwise a key-authenticated
+	// host would list logged-out (or nothing) and publish that as exhaustive.
+	allowAPIKey := grokAPIKeyFallbackOptedIn()
 	for _, entry := range env {
 		name, value, found := strings.Cut(entry, "=")
-		if !found || !strings.EqualFold(strings.TrimSpace(name), "GROK_HOME") {
+		if !found {
 			continue
 		}
-		filtered = setEnvVar(filtered, "GROK_HOME", value)
+		switch strings.ToUpper(strings.TrimSpace(name)) {
+		case "GROK_HOME":
+			filtered = setEnvVar(filtered, "GROK_HOME", value)
+		case "XAI_API_KEY":
+			if allowAPIKey {
+				filtered = setEnvVar(filtered, "XAI_API_KEY", value)
+			}
+		}
 	}
 	return filtered
+}
+
+// grokAPIKeyFallbackOptedIn reads the live config's API-key opt-in — the same
+// flag the ACP launch passes as AllowAPIKeyFallback. Absent config (tests, a
+// pre-registration probe) means the default: opt-in only, key stripped.
+func grokAPIKeyFallbackOptedIn() bool {
+	cfg := shutdownConfig
+	return cfg != nil && cfg.EnableGrokAPIKeyFallback
 }
 
 func grokModelsCachePath(home string) string {
