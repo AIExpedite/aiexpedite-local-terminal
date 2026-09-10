@@ -37,6 +37,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
@@ -145,6 +146,17 @@ func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected 
 		if len(usage.Models) == 0 {
 			return
 		}
+		// The legacy `models` list has its own receipt bound (2048 bytes per
+		// id); an id past it is dropped from BOTH lists rather than left to
+		// fail the whole provider in canonicalProvider.
+		legacy := make([]string, 0, len(usage.Models))
+		for _, id := range usage.Models {
+			if id != "" && bounded(id, cliUsageMaxLegacyModelIDLength) {
+				legacy = append(legacy, id)
+			}
+		}
+		dropped := len(legacy) < len(usage.Models)
+		usage.Models = legacy
 		details := make([]cliAgentModelDetail, 0, len(usage.Models))
 		for _, id := range usage.Models {
 			details = append(details, cliAgentModelDetail{ID: id})
@@ -156,7 +168,7 @@ func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected 
 		// Either way the details are not everything OpenCode accepts, and an
 		// exhaustive flag there would let routing veto a model OpenCode runs.
 		capped := len(usage.Models) >= cliUsageMaxModelsPerProvider
-		dropped := len(usage.ModelDetails) < len(usage.Models)
+		dropped = dropped || len(usage.ModelDetails) < len(usage.Models)
 		usage.ModelsExhaustive = authBoolPtr(!capped && !dropped)
 		return
 	}
@@ -665,14 +677,20 @@ func discoverGrokModels(ctx context.Context, detected detectedCLIAgent, home str
 	// authenticate the list, and the catalog of THAT account could veto the
 	// models the cached-token sessions actually run.
 	realBase := grokModelsHomeBase(home)
-	env := sanitizeGrokModelListEnv(os.Environ())
 	isolated, err := setupIsolatedGrokHomeFrom(grokAPIKeyFallbackOptedIn(), "", realBase)
 	if err == nil {
-		env = setEnvVar(env, "GROK_HOME", isolated)
 		defer func() { _ = removeIsolatedGrokHome(isolated) }()
-	}
-	if out, ok := cliAgentModelProbeRunner(ctx, detected.Path, env, "models"); ok {
-		listed, listedOK = parseGrokModelList(out)
+		env := setEnvVar(sanitizeGrokModelListEnv(os.Environ()), "GROK_HOME", isolated)
+		if out, ok := cliAgentModelProbeRunner(ctx, detected.Path, env, "models"); ok {
+			listed, listedOK = parseGrokModelList(out)
+		}
+	} else {
+		// Fail closed, as a managed session does on the same error: with no
+		// isolated home the list is NOT run against the real one (a persisted
+		// key the user never opted into would authenticate it); the cache
+		// alone is the answer, and cache-only is non-exhaustive by rule.
+		isolated = ""
+		fmt.Printf("%s[cli-usage] grok model list skipped — isolated home unavailable: %v%s\n", colorYellow, err, colorReset)
 	}
 	// Listing while signed in refreshes the cache under the home the child
 	// ran with — the isolated one — so that copy is read first; the real
@@ -891,6 +909,11 @@ func boundedModelDetail(detail cliAgentModelDetail) cliAgentModelDetail {
 // `modelDetails` (the legacy `models` list allows 2048; the detail row is the
 // one the verifier rejects at 256).
 const cliUsageMaxModelDetailIDLength = 256
+
+// cliUsageMaxLegacyModelIDLength is the receipt bound on one id in the legacy
+// `models` list — wider than the detail row, and the one an over-long
+// user-configured OpenCode provider id must be measured against there.
+const cliUsageMaxLegacyModelIDLength = 2048
 
 // boundedModelDetails drops the rows the receipt would reject — an empty id or
 // one over the id bound — and truncates the rest to the receipt cap, keeping

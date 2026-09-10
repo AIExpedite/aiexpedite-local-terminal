@@ -387,8 +387,12 @@ Three rules keep a probe from doing damage on the way:
   under the same opt-in — so a key the user never opted into cannot
   authenticate the list and publish another account's catalog; the cache the
   list just refreshed there is read first, the real home's cache is the
-  fallback. A backend catalog entry with its own id reaches discovery through
-  its `capabilities.utilization.parserKey`, as the usage parser does.
+  fallback. If the isolated home cannot be built the list is NOT run against
+  the real home — it fails closed like a managed session, and the cache alone
+  answers (non-exhaustive by rule). A backend catalog entry with its own id
+  reaches discovery through its `capabilities.utilization.parserKey`, as the
+  usage parser does; and OpenCode's legacy `models` list drops an id past its
+  own 2048-byte receipt bound, as the detail rows drop one past 256.
 - **Codex without a models cache still reports its configured model.** A fresh
   install or a cleared cache reports the top-level `model` from `config.toml`
   (basic `"…"` or literal `'…'` string) as a one-model, non-exhaustive floor,
