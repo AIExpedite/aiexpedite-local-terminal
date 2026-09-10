@@ -294,11 +294,24 @@ func parseOpenCodeModelList(out string) []string {
 	return ids
 }
 
+// capOpenCodeModelIDs deduplicates (first occurrence wins, order kept — the
+// plain-text path already does this while scanning) BEFORE applying the
+// receipt cap, so a repeat among the first entries can never push a distinct
+// later model past the cut and leave a shortened list that reads as complete.
 func capOpenCodeModelIDs(ids []string) []string {
-	if len(ids) > cliUsageMaxModelsPerProvider {
-		return ids[:cliUsageMaxModelsPerProvider]
+	seen := make(map[string]bool, len(ids))
+	unique := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		unique = append(unique, id)
+		if len(unique) == cliUsageMaxModelsPerProvider {
+			break
+		}
 	}
-	return ids
+	return unique
 }
 
 func parseOpenCodeModelJSON(trimmed string) []string {
