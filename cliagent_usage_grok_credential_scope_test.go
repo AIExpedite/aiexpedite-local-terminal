@@ -1411,3 +1411,53 @@ func TestGrokExternalAuthProviderEnvVars_MatchTheConfigClassification(t *testing
 		}
 	}
 }
+
+// A prompt is prose the child never parses as configuration, so quoting a
+// config key in one must not arm the contested identity and cost an honest
+// cached-login run its billing record. Every other token stays swept — the
+// carve-out is the prompt VALUE, not the flag's neighbourhood.
+func TestGrokDirectRunBillingIdentity_DoesNotReadThePromptAsAnOverride(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	helperNoGrokSystemConfigLayers(t)
+	base := helperGrokHomeWithAccount(t, "acct-login")
+
+	const prompt = "explain what model.api_key=xai-example does in config.toml"
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"separate-value prompt", []string{"--output-format", "streaming-json", "-p", prompt}, "acct-login"},
+		{"--single alias", []string{"--single", prompt}, "acct-login"},
+		{"joined spelling", []string{"-p=" + prompt}, "acct-login"},
+		{"prompt file path", []string{"--prompt-file", "/tmp/grok-prompt-model.api_key=x.txt"}, "acct-login"},
+		// A prompt that names an auth-override FLAG is still just prose.
+		{"prompt quoting an auth flag", []string{"-p", "why does --api-key-env exist?"}, "acct-login"},
+		// The real override still contests, alongside a prompt.
+		{
+			"a real config override beside a prompt",
+			[]string{"--config", "model.api_key=xai-real", "-p", prompt},
+			grokContestedBillingIdentity,
+		},
+		{
+			"an auth-override flag beside a prompt",
+			[]string{"--api-key-env", "OTHER_ACCOUNT_KEY", "-p", prompt},
+			grokContestedBillingIdentity,
+		},
+		// The token after an UNRECOGNISED flag keeps its sweep: only prompt
+		// delivery is exempt, so a future override spelling cannot hide behind
+		// a flag this file has never heard of.
+		{
+			"unrecognised flag does not shield its value",
+			[]string{"--some-future-flag", "model.api_key=xai-real"},
+			grokContestedBillingIdentity,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := grokDirectRunBillingIdentity(grokDirectRunLaunch{Args: tc.args}, base)
+			if got != tc.want {
+				t.Fatalf("identity = %q, want %q for args %v", got, tc.want, tc.args)
+			}
+		})
+	}
+}

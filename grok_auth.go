@@ -445,9 +445,33 @@ func grokLoaderConfigContests(path, cwd string) bool {
 // keeps the two from disagreeing about what an auth override is — `--api-key-env`
 // normalises to `apikeyenv`, which is a suffix of neither `api_key` nor
 // `env_key`, so the config-key rule below can never recognise it.
+//
+// The ONE token exempted from that sweep is the PROMPT: the value a
+// prompt-delivery flag consumes is prose the child never parses as
+// configuration, so `grok -p "explain model.api_key=..."` is a question about a
+// setting, not an override of one. Without the carve-out an ordinary prompt
+// that quotes a config key would arm the contested identity and cost an honest
+// cached-login run its billing record — the managed path usually relocates the
+// prompt into `--prompt-file` (rewriteGrokPromptToFile), but that rewrite is
+// best-effort and falls back to `-p <prompt>` on argv. Exempting a value the
+// CLI cannot read as config weakens nothing: every other token, including one
+// following any UNRECOGNISED flag, is still swept.
 func grokArgsPinCredential(args []string) bool {
+	skipNext := false
 	for _, arg := range args {
-		if isGrokAuthOverrideArg(strings.ToLower(strings.TrimSpace(arg))) {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		lower := strings.ToLower(strings.TrimSpace(arg))
+		if grokPromptDeliveryFlags[lower] {
+			skipNext = true
+			continue
+		}
+		if grokPromptDeliveryFlagAssignment(lower) {
+			continue
+		}
+		if isGrokAuthOverrideArg(lower) {
 			return true
 		}
 		if grokArgPinsCredential(arg) {
@@ -455,6 +479,27 @@ func grokArgsPinCredential(args []string) bool {
 		}
 	}
 	return false
+}
+
+// grokPromptDeliveryFlags are the flags whose NEXT token grok consumes as the
+// prompt (or as the file the prompt was relocated into). Kept to the spellings
+// buildGrokInteractiveArgs / rewriteGrokPromptToFile actually emit, plus grok's
+// own `--single` alias, rather than every flag that takes a value: the sweep's
+// value is that it inspects tokens after flags we do NOT recognise, and each
+// name added here is one more place an override could hide.
+var grokPromptDeliveryFlags = map[string]bool{
+	"-p":            true,
+	"--single":      true,
+	"--prompt-file": true,
+	"--prompt_file": true,
+}
+
+// grokPromptDeliveryFlagAssignment reports whether ONE token is the joined
+// `--flag=value` spelling of a prompt-delivery flag, whose value is the same
+// prose the separate-value form carries.
+func grokPromptDeliveryFlagAssignment(arg string) bool {
+	name, _, ok := strings.Cut(arg, "=")
+	return ok && grokPromptDeliveryFlags[strings.TrimSpace(name)]
 }
 
 // grokArgPinsCredential reports whether ONE argv token assigns a non-empty credential.
