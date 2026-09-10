@@ -455,9 +455,19 @@ func grokBillingIdentityIsNewest(base, identity string) bool {
 //
 // Only normalized allowlisted fields are persisted. Prompts, credentials, raw
 // config, tool results, and unrelated log fields never leave the isolated home.
-func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string) (grokManagedBillingOutcome, error) {
+func persistGrokManagedBillingSnapshot(isolatedHome, persistentHome string, producerContested bool) (grokManagedBillingOutcome, error) {
 	if isolatedHome == "" || persistentHome == "" {
 		return grokManagedBillingNotApplicable, nil
+	}
+	// The producer was contested at session start: the child could resolve an
+	// API key or a config/system credential layer GROK_HOME does not redirect,
+	// so the record in the isolated home may belong to an account the copied
+	// login does not name. Merging it would publish that account's utilization
+	// under the copied login's identity. Nothing is written — not even under
+	// the contested sentinel, which would only add a record no reader may ever
+	// publish to a provider-owned file.
+	if producerContested {
+		return grokManagedBillingContestedProducer, nil
 	}
 	identities := grokIdentityCandidates(isolatedHome)
 	if len(identities) == 0 {
@@ -1079,6 +1089,15 @@ const (
 	// catches up. Leaving the log alone keeps whatever valid observation it
 	// already had.
 	grokManagedBillingUntrusted
+	// grokManagedBillingContestedProducer — the child was spawned with a
+	// credential surface the copied login does not account for (an inherited or
+	// configured API key, a workspace/system config layer GROK_HOME does not
+	// redirect), so which account it billed is unknown. Nothing was written;
+	// the card falls back to "unobservable" for this session rather than
+	// attributing one account's spend to another. Mirrors what
+	// grokManagedRunLimitNoticeScope already does with the same session's limit
+	// notices.
+	grokManagedBillingContestedProducer
 	// grokManagedBillingPersisted — one normalized record was merged.
 	grokManagedBillingPersisted
 	// grokManagedBillingRaced — the record was merged, but a same-account direct
@@ -1105,6 +1124,8 @@ func (o grokManagedBillingOutcome) String() string {
 		return "superseded"
 	case grokManagedBillingUntrusted:
 		return "untrusted-timestamp"
+	case grokManagedBillingContestedProducer:
+		return "contested-producer"
 	case grokManagedBillingPersisted:
 		return "persisted"
 	case grokManagedBillingRaced:

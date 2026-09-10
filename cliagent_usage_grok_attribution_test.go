@@ -191,7 +191,7 @@ func TestPersistGrokManagedBillingSnapshot_ManagedRunLeavesAConfirmedUnmeteredMe
 	helperAppendGrokLogLine(t, isolated,
 		grokUnmeteredLine("2026-08-19T11:58:00Z", grokBillingLogMessage))
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestPersistGrokManagedBillingSnapshot_NoRecordLeavesThePriorReadingIntact(t
 	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
 		t.Fatalf("seed isolated identity: %v", err)
 	}
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestPersistGrokManagedBillingSnapshot_MergesPastAnUntrustedFutureRecord(t *
 		grokBillingLine(observed, 12, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -443,7 +443,7 @@ func TestPersistGrokManagedBillingSnapshot_DoesNotSupersedeANewerObservation(t *
 		grokBillingLine("2026-08-19T11:00:00Z", 12, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -484,7 +484,7 @@ func TestPersistGrokManagedBillingSnapshot_MergesANewerObservation(t *testing.T)
 		grokBillingLine("2026-08-19T12:00:00Z", 52, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -510,7 +510,7 @@ func TestPersistGrokManagedBillingSnapshot_IsIdempotentForTheSameRecord(t *testi
 	helperAppendGrokLogLine(t, isolated,
 		grokUnmeteredLine("2026-08-19T11:58:00Z", grokBillingLogMessage))
 
-	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil ||
+	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil ||
 		outcome != grokManagedBillingPersisted {
 		t.Fatalf("first persist: outcome=%s err=%v", outcome, err)
 	}
@@ -519,7 +519,7 @@ func TestPersistGrokManagedBillingSnapshot_IsIdempotentForTheSameRecord(t *testi
 		t.Fatalf("read persistent log: %v", err)
 	}
 
-	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil ||
+	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil ||
 		outcome != grokManagedBillingSuperseded {
 		t.Fatalf("second persist: outcome=%s err=%v, want %s", outcome, err, grokManagedBillingSuperseded)
 	}
@@ -568,7 +568,7 @@ func TestPersistGrokManagedBillingSnapshot_LooksPastAnInterveningAccountsRecord(
 		grokBillingLine("2026-08-19T11:00:00Z", 12, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -612,7 +612,7 @@ func TestPersistGrokManagedBillingSnapshot_AForeignRecordDoesNotBlockAFreshMerge
 		grokBillingLine("2026-08-19T12:00:00Z", 31, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}

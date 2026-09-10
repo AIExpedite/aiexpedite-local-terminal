@@ -198,6 +198,11 @@ type GrokACPSession struct {
 	// PersistentHome mid-session must not re-file this session's notices under
 	// the new account.
 	limitNoticeScope grokLimitNoticeScope
+	// producerContested freezes, from that same credential surface, whether the
+	// child may bill an account the copied login does not name. waitForExit
+	// refuses to merge this session's billing record when it is set — the
+	// billing twin of limitNoticeScope's refusal to cache its notices.
+	producerContested bool
 
 	mu            sync.Mutex
 	status        string // "running" | "ended"
@@ -497,8 +502,12 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// config carries the persisted `[model] api_key`, either of which can belong
 	// to a different account, and neither the system config layers nor the
 	// workspace `.grok/config.toml` under `cwd` is redirected by GROK_HOME.
-	limitNoticeScope := grokManagedRunLimitNoticeScope(
-		grokDirectRunLaunch{Env: env, Cwd: cwd, Args: args}, isolatedHome)
+	managedLaunch := grokDirectRunLaunch{Env: env, Cwd: cwd, Args: args}
+	limitNoticeScope := grokManagedRunLimitNoticeScope(managedLaunch, isolatedHome)
+	// The SAME verdict gates the billing merge on exit. Resolved once, here,
+	// from the pre-spawn surface: re-deriving it in waitForExit would read a
+	// config layer the run itself may have rewritten.
+	producerContested := grokManagedRunProducerContested(managedLaunch, isolatedHome)
 
 	// cleanupFailedStart removes the per-session temp dir on any pre-spawn
 	// failure path. Once the child is successfully started, ownership of the
@@ -548,24 +557,25 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	}
 
 	session := &GrokACPSession{
-		ID:               id,
-		Process:          proc,
-		Stdin:            stdin,
-		Stdout:           stdout,
-		Stderr:           stderr,
-		StartedAt:        time.Now(),
-		WorkspaceID:      workspaceID,
-		UID:              uid,
-		TimeoutMs:        timeoutMs,
-		WorkspaceRoot:    resolvedRoot,
-		IsolatedHome:     isolatedHome,
-		PersistentHome:   persistentHome,
-		limitNoticeScope: limitNoticeScope,
-		status:           "running",
-		done:             make(chan struct{}),
-		processExited:    make(chan struct{}),
-		streamDone:       make(chan struct{}),
-		firstFrame:       make(chan struct{}),
+		ID:                id,
+		Process:           proc,
+		Stdin:             stdin,
+		Stdout:            stdout,
+		Stderr:            stderr,
+		StartedAt:         time.Now(),
+		WorkspaceID:       workspaceID,
+		UID:               uid,
+		TimeoutMs:         timeoutMs,
+		WorkspaceRoot:     resolvedRoot,
+		IsolatedHome:      isolatedHome,
+		PersistentHome:    persistentHome,
+		limitNoticeScope:  limitNoticeScope,
+		producerContested: producerContested,
+		status:            "running",
+		done:              make(chan struct{}),
+		processExited:     make(chan struct{}),
+		streamDone:        make(chan struct{}),
+		firstFrame:        make(chan struct{}),
 	}
 
 	m.sessions[id] = session
@@ -1254,7 +1264,7 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	// login` can change the real home's account but cannot relabel this record:
 	// persistGrokManagedBillingSnapshot writes the copied producer identity and
 	// billing record together.
-	if outcome, err := persistGrokManagedBillingSnapshot(session.IsolatedHome, session.PersistentHome); err != nil {
+	if outcome, err := persistGrokManagedBillingSnapshot(session.IsolatedHome, session.PersistentHome, session.producerContested); err != nil {
 		fmt.Printf("%s[grok-acp] managed billing snapshot not persisted (%s): %v%s\n",
 			colorYellow, outcome, err, colorReset)
 	} else {

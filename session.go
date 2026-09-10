@@ -87,6 +87,12 @@ type CLISession struct {
 	isolatedGrokHome   string
 	persistentGrokHome string
 
+	// grokProducerContested freezes, from the credential surface the managed
+	// child was spawned with, whether it may bill an account the copied login
+	// does not name. waitForExit refuses to merge the billing snapshot when it
+	// is set — the billing twin of the notice scope's refusal below.
+	grokProducerContested bool
+
 	// grokLimitNoticeScope is the account this session's Grok limit notices may
 	// be cached under, frozen at spawn. Zero value for every non-Grok command
 	// and for a Grok run whose producer is contested — captureGrokUsageLimitLine
@@ -537,6 +543,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	// login copied into its isolated home and a direct run the persistent one —
 	// in both cases only while nothing else the child carries contests it.
 	var grokLimitScope grokLimitNoticeScope
+	var grokProducerContested bool
 	if isGrokCommand(command) && isolatedGrokHome != "" {
 		// From the credential surface the smoke child is SPAWNED with, not the
 		// isolated home alone: sanitizeGrokMaintenanceSmokeEnv strips the env
@@ -544,8 +551,11 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		// redirected by GROK_HOME and can still pin a key for an account the
 		// copied login does not name. Caching that account's notice under this
 		// fingerprint would show one account's limit on another's card.
-		grokLimitScope = grokManagedRunLimitNoticeScope(
-			grokDirectRunLaunch{Env: filtered, Cwd: proc.Dir, Args: cliArgs}, isolatedGrokHome)
+		managedLaunch := grokDirectRunLaunch{Env: filtered, Cwd: proc.Dir, Args: cliArgs}
+		grokLimitScope = grokManagedRunLimitNoticeScope(managedLaunch, isolatedGrokHome)
+		// The SAME verdict gates the billing merge on exit, resolved once from
+		// the pre-spawn surface rather than re-derived after the run.
+		grokProducerContested = grokManagedRunProducerContested(managedLaunch, isolatedGrokHome)
 	}
 	if isGrokCommand(command) && isolatedGrokHome == "" {
 		// The identity is CAPTURED here and re-asserted as-is for the life of the
@@ -648,6 +658,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		isolatedGrokHome:             isolatedGrokHome,
 		persistentGrokHome:           persistentGrokHome,
 		grokLimitNoticeScope:         grokLimitScope,
+		grokProducerContested:        grokProducerContested,
 		antigravityManagedStream:     antigravityManagedStream,
 		finishQuotaCapture:           finishQuotaCapture,
 		finishGrokBillingAttribution: finishGrokAttribution,
@@ -1873,7 +1884,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// lifecycle before announcing session_ended, then remove all copied auth and
 	// private logs. Never copy the raw log or config into the persistent home.
 	if session.isolatedGrokHome != "" {
-		outcome, persistErr := persistGrokManagedBillingSnapshot(session.isolatedGrokHome, session.persistentGrokHome)
+		outcome, persistErr := persistGrokManagedBillingSnapshot(session.isolatedGrokHome, session.persistentGrokHome, session.grokProducerContested)
 		if persistErr != nil {
 			fmt.Printf("%s[session] Grok no-tools billing snapshot not persisted (%s): %v%s\n",
 				colorYellow, outcome, persistErr, colorReset)

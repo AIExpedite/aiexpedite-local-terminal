@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -288,7 +289,7 @@ func TestPersistGrokManagedBillingSnapshot_SerializesWithDirectAttribution(t *te
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = persistGrokManagedBillingSnapshot(isolated, persistent)
+		_, _ = persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	}()
 
 	select {
@@ -393,7 +394,7 @@ func TestPersistGrokManagedBillingSnapshot_RepairsAnArmedDirectRunImmediately(t 
 	helperAppendGrokLogLine(t, isolated,
 		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
 
-	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil ||
+	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil ||
 		outcome != grokManagedBillingPersisted {
 		t.Fatalf("persist → %v, %v; want persisted", outcome, err)
 	}
@@ -427,7 +428,7 @@ func TestPersistGrokManagedBillingSnapshot_DoesNotRepairWhenNoDirectRunIsArmed(t
 	helperAppendGrokLogLine(t, isolated,
 		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
 
-	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
+	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
 	if got := grokIdentityLineCount(t, persistent); got != 2 {
@@ -459,7 +460,7 @@ func TestPersistGrokManagedBillingSnapshot_RepairsInTheSameAtomicWrite(t *testin
 	helperAppendGrokLogLine(t, isolated,
 		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
 
-	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil ||
+	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil ||
 		outcome != grokManagedBillingPersisted {
 		t.Fatalf("persist → %v, %v; want persisted", outcome, err)
 	}
@@ -503,7 +504,7 @@ func TestPersistGrokManagedBillingSnapshot_SkipsRepairForTheSameAccount(t *testi
 	helperAppendGrokLogLine(t, isolated,
 		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
 
-	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil ||
+	if outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil ||
 		outcome != grokManagedBillingPersisted {
 		t.Fatalf("persist → %v, %v; want persisted", outcome, err)
 	}
@@ -538,7 +539,7 @@ func TestPersistGrokManagedBillingSnapshot_ArmDuringTheWriteStillRepairs(t *test
 	grokBillingAttributionSerialize.Lock()
 	done := make(chan error, 1)
 	go func() {
-		_, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+		_, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 		done <- err
 	}()
 	// Give the merge time to reach the lock it is now blocked on, so the arm
@@ -950,5 +951,121 @@ func TestGrokArmableBillingIdentity_ContestsOnlyTheUnresolvedValue(t *testing.T)
 	}
 	if got := grokArmableBillingIdentity(grokContestedBillingIdentity); got != grokContestedBillingIdentity {
 		t.Fatalf("grokArmableBillingIdentity(sentinel) = %q, want it unchanged", got)
+	}
+}
+
+// The property that makes a losing keeper tick harmless: a re-assertion that
+// finds NO armed run re-affirms the seal rather than returning and leaving
+// whatever marker is newest standing. Returning was safe only while the
+// assertion was resolved before the lock — with the resolution moved inside it,
+// this arm is the one an in-flight tick lands in once the last release has
+// removed its account, and it must not leave a departed account vouching for
+// the log.
+func TestGrokBillingAttributionKeeper_ReassertionWithNoArmedRunsReaffirmsTheSeal(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	// A departed account is the newest marker — the state a stale append, or a
+	// managed merge for another account, leaves behind once nothing is live.
+	helperAppendGrokLogLine(t, base, helperGrokIdentityLine(t, "acct-1"))
+
+	reassertGrokDirectAttribution()
+
+	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("newest marker = %s, want the sentinel — no run is live to vouch for the log", last)
+	}
+
+	helperAppendGrokLogLine(t, base,
+		grokUnmeteredLine("2026-08-19T12:40:00Z", grokBillingLogMessage))
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 19, 12, 41, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("Parse failed")
+	}
+	if len(usage.Metrics) != 1 || usage.Metrics[0].ObservedAt != "" {
+		t.Fatalf("a record under a departed account must be unattributable, got %+v", usage.Metrics)
+	}
+}
+
+// A keeper tick captures its account, then the last direct run releases and
+// seals the log before that tick reaches its append. Closing the stop channel
+// does not join a tick already executing, so the tick's continuation must not
+// re-name the departed account ON TOP of the seal — the keeper is stopped by
+// then, nothing would repair it, and a later out-of-agent API-key run would
+// inherit that marker and have its billing published as the departed account's.
+//
+// Calling the tick's body directly after the release is that continuation: the
+// assertion is resolved under the append lock, so it observes the empty armed
+// set the release left and re-affirms the seal instead of undoing it.
+func TestGrokBillingAttributionKeeper_InFlightTickDoesNotOutliveTheSeal(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	finish := startGrokBillingAttributionKeeper("acct-1")
+	ensureGrokBillingIdentityNamed(base, "acct-1")
+	finish()
+
+	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("newest marker = %s, want the release seal", last)
+	}
+	// Race the two halves repeatedly. Whichever wins the append lock, the
+	// arm is removed BEFORE the seal, so a re-assertion that resolves under
+	// that lock either names the still-live run (and is sealed after it) or
+	// observes the empty set and re-affirms the seal. Resolving outside the
+	// lock is what lets the losing tick append the departed account last.
+	for i := 0; i < 64; i++ {
+		finish := startGrokBillingAttributionKeeper("acct-1")
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			reassertGrokDirectAttribution()
+		}()
+		go func() {
+			defer wg.Done()
+			finish()
+		}()
+		wg.Wait()
+
+		if last := helperGrokLastLogLine(t, base); !strings.Contains(last, grokContestedBillingIdentity) {
+			t.Fatalf("iteration %d: newest marker = %s, want the seal to outlive an in-flight tick",
+				i, last)
+		}
+	}
+
+	// The hazard the seal exists for: a record an out-of-agent run writes next
+	// stays unattributable rather than inheriting acct-1.
+	helperAppendGrokLogLine(t, base,
+		grokUnmeteredLine("2026-08-19T12:30:00Z", grokBillingLogMessage))
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 19, 12, 31, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("Parse failed")
+	}
+	if len(usage.Metrics) != 1 || usage.Metrics[0].ObservedAt != "" {
+		t.Fatalf("a post-seal record must be unattributable, got %+v", usage.Metrics)
+	}
+}
+
+// The re-assertion still names a SURVIVING run's account — resolving under the
+// lock must not turn every tick into a seal.
+func TestGrokBillingAttributionKeeper_TickStillNamesALiveRun(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	finish := startGrokBillingAttributionKeeper("acct-1")
+	defer finish()
+	helperAppendGrokLogLine(t, base, helperGrokIdentityLine(t, "acct-other"))
+
+	reassertGrokDirectAttribution()
+
+	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, "acct-1") {
+		t.Fatalf("newest marker = %s, want the live run's account re-asserted", last)
 	}
 }

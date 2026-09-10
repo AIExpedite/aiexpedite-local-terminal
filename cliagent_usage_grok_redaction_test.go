@@ -72,7 +72,7 @@ func TestGrokManagedBillingMergeAndReceiptCarryOnlyAllowlistedFields(t *testing.
 			`"toolResult":{"text":"tool-result-sentinel"}}}`)
 	helperAppendGrokLogLine(t, isolated, `{"ts":"2026-08-19T11:59:00Z","msg":"tool: result","ctx":{"text":"tool-result-sentinel"}}`)
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}

@@ -198,3 +198,103 @@ func stubGrokSystemConfigLayers(t *testing.T) {
 	grokSystemConfigPathsFn = func() []string { return nil }
 	t.Cleanup(func() { grokSystemConfigPathsFn = prev })
 }
+
+// The billing twin of the scope tests above. grokManagedRunLimitNoticeScope
+// already refuses to file an API-key run's notice under the copied login, but
+// the billing merge accepted the same session's record beneath that login's
+// seeded marker — so the account the child actually billed was published as the
+// copied login's utilization on the surface that drives the card.
+func TestPersistGrokManagedBillingSnapshot_ContestedProducerWritesNothing(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	// A good existing reading the merge must not disturb.
+	helperAppendGrokLogLine(t, persistent, helperGrokIdentityLine(t, "acct-1"))
+	helperAppendGrokLogLine(t, persistent,
+		grokUnmeteredLine("2026-08-19T12:00:00Z", grokBillingLogMessage))
+	before, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read persistent log: %v", err)
+	}
+
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+	helperAppendGrokLogLine(t, isolated, helperGrokIdentityLine(t, "acct-1"))
+	helperAppendGrokLogLine(t, isolated,
+		grokUnmeteredLine("2026-08-19T12:20:00Z", grokBillingLogMessage))
+
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, true)
+	if err != nil || outcome != grokManagedBillingContestedProducer {
+		t.Fatalf("persist → %v, %v; want contested-producer", outcome, err)
+	}
+
+	after, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("re-read persistent log: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("a contested producer must write nothing into the provider-owned log:\n%s", after)
+	}
+
+	// The account's own earlier reading is untouched — contesting costs this
+	// session's observation, not the card.
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 19, 12, 30, 0, 0, time.UTC))
+	if !ok || len(usage.Metrics) != 1 || usage.Metrics[0].ObservedAt != "2026-08-19T12:00:00Z" {
+		t.Fatalf("the existing reading must survive a contested merge: %+v", usage.Metrics)
+	}
+}
+
+// The notice scope and the billing merge must take ONE verdict, or they drift
+// back apart: every launch that contests the cache must contest the producer.
+func TestGrokManagedRunProducerContested_AgreesWithTheNoticeScope(t *testing.T) {
+	stubGrokSystemConfigLayers(t)
+
+	isolated := t.TempDir()
+	seedGrokHomeWithLogin(t, isolated)
+	if err := os.WriteFile(filepath.Join(isolated, "config.toml"),
+		[]byte("[cli]\nauto_update = false\n"), 0o600); err != nil {
+		t.Fatalf("write isolated config: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		launch grokDirectRunLaunch
+		want   bool
+	}{
+		{
+			name:   "copied login only",
+			launch: grokDirectRunLaunch{Env: []string{"GROK_HOME=" + isolated}, Cwd: t.TempDir()},
+			want:   false,
+		},
+		{
+			name: "inherited api key",
+			launch: grokDirectRunLaunch{
+				Env: []string{"GROK_HOME=" + isolated, "XAI_API_KEY=xai-another-account"},
+				Cwd: t.TempDir(),
+			},
+			want: true,
+		},
+		{
+			name: "api key pinned in argv",
+			launch: grokDirectRunLaunch{
+				Env:  []string{"GROK_HOME=" + isolated},
+				Cwd:  t.TempDir(),
+				Args: []string{"--config", "model.api_key=xai-another-account"},
+			},
+			want: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := grokManagedRunProducerContested(tc.launch, isolated)
+			if got != tc.want {
+				t.Fatalf("producer contested = %v, want %v", got, tc.want)
+			}
+			if scope := grokManagedRunLimitNoticeScope(tc.launch, isolated); scope.cacheable == got {
+				t.Fatalf("notice scope cacheable = %v while producer contested = %v — the two verdicts drifted",
+					scope.cacheable, got)
+			}
+		})
+	}
+}

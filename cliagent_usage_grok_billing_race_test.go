@@ -65,7 +65,7 @@ func TestPersistGrokManagedBillingSnapshot_RestoresARecordDisplacedByADirectRace
 				"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 	})
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestPersistGrokManagedBillingSnapshot_DoesNotRewriteAnUndisplacedRace(t *te
 		grokBillingLine(merged, 12, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestRestoreGrokBillingRecordDisplacedByRace_WritesOnlyNormalizedFields(t *t
 				`"prompt":"do not copy me"},"subscriptionTier":"SuperGrok"}}`)
 	})
 
-	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
+	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
 
@@ -268,7 +268,7 @@ func TestPersistGrokManagedBillingSnapshot_PreservesAnArmedDirectAccountsNewerRe
 		grokBillingLine(time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339), 12,
 			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
+	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
 
@@ -314,7 +314,7 @@ func TestPersistGrokManagedBillingSnapshot_DoesNotPromoteAnOlderDirectRecord(t *
 		grokBillingLine(merged, 12, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
+	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
 
@@ -374,7 +374,7 @@ func TestPersistGrokManagedBillingSnapshot_RestoresAnArmedDirectRecordRacedAfter
 				"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 	})
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -422,7 +422,7 @@ func TestPersistGrokManagedBillingSnapshot_DirectRepairWritesNothingWhenNothingW
 		grokBillingLine(time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339), 12,
 			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
+	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
 
@@ -468,7 +468,7 @@ func TestPersistGrokManagedBillingSnapshot_KeepsTheLiveDirectAccountReadable(t *
 		grokBillingLine(time.Now().Add(-1*time.Minute).UTC().Format(time.RFC3339), 12,
 			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
+	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent, false); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
 
@@ -558,7 +558,7 @@ func TestPersistGrokManagedBillingSnapshot_DirectRepairRetestsAfterItsOwnWrite(t
 		},
 	)
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -602,7 +602,7 @@ func TestPersistGrokManagedBillingSnapshot_SealsTheMarkerAfterAManagedOnlyMerge(
 		grokBillingLine(merged, 12, "USAGE_PERIOD_TYPE_WEEKLY",
 			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}

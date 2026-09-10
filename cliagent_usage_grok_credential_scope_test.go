@@ -135,7 +135,7 @@ func TestPersistGrokManagedBillingSnapshot_KeepsATrustedRecordBehindAFutureOne(t
 		grokBillingLine(time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339), 12,
 			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestPersistGrokManagedBillingSnapshot_RefusesAFutureDatedSnapshot(t *testin
 		grokBillingLine(time.Now().Add(48*time.Hour).UTC().Format(time.RFC3339), 12,
 			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}
@@ -448,7 +448,7 @@ func TestPersistGrokManagedBillingSnapshot_KeepsTheGreatestOutOfOrderObservation
 		grokBillingLine(time.Now().Add(-59*time.Minute).UTC().Format(time.RFC3339), 12,
 			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
 
-	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent, false)
 	if err != nil {
 		t.Fatalf("persist: %v", err)
 	}

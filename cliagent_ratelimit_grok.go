@@ -142,10 +142,34 @@ func grokManagedRunLimitNoticeScope(launch grokDirectRunLaunch, base string) gro
 	if base == "" {
 		return grokLimitNoticeScope{}
 	}
-	if grokDirectRunCredentialOverride(launch, base) {
+	if grokManagedRunProducerContested(launch, base) {
 		return grokLimitNoticeScope{}
 	}
 	return grokAccountLimitNoticeScope(base)
+}
+
+// grokManagedRunProducerContested reports whether a MANAGED run spawned as
+// `launch` against isolated home `base` may bill an account the copied login
+// does not name.
+//
+// The ONE decision point for a managed run's producer, so the notice cache and
+// the billing merge can never disagree about whose records a session produced.
+// It was split out because they did: the notice scope already refused the
+// copied login for an API-key/config override while
+// persistGrokManagedBillingSnapshot merged that same session's record under it,
+// publishing one account's utilization as another's — the exact billing lie the
+// notice scope exists to avoid, on the surface that actually drives the card.
+//
+// Conservative in the same direction: an override that is merely AVAILABLE
+// contests, because which credential the CLI resolves is its own per-turn
+// decision inside a process we do not observe. Contesting costs this session's
+// observation (the card falls back to "unobservable"); naming it wrong is
+// unrecoverable until the record ages out.
+func grokManagedRunProducerContested(launch grokDirectRunLaunch, base string) bool {
+	if base == "" {
+		return false
+	}
+	return grokDirectRunCredentialOverride(launch, base)
 }
 
 // grokDirectRunLimitNoticeScope freezes the scope for a DIRECT (PTY) run.
@@ -318,6 +342,18 @@ func ensureGrokBillingIdentityNamed(base, identity string) {
 
 	grokBillingAttributionSerialize.Lock()
 	defer grokBillingAttributionSerialize.Unlock()
+
+	ensureGrokBillingIdentityNamedLocked(base, identity)
+}
+
+// ensureGrokBillingIdentityNamedLocked is the body above for callers that
+// already hold grokBillingAttributionSerialize because they must RESOLVE which
+// identity to assert under the same lock — see reassertGrokDirectAttribution.
+func ensureGrokBillingIdentityNamedLocked(base, identity string) {
+	identity = strings.TrimSpace(identity)
+	if base == "" || identity == "" {
+		return
+	}
 
 	// A live direct run under a DIFFERENT account makes this marker a claim we
 	// cannot support: the next record in the shared log could be that run's,
@@ -746,12 +782,33 @@ func grokDirectAttributionAssertion() (string, bool) {
 // reassertGrokDirectAttribution re-names the account the live direct runs were
 // SPAWNED under — never the currently signed-in one, see
 // ensureGrokBillingIdentityNamed.
+// The assertion is resolved UNDER the append lock, never before it. Closing the
+// keeper's stop channel does not join a tick already running, so a tick that
+// resolved its identity outside the lock could hold a captured account that the
+// last release has since retired, and append that stale marker AFTER the
+// release's seal. The keeper is stopped by then, so nothing repairs it: a later
+// out-of-agent run inherits the departed account's marker and has its billing
+// published as that account's. Resolving here makes the release's arm removal
+// and this decision serial, so a tick that loses the race observes an empty
+// armed set and re-affirms the seal instead of undoing it.
 func reassertGrokDirectAttribution() {
-	identity, ok := grokDirectAttributionAssertion()
-	if !ok {
+	base := grokPersistentHome()
+	if base == "" {
 		return
 	}
-	ensureGrokBillingIdentityNamed(grokPersistentHome(), identity)
+
+	grokBillingAttributionSerialize.Lock()
+	defer grokBillingAttributionSerialize.Unlock()
+
+	identity, ok := grokDirectAttributionAssertion()
+	if !ok {
+		// Every run this tick was going to speak for has released. The seal is
+		// the only assertion still true, and re-affirming it is a no-op read
+		// when the release already wrote it.
+		sealGrokBillingAttributionLocked(base)
+		return
+	}
+	ensureGrokBillingIdentityNamedLocked(base, identity)
 }
 
 // sealGrokDirectAttribution closes the attribution window the last direct run
