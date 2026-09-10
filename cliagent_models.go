@@ -750,33 +750,23 @@ func grokModelsHomeBase(home string) string {
 	return firstNonEmpty(os.Getenv("GROK_HOME"), expandHome(home, ".grok"))
 }
 
-var grokConfigTableHeader = regexp.MustCompile(`(?m)^\s*\[([^\]]+)\]\s*$`)
-var grokConfigAPIKeyLine = regexp.MustCompile(`(?m)^\s*api_key\s*=`)
-
 // grokConfigHasPerModelAPIKey reports whether config.toml keeps an api_key
 // under any per-model table (`[model.<id>]`, quoted or not) — the persistent
-// form xAI documents beside the plain `[model] api_key`.
+// form xAI documents beside the plain `[model] api_key`. It reads through the
+// same line-oriented sweep readGrokPersistedAPIKey uses
+// (walkGrokTOMLAssignments: inline `#` comments stripped, array-of-tables
+// guarded), so the detector and the copier cannot disagree about a header
+// such as `[model.grok-build] # API credential`.
 func grokConfigHasPerModelAPIKey(path string) bool {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	text := string(raw)
-	headers := grokConfigTableHeader.FindAllStringSubmatchIndex(text, -1)
-	for i, header := range headers {
-		name := strings.TrimSpace(text[header[2]:header[3]])
-		if !strings.HasPrefix(name, "model.") {
-			continue
+	found := false
+	walkGrokTOMLAssignments(path, func(key, _ string) bool {
+		if strings.HasPrefix(key, "model.") && strings.HasSuffix(key, ".api_key") && key != "model.api_key" {
+			found = true
+			return false
 		}
-		end := len(text)
-		if i+1 < len(headers) {
-			end = headers[i+1][0]
-		}
-		if grokConfigAPIKeyLine.MatchString(text[header[1]:end]) {
-			return true
-		}
-	}
-	return false
+		return true
+	})
+	return found
 }
 
 // mergeGrokDiscovery keeps the list command's order (its default first) and

@@ -97,6 +97,10 @@ func TestGrokConfigHasPerModelAPIKey(t *testing.T) {
 		{"[model]\napi_key = \"k\"\n", false},
 		{"[model.grok-build]\napi_key = \"k\"\n", true},
 		{"[model.\"grok.4\"]\n  api_key = \"k\"\n", true},
+		// Inline comments on the header and the assignment, as the copier
+		// (walkGrokTOMLAssignments) already accepts them.
+		{"[model.grok-build] # API credential\napi_key = \"k\" # for this model\n", true},
+		{"# [model.grok-build]\n# api_key = \"k\"\n", false},
 		{"[model.grok-build]\nname = \"x\"\n\n[cli]\napi_key = \"not a model\"\n", false},
 		{"[cli]\ninstaller = \"internal\"\n", false},
 		{"", false},
