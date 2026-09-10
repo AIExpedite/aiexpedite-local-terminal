@@ -489,3 +489,151 @@ func TestPersistGrokManagedBillingSnapshot_KeepsTheLiveDirectAccountReadable(t *
 		t.Fatal("the merged managed record was lost, not merely preceded")
 	}
 }
+
+// helperGrokRaceBarrierSequence makes fns[i] run inside the i-th scan/write
+// window of a single merge, then no-ops. It exists because one merge now has
+// more than one such window — the payload write and each pass of the direct
+// repair — and the interesting regression is a racer that lands in the SECOND
+// one, after the repair chose what to preserve.
+func helperGrokRaceBarrierSequence(t *testing.T, fns ...func()) {
+	t.Helper()
+	previous := grokBillingPreWriteBarrier
+	call := 0
+	grokBillingPreWriteBarrier = func() {
+		if call < len(fns) {
+			fn := fns[call]
+			call++
+			fn()
+			return
+		}
+		call++
+	}
+	t.Cleanup(func() { grokBillingPreWriteBarrier = previous })
+}
+
+// The regression codex found after the direct repair landed: that repair picks
+// what to re-append from a scan taken BEFORE its own write, against the same
+// child that never takes our mutex. When account B lands an even newer record
+// inside THAT window, the repair appends the older scanned pair last, the
+// reader publishes it by file order, and nothing corrects it — the keeper sees a
+// marker already naming B, and the managed repair scans only A's identities.
+func TestPersistGrokManagedBillingSnapshot_DirectRepairRetestsAfterItsOwnWrite(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	// The persistent login is account B, so B's own record is what any gather
+	// on this device would publish.
+	persistent := helperGrokHomeWithAccount(t, "acct-2")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+
+	finish := startGrokBillingAttributionKeeper("acct-2")
+	defer finish()
+	helperAppendGrokLogLine(t, persistent,
+		`{"ts":"2026-08-19T12:00:00Z","msg":"session start","ctx":{"user_id":"acct-2"}}`)
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine(time.Now().Add(-3*time.Hour).UTC().Format(time.RFC3339), 55,
+			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	// Managed account A exits carrying its own receipt.
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine(time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339), 12,
+			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	// B fetches twice: once inside the payload write's window (the already
+	// covered race) and once inside the direct repair's own window.
+	displaced := time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	newest := time.Now().Add(-1 * time.Minute).UTC().Format(time.RFC3339)
+	helperGrokRaceBarrierSequence(t,
+		func() {
+			helperAppendGrokLogLine(t, persistent,
+				grokBillingLine(displaced, 66, "USAGE_PERIOD_TYPE_WEEKLY",
+					"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+		},
+		func() {
+			helperAppendGrokLogLine(t, persistent,
+				grokBillingLine(newest, 88, "USAGE_PERIOD_TYPE_WEEKLY",
+					"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+		},
+	)
+
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if outcome != grokManagedBillingRaced {
+		t.Fatalf("outcome = %s, want %s", outcome, grokManagedBillingRaced)
+	}
+
+	published, ok := readGrokBillingSnapshot(persistent, grokIdentityCandidates(persistent))
+	if !ok {
+		t.Fatal("the live direct account can no longer read any record of its own")
+	}
+	if published.ObservedAt.UTC().Format(time.RFC3339) != newest {
+		t.Fatalf("published observation = %s, want the newest %s — the direct repair "+
+			"left the pair it scanned before its own write as the last line",
+			published.ObservedAt.UTC().Format(time.RFC3339), newest)
+	}
+	if published.UsedPercent != 88 {
+		t.Fatalf("published percent = %v, want 88", published.UsedPercent)
+	}
+}
+
+// A managed-only merge leaves our identity as the log's newest marker, and a
+// trailing marker vouches for whatever is written next. Without a seal, a Grok
+// invocation OUTSIDE the agent — an API-key override under our still-cached
+// login — has its identity-less record accepted as this account's usage, so one
+// subscription's utilization publishes as another's.
+func TestPersistGrokManagedBillingSnapshot_SealsTheMarkerAfterAManagedOnlyMerge(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+
+	if err := appendGrokBillingIdentity(persistent); err != nil {
+		t.Fatalf("seed persistent identity: %v", err)
+	}
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	merged := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine(merged, 12, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if outcome != grokManagedBillingPersisted {
+		t.Fatalf("outcome = %s, want %s", outcome, grokManagedBillingPersisted)
+	}
+
+	// The merged record keeps its own attribution: it binds to the identity
+	// ABOVE it, so the seal cannot unbind it.
+	published, ok := readGrokBillingSnapshot(persistent, grokIdentityCandidates(persistent))
+	if !ok {
+		t.Fatal("the seal cost the merge its own record — a marker appended AFTER a " +
+			"record must not unbind it")
+	}
+	if published.ObservedAt.UTC().Format(time.RFC3339) != merged {
+		t.Fatalf("published observation = %s, want the merged %s",
+			published.ObservedAt.UTC().Format(time.RFC3339), merged)
+	}
+	if !grokBillingIdentityIsNewest(persistent, grokContestedBillingIdentity) {
+		raw, _ := os.ReadFile(grokBillingLogPath(persistent))
+		t.Fatalf("the managed marker is still the newest one, so it keeps vouching "+
+			"for records this agent never produced:\n%s", raw)
+	}
+
+	// A later out-of-agent CLI on another account writes a record with no
+	// identity of its own. It must NOT be read as ours.
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine(time.Now().Add(-1*time.Minute).UTC().Format(time.RFC3339), 99,
+			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	if snap, ok := readGrokBillingSnapshot(persistent, grokIdentityCandidates(persistent)); ok {
+		t.Fatalf("a foreign identity-less record was accepted as this account's usage "+
+			"(percent %v) — the managed marker vouched for it", snap.UsedPercent)
+	}
+}

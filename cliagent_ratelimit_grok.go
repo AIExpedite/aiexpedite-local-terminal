@@ -675,6 +675,23 @@ func sealGrokDirectAttribution() {
 	grokBillingAttributionSerialize.Lock()
 	defer grokBillingAttributionSerialize.Unlock()
 
+	sealGrokBillingAttributionLocked(base)
+}
+
+// sealGrokBillingAttributionLocked names the account the live direct runs were
+// spawned under — or grokContestedBillingIdentity when none is live — as the
+// log's newest marker, so our marker stops vouching for records we did not
+// produce. Appends nothing when that name is already newest, which keeps the
+// common case one bounded tail read and writes nothing extra into a
+// provider-owned file.
+//
+// Shared with the managed merge (appendGrokBillingPair), which leaves its own
+// identity as the newest marker and needs the same seal for the same reason.
+// Callers must hold grokBillingAttributionSerialize.
+func sealGrokBillingAttributionLocked(base string) {
+	if base == "" {
+		return
+	}
 	identity, armed := grokDirectAttributionAssertion()
 	if !armed {
 		identity = grokContestedBillingIdentity

@@ -304,8 +304,10 @@ func TestPersistGrokManagedBillingSnapshot_SerializesWithDirectAttribution(t *te
 	case <-time.After(5 * time.Second):
 		t.Fatal("the managed merge never completed after the lock was released")
 	}
-	if got := grokIdentityLineCount(t, persistent); got != 1 {
-		t.Fatalf("merged identity lines = %d, want 1", got)
+	// Two: the merged pair's own identity, then the contested seal a
+	// managed-only merge closes with.
+	if got := grokIdentityLineCount(t, persistent); got != 2 {
+		t.Fatalf("merged identity lines = %d, want 2 (the merged identity plus the seal)", got)
 	}
 }
 
@@ -411,9 +413,10 @@ func TestPersistGrokManagedBillingSnapshot_RepairsAnArmedDirectRunImmediately(t 
 	}
 }
 
-// With no direct run armed, a managed merge must write nothing beyond its own
-// pair — the repair is for live sessions only, not a standing extra append into
-// a provider-owned file.
+// With no direct run armed, a managed merge must not NAME an account it cannot
+// vouch for: the repair is for live sessions only. What it does write is the
+// contested seal, so its own identity stops vouching for whatever an
+// out-of-agent CLI logs next.
 func TestPersistGrokManagedBillingSnapshot_DoesNotRepairWhenNoDirectRunIsArmed(t *testing.T) {
 	resetGrokBillingAttribution(t)
 	persistent := helperGrokHomeWithAccount(t, "acct-1")
@@ -427,8 +430,12 @@ func TestPersistGrokManagedBillingSnapshot_DoesNotRepairWhenNoDirectRunIsArmed(t
 	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
-	if got := grokIdentityLineCount(t, persistent); got != 1 {
-		t.Fatalf("identity lines = %d, want 1 — the merge repaired attribution with no direct run armed", got)
+	if got := grokIdentityLineCount(t, persistent); got != 2 {
+		t.Fatalf("identity lines = %d, want 2 (the merged identity plus the seal)", got)
+	}
+	if last := helperGrokLastLogLine(t, persistent); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("the merge's extra line is %q — with no direct run armed it may only be "+
+			"the contested seal, never an account marker", last)
 	}
 }
 

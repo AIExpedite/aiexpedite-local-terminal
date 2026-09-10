@@ -654,6 +654,24 @@ func appendGrokBillingPair(
 		return grokManagedBillingFailed, repairAfterWrite, err
 	}
 
+	// A managed-only merge otherwise leaves OUR identity standing as the log's
+	// newest marker, and a trailing marker vouches for whatever is written
+	// next — the exact hazard sealGrokDirectAttribution closes when the last
+	// direct run releases. Without the seal, a later Grok invocation OUTSIDE
+	// the agent (an API-key override under our still-cached login, or a
+	// `grok login` elsewhere) has its identity-less record accepted as this
+	// account's usage indefinitely, publishing one subscription's utilization
+	// under another. The record we just wrote keeps its own attribution: it
+	// binds to the identity ABOVE it, so a marker appended after it cannot
+	// unbind it.
+	//
+	// Taken under the lock we already hold, so a direct run that arms
+	// concurrently either observes this seal or replaces it. When one IS armed
+	// the payload already ends with its marker or preserved pair, so this is a
+	// bounded tail read that writes nothing — except in the repairAfterWrite
+	// fallback, where naming it here is the repair.
+	sealGrokBillingAttributionLocked(persistentHome)
+
 	if raced || directRaced {
 		return grokManagedBillingRaced, repairAfterWrite, nil
 	}
@@ -694,35 +712,51 @@ func restoreArmedDirectBillingRecordDisplacedByRace(
 		return false, nil
 	}
 	directIdentities := []string{directIdentity}
-	trustedThrough := time.Now().Add(grokBillingMaxClockSkew)
+	repaired := false
 
-	newest, found := newestTrustedGrokBillingRecordFor(persistentHome, directIdentities, trustedThrough)
-	if !found {
-		return false, nil
-	}
-	if published, ok := readGrokBillingSnapshot(persistentHome, directIdentities); ok &&
-		!published.ObservedAt.Before(newest.ObservedAt) {
-		// The direct account already publishes its own newest observation, so
-		// the race — if there was one — did no harm and no duplicate line is
-		// written for it.
-		return false, nil
-	}
+	// Bounded and RE-TESTED after each write, exactly like its managed twin: the
+	// pair this repair appends is itself chosen by a scan taken before a write,
+	// against the same external writer. A direct record landing in THAT window
+	// leaves the pair we just appended stale as the log's last line — and
+	// nothing else corrects it, because the keeper sees a marker that already
+	// names the direct account and the managed repair scans only the managed
+	// identities. Each pass re-reads, so a quiet log settles on the first, and a
+	// child appending faster than we can restore does not need us: its own next
+	// record is the newest anyway and the following gather reads it.
+	for attempt := 0; attempt < grokBillingRaceRepairAttempts; attempt++ {
+		trustedThrough := time.Now().Add(grokBillingMaxClockSkew)
 
-	// Compared against the managed account's newest TRUSTED record rather than
-	// the snapshot we set out to merge: the repair above may have re-appended a
-	// newer managed record since, and displacing that one would undo it.
-	var managedObservedAt time.Time
-	if managedNewest, ok := newestTrustedGrokBillingRecordFor(persistentHome, identities, trustedThrough); ok {
-		managedObservedAt = managedNewest.ObservedAt
+		newest, found := newestTrustedGrokBillingRecordFor(persistentHome, directIdentities, trustedThrough)
+		if !found {
+			return repaired, nil
+		}
+		if published, ok := readGrokBillingSnapshot(persistentHome, directIdentities); ok &&
+			!published.ObservedAt.Before(newest.ObservedAt) {
+			// The direct account already publishes its own newest observation,
+			// so the race — if there was one — did no harm and no duplicate
+			// line is written for it.
+			return repaired, nil
+		}
+
+		// Compared against the managed account's newest TRUSTED record rather
+		// than the snapshot we set out to merge: the repair above may have
+		// re-appended a newer managed record since, and displacing that one
+		// would undo it.
+		var managedObservedAt time.Time
+		if managedNewest, ok := newestTrustedGrokBillingRecordFor(persistentHome, identities, trustedThrough); ok {
+			managedObservedAt = managedNewest.ObservedAt
+		}
+		pair, ok := grokDirectBillingPairToPreserve(persistentHome, directIdentity, identity, managedObservedAt)
+		if !ok {
+			return repaired, nil
+		}
+		grokBillingPreWriteBarrier()
+		if err := writeGrokBillingPayload(persistentHome, pair); err != nil {
+			return repaired, err
+		}
+		repaired = true
 	}
-	pair, ok := grokDirectBillingPairToPreserve(persistentHome, directIdentity, identity, managedObservedAt)
-	if !ok {
-		return false, nil
-	}
-	if err := writeGrokBillingPayload(persistentHome, pair); err != nil {
-		return false, err
-	}
-	return true, nil
+	return repaired, nil
 }
 
 // grokBillingPayloadWithDirectMarker appends the armed direct run's identity
