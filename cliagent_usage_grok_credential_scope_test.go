@@ -583,3 +583,96 @@ func TestGrokDirectRunBillingIdentity_ContestsAUserLayerPinnedKey(t *testing.T) 
 		})
 	}
 }
+
+// TestGrokConfigPinsCredential_MultilineValues pins that a credential written
+// as a TOML multiline string is CONTESTED rather than read as empty. The
+// line-oriented sweep only ever sees the opening `"""`, which trims to nothing,
+// so the guard reported "no pinned credential" while grok's own parser resolved
+// the value and billed the account it names — publishing an API-key account's
+// spend under the cached login.
+func TestGrokConfigPinsCredential_MultilineValues(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"multiline env_key", "[model]\nenv_key = \"\"\"\nOTHER_KEY_VAR\"\"\"\n", true},
+		{"multiline api_key", "[model]\napi_key = \"\"\"\nxai-abc\"\"\"\n", true},
+		{"literal multiline api_key", "[model]\napi_key = '''\nxai-abc'''\n", true},
+		{"per-model multiline api_key", "[model.\"grok-4\"]\napi_key = \"\"\"\nxai-abc\"\"\"\n", true},
+		// A multiline that OPENS AND CLOSES on one line is fully visible to the
+		// sweep, so it is read normally rather than contested by shape alone.
+		{"single-line multiline", "[model]\napi_key = \"\"\"xai-abc\"\"\"\n", true},
+		{"empty single-line multiline", "[model]\napi_key = \"\"\"\"\"\"\n", false},
+		// An unrelated multiline may not cost an honest run its observability.
+		{"unrelated multiline", "[model]\nsystem_prompt = \"\"\"\nbe helpful\"\"\"\n", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if got := grokConfigPinsCredential(path); got != tc.want {
+				t.Fatalf("grokConfigPinsCredential(%q) = %v, want %v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReadGrokPersistedAPIKey_ReEncodesAQuotedModelSection pins that the
+// section header handed to setupIsolatedGrokHomeWithSessionStore is a TOML key
+// PATH, not a decoded string. A model whose name needs a quoted key emitted
+// `[model.grok.4]` — a nested table rather than that model — so the copied
+// config passed the line-based preflight and started the child with no usable
+// credential.
+func TestReadGrokPersistedAPIKey_ReEncodesAQuotedModelSection(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path,
+		[]byte("[model.\"grok.4\"]\napi_key = \"xai-per-model\"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	section, value := readGrokPersistedAPIKey(path, "grok.4")
+	if value != "\"xai-per-model\"" {
+		t.Fatalf("value = %q, want the per-model key", value)
+	}
+	if section != "model.\"grok.4\"" {
+		t.Fatalf("section = %q, want the re-encoded quoted key path", section)
+	}
+	// The header the isolated config would carry must round-trip back to the
+	// same segments the sweep matched on.
+	if got := splitGrokTOMLKeyPath(section); len(got) != 2 || got[0] != "model" || got[1] != "grok.4" {
+		t.Fatalf("round-trip of %q = %v, want [model grok.4]", section, got)
+	}
+	// A bare model name is still emitted bare: no gratuitous re-quoting of the
+	// header every existing config already carries.
+	if err := os.WriteFile(path,
+		[]byte("[model.grok-4]\napi_key = \"xai-per-model\"\n"), 0o600); err != nil {
+		t.Fatalf("rewrite config: %v", err)
+	}
+	if section, _ := readGrokPersistedAPIKey(path, "grok-4"); section != "model.grok-4" {
+		t.Fatalf("section = %q, want the bare key path", section)
+	}
+}
+
+// TestReadGrokPersistedAPIKey_SkipsAMultilineValue pins that a value this sweep
+// can only see the first line of is NOT carried into the isolated config.
+// Copying `api_key = """` verbatim writes a truncated string that breaks the
+// whole file for the child's parser; grokConfigPinsCredential still contests
+// the same config, so the run loses its carryover and never its attribution.
+func TestReadGrokPersistedAPIKey_SkipsAMultilineValue(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path,
+		[]byte("[model]\napi_key = \"\"\"\nxai-abc\"\"\"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if section, value := readGrokPersistedAPIKey(path, "grok-4"); section != "" || value != "" {
+		t.Fatalf("section=%q value=%q, want a skipped multiline value", section, value)
+	}
+	if !grokConfigPinsCredential(path) {
+		t.Fatal("the same config must still contest attribution")
+	}
+}

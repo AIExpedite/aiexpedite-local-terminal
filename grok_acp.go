@@ -1475,13 +1475,28 @@ func readGrokPersistedAPIKey(path, runtimeModel string) (string, string) {
 		perModelMatch = "model." + strings.ToLower(runtimeModel) + ".api_key"
 	}
 	walkGrokTOMLAssignments(path, func(key, value string) bool {
+		// A value that OPENS a multiline string is only its first line here, so
+		// carrying it over would write a truncated `api_key = """` into the
+		// isolated config and break the whole file for the child's parser. The
+		// key is left unreadable instead; grokConfigPinsCredential still
+		// CONTESTS it, so the run loses its carryover, never its attribution.
+		if grokTOMLValueOpensMultiline(value) {
+			return true
+		}
 		if key == "model.api_key" && rootValue == "" {
 			rootSection = "model"
 			rootValue = value
 			return true
 		}
 		if perModelMatch != "" && key == perModelMatch && perModelValue == "" {
-			perModelSection = "model." + strings.ToLower(runtimeModel)
+			// Re-ENCODE rather than re-join: the sweep hands back decoded
+			// segments, and setupIsolatedGrokHomeWithSessionStore writes this
+			// string straight into a `[...]` header. A model whose name needs a
+			// quoted key (`grok.4`) would otherwise be emitted as
+			// `[model.grok.4]` — a nested table, not that model — so the copied
+			// config would pass the line-based preflight and start the child
+			// with no usable credential.
+			perModelSection = encodeGrokTOMLKeyPath([]string{"model", strings.ToLower(runtimeModel)})
 			perModelValue = value
 		}
 		return true
@@ -1606,6 +1621,52 @@ func splitGrokTOMLKeyPath(raw string) []string {
 	return segments
 }
 
+// encodeGrokTOMLKeyPath re-encodes decoded key segments into a TOML key path,
+// quoting any segment that is not a bare key. It is the inverse of
+// splitGrokTOMLKeyPath and exists because a decoded segment is only safe to
+// COMPARE — emitting one verbatim into a `[...]` header turns a model name
+// containing a dot, a space or a quote into a different table entirely.
+func encodeGrokTOMLKeyPath(segments []string) string {
+	encoded := make([]string, 0, len(segments))
+	for _, seg := range segments {
+		encoded = append(encoded, encodeGrokTOMLKeySegment(seg))
+	}
+	return strings.Join(encoded, ".")
+}
+
+// encodeGrokTOMLKeySegment returns `seg` as a TOML key: bare when every rune is
+// in TOML's bare-key set (A-Za-z0-9_-), otherwise a basic-quoted string with
+// the two characters that can escape it re-escaped.
+func encodeGrokTOMLKeySegment(seg string) string {
+	if seg == "" {
+		return `""`
+	}
+	for i := 0; i < len(seg); i++ {
+		c := seg[i]
+		bare := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-'
+		if !bare {
+			replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+			return `"` + replacer.Replace(seg) + `"`
+		}
+	}
+	return seg
+}
+
+// grokTOMLValueOpensMultiline reports whether a raw right-hand side begins a
+// TOML multiline string (`"""` / `”'`) that does not also close on the same
+// line — the one value shape this line-oriented sweep cannot read, because the
+// rest of it lives on lines the sweep sees as unrelated.
+func grokTOMLValueOpensMultiline(value string) bool {
+	v := strings.TrimSpace(value)
+	for _, delim := range []string{`"""`, "'''"} {
+		if strings.HasPrefix(v, delim) && !strings.Contains(v[len(delim):], delim) {
+			return true
+		}
+	}
+	return false
+}
+
 // decodeGrokTOMLEscape decodes ONE escape sequence from the body of a TOML
 // basic-quoted key, returning the rune, how many bytes of `s` it consumed and
 // whether `s` opened with an escape TOML actually defines.
@@ -1689,6 +1750,15 @@ func grokConfigPinsCredential(path string) bool {
 	found := false
 	walkGrokTOMLAssignments(path, func(key, value string) bool {
 		if grokModelCredentialTOMLKey(key) {
+			// A multiline assignment (`env_key = """` + the value on the NEXT
+			// line) exposes only its opening delimiter to this line-oriented
+			// sweep, which reads as empty. Grok's own parser resolves the whole
+			// value and bills the account it names, so an empty-looking opener
+			// is CONTESTED rather than dismissed.
+			if grokTOMLValueOpensMultiline(value) {
+				found = true
+				return false
+			}
 			if strings.TrimSpace(strings.Trim(value, `"'`)) == "" {
 				return true
 			}
