@@ -119,6 +119,30 @@ func TestGrokCardReportsTheCurrentPeriodWithUsageUnobservable(t *testing.T) {
 		`[{"kind":"weekly","label":"Weekly credits","unit":"%","resetAt":"2026-08-24T22:28:32Z","observedAt":"2026-08-17T23:02:12Z","unknown":true}]`)
 }
 
+// The exact shape that produced `observableMetricCount 0` with no
+// latestObservedAt: a CURRENT unmetered period whose `end` cannot be parsed.
+// The window is unknowable, but billing was still freshly checked, so the row
+// keeps its observation time and only loses ResetAt.
+func TestGrokCurrentUnmeteredPeriodWithUnparseableEndKeepsItsObservationTime(t *testing.T) {
+	unparseableEnd := `{"ts":"2026-08-17T23:02:12.510Z","msg":"billing: fetched credits config",` +
+		`"ver":"1.0.3","ctx":{"config":{` +
+		`"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-08-17T22:28:32.746607+00:00",` +
+		`"end":"soon"},"onDemandCap":{"val":0},"onDemandUsed":{"val":0}},` +
+		`"subscriptionTier":"SuperGrok"}}`
+	base := writeGrokLog(t, grokIdentityLine, unparseableEnd)
+	now := time.Date(2026, 8, 19, 23, 0, 0, 0, time.UTC)
+
+	snap, ok := readGrokBillingSnapshot(base, []string{"acct-1"})
+	if !ok {
+		t.Fatal("an unparseable period end must not make the record unusable")
+	}
+	if snap.HasPeriodEnd {
+		t.Fatal("HasPeriodEnd must be false for an unparseable end")
+	}
+	assertGrokMetricsJSON(t, grokBillingMetrics(snap, now),
+		`[{"kind":"weekly","label":"Weekly credits","unit":"%","observedAt":"2026-08-17T23:02:12Z","unknown":true}]`)
+}
+
 // A legacy-only log must be unaffected — installs that have not upgraded keep
 // their real number.
 func TestGrokBillingStillPlotsALegacyRecord(t *testing.T) {

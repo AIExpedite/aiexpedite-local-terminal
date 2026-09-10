@@ -385,8 +385,12 @@ func TestPersistGrokManagedBillingSnapshot_BindsCopiedAccountAcrossLoginChange(t
 	if err := os.WriteFile(grokBillingLogPath(realHome), []byte(`{"msg":"session start","ctx":{"user_id":"user-2"}}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := persistGrokManagedBillingSnapshot(isolatedHome, realHome); err != nil {
+	outcome, err := persistGrokManagedBillingSnapshot(isolatedHome, realHome, false)
+	if err != nil {
 		t.Fatalf("persist managed billing: %v", err)
+	}
+	if outcome != grokManagedBillingPersisted {
+		t.Fatalf("outcome = %s, want %s", outcome, grokManagedBillingPersisted)
 	}
 
 	if _, ok := readGrokBillingSnapshot(realHome, grokIdentityCandidates(realHome)); ok {
@@ -401,11 +405,24 @@ func TestPersistGrokManagedBillingSnapshot_BindsCopiedAccountAcrossLoginChange(t
 			t.Fatalf("persisted managed billing leaked or misbound %q: %s", forbidden, persisted)
 		}
 	}
+	// The merge ends with a contested SEAL (see sealGrokBillingAttributionLocked),
+	// so the record is no longer the file's last line — it is the last BILLING
+	// line, and what matters is the identity immediately above it.
 	lines := strings.Split(strings.TrimSpace(string(persisted)), "\n")
-	if len(lines) < 3 || !strings.Contains(lines[len(lines)-2], grokManagedBillingIdentityMessage) ||
-		!strings.Contains(lines[len(lines)-2], `"user_id":"user-1"`) ||
-		!strings.Contains(lines[len(lines)-1], `"msg":"billing: fetched credits config"`) {
+	record := -1
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.Contains(lines[i], `"msg":"billing: fetched credits config"`) {
+			record = i
+			break
+		}
+	}
+	if record < 1 || !strings.Contains(lines[record-1], grokManagedBillingIdentityMessage) ||
+		!strings.Contains(lines[record-1], `"user_id":"user-1"`) {
 		t.Fatalf("managed billing missing copied account-A identity: %s", persisted)
+	}
+	if last := lines[len(lines)-1]; !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("the merge left %q as the newest marker — a managed-only merge must "+
+			"seal so its identity stops vouching for later records: %s", last, persisted)
 	}
 }
 

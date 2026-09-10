@@ -480,6 +480,17 @@ func runMockCLI(mode string) {
 		fmt.Println(`{"type":"result","result":"billing refreshed"}`)
 		os.Exit(0)
 
+	case "grok-direct-billing-no-identity":
+		// What the REAL Grok CLI does: it logs the billing record and NO
+		// producer identity. The record is only attributable because the agent
+		// appended one at session start.
+		if err := writeMockGrokBillingRecordOnly(); err != nil {
+			fmt.Fprintf(os.Stderr, "write mock Grok billing record: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(`{"type":"result","result":"billing refreshed"}`)
+		os.Exit(0)
+
 	case "grok-acp-billing":
 		if err := writeMockGrokBillingEvidence(); err != nil {
 			fmt.Fprintf(os.Stderr, "write mock Grok billing evidence: %v\n", err)
@@ -761,6 +772,37 @@ func writeMockGrokBillingEvidence() error {
 	return nil
 }
 
+// writeMockGrokBillingRecordOnly appends the same allowlisted billing record as
+// writeMockGrokBillingEvidence but WITHOUT the `session start` identity line —
+// the shape the real Grok CLI writes. A record with no producer identity logged
+// before it is refused outright, so this only becomes observable when the agent
+// has appended its own identity line at session start.
+func writeMockGrokBillingRecordOnly() error {
+	base := os.Getenv("GROK_HOME")
+	if base == "" {
+		return fmt.Errorf("GROK_HOME is empty")
+	}
+	dir := filepath.Join(base, "logs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create logs directory: %w", err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "unified.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open unified log: %w", err)
+	}
+	now := time.Now().UTC()
+	body := fmt.Sprintf(`{"ts":%q,"msg":"billing: fetched credits config","credential":"credential-sentinel","prompt":"prompt-sentinel","ctx":{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":%q,"end":%q},"rawConfig":"raw-config-sentinel"},"subscriptionTier":"SuperGrok"}}`+"\n",
+		now.Format(time.RFC3339Nano), now.Add(-time.Hour).Format(time.RFC3339Nano), now.Add(7*24*time.Hour).Format(time.RFC3339Nano))
+	if _, err := f.WriteString(body); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write billing log: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close unified log: %w", err)
+	}
+	return nil
+}
+
 // captureSession runs a SessionManager session against the test binary
 // configured as a mock CLI in the given mode. It returns the captured
 // publishFn messages in the order they were published, plus the session ID.
@@ -783,10 +825,22 @@ func writeMockGrokBillingEvidence() error {
 // the literal "claude" string. That makes proc.Start() fail. Instead, the
 // tests below use a "shim" name and validate the lifecycle, not the argv.
 func captureSession(t *testing.T, mockMode string, sessionCmd string, args []string, sendInitialStdinPrompt string) (sessionID string, messages []resultMsg, finalErr error) {
+	id, msgs, _, err := captureSessionWithConfig(t, mockMode, sessionCmd, args, sendInitialStdinPrompt, nil)
+	return id, msgs, err
+}
+
+// captureSessionTimed is captureSession plus the SESSION-scoped elapsed time:
+// measured from just before StartSession to the moment session_ended is
+// observed. It deliberately EXCLUDES the harness setup above it — copying the
+// (50 MB+) go test binary into a tempdir so PATH resolution finds the mock is
+// the dominant cost on a loaded CI runner, it grows with the test binary, and
+// it says nothing about whether the SessionManager hangs. A hang-budget
+// assertion that counted it was measuring the runner's disk, not the session.
+func captureSessionTimed(t *testing.T, mockMode string, sessionCmd string, args []string, sendInitialStdinPrompt string) (sessionID string, messages []resultMsg, sessionElapsed time.Duration, finalErr error) {
 	return captureSessionWithConfig(t, mockMode, sessionCmd, args, sendInitialStdinPrompt, nil)
 }
 
-func captureSessionWithConfig(t *testing.T, mockMode string, sessionCmd string, args []string, sendInitialStdinPrompt string, cfg *Config) (sessionID string, messages []resultMsg, finalErr error) {
+func captureSessionWithConfig(t *testing.T, mockMode string, sessionCmd string, args []string, sendInitialStdinPrompt string, cfg *Config) (sessionID string, messages []resultMsg, sessionElapsed time.Duration, finalErr error) {
 	t.Helper()
 
 	// Locate the test binary and copy it into a tempdir with the desired
@@ -834,6 +888,7 @@ func captureSessionWithConfig(t *testing.T, mockMode string, sessionCmd string, 
 	// closed. This is a known, transient race (golang/go#22315); the stdlib's
 	// own tests retry the same way. It clears within milliseconds.
 	var startErr error
+	sessionStart := time.Now()
 	for attempt := 0; attempt < 5; attempt++ {
 		startErr = sm.StartSession(id, sessionCmd, args, tmpDir, "ws-test", "uid-test", 30000, false, publishFn)
 		if startErr == nil || !strings.Contains(startErr.Error(), "text file busy") {
@@ -842,7 +897,7 @@ func captureSessionWithConfig(t *testing.T, mockMode string, sessionCmd string, 
 		time.Sleep(50 * time.Millisecond)
 	}
 	if startErr != nil {
-		return id, nil, fmt.Errorf("StartSession: %w", startErr)
+		return id, nil, time.Since(sessionStart), fmt.Errorf("StartSession: %w", startErr)
 	}
 
 	// Send initial stdin prompt manually if requested (mimics what
@@ -872,11 +927,12 @@ func captureSessionWithConfig(t *testing.T, mockMode string, sessionCmd string, 
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	elapsed := time.Since(sessionStart)
 
 	mu.Lock()
 	out := append([]resultMsg(nil), captured...)
 	mu.Unlock()
-	return id, out, nil
+	return id, out, elapsed, nil
 }
 
 // copyTestBinary is the test-only helper. The main package already has a
@@ -1006,6 +1062,54 @@ func TestSessionLifecycle_GrokDirectPublishesFreshRedactedBilling(t *testing.T) 
 	}
 }
 
+// The direct-run acceptance, end to end through StartSession: the real Grok CLI
+// logs no producer identity, so before this the account gate refused every
+// record a direct run wrote and the card could never show an observation.
+func TestSessionLifecycle_GrokDirectRunAttributesARecordTheCLIDidNotIdentify(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	realHome := t.TempDir()
+	seedGrokHomeWithLogin(t, realHome)
+	t.Setenv("GROK_HOME", realHome)
+	t.Setenv("XAI_API_KEY", "")
+
+	_, messages, err := captureSession(t, "grok-direct-billing-no-identity", "grok",
+		[]string{"refresh billing"}, "")
+	if err != nil {
+		t.Fatalf("captureSession: %v", err)
+	}
+	if len(messages) == 0 || messages[len(messages)-1].Type != "session_ended" {
+		t.Fatalf("direct Grok lifecycle did not complete: %+v", messages)
+	}
+
+	// Two: the run's own marker at session start, and the contested seal the
+	// last release appends so a LATER out-of-agent record cannot inherit this
+	// account's name. The record this run wrote sits between them, so it stays
+	// attributed — a marker below a record cannot unbind it.
+	if got := grokIdentityLineCount(t, realHome); got != 2 {
+		t.Fatalf("identity lines = %d, want the session-start marker plus the release seal", got)
+	}
+	if last := helperGrokLastLogLine(t, realHome); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("newest marker = %s, want the contested seal after the last direct run exits", last)
+	}
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, time.Now())
+	if !ok || len(usage.Metrics) != 1 {
+		t.Fatalf("direct billing parse failed: %+v", usage)
+	}
+	metric := usage.Metrics[0]
+	if !metric.Unknown || metric.ObservedAt == "" {
+		t.Fatalf("a direct run must leave a confirmed-unmetered record: %+v", metric)
+	}
+	out, err := json.Marshal(usage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"credential-sentinel", "prompt-sentinel", "raw-config-sentinel"} {
+		if strings.Contains(string(out), secret) {
+			t.Fatalf("direct usage leaked %q: %s", secret, out)
+		}
+	}
+}
+
 func TestSessionLifecycle_GrokNoToolsSmokeSurvivesUpdateAndSignedRefresh(t *testing.T) {
 	realHome := t.TempDir()
 	vendorHome := t.TempDir()
@@ -1121,7 +1225,7 @@ mcps = false
 	}
 	run := func(mode string) cliAgentUsage {
 		t.Helper()
-		_, messages, err := captureSessionWithConfig(t, mode, "grok", dispatchedSmokeArgs, projectCwd, &Config{
+		_, messages, _, err := captureSessionWithConfig(t, mode, "grok", dispatchedSmokeArgs, projectCwd, &Config{
 			EnableGrokAlwaysApprove: true,
 		})
 		if err != nil {
@@ -1320,12 +1424,10 @@ func TestSessionLifecycle_StreamBurstPreservesAllChunks(t *testing.T) {
    ------------------------------------------------------------------------ */
 
 func TestSessionLifecycle_ImmediateExitDoesNotHang(t *testing.T) {
-	start := time.Now()
-	_, messages, err := captureSession(t, "no-prompt-immediate-exit", "shim", []string{}, "")
+	_, messages, elapsed, err := captureSessionTimed(t, "no-prompt-immediate-exit", "shim", []string{}, "")
 	if err != nil {
 		t.Fatalf("captureSession: %v", err)
 	}
-	elapsed := time.Since(start)
 
 	if elapsed > 10*time.Second {
 		t.Errorf("session took %v — should have completed in well under 10s for immediate-exit CLI", elapsed)
@@ -1476,7 +1578,38 @@ func startManagedClaudeSession(t *testing.T, mode string) (*SessionManager, stri
 	if startErr != nil {
 		t.Fatalf("StartSession: %v", startErr)
 	}
+	// Registered FIRST, so LIFO cleanup runs it AFTER each test's own
+	// EndSession and BEFORE armClaudeUsageProbe's resetClaudeUsageProbeGate:
+	// end the run, wait for its exit path to finish, then clear the gate.
+	t.Cleanup(func() {
+		_ = sm.EndSession(id)
+		waitForManagedSessionDrained(t, sm, id)
+	})
 	return sm, id
+}
+
+// waitForManagedSessionDrained blocks until waitForExit has run to completion
+// for id. Removal from the manager is its LAST act — after the post-run
+// utilization trigger — so an absent session proves nothing further can be
+// recorded for this run.
+//
+// The barrier is load-bearing, not tidiness. A run killed mid-turn
+// (`claude-heartbeat-hang`) leaves turnSettled false, so its exit path calls
+// triggerClaudeUsageProbeAfterRun — and that path first waits out the stream
+// drain, up to sessionStreamDrainTimeout when a scanner is slow to reach EOF on
+// a loaded Windows runner. Without this wait the trigger lands inside a LATER
+// test, which sees a debt recorded after its own turn was already reported and
+// fails as `a trailing trigger recorded a new debt` — the flake this fixes.
+func waitForManagedSessionDrained(t *testing.T, sm *SessionManager, id string) {
+	t.Helper()
+	deadline := time.Now().Add(sessionStreamDrainTimeout + 30*time.Second)
+	for time.Now().Before(deadline) {
+		if sm.GetSession(id) == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("managed session %s never drained — its exit path can still record a post-run debt inside a later test", id)
 }
 
 // Terminal-managed run: session start → heartbeat lines → terminal `result`

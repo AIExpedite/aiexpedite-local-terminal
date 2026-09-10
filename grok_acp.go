@@ -51,10 +51,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 	"golang.org/x/mod/semver"
@@ -190,6 +192,17 @@ type GrokACPSession struct {
 	// waitForExit merges only the session's normalized account-bound billing
 	// snapshot here; the child never receives this path as its log directory.
 	PersistentHome string
+	// limitNoticeScope is the account this session's limit notices may be
+	// cached under, read ONCE from IsolatedHome at Start. The child bills the
+	// login copied into that home for its whole life, so a `grok login` against
+	// PersistentHome mid-session must not re-file this session's notices under
+	// the new account.
+	limitNoticeScope grokLimitNoticeScope
+	// producerContested freezes, from that same credential surface, whether the
+	// child may bill an account the copied login does not name. waitForExit
+	// refuses to merge this session's billing record when it is set — the
+	// billing twin of limitNoticeScope's refusal to cache its notices.
+	producerContested bool
 
 	mu            sync.Mutex
 	status        string // "running" | "ended"
@@ -441,6 +454,15 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	// argv has no neutralizers, so launching with the inherited (potentially
 	// unsafe) GROK_HOME would silently bypass the workspace's opt-in gates.
 	persistentHome := grokPersistentHome()
+	// No persistent-home attribution is written here. A managed session needs
+	// none: persistGrokManagedBillingSnapshot merges its identity and its
+	// record as one atomic pair, so the merged record binds to the identity
+	// directly above it whatever else is in the log. The append this replaced
+	// only helped a LATER direct run — which names its own account at its own
+	// session start anyway — while naming, at ACP-start time, an account that
+	// may not be the one a live direct run is writing records under. That made
+	// starting an ACP session after a `grok login` enough to publish the live
+	// direct run's utilization as the newly signed-in account's.
 	isolatedHome, err := setupIsolatedGrokHomeFrom(opts.AllowAPIKeyFallback, resolvedModel, persistentHome)
 	if err != nil {
 		return fmt.Errorf("grok ACP isolation setup failed; refusing to spawn with inherited GROK_HOME: %w", err)
@@ -472,6 +494,20 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	env := sanitizeGrokACPEnv(os.Environ(), opts.AllowAPIKeyFallback)
 	env = setEnvVar(env, "GROK_HOME", isolatedHome)
 	proc.Env = env
+
+	// The limit-notice scope is frozen here, from the credential surface the
+	// child is actually spawned with rather than from the isolated home alone.
+	// The copied OAuth login is the billed account only when nothing else is in
+	// play: with AllowAPIKeyFallback the env keeps XAI_API_KEY and the isolated
+	// config carries the persisted `[model] api_key`, either of which can belong
+	// to a different account, and neither the system config layers nor the
+	// workspace `.grok/config.toml` under `cwd` is redirected by GROK_HOME.
+	managedLaunch := grokDirectRunLaunch{Env: env, Cwd: cwd, Args: args}
+	limitNoticeScope := grokManagedRunLimitNoticeScope(managedLaunch, isolatedHome)
+	// The SAME verdict gates the billing merge on exit. Resolved once, here,
+	// from the pre-spawn surface: re-deriving it in waitForExit would read a
+	// config layer the run itself may have rewritten.
+	producerContested := grokManagedRunProducerContested(managedLaunch, isolatedHome)
 
 	// cleanupFailedStart removes the per-session temp dir on any pre-spawn
 	// failure path. Once the child is successfully started, ownership of the
@@ -521,23 +557,25 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	}
 
 	session := &GrokACPSession{
-		ID:             id,
-		Process:        proc,
-		Stdin:          stdin,
-		Stdout:         stdout,
-		Stderr:         stderr,
-		StartedAt:      time.Now(),
-		WorkspaceID:    workspaceID,
-		UID:            uid,
-		TimeoutMs:      timeoutMs,
-		WorkspaceRoot:  resolvedRoot,
-		IsolatedHome:   isolatedHome,
-		PersistentHome: persistentHome,
-		status:         "running",
-		done:           make(chan struct{}),
-		processExited:  make(chan struct{}),
-		streamDone:     make(chan struct{}),
-		firstFrame:     make(chan struct{}),
+		ID:                id,
+		Process:           proc,
+		Stdin:             stdin,
+		Stdout:            stdout,
+		Stderr:            stderr,
+		StartedAt:         time.Now(),
+		WorkspaceID:       workspaceID,
+		UID:               uid,
+		TimeoutMs:         timeoutMs,
+		WorkspaceRoot:     resolvedRoot,
+		IsolatedHome:      isolatedHome,
+		PersistentHome:    persistentHome,
+		limitNoticeScope:  limitNoticeScope,
+		producerContested: producerContested,
+		status:            "running",
+		done:              make(chan struct{}),
+		processExited:     make(chan struct{}),
+		streamDone:        make(chan struct{}),
+		firstFrame:        make(chan struct{}),
 	}
 
 	m.sessions[id] = session
@@ -1085,7 +1123,7 @@ func (m *GrokACPManager) readStream(session *GrokACPSession, publishFn PublishFu
 			// stream. The raw `session_start` path in session.go already calls
 			// captureGrokUsageLimitLine; without mirroring it here, the CLI
 			// Agents card stays Unknown for the primary Grok flow.
-			captureGrokUsageLimitLine(trimmed, time.Now())
+			captureGrokUsageLimitLine(trimmed, time.Now(), session.limitNoticeScope)
 
 			if !publishOrFail(resultMsg{
 				ID:          session.ID,
@@ -1226,9 +1264,14 @@ func (m *GrokACPManager) waitForExit(session *GrokACPSession, publishFn PublishF
 	// login` can change the real home's account but cannot relabel this record:
 	// persistGrokManagedBillingSnapshot writes the copied producer identity and
 	// billing record together.
-	if err := persistGrokManagedBillingSnapshot(session.IsolatedHome, session.PersistentHome); err != nil {
-		fmt.Printf("%s[grok-acp] managed billing snapshot not persisted: %v%s\n",
-			colorYellow, err, colorReset)
+	if outcome, err := persistGrokManagedBillingSnapshot(session.IsolatedHome, session.PersistentHome, session.producerContested); err != nil {
+		fmt.Printf("%s[grok-acp] managed billing snapshot not persisted (%s): %v%s\n",
+			colorYellow, outcome, err, colorReset)
+	} else {
+		// Report the typed outcome: a session whose child never fetched credits
+		// must not read as a successful merge in the logs.
+		fmt.Printf("%s[grok-acp] managed billing snapshot: %s%s\n",
+			colorCyan, outcome, colorReset)
 	}
 
 	// Scan for and upload whatever media this session wrote before announcing
@@ -1452,27 +1495,101 @@ func buildGrokACPArgs(extraArgs []string, allowAlwaysApprove bool) ([]string, er
 // detectPinnedSystemGrokRequirementsFile, with inline `#` strip and the same
 // array-of-tables guard.
 func readGrokPersistedAPIKey(path, runtimeModel string) (string, string) {
-	if path == "" {
-		return "", ""
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return "", ""
-	}
-	defer f.Close()
-
-	const maxBytes = 1 << 20
-	scanner := bufio.NewScanner(io.LimitReader(f, maxBytes))
-	scanner.Buffer(make([]byte, 64*1024), 256*1024)
-	var currentSection string
 	var rootSection, rootValue string
 	var perModelSection, perModelValue string
 	perModelMatch := ""
 	if runtimeModel != "" {
-		perModelMatch = "model." + strings.ToLower(runtimeModel) + ".api_key"
+		// Built through the SAME encoding the sweep hands back, so a model
+		// whose name needs a quoted key (`grok.4`) is compared as
+		// `model."grok.4".api_key` rather than as the three-segment
+		// `model.grok.4.api_key` it is not.
+		perModelMatch = encodeGrokTOMLKeyPath([]string{"model", strings.ToLower(runtimeModel), "api_key"})
 	}
+	walkGrokTOMLAssignments(path, func(key, value string) bool {
+		// A value that OPENS a multiline string is only its first line here, so
+		// carrying it over would write a truncated `api_key = """` into the
+		// isolated config and break the whole file for the child's parser. The
+		// key is left unreadable instead; grokConfigPinsCredential still
+		// CONTESTS it, so the run loses its carryover, never its attribution.
+		if grokTOMLValueOpensMultiline(value) {
+			return true
+		}
+		if key == "model.api_key" && rootValue == "" {
+			rootSection = "model"
+			rootValue = value
+			return true
+		}
+		if perModelMatch != "" && key == perModelMatch && perModelValue == "" {
+			// Re-ENCODE rather than re-join: the sweep hands back decoded
+			// segments, and setupIsolatedGrokHomeWithSessionStore writes this
+			// string straight into a `[...]` header. A model whose name needs a
+			// quoted key (`grok.4`) would otherwise be emitted as
+			// `[model.grok.4]` — a nested table, not that model — so the copied
+			// config would pass the line-based preflight and start the child
+			// with no usable credential.
+			perModelSection = encodeGrokTOMLKeyPath([]string{"model", strings.ToLower(runtimeModel)})
+			perModelValue = value
+		}
+		return true
+	})
+	if perModelValue != "" {
+		return perModelSection, perModelValue
+	}
+	return rootSection, rootValue
+}
+
+// walkGrokTOMLAssignments runs `visit` for every `key = value` assignment in a
+// Grok TOML config, with the active section folded into a dotted key
+// (`model.api_key`, `model.grok-build.api_key`) and the raw right-hand side
+// preserved exactly as written. Returning false from `visit` stops the sweep.
+//
+// Single-sourced so readGrokPersistedAPIKey (which wants ONE key for ONE model)
+// and grokConfigPinsCredential (which wants "is any credential pinned at all") cannot
+// disagree about what counts as an assignment — a config whose per-model key
+// one of them parses and the other misses would either carry a credential over
+// silently or leave a credential override undetected by the billing-attribution
+// guard. Missing/unreadable files are skipped, matching every other reader of
+// these optional layers. Same line-oriented sweep as
+// detectPinnedSystemGrokRequirementsFile: inline `#` strip and the same
+// array-of-tables guard, not a TOML parser.
+func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (complete bool) {
+	if path == "" {
+		return true
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		// A layer that is simply ABSENT is nothing to read, so the sweep saw
+		// all of it. A file that exists and cannot be opened is a scan this
+		// process could not perform over content the child's parser may still
+		// load, which is the incomplete case callers must fail closed on.
+		return os.IsNotExist(err)
+	}
+	defer f.Close()
+
+	const maxBytes = 1 << 20
+	counted := &countingReader{r: io.LimitReader(f, maxBytes+1)}
+	scanner := bufio.NewScanner(counted)
+	scanner.Buffer(make([]byte, 64*1024), 256*1024)
+	var currentSection string
+	// openMultiline holds the delimiter of a multiline string whose body is
+	// still running. Those lines are CONTENT, not configuration: a `[other]`
+	// inside one is text grok's own parser never applies, and reading it
+	// re-scoped every FOLLOWING assignment under a table that does not exist —
+	// a root `model.api_key` classified as `other.model.api_key` reads as no
+	// pinned credential, which is exactly the misattribution this sweep exists
+	// to prevent.
+	var openMultiline string
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+		raw := scanner.Text()
+		if openMultiline != "" {
+			if grokTOMLMultilineCloserIndex(raw, openMultiline) >= 0 {
+				// TOML permits nothing but a comment after a closing
+				// delimiter, so the rest of this line carries no assignment.
+				openMultiline = ""
+			}
+			continue
+		}
+		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -1480,33 +1597,728 @@ func readGrokPersistedAPIKey(path, runtimeModel string) (string, string) {
 		if line == "" {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") && !strings.HasPrefix(line, "[[") {
-			currentSection = strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			// An ARRAY-OF-TABLES header (`[[version_overrides]]`) opens a
+			// section exactly as `[name]` does. Skipping it left the entry's
+			// keys attributed to the PREVIOUS table, which both invented a
+			// prefix that is not in the file and hid the documented
+			// `[[version_overrides]]` + `[version_overrides.model]` spelling of
+			// a pinned credential — effectiveGrokSystemConfigForVersion applies
+			// that patch, so the child bills the API-key account while
+			// attribution named the cached login.
+			body := line[1 : len(line)-1]
+			if strings.HasPrefix(line, "[[") {
+				if !strings.HasSuffix(line, "]]") {
+					// Not a header at all; nothing here to scope by.
+					continue
+				}
+				body = line[2 : len(line)-2]
+			}
+			currentSection = grokTOMLKeyPath(body)
 			continue
 		}
-		eq := strings.IndexByte(line, '=')
+		eq := grokTOMLAssignmentIndex(line)
 		if eq <= 0 {
 			continue
 		}
-		bareKey := strings.ToLower(strings.TrimSpace(line[:eq]))
-		key := bareKey
-		if currentSection != "" && !strings.Contains(bareKey, ".") {
-			key = currentSection + "." + bareKey
+		key := grokTOMLKeyPath(line[:eq])
+		if currentSection != "" {
+			// A dotted key inside a table is RELATIVE to that table: under
+			// `[model]`, `grok-4.api_key` is `model.grok-4.api_key`. Prefixing
+			// only single-segment keys left the per-model credential looking
+			// unscoped, so the attribution guard saw no pinned credential and
+			// named the cached login for an API-key-billed run.
+			key = currentSection + "." + key
 		}
-		if key == "model.api_key" && rootValue == "" {
-			rootSection = "model"
-			rootValue = strings.TrimSpace(line[eq+1:])
+		value := strings.TrimSpace(line[eq+1:])
+		openMultiline = grokTOMLMultilineOpener(value)
+		if openMultiline == "" {
+			// A COMPOSITE value (a multi-line array, or an array of inline
+			// tables) is READ, not skipped. Its continuation lines are value
+			// body, so the sweep must not read them as configuration — a body
+			// line like `[1, 2]` satisfies the section-header test above
+			// exactly — but skipping them also hid every credential written
+			// inside one: a documented `version_overrides = [\n { model = {
+			// api_key = "..." } }\n]` patch is applied by grok's own parser
+			// before it bills, while this sweep reported no pinned credential
+			// and named the cached login. Joining the body into one logical
+			// value keeps the section tracking correct AND lets the callers'
+			// inline-table descent see what is in there.
+			//
+			// A composite can OPEN a multiline string on its own first line
+			// (`tools = [ """`), which grokTOMLMultilineOpener does not see
+			// because the value does not START with the delimiter. Both states
+			// come out of the same scan so the accumulation inherits them.
+			// The line was comment-stripped before the split, so the scan's
+			// own stripped text is `value` verbatim here.
+			_, depth, running := grokTOMLCompositeLineDepth(value, "")
+			switch {
+			case depth > 0:
+				joined, ok := accumulateGrokTOMLCompositeValue(scanner, value, depth, running)
+				if !ok {
+					// An unterminated or oversized composite is a scan this
+					// process could not finish over content the child's parser
+					// still loads — the incomplete case callers fail closed on.
+					return false
+				}
+				value = joined
+			case running != "":
+				// A string body opened without any bracket to close: nothing
+				// left on this line is configuration, so it is skipped like any
+				// other multiline value.
+				openMultiline = running
+			}
+		}
+		if !visit(key, value) {
+			// A caller that stops early has the answer it came for, so the
+			// unread remainder is not a gap in what it decided.
+			return true
+		}
+	}
+	// A line longer than the scanner's buffer, or a read error, ends the sweep
+	// with content still unread; so does hitting the tail bound. So does a
+	// multiline string that never closes: everything after its opener was
+	// skipped as body, so an assignment the child's parser still applies may sit
+	// in the part this sweep never classified. An unterminated COMPOSITE value
+	// returns false from the accumulation above, at the point it gives up.
+	return scanner.Err() == nil && counted.n <= maxBytes && openMultiline == ""
+}
+
+// countingReader counts the bytes it has handed on, so walkGrokTOMLAssignments
+// can tell "the whole file fitted in the tail bound" from "the bound cut it
+// off" — the difference between a credential that is absent and one this
+// process merely never saw.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// splitGrokTOMLKeyPath splits a TOML key path — a section header's body or the
+// left-hand side of an assignment — into its lower-cased segments, honouring
+// TOML's quoted keys.
+//
+// `[model]` / `"api_key" = "xai-..."`, `"model" = { api_key = "xai-..." }` and
+// `model."grok-4".env_key` are all valid configs grok's own parser applies. The
+// previous raw-lowercase normalization kept the quote characters in the key, so
+// none of them matched grokModelCredentialTOMLKey / grokModelScopedTOMLKey and
+// the billing-attribution guard reported "no pinned credential" for a run the
+// API-key account is actually billed for — publishing one subscription's spend
+// under another's. A dot INSIDE quotes is part of the segment, not a separator,
+// so `"model.api_key" = 1` stays the single unrelated key it is rather than
+// impersonating the credential.
+func splitGrokTOMLKeyPath(raw string) []string {
+	var segments []string
+	var cur strings.Builder
+	var quote byte
+	flush := func() {
+		segments = append(segments, strings.ToLower(strings.TrimSpace(cur.String())))
+		cur.Reset()
+	}
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if quote != 0 {
+			if c == '\\' && quote == '"' && i+1 < len(raw) {
+				if r, width, ok := decodeGrokTOMLEscape(raw[i+1:]); ok {
+					cur.WriteRune(r)
+					i += width
+					continue
+				}
+				i++
+				cur.WriteByte(raw[i])
+				continue
+			}
+			if c == quote {
+				quote = 0
+				continue
+			}
+			cur.WriteByte(c)
 			continue
 		}
-		if perModelMatch != "" && key == perModelMatch && perModelValue == "" {
-			perModelSection = "model." + strings.ToLower(runtimeModel)
-			perModelValue = strings.TrimSpace(line[eq+1:])
+		switch c {
+		case '"', '\'':
+			quote = c
+		case '.':
+			flush()
+		default:
+			cur.WriteByte(c)
 		}
 	}
-	if perModelValue != "" {
-		return perModelSection, perModelValue
+	flush()
+	return segments
+}
+
+// grokTOMLKeyPath normalises a raw TOML key path — a section header's body or
+// the left-hand side of an assignment — into the dotted, lower-cased form every
+// key rule in this file compares against.
+//
+// It re-ENCODES the split segments rather than joining them raw, because a
+// decoded segment can itself contain the separator: the single quoted key
+// `"model.api_key" = 1` decodes to ONE segment whose text is `model.api_key`,
+// and joining it plainly produced the exact string the two-segment
+// `model.api_key = "xai-..."` produces. That collapse made an unrelated key
+// impersonate the credential — grokConfigPinsCredential contested an honest
+// direct run's attribution, and readGrokPersistedAPIKey would promote the
+// unrelated value into a real `[model] api_key` in the isolated child config.
+// Quoting a segment that is not a bare key keeps the boundary, so only keys the
+// child's own parser reads as a credential match one.
+func grokTOMLKeyPath(raw string) string {
+	return encodeGrokTOMLKeyPath(splitGrokTOMLKeyPath(raw))
+}
+
+// encodeGrokTOMLKeyPath re-encodes decoded key segments into a TOML key path,
+// quoting any segment that is not a bare key. It is the inverse of
+// splitGrokTOMLKeyPath and exists because a decoded segment is only safe to
+// COMPARE — emitting one verbatim into a `[...]` header turns a model name
+// containing a dot, a space or a quote into a different table entirely.
+func encodeGrokTOMLKeyPath(segments []string) string {
+	encoded := make([]string, 0, len(segments))
+	for _, seg := range segments {
+		encoded = append(encoded, encodeGrokTOMLKeySegment(seg))
 	}
-	return rootSection, rootValue
+	return strings.Join(encoded, ".")
+}
+
+// encodeGrokTOMLKeySegment returns `seg` as a TOML key: bare when every rune is
+// in TOML's bare-key set (A-Za-z0-9_-), otherwise a basic-quoted string with
+// the two characters that can escape it re-escaped.
+func encodeGrokTOMLKeySegment(seg string) string {
+	if seg == "" {
+		return `""`
+	}
+	for i := 0; i < len(seg); i++ {
+		c := seg[i]
+		bare := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-'
+		if !bare {
+			replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+			return `"` + replacer.Replace(seg) + `"`
+		}
+	}
+	return seg
+}
+
+// grokTOMLValueOpensMultiline reports whether a raw right-hand side begins a
+// TOML multiline string (`"""` / `”'`) that does not also close on the same
+// line — the one value shape this line-oriented sweep cannot read, because the
+// rest of it lives on lines the sweep sees as unrelated.
+func grokTOMLValueOpensMultiline(value string) bool {
+	return grokTOMLMultilineOpener(value) != ""
+}
+
+// grokTOMLMultilineOpener returns the delimiter of the multiline string a raw
+// right-hand side OPENS without closing, or "" when the value is complete on
+// its own line. Single-sourced with grokTOMLValueOpensMultiline so the sweep's
+// "skip this body" decision and the callers' "contest this value" decision
+// cannot disagree about which values run past their line.
+func grokTOMLMultilineOpener(value string) string {
+	v := strings.TrimSpace(value)
+	for _, delim := range []string{`"""`, "'''"} {
+		if strings.HasPrefix(v, delim) && grokTOMLMultilineCloserIndex(v[len(delim):], delim) < 0 {
+			return delim
+		}
+	}
+	return ""
+}
+
+// grokTOMLMultilineCloserIndex returns the index at which `s` closes an already
+// OPEN multiline string delimited by `delim`, or -1 when the delimiter never
+// appears unescaped.
+//
+// A basic (three-double-quote) multiline string still honours backslash
+// escapes, so a `\"""` in its body decodes to a literal quote followed by two
+// content quotes — never the terminator. Reading it as one ended the string
+// early, and the body lines that followed were then read as configuration: a
+// section-shaped body line re-scoped every LATER assignment, so a root
+// `model.api_key` surfaced as `other.model.api_key` and the attribution guard
+// reported no pinned credential for a run grok's own parser bills by API key. A
+// literal (three-single-quote) multiline string defines no escapes, so a
+// backslash in one is ordinary content.
+//
+// Only the FIRST unescaped occurrence is reported. A caller that RESUMES
+// scanning after the close must use grokTOMLMultilineCloserSpan instead, which
+// also reports how many bytes the terminator occupies.
+func grokTOMLMultilineCloserIndex(s, delim string) int {
+	idx, _ := grokTOMLMultilineCloserSpan(s, delim)
+	return idx
+}
+
+// grokTOMLMultilineCloserSpan reports the index at which `s` closes an open
+// multiline string delimited by `delim` AND the length of that terminator, or
+// (-1, 0) when it never closes.
+//
+// TOML lets up to two extra quotes sit against a closing delimiter: in
+// `"""foo""""` the content is `foo"` and the terminator is the LAST three
+// quotes, so the whole run is what ends the string. Reporting just the first
+// triple left the extra quote for the caller to resume ON, which opened a fresh
+// single-quoted string in the composite and inline-table scanners; both then
+// finished with quote state still open and reported the scan INCOMPLETE, and
+// grokConfigPinsCredential reads an incomplete scan as a pin — contesting a
+// direct run over a config that pins no credential and rejecting its billing
+// observation. A run of six or more quotes is not a single terminator (it is a
+// close immediately followed by a new opener), so the span is capped at five
+// bytes rather than swallowing the next string's delimiter.
+func grokTOMLMultilineCloserSpan(s, delim string) (int, int) {
+	escapes := delim == `"""`
+	quote := delim[0]
+	for i := 0; i < len(s); i++ {
+		if escapes && s[i] == '\\' {
+			i++
+			continue
+		}
+		if !strings.HasPrefix(s[i:], delim) {
+			continue
+		}
+		run := len(delim)
+		for i+run < len(s) && s[i+run] == quote {
+			run++
+		}
+		if run > len(delim)+2 {
+			// Six or more quotes in a row is a terminator immediately followed
+			// by a new opener, not one long terminator; consuming the run
+			// whole would swallow the next string's delimiter and leave the
+			// scan reading its body as value syntax.
+			run = len(delim)
+		}
+		return i, run
+	}
+	return -1, 0
+}
+
+// grokTOMLAssignmentIndex returns the index of the `=` separating a TOML
+// assignment's key path from its value, or -1 when the text carries no
+// assignment separator outside its quoted key segments.
+//
+// A QUOTED key segment may contain an `=` of its own: under `[model]`,
+// `"foo=bar".api_key = "xai-..."` is a valid pin grok's own parser applies.
+// Taking the first `=` in the line split that key as `model.foo`, so the
+// credential never matched grokModelCredentialTOMLKey and an API-key-billed run
+// was attributed to the cached login. Quote handling matches
+// splitGrokTOMLKeyPath — backslash escapes inside a basic-quoted segment, none
+// inside a literal one — so the two cannot disagree about where a key ends. An
+// unterminated quote has no separator at this level and reports -1, which every
+// caller skips.
+func grokTOMLAssignmentIndex(s string) int {
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == '\\' && quote == '"' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			quote = c
+		case '=':
+			return i
+		}
+	}
+	return -1
+}
+
+// decodeGrokTOMLEscape decodes ONE escape sequence from the body of a TOML
+// basic-quoted key, returning the rune, how many bytes of `s` it consumed and
+// whether `s` opened with an escape TOML actually defines.
+//
+// Grok's own parser resolves `"api_\u006bey"` to `api_key`; merely dropping the
+// backslash produced `api_u006bey`, which matched no credential key, so the
+// billing-attribution guard reported "no pinned credential" and published an
+// API-key run's spend under the cached-login account. An UNDEFINED escape is
+// reported as such rather than guessed at — the caller keeps its previous
+// literal-next-byte behaviour there, which is what a best-effort sweep over a
+// possibly-invalid config should do.
+func decodeGrokTOMLEscape(s string) (rune, int, bool) {
+	if s == "" {
+		return 0, 0, false
+	}
+	switch s[0] {
+	case 'b':
+		return '\b', 1, true
+	case 't':
+		return '\t', 1, true
+	case 'n':
+		return '\n', 1, true
+	case 'f':
+		return '\f', 1, true
+	case 'r':
+		return '\r', 1, true
+	case '"':
+		return '"', 1, true
+	case '\\':
+		return '\\', 1, true
+	case 'u', 'U':
+		width := 4
+		if s[0] == 'U' {
+			width = 8
+		}
+		if len(s) < 1+width {
+			return 0, 0, false
+		}
+		v, err := strconv.ParseUint(s[1:1+width], 16, 32)
+		if err != nil {
+			return 0, 0, false
+		}
+		r := rune(v)
+		if !utf8.ValidRune(r) {
+			return 0, 0, false
+		}
+		return r, 1 + width, true
+	}
+	return 0, 0, false
+}
+
+// grokModelCredentialKeySuffixes are the `[model]` assignments that hand a Grok
+// child a credential of its own. `api_key` carries the key inline; `env_key`
+// names the environment variable the key is read from — a different spelling of
+// the same credential, which classifyGrokSystemSemanticValue already treats as
+// one. Listing both here is what keeps the semantic classifier and the
+// billing-attribution guard from disagreeing about what a credential is.
+var grokModelCredentialKeySuffixes = []string{"api_key", "env_key"}
+
+// grokConfigPinsCredential reports whether a Grok TOML config pins a credential
+// for ANY model, not just the one a given session runs under.
+//
+// readGrokPersistedAPIKey answers "which key would this model use", which needs
+// a runtime model. A DIRECT (PTY) run has no resolved model — the user picks it
+// inside the CLI — so the attribution guard has to assume any pinned credential
+// could be the one that ends up billed, and a per-model key it could not see
+// would be exactly the misattribution the guard exists to prevent.
+//
+// An `env_key` pin counts even when the variable it names is unset in this
+// process: the child resolves that variable in its OWN environment, per turn,
+// and the guard is conservative by construction — over-reporting costs one
+// session's observability, under-reporting publishes one account's spend as
+// another's.
+// An INLINE TABLE counts too. `model = { api_key = "xai-..." }` and
+// `[model] grok-4 = { env_key = "OTHER" }` are valid TOML that grok's own parser
+// honours, but the line-oriented sweep only ever exposes the OUTER key (`model`,
+// `model.grok-4`), so the credential lives entirely inside the value. Descending
+// into the braces is what keeps a config written in that shape from silently
+// attributing an API-key run to the cached login.
+// A scan this process could not COMPLETE — an oversized config truncated at the
+// tail bound, a line past the scanner's buffer, an unreadable file — reports
+// pinned as well. The child's own parser reads the whole layer regardless, so a
+// credential past the boundary would be billed to the API-key account while
+// direct attribution named the cached login. Contesting costs that session its
+// observability; the alternative publishes one subscription's spend as another's.
+func grokConfigPinsCredential(path string) bool {
+	found := false
+	complete := walkGrokTOMLAssignments(path, func(key, value string) bool {
+		if grokAssignmentPinsAccount(key, value) {
+			found = true
+			return false
+		}
+		// The sweep is line-oriented, so an INLINE table exposes only its outer
+		// key: `model = { api_key = "..." }` and
+		// `auth = { oidc = { issuer = "..." } }` both hide the assignment that
+		// matters inside the value. Descending with the outer key as the prefix
+		// lets one set of key rules decide both spellings, so the dotted and
+		// the inline form of the same setting cannot disagree.
+		if grokInlineTableMatches(key, value, grokAssignmentPinsAccount) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found || !complete
+}
+
+// grokAssignmentPinsAccount reports whether ONE resolved assignment takes the
+// child off the cached `$GROK_HOME` login — a pinned model credential, or a
+// setting that authenticates through a provider of its own.
+//
+// A multiline opener reads as empty to this line-oriented sweep while grok's
+// own parser resolves the whole value and bills the account it names, so it is
+// CONTESTED rather than dismissed. An empty value is not a pin and must not
+// cost an honest run its observability.
+func grokAssignmentPinsAccount(key, value string) bool {
+	if !grokAttributionKeyLeavesCachedLogin(key) {
+		return false
+	}
+	return grokTOMLValueOpensMultiline(value) ||
+		strings.TrimSpace(strings.Trim(value, `"'`)) != ""
+}
+
+// grokAttributionKeyLeavesCachedLogin reports whether a dotted key names a
+// model credential or an external auth provider, in the file's own scope or
+// inside a `version_overrides` patch.
+//
+// Grok applies those patches (effectiveGrokSystemConfigForVersion) into the
+// effective config BEFORE anything classifies it, so a credential written there
+// is a credential the child bills with — in the inline
+// `version_overrides = [{ model = { api_key = "..." } }]` spelling AND in the
+// documented `[[version_overrides]]` + `[version_overrides.model]` one, which
+// reaches this function as `version_overrides.model.api_key`. Applicability is
+// deliberately NOT resolved: which entries apply depends on the child's own
+// version, and this guard is conservative by construction — over-reporting
+// costs one session's observability, under-reporting publishes one account's
+// spend as another's.
+func grokAttributionKeyLeavesCachedLogin(key string) bool {
+	if grokModelCredentialTOMLKey(key) || grokTOMLKeyNamesExternalAuthProvider(key) {
+		return true
+	}
+	relative, ok := grokVersionOverrideRelativeKey(key)
+	if !ok {
+		return false
+	}
+	// Inside an override entry the credential may be written without the
+	// `model.` scope the root config needs, so the looser inline-table spelling
+	// counts here too.
+	return grokModelCredentialTOMLKey(relative) ||
+		grokInlineTableCredentialKey(relative) ||
+		grokTOMLKeyNamesExternalAuthProvider(relative)
+}
+
+// grokVersionOverrideRelativeKey returns the part of a dotted key that sits
+// INSIDE a `version_overrides` entry, and whether the key is inside one at all.
+// The array index has no spelling in either form — an inline element keeps the
+// outer key, an `[[version_overrides]]` header names the table — so the
+// remainder after the segment is the key as the patched config would read it.
+func grokVersionOverrideRelativeKey(key string) (string, bool) {
+	segments := strings.Split(key, ".")
+	for i, segment := range segments {
+		if segment == "version_overrides" && i+1 < len(segments) {
+			return strings.Join(segments[i+1:], "."), true
+		}
+	}
+	return "", false
+}
+
+// grokTOMLKeyNamesExternalAuthProvider reports whether a dotted key names one of
+// the settings that make a Grok child authenticate through a provider of its
+// own rather than the cached `$GROK_HOME` login. Kept to the same shapes
+// classifyGrokSystemSemanticValue treats as external providers
+// (`auth_provider_command`, and the `[auth.oidc]` issuer/client pair), so the
+// semantic classifier and the billing-attribution guard cannot disagree about
+// which layers take the child off the cached account.
+func grokTOMLKeyNamesExternalAuthProvider(key string) bool {
+	segments := strings.Split(key, ".")
+	last := segments[len(segments)-1]
+	if last == "auth_provider_command" {
+		return true
+	}
+	if last != "issuer" && last != "client_id" {
+		return false
+	}
+	return len(segments) >= 3 &&
+		segments[len(segments)-2] == "oidc" &&
+		segments[len(segments)-3] == "auth"
+}
+
+// grokInlineTableMaxDepth bounds the descent into nested inline tables. Deep
+// enough for any config a human writes, finite so a pathological or hostile
+// value cannot turn a session start into unbounded recursion.
+const grokInlineTableMaxDepth = 8
+
+// grokInlineTableMatches reports whether any assignment nested inside an inline
+// TOML value satisfies `match`, which is handed the assignment's FULL dotted
+// key — the outer key this value was assigned to, plus the path inside the
+// table — and its raw value.
+//
+// Composing the full key is what lets the dotted and the inline spelling of the
+// same setting share one set of key rules: `[auth] auth_provider_command = ...`
+// and `auth = { auth_provider_command = ... }` both reach `match` as
+// `auth.auth_provider_command`. A value that is not an inline table (a bare
+// string, number or scalar array) has nothing nested in it and reports false —
+// the caller has already judged the assignment itself. Quoted strings are
+// skipped over while splitting so a `,`, `{` or `}` inside a value cannot
+// desynchronise the scan and hide the assignment that follows it.
+func grokInlineTableMatches(key, value string, match func(key, value string) bool) bool {
+	return grokInlineTableMatchesAt(key, value, match, 0)
+}
+
+func grokInlineTableMatchesAt(key, value string, match func(key, value string) bool, depth int) bool {
+	if depth >= grokInlineTableMaxDepth {
+		// Deeper than any real config nests. Fail CLOSED: we cannot rule the
+		// credential out, and over-reporting costs one session's observability
+		// while under-reporting publishes one account's spend as another's.
+		return true
+	}
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		// An ARRAY of inline tables is the documented shape of
+		// `version_overrides`, and a `[model] grok-4 = [{ api_key = ... }]` is
+		// valid TOML too. An array index has no key of its own, so elements
+		// keep the outer key; an array of plain scalars simply has no element
+		// that is an inline table and reports false.
+		elements, split := splitGrokInlineTableFields(value[1 : len(value)-1])
+		if !split {
+			// The body ends inside a string or bracket, so the fragments are
+			// not the elements grok's own parser sees. Same fail-CLOSED reason
+			// as the depth bound above.
+			return true
+		}
+		for _, element := range elements {
+			if grokInlineTableMatchesAt(key, element, match, depth+1) {
+				return true
+			}
+		}
+		return false
+	}
+	if !strings.HasPrefix(value, "{") || !strings.HasSuffix(value, "}") {
+		return false
+	}
+	fields, split := splitGrokInlineTableFields(value[1 : len(value)-1])
+	if !split {
+		return true
+	}
+	for _, field := range fields {
+		eq := grokTOMLAssignmentIndex(field)
+		if eq <= 0 {
+			continue
+		}
+		fieldKey := grokTOMLKeyPath(field[:eq])
+		if key != "" {
+			fieldKey = key + "." + fieldKey
+		}
+		inner := strings.TrimSpace(field[eq+1:])
+		if match(fieldKey, inner) {
+			return true
+		}
+		if grokInlineTableMatchesAt(fieldKey, inner, match, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// grokInlineTableCredentialKey reports whether a key written INSIDE an inline
+// table names a credential, in either the bare (`api_key`) or dotted
+// (`grok-4.api_key`) spelling TOML allows there.
+func grokInlineTableCredentialKey(key string) bool {
+	for _, suffix := range grokModelCredentialKeySuffixes {
+		if key == suffix || strings.HasSuffix(key, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitGrokInlineTableFields splits the BODY of an inline table on its
+// top-level commas, ignoring commas inside quoted strings or nested
+// inline tables / arrays so a nested value cannot swallow the field after it.
+//
+// Multiline (triple-quoted) strings are tracked with the SAME closer rules the
+// line sweep uses, because the body handed here is a composite value the sweep
+// already JOINED across lines: `note = ”'it's, text”', model = { api_key =
+// "xai-..." }` is one field plus another, and reading the apostrophe in `it's`
+// as a terminator split it mid-string, left `model.api_key` inside a falsely
+// open quote and lost the pin. The second result reports whether every string
+// and bracket closed; a body that ends inside one cannot be split faithfully,
+// and the caller fails CLOSED rather than trusting the fragments.
+func splitGrokInlineTableFields(body string) ([]string, bool) {
+	var fields []string
+	depth := 0
+	var quote byte
+	start := 0
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if quote != 0 {
+			if c == '\\' && quote == '"' {
+				i++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			if delim := grokTOMLMultilineDelimiterAt(body[i:]); delim != "" {
+				closer, closerLen := grokTOMLMultilineCloserSpan(body[i+len(delim):], delim)
+				if closer < 0 {
+					// Never closes: the rest of the body is string content, so
+					// no further field boundary is knowable.
+					return append(fields, body[start:]), false
+				}
+				i += len(delim) + closer + closerLen - 1
+				continue
+			}
+			quote = c
+		case '{', '[':
+			depth++
+		case '}', ']':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				fields = append(fields, body[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(fields, body[start:]), quote == 0 && depth == 0
+}
+
+// grokTOMLMultilineDelimiterAt returns the triple-quote delimiter `s` opens
+// with, or "" when it opens with a single-quote of either kind (or nothing).
+func grokTOMLMultilineDelimiterAt(s string) string {
+	for _, delim := range []string{`"""`, "'''"} {
+		if strings.HasPrefix(s, delim) {
+			return delim
+		}
+	}
+	return ""
+}
+
+// grokModelCredentialTOMLKey reports whether a dotted TOML key from
+// walkGrokTOMLAssignments names a `[model]` credential, in either the root
+// (`model.api_key`) or the documented per-model (`model.<name>.env_key`) form.
+func grokModelCredentialTOMLKey(key string) bool {
+	if !strings.HasPrefix(key, "model.") {
+		return false
+	}
+	for _, suffix := range grokModelCredentialKeySuffixes {
+		if key == "model."+suffix || strings.HasSuffix(key, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// grokUserConfigFileNames are the TOML layers xAI's loader reads out of
+// GROK_HOME. All three are user-level — GROK_HOME redirects them, which is what
+// setupIsolatedGrokHome relies on to neutralise them for MANAGED sessions — but
+// a DIRECT (PTY) run reads the user's REAL home, so a credential pinned in any
+// of them is a credential the child can bill. Scanning only `config.toml` would
+// attribute a `managed_config.toml`/`requirements.toml` API-key run to the
+// cached login and publish that spend under the wrong subscription.
+//
+// The system-level twins (`/etc/grok/...`) are a separate list because they are
+// NOT redirected by GROK_HOME and so apply to managed sessions too.
+var grokUserConfigFileNames = []string{"config.toml", "managed_config.toml", "requirements.toml"}
+
+// grokAnyPinnedCredential reports whether a credential is pinned by any user
+// config layer in the home `base`, or by a system config layer that GROK_HOME
+// cannot redirect.
+func grokAnyPinnedCredential(base string) bool {
+	for _, p := range grokSystemConfigPathsFn() {
+		if grokConfigPinsCredential(p) {
+			return true
+		}
+	}
+	if base == "" {
+		return false
+	}
+	for _, name := range grokUserConfigFileNames {
+		if grokConfigPinsCredential(filepath.Join(base, name)) {
+			return true
+		}
+	}
+	return false
 }
 
 // grokSystemRequirementsPath is the documented system-level pinned-config
@@ -2398,11 +3210,35 @@ func inspectClaudeManagedSettingsAllowRule(path string) (bool, error) {
 // oriented requirements scanner would corrupt valid pinned values that
 // embed `#` in a pattern literal — silently letting them route past the
 // approval gate.
+//
+// TRIPLE-quoted strings are recognised BEFORE the single-quote toggles, because
+// a same-line multiline value whose body contains an odd number of quote
+// characters (`note = """contains " # text"""`) would otherwise leave the
+// toggle "outside a string" at the `#` and take the real closing delimiter with
+// the comment. walkGrokTOMLAssignments then reads the mutilated line as an
+// UNCLOSED multiline opener, runs to EOF with `openMultiline` set and reports
+// the credential scan incomplete — so grokConfigPinsCredential contests a
+// cached-login run over a config that pins nothing. A triple-quoted body is
+// content, so no `#` inside one is a comment; when the body does not close on
+// this line the rest of the line is body and nothing is stripped.
 func grokTOMLStripInlineComment(line string) string {
 	inDouble := false
 	inSingle := false
 	for i := 0; i < len(line); i++ {
 		c := line[i]
+		if !inDouble && !inSingle {
+			if delim := grokTOMLMultilineDelimiterAt(line[i:]); delim != "" {
+				body := line[i+len(delim):]
+				closer, closerLen := grokTOMLMultilineCloserSpan(body, delim)
+				if closer < 0 {
+					// The body runs past this line: everything after the
+					// opener is string content, never a comment.
+					return line
+				}
+				i += len(delim) + closer + closerLen - 1
+				continue
+			}
+		}
 		if inDouble {
 			if c == '\\' && i+1 < len(line) {
 				i++
@@ -2468,6 +3304,133 @@ func grokTOMLBracketDepth(s string) int {
 		}
 	}
 	return depth
+}
+
+// grokTOMLCompositeLineDepth counts the net bracket depth one line contributes
+// to a composite value (a multi-line array, or an array of inline tables) while
+// carrying multiline STRING state across lines, and returns the delimiter of a
+// string body still running at the end of the line ("" when none is).
+//
+// grokTOMLBracketDepth alone is not enough for a composite BODY. A multiline
+// string nested inside an array is valid TOML, and its body is text: a `]` in it
+// is not the array's close, and a following section-shaped line like `[other]`
+// is not a table. Counting the string's `]` ended the composite early, so that
+// body line re-scoped every FOLLOWING assignment — a root `model.api_key` read
+// as `other.model.api_key`, which the attribution guard sees as no pinned
+// credential for a run grok's own parser bills by API key.
+//
+// `openMultiline` is the delimiter already running when the line starts; the
+// scan resumes after its close and only then reads the rest of the line as
+// value syntax.
+func grokTOMLCompositeLineDepth(s, openMultiline string) (string, int, string) {
+	i := 0
+	if openMultiline != "" {
+		idx, closerLen := grokTOMLMultilineCloserSpan(s, openMultiline)
+		if idx < 0 {
+			// The whole line is still string body.
+			return s, 0, openMultiline
+		}
+		i = idx + closerLen
+		openMultiline = ""
+	}
+	depth := 0
+	inDouble := false
+	inSingle := false
+	for ; i < len(s); i++ {
+		c := s[i]
+		if inDouble {
+			if c == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			delim := strings.Repeat(string(c), 3)
+			if strings.HasPrefix(s[i:], delim) {
+				rest := s[i+len(delim):]
+				closed, closerLen := grokTOMLMultilineCloserSpan(rest, delim)
+				if closed < 0 {
+					// Everything after this opener is body, on this line and
+					// on the ones that follow.
+					return s, depth, delim
+				}
+				// Resume at the first byte after the closing delimiter; the
+				// loop's own i++ carries it there.
+				i += len(delim) + closed + closerLen - 1
+				continue
+			}
+			if c == '"' {
+				inDouble = true
+			} else {
+				inSingle = true
+			}
+		case '#':
+			// Outside every string body a `#` starts a comment, and the rest
+			// of the line is not value syntax. Stripping it HERE rather than
+			// before the scan is what makes a comment on the line that CLOSES
+			// a multiline string count as a comment: the caller cannot strip
+			// that line up front (a `#` before the closing delimiter is body),
+			// and leaving it unstripped let a trailing `# ]` close the
+			// composite early, so the next element line was read as a table
+			// header and every following root key was re-scoped.
+			return strings.TrimRight(s[:i], " \t"), depth, ""
+		case '[':
+			depth++
+		case ']':
+			depth--
+		}
+	}
+	return s, depth, ""
+}
+
+// grokTOMLCompositeMaxContinuationLines bounds how far walkGrokTOMLAssignments
+// will follow one composite value. Generous for anything a human writes, finite
+// so a corrupted file with no closing `]` cannot make one assignment consume the
+// whole scan. Past the bound the sweep reports INCOMPLETE rather than resuming
+// mid-body, because resuming would read value body as configuration — the
+// re-scoping bug this accumulation exists to avoid.
+const grokTOMLCompositeMaxContinuationLines = 256
+
+// accumulateGrokTOMLCompositeValue joins the continuation lines of a composite
+// value into one logical right-hand side, carrying both the bracket depth and
+// any multiline STRING body across lines. Reports false when the value neither
+// closes within grokTOMLCompositeMaxContinuationLines nor before EOF.
+func accumulateGrokTOMLCompositeValue(
+	scanner *bufio.Scanner,
+	initial string,
+	depth int,
+	openMultiline string,
+) (string, bool) {
+	parts := []string{initial}
+	for i := 0; i < grokTOMLCompositeMaxContinuationLines && scanner.Scan(); i++ {
+		// Comment stripping is left to grokTOMLCompositeLineDepth, the only
+		// scan that knows where the value syntax on this line actually starts.
+		// Pre-stripping was wrong inside a string body (a `#` there is
+		// content), and skipping the strip for the WHOLE line whenever it
+		// began in one was wrong once the delimiter closed mid-line: a
+		// trailing `# ]` after the close was then counted as the composite's
+		// bracket.
+		line := strings.TrimSpace(scanner.Text())
+		var delta int
+		line, delta, openMultiline = grokTOMLCompositeLineDepth(line, openMultiline)
+		depth += delta
+		parts = append(parts, line)
+		if depth <= 0 && openMultiline == "" {
+			return strings.Join(parts, " "), true
+		}
+	}
+	return "", false
 }
 
 // accumulateGrokTOMLArrayContinuation reads continuation lines from scanner

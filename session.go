@@ -87,6 +87,18 @@ type CLISession struct {
 	isolatedGrokHome   string
 	persistentGrokHome string
 
+	// grokProducerContested freezes, from the credential surface the managed
+	// child was spawned with, whether it may bill an account the copied login
+	// does not name. waitForExit refuses to merge the billing snapshot when it
+	// is set — the billing twin of the notice scope's refusal below.
+	grokProducerContested bool
+
+	// grokLimitNoticeScope is the account this session's Grok limit notices may
+	// be cached under, frozen at spawn. Zero value for every non-Grok command
+	// and for a Grok run whose producer is contested — captureGrokUsageLimitLine
+	// then caches nothing rather than filing one account's limit under another's.
+	grokLimitNoticeScope grokLimitNoticeScope
+
 	// antigravityManagedStream is true only when StartSession shaped this
 	// invocation into agy's managed stream-json protocol. Raw diagnostics such
 	// as `agy --version` also use the pipe reader, but legitimately exit without
@@ -100,6 +112,14 @@ type CLISession struct {
 	// is reaped, so the poller's final read still happens while the language
 	// server's loopback socket may answer.
 	finishQuotaCapture func()
+
+	// finishGrokBillingAttribution releases the run-scoped Grok attribution
+	// keeper armed at spawn (cliagent_ratelimit_grok.go). Set only for a DIRECT
+	// Grok run; nil for a maintenance smoke (its child logs into the isolated
+	// home) and for every other command. waitForExit calls it exactly once, once
+	// the process is reaped — after that the run writes no further records, so
+	// there is nothing left to keep attributed.
+	finishGrokBillingAttribution func()
 
 	// deferredStdinClose marks a one-shot, stdin-fed CLI (codex) that
 	// was started with NO prompt — the chat-direct flow opens the session
@@ -421,6 +441,12 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		filtered = setEnvVar(filtered, "HOME", isolatedGrokHome)
 		filtered = setEnvVar(filtered, "USERPROFILE", isolatedGrokHome)
 		filtered = setEnvVar(filtered, "PWD", isolatedGrokCwd)
+	} else if isGrokCommand(command) {
+		// Pin a relative GROK_HOME to the same absolute path the attribution
+		// marker and the billing reader use; see grokDirectChildHomeOverride.
+		if resolved := grokDirectChildHomeOverride(os.Getenv("GROK_HOME")); resolved != "" {
+			filtered = setEnvVar(filtered, "GROK_HOME", resolved)
+		}
 	}
 	proc.Env = filtered
 	if len(strippedVars) > 0 {
@@ -481,8 +507,116 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	stdout := stdoutR
 	stderr := stderrR
 
+	// A DIRECT Grok run writes its billing records into the user's own
+	// ~/.grok/logs/unified.jsonl, where the CLI logs no producer identity — so
+	// without this the account gate refuses every one of them and the card can
+	// never show a fresh observation. Session-scoped and best-effort; no work is
+	// added to the per-line streaming path. A maintenance smoke is excluded: its
+	// child writes into the isolated home, whose identity is seeded there and
+	// merged by persistGrokManagedBillingSnapshot on exit.
+	//
+	// Must run BEFORE proc.Start(): grokRecordBelongsToCurrentAccount only
+	// accepts an identity logged EARLIER in the log than the billing record, and
+	// a fast child can write its startup `billing: fetched credits config` line
+	// before the parent gets scheduled again. Appending after the spawn would
+	// leave attribution — and therefore the whole capture this exists to
+	// restore — dependent on that race. Mirrors grok_acp.go, which likewise
+	// attributes before it spawns.
+	//
+	// Session start alone does not hold attribution: the CLI fetches credits for
+	// the whole life of the run, and a later identity from a managed exit or an
+	// out-of-process `grok login` displaces ours for every record written after
+	// it. The keeper armed below re-asserts on a bounded tick until the child is
+	// reaped, so displacement costs at most one interval instead of the rest of
+	// the session.
+	//
+	// ARM FIRST, then check. persistGrokManagedBillingSnapshot only carries its
+	// repair marker when it can see an armed direct run, so a managed exit
+	// landing between a check and a later arm would displace us with no repair
+	// and no tick due — and this run's only billing record would be refused.
+	// Arming first makes that gap unreachable: a managed merge either sees the
+	// arm and re-names us in its own payload, or lands before it and is
+	// corrected by the check below (both serialize on the same write lock).
+	var finishGrokAttribution func()
+	// Frozen here, next to the arm, for the same reason the arm is: the child
+	// bills the credentials it is SPAWNED with. A maintenance smoke bills the
+	// login copied into its isolated home and a direct run the persistent one —
+	// in both cases only while nothing else the child carries contests it.
+	var grokLimitScope grokLimitNoticeScope
+	var grokProducerContested bool
+	if isGrokCommand(command) && isolatedGrokHome != "" {
+		// From the credential surface the smoke child is SPAWNED with, not the
+		// isolated home alone: sanitizeGrokMaintenanceSmokeEnv strips the env
+		// credentials, but a system config layer (`/etc/grok/...`) is not
+		// redirected by GROK_HOME and can still pin a key for an account the
+		// copied login does not name. Caching that account's notice under this
+		// fingerprint would show one account's limit on another's card.
+		managedLaunch := grokDirectRunLaunch{Env: filtered, Cwd: proc.Dir, Args: cliArgs}
+		grokLimitScope = grokManagedRunLimitNoticeScope(managedLaunch, isolatedGrokHome)
+		// The SAME verdict gates the billing merge on exit, resolved once from
+		// the pre-spawn surface rather than re-derived after the run.
+		grokProducerContested = grokManagedRunProducerContested(managedLaunch, isolatedGrokHome)
+	}
+	if isGrokCommand(command) && isolatedGrokHome == "" {
+		// The identity is CAPTURED here and re-asserted as-is for the life of the
+		// run. The child keeps writing records under the credentials it is spawned
+		// with, so re-reading the shared home later — after a `grok login` to
+		// another account — would name the new account above this run's records and
+		// publish one account's utilization as another's.
+		//
+		// grokDirectRunBillingIdentity also withholds the cached login entirely
+		// when this child carries a credential override (an inherited
+		// XAI_API_KEY / provider token, a key pinned in its own argv, or one
+		// pinned in the workspace it runs in or the user's real config.toml — a
+		// direct session strips none of them, unlike the ACP and
+		// maintenance-smoke paths): the records would then be billed to an
+		// account we cannot resolve, and naming the login above them publishes
+		// one account's spend as another's. It captures the contested sentinel
+		// instead, which ARMS as well as writes, so a concurrent honest run is
+		// made contested too and the override run's records cannot bind to the
+		// marker that run asserts.
+		//
+		// All three credential sources are handed over together: the child is
+		// spawned with `filtered`, starts in the caller's `cwd` (which is what
+		// Grok walks upward from for a project `.grok/config.toml`) and runs
+		// `cliArgs`, which forwards `--config <key>=value` verbatim.
+		//
+		// proc.Dir is left empty when the caller named no cwd, and the child
+		// then inherits the daemon's — so resolve that here rather than inside
+		// the detector, which must never read ambient process state of its own.
+		grokChildCwd := cwd
+		if grokChildCwd == "" {
+			if wd, err := os.Getwd(); err == nil {
+				grokChildCwd = wd
+			}
+		}
+		grokLaunch := grokDirectRunLaunch{Env: filtered, Cwd: grokChildCwd, Args: cliArgs}
+		grokBase := grokPersistentHome()
+		// Normalized HERE, before either use. An unresolved resolution is still
+		// a live run whose records nobody may be named for, and the keeper's own
+		// normalization only reached the keeper: the marker call below no-ops on
+		// an empty identity, so the log kept ending under an EARLIER account's
+		// marker and this child's first identity-less billing record bound to
+		// it. One value, armed and written.
+		directIdentity := grokArmableBillingIdentity(grokDirectRunBillingIdentity(grokLaunch, grokBase))
+		finishGrokAttribution = startGrokBillingAttributionKeeper(directIdentity)
+		// Names the identity the keeper was ARMED with, never a re-resolution of
+		// the same credentials: the sources it reads (the auth cache, config
+		// layers, the repository) can change between the two calls, and a marker
+		// that disagreed with the arm would be reasserted back to the stale
+		// account on the keeper's next tick. One decision, used twice.
+		ensureGrokBillingIdentityNamed(grokBase, directIdentity)
+		// Same single decision, third use: a contested arm caches no notice.
+		grokLimitScope = grokDirectRunLimitNoticeScope(directIdentity, grokBase)
+	}
+
 	// Start the process
 	if err := proc.Start(); err != nil {
+		if finishGrokAttribution != nil {
+			// No child will ever write a record for this arm; release now so a
+			// failed spawn cannot leave the shared keeper running forever.
+			finishGrokAttribution()
+		}
 		stdin.Close()
 		stdoutR.Close()
 		stdoutW.Close()
@@ -509,22 +643,25 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	}
 
 	session := &CLISession{
-		ID:                       id,
-		Command:                  command,
-		Process:                  proc,
-		Stdin:                    stdin,
-		Stdout:                   stdout,
-		Stderr:                   stderr,
-		StartedAt:                time.Now(),
-		Status:                   "running",
-		WorkspaceID:              workspaceID,
-		UID:                      uid,
-		TimeoutMs:                timeoutMs,
-		promptFile:               promptFile,
-		isolatedGrokHome:         isolatedGrokHome,
-		persistentGrokHome:       persistentGrokHome,
-		antigravityManagedStream: antigravityManagedStream,
-		finishQuotaCapture:       finishQuotaCapture,
+		ID:                           id,
+		Command:                      command,
+		Process:                      proc,
+		Stdin:                        stdin,
+		Stdout:                       stdout,
+		Stderr:                       stderr,
+		StartedAt:                    time.Now(),
+		Status:                       "running",
+		WorkspaceID:                  workspaceID,
+		UID:                          uid,
+		TimeoutMs:                    timeoutMs,
+		promptFile:                   promptFile,
+		isolatedGrokHome:             isolatedGrokHome,
+		persistentGrokHome:           persistentGrokHome,
+		grokLimitNoticeScope:         grokLimitScope,
+		grokProducerContested:        grokProducerContested,
+		antigravityManagedStream:     antigravityManagedStream,
+		finishQuotaCapture:           finishQuotaCapture,
+		finishGrokBillingAttribution: finishGrokAttribution,
 		// A stdin-fed one-shot CLI (codex) started without a prompt keeps
 		// its stdin open so the first SendInput can deliver the prompt; that
 		// SendInput then closes the pipe. Mirrors shouldCloseStdinAfterStart.
@@ -1366,7 +1503,7 @@ func (sm *SessionManager) readOutputStream(session *CLISession, publishFn Publis
 			// the cap. Capture it (best-effort) so the CLI Agents card can show a
 			// warning instead of a permanently-Unknown bar.
 			if isGrokCommand(session.Command) {
-				captureGrokUsageLimitLine(line.text, time.Now())
+				captureGrokUsageLimitLine(line.text, time.Now(), session.grokLimitNoticeScope)
 			}
 
 			if isClaudeCommand(session.Command) {
@@ -1698,6 +1835,13 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 		session.finishQuotaCapture()
 	}
 
+	// Same timing for the Grok attribution keeper: the reaped child writes no
+	// further billing records, so holding the marker past this point would only
+	// keep writing into a provider-owned log for a run that has ended.
+	if session.finishGrokBillingAttribution != nil {
+		session.finishGrokBillingAttribution()
+	}
+
 	if timeoutTimer != nil {
 		timeoutTimer.Stop()
 	}
@@ -1740,9 +1884,15 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 	// lifecycle before announcing session_ended, then remove all copied auth and
 	// private logs. Never copy the raw log or config into the persistent home.
 	if session.isolatedGrokHome != "" {
-		if persistErr := persistGrokManagedBillingSnapshot(session.isolatedGrokHome, session.persistentGrokHome); persistErr != nil {
-			fmt.Printf("%s[session] Grok no-tools billing snapshot not persisted: %v%s\n",
-				colorYellow, persistErr, colorReset)
+		outcome, persistErr := persistGrokManagedBillingSnapshot(session.isolatedGrokHome, session.persistentGrokHome, session.grokProducerContested)
+		if persistErr != nil {
+			fmt.Printf("%s[session] Grok no-tools billing snapshot not persisted (%s): %v%s\n",
+				colorYellow, outcome, persistErr, colorReset)
+		} else {
+			// A smoke that never fetched credits is a real outcome, not success:
+			// logging only errors made it indistinguishable from a merged record.
+			fmt.Printf("%s[session] Grok no-tools billing snapshot: %s%s\n",
+				colorCyan, outcome, colorReset)
 		}
 		_ = os.RemoveAll(session.isolatedGrokHome)
 	}

@@ -13,6 +13,13 @@
 *.out
 dist/
 
+# Local dev builds of the agent itself. These have no file extension, so the
+# patterns above miss them; a tracked one silently ships a stale executable to
+# anyone who runs it instead of rebuilding. Releases are built and signed by
+# .github/workflows/release-*.yml, never committed here.
+/aiexpedite-local-terminal
+/aiexpedite-terminal
+
 # Windows resource files (generated)
 *.syso
 

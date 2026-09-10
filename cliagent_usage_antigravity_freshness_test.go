@@ -304,9 +304,7 @@ func TestAntigravityFreshness_SurvivesAnInstallTreeMigrationMidCapture(t *testin
 	// log under the modern tree names the relocated server (a different account
 	// so the source of the next reading is unambiguous).
 	old.srv.Close()
-	if err := os.Remove(filepath.Join(legacy, "config.json")); err != nil {
-		t.Fatalf("remove legacy config: %v", err)
-	}
+	helperRemoveFile(t, filepath.Join(legacy, "config.json"))
 	modern := filepath.Join(home, ".gemini", "antigravity-cli")
 	helperWriteJSON(t, filepath.Join(modern, "settings.json"), map[string]any{})
 	helperStartCaptureServer(t, modern, helperQuotaJSON,
