@@ -3152,11 +3152,35 @@ func inspectClaudeManagedSettingsAllowRule(path string) (bool, error) {
 // oriented requirements scanner would corrupt valid pinned values that
 // embed `#` in a pattern literal — silently letting them route past the
 // approval gate.
+//
+// TRIPLE-quoted strings are recognised BEFORE the single-quote toggles, because
+// a same-line multiline value whose body contains an odd number of quote
+// characters (`note = """contains " # text"""`) would otherwise leave the
+// toggle "outside a string" at the `#` and take the real closing delimiter with
+// the comment. walkGrokTOMLAssignments then reads the mutilated line as an
+// UNCLOSED multiline opener, runs to EOF with `openMultiline` set and reports
+// the credential scan incomplete — so grokConfigPinsCredential contests a
+// cached-login run over a config that pins nothing. A triple-quoted body is
+// content, so no `#` inside one is a comment; when the body does not close on
+// this line the rest of the line is body and nothing is stripped.
 func grokTOMLStripInlineComment(line string) string {
 	inDouble := false
 	inSingle := false
 	for i := 0; i < len(line); i++ {
 		c := line[i]
+		if !inDouble && !inSingle {
+			if delim := grokTOMLMultilineDelimiterAt(line[i:]); delim != "" {
+				body := line[i+len(delim):]
+				closer := grokTOMLMultilineCloserIndex(body, delim)
+				if closer < 0 {
+					// The body runs past this line: everything after the
+					// opener is string content, never a comment.
+					return line
+				}
+				i += len(delim) + closer + len(delim) - 1
+				continue
+			}
+		}
 		if inDouble {
 			if c == '\\' && i+1 < len(line) {
 				i++

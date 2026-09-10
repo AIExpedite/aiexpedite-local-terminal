@@ -740,3 +740,121 @@ func TestEnsureGrokBillingAttribution_AnArmedOverrideRunContestsAConcurrentRun(t
 		t.Fatalf("the contested marker was not written: %s", raw)
 	}
 }
+
+// A merge is correct at the time it is taken and can be wrong later: ownership
+// of the reader moves with a `grok login`. A managed acct-1 merge made while the
+// persistent credentials still resolved to acct-1 leaves `acct-2 record, acct-1
+// record, acct-2 marker` for a live direct acct-2 run — right then, because
+// acct-2's record is older and acct-1 is the account reading here. After the
+// user switches the shared home back to acct-2, every gather stops at acct-1's
+// foreign record and publishes nothing, while the trailing acct-2 marker makes
+// the keeper report attribution intact forever. The re-assertion has to restore
+// the reader's own newest record, not just check the marker.
+func TestReassertGrokDirectAttribution_RestoresTheReadersRecordAfterALoginSwitch(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+
+	// The direct acct-2 run's own (older) observation.
+	if err := appendGrokBillingIdentityValue(base, "acct-2"); err != nil {
+		t.Fatalf("seed direct identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, base,
+		grokBillingLine("2026-08-19T10:00:00Z", 41, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	// The managed acct-1 merge that landed on top of it, ending — correctly for
+	// the state at that moment — with the direct account's bare marker.
+	if err := appendGrokBillingIdentityValue(base, "acct-1"); err != nil {
+		t.Fatalf("seed managed identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, base,
+		grokBillingLine("2026-08-19T11:00:00Z", 9, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	if err := appendGrokBillingIdentityValue(base, "acct-2"); err != nil {
+		t.Fatalf("seed trailing direct marker: %v", err)
+	}
+
+	// The login switch: the shared home now reads under acct-2.
+	helperWriteJSON(t, filepath.Join(base, "auth.json"), map[string]any{"user_id": "acct-2"})
+
+	candidates := grokIdentityCandidates(base)
+	if _, ok := readGrokBillingSnapshot(base, candidates); ok {
+		t.Fatal("precondition: acct-2 should be dark before the repair — the fixture no longer reproduces the defect")
+	}
+	if !grokBillingIdentityIsNewest(base, "acct-2") {
+		t.Fatal("precondition: the trailing marker should already name acct-2, which is what suppressed the repair")
+	}
+
+	finish := startGrokBillingAttributionKeeper("acct-2")
+	defer finish()
+	reassertGrokDirectAttribution()
+
+	snap, ok := readGrokBillingSnapshot(base, candidates)
+	if !ok {
+		t.Fatal("acct-2 still publishes nothing: the re-assertion checked only the marker")
+	}
+	want, err := time.Parse(time.RFC3339, "2026-08-19T10:00:00Z")
+	if err != nil {
+		t.Fatalf("parse want: %v", err)
+	}
+	if !snap.ObservedAt.Equal(want) {
+		t.Fatalf("ObservedAt = %s, want the reader's own newest record at %s", snap.ObservedAt, want)
+	}
+
+	// Idempotent: a healthy log costs a read and no append, so the keeper does
+	// not grow a provider-owned file one line per tick.
+	before, err := os.ReadFile(grokBillingLogPath(base))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	reassertGrokDirectAttribution()
+	after, err := os.ReadFile(grokBillingLogPath(base))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("a second re-assertion rewrote a healthy log:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// The repair must not fire for an account that is NOT the one reading here:
+// moving an older record last while its owner can still be read republishes a
+// stale reading, which is the failure the supersession guard exists to prevent.
+func TestReassertGrokDirectAttribution_LeavesTheLogAloneWhileTheMergedAccountReads(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+
+	if err := appendGrokBillingIdentityValue(base, "acct-2"); err != nil {
+		t.Fatalf("seed direct identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, base,
+		grokBillingLine("2026-08-19T10:00:00Z", 41, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	if err := appendGrokBillingIdentityValue(base, "acct-1"); err != nil {
+		t.Fatalf("seed managed identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, base,
+		grokBillingLine("2026-08-19T11:00:00Z", 9, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	if err := appendGrokBillingIdentityValue(base, "acct-2"); err != nil {
+		t.Fatalf("seed trailing direct marker: %v", err)
+	}
+
+	before, err := os.ReadFile(grokBillingLogPath(base))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+
+	finish := startGrokBillingAttributionKeeper("acct-2")
+	defer finish()
+	reassertGrokDirectAttribution()
+
+	after, err := os.ReadFile(grokBillingLogPath(base))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("the repair displaced a readable account's newer record:\nbefore=%s\nafter=%s", before, after)
+	}
+}

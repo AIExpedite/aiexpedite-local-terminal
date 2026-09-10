@@ -251,10 +251,18 @@ func ensureGrokBillingIdentityNamed(base, identity string) {
 		identity = grokContestedBillingIdentity
 	}
 
-	if grokBillingIdentityIsNewest(base, identity) {
-		return
+	if !grokBillingIdentityIsNewest(base, identity) {
+		_ = appendGrokBillingIdentityValue(base, identity)
 	}
-	_ = appendGrokBillingIdentityValue(base, identity)
+
+	// A standing marker proves the NEXT record will be attributable; it says
+	// nothing about the records already in the log. When ownership of the
+	// reader moves to this account after a merge left a foreign record on top
+	// — a `grok login` back to the direct run's account — the marker check
+	// passes while every gather here publishes nothing. This is where that is
+	// noticed, because it is the only guard that runs again after the merge.
+	// A no-op read when the log is healthy.
+	restoreGrokBillingRecordForArmedReaderLocked(base, identity)
 }
 
 // grokLimitStateFromFrame walks a decoded Grok frame for a usage-limit signal.

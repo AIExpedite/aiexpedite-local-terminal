@@ -211,3 +211,76 @@ func TestGrokTOMLCompositeLineDepth_KeepsAHashInsideTheStringBody(t *testing.T) 
 		t.Fatalf("code = %q, want the `#` kept as string content", code)
 	}
 }
+
+// A same-line multiline string whose BODY contains an odd number of quote
+// characters left the single-quote toggle reading "outside a string" at the
+// `#`, so the inline-comment strip took the real closing delimiter with the
+// comment. The sweep then read the mutilated line as an unclosed multiline
+// opener, ran to EOF with the string still open, and reported the scan
+// incomplete — which contests a cached-login run over a config that pins no
+// credential at all.
+func TestGrokTOMLWalk_TripleQuotedBodyWithAQuoteAndAHashStaysComplete(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	body := `note = """contains " # text""" # trailing
+model.api_key = "xai-triple-quote-sentinel"
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	keys := map[string]string{}
+	if complete := walkGrokTOMLAssignments(path, func(key, value string) bool {
+		keys[key] = value
+		return true
+	}); !complete {
+		t.Fatal("sweep reported incomplete for a config whose multiline string closes on its own line")
+	}
+	if _, ok := keys["model.api_key"]; !ok {
+		t.Fatalf("keys = %v, want the assignment after the multiline string", keys)
+	}
+	if !grokConfigPinsCredential(path) {
+		t.Fatal("pinned credential missed: the closing delimiter was stripped as a comment")
+	}
+}
+
+// The strip must leave a triple-quoted body untouched — every `#` inside one is
+// content — while still dropping a comment that follows the closing delimiter.
+func TestGrokTOMLStripInlineComment_HonorsTripleQuotedStrings(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		line string
+		want string
+	}{
+		{
+			name: "closed body keeps its hash and loses the trailing comment",
+			line: `note = """contains " # text""" # trailing`,
+			want: `note = """contains " # text"""`,
+		},
+		{
+			name: "literal triple quotes are content too",
+			line: `note = '''a ' # b''' # trailing`,
+			want: `note = '''a ' # b'''`,
+		},
+		{
+			name: "an unclosed opener makes the rest of the line body",
+			line: `note = """opens # here`,
+			want: `note = """opens # here`,
+		},
+		{
+			name: "an ordinary single-quoted value still strips",
+			line: `key = "value" # trailing`,
+			want: `key = "value"`,
+		},
+		{
+			name: "a hash inside an ordinary string is kept",
+			line: `pattern = "Bash(#magic)"`,
+			want: `pattern = "Bash(#magic)"`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := grokTOMLStripInlineComment(tc.line); got != tc.want {
+				t.Fatalf("grokTOMLStripInlineComment(%q) = %q, want %q", tc.line, got, tc.want)
+			}
+		})
+	}
+}

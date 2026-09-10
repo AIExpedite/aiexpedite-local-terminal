@@ -876,6 +876,71 @@ func grokDirectAccountOwnsTheReader(persistentHome, directIdentity, mergedIdenti
 		!grokIdentityAmongCandidates(candidates, mergedIdentity)
 }
 
+// restoreGrokBillingRecordForArmedReaderLocked re-appends the armed DIRECT
+// account's own newest trusted record when that account is the one a gather on
+// this device reads under and a FOREIGN record sits above it.
+//
+// The marker guard alone is not enough once ownership of the reader can change
+// AFTER a merge. A managed merge for account A, taken while the persistent
+// credentials still resolved to A, correctly leaves `A identity, A record, B
+// marker` for a live direct run under B: B's older record stays where it is
+// because moving it last would have republished a stale reading for the account
+// that was then reading. A later `grok login` back to B flips that: every gather
+// now stops at A's record, refuses it as foreign and publishes nothing, while
+// the keeper sees a trailing B marker, reports attribution intact, and never
+// repairs it — B goes dark with a perfectly good record of its own in the file.
+//
+// So the re-assertion asks the same question grokDirectBillingPairToPreserve
+// asks at merge time, just later: is the account we are naming the one that
+// reads here, and does it already publish its own newest observation? Only when
+// the answer is "yes, and no" is anything written, so a healthy log costs a
+// bounded tail read and no append. The record it displaces is unreadable on this
+// device regardless, which is what makes an older record taking the last line
+// honest rather than a stale republish.
+//
+// Bounded and RE-TESTED after each write like the merge's race repair, and for
+// the same reason: the pair is chosen by a read taken before a write, against a
+// direct child that never takes our mutex. Callers must hold
+// grokBillingAttributionSerialize.
+func restoreGrokBillingRecordForArmedReaderLocked(base, identity string) bool {
+	identity = strings.TrimSpace(identity)
+	if base == "" || identity == "" {
+		return false
+	}
+	// The contested sentinel is never a login, so grokIdentityAmongCandidates
+	// refuses it here as it does everywhere else: while two accounts overlap
+	// there is no record this device may honestly publish for either.
+	if !grokIdentityAmongCandidates(grokIdentityCandidates(base), identity) {
+		return false
+	}
+
+	identities := []string{identity}
+	repaired := false
+	for attempt := 0; attempt < grokBillingRaceRepairAttempts; attempt++ {
+		newest, ok := newestTrustedGrokBillingRecordFor(
+			base, identities, time.Now().Add(grokBillingMaxClockSkew))
+		if !ok {
+			return repaired
+		}
+		if published, ok := readGrokBillingSnapshot(base, identities); ok &&
+			!published.ObservedAt.Before(newest.ObservedAt) {
+			// The account already publishes its own newest observation, so
+			// nothing is stranded and no duplicate line is written.
+			return repaired
+		}
+		pair, err := grokManagedBillingPayload(identity, newest)
+		if err != nil {
+			return repaired
+		}
+		grokBillingPreWriteBarrier()
+		if err := writeGrokBillingPayload(base, pair); err != nil {
+			return repaired
+		}
+		repaired = true
+	}
+	return repaired
+}
+
 // grokIdentityAmongCandidates reports whether `identity` is one of the account
 // values the current credentials resolve to.
 func grokIdentityAmongCandidates(candidates []string, identity string) bool {
