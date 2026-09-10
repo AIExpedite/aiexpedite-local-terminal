@@ -40,6 +40,27 @@ func helperWriteJSON(t *testing.T, path string, payload any) {
 	}
 }
 
+// helperRemoveFile deletes a file the code under test may still be polling.
+// Windows refuses a delete while any handle is open, so a capture loop that
+// happens to be reading the file on this tick fails os.Remove outright with
+// ERROR_SHARING_VIOLATION; on Unix the same delete always succeeds. Retry
+// briefly so the test asserts on the migration it is about rather than on which
+// side of a 20ms tick the removal landed.
+func helperRemoveFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := os.Remove(path)
+		if err == nil || errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("remove %s: %v", path, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func helperJWT(t *testing.T, claims any) string {
 	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
