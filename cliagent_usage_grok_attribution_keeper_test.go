@@ -107,11 +107,15 @@ func TestGrokBillingAttributionKeeper_WritesNothingWhileAttributionHolds(t *test
 	ensureGrokBillingAttribution(grokDirectRunLaunch{})
 	finish := startGrokBillingAttributionKeeper("acct-1")
 	time.Sleep(120 * time.Millisecond) // many ticks
-	finish()
 
+	// Counted while the run is still armed: the release deliberately appends
+	// one seal (TestGrokBillingAttributionKeeper_LastReleaseSealsAttribution),
+	// so counting after it would be satisfied by the seal and assert nothing
+	// about the ticks.
 	if got := grokIdentityLineCount(t, base); got != 1 {
 		t.Fatalf("identity lines = %d, want 1 — the keeper appended on an undisplaced log", got)
 	}
+	finish()
 }
 
 // Release is ref-counted across concurrently live direct sessions and idempotent
@@ -629,10 +633,13 @@ func TestGrokBillingAttributionKeeper_ReassertsTheSurvivorWhenAConflictingRunExi
 	}
 }
 
-// The release repair must stay quiet in the ordinary case: a lone run exiting
-// asserts nothing (no live run to attribute), and it must not pile a marker into
-// a provider-owned log on every child reap.
-func TestGrokBillingAttributionKeeper_LastReleaseWritesNothing(t *testing.T) {
+// When the LAST instrumented run exits, our marker must stop vouching for the
+// log. Leaving it newest lets a later out-of-agent invocation — a `grok login`
+// to another account, or an API-key override over the still-cached login — write
+// an identity-less record that binds to our name, publishing one subscription's
+// utilization as another's. The release seals with the contested sentinel: one
+// line, once, and never at the cost of the finished run's own record.
+func TestGrokBillingAttributionKeeper_LastReleaseSealsAttribution(t *testing.T) {
 	resetGrokBillingAttribution(t)
 	base := helperGrokHomeWithAccount(t, "acct-1")
 	t.Setenv("GROK_HOME", base)
@@ -640,12 +647,57 @@ func TestGrokBillingAttributionKeeper_LastReleaseWritesNothing(t *testing.T) {
 
 	finish := startGrokBillingAttributionKeeper("acct-1")
 	ensureGrokBillingIdentityNamed(base, "acct-1")
+	helperAppendGrokLogLine(t, base,
+		grokUnmeteredLine("2026-08-19T12:00:00Z", grokBillingLogMessage))
 	before := grokIdentityLineCount(t, base)
 
 	finish()
 
-	if got := grokIdentityLineCount(t, base); got != before {
-		t.Fatalf("identity lines = %d after the last release, want %d", got, before)
+	if got := grokIdentityLineCount(t, base); got != before+1 {
+		t.Fatalf("identity lines = %d after the last release, want %d — exactly one seal",
+			got, before+1)
+	}
+	if last := helperGrokLastLogLine(t, base); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("newest marker = %s, want the contested sentinel once no run is live", last)
+	}
+
+	// The finished run's own record precedes the seal, so it is still ours.
+	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 19, 12, 1, 0, 0, time.UTC))
+	if !ok || len(usage.Metrics) != 1 || usage.Metrics[0].ObservedAt != "2026-08-19T12:00:00Z" {
+		t.Fatalf("the sealed run lost its own observation: %+v", usage.Metrics)
+	}
+
+	// A record written AFTER the seal — the out-of-agent account switch this
+	// exists for — is refused rather than published as acct-1's.
+	helperAppendGrokLogLine(t, base,
+		grokUnmeteredLine("2026-08-19T12:05:00Z", grokBillingLogMessage))
+	usage, ok = grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true},
+		time.Date(2026, 8, 19, 12, 6, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("Parse failed")
+	}
+	if len(usage.Metrics) != 1 || usage.Metrics[0].ObservedAt != "" {
+		t.Fatalf("a post-seal record must be unattributable, got %+v", usage.Metrics)
+	}
+}
+
+// The seal is one line per direct-run lifetime, not one per reap: a second
+// release with the sentinel already newest must not pile markers into a
+// provider-owned log.
+func TestGrokBillingAttributionKeeper_SealIsNotRewrittenOnEveryRelease(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	base := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", base)
+	t.Setenv(grokBillingAttributionKeeperIntervalEnv, "1h")
+
+	startGrokBillingAttributionKeeper("acct-1")()
+	sealed := grokIdentityLineCount(t, base)
+
+	startGrokBillingAttributionKeeper("")() // an arm that resolved no identity
+	if got := grokIdentityLineCount(t, base); got != sealed {
+		t.Fatalf("identity lines = %d, want %d — the seal was rewritten with nothing to seal",
+			got, sealed)
 	}
 }
 

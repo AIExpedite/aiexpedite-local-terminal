@@ -547,6 +547,10 @@ func startGrokBillingAttributionKeeper(identity string) (finish func()) {
 			grokAttributionKeeperMu.Unlock()
 			if stop != nil {
 				close(stop)
+				// The LAST instrumented run is gone, so our marker must stop
+				// vouching for whatever is written next. See
+				// sealGrokDirectAttribution.
+				sealGrokDirectAttribution()
 				return
 			}
 			// Runs remain, and this release may have RESOLVED a disagreement:
@@ -627,6 +631,44 @@ func reassertGrokDirectAttribution() {
 		return
 	}
 	ensureGrokBillingIdentityNamed(grokPersistentHome(), identity)
+}
+
+// sealGrokDirectAttribution closes the attribution window the last direct run
+// leaves behind: it names the contested sentinel once no instrumented run is
+// live, so records written after that point bind to a name no account matches.
+//
+// Without it our marker keeps vouching for the log indefinitely. A later Grok
+// invocation OUTSIDE the agent — a `grok login` to another account, or an
+// API-key override while the cached login is still ours — writes an
+// identity-less billing record beneath our stale marker, and
+// grokRecordBelongsToCurrentAccount then accepts that account's record as ours
+// and publishes one subscription's utilization under another. Refusing it costs
+// an observation the agent never produced anyway; accepting it is a billing lie.
+//
+// The completed run keeps its own attribution: a record binds to the nearest
+// identity ABOVE it, so a marker appended after that record cannot unbind it.
+//
+// A run that re-armed between the release and this append is asserted normally
+// instead — the whole decision is taken under grokBillingAttributionSerialize,
+// the same lock ensureGrokBillingIdentityNamed serializes its own read-then-
+// append with, so a concurrent arm either observes this seal or replaces it.
+func sealGrokDirectAttribution() {
+	base := grokPersistentHome()
+	if base == "" {
+		return
+	}
+
+	grokBillingAttributionSerialize.Lock()
+	defer grokBillingAttributionSerialize.Unlock()
+
+	identity, armed := grokDirectAttributionAssertion()
+	if !armed {
+		identity = grokContestedBillingIdentity
+	}
+	if grokBillingIdentityIsNewest(base, identity) {
+		return
+	}
+	_ = appendGrokBillingIdentityValue(base, identity)
 }
 
 // runGrokBillingAttributionKeeper re-asserts attribution until the last armed

@@ -715,7 +715,7 @@ func restoreArmedDirectBillingRecordDisplacedByRace(
 	if managedNewest, ok := newestTrustedGrokBillingRecordFor(persistentHome, identities, trustedThrough); ok {
 		managedObservedAt = managedNewest.ObservedAt
 	}
-	pair, ok := grokDirectBillingPairToPreserve(persistentHome, directIdentity, managedObservedAt)
+	pair, ok := grokDirectBillingPairToPreserve(persistentHome, directIdentity, identity, managedObservedAt)
 	if !ok {
 		return false, nil
 	}
@@ -773,7 +773,7 @@ func grokBillingPayloadWithDirectMarker(
 			// merge: a narrowed window beats an unattributed direct run.
 			return payload, true
 		}
-		if pair, ok := grokDirectBillingPairToPreserve(persistentHome, directIdentity, observedAt); ok {
+		if pair, ok := grokDirectBillingPairToPreserve(persistentHome, directIdentity, identity, observedAt); ok {
 			return append(payload, pair...), false
 		}
 		payload = append(payload, directLine...)
@@ -795,14 +795,28 @@ func grokBillingPayloadWithDirectMarker(
 // caller falls back to the bare marker: attribution for the direct run's NEXT
 // record still beats writing nothing for it.
 //
+// The timestamp comparison is the right tiebreak only while both records could
+// be published on this device. When the persistent home's credentials resolve to
+// the DIRECT account and not to `mergedIdentity`, leaving the merged record last
+// serves nobody: every gather here reads under the direct account's identities,
+// stops at that foreign record and reports nothing, while the keeper sees a
+// direct marker as newest and never repairs it — the direct account goes dark
+// with a perfectly good record of its own sitting in the file. Preserving it
+// then is not republishing a stale reading either: it is that account's OWN
+// newest observation, and the account it displaces has no reader left here.
+//
 // Callers must hold grokBillingAttributionSerialize.
 func grokDirectBillingPairToPreserve(
-	persistentHome, directIdentity string,
+	persistentHome, directIdentity, mergedIdentity string,
 	observedAt time.Time,
 ) ([]byte, bool) {
 	newest, ok := newestTrustedGrokBillingRecordFor(
 		persistentHome, []string{directIdentity}, time.Now().Add(grokBillingMaxClockSkew))
-	if !ok || !newest.ObservedAt.After(observedAt) {
+	if !ok {
+		return nil, false
+	}
+	if !newest.ObservedAt.After(observedAt) &&
+		!grokDirectAccountOwnsTheReader(persistentHome, directIdentity, mergedIdentity) {
 		return nil, false
 	}
 	pair, err := grokManagedBillingPayload(directIdentity, newest)
@@ -810,6 +824,38 @@ func grokDirectBillingPairToPreserve(
 		return nil, false
 	}
 	return pair, true
+}
+
+// grokDirectAccountOwnsTheReader reports whether the armed DIRECT account is the
+// one a gather on this device would read under, while the account being merged
+// is not. It is the only condition under which an older record may take the
+// log's last line: the record it displaces is unreadable here regardless, so the
+// choice is between one account's real observation and nothing at all.
+//
+// Both sides are resolved from the SAME candidate list the gather uses
+// (grokIdentityCandidates), and folded with grokIdentityFoldKey, so this cannot
+// disagree with grokRecordBelongsToCurrentAccount about who the current login
+// is. The contested sentinel is never a login.
+func grokDirectAccountOwnsTheReader(persistentHome, directIdentity, mergedIdentity string) bool {
+	candidates := grokIdentityCandidates(persistentHome)
+	return grokIdentityAmongCandidates(candidates, directIdentity) &&
+		!grokIdentityAmongCandidates(candidates, mergedIdentity)
+}
+
+// grokIdentityAmongCandidates reports whether `identity` is one of the account
+// values the current credentials resolve to.
+func grokIdentityAmongCandidates(candidates []string, identity string) bool {
+	identity = strings.TrimSpace(identity)
+	if identity == "" || strings.EqualFold(identity, grokContestedBillingIdentity) {
+		return false
+	}
+	key := grokIdentityFoldKey(identity)
+	for _, candidate := range candidates {
+		if key == grokIdentityFoldKey(candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 // restoreGrokBillingRecordDisplacedByRace re-appends this account's newest

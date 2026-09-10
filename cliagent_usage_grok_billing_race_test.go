@@ -436,3 +436,56 @@ func TestPersistGrokManagedBillingSnapshot_DirectRepairWritesNothingWhenNothingW
 			"post-write repair re-appended a record that was never displaced", got)
 	}
 }
+
+// The timestamp tiebreak is only sound while both accounts still have a reader
+// here. When the persistent home's credentials have moved to the armed DIRECT
+// account, leaving the managed account's newer record last serves nobody: every
+// gather on this device reads under the direct account, stops at that foreign
+// record and publishes nothing, while the keeper sees a direct marker as newest
+// and never repairs it — the live account goes dark with a usable record of its
+// own already in the file.
+func TestPersistGrokManagedBillingSnapshot_KeepsTheLiveDirectAccountReadable(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	// The persistent login is account B — the account the direct run is using.
+	persistent := helperGrokHomeWithAccount(t, "acct-2")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+
+	finish := startGrokBillingAttributionKeeper("acct-2")
+	defer finish()
+	helperAppendGrokLogLine(t, persistent,
+		`{"ts":"2026-08-19T12:00:00Z","msg":"session start","ctx":{"user_id":"acct-2"}}`)
+	direct := time.Now().Add(-3 * time.Hour).UTC().Format(time.RFC3339)
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine(direct, 77, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	// Managed account A exits with a NEWER receipt than B's.
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine(time.Now().Add(-1*time.Minute).UTC().Format(time.RFC3339), 12,
+			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	if _, err := persistGrokManagedBillingSnapshot(isolated, persistent); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	published, ok := readGrokBillingSnapshot(persistent, grokIdentityCandidates(persistent))
+	if !ok {
+		t.Fatal("the live direct account can no longer read anything: the merge left " +
+			"a foreign record last and nothing on this device will ever publish it")
+	}
+	if published.UsedPercent != 77 {
+		t.Fatalf("published percent = %v, want 77 — the live account's own record",
+			published.UsedPercent)
+	}
+
+	// Account A keeps its merged record in the file, so a device that logs back
+	// into it later still reads it — it is preceded, not removed.
+	if _, ok := newestTrustedGrokBillingRecordFor(
+		persistent, []string{"acct-1"}, time.Now().Add(grokBillingMaxClockSkew)); !ok {
+		t.Fatal("the merged managed record was lost, not merely preceded")
+	}
+}

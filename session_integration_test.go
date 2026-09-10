@@ -1067,8 +1067,15 @@ func TestSessionLifecycle_GrokDirectRunAttributesARecordTheCLIDidNotIdentify(t *
 		t.Fatalf("direct Grok lifecycle did not complete: %+v", messages)
 	}
 
-	if got := grokIdentityLineCount(t, realHome); got != 1 {
-		t.Fatalf("identity lines = %d, want exactly 1 appended at session start", got)
+	// Two: the run's own marker at session start, and the contested seal the
+	// last release appends so a LATER out-of-agent record cannot inherit this
+	// account's name. The record this run wrote sits between them, so it stays
+	// attributed — a marker below a record cannot unbind it.
+	if got := grokIdentityLineCount(t, realHome); got != 2 {
+		t.Fatalf("identity lines = %d, want the session-start marker plus the release seal", got)
+	}
+	if last := helperGrokLastLogLine(t, realHome); !strings.Contains(last, grokContestedBillingIdentity) {
+		t.Fatalf("newest marker = %s, want the contested seal after the last direct run exits", last)
 	}
 	usage, ok := grokUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{Detected: true}, time.Now())
 	if !ok || len(usage.Metrics) != 1 {
