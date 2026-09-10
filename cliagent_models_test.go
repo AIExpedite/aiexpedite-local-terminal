@@ -102,8 +102,10 @@ func TestParseCodexModelsCacheKeepsListedModelsInPriorityOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, ok := parseCodexModelsCache(cache)
-	if !ok || !got.Exhaustive {
-		t.Fatalf("expected an exhaustive parse, got ok=%v %#v", ok, got)
+	if !ok || got.Exhaustive {
+		// A server-fetched cache only a `codex` run refreshes is a floor: the
+		// catalog can gain a model with no binary upgrade (Codex round 5).
+		t.Fatalf("expected a conclusive, NON-exhaustive parse, got ok=%v %#v", ok, got)
 	}
 	want := []cliAgentModelDetail{
 		{ID: "gpt-6-astra", Label: "GPT-6-Astra", Efforts: []string{"low", "medium", "high", "xhigh", "max", "ultra"}, DefaultEffort: "medium"},
@@ -125,8 +127,8 @@ func TestDiscoverCodexModelsReadsCodexHome(t *testing.T) {
 	}
 	t.Setenv("CODEX_HOME", "")
 	got, ok := discoverCodexModels(home, "codex-cli 0.153.4")
-	if !ok || len(got.Models) != 1 || got.Models[0].ID != "gpt-6-astra" || !got.Exhaustive {
-		t.Fatalf("got ok=%v %#v", ok, got)
+	if !ok || len(got.Models) != 1 || got.Models[0].ID != "gpt-6-astra" || got.Exhaustive {
+		t.Fatalf("got ok=%v %#v (a Codex cache is never exhaustive)", ok, got)
 	}
 	if _, ok := discoverCodexModels(t.TempDir(), "codex-cli 0.153.4"); ok {
 		t.Fatal("a missing cache is inconclusive, not empty")
@@ -192,6 +194,9 @@ func TestCodexCacheMatchesInstalled(t *testing.T) {
 func TestReconcileCodexDiscoveryKeepsAListedConfiguredModelExhaustive(t *testing.T) {
 	in := cliAgentModelDiscovery{Exhaustive: true, Models: []cliAgentModelDetail{{ID: "gpt-6-astra", Efforts: []string{"low", "high"}}}}
 	got := reconcileCodexDiscovery(in, "0.153.4", "codex-cli 0.153.4", "gpt-6-astra")
+	// reconcile itself keeps a listed configured model from prepending twice
+	// and leaves the input's exhaustive flag alone when versions match; the
+	// Codex parser now always hands it false (Codex round 5).
 	if !got.Exhaustive || got.DefaultModel != "gpt-6-astra" || len(got.Models) != 1 {
 		t.Fatalf("got %#v", got)
 	}

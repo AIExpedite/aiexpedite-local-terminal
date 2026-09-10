@@ -445,7 +445,12 @@ func parseCodexModelsCache(cache codexModelsCacheFile) (cliAgentModelDiscovery, 
 		if effort, ok := normalizeEffortToken(model.DefaultReasoningLevel); ok && containsString(detail.Efforts, effort) {
 			detail.DefaultEffort = effort
 		}
-		if len(detail.Efforts) == 0 {
+		// "Takes no effort flag" only when Codex itself listed NO levels. A
+		// model whose levels are all outside the shared union (a level Codex
+		// introduced that this build does not know) has an UNKNOWN scale —
+		// reporting NoEffort there would make the resolver drop the flag on a
+		// model that accepts one.
+		if len(model.SupportedReasoningLevels) == 0 {
 			detail.NoEffort = true
 		}
 		kept = append(kept, ranked{detail: detail, priority: model.Priority, index: index})
@@ -459,7 +464,13 @@ func parseCodexModelsCache(cache codexModelsCacheFile) (cliAgentModelDiscovery, 
 		}
 		return kept[i].index < kept[j].index
 	})
-	out := cliAgentModelDiscovery{Exhaustive: true}
+	// A floor, never the whole list: this file is a server-fetched cache that
+	// only a `codex` run refreshes, so Codex's catalog can gain a model with
+	// no binary upgrade and the cache — same client_version and all — would
+	// not know. An exhaustive claim here would let routing veto a pin to a
+	// model Codex already runs. (The version comparison in reconcile still
+	// drives Grok's cache, which a live list probe refreshes.)
+	out := cliAgentModelDiscovery{Exhaustive: false}
 	for _, item := range kept {
 		out.Models = append(out.Models, boundedModelDetail(item.detail))
 	}

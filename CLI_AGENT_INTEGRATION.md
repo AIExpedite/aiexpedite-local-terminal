@@ -378,6 +378,14 @@ Three rules keep a probe from doing damage on the way:
   install or a cleared cache reports the top-level `model` from `config.toml`
   (basic `"…"` or literal `'…'` string) as a one-model, non-exhaustive floor,
   not nothing.
+- **A Codex cache is ALWAYS a floor.** `models_cache.json` is server-fetched
+  and only a `codex` run refreshes it, so the catalog can gain a model with no
+  binary upgrade and a same-`client_version` cache would not know; Codex
+  discovery is therefore never exhaustive (the writer-version comparison still
+  drives Grok, whose list probe refreshes its cache live). And a model whose
+  listed levels are all outside the shared union has an UNKNOWN scale —
+  `noEffort` is reported only when Codex listed no levels at all, because
+  `noEffort` tells the resolver to drop the flag.
 - **Cache-only Grok discovery is a floor.** When the list command fails but the
   cache reads, `modelsExhaustive` is false regardless of the build-version
   match — Grok fetches this catalog from its backend, so it can gain a model
