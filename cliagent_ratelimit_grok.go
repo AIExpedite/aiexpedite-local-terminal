@@ -115,6 +115,39 @@ func grokAccountLimitNoticeScope(base string) grokLimitNoticeScope {
 	return grokLimitNoticeScope{fingerprint: grokAccountFingerprintFor(base), cacheable: true}
 }
 
+// grokManagedRunLimitNoticeScope freezes the scope for a MANAGED (ACP or
+// maintenance-smoke) run whose child is spawned as `launch` against the
+// isolated home `base`.
+//
+// The copied login is the producer only when the child carries no credential of
+// its own, and isolation does not guarantee that. GROK_HOME neutralises the
+// user-level config layers by omission, but it redirects neither the system
+// layers nor the workspace `.grok/config.toml` that Grok walks upward from the
+// child's cwd to find — and with Config.EnableGrokAPIKeyFallback the ACP path
+// deliberately preserves XAI_API_KEY and copies the persisted `[model] api_key`
+// line into the isolated config. Any of those bills an account the copied login
+// does not name, so filing that account's approaching/reached notice under the
+// copied login's fingerprint shows one account's limit on another's card for
+// grokLimitNoticeTTL.
+//
+// grokDirectRunCredentialOverride answers exactly that question for a spawn —
+// its inputs are a child's environment, cwd and argv, and the home whose cached
+// login is the claim under test — so the managed arm reuses it rather than
+// growing a second, drifting notion of what a credential is. Conservative the
+// same way: an override that is merely AVAILABLE contests, because which
+// credential the CLI resolves is its own per-turn decision inside a process we
+// do not observe. Contesting costs this session's notice; naming it wrong
+// publishes one account's limit as another's.
+func grokManagedRunLimitNoticeScope(launch grokDirectRunLaunch, base string) grokLimitNoticeScope {
+	if base == "" {
+		return grokLimitNoticeScope{}
+	}
+	if grokDirectRunCredentialOverride(launch, base) {
+		return grokLimitNoticeScope{}
+	}
+	return grokAccountLimitNoticeScope(base)
+}
+
 // grokDirectRunLimitNoticeScope freezes the scope for a DIRECT (PTY) run.
 //
 // identity is the value the attribution keeper was ARMED with — the single

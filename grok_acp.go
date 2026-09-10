@@ -490,6 +490,16 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 	env = setEnvVar(env, "GROK_HOME", isolatedHome)
 	proc.Env = env
 
+	// The limit-notice scope is frozen here, from the credential surface the
+	// child is actually spawned with rather than from the isolated home alone.
+	// The copied OAuth login is the billed account only when nothing else is in
+	// play: with AllowAPIKeyFallback the env keeps XAI_API_KEY and the isolated
+	// config carries the persisted `[model] api_key`, either of which can belong
+	// to a different account, and neither the system config layers nor the
+	// workspace `.grok/config.toml` under `cwd` is redirected by GROK_HOME.
+	limitNoticeScope := grokManagedRunLimitNoticeScope(
+		grokDirectRunLaunch{Env: env, Cwd: cwd, Args: args}, isolatedHome)
+
 	// cleanupFailedStart removes the per-session temp dir on any pre-spawn
 	// failure path. Once the child is successfully started, ownership of the
 	// dir transfers to waitForExit (which removes it after the process exits),
@@ -550,7 +560,7 @@ func (m *GrokACPManager) Start(id, cwd string, extraArgs []string, workspaceID, 
 		WorkspaceRoot:    resolvedRoot,
 		IsolatedHome:     isolatedHome,
 		PersistentHome:   persistentHome,
-		limitNoticeScope: grokAccountLimitNoticeScope(isolatedHome),
+		limitNoticeScope: limitNoticeScope,
 		status:           "running",
 		done:             make(chan struct{}),
 		processExited:    make(chan struct{}),

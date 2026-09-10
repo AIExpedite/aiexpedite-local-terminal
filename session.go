@@ -534,11 +534,18 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	var finishGrokAttribution func()
 	// Frozen here, next to the arm, for the same reason the arm is: the child
 	// bills the credentials it is SPAWNED with. A maintenance smoke bills the
-	// login copied into its isolated home; a direct run bills the persistent
-	// home unless an override contests it.
+	// login copied into its isolated home and a direct run the persistent one —
+	// in both cases only while nothing else the child carries contests it.
 	var grokLimitScope grokLimitNoticeScope
 	if isGrokCommand(command) && isolatedGrokHome != "" {
-		grokLimitScope = grokAccountLimitNoticeScope(isolatedGrokHome)
+		// From the credential surface the smoke child is SPAWNED with, not the
+		// isolated home alone: sanitizeGrokMaintenanceSmokeEnv strips the env
+		// credentials, but a system config layer (`/etc/grok/...`) is not
+		// redirected by GROK_HOME and can still pin a key for an account the
+		// copied login does not name. Caching that account's notice under this
+		// fingerprint would show one account's limit on another's card.
+		grokLimitScope = grokManagedRunLimitNoticeScope(
+			grokDirectRunLaunch{Env: filtered, Cwd: proc.Dir, Args: cliArgs}, isolatedGrokHome)
 	}
 	if isGrokCommand(command) && isolatedGrokHome == "" {
 		// The identity is CAPTURED here and re-asserted as-is for the life of the

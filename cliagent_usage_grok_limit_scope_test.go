@@ -104,3 +104,97 @@ func TestGrokLimitNoticeScope_FrozenAtSessionStart(t *testing.T) {
 		t.Fatalf("Severity=%q, want %q", got.Severity, grokLimitReached)
 	}
 }
+
+// TestGrokManagedRunLimitNoticeScope_APIKeyFallbackIsNotCacheable pins the
+// managed half of the same hazard. With Config.EnableGrokAPIKeyFallback the ACP
+// path deliberately preserves XAI_API_KEY on the child's environment, so the
+// account the child bills need not be the OAuth login copied into its isolated
+// home. Filing that child's reached notice under the copied login's fingerprint
+// would show one account's limit on another's card for grokLimitNoticeTTL.
+func TestGrokManagedRunLimitNoticeScope_APIKeyFallbackIsNotCacheable(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "grok_usage_limit.json")
+	t.Setenv("AIEXPEDITE_GROK_LIMIT_CACHE", cache)
+	stubGrokSystemConfigLayers(t)
+
+	isolated := t.TempDir()
+	seedGrokHomeWithLogin(t, isolated)
+	launch := grokDirectRunLaunch{
+		Env: []string{"GROK_HOME=" + isolated, "XAI_API_KEY=xai-another-account"},
+		Cwd: t.TempDir(),
+	}
+
+	scope := grokManagedRunLimitNoticeScope(launch, isolated)
+	if scope.cacheable {
+		t.Fatalf("an inherited API key must contest the managed scope: %+v", scope)
+	}
+
+	captureGrokUsageLimitLine(grokLimitScopeTestFrame, time.Now(), scope)
+	if _, err := os.Stat(cache); !os.IsNotExist(err) {
+		t.Fatalf("an API-key managed producer must write no notice cache: %v", err)
+	}
+}
+
+// TestGrokManagedRunLimitNoticeScope_CarriedOverConfigKeyIsNotCacheable covers
+// the second fallback channel: setupIsolatedGrokHome copies the persisted
+// `[model] api_key` line into the ISOLATED config.toml on the same opt-in, so
+// isolation alone is no proof that the copied login is the producer.
+func TestGrokManagedRunLimitNoticeScope_CarriedOverConfigKeyIsNotCacheable(t *testing.T) {
+	t.Setenv("AIEXPEDITE_GROK_LIMIT_CACHE", filepath.Join(t.TempDir(), "grok_usage_limit.json"))
+	stubGrokSystemConfigLayers(t)
+
+	isolated := t.TempDir()
+	seedGrokHomeWithLogin(t, isolated)
+	if err := os.WriteFile(filepath.Join(isolated, "config.toml"),
+		[]byte("[cli]\nauto_update = false\n\n[model]\napi_key = \"xai-another-account\"\n"), 0o600); err != nil {
+		t.Fatalf("write isolated config: %v", err)
+	}
+
+	scope := grokManagedRunLimitNoticeScope(
+		grokDirectRunLaunch{Env: []string{"GROK_HOME=" + isolated}, Cwd: t.TempDir()}, isolated)
+	if scope.cacheable {
+		t.Fatalf("a carried-over config api_key must contest the managed scope: %+v", scope)
+	}
+}
+
+// TestGrokManagedRunLimitNoticeScope_CopiedLoginStaysObservable is the other
+// direction: the ordinary managed session — no API key anywhere — must keep
+// caching under the copied login, or contesting would cost every ACP and smoke
+// run its limit banner.
+func TestGrokManagedRunLimitNoticeScope_CopiedLoginStaysObservable(t *testing.T) {
+	cache := filepath.Join(t.TempDir(), "grok_usage_limit.json")
+	t.Setenv("AIEXPEDITE_GROK_LIMIT_CACHE", cache)
+	stubGrokSystemConfigLayers(t)
+
+	isolated := t.TempDir()
+	seedGrokHomeWithLogin(t, isolated)
+	if err := os.WriteFile(filepath.Join(isolated, "config.toml"),
+		[]byte("[cli]\nauto_update = false\n"), 0o600); err != nil {
+		t.Fatalf("write isolated config: %v", err)
+	}
+
+	scope := grokManagedRunLimitNoticeScope(
+		grokDirectRunLaunch{Env: []string{"GROK_HOME=" + isolated}, Cwd: t.TempDir()}, isolated)
+	if !scope.cacheable || scope.fingerprint != grokAccountFingerprintFor(isolated) {
+		t.Fatalf("an uncontested managed producer must cache under the copied login: %+v", scope)
+	}
+
+	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	captureGrokUsageLimitLine(grokLimitScopeTestFrame, now, scope)
+	got, ok := loadGrokUsageLimitState(scope.fingerprint, now)
+	if !ok {
+		t.Fatalf("the copied login's own notice must be cached")
+	}
+	if got.Severity != grokLimitReached {
+		t.Fatalf("Severity=%q, want %q", got.Severity, grokLimitReached)
+	}
+}
+
+// stubGrokSystemConfigLayers removes the real machine's `/etc/grok` layers from
+// the credential scan. They are not redirected by GROK_HOME, so a host that
+// happens to pin a key would otherwise contest every case here.
+func stubGrokSystemConfigLayers(t *testing.T) {
+	t.Helper()
+	prev := grokSystemConfigPathsFn
+	grokSystemConfigPathsFn = func() []string { return nil }
+	t.Cleanup(func() { grokSystemConfigPathsFn = prev })
+}
