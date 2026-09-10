@@ -25,7 +25,10 @@ func TestGrokTOMLWalk_FindsAssignmentSeparatorOutsideQuotedKeys(t *testing.T) {
 	}); !complete {
 		t.Fatal("sweep reported incomplete for a config it read to the end")
 	}
-	value, ok := keys["model.foo=bar.api_key"]
+	// The sweep hands back RE-ENCODED key paths, so a segment that is not a
+	// bare key keeps its quotes — that boundary is what stops a quoted
+	// `"model.api_key"` from impersonating the two-segment credential.
+	value, ok := keys[`model."foo=bar".api_key`]
 	if !ok {
 		t.Fatalf("keys = %v, want the per-model credential whose model name contains an `=`", keys)
 	}

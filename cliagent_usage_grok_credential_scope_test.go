@@ -485,6 +485,13 @@ func TestGrokConfigPinsCredential_QuotedTOMLKeys(t *testing.T) {
 		{"quoted key inside inline table", "model = { \"api_key\" = \"xai-abc\" }\n", true},
 		{"empty quoted credential", "[model]\n\"api_key\" = \"\"\n", false},
 		{"dot inside quotes is one segment", "[other]\n\"model.api_key\" = \"xai-abc\"\n", false},
+		// The same collapse at the ROOT: joining the decoded segments plainly
+		// turned this ONE quoted key into the two-segment credential path, so
+		// an unrelated setting contested an honest direct run's attribution.
+		{"root dot inside quotes is one segment", "\"model.api_key\" = \"xai-abc\"\n", false},
+		{"root dot inside single quotes is one segment", "'model.api_key' = \"xai-abc\"\n", false},
+		{"quoted section with a dot is one table", "[\"model.grok-4\"]\napi_key = \"xai-abc\"\n", false},
+		{"quoted dot inside an inline table is one key", "{}\n\"model.api_key\" = { }\n", false},
 		{"unrelated quoted key", "[model]\n\"base_url\" = \"https://x\"\n", false},
 		// A dotted key inside a table is relative to it, so `[model]` +
 		// `grok-4.api_key` is the per-model credential `model.grok-4.api_key`.
@@ -663,6 +670,32 @@ func TestReadGrokPersistedAPIKey_ReEncodesAQuotedModelSection(t *testing.T) {
 // Copying `api_key = """` verbatim writes a truncated string that breaks the
 // whole file for the child's parser; grokConfigPinsCredential still contests
 // the same config, so the run loses its carryover and never its attribution.
+// TestReadGrokPersistedAPIKey_IgnoresAQuotedDottedKey pins that the single
+// quoted key `"model.api_key"` is NOT promoted into the isolated child's real
+// `[model] api_key`. It is an unrelated setting whose decoded text merely
+// contains the separator; carrying its value over would start the child with a
+// credential the user never pinned for the model.
+func TestReadGrokPersistedAPIKey_IgnoresAQuotedDottedKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path,
+		[]byte("\"model.api_key\" = \"xai-unrelated\"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if section, value := readGrokPersistedAPIKey(path, ""); section != "" || value != "" {
+		t.Fatalf("readGrokPersistedAPIKey = (%q, %q), want no carryover", section, value)
+	}
+	// The per-model spelling collapses the same way: `model."grok-4.api_key"`
+	// is one quoted segment under `model`, not that model's credential.
+	if err := os.WriteFile(path,
+		[]byte("[model]\n\"grok-4.api_key\" = \"xai-unrelated\"\n"), 0o600); err != nil {
+		t.Fatalf("rewrite config: %v", err)
+	}
+	if section, value := readGrokPersistedAPIKey(path, "grok-4"); section != "" || value != "" {
+		t.Fatalf("readGrokPersistedAPIKey = (%q, %q), want no carryover", section, value)
+	}
+}
+
 func TestReadGrokPersistedAPIKey_SkipsAMultilineValue(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")

@@ -1472,7 +1472,11 @@ func readGrokPersistedAPIKey(path, runtimeModel string) (string, string) {
 	var perModelSection, perModelValue string
 	perModelMatch := ""
 	if runtimeModel != "" {
-		perModelMatch = "model." + strings.ToLower(runtimeModel) + ".api_key"
+		// Built through the SAME encoding the sweep hands back, so a model
+		// whose name needs a quoted key (`grok.4`) is compared as
+		// `model."grok.4".api_key` rather than as the three-segment
+		// `model.grok.4.api_key` it is not.
+		perModelMatch = encodeGrokTOMLKeyPath([]string{"model", strings.ToLower(runtimeModel), "api_key"})
 	}
 	walkGrokTOMLAssignments(path, func(key, value string) bool {
 		// A value that OPENS a multiline string is only its first line here, so
@@ -1583,14 +1587,14 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) (c
 				}
 				body = line[2 : len(line)-2]
 			}
-			currentSection = strings.Join(splitGrokTOMLKeyPath(body), ".")
+			currentSection = grokTOMLKeyPath(body)
 			continue
 		}
 		eq := grokTOMLAssignmentIndex(line)
 		if eq <= 0 {
 			continue
 		}
-		key := strings.Join(splitGrokTOMLKeyPath(line[:eq]), ".")
+		key := grokTOMLKeyPath(line[:eq])
 		if currentSection != "" {
 			// A dotted key inside a table is RELATIVE to that table: under
 			// `[model]`, `grok-4.api_key` is `model.grok-4.api_key`. Prefixing
@@ -1720,6 +1724,24 @@ func splitGrokTOMLKeyPath(raw string) []string {
 	}
 	flush()
 	return segments
+}
+
+// grokTOMLKeyPath normalises a raw TOML key path — a section header's body or
+// the left-hand side of an assignment — into the dotted, lower-cased form every
+// key rule in this file compares against.
+//
+// It re-ENCODES the split segments rather than joining them raw, because a
+// decoded segment can itself contain the separator: the single quoted key
+// `"model.api_key" = 1` decodes to ONE segment whose text is `model.api_key`,
+// and joining it plainly produced the exact string the two-segment
+// `model.api_key = "xai-..."` produces. That collapse made an unrelated key
+// impersonate the credential — grokConfigPinsCredential contested an honest
+// direct run's attribution, and readGrokPersistedAPIKey would promote the
+// unrelated value into a real `[model] api_key` in the isolated child config.
+// Quoting a segment that is not a bare key keeps the boundary, so only keys the
+// child's own parser reads as a credential match one.
+func grokTOMLKeyPath(raw string) string {
+	return encodeGrokTOMLKeyPath(splitGrokTOMLKeyPath(raw))
 }
 
 // encodeGrokTOMLKeyPath re-encodes decoded key segments into a TOML key path,
@@ -2087,7 +2109,7 @@ func grokInlineTableMatchesAt(key, value string, match func(key, value string) b
 		if eq <= 0 {
 			continue
 		}
-		fieldKey := strings.Join(splitGrokTOMLKeyPath(field[:eq]), ".")
+		fieldKey := grokTOMLKeyPath(field[:eq])
 		if key != "" {
 			fieldKey = key + "." + fieldKey
 		}
