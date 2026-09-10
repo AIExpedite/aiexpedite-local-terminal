@@ -51,10 +51,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 	"golang.org/x/mod/semver"
@@ -1535,9 +1537,13 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) {
 		if eq <= 0 {
 			continue
 		}
-		keySegments := splitGrokTOMLKeyPath(line[:eq])
-		key := strings.Join(keySegments, ".")
-		if currentSection != "" && len(keySegments) == 1 {
+		key := strings.Join(splitGrokTOMLKeyPath(line[:eq]), ".")
+		if currentSection != "" {
+			// A dotted key inside a table is RELATIVE to that table: under
+			// `[model]`, `grok-4.api_key` is `model.grok-4.api_key`. Prefixing
+			// only single-segment keys left the per-model credential looking
+			// unscoped, so the attribution guard saw no pinned credential and
+			// named the cached login for an API-key-billed run.
 			key = currentSection + "." + key
 		}
 		if !visit(key, strings.TrimSpace(line[eq+1:])) {
@@ -1571,6 +1577,11 @@ func splitGrokTOMLKeyPath(raw string) []string {
 		c := raw[i]
 		if quote != 0 {
 			if c == '\\' && quote == '"' && i+1 < len(raw) {
+				if r, width, ok := decodeGrokTOMLEscape(raw[i+1:]); ok {
+					cur.WriteRune(r)
+					i += width
+					continue
+				}
 				i++
 				cur.WriteByte(raw[i])
 				continue
@@ -1593,6 +1604,57 @@ func splitGrokTOMLKeyPath(raw string) []string {
 	}
 	flush()
 	return segments
+}
+
+// decodeGrokTOMLEscape decodes ONE escape sequence from the body of a TOML
+// basic-quoted key, returning the rune, how many bytes of `s` it consumed and
+// whether `s` opened with an escape TOML actually defines.
+//
+// Grok's own parser resolves `"api_\u006bey"` to `api_key`; merely dropping the
+// backslash produced `api_u006bey`, which matched no credential key, so the
+// billing-attribution guard reported "no pinned credential" and published an
+// API-key run's spend under the cached-login account. An UNDEFINED escape is
+// reported as such rather than guessed at — the caller keeps its previous
+// literal-next-byte behaviour there, which is what a best-effort sweep over a
+// possibly-invalid config should do.
+func decodeGrokTOMLEscape(s string) (rune, int, bool) {
+	if s == "" {
+		return 0, 0, false
+	}
+	switch s[0] {
+	case 'b':
+		return '\b', 1, true
+	case 't':
+		return '\t', 1, true
+	case 'n':
+		return '\n', 1, true
+	case 'f':
+		return '\f', 1, true
+	case 'r':
+		return '\r', 1, true
+	case '"':
+		return '"', 1, true
+	case '\\':
+		return '\\', 1, true
+	case 'u', 'U':
+		width := 4
+		if s[0] == 'U' {
+			width = 8
+		}
+		if len(s) < 1+width {
+			return 0, 0, false
+		}
+		v, err := strconv.ParseUint(s[1:1+width], 16, 32)
+		if err != nil {
+			return 0, 0, false
+		}
+		r := rune(v)
+		if !utf8.ValidRune(r) {
+			return 0, 0, false
+		}
+		return r, 1 + width, true
+	}
+	return 0, 0, false
 }
 
 // grokModelCredentialKeySuffixes are the `[model]` assignments that hand a Grok

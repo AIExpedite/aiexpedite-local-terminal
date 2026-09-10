@@ -485,6 +485,17 @@ func TestGrokConfigPinsCredential_QuotedTOMLKeys(t *testing.T) {
 		{"empty quoted credential", "[model]\n\"api_key\" = \"\"\n", false},
 		{"dot inside quotes is one segment", "[other]\n\"model.api_key\" = \"xai-abc\"\n", false},
 		{"unrelated quoted key", "[model]\n\"base_url\" = \"https://x\"\n", false},
+		// A dotted key inside a table is relative to it, so `[model]` +
+		// `grok-4.api_key` is the per-model credential `model.grok-4.api_key`.
+		{"dotted key under a section", "[model]\ngrok-4.api_key = \"xai-abc\"\n", true},
+		{"quoted dotted key under a section", "[model]\n\"grok-4\".env_key = \"XAI_KEY\"\n", true},
+		{"dotted key under an unrelated section", "[other]\ngrok-4.api_key = \"xai-abc\"\n", false},
+		// Grok's parser decodes basic-string escapes in a quoted key; leaving
+		// them raw yielded `api_u006bey`, which matched no credential key.
+		{"unicode escape in quoted key", "[model]\n\"api_\\u006bey\" = \"xai-abc\"\n", true},
+		{"long unicode escape in quoted key", "[model]\n\"api_\\U0000006bey\" = \"xai-abc\"\n", true},
+		{"escaped quote keeps the key unrelated", "[model]\n\"api\\\"_key\" = \"xai-abc\"\n", false},
+		{"literal keys do not decode escapes", "[model]\n'api_\\u006bey' = \"xai-abc\"\n", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
