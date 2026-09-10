@@ -236,6 +236,9 @@ func grokDirectRunCredentialOverride(launch grokDirectRunLaunch, base string) bo
 				return true
 			}
 		}
+		if grokConfigLoaderEnvContests(name, value) {
+			return true
+		}
 	}
 	if grokArgsPinCredential(launch.Args) {
 		return true
@@ -244,6 +247,60 @@ func grokDirectRunCredentialOverride(launch grokDirectRunLaunch, base string) bo
 		return true
 	}
 	return grokAnyPinnedCredential(base)
+}
+
+// grokConfigPathEnvVar / grokManagedConfigURLEnvVar are the two environment
+// variables that point xAI's config LOADER somewhere other than the layers
+// grokAnyPinnedCredential scans. They carry no credential themselves, which is
+// why they are not in grokCredentialOverrideEnvVars — they name a configuration
+// that can pin `model.api_key`/`env_key` for the child while every file on the
+// scanned paths stays clean. sanitizeGrokMaintenanceSmokeEnv already strips
+// both (it removes every inherited GROK_*) for exactly that reason; a DIRECT
+// (PTY) run deliberately inherits the user's shell environment, so the
+// attribution guard has to account for them itself.
+const (
+	grokConfigPathEnvVar       = "GROK_CONFIG_PATH"
+	grokManagedConfigURLEnvVar = "GROK_MANAGED_CONFIG_URL"
+)
+
+// grokConfigLoaderEnvContests reports whether one inherited config-loader
+// variable puts the launch's billing account in doubt.
+//
+// A managed-config URL is resolved by the child over the network, from a
+// document this process never sees and cannot re-read at the instant the child
+// loads it, so a non-empty value CONTESTS unconditionally.
+//
+// A config PATH names a local file, so it is inspected with the same
+// credential sweep every other layer gets rather than contesting on presence
+// alone — a developer who points GROK_CONFIG_PATH at an ordinary config keeps
+// their session observable. An unreadable path contests: "we could not look"
+// is not "there is nothing there", and this guard is conservative by
+// construction (over-reporting costs one session's observability,
+// under-reporting publishes one account's spend as another's).
+func grokConfigLoaderEnvContests(name, value string) bool {
+	switch name {
+	case grokManagedConfigURLEnvVar:
+		return true
+	case grokConfigPathEnvVar:
+		return grokLoaderConfigContests(value)
+	}
+	return false
+}
+
+// grokLoaderConfigContests reports whether the config file GROK_CONFIG_PATH
+// names either pins a credential or cannot be read. The stat is what separates
+// the two dismissible cases from each other: a file that is absent or
+// unreadable to US may still be loaded by the child (a race, a permission
+// difference, a path only the child's namespace resolves), so it fails closed.
+func grokLoaderConfigContests(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	if _, err := os.Stat(path); err != nil {
+		return true
+	}
+	return grokConfigPinsCredential(path)
 }
 
 // grokArgsPinCredential reports whether the argv a direct child is spawned with

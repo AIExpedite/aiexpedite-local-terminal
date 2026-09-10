@@ -676,3 +676,56 @@ func TestReadGrokPersistedAPIKey_SkipsAMultilineValue(t *testing.T) {
 		t.Fatal("the same config must still contest attribution")
 	}
 }
+
+// A config-loader variable carries no credential itself, which is why it is not
+// in grokCredentialOverrideEnvVars — it points xAI's loader at a configuration
+// none of the scanned layers contain. GROK_MANAGED_CONFIG_URL resolves over the
+// network from a document this process never sees, so it contests on presence;
+// GROK_CONFIG_PATH names a local file, so it gets the same credential sweep
+// every other layer gets and only contests when it pins one (or cannot be read).
+func TestGrokDirectRunBillingIdentity_ContestsAConfigLoaderOverride(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	helperNoGrokSystemConfigLayers(t)
+	base := helperGrokHomeWithAccount(t, "acct-login")
+
+	dir := t.TempDir()
+	pinned := filepath.Join(dir, "pinned.toml")
+	if err := os.WriteFile(pinned, []byte("[model]\napi_key = \"xai-loader-sentinel\"\n"), 0o600); err != nil {
+		t.Fatalf("write pinned loader config: %v", err)
+	}
+	clean := filepath.Join(dir, "clean.toml")
+	if err := os.WriteFile(clean, []byte("[model]\ndefault = \"grok-4\"\n"), 0o600); err != nil {
+		t.Fatalf("write clean loader config: %v", err)
+	}
+	perModel := filepath.Join(dir, "per-model.toml")
+	if err := os.WriteFile(perModel, []byte("[model.grok-4-fast]\nenv_key = \"OTHER_ACCOUNT_KEY\"\n"), 0o600); err != nil {
+		t.Fatalf("write per-model loader config: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"managed config url", []string{"GROK_MANAGED_CONFIG_URL=https://config-sentinel.invalid/grok.toml"}, grokContestedBillingIdentity},
+		{"config path pinning a key", []string{"GROK_CONFIG_PATH=" + pinned}, grokContestedBillingIdentity},
+		{"config path pinning a per-model env key", []string{"GROK_CONFIG_PATH=" + perModel}, grokContestedBillingIdentity},
+		{"lowercase spelling is still recognised", []string{"grok_config_path=" + pinned}, grokContestedBillingIdentity},
+		// "We could not look" is not "there is nothing there": the child may
+		// still resolve a path we cannot, so an unreadable one fails closed.
+		{"unreadable config path", []string{"GROK_CONFIG_PATH=" + filepath.Join(dir, "absent.toml")}, grokContestedBillingIdentity},
+		// An honest session keeps its observability: a loader pointed at an
+		// ordinary config and an empty value must still name the cached login.
+		{"config path with no credential", []string{"GROK_CONFIG_PATH=" + clean}, "acct-login"},
+		{"empty config path", []string{"GROK_CONFIG_PATH="}, "acct-login"},
+		{"empty managed config url", []string{"GROK_MANAGED_CONFIG_URL="}, "acct-login"},
+		{"unrelated variable", []string{"GROK_DEFAULT_MODEL=grok-4"}, "acct-login"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := grokDirectRunBillingIdentity(grokDirectRunLaunch{Env: tc.env}, base)
+			if got != tc.want {
+				t.Fatalf("identity = %q, want %q for env %v", got, tc.want, tc.env)
+			}
+		})
+	}
+}
