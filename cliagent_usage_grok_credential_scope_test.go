@@ -204,3 +204,126 @@ func TestPersistGrokManagedBillingSnapshot_RefusesAFutureDatedSnapshot(t *testin
 		t.Fatalf("the valid observation must survive the refused merge: %+v ok=%v", snap, ok)
 	}
 }
+
+// `env_key` is the second credential spelling xAI's config supports: instead of
+// carrying the key inline it names the environment variable the child reads it
+// from. classifyGrokSystemSemanticValue already treats every non-empty env_key
+// as a credential, so an attribution guard that recognised only `api_key` would
+// name the cached login for a child billing the API-key account — the exact
+// misattribution the contested sentinel exists to prevent.
+//
+// The pin counts even when the variable it names is unset in THIS process: the
+// child resolves it in its own environment, per turn, and the guard is
+// conservative by construction.
+func TestGrokDirectRunBillingIdentity_ContestsAnEnvKeyCredential(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		launch func(t *testing.T) grokDirectRunLaunch
+		want   string
+	}{
+		{
+			name: "argv env_key",
+			launch: func(*testing.T) grokDirectRunLaunch {
+				return grokDirectRunLaunch{Args: []string{"--config", "model.env_key=MY_XAI_KEY"}}
+			},
+			want: grokContestedBillingIdentity,
+		},
+		{
+			name: "argv per-model envKey",
+			launch: func(*testing.T) grokDirectRunLaunch {
+				return grokDirectRunLaunch{Args: []string{"--config=model.grok-4-fast.envKey=MY_XAI_KEY"}}
+			},
+			want: grokContestedBillingIdentity,
+		},
+		{
+			name: "argv empty env_key",
+			launch: func(*testing.T) grokDirectRunLaunch {
+				return grokDirectRunLaunch{Args: []string{"--config", "model.env_key="}}
+			},
+			want: "acct-login",
+		},
+		{
+			name: "project config env_key",
+			launch: func(t *testing.T) grokDirectRunLaunch {
+				repo := t.TempDir()
+				helperWriteGrokProjectConfig(t, repo, "[model]\nenv_key = \"MY_XAI_KEY\"\n")
+				return grokDirectRunLaunch{Cwd: repo}
+			},
+			want: grokContestedBillingIdentity,
+		},
+		{
+			name: "project config per-model env_key",
+			launch: func(t *testing.T) grokDirectRunLaunch {
+				repo := t.TempDir()
+				helperWriteGrokProjectConfig(t, repo, "[model.grok-4-fast]\nenv_key = \"MY_XAI_KEY\"\n")
+				return grokDirectRunLaunch{Cwd: repo}
+			},
+			want: grokContestedBillingIdentity,
+		},
+		{
+			name: "project config empty env_key",
+			launch: func(t *testing.T) grokDirectRunLaunch {
+				repo := t.TempDir()
+				helperWriteGrokProjectConfig(t, repo, "[model]\nenv_key = \"\"\n")
+				return grokDirectRunLaunch{Cwd: repo}
+			},
+			want: "acct-login",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetGrokBillingAttribution(t)
+			helperNoGrokSystemConfigLayers(t)
+			base := helperGrokHomeWithAccount(t, "acct-login")
+			if got := grokDirectRunBillingIdentity(tc.launch(t), base); got != tc.want {
+				t.Fatalf("identity = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The home config and the system layers carry the same second spelling, and
+// neither is redirected away from the child: the home one is the file a direct
+// run really reads (it is not the neutralised isolated copy), and a system
+// layer survives GROK_HOME isolation entirely.
+func TestGrokDirectRunBillingIdentity_ContestsAnEnvKeyOutsideTheRepository(t *testing.T) {
+	t.Run("home config", func(t *testing.T) {
+		resetGrokBillingAttribution(t)
+		helperNoGrokSystemConfigLayers(t)
+		base := helperGrokHomeWithAccount(t, "acct-login")
+		if err := os.WriteFile(filepath.Join(base, "config.toml"),
+			[]byte("[model]\nenv_key = \"MY_XAI_KEY\"\n"), 0o600); err != nil {
+			t.Fatalf("write home config.toml: %v", err)
+		}
+		if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{}, base); got != grokContestedBillingIdentity {
+			t.Fatalf("identity = %q, want the contested sentinel for a home-pinned env_key", got)
+		}
+	})
+
+	t.Run("system layer", func(t *testing.T) {
+		resetGrokBillingAttribution(t)
+		base := helperGrokHomeWithAccount(t, "acct-login")
+		layer := filepath.Join(t.TempDir(), "managed_config.toml")
+		if err := os.WriteFile(layer, []byte("[model]\nenv_key = \"MY_XAI_KEY\"\n"), 0o600); err != nil {
+			t.Fatalf("write system layer: %v", err)
+		}
+		prev := grokSystemConfigPathsFn
+		grokSystemConfigPathsFn = func() []string { return []string{layer} }
+		t.Cleanup(func() { grokSystemConfigPathsFn = prev })
+
+		if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{}, base); got != grokContestedBillingIdentity {
+			t.Fatalf("identity = %q, want the contested sentinel for a system-pinned env_key", got)
+		}
+	})
+}
+
+// helperWriteGrokProjectConfig writes a repository-scoped `.grok/config.toml`,
+// the layer Grok discovers by walking upward from the child's cwd.
+func helperWriteGrokProjectConfig(t *testing.T, repo, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(repo, ".grok"), 0o700); err != nil {
+		t.Fatalf("mkdir .grok: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".grok", "config.toml"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write project config.toml: %v", err)
+	}
+}

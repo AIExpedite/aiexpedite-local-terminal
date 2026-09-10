@@ -1496,7 +1496,7 @@ func readGrokPersistedAPIKey(path, runtimeModel string) (string, string) {
 // preserved exactly as written. Returning false from `visit` stops the sweep.
 //
 // Single-sourced so readGrokPersistedAPIKey (which wants ONE key for ONE model)
-// and grokConfigHasModelAPIKey (which wants "is any key pinned at all") cannot
+// and grokConfigPinsCredential (which wants "is any credential pinned at all") cannot
 // disagree about what counts as an assignment — a config whose per-model key
 // one of them parses and the other misses would either carry a credential over
 // silently or leave a credential override undetected by the billing-attribution
@@ -1546,19 +1546,32 @@ func walkGrokTOMLAssignments(path string, visit func(key, value string) bool) {
 	}
 }
 
-// grokConfigHasModelAPIKey reports whether a Grok TOML config pins an API key
+// grokModelCredentialKeySuffixes are the `[model]` assignments that hand a Grok
+// child a credential of its own. `api_key` carries the key inline; `env_key`
+// names the environment variable the key is read from — a different spelling of
+// the same credential, which classifyGrokSystemSemanticValue already treats as
+// one. Listing both here is what keeps the semantic classifier and the
+// billing-attribution guard from disagreeing about what a credential is.
+var grokModelCredentialKeySuffixes = []string{"api_key", "env_key"}
+
+// grokConfigPinsCredential reports whether a Grok TOML config pins a credential
 // for ANY model, not just the one a given session runs under.
 //
 // readGrokPersistedAPIKey answers "which key would this model use", which needs
 // a runtime model. A DIRECT (PTY) run has no resolved model — the user picks it
-// inside the CLI — so the attribution guard has to assume any pinned key could
-// be the credential that ends up billed, and a per-model key it could not see
+// inside the CLI — so the attribution guard has to assume any pinned credential
+// could be the one that ends up billed, and a per-model key it could not see
 // would be exactly the misattribution the guard exists to prevent.
-func grokConfigHasModelAPIKey(path string) bool {
+//
+// An `env_key` pin counts even when the variable it names is unset in this
+// process: the child resolves that variable in its OWN environment, per turn,
+// and the guard is conservative by construction — over-reporting costs one
+// session's observability, under-reporting publishes one account's spend as
+// another's.
+func grokConfigPinsCredential(path string) bool {
 	found := false
 	walkGrokTOMLAssignments(path, func(key, value string) bool {
-		if key != "model.api_key" &&
-			!(strings.HasPrefix(key, "model.") && strings.HasSuffix(key, ".api_key")) {
+		if !grokModelCredentialTOMLKey(key) {
 			return true
 		}
 		if strings.TrimSpace(strings.Trim(value, `"'`)) == "" {
@@ -1570,18 +1583,33 @@ func grokConfigHasModelAPIKey(path string) bool {
 	return found
 }
 
-// grokAnyPinnedAPIKey reports whether an API-key credential is pinned for the
-// home `base` or by a system config layer that GROK_HOME cannot redirect.
-func grokAnyPinnedAPIKey(base string) bool {
+// grokModelCredentialTOMLKey reports whether a dotted TOML key from
+// walkGrokTOMLAssignments names a `[model]` credential, in either the root
+// (`model.api_key`) or the documented per-model (`model.<name>.env_key`) form.
+func grokModelCredentialTOMLKey(key string) bool {
+	if !strings.HasPrefix(key, "model.") {
+		return false
+	}
+	for _, suffix := range grokModelCredentialKeySuffixes {
+		if key == "model."+suffix || strings.HasSuffix(key, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// grokAnyPinnedCredential reports whether a credential is pinned for the home
+// `base` or by a system config layer that GROK_HOME cannot redirect.
+func grokAnyPinnedCredential(base string) bool {
 	for _, p := range grokSystemConfigPathsFn() {
-		if grokConfigHasModelAPIKey(p) {
+		if grokConfigPinsCredential(p) {
 			return true
 		}
 	}
 	if base == "" {
 		return false
 	}
-	return grokConfigHasModelAPIKey(filepath.Join(base, "config.toml"))
+	return grokConfigPinsCredential(filepath.Join(base, "config.toml"))
 }
 
 // grokSystemRequirementsPath is the documented system-level pinned-config

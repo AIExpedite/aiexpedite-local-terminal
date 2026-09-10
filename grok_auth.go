@@ -237,17 +237,17 @@ func grokDirectRunCredentialOverride(launch grokDirectRunLaunch, base string) bo
 			}
 		}
 	}
-	if grokArgsPinAPIKey(launch.Args) {
+	if grokArgsPinCredential(launch.Args) {
 		return true
 	}
-	if grokProjectPinnedAPIKey(launch.Cwd) {
+	if grokProjectPinnedCredential(launch.Cwd) {
 		return true
 	}
-	return grokAnyPinnedAPIKey(base)
+	return grokAnyPinnedCredential(base)
 }
 
-// grokArgsPinAPIKey reports whether the argv a direct child is spawned with
-// hands it an API key of its own. xAI documents `-c|--config <key>=value` as the
+// grokArgsPinCredential reports whether the argv a direct child is spawned with
+// hands it a credential of its own. xAI documents `-c|--config <key>=value` as the
 // per-process config-override surface and buildGrokInteractiveArgs forwards it
 // verbatim, so `--config model.api_key=sk-...` is a credential neither the
 // environment nor any config file on this machine ever sees.
@@ -256,39 +256,46 @@ func grokDirectRunCredentialOverride(launch grokDirectRunLaunch, base string) bo
 // flag: the same override is spelled `--config k=v`, `--config=k=v` and `-c k=v`
 // across Grok releases, and over-reporting costs one session's observability
 // while under-reporting publishes one account's spend as another's.
-func grokArgsPinAPIKey(args []string) bool {
+func grokArgsPinCredential(args []string) bool {
 	for _, arg := range args {
-		if grokArgPinsAPIKey(arg) {
+		if grokArgPinsCredential(arg) {
 			return true
 		}
 	}
 	return false
 }
 
-// grokArgPinsAPIKey reports whether ONE argv token assigns a non-empty API key.
+// grokArgPinsCredential reports whether ONE argv token assigns a non-empty credential.
 // The flag form nests the assignment inside the flag's own value
 // (`--config=model.api_key=sk-...`), so a key that is not itself an API-key path
 // is retried against the value once the outer `flag=` has been peeled off.
-func grokArgPinsAPIKey(arg string) bool {
+func grokArgPinsCredential(arg string) bool {
 	key, value, ok := strings.Cut(arg, "=")
 	if !ok {
 		return false
 	}
-	if grokAPIKeyConfigKey(key) {
+	if grokCredentialConfigKey(key) {
 		return strings.TrimSpace(strings.Trim(value, `"'`)) != ""
 	}
-	return grokArgPinsAPIKey(value)
+	return grokArgPinsCredential(value)
 }
 
-// grokAPIKeyConfigKey reports whether a config key path names an API key, in any
-// of the spellings a flag can carry it (`model.api_key`, `model.grok-4.apiKey`,
-// `--api-key`). Separator- and case-insensitive, so a rename across a CLI update
-// does not silently reopen the misattribution this guard closes.
-func grokAPIKeyConfigKey(key string) bool {
+// grokCredentialConfigKey reports whether a config key path names a credential,
+// in any of the spellings a flag can carry it (`model.api_key`,
+// `model.grok-4.apiKey`, `--api-key`, and the `env_key` form that names the
+// variable the key is read from rather than carrying it inline). Separator- and
+// case-insensitive, so a rename across a CLI update does not silently reopen the
+// misattribution this guard closes.
+func grokCredentialConfigKey(key string) bool {
 	key = strings.ToLower(strings.TrimSpace(key))
 	key = strings.TrimLeft(key, "-")
 	key = strings.NewReplacer("_", "", "-", "").Replace(key)
-	return strings.HasSuffix(key, "apikey")
+	for _, suffix := range grokModelCredentialKeySuffixes {
+		if strings.HasSuffix(key, strings.ReplaceAll(suffix, "_", "")) {
+			return true
+		}
+	}
+	return false
 }
 
 // grokProjectConfigMaxDepth bounds the upward `.grok/config.toml` walk. Deep
@@ -296,8 +303,9 @@ func grokAPIKeyConfigKey(key string) bool {
 // session start into an unbounded stat loop.
 const grokProjectConfigMaxDepth = 64
 
-// grokProjectPinnedAPIKey reports whether a repository-scoped
-// `.grok/config.toml` at or above the child's working directory pins an API key.
+// grokProjectPinnedCredential reports whether a repository-scoped
+// `.grok/config.toml` at or above the child's working directory pins a
+// credential (an inline `api_key` or an `env_key` naming one).
 //
 // Grok discovers project config by walking UPWARD from cwd — the same discovery
 // the maintenance smoke isolates itself from by running in an empty directory —
@@ -313,7 +321,7 @@ const grokProjectConfigMaxDepth = 64
 // caller never named.
 //
 // One bounded stat walk per direct session start, never on the streaming path.
-func grokProjectPinnedAPIKey(cwd string) bool {
+func grokProjectPinnedCredential(cwd string) bool {
 	dir := strings.TrimSpace(cwd)
 	if dir == "" {
 		return false
@@ -323,7 +331,7 @@ func grokProjectPinnedAPIKey(cwd string) bool {
 		return false
 	}
 	for depth := 0; depth < grokProjectConfigMaxDepth; depth++ {
-		if grokConfigHasModelAPIKey(filepath.Join(dir, ".grok", "config.toml")) {
+		if grokConfigPinsCredential(filepath.Join(dir, ".grok", "config.toml")) {
 			return true
 		}
 		parent := filepath.Dir(dir)
