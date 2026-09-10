@@ -327,3 +327,138 @@ func helperWriteGrokProjectConfig(t *testing.T, repo, body string) {
 		t.Fatalf("write project config.toml: %v", err)
 	}
 }
+
+// `--api-key-env=OTHER_VAR` normalises to `apikeyenv`, which is a suffix of
+// neither `api_key` nor `env_key`, so the config-key rule could never recognise
+// it and the run was attributed to the cached login while the CLI billed the
+// named environment key. The flag set is the repository's own enumeration
+// (isGrokAuthOverrideArg), and both the joined and the space-separated
+// spellings survive buildGrokInteractiveArgs, so both must contest.
+func TestGrokDirectRunBillingIdentity_ContestsAnAuthOverrideFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"api-key-env joined", []string{"--api-key-env=OTHER_XAI_KEY"}, grokContestedBillingIdentity},
+		{"api-key-env separate", []string{"--api-key-env", "OTHER_XAI_KEY"}, grokContestedBillingIdentity},
+		{"api-key joined", []string{"--api-key=xai-flag-sentinel"}, grokContestedBillingIdentity},
+		{"api-key separate", []string{"--api-key", "xai-flag-sentinel"}, grokContestedBillingIdentity},
+		{"auth-method", []string{"--auth-method", "api-key"}, grokContestedBillingIdentity},
+		// A bare flag with no value still contests: whether the CLI resolves it
+		// is its decision, made inside a process we do not observe.
+		{"bare flag", []string{"--api-key-env"}, grokContestedBillingIdentity},
+		// An unrelated flag that merely LOOKS adjacent must not cost an honest
+		// run its observability.
+		{"unrelated flag", []string{"--api-keys-report", "fix", "the", "bug"}, "acct-login"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetGrokBillingAttribution(t)
+			helperNoGrokSystemConfigLayers(t)
+			base := helperGrokHomeWithAccount(t, "acct-login")
+			if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{Args: tc.args}, base); got != tc.want {
+				t.Fatalf("identity = %q, want %q for args %v", got, tc.want, tc.args)
+			}
+		})
+	}
+}
+
+// `model = { api_key = "..." }` is valid TOML that grok's own parser honours,
+// but the line-oriented sweep only exposes the OUTER key, so the credential
+// lives entirely inside the value. Missing it named the cached login above a
+// record the API-key account was billed for.
+func TestGrokDirectRunBillingIdentity_ContestsAnInlineTableCredential(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config string
+		want   string
+	}{
+		{"root inline table", "model = { api_key = \"xai-inline-sentinel\" }\n", grokContestedBillingIdentity},
+		{"root inline env_key", "model = { env_key = \"OTHER_XAI_KEY\" }\n", grokContestedBillingIdentity},
+		{"per-model inline table", "[model]\ngrok-4-fast = { api_key = \"xai-inline-sentinel\" }\n", grokContestedBillingIdentity},
+		{"nested inline table", "model = { models = { \"grok-4-fast\" = { api_key = \"xai-inline-sentinel\" } } }\n", grokContestedBillingIdentity},
+		{"dotted key inside table", "model = { \"grok-4-fast\".api_key = \"xai-inline-sentinel\" }\n", grokContestedBillingIdentity},
+		// A quoted value containing a brace or a comma must not desynchronise
+		// the field split and hide the assignment that follows it.
+		{"credential after a quoted brace", "model = { name = \"a,{b}\", api_key = \"xai-inline-sentinel\" }\n", grokContestedBillingIdentity},
+		// An empty credential is not one, and an inline table with no
+		// credential in it may not cost an honest run its observability.
+		{"empty inline credential", "model = { api_key = \"\" }\n", "acct-login"},
+		{"unrelated inline table", "model = { temperature = 0.2, name = \"grok-4-fast\" }\n", "acct-login"},
+		// A credential-shaped key under an UNRELATED table is not a credential
+		// grok would bill with.
+		{"credential outside [model]", "logging = { api_key = \"not-a-model-credential\" }\n", "acct-login"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetGrokBillingAttribution(t)
+			helperNoGrokSystemConfigLayers(t)
+			base := helperGrokHomeWithAccount(t, "acct-login")
+			repo := t.TempDir()
+			helperWriteGrokProjectConfig(t, repo, tc.config)
+			if got := grokDirectRunBillingIdentity(grokDirectRunLaunch{Cwd: repo}, base); got != tc.want {
+				t.Fatalf("identity = %q, want %q for config %q", got, tc.want, tc.config)
+			}
+		})
+	}
+}
+
+// File order is APPEND order, not timestamp order. A clock correction on the
+// device (or a managed snapshot merged in after the fact) can leave an older
+// same-account record physically after a newer one. Stopping the supersession
+// scan at the first same-account hit reported the OLDER time, which let a stale
+// managed receipt append over the newer observation this guard protects.
+func TestPersistGrokManagedBillingSnapshot_KeepsTheGreatestOutOfOrderObservation(t *testing.T) {
+	resetGrokBillingAttribution(t)
+	persistent := helperGrokHomeWithAccount(t, "acct-1")
+	isolated := helperGrokHomeWithAccount(t, "acct-1")
+	t.Setenv("GROK_HOME", persistent)
+
+	if err := appendGrokBillingIdentity(persistent); err != nil {
+		t.Fatalf("seed persistent identity: %v", err)
+	}
+	// The newest observation is written FIRST; a backwards clock step then
+	// appends an older one on top of it. Both are this account's and both are
+	// trusted, so neither is skipped for any other reason.
+	newest := time.Now().Add(-57 * time.Minute).UTC().Format(time.RFC3339)
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine(newest, 52, "USAGE_PERIOD_TYPE_WEEKLY",
+			"2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+	helperAppendGrokLogLine(t, persistent,
+		grokBillingLine(time.Now().Add(-61*time.Minute).UTC().Format(time.RFC3339), 40,
+			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	got, ok := newestTrustedGrokBillingObservationFor(persistent,
+		grokIdentityCandidates(persistent), time.Now().Add(grokBillingMaxClockSkew))
+	if !ok || got.UTC().Format(time.RFC3339) != newest {
+		t.Fatalf("newest trusted observation = %v ok=%v, want %s — the scan must "+
+			"take the GREATEST attributable time, not the last one appended", got, ok, newest)
+	}
+
+	// A managed receipt dated between the two must therefore be superseded
+	// rather than appended over the newer observation.
+	before, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read persistent log: %v", err)
+	}
+	if err := seedGrokManagedBillingIdentity(isolated); err != nil {
+		t.Fatalf("seed isolated identity: %v", err)
+	}
+	helperAppendGrokLogLine(t, isolated,
+		grokBillingLine(time.Now().Add(-59*time.Minute).UTC().Format(time.RFC3339), 12,
+			"USAGE_PERIOD_TYPE_WEEKLY", "2026-08-17T22:28:32Z", "2126-08-24T22:28:32Z"))
+
+	outcome, err := persistGrokManagedBillingSnapshot(isolated, persistent)
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if outcome != grokManagedBillingSuperseded {
+		t.Fatalf("outcome = %s, want %s", outcome, grokManagedBillingSuperseded)
+	}
+	after, err := os.ReadFile(grokBillingLogPath(persistent))
+	if err != nil {
+		t.Fatalf("read persistent log: %v", err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("a stale managed receipt rewrote the log:\nbefore=%s\nafter=%s", before, after)
+	}
+}

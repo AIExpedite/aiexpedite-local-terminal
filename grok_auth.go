@@ -256,8 +256,20 @@ func grokDirectRunCredentialOverride(launch grokDirectRunLaunch, base string) bo
 // flag: the same override is spelled `--config k=v`, `--config=k=v` and `-c k=v`
 // across Grok releases, and over-reporting costs one session's observability
 // while under-reporting publishes one account's spend as another's.
+//
+// A token that IS one of grok's own auth-override flags contests the launch on
+// its own, in either the `--api-key-env=OTHER_VAR` or the space-separated
+// `--api-key-env OTHER_VAR` spelling, and whether or not a value follows it in
+// this argv. isGrokAuthOverrideArg is the repository's existing enumeration of
+// that flag set (it is what the ACP side-door classifier strips), so reusing it
+// keeps the two from disagreeing about what an auth override is — `--api-key-env`
+// normalises to `apikeyenv`, which is a suffix of neither `api_key` nor
+// `env_key`, so the config-key rule below can never recognise it.
 func grokArgsPinCredential(args []string) bool {
 	for _, arg := range args {
+		if isGrokAuthOverrideArg(strings.ToLower(strings.TrimSpace(arg))) {
+			return true
+		}
 		if grokArgPinsCredential(arg) {
 			return true
 		}

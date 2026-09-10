@@ -1568,19 +1568,138 @@ var grokModelCredentialKeySuffixes = []string{"api_key", "env_key"}
 // and the guard is conservative by construction — over-reporting costs one
 // session's observability, under-reporting publishes one account's spend as
 // another's.
+// An INLINE TABLE counts too. `model = { api_key = "xai-..." }` and
+// `[model] grok-4 = { env_key = "OTHER" }` are valid TOML that grok's own parser
+// honours, but the line-oriented sweep only ever exposes the OUTER key (`model`,
+// `model.grok-4`), so the credential lives entirely inside the value. Descending
+// into the braces is what keeps a config written in that shape from silently
+// attributing an API-key run to the cached login.
 func grokConfigPinsCredential(path string) bool {
 	found := false
 	walkGrokTOMLAssignments(path, func(key, value string) bool {
-		if !grokModelCredentialTOMLKey(key) {
-			return true
+		if grokModelCredentialTOMLKey(key) {
+			if strings.TrimSpace(strings.Trim(value, `"'`)) == "" {
+				return true
+			}
+			found = true
+			return false
 		}
-		if strings.TrimSpace(strings.Trim(value, `"'`)) == "" {
-			return true
+		if grokModelScopedTOMLKey(key) && grokInlineTablePinsCredential(value) {
+			found = true
+			return false
 		}
-		found = true
-		return false
+		return true
 	})
 	return found
+}
+
+// grokModelScopedTOMLKey reports whether a dotted key from
+// walkGrokTOMLAssignments sits anywhere under `[model]` — the table itself
+// (`model`) or a per-model child (`model.grok-4`). Only these values are worth
+// descending into: a credential-shaped assignment under an unrelated table is
+// not a credential grok would bill with.
+func grokModelScopedTOMLKey(key string) bool {
+	return key == "model" || strings.HasPrefix(key, "model.")
+}
+
+// grokInlineTableMaxDepth bounds the descent into nested inline tables. Deep
+// enough for any config a human writes, finite so a pathological or hostile
+// value cannot turn a session start into unbounded recursion.
+const grokInlineTableMaxDepth = 8
+
+// grokInlineTablePinsCredential reports whether a TOML inline-table value
+// assigns a non-empty credential to one of grokModelCredentialKeySuffixes, at
+// this level or in a nested inline table.
+//
+// A value that is not an inline table (a bare string, number or array) is never
+// a credential assignment on its own — the key already decided that — so it
+// reports false. Quoted strings are skipped over while splitting so a `,`, `{`
+// or `}` inside a key value cannot desynchronise the scan and hide the
+// assignment that follows it.
+func grokInlineTablePinsCredential(value string) bool {
+	return grokInlineTablePinsCredentialAt(value, 0)
+}
+
+func grokInlineTablePinsCredentialAt(value string, depth int) bool {
+	if depth >= grokInlineTableMaxDepth {
+		// Deeper than any real config nests. Fail CLOSED: we cannot rule the
+		// credential out, and over-reporting costs one session's observability
+		// while under-reporting publishes one account's spend as another's.
+		return true
+	}
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "{") || !strings.HasSuffix(value, "}") {
+		return false
+	}
+	for _, field := range splitGrokInlineTableFields(value[1 : len(value)-1]) {
+		eq := strings.IndexByte(field, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(strings.Trim(strings.TrimSpace(field[:eq]), `"'`)))
+		inner := strings.TrimSpace(field[eq+1:])
+		if grokInlineTableCredentialKey(key) {
+			if strings.TrimSpace(strings.Trim(inner, `"'`)) != "" {
+				return true
+			}
+			continue
+		}
+		if grokInlineTablePinsCredentialAt(inner, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// grokInlineTableCredentialKey reports whether a key written INSIDE an inline
+// table names a credential, in either the bare (`api_key`) or dotted
+// (`grok-4.api_key`) spelling TOML allows there.
+func grokInlineTableCredentialKey(key string) bool {
+	for _, suffix := range grokModelCredentialKeySuffixes {
+		if key == suffix || strings.HasSuffix(key, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitGrokInlineTableFields splits the BODY of an inline table on its
+// top-level commas, ignoring commas inside quoted strings or nested
+// inline tables / arrays so a nested value cannot swallow the field after it.
+func splitGrokInlineTableFields(body string) []string {
+	var fields []string
+	depth := 0
+	var quote byte
+	start := 0
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		if quote != 0 {
+			if c == '\\' && quote == '"' {
+				i++
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			quote = c
+		case '{', '[':
+			depth++
+		case '}', ']':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				fields = append(fields, body[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(fields, body[start:])
 }
 
 // grokModelCredentialTOMLKey reports whether a dotted TOML key from

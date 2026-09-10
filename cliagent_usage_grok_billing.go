@@ -765,11 +765,22 @@ func readGrokBillingLogTailWithOffset(base string) (lines [][]byte, truncatedFir
 // past it to the newest same-account record we would be willing to publish —
 // stopping there would report "nothing" and let a stale merge land on top of a
 // perfectly good older-but-trusted observation.
+//
+// Every attributable record is inspected and the GREATEST observation time wins,
+// rather than the first one the reverse scan reaches. File order is APPEND order,
+// not timestamp order: a clock correction on the device, or a managed snapshot
+// merged in after the fact, can leave an older same-account record physically
+// after a newer one. Stopping at the first same-account hit would then report the
+// older time and let a merge append over the newer observation this guard exists
+// to protect. The scan already walked the whole tail whenever nothing was
+// attributable, so always finishing it adds no new worst case.
 func newestTrustedGrokBillingObservationFor(base string, identities []string, trustedThrough time.Time) (time.Time, bool) {
 	lines, _ := readGrokBillingLogTailWithOffset(base)
 	if lines == nil {
 		return time.Time{}, false
 	}
+	var newest time.Time
+	found := false
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
 		if len(line) == 0 || !grokLineMentionsBillingMessage(line) {
@@ -795,9 +806,12 @@ func newestTrustedGrokBillingObservationFor(base string, identities []string, tr
 		if !grokRecordBelongsToCurrentAccount(lines, i, identities) {
 			continue
 		}
-		return snap.ObservedAt, true
+		if !found || snap.ObservedAt.After(newest) {
+			newest = snap.ObservedAt
+			found = true
+		}
 	}
-	return time.Time{}, false
+	return newest, found
 }
 
 // readGrokBillingSnapshot returns the NEWEST billing record in the log tail,
