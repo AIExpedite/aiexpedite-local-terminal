@@ -1813,23 +1813,54 @@ func grokTOMLMultilineOpener(value string) string {
 // literal (three-single-quote) multiline string defines no escapes, so a
 // backslash in one is ordinary content.
 //
-// Only the FIRST unescaped occurrence is reported. TOML lets up to two extra
-// quotes sit against a closing delimiter (`foo""""`), which shifts the true
-// terminator by a byte or two; every caller here asks only WHETHER the string
-// closes within the text it was handed, so the earlier index answers the same
-// question.
+// Only the FIRST unescaped occurrence is reported. A caller that RESUMES
+// scanning after the close must use grokTOMLMultilineCloserSpan instead, which
+// also reports how many bytes the terminator occupies.
 func grokTOMLMultilineCloserIndex(s, delim string) int {
+	idx, _ := grokTOMLMultilineCloserSpan(s, delim)
+	return idx
+}
+
+// grokTOMLMultilineCloserSpan reports the index at which `s` closes an open
+// multiline string delimited by `delim` AND the length of that terminator, or
+// (-1, 0) when it never closes.
+//
+// TOML lets up to two extra quotes sit against a closing delimiter: in
+// `"""foo""""` the content is `foo"` and the terminator is the LAST three
+// quotes, so the whole run is what ends the string. Reporting just the first
+// triple left the extra quote for the caller to resume ON, which opened a fresh
+// single-quoted string in the composite and inline-table scanners; both then
+// finished with quote state still open and reported the scan INCOMPLETE, and
+// grokConfigPinsCredential reads an incomplete scan as a pin — contesting a
+// direct run over a config that pins no credential and rejecting its billing
+// observation. A run of six or more quotes is not a single terminator (it is a
+// close immediately followed by a new opener), so the span is capped at five
+// bytes rather than swallowing the next string's delimiter.
+func grokTOMLMultilineCloserSpan(s, delim string) (int, int) {
 	escapes := delim == `"""`
+	quote := delim[0]
 	for i := 0; i < len(s); i++ {
 		if escapes && s[i] == '\\' {
 			i++
 			continue
 		}
-		if strings.HasPrefix(s[i:], delim) {
-			return i
+		if !strings.HasPrefix(s[i:], delim) {
+			continue
 		}
+		run := len(delim)
+		for i+run < len(s) && s[i+run] == quote {
+			run++
+		}
+		if run > len(delim)+2 {
+			// Six or more quotes in a row is a terminator immediately followed
+			// by a new opener, not one long terminator; consuming the run
+			// whole would swallow the next string's delimiter and leave the
+			// scan reading its body as value syntax.
+			run = len(delim)
+		}
+		return i, run
 	}
-	return -1
+	return -1, 0
 }
 
 // grokTOMLAssignmentIndex returns the index of the `=` separating a TOML
@@ -2179,13 +2210,13 @@ func splitGrokInlineTableFields(body string) ([]string, bool) {
 		switch c {
 		case '"', '\'':
 			if delim := grokTOMLMultilineDelimiterAt(body[i:]); delim != "" {
-				closer := grokTOMLMultilineCloserIndex(body[i+len(delim):], delim)
+				closer, closerLen := grokTOMLMultilineCloserSpan(body[i+len(delim):], delim)
 				if closer < 0 {
 					// Never closes: the rest of the body is string content, so
 					// no further field boundary is knowable.
 					return append(fields, body[start:]), false
 				}
-				i += len(delim) + closer + len(delim) - 1
+				i += len(delim) + closer + closerLen - 1
 				continue
 			}
 			quote = c
@@ -3171,13 +3202,13 @@ func grokTOMLStripInlineComment(line string) string {
 		if !inDouble && !inSingle {
 			if delim := grokTOMLMultilineDelimiterAt(line[i:]); delim != "" {
 				body := line[i+len(delim):]
-				closer := grokTOMLMultilineCloserIndex(body, delim)
+				closer, closerLen := grokTOMLMultilineCloserSpan(body, delim)
 				if closer < 0 {
 					// The body runs past this line: everything after the
 					// opener is string content, never a comment.
 					return line
 				}
-				i += len(delim) + closer + len(delim) - 1
+				i += len(delim) + closer + closerLen - 1
 				continue
 			}
 		}
@@ -3267,12 +3298,12 @@ func grokTOMLBracketDepth(s string) int {
 func grokTOMLCompositeLineDepth(s, openMultiline string) (string, int, string) {
 	i := 0
 	if openMultiline != "" {
-		idx := grokTOMLMultilineCloserIndex(s, openMultiline)
+		idx, closerLen := grokTOMLMultilineCloserSpan(s, openMultiline)
 		if idx < 0 {
 			// The whole line is still string body.
 			return s, 0, openMultiline
 		}
-		i = idx + len(openMultiline)
+		i = idx + closerLen
 		openMultiline = ""
 	}
 	depth := 0
@@ -3301,7 +3332,7 @@ func grokTOMLCompositeLineDepth(s, openMultiline string) (string, int, string) {
 			delim := strings.Repeat(string(c), 3)
 			if strings.HasPrefix(s[i:], delim) {
 				rest := s[i+len(delim):]
-				closed := grokTOMLMultilineCloserIndex(rest, delim)
+				closed, closerLen := grokTOMLMultilineCloserSpan(rest, delim)
 				if closed < 0 {
 					// Everything after this opener is body, on this line and
 					// on the ones that follow.
@@ -3309,7 +3340,7 @@ func grokTOMLCompositeLineDepth(s, openMultiline string) (string, int, string) {
 				}
 				// Resume at the first byte after the closing delimiter; the
 				// loop's own i++ carries it there.
-				i += len(delim) + closed + len(delim) - 1
+				i += len(delim) + closed + closerLen - 1
 				continue
 			}
 			if c == '"' {
