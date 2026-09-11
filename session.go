@@ -317,6 +317,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 		isolatedGrokCwd = filepath.Join(isolatedGrokHome, "workspace")
 		if mkdirErr := os.Mkdir(isolatedGrokCwd, 0o700); mkdirErr != nil {
 			_ = os.RemoveAll(isolatedGrokHome)
+			grokLogin.releaseCopy(isolatedGrokHome)
 			isolatedGrokHome = ""
 			return fmt.Errorf("grok no-tools working-directory isolation failed; refusing to spawn in caller workspace")
 		}
@@ -325,6 +326,7 @@ func (sm *SessionManager) StartSession(id, command string, args []string, cwd, w
 	defer func() {
 		if isolatedGrokHome != "" && !isolationOwnedBySession {
 			_ = os.RemoveAll(isolatedGrokHome)
+			grokLogin.releaseCopy(isolatedGrokHome)
 		}
 	}()
 
@@ -1895,6 +1897,7 @@ func (sm *SessionManager) waitForExit(session *CLISession, publishFn PublishFunc
 				colorCyan, outcome, colorReset)
 		}
 		_ = os.RemoveAll(session.isolatedGrokHome)
+		grokLogin.releaseCopy(session.isolatedGrokHome)
 	}
 
 	// 120s rather than 45s — publishFn can block up to 30s per pubsub.Publish

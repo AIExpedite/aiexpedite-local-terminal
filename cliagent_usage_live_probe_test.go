@@ -825,3 +825,79 @@ func TestCodexLiveProbeConverse_AccountSwitchMidProbeIsDropped(t *testing.T) {
 		t.Errorf("a reading from another account must not be cached (stat err=%v)", err)
 	}
 }
+
+func resetAntigravityLiveProducer(t *testing.T) {
+	t.Helper()
+	clear := func() { noteAntigravityLiveProducerForTest("", time.Time{}) }
+	clear()
+	t.Cleanup(clear)
+}
+
+func noteAntigravityLiveProducerForTest(fingerprint string, at time.Time) {
+	antigravityLiveProducer.mu.Lock()
+	defer antigravityLiveProducer.mu.Unlock()
+	antigravityLiveProducer.fingerprint = fingerprint
+	antigravityLiveProducer.at = at
+}
+
+// TestAntigravityUsageParser_LiveProbeProducerOutranksStaleSettings: the account
+// lives in the OS keyring, so settings.json can name a previous login (A) while
+// `agy` is signed into B. The gather a Refresh click runs next must show the
+// reading the click's probe just took from B — and only for that gather: once
+// the probe's word is stale, settings.json stands again.
+func TestAntigravityUsageParser_LiveProbeProducerOutranksStaleSettings(t *testing.T) {
+	resetAntigravityLiveProducer(t)
+	home := t.TempDir()
+	t.Setenv("AIEXPEDITE_AGY_QUOTA_CACHE", filepath.Join(t.TempDir(), "agyq.json"))
+	helperWriteJSON(t, filepath.Join(home, ".gemini", "antigravity-cli", "settings.json"),
+		map[string]any{"email": "a@example.com"})
+	now := time.Now().UTC()
+	fresh := antigravityQuotaSnapshot{
+		ObservedAt: now.Format(time.RFC3339),
+		Account:    "b@example.com",
+		Plan:       "Pro",
+		Buckets: []antigravityQuotaBucket{
+			{Group: "Gemini Models", Window: "weekly", RemainingFraction: 0.4, ResetTime: now.Add(72 * time.Hour).Format(time.RFC3339)},
+		},
+	}
+	if persisted, _ := antigravityCapturePersist(fresh); !persisted {
+		t.Fatal("fixture must persist B's reading")
+	}
+	bFingerprint := fingerprintAccount("antigravity", "b@example.com")
+
+	parse := func() *cliAgentUsage {
+		usage, ok := antigravityUsageParser{}.Parse(home, detectedCLIAgent{Detected: true}, now)
+		if !ok {
+			t.Fatal("parse failed")
+		}
+		return usage
+	}
+
+	// Without a probe, settings.json's account stands and B's reading is not
+	// plotted under it (the existing conflict rule).
+	if usage := parse(); usage.Account != "a@example.com" || !usage.Metrics[0].Unknown {
+		t.Fatalf("no probe: account=%q metrics=%+v, want A with placeholders", usage.Account, usage.Metrics)
+	}
+
+	noteAntigravityLiveProducer(bFingerprint, time.Now())
+	usage := parse()
+	if usage.Account != "b@example.com" || usage.AccountFingerprint != bFingerprint {
+		t.Errorf("after probe: account/fingerprint=%q/%q, want the account the probe's server named",
+			usage.Account, usage.AccountFingerprint)
+	}
+	if len(usage.Metrics) != 1 || usage.Metrics[0].Unknown {
+		t.Errorf("after probe: metrics=%+v, want B's fresh reading", usage.Metrics)
+	}
+
+	// The probe attests B, but the cache holds another account's reading: it is
+	// never replayed on the probe's word.
+	noteAntigravityLiveProducer(fingerprintAccount("antigravity", "c@example.com"), time.Now())
+	if usage := parse(); usage.Account != "a@example.com" || !usage.Metrics[0].Unknown {
+		t.Errorf("other producer: account=%q metrics=%+v, want A with placeholders", usage.Account, usage.Metrics)
+	}
+
+	noteAntigravityLiveProducer(bFingerprint, time.Now().Add(-antigravityLiveProducerTTL-time.Second))
+	if usage := parse(); usage.Account != "a@example.com" || !usage.Metrics[0].Unknown {
+		t.Errorf("stale probe: account=%q metrics=%+v, want settings.json to stand again", usage.Account, usage.Metrics)
+	}
+}

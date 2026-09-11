@@ -69,6 +69,10 @@ func setupIsolatedGrokHomeWithSessionStore(allowAPIKeyFallback bool, runtimeMode
 	if err != nil {
 		return "", fmt.Errorf("create isolated grok home: %w", err)
 	}
+	// Registered before the auth file is read, so this home never copies a
+	// login a renewal is mid-way through rotating (see grokLoginGuard). Every
+	// removal path releases it.
+	grokLogin.acquireCopy(dir)
 
 	// Copy the auth file under the first name that exists. Best-effort: a
 	// missing/unreadable source is tolerated (grok surfaces the auth error
@@ -150,6 +154,7 @@ func removeIsolatedGrokHomeWithUnlink(home string, unlink func(string) error) er
 	if home == "" {
 		return nil
 	}
+	defer grokLogin.releaseCopy(home)
 
 	link := filepath.Join(home, grokSessionsDirName)
 	if err := unlink(link); err != nil {

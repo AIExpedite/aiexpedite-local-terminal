@@ -69,6 +69,11 @@ const (
 	codexLiveProbeTimeout       = 15 * time.Second
 	antigravityLiveProbeTimeout = 20 * time.Second
 	antigravityLiveProbePoll    = 250 * time.Millisecond
+	// antigravityLiveProducerTTL is how long the account a live probe's server
+	// named outranks settings.json. It only has to cover the gather the same
+	// click runs next; after that, with no `agy` to ask, settings.json is again
+	// the only statement of who is signed in.
+	antigravityLiveProducerTTL = 2 * time.Minute
 	// antigravityLiveProbePrompt is sent only because `agy` needs a prompt to
 	// start; the process is normally killed before a turn completes.
 	antigravityLiveProbePrompt = "Reply with a single period."
@@ -552,6 +557,7 @@ func probeAntigravityQuotaLive(parent context.Context, agyPath, home string) str
 				// Persisted only under the account the server itself named —
 				// the same attribution rule the run-scoped poller follows.
 				if persisted, _ := antigravityCapturePersist(snap); persisted {
+					noteAntigravityLiveProducer(fingerprintAccount("antigravity", snap.Account), time.Now())
 					return liveProbeOutcomeOK
 				}
 			}
@@ -570,6 +576,37 @@ func probeAntigravityQuotaLive(parent context.Context, agyPath, home string) str
 		case <-ticker.C:
 		}
 	}
+}
+
+// antigravityLiveProducer is the account the most recent live probe's server
+// named. The account lives in the OS keyring, so settings.json can still name a
+// previous login; for the gather this click runs next, the server's own answer
+// is the better statement of who is signed in.
+var antigravityLiveProducer struct {
+	mu          sync.Mutex
+	fingerprint string
+	at          time.Time
+}
+
+func noteAntigravityLiveProducer(fingerprint string, at time.Time) {
+	if fingerprint == "" {
+		return
+	}
+	antigravityLiveProducer.mu.Lock()
+	defer antigravityLiveProducer.mu.Unlock()
+	antigravityLiveProducer.fingerprint = fingerprint
+	antigravityLiveProducer.at = at
+}
+
+// recentAntigravityLiveProducer returns the fingerprint a live probe attested
+// within antigravityLiveProducerTTL, else "".
+func recentAntigravityLiveProducer(now time.Time) string {
+	antigravityLiveProducer.mu.Lock()
+	defer antigravityLiveProducer.mu.Unlock()
+	if antigravityLiveProducer.fingerprint == "" || now.Sub(antigravityLiveProducer.at) > antigravityLiveProducerTTL {
+		return ""
+	}
+	return antigravityLiveProducer.fingerprint
 }
 
 // removeDirEventually deletes a probe's temp directory. Windows keeps a killed

@@ -257,6 +257,16 @@ func probeGrokBillingLive(ctx context.Context, grokPath string, now func() time.
 	renewed := false
 	renew := func() {
 		renewed = true
+		// Never while an isolated home holds a copy of this login (a model
+		// discovery, an ACP session, a smoke): both could redeem the same
+		// rotating refresh token and sign the user's CLI out. When no gap opens
+		// within the probe's budget the renewal is skipped and the probe
+		// reports what the stale token gets.
+		release, ok := grokLogin.beginRenewal(ctx)
+		if !ok {
+			return
+		}
+		defer release()
 		runGrokLoginRenewal(ctx, grokPath, base)
 	}
 	token, expiresAt, hasExpiry := grokPresentedToken(base)
