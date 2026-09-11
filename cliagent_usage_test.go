@@ -120,6 +120,19 @@ func TestClaudeCodeUsageParser_FullCredentials(t *testing.T) {
 			t.Errorf("metric %q should be Unknown (no observable counter)", m.Label)
 		}
 	}
+	// The Fable row NAMES its model, which is what makes it a nested sub-limit
+	// server-side rather than another window of the shared weekly budget: spent,
+	// it blocks Fable and leaves the account routable on every other model.
+	// The two shared rows must stay unnamed, or they would each carve out a
+	// pool of their own and the account would have no shared budget at all.
+	if got := usage.Metrics[2].Model; got != "fable" {
+		t.Errorf("Weekly Fable Model=%q, want fable", got)
+	}
+	for _, i := range []int{0, 1} {
+		if got := usage.Metrics[i].Model; got != "" {
+			t.Errorf("metric[%d] (%q) Model=%q, want empty", i, usage.Metrics[i].Label, got)
+		}
+	}
 }
 
 // The account email is NOT in .credentials.json (it holds only the OAuth token

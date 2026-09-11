@@ -114,11 +114,17 @@ var cliAgentEffortRank = map[string]int{
 	"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5, "ultra": 6,
 }
 
+// claudeModelFable is the alias Claude Code lists Fable under, and the id the
+// weekly Fable window names as the model it meters (see
+// claudeCodeMetricsFromBuckets): one spelling, so the sub-limit and the model
+// a route asks for are the same string on both sides.
+const claudeModelFable = "fable"
+
 // claudeModelAliases is the alias set `claude --model` documents. It is a
 // floor, not a ceiling: full model ids are accepted too, which is why Claude's
 // discovery is reported as non-exhaustive.
 var claudeModelAliases = []cliAgentModelDetail{
-	{ID: "fable", Label: "Fable"},
+	{ID: claudeModelFable, Label: "Fable"},
 	{ID: "opus", Label: "Opus"},
 	{ID: "sonnet", Label: "Sonnet"},
 	{ID: "haiku", Label: "Haiku"},
