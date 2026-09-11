@@ -92,10 +92,13 @@ const (
 	// free, so after the first refresh a run rarely spends any of it.
 	cliAgentModelDiscoveryGatherBudget = 4 * time.Second
 	// cliAgentModelDiscoveryGatherReserve is what a probe leaves the parent
-	// gather for the providers still to be polled: one utilization probe's
-	// worth. Discovery is optional and theirs is not, so a probe that would
-	// eat into the reserve is skipped (the cache still answers) rather than
-	// handing the next provider an already-expired context.
+	// gather PER provider still to be polled that performs bounded I/O
+	// (cliAgentUsageContextParser): one utilization probe's worth each, summed
+	// over the rest of the gather by cliAgentUsageGatherReservesAfter. Discovery
+	// is optional and theirs is not, so a probe that would eat into the reserve
+	// is skipped (the cache still answers) rather than handing a later provider
+	// an already-expired context. The single-provider entry point assumes one
+	// such provider follows.
 	cliAgentModelDiscoveryGatherReserve = machineInfoProbeTimeout
 	// cliUsageMaxEffortsPerModel is the receipt bound on one model's scale.
 	cliUsageMaxEffortsPerModel = 16
@@ -182,12 +185,14 @@ func newCLIAgentDiscoveryBudget(ctx context.Context) *cliAgentDiscoveryBudget {
 	return &cliAgentDiscoveryBudget{remaining: cliAgentModelDiscoveryGatherBudget}
 }
 
-// probeContext hands one probe its slice of the gather. ok=false means the
-// gather cannot afford a probe now (the budget is spent, or the parent has
-// no more than the reserve left) and the caller must answer from cache only.
-// The release function must be called when the probe is done; it charges the
-// time actually spent, not the slice allotted, so a fast answer costs little.
-func (b *cliAgentDiscoveryBudget) probeContext(ctx context.Context) (probeCtx context.Context, release func(), ok bool) {
+// probeContext hands one probe its slice of the gather. reserve is what the
+// parent must keep for the providers still to be polled after this one (see
+// cliAgentUsageGatherReservesAfter). ok=false means the gather cannot afford a
+// probe now (the budget is spent, or the parent has no more than the reserve
+// left) and the caller must answer from cache only. The release function must
+// be called when the probe is done; it charges the time actually spent, not
+// the slice allotted, so a fast answer costs little.
+func (b *cliAgentDiscoveryBudget) probeContext(ctx context.Context, reserve time.Duration) (probeCtx context.Context, release func(), ok bool) {
 	if b == nil {
 		return ctx, func() {}, true
 	}
@@ -195,7 +200,7 @@ func (b *cliAgentDiscoveryBudget) probeContext(ctx context.Context) (probeCtx co
 	allowance := min(cliAgentModelProbeGatherBudget, b.remaining)
 	b.mu.Unlock()
 	if deadline, bounded := ctx.Deadline(); bounded {
-		allowance = min(allowance, time.Until(deadline)-cliAgentModelDiscoveryGatherReserve)
+		allowance = min(allowance, time.Until(deadline)-reserve)
 	}
 	if allowance <= 0 {
 		return ctx, func() {}, false
@@ -212,13 +217,15 @@ func (b *cliAgentDiscoveryBudget) probeContext(ctx context.Context) (probeCtx co
 
 // attachCLIAgentModelDiscovery is the single-provider entry point: it budgets
 // this one call as a bounded gather would (a fresh budget when ctx carries a
-// deadline, none otherwise). GatherCLIAgentUsageOnly shares ONE budget across
-// its providers through attachCLIAgentModelDiscoveryBudgeted instead.
+// deadline, none otherwise) and assumes one I/O-bound provider follows.
+// GatherCLIAgentUsageOnly shares ONE budget across its providers, with the
+// reserve summed over the providers actually left, through
+// attachCLIAgentModelDiscoveryBudgeted instead.
 func attachCLIAgentModelDiscovery(ctx context.Context, agentID string, detected detectedCLIAgent, usage *cliAgentUsage, home string, now time.Time) {
-	attachCLIAgentModelDiscoveryBudgeted(ctx, newCLIAgentDiscoveryBudget(ctx), agentID, detected, usage, home, now)
+	attachCLIAgentModelDiscoveryBudgeted(ctx, newCLIAgentDiscoveryBudget(ctx), cliAgentModelDiscoveryGatherReserve, agentID, detected, usage, home, now)
 }
 
-func attachCLIAgentModelDiscoveryBudgeted(ctx context.Context, budget *cliAgentDiscoveryBudget, agentID string, detected detectedCLIAgent, usage *cliAgentUsage, home string, now time.Time) {
+func attachCLIAgentModelDiscoveryBudgeted(ctx context.Context, budget *cliAgentDiscoveryBudget, reserve time.Duration, agentID string, detected detectedCLIAgent, usage *cliAgentUsage, home string, now time.Time) {
 	if usage == nil {
 		return
 	}
@@ -268,7 +275,7 @@ func attachCLIAgentModelDiscoveryBudgeted(ctx context.Context, budget *cliAgentD
 	}
 	var discovery cliAgentModelDiscovery
 	var ok bool
-	if probeCtx, release, affordable := budget.probeContext(ctx); affordable {
+	if probeCtx, release, affordable := budget.probeContext(ctx, reserve); affordable {
 		discovery, ok = cachedCLIAgentModelDiscovery(probeCtx, agentID, detected, home, now)
 		release()
 	} else {

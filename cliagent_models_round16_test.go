@@ -26,7 +26,7 @@ func TestCLIAgentDiscoveryBudgetIsSharedAcrossProbes(t *testing.T) {
 	// First probe: the per-probe cap, since both the budget and the parent
 	// (10s less the reserve) have more than that.
 	start := time.Now()
-	probeCtx, release, ok := budget.probeContext(parent)
+	probeCtx, release, ok := budget.probeContext(parent, cliAgentModelDiscoveryGatherReserve)
 	if !ok {
 		t.Fatal("a fresh budget under a fresh gather must afford a probe")
 	}
@@ -50,7 +50,7 @@ func TestCLIAgentDiscoveryBudgetIsSharedAcrossProbes(t *testing.T) {
 	budget.remaining = 500 * time.Millisecond
 	budget.mu.Unlock()
 	start = time.Now()
-	probeCtx, release, ok = budget.probeContext(parent)
+	probeCtx, release, ok = budget.probeContext(parent, cliAgentModelDiscoveryGatherReserve)
 	if !ok {
 		t.Fatal("a partly spent budget must still afford a shorter probe")
 	}
@@ -64,7 +64,7 @@ func TestCLIAgentDiscoveryBudgetIsSharedAcrossProbes(t *testing.T) {
 	budget.mu.Lock()
 	budget.remaining = 0
 	budget.mu.Unlock()
-	if _, _, ok := budget.probeContext(parent); ok {
+	if _, _, ok := budget.probeContext(parent, cliAgentModelDiscoveryGatherReserve); ok {
 		t.Fatal("a spent budget must refuse the probe")
 	}
 }
@@ -76,7 +76,7 @@ func TestCLIAgentDiscoveryBudgetLeavesTheReserveToLaterProviders(t *testing.T) {
 	defer cancel()
 	budget := newCLIAgentDiscoveryBudget(parent)
 	start := time.Now()
-	probeCtx, release, ok := budget.probeContext(parent)
+	probeCtx, release, ok := budget.probeContext(parent, cliAgentModelDiscoveryGatherReserve)
 	if !ok {
 		t.Fatal("a gather with the reserve plus a second left must afford a one-second probe")
 	}
@@ -88,7 +88,7 @@ func TestCLIAgentDiscoveryBudgetLeavesTheReserveToLaterProviders(t *testing.T) {
 
 	tight, cancelTight := context.WithTimeout(context.Background(), cliAgentModelDiscoveryGatherReserve-500*time.Millisecond)
 	defer cancelTight()
-	if _, _, ok := newCLIAgentDiscoveryBudget(tight).probeContext(tight); ok {
+	if _, _, ok := newCLIAgentDiscoveryBudget(tight).probeContext(tight, cliAgentModelDiscoveryGatherReserve); ok {
 		t.Fatal("a gather inside its reserve must not probe")
 	}
 }
@@ -117,7 +117,7 @@ func TestAttachCLIAgentModelDiscoveryServesTheCacheWhenItCannotProbe(t *testing.
 	// receipt — the refresh loses nothing it already knew.
 	spent := &cliAgentDiscoveryBudget{}
 	second := &cliAgentUsage{Provider: "antigravity"}
-	attachCLIAgentModelDiscoveryBudgeted(context.Background(), spent, "antigravity", detected, second, "", now)
+	attachCLIAgentModelDiscoveryBudgeted(context.Background(), spent, cliAgentModelDiscoveryGatherReserve, "antigravity", detected, second, "", now)
 	if probes != 1 {
 		t.Fatalf("a spent budget must not probe, ran %d probes", probes)
 	}
@@ -128,7 +128,7 @@ func TestAttachCLIAgentModelDiscoveryServesTheCacheWhenItCannotProbe(t *testing.
 	// Two providers under ONE spent budget: neither probes, so the gather's
 	// discovery as a whole — not one probe — is what the budget bounds.
 	third := &cliAgentUsage{Provider: "claudecode"}
-	attachCLIAgentModelDiscoveryBudgeted(context.Background(), spent, "claudecode", detectedCLIAgent{Detected: true, Path: "/bin/claude", Version: "2.0.0"}, third, "", now)
+	attachCLIAgentModelDiscoveryBudgeted(context.Background(), spent, cliAgentModelDiscoveryGatherReserve, "claudecode", detectedCLIAgent{Detected: true, Path: "/bin/claude", Version: "2.0.0"}, third, "", now)
 	if probes != 1 || len(third.ModelDetails) != 0 {
 		t.Fatalf("a second provider on the same spent budget must not probe either: probes=%d details=%d", probes, len(third.ModelDetails))
 	}

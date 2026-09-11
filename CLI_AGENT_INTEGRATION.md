@@ -368,9 +368,12 @@ Three rules keep a probe from doing damage on the way:
   ran out of time would hide the agent's models for the whole 30-minute TTL.
   Under a bounded gather the probes are rationed by ONE
   `cliAgentDiscoveryBudget` shared across every provider (4s of time actually
-  spent per gather, at most 2s per probe), and a probe never takes the
-  gather's last 3s — one utilization probe's worth, reserved for the
-  providers still to be polled. A probe the gather cannot afford is skipped
+  spent per gather, at most 2s per probe), and a probe never takes what the
+  providers still to be polled need — 3s (one utilization probe) for each
+  later parser that performs bounded I/O (Claude, Codex, OpenCode; Antigravity
+  and Grok read local state), summed by `cliAgentUsageGatherReservesAfter`
+  over the ordered run, so the first provider on a fully loaded box gets a
+  short probe and the last gets the full cap. A probe the gather cannot afford is skipped
   and the cache answers; a cold cache reports nothing and the next gather asks.
   Discovery as a whole is therefore bounded under the refresh deadline. The
   same rule reaches OpenCode's readiness probes: `openCodeUsageParser`
