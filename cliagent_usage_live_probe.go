@@ -398,16 +398,35 @@ func antigravityHTTPPortForPID(base string, pid int) int {
 		if err != nil {
 			continue
 		}
-		match := antigravityLanguageServerPIDPattern.FindSubmatch(body)
-		if match == nil || string(match[1]) != want {
-			continue
+		if port, found := antigravityHTTPPortInPIDBlock(body, want); found {
+			return port
 		}
-		if ports := antigravityPortsInLog(body); len(ports) > 0 {
-			return ports[0]
-		}
-		return 0
 	}
 	return 0
+}
+
+// antigravityHTTPPortInPIDBlock scopes a log to the block the run with the
+// given PID wrote: from its startup line up to the next run's startup line (or
+// the end of the file). Two `agy` runs started in the same second can share one
+// log file, so the port is read only from that block — never paired with a PID
+// matched elsewhere in the file. found is false when no block names the PID;
+// port is 0 while the block has not logged its port yet.
+func antigravityHTTPPortInPIDBlock(body []byte, pid string) (port int, found bool) {
+	starts := antigravityLanguageServerPIDPattern.FindAllSubmatchIndex(body, -1)
+	for i, loc := range starts {
+		if string(body[loc[2]:loc[3]]) != pid {
+			continue
+		}
+		end := len(body)
+		if i+1 < len(starts) {
+			end = starts[i+1][0]
+		}
+		if ports := antigravityPortsInLog(body[loc[0]:end]); len(ports) > 0 {
+			return ports[0], true
+		}
+		return 0, true
+	}
+	return 0, false
 }
 
 // probeAntigravityQuotaLive starts `agy` only to bring up its language server,

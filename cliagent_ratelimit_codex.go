@@ -1066,8 +1066,10 @@ func captureCodexRateLimitLine(line string, now time.Time) {
 
 // extractCodexLimitNames returns the display name of every metered limit a
 // frame describes under `rateLimitsByLimitId`, keyed by limit id. A limit whose
-// name is null or absent maps to "" so a merge can forget a name the provider
-// stopped sending. Only JSON strings are accepted and each is bounded, so an
+// name is explicitly null or empty maps to "" so an authoritative snapshot can
+// forget a name the provider stopped sending; a limit that omits the field is
+// left out entirely, so a sparse update that does not restate the name keeps
+// the cached one. Only JSON strings are accepted and each is bounded, so an
 // unexpected value can never reach a metric label.
 func extractCodexLimitNames(raw map[string]interface{}) map[string]string {
 	names := map[string]string{}
@@ -1094,11 +1096,13 @@ func extractCodexLimitNames(raw map[string]interface{}) map[string]string {
 			if !ok {
 				continue
 			}
+			v, ok := pickField(info, "limit_name", "limitName")
+			if !ok {
+				continue
+			}
 			name := ""
-			if v, ok := pickField(info, "limit_name", "limitName"); ok {
-				if s, ok := v.(string); ok {
-					name = clampAntigravityQuotaField(strings.TrimSpace(s), codexLimitNameMaxBytes)
-				}
+			if s, ok := v.(string); ok {
+				name = clampAntigravityQuotaField(strings.TrimSpace(s), codexLimitNameMaxBytes)
 			}
 			names[limitID] = name
 		}
@@ -1555,7 +1559,7 @@ func mergeCodexRateLimitCachePerLimitProgressWithLock(
 		}
 		snap.FullSnapshotAtMs = nowMs
 	}
-	snap.LimitNames = codexMergeLimitNames(snap.LimitNames, limitNames, snap.Contributors)
+	snap.LimitNames = codexMergeLimitNames(snap.LimitNames, limitNames, fullSnapshot, snap.Contributors)
 	// Recompute the flat aggregate from contributors so callers reading the
 	// cache (codexMetricsFromCache, tests) see the most-constrained view.
 	snap.Buckets = aggregateCodexBuckets(snap.Contributors, now)
@@ -1714,15 +1718,19 @@ func codexContributorsForAccount(currentFingerprint string) map[string]map[strin
 // codexMergeLimitNames folds a frame's limit names into the cached ones and
 // forgets the name of every limit that no longer has a contributor, so a pool
 // the account lost cannot keep labelling rows. An empty incoming name removes
-// the entry (the provider now reports that limit unnamed).
-func codexMergeLimitNames(cached, incoming map[string]string, contributors map[string]map[string]codexRateLimitBucket) map[string]string {
+// the entry (the provider now reports that limit unnamed) only when the frame
+// is an authoritative snapshot; a sparse update's null name says nothing about
+// the pool and keeps the cached one.
+func codexMergeLimitNames(cached, incoming map[string]string, authoritative bool, contributors map[string]map[string]codexRateLimitBucket) map[string]string {
 	merged := map[string]string{}
 	for id, name := range cached {
 		merged[id] = name
 	}
 	for id, name := range incoming {
 		if name == "" {
-			delete(merged, id)
+			if authoritative {
+				delete(merged, id)
+			}
 			continue
 		}
 		merged[id] = name

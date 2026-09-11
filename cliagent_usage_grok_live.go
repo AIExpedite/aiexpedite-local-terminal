@@ -119,12 +119,25 @@ var runGrokLoginRenewal = func(ctx context.Context, grokPath, base string) {
 
 // grokPresentedToken returns the access token Grok's own resolver would send,
 // walked in the same scope precedence as grokAuthExpiry, and its expiry when
-// the entry states one.
+// the entry states one. It reads the same files as grokHasUsableToken
+// (`auth.json`, else the legacy `cached_token.json`) and falls back to the
+// id_token exactly as that resolver does, so a login the card counts as signed
+// in is never reported here as no_login.
 func grokPresentedToken(base string) (token string, expiresAt time.Time, hasExpiry bool) {
 	raw, err := os.ReadFile(filepath.Join(base, "auth.json"))
 	if err != nil {
-		return "", time.Time{}, false
+		raw, err = os.ReadFile(filepath.Join(base, "cached_token.json"))
+		if err != nil {
+			return "", time.Time{}, false
+		}
 	}
+	withExpiry := func(token, expires string) (string, time.Time, bool) {
+		if t, err := time.Parse(time.RFC3339, expires); err == nil {
+			return token, t, true
+		}
+		return token, time.Time{}, false
+	}
+
 	var scoped map[string]struct {
 		ExpiresAt   string `json:"expires_at"`
 		Key         string `json:"key"`
@@ -132,27 +145,50 @@ func grokPresentedToken(base string) (token string, expiresAt time.Time, hasExpi
 		AccessToken string `json:"access_token"`
 		IDToken     string `json:"id_token"`
 	}
-	if json.Unmarshal(raw, &scoped) != nil || len(scoped) == 0 {
+	if json.Unmarshal(raw, &scoped) == nil && len(scoped) > 0 {
+		keys := make([]string, 0, len(scoped))
+		for k := range scoped {
+			keys = append(keys, k)
+		}
+		for _, k := range grokScopeKeysByPrecedence(keys) {
+			entry := scoped[k]
+			// Same rule as grokHasUsableToken: a scope without a token is
+			// skipped, and the first token-bearing scope is the one Grok
+			// presents — its access credential, else its id_token.
+			token = firstNonEmpty(entry.Key, entry.AccessToken, entry.Token, entry.IDToken)
+			if token == "" {
+				continue
+			}
+			return withExpiry(token, entry.ExpiresAt)
+		}
+	}
+
+	// Flat / legacy layout (a nested `cached_token` object also lands here: it
+	// unmarshals into the scoped map as a key no scope precedence selects): one
+	// account, access credential before id_token, the order grokAuthExpiry uses.
+	var flat struct {
+		ExpiresAt   string `json:"expires_at"`
+		Key         string `json:"key"`
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
+		IDToken     string `json:"id_token"`
+		CachedToken struct {
+			AccessToken string `json:"access_token"`
+			IDToken     string `json:"id_token"`
+		} `json:"cached_token"`
+	}
+	if json.Unmarshal(raw, &flat) != nil {
 		return "", time.Time{}, false
 	}
-	keys := make([]string, 0, len(scoped))
-	for k := range scoped {
-		keys = append(keys, k)
+	token = firstNonEmpty(
+		flat.AccessToken, flat.Token, flat.Key,
+		flat.CachedToken.AccessToken,
+		flat.IDToken, flat.CachedToken.IDToken,
+	)
+	if token == "" {
+		return "", time.Time{}, false
 	}
-	for _, k := range grokScopeKeysByPrecedence(keys) {
-		entry := scoped[k]
-		// Same rule as grokHasUsableToken: a scope without a token is skipped,
-		// and the first token-bearing scope is the one Grok presents.
-		if firstNonEmpty(entry.Key, entry.Token, entry.AccessToken, entry.IDToken) == "" {
-			continue
-		}
-		token = firstNonEmpty(entry.Key, entry.AccessToken, entry.Token)
-		if t, err := time.Parse(time.RFC3339, entry.ExpiresAt); err == nil {
-			return token, t, true
-		}
-		return token, time.Time{}, false
-	}
-	return "", time.Time{}, false
+	return withExpiry(token, flat.ExpiresAt)
 }
 
 // grokBillingLiveClient refuses redirects and proxies, mirroring the Claude

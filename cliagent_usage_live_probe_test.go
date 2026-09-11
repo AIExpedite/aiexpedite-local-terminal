@@ -189,6 +189,40 @@ func TestCodexMetrics_PoolRowsDisappearWhenPoolIsGone(t *testing.T) {
 	}
 }
 
+func TestCodexLimitNames_SparseUpdateKeepsPoolName(t *testing.T) {
+	cache := isolateCodexCache(t)
+	now := time.Now()
+	stdin, stdout, _ := fakeCodexAppServer(t, codexReadFixture(now))
+	if got := codexLiveProbeConverse(stdin, stdout); got != liveProbeOutcomeOK {
+		t.Fatalf("outcome=%q", got)
+	}
+	// Sparse updates restate the Spark pool's numbers: one omits limitName, the
+	// other sends it null. Neither is authoritative about the name.
+	for _, name := range []string{``, `"limitName":null,`} {
+		captureCodexRateLimitLine(`{"method":"account/rateLimits/updated","params":{"rateLimitsByLimitId":{`+
+			`"codex_bengalfox":{"limitId":"codex_bengalfox",`+name+
+			`"primary":{"usedPercent":6,"windowDurationMins":300,"resetsInSeconds":3600}}}}}`, now.Add(time.Minute))
+		snap, ok := loadCodexRateLimitSnapshot(cache)
+		if !ok {
+			t.Fatal("expected cache")
+		}
+		if snap.LimitNames["codex_bengalfox"] != "GPT-5.3-Codex-Spark" {
+			t.Errorf("after sparse update %q limit names=%v, want the Spark pool still named", name, snap.LimitNames)
+		}
+	}
+}
+
+func TestCodexMergeLimitNames_OnlyAuthoritativeNullClears(t *testing.T) {
+	contributors := map[string]map[string]codexRateLimitBucket{"primary": {"pool": {}}}
+	cached := map[string]string{"pool": "Spark"}
+	if got := codexMergeLimitNames(cached, map[string]string{"pool": ""}, false, contributors); got["pool"] != "Spark" {
+		t.Errorf("sparse null cleared the name: %v", got)
+	}
+	if got := codexMergeLimitNames(cached, map[string]string{"pool": ""}, true, contributors); got["pool"] != "" {
+		t.Errorf("authoritative null kept the name: %v", got)
+	}
+}
+
 func TestCodexMetrics_NoFullSnapshotKeepsPlaceholders(t *testing.T) {
 	isolateCodexCache(t)
 	now := time.Now()
@@ -336,6 +370,33 @@ func TestProbeGrokBillingLive_UnauthorizedRenewsOnceThenGivesUp(t *testing.T) {
 	}
 }
 
+func TestGrokPresentedToken_MatchesTheUsableTokenResolver(t *testing.T) {
+	cases := []struct {
+		name, file, body, want string
+	}{
+		{"id_token-only scope", "auth.json",
+			`{"` + grokExactOIDCScope + `":{"id_token":"id-only","expires_at":"2099-01-01T00:00:00Z"}}`, "id-only"},
+		{"access token before id_token", "auth.json",
+			`{"` + grokExactOIDCScope + `":{"access_token":"access","id_token":"id"}}`, "access"},
+		{"legacy cached_token.json", "cached_token.json",
+			`{"cached_token":{"access_token":"legacy-access","id_token":"legacy-id"}}`, "legacy-access"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			if err := os.WriteFile(filepath.Join(base, tc.file), []byte(tc.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if !grokHasUsableToken(base) {
+				t.Fatal("fixture must be a login the card counts as usable")
+			}
+			if got, _, _ := grokPresentedToken(base); got != tc.want {
+				t.Errorf("token=%q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadGrokBillingLiveSnapshot_OtherAccountNeverReplayed(t *testing.T) {
 	home := isolateGrok(t)
 	now := time.Now()
@@ -379,6 +440,36 @@ func TestAntigravityHTTPPortForPID_OnlyTheRunWeStarted(t *testing.T) {
 	}
 	if got := antigravityHTTPPortForPID(base, 3333); got != 0 {
 		t.Errorf("port=%d, want 0 for a pid that has not logged yet", got)
+	}
+}
+
+func TestAntigravityHTTPPortForPID_SharedLogReadsOnlyOurBlock(t *testing.T) {
+	base := t.TempDir()
+	logDir := filepath.Join(base, "log")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Two runs started in the same second share one log; the other run's block
+	// comes first and our block has not logged its port yet.
+	body := "I0911 server.go:1544] Starting language server process with pid 2222\n" +
+		"I0911 server.go:620] Language server listening on random port at 60000 for HTTP\n" +
+		"I0911 server.go:1544] Starting language server process with pid 1111\n"
+	path := filepath.Join(logDir, "cli-shared.log")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := antigravityHTTPPortForPID(base, 1111); got != 0 {
+		t.Fatalf("port=%d, want 0 until our own block logs a port", got)
+	}
+	body += "I0911 server.go:620] Language server listening on random port at 50000 for HTTP\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := antigravityHTTPPortForPID(base, 1111); got != 50000 {
+		t.Errorf("port=%d, want 50000 from our block", got)
+	}
+	if got := antigravityHTTPPortForPID(base, 2222); got != 60000 {
+		t.Errorf("port=%d, want 60000 for the other run's block", got)
 	}
 }
 
