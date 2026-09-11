@@ -381,7 +381,9 @@ Three rules keep a probe from doing damage on the way:
   optional `auth list` gets only what the gather can spare beyond the same 3s
   reserve (`optionalOpenCodeProbeContext`) and is skipped otherwise — the
   provider names then derive from the listed model ids — so a stall there can
-  never have the conclusive `models` answer discarded as canceled.
+  never have the conclusive `models` answer discarded as canceled. Claude's
+  `claude auth status --json` (`claudeAuthStatusProbe`) takes the gather
+  context the same way, so both of Claude's probes end with the gather.
 - **`grok models` describes the same service, config and login as an ACP
   session.** `sanitizeGrokModelListEnv` starts from the maintenance-smoke
   sanitizer (every `GROK_*` stripped, telemetry / Rust noise dropped, the

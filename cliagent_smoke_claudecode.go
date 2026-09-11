@@ -423,7 +423,7 @@ func replayableCLISmokeVerdict(cliID, stamp, path string) (cliSmokeResult, bool)
 	if !seen || entry.Stamp != stamp || time.Since(entry.At) >= cliSmokeCooldown {
 		return cliSmokeResult{}, false
 	}
-	if loggedIn, known := claudeAuthStatusProbe(path); known && !loggedIn {
+	if loggedIn, known := claudeAuthStatusProbe(context.Background(), path); known && !loggedIn {
 		// Drop it rather than keep re-probing: the caller falls through to a
 		// real run, whose own pre-check returns not_authenticated for free.
 		cliSmokeCooldownMu.Lock()
@@ -504,7 +504,7 @@ func runClaudeCodeSmoke(ctx context.Context, path, version string) cliSmokeResul
 	// An INCONCLUSIVE probe (known == false) deliberately proceeds: that is how
 	// a working env-credential login looks, and refusing there would report a
 	// broken CLI that is in fact healthy.
-	if loggedIn, known := claudeAuthStatusProbe(path); known && !loggedIn {
+	if loggedIn, known := claudeAuthStatusProbe(ctx, path); known && !loggedIn {
 		result.Diagnostic = cliSmokeDiagnosticNotLoggedIn
 		return finish(cliUsageErrorNotAuthenticated)
 	}

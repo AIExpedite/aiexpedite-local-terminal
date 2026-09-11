@@ -47,11 +47,21 @@ var _ cliAgentUsageContextParser = (*claudeCodeUsageParser)(nil)
 
 func (claudeCodeUsageParser) Provider() string { return "claudeCode" }
 
-var claudeAuthStatusProbe = func(path string) (bool, bool) {
+// claudeAuthStatusProbe runs `claude auth status --json`. Its timeout DERIVES
+// from the caller's context (the earlier deadline wins): under the gather's
+// shared budget the probe ends with the gather instead of holding it past the
+// deadline on its own 3s clock — the second Claude probe after the usage
+// request, which the discovery reserve alone could not cover (Codex round 19
+// on #147). Callers without a gather pass context.Background() and keep the
+// full cap.
+var claudeAuthStatusProbe = func(ctx context.Context, path string) (bool, bool) {
 	if path == "" {
 		return false, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), machineInfoProbeTimeout)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, machineInfoProbeTimeout)
 	defer cancel()
 	probeEnv, _ := prepareClaudeChildEnv(path, os.Environ())
 	out, err := runClaudeAuthStatusCommand(ctx, path, probeEnv)
@@ -441,7 +451,7 @@ func (p claudeCodeUsageParser) ParseContext(ctx context.Context, home string, de
 	// state a stale-but-valid credential produces — a definite loggedIn:true was
 	// discarded, the card read "Login expired", and the error notice blanked
 	// every usage bar below it.
-	if loggedIn, known := claudeAuthStatusProbe(detected.Path); known {
+	if loggedIn, known := claudeAuthStatusProbe(ctx, detected.Path); known {
 		if !loggedIn {
 			usage.Authenticated = authBoolPtr(false)
 			usage.AuthState = "missing"

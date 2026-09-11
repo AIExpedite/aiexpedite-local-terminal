@@ -518,7 +518,7 @@ func TestClaudeCodeUsageParser_ApiKeyNoOAuthNoNotice(t *testing.T) {
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	originalProbe := claudeAuthStatusProbe
-	claudeAuthStatusProbe = func(string) (bool, bool) { return true, true }
+	claudeAuthStatusProbe = func(context.Context, string) (bool, bool) { return true, true }
 	t.Cleanup(func() { claudeAuthStatusProbe = originalProbe })
 	home := t.TempDir()
 	helperWriteJSON(t, filepath.Join(home, ".claude", ".credentials.json"), map[string]any{
@@ -589,7 +589,7 @@ func TestClaudeCodeUsageParser_NoFileNoKeychainIsMissing(t *testing.T) {
 	claudeKeychainReader = func() ([]byte, bool) { return nil, false }
 	originalProbe := claudeAuthStatusProbe
 	t.Cleanup(func() { claudeAuthStatusProbe = originalProbe })
-	claudeAuthStatusProbe = func(string) (bool, bool) { return false, false }
+	claudeAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, false }
 
 	usage, _ := claudeCodeUsageParser{}.Parse(home, detectedCLIAgent{Detected: true, Path: "claude-test"}, now)
 	if usage.Authenticated == nil || *usage.Authenticated || usage.AuthState != "missing" {
@@ -722,7 +722,7 @@ func TestClaudeCodeUsageParser_MissingCredentials(t *testing.T) {
 
 func TestClaudeCodeUsageParser_InvalidCredentialsDoNotAuthenticate(t *testing.T) {
 	originalProbe := claudeAuthStatusProbe
-	claudeAuthStatusProbe = func(string) (bool, bool) { return false, false }
+	claudeAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, false }
 	t.Cleanup(func() { claudeAuthStatusProbe = originalProbe })
 
 	for _, tc := range []struct {
@@ -774,7 +774,7 @@ func TestClaudeCodeUsageParser_DefiniteLoggedOutProbeMakesUsageUnobservable(t *t
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("AIEXPEDITE_CLAUDE_RL_CACHE", filepath.Join(t.TempDir(), "rl.json"))
 	original := claudeAuthStatusProbe
-	claudeAuthStatusProbe = func(string) (bool, bool) { return false, true }
+	claudeAuthStatusProbe = func(context.Context, string) (bool, bool) { return false, true }
 	t.Cleanup(func() { claudeAuthStatusProbe = original })
 
 	usage, _ := claudeCodeUsageParser{}.Parse(t.TempDir(), detectedCLIAgent{
@@ -803,7 +803,7 @@ func TestClaudeAuthStatusProbe_ParsesLoggedOutJSONAndSanitizesEnvironment(t *tes
 		return []byte(`{"loggedIn":false}`), errors.New("exit status 1")
 	}
 
-	loggedIn, known := claudeAuthStatusProbe("claude")
+	loggedIn, known := claudeAuthStatusProbe(context.Background(), "claude")
 	if !known || loggedIn {
 		t.Fatalf("probe=(%v, %v), want false/known from logged-out JSON despite exit status 1", loggedIn, known)
 	}
